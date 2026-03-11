@@ -1,0 +1,15 @@
+/target
+
+# Large model files
+benchmarks/
+*.gguf
+*.lbc
+
+# macOS
+.DS_Store
+
+# Benchmark results (raw data, generated reports)
+bench/results/
+
+# Backup files
+*.original

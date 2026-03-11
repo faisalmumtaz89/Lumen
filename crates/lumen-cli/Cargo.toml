@@ -1,0 +1,18 @@
+[package]
+name = "lumen-cli"
+description = "CLI for Lumen LLM inference engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "lumen"
+path = "src/main.rs"
+
+[dependencies]
+lumen-format.workspace = true
+lumen-runtime.workspace = true
+lumen-convert.workspace = true
+lumen-bench.workspace = true

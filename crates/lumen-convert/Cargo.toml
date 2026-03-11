@@ -1,0 +1,11 @@
+[package]
+name = "lumen-convert"
+description = "Converter from GGUF to LBC format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lumen-format.workspace = true

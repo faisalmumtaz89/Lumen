@@ -1,0 +1,12 @@
+[package]
+name = "lumen-bench"
+description = "Microbenchmarks and end-to-end benchmarks for lumen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lumen-format.workspace = true
+lumen-runtime.workspace = true

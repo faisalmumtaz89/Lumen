@@ -1,0 +1,13 @@
+[package]
+name = "lumen-runtime"
+description = "Core inference engine with Metal GPU, SIMD, and scalar compute backends"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lumen-format.workspace = true
+thiserror.workspace = true
+libc = "0.2"

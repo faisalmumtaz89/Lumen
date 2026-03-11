@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lumen-format",
+    "crates/lumen-runtime",
+    "crates/lumen-convert",
+    "crates/lumen-bench",
+    "crates/lumen-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.75"
+repository = "https://github.com/faisalmumtaz/lumen"
+homepage = "https://github.com/faisalmumtaz/lumen"
+description = "GPU-resident LLM inference engine in Rust with Metal GPU acceleration"
+
+[workspace.dependencies]
+lumen-format = { path = "crates/lumen-format" }
+lumen-runtime = { path = "crates/lumen-runtime" }
+lumen-convert = { path = "crates/lumen-convert" }
+lumen-bench = { path = "crates/lumen-bench" }
+thiserror = "2"
