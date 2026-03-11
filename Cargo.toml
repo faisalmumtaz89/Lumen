@@ -13,8 +13,8 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.75"
-repository = "https://github.com/faisalmumtaz/lumen"
-homepage = "https://github.com/faisalmumtaz/lumen"
+repository = "https://github.com/faisalmumtaz89/Lumen"
+homepage = "https://github.com/faisalmumtaz89/Lumen"
 description = "GPU-resident LLM inference engine in Rust with Metal GPU acceleration"
 
 [workspace.dependencies]
