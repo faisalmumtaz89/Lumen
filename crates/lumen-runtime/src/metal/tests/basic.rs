@@ -1031,7 +1031,6 @@ fn bench_matvec_bandwidth_output_proj() {
     println!("Iterations: {}", iterations);
     println!("Elapsed: {:.2} ms", elapsed_ms);
     println!("Effective bandwidth: {:.1} GB/s", bw);
-    println!("Effective bandwidth: {:.1} GB/s", bw);
     println!("Note: {:.1} MB exceeds typical L2 cache -- measures true DRAM bandwidth", weight_mb);
     println!("===================================================\n");
 

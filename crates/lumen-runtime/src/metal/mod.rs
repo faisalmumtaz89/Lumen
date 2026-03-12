@@ -1916,7 +1916,7 @@ impl MetalF32Backend {
             if n_linear > 0 {
                 const GDN_NUM_HEADS: usize = 32;    // ssm.time_step_rank
                 const GDN_HEAD_DIM: usize = 128;    // ssm.state_size
-                const GDN_QKV_DIM: usize = 8192;    // Q(4096) + K(2048) + V(2048)
+                const GDN_QKV_DIM: usize = 8192;    // Q(2048) + K(2048) + V(4096)
                 let conv_kernel_size: usize = 4;    // Qwen3.5 uses kernel_size=4
                 let hidden = s.hidden_dim;
 
@@ -7733,7 +7733,7 @@ impl ComputeBackend for MetalF32Backend {
                 // GDN dimensions differ from full-attention hyperparams.
                 const GDN_NUM_HEADS: usize = 32;    // ssm.time_step_rank
                 const GDN_HEAD_DIM: usize = 128;    // ssm.state_size
-                const GDN_QKV_DIM: usize = 8192;    // Q(4096) + K(2048) + V(2048)
+                const GDN_QKV_DIM: usize = 8192;    // Q(2048) + K(2048) + V(4096)
                 let gdn_q_dim = GDN_NUM_HEADS * GDN_HEAD_DIM; // 4096
                 let conv_kernel_size = 4usize;
                 let h_state_size = GDN_NUM_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM; // 32*128*128

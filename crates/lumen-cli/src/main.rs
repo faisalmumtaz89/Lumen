@@ -129,7 +129,10 @@ fn generate_test_model_cmd(args: &[String]) {
                 eprintln!("Error creating {output_path}: {e}");
                 std::process::exit(1);
             });
-            f.write_all(&data).unwrap();
+            f.write_all(&data).unwrap_or_else(|e| {
+                eprintln!("Error writing {output_path}: {e}");
+                std::process::exit(1);
+            });
 
             println!("Generated test model: {output_path}");
             println!("  Layers: {}", config.num_layers);
@@ -610,7 +613,10 @@ fn create_backend(
             println!("  weight_tying: output_proj shares embedding storage");
             backend.set_weight_tying(true);
         }
-        backend.init(hyperparams).unwrap();
+        backend.init(hyperparams).unwrap_or_else(|e| {
+            eprintln!("Error: Metal initialization failed: {e}");
+            std::process::exit(1);
+        });
         if profile { backend.set_profile(true); }
         return Box::new(backend);
     }
@@ -840,7 +846,10 @@ fn run_with_mmap(
             metal.configure_routing_bias(lambda);
             println!("Routing bias \u{03bb}={lambda} (cache-conditional routing active)");
         }
-        metal.init(&hyperparams_capped).unwrap();
+        metal.init(&hyperparams_capped).unwrap_or_else(|e| {
+            eprintln!("Error: Metal initialization failed: {e}");
+            std::process::exit(1);
+        });
         if profile { metal.set_profile(true); }
 
         // Configure MoE Option A dispatch (streaming + GPU-resident).

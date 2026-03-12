@@ -13,3 +13,4 @@ bench/results/
 
 # Backup files
 *.original
+/.codecompass

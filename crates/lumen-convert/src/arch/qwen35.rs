@@ -93,6 +93,8 @@ fn compute_layer_shape_qwen35(
             }
             // Compute size for target quant
             let n_elements = tensor.n_elements() as usize;
+            assert!(n_elements % 32 == 0,
+                "quantization requires elements divisible by 32, got {n_elements} for {name}");
             let (size, quant) = match target {
                 QuantScheme::Q8_0 => {
                     // Q8_0: 34 bytes per 32 elements
@@ -217,6 +219,8 @@ fn compute_layer_shape_qwen35(
                 let is_alpha_or_beta = suffix == SSM_ALPHA || suffix == SSM_BETA;
                 if is_alpha_or_beta && matches!(quant, QuantScheme::F16 | QuantScheme::Bf16) {
                     let n_elements = tensor.n_elements() as usize;
+                    assert!(n_elements % 32 == 0,
+                        "Q8_0 requires elements divisible by 32, got {n_elements} for {name}");
                     let num_blocks = n_elements / 32;
                     let size = (num_blocks * 34) as u64; // Q8_0: 34 bytes per 32 elements
                     let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::Q8_0 };

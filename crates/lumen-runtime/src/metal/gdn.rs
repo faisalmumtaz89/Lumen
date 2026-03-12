@@ -1120,7 +1120,7 @@ impl MetalF32Backend {
     ///
     /// Replaces the token-by-token GDN prefill loop with batched GPU dispatches.
     /// All projections use batched GEMM; the recurrent state update is sequential
-    /// inside the fused kernel (gdn_prefill_state_output_norm from Agent B).
+    /// inside the fused kernel (gdn_prefill_state_output_norm).
     ///
     /// Dispatch sequence (15 steps):
     ///  1. Batched RMSNorm: x_buf[T, 4096] -> normed_buf[T, 4096]
@@ -1507,18 +1507,16 @@ impl MetalF32Backend {
             enc.set_pipeline_state(pso_v3);
             enc.set_buffer(h_state_buf, 0, 0);                       // h_state [n_heads * val_dim * key_dim] (transposed layout)
             enc.set_buffer(scratch_buf, conv_out_off, 1);             // conv_out_all [T, qkv_dim]
-            enc.set_buffer(scratch_buf, 0, 2);                        // alpha_raw_all [T, n_heads]
-            enc.set_buffer(scratch_buf, alpha_all_bytes, 3);          // beta_raw_all [T, n_heads]
-            enc.set_buffer(layer_buf, ssm_dt_off, 4);                 // dt_bias [n_heads]
-            enc.set_buffer(layer_buf, ssm_a_off, 5);                  // A_log [n_heads]
-            enc.set_buffer(qkv_buf, raw_out_off, 6);                  // raw_out [T, q_dim] (upper half of qkv_buf)
-            enc.set_bytes(&(num_heads as u32).to_le_bytes(), 7);
-            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 8);       // key_dim
-            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 9);       // val_dim
-            enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 10);
-            enc.set_bytes(&(batch_size as u32).to_le_bytes(), 11);    // T
-            enc.set_bytes(&(qk_dim as u32).to_le_bytes(), 12);
-            enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 13);
+            enc.set_buffer(scratch_buf, 0, 2);                        // alpha_all [T, n_heads]
+            enc.set_buffer(scratch_buf, alpha_all_bytes, 3);          // beta_all [T, n_heads]
+            enc.set_buffer(qkv_buf, raw_out_off, 4);                  // raw_out [T, q_dim] (upper half of qkv_buf)
+            enc.set_bytes(&(num_heads as u32).to_le_bytes(), 5);
+            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 6);       // key_dim
+            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 7);       // val_dim
+            enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 8);
+            enc.set_bytes(&(batch_size as u32).to_le_bytes(), 9);     // T
+            enc.set_bytes(&(qk_dim as u32).to_le_bytes(), 10);
+            enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 11);
             enc.dispatch_threadgroups(
                 MTLSize::new(1, head_dim as u64, num_heads as u64),
                 MTLSize::new(32, 1, 1),
@@ -1689,7 +1687,7 @@ impl MetalF32Backend {
                 // which are full-attention hyperparams. GDN uses different per-model constants.
                 const GDN_NUM_HEADS: usize = 32;    // ssm.time_step_rank
                 const GDN_HEAD_DIM: usize = 128;    // ssm.state_size
-                const GDN_QKV_DIM: usize = 8192;    // Q(4096)+K(2048)+V(2048)
+                const GDN_QKV_DIM: usize = 8192;    // Q(2048)+K(2048)+V(4096)
                 let conv_kernel_size = s.gdn_conv_kernel_size;
                 let h_state_size = GDN_NUM_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM;
                 let conv_state_size = (conv_kernel_size - 1) * GDN_QKV_DIM;

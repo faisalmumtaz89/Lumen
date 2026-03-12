@@ -15535,7 +15535,7 @@ kernel void gdn_prefill_fused_v2(
 // Grid: (1, val_dim=128, n_heads=32) threadgroups
 // Threadgroup: (32, 1, 1) threads
 //
-// Buffers: identical to gdn_prefill_fused_v2
+// Buffers: alpha/beta are pre-computed gates (not raw projections)
 // ============================================================================
 
 kernel void gdn_prefill_fused_v3_chunked(
@@ -15543,16 +15543,14 @@ kernel void gdn_prefill_fused_v3_chunked(
     device const float* conv_out_all   [[buffer(1)]],
     device const float* alpha_all      [[buffer(2)]],
     device const float* beta_all       [[buffer(3)]],
-    device const float* dt_bias        [[buffer(4)]],
-    device const float* A_log          [[buffer(5)]],
-    device       float* raw_out        [[buffer(6)]],
-    constant     uint&  n_heads        [[buffer(7)]],
-    constant     uint&  key_dim        [[buffer(8)]],
-    constant     uint&  val_dim        [[buffer(9)]],
-    constant     uint&  n_kv_heads     [[buffer(10)]],
-    constant     uint&  T              [[buffer(11)]],
-    constant     uint&  qk_dim         [[buffer(12)]],
-    constant     uint&  qkv_dim        [[buffer(13)]],
+    device       float* raw_out        [[buffer(4)]],
+    constant     uint&  n_heads        [[buffer(5)]],
+    constant     uint&  key_dim        [[buffer(6)]],
+    constant     uint&  val_dim        [[buffer(7)]],
+    constant     uint&  n_kv_heads     [[buffer(8)]],
+    constant     uint&  T              [[buffer(9)]],
+    constant     uint&  qk_dim         [[buffer(10)]],
+    constant     uint&  qkv_dim        [[buffer(11)]],
     uint3 tg_pos                       [[threadgroup_position_in_grid]],
     uint lane                          [[thread_index_in_simdgroup]])
 {
