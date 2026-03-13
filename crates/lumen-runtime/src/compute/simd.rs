@@ -20,7 +20,7 @@
 use crate::weight::cache::LayerView;
 use crate::compute::{ActivationBuffer, ComputeBackend, ComputeDtype, Logits};
 use crate::error::RuntimeError;
-use crate::kv::KvCacheView;
+use crate::kv::{KvCacheView, KvPrecision};
 use crate::compute::simd_kernels;
 use crate::thread_pool::ThreadPool;
 use lumen_format::hyperparams::ModelHyperparams;
@@ -953,9 +953,9 @@ impl ComputeBackend for SimdF32Backend {
         let kv = kv.ok_or_else(|| {
             RuntimeError::Compute("KV cache view required for attention".into())
         })?;
-        kv.append_keys_f32(&s.k);
-        kv.append_values_f32(&s.v);
-        let new_seq_len = kv.seq_len + 1;
+        kv.append_keys(&s.k);
+        kv.append_values(&s.v);
+        let new_seq_len = (kv.seq_len + 1).min(kv.max_seq_len);
         tock!(t0, kv_cache_write);
 
         // 5. Multi-head attention with GQA (parallel across heads)
@@ -969,6 +969,10 @@ impl ComputeBackend for SimdF32Backend {
         // Q is pre-scaled by attn_scale in step 3b, so no per-position scale multiply needed.
         let t0 = tick!();
         let max_seq_len = s.max_seq_len;
+        let kv_is_f16 = kv.precision == KvPrecision::F16;
+        let bytes_per_elem = kv.precision.bytes_per_element();
+        let head_dim_bytes = head_dim * bytes_per_elem;
+        let kv_max_seq_len = kv.max_seq_len;
 
         if num_heads >= self.pool.total_threads() && self.pool.total_threads() > 1 && new_seq_len >= 64 {
             // Parallel path: each thread processes a range of heads.
@@ -992,7 +996,8 @@ impl ComputeBackend for SimdF32Backend {
             self.pool.parallel_for_heads(num_heads, |start_head, end_head| {
                 for h in start_head..end_head {
                     let kv_h = h / gqa_ratio;
-                    let kv_head_offset = kv_h * head_dim;
+                    // Head-first layout: per-head base byte offset
+                    let kv_head_byte_base = kv_h * kv_max_seq_len * head_dim_bytes;
 
                     // SAFETY: q_ptr + h*head_dim is within the q allocation (size = num_heads * head_dim).
                     // Each head reads a disjoint slice.
@@ -1014,16 +1019,25 @@ impl ComputeBackend for SimdF32Backend {
 
                     // Compute attention scores using SIMD dot product.
                     // Q is already scaled by 1/sqrt(head_dim), so scores = Q . K directly.
+                    // Head-first layout: K[kv_h] is contiguous at base + t*head_dim_bytes.
                     for t in 0..new_seq_len {
-                        let k_byte_start = (t * kv_dim + kv_head_offset) * 4;
-                        debug_assert!(k_byte_start + head_dim * 4 <= kv_keys_len);
-                        let k_slice = unsafe {
-                            std::slice::from_raw_parts(
-                                (kv_keys_ptr as *const u8).add(k_byte_start) as *const f32,
-                                head_dim,
-                            )
+                        let k_byte_start = kv_head_byte_base + t * head_dim_bytes;
+                        let dot = if kv_is_f16 {
+                            debug_assert!(k_byte_start + head_dim * 2 <= kv_keys_len);
+                            unsafe {
+                                let src = (kv_keys_ptr as *const u8).add(k_byte_start);
+                                simd_kernels::dot_product_f16_f32_simd(q_head, src, head_dim)
+                            }
+                        } else {
+                            debug_assert!(k_byte_start + head_dim * 4 <= kv_keys_len);
+                            let k_slice = unsafe {
+                                std::slice::from_raw_parts(
+                                    (kv_keys_ptr as *const u8).add(k_byte_start) as *const f32,
+                                    head_dim,
+                                )
+                            };
+                            simd_kernels::dot_product_simd(q_head, k_slice)
                         };
-                        let dot = simd_kernels::dot_product_simd(q_head, k_slice);
                         unsafe { *head_scores.get_unchecked_mut(t) = dot; }
                     }
 
@@ -1042,15 +1056,23 @@ impl ComputeBackend for SimdF32Backend {
 
                     for t in 0..new_seq_len {
                         let score = unsafe { *head_scores.get_unchecked(t) };
-                        let v_byte_start = (t * kv_dim + kv_head_offset) * 4;
-                        debug_assert!(v_byte_start + head_dim * 4 <= kv_values_len);
-                        let v_slice = unsafe {
-                            std::slice::from_raw_parts(
-                                (kv_values_ptr as *const u8).add(v_byte_start) as *const f32,
-                                head_dim,
-                            )
-                        };
-                        vscale_add_inplace(out_slice, v_slice, score);
+                        let v_byte_start = kv_head_byte_base + t * head_dim_bytes;
+                        if kv_is_f16 {
+                            debug_assert!(v_byte_start + head_dim * 2 <= kv_values_len);
+                            unsafe {
+                                let src = (kv_values_ptr as *const u8).add(v_byte_start);
+                                simd_kernels::vscale_add_f16_f32_inplace(out_slice, src, score, head_dim);
+                            }
+                        } else {
+                            debug_assert!(v_byte_start + head_dim * 4 <= kv_values_len);
+                            let v_slice = unsafe {
+                                std::slice::from_raw_parts(
+                                    (kv_values_ptr as *const u8).add(v_byte_start) as *const f32,
+                                    head_dim,
+                                )
+                            };
+                            vscale_add_inplace(out_slice, v_slice, score);
+                        }
                     }
                 }
             });
@@ -1058,7 +1080,8 @@ impl ComputeBackend for SimdF32Backend {
             // Serial fallback for small head counts or when parallelism isn't beneficial.
             for h in 0..num_heads {
                 let kv_h = h / gqa_ratio;
-                let kv_head_offset = kv_h * head_dim;
+                // Head-first layout: compute per-head base element offset
+                let kv_head_elem_base = kv_h * kv_max_seq_len * head_dim;
 
                 let q_head_ptr = unsafe { s.q.as_ptr().add(h * head_dim) };
                 let q_head = unsafe { std::slice::from_raw_parts(q_head_ptr, head_dim) };
@@ -1067,16 +1090,25 @@ impl ComputeBackend for SimdF32Backend {
                 let scores_start = h * max_seq_len;
 
                 // Compute attention scores. Q is pre-scaled, so no per-position multiply.
+                // Head-first layout: K[kv_h] is contiguous at base + t*head_dim.
                 for t in 0..new_seq_len {
-                    let k_start = t * kv_dim + kv_head_offset;
-                    #[cfg(target_endian = "little")]
-                    let k_slice = kv.keys_f32_slice(k_start, head_dim);
-                    #[cfg(not(target_endian = "little"))]
-                    let k_slice = {
-                        kv.read_keys_f32_into(&mut s.k_head_buf, k_start, head_dim);
-                        &s.k_head_buf[..head_dim]
+                    let k_start = kv_head_elem_base + t * head_dim;
+                    let dot = if kv_is_f16 {
+                        let k_byte_start = k_start * 2;
+                        unsafe {
+                            let src = kv.keys.as_ptr().add(k_byte_start);
+                            simd_kernels::dot_product_f16_f32_simd(q_head, src, head_dim)
+                        }
+                    } else {
+                        #[cfg(target_endian = "little")]
+                        let k_slice = kv.keys_f32_slice(k_start, head_dim);
+                        #[cfg(not(target_endian = "little"))]
+                        let k_slice = {
+                            kv.read_keys_f32_into(&mut s.k_head_buf, k_start, head_dim);
+                            &s.k_head_buf[..head_dim]
+                        };
+                        simd_kernels::dot_product_simd(q_head, k_slice)
                     };
-                    let dot = simd_kernels::dot_product_simd(q_head, k_slice);
                     unsafe { *s.scores.get_unchecked_mut(scores_start + t) = dot; }
                 }
 
@@ -1092,15 +1124,23 @@ impl ComputeBackend for SimdF32Backend {
 
                 for t in 0..new_seq_len {
                     let score = unsafe { *s.scores.get_unchecked(scores_start + t) };
-                    let v_base = t * kv_dim + kv_head_offset;
-                    #[cfg(target_endian = "little")]
-                    let v_slice = kv.values_f32_slice(v_base, head_dim);
-                    #[cfg(not(target_endian = "little"))]
-                    let v_slice = {
-                        kv.read_values_f32_into(&mut s.v_head_buf, v_base, head_dim);
-                        &s.v_head_buf[..head_dim]
-                    };
-                    vscale_add_inplace(out_slice, v_slice, score);
+                    let v_start = kv_head_elem_base + t * head_dim;
+                    if kv_is_f16 {
+                        let v_byte_start = v_start * 2;
+                        unsafe {
+                            let src = kv.values.as_ptr().add(v_byte_start);
+                            simd_kernels::vscale_add_f16_f32_inplace(out_slice, src, score, head_dim);
+                        }
+                    } else {
+                        #[cfg(target_endian = "little")]
+                        let v_slice = kv.values_f32_slice(v_start, head_dim);
+                        #[cfg(not(target_endian = "little"))]
+                        let v_slice = {
+                            kv.read_values_f32_into(&mut s.v_head_buf, v_start, head_dim);
+                            &s.v_head_buf[..head_dim]
+                        };
+                        vscale_add_inplace(out_slice, v_slice, score);
+                    }
                 }
             }
         }

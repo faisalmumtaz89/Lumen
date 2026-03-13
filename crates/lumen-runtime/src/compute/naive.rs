@@ -386,22 +386,25 @@ impl ComputeBackend for NaiveF32Backend {
         })?;
 
         // Append new k,v to cache via KvCacheView helpers (proper abstraction layer)
-        kv.append_keys_f32(&s.k);
-        kv.append_values_f32(&s.v);
-        let new_seq_len = kv.seq_len + 1;
+        kv.append_keys(&s.k);
+        kv.append_values(&s.v);
+        let new_seq_len = (kv.seq_len + 1).min(kv.max_seq_len);
 
         // 5. Multi-head attention with GQA
         let scale = 1.0 / (head_dim as f32).sqrt(); // MUST: practice 4.3
         let gqa_ratio = num_heads / num_kv_heads;
+        let kv_max_seq_len = kv.max_seq_len;
 
         for h in 0..num_heads {
             let kv_h = h / gqa_ratio; // GQA: multiple Q heads share one KV head
+            // Head-first layout: per-head element base
+            let kv_head_elem_base = kv_h * kv_max_seq_len * head_dim;
 
             // Compute attention scores for this head
             for t in 0..new_seq_len {
-                // Bulk-read contiguous key slice for this head at position t
-                let k_start = t * kv_dim + kv_h * head_dim;
-                kv.read_keys_f32_into(&mut s.k_head_buf, k_start, head_dim);
+                // Head-first layout: K[kv_h] is contiguous at base + t*head_dim
+                let k_start = kv_head_elem_base + t * head_dim;
+                kv.read_keys_into(&mut s.k_head_buf, k_start, head_dim);
                 let mut dot = 0.0f32;
                 for d in 0..head_dim {
                     dot += s.q[h * head_dim + d] * s.k_head_buf[d];
@@ -418,9 +421,9 @@ impl ComputeBackend for NaiveF32Backend {
             }
             for t in 0..new_seq_len {
                 let score = s.scores[t];
-                let v_base = t * kv_dim + kv_h * head_dim;
+                let v_start = kv_head_elem_base + t * head_dim;
                 // Bulk-read contiguous V data into scratch buffer
-                kv.read_values_f32_into(&mut s.v_head_buf, v_base, head_dim);
+                kv.read_values_into(&mut s.v_head_buf, v_start, head_dim);
                 for d in 0..head_dim {
                     s.attn_out[h * head_dim + d] += score * s.v_head_buf[d];
                 }

@@ -213,6 +213,13 @@ impl AccelerateBatchBackend {
         weights: &LayerView,
         kv: &mut KvCacheView,
     ) -> Result<(), RuntimeError> {
+        if kv.precision != crate::kv::KvPrecision::F32 {
+            return Err(RuntimeError::KvCache(format!(
+                "Accelerate backend currently only supports F32 KV cache precision, got {:?}",
+                kv.precision
+            )));
+        }
+
         let hidden_dim = self.hidden_dim;
         let q_dim = self.q_dim;
         let kv_dim = self.kv_dim;
@@ -285,22 +292,24 @@ impl AccelerateBatchBackend {
             }
 
             // Write K, V to KV cache
-            kv.append_keys_f32(k_slice);
-            kv.append_values_f32(&self.v_batch[k_start..k_start + kv_dim]);
+            kv.append_keys(k_slice);
+            kv.append_values(&self.v_batch[k_start..k_start + kv_dim]);
+            kv.seq_len = (kv.seq_len + 1).min(kv.max_seq_len);
         }
 
         // ---- 5. Causal attention per-token ----
         // Parallelize across attention heads using the thread pool.
         // Each head reads from disjoint Q regions and writes to disjoint
         // attn_out and scores regions. KV cache is read-only at this point.
-        let new_total_seq_len = seq_pos_start + batch_size;
+        let new_total_seq_len = (seq_pos_start + batch_size).min(kv.max_seq_len);
         let max_seq_len = self.max_seq_len;
+        let kv_max_seq_len = kv.max_seq_len;
         let total_threads = self.pool.total_threads();
         let use_parallel_attn = num_heads >= total_threads && total_threads > 1;
 
         for t in 0..batch_size {
             let current_pos = seq_pos_start + t;
-            let attend_len = current_pos + 1; // causal: attend to positions 0..=current_pos
+            let attend_len = (current_pos + 1).min(kv_max_seq_len); // causal: attend to positions 0..=current_pos
 
             let attn_out_start = t * q_dim;
             // Zero the output for this token
@@ -321,7 +330,7 @@ impl AccelerateBatchBackend {
                 self.pool.parallel_for_heads(num_heads, |h_start, h_end| {
                     for h in h_start..h_end {
                         let kv_h = h / gqa_ratio;
-                        let kv_head_offset = kv_h * head_dim;
+                        let kv_head_byte_base = kv_h * kv_max_seq_len * head_dim * 4;
 
                         let q_head = unsafe {
                             std::slice::from_raw_parts(
@@ -338,7 +347,7 @@ impl AccelerateBatchBackend {
                         };
 
                         for (p, score_slot) in head_scores.iter_mut().enumerate() {
-                            let k_byte_start = (p * kv_dim + kv_head_offset) * 4;
+                            let k_byte_start = kv_head_byte_base + p * head_dim * 4;
                             debug_assert!(k_byte_start + head_dim * 4 <= kv_keys_len);
                             let k_slice = unsafe {
                                 std::slice::from_raw_parts(
@@ -359,7 +368,7 @@ impl AccelerateBatchBackend {
                         };
                         out_head.fill(0.0);
                         for (p, &score) in head_scores.iter().enumerate() {
-                            let v_byte_start = (p * kv_dim + kv_head_offset) * 4;
+                            let v_byte_start = kv_head_byte_base + p * head_dim * 4;
                             debug_assert!(v_byte_start + head_dim * 4 <= kv_values_len);
                             let v_slice = unsafe {
                                 std::slice::from_raw_parts(
@@ -375,13 +384,13 @@ impl AccelerateBatchBackend {
                 // Serial fallback for short sequences or small head counts
                 for h in 0..num_heads {
                     let kv_h = h / gqa_ratio;
-                    let kv_head_offset = kv_h * head_dim;
+                    let kv_head_elem_base = kv_h * kv_max_seq_len * head_dim;
 
                     let q_head = &self.q_batch[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
 
                     let scores_start = h * max_seq_len;
                     for p in 0..attend_len {
-                        let k_elem_start = p * kv_dim + kv_head_offset;
+                        let k_elem_start = kv_head_elem_base + p * head_dim;
                         let k_slice = kv.keys_f32_slice(k_elem_start, head_dim);
                         self.scores[scores_start + p] = simd_kernels::dot_product_simd(q_head, k_slice);
                     }
@@ -394,7 +403,7 @@ impl AccelerateBatchBackend {
                     out_head.fill(0.0);
                     for p in 0..attend_len {
                         let score = self.scores[scores_start + p];
-                        let v_elem_start = p * kv_dim + kv_head_offset;
+                        let v_elem_start = kv_head_elem_base + p * head_dim;
                         let v_slice = kv.values_f32_slice(v_elem_start, head_dim);
                         simd_kernels::vscale_add_inplace_simd(out_head, v_slice, score);
                     }

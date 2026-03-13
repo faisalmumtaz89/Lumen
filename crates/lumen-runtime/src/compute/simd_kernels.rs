@@ -687,7 +687,7 @@ const Q8_0_GROUP_SIZE: usize = 32;
 /// ~10x fewer instructions than the software `f16_to_f32_inline`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn f16_to_f32_hw(bits: u16) -> f32 {
+pub(crate) fn f16_to_f32_hw(bits: u16) -> f32 {
     let result: f32;
     unsafe {
         std::arch::asm!(
@@ -705,7 +705,7 @@ fn f16_to_f32_hw(bits: u16) -> f32 {
 /// Used in the quantization path instead of the software `f32_to_f16_inline`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn f32_to_f16_hw(val: f32) -> u16 {
+pub(crate) fn f32_to_f16_hw(val: f32) -> u16 {
     let result: u16;
     unsafe {
         std::arch::asm!(
@@ -719,10 +719,84 @@ fn f32_to_f16_hw(val: f32) -> u16 {
     result
 }
 
+/// Batch-convert f16 bytes to f32, using NEON FCVTL for 4-wide vectorized conversion.
+/// `src` points to `count` packed f16 values (2 bytes each).
+/// `dst` must have capacity for `count` f32 values.
+///
+/// Uses FCVTL (float convert to longer) which widens 4 f16 → 4 f32 in one instruction.
+/// Falls back to scalar FCVT for the tail elements.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn f16_to_f32_batch(src: *const u8, dst: *mut f32, count: usize) {
+    unsafe {
+        let chunks = count / 4;
+        let remainder = count % 4;
+        let mut s = src as *const u16;
+        let mut d = dst;
+
+        for _ in 0..chunks {
+            // Load 4 f16 values into a 64-bit NEON register, then widen to 4 f32
+            std::arch::asm!(
+                "ld1 {{v0.4h}}, [{src}]",
+                "fcvtl v1.4s, v0.4h",
+                "st1 {{v1.4s}}, [{dst}]",
+                src = in(reg) s,
+                dst = in(reg) d,
+                out("v0") _,
+                out("v1") _,
+            );
+            s = s.add(4);
+            d = d.add(4);
+        }
+
+        // Scalar tail
+        for i in 0..remainder {
+            *d.add(i) = f16_to_f32_hw(*s.add(i));
+        }
+    }
+}
+
+/// Batch-convert f32 to f16 bytes, using NEON FCVTN for 4-wide vectorized conversion.
+/// `src` points to `count` f32 values.
+/// `dst` must have capacity for `count` packed f16 values (2 bytes each).
+///
+/// Uses FCVTN (float convert to narrower) which narrows 4 f32 → 4 f16 in one instruction.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn f32_to_f16_batch(src: *const f32, dst: *mut u8, count: usize) {
+    unsafe {
+        let chunks = count / 4;
+        let remainder = count % 4;
+        let mut s = src;
+        let mut d = dst as *mut u16;
+
+        for _ in 0..chunks {
+            // Load 4 f32 values, narrow to 4 f16, store
+            std::arch::asm!(
+                "ld1 {{v0.4s}}, [{src}]",
+                "fcvtn v1.4h, v0.4s",
+                "st1 {{v1.4h}}, [{dst}]",
+                src = in(reg) s,
+                dst = in(reg) d,
+                out("v0") _,
+                out("v1") _,
+            );
+            s = s.add(4);
+            d = d.add(4);
+        }
+
+        // Scalar tail
+        for i in 0..remainder {
+            let bits = f32_to_f16_hw(*s.add(i));
+            *d.add(i) = bits;
+        }
+    }
+}
+
 /// Convert f16 (IEEE 754 binary16) bits to f32.
 /// Self-contained to avoid cross-crate dependency on the converter's f16_to_f32.
 #[inline(always)]
-fn f16_to_f32_inline(bits: u16) -> f32 {
+pub(crate) fn f16_to_f32_inline(bits: u16) -> f32 {
     let sign = (bits >> 15) & 1;
     let exp = (bits >> 10) & 0x1f;
     let frac = bits & 0x3ff;
@@ -1075,7 +1149,7 @@ pub fn matmul_q8_0_simd_2row_widen(
 #[cfg(target_arch = "aarch64")]
 #[allow(dead_code)]
 #[inline(always)]
-fn f32_to_f16_inline(val: f32) -> u16 {
+pub(crate) fn f32_to_f16_inline(val: f32) -> u16 {
     let bits = val.to_bits();
     let sign = (bits >> 31) & 1;
     let exp = ((bits >> 23) & 0xff) as i32;
@@ -2353,6 +2427,126 @@ pub fn dot_product_simd(a: &[f32], b: &[f32]) -> f32 {
 #[inline(always)]
 pub fn dot_product_simd(a: &[f32], b: &[f32]) -> f32 {
     dot_product_fallback(a, b)
+}
+
+/// Fused f16→f32 dot product: computes dot(a_f32, b_f16) without intermediate buffer.
+///
+/// `a` is f32 query data. `b_f16` points to `n` packed f16 values (2 bytes each).
+/// Loads f16 data, widens to f32 via FCVTL (inline asm), and accumulates with NEON FMA —
+/// all within registers, eliminating the store-to-load latency of a separate dequant buffer.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn dot_product_f16_f32_simd(a: &[f32], b_f16: *const u8, n: usize) -> f32 {
+    debug_assert!(a.len() >= n);
+
+    /// Load 4 packed f16 values and widen to float32x4_t via FCVTL.
+    #[inline(always)]
+    unsafe fn fcvtl_4h(ptr: *const u16) -> float32x4_t {
+        let result: float32x4_t;
+        std::arch::asm!(
+            "ld1 {{v0.4h}}, [{src}]",
+            "fcvtl {out:v}.4s, v0.4h",
+            src = in(reg) ptr,
+            out = out(vreg) result,
+            out("v0") _,
+            options(nostack, readonly),
+        );
+        result
+    }
+
+    let chunks8 = n / 8;
+    let mid_start = chunks8 * 8;
+    let chunks4 = (n - mid_start) / 4;
+    let tail_start = mid_start + chunks4 * 4;
+    let remainder = n - tail_start;
+
+    unsafe {
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+
+        // Primary loop: 8 elements per iteration (two FCVTL + two FMA)
+        for c in 0..chunks8 {
+            let base = c * 8;
+            let b_ptr = b_f16.add(base * 2) as *const u16;
+
+            let f0 = fcvtl_4h(b_ptr);
+            let a0 = vld1q_f32(a.as_ptr().add(base));
+            acc0 = vfmaq_f32(acc0, a0, f0);
+
+            let f1 = fcvtl_4h(b_ptr.add(4));
+            let a1 = vld1q_f32(a.as_ptr().add(base + 4));
+            acc1 = vfmaq_f32(acc1, a1, f1);
+        }
+
+        // Secondary: 4 elements
+        for c in 0..chunks4 {
+            let idx = mid_start + c * 4;
+            let b_ptr = b_f16.add(idx * 2) as *const u16;
+            let f = fcvtl_4h(b_ptr);
+            let a_vec = vld1q_f32(a.as_ptr().add(idx));
+            acc0 = vfmaq_f32(acc0, a_vec, f);
+        }
+
+        let sum_all = vaddq_f32(acc0, acc1);
+        let mut sum = vaddvq_f32(sum_all);
+
+        // Scalar tail
+        for j in 0..remainder {
+            let idx = tail_start + j;
+            let bits = std::ptr::read_unaligned(b_f16.add(idx * 2) as *const u16);
+            sum += *a.get_unchecked(idx) * f16_to_f32_hw(bits);
+        }
+
+        sum
+    }
+}
+
+/// Fused f16 value weighted accumulation: out[i] += scale * dequant(v_f16[i]).
+///
+/// Same register-fusion as `dot_product_f16_f32_simd`: loads f16 values, widens
+/// to f32 via FCVTL, scales, and accumulates into `out` — all without intermediate buffer.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn vscale_add_f16_f32_inplace(out: &mut [f32], v_f16: *const u8, scale: f32, n: usize) {
+    debug_assert!(out.len() >= n);
+
+    /// Load 4 packed f16 values and widen to float32x4_t via FCVTL.
+    #[inline(always)]
+    unsafe fn fcvtl_4h(ptr: *const u16) -> float32x4_t {
+        let result: float32x4_t;
+        std::arch::asm!(
+            "ld1 {{v0.4h}}, [{src}]",
+            "fcvtl {out:v}.4s, v0.4h",
+            src = in(reg) ptr,
+            out = out(vreg) result,
+            out("v0") _,
+            options(nostack, readonly),
+        );
+        result
+    }
+
+    let scale_vec = unsafe { vdupq_n_f32(scale) };
+    let chunks4 = n / 4;
+    let tail_start = chunks4 * 4;
+    let remainder = n - tail_start;
+
+    unsafe {
+        for c in 0..chunks4 {
+            let idx = c * 4;
+            let b_ptr = v_f16.add(idx * 2) as *const u16;
+            let f = fcvtl_4h(b_ptr);
+            let out_vec = vld1q_f32(out.as_ptr().add(idx));
+            let result = vfmaq_f32(out_vec, f, scale_vec);
+            vst1q_f32(out.as_mut_ptr().add(idx), result);
+        }
+
+        // Scalar tail
+        for j in 0..remainder {
+            let idx = tail_start + j;
+            let bits = std::ptr::read_unaligned(v_f16.add(idx * 2) as *const u16);
+            *out.get_unchecked_mut(idx) += scale * f16_to_f32_hw(bits);
+        }
+    }
 }
 
 /// Fused SwiGLU: gate_i = silu(gate_i) * up_i, written in-place.
@@ -4777,7 +4971,7 @@ mod tests {
         let in_dim = 32;
         let out_dim = 2;
         let w_f32 = vec![0.0f32; out_dim * in_dim];
-        let x: Vec<f32> = (0..in_dim).map(|i| (i as f32 + 1.0)).collect();
+        let x: Vec<f32> = (0..in_dim).map(|i| i as f32 + 1.0).collect();
 
         let w_q8 = encode_q8_0_blocks(&w_f32);
         let mut out = vec![0.0f32; out_dim];
