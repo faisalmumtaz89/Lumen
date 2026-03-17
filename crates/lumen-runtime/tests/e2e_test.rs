@@ -6,8 +6,8 @@ use lumen_runtime::engine::{InferenceEngine, SamplingParams, StopCondition};
 use lumen_runtime::config::RuntimeConfig;
 use lumen_runtime::kv::KvPrecision;
 use lumen_runtime::pipeline::PipelineMode;
-use lumen_runtime::compute::naive::NaiveF32Backend;
-use lumen_runtime::compute::simd::SimdF32Backend;
+use lumen_runtime::compute::cpu_naive::NaiveF32Backend;
+use lumen_runtime::compute::cpu_simd::SimdF32Backend;
 #[cfg(target_os = "macos")]
 use lumen_runtime::metal::MetalF32Backend;
 use lumen_runtime::weight::provider_async::AsyncWeightProvider;

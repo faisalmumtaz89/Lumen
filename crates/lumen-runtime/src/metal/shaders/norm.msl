@@ -1,0 +1,107 @@
+// ============================================================================
+// rmsnorm: RMS Normalization
+//
+// out[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
+//
+// Two-pass: first compute sum of squares, then normalize.
+// Uses simd_sum for fast reduction.
+// ============================================================================
+
+kernel void rmsnorm(
+    device const float* x       [[buffer(0)]],
+    device const float* weight  [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      dim     [[buffer(3)]],
+    constant float&     eps     [[buffer(4)]],
+    uint tid                    [[thread_index_in_threadgroup]],
+    uint tg_size                [[threads_per_threadgroup]],
+    uint simd_lane              [[thread_index_in_simdgroup]],
+    uint simd_group             [[simdgroup_index_in_threadgroup]])
+{
+    // Pass 1: compute sum of squares
+    float ss = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float v = x[i];
+        ss += v * v;
+    }
+
+    ss = simd_sum(ss);
+
+    threadgroup float partial_sums[32];
+
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reduce across SIMD groups
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float total_ss;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_ss = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float scale = rsqrt(total_ss / float(dim) + eps);
+
+    // Pass 2: normalize and scale by weight
+    for (uint i = tid; i < dim; i += tg_size) {
+        out[i] = x[i] * scale * weight[i];
+    }
+}
+
+// ============================================================================
+// rmsnorm_bytes: RMS Normalization with byte-encoded weights.
+// ============================================================================
+
+kernel void rmsnorm_bytes(
+    device const float* x          [[buffer(0)]],
+    device const uchar* w_bytes    [[buffer(1)]],
+    device float*       out        [[buffer(2)]],
+    constant uint&      dim        [[buffer(3)]],
+    constant float&     eps        [[buffer(4)]],
+    uint tid                       [[thread_index_in_threadgroup]],
+    uint tg_size                   [[threads_per_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_group                [[simdgroup_index_in_threadgroup]])
+{
+    device const float* weight = (device const float*)w_bytes;
+
+    float ss = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float v = x[i];
+        ss += v * v;
+    }
+
+    ss = simd_sum(ss);
+
+    threadgroup float partial_sums[32];
+
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float total_ss;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_ss = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float scale = rsqrt(total_ss / float(dim) + eps);
+
+    for (uint i = tid; i < dim; i += tg_size) {
+        out[i] = x[i] * scale * weight[i];
+    }
+}
+
+// ============================================================================

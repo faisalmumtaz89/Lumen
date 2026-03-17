@@ -29,8 +29,8 @@ pub mod weight;
 
 pub use weight::cache::{CacheStats, LayerView, PrefetchHandle, PrefetchPriority, WeightProvider};
 pub use compute::ComputeBackend;
-pub use compute::naive::NaiveF32Backend;
-pub use compute::simd::SimdF32Backend;
+pub use compute::cpu_naive::NaiveF32Backend;
+pub use compute::cpu_simd::SimdF32Backend;
 #[cfg(target_os = "macos")]
 pub use metal::MetalF32Backend;
 #[cfg(target_os = "macos")]

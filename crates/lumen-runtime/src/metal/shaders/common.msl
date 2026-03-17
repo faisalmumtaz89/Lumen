@@ -1,0 +1,9 @@
+
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+// FOR_UNROLL: Hint the compiler to fully unroll the following loop.
+// Matches llama.cpp convention for simdgroup MMA inner loops.
+#define FOR_UNROLL _Pragma("clang loop unroll(full)") for
+

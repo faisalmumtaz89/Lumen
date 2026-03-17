@@ -1,8 +1,8 @@
 //! Lumen CLI -- command-line interface for LLM inference.
 
 use lumen_runtime::compute::ComputeBackend;
-use lumen_runtime::compute::naive::NaiveF32Backend;
-use lumen_runtime::compute::simd::SimdF32Backend;
+use lumen_runtime::compute::cpu_naive::NaiveF32Backend;
+use lumen_runtime::compute::cpu_simd::SimdF32Backend;
 #[cfg(target_os = "macos")]
 use lumen_runtime::metal::MetalF32Backend;
 #[cfg(target_os = "macos")]
@@ -567,6 +567,9 @@ fn effective_max_seq_len(model_max: usize, user_override: Option<usize>, prompt_
 
 /// Create and initialize the appropriate compute backend.
 ///
+/// All backends are configured through the `ComputeBackend` trait after boxing,
+/// so the setup logic (global tensors, quant data, init, profile) is shared.
+///
 /// `threads` controls the SIMD backend thread pool size:
 ///   0 = auto-detect (all available cores), N = use exactly N threads.
 #[allow(clippy::too_many_arguments)]
@@ -591,55 +594,63 @@ fn create_backend(
     #[allow(unused_variables)]
     weight_tying: bool,
 ) -> Box<dyn ComputeBackend> {
-    #[cfg(target_os = "macos")]
-    if use_metal {
-        let mut backend = MetalF32Backend::new().unwrap_or_else(|e| {
-            eprintln!("Error: Metal backend unavailable: {e}");
-            std::process::exit(1);
-        });
-        println!("Metal GPU backend: {}", backend.device_name());
-        backend.set_global_tensors(embedding, final_norm, output_proj);
-        if matches!(output_proj_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) && !output_proj_raw.is_empty() {
-            println!("  output_proj: {:?} ({} bytes, ~{:.1} MB)",
-                output_proj_quant, output_proj_raw.len(), output_proj_raw.len() as f64 / 1048576.0);
-            backend.set_output_proj_q8(output_proj_raw, output_proj_quant);
+    // Construct the concrete backend and box it. All subsequent setup goes
+    // through the ComputeBackend trait, keeping the logic backend-agnostic.
+    #[allow(unused_mut)]
+    let mut backend: Box<dyn ComputeBackend> = {
+        #[cfg(target_os = "macos")]
+        if use_metal {
+            let metal = MetalF32Backend::new().unwrap_or_else(|e| {
+                eprintln!("Error: Metal backend unavailable: {e}");
+                std::process::exit(1);
+            });
+            println!("Metal GPU backend: {}", metal.device_name());
+            Box::new(metal)
+        } else if use_simd {
+            Box::new(SimdF32Backend::with_threads(threads))
+        } else {
+            Box::new(NaiveF32Backend::new())
         }
-        if matches!(embedding_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) && !embedding_raw.is_empty() {
-            println!("  embedding: {:?} ({} bytes, ~{:.1} MB)",
-                embedding_quant, embedding_raw.len(), embedding_raw.len() as f64 / 1048576.0);
-            backend.set_embedding_raw(embedding_raw, embedding_quant);
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            if use_metal {
+                eprintln!("Error: --metal is only supported on macOS");
+                std::process::exit(1);
+            }
+            if use_simd {
+                Box::new(SimdF32Backend::with_threads(threads))
+            } else {
+                Box::new(NaiveF32Backend::new())
+            }
         }
-        if weight_tying {
-            println!("  weight_tying: output_proj shares embedding storage");
-            backend.set_weight_tying(true);
-        }
-        backend.init(hyperparams).unwrap_or_else(|e| {
-            eprintln!("Error: Metal initialization failed: {e}");
-            std::process::exit(1);
-        });
-        if profile { backend.set_profile(true); }
-        return Box::new(backend);
+    };
+
+    // Backend-agnostic setup via trait methods.
+    backend.set_global_tensors(embedding, final_norm, output_proj);
+
+    if matches!(output_proj_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) && !output_proj_raw.is_empty() {
+        println!("  output_proj: {:?} ({} bytes, ~{:.1} MB)",
+            output_proj_quant, output_proj_raw.len(), output_proj_raw.len() as f64 / 1048576.0);
+        backend.set_output_proj_raw(output_proj_raw, output_proj_quant);
+    }
+    if matches!(embedding_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) && !embedding_raw.is_empty() {
+        println!("  embedding: {:?} ({} bytes, ~{:.1} MB)",
+            embedding_quant, embedding_raw.len(), embedding_raw.len() as f64 / 1048576.0);
+        backend.set_embedding_raw(embedding_raw, embedding_quant);
+    }
+    if weight_tying {
+        println!("  weight_tying: output_proj shares embedding storage");
+        backend.set_weight_tying(true);
     }
 
-    #[cfg(not(target_os = "macos"))]
-    if use_metal {
-        eprintln!("Error: --metal is only supported on macOS");
+    backend.init(hyperparams).unwrap_or_else(|e| {
+        eprintln!("Error: backend initialization failed: {e}");
         std::process::exit(1);
-    }
+    });
+    if profile { backend.set_profile(true); }
 
-    if use_simd {
-        let mut backend = SimdF32Backend::with_threads(threads);
-        backend.set_global_tensors(embedding, final_norm, output_proj);
-        backend.init(hyperparams).unwrap();
-        if profile { backend.set_profile(true); }
-        Box::new(backend)
-    } else {
-        let mut backend = NaiveF32Backend::new();
-        backend.set_global_tensors(embedding, final_norm, output_proj);
-        backend.init(hyperparams).unwrap();
-        if profile { backend.set_profile(true); }
-        Box::new(backend)
-    }
+    backend
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -689,10 +700,10 @@ fn run_with_async(
 
     let engine = InferenceEngine::new(config, provider.lbc().header.hyperparams);
     run_engine(
-        &engine, &provider, backend.as_ref(), use_accelerate, use_metal,
+        &engine, &provider, backend.as_ref(), use_accelerate,
         &provider.lbc().header.hyperparams,
-        &provider.embedding, &provider.final_norm, &provider.output_proj,
-        prompt_tokens, stop, sampling, profile,
+        &provider.embedding, &provider.final_norm,
+        prompt_tokens, stop, sampling,
     );
 }
 
@@ -743,10 +754,10 @@ fn run_with_sync(
 
     let engine = InferenceEngine::new(config, provider.lbc().header.hyperparams);
     run_engine(
-        &engine, &provider, backend.as_ref(), use_accelerate, use_metal,
+        &engine, &provider, backend.as_ref(), use_accelerate,
         &provider.lbc().header.hyperparams,
-        &provider.embedding, &provider.final_norm, &provider.output_proj,
-        prompt_tokens, stop, sampling, profile,
+        &provider.embedding, &provider.final_norm,
+        prompt_tokens, stop, sampling,
     );
 }
 
@@ -814,7 +825,7 @@ fn run_with_mmap(
         if matches!(provider.output_proj_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) && !provider.output_proj_raw.is_empty() {
             println!("  output_proj: {:?} ({} bytes, ~{:.1} MB)",
                 provider.output_proj_quant, provider.output_proj_raw.len(), provider.output_proj_raw.len() as f64 / 1048576.0);
-            metal.set_output_proj_q8(provider.output_proj_raw.clone(), provider.output_proj_quant);
+            metal.set_output_proj_raw(provider.output_proj_raw.clone(), provider.output_proj_quant);
         }
         if matches!(provider.embedding_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) && !provider.embedding_raw.is_empty() {
             println!("  embedding: {:?} ({} bytes, ~{:.1} MB)",
@@ -876,7 +887,7 @@ fn run_with_mmap(
             });
         }
 
-        match engine.generate_with_metal_prefill(prompt_tokens, &provider, &metal, stop, sampling) {
+        match engine.generate(prompt_tokens, &provider, &metal as &dyn ComputeBackend, stop, sampling) {
             Ok(result) => {
                 println!("Generated tokens: {:?}", result.tokens);
                 println!("\n--- Metrics ---");
@@ -946,10 +957,10 @@ fn run_with_mmap(
     );
 
     run_engine(
-        &engine, &provider, backend.as_ref(), use_accelerate, use_metal,
+        &engine, &provider, backend.as_ref(), use_accelerate,
         &hyperparams_capped,
-        &provider.embedding, &provider.final_norm, &provider.output_proj,
-        prompt_tokens, stop, sampling, profile,
+        &provider.embedding, &provider.final_norm,
+        prompt_tokens, stop, sampling,
     );
 }
 
@@ -961,19 +972,14 @@ fn run_engine(
     #[allow(unused_variables)]
     use_accelerate: bool,
     #[allow(unused_variables)]
-    use_metal: bool,
-    #[allow(unused_variables)]
     hyperparams: &lumen_format::hyperparams::ModelHyperparams,
     #[allow(unused_variables)]
     embedding: &[f32],
     #[allow(unused_variables)]
     final_norm: &[f32],
-    #[allow(unused_variables)]
-    output_proj: &[f32],
     prompt_tokens: &[u32],
     stop: &StopCondition,
     sampling: &SamplingParams,
-    _profile: bool,
 ) {
     println!("Prompt tokens: {prompt_tokens:?}");
 

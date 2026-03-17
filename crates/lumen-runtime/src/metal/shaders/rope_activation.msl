@@ -1,0 +1,107 @@
+// rope: Rotary Position Embeddings
+//
+// Applies rotation to interleaved (even, odd) pairs:
+//   new_even = even * cos - odd * sin
+//   new_odd  = even * sin + odd * cos
+// ============================================================================
+
+kernel void rope(
+    device float*       vec          [[buffer(0)]],
+    device const float* cos_table    [[buffer(1)]],
+    device const float* sin_table    [[buffer(2)]],
+    constant uint&      num_heads    [[buffer(3)]],
+    constant uint&      head_dim     [[buffer(4)]],
+    constant uint&      half_dim     [[buffer(5)]],
+    constant uint&      pos_offset   [[buffer(6)]],
+    uint gid                         [[thread_position_in_grid]])
+{
+    // gid ranges over total_half_elements = num_heads * half_dim
+    uint head = gid / half_dim;
+    uint i    = gid % half_dim;
+
+    if (head >= num_heads) return;
+
+    uint idx0 = head * head_dim + 2 * i;
+    uint idx1 = idx0 + 1;
+
+    float v0 = vec[idx0];
+    float v1 = vec[idx1];
+
+    uint cos_idx = pos_offset + i;
+    float c = cos_table[cos_idx];
+    float s = sin_table[cos_idx];
+
+    vec[idx0] = v0 * c - v1 * s;
+    vec[idx1] = v0 * s + v1 * c;
+}
+
+// ============================================================================
+// rope_neox: NeoX-style Rotary Position Embeddings
+//
+// Pairs dimensions as (i, i + half_dim) instead of (2*i, 2*i+1):
+//   x0 = vec[head*head_dim + i]
+//   x1 = vec[head*head_dim + i + half_dim]
+//   new_x0 = x0 * cos - x1 * sin
+//   new_x1 = x0 * sin + x1 * cos
+//
+// Used by Qwen3.5 (IMROPE) and other NeoX-family models.
+// ============================================================================
+
+kernel void rope_neox(
+    device float*       vec          [[buffer(0)]],
+    device const float* cos_table    [[buffer(1)]],
+    device const float* sin_table    [[buffer(2)]],
+    constant uint&      num_heads    [[buffer(3)]],
+    constant uint&      head_dim     [[buffer(4)]],
+    constant uint&      half_dim     [[buffer(5)]],
+    constant uint&      pos_offset   [[buffer(6)]],
+    uint gid                         [[thread_position_in_grid]])
+{
+    // gid ranges over total_half_elements = num_heads * half_dim
+    uint head = gid / half_dim;
+    uint i    = gid % half_dim;
+
+    if (head >= num_heads) return;
+
+    uint base = head * head_dim;
+    uint idx0 = base + i;            // first half: [0, half_dim)
+    uint idx1 = base + i + half_dim; // second half: [half_dim, 2*half_dim)
+
+    float v0 = vec[idx0];
+    float v1 = vec[idx1];
+
+    uint cos_idx = pos_offset + i;
+    float c = cos_table[cos_idx];
+    float s = sin_table[cos_idx];
+
+    vec[idx0] = v0 * c - v1 * s;
+    vec[idx1] = v0 * s + v1 * c;
+}
+
+// ============================================================================
+// swiglu: Fused SiLU(gate) * up
+//
+// gate[i] = silu(gate[i]) * up[i]
+// silu(x) = x / (1 + exp(-x))
+// ============================================================================
+
+kernel void swiglu(
+    device float*       gate [[buffer(0)]],
+    device const float* up   [[buffer(1)]],
+    constant uint&      dim  [[buffer(2)]],
+    uint gid                 [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+    float g = gate[gid];
+    float sigmoid = 1.0f / (1.0f + exp(-g));
+    gate[gid] = g * sigmoid * up[gid];
+}
+
+// ============================================================================
+// softmax: Softmax with max-subtraction (best practice 4.1)
+//
+// Three-phase approach using threadgroup reduction:
+// 1. Find max
+// 2. Subtract max, exp, sum
+// 3. Normalize
+// ============================================================================

@@ -1,0 +1,385 @@
+// ============================================================================
+// ============================================================================
+// dequant_matmul_q8_0_2sg: MLX-style 2-SG independent row ownership matvec
+//
+// Key insight from MLX: Instead of 4 SGs cooperatively computing the SAME rows
+// (requiring cross-SG reduction via shmem + 2 barriers), use 2 SGs where each
+// SG independently owns 4 output rows. Zero threadgroup barriers. Zero shared
+// memory for reduction.
+//
+// Thread mapping (same as deferred pattern):
+//   ix = tiisg / 4  -> 0..7 (which of 8 blocks in the stride)
+//   il = tiisg % 4  -> 0..3 (which sub-chunk of 8 within the 32-element block)
+//   4 threads collectively process one 32-element Q8_0 block (4 x 8 = 32)
+//
+// Each SG independently processes ALL blocks for its 4 rows.
+// Stride = NQ = 8 blocks per outer iteration (each SG is self-contained).
+//
+// Dispatch: threadgroups = ceil(out_dim/8), threads_per_threadgroup = 64
+// Threadgroup memory: ZERO
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_2sg(
+    device const uchar* weights [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 4;          // rows per simdgroup
+    const uint NQ = 8;          // elements per thread per iteration
+    const uint NW = 32;         // SIMD width
+    const uint Q8_BLOCK_SIZE = 34; // 2 bytes scale (f16) + 32 bytes data (int8)
+
+    const uint nb = in_dim >> 5;   // number of Q8_0 blocks per row = in_dim / 32
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    // Each SG owns 4 rows: SG 0 -> rows 0-3, SG 1 -> rows 4-7
+    const uint r0 = tgpig * 8 + sgitg * NR;
+
+    // Thread mapping within SIMD group (same as deferred)
+    const uint ix = tiisg / (NW / NQ);  // = tiisg / 4 -> 0..7 (block index in stride)
+    const uint il = tiisg % (NW / NQ);  // = tiisg % 4 -> 0..3 (sub-chunk index)
+
+    const uint ib0 = ix;               // starting block (no SG offset, each SG independent)
+
+    // Pointers to weight rows
+    device const uchar* ax[NR];
+    for (uint row = 0; row < NR; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR] = { 0.f, 0.f, 0.f, 0.f };
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+
+    // Main loop: each SG independently processes all blocks for its 4 rows
+    // Stride = NQ = 8 blocks per iteration (single SG, not NSG*NQ)
+    for (uint ib = ib0; ib < nb; ib += NQ) {
+        // Load 8 x-values into registers
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        // Process all NR rows with these x-values
+        for (uint row = 0; row < NR; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            // Point to this block in the weight row
+            device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb += NQ * 32;
+    }
+
+    // Final reduction: just simd_sum, NO cross-SG reduction needed
+    for (uint row = 0; row < NR && r0 + row < out_dim; ++row) {
+        sumf[row] = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            out[r0 + row] = sumf[row];
+        }
+    }
+}
+
+// ============================================================================
+// dequant_matmul_q8_0_2sg_residual: MLX-style 2-SG matvec + residual add
+// out[row] = dot(w_q8_row, x) + residual[row]
+// Same 2-SG independent ownership pattern, with fused residual addition.
+//
+// Dispatch: threadgroups = ceil(out_dim/8), threads_per_threadgroup = 64
+// Threadgroup memory: ZERO
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_2sg_residual(
+    device const uchar* weights   [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device float*       out       [[buffer(2)]],
+    constant uint&      in_dim    [[buffer(3)]],
+    device const float* residual  [[buffer(4)]],
+    constant uint&      out_dim   [[buffer(5)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q8_BLOCK_SIZE = 34;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * 8 + sgitg * NR;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = ix;
+
+    device const uchar* ax[NR];
+    for (uint row = 0; row < NR; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR] = { 0.f, 0.f, 0.f, 0.f };
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+
+    for (uint ib = ib0; ib < nb; ib += NQ) {
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (uint row = 0; row < NR; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb += NQ * 32;
+    }
+
+    // Final reduction: just simd_sum + residual add, NO cross-SG reduction
+    for (uint row = 0; row < NR && r0 + row < out_dim; ++row) {
+        sumf[row] = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            out[r0 + row] = sumf[row] + residual[r0 + row];
+        }
+    }
+}
+
+// ============================================================================
+// ffn_fused_gate_up_swiglu_q8_0_2sg: MLX-style 2-SG fused Gate+Up+SwiGLU
+//
+// Same 2-SG independent ownership but fuses gate+up+SwiGLU:
+// Each SG owns 4 output rows. For each row, compute both gate and up dot
+// products, then apply SwiGLU = silu(gate) * up.
+//
+// 64 threads (2 SGs), 8 output rows per TG.
+// Zero threadgroup barriers. Zero shared memory for reduction.
+//
+// Dispatch: threadgroups = ceil(inter_dim/8), threads_per_threadgroup = 64
+// ============================================================================
+
+kernel void ffn_fused_gate_up_swiglu_q8_0_2sg(
+    device const uchar* w_gate_q8   [[buffer(0)]],   // gate weights Q8_0 [inter_dim, hidden_dim]
+    device const float* x           [[buffer(1)]],   // normed input [hidden_dim]
+    device float*       out         [[buffer(2)]],   // output [inter_dim] (SwiGLU result)
+    constant uint&      in_dim      [[buffer(3)]],   // hidden_dim
+    constant uint&      out_dim     [[buffer(4)]],   // inter_dim
+    device const uchar* w_up_q8     [[buffer(5)]],   // up weights Q8_0 [inter_dim, hidden_dim]
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 4;          // rows per simdgroup
+    const uint NQ = 8;          // elements per thread per iteration
+    const uint NW = 32;         // SIMD width
+    const uint Q8_BLOCK_SIZE = 34;
+
+    const uint nb = in_dim >> 5;   // number of Q8_0 blocks per row
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * 8 + sgitg * NR;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = ix;
+
+    float gate_sum[NR] = { 0.f, 0.f, 0.f, 0.f };
+    float up_sum[NR]   = { 0.f, 0.f, 0.f, 0.f };
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+
+    for (uint ib = ib0; ib < nb; ib += NQ) {
+        // Load 8 x-values into registers (shared between gate and up)
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (uint row = 0; row < NR; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            uint global_row = r0 + row;
+
+            // Gate weights
+            device const uchar* gate_bp = w_gate_q8 + global_row * row_bytes + ib * Q8_BLOCK_SIZE;
+            float gate_scale = float(as_type<half>(*(device const ushort*)gate_bp));
+            device const char* gate_qs = (device const char*)(gate_bp + 2) + il * NQ;
+
+            // Up weights
+            device const uchar* up_bp = w_up_q8 + global_row * row_bytes + ib * Q8_BLOCK_SIZE;
+            float up_scale = float(as_type<half>(*(device const ushort*)up_bp));
+            device const char* up_qs = (device const char*)(up_bp + 2) + il * NQ;
+
+            float gate_dot = 0.f;
+            float up_dot   = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                float xi = yl[i];
+                gate_dot += float(gate_qs[i]) * xi;
+                up_dot   += float(up_qs[i])   * xi;
+            }
+            gate_sum[row] += gate_dot * gate_scale;
+            up_sum[row]   += up_dot   * up_scale;
+        }
+
+        yb += NQ * 32;
+    }
+
+    // Final reduction: simd_sum + SwiGLU, NO cross-SG reduction
+    for (uint row = 0; row < NR && r0 + row < out_dim; ++row) {
+        float g = simd_sum(gate_sum[row]);
+        float u = simd_sum(up_sum[row]);
+        if (tiisg == 0) {
+            float sigmoid = 1.0f / (1.0f + exp(-g));
+            out[r0 + row] = g * sigmoid * u;
+        }
+    }
+}
+
+// ============================================================================
+// dequant_matmul_q8_0_8row: 8-row Q8_0 matmul (8 rows per threadgroup)
+//
+// Processes 8 output rows per threadgroup using 8 SIMD groups (256 threads).
+// Maximal x-vector reuse: 8x less x-bandwidth vs single-row dispatch.
+//
+// Dispatch: threadgroups = ceil(out_dim/8), threads_per_threadgroup = 256
+// SIMD group 0..7 -> rows 8*gid+0 .. 8*gid+7
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_8row(
+    device const uchar* w_q8    [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    uint row_group              [[threadgroup_position_in_grid]],
+    uint lane                   [[thread_index_in_simdgroup]],
+    uint sg                     [[simdgroup_index_in_threadgroup]])
+{
+    uint row = row_group * 8 + sg;
+    if (row >= out_dim) return;
+
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = in_dim >> 5;
+    uint row_bytes = num_blocks * Q8_BLOCK_SIZE;
+    device const uchar* row_ptr = w_q8 + row * row_bytes;
+
+    float sum = 0.0f;
+
+    uint b = 0;
+    for (; b + 3 < num_blocks; b += 4) {
+        device const uchar* bp0 = row_ptr + b * Q8_BLOCK_SIZE;
+        device const uchar* bp1 = bp0 + Q8_BLOCK_SIZE;
+        device const uchar* bp2 = bp1 + Q8_BLOCK_SIZE;
+        device const uchar* bp3 = bp2 + Q8_BLOCK_SIZE;
+        half s0 = as_type<half>(*(device const ushort*)bp0);
+        half s1 = as_type<half>(*(device const ushort*)bp1);
+        half s2 = as_type<half>(*(device const ushort*)bp2);
+        half s3 = as_type<half>(*(device const ushort*)bp3);
+        float v0 = float(((device const char*)(bp0 + 2))[lane]) * x[(b << 5) + lane];
+        float v1 = float(((device const char*)(bp1 + 2))[lane]) * x[((b+1) << 5) + lane];
+        float v2 = float(((device const char*)(bp2 + 2))[lane]) * x[((b+2) << 5) + lane];
+        float v3 = float(((device const char*)(bp3 + 2))[lane]) * x[((b+3) << 5) + lane];
+        sum += float(s0) * simd_sum(v0) + float(s1) * simd_sum(v1)
+             + float(s2) * simd_sum(v2) + float(s3) * simd_sum(v3);
+    }
+    for (; b < num_blocks; b++) {
+        device const uchar* bp = row_ptr + b * Q8_BLOCK_SIZE;
+        half scale = as_type<half>(*(device const ushort*)bp);
+        float val = float(((device const char*)(bp + 2))[lane]) * x[(b << 5) + lane];
+        sum += float(scale) * simd_sum(val);
+    }
+
+    if (lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
+// dequant_matmul_q8_0_residual_8row: 8-row Q8_0 matmul + residual add
+// out[row] = dot(w_q8_row, x) + residual[row]
+// Same 8-row strategy: 8 rows per threadgroup, 8 SIMD groups (256 threads).
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_residual_8row(
+    device const uchar* w_q8      [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device float*       out       [[buffer(2)]],
+    constant uint&      in_dim    [[buffer(3)]],
+    device const float* residual  [[buffer(4)]],
+    constant uint&      out_dim   [[buffer(5)]],
+    uint row_group                [[threadgroup_position_in_grid]],
+    uint lane                     [[thread_index_in_simdgroup]],
+    uint sg                       [[simdgroup_index_in_threadgroup]])
+{
+    uint row = row_group * 8 + sg;
+    if (row >= out_dim) return;
+
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = in_dim >> 5;
+    device const uchar* row_ptr = w_q8 + row * num_blocks * Q8_BLOCK_SIZE;
+
+    float sum = 0.0f;
+    uint b = 0;
+    for (; b + 3 < num_blocks; b += 4) {
+        device const uchar* bp0 = row_ptr + b * Q8_BLOCK_SIZE;
+        device const uchar* bp1 = bp0 + Q8_BLOCK_SIZE;
+        device const uchar* bp2 = bp1 + Q8_BLOCK_SIZE;
+        device const uchar* bp3 = bp2 + Q8_BLOCK_SIZE;
+        half s0 = as_type<half>(*(device const ushort*)bp0);
+        half s1 = as_type<half>(*(device const ushort*)bp1);
+        half s2 = as_type<half>(*(device const ushort*)bp2);
+        half s3 = as_type<half>(*(device const ushort*)bp3);
+        float v0 = float(((device const char*)(bp0 + 2))[lane]) * x[(b << 5) + lane];
+        float v1 = float(((device const char*)(bp1 + 2))[lane]) * x[((b+1) << 5) + lane];
+        float v2 = float(((device const char*)(bp2 + 2))[lane]) * x[((b+2) << 5) + lane];
+        float v3 = float(((device const char*)(bp3 + 2))[lane]) * x[((b+3) << 5) + lane];
+        sum += float(s0) * simd_sum(v0) + float(s1) * simd_sum(v1)
+             + float(s2) * simd_sum(v2) + float(s3) * simd_sum(v3);
+    }
+    for (; b < num_blocks; b++) {
+        device const uchar* bp = row_ptr + b * Q8_BLOCK_SIZE;
+        half scale = as_type<half>(*(device const ushort*)bp);
+        float val = float(((device const char*)(bp + 2))[lane]) * x[(b << 5) + lane];
+        sum += float(scale) * simd_sum(val);
+    }
+
+    if (lane == 0) {
+        out[row] = sum + residual[row];
+    }
+}
+
+// ============================================================================

@@ -1,6 +1,6 @@
 //! SIMD-accelerated F32 compute backend.
 //!
-//! Mirrors `compute_naive::NaiveF32Backend` exactly, substituting SIMD kernel
+//! Mirrors `cpu_naive::NaiveF32Backend` exactly, substituting SIMD kernel
 //! calls for the scalar math operations. Must produce identical output to the
 //! naive backend (verified by e2e tests in Task #3).
 //!
@@ -591,7 +591,14 @@ impl SimdF32Backend {
         }
     }
 
-    pub fn set_global_tensors(
+    /// Returns the total thread count (workers + caller thread).
+    pub fn thread_count(&self) -> usize {
+        self.pool.total_threads()
+    }
+}
+
+impl ComputeBackend for SimdF32Backend {
+    fn set_global_tensors(
         &mut self,
         embedding: Vec<f32>,
         final_norm: Vec<f32>,
@@ -602,13 +609,6 @@ impl SimdF32Backend {
         self.output_proj = output_proj;
     }
 
-    /// Returns the total thread count (workers + caller thread).
-    pub fn thread_count(&self) -> usize {
-        self.pool.total_threads()
-    }
-}
-
-impl ComputeBackend for SimdF32Backend {
     fn init(&mut self, hyperparams: &ModelHyperparams) -> Result<(), RuntimeError> {
         self.hyperparams = Some(*hyperparams);
         self.cached_hidden_dim = hyperparams.hidden_dim as usize;

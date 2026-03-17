@@ -308,11 +308,25 @@ impl InferenceEngine {
         }
     }
 
-    /// Run the token generation loop.
+    /// Run the unified token generation loop.
     ///
-    /// This is the core algorithm from Section 4. It processes each layer
-    /// sequentially, using the weight provider to ensure weights are
-    /// available (with prefetch) and the compute backend for execution.
+    /// Dispatches prefill and decode via `backend.caps()`:
+    ///
+    /// - **Prefill**: If `caps.batched_prefill`, uses `backend.prefill()` (GPU
+    ///   batched GEMM). Otherwise, processes tokens one at a time through
+    ///   `forward_pass()` + `kv.advance_seq_len()`.
+    ///
+    /// - **Decode**: Three paths, selected by capability flags:
+    ///   1. `gpu_resident && gpu_argmax && temperature <= 0.0`: greedy GPU decode
+    ///      via `backend.decode_token_greedy()` (4-byte readback per token).
+    ///   2. `gpu_resident`: GPU decode via `backend.decode_token()` (logits
+    ///      readback + CPU sampling).
+    ///   3. Fallback: per-layer `forward_pass()` + `compute_final()` + CPU
+    ///      sampling.
+    ///
+    /// All three trait methods (`prefill`, `decode_token`, `decode_token_greedy`)
+    /// advance `kv.seq_len()` internally. The fallback `forward_pass()` path
+    /// requires the caller to call `kv.advance_seq_len()`.
     pub fn generate(
         &self,
         prompt_tokens: &[u32],
@@ -326,6 +340,7 @@ impl InferenceEngine {
             return Err(RuntimeError::Config("model has 0 layers".into()));
         }
         let total_start = Instant::now();
+        let caps = backend.caps();
 
         // Initialize RNG once for the entire generation session (C-1 fix).
         let mut rng = Xorshift64::new(sampling.seed.unwrap_or(42));
@@ -356,48 +371,84 @@ impl InferenceEngine {
             Vec::new()
         };
 
-        // Prefill: process all prompt tokens through the model.
-        let prefill_start = Instant::now();
-        let mut x: Option<ActivationBuffer> = None;
+        // Reset GDN recurrent state for this new sequence (h_state, conv_state).
+        // No-op for non-GDN backends.
+        backend.reset_recurrent_state();
 
-        for &token_id in prompt_tokens {
-            x = Some(self.forward_pass(
-                token_id,
-                num_layers,
-                weights,
-                backend,
-                &mut kv,
-                &mut per_layer_timings,
-            )?);
-            kv.advance_seq_len()?;
-        }
+        // ---- Prefill ----
+        let prefill_start = Instant::now();
+
+        let mut logits = if caps.batched_prefill {
+            // Batched prefill: single GPU dispatch for all prompt tokens.
+            // prefill() advances kv.seq_len() internally -- do NOT advance here.
+            let last_hidden = backend.prefill(prompt_tokens, weights, &mut kv)?;
+            let mut current_x = ActivationBuffer::zeros(last_hidden.len(), ComputeDtype::F32);
+            current_x.write_f32_from(&last_hidden);
+            backend.compute_final(&current_x)?
+        } else {
+            // Token-at-a-time prefill: forward_pass() does NOT advance kv.seq_len(),
+            // so we advance after each token.
+            let mut x: Option<ActivationBuffer> = None;
+            for &token_id in prompt_tokens {
+                x = Some(self.forward_pass(
+                    token_id,
+                    num_layers,
+                    weights,
+                    backend,
+                    &mut kv,
+                    &mut per_layer_timings,
+                )?);
+                kv.advance_seq_len()?;
+            }
+            let current_x = x.ok_or_else(|| {
+                RuntimeError::Compute("empty prompt: no tokens to process".to_string())
+            })?;
+            backend.compute_final(&current_x)?
+        };
 
         let prefill_time = prefill_start.elapsed();
 
-        // Decode: generate tokens one at a time.
+        // ---- Decode: generate tokens one at a time ----
         let decode_start = Instant::now();
 
-        let mut current_x = x.ok_or_else(|| {
-            RuntimeError::Compute("empty prompt: no tokens to process".to_string())
-        })?;
-        let mut logits = backend.compute_final(&current_x)?;
         let mut next_token = sample_token(&mut logits, sampling, &mut rng);
         generated_tokens.push(next_token);
 
-        while !stop.should_stop(next_token, generated_tokens.len()) {
-            current_x = self.forward_pass(
-                next_token,
-                num_layers,
-                weights,
-                backend,
-                &mut kv,
-                &mut per_layer_timings,
-            )?;
-            kv.advance_seq_len()?;
+        let use_gpu_greedy = caps.gpu_resident && caps.gpu_argmax && sampling.temperature <= 0.0;
 
-            logits = backend.compute_final(&current_x)?;
-            next_token = sample_token(&mut logits, sampling, &mut rng);
-            generated_tokens.push(next_token);
+        if use_gpu_greedy {
+            // GPU-RESIDENT GREEDY fast path: argmax on GPU, 4-byte readback.
+            // decode_token_greedy() advances kv.seq_len() internally.
+            while !stop.should_stop(next_token, generated_tokens.len()) {
+                next_token = backend.decode_token_greedy(next_token, weights, &mut kv)?;
+                generated_tokens.push(next_token);
+            }
+        } else if caps.gpu_resident {
+            // GPU-RESIDENT fast path: single command buffer per token.
+            // decode_token() advances kv.seq_len() internally.
+            while !stop.should_stop(next_token, generated_tokens.len()) {
+                logits = backend.decode_token(next_token, weights, &mut kv)?;
+                next_token = sample_token(&mut logits, sampling, &mut rng);
+                generated_tokens.push(next_token);
+            }
+        } else {
+            // Streaming/CPU path: per-layer forward_pass + compute_final.
+            // forward_pass() does NOT advance kv.seq_len() -- we advance here.
+            while !stop.should_stop(next_token, generated_tokens.len()) {
+                let x = self.forward_pass(
+                    next_token,
+                    num_layers,
+                    weights,
+                    backend,
+                    &mut kv,
+                    &mut per_layer_timings,
+                )?;
+                kv.advance_seq_len()?;
+
+                logits = backend.compute_final(&x)?;
+                next_token = sample_token(&mut logits, sampling, &mut rng);
+                generated_tokens.push(next_token);
+            }
         }
 
         let decode_time = decode_start.elapsed();
@@ -528,163 +579,6 @@ impl InferenceEngine {
             logits = backend.compute_final(&current_x)?;
             next_token = sample_token(&mut logits, sampling, &mut rng);
             generated_tokens.push(next_token);
-        }
-
-        let decode_time = decode_start.elapsed();
-        let total_time = total_start.elapsed();
-
-        let io = match weights.io_snapshot() {
-            Some(snap) => IoMetrics {
-                bytes_read: snap.bytes_read,
-                read_ops: snap.read_ops,
-                duration: total_time,
-                ..Default::default()
-            },
-            None => IoMetrics {
-                duration: total_time,
-                ..Default::default()
-            },
-        };
-
-        let metrics = InferenceMetrics {
-            prompt_tokens: prompt_tokens.len(),
-            generated_tokens: generated_tokens.len(),
-            prefill_tokens_per_sec: if prefill_time.is_zero() {
-                0.0
-            } else {
-                prompt_tokens.len() as f64 / prefill_time.as_secs_f64()
-            },
-            decode_tokens_per_sec: if decode_time.is_zero() {
-                0.0
-            } else {
-                generated_tokens.len() as f64 / decode_time.as_secs_f64()
-            },
-            tpot_ms: if generated_tokens.is_empty() {
-                0.0
-            } else {
-                decode_time.as_secs_f64() * 1000.0 / generated_tokens.len() as f64
-            },
-            total_time,
-            prefill_time,
-            decode_time,
-            io,
-            weight_cache_hit_rate: weights.stats().hit_rate(),
-            per_layer_timings,
-            ..Default::default()
-        };
-
-        Ok(GenerationResult {
-            tokens: generated_tokens,
-            metrics,
-        })
-    }
-
-    /// Run token generation with Metal GPU batched prefill.
-    ///
-    /// Uses `MetalF32Backend::prefill` for GPU-accelerated batched prefill
-    /// (matrix-matrix GEMM on Metal), then continues with the Metal single-token
-    /// decode path for autoregressive generation.
-    #[cfg(target_os = "macos")]
-    pub fn generate_with_metal_prefill(
-        &self,
-        prompt_tokens: &[u32],
-        weights: &dyn WeightProvider,
-        metal: &crate::metal::MetalF32Backend,
-        stop: &StopCondition,
-        sampling: &SamplingParams,
-    ) -> Result<GenerationResult, RuntimeError> {
-        let num_layers = self.hyperparams.num_layers as usize;
-        if num_layers == 0 {
-            return Err(RuntimeError::Config("model has 0 layers".into()));
-        }
-        let total_start = Instant::now();
-
-        let mut rng = Xorshift64::new(sampling.seed.unwrap_or(42));
-
-        // Initialize KV cache.
-        let mut kv = KvCache::new(KvCacheConfig {
-            max_seq_len: self.config.max_seq_len,
-            num_layers,
-            num_kv_heads: self.hyperparams.num_kv_heads as usize,
-            head_dim: self.hyperparams.head_dim as usize,
-            precision: self.config.kv_precision,
-        })?;
-
-        let max_expected = match stop {
-            StopCondition::MaxTokens(n) => *n,
-            StopCondition::EosTokens(_) => {
-                self.config.max_seq_len.saturating_sub(prompt_tokens.len())
-            }
-            StopCondition::MaxTokensOrEos { max_tokens, .. } => *max_tokens,
-        };
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_expected);
-        let expected_total_tokens = prompt_tokens.len() + max_expected;
-        let mut per_layer_timings: Vec<PerLayerTiming> = if self.config.collect_per_layer_timings {
-            Vec::with_capacity(num_layers * expected_total_tokens)
-        } else {
-            Vec::new()
-        };
-
-        // Reset GDN recurrent state for this new sequence (h_state, conv_state).
-        metal.reset_gdn_state();
-
-        let prefill_start = Instant::now();
-        let use_single_cb = metal.is_gpu_resident();
-
-        // ---- Batched Metal prefill for ALL models (including GDN) ----
-        // encode_layer_batched dispatches GDN layers through
-        // encode_batched_gdn_prefill (which properly updates h_state and
-        // conv_state for every prompt token) and full-attention layers
-        // through the standard batched attention path.
-        let mut logits = {
-            let last_hidden = metal.prefill(prompt_tokens, weights, &mut kv)?;
-            let mut current_x = ActivationBuffer::zeros(last_hidden.len(), ComputeDtype::F32);
-            current_x.write_f32_from(&last_hidden);
-            metal.compute_final(&current_x)?
-        };
-
-        let prefill_time = prefill_start.elapsed();
-
-        // ---- Decode: generate tokens one at a time via Metal single-token path ----
-        let decode_start = Instant::now();
-
-        let mut next_token = sample_token(&mut logits, sampling, &mut rng);
-        generated_tokens.push(next_token);
-
-        let use_gpu_argmax = use_single_cb && sampling.temperature <= 0.0;
-
-        if use_single_cb && use_gpu_argmax {
-            // GPU-RESIDENT GREEDY fast path: argmax on GPU, 4-byte readback.
-            // embed + all layers + final projection + argmax in ONE CB.
-            while !stop.should_stop(next_token, generated_tokens.len()) {
-                next_token = metal.decode_token_greedy(next_token, weights, &mut kv)?;
-                generated_tokens.push(next_token);
-            }
-        } else if use_single_cb {
-            // GPU-RESIDENT fast path: single command buffer per token.
-            // embed + all layers + final projection in ONE CB, ONE mutex lock.
-            while !stop.should_stop(next_token, generated_tokens.len()) {
-                logits = metal.decode_token_single_cb(next_token, weights, &mut kv)?;
-                next_token = sample_token(&mut logits, sampling, &mut rng);
-                generated_tokens.push(next_token);
-            }
-        } else {
-            // Streaming path: per-layer command buffers (unchanged).
-            while !stop.should_stop(next_token, generated_tokens.len()) {
-                let x = self.forward_pass(
-                    next_token,
-                    num_layers,
-                    weights,
-                    metal,
-                    &mut kv,
-                    &mut per_layer_timings,
-                )?;
-                kv.advance_seq_len()?;
-
-                logits = metal.compute_final(&x)?;
-                next_token = sample_token(&mut logits, sampling, &mut rng);
-                generated_tokens.push(next_token);
-            }
         }
 
         let decode_time = decode_start.elapsed();

@@ -1,0 +1,1677 @@
+kernel void moe_router_softmax(
+    device const float* hidden_state   [[buffer(0)]],
+    device const float* gate_weight    [[buffer(1)]],
+    device uint*        expert_ids     [[buffer(2)]],
+    device float*       expert_weights [[buffer(3)]],
+    constant uint&      hidden_dim     [[buffer(4)]],
+    constant uint&      num_experts    [[buffer(5)]],
+    constant uint&      top_k          [[buffer(6)]],
+    uint tid                           [[thread_index_in_threadgroup]],
+    uint tg_size                       [[threads_per_threadgroup]],
+    uint simd_lane                     [[thread_index_in_simdgroup]],
+    uint simd_group                    [[simdgroup_index_in_threadgroup]])
+{
+    // --- Phase 1: Compute logits[e] = dot(gate_weight[e], hidden_state) ---
+    // Each expert's logit is a full dot product over hidden_dim elements.
+    // We compute all experts serially but parallelize the dot product across
+    // the threadgroup (256 threads cooperating on the reduction).
+
+    // Shared memory for intermediate logits (max 64 experts should cover all models)
+    threadgroup float logits[256]; // supports up to 256 experts (e.g. Qwen3.5-35B-A3B)
+    threadgroup float partial_sums[32]; // for simd cross-group reduction
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+
+    for (uint e = 0; e < num_experts; e++) {
+        device const float* w_row = gate_weight + e * hidden_dim;
+
+        // Each thread accumulates partial dot product for this expert
+        float sum = 0.0f;
+        for (uint j = tid; j < hidden_dim; j += tg_size) {
+            sum += w_row[j] * hidden_state[j];
+        }
+
+        // SIMD group reduction
+        sum = simd_sum(sum);
+
+        if (simd_lane == 0) {
+            partial_sums[simd_group] = sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Final reduction by first SIMD group
+        if (simd_group == 0) {
+            float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+            val = simd_sum(val);
+            if (simd_lane == 0) {
+                logits[e] = val;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // --- Phase 2: Softmax over logits (numerically stable, max-subtraction) ---
+    // Only thread 0 performs softmax and top-K since num_experts is small (e.g. 8).
+    // Parallelizing over 8 elements would waste threads.
+    if (tid == 0) {
+        // Find max logit for numerical stability
+        float max_logit = logits[0];
+        for (uint e = 1; e < num_experts; e++) {
+            max_logit = max(max_logit, logits[e]);
+        }
+
+        // Compute exp(logit - max) and sum
+        float sum_exp = 0.0f;
+        for (uint e = 0; e < num_experts; e++) {
+            float val = exp(logits[e] - max_logit);
+            logits[e] = val;
+            sum_exp += val;
+        }
+
+        // Normalize to get softmax probabilities
+        float inv_sum = 1.0f / sum_exp;
+        for (uint e = 0; e < num_experts; e++) {
+            logits[e] *= inv_sum;
+        }
+
+        // --- Phase 3: Top-K selection via repeated argmax ---
+        // For each of the K selections, find the expert with highest softmax
+        // weight, record it, then mask it out with -1 so it is not re-selected.
+        float renorm_sum = 0.0f;
+        for (uint k = 0; k < top_k; k++) {
+            float best_val = -1.0f;
+            uint best_idx = 0;
+            for (uint e = 0; e < num_experts; e++) {
+                if (logits[e] > best_val) {
+                    best_val = logits[e];
+                    best_idx = e;
+                }
+            }
+            expert_ids[k] = best_idx;
+            expert_weights[k] = best_val;
+            renorm_sum += best_val;
+            logits[best_idx] = -1.0f; // mask out selected expert
+        }
+
+        // --- Phase 4: Renormalize selected weights to sum to 1.0 ---
+        if (renorm_sum > 0.0f) {
+            float inv_renorm = 1.0f / renorm_sum;
+            for (uint k = 0; k < top_k; k++) {
+                expert_weights[k] *= inv_renorm;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// moe_router_softmax_batched: Batched version for prefill (multiple tokens).
+//
+// Each threadgroup handles one token (one batch item). The algorithm per token
+// is identical to moe_router_softmax above.
+//
+// buffer(0): hidden_states  [batch_size * hidden_dim] float
+// buffer(1): gate_weight    [num_experts * hidden_dim] float
+// buffer(2): expert_ids     [batch_size * top_k] uint32    — OUTPUT
+// buffer(3): expert_weights [batch_size * top_k] float     — OUTPUT
+// buffer(4): hidden_dim (uint)
+// buffer(5): num_experts (uint)
+// buffer(6): top_k (uint)
+// buffer(7): batch_size (uint)
+//
+// grid: (batch_size, 1, 1), threadgroup: (min(256, hidden_dim), 1, 1)
+// ============================================================================
+
+kernel void moe_router_softmax_batched(
+    device const float* hidden_states  [[buffer(0)]],
+    device const float* gate_weight    [[buffer(1)]],
+    device uint*        expert_ids     [[buffer(2)]],
+    device float*       expert_weights [[buffer(3)]],
+    constant uint&      hidden_dim     [[buffer(4)]],
+    constant uint&      num_experts    [[buffer(5)]],
+    constant uint&      top_k          [[buffer(6)]],
+    constant uint&      batch_size     [[buffer(7)]],
+    uint batch_idx                     [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_index_in_threadgroup]],
+    uint tg_size                       [[threads_per_threadgroup]],
+    uint simd_lane                     [[thread_index_in_simdgroup]],
+    uint simd_group                    [[simdgroup_index_in_threadgroup]])
+{
+    if (batch_idx >= batch_size) return;
+
+    // Pointer to this token's hidden state
+    device const float* hidden_state = hidden_states + batch_idx * hidden_dim;
+
+    // Output pointers for this token
+    device uint*  out_ids     = expert_ids     + batch_idx * top_k;
+    device float* out_weights = expert_weights + batch_idx * top_k;
+
+    // --- Phase 1: Compute logits[e] = dot(gate_weight[e], hidden_state) ---
+    threadgroup float logits[256]; // supports up to 256 experts (e.g. Qwen3.5-35B-A3B)
+    threadgroup float partial_sums[32];
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+
+    for (uint e = 0; e < num_experts; e++) {
+        device const float* w_row = gate_weight + e * hidden_dim;
+
+        float sum = 0.0f;
+        for (uint j = tid; j < hidden_dim; j += tg_size) {
+            sum += w_row[j] * hidden_state[j];
+        }
+
+        sum = simd_sum(sum);
+
+        if (simd_lane == 0) {
+            partial_sums[simd_group] = sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+            val = simd_sum(val);
+            if (simd_lane == 0) {
+                logits[e] = val;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // --- Phase 2: Softmax + Top-K (single thread, num_experts is small) ---
+    if (tid == 0) {
+        float max_logit = logits[0];
+        for (uint e = 1; e < num_experts; e++) {
+            max_logit = max(max_logit, logits[e]);
+        }
+
+        float sum_exp = 0.0f;
+        for (uint e = 0; e < num_experts; e++) {
+            float val = exp(logits[e] - max_logit);
+            logits[e] = val;
+            sum_exp += val;
+        }
+
+        float inv_sum = 1.0f / sum_exp;
+        for (uint e = 0; e < num_experts; e++) {
+            logits[e] *= inv_sum;
+        }
+
+        // --- Phase 3: Top-K selection ---
+        float renorm_sum = 0.0f;
+        for (uint k = 0; k < top_k; k++) {
+            float best_val = -1.0f;
+            uint best_idx = 0;
+            for (uint e = 0; e < num_experts; e++) {
+                if (logits[e] > best_val) {
+                    best_val = logits[e];
+                    best_idx = e;
+                }
+            }
+            out_ids[k] = best_idx;
+            out_weights[k] = best_val;
+            renorm_sum += best_val;
+            logits[best_idx] = -1.0f;
+        }
+
+        // --- Phase 4: Renormalize ---
+        if (renorm_sum > 0.0f) {
+            float inv_renorm = 1.0f / renorm_sum;
+            for (uint k = 0; k < top_k; k++) {
+                out_weights[k] *= inv_renorm;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// moe_expert_accum: Weighted accumulation of top-K expert outputs + residual.
+//
+// After running each selected expert's FFN, this kernel combines the outputs
+// using the routing weights and adds the residual connection:
+//   output[t] = residual[t] + sum_k(expert_weights[k] * expert_outputs[expert_ids[k] * hidden_dim + t])
+//
+// The expert_outputs buffer contains ALL num_experts expert outputs at slots
+// 0..num_experts (layout: [num_experts, hidden_dim]). The router selects
+// top_k of them; expert_ids[k] gives the slot index for selection k.
+//
+// Purely elementwise -- no threadgroup memory required.
+//
+// buffer(0): expert_outputs  [num_experts * hidden_dim] float — all expert outputs
+// buffer(1): expert_weights  [top_k] float                   — routing weights (sum to 1)
+// buffer(2): expert_ids      [top_k] uint32                  — selected expert slot indices
+// buffer(3): output          [hidden_dim] float               — OUTPUT: accumulated result
+// buffer(4): residual        [hidden_dim] float               — residual to add
+// buffer(5): hidden_dim (uint)
+// buffer(6): top_k (uint)
+//
+// grid: (ceil(hidden_dim / 256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void moe_expert_accum(
+    device const float* expert_outputs  [[buffer(0)]],
+    device const float* expert_weights  [[buffer(1)]],
+    device const uint*  expert_ids      [[buffer(2)]],
+    device float*       output          [[buffer(3)]],
+    device const float* residual        [[buffer(4)]],
+    constant uint&      hidden_dim      [[buffer(5)]],
+    constant uint&      top_k           [[buffer(6)]],
+    uint gid                            [[thread_position_in_grid]])
+{
+    if (gid >= hidden_dim) return;
+
+    float sum = residual[gid];
+    for (uint k = 0; k < top_k; k++) {
+        uint e = expert_ids[k];
+        sum += expert_weights[k] * expert_outputs[e * hidden_dim + gid];
+    }
+    output[gid] = sum;
+}
+
+// ============================================================================
+// moe_expert_accum_batched: Batched version for prefill (multiple tokens).
+//
+// For each token in the batch, combines top-K expert outputs with routing
+// weights and adds the residual. Uses expert_ids to index into the sparse
+// expert_outputs buffer.
+//
+// expert_outputs is written by the dispatch loop with layout:
+//   [num_experts, batch_size, hidden_dim]
+// where expert e's output for batch item b is at:
+//   expert_outputs[e * batch_size * hidden_dim + b * hidden_dim + t]
+//
+// buffer(0): expert_outputs  [num_experts * batch_size * hidden_dim] float
+// buffer(1): expert_weights  [batch_size * top_k] float
+// buffer(2): expert_ids      [batch_size * top_k] uint32  — selected expert slot indices
+// buffer(3): output          [batch_size * hidden_dim] float  — OUTPUT
+// buffer(4): residual        [batch_size * hidden_dim] float
+// buffer(5): hidden_dim (uint)
+// buffer(6): top_k (uint)
+// buffer(7): batch_size (uint)
+//
+// grid: (ceil(batch_size * hidden_dim / 256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void moe_expert_accum_batched(
+    device const float* expert_outputs  [[buffer(0)]],
+    device const float* expert_weights  [[buffer(1)]],
+    device const uint*  expert_ids      [[buffer(2)]],
+    device float*       output          [[buffer(3)]],
+    device const float* residual        [[buffer(4)]],
+    constant uint&      hidden_dim      [[buffer(5)]],
+    constant uint&      top_k           [[buffer(6)]],
+    constant uint&      batch_size      [[buffer(7)]],
+    uint gid                            [[thread_position_in_grid]])
+{
+    uint total = batch_size * hidden_dim;
+    if (gid >= total) return;
+
+    // Determine which batch item and which element within hidden_dim
+    uint b = gid / hidden_dim;
+    uint t = gid % hidden_dim;
+
+    float sum = residual[gid];
+    for (uint k = 0; k < top_k; k++) {
+        uint e = expert_ids[b * top_k + k];
+        float w = expert_weights[b * top_k + k];
+        // expert_outputs layout: [num_experts, batch_size, hidden_dim]
+        sum += w * expert_outputs[e * batch_size * hidden_dim + b * hidden_dim + t];
+    }
+    output[gid] = sum;
+}
+
+// ============================================================================
+// moe_router_softmax_biased: Cache-conditional routing bias.
+//
+// Identical to moe_router_softmax, except after computing each expert's dot
+// product logit, a small bias is added for cached experts:
+//   logit[e] = dot(hidden_state, gate_weight[e]) + cache_bias_lambda * is_cached[e]
+//
+// When cache_bias_lambda == 0.0 and all is_cached == 0, output is identical
+// to moe_router_softmax.
+//
+// buffer(0): hidden_state      [hidden_dim] float          — normalized input
+// buffer(1): gate_weight       [num_experts * hidden_dim] float — router weights
+// buffer(2): expert_ids        [top_k] uint32              — OUTPUT
+// buffer(3): expert_weights    [top_k] float               — OUTPUT
+// buffer(4): hidden_dim (uint)
+// buffer(5): num_experts (uint)
+// buffer(6): top_k (uint)
+// buffer(7): is_cached         [num_experts] uint8_t       — 1 if cached, 0 if not
+// buffer(8): cache_bias_lambda (float)                     — bias magnitude
+//
+// grid: (1, 1, 1), threadgroup: (min(256, hidden_dim), 1, 1)
+// ============================================================================
+
+kernel void moe_router_softmax_biased(
+    device const float*   hidden_state      [[buffer(0)]],
+    device const float*   gate_weight       [[buffer(1)]],
+    device uint*          expert_ids        [[buffer(2)]],
+    device float*         expert_weights    [[buffer(3)]],
+    constant uint&        hidden_dim        [[buffer(4)]],
+    constant uint&        num_experts       [[buffer(5)]],
+    constant uint&        top_k             [[buffer(6)]],
+    device const uint8_t* is_cached         [[buffer(7)]],
+    constant float&       cache_bias_lambda [[buffer(8)]],
+    uint tid                               [[thread_index_in_threadgroup]],
+    uint tg_size                           [[threads_per_threadgroup]],
+    uint simd_lane                         [[thread_index_in_simdgroup]],
+    uint simd_group                        [[simdgroup_index_in_threadgroup]])
+{
+    // --- Phase 1: Compute logits[e] = dot(gate_weight[e], hidden_state) + bias ---
+    threadgroup float logits[256]; // supports up to 256 experts (e.g. Qwen3.5-35B-A3B)
+    threadgroup float partial_sums[32];
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+
+    for (uint e = 0; e < num_experts; e++) {
+        device const float* w_row = gate_weight + e * hidden_dim;
+
+        float sum = 0.0f;
+        for (uint j = tid; j < hidden_dim; j += tg_size) {
+            sum += w_row[j] * hidden_state[j];
+        }
+
+        sum = simd_sum(sum);
+
+        if (simd_lane == 0) {
+            partial_sums[simd_group] = sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+            val = simd_sum(val);
+            if (simd_lane == 0) {
+                // Add cache bias: cached experts get a small logit boost
+                logits[e] = val + cache_bias_lambda * float(is_cached[e]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // --- Phase 2: Softmax (numerically stable, max-subtraction) ---
+    if (tid == 0) {
+        float max_logit = logits[0];
+        for (uint e = 1; e < num_experts; e++) {
+            max_logit = max(max_logit, logits[e]);
+        }
+
+        float sum_exp = 0.0f;
+        for (uint e = 0; e < num_experts; e++) {
+            float val = exp(logits[e] - max_logit);
+            logits[e] = val;
+            sum_exp += val;
+        }
+
+        float inv_sum = 1.0f / sum_exp;
+        for (uint e = 0; e < num_experts; e++) {
+            logits[e] *= inv_sum;
+        }
+
+        // --- Phase 3: Top-K selection via repeated argmax ---
+        float renorm_sum = 0.0f;
+        for (uint k = 0; k < top_k; k++) {
+            float best_val = -1.0f;
+            uint best_idx = 0;
+            for (uint e = 0; e < num_experts; e++) {
+                if (logits[e] > best_val) {
+                    best_val = logits[e];
+                    best_idx = e;
+                }
+            }
+            expert_ids[k] = best_idx;
+            expert_weights[k] = best_val;
+            renorm_sum += best_val;
+            logits[best_idx] = -1.0f;
+        }
+
+        // --- Phase 4: Renormalize selected weights to sum to 1.0 ---
+        if (renorm_sum > 0.0f) {
+            float inv_renorm = 1.0f / renorm_sum;
+            for (uint k = 0; k < top_k; k++) {
+                expert_weights[k] *= inv_renorm;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// moe_expert_accum_option_a: Dense accumulation for Option A dispatch.
+//
+// With Option A, only the top-K selected experts are dispatched. The expert_outputs
+// buffer has dense layout: [top_k, hidden_dim] where slot k contains the output
+// of the k-th selected expert. No expert_ids indexing is needed for the output
+// buffer -- we just iterate 0..top_k directly.
+//
+// buffer(0): expert_outputs  [top_k * hidden_dim] float — dense top-K outputs
+// buffer(1): expert_weights  [top_k] float              — routing weights (sum to 1)
+// buffer(2): output          [hidden_dim] float          — OUTPUT: accumulated result
+// buffer(3): residual        [hidden_dim] float          — residual to add
+// buffer(4): hidden_dim (uint)
+// buffer(5): top_k (uint)
+//
+// grid: (ceil(hidden_dim / 256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void moe_expert_accum_option_a(
+    device const float* expert_outputs  [[buffer(0)]],
+    device const float* expert_weights  [[buffer(1)]],
+    device float*       output          [[buffer(2)]],
+    device const float* residual        [[buffer(3)]],
+    constant uint&      hidden_dim      [[buffer(4)]],
+    constant uint&      top_k           [[buffer(5)]],
+    uint gid                            [[thread_position_in_grid]])
+{
+    if (gid >= hidden_dim) return;
+
+    float sum = residual[gid];
+    for (uint k = 0; k < top_k; k++) {
+        sum += expert_weights[k] * expert_outputs[k * hidden_dim + gid];
+    }
+    output[gid] = sum;
+}
+
+// ============================================================================
+// Batched MoE expert FFN kernels — GPU-side routing, no CPU readback.
+//
+// These kernels take expert_ids[top_k] and expert_weights[top_k] directly from
+// GPU buffers (written by the router kernel in the same command buffer).
+// This eliminates the per-layer commit_and_wait + CPU readback that Option A
+// previously required.
+//
+// Two-phase approach per MoE layer:
+//   Phase 1: moe_batched_gate_up_swiglu_q4_0 — compute gate+up+swiglu for all top_k experts
+//   Phase 2: moe_batched_down_accum_q4_0 — compute down projection + weighted accumulation
+// ============================================================================
+
+// Phase 1: Batched gate+up+SwiGLU for top_k experts (Q4_0)
+//
+// Layout: All expert gate weights are contiguous in the layer buffer at known
+// byte offsets. An offset table (expert_offsets) provides the absolute byte offset
+// for each of the num_experts gate/up weight pairs:
+//   expert_offsets[e * 2 + 0] = gate_off for expert e (byte offset from layer_buf start)
+//   expert_offsets[e * 2 + 1] = up_off for expert e
+//
+// The kernel reads expert_ids[k] (0..num_experts-1) to find which expert to process,
+// then uses expert_offsets to locate the weight data.
+//
+// buffer(0): layer_buf        — full layer weight buffer
+// buffer(1): x                — normed input [hidden_dim] float
+// buffer(2): swiglu_out       — output [top_k * inter_dim] float (dense packed)
+// buffer(3): expert_ids       — [top_k] uint (from router, on GPU)
+// buffer(4): expert_offsets   — [num_experts * 2] ulong (gate_off, up_off per expert)
+// buffer(5): hidden_dim (uint)
+// buffer(6): inter_dim (uint)
+// buffer(7): top_k (uint)
+//
+// Dispatch: (top_k * inter_dim) threadgroups, 128 threads each.
+// threadgroup_position_in_grid encodes (expert_slot * inter_dim + row).
+// ============================================================================
+
+kernel void moe_batched_gate_up_swiglu_q4_0(
+    device const uchar*  layer_buf      [[buffer(0)]],
+    device const float*  x              [[buffer(1)]],
+    device float*        swiglu_out     [[buffer(2)]],
+    device const uint*   expert_ids     [[buffer(3)]],
+    device const ulong*  expert_offsets [[buffer(4)]],
+    constant uint&       hidden_dim     [[buffer(5)]],
+    constant uint&       inter_dim      [[buffer(6)]],
+    constant uint&       top_k          [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    // Decode threadgroup index into (expert_slot, row)
+    uint row = tgpig % inter_dim;
+    uint expert_slot = tgpig / inter_dim;
+    if (expert_slot >= top_k) return;
+
+    // Look up expert ID and weight offsets
+    uint expert_id = expert_ids[expert_slot];
+    ulong gate_off = expert_offsets[expert_id * 2 + 0];
+    ulong up_off   = expert_offsets[expert_id * 2 + 1];
+
+    // Q4_0 row layout
+    uint num_blocks = hidden_dim >> 5;  // hidden_dim / 32
+    uint row_bytes = num_blocks * 18u;  // Q4_BLOCK_SIZE = 18
+
+    device const uchar* gate_row_ptr = layer_buf + gate_off + row * row_bytes;
+    device const uchar* up_row_ptr   = layer_buf + up_off   + row * row_bytes;
+
+    // Thread mapping: each thread handles 8 contiguous elements within a block
+    uint ix = tiisg / 4;   // 0..7: which block in stride of 8
+    uint il = tiisg % 4;   // 0..3: which 4-byte (8-element) quarter
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+
+    for (uint ib = sgitg * 8 + ix; ib < num_blocks; ib += 32) {
+        uint block_base = ib * 32;
+        float yl_lo[4], yl_hi[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            yl_lo[i] = x[block_base + il * 4 + i];
+            yl_hi[i] = x[block_base + il * 4 + 16 + i];
+        }
+
+        // Gate weights
+        device const uchar* gate_bp = gate_row_ptr + ib * 18u;
+        float gate_scale = float(as_type<half>(*(device const ushort*)gate_bp));
+        device const uchar* gate_qdata = (device const uchar*)(gate_bp + 2) + il * 4;
+        float gate_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            uchar bv = gate_qdata[i];
+            float lo = float(bv & 0x0F) - 8.0f;
+            float hi = float(bv >> 4) - 8.0f;
+            gate_dot += lo * yl_lo[i] + hi * yl_hi[i];
+        }
+        gate_sum += gate_dot * gate_scale;
+
+        // Up weights
+        device const uchar* up_bp = up_row_ptr + ib * 18u;
+        float up_scale = float(as_type<half>(*(device const ushort*)up_bp));
+        device const uchar* up_qdata = (device const uchar*)(up_bp + 2) + il * 4;
+        float up_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            uchar bv = up_qdata[i];
+            float lo = float(bv & 0x0F) - 8.0f;
+            float hi = float(bv >> 4) - 8.0f;
+            up_dot += lo * yl_lo[i] + hi * yl_hi[i];
+        }
+        up_sum += up_dot * up_scale;
+    }
+
+    // Final reduction
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+
+    threadgroup float shmem[8];
+    if (tiisg == 0) {
+        shmem[sgitg]     = gate_sum;
+        shmem[sgitg + 4] = up_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg == 0) {
+        float g = shmem[0] + shmem[1] + shmem[2] + shmem[3];
+        float u = shmem[4] + shmem[5] + shmem[6] + shmem[7];
+        float sigmoid = 1.0f / (1.0f + exp(-g));
+        swiglu_out[expert_slot * inter_dim + row] = g * sigmoid * u;
+    }
+}
+
+// ============================================================================
+// Phase 1b: Batched gate+up+SwiGLU for top_k experts (Q4_1)
+//
+// Identical to moe_batched_gate_up_swiglu_q4_0 but uses Q4_1 block layout:
+//   [f16 scale (2B)] [f16 min (2B)] [16B nibbles] = 20 bytes per 32 elements
+// Dequant: value = scale * nibble + min
+//
+// buffer(0): layer_buf        — full layer weight buffer
+// buffer(1): x                — [hidden_dim] float (normed input)
+// buffer(2): swiglu_out       — [top_k * inter_dim] float
+// buffer(3): expert_ids       — [top_k] uint
+// buffer(4): expert_offsets   — [num_experts * 2] ulong (gate_off, up_off per expert)
+// buffer(5): hidden_dim (uint)
+// buffer(6): inter_dim (uint)
+// buffer(7): top_k (uint)
+//
+// Dispatch: (top_k * inter_dim) threadgroups, 128 threads each.
+// threadgroup_position_in_grid encodes (expert_slot * inter_dim + row).
+// ============================================================================
+
+kernel void moe_batched_gate_up_swiglu_q4_1(
+    device const uchar*  layer_buf      [[buffer(0)]],
+    device const float*  x              [[buffer(1)]],
+    device float*        swiglu_out     [[buffer(2)]],
+    device const uint*   expert_ids     [[buffer(3)]],
+    device const ulong*  expert_offsets [[buffer(4)]],
+    constant uint&       hidden_dim     [[buffer(5)]],
+    constant uint&       inter_dim      [[buffer(6)]],
+    constant uint&       top_k          [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    // Decode threadgroup index into (expert_slot, row)
+    uint row = tgpig % inter_dim;
+    uint expert_slot = tgpig / inter_dim;
+    if (expert_slot >= top_k) return;
+
+    // Look up expert ID and weight offsets
+    uint expert_id = expert_ids[expert_slot];
+    ulong gate_off = expert_offsets[expert_id * 2 + 0];
+    ulong up_off   = expert_offsets[expert_id * 2 + 1];
+
+    // Q4_1 row layout
+    uint num_blocks = hidden_dim >> 5;  // hidden_dim / 32
+    uint row_bytes = num_blocks * Q4_1_BLOCK_SIZE;  // 20 bytes per block
+
+    device const uchar* gate_row_ptr = layer_buf + gate_off + row * row_bytes;
+    device const uchar* up_row_ptr   = layer_buf + up_off   + row * row_bytes;
+
+    // Thread mapping: each thread handles 8 contiguous elements within a block
+    uint ix = tiisg / 4;   // 0..7: which block in stride of 8
+    uint il = tiisg % 4;   // 0..3: which 4-byte (8-element) quarter
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+
+    for (uint ib = sgitg * 8 + ix; ib < num_blocks; ib += 32) {
+        uint block_base = ib * 32;
+        float yl_lo[4], yl_hi[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            yl_lo[i] = x[block_base + il * 4 + i];
+            yl_hi[i] = x[block_base + il * 4 + 16 + i];
+        }
+
+        // Gate weights: Q4_1 block = [f16 scale, f16 min, 16B nibbles]
+        device const uchar* gate_bp = gate_row_ptr + ib * Q4_1_BLOCK_SIZE;
+        float gate_scale = float(as_type<half>(*(device const ushort*)gate_bp));
+        float gate_min   = float(as_type<half>(*(device const ushort*)(gate_bp + 2)));
+        device const uchar* gate_qdata = (device const uchar*)(gate_bp + 4) + il * 4;
+        float gate_dot = 0.0f;
+        float gate_sumy = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            uchar bv = gate_qdata[i];
+            float lo = float(bv & 0x0F);
+            float hi = float(bv >> 4);
+            gate_dot  += lo * yl_lo[i] + hi * yl_hi[i];
+            gate_sumy += yl_lo[i] + yl_hi[i];
+        }
+        gate_sum += gate_dot * gate_scale + gate_sumy * gate_min;
+
+        // Up weights: same x-values, different weight row
+        device const uchar* up_bp = up_row_ptr + ib * Q4_1_BLOCK_SIZE;
+        float up_scale = float(as_type<half>(*(device const ushort*)up_bp));
+        float up_min   = float(as_type<half>(*(device const ushort*)(up_bp + 2)));
+        device const uchar* up_qdata = (device const uchar*)(up_bp + 4) + il * 4;
+        float up_dot = 0.0f;
+        float up_sumy = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            uchar bv = up_qdata[i];
+            float lo = float(bv & 0x0F);
+            float hi = float(bv >> 4);
+            up_dot  += lo * yl_lo[i] + hi * yl_hi[i];
+            up_sumy += yl_lo[i] + yl_hi[i];
+        }
+        up_sum += up_dot * up_scale + up_sumy * up_min;
+    }
+
+    // Final reduction
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+
+    threadgroup float shmem[8];
+    if (tiisg == 0) {
+        shmem[sgitg]     = gate_sum;
+        shmem[sgitg + 4] = up_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg == 0) {
+        float g = shmem[0] + shmem[1] + shmem[2] + shmem[3];
+        float u = shmem[4] + shmem[5] + shmem[6] + shmem[7];
+        float sigmoid = 1.0f / (1.0f + exp(-g));
+        swiglu_out[expert_slot * inter_dim + row] = g * sigmoid * u;
+    }
+}
+// Phase 1: Batched gate+up+SwiGLU for top_k experts (Q8_0)
+//
+// Identical structure to moe_batched_gate_up_swiglu_q4_0 but with Q8_0 blocks:
+//   [f16 scale (2B)] [32B int8 data] = 34 bytes per 32 elements
+// Dequant: value = scale * int8_val
+//
+// Thread mapping: deferred-reduction pattern with 128 threads (4 simdgroups).
+//   ix = tiisg / 4  -> 0..7  (which block in stride of 8)
+//   il = tiisg % 4  -> 0..3  (which 8-byte quarter within 32-byte data)
+//
+// Each threadgroup processes 1 output row for 1 expert.
+// gate and up weights share the same x-vector load.
+//
+// buffer(0): layer_buf        -- full layer weight buffer
+// buffer(1): x                -- normed input [hidden_dim] float
+// buffer(2): swiglu_out       -- output [top_k * inter_dim] float (dense packed)
+// buffer(3): expert_ids       -- [top_k] uint (from router, on GPU)
+// buffer(4): expert_offsets   -- [num_experts * 2] ulong (gate_off, up_off per expert)
+// buffer(5): hidden_dim (uint)
+// buffer(6): inter_dim (uint)
+// buffer(7): top_k (uint)
+//
+// Dispatch: (top_k * inter_dim) threadgroups, 128 threads each.
+// threadgroup_position_in_grid encodes (expert_slot * inter_dim + row).
+// ============================================================================
+
+kernel void moe_batched_gate_up_swiglu_q8_0(
+    device const uchar*  layer_buf      [[buffer(0)]],
+    device const float*  x              [[buffer(1)]],
+    device float*        swiglu_out     [[buffer(2)]],
+    device const uint*   expert_ids     [[buffer(3)]],
+    device const ulong*  expert_offsets [[buffer(4)]],
+    constant uint&       hidden_dim     [[buffer(5)]],
+    constant uint&       inter_dim      [[buffer(6)]],
+    constant uint&       top_k          [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    // Decode threadgroup index into (expert_slot, row)
+    uint row = tgpig % inter_dim;
+    uint expert_slot = tgpig / inter_dim;
+    if (expert_slot >= top_k) return;
+
+    // Look up expert ID and weight offsets
+    uint expert_id = expert_ids[expert_slot];
+    ulong gate_off = expert_offsets[expert_id * 2 + 0];
+    ulong up_off   = expert_offsets[expert_id * 2 + 1];
+
+    // Q8_0 row layout
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = hidden_dim >> 5;  // hidden_dim / 32
+    uint row_bytes = num_blocks * Q8_BLOCK_SIZE;
+
+    device const uchar* gate_row_ptr = layer_buf + gate_off + row * row_bytes;
+    device const uchar* up_row_ptr   = layer_buf + up_off   + row * row_bytes;
+
+    // Thread mapping: each thread handles 8 contiguous elements within a block
+    uint ix = tiisg / 4;   // 0..7: which block in stride of 8
+    uint il = tiisg % 4;   // 0..3: which 8-byte quarter within 32-byte data
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+
+    // Each simdgroup starts at a different offset and strides by NSG * 8 blocks
+    // NSG=4 simdgroups, each strides 8 blocks -> total stride = 32 blocks/iter
+    for (uint ib = sgitg * 8 + ix; ib < num_blocks; ib += 32) {
+        // Load 8 x-values for this thread's quarter of the block
+        uint x_base = ib * 32 + il * 8;
+        float yl[8];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) {
+            yl[i] = x[x_base + i];
+        }
+
+        // Gate weights: read scale + 8 int8 values
+        device const uchar* gate_bp = gate_row_ptr + ib * Q8_BLOCK_SIZE;
+        half gate_scale = as_type<half>(*(device const ushort*)gate_bp);
+        device const char* gate_qs = (device const char*)(gate_bp + 2) + il * 8;
+        float gate_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) {
+            gate_dot += float(gate_qs[i]) * yl[i];
+        }
+        gate_sum += gate_dot * float(gate_scale);
+
+        // Up weights: same x-values, different weight row
+        device const uchar* up_bp = up_row_ptr + ib * Q8_BLOCK_SIZE;
+        half up_scale = as_type<half>(*(device const ushort*)up_bp);
+        device const char* up_qs = (device const char*)(up_bp + 2) + il * 8;
+        float up_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) {
+            up_dot += float(up_qs[i]) * yl[i];
+        }
+        up_sum += up_dot * float(up_scale);
+    }
+
+    // Final reduction: simd_sum within each simdgroup
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+
+    // Cross-simdgroup reduction via shared memory
+    threadgroup float shmem[8];  // [0..3] for gate, [4..7] for up
+
+    if (tiisg == 0) {
+        shmem[sgitg]     = gate_sum;
+        shmem[sgitg + 4] = up_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread 0 of simdgroup 0 does final reduction + SwiGLU
+    if (sgitg == 0 && tiisg == 0) {
+        float g = shmem[0] + shmem[1] + shmem[2] + shmem[3];
+        float u = shmem[4] + shmem[5] + shmem[6] + shmem[7];
+        float sigmoid = 1.0f / (1.0f + exp(-g));
+        swiglu_out[expert_slot * inter_dim + row] = g * sigmoid * u;
+    }
+}
+
+// ============================================================================
+// Phase 2: Batched down projection + weighted accumulation for top_k experts (Q8_0)
+//
+// For each output element d, computes:
+//   output[d] = residual[d] + sum_{k=0}^{top_k-1} expert_weights[k] *
+//               dot(w_down[expert_ids[k]][d, :], swiglu_results[k, :])
+//
+// Q8_0 block: [f16 scale (2B)] [32B int8 data] = 34 bytes per 32 elements
+//
+// buffer(0): layer_buf        -- full layer weight buffer
+// buffer(1): swiglu_in        -- [top_k * inter_dim] float (from phase 1)
+// buffer(2): output           -- [hidden_dim] float (x_buf)
+// buffer(3): residual         -- [hidden_dim] float (attn_proj_buf)
+// buffer(4): expert_ids       -- [top_k] uint
+// buffer(5): expert_weights   -- [top_k] float
+// buffer(6): down_offsets     -- [num_experts] ulong (byte offset per expert for down weights)
+// buffer(7): inter_dim (uint)
+// buffer(8): hidden_dim (uint)
+// buffer(9): top_k (uint)
+//
+// Dispatch: ceil(hidden_dim / 4) threadgroups, 128 threads each
+// (deferred-reduction: 4 output rows per threadgroup)
+// ============================================================================
+
+kernel void moe_batched_down_accum_q8_0(
+    device const uchar*  layer_buf       [[buffer(0)]],
+    device const float*  swiglu_in       [[buffer(1)]],
+    device float*        output          [[buffer(2)]],
+    device const float*  residual        [[buffer(3)]],
+    device const uint*   expert_ids      [[buffer(4)]],
+    device const float*  expert_weights  [[buffer(5)]],
+    device const ulong*  down_offsets    [[buffer(6)]],
+    constant uint&       inter_dim       [[buffer(7)]],
+    constant uint&       hidden_dim      [[buffer(8)]],
+    constant uint&       top_k           [[buffer(9)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    // 4 output rows per threadgroup (deferred reduction pattern)
+    uint base_row = tgpig * 4;
+
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = inter_dim >> 5;  // inter_dim / 32
+    uint row_bytes = num_blocks * Q8_BLOCK_SIZE;
+
+    // Thread mapping: each thread handles 8 contiguous elements within a block
+    uint ix = tiisg / 4;   // 0..7: which block in stride of 8
+    uint il = tiisg % 4;   // 0..3: which 8-byte quarter within 32-byte data
+
+    // Accumulate over all top_k experts for each of 4 output rows
+    float row_sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint k = 0; k < top_k; k++) {
+        uint expert_id = expert_ids[k];
+        ulong down_off = down_offsets[expert_id];
+        float w_k = expert_weights[k];
+        device const float* swiglu_k = swiglu_in + k * inter_dim;
+
+        for (uint r = 0; r < 4; r++) {
+            uint row = base_row + r;
+            if (row >= hidden_dim) continue;
+
+            device const uchar* row_ptr = layer_buf + down_off + row * row_bytes;
+
+            float dot = 0.0f;
+            for (uint ib = sgitg * 8 + ix; ib < num_blocks; ib += 32) {
+                uint x_base = ib * 32 + il * 8;
+                float yl[8];
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 8; i++) {
+                    yl[i] = swiglu_k[x_base + i];
+                }
+
+                device const uchar* bp = row_ptr + ib * Q8_BLOCK_SIZE;
+                half scale = as_type<half>(*(device const ushort*)bp);
+                device const char* qs = (device const char*)(bp + 2) + il * 8;
+                float d = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 8; i++) {
+                    d += float(qs[i]) * yl[i];
+                }
+                dot += d * float(scale);
+            }
+            row_sums[r] += w_k * dot;
+        }
+    }
+
+    // Reduce each row_sum across simdgroups
+    for (uint r = 0; r < 4; r++) {
+        row_sums[r] = simd_sum(row_sums[r]);
+    }
+
+    threadgroup float shmem[16]; // 4 rows * 4 simdgroups
+
+    if (tiisg == 0) {
+        for (uint r = 0; r < 4; r++) {
+            shmem[r * 4 + sgitg] = row_sums[r];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint r = 0; r < 4; r++) {
+            uint row = base_row + r;
+            if (row >= hidden_dim) continue;
+            float total = shmem[r * 4] + shmem[r * 4 + 1] + shmem[r * 4 + 2] + shmem[r * 4 + 3];
+            output[row] = residual[row] + total;
+        }
+    }
+}
+
+// ============================================================================
+
+// ============================================================================
+// Phase 2: Batched down projection + weighted accumulation for top_k experts (Q4_0)
+//
+// For each output element d, computes:
+//   output[d] = residual[d] + sum_{k=0}^{top_k-1} expert_weights[k] *
+//               dot(w_down[expert_ids[k]][d, :], swiglu_results[k, :])
+//
+// buffer(0): layer_buf        — full layer weight buffer
+// buffer(1): swiglu_in        — [top_k * inter_dim] float (from phase 1)
+// buffer(2): output           — [hidden_dim] float (x_buf)
+// buffer(3): residual         — [hidden_dim] float (attn_proj_buf)
+// buffer(4): expert_ids       — [top_k] uint
+// buffer(5): expert_weights   — [top_k] float
+// buffer(6): down_offsets     — [num_experts] ulong (byte offset per expert for down weights)
+// buffer(7): inter_dim (uint)
+// buffer(8): hidden_dim (uint)
+// buffer(9): top_k (uint)
+//
+// Dispatch: ceil(hidden_dim / 4) threadgroups, 128 threads each
+// (deferred-reduction: 4 output rows per threadgroup)
+// ============================================================================
+
+kernel void moe_batched_down_accum_q4_0(
+    device const uchar*  layer_buf       [[buffer(0)]],
+    device const float*  swiglu_in       [[buffer(1)]],
+    device float*        output          [[buffer(2)]],
+    device const float*  residual        [[buffer(3)]],
+    device const uint*   expert_ids      [[buffer(4)]],
+    device const float*  expert_weights  [[buffer(5)]],
+    device const ulong*  down_offsets    [[buffer(6)]],
+    constant uint&       inter_dim       [[buffer(7)]],
+    constant uint&       hidden_dim      [[buffer(8)]],
+    constant uint&       top_k           [[buffer(9)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    // 4 output rows per threadgroup (deferred reduction pattern)
+    uint base_row = tgpig * 4;
+
+    uint num_blocks = inter_dim >> 5;  // inter_dim / 32
+    uint row_bytes = num_blocks * 18u;  // Q4_BLOCK_SIZE = 18
+
+    uint ix = tiisg / 4;
+    uint il = tiisg % 4;
+
+    // Accumulate over all top_k experts for each of 4 output rows
+    float row_sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint k = 0; k < top_k; k++) {
+        uint expert_id = expert_ids[k];
+        ulong down_off = down_offsets[expert_id];
+        float w_k = expert_weights[k];
+        device const float* swiglu_k = swiglu_in + k * inter_dim;
+
+        for (uint r = 0; r < 4; r++) {
+            uint row = base_row + r;
+            if (row >= hidden_dim) continue;
+
+            device const uchar* row_ptr = layer_buf + down_off + row * row_bytes;
+
+            float dot = 0.0f;
+            for (uint ib = sgitg * 8 + ix; ib < num_blocks; ib += 32) {
+                uint block_base = ib * 32;
+                float yl_lo[4], yl_hi[4];
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 4; ++i) {
+                    yl_lo[i] = swiglu_k[block_base + il * 4 + i];
+                    yl_hi[i] = swiglu_k[block_base + il * 4 + 16 + i];
+                }
+
+                device const uchar* bp = row_ptr + ib * 18u;
+                float scale = float(as_type<half>(*(device const ushort*)bp));
+                device const uchar* qdata = (device const uchar*)(bp + 2) + il * 4;
+                float d = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 4; ++i) {
+                    uchar bv = qdata[i];
+                    float lo = float(bv & 0x0F) - 8.0f;
+                    float hi = float(bv >> 4) - 8.0f;
+                    d += lo * yl_lo[i] + hi * yl_hi[i];
+                }
+                dot += d * scale;
+            }
+            row_sums[r] += w_k * dot;
+        }
+    }
+
+    // Reduce each row_sum across simdgroups
+    for (uint r = 0; r < 4; r++) {
+        row_sums[r] = simd_sum(row_sums[r]);
+    }
+
+    threadgroup float shmem[16]; // 4 rows * 4 simdgroups
+
+    if (tiisg == 0) {
+        for (uint r = 0; r < 4; r++) {
+            shmem[r * 4 + sgitg] = row_sums[r];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint r = 0; r < 4; r++) {
+            uint row = base_row + r;
+            if (row >= hidden_dim) continue;
+            float total = shmem[r * 4] + shmem[r * 4 + 1] + shmem[r * 4 + 2] + shmem[r * 4 + 3];
+            output[row] = residual[row] + total;
+        }
+    }
+}
+
+// ============================================================================
+// Phase 2: Batched down projection + weighted accumulation for top_k experts (Q4_1)
+//
+// Identical to moe_batched_down_accum_q4_0 but uses Q4_1 block layout:
+//   [f16 scale (2B)] [f16 min (2B)] [16B nibbles] = 20 bytes per 32 elements
+// Dequant: value = scale * nibble + min
+//
+// buffer(0): layer_buf        — full layer weight buffer
+// buffer(1): swiglu_in        — [top_k * inter_dim] float (from phase 1)
+// buffer(2): output           — [hidden_dim] float (x_buf)
+// buffer(3): residual         — [hidden_dim] float (attn_proj_buf)
+// buffer(4): expert_ids       — [top_k] uint
+// buffer(5): expert_weights   — [top_k] float
+// buffer(6): down_offsets     — [num_experts] ulong (byte offset per expert for down weights)
+// buffer(7): inter_dim (uint)
+// buffer(8): hidden_dim (uint)
+// buffer(9): top_k (uint)
+//
+// Dispatch: ceil(hidden_dim / 4) threadgroups, 128 threads each
+// (deferred-reduction: 4 output rows per threadgroup)
+// ============================================================================
+
+kernel void moe_batched_down_accum_q4_1(
+    device const uchar*  layer_buf       [[buffer(0)]],
+    device const float*  swiglu_in       [[buffer(1)]],
+    device float*        output          [[buffer(2)]],
+    device const float*  residual        [[buffer(3)]],
+    device const uint*   expert_ids      [[buffer(4)]],
+    device const float*  expert_weights  [[buffer(5)]],
+    device const ulong*  down_offsets    [[buffer(6)]],
+    constant uint&       inter_dim       [[buffer(7)]],
+    constant uint&       hidden_dim      [[buffer(8)]],
+    constant uint&       top_k           [[buffer(9)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    // 4 output rows per threadgroup (deferred reduction pattern)
+    uint base_row = tgpig * 4;
+
+    uint num_blocks = inter_dim >> 5;  // inter_dim / 32
+    uint row_bytes = num_blocks * Q4_1_BLOCK_SIZE;  // 20 bytes per block
+
+    uint ix = tiisg / 4;
+    uint il = tiisg % 4;
+
+    // Accumulate over all top_k experts for each of 4 output rows
+    float row_sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint k = 0; k < top_k; k++) {
+        uint expert_id = expert_ids[k];
+        ulong down_off = down_offsets[expert_id];
+        float w_k = expert_weights[k];
+        device const float* swiglu_k = swiglu_in + k * inter_dim;
+
+        for (uint r = 0; r < 4; r++) {
+            uint row = base_row + r;
+            if (row >= hidden_dim) continue;
+
+            device const uchar* row_ptr = layer_buf + down_off + row * row_bytes;
+
+            float sumq = 0.0f;
+            float sumy = 0.0f;
+            for (uint ib = sgitg * 8 + ix; ib < num_blocks; ib += 32) {
+                // De-interleaved: lo nibble elements at [0..15], hi at [16..31]
+                uint block_base = ib * 32;
+                float yl_lo[4], yl_hi[4];
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 4; ++i) {
+                    yl_lo[i] = swiglu_k[block_base + il * 4 + i];
+                    yl_hi[i] = swiglu_k[block_base + il * 4 + 16 + i];
+                }
+
+                device const uchar* bp = row_ptr + ib * Q4_1_BLOCK_SIZE;
+                float scale = float(as_type<half>(*(device const ushort*)bp));
+                float minval = float(as_type<half>(*(device const ushort*)(bp + 2)));
+                device const uchar* qdata = (device const uchar*)(bp + 4) + il * 4;
+                float dq = 0.0f;
+                float dy = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 4; ++i) {
+                    uchar bv = qdata[i];
+                    float lo = float(bv & 0x0F);
+                    float hi = float(bv >> 4);
+                    dq += lo * yl_lo[i] + hi * yl_hi[i];
+                    dy += yl_lo[i] + yl_hi[i];
+                }
+                sumq += dq * scale + dy * minval;
+            }
+            row_sums[r] += w_k * sumq;
+        }
+    }
+
+    // Reduce each row_sum across simdgroups
+    for (uint r = 0; r < 4; r++) {
+        row_sums[r] = simd_sum(row_sums[r]);
+    }
+
+    threadgroup float shmem[16]; // 4 rows * 4 simdgroups
+
+    if (tiisg == 0) {
+        for (uint r = 0; r < 4; r++) {
+            shmem[r * 4 + sgitg] = row_sums[r];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint r = 0; r < 4; r++) {
+            uint row = base_row + r;
+            if (row >= hidden_dim) continue;
+            float total = shmem[r * 4] + shmem[r * 4 + 1] + shmem[r * 4 + 2] + shmem[r * 4 + 3];
+            output[row] = residual[row] + total;
+        }
+    }
+}
+
+// ============================================================================
+// Phase 2+SE: Batched down projection + weighted accumulation + shared expert (Q8_0)
+//
+// Fuses the routed expert down+accum with the shared expert's down projection,
+// sigmoid gating, and residual add into a single kernel. Eliminates 3 separate
+// dispatches per MoE layer (shared expert down, gating dot product, sigmoid+add).
+//
+// For each output element d, computes:
+//   output[d] = residual[d]
+//             + sum_{k=0}^{top_k-1} expert_weights[k] *
+//               dot(w_down[expert_ids[k]][d, :], swiglu_results[k, :])
+//             + se_gate * dot(w_se_down[d, :], se_swiglu[:])
+//
+// where se_gate = sigmoid(se_gate_scalar[0]) is precomputed by a prior dispatch.
+// When se_gate_scalar is NULL (no shared expert gating), se_gate = 1.0.
+//
+// buffer(0):  layer_buf        -- full layer weight buffer
+// buffer(1):  swiglu_in        -- [top_k * inter_dim] float (from batched phase 1)
+// buffer(2):  output           -- [hidden_dim] float (x_buf)
+// buffer(3):  residual         -- [hidden_dim] float (attn_proj_buf)
+// buffer(4):  expert_ids       -- [top_k] uint
+// buffer(5):  expert_weights   -- [top_k] float
+// buffer(6):  down_offsets     -- [num_experts] ulong
+// buffer(7):  inter_dim (uint)
+// buffer(8):  hidden_dim (uint)
+// buffer(9):  top_k (uint)
+// buffer(10): se_swiglu        -- [se_inter_dim] float (shared expert gate+up+swiglu output)
+// buffer(11): se_down_off (ulong) -- byte offset for shared expert down weights in layer_buf
+// buffer(12): se_gate_scalar   -- [1] float (pre-sigmoid gating logit, or post-sigmoid value)
+// buffer(13): se_inter_dim (uint) -- shared expert intermediate dimension
+// buffer(14): se_use_sigmoid (uint) -- 1 = apply sigmoid to se_gate_scalar, 0 = use as-is
+//
+// Dispatch: ceil(hidden_dim / 4) threadgroups, 128 threads each
+// ============================================================================
+
+kernel void moe_batched_down_accum_shared_q8_0(
+    device const uchar*  layer_buf        [[buffer(0)]],
+    device const float*  swiglu_in        [[buffer(1)]],
+    device float*        output           [[buffer(2)]],
+    device const float*  residual         [[buffer(3)]],
+    device const uint*   expert_ids       [[buffer(4)]],
+    device const float*  expert_weights   [[buffer(5)]],
+    device const ulong*  down_offsets     [[buffer(6)]],
+    constant uint&       inter_dim        [[buffer(7)]],
+    constant uint&       hidden_dim       [[buffer(8)]],
+    constant uint&       top_k            [[buffer(9)]],
+    device const float*  se_swiglu        [[buffer(10)]],
+    device const ulong*  se_down_off_ptr  [[buffer(11)]],
+    device const float*  se_gate_scalar   [[buffer(12)]],
+    constant uint&       se_inter_dim     [[buffer(13)]],
+    constant uint&       se_use_sigmoid   [[buffer(14)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    // 4 output rows per threadgroup (deferred reduction pattern)
+    uint base_row = tgpig * 4;
+
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = inter_dim >> 5;
+    uint row_bytes = num_blocks * Q8_BLOCK_SIZE;
+
+    uint ix = tiisg / 4;
+    uint il = tiisg % 4;
+
+    // Accumulate routed experts for each of 4 output rows
+    float row_sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint k = 0; k < top_k; k++) {
+        uint expert_id = expert_ids[k];
+        ulong down_off = down_offsets[expert_id];
+        float w_k = expert_weights[k];
+        device const float* swiglu_k = swiglu_in + k * inter_dim;
+
+        for (uint r = 0; r < 4; r++) {
+            uint row = base_row + r;
+            if (row >= hidden_dim) continue;
+
+            device const uchar* row_ptr = layer_buf + down_off + row * row_bytes;
+
+            float dot = 0.0f;
+            for (uint ib = sgitg * 8 + ix; ib < num_blocks; ib += 32) {
+                uint x_base = ib * 32 + il * 8;
+                float yl[8];
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 8; i++) {
+                    yl[i] = swiglu_k[x_base + i];
+                }
+
+                device const uchar* bp = row_ptr + ib * Q8_BLOCK_SIZE;
+                half scale = as_type<half>(*(device const ushort*)bp);
+                device const char* qs = (device const char*)(bp + 2) + il * 8;
+                float d = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 8; i++) {
+                    d += float(qs[i]) * yl[i];
+                }
+                dot += d * float(scale);
+            }
+            row_sums[r] += w_k * dot;
+        }
+    }
+
+    // Shared expert down projection: same Q8_0 layout, using se_swiglu as input
+    ulong se_off = se_down_off_ptr[0];
+    uint se_num_blocks = se_inter_dim >> 5;
+    uint se_row_bytes = se_num_blocks * Q8_BLOCK_SIZE;
+
+    float se_sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint r = 0; r < 4; r++) {
+        uint row = base_row + r;
+        if (row >= hidden_dim) continue;
+
+        device const uchar* se_row_ptr = layer_buf + se_off + row * se_row_bytes;
+
+        float dot = 0.0f;
+        for (uint ib = sgitg * 8 + ix; ib < se_num_blocks; ib += 32) {
+            uint x_base = ib * 32 + il * 8;
+            float yl[8];
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; i++) {
+                yl[i] = se_swiglu[x_base + i];
+            }
+
+            device const uchar* bp = se_row_ptr + ib * Q8_BLOCK_SIZE;
+            half scale = as_type<half>(*(device const ushort*)bp);
+            device const char* qs = (device const char*)(bp + 2) + il * 8;
+            float d = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; i++) {
+                d += float(qs[i]) * yl[i];
+            }
+            dot += d * float(scale);
+        }
+        se_sums[r] = dot;
+    }
+
+    // Reduce both routed and shared sums across simdgroups
+    for (uint r = 0; r < 4; r++) {
+        row_sums[r] = simd_sum(row_sums[r]);
+        se_sums[r] = simd_sum(se_sums[r]);
+    }
+
+    threadgroup float shmem[32]; // 4 rows * 4 simdgroups * 2 (routed + shared)
+
+    if (tiisg == 0) {
+        for (uint r = 0; r < 4; r++) {
+            shmem[r * 4 + sgitg] = row_sums[r];
+            shmem[16 + r * 4 + sgitg] = se_sums[r];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg == 0) {
+        // Read shared expert gate value and apply sigmoid if needed
+        // se_use_sigmoid=1: apply sigmoid to gate_inp_shexp dot product
+        // se_use_sigmoid=0: no gating, shared expert added at full weight (1.0)
+        float se_gate = se_use_sigmoid ? (1.0f / (1.0f + exp(-se_gate_scalar[0]))) : 1.0f;
+
+        for (uint r = 0; r < 4; r++) {
+            uint row = base_row + r;
+            if (row >= hidden_dim) continue;
+            float routed_total = shmem[r * 4] + shmem[r * 4 + 1] + shmem[r * 4 + 2] + shmem[r * 4 + 3];
+            float se_total = shmem[16 + r * 4] + shmem[16 + r * 4 + 1] + shmem[16 + r * 4 + 2] + shmem[16 + r * 4 + 3];
+            output[row] = residual[row] + routed_total + se_gate * se_total;
+        }
+    }
+}
+
+// ============================================================================
+// Phase 2+SE: Batched down (Q8_0 routed) + shared expert (Q4_0)
+// Mixed-quant variant: routed experts use Q8_0, shared expert uses Q4_0.
+// This is the common case for Qwen3.5-35B-A3B where the converter requantizes
+// shared expert weights to Q4_0 for memory savings.
+// ============================================================================
+
+kernel void moe_batched_down_accum_shared_q8_0_se_q4_0(
+    device const uchar*  layer_buf        [[buffer(0)]],
+    device const float*  swiglu_in        [[buffer(1)]],
+    device float*        output           [[buffer(2)]],
+    device const float*  residual         [[buffer(3)]],
+    device const uint*   expert_ids       [[buffer(4)]],
+    device const float*  expert_weights   [[buffer(5)]],
+    device const ulong*  down_offsets     [[buffer(6)]],
+    constant uint&       inter_dim        [[buffer(7)]],
+    constant uint&       hidden_dim       [[buffer(8)]],
+    constant uint&       top_k            [[buffer(9)]],
+    device const float*  se_swiglu        [[buffer(10)]],
+    device const ulong*  se_down_off_ptr  [[buffer(11)]],
+    device const float*  se_gate_scalar   [[buffer(12)]],
+    constant uint&       se_inter_dim     [[buffer(13)]],
+    constant uint&       se_use_sigmoid   [[buffer(14)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint base_row = tgpig * 4;
+
+    // Routed experts: Q8_0
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = inter_dim >> 5;
+    uint row_bytes = num_blocks * Q8_BLOCK_SIZE;
+
+    uint ix = tiisg / 4;
+    uint il = tiisg % 4;
+
+    float row_sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint k = 0; k < top_k; k++) {
+        uint expert_id = expert_ids[k];
+        ulong down_off = down_offsets[expert_id];
+        float w_k = expert_weights[k];
+        device const float* swiglu_k = swiglu_in + k * inter_dim;
+
+        for (uint r = 0; r < 4; r++) {
+            uint row = base_row + r;
+            if (row >= hidden_dim) continue;
+
+            device const uchar* row_ptr = layer_buf + down_off + row * row_bytes;
+
+            float dot = 0.0f;
+            for (uint ib = sgitg * 8 + ix; ib < num_blocks; ib += 32) {
+                uint x_base = ib * 32 + il * 8;
+                float yl[8];
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 8; i++) {
+                    yl[i] = swiglu_k[x_base + i];
+                }
+
+                device const uchar* bp = row_ptr + ib * Q8_BLOCK_SIZE;
+                half scale = as_type<half>(*(device const ushort*)bp);
+                device const char* qs = (device const char*)(bp + 2) + il * 8;
+                float d = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 8; i++) {
+                    d += float(qs[i]) * yl[i];
+                }
+                dot += d * float(scale);
+            }
+            row_sums[r] += w_k * dot;
+        }
+    }
+
+    // Shared expert down projection: Q4_0 layout
+    ulong se_off = se_down_off_ptr[0];
+    uint se_num_blocks = se_inter_dim >> 5;
+    uint se_row_bytes = se_num_blocks * 18u;  // Q4_0: 18 bytes per block
+
+    float se_sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint r = 0; r < 4; r++) {
+        uint row = base_row + r;
+        if (row >= hidden_dim) continue;
+
+        device const uchar* se_row_ptr = layer_buf + se_off + row * se_row_bytes;
+
+        float dot = 0.0f;
+        for (uint ib = sgitg * 8 + ix; ib < se_num_blocks; ib += 32) {
+            uint block_base = ib * 32;
+            float yl_lo[4], yl_hi[4];
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+                yl_lo[i] = se_swiglu[block_base + il * 4 + i];
+                yl_hi[i] = se_swiglu[block_base + il * 4 + 16 + i];
+            }
+
+            device const uchar* bp = se_row_ptr + ib * 18u;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const uchar* qdata = (device const uchar*)(bp + 2) + il * 4;
+            float d = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+                uchar bv = qdata[i];
+                float lo = float(bv & 0x0F) - 8.0f;
+                float hi = float(bv >> 4) - 8.0f;
+                d += lo * yl_lo[i] + hi * yl_hi[i];
+            }
+            dot += d * scale;
+        }
+        se_sums[r] = dot;
+    }
+
+    for (uint r = 0; r < 4; r++) {
+        row_sums[r] = simd_sum(row_sums[r]);
+        se_sums[r] = simd_sum(se_sums[r]);
+    }
+
+    threadgroup float shmem[32];
+
+    if (tiisg == 0) {
+        for (uint r = 0; r < 4; r++) {
+            shmem[r * 4 + sgitg] = row_sums[r];
+            shmem[16 + r * 4 + sgitg] = se_sums[r];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg == 0) {
+        // se_use_sigmoid=1: apply sigmoid to gate_inp_shexp dot product
+        // se_use_sigmoid=0: no gating, shared expert added at full weight (1.0)
+        float se_gate = se_use_sigmoid ? (1.0f / (1.0f + exp(-se_gate_scalar[0]))) : 1.0f;
+
+        for (uint r = 0; r < 4; r++) {
+            uint row = base_row + r;
+            if (row >= hidden_dim) continue;
+            float routed_total = shmem[r * 4] + shmem[r * 4 + 1] + shmem[r * 4 + 2] + shmem[r * 4 + 3];
+            float se_total = shmem[16 + r * 4] + shmem[16 + r * 4 + 1] + shmem[16 + r * 4 + 2] + shmem[16 + r * 4 + 3];
+            output[row] = residual[row] + routed_total + se_gate * se_total;
+        }
+    }
+}
+
+// ============================================================================
+// Phase 2+SE: Batched down + accum + shared expert (Q4_0)
+// Same as Q8_0 variant but uses Q4_0 block layout for both routed and shared experts.
+// ============================================================================
+
+kernel void moe_batched_down_accum_shared_q4_0(
+    device const uchar*  layer_buf        [[buffer(0)]],
+    device const float*  swiglu_in        [[buffer(1)]],
+    device float*        output           [[buffer(2)]],
+    device const float*  residual         [[buffer(3)]],
+    device const uint*   expert_ids       [[buffer(4)]],
+    device const float*  expert_weights   [[buffer(5)]],
+    device const ulong*  down_offsets     [[buffer(6)]],
+    constant uint&       inter_dim        [[buffer(7)]],
+    constant uint&       hidden_dim       [[buffer(8)]],
+    constant uint&       top_k            [[buffer(9)]],
+    device const float*  se_swiglu        [[buffer(10)]],
+    device const ulong*  se_down_off_ptr  [[buffer(11)]],
+    device const float*  se_gate_scalar   [[buffer(12)]],
+    constant uint&       se_inter_dim     [[buffer(13)]],
+    constant uint&       se_use_sigmoid   [[buffer(14)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint base_row = tgpig * 4;
+
+    uint num_blocks = inter_dim >> 5;
+    uint row_bytes = num_blocks * 18u;
+
+    uint ix = tiisg / 4;
+    uint il = tiisg % 4;
+
+    float row_sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint k = 0; k < top_k; k++) {
+        uint expert_id = expert_ids[k];
+        ulong down_off = down_offsets[expert_id];
+        float w_k = expert_weights[k];
+        device const float* swiglu_k = swiglu_in + k * inter_dim;
+
+        for (uint r = 0; r < 4; r++) {
+            uint row = base_row + r;
+            if (row >= hidden_dim) continue;
+
+            device const uchar* row_ptr = layer_buf + down_off + row * row_bytes;
+
+            float dot = 0.0f;
+            for (uint ib = sgitg * 8 + ix; ib < num_blocks; ib += 32) {
+                uint block_base = ib * 32;
+                float yl_lo[4], yl_hi[4];
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 4; ++i) {
+                    yl_lo[i] = swiglu_k[block_base + il * 4 + i];
+                    yl_hi[i] = swiglu_k[block_base + il * 4 + 16 + i];
+                }
+
+                device const uchar* bp = row_ptr + ib * 18u;
+                float scale = float(as_type<half>(*(device const ushort*)bp));
+                device const uchar* qdata = (device const uchar*)(bp + 2) + il * 4;
+                float d = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < 4; ++i) {
+                    uchar bv = qdata[i];
+                    float lo = float(bv & 0x0F) - 8.0f;
+                    float hi = float(bv >> 4) - 8.0f;
+                    d += lo * yl_lo[i] + hi * yl_hi[i];
+                }
+                dot += d * scale;
+            }
+            row_sums[r] += w_k * dot;
+        }
+    }
+
+    // Shared expert down projection (Q4_0)
+    ulong se_off = se_down_off_ptr[0];
+    uint se_num_blocks = se_inter_dim >> 5;
+    uint se_row_bytes = se_num_blocks * 18u;
+
+    float se_sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint r = 0; r < 4; r++) {
+        uint row = base_row + r;
+        if (row >= hidden_dim) continue;
+
+        device const uchar* se_row_ptr = layer_buf + se_off + row * se_row_bytes;
+
+        float dot = 0.0f;
+        for (uint ib = sgitg * 8 + ix; ib < se_num_blocks; ib += 32) {
+            uint block_base = ib * 32;
+            float yl_lo[4], yl_hi[4];
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+                yl_lo[i] = se_swiglu[block_base + il * 4 + i];
+                yl_hi[i] = se_swiglu[block_base + il * 4 + 16 + i];
+            }
+
+            device const uchar* bp = se_row_ptr + ib * 18u;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const uchar* qdata = (device const uchar*)(bp + 2) + il * 4;
+            float d = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+                uchar bv = qdata[i];
+                float lo = float(bv & 0x0F) - 8.0f;
+                float hi = float(bv >> 4) - 8.0f;
+                d += lo * yl_lo[i] + hi * yl_hi[i];
+            }
+            dot += d * scale;
+        }
+        se_sums[r] = dot;
+    }
+
+    for (uint r = 0; r < 4; r++) {
+        row_sums[r] = simd_sum(row_sums[r]);
+        se_sums[r] = simd_sum(se_sums[r]);
+    }
+
+    threadgroup float shmem[32];
+
+    if (tiisg == 0) {
+        for (uint r = 0; r < 4; r++) {
+            shmem[r * 4 + sgitg] = row_sums[r];
+            shmem[16 + r * 4 + sgitg] = se_sums[r];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg == 0) {
+        // se_use_sigmoid=1: apply sigmoid to gate_inp_shexp dot product
+        // se_use_sigmoid=0: no gating, shared expert added at full weight (1.0)
+        float se_gate = se_use_sigmoid ? (1.0f / (1.0f + exp(-se_gate_scalar[0]))) : 1.0f;
+
+        for (uint r = 0; r < 4; r++) {
+            uint row = base_row + r;
+            if (row >= hidden_dim) continue;
+            float routed_total = shmem[r * 4] + shmem[r * 4 + 1] + shmem[r * 4 + 2] + shmem[r * 4 + 3];
+            float se_total = shmem[16 + r * 4] + shmem[16 + r * 4 + 1] + shmem[16 + r * 4 + 2] + shmem[16 + r * 4 + 3];
+            output[row] = residual[row] + routed_total + se_gate * se_total;
+        }
+    }
+}
+
+// ============================================================================
+// GatedDeltaNet (Linear Attention) kernels for Qwen3.5-35B-A3B decode
+//
+// These kernels implement the recurrent state-space computation used in
+// GatedDeltaNet layers (30 of 40 layers in Qwen3.5-35B-A3B). For single-token
+// decode, this is O(1) per token (fixed-size state update) rather than O(n)
+// KV cache scan.
+//
+// Core operations:
+//   1. Short causal 1D convolution (kernel_size=4)
+//   2. Per-head L2 normalization of Q and K
+//   3. Sigmoid gating (beta)
+//   4. Delta rule state update: h = (1-beta)*h + beta*outer(k,v)
+//   5. Output from state: out = h^T @ q
+//   6. SiLU gating (alpha) and elementwise multiply
+// ============================================================================
+
+// ============================================================================
+// ssm_conv1d_decode: Causal 1D convolution for single-token decode
+//
+// Maintains a circular buffer of the last (kernel_size-1) token activations.
+// For each dimension d:
+//   output[d] = sum_{i=0}^{kernel_size-1} kernel_w[d * kernel_size + i] * state[i][d]
+// where state includes the current input as the newest entry.
+//
+// buffer(0): input_val   [dim] float         — current token activation
+// buffer(1): conv_state  [(kernel_size-1) * dim] float — circular buffer (R/W)
+// buffer(2): kernel_w    [dim * kernel_size] float     — conv weights [dim, kernel_size]
+// buffer(3): output      [dim] float                   — OUTPUT
+// buffer(4): dim (uint)
+// buffer(5): kernel_size (uint)
+// buffer(6): state_pos (uint)  — current write position in circular buffer [0..kernel_size-2]
+//
+// grid: (ceil(dim/256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+

@@ -1,0 +1,784 @@
+kernel void add_write(
+    device const float* a   [[buffer(0)]],
+    device const float* b   [[buffer(1)]],
+    device float*       out [[buffer(2)]],
+    uint gid                [[thread_position_in_grid]])
+{
+    out[gid] = a[gid] + b[gid];
+}
+
+kernel void copy_buffer(
+    device const float* src [[buffer(0)]],
+    device float*       dst [[buffer(1)]],
+    uint gid                [[thread_position_in_grid]])
+{
+    dst[gid] = src[gid];
+}
+
+// ============================================================================
+// ffn_fused_gate_up_swiglu_q8_0: Fused Gate+Up+SwiGLU for decode
+//
+// Fuses 3 operations into a single dispatch:
+//   Phase 1: Gate matmul (Q8_0 dequant, reads normed x from device memory)
+//   Phase 2: Up matmul (Q8_0 dequant, reads normed x from device memory)
+//   Phase 3: SwiGLU (gate * sigmoid(gate) * up) -> write to out
+//
+// Eliminates:
+//   - 1 encoder barrier between gate/up and swiglu dispatches
+//   - Device memory write of up_buf (22KB) -- up goes directly to SwiGLU
+//   - Device memory read of gate_buf by SwiGLU (22KB)
+//   - Device memory read of up_buf by SwiGLU (22KB)
+//   - Gate and up values stay in registers, never touch device memory
+//
+// Dispatch: ceil(inter_dim/4) threadgroups, 128 threads each (4 simdgroups)
+// Each simdgroup handles 1 output row.
+// Zero threadgroup memory required.
+// ============================================================================
+
+kernel void ffn_fused_gate_up_swiglu_q8_0(
+    device const uchar* w_gate_q8   [[buffer(0)]],   // gate weights Q8_0 [inter_dim, hidden_dim]
+    device const float* x           [[buffer(1)]],   // normed input [hidden_dim]
+    device float*       out         [[buffer(2)]],   // output [inter_dim] (SwiGLU result)
+    constant uint&      in_dim      [[buffer(3)]],   // hidden_dim
+    constant uint&      out_dim     [[buffer(4)]],   // inter_dim
+    device const uchar* w_up_q8     [[buffer(5)]],   // up weights Q8_0 [inter_dim, hidden_dim]
+    uint row_group                  [[threadgroup_position_in_grid]],
+    uint lane                       [[thread_index_in_simdgroup]],
+    uint sg                         [[simdgroup_index_in_threadgroup]])
+{
+    uint row = row_group * 4 + sg;
+    if (row >= out_dim) return;
+
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = in_dim >> 5;  // in_dim / 32
+    uint row_bytes = num_blocks * Q8_BLOCK_SIZE;
+
+    // --- Gate matmul: dot(w_gate[row], x) ---
+    device const uchar* gate_row_ptr = w_gate_q8 + row * row_bytes;
+    float gate_sum = 0.0f;
+
+    uint b = 0;
+    for (; b + 3 < num_blocks; b += 4) {
+        device const uchar* bp0 = gate_row_ptr + b * Q8_BLOCK_SIZE;
+        device const uchar* bp1 = bp0 + Q8_BLOCK_SIZE;
+        device const uchar* bp2 = bp1 + Q8_BLOCK_SIZE;
+        device const uchar* bp3 = bp2 + Q8_BLOCK_SIZE;
+        half s0 = as_type<half>(*(device const ushort*)bp0);
+        half s1 = as_type<half>(*(device const ushort*)bp1);
+        half s2 = as_type<half>(*(device const ushort*)bp2);
+        half s3 = as_type<half>(*(device const ushort*)bp3);
+        float v0 = float(((device const char*)(bp0 + 2))[lane]) * x[(b << 5) + lane];
+        float v1 = float(((device const char*)(bp1 + 2))[lane]) * x[((b+1) << 5) + lane];
+        float v2 = float(((device const char*)(bp2 + 2))[lane]) * x[((b+2) << 5) + lane];
+        float v3 = float(((device const char*)(bp3 + 2))[lane]) * x[((b+3) << 5) + lane];
+        gate_sum += float(s0) * simd_sum(v0) + float(s1) * simd_sum(v1)
+                  + float(s2) * simd_sum(v2) + float(s3) * simd_sum(v3);
+    }
+    for (; b < num_blocks; b++) {
+        device const uchar* bp = gate_row_ptr + b * Q8_BLOCK_SIZE;
+        half sc = as_type<half>(*(device const ushort*)bp);
+        float val = float(((device const char*)(bp + 2))[lane]) * x[(b << 5) + lane];
+        gate_sum += float(sc) * simd_sum(val);
+    }
+
+    // --- Up matmul: dot(w_up[row], x) ---
+    device const uchar* up_row_ptr = w_up_q8 + row * row_bytes;
+    float up_sum = 0.0f;
+
+    b = 0;
+    for (; b + 3 < num_blocks; b += 4) {
+        device const uchar* bp0 = up_row_ptr + b * Q8_BLOCK_SIZE;
+        device const uchar* bp1 = bp0 + Q8_BLOCK_SIZE;
+        device const uchar* bp2 = bp1 + Q8_BLOCK_SIZE;
+        device const uchar* bp3 = bp2 + Q8_BLOCK_SIZE;
+        half s0 = as_type<half>(*(device const ushort*)bp0);
+        half s1 = as_type<half>(*(device const ushort*)bp1);
+        half s2 = as_type<half>(*(device const ushort*)bp2);
+        half s3 = as_type<half>(*(device const ushort*)bp3);
+        float v0 = float(((device const char*)(bp0 + 2))[lane]) * x[(b << 5) + lane];
+        float v1 = float(((device const char*)(bp1 + 2))[lane]) * x[((b+1) << 5) + lane];
+        float v2 = float(((device const char*)(bp2 + 2))[lane]) * x[((b+2) << 5) + lane];
+        float v3 = float(((device const char*)(bp3 + 2))[lane]) * x[((b+3) << 5) + lane];
+        up_sum += float(s0) * simd_sum(v0) + float(s1) * simd_sum(v1)
+                + float(s2) * simd_sum(v2) + float(s3) * simd_sum(v3);
+    }
+    for (; b < num_blocks; b++) {
+        device const uchar* bp = up_row_ptr + b * Q8_BLOCK_SIZE;
+        half sc = as_type<half>(*(device const ushort*)bp);
+        float val = float(((device const char*)(bp + 2))[lane]) * x[(b << 5) + lane];
+        up_sum += float(sc) * simd_sum(val);
+    }
+
+    // --- SwiGLU: gate * sigmoid(gate) * up ---
+    if (lane == 0) {
+        float g = gate_sum;
+        float sigmoid = 1.0f / (1.0f + exp(-g));
+        out[row] = g * sigmoid * up_sum;
+    }
+}
+
+// ============================================================================
+// ffn_fused_gate_up_swiglu_q8_0_deferred: Deferred-reduction fused FFN
+//
+// Same computation as ffn_fused_gate_up_swiglu_q8_0 but uses the llama.cpp
+// deferred-reduction pattern to minimize simd_sum() synchronization:
+//
+// Old kernel: simd_sum() on every Q8_0 block (176 calls for hidden_dim=5632)
+// New kernel: each thread accumulates 8 elements locally per block, ONE
+//             simd_sum() at the end + cross-SG shared memory reduction.
+//
+// Thread mapping (NQ=8, NW=32, NSG=4, 128 threads/TG):
+//   ix = tiisg / 4  -> 0..7 (selects block within stride of 8)
+//   il = tiisg % 4  -> 0..3 (selects which 8 bytes within 32-byte block)
+//   Stride = NW/4 = 8 blocks per iteration
+//
+// Each threadgroup processes 1 output row (out_dim threadgroups).
+// All 4 simdgroups cooperate on the SAME row via shared memory reduction.
+//
+// Dispatch: out_dim threadgroups, 128 threads each (4 simdgroups)
+// ============================================================================
+
+kernel void ffn_fused_gate_up_swiglu_q8_0_deferred(
+    device const uchar* w_gate_q8   [[buffer(0)]],   // gate weights Q8_0 [inter_dim, hidden_dim]
+    device const float* x           [[buffer(1)]],   // normed input [hidden_dim]
+    device float*       out         [[buffer(2)]],   // output [inter_dim] (SwiGLU result)
+    constant uint&      in_dim      [[buffer(3)]],   // hidden_dim
+    constant uint&      out_dim     [[buffer(4)]],   // inter_dim
+    device const uchar* w_up_q8     [[buffer(5)]],   // up weights Q8_0 [inter_dim, hidden_dim]
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint row = tgpig;
+    if (row >= out_dim) return;
+
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = in_dim >> 5;  // in_dim / 32
+    uint row_bytes = num_blocks * Q8_BLOCK_SIZE;
+
+    // Thread mapping: each thread handles 8 contiguous elements within a block
+    uint ix = tiisg / 4;   // 0..7: which block in stride of 8
+    uint il = tiisg % 4;   // 0..3: which 8-byte quarter within 32-byte data
+
+    device const uchar* gate_row_ptr = w_gate_q8 + row * row_bytes;
+    device const uchar* up_row_ptr   = w_up_q8   + row * row_bytes;
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+
+    // Each simdgroup starts at a different offset and strides by NSG * 8 blocks
+    // NSG=4 simdgroups, each strides 8 blocks -> total stride = 32 blocks/iter
+    for (uint ib = sgitg * 8 + ix; ib < num_blocks; ib += 32) {
+        // Load 8 x-values for this thread's quarter of the block
+        uint x_base = ib * 32 + il * 8;
+        float yl[8];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) {
+            yl[i] = x[x_base + i];
+        }
+
+        // Gate weights: read scale + 8 int8 values
+        device const uchar* gate_bp = gate_row_ptr + ib * Q8_BLOCK_SIZE;
+        half gate_scale = as_type<half>(*(device const ushort*)gate_bp);
+        device const char* gate_qs = (device const char*)(gate_bp + 2) + il * 8;
+        float gate_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) {
+            gate_dot += float(gate_qs[i]) * yl[i];
+        }
+        gate_sum += gate_dot * float(gate_scale);
+
+        // Up weights: same x-values, different weight row
+        device const uchar* up_bp = up_row_ptr + ib * Q8_BLOCK_SIZE;
+        half up_scale = as_type<half>(*(device const ushort*)up_bp);
+        device const char* up_qs = (device const char*)(up_bp + 2) + il * 8;
+        float up_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) {
+            up_dot += float(up_qs[i]) * yl[i];
+        }
+        up_sum += up_dot * float(up_scale);
+    }
+
+    // Final reduction: simd_sum within each simdgroup (just 1 call each!)
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+
+    // Cross-simdgroup reduction via shared memory
+    threadgroup float shmem[8];  // [0..3] for gate, [4..7] for up
+
+    if (tiisg == 0) {
+        shmem[sgitg]     = gate_sum;
+        shmem[sgitg + 4] = up_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread 0 of simdgroup 0 does final reduction + SwiGLU
+    if (sgitg == 0 && tiisg == 0) {
+        float g = shmem[0] + shmem[1] + shmem[2] + shmem[3];
+        float u = shmem[4] + shmem[5] + shmem[6] + shmem[7];
+        float sigmoid = 1.0f / (1.0f + exp(-g));
+        out[row] = g * sigmoid * u;
+    }
+}
+
+// ============================================================================
+// ffn_fused_gate_up_swiglu_q4_0: Fused Gate+Up+SwiGLU for Q4_0 decode
+//
+// Identical structure to Q8_0 fused kernel but with Q4_0 dequantization.
+// Q4_0 block: 18 bytes (2 byte f16 scale + 16 bytes of packed 4-bit values)
+// Each byte holds 2 elements: low nibble (even lane), high nibble (odd lane).
+// Dequant: (float(nibble) - 8.0) * scale
+//
+// Dispatch: ceil(inter_dim/4) threadgroups, 128 threads each (4 simdgroups)
+// Each simdgroup handles 1 output row.
+// Zero threadgroup memory required.
+// ============================================================================
+
+kernel void ffn_fused_gate_up_swiglu_q4_0(
+    device const uchar* w_gate_q4   [[buffer(0)]],   // gate weights Q4_0 [inter_dim, hidden_dim]
+    device const float* x           [[buffer(1)]],   // normed input [hidden_dim]
+    device float*       out         [[buffer(2)]],   // output [inter_dim] (SwiGLU result)
+    constant uint&      in_dim      [[buffer(3)]],   // hidden_dim
+    constant uint&      out_dim     [[buffer(4)]],   // inter_dim
+    device const uchar* w_up_q4     [[buffer(5)]],   // up weights Q4_0 [inter_dim, hidden_dim]
+    uint row_group                  [[threadgroup_position_in_grid]],
+    uint lane                       [[thread_index_in_simdgroup]],
+    uint sg                         [[simdgroup_index_in_threadgroup]])
+{
+    uint row = row_group * 4 + sg;
+    if (row >= out_dim) return;
+
+    uint num_blocks = in_dim >> 5;  // in_dim / 32
+    uint row_bytes = num_blocks * Q4_BLOCK_SIZE;
+
+    // De-interleaved nibble mapping
+    uint q4_byte = (lane < 16) ? lane : (lane - 16);
+    bool q4_hi = (lane >= 16);
+
+    // --- Gate matmul: dot(w_gate[row], x) ---
+    device const uchar* gate_row_ptr = w_gate_q4 + row * row_bytes;
+    float gate_sum = 0.0f;
+
+    uint b = 0;
+    for (; b + 3 < num_blocks; b += 4) {
+        device const uchar* bp0 = gate_row_ptr + b * Q4_BLOCK_SIZE;
+        device const uchar* bp1 = bp0 + Q4_BLOCK_SIZE;
+        device const uchar* bp2 = bp1 + Q4_BLOCK_SIZE;
+        device const uchar* bp3 = bp2 + Q4_BLOCK_SIZE;
+        half s0 = as_type<half>(*(device const ushort*)bp0);
+        half s1 = as_type<half>(*(device const ushort*)bp1);
+        half s2 = as_type<half>(*(device const ushort*)bp2);
+        half s3 = as_type<half>(*(device const ushort*)bp3);
+        uchar byte0 = (bp0 + 2)[q4_byte];
+        uchar byte1 = (bp1 + 2)[q4_byte];
+        uchar byte2 = (bp2 + 2)[q4_byte];
+        uchar byte3 = (bp3 + 2)[q4_byte];
+        int q0 = (q4_hi ? (byte0 >> 4) : (byte0 & 0xF)) - 8;
+        int q1 = (q4_hi ? (byte1 >> 4) : (byte1 & 0xF)) - 8;
+        int q2 = (q4_hi ? (byte2 >> 4) : (byte2 & 0xF)) - 8;
+        int q3 = (q4_hi ? (byte3 >> 4) : (byte3 & 0xF)) - 8;
+        float v0 = float(q0) * x[(b << 5) + lane];
+        float v1 = float(q1) * x[((b+1) << 5) + lane];
+        float v2 = float(q2) * x[((b+2) << 5) + lane];
+        float v3 = float(q3) * x[((b+3) << 5) + lane];
+        gate_sum += float(s0) * simd_sum(v0) + float(s1) * simd_sum(v1)
+                  + float(s2) * simd_sum(v2) + float(s3) * simd_sum(v3);
+    }
+    for (; b < num_blocks; b++) {
+        device const uchar* bp = gate_row_ptr + b * Q4_BLOCK_SIZE;
+        half sc = as_type<half>(*(device const ushort*)bp);
+        uchar byte_val = (bp + 2)[q4_byte];
+        int q = (q4_hi ? (byte_val >> 4) : (byte_val & 0xF)) - 8;
+        float val = float(q) * x[(b << 5) + lane];
+        gate_sum += float(sc) * simd_sum(val);
+    }
+
+    // --- Up matmul: dot(w_up[row], x) ---
+    device const uchar* up_row_ptr = w_up_q4 + row * row_bytes;
+    float up_sum = 0.0f;
+
+    b = 0;
+    for (; b + 3 < num_blocks; b += 4) {
+        device const uchar* bp0 = up_row_ptr + b * Q4_BLOCK_SIZE;
+        device const uchar* bp1 = bp0 + Q4_BLOCK_SIZE;
+        device const uchar* bp2 = bp1 + Q4_BLOCK_SIZE;
+        device const uchar* bp3 = bp2 + Q4_BLOCK_SIZE;
+        half s0 = as_type<half>(*(device const ushort*)bp0);
+        half s1 = as_type<half>(*(device const ushort*)bp1);
+        half s2 = as_type<half>(*(device const ushort*)bp2);
+        half s3 = as_type<half>(*(device const ushort*)bp3);
+        uchar byte0 = (bp0 + 2)[q4_byte];
+        uchar byte1 = (bp1 + 2)[q4_byte];
+        uchar byte2 = (bp2 + 2)[q4_byte];
+        uchar byte3 = (bp3 + 2)[q4_byte];
+        int q0 = (q4_hi ? (byte0 >> 4) : (byte0 & 0xF)) - 8;
+        int q1 = (q4_hi ? (byte1 >> 4) : (byte1 & 0xF)) - 8;
+        int q2 = (q4_hi ? (byte2 >> 4) : (byte2 & 0xF)) - 8;
+        int q3 = (q4_hi ? (byte3 >> 4) : (byte3 & 0xF)) - 8;
+        float v0 = float(q0) * x[(b << 5) + lane];
+        float v1 = float(q1) * x[((b+1) << 5) + lane];
+        float v2 = float(q2) * x[((b+2) << 5) + lane];
+        float v3 = float(q3) * x[((b+3) << 5) + lane];
+        up_sum += float(s0) * simd_sum(v0) + float(s1) * simd_sum(v1)
+                + float(s2) * simd_sum(v2) + float(s3) * simd_sum(v3);
+    }
+    for (; b < num_blocks; b++) {
+        device const uchar* bp = up_row_ptr + b * Q4_BLOCK_SIZE;
+        half sc = as_type<half>(*(device const ushort*)bp);
+        uchar byte_val = (bp + 2)[q4_byte];
+        int q = (q4_hi ? (byte_val >> 4) : (byte_val & 0xF)) - 8;
+        float val = float(q) * x[(b << 5) + lane];
+        up_sum += float(sc) * simd_sum(val);
+    }
+
+    // --- SwiGLU: gate * sigmoid(gate) * up ---
+    if (lane == 0) {
+        float g = gate_sum;
+        float sigmoid = 1.0f / (1.0f + exp(-g));
+        out[row] = g * sigmoid * up_sum;
+    }
+}
+
+// ============================================================================
+// ffn_fused_gate_up_swiglu_q4_0_deferred: Fused Gate+Up+SwiGLU for Q4_0 decode
+// with deferred reduction (mirrors Q8_0 deferred FFN pattern).
+//
+// 128 threads (4 simdgroups), 1 output row per threadgroup.
+// Deferred accumulation: local sums across all blocks, ONE simd_sum at end.
+// Q4_0 nibble dequantization for both gate and up weights.
+//
+// Dispatch: inter_dim threadgroups, 128 threads each
+// ============================================================================
+
+kernel void ffn_fused_gate_up_swiglu_q4_0_deferred(
+    device const uchar* w_gate_q4   [[buffer(0)]],   // gate weights Q4_0 [inter_dim, hidden_dim]
+    device const float* x           [[buffer(1)]],   // normed input [hidden_dim]
+    device float*       out         [[buffer(2)]],   // output [inter_dim] (SwiGLU result)
+    constant uint&      in_dim      [[buffer(3)]],   // hidden_dim
+    constant uint&      out_dim     [[buffer(4)]],   // inter_dim
+    device const uchar* w_up_q4     [[buffer(5)]],   // up weights Q4_0 [inter_dim, hidden_dim]
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint row = tgpig;
+    if (row >= out_dim) return;
+
+    uint num_blocks = in_dim >> 5;  // in_dim / 32
+    uint row_bytes = num_blocks * Q4_BLOCK_SIZE;
+
+    // Thread mapping: each thread handles 8 contiguous elements within a block
+    uint ix = tiisg / 4;   // 0..7: which block in stride of 8
+    uint il = tiisg % 4;   // 0..3: which 4-byte (8-element) quarter within 16-byte data
+
+    device const uchar* gate_row_ptr = w_gate_q4 + row * row_bytes;
+    device const uchar* up_row_ptr   = w_up_q4   + row * row_bytes;
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+
+    // Each simdgroup starts at a different offset and strides by NSG * 8 blocks
+    // NSG=4 simdgroups, each strides 8 blocks -> total stride = 32 blocks/iter
+    for (uint ib = sgitg * 8 + ix; ib < num_blocks; ib += 32) {
+        // Load x-values for de-interleaved nibble positions
+        uint block_base = ib * 32;
+        float yl_lo[4], yl_hi[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            yl_lo[i] = x[block_base + il * 4 + i];
+            yl_hi[i] = x[block_base + il * 4 + 16 + i];
+        }
+
+        // Gate weights: read scale + 4 bytes (8 nibbles)
+        device const uchar* gate_bp = gate_row_ptr + ib * Q4_BLOCK_SIZE;
+        float gate_scale = float(as_type<half>(*(device const ushort*)gate_bp));
+        device const uchar* gate_qdata = (device const uchar*)(gate_bp + 2) + il * 4;
+
+        float gate_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            uchar byte_val = gate_qdata[i];
+            float lo = float(byte_val & 0x0F) - 8.0f;
+            float hi = float(byte_val >> 4) - 8.0f;
+            gate_dot += lo * yl_lo[i] + hi * yl_hi[i];
+        }
+        gate_sum += gate_dot * gate_scale;
+
+        // Up weights: same x-values, different weight row
+        device const uchar* up_bp = up_row_ptr + ib * Q4_BLOCK_SIZE;
+        float up_scale = float(as_type<half>(*(device const ushort*)up_bp));
+        device const uchar* up_qdata = (device const uchar*)(up_bp + 2) + il * 4;
+
+        float up_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            uchar byte_val = up_qdata[i];
+            float lo = float(byte_val & 0x0F) - 8.0f;
+            float hi = float(byte_val >> 4) - 8.0f;
+            up_dot += lo * yl_lo[i] + hi * yl_hi[i];
+        }
+        up_sum += up_dot * up_scale;
+    }
+
+    // Final reduction: simd_sum within each simdgroup (just 1 call each!)
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+
+    // Cross-simdgroup reduction via shared memory
+    threadgroup float shmem[8];  // [0..3] for gate, [4..7] for up
+
+    if (tiisg == 0) {
+        shmem[sgitg]     = gate_sum;
+        shmem[sgitg + 4] = up_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread 0 of simdgroup 0 does final reduction + SwiGLU
+    if (sgitg == 0 && tiisg == 0) {
+        float g = shmem[0] + shmem[1] + shmem[2] + shmem[3];
+        float u = shmem[4] + shmem[5] + shmem[6] + shmem[7];
+        float sigmoid = 1.0f / (1.0f + exp(-g));
+        out[row] = g * sigmoid * u;
+    }
+}
+
+// ============================================================================
+// ffn_fused_gate_up_swiglu_q4_1_deferred: Fused Gate+Up+SwiGLU for Q4_1 decode
+// with deferred reduction (mirrors Q4_0 deferred FFN pattern).
+//
+// Q4_1 block layout: [f16 scale (2B)] [f16 min (2B)] [16 x uint8 nibbles (16B)] = 20 bytes/block
+// dequant: value[i] = scale * nibble(i) + min
+//
+// 128 threads (4 simdgroups), 1 output row per threadgroup.
+// Deferred accumulation: local sums across all blocks, ONE simd_sum at end.
+//
+// Dispatch: inter_dim threadgroups, 128 threads each
+// ============================================================================
+
+kernel void ffn_fused_gate_up_swiglu_q4_1_deferred(
+    device const uchar* w_gate_q4   [[buffer(0)]],   // gate weights Q4_1 [inter_dim, hidden_dim]
+    device const float* x           [[buffer(1)]],   // normed input [hidden_dim]
+    device float*       out         [[buffer(2)]],   // output [inter_dim] (SwiGLU result)
+    constant uint&      in_dim      [[buffer(3)]],   // hidden_dim
+    constant uint&      out_dim     [[buffer(4)]],   // inter_dim
+    device const uchar* w_up_q4     [[buffer(5)]],   // up weights Q4_1 [inter_dim, hidden_dim]
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint row = tgpig;
+    if (row >= out_dim) return;
+
+    uint num_blocks = in_dim >> 5;  // in_dim / 32
+    uint row_bytes = num_blocks * Q4_1_BLOCK_SIZE;
+
+    // Thread mapping: each thread handles 8 contiguous elements within a block
+    uint ix = tiisg / 4;   // 0..7: which block in stride of 8
+    uint il = tiisg % 4;   // 0..3: which 4-byte (8-element) quarter within 16-byte data
+
+    device const uchar* gate_row_ptr = w_gate_q4 + row * row_bytes;
+    device const uchar* up_row_ptr   = w_up_q4   + row * row_bytes;
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+
+    // Each simdgroup starts at a different offset and strides by NSG * 8 blocks
+    // NSG=4 simdgroups, each strides 8 blocks -> total stride = 32 blocks/iter
+    for (uint ib = sgitg * 8 + ix; ib < num_blocks; ib += 32) {
+        // Load x-values for de-interleaved nibble positions
+        uint block_base = ib * 32;
+        float yl_lo[4], yl_hi[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            yl_lo[i] = x[block_base + il * 4 + i];
+            yl_hi[i] = x[block_base + il * 4 + 16 + i];
+        }
+
+        // Gate weights: Q4_1 block = [f16 scale, f16 min, 16B nibbles]
+        device const uchar* gate_bp = gate_row_ptr + ib * Q4_1_BLOCK_SIZE;
+        float gate_scale = float(as_type<half>(*(device const ushort*)gate_bp));
+        float gate_min   = float(as_type<half>(*(device const ushort*)(gate_bp + 2)));
+        device const uchar* gate_qdata = (device const uchar*)(gate_bp + 4) + il * 4;
+
+        float gate_dot = 0.0f;
+        float gate_sumy = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            uchar byte_val = gate_qdata[i];
+            float lo = float(byte_val & 0x0F);
+            float hi = float(byte_val >> 4);
+            gate_dot  += lo * yl_lo[i] + hi * yl_hi[i];
+            gate_sumy += yl_lo[i] + yl_hi[i];
+        }
+        gate_sum += gate_dot * gate_scale + gate_sumy * gate_min;
+
+        // Up weights: same x-values, different weight row
+        device const uchar* up_bp = up_row_ptr + ib * Q4_1_BLOCK_SIZE;
+        float up_scale = float(as_type<half>(*(device const ushort*)up_bp));
+        float up_min   = float(as_type<half>(*(device const ushort*)(up_bp + 2)));
+        device const uchar* up_qdata = (device const uchar*)(up_bp + 4) + il * 4;
+
+        float up_dot = 0.0f;
+        float up_sumy = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            uchar byte_val = up_qdata[i];
+            float lo = float(byte_val & 0x0F);
+            float hi = float(byte_val >> 4);
+            up_dot  += lo * yl_lo[i] + hi * yl_hi[i];
+            up_sumy += yl_lo[i] + yl_hi[i];
+        }
+        up_sum += up_dot * up_scale + up_sumy * up_min;
+    }
+
+    // Final reduction: simd_sum within each simdgroup (just 1 call each!)
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+
+    // Cross-simdgroup reduction via shared memory
+    threadgroup float shmem[8];  // [0..3] for gate, [4..7] for up
+
+    if (tiisg == 0) {
+        shmem[sgitg]     = gate_sum;
+        shmem[sgitg + 4] = up_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread 0 of simdgroup 0 does final reduction + SwiGLU
+    if (sgitg == 0 && tiisg == 0) {
+        float g = shmem[0] + shmem[1] + shmem[2] + shmem[3];
+        float u = shmem[4] + shmem[5] + shmem[6] + shmem[7];
+        float sigmoid = 1.0f / (1.0f + exp(-g));
+        out[row] = g * sigmoid * u;
+    }
+}
+
+// ============================================================================
+// ffn_fused_gate_up_swiglu_f16_deferred: Fused Gate+Up+SwiGLU for F16 decode
+// with deferred reduction (mirrors Q8_0 deferred FFN pattern).
+//
+// F16 weights: dense half-precision, no block structure.
+// Each row of gate/up weights is in_dim contiguous half values.
+//
+// 128 threads (4 simdgroups), 1 output row per threadgroup.
+// Deferred accumulation: local sums across entire row, ONE simd_sum at end.
+//
+// Dispatch: inter_dim threadgroups, 128 threads each
+// ============================================================================
+
+kernel void ffn_fused_gate_up_swiglu_f16_deferred(
+    device const half*  w_gate_f16  [[buffer(0)]],   // gate weights F16 [inter_dim, hidden_dim]
+    device const float* x           [[buffer(1)]],   // normed input [hidden_dim]
+    device float*       out         [[buffer(2)]],   // output [inter_dim] (SwiGLU result)
+    constant uint&      in_dim      [[buffer(3)]],   // hidden_dim
+    constant uint&      out_dim     [[buffer(4)]],   // inter_dim
+    device const half*  w_up_f16    [[buffer(5)]],   // up weights F16 [inter_dim, hidden_dim]
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint row = tgpig;
+    if (row >= out_dim) return;
+
+    const uint NSG = 4;
+    const uint NW = 32;
+    const uint tid = sgitg * NW + tiisg;
+    const uint total_threads = NSG * NW;  // 128
+
+    device const half* gate_row = w_gate_f16 + row * in_dim;
+    device const half* up_row   = w_up_f16   + row * in_dim;
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+
+    for (uint j = tid; j < in_dim; j += total_threads) {
+        float xv = x[j];
+        gate_sum += float(gate_row[j]) * xv;
+        up_sum   += float(up_row[j])   * xv;
+    }
+
+    // Final reduction: simd_sum within each simdgroup
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+
+    // Cross-simdgroup reduction via shared memory
+    threadgroup float shmem[8];  // [0..3] for gate, [4..7] for up
+
+    if (tiisg == 0) {
+        shmem[sgitg]     = gate_sum;
+        shmem[sgitg + 4] = up_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread 0 of simdgroup 0 does final reduction + SwiGLU
+    if (sgitg == 0 && tiisg == 0) {
+        float g = shmem[0] + shmem[1] + shmem[2] + shmem[3];
+        float u = shmem[4] + shmem[5] + shmem[6] + shmem[7];
+        float sigmoid = 1.0f / (1.0f + exp(-g));
+        out[row] = g * sigmoid * u;
+    }
+}
+
+// ============================================================================
+// argmax: GPU-side greedy sampling (single threadgroup, 256 threads)
+//
+// Finds the index of the maximum element in logits[0..n).
+// Eliminates 128 KB logits readback -- only 4 bytes (u32 token ID) returned.
+//
+// Launch: 1 threadgroup, 256 threads.
+// ============================================================================
+
+kernel void argmax(
+    device const float* logits [[buffer(0)]],
+    device uint*        result [[buffer(1)]],
+    constant uint&      n      [[buffer(2)]],
+    uint tid        [[thread_index_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    // Each thread finds local max across strided elements
+    float max_val = -INFINITY;
+    uint max_idx = 0;
+    uint tg_size = 256;
+    for (uint i = tid; i < n; i += tg_size) {
+        float v = logits[i];
+        if (v > max_val) { max_val = v; max_idx = i; }
+    }
+
+    // SIMD reduction (32-wide on Apple Silicon)
+    for (uint offset = 16; offset > 0; offset >>= 1) {
+        float other_val = simd_shuffle_down(max_val, offset);
+        uint other_idx = simd_shuffle_down(max_idx, offset);
+        if (other_val > max_val) { max_val = other_val; max_idx = other_idx; }
+    }
+
+    // Cross-simdgroup reduction via threadgroup memory
+    threadgroup float tg_vals[8];
+    threadgroup uint tg_idxs[8];
+    if (simd_lane == 0) {
+        tg_vals[simd_group] = max_val;
+        tg_idxs[simd_group] = max_idx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread 0 does final serial reduction across 8 simdgroups
+    if (tid == 0) {
+        float best = tg_vals[0];
+        uint best_idx = tg_idxs[0];
+        for (uint i = 1; i < 8; i++) {
+            if (tg_vals[i] > best) { best = tg_vals[i]; best_idx = tg_idxs[i]; }
+        }
+        result[0] = best_idx;
+    }
+}
+
+// ============================================================================
+// bias_add: Element-wise bias addition for single-token decode
+//
+// Adds a bias vector to the output of a matmul projection:
+//   data[i] += bias[i]  for i in 0..n
+//
+// Used for QKV bias in Qwen2-family models. Zero-cost for models without bias
+// (dispatch is conditional on the presence of bias tensors).
+// Dispatch: ceil(n / 256) threadgroups, 256 threads each.
+// ============================================================================
+
+kernel void bias_add(
+    device float*       data [[buffer(0)]],
+    device const float* bias [[buffer(1)]],
+    constant uint&      n    [[buffer(2)]],
+    uint tid                 [[thread_position_in_grid]])
+{
+    if (tid < n) {
+        data[tid] += bias[tid];
+    }
+}
+
+// ============================================================================
+// bias_add_batched: Broadcast bias addition for batched prefill
+//
+// For a [rows, cols] activation matrix, adds bias[j] to every row:
+//   data[i * cols + j] += bias[j]  for all (i, j)
+//
+// total = rows * cols. The bias vector (length = cols) is broadcast across
+// all rows via modular indexing.
+// Dispatch: ceil(total / 256) threadgroups, 256 threads each.
+// ============================================================================
+
+kernel void bias_add_batched(
+    device float*       data  [[buffer(0)]],
+    device const float* bias  [[buffer(1)]],
+    constant uint&      cols  [[buffer(2)]],
+    constant uint&      total [[buffer(3)]],
+    uint tid                  [[thread_position_in_grid]])
+{
+    if (tid < total) {
+        data[tid] += bias[tid % cols];
+    }
+}
+
+// ============================================================================
+// deinterleave_qkv: Split fused [M][qkv_dim] output into separate Q, K, V buffers
+//
+// Fused QKV GEMM produces [M][qkv_dim] where each row is [Q|K|V] concatenated.
+// Downstream kernels expect separate [M][q_dim], [M][kv_dim], [M][kv_dim] buffers.
+// This kernel copies each component to its target buffer with correct stride.
+//
+// Thread mapping: 1D grid, total_elements = M * qkv_dim
+// Each thread copies one float from the fused buffer to the correct output buffer.
+// ============================================================================
+
+kernel void deinterleave_qkv(
+    device const float* qkv_fused  [[buffer(0)]],  // [M, qkv_dim] fused output
+    device float*       Q          [[buffer(1)]],   // [M, q_dim] output
+    device float*       K          [[buffer(2)]],   // [M, kv_dim] output
+    device float*       V          [[buffer(3)]],   // [M, kv_dim] output
+    constant uint&      M          [[buffer(4)]],   // batch size
+    constant uint&      q_dim      [[buffer(5)]],   // Q output dim
+    constant uint&      kv_dim     [[buffer(6)]],   // K/V output dim
+    constant uint&      qkv_dim    [[buffer(7)]],   // q_dim + 2*kv_dim
+    uint tid                       [[thread_position_in_grid]])
+{
+    uint total = M * qkv_dim;
+    if (tid >= total) return;
+
+    uint row = tid / qkv_dim;
+    uint col = tid % qkv_dim;
+    float val = qkv_fused[tid];
+
+    if (col < q_dim) {
+        Q[row * q_dim + col] = val;
+    } else if (col < q_dim + kv_dim) {
+        K[row * kv_dim + (col - q_dim)] = val;
+    } else {
+        V[row * kv_dim + (col - q_dim - kv_dim)] = val;
+    }
+}
+
+// ============================================================================
+// MoE (Mixture of Experts) Kernels
+// ============================================================================
+
+// ============================================================================
+// moe_router_softmax: Compute router logits, apply softmax, select top-K experts.
+//
+// For a single token's hidden state, computes the dot product against each
+// expert's gating vector (one row of gate_weight), applies softmax over all
+// experts, selects the top-K experts by weight, and renormalizes the selected
+// weights to sum to 1.0.
+//
+// Optimized for small num_experts (e.g. 8 for Mixtral) with large hidden_dim
+// (e.g. 4096). The threadgroup cooperatively reduces the dot products.
+//
+// buffer(0): hidden_state  [hidden_dim] float            — normalized input
+// buffer(1): gate_weight   [num_experts * hidden_dim] float — router weights (row-major)
+// buffer(2): expert_ids    [top_k] uint32                — OUTPUT: selected expert indices
+// buffer(3): expert_weights [top_k] float                — OUTPUT: normalized routing weights
+// buffer(4): hidden_dim (uint)
+// buffer(5): num_experts (uint)
+// buffer(6): top_k (uint)
+//
+// grid: (1, 1, 1), threadgroup: (min(256, hidden_dim), 1, 1)
+// ============================================================================
+

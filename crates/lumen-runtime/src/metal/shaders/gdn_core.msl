@@ -1,0 +1,1163 @@
+kernel void ssm_conv1d_decode(
+    device const float* input_val  [[buffer(0)]],
+    device       float* conv_state [[buffer(1)]],
+    device const float* kernel_w   [[buffer(2)]],
+    device       float* output     [[buffer(3)]],
+    constant     uint&  dim        [[buffer(4)]],
+    constant     uint&  kernel_size [[buffer(5)]],
+    constant     uint&  state_pos  [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+
+    float sum = 0.0f;
+    uint buf_slots = kernel_size - 1;
+
+    // Taps 0..kernel_size-2: read from circular buffer (oldest to newest)
+    for (uint tap = 0; tap < buf_slots; tap++) {
+        uint slot = (state_pos + tap) % buf_slots;
+        sum += kernel_w[gid * kernel_size + tap] * conv_state[slot * dim + gid];
+    }
+
+    // Tap kernel_size-1: current input (newest)
+    sum += kernel_w[gid * kernel_size + buf_slots] * input_val[gid];
+
+    output[gid] = sum;
+
+    // Update circular buffer: overwrite oldest entry (at state_pos) with current input
+    conv_state[state_pos * dim + gid] = input_val[gid];
+}
+
+// ============================================================================
+// ssm_conv1d_silu_decode: Fused Conv1D + SiLU for GDN decode
+//
+// Same as ssm_conv1d_decode but applies SiLU activation to the output:
+//   output[gid] = sum * sigmoid(sum) = sum / (1 + exp(-sum))
+//
+// Eliminates 1 dispatch + 1 barrier per GDN layer vs separate conv1d + silu.
+// ============================================================================
+
+kernel void ssm_conv1d_silu_decode(
+    device const float* input_val  [[buffer(0)]],
+    device       float* conv_state [[buffer(1)]],
+    device const float* kernel_w   [[buffer(2)]],
+    device       float* output     [[buffer(3)]],
+    constant     uint&  dim        [[buffer(4)]],
+    constant     uint&  kernel_size [[buffer(5)]],
+    constant     uint&  state_pos  [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+
+    float sum = 0.0f;
+    uint buf_slots = kernel_size - 1;
+
+    // Taps 0..kernel_size-2: read from circular buffer (oldest to newest)
+    for (uint tap = 0; tap < buf_slots; tap++) {
+        uint slot = (state_pos + tap) % buf_slots;
+        sum += kernel_w[gid * kernel_size + tap] * conv_state[slot * dim + gid];
+    }
+
+    // Tap kernel_size-1: current input (newest)
+    sum += kernel_w[gid * kernel_size + buf_slots] * input_val[gid];
+
+    // Fused SiLU: output = sum * sigmoid(sum)
+    output[gid] = sum / (1.0f + exp(-sum));
+
+    // Update circular buffer: overwrite oldest entry (at state_pos) with current input
+    conv_state[state_pos * dim + gid] = input_val[gid];
+}
+
+// ============================================================================
+// l2_normalize_heads: Per-head L2 normalization
+//
+// For each head h: x[h*head_dim .. (h+1)*head_dim] /= max(||x_head||, eps)
+//
+// buffer(0): x         [n_heads * head_dim] float — modified in-place
+// buffer(1): n_heads (uint)
+// buffer(2): head_dim (uint)
+// buffer(3): eps (float)
+//
+// grid: (n_heads, 1, 1), threadgroup: (min(head_dim, 256), 1, 1)
+// ============================================================================
+
+kernel void l2_normalize_heads(
+    device       float* x        [[buffer(0)]],
+    constant     uint&  n_heads  [[buffer(1)]],
+    constant     uint&  head_dim [[buffer(2)]],
+    constant     float& eps      [[buffer(3)]],
+    uint head_idx                [[threadgroup_position_in_grid]],
+    uint tid                     [[thread_index_in_threadgroup]],
+    uint tg_size                 [[threads_per_threadgroup]],
+    uint simd_lane               [[thread_index_in_simdgroup]],
+    uint simd_group              [[simdgroup_index_in_threadgroup]])
+{
+    if (head_idx >= n_heads) return;
+
+    device float* head = x + head_idx * head_dim;
+
+    // Pass 1: compute sum of squares
+    float ss = 0.0f;
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        float v = head[i];
+        ss += v * v;
+    }
+
+    ss = simd_sum(ss);
+
+    threadgroup float partial_sums[8];
+
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float total_ss;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_ss = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float norm = sqrt(total_ss);
+    float scale = (norm > eps) ? (1.0f / norm) : (1.0f / eps);
+
+    // Pass 2: normalize
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        head[i] *= scale;
+    }
+}
+
+// ============================================================================
+// sigmoid_gate: Elementwise sigmoid
+//
+// output[i] = 1 / (1 + exp(-input[i]))
+//
+// buffer(0): input  [dim] float
+// buffer(1): output [dim] float
+// buffer(2): dim (uint)
+//
+// grid: (ceil(dim/256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void sigmoid_gate(
+    device const float* input  [[buffer(0)]],
+    device       float* output [[buffer(1)]],
+    constant     uint&  dim    [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+    output[gid] = 1.0f / (1.0f + exp(-input[gid]));
+}
+
+// ============================================================================
+// silu_inplace: In-place SiLU activation
+//
+// x[i] = x[i] * sigmoid(x[i]) = x[i] / (1 + exp(-x[i]))
+//
+// buffer(0): x   [dim] float -- modified in-place
+// buffer(1): dim (uint)
+//
+// grid: (ceil(dim/256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void silu_inplace(
+    device       float* x   [[buffer(0)]],
+    constant     uint&  dim [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+    float val = x[gid];
+    x[gid] = val / (1.0f + exp(-val));
+}
+
+// ============================================================================
+// silu_elementwise_mul: SiLU(alpha) * x elementwise
+//
+// output[i] = silu(alpha[i]) * x[i]
+// silu(a) = a * sigmoid(a) = a / (1 + exp(-a))
+//
+// buffer(0): alpha  [dim] float — gate values
+// buffer(1): x      [dim] float — values to gate
+// buffer(2): output [dim] float
+// buffer(3): dim (uint)
+//
+// grid: (ceil(dim/256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void silu_elementwise_mul(
+    device const float* alpha  [[buffer(0)]],
+    device const float* x      [[buffer(1)]],
+    device       float* output [[buffer(2)]],
+    constant     uint&  dim    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+    float a = alpha[gid];
+    float sigmoid = 1.0f / (1.0f + exp(-a));
+    output[gid] = a * sigmoid * x[gid];
+}
+
+// ============================================================================
+// gated_delta_net_state_update: Delta rule recurrent state update
+//
+// For each head h (0..n_heads):
+//   h_state[h] = (1 - beta[h]) * h_state[h] + beta[h] * outer(k_norm[h], v[h])
+//
+// h_state layout: [n_heads, val_dim, key_dim] — transposed for coalesced access
+// k_norm layout:  [n_heads * key_dim]
+// v layout:       [n_kv_heads * val_dim] — may differ from n_heads (GQA)
+//
+// Each thread handles one (key_i, val_j) element for ALL heads.
+// Grid is 2D: (key_dim, val_dim). Loops over heads.
+//
+// buffer(0): h_state    [n_heads * val_dim * key_dim] float — R/W
+// buffer(1): k_norm     [n_heads * key_dim] float
+// buffer(2): v_tokens   [n_kv_heads * val_dim] float
+// buffer(3): beta       [n_heads] float — sigmoid-gated interpolation rates
+// buffer(4): n_heads (uint)
+// buffer(5): key_dim (uint)
+// buffer(6): val_dim (uint)
+// buffer(7): n_kv_heads (uint)
+//
+// grid: (key_dim, val_dim, 1), threadgroup: (min(key_dim,16), min(val_dim,16), 1)
+// ============================================================================
+
+kernel void gated_delta_net_state_update(
+    device       float* h_state    [[buffer(0)]],
+    device const float* k_norm     [[buffer(1)]],
+    device const float* v_tokens   [[buffer(2)]],
+    device const float* beta       [[buffer(3)]],
+    constant     uint&  n_heads    [[buffer(4)]],
+    constant     uint&  key_dim    [[buffer(5)]],
+    constant     uint&  val_dim    [[buffer(6)]],
+    constant     uint&  n_kv_heads [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint ki = gid.x;
+    uint vj = gid.y;
+
+    if (ki >= key_dim || vj >= val_dim) return;
+
+    uint gqa_ratio = n_heads / n_kv_heads;
+
+    for (uint h = 0; h < n_heads; h++) {
+        float b = beta[h];
+        float k_val = k_norm[h * key_dim + ki];
+
+        uint kv_head = h / gqa_ratio;
+        float v_val = v_tokens[kv_head * val_dim + vj];
+
+        uint state_idx = h * val_dim * key_dim + vj * key_dim + ki;
+        h_state[state_idx] = (1.0f - b) * h_state[state_idx] + b * k_val * v_val;
+    }
+}
+
+// ============================================================================
+// gated_delta_net_output: Compute output from recurrent state
+//
+// For each head h, value dimension j:
+//   output[h * val_dim + j] = dot(h_state[h, :, j], q_norm[h, :])
+//
+// Each threadgroup computes one output element using 32-wide SIMD reduction.
+//
+// buffer(0): h_state  [n_heads * val_dim * key_dim] float
+// buffer(1): q_norm   [n_heads * key_dim] float
+// buffer(2): output   [n_heads * val_dim] float
+// buffer(3): n_heads (uint)
+// buffer(4): key_dim (uint)
+// buffer(5): val_dim (uint)
+//
+// grid: (n_heads * val_dim, 1, 1), threadgroup: (32, 1, 1)
+// ============================================================================
+
+kernel void gated_delta_net_output(
+    device const float* h_state  [[buffer(0)]],
+    device const float* q_norm   [[buffer(1)]],
+    device       float* output   [[buffer(2)]],
+    constant     uint&  n_heads  [[buffer(3)]],
+    constant     uint&  key_dim  [[buffer(4)]],
+    constant     uint&  val_dim  [[buffer(5)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint lane  [[thread_index_in_simdgroup]])
+{
+    uint h = tgpig / val_dim;
+    uint j = tgpig % val_dim;
+    if (h >= n_heads) return;
+
+    float sum = 0.0f;
+    device const float* h_row = h_state + h * val_dim * key_dim + j * key_dim;
+    device const float* q_head = q_norm + h * key_dim;
+
+    for (uint i = lane; i < key_dim; i += 32) {
+        sum += h_row[i] * q_head[i];
+    }
+
+    sum = simd_sum(sum);
+
+    if (lane == 0) {
+        output[h * val_dim + j] = sum;
+    }
+}
+
+// ============================================================================
+// gated_delta_net_state_update_v2: Delta rule with independent alpha and beta
+//
+// For each head h (0..n_heads):
+//   h_state[h] = alpha[h] * h_state[h] + beta[h] * outer(k_norm[h], v[h])
+//
+// Unlike v1 which constrains decay = (1-beta), this version takes separate
+// alpha (decay) and beta (mixing) arrays computed from the gating parameters.
+//
+// h_state layout: [n_heads, val_dim, key_dim] -- transposed for coalesced access
+// k_norm layout:  [n_heads * key_dim]
+// v layout:       [n_kv_heads * val_dim] -- may differ from n_heads (GQA)
+//
+// buffer(0): h_state    [n_heads * val_dim * key_dim] float -- R/W
+// buffer(1): k_norm     [n_heads * key_dim] float
+// buffer(2): v_tokens   [n_kv_heads * val_dim] float
+// buffer(3): alpha      [n_heads] float -- decay factors
+// buffer(4): beta       [n_heads] float -- mixing rates
+// buffer(5): n_heads (uint)
+// buffer(6): key_dim (uint)
+// buffer(7): val_dim (uint)
+// buffer(8): n_kv_heads (uint)
+//
+// grid: (key_dim, val_dim, 1), threadgroup: (min(key_dim,16), min(val_dim,16), 1)
+// ============================================================================
+
+kernel void gated_delta_net_state_update_v2(
+    device       float* h_state    [[buffer(0)]],
+    device const float* k_norm     [[buffer(1)]],
+    device const float* v_tokens   [[buffer(2)]],
+    device const float* alpha      [[buffer(3)]],
+    device const float* beta       [[buffer(4)]],
+    constant     uint&  n_heads    [[buffer(5)]],
+    constant     uint&  key_dim    [[buffer(6)]],
+    constant     uint&  val_dim    [[buffer(7)]],
+    constant     uint&  n_kv_heads [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint ki = gid.x;
+    uint vj = gid.y;
+
+    if (ki >= key_dim || vj >= val_dim) return;
+
+    uint gqa_ratio = n_heads / n_kv_heads;
+
+    for (uint h = 0; h < n_heads; h++) {
+        float a = alpha[h];
+        float b = beta[h];
+        uint kv_head = h / gqa_ratio;
+        float k_val = k_norm[kv_head * key_dim + ki];     // use kv_head for GQA k_norm
+        float v_val = v_tokens[kv_head * val_dim + vj];
+
+        uint state_idx = h * val_dim * key_dim + vj * key_dim + ki;
+        h_state[state_idx] = a * h_state[state_idx] + b * k_val * v_val;
+    }
+}
+
+// ============================================================================
+// gdn_compute_gates: Compute GatedDeltaNet gating parameters
+//
+// Per-head computation (matching NVLabs GatedDeltaNet reference):
+//   gate[h] = -exp(A_log[h]) * softplus(gk_proj[h] + dt_bias[h])
+//   alpha[h] = exp(gate[h])     // decay factor in (0,1)
+//   beta[h]  = sigmoid(gn_proj[h])
+//
+// GGUF stores ssm_a = -exp(A_log) (already negated and exponentiated).
+// Typical values: ssm_a ~ -0.036 (slow decay) to -72 (fast decay).
+// gate = ssm_a * softplus(gk_proj + dt_bias), so gate is negative => alpha = exp(gate) in (0,1).
+// Reference: gk = -exp(A_log) * softplus(gk_proj + dt_bias)  [NVLabs/GatedDeltaNet]
+//
+// buffer(0): ssm_dt_bias       [n_heads] float -- dt bias per head
+// buffer(1): ssm_a             [n_heads] float -- -exp(A_log) (pre-negated+exponentiated)
+// buffer(2): ssm_beta_weight   [n_heads] float -- gn_proj output (pre-sigmoid)
+// buffer(3): ssm_alpha_weight  [n_heads] float -- gk_proj output (from matvec)
+// buffer(4): alpha_out         [n_heads] float -- OUTPUT: decay factors
+// buffer(5): beta_out          [n_heads] float -- OUTPUT: mixing rates
+// buffer(6): n_heads (uint)
+//
+// grid: (ceil(n_heads/256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void gdn_compute_gates(
+    device const float* ssm_dt_bias       [[buffer(0)]],
+    device const float* ssm_a             [[buffer(1)]],
+    device const float* ssm_beta_weight   [[buffer(2)]],
+    device const float* ssm_alpha_weight  [[buffer(3)]],
+    device       float* alpha_out         [[buffer(4)]],
+    device       float* beta_out          [[buffer(5)]],
+    constant     uint&  n_heads           [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n_heads) return;
+
+    // softplus(x) = log(1 + exp(x)), numerically stable
+    float sp_input = ssm_alpha_weight[gid] + ssm_dt_bias[gid];
+    float sp;
+    if (sp_input > 20.0f) {
+        sp = sp_input;  // softplus(x) ~= x for large x
+    } else {
+        sp = log(1.0f + exp(sp_input));
+    }
+
+    // gate = ssm_a * softplus(gk_proj + dt_bias)
+    // GGUF stores ssm_a = -exp(A_log) (already negated+exponentiated).
+    // Reference (llama.cpp): gate = ggml_mul(alpha_softplus, ssm_a)
+    // Typical values: ssm_a ~ -0.036 (slow decay) to -72 (fast decay).
+    // gate is negative => alpha = exp(gate) in (0, 1).
+    float gate = ssm_a[gid] * sp;
+    alpha_out[gid] = exp(gate);
+
+    // beta = sigmoid(gn_proj)
+    float beta_raw = ssm_beta_weight[gid];
+    beta_out[gid] = 1.0f / (1.0f + exp(-beta_raw));
+}
+
+// ============================================================================
+// dequant_matmul_q8_0_dual_gates_nr2: Fused dual alpha+beta matvec + gates
+//
+// Merges 3 decode dispatches into 1:
+//   1. RMSNorm + alpha_raw matvec (rmsnorm_dequant_matmul_q8_0_deferred_nr2)
+//   2. RMSNorm + beta_raw matvec  (same kernel, different weights)
+//   3. gdn_compute_gates (softplus+exp for alpha, sigmoid for beta)
+//
+// Reads x_buf ONCE, computes inline RMSNorm, performs dual Q8_0 dot products
+// for alpha_raw and beta_raw, then applies gate transforms inline.
+//
+// Gate math (matching gdn_compute_gates exactly):
+//   softplus(x) = x > 20 ? x : log(1 + exp(x))
+//   gate = ssm_a[h] * softplus(alpha_raw[h] + dt_bias[h])
+//   alpha_out[h] = exp(gate)        // decay factor in (0,1)
+//   beta_out[h]  = sigmoid(beta_raw) // mixing rate
+//
+// buffer(0): weights_alpha  [N * row_bytes] Q8_0 alpha weight matrix
+// buffer(1): weights_beta   [N * row_bytes] Q8_0 beta weight matrix
+// buffer(2): x              [K] float -- raw input (un-normalized)
+// buffer(3): alpha_out      [N] float -- OUTPUT: decay factors
+// buffer(4): beta_out       [N] float -- OUTPUT: mixing rates
+// buffer(5): norm_w         [K] float (as uchar*) -- RMSNorm weights
+// buffer(6): ssm_a          [N] float -- -exp(A_log), pre-negated
+// buffer(7): dt_bias        [N] float -- per-head dt bias
+// buffer(8): K              (uint) -- hidden_dim
+// buffer(9): N              (uint) -- num_heads (output dim)
+// buffer(10): eps           (float) -- RMSNorm epsilon
+//
+// grid: (ceil(N/2), 1, 1), threadgroup: (128, 1, 1)
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_dual_gates_nr2(
+    device const uchar* weights_alpha [[buffer(0)]],
+    device const uchar* weights_beta  [[buffer(1)]],
+    device const float* x             [[buffer(2)]],
+    device float*       alpha_out     [[buffer(3)]],
+    device float*       beta_out      [[buffer(4)]],
+    device const uchar* norm_w        [[buffer(5)]],
+    device const float* ssm_a         [[buffer(6)]],
+    device const float* dt_bias       [[buffer(7)]],
+    constant uint&      K             [[buffer(8)]],
+    constant uint&      N             [[buffer(9)]],
+    constant float&     eps           [[buffer(10)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    // NR2 deferred-reduction with fused RMSNorm + dual dot product + gates.
+    // Same single-pass fusion as rmsnorm_dequant_matmul_q8_0_deferred_nr2:
+    // dot(W, norm_x) = scale * dot(W, x * norm_w)
+    // We compute dot(W_alpha, x*nw) and dot(W_beta, x*nw) AND sum(x^2)
+    // in the SAME loop, then multiply by scale and apply gate transforms.
+
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q8_BLOCK_SIZE = 34;
+
+    device const float* norm_weight = (device const float*)norm_w;
+
+    const uint nb = K >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    // Weight row pointers for both matrices
+    device const uchar* ax_a[NR0];
+    device const uchar* ax_b[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax_a[row] = weights_alpha + (r0 + row) * row_bytes;
+        ax_b[row] = weights_beta  + (r0 + row) * row_bytes;
+    }
+
+    float sumf_a[NR0] = { 0.f, 0.f };
+    float sumf_b[NR0] = { 0.f, 0.f };
+    float ss = 0.0f;  // sum of squares for RMSNorm
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+    device const float* nwb = norm_weight + ib0 * 32 + il * NQ;
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        // Load x * norm_w (without scale) and accumulate x^2 simultaneously
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            float xi = yb[i];
+            ss += xi * xi;
+            yl[i] = xi * nwb[i];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= N) break;
+
+            // Alpha weights
+            {
+                device const uchar* bp = ax_a[row] + ib * Q8_BLOCK_SIZE;
+                float scale = float(as_type<half>(*(device const ushort*)bp));
+                device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+                float sumq = 0.f;
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < NQ; ++i) {
+                    sumq += float(qs[i]) * yl[i];
+                }
+                sumf_a[row] += sumq * scale;
+            }
+
+            // Beta weights
+            {
+                device const uchar* bp = ax_b[row] + ib * Q8_BLOCK_SIZE;
+                float scale = float(as_type<half>(*(device const ushort*)bp));
+                device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+                float sumq = 0.f;
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < NQ; ++i) {
+                    sumq += float(qs[i]) * yl[i];
+                }
+                sumf_b[row] += sumq * scale;
+            }
+        }
+
+        yb += NSG * NQ * 32;
+        nwb += NSG * NQ * 32;
+    }
+
+    // Reduce sum-of-squares across all 128 threads
+    ss = simd_sum(ss);
+
+    threadgroup float shmem[NR0 * NW];
+
+    if (tiisg == 0) {
+        shmem[sgitg] = ss;
+    }
+
+    // Also reduce dot products for both alpha and beta
+    for (uint row = 0; row < NR0; ++row) {
+        sumf_a[row] = simd_sum(sumf_a[row]);
+        sumf_b[row] = simd_sum(sumf_b[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Compute RMSNorm scale from reduced sum-of-squares
+    threadgroup float rms_scale_shared;
+    if (sgitg == 0) {
+        float total_ss = (tiisg < NSG) ? shmem[tiisg] : 0.0f;
+        total_ss = simd_sum(total_ss);
+        if (tiisg == 0) {
+            rms_scale_shared = rsqrt(total_ss / float(K) + eps);
+        }
+    }
+
+    // Write alpha partial sums to shmem
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf_a[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms_scale = rms_scale_shared;
+
+    // Final reduction of alpha dot products, apply scale + gate transform
+    for (uint row = 0; row < NR0 && r0 + row < N; ++row) {
+        float tot_a = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            float alpha_raw = tot_a * rms_scale;
+
+            // Gate: alpha = exp(ssm_a * softplus(alpha_raw + dt_bias))
+            float sp_input = alpha_raw + dt_bias[r0 + row];
+            float sp;
+            if (sp_input > 20.0f) {
+                sp = sp_input;  // softplus(x) ~= x for large x
+            } else {
+                sp = log(1.0f + exp(sp_input));
+            }
+            float gate = ssm_a[r0 + row] * sp;
+            alpha_out[r0 + row] = exp(gate);
+        }
+    }
+
+    // Now reduce beta partial sums using shmem
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf_b[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Final reduction of beta dot products, apply scale + sigmoid
+    for (uint row = 0; row < NR0 && r0 + row < N; ++row) {
+        float tot_b = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            float beta_raw = tot_b * rms_scale;
+
+            // Gate: beta = sigmoid(beta_raw)
+            beta_out[r0 + row] = 1.0f / (1.0f + exp(-beta_raw));
+        }
+    }
+}
+
+// ============================================================================
+// elementwise_mul_f32: Element-wise multiplication of two float arrays
+//
+// output[i] = a[i] * b[i]
+//
+// buffer(0): a      [dim] float
+// buffer(1): b      [dim] float
+// buffer(2): output [dim] float
+// buffer(3): dim (uint)
+//
+// grid: (ceil(dim/256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void elementwise_mul_f32(
+    device const float* a      [[buffer(0)]],
+    device const float* b      [[buffer(1)]],
+    device       float* output [[buffer(2)]],
+    constant     uint&  dim    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+    output[gid] = a[gid] * b[gid];
+}
+
+// ============================================================================
+// ssm_rms_norm_scale: RMS-normalize then multiply by learned scale per element
+//
+// For each head h:
+//   rms = sqrt(mean(x[h*head_dim..(h+1)*head_dim]^2) + eps)
+//   scale_head = h % scale_n_heads  (allows shared scale across heads)
+//   output[h*head_dim+i] = (x[h*head_dim+i] / rms) * scale[scale_head*head_dim+i]
+//
+// buffer(0): x              [n_heads * head_dim] float -- input (not modified)
+// buffer(1): scale          [scale_n_heads * head_dim] float -- learned per-element scale
+// buffer(2): output         [n_heads * head_dim] float -- OUTPUT
+// buffer(3): n_heads        (uint)
+// buffer(4): head_dim       (uint)
+// buffer(5): eps            (float)
+// buffer(6): scale_n_heads  (uint) -- number of heads in scale tensor (1 = shared)
+//
+// grid: (n_heads, 1, 1), threadgroup: (min(head_dim, 256), 1, 1)
+// ============================================================================
+
+kernel void ssm_l2_norm_scale(
+    device const float* x              [[buffer(0)]],
+    device const float* scale          [[buffer(1)]],
+    device       float* output         [[buffer(2)]],
+    constant     uint&  n_heads        [[buffer(3)]],
+    constant     uint&  head_dim       [[buffer(4)]],
+    constant     float& eps            [[buffer(5)]],
+    constant     uint&  scale_n_heads  [[buffer(6)]],
+    uint head_idx                [[threadgroup_position_in_grid]],
+    uint tid                     [[thread_index_in_threadgroup]],
+    uint tg_size                 [[threads_per_threadgroup]],
+    uint simd_lane               [[thread_index_in_simdgroup]],
+    uint simd_group              [[simdgroup_index_in_threadgroup]])
+{
+    if (head_idx >= n_heads) return;
+
+    device const float* head_in = x + head_idx * head_dim;
+
+    // Pass 1: compute sum of squares
+    float ss = 0.0f;
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        float v = head_in[i];
+        ss += v * v;
+    }
+
+    ss = simd_sum(ss);
+
+    threadgroup float partial_sums[8];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float total_ss;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_ss = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // RMSNorm: divide by sqrt(mean(x^2) + eps)
+    float rms = sqrt(total_ss / (float)head_dim + eps);
+    float inv_norm = 1.0f / rms;
+
+    // Pass 2: normalize and scale (modular head indexing for shared scale)
+    device float* head_out = output + head_idx * head_dim;
+    device const float* head_scale = scale + (head_idx % scale_n_heads) * head_dim;
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        head_out[i] = head_in[i] * inv_norm * head_scale[i];
+    }
+}
+
+// ============================================================================
+// Fused element-wise kernels for GDN dispatch reduction
+// ============================================================================
+
+// sigmoid_mul_fused: Fused sigmoid + element-wise multiply
+//
+// output[i] = sigmoid(gate[i]) * x[i]
+//           = x[i] / (1 + exp(-gate[i]))
+//
+// Replaces separate sigmoid_gate + elementwise_mul_f32 dispatches.
+//
+// buffer(0): gate   [dim] float -- raw gate values (pre-sigmoid)
+// buffer(1): x      [dim] float -- values to multiply
+// buffer(2): output [dim] float
+// buffer(3): dim (uint)
+//
+// grid: (ceil(dim/256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void sigmoid_mul_fused(
+    device const float* gate   [[buffer(0)]],
+    device const float* x      [[buffer(1)]],
+    device       float* output [[buffer(2)]],
+    constant     uint&  dim    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+    float sig = 1.0f / (1.0f + exp(-gate[gid]));
+    output[gid] = sig * x[gid];
+}
+
+// ============================================================================
+// deinterleave_norm_assemble: Fused deinterleave Q+gate, per-head RMSNorm Q/K,
+// assemble K|V into qkv_out, and write normalized Q to q_out.
+// Replaces 6 separate dispatches + 2 barriers with 1 dispatch.
+//
+// NOTE: Q is written to q_out (NOT qkv_out) to avoid aliasing with the
+// interleaved Q+gate input in qkv_out. The caller must copy q_out to
+// qkv_out[0..q_dim] after this kernel completes.
+//
+// Input: interleaved Q+gate [num_heads * 2 * head_dim] in qgate_interleaved,
+//        K [num_kv_heads * head_dim], V [num_kv_heads * head_dim]
+// Output: q_out [num_heads * head_dim] (normalized Q, separate buffer)
+//         qkv_out: K at [q_dim..q_dim+kv_dim), V at [q_dim+kv_dim..)
+//         gate_out [num_heads * head_dim]
+//
+// Dispatch: (num_heads + num_kv_heads) threadgroups, min(head_dim, 256) threads each.
+//   TGs [0, num_heads): deinterleave + RMSNorm Q head, write gate. Copy V if h < num_kv_heads.
+//   TGs [num_heads, num_heads+num_kv_heads): RMSNorm K head.
+//
+// buffer(0):  qgate_interleaved [num_heads * 2 * head_dim] float
+// buffer(1):  k_data       [num_kv_heads * head_dim] float
+// buffer(2):  v_data       [num_kv_heads * head_dim] float
+// buffer(3):  q_norm_w     [head_dim] float -- shared RMSNorm weight for Q
+// buffer(4):  k_norm_w     [head_dim] float -- shared RMSNorm weight for K
+// buffer(5):  qkv_out      [q_dim + kv_dim + kv_dim] float -- K|V assembled (Q portion unused)
+// buffer(6):  gate_out     [num_heads * head_dim] float
+// buffer(7):  num_heads    (uint) -- Q/gate heads
+// buffer(8):  num_kv_heads (uint) -- K/V heads
+// buffer(9):  head_dim     (uint)
+// buffer(10): q_dim        (uint) -- num_heads * head_dim
+// buffer(11): kv_dim       (uint) -- num_kv_heads * head_dim
+// buffer(12): eps          (float) -- RMSNorm epsilon
+// buffer(13): q_out        [num_heads * head_dim] float -- normalized Q (separate buf)
+// ============================================================================
+
+kernel void deinterleave_norm_assemble(
+    device const float* qgate_interleaved [[buffer(0)]],
+    device const float* k_data            [[buffer(1)]],
+    device const float* v_data            [[buffer(2)]],
+    device const float* q_norm_w          [[buffer(3)]],
+    device const float* k_norm_w          [[buffer(4)]],
+    device       float* qkv_out           [[buffer(5)]],
+    device       float* gate_out          [[buffer(6)]],
+    constant     uint&  num_heads         [[buffer(7)]],
+    constant     uint&  num_kv_heads      [[buffer(8)]],
+    constant     uint&  head_dim          [[buffer(9)]],
+    constant     uint&  q_dim             [[buffer(10)]],
+    constant     uint&  kv_dim            [[buffer(11)]],
+    constant     float& eps               [[buffer(12)]],
+    device       float* q_out             [[buffer(13)]],
+    uint tg_idx                           [[threadgroup_position_in_grid]],
+    uint tid                              [[thread_index_in_threadgroup]],
+    uint tg_size                          [[threads_per_threadgroup]],
+    uint simd_lane                        [[thread_index_in_simdgroup]],
+    uint simd_group                       [[simdgroup_index_in_threadgroup]])
+{
+    uint total_tgs = num_heads + num_kv_heads;
+    if (tg_idx >= total_tgs) return;
+
+    threadgroup float partial_sums[32];
+    threadgroup float total_ss;
+
+    if (tg_idx < num_heads) {
+        // --- Q head: deinterleave + RMSNorm + write Q and gate ---
+        uint h = tg_idx;
+        uint interleaved_base = h * 2 * head_dim;
+
+        // Step 1: Load Q and compute RMSNorm sum-of-squares
+        float q_val = 0.0f;
+        float ss = 0.0f;
+        for (uint i = tid; i < head_dim; i += tg_size) {
+            q_val = qgate_interleaved[interleaved_base + i];
+            ss += q_val * q_val;
+            // Also write gate while we're reading the interleaved data
+            gate_out[h * head_dim + i] = qgate_interleaved[interleaved_base + head_dim + i];
+        }
+
+        ss = simd_sum(ss);
+        if (simd_lane == 0) {
+            partial_sums[simd_group] = ss;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint num_sg = (tg_size + 31) / 32;
+        if (simd_group == 0) {
+            float val = (simd_lane < num_sg) ? partial_sums[simd_lane] : 0.0f;
+            val = simd_sum(val);
+            if (simd_lane == 0) {
+                total_ss = val;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float scale = rsqrt(total_ss / float(head_dim) + eps);
+
+        // Step 2: Write normalized Q to q_out (separate buffer to avoid aliasing)
+        for (uint i = tid; i < head_dim; i += tg_size) {
+            float qv = qgate_interleaved[interleaved_base + i];
+            q_out[h * head_dim + i] = qv * scale * q_norm_w[i];
+        }
+
+        // Step 3: Copy V head (if this Q head index < num_kv_heads)
+        if (h < num_kv_heads) {
+            for (uint i = tid; i < head_dim; i += tg_size) {
+                qkv_out[q_dim + kv_dim + h * head_dim + i] = v_data[h * head_dim + i];
+            }
+        }
+    } else {
+        // --- K head: RMSNorm + write K ---
+        uint kh = tg_idx - num_heads;
+
+        // Step 1: Load K and compute RMSNorm sum-of-squares
+        float ss = 0.0f;
+        for (uint i = tid; i < head_dim; i += tg_size) {
+            float kv = k_data[kh * head_dim + i];
+            ss += kv * kv;
+        }
+
+        ss = simd_sum(ss);
+        if (simd_lane == 0) {
+            partial_sums[simd_group] = ss;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint num_sg = (tg_size + 31) / 32;
+        if (simd_group == 0) {
+            float val = (simd_lane < num_sg) ? partial_sums[simd_lane] : 0.0f;
+            val = simd_sum(val);
+            if (simd_lane == 0) {
+                total_ss = val;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float scale = rsqrt(total_ss / float(head_dim) + eps);
+
+        // Step 2: Write normalized K to qkv_out at K offset [q_dim..q_dim+kv_dim)
+        for (uint i = tid; i < head_dim; i += tg_size) {
+            float kv = k_data[kh * head_dim + i];
+            qkv_out[q_dim + kh * head_dim + i] = kv * scale * k_norm_w[i];
+        }
+    }
+}
+
+// ============================================================================
+// deinterleave_qgate: Split interleaved [Q_h0, gate_h0, Q_h1, gate_h1, ...] into
+// separate Q and gate buffers.
+//
+// In Qwen3.5 full-attention layers, attn_q.weight produces interleaved Q+gate:
+//   [Q_head0(head_dim), gate_head0(head_dim), Q_head1(head_dim), gate_head1(head_dim), ...]
+// Total elements = num_heads * 2 * head_dim.
+// This kernel copies Q heads to contiguous Q buffer [num_heads * head_dim]
+// and gate heads to contiguous gate buffer [num_heads * head_dim].
+//
+// buffer(0): qgate_interleaved [num_heads * 2 * head_dim] float
+// buffer(1): Q     [num_heads * head_dim] float (output)
+// buffer(2): gate  [num_heads * head_dim] float (output)
+// buffer(3): head_dim (uint)
+// buffer(4): num_heads (uint)
+//
+// grid: (ceil(num_heads * head_dim / 256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void deinterleave_qgate(
+    device const float* qgate  [[buffer(0)]],
+    device       float* Q      [[buffer(1)]],
+    device       float* gate   [[buffer(2)]],
+    constant     uint&  head_dim  [[buffer(3)]],
+    constant     uint&  num_heads [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint q_dim = num_heads * head_dim;
+    if (gid >= q_dim) return;
+    uint head = gid / head_dim;
+    uint offset_in_head = gid % head_dim;
+    // In interleaved layout: head h starts at h * 2 * head_dim
+    // Q component at h * 2 * head_dim + offset
+    // gate component at h * 2 * head_dim + head_dim + offset
+    uint interleaved_base = head * 2 * head_dim;
+    Q[gid]    = qgate[interleaved_base + offset_in_head];
+    gate[gid] = qgate[interleaved_base + head_dim + offset_in_head];
+}
+
+// ============================================================================
+// sigmoid_scale_buffer: Apply sigmoid of a scalar to scale an entire buffer.
+//
+// out[i] = out[i] * sigmoid(scalar[0])
+//
+// buffer(0): scalar   [1] float -- input scalar (e.g. dot product result)
+// buffer(1): out      [dim] float -- R/W buffer to scale in-place
+// buffer(2): dim      (uint)
+//
+// grid: (ceil(dim/256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void sigmoid_scale_buffer(
+    device const float* scalar  [[buffer(0)]],
+    device float*       out     [[buffer(1)]],
+    constant uint&      dim     [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+    float gate = 1.0f / (1.0f + exp(-scalar[0]));
+    out[gid] *= gate;
+}
+
+// sigmoid_scale_add: Apply sigmoid-gated shared expert output and add to
+// destination for decode (single token).
+//
+// dst[i] += sigmoid(scalar[0]) * src[i]
+//
+// Fuses sigmoid_scale_buffer + add_residual into 1 dispatch, eliminating
+// the intermediate in-place multiply on src and the separate add_residual.
+//
+// buffer(0): scalar   [1] float -- gate scalar (e.g. dot product result)
+// buffer(1): src      [dim] float -- shared expert FFN output (read-only)
+// buffer(2): dst      [dim] float -- R/W (x_buf)
+// buffer(3): dim      (uint)
+//
+// grid: (ceil(dim/256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void sigmoid_scale_add(
+    device const float* scalar  [[buffer(0)]],
+    device const float* src     [[buffer(1)]],
+    device float*       dst     [[buffer(2)]],
+    constant uint&      dim     [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+    float gate = 1.0f / (1.0f + exp(-scalar[0]));
+    dst[gid] += gate * src[gid];
+}
+
+// ============================================================================
+// rmsnorm_per_head: Per-head RMS normalization for Q or K vectors.
+//
+// Applies RMSNorm to each head slice independently.
+// weight[head_dim] is shared across all heads.
+// ============================================================================
+// sigmoid_scale_add_batched: For each token in a batch, apply sigmoid-gated
+// shared expert output and add to destination.
+//
+// For token b at element t:
+//   dst[b * hidden_dim + t] += sigmoid(gate_scalars[b]) * src[b * hidden_dim + t]
+//
+// buffer(0): gate_scalars  [batch_size] float -- one scalar per token
+// buffer(1): src           [batch_size * hidden_dim] float -- shared expert FFN output
+// buffer(2): dst           [batch_size * hidden_dim] float -- R/W (x_buf)
+// buffer(3): hidden_dim    (uint)
+// buffer(4): batch_size    (uint)
+//
+// grid: (ceil(batch_size * hidden_dim / 256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void sigmoid_scale_add_batched(
+    device const float* gate_scalars [[buffer(0)]],
+    device const float* src          [[buffer(1)]],
+    device float*       dst          [[buffer(2)]],
+    constant uint&      hidden_dim   [[buffer(3)]],
+    constant uint&      batch_size   [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch_size * hidden_dim;
+    if (gid >= total) return;
+    uint b = gid / hidden_dim;
+    float g = 1.0f / (1.0f + exp(-gate_scalars[b]));
+    dst[gid] += g * src[gid];
+}
+
+// ============================================================================
+// rmsnorm_per_head: Per-head RMS normalization for Q or K vectors.
+//
+// Applies RMSNorm to each head slice independently.
+// weight[head_dim] is shared across all heads.
+// x[num_heads * head_dim] is the input/output vector.
+//
+// out[h * head_dim + i] = x[h * head_dim + i] * weight[i] / sqrt(mean(x_h^2) + eps)
+//
+// buffer(0): x        [num_heads * head_dim] float -- input
+// buffer(1): weight   [head_dim] float -- per-element scale, shared across heads
+// buffer(2): out      [num_heads * head_dim] float -- output (can alias x)
+// buffer(3): head_dim (uint)
+// buffer(4): eps      (float)
+//
+// Dispatch: threadgroups=(num_heads, 1, 1), threads_per_tg=(min(head_dim, 256), 1, 1)
+// Each threadgroup handles one head.
+// ============================================================================
+
+kernel void rmsnorm_per_head(
+    device const float* x       [[buffer(0)]],
+    device const float* weight  [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      head_dim [[buffer(3)]],
+    constant float&     eps     [[buffer(4)]],
+    uint tid                    [[thread_index_in_threadgroup]],
+    uint tg_size                [[threads_per_threadgroup]],
+    uint head_idx               [[threadgroup_position_in_grid]],
+    uint simd_lane              [[thread_index_in_simdgroup]],
+    uint simd_group             [[simdgroup_index_in_threadgroup]])
+{
+    uint base = head_idx * head_dim;
+
+    // Pass 1: compute sum of squares for this head
+    float ss = 0.0f;
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        float v = x[base + i];
+        ss += v * v;
+    }
+
+    ss = simd_sum(ss);
+
+    threadgroup float partial_sums[32];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float total_ss;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_ss = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float scale = rsqrt(total_ss / float(head_dim) + eps);
+
+    // Pass 2: normalize and scale by weight
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        out[base + i] = x[base + i] * scale * weight[i];
+    }
+}
+
+// ============================================================================
+// residual_add_copy: Fused residual addition + buffer copy
+//
+// dst[i] += src[i]; copy_dst[i] = dst[i]
+//
+// Replaces separate add_residual + copy_buffer dispatches.
+//
+// buffer(0): dst      [dim] float -- R/W (accumulator)
+// buffer(1): src      [dim] float -- addend
+// buffer(2): copy_dst [dim] float -- receives final value of dst
+// buffer(3): dim (uint)
+//
+// grid: (ceil(dim/256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void residual_add_copy(
+    device       float* dst      [[buffer(0)]],
+    device const float* src      [[buffer(1)]],
+    device       float* copy_dst [[buffer(2)]],
+    constant     uint&  dim      [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+    float val = dst[gid] + src[gid];
+    dst[gid] = val;
+    copy_dst[gid] = val;
+}
+
+// ============================================================================
+// l2_normalize_qk: Fused L2 normalization for both Q and K head blocks
+//
+// Normalizes Q heads [0..n_q_heads) and K heads [0..n_k_heads) in a single
+// dispatch. The two head arrays are at different buffer offsets.
+// Each threadgroup handles one head (Q or K), distinguished by threadgroup index.
+// Threadgroups 0..n_q_heads-1 handle Q heads, n_q_heads..n_q_heads+n_k_heads-1
+// handle K heads.
+//
+// buffer(0): q_data     [n_q_heads * head_dim] float -- modified in-place
+// buffer(1): k_data     [n_k_heads * head_dim] float -- modified in-place
+// buffer(2): n_q_heads  (uint)
+// buffer(3): n_k_heads  (uint)
+// buffer(4): head_dim   (uint)
+// buffer(5): eps        (float)
+//
+// grid: (n_q_heads + n_k_heads, 1, 1), threadgroup: (min(head_dim, 256), 1, 1)
+// ============================================================================
+

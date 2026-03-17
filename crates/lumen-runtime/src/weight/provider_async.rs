@@ -479,7 +479,7 @@ impl Drop for AsyncWeightProvider {
 mod tests {
     use super::*;
     use crate::compute::ComputeBackend;
-    use crate::compute::naive::NaiveF32Backend;
+    use crate::compute::cpu_naive::NaiveF32Backend;
     use crate::config::RuntimeConfig;
     use crate::engine::{InferenceEngine, SamplingParams, StopCondition};
     use crate::kv::KvPrecision;

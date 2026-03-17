@@ -1,6 +1,6 @@
 //! MoE (Mixture of Experts) encode functions and configuration for Metal backend.
 //!
-//! Extracted from compute_metal.rs for modularity.
+//! Extracted from mod.rs for modularity.
 
 use crate::error::RuntimeError;
 use crate::expert::cache::ExpertLfuCache;

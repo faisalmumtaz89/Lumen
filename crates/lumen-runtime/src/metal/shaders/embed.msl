@@ -1,0 +1,115 @@
+
+kernel void add_residual(
+    device float*       dst [[buffer(0)]],
+    device const float* src [[buffer(1)]],
+    constant uint&      dim [[buffer(2)]],
+    uint gid                [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+    dst[gid] += src[gid];
+}
+
+// ============================================================================
+// embed_token: Token embedding lookup
+//
+// Copies embedding[token_id * hidden_dim .. (token_id+1) * hidden_dim]
+// to the output buffer.
+// ============================================================================
+
+kernel void embed_token(
+    device const float* embedding  [[buffer(0)]],
+    device float*       out        [[buffer(1)]],
+    constant uint&      token_id   [[buffer(2)]],
+    constant uint&      hidden_dim [[buffer(3)]],
+    uint gid                       [[thread_position_in_grid]])
+{
+    if (gid >= hidden_dim) return;
+    out[gid] = embedding[token_id * hidden_dim + gid];
+}
+
+// ============================================================================
+// embed_token_f16: F16 (half-precision) token embedding lookup (decode)
+//
+// Reads half-precision embedding table, outputs F32.
+// ============================================================================
+
+kernel void embed_token_f16(
+    device const half* embedding_f16 [[buffer(0)]],
+    device float*      out           [[buffer(1)]],
+    constant uint&     token_id      [[buffer(2)]],
+    constant uint&     hidden_dim    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= hidden_dim) return;
+    out[gid] = float(embedding_f16[token_id * hidden_dim + gid]);
+}
+
+
+// ============================================================================
+// embed_token_q8_0: Q8_0 quantized token embedding lookup (decode)
+//
+// Q8_0 block: 34 bytes = 2-byte f16 scale + 32 int8 values
+// Dequantizes on-the-fly: out[gid] = scale * (int8)quant[elem]
+// ============================================================================
+
+kernel void embed_token_q8_0(
+    device const char* embedding_q8  [[buffer(0)]],
+    device float*      out           [[buffer(1)]],
+    constant uint&     token_id      [[buffer(2)]],
+    constant uint&     hidden_dim    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= hidden_dim) return;
+    uint global_elem = token_id * hidden_dim + gid;
+    uint block_idx = global_elem >> 5;       // / 32
+    uint elem_in_block = global_elem & 31;   // % 32
+
+    device const char* block_ptr = embedding_q8 + block_idx * 34;
+    float scale = float(*(device const half*)block_ptr);
+    float val = float(block_ptr[2 + elem_in_block]);
+    out[gid] = val * scale;
+}
+
+// ============================================================================
+// embed_token_q4_0: Q4_0 quantized token embedding lookup (decode)
+//
+// Q4_0 block: 18 bytes = 2-byte f16 scale + 16 bytes (32 packed 4-bit values)
+// GGML de-interleaved nibble ordering:
+//   elements 0-15  = lo nibble of bytes 0-15
+//   elements 16-31 = hi nibble of bytes 0-15
+// Values are unsigned 0-15, subtract 8 for signed range [-8, 7]
+// ============================================================================
+
+kernel void embed_token_q4_0(
+    device const char* embedding_q4  [[buffer(0)]],
+    device float*      out           [[buffer(1)]],
+    constant uint&     token_id      [[buffer(2)]],
+    constant uint&     hidden_dim    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= hidden_dim) return;
+    uint global_elem = token_id * hidden_dim + gid;
+    uint block_idx = global_elem >> 5;
+    uint elem_in_block = global_elem & 31;
+
+    device const uchar* block_ptr = (device const uchar*)(embedding_q4 + block_idx * 18);
+    float scale = float(*(device const half*)block_ptr);
+
+    // De-interleaved: elem 0-15 use lo nibble, elem 16-31 use hi nibble
+    uint byte_idx = (elem_in_block < 16) ? elem_in_block : (elem_in_block - 16);
+    uchar packed = block_ptr[2 + byte_idx];
+    int nibble = (elem_in_block < 16) ? (int)(packed & 0xF) - 8 : (int)(packed >> 4) - 8;
+    out[gid] = float(nibble) * scale;
+}
+
+// ============================================================================
+// BATCHED PREFILL KERNELS
+//
+// These kernels process multiple tokens at once (mat-mat GEMM) for prompt
+// processing. Dramatically more efficient than dispatching mat-vec per token
+// because:
+//   1. Weights are loaded once from memory and reused across all batch tokens
+//   2. Threadgroup memory tiling achieves high ALU utilization
+//   3. Orders of magnitude fewer GPU dispatches
+// ============================================================================
+

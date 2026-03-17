@@ -5,8 +5,8 @@ use crate::results::{BenchResult, BenchSummary};
 
 use lumen_format::large_model::{self, LargeModelConfig};
 use lumen_runtime::compute::ComputeBackend;
-use lumen_runtime::compute::naive::NaiveF32Backend;
-use lumen_runtime::compute::simd::SimdF32Backend;
+use lumen_runtime::compute::cpu_naive::NaiveF32Backend;
+use lumen_runtime::compute::cpu_simd::SimdF32Backend;
 use lumen_runtime::config::RuntimeConfig;
 use lumen_runtime::engine::{GenerationResult, InferenceEngine, SamplingParams, StopCondition};
 use lumen_runtime::kv::KvPrecision;

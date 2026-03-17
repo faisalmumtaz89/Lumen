@@ -360,7 +360,7 @@ discover_mlx_models() {
     # --- TinyLlama ---
     # Q8_0 (HF cache or local)
     local tinyllama_dir
-    tinyllama_dir="$(ls -d "${HOME}/.cache/huggingface/hub/models--steamdroid--TinyLlama-1.1B-Chat-v1.0-mlx-8Bit/snapshots"/*/ 2>/dev/null | head -1)"
+    tinyllama_dir="$(ls -d "${HOME}/.cache/huggingface/hub/models--steamdroid--TinyLlama-1.1B-Chat-v1.0-mlx-8Bit/snapshots"/*/ 2>/dev/null | head -1 || true)"
     if [[ -n "$tinyllama_dir" && -d "$tinyllama_dir" ]]; then
         mlx_add "tinyllama-1.1b-q8_0" "$tinyllama_dir"
     elif [[ -d "${BENCH_DIR}/tinyllama-1.1b-mlx-8bit" ]]; then
@@ -378,7 +378,7 @@ discover_mlx_models() {
     # --- Llama 3.1 8B ---
     # Q8_0 (HF cache or local)
     local llama8b_dir
-    llama8b_dir="$(ls -d "${HOME}/.cache/huggingface/hub/models--mlx-community--Meta-Llama-3.1-8B-Instruct-8bit/snapshots"/*/ 2>/dev/null | head -1)"
+    llama8b_dir="$(ls -d "${HOME}/.cache/huggingface/hub/models--mlx-community--Meta-Llama-3.1-8B-Instruct-8bit/snapshots"/*/ 2>/dev/null | head -1 || true)"
     if [[ -n "$llama8b_dir" && -d "$llama8b_dir" ]]; then
         mlx_add "llama-3.1-8b-q8_0" "$llama8b_dir"
     elif [[ -d "${BENCH_DIR}/llama-3.1-8b-mlx-8bit" ]]; then

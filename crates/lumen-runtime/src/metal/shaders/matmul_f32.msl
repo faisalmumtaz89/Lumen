@@ -1,0 +1,179 @@
+// ============================================================================
+// matmul_f32: Matrix-vector multiply (the hot kernel, ~90% of compute)
+//
+// W: [out_dim, in_dim] row-major weights
+// x: [in_dim] input vector
+// out: [out_dim] output vector
+//
+// Strategy: One threadgroup per output row. Each thread in the threadgroup
+// processes a chunk of the dot product, then we reduce via simd_sum.
+// ============================================================================
+
+kernel void matmul_f32(
+    device const float* W      [[buffer(0)]],
+    device const float* x      [[buffer(1)]],
+    device float*       out    [[buffer(2)]],
+    constant uint&      in_dim [[buffer(3)]],
+    uint row                   [[threadgroup_position_in_grid]],
+    uint tid                   [[thread_index_in_threadgroup]],
+    uint tg_size               [[threads_per_threadgroup]],
+    uint simd_lane             [[thread_index_in_simdgroup]],
+    uint simd_group            [[simdgroup_index_in_threadgroup]])
+{
+    // Each thread accumulates its portion of the dot product
+    device const float* w_row = W + row * in_dim;
+    float sum = 0.0f;
+
+    // Process elements in strides of threadgroup size
+    for (uint j = tid; j < in_dim; j += tg_size) {
+        sum += w_row[j] * x[j];
+    }
+
+    // SIMD group reduction (hardware-accelerated on Apple GPU)
+    sum = simd_sum(sum);
+
+    // Only the first thread in each SIMD group has the partial sum.
+    // We need to reduce across SIMD groups within the threadgroup.
+    threadgroup float partial_sums[32]; // max 1024 threads / 32 per simd group
+
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Final reduction by the first SIMD group
+    uint num_simd_groups = (tg_size + 31) / 32;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            out[row] = val;
+        }
+    }
+}
+
+// ============================================================================
+// matmul_bytes_f32: Matrix-vector multiply reading weights from raw LE bytes.
+//
+// Same algorithm as matmul_f32, but w_bytes is a byte buffer containing
+// LE-encoded f32 values. On Apple Silicon (little-endian), we can just cast.
+// ============================================================================
+
+kernel void matmul_bytes_f32(
+    device const uchar* w_bytes [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    uint row                    [[threadgroup_position_in_grid]],
+    uint tid                    [[thread_index_in_threadgroup]],
+    uint tg_size                [[threads_per_threadgroup]],
+    uint simd_lane              [[thread_index_in_simdgroup]],
+    uint simd_group             [[simdgroup_index_in_threadgroup]])
+{
+    // Cast the byte pointer to float pointer for this row
+    // Apple Silicon is little-endian, so LE f32 bytes == native f32.
+    device const float* w_row = (device const float*)(w_bytes + row * in_dim * 4);
+
+    float sum = 0.0f;
+    for (uint j = tid; j < in_dim; j += tg_size) {
+        sum += w_row[j] * x[j];
+    }
+
+    sum = simd_sum(sum);
+
+    threadgroup float partial_sums[32];
+
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            out[row] = val;
+        }
+    }
+}
+
+// ============================================================================
+// matmul_f32_deferred: Deferred-reduction F32 matvec (4 rows/TG, 128 threads)
+//
+// Same deferred-reduction pattern as dequant_matmul_q8_0_deferred but for F32
+// weights — no dequantization needed. Each thread accumulates locally across
+// a stride of the input dimension, then ONE simd_sum + ONE cross-SG shmem
+// reduce = 2 sync points total.
+//
+// NR0=4 rows per threadgroup (4 SIMD groups x 32 threads = 128 threads).
+// Each SG handles one output row and strides across in_dim with step=32.
+// x-vector is reused across all 4 rows (4x bandwidth reduction vs 1 row/TG).
+//
+// Dispatch: threadgroups = ceil(out_dim/4), threads_per_threadgroup = 128
+// Threadgroup memory: NR0 * 32 * sizeof(float) = 512 bytes
+// ============================================================================
+
+kernel void matmul_f32_deferred(
+    device const float* W       [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 4;   // rows per threadgroup
+    const uint NSG = 4;   // simdgroups per threadgroup
+    const uint NW  = 32;  // threads per simdgroup
+
+    const uint r0 = tgpig * NR0;  // first output row for this threadgroup
+
+    // Global thread index within threadgroup: sgitg * 32 + tiisg
+    const uint tid = sgitg * NW + tiisg;
+    const uint total_threads = NSG * NW;  // 128
+
+    // Each thread accumulates a partial dot product for all NR0 rows
+    float sumf[NR0] = { 0.f, 0.f, 0.f, 0.f };
+
+    // Stride across in_dim: thread tid processes elements tid, tid+128, tid+256, ...
+    for (uint j = tid; j < in_dim; j += total_threads) {
+        float xv = x[j];
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row < out_dim) {
+                sumf[row] += W[(r0 + row) * in_dim + j] * xv;
+            }
+        }
+    }
+
+    // Final reduction: 1 simd_sum + cross-SG shmem reduce
+    threadgroup float shmem[NR0 * NW];  // 512 bytes
+
+    // Initialize shmem (SG 0 zeros its slots)
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each SG writes its reduced sum
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // SG 0 does the final reduction and writes output
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            out[r0 + row] = tot;
+        }
+    }
+}

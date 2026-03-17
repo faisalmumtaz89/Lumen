@@ -2820,7 +2820,7 @@ pub fn vscale_add_inplace_simd(dst: &mut [f32], src: &[f32], scale: f32) {
 
 // ---- Fallback implementations (used on non-aarch64 and in tests) ----
 
-/// Scalar matmul_bytes -- matches compute_naive::matmul_bytes exactly.
+/// Scalar matmul_bytes -- matches cpu_naive::matmul_bytes exactly.
 #[cfg(any(not(target_arch = "aarch64"), test))]
 fn matmul_bytes_fallback(
     out: &mut [f32],
@@ -2841,7 +2841,7 @@ fn matmul_bytes_fallback(
     }
 }
 
-/// Scalar matmul -- matches compute_naive::matmul exactly.
+/// Scalar matmul -- matches cpu_naive::matmul exactly.
 #[cfg(any(not(target_arch = "aarch64"), test))]
 fn matmul_fallback(
     out: &mut [f32],
@@ -2856,7 +2856,7 @@ fn matmul_fallback(
     }
 }
 
-/// Scalar rmsnorm_bytes -- matches compute_naive::rmsnorm_bytes exactly.
+/// Scalar rmsnorm_bytes -- matches cpu_naive::rmsnorm_bytes exactly.
 #[cfg(any(not(target_arch = "aarch64"), test))]
 fn rmsnorm_bytes_fallback(out: &mut [f32], x: &[f32], weight_bytes: &[u8], eps: f32) {
     let n = x.len();
@@ -2874,7 +2874,7 @@ fn dot_product_fallback(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(&a, &b)| a * b).sum()
 }
 
-/// Scalar swiglu -- matches compute_naive::swiglu_inplace exactly.
+/// Scalar swiglu -- matches cpu_naive::swiglu_inplace exactly.
 #[cfg(any(not(target_arch = "aarch64"), test))]
 fn swiglu_inplace_fallback(gate: &mut [f32], up: &[f32]) {
     for i in 0..gate.len() {

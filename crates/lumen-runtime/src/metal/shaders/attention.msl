@@ -1,0 +1,909 @@
+
+kernel void softmax(
+    device float*  data   [[buffer(0)]],
+    constant uint& len    [[buffer(1)]],
+    uint tid              [[thread_index_in_threadgroup]],
+    uint tg_size          [[threads_per_threadgroup]],
+    uint simd_lane        [[thread_index_in_simdgroup]],
+    uint simd_group       [[simdgroup_index_in_threadgroup]])
+{
+    // Phase 1: Find max
+    float local_max = -INFINITY;
+    for (uint i = tid; i < len; i += tg_size) {
+        local_max = max(local_max, data[i]);
+    }
+
+    local_max = simd_max(local_max);
+
+    threadgroup float partial_max[32];
+
+    if (simd_lane == 0) {
+        partial_max[simd_group] = local_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float global_max;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_max[simd_lane] : -INFINITY;
+        val = simd_max(val);
+        if (simd_lane == 0) {
+            global_max = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: exp(x - max) and sum
+    float local_sum = 0.0f;
+    for (uint i = tid; i < len; i += tg_size) {
+        float e = exp(data[i] - global_max);
+        data[i] = e;
+        local_sum += e;
+    }
+
+    local_sum = simd_sum(local_sum);
+
+    threadgroup float partial_sums[32];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = local_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float global_sum;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            global_sum = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 3: Normalize
+    float inv_sum = 1.0f / global_sum;
+    for (uint i = tid; i < len; i += tg_size) {
+        data[i] *= inv_sum;
+    }
+}
+
+// ============================================================================
+// attention_scores: Compute Q . K^T dot products for a single head
+//
+// q:       [head_dim]
+// k_cache: [seq_len * kv_dim] -- all KV heads flattened
+// scores:  [seq_len] output
+// ============================================================================
+
+kernel void attention_scores(
+    device const float* q          [[buffer(0)]],
+    device const half*  k_cache    [[buffer(1)]],
+    device float*       scores     [[buffer(2)]],
+    constant uint&      head_dim   [[buffer(3)]],
+    constant uint&      kv_dim     [[buffer(4)]],
+    constant uint&      kv_head    [[buffer(5)]],
+    constant float&     scale      [[buffer(6)]],
+    constant uint&      seq_len    [[buffer(7)]],
+    uint t                         [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_index_in_threadgroup]],
+    uint tg_size                   [[threads_per_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_group                [[simdgroup_index_in_threadgroup]])
+{
+    if (t >= seq_len) return;
+
+    device const half* k_vec = k_cache + t * kv_dim + kv_head * head_dim;
+
+    float dot = 0.0f;
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        dot += q[d] * float(k_vec[d]);
+    }
+
+    dot = simd_sum(dot);
+
+    threadgroup float partial_sums[32];
+
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = dot;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            scores[t] = val * scale;
+        }
+    }
+}
+
+// ============================================================================
+// attention_output: Weighted sum of V vectors
+//
+// scores:  [seq_len] -- softmax attention weights
+// v_cache: [seq_len * kv_dim] -- all KV heads flattened
+// out:     [head_dim] -- output for one head
+// ============================================================================
+
+kernel void attention_output(
+    device const float* scores     [[buffer(0)]],
+    device const half*  v_cache    [[buffer(1)]],
+    device float*       out        [[buffer(2)]],
+    constant uint&      head_dim   [[buffer(3)]],
+    constant uint&      kv_dim     [[buffer(4)]],
+    constant uint&      kv_head    [[buffer(5)]],
+    constant uint&      seq_len    [[buffer(6)]],
+    constant uint&      max_seq_len [[buffer(7)]],
+    uint d                         [[thread_position_in_grid]])
+{
+    if (d >= head_dim) return;
+
+    // V cache transposed: [kv_dim, max_seq_len], contiguous along time (f16)
+    device const half* v_row = v_cache + (kv_head * head_dim + d) * max_seq_len;
+    float sum = 0.0f;
+    for (uint t = 0; t < seq_len; t++) {
+        sum += scores[t] * float(v_row[t]);
+    }
+    out[d] = sum;
+}
+
+// ============================================================================
+// write_kv_cache: Write K,V projections directly into GPU-resident KV cache
+//
+// Copies kv_dim floats from k_new/v_new into the correct position in the
+// persistent GPU KV cache buffers. Avoids CPU round-trip entirely.
+// ============================================================================
+
+kernel void write_kv_cache(
+    device const float* k_new       [[buffer(0)]],
+    device const float* v_new       [[buffer(1)]],
+    device half*        k_cache     [[buffer(2)]],
+    device half*        v_cache     [[buffer(3)]],
+    constant uint&      kv_dim      [[buffer(4)]],
+    constant uint&      seq_pos     [[buffer(5)]],
+    constant uint&      max_seq_len [[buffer(6)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (gid >= kv_dim) return;
+    // K cache: row-major [max_seq_len, kv_dim]
+    k_cache[seq_pos * kv_dim + gid] = half(k_new[gid]);
+    // V cache: transposed [kv_dim, max_seq_len] for contiguous attention reads
+    v_cache[gid * max_seq_len + seq_pos] = half(v_new[gid]);
+}
+
+// ============================================================================
+// fused_rope_kv_write: Fused RoPE Q + RoPE K + KV cache write
+//
+// Combines 3 separate dispatches into 1 for decode:
+//   Region 0: Apply standard RoPE to Q vectors (interleaved pairs)
+//   Region 1: Apply standard RoPE to K vectors + write K to cache
+//   Region 2: Write V to cache (no RoPE needed)
+//
+// Grid is flat: total_threads = num_q_heads*half_dim + num_kv_heads*half_dim + kv_dim
+// The kernel partitions gid space into 3 contiguous regions using offsets.
+// All 3 regions operate on non-overlapping buffers, so no barriers are needed.
+//
+// Saves 2 dispatches per layer (64 dispatches for 32-layer models).
+// ============================================================================
+
+kernel void fused_rope_kv_write(
+    device float*       q_vec        [[buffer(0)]],   // qkv_buf + q_byte_off
+    device float*       k_vec        [[buffer(1)]],   // qkv_buf + k_byte_off
+    device const float* v_vec        [[buffer(2)]],   // qkv_buf + v_byte_off
+    device const float* cos_table    [[buffer(3)]],
+    device const float* sin_table    [[buffer(4)]],
+    device half*        k_cache      [[buffer(5)]],
+    device half*        v_cache      [[buffer(6)]],
+    constant uint&      num_q_heads  [[buffer(7)]],
+    constant uint&      num_kv_heads [[buffer(8)]],
+    constant uint&      head_dim     [[buffer(9)]],
+    constant uint&      half_dim     [[buffer(10)]],
+    constant uint&      pos_offset   [[buffer(11)]],
+    constant uint&      kv_dim       [[buffer(12)]],
+    constant uint&      seq_pos      [[buffer(13)]],
+    constant uint&      max_seq_len  [[buffer(14)]],
+    uint gid                         [[thread_position_in_grid]])
+{
+    // Region boundaries
+    uint q_region_size  = num_q_heads * half_dim;   // Q RoPE region
+    uint k_region_size  = num_kv_heads * half_dim;  // K RoPE region
+
+    if (gid < q_region_size) {
+        // --- Region 0: Q RoPE (standard interleaved) ---
+        uint head = gid / half_dim;
+        uint i    = gid % half_dim;
+        if (head >= num_q_heads) return;
+
+        uint idx0 = head * head_dim + 2 * i;
+        uint idx1 = idx0 + 1;
+
+        float v0 = q_vec[idx0];
+        float v1 = q_vec[idx1];
+
+        uint cos_idx = pos_offset + i;
+        float c = cos_table[cos_idx];
+        float s = sin_table[cos_idx];
+
+        q_vec[idx0] = v0 * c - v1 * s;
+        q_vec[idx1] = v0 * s + v1 * c;
+    }
+    else if (gid < q_region_size + k_region_size) {
+        // --- Region 1: K RoPE (standard interleaved) + K cache write ---
+        uint local_gid = gid - q_region_size;
+        uint head = local_gid / half_dim;
+        uint i    = local_gid % half_dim;
+        if (head >= num_kv_heads) return;
+
+        uint idx0 = head * head_dim + 2 * i;
+        uint idx1 = idx0 + 1;
+
+        float v0 = k_vec[idx0];
+        float v1 = k_vec[idx1];
+
+        uint cos_idx = pos_offset + i;
+        float c = cos_table[cos_idx];
+        float s = sin_table[cos_idx];
+
+        float new0 = v0 * c - v1 * s;
+        float new1 = v0 * s + v1 * c;
+
+        k_vec[idx0] = new0;
+        k_vec[idx1] = new1;
+
+        // Write both rotated elements to K cache (row-major [max_seq_len, kv_dim]) as f16
+        k_cache[seq_pos * kv_dim + idx0] = half(new0);
+        k_cache[seq_pos * kv_dim + idx1] = half(new1);
+    }
+    else {
+        // --- Region 2: V cache write (no RoPE) ---
+        uint local_gid = gid - q_region_size - k_region_size;
+        if (local_gid >= kv_dim) return;
+
+        // V cache: transposed [kv_dim, max_seq_len] as f16
+        v_cache[local_gid * max_seq_len + seq_pos] = half(v_vec[local_gid]);
+    }
+}
+
+// ============================================================================
+// fused_rope_neox_kv_write: NeoX-style variant of fused RoPE + KV write
+//
+// Same as fused_rope_kv_write but uses NeoX dimension pairing:
+//   (i, i + half_dim) instead of (2*i, 2*i+1)
+// ============================================================================
+
+kernel void fused_rope_neox_kv_write(
+    device float*       q_vec        [[buffer(0)]],
+    device float*       k_vec        [[buffer(1)]],
+    device const float* v_vec        [[buffer(2)]],
+    device const float* cos_table    [[buffer(3)]],
+    device const float* sin_table    [[buffer(4)]],
+    device half*        k_cache      [[buffer(5)]],
+    device half*        v_cache      [[buffer(6)]],
+    constant uint&      num_q_heads  [[buffer(7)]],
+    constant uint&      num_kv_heads [[buffer(8)]],
+    constant uint&      head_dim     [[buffer(9)]],
+    constant uint&      half_dim     [[buffer(10)]],
+    constant uint&      pos_offset   [[buffer(11)]],
+    constant uint&      kv_dim       [[buffer(12)]],
+    constant uint&      seq_pos      [[buffer(13)]],
+    constant uint&      max_seq_len  [[buffer(14)]],
+    uint gid                         [[thread_position_in_grid]])
+{
+    uint q_region_size  = num_q_heads * half_dim;
+    uint k_region_size  = num_kv_heads * half_dim;
+
+    if (gid < q_region_size) {
+        // --- Region 0: Q RoPE (NeoX half-offset) ---
+        uint head = gid / half_dim;
+        uint i    = gid % half_dim;
+        if (head >= num_q_heads) return;
+
+        uint base = head * head_dim;
+        uint idx0 = base + i;
+        uint idx1 = base + i + half_dim;
+
+        float v0 = q_vec[idx0];
+        float v1 = q_vec[idx1];
+
+        uint cos_idx = pos_offset + i;
+        float c = cos_table[cos_idx];
+        float s = sin_table[cos_idx];
+
+        q_vec[idx0] = v0 * c - v1 * s;
+        q_vec[idx1] = v0 * s + v1 * c;
+    }
+    else if (gid < q_region_size + k_region_size) {
+        // --- Region 1: K RoPE (NeoX half-offset) + K cache write ---
+        uint local_gid = gid - q_region_size;
+        uint head = local_gid / half_dim;
+        uint i    = local_gid % half_dim;
+        if (head >= num_kv_heads) return;
+
+        uint base = head * head_dim;
+        uint idx0 = base + i;
+        uint idx1 = base + i + half_dim;
+
+        float v0 = k_vec[idx0];
+        float v1 = k_vec[idx1];
+
+        uint cos_idx = pos_offset + i;
+        float c = cos_table[cos_idx];
+        float s = sin_table[cos_idx];
+
+        float new0 = v0 * c - v1 * s;
+        float new1 = v0 * s + v1 * c;
+
+        k_vec[idx0] = new0;
+        k_vec[idx1] = new1;
+
+        // Write both rotated elements to K cache (row-major [max_seq_len, kv_dim]) as f16
+        k_cache[seq_pos * kv_dim + idx0] = half(new0);
+        k_cache[seq_pos * kv_dim + idx1] = half(new1);
+    }
+    else {
+        // --- Region 2: V cache write (no RoPE) ---
+        uint local_gid = gid - q_region_size - k_region_size;
+        if (local_gid >= kv_dim) return;
+
+        // V cache: transposed [kv_dim, max_seq_len] as f16
+        v_cache[local_gid * max_seq_len + seq_pos] = half(v_vec[local_gid]);
+    }
+}
+
+// ============================================================================
+// multi_head_attention: Fused all-heads attention in a single dispatch
+//
+// Computes Q.K^T scores, softmax, and V weighted sum for ALL heads
+// simultaneously. Each threadgroup handles one query head. Supports GQA
+// via kv_head = head / gqa_ratio mapping.
+//
+// Dispatch: threadgroups = (num_heads, 1, 1), threads_per_threadgroup = (tg_size, 1, 1)
+//
+// The kernel performs three phases per head:
+// 1. Dot product: score[t] = sum_d(q[d] * k_cache[t, kv_head, d]) * scale
+// 2. Softmax: in-place over scores (max-subtract for numerical stability)
+// 3. Output: out[d] = sum_t(score[t] * v_cache[t, kv_head, d])
+//
+// Uses device-memory scores buffer instead of threadgroup memory to avoid
+// threadgroup size limits and compiler issues.
+// ============================================================================
+
+kernel void multi_head_attention(
+    device const float* q              [[buffer(0)]],
+    device const half*  k_cache        [[buffer(1)]],
+    device const half*  v_cache        [[buffer(2)]],
+    device float*       attn_out       [[buffer(3)]],
+    device float*       scores_scratch [[buffer(4)]],
+    constant uint&      num_heads      [[buffer(5)]],
+    constant uint&      num_kv_heads   [[buffer(6)]],
+    constant uint&      head_dim       [[buffer(7)]],
+    constant uint&      kv_dim         [[buffer(8)]],
+    constant uint&      seq_len        [[buffer(9)]],
+    constant float&     scale          [[buffer(10)]],
+    constant uint&      max_seq_len    [[buffer(11)]],
+    uint head                          [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_index_in_threadgroup]],
+    uint tg_size                       [[threads_per_threadgroup]],
+    uint simd_lane                     [[thread_index_in_simdgroup]],
+    uint simd_group                    [[simdgroup_index_in_threadgroup]])
+{
+    if (head >= num_heads) return;
+
+    // GQA mapping: multiple query heads share the same KV head
+    uint gqa_ratio = num_heads / num_kv_heads;
+    uint kv_head = head / gqa_ratio;
+
+    // Pointers for this head's Q and output
+    device const float* q_head = q + head * head_dim;
+    device float* out_head = attn_out + head * head_dim;
+
+    // Per-head scores stored in device memory (indexed by head * max_seq_capacity + t)
+    // The host allocates scores_scratch as [num_heads * max_seq_len] floats.
+    device float* scores = scores_scratch + head * seq_len;
+
+    // ---- Phase 1: Compute attention scores (read K as half, accumulate in f32) ----
+    for (uint t = tid; t < seq_len; t += tg_size) {
+        device const half* k_vec = k_cache + t * kv_dim + kv_head * head_dim;
+        float dot = 0.0f;
+        for (uint d = 0; d < head_dim; d++) {
+            dot += q_head[d] * float(k_vec[d]);
+        }
+        scores[t] = dot * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // ---- Phase 2: Softmax over scores[0..seq_len] ----
+
+    // 2a: Find max
+    float local_max = -INFINITY;
+    for (uint t = tid; t < seq_len; t += tg_size) {
+        local_max = max(local_max, scores[t]);
+    }
+    local_max = simd_max(local_max);
+
+    threadgroup float partial_max[32];
+    if (simd_lane == 0) {
+        partial_max[simd_group] = local_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float global_max;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_max[simd_lane] : -INFINITY;
+        val = simd_max(val);
+        if (simd_lane == 0) {
+            global_max = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2b: exp(x - max) and sum
+    float local_sum = 0.0f;
+    for (uint t = tid; t < seq_len; t += tg_size) {
+        float e = exp(scores[t] - global_max);
+        scores[t] = e;
+        local_sum += e;
+    }
+    local_sum = simd_sum(local_sum);
+
+    threadgroup float partial_sums[32];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = local_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float global_sum;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            global_sum = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2c: Normalize
+    float inv_sum = 1.0f / global_sum;
+    for (uint t = tid; t < seq_len; t += tg_size) {
+        scores[t] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // ---- Phase 3: Weighted sum of V (transposed layout: [kv_dim, max_seq_len], f16) ----
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        // V is stored as [kv_dim, max_seq_len]: contiguous along time dimension (f16)
+        device const half* v_row = v_cache + (kv_head * head_dim + d) * max_seq_len;
+        float sum = 0.0f;
+        for (uint t = 0; t < seq_len; t++) {
+            sum += scores[t] * float(v_row[t]);
+        }
+        out_head[d] = sum;
+    }
+}
+
+// ============================================================================
+// fused_rope_kv_mha: Fused RoPE + KV cache write + Multi-Head Attention
+//
+// Combines fused_rope_kv_write + multi_head_attention into a single dispatch,
+// eliminating 2 memory barriers and 1 dispatch per layer.
+//
+// Each threadgroup handles one Q head:
+//   Phase 0: Apply RoPE to Q[head], RoPE to K[kv_head], write K/V to cache
+//   Phase 1: Compute attention scores (Q dot K_cache for all positions)
+//   Phase 2: Softmax over scores
+//   Phase 3: Weighted sum of V_cache
+//
+// For GQA (num_q_heads > num_kv_heads), all Q heads in the same KV group
+// redundantly write K/V to cache (benign race: identical values).
+//
+// Only used for short sequences (seq_len < FLASH_DECODE_THRESHOLD = 257).
+// Dispatch: threadgroups = num_q_heads, threads = min(256, max(head_dim, seq_len+1))
+// ============================================================================
+
+kernel void fused_rope_kv_mha(
+    device float*       q_vec        [[buffer(0)]],   // qkv_buf + q_byte_off [q_dim]
+    device float*       k_vec        [[buffer(1)]],   // qkv_buf + k_byte_off [kv_dim]
+    device const float* v_vec        [[buffer(2)]],   // qkv_buf + v_byte_off [kv_dim]
+    device const float* cos_table    [[buffer(3)]],
+    device const float* sin_table    [[buffer(4)]],
+    device half*        k_cache      [[buffer(5)]],   // [max_seq_len, kv_dim] row-major
+    device half*        v_cache      [[buffer(6)]],   // [kv_dim, max_seq_len] transposed
+    device float*       attn_out     [[buffer(7)]],   // [q_dim]
+    device float*       scores_scratch [[buffer(8)]], // [num_q_heads * (seq_pos+1)]
+    constant uint&      num_q_heads  [[buffer(9)]],
+    constant uint&      num_kv_heads [[buffer(10)]],
+    constant uint&      head_dim     [[buffer(11)]],
+    constant uint&      half_dim     [[buffer(12)]],  // head_dim / 2 (for RoPE)
+    constant uint&      pos_offset   [[buffer(13)]],  // seq_pos * half_dim (cos/sin table offset)
+    constant uint&      kv_dim       [[buffer(14)]],
+    constant uint&      seq_pos      [[buffer(15)]],  // current position (0-indexed)
+    constant float&     attn_scale   [[buffer(16)]],
+    constant uint&      max_seq_len  [[buffer(17)]],
+    uint head                        [[threadgroup_position_in_grid]],
+    uint tid                         [[thread_index_in_threadgroup]],
+    uint tg_size                     [[threads_per_threadgroup]],
+    uint simd_lane                   [[thread_index_in_simdgroup]],
+    uint simd_group                  [[simdgroup_index_in_threadgroup]])
+{
+    if (head >= num_q_heads) return;
+
+    uint gqa_ratio = num_q_heads / num_kv_heads;
+    uint kv_head = head / gqa_ratio;
+    uint new_seq_len = seq_pos + 1;
+
+    // ---- Phase 0: RoPE + KV cache write ----
+
+    // Apply RoPE to Q[head] (in-place)
+    for (uint i = tid; i < half_dim; i += tg_size) {
+        uint idx0 = head * head_dim + 2 * i;
+        uint idx1 = idx0 + 1;
+        float v0 = q_vec[idx0];
+        float v1 = q_vec[idx1];
+        uint cos_idx = pos_offset + i;
+        float c = cos_table[cos_idx];
+        float s = sin_table[cos_idx];
+        q_vec[idx0] = v0 * c - v1 * s;
+        q_vec[idx1] = v0 * s + v1 * c;
+    }
+
+    // Apply RoPE to K[kv_head] + write to K cache
+    // All Q heads in the same KV group do this redundantly (benign race).
+    for (uint i = tid; i < half_dim; i += tg_size) {
+        uint idx0 = kv_head * head_dim + 2 * i;
+        uint idx1 = idx0 + 1;
+        float v0 = k_vec[idx0];
+        float v1 = k_vec[idx1];
+        uint cos_idx = pos_offset + i;
+        float c = cos_table[cos_idx];
+        float s = sin_table[cos_idx];
+        float new0 = v0 * c - v1 * s;
+        float new1 = v0 * s + v1 * c;
+        k_vec[idx0] = new0;
+        k_vec[idx1] = new1;
+        k_cache[seq_pos * kv_dim + idx0] = half(new0);
+        k_cache[seq_pos * kv_dim + idx1] = half(new1);
+    }
+
+    // Write V to cache (transposed layout: [kv_dim, max_seq_len])
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        uint v_idx = kv_head * head_dim + d;
+        v_cache[v_idx * max_seq_len + seq_pos] = half(v_vec[v_idx]);
+    }
+
+    // Ensure K/V cache writes are visible before reading in attention phase
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // ---- Phase 1: Attention scores ----
+    device const float* q_head_ptr = q_vec + head * head_dim;
+    device float* out_head = attn_out + head * head_dim;
+    device float* scores = scores_scratch + head * new_seq_len;
+
+    for (uint t = tid; t < new_seq_len; t += tg_size) {
+        device const half* k_t = k_cache + t * kv_dim + kv_head * head_dim;
+        float dot = 0.0f;
+        for (uint d = 0; d < head_dim; d++) {
+            dot += q_head_ptr[d] * float(k_t[d]);
+        }
+        scores[t] = dot * attn_scale;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // ---- Phase 2: Softmax ----
+
+    // 2a: Find max
+    float local_max = -INFINITY;
+    for (uint t = tid; t < new_seq_len; t += tg_size) {
+        local_max = max(local_max, scores[t]);
+    }
+    local_max = simd_max(local_max);
+
+    threadgroup float partial_max[32];
+    if (simd_lane == 0) {
+        partial_max[simd_group] = local_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float global_max_val;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_max[simd_lane] : -INFINITY;
+        val = simd_max(val);
+        if (simd_lane == 0) {
+            global_max_val = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2b: exp(x - max) and sum
+    float local_sum = 0.0f;
+    for (uint t = tid; t < new_seq_len; t += tg_size) {
+        float e = exp(scores[t] - global_max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    local_sum = simd_sum(local_sum);
+
+    threadgroup float partial_sums[32];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = local_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float global_sum_val;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            global_sum_val = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2c: Normalize
+    float inv_sum = 1.0f / global_sum_val;
+    for (uint t = tid; t < new_seq_len; t += tg_size) {
+        scores[t] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // ---- Phase 3: Weighted sum of V ----
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        device const half* v_row = v_cache + (kv_head * head_dim + d) * max_seq_len;
+        float sum = 0.0f;
+        for (uint t = 0; t < new_seq_len; t++) {
+            sum += scores[t] * float(v_row[t]);
+        }
+        out_head[d] = sum;
+    }
+}
+
+
+// ============================================================================
+// Flash Decoding: Two-phase tiled attention for decode (single query)
+//
+// Phase 1 (flash_decode_attention):
+//   Grid: (num_heads * num_kv_tiles, 1, 1) -- flattened 1D
+//   Each threadgroup processes one (head, kv_tile) pair.
+//   Uses online softmax: maintains running (max, sum, weighted_v).
+//   Writes partial results to an intermediate buffer.
+//
+// Phase 2 (flash_decode_reduce):
+//   Grid: (num_heads, 1, 1)
+//   Merges partial results across all KV tiles for each head using
+//   log-sum-exp combination to produce final attention output.
+//
+// This provides parallelism across the KV sequence dimension, which is
+// critical for long sequences where a single threadgroup per head
+// cannot saturate the GPU.
+// ============================================================================
+
+// Partial result layout per (head, tile):
+//   [head_dim floats of weighted_v] [1 float max] [1 float sum]
+// Total stride per entry = head_dim + 2
+
+kernel void flash_decode_attention(
+    device const float* q              [[buffer(0)]],
+    device const half*  k_cache        [[buffer(1)]],
+    device const half*  v_cache        [[buffer(2)]],
+    device float*       partial_out    [[buffer(3)]],
+    constant uint&      num_heads      [[buffer(4)]],
+    constant uint&      num_kv_heads   [[buffer(5)]],
+    constant uint&      head_dim       [[buffer(6)]],
+    constant uint&      kv_dim         [[buffer(7)]],
+    constant uint&      seq_len        [[buffer(8)]],
+    constant float&     scale          [[buffer(9)]],
+    constant uint&      tile_kv        [[buffer(10)]],
+    constant uint&      num_tiles      [[buffer(11)]],
+    constant uint&      max_seq_len    [[buffer(12)]],
+    uint tg_flat                       [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_index_in_threadgroup]],
+    uint tg_size                       [[threads_per_threadgroup]],
+    uint simd_lane                     [[thread_index_in_simdgroup]],
+    uint simd_group                    [[simdgroup_index_in_threadgroup]])
+{
+    // Flatten 2D grid: tg_flat = head * num_tiles + tile_idx
+    uint head = tg_flat / num_tiles;
+    uint tile_idx = tg_flat % num_tiles;
+    if (head >= num_heads || tile_idx >= num_tiles) return;
+
+    // GQA mapping
+    uint gqa_ratio = num_heads / num_kv_heads;
+    uint kv_head = head / gqa_ratio;
+
+    // KV range for this tile
+    uint t_start = tile_idx * tile_kv;
+    uint t_end = min(t_start + tile_kv, seq_len);
+    if (t_start >= seq_len) {
+        // This tile is entirely beyond seq_len; write sentinel values
+        uint partial_stride = head_dim + 2;
+        uint partial_base = (head * num_tiles + tile_idx) * partial_stride;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            partial_out[partial_base + d] = 0.0f;
+        }
+        if (tid == 0) {
+            partial_out[partial_base + head_dim]     = -INFINITY;  // max
+            partial_out[partial_base + head_dim + 1] = 0.0f;       // sum
+        }
+        return;
+    }
+
+    // Pointer to this head's query
+    device const float* q_head = q + head * head_dim;
+
+    // Phase 1: Compute Q*K scores for this tile and online softmax
+
+    // Step 1a: Compute all scores and find local max
+    // Use threadgroup memory for scores within this tile
+    threadgroup float tile_scores[256];  // max tile_kv; we cap tile_kv at 256
+
+    // Each thread computes dot products for positions it owns (read K as half, accumulate in f32)
+    float local_max = -INFINITY;
+    uint tile_len = t_end - t_start;
+    for (uint i = tid; i < tile_len; i += tg_size) {
+        uint t = t_start + i;
+        device const half* k_vec = k_cache + t * kv_dim + kv_head * head_dim;
+        float dot = 0.0f;
+        for (uint d = 0; d < head_dim; d++) {
+            dot += q_head[d] * float(k_vec[d]);
+        }
+        float s = dot * scale;
+        tile_scores[i] = s;
+        local_max = max(local_max, s);
+    }
+
+    // Reduce max across threadgroup
+    local_max = simd_max(local_max);
+    threadgroup float partial_max[32];
+    if (simd_lane == 0) {
+        partial_max[simd_group] = local_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float global_max_val;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_max[simd_lane] : -INFINITY;
+        val = simd_max(val);
+        if (simd_lane == 0) global_max_val = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 1b: exp(score - max) and sum
+    float local_sum = 0.0f;
+    for (uint i = tid; i < tile_len; i += tg_size) {
+        float e = exp(tile_scores[i] - global_max_val);
+        tile_scores[i] = e;
+        local_sum += e;
+    }
+
+    local_sum = simd_sum(local_sum);
+    threadgroup float partial_sums[32];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = local_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float global_sum_val;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) global_sum_val = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 1c: Weighted sum of V for this tile (unnormalized -- store raw exp-weighted sum)
+    uint partial_stride = head_dim + 2;
+    uint partial_base = (head * num_tiles + tile_idx) * partial_stride;
+
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        // V cache transposed: [kv_dim, max_seq_len], contiguous along time (f16)
+        device const half* v_row = v_cache + (kv_head * head_dim + d) * max_seq_len + t_start;
+        float wsum = 0.0f;
+        for (uint i = 0; i < tile_len; i++) {
+            wsum += tile_scores[i] * float(v_row[i]);
+        }
+        partial_out[partial_base + d] = wsum;
+    }
+
+    // Store max and sum for this tile
+    if (tid == 0) {
+        partial_out[partial_base + head_dim]     = global_max_val;
+        partial_out[partial_base + head_dim + 1] = global_sum_val;
+    }
+}
+
+// Phase 2: Reduce partial results across KV tiles
+// Parallel reduction -- all threads participate in finding global max
+// and computing rescaled sum, eliminating the serial thread-0 bottleneck.
+// Tile rescale factors are pre-computed into threadgroup memory so Phase 3
+// reads from fast SRAM instead of recomputing exp() from device memory.
+kernel void flash_decode_reduce(
+    device const float* partial_in     [[buffer(0)]],  // [num_heads * num_tiles * (head_dim+2)]
+    device float*       attn_out       [[buffer(1)]],  // [num_heads * head_dim]
+    constant uint&      num_heads      [[buffer(2)]],
+    constant uint&      head_dim       [[buffer(3)]],
+    constant uint&      num_tiles      [[buffer(4)]],
+    uint head                          [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_index_in_threadgroup]],
+    uint tg_size                       [[threads_per_threadgroup]],
+    uint tiisg                         [[thread_index_in_simdgroup]],
+    uint sgitg                         [[simdgroup_index_in_threadgroup]])
+{
+    if (head >= num_heads) return;
+
+    uint partial_stride = head_dim + 2;
+    uint num_simd_groups = (tg_size + 31) / 32;
+
+    // --- Phase 1: Parallel global max across all tiles ---
+    // Each thread reads tiles at stride tg_size, then SIMD + cross-SG reduction
+    float local_max = -INFINITY;
+    for (uint t = tid; t < num_tiles; t += tg_size) {
+        uint base = (head * num_tiles + t) * partial_stride;
+        local_max = max(local_max, partial_in[base + head_dim]);
+    }
+    // Intra-simdgroup max
+    local_max = simd_max(local_max);
+
+    // Cross-simdgroup max via threadgroup memory
+    threadgroup float sg_max[8];  // up to 8 simdgroups (256 threads / 32)
+    if (tiisg == 0) sg_max[sgitg] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float global_max_shared;
+    if (sgitg == 0) {
+        float v = (tiisg < num_simd_groups) ? sg_max[tiisg] : -INFINITY;
+        v = simd_max(v);
+        if (tiisg == 0) global_max_shared = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float gmax = global_max_shared;
+
+    // --- Phase 2: Parallel rescale + global sum ---
+    // Each thread computes rescale factors for its tiles, stores in threadgroup mem
+    threadgroup float tile_rescale[1024];  // max tiles supported
+    float local_sum = 0.0f;
+    for (uint t = tid; t < num_tiles; t += tg_size) {
+        uint base = (head * num_tiles + t) * partial_stride;
+        float tile_max = partial_in[base + head_dim];
+        float tile_sum = partial_in[base + head_dim + 1];
+        float rescale = (tile_sum > 0.0f) ? exp(tile_max - gmax) : 0.0f;
+        tile_rescale[t] = rescale;
+        local_sum += rescale * tile_sum;
+    }
+    // Intra-simdgroup sum
+    local_sum = simd_sum(local_sum);
+
+    // Cross-simdgroup sum via threadgroup memory
+    threadgroup float sg_sum[8];
+    if (tiisg == 0) sg_sum[sgitg] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float global_sum_shared;
+    if (sgitg == 0) {
+        float v = (tiisg < num_simd_groups) ? sg_sum[tiisg] : 0.0f;
+        v = simd_sum(v);
+        if (tiisg == 0) global_sum_shared = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_sum = (global_sum_shared > 0.0f) ? (1.0f / global_sum_shared) : 0.0f;
+
+    // --- Phase 3: Combine weighted V across tiles ---
+    // tile_rescale is in threadgroup memory (fast SRAM), no redundant exp() needed
+    device float* out_head = attn_out + head * head_dim;
+
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        float combined = 0.0f;
+        for (uint t = 0; t < num_tiles; t++) {
+            uint base = (head * num_tiles + t) * partial_stride;
+            float tile_v = partial_in[base + d];
+            combined += tile_v * tile_rescale[t];
+        }
+        out_head[d] = combined * inv_sum;
+    }
+}
+
+// ============================================================================
+// add_residual: Element-wise vector addition dst[i] += src[i]
+// ============================================================================

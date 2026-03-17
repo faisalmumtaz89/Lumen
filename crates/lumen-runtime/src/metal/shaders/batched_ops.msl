@@ -1,0 +1,1030 @@
+kernel void rmsnorm_batched(
+    device const float* x        [[buffer(0)]],   // [batch_size, dim]
+    device const float* weight   [[buffer(1)]],   // [dim]
+    device float*       out      [[buffer(2)]],   // [batch_size, dim]
+    constant uint&      dim      [[buffer(3)]],
+    constant float&     eps      [[buffer(4)]],
+    uint batch_idx               [[threadgroup_position_in_grid]],
+    uint tid                     [[thread_index_in_threadgroup]],
+    uint tg_size                 [[threads_per_threadgroup]],
+    uint simd_lane               [[thread_index_in_simdgroup]],
+    uint simd_group              [[simdgroup_index_in_threadgroup]])
+{
+    device const float* x_row   = x + batch_idx * dim;
+    device float*       out_row = out + batch_idx * dim;
+
+    float ss = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float v = x_row[i];
+        ss += v * v;
+    }
+
+    ss = simd_sum(ss);
+
+    threadgroup float partial_sums[32];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float total_ss;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_ss = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float scale = rsqrt(total_ss / float(dim) + eps);
+
+    for (uint i = tid; i < dim; i += tg_size) {
+        out_row[i] = x_row[i] * scale * weight[i];
+    }
+}
+
+// ============================================================================
+// rmsnorm_batched_bytes: Batched RMSNorm with byte-encoded weights
+// ============================================================================
+
+kernel void rmsnorm_batched_bytes(
+    device const float* x          [[buffer(0)]],
+    device const uchar* w_bytes    [[buffer(1)]],
+    device float*       out        [[buffer(2)]],
+    constant uint&      dim        [[buffer(3)]],
+    constant float&     eps        [[buffer(4)]],
+    uint batch_idx                 [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_index_in_threadgroup]],
+    uint tg_size                   [[threads_per_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_group                [[simdgroup_index_in_threadgroup]])
+{
+    device const float* weight = (device const float*)w_bytes;
+    device const float* x_row  = x + batch_idx * dim;
+    device float*       out_row = out + batch_idx * dim;
+
+    float ss = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float v = x_row[i];
+        ss += v * v;
+    }
+
+    ss = simd_sum(ss);
+
+    threadgroup float partial_sums[32];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float total_ss;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_ss = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float scale = rsqrt(total_ss / float(dim) + eps);
+
+    for (uint i = tid; i < dim; i += tg_size) {
+        out_row[i] = x_row[i] * scale * weight[i];
+    }
+}
+
+// ============================================================================
+// rope_batched: Batched Rotary Position Embeddings
+//
+// Applies RoPE to a batch of head vectors. Each thread handles one
+// (even, odd) pair across the batch.
+//
+// vec:       [batch_size * num_heads * head_dim] flattened
+// pos_start: starting position index for this batch
+//
+// Dispatch: total threads = batch_size * num_heads * half_dim
+// ============================================================================
+
+kernel void rope_batched(
+    device float*       vec          [[buffer(0)]],
+    device const float* cos_table    [[buffer(1)]],
+    device const float* sin_table    [[buffer(2)]],
+    constant uint&      num_heads    [[buffer(3)]],
+    constant uint&      head_dim     [[buffer(4)]],
+    constant uint&      half_dim     [[buffer(5)]],
+    constant uint&      pos_start    [[buffer(6)]],
+    constant uint&      total_dim    [[buffer(7)]],   // num_heads * head_dim per token
+    uint gid                         [[thread_position_in_grid]])
+{
+    // gid ranges over batch_size * num_heads * half_dim
+    uint elems_per_token = num_heads * half_dim;
+    uint token_idx = gid / elems_per_token;
+    uint within_token = gid % elems_per_token;
+    uint head = within_token / half_dim;
+    uint i = within_token % half_dim;
+
+    if (head >= num_heads) return;
+
+    uint base = token_idx * total_dim + head * head_dim;
+    uint idx0 = base + 2 * i;
+    uint idx1 = idx0 + 1;
+
+    float v0 = vec[idx0];
+    float v1 = vec[idx1];
+
+    uint pos = pos_start + token_idx;
+    uint cos_idx = pos * half_dim + i;
+    float c = cos_table[cos_idx];
+    float s = sin_table[cos_idx];
+
+    vec[idx0] = v0 * c - v1 * s;
+    vec[idx1] = v0 * s + v1 * c;
+}
+
+// ============================================================================
+// rope_batched_neox: NeoX-style Batched Rotary Position Embeddings
+//
+// Same as rope_batched but pairs (i, i+half_dim) instead of (2*i, 2*i+1).
+// Used by Qwen3.5 (IMROPE) and other NeoX-family models.
+//
+// Dispatch: total threads = batch_size * num_heads * half_dim
+// ============================================================================
+
+kernel void rope_batched_neox(
+    device float*       vec          [[buffer(0)]],
+    device const float* cos_table    [[buffer(1)]],
+    device const float* sin_table    [[buffer(2)]],
+    constant uint&      num_heads    [[buffer(3)]],
+    constant uint&      head_dim     [[buffer(4)]],
+    constant uint&      half_dim     [[buffer(5)]],
+    constant uint&      pos_start    [[buffer(6)]],
+    constant uint&      total_dim    [[buffer(7)]],   // num_heads * head_dim per token
+    uint gid                         [[thread_position_in_grid]])
+{
+    // gid ranges over batch_size * num_heads * half_dim
+    uint elems_per_token = num_heads * half_dim;
+    uint token_idx = gid / elems_per_token;
+    uint within_token = gid % elems_per_token;
+    uint head = within_token / half_dim;
+    uint i = within_token % half_dim;
+
+    if (head >= num_heads) return;
+
+    uint base = token_idx * total_dim + head * head_dim;
+    uint idx0 = base + i;            // first half: [0, half_dim)
+    uint idx1 = base + i + half_dim; // second half: [half_dim, 2*half_dim)
+
+    float v0 = vec[idx0];
+    float v1 = vec[idx1];
+
+    uint pos = pos_start + token_idx;
+    uint cos_idx = pos * half_dim + i;
+    float c = cos_table[cos_idx];
+    float s = sin_table[cos_idx];
+
+    vec[idx0] = v0 * c - v1 * s;
+    vec[idx1] = v0 * s + v1 * c;
+}
+
+// ============================================================================
+// add_residual_batched: Element-wise addition for batched activations
+//
+// dst[i] += src[i] for i in 0..len
+// ============================================================================
+
+kernel void add_residual_batched(
+    device float*       dst  [[buffer(0)]],
+    device const float* src  [[buffer(1)]],
+    constant uint&      len  [[buffer(2)]],
+    uint gid                 [[thread_position_in_grid]])
+{
+    if (gid >= len) return;
+    dst[gid] += src[gid];
+}
+
+// ============================================================================
+// swiglu_batched: Fused SiLU(gate) * up for batched activations
+//
+// gate[i] = silu(gate[i]) * up[i] for i in 0..len
+// ============================================================================
+
+kernel void swiglu_batched(
+    device float*       gate [[buffer(0)]],
+    device const float* up   [[buffer(1)]],
+    constant uint&      len  [[buffer(2)]],
+    uint gid                 [[thread_position_in_grid]])
+{
+    if (gid >= len) return;
+    float g = gate[gid];
+    float sigmoid = 1.0f / (1.0f + exp(-g));
+    gate[gid] = g * sigmoid * up[gid];
+}
+
+// ============================================================================
+// embed_tokens_batched: Batch token embedding lookup
+//
+// token_ids: [batch_size] array of token IDs
+// out:       [batch_size, hidden_dim] output
+// ============================================================================
+
+kernel void embed_tokens_batched(
+    device const float* embedding   [[buffer(0)]],
+    device float*       out         [[buffer(1)]],
+    device const uint*  token_ids   [[buffer(2)]],
+    constant uint&      hidden_dim  [[buffer(3)]],
+    constant uint&      batch_size  [[buffer(4)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    uint total = batch_size * hidden_dim;
+    if (gid >= total) return;
+
+    uint token_idx = gid / hidden_dim;
+    uint dim_idx   = gid % hidden_dim;
+
+    uint tok = token_ids[token_idx];
+    out[gid] = embedding[tok * hidden_dim + dim_idx];
+}
+
+// ============================================================================
+// embed_tokens_batched_f16: F16 batch token embedding lookup (prefill)
+// ============================================================================
+
+kernel void embed_tokens_batched_f16(
+    device const half*  embedding_f16 [[buffer(0)]],
+    device float*       out           [[buffer(1)]],
+    device const uint*  token_ids     [[buffer(2)]],
+    constant uint&      hidden_dim    [[buffer(3)]],
+    constant uint&      batch_size    [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch_size * hidden_dim;
+    if (gid >= total) return;
+
+    uint token_idx = gid / hidden_dim;
+    uint dim_idx   = gid % hidden_dim;
+
+    uint tok = token_ids[token_idx];
+    out[gid] = float(embedding_f16[tok * hidden_dim + dim_idx]);
+}
+
+// ============================================================================
+// embed_tokens_batched_q8_0: Q8_0 batch token embedding lookup (prefill)
+// ============================================================================
+
+kernel void embed_tokens_batched_q8_0(
+    device const char* embedding_q8  [[buffer(0)]],
+    device float*      out           [[buffer(1)]],
+    device const uint* token_ids     [[buffer(2)]],
+    constant uint&     hidden_dim    [[buffer(3)]],
+    constant uint&     batch_size    [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch_size * hidden_dim;
+    if (gid >= total) return;
+
+    uint token_idx = gid / hidden_dim;
+    uint dim_idx = gid % hidden_dim;
+    uint tok = token_ids[token_idx];
+
+    uint global_elem = tok * hidden_dim + dim_idx;
+    uint block_idx = global_elem >> 5;
+    uint elem_in_block = global_elem & 31;
+
+    device const char* block_ptr = embedding_q8 + block_idx * 34;
+    float scale = float(*(device const half*)block_ptr);
+    float val = float(block_ptr[2 + elem_in_block]);
+    out[gid] = val * scale;
+}
+
+// ============================================================================
+// embed_tokens_batched_q4_0: Q4_0 batch token embedding lookup (prefill)
+// ============================================================================
+
+kernel void embed_tokens_batched_q4_0(
+    device const char* embedding_q4  [[buffer(0)]],
+    device float*      out           [[buffer(1)]],
+    device const uint* token_ids     [[buffer(2)]],
+    constant uint&     hidden_dim    [[buffer(3)]],
+    constant uint&     batch_size    [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch_size * hidden_dim;
+    if (gid >= total) return;
+
+    uint token_idx = gid / hidden_dim;
+    uint dim_idx = gid % hidden_dim;
+    uint tok = token_ids[token_idx];
+
+    uint global_elem = tok * hidden_dim + dim_idx;
+    uint block_idx = global_elem >> 5;
+    uint elem_in_block = global_elem & 31;
+
+    device const uchar* block_ptr = (device const uchar*)(embedding_q4 + block_idx * 18);
+    float scale = float(*(device const half*)block_ptr);
+
+    // De-interleaved: elem 0-15 use lo nibble, elem 16-31 use hi nibble
+    uint byte_idx = (elem_in_block < 16) ? elem_in_block : (elem_in_block - 16);
+    uchar packed = block_ptr[2 + byte_idx];
+    int nibble = (elem_in_block < 16) ? (int)(packed & 0xF) - 8 : (int)(packed >> 4) - 8;
+    out[gid] = float(nibble) * scale;
+}
+
+// ============================================================================
+// kv_cache_write_batched: Write K or V vectors for a batch to the KV cache
+//
+// src:  [batch_size, kv_dim] -- projected K or V vectors
+// dst:  [max_seq_len, kv_dim] -- KV cache (contiguous)
+//
+// Writes batch_size vectors to positions [start_pos..start_pos+batch_size]
+// ============================================================================
+
+kernel void kv_cache_write_batched(
+    device const float* src        [[buffer(0)]],
+    device half*        dst        [[buffer(1)]],
+    constant uint&      kv_dim     [[buffer(2)]],
+    constant uint&      start_pos  [[buffer(3)]],
+    constant uint&      batch_size [[buffer(4)]],
+    uint gid                       [[thread_position_in_grid]])
+{
+    uint total = batch_size * kv_dim;
+    if (gid >= total) return;
+
+    uint token_idx = gid / kv_dim;
+    uint dim_idx   = gid % kv_dim;
+
+    uint dst_pos = start_pos + token_idx;
+    dst[dst_pos * kv_dim + dim_idx] = half(src[gid]);
+}
+
+// ============================================================================
+// v_cache_write_batched: Write V vectors for a batch to the transposed V cache
+//
+// src:  [batch_size, kv_dim] -- projected V vectors (row-major)
+// dst:  [kv_dim, max_seq_len] -- V cache (transposed for contiguous time reads)
+//
+// Writes batch_size vectors to positions [start_pos..start_pos+batch_size]
+// ============================================================================
+
+kernel void v_cache_write_batched(
+    device const float* src         [[buffer(0)]],
+    device half*        dst         [[buffer(1)]],
+    constant uint&      kv_dim      [[buffer(2)]],
+    constant uint&      start_pos   [[buffer(3)]],
+    constant uint&      batch_size  [[buffer(4)]],
+    constant uint&      max_seq_len [[buffer(5)]],
+    uint gid                        [[thread_position_in_grid]])
+{
+    uint total = batch_size * kv_dim;
+    if (gid >= total) return;
+
+    uint token_idx = gid / kv_dim;
+    uint dim_idx   = gid % kv_dim;
+
+    uint dst_pos = start_pos + token_idx;
+    // Transposed layout: dst[dim_idx, dst_pos] = dst[dim_idx * max_seq_len + dst_pos]
+    dst[dim_idx * max_seq_len + dst_pos] = half(src[gid]);
+}
+
+// ============================================================================
+// attention_scores_batched: Batched Q.K^T for prefill with causal mask
+//
+// For each token t in the batch, computes attention scores against all
+// previous positions (0..start_pos+t) with causal masking.
+//
+// One threadgroup per (time_step, head, token) triple. Reduces the dot
+// product within the threadgroup using simd_sum.
+// ============================================================================
+
+kernel void attention_scores_batched(
+    device const float* q_batch     [[buffer(0)]],   // [batch_size, num_q_heads * head_dim]
+    device const half*  k_cache     [[buffer(1)]],   // [max_seq_len, kv_dim] (f16)
+    device half*        scores      [[buffer(2)]],   // [batch_size, num_q_heads, max_seq_len] (f16)
+    constant uint&      head_dim    [[buffer(3)]],
+    constant uint&      kv_dim      [[buffer(4)]],
+    constant uint&      num_q_heads [[buffer(5)]],
+    constant uint&      num_kv_heads [[buffer(6)]],
+    constant float&     scale       [[buffer(7)]],
+    constant uint&      start_pos   [[buffer(8)]],
+    constant uint&      max_seq_len [[buffer(9)]],
+    constant uint&      batch_size  [[buffer(10)]],
+    uint3 tg_pos                    [[threadgroup_position_in_grid]],
+    uint3 tid_vec                   [[thread_position_in_threadgroup]],
+    uint3 tg_size_vec               [[threads_per_threadgroup]],
+    uint simd_lane                  [[thread_index_in_simdgroup]],
+    uint simd_group                 [[simdgroup_index_in_threadgroup]])
+{
+    uint tid = tid_vec.x;
+    uint tg_size = tg_size_vec.x;
+    uint t_step = tg_pos.x;  // which time step to compute score for
+    uint head   = tg_pos.y;  // which Q head
+    uint token  = tg_pos.z;  // which token in the batch
+
+    // Causal: token at position (start_pos + token) can attend to 0..start_pos+token
+    uint attend_len = start_pos + token + 1;
+    if (t_step >= attend_len) return;
+    if (head >= num_q_heads) return;
+    if (token >= batch_size) return;
+
+    uint gqa_ratio = num_q_heads / num_kv_heads;
+    uint kv_h = head / gqa_ratio;
+
+    uint q_dim_total = num_q_heads * head_dim;
+    device const float* q_vec = q_batch + token * q_dim_total + head * head_dim;
+    device const half* k_vec = k_cache + t_step * kv_dim + kv_h * head_dim;
+
+    float dot = 0.0f;
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        dot += q_vec[d] * float(k_vec[d]);
+    }
+
+    dot = simd_sum(dot);
+
+    threadgroup float partial_sums[32];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = dot;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            uint score_idx = token * num_q_heads * max_seq_len + head * max_seq_len + t_step;
+            scores[score_idx] = (half)(val * scale);
+        }
+    }
+}
+
+// ============================================================================
+// softmax_batched: Softmax with causal mask for each (token, head) pair
+//
+// Dispatch: one threadgroup per (head, token) pair.
+// ============================================================================
+
+kernel void softmax_batched(
+    device half*   scores      [[buffer(0)]],   // f16 scores buffer
+    constant uint& max_seq_len [[buffer(1)]],
+    constant uint& num_heads   [[buffer(2)]],
+    constant uint& start_pos   [[buffer(3)]],
+    constant uint& batch_size  [[buffer(4)]],
+    uint2 tg_pos               [[threadgroup_position_in_grid]],
+    uint2 tid_vec              [[thread_position_in_threadgroup]],
+    uint2 tg_size_vec          [[threads_per_threadgroup]],
+    uint simd_lane             [[thread_index_in_simdgroup]],
+    uint simd_group            [[simdgroup_index_in_threadgroup]])
+{
+    uint tid = tid_vec.x;
+    uint tg_size = tg_size_vec.x;
+    uint head  = tg_pos.x;
+    uint token = tg_pos.y;
+
+    if (head >= num_heads) return;
+    if (token >= batch_size) return;
+
+    uint attend_len = start_pos + token + 1;
+    uint row_offset = token * num_heads * max_seq_len + head * max_seq_len;
+    device half* row = scores + row_offset;
+
+    // Phase 1: find max (accumulate in f32 for numerical stability)
+    float local_max = -INFINITY;
+    for (uint i = tid; i < attend_len; i += tg_size) {
+        local_max = max(local_max, (float)row[i]);
+    }
+    local_max = simd_max(local_max);
+
+    threadgroup float partial_max[32];
+    if (simd_lane == 0) {
+        partial_max[simd_group] = local_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float global_max;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_max[simd_lane] : -INFINITY;
+        val = simd_max(val);
+        if (simd_lane == 0) global_max = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: exp(x - max) and sum (f32 accumulation, write back as f16)
+    float local_sum = 0.0f;
+    for (uint i = tid; i < attend_len; i += tg_size) {
+        float e = exp((float)row[i] - global_max);
+        row[i] = (half)e;
+        local_sum += e;
+    }
+    local_sum = simd_sum(local_sum);
+
+    threadgroup float partial_sums[32];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = local_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float global_sum;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) global_sum = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 3: normalize (read f16, compute in f32, write back f16)
+    float inv_sum = 1.0f / global_sum;
+    for (uint i = tid; i < attend_len; i += tg_size) {
+        row[i] = (half)((float)row[i] * inv_sum);
+    }
+}
+
+// ============================================================================
+// attention_output_batched: Weighted sum of V vectors for batched prefill
+//
+// For each (token, head, d) element, computes:
+//   out[token, head, d] = sum_t scores[token, head, t] * v_cache[t, kv_h, d]
+//
+// Dispatch: one thread per output element.
+// ============================================================================
+
+kernel void attention_output_batched(
+    device const half*  scores       [[buffer(0)]],   // f16 scores
+    device const half*  v_cache      [[buffer(1)]],   // f16 V cache
+    device float*       out          [[buffer(2)]],
+    constant uint&      head_dim     [[buffer(3)]],
+    constant uint&      kv_dim       [[buffer(4)]],
+    constant uint&      num_q_heads  [[buffer(5)]],
+    constant uint&      num_kv_heads [[buffer(6)]],
+    constant uint&      start_pos    [[buffer(7)]],
+    constant uint&      max_seq_len  [[buffer(8)]],
+    constant uint&      batch_size   [[buffer(9)]],
+    constant uint&      v_max_seq_len [[buffer(10)]],
+    uint gid                         [[thread_position_in_grid]])
+{
+    uint q_dim = num_q_heads * head_dim;
+    uint total = batch_size * q_dim;
+    if (gid >= total) return;
+
+    uint token = gid / q_dim;
+    uint within = gid % q_dim;
+    uint head   = within / head_dim;
+    uint d      = within % head_dim;
+
+    uint gqa_ratio = num_q_heads / num_kv_heads;
+    uint kv_h = head / gqa_ratio;
+    uint attend_len = start_pos + token + 1;
+
+    uint scores_base = token * num_q_heads * max_seq_len + head * max_seq_len;
+
+    // V cache transposed: [kv_dim, v_max_seq_len], contiguous along time (f16)
+    device const half* v_row = v_cache + (kv_h * head_dim + d) * v_max_seq_len;
+    float sum = 0.0f;
+    for (uint t = 0; t < attend_len; t++) {
+        sum += (float)scores[scores_base + t] * float(v_row[t]);
+    }
+    out[gid] = sum;
+}
+
+// ============================================================================
+// attention_scores_tiled: Tiled GEMM for Q * K^T attention scores (prefill)
+//
+// Per Q-head: Scores[M,N] = Q[M,K] * K_cache[N,K]^T * scale + causal_mask
+// Where M=batch_size, N=max_attend_len, K=head_dim
+//
+// Q layout:     q_batch[token * q_stride + d]  (q_stride = num_q_heads * head_dim)
+// K layout:     k_cache[t_step * kv_dim + kv_h * head_dim + d]
+// Score layout: scores[token * num_q_heads * max_seq_len + head * max_seq_len + t_step]
+//
+// Dispatch: (ceil(N/TILE_N), ceil(M/TILE_M), num_q_heads), TG=(128,1,1)
+// tg_pos.z = q_head index; GQA maps to kv_head via head / gqa_ratio
+// ============================================================================
+
+kernel void attention_scores_tiled(
+    device const float* q_batch     [[buffer(0)]],   // [batch_size, num_q_heads * head_dim]
+    device const half*  k_cache     [[buffer(1)]],   // [max_seq_len, kv_dim] (f16)
+    device half*        scores      [[buffer(2)]],   // [batch_size, num_q_heads, max_seq_len] (f16)
+    constant uint&      head_dim    [[buffer(3)]],
+    constant uint&      kv_dim      [[buffer(4)]],
+    constant uint&      num_q_heads [[buffer(5)]],
+    constant uint&      num_kv_heads [[buffer(6)]],
+    constant float&     scale       [[buffer(7)]],
+    constant uint&      start_pos   [[buffer(8)]],
+    constant uint&      max_seq_len [[buffer(9)]],
+    constant uint&      batch_size  [[buffer(10)]],
+    uint3 tg_pos                    [[threadgroup_position_in_grid]],
+    ushort tiitg                    [[thread_index_in_threadgroup]],
+    ushort sgitg                    [[simdgroup_index_in_threadgroup]])
+{
+    // Tile constants: TILE_M=32, TILE_N=32, TILE_K=32, 4 SG (128 threads)
+    // shmem: sa[TILE_M * TILE_K] + sb[TILE_N * TILE_K] = 2048 halfs
+    threadgroup half shmem_attn[2048];
+    threadgroup half* sa = shmem_attn;
+    threadgroup half* sb = shmem_attn + TILE_M * TILE_K;
+
+    uint tile_m_start = tg_pos.y * TILE_M;   // token dim
+    uint tile_n_start = tg_pos.x * TILE_N;   // time_step dim
+    uint q_head = tg_pos.z;                   // Q head index
+
+    if (q_head >= num_q_heads) return;
+
+    // Early exit: if the entire tile is above the causal diagonal, write zeros
+    // The minimum attend_len in this tile = start_pos + tile_m_start + 1
+    // If tile_n_start >= min_attend_len, the whole tile is masked
+    uint min_attend_in_tile = start_pos + tile_m_start + 1;
+    if (tile_n_start >= min_attend_in_tile) {
+        // Write zeros for the entire tile
+        uint score_stride = num_q_heads * max_seq_len;
+        for (ushort idx = tiitg; idx < TILE_M * TILE_N; idx += 128) {
+            ushort local_m = idx / TILE_N;
+            ushort local_n = idx % TILE_N;
+            uint gm = tile_m_start + local_m;
+            uint gn = tile_n_start + local_n;
+            if (gm < batch_size && gn < max_seq_len) {
+                scores[gm * score_stride + q_head * max_seq_len + gn] = (half)0.0h;
+            }
+        }
+        return;
+    }
+
+    uint gqa_ratio = num_q_heads / num_kv_heads;
+    uint kv_h = q_head / gqa_ratio;
+
+    // Q row stride: num_q_heads * head_dim (interleaved heads)
+    uint q_stride = num_q_heads * head_dim;
+    // Per-head Q base offset
+    uint q_head_off = q_head * head_dim;
+    // Per-kv-head K base offset
+    uint k_head_off = kv_h * head_dim;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_k_tiles = (head_dim + TILE_K - 1) / TILE_K;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K;
+
+        // Load A tile (Q) with pre-scaling: sa[row, k] = Q[token, head, k] * scale
+        // Pre-scaling Q eliminates the per-element multiply in the store phase.
+        // 128 threads, 32 rows x 32 cols, 4 threads per row, 8 elements each
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 3;
+
+            uint gm = tile_m_start + row;    // token index
+            uint gk = k_base + k_start;      // head_dim offset
+            threadgroup half* sa_ptr = sa + row * TILE_K + k_start;
+
+            if (gm < batch_size && gk + 7 < head_dim) {
+                device const float* q_ptr = q_batch + gm * q_stride + q_head_off + gk;
+                float4 v0 = *(device const float4*)(q_ptr) * scale;
+                float4 v1 = *(device const float4*)(q_ptr + 4) * scale;
+                sa_ptr[0] = (half)v0.x; sa_ptr[1] = (half)v0.y;
+                sa_ptr[2] = (half)v0.z; sa_ptr[3] = (half)v0.w;
+                sa_ptr[4] = (half)v1.x; sa_ptr[5] = (half)v1.y;
+                sa_ptr[6] = (half)v1.z; sa_ptr[7] = (half)v1.w;
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    uint gk_i = gk + i;
+                    sa_ptr[i] = (gm < batch_size && gk_i < head_dim)
+                        ? (half)(q_batch[gm * q_stride + q_head_off + gk_i] * scale)
+                        : (half)0.0h;
+                }
+            }
+        }
+
+        // Load B tile (K): sb[n_local, k_local] = K[t_step, kv_head, k]
+        // B is stored as K[t_step, kv_dim] in f16, we need K^T for GEMM
+        // sb layout: [TILE_N rows x TILE_K cols], row-major
+        {
+            ushort row = tiitg >> 2;           // 0..31 = n_local (time_step within tile)
+            ushort col_group = tiitg & 3;      // 0..3
+            ushort k_start = col_group << 3;   // 0,8,16,24
+
+            uint gn = tile_n_start + row;      // global time_step
+            uint gk = k_base + k_start;
+            uint max_attend = start_pos + batch_size;  // maximum possible attend length
+
+            threadgroup half* sb_ptr = sb + row * TILE_K + k_start;
+
+            if (gn < max_attend && gk + 7 < head_dim) {
+                // K cache is already f16 -- load directly as half4
+                device const half* k_ptr = k_cache + gn * kv_dim + k_head_off + gk;
+                half4 v0 = *(device const half4*)(k_ptr);
+                half4 v1 = *(device const half4*)(k_ptr + 4);
+                sb_ptr[0] = v0.x; sb_ptr[1] = v0.y;
+                sb_ptr[2] = v0.z; sb_ptr[3] = v0.w;
+                sb_ptr[4] = v1.x; sb_ptr[5] = v1.y;
+                sb_ptr[6] = v1.z; sb_ptr[7] = v1.w;
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    uint gk_i = gk + i;
+                    sb_ptr[i] = (gn < max_attend && gk_i < head_dim)
+                        ? k_cache[gn * kv_dim + k_head_off + gk_i]
+                        : (half)0.0h;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // MMA: each simdgroup computes its 16x16 sub-tile
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K + ks, TILE_K);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K + ks, TILE_K);
+
+            simdgroup_half8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            // B loaded as [N, K] row-major, need transpose for A * B^T
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store results with causal mask (scale already applied via pre-scaled Q)
+    // Each simdgroup writes its 16x16 sub-tile
+    uint sg_m_base = tile_m_start + sg_r * 16;  // token base
+    uint sg_n_base = tile_n_start + sg_c * 16;  // time_step base
+
+    // Determine if this simdgroup sub-tile needs causal masking:
+    // max attend for any row in sub-tile = start_pos + min(sg_m_base + 15, batch_size - 1) + 1
+    // If sg_n_base + 15 < min_attend, all positions are valid (no masking needed)
+    uint sg_min_attend = start_pos + sg_m_base + 1;  // attend_len for first row in sub-tile
+    bool fully_valid = (sg_n_base + 16 <= sg_min_attend)
+                    && (sg_m_base + 16 <= batch_size)
+                    && (sg_n_base + 16 <= max_seq_len);
+
+    if (fully_valid) {
+        // Fast path: entire sub-tile is valid and in-bounds.
+        // Store to threadgroup staging, then write directly to device (no mask check).
+        threadgroup float* sc = (threadgroup float*)shmem_attn;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint score_stride = num_q_heads * max_seq_len;
+        ushort lane = tiitg % 32;
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            scores[gm * score_stride + q_head * max_seq_len + gn] = (half)my_sc[local_m * 16 + local_n];
+        }
+    } else {
+        // Boundary path: need per-element causal mask check
+        threadgroup float* sc = (threadgroup float*)shmem_attn;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint score_stride = num_q_heads * max_seq_len;
+        ushort lane = tiitg % 32;
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+
+            if (gm < batch_size && gn < max_seq_len) {
+                uint attend_len = start_pos + gm + 1;
+                float val = (gn < attend_len) ? my_sc[local_m * 16 + local_n] : 0.0f;
+                scores[gm * score_stride + q_head * max_seq_len + gn] = (half)val;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// attention_output_tiled: Tiled GEMM for Scores * V weighted sum (prefill)
+//
+// Per Q-head: Out[M,N] = Scores[M,K_eff] * V[K_eff,N]
+// Where M=batch_size, N=head_dim, K_eff=max_attend_len (after softmax)
+//
+// Scores layout: scores[token * num_q_heads * max_seq_len + head * max_seq_len + t]
+// V layout:      v_cache[t * kv_dim + kv_h * head_dim + d]
+// Out layout:    out[token * q_dim + head * head_dim + d]
+//
+// Dispatch: (ceil(head_dim/TILE_N), ceil(batch_size/TILE_M), num_q_heads), TG=(128,1,1)
+// ============================================================================
+
+kernel void attention_output_tiled(
+    device const half*  scores       [[buffer(0)]],   // [batch_size, num_q_heads, max_seq_len] (f16)
+    device const half*  v_cache      [[buffer(1)]],   // [kv_dim, v_max_seq_len] (transposed, f16)
+    device float*       out          [[buffer(2)]],   // [batch_size, num_q_heads * head_dim]
+    constant uint&      head_dim     [[buffer(3)]],
+    constant uint&      kv_dim       [[buffer(4)]],
+    constant uint&      num_q_heads  [[buffer(5)]],
+    constant uint&      num_kv_heads [[buffer(6)]],
+    constant uint&      start_pos    [[buffer(7)]],
+    constant uint&      max_seq_len  [[buffer(8)]],
+    constant uint&      batch_size   [[buffer(9)]],
+    constant uint&      v_max_seq_len [[buffer(10)]],
+    uint3 tg_pos                     [[threadgroup_position_in_grid]],
+    ushort tiitg                     [[thread_index_in_threadgroup]],
+    ushort sgitg                     [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half shmem_attn_out[2048];
+    threadgroup half* sa = shmem_attn_out;
+    threadgroup half* sb = shmem_attn_out + TILE_M * TILE_K;
+
+    uint tile_m_start = tg_pos.y * TILE_M;   // token dim
+    uint tile_n_start = tg_pos.x * TILE_N;   // head_dim output dim
+    uint q_head = tg_pos.z;
+
+    if (q_head >= num_q_heads) return;
+
+    uint gqa_ratio = num_q_heads / num_kv_heads;
+    uint kv_h = q_head / gqa_ratio;
+
+    uint q_dim = num_q_heads * head_dim;
+
+    // Scores row stride: max_seq_len (per head)
+    // V stride between time steps: kv_dim
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    // K dimension = attend_len (up to start_pos + batch_size)
+    uint max_attend = start_pos + batch_size;
+    uint num_k_tiles = (max_attend + TILE_K - 1) / TILE_K;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K;
+
+        // Load A tile (Scores): sa[row, k] = scores[token, head, t_step]
+        // Scores layout: scores[token * num_q_heads * max_seq_len + q_head * max_seq_len + t]
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 3;
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sa_ptr = sa + row * TILE_K + k_start;
+
+            // Each token has its own attend_len = start_pos + token + 1
+            // But softmax already zeroed beyond attend_len, so we can load freely
+            // (just bounds-check against max_seq_len)
+            if (gm < batch_size && gk + 7 < max_attend) {
+                uint s_base = gm * num_q_heads * max_seq_len + q_head * max_seq_len + gk;
+                device const half4* s_ptr = (device const half4*)(scores + s_base);
+                half4 v0 = s_ptr[0];
+                half4 v1 = s_ptr[1];
+                sa_ptr[0] = v0.x; sa_ptr[1] = v0.y;
+                sa_ptr[2] = v0.z; sa_ptr[3] = v0.w;
+                sa_ptr[4] = v1.x; sa_ptr[5] = v1.y;
+                sa_ptr[6] = v1.z; sa_ptr[7] = v1.w;
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    uint gk_i = gk + i;
+                    sa_ptr[i] = (gm < batch_size && gk_i < max_attend)
+                        ? scores[gm * num_q_heads * max_seq_len + q_head * max_seq_len + gk_i]
+                        : (half)0.0h;
+                }
+            }
+        }
+
+        // Load B tile (V): sb[n_local, k_local] = V[d, t_step] (transposed layout, f16)
+        // V cache is [kv_dim, v_max_seq_len]: contiguous along time dimension (f16)
+        // B[n, k] = V[(kv_h*head_dim + tile_n_start + n_local), k_base + k_local]
+        // sb[n_local, k_local] = v_cache[(kv_h*head_dim + gn) * v_max_seq_len + gk]
+        {
+            ushort row = tiitg >> 2;           // n_local (head_dim within tile)
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 3;
+
+            uint gn = tile_n_start + row;      // head_dim index
+            uint gk = k_base + k_start;        // time_step index
+            threadgroup half* sb_ptr = sb + row * TILE_K + k_start;
+
+            if (gn < head_dim && gk + 7 < max_attend) {
+                // Load 8 consecutive V values: contiguous in transposed layout, already f16!
+                device const half* v_row = v_cache + (kv_h * head_dim + gn) * v_max_seq_len + gk;
+                half4 v0 = *(device const half4*)(v_row);
+                half4 v1 = *(device const half4*)(v_row + 4);
+                sb_ptr[0] = v0.x; sb_ptr[1] = v0.y;
+                sb_ptr[2] = v0.z; sb_ptr[3] = v0.w;
+                sb_ptr[4] = v1.x; sb_ptr[5] = v1.y;
+                sb_ptr[6] = v1.z; sb_ptr[7] = v1.w;
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    uint gk_i = gk + i;
+                    sb_ptr[i] = (gn < head_dim && gk_i < max_attend)
+                        ? v_cache[(kv_h * head_dim + gn) * v_max_seq_len + gk_i]
+                        : (half)0.0h;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // MMA
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K + ks, TILE_K);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K + ks, TILE_K);
+
+            simdgroup_half8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            // B = V transposed: [head_dim, attend_len], load with transpose
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store results
+    uint sg_m_base = tile_m_start + sg_r * 16;  // token base
+    uint sg_n_base = tile_n_start + sg_c * 16;  // head_dim base
+
+    // Fast path: all within bounds
+    if (sg_m_base + 16 <= batch_size && sg_n_base + 16 <= head_dim) {
+        // Store to staging, then write with stride
+        threadgroup float* sc = (threadgroup float*)shmem_attn_out;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        ushort lane = tiitg % 32;
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            out[gm * q_dim + q_head * head_dim + gn] = my_sc[local_m * 16 + local_n];
+        }
+    } else {
+        // Boundary path
+        threadgroup float* sc = (threadgroup float*)shmem_attn_out;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        ushort lane = tiitg % 32;
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            if (gm < batch_size && gn < head_dim)
+                out[gm * q_dim + q_head * head_dim + gn] = my_sc[local_m * 16 + local_n];
+        }
+    }
+}
+
+// ============================================================================
+// copy_buffer: Simple buffer copy (src → dst)
+//
+// Used to copy attn_proj_buf → x_buf between layers within a command buffer,
+// avoiding CPU round-trip.
+// ============================================================================
+// dequant_tiled_matmul_q8_0_residual_batched: Tiled Q8_0 GEMM + residual add
+//
+// Y[m,n] = X[M,K] * dequant(W_q8[N,K_bytes])^T + R[m,n]
+//
+// Identical to dequant_tiled_matmul_q8_0 except the writeback adds residual[m,n].
+// Eliminates a separate add_residual dispatch + encoder barrier per layer.
+// ============================================================================
+

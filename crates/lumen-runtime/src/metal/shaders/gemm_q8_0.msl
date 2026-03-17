@@ -1,0 +1,955 @@
+kernel void dequant_tiled_matmul_q8_0(
+    device const uchar* W_q8     [[buffer(0)]],   // Q8_0 weights [N, K_bytes]
+    device const float* X        [[buffer(1)]],   // [M, K] input batch
+    device float*       Y        [[buffer(2)]],   // [M, N] output batch
+    constant uint&      M        [[buffer(3)]],   // batch size
+    constant uint&      N        [[buffer(4)]],   // output dim
+    constant uint&      K        [[buffer(5)]],   // input dim (elements, not bytes)
+    uint2 tg_pos                 [[threadgroup_position_in_grid]],
+    ushort tiitg                 [[thread_index_in_threadgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half shmem[2048];
+    threadgroup half* sa = shmem;
+    threadgroup half* sb = shmem + TILE_M * TILE_K;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_blocks_per_row = (K + Q8B_GROUP_SIZE - 1) / Q8B_GROUP_SIZE;
+    uint row_bytes = num_blocks_per_row * Q8B_BLOCK_SIZE;
+
+    uint num_k_tiles = (K + TILE_K - 1) / TILE_K;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K;
+
+        // Load A tile: vectorized 2D mapping, 4 threads per row, 8 elements each via float4
+        // FC_BC_M/FC_BC_K: when false (aligned), compiler eliminates boundary checks
+        {
+            ushort row = tiitg >> 2;           // tiitg / 4, range 0..31
+            ushort col_group = tiitg & 3;      // tiitg % 4, range 0..3
+            ushort k_start = col_group << 3;   // col_group * 8
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sa_ptr = sa + row * TILE_K + k_start;
+
+            if (FC_BC_M || FC_BC_K) {
+                // Boundary-checked path (compiled in only when dimensions may be unaligned)
+                if (gm < M && gk + 7 < K) {
+                    device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                    float4 v0 = x_ptr[0];
+                    float4 v1 = x_ptr[1];
+                    sa_ptr[0] = (half)v0.x; sa_ptr[1] = (half)v0.y;
+                    sa_ptr[2] = (half)v0.z; sa_ptr[3] = (half)v0.w;
+                    sa_ptr[4] = (half)v1.x; sa_ptr[5] = (half)v1.y;
+                    sa_ptr[6] = (half)v1.z; sa_ptr[7] = (half)v1.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                        uint gk_i = gk + i;
+                        sa_ptr[i] = (gm < M && gk_i < K) ? (half)X[gm * K + gk_i] : (half)0.0h;
+                    }
+                }
+            } else {
+                // Fast path: no bounds checks needed (M aligned to TILE_M, K aligned to TILE_K)
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                sa_ptr[0] = (half)v0.x; sa_ptr[1] = (half)v0.y;
+                sa_ptr[2] = (half)v0.z; sa_ptr[3] = (half)v0.w;
+                sa_ptr[4] = (half)v1.x; sa_ptr[5] = (half)v1.y;
+                sa_ptr[6] = (half)v1.z; sa_ptr[7] = (half)v1.w;
+            }
+        }
+
+        // Load B tile: vectorized Q8_0 dequant (TILE_K=32 = Q8_0 block size)
+        // 32 rows x 1 block/row = 32 blocks. 128 threads => 4 threads/row.
+        // Each thread loads 8 consecutive int8 values (2 x uint) + 1 scale read.
+        // FC_BC_N/FC_BC_K: when false (aligned), compiler eliminates boundary checks
+        {
+            uint block_idx = k_base / Q8B_GROUP_SIZE;
+            ushort n_local = tiitg / 4;     // 0..31 (which row)
+            ushort t_in_row = tiitg % 4;    // 0..3 (which quarter of the 32 elements)
+            ushort k_offset = t_in_row * 8; // starting k position within block
+            uint gn = tile_n_start + n_local;
+
+            threadgroup half* sb_row = sb + n_local * TILE_K + k_offset;
+
+            if (FC_BC_N || FC_BC_K) {
+                // Boundary-checked path
+                if (gn < N && k_base + k_offset < K) {
+                    uint block_offset = gn * row_bytes + block_idx * Q8B_BLOCK_SIZE;
+                    half scale = as_type<half>(*(device const ushort*)(W_q8 + block_offset));
+                    device const char* qdata = (device const char*)(W_q8 + block_offset + 2 + k_offset);
+
+                    uint k_remaining = K - (k_base + k_offset);
+                    ushort count = (k_remaining >= 8) ? 8 : (ushort)k_remaining;
+
+                    if (count == 8) {
+                        sb_row[0] = scale * (half)qdata[0];
+                        sb_row[1] = scale * (half)qdata[1];
+                        sb_row[2] = scale * (half)qdata[2];
+                        sb_row[3] = scale * (half)qdata[3];
+                        sb_row[4] = scale * (half)qdata[4];
+                        sb_row[5] = scale * (half)qdata[5];
+                        sb_row[6] = scale * (half)qdata[6];
+                        sb_row[7] = scale * (half)qdata[7];
+                    } else {
+                        for (ushort i = 0; i < count; i++) {
+                            sb_row[i] = scale * (half)qdata[i];
+                        }
+                        for (ushort i = count; i < 8; i++) {
+                            sb_row[i] = (half)0.0h;
+                        }
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                        sb_row[i] = (half)0.0h;
+                    }
+                }
+            } else {
+                // Fast path: no bounds checks (N aligned to TILE_N, K aligned to TILE_K)
+                uint block_offset = gn * row_bytes + block_idx * Q8B_BLOCK_SIZE;
+                half scale = as_type<half>(*(device const ushort*)(W_q8 + block_offset));
+                device const char* qdata = (device const char*)(W_q8 + block_offset + 2 + k_offset);
+
+                sb_row[0] = scale * (half)qdata[0];
+                sb_row[1] = scale * (half)qdata[1];
+                sb_row[2] = scale * (half)qdata[2];
+                sb_row[3] = scale * (half)qdata[3];
+                sb_row[4] = scale * (half)qdata[4];
+                sb_row[5] = scale * (half)qdata[5];
+                sb_row[6] = scale * (half)qdata[6];
+                sb_row[7] = scale * (half)qdata[7];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K + ks, TILE_K);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K + ks, TILE_K);
+
+            simdgroup_half8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    if (FC_BC_M || FC_BC_N) {
+        // Boundary-checked store path
+        if (sg_m_base + 16 <= M && sg_n_base + 16 <= N) {
+            FOR_UNROLL (ushort i = 0; i < 2; i++)
+                FOR_UNROLL (ushort j = 0; j < 2; j++)
+                    simdgroup_store(mc[i][j], Y + (sg_m_base + i * 8) * N + (sg_n_base + j * 8), N);
+        } else {
+            threadgroup float* sc = (threadgroup float*)shmem;
+            threadgroup float* my_sc = sc + sgitg * 256;
+            FOR_UNROLL (ushort i = 0; i < 2; i++)
+                FOR_UNROLL (ushort j = 0; j < 2; j++)
+                    simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            ushort lane = tiitg % 32;
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                if (gm < M && gn < N) {
+                    Y[gm * N + gn] = my_sc[local_m * 16 + local_n];
+                }
+            }
+        }
+    } else {
+        // Fast path: direct store (M and N aligned to tile dimensions)
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], Y + (sg_m_base + i * 8) * N + (sg_n_base + j * 8), N);
+    }
+}
+
+constant constexpr uint TILE_K_64 = 64;
+
+// ============================================================================
+// dequant_tiled_matmul_q8_0_k64: TILE_K=64 variant for fewer barriers
+//
+// Same algorithm as dequant_tiled_matmul_q8_0 but processes 2 Q8_0 blocks per
+// K-step instead of 1. This halves the number of threadgroup barriers (from
+// K/32 to K/64) and K-loop iterations, improving efficiency for large-K GEMMs.
+//
+// Shared memory: sa[32*64] + sb[32*64] = 4096 halfs = 8192 bytes
+// (still well within 32KB threadgroup limit; occupancy >= 2 TG/CU)
+//
+// A-tile loading: 128 threads, 32 rows x 4 threads/row, each loads 16 elems
+// (two float4 reads). 4 threads * 16 = 64 = TILE_K_64.
+//
+// B-tile loading: 2-pass approach. Each pass loads one Q8_0 block (32 elems)
+// across 32 rows using 128 threads mapped as 32 rows x 4 threads/row.
+// ============================================================================
+
+kernel void dequant_tiled_matmul_q8_0_k64(
+    device const uchar* W_q8     [[buffer(0)]],   // Q8_0 weights [N, K_bytes]
+    device const float* X        [[buffer(1)]],   // [M, K] input batch
+    device float*       Y        [[buffer(2)]],   // [M, N] output batch
+    constant uint&      M        [[buffer(3)]],   // batch size
+    constant uint&      N        [[buffer(4)]],   // output dim
+    constant uint&      K        [[buffer(5)]],   // input dim (elements, not bytes)
+    uint2 tg_pos                 [[threadgroup_position_in_grid]],
+    ushort tiitg                 [[thread_index_in_threadgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half shmem_k64[4096];  // sa[32*64] + sb[32*64]
+    threadgroup half* sa = shmem_k64;
+    threadgroup half* sb = shmem_k64 + TILE_M * TILE_K_64;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_blocks_per_row = (K + Q8B_GROUP_SIZE - 1) / Q8B_GROUP_SIZE;
+    uint row_bytes = num_blocks_per_row * Q8B_BLOCK_SIZE;
+
+    uint num_k_tiles = (K + TILE_K_64 - 1) / TILE_K_64;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K_64;
+
+        // Load A tile: 32 rows x 64 cols
+        // FC_BC_M/FC_BC_K: when false (aligned), compiler eliminates boundary checks
+        {
+            ushort row = tiitg >> 2;           // tiitg / 4, range 0..31
+            ushort col_group = tiitg & 3;      // tiitg % 4, range 0..3
+            ushort k_start = col_group << 4;   // col_group * 16
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sa_ptr = sa + row * TILE_K_64 + k_start;
+
+            if (FC_BC_M || FC_BC_K) {
+                if (gm < M && gk + 15 < K) {
+                    device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                    float4 v0 = x_ptr[0];
+                    float4 v1 = x_ptr[1];
+                    float4 v2 = x_ptr[2];
+                    float4 v3 = x_ptr[3];
+                    sa_ptr[0]  = (half)v0.x; sa_ptr[1]  = (half)v0.y;
+                    sa_ptr[2]  = (half)v0.z; sa_ptr[3]  = (half)v0.w;
+                    sa_ptr[4]  = (half)v1.x; sa_ptr[5]  = (half)v1.y;
+                    sa_ptr[6]  = (half)v1.z; sa_ptr[7]  = (half)v1.w;
+                    sa_ptr[8]  = (half)v2.x; sa_ptr[9]  = (half)v2.y;
+                    sa_ptr[10] = (half)v2.z; sa_ptr[11] = (half)v2.w;
+                    sa_ptr[12] = (half)v3.x; sa_ptr[13] = (half)v3.y;
+                    sa_ptr[14] = (half)v3.z; sa_ptr[15] = (half)v3.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sa_ptr[i] = (gm < M && gk_i < K) ? (half)X[gm * K + gk_i] : (half)0.0h;
+                    }
+                }
+            } else {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                float4 v2 = x_ptr[2];
+                float4 v3 = x_ptr[3];
+                sa_ptr[0]  = (half)v0.x; sa_ptr[1]  = (half)v0.y;
+                sa_ptr[2]  = (half)v0.z; sa_ptr[3]  = (half)v0.w;
+                sa_ptr[4]  = (half)v1.x; sa_ptr[5]  = (half)v1.y;
+                sa_ptr[6]  = (half)v1.z; sa_ptr[7]  = (half)v1.w;
+                sa_ptr[8]  = (half)v2.x; sa_ptr[9]  = (half)v2.y;
+                sa_ptr[10] = (half)v2.z; sa_ptr[11] = (half)v2.w;
+                sa_ptr[12] = (half)v3.x; sa_ptr[13] = (half)v3.y;
+                sa_ptr[14] = (half)v3.z; sa_ptr[15] = (half)v3.w;
+            }
+        }
+
+        // Load B tile: 32 rows x 64 cols = 2 Q8_0 blocks per row
+        // FC_BC_N/FC_BC_K: when false (aligned), compiler eliminates boundary checks
+        {
+            ushort n_local = tiitg >> 2;       // 0..31 (which row)
+            ushort t_in_row = tiitg & 3;       // 0..3 (quarter of 32 elements)
+            uint gn = tile_n_start + n_local;
+
+            // Pass 0: first Q8_0 block (k_base + 0..31)
+            {
+                uint block_idx = k_base / Q8B_GROUP_SIZE;
+                ushort k_offset = t_in_row * 8;
+                threadgroup half* sb_row = sb + n_local * TILE_K_64 + k_offset;
+
+                if (FC_BC_N || FC_BC_K) {
+                    if (gn < N && k_base + k_offset < K) {
+                        uint block_offset = gn * row_bytes + block_idx * Q8B_BLOCK_SIZE;
+                        half scale = as_type<half>(*(device const ushort*)(W_q8 + block_offset));
+                        device const char* qdata = (device const char*)(W_q8 + block_offset + 2 + k_offset);
+
+                        uint k_remaining = K - (k_base + k_offset);
+                        ushort count = (k_remaining >= 8) ? 8 : (ushort)k_remaining;
+
+                        if (count == 8) {
+                            sb_row[0] = scale * (half)qdata[0];
+                            sb_row[1] = scale * (half)qdata[1];
+                            sb_row[2] = scale * (half)qdata[2];
+                            sb_row[3] = scale * (half)qdata[3];
+                            sb_row[4] = scale * (half)qdata[4];
+                            sb_row[5] = scale * (half)qdata[5];
+                            sb_row[6] = scale * (half)qdata[6];
+                            sb_row[7] = scale * (half)qdata[7];
+                        } else {
+                            for (ushort i = 0; i < count; i++) {
+                                sb_row[i] = scale * (half)qdata[i];
+                            }
+                            for (ushort i = count; i < 8; i++) {
+                                sb_row[i] = (half)0.0h;
+                            }
+                        }
+                    } else {
+                        FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                            sb_row[i] = (half)0.0h;
+                        }
+                    }
+                } else {
+                    uint block_offset = gn * row_bytes + block_idx * Q8B_BLOCK_SIZE;
+                    half scale = as_type<half>(*(device const ushort*)(W_q8 + block_offset));
+                    device const char* qdata = (device const char*)(W_q8 + block_offset + 2 + k_offset);
+                    sb_row[0] = scale * (half)qdata[0];
+                    sb_row[1] = scale * (half)qdata[1];
+                    sb_row[2] = scale * (half)qdata[2];
+                    sb_row[3] = scale * (half)qdata[3];
+                    sb_row[4] = scale * (half)qdata[4];
+                    sb_row[5] = scale * (half)qdata[5];
+                    sb_row[6] = scale * (half)qdata[6];
+                    sb_row[7] = scale * (half)qdata[7];
+                }
+            }
+
+            // Pass 1: second Q8_0 block (k_base + 32..63)
+            {
+                uint block_idx = (k_base + 32) / Q8B_GROUP_SIZE;
+                ushort k_offset = t_in_row * 8;
+                threadgroup half* sb_row = sb + n_local * TILE_K_64 + 32 + k_offset;
+
+                if (FC_BC_N || FC_BC_K) {
+                    if (gn < N && k_base + 32 + k_offset < K) {
+                        uint block_offset = gn * row_bytes + block_idx * Q8B_BLOCK_SIZE;
+                        half scale = as_type<half>(*(device const ushort*)(W_q8 + block_offset));
+                        device const char* qdata = (device const char*)(W_q8 + block_offset + 2 + k_offset);
+
+                        uint k_remaining = K - (k_base + 32 + k_offset);
+                        ushort count = (k_remaining >= 8) ? 8 : (ushort)k_remaining;
+
+                        if (count == 8) {
+                            sb_row[0] = scale * (half)qdata[0];
+                            sb_row[1] = scale * (half)qdata[1];
+                            sb_row[2] = scale * (half)qdata[2];
+                            sb_row[3] = scale * (half)qdata[3];
+                            sb_row[4] = scale * (half)qdata[4];
+                            sb_row[5] = scale * (half)qdata[5];
+                            sb_row[6] = scale * (half)qdata[6];
+                            sb_row[7] = scale * (half)qdata[7];
+                        } else {
+                            for (ushort i = 0; i < count; i++) {
+                                sb_row[i] = scale * (half)qdata[i];
+                            }
+                            for (ushort i = count; i < 8; i++) {
+                                sb_row[i] = (half)0.0h;
+                            }
+                        }
+                    } else {
+                        FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                            sb_row[i] = (half)0.0h;
+                        }
+                    }
+                } else {
+                    uint block_offset = gn * row_bytes + block_idx * Q8B_BLOCK_SIZE;
+                    half scale = as_type<half>(*(device const ushort*)(W_q8 + block_offset));
+                    device const char* qdata = (device const char*)(W_q8 + block_offset + 2 + k_offset);
+                    sb_row[0] = scale * (half)qdata[0];
+                    sb_row[1] = scale * (half)qdata[1];
+                    sb_row[2] = scale * (half)qdata[2];
+                    sb_row[3] = scale * (half)qdata[3];
+                    sb_row[4] = scale * (half)qdata[4];
+                    sb_row[5] = scale * (half)qdata[5];
+                    sb_row[6] = scale * (half)qdata[6];
+                    sb_row[7] = scale * (half)qdata[7];
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // MMA: 8 iterations (TILE_K_64=64, step by 8)
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K_64; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K_64 + ks, TILE_K_64);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K_64 + ks, TILE_K_64);
+
+            simdgroup_half8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store results
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    if (FC_BC_M || FC_BC_N) {
+        if (sg_m_base + 16 <= M && sg_n_base + 16 <= N) {
+            FOR_UNROLL (ushort i = 0; i < 2; i++)
+                FOR_UNROLL (ushort j = 0; j < 2; j++)
+                    simdgroup_store(mc[i][j], Y + (sg_m_base + i * 8) * N + (sg_n_base + j * 8), N);
+        } else {
+            threadgroup float* sc = (threadgroup float*)shmem_k64;
+            threadgroup float* my_sc = sc + sgitg * 256;
+            FOR_UNROLL (ushort i = 0; i < 2; i++)
+                FOR_UNROLL (ushort j = 0; j < 2; j++)
+                    simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            ushort lane = tiitg % 32;
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                if (gm < M && gn < N) {
+                    Y[gm * N + gn] = my_sc[local_m * 16 + local_n];
+                }
+            }
+        }
+    } else {
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], Y + (sg_m_base + i * 8) * N + (sg_n_base + j * 8), N);
+    }
+}
+
+// ============================================================================
+// dequant_tiled_matmul_q8_0_k64_residual_batched: K64 variant + residual add
+//
+// Y[m,n] = X[M,K] * dequant(W_q8[N,K_bytes])^T + R[m,n]
+// Same as dequant_tiled_matmul_q8_0_k64 but fuses residual add at writeback.
+// ============================================================================
+
+kernel void dequant_tiled_matmul_q8_0_k64_residual_batched(
+    device const uchar* W_q8     [[buffer(0)]],   // Q8_0 weights [N, K_bytes]
+    device const float* X        [[buffer(1)]],   // [M, K] input batch
+    device float*       Y        [[buffer(2)]],   // [M, N] output batch
+    constant uint&      M        [[buffer(3)]],   // batch size
+    constant uint&      N        [[buffer(4)]],   // output dim
+    constant uint&      K        [[buffer(5)]],   // input dim (elements, not bytes)
+    device const float* R        [[buffer(6)]],   // [M, N] residual to add
+    uint2 tg_pos                 [[threadgroup_position_in_grid]],
+    ushort tiitg                 [[thread_index_in_threadgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half shmem_k64r[4096];
+    threadgroup half* sa = shmem_k64r;
+    threadgroup half* sb = shmem_k64r + TILE_M * TILE_K_64;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_blocks_per_row = (K + Q8B_GROUP_SIZE - 1) / Q8B_GROUP_SIZE;
+    uint row_bytes = num_blocks_per_row * Q8B_BLOCK_SIZE;
+
+    uint num_k_tiles = (K + TILE_K_64 - 1) / TILE_K_64;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K_64;
+
+        // Load A tile: 32 rows x 64 cols
+        // FC_BC_M/FC_BC_K: when false (aligned), compiler eliminates boundary checks
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 4;   // col_group * 16
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sa_ptr = sa + row * TILE_K_64 + k_start;
+
+            if (FC_BC_M || FC_BC_K) {
+                if (gm < M && gk + 15 < K) {
+                    device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                    float4 v0 = x_ptr[0];
+                    float4 v1 = x_ptr[1];
+                    float4 v2 = x_ptr[2];
+                    float4 v3 = x_ptr[3];
+                    sa_ptr[0]  = (half)v0.x; sa_ptr[1]  = (half)v0.y;
+                    sa_ptr[2]  = (half)v0.z; sa_ptr[3]  = (half)v0.w;
+                    sa_ptr[4]  = (half)v1.x; sa_ptr[5]  = (half)v1.y;
+                    sa_ptr[6]  = (half)v1.z; sa_ptr[7]  = (half)v1.w;
+                    sa_ptr[8]  = (half)v2.x; sa_ptr[9]  = (half)v2.y;
+                    sa_ptr[10] = (half)v2.z; sa_ptr[11] = (half)v2.w;
+                    sa_ptr[12] = (half)v3.x; sa_ptr[13] = (half)v3.y;
+                    sa_ptr[14] = (half)v3.z; sa_ptr[15] = (half)v3.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sa_ptr[i] = (gm < M && gk_i < K) ? (half)X[gm * K + gk_i] : (half)0.0h;
+                    }
+                }
+            } else {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                float4 v2 = x_ptr[2];
+                float4 v3 = x_ptr[3];
+                sa_ptr[0]  = (half)v0.x; sa_ptr[1]  = (half)v0.y;
+                sa_ptr[2]  = (half)v0.z; sa_ptr[3]  = (half)v0.w;
+                sa_ptr[4]  = (half)v1.x; sa_ptr[5]  = (half)v1.y;
+                sa_ptr[6]  = (half)v1.z; sa_ptr[7]  = (half)v1.w;
+                sa_ptr[8]  = (half)v2.x; sa_ptr[9]  = (half)v2.y;
+                sa_ptr[10] = (half)v2.z; sa_ptr[11] = (half)v2.w;
+                sa_ptr[12] = (half)v3.x; sa_ptr[13] = (half)v3.y;
+                sa_ptr[14] = (half)v3.z; sa_ptr[15] = (half)v3.w;
+            }
+        }
+
+        // Load B tile: 2-pass Q8_0 dequant (2 blocks per row)
+        // FC_BC_N/FC_BC_K: when false (aligned), compiler eliminates boundary checks
+        {
+            ushort n_local = tiitg >> 2;
+            ushort t_in_row = tiitg & 3;
+            uint gn = tile_n_start + n_local;
+
+            // Pass 0: first block (k_base + 0..31)
+            {
+                uint block_idx = k_base / Q8B_GROUP_SIZE;
+                ushort k_offset = t_in_row * 8;
+                threadgroup half* sb_row = sb + n_local * TILE_K_64 + k_offset;
+
+                if (FC_BC_N || FC_BC_K) {
+                    if (gn < N && k_base + k_offset < K) {
+                        uint block_offset = gn * row_bytes + block_idx * Q8B_BLOCK_SIZE;
+                        half scale = as_type<half>(*(device const ushort*)(W_q8 + block_offset));
+                        device const char* qdata = (device const char*)(W_q8 + block_offset + 2 + k_offset);
+
+                        uint k_remaining = K - (k_base + k_offset);
+                        ushort count = (k_remaining >= 8) ? 8 : (ushort)k_remaining;
+
+                        if (count == 8) {
+                            sb_row[0] = scale * (half)qdata[0];
+                            sb_row[1] = scale * (half)qdata[1];
+                            sb_row[2] = scale * (half)qdata[2];
+                            sb_row[3] = scale * (half)qdata[3];
+                            sb_row[4] = scale * (half)qdata[4];
+                            sb_row[5] = scale * (half)qdata[5];
+                            sb_row[6] = scale * (half)qdata[6];
+                            sb_row[7] = scale * (half)qdata[7];
+                        } else {
+                            for (ushort i = 0; i < count; i++) {
+                                sb_row[i] = scale * (half)qdata[i];
+                            }
+                            for (ushort i = count; i < 8; i++) {
+                                sb_row[i] = (half)0.0h;
+                            }
+                        }
+                    } else {
+                        FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                            sb_row[i] = (half)0.0h;
+                        }
+                    }
+                } else {
+                    uint block_offset = gn * row_bytes + block_idx * Q8B_BLOCK_SIZE;
+                    half scale = as_type<half>(*(device const ushort*)(W_q8 + block_offset));
+                    device const char* qdata = (device const char*)(W_q8 + block_offset + 2 + k_offset);
+                    sb_row[0] = scale * (half)qdata[0];
+                    sb_row[1] = scale * (half)qdata[1];
+                    sb_row[2] = scale * (half)qdata[2];
+                    sb_row[3] = scale * (half)qdata[3];
+                    sb_row[4] = scale * (half)qdata[4];
+                    sb_row[5] = scale * (half)qdata[5];
+                    sb_row[6] = scale * (half)qdata[6];
+                    sb_row[7] = scale * (half)qdata[7];
+                }
+            }
+
+            // Pass 1: second block (k_base + 32..63)
+            {
+                uint block_idx = (k_base + 32) / Q8B_GROUP_SIZE;
+                ushort k_offset = t_in_row * 8;
+                threadgroup half* sb_row = sb + n_local * TILE_K_64 + 32 + k_offset;
+
+                if (FC_BC_N || FC_BC_K) {
+                    if (gn < N && k_base + 32 + k_offset < K) {
+                        uint block_offset = gn * row_bytes + block_idx * Q8B_BLOCK_SIZE;
+                        half scale = as_type<half>(*(device const ushort*)(W_q8 + block_offset));
+                        device const char* qdata = (device const char*)(W_q8 + block_offset + 2 + k_offset);
+
+                        uint k_remaining = K - (k_base + 32 + k_offset);
+                        ushort count = (k_remaining >= 8) ? 8 : (ushort)k_remaining;
+
+                        if (count == 8) {
+                            sb_row[0] = scale * (half)qdata[0];
+                            sb_row[1] = scale * (half)qdata[1];
+                            sb_row[2] = scale * (half)qdata[2];
+                            sb_row[3] = scale * (half)qdata[3];
+                            sb_row[4] = scale * (half)qdata[4];
+                            sb_row[5] = scale * (half)qdata[5];
+                            sb_row[6] = scale * (half)qdata[6];
+                            sb_row[7] = scale * (half)qdata[7];
+                        } else {
+                            for (ushort i = 0; i < count; i++) {
+                                sb_row[i] = scale * (half)qdata[i];
+                            }
+                            for (ushort i = count; i < 8; i++) {
+                                sb_row[i] = (half)0.0h;
+                            }
+                        }
+                    } else {
+                        FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                            sb_row[i] = (half)0.0h;
+                        }
+                    }
+                } else {
+                    uint block_offset = gn * row_bytes + block_idx * Q8B_BLOCK_SIZE;
+                    half scale = as_type<half>(*(device const ushort*)(W_q8 + block_offset));
+                    device const char* qdata = (device const char*)(W_q8 + block_offset + 2 + k_offset);
+                    sb_row[0] = scale * (half)qdata[0];
+                    sb_row[1] = scale * (half)qdata[1];
+                    sb_row[2] = scale * (half)qdata[2];
+                    sb_row[3] = scale * (half)qdata[3];
+                    sb_row[4] = scale * (half)qdata[4];
+                    sb_row[5] = scale * (half)qdata[5];
+                    sb_row[6] = scale * (half)qdata[6];
+                    sb_row[7] = scale * (half)qdata[7];
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K_64; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K_64 + ks, TILE_K_64);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K_64 + ks, TILE_K_64);
+
+            simdgroup_half8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store results with residual add: Y[m,n] = GEMM[m,n] + R[m,n]
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    {
+        threadgroup float* sc = (threadgroup float*)shmem_k64r;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ushort lane = tiitg % 32;
+        if (FC_BC_M || FC_BC_N) {
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                if (gm < M && gn < N) {
+                    Y[gm * N + gn] = my_sc[local_m * 16 + local_n] + R[gm * N + gn];
+                }
+            }
+        } else {
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                Y[gm * N + gn] = my_sc[local_m * 16 + local_n] + R[gm * N + gn];
+            }
+        }
+    }
+}
+
+// ============================================================================
+// dequant_tiled_matmul_q8_0_splitk: Split-K variant for GPU core saturation
+//
+// Same computation as dequant_tiled_matmul_q8_0 but splits the K (reduction)
+// dimension across multiple threadgroups via a 3D dispatch grid:
+//   (ceil(N/TILE_N), ceil(M/TILE_M), k_splits)
+//
+// Each threadgroup computes a partial result for its K range, writing to
+// Y_partial[split_idx * M * N + m * N + n]. A separate reduce_splitk kernel
+// sums the partial results into the final output.
+//
+// This increases threadgroup count for small M*N GEMMs (e.g. pp128 with
+// TinyLlama), saturating more GPU cores.
+// ============================================================================
+
+kernel void dequant_tiled_matmul_q8_0_splitk(
+    device const uchar* W_q8     [[buffer(0)]],   // Q8_0 weights [N, K_bytes]
+    device const float* X        [[buffer(1)]],   // [M, K] input batch
+    device float*       Y_partial [[buffer(2)]],  // [k_splits, M, N] partial results
+    constant uint&      M        [[buffer(3)]],   // batch size
+    constant uint&      N        [[buffer(4)]],   // output dim
+    constant uint&      K        [[buffer(5)]],   // input dim (elements)
+    constant uint&      k_splits [[buffer(6)]],   // number of K splits
+    uint3 tg_pos                 [[threadgroup_position_in_grid]],
+    ushort tiitg                 [[thread_index_in_threadgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half shmem[2048];
+    threadgroup half* sa = shmem;
+    threadgroup half* sb = shmem + TILE_M * TILE_K;
+
+    uint tile_n_start = tg_pos.x * TILE_N;
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint split_idx    = tg_pos.z;
+
+    // Compute K range for this split, aligned to TILE_K (which equals Q8_0 group size)
+    uint k_per_split = ((K + k_splits - 1) / k_splits);
+    k_per_split = ((k_per_split + TILE_K - 1) / TILE_K) * TILE_K;
+    uint k_start = split_idx * k_per_split;
+    uint k_end = min(k_start + k_per_split, K);
+    if (k_start >= K) {
+        // This split has no work; zero its output tile
+        uint partial_offset = split_idx * M * N;
+        for (ushort idx = tiitg; idx < TILE_M * TILE_N; idx += TG_SIZE) {
+            uint m_local = idx / TILE_N;
+            uint n_local = idx % TILE_N;
+            uint gm = tile_m_start + m_local;
+            uint gn = tile_n_start + n_local;
+            if (gm < M && gn < N)
+                Y_partial[partial_offset + gm * N + gn] = 0.0f;
+        }
+        return;
+    }
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_blocks_per_row = (K + Q8B_GROUP_SIZE - 1) / Q8B_GROUP_SIZE;
+    uint row_bytes = num_blocks_per_row * Q8B_BLOCK_SIZE;
+
+    uint first_kt = k_start / TILE_K;
+    uint last_kt = (k_end + TILE_K - 1) / TILE_K;
+
+    for (uint kt = first_kt; kt < last_kt; kt++) {
+        uint k_base = kt * TILE_K;
+
+        // Load A tile: vectorized 2D mapping, 4 threads per row, 8 elements each via float4
+        // (Split-K variant: also checks gk is within [k_start, k_end) range)
+        {
+            ushort row = tiitg >> 2;           // tiitg / 4, range 0..31
+            ushort col_group = tiitg & 3;      // tiitg % 4, range 0..3
+            ushort k_local = col_group << 3;   // col_group * 8
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_local;
+            threadgroup half* sa_ptr = sa + row * TILE_K + k_local;
+
+            if (gm < M && gk + 7 < K && gk >= k_start && gk + 7 < k_end) {
+                // Fast path: all 8 elements valid and within split range
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                sa_ptr[0] = (half)v0.x; sa_ptr[1] = (half)v0.y;
+                sa_ptr[2] = (half)v0.z; sa_ptr[3] = (half)v0.w;
+                sa_ptr[4] = (half)v1.x; sa_ptr[5] = (half)v1.y;
+                sa_ptr[6] = (half)v1.z; sa_ptr[7] = (half)v1.w;
+            } else {
+                // Boundary: element-wise with full bounds check
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    uint gk_i = gk + i;
+                    sa_ptr[i] = (gm < M && gk_i < K && gk_i >= k_start && gk_i < k_end) ? (half)X[gm * K + gk_i] : (half)0.0h;
+                }
+            }
+        }
+
+        // Load B tile: vectorized Q8_0 dequant
+        {
+            uint block_idx = k_base / Q8B_GROUP_SIZE;
+            ushort n_local = tiitg / 4;
+            ushort t_in_row = tiitg % 4;
+            ushort k_offset = t_in_row * 8;
+            uint gn = tile_n_start + n_local;
+
+            threadgroup half* sb_row = sb + n_local * TILE_K + k_offset;
+
+            if (gn < N && k_base + k_offset < K && k_base + k_offset >= k_start && k_base + k_offset < k_end) {
+                uint block_offset = gn * row_bytes + block_idx * Q8B_BLOCK_SIZE;
+                half scale = as_type<half>(*(device const ushort*)(W_q8 + block_offset));
+                device const char* qdata = (device const char*)(W_q8 + block_offset + 2 + k_offset);
+
+                uint k_remaining = K - (k_base + k_offset);
+                ushort count = (k_remaining >= 8) ? 8 : (ushort)k_remaining;
+
+                if (count == 8) {
+                    sb_row[0] = scale * (half)qdata[0];
+                    sb_row[1] = scale * (half)qdata[1];
+                    sb_row[2] = scale * (half)qdata[2];
+                    sb_row[3] = scale * (half)qdata[3];
+                    sb_row[4] = scale * (half)qdata[4];
+                    sb_row[5] = scale * (half)qdata[5];
+                    sb_row[6] = scale * (half)qdata[6];
+                    sb_row[7] = scale * (half)qdata[7];
+                } else {
+                    for (ushort i = 0; i < count; i++) {
+                        sb_row[i] = scale * (half)qdata[i];
+                    }
+                    for (ushort i = count; i < 8; i++) {
+                        sb_row[i] = (half)0.0h;
+                    }
+                }
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    sb_row[i] = (half)0.0h;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // MMA
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K + ks, TILE_K);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K + ks, TILE_K);
+
+            simdgroup_half8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store to partial buffer at offset split_idx * M * N
+    uint partial_offset = split_idx * M * N;
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    if (sg_m_base + 16 <= M && sg_n_base + 16 <= N) {
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], Y_partial + partial_offset + (sg_m_base + i * 8) * N + (sg_n_base + j * 8), N);
+    } else {
+        threadgroup float* sc = (threadgroup float*)shmem;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ushort lane = tiitg % 32;
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            if (gm < M && gn < N) {
+                Y_partial[partial_offset + gm * N + gn] = my_sc[local_m * 16 + local_n];
+            }
+        }
+    }
+}
+
+// ============================================================================
+// reduce_splitk: Sum partial results from Split-K GEMM
+//
+// partials: [k_splits, M, N] -- partial sums from each split
+// output:   [M, N] -- final result
+//
+// Simple element-wise reduction: output[i] = sum(partials[s * M*N + i])
+// ============================================================================
+
+kernel void reduce_splitk(
+    device const float* partials  [[buffer(0)]],
+    device float*       output    [[buffer(1)]],
+    constant uint&      M         [[buffer(2)]],
+    constant uint&      N         [[buffer(3)]],
+    constant uint&      k_splits  [[buffer(4)]],
+    uint gid                      [[thread_position_in_grid]])
+{
+    uint total = M * N;
+    if (gid >= total) return;
+
+    float sum = 0.0f;
+    for (uint s = 0; s < k_splits; s++) {
+        sum += partials[s * total + gid];
+    }
+    output[gid] = sum;
+}
+
+// ============================================================================
+// rmsnorm_batched: RMS Normalization for a batch of vectors
+//
+// Each threadgroup normalizes one row: out[batch_idx, :] = normalize(x[batch_idx, :])
+//
+// Dispatch: threadgroups = batch_size, threads_per_threadgroup = norm_tg_size
+// ============================================================================
+

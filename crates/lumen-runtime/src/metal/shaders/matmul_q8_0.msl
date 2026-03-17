@@ -1,0 +1,1650 @@
+// dequant_matmul_q8_0: Fused Q8_0 dequantization + matrix-vector multiply
+//
+// w_q8:   Q8_0 weight data for [out_dim, in_dim] matrix
+//         Each row: ceil(in_dim/32) blocks, each block = 2 bytes f16 scale + 32 bytes int8
+// x:      [in_dim] input vector (f32)
+// out:    [out_dim] output vector (f32)
+// in_dim: number of elements per row (NOT byte stride)
+// out_dim: total number of output rows (for bounds checking in multi-row dispatch)
+//
+// Strategy: One threadgroup per output row (same dispatch pattern as matmul_f32).
+// Each thread processes multiple Q8_0 blocks in a strided pattern, accumulating
+// the dot product with on-the-fly dequantization. Reduced via simd_sum.
+//
+// Q8_0 block layout (34 bytes):
+//   [f16 scale (2 bytes)] [32 x int8 quantized values (32 bytes)]
+//   dequantized value = scale * (float)int8_val
+// ============================================================================
+
+kernel void dequant_matmul_q8_0(
+    device const uchar* w_q8    [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    uint row                    [[threadgroup_position_in_grid]],
+    uint lane                   [[thread_index_in_simdgroup]])
+{
+    // Single SIMD group (32 threads) per output row.
+    // Each lane handles element [lane] of every Q8_0 block — perfect 1:1 mapping
+    // since Q8_0 has exactly 32 elements per block = Apple SIMD width.
+    // No threadgroup memory or barriers needed.
+    const uint Q8_BLOCK_SIZE = 34;  // 2 bytes f16 scale + 32 bytes int8 data
+
+    uint num_blocks = in_dim >> 5;  // in_dim / 32
+    uint row_bytes = num_blocks * Q8_BLOCK_SIZE;
+    device const uchar* row_ptr = w_q8 + row * row_bytes;
+
+    float sum = 0.0f;
+
+    // 4x unrolled: process 4 Q8_0 blocks per iteration for ILP
+    uint b = 0;
+    for (; b + 3 < num_blocks; b += 4) {
+        device const uchar* bp0 = row_ptr + b * Q8_BLOCK_SIZE;
+        device const uchar* bp1 = bp0 + Q8_BLOCK_SIZE;
+        device const uchar* bp2 = bp1 + Q8_BLOCK_SIZE;
+        device const uchar* bp3 = bp2 + Q8_BLOCK_SIZE;
+        half s0 = as_type<half>(*(device const ushort*)bp0);
+        half s1 = as_type<half>(*(device const ushort*)bp1);
+        half s2 = as_type<half>(*(device const ushort*)bp2);
+        half s3 = as_type<half>(*(device const ushort*)bp3);
+        float v0 = float(((device const char*)(bp0 + 2))[lane]) * x[(b << 5) + lane];
+        float v1 = float(((device const char*)(bp1 + 2))[lane]) * x[((b+1) << 5) + lane];
+        float v2 = float(((device const char*)(bp2 + 2))[lane]) * x[((b+2) << 5) + lane];
+        float v3 = float(((device const char*)(bp3 + 2))[lane]) * x[((b+3) << 5) + lane];
+        sum += float(s0) * simd_sum(v0) + float(s1) * simd_sum(v1)
+             + float(s2) * simd_sum(v2) + float(s3) * simd_sum(v3);
+    }
+    // Handle remaining blocks
+    for (; b < num_blocks; b++) {
+        device const uchar* bp = row_ptr + b * Q8_BLOCK_SIZE;
+        half scale = as_type<half>(*(device const ushort*)bp);
+        float val = float(((device const char*)(bp + 2))[lane]) * x[(b << 5) + lane];
+        sum += float(scale) * simd_sum(val);
+    }
+
+    if (lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
+// dequant_matmul_q8_0_residual: Fused Q8_0 matmul + residual add
+// out[row] = dot(w_q8_row, x) + residual[row]
+// Eliminates separate add_residual dispatch.
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_residual(
+    device const uchar* w_q8      [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device float*       out       [[buffer(2)]],
+    constant uint&      in_dim    [[buffer(3)]],
+    device const float* residual  [[buffer(4)]],
+    uint row                      [[threadgroup_position_in_grid]],
+    uint lane                     [[thread_index_in_simdgroup]])
+{
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = in_dim >> 5;
+    device const uchar* row_ptr = w_q8 + row * num_blocks * Q8_BLOCK_SIZE;
+
+    float sum = 0.0f;
+    uint b = 0;
+    for (; b + 3 < num_blocks; b += 4) {
+        device const uchar* bp0 = row_ptr + b * Q8_BLOCK_SIZE;
+        device const uchar* bp1 = bp0 + Q8_BLOCK_SIZE;
+        device const uchar* bp2 = bp1 + Q8_BLOCK_SIZE;
+        device const uchar* bp3 = bp2 + Q8_BLOCK_SIZE;
+        half s0 = as_type<half>(*(device const ushort*)bp0);
+        half s1 = as_type<half>(*(device const ushort*)bp1);
+        half s2 = as_type<half>(*(device const ushort*)bp2);
+        half s3 = as_type<half>(*(device const ushort*)bp3);
+        float v0 = float(((device const char*)(bp0 + 2))[lane]) * x[(b << 5) + lane];
+        float v1 = float(((device const char*)(bp1 + 2))[lane]) * x[((b+1) << 5) + lane];
+        float v2 = float(((device const char*)(bp2 + 2))[lane]) * x[((b+2) << 5) + lane];
+        float v3 = float(((device const char*)(bp3 + 2))[lane]) * x[((b+3) << 5) + lane];
+        sum += float(s0) * simd_sum(v0) + float(s1) * simd_sum(v1)
+             + float(s2) * simd_sum(v2) + float(s3) * simd_sum(v3);
+    }
+    for (; b < num_blocks; b++) {
+        device const uchar* bp = row_ptr + b * Q8_BLOCK_SIZE;
+        half scale = as_type<half>(*(device const ushort*)bp);
+        float val = float(((device const char*)(bp + 2))[lane]) * x[(b << 5) + lane];
+        sum += float(scale) * simd_sum(val);
+    }
+
+    if (lane == 0) {
+        out[row] = sum + residual[row];
+    }
+}
+
+// ============================================================================
+// dequant_matmul_q8_0_multirow: Multi-row Q8_0 matmul (2 rows per threadgroup)
+//
+// Same computation as dequant_matmul_q8_0 but processes 2 output rows per
+// threadgroup using 2 SIMD groups (64 threads). Both SIMD groups load the
+// SAME x-vector blocks from device memory, halving x-bandwidth compared to
+// dispatching separate threadgroups per row.
+//
+// Dispatch: threadgroups = ceil(out_dim/2), threads_per_threadgroup = 64
+// SIMD group 0 -> row 2*gid, SIMD group 1 -> row 2*gid+1
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_multirow(
+    device const uchar* w_q8    [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    uint row_pair               [[threadgroup_position_in_grid]],
+    uint lane                   [[thread_index_in_simdgroup]],
+    uint sg                     [[simdgroup_index_in_threadgroup]])
+{
+    // Each SIMD group handles one row: sg0 -> row 2*row_pair, sg1 -> row 2*row_pair+1
+    uint row = row_pair * 2 + sg;
+    if (row >= out_dim) return;
+
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = in_dim >> 5;
+    uint row_bytes = num_blocks * Q8_BLOCK_SIZE;
+    device const uchar* row_ptr = w_q8 + row * row_bytes;
+
+    float sum = 0.0f;
+
+    // 4x unrolled: process 4 Q8_0 blocks per iteration for ILP
+    uint b = 0;
+    for (; b + 3 < num_blocks; b += 4) {
+        device const uchar* bp0 = row_ptr + b * Q8_BLOCK_SIZE;
+        device const uchar* bp1 = bp0 + Q8_BLOCK_SIZE;
+        device const uchar* bp2 = bp1 + Q8_BLOCK_SIZE;
+        device const uchar* bp3 = bp2 + Q8_BLOCK_SIZE;
+        half s0 = as_type<half>(*(device const ushort*)bp0);
+        half s1 = as_type<half>(*(device const ushort*)bp1);
+        half s2 = as_type<half>(*(device const ushort*)bp2);
+        half s3 = as_type<half>(*(device const ushort*)bp3);
+        float v0 = float(((device const char*)(bp0 + 2))[lane]) * x[(b << 5) + lane];
+        float v1 = float(((device const char*)(bp1 + 2))[lane]) * x[((b+1) << 5) + lane];
+        float v2 = float(((device const char*)(bp2 + 2))[lane]) * x[((b+2) << 5) + lane];
+        float v3 = float(((device const char*)(bp3 + 2))[lane]) * x[((b+3) << 5) + lane];
+        sum += float(s0) * simd_sum(v0) + float(s1) * simd_sum(v1)
+             + float(s2) * simd_sum(v2) + float(s3) * simd_sum(v3);
+    }
+    // Handle remaining blocks
+    for (; b < num_blocks; b++) {
+        device const uchar* bp = row_ptr + b * Q8_BLOCK_SIZE;
+        half scale = as_type<half>(*(device const ushort*)bp);
+        float val = float(((device const char*)(bp + 2))[lane]) * x[(b << 5) + lane];
+        sum += float(scale) * simd_sum(val);
+    }
+
+    if (lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
+// dequant_matmul_q8_0_residual_multirow: Multi-row Q8_0 matmul + residual add
+// out[row] = dot(w_q8_row, x) + residual[row]
+// Same multi-row strategy: 2 rows per threadgroup, 2 SIMD groups.
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_residual_multirow(
+    device const uchar* w_q8      [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device float*       out       [[buffer(2)]],
+    constant uint&      in_dim    [[buffer(3)]],
+    device const float* residual  [[buffer(4)]],
+    constant uint&      out_dim   [[buffer(5)]],
+    uint row_pair                 [[threadgroup_position_in_grid]],
+    uint lane                     [[thread_index_in_simdgroup]],
+    uint sg                       [[simdgroup_index_in_threadgroup]])
+{
+    uint row = row_pair * 2 + sg;
+    if (row >= out_dim) return;
+
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = in_dim >> 5;
+    device const uchar* row_ptr = w_q8 + row * num_blocks * Q8_BLOCK_SIZE;
+
+    float sum = 0.0f;
+    uint b = 0;
+    for (; b + 3 < num_blocks; b += 4) {
+        device const uchar* bp0 = row_ptr + b * Q8_BLOCK_SIZE;
+        device const uchar* bp1 = bp0 + Q8_BLOCK_SIZE;
+        device const uchar* bp2 = bp1 + Q8_BLOCK_SIZE;
+        device const uchar* bp3 = bp2 + Q8_BLOCK_SIZE;
+        half s0 = as_type<half>(*(device const ushort*)bp0);
+        half s1 = as_type<half>(*(device const ushort*)bp1);
+        half s2 = as_type<half>(*(device const ushort*)bp2);
+        half s3 = as_type<half>(*(device const ushort*)bp3);
+        float v0 = float(((device const char*)(bp0 + 2))[lane]) * x[(b << 5) + lane];
+        float v1 = float(((device const char*)(bp1 + 2))[lane]) * x[((b+1) << 5) + lane];
+        float v2 = float(((device const char*)(bp2 + 2))[lane]) * x[((b+2) << 5) + lane];
+        float v3 = float(((device const char*)(bp3 + 2))[lane]) * x[((b+3) << 5) + lane];
+        sum += float(s0) * simd_sum(v0) + float(s1) * simd_sum(v1)
+             + float(s2) * simd_sum(v2) + float(s3) * simd_sum(v3);
+    }
+    for (; b < num_blocks; b++) {
+        device const uchar* bp = row_ptr + b * Q8_BLOCK_SIZE;
+        half scale = as_type<half>(*(device const ushort*)bp);
+        float val = float(((device const char*)(bp + 2))[lane]) * x[(b << 5) + lane];
+        sum += float(scale) * simd_sum(val);
+    }
+
+    if (lane == 0) {
+        out[row] = sum + residual[row];
+    }
+}
+
+// ============================================================================
+// dequant_matmul_q8_0_4row: 4-row Q8_0 matmul (4 rows per threadgroup)
+//
+// Same computation as dequant_matmul_q8_0 but processes 4 output rows per
+// threadgroup using 4 SIMD groups (128 threads). All SIMD groups load the
+// SAME x-vector blocks, quartering x-bandwidth vs single-row dispatch.
+//
+// Dispatch: threadgroups = ceil(out_dim/4), threads_per_threadgroup = 128
+// SIMD group 0..3 -> rows 4*gid+0 .. 4*gid+3
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_4row(
+    device const uchar* w_q8    [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    uint row_group              [[threadgroup_position_in_grid]],
+    uint lane                   [[thread_index_in_simdgroup]],
+    uint sg                     [[simdgroup_index_in_threadgroup]])
+{
+    uint row = row_group * 4 + sg;
+    if (row >= out_dim) return;
+
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = in_dim >> 5;
+    uint row_bytes = num_blocks * Q8_BLOCK_SIZE;
+    device const uchar* row_ptr = w_q8 + row * row_bytes;
+
+    float sum = 0.0f;
+
+    uint b = 0;
+    for (; b + 3 < num_blocks; b += 4) {
+        device const uchar* bp0 = row_ptr + b * Q8_BLOCK_SIZE;
+        device const uchar* bp1 = bp0 + Q8_BLOCK_SIZE;
+        device const uchar* bp2 = bp1 + Q8_BLOCK_SIZE;
+        device const uchar* bp3 = bp2 + Q8_BLOCK_SIZE;
+        half s0 = as_type<half>(*(device const ushort*)bp0);
+        half s1 = as_type<half>(*(device const ushort*)bp1);
+        half s2 = as_type<half>(*(device const ushort*)bp2);
+        half s3 = as_type<half>(*(device const ushort*)bp3);
+        float v0 = float(((device const char*)(bp0 + 2))[lane]) * x[(b << 5) + lane];
+        float v1 = float(((device const char*)(bp1 + 2))[lane]) * x[((b+1) << 5) + lane];
+        float v2 = float(((device const char*)(bp2 + 2))[lane]) * x[((b+2) << 5) + lane];
+        float v3 = float(((device const char*)(bp3 + 2))[lane]) * x[((b+3) << 5) + lane];
+        sum += float(s0) * simd_sum(v0) + float(s1) * simd_sum(v1)
+             + float(s2) * simd_sum(v2) + float(s3) * simd_sum(v3);
+    }
+    for (; b < num_blocks; b++) {
+        device const uchar* bp = row_ptr + b * Q8_BLOCK_SIZE;
+        half scale = as_type<half>(*(device const ushort*)bp);
+        float val = float(((device const char*)(bp + 2))[lane]) * x[(b << 5) + lane];
+        sum += float(scale) * simd_sum(val);
+    }
+
+    if (lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
+// dequant_matmul_q8_0_residual_4row: 4-row Q8_0 matmul + residual add
+// out[row] = dot(w_q8_row, x) + residual[row]
+// Same 4-row strategy: 4 rows per threadgroup, 4 SIMD groups (128 threads).
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_residual_4row(
+    device const uchar* w_q8      [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device float*       out       [[buffer(2)]],
+    constant uint&      in_dim    [[buffer(3)]],
+    device const float* residual  [[buffer(4)]],
+    constant uint&      out_dim   [[buffer(5)]],
+    uint row_group                [[threadgroup_position_in_grid]],
+    uint lane                     [[thread_index_in_simdgroup]],
+    uint sg                       [[simdgroup_index_in_threadgroup]])
+{
+    uint row = row_group * 4 + sg;
+    if (row >= out_dim) return;
+
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = in_dim >> 5;
+    device const uchar* row_ptr = w_q8 + row * num_blocks * Q8_BLOCK_SIZE;
+
+    float sum = 0.0f;
+    uint b = 0;
+    for (; b + 3 < num_blocks; b += 4) {
+        device const uchar* bp0 = row_ptr + b * Q8_BLOCK_SIZE;
+        device const uchar* bp1 = bp0 + Q8_BLOCK_SIZE;
+        device const uchar* bp2 = bp1 + Q8_BLOCK_SIZE;
+        device const uchar* bp3 = bp2 + Q8_BLOCK_SIZE;
+        half s0 = as_type<half>(*(device const ushort*)bp0);
+        half s1 = as_type<half>(*(device const ushort*)bp1);
+        half s2 = as_type<half>(*(device const ushort*)bp2);
+        half s3 = as_type<half>(*(device const ushort*)bp3);
+        float v0 = float(((device const char*)(bp0 + 2))[lane]) * x[(b << 5) + lane];
+        float v1 = float(((device const char*)(bp1 + 2))[lane]) * x[((b+1) << 5) + lane];
+        float v2 = float(((device const char*)(bp2 + 2))[lane]) * x[((b+2) << 5) + lane];
+        float v3 = float(((device const char*)(bp3 + 2))[lane]) * x[((b+3) << 5) + lane];
+        sum += float(s0) * simd_sum(v0) + float(s1) * simd_sum(v1)
+             + float(s2) * simd_sum(v2) + float(s3) * simd_sum(v3);
+    }
+    for (; b < num_blocks; b++) {
+        device const uchar* bp = row_ptr + b * Q8_BLOCK_SIZE;
+        half scale = as_type<half>(*(device const ushort*)bp);
+        float val = float(((device const char*)(bp + 2))[lane]) * x[(b << 5) + lane];
+        sum += float(scale) * simd_sum(val);
+    }
+
+    if (lane == 0) {
+        out[row] = sum + residual[row];
+    }
+}
+
+// ============================================================================
+// dequant_matmul_q8_0_deferred: Deferred-reduction Q8_0 matvec (llama.cpp pattern)
+//
+// Key insight: Instead of calling simd_sum() once per Q8_0 block (64 syncs for
+// hidden_dim=2048), each thread processes NQ=8 elements from the SAME block
+// and accumulates locally. Final reduction: 1 simd_sum + 1 shmem cross-SG
+// reduce = 2 sync points total (32x fewer than the 4-row kernel).
+//
+// Thread mapping (NQ=8, 32 threads per SIMD group):
+//   ix = tiisg / 4  -> 0..7 (which of 8 blocks in the stride)
+//   il = tiisg % 4  -> 0..3 (which sub-chunk of 8 within the 32-element block)
+//   4 threads collectively process one 32-element block (4 x 8 = 32)
+//
+// NR0=4 rows per threadgroup (4 SIMD groups x 32 threads = 128 threads).
+// Stride = NSG * NQ = 4 * 8 = 32 blocks per outer iteration.
+//
+// Dispatch: threadgroups = ceil(out_dim/4), threads_per_threadgroup = 128
+// Threadgroup memory: NR0 * 32 * sizeof(float) = 512 bytes (for cross-SG reduce)
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_deferred(
+    device const uchar* weights [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 4;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q8_BLOCK_SIZE = 34; // 2 bytes scale (f16) + 32 bytes data (int8)
+
+    const uint nb = in_dim >> 5;  // number of Q8_0 blocks per row = in_dim / 32
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * NR0;  // first output row for this threadgroup
+
+    // Thread mapping within SIMD group
+    const uint ix = tiisg / (NW / NQ);  // = tiisg / 4 -> 0..7 (block index in stride)
+    const uint il = tiisg % (NW / NQ);  // = tiisg % 4 -> 0..3 (sub-chunk index)
+
+    const uint ib0 = sgitg * NQ + ix;   // starting block for this thread
+
+    // Pointers to weight rows
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f, 0.f, 0.f };
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+
+    // Main loop: each thread processes NQ=8 elements per block, accumulates locally
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        // Load 8 x-values into registers
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        // Process all NR0 rows with these x-values
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            // Point to this block in the weight row
+            device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb += NSG * NQ * 32;
+    }
+
+    // Final reduction: 1 simd_sum + cross-SG shmem reduce
+    threadgroup float shmem[NR0 * NW];  // NR0 * 32 floats = 512 bytes
+
+    // Initialize shmem (SG 0 zeros its slots)
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each SG writes its reduced sum
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // SG 0 does the final reduction and writes output
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            out[r0 + row] = tot;
+        }
+    }
+}
+
+// ============================================================================
+// dequant_matmul_q8_0_deferred_residual: Deferred-reduction Q8_0 matvec + residual
+// out[row] = dot(w_q8_row, x) + residual[row]
+// Same deferred-reduction pattern as above, with fused residual addition.
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_deferred_residual(
+    device const uchar* weights   [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device float*       out       [[buffer(2)]],
+    constant uint&      in_dim    [[buffer(3)]],
+    device const float* residual  [[buffer(4)]],
+    constant uint&      out_dim   [[buffer(5)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 4;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q8_BLOCK_SIZE = 34;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f, 0.f, 0.f };
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb += NSG * NQ * 32;
+    }
+
+    threadgroup float shmem[NR0 * NW];
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            out[r0 + row] = tot + residual[r0 + row];
+        }
+    }
+}
+
+// ============================================================================
+// dequant_matmul_q8_0_deferred_bias: Deferred-reduction Q8_0 matvec + fused bias
+// out[row] = dot(w_q8_row, x) + bias[row]
+//
+// Same deferred-reduction pattern as dequant_matmul_q8_0_deferred, with fused
+// bias addition. The bias is split across Q/K/V sections:
+//   row in [0, q_dim)            -> bias_q[row]
+//   row in [q_dim, q_dim+kv_dim) -> bias_k[row - q_dim]
+//   row in [q_dim+kv_dim, ...)   -> bias_v[row - q_dim - kv_dim]
+//
+// Eliminates 3 separate bias_add dispatches per layer for Qwen2-family models.
+// Dispatch: threadgroups = ceil(out_dim/4), threads_per_threadgroup = 128
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_deferred_bias(
+    device const uchar* weights [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    device const float* bias_q  [[buffer(5)]],
+    device const float* bias_k  [[buffer(6)]],
+    device const float* bias_v  [[buffer(7)]],
+    constant uint&      q_dim   [[buffer(8)]],
+    constant uint&      qk_dim  [[buffer(9)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 4;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q8_BLOCK_SIZE = 34;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f, 0.f, 0.f };
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb += NSG * NQ * 32;
+    }
+
+    threadgroup float shmem[NR0 * NW];
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            uint r = r0 + row;
+            float b;
+            if (r < q_dim) b = bias_q[r];
+            else if (r < qk_dim) b = bias_k[r - q_dim];
+            else b = bias_v[r - qk_dim];
+            out[r] = tot + b;
+        }
+    }
+}
+
+// ============================================================================
+// NR0=2 variants of the deferred-reduction Q8_0 matvec kernels.
+//
+// Same algorithm as the NR0=4 variants above, but with NR0=2 (2 rows per TG).
+// This doubles the threadgroup count, improving GPU occupancy for small output
+// dimensions where NR0=4 produces too few TGs to saturate all GPU cores.
+//
+// Trade-off: less x-vector reuse per TG (2 rows share x vs 4 rows), but more
+// TGs for better wave scheduling. Shmem per TG: 2*32*4 = 256 bytes (vs 512).
+//
+// Dispatch: threadgroups = ceil(out_dim/2), threads_per_threadgroup = 128
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_deferred_nr2(
+    device const uchar* weights [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q8_BLOCK_SIZE = 34;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f };
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb += NSG * NQ * 32;
+    }
+
+    threadgroup float shmem[NR0 * NW];
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            out[r0 + row] = tot;
+        }
+    }
+}
+
+kernel void dequant_matmul_q8_0_deferred_residual_nr2(
+    device const uchar* weights   [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device float*       out       [[buffer(2)]],
+    constant uint&      in_dim    [[buffer(3)]],
+    device const float* residual  [[buffer(4)]],
+    constant uint&      out_dim   [[buffer(5)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q8_BLOCK_SIZE = 34;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f };
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb += NSG * NQ * 32;
+    }
+
+    threadgroup float shmem[NR0 * NW];
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            out[r0 + row] = tot + residual[r0 + row];
+        }
+    }
+}
+
+kernel void dequant_matmul_q8_0_deferred_bias_nr2(
+    device const uchar* weights [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    device const float* bias_q  [[buffer(5)]],
+    device const float* bias_k  [[buffer(6)]],
+    device const float* bias_v  [[buffer(7)]],
+    constant uint&      q_dim   [[buffer(8)]],
+    constant uint&      qk_dim  [[buffer(9)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q8_BLOCK_SIZE = 34;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f };
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb += NSG * NQ * 32;
+    }
+
+    threadgroup float shmem[NR0 * NW];
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            uint r = r0 + row;
+            float b;
+            if (r < q_dim) b = bias_q[r];
+            else if (r < qk_dim) b = bias_k[r - q_dim];
+            else b = bias_v[r - qk_dim];
+            out[r] = tot + b;
+        }
+    }
+}
+
+kernel void dequant_matmul_q8_0_deferred_residual_copy_nr2(
+    device const uchar* weights   [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device       float* accum     [[buffer(2)]],
+    constant     uint&  in_dim    [[buffer(3)]],
+    device       float* copy_dst  [[buffer(4)]],
+    constant     uint&  out_dim   [[buffer(5)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q8_BLOCK_SIZE = 34;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f };
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb += NSG * NQ * 32;
+    }
+
+    threadgroup float shmem[NR0 * NW];
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            float val = tot + accum[r0 + row];
+            accum[r0 + row] = val;
+            copy_dst[r0 + row] = val;
+        }
+    }
+}
+
+// ============================================================================
+// dequant_matmul_q8_0_silu_deferred_residual_copy_nr2:
+// Same as dequant_matmul_q8_0_deferred_residual_copy_nr2 but applies
+// silu(gate[i]) * x[i] inline during x-vector loading. This eliminates
+// the separate silu_elementwise_mul dispatch and barrier.
+//
+// buffer(0): weights   [out_dim, in_dim] Q8_0
+// buffer(1): x         [in_dim] float -- values to gate
+// buffer(2): accum     [out_dim] float -- R/W (residual accumulator)
+// buffer(3): in_dim (uint)
+// buffer(4): copy_dst  [out_dim] float -- write copy of accum
+// buffer(5): out_dim (uint)
+// buffer(6): gate      [in_dim] float -- gate values (silu applied)
+//
+// Dispatch: threadgroups = ceil(out_dim/2), threads_per_threadgroup = 128
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_silu_deferred_residual_copy_nr2(
+    device const uchar* weights   [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device       float* accum     [[buffer(2)]],
+    constant     uint&  in_dim    [[buffer(3)]],
+    device       float* copy_dst  [[buffer(4)]],
+    constant     uint&  out_dim   [[buffer(5)]],
+    device const float* gate      [[buffer(6)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q8_BLOCK_SIZE = 34;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f };
+
+    float yl[NQ];
+
+    device const float* xb = x + ib0 * 32 + il * NQ;
+    device const float* gb = gate + ib0 * 32 + il * NQ;
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        // Fused silu(gate) * x: load gate and x, compute inline
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            float g = gb[i];
+            float sigmoid = 1.0f / (1.0f + exp(-g));
+            yl[i] = g * sigmoid * xb[i];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        xb += NSG * NQ * 32;
+        gb += NSG * NQ * 32;
+    }
+
+    threadgroup float shmem[NR0 * NW];
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            float val = tot + accum[r0 + row];
+            accum[r0 + row] = val;
+            copy_dst[r0 + row] = val;
+        }
+    }
+}
+
+// ============================================================================
+// Fused RMSNorm + Q8_0 matvec NR2 variants.
+//
+// These kernels eliminate the separate RMSNorm dispatch by computing the
+// RMSNorm scale factor as a preamble, then applying x[i]*scale*norm_w[i]
+// inline during the matvec x-vector load.
+//
+// Phase 1 (preamble): All 128 threads cooperatively compute sum(x^2),
+//   reduce via simd_sum + shmem, compute scale = rsqrt(ss/dim + eps).
+//   Cost: ~dim/128 iterations + 2 reductions.  For dim=2048: 16 iters.
+//
+// Phase 2 (matvec): Standard deferred-reduction pattern with NR0=2,
+//   but loads yl[i] = x[idx] * scale * norm_w[idx] instead of just x[idx].
+//
+// Saves per invocation: 1 RMSNorm dispatch, 1 barrier, 1 full write + read
+//   of the normed intermediate buffer (dim * 4 bytes).
+//
+// Dispatch: threadgroups = ceil(out_dim/2), threads_per_threadgroup = 128
+// ============================================================================
+
+kernel void rmsnorm_dequant_matmul_q8_0_deferred_nr2(
+    device const uchar* weights   [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device float*       out       [[buffer(2)]],
+    constant uint&      in_dim    [[buffer(3)]],
+    constant uint&      out_dim   [[buffer(4)]],
+    device const uchar* norm_w    [[buffer(5)]],    // RMSNorm weight [in_dim] as f32 bytes
+    constant float&     eps       [[buffer(6)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    // Single-pass fused RMSNorm + Q8_0 matvec NR2.
+    //
+    // Key insight: dot(W, norm_x) = scale * dot(W, x * norm_w)
+    // where scale = rsqrt(sum(x^2)/dim + eps).
+    //
+    // We compute dot(W, x * norm_w) AND sum(x^2) in the SAME loop,
+    // then multiply the final result by scale. Zero preamble overhead.
+    //
+    // Each thread reads x exactly ONCE, accumulating both the dot product
+    // contribution and the sum-of-squares simultaneously.
+
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q8_BLOCK_SIZE = 34;
+
+    device const float* norm_weight = (device const float*)norm_w;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f };
+    float ss = 0.0f;  // sum of squares for RMSNorm
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+    device const float* nwb = norm_weight + ib0 * 32 + il * NQ;
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        // Load x * norm_w (without scale) and accumulate x^2 simultaneously
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            float xi = yb[i];
+            ss += xi * xi;
+            yl[i] = xi * nwb[i];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb += NSG * NQ * 32;
+        nwb += NSG * NQ * 32;
+    }
+
+    // Reduce sum-of-squares across all 128 threads
+    ss = simd_sum(ss);
+
+    threadgroup float shmem[NR0 * NW];
+
+    if (tiisg == 0) {
+        shmem[sgitg] = ss;
+    }
+
+    // Also reduce dot products
+    for (uint row = 0; row < NR0; ++row) {
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Compute RMSNorm scale from reduced sum-of-squares
+    threadgroup float rms_scale_shared;
+    if (sgitg == 0) {
+        float total_ss = (tiisg < NSG) ? shmem[tiisg] : 0.0f;
+        total_ss = simd_sum(total_ss);
+        if (tiisg == 0) {
+            rms_scale_shared = rsqrt(total_ss / float(in_dim) + eps);
+        }
+    }
+
+    // Write dot product partial sums to shmem (reuse space)
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms_scale = rms_scale_shared;
+
+    // Final reduction of dot products, multiply by RMSNorm scale
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            out[r0 + row] = tot * rms_scale;
+        }
+    }
+}
+
+// Fused RMSNorm + Q8_0 matvec + residual NR2.
+// Single-pass: computes dot(W, x * norm_w) and sum(x^2) simultaneously,
+// then applies scale * dot + residual at the end.
+kernel void rmsnorm_dequant_matmul_q8_0_deferred_residual_nr2(
+    device const uchar* weights   [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device float*       out       [[buffer(2)]],
+    constant uint&      in_dim    [[buffer(3)]],
+    device const float* residual  [[buffer(4)]],
+    constant uint&      out_dim   [[buffer(5)]],
+    device const uchar* norm_w    [[buffer(6)]],
+    constant float&     eps       [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q8_BLOCK_SIZE = 34;
+
+    device const float* norm_weight = (device const float*)norm_w;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f };
+    float ss = 0.0f;
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+    device const float* nwb = norm_weight + ib0 * 32 + il * NQ;
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            float xi = yb[i];
+            ss += xi * xi;
+            yl[i] = xi * nwb[i];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb += NSG * NQ * 32;
+        nwb += NSG * NQ * 32;
+    }
+
+    ss = simd_sum(ss);
+
+    threadgroup float shmem[NR0 * NW];
+
+    if (tiisg == 0) {
+        shmem[sgitg] = ss;
+    }
+
+    for (uint row = 0; row < NR0; ++row) {
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float rms_scale_shared;
+    if (sgitg == 0) {
+        float total_ss = (tiisg < NSG) ? shmem[tiisg] : 0.0f;
+        total_ss = simd_sum(total_ss);
+        if (tiisg == 0) {
+            rms_scale_shared = rsqrt(total_ss / float(in_dim) + eps);
+        }
+    }
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms_scale = rms_scale_shared;
+
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            out[r0 + row] = tot * rms_scale + residual[r0 + row];
+        }
+    }
+}
+
+// ============================================================================
+// Fused RMSNorm + Q8_0 matvec — 2SG variant
+//
+// Same single-pass fusion as rmsnorm_dequant_matmul_q8_0_deferred_nr2:
+//   dot(W, norm_x) = scale * dot(W, x * norm_w)
+//   where scale = rsqrt(sum(x^2)/dim + eps)
+//
+// Key difference from NR2: each SG independently processes ALL blocks (stride NQ),
+// so each SG computes the FULL sum-of-squares. No cross-SG reduction needed for ss.
+// Dot products: each SG owns 4 rows, only needs simd_sum (no threadgroup barrier).
+//
+// 2 SGs, 64 threads/TG, 8 rows/TG, ZERO threadgroup barriers for dot products.
+// One threadgroup barrier needed for ss -> rms_scale broadcast between SGs.
+//
+// Dispatch: threadgroups = ceil(out_dim/8), threads_per_threadgroup = 64
+// ============================================================================
+
+kernel void rmsnorm_dequant_matmul_q8_0_2sg(
+    device const uchar* weights   [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device float*       out       [[buffer(2)]],
+    constant uint&      in_dim    [[buffer(3)]],
+    constant uint&      out_dim   [[buffer(4)]],
+    device const uchar* norm_w    [[buffer(5)]],
+    constant float&     eps       [[buffer(6)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q8_BLOCK_SIZE = 34;
+
+    device const float* norm_weight = (device const float*)norm_w;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * 8 + sgitg * NR;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = ix;
+
+    device const uchar* ax[NR];
+    for (uint row = 0; row < NR; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR] = { 0.f, 0.f, 0.f, 0.f };
+    float ss = 0.0f;
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+    device const float* nwb = norm_weight + ib0 * 32 + il * NQ;
+
+    for (uint ib = ib0; ib < nb; ib += NQ) {
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            float xi = yb[i];
+            ss += xi * xi;
+            yl[i] = xi * nwb[i];
+        }
+
+        for (uint row = 0; row < NR; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb += NQ * 32;
+        nwb += NQ * 32;
+    }
+
+    // Each SG independently computes the full ss — just simd_sum within SG
+    ss = simd_sum(ss);
+
+    // Compute RMSNorm scale (both SGs have identical ss, but use SG0 as canonical)
+    // Broadcast via threadgroup memory with a single barrier
+    threadgroup float rms_scale_shared;
+    if (sgitg == 0 && tiisg == 0) {
+        rms_scale_shared = rsqrt(ss / float(in_dim) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rms_scale = rms_scale_shared;
+
+    // Final reduction: simd_sum for each row, then write
+    for (uint row = 0; row < NR && r0 + row < out_dim; ++row) {
+        sumf[row] = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            out[r0 + row] = sumf[row] * rms_scale;
+        }
+    }
+}
+
+// ============================================================================
+// Fused RMSNorm + Q8_0 matvec + residual — 2SG variant
+// out[row] = dot(W, norm(x)) + residual[row]
+// Same pattern as above with residual addition at the end.
+//
+// Dispatch: threadgroups = ceil(out_dim/8), threads_per_threadgroup = 64
+// ============================================================================
+
+kernel void rmsnorm_dequant_matmul_q8_0_2sg_residual(
+    device const uchar* weights   [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device float*       out       [[buffer(2)]],
+    constant uint&      in_dim    [[buffer(3)]],
+    device const float* residual  [[buffer(4)]],
+    constant uint&      out_dim   [[buffer(5)]],
+    device const uchar* norm_w    [[buffer(6)]],
+    constant float&     eps       [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q8_BLOCK_SIZE = 34;
+
+    device const float* norm_weight = (device const float*)norm_w;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * 8 + sgitg * NR;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = ix;
+
+    device const uchar* ax[NR];
+    for (uint row = 0; row < NR; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR] = { 0.f, 0.f, 0.f, 0.f };
+    float ss = 0.0f;
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+    device const float* nwb = norm_weight + ib0 * 32 + il * NQ;
+
+    for (uint ib = ib0; ib < nb; ib += NQ) {
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            float xi = yb[i];
+            ss += xi * xi;
+            yl[i] = xi * nwb[i];
+        }
+
+        for (uint row = 0; row < NR; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb += NQ * 32;
+        nwb += NQ * 32;
+    }
+
+    ss = simd_sum(ss);
+
+    threadgroup float rms_scale_shared;
+    if (sgitg == 0 && tiisg == 0) {
+        rms_scale_shared = rsqrt(ss / float(in_dim) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rms_scale = rms_scale_shared;
+
+    for (uint row = 0; row < NR && r0 + row < out_dim; ++row) {
+        sumf[row] = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            out[r0 + row] = sumf[row] * rms_scale + residual[r0 + row];
+        }
+    }
+}
+
+// Fused RMSNorm + FFN Gate+Up+SwiGLU Q8_0 deferred.

@@ -1,0 +1,996 @@
+kernel void dequant_tiled_matmul_q8_0_residual_batched(
+    device const uchar* W_q8     [[buffer(0)]],   // Q8_0 weights [N, K_bytes]
+    device const float* X        [[buffer(1)]],   // [M, K] input batch
+    device float*       Y        [[buffer(2)]],   // [M, N] output batch
+    constant uint&      M        [[buffer(3)]],   // batch size
+    constant uint&      N        [[buffer(4)]],   // output dim
+    constant uint&      K        [[buffer(5)]],   // input dim (elements, not bytes)
+    device const float* R        [[buffer(6)]],   // [M, N] residual to add
+    uint2 tg_pos                 [[threadgroup_position_in_grid]],
+    ushort tiitg                 [[thread_index_in_threadgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half shmem[2048];
+    threadgroup half* sa = shmem;
+    threadgroup half* sb = shmem + TILE_M * TILE_K;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_blocks_per_row = (K + Q8B_GROUP_SIZE - 1) / Q8B_GROUP_SIZE;
+    uint row_bytes = num_blocks_per_row * Q8B_BLOCK_SIZE;
+
+    uint num_k_tiles = (K + TILE_K - 1) / TILE_K;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K;
+
+        // Load A tile
+        // FC_BC_M/FC_BC_K: when false (aligned), compiler eliminates boundary checks
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 3;
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sa_ptr = sa + row * TILE_K + k_start;
+
+            if (FC_BC_M || FC_BC_K) {
+                if (gm < M && gk + 7 < K) {
+                    device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                    float4 v0 = x_ptr[0];
+                    float4 v1 = x_ptr[1];
+                    sa_ptr[0] = (half)v0.x; sa_ptr[1] = (half)v0.y;
+                    sa_ptr[2] = (half)v0.z; sa_ptr[3] = (half)v0.w;
+                    sa_ptr[4] = (half)v1.x; sa_ptr[5] = (half)v1.y;
+                    sa_ptr[6] = (half)v1.z; sa_ptr[7] = (half)v1.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                        uint gk_i = gk + i;
+                        sa_ptr[i] = (gm < M && gk_i < K) ? (half)X[gm * K + gk_i] : (half)0.0h;
+                    }
+                }
+            } else {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                sa_ptr[0] = (half)v0.x; sa_ptr[1] = (half)v0.y;
+                sa_ptr[2] = (half)v0.z; sa_ptr[3] = (half)v0.w;
+                sa_ptr[4] = (half)v1.x; sa_ptr[5] = (half)v1.y;
+                sa_ptr[6] = (half)v1.z; sa_ptr[7] = (half)v1.w;
+            }
+        }
+
+        // Load B tile: vectorized Q8_0 dequant
+        // FC_BC_N/FC_BC_K: when false (aligned), compiler eliminates boundary checks
+        {
+            uint block_idx = k_base / Q8B_GROUP_SIZE;
+            ushort n_local = tiitg / 4;
+            ushort t_in_row = tiitg % 4;
+            ushort k_offset = t_in_row * 8;
+            uint gn = tile_n_start + n_local;
+
+            threadgroup half* sb_row = sb + n_local * TILE_K + k_offset;
+
+            if (FC_BC_N || FC_BC_K) {
+                if (gn < N && k_base + k_offset < K) {
+                    uint block_offset = gn * row_bytes + block_idx * Q8B_BLOCK_SIZE;
+                    half scale = as_type<half>(*(device const ushort*)(W_q8 + block_offset));
+                    device const char* qdata = (device const char*)(W_q8 + block_offset + 2 + k_offset);
+
+                    uint k_remaining = K - (k_base + k_offset);
+                    ushort count = (k_remaining >= 8) ? 8 : (ushort)k_remaining;
+
+                    if (count == 8) {
+                        sb_row[0] = scale * (half)qdata[0];
+                        sb_row[1] = scale * (half)qdata[1];
+                        sb_row[2] = scale * (half)qdata[2];
+                        sb_row[3] = scale * (half)qdata[3];
+                        sb_row[4] = scale * (half)qdata[4];
+                        sb_row[5] = scale * (half)qdata[5];
+                        sb_row[6] = scale * (half)qdata[6];
+                        sb_row[7] = scale * (half)qdata[7];
+                    } else {
+                        for (ushort i = 0; i < count; i++) {
+                            sb_row[i] = scale * (half)qdata[i];
+                        }
+                        for (ushort i = count; i < 8; i++) {
+                            sb_row[i] = (half)0.0h;
+                        }
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                        sb_row[i] = (half)0.0h;
+                    }
+                }
+            } else {
+                uint block_offset = gn * row_bytes + block_idx * Q8B_BLOCK_SIZE;
+                half scale = as_type<half>(*(device const ushort*)(W_q8 + block_offset));
+                device const char* qdata = (device const char*)(W_q8 + block_offset + 2 + k_offset);
+
+                sb_row[0] = scale * (half)qdata[0];
+                sb_row[1] = scale * (half)qdata[1];
+                sb_row[2] = scale * (half)qdata[2];
+                sb_row[3] = scale * (half)qdata[3];
+                sb_row[4] = scale * (half)qdata[4];
+                sb_row[5] = scale * (half)qdata[5];
+                sb_row[6] = scale * (half)qdata[6];
+                sb_row[7] = scale * (half)qdata[7];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K + ks, TILE_K);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K + ks, TILE_K);
+
+            simdgroup_half8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store results with residual add: Y[m,n] = GEMM[m,n] + R[m,n]
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    // Use threadgroup memory for store + residual add
+    {
+        threadgroup float* sc = (threadgroup float*)shmem;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ushort lane = tiitg % 32;
+        if (FC_BC_M || FC_BC_N) {
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                if (gm < M && gn < N) {
+                    Y[gm * N + gn] = my_sc[local_m * 16 + local_n] + R[gm * N + gn];
+                }
+            }
+        } else {
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                Y[gm * N + gn] = my_sc[local_m * 16 + local_n] + R[gm * N + gn];
+            }
+        }
+    }
+}
+
+// ============================================================================
+// tiled_matmul_bytes_f32_residual: Tiled GEMM + residual with byte-encoded F32
+//
+// C[m,n] = A[M,K] * B^T[N,K] + R[m,n]
+// ============================================================================
+
+kernel void tiled_matmul_bytes_f32_residual(
+    device const float* A        [[buffer(0)]],
+    device const uchar* B_bytes  [[buffer(1)]],
+    device float*       C        [[buffer(2)]],
+    constant uint&      M        [[buffer(3)]],
+    constant uint&      N        [[buffer(4)]],
+    constant uint&      K        [[buffer(5)]],
+    device const float* R        [[buffer(6)]],
+    uint2 tg_pos                 [[threadgroup_position_in_grid]],
+    ushort tiitg                 [[thread_index_in_threadgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]])
+{
+    device const float* B = (device const float*)B_bytes;
+
+    threadgroup half shmem[2048];
+    threadgroup half* sa = shmem;
+    threadgroup half* sb = shmem + TILE_M * TILE_K;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_k_tiles = (K + TILE_K - 1) / TILE_K;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K;
+
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 3;
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sa_ptr = sa + row * TILE_K + k_start;
+
+            if (gm < M && gk + 7 < K) {
+                device const float4* a_ptr = (device const float4*)(A + gm * K + gk);
+                float4 v0 = a_ptr[0];
+                float4 v1 = a_ptr[1];
+                sa_ptr[0] = (half)v0.x; sa_ptr[1] = (half)v0.y;
+                sa_ptr[2] = (half)v0.z; sa_ptr[3] = (half)v0.w;
+                sa_ptr[4] = (half)v1.x; sa_ptr[5] = (half)v1.y;
+                sa_ptr[6] = (half)v1.z; sa_ptr[7] = (half)v1.w;
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    uint gk_i = gk + i;
+                    sa_ptr[i] = (gm < M && gk_i < K) ? (half)A[gm * K + gk_i] : (half)0.0h;
+                }
+            }
+        }
+
+        for (ushort idx = tiitg; idx < TILE_N * TILE_K; idx += TG_SIZE) {
+            ushort n_local = idx / TILE_K;
+            ushort k_local = idx % TILE_K;
+            uint gn = tile_n_start + n_local;
+            uint gk = k_base + k_local;
+            sb[n_local * TILE_K + k_local] = (gn < N && gk < K) ? (half)B[gn * K + gk] : (half)0.0h;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K + ks, TILE_K);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K + ks, TILE_K);
+
+            simdgroup_half8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    {
+        threadgroup float* sc = (threadgroup float*)shmem;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ushort lane = tiitg % 32;
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            if (gm < M && gn < N)
+                C[gm * N + gn] = my_sc[local_m * 16 + local_n] + R[gm * N + gn];
+        }
+    }
+}
+// ============================================================================
+// tiled_matmul_f16: Tiled GEMM with F16 (half-precision) weights
+//
+// Y[M,N] = X[M,K] * W^T[N,K]    (W stored row-major as [N,K] in half)
+//
+// Same as tiled_matmul_bytes_f32 but B is a native half buffer.
+// Each weight is a 2-byte IEEE 754 half-precision float -- no block structure,
+// no scale factors. Simpler than Q8_0 (no dequantization needed).
+// Uses simdgroup MMA with half-precision threadgroup tiles.
+// ============================================================================
+
+kernel void tiled_matmul_f16(
+    device const half*  W        [[buffer(0)]],   // [N, K] weights (half)
+    device const float* X        [[buffer(1)]],   // [M, K] input batch (float)
+    device float*       Y        [[buffer(2)]],   // [M, N] output (float)
+    constant uint&      M        [[buffer(3)]],
+    constant uint&      N        [[buffer(4)]],
+    constant uint&      K        [[buffer(5)]],
+    uint2 tg_pos                 [[threadgroup_position_in_grid]],
+    ushort tiitg                 [[thread_index_in_threadgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half shmem[2048];
+    threadgroup half* sa = shmem;
+    threadgroup half* sb = shmem + TILE_M * TILE_K;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_k_tiles = (K + TILE_K - 1) / TILE_K;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K;
+
+        // Load A tile (X): float -> half conversion
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 3;
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sa_ptr = sa + row * TILE_K + k_start;
+
+            if (gm < M && gk + 7 < K) {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                sa_ptr[0] = (half)v0.x; sa_ptr[1] = (half)v0.y;
+                sa_ptr[2] = (half)v0.z; sa_ptr[3] = (half)v0.w;
+                sa_ptr[4] = (half)v1.x; sa_ptr[5] = (half)v1.y;
+                sa_ptr[6] = (half)v1.z; sa_ptr[7] = (half)v1.w;
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    uint gk_i = gk + i;
+                    sa_ptr[i] = (gm < M && gk_i < K) ? (half)X[gm * K + gk_i] : (half)0.0h;
+                }
+            }
+        }
+
+        // Load B tile (W): native half reads -- no dequantization needed
+        // Vectorized: 128 threads load 32x32 = 1024 halfs, ~8 per thread
+        {
+            ushort row = tiitg >> 2;           // 0..31
+            ushort col_group = tiitg & 3;      // 0..3
+            ushort k_start = col_group << 3;   // col_group * 8
+
+            uint gn = tile_n_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sb_ptr = sb + row * TILE_K + k_start;
+
+            if (gn < N && gk + 7 < K) {
+                // Fast path: 8 consecutive halfs via half4 vectorized loads
+                device const half4* w_ptr = (device const half4*)(W + gn * K + gk);
+                half4 h0 = w_ptr[0];
+                half4 h1 = w_ptr[1];
+                sb_ptr[0] = h0.x; sb_ptr[1] = h0.y;
+                sb_ptr[2] = h0.z; sb_ptr[3] = h0.w;
+                sb_ptr[4] = h1.x; sb_ptr[5] = h1.y;
+                sb_ptr[6] = h1.z; sb_ptr[7] = h1.w;
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    uint gk_i = gk + i;
+                    sb_ptr[i] = (gn < N && gk_i < K) ? W[gn * K + gk_i] : (half)0.0h;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K + ks, TILE_K);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K + ks, TILE_K);
+
+            simdgroup_half8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    if (sg_m_base + 16 <= M && sg_n_base + 16 <= N) {
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], Y + (sg_m_base + i * 8) * N + (sg_n_base + j * 8), N);
+    } else {
+        threadgroup float* sc = (threadgroup float*)shmem;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ushort lane = tiitg % 32;
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            if (gm < M && gn < N)
+                Y[gm * N + gn] = my_sc[local_m * 16 + local_n];
+        }
+    }
+}
+
+// ============================================================================
+// tiled_matmul_f16_residual: Tiled GEMM with F16 weights + residual add
+//
+// Y[m,n] = X[M,K] * W^T[N,K] + R[m,n]
+//
+// Same as tiled_matmul_f16 but fuses residual addition at writeback.
+// Eliminates a separate add_residual dispatch + encoder barrier per layer.
+// ============================================================================
+
+kernel void tiled_matmul_f16_residual(
+    device const half*  W        [[buffer(0)]],   // [N, K] weights (half)
+    device const float* X        [[buffer(1)]],   // [M, K] input batch (float)
+    device float*       Y        [[buffer(2)]],   // [M, N] output (float)
+    constant uint&      M        [[buffer(3)]],
+    constant uint&      N        [[buffer(4)]],
+    constant uint&      K        [[buffer(5)]],
+    device const float* R        [[buffer(6)]],   // [M, N] residual to add
+    uint2 tg_pos                 [[threadgroup_position_in_grid]],
+    ushort tiitg                 [[thread_index_in_threadgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half shmem[2048];
+    threadgroup half* sa = shmem;
+    threadgroup half* sb = shmem + TILE_M * TILE_K;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_k_tiles = (K + TILE_K - 1) / TILE_K;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K;
+
+        // Load A tile (X): float -> half conversion
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 3;
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sa_ptr = sa + row * TILE_K + k_start;
+
+            if (gm < M && gk + 7 < K) {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                sa_ptr[0] = (half)v0.x; sa_ptr[1] = (half)v0.y;
+                sa_ptr[2] = (half)v0.z; sa_ptr[3] = (half)v0.w;
+                sa_ptr[4] = (half)v1.x; sa_ptr[5] = (half)v1.y;
+                sa_ptr[6] = (half)v1.z; sa_ptr[7] = (half)v1.w;
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    uint gk_i = gk + i;
+                    sa_ptr[i] = (gm < M && gk_i < K) ? (half)X[gm * K + gk_i] : (half)0.0h;
+                }
+            }
+        }
+
+        // Load B tile (W): native half reads
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 3;
+
+            uint gn = tile_n_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sb_ptr = sb + row * TILE_K + k_start;
+
+            if (gn < N && gk + 7 < K) {
+                device const half4* w_ptr = (device const half4*)(W + gn * K + gk);
+                half4 h0 = w_ptr[0];
+                half4 h1 = w_ptr[1];
+                sb_ptr[0] = h0.x; sb_ptr[1] = h0.y;
+                sb_ptr[2] = h0.z; sb_ptr[3] = h0.w;
+                sb_ptr[4] = h1.x; sb_ptr[5] = h1.y;
+                sb_ptr[6] = h1.z; sb_ptr[7] = h1.w;
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    uint gk_i = gk + i;
+                    sb_ptr[i] = (gn < N && gk_i < K) ? W[gn * K + gk_i] : (half)0.0h;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K + ks, TILE_K);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K + ks, TILE_K);
+
+            simdgroup_half8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store results with residual add: Y[m,n] = GEMM[m,n] + R[m,n]
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    {
+        threadgroup float* sc = (threadgroup float*)shmem;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ushort lane = tiitg % 32;
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            if (gm < M && gn < N)
+                Y[gm * N + gn] = my_sc[local_m * 16 + local_n] + R[gm * N + gn];
+        }
+    }
+}
+
+// ============================================================================
+// tiled_matmul_f16_k64: TILE_K=64 variant for F16 — fewer barriers
+//
+// Y[M,N] = X[M,K] * W^T[N,K]    (W stored row-major as [N,K] in half)
+//
+// Processes 64 elements per K-tile iteration instead of 32, halving the
+// outer loop count and threadgroup barriers (from K/32 to K/64).
+//
+// Shared memory: sa[32*64] + sb[32*64] = 4096 halfs = 8192 bytes
+//
+// A-tile loading: 128 threads, 32 rows x 4 threads/row, each loads 16 elems.
+// B-tile loading: 128 threads, 32 rows x 4 threads/row, each loads 16 halfs.
+// No dequantization needed — native half reads.
+//
+// Uses FC_BC function constants for aligned variant optimization.
+// ============================================================================
+
+kernel void tiled_matmul_f16_k64(
+    device const half*  W        [[buffer(0)]],   // [N, K] weights (half)
+    device const float* X        [[buffer(1)]],   // [M, K] input batch (float)
+    device float*       Y        [[buffer(2)]],   // [M, N] output (float)
+    constant uint&      M        [[buffer(3)]],
+    constant uint&      N        [[buffer(4)]],
+    constant uint&      K        [[buffer(5)]],
+    uint2 tg_pos                 [[threadgroup_position_in_grid]],
+    ushort tiitg                 [[thread_index_in_threadgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half shmem_f16_k64[4096];  // sa[32*64] + sb[32*64]
+    threadgroup half* sa = shmem_f16_k64;
+    threadgroup half* sb = shmem_f16_k64 + TILE_M * TILE_K_64;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_k_tiles = (K + TILE_K_64 - 1) / TILE_K_64;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K_64;
+
+        // Load A tile (X): 32 rows x 64 cols, float -> half conversion
+        // 128 threads: 32 rows x 4 threads/row, each loads 16 elements
+        {
+            ushort row = tiitg >> 2;           // 0..31
+            ushort col_group = tiitg & 3;      // 0..3
+            ushort k_start = col_group << 4;   // col_group * 16
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sa_ptr = sa + row * TILE_K_64 + k_start;
+
+            if (FC_BC_M || FC_BC_K) {
+                if (gm < M && gk + 15 < K) {
+                    device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                    float4 v0 = x_ptr[0];
+                    float4 v1 = x_ptr[1];
+                    float4 v2 = x_ptr[2];
+                    float4 v3 = x_ptr[3];
+                    sa_ptr[0]  = (half)v0.x; sa_ptr[1]  = (half)v0.y;
+                    sa_ptr[2]  = (half)v0.z; sa_ptr[3]  = (half)v0.w;
+                    sa_ptr[4]  = (half)v1.x; sa_ptr[5]  = (half)v1.y;
+                    sa_ptr[6]  = (half)v1.z; sa_ptr[7]  = (half)v1.w;
+                    sa_ptr[8]  = (half)v2.x; sa_ptr[9]  = (half)v2.y;
+                    sa_ptr[10] = (half)v2.z; sa_ptr[11] = (half)v2.w;
+                    sa_ptr[12] = (half)v3.x; sa_ptr[13] = (half)v3.y;
+                    sa_ptr[14] = (half)v3.z; sa_ptr[15] = (half)v3.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sa_ptr[i] = (gm < M && gk_i < K) ? (half)X[gm * K + gk_i] : (half)0.0h;
+                    }
+                }
+            } else {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                float4 v2 = x_ptr[2];
+                float4 v3 = x_ptr[3];
+                sa_ptr[0]  = (half)v0.x; sa_ptr[1]  = (half)v0.y;
+                sa_ptr[2]  = (half)v0.z; sa_ptr[3]  = (half)v0.w;
+                sa_ptr[4]  = (half)v1.x; sa_ptr[5]  = (half)v1.y;
+                sa_ptr[6]  = (half)v1.z; sa_ptr[7]  = (half)v1.w;
+                sa_ptr[8]  = (half)v2.x; sa_ptr[9]  = (half)v2.y;
+                sa_ptr[10] = (half)v2.z; sa_ptr[11] = (half)v2.w;
+                sa_ptr[12] = (half)v3.x; sa_ptr[13] = (half)v3.y;
+                sa_ptr[14] = (half)v3.z; sa_ptr[15] = (half)v3.w;
+            }
+        }
+
+        // Load B tile (W): 32 rows x 64 cols, native half reads
+        // 128 threads: 32 rows x 4 threads/row, each loads 16 halfs
+        {
+            ushort row = tiitg >> 2;           // 0..31
+            ushort col_group = tiitg & 3;      // 0..3
+            ushort k_start = col_group << 4;   // col_group * 16
+
+            uint gn = tile_n_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sb_ptr = sb + row * TILE_K_64 + k_start;
+
+            if (FC_BC_N || FC_BC_K) {
+                if (gn < N && gk + 15 < K) {
+                    device const half4* w_ptr = (device const half4*)(W + gn * K + gk);
+                    half4 h0 = w_ptr[0];
+                    half4 h1 = w_ptr[1];
+                    half4 h2 = w_ptr[2];
+                    half4 h3 = w_ptr[3];
+                    sb_ptr[0]  = h0.x; sb_ptr[1]  = h0.y;
+                    sb_ptr[2]  = h0.z; sb_ptr[3]  = h0.w;
+                    sb_ptr[4]  = h1.x; sb_ptr[5]  = h1.y;
+                    sb_ptr[6]  = h1.z; sb_ptr[7]  = h1.w;
+                    sb_ptr[8]  = h2.x; sb_ptr[9]  = h2.y;
+                    sb_ptr[10] = h2.z; sb_ptr[11] = h2.w;
+                    sb_ptr[12] = h3.x; sb_ptr[13] = h3.y;
+                    sb_ptr[14] = h3.z; sb_ptr[15] = h3.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sb_ptr[i] = (gn < N && gk_i < K) ? W[gn * K + gk_i] : (half)0.0h;
+                    }
+                }
+            } else {
+                device const half4* w_ptr = (device const half4*)(W + gn * K + gk);
+                half4 h0 = w_ptr[0];
+                half4 h1 = w_ptr[1];
+                half4 h2 = w_ptr[2];
+                half4 h3 = w_ptr[3];
+                sb_ptr[0]  = h0.x; sb_ptr[1]  = h0.y;
+                sb_ptr[2]  = h0.z; sb_ptr[3]  = h0.w;
+                sb_ptr[4]  = h1.x; sb_ptr[5]  = h1.y;
+                sb_ptr[6]  = h1.z; sb_ptr[7]  = h1.w;
+                sb_ptr[8]  = h2.x; sb_ptr[9]  = h2.y;
+                sb_ptr[10] = h2.z; sb_ptr[11] = h2.w;
+                sb_ptr[12] = h3.x; sb_ptr[13] = h3.y;
+                sb_ptr[14] = h3.z; sb_ptr[15] = h3.w;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // MMA: 8 iterations (TILE_K_64=64, step by 8)
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K_64; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K_64 + ks, TILE_K_64);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K_64 + ks, TILE_K_64);
+
+            simdgroup_half8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store results
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    if (FC_BC_M || FC_BC_N) {
+        if (sg_m_base + 16 <= M && sg_n_base + 16 <= N) {
+            FOR_UNROLL (ushort i = 0; i < 2; i++)
+                FOR_UNROLL (ushort j = 0; j < 2; j++)
+                    simdgroup_store(mc[i][j], Y + (sg_m_base + i * 8) * N + (sg_n_base + j * 8), N);
+        } else {
+            threadgroup float* sc = (threadgroup float*)shmem_f16_k64;
+            threadgroup float* my_sc = sc + sgitg * 256;
+            FOR_UNROLL (ushort i = 0; i < 2; i++)
+                FOR_UNROLL (ushort j = 0; j < 2; j++)
+                    simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            ushort lane = tiitg % 32;
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                if (gm < M && gn < N) {
+                    Y[gm * N + gn] = my_sc[local_m * 16 + local_n];
+                }
+            }
+        }
+    } else {
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], Y + (sg_m_base + i * 8) * N + (sg_n_base + j * 8), N);
+    }
+}
+
+// ============================================================================
+// tiled_matmul_f16_k64_residual: TILE_K=64 variant for F16 + residual add
+//
+// Y[m,n] = X[M,K] * W^T[N,K] + R[m,n]
+//
+// Same as tiled_matmul_f16_k64 but fuses residual addition at writeback.
+// Eliminates a separate add_residual dispatch + encoder barrier per layer.
+// ============================================================================
+
+kernel void tiled_matmul_f16_k64_residual(
+    device const half*  W        [[buffer(0)]],   // [N, K] weights (half)
+    device const float* X        [[buffer(1)]],   // [M, K] input batch (float)
+    device float*       Y        [[buffer(2)]],   // [M, N] output (float)
+    constant uint&      M        [[buffer(3)]],
+    constant uint&      N        [[buffer(4)]],
+    constant uint&      K        [[buffer(5)]],
+    device const float* R        [[buffer(6)]],   // [M, N] residual to add
+    uint2 tg_pos                 [[threadgroup_position_in_grid]],
+    ushort tiitg                 [[thread_index_in_threadgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half shmem_f16_k64r[4096];  // sa[32*64] + sb[32*64]
+    threadgroup half* sa = shmem_f16_k64r;
+    threadgroup half* sb = shmem_f16_k64r + TILE_M * TILE_K_64;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_k_tiles = (K + TILE_K_64 - 1) / TILE_K_64;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K_64;
+
+        // Load A tile (X): 32 rows x 64 cols, float -> half conversion
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 4;
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sa_ptr = sa + row * TILE_K_64 + k_start;
+
+            if (FC_BC_M || FC_BC_K) {
+                if (gm < M && gk + 15 < K) {
+                    device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                    float4 v0 = x_ptr[0];
+                    float4 v1 = x_ptr[1];
+                    float4 v2 = x_ptr[2];
+                    float4 v3 = x_ptr[3];
+                    sa_ptr[0]  = (half)v0.x; sa_ptr[1]  = (half)v0.y;
+                    sa_ptr[2]  = (half)v0.z; sa_ptr[3]  = (half)v0.w;
+                    sa_ptr[4]  = (half)v1.x; sa_ptr[5]  = (half)v1.y;
+                    sa_ptr[6]  = (half)v1.z; sa_ptr[7]  = (half)v1.w;
+                    sa_ptr[8]  = (half)v2.x; sa_ptr[9]  = (half)v2.y;
+                    sa_ptr[10] = (half)v2.z; sa_ptr[11] = (half)v2.w;
+                    sa_ptr[12] = (half)v3.x; sa_ptr[13] = (half)v3.y;
+                    sa_ptr[14] = (half)v3.z; sa_ptr[15] = (half)v3.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sa_ptr[i] = (gm < M && gk_i < K) ? (half)X[gm * K + gk_i] : (half)0.0h;
+                    }
+                }
+            } else {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                float4 v2 = x_ptr[2];
+                float4 v3 = x_ptr[3];
+                sa_ptr[0]  = (half)v0.x; sa_ptr[1]  = (half)v0.y;
+                sa_ptr[2]  = (half)v0.z; sa_ptr[3]  = (half)v0.w;
+                sa_ptr[4]  = (half)v1.x; sa_ptr[5]  = (half)v1.y;
+                sa_ptr[6]  = (half)v1.z; sa_ptr[7]  = (half)v1.w;
+                sa_ptr[8]  = (half)v2.x; sa_ptr[9]  = (half)v2.y;
+                sa_ptr[10] = (half)v2.z; sa_ptr[11] = (half)v2.w;
+                sa_ptr[12] = (half)v3.x; sa_ptr[13] = (half)v3.y;
+                sa_ptr[14] = (half)v3.z; sa_ptr[15] = (half)v3.w;
+            }
+        }
+
+        // Load B tile (W): 32 rows x 64 cols, native half reads
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 4;
+
+            uint gn = tile_n_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sb_ptr = sb + row * TILE_K_64 + k_start;
+
+            if (FC_BC_N || FC_BC_K) {
+                if (gn < N && gk + 15 < K) {
+                    device const half4* w_ptr = (device const half4*)(W + gn * K + gk);
+                    half4 h0 = w_ptr[0];
+                    half4 h1 = w_ptr[1];
+                    half4 h2 = w_ptr[2];
+                    half4 h3 = w_ptr[3];
+                    sb_ptr[0]  = h0.x; sb_ptr[1]  = h0.y;
+                    sb_ptr[2]  = h0.z; sb_ptr[3]  = h0.w;
+                    sb_ptr[4]  = h1.x; sb_ptr[5]  = h1.y;
+                    sb_ptr[6]  = h1.z; sb_ptr[7]  = h1.w;
+                    sb_ptr[8]  = h2.x; sb_ptr[9]  = h2.y;
+                    sb_ptr[10] = h2.z; sb_ptr[11] = h2.w;
+                    sb_ptr[12] = h3.x; sb_ptr[13] = h3.y;
+                    sb_ptr[14] = h3.z; sb_ptr[15] = h3.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sb_ptr[i] = (gn < N && gk_i < K) ? W[gn * K + gk_i] : (half)0.0h;
+                    }
+                }
+            } else {
+                device const half4* w_ptr = (device const half4*)(W + gn * K + gk);
+                half4 h0 = w_ptr[0];
+                half4 h1 = w_ptr[1];
+                half4 h2 = w_ptr[2];
+                half4 h3 = w_ptr[3];
+                sb_ptr[0]  = h0.x; sb_ptr[1]  = h0.y;
+                sb_ptr[2]  = h0.z; sb_ptr[3]  = h0.w;
+                sb_ptr[4]  = h1.x; sb_ptr[5]  = h1.y;
+                sb_ptr[6]  = h1.z; sb_ptr[7]  = h1.w;
+                sb_ptr[8]  = h2.x; sb_ptr[9]  = h2.y;
+                sb_ptr[10] = h2.z; sb_ptr[11] = h2.w;
+                sb_ptr[12] = h3.x; sb_ptr[13] = h3.y;
+                sb_ptr[14] = h3.z; sb_ptr[15] = h3.w;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // MMA: 8 iterations (TILE_K_64=64, step by 8)
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K_64; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K_64 + ks, TILE_K_64);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K_64 + ks, TILE_K_64);
+
+            simdgroup_half8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store results with residual add: Y[m,n] = GEMM[m,n] + R[m,n]
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    {
+        threadgroup float* sc = (threadgroup float*)shmem_f16_k64r;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ushort lane = tiitg % 32;
+        if (FC_BC_M || FC_BC_N) {
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                if (gm < M && gn < N) {
+                    Y[gm * N + gn] = my_sc[local_m * 16 + local_n] + R[gm * N + gn];
+                }
+            }
+        } else {
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                Y[gm * N + gn] = my_sc[local_m * 16 + local_n] + R[gm * N + gn];
+            }
+        }
+    }
+}
+
+
+// ============================================================================
+// matmul_bytes_f32_residual: Mat-vec with byte-encoded F32 weights + residual add
+//
+// out[row] = dot(W_row, x) + residual[row]
+// Used in decode path for non-Q8_0 Wo and Down projections.
+// ============================================================================
+

@@ -1,5 +1,5 @@
 // GatedDeltaNet (Linear Attention) kernel tests
-// Extracted from compute_metal.rs for modularity.
+// Extracted from mod.rs for modularity.
 
 use crate::metal::*;
 use crate::metal::shaders::METAL_SHADER_SOURCE;

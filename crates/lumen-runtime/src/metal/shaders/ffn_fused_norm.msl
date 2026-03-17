@@ -1,0 +1,790 @@
+// Single-pass: computes dot(gate/up, x * norm_w) and sum(x^2) simultaneously.
+// After loop, computes rms_scale, multiplies gate/up sums by scale, applies SwiGLU.
+kernel void rmsnorm_ffn_fused_gate_up_swiglu_q8_0_deferred(
+    device const uchar* w_gate_q8   [[buffer(0)]],   // gate weights Q8_0 [inter_dim, hidden_dim]
+    device const float* x           [[buffer(1)]],   // input [hidden_dim] (NOT normed)
+    device float*       out         [[buffer(2)]],   // output [inter_dim] (SwiGLU result)
+    constant uint&      in_dim      [[buffer(3)]],   // hidden_dim
+    constant uint&      out_dim     [[buffer(4)]],   // inter_dim
+    device const uchar* w_up_q8     [[buffer(5)]],   // up weights Q8_0 [inter_dim, hidden_dim]
+    device const uchar* norm_w      [[buffer(6)]],   // RMSNorm weight [hidden_dim] as f32 bytes
+    constant float&     eps         [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint row = tgpig;
+    if (row >= out_dim) return;
+
+    device const float* norm_weight = (device const float*)norm_w;
+
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = in_dim >> 5;
+    uint row_bytes = num_blocks * Q8_BLOCK_SIZE;
+
+    uint ix = tiisg / 4;
+    uint il = tiisg % 4;
+
+    device const uchar* gate_row_ptr = w_gate_q8 + row * row_bytes;
+    device const uchar* up_row_ptr   = w_up_q8   + row * row_bytes;
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+    float ss       = 0.0f;
+
+    // Single-pass: accumulate gate/up dot products (unscaled) AND sum(x^2)
+    for (uint ib = sgitg * 8 + ix; ib < num_blocks; ib += 32) {
+        uint x_base = ib * 32 + il * 8;
+        float yl[8];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) {
+            float xi = x[x_base + i];
+            ss += xi * xi;
+            yl[i] = xi * norm_weight[x_base + i];
+        }
+
+        device const uchar* gate_bp = gate_row_ptr + ib * Q8_BLOCK_SIZE;
+        half gate_scale = as_type<half>(*(device const ushort*)gate_bp);
+        device const char* gate_qs = (device const char*)(gate_bp + 2) + il * 8;
+        float gate_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) {
+            gate_dot += float(gate_qs[i]) * yl[i];
+        }
+        gate_sum += gate_dot * float(gate_scale);
+
+        device const uchar* up_bp = up_row_ptr + ib * Q8_BLOCK_SIZE;
+        half up_scale = as_type<half>(*(device const ushort*)up_bp);
+        device const char* up_qs = (device const char*)(up_bp + 2) + il * 8;
+        float up_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) {
+            up_dot += float(up_qs[i]) * yl[i];
+        }
+        up_sum += up_dot * float(up_scale);
+    }
+
+    // Reduce all three quantities
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+    ss       = simd_sum(ss);
+
+    threadgroup float shmem[12];  // [0..3] gate, [4..7] up, [8..11] ss
+
+    if (tiisg == 0) {
+        shmem[sgitg]     = gate_sum;
+        shmem[sgitg + 4] = up_sum;
+        shmem[sgitg + 8] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg == 0) {
+        float g = shmem[0] + shmem[1] + shmem[2] + shmem[3];
+        float u = shmem[4] + shmem[5] + shmem[6] + shmem[7];
+        float total_ss = shmem[8] + shmem[9] + shmem[10] + shmem[11];
+        float rms_scale = rsqrt(total_ss / float(in_dim) + eps);
+        // Apply scale to both gate and up sums
+        g *= rms_scale;
+        u *= rms_scale;
+        float sigmoid = 1.0f / (1.0f + exp(-g));
+        out[row] = g * sigmoid * u;
+    }
+}
+
+// ============================================================================
+// rmsnorm_ffn_fused_gate_up_swiglu_q8_0_8row: 8-row fused RMSNorm + FFN
+//
+// Same computation as rmsnorm_ffn_fused_gate_up_swiglu_q8_0_deferred but uses
+// the 8-row independent SG pattern: 8 SGs (256 threads), each SG independently
+// owns 1 output row. Zero threadgroup barriers. Zero shared memory for reduction.
+//
+// Key insight: Each SG independently walks the ENTIRE x-vector for its row's
+// gate+up dot products. Since every SG reads all of x, each SG also computes
+// the complete sum-of-squares for RMSNorm -- no cross-SG communication needed.
+//
+// Benefits vs deferred (1 row/TG, 4 SGs cooperating):
+// - Zero threadgroup barriers (deferred needs 2)
+// - Zero shared memory for reduction
+// - 8x fewer threadgroups (1024 vs 8192 for inter_dim=8192)
+// - Better x-vector cache reuse (8 SGs read same x from L1/L2)
+//
+// Trade-off: Each SG reads x independently (8x bandwidth), but for small
+// hidden_dim (2048 = 8 KB), x fits in L1 cache and subsequent SG reads hit cache.
+//
+// Dispatch: ceil(inter_dim/8) threadgroups, 256 threads each (8 simdgroups)
+// ============================================================================
+
+kernel void rmsnorm_ffn_fused_gate_up_swiglu_q8_0_8row(
+    device const uchar* w_gate_q8   [[buffer(0)]],   // gate weights Q8_0 [inter_dim, hidden_dim]
+    device const float* x           [[buffer(1)]],   // input [hidden_dim] (NOT normed)
+    device float*       out         [[buffer(2)]],   // output [inter_dim] (SwiGLU result)
+    constant uint&      in_dim      [[buffer(3)]],   // hidden_dim
+    constant uint&      out_dim     [[buffer(4)]],   // inter_dim
+    device const uchar* w_up_q8     [[buffer(5)]],   // up weights Q8_0 [inter_dim, hidden_dim]
+    device const uchar* norm_w      [[buffer(6)]],   // RMSNorm weight [hidden_dim] as f32 bytes
+    constant float&     eps         [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    // Each SG independently owns 1 output row. 8 SGs per TG = 8 rows per TG.
+    // Uses deferred reduction (accumulate locally, one simd_sum at end).
+    // Zero threadgroup barriers, zero shared memory.
+    uint row = tgpig * 8 + sgitg;
+    if (row >= out_dim) return;
+
+    device const float* norm_weight = (device const float*)norm_w;
+
+    const uint NQ = 8;
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = in_dim >> 5;
+    uint row_bytes = num_blocks * Q8_BLOCK_SIZE;
+
+    // Thread mapping within SG (same as deferred pattern)
+    uint ix = tiisg / 4;   // 0..7: which block in stride of 8
+    uint il = tiisg % 4;   // 0..3: which 8-byte quarter within 32-byte data
+
+    device const uchar* gate_row_ptr = w_gate_q8 + row * row_bytes;
+    device const uchar* up_row_ptr   = w_up_q8   + row * row_bytes;
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+    float ss       = 0.0f;
+
+    // Each SG independently processes ALL blocks for its row.
+    // Stride = NQ = 8 blocks per iteration (single SG, no cross-SG stride).
+    for (uint ib = ix; ib < num_blocks; ib += NQ) {
+        uint x_base = ib * 32 + il * 8;
+        float yl[8];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) {
+            float xi = x[x_base + i];
+            ss += xi * xi;
+            yl[i] = xi * norm_weight[x_base + i];
+        }
+
+        // Gate weights
+        device const uchar* gate_bp = gate_row_ptr + ib * Q8_BLOCK_SIZE;
+        half gate_scale = as_type<half>(*(device const ushort*)gate_bp);
+        device const char* gate_qs = (device const char*)(gate_bp + 2) + il * 8;
+        float gate_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) {
+            gate_dot += float(gate_qs[i]) * yl[i];
+        }
+        gate_sum += gate_dot * float(gate_scale);
+
+        // Up weights
+        device const uchar* up_bp = up_row_ptr + ib * Q8_BLOCK_SIZE;
+        half up_scale = as_type<half>(*(device const ushort*)up_bp);
+        device const char* up_qs = (device const char*)(up_bp + 2) + il * 8;
+        float up_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) {
+            up_dot += float(up_qs[i]) * yl[i];
+        }
+        up_sum += up_dot * float(up_scale);
+    }
+
+    // Final reduction: ONE simd_sum each (deferred pattern payoff)
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+    ss       = simd_sum(ss);
+
+    // Apply RMSNorm scale + SwiGLU
+    if (tiisg == 0) {
+        float rms_scale = rsqrt(ss / float(in_dim) + eps);
+        float g = gate_sum * rms_scale;
+        float u = up_sum * rms_scale;
+        float sigmoid = 1.0f / (1.0f + exp(-g));
+        out[row] = g * sigmoid * u;
+    }
+}
+
+// ============================================================================
+// Fused RMSNorm + Q4_0 matvec NR2
+//
+// Same single-pass fusion as rmsnorm_dequant_matmul_q8_0_deferred_nr2:
+//   dot(W, norm_x) = scale * dot(W, x * norm_w)
+//   where scale = rsqrt(sum(x^2)/dim + eps)
+//
+// Q4_0 block: 18 bytes = 2B f16 scale + 16B packed nibbles (32 elements).
+// De-interleaved: byte j has lo -> element j, hi -> element j+16.
+// Thread processes 4 bytes = 8 elements (4 lo + 4 hi).
+//
+// Dispatch: threadgroups = ceil(out_dim/2), threads_per_threadgroup = 128
+// ============================================================================
+
+kernel void rmsnorm_dequant_matmul_q4_0_deferred_nr2(
+    device const uchar* weights   [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device float*       out       [[buffer(2)]],
+    constant uint&      in_dim    [[buffer(3)]],
+    constant uint&      out_dim   [[buffer(4)]],
+    device const uchar* norm_w    [[buffer(5)]],    // RMSNorm weight [in_dim] as f32 bytes
+    constant float&     eps       [[buffer(6)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    // Single-pass fused RMSNorm + Q4_0 matvec NR2.
+    // Computes dot(W, x * norm_w) AND sum(x^2) in the SAME loop.
+
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q4_BS = 18;  // Q4_0 block size: 2B scale + 16B nibbles
+
+    device const float* norm_weight = (device const float*)norm_w;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q4_BS;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f };
+    float ss = 0.0f;  // sum of squares for RMSNorm
+
+    device const float* yb_lo = x + ib0 * 32 + il * 4;
+    device const float* yb_hi = x + ib0 * 32 + il * 4 + 16;
+    device const float* nwb_lo = norm_weight + ib0 * 32 + il * 4;
+    device const float* nwb_hi = norm_weight + ib0 * 32 + il * 4 + 16;
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        // Load x * norm_w for lo and hi nibble positions, accumulate x^2
+        float yl_lo[4], yl_hi[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            float xi_lo = yb_lo[i];
+            float xi_hi = yb_hi[i];
+            ss += xi_lo * xi_lo + xi_hi * xi_hi;
+            yl_lo[i] = xi_lo * nwb_lo[i];
+            yl_hi[i] = xi_hi * nwb_hi[i];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q4_BS;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const uchar* qdata = (device const uchar*)(bp + 2) + il * 4;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+                uchar byte_val = qdata[i];
+                float lo = float(byte_val & 0x0F) - 8.0f;
+                float hi = float(byte_val >> 4) - 8.0f;
+                sumq += lo * yl_lo[i] + hi * yl_hi[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb_lo += NSG * NQ * 32;
+        yb_hi += NSG * NQ * 32;
+        nwb_lo += NSG * NQ * 32;
+        nwb_hi += NSG * NQ * 32;
+    }
+
+    // Reduce sum-of-squares across all 128 threads
+    ss = simd_sum(ss);
+
+    threadgroup float shmem[NR0 * NW];
+
+    if (tiisg == 0) {
+        shmem[sgitg] = ss;
+    }
+
+    // Also reduce dot products
+    for (uint row = 0; row < NR0; ++row) {
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Compute RMSNorm scale from reduced sum-of-squares
+    threadgroup float rms_scale_shared;
+    if (sgitg == 0) {
+        float total_ss = (tiisg < NSG) ? shmem[tiisg] : 0.0f;
+        total_ss = simd_sum(total_ss);
+        if (tiisg == 0) {
+            rms_scale_shared = rsqrt(total_ss / float(in_dim) + eps);
+        }
+    }
+
+    // Write dot product partial sums to shmem (reuse space)
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms_scale = rms_scale_shared;
+
+    // Final reduction of dot products, multiply by RMSNorm scale
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            out[r0 + row] = tot * rms_scale;
+        }
+    }
+}
+
+// Fused RMSNorm + Q4_0 matvec + residual NR2.
+// Single-pass: computes dot(W, x * norm_w) and sum(x^2) simultaneously,
+// then applies scale * dot + residual at the end.
+kernel void rmsnorm_dequant_matmul_q4_0_deferred_residual_nr2(
+    device const uchar* weights   [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device float*       out       [[buffer(2)]],
+    constant uint&      in_dim    [[buffer(3)]],
+    device const float* residual  [[buffer(4)]],
+    constant uint&      out_dim   [[buffer(5)]],
+    device const uchar* norm_w    [[buffer(6)]],
+    constant float&     eps       [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q4_BS = 18;  // Q4_0 block size: 2B scale + 16B nibbles
+
+    device const float* norm_weight = (device const float*)norm_w;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q4_BS;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f };
+    float ss = 0.0f;
+
+    device const float* yb_lo = x + ib0 * 32 + il * 4;
+    device const float* yb_hi = x + ib0 * 32 + il * 4 + 16;
+    device const float* nwb_lo = norm_weight + ib0 * 32 + il * 4;
+    device const float* nwb_hi = norm_weight + ib0 * 32 + il * 4 + 16;
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        float yl_lo[4], yl_hi[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            float xi_lo = yb_lo[i];
+            float xi_hi = yb_hi[i];
+            ss += xi_lo * xi_lo + xi_hi * xi_hi;
+            yl_lo[i] = xi_lo * nwb_lo[i];
+            yl_hi[i] = xi_hi * nwb_hi[i];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q4_BS;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const uchar* qdata = (device const uchar*)(bp + 2) + il * 4;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+                uchar byte_val = qdata[i];
+                float lo = float(byte_val & 0x0F) - 8.0f;
+                float hi = float(byte_val >> 4) - 8.0f;
+                sumq += lo * yl_lo[i] + hi * yl_hi[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb_lo += NSG * NQ * 32;
+        yb_hi += NSG * NQ * 32;
+        nwb_lo += NSG * NQ * 32;
+        nwb_hi += NSG * NQ * 32;
+    }
+
+    ss = simd_sum(ss);
+
+    threadgroup float shmem[NR0 * NW];
+
+    if (tiisg == 0) {
+        shmem[sgitg] = ss;
+    }
+
+    for (uint row = 0; row < NR0; ++row) {
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float rms_scale_shared;
+    if (sgitg == 0) {
+        float total_ss = (tiisg < NSG) ? shmem[tiisg] : 0.0f;
+        total_ss = simd_sum(total_ss);
+        if (tiisg == 0) {
+            rms_scale_shared = rsqrt(total_ss / float(in_dim) + eps);
+        }
+    }
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms_scale = rms_scale_shared;
+
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            out[r0 + row] = tot * rms_scale + residual[r0 + row];
+        }
+    }
+}
+
+// ============================================================================
+// Fused RMSNorm + FFN Gate+Up+SwiGLU Q4_0 deferred.
+// Single-pass: computes dot(gate/up, x * norm_w) and sum(x^2) simultaneously.
+// After loop, computes rms_scale, multiplies gate/up sums by scale, applies SwiGLU.
+//
+// 128 threads (4 simdgroups), 1 output row per threadgroup.
+// Q4_0 nibble dequantization for both gate and up weights.
+//
+// Dispatch: inter_dim threadgroups, 128 threads each
+// ============================================================================
+
+kernel void rmsnorm_ffn_fused_gate_up_swiglu_q4_0_deferred(
+    device const uchar* w_gate_q4   [[buffer(0)]],   // gate weights Q4_0 [inter_dim, hidden_dim]
+    device const float* x           [[buffer(1)]],   // input [hidden_dim] (NOT normed)
+    device float*       out         [[buffer(2)]],   // output [inter_dim] (SwiGLU result)
+    constant uint&      in_dim      [[buffer(3)]],   // hidden_dim
+    constant uint&      out_dim     [[buffer(4)]],   // inter_dim
+    device const uchar* w_up_q4     [[buffer(5)]],   // up weights Q4_0 [inter_dim, hidden_dim]
+    device const uchar* norm_w      [[buffer(6)]],   // RMSNorm weight [hidden_dim] as f32 bytes
+    constant float&     eps         [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint row = tgpig;
+    if (row >= out_dim) return;
+
+    device const float* norm_weight = (device const float*)norm_w;
+
+    const uint Q4_BS = 18;  // Q4_0 block size: 2B scale + 16B nibbles
+    uint num_blocks = in_dim >> 5;
+    uint row_bytes = num_blocks * Q4_BS;
+
+    uint ix = tiisg / 4;
+    uint il = tiisg % 4;
+
+    device const uchar* gate_row_ptr = w_gate_q4 + row * row_bytes;
+    device const uchar* up_row_ptr   = w_up_q4   + row * row_bytes;
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+    float ss       = 0.0f;
+
+    // Single-pass: accumulate gate/up dot products (unscaled) AND sum(x^2)
+    for (uint ib = sgitg * 8 + ix; ib < num_blocks; ib += 32) {
+        uint block_base = ib * 32;
+        float yl_lo[4], yl_hi[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; i++) {
+            float xi_lo = x[block_base + il * 4 + i];
+            float xi_hi = x[block_base + il * 4 + 16 + i];
+            ss += xi_lo * xi_lo + xi_hi * xi_hi;
+            yl_lo[i] = xi_lo * norm_weight[block_base + il * 4 + i];
+            yl_hi[i] = xi_hi * norm_weight[block_base + il * 4 + 16 + i];
+        }
+
+        // Gate weights
+        device const uchar* gate_bp = gate_row_ptr + ib * Q4_BS;
+        float gate_scale = float(as_type<half>(*(device const ushort*)gate_bp));
+        device const uchar* gate_qdata = (device const uchar*)(gate_bp + 2) + il * 4;
+        float gate_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; i++) {
+            uchar byte_val = gate_qdata[i];
+            float lo = float(byte_val & 0x0F) - 8.0f;
+            float hi = float(byte_val >> 4) - 8.0f;
+            gate_dot += lo * yl_lo[i] + hi * yl_hi[i];
+        }
+        gate_sum += gate_dot * gate_scale;
+
+        // Up weights
+        device const uchar* up_bp = up_row_ptr + ib * Q4_BS;
+        float up_scale = float(as_type<half>(*(device const ushort*)up_bp));
+        device const uchar* up_qdata = (device const uchar*)(up_bp + 2) + il * 4;
+        float up_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; i++) {
+            uchar byte_val = up_qdata[i];
+            float lo = float(byte_val & 0x0F) - 8.0f;
+            float hi = float(byte_val >> 4) - 8.0f;
+            up_dot += lo * yl_lo[i] + hi * yl_hi[i];
+        }
+        up_sum += up_dot * up_scale;
+    }
+
+    // Reduce all three quantities
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+    ss       = simd_sum(ss);
+
+    threadgroup float shmem[12];  // [0..3] gate, [4..7] up, [8..11] ss
+
+    if (tiisg == 0) {
+        shmem[sgitg]     = gate_sum;
+        shmem[sgitg + 4] = up_sum;
+        shmem[sgitg + 8] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg == 0) {
+        float g = shmem[0] + shmem[1] + shmem[2] + shmem[3];
+        float u = shmem[4] + shmem[5] + shmem[6] + shmem[7];
+        float total_ss = shmem[8] + shmem[9] + shmem[10] + shmem[11];
+        float rms_scale = rsqrt(total_ss / float(in_dim) + eps);
+        // Apply scale to both gate and up sums
+        g *= rms_scale;
+        u *= rms_scale;
+        float sigmoid = 1.0f / (1.0f + exp(-g));
+        out[row] = g * sigmoid * u;
+    }
+}
+
+// ============================================================================
+// rmsnorm_ffn_fused_gate_up_swiglu_q4_0_8row: 8-row fused RMSNorm + FFN
+//
+// Same computation as rmsnorm_ffn_fused_gate_up_swiglu_q4_0_deferred but uses
+// the 8-row independent SG pattern: 8 SGs (256 threads), each SG independently
+// owns 1 output row. Zero threadgroup barriers. Zero shared memory for reduction.
+//
+// Each SG independently walks the ENTIRE x-vector for its row's gate+up dot
+// products. Since every SG reads all of x, each SG also computes the complete
+// sum-of-squares for RMSNorm -- no cross-SG communication needed.
+//
+// Q4_0 nibble dequantization for both gate and up weights.
+//
+// Dispatch: ceil(inter_dim/8) threadgroups, 256 threads each (8 simdgroups)
+// ============================================================================
+
+kernel void rmsnorm_ffn_fused_gate_up_swiglu_q4_0_8row(
+    device const uchar* w_gate_q4   [[buffer(0)]],   // gate weights Q4_0 [inter_dim, hidden_dim]
+    device const float* x           [[buffer(1)]],   // input [hidden_dim] (NOT normed)
+    device float*       out         [[buffer(2)]],   // output [inter_dim] (SwiGLU result)
+    constant uint&      in_dim      [[buffer(3)]],   // hidden_dim
+    constant uint&      out_dim     [[buffer(4)]],   // inter_dim
+    device const uchar* w_up_q4     [[buffer(5)]],   // up weights Q4_0 [inter_dim, hidden_dim]
+    device const uchar* norm_w      [[buffer(6)]],   // RMSNorm weight [hidden_dim] as f32 bytes
+    constant float&     eps         [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    // Each SG independently owns 1 output row. 8 SGs per TG = 8 rows per TG.
+    // Uses deferred reduction (accumulate locally, one simd_sum at end).
+    // Zero threadgroup barriers, zero shared memory.
+    uint row = tgpig * 8 + sgitg;
+    if (row >= out_dim) return;
+
+    device const float* norm_weight = (device const float*)norm_w;
+
+    const uint NQ = 8;
+    const uint Q4_BS = 18;  // Q4_0 block size: 2B scale + 16B nibbles
+    uint num_blocks = in_dim >> 5;
+    uint row_bytes = num_blocks * Q4_BS;
+
+    // Thread mapping within SG (same as deferred pattern)
+    uint ix = tiisg / 4;   // 0..7: which block in stride of 8
+    uint il = tiisg % 4;   // 0..3: which 4-byte quarter within 16-byte data
+
+    device const uchar* gate_row_ptr = w_gate_q4 + row * row_bytes;
+    device const uchar* up_row_ptr   = w_up_q4   + row * row_bytes;
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+    float ss       = 0.0f;
+
+    // Each SG independently processes ALL blocks for its row.
+    // Stride = NQ = 8 blocks per iteration (single SG, no cross-SG stride).
+    for (uint ib = ix; ib < num_blocks; ib += NQ) {
+        uint block_base = ib * 32;
+        float yl_lo[4], yl_hi[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; i++) {
+            float xi_lo = x[block_base + il * 4 + i];
+            float xi_hi = x[block_base + il * 4 + 16 + i];
+            ss += xi_lo * xi_lo + xi_hi * xi_hi;
+            yl_lo[i] = xi_lo * norm_weight[block_base + il * 4 + i];
+            yl_hi[i] = xi_hi * norm_weight[block_base + il * 4 + 16 + i];
+        }
+
+        // Gate weights
+        device const uchar* gate_bp = gate_row_ptr + ib * Q4_BS;
+        float gate_scale = float(as_type<half>(*(device const ushort*)gate_bp));
+        device const uchar* gate_qdata = (device const uchar*)(gate_bp + 2) + il * 4;
+        float gate_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; i++) {
+            uchar byte_val = gate_qdata[i];
+            float lo = float(byte_val & 0x0F) - 8.0f;
+            float hi = float(byte_val >> 4) - 8.0f;
+            gate_dot += lo * yl_lo[i] + hi * yl_hi[i];
+        }
+        gate_sum += gate_dot * gate_scale;
+
+        // Up weights
+        device const uchar* up_bp = up_row_ptr + ib * Q4_BS;
+        float up_scale = float(as_type<half>(*(device const ushort*)up_bp));
+        device const uchar* up_qdata = (device const uchar*)(up_bp + 2) + il * 4;
+        float up_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; i++) {
+            uchar byte_val = up_qdata[i];
+            float lo = float(byte_val & 0x0F) - 8.0f;
+            float hi = float(byte_val >> 4) - 8.0f;
+            up_dot += lo * yl_lo[i] + hi * yl_hi[i];
+        }
+        up_sum += up_dot * up_scale;
+    }
+
+    // Final reduction: ONE simd_sum each (deferred pattern payoff)
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+    ss       = simd_sum(ss);
+
+    // Apply RMSNorm scale + SwiGLU
+    if (tiisg == 0) {
+        float rms_scale = rsqrt(ss / float(in_dim) + eps);
+        float g = gate_sum * rms_scale;
+        float u = up_sum * rms_scale;
+        float sigmoid = 1.0f / (1.0f + exp(-g));
+        out[row] = g * sigmoid * u;
+    }
+}
+
+// ============================================================================
+// rmsnorm_ffn_fused_gate_up_swiglu_f16_deferred: Fused RMSNorm + F16 FFN
+//
+// Single-pass: accumulates dot(gate, x*norm_w), dot(up, x*norm_w),
+// and sum(x^2) simultaneously, then applies rms_scale + SwiGLU at the end.
+// Saves 1 RMSNorm dispatch + 1 barrier + normed_buf write/read + 2 matvec
+// dispatches + 1 SwiGLU dispatch.
+//
+// F16 weights: dense half-precision, no block structure.
+// Each row of gate/up weights is in_dim contiguous half values.
+//
+// 128 threads (4 simdgroups), 1 output row per threadgroup.
+//
+// Dispatch: inter_dim threadgroups, 128 threads each
+// ============================================================================
+
+kernel void rmsnorm_ffn_fused_gate_up_swiglu_f16_deferred(
+    device const half*  w_gate_f16  [[buffer(0)]],   // gate weights F16 [inter_dim, hidden_dim]
+    device const float* x           [[buffer(1)]],   // input [hidden_dim] (NOT normed)
+    device float*       out         [[buffer(2)]],   // output [inter_dim] (SwiGLU result)
+    constant uint&      in_dim      [[buffer(3)]],   // hidden_dim
+    constant uint&      out_dim     [[buffer(4)]],   // inter_dim
+    device const half*  w_up_f16    [[buffer(5)]],   // up weights F16 [inter_dim, hidden_dim]
+    device const uchar* norm_w      [[buffer(6)]],   // RMSNorm weight [hidden_dim] as f32 bytes
+    constant float&     eps         [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint row = tgpig;
+    if (row >= out_dim) return;
+
+    device const float* norm_weight = (device const float*)norm_w;
+
+    const uint NSG = 4;
+    const uint NW = 32;
+    const uint tid = sgitg * NW + tiisg;
+    const uint total_threads = NSG * NW;  // 128
+
+    device const half* gate_row = w_gate_f16 + row * in_dim;
+    device const half* up_row   = w_up_f16   + row * in_dim;
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+    float ss       = 0.0f;
+
+    // Single-pass: accumulate gate/up dot products (with norm_w) AND sum(x^2)
+    for (uint j = tid; j < in_dim; j += total_threads) {
+        float xi = x[j];
+        ss += xi * xi;
+        float normed_xj = xi * norm_weight[j];
+        gate_sum += float(gate_row[j]) * normed_xj;
+        up_sum   += float(up_row[j])   * normed_xj;
+    }
+
+    // Final reduction: simd_sum within each simdgroup
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+    ss       = simd_sum(ss);
+
+    // Cross-simdgroup reduction via shared memory
+    threadgroup float shmem[12];  // [0..3] gate, [4..7] up, [8..11] ss
+
+    if (tiisg == 0) {
+        shmem[sgitg]     = gate_sum;
+        shmem[sgitg + 4] = up_sum;
+        shmem[sgitg + 8] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg == 0) {
+        float g = shmem[0] + shmem[1] + shmem[2] + shmem[3];
+        float u = shmem[4] + shmem[5] + shmem[6] + shmem[7];
+        float total_ss = shmem[8] + shmem[9] + shmem[10] + shmem[11];
+        float rms_scale = rsqrt(total_ss / float(in_dim) + eps);
+        // Apply scale to both gate and up sums
+        g *= rms_scale;
+        u *= rms_scale;
+        float sigmoid = 1.0f / (1.0f + exp(-g));
+        out[row] = g * sigmoid * u;
+    }
+}
+

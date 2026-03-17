@@ -1,6 +1,6 @@
 //! GatedDeltaNet (linear attention) encode functions for Metal backend.
 //!
-//! Extracted from compute_metal.rs for modularity.
+//! Extracted from mod.rs for modularity.
 //! These are methods on MetalF32Backend that encode GDN-specific GPU dispatch sequences.
 
 use crate::error::RuntimeError;

@@ -1,9 +1,11 @@
 // MoE (Mixture of Experts) kernel and routing tests.
-// Extracted from compute_metal.rs for modularity.
+// Extracted from mod.rs for modularity.
 
 use crate::metal::*;
 use crate::metal::shaders::METAL_SHADER_SOURCE;
 use crate::metal::ffi::MTLSize;
+use crate::compute::ComputeBackend;
+use lumen_format::hyperparams::ModelHyperparams;
 
 /// Test moe_expert_accum kernel correctness (decode path).
 ///
@@ -1935,8 +1937,8 @@ fn test_moe_mixtral_routing_entropy() {
     };
     let stop = crate::engine::StopCondition::MaxTokens(20);
 
-    match engine.generate_with_metal_prefill(
-        &prompt_tokens, &provider, &metal, &stop, &sampling,
+    match engine.generate(
+        &prompt_tokens, &provider, &metal as &dyn ComputeBackend, &stop, &sampling,
     ) {
         Ok(result) => {
             eprintln!("Generated {} tokens: {:?}", result.tokens.len(), result.tokens);

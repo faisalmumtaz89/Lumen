@@ -4,14 +4,25 @@
 //! owns memory and scheduling; the backend provides matrix operations
 //! (matmul, attention, MLP, normalization, sampling).
 
-pub mod naive;
-pub mod simd;
+pub mod cpu_naive;
+pub mod cpu_simd;
 pub mod simd_kernels;
 
-use crate::weight::cache::LayerView;
+use crate::weight::cache::{LayerView, WeightProvider};
 use crate::error::RuntimeError;
-use crate::kv::KvCacheView;
+use crate::kv::{KvCache, KvCacheView};
 use lumen_format::hyperparams::ModelHyperparams;
+use lumen_format::quantization::QuantScheme;
+
+/// What a backend can do. Queried once at init, cached by the engine.
+#[derive(Debug, Clone)]
+pub struct BackendCaps {
+    pub batched_prefill: bool,
+    pub gpu_resident: bool,
+    pub gdn: bool,
+    pub moe: bool,
+    pub gpu_argmax: bool,
+}
 
 /// A contiguous buffer of activations flowing through the model.
 ///
@@ -201,6 +212,12 @@ pub trait ComputeBackend: Send + Sync {
     fn init(&mut self, hyperparams: &ModelHyperparams) -> Result<(), RuntimeError>;
 
     /// Execute a single transformer layer.
+    ///
+    /// # KV seq_len contract
+    ///
+    /// This method does NOT advance `kv.seq_len()`. The caller (typically
+    /// `forward_pass()` in the engine) MUST call `kv.advance_seq_len()`
+    /// after each token's full forward pass completes.
     fn compute_layer(
         &self,
         layer_idx: usize,
@@ -225,4 +242,93 @@ pub trait ComputeBackend: Send + Sync {
     /// Default implementation is a no-op. Only backends with profiling support
     /// need to override this.
     fn set_profile(&mut self, _enabled: bool) {}
+
+    // ====================================================================
+    // Phase 3: enriched trait methods for GPU fast paths.
+    // All have default implementations so CPU backends compile unchanged.
+    // ====================================================================
+
+    /// Query backend capabilities.
+    fn caps(&self) -> BackendCaps {
+        BackendCaps {
+            batched_prefill: false,
+            gpu_resident: false,
+            gdn: false,
+            moe: false,
+            gpu_argmax: false,
+        }
+    }
+
+    /// Set global tensors (embedding, final_norm, output_proj).
+    fn set_global_tensors(
+        &mut self,
+        embedding: Vec<f32>,
+        final_norm: Vec<f32>,
+        output_proj: Vec<f32>,
+    );
+
+    /// Set raw quantized output projection bytes.
+    fn set_output_proj_raw(&mut self, _raw: Vec<u8>, _quant: QuantScheme) {}
+
+    /// Set raw quantized embedding bytes.
+    fn set_embedding_raw(&mut self, _raw: Vec<u8>, _quant: QuantScheme) {}
+
+    /// Enable weight tying (output_proj shares embedding storage).
+    fn set_weight_tying(&mut self, _enabled: bool) {}
+
+    /// Batched GPU prefill. Returns the final hidden state of the last token.
+    ///
+    /// # KV seq_len contract
+    ///
+    /// This method advances `kv.seq_len()` internally (once per prompt token).
+    /// The caller must NOT call `kv.advance_seq_len()` after prefill returns.
+    fn prefill(
+        &self,
+        _tokens: &[u32],
+        _weights: &dyn WeightProvider,
+        _kv: &mut KvCache,
+    ) -> Result<Vec<f32>, RuntimeError> {
+        Err(RuntimeError::Compute("batched prefill not supported".into()))
+    }
+
+    /// Preload weights to GPU memory.
+    fn preload_weights(
+        &mut self,
+        _weights: &dyn WeightProvider,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    /// GPU-resident decode returning logits for a single token.
+    ///
+    /// # KV seq_len contract
+    ///
+    /// This method advances `kv.seq_len()` internally (once per call).
+    /// The caller must NOT call `kv.advance_seq_len()` after decode_token returns.
+    fn decode_token(
+        &self,
+        _token_id: u32,
+        _weights: &dyn WeightProvider,
+        _kv: &mut KvCache,
+    ) -> Result<Logits, RuntimeError> {
+        Err(RuntimeError::Compute("GPU-resident decode not supported".into()))
+    }
+
+    /// GPU-side greedy decode returning token ID directly.
+    ///
+    /// # KV seq_len contract
+    ///
+    /// This method advances `kv.seq_len()` internally (once per call).
+    /// The caller must NOT call `kv.advance_seq_len()` after decode_token_greedy returns.
+    fn decode_token_greedy(
+        &self,
+        _token_id: u32,
+        _weights: &dyn WeightProvider,
+        _kv: &mut KvCache,
+    ) -> Result<u32, RuntimeError> {
+        Err(RuntimeError::Compute("GPU-side argmax not supported".into()))
+    }
+
+    /// Reset recurrent state (GDN h_state, conv_state).
+    fn reset_recurrent_state(&self) {}
 }

@@ -127,18 +127,6 @@ impl NaiveF32Backend {
         }
     }
 
-    /// Set the global tensors (embedding, final_norm, output_proj).
-    pub fn set_global_tensors(
-        &mut self,
-        embedding: Vec<f32>,
-        final_norm: Vec<f32>,
-        output_proj: Vec<f32>,
-    ) {
-        self.embedding = embedding;
-        self.final_norm = final_norm;
-        self.output_proj = output_proj;
-    }
-
     fn hp(&self) -> Result<&ModelHyperparams, RuntimeError> {
         self.hyperparams.as_ref().ok_or_else(|| {
             RuntimeError::Compute("backend not initialized: call init() first".into())
@@ -270,6 +258,17 @@ fn f32_to_activation(values: &[f32]) -> ActivationBuffer {
 }
 
 impl ComputeBackend for NaiveF32Backend {
+    fn set_global_tensors(
+        &mut self,
+        embedding: Vec<f32>,
+        final_norm: Vec<f32>,
+        output_proj: Vec<f32>,
+    ) {
+        self.embedding = embedding;
+        self.final_norm = final_norm;
+        self.output_proj = output_proj;
+    }
+
     fn init(&mut self, hyperparams: &ModelHyperparams) -> Result<(), RuntimeError> {
         self.hyperparams = Some(*hyperparams);
 

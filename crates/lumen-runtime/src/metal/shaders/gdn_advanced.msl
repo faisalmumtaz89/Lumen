@@ -1,0 +1,2711 @@
+kernel void l2_normalize_qk(
+    device       float* q_data     [[buffer(0)]],
+    device       float* k_data     [[buffer(1)]],
+    constant     uint&  n_q_heads  [[buffer(2)]],
+    constant     uint&  n_k_heads  [[buffer(3)]],
+    constant     uint&  head_dim   [[buffer(4)]],
+    constant     float& eps        [[buffer(5)]],
+    uint head_idx                  [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_index_in_threadgroup]],
+    uint tg_size                   [[threads_per_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_group                [[simdgroup_index_in_threadgroup]])
+{
+    uint total_heads = n_q_heads + n_k_heads;
+    if (head_idx >= total_heads) return;
+
+    // Select pointer: Q heads first, then K heads
+    device float* head;
+    if (head_idx < n_q_heads) {
+        head = q_data + head_idx * head_dim;
+    } else {
+        head = k_data + (head_idx - n_q_heads) * head_dim;
+    }
+
+    // Pass 1: compute sum of squares
+    float ss = 0.0f;
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        float v = head[i];
+        ss += v * v;
+    }
+
+    ss = simd_sum(ss);
+
+    threadgroup float partial_sums[8];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float total_ss;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_ss = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float norm = sqrt(total_ss);
+    float scale = (norm > eps) ? (1.0f / norm) : (1.0f / eps);
+
+    // Pass 2: normalize
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        head[i] *= scale;
+    }
+}
+
+// ============================================================================
+// Fused GDN state-update + output + RMS-norm-scale kernel (DELTA RULE)
+//
+// Implements the Gated Delta Net recurrence per head h and output column vj:
+//   retrieval[vj] = sum_ki(h_state[h,ki,vj] * k[kv_head,ki])  // from ORIGINAL h
+//   h_state[h,ki,vj] = alpha[h]*h_state[h,ki,vj] + k[kv_head,ki]*beta[h]*(v[h,vj]-retrieval[vj])
+//   raw_out[vj]      = sum_ki(h_state[h,ki,vj] * q[kv_head,ki])   // from NEW h
+//   output[vj]       = (raw_out[vj] / sqrt(mean(raw_out^2)+eps)) * scale[vj]
+//
+// KEY: retrieval uses ORIGINAL (undecayed) h; decay+update happen in one combined step.
+// KEY: Q and K both use GQA (kv_head = h / (n_heads/n_kv_heads)).
+// KEY: V uses direct head index h (n_heads V-heads, no GQA).
+//
+// buffer(0):  h_state    [n_heads * val_dim * key_dim] float -- R/W (transposed layout)
+// buffer(1):  k_norm     [n_kv_heads * key_dim] float
+// buffer(2):  v_tokens   [n_heads * val_dim] float  (n_heads V-heads, no GQA)
+// buffer(3):  alpha      [n_heads] float -- decay factors
+// buffer(4):  beta       [n_heads] float -- mixing rates
+// buffer(5):  q_norm     [n_kv_heads * key_dim] float  (n_kv_heads Q-heads, GQA)
+// buffer(6):  scale      [scale_n_heads * val_dim] float -- learned norm scale
+// buffer(7):  output     [n_heads * val_dim] float -- OUTPUT
+// buffer(8):  n_heads (uint)       -- state/V/output heads (= num_v_heads = 32)
+// buffer(9):  key_dim (uint)
+// buffer(10): val_dim (uint)
+// buffer(11): n_kv_heads (uint)   -- Q and K original heads (= num_k_heads = 16)
+// buffer(12): eps (float)
+// buffer(13): scale_n_heads (uint)
+//
+// grid: (n_heads, 1, 1), threadgroup: (val_dim, 1, 1)  -- one thread per column
+// ============================================================================
+
+kernel void gdn_state_output_norm(
+    device       float* h_state        [[buffer(0)]],
+    device const float* k_norm         [[buffer(1)]],
+    device const float* v_tokens       [[buffer(2)]],
+    device const float* alpha          [[buffer(3)]],
+    device const float* beta           [[buffer(4)]],
+    device const float* q_norm         [[buffer(5)]],
+    device const float* scale          [[buffer(6)]],
+    device       float* output         [[buffer(7)]],
+    constant     uint&  n_heads        [[buffer(8)]],
+    constant     uint&  key_dim        [[buffer(9)]],
+    constant     uint&  val_dim        [[buffer(10)]],
+    constant     uint&  n_kv_heads     [[buffer(11)]],
+    constant     float& eps            [[buffer(12)]],
+    constant     uint&  scale_n_heads  [[buffer(13)]],
+    uint head_idx                      [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_index_in_threadgroup]],
+    uint tg_size                       [[threads_per_threadgroup]],
+    uint simd_lane                     [[thread_index_in_simdgroup]],
+    uint simd_group                    [[simdgroup_index_in_threadgroup]])
+{
+    if (head_idx >= n_heads) return;
+
+    uint h = head_idx;
+    // V has n_heads=32 heads. Q and K have n_kv_heads=16 heads.
+    // GGUF stores V-heads de-interleaved: our heads 0..15 = MLX even heads,
+    // our heads 16..31 = MLX odd heads. Q/K heads are NOT de-interleaved.
+    // Correct GQA mapping for de-interleaved V: kv_head = h % n_kv_heads
+    // This maps our heads [0..15] to kv [0..15] and [16..31] to kv [0..15].
+    uint kv_head = h % n_kv_heads;
+
+    float a = alpha[h];
+    float b = beta[h];
+    uint vj = tid;
+
+    // Q scaling factor: 1/sqrt(key_dim), matching llama.cpp build_delta_net_autoregressive
+    float q_scale = rsqrt((float)key_dim);
+
+    // GDN recurrence per column vj (h_state is [n_heads, val_dim, key_dim] transposed):
+    //   Reference (llama.cpp build_delta_net_autoregressive):
+    //     1. s_decayed = alpha * s_old          (decay FIRST)
+    //     2. retrieval = s_decayed^T @ k        (retrieve from DECAYED state)
+    //     3. delta = beta * (v - retrieval)
+    //     4. s_new = s_decayed + outer(k, delta)
+    //     5. output = s_new @ (q * scale)       (scale = 1/sqrt(key_dim))
+    float my_out = 0.0f;
+    if (vj < val_dim) {
+        // V has n_heads heads (no GQA) — use h directly
+        float v_val = v_tokens[h * val_dim + vj];
+        device float* h_row = h_state + h * val_dim * key_dim + vj * key_dim;
+        // Q and K both have n_kv_heads original heads (tile-style: kv_head = h * n_kv_heads / n_heads)
+        device const float* q_head = q_norm + kv_head * key_dim;
+        device const float* k_head = k_norm + kv_head * key_dim;
+
+        // Phase 1: Decay state, then retrieve from DECAYED state
+        float retrieval = 0.0f;
+        for (uint ki = 0; ki < key_dim; ki++) {
+            float h_decayed = a * h_row[ki];
+            h_row[ki] = h_decayed;  // write decayed state back
+            retrieval += h_decayed * k_head[ki];
+        }
+
+        // Phase 2: Delta rule update + output (on already-decayed state)
+        float v_delta = b * (v_val - retrieval);
+        for (uint ki = 0; ki < key_dim; ki++) {
+            float h_updated = h_row[ki] + k_head[ki] * v_delta;
+            h_row[ki] = h_updated;
+            my_out += h_updated * q_head[ki] * q_scale;
+        }
+    }
+
+    // Phase 4: RMSNorm + scale (cooperative reduction across threadgroup)
+    // llama.cpp build_norm_gated uses ggml_rms_norm: x / sqrt(mean(x^2) + eps) * weight
+    float ss = my_out * my_out;
+    ss = simd_sum(ss);
+
+    threadgroup float partial_sums[8];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float total_ss;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_ss = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms = sqrt(total_ss / (float)val_dim + eps);
+    float inv_norm = 1.0f / rms;
+
+    // Write normalized + scaled output
+    if (vj < val_dim) {
+        device const float* head_scale = scale + (h % scale_n_heads) * val_dim;
+        output[h * val_dim + vj] = my_out * inv_norm * head_scale[vj];
+    }
+}
+
+// ============================================================================
+// gdn_state_output_norm_l2: Fused L2-normalize Q/K + state-update + output + RMSNorm
+//
+// Same as gdn_state_output_norm but takes UN-normalized Q and K and performs
+// per-head L2 normalization inline using threadgroup memory. This eliminates
+// the separate l2_normalize_qk dispatch and its preceding barrier.
+//
+// Each threadgroup (one per head) independently loads its Q/K head into
+// threadgroup memory, computes L2 norm via simd_sum, normalizes, then
+// proceeds with the standard GDN recurrence using the local normalized copy.
+//
+// buffer(0):  h_state    [n_heads * val_dim * key_dim] float -- R/W (transposed layout)
+// buffer(1):  k_raw      [n_kv_heads * key_dim] float -- UN-normalized
+// buffer(2):  v_tokens   [n_heads * val_dim] float  (n_heads V-heads, no GQA)
+// buffer(3):  alpha      [n_heads] float -- decay factors
+// buffer(4):  beta       [n_heads] float -- mixing rates
+// buffer(5):  q_raw      [n_kv_heads * key_dim] float -- UN-normalized
+// buffer(6):  scale      [scale_n_heads * val_dim] float -- learned norm scale
+// buffer(7):  output     [n_heads * val_dim] float -- OUTPUT
+// buffer(8):  n_heads (uint)       -- state/V/output heads (= 32)
+// buffer(9):  key_dim (uint)       -- 128
+// buffer(10): val_dim (uint)       -- 128
+// buffer(11): n_kv_heads (uint)    -- Q and K original heads (= 16)
+// buffer(12): eps (float)          -- RMSNorm eps
+// buffer(13): scale_n_heads (uint)
+// buffer(14): l2_eps (float)       -- L2 norm eps (typically 1e-12)
+//
+// grid: (n_heads, 1, 1), threadgroup: (val_dim, 1, 1)  -- one thread per column
+// REQUIREMENT: key_dim == val_dim (both 128 for Qwen3.5)
+// ============================================================================
+
+kernel void gdn_state_output_norm_l2(
+    device       float* h_state        [[buffer(0)]],
+    device const float* k_raw          [[buffer(1)]],
+    device const float* v_tokens       [[buffer(2)]],
+    device const float* alpha          [[buffer(3)]],
+    device const float* beta           [[buffer(4)]],
+    device const float* q_raw          [[buffer(5)]],
+    device const float* scale          [[buffer(6)]],
+    device       float* output         [[buffer(7)]],
+    constant     uint&  n_heads        [[buffer(8)]],
+    constant     uint&  key_dim        [[buffer(9)]],
+    constant     uint&  val_dim        [[buffer(10)]],
+    constant     uint&  n_kv_heads     [[buffer(11)]],
+    constant     float& eps            [[buffer(12)]],
+    constant     uint&  scale_n_heads  [[buffer(13)]],
+    constant     float& l2_eps         [[buffer(14)]],
+    uint head_idx                      [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_index_in_threadgroup]],
+    uint tg_size                       [[threads_per_threadgroup]],
+    uint simd_lane                     [[thread_index_in_simdgroup]],
+    uint simd_group                    [[simdgroup_index_in_threadgroup]])
+{
+    if (head_idx >= n_heads) return;
+
+    uint h = head_idx;
+    uint kv_head = h % n_kv_heads;
+
+    // --- Phase 0: L2 normalize Q and K in threadgroup memory ---
+    // key_dim == val_dim == tg_size == 128, so thread tid loads element tid.
+    threadgroup float q_local[128];
+    threadgroup float k_local[128];
+
+    float q_val = 0.0f;
+    float k_val = 0.0f;
+    if (tid < key_dim) {
+        q_val = q_raw[kv_head * key_dim + tid];
+        k_val = k_raw[kv_head * key_dim + tid];
+    }
+
+    // L2 norm for Q: compute sum of squares
+    float q_ss = q_val * q_val;
+    q_ss = simd_sum(q_ss);
+
+    threadgroup float partial_sums_l2[8];
+    if (simd_lane == 0) {
+        partial_sums_l2[simd_group] = q_ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float total_l2;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums_l2[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_l2 = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float q_norm_val = sqrt(total_l2);
+    float q_l2_scale = (q_norm_val > l2_eps) ? (1.0f / q_norm_val) : (1.0f / l2_eps);
+
+    // L2 norm for K: compute sum of squares
+    float k_ss = k_val * k_val;
+    k_ss = simd_sum(k_ss);
+
+    if (simd_lane == 0) {
+        partial_sums_l2[simd_group] = k_ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums_l2[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_l2 = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float k_norm_val = sqrt(total_l2);
+    float k_l2_scale = (k_norm_val > l2_eps) ? (1.0f / k_norm_val) : (1.0f / l2_eps);
+
+    // Store normalized Q and K in threadgroup memory
+    if (tid < key_dim) {
+        q_local[tid] = q_val * q_l2_scale;
+        k_local[tid] = k_val * k_l2_scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Phase 1-3: GDN recurrence (same as gdn_state_output_norm, transposed layout) ---
+    float a = alpha[h];
+    float b = beta[h];
+    uint vj = tid;
+    float q_scale = rsqrt((float)key_dim);
+
+    float my_out = 0.0f;
+    if (vj < val_dim) {
+        float v_val = v_tokens[h * val_dim + vj];
+        device float* h_row = h_state + h * val_dim * key_dim + vj * key_dim;
+
+        // Phase 1: Decay state, then retrieve from DECAYED state
+        float retrieval = 0.0f;
+        for (uint ki = 0; ki < key_dim; ki++) {
+            float h_decayed = a * h_row[ki];
+            h_row[ki] = h_decayed;
+            retrieval += h_decayed * k_local[ki];
+        }
+
+        // Phase 2: Delta rule update + output
+        float v_delta = b * (v_val - retrieval);
+        for (uint ki = 0; ki < key_dim; ki++) {
+            float h_updated = h_row[ki] + k_local[ki] * v_delta;
+            h_row[ki] = h_updated;
+            my_out += h_updated * q_local[ki] * q_scale;
+        }
+    }
+
+    // --- Phase 4: RMSNorm + scale ---
+    float ss = my_out * my_out;
+    ss = simd_sum(ss);
+
+    threadgroup float partial_sums[8];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float total_ss;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_ss = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms = sqrt(total_ss / (float)val_dim + eps);
+    float inv_norm = 1.0f / rms;
+
+    if (vj < val_dim) {
+        device const float* head_scale = scale + (h % scale_n_heads) * val_dim;
+        output[h * val_dim + vj] = my_out * inv_norm * head_scale[vj];
+    }
+}
+
+// ============================================================================
+// gdn_state_output_l2_sg: Simdgroup-parallel GDN state update
+//
+// Same algorithm as gdn_state_output_norm_l2 (L2 normalize Q/K + delta rule
+// state update + output), but parallelized across (head, val_col) pairs using
+// one simdgroup (32 threads) per pair. This increases occupancy from 32 TGs
+// (0.53/core on M3 Ultra 60 cores) to 4096 TGs (68/core).
+//
+// Each simdgroup cooperates on key_dim=128 (4 elements per thread). All
+// reductions use pure simd_sum with zero threadgroup barriers.
+//
+// Writes raw (un-normalized) output. RMSNorm is applied by a separate
+// gdn_decode_norm_scale dispatch.
+//
+// buffer(0):  h_state    [n_heads * val_dim * key_dim] float -- R/W (transposed layout)
+// buffer(1):  k_raw      [n_kv_heads * key_dim] float -- UN-normalized
+// buffer(2):  v_tokens   [n_heads * val_dim] float  (n_heads V-heads, no GQA)
+// buffer(3):  alpha      [n_heads] float -- decay factors
+// buffer(4):  beta       [n_heads] float -- mixing rates
+// buffer(5):  q_raw      [n_kv_heads * key_dim] float -- UN-normalized
+// buffer(6):  raw_out    [n_heads * val_dim] float -- OUTPUT (raw, pre-norm)
+// buffer(7):  n_heads (uint)
+// buffer(8):  key_dim (uint)       -- 128
+// buffer(9):  val_dim (uint)       -- 128
+// buffer(10): n_kv_heads (uint)    -- 16
+// buffer(11): l2_eps (float)       -- L2 norm eps (typically 1e-12)
+//
+// grid: (1, val_dim, n_heads), threadgroup: (32, 1, 1) -- 1 simdgroup per TG
+// REQUIREMENT: key_dim == 128 (32 threads * 4 elements)
+// ============================================================================
+
+kernel void gdn_state_output_l2_sg(
+    device       float* h_state        [[buffer(0)]],
+    device const float* k_raw          [[buffer(1)]],
+    device const float* v_tokens       [[buffer(2)]],
+    device const float* alpha          [[buffer(3)]],
+    device const float* beta           [[buffer(4)]],
+    device const float* q_raw          [[buffer(5)]],
+    device       float* raw_out        [[buffer(6)]],
+    constant     uint&  n_heads        [[buffer(7)]],
+    constant     uint&  key_dim        [[buffer(8)]],
+    constant     uint&  val_dim        [[buffer(9)]],
+    constant     uint&  n_kv_heads     [[buffer(10)]],
+    constant     float& l2_eps         [[buffer(11)]],
+    uint3 tgpig                        [[threadgroup_position_in_grid]],
+    uint lane                          [[thread_index_in_simdgroup]])
+{
+    uint h  = tgpig.z;   // head index [0, n_heads)
+    uint vi = tgpig.y;   // val_dim column [0, val_dim)
+    if (h >= n_heads || vi >= val_dim) return;
+
+    uint kv_head = h % n_kv_heads;
+    float q_scale = rsqrt((float)key_dim);
+
+    // --- Phase 0: L2 normalize Q and K using simd_sum ---
+    // 32 threads * 4 elements = 128 = key_dim
+    uint k_base = lane * 4;
+
+    device const float* q_head = q_raw + kv_head * key_dim;
+    device const float* k_head = k_raw + kv_head * key_dim;
+
+    // Load 4 Q and K elements per thread
+    float4 q_local = float4(q_head[k_base], q_head[k_base+1], q_head[k_base+2], q_head[k_base+3]);
+    float4 k_local = float4(k_head[k_base], k_head[k_base+1], k_head[k_base+2], k_head[k_base+3]);
+
+    // L2 norm Q
+    float q_ss = q_local[0]*q_local[0] + q_local[1]*q_local[1] + q_local[2]*q_local[2] + q_local[3]*q_local[3];
+    float q_total_ss = simd_sum(q_ss);
+    float q_norm_val = sqrt(q_total_ss);
+    float q_l2_scale = (q_norm_val > l2_eps) ? (1.0f / q_norm_val) : (1.0f / l2_eps);
+    q_local *= q_l2_scale;
+
+    // L2 norm K
+    float k_ss = k_local[0]*k_local[0] + k_local[1]*k_local[1] + k_local[2]*k_local[2] + k_local[3]*k_local[3];
+    float k_total_ss = simd_sum(k_ss);
+    float k_norm_val = sqrt(k_total_ss);
+    float k_l2_scale = (k_norm_val > l2_eps) ? (1.0f / k_norm_val) : (1.0f / l2_eps);
+    k_local *= k_l2_scale;
+
+    // --- Phase 1: Decay state + retrieval (from DECAYED state) ---
+    float a = alpha[h];
+    float b = beta[h];
+    float v_val = v_tokens[h * val_dim + vi];
+
+    // State row pointer: h_state[h, vi, ki] at h_row[ki] (transposed, coalesced)
+    device float* h_row = h_state + h * val_dim * key_dim + vi * key_dim;
+
+    // Load 4 state elements, apply decay (contiguous access!)
+    float s0 = a * h_row[k_base + 0];
+    float s1 = a * h_row[k_base + 1];
+    float s2 = a * h_row[k_base + 2];
+    float s3 = a * h_row[k_base + 3];
+
+    // Write decayed state back
+    h_row[k_base + 0] = s0;
+    h_row[k_base + 1] = s1;
+    h_row[k_base + 2] = s2;
+    h_row[k_base + 3] = s3;
+
+    // Compute retrieval = dot(h_decayed, k_normalized) across simd
+    float ret_local = s0*k_local[0] + s1*k_local[1] + s2*k_local[2] + s3*k_local[3];
+    float retrieval = simd_sum(ret_local);
+
+    // --- Phase 2: Delta rule update + output ---
+    float v_delta = b * (v_val - retrieval);
+
+    s0 += k_local[0] * v_delta;
+    s1 += k_local[1] * v_delta;
+    s2 += k_local[2] * v_delta;
+    s3 += k_local[3] * v_delta;
+
+    // Write updated state back
+    h_row[k_base + 0] = s0;
+    h_row[k_base + 1] = s1;
+    h_row[k_base + 2] = s2;
+    h_row[k_base + 3] = s3;
+
+    // Output = dot(h_updated, q_normalized * q_scale)
+    float out_local = s0*q_local[0] + s1*q_local[1] + s2*q_local[2] + s3*q_local[3];
+    float my_out = simd_sum(out_local) * q_scale;
+
+    // Only lane 0 writes the output for this (head, val_col) pair
+    if (lane == 0) {
+        raw_out[h * val_dim + vi] = my_out;
+    }
+}
+
+// ============================================================================
+// gdn_decode_norm_scale: RMSNorm + learned scale on raw GDN decode output
+//
+// Applied after gdn_state_output_l2_sg to produce the final normed output.
+// Each threadgroup handles one head: computes RMSNorm across val_dim elements,
+// then applies learned scale weights.
+//
+// buffer(0): raw_out    [n_heads * val_dim] float -- INPUT
+// buffer(1): scale      [scale_n_heads * val_dim] float -- learned norm scale
+// buffer(2): output     [n_heads * val_dim] float -- OUTPUT
+// buffer(3): n_heads (uint)
+// buffer(4): val_dim (uint)
+// buffer(5): eps (float)          -- RMSNorm eps
+// buffer(6): scale_n_heads (uint)
+//
+// grid: (n_heads, 1, 1), threadgroup: (val_dim, 1, 1) where val_dim=128
+// ============================================================================
+
+kernel void gdn_decode_norm_scale(
+    device const float* raw_out       [[buffer(0)]],
+    device const float* scale         [[buffer(1)]],
+    device       float* output        [[buffer(2)]],
+    constant     uint&  n_heads       [[buffer(3)]],
+    constant     uint&  val_dim       [[buffer(4)]],
+    constant     float& eps           [[buffer(5)]],
+    constant     uint&  scale_n_heads [[buffer(6)]],
+    uint head_idx                     [[threadgroup_position_in_grid]],
+    uint tid                          [[thread_index_in_threadgroup]],
+    uint simd_lane                    [[thread_index_in_simdgroup]],
+    uint simd_group                   [[simdgroup_index_in_threadgroup]])
+{
+    if (head_idx >= n_heads) return;
+
+    uint h = head_idx;
+    uint vj = tid;
+
+    // Load raw output value for this (head, vj)
+    float val = (vj < val_dim) ? raw_out[h * val_dim + vj] : 0.0f;
+
+    // RMSNorm: compute sum of squares across val_dim
+    float ss = val * val;
+    ss = simd_sum(ss);
+
+    // Cross-simdgroup reduction (val_dim=128 = 4 simdgroups of 32)
+    threadgroup float partial[4];
+    if (simd_lane == 0) {
+        partial[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_sg = (val_dim + 31) / 32;
+    threadgroup float total_ss;
+    if (simd_group == 0) {
+        float v = (simd_lane < num_sg) ? partial[simd_lane] : 0.0f;
+        v = simd_sum(v);
+        if (simd_lane == 0) {
+            total_ss = v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (vj < val_dim) {
+        float inv_norm = 1.0f / sqrt(total_ss / (float)val_dim + eps);
+        device const float* head_scale = scale + (h % scale_n_heads) * val_dim;
+        output[h * val_dim + vj] = val * inv_norm * head_scale[vj];
+    }
+}
+
+// ============================================================================
+// gdn_state_output_norm_l2_conv: Fused Conv1D+SiLU + L2-normalize Q/K +
+//   state-update + output + RMSNorm
+//
+// Inlines the Conv1D+SiLU computation into the state kernel, eliminating the
+// separate ssm_conv1d_silu_decode dispatch and one barrier per GDN layer.
+// The kernel reads raw QKV (pre-conv) and conv_state, computes the convolution
+// inline, applies SiLU, then proceeds with L2 normalization and GDN recurrence.
+//
+// Conv1D layout (matches ssm_conv1d_silu_decode exactly):
+//   conv_state: [buf_slots * qkv_dim] float, indexed as [slot * qkv_dim + ch]
+//   conv_weight: [qkv_dim * kernel_size] float, indexed as [ch * kernel_size + tap]
+//   buf_slots = kernel_size - 1 = 3  (kernel_size = 4)
+//   state_pos: current write position in circular buffer [0..buf_slots-1]
+//   After conv, overwrites oldest: conv_state[state_pos * qkv_dim + ch] = input[ch]
+//
+// QKV channel layout (qkv_dim = 8192):
+//   Q: [0 .. qk_dim)           = [0 .. 2048)    -- 16 kv_heads * 128
+//   K: [qk_dim .. 2*qk_dim)    = [2048 .. 4096)  -- 16 kv_heads * 128
+//   V: [2*qk_dim .. qkv_dim)   = [4096 .. 8192)  -- 32 heads * 128
+//
+// Thread mapping: 32 TGs (one per head), 128 threads per TG.
+//   Thread tid in head h:
+//     Q channel: (h % n_kv_heads) * key_dim + tid  (shared via GQA)
+//     K channel: qk_dim + (h % n_kv_heads) * key_dim + tid  (shared via GQA)
+//     V channel: 2*qk_dim + h * val_dim + tid  (unique per head)
+//
+// Conv_state updates: only heads with h < n_kv_heads write Q/K conv_state
+// (avoiding duplicate writes from GQA-repeated heads). All heads write their
+// unique V conv_state entries.
+//
+// buffer(0):  h_state      [n_heads * val_dim * key_dim] float -- R/W (transposed layout)
+// buffer(1):  qkv_raw      [qkv_dim] float -- raw QKV from matvec (pre-conv)
+// buffer(2):  conv_state   [buf_slots * qkv_dim] float -- circular buffer (R/W)
+// buffer(3):  conv_weight  [qkv_dim * kernel_size] float -- conv weights
+// buffer(4):  alpha        [n_heads] float -- decay factors
+// buffer(5):  beta         [n_heads] float -- mixing rates
+// buffer(6):  scale        [scale_n_heads * val_dim] float -- learned norm scale
+// buffer(7):  output       [n_heads * val_dim] float -- OUTPUT
+// buffer(8):  n_heads (uint)       -- state/V/output heads (= 32)
+// buffer(9):  key_dim (uint)       -- 128
+// buffer(10): val_dim (uint)       -- 128
+// buffer(11): n_kv_heads (uint)    -- Q and K heads (= 16)
+// buffer(12): eps (float)          -- RMSNorm eps
+// buffer(13): scale_n_heads (uint)
+// buffer(14): l2_eps (float)       -- L2 norm eps
+// buffer(15): qk_dim (uint)       -- Q or K total dim (= n_kv_heads * key_dim = 2048)
+// buffer(16): qkv_dim (uint)      -- total QKV dim (= 8192)
+// buffer(17): kernel_size (uint)  -- conv kernel size (= 4)
+// buffer(18): state_pos (uint)    -- current conv circular buffer position
+//
+// grid: (n_heads, 1, 1), threadgroup: (val_dim, 1, 1)  -- one thread per column
+// REQUIREMENT: key_dim == val_dim (both 128 for Qwen3.5)
+// ============================================================================
+
+kernel void gdn_state_output_norm_l2_conv(
+    device       float* h_state        [[buffer(0)]],
+    device const float* qkv_raw        [[buffer(1)]],
+    device       float* conv_state     [[buffer(2)]],
+    device const float* conv_weight    [[buffer(3)]],
+    device const float* alpha          [[buffer(4)]],
+    device const float* beta           [[buffer(5)]],
+    device const float* scale          [[buffer(6)]],
+    device       float* output         [[buffer(7)]],
+    constant     uint&  n_heads        [[buffer(8)]],
+    constant     uint&  key_dim        [[buffer(9)]],
+    constant     uint&  val_dim        [[buffer(10)]],
+    constant     uint&  n_kv_heads     [[buffer(11)]],
+    constant     float& eps            [[buffer(12)]],
+    constant     uint&  scale_n_heads  [[buffer(13)]],
+    constant     float& l2_eps         [[buffer(14)]],
+    constant     uint&  qk_dim         [[buffer(15)]],
+    constant     uint&  qkv_dim        [[buffer(16)]],
+    constant     uint&  kernel_size    [[buffer(17)]],
+    constant     uint&  state_pos      [[buffer(18)]],
+    uint head_idx                      [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_index_in_threadgroup]],
+    uint tg_size                       [[threads_per_threadgroup]],
+    uint simd_lane                     [[thread_index_in_simdgroup]],
+    uint simd_group                    [[simdgroup_index_in_threadgroup]])
+{
+    if (head_idx >= n_heads) return;
+
+    uint h = head_idx;
+    uint kv_head = h % n_kv_heads;
+    uint buf_slots = kernel_size - 1;
+
+    // --- Phase -1: Inline Conv1D + SiLU for this thread's Q, K, V channels ---
+
+    // Q channel conv1d + SiLU
+    float q_val = 0.0f;
+    if (tid < key_dim) {
+        uint q_ch = kv_head * key_dim + tid;  // channel in [0..qk_dim)
+        float q_sum = 0.0f;
+        for (uint tap = 0; tap < buf_slots; tap++) {
+            uint slot = (state_pos + tap) % buf_slots;
+            q_sum += conv_weight[q_ch * kernel_size + tap] * conv_state[slot * qkv_dim + q_ch];
+        }
+        q_sum += conv_weight[q_ch * kernel_size + buf_slots] * qkv_raw[q_ch];
+        q_val = q_sum / (1.0f + exp(-q_sum));  // SiLU
+
+        // Only first n_kv_heads heads update Q conv_state (avoid GQA duplicate writes)
+        if (h < n_kv_heads) {
+            conv_state[state_pos * qkv_dim + q_ch] = qkv_raw[q_ch];
+        }
+    }
+
+    // K channel conv1d + SiLU
+    float k_val = 0.0f;
+    if (tid < key_dim) {
+        uint k_ch = qk_dim + kv_head * key_dim + tid;  // channel in [qk_dim..2*qk_dim)
+        float k_sum = 0.0f;
+        for (uint tap = 0; tap < buf_slots; tap++) {
+            uint slot = (state_pos + tap) % buf_slots;
+            k_sum += conv_weight[k_ch * kernel_size + tap] * conv_state[slot * qkv_dim + k_ch];
+        }
+        k_sum += conv_weight[k_ch * kernel_size + buf_slots] * qkv_raw[k_ch];
+        k_val = k_sum / (1.0f + exp(-k_sum));  // SiLU
+
+        // Only first n_kv_heads heads update K conv_state
+        if (h < n_kv_heads) {
+            conv_state[state_pos * qkv_dim + k_ch] = qkv_raw[k_ch];
+        }
+    }
+
+    // V channel conv1d + SiLU (unique per head, no GQA sharing)
+    float v_conv = 0.0f;
+    if (tid < val_dim) {
+        uint v_ch = 2 * qk_dim + h * val_dim + tid;  // channel in [2*qk_dim..qkv_dim)
+        float v_sum = 0.0f;
+        for (uint tap = 0; tap < buf_slots; tap++) {
+            uint slot = (state_pos + tap) % buf_slots;
+            v_sum += conv_weight[v_ch * kernel_size + tap] * conv_state[slot * qkv_dim + v_ch];
+        }
+        v_sum += conv_weight[v_ch * kernel_size + buf_slots] * qkv_raw[v_ch];
+        v_conv = v_sum / (1.0f + exp(-v_sum));  // SiLU
+
+        // All heads write their unique V conv_state entry
+        conv_state[state_pos * qkv_dim + v_ch] = qkv_raw[v_ch];
+    }
+
+    // --- Phase 0: L2 normalize Q and K in threadgroup memory ---
+    threadgroup float q_local[128];
+    threadgroup float k_local[128];
+
+    // L2 norm for Q: compute sum of squares
+    float q_ss = q_val * q_val;
+    q_ss = simd_sum(q_ss);
+
+    threadgroup float partial_sums_l2[8];
+    if (simd_lane == 0) {
+        partial_sums_l2[simd_group] = q_ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float total_l2;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums_l2[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_l2 = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float q_norm_val = sqrt(total_l2);
+    float q_l2_scale = (q_norm_val > l2_eps) ? (1.0f / q_norm_val) : (1.0f / l2_eps);
+
+    // L2 norm for K: compute sum of squares
+    float k_ss = k_val * k_val;
+    k_ss = simd_sum(k_ss);
+
+    if (simd_lane == 0) {
+        partial_sums_l2[simd_group] = k_ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums_l2[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_l2 = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float k_norm_val = sqrt(total_l2);
+    float k_l2_scale = (k_norm_val > l2_eps) ? (1.0f / k_norm_val) : (1.0f / l2_eps);
+
+    // Store normalized Q and K in threadgroup memory
+    if (tid < key_dim) {
+        q_local[tid] = q_val * q_l2_scale;
+        k_local[tid] = k_val * k_l2_scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Phase 1-3: GDN recurrence (transposed layout) ---
+    float a = alpha[h];
+    float b = beta[h];
+    uint vj = tid;
+    float q_scale = rsqrt((float)key_dim);
+
+    float my_out = 0.0f;
+    if (vj < val_dim) {
+        float v_val = v_conv;  // Use inline conv'd V value (already SiLU'd)
+        device float* h_row = h_state + h * val_dim * key_dim + vj * key_dim;
+
+        // Phase 1: Decay state, then retrieve from DECAYED state
+        float retrieval = 0.0f;
+        for (uint ki = 0; ki < key_dim; ki++) {
+            float h_decayed = a * h_row[ki];
+            h_row[ki] = h_decayed;
+            retrieval += h_decayed * k_local[ki];
+        }
+
+        // Phase 2: Delta rule update + output
+        float v_delta = b * (v_val - retrieval);
+        for (uint ki = 0; ki < key_dim; ki++) {
+            float h_updated = h_row[ki] + k_local[ki] * v_delta;
+            h_row[ki] = h_updated;
+            my_out += h_updated * q_local[ki] * q_scale;
+        }
+    }
+
+    // --- Phase 4: RMSNorm + scale ---
+    float ss = my_out * my_out;
+    ss = simd_sum(ss);
+
+    threadgroup float partial_sums[8];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float total_ss;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_ss = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms = sqrt(total_ss / (float)val_dim + eps);
+    float inv_norm = 1.0f / rms;
+
+    if (vj < val_dim) {
+        device const float* head_scale = scale + (h % scale_n_heads) * val_dim;
+        output[h * val_dim + vj] = my_out * inv_norm * head_scale[vj];
+    }
+}
+
+// ============================================================================
+// Batched GDN prefill kernels
+//
+// These kernels process T tokens in a single dispatch, eliminating per-token
+// kernel launch overhead during prefill. All T tokens' Q, K, V, alpha, beta
+// are pre-computed by batched GEMMs before these kernels run.
+// ============================================================================
+
+// ============================================================================
+// gdn_prefill_state_output_norm: Multi-token GDN state update + output + RMSNorm
+//
+// Processes T tokens sequentially (recurrent dependency), but:
+// - All T tokens' Q, K, V, alpha, beta are PRE-COMPUTED by batched GEMMs
+// - Single kernel launch eliminates per-token dispatch overhead
+// - RMSNorm cooperative reduction per token via threadgroup barrier
+//
+// buffer(0):  h_state      [n_heads * val_dim * key_dim] float -- R/W persistent (transposed)
+// buffer(1):  k_norm_all   [T * n_kv_heads * key_dim] float
+// buffer(2):  v_all        [T * n_heads * val_dim] float
+// buffer(3):  alpha_all    [T * n_heads] float
+// buffer(4):  beta_all     [T * n_heads] float
+// buffer(5):  q_norm_all   [T * n_kv_heads * key_dim] float
+// buffer(6):  scale        [scale_n_heads * val_dim] float
+// buffer(7):  output_all   [T * n_heads * val_dim] float -- OUTPUT
+// buffer(8):  n_heads (uint)       -- 32
+// buffer(9):  key_dim (uint)       -- 128
+// buffer(10): val_dim (uint)       -- 128
+// buffer(11): n_kv_heads (uint)    -- 16
+// buffer(12): eps (float)
+// buffer(13): scale_n_heads (uint)
+// buffer(14): T (uint)             -- number of tokens
+//
+// grid: (n_heads, 1, 1) = (32, 1, 1)
+// threadgroup: (val_dim, 1, 1) = (128, 1, 1)
+// ============================================================================
+
+kernel void gdn_prefill_state_output_norm(
+    device       float* h_state        [[buffer(0)]],
+    device const float* k_norm_all     [[buffer(1)]],
+    device const float* v_all          [[buffer(2)]],
+    device const float* alpha_all      [[buffer(3)]],
+    device const float* beta_all       [[buffer(4)]],
+    device const float* q_norm_all     [[buffer(5)]],
+    device const float* scale          [[buffer(6)]],
+    device       float* output_all     [[buffer(7)]],
+    constant     uint&  n_heads        [[buffer(8)]],
+    constant     uint&  key_dim        [[buffer(9)]],
+    constant     uint&  val_dim        [[buffer(10)]],
+    constant     uint&  n_kv_heads     [[buffer(11)]],
+    constant     float& eps            [[buffer(12)]],
+    constant     uint&  scale_n_heads  [[buffer(13)]],
+    constant     uint&  T              [[buffer(14)]],
+    uint head_idx                      [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_index_in_threadgroup]],
+    uint tg_size                       [[threads_per_threadgroup]],
+    uint simd_lane                     [[thread_index_in_simdgroup]],
+    uint simd_group                    [[simdgroup_index_in_threadgroup]])
+{
+    if (head_idx >= n_heads) return;
+
+    uint h = head_idx;
+    // V has n_heads=32 heads. Q and K have n_kv_heads=16 heads.
+    // GGUF stores V-heads de-interleaved: heads 0..15 = MLX even heads,
+    // heads 16..31 = MLX odd heads. Correct GQA: kv_head = h % n_kv_heads
+    uint kv_head = h % n_kv_heads;
+
+    // Q scaling factor: 1/sqrt(key_dim)
+    float q_scale = rsqrt((float)key_dim);
+
+    uint vj = tid;
+
+    // Pointer to this head's state row (contiguous key_dim, transposed layout)
+    device float* h_row = (vj < val_dim) ? (h_state + h * val_dim * key_dim + vj * key_dim) : nullptr;
+
+    for (uint t = 0; t < T; t++) {
+        // Read per-token gating values
+        float a = alpha_all[t * n_heads + h];
+        float b = beta_all[t * n_heads + h];
+
+        // Per-token K and Q pointers (GQA: use kv_head)
+        device const float* k_head = k_norm_all + t * n_kv_heads * key_dim + kv_head * key_dim;
+        device const float* q_head = q_norm_all + t * n_kv_heads * key_dim + kv_head * key_dim;
+
+        // GDN recurrence per column vj (transposed layout):
+        //   1. s_decayed = alpha * s_old          (decay FIRST)
+        //   2. retrieval = s_decayed^T @ k        (retrieve from DECAYED state)
+        //   3. delta = beta * (v - retrieval)
+        //   4. s_new = s_decayed + outer(k, delta)
+        //   5. output = s_new @ (q * scale)       (scale = 1/sqrt(key_dim))
+        float my_out = 0.0f;
+        if (vj < val_dim) {
+            // V has n_heads heads (no GQA) -- use h directly
+            float v_val = v_all[t * n_heads * val_dim + h * val_dim + vj];
+
+            // Phase 1: Decay state, then retrieve from DECAYED state
+            float retrieval = 0.0f;
+            for (uint ki = 0; ki < key_dim; ki++) {
+                float h_decayed = a * h_row[ki];
+                h_row[ki] = h_decayed;  // write decayed state back
+                retrieval += h_decayed * k_head[ki];
+            }
+
+            // Phase 2: Delta rule update + output (on already-decayed state)
+            float v_delta = b * (v_val - retrieval);
+            for (uint ki = 0; ki < key_dim; ki++) {
+                float h_updated = h_row[ki] + k_head[ki] * v_delta;
+                h_row[ki] = h_updated;
+                my_out += h_updated * q_head[ki] * q_scale;
+            }
+        }
+
+        // Phase 3: RMSNorm cooperative reduction across threadgroup
+        // x / sqrt(mean(x^2) + eps) * weight
+        float ss = my_out * my_out;
+        ss = simd_sum(ss);
+
+        threadgroup float partial_sums[8];
+        if (simd_lane == 0) {
+            partial_sums[simd_group] = ss;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint num_simd_groups = (tg_size + 31) / 32;
+        threadgroup float total_ss;
+        if (simd_group == 0) {
+            float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+            val = simd_sum(val);
+            if (simd_lane == 0) {
+                total_ss = val;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float rms = sqrt(total_ss / (float)val_dim + eps);
+        float inv_norm = 1.0f / rms;
+
+        // Write normalized + scaled output for this token
+        if (vj < val_dim) {
+            device const float* head_scale = scale + (h % scale_n_heads) * val_dim;
+            output_all[t * n_heads * val_dim + h * val_dim + vj] = my_out * inv_norm * head_scale[vj];
+        }
+    }
+}
+// gdn_prefill_fused: Fused GDN prefill kernel with register-resident state
+//
+// Critical optimization: keeps the h_state matrix in registers instead of
+// reading/writing from device memory for each token. This eliminates
+// T * 2MB * 2 (R+W) = ~504MB of state memory traffic per layer (T=126).
+//
+// Also fuses: compute_gates (alpha/beta transformation) + L2 normalize Q/K
+// + state update + output projection + RMSNorm + SiLU mul (output gating)
+//
+// Input layout (all pre-computed by batched matvec):
+//   conv_out:  [T, qkv_dim] float  -- SiLU-activated conv1d output
+//              Q at [0..qk_dim), K at [qk_dim..2*qk_dim), V at [2*qk_dim..2*qk_dim+value_dim)
+//   alpha_raw: [T, n_heads] float  -- raw alpha projection (before compute_gates)
+//   beta_raw:  [T, n_heads] float  -- raw beta projection (before compute_gates)
+//   gate:      [T, q_dim] float    -- output gate for SiLU mul
+//
+// buffer(0):  h_state       [n_heads * val_dim * key_dim] float -- R/W persistent (transposed)
+// buffer(1):  conv_out_all  [T * (qk_dim + qk_dim + value_dim)] float
+// buffer(2):  alpha_raw_all [T * n_heads] float
+// buffer(3):  beta_raw_all  [T * n_heads] float
+// buffer(4):  gate_all      [T * q_dim] float (output gate)
+// buffer(5):  dt_bias       [n_heads] float
+// buffer(6):  A_log         [n_heads] float
+// buffer(7):  norm_scale    [scale_n_heads * val_dim] float
+// buffer(8):  ssm_out       [T * n_heads * val_dim] float -- OUTPUT (after RMSNorm + SiLU mul)
+// buffer(9):  n_heads (uint)       -- 32
+// buffer(10): key_dim (uint)       -- 128
+// buffer(11): val_dim (uint)       -- 128
+// buffer(12): n_kv_heads (uint)    -- 16
+// buffer(13): eps (float)
+// buffer(14): scale_n_heads (uint)
+// buffer(15): T (uint)
+// buffer(16): qk_dim (uint)        -- 2048
+// buffer(17): qkv_dim (uint)       -- 8192 (total Q+K+V dim)
+//
+// grid: (n_heads, 1, 1) = (32, 1, 1)
+// threadgroup: (val_dim, 1, 1) = (128, 1, 1)
+// ============================================================================
+
+kernel void gdn_prefill_fused(
+    device       float* h_state        [[buffer(0)]],
+    device const float* conv_out_all   [[buffer(1)]],
+    device const float* alpha_raw_all  [[buffer(2)]],
+    device const float* beta_raw_all   [[buffer(3)]],
+    device const float* gate_all       [[buffer(4)]],
+    device const float* dt_bias        [[buffer(5)]],
+    device const float* A_log          [[buffer(6)]],
+    device const float* norm_scale     [[buffer(7)]],
+    device       float* ssm_out        [[buffer(8)]],
+    constant     uint&  n_heads        [[buffer(9)]],
+    constant     uint&  key_dim        [[buffer(10)]],
+    constant     uint&  val_dim        [[buffer(11)]],
+    constant     uint&  n_kv_heads     [[buffer(12)]],
+    constant     float& eps            [[buffer(13)]],
+    constant     uint&  scale_n_heads  [[buffer(14)]],
+    constant     uint&  T              [[buffer(15)]],
+    constant     uint&  qk_dim         [[buffer(16)]],
+    constant     uint&  qkv_dim        [[buffer(17)]],
+    uint head_idx                      [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_index_in_threadgroup]],
+    uint tg_size                       [[threads_per_threadgroup]],
+    uint simd_lane                     [[thread_index_in_simdgroup]],
+    uint simd_group                    [[simdgroup_index_in_threadgroup]])
+{
+    if (head_idx >= n_heads) return;
+
+    uint h = head_idx;
+    uint kv_head = h % n_kv_heads;
+    float q_scale = rsqrt((float)key_dim);
+    uint vj = tid;
+
+    // Load state into registers (128 floats per thread, transposed layout)
+    float state[128];  // key_dim=128 elements per val_dim row
+    if (vj < val_dim) {
+        device const float* h_row = h_state + h * val_dim * key_dim + vj * key_dim;
+        for (uint ki = 0; ki < key_dim; ki++) {
+            state[ki] = h_row[ki];
+        }
+    }
+
+    // Pre-compute per-head gate transformation constants
+    float dt_b = dt_bias[h];
+    // GGUF stores ssm_a = -exp(A_log), already negated+exponentiated.
+    // Typical values: ssm_a ~ -0.036 (slow decay) to -72 (fast decay).
+    float ssm_a_val = A_log[h];
+
+    for (uint t = 0; t < T; t++) {
+        // --- Compute gates (fused, matching gdn_compute_gates kernel) ---
+        float alpha_raw = alpha_raw_all[t * n_heads + h];
+        float beta_raw = beta_raw_all[t * n_heads + h];
+
+        // softplus(x) = log(1 + exp(x)), with numerical stability for large x
+        float sp_input = alpha_raw + dt_b;
+        float sp;
+        if (sp_input > 20.0f) {
+            sp = sp_input;
+        } else {
+            sp = log(1.0f + exp(sp_input));
+        }
+        // gate = ssm_a * softplus(alpha_raw + dt_bias)
+        // ssm_a is negative, so gate is negative, alpha = exp(gate) in (0,1)
+        float a = exp(ssm_a_val * sp);
+
+        // beta = sigmoid(beta_raw)
+        float b = 1.0f / (1.0f + exp(-beta_raw));
+
+        // --- L2 normalize Q and K (fused, avoids separate dispatch) ---
+        // Each thread contributes to the norm computation for its simdgroup's head.
+        // Q is at conv_out_all[t * qkv_dim + 0..qk_dim)
+        // K is at conv_out_all[t * qkv_dim + qk_dim..2*qk_dim)
+        device const float* conv_t = conv_out_all + t * qkv_dim;
+        device const float* q_raw = conv_t + kv_head * key_dim;
+        device const float* k_raw = conv_t + qk_dim + kv_head * key_dim;
+
+        // Compute L2 norms using simd reduction across key_dim
+        // We need a threadgroup-level approach since key_dim=128 = 4 simdgroups
+        // But each thread handles one vj, not one ki. We need to read Q and K
+        // values in a cooperative manner.
+        //
+        // Actually, the current approach reads Q[ki] and K[ki] in the inner loop.
+        // We can compute the L2 norm inline during the first pass.
+
+        // First pass: compute L2 norms of Q and K heads (cooperative)
+        // Each thread reads a portion of the Q/K vectors and contributes to the norm
+        float q_val = (vj < key_dim) ? q_raw[vj] : 0.0f;
+        float k_val = (vj < key_dim) ? k_raw[vj] : 0.0f;
+        float q_sq = q_val * q_val;
+        float k_sq = k_val * k_val;
+
+        // Reduce across threadgroup to get full norms
+        q_sq = simd_sum(q_sq);
+        k_sq = simd_sum(k_sq);
+
+        threadgroup float tg_q_sq[4];
+        threadgroup float tg_k_sq[4];
+        if (simd_lane == 0) {
+            tg_q_sq[simd_group] = q_sq;
+            tg_k_sq[simd_group] = k_sq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint num_sg = (tg_size + 31) / 32;
+        threadgroup float tg_q_norm;
+        threadgroup float tg_k_norm;
+        if (simd_group == 0) {
+            float qv = (simd_lane < num_sg) ? tg_q_sq[simd_lane] : 0.0f;
+            float kv = (simd_lane < num_sg) ? tg_k_sq[simd_lane] : 0.0f;
+            qv = simd_sum(qv);
+            kv = simd_sum(kv);
+            if (simd_lane == 0) {
+                float l2_eps = 1e-12f;
+                tg_q_norm = max(sqrt(qv), l2_eps);
+                tg_k_norm = max(sqrt(kv), l2_eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float q_inv_norm = 1.0f / tg_q_norm;
+        float k_inv_norm = 1.0f / tg_k_norm;
+
+        // --- GDN recurrence with register-resident state ---
+        float my_out = 0.0f;
+        if (vj < val_dim) {
+            // V value for this head and token
+            float v_val = conv_t[qk_dim + qk_dim + h * val_dim + vj];
+
+            // Phase 1: Decay state, then retrieve from DECAYED state
+            float retrieval = 0.0f;
+            for (uint ki = 0; ki < key_dim; ki++) {
+                float h_decayed = a * state[ki];
+                state[ki] = h_decayed;
+                float k_norm_ki = k_raw[ki] * k_inv_norm;
+                retrieval += h_decayed * k_norm_ki;
+            }
+
+            // Phase 2: Delta rule update + output projection
+            float v_delta = b * (v_val - retrieval);
+            for (uint ki = 0; ki < key_dim; ki++) {
+                float k_norm_ki = k_raw[ki] * k_inv_norm;
+                float h_updated = state[ki] + k_norm_ki * v_delta;
+                state[ki] = h_updated;
+                float q_norm_ki = q_raw[ki] * q_inv_norm;
+                my_out += h_updated * q_norm_ki * q_scale;
+            }
+        }
+
+        // Phase 3: RMSNorm cooperative reduction
+        float ss = my_out * my_out;
+        ss = simd_sum(ss);
+
+        threadgroup float partial_sums[4];
+        if (simd_lane == 0) {
+            partial_sums[simd_group] = ss;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float total_ss;
+        if (simd_group == 0) {
+            float val = (simd_lane < num_sg) ? partial_sums[simd_lane] : 0.0f;
+            val = simd_sum(val);
+            if (simd_lane == 0) {
+                total_ss = val;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float rms = sqrt(total_ss / (float)val_dim + eps);
+        float inv_norm = 1.0f / rms;
+
+        // Phase 4: Write SiLU-gated, normalized output
+        // silu_mul: silu(gate) * normed_out = (gate * sigmoid(gate)) * (out * inv_norm * scale)
+        if (vj < val_dim) {
+            device const float* head_scale = norm_scale + (h % scale_n_heads) * val_dim;
+            float normed = my_out * inv_norm * head_scale[vj];
+
+            // Output gating: gate has q_dim=4096 elements, indexed by [h * val_dim + vj]
+            float gate_val = gate_all[t * n_heads * val_dim + h * val_dim + vj];
+            float silu_gate = gate_val / (1.0f + exp(-gate_val));  // silu(x) = x * sigmoid(x)
+
+            ssm_out[t * n_heads * val_dim + h * val_dim + vj] = silu_gate * normed;
+        }
+    }
+
+    // Write state back to device memory (transposed layout)
+    if (vj < val_dim) {
+        device float* h_row = h_state + h * val_dim * key_dim + vj * key_dim;
+        for (uint ki = 0; ki < key_dim; ki++) {
+            h_row[ki] = state[ki];
+        }
+    }
+}
+
+// ============================================================================
+// gdn_prefill_fused_v2: Simdgroup-parallel GDN prefill kernel
+//
+// Key optimization: each thread holds only 4 state floats instead of 128.
+// This reduces register pressure by 32x vs. gdn_prefill_fused.
+//
+// Thread mapping:
+//   - Each threadgroup = 1 simdgroup = 32 threads
+//   - Each threadgroup handles one (head, val_dim_index) pair
+//   - 32 threads cooperate on key_dim=128 (4 elements each)
+//   - simd_sum for all reductions across key_dim
+//   - No threadgroup barriers (pure simd operations)
+//
+// Grid: (1, val_dim=128, n_heads=32) threadgroups
+// Threadgroup: (32, 1, 1) threads
+//
+// Output: raw_out [T * n_heads * val_dim] float (before RMSNorm)
+// RMSNorm + SiLU gating done by a separate gdn_prefill_norm_gate kernel.
+//
+// buffer(0):  h_state       [n_heads * val_dim * key_dim] float -- R/W persistent (transposed)
+// buffer(1):  conv_out_all  [T * qkv_dim] float (SiLU-activated, Q/K L2-normalized)
+// buffer(2):  alpha_all     [T * n_heads] float -- PRECOMPUTED: exp(gate)
+// buffer(3):  beta_all      [T * n_heads] float -- PRECOMPUTED: sigmoid(beta_raw)
+// buffer(4):  dt_bias       [n_heads] float     -- UNUSED (gates precomputed)
+// buffer(5):  A_log         [n_heads] float     -- UNUSED (gates precomputed)
+// buffer(6):  raw_out       [T * n_heads * val_dim] float -- OUTPUT (raw, before RMSNorm)
+// buffer(7):  n_heads (uint)       -- 32
+// buffer(8):  key_dim (uint)       -- 128
+// buffer(9):  val_dim (uint)       -- 128
+// buffer(10): n_kv_heads (uint)    -- 16
+// buffer(11): T (uint)
+// buffer(12): qk_dim (uint)        -- 2048
+// buffer(13): qkv_dim (uint)       -- 8192
+// ============================================================================
+
+kernel void gdn_prefill_fused_v2(
+    device       float* h_state        [[buffer(0)]],
+    device const float* conv_out_all   [[buffer(1)]],
+    device const float* alpha_all      [[buffer(2)]],
+    device const float* beta_all       [[buffer(3)]],
+    device const float* dt_bias        [[buffer(4)]],
+    device const float* A_log          [[buffer(5)]],
+    device       float* raw_out        [[buffer(6)]],
+    constant     uint&  n_heads        [[buffer(7)]],
+    constant     uint&  key_dim        [[buffer(8)]],
+    constant     uint&  val_dim        [[buffer(9)]],
+    constant     uint&  n_kv_heads     [[buffer(10)]],
+    constant     uint&  T              [[buffer(11)]],
+    constant     uint&  qk_dim         [[buffer(12)]],
+    constant     uint&  qkv_dim        [[buffer(13)]],
+    uint3 tg_pos                       [[threadgroup_position_in_grid]],
+    uint lane                          [[thread_index_in_simdgroup]])
+{
+    // tg_pos.y = val_dim index (vj), tg_pos.z = head index (h)
+    uint vj = tg_pos.y;
+    uint h  = tg_pos.z;
+    if (h >= n_heads || vj >= val_dim) return;
+
+    uint kv_head = h % n_kv_heads;
+    float q_scale = rsqrt((float)key_dim);
+
+    // Each thread handles 4 key_dim elements: lane*4 .. lane*4+3
+    uint k_base = lane * 4;
+
+    // Load 4 state elements into registers (transposed layout, contiguous access)
+    device float* h_row = h_state + h * val_dim * key_dim + vj * key_dim;
+    float s0 = h_row[k_base + 0];
+    float s1 = h_row[k_base + 1];
+    float s2 = h_row[k_base + 2];
+    float s3 = h_row[k_base + 3];
+
+    for (uint t = 0; t < T; t++) {
+        // --- Read precomputed gates ---
+        float a = alpha_all[t * n_heads + h];
+        float b = beta_all[t * n_heads + h];
+
+        // --- Read pre-normalized Q and K (L2 normalization done by l2_normalize_qk_strided) ---
+        device const float* conv_t = conv_out_all + t * qkv_dim;
+        device const float* q_head = conv_t + kv_head * key_dim;
+        device const float* k_head = conv_t + qk_dim + kv_head * key_dim;
+
+        // Each thread loads 4 pre-normalized Q and K values
+        float qn0 = q_head[k_base + 0];
+        float qn1 = q_head[k_base + 1];
+        float qn2 = q_head[k_base + 2];
+        float qn3 = q_head[k_base + 3];
+
+        float kn0 = k_head[k_base + 0];
+        float kn1 = k_head[k_base + 1];
+        float kn2 = k_head[k_base + 2];
+        float kn3 = k_head[k_base + 3];
+
+        // --- V value for this head and vj ---
+        float v_val = conv_t[qk_dim + qk_dim + h * val_dim + vj];
+
+        // --- Phase 1: Decay state + retrieval ---
+        float d0 = a * s0;
+        float d1 = a * s1;
+        float d2 = a * s2;
+        float d3 = a * s3;
+
+        // retrieval = dot(h_decayed, k_norm) -- reduce across simd
+        float ret_local = d0*kn0 + d1*kn1 + d2*kn2 + d3*kn3;
+        float retrieval = simd_sum(ret_local);
+
+        // --- Phase 2: Delta update + output projection ---
+        float v_delta = b * (v_val - retrieval);
+
+        s0 = d0 + kn0 * v_delta;
+        s1 = d1 + kn1 * v_delta;
+        s2 = d2 + kn2 * v_delta;
+        s3 = d3 + kn3 * v_delta;
+
+        // output = dot(h_updated, q_norm * q_scale) -- reduce across simd
+        float out_local = s0*qn0 + s1*qn1 + s2*qn2 + s3*qn3;
+        float my_out = simd_sum(out_local) * q_scale;
+
+        // Write raw output (only lane 0 writes to avoid races)
+        if (lane == 0) {
+            raw_out[t * n_heads * val_dim + h * val_dim + vj] = my_out;
+        }
+    }
+
+    // Write state back to device memory (transposed layout, contiguous)
+    h_row[k_base + 0] = s0;
+    h_row[k_base + 1] = s1;
+    h_row[k_base + 2] = s2;
+    h_row[k_base + 3] = s3;
+}
+
+// ============================================================================
+// gdn_prefill_fused_v3_chunked: Loop-unrolled GDN prefill kernel
+//
+// Identical algorithm to gdn_prefill_fused_v2 but with C=4 loop unrolling.
+// Prefetches alpha/beta/Q/K/V for 4 consecutive tokens into registers before
+// processing the recurrence steps, enabling memory latency hiding and reducing
+// loop overhead by 4x.
+//
+// Thread mapping and grid are identical to v2:
+//   - Each threadgroup = 1 simdgroup = 32 threads
+//   - Each threadgroup handles one (head, val_dim_index) pair
+//   - 32 threads cooperate on key_dim=128 (4 elements each)
+//   - simd_sum for all reductions across key_dim
+//
+// Grid: (1, val_dim=128, n_heads=32) threadgroups
+// Threadgroup: (32, 1, 1) threads
+//
+// Buffers: alpha/beta are pre-computed gates (not raw projections)
+// ============================================================================
+
+kernel void gdn_prefill_fused_v3_chunked(
+    device       float* h_state        [[buffer(0)]],
+    device const float* conv_out_all   [[buffer(1)]],
+    device const float* alpha_all      [[buffer(2)]],
+    device const float* beta_all       [[buffer(3)]],
+    device       float* raw_out        [[buffer(4)]],
+    constant     uint&  n_heads        [[buffer(5)]],
+    constant     uint&  key_dim        [[buffer(6)]],
+    constant     uint&  val_dim        [[buffer(7)]],
+    constant     uint&  n_kv_heads     [[buffer(8)]],
+    constant     uint&  T              [[buffer(9)]],
+    constant     uint&  qk_dim         [[buffer(10)]],
+    constant     uint&  qkv_dim        [[buffer(11)]],
+    uint3 tg_pos                       [[threadgroup_position_in_grid]],
+    uint lane                          [[thread_index_in_simdgroup]])
+{
+    uint vj = tg_pos.y;
+    uint h  = tg_pos.z;
+    if (h >= n_heads || vj >= val_dim) return;
+
+    uint kv_head = h % n_kv_heads;
+    float q_scale = rsqrt((float)key_dim);
+
+    // Each thread handles 4 key_dim elements: lane*4 .. lane*4+3
+    uint k_base = lane * 4;
+
+    // Load 4 state elements into registers (transposed layout, contiguous access)
+    device float* h_row = h_state + h * val_dim * key_dim + vj * key_dim;
+    float s0 = h_row[k_base + 0];
+    float s1 = h_row[k_base + 1];
+    float s2 = h_row[k_base + 2];
+    float s3 = h_row[k_base + 3];
+
+    // Precomputed offsets for Q/K/V indexing within conv_out_all
+    uint q_head_off = kv_head * key_dim + k_base;
+    uint k_head_off = qk_dim + kv_head * key_dim + k_base;
+    uint v_head_off = qk_dim + qk_dim + h * val_dim + vj;
+    uint out_stride = n_heads * val_dim;
+    uint out_base = h * val_dim + vj;
+
+    // Process T tokens in chunks of 4
+    uint t = 0;
+    uint T_aligned = T & ~3u;  // T rounded down to multiple of 4
+
+    for (; t < T_aligned; t += 4) {
+        // --- Prefetch all data for 4 tokens into registers ---
+        device const float* c0 = conv_out_all + t * qkv_dim;
+        device const float* c1 = c0 + qkv_dim;
+        device const float* c2 = c1 + qkv_dim;
+        device const float* c3 = c2 + qkv_dim;
+
+        float a_0 = alpha_all[t * n_heads + h];
+        float a_1 = alpha_all[(t+1) * n_heads + h];
+        float a_2 = alpha_all[(t+2) * n_heads + h];
+        float a_3 = alpha_all[(t+3) * n_heads + h];
+
+        float b_0 = beta_all[t * n_heads + h];
+        float b_1 = beta_all[(t+1) * n_heads + h];
+        float b_2 = beta_all[(t+2) * n_heads + h];
+        float b_3 = beta_all[(t+3) * n_heads + h];
+
+        // Q values for 4 tokens (4 key elements each)
+        float q0_0 = c0[q_head_off];     float q0_1 = c0[q_head_off+1];
+        float q0_2 = c0[q_head_off+2];   float q0_3 = c0[q_head_off+3];
+        float q1_0 = c1[q_head_off];     float q1_1 = c1[q_head_off+1];
+        float q1_2 = c1[q_head_off+2];   float q1_3 = c1[q_head_off+3];
+        float q2_0 = c2[q_head_off];     float q2_1 = c2[q_head_off+1];
+        float q2_2 = c2[q_head_off+2];   float q2_3 = c2[q_head_off+3];
+        float q3_0 = c3[q_head_off];     float q3_1 = c3[q_head_off+1];
+        float q3_2 = c3[q_head_off+2];   float q3_3 = c3[q_head_off+3];
+
+        // K values for 4 tokens
+        float k0_0 = c0[k_head_off];     float k0_1 = c0[k_head_off+1];
+        float k0_2 = c0[k_head_off+2];   float k0_3 = c0[k_head_off+3];
+        float k1_0 = c1[k_head_off];     float k1_1 = c1[k_head_off+1];
+        float k1_2 = c1[k_head_off+2];   float k1_3 = c1[k_head_off+3];
+        float k2_0 = c2[k_head_off];     float k2_1 = c2[k_head_off+1];
+        float k2_2 = c2[k_head_off+2];   float k2_3 = c2[k_head_off+3];
+        float k3_0 = c3[k_head_off];     float k3_1 = c3[k_head_off+1];
+        float k3_2 = c3[k_head_off+2];   float k3_3 = c3[k_head_off+3];
+
+        // V values for 4 tokens
+        float v0 = c0[v_head_off];
+        float v1 = c1[v_head_off];
+        float v2 = c2[v_head_off];
+        float v3_v = c3[v_head_off];
+
+        // --- Token 0: recurrence step ---
+        {
+            float d0 = a_0 * s0;  float d1 = a_0 * s1;
+            float d2 = a_0 * s2;  float d3 = a_0 * s3;
+            float retrieval = simd_sum(d0*k0_0 + d1*k0_1 + d2*k0_2 + d3*k0_3);
+            float v_delta = b_0 * (v0 - retrieval);
+            s0 = d0 + k0_0 * v_delta;  s1 = d1 + k0_1 * v_delta;
+            s2 = d2 + k0_2 * v_delta;  s3 = d3 + k0_3 * v_delta;
+            float my_out = simd_sum(s0*q0_0 + s1*q0_1 + s2*q0_2 + s3*q0_3) * q_scale;
+            if (lane == 0) raw_out[t * out_stride + out_base] = my_out;
+        }
+
+        // --- Token 1: recurrence step ---
+        {
+            float d0 = a_1 * s0;  float d1 = a_1 * s1;
+            float d2 = a_1 * s2;  float d3 = a_1 * s3;
+            float retrieval = simd_sum(d0*k1_0 + d1*k1_1 + d2*k1_2 + d3*k1_3);
+            float v_delta = b_1 * (v1 - retrieval);
+            s0 = d0 + k1_0 * v_delta;  s1 = d1 + k1_1 * v_delta;
+            s2 = d2 + k1_2 * v_delta;  s3 = d3 + k1_3 * v_delta;
+            float my_out = simd_sum(s0*q1_0 + s1*q1_1 + s2*q1_2 + s3*q1_3) * q_scale;
+            if (lane == 0) raw_out[(t+1) * out_stride + out_base] = my_out;
+        }
+
+        // --- Token 2: recurrence step ---
+        {
+            float d0 = a_2 * s0;  float d1 = a_2 * s1;
+            float d2 = a_2 * s2;  float d3 = a_2 * s3;
+            float retrieval = simd_sum(d0*k2_0 + d1*k2_1 + d2*k2_2 + d3*k2_3);
+            float v_delta = b_2 * (v2 - retrieval);
+            s0 = d0 + k2_0 * v_delta;  s1 = d1 + k2_1 * v_delta;
+            s2 = d2 + k2_2 * v_delta;  s3 = d3 + k2_3 * v_delta;
+            float my_out = simd_sum(s0*q2_0 + s1*q2_1 + s2*q2_2 + s3*q2_3) * q_scale;
+            if (lane == 0) raw_out[(t+2) * out_stride + out_base] = my_out;
+        }
+
+        // --- Token 3: recurrence step ---
+        {
+            float d0 = a_3 * s0;  float d1 = a_3 * s1;
+            float d2 = a_3 * s2;  float d3 = a_3 * s3;
+            float retrieval = simd_sum(d0*k3_0 + d1*k3_1 + d2*k3_2 + d3*k3_3);
+            float v_delta = b_3 * (v3_v - retrieval);
+            s0 = d0 + k3_0 * v_delta;  s1 = d1 + k3_1 * v_delta;
+            s2 = d2 + k3_2 * v_delta;  s3 = d3 + k3_3 * v_delta;
+            float my_out = simd_sum(s0*q3_0 + s1*q3_1 + s2*q3_2 + s3*q3_3) * q_scale;
+            if (lane == 0) raw_out[(t+3) * out_stride + out_base] = my_out;
+        }
+    }
+
+    // --- Tail: process remaining 0-3 tokens one at a time ---
+    for (; t < T; t++) {
+        float a = alpha_all[t * n_heads + h];
+        float b = beta_all[t * n_heads + h];
+
+        device const float* conv_t = conv_out_all + t * qkv_dim;
+
+        float qn0 = conv_t[q_head_off];     float qn1 = conv_t[q_head_off+1];
+        float qn2 = conv_t[q_head_off+2];   float qn3 = conv_t[q_head_off+3];
+        float kn0 = conv_t[k_head_off];     float kn1 = conv_t[k_head_off+1];
+        float kn2 = conv_t[k_head_off+2];   float kn3 = conv_t[k_head_off+3];
+        float v_val = conv_t[v_head_off];
+
+        float d0 = a * s0;  float d1 = a * s1;
+        float d2 = a * s2;  float d3 = a * s3;
+        float retrieval = simd_sum(d0*kn0 + d1*kn1 + d2*kn2 + d3*kn3);
+        float v_delta = b * (v_val - retrieval);
+        s0 = d0 + kn0 * v_delta;  s1 = d1 + kn1 * v_delta;
+        s2 = d2 + kn2 * v_delta;  s3 = d3 + kn3 * v_delta;
+        float my_out = simd_sum(s0*qn0 + s1*qn1 + s2*qn2 + s3*qn3) * q_scale;
+        if (lane == 0) raw_out[t * out_stride + out_base] = my_out;
+    }
+
+    // Write state back to device memory (transposed layout, contiguous)
+    h_row[k_base + 0] = s0;
+    h_row[k_base + 1] = s1;
+    h_row[k_base + 2] = s2;
+    h_row[k_base + 3] = s3;
+}
+
+// ============================================================================
+// gdn_prefill_norm_gate: RMSNorm + SiLU gate on raw GDN output
+//
+// Applies per-head RMSNorm + scale + SiLU output gating.
+// Designed as post-processing for gdn_prefill_fused_v3_chunked.
+//
+// This kernel CANNOT be fused into gdn_prefill_fused_v3_chunked.
+// The state kernel is grid (1, val_dim=128, n_heads=32) -- each TG owns one vj.
+// RMSNorm needs sum-of-squares across all 128 vj values for a given (head, token),
+// which requires cross-TG reduction. Metal has no cross-TG sync within a dispatch.
+// Restructuring to coalesce all vj into one TG would require 64KB state per TG,
+// destroying occupancy. The separate dispatch + barrier is architecturally required.
+//
+// buffer(0): raw_out   [T * n_heads * val_dim] float -- INPUT (raw output)
+// buffer(1): gate_all  [T * q_dim] float             -- SiLU gate
+// buffer(2): norm_scale [scale_n_heads * val_dim] float
+// buffer(3): ssm_out   [T * n_heads * val_dim] float -- OUTPUT
+// buffer(4): n_heads (uint)
+// buffer(5): val_dim (uint)
+// buffer(6): eps (float)
+// buffer(7): scale_n_heads (uint)
+// buffer(8): T (uint)
+//
+// grid: (n_heads, T, 1), threadgroup: (128, 1, 1) where 128 = val_dim
+// Each threadgroup handles one (head, token) pair
+// ============================================================================
+
+kernel void gdn_prefill_norm_gate(
+    device const float* raw_out     [[buffer(0)]],
+    device const float* gate_all    [[buffer(1)]],
+    device const float* norm_scale  [[buffer(2)]],
+    device       float* ssm_out     [[buffer(3)]],
+    constant     uint&  n_heads     [[buffer(4)]],
+    constant     uint&  val_dim     [[buffer(5)]],
+    constant     float& eps         [[buffer(6)]],
+    constant     uint&  scale_n_heads [[buffer(7)]],
+    constant     uint&  T           [[buffer(8)]],
+    uint2 tg_pos                    [[threadgroup_position_in_grid]],
+    uint  tid                       [[thread_index_in_threadgroup]],
+    uint  simd_lane                 [[thread_index_in_simdgroup]],
+    uint  simd_group                [[simdgroup_index_in_threadgroup]])
+{
+    uint h = tg_pos.x;
+    uint t = tg_pos.y;
+    if (h >= n_heads || t >= T) return;
+
+    uint vj = tid;
+    uint idx = t * n_heads * val_dim + h * val_dim + vj;
+
+    // Load raw output value
+    float val = (vj < val_dim) ? raw_out[idx] : 0.0f;
+
+    // RMSNorm: compute sum of squares across val_dim
+    float ss = val * val;
+    ss = simd_sum(ss);
+
+    // Cross-simdgroup reduction (val_dim=128 = 4 simdgroups of 32)
+    threadgroup float partial[4];
+    if (simd_lane == 0) {
+        partial[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_sg = (val_dim + 31) / 32;
+    threadgroup float total_ss;
+    if (simd_group == 0) {
+        float v = (simd_lane < num_sg) ? partial[simd_lane] : 0.0f;
+        v = simd_sum(v);
+        if (simd_lane == 0) {
+            total_ss = v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (vj < val_dim) {
+        float inv_norm = rsqrt(total_ss / (float)val_dim + eps);
+
+        // Apply scale
+        device const float* head_scale = norm_scale + (h % scale_n_heads) * val_dim;
+        float normed = val * inv_norm * head_scale[vj];
+
+        // SiLU gate
+        float gate_val = gate_all[idx];
+        float silu_gate = gate_val / (1.0f + exp(-gate_val));
+
+        ssm_out[idx] = silu_gate * normed;
+    }
+}
+
+// ============================================================================
+
+// ============================================================================
+// ssm_conv1d_prefill: Batched causal conv1d for T tokens
+//
+// For each token t, channel d:
+//   output[t][d] = sum_{tap=0}^{kernel_size-1} kernel_w[d*kernel_size+tap] * input_at_tap
+// where input_at_tap reads from conv_state circular buffer (for taps before
+// the batch) or from earlier tokens in the batch.
+//
+// After all T tokens, conv_state is updated with the last (kernel_size-1)
+// tokens from the input batch.
+//
+// buffer(0): input      [T * dim] float
+// buffer(1): conv_state [(kernel_size-1) * dim] float -- R/W circular buffer
+// buffer(2): kernel_w   [dim * kernel_size] float     -- [dim, kernel_size]
+// buffer(3): output     [T * dim] float
+// buffer(4): dim (uint)
+// buffer(5): kernel_size (uint)  -- 4
+// buffer(6): state_pos (uint)    -- current write position in circular buffer
+// buffer(7): T (uint)
+//
+// grid: (ceil(dim/256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void ssm_conv1d_prefill(
+    device const float* input      [[buffer(0)]],
+    device       float* conv_state [[buffer(1)]],
+    device const float* kernel_w   [[buffer(2)]],
+    device       float* output     [[buffer(3)]],
+    constant     uint&  dim        [[buffer(4)]],
+    constant     uint&  kernel_size [[buffer(5)]],
+    constant     uint&  state_pos  [[buffer(6)]],
+    constant     uint&  T          [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+
+    uint d = gid;
+    uint buf_slots = kernel_size - 1;  // e.g. 3 for kernel_size=4
+
+    // Process each token in sequence
+    for (uint t = 0; t < T; t++) {
+        float sum = 0.0f;
+
+        // For each tap position (0 = oldest, kernel_size-1 = newest/current)
+        for (uint tap = 0; tap < kernel_size; tap++) {
+            float input_val;
+
+            // How many tokens back from current token t does this tap reach?
+            // tap 0 = (kernel_size-1) tokens back, tap (kernel_size-1) = current token
+            int tokens_back = (int)(kernel_size - 1 - tap);
+            int source_t = (int)t - tokens_back;
+
+            if (source_t >= 0) {
+                // Read from the input batch
+                input_val = input[(uint)source_t * dim + d];
+            } else {
+                // Read from conv_state circular buffer
+                // source_t is negative, meaning we need to look into the state
+                // The state holds the last buf_slots tokens before the batch.
+                // state_pos is the NEXT write position (oldest entry).
+                // Slot for this tap: (state_pos + buf_slots + source_t) % buf_slots
+                uint slot = (state_pos + buf_slots + (uint)((int)buf_slots + source_t)) % buf_slots;
+                input_val = conv_state[slot * dim + d];
+            }
+
+            sum += kernel_w[d * kernel_size + tap] * input_val;
+        }
+
+        output[t * dim + d] = sum;
+    }
+
+    // Update conv_state with the last buf_slots tokens from the input batch.
+    // After processing T tokens, the conv_state should contain the last
+    // (kernel_size-1) tokens so the next decode/prefill continues correctly.
+    for (uint s = 0; s < buf_slots; s++) {
+        int src_t = (int)T - (int)buf_slots + (int)s;
+        if (src_t >= 0) {
+            // This token came from the input batch
+            uint new_slot = (state_pos + s) % buf_slots;
+            conv_state[new_slot * dim + d] = input[(uint)src_t * dim + d];
+        }
+        // If src_t < 0, the state slot already has the correct value (unchanged)
+    }
+}
+
+// ============================================================================
+// ssm_conv1d_silu_prefill: Fused conv1d + SiLU for batched GDN prefill
+//
+// Same as ssm_conv1d_prefill but applies SiLU activation to the output.
+// Saves 1 dispatch + 1 memory barrier vs. separate conv1d + SiLU.
+//
+// buffer(0): input      [T * dim] float
+// buffer(1): conv_state [(kernel_size-1) * dim] float -- R/W circular buffer
+// buffer(2): kernel_w   [dim * kernel_size] float     -- [dim, kernel_size]
+// buffer(3): output     [T * dim] float
+// buffer(4): dim (uint)
+// buffer(5): kernel_size (uint)  -- 4
+// buffer(6): state_pos (uint)    -- current write position in circular buffer
+// buffer(7): T (uint)
+//
+// grid: (ceil(dim/256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void ssm_conv1d_silu_prefill(
+    device const float* input      [[buffer(0)]],
+    device       float* conv_state [[buffer(1)]],
+    device const float* kernel_w   [[buffer(2)]],
+    device       float* output     [[buffer(3)]],
+    constant     uint&  dim        [[buffer(4)]],
+    constant     uint&  kernel_size [[buffer(5)]],
+    constant     uint&  state_pos  [[buffer(6)]],
+    constant     uint&  T          [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+
+    uint d = gid;
+    uint buf_slots = kernel_size - 1;
+
+    for (uint t = 0; t < T; t++) {
+        float sum = 0.0f;
+
+        for (uint tap = 0; tap < kernel_size; tap++) {
+            float input_val;
+            int tokens_back = (int)(kernel_size - 1 - tap);
+            int source_t = (int)t - tokens_back;
+
+            if (source_t >= 0) {
+                input_val = input[(uint)source_t * dim + d];
+            } else {
+                uint slot = (state_pos + buf_slots + (uint)((int)buf_slots + source_t)) % buf_slots;
+                input_val = conv_state[slot * dim + d];
+            }
+
+            sum += kernel_w[d * kernel_size + tap] * input_val;
+        }
+
+        // Fused SiLU: silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+        output[t * dim + d] = sum / (1.0f + exp(-sum));
+    }
+
+    // Update conv_state
+    for (uint s = 0; s < buf_slots; s++) {
+        int src_t = (int)T - (int)buf_slots + (int)s;
+        if (src_t >= 0) {
+            uint new_slot = (state_pos + s) % buf_slots;
+            conv_state[new_slot * dim + d] = input[(uint)src_t * dim + d];
+        }
+    }
+}
+
+// ============================================================================
+// ssm_conv1d_silu_prefill_parallel: Token-parallel fused conv1d + SiLU
+//
+// Same computation as ssm_conv1d_silu_prefill but parallelized across tokens.
+// The serial kernel dispatches ceil(dim/256) TGs, each looping over T tokens.
+// This kernel dispatches (ceil(dim/TG_SIZE), T) TGs -- one per (channel_block, token).
+//
+// For T=128, dim=8192: 32 * 128 = 4096 TGs vs 32 serial TGs.
+// Each thread computes conv1d + SiLU for one (channel, token) pair.
+// Conv state update: only the last-token TGs (grid_y == T-1) update conv_state.
+//
+// buffer(0): input      [T * dim] float
+// buffer(1): conv_state [(kernel_size-1) * dim] float -- R/W circular buffer
+// buffer(2): kernel_w   [dim * kernel_size] float     -- [dim, kernel_size]
+// buffer(3): output     [T * dim] float
+// buffer(4): dim (uint)
+// buffer(5): kernel_size (uint)  -- 4
+// buffer(6): state_pos (uint)    -- current write position in circular buffer
+// buffer(7): T (uint)
+//
+// grid: (ceil(dim/TG_SIZE), T, 1), threadgroup: (TG_SIZE, 1, 1)
+// ============================================================================
+
+kernel void ssm_conv1d_silu_prefill_parallel(
+    device const float* input      [[buffer(0)]],
+    device       float* conv_state [[buffer(1)]],
+    device const float* kernel_w   [[buffer(2)]],
+    device       float* output     [[buffer(3)]],
+    constant     uint&  dim        [[buffer(4)]],
+    constant     uint&  kernel_size [[buffer(5)]],
+    constant     uint&  state_pos  [[buffer(6)]],
+    constant     uint&  T          [[buffer(7)]],
+    uint2  gid [[thread_position_in_grid]])
+{
+    uint d = gid.x;
+    if (d >= dim) return;
+
+    uint t = gid.y;
+    uint buf_slots = kernel_size - 1;
+
+    // Compute conv1d for this (d, t) pair
+    float sum = 0.0f;
+    for (uint tap = 0; tap < kernel_size; tap++) {
+        float input_val;
+        int tokens_back = (int)(kernel_size - 1 - tap);
+        int source_t = (int)t - tokens_back;
+
+        if (source_t >= 0) {
+            input_val = input[(uint)source_t * dim + d];
+        } else {
+            uint slot = (state_pos + buf_slots + (uint)((int)buf_slots + source_t)) % buf_slots;
+            input_val = conv_state[slot * dim + d];
+        }
+
+        sum += kernel_w[d * kernel_size + tap] * input_val;
+    }
+
+    // Fused SiLU: silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    output[t * dim + d] = sum / (1.0f + exp(-sum));
+
+    // Update conv_state: only threads handling the LAST token do this
+    if (t == T - 1) {
+        for (uint s = 0; s < buf_slots; s++) {
+            int src_t = (int)T - (int)buf_slots + (int)s;
+            if (src_t >= 0) {
+                uint new_slot = (state_pos + s) % buf_slots;
+                conv_state[new_slot * dim + d] = input[(uint)src_t * dim + d];
+            }
+        }
+    }
+}
+
+// ============================================================================
+// NOTE: silu_inplace_batched is NOT needed as a separate kernel.
+// The existing silu_inplace kernel works for batched prefill by simply
+// dispatching with dim = T * channels (total number of elements).
+// ============================================================================
+
+// ============================================================================
+// l2_normalize_heads_batched: Per-head L2 normalization for T tokens
+//
+// For each token t and head h:
+//   x[t*n_heads*head_dim + h*head_dim .. +head_dim] /= max(||x_head||, eps)
+//
+// buffer(0): x         [T * n_heads * head_dim] float -- modified in-place
+// buffer(1): n_heads (uint)
+// buffer(2): head_dim (uint)
+// buffer(3): eps (float)
+// buffer(4): T (uint)
+//
+// grid: (n_heads * T, 1, 1) -- one threadgroup per (token, head) pair
+// threadgroup: (min(head_dim, 256), 1, 1)
+// ============================================================================
+
+kernel void l2_normalize_heads_batched(
+    device       float* x        [[buffer(0)]],
+    constant     uint&  n_heads  [[buffer(1)]],
+    constant     uint&  head_dim [[buffer(2)]],
+    constant     float& eps      [[buffer(3)]],
+    constant     uint&  T        [[buffer(4)]],
+    uint group_idx               [[threadgroup_position_in_grid]],
+    uint tid                     [[thread_index_in_threadgroup]],
+    uint tg_size                 [[threads_per_threadgroup]],
+    uint simd_lane               [[thread_index_in_simdgroup]],
+    uint simd_group              [[simdgroup_index_in_threadgroup]])
+{
+    // group_idx maps to (token, head) pair
+    // Layout: group_idx = t * n_heads + h
+    uint t = group_idx / n_heads;
+    uint h = group_idx % n_heads;
+
+    if (t >= T || h >= n_heads) return;
+
+    device float* head = x + t * n_heads * head_dim + h * head_dim;
+
+    // Pass 1: compute sum of squares
+    float ss = 0.0f;
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        float v = head[i];
+        ss += v * v;
+    }
+
+    ss = simd_sum(ss);
+
+    threadgroup float partial_sums[8];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float total_ss;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_ss = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float norm = sqrt(total_ss);
+    float s = (norm > eps) ? (1.0f / norm) : (1.0f / eps);
+
+    // Pass 2: normalize
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        head[i] *= s;
+    }
+}
+
+// ============================================================================
+// l2_normalize_qk_strided: Per-head L2 normalization of Q and K within conv_out
+//
+// Q is at conv_out[t * stride + q_offset + h * head_dim .. + head_dim]
+// K is at conv_out[t * stride + k_offset + h * head_dim .. + head_dim]
+//
+// buffer(0): data       [T * stride] float -- modified in-place
+// buffer(1): n_heads (uint)       -- 16 (n_kv_heads)
+// buffer(2): head_dim (uint)      -- 128
+// buffer(3): T (uint)
+// buffer(4): stride (uint)        -- qkv_dim = 8192
+// buffer(5): q_offset (uint)      -- 0
+// buffer(6): k_offset (uint)      -- qk_dim = 2048
+//
+// grid: (n_heads * T, 1, 1) -- one threadgroup per (token, head)
+// threadgroup: (128, 1, 1)
+// ============================================================================
+
+kernel void l2_normalize_qk_strided(
+    device       float* data      [[buffer(0)]],
+    constant     uint&  n_heads   [[buffer(1)]],
+    constant     uint&  head_dim  [[buffer(2)]],
+    constant     uint&  T         [[buffer(3)]],
+    constant     uint&  stride    [[buffer(4)]],
+    constant     uint&  q_offset  [[buffer(5)]],
+    constant     uint&  k_offset  [[buffer(6)]],
+    uint group_idx               [[threadgroup_position_in_grid]],
+    uint tid                     [[thread_index_in_threadgroup]],
+    uint simd_lane               [[thread_index_in_simdgroup]],
+    uint simd_group              [[simdgroup_index_in_threadgroup]])
+{
+    uint t = group_idx / n_heads;
+    uint h = group_idx % n_heads;
+    if (t >= T || h >= n_heads) return;
+
+    device float* q_head = data + t * stride + q_offset + h * head_dim;
+    device float* k_head = data + t * stride + k_offset + h * head_dim;
+
+    // Compute L2 norms of Q and K heads (cooperative across threadgroup)
+    float q_val = (tid < head_dim) ? q_head[tid] : 0.0f;
+    float k_val = (tid < head_dim) ? k_head[tid] : 0.0f;
+    float q_sq = q_val * q_val;
+    float k_sq = k_val * k_val;
+
+    q_sq = simd_sum(q_sq);
+    k_sq = simd_sum(k_sq);
+
+    uint num_sg = (head_dim + 31) / 32;
+    threadgroup float tg_q[4];
+    threadgroup float tg_k[4];
+    if (simd_lane == 0) {
+        tg_q[simd_group] = q_sq;
+        tg_k[simd_group] = k_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float total_q_sq;
+    threadgroup float total_k_sq;
+    if (simd_group == 0) {
+        float qv = (simd_lane < num_sg) ? tg_q[simd_lane] : 0.0f;
+        float kv = (simd_lane < num_sg) ? tg_k[simd_lane] : 0.0f;
+        qv = simd_sum(qv);
+        kv = simd_sum(kv);
+        if (simd_lane == 0) {
+            float l2_eps = 1e-12f;
+            total_q_sq = rsqrt(max(qv, l2_eps));
+            total_k_sq = rsqrt(max(kv, l2_eps));
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < head_dim) {
+        q_head[tid] *= total_q_sq;
+        k_head[tid] *= total_k_sq;
+    }
+}
+
+// ============================================================================
+// gdn_compute_gates_batched: Compute decay and mixing gates for T tokens
+//
+// Per-head computation for each token t (matching NVLabs GatedDeltaNet):
+//   gate[h] = ssm_a[h] * softplus(alpha_weight[t*n_heads+h] + dt_bias[h])
+//   alpha_out[t*n_heads+h] = exp(gate)     // decay factor in (0,1)
+//   beta_out[t*n_heads+h]  = sigmoid(beta_weight[t*n_heads+h])
+//
+// buffer(0): ssm_dt_bias       [n_heads] float -- dt bias per head (shared across tokens)
+// buffer(1): ssm_a             [n_heads] float -- -exp(A_log) (shared across tokens)
+// buffer(2): ssm_beta_weight   [T * n_heads] float -- gn_proj per-token (pre-sigmoid)
+// buffer(3): ssm_alpha_weight  [T * n_heads] float -- gk_proj per-token (from batched matvec)
+// buffer(4): alpha_out         [T * n_heads] float -- OUTPUT: decay factors
+// buffer(5): beta_out          [T * n_heads] float -- OUTPUT: mixing rates
+// buffer(6): n_heads (uint)
+// buffer(7): T (uint)
+//
+// grid: (ceil(n_heads * T / 256), 1, 1), threadgroup: (256, 1, 1)
+// ============================================================================
+
+kernel void gdn_compute_gates_batched(
+    device const float* ssm_dt_bias       [[buffer(0)]],
+    device const float* ssm_a             [[buffer(1)]],
+    device const float* ssm_beta_weight   [[buffer(2)]],
+    device const float* ssm_alpha_weight  [[buffer(3)]],
+    device       float* alpha_out         [[buffer(4)]],
+    device       float* beta_out          [[buffer(5)]],
+    constant     uint&  n_heads           [[buffer(6)]],
+    constant     uint&  T                 [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = n_heads * T;
+    if (gid >= total) return;
+
+    // gid = t * n_heads + h
+    uint h = gid % n_heads;
+
+    // softplus(x) = log(1 + exp(x)), numerically stable
+    float sp_input = ssm_alpha_weight[gid] + ssm_dt_bias[h];
+    float sp;
+    if (sp_input > 20.0f) {
+        sp = sp_input;  // softplus(x) ~= x for large x
+    } else {
+        sp = log(1.0f + exp(sp_input));
+    }
+
+    // gate = ssm_a * softplus(gk_proj + dt_bias)
+    // ssm_a = -exp(A_log) (already negated+exponentiated in GGUF)
+    // gate is negative => alpha = exp(gate) in (0, 1)
+    float gate = ssm_a[h] * sp;
+    alpha_out[gid] = exp(gate);
+
+    // beta = sigmoid(gn_proj)
+    float beta_raw = ssm_beta_weight[gid];
+    beta_out[gid] = 1.0f / (1.0f + exp(-beta_raw));
+}
+
+// ============================================================================
+// Deferred-reduction Q8_0 matvec + residual add + copy
+//
+// accum[row] += dot(w_q8_row, x); copy_dst[row] = accum[row]
+//
+// Combines the matvec output projection, residual accumulation, and buffer
+// copy into a single dispatch. This fuses the SSMOut matvec + residual_add_copy
+// pattern in GDN layers.
+//
+// buffer(0): weights   [out_dim * row_bytes] uchar -- Q8_0 weight matrix
+// buffer(1): x         [in_dim] float -- input vector
+// buffer(2): accum     [out_dim] float -- R/W accumulator (residual stream)
+// buffer(3): in_dim    (uint)
+// buffer(4): copy_dst  [out_dim] float -- receives final accumulated value
+// buffer(5): out_dim   (uint)
+//
+// grid: (ceil(out_dim/4), 1, 1), threadgroup: (128, 1, 1)
+// ============================================================================
+
+kernel void dequant_matmul_q8_0_deferred_residual_copy(
+    device const uchar* weights   [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device       float* accum     [[buffer(2)]],
+    constant     uint&  in_dim    [[buffer(3)]],
+    device       float* copy_dst  [[buffer(4)]],
+    constant     uint&  out_dim   [[buffer(5)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 4;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+    const uint Q8_BLOCK_SIZE = 34;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f, 0.f, 0.f };
+
+    float yl[NQ];
+
+    device const float* yb = x + ib0 * 32 + il * NQ;
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+
+        yb += NSG * NQ * 32;
+    }
+
+    threadgroup float shmem[NR0 * NW];
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            float val = tot + accum[r0 + row];
+            accum[r0 + row] = val;
+            copy_dst[r0 + row] = val;
+        }
+    }
+}
+
+// ============================================================================
+// Deferred-reduction Q4_0 matvec + residual add + copy
+//
+// accum[row] += dot(w_q4_row, x); copy_dst[row] = accum[row]
+//
+// Q4_0 variant of the residual+copy fused matvec.
+//
+// buffer(0): weights   [out_dim * row_bytes] uchar -- Q4_0 weight matrix
+// buffer(1): x         [in_dim] float -- input vector
+// buffer(2): accum     [out_dim] float -- R/W accumulator (residual stream)
+// buffer(3): in_dim    (uint)
+// buffer(4): copy_dst  [out_dim] float -- receives final accumulated value
+// buffer(5): out_dim   (uint)
+//
+// grid: (ceil(out_dim/4), 1, 1), threadgroup: (128, 1, 1)
+// ============================================================================
+
+kernel void dequant_matmul_q4_0_deferred_residual_copy(
+    device const uchar* weights   [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device       float* accum     [[buffer(2)]],
+    constant     uint&  in_dim    [[buffer(3)]],
+    device       float* copy_dst  [[buffer(4)]],
+    constant     uint&  out_dim   [[buffer(5)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 4;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q4_BLOCK_SIZE;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f, 0.f, 0.f };
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        uint block_base = ib * 32;
+        float yl_lo[4], yl_hi[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            yl_lo[i] = x[block_base + il * 4 + i];
+            yl_hi[i] = x[block_base + il * 4 + 16 + i];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q4_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const uchar* qdata = (device const uchar*)(bp + 2) + il * 4;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+                uchar byte_val = qdata[i];
+                float lo = float(byte_val & 0x0F) - 8.0f;
+                float hi = float(byte_val >> 4) - 8.0f;
+                sumq += lo * yl_lo[i] + hi * yl_hi[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+    }
+
+    threadgroup float shmem[NR0 * NW];
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            float val = tot + accum[r0 + row];
+            accum[r0 + row] = val;
+            copy_dst[r0 + row] = val;
+        }
+    }
+}
+
+// ============================================================================
+// dequant_matmul_q4_0_deferred_residual_copy_nr2: NR0=2 Q4_0 matvec + residual + copy
+//
+// accum[row] += dot(w_q4_row, x); copy_dst[row] = accum[row]
+//
+// NR0=2 variant for better GPU occupancy.
+//
+// Dispatch: threadgroups = ceil(out_dim/2), threads_per_threadgroup = 128
+// ============================================================================
+
+kernel void dequant_matmul_q4_0_deferred_residual_copy_nr2(
+    device const uchar* weights   [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device       float* accum     [[buffer(2)]],
+    constant     uint&  in_dim    [[buffer(3)]],
+    device       float* copy_dst  [[buffer(4)]],
+    constant     uint&  out_dim   [[buffer(5)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q4_BLOCK_SIZE;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f };
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        uint block_base = ib * 32;
+        float yl_lo[4], yl_hi[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            yl_lo[i] = x[block_base + il * 4 + i];
+            yl_hi[i] = x[block_base + il * 4 + 16 + i];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q4_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const uchar* qdata = (device const uchar*)(bp + 2) + il * 4;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+                uchar byte_val = qdata[i];
+                float lo = float(byte_val & 0x0F) - 8.0f;
+                float hi = float(byte_val >> 4) - 8.0f;
+                sumq += lo * yl_lo[i] + hi * yl_hi[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+    }
+
+    threadgroup float shmem[NR0 * NW];
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            float val = tot + accum[r0 + row];
+            accum[r0 + row] = val;
+            copy_dst[r0 + row] = val;
+        }
+    }
+}
+
+// ============================================================================
+// dequant_matmul_q4_0_silu_deferred_residual_copy_nr2:
+// Same as dequant_matmul_q4_0_deferred_residual_copy_nr2 but applies
+// silu(gate[i]) * x[i] inline during x-vector loading. This eliminates
+// the separate silu_elementwise_mul dispatch and barrier.
+//
+// buffer(0): weights   [out_dim, in_dim] Q4_0
+// buffer(1): x         [in_dim] float -- values to gate (normed GDN output)
+// buffer(2): accum     [out_dim] float -- R/W (residual accumulator)
+// buffer(3): in_dim (uint)
+// buffer(4): copy_dst  [out_dim] float -- write copy of accum
+// buffer(5): out_dim (uint)
+// buffer(6): gate      [in_dim] float -- gate values (silu applied inline)
+//
+// Dispatch: threadgroups = ceil(out_dim/2), threads_per_threadgroup = 128
+// ============================================================================
+
+kernel void dequant_matmul_q4_0_silu_deferred_residual_copy_nr2(
+    device const uchar* weights   [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device       float* accum     [[buffer(2)]],
+    constant     uint&  in_dim    [[buffer(3)]],
+    device       float* copy_dst  [[buffer(4)]],
+    constant     uint&  out_dim   [[buffer(5)]],
+    device const float* gate      [[buffer(6)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NQ = 8;
+    const uint NW = 32;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q4_BLOCK_SIZE;
+
+    const uint r0 = tgpig * NR0;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    const uint ib0 = sgitg * NQ + ix;
+
+    device const uchar* ax[NR0];
+    for (uint row = 0; row < NR0; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    float sumf[NR0] = { 0.f, 0.f };
+
+    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+        uint block_base = ib * 32;
+        // Fused silu(gate) * x: load gate and x, compute inline
+        // Q4_0 de-interleaved: elements 0-15 = lo nibbles, 16-31 = hi nibbles
+        float yl_lo[4], yl_hi[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            uint idx_lo = block_base + il * 4 + i;
+            uint idx_hi = block_base + il * 4 + 16 + i;
+            float g_lo = gate[idx_lo];
+            float g_hi = gate[idx_hi];
+            float sig_lo = 1.0f / (1.0f + exp(-g_lo));
+            float sig_hi = 1.0f / (1.0f + exp(-g_hi));
+            yl_lo[i] = g_lo * sig_lo * x[idx_lo];
+            yl_hi[i] = g_hi * sig_hi * x[idx_hi];
+        }
+
+        for (uint row = 0; row < NR0; ++row) {
+            if (r0 + row >= out_dim) break;
+
+            device const uchar* bp = ax[row] + ib * Q4_BLOCK_SIZE;
+            float scale = float(as_type<half>(*(device const ushort*)bp));
+            device const uchar* qdata = (device const uchar*)(bp + 2) + il * 4;
+
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+                uchar byte_val = qdata[i];
+                float lo = float(byte_val & 0x0F) - 8.0f;
+                float hi = float(byte_val >> 4) - 8.0f;
+                sumq += lo * yl_lo[i] + hi * yl_hi[i];
+            }
+            sumf[row] += sumq * scale;
+        }
+    }
+
+    threadgroup float shmem[NR0 * NW];
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[row * NW + tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[row * NW + sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            float val = tot + accum[r0 + row];
+            accum[r0 + row] = val;
+            copy_dst[r0 + row] = val;
+        }
+    }
+}
+
+// ============================================================================
+// dequant_batched_matvec_q8_0: Batched Q8_0 matvec for T input vectors
+//
+// For each output row r and token t:
+//   out[t * out_dim + r] = dot(W[r, :], x[t * in_dim .. (t+1) * in_dim])
+//
+// Key optimization: weights for each row are loaded ONCE and reused across
+// all T tokens, amortizing memory bandwidth by factor T.
+//
+// Uses the same 2-SG structure as dequant_matmul_q8_0_2sg but adds a
+// token loop inside each threadgroup.
+//
+// buffer(0): weights  [out_dim * row_bytes] uchar -- Q8_0 weight matrix
+// buffer(1): x        [T * in_dim] float -- input batch
+// buffer(2): out      [T * out_dim] float -- output batch
+// buffer(3): in_dim   (uint)
+// buffer(4): out_dim  (uint)
+// buffer(5): T        (uint) -- number of tokens in the batch
+//
+// grid: (ceil(out_dim/8), 1, 1), threadgroup: (64, 1, 1)
+// ============================================================================
+
+kernel void dequant_batched_matvec_q8_0(
+    device const uchar* weights [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    constant uint&      T       [[buffer(5)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 4;          // rows per simdgroup
+    const uint NQ = 8;          // elements per thread per iteration
+    const uint NW = 32;         // SIMD width
+    const uint Q8_BLOCK_SIZE = 34;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    // Each SG owns 4 rows: SG 0 -> rows 0-3, SG 1 -> rows 4-7
+    const uint r0 = tgpig * 8 + sgitg * NR;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    // Pointers to weight rows (shared across all tokens)
+    device const uchar* ax[NR];
+    for (uint row = 0; row < NR; ++row) {
+        ax[row] = weights + (r0 + row) * row_bytes;
+    }
+
+    // Process each token
+    for (uint t = 0; t < T; t++) {
+        device const float* xt = x + t * in_dim;
+        float sumf[NR] = { 0.f, 0.f, 0.f, 0.f };
+        float yl[NQ];
+
+        device const float* yb = xt + ix * 32 + il * NQ;
+
+        for (uint ib = ix; ib < nb; ib += NQ) {
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                yl[i] = yb[i];
+            }
+
+            for (uint row = 0; row < NR; ++row) {
+                if (r0 + row >= out_dim) break;
+
+                device const uchar* bp = ax[row] + ib * Q8_BLOCK_SIZE;
+                float scale = float(as_type<half>(*(device const ushort*)bp));
+                device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+                float sumq = 0.f;
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < NQ; ++i) {
+                    sumq += float(qs[i]) * yl[i];
+                }
+                sumf[row] += sumq * scale;
+            }
+
+            yb += NQ * 32;
+        }
+
+        for (uint row = 0; row < NR && r0 + row < out_dim; ++row) {
+            sumf[row] = simd_sum(sumf[row]);
+            if (tiisg == 0) {
+                out[t * out_dim + r0 + row] = sumf[row];
+            }
+        }
+    }
+}
+
+// ============================================================================
+// dequant_batched_matvec_q8_0_dual: Fused dual alpha+beta GEMV + gate compute
+//
+// Performs TWO Q8_0 batched matrix-vector multiplications in a single dispatch
+// AND applies gate transformations (softplus+exp for alpha, sigmoid for beta).
+// This replaces 3 dispatches (alpha matvec + beta matvec + gate precompute)
+// with a single fused kernel, eliminating 2 dispatches and 1 memory barrier.
+//
+// Gate computations (matching gdn_compute_gates_batched):
+//   alpha_out = exp(-exp(A_log) * softplus(alpha_raw + dt_bias))
+//   beta_out  = sigmoid(beta_raw)
+//
+// buffer(0): weights_a  [out_dim * row_bytes] uchar -- Q8_0 alpha weight matrix
+// buffer(1): weights_b  [out_dim * row_bytes] uchar -- Q8_0 beta weight matrix
+// buffer(2): x          [T * in_dim] float -- input batch (shared)
+// buffer(3): out_a      [T * out_dim] float -- alpha output: exp(gate) decay factors
+// buffer(4): out_b      [T * out_dim] float -- beta output: sigmoid mixing rates
+// buffer(5): in_dim     (uint)
+// buffer(6): out_dim    (uint)
+// buffer(7): T          (uint) -- number of tokens in the batch
+// buffer(8): dt_bias    [out_dim] float -- per-head dt bias
+// buffer(9): A_log      [out_dim] float -- per-head A_log (ssm_a = -exp(A_log))
+//
+// grid: (ceil(out_dim/8), 1, 1), threadgroup: (64, 1, 1)
+// ============================================================================
+
+kernel void dequant_batched_matvec_q8_0_dual(
+    device const uchar* weights_a [[buffer(0)]],
+    device const uchar* weights_b [[buffer(1)]],
+    device const float* x         [[buffer(2)]],
+    device float*       out_a     [[buffer(3)]],
+    device float*       out_b     [[buffer(4)]],
+    constant uint&      in_dim    [[buffer(5)]],
+    constant uint&      out_dim   [[buffer(6)]],
+    constant uint&      T         [[buffer(7)]],
+    device const float* dt_bias   [[buffer(8)]],
+    device const float* A_log     [[buffer(9)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 4;          // rows per simdgroup
+    const uint NQ = 8;          // elements per thread per iteration
+    const uint NW = 32;         // SIMD width
+    const uint Q8_BLOCK_SIZE = 34;
+
+    const uint nb = in_dim >> 5;
+    const uint row_bytes = nb * Q8_BLOCK_SIZE;
+
+    // Each SG owns 4 rows: SG 0 -> rows 0-3, SG 1 -> rows 4-7
+    const uint r0 = tgpig * 8 + sgitg * NR;
+
+    const uint ix = tiisg / (NW / NQ);
+    const uint il = tiisg % (NW / NQ);
+
+    // Preload per-head constants (shared across all tokens)
+    float head_dt_bias[NR];
+    float head_ssm_a[NR];
+    for (uint row = 0; row < NR; ++row) {
+        if (r0 + row < out_dim) {
+            head_dt_bias[row] = dt_bias[r0 + row];
+            head_ssm_a[row] = -exp(A_log[r0 + row]); // ssm_a = -exp(A_log)
+        }
+    }
+
+    // Pointers to weight rows for both matrices (shared across all tokens)
+    device const uchar* ax_a[NR];
+    device const uchar* ax_b[NR];
+    for (uint row = 0; row < NR; ++row) {
+        ax_a[row] = weights_a + (r0 + row) * row_bytes;
+        ax_b[row] = weights_b + (r0 + row) * row_bytes;
+    }
+
+    // Process each token
+    for (uint t = 0; t < T; t++) {
+        device const float* xt = x + t * in_dim;
+        float sumf_a[NR] = { 0.f, 0.f, 0.f, 0.f };
+        float sumf_b[NR] = { 0.f, 0.f, 0.f, 0.f };
+        float yl[NQ];
+
+        device const float* yb = xt + ix * 32 + il * NQ;
+
+        for (uint ib = ix; ib < nb; ib += NQ) {
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < NQ; ++i) {
+                yl[i] = yb[i];
+            }
+
+            for (uint row = 0; row < NR; ++row) {
+                if (r0 + row >= out_dim) break;
+
+                // Alpha weights
+                {
+                    device const uchar* bp = ax_a[row] + ib * Q8_BLOCK_SIZE;
+                    float scale = float(as_type<half>(*(device const ushort*)bp));
+                    device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+                    float sumq = 0.f;
+                    #pragma clang loop unroll(full)
+                    for (uint i = 0; i < NQ; ++i) {
+                        sumq += float(qs[i]) * yl[i];
+                    }
+                    sumf_a[row] += sumq * scale;
+                }
+
+                // Beta weights
+                {
+                    device const uchar* bp = ax_b[row] + ib * Q8_BLOCK_SIZE;
+                    float scale = float(as_type<half>(*(device const ushort*)bp));
+                    device const char* qs = (device const char*)(bp + 2) + il * NQ;
+
+                    float sumq = 0.f;
+                    #pragma clang loop unroll(full)
+                    for (uint i = 0; i < NQ; ++i) {
+                        sumq += float(qs[i]) * yl[i];
+                    }
+                    sumf_b[row] += sumq * scale;
+                }
+            }
+
+            yb += NQ * 32;
+        }
+
+        for (uint row = 0; row < NR && r0 + row < out_dim; ++row) {
+            sumf_a[row] = simd_sum(sumf_a[row]);
+            sumf_b[row] = simd_sum(sumf_b[row]);
+            if (tiisg == 0) {
+                // Apply gate transformations inline:
+                // alpha = exp(ssm_a * softplus(alpha_raw + dt_bias))
+                float sp_input = sumf_a[row] + head_dt_bias[row];
+                float sp;
+                if (sp_input > 20.0f) {
+                    sp = sp_input;
+                } else {
+                    sp = log(1.0f + exp(sp_input));
+                }
+                float gate = head_ssm_a[row] * sp;
+                out_a[t * out_dim + r0 + row] = exp(gate);
+
+                // beta = sigmoid(beta_raw)
+                out_b[t * out_dim + r0 + row] = 1.0f / (1.0f + exp(-sumf_b[row]));
+            }
+        }
+    }
+}
+
