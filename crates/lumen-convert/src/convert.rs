@@ -226,9 +226,14 @@ fn do_convert_from_reader<R: Read + Seek>(
     let embedding_ggml_type = embedding_tensor.ggml_type;
     let embedding_n_elements = embedding_tensor.n_elements();
 
-    // For Q8_0 and Q4_0 embeddings, keep raw bytes in the LBC file.
+    // For Q8_0, Q4_0, and F16 embeddings, keep raw bytes in the LBC file.
     // The runtime will use GPU dequant kernels for embedding lookup.
     let (embedding, embedding_quant) = match embedding_ggml_type {
+        GgmlType::F16 => {
+            eprintln!("  Keeping embedding as F16 ({} bytes, {} elements)",
+                embedding_bytes.len(), embedding_n_elements);
+            (embedding_bytes, QuantScheme::F16)
+        }
         GgmlType::Q8_0 => {
             eprintln!("  Keeping embedding as Q8_0 ({} bytes, {} elements)",
                 embedding_bytes.len(), embedding_n_elements);

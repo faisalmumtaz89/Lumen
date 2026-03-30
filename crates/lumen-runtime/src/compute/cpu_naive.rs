@@ -25,6 +25,7 @@ use crate::engine::softmax_inplace;
 use crate::error::RuntimeError;
 use crate::kv::KvCacheView;
 use lumen_format::hyperparams::ModelHyperparams;
+use lumen_format::quantization::QuantScheme;
 use std::sync::Mutex;
 
 /// Pre-allocated working buffers reused across compute_layer calls.
@@ -169,6 +170,126 @@ fn matmul_bytes(out: &mut [f32], w_bytes: &[u8], x: &[f32], out_dim: usize, in_d
             sum += w_val * x[j];
         }
         out[i] = sum;
+    }
+}
+
+/// Convert f16 bits to f32 (software implementation, no external dependency).
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = (bits >> 15) & 1;
+    let exp = (bits >> 10) & 0x1f;
+    let frac = bits & 0x3ff;
+    if exp == 0 {
+        if frac == 0 {
+            return if sign == 1 { -0.0 } else { 0.0 };
+        }
+        let f = frac as f32 / 1024.0;
+        let v = f * 2.0f32.powi(-14);
+        return if sign == 1 { -v } else { v };
+    }
+    if exp == 31 {
+        return if frac == 0 {
+            if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY }
+        } else {
+            f32::NAN
+        };
+    }
+    let exp_f32 = ((exp as u32 - 15 + 127) << 23) | ((frac as u32) << 13);
+    let v = f32::from_bits(exp_f32);
+    if sign == 1 { -v } else { v }
+}
+
+/// Matrix-vector multiply reading F16 weights from bytes.
+/// Weight layout: row-major [out_dim, in_dim], each element is 2 bytes (LE f16 bits).
+#[allow(clippy::needless_range_loop)]
+fn matmul_bytes_f16(out: &mut [f32], w_bytes: &[u8], x: &[f32], out_dim: usize, in_dim: usize) {
+    for i in 0..out_dim {
+        let row_byte_start = i * in_dim * 2;
+        let mut sum = 0.0f32;
+        for j in 0..in_dim {
+            let offset = row_byte_start + j * 2;
+            let bits = u16::from_le_bytes(w_bytes[offset..offset + 2].try_into().unwrap());
+            let w_val = f16_bits_to_f32(bits);
+            sum += w_val * x[j];
+        }
+        out[i] = sum;
+    }
+}
+
+/// Matrix-vector multiply reading Q8_0 weights from bytes.
+/// Weight layout: row-major [out_dim, in_dim] stored as Q8_0 blocks.
+/// Each row has (in_dim / 32) blocks of 34 bytes: [2B f16 scale][32B int8].
+#[allow(clippy::needless_range_loop)]
+fn matmul_bytes_q8_0(out: &mut [f32], w_bytes: &[u8], x: &[f32], out_dim: usize, in_dim: usize) {
+    let blocks_per_row = in_dim / 32;
+    let row_bytes = blocks_per_row * 34;
+    for i in 0..out_dim {
+        let row_start = i * row_bytes;
+        let mut sum = 0.0f32;
+        let mut x_idx = 0usize;
+        for b in 0..blocks_per_row {
+            let block_start = row_start + b * 34;
+            let scale_bits = u16::from_le_bytes([w_bytes[block_start], w_bytes[block_start + 1]]);
+            let scale = f16_bits_to_f32(scale_bits);
+            for k in 0..32 {
+                let q = w_bytes[block_start + 2 + k] as i8;
+                sum += (scale * q as f32) * x[x_idx];
+                x_idx += 1;
+            }
+        }
+        out[i] = sum;
+    }
+}
+
+/// Matrix-vector multiply reading Q4_0 weights from bytes.
+/// Weight layout: row-major [out_dim, in_dim] stored as Q4_0 blocks.
+/// Each row has (in_dim / 32) blocks of 18 bytes: [2B f16 scale][16B packed nibbles].
+/// GGML de-interleaved order: indices 0-15 from lo nibbles, indices 16-31 from hi nibbles.
+#[allow(clippy::needless_range_loop)]
+fn matmul_bytes_q4_0(out: &mut [f32], w_bytes: &[u8], x: &[f32], out_dim: usize, in_dim: usize) {
+    let blocks_per_row = in_dim / 32;
+    let row_bytes = blocks_per_row * 18;
+    for i in 0..out_dim {
+        let row_start = i * row_bytes;
+        let mut sum = 0.0f32;
+        let mut x_idx = 0usize;
+        for b in 0..blocks_per_row {
+            let block_start = row_start + b * 18;
+            let scale_bits = u16::from_le_bytes([w_bytes[block_start], w_bytes[block_start + 1]]);
+            let scale = f16_bits_to_f32(scale_bits);
+            // First 16 elements: lo nibbles (indices 0-15)
+            for k in 0..16 {
+                let byte = w_bytes[block_start + 2 + k];
+                let lo = (byte & 0x0F) as i32 - 8;
+                sum += (scale * lo as f32) * x[x_idx];
+                x_idx += 1;
+            }
+            // Next 16 elements: hi nibbles (indices 16-31)
+            for k in 0..16 {
+                let byte = w_bytes[block_start + 2 + k];
+                let hi = ((byte >> 4) & 0x0F) as i32 - 8;
+                sum += (scale * hi as f32) * x[x_idx];
+                x_idx += 1;
+            }
+        }
+        out[i] = sum;
+    }
+}
+
+/// Dispatch matrix-vector multiply based on the tensor's quantization scheme.
+fn matmul_dispatch(
+    out: &mut [f32],
+    w_bytes: &[u8],
+    x: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+    quant: QuantScheme,
+) {
+    match quant {
+        QuantScheme::F32 => matmul_bytes(out, w_bytes, x, out_dim, in_dim),
+        QuantScheme::F16 => matmul_bytes_f16(out, w_bytes, x, out_dim, in_dim),
+        QuantScheme::Q8_0 => matmul_bytes_q8_0(out, w_bytes, x, out_dim, in_dim),
+        QuantScheme::Q4_0 => matmul_bytes_q4_0(out, w_bytes, x, out_dim, in_dim),
+        _ => panic!("NaiveF32Backend: unsupported weight quant scheme {:?}", quant),
     }
 }
 
@@ -363,14 +484,16 @@ impl ComputeBackend for NaiveF32Backend {
         let w_down_bytes = weights.subtensor_bytes(&st.w_down)?;
 
         // 1. Attention RMSNorm (writes into scratch.normed)
+        // Norms are always F32 regardless of weight quant scheme
         rmsnorm_bytes(&mut s.normed, x_f32, attn_norm_bytes, eps);
 
         // 2. Q/K/V projections (write into scratch buffers)
+        // Dispatch based on per-tensor quant scheme for quantized models
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
-        matmul_bytes(&mut s.q, wq_bytes, &s.normed, q_dim, hidden_dim);
-        matmul_bytes(&mut s.k, wk_bytes, &s.normed, kv_dim, hidden_dim);
-        matmul_bytes(&mut s.v, wv_bytes, &s.normed, kv_dim, hidden_dim);
+        matmul_dispatch(&mut s.q, wq_bytes, &s.normed, q_dim, hidden_dim, st.wq.quant);
+        matmul_dispatch(&mut s.k, wk_bytes, &s.normed, kv_dim, hidden_dim, st.wk.quant);
+        matmul_dispatch(&mut s.v, wv_bytes, &s.normed, kv_dim, hidden_dim, st.wv.quant);
 
         // 3. Apply RoPE (pre-computed tables)
         apply_rope_precomputed(
@@ -430,7 +553,7 @@ impl ComputeBackend for NaiveF32Backend {
         }
 
         // 6. Output projection
-        matmul_bytes(&mut s.attn_proj, wo_bytes, &s.attn_out, hidden_dim, q_dim);
+        matmul_dispatch(&mut s.attn_proj, wo_bytes, &s.attn_out, hidden_dim, q_dim, st.wo.quant);
 
         // 7. Residual connection (in-place into attn_proj to reuse buffer)
         // x_f32 is the zero-copy view of the original input activation
@@ -442,10 +565,10 @@ impl ComputeBackend for NaiveF32Backend {
         rmsnorm_bytes(&mut s.normed, &s.attn_proj, ffn_norm_bytes, eps);
 
         // 9. SwiGLU MLP (fused silu+multiply, reuse buffers)
-        matmul_bytes(&mut s.gate, w_gate_bytes, &s.normed, inter_dim, hidden_dim);
-        matmul_bytes(&mut s.up, w_up_bytes, &s.normed, inter_dim, hidden_dim);
+        matmul_dispatch(&mut s.gate, w_gate_bytes, &s.normed, inter_dim, hidden_dim, st.w_gate.quant);
+        matmul_dispatch(&mut s.up, w_up_bytes, &s.normed, inter_dim, hidden_dim, st.w_up.quant);
         swiglu_inplace(&mut s.gate, &s.up); // gate now holds silu(gate)*up
-        matmul_bytes(&mut s.down, w_down_bytes, &s.gate, hidden_dim, inter_dim);
+        matmul_dispatch(&mut s.down, w_down_bytes, &s.gate, hidden_dim, inter_dim, st.w_down.quant);
 
         // 10. Residual connection
         for i in 0..hidden_dim {

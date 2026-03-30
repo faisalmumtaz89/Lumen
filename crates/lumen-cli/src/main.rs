@@ -7,6 +7,8 @@ use lumen_runtime::compute::cpu_simd::SimdF32Backend;
 use lumen_runtime::metal::MetalF32Backend;
 #[cfg(target_os = "macos")]
 use lumen_runtime::AccelerateBatchBackend;
+#[cfg(feature = "cuda")]
+use lumen_runtime::CudaBackend;
 use lumen_runtime::config::RuntimeConfig;
 use lumen_runtime::engine::{InferenceEngine, SamplingParams, StopCondition};
 use lumen_runtime::kv::KvPrecision;
@@ -355,6 +357,8 @@ fn run_inference(args: &[String]) {
     let mut use_simd = false;
     let mut use_metal = false;
     let mut use_accelerate = false;
+    let mut use_cuda = false;
+    let mut cuda_device: usize = 0;
     let mut gpu_resident = true;  // Default: GPU-resident when --metal
     let mut option_a = false;
     let mut threads: usize = 0;
@@ -438,6 +442,21 @@ fn run_inference(args: &[String]) {
             }
             "--accelerate" => {
                 use_accelerate = true;
+            }
+            "--cuda" => {
+                use_cuda = true;
+            }
+            "--cuda-device" => {
+                i += 1;
+                let val = args.get(i).unwrap_or_else(|| {
+                    eprintln!("Error: --cuda-device requires a device ordinal (e.g. 0, 1)");
+                    std::process::exit(1);
+                });
+                cuda_device = val.parse().unwrap_or_else(|_| {
+                    eprintln!("Error: --cuda-device must be a non-negative integer, got: {val}");
+                    std::process::exit(1);
+                });
+                use_cuda = true; // --cuda-device implies --cuda
             }
             "--gpu-resident" => {
                 gpu_resident = true;
@@ -529,11 +548,11 @@ fn run_inference(args: &[String]) {
     }
 
     if use_async {
-        run_with_async(path, use_simd, use_metal, use_accelerate, threads, profile, &prompt_tokens, &stop, &sampling, context_len);
+        run_with_async(path, use_simd, use_metal, use_cuda, cuda_device, use_accelerate, threads, profile, &prompt_tokens, &stop, &sampling, context_len);
     } else if use_sync {
-        run_with_sync(path, use_simd, use_metal, use_accelerate, threads, profile, &prompt_tokens, &stop, &sampling, context_len);
+        run_with_sync(path, use_simd, use_metal, use_cuda, cuda_device, use_accelerate, threads, profile, &prompt_tokens, &stop, &sampling, context_len);
     } else {
-        run_with_mmap(path, use_simd, use_metal, use_accelerate, gpu_resident, option_a, threads, profile, verbose_routing, routing_bias, &prompt_tokens, &stop, &sampling, context_len);
+        run_with_mmap(path, use_simd, use_metal, use_cuda, cuda_device, use_accelerate, gpu_resident, option_a, threads, profile, verbose_routing, routing_bias, &prompt_tokens, &stop, &sampling, context_len);
     }
 }
 
@@ -565,6 +584,38 @@ fn effective_max_seq_len(model_max: usize, user_override: Option<usize>, prompt_
     effective
 }
 
+/// Select CPU or Metal backend based on platform and flags.
+///
+/// Extracted so that both `#[cfg(feature = "cuda")]` and `#[cfg(not(feature = "cuda"))]`
+/// branches can call it without duplicating the platform-specific Metal logic.
+fn create_cpu_or_metal_backend(
+    #[allow(unused_variables)] use_metal: bool,
+    use_simd: bool,
+    threads: usize,
+) -> Box<dyn ComputeBackend> {
+    #[cfg(target_os = "macos")]
+    if use_metal {
+        let metal = MetalF32Backend::new().unwrap_or_else(|e| {
+            eprintln!("Error: Metal backend unavailable: {e}");
+            std::process::exit(1);
+        });
+        println!("Metal GPU backend: {}", metal.device_name());
+        return Box::new(metal);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    if use_metal {
+        eprintln!("Error: --metal is only supported on macOS");
+        std::process::exit(1);
+    }
+
+    if use_simd {
+        Box::new(SimdF32Backend::with_threads(threads))
+    } else {
+        Box::new(NaiveF32Backend::new())
+    }
+}
+
 /// Create and initialize the appropriate compute backend.
 ///
 /// All backends are configured through the `ComputeBackend` trait after boxing,
@@ -577,6 +628,10 @@ fn create_backend(
     use_simd: bool,
     #[allow(unused_variables)]
     use_metal: bool,
+    #[allow(unused_variables)]
+    use_cuda: bool,
+    #[allow(unused_variables)]
+    cuda_device: usize,
     threads: usize,
     profile: bool,
     embedding: Vec<f32>,
@@ -598,31 +653,25 @@ fn create_backend(
     // through the ComputeBackend trait, keeping the logic backend-agnostic.
     #[allow(unused_mut)]
     let mut backend: Box<dyn ComputeBackend> = {
-        #[cfg(target_os = "macos")]
-        if use_metal {
-            let metal = MetalF32Backend::new().unwrap_or_else(|e| {
-                eprintln!("Error: Metal backend unavailable: {e}");
+        // CUDA backend (cross-platform, requires --features cuda at build time).
+        #[cfg(feature = "cuda")]
+        if use_cuda {
+            let cuda = CudaBackend::new(cuda_device).unwrap_or_else(|e| {
+                eprintln!("Error: CUDA backend unavailable: {e}");
                 std::process::exit(1);
             });
-            println!("Metal GPU backend: {}", metal.device_name());
-            Box::new(metal)
-        } else if use_simd {
-            Box::new(SimdF32Backend::with_threads(threads))
+            Box::new(cuda)
         } else {
-            Box::new(NaiveF32Backend::new())
+            create_cpu_or_metal_backend(use_metal, use_simd, threads)
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(feature = "cuda"))]
         {
-            if use_metal {
-                eprintln!("Error: --metal is only supported on macOS");
+            if use_cuda {
+                eprintln!("Error: --cuda requires building with --features cuda");
                 std::process::exit(1);
             }
-            if use_simd {
-                Box::new(SimdF32Backend::with_threads(threads))
-            } else {
-                Box::new(NaiveF32Backend::new())
-            }
+            create_cpu_or_metal_backend(use_metal, use_simd, threads)
         }
     };
 
@@ -658,6 +707,8 @@ fn run_with_async(
     path: &Path,
     use_simd: bool,
     use_metal: bool,
+    use_cuda: bool,
+    cuda_device: usize,
     use_accelerate: bool,
     threads: usize,
     profile: bool,
@@ -677,6 +728,8 @@ fn run_with_async(
     let backend = create_backend(
         use_simd,
         use_metal,
+        use_cuda,
+        cuda_device,
         threads,
         profile,
         provider.embedding.clone(),
@@ -712,6 +765,8 @@ fn run_with_sync(
     path: &Path,
     use_simd: bool,
     use_metal: bool,
+    use_cuda: bool,
+    cuda_device: usize,
     use_accelerate: bool,
     threads: usize,
     profile: bool,
@@ -731,6 +786,8 @@ fn run_with_sync(
     let backend = create_backend(
         use_simd,
         use_metal,
+        use_cuda,
+        cuda_device,
         threads,
         profile,
         provider.embedding.clone(),
@@ -766,6 +823,8 @@ fn run_with_mmap(
     path: &Path,
     use_simd: bool,
     use_metal: bool,
+    use_cuda: bool,
+    cuda_device: usize,
     use_accelerate: bool,
     gpu_resident: bool,
     option_a: bool,
@@ -943,6 +1002,8 @@ fn run_with_mmap(
     let backend = create_backend(
         use_simd,
         use_metal,
+        use_cuda,
+        cuda_device,
         threads,
         profile,
         provider.embedding.clone(),
@@ -1171,6 +1232,8 @@ OPTIONS:
     --simd                Use SIMD-accelerated compute backend
     --threads <n>         Thread count for SIMD backend (default: 0 = auto-detect)
     --metal               Use Metal GPU compute backend (macOS only)
+    --cuda                Use CUDA GPU compute backend (NVIDIA, requires --features cuda)
+    --cuda-device <n>     Select CUDA device ordinal (default: 0, implies --cuda)
     --accelerate          Use Accelerate AMX batched prefill (macOS only, use with --simd)
     --gpu-resident        Pre-load all weights into GPU Metal buffers (DEFAULT with --metal)
     --no-gpu-resident     Disable GPU-resident mode, use SSD-streaming (alias: --streaming)

@@ -1145,8 +1145,7 @@ pub fn matmul_q8_0_simd_2row_widen(
 // The quantization of x introduces ~0.5-1% relative error vs. the widening approach
 // (which operates on the exact f32 x values). This matches llama.cpp's approach.
 
-/// Convert f32 to f16 bits (software fallback, kept as reference).
-#[cfg(target_arch = "aarch64")]
+/// Convert f32 to f16 bits (software implementation, no SIMD intrinsics).
 #[allow(dead_code)]
 #[inline(always)]
 pub(crate) fn f32_to_f16_inline(val: f32) -> u16 {
@@ -2501,6 +2500,21 @@ pub(crate) fn dot_product_f16_f32_simd(a: &[f32], b_f16: *const u8, n: usize) ->
     }
 }
 
+/// Scalar fallback for `dot_product_f16_f32_simd` on non-aarch64 platforms.
+///
+/// Computes dot product of f32 vector `a` with packed f16 vector `b_f16`.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+pub(crate) fn dot_product_f16_f32_simd(a: &[f32], b_f16: *const u8, n: usize) -> f32 {
+    debug_assert!(a.len() >= n);
+    let mut sum = 0.0f32;
+    for i in 0..n {
+        let bits = unsafe { std::ptr::read_unaligned(b_f16.add(i * 2) as *const u16) };
+        sum += a[i] * f16_to_f32_inline(bits);
+    }
+    sum
+}
+
 /// Fused f16 value weighted accumulation: out[i] += scale * dequant(v_f16[i]).
 ///
 /// Same register-fusion as `dot_product_f16_f32_simd`: loads f16 values, widens
@@ -2546,6 +2560,19 @@ pub(crate) fn vscale_add_f16_f32_inplace(out: &mut [f32], v_f16: *const u8, scal
             let bits = std::ptr::read_unaligned(v_f16.add(idx * 2) as *const u16);
             *out.get_unchecked_mut(idx) += scale * f16_to_f32_hw(bits);
         }
+    }
+}
+
+/// Scalar fallback for `vscale_add_f16_f32_inplace` on non-aarch64 platforms.
+///
+/// out[i] += scale * dequant(v_f16[i]) for each element.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+pub(crate) fn vscale_add_f16_f32_inplace(out: &mut [f32], v_f16: *const u8, scale: f32, n: usize) {
+    debug_assert!(out.len() >= n);
+    for i in 0..n {
+        let bits = unsafe { std::ptr::read_unaligned(v_f16.add(i * 2) as *const u16) };
+        out[i] += scale * f16_to_f32_inline(bits);
     }
 }
 

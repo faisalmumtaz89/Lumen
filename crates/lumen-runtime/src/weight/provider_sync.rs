@@ -10,6 +10,7 @@ use crate::error::RuntimeError;
 use crate::storage::{IoSnapshot, StorageBackend};
 use crate::storage::sync::SyncFileBackend;
 use lumen_format::reader::LbcFile;
+use lumen_format::index::{SubtensorOffsets, TensorSlice};
 use lumen_format::quantization::QuantScheme;
 use std::path::Path;
 use std::sync::Mutex;
@@ -305,6 +306,119 @@ pub fn read_output_proj_global(
     }
 }
 
+/// Dequantize a single subtensor from the raw layer blob, returning F32 bytes.
+/// Returns the dequantized bytes and the number of F32 elements.
+fn dequant_subtensor_to_f32_bytes(
+    raw_blob: &[u8],
+    slice: &TensorSlice,
+) -> Option<Vec<u8>> {
+    match slice.quant {
+        QuantScheme::F32 => None, // Already F32, no conversion needed
+        QuantScheme::Q8_0 => {
+            let src = &raw_blob[slice.offset as usize..(slice.offset + slice.length) as usize];
+            // Q8_0: 34 bytes per 32 elements
+            let n_blocks = src.len() / 34;
+            let n_elements = n_blocks * 32;
+            let f32_data = dequantize_q8_0_to_f32(src, n_elements);
+            let mut bytes = Vec::with_capacity(f32_data.len() * 4);
+            for &v in &f32_data {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            Some(bytes)
+        }
+        QuantScheme::Q4_0 => {
+            let src = &raw_blob[slice.offset as usize..(slice.offset + slice.length) as usize];
+            // Q4_0: 18 bytes per 32 elements
+            let n_blocks = src.len() / 18;
+            let n_elements = n_blocks * 32;
+            let f32_data = dequantize_q4_0_to_f32(src, n_elements);
+            let mut bytes = Vec::with_capacity(f32_data.len() * 4);
+            for &v in &f32_data {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            Some(bytes)
+        }
+        QuantScheme::F16 => {
+            let src = &raw_blob[slice.offset as usize..(slice.offset + slice.length) as usize];
+            let n_elements = src.len() / 2;
+            let f32_data = dequantize_f16_to_f32(src, n_elements);
+            let mut bytes = Vec::with_capacity(f32_data.len() * 4);
+            for &v in &f32_data {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            Some(bytes)
+        }
+        _ => None, // Unsupported quant scheme -- pass through as-is
+    }
+}
+
+/// Dequantize all quantized subtensors in a layer blob to F32.
+///
+/// Builds a new blob where all weight tensors are in F32 format, and updates
+/// the subtensor offsets to match. Tensors that are already F32 are copied as-is.
+/// This enables the CPU naive backend (which reads raw bytes as F32) to work
+/// with Q8_0/Q4_0/F16 model files.
+fn dequantize_layer_to_f32(
+    raw_blob: &[u8],
+    subtensors: &SubtensorOffsets,
+) -> (Vec<u8>, SubtensorOffsets) {
+    // Check if any subtensor needs dequantization
+    let needs_dequant = [
+        &subtensors.wq, &subtensors.wk, &subtensors.wv, &subtensors.wo,
+        &subtensors.w_gate, &subtensors.w_up, &subtensors.w_down,
+        &subtensors.attn_norm, &subtensors.ffn_norm,
+    ].iter().any(|s| s.quant != QuantScheme::F32);
+
+    if !needs_dequant {
+        // Fast path: all F32, return as-is
+        return (raw_blob.to_vec(), subtensors.clone());
+    }
+
+    // Slow path: rebuild the blob with dequantized tensors
+    let mut new_blob = Vec::new();
+    let mut new_subtensors = subtensors.clone();
+
+    // NOTE: Only mandatory subtensors are processed. Optional fields (bq, bk, bv,
+    // ssm_*, attn_gate, etc.) retain their original-blob offsets. This is safe
+    // because the cpu_naive backend only reads mandatory fields.
+    let slices_and_fields: Vec<(&TensorSlice, Box<dyn FnOnce(&mut SubtensorOffsets, TensorSlice)>)> = vec![
+        (&subtensors.wq, Box::new(|st: &mut SubtensorOffsets, s| st.wq = s)),
+        (&subtensors.wk, Box::new(|st: &mut SubtensorOffsets, s| st.wk = s)),
+        (&subtensors.wv, Box::new(|st: &mut SubtensorOffsets, s| st.wv = s)),
+        (&subtensors.wo, Box::new(|st: &mut SubtensorOffsets, s| st.wo = s)),
+        (&subtensors.w_gate, Box::new(|st: &mut SubtensorOffsets, s| st.w_gate = s)),
+        (&subtensors.w_up, Box::new(|st: &mut SubtensorOffsets, s| st.w_up = s)),
+        (&subtensors.w_down, Box::new(|st: &mut SubtensorOffsets, s| st.w_down = s)),
+        (&subtensors.attn_norm, Box::new(|st: &mut SubtensorOffsets, s| st.attn_norm = s)),
+        (&subtensors.ffn_norm, Box::new(|st: &mut SubtensorOffsets, s| st.ffn_norm = s)),
+    ];
+
+    for (slice, setter) in slices_and_fields {
+        let offset = new_blob.len() as u64;
+        if let Some(f32_bytes) = dequant_subtensor_to_f32_bytes(raw_blob, slice) {
+            let new_slice = TensorSlice {
+                offset,
+                length: f32_bytes.len() as u64,
+                quant: QuantScheme::F32,
+            };
+            new_blob.extend_from_slice(&f32_bytes);
+            setter(&mut new_subtensors, new_slice);
+        } else {
+            // Already F32 or unsupported -- copy raw bytes
+            let src = &raw_blob[slice.offset as usize..(slice.offset + slice.length) as usize];
+            let new_slice = TensorSlice {
+                offset,
+                length: slice.length,
+                quant: slice.quant,
+            };
+            new_blob.extend_from_slice(src);
+            setter(&mut new_subtensors, new_slice);
+        }
+    }
+
+    (new_blob, new_subtensors)
+}
+
 impl WeightProvider for SyncWeightProvider {
     fn prefetch_layer(
         &self,
@@ -336,14 +450,38 @@ impl WeightProvider for SyncWeightProvider {
         stats.misses += 1;
 
         let idx = &self.lbc.layer_indices[layer];
-        let data = self.backend.read_range(idx.layer_offset_bytes, idx.layer_length_bytes)?;
-        let view = LayerView::from_owned(layer, data, idx.subtensors.clone());
+        let raw_data = self.backend.read_range(idx.layer_offset_bytes, idx.layer_length_bytes)?;
+
+        // Dequantize quantized subtensors to F32 for CPU backends.
+        // The CPU naive backend reads raw bytes as F32 via matmul_bytes/rmsnorm_bytes.
+        // When subtensors are stored in Q8_0/Q4_0/F16, we must dequantize them here.
+        let (data, subtensors) = dequantize_layer_to_f32(&raw_data, &idx.subtensors);
+
+        let view = LayerView::from_owned(layer, data, subtensors);
 
         cache[layer] = Some(view.clone());
         stats.layers_cached += 1;
         stats.bytes_cached += idx.layer_length_bytes;
 
         Ok(view)
+    }
+
+    /// Get raw layer data WITHOUT dequantization.
+    ///
+    /// Returns Q8_0/Q4_0/F16 weights in their native format so the CUDA
+    /// backend can upload raw bytes and dispatch quantized GPU kernels (dp4a,
+    /// HGEMM). Skips the `dequantize_layer_to_f32` step used by `get_layer_blocking`.
+    fn get_layer_raw(&self, layer: usize) -> Result<LayerView, RuntimeError> {
+        if layer >= self.lbc.layer_indices.len() {
+            return Err(RuntimeError::LayerUnavailable {
+                layer,
+                reason: format!("layer index out of range (num_layers={})", self.lbc.layer_indices.len()),
+            });
+        }
+        let idx = &self.lbc.layer_indices[layer];
+        let raw_data = self.backend.read_range(idx.layer_offset_bytes, idx.layer_length_bytes)?;
+        // Return raw bytes with original quant schemes — NO dequantization.
+        Ok(LayerView::from_owned(layer, raw_data, idx.subtensors.clone()))
     }
 
     fn try_get_layer(&self, layer: usize) -> Option<LayerView> {

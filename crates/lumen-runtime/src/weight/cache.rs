@@ -286,6 +286,18 @@ pub trait WeightProvider: Send + Sync {
     /// Block until the given layer is available, then return a view.
     fn get_layer_blocking(&self, layer: usize) -> Result<LayerView, RuntimeError>;
 
+    /// Get raw layer data without dequantization.
+    ///
+    /// Returns the layer's weight tensors in their original quantization format
+    /// (Q8_0, Q4_0, F16, etc.) without converting to F32. Used by GPU backends
+    /// that dispatch quantized kernels directly on the GPU.
+    ///
+    /// Default implementation falls back to `get_layer_blocking` (which may
+    /// dequantize for CPU backends). Override in providers that can return raw data.
+    fn get_layer_raw(&self, layer: usize) -> Result<LayerView, RuntimeError> {
+        self.get_layer_blocking(layer)
+    }
+
     /// Non-blocking attempt to get a layer view.
     ///
     /// Returns `Some(view)` if the layer is currently cached.

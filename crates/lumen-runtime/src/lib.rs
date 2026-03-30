@@ -16,6 +16,8 @@ pub mod compute;
 pub mod metal;
 #[cfg(target_os = "macos")]
 pub mod accelerate;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod config;
 pub mod engine;
 pub mod error;
@@ -60,3 +62,7 @@ pub use expert::reader::{ExpertReader, ExpertReaderError};
 // Metal IO re-exports (Metal 3, macOS 13+)
 #[cfg(target_os = "macos")]
 pub use metal::io::MetalIOQueue;
+
+// CUDA backend re-exports (NVIDIA GPUs, requires --features cuda)
+#[cfg(feature = "cuda")]
+pub use cuda::CudaBackend;

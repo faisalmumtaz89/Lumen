@@ -14,3 +14,5 @@ bench/results/
 # Backup files
 *.original
 /.codecompass
+/modal
+tracker.md

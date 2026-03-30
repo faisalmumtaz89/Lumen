@@ -11,6 +11,9 @@ rust-version.workspace = true
 name = "lumen"
 path = "src/main.rs"
 
+[features]
+cuda = ["lumen-runtime/cuda"]
+
 [dependencies]
 lumen-format.workspace = true
 lumen-runtime.workspace = true

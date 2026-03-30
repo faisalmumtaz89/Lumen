@@ -7,7 +7,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+cuda = ["dep:cudarc"]
+
 [dependencies]
 lumen-format.workspace = true
 thiserror.workspace = true
 libc = "0.2"
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "f16", "fallback-dynamic-loading", "cuda-version-from-build-system", "fallback-latest"], optional = true }
