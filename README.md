@@ -59,26 +59,155 @@ LBC is designed for GPU-resident loading: 128 KiB-aligned layer blobs for direct
 
 ## Performance
 
-Decode and prefill throughput (tok/s) compared to llama.cpp using real model weights.
+Decode and prefill throughput (tok/s). pp128 + gen128. Same model weights across all engines.
 
-**CUDA** (NVIDIA A100 80GB):
+### CUDA (NVIDIA A100-SXM4-80GB)
 
-| Model | Quant | Metric | Lumen | llama.cpp | Ratio |
-|-------|:-----:|--------|------:|----------:|:-----:|
-| Qwen2.5 3B | Q8_0 | decode | 227 | 209 | **1.09x** |
-| Qwen2.5 7B | Q8_0 | decode | 147 | 136 | **1.08x** |
-| Llama 3.1 8B | Q8_0 | prefill | 5,468 | 2,791 | **1.96x** |
-| Qwen2.5 14B | Q8_0 | prefill | 3,325 | 1,803 | **1.84x** |
+#### Qwen2.5 3B
 
-**Metal** (Apple M3 Ultra 96 GB):
+**Decode (tok/s):**
 
-| Model | Quant | Metric | Lumen | llama.cpp | Ratio |
-|-------|:-----:|--------|------:|----------:|:-----:|
-| TinyLlama 1.1B | Q8_0 | decode | 312 | 233 | **1.34x** |
-| TinyLlama 1.1B | Q4_0 | decode | 324 | 261 | **1.24x** |
-| Llama 3.1 8B | Q8_0 | decode | 74 | 68 | **1.09x** |
+| Quant | Lumen | llama.cpp | vLLM |
+|:-----:|------:|----------:|-----:|
+| F16 | 153 | 169 | 61 |
+| Q8_0 | 225 | 205 | N/A |
+| Q4_0 | 217 | 246 | N/A |
 
-Values in tok/s.
+**Prefill (tok/s):**
+
+| Quant | Lumen | llama.cpp | vLLM |
+|:-----:|------:|----------:|-----:|
+| F16 | 6,454 | 8,168 | 7,588 |
+| Q8_0 | 6,471 | 4,037 | N/A |
+| Q4_0 | 6,486 | 3,992 | N/A |
+
+#### Qwen2.5 7B
+
+**Decode (tok/s):**
+
+| Quant | Lumen | llama.cpp | vLLM |
+|:-----:|------:|----------:|-----:|
+| F16 | 95 | 95 | 73 |
+| Q8_0 | 153 | 135 | N/A |
+| Q4_0 | 196 | 184 | N/A |
+
+**Prefill (tok/s):**
+
+| Quant | Lumen | llama.cpp | vLLM |
+|:-----:|------:|----------:|-----:|
+| F16 | 5,204 | 4,632 | 8,536 |
+| Q8_0 | 5,948 | 3,245 | N/A |
+| Q4_0 | 5,202 | 2,975 | N/A |
+
+#### Llama 3.1 8B
+
+**Decode (tok/s):**
+
+| Quant | Lumen | llama.cpp | vLLM |
+|:-----:|------:|----------:|-----:|
+| F16 | 89 | 91 | 67 |
+| Q8_0 | 142 | 131 | N/A |
+| Q4_0 | 178 | 169 | N/A |
+
+**Prefill (tok/s):**
+
+| Quant | Lumen | llama.cpp | vLLM |
+|:-----:|------:|----------:|-----:|
+| F16 | 4,847 | 4,275 | 7,607 |
+| Q8_0 | 5,556 | 3,023 | N/A |
+| Q4_0 | 4,812 | 2,947 | N/A |
+
+#### Qwen2.5 14B
+
+**Decode (tok/s):**
+
+| Quant | Lumen | llama.cpp | vLLM |
+|:-----:|------:|----------:|-----:|
+| F16 | 51 | 50 | 44 |
+| Q8_0 | 79 | 71 | N/A |
+| Q4_0 | 100 | 98 | N/A |
+
+**Prefill (tok/s):**
+
+| Quant | Lumen | llama.cpp | vLLM |
+|:-----:|------:|----------:|-----:|
+| F16 | 2,989 | 2,875 | 5,447 |
+| Q8_0 | 3,432 | 1,891 | N/A |
+| Q4_0 | 3,413 | 1,948 | N/A |
+
+#### Qwen3.5 9B
+
+**Decode (tok/s):**
+
+| Quant | Lumen | llama.cpp | vLLM |
+|:-----:|------:|----------:|-----:|
+| Q8_0 | 59 | 114 | N/A |
+| Q4_0 | 70 | 140 | N/A |
+
+**Prefill (tok/s):**
+
+| Quant | Lumen | llama.cpp | vLLM |
+|:-----:|------:|----------:|-----:|
+| Q8_0 | 324 | 2,611 | N/A |
+| Q4_0 | 316 | 2,806 | N/A |
+
+### Metal (Apple M3 Ultra 96 GB, median of 3 runs)
+
+#### TinyLlama 1.1B
+
+**Decode (tok/s):**
+
+| Quant | Lumen | llama.cpp | MLX |
+|:-----:|------:|----------:|----:|
+| F16 | 194 | 184 | 239 |
+| Q8_0 | 305 | 225 | 449 |
+| Q4_0 | 319 | 246 | N/A |
+
+**Prefill (tok/s):**
+
+| Quant | Lumen | llama.cpp | MLX |
+|:-----:|------:|----------:|----:|
+| F16 | 4,028 | 5,249 | 4,189 |
+| Q8_0 | 4,911 | 5,053 | 4,838 |
+| Q4_0 | 4,525 | 5,201 | N/A |
+
+#### Llama 3.1 8B
+
+**Decode (tok/s):**
+
+| Quant | Lumen | llama.cpp | MLX |
+|:-----:|------:|----------:|----:|
+| F16 | 40 | 42 | N/A |
+| Q8_0 | 73 | 67 | 79 |
+| Q4_0 | 98 | 95 | N/A |
+
+**Prefill (tok/s):**
+
+| Quant | Lumen | llama.cpp | MLX |
+|:-----:|------:|----------:|----:|
+| F16 | 766 | 1,050 | N/A |
+| Q8_0 | 838 | 1,003 | 906 |
+| Q4_0 | 796 | 1,028 | N/A |
+
+#### Qwen3.5 9B
+
+**Decode (tok/s):**
+
+| Quant | Lumen | llama.cpp | MLX |
+|:-----:|------:|----------:|----:|
+| Q8_0 | 57 | N/A | 92 |
+| Q4_0 | 68 | N/A | N/A |
+
+**Prefill (tok/s):**
+
+| Quant | Lumen | llama.cpp | MLX |
+|:-----:|------:|----------:|----:|
+| Q8_0 | 343 | N/A | 747 |
+| Q4_0 | 332 | N/A | N/A |
+
+vLLM supports F16 only. MLX Q4_0 uses different encoding — not comparable. llama.cpp does not support Qwen3.5 on Metal.
+
+Methodology in [`bench/METHODOLOGY.md`](bench/METHODOLOGY.md). Full report in [`bench/BENCHMARK_REPORT.md`](bench/BENCHMARK_REPORT.md).
 
 ## Building from Source
 
