@@ -8,6 +8,7 @@ LLM inference engine in Rust with Metal and CUDA GPU backends.
 
 - **Metal** (Apple Silicon) and **CUDA** (NVIDIA) GPU backends
 - GPU-resident inference — all weights in GPU memory, zero per-token transfers
+- Custom **LBC** binary format optimized for zero-copy GPU mapping and MoE streaming
 - GGUF model import with automatic quantization format conversion
 - F16, Q8_0, and Q4_0 runtime quantization
 - 8 model architectures including GatedDeltaNet linear attention (Qwen3.5)
@@ -48,14 +49,22 @@ cargo build --release --features cuda
 
 ## LBC Format
 
-Lumen uses its own binary format (`.lbc`) instead of reading GGUF directly. Convert once, load fast:
+Lumen uses its own Layer-Blob Container (`.lbc`) format instead of reading GGUF directly. While GGUF requires full-header string parsing to locate individual tensors, LBC stores weights in large contiguous blobs with fixed byte offsets, allowing the runtime to seek instantly without scanning metadata.
 
 ```bash
 lumen convert --input model.gguf --output model.lbc
 lumen convert --input model.gguf --output model.lbc --requant q4_0   # requantize during conversion
 ```
 
-LBC is designed for GPU-resident loading: 128 KiB-aligned layer blobs for direct I/O, per-tensor quantization metadata, and expert-granular indexing for MoE models. The converter handles all GGUF v2/v3 models and automatically converts K-quant tensors (Q4_K, Q5_K, Q6_K, etc.) to runtime-supported formats.
+**Benefits of LBC:**
+
+- **Aligned for Direct I/O:** Layer blobs are perfectly aligned to 128 KiB boundaries, enabling zero-copy memory mapping and direct hardware reads from SSDs without padding overhead.
+- **Zero-Copy Loading:** The entire file is memory-mapped. Accessing a layer is instantaneous (a simple pointer clone), with windowed prefetching allowing models to stream effectively even if they exceed available RAM.
+- **Fast MoE Routing:** Sub-layer indexing allows loading individual experts by their absolute byte position in parallel without reading the full layer.
+- **Streaming Conversion:** Layer sizes are deterministic, allowing conversion in constant memory without holding the full model. 
+- **Per-Tensor Quantization:** Mixes multiple quantization schemes (F16, Q8_0, Q4_K, etc.) securely in the same file with a CRC32-validated header and backward-compatible sections.
+
+The converter handles all GGUF v2/v3 models, streams one layer at a time, and automatically dequantizes K-quant tensors (Q4_K, Q5_K, Q6_K, Q2_K, Q3_K) and MXFP4 to runtime-supported formats.
 
 ## Performance
 
