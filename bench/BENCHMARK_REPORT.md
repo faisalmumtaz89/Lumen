@@ -108,6 +108,27 @@ All benchmarks use **pp128+gen128** (128-token prompt, 128-token generation). Th
 | Q8_0 | 324 | 2,611 | N/A |
 | Q4_0 | 316 | 2,806 | N/A |
 
+## vLLM GGUF (Experimental)
+
+vLLM 0.8.4 supports GGUF Q8_0/Q4_0 via its V0 engine, but this path is [experimental and under-optimized](https://docs.vllm.ai/en/v0.8.4/features/quantization/gguf.html). GGUF decode throughput is no faster than FP16 (no quantization benefit), and GGUF prefill is 3-15x slower than FP16. These numbers are included for completeness but do not represent vLLM's production performance. Hardware: A100 PCIe (separate run from the SXM4 data above).
+
+| Model | Quant | vLLM Decode | vLLM Prefill | vs vLLM F16 Dec | vs vLLM F16 PP |
+|-------|:-----:|------------:|-------------:|----------------:|---------------:|
+| Qwen2.5 3B | F16 | 54.9 | 6,630 | — | — |
+| Qwen2.5 3B | Q8_0 | 52.8 | 1,599 | 0.96x | 0.24x |
+| Qwen2.5 3B | Q4_0 | 51.8 | 2,344 | 0.94x | 0.35x |
+| Qwen2.5 7B | F16 | 66.6 | 7,748 | — | — |
+| Qwen2.5 7B | Q8_0 | 63.9 | 665 | 0.96x | 0.09x |
+| Qwen2.5 7B | Q4_0 | 59.4 | 979 | 0.89x | 0.13x |
+| Llama 3.1 8B | F16 | 54.4 | 6,306 | — | — |
+| Llama 3.1 8B | Q8_0 | 60.2 | 596 | 1.11x | 0.09x |
+| Llama 3.1 8B | Q4_0 | 59.5 | 918 | 1.09x | 0.15x |
+| Qwen2.5 14B | F16 | 40.2 | 5,052 | — | — |
+| Qwen2.5 14B | Q8_0 | 39.9 | 329 | 0.99x | 0.07x |
+| Qwen2.5 14B | Q4_0 | 40.0 | 496 | 0.99x | 0.10x |
+
+Qwen3.5 9B: GGUF architecture `qwen35` not supported by vLLM 0.8.4.
+
 ## Metal Results
 
 ### TinyLlama 1.1B
@@ -204,3 +225,5 @@ Per-run values (R1/R2/R3) and coefficient of variation (CV%) across the 3 Metal 
 | Qwen3.5 9B | Q8_0 | MLX | prefill | 738 | 747 | 750 | 747 | 0.8 |
 | Qwen3.5 9B | Q4_0 | Lumen | decode | 67.7 | 67.8 | 67.5 | 67.7 | 0.2 |
 | Qwen3.5 9B | Q4_0 | Lumen | prefill | 334 | 332 | 332 | 332 | 0.3 |
+
+> **High-variance flag:** Llama 3.1 8B F16 Lumen prefill has CV=16.3% (R2=570 is an outlier vs R1=772, R3=766). The median (766) is robust but this measurement has elevated run-to-run variance.

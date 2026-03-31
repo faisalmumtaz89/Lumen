@@ -214,7 +214,7 @@ Decode and prefill throughput (tok/s). pp128 + gen128. Same model weights across
 | Q8_0 | 343 | N/A | 747 |
 | Q4_0 | 332 | N/A | N/A |
 
-vLLM supports F16 only. MLX Q4_0 uses different encoding — not comparable. llama.cpp does not support Qwen3.5 on Metal.
+vLLM: F16 only (GGUF quantized path is experimental — see report). MLX Q4_0: different encoding, not comparable. llama.cpp: does not support Qwen3.5 on Metal.
 
 Methodology in [`bench/METHODOLOGY.md`](bench/METHODOLOGY.md). Full report in [`bench/BENCHMARK_REPORT.md`](bench/BENCHMARK_REPORT.md).
 

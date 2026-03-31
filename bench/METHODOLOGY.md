@@ -11,9 +11,11 @@ This document describes the methodology used for Lumen's benchmarks against llam
 | **Lumen** | Git commit hash | LBC (converted from GGUF) |
 | **llama.cpp** | Git commit hash + build number | GGUF (same file as Lumen's source) |
 | **MLX** | mlx-lm pip version + mlx version | MLX format (converted from HuggingFace) |
-| **vLLM** | pip version | HuggingFace (FP16 only) |
+| **vLLM** | pip version | HuggingFace (FP16), GGUF (Q8_0/Q4_0, experimental) |
 
 All engines use the **same model weights** where format permits. Lumen and llama.cpp share the same GGUF source file (bit-identical weights). MLX uses its own quantization format converted from HuggingFace. Note: MLX 4-bit uses affine quantization (group_size=64) while GGML Q4_0 uses symmetric quantization (group_size=32) — these are not the same encoding. Q8_0 is effectively equivalent across formats.
+
+**vLLM GGUF note:** vLLM 0.8.4 can load GGUF Q8_0/Q4_0 files, but this path forces the V0 engine (no torch.compile) and is [documented as experimental](https://docs.vllm.ai/en/v0.8.4/features/quantization/gguf.html). GGUF prefill throughput is 3-15x lower than vLLM's own FP16 path on the same hardware. Primary vLLM comparisons use FP16 (HuggingFace). GGUF numbers are reported separately for completeness.
 
 ## Hardware
 
