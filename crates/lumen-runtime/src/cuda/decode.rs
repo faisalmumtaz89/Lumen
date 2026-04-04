@@ -135,6 +135,24 @@ pub(crate) struct KernelSet {
     pub(crate) silu_inplace: Option<CudaFunction>,
     pub(crate) silu_elementwise_mul: Option<CudaFunction>,
 
+    // GDN fused decode megakernels (8 launches -> 2 per GDN layer).
+    // gdn_decode_megakernel: fuses conv1d+silu, gates, L2 norm, state update.
+    // gdn_rmsnorm_silu_gate: fuses RMSNorm + SiLU(gate) * normed.
+    pub(crate) gdn_decode_megakernel: Option<CudaFunction>,
+    pub(crate) gdn_rmsnorm_silu_gate: Option<CudaFunction>,
+
+    // GDN fused prefill kernels (eliminate per-token loop over decode kernels).
+    // ssm_conv1d_silu_prefill: batched conv1d+SiLU across T tokens.
+    // gdn_compute_gates_batched: batched gate computation for T * num_heads.
+    // l2_normalize_qk_strided: batched L2 norm for Q and K across T tokens.
+    // gdn_prefill_fused_v3: warp-parallel fused state update (4x unrolled).
+    // gdn_prefill_norm_gate: batched RMSNorm + SiLU gate on raw output.
+    pub(crate) ssm_conv1d_silu_prefill: Option<CudaFunction>,
+    pub(crate) gdn_compute_gates_batched: Option<CudaFunction>,
+    pub(crate) l2_normalize_qk_strided: Option<CudaFunction>,
+    pub(crate) gdn_prefill_fused_v3: Option<CudaFunction>,
+    pub(crate) gdn_prefill_norm_gate: Option<CudaFunction>,
+
     // Tensor-core Flash Attention (WMMA via inline PTX, SM 80+).
     // 16x16 query tiles via mma.sync.aligned.m16n8k16 for QK^T and PV.
     // Optional: compilation requires SM 8.0+; falls back to scalar flash_attention_br4 if unavailable.
@@ -186,7 +204,7 @@ pub(crate) struct KernelSet {
     pub(crate) hgemv_q4_0: Option<CudaFunction>,
     pub(crate) hgemv_q4_0_residual: Option<CudaFunction>,
 
-    // dp4a with pre-quantized Q8_1 input (llama.cpp approach).
+    // dp4a with pre-quantized Q8_1 input.
     // quantize_f32_to_q8_1: pre-quantize x once per token.
     // matvec_q8_0_q8_1: dp4a dot product with native int* input loads.
     // NR=2 rows/block, 128 threads, NO shmem for input. SM 6.1+.
@@ -196,11 +214,11 @@ pub(crate) struct KernelSet {
 
     // Q4_0 dp4a kernels: native Q4_0 weights + pre-quantized Q8_1 input.
     // Unpacks nibbles to sequential int8 for dp4a, includes zero-point correction.
-    // NR=2 rows/block, 128 threads. SM 6.1+.
+    // NR=4 rows/block, 256 threads. SM 6.1+.
     pub(crate) matvec_q4_0_dp4a: Option<CudaFunction>,
     pub(crate) matvec_q4_0_dp4a_residual: Option<CudaFunction>,
 
-    // Q4Aligned + Q8_1 input dp4a kernels (NR=2).
+    // Q4Aligned + Q8_1 input dp4a kernels (NR=4).
     // Combines aligned int* nibble loads (20-byte blocks) with pre-quantized Q8_1 input.
     // 4 int* loads vs 16 byte loads per block. Dispatch priority: this > matvec_q4_0_dp4a.
     pub(crate) matvec_q4_aligned_q8_1: Option<CudaFunction>,
@@ -483,6 +501,27 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         gdn_state_update: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_state_update").ok(),
         silu_inplace: load_fn(shaders::ACTIVATIONS_KERNEL_SOURCE, "silu_inplace").ok(),
         silu_elementwise_mul: load_fn(shaders::ACTIVATIONS_KERNEL_SOURCE, "silu_elementwise_mul").ok(),
+        // GDN fused decode megakernels (8 -> 2 launches per GDN layer)
+        gdn_decode_megakernel: match load_fn(
+            shaders::GDN_MEGAKERNEL_SOURCE,
+            "gdn_decode_megakernel",
+        ) {
+            Ok(f) => { eprintln!("[CUDA] gdn_decode_megakernel: OK"); Some(f) }
+            Err(e) => { eprintln!("[CUDA] gdn_decode_megakernel: FAILED: {e}"); None }
+        },
+        gdn_rmsnorm_silu_gate: match load_fn(
+            shaders::GDN_MEGAKERNEL_SOURCE,
+            "gdn_rmsnorm_silu_gate",
+        ) {
+            Ok(f) => { eprintln!("[CUDA] gdn_rmsnorm_silu_gate: OK"); Some(f) }
+            Err(e) => { eprintln!("[CUDA] gdn_rmsnorm_silu_gate: FAILED: {e}"); None }
+        },
+        // GDN fused prefill kernels
+        ssm_conv1d_silu_prefill: load_fn(shaders::GDN_KERNEL_SOURCE, "ssm_conv1d_silu_prefill").ok(),
+        gdn_compute_gates_batched: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_compute_gates_batched").ok(),
+        l2_normalize_qk_strided: load_fn(shaders::GDN_KERNEL_SOURCE, "l2_normalize_qk_strided").ok(),
+        gdn_prefill_fused_v3: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_fused_v3").ok(),
+        gdn_prefill_norm_gate: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_norm_gate").ok(),
         // Fused F16 decode kernels (dispatch count reduction)
         fused_rmsnorm_f16: match load_fn(
             shaders::FUSED_F16_KERNEL_SOURCE,
@@ -564,7 +603,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             Ok(f) => Some(f),
             Err(e) => { eprintln!("[CUDA] hgemv_q4_0_residual: FAILED: {e}"); None }
         },
-        // dp4a with pre-quantized Q8_1 input (llama.cpp approach)
+        // dp4a with pre-quantized Q8_1 input
         // Compiled with --use_fast_math for accelerated scale multiplication.
         quantize_f32_to_q8_1: match load_fn_sm80_fast_math(
             shaders::MATVEC_DP4A_Q8_1_KERNEL_SOURCE,
@@ -587,7 +626,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             Ok(f) => Some(f),
             Err(e) => { eprintln!("[CUDA] matvec_q8_0_q8_1_residual: FAILED: {e}"); None }
         },
-        // Q4_0 dp4a with pre-quantized Q8_1 input (NR=2, nibble unpack + dp4a)
+        // Q4_0 dp4a with pre-quantized Q8_1 input (NR=4, nibble unpack + dp4a)
         // Compiled with --use_fast_math for accelerated scale multiplication.
         matvec_q4_0_dp4a: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_0_DP4A_KERNEL_SOURCE,
@@ -603,7 +642,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             Ok(f) => { eprintln!("[CUDA] matvec_q4_0_dp4a_residual: OK"); Some(f) }
             Err(e) => { eprintln!("[CUDA] matvec_q4_0_dp4a_residual: FAILED: {e}"); None }
         },
-        // Q4Aligned + Q8_1 input dp4a (NR=2, aligned int* nibble loads)
+        // Q4Aligned + Q8_1 input dp4a (NR=4, aligned int* nibble loads)
         // Compiled with --use_fast_math for accelerated scale multiplication.
         matvec_q4_aligned_q8_1: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_ALIGNED_Q8_1_KERNEL_SOURCE,
@@ -999,8 +1038,22 @@ pub(crate) fn q8_1_quant_grid(in_dim: u32) -> u32 {
 
 /// Grid size for the dp4a Q8_1 matvec: ceil(out_dim / MV_NR) blocks.
 /// MV_NR=2: each block processes 2 output rows.
+/// Used by Q8_0, Q8Aligned, and Q8_1 kernels (NR=2).
 pub(crate) fn dp4a_q8_1_grid(out_dim: u32) -> u32 {
     (out_dim + 1) / 2
+}
+
+/// Threads per block for Q4_0 dp4a kernels (NR=4, 8 warps).
+/// Q4 kernels use NR=4 with 256 threads for better x-vector amortization:
+/// 4x weight bandwidth amortization per x-vector load vs 2x for Q8.
+/// Q4 blocks are smaller (18-20 bytes vs 34-36 for Q8), so NR=4 doesn't
+/// cause register spill despite processing 4 rows per block.
+pub(crate) const DP4A_Q4_BLOCK_DIM: u32 = 256;
+
+/// Grid size for Q4_0 dp4a matvec: ceil(out_dim / 4) blocks.
+/// NR=4: each block processes 4 output rows.
+pub(crate) fn dp4a_q4_grid(out_dim: u32) -> u32 {
+    (out_dim + 3) / 4
 }
 
 // ------------------------------------------------------------------

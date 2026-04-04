@@ -8,7 +8,7 @@
 //      dp4a INT8 dot products on both sides -- no on-the-fly quantization.
 //   3. matvec_q8_0_q8_1_residual: Same + fused residual addition.
 //
-// This mirrors llama.cpp's proven approach for quantized decode on A100:
+// Optimized dp4a approach for quantized decode on A100:
 //   - Pre-quantize F32 x to Q8_1 blocks (32-element blocks, f16 scale + f16 sum + 32 int8)
 //   - Weight reads: 1.0625 B/elem (native Q8_0, 34 bytes per 32 elements)
 //   - Input reads: 1.125 B/elem (Q8_1, 36 bytes per 32 elements)
@@ -30,7 +30,7 @@
 // Q8_0 block layout (34 bytes per 32 elements):
 //   bytes [0..1]: f16 scale (d)
 //   bytes [2..33]: 32 x int8 quantized values
-//   Quant data at byte 2 is NOT 4-byte aligned -> byte loads + manual packing
+//   Quant data at byte 2 is 2-byte aligned -> uint16 pair loads + shift/OR packing
 //
 // Architecture:
 //   - 128 threads per block (4 warps)
@@ -250,19 +250,17 @@ extern "C" __global__ __launch_bounds__(MV_THREADS, 1) void matvec_q8_0_q8_1(
                                         | ((unsigned short)(unsigned char)w_block[1] << 8);
             float w_scale = f16_bits_to_f32(w_scale_bits);
 
-            // Load 32 int8 weight values from w_block+2 (NOT 4-byte aligned).
-            // Must use byte loads to avoid XID 13 on A100 (34-byte blocks).
-            const unsigned char* wq = (const unsigned char*)(w_block + 2);
+            // Load 32 int8 weight values from w_block+2 as uint16 pairs.
+            // Q8_0 quant data at +2 is 2-byte aligned (34-byte blocks, even offset).
+            // uint16 loads: 2 loads + 1 shift + 1 OR = 4 ops per int32 word,
+            // vs byte loads: 4 loads + 3 shifts + 3 ORs = 10 ops per int32 word.
+            // NOT 4-byte aligned, so int* cast is unsafe (XID 13 on A100).
+            const unsigned short* w16 = (const unsigned short*)(w_block + 2);
 
             int acc = 0;
             #pragma unroll
             for (int k = 0; k < 8; k++) {
-                // Weight: byte loads + manual packing (not 4-byte aligned).
-                int w_word = (int)(signed char)wq[k * 4 + 0]
-                           | ((int)(signed char)wq[k * 4 + 1] << 8)
-                           | ((int)(signed char)wq[k * 4 + 2] << 16)
-                           | ((int)(signed char)wq[k * 4 + 3] << 24);
-
+                int w_word = (int)w16[k * 2] | ((int)w16[k * 2 + 1] << 16);
                 acc = __dp4a(w_word, xv[k], acc);
             }
 
@@ -358,15 +356,13 @@ extern "C" __global__ __launch_bounds__(MV_THREADS, 1) void matvec_q8_0_q8_1_res
                                         | ((unsigned short)(unsigned char)w_block[1] << 8);
             float w_scale = f16_bits_to_f32(w_scale_bits);
 
-            const unsigned char* wq = (const unsigned char*)(w_block + 2);
+            // uint16 loads: 2-byte aligned at w_block+2, avoids XID 13 from int* cast.
+            const unsigned short* w16 = (const unsigned short*)(w_block + 2);
 
             int acc = 0;
             #pragma unroll
             for (int k = 0; k < 8; k++) {
-                int w_word = (int)(signed char)wq[k * 4 + 0]
-                           | ((int)(signed char)wq[k * 4 + 1] << 8)
-                           | ((int)(signed char)wq[k * 4 + 2] << 16)
-                           | ((int)(signed char)wq[k * 4 + 3] << 24);
+                int w_word = (int)w16[k * 2] | ((int)w16[k * 2 + 1] << 16);
                 acc = __dp4a(w_word, xv[k], acc);
             }
 

@@ -470,3 +470,62 @@ extern "C" __global__ void attention_decode_graph(
         reinterpret_cast<float4*>(out_head)[d4] = acc;
     }
 }
+
+// ============================================================================
+// GDN Conv1D decode -- reads state_pos from device pointer (graph-compatible)
+// ============================================================================
+//
+// Identical to ssm_conv1d_decode in gdn.cu, except state_pos is read from
+// a device pointer instead of a scalar argument. This allows CUDA graph
+// capture since the pointer is baked in but its value can change.
+//
+// Grid: 1D, ceil(conv_dim / 256) blocks of 256 threads
+
+extern "C" __global__ void ssm_conv1d_decode_graph(
+    float* __restrict__ conv_state,   // [buf_slots, conv_dim] circular buffer R/W
+    const float* __restrict__ input,  // [conv_dim] new token values
+    const float* __restrict__ weight, // [conv_dim, kernel_size] convolution weights
+    float* __restrict__ output,       // [conv_dim] convolved output
+    unsigned int conv_dim,
+    unsigned int kernel_size,
+    const unsigned int* __restrict__ p_state_pos)  // device pointer to state_pos
+{
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= conv_dim) return;
+
+    unsigned int state_pos = *p_state_pos;
+    float sum = 0.0f;
+    unsigned int buf_slots = kernel_size - 1;
+
+    // Taps 0..kernel_size-2: read from circular buffer (oldest to newest)
+    for (unsigned int tap = 0; tap < buf_slots; tap++) {
+        unsigned int slot = (state_pos + tap) % buf_slots;
+        sum += weight[gid * kernel_size + tap] * conv_state[slot * conv_dim + gid];
+    }
+
+    // Tap kernel_size-1: current input (newest)
+    sum += weight[gid * kernel_size + buf_slots] * input[gid];
+
+    output[gid] = sum;
+
+    // Update circular buffer: overwrite oldest entry (at state_pos) with current input
+    conv_state[state_pos * conv_dim + gid] = input[gid];
+}
+
+// ============================================================================
+// Advance conv position -- increments GPU-resident conv_pos for graph capture
+// ============================================================================
+//
+// Single-thread kernel that advances the circular buffer write position.
+// Dispatched AFTER ssm_conv1d_decode_graph for each GDN layer inside the
+// captured graph. The position update happens on-GPU, so no host<->device
+// sync is needed during graph replay.
+//
+// Grid: (1, 1, 1), Block: (1, 1, 1)
+
+extern "C" __global__ void advance_conv_position(
+    unsigned int* __restrict__ conv_pos,
+    unsigned int buf_slots)
+{
+    *conv_pos = (*conv_pos + 1) % buf_slots;
+}

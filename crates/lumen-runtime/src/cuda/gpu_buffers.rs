@@ -113,6 +113,14 @@ pub struct LayerWeightsGpu {
     pub ssm_alpha_f16: Option<CudaSlice<u8>>,
     /// F16 cache for SSM beta projection (None if not Q8_0/Q4_0 or OOM).
     pub ssm_beta_f16: Option<CudaSlice<u8>>,
+
+    // --- Fused alpha+beta weight (row-concatenated for batched dispatch) ---
+    /// Fused [alpha; beta] weight: [2*num_heads, hidden_dim] in the same quant as
+    /// ssm_alpha / ssm_beta. One matvec dispatch instead of two.
+    /// Created at load time by concatenating raw bytes. None if alpha or beta missing.
+    pub ssm_alpha_beta: Option<GpuWeightBuf>,
+    /// F16 cache for the fused alpha+beta projection.
+    pub ssm_alpha_beta_f16: Option<CudaSlice<u8>>,
 }
 
 /// Reinterpret raw LE bytes as an f32 slice.
@@ -172,7 +180,7 @@ fn estimate_quant_elements(byte_len: usize, scheme: QuantScheme) -> usize {
 /// Decode K-quant scales from 12 packed bytes into 8 scale + 8 min arrays.
 ///
 /// Used by Q4_K and Q5_K. The 12 bytes encode 8 6-bit scales and 8 6-bit mins
-/// in the GGML packed layout: low 6 bits from bytes 0..7, high 2 bits from bytes 8..11.
+/// in the standard packed layout: low 6 bits from bytes 0..7, high 2 bits from bytes 8..11.
 fn decode_k_scales(scales: &[u8]) -> ([u8; 8], [u8; 8]) {
     let mut sc = [0u8; 8];
     let mut m = [0u8; 8];
@@ -193,7 +201,7 @@ fn decode_k_scales(scales: &[u8]) -> ([u8; 8], [u8; 8]) {
 /// Q3_K. Mixed-quant GGUFs (e.g. bartowski/mradermacher Q4_0 with imatrix)
 /// commonly use Q5_K or Q6_K for sensitive per-layer tensors alongside Q4_0.
 ///
-/// All implementations match the GGML reference layout exactly (same as
+/// All implementations match the reference layout exactly (same as
 /// lumen-convert::dequant).
 fn dequant_kquant_to_f32(
     raw: &[u8],
@@ -393,7 +401,7 @@ fn dequant_kquant_to_f32(
                 let scale_bytes = &bp[96..108];
                 let d = f16_to_f32(u16::from_le_bytes([bp[108], bp[109]]));
 
-                // Decode 16 6-bit scales from 12 bytes (GGML packed layout)
+                // Decode 16 6-bit scales from 12 bytes (standard packed layout)
                 let mut sc_arr = [0u8; 16];
                 for j in 0..4 {
                     sc_arr[j] = scale_bytes[j] & 0x0F;
@@ -639,6 +647,67 @@ fn upload_norm_tensor(
     device.htod_copy(f32_data)
 }
 
+/// Upload two tensors row-concatenated as a single fused `GpuWeightBuf`.
+///
+/// Both slices must have the same quant scheme. The raw bytes of `a` and `b` are
+/// concatenated (a's rows first, then b's rows) and uploaded in one H2D transfer.
+/// This is used to fuse alpha+beta projections: [num_heads, hidden_dim] each
+/// becomes [2*num_heads, hidden_dim] as a single weight. One-time cost at load.
+fn upload_fused_tensor(
+    device: &CudaDevice,
+    weights: &LayerView,
+    name: &str,
+    a: &lumen_format::index::TensorSlice,
+    b: &lumen_format::index::TensorSlice,
+) -> Result<GpuWeightBuf, RuntimeError> {
+    if a.quant != b.quant {
+        return Err(RuntimeError::Compute(format!(
+            "CUDA fused upload {name}: quant mismatch {:?} vs {:?}",
+            a.quant, b.quant,
+        )));
+    }
+    let raw_a = weights.subtensor_bytes(a)?;
+    let raw_b = weights.subtensor_bytes(b)?;
+
+    match a.quant {
+        QuantScheme::F32 => {
+            let f32_a = bytes_as_f32(raw_a)?;
+            let f32_b = bytes_as_f32(raw_b)?;
+            let mut fused = Vec::with_capacity(f32_a.len() + f32_b.len());
+            fused.extend_from_slice(f32_a);
+            fused.extend_from_slice(f32_b);
+            Ok(GpuWeightBuf::F32(device.htod_copy(&fused)?))
+        }
+        QuantScheme::F16 => {
+            let mut fused = Vec::with_capacity(raw_a.len() + raw_b.len());
+            fused.extend_from_slice(raw_a);
+            fused.extend_from_slice(raw_b);
+            Ok(GpuWeightBuf::F16Raw(device.htod_copy(&fused)?))
+        }
+        QuantScheme::Q8_0 => {
+            let mut fused = Vec::with_capacity(raw_a.len() + raw_b.len());
+            fused.extend_from_slice(raw_a);
+            fused.extend_from_slice(raw_b);
+            Ok(GpuWeightBuf::Q8Raw(device.htod_copy(&fused)?))
+        }
+        QuantScheme::Q4_0 => {
+            let mut fused = Vec::with_capacity(raw_a.len() + raw_b.len());
+            fused.extend_from_slice(raw_a);
+            fused.extend_from_slice(raw_b);
+            Ok(GpuWeightBuf::Q4Raw(device.htod_copy(&fused)?))
+        }
+        other => {
+            // For other quant types (Q4_1, K-quants, etc.), the individual upload_tensor
+            // calls dequant to F32. We can't easily fuse those here without duplicating
+            // the dequant logic. Fall back to None (caller uses separate alpha/beta).
+            Err(RuntimeError::Compute(format!(
+                "CUDA fused upload {name}: unsupported quant {:?} for fusion",
+                other,
+            )))
+        }
+    }
+}
+
 /// Upload a single layer's weight tensors from a `LayerView` to GPU memory.
 ///
 /// Extracts each subtensor's raw bytes and uploads according to quant scheme:
@@ -744,6 +813,10 @@ pub fn upload_layer_weights(
         attn_gate_f16: None,
         ssm_alpha_f16: None,
         ssm_beta_f16: None,
+        // Fused alpha+beta weight reserved for future batched alpha+beta projection.
+        // Currently None -- dispatch not yet wired.
+        ssm_alpha_beta: None,
+        ssm_alpha_beta_f16: None,
     })
 }
 

@@ -80,6 +80,14 @@ pub(crate) struct PrefillScratch {
     /// Used to convert F32 activations to F16 before `cublasGemmEx` HGEMM.
     /// Reused across all projections. Only allocated when F16 weight caches exist.
     pub activation_f16: CudaSlice<u8>,
+    /// F16 scratch for dequantized Q8_0/Q4_0 weights: [max_weight_elements * 2] bytes.
+    ///
+    /// Sized to hold the largest projection weight matrix in F16 format.
+    /// Reused across all projections within a layer. Enables the HGEMM path
+    /// (312 TFLOPS tensor cores) for quantized weights that lack a persistent
+    /// F16 cache (e.g., GDN layers). Replaces the slow dequant->F32->SGEMM
+    /// path (19.5 TFLOPS) with dequant->F16->HGEMM.
+    pub dequant_f16: CudaSlice<u8>,
 }
 
 /// Pre-allocated GPU scratch buffers for GDN batched prefill.
@@ -93,10 +101,22 @@ pub(crate) struct GdnPrefillScratch {
     pub alpha_raw: CudaSlice<f32>,
     /// Batched beta raw projection: [batch, num_heads].
     pub beta_raw: CudaSlice<f32>,
+    /// Fused alpha+beta raw projection: [batch, 2*num_heads].
+    /// First num_heads columns = alpha, last num_heads columns = beta.
+    /// Used when ssm_alpha_beta fused weight is available.
+    pub alpha_beta_raw: CudaSlice<f32>,
     /// Batched gate projection: [batch, value_dim].
     pub gate: CudaSlice<f32>,
     /// Batched GDN output (per-token gated output): [batch, value_dim].
     pub gdn_out: CudaSlice<f32>,
+    /// Batched conv1d + SiLU output: [batch, qkv_dim].
+    pub conv_out: CudaSlice<f32>,
+    /// Raw output from gdn_prefill_fused_v3: [batch, num_heads * val_dim].
+    pub raw_out: CudaSlice<f32>,
+    /// Computed alpha gates: [batch, num_heads]. Output of gdn_compute_gates_batched.
+    pub alpha_out: CudaSlice<f32>,
+    /// Computed beta gates: [batch, num_heads]. Output of gdn_compute_gates_batched.
+    pub beta_out: CudaSlice<f32>,
 }
 
 /// Allocate GDN prefill scratch buffers.
@@ -111,8 +131,13 @@ pub(crate) fn alloc_gdn_prefill_scratch(
         qkv: device.alloc_zeros(batch * qkv_dim)?,
         alpha_raw: device.alloc_zeros(batch * num_heads)?,
         beta_raw: device.alloc_zeros(batch * num_heads)?,
+        alpha_beta_raw: device.alloc_zeros(batch * 2 * num_heads)?,
         gate: device.alloc_zeros(batch * value_dim)?,
         gdn_out: device.alloc_zeros(batch * value_dim)?,
+        conv_out: device.alloc_zeros(batch * qkv_dim)?,
+        raw_out: device.alloc_zeros(batch * value_dim)?,
+        alpha_out: device.alloc_zeros(batch * num_heads)?,
+        beta_out: device.alloc_zeros(batch * num_heads)?,
     })
 }
 
@@ -159,6 +184,9 @@ pub(crate) fn alloc_prefill_scratch(
         dequant_f32: device.alloc_zeros(max_weight_elems)?,
         // F16 activation: batch * max_in_dim * 2 bytes. max_in_dim = max(hidden_dim, inter_dim, q_dim).
         activation_f16: device.alloc_zeros(batch * [hidden_dim, inter_dim, q_dim].into_iter().max().unwrap_or(hidden_dim) * 2)?,
+        // F16 dequant scratch: max_weight_elems * 2 bytes (F16). Enables HGEMM for Q8_0/Q4_0
+        // weights without persistent F16 caches (GDN layers).
+        dequant_f16: device.alloc_zeros(max_weight_elems * 2)?,
     })
 }
 
@@ -305,6 +333,7 @@ pub(crate) unsafe fn launch_gemm_projection(
     output: &mut CudaSlice<f32>,
     dequant_scratch: &mut CudaSlice<f32>,
     activation_f16: &mut CudaSlice<u8>,
+    dequant_f16: &mut CudaSlice<u8>,
     batch: usize,
     out_dim: usize,
     in_dim: usize,
@@ -389,51 +418,71 @@ pub(crate) unsafe fn launch_gemm_projection(
                 })?;
         }
         GpuWeightBuf::Q8Raw(w_q8) => {
-            // Dequantize Q8_0 weights to F32 scratch, then cuBLAS SGEMM.
+            // Dequantize Q8_0 weights to F16 scratch, then cuBLAS HGEMM (tensor cores).
             //
-            // This replaces `batch` sequential matvec kernel launches with:
-            //   1. One dequant_q8_0_to_f32 kernel (num_elements threads)
-            //   2. One cuBLAS SGEMM call
+            // This replaces the old F32 SGEMM path (19.5 TFLOPS) with:
+            //   1. One dequant_q8_0_to_f16 kernel (num_elements threads)
+            //   2. One f32_to_f16 conversion of activations
+            //   3. One cublasGemmEx HGEMM call (312 TFLOPS on A100)
             //
-            // For pp128 on Llama 8B (out_dim=4096, in_dim=4096):
-            //   Before: 128 matvec launches * 7 projections * 32 layers = 28,672 launches
-            //   After:  2 launches * 7 projections * 32 layers = 448 launches
+            // Critical for GDN layers where F16 weight caches are skipped (OOM concern)
+            // but HGEMM tensor cores provide 16x higher throughput than SGEMM.
             let num_elements = out_dim * in_dim;
-            if dequant_scratch.len() < num_elements {
-                return Err(RuntimeError::Compute(format!(
-                    "sgemm {label}: dequant scratch too small: have {} elements, \
-                     need {} (out_dim={out_dim}, in_dim={in_dim})",
-                    dequant_scratch.len(),
-                    num_elements,
-                )));
+            let f16_bytes_needed = num_elements * 2;
+            if dequant_f16.len() < f16_bytes_needed {
+                // Fallback to F32 SGEMM if dequant_f16 buffer is too small.
+                if dequant_scratch.len() < num_elements {
+                    return Err(RuntimeError::Compute(format!(
+                        "sgemm {label}: dequant scratch too small: have {} elements, \
+                         need {} (out_dim={out_dim}, in_dim={in_dim})",
+                        dequant_scratch.len(),
+                        num_elements,
+                    )));
+                }
+                launch_dequant_q8_0_to_f32(
+                    device, kernels, w_q8, dequant_scratch, num_elements, label,
+                )?;
+                let cfg = GemmConfig {
+                    transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    m: out_dim as i32,
+                    n: batch as i32,
+                    k: in_dim as i32,
+                    alpha: 1.0f32,
+                    lda: in_dim as i32,
+                    ldb: in_dim as i32,
+                    beta: 0.0f32,
+                    ldc: out_dim as i32,
+                };
+                device
+                    .blas
+                    .gemm(cfg, &*dequant_scratch, input, output)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "cuBLAS SGEMM fallback (dequant Q8_0) {label}: {e}"
+                        ))
+                    })?;
+            } else {
+                static Q8_HGEMM_LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !Q8_HGEMM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("[CUDA] Prefill Q8_0 HGEMM: ACTIVE (dequant->F16->tensor core path)");
+                }
+
+                // Step 1: Dequantize Q8_0 -> F16 in scratch buffer.
+                launch_dequant_q8_0_to_f16(
+                    device, kernels, w_q8, dequant_f16, num_elements, label,
+                )?;
+
+                // Step 2: Convert F32 activation to F16.
+                launch_f32_to_f16_fast(device, kernels, input, activation_f16, batch * in_dim, label)?;
+
+                // Step 3: cublasGemmEx HGEMM (F16 weight + F16 activation -> F32 output).
+                launch_cublas_hgemm(
+                    device, dequant_f16, activation_f16, output,
+                    out_dim, batch, in_dim, 0.0, label,
+                )?;
             }
-
-            // Step 1: Dequantize Q8_0 -> F32 in scratch buffer.
-            launch_dequant_q8_0_to_f32(
-                device, kernels, w_q8, dequant_scratch, num_elements, label,
-            )?;
-
-            // Step 2: cuBLAS SGEMM with the dequantized F32 weights.
-            let cfg = GemmConfig {
-                transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-                transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-                m: out_dim as i32,
-                n: batch as i32,
-                k: in_dim as i32,
-                alpha: 1.0f32,
-                lda: in_dim as i32,
-                ldb: in_dim as i32,
-                beta: 0.0f32,
-                ldc: out_dim as i32,
-            };
-            device
-                .blas
-                .gemm(cfg, &*dequant_scratch, input, output)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!(
-                        "cuBLAS SGEMM (dequant Q8_0) {label}: {e}"
-                    ))
-                })?;
         }
         GpuWeightBuf::F16Raw(w_f16) => {
             // Native F16 weights: cublasGemmEx HGEMM directly (no dequant needed).
@@ -454,49 +503,70 @@ pub(crate) unsafe fn launch_gemm_projection(
             )?;
         }
         GpuWeightBuf::Q4Raw(w_q4) => {
-            // Dequantize Q4_0 weights to F32 scratch, then cuBLAS SGEMM.
+            // Dequantize Q4_0 weights to F16 scratch, then cuBLAS HGEMM (tensor cores).
             //
-            // Same pattern as Q8Raw: replaces `batch` sequential matvec launches with:
-            //   1. One dequant_q4_0_to_f32 kernel (num_elements threads)
-            //   2. One cuBLAS SGEMM call
+            // Same pattern as Q8Raw HGEMM: replaces `batch` sequential matvec launches with:
+            //   1. One dequant_q4_0_to_f16 kernel (num_elements threads)
+            //   2. One f32_to_f16 conversion of activations
+            //   3. One cublasGemmEx HGEMM call (312 TFLOPS on A100)
             //
             // Critical for GDN layers where F16 caches are skipped to save GPU memory.
             let num_elements = out_dim * in_dim;
-            if dequant_scratch.len() < num_elements {
-                return Err(RuntimeError::Compute(format!(
-                    "sgemm {label}: dequant scratch too small: have {} elements, \
-                     need {} (out_dim={out_dim}, in_dim={in_dim})",
-                    dequant_scratch.len(),
-                    num_elements,
-                )));
+            let f16_bytes_needed = num_elements * 2;
+            if dequant_f16.len() < f16_bytes_needed {
+                // Fallback to F32 SGEMM if dequant_f16 buffer is too small.
+                if dequant_scratch.len() < num_elements {
+                    return Err(RuntimeError::Compute(format!(
+                        "sgemm {label}: dequant scratch too small: have {} elements, \
+                         need {} (out_dim={out_dim}, in_dim={in_dim})",
+                        dequant_scratch.len(),
+                        num_elements,
+                    )));
+                }
+                launch_dequant_q4_0_to_f32(
+                    device, kernels, w_q4, dequant_scratch, num_elements, label,
+                )?;
+                let cfg = GemmConfig {
+                    transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    m: out_dim as i32,
+                    n: batch as i32,
+                    k: in_dim as i32,
+                    alpha: 1.0f32,
+                    lda: in_dim as i32,
+                    ldb: in_dim as i32,
+                    beta: 0.0f32,
+                    ldc: out_dim as i32,
+                };
+                device
+                    .blas
+                    .gemm(cfg, &*dequant_scratch, input, output)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "cuBLAS SGEMM fallback (dequant Q4_0) {label}: {e}"
+                        ))
+                    })?;
+            } else {
+                static Q4_HGEMM_LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !Q4_HGEMM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("[CUDA] Prefill Q4_0 HGEMM: ACTIVE (dequant->F16->tensor core path)");
+                }
+
+                // Step 1: Dequantize Q4_0 -> F16 in scratch buffer.
+                launch_dequant_q4_0_to_f16(
+                    device, kernels, w_q4, dequant_f16, num_elements, label,
+                )?;
+
+                // Step 2: Convert F32 activation to F16.
+                launch_f32_to_f16_fast(device, kernels, input, activation_f16, batch * in_dim, label)?;
+
+                // Step 3: cublasGemmEx HGEMM (F16 weight + F16 activation -> F32 output).
+                launch_cublas_hgemm(
+                    device, dequant_f16, activation_f16, output,
+                    out_dim, batch, in_dim, 0.0, label,
+                )?;
             }
-
-            // Step 1: Dequantize Q4_0 -> F32 in scratch buffer.
-            launch_dequant_q4_0_to_f32(
-                device, kernels, w_q4, dequant_scratch, num_elements, label,
-            )?;
-
-            // Step 2: cuBLAS SGEMM with the dequantized F32 weights.
-            let cfg = GemmConfig {
-                transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-                transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-                m: out_dim as i32,
-                n: batch as i32,
-                k: in_dim as i32,
-                alpha: 1.0f32,
-                lda: in_dim as i32,
-                ldb: in_dim as i32,
-                beta: 0.0f32,
-                ldc: out_dim as i32,
-            };
-            device
-                .blas
-                .gemm(cfg, &*dequant_scratch, input, output)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!(
-                        "cuBLAS SGEMM (dequant Q4_0) {label}: {e}"
-                    ))
-                })?;
         }
         GpuWeightBuf::Q8Aligned(_) => {
             // Q8Aligned in batched prefill: fall back to per-row matvec
@@ -546,6 +616,7 @@ pub(crate) unsafe fn launch_gemm_residual(
     output: &mut CudaSlice<f32>,
     dequant_scratch: &mut CudaSlice<f32>,
     activation_f16: &mut CudaSlice<u8>,
+    dequant_f16: &mut CudaSlice<u8>,
     batch: usize,
     out_dim: usize,
     in_dim: usize,
@@ -642,53 +713,75 @@ pub(crate) unsafe fn launch_gemm_residual(
                 })?;
         }
         GpuWeightBuf::Q8Raw(w_q8) => {
-            // Dequantize Q8_0 -> F32, then cuBLAS SGEMM with fused residual.
+            // Dequantize Q8_0 -> F16, then cuBLAS HGEMM with fused residual (tensor cores).
             let num_elements = out_dim * in_dim;
-            if dequant_scratch.len() < num_elements {
-                return Err(RuntimeError::Compute(format!(
-                    "sgemm_residual {label}: dequant scratch too small: have {} elements, \
-                     need {} (out_dim={out_dim}, in_dim={in_dim})",
-                    dequant_scratch.len(),
-                    num_elements,
-                )));
+            let f16_bytes_needed = num_elements * 2;
+            if dequant_f16.len() < f16_bytes_needed {
+                // Fallback to F32 SGEMM if dequant_f16 buffer is too small.
+                if dequant_scratch.len() < num_elements {
+                    return Err(RuntimeError::Compute(format!(
+                        "sgemm_residual {label}: dequant scratch too small: have {} elements, \
+                         need {} (out_dim={out_dim}, in_dim={in_dim})",
+                        dequant_scratch.len(),
+                        num_elements,
+                    )));
+                }
+                launch_dequant_q8_0_to_f32(
+                    device, kernels, w_q8, dequant_scratch, num_elements, label,
+                )?;
+                device
+                    .stream
+                    .memcpy_dtod(residual, output)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "dtod residual copy (dequant Q8_0 fallback) {label}: {e}"
+                        ))
+                    })?;
+                let cfg = GemmConfig {
+                    transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    m: out_dim as i32,
+                    n: batch as i32,
+                    k: in_dim as i32,
+                    alpha: 1.0f32,
+                    lda: in_dim as i32,
+                    ldb: in_dim as i32,
+                    beta: 1.0f32,
+                    ldc: out_dim as i32,
+                };
+                device
+                    .blas
+                    .gemm(cfg, &*dequant_scratch, input, output)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "cuBLAS SGEMM+residual fallback (dequant Q8_0) {label}: {e}"
+                        ))
+                    })?;
+            } else {
+                // Step 1: Copy residual -> output for beta=1.0 accumulation.
+                device
+                    .stream
+                    .memcpy_dtod(residual, output)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "dtod residual copy (dequant Q8_0) {label}: {e}"
+                        ))
+                    })?;
+
+                // Step 2: Dequantize Q8_0 -> F16 in scratch buffer.
+                launch_dequant_q8_0_to_f16(
+                    device, kernels, w_q8, dequant_f16, num_elements, label,
+                )?;
+
+                // Step 3: Convert F32 activation to F16.
+                launch_f32_to_f16_fast(device, kernels, input, activation_f16, batch * in_dim, label)?;
+
+                // Step 4: cublasGemmEx HGEMM with beta=1.0 for residual accumulation.
+                launch_cublas_hgemm(
+                    device, dequant_f16, activation_f16, output,
+                    out_dim, batch, in_dim, 1.0, label,
+                )?;
             }
-
-            // Step 1: Dequantize Q8_0 -> F32 in scratch buffer.
-            launch_dequant_q8_0_to_f32(
-                device, kernels, w_q8, dequant_scratch, num_elements, label,
-            )?;
-
-            // Step 2: Copy residual -> output for beta=1.0 accumulation.
-            device
-                .stream
-                .memcpy_dtod(residual, output)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!(
-                        "dtod residual copy (dequant Q8_0) {label}: {e}"
-                    ))
-                })?;
-
-            // Step 3: cuBLAS SGEMM with beta=1.0.
-            let cfg = GemmConfig {
-                transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-                transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-                m: out_dim as i32,
-                n: batch as i32,
-                k: in_dim as i32,
-                alpha: 1.0f32,
-                lda: in_dim as i32,
-                ldb: in_dim as i32,
-                beta: 1.0f32,
-                ldc: out_dim as i32,
-            };
-            device
-                .blas
-                .gemm(cfg, &*dequant_scratch, input, output)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!(
-                        "cuBLAS SGEMM+residual (dequant Q8_0) {label}: {e}"
-                    ))
-                })?;
         }
         GpuWeightBuf::F16Raw(w_f16) => {
             // Native F16 weights: cublasGemmEx HGEMM with residual (no dequant needed).
@@ -712,53 +805,75 @@ pub(crate) unsafe fn launch_gemm_residual(
             )?;
         }
         GpuWeightBuf::Q4Raw(w_q4) => {
-            // Dequantize Q4_0 -> F32, then cuBLAS SGEMM with fused residual.
+            // Dequantize Q4_0 -> F16, then cuBLAS HGEMM with fused residual (tensor cores).
             let num_elements = out_dim * in_dim;
-            if dequant_scratch.len() < num_elements {
-                return Err(RuntimeError::Compute(format!(
-                    "sgemm_residual {label}: dequant scratch too small: have {} elements, \
-                     need {} (out_dim={out_dim}, in_dim={in_dim})",
-                    dequant_scratch.len(),
-                    num_elements,
-                )));
+            let f16_bytes_needed = num_elements * 2;
+            if dequant_f16.len() < f16_bytes_needed {
+                // Fallback to F32 SGEMM if dequant_f16 buffer is too small.
+                if dequant_scratch.len() < num_elements {
+                    return Err(RuntimeError::Compute(format!(
+                        "sgemm_residual {label}: dequant scratch too small: have {} elements, \
+                         need {} (out_dim={out_dim}, in_dim={in_dim})",
+                        dequant_scratch.len(),
+                        num_elements,
+                    )));
+                }
+                launch_dequant_q4_0_to_f32(
+                    device, kernels, w_q4, dequant_scratch, num_elements, label,
+                )?;
+                device
+                    .stream
+                    .memcpy_dtod(residual, output)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "dtod residual copy (dequant Q4_0 fallback) {label}: {e}"
+                        ))
+                    })?;
+                let cfg = GemmConfig {
+                    transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    m: out_dim as i32,
+                    n: batch as i32,
+                    k: in_dim as i32,
+                    alpha: 1.0f32,
+                    lda: in_dim as i32,
+                    ldb: in_dim as i32,
+                    beta: 1.0f32,
+                    ldc: out_dim as i32,
+                };
+                device
+                    .blas
+                    .gemm(cfg, &*dequant_scratch, input, output)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "cuBLAS SGEMM+residual fallback (dequant Q4_0) {label}: {e}"
+                        ))
+                    })?;
+            } else {
+                // Step 1: Copy residual -> output for beta=1.0 accumulation.
+                device
+                    .stream
+                    .memcpy_dtod(residual, output)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "dtod residual copy (dequant Q4_0) {label}: {e}"
+                        ))
+                    })?;
+
+                // Step 2: Dequantize Q4_0 -> F16 in scratch buffer.
+                launch_dequant_q4_0_to_f16(
+                    device, kernels, w_q4, dequant_f16, num_elements, label,
+                )?;
+
+                // Step 3: Convert F32 activation to F16.
+                launch_f32_to_f16_fast(device, kernels, input, activation_f16, batch * in_dim, label)?;
+
+                // Step 4: cublasGemmEx HGEMM with beta=1.0 for residual accumulation.
+                launch_cublas_hgemm(
+                    device, dequant_f16, activation_f16, output,
+                    out_dim, batch, in_dim, 1.0, label,
+                )?;
             }
-
-            // Step 1: Dequantize Q4_0 -> F32 in scratch buffer.
-            launch_dequant_q4_0_to_f32(
-                device, kernels, w_q4, dequant_scratch, num_elements, label,
-            )?;
-
-            // Step 2: Copy residual -> output for beta=1.0 accumulation.
-            device
-                .stream
-                .memcpy_dtod(residual, output)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!(
-                        "dtod residual copy (dequant Q4_0) {label}: {e}"
-                    ))
-                })?;
-
-            // Step 3: cuBLAS SGEMM with beta=1.0.
-            let cfg = GemmConfig {
-                transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-                transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-                m: out_dim as i32,
-                n: batch as i32,
-                k: in_dim as i32,
-                alpha: 1.0f32,
-                lda: in_dim as i32,
-                ldb: in_dim as i32,
-                beta: 1.0f32,
-                ldc: out_dim as i32,
-            };
-            device
-                .blas
-                .gemm(cfg, &*dequant_scratch, input, output)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!(
-                        "cuBLAS SGEMM+residual (dequant Q4_0) {label}: {e}"
-                    ))
-                })?;
         }
         GpuWeightBuf::Q8Aligned(_) => {
             // Q8Aligned in batched prefill residual: fall back to per-row matvec.
@@ -1147,6 +1262,82 @@ unsafe fn launch_dequant_q4_0_to_f32(
         .launch(launch_cfg)
         .map_err(|e| {
             RuntimeError::Compute(format!("dequant_q4_0_to_f32 {label}: {e}"))
+        })?;
+    Ok(())
+}
+
+/// Dequantize Q8_0 weights to F16 scratch buffer for cuBLAS HGEMM.
+///
+/// Each thread dequantizes one element from Q8_0 format to F16.
+/// Enables the tensor core HGEMM path (312 TFLOPS on A100) for Q8_0 weights
+/// that lack a persistent F16 cache (e.g., GDN layers).
+///
+/// # Safety
+///
+/// `q8_data` must contain valid Q8_0 blocks. `f16_out` must have at least
+/// `num_elements * 2` bytes.
+unsafe fn launch_dequant_q8_0_to_f16(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    q8_data: &CudaSlice<u8>,
+    f16_out: &mut CudaSlice<u8>,
+    num_elements: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    let config = LaunchConfig::for_elements(num_elements);
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (config.grid_dim, 1, 1),
+        block_dim: (config.block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n = num_elements as u32;
+    device
+        .stream
+        .launch_builder(&kernels.dequant_q8_0_to_f16)
+        .arg(q8_data)
+        .arg(f16_out)
+        .arg(&n)
+        .launch(launch_cfg)
+        .map_err(|e| {
+            RuntimeError::Compute(format!("dequant_q8_0_to_f16 {label}: {e}"))
+        })?;
+    Ok(())
+}
+
+/// Dequantize Q4_0 weights to F16 scratch buffer for cuBLAS HGEMM.
+///
+/// Each thread dequantizes one element from Q4_0 format to F16: reads the
+/// block's F16 scale and the element's 4-bit nibble, computes
+/// `f16(scale * (nibble - 8))`.
+///
+/// # Safety
+///
+/// `q4_data` must contain valid Q4_0 blocks. `f16_out` must have at least
+/// `num_elements * 2` bytes.
+unsafe fn launch_dequant_q4_0_to_f16(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    q4_data: &CudaSlice<u8>,
+    f16_out: &mut CudaSlice<u8>,
+    num_elements: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    let config = LaunchConfig::for_elements(num_elements);
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (config.grid_dim, 1, 1),
+        block_dim: (config.block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n = num_elements as u32;
+    device
+        .stream
+        .launch_builder(&kernels.dequant_q4_0_to_f16)
+        .arg(q4_data)
+        .arg(f16_out)
+        .arg(&n)
+        .launch(launch_cfg)
+        .map_err(|e| {
+            RuntimeError::Compute(format!("dequant_q4_0_to_f16 {label}: {e}"))
         })?;
     Ok(())
 }

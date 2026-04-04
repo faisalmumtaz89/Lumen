@@ -7,7 +7,7 @@
 //      bytes) instead of 16 individual byte loads.
 //   2. Pre-quantized Q8_1 input: native int* loads, zero per-call quantization
 //   3. dp4a INT8 dot product: 4 multiply-accumulates per instruction
-//   4. NR=2: 2 output rows per block, 2x x-vector bandwidth amortization
+//   4. NR=4: 4 output rows per block, 4x x-vector bandwidth amortization
 //
 // Q4Aligned block layout (20 bytes per 32 elements):
 //   bytes [0..1]:   f16 scale (d)
@@ -34,7 +34,7 @@
 //   - Nibble unpacking from int registers (no byte-gather from memory)
 //   - Same dp4a core as the unaligned version
 //
-// Architecture: NR=2 rows per block, 128 threads (4 warps).
+// Architecture: NR=4 rows per block, 256 threads (8 warps).
 // Requires compute capability >= 6.1 for __dp4a() (Pascal+).
 // in_dim must be a multiple of 32 (Q4_0 block size).
 //
@@ -48,10 +48,10 @@
 // NVRTC-compatible: no system includes, extern "C" linkage.
 // ==========================================================================
 
-#define NR       2     // rows per thread block
+#define NR       4     // rows per thread block
 #define NW       32    // warp size
-#define THREADS_PER_BLOCK 128  // 4 warps
-#define NWARPS   (THREADS_PER_BLOCK / NW)  // 4
+#define THREADS_PER_BLOCK 256  // 8 warps
+#define NWARPS   (THREADS_PER_BLOCK / NW)  // 8
 #define Q4_BLOCK_SIZE     32   // elements per Q4_0 block
 #define Q4_ALIGNED_BYTES  20   // 2B f16 scale + 2B pad + 16B nibble data
 #define Q8_1_BYTES        36   // 2B f16 scale + 2B f16 sum + 32B int8 data
@@ -103,12 +103,12 @@ __device__ __forceinline__ void unpack_nibbles_4bytes(unsigned int packed, int &
 }
 
 // ==========================================================================
-// Kernel 1: Q4Aligned weight x Q8_1 input -> F32 output (dp4a, NR=2).
+// Kernel 1: Q4Aligned weight x Q8_1 input -> F32 output (dp4a, NR=4).
 //
 // Grid:  (ceil(out_dim / NR), 1, 1)  -- one block per NR rows
-// Block: (128, 1, 1)                 -- 4 warps x 32 threads
+// Block: (256, 1, 1)                 -- 8 warps x 32 threads
 // ==========================================================================
-extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q4_aligned_q8_1(
+extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_aligned_q8_1(
     const char* __restrict__ weight_q4a,   // [out_dim * nb * 20] Q4Aligned bytes
     const char* __restrict__ input_q8_1,   // [nb * 36] Q8_1 pre-quantized input
     float* __restrict__ out,               // [out_dim] F32 output
@@ -129,19 +129,17 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q4_ali
     for (int r = 0; r < NR; r++) sumf[r] = 0.0f;
 
     // Main loop: each thread handles one Q4/Q8_1 block pair per iteration,
-    // striding by THREADS_PER_BLOCK (128) blocks.
+    // striding by THREADS_PER_BLOCK (256) blocks.
     for (unsigned int ib = threadIdx.x; ib < nb; ib += THREADS_PER_BLOCK) {
         // --- Load Q8_1 input block (36 bytes, quant data at +4) ---
         const char* x_block = input_q8_1 + (unsigned long long)ib * Q8_1_BYTES;
 
-        // Read f16 input scale (bytes 0-1, little-endian).
-        unsigned short x_scale_bits = (unsigned short)(unsigned char)x_block[0]
-                                    | ((unsigned short)(unsigned char)x_block[1] << 8);
+        // Read f16 input scale (bytes 0-1, native halfword load).
+        unsigned short x_scale_bits = *(const unsigned short*)x_block;
         float x_scale = f16_bits_to_f32(x_scale_bits);
 
         // Read f16 weighted sum (bytes 2-3): s = d * sum(quants).
-        unsigned short x_sum_bits = (unsigned short)(unsigned char)x_block[2]
-                                  | ((unsigned short)(unsigned char)x_block[3] << 8);
+        unsigned short x_sum_bits = *(const unsigned short*)(x_block + 2);
         float x_sum = f16_bits_to_f32(x_sum_bits);
 
         // Native int* load for input quant data (4-byte aligned at +4).
@@ -162,9 +160,8 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q4_ali
                 + (unsigned long long)(r0 + row) * row_bytes
                 + (unsigned long long)ib * Q4_ALIGNED_BYTES;
 
-            // Read f16 weight scale (bytes 0-1).
-            unsigned short w_scale_bits = (unsigned short)(unsigned char)w_block[0]
-                                        | ((unsigned short)(unsigned char)w_block[1] << 8);
+            // Read f16 weight scale (bytes 0-1, native halfword load).
+            unsigned short w_scale_bits = *(const unsigned short*)w_block;
             float w_scale = f16_bits_to_f32(w_scale_bits);
 
             // KEY OPTIMIZATION: aligned int* loads for nibble data.
@@ -190,7 +187,7 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q4_ali
         }
     }
 
-    // --- Cross-warp reduction via simple shmem (3 warps write, warp 0 sums) ---
+    // --- Cross-warp reduction via simple shmem (7 warps write, warp 0 sums) ---
     #pragma unroll
     for (int r = 0; r < NR; r++) {
         sumf[r] = warp_reduce_sum(sumf[r]);
@@ -222,15 +219,15 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q4_ali
 }
 
 // ==========================================================================
-// Kernel 2: Q4Aligned weight x Q8_1 input + residual -> F32 output (dp4a, NR=2).
+// Kernel 2: Q4Aligned weight x Q8_1 input + residual -> F32 output (dp4a, NR=4).
 //
 // Same as matvec_q4_aligned_q8_1 but with fused residual addition at final write.
 // Used for Wo (attention output) and down projection.
 //
 // Grid:  (ceil(out_dim / NR), 1, 1)  -- one block per NR rows
-// Block: (128, 1, 1)                 -- 4 warps x 32 threads
+// Block: (256, 1, 1)                 -- 8 warps x 32 threads
 // ==========================================================================
-extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q4_aligned_q8_1_residual(
+extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_aligned_q8_1_residual(
     const char* __restrict__ weight_q4a,   // [out_dim * nb * 20] Q4Aligned bytes
     const char* __restrict__ input_q8_1,   // [nb * 36] Q8_1 pre-quantized input
     const float* __restrict__ residual,    // [out_dim] F32 residual
@@ -254,12 +251,10 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q4_ali
         // Load Q8_1 input block.
         const char* x_block = input_q8_1 + (unsigned long long)ib * Q8_1_BYTES;
 
-        unsigned short x_scale_bits = (unsigned short)(unsigned char)x_block[0]
-                                    | ((unsigned short)(unsigned char)x_block[1] << 8);
+        unsigned short x_scale_bits = *(const unsigned short*)x_block;
         float x_scale = f16_bits_to_f32(x_scale_bits);
 
-        unsigned short x_sum_bits = (unsigned short)(unsigned char)x_block[2]
-                                  | ((unsigned short)(unsigned char)x_block[3] << 8);
+        unsigned short x_sum_bits = *(const unsigned short*)(x_block + 2);
         float x_sum = f16_bits_to_f32(x_sum_bits);
 
         const int* x_packed = (const int*)(x_block + 4);
@@ -277,8 +272,7 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q4_ali
                 + (unsigned long long)(r0 + row) * row_bytes
                 + (unsigned long long)ib * Q4_ALIGNED_BYTES;
 
-            unsigned short w_scale_bits = (unsigned short)(unsigned char)w_block[0]
-                                        | ((unsigned short)(unsigned char)w_block[1] << 8);
+            unsigned short w_scale_bits = *(const unsigned short*)w_block;
             float w_scale = f16_bits_to_f32(w_scale_bits);
 
             // Aligned int* loads for nibble data (4-byte aligned at +4).

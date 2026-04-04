@@ -3,7 +3,7 @@
 // Key optimization: instead of dequantizing int8 weights to float and doing
 // float multiply-accumulate, we quantize x on-the-fly to int8 (Q8_1 style)
 // and use __dp4a() for native INT8 dot products. This is the same approach
-// used by llama.cpp's CUDA Q8_0 x Q8_1 kernel.
+// used for efficient Q8_0 x Q8_1 CUDA decode.
 //
 // Per Q8_0 block (32 elements):
 //   1. Load f16 weight scale -> f32
@@ -25,7 +25,7 @@
 // Architecture: NR=2 rows per block, 128 threads (4 warps).
 // Each thread strides over blocks: thread t handles blocks t, t+128, t+256, ...
 //
-// Q8_0 block layout (GGML): 34 bytes per block of 32 elements.
+// Q8_0 block layout: 34 bytes per block of 32 elements.
 //   bytes [0..1]: f16 scale (IEEE 754 half-precision, little-endian)
 //   bytes [2..33]: 32 x int8 quantized values
 //   Dequant: float_val = scale * (float)(int8_t)quant[j]
@@ -165,19 +165,17 @@ extern "C" __global__ void matvec_q8_0_dp4a(
                                       | ((unsigned short)(unsigned char)bp[1] << 8);
             float w_scale = f16_bits_to_f32(scale_bits);
 
-            // Load 32 int8 weight values as 8 x int32 (packed 4 bytes each).
-            // Q8_0 quant data at bp+2 is NOT 4-byte aligned (34-byte blocks).
-            // CONFIRMED: int* cast causes XID 13 Misaligned Address on A100 PCIe
-            // when compiled with compute_80. Use byte loads + manual packing.
-            const unsigned char* wq = (const unsigned char*)(bp + 2);
+            // Load 32 int8 weight values as uint16 pairs -> int32 words.
+            // Q8_0 quant data at bp+2 is 2-byte aligned (34-byte blocks, offset 2).
+            // uint16 loads: 2 loads + 1 shift + 1 OR = 4 ops per int32 word,
+            // vs byte loads: 4 loads + 3 shifts + 3 ORs = 10 ops per int32 word.
+            // NOT 4-byte aligned, so int* cast is unsafe (XID 13 on A100).
+            const unsigned short* w16 = (const unsigned short*)(bp + 2);
 
             int acc = 0;
             #pragma unroll
             for (int k = 0; k < 8; k++) {
-                int w_word = (int)(signed char)wq[k * 4 + 0]
-                           | ((int)(signed char)wq[k * 4 + 1] << 8)
-                           | ((int)(signed char)wq[k * 4 + 2] << 16)
-                           | ((int)(signed char)wq[k * 4 + 3] << 24);
+                int w_word = (int)w16[k * 2] | ((int)w16[k * 2 + 1] << 16);
                 acc = __dp4a(w_word, x_packed[k], acc);
             }
 
@@ -312,16 +310,13 @@ extern "C" __global__ void matvec_q8_0_dp4a_residual(
                                       | ((unsigned short)(unsigned char)bp[1] << 8);
             float w_scale = f16_bits_to_f32(scale_bits);
 
-            // Byte-level loads: int* cast at +2 causes XID 13 on A100 (confirmed).
-            const unsigned char* wq = (const unsigned char*)(bp + 2);
+            // uint16 loads: 2-byte aligned at bp+2, avoids XID 13 from int* cast.
+            const unsigned short* w16 = (const unsigned short*)(bp + 2);
 
             int acc = 0;
             #pragma unroll
             for (int k = 0; k < 8; k++) {
-                int w_word = (int)(signed char)wq[k * 4 + 0]
-                           | ((int)(signed char)wq[k * 4 + 1] << 8)
-                           | ((int)(signed char)wq[k * 4 + 2] << 16)
-                           | ((int)(signed char)wq[k * 4 + 3] << 24);
+                int w_word = (int)w16[k * 2] | ((int)w16[k * 2 + 1] << 16);
                 acc = __dp4a(w_word, x_packed[k], acc);
             }
 

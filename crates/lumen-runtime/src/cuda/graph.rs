@@ -86,6 +86,10 @@ pub(crate) struct GraphKernelSet {
     /// Fused F32->F16 conversion + residual copy (for HGEMV output projection).
     /// Combines f32_to_f16_vec + memcpy_dtod into 1 kernel.
     pub(crate) convert_f16_residual_copy: CudaFunction,
+    /// GDN Conv1D decode variant (reads state_pos from device pointer).
+    pub(crate) ssm_conv1d_decode: CudaFunction,
+    /// Advance conv position on GPU (single-thread kernel).
+    pub(crate) advance_conv_position: CudaFunction,
 }
 
 /// Compile all graph-compatible kernel variants.
@@ -108,6 +112,8 @@ pub(crate) fn compile_graph_kernels(device: &CudaDevice) -> Result<GraphKernelSe
         attention_decode: load("attention_decode_graph")?,
         rope_kv_write: load("rope_kv_write_graph")?,
         convert_f16_residual_copy: load("convert_f32_to_f16_and_residual_copy")?,
+        ssm_conv1d_decode: load("ssm_conv1d_decode_graph")?,
+        advance_conv_position: load("advance_conv_position")?,
     })
 }
 

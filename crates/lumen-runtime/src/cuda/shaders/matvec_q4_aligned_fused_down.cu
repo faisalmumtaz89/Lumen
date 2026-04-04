@@ -40,18 +40,18 @@
 //     4. dp4a: 8 calls = 32 multiply-accumulates
 //     5. result += w_scale * x_scale * dp4a_sum - 8 * w_scale * x_sum
 //
-// Architecture: NR=2 rows per block, 128 threads (4 warps).
-// __launch_bounds__(128, 2) for occupancy parity with matvec_q4_aligned_q8_1.
+// Architecture: NR=4 rows per block, 256 threads (8 warps).
+// __launch_bounds__(256, 1) for occupancy parity with matvec_q4_aligned_q8_1.
 // Requires compute capability >= 6.1 for __dp4a() (Pascal+).
 // in_dim must be a multiple of 32 (Q4_0 block size).
 //
 // NVRTC-compatible: no system includes, extern "C" linkage.
 // ==========================================================================
 
-#define NR       2     // rows per thread block
+#define NR       4     // rows per thread block
 #define NW       32    // warp size
-#define THREADS_PER_BLOCK 128  // 4 warps
-#define NWARPS   (THREADS_PER_BLOCK / NW)  // 4
+#define THREADS_PER_BLOCK 256  // 8 warps
+#define NWARPS   (THREADS_PER_BLOCK / NW)  // 8
 #define Q4_BLOCK_SIZE     32   // elements per Q4_0 block
 #define Q4_ALIGNED_BYTES  20   // 2B f16 scale + 2B pad + 16B nibble data
 
@@ -147,9 +147,8 @@ __device__ __forceinline__ void fused_q4a_dp4a_block(
             + (unsigned long long)(r0 + row) * row_bytes
             + (unsigned long long)ib * Q4_ALIGNED_BYTES;
 
-        // Read f16 weight scale (bytes 0-1).
-        unsigned short w_scale_bits = (unsigned short)(unsigned char)w_block[0]
-                                    | ((unsigned short)(unsigned char)w_block[1] << 8);
+        // Read f16 weight scale (bytes 0-1, native halfword load).
+        unsigned short w_scale_bits = *(const unsigned short*)w_block;
         float w_scale = f16_bits_to_f32(w_scale_bits);
 
         // Aligned int* loads for nibble data (4-byte aligned at +4).
@@ -262,9 +261,9 @@ __device__ __forceinline__ void cross_warp_reduce_and_write_residual(
 // against Q4Aligned weights. Eliminates the separate quantize kernel.
 //
 // Grid:  (ceil(out_dim / NR), 1, 1)
-// Block: (128, 1, 1)
+// Block: (256, 1, 1)
 // ==========================================================================
-extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q4_aligned_f32(
+extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_aligned_f32(
     const char* __restrict__ weight_q4a,   // [out_dim * nb * 20] Q4Aligned bytes
     const float* __restrict__ input_f32,   // [in_dim] F32 input vector
     float* __restrict__ out,               // [out_dim] F32 output
@@ -298,7 +297,7 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q4_ali
 // ==========================================================================
 // Kernel 2: Q4Aligned weight x F32 input + residual -> F32 output.
 // ==========================================================================
-extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q4_aligned_f32_residual(
+extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_aligned_f32_residual(
     const char* __restrict__ weight_q4a,
     const float* __restrict__ input_f32,
     const float* __restrict__ residual,
@@ -342,7 +341,7 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q4_ali
 // Grid:  (ceil(out_dim / NR), 1, 1)
 // Block: (128, 1, 1)
 // ==========================================================================
-extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q4_aligned_f32_swiglu(
+extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_aligned_f32_swiglu(
     const char* __restrict__ weight_q4a,   // [out_dim * nb * 20] Q4Aligned bytes
     const float* __restrict__ gate,        // [in_dim] F32 gate projection
     const float* __restrict__ up,          // [in_dim] F32 up projection
@@ -379,7 +378,7 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q4_ali
 // ==========================================================================
 // Kernel 4: Q4Aligned weight x SwiGLU(gate, up) + residual -> F32 output.
 // ==========================================================================
-extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q4_aligned_f32_swiglu_residual(
+extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_aligned_f32_swiglu_residual(
     const char* __restrict__ weight_q4a,
     const float* __restrict__ gate,
     const float* __restrict__ up,

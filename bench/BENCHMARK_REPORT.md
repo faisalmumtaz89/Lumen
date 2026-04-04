@@ -1,13 +1,13 @@
 # Lumen Benchmark Report v2
 
-Generated: 2026-03-31
+Generated: 2026-04-04
 
 ## Environment
 
 ### CUDA
-- GPU: NVIDIA A100-SXM4-80GB
+- GPU: NVIDIA A100 80GB PCIe
 - Runs: 1 (5 trials per config)
-- Engines: Lumen (lumen 0.1.0), llama.cpp (6729d49), vLLM 0.8.4 (HuggingFace FP16)
+- Engines: Lumen (lumen 0.1.0), llama.cpp (d006858)
 
 ### Metal
 - Hardware: Apple M3 Ultra (60 GPU cores, 96 GB, 819 GB/s)
@@ -24,110 +24,89 @@ All benchmarks use **pp128+gen128** (128-token prompt, 128-token generation). Th
 
 **Decode (tok/s):**
 
-| Quant | Lumen | llama.cpp | vLLM |
-|:-----:|------:|----------:|-----:|
-| F16 | 153 | 169 | 61.3 |
-| Q8_0 | 225 | 205 | N/A |
-| Q4_0 | 217 | 246 | N/A |
+| Quant | Lumen | llama.cpp |
+|:-----:|------:|----------:|
+| F16 | 152 | 174 |
+| Q8_0 | 228 | 214 |
+| Q4_0 | 213 | 259 |
 
 **Prefill (tok/s):**
 
-| Quant | Lumen | llama.cpp | vLLM |
-|:-----:|------:|----------:|-----:|
-| F16 | 6,454 | 8,168 | 7,588 |
-| Q8_0 | 6,471 | 4,037 | N/A |
-| Q4_0 | 6,486 | 3,992 | N/A |
+| Quant | Lumen | llama.cpp |
+|:-----:|------:|----------:|
+| F16 | 6,396 | 9,023 |
+| Q8_0 | 7,743 | 5,031 |
+| Q4_0 | 6,435 | 5,024 |
 
 ### Qwen2.5 7B
 
 **Decode (tok/s):**
 
-| Quant | Lumen | llama.cpp | vLLM |
-|:-----:|------:|----------:|-----:|
-| F16 | 94.7 | 95.5 | 72.9 |
-| Q8_0 | 153 | 135 | N/A |
-| Q4_0 | 196 | 184 | N/A |
+| Quant | Lumen | llama.cpp |
+|:-----:|------:|----------:|
+| F16 | 94.7 | 95.2 |
+| Q8_0 | 153 | 136 |
+| Q4_0 | 194 | 189 |
 
 **Prefill (tok/s):**
 
-| Quant | Lumen | llama.cpp | vLLM |
-|:-----:|------:|----------:|-----:|
-| F16 | 5,204 | 4,632 | 8,536 |
-| Q8_0 | 5,948 | 3,245 | N/A |
-| Q4_0 | 5,202 | 2,975 | N/A |
+| Quant | Lumen | llama.cpp |
+|:-----:|------:|----------:|
+| F16 | 5,166 | 5,702 |
+| Q8_0 | 5,426 | 3,673 |
+| Q4_0 | 5,164 | 3,765 |
 
 ### Llama 3.1 8B
 
 **Decode (tok/s):**
 
-| Quant | Lumen | llama.cpp | vLLM |
-|:-----:|------:|----------:|-----:|
-| F16 | 88.8 | 91.1 | 67.2 |
-| Q8_0 | 142 | 131 | N/A |
-| Q4_0 | 178 | 169 | N/A |
+| Quant | Lumen | llama.cpp |
+|:-----:|------:|----------:|
+| F16 | 88.6 | 93.0 |
+| Q8_0 | 141 | 131 |
+| Q4_0 | 180 | 175 |
 
 **Prefill (tok/s):**
 
-| Quant | Lumen | llama.cpp | vLLM |
-|:-----:|------:|----------:|-----:|
-| F16 | 4,847 | 4,275 | 7,607 |
-| Q8_0 | 5,556 | 3,023 | N/A |
-| Q4_0 | 4,812 | 2,947 | N/A |
+| Quant | Lumen | llama.cpp |
+|:-----:|------:|----------:|
+| F16 | 4,812 | 4,478 |
+| Q8_0 | 5,486 | 3,308 |
+| Q4_0 | 4,923 | 3,354 |
 
 ### Qwen2.5 14B
 
 **Decode (tok/s):**
 
-| Quant | Lumen | llama.cpp | vLLM |
-|:-----:|------:|----------:|-----:|
-| F16 | 50.6 | 49.8 | 44.1 |
-| Q8_0 | 79.1 | 70.7 | N/A |
-| Q4_0 | 100 | 97.9 | N/A |
+| Quant | Lumen | llama.cpp |
+|:-----:|------:|----------:|
+| F16 | 50.6 | 49.6 |
+| Q8_0 | 79.1 | 70.6 |
+| Q4_0 | 99.5 | 99.2 |
 
 **Prefill (tok/s):**
 
-| Quant | Lumen | llama.cpp | vLLM |
-|:-----:|------:|----------:|-----:|
-| F16 | 2,989 | 2,875 | 5,447 |
-| Q8_0 | 3,432 | 1,891 | N/A |
-| Q4_0 | 3,413 | 1,948 | N/A |
+| Quant | Lumen | llama.cpp |
+|:-----:|------:|----------:|
+| F16 | 3,215 | 3,183 |
+| Q8_0 | 3,415 | 1,989 |
+| Q4_0 | 3,410 | 2,032 |
 
 ### Qwen3.5 9B
 
 **Decode (tok/s):**
 
-| Quant | Lumen | llama.cpp | vLLM |
-|:-----:|------:|----------:|-----:|
-| Q8_0 | 58.9 | 114 | N/A |
-| Q4_0 | 69.9 | 140 | N/A |
+| Quant | Lumen | llama.cpp |
+|:-----:|------:|----------:|
+| Q8_0 | 62.6 | 116 |
+| Q4_0 | 65.9 | 146 |
 
 **Prefill (tok/s):**
 
-| Quant | Lumen | llama.cpp | vLLM |
-|:-----:|------:|----------:|-----:|
-| Q8_0 | 324 | 2,611 | N/A |
-| Q4_0 | 316 | 2,806 | N/A |
-
-## vLLM GGUF (Experimental)
-
-vLLM 0.8.4 supports GGUF Q8_0/Q4_0 via its V0 engine, but this path is [experimental and under-optimized](https://docs.vllm.ai/en/v0.8.4/features/quantization/gguf.html). GGUF decode throughput is no faster than FP16 (no quantization benefit), and GGUF prefill is 3-15x slower than FP16. These numbers are included for completeness but do not represent vLLM's production performance. Hardware: A100 PCIe (separate run from the SXM4 data above).
-
-| Model | Quant | vLLM Decode | vLLM Prefill | vs vLLM F16 Dec | vs vLLM F16 PP |
-|-------|:-----:|------------:|-------------:|----------------:|---------------:|
-| Qwen2.5 3B | F16 | 54.9 | 6,630 | — | — |
-| Qwen2.5 3B | Q8_0 | 52.8 | 1,599 | 0.96x | 0.24x |
-| Qwen2.5 3B | Q4_0 | 51.8 | 2,344 | 0.94x | 0.35x |
-| Qwen2.5 7B | F16 | 66.6 | 7,748 | — | — |
-| Qwen2.5 7B | Q8_0 | 63.9 | 665 | 0.96x | 0.09x |
-| Qwen2.5 7B | Q4_0 | 59.4 | 979 | 0.89x | 0.13x |
-| Llama 3.1 8B | F16 | 54.4 | 6,306 | — | — |
-| Llama 3.1 8B | Q8_0 | 60.2 | 596 | 1.11x | 0.09x |
-| Llama 3.1 8B | Q4_0 | 59.5 | 918 | 1.09x | 0.15x |
-| Qwen2.5 14B | F16 | 40.2 | 5,052 | — | — |
-| Qwen2.5 14B | Q8_0 | 39.9 | 329 | 0.99x | 0.07x |
-| Qwen2.5 14B | Q4_0 | 40.0 | 496 | 0.99x | 0.10x |
-
-Qwen3.5 9B: GGUF architecture `qwen35` not supported by vLLM 0.8.4.
+| Quant | Lumen | llama.cpp |
+|:-----:|------:|----------:|
+| Q8_0 | 2,367 | 3,031 |
+| Q4_0 | 2,196 | 3,089 |
 
 ## Metal Results
 

@@ -66,6 +66,10 @@ pub const CONVERT_F16_KERNEL_SOURCE: &str = include_str!("convert_f16.cu");
 /// GatedDeltaNet (GDN) kernels (conv1d, gates, L2 norm, state update).
 pub const GDN_KERNEL_SOURCE: &str = include_str!("gdn.cu");
 
+/// GDN decode megakernel: fuses 8 per-token launches into 2
+/// (gdn_decode_megakernel + gdn_rmsnorm_silu_gate).
+pub const GDN_MEGAKERNEL_SOURCE: &str = include_str!("gdn_megakernel.cu");
+
 /// Fused RMSNorm + MatVec kernels (two-pass: compute_rms_scale + fused_norm_matvec_f32).
 ///
 /// Eliminates the intermediate `normed[hidden_dim]` buffer by precomputing the
@@ -174,7 +178,7 @@ pub const HGEMV_Q4_0_KERNEL_SOURCE: &str = include_str!("hgemv_q4_0.cu");
 
 /// dp4a GEMV with pre-quantized Q8_1 input vector.
 ///
-/// Two-phase approach matching llama.cpp's proven Q8_0 × Q8_1 decode path:
+/// Two-phase approach for optimized Q8_0 × Q8_1 decode:
 ///   1. `quantize_f32_to_q8_1`: Pre-quantize F32 x to Q8_1 (once per token)
 ///   2. `matvec_q8_0_q8_1`: dp4a dot product with native int* input loads
 ///

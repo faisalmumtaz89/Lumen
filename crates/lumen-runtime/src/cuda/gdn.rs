@@ -581,6 +581,64 @@ pub fn dispatch_gdn_layer(
     Ok(())
 }
 
+/// Batched causal conv1d + SiLU for T tokens (CPU reference for CUDA kernel).
+///
+/// Processes all T tokens in sequence, reading from conv_state for taps that
+/// precede the batch and from earlier tokens in the batch for later taps.
+/// After processing, updates conv_state with the last (kernel_size-1) tokens.
+///
+/// Returns the new conv_position after processing all T tokens.
+#[allow(dead_code)]
+pub fn conv1d_silu_prefill(
+    input: &[f32],       // [T * dim]
+    conv_state: &mut [f32], // [(kernel_size-1) * dim]
+    conv_weight: &[f32],  // [dim * kernel_size]
+    output: &mut [f32],   // [T * dim]
+    dim: usize,
+    kernel_size: usize,
+    conv_pos: u32,
+    t_count: usize,
+) -> u32 {
+    let buf_slots = (kernel_size - 1) as u32;
+
+    for t in 0..t_count {
+        for d in 0..dim {
+            let mut sum = 0.0f32;
+
+            for tap in 0..kernel_size {
+                let tokens_back = kernel_size - 1 - tap;
+                let source_t = t as i32 - tokens_back as i32;
+
+                let input_val = if source_t >= 0 {
+                    input[source_t as usize * dim + d]
+                } else {
+                    let slot = (conv_pos as usize + buf_slots as usize
+                        + (buf_slots as i32 + source_t) as usize) % buf_slots as usize;
+                    conv_state[slot * dim + d]
+                };
+
+                sum += conv_weight[d * kernel_size + tap] * input_val;
+            }
+
+            // SiLU: x / (1 + exp(-x))
+            output[t * dim + d] = sum / (1.0 + (-sum).exp());
+        }
+    }
+
+    // Update conv_state with last buf_slots tokens
+    for s in 0..buf_slots as usize {
+        let src_t = t_count as i32 - buf_slots as i32 + s as i32;
+        if src_t >= 0 {
+            let new_slot = (conv_pos as usize + s) % buf_slots as usize;
+            for d in 0..dim {
+                conv_state[new_slot * dim + d] = input[src_t as usize * dim + d];
+            }
+        }
+    }
+
+    (conv_pos + t_count as u32) % buf_slots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,5 +734,68 @@ mod tests {
         // alpha = decay * sigmoid(alpha_raw) = 0.5 * 0.5 = 0.25
         assert!((alpha[0] - 0.25).abs() < 1e-3);
         assert!((beta[0] - 0.5).abs() < 1e-3);
+    }
+
+    /// Verify that batched conv1d+SiLU produces the same output as sequential decode.
+    #[test]
+    fn conv1d_silu_prefill_matches_sequential() {
+        let dim = 8;
+        let kernel_size = 4;
+        let t_count = 6; // Process 6 tokens
+        let buf_slots = kernel_size - 1; // 3
+
+        // Random-ish input and weights
+        let input: Vec<f32> = (0..t_count * dim)
+            .map(|i| ((i as f32) * 0.1 + 0.3).sin())
+            .collect();
+        let conv_weight: Vec<f32> = (0..dim * kernel_size)
+            .map(|i| ((i as f32) * 0.2 + 0.5).cos())
+            .collect();
+
+        // --- Sequential path: conv1d_decode + silu_inplace for each token ---
+        let mut seq_state = vec![0.0f32; buf_slots * dim];
+        let mut seq_pos = 0u32;
+        let mut seq_output = vec![0.0f32; t_count * dim];
+        let mut conv_out = vec![0.0f32; dim];
+
+        for t in 0..t_count {
+            let token_input = &input[t * dim..(t + 1) * dim];
+            seq_pos = conv1d_decode(
+                token_input, &mut seq_state, &conv_weight,
+                &mut conv_out, dim, kernel_size, seq_pos,
+            );
+            silu_inplace(&mut conv_out);
+            seq_output[t * dim..(t + 1) * dim].copy_from_slice(&conv_out);
+        }
+
+        // --- Batched path: conv1d_silu_prefill ---
+        let mut batch_state = vec![0.0f32; buf_slots * dim];
+        let mut batch_output = vec![0.0f32; t_count * dim];
+        let batch_new_pos = conv1d_silu_prefill(
+            &input, &mut batch_state, &conv_weight,
+            &mut batch_output, dim, kernel_size, 0, t_count,
+        );
+
+        // Verify outputs match
+        for i in 0..t_count * dim {
+            assert!(
+                (seq_output[i] - batch_output[i]).abs() < 1e-5,
+                "Mismatch at index {i}: seq={} batch={}",
+                seq_output[i], batch_output[i]
+            );
+        }
+
+        // Verify final conv position matches
+        assert_eq!(seq_pos, batch_new_pos,
+            "Conv positions differ: seq={seq_pos} batch={batch_new_pos}");
+
+        // Verify conv_state matches
+        for i in 0..buf_slots * dim {
+            assert!(
+                (seq_state[i] - batch_state[i]).abs() < 1e-6,
+                "Conv state mismatch at index {i}: seq={} batch={}",
+                seq_state[i], batch_state[i]
+            );
+        }
     }
 }
