@@ -143,30 +143,38 @@ def main():
     print("Running Lumen Metal inference...")
     print("-" * 60)
 
-    gen_tokens, metrics, raw_output = run_lumen(
+    gen_tokens, metrics, _ = run_lumen(
         binary, args.model, prompt_ids, args.max_tokens, args.temperature, args.profile
     )
 
     # Detokenize
-    full_ids = prompt_ids + gen_tokens
-    full_text = detokenize(full_ids, tokenizer)
     gen_text = detokenize(gen_tokens, tokenizer)
 
-    print("-" * 60)
+    print("-" * 46)
     print()
-    print(f"Generated {len(gen_tokens)} tokens")
-    if metrics.get("decode_tps"):
-        print(f"Decode: {metrics['decode_tps']:.1f} tok/s")
+    print(" _   _   _ __  __ ___ _  _ ")
+    print("| | | | | |  \\/  | __| \\| |")
+    print("| |_| |_| | |\\/| | _|| .` |")
+    print("|____\\___/|_|  |_|___|_|\\_|")
+    print()
+    print(" Rust LLM Inference Engine")
+    print()
+    print("\u2500" * 46)
+    print("  Source    github.com/faisalmumtaz89/Lumen")
+    print("  Engine    Lumen v0.1 (Rust + Metal)")
+    print("  Backend   Metal (Apple Silicon GPU)")
+    print(f"  Model     {args.model}")
+    print(f"  Tokens    {len(prompt_ids)} prompt, {len(gen_tokens)} generated")
     if metrics.get("prefill_tps"):
-        print(f"Prefill: {metrics['prefill_tps']:.1f} tok/s")
+        print(f"  Prefill   {metrics['prefill_tps']:.1f} tok/s")
+    if metrics.get("decode_tps"):
+        print(f"  Decode    {metrics['decode_tps']:.1f} tok/s")
+    print("\u2500" * 46)
     print()
-    print("=" * 60)
-    print("PROMPT:", args.prompt)
-    print("OUTPUT:", gen_text)
-    print("=" * 60)
+    print(f"Prompt: {args.prompt}")
     print()
-    print("FULL TEXT:")
-    print(full_text)
+    print(gen_text)
+    print()
 
 
 if __name__ == "__main__":

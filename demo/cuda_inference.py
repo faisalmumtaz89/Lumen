@@ -115,7 +115,7 @@ def run_inference(model_key: str, prompt: str, max_tokens: int, temperature: flo
     print(f"LBC: {lbc_path}")
 
     # Tokenize
-    print(f"\n=== Tokenizing ===")
+    print("\n=== Tokenizing ===")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(mdef["hf_tokenizer"], trust_remote_code=True)
     # Apply chat template for instruct models
@@ -159,23 +159,27 @@ def run_inference(model_key: str, prompt: str, max_tokens: int, temperature: flo
 
     # Parse metrics
     decode_tps = 0.0
+    prefill_tps = 0.0
     for line in output.split("\n"):
         m = re.search(r"Decode:\s+([\d.]+)\s+tok/s", line)
         if m:
             decode_tps = float(m.group(1))
+        m = re.search(r"Prefill:\s+([\d.]+)\s+tok/s", line)
+        if m:
+            prefill_tps = float(m.group(1))
 
     # Detokenize
     gen_text = tok.decode(gen_tokens, skip_special_tokens=True)
-    full_text = tok.decode(prompt_ids + gen_tokens, skip_special_tokens=True)
 
     return {
         "model": mdef["display"],
         "gpu": gpu,
         "prompt": prompt,
         "generated_text": gen_text,
-        "full_text": full_text,
         "tokens_generated": len(gen_tokens),
+        "prompt_tokens": len(prompt_ids),
         "decode_tps": decode_tps,
+        "prefill_tps": prefill_tps,
     }
 
 
@@ -203,17 +207,28 @@ def main(
             print(result["output"][-1000:])
         sys.exit(1)
 
-    print("=" * 60)
-    print(f"GPU: {result['gpu']}")
-    print(f"Model: {result['model']}")
+    print()
+    print(" _   _   _ __  __ ___ _  _ ")
+    print("| | | | | |  \\/  | __| \\| |")
+    print("| |_| |_| | |\\/| | _|| .` |")
+    print("|____\\___/|_|  |_|___|_|\\_|")
+    print()
+    print(" Rust LLM Inference Engine")
+    print()
+    print("\u2500" * 46)
+    print("  Source    github.com/faisalmumtaz89/Lumen")
+    print("  Engine    Lumen v0.1 (Rust + CUDA)")
+    print("  Backend   CUDA")
+    print(f"  GPU       {result['gpu']}")
+    print(f"  Model     {result['model']}")
+    print(f"  Tokens    {result['prompt_tokens']} prompt, {result['tokens_generated']} generated")
+    if result['prefill_tps'] > 0:
+        print(f"  Prefill   {result['prefill_tps']:.1f} tok/s")
     if result['decode_tps'] > 0:
-        print(f"Tokens: {result['tokens_generated']} @ {result['decode_tps']:.1f} tok/s")
-    else:
-        print(f"Tokens: {result['tokens_generated']}")
-    print("=" * 60)
+        print(f"  Decode    {result['decode_tps']:.1f} tok/s")
+    print("\u2500" * 46)
     print()
-    print(f"PROMPT: {result['prompt']}")
-    print(f"OUTPUT: {result['generated_text']}")
+    print(f"Prompt: {result['prompt']}")
     print()
-    print("FULL TEXT:")
-    print(result["full_text"])
+    print(result['generated_text'])
+    print()
