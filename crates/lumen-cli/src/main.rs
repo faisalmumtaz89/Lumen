@@ -542,8 +542,8 @@ fn run_inference(args: &[String]) {
     };
     let stop = StopCondition::MaxTokens(max_tokens);
 
-    // GPU-resident only applies to Metal backend
-    if !use_metal {
+    // GPU-resident mode for Metal and CUDA backends.
+    if !use_metal && !use_cuda {
         gpu_resident = false;
     }
 
@@ -999,7 +999,8 @@ fn run_with_mmap(
         return;
     }
 
-    let backend = create_backend(
+    #[allow(unused_mut)]
+    let mut backend = create_backend(
         use_simd,
         use_metal,
         use_cuda,
@@ -1016,6 +1017,15 @@ fn run_with_mmap(
         provider.embedding_quant,
         provider.weight_tying,
     );
+
+    // GPU-resident preload for CUDA: loads all layer weights to GPU memory.
+    // Enables native quantized kernel paths (dp4a, HGEMV) and batched prefill.
+    if gpu_resident && use_cuda {
+        backend.as_mut().preload_weights(&provider).unwrap_or_else(|e| {
+            eprintln!("Error: CUDA GPU-resident preload failed: {e}");
+            std::process::exit(1);
+        });
+    }
 
     run_engine(
         &engine, &provider, backend.as_ref(), use_accelerate,

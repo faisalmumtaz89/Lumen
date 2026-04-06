@@ -5,7 +5,7 @@
 //
 // Q4_0 block layout (GGML): 18 bytes per block of 32 elements.
 //   bytes [0..1]: f16 scale (IEEE 754 half-precision, little-endian)
-//   bytes [2..17]: 16 bytes = 32 x 4-bit unsigned nibbles packed as pairs
+//   bytes [2..17]: 16 bytes = 32 x 4-bit unsigned nibbles (de-interleaved)
 //   Dequant: float_val = scale * ((float)nibble - 8.0f)
 //
 // Grid: (ceil(num_elements / 256), 1, 1)
@@ -42,10 +42,11 @@ extern "C" __global__ void dequant_q4_0_to_f16(
                               | ((unsigned short)(unsigned char)block_ptr[1] << 8);
     float scale = f16_bits_to_f32(scale_bits);
 
-    // Extract nibble.
-    unsigned int byte_idx = elem_in_block >> 1;
+    // Extract nibble (GGML de-interleaved layout):
+    // Elements 0-15 are lo nibbles of bytes 0-15; elements 16-31 are hi nibbles of bytes 0-15.
+    unsigned int byte_idx = (elem_in_block < 16u) ? elem_in_block : (elem_in_block - 16u);
     unsigned char byte_val = (unsigned char)block_ptr[2 + byte_idx];
-    unsigned int nibble = (elem_in_block & 1u) ? (byte_val >> 4) : (byte_val & 0x0Fu);
+    unsigned int nibble = (elem_in_block < 16u) ? (byte_val & 0x0Fu) : ((byte_val >> 4) & 0x0Fu);
 
     float val = scale * ((float)nibble - 8.0f);
     f16_out[idx] = f32_to_f16_bits(val);
@@ -77,10 +78,11 @@ extern "C" __global__ void dequant_q4_0_to_f32(
                               | ((unsigned short)(unsigned char)block_ptr[1] << 8);
     float scale = f16_bits_to_f32(scale_bits);
 
-    // Extract nibble.
-    unsigned int byte_idx = elem_in_block >> 1;
+    // Extract nibble (GGML de-interleaved layout):
+    // Elements 0-15 are lo nibbles of bytes 0-15; elements 16-31 are hi nibbles of bytes 0-15.
+    unsigned int byte_idx = (elem_in_block < 16u) ? elem_in_block : (elem_in_block - 16u);
     unsigned char byte_val = (unsigned char)block_ptr[2 + byte_idx];
-    unsigned int nibble = (elem_in_block & 1u) ? (byte_val >> 4) : (byte_val & 0x0Fu);
+    unsigned int nibble = (elem_in_block < 16u) ? (byte_val & 0x0Fu) : ((byte_val >> 4) & 0x0Fu);
 
     f32_out[idx] = scale * ((float)nibble - 8.0f);
 }

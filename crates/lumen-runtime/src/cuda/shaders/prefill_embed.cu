@@ -113,9 +113,9 @@ extern "C" __global__ void embed_batch_f16(
 // embed_batch_q4_0: Q4_0 batched token embedding lookup
 //
 // Q4_0 block: 18 bytes = 2-byte f16 scale + 16 bytes (32 x 4-bit unsigned).
-// Nibble layout (GGML standard interleaved pairs):
-//   byte i (i=0..15): lo nibble (bits 0-3) = element 2*i
-//                      hi nibble (bits 4-7) = element 2*i+1
+// Nibble layout (GGML de-interleaved):
+//   Elements 0-15: lo nibbles of bytes 0-15
+//   Elements 16-31: hi nibbles of bytes 0-15
 // Dequant: val = scale * ((float)nibble - 8.0f)
 // ============================================================================
 
@@ -145,10 +145,9 @@ extern "C" __global__ void embed_batch_q4_0(
                               | ((unsigned short)(unsigned char)block_ptr[1] << 8);
     float scale = f16_bits_to_f32_embed(scale_bits);
 
-    // Standard GGML interleaved pair layout:
-    // byte_idx = elem / 2, lo nibble for even elems, hi nibble for odd elems.
-    unsigned int byte_idx = elem_in_block >> 1;
+    // GGML de-interleaved layout: elements 0-15 = lo nibbles, elements 16-31 = hi nibbles.
+    unsigned int byte_idx = (elem_in_block < 16u) ? elem_in_block : (elem_in_block - 16u);
     unsigned char byte_val = (unsigned char)block_ptr[2 + byte_idx];
-    unsigned int nibble = (elem_in_block & 1u) ? (byte_val >> 4) : (byte_val & 0x0Fu);
+    unsigned int nibble = (elem_in_block < 16u) ? (byte_val & 0x0Fu) : ((byte_val >> 4) & 0x0Fu);
     output[idx] = scale * ((float)nibble - 8.0f);
 }

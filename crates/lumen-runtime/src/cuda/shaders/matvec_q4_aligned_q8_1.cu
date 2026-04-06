@@ -12,8 +12,9 @@
 // Q4Aligned block layout (20 bytes per 32 elements):
 //   bytes [0..1]:   f16 scale (d)
 //   bytes [2..3]:   padding (alignment)
-//   bytes [4..19]:  16 bytes of packed nibble pairs
-//     byte[i] (i=0..15): lo_nibble = element[2*i], hi_nibble = element[2*i+1]
+//   bytes [4..19]:  16 bytes of de-interleaved nibbles
+//     Elements 0-15: lo nibbles of bytes 0-15
+//     Elements 16-31: hi nibbles of bytes 0-15
 //   Dequantized value: scale * (nibble - 8)
 //
 // Q8_1 block layout (36 bytes per 32 elements):
@@ -24,7 +25,7 @@
 // dp4a dot product for Q4_0 x Q8_1:
 //   For each Q4Aligned block and corresponding Q8_1 block:
 //     1. Load nibble data as 4 aligned int32 words (4 bytes each = 16 nibble bytes)
-//     2. Unpack each int32 word into 2 dp4a-compatible int32 words (8 sequential int8)
+//     2. Unpack each int32 word into 2 dp4a-compatible int32 words (lo/hi de-interleaved nibbles)
 //     3. Load 8 int32 words from Q8_1 quant data
 //     4. dp4a: 8 calls = 32 multiply-accumulates
 //     5. result += w_scale * x_scale * dp4a_sum - 8 * w_scale * x_sum
@@ -73,33 +74,26 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
-// Unpack 4 nibble bytes (packed in an int32) into 2 dp4a-compatible int32 words.
+// Unpack 4 nibble bytes (packed in an int32) for GGML de-interleaved Q4_0 layout.
 //
 // Input: int32 containing 4 nibble bytes (b0 at bits 0-7, b1 at 8-15, b2 at 16-23, b3 at 24-31).
-// Each byte has 2 nibbles: lo = element[2*i], hi = element[2*i+1].
+// De-interleaved layout: lo nibble of byte i = element i, hi nibble = element i+16.
 //
-// Output: 2 int32 words, each containing 4 sequential signed int8 (nibble - 8) values.
-//   out0 = {b0.lo-8, b0.hi-8, b1.lo-8, b1.hi-8}
-//   out1 = {b2.lo-8, b2.hi-8, b3.lo-8, b3.hi-8}
+// Output: 2 int32 words for dp4a:
+//   out_lo = {b0.lo, b1.lo, b2.lo, b3.lo} = 4 consecutive lo-half elements (unsigned, 0-15)
+//   out_hi = {b0.hi, b1.hi, b2.hi, b3.hi} = 4 consecutive hi-half elements (unsigned, 0-15)
 //
-// Uses __byte_perm (PRMT instruction, SM 35+) for register-level byte rearrangement.
-// 7 ops vs ~43 ops in the scalar version (6x fewer instructions).
-__device__ __forceinline__ void unpack_nibbles_4bytes(unsigned int packed, int &out0, int &out1) {
-    // Split each byte into lo and hi nibbles using vectorized masks.
-    unsigned int lo = packed & 0x0F0F0F0Fu;           // lo nibbles in bytes 0-3
-    unsigned int hi = (packed >> 4) & 0x0F0F0F0Fu;    // hi nibbles in bytes 0-3
+// The zero-point correction (-8) is handled in the accumulation formula via x_sum,
+// so we output UNSIGNED nibbles (0-15) here, NOT signed (-8..+7).
+// This matches the dp4a accumulation: result = w_scale * (x_scale * dp4a_sum - 8 * x_sum).
+__device__ __forceinline__ void unpack_nibbles_4bytes_deinterleaved(unsigned int packed, int &out_lo, int &out_hi) {
+    // Extract lo nibbles of all 4 bytes -> 4 consecutive lo-half elements.
+    unsigned int lo = packed & 0x0F0F0F0Fu;
+    // Extract hi nibbles of all 4 bytes -> 4 consecutive hi-half elements.
+    unsigned int hi = (packed >> 4) & 0x0F0F0F0Fu;
 
-    // Interleave lo/hi nibbles into sequential order using byte permute:
-    //   __byte_perm(a, b, sel): a=bytes 0-3, b=bytes 4-7, sel picks 4 output bytes.
-    //   0x5140: byte0=lo[0], byte1=hi[0](=4), byte2=lo[1](=1), byte3=hi[1](=5)
-    //   0x7362: byte0=lo[2], byte1=hi[2](=6), byte2=lo[3](=3), byte3=hi[3](=7)
-    unsigned int interleaved0 = __byte_perm(lo, hi, 0x5140);
-    unsigned int interleaved1 = __byte_perm(lo, hi, 0x7362);
-
-    // Subtract zero-point (8) from all 4 bytes simultaneously.
-    // Each byte holds 0-15; after subtract, range is -8..+7 (fits signed int8).
-    out0 = (int)(interleaved0 - 0x08080808u);
-    out1 = (int)(interleaved1 - 0x08080808u);
+    out_lo = (int)lo;
+    out_hi = (int)hi;
 }
 
 // ==========================================================================
@@ -169,16 +163,17 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_ali
             // Load 16 nibble bytes as 4 int32 words (vs 16 byte loads in unaligned kernel).
             const unsigned int* w_nibbles = (const unsigned int*)(w_block + 4);
 
-            // Unpack 4 int32 words (16 nibble bytes) into 8 dp4a-compatible int32 words
-            // and compute dp4a dot product against Q8_1 input.
+            // De-interleaved unpack: each int32 word k (bytes k*4..k*4+3) produces:
+            //   w_lo = lo nibbles = elements k*4..k*4+3 -> dot with xv[k] (elements k*4..k*4+3)
+            //   w_hi = hi nibbles = elements k*4+16..k*4+19 -> dot with xv[k+4] (elements k*4+16..k*4+19)
             int acc = 0;
             #pragma unroll
             for (int k = 0; k < 4; k++) {
                 unsigned int packed = w_nibbles[k];
-                int w0, w1;
-                unpack_nibbles_4bytes(packed, w0, w1);
-                acc = __dp4a(w0, xv[2 * k],     acc);
-                acc = __dp4a(w1, xv[2 * k + 1], acc);
+                int w_lo, w_hi;
+                unpack_nibbles_4bytes_deinterleaved(packed, w_lo, w_hi);
+                acc = __dp4a(w_lo, xv[k],     acc);
+                acc = __dp4a(w_hi, xv[k + 4], acc);
             }
 
             // Combined result with zero-point correction:
@@ -282,10 +277,10 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_ali
             #pragma unroll
             for (int k = 0; k < 4; k++) {
                 unsigned int packed = w_nibbles[k];
-                int w0, w1;
-                unpack_nibbles_4bytes(packed, w0, w1);
-                acc = __dp4a(w0, xv[2 * k],     acc);
-                acc = __dp4a(w1, xv[2 * k + 1], acc);
+                int w_lo, w_hi;
+                unpack_nibbles_4bytes_deinterleaved(packed, w_lo, w_hi);
+                acc = __dp4a(w_lo, xv[k],     acc);
+                acc = __dp4a(w_hi, xv[k + 4], acc);
             }
 
             sumf[row] += w_scale * (x_scale * (float)acc - 8.0f * x_sum);

@@ -9,8 +9,9 @@
 //
 // Q4_0 block layout (18 bytes per 32 elements):
 //   bytes [0..1]: f16 scale (d)
-//   bytes [2..17]: 16 bytes of packed nibble pairs
-//     byte[i] (i=0..15): lo_nibble = element[2*i], hi_nibble = element[2*i+1]
+//   bytes [2..17]: 16 bytes of de-interleaved nibbles
+//     Elements 0-15: lo nibbles of bytes 0-15
+//     Elements 16-31: hi nibbles of bytes 0-15
 //   Dequantized value: scale * (nibble - 8)
 //
 // Q8_1 block layout (36 bytes per 32 elements):
@@ -20,19 +21,18 @@
 //
 // dp4a dot product for Q4_0 x Q8_1:
 //   For each Q4_0 block and corresponding Q8_1 block:
-//     1. Unpack 16 nibble bytes into 8 int32 words (4 sequential int8 per word)
+//     1. Unpack 16 nibble bytes into 8 int32 words (4 consecutive unsigned nibbles per word)
+//        using de-interleaved layout (lo nibbles = elements 0-15, hi = elements 16-31)
 //     2. Load 8 int32 words from Q8_1 quant data
-//     3. dp4a: 8 calls = 32 multiply-accumulates
+//     3. dp4a: 8 calls = 32 multiply-accumulates (unsigned nibbles * signed int8)
 //     4. result += w_scale * x_scale * dp4a_sum - 8 * w_scale * x_sum
 //        where x_sum = d * sum(quants) from Q8_1 block (bytes 2-3)
 //
 // The zero-point correction (-8):
-//   dot(w, x) = scale * sum(nibble_i * x_quant_i) - 8 * scale * sum(x_quant_i)
-//             = scale * sum(nibble_i * x_quant_i) - 8 * x_sum / x_scale * w_scale * x_scale
-//   Simplification: partial = w_scale * x_scale * dp4a_sum
-//                   correction = w_scale * 8.0f * x_sum
-//                   (x_sum = f16_to_f32(Q8_1 bytes [2..3]) = d * sum(quants))
-//   result += partial - correction
+//   dot(w, x) = w_scale * sum((nibble_i - 8) * x_quant_i) * x_scale
+//             = w_scale * x_scale * sum(nibble_i * x_quant_i) - 8 * w_scale * x_scale * sum(x_quant_i)
+//             = w_scale * (x_scale * dp4a_sum - 8.0f * x_sum)
+//   where dp4a_sum uses unsigned nibbles (0-15) and x_sum = d * sum(quants)
 //
 // Architecture: NR=4 rows per block, 256 threads (8 warps).
 // Requires compute capability >= 6.1 for __dp4a() (Pascal+).
@@ -73,27 +73,43 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
-// Unpack 2 nibble bytes into 4 sequential signed int8 values packed in an int32.
+// Pack 4 consecutive de-interleaved Q4_0 elements into a dp4a-compatible int32.
 //
-// Input: 2 bytes from Q4_0 nibble data (byte_lo, byte_hi).
-//   byte_lo: lo_nibble = element[2*i],     hi_nibble = element[2*i + 1]
-//   byte_hi: lo_nibble = element[2*i + 2], hi_nibble = element[2*i + 3]
+// GGML Q4_0 de-interleaved layout (16 nibble bytes per 32 elements):
+//   Elements 0-15:  lo nibbles of bytes 0-15
+//   Elements 16-31: hi nibbles of bytes 0-15
 //
-// Output: int32 = {elem[2*i]-8, elem[2*i+1]-8, elem[2*i+2]-8, elem[2*i+3]-8}
-//         as 4 packed signed int8 in little-endian order.
+// For dp4a we need 4 consecutive elements packed into one int32.
+// k = 0..7 selects which group of 4:
+//   k=0: elements 0-3   (lo nibbles of bytes 0-3)
+//   k=1: elements 4-7   (lo nibbles of bytes 4-7)
+//   k=2: elements 8-11  (lo nibbles of bytes 8-11)
+//   k=3: elements 12-15 (lo nibbles of bytes 12-15)
+//   k=4: elements 16-19 (hi nibbles of bytes 0-3)
+//   k=5: elements 20-23 (hi nibbles of bytes 4-7)
+//   k=6: elements 24-27 (hi nibbles of bytes 8-11)
+//   k=7: elements 28-31 (hi nibbles of bytes 12-15)
 //
-// This matches Q8_1's sequential int8 layout for dp4a.
-// Uses vectorized mask+shift+byte_perm for ~10 ops vs ~20 scalar ops.
-__device__ __forceinline__ int unpack_nibbles_2bytes(unsigned char b0, unsigned char b1) {
-    // Combine 2 bytes into a single uint, then use vectorized nibble extraction.
-    unsigned int packed = (unsigned int)b0 | ((unsigned int)b1 << 8);
-    unsigned int lo = packed & 0x0F0Fu;           // lo nibbles of both bytes
-    unsigned int hi = (packed >> 4) & 0x0F0Fu;    // hi nibbles of both bytes
-    // Interleave: {b0_lo, b0_hi, b1_lo, b1_hi} using byte_perm.
-    // lo=bytes 0-3 (only 0,1 valid), hi=bytes 4-7 (only 4,5 valid).
-    unsigned int interleaved = __byte_perm(lo, hi, 0x5140);
-    // Subtract zero-point (8) from all 4 bytes simultaneously.
-    return (int)(interleaved - 0x08080808u);
+// Returns unsigned nibbles (0-15) packed as 4 bytes in an int32.
+// The zero-point correction (-8) is handled in the accumulation formula.
+__device__ __forceinline__ int pack_deinterleaved_nibbles(const unsigned char* qs, int k) {
+    if (k < 4) {
+        // Lo nibbles: elements k*4 .. k*4+3
+        unsigned int b = k * 4;
+        unsigned int packed = ((unsigned int)(qs[b]   & 0x0Fu))
+                            | ((unsigned int)(qs[b+1] & 0x0Fu) << 8)
+                            | ((unsigned int)(qs[b+2] & 0x0Fu) << 16)
+                            | ((unsigned int)(qs[b+3] & 0x0Fu) << 24);
+        return (int)packed;
+    } else {
+        // Hi nibbles: elements (k-4)*4+16 .. (k-4)*4+19
+        unsigned int b = (k - 4) * 4;
+        unsigned int packed = ((unsigned int)((qs[b]   >> 4) & 0x0Fu))
+                            | ((unsigned int)((qs[b+1] >> 4) & 0x0Fu) << 8)
+                            | ((unsigned int)((qs[b+2] >> 4) & 0x0Fu) << 16)
+                            | ((unsigned int)((qs[b+3] >> 4) & 0x0Fu) << 24);
+        return (int)packed;
+    }
 }
 
 // ==========================================================================
@@ -162,12 +178,12 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_0_d
             // Nibble data starts at w_block + 2 (16 bytes = 32 nibbles).
             const unsigned char* qs = (const unsigned char*)(w_block + 2);
 
-            // Unpack 16 nibble bytes into 8 int32 words (4 sequential elements each)
-            // and dp4a against the corresponding Q8_1 int32 words.
+            // Unpack 16 nibble bytes into 8 int32 words (4 consecutive de-interleaved
+            // elements each) and dp4a against the corresponding Q8_1 int32 words.
             int acc = 0;
             #pragma unroll
             for (int k = 0; k < 8; k++) {
-                int w_packed = unpack_nibbles_2bytes(qs[2 * k], qs[2 * k + 1]);
+                int w_packed = pack_deinterleaved_nibbles(qs, k);
                 acc = __dp4a(w_packed, xv[k], acc);
             }
 
@@ -271,7 +287,7 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_0_d
             int acc = 0;
             #pragma unroll
             for (int k = 0; k < 8; k++) {
-                int w_packed = unpack_nibbles_2bytes(qs[2 * k], qs[2 * k + 1]);
+                int w_packed = pack_deinterleaved_nibbles(qs, k);
                 acc = __dp4a(w_packed, xv[k], acc);
             }
 

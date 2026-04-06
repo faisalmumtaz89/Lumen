@@ -69,6 +69,10 @@ pub struct LayerWeightsGpu {
     pub wo: GpuWeightBuf,
     pub attn_norm: CudaSlice<f32>,
     pub ffn_norm: CudaSlice<f32>,
+    /// QKV bias vectors (Qwen2-family models). F32, [dim] each.
+    pub bq: Option<CudaSlice<f32>>,
+    pub bk: Option<CudaSlice<f32>>,
+    pub bv: Option<CudaSlice<f32>>,
     pub w_gate: GpuWeightBuf,
     pub w_up: GpuWeightBuf,
     pub w_down: GpuWeightBuf,
@@ -114,13 +118,6 @@ pub struct LayerWeightsGpu {
     /// F16 cache for SSM beta projection (None if not Q8_0/Q4_0 or OOM).
     pub ssm_beta_f16: Option<CudaSlice<u8>>,
 
-    // --- Fused alpha+beta weight (row-concatenated for batched dispatch) ---
-    /// Fused [alpha; beta] weight: [2*num_heads, hidden_dim] in the same quant as
-    /// ssm_alpha / ssm_beta. One matvec dispatch instead of two.
-    /// Created at load time by concatenating raw bytes. None if alpha or beta missing.
-    pub ssm_alpha_beta: Option<GpuWeightBuf>,
-    /// F16 cache for the fused alpha+beta projection.
-    pub ssm_alpha_beta_f16: Option<CudaSlice<u8>>,
 }
 
 /// Reinterpret raw LE bytes as an f32 slice.
@@ -647,67 +644,6 @@ fn upload_norm_tensor(
     device.htod_copy(f32_data)
 }
 
-/// Upload two tensors row-concatenated as a single fused `GpuWeightBuf`.
-///
-/// Both slices must have the same quant scheme. The raw bytes of `a` and `b` are
-/// concatenated (a's rows first, then b's rows) and uploaded in one H2D transfer.
-/// This is used to fuse alpha+beta projections: [num_heads, hidden_dim] each
-/// becomes [2*num_heads, hidden_dim] as a single weight. One-time cost at load.
-fn upload_fused_tensor(
-    device: &CudaDevice,
-    weights: &LayerView,
-    name: &str,
-    a: &lumen_format::index::TensorSlice,
-    b: &lumen_format::index::TensorSlice,
-) -> Result<GpuWeightBuf, RuntimeError> {
-    if a.quant != b.quant {
-        return Err(RuntimeError::Compute(format!(
-            "CUDA fused upload {name}: quant mismatch {:?} vs {:?}",
-            a.quant, b.quant,
-        )));
-    }
-    let raw_a = weights.subtensor_bytes(a)?;
-    let raw_b = weights.subtensor_bytes(b)?;
-
-    match a.quant {
-        QuantScheme::F32 => {
-            let f32_a = bytes_as_f32(raw_a)?;
-            let f32_b = bytes_as_f32(raw_b)?;
-            let mut fused = Vec::with_capacity(f32_a.len() + f32_b.len());
-            fused.extend_from_slice(f32_a);
-            fused.extend_from_slice(f32_b);
-            Ok(GpuWeightBuf::F32(device.htod_copy(&fused)?))
-        }
-        QuantScheme::F16 => {
-            let mut fused = Vec::with_capacity(raw_a.len() + raw_b.len());
-            fused.extend_from_slice(raw_a);
-            fused.extend_from_slice(raw_b);
-            Ok(GpuWeightBuf::F16Raw(device.htod_copy(&fused)?))
-        }
-        QuantScheme::Q8_0 => {
-            let mut fused = Vec::with_capacity(raw_a.len() + raw_b.len());
-            fused.extend_from_slice(raw_a);
-            fused.extend_from_slice(raw_b);
-            Ok(GpuWeightBuf::Q8Raw(device.htod_copy(&fused)?))
-        }
-        QuantScheme::Q4_0 => {
-            let mut fused = Vec::with_capacity(raw_a.len() + raw_b.len());
-            fused.extend_from_slice(raw_a);
-            fused.extend_from_slice(raw_b);
-            Ok(GpuWeightBuf::Q4Raw(device.htod_copy(&fused)?))
-        }
-        other => {
-            // For other quant types (Q4_1, K-quants, etc.), the individual upload_tensor
-            // calls dequant to F32. We can't easily fuse those here without duplicating
-            // the dequant logic. Fall back to None (caller uses separate alpha/beta).
-            Err(RuntimeError::Compute(format!(
-                "CUDA fused upload {name}: unsupported quant {:?} for fusion",
-                other,
-            )))
-        }
-    }
-}
-
 /// Upload a single layer's weight tensors from a `LayerView` to GPU memory.
 ///
 /// Extracts each subtensor's raw bytes and uploads according to quant scheme:
@@ -730,6 +666,27 @@ pub fn upload_layer_weights(
         wk: upload_tensor(device, weights, "wk", &subs.wk)?,
         wv: upload_tensor(device, weights, "wv", &subs.wv)?,
         wo: upload_tensor(device, weights, "wo", &subs.wo)?,
+        bq: match &subs.bq {
+            Some(s) if s.quant == QuantScheme::F32 => {
+                let raw = weights.subtensor_bytes(s)?;
+                Some(device.htod_copy(bytes_as_f32(raw)?)?)
+            }
+            _ => None,
+        },
+        bk: match &subs.bk {
+            Some(s) if s.quant == QuantScheme::F32 => {
+                let raw = weights.subtensor_bytes(s)?;
+                Some(device.htod_copy(bytes_as_f32(raw)?)?)
+            }
+            _ => None,
+        },
+        bv: match &subs.bv {
+            Some(s) if s.quant == QuantScheme::F32 => {
+                let raw = weights.subtensor_bytes(s)?;
+                Some(device.htod_copy(bytes_as_f32(raw)?)?)
+            }
+            _ => None,
+        },
         attn_norm: upload_norm_tensor(device, weights, "attn_norm", &subs.attn_norm)?,
         // Prefer attn_post_norm when ffn_norm sentinel is absent (length=0).
         // Qwen3.5 GDN layers use post_attention_norm as the FFN pre-norm;
@@ -813,10 +770,6 @@ pub fn upload_layer_weights(
         attn_gate_f16: None,
         ssm_alpha_f16: None,
         ssm_beta_f16: None,
-        // Fused alpha+beta weight reserved for future batched alpha+beta projection.
-        // Currently None -- dispatch not yet wired.
-        ssm_alpha_beta: None,
-        ssm_alpha_beta_f16: None,
     })
 }
 
@@ -935,7 +888,7 @@ pub fn dequant_layer_q8_to_f16(
     // Helper: compute element count from buffer type and dimensions.
     // For GDN layers, wq is fused [qkv_dim, hidden_dim] so we derive
     // the element count from the buffer byte size instead of model dims.
-    let buf_elements = |w: &GpuWeightBuf| -> usize {
+    let _buf_elements = |w: &GpuWeightBuf| -> usize {
         match w {
             GpuWeightBuf::Q8Raw(q8) | GpuWeightBuf::Q8Aligned(q8) => {
                 // Q8_0: 34 bytes per block of 32 elements

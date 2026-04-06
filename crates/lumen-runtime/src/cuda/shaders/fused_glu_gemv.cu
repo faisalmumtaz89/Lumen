@@ -323,8 +323,8 @@ extern "C" __global__ void fused_glu_gemv_q4_0(
             float g_block_sum = 0.0f;
             float u_block_sum = 0.0f;
 
-            // Unpack nibbles: each byte holds 2 elements.
-            // Low nibble = element 2*i, high nibble = element 2*i+1.
+            // Unpack nibbles (GGML de-interleaved layout):
+            // Lo nibble of byte b = element b, hi nibble = element b+16.
             // Dequant: scale * ((float)nibble - 8.0f)
             #pragma unroll
             for (int b = 0; b < 16; b++) {
@@ -336,8 +336,8 @@ extern "C" __global__ void fused_glu_gemv_q4_0(
                 float uq_lo = (float)(ub & 0x0F) - 8.0f;
                 float uq_hi = (float)(ub >> 4)    - 8.0f;
 
-                g_block_sum += gq_lo * xv[2 * b]     + gq_hi * xv[2 * b + 1];
-                u_block_sum += uq_lo * xv[2 * b]     + uq_hi * xv[2 * b + 1];
+                g_block_sum += gq_lo * xv[b]     + gq_hi * xv[b + 16];
+                u_block_sum += uq_lo * xv[b]     + uq_hi * xv[b + 16];
             }
 
             gate_sum[row] += g_scale * g_block_sum;
@@ -764,8 +764,8 @@ extern "C" __global__ void fused_glu_gemv_q4_0_hg(
                 float uq_lo = (float)(ub & 0x0F) - 8.0f;
                 float uq_hi = (float)(ub >> 4)    - 8.0f;
 
-                g_block_sum += gq_lo * xv[2 * b]     + gq_hi * xv[2 * b + 1];
-                u_block_sum += uq_lo * xv[2 * b]     + uq_hi * xv[2 * b + 1];
+                g_block_sum += gq_lo * xv[b]     + gq_hi * xv[b + 16];
+                u_block_sum += uq_lo * xv[b]     + uq_hi * xv[b + 16];
             }
 
             gate_sum[row] += g_scale * g_block_sum;

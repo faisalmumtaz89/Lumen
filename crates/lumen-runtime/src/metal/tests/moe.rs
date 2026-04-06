@@ -1053,6 +1053,7 @@ fn test_hyperparams() -> ModelHyperparams {
         }),
         num_experts: None,
         num_active_experts: None,
+        rotary_dim: None, rope_neox: false,
     }
 }
 

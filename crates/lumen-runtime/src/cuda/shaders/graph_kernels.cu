@@ -92,9 +92,10 @@ extern "C" __global__ void embed_token_q4_0_graph(
                               | ((unsigned short)(unsigned char)block_ptr[1] << 8);
     float scale = f16_to_f32(scale_bits);
 
-    unsigned int byte_idx = elem_in_block >> 1;
+    // De-interleaved Q4_0: elements 0-15 = lo nibbles, 16-31 = hi nibbles.
+    unsigned int byte_idx = (elem_in_block < 16u) ? elem_in_block : (elem_in_block - 16u);
     unsigned char byte_val = (unsigned char)block_ptr[2 + byte_idx];
-    unsigned int nibble = (elem_in_block & 1u) ? (byte_val >> 4) : (byte_val & 0x0Fu);
+    unsigned int nibble = (elem_in_block < 16u) ? (byte_val & 0x0Fu) : ((byte_val >> 4) & 0x0Fu);
     output[idx] = scale * ((float)nibble - 8.0f);
 }
 
@@ -109,20 +110,23 @@ extern "C" __global__ void rope_apply_graph(
     unsigned int num_q_heads,
     unsigned int num_kv_heads,
     unsigned int head_dim,
-    float theta_base)
+    float theta_base,
+    unsigned int rotary_dim)                 // 0 = full head_dim (backward compatible)
 {
-    unsigned int half_dim = head_dim >> 1;
-    unsigned int total_q_pairs = num_q_heads * half_dim;
-    unsigned int total_k_pairs = num_kv_heads * half_dim;
+    // Actual rotary dimension: 0 means full head_dim (backward compatible)
+    unsigned int actual_rot = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
+    unsigned int half_rot = actual_rot >> 1;
+    unsigned int total_q_pairs = num_q_heads * half_rot;
+    unsigned int total_k_pairs = num_kv_heads * half_rot;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     unsigned int pos = *p_pos;
 
     if (idx < total_q_pairs) {
-        unsigned int d = idx % half_dim;
-        unsigned int head_offset = (idx / half_dim) * head_dim;
+        unsigned int d = idx % half_rot;
+        unsigned int head_offset = (idx / half_rot) * head_dim;
 
-        float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)head_dim);
+        float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)actual_rot);
         float angle = (float)pos * freq;
         float cos_a = cosf(angle);
         float sin_a = sinf(angle);
@@ -136,10 +140,10 @@ extern "C" __global__ void rope_apply_graph(
     }
 
     if (idx < total_k_pairs) {
-        unsigned int d = idx % half_dim;
-        unsigned int head_offset = (idx / half_dim) * head_dim;
+        unsigned int d = idx % half_rot;
+        unsigned int head_offset = (idx / half_rot) * head_dim;
 
-        float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)head_dim);
+        float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)actual_rot);
         float angle = (float)pos * freq;
         float cos_a = cosf(angle);
         float sin_a = sinf(angle);
@@ -209,19 +213,27 @@ extern "C" __global__ void rope_kv_write_graph(
     unsigned int num_kv_heads,
     unsigned int head_dim,
     unsigned int max_seq_len,
-    float theta_base)
+    float theta_base,
+    unsigned int rotary_dim)                     // 0 = full head_dim (backward compatible)
 {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int pos = *p_pos;
+    // Actual rotary dimension: 0 means full head_dim (backward compatible)
+    unsigned int actual_rot = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
+    unsigned int half_rot = actual_rot >> 1;
     unsigned int half_dim = head_dim >> 1;
 
-    // --- Q RoPE ---
-    unsigned int total_q_pairs = num_q_heads * half_dim;
-    if (idx < total_q_pairs) {
-        unsigned int d = idx % half_dim;
-        unsigned int head_offset = (idx / half_dim) * head_dim;
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int pos = *p_pos;
 
-        float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)head_dim);
+    // --- Q RoPE ---
+    // Thread mapping: half_rot pairs per head for RoPE, half_dim pairs per head for V cache.
+    // Use max(half_rot, half_dim) pairs in the grid for K+V cache writes.
+    unsigned int total_q_rot_pairs = num_q_heads * half_rot;
+    if (idx < total_q_rot_pairs) {
+        unsigned int d = idx % half_rot;
+        unsigned int head_offset = (idx / half_rot) * head_dim;
+
+        // Freq base uses actual_rot for correct frequency spacing
+        float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)actual_rot);
         float angle = (float)pos * freq;
         float cos_a = cosf(angle);
         float sin_a = sinf(angle);
@@ -235,38 +247,114 @@ extern "C" __global__ void rope_kv_write_graph(
     }
 
     // --- K RoPE + KV cache write ---
-    // Each thread handles one pair of K elements: rotate and write to cache.
-    // V elements at the same positions are also written to v_cache.
-    unsigned int total_k_pairs = num_kv_heads * half_dim;
-    if (idx < total_k_pairs) {
+    // Each thread handles one pair of elements. For d < half_rot, apply RoPE to K
+    // and write both rotated K and V to cache. For d >= half_rot (partial RoPE),
+    // K is unrotated -- just copy K and V to cache.
+    unsigned int total_kv_pairs = num_kv_heads * half_dim;
+    if (idx < total_kv_pairs) {
         unsigned int d = idx % half_dim;
         unsigned int kv_head = idx / half_dim;
         unsigned int head_offset = kv_head * head_dim;
-
-        // RoPE rotation
-        float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)head_dim);
-        float angle = (float)pos * freq;
-        float cos_a = cosf(angle);
-        float sin_a = sinf(angle);
 
         unsigned int i0 = head_offset + 2 * d;
         unsigned int i1 = i0 + 1;
         float k0 = k[i0];
         float k1 = k[i1];
-        float k0_rot = k0 * cos_a - k1 * sin_a;
-        float k1_rot = k0 * sin_a + k1 * cos_a;
 
-        // Write rotated K back to k[] buffer (for attention) and to k_cache
-        k[i0] = k0_rot;
-        k[i1] = k1_rot;
+        // Apply RoPE rotation only to the first half_rot pairs
+        if (d < half_rot) {
+            float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)actual_rot);
+            float angle = (float)pos * freq;
+            float cos_a = cosf(angle);
+            float sin_a = sinf(angle);
 
+            float k0_rot = k0 * cos_a - k1 * sin_a;
+            float k1_rot = k0 * sin_a + k1 * cos_a;
+            k[i0] = k0_rot;
+            k[i1] = k1_rot;
+            k0 = k0_rot;
+            k1 = k1_rot;
+        }
+
+        // Write K (rotated or pass-through) and V to cache
         unsigned int cache_base = kv_head * max_seq_len * head_dim + pos * head_dim;
-        k_cache[cache_base + 2 * d]     = k0_rot;
-        k_cache[cache_base + 2 * d + 1] = k1_rot;
+        k_cache[cache_base + 2 * d]     = k0;
+        k_cache[cache_base + 2 * d + 1] = k1;
 
         // Write V to cache (no RoPE, just scatter to head-first layout)
         v_cache[cache_base + 2 * d]     = v[i0];
         v_cache[cache_base + 2 * d + 1] = v[i1];
+    }
+}
+
+// NeoX-style fused RoPE + KV cache write for graph decode (Qwen2/Qwen3.5).
+// Pairs at (d, d+half_rot) instead of (2d, 2d+1).
+extern "C" __global__ void rope_kv_write_neox_graph(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ k_cache,
+    float* __restrict__ v_cache,
+    const unsigned int* __restrict__ p_pos,
+    unsigned int num_q_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int max_seq_len,
+    float theta_base,
+    unsigned int rotary_dim)
+{
+    unsigned int actual_rot = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
+    unsigned int half_rot = actual_rot >> 1;
+    unsigned int half_dim = head_dim >> 1;
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int pos = *p_pos;
+
+    // Q RoPE (NeoX half-split)
+    unsigned int total_q_rot_pairs = num_q_heads * half_rot;
+    if (idx < total_q_rot_pairs) {
+        unsigned int d = idx % half_rot;
+        unsigned int head_offset = (idx / half_rot) * head_dim;
+        float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)actual_rot);
+        float angle = (float)pos * freq;
+        float cos_a = cosf(angle);
+        float sin_a = sinf(angle);
+        unsigned int i0 = head_offset + d;
+        unsigned int i1 = head_offset + d + half_rot;
+        float x0 = q[i0];
+        float x1 = q[i1];
+        q[i0] = x0 * cos_a - x1 * sin_a;
+        q[i1] = x0 * sin_a + x1 * cos_a;
+    }
+
+    // K RoPE + KV cache write (NeoX)
+    unsigned int total_kv_pairs = num_kv_heads * half_dim;
+    if (idx < total_kv_pairs) {
+        unsigned int d = idx % half_dim;
+        unsigned int kv_head = idx / half_dim;
+        unsigned int head_offset = kv_head * head_dim;
+        unsigned int i0 = head_offset + d;
+        unsigned int i1 = head_offset + d + half_dim;
+        float k0 = k[i0];
+        float k1 = k[i1];
+
+        if (d < half_rot) {
+            float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)actual_rot);
+            float angle = (float)pos * freq;
+            float cos_a = cosf(angle);
+            float sin_a = sinf(angle);
+            float k0_rot = k0 * cos_a - k1 * sin_a;
+            float k1_rot = k0 * sin_a + k1 * cos_a;
+            k[i0] = k0_rot;
+            k[i1] = k1_rot;
+            k0 = k0_rot;
+            k1 = k1_rot;
+        }
+
+        unsigned int cache_base = kv_head * max_seq_len * head_dim + pos * head_dim;
+        k_cache[cache_base + d] = k0;
+        k_cache[cache_base + d + half_dim] = k1;
+        v_cache[cache_base + d] = v[i0];
+        v_cache[cache_base + d + half_dim] = v[i1];
     }
 }
 

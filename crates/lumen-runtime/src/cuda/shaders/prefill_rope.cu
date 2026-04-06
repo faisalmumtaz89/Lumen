@@ -18,6 +18,9 @@
 //
 // NVRTC-compatible: no system includes, extern "C" linkage.
 
+// `rotary_dim`: number of dimensions to rotate per head (0 = full head_dim).
+// For Qwen3.5: rotary_dim=64 out of head_dim=256 — only first 32 pairs rotated.
+// Freq base uses rotary_dim (not head_dim) for correct frequency spacing.
 extern "C" __global__ void rope_apply_batched(
     float* __restrict__ q,         // [batch, num_q_heads * head_dim]
     float* __restrict__ k,         // [batch, num_kv_heads * head_dim]
@@ -26,11 +29,14 @@ extern "C" __global__ void rope_apply_batched(
     unsigned int num_q_heads,
     unsigned int num_kv_heads,
     unsigned int head_dim,
-    float theta_base)
+    float theta_base,
+    unsigned int rotary_dim)       // 0 = full head_dim (backward compatible)
 {
-    unsigned int half_dim = head_dim >> 1;
-    unsigned int total_q_pairs = num_q_heads * half_dim;
-    unsigned int total_k_pairs = num_kv_heads * half_dim;
+    // Actual rotary dimension: 0 means full head_dim (backward compatible)
+    unsigned int actual_rot = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
+    unsigned int half_rot = actual_rot >> 1;
+    unsigned int total_q_pairs = num_q_heads * half_rot;
+    unsigned int total_k_pairs = num_kv_heads * half_rot;
     unsigned int q_dim = num_q_heads * head_dim;
     unsigned int kv_dim = num_kv_heads * head_dim;
 
@@ -44,12 +50,12 @@ extern "C" __global__ void rope_apply_batched(
     unsigned int pos = pos_start + token;
 
     // Decompose pair_idx -> (head, dimension_pair).
-    unsigned int d = pair_idx % half_dim;
-    unsigned int head_in_q = pair_idx / half_dim;
+    unsigned int d = pair_idx % half_rot;
+    unsigned int head_in_q = pair_idx / half_rot;
     unsigned int head_offset_q = head_in_q * head_dim;
 
-    // Compute rotation angle. Subtract max not needed here (no exp/softmax).
-    float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)head_dim);
+    // Compute rotation angle. Freq base uses actual_rot for correct frequency spacing.
+    float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)actual_rot);
     float angle = (float)pos * freq;
     float cos_a = cosf(angle);
     float sin_a = sinf(angle);
@@ -66,7 +72,7 @@ extern "C" __global__ void rope_apply_batched(
     // Apply rotation to K (only if this thread maps to a valid K head).
     // In GQA, num_kv_heads <= num_q_heads, so some Q threads have no K work.
     if (pair_idx < total_k_pairs) {
-        unsigned int head_in_k = pair_idx / half_dim;
+        unsigned int head_in_k = pair_idx / half_rot;
         unsigned int head_offset_k = head_in_k * head_dim;
         unsigned int base = token * kv_dim + head_offset_k + 2 * d;
         float x0 = k[base];

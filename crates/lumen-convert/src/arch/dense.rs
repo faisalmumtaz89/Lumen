@@ -75,6 +75,19 @@ fn compute_layer_shape_dense(
                 quant: QuantScheme::F32,
             });
             blob_size += size;
+        } else if tensor.ggml_type == crate::gguf::GgmlType::Q4_1 {
+            // Q4_1 has no dedicated GPU kernel (neither Metal nor CUDA).
+            // Requantize to Q4_0 during conversion so the runtime can use
+            // native Q4_0 dequant-matvec kernels.
+            let n_elements = tensor.n_elements();
+            assert!(n_elements % 32 == 0, "Q4_0 requires elements divisible by 32, got {n_elements} for {name}");
+            let size = ((n_elements as usize / 32) * 18) as u64; // Q4_0: 18 bytes per block
+            slices.push(TensorSlice {
+                offset: blob_size,
+                length: size,
+                quant: QuantScheme::Q4_0,
+            });
+            blob_size += size;
         } else {
             let quant = tensor
                 .ggml_type
@@ -280,6 +293,17 @@ fn write_dense_layer_blob<R: Read + Seek>(
                 &name,
             )?;
             blob.extend_from_slice(&f32_data);
+        } else if tensor.ggml_type == crate::gguf::GgmlType::Q4_1 {
+            // Q4_1 has no dedicated GPU kernel (neither Metal nor CUDA).
+            // Requantize to Q4_0: dequant Q4_1 -> F32 -> quantize Q4_0.
+            let f32_data = dequantize_to_f32_bytes(
+                &data, tensor.ggml_type, tensor.n_elements(), &name,
+            )?;
+            let n_elems = tensor.n_elements() as usize;
+            let q4_data = quantize_f32_to_q4_0(&f32_data, n_elems);
+            eprintln!("    Requantized Q4_1 -> Q4_0: {name} ({} -> {} bytes)",
+                data.len(), q4_data.len());
+            blob.extend_from_slice(&q4_data);
         } else {
             blob.extend_from_slice(&data);
         }

@@ -42,6 +42,7 @@ impl KvCacheGpu {
     ///
     /// Both K and V buffers are zeroed. The `kv_cache_write` kernel is compiled
     /// and cached for the lifetime of this struct.
+    #[allow(dead_code)] // Used in #[cfg(test)] blocks in prefill_attention.rs.
     pub fn new(
         device: &CudaDevice,
         num_kv_heads: usize,

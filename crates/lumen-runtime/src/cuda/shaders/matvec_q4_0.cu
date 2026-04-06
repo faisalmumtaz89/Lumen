@@ -8,8 +8,8 @@
 // Q4_0 block layout (GGML standard, 18 bytes per 32 elements):
 //   bytes [0..1]: f16 scale (IEEE 754 half-precision, little-endian)
 //   bytes [2..17]: 16 bytes = 32 x 4-bit unsigned values packed as nibble pairs
-//     byte i (i = 0..15): low nibble (bits 0-3) = element 2*i
-//                          high nibble (bits 4-7) = element 2*i + 1
+//     De-interleaved layout: elements 0-15 from lo nibbles of bytes 0-15,
+//     elements 16-31 from hi nibbles of bytes 0-15
 //   Dequantize: float_value = scale * ((float)(nibble) - 8.0f)
 //
 // Strategy: one thread block per output row. 256 threads cooperatively iterate
@@ -99,11 +99,12 @@ extern "C" __global__ void matvec_q4_0(
         // Base index into x for this block's 32 elements.
         unsigned int x_base = b * Q4_0_GROUP_SIZE;
 
-        // Unpack 16 nibble-pair bytes into 32 dequantized values, dot with x.
+        // Unpack 16 nibble bytes into 32 dequantized values, dot with x.
+        // GGML de-interleaved layout: lo nibble of byte i = element i,
+        // hi nibble of byte i = element i+16.
         float block_sum = 0.0f;
         const char* qs = block_ptr + 2;
 
-        // Process 2 elements per byte (16 bytes = 32 elements).
         for (unsigned int i = 0; i < 16; i++) {
             unsigned char byte_val = (unsigned char)qs[i];
             unsigned int nibble_lo = byte_val & 0x0Fu;
@@ -112,8 +113,8 @@ extern "C" __global__ void matvec_q4_0(
             float dq_lo = (float)nibble_lo - 8.0f;
             float dq_hi = (float)nibble_hi - 8.0f;
 
-            block_sum += dq_lo * x[x_base + 2 * i]
-                       + dq_hi * x[x_base + 2 * i + 1];
+            block_sum += dq_lo * x[x_base + i]
+                       + dq_hi * x[x_base + i + 16];
         }
 
         sum += scale * block_sum;
@@ -172,8 +173,8 @@ extern "C" __global__ void matvec_q4_0_residual(
             float dq_lo = (float)nibble_lo - 8.0f;
             float dq_hi = (float)nibble_hi - 8.0f;
 
-            block_sum += dq_lo * x[x_base + 2 * i]
-                       + dq_hi * x[x_base + 2 * i + 1];
+            block_sum += dq_lo * x[x_base + i]
+                       + dq_hi * x[x_base + i + 16];
         }
 
         sum += scale * block_sum;

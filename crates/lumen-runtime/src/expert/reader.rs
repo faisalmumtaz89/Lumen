@@ -401,6 +401,7 @@ mod tests {
             num_experts: Some(num_experts as u32),
             num_active_experts: Some(2),
             norm_eps: 1e-5,
+            rotary_dim: None, rope_neox: false,
         };
         let qd = QuantizationDescriptor {
             scheme: QuantScheme::F32,
@@ -682,6 +683,7 @@ mod tests {
             num_experts: None,
             num_active_experts: None,
             norm_eps: 1e-5,
+            rotary_dim: None, rope_neox: false,
         };
         let qd = QuantizationDescriptor {
             scheme: QuantScheme::F32,

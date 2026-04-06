@@ -92,6 +92,17 @@ pub(crate) fn extract_hyperparams(gguf: &GgufFile) -> Result<(ModelHyperparams, 
     let num_experts = gguf.get_u32(&format!("{prefix}.expert_count"));
     let num_active_experts = gguf.get_u32(&format!("{prefix}.expert_used_count"));
 
+    // Partial RoPE: some models (e.g. Qwen3.5) only rotate a subset of head dimensions.
+    // GGUF key: {arch}.rope.dimension_count. None/0 = full head_dim (most models).
+    let rotary_dim = gguf.get_u32(&format!("{prefix}.rope.dimension_count"))
+        .filter(|&v| v > 0 && v < head_dim);
+    if let Some(d) = rotary_dim {
+        if d > 255 {
+            return Err(ConvertError::MissingMetadata(
+                format!("{prefix}.rope.dimension_count={d} exceeds u8 wire limit (255)")));
+        }
+    }
+
     let hp = ModelHyperparams {
         num_layers,
         num_heads,
@@ -109,6 +120,8 @@ pub(crate) fn extract_hyperparams(gguf: &GgufFile) -> Result<(ModelHyperparams, 
         num_experts,
         num_active_experts,
         norm_eps,
+        rotary_dim,
+        rope_neox: matches!(arch.as_str(), "qwen2" | "qwen35" | "qwen35moe" | "qwen3_5_moe" | "qwen3.5_moe"),
     };
 
     Ok((hp, arch))

@@ -89,8 +89,9 @@ extern "C" __global__ void embed_token_q4_0(
                               | ((unsigned short)(unsigned char)block_ptr[1] << 8);
     float scale = f16_bits_to_f32(scale_bits);
 
-    unsigned int byte_idx = elem_in_block >> 1;
+    // GGML de-interleaved layout: elements 0-15 = lo nibbles, elements 16-31 = hi nibbles.
+    unsigned int byte_idx = (elem_in_block < 16u) ? elem_in_block : (elem_in_block - 16u);
     unsigned char byte_val = (unsigned char)block_ptr[2 + byte_idx];
-    unsigned int nibble = (elem_in_block & 1u) ? (byte_val >> 4) : (byte_val & 0x0Fu);
+    unsigned int nibble = (elem_in_block < 16u) ? (byte_val & 0x0Fu) : ((byte_val >> 4) & 0x0Fu);
     output[idx] = scale * ((float)nibble - 8.0f);
 }

@@ -149,11 +149,14 @@ extern "C" __global__ void rope_apply_batched(
     unsigned int num_q_heads,
     unsigned int num_kv_heads,
     unsigned int head_dim,
-    float theta_base)
+    float theta_base,
+    unsigned int rotary_dim)       // 0 = full head_dim (backward compatible)
 {
-    unsigned int half_dim = head_dim >> 1;
-    unsigned int total_q_pairs = num_q_heads * half_dim;
-    unsigned int total_k_pairs = num_kv_heads * half_dim;
+    // Actual rotary dimension: 0 means full head_dim (backward compatible)
+    unsigned int actual_rot = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
+    unsigned int half_rot = actual_rot >> 1;
+    unsigned int total_q_pairs = num_q_heads * half_rot;
+    unsigned int total_k_pairs = num_kv_heads * half_rot;
     unsigned int q_dim = num_q_heads * head_dim;
     unsigned int kv_dim = num_kv_heads * head_dim;
 
@@ -167,10 +170,10 @@ extern "C" __global__ void rope_apply_batched(
 
     // Process Q.
     {
-        unsigned int d = pair_idx % half_dim;
-        unsigned int head_offset = (pair_idx / half_dim) * head_dim;
+        unsigned int d = pair_idx % half_rot;
+        unsigned int head_offset = (pair_idx / half_rot) * head_dim;
 
-        float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)head_dim);
+        float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)actual_rot);
         float angle = (float)pos * freq;
         float cos_a = cosf(angle);
         float sin_a = sinf(angle);
@@ -184,10 +187,10 @@ extern "C" __global__ void rope_apply_batched(
 
     // Process K (only if this thread is also within K range).
     if (pair_idx < total_k_pairs) {
-        unsigned int d = pair_idx % half_dim;
-        unsigned int head_offset = (pair_idx / half_dim) * head_dim;
+        unsigned int d = pair_idx % half_rot;
+        unsigned int head_offset = (pair_idx / half_rot) * head_dim;
 
-        float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)head_dim);
+        float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)actual_rot);
         float angle = (float)pos * freq;
         float cos_a = cosf(angle);
         float sin_a = sinf(angle);
@@ -197,6 +200,76 @@ extern "C" __global__ void rope_apply_batched(
         float x1 = k[base + 1];
         k[base]     = x0 * cos_a - x1 * sin_a;
         k[base + 1] = x0 * sin_a + x1 * cos_a;
+    }
+}
+
+// ---------- Batched NeoX-style RoPE ----------
+//
+// NeoX half-split variant: pairs at (d, d + half_rot) instead of (2d, 2d+1).
+// Used for Qwen2/Qwen3.5 architectures.
+
+extern "C" __global__ void rope_apply_batched_neox(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    unsigned int pos_start,
+    unsigned int batch,
+    unsigned int num_q_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    float theta_base,
+    unsigned int rotary_dim)
+{
+    unsigned int actual_rot = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
+    unsigned int half_rot = actual_rot >> 1;
+    unsigned int total_q_pairs = num_q_heads * half_rot;
+    unsigned int total_k_pairs = num_kv_heads * half_rot;
+    unsigned int q_dim = num_q_heads * head_dim;
+    unsigned int kv_dim = num_kv_heads * head_dim;
+
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total_work = batch * total_q_pairs;
+    if (idx >= total_work) return;
+
+    unsigned int token = idx / total_q_pairs;
+    unsigned int pair_idx = idx % total_q_pairs;
+    unsigned int pos = pos_start + token;
+
+    // Process Q.
+    {
+        unsigned int d = pair_idx % half_rot;
+        unsigned int head_offset = (pair_idx / half_rot) * head_dim;
+
+        float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)actual_rot);
+        float angle = (float)pos * freq;
+        float cos_a = cosf(angle);
+        float sin_a = sinf(angle);
+
+        unsigned int base = token * q_dim + head_offset;
+        unsigned int i0 = base + d;
+        unsigned int i1 = base + d + half_rot;
+        float x0 = q[i0];
+        float x1 = q[i1];
+        q[i0] = x0 * cos_a - x1 * sin_a;
+        q[i1] = x0 * sin_a + x1 * cos_a;
+    }
+
+    // Process K.
+    if (pair_idx < total_k_pairs) {
+        unsigned int d = pair_idx % half_rot;
+        unsigned int head_offset = (pair_idx / half_rot) * head_dim;
+
+        float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)actual_rot);
+        float angle = (float)pos * freq;
+        float cos_a = cosf(angle);
+        float sin_a = sinf(angle);
+
+        unsigned int base = token * kv_dim + head_offset;
+        unsigned int i0 = base + d;
+        unsigned int i1 = base + d + half_rot;
+        float x0 = k[i0];
+        float x1 = k[i1];
+        k[i0] = x0 * cos_a - x1 * sin_a;
+        k[i1] = x0 * sin_a + x1 * cos_a;
     }
 }
 
@@ -298,4 +371,27 @@ extern "C" __global__ void scatter_row(
     if (idx >= dim) return;
 
     matrix[(unsigned long long)row_idx * dim + idx] = input[idx];
+}
+
+// ---------- Bias addition: output[b][i] += bias[i] for all rows ----------
+extern "C" __global__ void bias_add_batched(
+    float* __restrict__ output,
+    const float* __restrict__ bias,
+    unsigned int total,
+    unsigned int dim)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    output[idx] += bias[idx % dim];
+}
+
+// ---------- Bias addition for single vector (decode path) ----------
+extern "C" __global__ void bias_add(
+    float* __restrict__ output,
+    const float* __restrict__ bias,
+    unsigned int dim)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= dim) return;
+    output[idx] += bias[idx];
 }

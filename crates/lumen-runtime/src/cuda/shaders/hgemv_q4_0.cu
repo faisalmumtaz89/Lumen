@@ -5,7 +5,7 @@
 // Reads 0.5625 B/elem (18 bytes / 32 elements) vs HGEMV's 2 B/elem = 3.55x savings.
 //
 // Q4_0 block: 18 bytes = 2B f16 scale + 16B nibble pairs (32 elements)
-//   byte i (i = 0..15): low nibble = element 2*i, high nibble = element 2*i + 1
+//   De-interleaved layout: elements 0-15 from lo nibbles, elements 16-31 from hi nibbles
 //   dequant: float_value = scale * ((float)(nibble) - 8.0f)
 //
 // Architecture: NR=4 output rows per block, 256 threads (8 warps).
@@ -115,7 +115,7 @@ extern "C" __global__ void hgemv_q4_0(
                 unsigned int byte_val = qs[i];
                 float dq_lo = (float)(byte_val & 0x0Fu) - 8.0f;
                 float dq_hi = (float)((byte_val >> 4) & 0x0Fu) - 8.0f;
-                block_sum += dq_lo * xv[2 * i] + dq_hi * xv[2 * i + 1];
+                block_sum += dq_lo * xv[i] + dq_hi * xv[i + 16];
             }
 
             sumf[row] += scale * block_sum;
@@ -217,7 +217,7 @@ extern "C" __global__ void hgemv_q4_0_residual(
                 unsigned int byte_val = qs[i];
                 float dq_lo = (float)(byte_val & 0x0Fu) - 8.0f;
                 float dq_hi = (float)((byte_val >> 4) & 0x0Fu) - 8.0f;
-                block_sum += dq_lo * xv[2 * i] + dq_hi * xv[2 * i + 1];
+                block_sum += dq_lo * xv[i] + dq_hi * xv[i + 16];
             }
 
             sumf[row] += scale * block_sum;

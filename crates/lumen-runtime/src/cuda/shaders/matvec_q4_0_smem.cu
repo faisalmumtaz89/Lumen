@@ -6,8 +6,8 @@
 // Q4_0 block layout (GGML): 18 bytes per block of 32 elements.
 //   bytes [0..1]: f16 scale (IEEE 754 half-precision, little-endian)
 //   bytes [2..17]: 16 bytes = 32 x 4-bit unsigned values packed as nibble pairs
-//     byte i (i = 0..15): low nibble (bits 0-3) = element 2*i
-//                          high nibble (bits 4-7) = element 2*i + 1
+//     De-interleaved layout: elements 0-15 from lo nibbles of bytes 0-15,
+//     elements 16-31 from hi nibbles of bytes 0-15
 //   Dequantize: float_value = scale * ((float)(nibble) - 8.0f)
 //
 // Architecture: NR=2 rows per block, 256 threads (8 warps).
@@ -120,7 +120,7 @@ extern "C" __global__ void matvec_q4_0_smem(
                 unsigned int byte_val = qs[i];
                 float dq_lo = (float)(byte_val & 0x0Fu) - 8.0f;
                 float dq_hi = (float)((byte_val >> 4) & 0x0Fu) - 8.0f;
-                block_sum += dq_lo * xv[2 * i] + dq_hi * xv[2 * i + 1];
+                block_sum += dq_lo * xv[i] + dq_hi * xv[i + 16];
             }
 
             sumf[row] += scale * block_sum;
@@ -226,7 +226,7 @@ extern "C" __global__ void matvec_q4_0_smem_residual(
                 unsigned int byte_val = qs[i];
                 float dq_lo = (float)(byte_val & 0x0Fu) - 8.0f;
                 float dq_hi = (float)((byte_val >> 4) & 0x0Fu) - 8.0f;
-                block_sum += dq_lo * xv[2 * i] + dq_hi * xv[2 * i + 1];
+                block_sum += dq_lo * xv[i] + dq_hi * xv[i + 16];
             }
 
             sumf[row] += scale * block_sum;

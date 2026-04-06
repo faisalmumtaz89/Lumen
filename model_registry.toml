@@ -1,0 +1,92 @@
+# Lumen Model Registry
+# ====================
+#
+# Canonical registry of models supported by the Lumen inference engine.
+# Each entry specifies the model, architecture, quantization formats,
+# and GGUF source for reproducible benchmarking and testing.
+
+[meta]
+schema_version = 1
+last_validated = "2026-04-06"
+
+supported_architectures = [
+    "llama",      # LLaMA 2/3/3.1, CodeLlama
+    "mistral",    # Mistral
+    "qwen2",      # Qwen2, Qwen2.5
+    "qwen35",     # Qwen3.5 (GatedDeltaNet)
+    "qwen35moe",  # Qwen3.5 MoE (Metal only)
+    "internlm2",  # InternLM2
+    "exaone",     # EXAONE
+    "xverse",     # XVERSE
+]
+
+supported_quantizations = ["F16", "Q8_0", "Q4_0"]
+
+
+# =============================================================================
+# Models
+# =============================================================================
+
+[models.llama-3-1-8b]
+display_name = "Llama 3.1 8B Instruct"
+architecture = "llama"
+parameters = "8B"
+tokenizer = "unsloth/Meta-Llama-3.1-8B-Instruct"
+
+    [models.llama-3-1-8b.gguf_files]
+    Q8_0 = { repo = "mradermacher/Meta-Llama-3.1-8B-Instruct-GGUF", file = "Meta-Llama-3.1-8B-Instruct.Q8_0.gguf" }
+    F16  = { repo = "mradermacher/Meta-Llama-3.1-8B-Instruct-GGUF", file = "Meta-Llama-3.1-8B-Instruct.f16.gguf" }
+
+
+[models.qwen2-5-7b]
+display_name = "Qwen2.5 7B Instruct"
+architecture = "qwen2"
+parameters = "7B"
+tokenizer = "Qwen/Qwen2.5-7B-Instruct"
+
+    [models.qwen2-5-7b.gguf_files]
+    Q8_0 = { repo = "bartowski/Qwen2.5-7B-Instruct-GGUF", file = "Qwen2.5-7B-Instruct-Q8_0.gguf" }
+    Q4_0 = { repo = "bartowski/Qwen2.5-7B-Instruct-GGUF", file = "Qwen2.5-7B-Instruct-Q4_0.gguf" }
+
+
+[models.qwen2-5-14b]
+display_name = "Qwen2.5 14B Instruct"
+architecture = "qwen2"
+parameters = "14B"
+tokenizer = "Qwen/Qwen2.5-14B-Instruct"
+
+    [models.qwen2-5-14b.gguf_files]
+    Q8_0 = { repo = "bartowski/Qwen2.5-14B-Instruct-GGUF", file = "Qwen2.5-14B-Instruct-Q8_0.gguf" }
+    Q4_0 = { repo = "bartowski/Qwen2.5-14B-Instruct-GGUF", file = "Qwen2.5-14B-Instruct-Q4_0.gguf" }
+
+
+[models.mistral-7b-v0-3]
+display_name = "Mistral 7B Instruct v0.3"
+architecture = "mistral"
+parameters = "7B"
+tokenizer = "mistralai/Mistral-7B-Instruct-v0.3"
+
+    [models.mistral-7b-v0-3.gguf_files]
+    Q8_0 = { repo = "bartowski/Mistral-7B-Instruct-v0.3-GGUF", file = "Mistral-7B-Instruct-v0.3-Q8_0.gguf" }
+
+
+[models.qwen2-5-3b]
+display_name = "Qwen2.5 3B Instruct"
+architecture = "qwen2"
+parameters = "3B"
+tokenizer = "Qwen/Qwen2.5-3B-Instruct"
+
+    [models.qwen2-5-3b.gguf_files]
+    Q8_0 = { repo = "bartowski/Qwen2.5-3B-Instruct-GGUF", file = "Qwen2.5-3B-Instruct-Q8_0.gguf" }
+    Q4_0 = { repo = "bartowski/Qwen2.5-3B-Instruct-GGUF", file = "Qwen2.5-3B-Instruct-Q4_0.gguf" }
+    F16  = { repo = "bartowski/Qwen2.5-3B-Instruct-GGUF", file = "Qwen2.5-3B-Instruct-f16.gguf" }
+
+
+[models.qwen3-5-9b]
+display_name = "Qwen3.5 9B"
+architecture = "qwen35"
+parameters = "9B"
+tokenizer = "Qwen/Qwen3.5-9B"
+
+    [models.qwen3-5-9b.gguf_files]
+    Q8_0 = { repo = "bartowski/Qwen_Qwen3.5-9B-GGUF", file = "Qwen_Qwen3.5-9B-Q8_0.gguf" }

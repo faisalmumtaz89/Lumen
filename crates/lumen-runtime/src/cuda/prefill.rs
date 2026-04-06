@@ -101,10 +101,6 @@ pub(crate) struct GdnPrefillScratch {
     pub alpha_raw: CudaSlice<f32>,
     /// Batched beta raw projection: [batch, num_heads].
     pub beta_raw: CudaSlice<f32>,
-    /// Fused alpha+beta raw projection: [batch, 2*num_heads].
-    /// First num_heads columns = alpha, last num_heads columns = beta.
-    /// Used when ssm_alpha_beta fused weight is available.
-    pub alpha_beta_raw: CudaSlice<f32>,
     /// Batched gate projection: [batch, value_dim].
     pub gate: CudaSlice<f32>,
     /// Batched GDN output (per-token gated output): [batch, value_dim].
@@ -131,7 +127,6 @@ pub(crate) fn alloc_gdn_prefill_scratch(
         qkv: device.alloc_zeros(batch * qkv_dim)?,
         alpha_raw: device.alloc_zeros(batch * num_heads)?,
         beta_raw: device.alloc_zeros(batch * num_heads)?,
-        alpha_beta_raw: device.alloc_zeros(batch * 2 * num_heads)?,
         gate: device.alloc_zeros(batch * value_dim)?,
         gdn_out: device.alloc_zeros(batch * value_dim)?,
         conv_out: device.alloc_zeros(batch * qkv_dim)?,
@@ -912,9 +907,13 @@ pub(crate) unsafe fn launch_rope_batched(
     num_kv_heads: usize,
     head_dim: usize,
     theta: f32,
+    rope_neox: bool,
+    rotary_dim: u32,
 ) -> Result<(), RuntimeError> {
-    let half_dim = head_dim / 2;
-    let total_q_pairs = num_q_heads * half_dim;
+    // For partial RoPE (rotary_dim > 0), only rotate first rotary_dim dims per head.
+    let actual_rot = if rotary_dim > 0 && (rotary_dim as usize) < head_dim { rotary_dim as usize } else { head_dim };
+    let half_rot = actual_rot / 2;
+    let total_q_pairs = num_q_heads * half_rot;
     let total_work = batch * total_q_pairs;
     let config = LaunchConfig::for_elements(total_work);
     let launch_cfg = CudarcLaunchConfig {
@@ -928,9 +927,14 @@ pub(crate) unsafe fn launch_rope_batched(
     let nkvh = num_kv_heads as u32;
     let hd = head_dim as u32;
 
+    let rope_fn = if rope_neox {
+        &kernels.rope_apply_batched_neox
+    } else {
+        &kernels.rope_apply_batched
+    };
     device
         .stream
-        .launch_builder(&kernels.rope_apply_batched)
+        .launch_builder(rope_fn)
         .arg(&mut *q)
         .arg(&mut *k)
         .arg(&pos_start_u32)
@@ -939,6 +943,7 @@ pub(crate) unsafe fn launch_rope_batched(
         .arg(&nkvh)
         .arg(&hd)
         .arg(&theta)
+        .arg(&rotary_dim)
         .launch(launch_cfg)
         .map_err(|e| RuntimeError::Compute(format!("rope_apply_batched launch: {e}")))?;
     Ok(())
@@ -2002,117 +2007,3 @@ unsafe fn launch_cublas_hgemm(
     Ok(())
 }
 
-/// HGEMM projection using pre-converted F16 activations (no F32->F16 conversion needed).
-///
-/// This is used when the activation is already in F16 format (e.g., from fused_rmsnorm_f16_batched).
-/// Skips the F32->F16 conversion step entirely, saving one kernel dispatch per projection.
-///
-/// # Safety
-///
-/// `activation_f16` must already contain valid F16 data for [batch, in_dim].
-/// `weight_f16` must be [out_dim, in_dim] F16. `output` must be [batch, out_dim] F32.
-pub(crate) unsafe fn launch_hgemm_with_f16_input(
-    device: &CudaDevice,
-    weight_f16: &CudaSlice<u8>,
-    activation_f16: &CudaSlice<u8>,
-    output: &mut CudaSlice<f32>,
-    batch: usize,
-    out_dim: usize,
-    in_dim: usize,
-    label: &str,
-) -> Result<(), RuntimeError> {
-    launch_cublas_hgemm(
-        device, weight_f16, activation_f16, output,
-        out_dim, batch, in_dim, 0.0, label,
-    )
-}
-
-/// Batched fused RMSNorm -> F16 output.
-///
-/// Replaces the two-dispatch sequence: rmsnorm_batched + f32_to_f16_vec.
-/// Each threadblock handles one row of the [batch, dim] input matrix.
-///
-/// # Safety
-///
-/// `x` must be [batch, dim] F32. `weight` must be [dim] F32. `out_f16` must be [batch * dim * 2] bytes.
-pub(crate) unsafe fn launch_fused_rmsnorm_f16_batched(
-    device: &CudaDevice,
-    kernels: &super::decode::KernelSet,
-    x: &CudaSlice<f32>,
-    weight: &CudaSlice<f32>,
-    out_f16: &mut CudaSlice<u8>,
-    eps: f32,
-    batch: usize,
-    dim: usize,
-) -> Result<(), RuntimeError> {
-    let func = kernels.fused_rmsnorm_f16_batched.as_ref()
-        .ok_or_else(|| RuntimeError::Compute(
-            "fused_rmsnorm_f16_batched kernel not available".into()
-        ))?;
-
-    let block_size = rmsnorm_block_size(dim);
-    let shared_bytes = rmsnorm_shared_bytes(block_size);
-    let launch_cfg = CudarcLaunchConfig {
-        grid_dim: (batch as u32, 1, 1),
-        block_dim: (block_size, 1, 1),
-        shared_mem_bytes: shared_bytes,
-    };
-    let dim_u32 = dim as u32;
-    device
-        .stream
-        .launch_builder(func)
-        .arg(x)
-        .arg(weight)
-        .arg(out_f16)
-        .arg(&eps)
-        .arg(&dim_u32)
-        .launch(launch_cfg)
-        .map_err(|e| RuntimeError::Compute(format!(
-            "fused_rmsnorm_f16_batched launch: {e}"
-        )))?;
-    Ok(())
-}
-
-/// Batched fused SwiGLU -> F16 output.
-///
-/// Replaces the two-dispatch sequence: swiglu_batched + f32_to_f16_vec.
-/// Computes SwiGLU and writes both F32 (in-place to gate) and F16 (to out_f16).
-///
-/// # Safety
-///
-/// `gate` and `up` must be [batch * inter_dim] F32. `out_f16` must be [batch * inter_dim * 2] bytes.
-pub(crate) unsafe fn launch_fused_swiglu_f16_batched(
-    device: &CudaDevice,
-    kernels: &super::decode::KernelSet,
-    gate: &mut CudaSlice<f32>,
-    up: &CudaSlice<f32>,
-    out_f16: &mut CudaSlice<u8>,
-    batch: usize,
-    inter_dim: usize,
-) -> Result<(), RuntimeError> {
-    let func = kernels.swiglu_f32_to_f16_batched.as_ref()
-        .ok_or_else(|| RuntimeError::Compute(
-            "swiglu_f32_to_f16_batched kernel not available".into()
-        ))?;
-
-    let total = (batch * inter_dim) as u32;
-    let block_size = 256u32;
-    let grid_size = (total + block_size - 1) / block_size;
-    let launch_cfg = CudarcLaunchConfig {
-        grid_dim: (grid_size, 1, 1),
-        block_dim: (block_size, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    device
-        .stream
-        .launch_builder(func)
-        .arg(gate)
-        .arg(up)
-        .arg(out_f16)
-        .arg(&total)
-        .launch(launch_cfg)
-        .map_err(|e| RuntimeError::Compute(format!(
-            "swiglu_f32_to_f16_batched launch: {e}"
-        )))?;
-    Ok(())
-}

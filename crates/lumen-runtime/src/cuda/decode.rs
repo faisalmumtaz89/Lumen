@@ -15,10 +15,13 @@ use cudarc::driver::CudaFunction;
 pub(crate) struct KernelSet {
     // Normalization
     pub(crate) rmsnorm: CudaFunction,
+    #[allow(dead_code)] // Compiled but not yet dispatched; kept for per-head norm path.
     pub(crate) rmsnorm_per_head: CudaFunction,
 
-    // F32 matrix-vector multiply
+    // F32 matrix-vector multiply (superseded by fused_norm_matvec_f32; kept for fallback).
+    #[allow(dead_code)]
     pub(crate) matvec_f32: CudaFunction,
+    #[allow(dead_code)]
     pub(crate) matvec_f32_residual: CudaFunction,
 
     // F16 matrix-vector multiply (custom NVRTC kernel, fallback for non-cuBLAS path)
@@ -30,6 +33,7 @@ pub(crate) struct KernelSet {
     // Vectorized F32->F16: 4 elements/thread with float4 loads + uint2 stores.
     // Used in prefill GEMM where conversion sizes are large and aligned.
     pub(crate) f32_to_f16_vec4: Option<CudaFunction>,
+    #[allow(dead_code)] // Compiled but superseded by in-kernel F16 reads; kept for fallback.
     pub(crate) f16_to_f32_vec: CudaFunction,
 
     // Q8_0 matrix-vector multiply (on-the-fly dequantization)
@@ -54,8 +58,10 @@ pub(crate) struct KernelSet {
     // Multi-head attention
     pub(crate) attention_decode: CudaFunction,
 
-    // Tiled GEMM for batched prefill
+    // Tiled GEMM for batched prefill (superseded by cuBLAS HGEMM; kept for fallback).
+    #[allow(dead_code)]
     pub(crate) gemm_f32: CudaFunction,
+    #[allow(dead_code)]
     pub(crate) gemm_f32_residual: CudaFunction,
 
     // Fused RMSNorm + MatVec (two-pass: rms_scale scalar + inline norm)
@@ -70,6 +76,10 @@ pub(crate) struct KernelSet {
     pub(crate) embed_batch_q4_0: CudaFunction,
     pub(crate) rmsnorm_batched: CudaFunction,
     pub(crate) rope_apply_batched: CudaFunction,
+    pub(crate) rope_apply_neox: CudaFunction,
+    pub(crate) rope_apply_batched_neox: CudaFunction,
+    pub(crate) bias_add_batched: CudaFunction,
+    pub(crate) bias_add: CudaFunction,
     pub(crate) kv_cache_write_batch: CudaFunction,
     pub(crate) swiglu_batched: CudaFunction,
     pub(crate) residual_add_batched: CudaFunction,
@@ -94,7 +104,10 @@ pub(crate) struct KernelSet {
 
     // Q8_0 native warp-cooperative: scalar dequant+FMA, no x-quantization.
     // 2 warps per row, deferred reduction. Reads 1.0625 bytes/elem.
+    // Superseded by dp4a/HGEMV paths; kept for fallback.
+    #[allow(dead_code)]
     pub(crate) matvec_q8_0_native: Option<CudaFunction>,
+    #[allow(dead_code)]
     pub(crate) matvec_q8_0_native_residual: Option<CudaFunction>,
 
     // Q8_0 aligned dp4a kernels: 36-byte blocks with 4-byte-aligned quant data.
@@ -176,20 +189,24 @@ pub(crate) struct KernelSet {
     // fused_residual_rmsnorm_f32: Residual add + RMSNorm (F32 output) in one kernel.
     // For Q8_0/Q4_0 inter-layer: fuses residual_add_copy + rmsnorm.
     // Saves 1 dispatch per inter-layer boundary (47 fewer for 48-layer models).
+    #[allow(dead_code)] // Compiled but not yet wired into dispatch; kept for future inter-layer fusion.
     pub(crate) fused_residual_rmsnorm_f32: Option<CudaFunction>,
     // fused_residual_rms_scale: Residual add + compute_rms_scale (scalar output).
     // For fused_glu_gemv inter-layer: fuses residual_add_copy + compute_rms_scale.
     // Saves 1 dispatch per inter-layer boundary.
+    #[allow(dead_code)] // Compiled but not yet wired into dispatch; kept for future inter-layer fusion.
     pub(crate) fused_residual_rms_scale: Option<CudaFunction>,
 
     // Fused F16 prefill kernels (dispatch count reduction for F16 HGEMM path).
     // fused_rmsnorm_f16_batched: Batched RMSNorm + F32->F16 output.
     // Replaces rmsnorm_batched + f32_to_f16_vec at 2 sites/layer (attn_norm, ffn_norm).
     // Saves 64 dispatches per prefill on 32-layer models.
+    #[allow(dead_code)] // Compiled but launch wrapper removed; kept for future prefill fusion.
     pub(crate) fused_rmsnorm_f16_batched: Option<CudaFunction>,
     // swiglu_f32_to_f16_batched: Batched SwiGLU + F32->F16 output.
     // Replaces swiglu_batched + f32_to_f16_vec at 1 site/layer (FFN).
     // Saves 32 dispatches per prefill on 32-layer models.
+    #[allow(dead_code)] // Compiled but launch wrapper removed; kept for future prefill fusion.
     pub(crate) swiglu_f32_to_f16_batched: Option<CudaFunction>,
 
     // Q8_0 dequant-in-register HGEMV: F16 x-vector in shmem, NR=4.
@@ -257,9 +274,11 @@ pub(crate) struct KernelSet {
     // Eliminates separate quantize_f32_to_q8_1 dispatch for down projection.
     // matvec_q8_aligned_f32: reads F32 (from fused_glu output), quantizes inline, dp4a.
     pub(crate) matvec_q8_aligned_f32: Option<CudaFunction>,
+    #[allow(dead_code)] // Compiled but not yet dispatched; kept for residual fusion path.
     pub(crate) matvec_q8_aligned_f32_residual: Option<CudaFunction>,
     // matvec_q8_aligned_f32_swiglu: fuses SwiGLU + quantize + dp4a (3 dispatches -> 1).
     pub(crate) matvec_q8_aligned_f32_swiglu: Option<CudaFunction>,
+    #[allow(dead_code)] // Compiled but not yet dispatched; kept for residual fusion path.
     pub(crate) matvec_q8_aligned_f32_swiglu_residual: Option<CudaFunction>,
 
     // Fused down projection for Q4Aligned: inline F32->Q8_1 quantize + dp4a.
@@ -267,9 +286,11 @@ pub(crate) struct KernelSet {
     // __byte_perm nibble unpack, zero-point correction).
     // matvec_q4_aligned_f32: reads F32, quantizes inline, dp4a against Q4Aligned.
     pub(crate) matvec_q4_aligned_f32: Option<CudaFunction>,
+    #[allow(dead_code)] // Compiled but not yet dispatched; kept for residual fusion path.
     pub(crate) matvec_q4_aligned_f32_residual: Option<CudaFunction>,
     // matvec_q4_aligned_f32_swiglu: fuses SwiGLU + quantize + dp4a (3 dispatches -> 1).
     pub(crate) matvec_q4_aligned_f32_swiglu: Option<CudaFunction>,
+    #[allow(dead_code)] // Compiled but not yet dispatched; kept for residual fusion path.
     pub(crate) matvec_q4_aligned_f32_swiglu_residual: Option<CudaFunction>,
 
     // Fused RMSNorm + Q8_1 quantization (dispatch count reduction for Q8_0 dp4a path).
@@ -364,6 +385,10 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         embed_batch_q4_0: load_fn(shaders::PREFILL_EMBED_KERNEL_SOURCE, "embed_batch_q4_0")?,
         rmsnorm_batched: load_fn(shaders::PREFILL_KERNEL_SOURCE, "rmsnorm_batched")?,
         rope_apply_batched: load_fn(shaders::PREFILL_KERNEL_SOURCE, "rope_apply_batched")?,
+        rope_apply_neox: load_fn(shaders::ROPE_KERNEL_SOURCE, "rope_apply_neox")?,
+        rope_apply_batched_neox: load_fn(shaders::PREFILL_KERNEL_SOURCE, "rope_apply_batched_neox")?,
+        bias_add_batched: load_fn(shaders::PREFILL_KERNEL_SOURCE, "bias_add_batched")?,
+        bias_add: load_fn(shaders::PREFILL_KERNEL_SOURCE, "bias_add")?,
         kv_cache_write_batch: load_fn(
             shaders::PREFILL_KERNEL_SOURCE,
             "kv_cache_write_batch",
@@ -881,22 +906,6 @@ pub(crate) fn attention_block_size(seq_len: usize) -> u32 {
 /// Block size for fused norm+matvec F32: 256 threads (matches FUSED_BLOCK_SIZE define).
 pub(crate) fn fused_norm_matvec_block_size() -> u32 {
     256
-}
-
-/// GEMM tile dimensions (must match gemm_f32.cu defines).
-pub(crate) const GEMM_TILE_M: u32 = 32;
-pub(crate) const GEMM_TILE_N: u32 = 32;
-
-/// GEMM block dimensions: 32x32 threads per block (one thread per output element in a tile).
-pub(crate) fn gemm_block_dim() -> (u32, u32) {
-    (GEMM_TILE_N, GEMM_TILE_M) // (x=col, y=row)
-}
-
-/// GEMM grid dimensions for an M x N output.
-pub(crate) fn gemm_grid_dim(m: usize, n: usize) -> (u32, u32) {
-    let grid_x = (n as u32).div_ceil(GEMM_TILE_N);
-    let grid_y = (m as u32).div_ceil(GEMM_TILE_M);
-    (grid_x, grid_y)
 }
 
 // ------------------------------------------------------------------

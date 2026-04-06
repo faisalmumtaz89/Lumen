@@ -102,6 +102,17 @@ pub(crate) fn append_tensor_to_blob_requant<R: Read + Seek>(
             &data, tensor.ggml_type, tensor.n_elements(), tensor_name,
         )?;
         blob.extend_from_slice(&f32_data);
+    } else if tensor.ggml_type == crate::gguf::GgmlType::Q4_1 {
+        // Q4_1 has no dedicated GPU kernel (neither Metal nor CUDA).
+        // Requantize to Q4_0: dequant Q4_1 -> F32 -> quantize Q4_0.
+        let f32_data = dequantize_to_f32_bytes(
+            &data, tensor.ggml_type, tensor.n_elements(), tensor_name,
+        )?;
+        let n_elems = tensor.n_elements() as usize;
+        let q4_data = quantize_f32_to_q4_0(&f32_data, n_elems);
+        eprintln!("    Requantized Q4_1 -> Q4_0: {tensor_name} ({} -> {} bytes)",
+            data.len(), q4_data.len());
+        blob.extend_from_slice(&q4_data);
     } else {
         blob.extend_from_slice(&data);
     }

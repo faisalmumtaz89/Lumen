@@ -252,7 +252,7 @@ fn parse_hyperparams(c: &mut Cursor<'_>) -> Result<ModelHyperparams, FormatError
     let max_seq_len = c.read_u32()?;
 
     let has_rope = c.read_u8()? != 0;
-    let rope_params = if has_rope {
+    let (rope_params, rope_neox, rotary_dim_raw) = if has_rope {
         let theta = c.read_f32()?;
         let scaling_factor = c.read_f32()?;
         let scaling_type = match c.read_u8()? {
@@ -262,16 +262,20 @@ fn parse_hyperparams(c: &mut Cursor<'_>) -> Result<ModelHyperparams, FormatError
             3 => RopeScalingType::Yarn,
             other => return Err(FormatError::InvalidRopeScalingType(other)),
         };
-        c.skip(2)?; // padding
-        Some(RopeParams {
+        // rope_neox: NeoX half-split RoPE for Qwen2/Qwen3.5.
+        // Backward compatible: old files had 0x00 padding here (= false).
+        let rope_neox = c.read_u8()? != 0;
+        // rotary_dim as u8: 0 = full head_dim, N = partial.
+        let rotary_dim_u8 = c.read_u8()?;
+        (Some(RopeParams {
             theta,
             scaling_factor,
             scaling_type,
-        })
+        }), rope_neox, rotary_dim_u8)
     } else {
-        // Must match present-path size: theta(4) + scaling_factor(4) + type(1) + padding(2) = 11
+        // Must match present-path size: theta(4) + scaling_factor(4) + type(1) + rope_neox(1) + rotary_dim(1) = 11
         c.skip(11)?;
-        None
+        (None, false, 0u8)
     };
 
     let num_experts_raw = c.read_u32()?;
@@ -291,6 +295,8 @@ fn parse_hyperparams(c: &mut Cursor<'_>) -> Result<ModelHyperparams, FormatError
         num_experts: if num_experts_raw > 0 { Some(num_experts_raw) } else { None },
         num_active_experts: if num_active_raw > 0 { Some(num_active_raw) } else { None },
         norm_eps,
+        rotary_dim: if rotary_dim_raw > 0 { Some(rotary_dim_raw as u32) } else { None },
+        rope_neox,
     })
 }
 
@@ -526,6 +532,8 @@ mod tests {
             num_experts: None,
             num_active_experts: None,
             norm_eps: 1e-5,
+            rotary_dim: None,
+            rope_neox: false,
         };
         let qd = QuantizationDescriptor {
             scheme: QuantScheme::F32,
@@ -650,6 +658,8 @@ mod tests {
             num_experts: Some(4),
             num_active_experts: Some(2),
             norm_eps: 1e-5,
+            rotary_dim: None,
+            rope_neox: false,
         };
         let qd = QuantizationDescriptor {
             scheme: QuantScheme::F32,

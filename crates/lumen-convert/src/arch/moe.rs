@@ -84,6 +84,18 @@ fn compute_layer_shape_moe(
             };
             *blob_offset += size;
             Ok(slice)
+        } else if tensor.ggml_type == crate::gguf::GgmlType::Q4_1 {
+            // Q4_1 has no dedicated GPU kernel -- requantize to Q4_0.
+            let n_elements = tensor.n_elements();
+            assert!(n_elements % 32 == 0, "Q4_1->Q4_0 requires elements divisible by 32, got {n_elements} for {name}");
+            let size = ((n_elements as usize / 32) * 18) as u64;
+            let slice = TensorSlice {
+                offset: *blob_offset,
+                length: size,
+                quant: QuantScheme::Q4_0,
+            };
+            *blob_offset += size;
+            Ok(slice)
         } else {
             let quant = tensor
                 .ggml_type

@@ -658,6 +658,7 @@ mod tests {
             num_experts: None,
             num_active_experts: None,
             norm_eps: 1e-6,
+            rotary_dim: None, rope_neox: false,
         };
         let p = GdnParams::from_hyperparams(&hp);
         assert_eq!(p.num_kv_heads, 16);

@@ -26,6 +26,13 @@ pub struct ModelHyperparams {
     pub num_active_experts: Option<u32>,
     /// Typically 1e-5 or 1e-6.
     pub norm_eps: f32,
+    /// Number of dimensions to apply rotary embedding to per head.
+    /// `None` = full `head_dim` (default for most models).
+    /// `Some(n)` = partial RoPE, only rotate first `n` dims (e.g. Qwen3.5: 64 of 256).
+    pub rotary_dim: Option<u32>,
+    /// NeoX-style (half-split) RoPE: pairs at (d, d+half_rot) instead of interleaved (2d, 2d+1).
+    /// True for Qwen2, Qwen3.5 architectures. False for Llama, Mistral.
+    pub rope_neox: bool,
 }
 
 /// RoPE (Rotary Position Embedding) configuration.

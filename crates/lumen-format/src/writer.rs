@@ -241,11 +241,15 @@ fn serialize_hyperparams(buf: &mut Vec<u8>, hp: &ModelHyperparams) {
                 RopeScalingType::Ntk => 2,
                 RopeScalingType::Yarn => 3,
             });
-            buf.extend_from_slice(&[0u8; 2]); // padding
+            // rope_neox: NeoX half-split RoPE for Qwen2/Qwen3.5.
+            buf.push(if hp.rope_neox { 1u8 } else { 0u8 });
+            // rotary_dim as u8: 0 = full head_dim, N = partial.
+            let rotary_dim_u8 = hp.rotary_dim.unwrap_or(0).min(255) as u8;
+            buf.push(rotary_dim_u8);
         }
         None => {
             buf.push(0);
-            // Must match present-path size: theta(4) + scaling_factor(4) + type(1) + padding(2) = 11
+            // Must match present-path size: theta(4) + scaling_factor(4) + type(1) + rope_neox(1) + rotary_dim(1) = 11
             buf.extend_from_slice(&[0u8; 11]);
         }
     }
@@ -439,6 +443,8 @@ mod tests {
             num_experts: None,
             num_active_experts: None,
             norm_eps: 1e-5,
+            rotary_dim: None,
+            rope_neox: false,
         };
         let qd = QuantizationDescriptor {
             scheme: QuantScheme::F32,

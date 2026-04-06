@@ -504,9 +504,16 @@ extern "C" __global__ void flash_attention_wmma(
         }
         __syncthreads();
 
-        // Step 3c: Convert P to F16 for tensor core PV multiply
+        // Step 3c: Convert P to F16 for tensor core PV multiply.
+        // Zero padding rows beyond num_q_rows to prevent NaN propagation
+        // through tensor core MMA (which always computes full 16-row tiles).
         for (unsigned int i = tid; i < FA_TC_BR * FA_TC_BC; i += blockDim.x) {
-            P_sh[i] = f32_to_f16(S_sh[i]);
+            unsigned int r = i / FA_TC_BC;
+            if (r < num_q_rows) {
+                P_sh[i] = f32_to_f16(S_sh[i]);
+            } else {
+                P_sh[i] = (half_raw)0;
+            }
         }
         __syncthreads();
 

@@ -29,7 +29,7 @@
 //   bytes [0..1]:   f16 scale (d)
 //   bytes [2..3]:   padding (alignment)
 //   bytes [4..19]:  16 bytes of packed nibble pairs
-//     byte[i] (i=0..15): lo_nibble = element[2*i], hi_nibble = element[2*i+1]
+//     De-interleaved: elements 0-15 = lo nibbles, elements 16-31 = hi nibbles
 //   Dequantized value: scale * (nibble - 8)
 //
 // dp4a dot product for Q4Aligned x inline-Q8_1:
@@ -72,16 +72,16 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
-// Unpack 4 nibble bytes (packed in an int32) into 2 dp4a-compatible int32 words.
-// Uses __byte_perm (PRMT instruction) for register-level byte rearrangement.
-// 7 ops vs ~43 ops in the scalar version.
-__device__ __forceinline__ void unpack_nibbles_4bytes(unsigned int packed, int &out0, int &out1) {
+// Unpack 4 nibble bytes for GGML de-interleaved Q4_0 layout.
+// Lo nibble of byte i = element i; hi nibble = element i+16.
+// out_lo = {b0.lo, b1.lo, b2.lo, b3.lo} (unsigned 0-15)
+// out_hi = {b0.hi, b1.hi, b2.hi, b3.hi} (unsigned 0-15)
+// Zero-point correction handled in accumulation formula.
+__device__ __forceinline__ void unpack_nibbles_4bytes_deinterleaved(unsigned int packed, int &out_lo, int &out_hi) {
     unsigned int lo = packed & 0x0F0F0F0Fu;
     unsigned int hi = (packed >> 4) & 0x0F0F0F0Fu;
-    unsigned int interleaved0 = __byte_perm(lo, hi, 0x5140);
-    unsigned int interleaved1 = __byte_perm(lo, hi, 0x7362);
-    out0 = (int)(interleaved0 - 0x08080808u);
-    out1 = (int)(interleaved1 - 0x08080808u);
+    out_lo = (int)lo;
+    out_hi = (int)hi;
 }
 
 // Inline F32->Q8_1 quantization + dp4a against Q4Aligned weight rows.
@@ -154,15 +154,15 @@ __device__ __forceinline__ void fused_q4a_dp4a_block(
         // Aligned int* loads for nibble data (4-byte aligned at +4).
         const unsigned int* w_nibbles = (const unsigned int*)(w_block + 4);
 
-        // Unpack + dp4a.
+        // De-interleaved unpack + dp4a.
         int acc = 0;
         #pragma unroll
         for (int k = 0; k < 4; k++) {
             unsigned int packed = w_nibbles[k];
-            int w0, w1;
-            unpack_nibbles_4bytes(packed, w0, w1);
-            acc = __dp4a(w0, xv[2 * k],     acc);
-            acc = __dp4a(w1, xv[2 * k + 1], acc);
+            int w_lo, w_hi;
+            unpack_nibbles_4bytes_deinterleaved(packed, w_lo, w_hi);
+            acc = __dp4a(w_lo, xv[k],     acc);
+            acc = __dp4a(w_hi, xv[k + 4], acc);
         }
 
         // Combined result with zero-point correction:

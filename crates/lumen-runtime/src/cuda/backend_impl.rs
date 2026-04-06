@@ -1121,10 +1121,38 @@ impl CudaBackend {
             }
         }
 
+        // QKV bias (Qwen2-family, decode).
+        if lw.bq.is_some() || lw.bk.is_some() || lw.bv.is_some() {
+            let block = 256u32;
+            unsafe {
+                if let Some(ref bq) = lw.bq {
+                    let d = q_dim as u32; let g = (d + block - 1) / block;
+                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.q).arg(bq).arg(&d)
+                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
+                        .map_err(|e| RuntimeError::Compute(format!("bias_add bq decode: {e}")))?;
+                }
+                if let Some(ref bk) = lw.bk {
+                    let d = kv_dim as u32; let g = (d + block - 1) / block;
+                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.k).arg(bk).arg(&d)
+                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
+                        .map_err(|e| RuntimeError::Compute(format!("bias_add bk decode: {e}")))?;
+                }
+                if let Some(ref bv) = lw.bv {
+                    let d = kv_dim as u32; let g = (d + block - 1) / block;
+                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.v).arg(bv).arg(&d)
+                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
+                        .map_err(|e| RuntimeError::Compute(format!("bias_add bv decode: {e}")))?;
+                }
+            }
+        }
+
         // 2. RoPE.
         {
-            let total_q_pairs = num_heads * (head_dim / 2);
-            let total_k_pairs = num_kv_heads * (head_dim / 2);
+            let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
+            let actual_rot = if rotary_dim > 0 && rotary_dim < head_dim as u32 { rotary_dim as usize } else { head_dim };
+            let half_rot = actual_rot / 2;
+            let total_q_pairs = num_heads * half_rot;
+            let total_k_pairs = num_kv_heads * half_rot;
             let max_pairs = total_q_pairs.max(total_k_pairs);
             let config = LaunchConfig::for_elements(max_pairs);
             let launch_cfg = CudarcLaunchConfig {
@@ -1136,10 +1164,18 @@ impl CudaBackend {
             let nqh = num_heads as u32;
             let nkvh = num_kv_heads as u32;
             let hd = head_dim as u32;
+            // NeoX RoPE: models with partial rotary_dim (e.g. Qwen3.5) use half-offset
+            // dimension pairing instead of standard interleaved pairing.
+            let rope_neox = hp.rope_neox;
+            let rope_fn = if rope_neox {
+                &st.kernels.rope_apply_neox
+            } else {
+                &st.kernels.rope_apply
+            };
             unsafe {
                 self.device
                     .stream
-                    .launch_builder(&st.kernels.rope_apply)
+                    .launch_builder(rope_fn)
                     .arg(&mut st.scratch.q)
                     .arg(&mut st.scratch.k)
                     .arg(&pos)
@@ -1147,7 +1183,7 @@ impl CudaBackend {
                     .arg(&nkvh)
                     .arg(&hd)
                     .arg(&theta)
-                    .arg(&0u32) // rotary_dim: 0 = full head_dim (Llama/Qwen2.5 default)
+                    .arg(&rotary_dim)
                     .launch(launch_cfg)
             }
             .map_err(|e| RuntimeError::Compute(format!("rope launch: {e}")))?;
@@ -3556,6 +3592,32 @@ impl CudaBackend {
             }
         }
 
+        // QKV bias (Qwen2-family, graph decode).
+        let lw = &st.layer_weights_cache[layer_idx];
+        if lw.bq.is_some() || lw.bk.is_some() || lw.bv.is_some() {
+            let block = 256u32;
+            unsafe {
+                if let Some(ref bq) = lw.bq {
+                    let d = q_dim as u32; let g = (d + block - 1) / block;
+                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.q).arg(bq).arg(&d)
+                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
+                        .map_err(|e| RuntimeError::Compute(format!("bias_add bq graph: {e}")))?;
+                }
+                if let Some(ref bk) = lw.bk {
+                    let d = kv_dim as u32; let g = (d + block - 1) / block;
+                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.k).arg(bk).arg(&d)
+                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
+                        .map_err(|e| RuntimeError::Compute(format!("bias_add bk graph: {e}")))?;
+                }
+                if let Some(ref bv) = lw.bv {
+                    let d = kv_dim as u32; let g = (d + block - 1) / block;
+                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.v).arg(bv).arg(&d)
+                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
+                        .map_err(|e| RuntimeError::Compute(format!("bias_add bv graph: {e}")))?;
+                }
+            }
+        }
+
         // Steps 2+3: Fused RoPE + KV cache write -- GRAPH VARIANT.
         // Single kernel applies RoPE to Q and K, then writes K and V to cache.
         // Saves 2 dispatches/layer vs separate rope_apply + 2x kv_cache_write.
@@ -3568,17 +3630,27 @@ impl CudaBackend {
             let nkv = kvc.num_kv_heads as u32;
             let msl = kvc.max_seq_len as u32;
             let hd = kvc.head_dim as u32;
-            let half_dim = head_dim / 2;
-            let total_q_pairs = num_heads * half_dim;
-            let total_k_pairs = num_kv_heads * half_dim;
+            let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
+            let actual_rot = if rotary_dim > 0 && rotary_dim < head_dim as u32 { rotary_dim as usize } else { head_dim };
+            let half_rot = actual_rot / 2;
+            let total_q_pairs = num_heads * half_rot;
+            let total_k_pairs = num_kv_heads * half_rot;
             let max_pairs = total_q_pairs.max(total_k_pairs);
             let config = LaunchConfig::for_elements(max_pairs);
             let lc = CudarcLaunchConfig { grid_dim: (config.grid_dim,1,1), block_dim: (config.block_dim,1,1), shared_mem_bytes: 0 };
-            unsafe { self.device.stream.launch_builder(&gk.rope_kv_write)
+            // NeoX RoPE: models with partial rotary_dim use half-offset dimension pairing.
+            let rope_neox = hp.rope_neox;
+            let rope_kv_fn = if rope_neox {
+                &gk.rope_kv_write_neox
+            } else {
+                &gk.rope_kv_write
+            };
+            unsafe { self.device.stream.launch_builder(rope_kv_fn)
                 .arg(&mut st.scratch.q).arg(&mut st.scratch.k).arg(&st.scratch.v)
                 .arg(&mut kvc.k_cache).arg(&mut kvc.v_cache)
                 .arg(&pos_ptr)
                 .arg(&(num_heads as u32)).arg(&nkv).arg(&hd).arg(&msl).arg(&theta)
+                .arg(&rotary_dim)
                 .launch(lc) }
             .map_err(|e| RuntimeError::Compute(format!("graph rope_kv_write L{layer_idx}: {e}")))?;
         }
@@ -5997,46 +6069,6 @@ unsafe fn launch_hgemv_f16_residual(
     Ok(())
 }
 
-/// Convert an F32 GPU buffer to F16 in a pre-allocated scratch buffer.
-///
-/// Launches the `f32_to_f16_vec` kernel to convert `num_elements` values from
-/// `input_f32` into `output_f16` (which must have at least `num_elements * 2` bytes).
-///
-/// This is the first half of the split HGEMV pattern: convert once, then call
-/// `launch_hgemv_f16_preconverted` multiple times with the cached F16 buffer.
-///
-/// # Safety
-///
-/// `input_f32` must have at least `num_elements` f32 values.
-/// `output_f16` must have at least `num_elements * 2` bytes.
-unsafe fn convert_f32_to_f16(
-    device: &CudaDevice,
-    kernels: &KernelSet,
-    input_f32: &CudaSlice<f32>,
-    output_f16: &mut CudaSlice<u8>,
-    num_elements: usize,
-) -> Result<(), RuntimeError> {
-    let n = num_elements as u32;
-    let block = 256u32;
-    let grid = (n + block - 1) / block;
-    let cvt_cfg = CudarcLaunchConfig {
-        grid_dim: (grid, 1, 1),
-        block_dim: (block, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    device
-        .stream
-        .launch_builder(&kernels.f32_to_f16_vec)
-        .arg(input_f32)
-        .arg(output_f16)
-        .arg(&n)
-        .launch(cvt_cfg)
-        .map_err(|e| RuntimeError::Compute(format!(
-            "convert_f32_to_f16 ({num_elements} elems): {e}",
-        )))?;
-    Ok(())
-}
-
 /// Fused RMSNorm + F32->F16 conversion in a single kernel dispatch.
 ///
 /// Replaces the two-dispatch sequence: `rmsnorm` (F32 out) + `f32_to_f16_vec`.
@@ -6145,7 +6177,7 @@ unsafe fn launch_swiglu_f32_to_f16(
 
 /// cuBLAS HGEMV with pre-converted F16 input (no F32->F16 conversion).
 ///
-/// The caller must have already converted the input to F16 via `convert_f32_to_f16`.
+/// The caller must have already converted the input to F16 (e.g., via `f32_to_f16_vec`).
 /// This function only issues the `cublasGemmEx` call with N=1 (GEMV).
 ///
 /// # Safety
@@ -7169,6 +7201,24 @@ impl ComputeBackend for CudaBackend {
             &fresh_weights
         };
 
+        // GDN layer routing: delegate to compute_layer_gpu which has full GDN support.
+        // GDN layers have zero-sentinel wk/wv/wo — the standard attention path would fail.
+        if lw.layer_type == 1 {
+            if layer_idx >= st.layer_weights_cache.len() {
+                return Err(RuntimeError::Compute(
+                    "GDN layers require GPU-resident weights (call preload_weights first)".into()
+                ));
+            }
+            // Upload x to GPU, run GPU-resident compute, download result.
+            let x_f32 = x.as_f32_slice();
+            self.device.htod_copy_into(x_f32, &mut st.scratch.x_gpu)?;
+            self.compute_layer_gpu(layer_idx, seq_pos, st)?;
+            self.device.synchronize()?;
+            let result = self.device.dtoh_copy(&st.scratch.x_gpu)?;
+            x.write_f32_from(&result);
+            return Ok(());
+        }
+
         // 1. Upload x (activation) to GPU.
         let x_f32 = x.as_f32_slice();
         self.device.htod_copy_into(x_f32, &mut st.scratch.x_gpu)?;
@@ -7285,10 +7335,38 @@ impl ComputeBackend for CudaBackend {
             }
         }
 
+        // QKV bias (Qwen2-family, streaming decode).
+        if lw.bq.is_some() || lw.bk.is_some() || lw.bv.is_some() {
+            let block = 256u32;
+            unsafe {
+                if let Some(ref bq) = lw.bq {
+                    let d = q_dim as u32; let g = (d + block - 1) / block;
+                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.q).arg(bq).arg(&d)
+                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
+                        .map_err(|e| RuntimeError::Compute(format!("bias_add bq streaming: {e}")))?;
+                }
+                if let Some(ref bk) = lw.bk {
+                    let d = kv_dim as u32; let g = (d + block - 1) / block;
+                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.k).arg(bk).arg(&d)
+                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
+                        .map_err(|e| RuntimeError::Compute(format!("bias_add bk streaming: {e}")))?;
+                }
+                if let Some(ref bv) = lw.bv {
+                    let d = kv_dim as u32; let g = (d + block - 1) / block;
+                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.v).arg(bv).arg(&d)
+                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
+                        .map_err(|e| RuntimeError::Compute(format!("bias_add bv streaming: {e}")))?;
+                }
+            }
+        }
+
         // 4. RoPE: apply rotary position embeddings to q and k.
         {
-            let total_q_pairs = num_heads * (head_dim / 2);
-            let total_k_pairs = num_kv_heads * (head_dim / 2);
+            let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
+            let actual_rot = if rotary_dim > 0 && rotary_dim < head_dim as u32 { rotary_dim as usize } else { head_dim };
+            let half_rot = actual_rot / 2;
+            let total_q_pairs = num_heads * half_rot;
+            let total_k_pairs = num_kv_heads * half_rot;
             let max_pairs = total_q_pairs.max(total_k_pairs);
             let config = LaunchConfig::for_elements(max_pairs);
             let launch_cfg = CudarcLaunchConfig {
@@ -7300,12 +7378,19 @@ impl ComputeBackend for CudaBackend {
             let nqh = num_heads as u32;
             let nkvh = num_kv_heads as u32;
             let hd = head_dim as u32;
+            // NeoX RoPE: models with partial rotary_dim use half-offset dimension pairing.
+            let rope_neox = hp.rope_neox;
+            let rope_fn = if rope_neox {
+                &st.kernels.rope_apply_neox
+            } else {
+                &st.kernels.rope_apply
+            };
             // SAFETY: q has num_heads * head_dim elements, k has num_kv_heads * head_dim
             // elements. The kernel processes pairs within these bounds.
             unsafe {
                 self.device
                     .stream
-                    .launch_builder(&st.kernels.rope_apply)
+                    .launch_builder(rope_fn)
                     .arg(&mut st.scratch.q)
                     .arg(&mut st.scratch.k)
                     .arg(&pos)
@@ -7313,7 +7398,7 @@ impl ComputeBackend for CudaBackend {
                     .arg(&nkvh)
                     .arg(&hd)
                     .arg(&theta)
-                    .arg(&0u32) // rotary_dim: 0 = full head_dim (Llama/Qwen2.5 default)
+                    .arg(&rotary_dim)
                     .launch(launch_cfg)
             }
             .map_err(|e| RuntimeError::Compute(format!("rope launch: {e}")))?;
@@ -7875,12 +7960,27 @@ impl ComputeBackend for CudaBackend {
     }
 
     fn caps(&self) -> BackendCaps {
+        let is_preloaded = self.state.lock().unwrap()
+            .as_ref()
+            .map(|st| !st.layer_weights_cache.is_empty())
+            .unwrap_or(false);
         BackendCaps {
-            batched_prefill: true,
-            gpu_resident: true,
+            // Standard models use per-token prefill for exact decode precision match.
+            // GDN models (Qwen3.5) REQUIRE batched prefill because per-token is
+            // too slow with host round-trips per GDN layer. The batched prefill
+            // has its own GDN routing (prefill_gdn_layer) and uses F32 SGEMM
+            // for standard attention layers.
+            batched_prefill: {
+                let has_gdn = self.state.lock().unwrap()
+                    .as_ref()
+                    .map(|st| st.layer_weights_cache.iter().any(|lw| lw.layer_type == 1))
+                    .unwrap_or(false);
+                is_preloaded && has_gdn
+            },
+            gpu_resident: is_preloaded,
             gdn: true,
             moe: false,
-            gpu_argmax: true,
+            gpu_argmax: false,
         }
     }
 
@@ -8029,123 +8129,83 @@ impl ComputeBackend for CudaBackend {
 
             // ---- STANDARD ATTENTION LAYER ----
 
-            // Detect if this layer has HGEMM-eligible weights (F16 cache or native F16).
-            // When true, use fused RMSNorm->F16 + direct HGEMM (skip F32->F16 conversion).
-            let has_attn_f16 = lw.wq_f16.is_some()
-                || matches!(lw.wq, super::gpu_buffers::GpuWeightBuf::F16Raw(_));
-            let has_ffn_f16 = lw.w_gate_f16.is_some()
-                || matches!(lw.w_gate, super::gpu_buffers::GpuWeightBuf::F16Raw(_));
-            let has_down_f16 = lw.w_down_f16.is_some()
-                || matches!(lw.w_down, super::gpu_buffers::GpuWeightBuf::F16Raw(_));
+            // 2a. Batched RMSNorm for QKV projections (always F32 path for precision).
+            unsafe {
+                super::prefill::launch_rmsnorm_batched(
+                    &self.device, &st.kernels,
+                    &pf.x, &lw.attn_norm, &mut pf.normed,
+                    eps, batch, hidden_dim,
+                )?;
+            }
 
-            // 2a. Batched RMSNorm for QKV projections.
-            // When all QKV weights are F16, use fused RMSNorm->F16 to skip separate conversion.
-            if has_attn_f16 && st.kernels.fused_rmsnorm_f16_batched.is_some() {
-                // Fused path: RMSNorm + F32->F16 in one kernel -> activation_f16.
-                // Saves 3 f32_to_f16_vec launches (wq, wk, wv share the same normed input).
+            // 2b. Batched QKV projections via GEMM (no F16 caches for precision match).
+            unsafe {
+                super::prefill::launch_gemm_projection(
+                    &self.device, &st.kernels, &lw.wq, None,
+                    &pf.normed, &mut pf.q,
+                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &mut pf.dequant_f16,
+                    batch, q_dim, hidden_dim, "wq",
+                )?;
+                super::prefill::launch_gemm_projection(
+                    &self.device, &st.kernels, &lw.wk, None,
+                    &pf.normed, &mut pf.k,
+                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &mut pf.dequant_f16,
+                    batch, kv_dim, hidden_dim, "wk",
+                )?;
+                super::prefill::launch_gemm_projection(
+                    &self.device, &st.kernels, &lw.wv, None,
+                    &pf.normed, &mut pf.v,
+                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &mut pf.dequant_f16,
+                    batch, kv_dim, hidden_dim, "wv",
+                )?;
+            }
+
+            // QKV bias (Qwen2-family, prefill).
+            if lw.bq.is_some() || lw.bk.is_some() || lw.bv.is_some() {
+                let block = 256u32;
                 unsafe {
-                    super::prefill::launch_fused_rmsnorm_f16_batched(
-                        &self.device, &st.kernels,
-                        &pf.x, &lw.attn_norm, &mut pf.activation_f16,
-                        eps, batch, hidden_dim,
-                    )?;
-                }
-
-                // 2b. QKV projections: HGEMM directly from F16 activation (no conversion needed).
-                unsafe {
-                    let wq_f16 = lw.wq_f16.as_ref()
-                        .or(match &lw.wq { super::gpu_buffers::GpuWeightBuf::F16Raw(w) => Some(w), _ => None });
-                    let wk_f16 = lw.wk_f16.as_ref()
-                        .or(match &lw.wk { super::gpu_buffers::GpuWeightBuf::F16Raw(w) => Some(w), _ => None });
-                    let wv_f16 = lw.wv_f16.as_ref()
-                        .or(match &lw.wv { super::gpu_buffers::GpuWeightBuf::F16Raw(w) => Some(w), _ => None });
-
-                    if let Some(w_f16) = wq_f16 {
-                        super::prefill::launch_hgemm_with_f16_input(
-                            &self.device, w_f16, &pf.activation_f16, &mut pf.q,
-                            batch, q_dim, hidden_dim, "wq",
-                        )?;
-                    } else {
-                        super::prefill::launch_gemm_projection(
-                            &self.device, &st.kernels, &lw.wq, None,
-                            &pf.normed, &mut pf.q,
-                            &mut pf.dequant_f32, &mut pf.activation_f16,
-                            &mut pf.dequant_f16,
-                            batch, q_dim, hidden_dim, "wq",
-                        )?;
+                    if let Some(ref bq) = lw.bq {
+                        let total = (batch * q_dim) as u32;
+                        let dim_u32 = q_dim as u32;
+                        let g = (total + block - 1) / block;
+                        self.device.stream.launch_builder(&st.kernels.bias_add_batched)
+                            .arg(&mut pf.q).arg(bq).arg(&total).arg(&dim_u32)
+                            .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
+                            .map_err(|e| RuntimeError::Compute(format!("bias_add_batched bq prefill: {e}")))?;
                     }
-                    if let Some(w_f16) = wk_f16 {
-                        super::prefill::launch_hgemm_with_f16_input(
-                            &self.device, w_f16, &pf.activation_f16, &mut pf.k,
-                            batch, kv_dim, hidden_dim, "wk",
-                        )?;
-                    } else {
-                        super::prefill::launch_gemm_projection(
-                            &self.device, &st.kernels, &lw.wk, None,
-                            &pf.normed, &mut pf.k,
-                            &mut pf.dequant_f32, &mut pf.activation_f16,
-                            &mut pf.dequant_f16,
-                            batch, kv_dim, hidden_dim, "wk",
-                        )?;
+                    if let Some(ref bk) = lw.bk {
+                        let total = (batch * kv_dim) as u32;
+                        let dim_u32 = kv_dim as u32;
+                        let g = (total + block - 1) / block;
+                        self.device.stream.launch_builder(&st.kernels.bias_add_batched)
+                            .arg(&mut pf.k).arg(bk).arg(&total).arg(&dim_u32)
+                            .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
+                            .map_err(|e| RuntimeError::Compute(format!("bias_add_batched bk prefill: {e}")))?;
                     }
-                    if let Some(w_f16) = wv_f16 {
-                        super::prefill::launch_hgemm_with_f16_input(
-                            &self.device, w_f16, &pf.activation_f16, &mut pf.v,
-                            batch, kv_dim, hidden_dim, "wv",
-                        )?;
-                    } else {
-                        super::prefill::launch_gemm_projection(
-                            &self.device, &st.kernels, &lw.wv, None,
-                            &pf.normed, &mut pf.v,
-                            &mut pf.dequant_f32, &mut pf.activation_f16,
-                            &mut pf.dequant_f16,
-                            batch, kv_dim, hidden_dim, "wv",
-                        )?;
+                    if let Some(ref bv) = lw.bv {
+                        let total = (batch * kv_dim) as u32;
+                        let dim_u32 = kv_dim as u32;
+                        let g = (total + block - 1) / block;
+                        self.device.stream.launch_builder(&st.kernels.bias_add_batched)
+                            .arg(&mut pf.v).arg(bv).arg(&total).arg(&dim_u32)
+                            .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
+                            .map_err(|e| RuntimeError::Compute(format!("bias_add_batched bv prefill: {e}")))?;
                     }
-                }
-            } else {
-                // Standard path: RMSNorm to F32, then each projection does its own conversion.
-                unsafe {
-                    super::prefill::launch_rmsnorm_batched(
-                        &self.device, &st.kernels,
-                        &pf.x, &lw.attn_norm, &mut pf.normed,
-                        eps, batch, hidden_dim,
-                    )?;
-                }
-
-                // 2b. Batched QKV projections via GEMM (HGEMM if F16 cache available).
-                unsafe {
-                    super::prefill::launch_gemm_projection(
-                        &self.device, &st.kernels, &lw.wq, lw.wq_f16.as_ref(),
-                        &pf.normed, &mut pf.q,
-                        &mut pf.dequant_f32, &mut pf.activation_f16,
-                        &mut pf.dequant_f16,
-                        batch, q_dim, hidden_dim, "wq",
-                    )?;
-                    super::prefill::launch_gemm_projection(
-                        &self.device, &st.kernels, &lw.wk, lw.wk_f16.as_ref(),
-                        &pf.normed, &mut pf.k,
-                        &mut pf.dequant_f32, &mut pf.activation_f16,
-                        &mut pf.dequant_f16,
-                        batch, kv_dim, hidden_dim, "wk",
-                    )?;
-                    super::prefill::launch_gemm_projection(
-                        &self.device, &st.kernels, &lw.wv, lw.wv_f16.as_ref(),
-                        &pf.normed, &mut pf.v,
-                        &mut pf.dequant_f32, &mut pf.activation_f16,
-                        &mut pf.dequant_f16,
-                        batch, kv_dim, hidden_dim, "wv",
-                    )?;
                 }
             }
 
             // 2c. Batched RoPE with per-token positions.
+            let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
             unsafe {
                 super::prefill::launch_rope_batched(
                     &self.device, &st.kernels,
                     &mut pf.q, &mut pf.k,
                     pos_start, batch,
                     num_heads, num_kv_heads, head_dim, theta,
+                    hp.rope_neox, rotary_dim,
                 )?;
             }
 
@@ -8191,10 +8251,10 @@ impl ComputeBackend for CudaBackend {
                 }
             }
 
-            // 2f. Batched output projection + residual via GEMM (HGEMM if available).
+            // 2f. Batched output projection + residual via GEMM (no F16 caches).
             unsafe {
                 super::prefill::launch_gemm_residual(
-                    &self.device, &st.kernels, &lw.wo, lw.wo_f16.as_ref(),
+                    &self.device, &st.kernels, &lw.wo, None,
                     &pf.attn_out, &pf.x, &mut pf.attn_proj,
                     &mut pf.dequant_f32, &mut pf.activation_f16,
                     &mut pf.dequant_f16,
@@ -8202,130 +8262,46 @@ impl ComputeBackend for CudaBackend {
                 )?;
             }
 
-            // 2g. FFN: batched RMSNorm + GEMM gate/up.
-            // When FFN weights are F16, use fused RMSNorm->F16 to skip conversion.
-            if has_ffn_f16 && st.kernels.fused_rmsnorm_f16_batched.is_some() {
-                // Fused path: RMSNorm + F32->F16 in one kernel.
-                // Saves 2 f32_to_f16_vec launches (gate and up share the same normed input).
-                unsafe {
-                    super::prefill::launch_fused_rmsnorm_f16_batched(
-                        &self.device, &st.kernels,
-                        &pf.attn_proj, &lw.ffn_norm, &mut pf.activation_f16,
-                        eps, batch, hidden_dim,
-                    )?;
-                }
-
-                unsafe {
-                    let wg_f16 = lw.w_gate_f16.as_ref()
-                        .or(match &lw.w_gate { super::gpu_buffers::GpuWeightBuf::F16Raw(w) => Some(w), _ => None });
-                    let wu_f16 = lw.w_up_f16.as_ref()
-                        .or(match &lw.w_up { super::gpu_buffers::GpuWeightBuf::F16Raw(w) => Some(w), _ => None });
-
-                    if let Some(w_f16) = wg_f16 {
-                        super::prefill::launch_hgemm_with_f16_input(
-                            &self.device, w_f16, &pf.activation_f16, &mut pf.gate,
-                            batch, inter_dim, hidden_dim, "gate",
-                        )?;
-                    } else {
-                        super::prefill::launch_gemm_projection(
-                            &self.device, &st.kernels, &lw.w_gate, None,
-                            &pf.normed, &mut pf.gate,
-                            &mut pf.dequant_f32, &mut pf.activation_f16,
-                            &mut pf.dequant_f16,
-                            batch, inter_dim, hidden_dim, "gate",
-                        )?;
-                    }
-                    if let Some(w_f16) = wu_f16 {
-                        super::prefill::launch_hgemm_with_f16_input(
-                            &self.device, w_f16, &pf.activation_f16, &mut pf.up,
-                            batch, inter_dim, hidden_dim, "up",
-                        )?;
-                    } else {
-                        super::prefill::launch_gemm_projection(
-                            &self.device, &st.kernels, &lw.w_up, None,
-                            &pf.normed, &mut pf.up,
-                            &mut pf.dequant_f32, &mut pf.activation_f16,
-                            &mut pf.dequant_f16,
-                            batch, inter_dim, hidden_dim, "up",
-                        )?;
-                    }
-                }
-            } else {
-                // Standard path: RMSNorm to F32, each projection handles its own conversion.
-                unsafe {
-                    super::prefill::launch_rmsnorm_batched(
-                        &self.device, &st.kernels,
-                        &pf.attn_proj, &lw.ffn_norm, &mut pf.normed,
-                        eps, batch, hidden_dim,
-                    )?;
-                    super::prefill::launch_gemm_projection(
-                        &self.device, &st.kernels, &lw.w_gate, lw.w_gate_f16.as_ref(),
-                        &pf.normed, &mut pf.gate,
-                        &mut pf.dequant_f32, &mut pf.activation_f16,
-                        &mut pf.dequant_f16,
-                        batch, inter_dim, hidden_dim, "gate",
-                    )?;
-                    super::prefill::launch_gemm_projection(
-                        &self.device, &st.kernels, &lw.w_up, lw.w_up_f16.as_ref(),
-                        &pf.normed, &mut pf.up,
-                        &mut pf.dequant_f32, &mut pf.activation_f16,
-                        &mut pf.dequant_f16,
-                        batch, inter_dim, hidden_dim, "up",
-                    )?;
-                }
+            // 2g. FFN: batched RMSNorm + GEMM gate/up (always F32 path for precision).
+            unsafe {
+                super::prefill::launch_rmsnorm_batched(
+                    &self.device, &st.kernels,
+                    &pf.attn_proj, &lw.ffn_norm, &mut pf.normed,
+                    eps, batch, hidden_dim,
+                )?;
+                super::prefill::launch_gemm_projection(
+                    &self.device, &st.kernels, &lw.w_gate, None,
+                    &pf.normed, &mut pf.gate,
+                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &mut pf.dequant_f16,
+                    batch, inter_dim, hidden_dim, "gate",
+                )?;
+                super::prefill::launch_gemm_projection(
+                    &self.device, &st.kernels, &lw.w_up, None,
+                    &pf.normed, &mut pf.up,
+                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &mut pf.dequant_f16,
+                    batch, inter_dim, hidden_dim, "up",
+                )?;
             }
 
-            // 2h. Batched SwiGLU + optional F16 fusion for down projection.
-            if has_down_f16 && st.kernels.swiglu_f32_to_f16_batched.is_some() {
-                // Fused path: SwiGLU + F32->F16 in one kernel.
-                // Saves 1 f32_to_f16_vec launch before down projection.
-                unsafe {
-                    super::prefill::launch_fused_swiglu_f16_batched(
-                        &self.device, &st.kernels,
-                        &mut pf.gate, &pf.up, &mut pf.activation_f16,
-                        batch, inter_dim,
-                    )?;
-                }
+            // 2h. Batched SwiGLU (standard path, no F16 fusion).
+            unsafe {
+                super::prefill::launch_swiglu_batched(
+                    &self.device, &st.kernels,
+                    &mut pf.gate, &pf.up, batch, inter_dim,
+                )?;
+            }
 
-                // 2i. Down projection HGEMM directly from F16 SwiGLU output.
-                unsafe {
-                    let wd_f16 = lw.w_down_f16.as_ref()
-                        .or(match &lw.w_down { super::gpu_buffers::GpuWeightBuf::F16Raw(w) => Some(w), _ => None });
-
-                    if let Some(w_f16) = wd_f16 {
-                        super::prefill::launch_hgemm_with_f16_input(
-                            &self.device, w_f16, &pf.activation_f16, &mut pf.down,
-                            batch, hidden_dim, inter_dim, "down",
-                        )?;
-                    } else {
-                        super::prefill::launch_gemm_projection(
-                            &self.device, &st.kernels, &lw.w_down, None,
-                            &pf.gate, &mut pf.down,
-                            &mut pf.dequant_f32, &mut pf.activation_f16,
-                            &mut pf.dequant_f16,
-                            batch, hidden_dim, inter_dim, "down",
-                        )?;
-                    }
-                }
-            } else {
-                // Standard path: separate SwiGLU + down projection with conversion.
-                unsafe {
-                    super::prefill::launch_swiglu_batched(
-                        &self.device, &st.kernels,
-                        &mut pf.gate, &pf.up, batch, inter_dim,
-                    )?;
-                }
-
-                // 2i. Batched down projection via GEMM (HGEMM if F16 cache available).
-                unsafe {
-                    super::prefill::launch_gemm_projection(
-                        &self.device, &st.kernels, &lw.w_down, lw.w_down_f16.as_ref(),
-                        &pf.gate, &mut pf.down,
-                        &mut pf.dequant_f32, &mut pf.activation_f16,
-                        &mut pf.dequant_f16,
-                        batch, hidden_dim, inter_dim, "down",
-                    )?;
-                }
+            // 2i. Batched down projection via GEMM (no F16 caches).
+            unsafe {
+                super::prefill::launch_gemm_projection(
+                    &self.device, &st.kernels, &lw.w_down, None,
+                    &pf.gate, &mut pf.down,
+                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &mut pf.dequant_f16,
+                    batch, hidden_dim, inter_dim, "down",
+                )?;
             }
 
             // 2j. Batched residual add: x = attn_proj + down.
@@ -8420,7 +8396,7 @@ impl ComputeBackend for CudaBackend {
 
         // Tile ssm_norm from [head_dim] to [value_dim] for GDN layers.
         // This allows the standard rmsnorm kernel to be used on the [value_dim] output.
-        let gdn_params = super::gdn::GdnParams::from_hyperparams(&hp_copy);
+        let _gdn_params = super::gdn::GdnParams::from_hyperparams(&hp_copy);
         for layer in cache.iter_mut() {
             if layer.layer_type == 1 {
                 // Read ssm_norm from the layer's subtensors (it's [head_dim] F32).

@@ -87,6 +87,21 @@ fn append_stacked_expert_slice<R: Read + Seek>(
         reader.read_exact(&mut buf)?;
         let f32_data = dequantize_to_f32_bytes(&buf, tensor.ggml_type, expert_elements, tensor_name)?;
         blob.extend_from_slice(&f32_data);
+    } else if tensor.ggml_type == GgmlType::Q4_1 {
+        // Q4_1 has no dedicated GPU kernel -- requantize to Q4_0.
+        let total_size = tensor.byte_size().ok_or_else(|| ConvertError::UnsupportedTensorType {
+            tensor: tensor_name.to_string(),
+            ggml_type: format!("{:?} (unknown block geometry)", tensor.ggml_type),
+        })?;
+        let expert_byte_size = total_size / num_experts;
+        let expert_offset = base_offset + (expert_idx as u64) * expert_byte_size;
+        reader.seek(SeekFrom::Start(expert_offset))?;
+        let mut buf = vec![0u8; expert_byte_size as usize];
+        reader.read_exact(&mut buf)?;
+        let f32_data = dequantize_to_f32_bytes(&buf, tensor.ggml_type, expert_elements, tensor_name)?;
+        let n_elems = expert_elements as usize;
+        let q4_data = quantize_f32_to_q4_0(&f32_data, n_elems);
+        blob.extend_from_slice(&q4_data);
     } else {
         let total_size = tensor.byte_size().ok_or_else(|| ConvertError::UnsupportedTensorType {
             tensor: tensor_name.to_string(),
@@ -121,6 +136,14 @@ fn compute_stacked_slice(
         let expert_elements = tensor.n_elements() / num_experts;
         let size = expert_elements * 4;
         let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::F32 };
+        *blob_offset += size;
+        Ok(slice)
+    } else if tensor.ggml_type == GgmlType::Q4_1 {
+        // Q4_1 has no dedicated GPU kernel -- requantize to Q4_0.
+        let expert_elements = tensor.n_elements() / num_experts;
+        assert!(expert_elements % 32 == 0, "Q4_1->Q4_0 requires elements divisible by 32, got {expert_elements}");
+        let size = ((expert_elements as usize / 32) * 18) as u64;
+        let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::Q4_0 };
         *blob_offset += size;
         Ok(slice)
     } else {
@@ -177,6 +200,14 @@ fn compute_layer_shape_qwen35moe(
             let n_elements = tensor.n_elements();
             let size = n_elements * 4;
             let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::F32 };
+            *blob_offset += size;
+            Ok(slice)
+        } else if tensor.ggml_type == GgmlType::Q4_1 {
+            // Q4_1 has no dedicated GPU kernel -- requantize to Q4_0.
+            let n_elements = tensor.n_elements();
+            assert!(n_elements % 32 == 0, "Q4_1->Q4_0 requires elements divisible by 32, got {n_elements}");
+            let size = ((n_elements as usize / 32) * 18) as u64;
+            let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::Q4_0 };
             *blob_offset += size;
             Ok(slice)
         } else {
