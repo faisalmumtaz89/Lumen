@@ -75,7 +75,7 @@ pub(crate) struct MetalPipelines {
     pub(crate) dequant_matmul_q8_0_residual_4row: MetalPipelineState,
     pub(crate) dequant_matmul_q8_0_8row: MetalPipelineState,
     pub(crate) dequant_matmul_q8_0_residual_8row: MetalPipelineState,
-    // Deferred-reduction decode kernels (llama.cpp NQ=8 pattern, 2 sync points vs 64)
+    // Deferred-reduction decode kernels (NR=2 pattern, 2 sync points vs 64)
     pub(crate) dequant_matmul_q8_0_deferred: MetalPipelineState,
     pub(crate) dequant_matmul_q8_0_deferred_residual: MetalPipelineState,
     pub(crate) dequant_matmul_q8_0_deferred_bias: MetalPipelineState,
@@ -83,7 +83,7 @@ pub(crate) struct MetalPipelines {
     pub(crate) dequant_matmul_q8_0_deferred_nr2: MetalPipelineState,
     pub(crate) dequant_matmul_q8_0_deferred_residual_nr2: MetalPipelineState,
     pub(crate) dequant_matmul_q8_0_deferred_bias_nr2: MetalPipelineState,
-    // MLX-style 2-SG independent row ownership (zero barriers, zero shmem)
+    // 2-SG independent row ownership (zero barriers, zero shmem)
     pub(crate) dequant_matmul_q8_0_2sg: MetalPipelineState,
     pub(crate) dequant_matmul_q8_0_2sg_residual: MetalPipelineState,
     pub(crate) ffn_fused_gate_up_swiglu_q8_0_2sg: MetalPipelineState,
@@ -605,8 +605,11 @@ pub(crate) struct MetalScratch {
     // Qwen3.5-MoE scratch
     // ====================================================================
 
-    /// True when the model is detected as Qwen3.5-MoE (hybrid attention + shared expert).
-    pub(crate) is_qwen35moe: bool,
+    /// RoPE theta value from hyperparams. Used for RoPE table recomputation in gpu_resident.
+    pub(crate) rope_theta: f64,
+    /// True when the model uses NeoX-style half-split RoPE (e.g. Qwen2, Qwen3.5).
+    /// Set from hp.rope_neox in init(). Used for all RoPE dispatch site selection.
+    pub(crate) rope_neox: bool,
     /// Effective rotary dimension (partial RoPE). Equals head_dim for standard models,
     /// head_dim/4 for Qwen3.5-MoE (partial_rotary_factor=0.25).
     pub(crate) rotary_dim: usize,

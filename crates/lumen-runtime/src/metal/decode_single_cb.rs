@@ -97,13 +97,24 @@ impl MetalF32Backend {
         // guarantee completion ordering: each dispatch finishes before the next
         // begins, making memory_barrier_with_scope calls unnecessary (skipped
         // for serial via the all_dense flag to reduce CPU-side encoding cost).
-        // GDN/MoE models keep the concurrent encoder for overlap of independent
-        // small dispatches.
+        // MoE-only models (no GDN) keep the concurrent encoder for overlap.
+        // GDN models use serial encoder for deterministic recurrent state (see below).
         let all_dense = s.cached_layer_meta.iter().all(|m| {
             m.gdn_layer_idx.is_none() && m.moe_meta.is_none()
         });
-        let needs_barriers = !all_dense;
-        let mut enc = if all_dense {
+        // GDN models MUST use a serial encoder for deterministic decode.
+        // The GDN h_state recurrence accumulates floating-point values across
+        // ALL tokens. With a concurrent encoder, Metal's non-deterministic
+        // dispatch ordering introduces slight numerical variations in parallel
+        // reductions (simd_sum, threadgroup partial sums). These variations
+        // accumulate in h_state across tokens, causing the model to diverge
+        // from the correct output after a few decode steps.
+        // Dense models (no GDN, no MoE) already use serial for other reasons.
+        // MoE-only models (no GDN) can safely use concurrent since MoE FFN
+        // routing is stateless between tokens.
+        let has_gdn = s.cached_layer_meta.iter().any(|m| m.gdn_layer_idx.is_some());
+        let needs_barriers = !all_dense && !has_gdn;
+        let mut enc = if all_dense || has_gdn {
             cmd.new_compute_encoder().ok_or_else(|| {
                 RuntimeError::Compute("Failed to create serial encoder".into())
             })?
@@ -537,7 +548,7 @@ impl MetalF32Backend {
 
                 // Fused RoPE + KV cache write + MHA (eliminates 2 barriers per layer)
                 // Only for: standard RoPE (not NeoX), short sequences, full rotary_dim
-                let use_fused_rope_kv_mha = use_fused_rope_kv && !s.is_qwen35moe && new_seq_len < FLASH_DECODE_THRESHOLD;
+                let use_fused_rope_kv_mha = use_fused_rope_kv && !s.rope_neox && new_seq_len < FLASH_DECODE_THRESHOLD;
 
                 if use_fused_rope_kv_mha {
                     // Single dispatch: RoPE Q/K + KV cache write + MHA
@@ -576,7 +587,7 @@ impl MetalF32Backend {
                 let use_fused_rope_kv = !is_linear_attn && s.rotary_dim == head_dim;
                 if use_fused_rope_kv {
                     let pos_offset_u32 = (seq_pos * rope_half_dim) as u32;
-                    let fused_pipe = if s.is_qwen35moe {
+                    let fused_pipe = if s.rope_neox {
                         pipelines.fused_rope_neox_kv_write.as_ref().unwrap_or(&pipelines.fused_rope_kv_write)
                     } else {
                         &pipelines.fused_rope_kv_write
@@ -606,7 +617,7 @@ impl MetalF32Backend {
                 } else {
                     if !is_linear_attn {
                         let pos_offset_u32 = (seq_pos * rope_half_dim) as u32;
-                        let rope_pipe = if s.is_qwen35moe {
+                        let rope_pipe = if s.rope_neox {
                             pipelines.rope_neox.as_ref().unwrap_or(&pipelines.rope)
                         } else {
                             &pipelines.rope
@@ -1053,10 +1064,16 @@ impl MetalF32Backend {
                             &cmd, pipelines, s, layer_buf, meta,
                         )?;
                     }
-                    // Re-create concurrent encoder for remaining layers
-                    enc = cmd.new_concurrent_compute_encoder().ok_or_else(|| {
-                        RuntimeError::Compute("Failed to re-create concurrent encoder".into())
-                    })?;
+                    // Re-create encoder for remaining layers (serial for GDN, concurrent for MoE-only)
+                    enc = if has_gdn {
+                        cmd.new_compute_encoder().ok_or_else(|| {
+                            RuntimeError::Compute("Failed to re-create serial encoder".into())
+                        })?
+                    } else {
+                        cmd.new_concurrent_compute_encoder().ok_or_else(|| {
+                            RuntimeError::Compute("Failed to re-create concurrent encoder".into())
+                        })?
+                    };
                     continue; // encoder already ended, skip end_encoding below
                 }
             } else {

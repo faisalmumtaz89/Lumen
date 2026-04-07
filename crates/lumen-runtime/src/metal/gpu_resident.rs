@@ -291,8 +291,9 @@ impl MetalF32Backend {
             // MoE variant (Qwen3.5-35B-A3B) also has MoE routing.
             // Dense variant (Qwen3.5-9B) has layer_types but no MoE.
             if has_layer_types {
-                // All Qwen3.5 variants (MoE and dense) use NeoX-style RoPE
-                s.is_qwen35moe = true;
+                // All Qwen3.5 variants (MoE and dense) use NeoX-style RoPE.
+                // rope_neox is already set from hyperparams in init(); this is defensive.
+                s.rope_neox = true;
                 if has_moe {
                     // Shared expert intermediate dimension
                     s.shared_expert_inter_dim = s.inter_dim;
@@ -322,10 +323,10 @@ impl MetalF32Backend {
                     })?);
                 }
 
-                // Recompute RoPE cos/sin tables for partial rotation with Qwen3.5 theta.
-                // Qwen3.5 uses rope_theta = 10_000_000 (10M) and partial rotation.
+                // Recompute RoPE cos/sin tables for partial rotation.
+                // theta is sourced from hyperparams (stored in MetalScratch during init).
                 let rotary_half_dim = s.rotary_dim / 2;
-                let theta: f64 = 10_000_000.0;
+                let theta: f64 = s.rope_theta;
                 let max_seq = s.max_seq_len;
                 let mut cos_table = vec![0.0f32; max_seq * rotary_half_dim];
                 let mut sin_table = vec![0.0f32; max_seq * rotary_half_dim];

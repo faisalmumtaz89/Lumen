@@ -97,16 +97,18 @@ impl ComputeBackend for MetalF32Backend {
         // (same as dense inter_dim for uniform-expert architectures like Mixtral).
         let moe_expert_inter_dim = if moe_num_experts > 0 { inter_dim } else { 0 };
 
-        // Pre-compute RoPE tables and upload to GPU
-        let theta = hyperparams.rope_params.as_ref().map(|r| r.theta).unwrap_or(10000.0);
+        // Pre-compute RoPE tables and upload to GPU (f64 precision for intermediate math,
+        // stored as f32. Matches the Qwen3.5 path in gpu_resident.rs and avoids accumulated
+        // f32 powf rounding error that causes degeneration on high-theta models like Llama 3.1.)
+        let theta: f64 = hyperparams.rope_params.as_ref().map(|r| r.theta as f64).unwrap_or(10000.0);
         let mut rope_cos = vec![0.0f32; max_seq_len * half_dim];
         let mut rope_sin = vec![0.0f32; max_seq_len * half_dim];
         for pos in 0..max_seq_len {
             for i in 0..half_dim {
-                let freq = 1.0 / theta.powf((2 * i) as f32 / head_dim as f32);
-                let angle = pos as f32 * freq;
-                rope_cos[pos * half_dim + i] = angle.cos();
-                rope_sin[pos * half_dim + i] = angle.sin();
+                let freq = 1.0 / theta.powf((2 * i) as f64 / head_dim as f64);
+                let angle = pos as f64 * freq;
+                rope_cos[pos * half_dim + i] = angle.cos() as f32;
+                rope_sin[pos * half_dim + i] = angle.sin() as f32;
             }
         }
 
@@ -292,7 +294,8 @@ impl ComputeBackend for MetalF32Backend {
 
             // Qwen3.5-MoE scratch: defaults for non-hybrid models.
             // Overridden in preload_weights_gpu_resident when hybrid model is detected.
-            is_qwen35moe: false,
+            rope_theta: hyperparams.rope_params.as_ref().map(|r| r.theta as f64).unwrap_or(10000.0),
+            rope_neox: hyperparams.rope_neox,
             rotary_dim: head_dim,
             shared_expert_inter_dim: 0,
             shared_expert_gate_buf: None,
@@ -983,7 +986,7 @@ impl ComputeBackend for MetalF32Backend {
                 RuntimeError::Compute("Failed to create encoder for partial RoPE".into())
             })?;
             let pos_offset_u32 = (seq_pos * rope_half_dim) as u32;
-            let rope_pipe = if s.is_qwen35moe {
+            let rope_pipe = if s.rope_neox {
                 pipelines.rope_neox.as_ref().unwrap_or(&pipelines.rope)
             } else {
                 &pipelines.rope
@@ -1033,7 +1036,7 @@ impl ComputeBackend for MetalF32Backend {
                 RuntimeError::Compute("Failed to create encoder".into())
             })?;
             let pos_offset_u32 = (seq_pos * half_dim) as u32;
-            let fused_pipe = if s.is_qwen35moe {
+            let fused_pipe = if s.rope_neox {
                 pipelines.fused_rope_neox_kv_write.as_ref().unwrap_or(&pipelines.fused_rope_kv_write)
             } else {
                 &pipelines.fused_rope_kv_write

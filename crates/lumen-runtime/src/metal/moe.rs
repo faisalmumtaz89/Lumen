@@ -1981,7 +1981,7 @@ impl MetalF32Backend {
                     RuntimeError::Compute("Failed to create encoder".into())
                 })?;
                 let pos_offset_u32 = (seq_pos * rope_half_dim) as u32;
-                let fused_pipe = if s.is_qwen35moe {
+                let fused_pipe = if s.rope_neox {
                     pipelines.fused_rope_neox_kv_write.as_ref().unwrap_or(&pipelines.fused_rope_kv_write)
                 } else {
                     &pipelines.fused_rope_kv_write
@@ -2015,7 +2015,7 @@ impl MetalF32Backend {
                         RuntimeError::Compute("Failed to create encoder".into())
                     })?;
                     let pos_offset_u32 = (seq_pos * rope_half_dim) as u32;
-                    let rope_pipe = if s.is_qwen35moe {
+                    let rope_pipe = if s.rope_neox {
                         pipelines.rope_neox.as_ref().unwrap_or(&pipelines.rope)
                     } else {
                         &pipelines.rope

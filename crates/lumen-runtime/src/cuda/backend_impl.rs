@@ -402,6 +402,13 @@ struct GpuScratch {
     batched_a_ptrs: CudaSlice<u64>,
     batched_b_ptrs: CudaSlice<u64>,
     batched_c_ptrs: CudaSlice<u64>,
+
+    /// Qwen3.5 Q+gate fusion scratch buffers.
+    /// q_gate: [q_dim * 2] F32 -- raw interleaved Q+gate output from wq projection.
+    /// gate_buf: [q_dim] F32 -- deinterleaved gate (persists until after attention).
+    /// None for models without Q+gate fusion (standard Llama/Qwen2/Mistral).
+    q_gate: Option<CudaSlice<f32>>,
+    gate_buf: Option<CudaSlice<f32>>,
 }
 
 /// GPU-resident global tensors (uploaded once at init, reused across all tokens).
@@ -529,6 +536,8 @@ struct MutableState {
     graph_params: Option<super::graph::GraphParamsBuf>,
     /// Whether the model has any GDN layers (disables graph capture).
     has_gdn_layers: bool,
+    /// Whether the model has Q+gate fusion layers (disables graph capture).
+    has_qgate_layers: bool,
     /// Number of decode tokens processed since last graph invalidation.
     /// 0 = not yet run, 1 = first token (no capture), 2+ = graph replay.
     decode_token_count: usize,
@@ -782,6 +791,12 @@ impl CudaBackend {
                 "compute_layer_gpu: layer {layer_idx} not in GPU-resident cache",
             )))?;
 
+        // Q+gate fusion detection: Qwen3.5 full-attention layers have fused Q+gate
+        // in wq with output dimension q_dim*2. When active, wq projects to q_gate
+        // scratch buffer, then deinterleave + per-head norm produces final Q and gate.
+        let has_qgate_fusion = lw.attn_q_norm.is_some();
+        let wq_out_dim = if has_qgate_fusion { q_dim * 2 } else { q_dim };
+
         // 1. Fused RMSNorm + QKV projections (same logic as compute_layer).
         if matches!(&lw.wq, GpuWeightBuf::F32(_)) {
             // SAFETY: x_gpu is [hidden_dim], rms_scale is [1]. Both allocated in init.
@@ -796,6 +811,12 @@ impl CudaBackend {
                 )?;
             }
             if let GpuWeightBuf::F32(ref wq_f32) = lw.wq {
+                // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                let (wq_out_buf, wq_od) = if has_qgate_fusion {
+                    (st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>, wq_out_dim)
+                } else {
+                    (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
+                };
                 unsafe {
                     launch_fused_norm_matvec_f32(
                         &self.device,
@@ -804,8 +825,8 @@ impl CudaBackend {
                         &st.scratch.rms_scale,
                         &lw.attn_norm,
                         wq_f32,
-                        &mut st.scratch.q,
-                        q_dim,
+                        wq_out_buf,
+                        wq_od,
                         hidden_dim,
                         "wq",
                     )?;
@@ -858,11 +879,17 @@ impl CudaBackend {
             if let Some(ref pcp) = st.precomputed_ptrs {
                 // Pre-computed batched: Q separate + KV batched (no htod).
                 if let GpuWeightBuf::F16Raw(ref wq_f16) = lw.wq {
+                    // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                    let (wq_out_buf, wq_od) = if has_qgate_fusion {
+                        (st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>, wq_out_dim)
+                    } else {
+                        (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
+                    };
                     unsafe {
                         launch_hgemv_f16_preconverted(
                             &self.device, wq_f16, &st.scratch.input_f16,
-                            &mut st.scratch.q, q_dim, hidden_dim, "wq",
-                            st.algo_cache.get(q_dim, hidden_dim),
+                            wq_out_buf, wq_od, hidden_dim, "wq",
+                            st.algo_cache.get(wq_od, hidden_dim),
                         )?;
                     }
                 }
@@ -879,11 +906,17 @@ impl CudaBackend {
             } else {
                 // Fallback: original per-layer htod path.
                 if let GpuWeightBuf::F16Raw(ref wq_f16) = lw.wq {
+                    // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                    let (wq_out_buf, wq_od) = if has_qgate_fusion {
+                        (st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>, wq_out_dim)
+                    } else {
+                        (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
+                    };
                     unsafe {
                         launch_hgemv_f16_preconverted(
                             &self.device, wq_f16, &st.scratch.input_f16,
-                            &mut st.scratch.q, q_dim, hidden_dim, "wq",
-                            st.algo_cache.get(q_dim, hidden_dim),
+                            wq_out_buf, wq_od, hidden_dim, "wq",
+                            st.algo_cache.get(wq_od, hidden_dim),
                         )?;
                     }
                 }
@@ -927,11 +960,17 @@ impl CudaBackend {
             if let Some(ref pcp) = st.precomputed_ptrs {
                 // Pre-computed batched: Q separate + KV batched (no htod).
                 if let Some(ref wq_f16) = lw.wq_f16 {
+                    // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                    let (wq_out_buf, wq_od) = if has_qgate_fusion {
+                        (st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>, wq_out_dim)
+                    } else {
+                        (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
+                    };
                     unsafe {
                         launch_hgemv_f16_preconverted(
                             &self.device, wq_f16, &st.scratch.input_f16,
-                            &mut st.scratch.q, q_dim, hidden_dim, "wq",
-                            st.algo_cache.get(q_dim, hidden_dim),
+                            wq_out_buf, wq_od, hidden_dim, "wq",
+                            st.algo_cache.get(wq_od, hidden_dim),
                         )?;
                     }
                 }
@@ -948,11 +987,17 @@ impl CudaBackend {
             } else {
                 // Fallback: Q separate + KV batched with per-layer htod.
                 if let Some(ref wq_f16) = lw.wq_f16 {
+                    // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                    let (wq_out_buf, wq_od) = if has_qgate_fusion {
+                        (st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>, wq_out_dim)
+                    } else {
+                        (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
+                    };
                     unsafe {
                         launch_hgemv_f16_preconverted(
                             &self.device, wq_f16, &st.scratch.input_f16,
-                            &mut st.scratch.q, q_dim, hidden_dim, "wq",
-                            st.algo_cache.get(q_dim, hidden_dim),
+                            wq_out_buf, wq_od, hidden_dim, "wq",
+                            st.algo_cache.get(wq_od, hidden_dim),
                         )?;
                     }
                 }
@@ -1017,7 +1062,12 @@ impl CudaBackend {
                 }
                 .map_err(|e| RuntimeError::Compute(format!("rmsnorm_to_q8_1 attn: {e}")))?;
                 unsafe {
-                    launch_matvec_preq8_1(&self.device, &st.kernels, &lw.wq, q8_1_buf, &mut st.scratch.q, q_dim, hidden_dim, "wq")?;
+                    // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                    if has_qgate_fusion {
+                        launch_matvec_preq8_1(&self.device, &st.kernels, &lw.wq, q8_1_buf, st.scratch.q_gate.as_mut().unwrap(), wq_out_dim, hidden_dim, "wq")?;
+                    } else {
+                        launch_matvec_preq8_1(&self.device, &st.kernels, &lw.wq, q8_1_buf, &mut st.scratch.q, q_dim, hidden_dim, "wq")?;
+                    }
                     launch_matvec_preq8_1(&self.device, &st.kernels, &lw.wk, q8_1_buf, &mut st.scratch.k, kv_dim, hidden_dim, "wk")?;
                     launch_matvec_preq8_1(&self.device, &st.kernels, &lw.wv, q8_1_buf, &mut st.scratch.v, kv_dim, hidden_dim, "wv")?;
                 }
@@ -1049,7 +1099,12 @@ impl CudaBackend {
                 let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
                 unsafe {
                     launch_quantize_input_q8_1(&self.device, quant_fn, &st.scratch.normed, q8_1_buf, hidden_dim, "qkv")?;
-                    launch_matvec_preq8_1(&self.device, &st.kernels, &lw.wq, q8_1_buf, &mut st.scratch.q, q_dim, hidden_dim, "wq")?;
+                    // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                    if has_qgate_fusion {
+                        launch_matvec_preq8_1(&self.device, &st.kernels, &lw.wq, q8_1_buf, st.scratch.q_gate.as_mut().unwrap(), wq_out_dim, hidden_dim, "wq")?;
+                    } else {
+                        launch_matvec_preq8_1(&self.device, &st.kernels, &lw.wq, q8_1_buf, &mut st.scratch.q, q_dim, hidden_dim, "wq")?;
+                    }
                     launch_matvec_preq8_1(&self.device, &st.kernels, &lw.wk, q8_1_buf, &mut st.scratch.k, kv_dim, hidden_dim, "wk")?;
                     launch_matvec_preq8_1(&self.device, &st.kernels, &lw.wv, q8_1_buf, &mut st.scratch.v, kv_dim, hidden_dim, "wv")?;
                 }
@@ -1078,19 +1133,36 @@ impl CudaBackend {
                     .map_err(|e| RuntimeError::Compute(format!("rmsnorm attn launch: {e}")))?;
                 }
                 unsafe {
-                    launch_matvec(
-                        &self.device,
-                        &st.kernels,
-                        &lw.wq,
-                        &st.scratch.normed,
-                        &mut st.scratch.q,
-                        q_dim,
-                        hidden_dim,
-                        "wq",
-                        lw.wq_f16.as_ref(),
-                        Some(&mut st.scratch.input_f16),
-                        st.scratch.input_q8_1.as_mut(),
-                    )?;
+                    // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                    if has_qgate_fusion {
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wq,
+                            &st.scratch.normed,
+                            st.scratch.q_gate.as_mut().unwrap(),
+                            wq_out_dim,
+                            hidden_dim,
+                            "wq",
+                            lw.wq_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
+                    } else {
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wq,
+                            &st.scratch.normed,
+                            &mut st.scratch.q,
+                            q_dim,
+                            hidden_dim,
+                            "wq",
+                            lw.wq_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
+                    }
                     launch_matvec(
                         &self.device,
                         &st.kernels,
@@ -1118,6 +1190,101 @@ impl CudaBackend {
                         st.scratch.input_q8_1.as_mut(),
                     )?;
                 }
+            }
+        }
+
+        // Q+gate fusion post-processing: deinterleave q_gate -> q + gate_buf,
+        // then per-head RMSNorm on Q (attn_q_norm) and K (attn_k_norm).
+        // Must run AFTER all QKV projection branches and BEFORE RoPE.
+        if has_qgate_fusion {
+            let q_gate_buf = st.scratch.q_gate.as_ref().unwrap();
+            let gate_buf = st.scratch.gate_buf.as_mut().unwrap();
+
+            // 1a. Deinterleave: q_gate [q_dim*2] -> q [q_dim] + gate_buf [q_dim]
+            if let Some(ref deinterleave_fn) = st.kernels.deinterleave_qgate {
+                let block = 256u32;
+                let grid = ((q_dim as u32) + block - 1) / block;
+                let hd = head_dim as u32;
+                let nh = num_heads as u32;
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(deinterleave_fn)
+                        .arg(q_gate_buf)
+                        .arg(&mut st.scratch.q)
+                        .arg(gate_buf)
+                        .arg(&hd)
+                        .arg(&nh)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!("deinterleave_qgate launch: {e}")))?;
+            } else {
+                return Err(RuntimeError::Compute(
+                    "Q+gate fusion requires deinterleave_qgate kernel".into(),
+                ));
+            }
+
+            // 1b. Per-head RMSNorm on Q using attn_q_norm [head_dim]
+            if let Some(ref q_norm_w) = lw.attn_q_norm {
+                let norm_fn = st.kernels.rmsnorm_per_head_inplace.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute("Q+gate fusion requires rmsnorm_per_head_inplace kernel".into())
+                })?;
+                let hd = head_dim as u32;
+                let nh = num_heads as u32;
+                let block = (head_dim as u32).min(1024).max(32);
+                let block = (block / 32) * 32; // Round down to warp multiple
+                let shared_bytes = (block / 32) * 4; // One float per warp
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (nh, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: shared_bytes,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(norm_fn)
+                        .arg(&mut st.scratch.q)
+                        .arg(q_norm_w)
+                        .arg(&nh)
+                        .arg(&hd)
+                        .arg(&eps)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!("rmsnorm_per_head Q launch: {e}")))?;
+            }
+
+            // 1c. Per-head RMSNorm on K using attn_k_norm [head_dim]
+            if let Some(ref k_norm_w) = lw.attn_k_norm {
+                let norm_fn = st.kernels.rmsnorm_per_head_inplace.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute("Q+gate fusion requires rmsnorm_per_head_inplace kernel".into())
+                })?;
+                let hd = head_dim as u32;
+                let nkvh = num_kv_heads as u32;
+                let block = (head_dim as u32).min(1024).max(32);
+                let block = (block / 32) * 32;
+                let shared_bytes = (block / 32) * 4;
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (nkvh, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: shared_bytes,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(norm_fn)
+                        .arg(&mut st.scratch.k)
+                        .arg(k_norm_w)
+                        .arg(&nkvh)
+                        .arg(&hd)
+                        .arg(&eps)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!("rmsnorm_per_head K launch: {e}")))?;
             }
         }
 
@@ -1230,6 +1397,48 @@ impl CudaBackend {
                     .launch(launch_cfg)
             }
             .map_err(|e| RuntimeError::Compute(format!("attention_decode launch: {e}")))?;
+        }
+
+        // 4b. Q+gate sigmoid gating: attn_out = sigmoid(gate_buf) * attn_out.
+        // Applied AFTER attention, BEFORE output projection.
+        // Two-step to avoid Rust aliasing: write to normed (temp), then memcpy back.
+        // normed is [hidden_dim], attn_out is [q_dim]. These must be equal for the
+        // memcpy to be safe. This holds for all standard transformer architectures.
+        debug_assert_eq!(q_dim, hidden_dim,
+            "sigmoid_mul path assumes normed[hidden_dim] == attn_out[q_dim]; got q_dim={q_dim}, hidden_dim={hidden_dim}");
+        if has_qgate_fusion {
+            if let Some(ref sigmoid_fn) = st.kernels.sigmoid_mul {
+                let gate_buf = st.scratch.gate_buf.as_ref().unwrap();
+                let n = q_dim as u32;
+                let block = 256u32;
+                let grid = (n + block - 1) / block;
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                // Step 1: sigmoid(gate) * attn_out -> normed (temp, no aliasing)
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(sigmoid_fn)
+                        .arg(gate_buf)
+                        .arg(&st.scratch.attn_out)
+                        .arg(&mut st.scratch.normed)
+                        .arg(&n)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!("sigmoid_mul launch: {e}")))?;
+                // Step 2: copy normed -> attn_out (both [q_dim] = [hidden_dim])
+                self.device
+                    .stream
+                    .memcpy_dtod(&st.scratch.normed, &mut st.scratch.attn_out)
+                    .map_err(|e| RuntimeError::Compute(format!("sigmoid_mul dtod copy: {e}")))?;
+            } else {
+                return Err(RuntimeError::Compute(
+                    "Q+gate fusion requires sigmoid_mul kernel".into(),
+                ));
+            }
         }
 
         // 5. Output projection + residual: attn_proj = wo * attn_out + x_gpu.
@@ -6875,6 +7084,9 @@ impl ComputeBackend for CudaBackend {
             batched_a_ptrs: self.device.alloc_zeros::<u64>(3)?,
             batched_b_ptrs: self.device.alloc_zeros::<u64>(3)?,
             batched_c_ptrs: self.device.alloc_zeros::<u64>(3)?,
+            // Q+gate fusion: allocated lazily in preload_weights when attn_q_norm detected.
+            q_gate: None,
+            gate_buf: None,
         };
 
         // Upload global tensors to GPU.
@@ -7054,6 +7266,7 @@ impl ComputeBackend for CudaBackend {
             graph_kernels,
             graph_params,
             has_gdn_layers: false,
+            has_qgate_layers: false,
             decode_token_count: 0,
             gdn_scratch_gpu: None,
             cublas_workspace,
@@ -8139,6 +8352,275 @@ impl ComputeBackend for CudaBackend {
             }
 
             // 2b. Batched QKV projections via GEMM (no F16 caches for precision match).
+            let has_qgate_fusion_pf = lw.attn_q_norm.is_some();
+            if has_qgate_fusion_pf {
+                // Q+gate fusion: project wq to [batch, q_dim*2], then deinterleave.
+                let q_gate_dim = q_dim * 2;
+                let mut pf_q_gate: CudaSlice<f32> = self.device.alloc_zeros(batch * q_gate_dim)?;
+                let mut pf_gate_buf: CudaSlice<f32> = self.device.alloc_zeros(batch * q_dim)?;
+                unsafe {
+                    super::prefill::launch_gemm_projection(
+                        &self.device, &st.kernels, &lw.wq, None,
+                        &pf.normed, &mut pf_q_gate,
+                        &mut pf.dequant_f32, &mut pf.activation_f16,
+                        &mut pf.dequant_f16,
+                        batch, q_gate_dim, hidden_dim, "wq_qgate",
+                    )?;
+                    super::prefill::launch_gemm_projection(
+                        &self.device, &st.kernels, &lw.wk, None,
+                        &pf.normed, &mut pf.k,
+                        &mut pf.dequant_f32, &mut pf.activation_f16,
+                        &mut pf.dequant_f16,
+                        batch, kv_dim, hidden_dim, "wk",
+                    )?;
+                    super::prefill::launch_gemm_projection(
+                        &self.device, &st.kernels, &lw.wv, None,
+                        &pf.normed, &mut pf.v,
+                        &mut pf.dequant_f32, &mut pf.activation_f16,
+                        &mut pf.dequant_f16,
+                        batch, kv_dim, hidden_dim, "wv",
+                    )?;
+                }
+                // Batched deinterleave: treat batch as (batch * num_heads) total heads.
+                // deinterleave_qgate works on [total_heads * head_dim * 2] -> [total_heads * head_dim] + [...]
+                // This works because per-head interleaving is contiguous across tokens.
+                if let Some(ref deinterleave_fn) = st.kernels.deinterleave_qgate {
+                    let block = 256u32;
+                    let hd = head_dim as u32;
+                    let total_heads = (batch * num_heads) as u32;
+                    let total_q = batch * q_dim;
+                    let grid = ((total_q as u32) + block - 1) / block;
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(deinterleave_fn)
+                            .arg(&pf_q_gate)
+                            .arg(&mut pf.q)
+                            .arg(&mut pf_gate_buf)
+                            .arg(&hd)
+                            .arg(&total_heads)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| RuntimeError::Compute(format!("deinterleave_qgate prefill: {e}")))?;
+                } else {
+                    return Err(RuntimeError::Compute(
+                        "Q+gate fusion requires deinterleave_qgate kernel".into(),
+                    ));
+                }
+                // Batched per-head RMSNorm on Q and K.
+                if let Some(ref q_norm_w) = lw.attn_q_norm {
+                    let norm_fn = st.kernels.rmsnorm_per_head_inplace.as_ref().ok_or_else(|| {
+                        RuntimeError::Compute("Q+gate fusion requires rmsnorm_per_head_inplace kernel".into())
+                    })?;
+                    let hd = head_dim as u32;
+                    let total_heads = (batch * num_heads) as u32;
+                    let block = (head_dim as u32).min(1024).max(32);
+                    let block = (block / 32) * 32;
+                    let shared_bytes = (block / 32) * 4;
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (total_heads, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: shared_bytes,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(norm_fn)
+                            .arg(&mut pf.q)
+                            .arg(q_norm_w)
+                            .arg(&total_heads)
+                            .arg(&hd)
+                            .arg(&eps)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| RuntimeError::Compute(format!("rmsnorm_per_head Q prefill: {e}")))?;
+                }
+                if let Some(ref k_norm_w) = lw.attn_k_norm {
+                    let norm_fn = st.kernels.rmsnorm_per_head_inplace.as_ref().ok_or_else(|| {
+                        RuntimeError::Compute("Q+gate fusion requires rmsnorm_per_head_inplace kernel".into())
+                    })?;
+                    let hd = head_dim as u32;
+                    let total_kv_heads = (batch * num_kv_heads) as u32;
+                    let block = (head_dim as u32).min(1024).max(32);
+                    let block = (block / 32) * 32;
+                    let shared_bytes = (block / 32) * 4;
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (total_kv_heads, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: shared_bytes,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(norm_fn)
+                            .arg(&mut pf.k)
+                            .arg(k_norm_w)
+                            .arg(&total_kv_heads)
+                            .arg(&hd)
+                            .arg(&eps)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| RuntimeError::Compute(format!("rmsnorm_per_head K prefill: {e}")))?;
+                }
+                // Store gate_buf for later sigmoid gating after attention.
+                // We'll use it after flash attention, before the output projection.
+                // For now, store in a local variable that persists through the layer scope.
+                // Apply sigmoid gating after attention (step 2e below).
+                // NOTE: pf_gate_buf needs to survive until after attention. Since we're in
+                // the same loop iteration scope, it's alive until the end of this block.
+
+                // Continue to RoPE (step 2c) -- Q and K are now deinterleaved and normalized.
+                // We don't add QKV bias for Q+gate layers (Qwen3.5 has no QKV bias).
+
+                // Skip bias section for qgate layers (handled above).
+                // Continue to step 2c...
+
+                // 2c. Batched RoPE (within qgate branch)
+                let rotary_dim_pf = hp.rotary_dim.unwrap_or(0) as u32;
+                unsafe {
+                    super::prefill::launch_rope_batched(
+                        &self.device, &st.kernels,
+                        &mut pf.q, &mut pf.k,
+                        pos_start, batch,
+                        num_heads, num_kv_heads, head_dim, theta,
+                        hp.rope_neox, rotary_dim_pf,
+                    )?;
+                }
+
+                // 2d. Batch KV cache write
+                let kv_cache = &mut st.kv_caches[layer_idx];
+                unsafe {
+                    super::prefill::launch_kv_cache_write_batch(
+                        &self.device, &st.kernels,
+                        &mut kv_cache.k_cache, &pf.k,
+                        pos_start, batch,
+                        num_kv_heads, kv_cache.max_seq_len, head_dim,
+                    )?;
+                    super::prefill::launch_kv_cache_write_batch(
+                        &self.device, &st.kernels,
+                        &mut kv_cache.v_cache, &pf.v,
+                        pos_start, batch,
+                        num_kv_heads, kv_cache.max_seq_len, head_dim,
+                    )?;
+                }
+                kv_cache.advance_seq_len_by(batch);
+
+                // 2e. Flash Attention
+                unsafe {
+                    if batch >= 16 && st.kernels.flash_attention_wmma.is_some() {
+                        super::prefill::launch_flash_attention_wmma(
+                            &self.device, &st.kernels,
+                            &pf.q, kv_cache, &mut pf.attn_out,
+                            batch, num_heads, num_kv_heads, head_dim, pos_start,
+                        )?;
+                    } else {
+                        super::prefill::launch_flash_attention_br4(
+                            &self.device, &st.kernels,
+                            &pf.q, kv_cache, &mut pf.attn_out,
+                            batch, num_heads, num_kv_heads, head_dim, pos_start,
+                        )?;
+                    }
+                }
+
+                // 2e.5. Sigmoid gating: attn_out = sigmoid(gate) * attn_out (per token)
+                if let Some(ref sigmoid_fn) = st.kernels.sigmoid_mul {
+                    let total_elems = (batch * q_dim) as u32;
+                    let block = 256u32;
+                    let grid = (total_elems + block - 1) / block;
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    // Use normed as temp output to avoid aliasing (normed is [batch * hidden_dim]).
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(sigmoid_fn)
+                            .arg(&pf_gate_buf)
+                            .arg(&pf.attn_out)
+                            .arg(&mut pf.normed)
+                            .arg(&total_elems)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| RuntimeError::Compute(format!("sigmoid_mul prefill: {e}")))?;
+                    // Copy normed -> attn_out (both [batch * q_dim] = [batch * hidden_dim])
+                    self.device
+                        .stream
+                        .memcpy_dtod(&pf.normed, &mut pf.attn_out)
+                        .map_err(|e| RuntimeError::Compute(format!("sigmoid_mul prefill dtod: {e}")))?;
+                } else {
+                    return Err(RuntimeError::Compute(
+                        "Q+gate fusion requires sigmoid_mul kernel".into(),
+                    ));
+                }
+
+                // 2f. Output projection + residual
+                unsafe {
+                    super::prefill::launch_gemm_residual(
+                        &self.device, &st.kernels, &lw.wo, None,
+                        &pf.attn_out, &pf.x, &mut pf.attn_proj,
+                        &mut pf.dequant_f32, &mut pf.activation_f16,
+                        &mut pf.dequant_f16,
+                        batch, hidden_dim, q_dim, "wo",
+                    )?;
+                }
+
+                // 2g-2j. FFN (same as standard path)
+                unsafe {
+                    super::prefill::launch_rmsnorm_batched(
+                        &self.device, &st.kernels,
+                        &pf.attn_proj, &lw.ffn_norm, &mut pf.normed,
+                        eps, batch, hidden_dim,
+                    )?;
+                    super::prefill::launch_gemm_projection(
+                        &self.device, &st.kernels, &lw.w_gate, None,
+                        &pf.normed, &mut pf.gate,
+                        &mut pf.dequant_f32, &mut pf.activation_f16,
+                        &mut pf.dequant_f16,
+                        batch, inter_dim, hidden_dim, "gate",
+                    )?;
+                    super::prefill::launch_gemm_projection(
+                        &self.device, &st.kernels, &lw.w_up, None,
+                        &pf.normed, &mut pf.up,
+                        &mut pf.dequant_f32, &mut pf.activation_f16,
+                        &mut pf.dequant_f16,
+                        batch, inter_dim, hidden_dim, "up",
+                    )?;
+                }
+                unsafe {
+                    super::prefill::launch_swiglu_batched(
+                        &self.device, &st.kernels,
+                        &mut pf.gate, &pf.up, batch, inter_dim,
+                    )?;
+                }
+                unsafe {
+                    super::prefill::launch_gemm_projection(
+                        &self.device, &st.kernels, &lw.w_down, None,
+                        &pf.gate, &mut pf.down,
+                        &mut pf.dequant_f32, &mut pf.activation_f16,
+                        &mut pf.dequant_f16,
+                        batch, hidden_dim, inter_dim, "down",
+                    )?;
+                }
+                unsafe {
+                    super::prefill::launch_residual_add_batched(
+                        &self.device, &st.kernels,
+                        &mut pf.attn_proj, &pf.down, batch, hidden_dim,
+                    )?;
+                }
+                self.device
+                    .stream
+                    .memcpy_dtod(&pf.attn_proj, &mut pf.x)
+                    .map_err(|e| RuntimeError::Compute(format!("dtod x<-attn_proj qgate prefill: {e}")))?;
+                continue; // Skip the standard path below
+            }
+
             unsafe {
                 super::prefill::launch_gemm_projection(
                     &self.device, &st.kernels, &lw.wq, None,
@@ -8489,8 +8971,19 @@ impl ComputeBackend for CudaBackend {
             }
         }
 
+        // Allocate Q+gate fusion scratch buffers if any layer has attn_q_norm.
+        let has_qgate = cache.iter().any(|lw| lw.attn_q_norm.is_some());
+        if has_qgate {
+            let q_dim = hp_copy.num_heads as usize * hp_copy.head_dim as usize;
+            let q_gate_dim = q_dim * 2;
+            st.scratch.q_gate = Some(self.device.alloc_zeros(q_gate_dim)?);
+            st.scratch.gate_buf = Some(self.device.alloc_zeros(q_dim)?);
+            eprintln!("[CUDA] Q+gate fusion scratch: q_gate={q_gate_dim}, gate_buf={q_dim} elements");
+        }
+
         // GDN layers use host-side conv_position — not yet graph-compatible.
         st.has_gdn_layers = has_gdn;
+        st.has_qgate_layers = has_qgate;
         if has_gdn {
             eprintln!("[CUDA] GDN layers detected -- CUDA graph capture disabled (host-side conv_position)");
         }
@@ -8542,6 +9035,10 @@ impl ComputeBackend for CudaBackend {
                 (inter_dim, hidden_dim),   // gate, up projections (x36 layers)
                 (hidden_dim, inter_dim),   // down projection (x36 layers)
             ];
+            // Q+gate fusion: add (q_dim*2, hidden_dim) for fused Q+gate projection.
+            if st.layer_weights_cache.iter().any(|lw| lw.attn_q_norm.is_some()) {
+                shapes.push((q_dim * 2, hidden_dim));
+            }
             shapes.sort();
             shapes.dedup();
 
@@ -8630,7 +9127,8 @@ impl ComputeBackend for CudaBackend {
             && st.graph_params.is_some()
             && st.cublas_workspace.is_some()
             && st.precomputed_ptrs.is_some()
-            && !st.has_gdn_layers;
+            && !st.has_gdn_layers
+            && !st.has_qgate_layers;
 
         if graph_diagnostic && st.decode_token_count == 0 {
             eprintln!("[GRAPH-DIAG] === CUDA Graph Diagnostic Mode Enabled ===");

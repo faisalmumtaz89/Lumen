@@ -300,6 +300,14 @@ pub(crate) struct KernelSet {
     // fused_residual_rmsnorm_q8_1: Residual add + RMSNorm + Q8_1 quantize.
     // For Q8_0 inter-layer boundaries: fuses residual_add_copy + rmsnorm + quantize_f32_to_q8_1.
     pub(crate) fused_residual_rmsnorm_q8_1: Option<CudaFunction>,
+
+    // Qwen3.5 Q+gate fusion kernels (full-attention layers only).
+    // deinterleave_qgate: Split [Q_h0, gate_h0, Q_h1, gate_h1, ...] -> Q + gate.
+    pub(crate) deinterleave_qgate: Option<CudaFunction>,
+    // sigmoid_mul: sigmoid(gate) * x -> out (for gating attention output).
+    pub(crate) sigmoid_mul: Option<CudaFunction>,
+    // rmsnorm_per_head_inplace: Per-head RMSNorm with shared [head_dim] weight across heads.
+    pub(crate) rmsnorm_per_head_inplace: Option<CudaFunction>,
 }
 
 /// Compile all CUDA kernels via NVRTC and return the kernel function handles.
@@ -832,6 +840,28 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         ) {
             Ok(f) => { eprintln!("[CUDA] fused_residual_rmsnorm_q8_1: OK"); Some(f) }
             Err(e) => { eprintln!("[CUDA] fused_residual_rmsnorm_q8_1: FAILED: {e}"); None }
+        },
+        // Qwen3.5 Q+gate fusion kernels (full-attention layers)
+        deinterleave_qgate: match load_fn(
+            shaders::QGATE_FUSION_KERNEL_SOURCE,
+            "deinterleave_qgate",
+        ) {
+            Ok(f) => { eprintln!("[CUDA] deinterleave_qgate: OK"); Some(f) }
+            Err(e) => { eprintln!("[CUDA] deinterleave_qgate: FAILED: {e}"); None }
+        },
+        sigmoid_mul: match load_fn(
+            shaders::QGATE_FUSION_KERNEL_SOURCE,
+            "sigmoid_mul",
+        ) {
+            Ok(f) => { eprintln!("[CUDA] sigmoid_mul: OK"); Some(f) }
+            Err(e) => { eprintln!("[CUDA] sigmoid_mul: FAILED: {e}"); None }
+        },
+        rmsnorm_per_head_inplace: match load_fn(
+            shaders::QGATE_FUSION_KERNEL_SOURCE,
+            "rmsnorm_per_head_inplace",
+        ) {
+            Ok(f) => { eprintln!("[CUDA] rmsnorm_per_head_inplace: OK"); Some(f) }
+            Err(e) => { eprintln!("[CUDA] rmsnorm_per_head_inplace: FAILED: {e}"); None }
         },
     })
 }

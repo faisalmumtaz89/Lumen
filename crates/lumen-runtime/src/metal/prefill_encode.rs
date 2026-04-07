@@ -61,13 +61,12 @@ impl MetalF32Backend {
             scratch.batch_gate_buf = Some(make(batch_size * inter_dim.max(q_dim))?);
             scratch.batch_up_buf = Some(make(batch_size * inter_dim)?);
             scratch.batch_down_buf = Some(make(batch_size * hidden_dim)?);
-            // Scores buffer for batched attention (f16). With dense stride (scores_stride=max_attend_len),
-            // the actual usage is batch_size * num_heads * max_attend_len. Since prefill starts at
-            // position 0, max_attend_len = batch_size. Allocate exactly for batch_size (the maximum
-            // attend length for a single prefill starting at position 0). If chunked prefill is
-            // added later, this buffer will be re-allocated via the batch_size check above.
+            // Scores buffer for batched attention (f16). The scores stride is padded
+            // to a multiple of 8 for half4-aligned vectorized reads in the tiled
+            // attention output kernel. Allocation uses the padded stride.
             let scores_max_attend = max_seq_len.min(batch_size);
-            let scores_bytes = (batch_size * num_heads * scores_max_attend).max(1) * 2; // f16 = 2 bytes
+            let scores_stride_padded = (scores_max_attend + 7) & !7; // match runtime padding
+            let scores_bytes = (batch_size * num_heads * scores_stride_padded).max(1) * 2; // f16 = 2 bytes
             scratch.batch_scores_buf = Some(self.device.new_buffer(scores_bytes).ok_or_else(|| {
                 RuntimeError::Compute(format!("Failed to allocate batch_scores_buf of {scores_bytes} bytes"))
             })?);
@@ -732,8 +731,8 @@ impl MetalF32Backend {
                 let total_dim_u32 = q_dim as u32;
                 let total_kv_dim_u32 = kv_dim as u32;
 
-                // Qwen3.5 uses NeoX-style (half-offset) dimension pairing
-                let rope_b_pipe = if scratch.is_qwen35moe {
+                // NeoX-style (half-offset) RoPE for Qwen2/Qwen3.5 models
+                let rope_b_pipe = if scratch.rope_neox {
                     pipelines.rope_batched_neox.as_ref().unwrap_or(&pipelines.rope_batched)
                 } else {
                     &pipelines.rope_batched
@@ -907,8 +906,8 @@ impl MetalF32Backend {
             let num_heads_u32 = num_heads as u32;
             let num_kv_heads_u32_rope = num_kv_heads as u32;
 
-            // Qwen3.5 uses NeoX-style (half-offset) dimension pairing
-            let rope_b_pipe = if scratch.is_qwen35moe {
+            // NeoX-style (half-offset) RoPE for Qwen2/Qwen3.5 models
+            let rope_b_pipe = if scratch.rope_neox {
                 pipelines.rope_batched_neox.as_ref().unwrap_or(&pipelines.rope_batched)
             } else {
                 &pipelines.rope_batched
@@ -954,7 +953,13 @@ impl MetalF32Backend {
             let start_pos_u32 = seq_pos_start as u32;
             let batch_size_u32 = batch_size as u32;
             let max_attend_len = seq_pos_start + batch_size;
-            let scores_stride_u32 = max_attend_len as u32;
+            // Pad scores stride to multiple of 8 for half4-aligned reads in
+            // attention_output_tiled. The tiled kernel casts score rows to half4*
+            // for vectorized loads; when q_head * stride is not half4-aligned
+            // (stride not divisible by 4), the cast reads garbage bytes. Padding
+            // to 8 ensures alignment for both half4 (4 halfs) and half8 reads.
+            let scores_stride = (max_attend_len + 7) & !7; // round up to multiple of 8
+            let scores_stride_u32 = scores_stride as u32;
 
             let enc = cmd.new_concurrent_compute_encoder().ok_or_else(|| {
                 RuntimeError::Compute("Failed to create concurrent encoder".into())
@@ -1294,7 +1299,10 @@ impl MetalF32Backend {
 
                 // Batched GDN prefill: batches GEMM operations while processing
                 // state updates sequentially per token via fused kernel.
-                let use_batched = true;
+                // Batched GDN prefill disabled: produces incorrect hidden states for
+                // multi-token batches. The token-by-token fallback uses the verified
+                // single-token decode path which matches MLX output exactly.
+                let use_batched = false;
 
                 if use_batched {
                     // Batched path: ~15 dispatches + per-token conv1d/state-update

@@ -136,8 +136,7 @@ extern "C" __global__ void gdn_decode_megakernel(
     unsigned int tid = threadIdx.x;
     unsigned int block_size = blockDim.x;
     unsigned int buf_slots = kernel_size - 1;
-    unsigned int gqa_ratio = num_heads / num_kv_heads;
-    unsigned int kv_head = h / gqa_ratio;
+    unsigned int kv_head = h % num_kv_heads;
 
     // Shared memory layout:
     //   warp_scratch[32]   -- reduction temporaries

@@ -1679,7 +1679,7 @@ kernel void ssm_conv1d_prefill(
         int src_t = (int)T - (int)buf_slots + (int)s;
         if (src_t >= 0) {
             // This token came from the input batch
-            uint new_slot = (state_pos + s) % buf_slots;
+            uint new_slot = (state_pos + (uint)src_t) % buf_slots;
             conv_state[new_slot * dim + d] = input[(uint)src_t * dim + d];
         }
         // If src_t < 0, the state slot already has the correct value (unchanged)
@@ -1746,7 +1746,7 @@ kernel void ssm_conv1d_silu_prefill(
     for (uint s = 0; s < buf_slots; s++) {
         int src_t = (int)T - (int)buf_slots + (int)s;
         if (src_t >= 0) {
-            uint new_slot = (state_pos + s) % buf_slots;
+            uint new_slot = (state_pos + (uint)src_t) % buf_slots;
             conv_state[new_slot * dim + d] = input[(uint)src_t * dim + d];
         }
     }
@@ -1817,7 +1817,7 @@ kernel void ssm_conv1d_silu_prefill_parallel(
         for (uint s = 0; s < buf_slots; s++) {
             int src_t = (int)T - (int)buf_slots + (int)s;
             if (src_t >= 0) {
-                uint new_slot = (state_pos + s) % buf_slots;
+                uint new_slot = (state_pos + (uint)src_t) % buf_slots;
                 conv_state[new_slot * dim + d] = input[(uint)src_t * dim + d];
             }
         }

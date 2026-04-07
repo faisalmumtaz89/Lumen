@@ -279,3 +279,6 @@ pub const RMSNORM_Q8_1_KERNEL_SOURCE: &str = include_str!("rmsnorm_q8_1.cu");
 
 /// CUDA graph-compatible kernel variants (fixed geometry, parameter indirection).
 pub const GRAPH_KERNEL_SOURCE: &str = include_str!("graph_kernels.cu");
+
+/// Qwen3.5 Q+gate fusion kernels (deinterleave, sigmoid_mul, per-head RMSNorm).
+pub const QGATE_FUSION_KERNEL_SOURCE: &str = include_str!("qgate_fusion.cu");

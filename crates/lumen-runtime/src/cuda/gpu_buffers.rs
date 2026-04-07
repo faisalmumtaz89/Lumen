@@ -118,6 +118,12 @@ pub struct LayerWeightsGpu {
     /// F16 cache for SSM beta projection (None if not Q8_0/Q4_0 or OOM).
     pub ssm_beta_f16: Option<CudaSlice<u8>>,
 
+    // --- Qwen3.5 full-attention Q+gate fusion weights ---
+    /// Per-head Q RMSNorm weight: [head_dim] F32, shared across all heads.
+    /// Present only for Qwen3.5 full-attention layers (where attn_q has fused Q+gate).
+    pub attn_q_norm: Option<CudaSlice<f32>>,
+    /// Per-head K RMSNorm weight: [head_dim] F32, shared across all heads.
+    pub attn_k_norm: Option<CudaSlice<f32>>,
 }
 
 /// Reinterpret raw LE bytes as an f32 slice.
@@ -770,6 +776,31 @@ pub fn upload_layer_weights(
         attn_gate_f16: None,
         ssm_alpha_f16: None,
         ssm_beta_f16: None,
+        // Qwen3.5 full-attention per-head Q/K RMSNorm weights.
+        attn_q_norm: match &subs.attn_q_norm {
+            Some(s) if s.quant == QuantScheme::F32 => {
+                let raw = weights.subtensor_bytes(s)?;
+                Some(device.htod_copy(bytes_as_f32(raw)?)?)
+            }
+            Some(s) => {
+                return Err(RuntimeError::Compute(format!(
+                    "attn_q_norm requires F32 quant, got {:?}", s.quant,
+                )));
+            }
+            None => None,
+        },
+        attn_k_norm: match &subs.attn_k_norm {
+            Some(s) if s.quant == QuantScheme::F32 => {
+                let raw = weights.subtensor_bytes(s)?;
+                Some(device.htod_copy(bytes_as_f32(raw)?)?)
+            }
+            Some(s) => {
+                return Err(RuntimeError::Compute(format!(
+                    "attn_k_norm requires F32 quant, got {:?}", s.quant,
+                )));
+            }
+            None => None,
+        },
     })
 }
 
@@ -917,7 +948,11 @@ pub fn dequant_layer_q8_to_f16(
     } else {
         // Standard attention layer: use model-dimension-based element counts.
         // These are critical for performance -- OOM here is a hard error.
-        layer.wq_f16 = dequant_weight(&layer.wq, q_dim * hidden)?;
+        //
+        // Qwen3.5 full-attention layers: wq is [q_dim*2, hidden] (fused Q+gate),
+        // so element count must be doubled when attn_q_norm is present.
+        let wq_out_dim = if layer.attn_q_norm.is_some() { q_dim * 2 } else { q_dim };
+        layer.wq_f16 = dequant_weight(&layer.wq, wq_out_dim * hidden)?;
         layer.wk_f16 = dequant_weight(&layer.wk, kv_dim * hidden)?;
         layer.wv_f16 = dequant_weight(&layer.wv, kv_dim * hidden)?;
         layer.wo_f16 = dequant_weight(&layer.wo, hidden * q_dim)?;
@@ -1024,7 +1059,9 @@ pub fn repack_layer_q8_to_aligned(
 
     // For GDN layers: skip QKV repack (wq is fused QKV used by GDN dispatch directly).
     if !is_gdn {
-        repack_weight(device, repack_kernel, &mut layer.wq, q_dim * hidden)?;
+        // Qwen3.5 full-attention layers: wq is [q_dim*2, hidden] (fused Q+gate).
+        let wq_out_dim = if layer.attn_q_norm.is_some() { q_dim * 2 } else { q_dim };
+        repack_weight(device, repack_kernel, &mut layer.wq, wq_out_dim * hidden)?;
         repack_weight(device, repack_kernel, &mut layer.wk, kv_dim * hidden)?;
         repack_weight(device, repack_kernel, &mut layer.wv, kv_dim * hidden)?;
         repack_weight(device, repack_kernel, &mut layer.wo, hidden * q_dim)?;
@@ -1135,7 +1172,9 @@ pub fn repack_layer_q4_to_aligned(
 
     // For GDN layers: skip QKV repack (wq is fused QKV used by GDN dispatch directly).
     if !is_gdn {
-        repack_weight(device, repack_kernel, &mut layer.wq, q_dim * hidden)?;
+        // Qwen3.5 full-attention layers: wq is [q_dim*2, hidden] (fused Q+gate).
+        let wq_out_dim = if layer.attn_q_norm.is_some() { q_dim * 2 } else { q_dim };
+        repack_weight(device, repack_kernel, &mut layer.wq, wq_out_dim * hidden)?;
         repack_weight(device, repack_kernel, &mut layer.wk, kv_dim * hidden)?;
         repack_weight(device, repack_kernel, &mut layer.wv, kv_dim * hidden)?;
         repack_weight(device, repack_kernel, &mut layer.wo, hidden * q_dim)?;

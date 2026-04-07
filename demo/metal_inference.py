@@ -102,7 +102,7 @@ def run_lumen(binary, model_path, token_ids, max_tokens, temperature, profile=Fa
             if m:
                 metrics["decode_tps"] = float(m.group(1))
 
-    return gen_tokens, metrics, output
+    return gen_tokens, metrics
 
 
 def main():
@@ -111,7 +111,7 @@ def main():
     parser.add_argument("--tokenizer", required=True, help="HuggingFace tokenizer name or path")
     parser.add_argument("--prompt", default="The meaning of life is", help="Text prompt")
     parser.add_argument("--max-tokens", type=int, default=64, help="Max tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (0=greedy)")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0=greedy)")
     parser.add_argument("--profile", action="store_true", help="Show per-layer timing")
     parser.add_argument("--binary", help="Path to lumen binary (auto-detected if not set)")
     args = parser.parse_args()
@@ -128,10 +128,10 @@ def main():
         sys.exit(1)
 
     # Tokenize
-    print(f"Model:     {args.model}")
-    print(f"Tokenizer: {args.tokenizer}")
-    print(f"Prompt:    {args.prompt}")
-    print(f"Max tokens: {args.max_tokens}")
+    print(f"Model:       {args.model}")
+    print(f"Tokenizer:   {args.tokenizer}")
+    print(f"Prompt:      {args.prompt}")
+    print(f"Max tokens:  {args.max_tokens}")
     print(f"Temperature: {args.temperature}")
     print()
 
@@ -141,9 +141,9 @@ def main():
 
     # Run inference
     print("Running Lumen Metal inference...")
-    print("-" * 60)
+    print("-" * 46)
 
-    gen_tokens, metrics, _ = run_lumen(
+    gen_tokens, metrics = run_lumen(
         binary, args.model, prompt_ids, args.max_tokens, args.temperature, args.profile
     )
 

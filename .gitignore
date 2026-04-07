@@ -16,4 +16,7 @@ bench/results/
 /.codecompass
 /modal
 tracker.md
-/demo/__pycache__
+
+# Python bytecache
+__pycache__/
+*.pyc

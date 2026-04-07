@@ -228,7 +228,7 @@ extern "C" __global__ void gdn_state_update(
     unsigned int vj = threadIdx.x;
     if (vj >= val_dim) return;
 
-    unsigned int kv_head = h / (num_heads / num_kv_heads);
+    unsigned int kv_head = h % num_kv_heads;
     float a = alpha[h];
     float b = beta[h];
     float q_scale = rsqrtf((float)key_dim);

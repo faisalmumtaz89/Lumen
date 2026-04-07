@@ -1664,12 +1664,11 @@ impl MetalF32Backend {
             enc.end_encoding();
         }
 
-        // Conv position after batched prefill
-        let new_conv_pos = if batch_size as u32 >= buf_slots {
-            conv_pos // all slots overwritten, wraps back to start
-        } else {
-            (conv_pos + batch_size as u32) % buf_slots
-        };
+        // Conv position after batched prefill: advance by batch_size tokens.
+        // The circular buffer has buf_slots = kernel_size - 1 slots.
+        // Each token writes to one slot and advances the position by 1.
+        // After T tokens: new_pos = (old_pos + T) % buf_slots.
+        let new_conv_pos = (conv_pos + batch_size as u32) % buf_slots;
 
         Ok(new_conv_pos)
     }
