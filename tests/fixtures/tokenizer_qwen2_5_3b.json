@@ -1,0 +1,614 @@
+{
+  "model_key": "qwen2.5-3b",
+  "hf_model_id": "Qwen/Qwen2.5-3B-Instruct",
+  "gguf_model_type": "gpt2",
+  "gguf_pre": "qwen2",
+  "vocab_size": 151643,
+  "bos_token_id": null,
+  "eos_token_id": 151645,
+  "generator_versions": {
+    "transformers": "5.3.0",
+    "python": "3.14.3"
+  },
+  "test_cases": [
+    {
+      "id": "basic_hello",
+      "input": "Hello, world!",
+      "token_ids": [
+        9707,
+        11,
+        1879,
+        0
+      ],
+      "decoded": "Hello, world!",
+      "round_trip": true,
+      "num_tokens": 4
+    },
+    {
+      "id": "basic_capital",
+      "input": "The capital of France is",
+      "token_ids": [
+        785,
+        6722,
+        315,
+        9625,
+        374
+      ],
+      "decoded": "The capital of France is",
+      "round_trip": true,
+      "num_tokens": 5
+    },
+    {
+      "id": "basic_math",
+      "input": "1 + 1 = 2",
+      "token_ids": [
+        16,
+        488,
+        220,
+        16,
+        284,
+        220,
+        17
+      ],
+      "decoded": "1 + 1 = 2",
+      "round_trip": true,
+      "num_tokens": 7
+    },
+    {
+      "id": "basic_empty",
+      "input": "",
+      "token_ids": [],
+      "decoded": "",
+      "round_trip": true,
+      "num_tokens": 0
+    },
+    {
+      "id": "basic_space",
+      "input": " ",
+      "token_ids": [
+        220
+      ],
+      "decoded": " ",
+      "round_trip": true,
+      "num_tokens": 1
+    },
+    {
+      "id": "unicode_accents",
+      "input": "café résumé",
+      "token_ids": [
+        924,
+        58858,
+        9333,
+        1242,
+        963
+      ],
+      "decoded": "café résumé",
+      "round_trip": true,
+      "num_tokens": 5
+    },
+    {
+      "id": "unicode_cjk",
+      "input": "北京市",
+      "token_ids": [
+        104554
+      ],
+      "decoded": "北京市",
+      "round_trip": true,
+      "num_tokens": 1
+    },
+    {
+      "id": "unicode_arabic",
+      "input": "مرحبا",
+      "token_ids": [
+        124122,
+        29825,
+        124671
+      ],
+      "decoded": "مرحبا",
+      "round_trip": true,
+      "num_tokens": 3
+    },
+    {
+      "id": "unicode_emoji",
+      "input": "🎉🔥💻",
+      "token_ids": [
+        144841,
+        144670,
+        145851
+      ],
+      "decoded": "🎉🔥💻",
+      "round_trip": true,
+      "num_tokens": 3
+    },
+    {
+      "id": "unicode_mixed",
+      "input": "Hello 世界",
+      "token_ids": [
+        9707,
+        220,
+        99489
+      ],
+      "decoded": "Hello 世界",
+      "round_trip": true,
+      "num_tokens": 3
+    },
+    {
+      "id": "unicode_zwj",
+      "input": "👨‍👩‍👧‍👦",
+      "token_ids": [
+        145367,
+        378,
+        235,
+        145233,
+        378,
+        235,
+        145665,
+        378,
+        235,
+        145988
+      ],
+      "decoded": "👨‍👩‍👧‍👦",
+      "round_trip": true,
+      "num_tokens": 10
+    },
+    {
+      "id": "ws_double_space",
+      "input": "Hello,  world!",
+      "token_ids": [
+        9707,
+        11,
+        220,
+        1879,
+        0
+      ],
+      "decoded": "Hello,  world!",
+      "round_trip": true,
+      "num_tokens": 5
+    },
+    {
+      "id": "ws_leading",
+      "input": "   leading",
+      "token_ids": [
+        256,
+        6388
+      ],
+      "decoded": "   leading",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "ws_trailing",
+      "input": "trailing   ",
+      "token_ids": [
+        376,
+        14277,
+        262
+      ],
+      "decoded": "trailing   ",
+      "round_trip": true,
+      "num_tokens": 3
+    },
+    {
+      "id": "ws_newlines",
+      "input": "\n\nfoo\n",
+      "token_ids": [
+        271,
+        7975,
+        198
+      ],
+      "decoded": "\n\nfoo\n",
+      "round_trip": true,
+      "num_tokens": 3
+    },
+    {
+      "id": "ws_contractions",
+      "input": "it's a test",
+      "token_ids": [
+        275,
+        594,
+        264,
+        1273
+      ],
+      "decoded": "it's a test",
+      "round_trip": true,
+      "num_tokens": 4
+    },
+    {
+      "id": "merge_repeated",
+      "input": "aaaaaa",
+      "token_ids": [
+        28458,
+        5305
+      ],
+      "decoded": "aaaaaa",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "merge_bigram",
+      "input": "abababab",
+      "token_ids": [
+        370,
+        370,
+        370,
+        370
+      ],
+      "decoded": "abababab",
+      "round_trip": true,
+      "num_tokens": 4
+    },
+    {
+      "id": "merge_special_text",
+      "input": "<|endoftext|>",
+      "token_ids": [
+        151643
+      ],
+      "decoded": "<|endoftext|>",
+      "round_trip": true,
+      "num_tokens": 1
+    },
+    {
+      "id": "merge_chatml_text",
+      "input": "<|im_start|>system",
+      "token_ids": [
+        151644,
+        8948
+      ],
+      "decoded": "<|im_start|>system",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "code_python",
+      "input": "def foo(x):\n    return x * 2\n",
+      "token_ids": [
+        750,
+        15229,
+        2075,
+        982,
+        262,
+        470,
+        856,
+        353,
+        220,
+        17,
+        198
+      ],
+      "decoded": "def foo(x):\n    return x * 2\n",
+      "round_trip": true,
+      "num_tokens": 11
+    },
+    {
+      "id": "code_rust",
+      "input": "fn main() {\n    println!(\"hello\");\n}",
+      "token_ids": [
+        8822,
+        1887,
+        368,
+        341,
+        262,
+        13751,
+        17223,
+        14990,
+        797,
+        92
+      ],
+      "decoded": "fn main() {\n    println!(\"hello\");\n}",
+      "round_trip": true,
+      "num_tokens": 10
+    },
+    {
+      "id": "code_json",
+      "input": "{\"key\": [1, 2, 3], \"nested\": {\"a\": null}}",
+      "token_ids": [
+        4913,
+        792,
+        788,
+        508,
+        16,
+        11,
+        220,
+        17,
+        11,
+        220,
+        18,
+        1125,
+        330,
+        59271,
+        788,
+        5212,
+        64,
+        788,
+        845,
+        3417
+      ],
+      "decoded": "{\"key\": [1, 2, 3], \"nested\": {\"a\": null}}",
+      "round_trip": true,
+      "num_tokens": 20
+    },
+    {
+      "id": "code_html",
+      "input": "<div class=\"test\">&amp;</div>",
+      "token_ids": [
+        2626,
+        536,
+        428,
+        1944,
+        13366,
+        1121,
+        11347,
+        611,
+        29
+      ],
+      "decoded": "<div class=\"test\">&amp;</div>",
+      "round_trip": true,
+      "num_tokens": 9
+    },
+    {
+      "id": "boundary_single_char",
+      "input": "a",
+      "token_ids": [
+        64
+      ],
+      "decoded": "a",
+      "round_trip": true,
+      "num_tokens": 1
+    },
+    {
+      "id": "boundary_paragraph",
+      "input": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. ",
+      "token_ids": [
+        785,
+        3974,
+        13876,
+        38835,
+        34208,
+        916,
+        279,
+        15678,
+        5562,
+        13,
+        576,
+        3974,
+        13876,
+        38835,
+        34208,
+        916,
+        279,
+        15678,
+        5562,
+        13,
+        576,
+        3974,
+        13876,
+        38835,
+        34208,
+        916,
+        279,
+        15678,
+        5562,
+        13,
+        576,
+        3974,
+        13876,
+        38835,
+        34208,
+        916,
+        279,
+        15678,
+        5562,
+        13,
+        576,
+        3974,
+        13876,
+        38835,
+        34208,
+        916,
+        279,
+        15678,
+        5562,
+        13,
+        576,
+        3974,
+        13876,
+        38835,
+        34208,
+        916,
+        279,
+        15678,
+        5562,
+        13,
+        576,
+        3974,
+        13876,
+        38835,
+        34208,
+        916,
+        279,
+        15678,
+        5562,
+        13,
+        576,
+        3974,
+        13876,
+        38835,
+        34208,
+        916,
+        279,
+        15678,
+        5562,
+        13,
+        576,
+        3974,
+        13876,
+        38835,
+        34208,
+        916,
+        279,
+        15678,
+        5562,
+        13,
+        576,
+        3974,
+        13876,
+        38835,
+        34208,
+        916,
+        279,
+        15678,
+        5562,
+        13,
+        576,
+        3974,
+        13876,
+        38835,
+        34208,
+        916,
+        279,
+        15678,
+        5562,
+        13,
+        220
+      ],
+      "decoded": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. ",
+      "round_trip": true,
+      "num_tokens": 111
+    },
+    {
+      "id": "boundary_special_ws",
+      "input": "​ ",
+      "token_ids": [
+        15692,
+        4102
+      ],
+      "decoded": "​ ",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "boundary_url",
+      "input": "https://example.com/path?q=hello+world&x=1#anchor",
+      "token_ids": [
+        2428,
+        1110,
+        8687,
+        905,
+        50976,
+        43782,
+        28,
+        14990,
+        10,
+        14615,
+        5,
+        87,
+        28,
+        16,
+        2,
+        17109
+      ],
+      "decoded": "https://example.com/path?q=hello+world&x=1#anchor",
+      "round_trip": true,
+      "num_tokens": 16
+    },
+    {
+      "id": "contract_multi",
+      "input": "don't won't can't",
+      "token_ids": [
+        15007,
+        944,
+        2765,
+        944,
+        646,
+        944
+      ],
+      "decoded": "don't won't can't",
+      "round_trip": true,
+      "num_tokens": 6
+    },
+    {
+      "id": "contract_im",
+      "input": "I'm",
+      "token_ids": [
+        40,
+        2776
+      ],
+      "decoded": "I'm",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "contract_theyre",
+      "input": "they're",
+      "token_ids": [
+        20069,
+        2299
+      ],
+      "decoded": "they're",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "norm_nfc",
+      "input": "café",
+      "token_ids": [
+        924,
+        58858
+      ],
+      "decoded": "café",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "norm_nfd",
+      "input": "café",
+      "token_ids": [
+        924,
+        58858
+      ],
+      "decoded": "café",
+      "round_trip": true,
+      "num_tokens": 2
+    }
+  ],
+  "chat_template_test": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "expected_text": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n",
+    "expected_token_ids": [
+      151644,
+      8948,
+      198,
+      2610,
+      525,
+      1207,
+      16948,
+      11,
+      3465,
+      553,
+      54364,
+      14817,
+      13,
+      1446,
+      525,
+      264,
+      10950,
+      17847,
+      13,
+      151645,
+      198,
+      151644,
+      872,
+      198,
+      9707,
+      151645,
+      198,
+      151644,
+      77091,
+      198
+    ]
+  }
+}

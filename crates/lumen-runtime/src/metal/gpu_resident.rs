@@ -32,7 +32,7 @@ impl MetalF32Backend {
 
         let num_layers = s.num_layers;
 
-        println!("Pre-loading {} layers into single private GPU buffer...", num_layers);
+        // Quiet by default — CLI controls verbosity.
 
         // === Pass 1: Collect layer blobs and compute page-aligned offsets ===
         let align = |size: usize| -> usize { (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1) };
@@ -254,18 +254,8 @@ impl MetalF32Backend {
         let layer_mb = layer_bytes_total as f64 / (1024.0 * 1024.0);
         let global_mb = if include_globals { global_bytes as f64 / (1024.0 * 1024.0) } else { 0.0 };
         let total_mb = total_size as f64 / (1024.0 * 1024.0);
-        if include_globals {
-            println!(
-                "GPU-resident private buffer: {} layers ({:.1} MB) + globals ({:.1} MB) = {:.1} MB (StorageModePrivate)",
-                num_layers, layer_mb, global_mb, total_mb,
-            );
-        } else {
-            println!(
-                "GPU-resident private buffer: {} layers ({:.1} MB) = {:.1} MB (StorageModePrivate); globals ({:.1} MB) in shared buffers",
-                num_layers, layer_mb, total_mb,
-                global_bytes as f64 / (1024.0 * 1024.0),
-            );
-        }
+        // GPU-resident buffer info available via MetalF32Backend::gpu_resident_summary().
+        let _ = (num_layers, layer_mb, global_mb, total_mb, include_globals);
 
         s.gpu_unified_weight_buf = Some(private_buf);
         s.gpu_layer_offsets = layer_offsets;
@@ -355,10 +345,7 @@ impl MetalF32Backend {
                 let n_moe = s.cached_layer_meta.iter().filter(|m| m.moe_meta.is_some()).count();
                 let n_shared = s.cached_layer_meta.iter().filter(|m| m.shared_expert_gate_off.is_some()).count();
                 let se_inter_display = s.shared_expert_inter_dim;
-                println!(
-                    "Qwen3.5 hybrid detected: {} layers ({} linear_attn, {} full_attn), {} MoE, {} shared_expert, rotary_dim={}, se_inter={}",
-                    num_layers, n_linear, n_full, n_moe, n_shared, s.rotary_dim, se_inter_display,
-                );
+                let _ = (n_linear, n_full, n_moe, n_shared, se_inter_display);
 
             }
         }
@@ -443,10 +430,7 @@ impl MetalF32Backend {
 
                 let h_state_mb = (n_linear * h_state_size * 4) as f64 / (1024.0 * 1024.0);
                 let conv_mb = (n_linear * conv_state_size * 4) as f64 / (1024.0 * 1024.0);
-                println!(
-                    "GDN state: {} layers, h_state={:.1} MB ({} heads x {}x{} per layer), conv={:.1} MB (kernel_size={})",
-                    n_linear, h_state_mb, GDN_NUM_HEADS, GDN_HEAD_DIM, GDN_HEAD_DIM, conv_mb, conv_kernel_size,
-                );
+                let _ = (h_state_mb, conv_mb, conv_kernel_size);
             }
         }
 

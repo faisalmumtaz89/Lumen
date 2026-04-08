@@ -1,6 +1,6 @@
 //! GGUF-to-LBC converter.
 //!
-//! Reads a GGUF file (llama.cpp format), extracts hyperparameters and tensor
+//! Reads a GGUF file, extracts hyperparameters and tensor
 //! data, and writes an LBC file using the streaming writer. Memory-efficient:
 //! only one layer blob is held in memory at a time.
 
@@ -13,6 +13,7 @@ use crate::tensor_io::read_tensor_data;
 use lumen_format::header::LbcHeader;
 use lumen_format::quantization::QuantScheme;
 use lumen_format::streaming_writer::StreamingLbcWriter;
+use lumen_format::tokenizer::TokenizerSection;
 use lumen_format::writer::GlobalTensors;
 use std::fmt;
 use std::io::{BufReader, BufWriter, Read, Seek};
@@ -367,8 +368,29 @@ fn do_convert_from_reader<R: Read + Seek>(
         output_proj,
     };
 
+    // Extract tokenizer data from GGUF and embed in LBC v3.
+    let tokenizer_section = crate::tokenizer_data::extract_tokenizer(gguf).map(|td| {
+        eprintln!("  Tokenizer: model={} pre={} vocab={} merges={} scores={}",
+            td.model_type, td.pre_tokenizer, td.tokens.len(), td.merges.len(), td.scores.len());
+        TokenizerSection {
+            model_type: td.model_type,
+            pre_tokenizer: td.pre_tokenizer,
+            tokens: td.tokens,
+            token_types: td.token_types,
+            scores: td.scores,
+            merges: td.merges,
+            bos_token_id: td.bos_token_id,
+            eos_token_id: td.eos_token_id,
+            pad_token_id: td.pad_token_id,
+            add_bos_token: td.add_bos_token,
+            add_eos_token: td.add_eos_token,
+            add_space_prefix: td.add_space_prefix,
+            chat_template: td.chat_template,
+        }
+    });
+
     let mut streaming =
-        StreamingLbcWriter::begin(writer, &header, &layer_shapes, &global_tensors)?;
+        StreamingLbcWriter::begin(writer, &header, &layer_shapes, &global_tensors, tokenizer_section.as_ref())?;
 
     // Write each layer blob (stream from GGUF file)
     for (layer, shape) in layer_shapes.iter().enumerate().take(num_layers) {

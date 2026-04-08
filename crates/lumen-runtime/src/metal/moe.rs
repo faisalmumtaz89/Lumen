@@ -268,7 +268,7 @@ impl MetalF32Backend {
         let has_reader = self.expert_reader.is_some();
 
         if !has_cache || !has_reader {
-            println!(
+            eprintln!(
                 "MoE warmup: profiling complete but cache={} reader={}. Skipping warmup.",
                 if has_cache { "yes" } else { "no" },
                 if has_reader { "yes" } else { "no" },
@@ -286,7 +286,7 @@ impl MetalF32Backend {
         }
 
         if warm_requests.is_empty() {
-            println!("MoE warmup: no hot experts found during profiling. Skipping.");
+            eprintln!("MoE warmup: no hot experts found during profiling. Skipping.");
             self.warmup_complete.store(true, Ordering::Relaxed);
             return;
         }
@@ -319,7 +319,7 @@ impl MetalF32Backend {
         }
 
         let cache_stats = self.expert_cache.as_ref().unwrap().lock().unwrap().stats();
-        println!(
+        eprintln!(
             "MoE warmup complete: loaded {} experts ({} failed), \
              cache has {}/{} experts ({:.1} MB)",
             loaded,

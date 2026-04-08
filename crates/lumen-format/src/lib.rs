@@ -23,6 +23,7 @@ pub mod reader;
 pub(crate) mod rng;
 pub mod streaming_writer;
 pub mod test_model;
+pub mod tokenizer;
 pub mod writer;
 
 pub use error::FormatError;
@@ -33,4 +34,5 @@ pub use large_model::{LargeModelConfig, generate_large_model, generate_large_mod
 pub use quantization::{QuantGroupSize, QuantScheme, QuantizationDescriptor};
 pub use reader::LbcFile;
 pub use streaming_writer::{LayerShape, StreamingLbcWriter};
+pub use tokenizer::TokenizerSection;
 pub use writer::GlobalTensors;

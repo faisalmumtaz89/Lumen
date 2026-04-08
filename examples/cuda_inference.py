@@ -10,7 +10,7 @@ Local mode (default, requires NVIDIA GPU + built Lumen):
     pip install transformers
 
   Usage:
-    python demo/cuda_inference.py --model /path/to/model.lbc \\
+    python examples/cuda_inference.py --model /path/to/model.lbc \\
         --tokenizer Qwen/Qwen2.5-3B-Instruct \\
         --prompt "Write a haiku about coding"
 
@@ -20,9 +20,9 @@ Modal mode (serverless A100, no local GPU needed):
     modal setup
 
   Usage:
-    modal run demo/cuda_inference.py
-    modal run demo/cuda_inference.py --model qwen2.5-3b --prompt "Write a haiku about coding"
-    modal run demo/cuda_inference.py --model llama-8b --prompt "Explain gravity" --max-tokens 100
+    modal run examples/cuda_inference.py
+    modal run examples/cuda_inference.py --model qwen2.5-3b --prompt "Write a haiku about coding"
+    modal run examples/cuda_inference.py --model llama-8b --prompt "Explain gravity" --max-tokens 100
 """
 
 import argparse
@@ -162,7 +162,7 @@ def main_local():
     parser = argparse.ArgumentParser(
         description="Lumen CUDA Inference Demo",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="For Modal serverless GPU: modal run demo/cuda_inference.py")
+        epilog="For Modal serverless GPU: modal run examples/cuda_inference.py")
     parser.add_argument("--model", required=True, help="Path to .lbc model file")
     parser.add_argument("--tokenizer", required=True, help="HuggingFace tokenizer name or path")
     parser.add_argument("--prompt", default="The meaning of life is", help="Text prompt")

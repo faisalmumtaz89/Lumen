@@ -360,7 +360,7 @@ pub fn generate_large_model_f16<W: Write>(w: W, config: &LargeModelConfig) -> io
     header.final_norm.quant = QuantScheme::F32;
     header.output_proj.quant = QuantScheme::F16;
 
-    let mut sw = StreamingLbcWriter::begin(w, &header, &layer_shapes, &globals)?;
+    let mut sw = StreamingLbcWriter::begin(w, &header, &layer_shapes, &globals, None)?;
     for _ in 0..config.num_layers {
         let blob = generate_layer_blob_f16(config, &mut rng);
         sw.write_layer(&blob)?;
@@ -418,7 +418,7 @@ pub fn generate_large_model<W: Write>(w: W, config: &LargeModelConfig) -> io::Re
     };
     let header = LbcHeader::new(hp, qd);
 
-    let mut sw = StreamingLbcWriter::begin(w, &header, &layer_shapes, &globals)?;
+    let mut sw = StreamingLbcWriter::begin(w, &header, &layer_shapes, &globals, None)?;
     for _ in 0..config.num_layers {
         let blob = generate_layer_blob(config, &mut rng);
         sw.write_layer(&blob)?;

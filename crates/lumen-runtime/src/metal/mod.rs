@@ -223,9 +223,7 @@ impl MetalF32Backend {
         // Attempt to create a Metal IO command queue (Metal 3 / macOS 13+).
         // This enables direct NVMe-to-GPU DMA for streaming expert loading.
         let metal_io_queue = MetalIOQueue::new(&device);
-        if metal_io_queue.is_some() {
-            eprintln!("[metal] MTLIOCommandQueue available (Metal 3 direct DMA enabled)");
-        }
+        // MTLIOCommandQueue availability is observable via MetalF32Backend API if needed.
 
         Ok(Self {
             device,

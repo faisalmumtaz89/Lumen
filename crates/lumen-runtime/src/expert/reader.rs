@@ -532,7 +532,7 @@ mod tests {
 
         let blob_refs: Vec<&[u8]> = layer_blobs.iter().map(|b| b.as_slice()).collect();
         let mut out = Vec::new();
-        write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs).unwrap();
+        write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs, None).unwrap();
 
         // Write to a temp file with unique name per test.
         let dir = std::env::temp_dir();
@@ -727,7 +727,7 @@ mod tests {
         };
         let blob = vec![0u8; 1344];
         let mut out = Vec::new();
-        write_lbc(&mut out, &header, &[idx], &globals, &[&blob]).unwrap();
+        write_lbc(&mut out, &header, &[idx], &globals, &[&blob], None).unwrap();
 
         let dir = std::env::temp_dir();
         let path = dir.join(format!(

@@ -6,6 +6,7 @@
 use crate::crc::crc32;
 use crate::header::{GlobalTensorRange, LbcHeader};
 use crate::index::LayerIndex;
+use crate::tokenizer::TokenizerSection;
 use crate::writer::{align_up, serialize_header, serialize_layer_indices, write_zeros, GlobalTensors};
 use std::io::{self, Write};
 
@@ -25,15 +26,23 @@ pub struct StreamingLbcWriter<W: Write> {
     fixed_indices: Vec<LayerIndex>,
     layers_written: usize,
     total_layers: usize,
+    /// Pre-serialized tokenizer section bytes (written in `finish()`).
+    tokenizer_bytes: Option<Vec<u8>>,
+    /// Alignment padding needed before the tokenizer section.
+    tokenizer_padding: usize,
 }
 
 impl<W: Write> StreamingLbcWriter<W> {
     /// Compute layout, write header + index + globals. O(globals) memory.
+    ///
+    /// If `tokenizer` is provided, it is serialized and its CRC/offset are
+    /// stored in the header. The actual bytes are written in [`finish()`].
     pub fn begin(
         mut w: W,
         header: &LbcHeader,
         layer_shapes: &[LayerShape],
         global_tensors: &GlobalTensors,
+        tokenizer: Option<&TokenizerSection>,
     ) -> io::Result<Self> {
         let num_layers = header.num_layers as usize;
         if layer_shapes.len() != num_layers {
@@ -101,11 +110,6 @@ impl<W: Write> StreamingLbcWriter<W> {
             };
         }
 
-        // Re-serialize header with correct offsets, compute checksum
-        let mut header_bytes = serialize_header(&fixed_header);
-        let checksum = crc32(&header_bytes);
-        header_bytes[12..16].copy_from_slice(&checksum.to_le_bytes());
-
         // Fix up layer indices
         let mut fixed_indices: Vec<LayerIndex> = layer_shapes.iter().map(|s| s.index.clone()).collect();
         let mut layer_cursor = layers_start as u64;
@@ -115,6 +119,36 @@ impl<W: Write> StreamingLbcWriter<W> {
             layer_cursor += layer_shapes[i].blob_size;
             layer_cursor = align_up(layer_cursor as usize, alignment) as u64;
         }
+
+        // Compute end of last layer (unaligned) for tokenizer placement
+        let last_layer_end = if layer_shapes.is_empty() {
+            layers_start as u64
+        } else {
+            let last = &fixed_indices[fixed_indices.len() - 1];
+            last.layer_offset_bytes + last.layer_length_bytes
+        };
+
+        // Pre-serialize tokenizer section, compute CRC and offset
+        let (tokenizer_bytes, tokenizer_padding) = if let Some(tok) = tokenizer {
+            let tok_data = tok.serialize();
+            let tok_start = align_up(last_layer_end as usize, alignment) as u64;
+            let tok_pad = (tok_start - last_layer_end) as usize;
+            fixed_header.tokenizer_section_offset = tok_start;
+            fixed_header.tokenizer_section_length = tok_data.len() as u64;
+            fixed_header.tokenizer_section_crc32 = crc32(&tok_data);
+            (Some(tok_data), tok_pad)
+        } else {
+            fixed_header.tokenizer_section_offset = 0;
+            fixed_header.tokenizer_section_length = 0;
+            fixed_header.tokenizer_section_crc32 = 0;
+            (None, 0)
+        };
+
+        // Re-serialize header with correct offsets, compute checksum
+        let mut header_bytes = serialize_header(&fixed_header);
+        let checksum = crc32(&header_bytes);
+        header_bytes[12..16].copy_from_slice(&checksum.to_le_bytes());
+
         let index_bytes = serialize_layer_indices(&fixed_indices);
 
         // --- Phase 3: write header + index + globals ---
@@ -135,6 +169,8 @@ impl<W: Write> StreamingLbcWriter<W> {
             fixed_indices,
             layers_written: 0,
             total_layers: num_layers,
+            tokenizer_bytes,
+            tokenizer_padding,
         })
     }
 
@@ -178,8 +214,8 @@ impl<W: Write> StreamingLbcWriter<W> {
         Ok(())
     }
 
-    /// Verify all layers written, return inner writer.
-    pub fn finish(self) -> io::Result<W> {
+    /// Verify all layers written, write tokenizer section (if any), return inner writer.
+    pub fn finish(mut self) -> io::Result<W> {
         if self.layers_written != self.total_layers {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -189,6 +225,13 @@ impl<W: Write> StreamingLbcWriter<W> {
                 ),
             ));
         }
+
+        // Write tokenizer section after all layers
+        if let Some(ref tok_data) = self.tokenizer_bytes {
+            write_zeros(&mut self.writer, self.tokenizer_padding)?;
+            self.writer.write_all(tok_data)?;
+        }
+
         Ok(self.writer)
     }
 }
@@ -324,7 +367,7 @@ mod tests {
         let header = LbcHeader::new(hp, qd);
 
         let mut out = Vec::new();
-        let mut sw = StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals).unwrap();
+        let mut sw = StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, None).unwrap();
         for _ in 0..config.num_layers {
             let blob = gen_blob(&mut rng);
             sw.write_layer(&blob).unwrap();
@@ -386,7 +429,7 @@ mod tests {
         let header = LbcHeader::new(hp, qd);
 
         let mut out = Vec::new();
-        let mut sw = StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals).unwrap();
+        let mut sw = StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, None).unwrap();
         for _ in 0..config.num_layers {
             sw.write_layer(&gen_blob(&mut rng)).unwrap();
         }
@@ -441,7 +484,7 @@ mod tests {
         let header = LbcHeader::new(hp, qd);
 
         let mut out = Vec::new();
-        let mut sw = StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals).unwrap();
+        let mut sw = StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, None).unwrap();
         for _ in 0..config.num_layers {
             sw.write_layer(&gen_blob(&mut rng)).unwrap();
         }
@@ -492,7 +535,7 @@ mod tests {
         let header = LbcHeader::new(hp, qd);
 
         let mut out = Vec::new();
-        let mut sw = StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals).unwrap();
+        let mut sw = StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, None).unwrap();
         // Write only 1 of 2 layers
         sw.write_layer(&gen_blob(&mut rng)).unwrap();
         let err = sw.finish();
@@ -540,7 +583,7 @@ mod tests {
         let header = LbcHeader::new(hp, qd);
 
         let mut out = Vec::new();
-        let mut sw = StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals).unwrap();
+        let mut sw = StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, None).unwrap();
         let err = sw.write_layer(&[0u8; 17]); // Wrong size
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("blob size mismatch"));

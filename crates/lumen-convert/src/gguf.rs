@@ -1,6 +1,6 @@
 //! Zero-dependency GGUF file format parser.
 //!
-//! GGUF is llama.cpp's model format. This module parses the header, metadata
+//! GGUF model format parser. Parses the header, metadata
 //! key-value pairs, and tensor info entries. It does NOT load tensor data into
 //! memory (which can be many GB), making it suitable for streaming conversion.
 //!
@@ -578,6 +578,41 @@ impl GgufFile {
         }
     }
 
+    /// Get an array of f32 metadata values (for tokenizer.ggml.scores).
+    pub fn get_f32_array(&self, key: &str) -> Option<Vec<f32>> {
+        match self.get_metadata(key)? {
+            GgufValue::Array(arr) => {
+                let mut result = Vec::with_capacity(arr.values.len());
+                for v in &arr.values {
+                    match v {
+                        GgufValue::F32(f) => result.push(*f),
+                        _ => return None,
+                    }
+                }
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+
+    /// Get an array of u32 metadata values, with i32 coercion (for tokenizer.ggml.token_type).
+    pub fn get_u32_array(&self, key: &str) -> Option<Vec<u32>> {
+        match self.get_metadata(key)? {
+            GgufValue::Array(arr) => {
+                let mut result = Vec::with_capacity(arr.values.len());
+                for v in &arr.values {
+                    match v {
+                        GgufValue::U32(n) => result.push(*n),
+                        GgufValue::I32(n) => result.push(u32::try_from(*n).ok()?),
+                        _ => return None,
+                    }
+                }
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+
     // -- Tensor accessors ----------------------------------------------------
 
     /// Find a tensor by name.
@@ -821,6 +856,35 @@ impl GgufBuilder {
     pub fn add_f32(&mut self, key: &str, value: f32) -> &mut Self {
         self.metadata
             .push((key.to_string(), GgufValue::F32(value)));
+        self
+    }
+
+    /// Add a bool metadata key-value pair.
+    pub fn add_bool(&mut self, key: &str, value: bool) -> &mut Self {
+        self.metadata
+            .push((key.to_string(), GgufValue::Bool(value)));
+        self
+    }
+
+    /// Add an f32 array metadata key-value pair.
+    pub fn add_f32_array(&mut self, key: &str, values: &[f32]) -> &mut Self {
+        let arr = GgufArray {
+            element_type: 6, // F32
+            values: values.iter().map(|v| GgufValue::F32(*v)).collect(),
+        };
+        self.metadata
+            .push((key.to_string(), GgufValue::Array(arr)));
+        self
+    }
+
+    /// Add a u32 array metadata key-value pair.
+    pub fn add_u32_array(&mut self, key: &str, values: &[u32]) -> &mut Self {
+        let arr = GgufArray {
+            element_type: 4, // U32
+            values: values.iter().map(|v| GgufValue::U32(*v)).collect(),
+        };
+        self.metadata
+            .push((key.to_string(), GgufValue::Array(arr)));
         self
     }
 
@@ -2106,5 +2170,192 @@ mod tests {
         assert!(msg.contains("resource limit exceeded"));
         assert!(msg.contains("test message"));
         assert!(std::error::Error::source(&err).is_none());
+    }
+
+    // -- f32 array accessor tests --------------------------------------------
+
+    #[test]
+    fn get_f32_array_basic() {
+        let mut builder = GgufBuilder::new();
+        builder.add_f32_array("test.scores", &[1.0, 2.5, -0.3]);
+        let bytes = builder.build();
+        let file = GgufFile::parse(&mut bytes.as_slice()).unwrap();
+
+        let arr = file.get_f32_array("test.scores").unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0], 1.0);
+        assert_eq!(arr[1], 2.5);
+        assert_eq!(arr[2], -0.3);
+    }
+
+    #[test]
+    fn get_f32_array_empty() {
+        let mut builder = GgufBuilder::new();
+        builder.add_f32_array("test.empty", &[]);
+        let bytes = builder.build();
+        let file = GgufFile::parse(&mut bytes.as_slice()).unwrap();
+
+        let arr = file.get_f32_array("test.empty").unwrap();
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn get_f32_array_missing_key() {
+        let builder = GgufBuilder::new();
+        let bytes = builder.build();
+        let file = GgufFile::parse(&mut bytes.as_slice()).unwrap();
+
+        assert!(file.get_f32_array("nonexistent").is_none());
+    }
+
+    #[test]
+    fn get_f32_array_wrong_type() {
+        let mut builder = GgufBuilder::new();
+        builder.add_u32("test.not_array", 42);
+        let bytes = builder.build();
+        let file = GgufFile::parse(&mut bytes.as_slice()).unwrap();
+
+        assert!(file.get_f32_array("test.not_array").is_none());
+    }
+
+    #[test]
+    fn get_f32_array_wrong_element_type() {
+        let mut builder = GgufBuilder::new();
+        builder.add_string_array("test.strings", &["a", "b"]);
+        let bytes = builder.build();
+        let file = GgufFile::parse(&mut bytes.as_slice()).unwrap();
+
+        assert!(file.get_f32_array("test.strings").is_none());
+    }
+
+    // -- u32 array accessor tests --------------------------------------------
+
+    #[test]
+    fn get_u32_array_basic() {
+        let mut builder = GgufBuilder::new();
+        builder.add_u32_array("test.types", &[1, 2, 3, 1]);
+        let bytes = builder.build();
+        let file = GgufFile::parse(&mut bytes.as_slice()).unwrap();
+
+        let arr = file.get_u32_array("test.types").unwrap();
+        assert_eq!(arr, vec![1, 2, 3, 1]);
+    }
+
+    #[test]
+    fn get_u32_array_empty() {
+        let mut builder = GgufBuilder::new();
+        builder.add_u32_array("test.empty", &[]);
+        let bytes = builder.build();
+        let file = GgufFile::parse(&mut bytes.as_slice()).unwrap();
+
+        let arr = file.get_u32_array("test.empty").unwrap();
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn get_u32_array_missing_key() {
+        let builder = GgufBuilder::new();
+        let bytes = builder.build();
+        let file = GgufFile::parse(&mut bytes.as_slice()).unwrap();
+
+        assert!(file.get_u32_array("nonexistent").is_none());
+    }
+
+    #[test]
+    fn get_u32_array_wrong_type() {
+        let mut builder = GgufBuilder::new();
+        builder.add_string("test.str", "hello");
+        let bytes = builder.build();
+        let file = GgufFile::parse(&mut bytes.as_slice()).unwrap();
+
+        assert!(file.get_u32_array("test.str").is_none());
+    }
+
+    #[test]
+    fn get_u32_array_i32_coercion() {
+        // Build a GGUF with an I32 array and verify get_u32_array coerces it.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // n_tensors
+        buf.extend_from_slice(&1u64.to_le_bytes()); // n_kv
+
+        write_test_string(&mut buf, "test.i32_array");
+        buf.extend_from_slice(&9u32.to_le_bytes()); // Array type tag
+        buf.extend_from_slice(&5u32.to_le_bytes()); // I32 element type
+        buf.extend_from_slice(&3u64.to_le_bytes()); // 3 elements
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&1i32.to_le_bytes());
+        buf.extend_from_slice(&3i32.to_le_bytes());
+
+        pad_to_alignment(&mut buf, 32);
+
+        let file = GgufFile::parse(&mut buf.as_slice()).unwrap();
+        let arr = file.get_u32_array("test.i32_array").unwrap();
+        assert_eq!(arr, vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn get_u32_array_negative_i32_returns_none() {
+        // Negative I32 values cannot convert to u32.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // n_tensors
+        buf.extend_from_slice(&1u64.to_le_bytes()); // n_kv
+
+        write_test_string(&mut buf, "test.neg_i32");
+        buf.extend_from_slice(&9u32.to_le_bytes()); // Array type tag
+        buf.extend_from_slice(&5u32.to_le_bytes()); // I32 element type
+        buf.extend_from_slice(&2u64.to_le_bytes()); // 2 elements
+        buf.extend_from_slice(&1i32.to_le_bytes());
+        buf.extend_from_slice(&(-1i32).to_le_bytes());
+
+        pad_to_alignment(&mut buf, 32);
+
+        let file = GgufFile::parse(&mut buf.as_slice()).unwrap();
+        assert!(file.get_u32_array("test.neg_i32").is_none());
+    }
+
+    // -- Builder bool/f32_array/u32_array roundtrip tests --------------------
+
+    #[test]
+    fn builder_bool_roundtrip() {
+        let mut builder = GgufBuilder::new();
+        builder.add_bool("test.true", true);
+        builder.add_bool("test.false", false);
+        let bytes = builder.build();
+        let file = GgufFile::parse(&mut bytes.as_slice()).unwrap();
+
+        match file.get_metadata("test.true").unwrap() {
+            GgufValue::Bool(v) => assert!(*v),
+            other => panic!("expected Bool(true), got {other:?}"),
+        }
+        match file.get_metadata("test.false").unwrap() {
+            GgufValue::Bool(v) => assert!(!v),
+            other => panic!("expected Bool(false), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_f32_array_roundtrip() {
+        let mut builder = GgufBuilder::new();
+        builder.add_f32_array("test.scores", &[0.5, 1.0, -2.0]);
+        let bytes = builder.build();
+        let file = GgufFile::parse(&mut bytes.as_slice()).unwrap();
+
+        let arr = file.get_f32_array("test.scores").unwrap();
+        assert_eq!(arr, vec![0.5, 1.0, -2.0]);
+    }
+
+    #[test]
+    fn builder_u32_array_roundtrip() {
+        let mut builder = GgufBuilder::new();
+        builder.add_u32_array("test.types", &[1, 3, 6]);
+        let bytes = builder.build();
+        let file = GgufFile::parse(&mut bytes.as_slice()).unwrap();
+
+        let arr = file.get_u32_array("test.types").unwrap();
+        assert_eq!(arr, vec![1, 3, 6]);
     }
 }

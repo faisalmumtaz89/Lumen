@@ -10,7 +10,7 @@ Prerequisites:
   3. Install tokenizer: pip install transformers
 
 Usage:
-  python demo/metal_inference.py --model /tmp/lumen-bench/tinyllama-1.1b-q8_0.lbc \
+  python examples/metal_inference.py --model /tmp/lumen-bench/tinyllama-1.1b-q8_0.lbc \
       --tokenizer TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
       --prompt "The capital of France is" \
       --max-tokens 64

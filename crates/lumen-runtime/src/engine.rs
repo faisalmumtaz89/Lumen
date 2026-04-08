@@ -356,12 +356,12 @@ impl InferenceEngine {
 
         // Derive the maximum expected generated tokens from the stop condition
         // to pre-allocate output and timing vectors accurately.
+        // Clamp to context window to prevent multi-GB allocations from huge --max-tokens.
+        let context_budget = self.config.max_seq_len.saturating_sub(prompt_tokens.len());
         let max_expected = match stop {
-            StopCondition::MaxTokens(n) => *n,
-            StopCondition::EosTokens(_) => {
-                self.config.max_seq_len.saturating_sub(prompt_tokens.len())
-            }
-            StopCondition::MaxTokensOrEos { max_tokens, .. } => *max_tokens,
+            StopCondition::MaxTokens(n) => (*n).min(context_budget),
+            StopCondition::EosTokens(_) => context_budget,
+            StopCondition::MaxTokensOrEos { max_tokens, .. } => (*max_tokens).min(context_budget),
         };
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_expected);
         let expected_total_tokens = prompt_tokens.len() + max_expected;
@@ -532,12 +532,11 @@ impl InferenceEngine {
             precision: self.config.kv_precision,
         })?;
 
+        let context_budget = self.config.max_seq_len.saturating_sub(prompt_tokens.len());
         let max_expected = match stop {
-            StopCondition::MaxTokens(n) => *n,
-            StopCondition::EosTokens(_) => {
-                self.config.max_seq_len.saturating_sub(prompt_tokens.len())
-            }
-            StopCondition::MaxTokensOrEos { max_tokens, .. } => *max_tokens,
+            StopCondition::MaxTokens(n) => (*n).min(context_budget),
+            StopCondition::EosTokens(_) => context_budget,
+            StopCondition::MaxTokensOrEos { max_tokens, .. } => (*max_tokens).min(context_budget),
         };
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_expected);
         let expected_total_tokens = prompt_tokens.len() + max_expected;

@@ -1,0 +1,681 @@
+{
+  "model_key": "tinyllama",
+  "hf_model_id": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "gguf_model_type": "llama",
+  "gguf_pre": "default",
+  "vocab_size": 32000,
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "generator_versions": {
+    "transformers": "5.3.0",
+    "python": "3.14.3"
+  },
+  "test_cases": [
+    {
+      "id": "basic_hello",
+      "input": "Hello, world!",
+      "token_ids": [
+        15043,
+        29892,
+        3186,
+        29991
+      ],
+      "decoded": "Hello, world!",
+      "round_trip": true,
+      "num_tokens": 4
+    },
+    {
+      "id": "basic_capital",
+      "input": "The capital of France is",
+      "token_ids": [
+        450,
+        7483,
+        310,
+        3444,
+        338
+      ],
+      "decoded": "The capital of France is",
+      "round_trip": true,
+      "num_tokens": 5
+    },
+    {
+      "id": "basic_math",
+      "input": "1 + 1 = 2",
+      "token_ids": [
+        29871,
+        29896,
+        718,
+        29871,
+        29896,
+        353,
+        29871,
+        29906
+      ],
+      "decoded": "1 + 1 = 2",
+      "round_trip": true,
+      "num_tokens": 8
+    },
+    {
+      "id": "basic_empty",
+      "input": "",
+      "token_ids": [],
+      "decoded": "",
+      "round_trip": true,
+      "num_tokens": 0
+    },
+    {
+      "id": "basic_space",
+      "input": " ",
+      "token_ids": [
+        29871
+      ],
+      "decoded": "",
+      "round_trip": false,
+      "num_tokens": 1
+    },
+    {
+      "id": "unicode_accents",
+      "input": "café résumé",
+      "token_ids": [
+        274,
+        28059,
+        6896,
+        398,
+        29948
+      ],
+      "decoded": "café résumé",
+      "round_trip": true,
+      "num_tokens": 5
+    },
+    {
+      "id": "unicode_cjk",
+      "input": "北京市",
+      "token_ids": [
+        29871,
+        30662,
+        30675,
+        30461
+      ],
+      "decoded": "北京市",
+      "round_trip": true,
+      "num_tokens": 4
+    },
+    {
+      "id": "unicode_arabic",
+      "input": "مرحبا",
+      "token_ids": [
+        29871,
+        30159,
+        30156,
+        30240,
+        30177,
+        30112
+      ],
+      "decoded": "مرحبا",
+      "round_trip": true,
+      "num_tokens": 6
+    },
+    {
+      "id": "unicode_emoji",
+      "input": "🎉🔥💻",
+      "token_ids": [
+        29871,
+        243,
+        162,
+        145,
+        140,
+        243,
+        162,
+        151,
+        168,
+        243,
+        162,
+        149,
+        190
+      ],
+      "decoded": "🎉🔥💻",
+      "round_trip": true,
+      "num_tokens": 13
+    },
+    {
+      "id": "unicode_mixed",
+      "input": "Hello 世界",
+      "token_ids": [
+        15043,
+        29871,
+        30793,
+        30967
+      ],
+      "decoded": "Hello 世界",
+      "round_trip": true,
+      "num_tokens": 4
+    },
+    {
+      "id": "unicode_zwj",
+      "input": "👨‍👩‍👧‍👦",
+      "token_ids": [
+        29871,
+        243,
+        162,
+        148,
+        171,
+        30722,
+        243,
+        162,
+        148,
+        172,
+        30722,
+        243,
+        162,
+        148,
+        170,
+        30722,
+        243,
+        162,
+        148,
+        169
+      ],
+      "decoded": "👨‍👩‍👧‍👦",
+      "round_trip": true,
+      "num_tokens": 20
+    },
+    {
+      "id": "ws_double_space",
+      "input": "Hello,  world!",
+      "token_ids": [
+        15043,
+        29892,
+        29871,
+        3186,
+        29991
+      ],
+      "decoded": "Hello,  world!",
+      "round_trip": true,
+      "num_tokens": 5
+    },
+    {
+      "id": "ws_leading",
+      "input": "   leading",
+      "token_ids": [
+        259,
+        8236
+      ],
+      "decoded": "  leading",
+      "round_trip": false,
+      "num_tokens": 2
+    },
+    {
+      "id": "ws_trailing",
+      "input": "trailing   ",
+      "token_ids": [
+        25053,
+        1678
+      ],
+      "decoded": "trailing   ",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "ws_newlines",
+      "input": "\n\nfoo\n",
+      "token_ids": [
+        29871,
+        13,
+        13,
+        5431,
+        13
+      ],
+      "decoded": "\n\nfoo\n",
+      "round_trip": true,
+      "num_tokens": 5
+    },
+    {
+      "id": "ws_contractions",
+      "input": "it's a test",
+      "token_ids": [
+        372,
+        29915,
+        29879,
+        263,
+        1243
+      ],
+      "decoded": "it's a test",
+      "round_trip": true,
+      "num_tokens": 5
+    },
+    {
+      "id": "merge_repeated",
+      "input": "aaaaaa",
+      "token_ids": [
+        263,
+        27137,
+        29874
+      ],
+      "decoded": "aaaaaa",
+      "round_trip": true,
+      "num_tokens": 3
+    },
+    {
+      "id": "merge_bigram",
+      "input": "abababab",
+      "token_ids": [
+        633,
+        370,
+        370,
+        370
+      ],
+      "decoded": "abababab",
+      "round_trip": true,
+      "num_tokens": 4
+    },
+    {
+      "id": "merge_special_text",
+      "input": "<|endoftext|>",
+      "token_ids": [
+        529,
+        29989,
+        355,
+        974,
+        726,
+        29989,
+        29958
+      ],
+      "decoded": "<|endoftext|>",
+      "round_trip": true,
+      "num_tokens": 7
+    },
+    {
+      "id": "merge_chatml_text",
+      "input": "<|im_start|>system",
+      "token_ids": [
+        529,
+        29989,
+        326,
+        29918,
+        2962,
+        29989,
+        29958,
+        5205
+      ],
+      "decoded": "<|im_start|>system",
+      "round_trip": true,
+      "num_tokens": 8
+    },
+    {
+      "id": "code_python",
+      "input": "def foo(x):\n    return x * 2\n",
+      "token_ids": [
+        822,
+        7953,
+        29898,
+        29916,
+        1125,
+        13,
+        1678,
+        736,
+        921,
+        334,
+        29871,
+        29906,
+        13
+      ],
+      "decoded": "def foo(x):\n    return x * 2\n",
+      "round_trip": true,
+      "num_tokens": 13
+    },
+    {
+      "id": "code_rust",
+      "input": "fn main() {\n    println!(\"hello\");\n}",
+      "token_ids": [
+        7876,
+        1667,
+        580,
+        426,
+        13,
+        1678,
+        22088,
+        28457,
+        12199,
+        1496,
+        13,
+        29913
+      ],
+      "decoded": "fn main() {\n    println!(\"hello\");\n}",
+      "round_trip": true,
+      "num_tokens": 12
+    },
+    {
+      "id": "code_json",
+      "input": "{\"key\": [1, 2, 3], \"nested\": {\"a\": null}}",
+      "token_ids": [
+        8853,
+        1989,
+        1115,
+        518,
+        29896,
+        29892,
+        29871,
+        29906,
+        29892,
+        29871,
+        29941,
+        1402,
+        376,
+        27420,
+        1115,
+        8853,
+        29874,
+        1115,
+        1870,
+        930
+      ],
+      "decoded": "{\"key\": [1, 2, 3], \"nested\": {\"a\": null}}",
+      "round_trip": true,
+      "num_tokens": 20
+    },
+    {
+      "id": "code_html",
+      "input": "<div class=\"test\">&amp;</div>",
+      "token_ids": [
+        529,
+        4563,
+        770,
+        543,
+        1688,
+        1013,
+        29987,
+        1160,
+        14814,
+        4563,
+        29958
+      ],
+      "decoded": "<div class=\"test\">&amp;</div>",
+      "round_trip": true,
+      "num_tokens": 11
+    },
+    {
+      "id": "boundary_single_char",
+      "input": "a",
+      "token_ids": [
+        263
+      ],
+      "decoded": "a",
+      "round_trip": true,
+      "num_tokens": 1
+    },
+    {
+      "id": "boundary_paragraph",
+      "input": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. ",
+      "token_ids": [
+        450,
+        4996,
+        17354,
+        1701,
+        29916,
+        432,
+        17204,
+        975,
+        278,
+        17366,
+        11203,
+        29889,
+        450,
+        4996,
+        17354,
+        1701,
+        29916,
+        432,
+        17204,
+        975,
+        278,
+        17366,
+        11203,
+        29889,
+        450,
+        4996,
+        17354,
+        1701,
+        29916,
+        432,
+        17204,
+        975,
+        278,
+        17366,
+        11203,
+        29889,
+        450,
+        4996,
+        17354,
+        1701,
+        29916,
+        432,
+        17204,
+        975,
+        278,
+        17366,
+        11203,
+        29889,
+        450,
+        4996,
+        17354,
+        1701,
+        29916,
+        432,
+        17204,
+        975,
+        278,
+        17366,
+        11203,
+        29889,
+        450,
+        4996,
+        17354,
+        1701,
+        29916,
+        432,
+        17204,
+        975,
+        278,
+        17366,
+        11203,
+        29889,
+        450,
+        4996,
+        17354,
+        1701,
+        29916,
+        432,
+        17204,
+        975,
+        278,
+        17366,
+        11203,
+        29889,
+        450,
+        4996,
+        17354,
+        1701,
+        29916,
+        432,
+        17204,
+        975,
+        278,
+        17366,
+        11203,
+        29889,
+        450,
+        4996,
+        17354,
+        1701,
+        29916,
+        432,
+        17204,
+        975,
+        278,
+        17366,
+        11203,
+        29889,
+        450,
+        4996,
+        17354,
+        1701,
+        29916,
+        432,
+        17204,
+        975,
+        278,
+        17366,
+        11203,
+        29889,
+        450,
+        4996,
+        17354,
+        1701,
+        29916,
+        432,
+        17204,
+        975,
+        278,
+        17366,
+        11203,
+        29889,
+        29871
+      ],
+      "decoded": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. ",
+      "round_trip": true,
+      "num_tokens": 133
+    },
+    {
+      "id": "boundary_special_ws",
+      "input": "​ ",
+      "token_ids": [
+        29871,
+        30166,
+        30081
+      ],
+      "decoded": "​ ",
+      "round_trip": true,
+      "num_tokens": 3
+    },
+    {
+      "id": "boundary_url",
+      "input": "https://example.com/path?q=hello+world&x=1#anchor",
+      "token_ids": [
+        2045,
+        597,
+        4773,
+        29889,
+        510,
+        29914,
+        2084,
+        29973,
+        29939,
+        29922,
+        12199,
+        29974,
+        11526,
+        29987,
+        29916,
+        29922,
+        29896,
+        29937,
+        25367
+      ],
+      "decoded": "https://example.com/path?q=hello+world&x=1#anchor",
+      "round_trip": true,
+      "num_tokens": 19
+    },
+    {
+      "id": "contract_multi",
+      "input": "don't won't can't",
+      "token_ids": [
+        1016,
+        29915,
+        29873,
+        2113,
+        29915,
+        29873,
+        508,
+        29915,
+        29873
+      ],
+      "decoded": "don't won't can't",
+      "round_trip": true,
+      "num_tokens": 9
+    },
+    {
+      "id": "contract_im",
+      "input": "I'm",
+      "token_ids": [
+        306,
+        29915,
+        29885
+      ],
+      "decoded": "I'm",
+      "round_trip": true,
+      "num_tokens": 3
+    },
+    {
+      "id": "contract_theyre",
+      "input": "they're",
+      "token_ids": [
+        896,
+        29915,
+        276
+      ],
+      "decoded": "they're",
+      "round_trip": true,
+      "num_tokens": 3
+    },
+    {
+      "id": "norm_nfc",
+      "input": "café",
+      "token_ids": [
+        274,
+        28059
+      ],
+      "decoded": "café",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "norm_nfd",
+      "input": "café",
+      "token_ids": [
+        5777,
+        1725,
+        30103
+      ],
+      "decoded": "café",
+      "round_trip": true,
+      "num_tokens": 3
+    }
+  ],
+  "chat_template_test": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "expected_text": "<|user|>\nHello</s>\n<|assistant|>\n",
+    "expected_token_ids": [
+      529,
+      29989,
+      1792,
+      29989,
+      29958,
+      13,
+      10994,
+      2,
+      13,
+      29966,
+      29989,
+      465,
+      22137,
+      29989,
+      29958,
+      13
+    ]
+  }
+}

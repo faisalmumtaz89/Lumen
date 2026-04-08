@@ -20,3 +20,4 @@ tracker.md
 # Python bytecache
 __pycache__/
 *.pyc
+/.claude

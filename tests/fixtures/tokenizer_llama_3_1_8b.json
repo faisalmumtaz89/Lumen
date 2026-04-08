@@ -1,0 +1,642 @@
+{
+  "model_key": "llama-3.1-8b",
+  "hf_model_id": "unsloth/Meta-Llama-3.1-8B-Instruct",
+  "gguf_model_type": "gpt2",
+  "gguf_pre": "llama-bpe",
+  "vocab_size": 128000,
+  "bos_token_id": 128000,
+  "eos_token_id": 128009,
+  "generator_versions": {
+    "transformers": "5.3.0",
+    "python": "3.14.3"
+  },
+  "test_cases": [
+    {
+      "id": "basic_hello",
+      "input": "Hello, world!",
+      "token_ids": [
+        9906,
+        11,
+        1917,
+        0
+      ],
+      "decoded": "Hello, world!",
+      "round_trip": true,
+      "num_tokens": 4
+    },
+    {
+      "id": "basic_capital",
+      "input": "The capital of France is",
+      "token_ids": [
+        791,
+        6864,
+        315,
+        9822,
+        374
+      ],
+      "decoded": "The capital of France is",
+      "round_trip": true,
+      "num_tokens": 5
+    },
+    {
+      "id": "basic_math",
+      "input": "1 + 1 = 2",
+      "token_ids": [
+        16,
+        489,
+        220,
+        16,
+        284,
+        220,
+        17
+      ],
+      "decoded": "1 + 1 = 2",
+      "round_trip": true,
+      "num_tokens": 7
+    },
+    {
+      "id": "basic_empty",
+      "input": "",
+      "token_ids": [],
+      "decoded": "",
+      "round_trip": true,
+      "num_tokens": 0
+    },
+    {
+      "id": "basic_space",
+      "input": " ",
+      "token_ids": [
+        220
+      ],
+      "decoded": " ",
+      "round_trip": true,
+      "num_tokens": 1
+    },
+    {
+      "id": "unicode_accents",
+      "input": "café résumé",
+      "token_ids": [
+        936,
+        59958,
+        9517,
+        1264,
+        978
+      ],
+      "decoded": "café résumé",
+      "round_trip": true,
+      "num_tokens": 5
+    },
+    {
+      "id": "unicode_cjk",
+      "input": "北京市",
+      "token_ids": [
+        70090,
+        23530
+      ],
+      "decoded": "北京市",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "unicode_arabic",
+      "input": "مرحبا",
+      "token_ids": [
+        101244,
+        30925,
+        103645
+      ],
+      "decoded": "مرحبا",
+      "round_trip": true,
+      "num_tokens": 3
+    },
+    {
+      "id": "unicode_emoji",
+      "input": "🎉🔥💻",
+      "token_ids": [
+        9468,
+        236,
+        231,
+        9468,
+        242,
+        98,
+        93273,
+        119
+      ],
+      "decoded": "🎉🔥💻",
+      "round_trip": true,
+      "num_tokens": 8
+    },
+    {
+      "id": "unicode_mixed",
+      "input": "Hello 世界",
+      "token_ids": [
+        9906,
+        127365
+      ],
+      "decoded": "Hello 世界",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "unicode_zwj",
+      "input": "👨‍👩‍👧‍👦",
+      "token_ids": [
+        9468,
+        239,
+        101,
+        102470,
+        9468,
+        239,
+        102,
+        102470,
+        9468,
+        239,
+        100,
+        102470,
+        9468,
+        239,
+        99
+      ],
+      "decoded": "👨‍👩‍👧‍👦",
+      "round_trip": true,
+      "num_tokens": 15
+    },
+    {
+      "id": "ws_double_space",
+      "input": "Hello,  world!",
+      "token_ids": [
+        9906,
+        11,
+        220,
+        1917,
+        0
+      ],
+      "decoded": "Hello,  world!",
+      "round_trip": true,
+      "num_tokens": 5
+    },
+    {
+      "id": "ws_leading",
+      "input": "   leading",
+      "token_ids": [
+        256,
+        6522
+      ],
+      "decoded": "   leading",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "ws_trailing",
+      "input": "trailing   ",
+      "token_ids": [
+        376,
+        14612,
+        262
+      ],
+      "decoded": "trailing   ",
+      "round_trip": true,
+      "num_tokens": 3
+    },
+    {
+      "id": "ws_newlines",
+      "input": "\n\nfoo\n",
+      "token_ids": [
+        271,
+        8134,
+        198
+      ],
+      "decoded": "\n\nfoo\n",
+      "round_trip": true,
+      "num_tokens": 3
+    },
+    {
+      "id": "ws_contractions",
+      "input": "it's a test",
+      "token_ids": [
+        275,
+        596,
+        264,
+        1296
+      ],
+      "decoded": "it's a test",
+      "round_trip": true,
+      "num_tokens": 4
+    },
+    {
+      "id": "merge_repeated",
+      "input": "aaaaaa",
+      "token_ids": [
+        29558,
+        5418
+      ],
+      "decoded": "aaaaaa",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "merge_bigram",
+      "input": "abababab",
+      "token_ids": [
+        370,
+        370,
+        370,
+        370
+      ],
+      "decoded": "abababab",
+      "round_trip": true,
+      "num_tokens": 4
+    },
+    {
+      "id": "merge_special_text",
+      "input": "<|endoftext|>",
+      "token_ids": [
+        27,
+        91,
+        8862,
+        728,
+        428,
+        91,
+        29
+      ],
+      "decoded": "<|endoftext|>",
+      "round_trip": true,
+      "num_tokens": 7
+    },
+    {
+      "id": "merge_chatml_text",
+      "input": "<|im_start|>system",
+      "token_ids": [
+        27,
+        91,
+        318,
+        5011,
+        91,
+        29,
+        9125
+      ],
+      "decoded": "<|im_start|>system",
+      "round_trip": true,
+      "num_tokens": 7
+    },
+    {
+      "id": "code_python",
+      "input": "def foo(x):\n    return x * 2\n",
+      "token_ids": [
+        755,
+        15586,
+        2120,
+        997,
+        262,
+        471,
+        865,
+        353,
+        220,
+        17,
+        198
+      ],
+      "decoded": "def foo(x):\n    return x * 2\n",
+      "round_trip": true,
+      "num_tokens": 11
+    },
+    {
+      "id": "code_rust",
+      "input": "fn main() {\n    println!(\"hello\");\n}",
+      "token_ids": [
+        8998,
+        1925,
+        368,
+        341,
+        262,
+        14069,
+        17667,
+        15339,
+        803,
+        92
+      ],
+      "decoded": "fn main() {\n    println!(\"hello\");\n}",
+      "round_trip": true,
+      "num_tokens": 10
+    },
+    {
+      "id": "code_json",
+      "input": "{\"key\": [1, 2, 3], \"nested\": {\"a\": null}}",
+      "token_ids": [
+        5018,
+        798,
+        794,
+        510,
+        16,
+        11,
+        220,
+        17,
+        11,
+        220,
+        18,
+        1145,
+        330,
+        60371,
+        794,
+        5324,
+        64,
+        794,
+        854,
+        3500
+      ],
+      "decoded": "{\"key\": [1, 2, 3], \"nested\": {\"a\": null}}",
+      "round_trip": true,
+      "num_tokens": 20
+    },
+    {
+      "id": "code_html",
+      "input": "<div class=\"test\">&amp;</div>",
+      "token_ids": [
+        2691,
+        538,
+        429,
+        1985,
+        13670,
+        1141,
+        11601,
+        614,
+        29
+      ],
+      "decoded": "<div class=\"test\">&amp;</div>",
+      "round_trip": true,
+      "num_tokens": 9
+    },
+    {
+      "id": "boundary_single_char",
+      "input": "a",
+      "token_ids": [
+        64
+      ],
+      "decoded": "a",
+      "round_trip": true,
+      "num_tokens": 1
+    },
+    {
+      "id": "boundary_paragraph",
+      "input": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. ",
+      "token_ids": [
+        791,
+        4062,
+        14198,
+        39935,
+        35308,
+        927,
+        279,
+        16053,
+        5679,
+        13,
+        578,
+        4062,
+        14198,
+        39935,
+        35308,
+        927,
+        279,
+        16053,
+        5679,
+        13,
+        578,
+        4062,
+        14198,
+        39935,
+        35308,
+        927,
+        279,
+        16053,
+        5679,
+        13,
+        578,
+        4062,
+        14198,
+        39935,
+        35308,
+        927,
+        279,
+        16053,
+        5679,
+        13,
+        578,
+        4062,
+        14198,
+        39935,
+        35308,
+        927,
+        279,
+        16053,
+        5679,
+        13,
+        578,
+        4062,
+        14198,
+        39935,
+        35308,
+        927,
+        279,
+        16053,
+        5679,
+        13,
+        578,
+        4062,
+        14198,
+        39935,
+        35308,
+        927,
+        279,
+        16053,
+        5679,
+        13,
+        578,
+        4062,
+        14198,
+        39935,
+        35308,
+        927,
+        279,
+        16053,
+        5679,
+        13,
+        578,
+        4062,
+        14198,
+        39935,
+        35308,
+        927,
+        279,
+        16053,
+        5679,
+        13,
+        578,
+        4062,
+        14198,
+        39935,
+        35308,
+        927,
+        279,
+        16053,
+        5679,
+        13,
+        578,
+        4062,
+        14198,
+        39935,
+        35308,
+        927,
+        279,
+        16053,
+        5679,
+        13,
+        220
+      ],
+      "decoded": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. ",
+      "round_trip": true,
+      "num_tokens": 111
+    },
+    {
+      "id": "boundary_special_ws",
+      "input": "​ ",
+      "token_ids": [
+        16067,
+        4194
+      ],
+      "decoded": "​ ",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "boundary_url",
+      "input": "https://example.com/path?q=hello+world&x=1#anchor",
+      "token_ids": [
+        2485,
+        1129,
+        8858,
+        916,
+        52076,
+        44882,
+        28,
+        15339,
+        10,
+        14957,
+        5,
+        87,
+        28,
+        16,
+        2,
+        17547
+      ],
+      "decoded": "https://example.com/path?q=hello+world&x=1#anchor",
+      "round_trip": true,
+      "num_tokens": 16
+    },
+    {
+      "id": "contract_multi",
+      "input": "don't won't can't",
+      "token_ids": [
+        15357,
+        956,
+        2834,
+        956,
+        649,
+        956
+      ],
+      "decoded": "don't won't can't",
+      "round_trip": true,
+      "num_tokens": 6
+    },
+    {
+      "id": "contract_im",
+      "input": "I'm",
+      "token_ids": [
+        40,
+        2846
+      ],
+      "decoded": "I'm",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "contract_theyre",
+      "input": "they're",
+      "token_ids": [
+        20670,
+        2351
+      ],
+      "decoded": "they're",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "norm_nfc",
+      "input": "café",
+      "token_ids": [
+        936,
+        59958
+      ],
+      "decoded": "café",
+      "round_trip": true,
+      "num_tokens": 2
+    },
+    {
+      "id": "norm_nfd",
+      "input": "café",
+      "token_ids": [
+        936,
+        1897,
+        54939
+      ],
+      "decoded": "café",
+      "round_trip": true,
+      "num_tokens": 3
+    }
+  ],
+  "chat_template_test": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "expected_text": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+    "expected_token_ids": [
+      128000,
+      128006,
+      9125,
+      128007,
+      271,
+      38766,
+      1303,
+      33025,
+      2696,
+      25,
+      6790,
+      220,
+      2366,
+      18,
+      198,
+      15724,
+      2696,
+      25,
+      220,
+      1627,
+      10263,
+      220,
+      2366,
+      19,
+      271,
+      128009,
+      128006,
+      882,
+      128007,
+      271,
+      9906,
+      128009,
+      128006,
+      78191,
+      128007,
+      271
+    ]
+  }
+}

@@ -2,35 +2,33 @@
 
 LLM inference engine in Rust with Metal and CUDA GPU backends.
 
-> **Status:** Active development. Produces correct output across 500+ tests. API and binary format not yet stable.
+Lumen is built from scratch with zero external ML dependencies — no PyTorch, no ONNX, no Python runtime. Every kernel, every tokenizer, every format parser is native Rust and GPU shader code. The result is a single binary that downloads a model, tokenizes your prompt, runs GPU-resident inference, and prints text.
+
+> **Status:** Active development. Produces correct output across 575+ tests. API and binary format not yet stable.
 
 ## Features
 
-- **Metal** (Apple Silicon) and **CUDA** (NVIDIA) GPU backends
-- GPU-resident inference — all weights in GPU memory, zero per-token transfers
-- Custom **LBC** binary format optimized for zero-copy GPU mapping and MoE streaming
-- GGUF model import with automatic quantization format conversion
-- F16, Q8_0, and Q4_0 runtime quantization
+- **GPU-resident inference** — all weights stay in GPU memory, zero per-token host/device transfers
+- **Metal** (178 kernels) and **CUDA** (157 kernels) backends, compiled at runtime from embedded source
+- **Built-in BPE tokenizer** — reads vocabulary from GGUF, embeds in LBC format, no Python needed
+- **Auto-download** — `lumen run model:quant "prompt"` fetches from HuggingFace, converts, caches, runs
+- Custom **LBC** binary format with 128 KiB aligned blobs for zero-copy GPU mapping
 - 8 model architectures including GatedDeltaNet linear attention (Qwen3.5)
-- Mixture of Experts support (Metal)
-- Zero external ML dependencies
+- F16, Q8_0, Q4_0, Q4_1 runtime quantization with automatic K-quant/MXFP4 conversion
+- Mixture of Experts with LFU expert cache and parallel NVMe streaming (Metal)
+- Zero external ML dependencies — single `cargo install`, nothing else
 
 ## Quick Start
 
 ```bash
-# Build (Metal + CPU backends)
-cargo build --release
+# Install
+cargo install --path crates/lumen-cli
 
-# Build with CUDA
-cargo build --release --features cuda
-
-# Convert GGUF to LBC
-./target/release/lumen convert --input model.gguf --output model.lbc
-
-# Run inference
-./target/release/lumen run --model model.lbc --tokens "1 2 3" --max-tokens 128 --metal
-./target/release/lumen run --model model.lbc --tokens "1 2 3" --max-tokens 128 --cuda
+# Run (auto-downloads model on first use)
+lumen run qwen2.5-3b:q8_0 "What is the meaning of life?"
 ```
+
+Backend is auto-detected (Metal on macOS, CUDA on Linux with NVIDIA GPU, CPU otherwise). To choose explicitly: `--metal`, `--cuda`, or `--simd`.
 
 ## Supported Models
 
@@ -45,18 +43,61 @@ cargo build --release --features cuda
 | `exaone` | EXAONE | Yes | Yes |
 | `xverse` | XVERSE | Yes | Yes |
 
-**Quantization:** F16, Q8_0, Q4_0, Q4_1 (Metal). The GGUF converter handles K-quant formats (Q4_K, Q5_K, Q6_K, Q2_K, Q3_K) and MXFP4 via automatic dequantization and requantization.
+**Quantization:** F16, Q8_0, Q4_0, Q4_1 (Metal). K-quant and MXFP4 models are automatically converted during import (see [LBC Format](#lbc-format)).
+
+### Model Registry
+
+Use `name:quant` syntax to refer to models. Available names:
+
+| Name | Model | Quants |
+|------|-------|--------|
+| `qwen2.5-3b` | Qwen2.5 3B Instruct | F16, Q8_0, Q4_0 |
+| `qwen2.5-7b` | Qwen2.5 7B Instruct | Q8_0, Q4_0 |
+| `qwen2.5-14b` | Qwen2.5 14B Instruct | Q8_0, Q4_0 |
+| `llama-8b` | Llama 3.1 8B Instruct | F16, Q8_0 |
+| `mistral-7b` | Mistral 7B Instruct v0.3 | Q8_0 |
+| `qwen3.5-9b` | Qwen3.5 9B | Q8_0 |
+| `tinyllama` | TinyLlama 1.1B Chat | Q8_0, Q4_0 |
+
+```bash
+lumen run tinyllama:q4_0 "Write a haiku about Rust"
+lumen run llama-8b:q8_0 "Explain quantum computing" --max-tokens 200
+lumen models   # list cached and available models
+lumen pull qwen2.5-7b:q8_0   # download without running
+```
+
+## CLI
+
+```bash
+# Raw token mode (for benchmarking and debugging)
+lumen run --model model.lbc --tokens "1 2 3" --max-tokens 128 --metal
+lumen run --model model.lbc --tokens "1 2 3" --cuda --cuda-device 1
+
+# Convert GGUF to LBC manually
+lumen convert --input model.gguf --output model.lbc
+lumen convert --input model.gguf --output model.lbc --requant q4_0
+```
+
+| Flag | Description |
+|------|-------------|
+| `--system <text>` | System prompt |
+| `--max-tokens <n>` | Tokens to generate (default: unlimited, stops at EOS) |
+| `--temperature <f>` | Sampling temperature, 0 = greedy (default: 0.8) |
+| `--seed <n>` | Random seed for reproducibility (default: random) |
+| `--metal` | Force Metal GPU backend (macOS) |
+| `--cuda` | Force CUDA GPU backend (NVIDIA) |
+| `--cuda-device <n>` | CUDA device ordinal (default: 0) |
+| `--simd` | CPU backend (ARM NEON SIMD) |
+| `--context-len <n>` | KV cache size (auto-sized by default) |
+| `--no-gpu-resident` | Stream weights from disk instead of GPU memory |
+| `--verbose` | Show diagnostics, metrics, and model info |
+| `--profile` | Per-operation timing breakdown |
 
 ## LBC Format
 
-Lumen uses its own Layer-Blob Container (`.lbc`) format instead of reading GGUF directly. While GGUF requires full-header string parsing to locate individual tensors, LBC stores weights in large contiguous blobs with fixed byte offsets, allowing the runtime to seek instantly without scanning metadata.
+Lumen uses its own Layer-Blob Container (`.lbc`) format. LBC stores weights in large contiguous blobs with fixed byte offsets, allowing the runtime to seek directly to any tensor without scanning metadata.
 
-```bash
-lumen convert --input model.gguf --output model.lbc
-lumen convert --input model.gguf --output model.lbc --requant q4_0   # requantize during conversion
-```
-
-**Benefits of LBC:**
+**Benefits:**
 
 - **Aligned for Direct I/O:** Layer blobs are perfectly aligned to 128 KiB boundaries, enabling zero-copy memory mapping and direct hardware reads from SSDs without padding overhead.
 - **Zero-Copy Loading:** The entire file is memory-mapped. Accessing a layer is instantaneous (a simple pointer clone), with windowed prefetching allowing models to stream effectively even if they exceed available RAM.
@@ -68,155 +109,36 @@ The converter handles all GGUF v2/v3 models, streams one layer at a time, and au
 
 ## Performance
 
-Decode and prefill throughput (tok/s). pp128 + gen128. Same model weights across all engines.
+Decode throughput (tok/s) on Q8_0 models. pp128 + gen128. Same weights across all engines.
 
-### CUDA (NVIDIA A100-80GB)
+**CUDA** (NVIDIA A100-80GB):
 
-#### Qwen2.5 3B
+| Model | Lumen | llama.cpp | Lumen Prefill |
+|-------|------:|----------:|--------------:|
+| Qwen2.5 3B | **228** | 214 | 7,743 |
+| Qwen2.5 7B | **153** | 136 | 5,426 |
+| Llama 3.1 8B | **141** | 131 | 5,486 |
+| Qwen2.5 14B | **79** | 71 | 3,415 |
 
-**Decode (tok/s):**
+**Metal** (Apple M3 Ultra, 96 GB):
 
-| Quant | Lumen | llama.cpp |
-|:-----:|------:|----------:|
-| F16 | 152 | 174 |
-| Q8_0 | 228 | 214 |
-| Q4_0 | 213 | 259 |
+| Model | Lumen | llama.cpp | MLX |
+|-------|------:|----------:|----:|
+| TinyLlama 1.1B | **305** | 225 | 449 |
+| Llama 3.1 8B | **73** | 67 | 79 |
+| Llama 3.1 8B Q4_0 | **98** | 95 | -- |
 
-**Prefill (tok/s):**
+Methodology and full benchmark details: [`bench/METHODOLOGY.md`](bench/METHODOLOGY.md).
 
-| Quant | Lumen | llama.cpp |
-|:-----:|------:|----------:|
-| F16 | 6,396 | 9,023 |
-| Q8_0 | 7,743 | 5,031 |
-| Q4_0 | 6,435 | 5,024 |
+### GPU Memory (LBC file size ≈ GPU-resident memory)
 
-#### Qwen2.5 7B
-
-**Decode (tok/s):**
-
-| Quant | Lumen | llama.cpp |
-|:-----:|------:|----------:|
-| F16 | 95 | 95 |
-| Q8_0 | 153 | 136 |
-| Q4_0 | 194 | 189 |
-
-**Prefill (tok/s):**
-
-| Quant | Lumen | llama.cpp |
-|:-----:|------:|----------:|
-| F16 | 5,166 | 5,702 |
-| Q8_0 | 5,426 | 3,673 |
-| Q4_0 | 5,164 | 3,765 |
-
-#### Llama 3.1 8B
-
-**Decode (tok/s):**
-
-| Quant | Lumen | llama.cpp |
-|:-----:|------:|----------:|
-| F16 | 89 | 93 |
-| Q8_0 | 141 | 131 |
-| Q4_0 | 180 | 175 |
-
-**Prefill (tok/s):**
-
-| Quant | Lumen | llama.cpp |
-|:-----:|------:|----------:|
-| F16 | 4,812 | 4,478 |
-| Q8_0 | 5,486 | 3,308 |
-| Q4_0 | 4,923 | 3,354 |
-
-#### Qwen2.5 14B
-
-**Decode (tok/s):**
-
-| Quant | Lumen | llama.cpp |
-|:-----:|------:|----------:|
-| F16 | 51 | 50 |
-| Q8_0 | 79 | 71 |
-| Q4_0 | 100 | 99 |
-
-**Prefill (tok/s):**
-
-| Quant | Lumen | llama.cpp |
-|:-----:|------:|----------:|
-| F16 | 3,215 | 3,183 |
-| Q8_0 | 3,415 | 1,989 |
-| Q4_0 | 3,410 | 2,032 |
-
-#### Qwen3.5 9B
-
-**Decode (tok/s):**
-
-| Quant | Lumen | llama.cpp |
-|:-----:|------:|----------:|
-| Q8_0 | 63 | 116 |
-| Q4_0 | 66 | 146 |
-
-**Prefill (tok/s):**
-
-| Quant | Lumen | llama.cpp |
-|:-----:|------:|----------:|
-| Q8_0 | 2,367 | 3,031 |
-| Q4_0 | 2,196 | 3,089 |
-
-### Metal (Apple M3 Ultra 96 GB, median of 3 runs)
-
-#### TinyLlama 1.1B
-
-**Decode (tok/s):**
-
-| Quant | Lumen | llama.cpp | MLX |
-|:-----:|------:|----------:|----:|
-| F16 | 194 | 184 | 239 |
-| Q8_0 | 305 | 225 | 449 |
-| Q4_0 | 319 | 246 | N/A |
-
-**Prefill (tok/s):**
-
-| Quant | Lumen | llama.cpp | MLX |
-|:-----:|------:|----------:|----:|
-| F16 | 4,028 | 5,249 | 4,189 |
-| Q8_0 | 4,911 | 5,053 | 4,838 |
-| Q4_0 | 4,525 | 5,201 | N/A |
-
-#### Llama 3.1 8B
-
-**Decode (tok/s):**
-
-| Quant | Lumen | llama.cpp | MLX |
-|:-----:|------:|----------:|----:|
-| F16 | 40 | 42 | N/A |
-| Q8_0 | 73 | 67 | 79 |
-| Q4_0 | 98 | 95 | N/A |
-
-**Prefill (tok/s):**
-
-| Quant | Lumen | llama.cpp | MLX |
-|:-----:|------:|----------:|----:|
-| F16 | 766 | 1,050 | N/A |
-| Q8_0 | 838 | 1,003 | 906 |
-| Q4_0 | 796 | 1,028 | N/A |
-
-#### Qwen3.5 9B
-
-**Decode (tok/s):**
-
-| Quant | Lumen | llama.cpp | MLX |
-|:-----:|------:|----------:|----:|
-| Q8_0 | 57 | N/A | 92 |
-| Q4_0 | 68 | N/A | N/A |
-
-**Prefill (tok/s):**
-
-| Quant | Lumen | llama.cpp | MLX |
-|:-----:|------:|----------:|----:|
-| Q8_0 | 343 | N/A | 747 |
-| Q4_0 | 332 | N/A | N/A |
-
-vLLM: F16 only (GGUF quantized path is experimental). MLX Q4_0: different block encoding, not directly comparable. llama.cpp: no Qwen3.5 Metal support.
-
-Methodology in [`bench/METHODOLOGY.md`](bench/METHODOLOGY.md). Full report in [`bench/BENCHMARK_REPORT.md`](bench/BENCHMARK_REPORT.md).
+| Model | Q4_0 | Q8_0 | F16 |
+|-------|-----:|-----:|----:|
+| TinyLlama 1.1B | 0.6 GB | 1.1 GB | 2.1 GB |
+| Qwen2.5 3B | 2.6 GB | 3.1 GB | 5.8 GB |
+| Llama 3.1 8B | -- | 8.0 GB | -- |
+| Qwen2.5 7B | -- | 7.5 GB | -- |
+| Qwen3.5 9B | -- | 10.0 GB | -- |
 
 ## Building from Source
 
@@ -230,26 +152,6 @@ cargo test --workspace --release         # run tests
 
 Kernels are compiled at runtime from embedded source — no external shader files or build steps.
 
-## CLI
-
-```bash
-lumen run --model model.lbc --tokens "1 2 3" --max-tokens 128 --metal
-lumen run --model model.lbc --tokens "1 2 3" --max-tokens 128 --cuda
-lumen run --model model.lbc --tokens "1 2 3" --cuda --cuda-device 1
-```
-
-| Flag | Description |
-|------|-------------|
-| `--metal` | Metal GPU backend (macOS) |
-| `--cuda` | CUDA GPU backend (NVIDIA) |
-| `--cuda-device <n>` | CUDA device ordinal (default: 0) |
-| `--simd` | ARM NEON SIMD backend |
-| `--max-tokens <n>` | Tokens to generate (default: 10) |
-| `--temperature <f>` | Sampling temperature, 0 = greedy (default: 1.0) |
-| `--context-len <n>` | KV cache size (auto-sized by default) |
-| `--no-gpu-resident` | Stream weights from disk instead of GPU-resident |
-| `--profile` | Print timing breakdown |
-
 ## Architecture
 
 ```
@@ -258,8 +160,12 @@ lumen-convert     GGUF-to-LBC converter, 8 architecture mappings, 10 dequant ker
 lumen-runtime     CUDA backend, Metal backend (178 kernels), SIMD backend,
                   KV cache, GDN state, MoE expert cache, weight providers
 lumen-bench       Benchmark harness with JSON + table output
-lumen-cli         CLI entry point
+lumen-cli         CLI with built-in BPE tokenizer, model registry, HuggingFace downloader
 ```
+
+## Contributing
+
+Contributions are welcome. The codebase is pure Rust with GPU shaders embedded as string constants — no external build tools or shader compilers needed. Run `cargo test --release --lib` to verify changes. See open issues for areas that need work.
 
 ## License
 

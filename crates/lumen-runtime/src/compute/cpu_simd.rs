@@ -69,7 +69,7 @@ impl ComputeProfile {
     /// Print a formatted summary of the per-operation profile.
     pub fn print_summary(&self, num_layers: usize) {
         if self.calls == 0 {
-            println!("[profile] No compute_layer calls recorded.");
+            eprintln!("[profile] No compute_layer calls recorded.");
             return;
         }
         let total = self.attn_rmsnorm
@@ -92,11 +92,11 @@ impl ComputeProfile {
         let num_layers = if num_layers > 0 { num_layers } else { 1 };
         let tokens = (self.calls as usize) / num_layers;
 
-        println!("\n========== COMPUTE PROFILE ({} layer calls, {} tokens x {} layers) ==========",
+        eprintln!("\n========== COMPUTE PROFILE ({} layer calls, {} tokens x {} layers) ==========",
             self.calls, tokens, num_layers);
-        println!("{:<30} {:>10} {:>10} {:>10} {:>7}",
+        eprintln!("{:<30} {:>10} {:>10} {:>10} {:>7}",
             "Operation", "Total(us)", "Per-call", "Per-tok", "Pct(%)");
-        println!("{:-<72}", "");
+        eprintln!("{:-<72}", "");
 
         let ops: &[(&str, Duration)] = &[
             ("1. Attn RMSNorm",          self.attn_rmsnorm),
@@ -120,15 +120,15 @@ impl ComputeProfile {
             let avg = us / calls;
             let per_tok = if tokens > 0 { us / tokens as f64 } else { 0.0 };
             let pct = if total_us > 0.0 { us / total_us * 100.0 } else { 0.0 };
-            println!("{name:<30} {us:>10.0} {avg:>10.1} {per_tok:>10.1} {pct:>6.1}%");
+            eprintln!("{name:<30} {us:>10.0} {avg:>10.1} {per_tok:>10.1} {pct:>6.1}%");
         }
 
-        println!("{:-<72}", "");
+        eprintln!("{:-<72}", "");
         let per_tok_total = if tokens > 0 { total_us / tokens as f64 } else { 0.0 };
-        println!("{:<30} {:>10.0} {:>10.1} {:>10.1} {:>6.1}%",
+        eprintln!("{:<30} {:>10.0} {:>10.1} {:>10.1} {:>6.1}%",
             "TOTAL", total_us, total_us / calls, per_tok_total, 100.0);
-        println!("\nPer-token compute: {:.1} us = {:.3} ms", per_tok_total, per_tok_total / 1000.0);
-        println!("=======================================================================\n");
+        eprintln!("\nPer-token compute: {:.1} us = {:.3} ms", per_tok_total, per_tok_total / 1000.0);
+        eprintln!("=======================================================================\n");
     }
 }
 

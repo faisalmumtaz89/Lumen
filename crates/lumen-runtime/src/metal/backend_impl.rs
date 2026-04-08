@@ -144,7 +144,7 @@ impl ComputeBackend for MetalF32Backend {
         // produce zero output via zero routing weights.
         let (moe_router_logits, moe_expert_ids, moe_expert_weights, moe_expert_output) =
             if moe_num_experts > 0 {
-                println!(
+                eprintln!(
                     "MoE model detected: {} experts, top-{} active. Allocating MoE scratch buffers.",
                     moe_num_experts, moe_num_active_experts,
                 );
@@ -346,7 +346,7 @@ impl ComputeBackend for MetalF32Backend {
                 match ExpertReader::open(path) {
                     Ok(reader) => {
                         self.expert_reader = Some(Mutex::new(reader));
-                        println!(
+                        eprintln!(
                             "MoE expert cache: reader initialized for {}",
                             path.display(),
                         );
@@ -363,7 +363,7 @@ impl ComputeBackend for MetalF32Backend {
 
             if let Some(ref cache) = self.expert_cache {
                 let stats = cache.lock().unwrap().stats();
-                println!(
+                eprintln!(
                     "MoE expert cache: capacity={} experts, reader={}",
                     stats.capacity,
                     if self.expert_reader.is_some() { "active" } else { "inactive" },

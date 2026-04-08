@@ -6,7 +6,7 @@ use crate::quantization::{QuantScheme, QuantizationDescriptor};
 /// Magic bytes identifying an LBC file: "LBC\x01" in little-endian u32.
 pub const LBC_MAGIC: u32 = 0x01_43_42_4C; // 'L' 'B' 'C' 0x01
 
-pub const LBC_VERSION: u32 = 2;
+pub const LBC_VERSION: u32 = 3;
 
 /// Default alignment for layer blobs (128 KiB).
 pub const DEFAULT_ALIGNMENT: u64 = 128 * 1024;
@@ -63,6 +63,13 @@ pub struct LbcHeader {
     pub output_proj: GlobalTensorRange,
     /// Whether output_proj shares embedding storage (weight tying).
     pub weight_tying: bool,
+    // --- v3 fields (tokenizer section pointers) ---
+    /// File offset of the tokenizer section (0 = absent).
+    pub tokenizer_section_offset: u64,
+    /// Byte length of the tokenizer section.
+    pub tokenizer_section_length: u64,
+    /// CRC32 checksum of the tokenizer section bytes.
+    pub tokenizer_section_crc32: u32,
 }
 
 impl LbcHeader {
@@ -117,6 +124,9 @@ impl LbcHeader {
             final_norm: GlobalTensorRange::default(),
             output_proj: GlobalTensorRange::default(),
             weight_tying: false,
+            tokenizer_section_offset: 0,
+            tokenizer_section_length: 0,
+            tokenizer_section_crc32: 0,
         }
     }
 }
@@ -174,18 +184,16 @@ mod tests {
 
     #[test]
     fn version_validation() {
-        // Version 0 and 1 pass (≤ LBC_VERSION which is 2)
-        let mut header = LbcHeader::new(test_hyperparams(), test_quant());
-        header.version = 0;
-        header.validate().unwrap();
+        // Version 0 through 3 pass (≤ LBC_VERSION which is 3)
+        for v in 0..=3 {
+            let mut header = LbcHeader::new(test_hyperparams(), test_quant());
+            header.version = v;
+            header.validate().unwrap();
+        }
 
+        // Version 4 fails (> LBC_VERSION)
         let mut header = LbcHeader::new(test_hyperparams(), test_quant());
-        header.version = 1;
-        header.validate().unwrap();
-
-        // Version 3 fails (> LBC_VERSION)
-        let mut header = LbcHeader::new(test_hyperparams(), test_quant());
-        header.version = 3;
+        header.version = 4;
         let err = header.validate().unwrap_err();
         assert!(matches!(err, crate::FormatError::UnsupportedVersion { .. }));
     }

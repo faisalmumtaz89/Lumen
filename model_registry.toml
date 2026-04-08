@@ -7,7 +7,8 @@
 
 [meta]
 schema_version = 1
-last_validated = "2026-04-06"
+last_validated = "2026-04-08"
+default_quant = "Q8_0"
 
 supported_architectures = [
     "llama",      # LLaMA 2/3/3.1, CodeLlama
@@ -90,3 +91,28 @@ tokenizer = "Qwen/Qwen3.5-9B"
 
     [models.qwen3-5-9b.gguf_files]
     Q8_0 = { repo = "bartowski/Qwen_Qwen3.5-9B-GGUF", file = "Qwen_Qwen3.5-9B-Q8_0.gguf" }
+
+
+[models.tinyllama-1-1b]
+display_name = "TinyLlama 1.1B Chat"
+architecture = "llama"
+parameters = "1.1B"
+tokenizer = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+    [models.tinyllama-1-1b.gguf_files]
+    Q8_0 = { repo = "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF", file = "tinyllama-1.1b-chat-v1.0.Q8_0.gguf" }
+    Q4_0 = { repo = "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF", file = "tinyllama-1.1b-chat-v1.0.Q4_0.gguf" }
+
+
+# =============================================================================
+# Aliases — short names mapping to canonical model keys
+# =============================================================================
+
+[aliases]
+llama-8b = "llama-3-1-8b"
+"qwen2.5-3b" = "qwen2-5-3b"
+"qwen2.5-7b" = "qwen2-5-7b"
+"qwen2.5-14b" = "qwen2-5-14b"
+"qwen3.5-9b" = "qwen3-5-9b"
+mistral-7b = "mistral-7b-v0-3"
+tinyllama = "tinyllama-1-1b"

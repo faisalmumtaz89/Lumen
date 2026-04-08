@@ -145,7 +145,7 @@ pub fn generate_test_model(config: &TestModelConfig) -> Vec<u8> {
     let blob_refs: Vec<&[u8]> = layer_blobs.iter().map(|b| b.as_slice()).collect();
 
     let mut out = Vec::new();
-    write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs)
+    write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs, None)
         .expect("failed to write test model");
 
     out
@@ -296,7 +296,7 @@ pub fn generate_test_model_q8_0(config: &TestModelQ8Config) -> Vec<u8> {
     let blob_refs: Vec<&[u8]> = layer_blobs.iter().map(|b| b.as_slice()).collect();
 
     let mut out = Vec::new();
-    write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs)
+    write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs, None)
         .expect("failed to write Q8_0 test model");
     out
 }
@@ -445,7 +445,7 @@ pub fn generate_test_model_f16(config: &TestModelF16Config) -> Vec<u8> {
     let blob_refs: Vec<&[u8]> = layer_blobs.iter().map(|b| b.as_slice()).collect();
 
     let mut out = Vec::new();
-    write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs)
+    write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs, None)
         .expect("failed to write F16 test model");
     out
 }
@@ -595,7 +595,7 @@ pub fn generate_test_model_q4_0(config: &TestModelQ4Config) -> Vec<u8> {
     let blob_refs: Vec<&[u8]> = layer_blobs.iter().map(|b| b.as_slice()).collect();
 
     let mut out = Vec::new();
-    write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs)
+    write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs, None)
         .expect("failed to write Q4_0 test model");
     out
 }

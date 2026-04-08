@@ -16,18 +16,22 @@ use crate::header::{Endianness, GlobalTensorRange, LbcHeader};
 use crate::hyperparams::{ModelHyperparams, RopeScalingType};
 use crate::index::{LayerIndex, TensorSlice};
 use crate::quantization::{QuantGroupSize, QuantizationDescriptor};
+use crate::tokenizer::TokenizerSection;
 use std::io::{self, Write};
 
 /// Write a complete LBC file to any `Write` sink.
 ///
 /// `layer_blobs` must have length equal to `header.num_layers`.
 /// `global_tensors` is `(embedding, final_norm, output_proj)` raw bytes.
+/// `tokenizer` is optional; if present, the tokenizer section is appended
+/// after the last layer blob and the header is updated with its offset/CRC.
 pub fn write_lbc<W: Write>(
     w: &mut W,
     header: &LbcHeader,
     layer_indices: &[LayerIndex],
     global_tensors: &GlobalTensors,
     layer_blobs: &[&[u8]],
+    tokenizer: Option<&TokenizerSection>,
 ) -> io::Result<()> {
     if layer_indices.len() != header.num_layers as usize {
         return Err(io::Error::new(
@@ -106,12 +110,6 @@ pub fn write_lbc<W: Write>(
         };
     }
 
-    // Re-serialize header with correct offsets, then compute checksum
-    let mut header_bytes = serialize_header(&fixed_header);
-    let checksum = crc32(&header_bytes);
-    // Patch the checksum field (bytes 12..16 in the header)
-    header_bytes[12..16].copy_from_slice(&checksum.to_le_bytes());
-
     // Fix up layer index offsets relative to file
     let mut fixed_indices = layer_indices.to_vec();
     let mut layer_cursor = layers_start as u64;
@@ -122,6 +120,34 @@ pub fn write_lbc<W: Write>(
         // Align each subsequent layer
         layer_cursor = align_up(layer_cursor as usize, alignment) as u64;
     }
+
+    // Compute end of last layer (unaligned) for tokenizer placement
+    let last_layer_end = if layer_blobs.is_empty() {
+        layers_start as u64
+    } else {
+        let last = &fixed_indices[fixed_indices.len() - 1];
+        last.layer_offset_bytes + last.layer_length_bytes
+    };
+
+    // Tokenizer section: serialize, compute CRC, set header offsets
+    let tok_bytes = tokenizer.map(|t| t.serialize());
+    if let Some(ref tok_data) = tok_bytes {
+        let tok_start = align_up(last_layer_end as usize, alignment) as u64;
+        fixed_header.tokenizer_section_offset = tok_start;
+        fixed_header.tokenizer_section_length = tok_data.len() as u64;
+        fixed_header.tokenizer_section_crc32 = crc32(tok_data);
+    } else {
+        fixed_header.tokenizer_section_offset = 0;
+        fixed_header.tokenizer_section_length = 0;
+        fixed_header.tokenizer_section_crc32 = 0;
+    }
+
+    // Re-serialize header with correct offsets, then compute checksum
+    let mut header_bytes = serialize_header(&fixed_header);
+    let checksum = crc32(&header_bytes);
+    // Patch the checksum field (bytes 12..16 in the header)
+    header_bytes[12..16].copy_from_slice(&checksum.to_le_bytes());
+
     let index_bytes = serialize_layer_indices(&fixed_indices);
 
     // --- Phase 3: write everything ---
@@ -147,6 +173,13 @@ pub fn write_lbc<W: Write>(
             let next = fixed_indices[i + 1].layer_offset_bytes;
             write_zeros(w, (next - cur) as usize)?;
         }
+    }
+
+    // Tokenizer section (after last layer, aligned)
+    if let Some(ref tok_data) = tok_bytes {
+        let tok_padding = fixed_header.tokenizer_section_offset as usize - last_layer_end as usize;
+        write_zeros(w, tok_padding)?;
+        w.write_all(tok_data)?;
     }
 
     Ok(())
@@ -215,6 +248,12 @@ pub(crate) fn serialize_header(h: &LbcHeader) -> Vec<u8> {
     buf.push(h.output_proj.quant.to_u8());
     buf.push(h.weight_tying as u8);
     buf.extend_from_slice(&[0u8; 4]); // padding to 8-byte alignment
+
+    // v3: tokenizer section pointers (24 bytes)
+    buf.extend_from_slice(&h.tokenizer_section_offset.to_le_bytes());
+    buf.extend_from_slice(&h.tokenizer_section_length.to_le_bytes());
+    buf.extend_from_slice(&h.tokenizer_section_crc32.to_le_bytes());
+    buf.extend_from_slice(&[0u8; 4]); // reserved
 
     buf
 }
