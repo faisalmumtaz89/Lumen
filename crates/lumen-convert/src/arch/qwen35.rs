@@ -203,9 +203,9 @@ fn compute_layer_shape_qwen35(
     // SSM tensors (linear attention layers only) — never requantized.
     // ssm_a/dt/conv1d are F32 scalars; ssm_alpha/beta are Q8_0 gate matrices.
     // Bypasses requant_to to preserve original format (GPU kernels expect specific quant).
-    // IMPORTANT: ssm_alpha/beta MUST be Q8_0 or F32 — the GDN runtime hardcodes Q8_0 matvec
-    // kernels for these tensors. If the source is F16/BF16 (e.g. from a BF16→F16 GGUF),
-    // we force-requantize them to Q8_0.
+    // IMPORTANT: ssm_alpha/beta MUST be Q8_0 — the GDN runtime hardcodes Q8_0 matvec
+    // kernels for these tensors. GGUF sources may have F32/F16/BF16; all are force-
+    // requantized to Q8_0 during conversion.
     let try_compute_ssm_slice = |gguf: &GgufFile, layer: usize, suffix: &str, blob_offset: &mut u64|
         -> Result<Option<TensorSlice>, ConvertError>
     {
@@ -223,9 +223,9 @@ fn compute_layer_shape_qwen35(
                         tensor: name.to_string(),
                         ggml_type: format!("{:?}", tensor.ggml_type),
                     })?;
-                // Force ssm_alpha/beta to Q8_0 if they are F16/BF16 — runtime expects Q8_0.
+                // Force ssm_alpha/beta to Q8_0 if they are not already Q8_0 — runtime hardcodes Q8_0 matvec.
                 let is_alpha_or_beta = suffix == SSM_ALPHA || suffix == SSM_BETA;
-                if is_alpha_or_beta && matches!(quant, QuantScheme::F16 | QuantScheme::Bf16) {
+                if is_alpha_or_beta && !matches!(quant, QuantScheme::Q8_0) {
                     let n_elements = tensor.n_elements() as usize;
                     assert!(n_elements % 32 == 0,
                         "Q8_0 requires elements divisible by 32, got {n_elements} for {name}");
@@ -350,14 +350,14 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
     // SSM tensors (if present) — preserve original precision, never requantize.
     // ssm_a/dt/conv1d are small F32 scalars read as float* in GPU kernels.
     // ssm_alpha/beta MUST be Q8_0 — the GDN runtime hardcodes Q8_0 matvec kernels.
-    // If the source is F16/BF16, force-requantize to Q8_0 via dequant→F32→Q8_0.
+    // Force-requantize any non-Q8_0 alpha/beta to Q8_0 (GGUF sources may be F32/F16/BF16).
     for suffix in &[SSM_A, SSM_CONV1D, SSM_DT, SSM_BETA, SSM_ALPHA, SSM_NORM] {
         let name = layer_tensor_name(layer, suffix);
         if let Some(tensor) = gguf.find_tensor(&name) {
             let is_alpha_or_beta = *suffix == SSM_ALPHA || *suffix == SSM_BETA;
             let src_quant = tensor.ggml_type.to_lbc_quant();
-            if is_alpha_or_beta && matches!(src_quant, Some(QuantScheme::F16) | Some(QuantScheme::Bf16)) {
-                // Force-requantize F16/BF16 alpha/beta to Q8_0
+            if is_alpha_or_beta && !matches!(src_quant, Some(QuantScheme::Q8_0)) {
+                // Force-requantize to Q8_0 (dequant to F32 first, then quantize to Q8_0)
                 append_tensor_to_blob_requant(blob, reader, gguf, &name, false, Some(QuantScheme::Q8_0))?;
             } else {
                 append_tensor_to_blob_requant(blob, reader, gguf, &name, dequantize, /*requant_to=*/ None)?;

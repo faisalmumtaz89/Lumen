@@ -275,6 +275,8 @@ pub(crate) struct MetalPipelines {
     pub(crate) gdn_decode_norm_scale: Option<MetalPipelineState>,
     // Fused Conv1D+SiLU + L2-normalize + state-update + output + RMSNorm (eliminates conv1d dispatch + barrier)
     pub(crate) gdn_state_output_norm_l2_conv: Option<MetalPipelineState>,
+    // Full GDN decode megakernel: Conv1D+SiLU + inline gates + L2 + state + output + RMSNorm
+    pub(crate) gdn_decode_megakernel: Option<MetalPipelineState>,
     // Fused SiLU-gated Q8_0 matvec + residual + copy (eliminates silu_elementwise_mul dispatch)
     pub(crate) dequant_matmul_q8_0_silu_deferred_residual_copy_nr2: Option<MetalPipelineState>,
     // Fused SiLU-gated Q4_0 matvec + residual + copy (eliminates silu_elementwise_mul dispatch)

@@ -1,23 +1,29 @@
+# Build
 /target
 
-# Large model files
-benchmarks/
+# Model files
 *.gguf
 *.lbc
 
-# macOS
-.DS_Store
-
-# Benchmark results (raw data, generated reports)
+# Benchmark output
 bench/results/
 
-# Backup files
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+*.bak
 *.original
-/.codecompass
-/modal
-tracker.md
 
-# Python bytecache
+# Python
 __pycache__/
 *.pyc
-/.claude
+
+# Secrets
+.env
+
+# Local dev
+/.artifacts/
+/.claude/
+/.codecompass/
+/modal/

@@ -316,6 +316,9 @@ impl MetalF32Backend {
             // Fused Conv1D+SiLU + L2-normalize + state-update + output + RMSNorm
             gdn_state_output_norm_l2_conv: lib.get_function("gdn_state_output_norm_l2_conv")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // Full GDN decode megakernel: Conv1D+SiLU + inline gates + L2 + state + output + RMSNorm
+            gdn_decode_megakernel: lib.get_function("gdn_decode_megakernel")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             // Fused SiLU-gated Q8_0 matvec + residual + copy
             dequant_matmul_q8_0_silu_deferred_residual_copy_nr2: lib.get_function("dequant_matmul_q8_0_silu_deferred_residual_copy_nr2")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),

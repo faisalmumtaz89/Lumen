@@ -2,7 +2,7 @@
 #
 # Lumen Benchmark Suite
 # ---------------------
-# Automated, reproducible benchmarking for Lumen inference engine vs MLX.
+# Automated, reproducible benchmarking for Lumen inference engine vs MLX and llama.cpp.
 # Compatible with macOS bash 3.2 (no associative arrays).
 #
 # Usage:
@@ -521,6 +521,7 @@ run_lumen_single() {
     if ! output=$("$LUMEN_BIN" run \
         --model "$lbc_path" \
         --metal \
+        --verbose \
         --tokens "$tokens" \
         --max-tokens "$gen_len" \
         --temperature 0 \

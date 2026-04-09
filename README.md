@@ -113,22 +113,22 @@ Decode throughput (tok/s) on Q8_0 models. pp128 + gen128. Same weights across al
 
 **CUDA** (NVIDIA A100-80GB):
 
-| Model | Lumen | llama.cpp | Lumen Prefill |
-|-------|------:|----------:|--------------:|
-| Qwen2.5 3B | **228** | 214 | 7,743 |
-| Qwen2.5 7B | **153** | 136 | 5,426 |
-| Llama 3.1 8B | **141** | 131 | 5,486 |
-| Qwen2.5 14B | **79** | 71 | 3,415 |
+| Model | Lumen | llama.cpp |
+|-------|------:|----------:|
+| Qwen2.5 3B | **228** | 214 |
+| Qwen2.5 7B | **153** | 136 |
+| Llama 3.1 8B | **141** | 131 |
+| Qwen2.5 14B | **79** | 71 |
 
 **Metal** (Apple M3 Ultra, 96 GB):
 
 | Model | Lumen | llama.cpp | MLX |
 |-------|------:|----------:|----:|
-| TinyLlama 1.1B | **305** | 225 | 449 |
-| Llama 3.1 8B | **73** | 67 | 79 |
-| Llama 3.1 8B Q4_0 | **98** | 95 | -- |
+| TinyLlama 1.1B | **307** | 221 | 422 |
+| Llama 3.1 8B | **73** | 64 | 76 |
+| Llama 3.1 8B Q4_0 | **97** | 92 | -- |
 
-Methodology and full benchmark details: [`bench/METHODOLOGY.md`](bench/METHODOLOGY.md).
+Full results with hardware and engine versions: [`bench/RESULTS.md`](bench/RESULTS.md). Methodology: [`bench/METHODOLOGY.md`](bench/METHODOLOGY.md).
 
 ### GPU Memory (LBC file size ≈ GPU-resident memory)
 

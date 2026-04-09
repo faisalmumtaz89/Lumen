@@ -8906,6 +8906,7 @@ impl ComputeBackend for CudaBackend {
                         repack_fn,
                         layer,
                         &hp_copy,
+                        has_gdn,
                     )
                     .map_err(|e| {
                         RuntimeError::Compute(format!(
@@ -8943,6 +8944,7 @@ impl ComputeBackend for CudaBackend {
                         repack_fn,
                         layer,
                         &hp_copy,
+                        has_gdn,
                     )
                     .map_err(|e| {
                         RuntimeError::Compute(format!(

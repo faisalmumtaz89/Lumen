@@ -1022,7 +1022,15 @@ pub fn repack_layer_q8_to_aligned(
     repack_kernel: &cudarc::driver::CudaFunction,
     layer: &mut LayerWeightsGpu,
     hp: &ModelHyperparams,
+    model_has_gdn: bool,
 ) -> Result<(), RuntimeError> {
+    // When the model has ANY GDN layers, batched prefill is enabled model-wide.
+    // Batched prefill uses dequant->F16->cuBLAS HGEMM, which requires Q8Raw (not Q8Aligned).
+    // Skip ALL repack for ALL layers (including full-attention layers) in GDN models.
+    if model_has_gdn {
+        return Ok(());
+    }
+
     let hidden = hp.hidden_dim as usize;
     let heads = hp.num_heads as usize;
     let kv_heads = hp.num_kv_heads as usize;
@@ -1031,7 +1039,6 @@ pub fn repack_layer_q8_to_aligned(
 
     let q_dim = heads * head_dim;
     let kv_dim = kv_heads * head_dim;
-    let is_gdn = layer.layer_type == 1;
 
     /// Repack a single weight buffer if it is Q8Raw.
     fn repack_weight(
@@ -1057,22 +1064,17 @@ pub fn repack_layer_q8_to_aligned(
         }
     }
 
-    // For GDN layers: skip QKV repack (wq is fused QKV used by GDN dispatch directly).
-    if !is_gdn {
-        // Qwen3.5 full-attention layers: wq is [q_dim*2, hidden] (fused Q+gate).
-        let wq_out_dim = if layer.attn_q_norm.is_some() { q_dim * 2 } else { q_dim };
-        repack_weight(device, repack_kernel, &mut layer.wq, wq_out_dim * hidden)?;
-        repack_weight(device, repack_kernel, &mut layer.wk, kv_dim * hidden)?;
-        repack_weight(device, repack_kernel, &mut layer.wv, kv_dim * hidden)?;
-        repack_weight(device, repack_kernel, &mut layer.wo, hidden * q_dim)?;
-    }
-    // FFN weights: skip aligned repack for GDN models to save GPU memory.
-    // The F16 HGEMV path handles FFN dispatch via F16 caches instead.
-    if !is_gdn {
-        repack_weight(device, repack_kernel, &mut layer.w_gate, inter * hidden)?;
-        repack_weight(device, repack_kernel, &mut layer.w_up, inter * hidden)?;
-        repack_weight(device, repack_kernel, &mut layer.w_down, hidden * inter)?;
-    }
+    // Non-GDN models: repack all projections for dp4a int* loads.
+    // Qwen3.5 full-attention layers: wq is [q_dim*2, hidden] (fused Q+gate).
+    let wq_out_dim = if layer.attn_q_norm.is_some() { q_dim * 2 } else { q_dim };
+    repack_weight(device, repack_kernel, &mut layer.wq, wq_out_dim * hidden)?;
+    repack_weight(device, repack_kernel, &mut layer.wk, kv_dim * hidden)?;
+    repack_weight(device, repack_kernel, &mut layer.wv, kv_dim * hidden)?;
+    repack_weight(device, repack_kernel, &mut layer.wo, hidden * q_dim)?;
+
+    repack_weight(device, repack_kernel, &mut layer.w_gate, inter * hidden)?;
+    repack_weight(device, repack_kernel, &mut layer.w_up, inter * hidden)?;
+    repack_weight(device, repack_kernel, &mut layer.w_down, hidden * inter)?;
 
     Ok(())
 }
@@ -1136,7 +1138,15 @@ pub fn repack_layer_q4_to_aligned(
     repack_kernel: &cudarc::driver::CudaFunction,
     layer: &mut LayerWeightsGpu,
     hp: &ModelHyperparams,
+    model_has_gdn: bool,
 ) -> Result<(), RuntimeError> {
+    // When the model has ANY GDN layers, batched prefill is enabled model-wide.
+    // Batched prefill uses dequant->F16->cuBLAS HGEMM, which requires Q4Raw (not Q4Aligned).
+    // Skip ALL repack for ALL layers (including full-attention layers) in GDN models.
+    if model_has_gdn {
+        return Ok(());
+    }
+
     let hidden = hp.hidden_dim as usize;
     let heads = hp.num_heads as usize;
     let kv_heads = hp.num_kv_heads as usize;
@@ -1145,7 +1155,6 @@ pub fn repack_layer_q4_to_aligned(
 
     let q_dim = heads * head_dim;
     let kv_dim = kv_heads * head_dim;
-    let is_gdn = layer.layer_type == 1;
 
     /// Repack a single weight buffer if it is Q4Raw.
     fn repack_weight(
@@ -1170,20 +1179,17 @@ pub fn repack_layer_q4_to_aligned(
         }
     }
 
-    // For GDN layers: skip QKV repack (wq is fused QKV used by GDN dispatch directly).
-    if !is_gdn {
-        // Qwen3.5 full-attention layers: wq is [q_dim*2, hidden] (fused Q+gate).
-        let wq_out_dim = if layer.attn_q_norm.is_some() { q_dim * 2 } else { q_dim };
-        repack_weight(device, repack_kernel, &mut layer.wq, wq_out_dim * hidden)?;
-        repack_weight(device, repack_kernel, &mut layer.wk, kv_dim * hidden)?;
-        repack_weight(device, repack_kernel, &mut layer.wv, kv_dim * hidden)?;
-        repack_weight(device, repack_kernel, &mut layer.wo, hidden * q_dim)?;
-    }
-    if !is_gdn {
-        repack_weight(device, repack_kernel, &mut layer.w_gate, inter * hidden)?;
-        repack_weight(device, repack_kernel, &mut layer.w_up, inter * hidden)?;
-        repack_weight(device, repack_kernel, &mut layer.w_down, hidden * inter)?;
-    }
+    // Non-GDN models: repack all projections for dp4a int* loads.
+    // Qwen3.5 full-attention layers: wq is [q_dim*2, hidden] (fused Q+gate).
+    let wq_out_dim = if layer.attn_q_norm.is_some() { q_dim * 2 } else { q_dim };
+    repack_weight(device, repack_kernel, &mut layer.wq, wq_out_dim * hidden)?;
+    repack_weight(device, repack_kernel, &mut layer.wk, kv_dim * hidden)?;
+    repack_weight(device, repack_kernel, &mut layer.wv, kv_dim * hidden)?;
+    repack_weight(device, repack_kernel, &mut layer.wo, hidden * q_dim)?;
+
+    repack_weight(device, repack_kernel, &mut layer.w_gate, inter * hidden)?;
+    repack_weight(device, repack_kernel, &mut layer.w_up, inter * hidden)?;
+    repack_weight(device, repack_kernel, &mut layer.w_down, hidden * inter)?;
 
     Ok(())
 }

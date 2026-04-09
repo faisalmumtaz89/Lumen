@@ -42,7 +42,9 @@ All engines use the **same model weights** where format permits. Lumen and llama
 
 ## Models
 
-### Standard Dense (benchmarked on both Metal and CUDA)
+The Metal benchmark script (`bench/run_bench.sh`) auto-discovers all `.lbc` files in the bench directory. Baseline comparisons (MLX, llama.cpp) are available for models with hardcoded discovery mappings. The tables below list the standard model sets.
+
+### CUDA (A100-80GB)
 
 | Model | Architecture | Params | Quants Tested |
 |-------|-------------|-------:|--------------|
@@ -51,17 +53,13 @@ All engines use the **same model weights** where format permits. Lumen and llama
 | Llama 3.1 8B | llama | 8B | F16, Q8_0, Q4_0 |
 | Qwen2.5 14B | qwen2 | 14B | F16, Q8_0, Q4_0 |
 
-### GDN Hybrid (CUDA and Metal)
-
-| Model | Architecture | Params | Quants Tested |
-|-------|-------------|-------:|--------------|
-| Qwen3.5 9B | qwen35 | 9B | Q8_0, Q4_0 |
-
-### Small Model (Metal only)
+### Metal (Apple Silicon)
 
 | Model | Architecture | Params | Quants Tested |
 |-------|-------------|-------:|--------------|
 | TinyLlama 1.1B | llama | 1.1B | F16, Q8_0, Q4_0 |
+| Llama 3.1 8B | llama | 8B | F16, Q8_0, Q4_0 |
+| Qwen3.5 9B | qwen35 (GDN hybrid) | 9B | Q8_0, Q4_0 |
 
 ## Metrics
 
@@ -114,7 +112,7 @@ Each engine runs in a separate Modal container. The report records each engine's
 
 ### Thermal Monitoring (Metal)
 
-Before each model's first trial, log GPU thermal state via `pmset -g therm`. If thermal pressure is elevated, insert additional 30-second cooldown and re-check. Discard any run where GPU frequency drops below 90% of observed peak.
+Before each config, log GPU thermal state via `pmset -g therm`. If thermal pressure is elevated (heavy, critical, or serious), insert an additional 30-second cooldown and re-check.
 
 Note: `pmset` thermal monitoring has limited granularity — it may not detect moderate frequency throttling. Close GPU-intensive background applications before benchmarking.
 
@@ -128,9 +126,8 @@ Each `modal run` invocation gets fresh GPU containers. Multiple benchmark runs o
 |-----------|------|
 | **Median** | Primary reported value |
 | **Stddev** | Shown as `+-` in detail tables |
-| **Min / Max** | Recorded in raw data |
 
-If coefficient of variation (stddev/mean) exceeds 5%, the result is flagged as high-variance.
+Individual per-run measurements are preserved in `raw/` output files for post-hoc analysis.
 
 ## Comparison Ratios
 
@@ -138,8 +135,8 @@ If coefficient of variation (stddev/mean) exceeds 5%, the result is flagged as h
 Ratio = Lumen / baseline
 ```
 
-- **Bold** when ratio > 1.00 (Lumen is faster)
-- Plain when ratio <= 1.00 (Lumen is slower or equal)
+- **Bold** when ratio >= 1.00 (Lumen is faster or equal)
+- Plain when ratio < 1.00 (Lumen is slower)
 - `n/a` when the baseline engine does not support this model/quant
 - `--` when the run failed or produced no result
 
@@ -150,38 +147,38 @@ Every benchmark run produces:
 ### 1. `results.md` — Human-readable report
 
 ```
-# Lumen Benchmark Report
-# [timestamp]
+# Lumen vs MLX vs llama.cpp Benchmark (timestamp)
 
-## Environment
-[Hardware, OS, engine versions, Lumen commit]
+**Hardware**: [chip, GPU cores, memory]
+**Methodology**: [runs, warmup, ordering, MLX internal trials]
+**Configs**: [prompt lengths x generation lengths]
 
-## Methodology
-[Brief: runs, warmup, cooldown, ordering, statistic]
+> Ratio = Lumen / baseline. Values >1.00 mean Lumen is faster (bold).
 
-## Summary — Decode (pp128 + gen128)
-[One table: all models × quants, Lumen vs baselines with ratios]
+## Summary (pp128 + gen128)
+[One table: all models × quants, decode + prefill with ratios per baseline]
 
-## Summary — Prefill (pp128 + gen128)
+## Decode: Lumen vs MLX vs llama.cpp (tok/s)
+[Per model/quant, all configs, with MLX and llama.cpp sub-rows and ratios]
+
+## Prefill: Lumen vs MLX vs llama.cpp (tok/s)
 [Same structure for prefill]
-
-## Detailed Results
-[Per model/quant tables with stddev]
 
 ## Lumen Only
 [Models/quants where no same-format baseline exists]
-
-## Models
-[File names, sizes, sources for reproducibility]
 ```
 
 ### 2. `results.json` — Machine-readable data
 
-Contains per-trial raw measurements, engine versions, hardware info, and model metadata.
+Contains per-config aggregated measurements (median and stddev), hardware info, and run parameters.
 
-### 3. `raw/` — Individual run output
+### 3. `results_raw.txt` — Pipe-delimited raw data
 
-Raw stdout/stderr from each engine invocation.
+One line per engine/model/config combination with median and stddev values.
+
+### 4. `raw/` — Individual run output
+
+Raw stdout/stderr from each engine invocation (warmup and measured runs).
 
 ## Reproducibility Requirements
 
@@ -214,8 +211,9 @@ For reproducibility, each benchmark report includes the source of every model fi
 
 | Engine | Build flags |
 |--------|------------|
-| Lumen | `cargo build --release` (Metal) or `cargo build --release --features cuda` (CUDA) |
-| llama.cpp | `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=80-real -DCMAKE_BUILD_TYPE=Release` |
+| Lumen | `cargo build --release -p lumen-cli` (Metal) or `cargo build --release --features cuda` (CUDA) |
+| llama.cpp (Metal) | Homebrew `llama-bench` (`/opt/homebrew/bin/llama-bench`), built with Metal backend |
+| llama.cpp (CUDA) | `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=80-real -DCMAKE_BUILD_TYPE=Release` |
 | vLLM | `enforce_eager=True` (CUDA graphs disabled in vLLM) |
 | MLX | `mlx_lm.benchmark` defaults |
 

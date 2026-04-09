@@ -820,6 +820,266 @@ kernel void gdn_state_output_norm_l2_conv(
 }
 
 // ============================================================================
+// gdn_decode_megakernel: Full GDN decode megakernel
+//
+// Fuses Conv1D+SiLU + Gate computation + L2 normalize + State update + Output
+// + RMSNorm+Scale into a SINGLE kernel dispatch per token.
+//
+// Takes raw alpha/beta matvec outputs and computes gate transforms inline,
+// eliminating the separate gdn_compute_gates dispatch. Combined with inline
+// Conv1D+SiLU and L2 normalization, this replaces 5-6 separate kernel
+// dispatches with 1.
+//
+// Gate math (matching gdn_compute_gates exactly):
+//   softplus(x) = x > 20 ? x : log(1 + exp(x))
+//   gate = ssm_a[h] * softplus(alpha_raw[h] + dt_bias[h])
+//   alpha = exp(gate)        // decay factor in (0,1)
+//   beta  = sigmoid(beta_raw[h]) // mixing rate
+//
+// buffer(0):  h_state      [n_heads * val_dim * key_dim] float -- R/W (transposed)
+// buffer(1):  qkv_raw      [qkv_dim] float -- raw QKV from matvec (pre-conv)
+// buffer(2):  conv_state   [buf_slots * qkv_dim] float -- circular buffer (R/W)
+// buffer(3):  conv_weight  [qkv_dim * kernel_size] float -- conv weights
+// buffer(4):  alpha_raw    [n_heads] float -- raw alpha matvec output
+// buffer(5):  beta_raw     [n_heads] float -- raw beta matvec output
+// buffer(6):  ssm_a        [n_heads] float -- -exp(A_log), pre-negated
+// buffer(7):  dt_bias      [n_heads] float -- per-head dt bias
+// buffer(8):  scale        [scale_n_heads * val_dim] float -- learned norm scale
+// buffer(9):  output       [n_heads * val_dim] float -- OUTPUT
+// buffer(10): n_heads (uint)       -- 32
+// buffer(11): key_dim (uint)       -- 128
+// buffer(12): val_dim (uint)       -- 128
+// buffer(13): n_kv_heads (uint)    -- 16
+// buffer(14): eps (float)          -- RMSNorm eps
+// buffer(15): scale_n_heads (uint)
+// buffer(16): l2_eps (float)       -- L2 norm eps
+// buffer(17): qk_dim (uint)       -- 2048
+// buffer(18): qkv_dim (uint)      -- 8192
+// buffer(19): kernel_size (uint)  -- 4
+// buffer(20): state_pos (uint)    -- conv circular buffer position
+//
+// grid: (n_heads, 1, 1), threadgroup: (val_dim, 1, 1)
+// REQUIREMENT: key_dim == val_dim (both 128 for Qwen3.5)
+// ============================================================================
+
+kernel void gdn_decode_megakernel(
+    device       float* h_state        [[buffer(0)]],
+    device const float* qkv_raw        [[buffer(1)]],
+    device       float* conv_state     [[buffer(2)]],
+    device const float* conv_weight    [[buffer(3)]],
+    device const float* alpha_raw      [[buffer(4)]],
+    device const float* beta_raw       [[buffer(5)]],
+    device const float* ssm_a          [[buffer(6)]],
+    device const float* dt_bias        [[buffer(7)]],
+    device const float* scale          [[buffer(8)]],
+    device       float* output         [[buffer(9)]],
+    constant     uint&  n_heads        [[buffer(10)]],
+    constant     uint&  key_dim        [[buffer(11)]],
+    constant     uint&  val_dim        [[buffer(12)]],
+    constant     uint&  n_kv_heads     [[buffer(13)]],
+    constant     float& eps            [[buffer(14)]],
+    constant     uint&  scale_n_heads  [[buffer(15)]],
+    constant     float& l2_eps         [[buffer(16)]],
+    constant     uint&  qk_dim         [[buffer(17)]],
+    constant     uint&  qkv_dim        [[buffer(18)]],
+    constant     uint&  kernel_size    [[buffer(19)]],
+    constant     uint&  state_pos      [[buffer(20)]],
+    uint head_idx                      [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_index_in_threadgroup]],
+    uint tg_size                       [[threads_per_threadgroup]],
+    uint simd_lane                     [[thread_index_in_simdgroup]],
+    uint simd_group                    [[simdgroup_index_in_threadgroup]])
+{
+    if (head_idx >= n_heads) return;
+
+    uint h = head_idx;
+    uint kv_head = h % n_kv_heads;
+    uint buf_slots = kernel_size - 1;
+
+    // === Phase 0: Conv1D + SiLU for this head's Q, K, V channels ===
+
+    // Q channel conv1d + SiLU
+    float q_val = 0.0f;
+    if (tid < key_dim) {
+        uint q_ch = kv_head * key_dim + tid;
+        float q_sum = 0.0f;
+        for (uint tap = 0; tap < buf_slots; tap++) {
+            uint slot = (state_pos + tap) % buf_slots;
+            q_sum += conv_weight[q_ch * kernel_size + tap] * conv_state[slot * qkv_dim + q_ch];
+        }
+        q_sum += conv_weight[q_ch * kernel_size + buf_slots] * qkv_raw[q_ch];
+        q_val = q_sum / (1.0f + exp(-q_sum));  // SiLU
+
+        // Only first n_kv_heads heads update Q conv_state (avoid GQA duplicate writes)
+        if (h < n_kv_heads) {
+            conv_state[state_pos * qkv_dim + q_ch] = qkv_raw[q_ch];
+        }
+    }
+
+    // K channel conv1d + SiLU
+    float k_val = 0.0f;
+    if (tid < key_dim) {
+        uint k_ch = qk_dim + kv_head * key_dim + tid;
+        float k_sum = 0.0f;
+        for (uint tap = 0; tap < buf_slots; tap++) {
+            uint slot = (state_pos + tap) % buf_slots;
+            k_sum += conv_weight[k_ch * kernel_size + tap] * conv_state[slot * qkv_dim + k_ch];
+        }
+        k_sum += conv_weight[k_ch * kernel_size + buf_slots] * qkv_raw[k_ch];
+        k_val = k_sum / (1.0f + exp(-k_sum));  // SiLU
+
+        if (h < n_kv_heads) {
+            conv_state[state_pos * qkv_dim + k_ch] = qkv_raw[k_ch];
+        }
+    }
+
+    // V channel conv1d + SiLU (unique per head, no GQA sharing)
+    float v_conv = 0.0f;
+    if (tid < val_dim) {
+        uint v_ch = 2 * qk_dim + h * val_dim + tid;
+        float v_sum = 0.0f;
+        for (uint tap = 0; tap < buf_slots; tap++) {
+            uint slot = (state_pos + tap) % buf_slots;
+            v_sum += conv_weight[v_ch * kernel_size + tap] * conv_state[slot * qkv_dim + v_ch];
+        }
+        v_sum += conv_weight[v_ch * kernel_size + buf_slots] * qkv_raw[v_ch];
+        v_conv = v_sum / (1.0f + exp(-v_sum));  // SiLU
+
+        conv_state[state_pos * qkv_dim + v_ch] = qkv_raw[v_ch];
+    }
+
+    // === Phase 1: Compute gates inline (single thread, broadcast via shmem) ===
+    threadgroup float gate_shmem[2];  // [0]=alpha, [1]=beta
+
+    if (tid == 0) {
+        float sp_input = alpha_raw[h] + dt_bias[h];
+        float sp;
+        if (sp_input > 20.0f) {
+            sp = sp_input;  // softplus(x) ~= x for large x
+        } else {
+            sp = log(1.0f + exp(sp_input));
+        }
+        float gate = ssm_a[h] * sp;
+        gate_shmem[0] = exp(gate);                         // alpha (decay)
+        gate_shmem[1] = 1.0f / (1.0f + exp(-beta_raw[h])); // beta (sigmoid)
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float a = gate_shmem[0];
+    float b = gate_shmem[1];
+
+    // === Phase 2: L2 normalize Q and K in threadgroup memory ===
+    threadgroup float q_local[128];
+    threadgroup float k_local[128];
+
+    // L2 norm for Q
+    float q_ss = q_val * q_val;
+    q_ss = simd_sum(q_ss);
+
+    threadgroup float partial_sums_l2[8];
+    if (simd_lane == 0) {
+        partial_sums_l2[simd_group] = q_ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_simd_groups = (tg_size + 31) / 32;
+    threadgroup float total_l2;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums_l2[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_l2 = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float q_norm_val = sqrt(total_l2);
+    float q_l2_scale = (q_norm_val > l2_eps) ? (1.0f / q_norm_val) : (1.0f / l2_eps);
+
+    // L2 norm for K
+    float k_ss = k_val * k_val;
+    k_ss = simd_sum(k_ss);
+
+    if (simd_lane == 0) {
+        partial_sums_l2[simd_group] = k_ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums_l2[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_l2 = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float k_norm_val = sqrt(total_l2);
+    float k_l2_scale = (k_norm_val > l2_eps) ? (1.0f / k_norm_val) : (1.0f / l2_eps);
+
+    // Store normalized Q and K in threadgroup memory
+    if (tid < key_dim) {
+        q_local[tid] = q_val * q_l2_scale;
+        k_local[tid] = k_val * k_l2_scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // === Phase 3: GDN recurrence (transposed layout) ===
+    uint vj = tid;
+    float q_scale = rsqrt((float)key_dim);
+
+    float my_out = 0.0f;
+    if (vj < val_dim) {
+        float v_val = v_conv;
+        device float* h_row = h_state + h * val_dim * key_dim + vj * key_dim;
+
+        // Decay state, then retrieve from DECAYED state
+        float retrieval = 0.0f;
+        for (uint ki = 0; ki < key_dim; ki++) {
+            float h_decayed = a * h_row[ki];
+            h_row[ki] = h_decayed;
+            retrieval += h_decayed * k_local[ki];
+        }
+
+        // Delta rule update + output
+        float v_delta = b * (v_val - retrieval);
+        for (uint ki = 0; ki < key_dim; ki++) {
+            float h_updated = h_row[ki] + k_local[ki] * v_delta;
+            h_row[ki] = h_updated;
+            my_out += h_updated * q_local[ki] * q_scale;
+        }
+    }
+
+    // === Phase 4: RMSNorm + scale ===
+    float ss = my_out * my_out;
+    ss = simd_sum(ss);
+
+    threadgroup float partial_sums[8];
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float total_ss;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            total_ss = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms = sqrt(total_ss / (float)val_dim + eps);
+    float inv_norm = 1.0f / rms;
+
+    if (vj < val_dim) {
+        device const float* head_scale = scale + (h % scale_n_heads) * val_dim;
+        output[h * val_dim + vj] = my_out * inv_norm * head_scale[vj];
+    }
+}
+
+// ============================================================================
 // Batched GDN prefill kernels
 //
 // These kernels process T tokens in a single dispatch, eliminating per-token

@@ -239,6 +239,10 @@ extern "C" __global__ void gdn_decode_megakernel(
     //   output = s_new @ (q * rsqrt(key_dim))
     //
     // One thread per val_dim element. Threads >= head_dim are idle.
+    //
+    // Vectorized with float4 loads/stores: 32 iterations instead of 128.
+    // h_state is 256-byte aligned (CUDA alloc_zeros), head_dim divisible by 4.
+    // k_shmem/q_shmem are loaded into register groups of 4 for reuse.
     // ====================================================================
     if (tid < head_dim) {
         unsigned int vj = tid;
@@ -247,25 +251,51 @@ extern "C" __global__ void gdn_decode_megakernel(
 
         float* h_row = h_state + (unsigned long long)h * head_dim * head_dim
                                 + (unsigned long long)vj * head_dim;
+        unsigned int vec_len = head_dim >> 2;  // head_dim / 4
+        float4* h_row4 = (float4*)h_row;
 
-        // Decay + retrieve from decayed state
+        // Pass 1: Decay + retrieve from decayed state (float4 vectorized)
         float retrieval = 0.0f;
-        for (unsigned int ki = 0; ki < head_dim; ki++) {
-            float h_decayed = alpha_val * h_row[ki];
-            h_row[ki] = h_decayed;
-            retrieval += h_decayed * k_shmem[ki];
+        #pragma unroll 8
+        for (unsigned int ki4 = 0; ki4 < vec_len; ki4++) {
+            float4 h4 = h_row4[ki4];
+            unsigned int base = ki4 << 2;
+            float k0 = k_shmem[base];
+            float k1 = k_shmem[base + 1];
+            float k2 = k_shmem[base + 2];
+            float k3 = k_shmem[base + 3];
+            h4.x *= alpha_val;
+            h4.y *= alpha_val;
+            h4.z *= alpha_val;
+            h4.w *= alpha_val;
+            h_row4[ki4] = h4;
+            retrieval += h4.x * k0 + h4.y * k1 + h4.z * k2 + h4.w * k3;
         }
 
-        // Delta update + output
+        // Pass 2: Delta update + output query (float4 vectorized)
         float v_delta = beta_val * (v_val - retrieval);
         float my_out = 0.0f;
-        for (unsigned int ki = 0; ki < head_dim; ki++) {
-            float h_updated = h_row[ki] + k_shmem[ki] * v_delta;
-            h_row[ki] = h_updated;
-            my_out += h_updated * q_shmem[ki] * inv_sqrt_key;
+        #pragma unroll 8
+        for (unsigned int ki4 = 0; ki4 < vec_len; ki4++) {
+            float4 h4 = h_row4[ki4];
+            unsigned int base = ki4 << 2;
+            float k0 = k_shmem[base];
+            float k1 = k_shmem[base + 1];
+            float k2 = k_shmem[base + 2];
+            float k3 = k_shmem[base + 3];
+            h4.x += k0 * v_delta;
+            h4.y += k1 * v_delta;
+            h4.z += k2 * v_delta;
+            h4.w += k3 * v_delta;
+            h_row4[ki4] = h4;
+            float q0 = q_shmem[base];
+            float q1 = q_shmem[base + 1];
+            float q2 = q_shmem[base + 2];
+            float q3 = q_shmem[base + 3];
+            my_out += h4.x * q0 + h4.y * q1 + h4.z * q2 + h4.w * q3;
         }
 
-        output[h * head_dim + vj] = my_out;
+        output[h * head_dim + vj] = my_out * inv_sqrt_key;
     }
 }
 
@@ -322,5 +352,168 @@ extern "C" __global__ void gdn_rmsnorm_silu_gate(
         float g = gate[i];
         float silu_g = g / (1.0f + expf(-g));
         out[i] = silu_g * normed;
+    }
+}
+
+
+// ============================================================================
+// gdn_decode_megakernel_graph -- CUDA graph-compatible variant
+//
+// Identical to gdn_decode_megakernel except state_pos is read from a device
+// pointer instead of a scalar argument. The device pointer is baked into the
+// captured graph; only its value (updated via htod memcpy before replay) changes
+// between tokens.
+//
+// Grid: (num_heads) blocks. Each block owns one head.
+// Block: block_dim threads (>= head_dim, typically 128 or 256).
+// ============================================================================
+extern "C" __global__ void gdn_decode_megakernel_graph(
+    // Mutable persistent state
+    float* __restrict__ conv_state,    // [(kernel_size-1) * qkv_dim] circular buffer
+    float* __restrict__ h_state,       // [num_heads * head_dim * head_dim] recurrent state
+
+    // Inputs from prior matvec steps
+    const float* __restrict__ qkv_buf,     // [qkv_dim] from QKV matvec
+    const float* __restrict__ alpha_raw,   // [num_heads] from alpha matvec
+    const float* __restrict__ beta_raw,    // [num_heads] from beta matvec
+
+    // Layer weights
+    const float* __restrict__ conv_weight, // [qkv_dim, kernel_size] row-major
+    const float* __restrict__ dt_bias,     // [num_heads]
+    const float* __restrict__ ssm_a,       // [num_heads] stores -exp(A_log)
+
+    // Output
+    float* __restrict__ output,            // [value_dim] raw state query output
+
+    // Dimensions
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,       // val_dim per head = key_dim per head
+    unsigned int qkv_dim,        // qk_dim + qk_dim + value_dim
+    unsigned int qk_dim,         // num_kv_heads * head_dim
+    unsigned int value_dim,      // num_heads * head_dim
+    unsigned int kernel_size,    // conv1d kernel size (4)
+    const unsigned int* __restrict__ p_state_pos)  // device pointer to state_pos
+{
+    unsigned int state_pos = *p_state_pos;
+
+    extern __shared__ float shmem[];
+
+    unsigned int h = blockIdx.x;
+    if (h >= num_heads) return;
+
+    unsigned int tid = threadIdx.x;
+    unsigned int block_size = blockDim.x;
+    unsigned int buf_slots = kernel_size - 1;
+    unsigned int kv_head = h % num_kv_heads;
+
+    // Shared memory layout:
+    //   warp_scratch[32]   -- reduction temporaries
+    //   q_shmem[head_dim]  -- Q for this head's kv_head (after conv+silu+norm)
+    //   k_shmem[head_dim]  -- K for this head's kv_head (after conv+silu+norm)
+    float* warp_scratch = shmem;
+    float* q_shmem = shmem + 32;
+    float* k_shmem = shmem + 32 + head_dim;
+
+    // ====================================================================
+    // Phase 1: Conv1D + SiLU for this head's Q, K, V elements.
+    // ====================================================================
+    unsigned int q_base = kv_head * head_dim;
+    unsigned int k_base = qk_dim + kv_head * head_dim;
+    unsigned int v_base = 2 * qk_dim + h * head_dim;
+
+    for (unsigned int i = tid; i < head_dim; i += block_size) {
+        q_shmem[i] = conv1d_silu_update(
+            q_base + i, qkv_buf, conv_weight, conv_state,
+            qkv_dim, kernel_size, buf_slots, state_pos);
+        k_shmem[i] = conv1d_silu_update(
+            k_base + i, qkv_buf, conv_weight, conv_state,
+            qkv_dim, kernel_size, buf_slots, state_pos);
+        output[h * head_dim + i] = conv1d_silu_update(
+            v_base + i, qkv_buf, conv_weight, conv_state,
+            qkv_dim, kernel_size, buf_slots, state_pos);
+    }
+
+    __syncthreads();
+
+    // ====================================================================
+    // Phase 2: Compute gates (alpha decay, beta mixing) for this head.
+    // ====================================================================
+    float alpha_val, beta_val;
+    if (tid == 0) {
+        float sp_input = alpha_raw[h] + dt_bias[h];
+        float sp = (sp_input > 20.0f) ? sp_input : logf(1.0f + expf(sp_input));
+        warp_scratch[0] = expf(ssm_a[h] * sp);                  // alpha
+        warp_scratch[1] = 1.0f / (1.0f + expf(-beta_raw[h]));   // beta
+    }
+    __syncthreads();
+    alpha_val = warp_scratch[0];
+    beta_val = warp_scratch[1];
+
+    // ====================================================================
+    // Phase 3: L2-normalize Q and K per head.
+    // ====================================================================
+
+    // L2-normalize Q
+    {
+        float ss = 0.0f;
+        for (unsigned int i = tid; i < head_dim; i += block_size) {
+            float v = q_shmem[i];
+            ss += v * v;
+        }
+        float total = block_reduce_sum_mega(ss, warp_scratch, tid, block_size);
+        float norm = sqrtf(total);
+        float inv = (norm > 1e-12f) ? (1.0f / norm) : (1.0f / 1e-12f);
+        for (unsigned int i = tid; i < head_dim; i += block_size) {
+            q_shmem[i] *= inv;
+        }
+    }
+    __syncthreads();
+
+    // L2-normalize K
+    {
+        float ss = 0.0f;
+        for (unsigned int i = tid; i < head_dim; i += block_size) {
+            float v = k_shmem[i];
+            ss += v * v;
+        }
+        float total = block_reduce_sum_mega(ss, warp_scratch, tid, block_size);
+        float norm = sqrtf(total);
+        float inv = (norm > 1e-12f) ? (1.0f / norm) : (1.0f / 1e-12f);
+        for (unsigned int i = tid; i < head_dim; i += block_size) {
+            k_shmem[i] *= inv;
+        }
+    }
+    __syncthreads();
+
+    // ====================================================================
+    // Phase 4: Delta-rule state update + output query.
+    // ====================================================================
+    if (tid < head_dim) {
+        unsigned int vj = tid;
+        float inv_sqrt_key = rsqrtf((float)head_dim);
+        float v_val = output[h * head_dim + vj];
+
+        float* h_row = h_state + (unsigned long long)h * head_dim * head_dim
+                                + (unsigned long long)vj * head_dim;
+
+        // Decay + retrieve from decayed state
+        float retrieval = 0.0f;
+        for (unsigned int ki = 0; ki < head_dim; ki++) {
+            float h_decayed = alpha_val * h_row[ki];
+            h_row[ki] = h_decayed;
+            retrieval += h_decayed * k_shmem[ki];
+        }
+
+        // Delta update + output
+        float v_delta = beta_val * (v_val - retrieval);
+        float my_out = 0.0f;
+        for (unsigned int ki = 0; ki < head_dim; ki++) {
+            float h_updated = h_row[ki] + k_shmem[ki] * v_delta;
+            h_row[ki] = h_updated;
+            my_out += h_updated * q_shmem[ki] * inv_sqrt_key;
+        }
+
+        output[h * head_dim + vj] = my_out;
     }
 }

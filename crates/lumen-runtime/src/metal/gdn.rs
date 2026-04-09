@@ -582,6 +582,10 @@ impl MetalF32Backend {
         })?;
         // Fused L2+state+output+norm (eliminates l2_normalize_qk dispatch + barrier)
         let pso_state_output_norm_l2 = pipelines.gdn_state_output_norm_l2.as_ref();
+        // Fused Conv1D+SiLU + L2 + state + output + norm (eliminates conv1d dispatch + barrier)
+        let pso_conv_l2_state = pipelines.gdn_state_output_norm_l2_conv.as_ref();
+        // Full GDN decode megakernel: Conv+SiLU + inline gates + L2 + state + output + norm
+        let pso_megakernel = pipelines.gdn_decode_megakernel.as_ref();
         // Fused SiLU-gated matvec+residual+copy (eliminates silu_elementwise_mul dispatch + barrier)
         let pso_silu_matvec = pipelines.dequant_matmul_q8_0_silu_deferred_residual_copy_nr2.as_ref();
         let pso_silu_matvec_q4 = pipelines.dequant_matmul_q4_0_silu_deferred_residual_copy_nr2.as_ref();
@@ -792,94 +796,101 @@ impl MetalF32Backend {
         // gate -> gate_sigmoid all ready
         enc.memory_barrier_with_scope(1);
 
-        // === PARALLEL GROUP 2 ===
-        // Conv1D reads qkv_buf; Compute gates reads alpha_raw/beta_raw (fallback only).
-
-        // Step 3+3b: Fused Conv1d+SiLU (or separate fallback)
-        // Fused variant eliminates 1 dispatch + 1 barrier per GDN layer.
-        if let Some(pso_fused) = pso_conv1d_silu {
-            enc.set_pipeline_state(pso_fused);
-        } else {
-            enc.set_pipeline_state(pso_conv1d);
-        }
-        enc.set_buffer(&s.qkv_buf, 0, 0);
-        enc.set_buffer(conv_state_buf, 0, 1);
-        enc.set_buffer(layer_buf, ssm_conv1d_off, 2);
-        enc.set_buffer(qkv_conv_buf, 0, 3);
-        enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 4);
-        enc.set_bytes(&(conv_kernel_size as u32).to_le_bytes(), 5);
-        enc.set_bytes(&conv_pos.to_le_bytes(), 6);
-        let conv_tg = 256u64.min(qkv_dim as u64).max(1);
-        enc.dispatch_threadgroups(
-            MTLSize::new((qkv_dim as u64).div_ceil(conv_tg), 1, 1),
-            MTLSize::new(conv_tg, 1, 1),
-        );
+        // === GROUP 2: Conv1D + L2 + StateUpdate + Output + Norm ===
+        // Prefer fused Conv1D+SiLU+L2+State+Output+Norm (1 dispatch replaces 2+barrier).
+        // Falls back to Conv1D+SiLU then L2+State+Output+Norm (original 2-dispatch path).
 
         let buf_slots = (conv_kernel_size - 1) as u32;
         let new_conv_pos = (conv_pos + 1) % buf_slots;
 
-        // Step 4c: Compute gates — only needed in fallback (fused kernel already wrote alpha/beta)
-        if pso_dual_gates.is_none() {
-            enc.set_pipeline_state(pso_compute_gates);
-            enc.set_buffer(layer_buf, ssm_dt_off, 0);
-            enc.set_buffer(layer_buf, ssm_a_off, 1);
-            enc.set_buffer(beta_raw_buf, 0, 2);
-            enc.set_buffer(alpha_raw_buf, 0, 3);
-            enc.set_buffer(alpha_buf, 0, 4);
-            enc.set_buffer(beta_buf, 0, 5);
-            enc.set_bytes(&(num_heads as u32).to_le_bytes(), 6);
-            {
-                let gates_tg = 256u64.min(num_heads as u64).max(1);
-                enc.dispatch_threadgroups(
-                    MTLSize::new((num_heads as u64).div_ceil(gates_tg), 1, 1),
-                    MTLSize::new(gates_tg, 1, 1),
-                );
-            }
-        }
+        // Tier 1 (best): gdn_decode_megakernel takes alpha_raw/beta_raw and computes gates inline.
+        //   When dual_gates is active, alpha/beta are post-gate; we can still use the conv-fused
+        //   kernel (pso_conv_l2_state) which takes post-gate values.
+        //   When dual_gates is NOT active, the megakernel eliminates the compute_gates dispatch.
+        //
+        // Tier 2: gdn_state_output_norm_l2_conv takes post-gate alpha/beta (needs gates pre-computed).
+        //   Eliminates Conv1D+SiLU dispatch + 1 barrier.
+        //
+        // Tier 3: separate Conv1D+SiLU then L2+State+Output+Norm (original multi-dispatch path).
 
-        // Barrier: Conv1D+SiLU -> qkv_conv_buf, gates -> alpha/beta all ready
-        enc.memory_barrier_with_scope(1);
-
-        if pso_conv1d_silu.is_none() {
-            // Fallback: separate SiLU when fused kernel unavailable
-            let pso_silu = pipelines.silu_inplace.as_ref().ok_or_else(|| {
-                RuntimeError::Compute("silu_inplace pipeline not compiled".into())
-            })?;
-            enc.set_pipeline_state(pso_silu);
-            enc.set_buffer(qkv_conv_buf, 0, 0);
-            enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 1);
-            let silu_tg = 256u64.min(qkv_dim as u64).max(1);
-            enc.dispatch_threadgroups(
-                MTLSize::new((qkv_dim as u64).div_ceil(silu_tg), 1, 1),
-                MTLSize::new(silu_tg, 1, 1),
-            );
-            enc.memory_barrier_with_scope(1); // SiLU applied to qkv_conv_buf
-        }
-
-        // Steps 5+6+7+8: L2-normalize Q/K + StateUpdate + Output + SSMNorm
-        // Prefer fused L2+state kernel (eliminates l2_normalize_qk dispatch + barrier).
-        // Fallback: separate L2 normalize then state kernel.
-        if let Some(pso_l2_fused) = pso_state_output_norm_l2 {
-            // Fused: L2 norm is done inline inside the state kernel using threadgroup memory.
-            // No separate L2 dispatch needed.
-            enc.set_pipeline_state(pso_l2_fused);
-            enc.set_buffer(h_state_buf, 0, 0);            // h_state [n_heads=32 * val_dim * key_dim] (transposed layout)
-            enc.set_buffer(qkv_conv_buf, k_byte_off, 1);  // k_raw [n_kv_heads=16 * key_dim] UN-normalized
-            enc.set_buffer(qkv_conv_buf, v_byte_off, 2);  // v_tokens [n_heads=32 * val_dim]
-            enc.set_buffer(alpha_buf, 0, 3);               // alpha [n_heads=32]
-            enc.set_buffer(beta_buf, 0, 4);                // beta [n_heads=32]
-            enc.set_buffer(qkv_conv_buf, 0, 5);            // q_raw [n_kv_heads=16 * key_dim] UN-normalized
-            enc.set_buffer(layer_buf, ssm_norm_off, 6);    // scale [val_dim=128] (shared across heads)
-            enc.set_buffer(normed_out_buf, 0, 7);          // output [n_heads=32 * val_dim]
-            enc.set_bytes(&(num_heads as u32).to_le_bytes(), 8);
-            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 9);   // key_dim = 128
-            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 10);  // val_dim = 128
-            enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 11);  // n_kv_heads=16 for Q/K GQA
-            enc.set_bytes(&eps.to_le_bytes(), 12);  // RMSNorm eps (model norm_eps)
-            enc.set_bytes(&(1u32).to_le_bytes(), 13);  // scale_n_heads=1: ssm_norm is [128], shared
+        if pso_dual_gates.is_none() && pso_megakernel.is_some() {
+            // Full megakernel: inline gates from alpha_raw/beta_raw, no compute_gates dispatch needed.
+            let pso = pso_megakernel.unwrap();
+            enc.set_pipeline_state(pso);
+            enc.set_buffer(h_state_buf, 0, 0);              // h_state [n_heads * val_dim * key_dim]
+            enc.set_buffer(&s.qkv_buf, 0, 1);               // qkv_raw [qkv_dim] from matvec (pre-conv)
+            enc.set_buffer(conv_state_buf, 0, 2);            // conv_state circular buffer (R/W)
+            enc.set_buffer(layer_buf, ssm_conv1d_off, 3);    // conv_weight [qkv_dim * kernel_size]
+            enc.set_buffer(alpha_raw_buf, 0, 4);             // alpha_raw [n_heads] (pre-gate)
+            enc.set_buffer(beta_raw_buf, 0, 5);              // beta_raw [n_heads] (pre-gate)
+            enc.set_buffer(layer_buf, ssm_a_off, 6);         // ssm_a [n_heads]
+            enc.set_buffer(layer_buf, ssm_dt_off, 7);        // dt_bias [n_heads]
+            enc.set_buffer(layer_buf, ssm_norm_off, 8);      // scale [val_dim]
+            enc.set_buffer(normed_out_buf, 0, 9);            // output [n_heads * val_dim]
+            enc.set_bytes(&(num_heads as u32).to_le_bytes(), 10);
+            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 11);   // key_dim = 128
+            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 12);   // val_dim = 128
+            enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 13);
+            enc.set_bytes(&eps.to_le_bytes(), 14);           // RMSNorm eps
+            enc.set_bytes(&(1u32).to_le_bytes(), 15);        // scale_n_heads = 1
             {
                 let l2_eps: f32 = 1e-12;
-                enc.set_bytes(&l2_eps.to_le_bytes(), 14);  // L2 norm eps
+                enc.set_bytes(&l2_eps.to_le_bytes(), 16);    // L2 norm eps
+                enc.set_bytes(&(qk_dim as u32).to_le_bytes(), 17);   // qk_dim = 2048
+                enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 18);  // qkv_dim = 8192
+                enc.set_bytes(&(conv_kernel_size as u32).to_le_bytes(), 19);
+                enc.set_bytes(&conv_pos.to_le_bytes(), 20);  // state_pos
+                let tg = head_dim as u64;
+                enc.dispatch_threadgroups(
+                    MTLSize::new(num_heads as u64, 1, 1),
+                    MTLSize::new(tg, 1, 1),
+                );
+            }
+        } else if pso_conv_l2_state.is_some() {
+            // Conv-fused kernel: Conv1D+SiLU + L2 + State + Output + Norm (needs post-gate alpha/beta).
+            // When dual_gates is None, compute_gates must run first.
+            if pso_dual_gates.is_none() {
+                enc.set_pipeline_state(pso_compute_gates);
+                enc.set_buffer(layer_buf, ssm_dt_off, 0);
+                enc.set_buffer(layer_buf, ssm_a_off, 1);
+                enc.set_buffer(beta_raw_buf, 0, 2);
+                enc.set_buffer(alpha_raw_buf, 0, 3);
+                enc.set_buffer(alpha_buf, 0, 4);
+                enc.set_buffer(beta_buf, 0, 5);
+                enc.set_bytes(&(num_heads as u32).to_le_bytes(), 6);
+                {
+                    let gates_tg = 256u64.min(num_heads as u64).max(1);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new((num_heads as u64).div_ceil(gates_tg), 1, 1),
+                        MTLSize::new(gates_tg, 1, 1),
+                    );
+                }
+                enc.memory_barrier_with_scope(1); // gates ready
+            }
+
+            let pso = pso_conv_l2_state.unwrap();
+            enc.set_pipeline_state(pso);
+            enc.set_buffer(h_state_buf, 0, 0);              // h_state [n_heads * val_dim * key_dim]
+            enc.set_buffer(&s.qkv_buf, 0, 1);               // qkv_raw [qkv_dim] from matvec (pre-conv)
+            enc.set_buffer(conv_state_buf, 0, 2);            // conv_state circular buffer (R/W)
+            enc.set_buffer(layer_buf, ssm_conv1d_off, 3);    // conv_weight [qkv_dim * kernel_size]
+            enc.set_buffer(alpha_buf, 0, 4);                 // alpha [n_heads] (post-gates)
+            enc.set_buffer(beta_buf, 0, 5);                  // beta [n_heads] (post-gates)
+            enc.set_buffer(layer_buf, ssm_norm_off, 6);      // scale [val_dim] (shared)
+            enc.set_buffer(normed_out_buf, 0, 7);            // output [n_heads * val_dim]
+            enc.set_bytes(&(num_heads as u32).to_le_bytes(), 8);
+            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 9);    // key_dim = 128
+            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 10);   // val_dim = 128
+            enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 11);
+            enc.set_bytes(&eps.to_le_bytes(), 12);           // RMSNorm eps
+            enc.set_bytes(&(1u32).to_le_bytes(), 13);        // scale_n_heads = 1
+            {
+                let l2_eps: f32 = 1e-12;
+                enc.set_bytes(&l2_eps.to_le_bytes(), 14);    // L2 norm eps
+                enc.set_bytes(&(qk_dim as u32).to_le_bytes(), 15);   // qk_dim = 2048
+                enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 16);  // qkv_dim = 8192
+                enc.set_bytes(&(conv_kernel_size as u32).to_le_bytes(), 17);
+                enc.set_bytes(&conv_pos.to_le_bytes(), 18);  // state_pos
                 let tg = head_dim as u64;
                 enc.dispatch_threadgroups(
                     MTLSize::new(num_heads as u64, 1, 1),
@@ -887,46 +898,127 @@ impl MetalF32Backend {
                 );
             }
         } else {
-            // Fallback: separate L2 normalize then state kernel
-            enc.set_pipeline_state(pso_l2_norm_qk);
-            enc.set_buffer(qkv_conv_buf, 0, 0);           // Q data (16 heads)
-            enc.set_buffer(qkv_conv_buf, k_byte_off, 1);  // K data (16 heads)
-            enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 2);  // n_q_heads = 16
-            enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 3);  // n_k_heads = 16
-            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 4);
-            {
-                let l2_eps: f32 = 1e-12;
-                enc.set_bytes(&l2_eps.to_le_bytes(), 5);
-                let l2_tg = 256u64.min(head_dim as u64).max(1);
-                let total_heads = (num_kv_heads + num_kv_heads) as u64;
-                enc.dispatch_threadgroups(
-                    MTLSize::new(total_heads, 1, 1),
-                    MTLSize::new(l2_tg, 1, 1),
-                );
+            // Tier 3 fallback: separate Conv1D+SiLU then L2+State+Output+Norm
+            if pso_dual_gates.is_none() {
+                enc.set_pipeline_state(pso_compute_gates);
+                enc.set_buffer(layer_buf, ssm_dt_off, 0);
+                enc.set_buffer(layer_buf, ssm_a_off, 1);
+                enc.set_buffer(beta_raw_buf, 0, 2);
+                enc.set_buffer(alpha_raw_buf, 0, 3);
+                enc.set_buffer(alpha_buf, 0, 4);
+                enc.set_buffer(beta_buf, 0, 5);
+                enc.set_bytes(&(num_heads as u32).to_le_bytes(), 6);
+                {
+                    let gates_tg = 256u64.min(num_heads as u64).max(1);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new((num_heads as u64).div_ceil(gates_tg), 1, 1),
+                        MTLSize::new(gates_tg, 1, 1),
+                    );
+                }
             }
-            enc.memory_barrier_with_scope(1); // L2-normalized Q/K ready
 
-            enc.set_pipeline_state(pso_state_output_norm);
-            enc.set_buffer(h_state_buf, 0, 0);
-            enc.set_buffer(qkv_conv_buf, k_byte_off, 1);
-            enc.set_buffer(qkv_conv_buf, v_byte_off, 2);
-            enc.set_buffer(alpha_buf, 0, 3);
-            enc.set_buffer(beta_buf, 0, 4);
-            enc.set_buffer(qkv_conv_buf, 0, 5);
-            enc.set_buffer(layer_buf, ssm_norm_off, 6);
-            enc.set_buffer(normed_out_buf, 0, 7);
-            enc.set_bytes(&(num_heads as u32).to_le_bytes(), 8);
-            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 9);
-            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 10);
-            enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 11);
-            enc.set_bytes(&eps.to_le_bytes(), 12);
-            enc.set_bytes(&(1u32).to_le_bytes(), 13);
-            {
-                let tg = head_dim as u64;
+            if let Some(pso_fused) = pso_conv1d_silu {
+                enc.set_pipeline_state(pso_fused);
+            } else {
+                enc.set_pipeline_state(pso_conv1d);
+            }
+            enc.set_buffer(&s.qkv_buf, 0, 0);
+            enc.set_buffer(conv_state_buf, 0, 1);
+            enc.set_buffer(layer_buf, ssm_conv1d_off, 2);
+            enc.set_buffer(qkv_conv_buf, 0, 3);
+            enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 4);
+            enc.set_bytes(&(conv_kernel_size as u32).to_le_bytes(), 5);
+            enc.set_bytes(&conv_pos.to_le_bytes(), 6);
+            let conv_tg = 256u64.min(qkv_dim as u64).max(1);
+            enc.dispatch_threadgroups(
+                MTLSize::new((qkv_dim as u64).div_ceil(conv_tg), 1, 1),
+                MTLSize::new(conv_tg, 1, 1),
+            );
+
+            // Barrier: Conv1D+SiLU -> qkv_conv_buf, gates -> alpha/beta all ready
+            enc.memory_barrier_with_scope(1);
+
+            if pso_conv1d_silu.is_none() {
+                let pso_silu = pipelines.silu_inplace.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute("silu_inplace pipeline not compiled".into())
+                })?;
+                enc.set_pipeline_state(pso_silu);
+                enc.set_buffer(qkv_conv_buf, 0, 0);
+                enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 1);
+                let silu_tg = 256u64.min(qkv_dim as u64).max(1);
                 enc.dispatch_threadgroups(
-                    MTLSize::new(num_heads as u64, 1, 1),
-                    MTLSize::new(tg, 1, 1),
+                    MTLSize::new((qkv_dim as u64).div_ceil(silu_tg), 1, 1),
+                    MTLSize::new(silu_tg, 1, 1),
                 );
+                enc.memory_barrier_with_scope(1);
+            }
+
+            if let Some(pso_l2_fused) = pso_state_output_norm_l2 {
+                enc.set_pipeline_state(pso_l2_fused);
+                enc.set_buffer(h_state_buf, 0, 0);
+                enc.set_buffer(qkv_conv_buf, k_byte_off, 1);
+                enc.set_buffer(qkv_conv_buf, v_byte_off, 2);
+                enc.set_buffer(alpha_buf, 0, 3);
+                enc.set_buffer(beta_buf, 0, 4);
+                enc.set_buffer(qkv_conv_buf, 0, 5);
+                enc.set_buffer(layer_buf, ssm_norm_off, 6);
+                enc.set_buffer(normed_out_buf, 0, 7);
+                enc.set_bytes(&(num_heads as u32).to_le_bytes(), 8);
+                enc.set_bytes(&(head_dim as u32).to_le_bytes(), 9);
+                enc.set_bytes(&(head_dim as u32).to_le_bytes(), 10);
+                enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 11);
+                enc.set_bytes(&eps.to_le_bytes(), 12);
+                enc.set_bytes(&(1u32).to_le_bytes(), 13);
+                {
+                    let l2_eps: f32 = 1e-12;
+                    enc.set_bytes(&l2_eps.to_le_bytes(), 14);
+                    let tg = head_dim as u64;
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(num_heads as u64, 1, 1),
+                        MTLSize::new(tg, 1, 1),
+                    );
+                }
+            } else {
+                enc.set_pipeline_state(pso_l2_norm_qk);
+                enc.set_buffer(qkv_conv_buf, 0, 0);
+                enc.set_buffer(qkv_conv_buf, k_byte_off, 1);
+                enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 2);
+                enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 3);
+                enc.set_bytes(&(head_dim as u32).to_le_bytes(), 4);
+                {
+                    let l2_eps: f32 = 1e-12;
+                    enc.set_bytes(&l2_eps.to_le_bytes(), 5);
+                    let l2_tg = 256u64.min(head_dim as u64).max(1);
+                    let total_heads = (num_kv_heads + num_kv_heads) as u64;
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(total_heads, 1, 1),
+                        MTLSize::new(l2_tg, 1, 1),
+                    );
+                }
+                enc.memory_barrier_with_scope(1);
+
+                enc.set_pipeline_state(pso_state_output_norm);
+                enc.set_buffer(h_state_buf, 0, 0);
+                enc.set_buffer(qkv_conv_buf, k_byte_off, 1);
+                enc.set_buffer(qkv_conv_buf, v_byte_off, 2);
+                enc.set_buffer(alpha_buf, 0, 3);
+                enc.set_buffer(beta_buf, 0, 4);
+                enc.set_buffer(qkv_conv_buf, 0, 5);
+                enc.set_buffer(layer_buf, ssm_norm_off, 6);
+                enc.set_buffer(normed_out_buf, 0, 7);
+                enc.set_bytes(&(num_heads as u32).to_le_bytes(), 8);
+                enc.set_bytes(&(head_dim as u32).to_le_bytes(), 9);
+                enc.set_bytes(&(head_dim as u32).to_le_bytes(), 10);
+                enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 11);
+                enc.set_bytes(&eps.to_le_bytes(), 12);
+                enc.set_bytes(&(1u32).to_le_bytes(), 13);
+                {
+                    let tg = head_dim as u64;
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(num_heads as u64, 1, 1),
+                        MTLSize::new(tg, 1, 1),
+                    );
+                }
             }
         }
 

@@ -1299,10 +1299,9 @@ impl MetalF32Backend {
 
                 // Batched GDN prefill: batches GEMM operations while processing
                 // state updates sequentially per token via fused kernel.
-                // Batched GDN prefill disabled: produces incorrect hidden states for
-                // multi-token batches. The token-by-token fallback uses the verified
-                // single-token decode path which matches MLX output exactly.
-                let use_batched = false;
+                // Re-enabled after conv_pos fix (was disabled due to stale conv position
+                // when batch_size >= buf_slots).
+                let use_batched = true;
 
                 if use_batched {
                     // Batched path: ~15 dispatches + per-token conv1d/state-update
