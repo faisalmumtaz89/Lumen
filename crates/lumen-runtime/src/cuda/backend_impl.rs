@@ -777,10 +777,12 @@ impl CudaBackend {
         // NOTE: GDN layers still have dense FFN (gate/up/SwiGLU/down) which runs
         // AFTER the GDN attention block, same as standard layers.
         if layer_type == 1 {
-            // Run the GDN attention block (steps 1-13), which replaces the standard
+            // Run the GDN attention block, which replaces the standard
             // QKV -> RoPE -> KV cache -> Attention -> Output proj path.
-            // After this, x_gpu contains the post-residual hidden state and
-            // attn_proj is set to a copy of x_gpu so the FFN block can read from it.
+            // After this, attn_proj = x_old + ssm_proj (the post-GDN-attention
+            // hidden state). x_gpu is NOT updated here -- it retains the old value.
+            // The FFN block reads from attn_proj, and the caller copies attn_proj
+            // to x_gpu after the full layer (GDN attention + FFN) completes.
             self.compute_gdn_attention_gpu(layer_idx, st)?;
         } else {
 
@@ -2501,24 +2503,25 @@ impl CudaBackend {
     /// Run the GDN (GatedDeltaNet) attention block on GPU, replacing the
     /// standard softmax attention path for GDN layers.
     ///
-    /// Implements the 13-step GDN pipeline:
-    ///   1. RMSNorm(x) -> normed
-    ///   2. QKV matvec: normed @ wq^T -> qkv_buf
-    ///   3a. Conv1D decode on QKV channels
-    ///   3b. SiLU activation on conv output
-    ///   4a-b. Alpha/beta matvec projections
-    ///   4c. Compute gates (alpha decay, beta mixing)
-    ///   5. L2-normalize Q and K per head
-    ///   6-7. State update + output (delta rule recurrence)
-    ///   8. RMSNorm on output
-    ///   9. Attention gate matvec
-    ///   10. SiLU(gate) * normed_output
-    ///   11. Output projection -> ssm_proj
-    ///   12. Residual: x_gpu += ssm_proj
-    ///   13. Copy x_gpu -> attn_proj (for FFN block)
+    /// Implements the GDN attention pipeline with fused optimizations:
+    ///
+    /// When dp4a Q8_1 path is available (Q8_0/Q4_0 weights):
+    ///   1. Fused RMSNorm + Q8_1 quantize (1 dispatch)
+    ///   2-4. QKV + alpha + beta + gate matvecs with shared Q8_1 input (4 dispatches)
+    ///   5. GDN megakernel: conv1d+silu, gates, L2 norm, state update (1 dispatch)
+    ///   6. Fused RMSNorm + SiLU gate (in-place on output_buf, 1 dispatch)
+    ///   7. SSM output projection (1 dispatch)
+    ///   8. Fused residual_add_copy: attn_proj = x_gpu + ssm_proj (1 dispatch)
+    ///
+    /// Fallback (F32/F16 weights):
+    ///   1. RMSNorm (1 dispatch)
+    ///   2-4. QKV + alpha + beta + gate matvecs (4+ dispatches)
+    ///   5-8. Same as above
     ///
     /// After this call, `st.scratch.attn_proj` contains the post-GDN hidden
-    /// state ready for the shared FFN block.
+    /// state (x + ssm_proj) ready for the shared FFN block. `x_gpu` is NOT
+    /// updated -- it retains the pre-GDN value. The caller updates `x_gpu`
+    /// after the full layer (GDN attention + FFN) completes.
     fn compute_gdn_attention_gpu(
         &self,
         layer_idx: usize,
@@ -2540,46 +2543,180 @@ impl CudaBackend {
                 "compute_gdn_attention_gpu: layer {layer_idx} is not a GDN layer",
             )))?;
 
-        // --- Step 1: RMSNorm(x) -> normed ---
-        {
-            let block_size = rmsnorm_block_size(hidden_dim);
-            let shared_bytes = rmsnorm_shared_bytes(block_size);
-            let launch_cfg = CudarcLaunchConfig {
+        // --- Step 1+2: RMSNorm + QKV matvec ---
+        // Detect if all GDN matvec consumers (QKV, alpha, beta, gate) use dp4a Q8_1
+        // so we can fuse RMSNorm + Q8_1 quantization and share the quantized input.
+        let ssm_alpha_w = lw.ssm_alpha.as_ref()
+            .ok_or_else(|| RuntimeError::Compute(format!(
+                "GDN L{layer_idx}: ssm_alpha weight missing",
+            )))?;
+        let ssm_beta_w = lw.ssm_beta.as_ref()
+            .ok_or_else(|| RuntimeError::Compute(format!(
+                "GDN L{layer_idx}: ssm_beta weight missing",
+            )))?;
+        let attn_gate_w = lw.attn_gate.as_ref()
+            .ok_or_else(|| RuntimeError::Compute(format!(
+                "GDN L{layer_idx}: attn_gate weight missing",
+            )))?;
+
+        let gdn_use_preq = weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
+            && weight_uses_dp4a_q8_1(ssm_alpha_w, &st.kernels)
+            && weight_uses_dp4a_q8_1(ssm_beta_w, &st.kernels)
+            && weight_uses_dp4a_q8_1(attn_gate_w, &st.kernels)
+            && st.scratch.input_q8_1.is_some()
+            && st.kernels.quantize_f32_to_q8_1.is_some();
+
+        if gdn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
+            // === FUSED: RMSNorm + Q8_1 quantize in 1 dispatch ===
+            // Then all 4 matvecs (QKV, alpha, beta, gate) use launch_matvec_preq8_1
+            // sharing the single quantized input. Saves 4 separate quantize dispatches.
+            let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
+            let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
+            let bs = rmsnorm_block_size(hidden_dim);
+            let lc = CudarcLaunchConfig {
                 grid_dim: (1, 1, 1),
-                block_dim: (block_size, 1, 1),
-                shared_mem_bytes: shared_bytes,
+                block_dim: (bs, 1, 1),
+                shared_mem_bytes: rmsnorm_shared_bytes(bs),
             };
             let dim = hidden_dim as u32;
             unsafe {
-                self.device
-                    .stream
-                    .launch_builder(&st.kernels.rmsnorm)
+                self.device.stream.launch_builder(fused_fn)
                     .arg(&st.scratch.x_gpu)
                     .arg(&lw.attn_norm)
-                    .arg(&mut st.scratch.normed)
+                    .arg(&mut *q8_1_buf)
                     .arg(&eps)
                     .arg(&dim)
-                    .launch(launch_cfg)
+                    .launch(lc)
             }
-            .map_err(|e| RuntimeError::Compute(format!("GDN rmsnorm attn L{layer_idx}: {e}")))?;
-        }
+            .map_err(|e| RuntimeError::Compute(format!("GDN rmsnorm_to_q8_1 L{layer_idx}: {e}")))?;
 
-        // --- Step 2: QKV matvec: normed @ wq^T -> qkv_buf ---
-        // wq for GDN is the fused [qkv_dim, hidden_dim] weight.
-        unsafe {
-            launch_matvec(
-                &self.device,
-                &st.kernels,
-                &lw.wq,
-                &st.scratch.normed,
-                &mut gdn.qkv_buf,
-                p.qkv_dim,
-                hidden_dim,
-                "gdn_qkv",
-                lw.wq_f16.as_ref(),
-                Some(&mut st.scratch.input_f16),
-            st.scratch.input_q8_1.as_mut(),
-            )?;
+            // QKV matvec with pre-quantized input
+            unsafe {
+                launch_matvec_preq8_1(
+                    &self.device, &st.kernels, &lw.wq,
+                    q8_1_buf, &mut gdn.qkv_buf,
+                    p.qkv_dim, hidden_dim, "gdn_qkv",
+                )?;
+            }
+
+            // Alpha matvec with shared pre-quantized input
+            unsafe {
+                launch_matvec_preq8_1(
+                    &self.device, &st.kernels, ssm_alpha_w,
+                    q8_1_buf, &mut gdn.alpha_raw_buf,
+                    p.num_heads, hidden_dim, "gdn_alpha",
+                )?;
+            }
+
+            // Beta matvec with shared pre-quantized input
+            unsafe {
+                launch_matvec_preq8_1(
+                    &self.device, &st.kernels, ssm_beta_w,
+                    q8_1_buf, &mut gdn.beta_raw_buf,
+                    p.num_heads, hidden_dim, "gdn_beta",
+                )?;
+            }
+
+            // Gate matvec with shared pre-quantized input (moved here from step 9)
+            unsafe {
+                launch_matvec_preq8_1(
+                    &self.device, &st.kernels, attn_gate_w,
+                    q8_1_buf, &mut gdn.gate_buf,
+                    p.value_dim, hidden_dim, "gdn_gate",
+                )?;
+            }
+        } else {
+            // === UNFUSED: separate RMSNorm + per-matvec quantize ===
+            {
+                let block_size = rmsnorm_block_size(hidden_dim);
+                let shared_bytes = rmsnorm_shared_bytes(block_size);
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: shared_bytes,
+                };
+                let dim = hidden_dim as u32;
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(&st.kernels.rmsnorm)
+                        .arg(&st.scratch.x_gpu)
+                        .arg(&lw.attn_norm)
+                        .arg(&mut st.scratch.normed)
+                        .arg(&eps)
+                        .arg(&dim)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!("GDN rmsnorm attn L{layer_idx}: {e}")))?;
+            }
+
+            // QKV matvec
+            unsafe {
+                launch_matvec(
+                    &self.device,
+                    &st.kernels,
+                    &lw.wq,
+                    &st.scratch.normed,
+                    &mut gdn.qkv_buf,
+                    p.qkv_dim,
+                    hidden_dim,
+                    "gdn_qkv",
+                    lw.wq_f16.as_ref(),
+                    Some(&mut st.scratch.input_f16),
+                    st.scratch.input_q8_1.as_mut(),
+                )?;
+            }
+
+            // Alpha matvec
+            unsafe {
+                launch_matvec(
+                    &self.device,
+                    &st.kernels,
+                    ssm_alpha_w,
+                    &st.scratch.normed,
+                    &mut gdn.alpha_raw_buf,
+                    p.num_heads,
+                    hidden_dim,
+                    "gdn_alpha",
+                    lw.ssm_alpha_f16.as_ref(),
+                    Some(&mut st.scratch.input_f16),
+                    st.scratch.input_q8_1.as_mut(),
+                )?;
+            }
+
+            // Beta matvec
+            unsafe {
+                launch_matvec(
+                    &self.device,
+                    &st.kernels,
+                    ssm_beta_w,
+                    &st.scratch.normed,
+                    &mut gdn.beta_raw_buf,
+                    p.num_heads,
+                    hidden_dim,
+                    "gdn_beta",
+                    lw.ssm_beta_f16.as_ref(),
+                    Some(&mut st.scratch.input_f16),
+                    st.scratch.input_q8_1.as_mut(),
+                )?;
+            }
+
+            // Gate matvec (moved here from step 9 to share quantized input)
+            unsafe {
+                launch_matvec(
+                    &self.device,
+                    &st.kernels,
+                    attn_gate_w,
+                    &st.scratch.normed,
+                    &mut gdn.gate_buf,
+                    p.value_dim,
+                    hidden_dim,
+                    "gdn_gate",
+                    lw.attn_gate_f16.as_ref(),
+                    Some(&mut st.scratch.input_f16),
+                    st.scratch.input_q8_1.as_mut(),
+                )?;
+            }
         }
 
 
@@ -2597,52 +2734,6 @@ impl CudaBackend {
             .ok_or_else(|| RuntimeError::Compute(format!(
                 "GDN L{layer_idx}: ssm_a missing",
             )))?;
-
-        // --- Step 4a: Alpha matvec: normed @ ssm_alpha^T -> alpha_raw ---
-        {
-            let ssm_alpha = lw.ssm_alpha.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(format!(
-                    "GDN L{layer_idx}: ssm_alpha weight missing",
-                )))?;
-            unsafe {
-                launch_matvec(
-                    &self.device,
-                    &st.kernels,
-                    ssm_alpha,
-                    &st.scratch.normed,
-                    &mut gdn.alpha_raw_buf,
-                    p.num_heads,
-                    hidden_dim,
-                    "gdn_alpha",
-                    lw.ssm_alpha_f16.as_ref(),
-                    Some(&mut st.scratch.input_f16),
-                st.scratch.input_q8_1.as_mut(),
-                )?;
-            }
-        }
-
-        // --- Step 4b: Beta matvec: normed @ ssm_beta^T -> beta_raw ---
-        {
-            let ssm_beta = lw.ssm_beta.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(format!(
-                    "GDN L{layer_idx}: ssm_beta weight missing",
-                )))?;
-            unsafe {
-                launch_matvec(
-                    &self.device,
-                    &st.kernels,
-                    ssm_beta,
-                    &st.scratch.normed,
-                    &mut gdn.beta_raw_buf,
-                    p.num_heads,
-                    hidden_dim,
-                    "gdn_beta",
-                    lw.ssm_beta_f16.as_ref(),
-                    Some(&mut st.scratch.input_f16),
-                st.scratch.input_q8_1.as_mut(),
-                )?;
-            }
-        }
 
         if let Some(ref mega_fn) = st.kernels.gdn_decode_megakernel {
             // === FUSED PATH: 8 launches -> 2 ===
@@ -2853,30 +2944,14 @@ impl CudaBackend {
 
         // --- Steps 8+10: Fused RMSNorm + SiLU(gate) * normed output ---
         // Fused path: gdn_rmsnorm_silu_gate (2 kernels -> 1).
-        // Falls back to unfused rmsnorm + gate_matvec + silu_mul if unavailable.
+        // Falls back to unfused rmsnorm + silu_mul if unavailable.
+        // Note: gate matvec was already dispatched above (step 1+2 block) to share
+        // the Q8_1 quantized input with QKV/alpha/beta matvecs.
 
-        // Step 9: Attention gate matvec (same for both paths -- runs BEFORE fused/unfused norm+gate)
-        {
-            let attn_gate = lw.attn_gate.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(format!(
-                    "GDN L{layer_idx}: attn_gate weight missing",
-                )))?;
-            unsafe {
-                launch_matvec(
-                    &self.device,
-                    &st.kernels,
-                    attn_gate,
-                    &st.scratch.normed,
-                    &mut gdn.gate_buf,
-                    p.value_dim,
-                    hidden_dim,
-                    "gdn_gate",
-                    lw.attn_gate_f16.as_ref(),
-                    Some(&mut st.scratch.input_f16),
-                st.scratch.input_q8_1.as_mut(),
-                )?;
-            }
-        }
+        // Track which buffer holds the final gated output for the ssm_out matvec.
+        // Fused path: writes to normed_out_buf (no memcpy needed).
+        // Unfused path: writes to output_buf (via silu_elementwise_mul).
+        let used_fused_norm_gate;
 
         if let Some(ref fused_fn) = st.kernels.gdn_rmsnorm_silu_gate {
             // === FUSED: RMSNorm + SiLU(gate) * normed in one kernel ===
@@ -2893,10 +2968,10 @@ impl CudaBackend {
                 shared_mem_bytes: shared_bytes,
             };
             let dim = p.value_dim as u32;
-            // gdn_rmsnorm_silu_gate(raw_output, ssm_norm, gate, out, eps, dim)
-            // Reads output_buf (raw state output), applies RMSNorm with ssm_norm weights,
-            // then applies silu(gate_buf) * normed. Writes final gated output to output_buf.
-            // We write to normed_out_buf as temp, then use it as the "gated" output.
+            // gdn_rmsnorm_silu_gate: output_buf -> normed_out_buf.
+            // The ssm_out matvec below reads from normed_out_buf directly,
+            // eliminating the memcpy_dtod that was previously needed to copy
+            // normed_out_buf back to output_buf.
             unsafe {
                 self.device
                     .stream
@@ -2904,21 +2979,13 @@ impl CudaBackend {
                     .arg(&gdn.output_buf)
                     .arg(ssm_norm)
                     .arg(&gdn.gate_buf)
-                    .arg(&mut gdn.normed_out_buf) // reuse as final gated output
+                    .arg(&mut gdn.normed_out_buf)
                     .arg(&eps)
                     .arg(&dim)
                     .launch(launch_cfg)
             }
             .map_err(|e| RuntimeError::Compute(format!("GDN fused_rmsnorm_silu_gate L{layer_idx}: {e}")))?;
-
-            // normed_out_buf now contains silu(gate) * normed_output. Copy to output_buf
-            // for the subsequent output projection step.
-            self.device
-                .stream
-                .memcpy_dtod(&gdn.normed_out_buf, &mut gdn.output_buf)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "GDN dtod normed_out->output L{layer_idx}: {e}",
-                )))?;
+            used_fused_norm_gate = true;
         } else {
             // === UNFUSED FALLBACK ===
             // Step 8: RMSNorm on output
@@ -2944,7 +3011,7 @@ impl CudaBackend {
                 .map_err(|e| RuntimeError::Compute(format!("GDN rmsnorm output L{layer_idx}: {e}")))?;
             }
 
-            // Step 10: SiLU(gate) * normed_output
+            // Step 10: SiLU(gate) * normed_output -> output_buf
             {
                 let silu_mul_fn = st.kernels.silu_elementwise_mul.as_ref()
                     .ok_or_else(|| RuntimeError::Compute(
@@ -2965,22 +3032,28 @@ impl CudaBackend {
                 }
                 .map_err(|e| RuntimeError::Compute(format!("GDN silu_mul L{layer_idx}: {e}")))?;
             }
+            used_fused_norm_gate = false;
         }
 
 
-        // --- Step 11: Output projection: output_buf @ ssm_out^T -> ssm_proj ---
-        // (output_buf now holds silu(gate) * normed_out from step 10)
+        // --- Step 11: Output projection -> ssm_proj ---
+        // Fused path: reads from normed_out_buf. Unfused path: reads from output_buf.
         {
             let ssm_out = lw.ssm_out.as_ref()
                 .ok_or_else(|| RuntimeError::Compute(format!(
                     "GDN L{layer_idx}: ssm_out weight missing",
                 )))?;
+            let ssm_input = if used_fused_norm_gate {
+                &gdn.normed_out_buf
+            } else {
+                &gdn.output_buf
+            };
             unsafe {
                 launch_matvec(
                     &self.device,
                     &st.kernels,
                     ssm_out,
-                    &gdn.output_buf,
+                    ssm_input,
                     &mut gdn.ssm_proj_buf,
                     hidden_dim,
                     p.value_dim,
@@ -2993,7 +3066,11 @@ impl CudaBackend {
         }
 
 
-        // --- Step 12: Residual add: x_gpu += ssm_proj ---
+        // --- Step 12+13: Fused residual add + copy ---
+        // attn_proj = x_gpu + ssm_proj (via residual_add_copy, 1 dispatch).
+        // x_gpu is NOT updated here -- it will be updated by the FFN residual
+        // (x_gpu = attn_proj + down) which already reads from attn_proj.
+        // This eliminates 1 dispatch vs the prior residual_add + memcpy_dtod pair.
         {
             let config = LaunchConfig::for_elements(hidden_dim);
             let launch_cfg = CudarcLaunchConfig {
@@ -3005,23 +3082,15 @@ impl CudaBackend {
             unsafe {
                 self.device
                     .stream
-                    .launch_builder(&st.kernels.residual_add)
-                    .arg(&mut st.scratch.x_gpu)
+                    .launch_builder(&st.kernels.residual_add_copy)
+                    .arg(&st.scratch.x_gpu)
                     .arg(&gdn.ssm_proj_buf)
+                    .arg(&mut st.scratch.attn_proj)
                     .arg(&n)
                     .launch(launch_cfg)
             }
-            .map_err(|e| RuntimeError::Compute(format!("GDN residual_add L{layer_idx}: {e}")))?;
+            .map_err(|e| RuntimeError::Compute(format!("GDN residual_add_copy L{layer_idx}: {e}")))?;
         }
-
-
-        // --- Step 13: Copy x_gpu -> attn_proj (so FFN block reads from attn_proj) ---
-        self.device
-            .stream
-            .memcpy_dtod(&st.scratch.x_gpu, &mut st.scratch.attn_proj)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "GDN dtod x_gpu->attn_proj L{layer_idx}: {e}",
-            )))?;
 
 
         Ok(())

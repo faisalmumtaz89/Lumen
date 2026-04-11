@@ -215,13 +215,25 @@ MODAL_MODELS = {
         "display": "Qwen2.5 3B Instruct",
         "registry": "qwen2.5-3b:q8_0",
     },
+    "qwen2.5-3b:f16": {
+        "display": "Qwen2.5 3B Instruct F16",
+        "registry": "qwen2.5-3b:f16",
+    },
     "llama-8b": {
         "display": "Llama 3.1 8B Instruct",
         "registry": "llama-8b:q8_0",
     },
+    "llama-8b:f16": {
+        "display": "Llama 3.1 8B Instruct F16",
+        "registry": "llama-8b:f16",
+    },
     "tinyllama": {
         "display": "TinyLlama 1.1B Chat",
         "registry": "tinyllama:q8_0",
+    },
+    "qwen3.5-9b": {
+        "display": "Qwen3.5 9B",
+        "registry": "qwen3.5-9b:q8_0",
     },
 }
 
