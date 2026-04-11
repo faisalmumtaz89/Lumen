@@ -1,6 +1,7 @@
 //! Qwen3.5-MoE converter: hybrid GDN + full-attention with stacked expert tensors.
 
 use super::ArchConverter;
+use super::gdn_gates::{compute_ssm_slices, write_ssm_tensors};
 use crate::convert::ConvertError;
 use crate::dequant::*;
 use crate::gguf::{GgmlType, GgufFile};
@@ -288,13 +289,15 @@ fn compute_layer_shape_qwen35moe(
     // Attention gate (full attention layers only)
     let attn_gate = try_compute_opt_slice(gguf, layer, ATTN_GATE_WEIGHT, &mut blob_size, dequantize)?;
 
-    // SSM tensors (linear attention layers only)
-    let ssm_a = try_compute_opt_slice(gguf, layer, SSM_A, &mut blob_size, dequantize)?;
-    let ssm_conv1d = try_compute_opt_slice(gguf, layer, SSM_CONV1D, &mut blob_size, dequantize)?;
-    let ssm_dt = try_compute_opt_slice(gguf, layer, SSM_DT, &mut blob_size, dequantize)?;
-    let ssm_beta = try_compute_opt_slice(gguf, layer, SSM_BETA, &mut blob_size, dequantize)?;
-    let ssm_alpha = try_compute_opt_slice(gguf, layer, SSM_ALPHA, &mut blob_size, dequantize)?;
-    let ssm_norm = try_compute_opt_slice(gguf, layer, SSM_NORM, &mut blob_size, dequantize)?;
+    // SSM tensors (linear attention layers only) — ssm_alpha/beta MUST be Q8_0.
+    // Shared logic in gdn_gates handles force-requant from F32/F16/BF16 to Q8_0.
+    let ssm = compute_ssm_slices(gguf, layer, &mut blob_size, dequantize)?;
+    let ssm_a = ssm.ssm_a;
+    let ssm_conv1d = ssm.ssm_conv1d;
+    let ssm_dt = ssm.ssm_dt;
+    let ssm_beta = ssm.ssm_beta;
+    let ssm_alpha = ssm.ssm_alpha;
+    let ssm_norm = ssm.ssm_norm;
     let ssm_out = try_compute_opt_slice(gguf, layer, SSM_OUT, &mut blob_size, true)?;  // force F32: Q5_K unsupported at runtime
 
     // Router weight (always F32)
@@ -424,13 +427,9 @@ fn write_qwen35moe_layer_blob<R: Read + Seek>(
         append_tensor_to_blob(blob, reader, gguf, &attn_gate_name, dequantize)?;
     }
 
-    // SSM tensors (if present). SSM_OUT is forced to F32 because Q5_K is unsupported at runtime.
-    for suffix in &[SSM_A, SSM_CONV1D, SSM_DT, SSM_BETA, SSM_ALPHA, SSM_NORM] {
-        let name = layer_tensor_name(layer, suffix);
-        if gguf.find_tensor(&name).is_some() {
-            append_tensor_to_blob(blob, reader, gguf, &name, dequantize)?;
-        }
-    }
+    // SSM tensors (if present) — shared GDN gate logic handles force-requant
+    // of ssm_alpha/beta to Q8_0 when source is F32/F16/BF16.
+    write_ssm_tensors(blob, reader, gguf, layer, dequantize)?;
     {
         let name = layer_tensor_name(layer, SSM_OUT);
         if gguf.find_tensor(&name).is_some() {

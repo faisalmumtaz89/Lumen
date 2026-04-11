@@ -7,6 +7,7 @@ use lumen_format::streaming_writer::LayerShape;
 use std::io::{Read, Seek};
 
 pub(crate) mod dense;
+pub(crate) mod gdn_gates;
 pub(crate) mod moe;
 pub(crate) mod qwen35;
 pub(crate) mod qwen35_moe;
