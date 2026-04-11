@@ -301,6 +301,23 @@ impl GgmlType {
             _ => None,
         }
     }
+
+    /// Whether `dequantize_to_f32_bytes` can convert this type to F32.
+    ///
+    /// This is the authoritative check used by `try_compute_opt_slice` to
+    /// decide whether a tensor with no direct LBC mapping can be force-
+    /// dequantized to F32 during conversion (vs. silently skipped).
+    pub fn has_dequant_path(&self) -> bool {
+        matches!(self,
+            Self::F32 | Self::F16 | Self::BF16
+            | Self::Q8_0 | Self::Q8_1
+            | Self::Q4_0 | Self::Q4_1
+            | Self::Q5_0 | Self::Q5_1
+            | Self::Q4_K | Self::Q5_K | Self::Q6_K
+            | Self::Q2_K | Self::Q3_K
+            | Self::MXFP4
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

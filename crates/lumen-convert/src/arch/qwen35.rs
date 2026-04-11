@@ -131,6 +131,21 @@ fn compute_layer_shape_qwen35(
             let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::Q4_0 };
             *blob_offset += size;
             Ok(slice)
+        } else if tensor.ggml_type == GgmlType::Q8_1 {
+            // Q8_1 has no LBC QuantScheme -- requantize to Q8_0.
+            let n_elements = tensor.n_elements();
+            assert!(n_elements % 32 == 0, "Q8_1->Q8_0 requires elements divisible by 32, got {n_elements} for {name}");
+            let size = ((n_elements as usize / 32) * 34) as u64;
+            let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::Q8_0 };
+            *blob_offset += size;
+            Ok(slice)
+        } else if tensor.ggml_type == GgmlType::Q5_1 {
+            // Q5_1 has no LBC QuantScheme -- dequantize to F32.
+            let n_elements = tensor.n_elements();
+            let size = n_elements * 4;
+            let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::F32 };
+            *blob_offset += size;
+            Ok(slice)
         } else {
             let quant = tensor.ggml_type.to_lbc_quant()
                 .ok_or_else(|| ConvertError::UnsupportedTensorType {
@@ -148,6 +163,9 @@ fn compute_layer_shape_qwen35(
     };
 
     // Helper for optional tensors.
+    // Returns None if the tensor is absent. For tensors with no direct LBC
+    // mapping but a known dequant path (Q8_1, Q5_1, MXFP4, etc.), forces
+    // dequantization to F32 instead of silently skipping.
     let try_compute_opt_slice = |gguf: &GgufFile, layer: usize, suffix: &str, blob_offset: &mut u64, dequantize: bool|
         -> Result<Option<TensorSlice>, ConvertError>
     {
@@ -155,7 +173,7 @@ fn compute_layer_shape_qwen35(
         if let Some(tensor) = gguf.find_tensor(&name) {
             let force_dequant = !dequantize && tensor.ggml_type.to_lbc_quant().is_none();
             if force_dequant {
-                if tensor.ggml_type == GgmlType::MXFP4 {
+                if tensor.ggml_type.has_dequant_path() {
                     eprintln!("  Note: dequantizing {} ({:?} -> F32)", name, tensor.ggml_type);
                     Ok(Some(compute_slice(gguf, &name, blob_offset, /*dequantize=*/ true)?))
                 } else {

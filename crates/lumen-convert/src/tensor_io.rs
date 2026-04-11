@@ -113,6 +113,26 @@ pub(crate) fn append_tensor_to_blob_requant<R: Read + Seek>(
         eprintln!("    Requantized Q4_1 -> Q4_0: {tensor_name} ({} -> {} bytes)",
             data.len(), q4_data.len());
         blob.extend_from_slice(&q4_data);
+    } else if tensor.ggml_type == crate::gguf::GgmlType::Q8_1 {
+        // Q8_1 has no LBC QuantScheme and no dedicated GPU kernel.
+        // Requantize to Q8_0: dequant Q8_1 -> F32 -> quantize Q8_0.
+        let f32_data = dequantize_to_f32_bytes(
+            &data, tensor.ggml_type, tensor.n_elements(), tensor_name,
+        )?;
+        let n_elems = tensor.n_elements() as usize;
+        let q8_data = quantize_f32_to_q8_0(&f32_data, n_elems);
+        eprintln!("    Requantized Q8_1 -> Q8_0: {tensor_name} ({} -> {} bytes)",
+            data.len(), q8_data.len());
+        blob.extend_from_slice(&q8_data);
+    } else if tensor.ggml_type == crate::gguf::GgmlType::Q5_1 {
+        // Q5_1 has no LBC QuantScheme and no dedicated GPU kernel.
+        // Dequantize to F32.
+        let f32_data = dequantize_to_f32_bytes(
+            &data, tensor.ggml_type, tensor.n_elements(), tensor_name,
+        )?;
+        eprintln!("    Dequantized Q5_1 -> F32: {tensor_name} ({} -> {} bytes)",
+            data.len(), f32_data.len());
+        blob.extend_from_slice(&f32_data);
     } else {
         blob.extend_from_slice(&data);
     }

@@ -1500,13 +1500,243 @@ mod tests {
 
     #[test]
     fn dequantize_unsupported_type_errors() {
-        let result = dequantize_to_f32_bytes(&[], GgmlType::Q8_1, 0, "test");
+        // Q8_K has known block geometry but no dequant path
+        let result = dequantize_to_f32_bytes(&[], GgmlType::Q8_K, 0, "test");
         assert!(result.is_err());
         match result.unwrap_err() {
             ConvertError::UnsupportedTensorType { tensor, .. } => {
                 assert_eq!(tensor, "test");
             }
             other => panic!("expected UnsupportedTensorType, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn dequantize_q8_1_known_block() {
+        // Q8_1: [f16 scale][f16 min][32 x i8] = 36 bytes
+        // val[i] = scale * qs[i] + min
+        let scale_bits = f32_to_f16_bits(2.0);
+        let min_bits = f32_to_f16_bits(0.5);
+        let mut block = Vec::new();
+        block.extend_from_slice(&scale_bits.to_le_bytes());
+        block.extend_from_slice(&min_bits.to_le_bytes());
+        for i in 0..32i8 {
+            block.push(i as u8);
+        }
+        assert_eq!(block.len(), 36);
+
+        let result = dequantize_q8_1(&block, 32);
+        let values: Vec<f32> = result
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+
+        assert_eq!(values.len(), 32);
+        for (i, &v) in values.iter().enumerate() {
+            let expected = 2.0 * i as f32 + 0.5;
+            assert!(
+                (v - expected).abs() < 1e-2,
+                "Q8_1 mismatch at {i}: got {v}, expected {expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn dequantize_q8_1_negative_values() {
+        let scale_bits = f32_to_f16_bits(1.0);
+        let min_bits = f32_to_f16_bits(-3.0);
+        let mut block = Vec::new();
+        block.extend_from_slice(&scale_bits.to_le_bytes());
+        block.extend_from_slice(&min_bits.to_le_bytes());
+        for i in 1..=32 {
+            block.push((-i as i8) as u8);
+        }
+
+        let result = dequantize_q8_1(&block, 32);
+        let values: Vec<f32> = result
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+
+        for (i, &v) in values.iter().enumerate() {
+            let expected = -(i as f32 + 1.0) - 3.0;
+            assert!(
+                (v - expected).abs() < 1e-2,
+                "Q8_1 neg mismatch at {i}: got {v}, expected {expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn dequantize_q8_1_via_dispatcher() {
+        // Verify Q8_1 works through dequantize_to_f32_bytes
+        let scale_bits = f32_to_f16_bits(1.0);
+        let min_bits = f32_to_f16_bits(0.0);
+        let mut block = Vec::new();
+        block.extend_from_slice(&scale_bits.to_le_bytes());
+        block.extend_from_slice(&min_bits.to_le_bytes());
+        for i in 0..32i8 {
+            block.push(i as u8);
+        }
+
+        let result = dequantize_to_f32_bytes(&block, GgmlType::Q8_1, 32, "test");
+        assert!(result.is_ok(), "Q8_1 should be supported in dispatcher");
+        let values: Vec<f32> = result.unwrap()
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), 32);
+        for (i, &v) in values.iter().enumerate() {
+            assert!(
+                (v - i as f32).abs() < 1e-2,
+                "Q8_1 dispatcher mismatch at {i}: got {v}, expected {i}",
+            );
+        }
+    }
+
+    #[test]
+    fn dequantize_q8_1_to_q8_0_round_trip() {
+        // Test the full Q8_1 -> F32 -> Q8_0 pipeline
+        let scale_bits = f32_to_f16_bits(0.1);
+        let min_bits = f32_to_f16_bits(0.0);
+        let mut block = Vec::new();
+        block.extend_from_slice(&scale_bits.to_le_bytes());
+        block.extend_from_slice(&min_bits.to_le_bytes());
+        for i in 0..32i8 {
+            block.push(i as u8);
+        }
+
+        // Step 1: Dequant Q8_1 -> F32
+        let f32_bytes = dequantize_q8_1(&block, 32);
+        let f32_values: Vec<f32> = f32_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+
+        // Step 2: Quantize F32 -> Q8_0
+        let q8_0_bytes = quantize_f32_to_q8_0(&f32_bytes, 32);
+        assert_eq!(q8_0_bytes.len(), 34, "Q8_0 block should be 34 bytes");
+
+        // Step 3: Dequant Q8_0 -> F32 and compare
+        let f32_roundtrip = dequantize_q8_0(&q8_0_bytes, 32);
+        let rt_values: Vec<f32> = f32_roundtrip
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+
+        for (i, (&orig, &rt)) in f32_values.iter().zip(rt_values.iter()).enumerate() {
+            assert!(
+                (orig - rt).abs() < 0.02,
+                "Q8_1->Q8_0 round-trip mismatch at {i}: orig={orig}, rt={rt}",
+            );
+        }
+    }
+
+    #[test]
+    fn dequantize_q5_1_known_block() {
+        // Q5_1: [f16 scale][f16 min][4 bytes qh][16 bytes qs] = 24 bytes
+        // val[i] = scale * (nibble | (high_bit << 4)) + min
+        let scale_bits = f32_to_f16_bits(1.0);
+        let min_bits = f32_to_f16_bits(0.0);
+        let mut block = Vec::new();
+        block.extend_from_slice(&scale_bits.to_le_bytes());
+        block.extend_from_slice(&min_bits.to_le_bytes());
+        // All high bits = 0
+        block.extend_from_slice(&0u32.to_le_bytes());
+        // All nibbles = 0x33 -> lo=3, hi=3
+        block.resize(block.len() + 16, 0x33);
+        assert_eq!(block.len(), 24);
+
+        let result = dequantize_q5_1(&block, 32);
+        let values: Vec<f32> = result
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+
+        assert_eq!(values.len(), 32);
+        // All values should be 3.0 (lo nibble 3 or hi nibble 3, no high bits)
+        for (i, &v) in values.iter().enumerate() {
+            assert!(
+                (v - 3.0).abs() < 1e-2,
+                "Q5_1 mismatch at {i}: got {v}, expected 3.0"
+            );
+        }
+    }
+
+    #[test]
+    fn dequantize_q5_1_with_min_and_high_bits() {
+        // Q5_1 with non-zero min and some high bits set
+        let scale_bits = f32_to_f16_bits(1.0);
+        let min_bits = f32_to_f16_bits(10.0);
+        let mut block = Vec::new();
+        block.extend_from_slice(&scale_bits.to_le_bytes());
+        block.extend_from_slice(&min_bits.to_le_bytes());
+        // Set high bit for element 0 only
+        let qh: u32 = 1;
+        block.extend_from_slice(&qh.to_le_bytes());
+        // All nibbles = 0x00
+        block.resize(block.len() + 16, 0x00);
+
+        let result = dequantize_q5_1(&block, 32);
+        let values: Vec<f32> = result
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+
+        // Element 0: scale * (0 | (1 << 4)) + min = 1.0 * 16 + 10.0 = 26.0
+        assert!(
+            (values[0] - 26.0).abs() < 1e-2,
+            "Q5_1 high-bit mismatch: got {}, expected 26.0", values[0]
+        );
+        // Element 1: scale * (0 | (0 << 4)) + min = 0 + 10.0 = 10.0
+        assert!(
+            (values[1] - 10.0).abs() < 1e-2,
+            "Q5_1 no-high-bit mismatch: got {}, expected 10.0", values[1]
+        );
+    }
+
+    #[test]
+    fn dequantize_q5_1_via_dispatcher() {
+        let scale_bits = f32_to_f16_bits(1.0);
+        let min_bits = f32_to_f16_bits(0.0);
+        let mut block = Vec::new();
+        block.extend_from_slice(&scale_bits.to_le_bytes());
+        block.extend_from_slice(&min_bits.to_le_bytes());
+        block.extend_from_slice(&0u32.to_le_bytes());
+        block.resize(block.len() + 16, 0x00);
+
+        let result = dequantize_to_f32_bytes(&block, GgmlType::Q5_1, 32, "test");
+        assert!(result.is_ok(), "Q5_1 should be supported in dispatcher");
+    }
+
+    #[test]
+    fn has_dequant_path_covers_all_supported_types() {
+        // Every type handled by dequantize_to_f32_bytes must return true
+        let supported = [
+            GgmlType::F32, GgmlType::F16, GgmlType::BF16,
+            GgmlType::Q8_0, GgmlType::Q8_1,
+            GgmlType::Q4_0, GgmlType::Q4_1,
+            GgmlType::Q5_0, GgmlType::Q5_1,
+            GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K,
+            GgmlType::Q2_K, GgmlType::Q3_K,
+            GgmlType::MXFP4,
+        ];
+        for t in supported {
+            assert!(t.has_dequant_path(), "{t:?} should have a dequant path");
+        }
+
+        // Types without dequant path
+        let unsupported = [
+            GgmlType::Q8_K, GgmlType::F64,
+            GgmlType::I8, GgmlType::I16, GgmlType::I32, GgmlType::I64,
+            GgmlType::IQ2_XXS, GgmlType::IQ2_XS, GgmlType::IQ2_S,
+            GgmlType::IQ3_XXS, GgmlType::IQ3_S,
+            GgmlType::IQ1_S, GgmlType::IQ1_M,
+            GgmlType::IQ4_NL, GgmlType::IQ4_XS,
+            GgmlType::Unknown(9999),
+        ];
+        for t in unsupported {
+            assert!(!t.has_dequant_path(), "{t:?} should NOT have a dequant path");
         }
     }
 

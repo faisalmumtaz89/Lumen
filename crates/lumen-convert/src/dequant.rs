@@ -200,6 +200,67 @@ pub(crate) fn dequantize_q4_1(src: &[u8], n_elements: u64) -> Vec<u8> {
     out
 }
 
+/// Dequantize Q8_1: block_size=32, type_size=36.
+/// Layout: [2 bytes f16 scale] [2 bytes f16 min] [32 bytes int8 values]
+/// Dequant: val[i] = f32(scale) * f32(qs[i]) + f32(min)
+pub(crate) fn dequantize_q8_1(src: &[u8], n_elements: u64) -> Vec<u8> {
+    let n = n_elements as usize;
+    let mut out = Vec::with_capacity(n * 4);
+    let block_size = 36;
+    let mut written = 0usize;
+    let mut offset = 0usize;
+    while written < n && offset + block_size <= src.len() {
+        let scale = f16_to_f32(u16::from_le_bytes([src[offset], src[offset + 1]]));
+        let min = f16_to_f32(u16::from_le_bytes([src[offset + 2], src[offset + 3]]));
+        for i in 0..32 {
+            if written >= n {
+                break;
+            }
+            let q = src[offset + 4 + i] as i8;
+            let val = scale * q as f32 + min;
+            out.extend_from_slice(&val.to_le_bytes());
+            written += 1;
+        }
+        offset += block_size;
+    }
+    out
+}
+
+/// Dequantize Q5_1: block_size=32, type_size=24.
+/// Layout: [2 bytes f16 scale] [2 bytes f16 min] [4 bytes high-bit array] [16 bytes packed 4-bit nibbles]
+/// Dequant: val[i] = f32(scale) * (nibble | (high_bit << 4)) + f32(min)
+pub(crate) fn dequantize_q5_1(src: &[u8], n_elements: u64) -> Vec<u8> {
+    let n = n_elements as usize;
+    let mut out = Vec::with_capacity(n * 4);
+    let block_size = 24;
+    let mut written = 0usize;
+    let mut offset = 0usize;
+    while written < n && offset + block_size <= src.len() {
+        let scale = f16_to_f32(u16::from_le_bytes([src[offset], src[offset + 1]]));
+        let min = f16_to_f32(u16::from_le_bytes([src[offset + 2], src[offset + 3]]));
+        let qh_bytes = &src[offset + 4..offset + 8]; // 4 bytes of high bits
+        let qh = u32::from_le_bytes([qh_bytes[0], qh_bytes[1], qh_bytes[2], qh_bytes[3]]);
+        let qs = &src[offset + 8..offset + 24]; // 16 bytes packed nibbles
+        for j in 0..32 {
+            if written >= n {
+                break;
+            }
+            let nibble = if j < 16 {
+                qs[j] & 0x0F
+            } else {
+                (qs[j - 16] >> 4) & 0x0F
+            };
+            let high_bit = ((qh >> j) & 1) as u8;
+            let combined = (nibble | (high_bit << 4)) as f32;
+            let val = scale * combined + min;
+            out.extend_from_slice(&val.to_le_bytes());
+            written += 1;
+        }
+        offset += block_size;
+    }
+    out
+}
+
 /// Dequantize Q5_0: block_size=32, type_size=22.
 /// Layout: [2 bytes f16 scale] [4 bytes high-bit array] [16 bytes packed 4-bit nibbles]
 pub(crate) fn dequantize_q5_0(src: &[u8], n_elements: u64) -> Vec<u8> {
@@ -756,9 +817,11 @@ pub(crate) fn dequantize_to_f32_bytes(
         GgmlType::F16 => Ok(convert_f16_bytes_to_f32(src)),
         GgmlType::BF16 => Ok(convert_bf16_bytes_to_f32(src)),
         GgmlType::Q8_0 => Ok(dequantize_q8_0(src, n_elements)),
+        GgmlType::Q8_1 => Ok(dequantize_q8_1(src, n_elements)),
         GgmlType::Q4_0 => Ok(dequantize_q4_0(src, n_elements)),
         GgmlType::Q4_1 => Ok(dequantize_q4_1(src, n_elements)),
         GgmlType::Q5_0 => Ok(dequantize_q5_0(src, n_elements)),
+        GgmlType::Q5_1 => Ok(dequantize_q5_1(src, n_elements)),
         GgmlType::Q4_K => Ok(dequantize_q4_k(src, n_elements)),
         GgmlType::Q5_K => Ok(dequantize_q5_k(src, n_elements)),
         GgmlType::Q6_K => Ok(dequantize_q6_k(src, n_elements)),

@@ -43,14 +43,39 @@ pub(crate) fn compute_ssm_tensor_slice(
         return Ok(Some(slice));
     }
 
-    let quant = tensor.ggml_type.to_lbc_quant()
-        .ok_or_else(|| ConvertError::UnsupportedTensorType {
-            tensor: name.to_string(),
-            ggml_type: format!("{:?}", tensor.ggml_type),
-        })?;
-
     // Force ssm_alpha/beta to Q8_0 if not already -- runtime hardcodes Q8_0 matvec.
+    // Handle types with no direct LBC mapping (Q8_1, Q5_1, etc.) by going through
+    // the dequant->F32->Q8_0 path for alpha/beta, or dequant->F32 for other SSM tensors.
     let is_alpha_or_beta = suffix == SSM_ALPHA || suffix == SSM_BETA;
+    let quant = match tensor.ggml_type.to_lbc_quant() {
+        Some(q) => q,
+        None if is_alpha_or_beta && tensor.ggml_type.has_dequant_path() => {
+            // No LBC mapping but dequantizable: force-requant to Q8_0 via dequant->F32->Q8_0
+            let n_elements = tensor.n_elements() as usize;
+            assert!(n_elements % 32 == 0,
+                "Q8_0 requires elements divisible by 32, got {n_elements} for {name}");
+            let num_blocks = n_elements / 32;
+            let size = (num_blocks * 34) as u64;
+            let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::Q8_0 };
+            *blob_offset += size;
+            return Ok(Some(slice));
+        }
+        None if tensor.ggml_type.has_dequant_path() => {
+            // Non-alpha/beta SSM tensor with dequantizable but non-LBC type: force F32
+            let n_elements = tensor.n_elements();
+            let size = n_elements * 4;
+            let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::F32 };
+            *blob_offset += size;
+            return Ok(Some(slice));
+        }
+        None => {
+            return Err(ConvertError::UnsupportedTensorType {
+                tensor: name.to_string(),
+                ggml_type: format!("{:?}", tensor.ggml_type),
+            });
+        }
+    };
+
     if is_alpha_or_beta && !matches!(quant, QuantScheme::Q8_0) {
         let n_elements = tensor.n_elements() as usize;
         assert!(n_elements % 32 == 0,

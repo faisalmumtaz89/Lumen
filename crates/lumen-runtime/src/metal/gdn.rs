@@ -91,11 +91,15 @@ impl MetalF32Backend {
         let ssm_out_off = meta.ssm_out_off.ok_or_else(|| {
             RuntimeError::Compute("GDN layer missing ssm_out_off".into())
         })?;
-        let ssm_out_quant = meta.ssm_out_quant.unwrap_or(QuantScheme::F32);
+        let ssm_out_quant = meta.ssm_out_quant.ok_or_else(|| {
+            RuntimeError::Compute("GDN layer missing ssm_out_quant. Re-convert model.".into())
+        })?;
         let attn_gate_off = meta.attn_gate_off.ok_or_else(|| {
             RuntimeError::Compute("GDN layer missing attn_gate_off".into())
         })?;
-        let attn_gate_quant = meta.attn_gate_quant.unwrap_or(QuantScheme::F32);
+        let attn_gate_quant = meta.attn_gate_quant.ok_or_else(|| {
+            RuntimeError::Compute("GDN layer missing attn_gate_quant. Re-convert model.".into())
+        })?;
         let attn_norm_off = meta.attn_norm_off;
 
         // Get GDN pipeline states (must be compiled for GDN model)
@@ -555,11 +559,15 @@ impl MetalF32Backend {
         let ssm_out_off = meta.ssm_out_off.ok_or_else(|| {
             RuntimeError::Compute("GDN layer missing ssm_out_off".into())
         })?;
-        let ssm_out_quant = meta.ssm_out_quant.unwrap_or(QuantScheme::F32);
+        let ssm_out_quant = meta.ssm_out_quant.ok_or_else(|| {
+            RuntimeError::Compute("GDN layer missing ssm_out_quant. Re-convert model.".into())
+        })?;
         let attn_gate_off = meta.attn_gate_off.ok_or_else(|| {
             RuntimeError::Compute("GDN layer missing attn_gate_off".into())
         })?;
-        let attn_gate_quant = meta.attn_gate_quant.unwrap_or(QuantScheme::F32);
+        let attn_gate_quant = meta.attn_gate_quant.ok_or_else(|| {
+            RuntimeError::Compute("GDN layer missing attn_gate_quant. Re-convert model.".into())
+        })?;
         let attn_norm_off = meta.attn_norm_off;
 
         // Prefer fused Conv1D+SiLU (eliminates 1 dispatch + 1 barrier), fall back to separate.
@@ -640,7 +648,6 @@ impl MetalF32Backend {
             enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
             enc.set_bytes(&eps.to_le_bytes(), 4);
             enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(norm_tg_size, 1, 1));
-            enc.memory_barrier_with_scope(1);
         }
 
         // === PARALLEL GROUP 1 ===
@@ -686,7 +693,6 @@ impl MetalF32Backend {
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
                 enc.set_bytes(&eps.to_le_bytes(), 4);
                 enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(norm_tg_size, 1, 1));
-                enc.memory_barrier_with_scope(1);
                 let tg = match meta.wq_quant {
                     QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); 128u64 },
                     _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32); s.matmul_tg_size },
@@ -797,7 +803,6 @@ impl MetalF32Backend {
 
         // Barrier: QKV -> qkv_buf, alpha/beta -> alpha/beta_buf (fused) or alpha_raw/beta_raw (fallback),
         // gate -> gate_sigmoid all ready
-        enc.memory_barrier_with_scope(1);
 
         // === GROUP 2: Conv1D + L2 + StateUpdate + Output + Norm ===
         //
@@ -855,7 +860,6 @@ impl MetalF32Backend {
             );
 
             // Barrier: Conv1D+SiLU -> qkv_conv_buf, gates -> alpha/beta all ready
-            enc.memory_barrier_with_scope(1);
 
             if pso_conv1d_silu.is_none() {
                 let pso_silu = pipelines.silu_inplace.as_ref().ok_or_else(|| {
@@ -869,7 +873,6 @@ impl MetalF32Backend {
                     MTLSize::new((qkv_dim as u64).div_ceil(silu_tg), 1, 1),
                     MTLSize::new(silu_tg, 1, 1),
                 );
-                enc.memory_barrier_with_scope(1);
             }
 
             // Simdgroup-parallel state update with high GPU occupancy.
@@ -896,7 +899,6 @@ impl MetalF32Backend {
                     MTLSize::new(32, 1, 1),
                 );
             }
-            enc.memory_barrier_with_scope(1); // raw_out ready
 
             // RMSNorm + learned scale on raw output -> normed_out_buf
             let pso_ns = pso_norm_scale.unwrap();
@@ -963,7 +965,6 @@ impl MetalF32Backend {
                         MTLSize::new(gates_tg, 1, 1),
                     );
                 }
-                enc.memory_barrier_with_scope(1); // gates ready
             }
 
             let pso = pso_conv_l2_state.unwrap();
@@ -1034,7 +1035,6 @@ impl MetalF32Backend {
             );
 
             // Barrier: Conv1D+SiLU -> qkv_conv_buf, gates -> alpha/beta all ready
-            enc.memory_barrier_with_scope(1);
 
             if pso_conv1d_silu.is_none() {
                 let pso_silu = pipelines.silu_inplace.as_ref().ok_or_else(|| {
@@ -1048,7 +1048,6 @@ impl MetalF32Backend {
                     MTLSize::new((qkv_dim as u64).div_ceil(silu_tg), 1, 1),
                     MTLSize::new(silu_tg, 1, 1),
                 );
-                enc.memory_barrier_with_scope(1);
             }
 
             if pso_state_l2_sg.is_some() && pso_norm_scale.is_some() {
@@ -1077,7 +1076,6 @@ impl MetalF32Backend {
                         MTLSize::new(32, 1, 1),
                     );
                 }
-                enc.memory_barrier_with_scope(1); // raw_out ready
 
                 // RMSNorm + learned scale on raw output -> normed_out_buf
                 let pso_ns = pso_norm_scale.unwrap();
@@ -1135,7 +1133,6 @@ impl MetalF32Backend {
                         MTLSize::new(l2_tg, 1, 1),
                     );
                 }
-                enc.memory_barrier_with_scope(1);
 
                 enc.set_pipeline_state(pso_state_output_norm);
                 enc.set_buffer(h_state_buf, 0, 0);
@@ -1162,7 +1159,6 @@ impl MetalF32Backend {
             }
         }
 
-        enc.memory_barrier_with_scope(1); // normed_out_buf ready
 
         // Steps 10+11+12+13: SiLU-gated output + SSMOut matvec + residual + copy
         // Prefer fused SiLU+matvec (eliminates silu_elementwise_mul dispatch + barrier).
@@ -1198,7 +1194,6 @@ impl MetalF32Backend {
                         MTLSize::new((q_dim as u64).div_ceil(fused_tg), 1, 1),
                         MTLSize::new(fused_tg, 1, 1),
                     );
-                    enc.memory_barrier_with_scope(1);
 
                     let pso = pipelines.dequant_matmul_q8_0_deferred_residual_copy_nr2.as_ref().ok_or_else(|| {
                         RuntimeError::Compute("dequant_matmul_q8_0_deferred_residual_copy_nr2 pipeline not compiled".into())
@@ -1242,7 +1237,6 @@ impl MetalF32Backend {
                         MTLSize::new((q_dim as u64).div_ceil(fused_tg), 1, 1),
                         MTLSize::new(fused_tg, 1, 1),
                     );
-                    enc.memory_barrier_with_scope(1);
 
                     let pso = pipelines.dequant_matmul_q4_0_deferred_residual_copy_nr2.as_ref().ok_or_else(|| {
                         RuntimeError::Compute("dequant_matmul_q4_0_deferred_residual_copy_nr2 pipeline not compiled".into())
@@ -1272,7 +1266,6 @@ impl MetalF32Backend {
                         MTLSize::new((q_dim as u64).div_ceil(fused_tg), 1, 1),
                         MTLSize::new(fused_tg, 1, 1),
                     );
-                    enc.memory_barrier_with_scope(1);
 
                     // F16 matvec -> ssm_proj_buf, then manual residual+copy
                     enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
@@ -1283,7 +1276,6 @@ impl MetalF32Backend {
                     enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
                     let n_tg = ((hidden_dim as u64) + 1) / 2;
                     enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
-                    enc.memory_barrier_with_scope(1);
 
                     // residual_add_copy: x_buf += ssm_proj_buf, attn_proj_buf = x_buf
                     let pso_residual_copy = pipelines.residual_add_copy.as_ref().ok_or_else(|| {
@@ -1315,7 +1307,6 @@ impl MetalF32Backend {
                         MTLSize::new((q_dim as u64).div_ceil(fused_tg), 1, 1),
                         MTLSize::new(fused_tg, 1, 1),
                     );
-                    enc.memory_barrier_with_scope(1);
 
                     enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
                     enc.set_buffer(layer_buf, ssm_out_off, 0);
@@ -1326,7 +1317,6 @@ impl MetalF32Backend {
                         MTLSize::new(hidden_dim as u64, 1, 1),
                         MTLSize::new(s.matmul_tg_size, 1, 1),
                     );
-                    enc.memory_barrier_with_scope(1);
 
                     let pso_residual_copy = pipelines.residual_add_copy.as_ref().ok_or_else(|| {
                         RuntimeError::Compute("residual_add_copy pipeline not compiled".into())
@@ -1422,11 +1412,15 @@ impl MetalF32Backend {
         let ssm_out_off = meta.ssm_out_off.ok_or_else(|| {
             RuntimeError::Compute("GDN batched prefill: missing ssm_out_off".into())
         })?;
-        let ssm_out_quant = meta.ssm_out_quant.unwrap_or(QuantScheme::F32);
+        let ssm_out_quant = meta.ssm_out_quant.ok_or_else(|| {
+            RuntimeError::Compute("GDN layer missing ssm_out_quant. Re-convert model.".into())
+        })?;
         let attn_gate_off = meta.attn_gate_off.ok_or_else(|| {
             RuntimeError::Compute("GDN batched prefill: missing attn_gate_off".into())
         })?;
-        let attn_gate_quant = meta.attn_gate_quant.unwrap_or(QuantScheme::F32);
+        let attn_gate_quant = meta.attn_gate_quant.ok_or_else(|| {
+            RuntimeError::Compute("GDN layer missing attn_gate_quant. Re-convert model.".into())
+        })?;
         let attn_norm_off = meta.attn_norm_off;
 
         let h_state_buf = &s.gdn_h_states[gdn_idx];
