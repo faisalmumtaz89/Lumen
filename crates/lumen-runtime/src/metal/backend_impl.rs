@@ -7,20 +7,27 @@ use crate::compute::{ActivationBuffer, BackendCaps, ComputeBackend, ComputeDtype
 use crate::error::RuntimeError;
 use crate::expert::profiler::ExpertActivationProfiler;
 use crate::expert::reader::ExpertReader;
-use crate::kv::{KvCache, KvCacheView};
+use crate::kv::{KvCache, KvCacheView, KvPrecision};
 use crate::weight::cache::{LayerView, WeightProvider};
 use lumen_format::hyperparams::ModelHyperparams;
 use lumen_format::quantization::QuantScheme;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
-use super::ffi::{MetalBuffer, MTLSize};
+use super::ffi::{autoreleasepool, MetalBuffer, MTLSize};
 use super::types::{CachedLayerMeta, CachedMoeMeta, MetalScratch};
 use super::{MetalF32Backend, PrefetchState, PAGE_SIZE};
 impl ComputeBackend for MetalF32Backend {
     fn init(&mut self, hyperparams: &ModelHyperparams) -> Result<(), RuntimeError> {
         self.cached_hidden_dim = hyperparams.hidden_dim as usize;
         self.cached_vocab_size = hyperparams.vocab_size as usize;
+
+        // Initialise the MPSGraph context up-front so dispatch
+        // sites can look it up via `mps_graph_ffi::get()` without
+        // threading `&MetalDevice` through every encode function. The
+        // returned context is process-wide; subsequent prefill calls
+        // reuse the same compiled-graph cache.
+        let _ = super::mps_graph_ffi::get_or_init(&self.device);
 
         // Compile shader pipelines
         let pipelines = self.compile_pipelines()?;
@@ -41,12 +48,23 @@ impl ComputeBackend for MetalF32Backend {
         // Upload global tensors to GPU
         // Upload embedding: use raw quantized bytes if available, else F32
         if let Some(ref raw) = self.embedding_raw {
-            if matches!(self.embedding_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) {
+            if matches!(self.embedding_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
                 self.embedding_buf = Some(
                     self.device.new_buffer_with_bytes(raw).ok_or_else(|| {
                         RuntimeError::Compute("Failed to create quantized embedding buffer".into())
                     })?
                 );
+                // The GPU embedding buffer now holds the native-quant table and
+                // every reachable Metal path (embed_token GPU branch, decode_*,
+                // prefill, weight tying, preload) reads it (or `embedding_raw`),
+                // never the F32 `self.embedding` Vec. The lone F32 reader — the
+                // embed_token CPU fallback at backend_impl.rs ~L2529 — is only
+                // reachable when `embedding_buf` is None, which never happens
+                // after init (no site resets it). So the ~2 GB F32 embedding
+                // dequant is dead the instant this raw buffer exists; free it.
+                // (Non-quantized models fall to the `else` branches below, which
+                // legitimately upload `self.embedding`, so it is retained there.)
+                self.embedding = Vec::new();
             } else {
                 self.embedding_buf = Some(self.upload_f32(&self.embedding)?);
             }
@@ -56,12 +74,20 @@ impl ComputeBackend for MetalF32Backend {
         self.final_norm_buf = Some(self.upload_f32(&self.final_norm)?);
         // Upload output_proj: use raw Q8_0 bytes if available, else F32
         if let Some(ref raw) = self.output_proj_raw {
-            if matches!(self.output_proj_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) {
+            if matches!(self.output_proj_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
                 self.output_proj_buf = Some(
                     self.device.new_buffer_with_bytes(raw).ok_or_else(|| {
                         RuntimeError::Compute("Failed to create Q8_0 output_proj buffer".into())
                     })?
                 );
+                // Symmetric to the embedding case above: compute_final and the
+                // GPU-resident decode paths read `output_proj_buf` (or
+                // `output_proj_raw`); weight tying reuses the embedding buffer
+                // offset and never copies the F32 Vec. There is NO reader of
+                // `self.output_proj` anywhere in the metal module. So the ~2 GB
+                // F32 output_proj dequant is dead once this raw buffer exists;
+                // free it. (Non-quantized models keep it via the `else` branches.)
+                self.output_proj = Vec::new();
             } else {
                 self.output_proj_buf = Some(self.upload_f32(&self.output_proj)?);
             }
@@ -232,6 +258,12 @@ impl ComputeBackend for MetalF32Backend {
             splitk_partial_buf: None,
             splitk_alloc_elems: 0,
             current_max_batch: 0,
+            // GDN de-aliased scratch buffers (allocated only when LUMEN_METAL_GDN_CONCURRENT_ENCODER=1)
+            batch_gdn_raw_out_buf: None,
+            batch_gdn_ssm_in_buf: None,
+            batch_gdn_alpha_buf: None,
+            batch_gdn_beta_buf: None,
+            batch_gdn_conv_out_buf: None,
 
             logits_readback: vec![0.0f32; vocab_size],
             cached_layer_meta: Vec::new(),
@@ -319,6 +351,21 @@ impl ComputeBackend for MetalF32Backend {
             gdn_conv_kernel_size: 4,
             gdn_num_layers: 0,
             gdn_layer_idx_map: Vec::new(),
+
+            // repacked Q8_0 hot-weight storage. Empty until
+            // `preload_weights_gpu_resident` builds them when env-gated ON.
+            repacked_ffn_down: Vec::new(),
+            repacked_ffn_gate_up: Vec::new(),
+
+            // repacked Q4_0 hot-weight storage. Empty until
+            // `preload_weights_gpu_resident` builds them when env-gated ON.
+            repacked_ffn_down_q4: Vec::new(),
+            repacked_ffn_gate_up_q4: Vec::new(),
+
+            // GDN qkv+attn_gate paired BF16 repacked storage. Empty
+            // until `preload_weights_gpu_resident` builds it when
+            // `LUMEN_METAL_BF16_GDN_QKV_GATE_PAIRED=1` is set at load time.
+            repacked_gdn_qkv_gate_bf16: Vec::new(),
         };
 
         *self.scratch.lock().unwrap() = Some(scratch);
@@ -705,19 +752,21 @@ impl ComputeBackend for MetalF32Backend {
                     QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2); 128u64 },
                     QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); 128u64 },
                     QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2); 128u64 },
+                    QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2); 128u64 },
                     _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32); matmul_tg_size },
                 };
                 enc.set_buffer(layer_buf, wq_off, 0);
                 enc.set_buffer(&s.normed_buf, 0, 1);
                 enc.set_buffer(&s.qkv_buf, 0, 2);
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                if matches!(st.wq.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) {
+                if matches!(st.wq.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
                     enc.set_bytes(&(qgate_dim as u32).to_le_bytes(), 4);
                 }
                 let n_tg = match st.wq.quant {
                     QuantScheme::Q8_0 => ((qgate_dim as u64) + 1) / 2,
                     QuantScheme::Q4_0 => ((qgate_dim as u64) + 1) / 2,
                     QuantScheme::F16 => ((qgate_dim as u64) + 1) / 2,
+                    QuantScheme::Bf16 => ((qgate_dim as u64) + 1) / 2,
                     _ => qgate_dim as u64,
                 };
                 enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(tg, 1, 1));
@@ -755,19 +804,21 @@ impl ComputeBackend for MetalF32Backend {
                     QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2); 128u64 },
                     QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); 128u64 },
                     QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2); 128u64 },
+                    QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2); 128u64 },
                     _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32); matmul_tg_size },
                 };
                 enc.set_buffer(layer_buf, wk_off_val, 0);
                 enc.set_buffer(&s.normed_buf, 0, 1);
                 enc.set_buffer(&s.k_buf, 0, 2);
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                if matches!(wk_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) {
+                if matches!(wk_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
                     enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
                 }
                 let n_tg = match wk_quant {
                     QuantScheme::Q8_0 => ((kv_dim as u64) + 1) / 2,
                     QuantScheme::Q4_0 => ((kv_dim as u64) + 1) / 2,
                     QuantScheme::F16 => ((kv_dim as u64) + 1) / 2,
+                    QuantScheme::Bf16 => ((kv_dim as u64) + 1) / 2,
                     _ => kv_dim as u64,
                 };
                 enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(tg, 1, 1));
@@ -784,19 +835,21 @@ impl ComputeBackend for MetalF32Backend {
                     QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2); 128u64 },
                     QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); 128u64 },
                     QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2); 128u64 },
+                    QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2); 128u64 },
                     _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32); matmul_tg_size },
                 };
                 enc.set_buffer(layer_buf, wv_off_val, 0);
                 enc.set_buffer(&s.normed_buf, 0, 1);
                 enc.set_buffer(&s.v_buf, 0, 2);
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                if matches!(wv_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) {
+                if matches!(wv_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
                     enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
                 }
                 let n_tg = match wv_quant {
                     QuantScheme::Q8_0 => ((kv_dim as u64) + 1) / 2,
                     QuantScheme::Q4_0 => ((kv_dim as u64) + 1) / 2,
                     QuantScheme::F16 => ((kv_dim as u64) + 1) / 2,
+                    QuantScheme::Bf16 => ((kv_dim as u64) + 1) / 2,
                     _ => kv_dim as u64,
                 };
                 enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(tg, 1, 1));
@@ -887,11 +940,12 @@ impl ComputeBackend for MetalF32Backend {
             })?;
             let in_dim_u32 = hidden_dim as u32;
 
-            let tg = if has_bias && matches!(st.wq.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) {
+            let tg = if has_bias && matches!(st.wq.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
                 match st.wq.quant {
                     QuantScheme::Q8_0 => enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_bias_nr2),
                     QuantScheme::Q4_0 => enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_bias_nr2),
                     QuantScheme::F16 => enc.set_pipeline_state(&pipelines.matmul_f16_deferred_bias_nr2),
+                    QuantScheme::Bf16 => enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_bias_nr2),
                     _ => unreachable!(),
                 };
                 128u64
@@ -900,6 +954,7 @@ impl ComputeBackend for MetalF32Backend {
                     QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2); 128u64 },
                     QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); 128u64 },
                     QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2); 128u64 },
+                    QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2); 128u64 },
                     _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32); matmul_tg_size },
                 }
             };
@@ -909,10 +964,10 @@ impl ComputeBackend for MetalF32Backend {
             enc.set_buffer(&s.qkv_buf, 0, 2);
             enc.set_bytes(&in_dim_u32.to_le_bytes(), 3);
             let qkv_out_dim_u32 = qkv_dim as u32;
-            if matches!(st.wq.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) {
+            if matches!(st.wq.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
                 enc.set_bytes(&qkv_out_dim_u32.to_le_bytes(), 4);
             }
-            if has_bias && matches!(st.wq.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) {
+            if has_bias && matches!(st.wq.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
                 let bq_off_abs = base_off + st.bq.as_ref().unwrap().offset;
                 let bk_off_abs = base_off + st.bk.as_ref().unwrap().offset;
                 let bv_off_abs = base_off + st.bv.as_ref().unwrap().offset;
@@ -930,6 +985,7 @@ impl ComputeBackend for MetalF32Backend {
                     QuantScheme::Q8_0 => ((qkv_dim as u64) + 1) / 2,
                     QuantScheme::Q4_0 => ((qkv_dim as u64) + 1) / 2,
                     QuantScheme::F16 => ((qkv_dim as u64) + 1) / 2,
+                    QuantScheme::Bf16 => ((qkv_dim as u64) + 1) / 2,
                     _ => qkv_dim as u64,
                 }
             };
@@ -942,7 +998,7 @@ impl ComputeBackend for MetalF32Backend {
         }
 
         // --- QKV bias addition fallback (F32 weights with bias only) ---
-        if !matches!(st.wq.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16)
+        if !matches!(st.wq.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16)
             && (st.bq.is_some() || st.bk.is_some() || st.bv.is_some())
         {
             let enc = cmd.new_compute_encoder().ok_or_else(|| {
@@ -1202,6 +1258,7 @@ impl ComputeBackend for MetalF32Backend {
                 QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_residual_nr2); 128u64 },
                 QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_residual_nr2); 128u64 },
                 QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_residual_nr2); 128u64 },
+                QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_residual_nr2); 128u64 },
                 _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32_residual); matmul_tg_size },
             };
             enc.set_buffer(layer_buf, wo_off, 0);
@@ -1209,7 +1266,7 @@ impl ComputeBackend for MetalF32Backend {
             enc.set_buffer(&s.attn_proj_buf, 0, 2);
             enc.set_bytes(&in_dim_u32.to_le_bytes(), 3);
             enc.set_buffer(&s.x_buf, 0, 4);  // residual input
-            if matches!(st.wo.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) {
+            if matches!(st.wo.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
                 let wo_out_dim_u32 = hidden_dim as u32;
                 enc.set_bytes(&wo_out_dim_u32.to_le_bytes(), 5);
             }
@@ -1217,6 +1274,7 @@ impl ComputeBackend for MetalF32Backend {
                 QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2,
                 QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2,
                 QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2,
+                QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2,
                 _ => hidden_dim as u64,
             };
             enc.dispatch_threadgroups(
@@ -2134,6 +2192,7 @@ impl ComputeBackend for MetalF32Backend {
                 QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_residual_nr2); 128u64 },
                 QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_residual_nr2); 128u64 },
                 QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_residual_nr2); 128u64 },
+                QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_residual_nr2); 128u64 },
                 _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32_residual); matmul_tg_size },
             };
             enc.set_buffer(layer_buf, w_down_off, 0);
@@ -2141,7 +2200,7 @@ impl ComputeBackend for MetalF32Backend {
             enc.set_buffer(&s.x_buf, 0, 2);  // write directly to x_buf
             enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 3);
             enc.set_buffer(&s.attn_proj_buf, 0, 4);  // residual input
-            if matches!(st.w_down.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) {
+            if matches!(st.w_down.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
                 let down_out_dim_u32 = hidden_dim as u32;
                 enc.set_bytes(&down_out_dim_u32.to_le_bytes(), 5);
             }
@@ -2149,6 +2208,7 @@ impl ComputeBackend for MetalF32Backend {
                 QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2,
                 QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2,
                 QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2,
+                QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2,
                 _ => hidden_dim as u64,
             };
             enc.dispatch_threadgroups(
@@ -2374,6 +2434,10 @@ impl ComputeBackend for MetalF32Backend {
                     enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
                     (128u64, 2u64)
                 }
+                QuantScheme::Bf16 => {
+                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                    (128u64, 2u64)
+                }
                 _ => {
                     enc.set_pipeline_state(&pipelines.matmul_f32_deferred);
                     (128u64, 4u64)
@@ -2524,6 +2588,27 @@ impl ComputeBackend for MetalF32Backend {
         }
     }
 
+    /// Metal stores the GPU-resident KV cache in F16 unconditionally
+    /// (`gpu_k_cache` / `gpu_v_cache` are allocated with 2 bytes/element in
+    /// `init`). The CPU mirror `KvCache.keys[layer]` is sized by
+    /// `config.precision`, so F32 would create a 2x size mismatch between
+    /// the GPU and CPU buffers and any later `sync_kv_to_cpu` blit would
+    /// truncate the data. Apple matmul kernels accumulate in F32 internally
+    /// regardless of the storage precision, so F16 KV is the only sensible
+    /// choice on Metal — F32 KV would just waste 2x memory without quality
+    /// gain. Reject the mismatch up front.
+    fn validate_kv_precision(&self, precision: KvPrecision) -> Result<(), RuntimeError> {
+        if precision != KvPrecision::F16 {
+            return Err(RuntimeError::Unsupported(format!(
+                "Metal backend KV cache is F16-only (requested {precision:?}); \
+                 set --kv-precision f16 explicitly or omit the flag. The Metal \
+                 path's GPU-resident KV buffers are allocated as F16 in \
+                 backend_impl.rs::init and the CPU mirror must match.",
+            )));
+        }
+        Ok(())
+    }
+
     fn set_global_tensors(
         &mut self,
         embedding: Vec<f32>,
@@ -2555,15 +2640,26 @@ impl ComputeBackend for MetalF32Backend {
         weights: &dyn WeightProvider,
         kv: &mut KvCache,
     ) -> Result<Vec<f32>, RuntimeError> {
-        // Delegate to the existing inherent method.
-        MetalF32Backend::prefill(self, tokens, weights, kv)
+        // Drain autoreleased Metal objects at prefill boundary.
+        // Tokio worker threads have no implicit autorelease pool, so every
+        // `[queue commandBuffer]` / `[cmd computeCommandEncoder]` autorelease
+        // accumulates forever without this wrap. See `ffi::autoreleasepool`.
+        autoreleasepool(|| {
+            // Delegate to the existing inherent method.
+            MetalF32Backend::prefill(self, tokens, weights, kv)
+        })
     }
 
     fn preload_weights(
         &mut self,
         weights: &dyn WeightProvider,
     ) -> Result<(), RuntimeError> {
-        self.preload_weights_gpu_resident(weights)
+        // Drain autoreleased Metal objects from one-shot
+        // weight upload. preload_weights_gpu_resident creates many command
+        // buffers and encoders during the multi-second upload pass.
+        autoreleasepool(|| {
+            self.preload_weights_gpu_resident(weights)
+        })
     }
 
     fn decode_token(
@@ -2572,7 +2668,11 @@ impl ComputeBackend for MetalF32Backend {
         weights: &dyn WeightProvider,
         kv: &mut KvCache,
     ) -> Result<Logits, RuntimeError> {
-        self.decode_token_single_cb(token_id, weights, kv)
+        // Drain autoreleased Metal objects at every token
+        // boundary. This is the dominant leak site (~120 MB/h per a prior leak attribution).
+        autoreleasepool(|| {
+            self.decode_token_single_cb(token_id, weights, kv)
+        })
     }
 
     fn decode_token_greedy(
@@ -2581,10 +2681,125 @@ impl ComputeBackend for MetalF32Backend {
         weights: &dyn WeightProvider,
         kv: &mut KvCache,
     ) -> Result<u32, RuntimeError> {
-        MetalF32Backend::decode_token_greedy(self, token_id, weights, kv)
+        // Drain autoreleased Metal objects at every token
+        // boundary (greedy path delegates to decode_token_greedy or the
+        // option-a-gpu-resident fallback; both create CBs + encoders).
+        autoreleasepool(|| {
+            MetalF32Backend::decode_token_greedy(self, token_id, weights, kv)
+        })
     }
 
     fn reset_recurrent_state(&self) {
         self.reset_gdn_state();
+    }
+
+    /// drain pending GPU work, transpose F16 KV from the
+    /// Metal-native layout into the CPU mirror, and optionally extract the
+    /// GDN recurrent state. The CPU buffer this writes into is what the
+    /// disk-KV save path streams byte-for-byte.
+    fn sync_kv_to_cpu(
+        &self,
+        kv: &mut crate::kv::KvCache,
+        recurrent: Option<&mut crate::kv::disk::RecurrentState>,
+    ) -> Result<(), RuntimeError> {
+        // Drain autoreleased Metal objects from the
+        // sync-drain path (creates a CB to wait on pending GPU work plus
+        // blit encoders to copy KV bytes back).
+        autoreleasepool(|| {
+            self.sync_kv_to_cpu_impl(kv, recurrent)
+        })
+    }
+
+    /// inverse of `sync_kv_to_cpu` — drain pending work,
+    /// untranspose CPU bytes back into the Metal-native KV layout, and
+    /// optionally restore GDN recurrent state into the GPU-resident
+    /// buffers.
+    fn sync_kv_from_cpu(
+        &self,
+        kv: &crate::kv::KvCache,
+        recurrent: Option<&crate::kv::disk::RecurrentState>,
+    ) -> Result<(), RuntimeError> {
+        // Drain autoreleased Metal objects from the
+        // sync-restore path (mirror of sync_kv_to_cpu).
+        autoreleasepool(|| {
+            self.sync_kv_from_cpu_impl(kv, recurrent)
+        })
+    }
+
+    /// Report current MTLDevice allocated bytes for the
+    /// `/debug/memory_breakdown` server endpoint.  Delegates to
+    /// `MetalF32Backend::current_allocated_bytes`, which calls
+    /// `MTLDevice.currentAllocatedSize`.
+    fn current_allocated_bytes(&self) -> u64 {
+        // Defense-in-depth wrap. `[device currentAllocatedSize]`
+        // does not itself return an autoreleased object, but Apple's internal
+        // implementation may autorelease NSNumber boxes or other transients.
+        // Wrap is free insurance.
+        autoreleasepool(|| {
+            // Internal method on Self; the trait method has the same name.
+            Self::current_allocated_bytes(self)
+        })
+    }
+
+    /// Metal peak memory == `currentAllocatedSize` at the
+    /// time of the call.  We do NOT track a separate high-water mark across
+    /// the generation; this is the residency at end-of-gen, which on the
+    /// Metal backend is itself a good proxy for peak because the backend
+    /// does not free GPU-resident weights between tokens.  Wrapped in an
+    /// autoreleasepool for the same reason as `current_allocated_bytes`.
+    fn peak_memory_bytes(&self) -> u64 {
+        autoreleasepool(|| Self::current_allocated_bytes(self))
+    }
+
+    /// describe the GDN layout the Metal backend allocates
+    /// for the current model. Returns `None` when no GDN layers have been
+    /// encountered yet (the GPU-resident path lazily allocates on first
+    /// GDN dispatch). The disk save path uses this to decide whether to
+    /// emit a recurrent section.
+    fn gdn_layout(&self) -> Option<crate::kv::disk::GdnLayout> {
+        let scratch_guard = self.scratch.lock().ok()?;
+        let s = scratch_guard.as_ref()?;
+        if s.gdn_num_layers == 0 {
+            return None;
+        }
+        // GDN constants mirror the per-layer allocator at line ~568 of this
+        // file. They are Qwen3.5-9B-tuned and not part of generic hyperparams.
+        const GDN_NUM_HEADS: u32 = 32;
+        const GDN_HEAD_DIM: u32 = 128;
+        const GDN_QKV_DIM: u32 = 8192;
+        Some(crate::kv::disk::GdnLayout {
+            num_gdn_layers: s.gdn_num_layers as u32,
+            gdn_num_heads: GDN_NUM_HEADS,
+            gdn_head_dim: GDN_HEAD_DIM,
+            gdn_conv_kernel_size: s.gdn_conv_kernel_size as u32,
+            gdn_conv_qkv_dim: GDN_QKV_DIM,
+            gdn_dtype_tag: crate::kv::disk::RECURRENT_DTYPE_F32,
+        })
+    }
+
+    /// Enable or disable per-section CPU-side GPU timing for Metal prefill.
+    ///
+    /// Wired into the `--profile` CLI flag (see `lumen-cli/src/run.rs`).
+    /// Also honoured via `LUMEN_METAL_PROFILE=1` env var at backend
+    /// construction time (`MetalF32Backend::new`).
+    ///
+    /// In profile mode, `prefill()` auto-splits its single command buffer
+    /// at known section boundaries (attn RMSNorm+QKV, QKV deinterleave,
+    /// KV-cache write+attention, Wo proj+residual, FFN gate/up, SwiGLU,
+    /// FFN down+residual, GDN). Each split issues a `commit + wait` and
+    /// records elapsed wall-clock time under a static section label.
+    ///
+    /// The per-section sync overhead inflates the absolute prefill time;
+    /// use the relative `% prefill` column in the report (from
+    /// `print_profile`) to identify hot kernels.
+    fn set_profile(&mut self, enabled: bool) {
+        super::profile::set_enabled(enabled);
+    }
+
+    /// Print the accumulated per-section profile to stderr.
+    /// Reset to empty after each `prefill()` invocation, so call this
+    /// right after the prefill of interest finishes.
+    fn print_profile(&self) {
+        super::profile::print_report();
     }
 }

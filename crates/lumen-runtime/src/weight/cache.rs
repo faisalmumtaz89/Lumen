@@ -261,7 +261,7 @@ impl CacheStats {
     }
 }
 
-/// The unified cache manager API (Section 6 of the design spec).
+/// The unified cache manager API (the unified cache manager interface).
 ///
 /// Abstracts over both mmap-based and async-read-based storage backends.
 /// The execution engine interacts exclusively through this interface.

@@ -12,6 +12,7 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::fmt;
 use std::ptr;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicPtr, Ordering as AOrdering};
 
 // ============================================================================
 // Objective-C runtime FFI
@@ -26,6 +27,12 @@ extern "C" {
     fn objc_getClass(name: *const c_char) -> ObjcClass;
     fn sel_registerName(name: *const c_char) -> ObjcSel;
     fn objc_msgSend(receiver: ObjcId, sel: ObjcSel, ...) -> ObjcId;
+    // Obj-C autorelease pool push/pop. Apple ABI, stable.
+    // Required to drain autoreleased Metal objects (command buffers, encoders)
+    // that accumulate in tokio worker threads which have no implicit Cocoa
+    // autorelease pool. See `autoreleasepool` helper below.
+    fn objc_autoreleasePoolPush() -> *mut c_void;
+    fn objc_autoreleasePoolPop(pool: *mut c_void);
 }
 
 // ============================================================================
@@ -63,6 +70,52 @@ fn cls(name: &str) -> ObjcClass {
 }
 
 // ============================================================================
+// Obj-C autorelease pool wrapper
+// ============================================================================
+
+/// Run `f` inside an Obj-C autorelease pool.
+///
+/// Semantically equivalent to Apple's `@autoreleasepool { ... }` block.
+/// Pushes a new pool before invoking `f`, pops it (draining every Obj-C
+/// object that was autoreleased during the call) on normal return, on
+/// `?`-style early return, and on panic.
+///
+/// **Why this exists**: every Metal selector that returns an autoreleased
+/// object (`[queue commandBuffer]`, `[cmd computeCommandEncoder]`, etc.)
+/// adds a +1 reference to the **outer** autorelease pool. Cocoa apps drain
+/// that pool every run-loop iteration; non-Cocoa Rust threads (every tokio
+/// worker) have no run-loop, so the outer pool effectively never drains.
+/// On a server under sustained load this is a ~120 MB/h leak (per a prior
+/// leak attribution).
+///
+/// **Safety contract**: Lumen's `MetalCommandBuffer`, `MetalComputeEncoder`,
+/// and every other FFI wrapper constructor `retain`s the underlying Obj-C
+/// object immediately. The Lumen-side +1 reference survives this pool's
+/// drain; only the autorelease (+1) reference is released here. The Lumen
+/// `Drop` impl releases the Lumen-side reference at the usual time. **Do
+/// NOT** call `release()` on a Lumen wrapper from inside the closure and
+/// then access the underlying pointer after the closure returns — the
+/// autorelease drain would have freed it. (Existing call sites never do
+/// this; they let `Drop` run after the closure ends.)
+///
+/// **Cost**: ~50 ns per push/pop pair on Apple Silicon. At decode TPOT of
+/// ~15 ms/token this is <0.001% overhead. Negligible.
+#[inline]
+pub fn autoreleasepool<R>(f: impl FnOnce() -> R) -> R {
+    // RAII guard: pop unconditionally on scope exit (normal return, `?`
+    // early-return, panic) — exactly matches Apple's `@autoreleasepool { }`
+    // semantics.
+    struct PoolGuard(*mut c_void);
+    impl Drop for PoolGuard {
+        fn drop(&mut self) {
+            unsafe { objc_autoreleasePoolPop(self.0) };
+        }
+    }
+    let _guard = PoolGuard(unsafe { objc_autoreleasePoolPush() });
+    f()
+}
+
+// ============================================================================
 // Cached Selectors — eliminates ~1600 CString heap allocations per token
 // ============================================================================
 
@@ -92,6 +145,10 @@ mod cached_sel {
 
     // -- Command buffer / encoder lifecycle --
     cached_sel!(command_buffer, "commandBuffer");
+    cached_sel!(
+        command_buffer_with_unretained_references,
+        "commandBufferWithUnretainedReferences"
+    );
     cached_sel!(compute_command_encoder, "computeCommandEncoder");
     cached_sel!(blit_command_encoder, "blitCommandEncoder");
     cached_sel!(commit, "commit");
@@ -106,6 +163,7 @@ mod cached_sel {
     cached_sel!(dispatch_threads, "dispatchThreads:threadsPerThreadgroup:");
     cached_sel!(set_threadgroup_memory_length, "setThreadgroupMemoryLength:atIndex:");
     cached_sel!(memory_barrier_with_scope, "memoryBarrierWithScope:");
+    cached_sel!(memory_barrier_with_resources, "memoryBarrierWithResources:count:");
 
     // -- Blit encoder --
     cached_sel!(copy_from_buffer, "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:");
@@ -132,6 +190,8 @@ mod cached_sel {
     cached_sel!(new_compute_pipeline_state, "newComputePipelineStateWithFunction:error:");
     cached_sel!(new_function_with_name, "newFunctionWithName:");
     cached_sel!(new_function_with_name_constant_values, "newFunctionWithName:constantValues:error:");
+    // -- MTLCompileOptions language version (Metal 3.0+ for bfloat support) --
+    cached_sel!(compile_options_set_language_version, "setLanguageVersion:");
 
     // -- Function constant values --
     cached_sel!(alloc, "alloc");
@@ -157,6 +217,19 @@ mod cached_sel {
     cached_sel!(load_buffer, "loadBuffer:offset:size:sourceHandle:sourceHandleOffset:");
     cached_sel!(set_type, "setType:");
     cached_sel!(status, "status");
+
+    // -- in-process MTLDevice allocation accounting --
+    //
+    // `currentAllocatedSize` returns the total bytes the driver has
+    // outstanding for THIS MTLDevice instance (all MTLBuffer / MTLTexture /
+    // MTLHeap allocations the process group currently holds). On Apple
+    // Silicon unified memory this is the authoritative GPU residency
+    // counter and is the in-process equivalent of the
+    // `mtl-mem-probe` external Swift probe — only this one sees the
+    // lumen-server process's own allocations, not a separate Swift
+    // process's allocations. Used by the server-side
+    // `/debug/memory_breakdown` endpoint.
+    cached_sel!(current_allocated_size, "currentAllocatedSize");
 }
 
 /// Send an Objective-C message with no arguments, returning an object pointer.
@@ -264,6 +337,26 @@ impl MetalDevice {
         unsafe { nsstring_to_string(msg_send_0_raw(self.raw, cached_sel::name())) }
     }
 
+    /// Total bytes the driver has currently allocated for this
+    /// MTLDevice (in-process).
+    ///
+    /// Returns the sum of bytes outstanding for all MTLBuffer / MTLTexture /
+    /// MTLHeap objects the process holds against this MTLDevice. On Apple
+    /// Silicon unified memory this is the authoritative GPU residency
+    /// figure and the only way to observe lumen-server's own GPU footprint
+    /// (an external probe sees its own process's allocations, not the
+    /// server's).
+    ///
+    /// Cost: one Objective-C selector dispatch (cached selector, no heap
+    /// allocation). Cheap enough to call from a 30 s breakdown sampler.
+    pub fn current_allocated_size(&self) -> u64 {
+        unsafe {
+            type GetSizeFn = unsafe extern "C" fn(ObjcId, ObjcSel) -> u64;
+            let f: GetSizeFn = std::mem::transmute(objc_msgSend as *const c_void);
+            f(self.raw, cached_sel::current_allocated_size())
+        }
+    }
+
     /// Create a new command queue.
     pub fn new_command_queue(&self) -> Option<MetalCommandQueue> {
         let raw = unsafe { msg_send_0_raw(self.raw, cached_sel::new_command_queue()) };
@@ -276,10 +369,36 @@ impl MetalDevice {
     }
 
     /// Compile Metal shading language source into a library.
+    ///
+    /// Sets `MTLCompileOptions.languageVersion = MTLLanguageVersion3_1` so the
+    /// shaders may use the `bfloat`, `bfloat4`, and `simdgroup_bfloat8x8`
+    /// types. Without an explicit version the default chosen by Metal can be
+    /// older (MSL 2.x) and reject these references, even on devices that
+    /// physically support BF16 (M2+, Metal 3+).
+    ///
+    /// `MTLLanguageVersion3_1` is encoded as `(3 << 16) | 1` (see
+    /// `MTLLanguageVersion` in `Metal/MTLLanguage.h`). Apple guarantees MSL
+    /// 3.1 on macOS 14.x+, which is below the macOS 13 floor Lumen already
+    /// enforces for `MTLIOCommandQueue` plus a minor delta — and the active
+    /// targets (M2/M3) require BF16-vector support.
     pub fn new_library_with_source(&self, source: &str) -> Result<MetalLibrary, String> {
         unsafe {
             let ns_source = nsstring(source);
             let mut error: ObjcId = ptr::null_mut();
+
+            // Build MTLCompileOptions with languageVersion = 3.1
+            let opts_class = cls("MTLCompileOptions");
+            let opts: ObjcId = msg_send_0_raw(opts_class as ObjcId, cached_sel::alloc());
+            let opts: ObjcId = msg_send_0_raw(opts, cached_sel::init());
+
+            // setLanguageVersion: takes a NSUInteger. MTLLanguageVersion3_1 = (3 << 16) | 1.
+            // 3.1 is required for `bfloat4` / `simdgroup_bfloat8x8` (Apple
+            // exposed BF16 vector and MMA types in this release; 3.0 only had
+            // the scalar `bfloat` type).
+            type SetLangVerFn = unsafe extern "C" fn(ObjcId, ObjcSel, usize);
+            let set_lang_ver: SetLangVerFn = std::mem::transmute(objc_msgSend as *const c_void);
+            const MTL_LANG_VERSION_3_1: usize = (3usize << 16) | 1;
+            set_lang_ver(opts, cached_sel::compile_options_set_language_version(), MTL_LANG_VERSION_3_1);
 
             type NewLibFn = unsafe extern "C" fn(
                 ObjcId, ObjcSel, ObjcId, ObjcId, *mut ObjcId,
@@ -289,9 +408,11 @@ impl MetalDevice {
                 self.raw,
                 cached_sel::new_library_with_source(),
                 ns_source,
-                ptr::null_mut(),        // MTLCompileOptions: nil (defaults)
+                opts,
                 &mut error as *mut ObjcId,
             );
+
+            release(opts);
 
             if lib.is_null() || !error.is_null() {
                 let desc = error_description(error);
@@ -479,6 +600,11 @@ pub struct MetalCommandQueue {
 
 impl MetalCommandQueue {
     /// Create a new command buffer from this queue.
+    ///
+    /// The returned buffer does NOT carry a queue handle, so it cannot
+    /// self-replace under profiling. For prefill (which auto-splits CBs
+    /// at section boundaries when `LUMEN_METAL_PROFILE=1`), use
+    /// `new_command_buffer_profilable()` instead.
     pub fn new_command_buffer(&self) -> Option<MetalCommandBuffer> {
         let raw = unsafe { msg_send_0_raw(self.raw, cached_sel::command_buffer()) };
         if raw.is_null() {
@@ -486,8 +612,124 @@ impl MetalCommandQueue {
         } else {
             // commandBuffer returns an autoreleased object; retain it.
             unsafe { retain(raw) };
-            Some(MetalCommandBuffer { raw })
+            Some(MetalCommandBuffer {
+                raw: AtomicPtr::new(raw),
+                queue_raw: AtomicPtr::new(ptr::null_mut()),
+            })
         }
+    }
+
+    /// Create a new command buffer that carries a back-reference to this
+    /// queue, allowing it to self-replace when Metal profiling is enabled.
+    ///
+    /// Behaviour identical to `new_command_buffer` when
+    /// `LUMEN_METAL_PROFILE` is OFF. When ON, calls to
+    /// `new_compute_encoder()` / `new_concurrent_compute_encoder()` on the
+    /// returned buffer will internally commit + wait on the prior CB and
+    /// allocate a fresh CB from this queue, with CPU-side timing recorded
+    /// into the thread-local profile accumulator.
+    ///
+    /// The lifetime relationship requires that this queue outlive the
+    /// returned buffer. In Lumen the queue is owned by `MetalF32Backend`
+    /// and the buffer lives entirely within a single `prefill()` call, so
+    /// this is always satisfied.
+    pub fn new_command_buffer_profilable(&self) -> Option<MetalCommandBuffer> {
+        let raw = unsafe { msg_send_0_raw(self.raw, cached_sel::command_buffer()) };
+        if raw.is_null() {
+            None
+        } else {
+            unsafe { retain(raw) };
+            // Retain queue for the lifetime of the buffer (released in Drop).
+            unsafe { retain(self.raw) };
+            Some(MetalCommandBuffer {
+                raw: AtomicPtr::new(raw),
+                queue_raw: AtomicPtr::new(self.raw),
+            })
+        }
+    }
+
+    /// Create a new command buffer using
+    /// `commandBufferWithUnretainedReferences`, the variant that does NOT
+    /// retain every Metal resource bound to it.
+    ///
+    /// Apple documents this on `MTLCommandQueue`: the default
+    /// `[queue commandBuffer]` retains every `MTLBuffer`, `MTLTexture`,
+    /// `MTLComputePipelineState`, etc. set on the buffer for the lifetime
+    /// of the buffer; the unretained variant skips both halves of the
+    /// `retain` + `release` pair. The unretained variant is the canonical
+    /// Apple-documented choice when the caller can guarantee resource
+    /// lifetime by other means (as Lumen does — see the safety contract
+    /// below).
+    ///
+    /// ## Safety contract (caller responsibility)
+    ///
+    /// The caller MUST guarantee that every resource bound to any encoder
+    /// created from this command buffer remains alive at least until the
+    /// command buffer's GPU execution completes. Concretely, this means
+    /// every `MTLBuffer` / `MTLTexture` / `MTLComputePipelineState` whose
+    /// Rust wrapper is dropped before
+    /// `cmd.commit_and_wait()` / `cmd.wait_until_completed()` returns is
+    /// a use-after-free hazard at the Metal driver level.
+    ///
+    /// Lumen's prefill and decode hot paths satisfy this trivially: the
+    /// `MetalF32Backend` owns `MetalBuffer`s and `MetalComputePipelineState`s
+    /// for the entire model session, and the prefill/decode functions
+    /// commit-and-wait on each command buffer before returning, so resource
+    /// `Drop`s cannot run before GPU completion.
+    pub fn new_command_buffer_unretained(&self) -> Option<MetalCommandBuffer> {
+        let raw = unsafe {
+            msg_send_0_raw(
+                self.raw,
+                cached_sel::command_buffer_with_unretained_references(),
+            )
+        };
+        if raw.is_null() {
+            None
+        } else {
+            // commandBufferWithUnretainedReferences also returns an
+            // autoreleased object; retain it for our reference (only the
+            // bound RESOURCES are unretained, not the CB itself).
+            unsafe { retain(raw) };
+            Some(MetalCommandBuffer {
+                raw: AtomicPtr::new(raw),
+                queue_raw: AtomicPtr::new(ptr::null_mut()),
+            })
+        }
+    }
+
+    /// Profilable unretained variant.
+    ///
+    /// Combines the `new_command_buffer_profilable` queue-back-reference
+    /// machinery with the `commandBufferWithUnretainedReferences` resource
+    /// retention semantics. The profile-mode auto-split path
+    /// (`profile_split_if_needed`) issues a fresh CB through the same
+    /// unretained selector so the savings persist across each split.
+    pub fn new_command_buffer_profilable_unretained(&self) -> Option<MetalCommandBuffer> {
+        let raw = unsafe {
+            msg_send_0_raw(
+                self.raw,
+                cached_sel::command_buffer_with_unretained_references(),
+            )
+        };
+        if raw.is_null() {
+            None
+        } else {
+            unsafe { retain(raw) };
+            unsafe { retain(self.raw) };
+            Some(MetalCommandBuffer {
+                raw: AtomicPtr::new(raw),
+                queue_raw: AtomicPtr::new(self.raw),
+            })
+        }
+    }
+
+    /// Raw Objective-C id for this queue. Exposed for the MPSGraph
+    /// path (`mps_graph_ffi.rs`) which needs the underlying
+    /// `id<MTLCommandQueue>` to pass into MPSGraph's
+    /// `runWithMTLCommandQueue:` API.
+    #[inline]
+    pub(crate) fn raw(&self) -> ObjcId {
+        self.raw
     }
 }
 
@@ -511,13 +753,82 @@ impl fmt::Debug for MetalCommandQueue {
 // ============================================================================
 
 pub struct MetalCommandBuffer {
-    raw: ObjcId,
+    /// Current MTLCommandBuffer raw handle. Wrapped in AtomicPtr so it
+    /// can be atomically swapped during profile-mode auto-splitting
+    /// (`profile_split_if_needed`). Loaded with `Relaxed` since access is
+    /// single-threaded per buffer (use sites pass `&self`).
+    raw: AtomicPtr<c_void>,
+    /// Optional back-reference to the parent MTLCommandQueue. Non-null
+    /// only when the buffer was created via
+    /// `MetalCommandQueue::new_command_buffer_profilable()`. Required for
+    /// profile-mode auto-splitting (we need a queue to allocate a fresh
+    /// CB on). Retained on the parent queue for the lifetime of this CB
+    /// (released in Drop).
+    queue_raw: AtomicPtr<c_void>,
 }
 
 impl MetalCommandBuffer {
+    /// Returns the current raw MTLCommandBuffer handle.
+    #[inline]
+    fn raw(&self) -> ObjcId {
+        self.raw.load(AOrdering::Relaxed)
+    }
+
+    /// Profile-mode hook: if profiling is enabled AND this CB is
+    /// profilable (has a queue back-ref) AND a CB is currently in flight,
+    /// commit + wait the in-flight CB, record elapsed time under the
+    /// current section label, then swap in a fresh CB from the queue.
+    ///
+    /// No-op in non-profile mode (single `Relaxed` atomic load). The
+    /// hot-path cost when profiling is disabled is one branch on a
+    /// global atomic, identical to the existing FFI dispatch overhead.
+    ///
+    /// Must be called BEFORE any `set_pipeline_state` / dispatch on the
+    /// new encoder, since it issues `commit + wait_until_completed` on
+    /// the prior buffer.
+    #[inline]
+    fn profile_split_if_needed(&self) {
+        if !super::profile::is_enabled() {
+            return;
+        }
+        let q = self.queue_raw.load(AOrdering::Relaxed);
+        if q.is_null() {
+            // Not profilable (created via plain new_command_buffer). The
+            // call site picked the wrong constructor — skip silently to
+            // avoid breaking non-prefill paths.
+            return;
+        }
+        let cur = self.raw.load(AOrdering::Relaxed);
+        if cur.is_null() {
+            return;
+        }
+        // Commit + wait the in-flight CB (records GPU work done since the
+        // last split). The encoder for this CB has already had
+        // end_encoding() called by the prior call site.
+        unsafe {
+            msg_send_0_raw(cur, cached_sel::commit());
+            msg_send_0_raw(cur, cached_sel::wait_until_completed());
+            release(cur);
+        }
+        super::profile::record_section_end();
+
+        // Allocate a fresh CB from the parent queue.
+        let fresh = unsafe { msg_send_0_raw(q, cached_sel::command_buffer()) };
+        if !fresh.is_null() {
+            unsafe { retain(fresh) };
+            self.raw.store(fresh, AOrdering::Relaxed);
+        } else {
+            // Allocation failed; mark raw as null so subsequent dispatch
+            // sites fall through to the existing null-check error paths.
+            self.raw.store(ptr::null_mut(), AOrdering::Relaxed);
+        }
+        super::profile::mark_section_start();
+    }
+
     /// Create a compute command encoder.
     pub fn new_compute_encoder(&self) -> Option<MetalComputeEncoder> {
-        let raw = unsafe { msg_send_0_raw(self.raw, cached_sel::compute_command_encoder()) };
+        self.profile_split_if_needed();
+        let raw = unsafe { msg_send_0_raw(self.raw(), cached_sel::compute_command_encoder()) };
         if raw.is_null() {
             None
         } else {
@@ -534,13 +845,14 @@ impl MetalCommandBuffer {
     /// MAY execute simultaneously on the GPU. Use `memory_barrier_with_scope`
     /// between concurrent writes and subsequent reads of the same buffer.
     pub fn new_concurrent_compute_encoder(&self) -> Option<MetalComputeEncoder> {
+        self.profile_split_if_needed();
         unsafe {
             type EncoderWithDispatchTypeFn =
                 unsafe extern "C" fn(ObjcId, ObjcSel, u64) -> ObjcId;
             let f: EncoderWithDispatchTypeFn =
                 std::mem::transmute(objc_msgSend as *const c_void);
             let raw = f(
-                self.raw,
+                self.raw(),
                 sel("computeCommandEncoderWithDispatchType:"),
                 1u64, // MTLDispatchTypeConcurrent
             );
@@ -556,7 +868,7 @@ impl MetalCommandBuffer {
 
     /// Create a blit command encoder for buffer/texture copy operations.
     pub fn new_blit_encoder(&self) -> Option<MetalBlitEncoder> {
-        let raw = unsafe { msg_send_0_raw(self.raw, cached_sel::blit_command_encoder()) };
+        let raw = unsafe { msg_send_0_raw(self.raw(), cached_sel::blit_command_encoder()) };
         if raw.is_null() {
             None
         } else {
@@ -569,32 +881,131 @@ impl MetalCommandBuffer {
     /// Commit and wait for completion (synchronous).
     pub fn commit_and_wait(&self) {
         unsafe {
-            msg_send_0_raw(self.raw, cached_sel::commit());
-            msg_send_0_raw(self.raw, cached_sel::wait_until_completed());
+            msg_send_0_raw(self.raw(), cached_sel::commit());
+            msg_send_0_raw(self.raw(), cached_sel::wait_until_completed());
         }
     }
 
     /// Commit (asynchronous).
     pub fn commit(&self) {
         unsafe {
-            msg_send_0_raw(self.raw, cached_sel::commit());
+            msg_send_0_raw(self.raw(), cached_sel::commit());
         }
     }
 
     /// Wait until completed.
     pub fn wait_until_completed(&self) {
         unsafe {
-            msg_send_0_raw(self.raw, cached_sel::wait_until_completed());
+            msg_send_0_raw(self.raw(), cached_sel::wait_until_completed());
+        }
+    }
+
+    /// Returns the raw `MTLCommandBuffer` Objective-C handle.
+    ///
+    /// Exposed only for the optional MPSGraph BF16 GEMM path
+    /// (`mps_graph_ffi.rs`). The returned pointer is **not** retained
+    /// by the caller; it remains owned by this `MetalCommandBuffer`.
+    #[inline]
+    pub(crate) fn raw_command_buffer(&self) -> *mut c_void {
+        self.raw.load(AOrdering::Relaxed)
+    }
+
+    /// Atomically replace the underlying `MTLCommandBuffer` pointer with
+    /// a new one, releasing the previous handle and retaining the new
+    /// one. Exposed only for the MPSGraph in-CB path — Apple's
+    /// `MPSCommandBuffer.encodeToCommandBuffer:` may internally call
+    /// `commitAndContinue`, committing the original CB and replacing it
+    /// with a fresh one read via `rootCommandBuffer`. The caller must
+    /// re-bind this wrapper to the new CB so subsequent compute
+    /// encoders land on an open (uncommitted) CB.
+    ///
+    /// `new_raw` is treated as a `+0` (autoreleased) source and is
+    /// retained inside; the previously held CB is released — its GPU
+    /// work is already committed by MPSGraph by the time we get here,
+    /// so dropping our Rust handle does not abort in-flight work.
+    #[inline]
+    pub(crate) fn replace_raw_command_buffer(&self, new_raw: *mut c_void) {
+        unsafe {
+            if new_raw.is_null() {
+                return;
+            }
+            retain(new_raw);
+            let prev = self.raw.swap(new_raw, AOrdering::Relaxed);
+            if !prev.is_null() {
+                release(prev);
+            }
+        }
+    }
+
+    /// Commit the in-flight CB, wait for GPU completion, then atomically
+    /// swap in a fresh CB allocated from `queue`. Provided for the
+    /// alternative MPSGraph BF16 GEMM path (`mps_graph_ffi.rs`) that
+    /// drains Lumen's encoded work before MPSGraph reads from the same
+    /// buffers on its own queue. The default in-CB path
+    /// (`encode_bf16_matmul_into_cb`) does not need this drain;
+    /// kept here as `#[allow(dead_code)]` because the alternative path
+    /// is wired up env-OFF and may be revisited in a future revision.
+    ///
+    /// `unretained` should match how the original CB was created: if
+    /// the caller wants the new CB to skip resource retain/release
+    /// (matching `LUMEN_METAL_UNRETAINED_CMDBUFS=1`), pass `true`.
+    #[allow(dead_code)]
+    pub(crate) fn commit_and_swap_to_fresh(
+        &self,
+        queue: &MetalCommandQueue,
+        unretained: bool,
+    ) -> Result<(), String> {
+        unsafe {
+            let prev = self.raw.load(AOrdering::Relaxed);
+            if prev.is_null() {
+                return Err(
+                    "MetalCommandBuffer::commit_and_swap_to_fresh: prior CB is null".into(),
+                );
+            }
+            msg_send_0_raw(prev, cached_sel::commit());
+            msg_send_0_raw(prev, cached_sel::wait_until_completed());
+
+            let sel = if unretained {
+                cached_sel::command_buffer_with_unretained_references()
+            } else {
+                cached_sel::command_buffer()
+            };
+            let fresh = msg_send_0_raw(queue.raw, sel);
+            if fresh.is_null() {
+                return Err(
+                    "MetalCommandBuffer::commit_and_swap_to_fresh: fresh CB alloc returned null"
+                        .into(),
+                );
+            }
+            // `commandBuffer` / unretained variants return autoreleased
+            // — retain for our wrapper's ownership.
+            retain(fresh);
+            self.raw.store(fresh, AOrdering::Relaxed);
+            release(prev);
+            Ok(())
         }
     }
 }
 
 impl Drop for MetalCommandBuffer {
     fn drop(&mut self) {
-        unsafe { release(self.raw) }
+        let r = self.raw.load(AOrdering::Relaxed);
+        if !r.is_null() {
+            unsafe { release(r) }
+        }
+        let q = self.queue_raw.load(AOrdering::Relaxed);
+        if !q.is_null() {
+            unsafe { release(q) }
+        }
     }
 }
 
+// SAFETY: MetalCommandBuffer wraps an MTLCommandBuffer pointer (single
+// owner) and an optional MTLCommandQueue back-reference. The AtomicPtr
+// fields provide interior mutability for profile-mode auto-splitting.
+// Concurrent encoder creation on the same buffer is not supported by
+// Metal regardless, so the existing Send/Sync contract (data lives behind
+// &self; ordering is the caller's responsibility) is preserved.
 unsafe impl Send for MetalCommandBuffer {}
 unsafe impl Sync for MetalCommandBuffer {}
 
@@ -796,6 +1207,40 @@ impl MetalComputeEncoder {
         }
     }
 
+    /// Insert a resource-scoped memory barrier on the supplied buffers.
+    ///
+    /// Wraps `[id<MTLComputeCommandEncoder> memoryBarrierWithResources:count:]`.
+    /// Use inside a concurrent compute encoder (`new_concurrent_compute_encoder`)
+    /// to enforce that all prior dispatches finish writing to the listed
+    /// buffers before any subsequent dispatch reads or writes them. This is
+    /// finer-grained than `memory_barrier_with_scope(1)`, which serialises
+    /// against the entire buffer namespace; per Apple docs, scoping the
+    /// barrier to a specific resource list lets the GPU keep unrelated work
+    /// in flight.
+    ///
+    /// Slices longer than 32 entries are silently truncated; no per-layer
+    /// plan in Lumen exceeds that. A zero-length slice is a no-op.
+    pub fn memory_barrier_with_resources(&self, buffers: &[&MetalBuffer]) {
+        if buffers.is_empty() { return; }
+        // Stack-allocated buffer (avoids pulling in a smallvec crate just
+        // for the barrier path). 32 is well above any realistic per-layer
+        // distinct-mutable-buffer count.
+        let mut raws: [ObjcId; 32] = [std::ptr::null_mut(); 32];
+        let n = buffers.len().min(raws.len());
+        for i in 0..n { raws[i] = buffers[i].raw; }
+        unsafe {
+            type BarrierResFn =
+                unsafe extern "C" fn(ObjcId, ObjcSel, *const ObjcId, u64);
+            let f: BarrierResFn = std::mem::transmute(objc_msgSend as *const c_void);
+            f(
+                self.raw,
+                cached_sel::memory_barrier_with_resources(),
+                raws.as_ptr(),
+                n as u64,
+            );
+        }
+    }
+
     /// End encoding.
     pub fn end_encoding(&self) {
         unsafe {
@@ -928,6 +1373,29 @@ impl MetalFunctionConstantValues {
                 cached_sel::set_constant_value(),
                 &val as *const u8 as *const c_void,
                 MTL_DATA_TYPE_BOOL,
+                index,
+            );
+        }
+    }
+
+    /// Set a 16-bit signed integer constant at the given index.
+    ///
+    /// The index corresponds to `[[function_constant(index)]]` in the shader,
+    /// where the declaration is `constant short FC_name [[function_constant(N)]]`.
+    /// Wraps `MTLFunctionConstantValues setConstantValue:type:atIndex:` with
+    /// `MTLDataType.short` (42) for `int16_t` function constants.
+    pub fn set_int16(&self, value: i16, index: u64) {
+        unsafe {
+            // MTLDataType.short = 42
+            const MTL_DATA_TYPE_SHORT: u64 = 42;
+            type SetConstFn =
+                unsafe extern "C" fn(ObjcId, ObjcSel, *const c_void, u64, u64);
+            let f: SetConstFn = std::mem::transmute(objc_msgSend as *const c_void);
+            f(
+                self.raw,
+                cached_sel::set_constant_value(),
+                &value as *const i16 as *const c_void,
+                MTL_DATA_TYPE_SHORT,
                 index,
             );
         }
@@ -1080,6 +1548,27 @@ impl MetalBuffer {
         assert!(
             byte_len as u64 <= self.length(),
             "MetalBuffer::read_u32: read size ({byte_len}) exceeds buffer length ({})",
+            self.length()
+        );
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.contents() as *const u8,
+                out.as_mut_ptr() as *mut u8,
+                byte_len,
+            );
+        }
+    }
+
+    /// Read u64 data out of the buffer (for DET-001 per-layer FNV hash readback).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the requested size exceeds the buffer length.
+    pub fn read_u64(&self, out: &mut [u64]) {
+        let byte_len = out.len() * 8;
+        assert!(
+            byte_len as u64 <= self.length(),
+            "MetalBuffer::read_u64: read size ({byte_len}) exceeds buffer length ({})",
             self.length()
         );
         unsafe {

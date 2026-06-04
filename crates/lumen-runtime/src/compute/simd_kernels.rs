@@ -1143,7 +1143,8 @@ pub fn matmul_q8_0_simd_2row_widen(
 // 2 sdot instructions per 32 elements, achieving ~2-3x throughput improvement.
 //
 // The quantization of x introduces ~0.5-1% relative error vs. the widening approach
-// (which operates on the exact f32 x values). This matches llama.cpp's approach.
+// (which operates on the exact f32 x values). This is the standard quantize-then-dot
+// trade-off used by mainstream Q8_0 inference kernels.
 
 /// Convert f32 to f16 bits (software implementation, no SIMD intrinsics).
 #[allow(dead_code)]
@@ -1983,8 +1984,9 @@ const Q8_0_STACK_BUF_SIZE: usize = 256 * Q8_0_BLOCK_SIZE; // 8704 bytes
 ///
 /// Uses stack buffer for x_q8 when dim <= 8192 to avoid heap allocation.
 ///
-/// Precision: quantizing x introduces ~0.5-1% relative error. This matches
-/// llama.cpp's approach and is acceptable for inference.
+/// Precision: quantizing x introduces ~0.5-1% relative error. This is the
+/// standard quantize-then-dot trade-off used by mainstream Q8_0 inference
+/// kernels and is acceptable for inference.
 #[cfg(target_arch = "aarch64")]
 pub fn matmul_q8_0_simd(
     out: &mut [f32],

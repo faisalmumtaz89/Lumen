@@ -408,7 +408,7 @@ kernel void gdn_compute_gates(
 
     // gate = ssm_a * softplus(gk_proj + dt_bias)
     // GGUF stores ssm_a = -exp(A_log) (already negated+exponentiated).
-    // Reference (llama.cpp): gate = ggml_mul(alpha_softplus, ssm_a)
+    // GDN algorithm: gate = alpha_softplus * ssm_a.
     // Typical values: ssm_a ~ -0.036 (slow decay) to -72 (fast decay).
     // gate is negative => alpha = exp(gate) in (0, 1).
     float gate = ssm_a[gid] * sp;
@@ -812,13 +812,21 @@ kernel void sigmoid_mul_fused(
 // buffer(13): q_out        [num_heads * head_dim] float -- normalized Q (separate buf)
 // ============================================================================
 
+// Determinism fix: this kernel previously wrote the assembled K and V directly into
+// qkv_out (= qkv_buf, buffer 5), whose K/V byte range [q_dim, q_dim+2*kv_dim) OVERLAPS the
+// qgate-interleaved READ range [0, 2*q_dim) of the SAME buffer. Under GQA, K/V-writing
+// threadgroups raced the (still-reading) Q-head threadgroups → non-deterministic Q/gate. FIX:
+// write normalized K back to k_data (k_buf) and V back to v_data (v_buf) IN PLACE (each is
+// per-element, same-thread → race-free), and Q to the separate q_out (q_buf). The caller then
+// assembles q_buf/k_buf/v_buf into qkv_buf with copies AFTER the encoder barrier. No writes to
+// qkv_out remain, so there is no aliasing with the qgate read. k_data/v_data are now writable.
 kernel void deinterleave_norm_assemble(
     device const float* qgate_interleaved [[buffer(0)]],
-    device const float* k_data            [[buffer(1)]],
-    device const float* v_data            [[buffer(2)]],
+    device       float* k_data            [[buffer(1)]],
+    device       float* v_data            [[buffer(2)]],
     device const float* q_norm_w          [[buffer(3)]],
     device const float* k_norm_w          [[buffer(4)]],
-    device       float* qkv_out           [[buffer(5)]],
+    device       float* qkv_out           [[buffer(5)]],  // UNUSED post-fix (kept for ABI)
     device       float* gate_out          [[buffer(6)]],
     constant     uint&  num_heads         [[buffer(7)]],
     constant     uint&  num_kv_heads      [[buffer(8)]],
@@ -878,12 +886,9 @@ kernel void deinterleave_norm_assemble(
             q_out[h * head_dim + i] = qv * scale * q_norm_w[i];
         }
 
-        // Step 3: Copy V head (if this Q head index < num_kv_heads)
-        if (h < num_kv_heads) {
-            for (uint i = tid; i < head_dim; i += tg_size) {
-                qkv_out[q_dim + kv_dim + h * head_dim + i] = v_data[h * head_dim + i];
-            }
-        }
+        // Step 3: V needs no transform and is already in v_data (v_buf); leave it there.
+        // The caller copies v_buf -> qkv_buf[V] after the barrier. (No write to qkv_out:
+        // that would alias the qgate read region — the DET-001 RACE #2.)
     } else {
         // --- K head: RMSNorm + write K ---
         uint kh = tg_idx - num_heads;
@@ -913,10 +918,11 @@ kernel void deinterleave_norm_assemble(
 
         float scale = rsqrt(total_ss / float(head_dim) + eps);
 
-        // Step 2: Write normalized K to qkv_out at K offset [q_dim..q_dim+kv_dim)
+        // Step 2: Write normalized K back to k_data (k_buf) IN PLACE (per-element, same
+        // thread → race-free). Caller copies k_buf -> qkv_buf[K] after the barrier.
         for (uint i = tid; i < head_dim; i += tg_size) {
             float kv = k_data[kh * head_dim + i];
-            qkv_out[q_dim + kh * head_dim + i] = kv * scale * k_norm_w[i];
+            k_data[kh * head_dim + i] = kv * scale * k_norm_w[i];
         }
     }
 }

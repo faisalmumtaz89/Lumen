@@ -445,6 +445,93 @@ extern "C" __global__ void l2_normalize_qk_strided(
 }
 
 // ============================================================================
+// l2_normalize_qk_strided_rsqrtf — two-step rsqrtf L2-norm
+// variant: scale = rsqrtf(fmaxf(ss, eps*eps)).
+// Uses eps = 1e-6 (the f_norm_rms_eps default for Qwen3.5) and the
+// hardware rsqrtf instruction (one rounded op, vs Lumen's 1/sqrt which is
+// two). Same grid/block/shared-mem layout as l2_normalize_qk_strided so the
+// dispatch site is byte-identical except for kernel selection.
+// ============================================================================
+extern "C" __global__ void l2_normalize_qk_strided_rsqrtf(
+    float* __restrict__ data,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int T,
+    unsigned int stride,
+    unsigned int q_offset,
+    unsigned int k_offset)
+{
+    extern __shared__ float shared[];
+
+    unsigned int block_id = blockIdx.x;
+    if (block_id >= num_kv_heads * T) return;
+
+    unsigned int t = block_id / num_kv_heads;
+    unsigned int kv_head = block_id % num_kv_heads;
+
+    unsigned int tid = threadIdx.x;
+    unsigned int block_size = blockDim.x;
+    unsigned int warp_id = tid >> 5;
+    unsigned int lane_id = tid & 31u;
+    unsigned int num_warps = (block_size + 31) >> 5;
+    // Two-step rsqrtf variant: eps=1e-6 (NOT 1e-12), scale = rsqrtf(fmaxf(ss, eps*eps))
+    const float eps = 1.0e-6f;
+    const float eps_sq = eps * eps;  // = 1e-12
+
+    // Normalize Q head
+    {
+        float* head = data + t * stride + q_offset + kv_head * head_dim;
+        float ss = 0.0f;
+        for (unsigned int i = tid; i < head_dim; i += block_size) {
+            float v = head[i];
+            ss += v * v;
+        }
+        ss = warp_reduce_sum(ss);
+        if (lane_id == 0) shared[warp_id] = ss;
+        __syncthreads();
+        float total_ss = 0.0f;
+        if (warp_id == 0) {
+            total_ss = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+            total_ss = warp_reduce_sum(total_ss);
+        }
+        if (tid == 0) shared[0] = total_ss;
+        __syncthreads();
+        total_ss = shared[0];
+        // RMSNorm formula: scale = rsqrtf(fmaxf(ss, eps*eps))
+        float scale = rsqrtf(fmaxf(total_ss, eps_sq));
+        for (unsigned int i = tid; i < head_dim; i += block_size) {
+            head[i] *= scale;
+        }
+    }
+    __syncthreads();
+
+    // Normalize K head
+    {
+        float* head = data + t * stride + k_offset + kv_head * head_dim;
+        float ss = 0.0f;
+        for (unsigned int i = tid; i < head_dim; i += block_size) {
+            float v = head[i];
+            ss += v * v;
+        }
+        ss = warp_reduce_sum(ss);
+        if (lane_id == 0) shared[warp_id] = ss;
+        __syncthreads();
+        float total_ss = 0.0f;
+        if (warp_id == 0) {
+            total_ss = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+            total_ss = warp_reduce_sum(total_ss);
+        }
+        if (tid == 0) shared[0] = total_ss;
+        __syncthreads();
+        total_ss = shared[0];
+        float scale = rsqrtf(fmaxf(total_ss, eps_sq));
+        for (unsigned int i = tid; i < head_dim; i += block_size) {
+            head[i] *= scale;
+        }
+    }
+}
+
+// ============================================================================
 // gdn_prefill_fused_v3: Warp-parallel GDN prefill state update (4x unrolled)
 //
 // Direct port of Metal's gdn_prefill_fused_v3_chunked kernel.
@@ -717,4 +804,102 @@ extern "C" __global__ void gdn_prefill_norm_gate(
     float silu_g = g / (1.0f + expf(-g));
 
     ssm_out[gate_idx] = silu_g * normed;
+}
+
+// ============================================================================
+// gdn_prefill_norm_gate_rsqrtf — alternate variant of the RMSNorm
+// + SiLU-gate kernel.  Two byte-level changes from the original above:
+//
+//   1.  Variance: this variant computes `mean = tmp / ncols; scale =
+//       rsqrtf(mean + eps)` (one hardware `rsqrtf` op).  Original Lumen
+//       uses `rms = sqrtf(total_ss / val_dim + eps); inv_rms = 1.0f / rms`
+//       (two ops — IEEE sqrt + IEEE divide).  rsqrtf is the hardware
+//       reciprocal sqrt (one rounded op).
+//
+//   2.  Cross-warp reduction: a block_reduce<SUM> pattern returns the full
+//       sum on EVERY thread of EVERY warp (lanes 0..num_warps-1 of each
+//       warp pick up the per-warp sums, then re-reduce via warp_reduce_sum).
+//       Original Lumen computes the cross-warp sum on warp 0 only, stashes
+//       shared[0], then broadcasts to every thread via a second
+//       __syncthreads + shared read. The ARITHMETIC result is identical
+//       (same set of partial sums fed into the same warp_reduce_sum tree)
+//       but the implementation differs; this variant uses the block-wide
+//       warp-shuffle SUM pattern.
+//
+// Mul-order: `(x * inv_rms * weight) * silu(g)` — left-to-right (normed) *
+// silu(g). Lumen's original was `(silu(g) * (val * inv_rms * weight))` —
+// F32 multiply is commutative AND associative for the same operand pairs,
+// so the byte-output is identical when the inv_rms, weight, val, gate,
+// silu(g) operands are the same.
+//
+// Env gate: LUMEN_CUDA_RMSNORM_RSQRTF=1 (default OFF, byte-identical when OFF).
+// Same kernel signature, same grid/block/shared-mem layout as the original.
+// ============================================================================
+extern "C" __global__ void gdn_prefill_norm_gate_rsqrtf(
+    const float* __restrict__ raw_out,
+    const float* __restrict__ gate_all,
+    const float* __restrict__ norm_scale,
+    float* __restrict__ ssm_out,
+    unsigned int num_heads,
+    unsigned int val_dim,
+    float eps,
+    unsigned int scale_n_heads,
+    unsigned int T)
+{
+    extern __shared__ float shared[];
+
+    unsigned int h = blockIdx.x;
+    unsigned int t = blockIdx.y;
+    if (h >= num_heads || t >= T) return;
+
+    unsigned int vj = threadIdx.x;
+    unsigned int block_size = blockDim.x;
+    unsigned int warp_id = vj >> 5;
+    unsigned int lane_id = vj & 31u;
+    unsigned int num_warps = (block_size + 31) >> 5;
+
+    unsigned int idx = t * num_heads * val_dim + h * val_dim + vj;
+
+    // Load raw output value
+    float val = (vj < val_dim) ? raw_out[idx] : 0.0f;
+
+    // === block_reduce<SUM> via warp-shuffle ===
+    // Step A: in-warp reduce (every lane in the warp now holds the warp's sum).
+    float tmp = warp_reduce_sum(val * val);
+
+    // Step B: lane 0 of each warp writes warp's sum to shared[warp_id].
+    if (lane_id == 0) {
+        shared[warp_id] = tmp;
+    }
+    __syncthreads();
+
+    // Step C: EVERY warp picks up the per-warp sums (lanes 0..num_warps-1)
+    // and re-reduces via warp_reduce_sum. This is the canonical block_reduce
+    // pattern: both the implementation pattern AND the per-thread numerical
+    // result are preserved across warps.
+    tmp = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+    tmp = warp_reduce_sum(tmp);
+    float total_ss = tmp;
+    // (No second __syncthreads + shared[0] broadcast — every thread already
+    //  has the full sum from its own warp_reduce_sum on the same operands.)
+
+    if (vj >= val_dim) return;
+
+    // === RMSNorm scale (one-op rsqrtf form) ===
+    // mean = sum_sq / ncols; scale = rsqrtf(mean + eps).
+    // This is ONE hardware rsqrtf, NOT IEEE-sqrt-then-divide. rsqrtf is
+    // approximate (~2 ULP per CUDA C Programming Guide §F.2).
+    const float mean = total_ss / (float)val_dim;
+    const float scale = rsqrtf(mean + eps);
+
+    // Apply learned scale (broadcast if scale_n_heads == 1)
+    unsigned int scale_h = (scale_n_heads == 1) ? 0 : h;
+    float normed = val * scale * norm_scale[scale_h * val_dim + vj];
+
+    // SiLU gate: silu(gate) * normed (canonical form: normed * silu(g))
+    unsigned int gate_idx = t * num_heads * val_dim + h * val_dim + vj;
+    float g = gate_all[gate_idx];
+    float silu_g = g / (1.0f + expf(-g));
+
+    ssm_out[gate_idx] = normed * silu_g;
 }

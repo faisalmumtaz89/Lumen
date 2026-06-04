@@ -101,7 +101,7 @@ pub fn ensure_model(spec: &ModelSpec) -> Result<PathBuf, BenchError> {
                 "256mb" => LargeModelConfig::bench_256mb(),
                 "1gb" => LargeModelConfig::bench_1gb(),
                 "4gb" => LargeModelConfig::bench_4gb(),
-                "7b" => LargeModelConfig::llama_7b(),
+                "7b" => LargeModelConfig::seven_b_reference(),
                 _ => return Err(BenchError::Config(format!("unknown size: {size}"))),
             };
 
@@ -198,6 +198,11 @@ fn run_single_iteration(
 /// This is the shared extraction logic for all backend variants. Before this
 /// refactor, the same ~20 lines were duplicated three times across
 /// run_mmap_iteration, run_async_iteration, and run_sync_iteration.
+///
+/// Captures the full generated-token vec for the
+/// cross-trial determinism check, plus the backend's end-of-gen
+/// `peak_memory_bytes`.  Both fields are additive — older callers that
+/// constructed `BenchResult` literals are unaffected.
 fn metrics_to_bench_result(
     result: &GenerationResult,
     initial_residency: f64,
@@ -226,6 +231,11 @@ fn metrics_to_bench_result(
         stall_fraction,
         prompt_tokens: m.prompt_tokens,
         generated_tokens: m.generated_tokens,
+        // Capture token stream for cross-trial
+        // determinism gate.  Clone is O(N) for N≤128 tokens — cheap.
+        generated_token_ids: result.tokens.clone(),
+        // Peak memory snapshot at end of generation.
+        peak_memory_bytes: m.peak_memory_bytes,
     }
 }
 

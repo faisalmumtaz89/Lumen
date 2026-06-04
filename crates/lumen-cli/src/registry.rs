@@ -19,11 +19,39 @@ pub struct ModelEntry {
     pub gguf_files: HashMap<String, GgufSource>,
 }
 
-/// Source location for a GGUF file on HuggingFace.
+/// Source location for a GGUF (single-file or multi-shard) on HuggingFace.
+///
+/// `files` is the list of shard filenames in the repo. For single-file GGUFs
+/// this is a one-element vector. For multi-shard GGUFs (e.g. BF16 Qwen3.5-MoE
+/// 35B-A3B which ships as `*-00001-of-00002.gguf` + `*-00002-of-00002.gguf`)
+/// every shard filename is listed here so the CLI can download all siblings
+/// before invoking the converter.
+///
+/// The `file()` accessor returns the canonical first/primary shard filename
+/// (whichever the converter should be pointed at -- the multi-shard reader
+/// auto-discovers siblings from any one shard's path, but the convention is
+/// to point at shard 1).
 #[derive(Debug, Clone)]
 pub struct GgufSource {
     pub repo: String,
-    pub file: String,
+    pub files: Vec<String>,
+}
+
+impl GgufSource {
+    /// Returns the primary (first) shard filename. For single-file GGUFs this
+    /// is the file itself; for multi-shard GGUFs it's the shard the converter
+    /// should be pointed at (auto-discovery will locate siblings).
+    pub fn file(&self) -> &str {
+        self.files
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("")
+    }
+
+    /// `true` iff this source contains more than one shard file.
+    pub fn is_multi_shard(&self) -> bool {
+        self.files.len() > 1
+    }
 }
 
 /// The parsed model registry.
@@ -54,7 +82,7 @@ impl Registry {
 
     /// Get the default model entry.
     pub fn default_model(&self) -> &ModelEntry {
-        self.models.get("qwen2-5-3b").expect("default model qwen2-5-3b must exist in registry")
+        self.models.get("qwen3-5-9b").expect("default model qwen3-5-9b must exist in registry")
     }
 
     /// List all model entries (sorted by key).
@@ -103,9 +131,26 @@ pub fn load_registry() -> Registry {
                     if let Some(source_table) = source_val.as_table() {
                         let repo = source_table.get("repo")
                             .and_then(|v| v.as_str()).unwrap_or("").to_owned();
-                        let file = source_table.get("file")
-                            .and_then(|v| v.as_str()).unwrap_or("").to_owned();
-                        gguf_files.insert(quant.clone(), GgufSource { repo, file });
+                        // Accept both single-file (`file = "name.gguf"`) and
+                        // multi-shard (`files = ["shard1.gguf", "shard2.gguf"]`)
+                        // forms. Multi-shard wins if both are present.
+                        let files = if let Some(arr) = source_table.get("files")
+                            .and_then(|v| v.as_array())
+                        {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_owned()))
+                                .collect::<Vec<String>>()
+                        } else if let Some(single) = source_table.get("file").and_then(|v| v.as_str()) {
+                            vec![single.to_owned()]
+                        } else {
+                            Vec::new()
+                        };
+                        if files.is_empty() {
+                            // Skip malformed entries silently to preserve the
+                            // permissive registry-loader contract.
+                            continue;
+                        }
+                        gguf_files.insert(quant.clone(), GgufSource { repo, files });
                     }
                 }
             }
@@ -152,34 +197,19 @@ mod tests {
     #[test]
     fn resolve_canonical_key() {
         let reg = load_registry();
-        let entry = reg.resolve("qwen2-5-3b").expect("qwen2-5-3b must exist");
-        assert_eq!(entry.display_name, "Qwen2.5 3B Instruct");
-        assert_eq!(entry.architecture, "qwen2");
-        assert_eq!(entry.tokenizer, "Qwen/Qwen2.5-3B-Instruct");
+        let entry = reg.resolve("qwen3-5-9b").expect("qwen3-5-9b must exist");
+        assert_eq!(entry.display_name, "Qwen3.5 9B");
+        assert_eq!(entry.architecture, "qwen35");
+        assert_eq!(entry.tokenizer, "Qwen/Qwen3.5-9B");
         assert!(entry.gguf_files.contains_key("Q8_0"));
     }
 
     #[test]
-    fn resolve_alias() {
+    fn resolve_qwen35_dot_alias() {
         let reg = load_registry();
-        let entry = reg.resolve("llama-8b").expect("alias llama-8b must resolve");
-        assert_eq!(entry.key, "llama-3-1-8b");
-        assert_eq!(entry.display_name, "Llama 3.1 8B Instruct");
-    }
-
-    #[test]
-    fn resolve_qwen_dot_alias() {
-        let reg = load_registry();
-        let entry = reg.resolve("qwen2.5-3b").expect("alias qwen2.5-3b must resolve");
-        assert_eq!(entry.key, "qwen2-5-3b");
-    }
-
-    #[test]
-    fn resolve_tinyllama_alias() {
-        let reg = load_registry();
-        let entry = reg.resolve("tinyllama").expect("alias tinyllama must resolve");
-        assert_eq!(entry.key, "tinyllama-1-1b");
-        assert_eq!(entry.architecture, "llama");
+        let entry = reg.resolve("qwen3.5-9b").expect("alias qwen3.5-9b must resolve");
+        assert_eq!(entry.key, "qwen3-5-9b");
+        assert_eq!(entry.architecture, "qwen35");
     }
 
     #[test]
@@ -189,29 +219,139 @@ mod tests {
     }
 
     #[test]
-    fn default_model_is_qwen25_3b() {
+    fn resolve_legacy_alias_returns_none() {
+        // Regression test for the Qwen3.5-only registry: the legacy
+        // aliases `llama-8b`, `tinyllama`, `qwen2.5-3b`, `mistral-7b`
+        // must no longer resolve. Callers should receive `None` (and the
+        // CLI will surface a clear "unsupported model" error).
+        let reg = load_registry();
+        for legacy in &["llama-8b", "tinyllama", "qwen2.5-3b", "qwen2.5-7b", "qwen2.5-14b", "mistral-7b"] {
+            assert!(reg.resolve(legacy).is_none(), "{legacy} must not resolve");
+        }
+    }
+
+    #[test]
+    fn default_model_is_qwen35_9b() {
         let reg = load_registry();
         let default = reg.default_model();
-        assert_eq!(default.key, "qwen2-5-3b");
+        assert_eq!(default.key, "qwen3-5-9b");
+        assert_eq!(default.architecture, "qwen35");
     }
 
     #[test]
-    fn list_returns_all_models() {
+    fn list_returns_supported_qwen35_models() {
+        // Post- (2026-05-26): registry contains the Qwen3.5 family that
+        // has a validated runtime path. Dense Qwen3.5-9B was the original
+        // baseline; Qwen3.5-MoE-35B-A3B (qwen35moe arch) shipped with
+        // after the batched-MoE correctness fix.
         let reg = load_registry();
         let list = reg.list();
-        // 7 models: llama-3-1-8b, mistral-7b-v0-3, qwen2-5-3b, qwen2-5-7b, qwen2-5-14b, qwen3-5-9b, tinyllama-1-1b
-        assert_eq!(list.len(), 7, "expected 7 models, got {}", list.len());
+        assert!(
+            list.len() >= 1,
+            "expected at least 1 model, got {}",
+            list.len(),
+        );
+        let keys: Vec<&str> = list.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"qwen3-5-9b"), "dense baseline missing: {:?}", keys);
+        // qwen35moe entry is asserted by `resolve_qwen35moe_canonical_key` below
+        // so this list test simply enforces the family lock.
+        let archs: std::collections::HashSet<&str> = list.iter().map(|e| e.architecture.as_str()).collect();
+        for arch in &archs {
+            assert!(
+                matches!(*arch, "qwen35" | "qwen35moe"),
+                "registry contains non-Qwen3.5 arch {}",
+                arch,
+            );
+        }
     }
 
     #[test]
-    fn tinyllama_has_gguf_files() {
+    fn resolve_qwen35moe_canonical_key() {
+        // P2-1 ships qwen35moe runtime path. The 35B-A3B
+        // checkpoint is the validated MoE production model.
         let reg = load_registry();
-        let entry = reg.resolve("tinyllama-1-1b").expect("tinyllama must exist");
+        let entry = reg
+            .resolve("qwen3-5-moe-35b-a3b")
+            .expect("qwen3-5-moe-35b-a3b must exist ");
+        assert_eq!(entry.architecture, "qwen35moe");
         assert!(entry.gguf_files.contains_key("Q8_0"));
-        assert!(entry.gguf_files.contains_key("Q4_0"));
+    }
+
+    #[test]
+    fn resolve_qwen35moe_dot_alias() {
+        let reg = load_registry();
+        let entry = reg
+            .resolve("qwen3.5-moe-35b-a3b")
+            .expect("alias qwen3.5-moe-35b-a3b must resolve");
+        assert_eq!(entry.key, "qwen3-5-moe-35b-a3b");
+        assert_eq!(entry.architecture, "qwen35moe");
+    }
+
+    #[test]
+    fn qwen35_has_gguf_files() {
+        let reg = load_registry();
+        let entry = reg.resolve("qwen3-5-9b").expect("qwen3-5-9b must exist");
+        assert!(entry.gguf_files.contains_key("Q8_0"));
         let q8 = &entry.gguf_files["Q8_0"];
-        assert!(q8.repo.contains("TinyLlama"));
-        assert!(q8.file.contains("Q8_0"));
+        assert!(q8.repo.contains("Qwen3.5"), "Q8_0 repo should reference Qwen3.5: {}", q8.repo);
+        assert!(q8.file().contains("Q8_0"));
+        assert!(!q8.is_multi_shard(), "Q8_0 dense should be single-shard");
+    }
+
+    #[test]
+    fn qwen35_moe_bf16_is_multi_shard() {
+        // BF16 Qwen3.5-MoE 35B-A3B ships as a 2-shard split GGUF from HF
+        // (the BF16 weights total ~68 GB, which exceeds the single-file
+        // convention). The registry MUST declare both shard filenames so the
+        // CLI can download them before invoking the multi-shard reader.
+        let reg = load_registry();
+        let entry = reg
+            .resolve("qwen3-5-moe-35b-a3b")
+            .expect("qwen3-5-moe-35b-a3b must exist");
+        let bf16 = entry
+            .gguf_files
+            .get("BF16")
+            .expect("BF16 quant must be declared for qwen3-5-moe-35b-a3b");
+        assert!(bf16.is_multi_shard(), "BF16 entry must list multiple shard files");
+        assert!(bf16.files.len() >= 2, "BF16 must have at least 2 shard files");
+        for f in &bf16.files {
+            // bartowski's repo uses lowercase `bf16` in the filename; other
+            // providers may use uppercase. Accept either casing.
+            let lower = f.to_ascii_lowercase();
+            assert!(
+                lower.contains("bf16") && lower.ends_with(".gguf"),
+                "BF16 shard filename should look like a BF16 GGUF: {f}"
+            );
+            assert!(
+                f.contains("-of-"),
+                "BF16 shard filename should match the *-of-* pattern: {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn gguf_source_single_file_accessor() {
+        // Sanity-check the file()/files accessors on a synthetic source.
+        let src = GgufSource {
+            repo: "test/repo".to_owned(),
+            files: vec!["only.gguf".to_owned()],
+        };
+        assert_eq!(src.file(), "only.gguf");
+        assert!(!src.is_multi_shard());
+    }
+
+    #[test]
+    fn gguf_source_multi_shard_accessor() {
+        let src = GgufSource {
+            repo: "test/repo".to_owned(),
+            files: vec![
+                "shard-00001-of-00002.gguf".to_owned(),
+                "shard-00002-of-00002.gguf".to_owned(),
+            ],
+        };
+        assert!(src.is_multi_shard());
+        // file() returns the first/primary shard.
+        assert_eq!(src.file(), "shard-00001-of-00002.gguf");
     }
 
     #[test]

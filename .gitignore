@@ -14,6 +14,12 @@ bench/results/
 *.swo
 *.bak
 *.original
+*.orig
+*.rej
+*.pre-m-z*
+
+# Local memory / context files
+MEMORY.md
 
 # Python
 __pycache__/

@@ -174,13 +174,33 @@ kernel void tiled_matmul_f32(
 // ============================================================================
 // tiled_matmul_bytes_f32: Tiled GEMM with byte-encoded F32 weights
 //
-// Same as tiled_matmul_f32 but B is a byte buffer of LE f32.
-// Uses simdgroup MMA with half-precision threadgroup tiles.
+// Computes C[M, N] = X[M, K] * W[N, K]^T where W is byte-encoded F32 (LE).
+//
+// (2026-06-02) buffer-binding convention fix
+// -------------------------------------------------
+// the prior kernel signature was `(A=buf0 [M,K], B_bytes=buf1 [N,K])` —
+// matching the original `tiled_matmul_f32` (math: C = A * B^T). However ALL
+// dispatch sites in Lumen bind layer_buf (weight) at buffer 0 and X (input)
+// at buffer 1, matching the Q8_0/Q4_0 kernel convention
+// (`W=buf0 [N,K], X=buf1 [M,K]`). At sites where M ≤ N_weight (typical
+// QKV/FFN GEMMs) this produced merely-wrong-math (still finite) outputs.
+// At the shared-expert gate-inp dispatch (N=1, M=batch ≥ 5), the kernel
+// read M*K=17*2048 floats from a 1*2048-float gis tensor, OVER-READING into
+// the next subtensor's bytes and producing NaN gate_scalars for batch
+// indices ≥ 1.
+//
+// Fix: swap the kernel's buffer roles to match every Lumen dispatch site.
+// buf 0 is now the BYTE-encoded WEIGHT [N, K]; buf 1 is the FLOAT INPUT
+// [M, K]; buf 2 is the output [M, N]. Math computed: C = X * W^T.
+//
+// This brings `tiled_matmul_bytes_f32` into line with the Q8_0/Q4_0/Bf16
+// kernels and silently corrects pre-existing wrong-math at all F32
+// fallback sites (no dispatch-site changes required).
 // ============================================================================
 
 kernel void tiled_matmul_bytes_f32(
-    device const float* A        [[buffer(0)]],
-    device const uchar* B_bytes  [[buffer(1)]],
+    device const uchar* W_bytes  [[buffer(0)]],
+    device const float* X        [[buffer(1)]],
     device float*       C        [[buffer(2)]],
     constant uint&      M        [[buffer(3)]],
     constant uint&      N        [[buffer(4)]],
@@ -189,7 +209,11 @@ kernel void tiled_matmul_bytes_f32(
     ushort tiitg                 [[thread_index_in_threadgroup]],
     ushort sgitg                 [[simdgroup_index_in_threadgroup]])
 {
-    device const float* B = (device const float*)B_bytes;
+    // Aliases preserve the body's original indexing exactly:
+    //   A is the [M, K] operand (input X)
+    //   B is the [N, K] operand (weight W, byte→float reinterpret)
+    device const float* A = X;
+    device const float* B = (device const float*)W_bytes;
 
     threadgroup half shmem[2048];
     threadgroup half* sa = shmem;

@@ -41,6 +41,14 @@ pub(crate) struct MetalPipelines {
     pub(crate) matmul_f16_deferred_nr2: MetalPipelineState,
     pub(crate) matmul_f16_deferred_residual_nr2: MetalPipelineState,
     pub(crate) matmul_f16_deferred_bias_nr2: MetalPipelineState,
+    // BF16 (brain-float) decode kernels — NR2 deferred reduction.
+    // Mirrors the F16 NR2 family for the BF16 prefill+decode foundation.
+    // Same dispatch signature; only the on-device weight type
+    // differs (bfloat vs half). Built unconditionally so BF16 LBC models
+    // run out of the box on Apple Silicon with MSL 3.0+ bfloat support.
+    pub(crate) matmul_bf16_deferred_nr2: MetalPipelineState,
+    pub(crate) matmul_bf16_deferred_residual_nr2: MetalPipelineState,
+    pub(crate) matmul_bf16_deferred_bias_nr2: MetalPipelineState,
     pub(crate) dequant_matmul_q8_0: MetalPipelineState,
     pub(crate) rmsnorm: MetalPipelineState,
     pub(crate) rmsnorm_bytes: MetalPipelineState,
@@ -63,6 +71,7 @@ pub(crate) struct MetalPipelines {
     pub(crate) embed_token_q8_0: MetalPipelineState,
     pub(crate) embed_token_q4_0: MetalPipelineState,
     pub(crate) embed_token_f16: MetalPipelineState,
+    pub(crate) embed_token_bf16: MetalPipelineState,
 
     // Fused kernels
     pub(crate) dequant_matmul_q8_0_residual: MetalPipelineState,
@@ -114,6 +123,33 @@ pub(crate) struct MetalPipelines {
     pub(crate) tiled_matmul_f16_residual: MetalPipelineState,
     pub(crate) tiled_matmul_f16_k64: MetalPipelineState,
     pub(crate) tiled_matmul_f16_k64_residual: MetalPipelineState,
+    // BF16 prefill GEMM kernels.
+    // Same simdgroup MMA tile geometry as F16 (32x32 output tile, 128
+    // threads, 4 simdgroups), but uses `simdgroup_bfloat8x8` on M3+
+    // (Apple GPU family 9). F32 accumulators preserve precision through
+    // the inner loop; output written F32 for downstream consumers.
+    pub(crate) tiled_matmul_bf16: MetalPipelineState,
+    pub(crate) tiled_matmul_bf16_residual: MetalPipelineState,
+    pub(crate) tiled_matmul_bf16_k64: MetalPipelineState,
+    pub(crate) tiled_matmul_bf16_k64_residual: MetalPipelineState,
+    /// BF16 GDN qkv-proj + attn-gate-proj paired GEMM. Consumes a
+    /// runtime-repacked concat-then-stripe weight buffer (`repack_bf16.rs`).
+    /// Single dispatch, dual-output (Y_qkv, Y_gate). BC-pipeline variant
+    /// (boundary-checked) since M may not be a clean multiple of TILE_M.
+    pub(crate) tiled_matmul_bf16_k64_qkv_gate_paired: MetalPipelineState,
+    /// Aligned variant (FC_BC_{M,N,K}=false) for the common case when
+    /// M is a multiple of TILE_M, both projection N dims are multiples of
+    /// TILE_N=32, and hidden_dim is a multiple of TILE_K_64=64 (Qwen3.5-9B
+    /// GDN: M=131 may misalign but N=8192/4096 and K=4096 are aligned —
+    /// the BC variant is used in practice when M is misaligned).
+    pub(crate) tiled_matmul_bf16_k64_qkv_gate_paired_aligned: MetalPipelineState,
+    /// Minimal warmup kernel for the BF16 GDN paired repack
+    /// buffer. Touches one BF16 element per layer at load time so that the
+    /// Apple Metal driver commits the GPU page-table mapping for the 96 MB
+    /// packed buffer upfront, not at first-prefill time. Cost: ~1µs per
+    /// layer; the alternative is ~280 ms on the cold first prefill per the
+    /// diagnostic.
+    pub(crate) bf16_paired_warmup: MetalPipelineState,
     pub(crate) matmul_bytes_f32_residual: MetalPipelineState,
 
     // Buffer ops (GPU-side activation transfer)
@@ -122,13 +158,48 @@ pub(crate) struct MetalPipelines {
 
     // Split-K GEMM kernels (for GPU core saturation during small prefill)
     pub(crate) dequant_tiled_matmul_q8_0_splitk: MetalPipelineState,
+    pub(crate) dequant_tiled_matmul_q8_0_k64_splitk: MetalPipelineState,
     pub(crate) reduce_splitk: MetalPipelineState,
+    pub(crate) reduce_splitk_add_residual: MetalPipelineState,
 
     // K64 (TILE_K=64) GEMM variants for fewer barriers
     pub(crate) dequant_tiled_matmul_q8_0_k64: MetalPipelineState,
     pub(crate) dequant_tiled_matmul_q8_0_k64_residual_batched: MetalPipelineState,
     pub(crate) dequant_tiled_matmul_q4_0_k64: MetalPipelineState,
     pub(crate) dequant_tiled_matmul_q4_0_k64_residual_batched: MetalPipelineState,
+
+    // Joint dual-output gate+up GEMM with register-resident SwiGLU.
+    // Replaces 2 separate dispatches (gate, up) + 1 swiglu_batched dispatch.
+    pub(crate) dequant_tiled_matmul_q8_0_gate_up_swiglu_fused: MetalPipelineState,
+    pub(crate) dequant_tiled_matmul_q8_0_gate_up_swiglu_fused_aligned: MetalPipelineState,
+
+    // packed-layout Q8_0 kernels. Consume runtime-repacked stripe SoA
+    // weight buffers (see `metal/repack_q8.rs`). Both BC and aligned variants
+    // are registered so the dispatch site can pick the fast path when M/N/K
+    // are aligned to the tile dimensions.
+    pub(crate) dequant_tiled_matmul_q8_0_k64_residual_batched_packed: MetalPipelineState,
+    pub(crate) dequant_tiled_matmul_q8_0_k64_residual_batched_packed_aligned: MetalPipelineState,
+    pub(crate) dequant_tiled_matmul_q8_0_gate_up_swiglu_fused_packed: MetalPipelineState,
+    pub(crate) dequant_tiled_matmul_q8_0_gate_up_swiglu_fused_packed_aligned: MetalPipelineState,
+
+    // Q4_0 port of the fused gate+up+SwiGLU kernel.
+    // Same kernel structure; Q4_0 de-interleaved nibble dequant path.
+    pub(crate) dequant_tiled_matmul_q4_0_gate_up_swiglu_fused: MetalPipelineState,
+    pub(crate) dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_aligned: MetalPipelineState,
+
+    // packed-layout Q4_0 kernels. Consume runtime-repacked stripe SoA
+    // weight buffers (see `metal/repack_q4.rs`). Both BC and aligned variants
+    // are registered so the dispatch site can pick the fast path when M/N/K
+    // are aligned to the tile dimensions. Q4 port of.
+    pub(crate) dequant_tiled_matmul_q4_0_k64_residual_batched_packed: MetalPipelineState,
+    pub(crate) dequant_tiled_matmul_q4_0_k64_residual_batched_packed_aligned: MetalPipelineState,
+    pub(crate) dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed: MetalPipelineState,
+    pub(crate) dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed_aligned: MetalPipelineState,
+
+    // ggml-metal ported Q8_0 GEMM (gated by LUMEN_METAL_GEMM_GGML_PORT=1).
+    // Adapted from ggml-org/ggml `kernel_mul_mm_q8_0_f32` — MIT.
+    // See `shaders/gemm_q8_0_ported.msl`.
+    pub(crate) kernel_mul_mm_q8_0_f32_ported: MetalPipelineState,
 
     // Function-constant-specialized GEMM variants (BC_M=false, BC_N=false, BC_K=false).
     // Used when M, N, K are all aligned to tile dimensions, eliminating all
@@ -141,6 +212,40 @@ pub(crate) struct MetalPipelines {
     pub(crate) dequant_tiled_matmul_q4_0_k64_residual_batched_aligned: MetalPipelineState,
     pub(crate) tiled_matmul_f16_k64_aligned: MetalPipelineState,
     pub(crate) tiled_matmul_f16_k64_residual_aligned: MetalPipelineState,
+    // BF16 aligned (FC_BC_*=false) variants for prefill GEMM on
+    // aligned dimensions. Dead-code-eliminates all per-element boundary
+    // checks for the typical Qwen3.5-9B dims (hidden=4096, ffn=12288).
+    pub(crate) tiled_matmul_bf16_k64_aligned: MetalPipelineState,
+    pub(crate) tiled_matmul_bf16_k64_residual_aligned: MetalPipelineState,
+
+    // BF16 port of the fused gate+up+SwiGLU kernel.
+    // Same kernel structure as the Q8 variant but operates on BF16 weights
+    // via simdgroup_bfloat8x8 MMA. Eliminates the 3-dispatch
+    // (gate / up / swiglu_batched) chain on the BF16 FFN prefill path.
+    pub(crate) bf16_matmul_gate_up_swiglu_fused: MetalPipelineState,
+    pub(crate) bf16_matmul_gate_up_swiglu_fused_aligned: MetalPipelineState,
+
+    // NR microtile sweep variants of the BF16 fused gate+up+SwiGLU
+    // kernel. NR refers to the number of 8x8 simdgroup MMA accumulator rows
+    // owned per simdgroup along the M axis. Baseline above is NR=2 (mc[2][2]).
+    //   - NR=1 (TILE_M=16): shmem 10 KB, 3 TG/CU at M3 knee. Probes lower
+    //     M-tile / higher occupancy.
+    //   - NR=4 (TILE_M=64): shmem 16 KB, 1 TG/CU at M3 knee. Probes higher
+    //     M-tile / better weight-load amortisation.
+    // Selected at dispatch time via `LUMEN_METAL_BF16_GATE_UP_NR=<1|2|4>` env
+    // var (default 2 = baseline). Each variant has BC + aligned function-const
+    // pipelines mirroring the baseline.
+    pub(crate) bf16_matmul_gate_up_swiglu_fused_nr1: MetalPipelineState,
+    pub(crate) bf16_matmul_gate_up_swiglu_fused_nr1_aligned: MetalPipelineState,
+    pub(crate) bf16_matmul_gate_up_swiglu_fused_nr4: MetalPipelineState,
+    pub(crate) bf16_matmul_gate_up_swiglu_fused_nr4_aligned: MetalPipelineState,
+
+    // BF16 K64 Split-K GEMM. Pairs with the existing
+    // reduce_splitk_add_residual (which is quant-agnostic and operates on F32
+    // partials) to deliver a Split-K FFN-down path for BF16. Same dispatch
+    // pattern as the Q8 variant; only the B-tile load differs (u16->bfloat).
+    pub(crate) bf16_matmul_k64_splitk: MetalPipelineState,
+    pub(crate) bf16_matmul_k64_splitk_aligned: MetalPipelineState,
 
     // Batched prefill kernels
     pub(crate) tiled_matmul_f32: MetalPipelineState,
@@ -151,11 +256,14 @@ pub(crate) struct MetalPipelines {
     pub(crate) rope_batched: MetalPipelineState,
     pub(crate) rope_batched_neox: Option<MetalPipelineState>,
     pub(crate) add_residual_batched: MetalPipelineState,
+    /// Determinism diagnostic: zero a half buffer (scores-buffer clear).
+    pub(crate) memset_half_zero: MetalPipelineState,
     pub(crate) swiglu_batched: MetalPipelineState,
     pub(crate) embed_tokens_batched: MetalPipelineState,
     pub(crate) embed_tokens_batched_q8_0: MetalPipelineState,
     pub(crate) embed_tokens_batched_q4_0: MetalPipelineState,
     pub(crate) embed_tokens_batched_f16: MetalPipelineState,
+    pub(crate) embed_tokens_batched_bf16: MetalPipelineState,
     pub(crate) kv_cache_write_batched: MetalPipelineState,
     pub(crate) v_cache_write_batched: MetalPipelineState,
     pub(crate) attention_scores_batched: MetalPipelineState,
@@ -173,6 +281,10 @@ pub(crate) struct MetalPipelines {
     // Fused RMSNorm + F16 matvec NR2 (eliminates separate RMSNorm dispatch)
     pub(crate) rmsnorm_matmul_f16_deferred_nr2: MetalPipelineState,
     pub(crate) rmsnorm_matmul_f16_deferred_residual_nr2: MetalPipelineState,
+    // Fused RMSNorm + BF16 matvec NR2. Same dispatch shape as the
+    // F16 fused variant; weights read as bfloat instead of half.
+    pub(crate) rmsnorm_matmul_bf16_deferred_nr2: MetalPipelineState,
+    pub(crate) rmsnorm_matmul_bf16_deferred_residual_nr2: MetalPipelineState,
     // Fused RMSNorm + FFN Gate+Up+SwiGLU Q8_0 deferred
     pub(crate) rmsnorm_ffn_fused_gate_up_swiglu_q8_0_deferred: MetalPipelineState,
     // Fused RMSNorm + FFN Gate+Up+SwiGLU Q8_0 8-row (8 SGs, zero barriers)
@@ -289,10 +401,20 @@ pub(crate) struct MetalPipelines {
     pub(crate) gdn_prefill_fused: Option<MetalPipelineState>,
     pub(crate) gdn_prefill_fused_v2: Option<MetalPipelineState>,
     pub(crate) gdn_prefill_fused_v3_chunked: Option<MetalPipelineState>,
+    /// (32, NSG=4, 1) threadgroup geometry for Phase 2a — 1024 TGs
+    /// of 128 threads (4 simdgroups per TG) instead of 4096 TGs of 32
+    /// threads. Algorithmically bit-identical to `gdn_prefill_fused_v3_
+    /// chunked`. Each TG owns 4 consecutive rows of state and the 4
+    /// simdgroups share Q/K HBM fetches via L1. Opt-in via
+    /// `LUMEN_METAL_GDN_PHASE2A_NSG4=1`.
+    pub(crate) gdn_prefill_fused_v3_chunked_nsg4: Option<MetalPipelineState>,
     pub(crate) gdn_prefill_norm_gate: Option<MetalPipelineState>,
     pub(crate) ssm_conv1d_prefill: Option<MetalPipelineState>,
     pub(crate) ssm_conv1d_silu_prefill: Option<MetalPipelineState>,
     pub(crate) ssm_conv1d_silu_prefill_parallel: Option<MetalPipelineState>,
+    /// Determinism fix: race-free conv_state update, dispatched after the
+    /// token-parallel conv1d compute (separated by a barrier).
+    pub(crate) ssm_conv1d_state_update: Option<MetalPipelineState>,
     pub(crate) l2_normalize_heads_batched: Option<MetalPipelineState>,
     pub(crate) l2_normalize_qk_strided: Option<MetalPipelineState>,
     pub(crate) gdn_compute_gates_batched: Option<MetalPipelineState>,
@@ -350,9 +472,9 @@ pub(crate) struct CachedLayerMeta {
 
     // -- Separate K/V weight offsets (Qwen3.5 full-attention layers) --
     // For full-attention layers where Q+gate are fused in wq (attn_q.weight produces
-    // q_dim+q_dim outputs = Q + gate), K and V must be projected separately.
+    // q_dim+q_dim outputs = Q +), K and V must be projected separately.
     // When has_qgate_fusion is true:
-    //   - wq_off points to attn_q.weight (output dim = 2*q_dim = Q + gate)
+    //   - wq_off points to attn_q.weight (output dim = 2*q_dim = Q +)
     //   - wk_off/wv_off point to separate attn_k.weight / attn_v.weight
     //   - The decode path projects Q+gate, K, V separately and applies sigmoid gate.
     pub(crate) has_qgate_fusion: bool,
@@ -530,6 +652,33 @@ pub(crate) struct MetalScratch {
     pub(crate) batch_down_buf: Option<MetalBuffer>,       // [batch, hidden_dim]
     pub(crate) batch_scores_buf: Option<MetalBuffer>,     // [batch, num_heads, max_seq_len]
     pub(crate) splitk_partial_buf: Option<MetalBuffer>,   // [K_SPLITS * max_M * max_N] floats for Split-K
+
+    // ====================================================================
+    // de-aliased GDN scratch buffers
+    // ====================================================================
+    // The legacy GDN prefill (`encode_batched_gdn_prefill`) packs four
+    // semantic roles into `batch_qkv_buf` (Phase 1 QKV output, Phase 2a
+    // raw_out write, Phase 2b ssm_in write, Phase 3 ssm_in read) and three
+    // roles into the alpha/beta/conv_out scratch slice. Apple's hazard
+    // tracker on `MTLDispatchTypeConcurrent` is whole-MTLBuffer granularity
+    // any consumer of one role inherits the
+    // producer-retirement stall of all roles on the same buffer.
+    //
+    // the path splits the multi-role buffers into separate MTLBuffers
+    // so resource-scoped barriers (`memoryBarrierWithResources:`) can scope
+    // each barrier to just the buffer the next phase actually reads. The
+    // four scratch buffers below cover the GDN dispatch chain; legacy
+    // `batch_qkv_buf` continues to hold the Phase 1 QKV GEMM output (the
+    // sole role on `qkv_buf` once de-aliased).
+    //
+    // Allocated only when the GDN concurrent-encoder path is enabled
+    // (`LUMEN_METAL_GDN_CONCURRENT_ENCODER=1`). Default OFF preserves legacy behaviour.
+    pub(crate) batch_gdn_raw_out_buf: Option<MetalBuffer>,   // [batch * q_dim] Phase 2a state-update output
+    pub(crate) batch_gdn_ssm_in_buf: Option<MetalBuffer>,    // [batch * q_dim] Phase 2b ssm_in / Phase 3 input
+    pub(crate) batch_gdn_alpha_buf: Option<MetalBuffer>,     // [batch * num_heads] alpha gate (Phase 1 -> Phase 2a)
+    pub(crate) batch_gdn_beta_buf: Option<MetalBuffer>,      // [batch * num_heads] beta gate (Phase 1 -> Phase 2a)
+    pub(crate) batch_gdn_conv_out_buf: Option<MetalBuffer>,  // [batch * qkv_dim] post-conv1d SiLU+L2-normalized QKV
+
     pub(crate) splitk_alloc_elems: usize,                 // tracks allocated Split-K buffer capacity (in floats)
     pub(crate) current_max_batch: usize,                  // tracks allocated batch size
 
@@ -663,4 +812,55 @@ pub(crate) struct MetalScratch {
     /// Maps layer_idx -> gdn_idx for streaming path lazy allocation.
     /// Empty until first GDN layer encountered in compute_layer.
     pub(crate) gdn_layer_idx_map: Vec<Option<usize>>,
+
+    // ========================================================================
+    // Runtime Q8_0 hot-weight repack storage.
+    // ========================================================================
+    //
+    // When `LUMEN_METAL_Q8_REPACKED=1` is set at load time, the following
+    // buffers hold repacked copies of hot FFN tensors in a stripe SoA layout
+    // (see `repack_q8.rs` for the exact byte layout). The repacked kernels
+    // (`*_packed`) consume these buffers; the original buffers + AoS kernels
+    // remain available as a fallback.
+    //
+    // Indexed by layer_idx. `None` entries indicate the layer is not eligible
+    // (e.g. quant != Q8_0, or repack disabled, or dimensions misaligned).
+    //
+    // Allocated once at `preload_weights_gpu_resident` time. Stays alive for
+    // the lifetime of the backend instance.
+
+    /// Per-layer FFN-down (`w_down`) repacked Q8_0 buffer.
+    /// Shape per layer: same bytes as raw Q8_0, restructured into stripes of
+    /// 32 rows × 32 K-elements. Set when `LUMEN_METAL_Q8_REPACKED_FFN_DOWN=1`.
+    pub(crate) repacked_ffn_down: Vec<Option<MetalBuffer>>,
+    /// Per-layer FFN gate+up pair-packed Q8_0 buffer.
+    /// Shape per layer: 2× the bytes of a single FFN-gate or FFN-up tensor,
+    /// holding both gate and up in an interleaved SoA stripe layout.
+    /// Set when `LUMEN_METAL_Q8_REPACKED_GATE_UP=1`.
+    pub(crate) repacked_ffn_gate_up: Vec<Option<MetalBuffer>>,
+
+    // Q4_0 port of — runtime hot-weight repack for FFN tensors.
+    // Identical semantics to `repacked_ffn_down` / `repacked_ffn_gate_up` above,
+    // but for Q4_0 quant. The Q4 stripe layout uses 18-byte source blocks (vs
+    // Q8's 34 bytes), so the packed stride differs (576 vs 1088 bytes per
+    // single-tensor (row_group, k_block); 1152 vs 2176 for pair-packed).
+    //
+    // Allocated when `LUMEN_METAL_Q4_REPACKED=1` is set at load time.
+
+    /// Per-layer FFN-down (`w_down`) repacked Q4_0 buffer.
+    /// Set when `LUMEN_METAL_Q4_REPACKED_FFN_DOWN=1`.
+    pub(crate) repacked_ffn_down_q4: Vec<Option<MetalBuffer>>,
+    /// Per-layer FFN gate+up pair-packed Q4_0 buffer.
+    /// Set when `LUMEN_METAL_Q4_REPACKED_GATE_UP=1`.
+    pub(crate) repacked_ffn_gate_up_q4: Vec<Option<MetalBuffer>>,
+
+    // BF16 GDN qkv-proj + attn-gate-proj concat-then-stripe repacked buffer.
+    // Per-layer entry contains both projections in a single Metal buffer of size
+    // `(qkv_n + gate_n) * hidden_dim * 2` bytes, byte-permuted into the
+    // stripe layout. Only populated for the 24 GDN layers in Qwen3.5-9B (layers
+    // where `attn_gate_off` is Some). VRAM ~2.3 GB for the full set, well under
+    // the 4.8 GB Apple AGX TLB threshold.
+    //
+    // Set when `LUMEN_METAL_BF16_GDN_QKV_GATE_PAIRED=1`.
+    pub(crate) repacked_gdn_qkv_gate_bf16: Vec<Option<MetalBuffer>>,
 }

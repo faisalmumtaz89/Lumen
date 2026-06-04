@@ -131,6 +131,51 @@ pub struct InferenceMetrics {
 
     /// Peak memory usage in bytes (weights + KV + activations + scratch).
     pub peak_memory_bytes: u64,
+
+    /// KV cache telemetry captured at the end of generation.
+    ///
+    /// Populated by the engine path when it observes the live `KvCache`.
+    /// Library callers that bypass the engine (direct `Session` use) can fill
+    /// this manually via [`InferenceMetrics::with_kv`].
+    pub kv: KvCacheStats,
+}
+
+/// Snapshot of the KV cache size + position at the end of an inference
+/// session.
+///
+/// Fields are unsigned so the type can be embedded directly in
+/// [`InferenceMetrics`] without `Option` overhead. Default = zeros, which
+/// matches "no KV reported" semantics for non-engine callers.
+///
+/// `allocated_bytes` is the constant pre-allocated capacity (matches
+/// `KvCache::allocated_bytes`); `used_bytes` is the live byte count that
+/// scales with `seq_len` (matches `KvCache::total_bytes`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KvCacheStats {
+    /// Pre-allocated CPU-side capacity in bytes.
+    /// Disk-KV `save_atomic` writes exactly this many bytes.
+    pub allocated_bytes: u64,
+
+    /// Live byte count (scales with `seq_len`).
+    pub used_bytes: u64,
+
+    /// Current sequence length in tokens.
+    pub seq_len: usize,
+
+    /// Maximum sequence length the cache was sized for.
+    pub max_seq_len: usize,
+}
+
+impl KvCacheStats {
+    /// Capture a stats snapshot from a live [`crate::kv::KvCache`].
+    pub fn from_kv(kv: &crate::kv::KvCache) -> Self {
+        Self {
+            allocated_bytes: kv.allocated_bytes(),
+            used_bytes: kv.total_bytes(),
+            seq_len: kv.seq_len(),
+            max_seq_len: kv.max_seq_len(),
+        }
+    }
 }
 
 impl InferenceMetrics {
@@ -152,6 +197,7 @@ impl InferenceMetrics {
              Decode:  {:.1} tok/s, TPOT: {:.1}ms\n\
              I/O:     read {:.2} GiB/s, avg request {:.0} KiB\n\
              Cache:   weight hit rate {:.1}%\n\
+             KV:      {}/{} tok, {:.1}/{:.1} MiB (used/allocated)\n\
              Memory:  peak {:.1} MiB",
             self.prompt_tokens,
             self.generated_tokens,
@@ -162,8 +208,20 @@ impl InferenceMetrics {
             self.io.read_bandwidth_gibs(),
             self.io.avg_read_size() / 1024.0,
             self.weight_cache_hit_rate * 100.0,
+            self.kv.seq_len,
+            self.kv.max_seq_len,
+            self.kv.used_bytes as f64 / (1024.0 * 1024.0),
+            self.kv.allocated_bytes as f64 / (1024.0 * 1024.0),
             self.peak_memory_bytes as f64 / (1024.0 * 1024.0),
         )
+    }
+
+    /// Attach a KV cache snapshot, consuming and returning `self` for use in
+    /// the `..InferenceMetrics::default()` builder pattern. Most call-sites
+    /// will instead set the `kv` field directly via the struct literal.
+    pub fn with_kv(mut self, kv_stats: KvCacheStats) -> Self {
+        self.kv = kv_stats;
+        self
     }
 }
 
@@ -214,5 +272,269 @@ mod tests {
         let s = m.summary();
         assert!(!s.is_empty());
         assert!(s.contains("Prompt:"));
+    }
+
+    // ---- KV telemetry tests ----
+
+    #[test]
+    fn kv_cache_stats_default_is_zero() {
+        let s = KvCacheStats::default();
+        assert_eq!(s.allocated_bytes, 0);
+        assert_eq!(s.used_bytes, 0);
+        assert_eq!(s.seq_len, 0);
+        assert_eq!(s.max_seq_len, 0);
+    }
+
+    #[test]
+    fn kv_cache_stats_from_kv_matches_kv_methods() {
+        use crate::kv::{KvCache, KvCacheConfig, KvPrecision};
+        let cfg = KvCacheConfig {
+            max_seq_len: 64,
+            num_layers: 4,
+            num_kv_heads: 2,
+            head_dim: 8,
+            precision: KvPrecision::F32,
+        };
+        let mut kv = KvCache::new(cfg).unwrap();
+        // Empty cache: used = 0, allocated = full capacity.
+        let s = KvCacheStats::from_kv(&kv);
+        assert_eq!(s.seq_len, 0);
+        assert_eq!(s.max_seq_len, 64);
+        assert_eq!(s.used_bytes, 0);
+        assert_eq!(s.allocated_bytes, kv.allocated_bytes());
+        // Allocated is constant; used grows with seq_len.
+        kv.advance_seq_len().unwrap();
+        kv.advance_seq_len().unwrap();
+        let s2 = KvCacheStats::from_kv(&kv);
+        assert_eq!(s2.seq_len, 2);
+        assert_eq!(s2.allocated_bytes, s.allocated_bytes);
+        assert!(s2.used_bytes > 0);
+        assert!(s2.used_bytes < s2.allocated_bytes);
+    }
+
+    #[test]
+    fn inference_metrics_with_kv_round_trips() {
+        let stats = KvCacheStats {
+            allocated_bytes: 4096,
+            used_bytes: 256,
+            seq_len: 4,
+            max_seq_len: 64,
+        };
+        let m = InferenceMetrics::default().with_kv(stats.clone());
+        assert_eq!(m.kv, stats);
+    }
+
+    #[test]
+    fn inference_metrics_summary_contains_kv_section() {
+        let stats = KvCacheStats {
+            allocated_bytes: 4096,
+            used_bytes: 256,
+            seq_len: 4,
+            max_seq_len: 64,
+        };
+        let m = InferenceMetrics::default().with_kv(stats);
+        let s = m.summary();
+        assert!(s.contains("KV:"), "summary must report KV: {s}");
+        assert!(s.contains("4/64"), "summary must report seq_len/max_seq_len: {s}");
+    }
+
+    // ---- per-component server memory breakdown tests ----
+
+    #[test]
+    fn server_memory_breakdown_default_is_zero() {
+        let b = ServerMemoryBreakdown::default();
+        assert_eq!(b.kv_used_bytes, 0);
+        assert_eq!(b.kv_allocated_bytes, 0);
+        assert_eq!(b.kv_seq_len, 0);
+        assert_eq!(b.kv_max_seq_len, 0);
+        assert_eq!(b.session_tokens_len, 0);
+        assert_eq!(b.session_pending_logits_bytes, 0);
+        assert_eq!(b.session_timings_bytes, 0);
+        assert_eq!(b.metal_current_allocated_bytes, 0);
+        assert_eq!(b.tokio_active_tasks, 0);
+        assert_eq!(b.engine_inbox_capacity, 0);
+        assert_eq!(b.engine_inbox_len, 0);
+        assert_eq!(b.disk_kv_used_bytes, 0);
+        assert_eq!(b.update_count, 0);
+        assert_eq!(b.last_update_unix, 0);
+    }
+
+    #[test]
+    fn server_memory_breakdown_to_json_keys_are_stable() {
+        // The soak harness sampler parses this JSON shape into JSONL, so the
+        // key set is load-bearing.  Pin every key here so a future field
+        // rename forces a test update + soak-harness update in lock-step.
+        let mut b = ServerMemoryBreakdown::default();
+        b.kv_used_bytes = 1_000;
+        b.kv_allocated_bytes = 2_000;
+        b.kv_seq_len = 3;
+        b.kv_max_seq_len = 4;
+        b.session_tokens_len = 5;
+        b.session_pending_logits_bytes = 6;
+        b.session_timings_bytes = 7;
+        b.metal_current_allocated_bytes = 8;
+        b.tokio_active_tasks = 9;
+        b.engine_inbox_capacity = 10;
+        b.engine_inbox_len = 11;
+        b.disk_kv_used_bytes = 12;
+        b.update_count = 13;
+        b.last_update_unix = 14;
+        let s = b.to_jsonl();
+        for k in [
+            "kv_used_bytes", "kv_allocated_bytes", "kv_seq_len", "kv_max_seq_len",
+            "session_tokens_len", "session_pending_logits_bytes", "session_timings_bytes",
+            "metal_current_allocated_bytes", "tokio_active_tasks",
+            "engine_inbox_capacity", "engine_inbox_len",
+            "disk_kv_used_bytes", "update_count", "last_update_unix",
+        ] {
+            assert!(
+                s.contains(&format!("\"{}\":", k)),
+                "ServerMemoryBreakdown.to_jsonl missing key {k:?}; got {s}",
+            );
+        }
+        // Spot-check a value to catch field/value cross-wiring.
+        assert!(
+            s.contains("\"kv_used_bytes\":1000"),
+            "ServerMemoryBreakdown.to_jsonl wired kv_used_bytes wrong: {s}",
+        );
+        // Output must be a single line with no embedded newlines so the
+        // soak harness can append it directly to a JSONL file.
+        assert!(!s.contains('\n'), "to_jsonl must be single-line: {s}");
+        // Output must start with `{` and end with `}` so the JSONL is
+        // well-formed without needing string-trimming.
+        assert!(s.starts_with('{') && s.ends_with('}'), "malformed JSON: {s}");
+    }
+}
+
+// =====================================================================
+// ServerMemoryBreakdown — per-component RSS attribution
+// =====================================================================
+//
+// lumen-server soak background: found RSS growing at +6.5%/h.
+// RSS is a single number — it cannot tell us which component is
+// leaking. This struct adds a per-component breakdown that the soak harness
+// samples alongside RSS on the same 30 s cadence, so the evaluation
+// phase can attribute growth to one of the 7 hypothesis classes:
+// (KV bytes, scratch pool, pipeline cache, Tokio tasks,
+// sampler map, mmap'd file bytes, MTLBuffer pool).
+//
+// Default-path constraints:
+//
+// - The struct lives in lumen-runtime (already a public surface for
+//   telemetry).
+// - All field reads are O(1) snapshots (atomic loads / single Mutex peek)
+//   so the breakdown sampler does not contend with the engine hot path.
+// - The struct + its `to_jsonl()` are public so the soak harness can
+//   capture them.  The HTTP `/debug/memory_breakdown` endpoint that
+//   actually serves the JSON is env-gated in `lumen-server` (returns
+//   404 when disabled), so the default path is byte-identical.
+
+/// Snapshot of the lumen-server's per-component memory residency.
+///
+/// Fields cover the 7 hypothesis classes from plus secondary
+/// counters (engine inbox depth, update count) that are useful for ruling
+/// out "did the sampler actually fire?" sanity questions.
+///
+/// Field semantics:
+///
+/// - `kv_*` mirror [`KvCacheStats`] for the single live `Session` the
+///   `EngineWorker` holds.
+/// - `session_tokens_len` is `session.tokens.len()`; multiplied by 4
+///   gives the token-vector heap footprint.  Stored as token count (not
+///   bytes) because the operator usually wants to spot the runaway pattern
+///   ("tokens never decay") more than the exact byte total.
+/// - `session_pending_logits_bytes` is the byte cost of the `pending_logits`
+///   buffer (vocab_size × 4 bytes when present, 0 when None).
+/// - `session_timings_bytes` is `timings.len() * size_of::<PerLayerTiming>()`
+///   — should be zero in production (per-layer timings off by default) but
+///   we report it so a misconfiguration is visible.
+/// - `metal_current_allocated_bytes` is what `MTLDevice.currentAllocatedSize`
+///   returns on Apple Silicon — total bytes outstanding for all MTLBuffer
+///   MTLTexture / MTLHeap objects this process holds. 0 on non-Metal
+///   backends.
+/// - `tokio_active_tasks` is the Tokio runtime's `metrics().num_alive_tasks()`
+///   when available; 0 if the metrics surface is unbuildable (Tokio < 1.34
+///   or `tokio_unstable` not enabled).
+/// - `engine_inbox_capacity` / `engine_inbox_len` are the mpsc job inbox
+///   stats: capacity is constant (16 by default), len is "jobs waiting" —
+///   should oscillate at low single digits in a healthy system.
+/// - `disk_kv_used_bytes` re-reads the disk-KV directory size.  Already
+///   tracked by the soak harness's `dir_size_bytes`; we mirror it here so
+///   the breakdown JSON is self-contained.
+/// - `update_count` is incremented once per breakdown refresh; the soak
+///   harness uses this to detect "snapshot got stale" (the breakdown only
+///   updates after a job completes; a quiet inbox produces a stale
+///   snapshot).
+/// - `last_update_unix` is the wall-clock time of the most recent refresh.
+///
+/// The struct is `Default` so a fresh `EngineWorker` starts with all
+/// zeros, and serializes to a single-line JSON via `to_jsonl()` for
+/// direct append to the soak harness's `soak-breakdown.jsonl` artifact.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerMemoryBreakdown {
+    // ---- Hypothesis class 1: KvCache bytes ----
+    pub kv_used_bytes: u64,
+    pub kv_allocated_bytes: u64,
+    pub kv_seq_len: usize,
+    pub kv_max_seq_len: usize,
+
+    // ---- Hypothesis class 2 + 5: Session-owned Rust state (tokens,
+    //      logits, timings — these are the per-Session structures most
+    //      likely to grow without bound under repeated extend_with_cache).
+    pub session_tokens_len: usize,
+    pub session_pending_logits_bytes: u64,
+    pub session_timings_bytes: u64,
+
+    // ---- Hypothesis class 3 + 7: Metal driver residency. ----
+    // The driver counts MTLBuffer / MTLTexture / MTLHeap objects for the
+    // calling process group.  If `MetalScratch` is leaking buffers this
+    // number rises monotonically.  If it stays flat the leak is in the
+    // Rust heap, not the Metal driver.
+    pub metal_current_allocated_bytes: u64,
+
+    // ---- Hypothesis class 4: Tokio task count ----
+    pub tokio_active_tasks: u64,
+
+    // ---- Engine inbox depth (rule out backpressure starvation) ----
+    pub engine_inbox_capacity: usize,
+    pub engine_inbox_len: usize,
+
+    // ---- Disk-KV byte count (mirrors the soak harness's directory walk) ----
+    pub disk_kv_used_bytes: u64,
+
+    // ---- Sampler heartbeat ----
+    pub update_count: u64,
+    pub last_update_unix: u64,
+}
+
+impl ServerMemoryBreakdown {
+    /// Serialise this breakdown as one JSONL line.
+    ///
+    /// Output: `{"kv_used_bytes":..,...,"last_update_unix":..}` with no
+    /// embedded newline (the soak harness appends one itself).  Numeric
+    /// formatting matches `serde_json` defaults (no thousands separators,
+    /// integers without decimals).
+    ///
+    /// The JSON keys are pinned by
+    /// `server_memory_breakdown_to_json_keys_are_stable` so renames force
+    /// a soak-harness update in lock-step.
+    pub fn to_jsonl(&self) -> String {
+        format!(
+            r#"{{"kv_used_bytes":{},"kv_allocated_bytes":{},"kv_seq_len":{},"kv_max_seq_len":{},"session_tokens_len":{},"session_pending_logits_bytes":{},"session_timings_bytes":{},"metal_current_allocated_bytes":{},"tokio_active_tasks":{},"engine_inbox_capacity":{},"engine_inbox_len":{},"disk_kv_used_bytes":{},"update_count":{},"last_update_unix":{}}}"#,
+            self.kv_used_bytes,
+            self.kv_allocated_bytes,
+            self.kv_seq_len,
+            self.kv_max_seq_len,
+            self.session_tokens_len,
+            self.session_pending_logits_bytes,
+            self.session_timings_bytes,
+            self.metal_current_allocated_bytes,
+            self.tokio_active_tasks,
+            self.engine_inbox_capacity,
+            self.engine_inbox_len,
+            self.disk_kv_used_bytes,
+            self.update_count,
+            self.last_update_unix,
+        )
     }
 }

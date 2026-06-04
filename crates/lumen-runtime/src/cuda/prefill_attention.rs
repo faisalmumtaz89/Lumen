@@ -10,14 +10,14 @@
 //! (which dominate time) are already batched. This module isolates the attention
 //! loop to keep `backend_impl` focused on orchestration.
 
-use cudarc::driver::{CudaSlice, LaunchConfig as CudarcLaunchConfig, PushKernelArg};
+use cudarc::driver::CudaSlice;
 
 use crate::error::RuntimeError;
 
-use super::decode::{KernelSet, attention_block_size, attention_shared_bytes};
+use super::decode::KernelSet;
 use super::ffi::CudaDevice;
 use super::kv_cache::KvCacheGpu;
-use super::prefill::{launch_extract_row, launch_scatter_row};
+use super::prefill::{launch_attention_decode_gated, launch_extract_row, launch_scatter_row};
 
 /// Run causal attention for all tokens in a prefill batch.
 ///
@@ -108,14 +108,11 @@ pub fn prefill_attention_sequential(
             launch_extract_row(device, kernels, q_batch, q_single, t, q_dim)?;
         }
 
-        // 2. Run attention_decode for this single token against the KV cache.
-        let block_size = attention_block_size(seq_len);
-        let shared_bytes = attention_shared_bytes(seq_len as u32);
-        let launch_cfg = CudarcLaunchConfig {
-            grid_dim: (num_heads as u32, 1, 1),
-            block_dim: (block_size, 1, 1),
-            shared_mem_bytes: shared_bytes,
-        };
+        // 2. Run decode-attention for this single token against the KV cache.
+        // gate: routes to the tiled streaming-softmax kernel at long
+        // context. Byte-identical to the prior single-block dispatch when
+        // the gate selects SingleBlock (the default for typical prefill shapes
+        // within the single-block ceiling).
         let nh = num_heads as u32;
         let nkvh = num_kv_heads as u32;
         let hd = head_dim as u32;
@@ -123,25 +120,25 @@ pub fn prefill_attention_sequential(
         let msl = kv_cache.max_seq_len as u32;
 
         unsafe {
-            device
-                .stream
-                .launch_builder(&kernels.attention_decode)
-                .arg(q_single as &CudaSlice<f32>)
-                .arg(&kv_cache.k_cache)
-                .arg(&kv_cache.v_cache)
-                .arg(&mut *attn_out_single)
-                .arg(&nh)
-                .arg(&nkvh)
-                .arg(&hd)
-                .arg(&sl)
-                .arg(&msl)
-                .arg(&scale)
-                .launch(launch_cfg)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!(
-                        "attention_decode prefill t={t} seq_len={seq_len}: {e}"
-                    ))
-                })?;
+            launch_attention_decode_gated(
+                device,
+                kernels,
+                q_single as &CudaSlice<f32>,
+                &kv_cache.k_cache,
+                &kv_cache.v_cache,
+                &mut *attn_out_single,
+                nh,
+                nkvh,
+                hd,
+                sl,
+                msl,
+                scale,
+            )
+            .map_err(|e| {
+                RuntimeError::Compute(format!(
+                    "attention_decode prefill t={t} seq_len={seq_len}: {e}"
+                ))
+            })?;
         }
 
         // 3. Scatter-write the attention output back into the batch matrix.
@@ -973,6 +970,278 @@ mod tests {
             );
         }
         eprintln!("flash_v2 vs sequential: max diff = {max_diff:.6e}");
+    }
+
+    // ------------------------------------------------------------------
+    // FA2 block-skip + Split-K tests
+    // ------------------------------------------------------------------
+
+    /// FA2 mask block-skip must agree with the existing FA v2 kernel for a
+    /// medium-length batch (well below the Split-K threshold). The two paths
+    /// run on the same data; their outputs must match to within the same
+    /// 1e-3 tolerance as the v2-vs-sequential comparison.
+    #[test]
+    fn test_fa2_blockskip_matches_flash_v2() {
+        if super::super::ffi::device_count().unwrap_or(0) == 0 {
+            eprintln!("Skipping test: no CUDA device");
+            return;
+        }
+        let device = match super::super::ffi::CudaDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("Skipping: device init: {e}"); return; }
+        };
+        let kernels = match super::super::decode::compile_all_kernels(&device) {
+            Ok(k) => k,
+            Err(e) => { eprintln!("Skipping: compile: {e}"); return; }
+        };
+        if kernels.flash_attention_fa2_causal.is_none() {
+            eprintln!("Skipping: flash_attention_fa2_causal not loaded");
+            return;
+        }
+
+        let batch = 12;
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 16;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let pos_start = 0;
+        let max_seq_len = 32;
+
+        let q_data: Vec<f32> = (0..batch * q_dim)
+            .map(|i| ((i as f32) * 0.13 + 0.4).sin())
+            .collect();
+        let k_data: Vec<f32> = (0..batch * kv_dim)
+            .map(|i| ((i as f32) * 0.07 + 0.9).cos())
+            .collect();
+        let v_data: Vec<f32> = (0..batch * kv_dim)
+            .map(|i| ((i as f32) * 0.09 + 1.4).sin())
+            .collect();
+
+        let mut kv_cache = KvCacheGpu::new(
+            &device, num_kv_heads, max_seq_len, head_dim,
+        ).unwrap();
+        for t in 0..batch {
+            let k_gpu = device.htod_copy(&k_data[t * kv_dim..(t + 1) * kv_dim]).unwrap();
+            let v_gpu = device.htod_copy(&v_data[t * kv_dim..(t + 1) * kv_dim]).unwrap();
+            kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
+        }
+
+        let q_batch = device.htod_copy(&q_data).unwrap();
+
+        // Reference: existing flash_attention_v2 (Br=1 streaming softmax).
+        let mut ref_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
+        unsafe {
+            super::super::prefill::launch_flash_attention_v2(
+                &device, &kernels, &q_batch, &kv_cache, &mut ref_out,
+                batch, num_heads, num_kv_heads, head_dim, pos_start,
+            ).unwrap();
+        }
+        device.synchronize().unwrap();
+        let ref_results = device.dtoh_copy(&ref_out).unwrap();
+
+        // FA2 with block-skip.
+        let mut fa2_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
+        unsafe {
+            super::super::prefill::launch_flash_attention_fa2(
+                &device, &kernels, &q_batch, &kv_cache, &mut fa2_out,
+                batch, num_heads, num_kv_heads, head_dim, pos_start,
+            ).unwrap();
+        }
+        device.synchronize().unwrap();
+        let fa2_results = device.dtoh_copy(&fa2_out).unwrap();
+
+        let mut max_diff = 0.0f32;
+        for i in 0..ref_results.len() {
+            let diff = (ref_results[i] - fa2_results[i]).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 1e-3,
+                "fa2_blockskip vs flash_v2 mismatch at index {i}: \
+                 ref={}, fa2={}, diff={diff}",
+                ref_results[i], fa2_results[i],
+            );
+        }
+        eprintln!("fa2_blockskip vs flash_v2: max diff = {max_diff:.6e}");
+    }
+
+    /// FA2 with non-zero `pos_start` must produce the same answer as the
+    /// reference. Exercises the suffix-prefill path over the new
+    /// kernel: 8 fresh queries continue a 24-token prefix.
+    #[test]
+    fn test_fa2_blockskip_with_pos_offset() {
+        if super::super::ffi::device_count().unwrap_or(0) == 0 {
+            eprintln!("Skipping test: no CUDA device");
+            return;
+        }
+        let device = match super::super::ffi::CudaDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("Skipping: device init: {e}"); return; }
+        };
+        let kernels = match super::super::decode::compile_all_kernels(&device) {
+            Ok(k) => k,
+            Err(e) => { eprintln!("Skipping: compile: {e}"); return; }
+        };
+        if kernels.flash_attention_fa2_causal.is_none() {
+            eprintln!("Skipping: flash_attention_fa2_causal not loaded");
+            return;
+        }
+
+        let pre_existing = 24;
+        let batch = 8;
+        let num_heads = 2;
+        let num_kv_heads = 1;
+        let head_dim = 32;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let pos_start = pre_existing;
+        let max_seq_len = 64;
+
+        let total = pre_existing + batch;
+        let all_k: Vec<f32> = (0..total * kv_dim)
+            .map(|i| ((i as f32) * 0.05 + 0.1).sin())
+            .collect();
+        let all_v: Vec<f32> = (0..total * kv_dim)
+            .map(|i| ((i as f32) * 0.07 + 0.2).cos())
+            .collect();
+
+        let mut kv_cache = KvCacheGpu::new(
+            &device, num_kv_heads, max_seq_len, head_dim,
+        ).unwrap();
+        for t in 0..total {
+            let k_gpu = device.htod_copy(&all_k[t * kv_dim..(t + 1) * kv_dim]).unwrap();
+            let v_gpu = device.htod_copy(&all_v[t * kv_dim..(t + 1) * kv_dim]).unwrap();
+            kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
+        }
+
+        let q_data: Vec<f32> = (0..batch * q_dim)
+            .map(|i| ((i as f32) * 0.21 + 0.7).cos())
+            .collect();
+        let q_batch = device.htod_copy(&q_data).unwrap();
+
+        let mut ref_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
+        unsafe {
+            super::super::prefill::launch_flash_attention_v2(
+                &device, &kernels, &q_batch, &kv_cache, &mut ref_out,
+                batch, num_heads, num_kv_heads, head_dim, pos_start,
+            ).unwrap();
+        }
+        device.synchronize().unwrap();
+        let ref_results = device.dtoh_copy(&ref_out).unwrap();
+
+        let mut fa2_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
+        unsafe {
+            super::super::prefill::launch_flash_attention_fa2(
+                &device, &kernels, &q_batch, &kv_cache, &mut fa2_out,
+                batch, num_heads, num_kv_heads, head_dim, pos_start,
+            ).unwrap();
+        }
+        device.synchronize().unwrap();
+        let fa2_results = device.dtoh_copy(&fa2_out).unwrap();
+
+        let mut max_diff = 0.0f32;
+        for i in 0..ref_results.len() {
+            let diff = (ref_results[i] - fa2_results[i]).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 1e-3,
+                "fa2 pos_offset mismatch at index {i}: \
+                 ref={}, fa2={}, diff={diff}",
+                ref_results[i], fa2_results[i],
+            );
+        }
+        eprintln!("fa2 pos_offset: max diff = {max_diff:.6e}");
+    }
+
+    /// Split-K FA2 must agree with the single-kernel FA2 (and therefore the
+    /// reference flash_v2) for a sequence that crosses the Split-K threshold.
+    /// We use a smaller `slice_size` to force multiple splits even on a
+    /// modest test sequence.
+    #[test]
+    fn test_fa2_splitk_matches_single_kernel() {
+        if super::super::ffi::device_count().unwrap_or(0) == 0 {
+            eprintln!("Skipping test: no CUDA device");
+            return;
+        }
+        let device = match super::super::ffi::CudaDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("Skipping: device init: {e}"); return; }
+        };
+        let kernels = match super::super::decode::compile_all_kernels(&device) {
+            Ok(k) => k,
+            Err(e) => { eprintln!("Skipping: compile: {e}"); return; }
+        };
+        if kernels.flash_attention_fa2_splitk_partial.is_none()
+            || kernels.flash_attention_fa2_splitk_reduce.is_none()
+        {
+            eprintln!("Skipping: split-k kernels not loaded");
+            return;
+        }
+
+        let batch = 6;
+        let num_heads = 2;
+        let num_kv_heads = 1;
+        let head_dim = 16;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let pos_start = 0;
+        let max_seq_len = 32;
+
+        let q_data: Vec<f32> = (0..batch * q_dim)
+            .map(|i| ((i as f32) * 0.17 + 0.3).sin())
+            .collect();
+        let k_data: Vec<f32> = (0..batch * kv_dim)
+            .map(|i| ((i as f32) * 0.06 + 0.4).cos())
+            .collect();
+        let v_data: Vec<f32> = (0..batch * kv_dim)
+            .map(|i| ((i as f32) * 0.08 + 0.6).sin())
+            .collect();
+
+        let mut kv_cache = KvCacheGpu::new(
+            &device, num_kv_heads, max_seq_len, head_dim,
+        ).unwrap();
+        for t in 0..batch {
+            let k_gpu = device.htod_copy(&k_data[t * kv_dim..(t + 1) * kv_dim]).unwrap();
+            let v_gpu = device.htod_copy(&v_data[t * kv_dim..(t + 1) * kv_dim]).unwrap();
+            kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
+        }
+
+        let q_batch = device.htod_copy(&q_data).unwrap();
+
+        let mut ref_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
+        unsafe {
+            super::super::prefill::launch_flash_attention_v2(
+                &device, &kernels, &q_batch, &kv_cache, &mut ref_out,
+                batch, num_heads, num_kv_heads, head_dim, pos_start,
+            ).unwrap();
+        }
+        device.synchronize().unwrap();
+        let ref_results = device.dtoh_copy(&ref_out).unwrap();
+
+        // Force at least 3 splits across 6 KV positions (slice_size=2).
+        let mut split_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
+        unsafe {
+            super::super::prefill::launch_flash_attention_fa2_splitk(
+                &device, &kernels, &q_batch, &kv_cache, &mut split_out,
+                batch, num_heads, num_kv_heads, head_dim, pos_start,
+                /* slice_size = */ 2,
+            ).unwrap();
+        }
+        device.synchronize().unwrap();
+        let split_results = device.dtoh_copy(&split_out).unwrap();
+
+        let mut max_diff = 0.0f32;
+        for i in 0..ref_results.len() {
+            let diff = (ref_results[i] - split_results[i]).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 1e-3,
+                "fa2_splitk vs flash_v2 mismatch at index {i}: \
+                 ref={}, split={}, diff={diff}",
+                ref_results[i], split_results[i],
+            );
+        }
+        eprintln!("fa2_splitk vs flash_v2: max diff = {max_diff:.6e}");
     }
 
     /// Verify buffer size validation catches undersized buffers.

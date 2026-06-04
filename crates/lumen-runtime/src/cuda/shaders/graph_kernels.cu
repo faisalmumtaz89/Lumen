@@ -198,7 +198,7 @@ extern "C" __global__ void kv_cache_write_graph(
 //     because the SAME thread writes and reads the pair.
 //   - V cache write: write v[2d] and v[2d+1] to v_cache (if idx < k_pairs).
 //
-// Correctness: each thread writes RoPE'd K values to the k[] buffer in registers,
+// Correctness: each thread writes RoPE'd K values to the kbuffer in registers,
 // then immediately writes them to k_cache. No other thread reads these K elements,
 // so no grid-wide synchronization is needed.
 
@@ -616,4 +616,216 @@ extern "C" __global__ void advance_conv_position(
     unsigned int buf_slots)
 {
     *conv_pos = (*conv_pos + 1) % buf_slots;
+}
+
+// ============================================================================
+// Tiled streaming-softmax decode attention -- graph variant
+// ============================================================================
+//
+// Identical mathematics to `attention_decode_tiled` in `attention_decode_tiled.cu`,
+// except `seq_len` is read from a device pointer (`p_seq_len`) instead of a host
+// scalar. This enables CUDA graph capture for long-context decode: the captured
+// graph bakes in the device pointer, while the value pointed to changes per
+// token (updated via `memcpy_htod` BEFORE graph replay -- same mechanism as
+// `attention_decode_graph` above).
+//
+// Shared memory layout (constant in seq_len -- the whole point of the tiled
+// kernel): partial[8] + q_row[head_dim] + s_tile[T_C] = (8 + head_dim + T_C) *
+// 4 bytes. At head_dim=256 + T_C=128: ~1.6 KB. Static across all decode tokens.
+// Unlike `attention_decode_graph`'s O(max_seq_len) shmem, this one needs no
+// special opt-in for extended dynamic shmem.
+//
+// Grid: (num_heads, 1, 1), Block: (TILED_BLOCK_DIM=128, 1, 1).
+// Invariant: head_dim must be a multiple of TILED_BLOCK_DIM (128). Production
+// Qwen3.5-9B has head_dim=256 (256 % 128 == 0). Smaller test models that fail
+// this guard fall back to the host-scalar variant in eager mode (the wrapper
+// at backend_impl.rs picks the variant before capture).
+//
+// Algorithm reference: Dao 2022 online softmax (FlashAttention-2 decode shape).
+// Tile width T_C = 128, fixed at compile time (same as host kernel).
+
+#define TILED_T_C        128u
+#define TILED_BLOCK_DIM  128u
+#define TILED_NEG_INF    (-3.402823466e+38f)
+
+// Inline Q@K dot-product helper (float4 vectorised when head_dim % 4 == 0).
+// Same algorithm as `tiled_qk_dot` in attention_decode_tiled.cu, inlined here
+// to avoid the shared-translation-unit prefix-name collision with the host
+// kernel's helpers.
+__device__ __forceinline__ float tiled_graph_qk_dot(
+    const float* __restrict__ q_row,
+    const float* __restrict__ k_vec,
+    unsigned int head_dim,
+    float scale)
+{
+    float dot = 0.0f;
+    if ((head_dim & 3u) == 0u) {
+        unsigned int hd4 = head_dim >> 2;
+        const float4* q4 = reinterpret_cast<const float4*>(q_row);
+        const float4* k4 = reinterpret_cast<const float4*>(k_vec);
+        for (unsigned int d4 = 0; d4 < hd4; d4++) {
+            float4 q = q4[d4];
+            float4 k = k4[d4];
+            dot += q.x * k.x + q.y * k.y + q.z * k.z + q.w * k.w;
+        }
+    } else {
+        for (unsigned int d = 0; d < head_dim; d++) {
+            dot += q_row[d] * k_vec[d];
+        }
+    }
+    return dot * scale;
+}
+
+extern "C" __global__ void attention_decode_tiled_graph(
+    const float* __restrict__ q,           // [num_heads * head_dim]
+    const float* __restrict__ k_cache,     // [num_kv_heads, max_seq_len, head_dim]
+    const float* __restrict__ v_cache,     // [num_kv_heads, max_seq_len, head_dim]
+    float* __restrict__ attn_out,          // [num_heads * head_dim]
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    const unsigned int* __restrict__ p_seq_len, // device pointer to current seq_len
+    unsigned int max_seq_len,
+    float scale)
+{
+    unsigned int head = blockIdx.x;
+    if (head >= num_heads) return;
+
+    unsigned int tid = threadIdx.x;
+    unsigned int block_size = blockDim.x;   // = TILED_BLOCK_DIM at launch
+
+    // Read dynamic seq_len from device memory (the only per-token-varying input).
+    unsigned int seq_len = *p_seq_len;
+
+    // Degenerate seq_len = 0: zero output and exit. Defensive only -- production
+    // decode always has seq_len >= 1 because KV is appended BEFORE attn call.
+    if (seq_len == 0u) {
+        for (unsigned int d = tid; d < head_dim; d += block_size) {
+            attn_out[head * head_dim + d] = 0.0f;
+        }
+        return;
+    }
+
+    // GQA mapping: multiple Q heads share the same KV head.
+    unsigned int gqa_ratio = num_heads / num_kv_heads;
+    unsigned int kv_h = head / gqa_ratio;
+
+    const float* q_head = q + head * head_dim;
+    float* out_head = attn_out + head * head_dim;
+
+    unsigned long long kv_base = (unsigned long long)kv_h
+                                 * (unsigned long long)max_seq_len
+                                 * (unsigned long long)head_dim;
+
+    // Shared memory layout (constant in seq_len):
+    //   [0..7]:           partial[8] -- warp-reduction scratch
+    //   [8..8+head_dim):  q_row[head_dim]
+    //   [8+head_dim..]:   s_tile[T_C]
+    extern __shared__ float smem[];
+    volatile float* partial = smem;
+    float* q_row = smem + 8;
+    float* s_tile = smem + 8 + head_dim;
+
+    // Phase 0: cooperative Q row load.
+    for (unsigned int d = tid; d < head_dim; d += block_size) {
+        q_row[d] = q_head[d];
+    }
+    __syncthreads();
+
+    // Per-thread running softmax state (registers across tiles).
+    float m_prev = TILED_NEG_INF;
+    float l_prev = 0.0f;
+
+    constexpr unsigned int MAX_SLOTS = 8u;
+    float o_acc[MAX_SLOTS];
+#pragma unroll
+    for (unsigned int s = 0; s < MAX_SLOTS; s++) o_acc[s] = 0.0f;
+    unsigned int num_slots = (head_dim + block_size - 1u) / block_size;
+
+    unsigned int num_tiles = (seq_len + TILED_T_C - 1u) / TILED_T_C;
+
+    for (unsigned int tile = 0; tile < num_tiles; tile++) {
+        unsigned int tile_start = tile * TILED_T_C;
+        unsigned int tile_end_raw = tile_start + TILED_T_C;
+        unsigned int tile_end = (tile_end_raw < seq_len) ? tile_end_raw : seq_len;
+        unsigned int tile_len = tile_end - tile_start;
+
+        // Phase A: scores for this tile (one lane per position when
+        // T_C == block_size; strided otherwise).
+        for (unsigned int j = tid; j < TILED_T_C; j += block_size) {
+            if (j < tile_len) {
+                unsigned int pos = tile_start + j;
+                const float* k_vec = k_cache + kv_base
+                                     + (unsigned long long)pos
+                                     * (unsigned long long)head_dim;
+                s_tile[j] = tiled_graph_qk_dot(q_row, k_vec, head_dim, scale);
+            } else {
+                s_tile[j] = TILED_NEG_INF;
+            }
+        }
+        __syncthreads();
+
+        // Phase B: tile max + online-softmax update.
+        float local_max = TILED_NEG_INF;
+        for (unsigned int j = tid; j < TILED_T_C; j += block_size) {
+            local_max = fmaxf(local_max, s_tile[j]);
+        }
+        float tile_max = graph_block_reduce_max(local_max, partial, tid, block_size);
+
+        float m_new = fmaxf(m_prev, tile_max);
+        float rescale = expf(m_prev - m_new);
+
+        // Phase C: exp(s - m_new) into s_tile + tile_sum reduction.
+        for (unsigned int j = tid; j < TILED_T_C; j += block_size) {
+            if (j < tile_len) {
+                s_tile[j] = expf(s_tile[j] - m_new);
+            } else {
+                s_tile[j] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        float local_sum = 0.0f;
+        for (unsigned int j = tid; j < TILED_T_C; j += block_size) {
+            local_sum += s_tile[j];
+        }
+        float tile_sum = graph_block_reduce_sum(local_sum, partial, tid, block_size);
+
+        float l_new = rescale * l_prev + tile_sum;
+
+        // Phase D: rescale O_prev and accumulate P @ V_tile (scalar V loads).
+#pragma unroll
+        for (unsigned int slot = 0; slot < MAX_SLOTS; slot++) {
+            if (slot >= num_slots) break;
+            unsigned int d = tid + slot * block_size;
+            if (d < head_dim) {
+                float pv = 0.0f;
+                for (unsigned int j = 0; j < tile_len; j++) {
+                    unsigned int pos = tile_start + j;
+                    float v_dj = v_cache[kv_base
+                                         + (unsigned long long)pos
+                                         * (unsigned long long)head_dim
+                                         + (unsigned long long)d];
+                    pv += s_tile[j] * v_dj;
+                }
+                o_acc[slot] = rescale * o_acc[slot] + pv;
+            }
+        }
+
+        m_prev = m_new;
+        l_prev = l_new;
+
+        __syncthreads(); // next tile overwrites s_tile in Phase A.
+    }
+
+    // Final: normalise and write output.
+    float inv_l = (l_prev > 0.0f) ? (1.0f / l_prev) : 0.0f;
+#pragma unroll
+    for (unsigned int slot = 0; slot < MAX_SLOTS; slot++) {
+        if (slot >= num_slots) break;
+        unsigned int d = tid + slot * block_size;
+        if (d < head_dim) {
+            out_head[d] = o_acc[slot] * inv_l;
+        }
+    }
 }

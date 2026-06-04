@@ -1046,7 +1046,7 @@ if not lumen_only and (has_mlx or has_llamacpp):
         hdr += " | MLX Decode | vs MLX"
         sep_h += "|-----------:|:-----:"
     if has_llamacpp:
-        hdr += " | LC Decode | vs LC"
+        hdr += " | llama.cpp Decode | vs llama.cpp"
         sep_h += "|----------:|:----:"
     hdr += " | Lumen Prefill"
     sep_h += "|--------------:"
@@ -1054,7 +1054,7 @@ if not lumen_only and (has_mlx or has_llamacpp):
         hdr += " | MLX Prefill | vs MLX"
         sep_h += "|------------:|:-----:"
     if has_llamacpp:
-        hdr += " | LC Prefill | vs LC"
+        hdr += " | llama.cpp Prefill | vs llama.cpp"
         sep_h += "|-----------:|:----:"
     hdr += " |"
     sep_h += "|"
@@ -1172,13 +1172,13 @@ if not lumen_only and (has_mlx or has_llamacpp):
             is_unsup = any(v[2] == "UNSUPPORTED" for v in lc_configs.values())
             if is_unsup:
                 row_lc = "| ^(llama.cpp) | |"
-                row_lr = "| ^(vs LC) | |"
+                row_lr = "| ^(vs llama.cpp) | |"
                 for _ in config_labels:
                     row_lc += " n/a |"
                     row_lr += " n/a |"
             else:
                 row_lc = "| ^(llama.cpp {}) | |".format(quant)
-                row_lr = "| ^(vs LC) | |"
+                row_lr = "| ^(vs llama.cpp) | |"
                 for pl in prompt_lengths:
                     for gl in gen_lengths:
                         cfg = (pl, gl)
@@ -1255,13 +1255,13 @@ if not lumen_only and (has_mlx or has_llamacpp):
             is_unsup = any(v[0] == "UNSUPPORTED" for v in lc_configs.values())
             if is_unsup:
                 row_lc = "| ^(llama.cpp) | |"
-                row_lr = "| ^(vs LC) | |"
+                row_lr = "| ^(vs llama.cpp) | |"
                 for _ in config_labels:
                     row_lc += " n/a |"
                     row_lr += " n/a |"
             else:
                 row_lc = "| ^(llama.cpp {}) | |".format(quant)
-                row_lr = "| ^(vs LC) | |"
+                row_lr = "| ^(vs llama.cpp) | |"
                 for pl in prompt_lengths:
                     for gl in gen_lengths:
                         cfg = (pl, gl)

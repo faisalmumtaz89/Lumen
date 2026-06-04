@@ -68,6 +68,14 @@ __device__ __forceinline__ float f16_bits_to_f32(unsigned short bits) {
     return result;
 }
 
+// inline-PTX dp4a wrapper. See matvec_q8_split_q8_1.cu for the
+// rationale (the `__dp4a` intrinsic NVRTC-fails in this build env).
+__device__ __forceinline__ int dp4a_s32(int a, int b, int c) {
+    int d;
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+
 // Hardware f32->f16 conversion via PTX.
 __device__ __forceinline__ unsigned short f32_to_f16_bits(float val) {
     unsigned short result;
@@ -261,7 +269,7 @@ extern "C" __global__ __launch_bounds__(MV_THREADS, 1) void matvec_q8_0_q8_1(
             #pragma unroll
             for (int k = 0; k < 8; k++) {
                 int w_word = (int)w16[k * 2] | ((int)w16[k * 2 + 1] << 16);
-                acc = __dp4a(w_word, xv[k], acc);
+                acc = dp4a_s32(w_word, xv[k], acc);
             }
 
             // Combined scale: w_scale * x_scale * int_dot_product.
@@ -363,7 +371,7 @@ extern "C" __global__ __launch_bounds__(MV_THREADS, 1) void matvec_q8_0_q8_1_res
             #pragma unroll
             for (int k = 0; k < 8; k++) {
                 int w_word = (int)w16[k * 2] | ((int)w16[k * 2 + 1] << 16);
-                acc = __dp4a(w_word, xv[k], acc);
+                acc = dp4a_s32(w_word, xv[k], acc);
             }
 
             sumf[row] += w_scale * x_scale * (float)acc;

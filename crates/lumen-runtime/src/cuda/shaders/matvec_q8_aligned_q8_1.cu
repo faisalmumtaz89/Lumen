@@ -36,7 +36,7 @@
 // Architecture: NR=2 rows per block, 128 threads (4 warps).
 // Cross-warp reduction: simple shmem (3 warps write, warp 0 sums).
 // in_dim must be a multiple of 32 (Q8_0 block size).
-// Requires compute capability >= 6.1 for __dp4a() (Pascal+).
+// Requires compute capability >= 6.1 for dp4a_s32() (Pascal+).
 //
 // NVRTC-compatible: no system includes, extern "C" linkage.
 // ==========================================================================
@@ -54,6 +54,15 @@ __device__ __forceinline__ float f16_bits_to_f32(unsigned short bits) {
     float result;
     asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(bits));
     return result;
+}
+
+// inline-PTX dp4a wrapper. The `__dp4a` intrinsic NVRTC-fails in
+// this build env (driver 580.126.20 / CUDA 12.2 / sm_80). The inline
+// `dp4a.s32.s32` opcode loads cleanly on compute_80.
+__device__ __forceinline__ int dp4a_s32(int a, int b, int c) {
+    int d;
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
 }
 
 // Warp-level reduction: sum all lanes in a warp using butterfly shuffle.
@@ -132,7 +141,7 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q8_ali
             int acc = 0;
             #pragma unroll
             for (int k = 0; k < 8; k++) {
-                acc = __dp4a(w_packed[k], xv[k], acc);
+                acc = dp4a_s32(w_packed[k], xv[k], acc);
             }
 
             // Combined scale: w_scale * x_scale * int_dot_product.
@@ -233,7 +242,7 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2) void matvec_q8_ali
             int acc = 0;
             #pragma unroll
             for (int k = 0; k < 8; k++) {
-                acc = __dp4a(w_packed[k], xv[k], acc);
+                acc = dp4a_s32(w_packed[k], xv[k], acc);
             }
 
             sumf[row] += w_scale * x_scale * (float)acc;

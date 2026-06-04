@@ -862,6 +862,13 @@ impl GgufBuilder {
         self
     }
 
+    /// Add a u16 metadata key-value pair (used for `split.no` and `split.count`).
+    pub fn add_u16(&mut self, key: &str, value: u16) -> &mut Self {
+        self.metadata
+            .push((key.to_string(), GgufValue::U16(value)));
+        self
+    }
+
     /// Add an i32 metadata key-value pair.
     pub fn add_i32(&mut self, key: &str, value: i32) -> &mut Self {
         self.metadata

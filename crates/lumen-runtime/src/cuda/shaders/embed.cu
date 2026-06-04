@@ -66,6 +66,25 @@ extern "C" __global__ void embed_token_f16(
     }
 }
 
+// BF16 embedding: each element is 2 bytes (top 16 bits of binary32 layout).
+// Dequantizes to f32 on the fly via a 16-bit left-shift bit-cast.
+// BF16 keeps the F32 8-bit exponent so the conversion is `(bits << 16)`
+// reinterpreted as an f32. On SM 80+ the compiler emits `cvt.f32.bf16`
+// for this idiom; on older targets the integer shift + reinterpret works.
+extern "C" __global__ void embed_token_bf16(
+    const unsigned short* __restrict__ embedding_bf16,
+    float* __restrict__ output,
+    unsigned int token_id,
+    unsigned int hidden_dim)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < hidden_dim) {
+        unsigned short bits = embedding_bf16[(unsigned long long)token_id * hidden_dim + idx];
+        unsigned int x = ((unsigned int)bits) << 16;
+        output[idx] = __int_as_float((int)x);
+    }
+}
+
 // Q4_0 embedding: 18 bytes per block of 32 elements.
 //   bytes [0..1]: f16 scale (LE)
 //   bytes [2..17]: 16 bytes of nibble pairs (2 x 4-bit values per byte)

@@ -1,9 +1,9 @@
 //! Native BPE tokenizer for Lumen.
 //!
 //! Supports two tokenizer families:
-//! - **tiktoken-style BPE** (model="gpt2"): Llama-3, Qwen2.5, Qwen3.5
+//! -**tiktoken-style BPE**(model="gpt2"): Llama-3, Qwen2.5, Qwen3.5
 //!   Uses a pre-tokenizer regex, GPT-2 byte-to-unicode mapping, ranked merges.
-//! - **SentencePiece BPE** (model="llama"): TinyLlama
+//! -**SentencePiece BPE**(model="llama"): TinyLlama
 //!   Uses scores as merge priorities, non-legacy prefix space, byte fallback.
 
 use std::collections::HashMap;
@@ -271,11 +271,19 @@ impl BpeTokenizer {
                  {prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
             )
         } else if self.pre_tokenizer == "qwen35" {
-            // Qwen3.5: system optional, includes <think>
+            // Qwen3.5: ChatML. The official Qwen3.5 jinja template emits an
+            // empty `<think>\n\n</think>\n\n` block when `enable_thinking=false`
+            // is set. Previously this code unconditionally pre-filled an OPEN
+            // `<think>\n` which forced the model into thinking mode for every
+            // prompt and burned the gen budget on metacommentary (
+            // root cause for an earlier coherence-test failure).
+            // We now emit the closed empty-think prefix so the model proceeds
+            // straight to the answer, matching the official Qwen3.5
+            // `enable_thinking=false` chat-template output.
             if let Some(sys) = system {
-                format!("<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n")
+                format!("<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
             } else {
-                format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n")
+                format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
             }
         } else if self.pre_tokenizer == "qwen2" {
             // Qwen2.5: ChatML with system message

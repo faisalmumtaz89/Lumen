@@ -44,6 +44,27 @@ kernel void embed_token_f16(
     out[gid] = float(embedding_f16[token_id * hidden_dim + gid]);
 }
 
+// ============================================================================
+// embed_token_bf16: BF16 (brain-float) token embedding lookup (decode)
+//
+// Reads bfloat16 embedding table as u16 raw bits and converts to F32 via the
+// `bits << 16` reinterpret. This bypasses any driver ambiguity around the
+// MSL `bfloat` scalar type and matches the host-side `bf16_to_f32` helper
+// bit-for-bit. F32 output is consumed by the activation buffer.
+// ============================================================================
+
+kernel void embed_token_bf16(
+    device const ushort* embedding_bf16 [[buffer(0)]],
+    device float*        out            [[buffer(1)]],
+    constant uint&       token_id       [[buffer(2)]],
+    constant uint&       hidden_dim     [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= hidden_dim) return;
+    ushort bits = embedding_bf16[token_id * hidden_dim + gid];
+    out[gid] = as_type<float>((uint(bits)) << 16);
+}
+
 
 // ============================================================================
 // embed_token_q8_0: Q8_0 quantized token embedding lookup (decode)

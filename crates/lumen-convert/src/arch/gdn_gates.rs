@@ -5,7 +5,7 @@
 //! logic so both the dense and MoE converters handle it identically.
 
 use crate::convert::ConvertError;
-use crate::gguf::GgufFile;
+use crate::gguf::{GgmlType, GgufFile};
 use crate::tensor_io::*;
 use crate::tensor_names::*;
 use lumen_format::index::TensorSlice;
@@ -47,6 +47,30 @@ pub(crate) fn compute_ssm_tensor_slice(
     // Handle types with no direct LBC mapping (Q8_1, Q5_1, etc.) by going through
     // the dequant->F32->Q8_0 path for alpha/beta, or dequant->F32 for other SSM tensors.
     let is_alpha_or_beta = suffix == SSM_ALPHA || suffix == SSM_BETA;
+    // The runtime SSM-scalar slots (ssm_a, ssm_conv1d, ssm_dt, ssm_norm) are
+    // typed `Option<CudaSlice<f32>>` — they only accept F32. If the GGUF
+    // stores them in F16 / BF16 / quantized format, we must dequantize at
+    // convert time so the runtime can upload them without misinterpretation.
+    let needs_f32_force =
+        !is_alpha_or_beta
+        && !matches!(tensor.ggml_type, GgmlType::F32)
+        && matches!(suffix, SSM_A | SSM_CONV1D | SSM_DT | SSM_NORM);
+
+    if needs_f32_force {
+        if !tensor.ggml_type.has_dequant_path() {
+            return Err(ConvertError::UnsupportedTensorType {
+                tensor: name.to_string(),
+                ggml_type: format!("{:?} (cannot force-dequant SSM scalar to F32)",
+                                   tensor.ggml_type),
+            });
+        }
+        let n_elements = tensor.n_elements();
+        let size = n_elements * 4;
+        let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::F32 };
+        *blob_offset += size;
+        return Ok(Some(slice));
+    }
+
     let quant = match tensor.ggml_type.to_lbc_quant() {
         Some(q) => q,
         None if is_alpha_or_beta && tensor.ggml_type.has_dequant_path() => {
@@ -143,10 +167,20 @@ pub(crate) fn write_ssm_tensors<R: Read + Seek>(
         let name = layer_tensor_name(layer, suffix);
         if let Some(tensor) = gguf.find_tensor(&name) {
             let is_alpha_or_beta = *suffix == SSM_ALPHA || *suffix == SSM_BETA;
+            // The runtime SSM-scalar slots (ssm_a, ssm_conv1d, ssm_dt, ssm_norm)
+            // accept only F32. If the GGUF stored them in F16/BF16/quant, we
+            // dequant here so layout matches the slice produced by
+            // `compute_ssm_tensor_slice`. ssm_alpha/beta are handled below.
+            let needs_f32_force = !is_alpha_or_beta
+                && !matches!(tensor.ggml_type, GgmlType::F32)
+                && matches!(*suffix, SSM_A | SSM_CONV1D | SSM_DT | SSM_NORM);
             let src_quant = tensor.ggml_type.to_lbc_quant();
             if is_alpha_or_beta && !matches!(src_quant, Some(QuantScheme::Q8_0)) {
                 // Force-requantize to Q8_0 (dequant to F32 first, then quantize to Q8_0)
                 append_tensor_to_blob_requant(blob, reader, gguf, &name, false, Some(QuantScheme::Q8_0))?;
+            } else if needs_f32_force {
+                // Dequantize F16/BF16/quant to F32 for runtime compatibility.
+                append_tensor_to_blob_requant(blob, reader, gguf, &name, /*dequantize=*/ true, /*requant_to=*/ None)?;
             } else {
                 append_tensor_to_blob_requant(blob, reader, gguf, &name, dequantize, /*requant_to=*/ None)?;
             }

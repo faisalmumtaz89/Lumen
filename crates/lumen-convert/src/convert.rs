@@ -8,6 +8,7 @@ use crate::arch;
 use crate::dequant::*;
 use crate::gguf::{GgmlType, GgufError, GgufFile};
 use crate::hyperparams::{detect_quant_scheme, extract_hyperparams, quant_descriptor_for};
+use crate::sharded::{MultiShardReader, ShardError, ShardedGguf};
 use crate::tensor_names::*;
 use crate::tensor_io::read_tensor_data;
 use lumen_format::header::LbcHeader;
@@ -16,12 +17,35 @@ use lumen_format::streaming_writer::StreamingLbcWriter;
 use lumen_format::tokenizer::TokenizerSection;
 use lumen_format::writer::GlobalTensors;
 use std::fmt;
-use std::io::{BufReader, BufWriter, Read, Seek};
+use std::io::{BufWriter, Read, Seek};
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/// Runtime backend the LBC is being prepared for.
+///
+/// Different GPU backends support different sets of quantization kernels.
+/// CUDA ships dedicated K-quant (Q2/Q3/Q4/Q5/Q6_K) dequant kernels, so
+/// K-quant layer tensors can ride through unchanged. Metal currently has
+/// **no** K-quant kernels, so layer tensors stored as K-quant in the source
+/// GGUF (e.g. `attn_q` in the Q4 MoE-30B GGUF) must be upcast to a
+/// scheme Metal does support (Q8_0).
+///
+/// `Generic` leaves K-quant layer tensors as-is (CUDA path).
+/// `Metal` upcasts any K-quant layer-projection tensor (attn_q/k/v, ffn_*)
+/// to Q8_0 at convert time -- numerically lossless within Q8_0 precision
+/// (Q8_0 is higher precision per element than Q6_K in practice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConvertTarget {
+    /// CUDA-style: keep K-quant layer tensors as-is.
+    #[default]
+    Generic,
+    /// Metal-style: upcast K-quant layer tensors to Q8_0 (Metal has no K-quant
+    /// dispatch kernels, would hit the slow F32 fallback or NaN out).
+    Metal,
+}
 
 /// Options controlling the GGUF-to-LBC conversion.
 pub struct ConvertOptions {
@@ -35,6 +59,8 @@ pub struct ConvertOptions {
     /// first dequantized to F32, then requantized to the target scheme.
     /// Norm tensors remain F32 regardless.
     pub requant_to: Option<QuantScheme>,
+    /// Runtime backend the LBC is being prepared for. See [`ConvertTarget`].
+    pub target: ConvertTarget,
 }
 
 impl Default for ConvertOptions {
@@ -43,6 +69,7 @@ impl Default for ConvertOptions {
             alignment: 128 * 1024,
             dequantize_to_f32: false,
             requant_to: None,
+            target: ConvertTarget::default(),
         }
     }
 }
@@ -145,24 +172,59 @@ impl From<lumen_format::FormatError> for ConvertError {
     }
 }
 
-/// Convert a GGUF file to LBC format.
+/// Convert a GGUF file (single-shard or multi-shard) to LBC format.
+///
+/// Auto-detects multi-shard GGUFs by parsing the filename for the
+/// `*-NNNNN-of-MMMMM.gguf` pattern. For a single-file GGUF the conversion is
+/// byte-identical to the legacy path. For a multi-shard GGUF, all sibling
+/// shards in the same directory are discovered, validated (consistent
+/// `split.count`, contiguous `split.no`, no tensor-name collisions, matching
+/// GGUF version + alignment), and presented as a single merged view to the
+/// downstream pipeline.
 ///
 /// Reads the GGUF header and metadata to extract model hyperparameters, then
 /// streams tensor data layer-by-layer to produce the LBC file. Peak memory
-/// usage is O(1 layer blob + global tensors).
+/// usage is O(1 layer blob + global tensors) -- the 68 GB of BF16 weights in a
+/// large model are never loaded simultaneously, regardless of shard count.
 pub fn convert_gguf_to_lbc(
     gguf_path: &Path,
     lbc_path: &Path,
     options: &ConvertOptions,
 ) -> Result<ConvertStats, ConvertError> {
-    let input_size = std::fs::metadata(gguf_path)?.len();
+    let sharded = ShardedGguf::open(gguf_path).map_err(convert_error_from_shard)?;
+    let input_size = sharded.total_disk_size()?;
+    if sharded.shard_count() > 1 {
+        eprintln!(
+            "  Multi-shard GGUF: {} shards, {:.2} GB total",
+            sharded.shard_count(),
+            input_size as f64 / 1_073_741_824.0,
+        );
+    }
+    let gguf = sharded.merged();
+    let mut reader = MultiShardReader::open(&sharded)?;
+    do_convert_from_reader(gguf, &mut reader, lbc_path, options, input_size)
+}
 
-    // Parse GGUF header (does not read tensor data)
-    let mut file = BufReader::new(std::fs::File::open(gguf_path)?);
-    let gguf = GgufFile::parse(&mut file)?;
+/// Convert a sharded GGUF directly. Useful when the caller has already
+/// constructed a [`ShardedGguf`] (e.g. to inspect metadata before deciding
+/// whether to convert). Equivalent to [`convert_gguf_to_lbc`] with the path
+/// resolved.
+pub fn convert_sharded_gguf_to_lbc(
+    sharded: &ShardedGguf,
+    lbc_path: &Path,
+    options: &ConvertOptions,
+) -> Result<ConvertStats, ConvertError> {
+    let input_size = sharded.total_disk_size()?;
+    let gguf = sharded.merged();
+    let mut reader = MultiShardReader::open(sharded)?;
+    do_convert_from_reader(gguf, &mut reader, lbc_path, options, input_size)
+}
 
-    let stats = do_convert(&gguf, gguf_path, lbc_path, options, input_size)?;
-    Ok(stats)
+/// Adapter: ShardError -> ConvertError. ShardError already implements
+/// `Into<ConvertError>`, but the explicit function keeps `?` in the public
+/// API tidy.
+fn convert_error_from_shard(e: ShardError) -> ConvertError {
+    e.into()
 }
 
 /// Convert from an in-memory GGUF buffer (useful for testing).
@@ -187,17 +249,6 @@ pub fn convert_gguf_bytes_to_lbc(
 // ---------------------------------------------------------------------------
 // Core conversion logic
 // ---------------------------------------------------------------------------
-
-fn do_convert(
-    gguf: &GgufFile,
-    gguf_path: &Path,
-    lbc_path: &Path,
-    opts: &ConvertOptions,
-    input_size: u64,
-) -> Result<ConvertStats, ConvertError> {
-    let mut reader = BufReader::new(std::fs::File::open(gguf_path)?);
-    do_convert_from_reader(gguf, &mut reader, lbc_path, opts, input_size)
-}
 
 fn do_convert_from_reader<R: Read + Seek>(
     gguf: &GgufFile,
@@ -234,6 +285,15 @@ fn do_convert_from_reader<R: Read + Seek>(
             eprintln!("  Keeping embedding as F16 ({} bytes, {} elements)",
                 embedding_bytes.len(), embedding_n_elements);
             (embedding_bytes, QuantScheme::F16)
+        }
+        GgmlType::BF16 => {
+            // BF16 embedding: 2 bytes/elem, same on-disk footprint as F16.
+            // Storing as F32 instead (the prior default fall-through) would
+            // double the embedding size and trip A100-80GB OOM on Qwen3.5-9B
+            // (2 GB BF16 -> 4 GB F32 just for embedding + same for output_proj).
+            eprintln!("  Keeping embedding as Bf16 ({} bytes, {} elements)",
+                embedding_bytes.len(), embedding_n_elements);
+            (embedding_bytes, QuantScheme::Bf16)
         }
         GgmlType::Q8_0 => {
             eprintln!("  Keeping embedding as Q8_0 ({} bytes, {} elements)",
@@ -296,6 +356,15 @@ fn do_convert_from_reader<R: Read + Seek>(
             eprintln!("  Keeping output.weight as F16 ({} bytes, {} elements)",
                 output_proj_bytes.len(), output_proj_tensor.n_elements());
             (output_proj_bytes, false, QuantScheme::F16)
+        } else if output_proj_tensor.ggml_type == GgmlType::BF16 {
+            // BF16 output_proj: 2 bytes/elem, fits in the runtime's Bf16Raw
+            // upload path. Keeping the source bytes avoids the F32 inflation
+            // that previously caused A100-80GB OOM during preload_weights on
+            // Qwen3.5-9B BF16 (embedding 2 GB + output_proj 2 GB + 30+ GB of
+            // F32-inflated layer weights blew past free VRAM).
+            eprintln!("  Keeping output.weight as Bf16 ({} bytes, {} elements)",
+                output_proj_bytes.len(), output_proj_tensor.n_elements());
+            (output_proj_bytes, false, QuantScheme::Bf16)
         } else if matches!(output_proj_tensor.ggml_type,
             GgmlType::Q6_K | GgmlType::Q5_K | GgmlType::Q4_K |
             GgmlType::Q3_K | GgmlType::Q2_K | GgmlType::Q8_K)
@@ -346,7 +415,7 @@ fn do_convert_from_reader<R: Read + Seek>(
     let mut layer_shapes = Vec::with_capacity(num_layers);
     for layer in 0..num_layers {
         layer_shapes.push(converter.compute_layer_shape(
-            gguf, layer, opts.dequantize_to_f32, opts.requant_to,
+            gguf, layer, opts.dequantize_to_f32, opts.requant_to, opts.target,
         )?);
     }
 
@@ -398,7 +467,7 @@ fn do_convert_from_reader<R: Read + Seek>(
             Vec::with_capacity(shape.blob_size as usize);
 
         converter.write_layer_blob(
-            &mut layer_blob, reader, gguf, layer, opts.dequantize_to_f32, opts.requant_to,
+            &mut layer_blob, reader, gguf, layer, opts.dequantize_to_f32, opts.requant_to, opts.target,
         )?;
 
         streaming.write_layer(&layer_blob)?;
@@ -445,7 +514,6 @@ mod tests {
     use super::*;
     use crate::gguf::{GgufBuilder, GgmlType};
     use crate::tensor_io::{layer_tensor_name, expert_tensor_name};
-    use lumen_format::reader::LbcFile;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -458,9 +526,18 @@ mod tests {
         dir
     }
 
-    /// Build a minimal GGUF file representing a 2-layer LLaMA-like model
-    /// with F32 tensors for testing.
-    fn build_test_gguf(
+    /// Build a minimal synthetic Qwen3.5-arch GGUF with no real layer
+    /// tensors -- enough for `extract_hyperparams` to read the metadata
+    /// header but not enough to drive a full pipeline conversion. Used by
+    /// the metadata-extraction unit tests below.
+    ///
+    /// The full converter pipeline is exercised by integration tests against
+    /// real `bartowski/Qwen_Qwen3.5-9B-GGUF` files on the Modal benchmark
+    /// harness (`modal/bench_real_models.py`), not by synthetic GGUFs --
+    /// Qwen3.5 has 24 GDN layers interleaved with 8 full-attention layers
+    /// and per-head Q/K RMSNorm, which a synthetic mini-GGUF cannot
+    /// reproduce faithfully.
+    fn build_minimal_qwen35_metadata_gguf(
         num_layers: u32,
         num_heads: u32,
         num_kv_heads: u32,
@@ -469,132 +546,41 @@ mod tests {
         vocab_size: u32,
     ) -> Vec<u8> {
         let head_dim = hidden_dim / num_heads;
-        let q_dim = (num_heads * head_dim) as usize;
-        let kv_dim = (num_kv_heads * head_dim) as usize;
         let hidden = hidden_dim as usize;
-        let inter = intermediate_dim as usize;
         let vocab = vocab_size as usize;
 
         let mut builder = GgufBuilder::new();
+        builder.add_string("general.architecture", "qwen35");
+        builder.add_u32("qwen35.block_count", num_layers);
+        builder.add_u32("qwen35.attention.head_count", num_heads);
+        builder.add_u32("qwen35.attention.head_count_kv", num_kv_heads);
+        builder.add_u32("qwen35.attention.key_length", head_dim);
+        builder.add_u32("qwen35.embedding_length", hidden_dim);
+        builder.add_u32("qwen35.feed_forward_length", intermediate_dim);
+        builder.add_u32("qwen35.context_length", 64);
+        builder.add_f32("qwen35.rope.freq_base", 10000.0);
+        builder.add_f32("qwen35.attention.layer_norm_rms_epsilon", 1e-5);
 
-        // Metadata
-        builder.add_string("general.architecture", "llama");
-        builder.add_u32("llama.block_count", num_layers);
-        builder.add_u32("llama.attention.head_count", num_heads);
-        builder.add_u32("llama.attention.head_count_kv", num_kv_heads);
-        builder.add_u32("llama.embedding_length", hidden_dim);
-        builder.add_u32("llama.feed_forward_length", intermediate_dim);
-        builder.add_u32("llama.context_length", 64);
-        builder.add_f32("llama.rope.freq_base", 10000.0);
-        builder.add_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
-
-        // Global tensors
-        let embedding_data: Vec<f32> = (0..vocab * hidden)
-            .map(|i| (i as f32 * 0.001) % 1.0)
-            .collect();
+        // Token embedding tensor satisfies the vocab_size discovery
+        // fallback when `tokenizer.ggml.tokens` is absent.
+        let embedding_data: Vec<f32> = vec![0.0; vocab * hidden];
         builder.add_f32_tensor(
             EMBEDDING_NAME,
             &[vocab as u64, hidden as u64],
             &embedding_data,
         );
 
-        let norm_data: Vec<f32> = vec![1.0; hidden];
-        builder.add_f32_tensor(FINAL_NORM_NAME, &[hidden as u64], &norm_data);
-
-        let output_data: Vec<f32> = (0..vocab * hidden)
-            .map(|i| (i as f32 * 0.002) % 1.0)
-            .collect();
-        builder.add_f32_tensor(
-            OUTPUT_PROJ_NAME,
-            &[vocab as u64, hidden as u64],
-            &output_data,
-        );
-
-        // Per-layer tensors
-        for layer in 0..num_layers as usize {
-            let layer_tensors: Vec<(&str, usize, usize)> = vec![
-                (ATTN_Q, q_dim, hidden),
-                (ATTN_K, kv_dim, hidden),
-                (ATTN_V, kv_dim, hidden),
-                (ATTN_OUTPUT, hidden, q_dim),
-                (FFN_GATE, inter, hidden),
-                (FFN_UP, inter, hidden),
-                (FFN_DOWN, hidden, inter),
-                (ATTN_NORM, hidden, 1),
-                (FFN_NORM, hidden, 1),
-            ];
-
-            for (suffix, rows, cols) in layer_tensors {
-                let name = layer_tensor_name(layer, suffix);
-                let n = rows * cols;
-                let data: Vec<f32> = (0..n)
-                    .map(|i| ((i + layer * 1000) as f32 * 0.001) % 1.0)
-                    .collect();
-                let dims = if cols == 1 {
-                    vec![rows as u64]
-                } else {
-                    vec![rows as u64, cols as u64]
-                };
-                builder.add_f32_tensor(&name, &dims, &data);
-            }
-        }
-
         builder.build()
     }
 
     #[test]
-    fn round_trip_f32() {
-        let dir = temp_dir();
-        let lbc_path = dir.join("test.lbc");
-
-        let gguf_data = build_test_gguf(2, 2, 2, 8, 16, 32);
-        let opts = ConvertOptions {
-            alignment: 128,
-            dequantize_to_f32: false,
-            requant_to: None,
-        };
-
-        let stats =
-            convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path, &opts).unwrap();
-        assert_eq!(stats.num_layers, 2);
-        assert_eq!(stats.architecture, "llama");
-        assert_eq!(stats.quant_scheme, QuantScheme::F32);
-
-        // Verify the LBC file is valid
-        let lbc = LbcFile::open(&lbc_path).unwrap();
-        assert_eq!(lbc.header.num_layers, 2);
-        assert_eq!(lbc.header.hyperparams.hidden_dim, 8);
-        assert_eq!(lbc.header.hyperparams.vocab_size, 32);
-        assert_eq!(lbc.header.hyperparams.num_heads, 2);
-        assert_eq!(lbc.header.hyperparams.num_kv_heads, 2);
-        assert_eq!(lbc.header.hyperparams.head_dim, 4);
-        assert_eq!(lbc.header.hyperparams.intermediate_dim, 16);
-        assert_eq!(lbc.header.hyperparams.max_seq_len, 64);
-
-        // Verify layer indices are valid
-        for (i, idx) in lbc.layer_indices.iter().enumerate() {
-            idx.validate(i).unwrap();
-        }
-
-        // Verify global tensor sizes
-        // embedding: vocab * hidden * 4 bytes = 32 * 8 * 4 = 1024
-        assert_eq!(lbc.header.embedding.length, 32 * 8 * 4);
-        // final_norm: hidden * 4 = 8 * 4 = 32
-        assert_eq!(lbc.header.final_norm.length, 8 * 4);
-        // output_proj: vocab * hidden * 4 = 32 * 8 * 4 = 1024
-        assert_eq!(lbc.header.output_proj.length, 32 * 8 * 4);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn extract_hyperparams_llama() {
-        let gguf_data = build_test_gguf(4, 8, 4, 64, 128, 256);
+    fn extract_hyperparams_qwen35() {
+        let gguf_data = build_minimal_qwen35_metadata_gguf(4, 8, 4, 64, 128, 256);
         let mut cursor = std::io::Cursor::new(&gguf_data);
         let gguf = GgufFile::parse(&mut cursor).unwrap();
 
         let (hp, arch) = extract_hyperparams(&gguf).unwrap();
-        assert_eq!(arch, "llama");
+        assert_eq!(arch, "qwen35");
         assert_eq!(hp.num_layers, 4);
         assert_eq!(hp.num_heads, 8);
         assert_eq!(hp.num_kv_heads, 4);
@@ -604,6 +590,8 @@ mod tests {
         assert_eq!(hp.vocab_size, 256);
         assert_eq!(hp.max_seq_len, 64);
         assert!((hp.norm_eps - 1e-5).abs() < 1e-10);
+        // Qwen3.5 uses NeoX-style partial rotary embeddings.
+        assert!(hp.rope_neox);
 
         let rope = hp.rope_params.unwrap();
         assert!((rope.theta - 10000.0).abs() < 0.01);
@@ -612,64 +600,9 @@ mod tests {
     }
 
     #[test]
-    fn tensor_mapping_completeness() {
-        use crate::tensor_names::LAYER_TENSOR_SUFFIXES;
-        let gguf_data = build_test_gguf(2, 2, 2, 8, 16, 32);
-        let mut cursor = std::io::Cursor::new(&gguf_data);
-        let gguf = GgufFile::parse(&mut cursor).unwrap();
-
-        // Check all 3 global tensors exist
-        assert!(gguf.find_tensor(EMBEDDING_NAME).is_some());
-        assert!(gguf.find_tensor(FINAL_NORM_NAME).is_some());
-        assert!(gguf.find_tensor(OUTPUT_PROJ_NAME).is_some());
-
-        // Check all 9 per-layer tensors exist for each layer
-        for layer in 0..2 {
-            for suffix in &LAYER_TENSOR_SUFFIXES {
-                let name = layer_tensor_name(layer, suffix);
-                assert!(
-                    gguf.find_tensor(&name).is_some(),
-                    "missing tensor: {name}"
-                );
-            }
-        }
-
-        // Total: 3 global + 2 * 9 layer = 21 tensors
-        assert_eq!(gguf.tensors.len(), 21);
-    }
-
-    #[test]
-    fn missing_tensor_error() {
-        // Build a GGUF file missing one tensor
-        let mut builder = GgufBuilder::new();
-        builder.add_string("general.architecture", "llama");
-        builder.add_u32("llama.block_count", 1);
-        builder.add_u32("llama.attention.head_count", 2);
-        builder.add_u32("llama.attention.head_count_kv", 2);
-        builder.add_u32("llama.embedding_length", 8);
-        builder.add_u32("llama.feed_forward_length", 16);
-        // Only add embedding, no other tensors
-        let data = vec![0.0f32; 32 * 8];
-        builder.add_f32_tensor(EMBEDDING_NAME, &[32, 8], &data);
-
-        let gguf_data = builder.build();
-        let dir = temp_dir();
-        let lbc_path = dir.join("missing.lbc");
-
-        let result = convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path, &ConvertOptions::default());
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ConvertError::MissingTensor(name) => {
-                assert_eq!(name, FINAL_NORM_NAME);
-            }
-            other => panic!("expected MissingTensor, got: {other}"),
-        }
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn unsupported_architecture() {
+        // `gpt2` and `llama` are both outside the Qwen3.5 family and must
+        // be rejected with a clear UnsupportedArchitecture error.
         let mut builder = GgufBuilder::new();
         builder.add_string("general.architecture", "gpt2");
         let gguf_data = builder.build();
@@ -687,324 +620,258 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Build a minimal GGUF WITHOUT output.weight (weight-tying scenario).
-    /// The token_embd.weight should be used as the output projection.
-    fn build_test_gguf_tied_weights(
-        num_layers: u32,
-        num_heads: u32,
-        num_kv_heads: u32,
-        hidden_dim: u32,
-        intermediate_dim: u32,
-        vocab_size: u32,
-    ) -> Vec<u8> {
-        let head_dim = hidden_dim / num_heads;
-        let q_dim = (num_heads * head_dim) as usize;
-        let kv_dim = (num_kv_heads * head_dim) as usize;
-        let hidden = hidden_dim as usize;
-        let inter = intermediate_dim as usize;
-        let vocab = vocab_size as usize;
-
+    /// `convert_gguf_to_lbc` must route a single-file GGUF (no shard suffix)
+    /// through the sharded path AND surface the legacy
+    /// `UnsupportedArchitecture` error -- proving the new path is fully
+    /// backward-compatible with the legacy single-file flow.
+    #[test]
+    fn convert_gguf_to_lbc_single_file_path_routing() {
         let mut builder = GgufBuilder::new();
+        builder.add_string("general.architecture", "gpt2");
+        let gguf_data = builder.build();
 
-        // Metadata
-        builder.add_string("general.architecture", "llama");
-        builder.add_u32("llama.block_count", num_layers);
-        builder.add_u32("llama.attention.head_count", num_heads);
-        builder.add_u32("llama.attention.head_count_kv", num_kv_heads);
-        builder.add_u32("llama.embedding_length", hidden_dim);
-        builder.add_u32("llama.feed_forward_length", intermediate_dim);
-        builder.add_u32("llama.context_length", 64);
-        builder.add_f32("llama.rope.freq_base", 10000.0);
-        builder.add_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
+        let dir = temp_dir();
+        let in_path = dir.join("solo-routing.gguf");
+        std::fs::write(&in_path, &gguf_data).unwrap();
+        let lbc_path = dir.join("solo-routing.lbc");
 
-        // Token list for vocab size
-        let tokens: Vec<String> = (0..vocab).map(|i| format!("tok_{i}")).collect();
-        let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-        builder.add_string_array("tokenizer.ggml.tokens", &token_refs);
-
-        // Global tensors -- NO output.weight (weight tying)
-        let embedding_data: Vec<f32> = (0..vocab * hidden)
-            .map(|i| (i as f32 * 0.001) % 1.0)
-            .collect();
-        builder.add_f32_tensor(
-            EMBEDDING_NAME,
-            &[vocab as u64, hidden as u64],
-            &embedding_data,
-        );
-
-        let norm_data: Vec<f32> = vec![1.0; hidden];
-        builder.add_f32_tensor(FINAL_NORM_NAME, &[hidden as u64], &norm_data);
-
-        // NOTE: output.weight is deliberately omitted to test weight tying
-
-        // Per-layer tensors
-        for layer in 0..num_layers as usize {
-            let layer_tensors: Vec<(&str, usize, usize)> = vec![
-                (ATTN_Q, q_dim, hidden),
-                (ATTN_K, kv_dim, hidden),
-                (ATTN_V, kv_dim, hidden),
-                (ATTN_OUTPUT, hidden, q_dim),
-                (FFN_GATE, inter, hidden),
-                (FFN_UP, inter, hidden),
-                (FFN_DOWN, hidden, inter),
-                (ATTN_NORM, hidden, 1),
-                (FFN_NORM, hidden, 1),
-            ];
-
-            for (suffix, rows, cols) in layer_tensors {
-                let name = layer_tensor_name(layer, suffix);
-                let n = rows * cols;
-                let data: Vec<f32> = (0..n)
-                    .map(|i| ((i + layer * 1000) as f32 * 0.001) % 1.0)
-                    .collect();
-                let dims = if cols == 1 {
-                    vec![rows as u64]
-                } else {
-                    vec![rows as u64, cols as u64]
-                };
-                builder.add_f32_tensor(&name, &dims, &data);
-            }
+        let result = convert_gguf_to_lbc(&in_path, &lbc_path, &ConvertOptions::default());
+        match result {
+            Err(ConvertError::UnsupportedArchitecture(a)) => assert_eq!(a, "gpt2"),
+            other => panic!("expected UnsupportedArchitecture, got: {other:?}"),
         }
-
-        builder.build()
+        std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `convert_gguf_to_lbc` must auto-discover sibling shards from a
+    /// `*-NNNNN-of-MMMMM.gguf` filename, merge them, and surface a downstream
+    /// converter error consistently. We exercise the routing with a
+    /// `general.architecture = gpt2` payload split across 2 shards so the
+    /// merge succeeds and downstream rejects with the expected error.
     #[test]
-    fn weight_tying_fallback() {
+    fn convert_gguf_to_lbc_multi_shard_path_routing() {
         let dir = temp_dir();
-        let lbc_path = dir.join("tied.lbc");
+        let stem = "multishard-routing";
 
-        let gguf_data = build_test_gguf_tied_weights(2, 2, 2, 8, 16, 32);
-        let opts = ConvertOptions {
-            alignment: 128,
-            dequantize_to_f32: false,
-            requant_to: None,
-        };
+        // Shard 1 carries the (unsupported) architecture string in metadata.
+        let mut b1 = GgufBuilder::new();
+        b1.add_string("general.architecture", "gpt2");
+        b1.add_u16("split.no", 0);
+        b1.add_u16("split.count", 2);
+        b1.add_u64("split.tensors.count", 2);
+        b1.add_f32_tensor("token_embd.weight", &[4], &[0.0; 4]);
+        let p1 = dir.join(format!("{stem}-00001-of-00002.gguf"));
+        std::fs::write(&p1, b1.build()).unwrap();
 
-        let stats = convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path, &opts).unwrap();
-        assert_eq!(stats.num_layers, 2);
-        assert_eq!(stats.architecture, "llama");
+        // Shard 2 declares split metadata only and one tensor.
+        let mut b2 = GgufBuilder::new();
+        b2.add_string("general.architecture", "gpt2");
+        b2.add_u16("split.no", 1);
+        b2.add_u16("split.count", 2);
+        b2.add_u64("split.tensors.count", 2);
+        b2.add_f32_tensor("blk.0.attn_q.weight", &[4], &[0.0; 4]);
+        let p2 = dir.join(format!("{stem}-00002-of-00002.gguf"));
+        std::fs::write(&p2, b2.build()).unwrap();
 
-        let lbc = LbcFile::open(&lbc_path).unwrap();
-        assert_eq!(lbc.header.num_layers, 2);
-        assert_eq!(lbc.header.hyperparams.hidden_dim, 8);
-        assert_eq!(lbc.header.hyperparams.vocab_size, 32);
-
-        assert_eq!(lbc.header.output_proj.length, 32 * 8 * 4);
-        assert_eq!(lbc.header.embedding.length, lbc.header.output_proj.length);
-
-        for (i, idx) in lbc.layer_indices.iter().enumerate() {
-            idx.validate(i).unwrap();
+        let lbc_path = dir.join(format!("{stem}.lbc"));
+        let result = convert_gguf_to_lbc(&p1, &lbc_path, &ConvertOptions::default());
+        match result {
+            Err(ConvertError::UnsupportedArchitecture(a)) => assert_eq!(a, "gpt2"),
+            other => panic!(
+                "expected UnsupportedArchitecture after multi-shard merge, got: {other:?}"
+            ),
         }
 
+        // Sanity: the test really exercised the multi-shard path -- the same
+        // routing succeeds when entering from shard 2's filename instead of
+        // shard 1, proving sibling discovery + merge.
+        let result_from_p2 = convert_gguf_to_lbc(&p2, &lbc_path, &ConvertOptions::default());
+        match result_from_p2 {
+            Err(ConvertError::UnsupportedArchitecture(a)) => assert_eq!(a, "gpt2"),
+            other => panic!(
+                "expected UnsupportedArchitecture from shard 2 entry, got: {other:?}"
+            ),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `convert_gguf_to_lbc` must surface the multi-shard validation errors
+    /// (e.g. missing sibling shards) as I/O errors rather than panicking or
+    /// silently treating the file as single-shard.
+    #[test]
+    fn convert_gguf_to_lbc_missing_shard_error() {
+        let dir = temp_dir();
+        let stem = "missing-shard";
+
+        // Write only shard 1 but claim total=2.
+        let mut b1 = GgufBuilder::new();
+        b1.add_string("general.architecture", "gpt2");
+        b1.add_u16("split.no", 0);
+        b1.add_u16("split.count", 2);
+        b1.add_f32_tensor("token_embd.weight", &[4], &[0.0; 4]);
+        let p1 = dir.join(format!("{stem}-00001-of-00002.gguf"));
+        std::fs::write(&p1, b1.build()).unwrap();
+
+        let lbc_path = dir.join(format!("{stem}.lbc"));
+        let result = convert_gguf_to_lbc(&p1, &lbc_path, &ConvertOptions::default());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("expected 2 shard") || err_msg.contains("only found 1"),
+            "expected missing-shard error to mention shard counts, got: {err_msg}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn weight_tying_data_matches_embedding() {
+    fn legacy_llama_arch_rejected() {
+        // Regression test for the Qwen3.5-only converter: GGUFs whose
+        // `general.architecture` reports `llama` or any other non-Qwen3.5
+        // family member must be rejected at extract_hyperparams.
+        let mut builder = GgufBuilder::new();
+        builder.add_string("general.architecture", "llama");
+        let gguf_data = builder.build();
+
         let dir = temp_dir();
-        let lbc_path = dir.join("tied_data.lbc");
+        let lbc_path = dir.join("legacy_llama.lbc");
 
-        let gguf_data = build_test_gguf_tied_weights(1, 2, 2, 8, 16, 32);
-        let opts = ConvertOptions {
-            alignment: 128,
-            dequantize_to_f32: false,
-            requant_to: None,
-        };
-
-        convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path, &opts).unwrap();
-
-        let lbc_bytes = std::fs::read(&lbc_path).unwrap();
-        let lbc = LbcFile::from_bytes(&lbc_bytes, lbc_path.clone()).unwrap();
-
-        let emb_start = lbc.header.embedding.offset as usize;
-        let emb_end = emb_start + lbc.header.embedding.length as usize;
-        let emb_data = &lbc_bytes[emb_start..emb_end];
-
-        let out_start = lbc.header.output_proj.offset as usize;
-        let out_end = out_start + lbc.header.output_proj.length as usize;
-        let out_data = &lbc_bytes[out_start..out_end];
-
-        assert_eq!(emb_data, out_data, "weight-tied output_proj data should match embedding data");
+        let result = convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path, &ConvertOptions::default());
+        assert!(matches!(
+            result,
+            Err(ConvertError::UnsupportedArchitecture(ref a)) if a == "llama"
+        ));
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Build a minimal GGUF WITHOUT output.weight where token_embd.weight is Q8_0.
-    fn build_test_gguf_tied_weights_q8(
-        num_layers: u32,
-        num_heads: u32,
-        num_kv_heads: u32,
-        hidden_dim: u32,
-        intermediate_dim: u32,
-        vocab_size: u32,
-    ) -> Vec<u8> {
-        let head_dim = hidden_dim / num_heads;
-        let q_dim = (num_heads * head_dim) as usize;
-        let kv_dim = (num_kv_heads * head_dim) as usize;
-        let hidden = hidden_dim as usize;
-        let inter = intermediate_dim as usize;
-        let vocab = vocab_size as usize;
+    /// Regression test for the Qwen3.5-Next BF16 GGUF pattern produced by
+    /// `convert_hf_to_gguf.py --outtype bf16`: the file declares
+    /// `block_count = 33` for a 32-layer model because it counts the trailing
+    /// MTP (Next-N) head at blk.32 as a regular block. The MTP head ships
+    /// `nextn.eh_proj.weight`, `nextn.enorm.weight`, `nextn.hnorm.weight`, and
+    /// `nextn.shared_head_norm.weight` alongside attn_q/k/v/output -- Lumen
+    /// must NOT try to convert it as a backbone layer (it would crash on the
+    /// wrong attention layout otherwise).
+    ///
+    /// We assert that `extract_hyperparams` reports the OBSERVED
+    /// `num_layers = 32`, not the metadata value 33.
+    #[test]
+    fn mtp_head_excluded_from_layer_count() {
+        use crate::hyperparams::extract_hyperparams;
 
         let mut builder = GgufBuilder::new();
+        builder.add_string("general.architecture", "qwen35");
+        // Lie: 32 real layers but metadata says 33 (counting the MTP head).
+        builder.add_u32("qwen35.block_count", 33);
+        builder.add_u32("qwen35.attention.head_count", 2);
+        builder.add_u32("qwen35.attention.head_count_kv", 2);
+        builder.add_u32("qwen35.embedding_length", 8);
+        builder.add_u32("qwen35.feed_forward_length", 16);
 
-        builder.add_string("general.architecture", "llama");
-        builder.add_u32("llama.block_count", num_layers);
-        builder.add_u32("llama.attention.head_count", num_heads);
-        builder.add_u32("llama.attention.head_count_kv", num_kv_heads);
-        builder.add_u32("llama.embedding_length", hidden_dim);
-        builder.add_u32("llama.feed_forward_length", intermediate_dim);
-        builder.add_u32("llama.context_length", 64);
-        builder.add_f32("llama.rope.freq_base", 10000.0);
-        builder.add_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
+        // Global tensors -- minimal, just so the metadata reader doesn't trip.
+        builder.add_f32_tensor(EMBEDDING_NAME, &[8, 4], &vec![0.0f32; 32]);
 
-        let tokens: Vec<String> = (0..vocab).map(|i| format!("tok_{i}")).collect();
-        let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-        builder.add_string_array("tokenizer.ggml.tokens", &token_refs);
-
-        let embedding_f32: Vec<f32> = (0..vocab * hidden)
-            .map(|i| ((i as f32 * 0.001) % 1.0) - 0.5)
-            .collect();
-        let embedding_q8 = build_q8_0_blocks(&embedding_f32);
-        builder.add_tensor(
-            EMBEDDING_NAME,
-            GgmlType::Q8_0,
-            &[vocab as u64, hidden as u64],
-            embedding_q8,
-        );
-
-        let norm_data: Vec<f32> = vec![1.0; hidden];
-        builder.add_f32_tensor(FINAL_NORM_NAME, &[hidden as u64], &norm_data);
-
-        for layer in 0..num_layers as usize {
-            let layer_tensors: Vec<(&str, usize, usize)> = vec![
-                (ATTN_Q, q_dim, hidden),
-                (ATTN_K, kv_dim, hidden),
-                (ATTN_V, kv_dim, hidden),
-                (ATTN_OUTPUT, hidden, q_dim),
-                (FFN_GATE, inter, hidden),
-                (FFN_UP, inter, hidden),
-                (FFN_DOWN, hidden, inter),
-            ];
-
-            for (suffix, rows, cols) in layer_tensors {
-                let name = layer_tensor_name(layer, suffix);
-                let n = rows * cols;
-                let f32_values: Vec<f32> = (0..n)
-                    .map(|i| ((i + layer * 1000) as f32 * 0.001 - 0.5).clamp(-1.0, 1.0))
-                    .collect();
-                let q8_data = build_q8_0_blocks(&f32_values);
-                let dims = vec![rows as u64, cols as u64];
-                builder.add_tensor(&name, GgmlType::Q8_0, &dims, q8_data);
-            }
-
-            let norm: Vec<f32> = vec![1.0; hidden];
-            let attn_norm_name = layer_tensor_name(layer, ATTN_NORM);
-            builder.add_f32_tensor(&attn_norm_name, &[hidden as u64], &norm);
-            let ffn_norm_name = layer_tensor_name(layer, FFN_NORM);
-            builder.add_f32_tensor(&ffn_norm_name, &[hidden as u64], &norm);
+        // 32 real layers: each carries `blk.N.attn_q.weight`.
+        for layer in 0..32 {
+            let name = layer_tensor_name(layer as usize, ATTN_Q);
+            builder.add_f32_tensor(&name, &[8, 8], &vec![0.0f32; 64]);
         }
 
-        builder.build()
-    }
+        // 1 MTP head at blk.32: has `attn_q.weight` AND `nextn.eh_proj.weight`.
+        // Without the `nextn.*` exclusion this would be counted as a real
+        // layer and num_layers would be 33.
+        builder.add_f32_tensor("blk.32.attn_q.weight", &[8, 8], &vec![0.0f32; 64]);
+        builder.add_f32_tensor("blk.32.nextn.eh_proj.weight", &[8, 8], &vec![0.0f32; 64]);
 
-    fn build_q8_0_blocks(values: &[f32]) -> Vec<u8> {
-        let mut data = Vec::new();
-        for chunk in values.chunks(32) {
-            let max_abs = chunk.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-            let scale = max_abs / 127.0;
-            let scale_bits = f32_to_f16_bits(scale);
-            data.extend_from_slice(&scale_bits.to_le_bytes());
-            for &v in chunk {
-                let q = if scale > 0.0 {
-                    (v / scale).round().clamp(-128.0, 127.0) as i8
-                } else {
-                    0i8
-                };
-                data.push(q as u8);
-            }
-        }
-        data
-    }
+        let gguf_data = builder.build();
+        let mut cur = std::io::Cursor::new(&gguf_data);
+        let gguf = crate::gguf::GgufFile::parse(&mut cur).unwrap();
 
-    #[test]
-    fn weight_tying_q8_0_preserves_quantization() {
-        let dir = temp_dir();
-        let lbc_path = dir.join("tied_q8.lbc");
+        // Sanity: metadata really says 33.
+        assert_eq!(gguf.get_u32("qwen35.block_count"), Some(33));
 
-        let gguf_data = build_test_gguf_tied_weights_q8(1, 2, 2, 32, 64, 64);
-        let opts = ConvertOptions {
-            alignment: 128,
-            dequantize_to_f32: false,
-            requant_to: None,
-        };
-
-        let stats = convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path, &opts).unwrap();
-        assert_eq!(stats.num_layers, 1);
-        assert_eq!(stats.quant_scheme, QuantScheme::Q8_0);
-
-        let lbc = LbcFile::open(&lbc_path).unwrap();
-        let vocab = 64usize;
-        let hidden = 32usize;
-        let n_elements = vocab * hidden;
-        let expected_q8_bytes = (n_elements / 32) * 34;
-        let f32_bytes = n_elements * 4;
-
+        let (hp, _arch) = extract_hyperparams(&gguf)
+            .expect("extract_hyperparams should succeed");
         assert_eq!(
-            lbc.header.output_proj.length, expected_q8_bytes as u64,
-            "output_proj should be Q8_0 sized ({} bytes), not F32 ({} bytes)",
-            expected_q8_bytes, f32_bytes
+            hp.num_layers, 32,
+            "num_layers must reflect the 32 real layers, ignoring the MTP head at blk.32 \
+             (metadata block_count=33). Got {}", hp.num_layers,
         );
-
-        assert_eq!(lbc.header.embedding.length, expected_q8_bytes as u64,
-            "embedding should be Q8_0 sized ({} bytes), not F32 ({} bytes)",
-            expected_q8_bytes, f32_bytes);
-
-        assert_eq!(lbc.header.output_proj.length, lbc.header.embedding.length,
-            "Q8_0 output_proj ({}) should be same size as Q8_0 embedding ({})",
-            lbc.header.output_proj.length, lbc.header.embedding.length);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `block_count` overshoot WITHOUT an MTP head (pure off-by-one bug in a
+    /// GGUF producer): if blk.32 simply doesn't have an attention weight,
+    /// `real_main_layer_count` must still stop at the first incomplete layer.
+    /// This covers e.g. a producer that wrote `block_count=N+1` but only
+    /// emitted N layers of attention tensors.
     #[test]
-    fn weight_tying_q8_0_data_matches_source() {
-        let dir = temp_dir();
-        let lbc_path = dir.join("tied_q8_data.lbc");
+    fn block_count_off_by_one_truncates_at_missing_attn() {
+        use crate::hyperparams::extract_hyperparams;
 
-        let vocab = 64usize;
-        let hidden = 32usize;
+        let mut builder = GgufBuilder::new();
+        builder.add_string("general.architecture", "qwen35");
+        builder.add_u32("qwen35.block_count", 3); // overshoot by 1
+        builder.add_u32("qwen35.attention.head_count", 2);
+        builder.add_u32("qwen35.attention.head_count_kv", 2);
+        builder.add_u32("qwen35.embedding_length", 8);
+        builder.add_u32("qwen35.feed_forward_length", 16);
+        builder.add_f32_tensor(EMBEDDING_NAME, &[8, 4], &vec![0.0f32; 32]);
 
-        let gguf_data = build_test_gguf_tied_weights_q8(1, 2, 2, hidden as u32, 64, vocab as u32);
-        let opts = ConvertOptions {
-            alignment: 128,
-            dequantize_to_f32: false,
-            requant_to: None,
-        };
+        // Real layers 0 and 1 each have attn_q.weight.
+        for layer in 0..2 {
+            let name = layer_tensor_name(layer as usize, ATTN_Q);
+            builder.add_f32_tensor(&name, &[8, 8], &vec![0.0f32; 64]);
+        }
+        // blk.2 exists in the tensor list but lacks attn_q.weight -- this
+        // happens when a producer stopped emitting layers part-way through.
+        // We emulate it with just a norm tensor so the index exists but
+        // doesn't carry a required attention weight.
+        builder.add_f32_tensor("blk.2.attn_norm.weight", &[8], &vec![1.0f32; 8]);
 
-        convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path, &opts).unwrap();
+        let gguf_data = builder.build();
+        let mut cur = std::io::Cursor::new(&gguf_data);
+        let gguf = crate::gguf::GgufFile::parse(&mut cur).unwrap();
 
-        let lbc_bytes = std::fs::read(&lbc_path).unwrap();
-        let lbc = LbcFile::from_bytes(&lbc_bytes, lbc_path.clone()).unwrap();
-
-        let out_start = lbc.header.output_proj.offset as usize;
-        let out_end = out_start + lbc.header.output_proj.length as usize;
-        let out_data = &lbc_bytes[out_start..out_end];
-
-        let n_elements = vocab * hidden;
-        let expected_q8_bytes = (n_elements / 32) * 34;
-        assert_eq!(out_data.len(), expected_q8_bytes,
-            "output_proj should contain Q8_0 blocks");
-
-        let embedding_f32: Vec<f32> = (0..n_elements)
-            .map(|i| ((i as f32 * 0.001) % 1.0) - 0.5)
-            .collect();
-        let expected_q8 = build_q8_0_blocks(&embedding_f32);
-        assert_eq!(out_data, &expected_q8[..],
-            "output_proj Q8_0 data should match the original embedding Q8_0 data");
-
-        std::fs::remove_dir_all(&dir).ok();
+        let (hp, _arch) = extract_hyperparams(&gguf).unwrap();
+        assert_eq!(hp.num_layers, 2,
+                   "expected truncation to 2 real layers, got {}", hp.num_layers);
     }
+
+    /// `block_count` matches the actual count: no warning, no surprise.
+    #[test]
+    fn block_count_matches_reality_no_op() {
+        use crate::hyperparams::extract_hyperparams;
+        let gguf_data = build_minimal_qwen35_metadata_gguf(4, 2, 2, 8, 16, 32);
+        // Add 4 real layers (each with attn_q.weight) so the observed
+        // count matches metadata block_count=4.
+        let mut cur = std::io::Cursor::new(&gguf_data);
+        // Validate the minimal metadata parses, then rebuild below with real layers.
+        crate::gguf::GgufFile::parse(&mut cur).unwrap();
+        // Re-construct with attention tensors for each layer.
+        let mut builder = GgufBuilder::new();
+        builder.add_string("general.architecture", "qwen35");
+        builder.add_u32("qwen35.block_count", 4);
+        builder.add_u32("qwen35.attention.head_count", 2);
+        builder.add_u32("qwen35.attention.head_count_kv", 2);
+        builder.add_u32("qwen35.embedding_length", 8);
+        builder.add_u32("qwen35.feed_forward_length", 16);
+        builder.add_f32_tensor(EMBEDDING_NAME, &[32, 8], &vec![0.0f32; 256]);
+        for layer in 0..4 {
+            let name = layer_tensor_name(layer as usize, ATTN_Q);
+            builder.add_f32_tensor(&name, &[8, 8], &vec![0.0f32; 64]);
+        }
+        let bytes = builder.build();
+        let mut cur2 = std::io::Cursor::new(&bytes);
+        let gguf = crate::gguf::GgufFile::parse(&mut cur2).unwrap();
+
+        let (hp, _arch) = extract_hyperparams(&gguf).unwrap();
+        assert_eq!(hp.num_layers, 4);
+    }
+
+    // NOTE: The synthetic weight-tying conversion tests (F32 + Q8_0
+    // variants) were removed when the generic Dense converter was retired
+    // in favour of the Qwen3.5-specific converter. Weight tying is still
+    // exercised end-to-end by integration tests against the real
+    // Qwen3.5-9B GGUF in `modal/test_qwen35.py`.
 
     #[test]
     fn f16_to_f32_conversion() {
@@ -1740,152 +1607,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn round_trip_q8_0_dequantize() {
-        let dir = temp_dir();
-        let lbc_path = dir.join("q8_deq.lbc");
-
-        let hidden = 32usize;
-        let vocab = 32usize;
-        let num_heads = 2u32;
-        let num_kv_heads = 2u32;
-        let head_dim = hidden / num_heads as usize;
-        let q_dim = (num_heads as usize) * head_dim;
-        let kv_dim = (num_kv_heads as usize) * head_dim;
-        let inter = 64usize;
-
-        let mut builder = GgufBuilder::new();
-        builder.add_string("general.architecture", "llama");
-        builder.add_u32("llama.block_count", 1);
-        builder.add_u32("llama.attention.head_count", num_heads);
-        builder.add_u32("llama.attention.head_count_kv", num_kv_heads);
-        builder.add_u32("llama.embedding_length", hidden as u32);
-        builder.add_u32("llama.feed_forward_length", inter as u32);
-        builder.add_u32("llama.context_length", 64);
-        builder.add_f32("llama.rope.freq_base", 10000.0);
-        builder.add_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
-
-        let embedding_data: Vec<f32> = (0..vocab * hidden)
-            .map(|i| (i as f32 * 0.001) % 1.0)
-            .collect();
-        builder.add_f32_tensor(
-            EMBEDDING_NAME,
-            &[vocab as u64, hidden as u64],
-            &embedding_data,
-        );
-        builder.add_f32_tensor(
-            FINAL_NORM_NAME,
-            &[hidden as u64],
-            &vec![1.0; hidden],
-        );
-        builder.add_f32_tensor(
-            OUTPUT_PROJ_NAME,
-            &[vocab as u64, hidden as u64],
-            &vec![0.1; vocab * hidden],
-        );
-
-        fn build_q8_0_blocks_inner(values: &[f32]) -> Vec<u8> {
-            let mut data = Vec::new();
-            for chunk in values.chunks(32) {
-                let max_abs = chunk.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-                let scale = max_abs / 127.0;
-                let bits = f32::to_bits(scale);
-                let sign = (bits >> 31) & 1;
-                let exp = ((bits >> 23) & 0xFF) as i32 - 127;
-                let frac = bits & 0x7FFFFF;
-                let scale_bits = if scale == 0.0 {
-                    if scale.is_sign_negative() { 0x8000u16 } else { 0u16 }
-                } else if exp > 15 {
-                    if sign == 1 { 0xFC00 } else { 0x7C00 }
-                } else if exp < -14 {
-                    if sign == 1 { 0x8000 } else { 0 }
-                } else {
-                    let f16_exp = (exp + 15) as u16;
-                    let f16_frac = (frac >> 13) as u16;
-                    ((sign as u16) << 15) | (f16_exp << 10) | f16_frac
-                };
-                data.extend_from_slice(&scale_bits.to_le_bytes());
-                for &v in chunk {
-                    let q = if scale > 0.0 {
-                        (v / scale).round().clamp(-128.0, 127.0) as i8
-                    } else {
-                        0i8
-                    };
-                    data.push(q as u8);
-                }
-            }
-            data
-        }
-
-        let layer_tensor_specs: Vec<(&str, usize, usize)> = vec![
-            (ATTN_Q, q_dim, hidden),
-            (ATTN_K, kv_dim, hidden),
-            (ATTN_V, kv_dim, hidden),
-            (ATTN_OUTPUT, hidden, q_dim),
-            (FFN_GATE, inter, hidden),
-            (FFN_UP, inter, hidden),
-            (FFN_DOWN, hidden, inter),
-            (ATTN_NORM, hidden, 1),
-            (FFN_NORM, hidden, 1),
-        ];
-
-        for (suffix, rows, cols) in &layer_tensor_specs {
-            let name = layer_tensor_name(0, suffix);
-            let n = rows * cols;
-            let f32_values: Vec<f32> = (0..n)
-                .map(|i| ((i as f32) * 0.01 - 0.5).clamp(-1.0, 1.0))
-                .collect();
-
-            if *suffix == ATTN_NORM || *suffix == FFN_NORM {
-                builder.add_f32_tensor(&name, &[n as u64], &f32_values);
-            } else {
-                let q8_data = build_q8_0_blocks_inner(&f32_values);
-                let dims = if *cols == 1 {
-                    vec![*rows as u64]
-                } else {
-                    vec![*rows as u64, *cols as u64]
-                };
-                builder.add_tensor(&name, GgmlType::Q8_0, &dims, q8_data);
-            }
-        }
-
-        let gguf_data = builder.build();
-
-        let opts = ConvertOptions {
-            alignment: 128,
-            dequantize_to_f32: true,
-            requant_to: None,
-        };
-        let stats = convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path, &opts).unwrap();
-        assert_eq!(stats.num_layers, 1);
-        assert_eq!(stats.quant_scheme, QuantScheme::F32);
-
-        let lbc = LbcFile::open(&lbc_path).unwrap();
-        assert_eq!(
-            lbc.header.quantization.scheme,
-            QuantScheme::F32,
-            "LBC should report F32 quant scheme when dequantized"
-        );
-
-        let idx = &lbc.layer_indices[0];
-        assert_eq!(
-            idx.subtensors.wq.length,
-            (q_dim * hidden * 4) as u64,
-            "wq should be F32 size"
-        );
-        assert_eq!(
-            idx.subtensors.wq.quant,
-            QuantScheme::F32,
-            "wq quant should be F32"
-        );
-        assert_eq!(
-            idx.subtensors.attn_norm.length,
-            (hidden * 4) as u64,
-            "attn_norm should be F32 size"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
+    // round_trip_q8_0_dequantize was removed when the generic Dense
+    // converter was retired: it built a synthetic llama-arch Q8_0 GGUF
+    // and round-tripped it through the Dense converter. Real Q8_0
+    // dequantize round-trip is exercised by `dequantize_q8_0_known_block`,
+    // `dequantize_q8_0_two_blocks`, and by integration tests against the
+    // real Qwen3.5-9B Q8_0 GGUF.
 
     #[test]
     fn dequantize_q8_0_two_blocks() {
@@ -1913,119 +1640,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn round_trip_dequantize_f32_noop() {
-        let dir = temp_dir();
-        let lbc_path = dir.join("f32_deq.lbc");
-
-        let gguf_data = build_test_gguf(1, 2, 2, 8, 16, 32);
-        let opts = ConvertOptions {
-            alignment: 128,
-            dequantize_to_f32: true,
-            requant_to: None,
-        };
-
-        let stats = convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path, &opts).unwrap();
-        assert_eq!(stats.quant_scheme, QuantScheme::F32);
-
-        let lbc_path2 = dir.join("f32_normal.lbc");
-        let opts2 = ConvertOptions {
-            alignment: 128,
-            dequantize_to_f32: false,
-            requant_to: None,
-        };
-        let stats2 =
-            convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path2, &opts2).unwrap();
-        assert_eq!(stats2.quant_scheme, QuantScheme::F32);
-
-        let lbc1 = LbcFile::open(&lbc_path).unwrap();
-        let lbc2 = LbcFile::open(&lbc_path2).unwrap();
-        assert_eq!(
-            lbc1.layer_indices[0].layer_length_bytes,
-            lbc2.layer_indices[0].layer_length_bytes,
-            "F32 dequantize should produce same layer sizes as pass-through"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn gguf_v2_converter_roundtrip() {
-        let dir = temp_dir();
-        let lbc_path = dir.join("v2_test.lbc");
-
-        let hidden = 8usize;
-        let vocab = 32usize;
-        let num_heads = 2u32;
-        let num_kv_heads = 2u32;
-        let head_dim = hidden / num_heads as usize;
-        let q_dim = num_heads as usize * head_dim;
-        let kv_dim = num_kv_heads as usize * head_dim;
-        let inter = 16usize;
-
-        let mut builder = GgufBuilder::new();
-        builder.version(2);
-
-        builder.add_string("general.architecture", "llama");
-        builder.add_u32("llama.block_count", 1);
-        builder.add_u32("llama.attention.head_count", num_heads);
-        builder.add_u32("llama.attention.head_count_kv", num_kv_heads);
-        builder.add_u32("llama.embedding_length", hidden as u32);
-        builder.add_u32("llama.feed_forward_length", inter as u32);
-        builder.add_u32("llama.context_length", 64);
-        builder.add_f32("llama.rope.freq_base", 10000.0);
-        builder.add_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
-
-        let tokens: Vec<String> = (0..vocab).map(|i| format!("t{i}")).collect();
-        let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-        builder.add_string_array("tokenizer.ggml.tokens", &token_refs);
-
-        let embedding_data: Vec<f32> = (0..vocab * hidden)
-            .map(|i| (i as f32 * 0.001) % 1.0)
-            .collect();
-        builder.add_f32_tensor(EMBEDDING_NAME, &[vocab as u64, hidden as u64], &embedding_data);
-        builder.add_f32_tensor(FINAL_NORM_NAME, &[hidden as u64], &vec![1.0; hidden]);
-        builder.add_f32_tensor(OUTPUT_PROJ_NAME, &[vocab as u64, hidden as u64], &vec![0.2; vocab * hidden]);
-
-        let layer_tensors: Vec<(&str, usize, usize)> = vec![
-            (ATTN_Q, q_dim, hidden), (ATTN_K, kv_dim, hidden), (ATTN_V, kv_dim, hidden),
-            (ATTN_OUTPUT, hidden, q_dim), (FFN_GATE, inter, hidden), (FFN_UP, inter, hidden),
-            (FFN_DOWN, hidden, inter), (ATTN_NORM, hidden, 1), (FFN_NORM, hidden, 1),
-        ];
-
-        for (suffix, rows, cols) in layer_tensors {
-            let name = layer_tensor_name(0, suffix);
-            let n = rows * cols;
-            let data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.001) % 1.0).collect();
-            let dims = if cols == 1 { vec![rows as u64] } else { vec![rows as u64, cols as u64] };
-            builder.add_f32_tensor(&name, &dims, &data);
-        }
-
-        let gguf_data = builder.build();
-        let mut cursor = std::io::Cursor::new(&gguf_data);
-        let gguf = GgufFile::parse(&mut cursor).unwrap();
-        assert_eq!(gguf.version, 2);
-
-        let opts = ConvertOptions { alignment: 128, dequantize_to_f32: false, requant_to: None };
-        let stats = convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path, &opts).unwrap();
-        assert_eq!(stats.num_layers, 1);
-        assert_eq!(stats.architecture, "llama");
-        assert_eq!(stats.quant_scheme, QuantScheme::F32);
-
-        let lbc = LbcFile::open(&lbc_path).unwrap();
-        assert_eq!(lbc.header.num_layers, 1);
-        assert_eq!(lbc.header.hyperparams.hidden_dim, hidden as u32);
-        assert_eq!(lbc.header.hyperparams.vocab_size, vocab as u32);
-        assert_eq!(lbc.header.embedding.length, (vocab * hidden * 4) as u64);
-        assert_eq!(lbc.header.final_norm.length, (hidden * 4) as u64);
-        assert_eq!(lbc.header.output_proj.length, (vocab * hidden * 4) as u64);
-
-        for (i, idx) in lbc.layer_indices.iter().enumerate() {
-            idx.validate(i).unwrap();
-        }
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
+    // round_trip_dequantize_f32_noop and gguf_v2_converter_roundtrip were
+    // removed when the generic Dense converter was retired: both
+    // depended on the synthetic-llama Dense converter pipeline. GGUF v2
+    // and v3 are still parsed by the converter (see `gguf.rs` tests) and
+    // round-tripped end-to-end by integration tests against real
+    // Qwen3.5-9B GGUFs.
 
     #[test]
     fn convert_stats_display() {
@@ -2033,296 +1653,62 @@ mod tests {
             input_size: 10 * 1024 * 1024,
             output_size: 8 * 1024 * 1024,
             num_layers: 32,
-            architecture: "llama".into(),
+            architecture: "qwen35".into(),
             tensor_count: 291,
             quant_scheme: QuantScheme::Q4_K,
         };
         let s = format!("{stats}");
         assert!(s.contains("291 tensors"));
         assert!(s.contains("32 layers"));
-        assert!(s.contains("llama"));
+        assert!(s.contains("qwen35"));
     }
 
-    fn build_test_gguf_moe(
-        num_layers: u32, num_heads: u32, num_kv_heads: u32, hidden_dim: u32,
-        intermediate_dim: u32, vocab_size: u32, num_experts: u32, num_active_experts: u32,
-    ) -> Vec<u8> {
-        let head_dim = hidden_dim / num_heads;
-        let q_dim = (num_heads * head_dim) as usize;
-        let kv_dim = (num_kv_heads * head_dim) as usize;
-        let hidden = hidden_dim as usize;
-        let inter = intermediate_dim as usize;
-        let vocab = vocab_size as usize;
+    // The MoE pipeline tests (`moe_round_trip_f32`, `moe_f16_router_*`)
+    // were removed when the generic MoE converter was retired: they
+    // built synthetic llama-arch MoE GGUFs and exercised the generic
+    // `MoeConverter` which has been deleted. The Qwen3.5-MoE converter
+    // (`arch::qwen35_moe`) is exercised by integration tests against
+    // real Qwen3.5-MoE GGUFs.
 
+    /// Hyperparameter extraction for the Qwen3.5 MoE variant: verifies
+    /// that `num_experts` and `num_active_experts` are read out of GGUF
+    /// metadata correctly for the MoE family.
+    #[test]
+    fn moe_hyperparams_extraction_qwen35moe() {
         let mut builder = GgufBuilder::new();
-        builder.add_string("general.architecture", "llama");
-        builder.add_u32("llama.block_count", num_layers);
-        builder.add_u32("llama.attention.head_count", num_heads);
-        builder.add_u32("llama.attention.head_count_kv", num_kv_heads);
-        builder.add_u32("llama.embedding_length", hidden_dim);
-        builder.add_u32("llama.feed_forward_length", intermediate_dim);
-        builder.add_u32("llama.context_length", 64);
-        builder.add_f32("llama.rope.freq_base", 10000.0);
-        builder.add_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
-        builder.add_u32("llama.expert_count", num_experts);
-        builder.add_u32("llama.expert_used_count", num_active_experts);
-
-        let embedding_data: Vec<f32> = (0..vocab * hidden).map(|i| (i as f32 * 0.001) % 1.0).collect();
-        builder.add_f32_tensor(EMBEDDING_NAME, &[vocab as u64, hidden as u64], &embedding_data);
-        let norm_data: Vec<f32> = vec![1.0; hidden];
-        builder.add_f32_tensor(FINAL_NORM_NAME, &[hidden as u64], &norm_data);
-        let output_data: Vec<f32> = (0..vocab * hidden).map(|i| (i as f32 * 0.002) % 1.0).collect();
-        builder.add_f32_tensor(OUTPUT_PROJ_NAME, &[vocab as u64, hidden as u64], &output_data);
-
-        for layer in 0..num_layers as usize {
-            let attn_tensors: Vec<(&str, usize, usize)> = vec![
-                (ATTN_Q, q_dim, hidden), (ATTN_K, kv_dim, hidden),
-                (ATTN_V, kv_dim, hidden), (ATTN_OUTPUT, hidden, q_dim),
-            ];
-            for (suffix, rows, cols) in attn_tensors {
-                let name = layer_tensor_name(layer, suffix);
-                let n = rows * cols;
-                let data: Vec<f32> = (0..n).map(|i| ((i + layer * 1000) as f32 * 0.001) % 1.0).collect();
-                builder.add_f32_tensor(&name, &[rows as u64, cols as u64], &data);
-            }
-
-            let norm: Vec<f32> = vec![1.0; hidden];
-            builder.add_f32_tensor(&layer_tensor_name(layer, ATTN_NORM), &[hidden as u64], &norm);
-            builder.add_f32_tensor(&layer_tensor_name(layer, FFN_NORM), &[hidden as u64], &norm);
-
-            let router_data: Vec<f32> = (0..(num_experts as usize * hidden)).map(|i| (i as f32 * 0.003) % 1.0).collect();
-            builder.add_f32_tensor(&layer_tensor_name(layer, FFN_GATE_INP), &[num_experts as u64, hidden as u64], &router_data);
-
-            for e in 0..num_experts as usize {
-                let gate_data: Vec<f32> = (0..inter * hidden).map(|i| ((i + e * 100 + layer * 1000) as f32 * 0.001) % 1.0).collect();
-                builder.add_f32_tensor(&expert_tensor_name(layer, "gate", e), &[inter as u64, hidden as u64], &gate_data);
-                let up_data: Vec<f32> = (0..inter * hidden).map(|i| ((i + e * 200 + layer * 1000) as f32 * 0.001) % 1.0).collect();
-                builder.add_f32_tensor(&expert_tensor_name(layer, "up", e), &[inter as u64, hidden as u64], &up_data);
-                let down_data: Vec<f32> = (0..hidden * inter).map(|i| ((i + e * 300 + layer * 1000) as f32 * 0.001) % 1.0).collect();
-                builder.add_f32_tensor(&expert_tensor_name(layer, "down", e), &[hidden as u64, inter as u64], &down_data);
-            }
+        builder.add_string("general.architecture", "qwen35moe");
+        builder.add_u32("qwen35moe.block_count", 2);
+        builder.add_u32("qwen35moe.attention.head_count", 2);
+        builder.add_u32("qwen35moe.attention.head_count_kv", 2);
+        builder.add_u32("qwen35moe.attention.key_length", 4);
+        builder.add_u32("qwen35moe.embedding_length", 8);
+        builder.add_u32("qwen35moe.feed_forward_length", 16);
+        builder.add_u32("qwen35moe.expert_count", 8);
+        builder.add_u32("qwen35moe.expert_used_count", 2);
+        builder.add_f32_tensor(EMBEDDING_NAME, &[32, 8], &vec![0.0f32; 256]);
+        for layer in 0..2 {
+            let name = layer_tensor_name(layer as usize, ATTN_Q);
+            builder.add_f32_tensor(&name, &[8, 8], &vec![0.0f32; 64]);
         }
-
-        builder.build()
-    }
-
-    #[test]
-    fn moe_round_trip_f32() {
-        let dir = temp_dir();
-        let lbc_path = dir.join("moe_test.lbc");
-        let num_experts = 4u32;
-        let num_active = 2u32;
-        let gguf_data = build_test_gguf_moe(2, 2, 2, 8, 16, 32, num_experts, num_active);
-        let opts = ConvertOptions { alignment: 128, dequantize_to_f32: false, requant_to: None };
-
-        let stats = convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path, &opts).unwrap();
-        assert_eq!(stats.num_layers, 2);
-        assert_eq!(stats.architecture, "llama");
-        assert_eq!(stats.quant_scheme, QuantScheme::F32);
-
-        let lbc = LbcFile::open(&lbc_path).unwrap();
-        assert_eq!(lbc.header.num_layers, 2);
-        assert_eq!(lbc.header.hyperparams.num_experts, Some(num_experts));
-        assert_eq!(lbc.header.hyperparams.num_active_experts, Some(num_active));
-        assert!(lbc.header.has_expert_index);
-
-        for (i, idx) in lbc.layer_indices.iter().enumerate() {
-            idx.validate(i).unwrap();
-            let st = &idx.subtensors;
-            assert!(st.router_weight.is_some(), "layer {i}: missing router_weight");
-            let experts = st.experts.as_ref().expect(&format!("layer {i}: missing experts"));
-            assert_eq!(experts.len(), num_experts as usize);
-            assert_eq!(st.w_gate.length, 0);
-            assert_eq!(st.w_up.length, 0);
-            assert_eq!(st.w_down.length, 0);
-            for (e, expert) in experts.iter().enumerate() {
-                assert!(expert.gate.length > 0, "layer {i} expert {e}: gate length=0");
-                assert!(expert.up.length > 0, "layer {i} expert {e}: up length=0");
-                assert!(expert.down.length > 0, "layer {i} expert {e}: down length=0");
-            }
-            let router = st.router_weight.as_ref().unwrap();
-            let expected_router_size = (num_experts as u64) * 8 * 4;
-            assert_eq!(router.length, expected_router_size);
-        }
-
-        assert_eq!(lbc.header.embedding.length, 32 * 8 * 4);
-        assert_eq!(lbc.header.final_norm.length, 8 * 4);
-        assert_eq!(lbc.header.output_proj.length, 32 * 8 * 4);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn moe_hyperparams_extraction() {
-        let gguf_data = build_test_gguf_moe(2, 2, 2, 8, 16, 32, 8, 2);
+        let gguf_data = builder.build();
         let mut cursor = std::io::Cursor::new(&gguf_data);
         let gguf = GgufFile::parse(&mut cursor).unwrap();
 
         let (hp, arch) = extract_hyperparams(&gguf).unwrap();
-        assert_eq!(arch, "llama");
+        assert_eq!(arch, "qwen35moe");
         assert_eq!(hp.num_experts, Some(8));
         assert_eq!(hp.num_active_experts, Some(2));
         assert!(hp.is_moe());
     }
 
+    /// Tensor-naming helpers do not depend on architecture or converter
+    /// implementation; they are pure string-builder utilities.
     #[test]
     fn moe_tensor_naming() {
         assert_eq!(layer_tensor_name(0, FFN_GATE_INP), "blk.0.ffn_gate_inp.weight");
         assert_eq!(expert_tensor_name(0, "gate", 0), "blk.0.ffn_gate.0.weight");
         assert_eq!(expert_tensor_name(0, "up", 3), "blk.0.ffn_up.3.weight");
         assert_eq!(expert_tensor_name(1, "down", 7), "blk.1.ffn_down.7.weight");
-    }
-
-    fn build_test_gguf_moe_f16_router(
-        num_layers: u32, num_heads: u32, num_kv_heads: u32, hidden_dim: u32,
-        intermediate_dim: u32, vocab_size: u32, num_experts: u32, num_active_experts: u32,
-    ) -> Vec<u8> {
-        let head_dim = hidden_dim / num_heads;
-        let q_dim = (num_heads * head_dim) as usize;
-        let kv_dim = (num_kv_heads * head_dim) as usize;
-        let hidden = hidden_dim as usize;
-        let inter = intermediate_dim as usize;
-        let vocab = vocab_size as usize;
-
-        let mut builder = GgufBuilder::new();
-        builder.add_string("general.architecture", "llama");
-        builder.add_u32("llama.block_count", num_layers);
-        builder.add_u32("llama.attention.head_count", num_heads);
-        builder.add_u32("llama.attention.head_count_kv", num_kv_heads);
-        builder.add_u32("llama.embedding_length", hidden_dim);
-        builder.add_u32("llama.feed_forward_length", intermediate_dim);
-        builder.add_u32("llama.context_length", 64);
-        builder.add_f32("llama.rope.freq_base", 10000.0);
-        builder.add_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
-        builder.add_u32("llama.expert_count", num_experts);
-        builder.add_u32("llama.expert_used_count", num_active_experts);
-
-        let embedding_data: Vec<f32> = (0..vocab * hidden).map(|i| (i as f32 * 0.001) % 1.0).collect();
-        builder.add_f32_tensor(EMBEDDING_NAME, &[vocab as u64, hidden as u64], &embedding_data);
-        let norm_data: Vec<f32> = vec![1.0; hidden];
-        builder.add_f32_tensor(FINAL_NORM_NAME, &[hidden as u64], &norm_data);
-        let output_data: Vec<f32> = (0..vocab * hidden).map(|i| (i as f32 * 0.002) % 1.0).collect();
-        builder.add_f32_tensor(OUTPUT_PROJ_NAME, &[vocab as u64, hidden as u64], &output_data);
-
-        for layer in 0..num_layers as usize {
-            let attn_tensors: Vec<(&str, usize, usize)> = vec![
-                (ATTN_Q, q_dim, hidden), (ATTN_K, kv_dim, hidden),
-                (ATTN_V, kv_dim, hidden), (ATTN_OUTPUT, hidden, q_dim),
-            ];
-            for (suffix, rows, cols) in attn_tensors {
-                let name = layer_tensor_name(layer, suffix);
-                let n = rows * cols;
-                let data: Vec<f32> = (0..n).map(|i| ((i + layer * 1000) as f32 * 0.001) % 1.0).collect();
-                builder.add_f32_tensor(&name, &[rows as u64, cols as u64], &data);
-            }
-
-            let norm: Vec<f32> = vec![1.0; hidden];
-            builder.add_f32_tensor(&layer_tensor_name(layer, ATTN_NORM), &[hidden as u64], &norm);
-            builder.add_f32_tensor(&layer_tensor_name(layer, FFN_NORM), &[hidden as u64], &norm);
-
-            let router_n = num_experts as usize * hidden;
-            let router_f32: Vec<f32> = (0..router_n).map(|i| (i as f32 * 0.003) % 1.0).collect();
-            let router_f16_bytes: Vec<u8> = router_f32.iter().flat_map(|&v| {
-                f32_to_f16_bits_convert(v).to_le_bytes()
-            }).collect();
-            builder.add_tensor(
-                &layer_tensor_name(layer, FFN_GATE_INP),
-                GgmlType::F16,
-                &[num_experts as u64, hidden as u64],
-                router_f16_bytes,
-            );
-
-            for e in 0..num_experts as usize {
-                let gate_data: Vec<f32> = (0..inter * hidden).map(|i| ((i + e * 100 + layer * 1000) as f32 * 0.001) % 1.0).collect();
-                builder.add_f32_tensor(&expert_tensor_name(layer, "gate", e), &[inter as u64, hidden as u64], &gate_data);
-                let up_data: Vec<f32> = (0..inter * hidden).map(|i| ((i + e * 200 + layer * 1000) as f32 * 0.001) % 1.0).collect();
-                builder.add_f32_tensor(&expert_tensor_name(layer, "up", e), &[inter as u64, hidden as u64], &up_data);
-                let down_data: Vec<f32> = (0..hidden * inter).map(|i| ((i + e * 300 + layer * 1000) as f32 * 0.001) % 1.0).collect();
-                builder.add_f32_tensor(&expert_tensor_name(layer, "down", e), &[hidden as u64, inter as u64], &down_data);
-            }
-        }
-
-        builder.build()
-    }
-
-    #[test]
-    fn moe_f16_router_forced_to_f32() {
-        let dir = temp_dir();
-        let lbc_path = dir.join("moe_f16_router.lbc");
-        let num_experts = 4u32;
-        let num_active = 2u32;
-        let hidden_dim = 8u32;
-        let gguf_data = build_test_gguf_moe_f16_router(2, 2, 2, hidden_dim, 16, 32, num_experts, num_active);
-
-        let opts = ConvertOptions { alignment: 128, dequantize_to_f32: false, requant_to: None };
-        let stats = convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path, &opts).unwrap();
-        assert_eq!(stats.num_layers, 2);
-
-        let lbc = LbcFile::open(&lbc_path).unwrap();
-        assert_eq!(lbc.header.hyperparams.num_experts, Some(num_experts));
-
-        for (i, idx) in lbc.layer_indices.iter().enumerate() {
-            idx.validate(i).unwrap();
-            let st = &idx.subtensors;
-            let router = st.router_weight.as_ref().expect(&format!("layer {i}: missing router_weight"));
-            assert_eq!(router.quant, QuantScheme::F32);
-            let expected_size = (num_experts as u64) * (hidden_dim as u64) * 4;
-            assert_eq!(router.length, expected_size);
-            let experts = st.experts.as_ref().expect(&format!("layer {i}: missing experts"));
-            assert_eq!(experts.len(), num_experts as usize);
-            for (e, expert) in experts.iter().enumerate() {
-                assert!(expert.gate.length > 0, "layer {i} expert {e}: gate length=0");
-                assert!(expert.up.length > 0, "layer {i} expert {e}: up length=0");
-                assert!(expert.down.length > 0, "layer {i} expert {e}: down length=0");
-            }
-        }
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn moe_f16_router_values_correct() {
-        let dir = temp_dir();
-        let lbc_path = dir.join("moe_f16_router_vals.lbc");
-        let num_experts = 4u32;
-        let hidden_dim = 8u32;
-        let gguf_data = build_test_gguf_moe_f16_router(1, 2, 2, hidden_dim, 16, 32, num_experts, 2);
-
-        let opts = ConvertOptions { alignment: 128, dequantize_to_f32: false, requant_to: None };
-        convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path, &opts).unwrap();
-
-        let lbc = LbcFile::open(&lbc_path).unwrap();
-        let idx = &lbc.layer_indices[0];
-        let router = idx.subtensors.router_weight.as_ref().unwrap();
-
-        let lbc_bytes = std::fs::read(&lbc_path).unwrap();
-        let layer_blob_start = idx.layer_offset_bytes as usize;
-        let router_start = layer_blob_start + router.offset as usize;
-        let router_end = router_start + router.length as usize;
-        let router_bytes = &lbc_bytes[router_start..router_end];
-
-        let router_n = num_experts as usize * hidden_dim as usize;
-        assert_eq!(router_bytes.len(), router_n * 4);
-        let mut recovered_f32 = Vec::with_capacity(router_n);
-        for chunk in router_bytes.chunks_exact(4) {
-            recovered_f32.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-        }
-
-        let expected_f32: Vec<f32> = (0..router_n).map(|i| (i as f32 * 0.003) % 1.0).collect();
-        for (i, (&got, &expected)) in recovered_f32.iter().zip(expected_f32.iter()).enumerate() {
-            let expected_via_f16 = f16_to_f32(f32_to_f16_bits_convert(expected));
-            assert!(
-                (got - expected_via_f16).abs() < 1e-6,
-                "router value [{i}]: got {got}, expected {expected_via_f16} (original {expected})"
-            );
-        }
-
-        for (i, &v) in recovered_f32.iter().enumerate() {
-            assert!(v.is_finite(), "router value [{i}] is not finite: {v}");
-            assert!(v >= -0.01 && v <= 1.01, "router value [{i}] out of expected range: {v}");
-        }
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2417,188 +1803,12 @@ mod tests {
         assert_eq!(f32s[16], 3.0);
     }
 
-    /// Build synthetic Q6_K blocks from F32 values.
-    /// Q6_K: 256 elements per block, 210 bytes per block.
-    /// Layout: [128 bytes ql][64 bytes qh][16 bytes scales][2 bytes f16 d]
-    /// We build trivial blocks (all zeros with zero scale) for testing
-    /// that the converter handles Q6_K output_proj correctly.
-    fn build_q6_k_zero_blocks(n_elements: usize) -> Vec<u8> {
-        assert!(n_elements % 256 == 0, "Q6_K requires elements divisible by 256");
-        let num_blocks = n_elements / 256;
-        // Each block: 210 bytes of zeros = all-zero dequantized output
-        vec![0u8; num_blocks * 210]
-    }
-
-    #[test]
-    fn output_proj_q6_k_requantized_to_q8_0() {
-        // When output.weight is Q6_K (common from llama-quantize), the converter
-        // should requantize it to Q8_0 instead of falling back to F32.
-        let dir = temp_dir();
-        let lbc_path = dir.join("q6k_output.lbc");
-
-        let hidden = 32usize;
-        let vocab = 256usize; // 256*32 = 8192 elements, divisible by 256 (Q6_K block)
-        let num_heads = 2u32;
-        let num_kv_heads = 2u32;
-        let head_dim = hidden / num_heads as usize;
-        let q_dim = num_heads as usize * head_dim;
-        let kv_dim = num_kv_heads as usize * head_dim;
-        let inter = 64usize;
-
-        let mut builder = GgufBuilder::new();
-        builder.add_string("general.architecture", "llama");
-        builder.add_u32("llama.block_count", 1);
-        builder.add_u32("llama.attention.head_count", num_heads);
-        builder.add_u32("llama.attention.head_count_kv", num_kv_heads);
-        builder.add_u32("llama.embedding_length", hidden as u32);
-        builder.add_u32("llama.feed_forward_length", inter as u32);
-        builder.add_u32("llama.context_length", 64);
-        builder.add_f32("llama.rope.freq_base", 10000.0);
-        builder.add_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
-
-        // Global tensors: embedding and final_norm as F32, output_proj as Q6_K
-        let embedding_data: Vec<f32> = vec![0.1; vocab * hidden];
-        builder.add_f32_tensor(EMBEDDING_NAME, &[vocab as u64, hidden as u64], &embedding_data);
-        builder.add_f32_tensor(FINAL_NORM_NAME, &[hidden as u64], &vec![1.0; hidden]);
-
-        // Q6_K output_proj: 8192 elements = 32 blocks * 210 bytes = 6720 bytes
-        let q6k_data = build_q6_k_zero_blocks(vocab * hidden);
-        builder.add_tensor(OUTPUT_PROJ_NAME, GgmlType::Q6_K, &[vocab as u64, hidden as u64], q6k_data);
-
-        // Per-layer tensors as F32
-        for suffix in &LAYER_TENSOR_SUFFIXES {
-            let name = layer_tensor_name(0, suffix);
-            let (rows, cols) = match *suffix {
-                ATTN_Q => (q_dim, hidden),
-                ATTN_K => (kv_dim, hidden),
-                ATTN_V => (kv_dim, hidden),
-                ATTN_OUTPUT => (hidden, q_dim),
-                FFN_GATE => (inter, hidden),
-                FFN_UP => (inter, hidden),
-                FFN_DOWN => (hidden, inter),
-                ATTN_NORM => (hidden, 1),
-                FFN_NORM => (hidden, 1),
-                _ => unreachable!(),
-            };
-            let n = rows * cols;
-            let data: Vec<f32> = vec![0.01; n];
-            let dims = if cols == 1 { vec![rows as u64] } else { vec![rows as u64, cols as u64] };
-            builder.add_f32_tensor(&name, &dims, &data);
-        }
-
-        let gguf_data = builder.build();
-
-        // Convert without explicit requant target -- K-quant should be requantized to Q8_0
-        let opts = ConvertOptions {
-            alignment: 128,
-            dequantize_to_f32: false,
-            requant_to: None,
-        };
-        let stats = convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path, &opts).unwrap();
-        assert_eq!(stats.num_layers, 1);
-
-        let lbc = LbcFile::open(&lbc_path).unwrap();
-
-        // Output proj should be Q8_0 (not F32)
-        assert_eq!(
-            lbc.header.output_proj.quant,
-            QuantScheme::Q8_0,
-            "Q6_K output.weight should be requantized to Q8_0, not stored as F32"
-        );
-
-        // Q8_0 size: 8192 elements / 32 * 34 bytes = 8704 bytes
-        let expected_q8_size = ((vocab * hidden) / 32) * 34;
-        assert_eq!(
-            lbc.header.output_proj.length,
-            expected_q8_size as u64,
-            "output_proj length should match Q8_0 encoding"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn output_proj_q6_k_with_requant_q4_0() {
-        // When requant_to=Q4_0 and output.weight is Q6_K, it should be
-        // handled by the existing requant_target=Q4_0 branch (line 269).
-        let dir = temp_dir();
-        let lbc_path = dir.join("q6k_requant_q4.lbc");
-
-        let hidden = 32usize;
-        let vocab = 256usize;
-        let num_heads = 2u32;
-        let num_kv_heads = 2u32;
-        let head_dim = hidden / num_heads as usize;
-        let q_dim = num_heads as usize * head_dim;
-        let kv_dim = num_kv_heads as usize * head_dim;
-        let inter = 64usize;
-
-        let mut builder = GgufBuilder::new();
-        builder.add_string("general.architecture", "llama");
-        builder.add_u32("llama.block_count", 1);
-        builder.add_u32("llama.attention.head_count", num_heads);
-        builder.add_u32("llama.attention.head_count_kv", num_kv_heads);
-        builder.add_u32("llama.embedding_length", hidden as u32);
-        builder.add_u32("llama.feed_forward_length", inter as u32);
-        builder.add_u32("llama.context_length", 64);
-        builder.add_f32("llama.rope.freq_base", 10000.0);
-        builder.add_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
-
-        let embedding_data: Vec<f32> = vec![0.1; vocab * hidden];
-        builder.add_f32_tensor(EMBEDDING_NAME, &[vocab as u64, hidden as u64], &embedding_data);
-        builder.add_f32_tensor(FINAL_NORM_NAME, &[hidden as u64], &vec![1.0; hidden]);
-
-        let q6k_data = build_q6_k_zero_blocks(vocab * hidden);
-        builder.add_tensor(OUTPUT_PROJ_NAME, GgmlType::Q6_K, &[vocab as u64, hidden as u64], q6k_data);
-
-        for suffix in &LAYER_TENSOR_SUFFIXES {
-            let name = layer_tensor_name(0, suffix);
-            let (rows, cols) = match *suffix {
-                ATTN_Q => (q_dim, hidden),
-                ATTN_K => (kv_dim, hidden),
-                ATTN_V => (kv_dim, hidden),
-                ATTN_OUTPUT => (hidden, q_dim),
-                FFN_GATE => (inter, hidden),
-                FFN_UP => (inter, hidden),
-                FFN_DOWN => (hidden, inter),
-                ATTN_NORM => (hidden, 1),
-                FFN_NORM => (hidden, 1),
-                _ => unreachable!(),
-            };
-            let n = rows * cols;
-            let data: Vec<f32> = vec![0.01; n];
-            let dims = if cols == 1 { vec![rows as u64] } else { vec![rows as u64, cols as u64] };
-            builder.add_f32_tensor(&name, &dims, &data);
-        }
-
-        let gguf_data = builder.build();
-
-        // Convert with requant_to=Q4_0
-        let opts = ConvertOptions {
-            alignment: 128,
-            dequantize_to_f32: false,
-            requant_to: Some(QuantScheme::Q4_0),
-        };
-        let stats = convert_gguf_bytes_to_lbc(&gguf_data, &lbc_path, &opts).unwrap();
-        assert_eq!(stats.num_layers, 1);
-
-        let lbc = LbcFile::open(&lbc_path).unwrap();
-
-        // Output proj should be Q4_0
-        assert_eq!(
-            lbc.header.output_proj.quant,
-            QuantScheme::Q4_0,
-            "Q6_K output.weight with requant_to=Q4_0 should be Q4_0"
-        );
-
-        // Q4_0 size: 8192 elements / 32 * 18 bytes = 4608 bytes
-        let expected_q4_size = ((vocab * hidden) / 32) * 18;
-        assert_eq!(
-            lbc.header.output_proj.length,
-            expected_q4_size as u64,
-            "output_proj length should match Q4_0 encoding"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
+    // The Q6_K-output-projection requantisation tests (and their
+    // `build_q6_k_zero_blocks` helper) were removed when the generic
+    // Dense converter was retired: they exercised the synthetic-llama
+    // Dense converter pipeline. The K-quant -> Q8_0/Q4_0 requantisation
+    // logic itself is unchanged (see `convert.rs` lines that match
+    // `requant_target == Some`). It is exercised end-to-end by
+    // integration tests against real Qwen3.5-9B GGUFs whose
+    // output.weight is stored as Q6_K.
 }

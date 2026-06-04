@@ -1354,7 +1354,7 @@ impl ComputeBackend for SimdF32Backend {
                         return;
                     }
 
-                    // SAFETY: Each thread writes to a disjoint range of gate[] and up[].
+                    // SAFETY: Each thread writes to a disjoint range of gateand up[].
                     // normed, normed_q8, w_gate_bytes, w_up_bytes are read-only shared references.
                     let gate_slice = unsafe {
                         std::slice::from_raw_parts_mut((gate_addr as *mut f32).add(start), chunk_len)
@@ -1459,7 +1459,7 @@ impl ComputeBackend for SimdF32Backend {
                         let chunk_len = end - start;
                         if chunk_len == 0 { return; }
 
-                        // SAFETY: Each thread writes to disjoint ranges of down[] and attn_proj[].
+                        // SAFETY: Each thread writes to disjoint ranges of downand attn_proj[].
                         // w_down_bytes and gate_q8_ref are read-only shared references.
                         let down_slice = unsafe {
                             std::slice::from_raw_parts_mut(
@@ -1739,5 +1739,12 @@ impl ComputeBackend for SimdF32Backend {
         let prof = unsafe { &*self.profile.get() };
         let num_layers = self.hyperparams.map(|hp| hp.num_layers as usize).unwrap_or(0);
         prof.print_summary(num_layers);
+    }
+
+    /// Report process RSS via `getrusage(RUSAGE_SELF)`.
+    /// Same semantics as the naive CPU backend; the SIMD path lives in the
+    /// same process and shares the same RSS counter.
+    fn peak_memory_bytes(&self) -> u64 {
+        crate::compute::process_rss_bytes()
     }
 }

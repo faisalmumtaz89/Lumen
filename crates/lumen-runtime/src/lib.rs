@@ -21,12 +21,17 @@ pub mod cuda;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod eval;
 pub mod expert;
 pub mod kv;
 pub mod pipeline;
+pub mod runtime_defaults;
+pub mod sampling;
+pub mod session;
 pub mod storage;
 pub mod telemetry;
 pub mod thread_pool;
+pub mod tooling;
 pub mod weight;
 
 pub use weight::cache::{CacheStats, LayerView, PrefetchHandle, PrefetchPriority, WeightProvider};
@@ -40,16 +45,23 @@ pub use metal::RouterLayerStats;
 #[cfg(target_os = "macos")]
 pub use accelerate::AccelerateBatchBackend;
 pub use config::RuntimeConfig;
-pub use engine::InferenceEngine;
+pub use engine::{InferenceEngine, SamplingParams, StopCondition};
 pub use error::RuntimeError;
 pub use kv::{KvCache, KvCacheConfig, KvPrecision};
+pub use session::{PrefillResult, Session, SuffixPrefillResult, TokenStream};
+pub use tooling::{
+    parse_final, ParsedAssistant, ParsedToolCall, Qwen35Renderer, StreamingDelta,
+    StreamingFinish, StreamingParser, ToolResult, ToolSchema,
+    TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
+};
 pub use pipeline::PipelineMode;
 pub use storage::{IoSnapshot, IoTracker, MmapPageCacheBackend, StorageBackend};
 #[cfg(unix)]
 pub use storage::purge_file_cache;
 pub use storage::mmap::MmapStorageBackend;
 pub use storage::sync::SyncFileBackend;
-pub use telemetry::{InferenceMetrics, IoMetrics, PerLayerTiming};
+pub use telemetry::{InferenceMetrics, IoMetrics, KvCacheStats, PerLayerTiming, ServerMemoryBreakdown};
+pub use eval::{coherence_score, CoherenceVerdict};
 pub use weight::provider_async::AsyncWeightProvider;
 pub use weight::provider_mmap::MmapWeightProvider;
 pub use weight::provider_sync::SyncWeightProvider;

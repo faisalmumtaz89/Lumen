@@ -1,9 +1,10 @@
 // ==========================================================================
 // Cooperative 4-thread-per-Q8_0-block matvec with pre-quantized Q8_1 input.
 //
-// Matches llama.cpp's mul_mat_vec_q architecture: instead of 1 thread
-// processing an entire Q8_0 block (8 dp4a calls, 32 byte loads), 4 threads
-// cooperate on each block (2 dp4a calls per thread, 8 byte loads each).
+// Uses the cooperative mul_mat_vec_q architecture: instead of
+// 1 thread processing an entire Q8_0 block (8 dp4a calls, 32 byte loads),
+// 4 threads cooperate on each block (2 dp4a calls per thread, 8 byte loads
+// each).
 //
 // Why this matters:
 //   - Current kernel: 1 thread/block, 8 dp4a + 8 scale loads + 32 weight bytes
@@ -46,7 +47,7 @@
 //   bytes [2..3]: f16 sum (unused for Q8_0 which has zero_point=0)
 //   bytes [4..35]: 32 x int8 quants (4-byte aligned)
 //
-// Requires compute capability >= 6.1 for __dp4a() (Pascal+).
+// Requires compute capability >= 6.1 for dp4a_s32() (Pascal+).
 // in_dim must be a multiple of 32 (Q8_0 block size).
 //
 // NVRTC-compatible: no system includes, extern "C" linkage.
@@ -56,7 +57,7 @@
 #define THREADS    128    // 4 warps per block
 #define NWARPS     (THREADS / WARP_SIZE)  // 4
 
-// Cooperative parameters (matching llama.cpp):
+// Cooperative mmvq parameters:
 #define QI8_0      8      // Q8_0 has 8 int32 words of quant data (32 bytes / 4)
 #define VDR        2      // Values decoded per reduction step: 2 int32 words per thread
 #define TPB        (QI8_0 / VDR)   // 4 threads per Q8_0 block
@@ -70,6 +71,15 @@ __device__ __forceinline__ float f16_bits_to_f32(unsigned short bits) {
     float result;
     asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(bits));
     return result;
+}
+
+// inline-PTX dp4a wrapper. The `__dp4a` intrinsic NVRTC-fails in
+// this build env (driver 580.126.20 / CUDA 12.2 / sm_80). The inline
+// `dp4a.s32.s32` opcode loads cleanly on compute_80.
+__device__ __forceinline__ int dp4a_s32(int a, int b, int c) {
+    int d;
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
 }
 
 // Warp-level reduction: sum all 32 lanes via butterfly shuffle.
@@ -160,8 +170,8 @@ extern "C" __global__ __launch_bounds__(THREADS, 1) void matvec_q8_coop_q8_1(
         int x1 = xq[kqs + 1];
 
         // 2 dp4a calls: 8 multiply-accumulates total.
-        int acc = __dp4a(w0, x0, 0);
-        acc = __dp4a(w1, x1, acc);
+        int acc = dp4a_s32(w0, x0, 0);
+        acc = dp4a_s32(w1, x1, acc);
 
         sum += w_scale * x_scale * (float)acc;
     }
@@ -253,8 +263,8 @@ extern "C" __global__ __launch_bounds__(THREADS, 1) void matvec_q8_coop_q8_1_res
         int x0 = xq[kqs];
         int x1 = xq[kqs + 1];
 
-        int acc = __dp4a(w0, x0, 0);
-        acc = __dp4a(w1, x1, acc);
+        int acc = dp4a_s32(w0, x0, 0);
+        acc = dp4a_s32(w1, x1, acc);
 
         sum += w_scale * x_scale * (float)acc;
     }
@@ -337,8 +347,8 @@ extern "C" __global__ __launch_bounds__(THREADS, 1) void matvec_q8a_coop_q8_1(
         int x1 = xq[kqs + 1];
 
         // 2 dp4a calls: 8 multiply-accumulates total.
-        int acc = __dp4a(w0, x0, 0);
-        acc = __dp4a(w1, x1, acc);
+        int acc = dp4a_s32(w0, x0, 0);
+        acc = dp4a_s32(w1, x1, acc);
 
         sum += w_scale * x_scale * (float)acc;
     }
@@ -415,8 +425,8 @@ extern "C" __global__ __launch_bounds__(THREADS, 1) void matvec_q8a_coop_q8_1_re
         int x0 = xq[kqs];
         int x1 = xq[kqs + 1];
 
-        int acc = __dp4a(w0, x0, 0);
-        acc = __dp4a(w1, x1, acc);
+        int acc = dp4a_s32(w0, x0, 0);
+        acc = dp4a_s32(w1, x1, acc);
 
         sum += w_scale * x_scale * (float)acc;
     }

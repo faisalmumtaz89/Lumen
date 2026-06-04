@@ -1,8 +1,8 @@
 // ============================================================================
 // ============================================================================
-// dequant_matmul_q8_0_2sg: MLX-style 2-SG independent row ownership matvec
+// dequant_matmul_q8_0_2sg: 2-simdgroup independent row ownership matvec
 //
-// Key insight from MLX: Instead of 4 SGs cooperatively computing the SAME rows
+// Design choice: instead of 4 SGs cooperatively computing the SAME rows
 // (requiring cross-SG reduction via shmem + 2 barriers), use 2 SGs where each
 // SG independently owns 4 output rows. Zero threadgroup barriers. Zero shared
 // memory for reduction.
@@ -97,7 +97,7 @@ kernel void dequant_matmul_q8_0_2sg(
 }
 
 // ============================================================================
-// dequant_matmul_q8_0_2sg_residual: MLX-style 2-SG matvec + residual add
+// dequant_matmul_q8_0_2sg_residual: 2-simdgroup matvec + residual add
 // out[row] = dot(w_q8_row, x) + residual[row]
 // Same 2-SG independent ownership pattern, with fused residual addition.
 //
@@ -176,7 +176,7 @@ kernel void dequant_matmul_q8_0_2sg_residual(
 }
 
 // ============================================================================
-// ffn_fused_gate_up_swiglu_q8_0_2sg: MLX-style 2-SG fused Gate+Up+SwiGLU
+// ffn_fused_gate_up_swiglu_q8_0_2sg: 2-simdgroup fused Gate+Up+SwiGLU
 //
 // Same 2-SG independent ownership but fuses gate+up+SwiGLU:
 // Each SG owns 4 output rows. For each row, compute both gate and up dot

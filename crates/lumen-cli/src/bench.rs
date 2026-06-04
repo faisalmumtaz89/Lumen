@@ -14,6 +14,22 @@ pub(crate) fn generate_test_model_cmd(args: &[String]) {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--help" | "-h" => {
+                println!("USAGE:");
+                println!("    lumen generate-test-model [OPTIONS]");
+                println!();
+                println!("Writes a synthetic LBC file. Default is a tiny 2-layer model");
+                println!("(~400 KB) used by the engine smoke tests; --size lets the");
+                println!("benchmark suite emit a larger fixture.");
+                println!();
+                println!("OPTIONS:");
+                println!("    --output <path>, -o <path>");
+                println!("                       Output LBC path (default: test_model.lbc in cwd)");
+                println!("    --size <spec>      Generate a larger benchmark fixture instead of the");
+                println!("                       tiny default. One of: 256mb | 1gb | 4gb | 7b");
+                println!("    -h, --help         Print this help");
+                return;
+            }
             "--output" | "-o" => {
                 i += 1;
                 output_path = args.get(i).unwrap_or_else(|| {
@@ -45,7 +61,7 @@ pub(crate) fn generate_test_model_cmd(args: &[String]) {
                 "256mb" => LargeModelConfig::bench_256mb(),
                 "1gb" => LargeModelConfig::bench_1gb(),
                 "4gb" => LargeModelConfig::bench_4gb(),
-                "7b" => LargeModelConfig::llama_7b(),
+                "7b" => LargeModelConfig::seven_b_reference(),
                 _ => {
                     eprintln!("Error: unknown size '{sz}'. Use: 256mb, 1gb, 4gb, 7b");
                     std::process::exit(1);
@@ -118,7 +134,18 @@ pub(crate) fn purge_cmd(args: &[String]) {
                 }).clone());
             }
             "--help" | "-h" => {
-                println!("USAGE: lumen purge --model <path.lbc>");
+                println!("USAGE:");
+                println!("    lumen purge --model <path.lbc>");
+                println!();
+                println!("Evicts a model file from the OS page cache so the next");
+                println!("`lumen run` (or benchmark) measures cold-start I/O cost.");
+                println!("Best-effort on macOS via `posix_fadvise(POSIX_FADV_DONTNEED)`");
+                println!("equivalent; takes effect only when no other process holds the");
+                println!("file open. Unix-only.");
+                println!();
+                println!("OPTIONS:");
+                println!("    --model <path>    Path to the .lbc file to purge (required)");
+                println!("    -h, --help        Print this help");
                 return;
             }
             other => {

@@ -189,12 +189,15 @@ kernel void dequant_tiled_matmul_q8_0_residual_batched(
 // ============================================================================
 // tiled_matmul_bytes_f32_residual: Tiled GEMM + residual with byte-encoded F32
 //
-// C[m,n] = A[M,K] * B^T[N,K] + R[m,n]
+// (2026-06-02): see `tiled_matmul_bytes_f32` for the buffer-binding
+// convention fix. Same swap applied here: buf 0 is now the BYTE-encoded
+// WEIGHT [N, K], buf 1 is the FLOAT INPUT [M, K], buf 2 is output [M, N],
+// buf 6 is residual [M, N]. Math: C = X * W^T + R.
 // ============================================================================
 
 kernel void tiled_matmul_bytes_f32_residual(
-    device const float* A        [[buffer(0)]],
-    device const uchar* B_bytes  [[buffer(1)]],
+    device const uchar* W_bytes  [[buffer(0)]],
+    device const float* X        [[buffer(1)]],
     device float*       C        [[buffer(2)]],
     constant uint&      M        [[buffer(3)]],
     constant uint&      N        [[buffer(4)]],
@@ -204,7 +207,9 @@ kernel void tiled_matmul_bytes_f32_residual(
     ushort tiitg                 [[thread_index_in_threadgroup]],
     ushort sgitg                 [[simdgroup_index_in_threadgroup]])
 {
-    device const float* B = (device const float*)B_bytes;
+    // Aliases preserve the original body's indexing exactly.
+    device const float* A = X;
+    device const float* B = (device const float*)W_bytes;
 
     threadgroup half shmem[2048];
     threadgroup half* sa = shmem;

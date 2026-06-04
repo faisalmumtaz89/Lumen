@@ -2,7 +2,7 @@
 
 use super::ArchConverter;
 use super::gdn_gates::{compute_ssm_slices, write_ssm_tensors};
-use crate::convert::ConvertError;
+use crate::convert::{ConvertError, ConvertTarget};
 use crate::dequant::*;
 use crate::gguf::{GgmlType, GgufFile};
 use crate::tensor_names::*;
@@ -23,8 +23,9 @@ impl ArchConverter for Qwen35MoeConverter {
         layer: usize,
         dequantize: bool,
         _requant_to: Option<QuantScheme>,
+        target: ConvertTarget,
     ) -> Result<LayerShape, ConvertError> {
-        compute_layer_shape_qwen35moe(gguf, layer, self.num_experts, dequantize)
+        compute_layer_shape_qwen35moe(gguf, layer, self.num_experts, dequantize, target)
     }
 
     fn write_layer_blob<R: Read + Seek>(
@@ -35,8 +36,9 @@ impl ArchConverter for Qwen35MoeConverter {
         layer: usize,
         dequantize: bool,
         _requant_to: Option<QuantScheme>,
+        target: ConvertTarget,
     ) -> Result<(), ConvertError> {
-        write_qwen35moe_layer_blob(blob, reader, gguf, layer, self.num_experts, dequantize)
+        write_qwen35moe_layer_blob(blob, reader, gguf, layer, self.num_experts, dequantize, target)
     }
 
     fn layer_kind_label(&self, layer: usize) -> String {
@@ -70,6 +72,7 @@ fn append_stacked_expert_slice<R: Read + Seek>(
     expert_idx: usize,
     num_experts: u64,
     dequantize: bool,
+    target: ConvertTarget,
 ) -> Result<(), ConvertError> {
     let tensor = gguf.find_tensor(tensor_name)
         .ok_or_else(|| ConvertError::MissingTensor(tensor_name.to_string()))?;
@@ -88,6 +91,23 @@ fn append_stacked_expert_slice<R: Read + Seek>(
         reader.read_exact(&mut buf)?;
         let f32_data = dequantize_to_f32_bytes(&buf, tensor.ggml_type, expert_elements, tensor_name)?;
         blob.extend_from_slice(&f32_data);
+    } else if target == ConvertTarget::Metal && is_k_quant(tensor.ggml_type) {
+        // Metal K-quant upcast for stacked expert weights: dequant slice to F32
+        // then quantize to Q8_0. Must match compute_stacked_slice's reported
+        // byte size when target == Metal.
+        let total_size = tensor.byte_size().ok_or_else(|| ConvertError::UnsupportedTensorType {
+            tensor: tensor_name.to_string(),
+            ggml_type: format!("{:?} (unknown block geometry)", tensor.ggml_type),
+        })?;
+        let expert_byte_size = total_size / num_experts;
+        let expert_offset = base_offset + (expert_idx as u64) * expert_byte_size;
+        reader.seek(SeekFrom::Start(expert_offset))?;
+        let mut buf = vec![0u8; expert_byte_size as usize];
+        reader.read_exact(&mut buf)?;
+        let f32_data = dequantize_to_f32_bytes(&buf, tensor.ggml_type, expert_elements, tensor_name)?;
+        let n_elems = expert_elements as usize;
+        let q8_data = quantize_f32_to_q8_0(&f32_data, n_elems);
+        blob.extend_from_slice(&q8_data);
     } else if tensor.ggml_type == GgmlType::Q4_1 {
         // Q4_1 has no dedicated GPU kernel -- requantize to Q4_0.
         let total_size = tensor.byte_size().ok_or_else(|| ConvertError::UnsupportedTensorType {
@@ -129,6 +149,7 @@ fn compute_stacked_slice(
     blob_offset: &mut u64,
     dequantize: bool,
     num_experts: u64,
+    target: ConvertTarget,
 ) -> Result<TensorSlice, ConvertError> {
     let tensor = gguf.find_tensor(tensor_name)
         .ok_or_else(|| ConvertError::MissingTensor(tensor_name.to_string()))?;
@@ -137,6 +158,15 @@ fn compute_stacked_slice(
         let expert_elements = tensor.n_elements() / num_experts;
         let size = expert_elements * 4;
         let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::F32 };
+        *blob_offset += size;
+        Ok(slice)
+    } else if target == ConvertTarget::Metal && is_k_quant(tensor.ggml_type) {
+        // Metal K-quant upcast: stacked expert slice -> Q8_0.
+        let expert_elements = tensor.n_elements() / num_experts;
+        assert!(expert_elements % 32 == 0,
+            "Q8_0 requires elements divisible by 32, got {expert_elements} for {tensor_name}");
+        let size = ((expert_elements as usize / 32) * 34) as u64;
+        let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::Q8_0 };
         *blob_offset += size;
         Ok(slice)
     } else if tensor.ggml_type == GgmlType::Q4_1 {
@@ -187,6 +217,7 @@ fn compute_layer_shape_qwen35moe(
     layer: usize,
     num_experts: u32,
     dequantize: bool,
+    target: ConvertTarget,
 ) -> Result<LayerShape, ConvertError> {
     let mut blob_size = 0u64;
     let is_full_attn = is_qwen35moe_full_attention_layer(layer);
@@ -197,10 +228,20 @@ fn compute_layer_shape_qwen35moe(
     {
         let tensor = gguf.find_tensor(name)
             .ok_or_else(|| ConvertError::MissingTensor(name.to_string()))?;
+        let is_norm = name.contains("norm");
         if dequantize {
             let n_elements = tensor.n_elements();
             let size = n_elements * 4;
             let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::F32 };
+            *blob_offset += size;
+            Ok(slice)
+        } else if target == ConvertTarget::Metal && !is_norm && is_k_quant(tensor.ggml_type) {
+            // Metal K-quant upcast for layer tensor: Qx_K -> Q8_0.
+            let n_elements = tensor.n_elements();
+            assert!(n_elements % 32 == 0,
+                "Q8_0 requires elements divisible by 32, got {n_elements} for {name}");
+            let size = ((n_elements as usize / 32) * 34) as u64;
+            let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::Q8_0 };
             *blob_offset += size;
             Ok(slice)
         } else if tensor.ggml_type == GgmlType::Q4_1 {
@@ -323,9 +364,9 @@ fn compute_layer_shape_qwen35moe(
 
     let mut expert_slices = Vec::with_capacity(num_experts as usize);
     for _e in 0..num_experts as usize {
-        let gate = compute_stacked_slice(gguf, &gate_exps_name, &mut blob_size, dequantize, num_experts.into())?;
-        let up = compute_stacked_slice(gguf, &up_exps_name, &mut blob_size, dequantize, num_experts.into())?;
-        let down = compute_stacked_slice(gguf, &down_exps_name, &mut blob_size, dequantize, num_experts.into())?;
+        let gate = compute_stacked_slice(gguf, &gate_exps_name, &mut blob_size, dequantize, num_experts.into(), target)?;
+        let up = compute_stacked_slice(gguf, &up_exps_name, &mut blob_size, dequantize, num_experts.into(), target)?;
+        let down = compute_stacked_slice(gguf, &down_exps_name, &mut blob_size, dequantize, num_experts.into(), target)?;
         expert_slices.push(ExpertSlice { gate, up, down });
     }
 
@@ -405,6 +446,7 @@ fn write_qwen35moe_layer_blob<R: Read + Seek>(
     layer: usize,
     num_experts: u32,
     dequantize: bool,
+    target: ConvertTarget,
 ) -> Result<(), ConvertError> {
     let is_full_attn = is_qwen35moe_full_attention_layer(layer);
 
@@ -412,11 +454,11 @@ fn write_qwen35moe_layer_blob<R: Read + Seek>(
     if is_full_attn {
         // Full attention: separate Q/K/V/output tensors
         for suffix in &ATTN_TENSOR_SUFFIXES {
-            append_tensor_to_blob(blob, reader, gguf, &layer_tensor_name(layer, suffix), dequantize)?;
+            append_tensor_to_blob_requant_with_target(blob, reader, gguf, &layer_tensor_name(layer, suffix), dequantize, None, target)?;
         }
     } else {
         // Linear attention: fused QKV tensor only (stored in wq slot in index)
-        append_tensor_to_blob(blob, reader, gguf, &layer_tensor_name(layer, ATTN_QKV), dequantize)?;
+        append_tensor_to_blob_requant_with_target(blob, reader, gguf, &layer_tensor_name(layer, ATTN_QKV), dequantize, None, target)?;
     }
 
     // Pre-attention norm
@@ -437,7 +479,7 @@ fn write_qwen35moe_layer_blob<R: Read + Seek>(
     // Attention gate (if present)
     let attn_gate_name = layer_tensor_name(layer, ATTN_GATE_WEIGHT);
     if gguf.find_tensor(&attn_gate_name).is_some() {
-        append_tensor_to_blob(blob, reader, gguf, &attn_gate_name, dequantize)?;
+        append_tensor_to_blob_requant_with_target(blob, reader, gguf, &attn_gate_name, dequantize, None, target)?;
     }
 
     // SSM tensors (if present) — shared GDN gate logic handles force-requant
@@ -459,9 +501,9 @@ fn write_qwen35moe_layer_blob<R: Read + Seek>(
     let down_exps_name = layer_tensor_name(layer, FFN_DOWN_EXPS);
 
     for e in 0..num_experts as usize {
-        append_stacked_expert_slice(blob, reader, gguf, &gate_exps_name, e, num_experts.into(), dequantize)?;
-        append_stacked_expert_slice(blob, reader, gguf, &up_exps_name, e, num_experts.into(), dequantize)?;
-        append_stacked_expert_slice(blob, reader, gguf, &down_exps_name, e, num_experts.into(), dequantize)?;
+        append_stacked_expert_slice(blob, reader, gguf, &gate_exps_name, e, num_experts.into(), dequantize, target)?;
+        append_stacked_expert_slice(blob, reader, gguf, &up_exps_name, e, num_experts.into(), dequantize, target)?;
+        append_stacked_expert_slice(blob, reader, gguf, &down_exps_name, e, num_experts.into(), dequantize, target)?;
     }
 
     // Shared expert weights (if present) -- dequantize to F32 then requantize to Q4_0.

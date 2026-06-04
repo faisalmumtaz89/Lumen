@@ -1,0 +1,68 @@
+[package]
+name = "lumen-server"
+description = "HTTP server with OpenAI / Anthropic / legacy completion APIs for Lumen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints.rust]
+# `stacks_dump` is an opt-in diagnostic cfg (see tests/server_soak.rs), enabled via
+# `RUSTFLAGS='--cfg stacks_dump'`; declare it so the default build is warning-clean.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(stacks_dump)'] }
+
+[features]
+default = []
+cuda = ["lumen-runtime/cuda"]
+# opt-in `lumen-server` standalone binary. Activates the
+# `lumen-cli` dependency for tokenizer reuse + LBC tokenizer wiring. Library
+# consumers that embed lumen-server without the bin keep their default
+# (empty) feature surface so the dep graph stays minimal.
+bin = ["dep:lumen-cli", "dep:lumen-convert", "dep:mimalloc"]
+
+# Standalone server binary; gated on the `bin` feature.
+# Gated on the `bin` feature so embedders that don't want the lumen-cli
+# tokenizer pull keep their dep graph clean.
+[[bin]]
+name = "lumen-server"
+path = "src/bin/lumen-server.rs"
+required-features = ["bin"]
+
+[dependencies]
+lumen-runtime.workspace = true
+lumen-format.workspace = true
+thiserror.workspace = true
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "json"] }
+# bin requires `signal` for graceful Ctrl-C shutdown.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+tower = { version = "0.5", default-features = false }
+tower-http = { version = "0.5", default-features = false, features = ["trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+bytes = "1"
+http-body = "1"
+# bin-only deps (gated `optional = true` + activated by the
+# `bin` feature above). Library consumers stay allocator-agnostic and pull
+# zero extra transitive deps when `bin` is OFF.
+lumen-cli = { path = "../lumen-cli", default-features = false, optional = true }
+lumen-convert = { workspace = true, optional = true }
+mimalloc = { workspace = true, optional = true }
+
+[dev-dependencies]
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "client", "client-legacy", "http1"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
+# soak harness — reuses lumen-cli's `BpeTokenizer` via the
+# `lumen_cli` library facade so the soak does not fork the BPE
+# implementation (convention).
+lumen-cli = { path = "../lumen-cli", default-features = false }
+lumen-convert.workspace = true
+# Global allocator for the integration + soak test
+# binaries (declared in tests/server_soak.rs, tests/server_integration.rs,
+# tests/server_memory_breakdown.rs). The lumen-server library itself does
+# NOT depend on mimalloc so external consumers stay allocator-agnostic.
+mimalloc = { workspace = true }

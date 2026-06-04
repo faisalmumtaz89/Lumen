@@ -67,6 +67,10 @@ impl MetalF32Backend {
             matmul_f16_deferred_nr2: make_pipeline!("matmul_f16_deferred_nr2"),
             matmul_f16_deferred_residual_nr2: make_pipeline!("matmul_f16_deferred_residual_nr2"),
             matmul_f16_deferred_bias_nr2: make_pipeline!("matmul_f16_deferred_bias_nr2"),
+            // BF16 decode kernels
+            matmul_bf16_deferred_nr2: make_pipeline!("matmul_bf16_deferred_nr2"),
+            matmul_bf16_deferred_residual_nr2: make_pipeline!("matmul_bf16_deferred_residual_nr2"),
+            matmul_bf16_deferred_bias_nr2: make_pipeline!("matmul_bf16_deferred_bias_nr2"),
             dequant_matmul_q8_0: make_pipeline!("dequant_matmul_q8_0"),
             rmsnorm: make_pipeline!("rmsnorm"),
             rmsnorm_bytes: make_pipeline!("rmsnorm_bytes"),
@@ -90,6 +94,7 @@ impl MetalF32Backend {
             embed_token_q8_0: make_pipeline!("embed_token_q8_0"),
             embed_token_q4_0: make_pipeline!("embed_token_q4_0"),
             embed_token_f16: make_pipeline!("embed_token_f16"),
+            embed_token_bf16: make_pipeline!("embed_token_bf16"),
             dequant_matmul_q8_0_residual: make_pipeline!("dequant_matmul_q8_0_residual"),
             dequant_matmul_q8_0_multirow: make_pipeline!("dequant_matmul_q8_0_multirow"),
             dequant_matmul_q8_0_residual_multirow: make_pipeline!("dequant_matmul_q8_0_residual_multirow"),
@@ -103,7 +108,7 @@ impl MetalF32Backend {
             dequant_matmul_q8_0_deferred_nr2: make_pipeline!("dequant_matmul_q8_0_deferred_nr2"),
             dequant_matmul_q8_0_deferred_residual_nr2: make_pipeline!("dequant_matmul_q8_0_deferred_residual_nr2"),
             dequant_matmul_q8_0_deferred_bias_nr2: make_pipeline!("dequant_matmul_q8_0_deferred_bias_nr2"),
-            // MLX-style 2-SG kernels
+            // 2-simdgroup matmul kernels (two SIMD groups cooperate on one output tile).
             dequant_matmul_q8_0_2sg: make_pipeline!("dequant_matmul_q8_0_2sg"),
             dequant_matmul_q8_0_2sg_residual: make_pipeline!("dequant_matmul_q8_0_2sg_residual"),
             ffn_fused_gate_up_swiglu_q8_0_2sg: make_pipeline!("ffn_fused_gate_up_swiglu_q8_0_2sg"),
@@ -132,19 +137,49 @@ impl MetalF32Backend {
             tiled_matmul_f16_residual: make_pipeline!("tiled_matmul_f16_residual"),
             tiled_matmul_f16_k64: make_bc_pipeline!("tiled_matmul_f16_k64"),
             tiled_matmul_f16_k64_residual: make_bc_pipeline!("tiled_matmul_f16_k64_residual"),
+            // BF16 prefill GEMM kernels
+            tiled_matmul_bf16: make_pipeline!("tiled_matmul_bf16"),
+            tiled_matmul_bf16_residual: make_pipeline!("tiled_matmul_bf16_residual"),
+            tiled_matmul_bf16_k64: make_bc_pipeline!("tiled_matmul_bf16_k64"),
+            tiled_matmul_bf16_k64_residual: make_bc_pipeline!("tiled_matmul_bf16_k64_residual"),
             matmul_bytes_f32_residual: make_pipeline!("matmul_bytes_f32_residual"),
             copy_buffer: make_pipeline!("copy_buffer"),
             add_write: make_pipeline!("add_write"),
 
             // Split-K GEMM kernels
             dequant_tiled_matmul_q8_0_splitk: make_pipeline!("dequant_tiled_matmul_q8_0_splitk"),
+            dequant_tiled_matmul_q8_0_k64_splitk: make_pipeline!("dequant_tiled_matmul_q8_0_k64_splitk"),
             reduce_splitk: make_pipeline!("reduce_splitk"),
+            reduce_splitk_add_residual: make_pipeline!("reduce_splitk_add_residual"),
 
             // K64 GEMM variants
             dequant_tiled_matmul_q8_0_k64: make_bc_pipeline!("dequant_tiled_matmul_q8_0_k64"),
             dequant_tiled_matmul_q8_0_k64_residual_batched: make_bc_pipeline!("dequant_tiled_matmul_q8_0_k64_residual_batched"),
             dequant_tiled_matmul_q4_0_k64: make_bc_pipeline!("dequant_tiled_matmul_q4_0_k64"),
             dequant_tiled_matmul_q4_0_k64_residual_batched: make_bc_pipeline!("dequant_tiled_matmul_q4_0_k64_residual_batched"),
+
+            // Joint gate+up+SwiGLU fused kernel (Q8_0).
+            dequant_tiled_matmul_q8_0_gate_up_swiglu_fused: make_bc_pipeline!("dequant_tiled_matmul_q8_0_gate_up_swiglu_fused"),
+            dequant_tiled_matmul_q8_0_gate_up_swiglu_fused_aligned: make_aligned_pipeline!("dequant_tiled_matmul_q8_0_gate_up_swiglu_fused"),
+
+            // packed-layout kernels (consume runtime-repacked SoA buffers).
+            dequant_tiled_matmul_q8_0_k64_residual_batched_packed: make_bc_pipeline!("dequant_tiled_matmul_q8_0_k64_residual_batched_packed"),
+            dequant_tiled_matmul_q8_0_k64_residual_batched_packed_aligned: make_aligned_pipeline!("dequant_tiled_matmul_q8_0_k64_residual_batched_packed"),
+            dequant_tiled_matmul_q8_0_gate_up_swiglu_fused_packed: make_bc_pipeline!("dequant_tiled_matmul_q8_0_gate_up_swiglu_fused_packed"),
+            dequant_tiled_matmul_q8_0_gate_up_swiglu_fused_packed_aligned: make_aligned_pipeline!("dequant_tiled_matmul_q8_0_gate_up_swiglu_fused_packed"),
+
+            // Q4_0 port of fused gate+up+SwiGLU kernel.
+            dequant_tiled_matmul_q4_0_gate_up_swiglu_fused: make_bc_pipeline!("dequant_tiled_matmul_q4_0_gate_up_swiglu_fused"),
+            dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_aligned: make_aligned_pipeline!("dequant_tiled_matmul_q4_0_gate_up_swiglu_fused"),
+
+            // packed-layout Q4_0 kernels (consume runtime-repacked SoA buffers).
+            dequant_tiled_matmul_q4_0_k64_residual_batched_packed: make_bc_pipeline!("dequant_tiled_matmul_q4_0_k64_residual_batched_packed"),
+            dequant_tiled_matmul_q4_0_k64_residual_batched_packed_aligned: make_aligned_pipeline!("dequant_tiled_matmul_q4_0_k64_residual_batched_packed"),
+            dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed: make_bc_pipeline!("dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed"),
+            dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed_aligned: make_aligned_pipeline!("dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed"),
+
+            // ggml-metal ported Q8_0 GEMM (env-var gated)
+            kernel_mul_mm_q8_0_f32_ported: make_pipeline!("kernel_mul_mm_q8_0_f32_ported"),
 
             // Function-constant-specialized aligned GEMM variants (no boundary checks)
             dequant_tiled_matmul_q8_0_aligned: make_aligned_pipeline!("dequant_tiled_matmul_q8_0"),
@@ -155,6 +190,24 @@ impl MetalF32Backend {
             dequant_tiled_matmul_q4_0_k64_residual_batched_aligned: make_aligned_pipeline!("dequant_tiled_matmul_q4_0_k64_residual_batched"),
             tiled_matmul_f16_k64_aligned: make_aligned_pipeline!("tiled_matmul_f16_k64"),
             tiled_matmul_f16_k64_residual_aligned: make_aligned_pipeline!("tiled_matmul_f16_k64_residual"),
+            tiled_matmul_bf16_k64_aligned: make_aligned_pipeline!("tiled_matmul_bf16_k64"),
+            tiled_matmul_bf16_k64_residual_aligned: make_aligned_pipeline!("tiled_matmul_bf16_k64_residual"),
+            // BF16 GDN qkv-proj + attn-gate-proj paired GEMM (BC + aligned).
+            tiled_matmul_bf16_k64_qkv_gate_paired: make_bc_pipeline!("tiled_matmul_bf16_k64_qkv_gate_paired"),
+            tiled_matmul_bf16_k64_qkv_gate_paired_aligned: make_aligned_pipeline!("tiled_matmul_bf16_k64_qkv_gate_paired"),
+            // minimal warmup kernel for the paired repack buffer.
+            bf16_paired_warmup: make_pipeline!("bf16_paired_warmup"),
+            // BF16 fused gate+up+SwiGLU (FC_BC_*=true and FC_BC_*=false variants).
+            bf16_matmul_gate_up_swiglu_fused: make_bc_pipeline!("bf16_matmul_gate_up_swiglu_fused"),
+            bf16_matmul_gate_up_swiglu_fused_aligned: make_aligned_pipeline!("bf16_matmul_gate_up_swiglu_fused"),
+            // NR microtile sweep variants of the fused gate+up+SwiGLU kernel.
+            bf16_matmul_gate_up_swiglu_fused_nr1: make_bc_pipeline!("bf16_matmul_gate_up_swiglu_fused_nr1"),
+            bf16_matmul_gate_up_swiglu_fused_nr1_aligned: make_aligned_pipeline!("bf16_matmul_gate_up_swiglu_fused_nr1"),
+            bf16_matmul_gate_up_swiglu_fused_nr4: make_bc_pipeline!("bf16_matmul_gate_up_swiglu_fused_nr4"),
+            bf16_matmul_gate_up_swiglu_fused_nr4_aligned: make_aligned_pipeline!("bf16_matmul_gate_up_swiglu_fused_nr4"),
+            // BF16 K64 Split-K (FC_BC_*=true and FC_BC_*=false variants).
+            bf16_matmul_k64_splitk: make_bc_pipeline!("bf16_matmul_k64_splitk"),
+            bf16_matmul_k64_splitk_aligned: make_aligned_pipeline!("bf16_matmul_k64_splitk"),
 
             // Batched prefill kernels
             tiled_matmul_f32: make_pipeline!("tiled_matmul_f32"),
@@ -166,11 +219,13 @@ impl MetalF32Backend {
             rope_batched_neox: lib.get_function("rope_batched_neox")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             add_residual_batched: make_pipeline!("add_residual_batched"),
+            memset_half_zero: make_pipeline!("memset_half_zero"),
             swiglu_batched: make_pipeline!("swiglu_batched"),
             embed_tokens_batched: make_pipeline!("embed_tokens_batched"),
             embed_tokens_batched_q8_0: make_pipeline!("embed_tokens_batched_q8_0"),
             embed_tokens_batched_q4_0: make_pipeline!("embed_tokens_batched_q4_0"),
             embed_tokens_batched_f16: make_pipeline!("embed_tokens_batched_f16"),
+            embed_tokens_batched_bf16: make_pipeline!("embed_tokens_batched_bf16"),
             kv_cache_write_batched: make_pipeline!("kv_cache_write_batched"),
             v_cache_write_batched: make_pipeline!("v_cache_write_batched"),
             attention_scores_batched: make_pipeline!("attention_scores_batched"),
@@ -185,6 +240,9 @@ impl MetalF32Backend {
             // Fused RMSNorm + F16 matvec NR2
             rmsnorm_matmul_f16_deferred_nr2: make_pipeline!("rmsnorm_matmul_f16_deferred_nr2"),
             rmsnorm_matmul_f16_deferred_residual_nr2: make_pipeline!("rmsnorm_matmul_f16_deferred_residual_nr2"),
+            // Fused RMSNorm + BF16 matvec NR2
+            rmsnorm_matmul_bf16_deferred_nr2: make_pipeline!("rmsnorm_matmul_bf16_deferred_nr2"),
+            rmsnorm_matmul_bf16_deferred_residual_nr2: make_pipeline!("rmsnorm_matmul_bf16_deferred_residual_nr2"),
             rmsnorm_ffn_fused_gate_up_swiglu_q8_0_deferred: make_pipeline!("rmsnorm_ffn_fused_gate_up_swiglu_q8_0_deferred"),
             rmsnorm_ffn_fused_gate_up_swiglu_q8_0_8row: make_pipeline!("rmsnorm_ffn_fused_gate_up_swiglu_q8_0_8row"),
             rmsnorm_ffn_fused_gate_up_swiglu_q4_0_deferred: make_pipeline!("rmsnorm_ffn_fused_gate_up_swiglu_q4_0_deferred"),
@@ -338,6 +396,9 @@ impl MetalF32Backend {
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             gdn_prefill_fused_v3_chunked: lib.get_function("gdn_prefill_fused_v3_chunked")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // (32, NSG=4, 1) threadgroup geometry for Phase 2a.
+            gdn_prefill_fused_v3_chunked_nsg4: lib.get_function("gdn_prefill_fused_v3_chunked_nsg4")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             gdn_prefill_norm_gate: lib.get_function("gdn_prefill_norm_gate")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             ssm_conv1d_prefill: lib.get_function("ssm_conv1d_prefill")
@@ -345,6 +406,8 @@ impl MetalF32Backend {
             ssm_conv1d_silu_prefill: lib.get_function("ssm_conv1d_silu_prefill")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             ssm_conv1d_silu_prefill_parallel: lib.get_function("ssm_conv1d_silu_prefill_parallel")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            ssm_conv1d_state_update: lib.get_function("ssm_conv1d_state_update")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             l2_normalize_heads_batched: lib.get_function("l2_normalize_heads_batched")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),

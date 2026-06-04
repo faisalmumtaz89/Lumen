@@ -512,6 +512,491 @@ kernel void dequant_tiled_matmul_q4_0_k64(
 }
 
 // ============================================================================
+// dequant_tiled_matmul_q4_0_gate_up_swiglu_fused: Joint dual-output gate+up
+// GEMM with register-resident SwiGLU writeback.
+//
+// Mirrors the Q8_0 fused kernel structure but for Q4_0 weights. Replaces
+// the three-dispatch chain (gate GEMM, up GEMM, swiglu_batched) used by the
+// FFN prefill path with a single kernel that:
+//   1. Reads the A-tile (token activations) once into shmem.
+//   2. Dequantizes BOTH gate and up Q4_0 tiles (de-interleaved nibbles) into
+//      separate shmem regions.
+//   3. Computes both gate and up output tiles via simdgroup MMA in registers.
+//   4. Applies SwiGLU (silu(gate) * up) in registers at the epilogue.
+//   5. Writes only the SwiGLU activation to global memory.
+//
+// Threadgroup memory:
+//   sa[TILE_M * TILE_K_64] = 32 * 64 = 2048 halfs = 4 KB  (shared A tile)
+//   sb_gate[TILE_N * TILE_K_64] = 32 * 64 = 2048 halfs = 4 KB
+//   sb_up  [TILE_N * TILE_K_64] = 32 * 64 = 2048 halfs = 4 KB
+//   total = 6144 halfs = 12 KB  (matches Q8 fused kernel, under M3 16 KB knee)
+//
+// Output: writes [M, N] float activation to Y. Eliminates the gate_buf and
+// up_buf hidden_inter (M * inter_dim) writes and reads.
+//
+// Function constants FC_BC_M / FC_BC_N / FC_BC_K control boundary handling.
+// ============================================================================
+
+kernel void dequant_tiled_matmul_q4_0_gate_up_swiglu_fused(
+    device const uchar* W_gate   [[buffer(0)]],   // Q4_0 gate weights [N, K_bytes]
+    device const float* X        [[buffer(1)]],   // [M, K] input activations
+    device float*       Y        [[buffer(2)]],   // [M, N] SwiGLU output
+    constant uint&      M        [[buffer(3)]],   // batch size
+    constant uint&      N        [[buffer(4)]],   // inter_dim
+    constant uint&      K        [[buffer(5)]],   // hidden_dim
+    device const uchar* W_up     [[buffer(6)]],   // Q4_0 up weights [N, K_bytes]
+    uint2 tg_pos                 [[threadgroup_position_in_grid]],
+    ushort tiitg                 [[thread_index_in_threadgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]])
+{
+    // 6144 halfs = 12 KB threadgroup memory (under 16 KB knee, 2 TG/CU on M3).
+    threadgroup half shmem_q4_gus[6144];
+    threadgroup half* sa     = shmem_q4_gus;
+    threadgroup half* sb_g   = shmem_q4_gus + TILE_M * TILE_K_64;
+    threadgroup half* sb_u   = shmem_q4_gus + TILE_M * TILE_K_64 + TILE_N * TILE_K_64;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    // Two output accumulators: gate and up.
+    simdgroup_float8x8 mc_g[2][2];
+    simdgroup_float8x8 mc_u[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++) {
+            mc_g[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+            mc_u[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        }
+
+    uint num_blocks_per_row = (K + Q4_GROUP_SIZE - 1) / Q4_GROUP_SIZE;
+    uint row_bytes = num_blocks_per_row * Q4_BLOCK_SIZE;
+
+    uint num_k_tiles = (K + TILE_K_64 - 1) / TILE_K_64;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K_64;
+
+        // ---- Load A tile (X): 32 rows x 64 cols. Same layout as q4_0_k64. ----
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 4;   // col_group * 16
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sa_ptr = sa + row * TILE_K_64 + k_start;
+
+            if (FC_BC_M || FC_BC_K) {
+                if (gm < M && gk + 15 < K) {
+                    device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                    float4 v0 = x_ptr[0];
+                    float4 v1 = x_ptr[1];
+                    float4 v2 = x_ptr[2];
+                    float4 v3 = x_ptr[3];
+                    sa_ptr[0]  = (half)v0.x; sa_ptr[1]  = (half)v0.y;
+                    sa_ptr[2]  = (half)v0.z; sa_ptr[3]  = (half)v0.w;
+                    sa_ptr[4]  = (half)v1.x; sa_ptr[5]  = (half)v1.y;
+                    sa_ptr[6]  = (half)v1.z; sa_ptr[7]  = (half)v1.w;
+                    sa_ptr[8]  = (half)v2.x; sa_ptr[9]  = (half)v2.y;
+                    sa_ptr[10] = (half)v2.z; sa_ptr[11] = (half)v2.w;
+                    sa_ptr[12] = (half)v3.x; sa_ptr[13] = (half)v3.y;
+                    sa_ptr[14] = (half)v3.z; sa_ptr[15] = (half)v3.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sa_ptr[i] = (gm < M && gk_i < K) ? (half)X[gm * K + gk_i] : (half)0.0h;
+                    }
+                }
+            } else {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                float4 v2 = x_ptr[2];
+                float4 v3 = x_ptr[3];
+                sa_ptr[0]  = (half)v0.x; sa_ptr[1]  = (half)v0.y;
+                sa_ptr[2]  = (half)v0.z; sa_ptr[3]  = (half)v0.w;
+                sa_ptr[4]  = (half)v1.x; sa_ptr[5]  = (half)v1.y;
+                sa_ptr[6]  = (half)v1.z; sa_ptr[7]  = (half)v1.w;
+                sa_ptr[8]  = (half)v2.x; sa_ptr[9]  = (half)v2.y;
+                sa_ptr[10] = (half)v2.z; sa_ptr[11] = (half)v2.w;
+                sa_ptr[12] = (half)v3.x; sa_ptr[13] = (half)v3.y;
+                sa_ptr[14] = (half)v3.z; sa_ptr[15] = (half)v3.w;
+            }
+        }
+
+        // ---- Load B-gate tile + B-up tile: 32 rows x 64 cols each. ----
+        // Two passes per tile (matches q4_0_k64): each pass loads one Q4_0
+        // block (32 elements) for BOTH gate and up. The de-interleaved
+        // nibble ordering (lo nibbles for elem 0..15, hi nibbles for
+        // elem 16..31) must be respected exactly as in q4_0_k64.
+        {
+            ushort n_local = tiitg >> 2;       // 0..31 (which row)
+            ushort t_in_row = tiitg & 3;       // 0..3 (quarter of 32 elements)
+            ushort k_offset = t_in_row * 8;
+            uint gn = tile_n_start + n_local;
+
+            uint block_idx_0 = k_base / Q4_GROUP_SIZE;
+            uint block_idx_1 = (k_base + 32) / Q4_GROUP_SIZE;
+
+            ushort byte_start = (k_offset < 16) ? k_offset : (k_offset - 16);
+            bool use_hi = (k_offset >= 16);
+
+            threadgroup half* sb_g_row_0 = sb_g + n_local * TILE_K_64 + k_offset;
+            threadgroup half* sb_u_row_0 = sb_u + n_local * TILE_K_64 + k_offset;
+            threadgroup half* sb_g_row_1 = sb_g + n_local * TILE_K_64 + 32 + k_offset;
+            threadgroup half* sb_u_row_1 = sb_u + n_local * TILE_K_64 + 32 + k_offset;
+
+            if (FC_BC_N || FC_BC_K) {
+                // Gate, pass 0
+                if (gn < N && k_base + k_offset < K) {
+                    uint w_off = gn * row_bytes + block_idx_0 * Q4_BLOCK_SIZE;
+                    half scale_g = as_type<half>(*(device const ushort*)(W_gate + w_off));
+                    device const uchar* qd_g = W_gate + w_off + 2;
+                    uint krem = K - (k_base + k_offset);
+                    ushort cnt = (krem >= 8) ? 8 : (ushort)krem;
+                    if (cnt == 8) {
+                        if (use_hi) {
+                            sb_g_row_0[0] = scale_g * (half)(int((qd_g[byte_start + 0] >> 4)) - 8);
+                            sb_g_row_0[1] = scale_g * (half)(int((qd_g[byte_start + 1] >> 4)) - 8);
+                            sb_g_row_0[2] = scale_g * (half)(int((qd_g[byte_start + 2] >> 4)) - 8);
+                            sb_g_row_0[3] = scale_g * (half)(int((qd_g[byte_start + 3] >> 4)) - 8);
+                            sb_g_row_0[4] = scale_g * (half)(int((qd_g[byte_start + 4] >> 4)) - 8);
+                            sb_g_row_0[5] = scale_g * (half)(int((qd_g[byte_start + 5] >> 4)) - 8);
+                            sb_g_row_0[6] = scale_g * (half)(int((qd_g[byte_start + 6] >> 4)) - 8);
+                            sb_g_row_0[7] = scale_g * (half)(int((qd_g[byte_start + 7] >> 4)) - 8);
+                        } else {
+                            sb_g_row_0[0] = scale_g * (half)(int((qd_g[byte_start + 0] & 0xF)) - 8);
+                            sb_g_row_0[1] = scale_g * (half)(int((qd_g[byte_start + 1] & 0xF)) - 8);
+                            sb_g_row_0[2] = scale_g * (half)(int((qd_g[byte_start + 2] & 0xF)) - 8);
+                            sb_g_row_0[3] = scale_g * (half)(int((qd_g[byte_start + 3] & 0xF)) - 8);
+                            sb_g_row_0[4] = scale_g * (half)(int((qd_g[byte_start + 4] & 0xF)) - 8);
+                            sb_g_row_0[5] = scale_g * (half)(int((qd_g[byte_start + 5] & 0xF)) - 8);
+                            sb_g_row_0[6] = scale_g * (half)(int((qd_g[byte_start + 6] & 0xF)) - 8);
+                            sb_g_row_0[7] = scale_g * (half)(int((qd_g[byte_start + 7] & 0xF)) - 8);
+                        }
+                    } else {
+                        for (ushort i = 0; i < cnt; i++) {
+                            ushort elem_idx = k_offset + i;
+                            ushort byte_idx = (elem_idx < 16) ? elem_idx : (elem_idx - 16);
+                            uchar raw = qd_g[byte_idx];
+                            int nibble = (elem_idx >= 16) ? int((raw >> 4) & 0xF) : int(raw & 0xF);
+                            sb_g_row_0[i] = scale_g * (half)(nibble - 8);
+                        }
+                        for (ushort i = cnt; i < 8; i++) sb_g_row_0[i] = (half)0.0h;
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 8; i++) sb_g_row_0[i] = (half)0.0h;
+                }
+                // Up, pass 0
+                if (gn < N && k_base + k_offset < K) {
+                    uint w_off = gn * row_bytes + block_idx_0 * Q4_BLOCK_SIZE;
+                    half scale_u = as_type<half>(*(device const ushort*)(W_up + w_off));
+                    device const uchar* qd_u = W_up + w_off + 2;
+                    uint krem = K - (k_base + k_offset);
+                    ushort cnt = (krem >= 8) ? 8 : (ushort)krem;
+                    if (cnt == 8) {
+                        if (use_hi) {
+                            sb_u_row_0[0] = scale_u * (half)(int((qd_u[byte_start + 0] >> 4)) - 8);
+                            sb_u_row_0[1] = scale_u * (half)(int((qd_u[byte_start + 1] >> 4)) - 8);
+                            sb_u_row_0[2] = scale_u * (half)(int((qd_u[byte_start + 2] >> 4)) - 8);
+                            sb_u_row_0[3] = scale_u * (half)(int((qd_u[byte_start + 3] >> 4)) - 8);
+                            sb_u_row_0[4] = scale_u * (half)(int((qd_u[byte_start + 4] >> 4)) - 8);
+                            sb_u_row_0[5] = scale_u * (half)(int((qd_u[byte_start + 5] >> 4)) - 8);
+                            sb_u_row_0[6] = scale_u * (half)(int((qd_u[byte_start + 6] >> 4)) - 8);
+                            sb_u_row_0[7] = scale_u * (half)(int((qd_u[byte_start + 7] >> 4)) - 8);
+                        } else {
+                            sb_u_row_0[0] = scale_u * (half)(int((qd_u[byte_start + 0] & 0xF)) - 8);
+                            sb_u_row_0[1] = scale_u * (half)(int((qd_u[byte_start + 1] & 0xF)) - 8);
+                            sb_u_row_0[2] = scale_u * (half)(int((qd_u[byte_start + 2] & 0xF)) - 8);
+                            sb_u_row_0[3] = scale_u * (half)(int((qd_u[byte_start + 3] & 0xF)) - 8);
+                            sb_u_row_0[4] = scale_u * (half)(int((qd_u[byte_start + 4] & 0xF)) - 8);
+                            sb_u_row_0[5] = scale_u * (half)(int((qd_u[byte_start + 5] & 0xF)) - 8);
+                            sb_u_row_0[6] = scale_u * (half)(int((qd_u[byte_start + 6] & 0xF)) - 8);
+                            sb_u_row_0[7] = scale_u * (half)(int((qd_u[byte_start + 7] & 0xF)) - 8);
+                        }
+                    } else {
+                        for (ushort i = 0; i < cnt; i++) {
+                            ushort elem_idx = k_offset + i;
+                            ushort byte_idx = (elem_idx < 16) ? elem_idx : (elem_idx - 16);
+                            uchar raw = qd_u[byte_idx];
+                            int nibble = (elem_idx >= 16) ? int((raw >> 4) & 0xF) : int(raw & 0xF);
+                            sb_u_row_0[i] = scale_u * (half)(nibble - 8);
+                        }
+                        for (ushort i = cnt; i < 8; i++) sb_u_row_0[i] = (half)0.0h;
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 8; i++) sb_u_row_0[i] = (half)0.0h;
+                }
+                // Gate, pass 1
+                if (gn < N && k_base + 32 + k_offset < K) {
+                    uint w_off = gn * row_bytes + block_idx_1 * Q4_BLOCK_SIZE;
+                    half scale_g = as_type<half>(*(device const ushort*)(W_gate + w_off));
+                    device const uchar* qd_g = W_gate + w_off + 2;
+                    uint krem = K - (k_base + 32 + k_offset);
+                    ushort cnt = (krem >= 8) ? 8 : (ushort)krem;
+                    if (cnt == 8) {
+                        if (use_hi) {
+                            sb_g_row_1[0] = scale_g * (half)(int((qd_g[byte_start + 0] >> 4)) - 8);
+                            sb_g_row_1[1] = scale_g * (half)(int((qd_g[byte_start + 1] >> 4)) - 8);
+                            sb_g_row_1[2] = scale_g * (half)(int((qd_g[byte_start + 2] >> 4)) - 8);
+                            sb_g_row_1[3] = scale_g * (half)(int((qd_g[byte_start + 3] >> 4)) - 8);
+                            sb_g_row_1[4] = scale_g * (half)(int((qd_g[byte_start + 4] >> 4)) - 8);
+                            sb_g_row_1[5] = scale_g * (half)(int((qd_g[byte_start + 5] >> 4)) - 8);
+                            sb_g_row_1[6] = scale_g * (half)(int((qd_g[byte_start + 6] >> 4)) - 8);
+                            sb_g_row_1[7] = scale_g * (half)(int((qd_g[byte_start + 7] >> 4)) - 8);
+                        } else {
+                            sb_g_row_1[0] = scale_g * (half)(int((qd_g[byte_start + 0] & 0xF)) - 8);
+                            sb_g_row_1[1] = scale_g * (half)(int((qd_g[byte_start + 1] & 0xF)) - 8);
+                            sb_g_row_1[2] = scale_g * (half)(int((qd_g[byte_start + 2] & 0xF)) - 8);
+                            sb_g_row_1[3] = scale_g * (half)(int((qd_g[byte_start + 3] & 0xF)) - 8);
+                            sb_g_row_1[4] = scale_g * (half)(int((qd_g[byte_start + 4] & 0xF)) - 8);
+                            sb_g_row_1[5] = scale_g * (half)(int((qd_g[byte_start + 5] & 0xF)) - 8);
+                            sb_g_row_1[6] = scale_g * (half)(int((qd_g[byte_start + 6] & 0xF)) - 8);
+                            sb_g_row_1[7] = scale_g * (half)(int((qd_g[byte_start + 7] & 0xF)) - 8);
+                        }
+                    } else {
+                        for (ushort i = 0; i < cnt; i++) {
+                            ushort elem_idx = k_offset + i;
+                            ushort byte_idx = (elem_idx < 16) ? elem_idx : (elem_idx - 16);
+                            uchar raw = qd_g[byte_idx];
+                            int nibble = (elem_idx >= 16) ? int((raw >> 4) & 0xF) : int(raw & 0xF);
+                            sb_g_row_1[i] = scale_g * (half)(nibble - 8);
+                        }
+                        for (ushort i = cnt; i < 8; i++) sb_g_row_1[i] = (half)0.0h;
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 8; i++) sb_g_row_1[i] = (half)0.0h;
+                }
+                // Up, pass 1
+                if (gn < N && k_base + 32 + k_offset < K) {
+                    uint w_off = gn * row_bytes + block_idx_1 * Q4_BLOCK_SIZE;
+                    half scale_u = as_type<half>(*(device const ushort*)(W_up + w_off));
+                    device const uchar* qd_u = W_up + w_off + 2;
+                    uint krem = K - (k_base + 32 + k_offset);
+                    ushort cnt = (krem >= 8) ? 8 : (ushort)krem;
+                    if (cnt == 8) {
+                        if (use_hi) {
+                            sb_u_row_1[0] = scale_u * (half)(int((qd_u[byte_start + 0] >> 4)) - 8);
+                            sb_u_row_1[1] = scale_u * (half)(int((qd_u[byte_start + 1] >> 4)) - 8);
+                            sb_u_row_1[2] = scale_u * (half)(int((qd_u[byte_start + 2] >> 4)) - 8);
+                            sb_u_row_1[3] = scale_u * (half)(int((qd_u[byte_start + 3] >> 4)) - 8);
+                            sb_u_row_1[4] = scale_u * (half)(int((qd_u[byte_start + 4] >> 4)) - 8);
+                            sb_u_row_1[5] = scale_u * (half)(int((qd_u[byte_start + 5] >> 4)) - 8);
+                            sb_u_row_1[6] = scale_u * (half)(int((qd_u[byte_start + 6] >> 4)) - 8);
+                            sb_u_row_1[7] = scale_u * (half)(int((qd_u[byte_start + 7] >> 4)) - 8);
+                        } else {
+                            sb_u_row_1[0] = scale_u * (half)(int((qd_u[byte_start + 0] & 0xF)) - 8);
+                            sb_u_row_1[1] = scale_u * (half)(int((qd_u[byte_start + 1] & 0xF)) - 8);
+                            sb_u_row_1[2] = scale_u * (half)(int((qd_u[byte_start + 2] & 0xF)) - 8);
+                            sb_u_row_1[3] = scale_u * (half)(int((qd_u[byte_start + 3] & 0xF)) - 8);
+                            sb_u_row_1[4] = scale_u * (half)(int((qd_u[byte_start + 4] & 0xF)) - 8);
+                            sb_u_row_1[5] = scale_u * (half)(int((qd_u[byte_start + 5] & 0xF)) - 8);
+                            sb_u_row_1[6] = scale_u * (half)(int((qd_u[byte_start + 6] & 0xF)) - 8);
+                            sb_u_row_1[7] = scale_u * (half)(int((qd_u[byte_start + 7] & 0xF)) - 8);
+                        }
+                    } else {
+                        for (ushort i = 0; i < cnt; i++) {
+                            ushort elem_idx = k_offset + i;
+                            ushort byte_idx = (elem_idx < 16) ? elem_idx : (elem_idx - 16);
+                            uchar raw = qd_u[byte_idx];
+                            int nibble = (elem_idx >= 16) ? int((raw >> 4) & 0xF) : int(raw & 0xF);
+                            sb_u_row_1[i] = scale_u * (half)(nibble - 8);
+                        }
+                        for (ushort i = cnt; i < 8; i++) sb_u_row_1[i] = (half)0.0h;
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 8; i++) sb_u_row_1[i] = (half)0.0h;
+                }
+            } else {
+                // Aligned fast path: no boundary checks.
+                // Gate, pass 0
+                {
+                    uint w_off = gn * row_bytes + block_idx_0 * Q4_BLOCK_SIZE;
+                    half scale_g = as_type<half>(*(device const ushort*)(W_gate + w_off));
+                    device const uchar* qd_g = W_gate + w_off + 2;
+                    if (use_hi) {
+                        sb_g_row_0[0] = scale_g * (half)(int((qd_g[byte_start + 0] >> 4)) - 8);
+                        sb_g_row_0[1] = scale_g * (half)(int((qd_g[byte_start + 1] >> 4)) - 8);
+                        sb_g_row_0[2] = scale_g * (half)(int((qd_g[byte_start + 2] >> 4)) - 8);
+                        sb_g_row_0[3] = scale_g * (half)(int((qd_g[byte_start + 3] >> 4)) - 8);
+                        sb_g_row_0[4] = scale_g * (half)(int((qd_g[byte_start + 4] >> 4)) - 8);
+                        sb_g_row_0[5] = scale_g * (half)(int((qd_g[byte_start + 5] >> 4)) - 8);
+                        sb_g_row_0[6] = scale_g * (half)(int((qd_g[byte_start + 6] >> 4)) - 8);
+                        sb_g_row_0[7] = scale_g * (half)(int((qd_g[byte_start + 7] >> 4)) - 8);
+                    } else {
+                        sb_g_row_0[0] = scale_g * (half)(int((qd_g[byte_start + 0] & 0xF)) - 8);
+                        sb_g_row_0[1] = scale_g * (half)(int((qd_g[byte_start + 1] & 0xF)) - 8);
+                        sb_g_row_0[2] = scale_g * (half)(int((qd_g[byte_start + 2] & 0xF)) - 8);
+                        sb_g_row_0[3] = scale_g * (half)(int((qd_g[byte_start + 3] & 0xF)) - 8);
+                        sb_g_row_0[4] = scale_g * (half)(int((qd_g[byte_start + 4] & 0xF)) - 8);
+                        sb_g_row_0[5] = scale_g * (half)(int((qd_g[byte_start + 5] & 0xF)) - 8);
+                        sb_g_row_0[6] = scale_g * (half)(int((qd_g[byte_start + 6] & 0xF)) - 8);
+                        sb_g_row_0[7] = scale_g * (half)(int((qd_g[byte_start + 7] & 0xF)) - 8);
+                    }
+                }
+                // Up, pass 0
+                {
+                    uint w_off = gn * row_bytes + block_idx_0 * Q4_BLOCK_SIZE;
+                    half scale_u = as_type<half>(*(device const ushort*)(W_up + w_off));
+                    device const uchar* qd_u = W_up + w_off + 2;
+                    if (use_hi) {
+                        sb_u_row_0[0] = scale_u * (half)(int((qd_u[byte_start + 0] >> 4)) - 8);
+                        sb_u_row_0[1] = scale_u * (half)(int((qd_u[byte_start + 1] >> 4)) - 8);
+                        sb_u_row_0[2] = scale_u * (half)(int((qd_u[byte_start + 2] >> 4)) - 8);
+                        sb_u_row_0[3] = scale_u * (half)(int((qd_u[byte_start + 3] >> 4)) - 8);
+                        sb_u_row_0[4] = scale_u * (half)(int((qd_u[byte_start + 4] >> 4)) - 8);
+                        sb_u_row_0[5] = scale_u * (half)(int((qd_u[byte_start + 5] >> 4)) - 8);
+                        sb_u_row_0[6] = scale_u * (half)(int((qd_u[byte_start + 6] >> 4)) - 8);
+                        sb_u_row_0[7] = scale_u * (half)(int((qd_u[byte_start + 7] >> 4)) - 8);
+                    } else {
+                        sb_u_row_0[0] = scale_u * (half)(int((qd_u[byte_start + 0] & 0xF)) - 8);
+                        sb_u_row_0[1] = scale_u * (half)(int((qd_u[byte_start + 1] & 0xF)) - 8);
+                        sb_u_row_0[2] = scale_u * (half)(int((qd_u[byte_start + 2] & 0xF)) - 8);
+                        sb_u_row_0[3] = scale_u * (half)(int((qd_u[byte_start + 3] & 0xF)) - 8);
+                        sb_u_row_0[4] = scale_u * (half)(int((qd_u[byte_start + 4] & 0xF)) - 8);
+                        sb_u_row_0[5] = scale_u * (half)(int((qd_u[byte_start + 5] & 0xF)) - 8);
+                        sb_u_row_0[6] = scale_u * (half)(int((qd_u[byte_start + 6] & 0xF)) - 8);
+                        sb_u_row_0[7] = scale_u * (half)(int((qd_u[byte_start + 7] & 0xF)) - 8);
+                    }
+                }
+                // Gate, pass 1
+                {
+                    uint w_off = gn * row_bytes + block_idx_1 * Q4_BLOCK_SIZE;
+                    half scale_g = as_type<half>(*(device const ushort*)(W_gate + w_off));
+                    device const uchar* qd_g = W_gate + w_off + 2;
+                    if (use_hi) {
+                        sb_g_row_1[0] = scale_g * (half)(int((qd_g[byte_start + 0] >> 4)) - 8);
+                        sb_g_row_1[1] = scale_g * (half)(int((qd_g[byte_start + 1] >> 4)) - 8);
+                        sb_g_row_1[2] = scale_g * (half)(int((qd_g[byte_start + 2] >> 4)) - 8);
+                        sb_g_row_1[3] = scale_g * (half)(int((qd_g[byte_start + 3] >> 4)) - 8);
+                        sb_g_row_1[4] = scale_g * (half)(int((qd_g[byte_start + 4] >> 4)) - 8);
+                        sb_g_row_1[5] = scale_g * (half)(int((qd_g[byte_start + 5] >> 4)) - 8);
+                        sb_g_row_1[6] = scale_g * (half)(int((qd_g[byte_start + 6] >> 4)) - 8);
+                        sb_g_row_1[7] = scale_g * (half)(int((qd_g[byte_start + 7] >> 4)) - 8);
+                    } else {
+                        sb_g_row_1[0] = scale_g * (half)(int((qd_g[byte_start + 0] & 0xF)) - 8);
+                        sb_g_row_1[1] = scale_g * (half)(int((qd_g[byte_start + 1] & 0xF)) - 8);
+                        sb_g_row_1[2] = scale_g * (half)(int((qd_g[byte_start + 2] & 0xF)) - 8);
+                        sb_g_row_1[3] = scale_g * (half)(int((qd_g[byte_start + 3] & 0xF)) - 8);
+                        sb_g_row_1[4] = scale_g * (half)(int((qd_g[byte_start + 4] & 0xF)) - 8);
+                        sb_g_row_1[5] = scale_g * (half)(int((qd_g[byte_start + 5] & 0xF)) - 8);
+                        sb_g_row_1[6] = scale_g * (half)(int((qd_g[byte_start + 6] & 0xF)) - 8);
+                        sb_g_row_1[7] = scale_g * (half)(int((qd_g[byte_start + 7] & 0xF)) - 8);
+                    }
+                }
+                // Up, pass 1
+                {
+                    uint w_off = gn * row_bytes + block_idx_1 * Q4_BLOCK_SIZE;
+                    half scale_u = as_type<half>(*(device const ushort*)(W_up + w_off));
+                    device const uchar* qd_u = W_up + w_off + 2;
+                    if (use_hi) {
+                        sb_u_row_1[0] = scale_u * (half)(int((qd_u[byte_start + 0] >> 4)) - 8);
+                        sb_u_row_1[1] = scale_u * (half)(int((qd_u[byte_start + 1] >> 4)) - 8);
+                        sb_u_row_1[2] = scale_u * (half)(int((qd_u[byte_start + 2] >> 4)) - 8);
+                        sb_u_row_1[3] = scale_u * (half)(int((qd_u[byte_start + 3] >> 4)) - 8);
+                        sb_u_row_1[4] = scale_u * (half)(int((qd_u[byte_start + 4] >> 4)) - 8);
+                        sb_u_row_1[5] = scale_u * (half)(int((qd_u[byte_start + 5] >> 4)) - 8);
+                        sb_u_row_1[6] = scale_u * (half)(int((qd_u[byte_start + 6] >> 4)) - 8);
+                        sb_u_row_1[7] = scale_u * (half)(int((qd_u[byte_start + 7] >> 4)) - 8);
+                    } else {
+                        sb_u_row_1[0] = scale_u * (half)(int((qd_u[byte_start + 0] & 0xF)) - 8);
+                        sb_u_row_1[1] = scale_u * (half)(int((qd_u[byte_start + 1] & 0xF)) - 8);
+                        sb_u_row_1[2] = scale_u * (half)(int((qd_u[byte_start + 2] & 0xF)) - 8);
+                        sb_u_row_1[3] = scale_u * (half)(int((qd_u[byte_start + 3] & 0xF)) - 8);
+                        sb_u_row_1[4] = scale_u * (half)(int((qd_u[byte_start + 4] & 0xF)) - 8);
+                        sb_u_row_1[5] = scale_u * (half)(int((qd_u[byte_start + 5] & 0xF)) - 8);
+                        sb_u_row_1[6] = scale_u * (half)(int((qd_u[byte_start + 6] & 0xF)) - 8);
+                        sb_u_row_1[7] = scale_u * (half)(int((qd_u[byte_start + 7] & 0xF)) - 8);
+                    }
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- MMA: accumulate BOTH gate and up outputs in parallel. ----
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K_64; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K_64 + ks, TILE_K_64);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K_64 + ks, TILE_K_64);
+
+            // Gate B tile.
+            simdgroup_half8x8 mb_g[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb_g[0], sb_g + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb_g[1], sb_g + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc_g[0][0], ma[0], mb_g[0], mc_g[0][0]);
+            simdgroup_multiply_accumulate(mc_g[0][1], ma[0], mb_g[1], mc_g[0][1]);
+            simdgroup_multiply_accumulate(mc_g[1][0], ma[1], mb_g[0], mc_g[1][0]);
+            simdgroup_multiply_accumulate(mc_g[1][1], ma[1], mb_g[1], mc_g[1][1]);
+
+            // Up B tile (re-uses ma loads above).
+            simdgroup_half8x8 mb_u[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb_u[0], sb_u + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb_u[1], sb_u + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc_u[0][0], ma[0], mb_u[0], mc_u[0][0]);
+            simdgroup_multiply_accumulate(mc_u[0][1], ma[0], mb_u[1], mc_u[0][1]);
+            simdgroup_multiply_accumulate(mc_u[1][0], ma[1], mb_u[0], mc_u[1][0]);
+            simdgroup_multiply_accumulate(mc_u[1][1], ma[1], mb_u[1], mc_u[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ---- SwiGLU epilogue (matches Q8 fused kernel verbatim). ----
+    // Cast shmem to floats and split into two halves: gate (4 KB) and up (4 KB).
+    threadgroup float* sc_gate = (threadgroup float*)shmem_q4_gus;
+    threadgroup float* sc_up   = (threadgroup float*)shmem_q4_gus + 4 * 256;
+    threadgroup float* my_sc_gate = sc_gate + sgitg * 256;
+    threadgroup float* my_sc_up   = sc_up   + sgitg * 256;
+
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++) {
+            simdgroup_store(mc_g[i][j], my_sc_gate + (i * 8) * 16 + (j * 8), 16);
+            simdgroup_store(mc_u[i][j], my_sc_up   + (i * 8) * 16 + (j * 8), 16);
+        }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    ushort lane = tiitg % 32;
+    if (FC_BC_M || FC_BC_N) {
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            if (gm < M && gn < N) {
+                float g = my_sc_gate[local_m * 16 + local_n];
+                float u = my_sc_up  [local_m * 16 + local_n];
+                float sig = 1.0f / (1.0f + exp(-g));
+                Y[gm * N + gn] = g * sig * u;
+            }
+        }
+    } else {
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            float g = my_sc_gate[local_m * 16 + local_n];
+            float u = my_sc_up  [local_m * 16 + local_n];
+            float sig = 1.0f / (1.0f + exp(-g));
+            Y[gm * N + gn] = g * sig * u;
+        }
+    }
+}
+
+// ============================================================================
 // dequant_tiled_matmul_q4_0_k64_residual_batched: K64 variant + residual add
 //
 // Y[m,n] = X[M,K] * dequant(W_q4[N,K_bytes])^T + R[m,n]
@@ -1565,6 +2050,825 @@ kernel void dequant_tiled_matmul_q4_0_splitk(
             if (gm < M && gn < N) {
                 Y_partial[partial_offset + gm * N + gn] = my_sc[local_m * 16 + local_n];
             }
+        }
+    }
+}
+
+// ============================================================================
+// Packed-layout Q4_0 GEMM kernels
+//
+// These kernels are bit-identical to their AoS counterparts (no precision
+// loss, same FMA order, same simdgroup MMA path) but consume a repacked
+// weight buffer in a stripe SoA layout (see `metal/repack_q4.rs`):
+//
+//   For each (row_group=gn/32, k_block=k_offset/32), the packed layout is
+//   a contiguous 576-byte block:
+//
+//     bytes [  0.. 64]: 32 × f16 scales  (one per row in the row-group)
+//     bytes [ 64..576]: 32 × 16-byte qdata (row-major within the group)
+//
+//   stripe_stride = (K / 32) * 576
+//   block_base    = row_group * stripe_stride + k_block * 576
+//   scale_for_row = block_base + (row_in_group) * 2
+//   qdata_for_row = block_base + 64 + (row_in_group) * 16
+//
+// Why repack: the original AoS kernel (gemm_q4.msl:1006) reads 4 threads
+// per row-block, each fetching its own 2-byte scale (4× redundant scale
+// fetches). With SoA, the 32 scales for a row-group sit on a 64-byte
+// contiguous segment — Apple AGX coalesces these into a single 128-byte
+// L1 line transfer regardless of thread arbitration, removing the
+// redundancy. The Q4 nibble extraction (low nibbles for elements 0..15
+// in low 4 bits, high nibbles for elements 16..31 in high 4 bits) is
+// preserved verbatim: only the address of the source qdata bytes changes.
+//
+// The kernel structure (TG geometry, MMA loops, residual writeback,
+// FC_BC_M/N/K function constants) is unchanged from the AoS K64 variant.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// dequant_tiled_matmul_q4_0_k64_residual_batched_packed
+//
+// Same algorithm as `dequant_tiled_matmul_q4_0_k64_residual_batched` but
+// reads weights from the packed stripe layout. Used for FFN-down.
+// ----------------------------------------------------------------------------
+
+kernel void dequant_tiled_matmul_q4_0_k64_residual_batched_packed(
+    device const uchar* W_q4     [[buffer(0)]],   // Packed Q4_0 weights, stripe SoA
+    device const float* X        [[buffer(1)]],   // [M, K] input batch
+    device float*       Y        [[buffer(2)]],   // [M, N] output batch
+    constant uint&      M        [[buffer(3)]],
+    constant uint&      N        [[buffer(4)]],
+    constant uint&      K        [[buffer(5)]],
+    device const float* R        [[buffer(6)]],   // [M, N] residual to add
+    uint2 tg_pos                 [[threadgroup_position_in_grid]],
+    ushort tiitg                 [[thread_index_in_threadgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half shmem_q4_k64rp[4096];
+    threadgroup half* sa = shmem_q4_k64rp;
+    threadgroup half* sb = shmem_q4_k64rp + TILE_M * TILE_K_64;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    // Packed layout parameters
+    uint num_blocks_per_row = (K + Q4_GROUP_SIZE - 1) / Q4_GROUP_SIZE;
+    // stripe_stride (bytes) = num_blocks_per_row * 576
+    uint stripe_stride = num_blocks_per_row * 576u;
+
+    uint num_k_tiles = (K + TILE_K_64 - 1) / TILE_K_64;
+
+    // tile_n_start is always a multiple of TILE_N=32, so it maps to one
+    // row-group (row_group = tile_n_start / 32). The row-group base is the
+    // same for all threads in the threadgroup.
+    uint row_group = tile_n_start / 32u;
+    uint rg_base = row_group * stripe_stride;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K_64;
+
+        // ---- Load A tile (X): identical to AoS k64_residual_batched. ----
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 4;
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sa_ptr = sa + row * TILE_K_64 + k_start;
+
+            if (FC_BC_M || FC_BC_K) {
+                if (gm < M && gk + 15 < K) {
+                    device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                    float4 v0 = x_ptr[0];
+                    float4 v1 = x_ptr[1];
+                    float4 v2 = x_ptr[2];
+                    float4 v3 = x_ptr[3];
+                    sa_ptr[0]  = (half)v0.x; sa_ptr[1]  = (half)v0.y;
+                    sa_ptr[2]  = (half)v0.z; sa_ptr[3]  = (half)v0.w;
+                    sa_ptr[4]  = (half)v1.x; sa_ptr[5]  = (half)v1.y;
+                    sa_ptr[6]  = (half)v1.z; sa_ptr[7]  = (half)v1.w;
+                    sa_ptr[8]  = (half)v2.x; sa_ptr[9]  = (half)v2.y;
+                    sa_ptr[10] = (half)v2.z; sa_ptr[11] = (half)v2.w;
+                    sa_ptr[12] = (half)v3.x; sa_ptr[13] = (half)v3.y;
+                    sa_ptr[14] = (half)v3.z; sa_ptr[15] = (half)v3.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sa_ptr[i] = (gm < M && gk_i < K) ? (half)X[gm * K + gk_i] : (half)0.0h;
+                    }
+                }
+            } else {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                float4 v2 = x_ptr[2];
+                float4 v3 = x_ptr[3];
+                sa_ptr[0]  = (half)v0.x; sa_ptr[1]  = (half)v0.y;
+                sa_ptr[2]  = (half)v0.z; sa_ptr[3]  = (half)v0.w;
+                sa_ptr[4]  = (half)v1.x; sa_ptr[5]  = (half)v1.y;
+                sa_ptr[6]  = (half)v1.z; sa_ptr[7]  = (half)v1.w;
+                sa_ptr[8]  = (half)v2.x; sa_ptr[9]  = (half)v2.y;
+                sa_ptr[10] = (half)v2.z; sa_ptr[11] = (half)v2.w;
+                sa_ptr[12] = (half)v3.x; sa_ptr[13] = (half)v3.y;
+                sa_ptr[14] = (half)v3.z; sa_ptr[15] = (half)v3.w;
+            }
+        }
+
+        // ---- Load B tile from PACKED layout: 32 rows × 64 cols (2 k-blocks) ----
+        {
+            ushort n_local = tiitg >> 2;       // 0..31 (which row in row-group)
+            ushort t_in_row = tiitg & 3;       // 0..3 (which quarter of 32 k-elements)
+            ushort k_offset = t_in_row * 8;
+            uint gn = tile_n_start + n_local;
+
+            ushort byte_start = (k_offset < 16) ? k_offset : (k_offset - 16);
+            bool use_hi = (k_offset >= 16);
+
+            // Pass 0: first Q4_0 block (k_base + 0..31)
+            {
+                uint block_idx_0 = k_base / Q4_GROUP_SIZE;
+                uint block_base_0 = rg_base + block_idx_0 * 576u;
+                threadgroup half* sb_row = sb + n_local * TILE_K_64 + k_offset;
+
+                if (FC_BC_N || FC_BC_K) {
+                    if (gn < N && k_base + k_offset < K) {
+                        // Scale: bytes [block_base_0 + n_local*2 .. +2]
+                        half scale = as_type<half>(*(device const ushort*)(W_q4 + block_base_0 + n_local * 2u));
+                        // Qdata: bytes [block_base_0 + 64 + n_local*16 + byte_start .. +8]
+                        device const uchar* qdata = W_q4 + block_base_0 + 64u + n_local * 16u;
+
+                        uint k_remaining = K - (k_base + k_offset);
+                        ushort count = (k_remaining >= 8) ? 8 : (ushort)k_remaining;
+
+                        if (count == 8) {
+                            if (use_hi) {
+                                sb_row[0] = scale * (half)(int((qdata[byte_start + 0] >> 4)) - 8);
+                                sb_row[1] = scale * (half)(int((qdata[byte_start + 1] >> 4)) - 8);
+                                sb_row[2] = scale * (half)(int((qdata[byte_start + 2] >> 4)) - 8);
+                                sb_row[3] = scale * (half)(int((qdata[byte_start + 3] >> 4)) - 8);
+                                sb_row[4] = scale * (half)(int((qdata[byte_start + 4] >> 4)) - 8);
+                                sb_row[5] = scale * (half)(int((qdata[byte_start + 5] >> 4)) - 8);
+                                sb_row[6] = scale * (half)(int((qdata[byte_start + 6] >> 4)) - 8);
+                                sb_row[7] = scale * (half)(int((qdata[byte_start + 7] >> 4)) - 8);
+                            } else {
+                                sb_row[0] = scale * (half)(int((qdata[byte_start + 0] & 0xF)) - 8);
+                                sb_row[1] = scale * (half)(int((qdata[byte_start + 1] & 0xF)) - 8);
+                                sb_row[2] = scale * (half)(int((qdata[byte_start + 2] & 0xF)) - 8);
+                                sb_row[3] = scale * (half)(int((qdata[byte_start + 3] & 0xF)) - 8);
+                                sb_row[4] = scale * (half)(int((qdata[byte_start + 4] & 0xF)) - 8);
+                                sb_row[5] = scale * (half)(int((qdata[byte_start + 5] & 0xF)) - 8);
+                                sb_row[6] = scale * (half)(int((qdata[byte_start + 6] & 0xF)) - 8);
+                                sb_row[7] = scale * (half)(int((qdata[byte_start + 7] & 0xF)) - 8);
+                            }
+                        } else {
+                            for (ushort i = 0; i < count; i++) {
+                                ushort elem_idx = k_offset + i;
+                                ushort byte_idx = (elem_idx < 16) ? elem_idx : (elem_idx - 16);
+                                uchar raw = qdata[byte_idx];
+                                int nibble = (elem_idx >= 16) ? int((raw >> 4) & 0xF) : int(raw & 0xF);
+                                sb_row[i] = scale * (half)(nibble - 8);
+                            }
+                            for (ushort i = count; i < 8; i++) {
+                                sb_row[i] = (half)0.0h;
+                            }
+                        }
+                    } else {
+                        FOR_UNROLL (ushort i = 0; i < 8; i++) sb_row[i] = (half)0.0h;
+                    }
+                } else {
+                    half scale = as_type<half>(*(device const ushort*)(W_q4 + block_base_0 + n_local * 2u));
+                    device const uchar* qdata = W_q4 + block_base_0 + 64u + n_local * 16u;
+                    if (use_hi) {
+                        sb_row[0] = scale * (half)(int((qdata[byte_start + 0] >> 4)) - 8);
+                        sb_row[1] = scale * (half)(int((qdata[byte_start + 1] >> 4)) - 8);
+                        sb_row[2] = scale * (half)(int((qdata[byte_start + 2] >> 4)) - 8);
+                        sb_row[3] = scale * (half)(int((qdata[byte_start + 3] >> 4)) - 8);
+                        sb_row[4] = scale * (half)(int((qdata[byte_start + 4] >> 4)) - 8);
+                        sb_row[5] = scale * (half)(int((qdata[byte_start + 5] >> 4)) - 8);
+                        sb_row[6] = scale * (half)(int((qdata[byte_start + 6] >> 4)) - 8);
+                        sb_row[7] = scale * (half)(int((qdata[byte_start + 7] >> 4)) - 8);
+                    } else {
+                        sb_row[0] = scale * (half)(int((qdata[byte_start + 0] & 0xF)) - 8);
+                        sb_row[1] = scale * (half)(int((qdata[byte_start + 1] & 0xF)) - 8);
+                        sb_row[2] = scale * (half)(int((qdata[byte_start + 2] & 0xF)) - 8);
+                        sb_row[3] = scale * (half)(int((qdata[byte_start + 3] & 0xF)) - 8);
+                        sb_row[4] = scale * (half)(int((qdata[byte_start + 4] & 0xF)) - 8);
+                        sb_row[5] = scale * (half)(int((qdata[byte_start + 5] & 0xF)) - 8);
+                        sb_row[6] = scale * (half)(int((qdata[byte_start + 6] & 0xF)) - 8);
+                        sb_row[7] = scale * (half)(int((qdata[byte_start + 7] & 0xF)) - 8);
+                    }
+                }
+            }
+
+            // Pass 1: second Q4_0 block (k_base + 32..63)
+            {
+                uint block_idx_1 = (k_base + 32) / Q4_GROUP_SIZE;
+                uint block_base_1 = rg_base + block_idx_1 * 576u;
+                threadgroup half* sb_row = sb + n_local * TILE_K_64 + 32 + k_offset;
+
+                if (FC_BC_N || FC_BC_K) {
+                    if (gn < N && k_base + 32 + k_offset < K) {
+                        half scale = as_type<half>(*(device const ushort*)(W_q4 + block_base_1 + n_local * 2u));
+                        device const uchar* qdata = W_q4 + block_base_1 + 64u + n_local * 16u;
+
+                        uint k_remaining = K - (k_base + 32 + k_offset);
+                        ushort count = (k_remaining >= 8) ? 8 : (ushort)k_remaining;
+
+                        if (count == 8) {
+                            if (use_hi) {
+                                sb_row[0] = scale * (half)(int((qdata[byte_start + 0] >> 4)) - 8);
+                                sb_row[1] = scale * (half)(int((qdata[byte_start + 1] >> 4)) - 8);
+                                sb_row[2] = scale * (half)(int((qdata[byte_start + 2] >> 4)) - 8);
+                                sb_row[3] = scale * (half)(int((qdata[byte_start + 3] >> 4)) - 8);
+                                sb_row[4] = scale * (half)(int((qdata[byte_start + 4] >> 4)) - 8);
+                                sb_row[5] = scale * (half)(int((qdata[byte_start + 5] >> 4)) - 8);
+                                sb_row[6] = scale * (half)(int((qdata[byte_start + 6] >> 4)) - 8);
+                                sb_row[7] = scale * (half)(int((qdata[byte_start + 7] >> 4)) - 8);
+                            } else {
+                                sb_row[0] = scale * (half)(int((qdata[byte_start + 0] & 0xF)) - 8);
+                                sb_row[1] = scale * (half)(int((qdata[byte_start + 1] & 0xF)) - 8);
+                                sb_row[2] = scale * (half)(int((qdata[byte_start + 2] & 0xF)) - 8);
+                                sb_row[3] = scale * (half)(int((qdata[byte_start + 3] & 0xF)) - 8);
+                                sb_row[4] = scale * (half)(int((qdata[byte_start + 4] & 0xF)) - 8);
+                                sb_row[5] = scale * (half)(int((qdata[byte_start + 5] & 0xF)) - 8);
+                                sb_row[6] = scale * (half)(int((qdata[byte_start + 6] & 0xF)) - 8);
+                                sb_row[7] = scale * (half)(int((qdata[byte_start + 7] & 0xF)) - 8);
+                            }
+                        } else {
+                            for (ushort i = 0; i < count; i++) {
+                                ushort elem_idx = k_offset + i;
+                                ushort byte_idx = (elem_idx < 16) ? elem_idx : (elem_idx - 16);
+                                uchar raw = qdata[byte_idx];
+                                int nibble = (elem_idx >= 16) ? int((raw >> 4) & 0xF) : int(raw & 0xF);
+                                sb_row[i] = scale * (half)(nibble - 8);
+                            }
+                            for (ushort i = count; i < 8; i++) {
+                                sb_row[i] = (half)0.0h;
+                            }
+                        }
+                    } else {
+                        FOR_UNROLL (ushort i = 0; i < 8; i++) sb_row[i] = (half)0.0h;
+                    }
+                } else {
+                    half scale = as_type<half>(*(device const ushort*)(W_q4 + block_base_1 + n_local * 2u));
+                    device const uchar* qdata = W_q4 + block_base_1 + 64u + n_local * 16u;
+                    if (use_hi) {
+                        sb_row[0] = scale * (half)(int((qdata[byte_start + 0] >> 4)) - 8);
+                        sb_row[1] = scale * (half)(int((qdata[byte_start + 1] >> 4)) - 8);
+                        sb_row[2] = scale * (half)(int((qdata[byte_start + 2] >> 4)) - 8);
+                        sb_row[3] = scale * (half)(int((qdata[byte_start + 3] >> 4)) - 8);
+                        sb_row[4] = scale * (half)(int((qdata[byte_start + 4] >> 4)) - 8);
+                        sb_row[5] = scale * (half)(int((qdata[byte_start + 5] >> 4)) - 8);
+                        sb_row[6] = scale * (half)(int((qdata[byte_start + 6] >> 4)) - 8);
+                        sb_row[7] = scale * (half)(int((qdata[byte_start + 7] >> 4)) - 8);
+                    } else {
+                        sb_row[0] = scale * (half)(int((qdata[byte_start + 0] & 0xF)) - 8);
+                        sb_row[1] = scale * (half)(int((qdata[byte_start + 1] & 0xF)) - 8);
+                        sb_row[2] = scale * (half)(int((qdata[byte_start + 2] & 0xF)) - 8);
+                        sb_row[3] = scale * (half)(int((qdata[byte_start + 3] & 0xF)) - 8);
+                        sb_row[4] = scale * (half)(int((qdata[byte_start + 4] & 0xF)) - 8);
+                        sb_row[5] = scale * (half)(int((qdata[byte_start + 5] & 0xF)) - 8);
+                        sb_row[6] = scale * (half)(int((qdata[byte_start + 6] & 0xF)) - 8);
+                        sb_row[7] = scale * (half)(int((qdata[byte_start + 7] & 0xF)) - 8);
+                    }
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- MMA: same as AoS K64 path. ----
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K_64; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K_64 + ks, TILE_K_64);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K_64 + ks, TILE_K_64);
+
+            simdgroup_half8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ---- Residual writeback: identical to AoS K64 path. ----
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    {
+        threadgroup float* sc = (threadgroup float*)shmem_q4_k64rp;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ushort lane = tiitg % 32;
+        if (FC_BC_M || FC_BC_N) {
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                if (gm < M && gn < N) {
+                    Y[gm * N + gn] = my_sc[local_m * 16 + local_n] + R[gm * N + gn];
+                }
+            }
+        } else {
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                Y[gm * N + gn] = my_sc[local_m * 16 + local_n] + R[gm * N + gn];
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed
+//
+// Same algorithm as `dequant_tiled_matmul_q4_0_gate_up_swiglu_fused` but
+// reads gate and up weights from a single pair-packed buffer (see
+// `repack_q4_pair_gate_up` in repack_q4.rs). Layout per (row_group, k_block):
+//
+//     bytes [   0..  64]: gate scales (32 × f16)
+//     bytes [  64.. 128]: up scales   (32 × f16)
+//     bytes [ 128.. 640]: gate qdata  (32 × 16 = 512 bytes)
+//     bytes [ 640..1152]: up qdata    (32 × 16 = 512 bytes)
+//
+//   stripe_stride = (K / 32) * 1152
+//   block_base    = row_group * stripe_stride + k_block * 1152
+//   gate_scale    = block_base + (row_in_group) * 2
+//   up_scale      = block_base + 64 + (row_in_group) * 2
+//   gate_qdata    = block_base + 128 + (row_in_group) * 16
+//   up_qdata      = block_base + 640 + (row_in_group) * 16
+//
+// One buffer replaces two distinct W_gate + W_up buffers, halving the
+// number of memory streams the fused kernel reads.
+// ----------------------------------------------------------------------------
+
+kernel void dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed(
+    device const uchar* W_gate_up [[buffer(0)]],  // Paired packed Q4_0 weights
+    device const float* X         [[buffer(1)]],
+    device float*       Y         [[buffer(2)]],
+    constant uint&      M         [[buffer(3)]],
+    constant uint&      N         [[buffer(4)]],  // inter_dim
+    constant uint&      K         [[buffer(5)]]   // hidden_dim
+    ,uint2 tg_pos                 [[threadgroup_position_in_grid]]
+    ,ushort tiitg                 [[thread_index_in_threadgroup]]
+    ,ushort sgitg                 [[simdgroup_index_in_threadgroup]])
+{
+    // 6144 halfs = 12 KB threadgroup memory (same as AoS fused kernel).
+    threadgroup half shmem_q4_gusp[6144];
+    threadgroup half* sa     = shmem_q4_gusp;
+    threadgroup half* sb_g   = shmem_q4_gusp + TILE_M * TILE_K_64;
+    threadgroup half* sb_u   = shmem_q4_gusp + TILE_M * TILE_K_64 + TILE_N * TILE_K_64;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc_g[2][2];
+    simdgroup_float8x8 mc_u[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++) {
+            mc_g[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+            mc_u[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        }
+
+    uint num_blocks_per_row = (K + Q4_GROUP_SIZE - 1) / Q4_GROUP_SIZE;
+    // stripe_stride (bytes) for paired layout = num_blocks_per_row * 1152
+    uint stripe_stride = num_blocks_per_row * 1152u;
+
+    uint row_group = tile_n_start / 32u;
+    uint rg_base = row_group * stripe_stride;
+
+    uint num_k_tiles = (K + TILE_K_64 - 1) / TILE_K_64;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K_64;
+
+        // ---- Load A tile: identical to AoS fused. ----
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 4;
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup half* sa_ptr = sa + row * TILE_K_64 + k_start;
+
+            if (FC_BC_M || FC_BC_K) {
+                if (gm < M && gk + 15 < K) {
+                    device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                    float4 v0 = x_ptr[0];
+                    float4 v1 = x_ptr[1];
+                    float4 v2 = x_ptr[2];
+                    float4 v3 = x_ptr[3];
+                    sa_ptr[0]  = (half)v0.x; sa_ptr[1]  = (half)v0.y;
+                    sa_ptr[2]  = (half)v0.z; sa_ptr[3]  = (half)v0.w;
+                    sa_ptr[4]  = (half)v1.x; sa_ptr[5]  = (half)v1.y;
+                    sa_ptr[6]  = (half)v1.z; sa_ptr[7]  = (half)v1.w;
+                    sa_ptr[8]  = (half)v2.x; sa_ptr[9]  = (half)v2.y;
+                    sa_ptr[10] = (half)v2.z; sa_ptr[11] = (half)v2.w;
+                    sa_ptr[12] = (half)v3.x; sa_ptr[13] = (half)v3.y;
+                    sa_ptr[14] = (half)v3.z; sa_ptr[15] = (half)v3.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sa_ptr[i] = (gm < M && gk_i < K) ? (half)X[gm * K + gk_i] : (half)0.0h;
+                    }
+                }
+            } else {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                float4 v2 = x_ptr[2];
+                float4 v3 = x_ptr[3];
+                sa_ptr[0]  = (half)v0.x; sa_ptr[1]  = (half)v0.y;
+                sa_ptr[2]  = (half)v0.z; sa_ptr[3]  = (half)v0.w;
+                sa_ptr[4]  = (half)v1.x; sa_ptr[5]  = (half)v1.y;
+                sa_ptr[6]  = (half)v1.z; sa_ptr[7]  = (half)v1.w;
+                sa_ptr[8]  = (half)v2.x; sa_ptr[9]  = (half)v2.y;
+                sa_ptr[10] = (half)v2.z; sa_ptr[11] = (half)v2.w;
+                sa_ptr[12] = (half)v3.x; sa_ptr[13] = (half)v3.y;
+                sa_ptr[14] = (half)v3.z; sa_ptr[15] = (half)v3.w;
+            }
+        }
+
+        // ---- Load B-gate AND B-up tiles from packed layout (2-pass Q4 dequant) ----
+        {
+            ushort n_local = tiitg >> 2;
+            ushort t_in_row = tiitg & 3;
+            ushort k_offset = t_in_row * 8;
+            uint gn = tile_n_start + n_local;
+
+            ushort byte_start = (k_offset < 16) ? k_offset : (k_offset - 16);
+            bool use_hi = (k_offset >= 16);
+
+            uint block_idx_0 = k_base / Q4_GROUP_SIZE;
+            uint block_base_0 = rg_base + block_idx_0 * 1152u;
+            uint block_idx_1 = (k_base + 32) / Q4_GROUP_SIZE;
+            uint block_base_1 = rg_base + block_idx_1 * 1152u;
+
+            threadgroup half* sb_g_row_0 = sb_g + n_local * TILE_K_64 + k_offset;
+            threadgroup half* sb_u_row_0 = sb_u + n_local * TILE_K_64 + k_offset;
+            threadgroup half* sb_g_row_1 = sb_g + n_local * TILE_K_64 + 32 + k_offset;
+            threadgroup half* sb_u_row_1 = sb_u + n_local * TILE_K_64 + 32 + k_offset;
+
+            if (FC_BC_N || FC_BC_K) {
+                // Gate, pass 0
+                if (gn < N && k_base + k_offset < K) {
+                    half scale_g = as_type<half>(*(device const ushort*)(W_gate_up + block_base_0 + n_local * 2u));
+                    device const uchar* qd_g = W_gate_up + block_base_0 + 128u + n_local * 16u;
+                    uint krem = K - (k_base + k_offset);
+                    ushort cnt = (krem >= 8) ? 8 : (ushort)krem;
+                    if (cnt == 8) {
+                        if (use_hi) {
+                            sb_g_row_0[0] = scale_g * (half)(int((qd_g[byte_start + 0] >> 4)) - 8);
+                            sb_g_row_0[1] = scale_g * (half)(int((qd_g[byte_start + 1] >> 4)) - 8);
+                            sb_g_row_0[2] = scale_g * (half)(int((qd_g[byte_start + 2] >> 4)) - 8);
+                            sb_g_row_0[3] = scale_g * (half)(int((qd_g[byte_start + 3] >> 4)) - 8);
+                            sb_g_row_0[4] = scale_g * (half)(int((qd_g[byte_start + 4] >> 4)) - 8);
+                            sb_g_row_0[5] = scale_g * (half)(int((qd_g[byte_start + 5] >> 4)) - 8);
+                            sb_g_row_0[6] = scale_g * (half)(int((qd_g[byte_start + 6] >> 4)) - 8);
+                            sb_g_row_0[7] = scale_g * (half)(int((qd_g[byte_start + 7] >> 4)) - 8);
+                        } else {
+                            sb_g_row_0[0] = scale_g * (half)(int((qd_g[byte_start + 0] & 0xF)) - 8);
+                            sb_g_row_0[1] = scale_g * (half)(int((qd_g[byte_start + 1] & 0xF)) - 8);
+                            sb_g_row_0[2] = scale_g * (half)(int((qd_g[byte_start + 2] & 0xF)) - 8);
+                            sb_g_row_0[3] = scale_g * (half)(int((qd_g[byte_start + 3] & 0xF)) - 8);
+                            sb_g_row_0[4] = scale_g * (half)(int((qd_g[byte_start + 4] & 0xF)) - 8);
+                            sb_g_row_0[5] = scale_g * (half)(int((qd_g[byte_start + 5] & 0xF)) - 8);
+                            sb_g_row_0[6] = scale_g * (half)(int((qd_g[byte_start + 6] & 0xF)) - 8);
+                            sb_g_row_0[7] = scale_g * (half)(int((qd_g[byte_start + 7] & 0xF)) - 8);
+                        }
+                    } else {
+                        for (ushort i = 0; i < cnt; i++) {
+                            ushort elem_idx = k_offset + i;
+                            ushort byte_idx = (elem_idx < 16) ? elem_idx : (elem_idx - 16);
+                            uchar raw = qd_g[byte_idx];
+                            int nibble = (elem_idx >= 16) ? int((raw >> 4) & 0xF) : int(raw & 0xF);
+                            sb_g_row_0[i] = scale_g * (half)(nibble - 8);
+                        }
+                        for (ushort i = cnt; i < 8; i++) sb_g_row_0[i] = (half)0.0h;
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 8; i++) sb_g_row_0[i] = (half)0.0h;
+                }
+                // Up, pass 0
+                if (gn < N && k_base + k_offset < K) {
+                    half scale_u = as_type<half>(*(device const ushort*)(W_gate_up + block_base_0 + 64u + n_local * 2u));
+                    device const uchar* qd_u = W_gate_up + block_base_0 + 640u + n_local * 16u;
+                    uint krem = K - (k_base + k_offset);
+                    ushort cnt = (krem >= 8) ? 8 : (ushort)krem;
+                    if (cnt == 8) {
+                        if (use_hi) {
+                            sb_u_row_0[0] = scale_u * (half)(int((qd_u[byte_start + 0] >> 4)) - 8);
+                            sb_u_row_0[1] = scale_u * (half)(int((qd_u[byte_start + 1] >> 4)) - 8);
+                            sb_u_row_0[2] = scale_u * (half)(int((qd_u[byte_start + 2] >> 4)) - 8);
+                            sb_u_row_0[3] = scale_u * (half)(int((qd_u[byte_start + 3] >> 4)) - 8);
+                            sb_u_row_0[4] = scale_u * (half)(int((qd_u[byte_start + 4] >> 4)) - 8);
+                            sb_u_row_0[5] = scale_u * (half)(int((qd_u[byte_start + 5] >> 4)) - 8);
+                            sb_u_row_0[6] = scale_u * (half)(int((qd_u[byte_start + 6] >> 4)) - 8);
+                            sb_u_row_0[7] = scale_u * (half)(int((qd_u[byte_start + 7] >> 4)) - 8);
+                        } else {
+                            sb_u_row_0[0] = scale_u * (half)(int((qd_u[byte_start + 0] & 0xF)) - 8);
+                            sb_u_row_0[1] = scale_u * (half)(int((qd_u[byte_start + 1] & 0xF)) - 8);
+                            sb_u_row_0[2] = scale_u * (half)(int((qd_u[byte_start + 2] & 0xF)) - 8);
+                            sb_u_row_0[3] = scale_u * (half)(int((qd_u[byte_start + 3] & 0xF)) - 8);
+                            sb_u_row_0[4] = scale_u * (half)(int((qd_u[byte_start + 4] & 0xF)) - 8);
+                            sb_u_row_0[5] = scale_u * (half)(int((qd_u[byte_start + 5] & 0xF)) - 8);
+                            sb_u_row_0[6] = scale_u * (half)(int((qd_u[byte_start + 6] & 0xF)) - 8);
+                            sb_u_row_0[7] = scale_u * (half)(int((qd_u[byte_start + 7] & 0xF)) - 8);
+                        }
+                    } else {
+                        for (ushort i = 0; i < cnt; i++) {
+                            ushort elem_idx = k_offset + i;
+                            ushort byte_idx = (elem_idx < 16) ? elem_idx : (elem_idx - 16);
+                            uchar raw = qd_u[byte_idx];
+                            int nibble = (elem_idx >= 16) ? int((raw >> 4) & 0xF) : int(raw & 0xF);
+                            sb_u_row_0[i] = scale_u * (half)(nibble - 8);
+                        }
+                        for (ushort i = cnt; i < 8; i++) sb_u_row_0[i] = (half)0.0h;
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 8; i++) sb_u_row_0[i] = (half)0.0h;
+                }
+                // Gate, pass 1
+                if (gn < N && k_base + 32 + k_offset < K) {
+                    half scale_g = as_type<half>(*(device const ushort*)(W_gate_up + block_base_1 + n_local * 2u));
+                    device const uchar* qd_g = W_gate_up + block_base_1 + 128u + n_local * 16u;
+                    uint krem = K - (k_base + 32 + k_offset);
+                    ushort cnt = (krem >= 8) ? 8 : (ushort)krem;
+                    if (cnt == 8) {
+                        if (use_hi) {
+                            sb_g_row_1[0] = scale_g * (half)(int((qd_g[byte_start + 0] >> 4)) - 8);
+                            sb_g_row_1[1] = scale_g * (half)(int((qd_g[byte_start + 1] >> 4)) - 8);
+                            sb_g_row_1[2] = scale_g * (half)(int((qd_g[byte_start + 2] >> 4)) - 8);
+                            sb_g_row_1[3] = scale_g * (half)(int((qd_g[byte_start + 3] >> 4)) - 8);
+                            sb_g_row_1[4] = scale_g * (half)(int((qd_g[byte_start + 4] >> 4)) - 8);
+                            sb_g_row_1[5] = scale_g * (half)(int((qd_g[byte_start + 5] >> 4)) - 8);
+                            sb_g_row_1[6] = scale_g * (half)(int((qd_g[byte_start + 6] >> 4)) - 8);
+                            sb_g_row_1[7] = scale_g * (half)(int((qd_g[byte_start + 7] >> 4)) - 8);
+                        } else {
+                            sb_g_row_1[0] = scale_g * (half)(int((qd_g[byte_start + 0] & 0xF)) - 8);
+                            sb_g_row_1[1] = scale_g * (half)(int((qd_g[byte_start + 1] & 0xF)) - 8);
+                            sb_g_row_1[2] = scale_g * (half)(int((qd_g[byte_start + 2] & 0xF)) - 8);
+                            sb_g_row_1[3] = scale_g * (half)(int((qd_g[byte_start + 3] & 0xF)) - 8);
+                            sb_g_row_1[4] = scale_g * (half)(int((qd_g[byte_start + 4] & 0xF)) - 8);
+                            sb_g_row_1[5] = scale_g * (half)(int((qd_g[byte_start + 5] & 0xF)) - 8);
+                            sb_g_row_1[6] = scale_g * (half)(int((qd_g[byte_start + 6] & 0xF)) - 8);
+                            sb_g_row_1[7] = scale_g * (half)(int((qd_g[byte_start + 7] & 0xF)) - 8);
+                        }
+                    } else {
+                        for (ushort i = 0; i < cnt; i++) {
+                            ushort elem_idx = k_offset + i;
+                            ushort byte_idx = (elem_idx < 16) ? elem_idx : (elem_idx - 16);
+                            uchar raw = qd_g[byte_idx];
+                            int nibble = (elem_idx >= 16) ? int((raw >> 4) & 0xF) : int(raw & 0xF);
+                            sb_g_row_1[i] = scale_g * (half)(nibble - 8);
+                        }
+                        for (ushort i = cnt; i < 8; i++) sb_g_row_1[i] = (half)0.0h;
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 8; i++) sb_g_row_1[i] = (half)0.0h;
+                }
+                // Up, pass 1
+                if (gn < N && k_base + 32 + k_offset < K) {
+                    half scale_u = as_type<half>(*(device const ushort*)(W_gate_up + block_base_1 + 64u + n_local * 2u));
+                    device const uchar* qd_u = W_gate_up + block_base_1 + 640u + n_local * 16u;
+                    uint krem = K - (k_base + 32 + k_offset);
+                    ushort cnt = (krem >= 8) ? 8 : (ushort)krem;
+                    if (cnt == 8) {
+                        if (use_hi) {
+                            sb_u_row_1[0] = scale_u * (half)(int((qd_u[byte_start + 0] >> 4)) - 8);
+                            sb_u_row_1[1] = scale_u * (half)(int((qd_u[byte_start + 1] >> 4)) - 8);
+                            sb_u_row_1[2] = scale_u * (half)(int((qd_u[byte_start + 2] >> 4)) - 8);
+                            sb_u_row_1[3] = scale_u * (half)(int((qd_u[byte_start + 3] >> 4)) - 8);
+                            sb_u_row_1[4] = scale_u * (half)(int((qd_u[byte_start + 4] >> 4)) - 8);
+                            sb_u_row_1[5] = scale_u * (half)(int((qd_u[byte_start + 5] >> 4)) - 8);
+                            sb_u_row_1[6] = scale_u * (half)(int((qd_u[byte_start + 6] >> 4)) - 8);
+                            sb_u_row_1[7] = scale_u * (half)(int((qd_u[byte_start + 7] >> 4)) - 8);
+                        } else {
+                            sb_u_row_1[0] = scale_u * (half)(int((qd_u[byte_start + 0] & 0xF)) - 8);
+                            sb_u_row_1[1] = scale_u * (half)(int((qd_u[byte_start + 1] & 0xF)) - 8);
+                            sb_u_row_1[2] = scale_u * (half)(int((qd_u[byte_start + 2] & 0xF)) - 8);
+                            sb_u_row_1[3] = scale_u * (half)(int((qd_u[byte_start + 3] & 0xF)) - 8);
+                            sb_u_row_1[4] = scale_u * (half)(int((qd_u[byte_start + 4] & 0xF)) - 8);
+                            sb_u_row_1[5] = scale_u * (half)(int((qd_u[byte_start + 5] & 0xF)) - 8);
+                            sb_u_row_1[6] = scale_u * (half)(int((qd_u[byte_start + 6] & 0xF)) - 8);
+                            sb_u_row_1[7] = scale_u * (half)(int((qd_u[byte_start + 7] & 0xF)) - 8);
+                        }
+                    } else {
+                        for (ushort i = 0; i < cnt; i++) {
+                            ushort elem_idx = k_offset + i;
+                            ushort byte_idx = (elem_idx < 16) ? elem_idx : (elem_idx - 16);
+                            uchar raw = qd_u[byte_idx];
+                            int nibble = (elem_idx >= 16) ? int((raw >> 4) & 0xF) : int(raw & 0xF);
+                            sb_u_row_1[i] = scale_u * (half)(nibble - 8);
+                        }
+                        for (ushort i = cnt; i < 8; i++) sb_u_row_1[i] = (half)0.0h;
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 8; i++) sb_u_row_1[i] = (half)0.0h;
+                }
+            } else {
+                // Aligned fast path: no boundary checks.
+                // Gate, pass 0
+                {
+                    half scale_g = as_type<half>(*(device const ushort*)(W_gate_up + block_base_0 + n_local * 2u));
+                    device const uchar* qd_g = W_gate_up + block_base_0 + 128u + n_local * 16u;
+                    if (use_hi) {
+                        sb_g_row_0[0] = scale_g * (half)(int((qd_g[byte_start + 0] >> 4)) - 8);
+                        sb_g_row_0[1] = scale_g * (half)(int((qd_g[byte_start + 1] >> 4)) - 8);
+                        sb_g_row_0[2] = scale_g * (half)(int((qd_g[byte_start + 2] >> 4)) - 8);
+                        sb_g_row_0[3] = scale_g * (half)(int((qd_g[byte_start + 3] >> 4)) - 8);
+                        sb_g_row_0[4] = scale_g * (half)(int((qd_g[byte_start + 4] >> 4)) - 8);
+                        sb_g_row_0[5] = scale_g * (half)(int((qd_g[byte_start + 5] >> 4)) - 8);
+                        sb_g_row_0[6] = scale_g * (half)(int((qd_g[byte_start + 6] >> 4)) - 8);
+                        sb_g_row_0[7] = scale_g * (half)(int((qd_g[byte_start + 7] >> 4)) - 8);
+                    } else {
+                        sb_g_row_0[0] = scale_g * (half)(int((qd_g[byte_start + 0] & 0xF)) - 8);
+                        sb_g_row_0[1] = scale_g * (half)(int((qd_g[byte_start + 1] & 0xF)) - 8);
+                        sb_g_row_0[2] = scale_g * (half)(int((qd_g[byte_start + 2] & 0xF)) - 8);
+                        sb_g_row_0[3] = scale_g * (half)(int((qd_g[byte_start + 3] & 0xF)) - 8);
+                        sb_g_row_0[4] = scale_g * (half)(int((qd_g[byte_start + 4] & 0xF)) - 8);
+                        sb_g_row_0[5] = scale_g * (half)(int((qd_g[byte_start + 5] & 0xF)) - 8);
+                        sb_g_row_0[6] = scale_g * (half)(int((qd_g[byte_start + 6] & 0xF)) - 8);
+                        sb_g_row_0[7] = scale_g * (half)(int((qd_g[byte_start + 7] & 0xF)) - 8);
+                    }
+                }
+                // Up, pass 0
+                {
+                    half scale_u = as_type<half>(*(device const ushort*)(W_gate_up + block_base_0 + 64u + n_local * 2u));
+                    device const uchar* qd_u = W_gate_up + block_base_0 + 640u + n_local * 16u;
+                    if (use_hi) {
+                        sb_u_row_0[0] = scale_u * (half)(int((qd_u[byte_start + 0] >> 4)) - 8);
+                        sb_u_row_0[1] = scale_u * (half)(int((qd_u[byte_start + 1] >> 4)) - 8);
+                        sb_u_row_0[2] = scale_u * (half)(int((qd_u[byte_start + 2] >> 4)) - 8);
+                        sb_u_row_0[3] = scale_u * (half)(int((qd_u[byte_start + 3] >> 4)) - 8);
+                        sb_u_row_0[4] = scale_u * (half)(int((qd_u[byte_start + 4] >> 4)) - 8);
+                        sb_u_row_0[5] = scale_u * (half)(int((qd_u[byte_start + 5] >> 4)) - 8);
+                        sb_u_row_0[6] = scale_u * (half)(int((qd_u[byte_start + 6] >> 4)) - 8);
+                        sb_u_row_0[7] = scale_u * (half)(int((qd_u[byte_start + 7] >> 4)) - 8);
+                    } else {
+                        sb_u_row_0[0] = scale_u * (half)(int((qd_u[byte_start + 0] & 0xF)) - 8);
+                        sb_u_row_0[1] = scale_u * (half)(int((qd_u[byte_start + 1] & 0xF)) - 8);
+                        sb_u_row_0[2] = scale_u * (half)(int((qd_u[byte_start + 2] & 0xF)) - 8);
+                        sb_u_row_0[3] = scale_u * (half)(int((qd_u[byte_start + 3] & 0xF)) - 8);
+                        sb_u_row_0[4] = scale_u * (half)(int((qd_u[byte_start + 4] & 0xF)) - 8);
+                        sb_u_row_0[5] = scale_u * (half)(int((qd_u[byte_start + 5] & 0xF)) - 8);
+                        sb_u_row_0[6] = scale_u * (half)(int((qd_u[byte_start + 6] & 0xF)) - 8);
+                        sb_u_row_0[7] = scale_u * (half)(int((qd_u[byte_start + 7] & 0xF)) - 8);
+                    }
+                }
+                // Gate, pass 1
+                {
+                    half scale_g = as_type<half>(*(device const ushort*)(W_gate_up + block_base_1 + n_local * 2u));
+                    device const uchar* qd_g = W_gate_up + block_base_1 + 128u + n_local * 16u;
+                    if (use_hi) {
+                        sb_g_row_1[0] = scale_g * (half)(int((qd_g[byte_start + 0] >> 4)) - 8);
+                        sb_g_row_1[1] = scale_g * (half)(int((qd_g[byte_start + 1] >> 4)) - 8);
+                        sb_g_row_1[2] = scale_g * (half)(int((qd_g[byte_start + 2] >> 4)) - 8);
+                        sb_g_row_1[3] = scale_g * (half)(int((qd_g[byte_start + 3] >> 4)) - 8);
+                        sb_g_row_1[4] = scale_g * (half)(int((qd_g[byte_start + 4] >> 4)) - 8);
+                        sb_g_row_1[5] = scale_g * (half)(int((qd_g[byte_start + 5] >> 4)) - 8);
+                        sb_g_row_1[6] = scale_g * (half)(int((qd_g[byte_start + 6] >> 4)) - 8);
+                        sb_g_row_1[7] = scale_g * (half)(int((qd_g[byte_start + 7] >> 4)) - 8);
+                    } else {
+                        sb_g_row_1[0] = scale_g * (half)(int((qd_g[byte_start + 0] & 0xF)) - 8);
+                        sb_g_row_1[1] = scale_g * (half)(int((qd_g[byte_start + 1] & 0xF)) - 8);
+                        sb_g_row_1[2] = scale_g * (half)(int((qd_g[byte_start + 2] & 0xF)) - 8);
+                        sb_g_row_1[3] = scale_g * (half)(int((qd_g[byte_start + 3] & 0xF)) - 8);
+                        sb_g_row_1[4] = scale_g * (half)(int((qd_g[byte_start + 4] & 0xF)) - 8);
+                        sb_g_row_1[5] = scale_g * (half)(int((qd_g[byte_start + 5] & 0xF)) - 8);
+                        sb_g_row_1[6] = scale_g * (half)(int((qd_g[byte_start + 6] & 0xF)) - 8);
+                        sb_g_row_1[7] = scale_g * (half)(int((qd_g[byte_start + 7] & 0xF)) - 8);
+                    }
+                }
+                // Up, pass 1
+                {
+                    half scale_u = as_type<half>(*(device const ushort*)(W_gate_up + block_base_1 + 64u + n_local * 2u));
+                    device const uchar* qd_u = W_gate_up + block_base_1 + 640u + n_local * 16u;
+                    if (use_hi) {
+                        sb_u_row_1[0] = scale_u * (half)(int((qd_u[byte_start + 0] >> 4)) - 8);
+                        sb_u_row_1[1] = scale_u * (half)(int((qd_u[byte_start + 1] >> 4)) - 8);
+                        sb_u_row_1[2] = scale_u * (half)(int((qd_u[byte_start + 2] >> 4)) - 8);
+                        sb_u_row_1[3] = scale_u * (half)(int((qd_u[byte_start + 3] >> 4)) - 8);
+                        sb_u_row_1[4] = scale_u * (half)(int((qd_u[byte_start + 4] >> 4)) - 8);
+                        sb_u_row_1[5] = scale_u * (half)(int((qd_u[byte_start + 5] >> 4)) - 8);
+                        sb_u_row_1[6] = scale_u * (half)(int((qd_u[byte_start + 6] >> 4)) - 8);
+                        sb_u_row_1[7] = scale_u * (half)(int((qd_u[byte_start + 7] >> 4)) - 8);
+                    } else {
+                        sb_u_row_1[0] = scale_u * (half)(int((qd_u[byte_start + 0] & 0xF)) - 8);
+                        sb_u_row_1[1] = scale_u * (half)(int((qd_u[byte_start + 1] & 0xF)) - 8);
+                        sb_u_row_1[2] = scale_u * (half)(int((qd_u[byte_start + 2] & 0xF)) - 8);
+                        sb_u_row_1[3] = scale_u * (half)(int((qd_u[byte_start + 3] & 0xF)) - 8);
+                        sb_u_row_1[4] = scale_u * (half)(int((qd_u[byte_start + 4] & 0xF)) - 8);
+                        sb_u_row_1[5] = scale_u * (half)(int((qd_u[byte_start + 5] & 0xF)) - 8);
+                        sb_u_row_1[6] = scale_u * (half)(int((qd_u[byte_start + 6] & 0xF)) - 8);
+                        sb_u_row_1[7] = scale_u * (half)(int((qd_u[byte_start + 7] & 0xF)) - 8);
+                    }
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- MMA: same as AoS fused (Q4 gate+up). ----
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K_64; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K_64 + ks, TILE_K_64);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K_64 + ks, TILE_K_64);
+
+            simdgroup_half8x8 mb_g[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb_g[0], sb_g + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb_g[1], sb_g + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc_g[0][0], ma[0], mb_g[0], mc_g[0][0]);
+            simdgroup_multiply_accumulate(mc_g[0][1], ma[0], mb_g[1], mc_g[0][1]);
+            simdgroup_multiply_accumulate(mc_g[1][0], ma[1], mb_g[0], mc_g[1][0]);
+            simdgroup_multiply_accumulate(mc_g[1][1], ma[1], mb_g[1], mc_g[1][1]);
+
+            simdgroup_half8x8 mb_u[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb_u[0], sb_u + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb_u[1], sb_u + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc_u[0][0], ma[0], mb_u[0], mc_u[0][0]);
+            simdgroup_multiply_accumulate(mc_u[0][1], ma[0], mb_u[1], mc_u[0][1]);
+            simdgroup_multiply_accumulate(mc_u[1][0], ma[1], mb_u[0], mc_u[1][0]);
+            simdgroup_multiply_accumulate(mc_u[1][1], ma[1], mb_u[1], mc_u[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ---- SwiGLU epilogue: identical to AoS Q4 fused. ----
+    threadgroup float* sc_gate = (threadgroup float*)shmem_q4_gusp;
+    threadgroup float* sc_up   = (threadgroup float*)shmem_q4_gusp + 4 * 256;
+    threadgroup float* my_sc_gate = sc_gate + sgitg * 256;
+    threadgroup float* my_sc_up   = sc_up   + sgitg * 256;
+
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++) {
+            simdgroup_store(mc_g[i][j], my_sc_gate + (i * 8) * 16 + (j * 8), 16);
+            simdgroup_store(mc_u[i][j], my_sc_up   + (i * 8) * 16 + (j * 8), 16);
+        }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    ushort lane = tiitg % 32;
+    if (FC_BC_M || FC_BC_N) {
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            if (gm < M && gn < N) {
+                float g = my_sc_gate[local_m * 16 + local_n];
+                float u = my_sc_up  [local_m * 16 + local_n];
+                float sig = 1.0f / (1.0f + exp(-g));
+                Y[gm * N + gn] = g * sig * u;
+            }
+        }
+    } else {
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            float g = my_sc_gate[local_m * 16 + local_n];
+            float u = my_sc_up  [local_m * 16 + local_n];
+            float sig = 1.0f / (1.0f + exp(-g));
+            Y[gm * N + gn] = g * sig * u;
         }
     }
 }

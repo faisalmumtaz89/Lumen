@@ -22,9 +22,8 @@ pub(crate) fn extract_hyperparams(gguf: &GgufFile) -> Result<(ModelHyperparams, 
         .ok_or_else(|| ConvertError::MissingMetadata("general.architecture".into()))?
         .to_string();
 
-    // Support LLaMA family + hybrid MoE architectures
+    // Supported architectures: Qwen3.5 (dense GatedDeltaNet) and Qwen3.5 MoE.
     match arch.as_str() {
-        "llama" | "mistral" | "internlm2" | "xverse" | "exaone" | "qwen2" => {}
         "qwen35" | "qwen35moe" | "qwen3_5_moe" | "qwen3.5_moe" => {}
         other => return Err(ConvertError::UnsupportedArchitecture(other.into())),
     }
@@ -43,7 +42,38 @@ pub(crate) fn extract_hyperparams(gguf: &GgufFile) -> Result<(ModelHyperparams, 
         .get_u32(&format!("{prefix}.attention.head_count_kv"))
         .unwrap_or(num_heads);
 
-    let num_layers = get_required_u32(gguf, &format!("{prefix}.block_count"))?;
+    let metadata_block_count = get_required_u32(gguf, &format!("{prefix}.block_count"))?;
+    // Some GGUF producers count auxiliary/MTP transformer blocks in
+    // `block_count` even though those blocks are not part of the main
+    // backbone. Concretely, `convert_hf_to_gguf.py --outtype bf16` for
+    // Qwen3.5-9B writes `qwen35.block_count = 33` because it counts the
+    // single MTP "Next-N" head (blk.32, identified by `nextn.eh_proj.weight`,
+    // `nextn.enorm.weight`, `nextn.hnorm.weight`, `nextn.shared_head_norm.weight`)
+    // alongside the 32 real layers. Trusting the metadata then causes the
+    // converter to iterate up to layer 32 and crash with
+    // `missing tensor: blk.32.attn_qkv.weight` because the schedule says
+    // layer 32 should be a linear-attn layer but the MTP head actually
+    // ships full-attn tensors (attn_q/k/v/output).
+    //
+    // Cross-check by counting `blk.N` indices that contain a REQUIRED
+    // attention weight (`attn_q.weight` OR `attn_qkv.weight`) AND lack
+    // any `nextn.*` MTP marker tensor. This handles:
+    //   - overshoot from MTP heads (Qwen3.5 NextN)
+    //   - simple off-by-one in `block_count` metadata
+    //   - undercount in `block_count`
+    let real_layers = real_main_layer_count(gguf);
+    let num_layers = match real_layers {
+        Some(observed) if observed != metadata_block_count => {
+            eprintln!(
+                "  WARNING: {prefix}.block_count metadata says {metadata_block_count} but \
+                 observed {observed} real (non-MTP) blk.* layers in tensor list. \
+                 Using observed value.",
+            );
+            observed
+        }
+        Some(observed) => observed,
+        None => metadata_block_count,
+    };
     // MoE models (e.g. Qwen3.5-35B-A3B) use expert_feed_forward_length for the per-expert
     // inter_dim and may not have a feed_forward_length field at all.
     // Dense models use feed_forward_length. Try both, preferring expert_feed_forward_length
@@ -121,10 +151,76 @@ pub(crate) fn extract_hyperparams(gguf: &GgufFile) -> Result<(ModelHyperparams, 
         num_active_experts,
         norm_eps,
         rotary_dim,
-        rope_neox: matches!(arch.as_str(), "qwen2" | "qwen35" | "qwen35moe" | "qwen3_5_moe" | "qwen3.5_moe"),
+        rope_neox: matches!(arch.as_str(), "qwen35" | "qwen35moe" | "qwen3_5_moe" | "qwen3.5_moe"),
     };
 
     Ok((hp, arch))
+}
+
+/// Return the number of REAL (non-MTP) backbone layers detected in the GGUF
+/// tensor list, or `None` if no `blk.N.*` tensors are present.
+///
+/// A `blk.N` index counts as a real layer iff:
+///   1. It exposes at least one of `attn_q.weight` (full-attn) or
+///      `attn_qkv.weight` (fused/linear-attn). These are the load-bearing
+///      attention weights every backbone layer must carry.
+///   2. It does NOT contain any `nextn.*` marker tensor
+///      (`nextn.eh_proj.weight`, `nextn.enorm.weight`, `nextn.hnorm.weight`,
+///      `nextn.shared_head_norm.weight`). Those tensors mark Multi-Token
+///      Prediction "Next-N" heads (Qwen3.5 / DeepSeek-V3 style) which are
+///      auxiliary speculative-decode helpers, not main transformer layers.
+///
+/// The Qwen3.5-9B BF16 GGUF produced by `convert_hf_to_gguf.py --outtype bf16`
+/// is the motivating case: 32 real layers (0..31) plus 1 MTP head at blk.32,
+/// declared as `block_count = 33`. Without this filter, the converter would
+/// loop past the real layers and fail on the wrong attention tensor.
+///
+/// Returns the number of *consecutive* real layers starting from 0. If there
+/// is a gap (e.g. blk.5 is missing but blk.6 exists), only the consecutive
+/// prefix is returned — that's the contract our per-layer arch dispatchers
+/// rely on.
+fn real_main_layer_count(gguf: &GgufFile) -> Option<u32> {
+    use std::collections::{HashMap, HashSet};
+
+    // Collect, per-layer, the set of suffixes (everything after `blk.N.`).
+    let mut per_layer: HashMap<u32, HashSet<String>> = HashMap::new();
+    let mut max_idx: Option<u32> = None;
+    for tensor in &gguf.tensors {
+        let name = &tensor.name;
+        if let Some(rest) = name.strip_prefix("blk.") {
+            if let Some(dot) = rest.find('.') {
+                if let Ok(idx) = rest[..dot].parse::<u32>() {
+                    let suffix = rest[dot + 1..].to_string();
+                    per_layer.entry(idx).or_default().insert(suffix);
+                    max_idx = Some(match max_idx {
+                        Some(m) => m.max(idx),
+                        None => idx,
+                    });
+                }
+            }
+        }
+    }
+    let max_idx = max_idx?;
+
+    // Walk from 0 upward and stop at the first index that is either missing
+    // or is an MTP head.
+    let mut real_count: u32 = 0;
+    for idx in 0..=max_idx {
+        let Some(suffixes) = per_layer.get(&idx) else {
+            // Gap: stop counting. The arch dispatcher iterates 0..n_layers
+            // consecutively so we can't safely extend past a missing layer.
+            break;
+        };
+        let has_attn = suffixes.contains("attn_q.weight")
+            || suffixes.contains("attn_qkv.weight");
+        let has_nextn = suffixes.iter().any(|s| s.starts_with("nextn."));
+        if !has_attn || has_nextn {
+            break;
+        }
+        real_count += 1;
+    }
+
+    Some(real_count)
 }
 
 // ---------------------------------------------------------------------------

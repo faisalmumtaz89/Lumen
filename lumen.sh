@@ -4,8 +4,8 @@
 #
 # Usage:
 #   ./lumen "What is the meaning of life?"
-#   ./lumen --model llama-8b "Write a haiku about Rust"
-#   ./lumen pull qwen2.5-3b
+#   ./lumen --model qwen3.5-9b:q8_0 "Write a haiku about Rust"
+#   ./lumen pull qwen3.5-9b:q8_0
 #   ./lumen models
 #
 # First run builds from source (requires Rust). Subsequent runs are instant.

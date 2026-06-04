@@ -522,14 +522,15 @@ impl MetalF32Backend {
                     enc.end_encoding();
                 }
                 _ => {
-                    // F16/F32/other quant fallback: separate gate + up matvecs, then SwiGLU.
+                    // F16/BF16/F32/other quant fallback: separate gate + up matvecs, then SwiGLU.
                     // Gate: gate_buf = W_gate * normed_buf
                     // Up:   up_buf   = W_up   * normed_buf
-                    let (fb_pso, fb_tg, fb_n_tg) = if moe_meta.expert_gate_quant == QuantScheme::F16 {
-                        (&pipelines.matmul_f16_deferred_nr2, 128u64, ((inter_dim as u64) + 1) / 2)
-                    } else {
-                        (&pipelines.matmul_bytes_f32, s.matmul_tg_size, inter_dim as u64)
+                    let (fb_pso, fb_tg, fb_n_tg) = match moe_meta.expert_gate_quant {
+                        QuantScheme::F16 => (&pipelines.matmul_f16_deferred_nr2, 128u64, ((inter_dim as u64) + 1) / 2),
+                        QuantScheme::Bf16 => (&pipelines.matmul_bf16_deferred_nr2, 128u64, ((inter_dim as u64) + 1) / 2),
+                        _ => (&pipelines.matmul_bytes_f32, s.matmul_tg_size, inter_dim as u64),
                     };
+                    let need_inter_byte = matches!(moe_meta.expert_gate_quant, QuantScheme::F16 | QuantScheme::Bf16);
                     {
                         let enc = cmd.new_compute_encoder().ok_or_else(|| {
                             RuntimeError::Compute("Failed to create encoder for MoE expert gate".into())
@@ -539,7 +540,7 @@ impl MetalF32Backend {
                         enc.set_buffer(&s.normed_buf, 0, 1);
                         enc.set_buffer(&s.gate_buf, 0, 2);
                         enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                        if moe_meta.expert_gate_quant == QuantScheme::F16 {
+                        if need_inter_byte {
                             enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 4);
                         }
                         enc.dispatch_threadgroups(
@@ -557,7 +558,7 @@ impl MetalF32Backend {
                         enc.set_buffer(&s.normed_buf, 0, 1);
                         enc.set_buffer(&s.up_buf, 0, 2);
                         enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                        if moe_meta.expert_gate_quant == QuantScheme::F16 {
+                        if need_inter_byte {
                             enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 4);
                         }
                         enc.dispatch_threadgroups(
@@ -624,6 +625,16 @@ impl MetalF32Backend {
                     }
                     QuantScheme::F16 => {
                         enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
+                        enc.set_buffer(ewb, down_off, 0);
+                        enc.set_buffer(&s.gate_buf, 0, 1);
+                        enc.set_buffer(expert_output_buf, expert_out_byte_off, 2);
+                        enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 3);
+                        enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
+                        let n_tg = ((hidden_dim as u64) + 1) / 2;
+                        enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
+                    }
+                    QuantScheme::Bf16 => {
+                        enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
                         enc.set_buffer(ewb, down_off, 0);
                         enc.set_buffer(&s.gate_buf, 0, 1);
                         enc.set_buffer(expert_output_buf, expert_out_byte_off, 2);
@@ -780,18 +791,19 @@ impl MetalF32Backend {
                     (128u64, se_inter as u64)
                 }
                 _ => {
-                    // F16/F32 fallback: separate gate, up, then swiglu
-                    let (fb_pso, fb_tg, fb_n_tg) = if gate_quant == QuantScheme::F16 {
-                        (&pipelines.matmul_f16_deferred_nr2, 128u64, ((se_inter as u64) + 1) / 2)
-                    } else {
-                        (&pipelines.matmul_bytes_f32, s.matmul_tg_size, se_inter as u64)
+                    // F16/BF16/F32 fallback: separate gate, up, then swiglu
+                    let (fb_pso, fb_tg, fb_n_tg) = match gate_quant {
+                        QuantScheme::F16 => (&pipelines.matmul_f16_deferred_nr2, 128u64, ((se_inter as u64) + 1) / 2),
+                        QuantScheme::Bf16 => (&pipelines.matmul_bf16_deferred_nr2, 128u64, ((se_inter as u64) + 1) / 2),
+                        _ => (&pipelines.matmul_bytes_f32, s.matmul_tg_size, se_inter as u64),
                     };
+                    let gate_need_inter_byte = matches!(gate_quant, QuantScheme::F16 | QuantScheme::Bf16);
                     enc.set_pipeline_state(fb_pso);
                     enc.set_buffer(layer_buf, gate_off, 0);
                     enc.set_buffer(&s.normed_buf, 0, 1);
                     enc.set_buffer(se_gate_buf, 0, 2);
                     enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                    if gate_quant == QuantScheme::F16 {
+                    if gate_need_inter_byte {
                         enc.set_bytes(&(se_inter as u32).to_le_bytes(), 4);
                     }
                     enc.dispatch_threadgroups(
@@ -827,17 +839,18 @@ impl MetalF32Backend {
                         let enc3 = cmd.new_compute_encoder().ok_or_else(|| {
                             RuntimeError::Compute("Failed to create encoder for shared expert down".into())
                         })?;
-                        let (d_pso, d_tg, d_n_tg) = if down_quant == QuantScheme::F16 {
-                            (&pipelines.matmul_f16_deferred_nr2, 128u64, ((hidden_dim as u64) + 1) / 2)
-                        } else {
-                            (&pipelines.matmul_bytes_f32, s.matmul_tg_size, hidden_dim as u64)
+                        let (d_pso, d_tg, d_n_tg) = match down_quant {
+                            QuantScheme::F16 => (&pipelines.matmul_f16_deferred_nr2, 128u64, ((hidden_dim as u64) + 1) / 2),
+                            QuantScheme::Bf16 => (&pipelines.matmul_bf16_deferred_nr2, 128u64, ((hidden_dim as u64) + 1) / 2),
+                            _ => (&pipelines.matmul_bytes_f32, s.matmul_tg_size, hidden_dim as u64),
                         };
+                        let down_need_hidden_byte = matches!(down_quant, QuantScheme::F16 | QuantScheme::Bf16);
                         enc3.set_pipeline_state(d_pso);
                         enc3.set_buffer(layer_buf, down_off, 0);
                         enc3.set_buffer(se_gate_buf, 0, 1);
                         enc3.set_buffer(se_down_buf, 0, 2);
                         enc3.set_bytes(&(se_inter as u32).to_le_bytes(), 3);
-                        if down_quant == QuantScheme::F16 {
+                        if down_need_hidden_byte {
                             enc3.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
                         }
                         enc3.dispatch_threadgroups(
@@ -938,16 +951,17 @@ impl MetalF32Backend {
                 QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); 128u64 },
                 QuantScheme::Q4_1 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_1_deferred); 128u64 },
                 QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2); 128u64 },
+                QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2); 128u64 },
                 _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32); s.matmul_tg_size },
             };
             enc.set_buffer(layer_buf, down_off, 0);
             enc.set_buffer(se_gate_buf, 0, 1);
             enc.set_buffer(se_down_buf, 0, 2);
             enc.set_bytes(&(se_inter as u32).to_le_bytes(), 3);
-            if matches!(down_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::Q4_1 | QuantScheme::F16) {
+            if matches!(down_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::Q4_1 | QuantScheme::F16 | QuantScheme::Bf16) {
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
             }
-            let n_tg_down = match down_quant { QuantScheme::Q8_0 => ((hidden_dim as u64) + 7) / 8, QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Q4_1 => ((hidden_dim as u64) + 3) / 4, QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2, _ => hidden_dim as u64 };
+            let n_tg_down = match down_quant { QuantScheme::Q8_0 => ((hidden_dim as u64) + 7) / 8, QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Q4_1 => ((hidden_dim as u64) + 3) / 4, QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2, _ => hidden_dim as u64 };
             enc.dispatch_threadgroups(MTLSize::new(n_tg_down, 1, 1), MTLSize::new(tg_down, 1, 1));
             enc.end_encoding();
         }
@@ -1203,6 +1217,10 @@ impl MetalF32Backend {
                         enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
                         (128u64, ((se_inter as u64) + 1) / 2)
                     },
+                    QuantScheme::Bf16 => {
+                        enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                        (128u64, ((se_inter as u64) + 1) / 2)
+                    }
                     _ => {
                         enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
                         (s.matmul_tg_size, se_inter as u64)
@@ -1387,16 +1405,17 @@ impl MetalF32Backend {
                 QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); 128u64 },
                 QuantScheme::Q4_1 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_1_deferred); 128u64 },
                 QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2); 128u64 },
+                QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2); 128u64 },
                 _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32); s.matmul_tg_size },
             };
             enc.set_buffer(layer_buf, down_off, 0);
             enc.set_buffer(se_gate_buf, 0, 1);
             enc.set_buffer(se_down_buf, 0, 2);
             enc.set_bytes(&(se_inter as u32).to_le_bytes(), 3);
-            if matches!(down_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::Q4_1 | QuantScheme::F16) {
+            if matches!(down_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::Q4_1 | QuantScheme::F16 | QuantScheme::Bf16) {
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
             }
-            let n_tg_down = match down_quant { QuantScheme::Q8_0 => ((hidden_dim as u64) + 7) / 8, QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Q4_1 => ((hidden_dim as u64) + 3) / 4, QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2, _ => hidden_dim as u64 };
+            let n_tg_down = match down_quant { QuantScheme::Q8_0 => ((hidden_dim as u64) + 7) / 8, QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Q4_1 => ((hidden_dim as u64) + 3) / 4, QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2, _ => hidden_dim as u64 };
             enc.dispatch_threadgroups(MTLSize::new(n_tg_down, 1, 1), MTLSize::new(tg_down, 1, 1));
         }
 
@@ -1594,6 +1613,10 @@ impl MetalF32Backend {
                         enc.set_pipeline_state(&pipelines.tiled_matmul_f16);
                         enc.set_threadgroup_memory_length(4096, 0);
                     }
+                    QuantScheme::Bf16 => {
+                        enc.set_pipeline_state(&pipelines.tiled_matmul_bf16);
+                        enc.set_threadgroup_memory_length(4096, 0);
+                    }
                     _ => {
                         enc.set_pipeline_state(&pipelines.tiled_matmul_bytes_f32);
                         enc.set_threadgroup_memory_length(4096, 0);
@@ -1628,6 +1651,10 @@ impl MetalF32Backend {
                     }
                     QuantScheme::F16 => {
                         enc.set_pipeline_state(&pipelines.tiled_matmul_f16);
+                        enc.set_threadgroup_memory_length(4096, 0);
+                    }
+                    QuantScheme::Bf16 => {
+                        enc.set_pipeline_state(&pipelines.tiled_matmul_bf16);
                         enc.set_threadgroup_memory_length(4096, 0);
                     }
                     _ => {
@@ -1684,6 +1711,10 @@ impl MetalF32Backend {
                     }
                     QuantScheme::F16 => {
                         enc.set_pipeline_state(&pipelines.tiled_matmul_f16);
+                        enc.set_threadgroup_memory_length(4096, 0);
+                    }
+                    QuantScheme::Bf16 => {
+                        enc.set_pipeline_state(&pipelines.tiled_matmul_bf16);
                         enc.set_threadgroup_memory_length(4096, 0);
                     }
                     _ => {
@@ -1902,11 +1933,12 @@ impl MetalF32Backend {
                 let enc = cmd.new_compute_encoder().ok_or_else(|| {
                     RuntimeError::Compute("Failed to create encoder".into())
                 })?;
-                let tg = if has_bias && matches!(meta.wq_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) {
+                let tg = if has_bias && matches!(meta.wq_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
                     match meta.wq_quant {
                         QuantScheme::Q8_0 => enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_bias_nr2),
                         QuantScheme::Q4_0 => enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_bias_nr2),
                         QuantScheme::F16 => enc.set_pipeline_state(&pipelines.matmul_f16_deferred_bias_nr2),
+                        QuantScheme::Bf16 => enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_bias_nr2),
                         _ => unreachable!(),
                     };
                     128u64
@@ -1915,6 +1947,7 @@ impl MetalF32Backend {
                         QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2); 128u64 },
                         QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); 128u64 },
                         QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2); 128u64 },
+                        QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2); 128u64 },
                         _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32); matmul_tg_size },
                     }
                 };
@@ -1922,10 +1955,10 @@ impl MetalF32Backend {
                 enc.set_buffer(&s.normed_buf, 0, 1);
                 enc.set_buffer(&s.qkv_buf, 0, 2);
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                if matches!(meta.wq_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) {
+                if matches!(meta.wq_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
                     enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 4);
                 }
-                if has_bias && matches!(meta.wq_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) {
+                if has_bias && matches!(meta.wq_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
                     enc.set_buffer(layer_buf, meta.bq_off.unwrap(), 5);
                     enc.set_buffer(layer_buf, meta.bk_off.unwrap(), 6);
                     enc.set_buffer(layer_buf, meta.bv_off.unwrap(), 7);
@@ -1936,13 +1969,13 @@ impl MetalF32Backend {
                 let n_tg = if tg == 64 {
                     ((qkv_dim as u64) + 7) / 8  // (dead path: Q8_0 now uses deferred with tg=128)
                 } else {
-                    match meta.wq_quant { QuantScheme::Q8_0 => ((qkv_dim as u64) + 1) / 2, QuantScheme::Q4_0 => ((qkv_dim as u64) + 1) / 2, QuantScheme::F16 => ((qkv_dim as u64) + 1) / 2, _ => qkv_dim as u64 }
+                    match meta.wq_quant { QuantScheme::Q8_0 => ((qkv_dim as u64) + 1) / 2, QuantScheme::Q4_0 => ((qkv_dim as u64) + 1) / 2, QuantScheme::F16 => ((qkv_dim as u64) + 1) / 2, QuantScheme::Bf16 => ((qkv_dim as u64) + 1) / 2, _ => qkv_dim as u64 }
                 };
                 enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(tg, 1, 1));
                 enc.end_encoding();
             }
             // QKV bias addition fallback (only for F32 weights with bias, rare)
-            if !matches!(meta.wq_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16)
+            if !matches!(meta.wq_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16)
                 && (meta.bq_off.is_some() || meta.bk_off.is_some() || meta.bv_off.is_some())
             {
                 let enc = cmd.new_compute_encoder().ok_or_else(|| {
@@ -2153,6 +2186,7 @@ impl MetalF32Backend {
                     QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_residual_nr2); 128u64 },
                     QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_residual_nr2); 128u64 },
                     QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_residual_nr2); 128u64 },
+                    QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_residual_nr2); 128u64 },
                     _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32_residual); matmul_tg_size },
                 };
                 enc.set_buffer(layer_buf, wo_off, 0);
@@ -2160,10 +2194,10 @@ impl MetalF32Backend {
                 enc.set_buffer(&s.attn_proj_buf, 0, 2);
                 enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
                 enc.set_buffer(&s.x_buf, 0, 4);
-                if matches!(meta.wo_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) {
+                if matches!(meta.wo_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
                     enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 5);
                 }
-                let n_tg_wo = match meta.wo_quant { QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2, _ => hidden_dim as u64 };
+                let n_tg_wo = match meta.wo_quant { QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2, _ => hidden_dim as u64 };
                 enc.dispatch_threadgroups(MTLSize::new(n_tg_wo, 1, 1), MTLSize::new(tg_wo, 1, 1));
                 enc.end_encoding();
             }
@@ -2317,10 +2351,10 @@ impl MetalF32Backend {
                     );
                     enc.end_encoding();
                 } else {
-                    let (fb_pso, fb_tg, fb_n_tg) = if meta.w_gate_quant == QuantScheme::F16 {
-                        (&pipelines.matmul_f16_deferred_nr2, 128u64, ((inter_dim as u64) + 1) / 2)
-                    } else {
-                        (&pipelines.matmul_bytes_f32, matmul_tg_size, inter_dim as u64)
+                    let (fb_pso, fb_tg, fb_n_tg) = match meta.w_gate_quant {
+                        QuantScheme::F16 => (&pipelines.matmul_f16_deferred_nr2, 128u64, ((inter_dim as u64) + 1) / 2),
+                        QuantScheme::Bf16 => (&pipelines.matmul_bf16_deferred_nr2, 128u64, ((inter_dim as u64) + 1) / 2),
+                        _ => (&pipelines.matmul_bytes_f32, matmul_tg_size, inter_dim as u64),
                     };
                     {
                         let enc = cmd.new_compute_encoder().ok_or_else(|| {
@@ -2331,7 +2365,7 @@ impl MetalF32Backend {
                         enc.set_buffer(&s.normed_buf, 0, 1);
                         enc.set_buffer(&s.gate_buf, 0, 2);
                         enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                        if meta.w_gate_quant == QuantScheme::F16 {
+                        if matches!(meta.w_gate_quant, QuantScheme::F16 | QuantScheme::Bf16) {
                             enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 4);
                         }
                         enc.dispatch_threadgroups(
@@ -2371,6 +2405,7 @@ impl MetalF32Backend {
                         QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_residual_nr2); 128u64 },
                         QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_residual_nr2); 128u64 },
                         QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_residual_nr2); 128u64 },
+                        QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_residual_nr2); 128u64 },
                         _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32_residual); matmul_tg_size },
                     };
                     enc.set_buffer(layer_buf, w_down_off, 0);
@@ -2378,10 +2413,10 @@ impl MetalF32Backend {
                     enc.set_buffer(&s.x_buf, 0, 2);
                     enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 3);
                     enc.set_buffer(&s.attn_proj_buf, 0, 4);
-                    if matches!(meta.w_down_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) {
+                    if matches!(meta.w_down_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
                         enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 5);
                     }
-                    let n_tg_down = match meta.w_down_quant { QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2, _ => hidden_dim as u64 };
+                    let n_tg_down = match meta.w_down_quant { QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2, _ => hidden_dim as u64 };
                     enc.dispatch_threadgroups(MTLSize::new(n_tg_down, 1, 1), MTLSize::new(tg_down, 1, 1));
                     enc.end_encoding();
                 }

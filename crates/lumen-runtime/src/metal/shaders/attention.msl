@@ -494,8 +494,13 @@ kernel void multi_head_attention(
 //   Phase 2: Softmax over scores
 //   Phase 3: Weighted sum of V_cache
 //
-// For GQA (num_q_heads > num_kv_heads), all Q heads in the same KV group
-// redundantly write K/V to cache (benign race: identical values).
+// For GQA (num_q_heads > num_kv_heads), all Q heads in the same KV group write
+// the SAME RoPE'd K/V to the same cache slots. This is deterministic and
+// idempotent (every sharing threadgroup writes the identical value computed from
+// LOCAL registers), NOT a data race. Critically, the RoPE'd K is written ONLY to
+// k_cache, never back into the shared k_vec input -- an in-place k_vec write-back
+// WOULD be a real cross-threadgroup read-modify-write race (double-applied RoPE);
+// see the K-RoPE loop below for the full rationale (DET-001 fix).
 //
 // Only used for short sequences (seq_len < FLASH_DECODE_THRESHOLD = 257).
 // Dispatch: threadgroups = num_q_heads, threads = min(256, max(head_dim, seq_len+1))
@@ -547,8 +552,16 @@ kernel void fused_rope_kv_mha(
         q_vec[idx1] = v0 * s + v1 * c;
     }
 
-    // Apply RoPE to K[kv_head] + write to K cache
-    // All Q heads in the same KV group do this redundantly (benign race).
+    // Apply RoPE to K[kv_head] + write to K cache.
+    //
+    // Under GQA (num_q_heads > num_kv_heads) ALL Q-head threadgroups sharing a kv_head run
+    // this loop on the SAME shared k_vec slots. The RoPE'd K is therefore written ONLY to the
+    // per-position K cache (from the LOCAL new0/new1); k_vec is left untouched. The attention
+    // scores phase reads K exclusively from k_cache (never from k_vec after this loop), so an
+    // in-place k_vec write-back would be both unnecessary and racy (a cross-threadgroup
+    // read-modify-write on shared k_vec could apply RoPE twice). Writing only to k_cache is
+    // race-free: each (seq_pos, idx) slot is written once with the same value by every sharing
+    // threadgroup.
     for (uint i = tid; i < half_dim; i += tg_size) {
         uint idx0 = kv_head * head_dim + 2 * i;
         uint idx1 = idx0 + 1;
@@ -559,8 +572,6 @@ kernel void fused_rope_kv_mha(
         float s = sin_table[cos_idx];
         float new0 = v0 * c - v1 * s;
         float new1 = v0 * s + v1 * c;
-        k_vec[idx0] = new0;
-        k_vec[idx1] = new1;
         k_cache[seq_pos * kv_dim + idx0] = half(new0);
         k_cache[seq_pos * kv_dim + idx1] = half(new1);
     }
@@ -904,6 +915,3 @@ kernel void flash_decode_reduce(
     }
 }
 
-// ============================================================================
-// add_residual: Element-wise vector addition dst[i] += src[i]
-// ============================================================================

@@ -14,8 +14,8 @@
 //   - Accumulate across all blocks in registers (no per-block reduction!)
 //   - Single warp_reduce_sum at the END (5 shuffles total, not per-block)
 //
-// Bytes per element: 34/32 = 1.0625 (same as llama.cpp's native Q8_0)
-// Expected: ~130 tok/s on 8B (vs 79.2 with aligned dp4a, vs 131 llama.cpp)
+// Bytes per element: 34/32 = 1.0625 (GGML native Q8_0 layout)
+// Target: ~130 tok/s on 8B (vs 79.2 with aligned dp4a baseline).
 //
 // Q8_0 block layout (GGML): 34 bytes per block of 32 elements.
 //   bytes [0..1]: f16 scale (IEEE 754 half-precision, little-endian)

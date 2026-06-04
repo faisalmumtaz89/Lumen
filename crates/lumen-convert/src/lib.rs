@@ -5,6 +5,7 @@ pub(crate) mod arch;
 pub(crate) mod dequant;
 pub mod gguf;
 pub(crate) mod hyperparams;
+pub mod sharded;
 pub mod tokenizer_data;
 pub(crate) mod tensor_io;
 pub(crate) mod tensor_names;

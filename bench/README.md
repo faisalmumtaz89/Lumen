@@ -1,108 +1,98 @@
 # Lumen Benchmark Suite
 
-Automated, reproducible benchmarking for Lumen inference engine vs MLX and llama.cpp on Apple Silicon.
+Reproducible benchmarking for Lumen — **LLM inference in Rust, for Apple Silicon and NVIDIA CUDA** — measured head-to-head against llama.cpp (CUDA + Metal) and vLLM (CUDA only).
+
+This directory contains the perf-benchmarking suite. Methodology lives in [METHODOLOGY.md](METHODOLOGY.md); results live in [RESULTS.md](RESULTS.md); the run harness is `run_bench.sh`.
+
+The published benchmark suite is currently scoped to Lumen's v1 model family on two accelerator families. Additional model families will be added to the suite as they ship.
+
+- **Primary model (v1)**: Qwen3.5-9B (`qwen35` architecture — GDN hybrid + dense FFN)
+- **Secondary model (v1)**: Qwen3.5-MoE 35B-A3B (`qwen35moe`; architecture-truthful active-parameter label is 30B-A3B) — see [RESULTS.md](RESULTS.md)
+- **Backends measured**: CUDA on NVIDIA A100-80GB (SM 80) and Metal on Apple Silicon M3 Ultra
+
+Architectures outside the v1 set are out of scope for the currently-published benchmark.
 
 ## Quick Start
 
+### Metal (canonical local harness — Apple Silicon)
+
+`run_bench.sh` is a macOS / Apple-Silicon-only harness that runs Lumen vs `llama-bench` (and, when available, MLX) head-to-head. It does **not** orchestrate Modal or vLLM; CUDA + vLLM runs use the legacy Modal path below.
+
 ```bash
-# Full suite (all models, all configs, ~45 min)
-./bench/run_bench.sh
-
-# Quick check (pp128+gen128 only, 3 runs, ~10 min)
-./bench/run_bench.sh --quick
-
-# Lumen only (skip MLX and llama.cpp)
-./bench/run_bench.sh --lumen-only
-
-# Specific model(s)
-./bench/run_bench.sh --models "llama-8b"
-./bench/run_bench.sh --models "llama-8b,qwen35-9b"
+./run_bench.sh                  # full envelope (~12 cells)
+./run_bench.sh --quick          # smaller subset
+./run_bench.sh --lumen-only     # skip llama-bench / MLX baselines
 ```
+
+Prerequisites: macOS on Apple Silicon, `/opt/homebrew/bin/llama-bench`, optionally an MLX venv at `~/.venvs/mlx-bench`, and Lumen built with `cargo build --release -p lumen-cli` (LBCs auto-cache under `/tmp/lumen-bench`).
+
+### CUDA (Modal — legacy, retained for historical re-runs)
+
+```bash
+# Q8_0 and Q4_0 head-to-head (Lumen vs llama.cpp vs vLLM)
+modal run modal/bench_real_models.py --models qwen3.5-9b --quants q8_0,q4_0
+
+# BF16 head-to-head (separate script — uses bf16-converted GGUF)
+modal run modal/bf16_industry_bench.py
+```
+
+Note: the Modal scripts (`modal/bench_real_models.py`, `modal/bf16_industry_bench.py`) are referenced by [METHODOLOGY.md](METHODOLOGY.md) but are no longer maintained in-tree; canonical CUDA numbers in [RESULTS.md](RESULTS.md) were captured directly on the remote A100 cluster.
+
+For the v1 Qwen3.5-9B cell, Lumen, llama.cpp, and vLLM all consume weights from `bartowski/Qwen_Qwen3.5-9B-GGUF` (BF16 weights generated locally via `convert_hf_to_gguf.py --outtype bf16`).
 
 ## Prerequisites
 
-- **Lumen**: Rust toolchain (`cargo build --release -p lumen-cli`)
-- **MLX**: Python venv at `~/.venvs/mlx-bench/` with `mlx-lm` installed
-- **llama.cpp** (optional): `llama-bench` at `/opt/homebrew/bin/llama-bench` + GGUF files; auto-skipped if not found
-- **Models**: `.lbc` files in `/tmp/lumen-bench/` (configurable with `--bench-dir`)
-- MLX models auto-discovered from HuggingFace cache and `/tmp/lumen-bench/`
+- **Lumen**: Rust toolchain (`cargo build --release --features cuda -p lumen-cli` for CUDA; `cargo build --release -p lumen-cli` for Metal)
+- **CUDA hardware harness**: remote A100 cluster (canonical) — see [METHODOLOGY.md](METHODOLOGY.md) §Hardware
+- **Metal hardware harness**: Mac Studio M3 Ultra 96 GB (canonical) — `run_bench.sh` is the entry point
+- **GGUF weights (v1)**: pulled from `bartowski/Qwen_Qwen3.5-9B-GGUF`; the LBC conversion runs once per container / once per Mac cache. Future model families will reference their own GGUF sources.
 
-## Options
+## Full-performance invocation (CUDA)
+
+The Lumen production env stack is **default-ON**.
+
+The 12-flag canonical env stack is documented at [METHODOLOGY.md § Required env-vars for full performance](METHODOLOGY.md#required-env-vars-for-full-performance). Critically `LUMEN_CUDA_BF16_GEMMEX=0` is required for BF16 P3 correctness on MoE.
+
+## Reproducing a single configuration
+
+`run_bench.sh` (Metal) flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--quick` | off | pp128+gen128 only, 3 runs |
-| `--lumen-only` | off | Skip MLX and llama.cpp benchmarks |
-| `--skip-llamacpp` | off | Skip llama.cpp benchmarks only |
-| `--no-build` | off | Skip `cargo build` step |
-| `--models FILTER` | all | Comma-separated substrings to match LBC filenames |
-| `--runs N` | 5 | Measured runs per config |
-| `--warmup N` | 1 | Warmup runs (discarded) |
-| `--cooldown N` | 30 | Seconds between model switches |
-| `--config-cooldown N` | 5 | Seconds between config changes within a model |
-| `--prompt-lengths "L..."` | "32 128 512 1024" | Space-separated prompt token counts |
-| `--gen-lengths "L..."` | "32 128 256" | Space-separated generation token counts |
-| `--bench-dir DIR` | /tmp/lumen-bench | Directory containing `.lbc` model files |
+| `--quick` | (off) | Smaller subset (single M, single G, fewer trials) |
+| `--lumen-only` | (off) | Skip llama-bench and MLX baselines |
+| `--models <filter>` | all | Filter by registry name fragment |
+| `--prompt-lengths "L L L"` | `32 128 512 1024` | M axis |
+| `--gen-lengths "L L L"` | `32 128 256` | G axis |
+| `RUNS` env var | 5 | Measured runs per cell |
+| `WARMUP_RUNS` env var | 1 | Warmup runs discarded |
 
-## Methodology
-
-1. **Execution order**: MLX first (cold GPU), then llama.cpp, then Lumen -- avoids thermal bias
-2. MLX uses `-n 5` (5 internal trials per run) for stable measurements
-3. Warmup runs are discarded before measured runs begin
-4. Statistics: **median** and **stddev** across measured runs
-5. Cooldown period between model switches to prevent thermal throttling
-6. Ctrl+C generates partial results from whatever has completed
+CUDA-via-Modal (legacy) flag list is preserved in `modal/bench_real_models.py` source.
 
 ## Output
 
-Results are saved to `bench/results/YYYY-MM-DD_HHMMSS/` with a symlink at `bench/results/latest/`.
+`run_bench.sh` writes per-run results under `bench/results/<timestamp>/`:
 
 ```
-bench/results/latest/
-  results.md         # Markdown report
-  results.json       # Machine-parseable JSON
-  results_raw.txt    # Pipe-delimited raw data
-  raw/               # Individual run logs
+bench/results/
+  <timestamp>/
+    results.md       # human-readable summary
+    results.json     # machine-parseable JSON (schema: METHODOLOGY.md §"Bench report JSON schema")
+  archive/           # archived legacy results preserved here
 ```
 
-`bench/results/` is gitignored.
+`bench/results/` is git-tracked only for the small summary text files; per-run raw directories are gitignored.
 
 ## Report Format
 
-The report is structured around **Lumen vs baselines** (MLX and llama.cpp where available), not model-to-model comparison.
+The canonical results live in [RESULTS.md](RESULTS.md). Each row is `Quant × Metric` with engine columns (Lumen, llama.cpp, vLLM where applicable). Ratios are reported as `Lumen / baseline` — values `>= 1.00` (bold) mean Lumen is at least as fast as the baseline.
 
-### Summary Table
+## What this suite does NOT cover
 
-One row per model+quant at the canonical pp128+gen128 config, showing decode and prefill with ratios against each available baseline:
+- Architectures other than v1's `qwen35` and `qwen35moe` (additional model families are on the roadmap)
+- Hardware below NVIDIA SM 8.0 / Apple Silicon M3 Ultra
+- Batched serving throughput (batch > 1 per request)
+- TTFT as a separate metric (prefill throughput is reported)
+- Power consumption
 
-```
-| Model        | Quant | Lumen Decode | MLX Decode | vs MLX    | LC Decode | vs LC     | Lumen Prefill | ...
-|--------------|:-----:|-------------:|-----------:|:---------:|----------:|:---------:|--------------:|----
-| Llama 3.1 8B | Q8_0  | 73           | 80         | 0.92x     | 68        | **1.08x** | 836           | ...
-| Qwen3.5 9B   | Q8_0  | 56           | 70         | 0.80x     | n/a       | n/a       | 336           | ...
-```
-
-- **Ratio = Lumen / baseline**. Bold when >= 1.00 (Lumen faster), plain when < 1.00 (Lumen slower).
-- Same-quant comparisons only. llama.cpp columns shown when models are supported (n/a otherwise).
-
-### Detail Tables
-
-Decode and prefill detail tables show every config (prompt length x generation length) grouped per model, with sub-rows for each available baseline:
-
-```
-| Model           | Quant | pp32+g32 | pp128+g128 | ...  |
-|-----------------|:-----:|--------: |----------: |-----:|
-| Llama 3.1 8B    | Q8_0  | 76       | 73         | ...  |   <- Lumen
-| ^(MLX Q8_0)     |       | 82       | 80         | ...  |   <- MLX baseline
-| ^(vs MLX)       |       | 0.93x    | 0.92x      | ...  |   <- Lumen/MLX
-| ^(llama.cpp Q8_0)|      | 70       | 68         | ...  |   <- llama.cpp baseline
-| ^(vs LC)        |       | **1.09x**| **1.08x**  | ...  |   <- Lumen/llama.cpp
-```
-
-### Lumen-Only Mode
-
-When `--lumen-only` is used, the report shows raw Lumen decode and prefill tables without baseline comparison.
-
-## CUDA Benchmarks
-
-CUDA benchmarks run on NVIDIA A100-80GB via [Modal](https://modal.com). The CUDA benchmark script is not included in this repository (it requires Modal credentials and infrastructure). See [METHODOLOGY.md](METHODOLOGY.md) for the CUDA benchmark methodology, execution order, and hardware details.
+See [METHODOLOGY.md](METHODOLOGY.md) for the full set of methodology decisions and the [archive](results/archive/) for historical results from earlier scopes.

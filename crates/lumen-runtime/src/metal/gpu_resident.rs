@@ -4,10 +4,13 @@
 //! `StorageModePrivate` Metal buffer, eliminating TLB misses, reducing virtual
 //! address ranges, and enabling GPU memory controller optimizations.
 
-use super::ffi::MetalBuffer;
+use super::ffi::{MetalBuffer, MTLSize};
+use super::repack_q8;
+use super::repack_q4;
 use super::types::{CachedLayerMeta, CachedMoeMeta};
 use super::{MetalF32Backend, PAGE_SIZE};
 use crate::error::RuntimeError;
+use lumen_format::quantization::QuantScheme;
 
 impl MetalF32Backend {
     /// Pre-load ALL layer weights into a single private (GPU-only) Metal buffer.
@@ -34,6 +37,105 @@ impl MetalF32Backend {
 
         // Quiet by default — CLI controls verbosity.
 
+        // ====================================================================
+        // `LUMEN_METAL_MMAP_ONLY=1` eligibility probe.
+        // ====================================================================
+        //
+        // When set AND layer 0's mmap pointer is page-aligned, Pass 1 emits
+        // mmap-relative `base` offsets and records each layer's mmap pointer.
+        // Pass 2/3 (staging + blit to private buffer) is replaced by a single
+        // `newBufferWithBytesNoCopy:` wrapping the union span of all layer
+        // mmap pages — zero CPU heap dup, zero staging dup, zero private dup.
+        // Post-Pass-3 setup (MoE detection, GDN state, repack,
+        // paired repack, etc.) runs unchanged.
+        //
+        // shipped this as `LUMEN_METAL_BF16_MMAP_ONLY` gated to BF16.
+        // generalized to `LUMEN_METAL_MMAP_ONLY` covering BF16, Q8, Q4
+        // for MoE 30B-A3B Q8/Q4 LBCs where the legacy Pass 1/2/3 dup pushes
+        // peak RSS above the 5 GB free-RAM BAIL threshold even on 96 GB hosts
+        // BF16 alias `LUMEN_METAL_BF16_MMAP_ONLY=1` is preserved for backward
+        // compat — either env enables the same path.
+        //
+        // Why safe across quant schemes: the no-copy MTLBuffer wraps raw
+        // mmap pages. BF16/Q8/Q4 weights are NOT mutated at residency time;
+        // on-disk bytes are exactly what the MSL kernels read. mmap regions
+        // are page-aligned on Unix. The MTLBuffer's lifetime is bounded by
+        // MetalScratch, which is bounded by the engine holding the
+        // WeightProvider (mmap owner). Globals (embedding/norm/output_proj)
+        // remain on their existing buffers via the `gpu_global_offsets =
+        // None` fallback already supported by decode/prefill paths.
+        //
+        // Q8 repack (FFN-down + gate+up SoA, env-default-ON via)
+        // and Q4 repack (env-default-OFF) operate by reading raw mmap
+        // bytes via `lv.subtensor_bytes(&st.<w>)` and writing into NEW Metal
+        // buffers — they do NOT touch the unified buffer's bytes, so the
+        // no-copy path is fully compatible with both repack passes.
+        //
+        // Fallback: if probe fails (non-aligned mmap ptr, or no layers),
+        // legacy Pass 1/2/3 runs unchanged. When env unset, the entire
+        // branch is skipped — binary-identical to the legacy path.
+        let mmap_only_env = {
+            let v_master = std::env::var("LUMEN_METAL_MMAP_ONLY")
+                .ok()
+                .as_deref()
+                .map(|s| !s.is_empty() && s != "0")
+                .unwrap_or(false);
+            let v_bf16_alias = std::env::var("LUMEN_METAL_BF16_MMAP_ONLY")
+                .ok()
+                .as_deref()
+                .map(|s| !s.is_empty() && s != "0")
+                .unwrap_or(false);
+            v_master || v_bf16_alias
+        };
+
+        // mmap-only path scratch:
+        // - mmap_only: gate decision after probe of layer 0.
+        // - mmap_min_ptr / mmap_max_end: union span of all layer mmap pages.
+        // - layer_ptrs[i] = (raw mmap ptr usize, len) for layer i — only
+        //   populated when mmap_only is true.
+        let mut mmap_min_ptr: usize = usize::MAX;
+        let mut mmap_max_end: usize = 0;
+        let mut layer_ptrs: Vec<(usize, usize)> = Vec::new();
+
+        let mmap_only = if mmap_only_env && num_layers > 0 {
+            // Probe-pass: walk all layers, record ptr/len, check first layer
+            // is page-aligned. get_layer_blocking() is O(1) for the mmap
+            // provider (cached LayerView clone — pointer copy only).
+            // removed BF16 quant gate; the no-copy path is correct
+            // for any quant scheme because the unified buffer holds raw bytes.
+            // get_layer_raw keeps the native blob layout (see the main upload
+            // loop below for why get_layer_blocking would corrupt sync weights).
+            let lv0 = weights.get_layer_raw(0).map_err(|e| {
+                RuntimeError::Compute(format!(
+                    " MMAP_ONLY: probe layer 0 failed: {}", e
+                ))
+            })?;
+            let probe_ptr = lv0.as_bytes().as_ptr() as usize;
+            let probe_aligned = probe_ptr != 0 && (probe_ptr % PAGE_SIZE == 0);
+            if probe_aligned {
+                layer_ptrs.reserve(num_layers);
+                for layer in 0..num_layers {
+                    let lv = weights.get_layer_raw(layer).map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            " MMAP_ONLY: probe layer {} failed: {}", layer, e
+                        ))
+                    })?;
+                    let bytes = lv.as_bytes();
+                    let p = bytes.as_ptr() as usize;
+                    let l = bytes.len();
+                    layer_ptrs.push((p, l));
+                    if p < mmap_min_ptr { mmap_min_ptr = p; }
+                    let end = p.saturating_add(l);
+                    if end > mmap_max_end { mmap_max_end = end; }
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // === Pass 1: Collect layer blobs and compute page-aligned offsets ===
         let align = |size: usize| -> usize { (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1) };
 
@@ -44,13 +146,30 @@ impl MetalF32Backend {
         let mut gdn_layer_counter: usize = 0;
 
         for layer in 0..num_layers {
-            let layer_view = weights.get_layer_blocking(layer).map_err(|e| {
+            // get_layer_raw (NOT get_layer_blocking): GPU-resident upload needs
+            // the weights in their native quant scheme (Q8_0/Q4_0/F16/BF16) with
+            // the original blob layout. SyncWeightProvider::get_layer_blocking
+            // dequantizes to F32 AND rebuilds the blob, leaving the GDN ssm_*
+            // subtensor offsets pointing into the wrong blob -> corrupt weights
+            // (pad-token garbage). MmapWeightProvider returns raw bytes for both
+            // methods, so this is a no-op on the mmap path. Mirrors the CUDA
+            // backend, which uses get_layer_raw for the same reason.
+            let layer_view = weights.get_layer_raw(layer).map_err(|e| {
                 RuntimeError::Compute(format!(
                     "Failed to get layer {} for GPU-resident loading: {}", layer, e
                 ))
             })?;
             let blob = layer_view.as_bytes();
-            let base = cursor as u64;
+            // In mmap-only mode, `base` is the mmap-relative
+            // byte offset of this layer's blob within the union span; subtensor
+            // offsets `base + st.<sub>.offset` index into the no-copy MTLBuffer
+            // that wraps `[mmap_min_ptr, mmap_max_end)`. Default-mode `base`
+            // is `cursor` (page-packed offset into staging/private buffer).
+            let base: u64 = if mmap_only {
+                (layer_ptrs[layer].0 - mmap_min_ptr) as u64
+            } else {
+                cursor as u64
+            };
             let st = &layer_view.subtensors;
             layer_metas.push(CachedLayerMeta {
                 attn_norm_off: base + st.attn_norm.offset,
@@ -142,129 +261,253 @@ impl MetalF32Backend {
                     None
                 },
             });
-            layer_offsets.push(cursor);
-            layer_blobs.push(blob.to_vec());
-            cursor = align(cursor + blob.len());
-        }
-
-        // Append global tensors at page-aligned offsets.
-        // For large-vocab models (>64K vocab), the embedding + output_proj tables
-        // can exceed 2 GB, causing a 3 GB private buffer that degrades GPU cache
-        // performance. Only pack globals into the unified buffer when they're small.
-        let embed_buf_ref = self.embedding_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("Embedding buffer not initialized for unified preload".into())
-        })?;
-        let embed_len = embed_buf_ref.length() as usize;
-
-        let norm_buf_ref = self.final_norm_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("Final norm buffer not initialized for unified preload".into())
-        })?;
-        let norm_len = norm_buf_ref.length() as usize;
-
-        let proj_buf_ref = self.output_proj_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("Output proj buffer not initialized for unified preload".into())
-        })?;
-        let proj_len = proj_buf_ref.length() as usize;
-
-        // Weight tying: output_proj shares embedding storage (no separate allocation)
-        let effective_proj_len = if self.weight_tying { 0 } else { proj_len };
-        let global_bytes = embed_len + norm_len + effective_proj_len;
-        // Include globals in the unified private buffer.
-        let include_globals = true;
-
-        let (embed_offset, norm_offset, proj_offset) = if include_globals {
-            let eo = cursor;
-            cursor = align(cursor + embed_len);
-            let no = cursor;
-            cursor = align(cursor + norm_len);
-            if self.weight_tying {
-                // output_proj reuses embedding offset
-                (eo, no, eo)
+            if mmap_only {
+                // Defer offset/blob accumulation; the mmap-only
+                // branch resolves layer_offsets from layer_ptrs and skips
+                // Pass 2/3. Push placeholder zero so
+                // layer_offsets.len() == num_layers.
+                layer_offsets.push(0);
             } else {
-                let po = cursor;
-                cursor = align(cursor + proj_len);
-                (eo, no, po)
+                layer_offsets.push(cursor);
+                layer_blobs.push(blob.to_vec());
+                cursor = align(cursor + blob.len());
             }
-        } else {
-            (0, 0, 0)
-        };
-
-        let total_size = cursor;
-
-        // === Pass 2: Allocate shared staging buffer and copy all data via CPU ===
-        let staging_buf = self.device.new_buffer(total_size).ok_or_else(|| {
-            RuntimeError::Compute(format!(
-                "Failed to allocate staging buffer ({} bytes, {:.1} MB)",
-                total_size, total_size as f64 / (1024.0 * 1024.0)
-            ))
-        })?;
-
-        let dst_base = staging_buf.contents() as *mut u8;
-        let mut layer_bytes_total: usize = 0;
-
-        for (layer, blob) in layer_blobs.iter().enumerate() {
-            let off = layer_offsets[layer];
-            unsafe {
-                std::ptr::copy_nonoverlapping(blob.as_ptr(), dst_base.add(off), blob.len());
-            }
-            layer_bytes_total += blob.len();
         }
 
-        if include_globals {
-            // Copy global tensors from their existing Metal buffers
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    embed_buf_ref.contents() as *const u8, dst_base.add(embed_offset), embed_len,
-                );
-                std::ptr::copy_nonoverlapping(
-                    norm_buf_ref.contents() as *const u8, dst_base.add(norm_offset), norm_len,
-                );
-                if !self.weight_tying {
+        // ====================================================================
+        // MMAP_ONLY: replace Pass 2/3 with a single no-copy MTLBuffer.
+        // ====================================================================
+        //
+        // In mmap-only mode:
+        //   - All layer blobs live in `[mmap_min_ptr, mmap_max_end)`.
+        //   - One `newBufferWithBytesNoCopy:` wraps that union span; the
+        //     GPU reads weights directly from mmap'd OS pages (unified memory
+        //     on Apple Silicon — no DMA copy, no private allocation).
+        //   - `layer_offsets[i]` = mmap-relative byte offset of layer i.
+        //   - Globals (embedding/norm/output_proj) live in their existing
+        //     per-tensor buffers (initialized by backend_impl.rs); the
+        //     `gpu_global_offsets = None` branch in decode/prefill paths
+        //     binds those buffers via fallback.
+        //   - VRAM ledger: peak transient = 0 above the steady-state mmap
+        //     resident set. Steady state = LBC file size (mmap'd pages,
+        //     OS-managed) + per-tensor globals (~1.5 GB for Qwen3.5-9B BF16)
+        //     + scratch/KV/RoPE/MoE-meta buffers.
+        let layer_bytes_total: usize;
+        let total_size: usize;
+        let include_globals: bool;
+        let global_bytes: usize;
+        let (embed_offset, norm_offset, proj_offset): (usize, usize, usize);
+
+        if mmap_only {
+            // Sanity: union span > 0 and the first layer's pointer is page-aligned
+            // (probe pass guaranteed this; double-check defensively).
+            if mmap_min_ptr == usize::MAX || mmap_max_end <= mmap_min_ptr {
+                return Err(RuntimeError::Compute(
+                    " MMAP_ONLY: invalid mmap span (no layers recorded)".into(),
+                ));
+            }
+            if mmap_min_ptr % PAGE_SIZE != 0 {
+                return Err(RuntimeError::Compute(format!(
+                    " MMAP_ONLY: mmap_min_ptr {:#x} not page-aligned",
+                    mmap_min_ptr
+                )));
+            }
+            // Fill layer_offsets with mmap-relative byte offsets.
+            // `base` in layer_metas was already computed in Pass 1 using these
+            // same offsets, so the two are consistent (no double accounting).
+            for (i, (ptr, _len)) in layer_ptrs.iter().enumerate() {
+                layer_offsets[i] = *ptr - mmap_min_ptr;
+            }
+
+            let span_raw = mmap_max_end - mmap_min_ptr;
+            // Round span up to page boundary as required by
+            // newBufferWithBytesNoCopy on Apple Silicon.
+            let span = align(span_raw);
+
+            // Sanity: don't wrap absurd sizes (defensive — Qwen3.5-9B BF16
+            // mmap span is ~16.3 GB; MoE-30B BF16 ~60 GB if we ever extend).
+            const MAX_MMAP_SPAN_BYTES: usize = 96 * 1024 * 1024 * 1024; // 96 GB
+            if span > MAX_MMAP_SPAN_BYTES {
+                return Err(RuntimeError::Compute(format!(
+                    " MMAP_ONLY: union span {} bytes exceeds ceiling {}",
+                    span, MAX_MMAP_SPAN_BYTES
+                )));
+            }
+
+            layer_bytes_total = layer_ptrs.iter().map(|(_, l)| *l).sum::<usize>();
+            total_size = span;
+            include_globals = false;
+            global_bytes = 0;
+            embed_offset = 0;
+            norm_offset = 0;
+            proj_offset = 0;
+
+            // Wrap mmap pages in a single MTLBuffer (zero-copy on unified memory).
+            //
+            // SAFETY: The mmap region is owned by the WeightProvider that the
+            // engine borrows for the duration of `generate()`. The MetalScratch
+            // (which holds the MTLBuffer in `gpu_unified_weight_buf`) drops
+            // before the engine drops the provider, so the MTLBuffer's
+            // dereferences always see live mmap pages. The deallocator block is
+            // nil (we do not own the memory — the kernel mmap does).
+            let unified_buf = unsafe {
+                self.device.new_buffer_no_copy(mmap_min_ptr as *mut std::ffi::c_void, span)
+            }.ok_or_else(|| {
+                RuntimeError::Compute(format!(
+                    " MMAP_ONLY: newBufferWithBytesNoCopy failed (ptr={:#x}, len={})",
+                    mmap_min_ptr, span
+                ))
+            })?;
+
+            // Drop layer_blobs (empty in mmap-only mode but allocator may
+            // have reserved capacity from with_capacity).
+            drop(layer_blobs);
+
+            s.gpu_unified_weight_buf = Some(unified_buf);
+            s.gpu_layer_offsets = layer_offsets;
+            s.gpu_global_offsets = None; // Use legacy per-tensor global buffers.
+            s.cached_layer_meta = layer_metas;
+
+            // instrumentation: surface span size via the resident summary path.
+            let layer_mb = layer_bytes_total as f64 / (1024.0 * 1024.0);
+            let total_mb = total_size as f64 / (1024.0 * 1024.0);
+            let _ = (num_layers, layer_mb, total_mb);
+        } else {
+            // Legacy path: Append global tensors at page-aligned offsets.
+            // For large-vocab models (>64K vocab), the embedding + output_proj tables
+            // can exceed 2 GB, causing a 3 GB private buffer that degrades GPU cache
+            // performance. Only pack globals into the unified buffer when they're small.
+            let embed_buf_ref = self.embedding_buf.as_ref().ok_or_else(|| {
+                RuntimeError::Compute("Embedding buffer not initialized for unified preload".into())
+            })?;
+            let embed_len = embed_buf_ref.length() as usize;
+
+            let norm_buf_ref = self.final_norm_buf.as_ref().ok_or_else(|| {
+                RuntimeError::Compute("Final norm buffer not initialized for unified preload".into())
+            })?;
+            let norm_len = norm_buf_ref.length() as usize;
+
+            let proj_buf_ref = self.output_proj_buf.as_ref().ok_or_else(|| {
+                RuntimeError::Compute("Output proj buffer not initialized for unified preload".into())
+            })?;
+            let proj_len = proj_buf_ref.length() as usize;
+
+            // Weight tying: output_proj shares embedding storage (no separate allocation)
+            let effective_proj_len = if self.weight_tying { 0 } else { proj_len };
+            global_bytes = embed_len + norm_len + effective_proj_len;
+            // Include globals in the unified private buffer.
+            include_globals = true;
+
+            let (eo, no_, po) = if include_globals {
+                let eo = cursor;
+                cursor = align(cursor + embed_len);
+                let no_ = cursor;
+                cursor = align(cursor + norm_len);
+                if self.weight_tying {
+                    // output_proj reuses embedding offset
+                    (eo, no_, eo)
+                } else {
+                    let po = cursor;
+                    cursor = align(cursor + proj_len);
+                    (eo, no_, po)
+                }
+            } else {
+                (0, 0, 0)
+            };
+            embed_offset = eo;
+            norm_offset = no_;
+            proj_offset = po;
+
+            total_size = cursor;
+
+            // === Pass 2: Allocate shared staging buffer and copy all data via CPU ===
+            let staging_buf = self.device.new_buffer(total_size).ok_or_else(|| {
+                RuntimeError::Compute(format!(
+                    "Failed to allocate staging buffer ({} bytes, {:.1} MB)",
+                    total_size, total_size as f64 / (1024.0 * 1024.0)
+                ))
+            })?;
+
+            let dst_base = staging_buf.contents() as *mut u8;
+            let mut layer_bytes_total_local: usize = 0;
+
+            for (layer, blob) in layer_blobs.iter().enumerate() {
+                let off = layer_offsets[layer];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(blob.as_ptr(), dst_base.add(off), blob.len());
+                }
+                layer_bytes_total_local += blob.len();
+            }
+
+            if include_globals {
+                // Copy global tensors from their existing Metal buffers
+                unsafe {
                     std::ptr::copy_nonoverlapping(
-                        proj_buf_ref.contents() as *const u8, dst_base.add(proj_offset), proj_len,
+                        embed_buf_ref.contents() as *const u8, dst_base.add(embed_offset), embed_len,
                     );
+                    std::ptr::copy_nonoverlapping(
+                        norm_buf_ref.contents() as *const u8, dst_base.add(norm_offset), norm_len,
+                    );
+                    if !self.weight_tying {
+                        std::ptr::copy_nonoverlapping(
+                            proj_buf_ref.contents() as *const u8, dst_base.add(proj_offset), proj_len,
+                        );
+                    }
                 }
             }
+
+            layer_bytes_total = layer_bytes_total_local;
+
+            // Free temporary layer blobs before allocating private buffer
+            drop(layer_blobs);
+
+            // === Pass 3: Blit copy from shared staging to private GPU-only buffer ===
+            let private_buf = self.device.new_buffer_private(total_size).ok_or_else(|| {
+                RuntimeError::Compute(format!(
+                    "Failed to allocate private GPU buffer ({} bytes, {:.1} MB)",
+                    total_size, total_size as f64 / (1024.0 * 1024.0)
+                ))
+            })?;
+
+            let blit_cmd = self.queue.new_command_buffer().ok_or_else(|| {
+                RuntimeError::Compute("Failed to create command buffer for weight blit".into())
+            })?;
+            let blit_enc = blit_cmd.new_blit_encoder().ok_or_else(|| {
+                RuntimeError::Compute("Failed to create blit encoder for weight copy".into())
+            })?;
+            blit_enc.copy_from_buffer(&staging_buf, 0, &private_buf, 0, total_size as u64);
+            blit_enc.end_encoding();
+            blit_cmd.commit_and_wait();
+
+            // Staging buffer dropped here, freeing shared memory
+            drop(staging_buf);
+
+            let layer_mb = layer_bytes_total as f64 / (1024.0 * 1024.0);
+            let global_mb = if include_globals { global_bytes as f64 / (1024.0 * 1024.0) } else { 0.0 };
+            let total_mb = total_size as f64 / (1024.0 * 1024.0);
+            // GPU-resident buffer info available via MetalF32Backend::gpu_resident_summary().
+            let _ = (num_layers, layer_mb, global_mb, total_mb, include_globals);
+
+            s.gpu_unified_weight_buf = Some(private_buf);
+            s.gpu_layer_offsets = layer_offsets;
+            if include_globals {
+                s.gpu_global_offsets = Some((embed_offset, norm_offset, proj_offset));
+            } else {
+                s.gpu_global_offsets = None;  // Forces fallback to separate shared buffers
+            }
+            s.cached_layer_meta = layer_metas;
         }
-
-        // Free temporary layer blobs before allocating private buffer
-        drop(layer_blobs);
-
-        // === Pass 3: Blit copy from shared staging to private GPU-only buffer ===
-        let private_buf = self.device.new_buffer_private(total_size).ok_or_else(|| {
-            RuntimeError::Compute(format!(
-                "Failed to allocate private GPU buffer ({} bytes, {:.1} MB)",
-                total_size, total_size as f64 / (1024.0 * 1024.0)
-            ))
-        })?;
-
-        let blit_cmd = self.queue.new_command_buffer().ok_or_else(|| {
-            RuntimeError::Compute("Failed to create command buffer for weight blit".into())
-        })?;
-        let blit_enc = blit_cmd.new_blit_encoder().ok_or_else(|| {
-            RuntimeError::Compute("Failed to create blit encoder for weight copy".into())
-        })?;
-        blit_enc.copy_from_buffer(&staging_buf, 0, &private_buf, 0, total_size as u64);
-        blit_enc.end_encoding();
-        blit_cmd.commit_and_wait();
-
-        // Staging buffer dropped here, freeing shared memory
-        drop(staging_buf);
-
-        let layer_mb = layer_bytes_total as f64 / (1024.0 * 1024.0);
-        let global_mb = if include_globals { global_bytes as f64 / (1024.0 * 1024.0) } else { 0.0 };
-        let total_mb = total_size as f64 / (1024.0 * 1024.0);
-        // GPU-resident buffer info available via MetalF32Backend::gpu_resident_summary().
-        let _ = (num_layers, layer_mb, global_mb, total_mb, include_globals);
-
-        s.gpu_unified_weight_buf = Some(private_buf);
-        s.gpu_layer_offsets = layer_offsets;
-        if include_globals {
-            s.gpu_global_offsets = Some((embed_offset, norm_offset, proj_offset));
-        } else {
-            s.gpu_global_offsets = None;  // Forces fallback to separate shared buffers
-        }
-        s.cached_layer_meta = layer_metas;
+        // ====================================================================
+        // End of/ split: both paths have populated
+        // `s.gpu_unified_weight_buf`, `s.gpu_layer_offsets`,
+        // `s.gpu_global_offsets`, `s.cached_layer_meta`. The remaining
+        // setup (Qwen3.5-MoE detection, GDN state, MoE offsets,/
+        // repack, warmup, etc.) runs unchanged for both paths.
+        // ====================================================================
+        // Suppress unused-variable warnings when only the legacy path uses
+        // the global offsets (mmap-only path zeros them as `_unused`).
+        let _ = (global_bytes, total_size, layer_bytes_total, include_globals,
+                 embed_offset, norm_offset, proj_offset);
 
         // ====================================================================
         // Qwen3.5-MoE detection
@@ -495,6 +738,602 @@ impl MetalF32Backend {
                     }
                 }
                 s.moe_shared_down_offsets = se_down_vecs;
+            }
+        }
+
+        // ====================================================================
+        // Runtime Q8_0 hot-weight repack (env-gated, default OFF).
+        // ====================================================================
+        //
+        // When `LUMEN_METAL_Q8_REPACKED=1`, allocate extra Metal buffers
+        // containing the FFN-down weights and the gate+up pair in a stripe
+        // SoA layout (see `metal/repack_q8.rs`). The packed kernels in
+        // `shaders/gemm_q8_0.msl` (`*_packed`) consume these. The original
+        // buffers + AoS kernels are preserved unchanged as a fallback path.
+        //
+        // VRAM cost (per layer, Qwen3.5-9B Q8):
+        //   FFN-down:   ~50 MB (same as raw Q8, byte count preserved)
+        //   Gate+Up:    ~100 MB (2 × 50 MB, paired interleaved)
+        //
+        // Across 32 layers: ~1.6 GB FFN-down + ~3.2 GB gate+up =  ~4.8 GB
+        // additional VRAM. M3 Ultra 96 GB headroom comfortably accomodates
+        // this; for smaller machines, the env gate keeps it off by default.
+        {
+            use super::graph_reorder as gr;
+            let want_repack = gr::q8_repacked_enabled();
+            let want_ffn_down = gr::q8_repacked_ffn_down_enabled();
+            let want_gate_up = gr::q8_repacked_gate_up_enabled();
+            if want_repack && (want_ffn_down || want_gate_up) {
+                let hidden_dim_u = s.hidden_dim;
+                let inter_dim_u = s.inter_dim;
+
+                let mut ffn_down_vecs: Vec<Option<MetalBuffer>> = Vec::with_capacity(num_layers);
+                let mut gate_up_vecs: Vec<Option<MetalBuffer>> = Vec::with_capacity(num_layers);
+
+                let mut down_ok_count: usize = 0;
+                let mut gate_up_ok_count: usize = 0;
+
+                for layer in 0..num_layers {
+                    let lv = weights.get_layer_raw(layer).map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            " repack: failed to get layer {}: {}", layer, e
+                        ))
+                    })?;
+                    let st = &lv.subtensors;
+
+                    // FFN-down: target shape [hidden_dim, inter_dim] Q8_0
+                    //   N = hidden_dim (output rows), K = inter_dim
+                    //   Qwen3.5-9B: N=4096, K=12288 — both multiples of 32.
+                    let ffn_down_buf: Option<MetalBuffer> = if want_ffn_down
+                        && st.w_down.quant == QuantScheme::Q8_0
+                        && hidden_dim_u % 32 == 0
+                        && inter_dim_u % 32 == 0
+                        && st.w_down.length > 0
+                    {
+                        let src = lv.subtensor_bytes(&st.w_down).map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                " repack: failed to read w_down at layer {}: {}", layer, e
+                            ))
+                        })?;
+                        match repack_q8::build_repacked_buffer_single(
+                            &self.device, src, hidden_dim_u, inter_dim_u,
+                        ) {
+                            Ok(buf) => { down_ok_count += 1; Some(buf) }
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+                    ffn_down_vecs.push(ffn_down_buf);
+
+                    // Gate+Up pair: target shape [inter_dim, hidden_dim] Q8_0 each.
+                    //   N = inter_dim, K = hidden_dim. Both gate AND up must be Q8.
+                    //   Qwen3.5-9B: N=12288, K=4096 — both multiples of 32.
+                    let gate_up_buf: Option<MetalBuffer> = if want_gate_up
+                        && st.w_gate.quant == QuantScheme::Q8_0
+                        && st.w_up.quant == QuantScheme::Q8_0
+                        && inter_dim_u % 32 == 0
+                        && hidden_dim_u % 32 == 0
+                        && st.w_gate.length > 0
+                        && st.w_up.length > 0
+                        && st.w_gate.length == st.w_up.length
+                    {
+                        let src_g = lv.subtensor_bytes(&st.w_gate).map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                " repack: failed to read w_gate at layer {}: {}", layer, e
+                            ))
+                        })?;
+                        let src_u = lv.subtensor_bytes(&st.w_up).map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                " repack: failed to read w_up at layer {}: {}", layer, e
+                            ))
+                        })?;
+                        match repack_q8::build_repacked_buffer_pair(
+                            &self.device, src_g, src_u, inter_dim_u, hidden_dim_u,
+                        ) {
+                            Ok(buf) => { gate_up_ok_count += 1; Some(buf) }
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+                    gate_up_vecs.push(gate_up_buf);
+                }
+
+                s.repacked_ffn_down = ffn_down_vecs;
+                s.repacked_ffn_gate_up = gate_up_vecs;
+
+                // Diagnostic counters (silenced by default; use env LUMEN_METAL_LOG to enable).
+                let _ = (down_ok_count, gate_up_ok_count);
+            }
+        }
+
+        // Q4_0 hot-weight repack pass.
+        //
+        // Same pattern as the Q8 block above. Allocates `MTLBuffer`s
+        // holding hot Q4_0 FFN tensors in a Metal-friendly stripe SoA layout
+        // (see `metal/repack_q4.rs`). The packed kernels in
+        // `shaders/gemm_q4.msl` (`*_packed`) consume these. The original
+        // buffers + AoS kernels are preserved unchanged as a fallback path.
+        //
+        // VRAM cost (per layer, Qwen3.5-9B Q4):
+        //   FFN-down:   ~25 MB (same as raw Q4, byte count preserved)
+        //   Gate+Up:    ~50 MB (2 × 25 MB, paired interleaved)
+        //
+        // Across 32 layers: ~0.8 GB FFN-down + ~1.6 GB gate+up = ~2.4 GB
+        // additional VRAM. M3 Ultra 96 GB headroom comfortably accomodates
+        // this; for smaller machines, the env gate keeps it off by default.
+        {
+            use super::graph_reorder as gr;
+            let want_repack = gr::q4_repacked_enabled();
+            let want_ffn_down = gr::q4_repacked_ffn_down_enabled();
+            let want_gate_up = gr::q4_repacked_gate_up_enabled();
+            if want_repack && (want_ffn_down || want_gate_up) {
+                let hidden_dim_u = s.hidden_dim;
+                let inter_dim_u = s.inter_dim;
+
+                let mut ffn_down_vecs: Vec<Option<MetalBuffer>> = Vec::with_capacity(num_layers);
+                let mut gate_up_vecs: Vec<Option<MetalBuffer>> = Vec::with_capacity(num_layers);
+
+                let mut down_ok_count: usize = 0;
+                let mut gate_up_ok_count: usize = 0;
+
+                for layer in 0..num_layers {
+                    let lv = weights.get_layer_raw(layer).map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            " Q4 repack: failed to get layer {}: {}", layer, e
+                        ))
+                    })?;
+                    let st = &lv.subtensors;
+
+                    // FFN-down: target shape [hidden_dim, inter_dim] Q4_0
+                    //   N = hidden_dim (output rows), K = inter_dim
+                    //   Qwen3.5-9B: N=4096, K=12288 — both multiples of 32.
+                    let ffn_down_buf: Option<MetalBuffer> = if want_ffn_down
+                        && st.w_down.quant == QuantScheme::Q4_0
+                        && hidden_dim_u % 32 == 0
+                        && inter_dim_u % 32 == 0
+                        && st.w_down.length > 0
+                    {
+                        let src = lv.subtensor_bytes(&st.w_down).map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                " Q4 repack: failed to read w_down at layer {}: {}", layer, e
+                            ))
+                        })?;
+                        match repack_q4::build_repacked_buffer_single(
+                            &self.device, src, hidden_dim_u, inter_dim_u,
+                        ) {
+                            Ok(buf) => { down_ok_count += 1; Some(buf) }
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+                    ffn_down_vecs.push(ffn_down_buf);
+
+                    // Gate+Up pair: target shape [inter_dim, hidden_dim] Q4_0 each.
+                    //   N = inter_dim, K = hidden_dim. Both gate AND up must be Q4.
+                    //   Qwen3.5-9B: N=12288, K=4096 — both multiples of 32.
+                    let gate_up_buf: Option<MetalBuffer> = if want_gate_up
+                        && st.w_gate.quant == QuantScheme::Q4_0
+                        && st.w_up.quant == QuantScheme::Q4_0
+                        && inter_dim_u % 32 == 0
+                        && hidden_dim_u % 32 == 0
+                        && st.w_gate.length > 0
+                        && st.w_up.length > 0
+                        && st.w_gate.length == st.w_up.length
+                    {
+                        let src_g = lv.subtensor_bytes(&st.w_gate).map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                " Q4 repack: failed to read w_gate at layer {}: {}", layer, e
+                            ))
+                        })?;
+                        let src_u = lv.subtensor_bytes(&st.w_up).map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                " Q4 repack: failed to read w_up at layer {}: {}", layer, e
+                            ))
+                        })?;
+                        match repack_q4::build_repacked_buffer_pair(
+                            &self.device, src_g, src_u, inter_dim_u, hidden_dim_u,
+                        ) {
+                            Ok(buf) => { gate_up_ok_count += 1; Some(buf) }
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+                    gate_up_vecs.push(gate_up_buf);
+                }
+
+                s.repacked_ffn_down_q4 = ffn_down_vecs;
+                s.repacked_ffn_gate_up_q4 = gate_up_vecs;
+
+                // Diagnostic counters (silenced by default; use env LUMEN_METAL_LOG to enable).
+                let _ = (down_ok_count, gate_up_ok_count);
+            }
+        }
+
+        // ====================================================================
+        // BF16 GDN qkv-proj + attn-gate-proj concat-then-stripe repack.
+        // ====================================================================
+        //
+        // When `LUMEN_METAL_BF16_GDN_QKV_GATE_PAIRED=1`, allocate one Metal
+        // buffer per GDN layer (24 layers on Qwen3.5-9B) holding the
+        // qkv and attn_gate BF16 weights concatenated along the output (N)
+        // axis and byte-permuted into the stripe layout (see
+        // `metal/repack_bf16.rs`). The packed kernel in
+        // `shaders/gemm_residual_bf16.msl` (`tiled_matmul_bf16_k64_qkv_gate_paired`)
+        // consumes these. The original sequential two-dispatch path is
+        // preserved as a fallback when this is OFF or when a layer doesn't
+        // qualify (non-BF16, wrong shape, alignment mismatch, etc).
+        //
+        // VRAM cost (per GDN layer, Qwen3.5-9B BF16):
+        //   (qkv_n + gate_n) * hidden_dim * 2 = (8192 + 4096) * 4096 * 2 = 96 MB
+        // 24 GDN layers x 96 MB = 2.30 GB extra resident. Well under the
+        // 4.8 GB Apple AGX TLB threshold established (Q8 repack at
+        // 4.8 GB = +6.89%) vs (BF16 repack at 6.1 GB = -54.74%).
+        {
+            use super::graph_reorder as gr;
+            if gr::bf16_gdn_qkv_gate_paired_enabled() {
+                let hidden_dim_u = s.hidden_dim;
+                // The packed buffer Vec is indexed by `gdn_idx` (sequential GDN
+                // layer counter 0..n_gdn_layers-1), matching the convention used
+                // for `gdn_h_states` and `gdn_conv_states`. Non-GDN (full-attn)
+                // layers do not enter the Vec at all.
+                let n_gdn_layers = s.cached_layer_meta.iter()
+                    .filter(|m| m.layer_type == Some(1))
+                    .count();
+                let mut qkv_gate_vecs: Vec<Option<MetalBuffer>> = Vec::with_capacity(n_gdn_layers);
+                // parallel record of per-layer `(qkv_n, gate_n)` so that
+                // the load-time warmup dispatch (below) can issue a correctly
+                // shaped touch-dispatch against each populated buffer.
+                let mut qkv_gate_shapes: Vec<Option<(u32, u32)>> = Vec::with_capacity(n_gdn_layers);
+
+                for layer in 0..num_layers {
+                    // Skip layers that aren't GDN. We rely on `layer_type == Some(1)`
+                    // as the canonical GDN marker (matches `gdn_h_states` ordering).
+                    let meta = &s.cached_layer_meta[layer];
+                    if meta.layer_type != Some(1) {
+                        continue;
+                    }
+                    let attn_gate_off = match meta.attn_gate_off {
+                        Some(_) => {},
+                        None => {
+                            qkv_gate_vecs.push(None);
+                            qkv_gate_shapes.push(None);
+                            continue;
+                        }
+                    };
+                    let _ = attn_gate_off;
+
+                    let lv = weights.get_layer_raw(layer).map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            " BF16 GDN paired repack: failed to get layer {}: {}", layer, e
+                        ))
+                    })?;
+                    let st = &lv.subtensors;
+
+                    let attn_gate_st = match &st.attn_gate {
+                        Some(a) => a,
+                        None => {
+                            qkv_gate_vecs.push(None);
+                            qkv_gate_shapes.push(None);
+                            continue;
+                        }
+                    };
+
+                    // BOTH tensors must be BF16. Otherwise skip — Q8/Q4 GDN layers
+                    // use the existing Q8/Q4 dispatch paths.
+                    if st.wq.quant != QuantScheme::Bf16 || attn_gate_st.quant != QuantScheme::Bf16 {
+                        qkv_gate_vecs.push(None);
+                        qkv_gate_shapes.push(None);
+                        continue;
+                    }
+
+                    // Derive the projection N dimensions from the BF16 tensor lengths
+                    // (each tensor is `N * K * 2` bytes).
+                    let row_bytes = hidden_dim_u
+                        .checked_mul(2)
+                        .ok_or_else(|| RuntimeError::Compute(
+                            " BF16 repack: hidden_dim * 2 overflow".into()
+                        ))?;
+                    if row_bytes == 0 {
+                        qkv_gate_vecs.push(None);
+                        qkv_gate_shapes.push(None);
+                        continue;
+                    }
+                    let qkv_n = (st.wq.length as usize) / row_bytes;
+                    let gate_n = (attn_gate_st.length as usize) / row_bytes;
+
+                    // Alignment guards: TILE_N=32 on N, TILE_K_64=64 on K.
+                    // For Qwen3.5-9B GDN both are exact multiples.
+                    if qkv_n == 0
+                        || gate_n == 0
+                        || qkv_n % super::repack_bf16::TILE_N != 0
+                        || gate_n % super::repack_bf16::TILE_N != 0
+                        || hidden_dim_u % super::repack_bf16::TILE_K_64 != 0
+                    {
+                        qkv_gate_vecs.push(None);
+                        qkv_gate_shapes.push(None);
+                        continue;
+                    }
+
+                    // Sanity-check the byte counts match the inferred shape.
+                    if st.wq.length as usize != qkv_n * row_bytes
+                        || attn_gate_st.length as usize != gate_n * row_bytes
+                    {
+                        qkv_gate_vecs.push(None);
+                        qkv_gate_shapes.push(None);
+                        continue;
+                    }
+
+                    let src_qkv = lv.subtensor_bytes(&st.wq).map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            " BF16 repack: failed to read wq at layer {}: {}", layer, e
+                        ))
+                    })?;
+                    let src_gate = lv.subtensor_bytes(attn_gate_st).map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            " BF16 repack: failed to read attn_gate at layer {}: {}", layer, e
+                        ))
+                    })?;
+
+                    let buf = super::repack_bf16::build_repacked_buffer_qkv_gate(
+                        &self.device, src_qkv, src_gate, qkv_n, gate_n, hidden_dim_u,
+                    );
+                    match buf {
+                        Ok(b) => {
+                            qkv_gate_vecs.push(Some(b));
+                            qkv_gate_shapes.push(Some((qkv_n as u32, gate_n as u32)));
+                        }
+                        Err(_) => {
+                            qkv_gate_vecs.push(None);
+                            qkv_gate_shapes.push(None);
+                        }
+                    }
+                }
+
+                let _ok_count = qkv_gate_vecs.iter().filter(|o| o.is_some()).count();
+                s.repacked_gdn_qkv_gate_bf16 = qkv_gate_vecs;
+
+                // Diagnostic counter silenced. Re-enable if needed by inserting
+                // an `eprintln!` here using `_ok_count` and `n_gdn_layers`.
+
+                // ================================================================
+                // Load-time warmup dispatch for the BF16 GDN repack buffer.
+                // ================================================================
+                //
+                // The 2.30 GB BF16 GDN repack buffer (24 layers × 96 MB) is
+                // allocated as a `StorageModeShared` Metal buffer via
+                // `device.new_buffer_with_bytes(..)`. The buffer pages are not
+                // committed to the GPU's translation table until the kernel
+                // first dispatches against it. On a fresh process, that first
+                // dispatch occurs DURING the first prefill and incurs roughly
+                // 280 ms of one-shot overhead versus subsequent dispatches.
+                //
+                // The fix: issue a tiny `M=1` dispatch against every populated
+                // packed buffer right here, at the tail of preload. The grid
+                // walks every (row_group, k_block) of every layer's repack
+                // buffer, forcing Apple's driver to commit the page-table
+                // mapping at preload time (where it's a one-time UX cost equal
+                // for all users), rather than at first-inference time (where
+                // it pessimizes single-shot CLI users specifically).
+                //
+                // Cost target <10 ms (ideally <5 ms): 24 layers ×
+                // (12288/32) = 9216 TGs × 128 threads × ~64 MMA iterations.
+                // Apple M3 Ultra dispatches this in roughly 3-5 ms total; the
+                // observed first-prefill saving is ~280 ms.
+                //
+                // Correctness: the warmup dispatch writes garbage into
+                // `s.qkv_buf` and `s.gate_buf`. Both are persistent scratch
+                // buffers that are rewritten at the start of every layer's
+                // GEMM dispatch in production; clobbering them at preload
+                // time has zero observable effect on inference output.
+                //
+                // The warmup is naturally scoped to `bf16_gdn_qkv_gate_paired_enabled()`
+                // — this entire block runs only when the resolver returns
+                // true, so non-BF16-paired runs pay zero warmup cost.
+                // The dispatch is also gated behind
+                // `LUMEN_METAL_BF16_GDN_WARMUP` (default OFF). When explicitly
+                // enabled, it attempts to commit the GPU page-table mapping
+                // for the 2.30 GB packed buffer at preload time.
+                //
+                // The minimal warmup mitigates but does not reliably eliminate
+                // the cold-start pessimization on the first one or two
+                // inferences of a freshly started process; the steady-state
+                // throughput improvement is real and reproducible, but the
+                // cold-start cost appears to depend on macOS / Apple AGX
+                // driver state that the warmup cannot address. The warmup is
+                // retained env-OFF for downstream investigation. The
+                // `LUMEN_METAL_BF16_GDN_QKV_GATE_PAIRED` parent gate remains
+                // OFF by default per `graph_reorder::bf16_gdn_qkv_gate_paired_enabled`.
+                //
+                // Implementation strategy is selected by `LUMEN_METAL_BF16_GDN_WARMUP_MODE`:
+                //   - `minimal`: a tiny single-thread kernel reads
+                //     the first BF16 element of each layer's packed buffer.
+                //     Cost: <1µs per dispatch × 24 layers = <50µs total.
+                //   - `full`: dispatches the actual production paired GEMM
+                //     kernel at M=32 (TILE_M, fully aligned) against every
+                //     packed buffer. Cost: <5 ms total. Discards Y outputs
+                //     into scratch buffers production will overwrite.
+                let warmup_enabled = std::env::var("LUMEN_METAL_BF16_GDN_WARMUP")
+                    .ok()
+                    .as_deref()
+                    .map(|s| s != "0" && !s.is_empty())
+                    .unwrap_or(false);
+                let warmup_mode = std::env::var("LUMEN_METAL_BF16_GDN_WARMUP_MODE")
+                    .ok()
+                    .unwrap_or_else(|| "minimal".to_string());
+                if warmup_enabled {
+                    if let Some(pipelines) = self.pipelines.as_ref() {
+                    let any_populated = s.repacked_gdn_qkv_gate_bf16.iter().any(|o| o.is_some());
+                    if any_populated {
+                        if let Some(cmd) = self.queue.new_command_buffer() {
+                            if let Some(enc) = cmd.new_compute_encoder() {
+                                if warmup_mode == "full" {
+                                    // Production-shape warmup using the actual
+                                    // paired GEMM kernel at M=32 (TILE_M).
+                                    // Commits page-table for every byte that
+                                    // the production dispatch will touch.
+                                    let k_u32 = hidden_dim_u as u32;
+                                    enc.set_pipeline_state(&pipelines.tiled_matmul_bf16_k64_qkv_gate_paired);
+                                    enc.set_threadgroup_memory_length(8192, 0);
+                                    for (slot, buf_opt) in s.repacked_gdn_qkv_gate_bf16.iter().enumerate() {
+                                        let Some(packed_buf) = buf_opt.as_ref() else { continue };
+                                        let Some(shape_opt) = qkv_gate_shapes.get(slot) else { continue };
+                                        let Some((qkv_n_u32, gate_n_u32)) = *shape_opt else { continue };
+                                        let n_total = qkv_n_u32 as u64 + gate_n_u32 as u64;
+                                        if n_total == 0 { continue; }
+                                        enc.set_buffer(packed_buf, 0, 0);
+                                        enc.set_buffer(&s.normed_buf, 0, 1);
+                                        enc.set_buffer(&s.qkv_buf, 0, 2);
+                                        enc.set_buffer(&s.gate_buf, 0, 3);
+                                        enc.set_bytes(&32u32.to_le_bytes(), 4);
+                                        enc.set_bytes(&qkv_n_u32.to_le_bytes(), 5);
+                                        enc.set_bytes(&gate_n_u32.to_le_bytes(), 6);
+                                        enc.set_bytes(&k_u32.to_le_bytes(), 7);
+                                        enc.dispatch_threadgroups(
+                                            MTLSize::new(n_total.div_ceil(32), 1, 1),
+                                            MTLSize::new(128, 1, 1),
+                                        );
+                                    }
+                                } else {
+                                    // Minimal warmup: 1-thread no-op per layer.
+                                    enc.set_pipeline_state(&pipelines.bf16_paired_warmup);
+                                    for buf_opt in s.repacked_gdn_qkv_gate_bf16.iter() {
+                                        let Some(packed_buf) = buf_opt.as_ref() else { continue };
+                                        enc.set_buffer(packed_buf, 0, 0);
+                                        enc.set_buffer(&s.qkv_buf, 0, 1);
+                                        enc.dispatch_threadgroups(
+                                            MTLSize::new(1, 1, 1),
+                                            MTLSize::new(1, 1, 1),
+                                        );
+                                    }
+                                }
+                                enc.end_encoding();
+                            }
+                            cmd.commit_and_wait();
+                        }
+                    }
+                    }
+                }
+            }
+        }
+
+        // ====================================================================
+        // Full-prefill warmup at preload time.
+        // ====================================================================
+        //
+        // Brief: "After the GDN paired repack buffer is allocated, run a
+        // complete dummy prefill at M=131 with throwaway input. This exercises
+        // EVERY paired-dispatch code path including the cold-cache penalty.
+        // After this dummy prefill, all page-table mappings are committed."
+        //
+        // Why a full prefill is stronger than the minimal touch
+        // dispatch: the 1-thread no-op kernel committed only the FIRST
+        // byte of each packed buffer (24 pages out of 6,144 × 24 = 147,456
+        // pages of the 2.30 GB packed buffer). The remaining 147,432 pages
+        // were still being faulted in lazily during the first production
+        // prefill. the full prefill walks every page of the packed
+        // buffer (via the production GEMM grid), commits page-table mappings
+        // for every scratch buffer the production prefill will touch
+        // (`qkv_buf`, `gate_buf`, `normed_buf`, `q_buf`, `k_buf`, `v_buf`,
+        // `scores_buf`, KV slots, GDN h_states, GDN conv_states), and runs
+        // every Metal pipeline state transition that the production
+        // prefill will use. Cost: ~180 ms one-shot at preload time;
+        // saving: the +50% to +54% cold-pair regression that the
+        // minimal touch could not eliminate.
+        //
+        // Correctness scope:
+        //   1. The dummy prefill mutates production scratch buffers
+        //      (`qkv_buf`, etc.) but those are rewritten at the start of
+        //      every layer's GEMM dispatch in production. Clobbering them
+        //      at preload time has zero observable effect on inference
+        //      output.
+        //   2. The dummy prefill ALSO mutates `s.gdn_h_states` and
+        //      `s.gdn_conv_states` (the recurrent SSM state). We must
+        //      `reset_gdn_state()` after the dummy prefill or the FIRST
+        //      production sequence would inherit the garbage SSM state.
+        //   3. The dummy prefill mutates a throwaway `KvCache` we allocate
+        //      with `max_seq_len = 131` (matching the dummy token count).
+        //      The throwaway KV cache is dropped after the prefill returns;
+        //      production uses its own KV cache from the caller.
+        //
+        // Skip conditions:
+        //   - `bf16_paired_full_prefill_warmup_enabled()` returns false:
+        //     either user opted out (`LUMEN_METAL_BF16_GDN_FULL_PREFILL_WARMUP=0`)
+        //     or the parent BF16 paired gate is OFF.
+        //   - No populated entries in `repacked_gdn_qkv_gate_bf16`: this is
+        //     a non-BF16 model (Q8 / Q4), so no paired dispatch will fire
+        //     in production and there's nothing to warm up.
+        //
+        // The block uses an explicit `drop(scratch_guard)` to release the
+        // scratch mutex before calling `self.prefill(..)`, because
+        // `prefill` re-acquires the same mutex internally. We re-fetch the
+        // necessary `KvCacheConfig` parameters from scratch under the
+        // current guard, then drop it.
+        {
+            use super::graph_reorder as gr;
+            if gr::bf16_paired_full_prefill_warmup_enabled() {
+                // Re-fetch scratch for the warmup metadata. The scratch
+                // guard is the same `scratch_guard` opened at the top of
+                // this function (still held here).
+                let s_ref = scratch_guard.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute(
+                        "scratch unexpectedly None at warmup time".into(),
+                    )
+                })?;
+                let any_populated = s_ref.repacked_gdn_qkv_gate_bf16.iter().any(|o| o.is_some());
+                let num_kv_heads_u = s_ref.num_kv_heads;
+                let head_dim_u = s_ref.head_dim;
+                let num_layers_u = s_ref.num_layers;
+
+                if any_populated && num_layers_u > 0 && num_kv_heads_u > 0 && head_dim_u > 0 {
+                    // Release the scratch lock before calling `prefill`,
+                    // which re-acquires it internally.
+                    drop(scratch_guard);
+
+                    // Throwaway KvCache: F32 KV at exactly 131 positions
+                    // (matching the dummy token count = production
+                    // paired-bench M). KV memory cost:
+                    //   131 tokens × num_kv_heads × head_dim × 4 (F32) × 2 (K+V)
+                    //   × num_layers
+                    // For Qwen3.5-9B (num_kv_heads=2, head_dim=128,
+                    // num_layers=32): 131 × 2 × 128 × 4 × 2 × 32 = 8.6 MB.
+                    // Dropped at the end of this scope.
+                    const DUMMY_M: usize = 131;
+                    let kv_config = crate::kv::KvCacheConfig {
+                        max_seq_len: DUMMY_M,
+                        num_layers: num_layers_u,
+                        num_kv_heads: num_kv_heads_u,
+                        head_dim: head_dim_u,
+                        precision: crate::kv::KvPrecision::F32,
+                    };
+
+                    if let Ok(mut throwaway_kv) = crate::kv::KvCache::new(kv_config) {
+                        // Synthesize a `DUMMY_M`-token zero prompt. Token 0
+                        // is a valid row in the embed table for every
+                        // model we ship (vocab size >= 1). The embed
+                        // kernel will read row 0 from the embed table.
+                        let dummy_tokens: Vec<u32> = vec![0u32; DUMMY_M];
+
+                        // Drive a full prefill. We intentionally `let _ =`
+                        // the result — the hidden state is discarded; the
+                        // only side-effect we care about is the
+                        // GPU page-table commit + per-process residency
+                        // state that the production prefill will reuse.
+                        let _ = self.prefill(&dummy_tokens, weights, &mut throwaway_kv);
+
+                        // Reset GDN recurrent state — the dummy prefill
+                        // wrote garbage SSM state into `gdn_h_states` and
+                        // `gdn_conv_states`. Without this reset, the
+                        // first production sequence would inherit this
+                        // garbage and produce divergent output.
+                        self.reset_gdn_state();
+
+                        // `throwaway_kv` drops here (KV memory returned).
+                    }
+                }
             }
         }
 

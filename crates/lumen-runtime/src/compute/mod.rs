@@ -10,7 +10,8 @@ pub mod simd_kernels;
 
 use crate::weight::cache::{LayerView, WeightProvider};
 use crate::error::RuntimeError;
-use crate::kv::{KvCache, KvCacheView};
+use crate::kv::disk::RecurrentState;
+use crate::kv::{KvCache, KvCacheView, KvPrecision};
 use lumen_format::hyperparams::ModelHyperparams;
 use lumen_format::quantization::QuantScheme;
 
@@ -243,6 +244,33 @@ pub trait ComputeBackend: Send + Sync {
     /// need to override this.
     fn set_profile(&mut self, _enabled: bool) {}
 
+    /// Validate that this backend supports the requested KV cache precision.
+    ///
+    /// Each backend has a single hardcoded storage layout for the GPU- or
+    /// CPU-resident KV cache; if the runtime config asks for a different
+    /// precision the backend silently ignored it before, producing memory-
+    /// layout mismatches that would later corrupt KV writes (Metal: F16-only
+    /// `gpu_k_cache`/`gpu_v_cache`; CUDA: F32-only `KvCacheGpu`). Reject the
+    /// mismatch up front so the caller sees an explicit error instead of
+    /// downstream silent data corruption.
+    ///
+    /// Default impl (CPU naive / SIMD) accepts both `F32` and `F16` because
+    /// the CPU `KvCache` byte buffers are sized by `config.precision` and the
+    /// `KvCacheView` append/read helpers dispatch on precision at runtime.
+    ///
+    /// Backends with a hardcoded precision MUST override this and return
+    /// `RuntimeError::Unsupported` for mismatched configs.
+    fn validate_kv_precision(&self, precision: KvPrecision) -> Result<(), RuntimeError> {
+        // CPU backends store KV in `Vec<u8>` sized by precision and dispatch
+        // append/read at runtime, so any implemented precision works.
+        if !precision.is_implemented() {
+            return Err(RuntimeError::Unsupported(format!(
+                "KV cache precision {precision:?} is not yet implemented"
+            )));
+        }
+        Ok(())
+    }
+
     // ====================================================================
     // Phase 3: enriched trait methods for GPU fast paths.
     // All have default implementations so CPU backends compile unchanged.
@@ -291,6 +319,40 @@ pub trait ComputeBackend: Send + Sync {
         Err(RuntimeError::Compute("batched prefill not supported".into()))
     }
 
+    /// Batched prefill resuming from `start_pos`, used by suffix prefill /
+    /// prompt-cache paths.
+    ///
+    /// # Contract
+    ///
+    /// - `start_pos` MUST equal the current `kv.seq_len()`. The default
+    ///   implementation enforces this and then delegates to [`Self::prefill`],
+    ///   which already resumes from `kv.seq_len()` on every supporting backend
+    ///   (CUDA reads `pos_start = kv.seq_len()` at the top of `prefill`; Metal
+    ///   reads `seq_pos_start = kv.seq_len` in its batched layer encoder).
+    /// - `suffix_tokens` is just the new tail that extends the prior KV;
+    ///   callers pass the slice _after_ truncating `kv` to the common prefix.
+    /// - `kv.seq_len()` is advanced internally exactly like [`Self::prefill`].
+    ///
+    /// Backends that need to deviate from the "delegate to `prefill`" contract
+    /// (e.g. to recompute a partial RoPE table from `start_pos` lazily) can
+    /// override this directly.
+    fn prefill_from(
+        &self,
+        start_pos: usize,
+        suffix_tokens: &[u32],
+        weights: &dyn WeightProvider,
+        kv: &mut KvCache,
+    ) -> Result<Vec<f32>, RuntimeError> {
+        if start_pos != kv.seq_len() {
+            return Err(RuntimeError::Compute(format!(
+                "prefill_from: start_pos {start_pos} != kv.seq_len() {} \
+                 (callers must truncate KV to the resume point first)",
+                kv.seq_len()
+            )));
+        }
+        self.prefill(suffix_tokens, weights, kv)
+    }
+
     /// Preload weights to GPU memory.
     fn preload_weights(
         &mut self,
@@ -331,4 +393,153 @@ pub trait ComputeBackend: Send + Sync {
 
     /// Reset recurrent state (GDN h_state, conv_state).
     fn reset_recurrent_state(&self) {}
+
+    // ====================================================================
+    // disk-KV save/load sync hooks.
+    // ====================================================================
+
+    /// Mirror the live GPU KV state (and optional GDN recurrent state) back
+    /// into CPU-visible buffers, blocking until the GPU work has settled.
+    ///
+    /// The disk-save path (`kv::disk::save_atomic`) writes byte-for-byte
+    /// from `KvCache.keys[layer]` / `KvCache.values[layer]` and from the
+    /// caller-supplied [`RecurrentState`]; on GPU backends those CPU
+    /// mirrors only contain useful data after this method runs. The default
+    /// implementation is a no-op so the CPU backends (which already own the
+    /// authoritative buffers in `KvCache`) compile unchanged.
+    ///
+    /// Backends overriding this MUST:
+    /// - synchronously wait for any in-flight command buffers (Metal:
+    ///   submit an empty CB and `commit_and_wait`; CUDA: `device.synchronize`);
+    /// - populate `KvCache.set_layer_raw_bytes` for each layer in the
+    ///   storage layout declared by `validate_kv_precision`;
+    /// - populate the supplied `RecurrentState` when `Some` and the backend
+    ///   has GDN state (Metal Qwen3.5-9B); on backends without GDN, leave
+    ///   the recurrent argument untouched and return `Ok(())`.
+    ///
+    /// Errors are surfaced verbatim — a partial sync MUST leave the CPU
+    /// buffers in a known state (either fully synced or unmodified).
+    fn sync_kv_to_cpu(
+        &self,
+        _kv: &mut KvCache,
+        _recurrent: Option<&mut RecurrentState>,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    /// Inverse of [`Self::sync_kv_to_cpu`]: copy CPU KV bytes (and optional
+    /// recurrent state) into the backend's GPU-resident buffers so the
+    /// next forward pass uses the restored state.
+    ///
+    /// Same contract as [`Self::sync_kv_to_cpu`] in reverse: backends MUST
+    /// block until the upload completes, MUST validate that the supplied
+    /// `RecurrentState` layout matches what the backend has allocated, and
+    /// MUST leave their buffers in a known state on error.
+    ///
+    /// The default impl is a no-op so the CPU backends compile unchanged.
+    fn sync_kv_from_cpu(
+        &self,
+        _kv: &KvCache,
+        _recurrent: Option<&RecurrentState>,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    /// Describe the GDN layout this backend uses, if any. Returns `None`
+    /// when the backend either has no GDN state or has not yet allocated
+    /// it (e.g. a non-GDN model on the Metal backend). The disk-save path
+    /// uses this to size and tag the optional recurrent section.
+    fn gdn_layout(&self) -> Option<crate::kv::disk::GdnLayout> {
+        None
+    }
+
+    /// report this backend's current GPU residency in bytes, if
+    /// the backend can introspect its driver.
+    ///
+    /// On Metal this returns `MTLDevice.currentAllocatedSize` (the byte
+    /// count for all MTLBuffer / MTLTexture / MTLHeap objects the process
+    /// holds against the backend's device).  CUDA can return
+    /// `cuMemGetInfo`'s allocated portion when implemented.  CPU backends
+    /// return 0 by default (no separate device memory residency to count).
+    ///
+    /// Used by the `/debug/memory_breakdown` HTTP endpoint
+    /// (env-gated, default OFF) to attribute long-session RSS growth
+    /// between "Rust heap state" and "Metal/CUDA driver state".
+    ///
+    /// Cost: at most one syscall / driver query.  Cheap enough for the
+    /// 30-second sampling cadence used in the soak harness; must NOT be
+    /// called inside the per-token decode loop.
+    fn current_allocated_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Report peak memory residency observed over the
+    /// lifetime of this backend instance, in bytes.
+    ///
+    /// Semantics by backend:
+    /// - **CUDA**: `device.total_memory() - min(device.free_memory())` snapshot
+    ///   at call site, i.e. the worst-case VRAM consumption observed at the
+    ///   moment of the call.  The CUDA backend does NOT continuously track a
+    ///   running min(free) across the whole generation; instead the engine
+    ///   samples this at end-of-gen and the value is "VRAM in use right now".
+    ///   This is a worst-case lower bound and is sufficient for the
+    ///   `peak_vram_pct_of_device_limit` gate (≤ 90% of device limit).
+    /// - **Metal**: `MTLDevice.currentAllocatedSize()`, i.e. the byte count
+    ///   for all outstanding MTLBuffer / MTLTexture / MTLHeap objects.  On
+    ///   Apple unified memory this is the authoritative GPU residency
+    ///   measure.
+    /// - **CPU naive / SIMD**: process RSS via `getrusage(RUSAGE_SELF)`.
+    ///   On macOS, `ru_maxrss` is in **bytes**; on Linux, it is in
+    ///   **kilobytes** (1024-byte units). Implementations multiply by 1024
+    ///   on Linux.
+    ///
+    /// Default impl returns 0 for backwards compatibility with any future
+    /// backend; callers MUST treat a return of 0 as "unknown / not reported"
+    /// rather than "no memory used".
+    ///
+    /// Cost: at most one syscall / driver query.  Safe to call at
+    /// end-of-generation in the engine; must NOT be called inside the
+    /// per-token decode loop.
+    fn peak_memory_bytes(&self) -> u64 {
+        0
+    }
+}
+
+/// Read process Resident Set Size (RSS) in bytes via
+/// `getrusage(RUSAGE_SELF).ru_maxrss`.
+///
+/// Unit handling: macOS reports `ru_maxrss` in **bytes**, Linux reports it
+/// in **kilobytes** (1024-byte units). Returns 0 on any syscall failure
+/// so callers can use this in `InferenceMetrics::peak_memory_bytes`
+/// without an extra Option wrap.
+///
+/// Used by CPU backends (naive + SIMD) to populate the
+/// `ComputeBackend::peak_memory_bytes()` trait method.  Cheap (one
+/// syscall) so safe to call at end-of-generation but NOT in the
+/// per-token decode loop.
+#[cfg(unix)]
+pub fn process_rss_bytes() -> u64 {
+    // SAFETY: getrusage with a stack-allocated `rusage` struct is a
+    // straightforward libc call; we initialise to zeros so a partial
+    // write from a faulty libc still leaves a well-defined value.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage as *mut libc::rusage) };
+    if rc != 0 {
+        return 0;
+    }
+    let raw = usage.ru_maxrss as u64;
+    if cfg!(target_os = "macos") {
+        // Darwin reports bytes directly.
+        raw
+    } else {
+        // Linux reports kilobytes; convert to bytes.
+        raw.saturating_mul(1024)
+    }
+}
+
+/// Windows / non-unix fallback returns 0. This fallback does not
+/// target Windows for prod-readiness.
+#[cfg(not(unix))]
+pub fn process_rss_bytes() -> u64 {
+    0
 }

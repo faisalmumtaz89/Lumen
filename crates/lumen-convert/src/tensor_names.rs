@@ -23,7 +23,7 @@ pub(crate) const ATTN_NORM: &str = "attn_norm.weight";
 pub(crate) const FFN_NORM: &str = "ffn_norm.weight";
 
 // ---------------------------------------------------------------------------
-// Optional per-layer bias tensors (Qwen2 and similar architectures)
+// Optional per-layer attention bias tensors (Qwen3.5 full-attention layers)
 // ---------------------------------------------------------------------------
 
 pub(crate) const ATTN_Q_BIAS: &str = "attn_q.bias";
@@ -86,14 +86,6 @@ pub(crate) const SSM_OUT: &str = "ssm_out.weight";
 // Suffix arrays
 // ---------------------------------------------------------------------------
 
-/// All per-layer tensor suffixes in the order they appear in the LBC layer blob.
-/// For dense layers only. MoE layers use a different path.
-pub(crate) const LAYER_TENSOR_SUFFIXES: [&str; 9] = [
-    ATTN_Q, ATTN_K, ATTN_V, ATTN_OUTPUT, FFN_GATE, FFN_UP, FFN_DOWN, ATTN_NORM, FFN_NORM,
-];
-
-/// Attention tensor suffixes shared between dense and MoE layers.
+/// Attention tensor suffixes used by the Qwen3.5 full-attention layers and
+/// by the Qwen3.5-MoE full-attention layers.
 pub(crate) const ATTN_TENSOR_SUFFIXES: [&str; 4] = [ATTN_Q, ATTN_K, ATTN_V, ATTN_OUTPUT];
-
-/// Norm tensor suffixes shared between dense and MoE layers.
-pub(crate) const NORM_TENSOR_SUFFIXES: [&str; 2] = [ATTN_NORM, FFN_NORM];

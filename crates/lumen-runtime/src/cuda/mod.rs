@@ -6,9 +6,9 @@
 //!
 //! # Build requirements
 //!
-//! - **macOS (dev)**: `cargo check --features cuda` passes (cudarc with
+//! -**macOS (dev)**: `cargo check --features cuda` passes (cudarc with
 //!   `fallback-dynamic-loading` compiles without CUDA SDK).
-//! - **Linux (GPU)**: `cargo build --features cuda` requires CUDA 12.x driver.
+//! -**Linux (GPU)**: `cargo build --features cuda` requires CUDA 12.x driver.
 //!
 //! # Current status
 //!
@@ -29,6 +29,29 @@ pub(crate) mod gdn;
 pub(crate) mod graph;
 pub(crate) mod prefill;
 pub(crate) mod prefill_attention;
+/// CUDA MoE forward-path types.
+pub(crate) mod moe;
+/// CUDA expert-LFU cache adapter.
+pub(crate) mod moe_cache;
 mod backend_impl;
 
 pub use backend_impl::CudaBackend;
+
+// ---------------------------------------------------------------------------
+// BF16 GemmEx fault-injection hooks.
+//
+// Re-exported only when the test-fault-injection feature is enabled (or
+// in lib `cargo test` builds where `cfg(test)` applies). Production
+// release builds without the feature have neither the helpers nor the
+// underlying state -- everything compiles away.
+//
+// Consumed by the `cuda_bf16_gemmex_fault_injection_test` integration
+// suite to drive the wrapper's per-call cuBLAS-failure -> legacy-kernel
+// fall-through arm under a real BF16 matvec dispatch on Modal A100.
+#[cfg(any(test, feature = "test-fault-injection"))]
+pub use backend_impl::{
+    bf16_gemmex_fallback_armed_for_tests,
+    bf16_gemmex_runtime_warning_emitted_for_tests,
+    inject_next_bf16_cublas_failure,
+    reset_bf16_gemmex_state_for_tests,
+};

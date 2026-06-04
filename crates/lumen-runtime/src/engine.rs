@@ -1,6 +1,6 @@
 //! The core inference engine implementing the minimal "atomic" loop.
 //!
-//! This is Section 4 of the design spec: the token generation loop.
+//! This is the token generation loop: the token generation loop.
 //! Everything else in the runtime exists to make `ensure(weights available)`
 //! non-blocking and cheap.
 //!
@@ -31,167 +31,25 @@ use std::time::Instant;
 #[cfg(target_os = "macos")]
 use crate::accelerate::AccelerateBatchBackend;
 
-/// Sampling parameters for token generation.
-#[derive(Debug, Clone)]
-pub struct SamplingParams {
-    /// Temperature for softmax (1.0 = no scaling, <1.0 = sharper, >1.0 = flatter).
-    pub temperature: f32,
+// SamplingParams is now defined in `crate::sampling`; it carries
+// the full top-k / top-p / min-p / repetition-penalty / repeat-last-n
+// surface used by both the real sampler and the anti-degeneration
+// penalized-greedy). The struct still has `temperature: f32` and
+// `seed: Option<u64>` as its first two fields, so existing 2-field
+// constructors `SamplingParams { temperature, seed }` continue to compile.
+// All other fields are `Option<_>` defaulting to `None`, so call sites
+// using `..Default::default()` get the legacy "no shaping, no penalties"
+// behavior unchanged.
+// unify Xorshift64 + SamplerState + SamplingParams with the
+// canonical implementations in `crate::sampling`. Engine-level re-exports
+// keep historical import paths working (compute backends, session,
+// lumen-cli, lumen-server, tests all import via `engine::`).
+pub use crate::sampling::{SamplerState, SamplingParams, Xorshift64};
 
-    /// Random seed for reproducible sampling.
-    pub seed: Option<u64>,
-}
-
-impl Default for SamplingParams {
-    fn default() -> Self {
-        Self {
-            temperature: 1.0,
-            seed: None,
-        }
-    }
-}
-
-/// Minimal xorshift64 PRNG — deterministic, zero deps.
-pub struct Xorshift64 {
-    state: u64,
-}
-
-impl Xorshift64 {
-    pub fn new(seed: u64) -> Self {
-        // Ensure non-zero state
-        Self { state: if seed == 0 { 0xDEAD_BEEF_CAFE_BABEu64 } else { seed } }
-    }
-
-    pub fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        x
-    }
-
-    /// Returns a uniform f32 in [0, 1).
-    pub fn next_f32(&mut self) -> f32 {
-        const SCALE: f32 = 1.0 / (1u64 << 24) as f32;
-        (self.next_u64() >> 40) as f32 * SCALE
-    }
-}
-
-/// Softmax with max-subtraction for numerical stability (best practice 4.1).
-/// Shared between sampling and compute backends.
-///
-/// On aarch64, phases 1 (find max) and 3 (normalize) use NEON SIMD with
-/// 4-accumulator unrolling (16 floats/iter). Phase 2 (subtract-max + exp + sum)
-/// uses scalar f32::exp() for bit-identical results across backends.
-#[cfg(target_arch = "aarch64")]
-pub fn softmax_inplace(logits: &mut [f32]) {
-    if logits.is_empty() {
-        return;
-    }
-
-    unsafe {
-        use std::arch::aarch64::*;
-        let len = logits.len();
-        let ptr = logits.as_mut_ptr();
-
-        // Phase 1: Find max using NEON with 4 accumulators for ILP (16 floats/iter).
-        let mut max0 = vdupq_n_f32(f32::NEG_INFINITY);
-        let mut max1 = max0;
-        let mut max2 = max0;
-        let mut max3 = max0;
-
-        let chunks16 = len / 16;
-        let mut i = 0;
-        for _ in 0..chunks16 {
-            max0 = vmaxq_f32(max0, vld1q_f32(ptr.add(i)));
-            max1 = vmaxq_f32(max1, vld1q_f32(ptr.add(i + 4)));
-            max2 = vmaxq_f32(max2, vld1q_f32(ptr.add(i + 8)));
-            max3 = vmaxq_f32(max3, vld1q_f32(ptr.add(i + 12)));
-            i += 16;
-        }
-        // 4-wide remainder
-        while i + 4 <= len {
-            max0 = vmaxq_f32(max0, vld1q_f32(ptr.add(i)));
-            i += 4;
-        }
-        // Reduce 4 vectors to scalar
-        max0 = vmaxq_f32(vmaxq_f32(max0, max1), vmaxq_f32(max2, max3));
-        let mut max_val = vmaxvq_f32(max0);
-        // Scalar tail
-        while i < len {
-            max_val = max_val.max(*ptr.add(i));
-            i += 1;
-        }
-
-        if !max_val.is_finite() {
-            let uniform = 1.0 / len as f32;
-            logits.fill(uniform);
-            return;
-        }
-
-        // Phase 2: Subtract max + exp + sum (scalar for bit-identical results).
-        let mut sum = 0.0f32;
-        for v in logits.iter_mut() {
-            *v = (*v - max_val).exp();
-            sum += *v;
-        }
-
-        if sum <= f32::EPSILON {
-            let uniform = 1.0 / len as f32;
-            logits.fill(uniform);
-            return;
-        }
-
-        // Phase 3: Normalize using NEON multiply (16 floats/iter).
-        let inv_sum = 1.0 / sum;
-        let inv_sum_v = vdupq_n_f32(inv_sum);
-        i = 0;
-        for _ in 0..chunks16 {
-            vst1q_f32(ptr.add(i), vmulq_f32(vld1q_f32(ptr.add(i)), inv_sum_v));
-            vst1q_f32(ptr.add(i + 4), vmulq_f32(vld1q_f32(ptr.add(i + 4)), inv_sum_v));
-            vst1q_f32(ptr.add(i + 8), vmulq_f32(vld1q_f32(ptr.add(i + 8)), inv_sum_v));
-            vst1q_f32(ptr.add(i + 12), vmulq_f32(vld1q_f32(ptr.add(i + 12)), inv_sum_v));
-            i += 16;
-        }
-        // 4-wide remainder
-        while i + 4 <= len {
-            vst1q_f32(ptr.add(i), vmulq_f32(vld1q_f32(ptr.add(i)), inv_sum_v));
-            i += 4;
-        }
-        // Scalar tail
-        while i < len {
-            *ptr.add(i) *= inv_sum;
-            i += 1;
-        }
-    }
-}
-
-/// Scalar fallback for non-aarch64 targets.
-#[cfg(not(target_arch = "aarch64"))]
-pub fn softmax_inplace(logits: &mut [f32]) {
-    if logits.is_empty() {
-        return;
-    }
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    if !max.is_finite() {
-        let uniform = 1.0 / logits.len() as f32;
-        logits.fill(uniform);
-        return;
-    }
-    let mut sum = 0.0f32;
-    for v in logits.iter_mut() {
-        *v = (*v - max).exp();
-        sum += *v;
-    }
-    if sum <= f32::EPSILON {
-        let uniform = 1.0 / logits.len() as f32;
-        logits.fill(uniform);
-        return;
-    }
-    for v in logits.iter_mut() {
-        *v /= sum;
-    }
-}
+// softmax_inplace is the canonical impl in `crate::sampling`
+// (same SIMD/scalar split, same numerical contract). The re-export below
+// preserves historical `engine::softmax_inplace` imports.
+pub use crate::sampling::softmax_inplace;
 
 /// Sample a token from logits using temperature scaling and a mutable RNG.
 ///
@@ -201,63 +59,43 @@ pub fn softmax_inplace(logits: &mut [f32]) {
 /// The RNG is passed by `&mut` so its state advances across calls,
 /// producing different random draws for each token.
 pub fn sample_token(logits: &mut Logits, params: &SamplingParams, rng: &mut Xorshift64) -> u32 {
-    if logits.data.is_empty() {
-        return 0;
-    }
-    if params.temperature <= 0.0 {
-        return logits.argmax() as u32;
-    }
+    // stateless shim now delegates to the unified CPU sampler
+    // in `crate::sampling`. Behavior with the legacy 2-field params
+    // (temperature, seed; all others None) is byte-identical to the
+    // earlier inline softmax/CDF path. Callers that need history-aware
+    // anti-degeneration penalties must use `sample_token_with_state` and
+    // thread a `SamplerState` across decode steps.
+    let mut transient_state = SamplerState::new();
+    crate::sampling::sample_logits(&mut logits.data, params, &mut transient_state, rng)
+}
 
-    // Temperature scaling (in-place, SIMD on aarch64)
-    let inv_temp = 1.0 / params.temperature;
-    #[cfg(target_arch = "aarch64")]
-    {
-        use std::arch::aarch64::*;
-        unsafe {
-            let scale_v = vdupq_n_f32(inv_temp);
-            let ptr = logits.data.as_mut_ptr();
-            let len = logits.data.len();
-            let chunks16 = len / 16;
-            let mut i = 0;
-            for _ in 0..chunks16 {
-                vst1q_f32(ptr.add(i), vmulq_f32(vld1q_f32(ptr.add(i)), scale_v));
-                vst1q_f32(ptr.add(i + 4), vmulq_f32(vld1q_f32(ptr.add(i + 4)), scale_v));
-                vst1q_f32(ptr.add(i + 8), vmulq_f32(vld1q_f32(ptr.add(i + 8)), scale_v));
-                vst1q_f32(ptr.add(i + 12), vmulq_f32(vld1q_f32(ptr.add(i + 12)), scale_v));
-                i += 16;
-            }
-            while i + 4 <= len {
-                vst1q_f32(ptr.add(i), vmulq_f32(vld1q_f32(ptr.add(i)), scale_v));
-                i += 4;
-            }
-            while i < len {
-                *ptr.add(i) *= inv_temp;
-                i += 1;
-            }
-        }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        for v in logits.data.iter_mut() {
-            *v *= inv_temp;
-        }
-    }
+/// History-aware token sampler. `state.history` is appended with the
+/// selected token before return so the next call's penalty pass sees it.
+///
+/// this is the function the decode loops call. With penalties
+/// active (default CLI: `repetition_penalty = 1.1`, `repeat_last_n = 64`)
+/// it breaks MoE loop attractors even at `temperature = 0` (penalized
+/// greedy). With penalties disabled it is byte-identical to the legacy
+/// `sample_token`.
+pub fn sample_token_with_state(
+    logits: &mut Logits,
+    params: &SamplingParams,
+    state: &mut SamplerState,
+    rng: &mut Xorshift64,
+) -> u32 {
+    let token = crate::sampling::sample_logits(&mut logits.data, params, state, rng);
+    state.record(token);
+    token
+}
 
-    // Softmax with max-subtraction (best practice 4.1)
-    softmax_inplace(&mut logits.data);
-
-    // Sample from the probability distribution
-    let r = rng.next_f32();
-    let mut cumsum = 0.0f32;
-    for (i, &p) in logits.data.iter().enumerate() {
-        cumsum += p;
-        if r < cumsum {
-            return i as u32;
-        }
-    }
-
-    // Fallback to last token (rounding error)
-    (logits.data.len() - 1) as u32
+/// True iff the decode loop must take the logits-readback CPU sampling
+/// path. The GPU-resident greedy fast path (`decode_token_greedy`) does
+/// GPU argmax with a 4-byte readback and never returns logits to the CPU,
+/// so a history-aware penalty cannot be applied to its output.
+/// disables this fast path when ANY penalty is active so penalized-greedy
+/// works correctly even at `temperature <= 0`.
+pub fn use_gpu_greedy_predicate(params: &SamplingParams, gpu_resident: bool, gpu_argmax: bool) -> bool {
+    gpu_resident && gpu_argmax && params.temperature <= 0.0 && !params.penalties_active()
 }
 
 /// When to stop generating tokens.
@@ -342,8 +180,36 @@ impl InferenceEngine {
         let total_start = Instant::now();
         let caps = backend.caps();
 
-        // Initialize RNG once for the entire generation session (C-1 fix).
+        // Validate KV precision against backend capabilities before allocating
+        // the KV cache. Metal pins KV to F16; CUDA pins KV to F32. Without
+        // this check a mismatched config would silently corrupt KV writes
+        backend.validate_kv_precision(self.config.kv_precision)?;
+
+        // library-side prompt-length guard. The engine path
+        // is used by both the CLI direct call and tests; a too-long prompt
+        // here would otherwise reach the per-layer prefill kernel and write
+        // off the end of the GPU KV buffer (UB on Metal, OOB on CUDA). Reject
+        // up front with the same actionable message the server N18 emits.
+        if prompt_tokens.len() > self.config.max_seq_len {
+            return Err(RuntimeError::Compute(format!(
+                "prompt is {} tokens but max_seq_len is {}; reduce the prompt or \
+                 restart with a larger --context-len",
+                prompt_tokens.len(),
+                self.config.max_seq_len,
+            )));
+        }
+
+        // Initialize RNG once for the entire generation session.
         let mut rng = Xorshift64::new(sampling.seed.unwrap_or(42));
+
+        // SamplerState seeded with the prompt so the rolling
+        // repeat-last-n window sees recent context tokens. Penalized-greedy
+        // then suppresses tokens that already appear in the most recent
+        // window.
+        let mut sampler_state = SamplerState::new();
+        for &t in prompt_tokens.iter() {
+            sampler_state.record(t);
+        }
 
         // Initialize KV cache.
         let mut kv = KvCache::new(KvCacheConfig {
@@ -382,9 +248,26 @@ impl InferenceEngine {
             // Batched prefill: single GPU dispatch for all prompt tokens.
             // prefill() advances kv.seq_len() internally -- do NOT advance here.
             let last_hidden = backend.prefill(prompt_tokens, weights, &mut kv)?;
+            if std::env::var("LUMEN_PREFILL_DEBUG").is_ok() {
+                let n = prompt_tokens.len();
+                let head: Vec<u32> = prompt_tokens.iter().take(12).copied().collect();
+                let tail: Vec<u32> = prompt_tokens.iter().rev().take(6).rev().copied().collect();
+                let hsum: f64 = last_hidden.iter().map(|&v| v as f64).sum();
+                let hmin = last_hidden.iter().cloned().fold(f32::INFINITY, f32::min);
+                let hmax = last_hidden.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                eprintln!(
+                    "[prefill-debug] generate prompt_len={n} head={head:?} tail={tail:?} hidden_len={} hidden_sum={hsum:.4} hidden_min={hmin:.4} hidden_max={hmax:.4}",
+                    last_hidden.len()
+                );
+            }
             let mut current_x = ActivationBuffer::zeros(last_hidden.len(), ComputeDtype::F32);
             current_x.write_f32_from(&last_hidden);
-            backend.compute_final(&current_x)?
+            let lg = backend.compute_final(&current_x)?;
+            if std::env::var("LUMEN_PREFILL_DEBUG").is_ok() {
+                let argmax = lg.data.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(i, _)| i).unwrap_or(0);
+                eprintln!("[prefill-debug] generate first_logits_argmax={argmax} logit_val={:.4}", lg.data.get(argmax).copied().unwrap_or(0.0));
+            }
+            lg
         } else {
             // Token-at-a-time prefill: forward_pass() does NOT advance kv.seq_len(),
             // so we advance after each token.
@@ -411,16 +294,23 @@ impl InferenceEngine {
         // ---- Decode: generate tokens one at a time ----
         let decode_start = Instant::now();
 
-        let mut next_token = sample_token(&mut logits, sampling, &mut rng);
+        // first token comes from the prefill logits; history-aware
+        // penalties + history append happen via sample_token_with_state.
+        let mut next_token = sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
         generated_tokens.push(next_token);
 
-        let use_gpu_greedy = caps.gpu_resident && caps.gpu_argmax && sampling.temperature <= 0.0;
+        // GPU-argmax fast path requires NO active penalty (it
+        // returns 4-byte argmax, the CPU never sees logits). With a penalty
+        // we must route through decode_token() (now also F1-fixed: real
+        // logits readback) so the penalty can be applied on CPU.
+        let use_gpu_greedy = use_gpu_greedy_predicate(sampling, caps.gpu_resident, caps.gpu_argmax);
 
         if use_gpu_greedy {
             // GPU-RESIDENT GREEDY fast path: argmax on GPU, 4-byte readback.
             // decode_token_greedy() advances kv.seq_len() internally.
             while !stop.should_stop(next_token, generated_tokens.len()) {
                 next_token = backend.decode_token_greedy(next_token, weights, &mut kv)?;
+                sampler_state.record(next_token);
                 generated_tokens.push(next_token);
             }
         } else if caps.gpu_resident {
@@ -428,7 +318,7 @@ impl InferenceEngine {
             // decode_token() advances kv.seq_len() internally.
             while !stop.should_stop(next_token, generated_tokens.len()) {
                 logits = backend.decode_token(next_token, weights, &mut kv)?;
-                next_token = sample_token(&mut logits, sampling, &mut rng);
+                next_token = sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
                 generated_tokens.push(next_token);
             }
         } else {
@@ -446,7 +336,7 @@ impl InferenceEngine {
                 kv.advance_seq_len()?;
 
                 logits = backend.compute_final(&x)?;
-                next_token = sample_token(&mut logits, sampling, &mut rng);
+                next_token = sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
                 generated_tokens.push(next_token);
             }
         }
@@ -491,6 +381,12 @@ impl InferenceEngine {
             io,
             weight_cache_hit_rate: weights.stats().hit_rate(),
             per_layer_timings,
+            // surface live KV cache stats so the CLI banner
+            // and operators can observe context utilisation at end-of-gen.
+            kv: crate::telemetry::KvCacheStats::from_kv(&kv),
+            // peak memory snapshot at end-of-gen. Backend
+            // returns 0 if not instrumented (default impl).
+            peak_memory_bytes: backend.peak_memory_bytes(),
             ..Default::default()
         };
 
@@ -521,7 +417,30 @@ impl InferenceEngine {
         }
         let total_start = Instant::now();
 
+        // Validate KV precision against the decode backend (the prefill side
+        // shares the same `KvCache` byte buffers; the decode backend's
+        // storage contract is what matters).
+        backend.validate_kv_precision(self.config.kv_precision)?;
+
+        // library-side prompt-length guard. See generate()
+        // for rationale.
+        if prompt_tokens.len() > self.config.max_seq_len {
+            return Err(RuntimeError::Compute(format!(
+                "prompt is {} tokens but max_seq_len is {}; reduce the prompt or \
+                 restart with a larger --context-len",
+                prompt_tokens.len(),
+                self.config.max_seq_len,
+            )));
+        }
+
         let mut rng = Xorshift64::new(sampling.seed.unwrap_or(42));
+
+        // SamplerState seeded with the prompt for the
+        // repeat-last-n window. See generate() for rationale.
+        let mut sampler_state = SamplerState::new();
+        for &t in prompt_tokens.iter() {
+            sampler_state.record(t);
+        }
 
         // Initialize KV cache.
         let mut kv = KvCache::new(KvCacheConfig {
@@ -561,7 +480,7 @@ impl InferenceEngine {
         let decode_start = Instant::now();
 
         let mut logits = backend.compute_final(&current_x)?;
-        let mut next_token = sample_token(&mut logits, sampling, &mut rng);
+        let mut next_token = sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
         generated_tokens.push(next_token);
 
         while !stop.should_stop(next_token, generated_tokens.len()) {
@@ -576,7 +495,7 @@ impl InferenceEngine {
             kv.advance_seq_len()?;
 
             logits = backend.compute_final(&current_x)?;
-            next_token = sample_token(&mut logits, sampling, &mut rng);
+            next_token = sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
             generated_tokens.push(next_token);
         }
 
@@ -620,6 +539,12 @@ impl InferenceEngine {
             io,
             weight_cache_hit_rate: weights.stats().hit_rate(),
             per_layer_timings,
+            // surface live KV cache stats so the CLI banner
+            // and operators can observe context utilisation at end-of-gen.
+            kv: crate::telemetry::KvCacheStats::from_kv(&kv),
+            // peak memory snapshot at end-of-gen. Backend
+            // returns 0 if not instrumented (default impl).
+            peak_memory_bytes: backend.peak_memory_bytes(),
             ..Default::default()
         };
 
@@ -714,6 +639,165 @@ impl InferenceEngine {
         }
 
         Ok(x)
+    }
+
+    /// Run token generation with a caller-supplied [`crate::session::Session`].
+    ///
+    /// This is the entry point used by the CLI's `--session-resume` /
+    /// `--session-save` flow. The caller passes in a
+    /// `Session` that is either (a) freshly constructed with the same
+    /// `RuntimeConfig` + hyperparams + sampling that the engine carries, or
+    /// (b) loaded from disk via [`crate::session::Session::load_from_disk`].
+    ///
+    /// Generation flow:
+    /// 1. If the session is empty AND the prompt is non-empty, call
+    ///    [`Session::extend`] (full cold prefill). If the session already
+    ///    has tokens (resumed-from-disk case), call
+    ///    [`Session::extend_with_cache`] so the common prefix is reused —
+    ///    this is what makes `--session-resume foo.kv` actually skip the
+    ///    cold prefill on a continuing conversation.
+    /// 2. Stream tokens via [`Session::stream`] respecting the stop condition.
+    ///
+    /// Returns the same [`GenerationResult`] shape as [`Self::generate`], so
+    /// CLI code can treat the two paths interchangeably for reporting.
+    ///
+    /// `prompt_tokens` is the full prompt the operator typed; for a resumed
+    /// session whose first-turn prompt was identical to this prompt's
+    /// prefix, the cache-reuse path skips that prefix entirely. For an
+    /// empty `prompt_tokens` + resumed session (caller wants to continue
+    /// generation from the cached state), the prefill phase is a no-op and
+    /// decode runs directly.
+    pub fn generate_with_session(
+        &self,
+        session: &mut crate::session::Session,
+        prompt_tokens: &[u32],
+        weights: &dyn WeightProvider,
+        backend: &dyn ComputeBackend,
+        stop: &StopCondition,
+    ) -> Result<GenerationResult, RuntimeError> {
+        let total_start = Instant::now();
+
+        // Validate KV precision once at top of generation, mirroring the
+        // contract `generate()` enforces. Failing here surfaces the same
+        // actionable "Metal requires F16" / "CUDA requires F32" message.
+        backend.validate_kv_precision(self.config.kv_precision)?;
+
+        // library-side prompt-length guard. The session's
+        // own `extend` / `extend_with_cache` re-check, but failing here
+        // produces the same operator-facing error format as `generate()`.
+        if prompt_tokens.len() > self.config.max_seq_len {
+            return Err(RuntimeError::Compute(format!(
+                "prompt is {} tokens but max_seq_len is {}; reduce the prompt \
+                 or restart with a larger --context-len",
+                prompt_tokens.len(),
+                self.config.max_seq_len,
+            )));
+        }
+
+        // ---- Prefill ----
+        let prefill_start = Instant::now();
+        let suffix_threshold = crate::session::Session::resolve_suffix_threshold();
+        if !prompt_tokens.is_empty() {
+            if session.token_count() == 0 {
+                // Cold path: a fresh session sees the whole prompt; same
+                // behaviour as `engine.generate(prompt, ...)`.
+                session.extend(prompt_tokens, backend, weights)?;
+            } else {
+                // Resumed-from-disk path: try to reuse the cached prefix
+                // for any common-prefix tokens, fall back to cold restart
+                // on divergence (the standard `extend_with_cache` matrix).
+                session.extend_with_cache(
+                    prompt_tokens,
+                    backend,
+                    weights,
+                    suffix_threshold,
+                )?;
+            }
+        } else if session.token_count() == 0 {
+            // Edge case: empty prompt on a fresh session. Mirror the
+            // `engine.generate` behaviour and reject up front; there's
+            // nothing to generate from.
+            return Err(RuntimeError::Compute(
+                "empty prompt and empty session: nothing to generate from".into(),
+            ));
+        }
+        let prefill_time = prefill_start.elapsed();
+
+        // ---- Decode ----
+        let decode_start = Instant::now();
+        // The stream wrapper handles MaxTokens / MaxTokensOrEos / EosTokens
+        // by feeding `eos_tokens` to its iterator and capping at
+        // `max_tokens`. Mirror the stop-condition unpack here.
+        let (max_tokens, eos_tokens): (usize, Vec<u32>) = match stop {
+            StopCondition::MaxTokens(n) => (*n, Vec::new()),
+            StopCondition::EosTokens(eos) => (usize::MAX, eos.clone()),
+            StopCondition::MaxTokensOrEos { max_tokens, eos_tokens } => {
+                (*max_tokens, eos_tokens.clone())
+            }
+        };
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        // Track the pre-stream count so the generated-only slice excludes
+        // the prompt.
+        let prompt_len = session.token_count();
+        for r in session.stream(backend, weights, max_tokens, &eos_tokens) {
+            generated_tokens.push(r?);
+        }
+        // The stream wrapper appends generated tokens to the session's
+        // `tokens` vec via `next_token`; the local `generated_tokens` vec
+        // is what we return so the caller can decode it without the
+        // prompt.
+        let _ = prompt_len;
+        let decode_time = decode_start.elapsed();
+        let total_time = total_start.elapsed();
+
+        let io = match weights.io_snapshot() {
+            Some(snap) => IoMetrics {
+                bytes_read: snap.bytes_read,
+                read_ops: snap.read_ops,
+                duration: total_time,
+                ..Default::default()
+            },
+            None => IoMetrics {
+                duration: total_time,
+                ..Default::default()
+            },
+        };
+
+        let metrics = InferenceMetrics {
+            prompt_tokens: prompt_tokens.len(),
+            generated_tokens: generated_tokens.len(),
+            prefill_tokens_per_sec: if prefill_time.is_zero() {
+                0.0
+            } else {
+                prompt_tokens.len() as f64 / prefill_time.as_secs_f64()
+            },
+            decode_tokens_per_sec: if decode_time.is_zero() {
+                0.0
+            } else {
+                generated_tokens.len() as f64 / decode_time.as_secs_f64()
+            },
+            tpot_ms: if generated_tokens.is_empty() {
+                0.0
+            } else {
+                decode_time.as_secs_f64() * 1000.0 / generated_tokens.len() as f64
+            },
+            total_time,
+            prefill_time,
+            decode_time,
+            io,
+            weight_cache_hit_rate: weights.stats().hit_rate(),
+            per_layer_timings: session.take_timings(),
+            // live KV stats at end of generation.
+            kv: crate::telemetry::KvCacheStats::from_kv(session.kv()),
+            // peak memory snapshot at end-of-gen.
+            peak_memory_bytes: backend.peak_memory_bytes(),
+            ..Default::default()
+        };
+
+        Ok(GenerationResult {
+            tokens: generated_tokens,
+            metrics,
+        })
     }
 
     /// Returns the runtime configuration.
@@ -828,7 +912,7 @@ mod tests {
     #[test]
     fn sample_token_empty_logits() {
         let mut logits = Logits { data: vec![] };
-        let params = SamplingParams { temperature: 1.0, seed: None };
+        let params = SamplingParams { temperature: 1.0, seed: None, ..Default::default() };
         let mut rng = Xorshift64::new(42);
         assert_eq!(sample_token(&mut logits, &params, &mut rng), 0);
     }
@@ -836,14 +920,14 @@ mod tests {
     #[test]
     fn sample_token_greedy_returns_argmax() {
         let mut logits = Logits { data: vec![1.0, 5.0, 3.0, 2.0] };
-        let params = SamplingParams { temperature: 0.0, seed: None };
+        let params = SamplingParams { temperature: 0.0, seed: None, ..Default::default() };
         let mut rng = Xorshift64::new(42);
         assert_eq!(sample_token(&mut logits, &params, &mut rng), 1);
     }
 
     #[test]
     fn sample_token_deterministic_with_seed() {
-        let params = SamplingParams { temperature: 0.8, seed: Some(42) };
+        let params = SamplingParams { temperature: 0.8, seed: Some(42), ..Default::default() };
 
         let mut rng1 = Xorshift64::new(42);
         let mut logits1 = Logits { data: vec![1.0, 2.0, 3.0, 4.0] };

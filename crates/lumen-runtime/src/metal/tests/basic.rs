@@ -1069,4 +1069,50 @@ fn bench_matvec_bandwidth_summary() {
     println!("======================================================================\n");
 }
 
+// ---- Metal `validate_kv_precision` tests ------------------------------
+
+#[test]
+fn metal_validate_kv_precision_accepts_f16() {
+    use crate::compute::ComputeBackend;
+    use crate::kv::KvPrecision;
+    let backend = MetalF32Backend::new().unwrap();
+    assert!(
+        backend.validate_kv_precision(KvPrecision::F16).is_ok(),
+        "Metal must accept F16 KV precision (its hardcoded layout)",
+    );
+}
+
+#[test]
+fn metal_validate_kv_precision_rejects_f32() {
+    use crate::compute::ComputeBackend;
+    use crate::error::RuntimeError;
+    use crate::kv::KvPrecision;
+    let backend = MetalF32Backend::new().unwrap();
+    let result = backend.validate_kv_precision(KvPrecision::F32);
+    assert!(
+        matches!(result, Err(RuntimeError::Unsupported(_))),
+        "Metal must reject F32 KV with Unsupported error, got {result:?}",
+    );
+    if let Err(RuntimeError::Unsupported(msg)) = result {
+        assert!(
+            msg.contains("F16-only") && msg.contains("Metal"),
+            "error message should be actionable: {msg}",
+        );
+    }
+}
+
+#[test]
+fn metal_validate_kv_precision_rejects_int_quantized() {
+    use crate::compute::ComputeBackend;
+    use crate::error::RuntimeError;
+    use crate::kv::KvPrecision;
+    let backend = MetalF32Backend::new().unwrap();
+    for p in [KvPrecision::Int8, KvPrecision::Int4] {
+        let result = backend.validate_kv_precision(p);
+        assert!(
+            matches!(result, Err(RuntimeError::Unsupported(_))),
+            "Metal must reject {p:?} KV with Unsupported error",
+        );
+    }
+}
 

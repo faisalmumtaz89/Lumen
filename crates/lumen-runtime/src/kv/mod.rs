@@ -1,11 +1,14 @@
 //! KV cache management types.
 //!
 //! The KV cache stores key and value projections from attention layers so
-//! they can be reused across token generation steps. In v1, the KV cache
-//! is RAM-resident. Future versions may support disk-backed KV (KVSwap-style).
+//! they can be reused across token generation steps. The in-memory layout is
+//! RAM-resident; the [`disk`] submodule persists a snapshot to a file so the
+//! same cache can be reloaded after a server restart.
 //!
 //! The runtime manages KV memory explicitly and provides knobs for precision,
 //! eviction policy, and chunking (paged KV).
+
+pub mod disk;
 
 use crate::error::RuntimeError;
 use crate::compute::simd_kernels;
@@ -619,7 +622,15 @@ impl KvCache {
         &self.config
     }
 
-    /// Total bytes currently used across all layers (actual data, not pre-allocated).
+    /// Total bytes currently used across all layers (actual data, not
+    /// pre-allocated).
+    ///
+    /// Note: this is the LIVE byte count keyed off `seq_len`. The disk-KV
+    /// save path (`kv::disk::save_atomic`) writes the FULL pre-allocated
+    /// per-layer buffer (`num_kv_heads * max_seq_len * head_dim * bpe * 2`)
+    /// regardless of `seq_len`, so a 64-token session can produce a
+    /// `max_seq_len=8192`-sized file on disk. To size a `--kv-disk-space-mb`
+    /// budget, multiply by `max_seq_len / seq_len`, not by 1.
     pub fn total_bytes(&self) -> u64 {
         let bpe = self.config.precision.bytes_per_element() as u64;
         let per_token = self.config.num_kv_heads as u64
@@ -629,6 +640,36 @@ impl KvCache {
         self.seq_len as u64 * per_token * self.config.num_layers as u64
     }
 
+    /// Total bytes PRE-ALLOCATED across all layers (CPU-side `KvCache` only).
+    ///
+    /// Unlike [`Self::total_bytes`], which scales by the LIVE `seq_len`, this
+    /// returns the constant capacity the cache reserved at construction time:
+    /// `num_kv_heads * max_seq_len * head_dim * bpe * 2 * num_layers`. The
+    /// disk-KV save path writes exactly this many bytes regardless of how
+    /// many tokens have actually been processed, so this is the figure to
+    /// budget against `--kv-disk-space-mb`.
+    ///
+    /// Backend-resident GPU mirrors (Metal `gpu_k_cache`/`gpu_v_cache`, CUDA
+    /// `KvCacheGpu`) carry their own VRAM allocations that this method does
+    /// NOT account for; treat the value as an order-of-magnitude indicator
+    /// of memory pressure, not a precise VRAM ledger.
+    pub fn allocated_bytes(&self) -> u64 {
+        let bpe = self.config.precision.bytes_per_element() as u64;
+        let per_token = self.config.num_kv_heads as u64
+            * self.config.head_dim as u64
+            * bpe
+            * 2; // K + V
+        self.config.max_seq_len as u64 * per_token * self.config.num_layers as u64
+    }
+
+    /// Maximum sequence length the cache was sized for at construction.
+    ///
+    /// Surfaced separately from [`Self::config`] so telemetry call-sites can
+    /// access the dimension without taking a config borrow.
+    pub fn max_seq_len(&self) -> usize {
+        self.config.max_seq_len
+    }
+
     /// Reset the cache (e.g., for a new generation session).
     ///
     /// With head-first pre-filled layout, buffers are kept; only the
@@ -636,6 +677,116 @@ impl KvCache {
     /// only access positions < seq_len.
     pub fn reset(&mut self) {
         self.seq_len = 0;
+    }
+
+    /// Truncate the cache back to the first `n` positions.
+    ///
+    /// Sets `seq_len = min(n, seq_len)`. The underlying head-first buffers are
+    /// left in place; reads only access positions `< seq_len`, so the trailing
+    /// bytes are harmless. Used by `Session::truncate_to` and the suffix-prefill
+    /// path when a new prompt diverges from the cached prefix.
+    pub fn truncate_to(&mut self, n: usize) {
+        if n < self.seq_len {
+            self.seq_len = n;
+        }
+    }
+
+    /// Return the raw `(keys, values)` byte buffers for a layer.
+    ///
+    /// Exposed for serialization paths ([`disk::save_atomic`]) that need to
+    /// stream the full pre-allocated buffer to disk without re-encoding.
+    /// Callers MUST NOT mutate the returned slices via any other means.
+    pub fn layer_raw_bytes(&self, layer_idx: usize) -> Result<(&[u8], &[u8]), RuntimeError> {
+        if layer_idx >= self.config.num_layers {
+            return Err(RuntimeError::KvCache(format!(
+                "layer_raw_bytes: layer index {layer_idx} out of range \
+                 (num_layers={})",
+                self.config.num_layers
+            )));
+        }
+        Ok((
+            self.keys[layer_idx].as_slice(),
+            self.values[layer_idx].as_slice(),
+        ))
+    }
+
+    /// Return mutable raw `(keys, values)` byte buffers for a layer.
+    ///
+    /// Used by the GPU backends' `sync_kv_to_cpu` implementations
+    /// ([`crate::compute::ComputeBackend::sync_kv_to_cpu`]) to write
+    /// freshly extracted GPU bytes back into the CPU mirror in place
+    /// without re-allocating. Callers MUST preserve the head-first
+    /// `[head][pos][dim]` layout the disk format expects.
+    pub fn layer_raw_bytes_mut(
+        &mut self,
+        layer_idx: usize,
+    ) -> Result<(&mut [u8], &mut [u8]), RuntimeError> {
+        if layer_idx >= self.config.num_layers {
+            return Err(RuntimeError::KvCache(format!(
+                "layer_raw_bytes_mut: layer index {layer_idx} out of range \
+                 (num_layers={})",
+                self.config.num_layers
+            )));
+        }
+        // Split borrows of self.keys[layer_idx] and self.values[layer_idx]:
+        // the two Vec<u8>s are siblings inside disjoint outer Vecs, so we
+        // can safely produce two non-aliasing mutable slices.
+        Ok((
+            self.keys[layer_idx].as_mut_slice(),
+            self.values[layer_idx].as_mut_slice(),
+        ))
+    }
+
+    /// Replace a layer's raw byte buffers wholesale.
+    ///
+    /// Validates that the buffer sizes match the cache's pre-allocated shape
+    /// so a mismatched payload cannot corrupt downstream reads. Used by
+    /// [`disk::load_into`] to restore a previously saved cache.
+    pub fn set_layer_raw_bytes(
+        &mut self,
+        layer_idx: usize,
+        keys: Vec<u8>,
+        values: Vec<u8>,
+    ) -> Result<(), RuntimeError> {
+        if layer_idx >= self.config.num_layers {
+            return Err(RuntimeError::KvCache(format!(
+                "set_layer_raw_bytes: layer index {layer_idx} out of range \
+                 (num_layers={})",
+                self.config.num_layers
+            )));
+        }
+        let expected = self.config.num_kv_heads
+            * self.config.max_seq_len
+            * self.config.head_dim
+            * self.config.precision.bytes_per_element();
+        if keys.len() != expected || values.len() != expected {
+            return Err(RuntimeError::KvCache(format!(
+                "set_layer_raw_bytes: layer {layer_idx} buffer length mismatch \
+                 (keys={}, values={}, expected={expected})",
+                keys.len(),
+                values.len(),
+            )));
+        }
+        self.keys[layer_idx] = keys;
+        self.values[layer_idx] = values;
+        Ok(())
+    }
+
+    /// Advance the sequence cursor to an arbitrary position `n`.
+    ///
+    /// Unlike [`Self::advance_seq_len`] (single-token bump) and
+    /// [`Self::truncate_to`] (clamp-down only), this allows arbitrary forward
+    /// jumps -- which is what a disk-restored cache needs. Errors if `n`
+    /// exceeds `max_seq_len`.
+    pub fn set_seq_len(&mut self, n: usize) -> Result<(), RuntimeError> {
+        if n > self.config.max_seq_len {
+            return Err(RuntimeError::KvCache(format!(
+                "set_seq_len: {n} exceeds max_seq_len {}",
+                self.config.max_seq_len
+            )));
+        }
+        self.seq_len = n;
+        Ok(())
     }
 }
 

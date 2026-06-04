@@ -71,8 +71,8 @@ impl LargeModelConfig {
         }
     }
 
-    /// Llama-7B-equivalent: 32 layers, ~676 MB/layer, ~22 GB total.
-    pub fn llama_7b() -> Self {
+    /// 7B-class reference dimensions: 32 layers, ~676 MB/layer, ~22 GB total.
+    pub fn seven_b_reference() -> Self {
         Self {
             num_layers: 32,
             num_heads: 32,
@@ -453,7 +453,7 @@ mod tests {
             LargeModelConfig::bench_256mb(),
             LargeModelConfig::bench_1gb(),
             LargeModelConfig::bench_4gb(),
-            LargeModelConfig::llama_7b(),
+            LargeModelConfig::seven_b_reference(),
         ] {
             let shape = compute_layer_shape(&config);
             assert_eq!(
@@ -466,9 +466,9 @@ mod tests {
     }
 
     #[test]
-    fn llama_7b_layer_size() {
-        let config = LargeModelConfig::llama_7b();
-        // Manual calculation for Llama-7B (F32):
+    fn seven_b_reference_layer_size() {
+        let config = LargeModelConfig::seven_b_reference();
+        // Manual calculation for the 7B reference dims (F32):
         // hidden=4096, inter=11008, q_dim=4096, kv_dim=4096
         // wq: 4096*4096 = 16M elements
         // wk: 4096*4096 = 16M
@@ -550,7 +550,7 @@ mod tests {
             LargeModelConfig::bench_256mb(),
             LargeModelConfig::bench_1gb(),
             LargeModelConfig::bench_4gb(),
-            LargeModelConfig::llama_7b(),
+            LargeModelConfig::seven_b_reference(),
         ] {
             let shape = compute_layer_shape_f16(&config);
             assert_eq!(
@@ -567,7 +567,7 @@ mod tests {
         for config in [
             LargeModelConfig::bench_256mb(),
             LargeModelConfig::bench_1gb(),
-            LargeModelConfig::llama_7b(),
+            LargeModelConfig::seven_b_reference(),
         ] {
             let f32_size = config.layer_blob_size();
             let f16_size = config.layer_blob_size_f16();

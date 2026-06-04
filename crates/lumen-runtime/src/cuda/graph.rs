@@ -94,6 +94,12 @@ pub(crate) struct GraphKernelSet {
     /// Advance conv position on GPU (single-thread kernel).
     #[allow(dead_code)] // Compiled but graph-based GDN dispatch not yet wired.
     pub(crate) advance_conv_position: CudaFunction,
+    /// Tiled (streaming-softmax) attention decode variant -- reads seq_len from
+    /// device pointer.: enables CUDA graph capture on Qwen3.5-9B when
+    /// `ATTN_DECODE_TILED_DEFAULT_THRESHOLD=0` (the default) routes
+    /// decode through the tiled kernel. Loaded conditionally so older test
+    /// suites that lack the kernel string don't fail at startup.
+    pub(crate) attention_decode_tiled: Option<CudaFunction>,
 }
 
 /// Compile all graph-compatible kernel variants.
@@ -106,7 +112,7 @@ pub(crate) fn compile_graph_kernels(device: &CudaDevice) -> Result<GraphKernelSe
         })
     };
 
-    Ok(GraphKernelSet {
+    let kernels = GraphKernelSet {
         embed_f32: load("embed_token_f32_graph")?,
         embed_q8_0: load("embed_token_q8_0_graph")?,
         embed_f16: load("embed_token_f16_graph")?,
@@ -119,7 +125,20 @@ pub(crate) fn compile_graph_kernels(device: &CudaDevice) -> Result<GraphKernelSe
         rope_kv_write_neox: load("rope_kv_write_neox_graph")?,
         ssm_conv1d_decode: load("ssm_conv1d_decode_graph")?,
         advance_conv_position: load("advance_conv_position")?,
-    })
+        // tiled-attention graph variant. Optional so the absence of
+        // the symbol (older NVRTC bundles, future ABI evolution) does not bomb
+        // backend init. The dispatch site at backend_impl.rs falls back to the
+        // host-scalar tiled kernel (which prevents capture) when this is None.
+        attention_decode_tiled: module
+            .load_function("attention_decode_tiled_graph")
+            .ok(),
+    };
+
+    // Same dynamic-shared-memory opt-in as the non-graph attention_decode
+    // kernel — keep the long-context ceiling identical across paths.
+    super::decode::opt_in_attention_decode_dyn_shmem(&[&kernels.attention_decode])?;
+
+    Ok(kernels)
 }
 
 // ---------------------------------------------------------------------------

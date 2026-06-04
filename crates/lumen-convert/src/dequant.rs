@@ -834,3 +834,242 @@ pub(crate) fn dequantize_to_f32_bytes(
         }),
     }
 }
+
+// ---------------------------------------------------------------------------
+// F32 -> Q3_K quantization (Q3_K_M variant)
+// ---------------------------------------------------------------------------
+//
+// Q3_K block: 256 elements, 110 bytes.
+// Layout (matches dequantize_q3_k above):
+//   [32B hmask][64B qs 2-bit low][12B scales 6-bit packed][2B f16 d]
+//   16 sub-blocks of 16 elements each share a 6-bit signed scale ([-32,31],
+//   stored unsigned 0..63 = scale + 32). Per element: 3-bit signed value
+//   [-4,3] stored unsigned 0..7; low 2 bits in qs, high 1 bit in hmask.
+//   Super-block scale d (f16) multiplies the sub-block scale.
+//   Dequant: value = d * (sc6 - 32) * (q3 - 4)
+//
+// Encoder mirrors the GGML Q3_K reference (`quantize_row_q3_K_impl` in
+// `ggml-quants.c`):
+//   1. Per 16-element sub-block, find float scale via make_qx_quants
+//      (rmse_type=1, nmax=4): scale that maximizes <q,x>^2/<q,q> for clamped q.
+//   2. super-d = max_abs(sub_scale_float) / 32  (encoded as f16)
+//      Sign convention: iscale = -32 / max_abs => super-d = -max_abs / 32.
+//   3. int_scale_per_sb = round(iscale * sub_scale_float), clamped [-32, 31].
+//   4. Per element: q = round(x / (super_d * int_scale)), clamped [-4, 3].
+//
+// Currently exercised by the `q3_k_encoder_tests` module only -- Q3_K is not
+// yet a runtime target. The encoder is preserved for future round-trip
+// requantisation against Q3_K-quantised GGUFs.
+#[cfg(test)]
+pub(crate) fn quantize_f32_to_q3_k(f32_bytes: &[u8], n_elements: usize) -> Vec<u8> {
+    assert!(n_elements % 256 == 0, "Q3_K quantization requires elements divisible by 256");
+    let num_blocks = n_elements / 256;
+    let mut out = vec![0u8; num_blocks * 110];
+    let mut vals = [0.0f32; 256];
+
+    for blk in 0..num_blocks {
+        let base = blk * 256;
+        for i in 0..256 {
+            let off = (base + i) * 4;
+            vals[i] = f32::from_le_bytes([
+                f32_bytes[off], f32_bytes[off + 1],
+                f32_bytes[off + 2], f32_bytes[off + 3],
+            ]);
+        }
+
+        // 1) Per sub-block float scale.
+        let mut sub_scale = [0.0f32; 16];
+        let mut max_abs_scale = 0.0f32;
+        for sb in 0..16 {
+            let s = make_qx_quants_q3(&vals[sb * 16..(sb + 1) * 16]);
+            sub_scale[sb] = s;
+            let a = s.abs();
+            if a > max_abs_scale { max_abs_scale = a; }
+        }
+
+        // 2) Super-block iscale (GGML Q3_K sign convention).
+        let (super_d, iscale) = if max_abs_scale > 0.0 {
+            (-max_abs_scale / 32.0, -32.0 / max_abs_scale)
+        } else {
+            (0.0, 0.0)
+        };
+
+        // 3) Quantize sub-block scales to int [-32, 31], store unsigned 0..63.
+        let mut sc6 = [0u8; 16];
+        let mut int_scale = [0i32; 16];
+        for sb in 0..16 {
+            let q = ((iscale * sub_scale[sb]).round() as i32).clamp(-32, 31);
+            int_scale[sb] = q;
+            sc6[sb] = (q + 32) as u8;
+        }
+
+        // 4) Per-element quantization.
+        let mut q3 = [0u8; 256];
+        for sb in 0..16 {
+            let eff = super_d * int_scale[sb] as f32;
+            let inv_eff = if eff.abs() > 1e-30 { 1.0 / eff } else { 0.0 };
+            for k in 0..16 {
+                let idx = sb * 16 + k;
+                let mut q = (vals[idx] * inv_eff).round() as i32;
+                if q < -4 { q = -4; }
+                if q > 3 { q = 3; }
+                q3[idx] = (q + 4) as u8;
+            }
+        }
+
+        // 5) Encode into GGML Q3_K block layout.
+        let bp = &mut out[blk * 110..(blk + 1) * 110];
+
+        // hmask (32B): 1 bit per element, the high bit of q3 (bit 2).
+        for idx in 0..256 {
+            let h = (q3[idx] >> 2) & 1;
+            bp[idx / 8] |= h << (idx % 8);
+        }
+
+        // qs (64B): 2 bits per element, sequential packing matching dequantizer.
+        let mut q_byte_idx = 0usize;
+        let mut q_bit_shift = 0u8;
+        for idx in 0..256 {
+            bp[32 + q_byte_idx] |= (q3[idx] & 3) << q_bit_shift;
+            q_bit_shift += 2;
+            if q_bit_shift >= 8 { q_bit_shift = 0; q_byte_idx += 1; }
+        }
+
+        // scales (12B): 6-bit packed.
+        //   sb_scale[0..4] = (sc6[0..4] & 0x0F) | ((sc6[4..8] & 0x0F) << 4)
+        //   sb_scale[4..8] = (sc6[8..12] & 0x0F) | ((sc6[12..16] & 0x0F) << 4)
+        //   sb_scale[8..12] = high 2 bits of all 16 scales, 4 per byte at 2-bit shifts.
+        let sb_scale_bytes = &mut bp[96..108];
+        for j in 0..4 {
+            sb_scale_bytes[j] = (sc6[j] & 0x0F) | ((sc6[j + 4] & 0x0F) << 4);
+        }
+        for j in 0..4 {
+            sb_scale_bytes[4 + j] = (sc6[j + 8] & 0x0F) | ((sc6[j + 12] & 0x0F) << 4);
+        }
+        for (j, &sc) in sc6.iter().enumerate() {
+            sb_scale_bytes[8 + j / 4] |= ((sc >> 4) & 3) << (2 * (j % 4));
+        }
+
+        // f16 d
+        let d_f16 = f32_to_f16_bits_convert(super_d);
+        bp[108] = d_f16 as u8;
+        bp[109] = (d_f16 >> 8) as u8;
+    }
+
+    out
+}
+
+/// GGML `make_qx_quants` reference (n=16, nmax=4, rmse_type=1): returns the
+/// per-block float scale d that maximizes <q_clamped, x>^2 / <q_clamped,
+/// q_clamped> where q = round(x / d), clamped to [-4, 3]. Returns d (not 1/d).
+#[cfg(test)]
+fn make_qx_quants_q3(x: &[f32]) -> f32 {
+    const NMAX: i32 = 4;
+    let mut amax = 0.0f32;
+    let mut max_signed = 0.0f32;
+    for &v in x {
+        let av = v.abs();
+        if av > amax { amax = av; max_signed = v; }
+    }
+    if amax == 0.0 { return 0.0; }
+
+    // Initial iscale (per the GGML Q3_K reference encoder): -nmax / max(x).
+    let iscale_initial = -(NMAX as f32) / max_signed;
+    let mut best_score = q3_iscale_score(x, iscale_initial, NMAX);
+    let mut best_iscale = iscale_initial;
+
+    // Sweep small perturbations: is in [-9..9] except 0.
+    for is in -9..=9i32 {
+        if is == 0 { continue; }
+        let iscale = -(NMAX as f32 + 0.1f32 * is as f32) / max_signed;
+        let s = q3_iscale_score(x, iscale, NMAX);
+        if s > best_score {
+            best_score = s;
+            best_iscale = iscale;
+        }
+    }
+    if best_iscale == 0.0 { 0.0 } else { 1.0 / best_iscale }
+}
+
+#[cfg(test)]
+#[inline]
+fn q3_iscale_score(x: &[f32], iscale: f32, nmax: i32) -> f32 {
+    let mut sum_xq = 0.0f32;
+    let mut sum_qq = 0.0f32;
+    for &v in x {
+        let l = ((iscale * v).round() as i32).clamp(-nmax, nmax - 1) as f32;
+        sum_xq += v * l;
+        sum_qq += l * l;
+    }
+    if sum_qq > 0.0 { sum_xq * sum_xq / sum_qq } else { 0.0 }
+}
+
+#[cfg(test)]
+mod q3_k_encoder_tests {
+    use super::*;
+
+    fn vec_to_f32_bytes(v: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(v.len() * 4);
+        for &x in v { out.extend_from_slice(&x.to_le_bytes()); }
+        out
+    }
+
+    fn dequant_to_vec(q3_bytes: &[u8], n: usize) -> Vec<f32> {
+        let dq = dequantize_q3_k(q3_bytes, n as u64);
+        (0..n).map(|i| f32::from_le_bytes([
+            dq[i*4], dq[i*4+1], dq[i*4+2], dq[i*4+3]
+        ])).collect()
+    }
+
+    #[test]
+    fn q3_k_zero_input_roundtrips_zero() {
+        let n = 256;
+        let zeros = vec![0.0f32; n];
+        let q3 = quantize_f32_to_q3_k(&vec_to_f32_bytes(&zeros), n);
+        assert_eq!(q3.len(), 110);
+        let rt = dequant_to_vec(&q3, n);
+        for &v in &rt { assert_eq!(v, 0.0); }
+    }
+
+    #[test]
+    fn q3_k_block_size_is_110_bytes() {
+        let n = 256;
+        let v: Vec<f32> = (0..n).map(|i| (i as f32 - 128.0) * 0.01).collect();
+        let q3 = quantize_f32_to_q3_k(&vec_to_f32_bytes(&v), n);
+        assert_eq!(q3.len(), 110, "1 super-block must be exactly 110 bytes");
+    }
+
+    #[test]
+    fn q3_k_multi_block_size() {
+        let n = 1024; // 4 super-blocks
+        let v: Vec<f32> = (0..n).map(|i| (i as f32 * 0.001).sin()).collect();
+        let q3 = quantize_f32_to_q3_k(&vec_to_f32_bytes(&v), n);
+        assert_eq!(q3.len(), 4 * 110, "4 super-blocks must be 440 bytes");
+    }
+
+    #[test]
+    fn q3_k_snr_on_smooth_signal_meets_floor() {
+        // Smooth input is easier than i.i.d. Gaussian. We expect Q3_K to
+        // achieve >= 20 dB SNR here; this guards the encoder from gross bugs.
+        let n = 4096;
+        let v: Vec<f32> = (0..n).map(|i| {
+            let t = i as f32 / n as f32;
+            (t * 8.0 * std::f32::consts::PI).sin() * 1.5
+        }).collect();
+        let q3 = quantize_f32_to_q3_k(&vec_to_f32_bytes(&v), n);
+        let rt = dequant_to_vec(&q3, n);
+        let mut sig = 0.0f32;
+        let mut err = 0.0f32;
+        for i in 0..n {
+            sig += v[i] * v[i];
+            let e = v[i] - rt[i];
+            err += e * e;
+        }
+        let snr_db = 10.0 * (sig / err).log10();
+        assert!(
+            snr_db >= 20.0,
+            "Q3_K SNR on smooth signal: {:.2} dB (must be >= 20 dB)",
+            snr_db,
+        );
+    }
+}

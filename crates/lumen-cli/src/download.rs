@@ -303,7 +303,7 @@ pub use inner::*;
 mod tests {
     use super::*;
 
-    // -- sanitize_filename tests (always available, no feature gate) --
+    // -- sanitize_filename tests (always available, no feature) --
 
     #[test]
     fn sanitize_rejects_empty() {

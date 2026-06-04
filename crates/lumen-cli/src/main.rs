@@ -1,5 +1,14 @@
 //! Lumen CLI -- command-line interface for LLM inference.
 
+// Route Rust-heap allocations through mimalloc instead of the macOS
+// system allocator. Addresses the libmalloc page-retention pattern that
+// surfaced as a +154 MB/h RSS slope under sustained server-style load.
+// Allocator switch is per-binary (declared here for `lumen`); library
+// crates do not depend on mimalloc so external consumers can pick their
+// own.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod bench;
 pub mod cache;
 mod convert;
@@ -11,6 +20,19 @@ mod run;
 pub mod tokenize;
 
 fn main() {
+    // env-var typo validator. Catches `GDN_REGISTER_RESIDENT=1`
+    // (missing LUMEN_CUDA_ prefix - the literal bug) and the truncated form
+    // `LUMEN_CUDA_GDN_REGISTER_RESIDENT` with a missing trailing character
+    // (mis-spelled suffix). Emits one stderr
+    // WARNING per suspect name with the closest canonical matches as
+    // suggestions. The CLI path explicitly leaves
+    // `set_path_is_server(false)` (the default) so
+    // `LUMEN_CUDA_DECODE_DELAY_US` defaults to `0` µs — CLI is
+    // fork-deterministic. The server bin
+    // (`lumen-server::bin::main`) calls `set_path_is_server(true)`.
+    let _warnings = lumen_runtime::runtime_defaults::validate_lumen_env_vars();
+    lumen_runtime::runtime_defaults::mark_validator_ran();
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
@@ -95,7 +117,7 @@ fn pull_cmd(args: &[String]) {
         std::process::exit(1);
     });
 
-    // Parse model:quant tag syntax (e.g., "qwen2.5-3b:q4_0").
+    // Parse model:quant tag syntax (e.g., "qwen3.5-9b:q4_0").
     let (resolved_name, tag_quant) = if let Some(pos) = model_name.rfind(':') {
         let name = &model_name[..pos];
         let tag = &model_name[pos + 1..];
@@ -150,8 +172,11 @@ fn pull_cmd(args: &[String]) {
         std::process::exit(1);
     });
 
-    // Download GGUF (or use cached).
-    let gguf_path = pull_download_gguf(&gguf_source.repo, &gguf_source.file, skip_confirm);
+    // Download GGUF -- every shard for multi-shard sources, the single file
+    // for legacy single-shard. The primary (first) shard path is what the
+    // converter is pointed at; the multi-shard reader auto-discovers siblings
+    // from there.
+    let gguf_path = pull_download_gguf_shards(gguf_source, skip_confirm);
 
     // Convert GGUF to LBC.
     let lbc_out = cache::lbc_path(&entry.key, quant);
@@ -159,6 +184,45 @@ fn pull_cmd(args: &[String]) {
 
     println!("\nReady: {}", lbc_out.display());
     println!("Run with: lumen run {}:{} \"Hello\"", resolved_name, quant.to_lowercase());
+}
+
+/// Download every shard listed in a [`registry::GgufSource`], returning the
+/// path to the primary (first) shard. For single-file sources this is a
+/// single download; for multi-shard sources this fetches every sibling shard
+/// sequentially so the converter can ingest the full set.
+#[cfg(feature = "download")]
+fn pull_download_gguf_shards(src: &registry::GgufSource, skip_confirm: bool) -> std::path::PathBuf {
+    cache::ensure_cache_dir().unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+
+    if src.is_multi_shard() {
+        eprintln!(
+            "Multi-shard model: {} shard(s) to fetch from {}",
+            src.files.len(),
+            src.repo
+        );
+    }
+
+    let mut primary: Option<std::path::PathBuf> = None;
+    for (idx, filename) in src.files.iter().enumerate() {
+        let path = pull_download_gguf(&src.repo, filename, skip_confirm);
+        if idx == 0 {
+            primary = Some(path);
+        }
+    }
+    primary.unwrap_or_else(|| {
+        eprintln!("Internal error: GgufSource had no shard files");
+        std::process::exit(1);
+    })
+}
+
+#[cfg(not(feature = "download"))]
+fn pull_download_gguf_shards(_src: &registry::GgufSource, _skip_confirm: bool) -> std::path::PathBuf {
+    eprintln!("Error: download support is not compiled in.");
+    eprintln!("Rebuild with: cargo build --release --features download");
+    std::process::exit(1);
 }
 
 /// Download a GGUF file, returning its path. Exits on failure.
@@ -197,6 +261,7 @@ fn pull_convert_to_lbc(gguf_path: &std::path::Path, lbc_out: &std::path::Path) {
         alignment: 128 * 1024,
         dequantize_to_f32: false,
         requant_to: None,
+        target: crate::convert::default_target_for_host(),
     };
 
     eprintln!("Converting to LBC: {} -> {}", gguf_path.display(), lbc_out.display());

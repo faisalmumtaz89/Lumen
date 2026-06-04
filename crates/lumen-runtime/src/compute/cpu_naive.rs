@@ -1,7 +1,7 @@
 //! Naive F32 compute backend — the ground truth reference implementation.
 //!
 //! All future optimized backends MUST match the output of this implementation.
-//! Karpathy-style flat functions, no SIMD, no unsafe. Correct first.
+//! Flat, straightforward functions, no SIMD, no unsafe. Correct first.
 //!
 //! Implements a standard LLaMA-style transformer:
 //! - RMSNorm (eps inside sqrt, best practice 4.2)

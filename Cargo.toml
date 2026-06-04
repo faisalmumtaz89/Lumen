@@ -6,6 +6,7 @@ members = [
     "crates/lumen-convert",
     "crates/lumen-bench",
     "crates/lumen-cli",
+    "crates/lumen-server",
 ]
 
 [workspace.package]
@@ -22,4 +23,10 @@ lumen-format = { path = "crates/lumen-format" }
 lumen-runtime = { path = "crates/lumen-runtime" }
 lumen-convert = { path = "crates/lumen-convert" }
 lumen-bench = { path = "crates/lumen-bench" }
+lumen-server = { path = "crates/lumen-server" }
 thiserror = "2"
+# mimalloc global allocator (Microsoft, MIT). Pinned at the
+# workspace level so the production CLI binary and the lumen-server
+# integration/soak test binaries share one version. Library crates do
+# NOT depend on this so external consumers can pick their own allocator.
+mimalloc = "0.1"

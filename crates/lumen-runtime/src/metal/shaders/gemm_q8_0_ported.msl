@@ -1,0 +1,270 @@
+// ============================================================================
+// gemm_q8_0_ported.msl — Q8_0 × F32 → F32 GEMM (ported from ggml-org/ggml)
+//
+// Adapted from ggml-org/ggml `kernel_mul_mm` (q8_0 / f32 specialization),
+// MIT License. See https://github.com/ggml-org/ggml — file
+// `ggml/src/ggml-metal/ggml-metal.metal`, function `kernel_mul_mm`
+// (template) and host name `kernel_mul_mm_q8_0_f32`.
+//
+// The original kernel computes a generic templated mat-mul where the A
+// operand is a quantized block tensor (here Q8_0) and the B operand is a
+// dense numeric tensor (here F32). The dequantization template parameter
+// is `dequantize_q8_0`. The tile shape is 64×32 along the (M_out, N_batch)
+// axes with NK=32 along the inner K dim.
+//
+// Adaptations made for Lumen:
+//   - Removed batch-dim args (im, ne12, ne13, nb02, nb03, nb12, nb13).
+//     Lumen passes M/N/K as plain uint32 buffers like its existing GEMM.
+//   - Removed the GGML_METAL_HAS_TENSOR (Apple Tensor Operations API)
+//     branch; keep only the simdgroup-MMA fallback that ships in every
+//     Metal 3 binary.
+//   - Removed the `is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp`
+//     branch (used by F32→F32 / F16→F16 unquantized variants). For
+//     Q8_0×F32 the path is always the dequantize branch.
+//   - Hardcoded `block_q8_0` layout (2-byte half scale + 32 int8s = 34 B).
+//     Matches Lumen's existing convention (gemm_f32.msl Q8B_BLOCK_SIZE=34).
+//   - Removed the unaligned-row "FC_mul_mm_bc_inp" Y read; activation
+//     stride is contiguous (nb11 = K*sizeof(float), nb10 = sizeof(float)).
+//   - Removed FC_mul_mm_bc_out gating: the kernel always handles tail
+//     blocks via the shared-memory writeback (matches the safer of the
+//     two ggml branches).
+//
+// Lumen Q8_0 weight layout (matches GGML block_q8_0):
+//   per 32 K-elements row: [f16 scale][32 × int8 quants] = 34 bytes
+//   row stride in bytes = (K / 32) * 34
+// ============================================================================
+
+// metal_stdlib / metal_simdgroup_matrix already brought in by earlier shader
+// units in the concatenated MSL source unit (common.msl + gemm_f32.msl).
+// FOR_UNROLL is defined in common.msl.
+
+// ggml block_q8_0
+struct gemm_q8_0_ported_block_q8_0 {
+    half d;
+    int8_t qs[32];
+};
+
+// dequantize_q8_0 — half4x4 specialization (ported verbatim from ggml).
+// `il` selects which half of the 32-element block (0 = lo 16, 1 = hi 16).
+static inline void dequantize_q8_0_half(
+    device const gemm_q8_0_ported_block_q8_0 * xb,
+    short il,
+    thread half4x4 & reg)
+{
+    device const int8_t * qs = ((device const int8_t *)xb->qs);
+    const half d = xb->d;
+
+    half4x4 reg_h;
+    for (short i = 0; i < 16; i++) {
+        reg_h[i/4][i%4] = (half)qs[i + 16*il] * d;
+    }
+    reg = reg_h;
+}
+
+// ============================================================================
+// kernel_mul_mm_q8_0_f32_ported
+//
+// Compute: Y[M, N_out] = X[M, K] @ dequant(W_q8[N_out, K])^T
+//
+// Matches Lumen's existing dequant_tiled_matmul_q8_0 wrapper API
+// (M = batch, N = output dim, K = inner dim, F32 in / F32 out).
+//
+// Threadgroup: 128 threads = 4 simdgroups (sgitg 0..3).
+// Tile per threadgroup: 64 (N_out) × 32 (M_batch) — produced by 4 simdgroups
+// each holding 32×16 of the output via 8 8×8 accumulators.
+//
+// Grid:
+//   tgpig.y indexes N_out / 64
+//   tgpig.x indexes M_batch / 32
+//
+// Threadgroup memory needed: 4096 (sa, halfs) + 4096 (sb, halfs) = 8192 bytes.
+// On the tail-write path the shared region is reused as a 64*32 float scratch
+// (8192 bytes) so the total stays at 8192.
+// ============================================================================
+kernel void kernel_mul_mm_q8_0_f32_ported(
+    device const uchar * W_q8 [[buffer(0)]],   // [N_out, K_bytes] Q8_0 weights
+    device const float * X    [[buffer(1)]],   // [M_batch, K] activations
+    device       float * Y    [[buffer(2)]],   // [M_batch, N_out] output
+    constant uint &      M    [[buffer(3)]],   // batch size  → ggml ne1
+    constant uint &      N    [[buffer(4)]],   // output dim  → ggml ne0
+    constant uint &      K    [[buffer(5)]],   // inner dim   → ggml ne00
+    threadgroup char *   shmem [[threadgroup(0)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    // Tile dimensions — ggml `NR0`, `NR1`, `NK`.
+    constexpr int NR0 = 64;  // output-rows per threadgroup tile
+    constexpr int NR1 = 32;  // batch-rows per threadgroup tile
+    constexpr int NK  = 32;  // K elements per threadgroup tile
+    constexpr int NL0 = NK/16; //  2  threads per row when loading A
+    constexpr int NL1 = NK/8;  //  4  threads per row when loading B
+    constexpr int nl  = 2;     // block_q8_0 has 2 dequant pieces per block
+
+    // ne0 = N (output dim), ne1 = M (batch) in ggml notation
+    const int ne0 = (int)N;
+    const int ne1 = (int)M;
+    const int ne00 = (int)K;
+
+    // Row strides in bytes — derived from the contiguous Lumen layout.
+    const uint64_t nb01 = ((uint64_t)K / 32) * 34;  // q8_0 weight row stride
+    const uint64_t nb11 = (uint64_t)K * sizeof(float); // activation row stride
+    const uint64_t nb10 = sizeof(float);
+
+    const int r0 = tgpig.y * NR0;  // first output-row of this tile
+    const int r1 = tgpig.x * NR1;  // first batch-row of this tile
+
+    // tile-clipped sizes (handle partial last tile)
+    const short nr0 = (ne0 - r0 < NR0) ? (ne0 - r0) : NR0;
+    const short nr1 = (ne1 - r1 < NR1) ? (ne1 - r1) : NR1;
+
+    // Per-thread row indices inside the tile (clamped to tile-valid rows).
+    const short lr0 = ((short)tiitg / NL0) < nr0 ? ((short)tiitg / NL0) : nr0 - 1; // 0..63
+    const short lr1 = ((short)tiitg / NL1) < nr1 ? ((short)tiitg / NL1) : nr1 - 1; // 0..31
+
+    const short il0 = (tiitg % NL0);  // 0 or 1 — which half of the q8 block
+    short il = il0;
+
+    // Walking pointer into A: select the correct block within the first
+    // 32-element K group. block_q8_0 has nl=2, so offset1 ∈ {0}.
+    const short offset1 = il0 / nl;  // 0..0  (since il0 ∈ {0,1}, nl=2 → il0/2 ∈ {0})
+    device const gemm_q8_0_ported_block_q8_0 * x = (device const gemm_q8_0_ported_block_q8_0 *)(W_q8 + nb01 * (r0 + lr0)) + offset1;
+
+    // B loader: each thread reads 8 contiguous K elements per K-tile.
+    const short iy = 8 * (tiitg % NL1);   // 0..24  — col offset inside the K-tile
+    device const float * y = (device const float *)((device const char *)X
+        + nb11 * (r1 + lr1)
+        + nb10 * iy);
+
+    // Accumulators — 8 of them, arranged 2 cols × 4 rows of 8×8 (per simdgroup).
+    simdgroup_half8x8   ma[4];
+    simdgroup_half8x8   mb[2];
+    simdgroup_float8x8  mc[8];
+    FOR_UNROLL (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    // ===== K-loop =====
+    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
+        // ----- load A tile (dequantize q8_0 → half, write to sa) -----
+        {
+            half4x4 temp_a;
+            dequantize_q8_0_half(x, il, temp_a);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            FOR_UNROLL (short i = 0; i < 16; i++) {
+                const short sx = 2 * il0 + i / 8;
+                const short sy = (tiitg / NL0) / 8;
+
+                const short lx = (tiitg / NL0) % 8;
+                const short ly = i % 8;
+
+                const short ib = 8 * sx + sy;
+
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        // ----- load B tile (F32 → half, write to sb) -----
+        // Aligned path: contiguous reads, one vector per thread.
+        // (Lumen activations always have nb11 = K*4 and nb10 = 4.)
+        {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4 * sx + sy;
+
+            // Pack 8 consecutive K elements as 2 float2x4 (= 8 halfs)
+            // matching ggml's `S1_2x4` store path.
+            half2x4 v;
+            v[0][0] = (half) y[0];
+            v[0][1] = (half) y[1];
+            v[0][2] = (half) y[2];
+            v[0][3] = (half) y[3];
+            v[1][0] = (half) y[4];
+            v[1][1] = (half) y[5];
+            v[1][2] = (half) y[6];
+            v[1][3] = (half) y[7];
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = v;
+        }
+
+        // Advance A pointer: each iteration we want to consume 32 new K elems.
+        // Since each block_q8_0 holds 32 elements and nl=2 sub-pieces, we
+        // alternate il between 0 and 1; when both halves have been used we
+        // advance to the next block.
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x = (il < 2) ? x + (2 + nl - 1) / nl : x;
+
+        // Advance B pointer 32 elements forward.
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ----- inner: load simdgroup tiles, accumulate -----
+        threadgroup const half * lsma = (sa + 4*64*(sgitg % 2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg / 2));
+
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    // ===== writeback =====
+    if (r0 + NR0 <= ne0 && r1 + NR1 <= ne1) {
+        // Whole tile in-bounds: direct simdgroup_store.
+        device float * C = Y +
+            (r0 + 32*(sgitg & 1)) +
+            (r1 + 16*(sgitg >> 1)) * ne0;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8*(i%4) + 8*ne0*(i/4), ne0, 0, false);
+        }
+    } else {
+        // Partial tile: stage to threadgroup memory, then copy out with bounds.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float * temp_str = ((threadgroup float *)shmem)
+            + 32*(sgitg & 1) + (16*(sgitg >> 1))*NR0;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0) {
+            for (int j = tiitg; j < nr1; j += NR1) {
+                device float  * D  = Y + r0 + (r1 + j) * ne0;
+                device float4 * D4 = (device float4 *)D;
+                threadgroup float  * C  = ((threadgroup float *)shmem) + j*NR0;
+                threadgroup float4 * C4 = (threadgroup float4 *)C;
+
+                int i = 0;
+                for (; i < nr0/4; i++) { *(D4 + i) = *(C4 + i); }
+                i *= 4;
+                for (; i < nr0; i++) { *(D + i) = *(C + i); }
+            }
+        }
+    }
+}

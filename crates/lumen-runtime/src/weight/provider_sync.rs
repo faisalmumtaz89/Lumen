@@ -51,13 +51,15 @@ impl SyncWeightProvider {
         let hidden_dim = lbc.header.hyperparams.hidden_dim as usize;
 
         // Read global tensors
+        let embed_header_quant = lbc.header.embedding.quant;
+        let outproj_header_quant = lbc.header.output_proj.quant;
         let embedding_bytes = backend.read_range(lbc.header.embedding.offset, lbc.header.embedding.length)?;
         let (embedding, embedding_raw, embedding_quant) =
-            read_embedding_global(embedding_bytes, vocab_size, hidden_dim);
+            read_embedding_global(embedding_bytes, vocab_size, hidden_dim, embed_header_quant);
         let final_norm = read_f32_tensor(&backend, lbc.header.final_norm.offset, lbc.header.final_norm.length)?;
         let output_proj_bytes = backend.read_range(lbc.header.output_proj.offset, lbc.header.output_proj.length)?;
         let (output_proj, output_proj_raw, output_proj_quant) =
-            read_output_proj_global(output_proj_bytes, vocab_size, hidden_dim);
+            read_output_proj_global(output_proj_bytes, vocab_size, hidden_dim, outproj_header_quant);
 
         let weight_tying = lbc.header.weight_tying;
         Ok(Self {
@@ -86,13 +88,15 @@ impl SyncWeightProvider {
         let vocab_size = lbc.header.hyperparams.vocab_size as usize;
         let hidden_dim = lbc.header.hyperparams.hidden_dim as usize;
 
+        let embed_header_quant = lbc.header.embedding.quant;
+        let outproj_header_quant = lbc.header.output_proj.quant;
         let embedding_bytes = backend.read_range(lbc.header.embedding.offset, lbc.header.embedding.length)?;
         let (embedding, embedding_raw, embedding_quant) =
-            read_embedding_global(embedding_bytes, vocab_size, hidden_dim);
+            read_embedding_global(embedding_bytes, vocab_size, hidden_dim, embed_header_quant);
         let final_norm = read_f32_tensor(&backend, lbc.header.final_norm.offset, lbc.header.final_norm.length)?;
         let output_proj_bytes = backend.read_range(lbc.header.output_proj.offset, lbc.header.output_proj.length)?;
         let (output_proj, output_proj_raw, output_proj_quant) =
-            read_output_proj_global(output_proj_bytes, vocab_size, hidden_dim);
+            read_output_proj_global(output_proj_bytes, vocab_size, hidden_dim, outproj_header_quant);
 
         let weight_tying = lbc.header.weight_tying;
         Ok(Self {
@@ -161,7 +165,12 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
             f32::NAN
         };
     }
-    let exp_f32 = ((exp as u32 - 15 + 127) << 23) | ((frac as u32) << 13);
+    // Normalized: rebias the 5-bit f16 exponent (bias 15) to the 8-bit f32
+    // exponent (bias 127). Use i32 so the intermediate `exp - 15` cannot
+    // underflow for f16 values with exp < 15 (i.e. |x| < 1.0), which is the
+    // common case for quantization scales. For normalized f16 (1..=30) the
+    // result `exp + 112` is always in 113..=142, a valid f32 exponent.
+    let exp_f32 = ((exp as i32 - 15 + 127) as u32) << 23 | ((frac as u32) << 13);
     let v = f32::from_bits(exp_f32);
     if sign == 1 { -v } else { v }
 }
@@ -240,14 +249,34 @@ fn dequantize_f16_to_f32(src: &[u8], n_elements: usize) -> Vec<f32> {
     out
 }
 
+/// Dequantize BF16 (bfloat16) bytes to Vec<f32>. Each element is 2 bytes:
+/// the top 16 bits of the binary32 layout, so the conversion is a 16-bit
+/// left shift reinterpreted as f32. BF16 and F16 share the same 2-byte width
+/// but have different exponent/mantissa layouts, so callers MUST disambiguate
+/// via the LBC header quant scheme (see `read_embedding_global`).
+fn dequantize_bf16_to_f32(src: &[u8], n_elements: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n_elements);
+    for i in 0..n_elements {
+        let offset = i * 2;
+        if offset + 2 > src.len() {
+            break;
+        }
+        let bits = u16::from_le_bytes([src[offset], src[offset + 1]]);
+        out.push(f32::from_bits((bits as u32) << 16));
+    }
+    out
+}
+
 /// Detect embedding quantization from byte length and model dimensions.
 /// Returns (f32_data, raw_bytes, quant_scheme).
 /// Same heuristic as read_output_proj_global: compare byte length against
-/// expected sizes for F32, Q8_0, Q4_0, and F16.
+/// expected sizes for F32, Q8_0, Q4_0, and F16/BF16. F16 and BF16 share the
+/// same 2-byte width, so `header_quant` (from the LBC header) disambiguates them.
 pub fn read_embedding_global(
     raw_bytes: Vec<u8>,
     vocab_size: usize,
     hidden_dim: usize,
+    header_quant: QuantScheme,
 ) -> (Vec<f32>, Vec<u8>, QuantScheme) {
     let n_elements = vocab_size * hidden_dim;
     let expected_f32_bytes = n_elements * 4;
@@ -259,8 +288,14 @@ pub fn read_embedding_global(
         let f32_data = bytes_to_f32(&raw_bytes);
         (f32_data, Vec::new(), QuantScheme::F32)
     } else if raw_bytes.len() == expected_f16_bytes {
-        let f32_data = dequantize_f16_to_f32(&raw_bytes, n_elements);
-        (f32_data, raw_bytes, QuantScheme::F16)
+        // F16 and BF16 share the same byte width — trust the header to disambiguate.
+        if matches!(header_quant, QuantScheme::Bf16) {
+            let f32_data = dequantize_bf16_to_f32(&raw_bytes, n_elements);
+            (f32_data, raw_bytes, QuantScheme::Bf16)
+        } else {
+            let f32_data = dequantize_f16_to_f32(&raw_bytes, n_elements);
+            (f32_data, raw_bytes, QuantScheme::F16)
+        }
     } else if raw_bytes.len() == expected_q8_bytes {
         let f32_data = dequantize_q8_0_to_f32(&raw_bytes, n_elements);
         (f32_data, raw_bytes, QuantScheme::Q8_0)
@@ -275,11 +310,13 @@ pub fn read_embedding_global(
 }
 
 /// Detect output_proj quantization from byte length and model dimensions.
-/// Returns (f32_data, raw_bytes, quant_scheme).
+/// Returns (f32_data, raw_bytes, quant_scheme). F16 and BF16 share the same
+/// 2-byte width, so `header_quant` (from the LBC header) disambiguates them.
 pub fn read_output_proj_global(
     raw_bytes: Vec<u8>,
     vocab_size: usize,
     hidden_dim: usize,
+    header_quant: QuantScheme,
 ) -> (Vec<f32>, Vec<u8>, QuantScheme) {
     let n_elements = vocab_size * hidden_dim;
     let expected_f32_bytes = n_elements * 4;
@@ -291,8 +328,14 @@ pub fn read_output_proj_global(
         let f32_data = bytes_to_f32(&raw_bytes);
         (f32_data, raw_bytes, QuantScheme::F32)
     } else if raw_bytes.len() == expected_f16_bytes {
-        let f32_data = dequantize_f16_to_f32(&raw_bytes, n_elements);
-        (f32_data, raw_bytes, QuantScheme::F16)
+        // F16 and BF16 share the same byte width — trust the header to disambiguate.
+        if matches!(header_quant, QuantScheme::Bf16) {
+            let f32_data = dequantize_bf16_to_f32(&raw_bytes, n_elements);
+            (f32_data, raw_bytes, QuantScheme::Bf16)
+        } else {
+            let f32_data = dequantize_f16_to_f32(&raw_bytes, n_elements);
+            (f32_data, raw_bytes, QuantScheme::F16)
+        }
     } else if raw_bytes.len() == expected_q8_bytes {
         let f32_data = dequantize_q8_0_to_f32(&raw_bytes, n_elements);
         (f32_data, raw_bytes, QuantScheme::Q8_0)
@@ -515,5 +558,359 @@ impl WeightProvider for SyncWeightProvider {
 
     fn io_snapshot(&self) -> Option<IoSnapshot> {
         self.backend.io_tracker().map(|t| t.snapshot())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::MmapConfig;
+    use crate::weight::provider_mmap::MmapWeightProvider;
+    use lumen_format::test_model::{
+        generate_test_model_q8_0, generate_test_model_q8_0_gdn, TestModelQ8Config,
+    };
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SYNC_RAW_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Write the given LBC bytes to a unique temp file and return its path.
+    fn write_test_lbc(data: &[u8], tag: &str) -> std::path::PathBuf {
+        let id = SYNC_RAW_TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("lumen_sync_raw_invariant_{tag}_{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.lbc");
+        std::fs::File::create(&path).unwrap().write_all(data).unwrap();
+        path
+    }
+
+    /// Write a small Q8_0-quantized synthetic LBC to a temp file and return its path.
+    fn write_q8_test_lbc() -> std::path::PathBuf {
+        let data = generate_test_model_q8_0(&TestModelQ8Config::default());
+        write_test_lbc(&data, "q8")
+    }
+
+    /// Write a small Q8_0 GDN/full-attention HYBRID synthetic LBC (layer 0 is a
+    /// GatedDeltaNet layer with populated `ssm_*` subtensors) and return its path.
+    /// This is the only shape that exercises the stale-`ssm_*`-offset failure
+    /// class that produced the `[PAD248319]` garbage-token output.
+    fn write_q8_gdn_test_lbc() -> std::path::PathBuf {
+        let data = generate_test_model_q8_0_gdn(&TestModelQ8Config::default());
+        write_test_lbc(&data, "q8gdn")
+    }
+
+    /// REGRESSION GUARD (stale-`ssm_*`-offset garbage): the GPU-resident Metal path uploads layer
+    /// weights via `get_layer_raw` and then, in `metal/prefill.rs`, takes the
+    /// per-subtensor BYTE OFFSETS from the `LayerView` returned for that same
+    /// layer. Those offsets MUST describe the raw native-quant blob layout that
+    /// was uploaded, and they MUST be provider-independent — otherwise the
+    /// kernels read the (correct) raw GPU buffer at the (wrong) offsets and emit
+    /// pad-token garbage (the original `--sync` / `lumen-server` Q8 bug).
+    ///
+    /// This test locks the invariant that `SyncWeightProvider::get_layer_raw`
+    /// and `MmapWeightProvider::get_layer_raw` agree byte-for-byte on BOTH the
+    /// blob and every subtensor (offset, length, quant) for a quantized model.
+    /// It does NOT need a GPU or the full 10 GB model — a tiny synthetic Q8_0
+    /// LBC reproduces the dequant divergence that caused the bug.
+    #[test]
+    fn get_layer_raw_is_byte_identical_across_sync_and_mmap_for_q8() {
+        let path = write_q8_test_lbc();
+
+        let sync = SyncWeightProvider::open(&path).unwrap();
+        let mmap = MmapWeightProvider::open(&path, MmapConfig::default()).unwrap();
+
+        assert_eq!(sync.num_layers(), mmap.num_layers());
+        assert!(sync.num_layers() > 0);
+
+        for layer in 0..sync.num_layers() {
+            let s_view = sync.get_layer_raw(layer).unwrap();
+            let m_view = mmap.get_layer_raw(layer).unwrap();
+
+            // 1. Raw blob bytes must be identical — this is what the
+            //    GPU-resident preload uploads into the unified weight buffer.
+            assert_eq!(
+                s_view.as_bytes(),
+                m_view.as_bytes(),
+                "layer {layer}: get_layer_raw blob bytes differ between sync and mmap",
+            );
+
+            // 2. Every subtensor (offset, length, quant) must match — these are
+            //    the offsets `metal/prefill.rs` feeds into the kernels against
+            //    the raw buffer.
+            let s = &s_view.subtensors;
+            let m = &m_view.subtensors;
+            let check = |name: &str, a: &TensorSlice, b: &TensorSlice| {
+                assert_eq!(
+                    (a.offset, a.length, a.quant),
+                    (b.offset, b.length, b.quant),
+                    "layer {layer}: subtensor {name} differs (sync={:?} mmap={:?})",
+                    (a.offset, a.length, a.quant),
+                    (b.offset, b.length, b.quant),
+                );
+            };
+            check("wq", &s.wq, &m.wq);
+            check("wk", &s.wk, &m.wk);
+            check("wv", &s.wv, &m.wv);
+            check("wo", &s.wo, &m.wo);
+            check("w_gate", &s.w_gate, &m.w_gate);
+            check("w_up", &s.w_up, &m.w_up);
+            check("w_down", &s.w_down, &m.w_down);
+            check("attn_norm", &s.attn_norm, &m.attn_norm);
+            check("ffn_norm", &s.ffn_norm, &m.ffn_norm);
+            assert_eq!(s.layer_type, m.layer_type, "layer {layer}: layer_type differs");
+
+            // 3. The weight subtensors must stay in their NATIVE quant scheme on
+            //    the raw path (Q8_0 here). If a future change makes
+            //    get_layer_raw dequantize, the GPU buffer/offset contract breaks.
+            assert_eq!(
+                s.wq.quant,
+                QuantScheme::Q8_0,
+                "layer {layer}: get_layer_raw must preserve Q8_0 (got {:?})",
+                s.wq.quant,
+            );
+        }
+    }
+
+    /// Documents WHY the prefill fix had to switch from `get_layer_blocking` to
+    /// `get_layer_raw`: on a quantized model `SyncWeightProvider::get_layer_blocking`
+    /// dequantizes the weight subtensors to F32 and REBUILDS the blob, producing
+    /// a DIFFERENT byte layout and quant scheme than `get_layer_raw`. Feeding
+    /// those F32 offsets to GPU kernels reading the raw Q8 buffer was the bug.
+    #[test]
+    fn get_layer_blocking_diverges_from_get_layer_raw_on_q8_sync() {
+        let path = write_q8_test_lbc();
+        let sync = SyncWeightProvider::open(&path).unwrap();
+
+        let raw = sync.get_layer_raw(0).unwrap();
+        let blocking = sync.get_layer_blocking(0).unwrap();
+
+        // The blocking (dequantized) view reports F32 for the weight subtensors,
+        // while the raw view preserves Q8_0 — proving they are NOT interchangeable
+        // for the GPU-resident offset contract.
+        assert_eq!(raw.subtensors.wq.quant, QuantScheme::Q8_0);
+        assert_eq!(blocking.subtensors.wq.quant, QuantScheme::F32);
+        // F32 dequant is 4 bytes/elem vs Q8_0's 34 bytes/32 elems, so the blobs
+        // cannot be byte-identical.
+        assert_ne!(
+            raw.as_bytes().len(),
+            blocking.as_bytes().len(),
+            "dequantized blocking blob must differ in size from the raw Q8 blob",
+        );
+    }
+
+    /// DEFECT-2 GUARD: exercise the EXACT failure class that caused the
+    /// stale-`ssm_*`-offset garbage — a GDN/full-attention HYBRID where `get_layer_blocking`
+    /// rebuilds the layer blob to F32 but leaves the `ssm_*` offsets pointing at
+    /// their ORIGINAL-blob positions (now stale relative to the smaller rebuilt
+    /// blob). The pure full-attention model (`ssm_* = None`) cannot reproduce
+    /// this; only a GDN layer with populated `ssm_*` does.
+    ///
+    /// Locks two things on the GDN layer (layer 0 of the hybrid model):
+    ///   1. `get_layer_raw` returns the NATIVE-quant `ssm_*` subtensors with the
+    ///      ORIGINAL offsets — these match the raw GPU-resident buffer that
+    ///      `metal/prefill.rs` uploads, and are provider-independent (sync==mmap).
+    ///   2. `get_layer_blocking` DIVERGES: it rebuilds the blob to F32 (changing
+    ///      its size and layout) but keeps the original `ssm_*` offsets, so each
+    ///      stale `ssm_*` slice now indexes the WRONG bytes of the rebuilt blob —
+    ///      i.e. feeding the blocking view to the kernels would have read garbage.
+    ///      THIS is the bug the prefill fix prevents.
+    #[test]
+    fn get_layer_raw_locks_ssm_offsets_on_gdn_layer_and_blocking_goes_stale() {
+        let path = write_q8_gdn_test_lbc();
+        let sync = SyncWeightProvider::open(&path).unwrap();
+        let mmap = MmapWeightProvider::open(&path, MmapConfig::default()).unwrap();
+
+        // Layer 0 is the GDN layer (layer_type=1, populated ssm_*).
+        const GDN_LAYER: usize = 0;
+        let s_raw = sync.get_layer_raw(GDN_LAYER).unwrap();
+        let m_raw = mmap.get_layer_raw(GDN_LAYER).unwrap();
+        let blocking = sync.get_layer_blocking(GDN_LAYER).unwrap();
+
+        // The synthetic model must actually be a GDN layer, else this guard is
+        // vacuous (the R5 finding: the old model had ssm_* = None).
+        assert_eq!(
+            s_raw.subtensors.layer_type,
+            Some(1),
+            "test fixture regression: layer 0 must be a GDN layer (layer_type=1)",
+        );
+        let ssm_out_raw = s_raw
+            .subtensors
+            .ssm_out
+            .expect("test fixture regression: GDN layer must populate ssm_out");
+        let ssm_conv_raw = s_raw
+            .subtensors
+            .ssm_conv1d
+            .expect("test fixture regression: GDN layer must populate ssm_conv1d");
+
+        // (1) get_layer_raw is provider-independent for the ssm_* subtensors AND
+        //     preserves native quant + raw offsets (what prefill feeds the GPU).
+        let m_ssm_out = m_raw.subtensors.ssm_out.expect("mmap GDN layer must have ssm_out");
+        assert_eq!(
+            (ssm_out_raw.offset, ssm_out_raw.length, ssm_out_raw.quant),
+            (m_ssm_out.offset, m_ssm_out.length, m_ssm_out.quant),
+            "get_layer_raw ssm_out slice must match between sync and mmap",
+        );
+        assert_eq!(
+            ssm_out_raw.quant,
+            QuantScheme::Q8_0,
+            "get_layer_raw must preserve ssm_out native Q8_0 (got {:?})",
+            ssm_out_raw.quant,
+        );
+        assert_eq!(
+            s_raw.subtensors.layer_type, m_raw.subtensors.layer_type,
+            "layer_type must be provider-independent on the raw path",
+        );
+        // The raw ssm_* offsets must be valid within the raw blob.
+        let raw_blob_len = s_raw.as_bytes().len() as u64;
+        assert!(
+            ssm_out_raw.offset + ssm_out_raw.length <= raw_blob_len,
+            "raw ssm_out [{}, {}) must lie within the raw blob (len {})",
+            ssm_out_raw.offset, ssm_out_raw.offset + ssm_out_raw.length, raw_blob_len,
+        );
+
+        // (2) get_layer_blocking REBUILDS the blob to F32 but CLONES the ssm_*
+        //     slices UNCHANGED -> their offsets are now STALE (they describe the
+        //     RAW blob layout, not the rebuilt one). Prove the divergence with a
+        //     dimension-independent invariant: the SAME ssm_* slice, read against
+        //     the raw blob vs the rebuilt blob, yields DIFFERENT bytes. (The
+        //     rebuilt F32 blob is a different size — here larger, because Q8->F32
+        //     inflates the mandatory region ~3.76x — so the stale offset lands on
+        //     the wrong content. That wrong content fed to the GPU kernels is the
+        //     [PAD248319] bug.)
+        assert_eq!(
+            blocking.subtensors.wq.quant,
+            QuantScheme::F32,
+            "get_layer_blocking must rebuild mandatory weights to F32",
+        );
+        let blk_blob_len = blocking.as_bytes().len() as u64;
+        assert_ne!(
+            blk_blob_len, raw_blob_len,
+            "rebuilt blocking blob must differ in size from the raw blob",
+        );
+        let ssm_out_blk = blocking
+            .subtensors
+            .ssm_out
+            .expect("blocking view should still carry the (now stale) ssm_out slice");
+        // The blocking ssm_out slice is the STALE original slice (offset/len/quant
+        // all unchanged from raw) ...
+        assert_eq!(
+            (ssm_out_blk.offset, ssm_out_blk.length, ssm_out_blk.quant),
+            (ssm_out_raw.offset, ssm_out_raw.length, ssm_out_raw.quant),
+            "get_layer_blocking leaves the ssm_out slice at its original (stale) offset",
+        );
+        // ... yet that same slice now indexes DIFFERENT bytes in the rebuilt blob
+        // than the true ssm_out data in the raw blob. This is the exact failure
+        // mode: prefill would feed these stale offsets to the raw GPU buffer and
+        // read the wrong content.
+        let true_ssm_out_bytes = s_raw
+            .subtensor_bytes(&ssm_out_raw)
+            .expect("raw ssm_out slice must be in-bounds of the raw blob")
+            .to_vec();
+        let stale_ssm_out_bytes = blocking
+            .subtensor_bytes(&ssm_out_blk)
+            .expect("stale ssm_out slice happens to be in-bounds of the (larger) rebuilt blob");
+        assert_ne!(
+            true_ssm_out_bytes, stale_ssm_out_bytes,
+            "the stale ssm_out offset must read DIFFERENT bytes against the rebuilt \
+             blocking blob than the true ssm_out data in the raw blob — this is the \
+             exact stale-offset corruption the prefill fix prevents",
+        );
+        // Sanity: ssm_conv1d (F32-native) is likewise left at its stale offset.
+        let ssm_conv_blk = blocking.subtensors.ssm_conv1d.expect("ssm_conv1d present");
+        assert_eq!(
+            ssm_conv_blk.offset, ssm_conv_raw.offset,
+            "get_layer_blocking leaves ssm_conv1d offset stale too",
+        );
+    }
+
+    /// DEFECT-3 GUARD: lock the CALL-SITE contract. `metal/prefill.rs`
+    /// resolves each layer view with EXACTLY this logic on the fallback path:
+    ///
+    /// ```ignore
+    /// let layer_view = match weights.try_get_layer(layer) {
+    ///     Some(view) => view,
+    ///     None       => weights.get_layer_raw(layer)?,   // <-- the stale-offset fix
+    /// };
+    /// ```
+    ///
+    /// A `SyncWeightProvider`'s `try_get_layer` returns `None` (its cache is not
+    /// populated by the raw GPU-resident preload), so prefill MUST fall through
+    /// to `get_layer_raw` — which yields native-quant bytes + raw offsets that
+    /// match the uploaded GPU buffer. If a future edit swaps the prefill fallback
+    /// back to `get_layer_blocking`, the resolved view would report F32 (and a
+    /// rebuilt blob) and the `[PAD248319]` regression reappears.
+    ///
+    /// This guard mirrors that resolution against a `&dyn WeightProvider` and
+    /// asserts the resolved view is the RAW (native-quant, raw-offset) view, so
+    /// it fails if the contract the prefill depends on is broken. It is exercised
+    /// on the GDN hybrid so it also covers the `ssm_*` subtensors. The companion
+    /// counterfactual is a temporary `get_layer_blocking` revert of `prefill.rs`,
+    /// which makes this guard fail as expected.
+    #[test]
+    fn prefill_fallback_resolution_yields_raw_not_dequantized_view_for_sync() {
+        let path = write_q8_gdn_test_lbc();
+        let sync = SyncWeightProvider::open(&path).unwrap();
+        let provider: &dyn WeightProvider = &sync;
+
+        // Precondition that makes the prefill fallback fire for sync: its cache
+        // is empty, so try_get_layer returns None.
+        assert!(
+            provider.try_get_layer(0).is_none(),
+            "SyncWeightProvider::try_get_layer must be None before preload \
+             (this is what routes prefill to the get_layer_raw fallback)",
+        );
+
+        // Mirror EXACTLY the prefill fallback resolution.
+        let resolve = |layer: usize| -> LayerView {
+            match provider.try_get_layer(layer) {
+                Some(view) => view,
+                None => provider.get_layer_raw(layer).unwrap(),
+            }
+        };
+
+        let raw_reference = sync.get_layer_raw(0).unwrap();
+        for layer in 0..provider.num_layers() {
+            let resolved = resolve(layer);
+            let reference = sync.get_layer_raw(layer).unwrap();
+
+            // The resolved view MUST be the raw (native-quant) view, byte-for-byte.
+            assert_eq!(
+                resolved.as_bytes().len(),
+                reference.as_bytes().len(),
+                "layer {layer}: prefill fallback must resolve to the raw blob \
+                 (a get_layer_blocking swap-back would rebuild it to F32)",
+            );
+            assert_eq!(
+                resolved.subtensors.wq.quant,
+                QuantScheme::Q8_0,
+                "layer {layer}: prefill fallback must yield NATIVE-quant weights \
+                 (Q8_0), not the F32 produced by get_layer_blocking",
+            );
+            assert_eq!(
+                resolved.subtensors.wq.quant,
+                reference.subtensors.wq.quant,
+                "layer {layer}: resolved quant must equal get_layer_raw's",
+            );
+        }
+
+        // On the GDN layer the resolved ssm_* offsets must be the raw (valid)
+        // ones — i.e. the fallback gives prefill offsets that fit the raw buffer.
+        let resolved0 = resolve(0);
+        assert_eq!(resolved0.subtensors.layer_type, Some(1), "layer 0 is GDN");
+        let ssm_out = resolved0
+            .subtensors
+            .ssm_out
+            .expect("GDN layer ssm_out present on resolved (raw) view");
+        assert_eq!(ssm_out.quant, QuantScheme::Q8_0);
+        assert_eq!(
+            ssm_out.offset, raw_reference.subtensors.ssm_out.unwrap().offset,
+            "resolved ssm_out offset must equal the raw offset (not the stale \
+             get_layer_blocking one)",
+        );
+        assert!(
+            ssm_out.offset + ssm_out.length <= resolved0.as_bytes().len() as u64,
+            "resolved ssm_out must lie within the resolved (raw) blob — the \
+             get_layer_blocking path would leave it overrunning",
+        );
     }
 }

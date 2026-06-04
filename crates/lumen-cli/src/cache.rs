@@ -36,9 +36,32 @@ pub fn cache_dir() -> PathBuf {
 
 /// Check if a cached LBC file exists for a given model key and quant.
 ///
-/// The cached path is `<cache_dir>/<key>-<quant>.lbc` (e.g. `qwen2-5-3b-Q8_0.lbc`).
+/// Lookup order (first existing non-empty file wins):
+///   1. `<cache_dir>/<key>-<quant>-metal.lbc` (Metal-targeted convert output,
+///      only consulted on macOS where Metal is the auto-detected backend).
+///   2. `<cache_dir>/<key>-<quant>.lbc` (canonical / generic convert output).
+///
+/// The `-metal` suffix is produced by `lumen convert --target metal` and
+/// upcasts K-quant tensors (Q2..Q6_K) to Q8_0 because the Metal backend has
+/// no K-quant dispatch kernels. Loading the non-`-metal` Q4_0 LBC on a
+/// Metal host yields incoherent output (gibberish multilingual tokens) for
+/// MoE models converted with K-quant FFN experts. Preferring the
+/// `-metal` variant when present preserves the correctness contract
+/// without breaking generic-host workflows that don't have one.
+///
 /// Returns `Some(path)` if the file exists and is non-empty.
 pub fn cached_lbc(key: &str, quant: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let metal_path = cache_dir().join(format!("{key}-{quant}-metal.lbc"));
+        if metal_path.is_file() {
+            if let Ok(meta) = std::fs::metadata(&metal_path) {
+                if meta.len() > 0 {
+                    return Some(metal_path);
+                }
+            }
+        }
+    }
     let path = lbc_path(key, quant);
     if path.is_file() {
         // Check non-empty to avoid stale zero-length files.
@@ -184,8 +207,8 @@ mod tests {
     fn lbc_path_format() {
         let original = std::env::var("LUMEN_CACHE_DIR").ok();
         std::env::set_var("LUMEN_CACHE_DIR", "/tmp/lumen-test-cache");
-        let path = lbc_path("qwen2-5-3b", "Q8_0");
-        assert_eq!(path, PathBuf::from("/tmp/lumen-test-cache/qwen2-5-3b-Q8_0.lbc"));
+        let path = lbc_path("qwen3-5-9b", "Q8_0");
+        assert_eq!(path, PathBuf::from("/tmp/lumen-test-cache/qwen3-5-9b-Q8_0.lbc"));
         match original {
             Some(val) => std::env::set_var("LUMEN_CACHE_DIR", val),
             None => std::env::remove_var("LUMEN_CACHE_DIR"),

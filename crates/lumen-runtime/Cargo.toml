@@ -9,6 +9,16 @@ rust-version.workspace = true
 
 [features]
 cuda = ["dep:cudarc"]
+# Test-only feature: enables a one-shot fault-injection hook that forces
+# `launch_hgemv_bf16` / `_residual` to return `Bf16LaunchOutcome::CublasFailure`
+# without actually calling cuBLAS. Used by the
+# `cuda_bf16_gemmex_fault_injection_test` integration suite to drive the
+# wrapper's per-call CUBLAS-failure -> legacy-kernel fall-through arm.
+# The hook is `#[cfg(any(test, feature = "test-fault-injection"))]` so it is
+# also reachable from in-tree `#[test]` functions without the feature
+# being enabled at the workspace level; production builds without the
+# feature have zero overhead from the inject path.
+test-fault-injection = []
 
 [dependencies]
 lumen-format.workspace = true

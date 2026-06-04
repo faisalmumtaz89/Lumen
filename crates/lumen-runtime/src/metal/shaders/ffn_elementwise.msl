@@ -120,7 +120,7 @@ kernel void ffn_fused_gate_up_swiglu_q8_0(
 // ============================================================================
 // ffn_fused_gate_up_swiglu_q8_0_deferred: Deferred-reduction fused FFN
 //
-// Same computation as ffn_fused_gate_up_swiglu_q8_0 but uses the llama.cpp
+// Same computation as ffn_fused_gate_up_swiglu_q8_0 but uses a
 // deferred-reduction pattern to minimize simd_sum() synchronization:
 //
 // Old kernel: simd_sum() on every Q8_0 block (176 calls for hidden_dim=5632)

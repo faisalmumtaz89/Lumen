@@ -4,8 +4,8 @@
 // the minimum bytes per element (1.0625 B/elem for Q8_0) and amortizes the
 // x-vector loads across multiple output rows via shared memory.
 //
-// This kernel is designed to match llama.cpp's native Q8_0 matvec throughput
-// by eliminating the two bottlenecks of the existing kernels:
+// This kernel is designed to saturate native Q8_0 matvec bandwidth by
+// eliminating the two bottlenecks of the existing kernels:
 //   1. dp4a kernel: x-quantization overhead (~50 ALU ops per block)
 //   2. HGEMV path: 2 bytes/elem (F16) instead of 1.0625 (Q8_0)
 //

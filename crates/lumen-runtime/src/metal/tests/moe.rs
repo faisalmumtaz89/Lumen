@@ -1127,8 +1127,8 @@ fn test_option_a_greedy_dispatch_routing() {
 /// Gated behind #[ignore] because it requires a real model file on disk.
 ///
 /// Run with: cargo test -p lumen-runtime -- --ignored test_moe_hw_benchmark
+#[ignore = "requires external model file at runtime"]
 #[test]
-#[ignore]
 fn test_moe_hw_benchmark() {
     use crate::expert::reader::ExpertReader;
     use crate::expert::cache::ExpertLfuCache;
@@ -1858,8 +1858,8 @@ fn test_router_debug_summary_diverse() {
 /// Integration test: run moe_router_softmax on Mixtral 8x7B and check routing entropy.
 /// Requires the LBC model file at the expected path.
 /// Run with: cargo test -p lumen-runtime -- --ignored test_moe_mixtral_routing_entropy
+#[ignore = "requires external model file at runtime"]
 #[test]
-#[ignore]
 fn test_moe_mixtral_routing_entropy() {
     use std::path::Path;
 
@@ -1935,6 +1935,7 @@ fn test_moe_mixtral_routing_entropy() {
     let sampling = crate::engine::SamplingParams {
         temperature: 0.0,
         seed: Some(42),
+        ..Default::default()
     };
     let stop = crate::engine::StopCondition::MaxTokens(20);
 

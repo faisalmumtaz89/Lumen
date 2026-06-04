@@ -1,0 +1,1835 @@
+// ============================================================================
+// BF16 (brain-float) prefill GEMM kernels.
+//
+// Y[M,N] = X[M,K] * W^T[N,K]    (W stored row-major as [N,K] in bfloat)
+//
+// Tile layout mirrors gemm_residual_f16.msl exactly: 32x32 output tile, 128
+// threads (4 simdgroups in a 2x2 grid), threadgroup memory stores tiles as
+// bfloat, MMA accumulates in F32. Reuses TILE_M / TILE_N / TILE_K /
+// TILE_K_64 / SG_COLS / FC_BC_* constants defined in gemm_f32.msl.
+//
+// Storage interpretation: weights arrive as a packed u16 stream (the LBC blob
+// is bit-identical to the GGUF BF16 weight). The kernel reads `ushort` from
+// device memory and reinterprets the bits as `bfloat` via `as_type<bfloat>`
+// before writing into threadgroup shmem. This sidesteps any driver-side
+// ambiguity around a direct `device const bfloat*` load and is bit-exact with
+// the host-side `bf16_to_f32` helper (BF16 == high 16 bits of an F32, the low
+// 16 mantissa bits are zero).
+// ============================================================================
+
+inline bfloat bf16_bits_to_bfloat(ushort bits) {
+    return as_type<bfloat>(bits);
+}
+
+kernel void tiled_matmul_bf16(
+    device const ushort* W   [[buffer(0)]],   // [N, K] weights (BF16 as u16)
+    device const float*  X   [[buffer(1)]],   // [M, K] input batch (float)
+    device float*        Y   [[buffer(2)]],   // [M, N] output (float)
+    constant uint&       M   [[buffer(3)]],
+    constant uint&       N   [[buffer(4)]],
+    constant uint&       K   [[buffer(5)]],
+    uint2 tg_pos              [[threadgroup_position_in_grid]],
+    ushort tiitg              [[thread_index_in_threadgroup]],
+    ushort sgitg              [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup bfloat shmem_bf16[2048];
+    threadgroup bfloat* sa = shmem_bf16;
+    threadgroup bfloat* sb = shmem_bf16 + TILE_M * TILE_K;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_k_tiles = (K + TILE_K - 1) / TILE_K;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K;
+
+        // Load A tile (X): float -> bfloat conversion (round-to-nearest in MSL).
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 3;
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup bfloat* sa_ptr = sa + row * TILE_K + k_start;
+
+            if (gm < M && gk + 7 < K) {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                sa_ptr[0] = (bfloat)v0.x; sa_ptr[1] = (bfloat)v0.y;
+                sa_ptr[2] = (bfloat)v0.z; sa_ptr[3] = (bfloat)v0.w;
+                sa_ptr[4] = (bfloat)v1.x; sa_ptr[5] = (bfloat)v1.y;
+                sa_ptr[6] = (bfloat)v1.z; sa_ptr[7] = (bfloat)v1.w;
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    uint gk_i = gk + i;
+                    sa_ptr[i] = (gm < M && gk_i < K) ? (bfloat)X[gm * K + gk_i] : (bfloat)0.0f;
+                }
+            }
+        }
+
+        // Load B tile (W): u16 reinterpreted as bfloat (zero-cost cast).
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 3;
+
+            uint gn = tile_n_start + row;
+            uint gk = k_base + k_start;
+            threadgroup bfloat* sb_ptr = sb + row * TILE_K + k_start;
+
+            if (gn < N && gk + 7 < K) {
+                device const ushort* w_ptr = W + gn * K + gk;
+                sb_ptr[0] = bf16_bits_to_bfloat(w_ptr[0]);
+                sb_ptr[1] = bf16_bits_to_bfloat(w_ptr[1]);
+                sb_ptr[2] = bf16_bits_to_bfloat(w_ptr[2]);
+                sb_ptr[3] = bf16_bits_to_bfloat(w_ptr[3]);
+                sb_ptr[4] = bf16_bits_to_bfloat(w_ptr[4]);
+                sb_ptr[5] = bf16_bits_to_bfloat(w_ptr[5]);
+                sb_ptr[6] = bf16_bits_to_bfloat(w_ptr[6]);
+                sb_ptr[7] = bf16_bits_to_bfloat(w_ptr[7]);
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    uint gk_i = gk + i;
+                    sb_ptr[i] = (gn < N && gk_i < K)
+                        ? bf16_bits_to_bfloat(W[gn * K + gk_i])
+                        : (bfloat)0.0f;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K; ks += 8) {
+            simdgroup_bfloat8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K + ks, TILE_K);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K + ks, TILE_K);
+
+            simdgroup_bfloat8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    if (sg_m_base + 16 <= M && sg_n_base + 16 <= N) {
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], Y + (sg_m_base + i * 8) * N + (sg_n_base + j * 8), N);
+    } else {
+        threadgroup float* sc = (threadgroup float*)shmem_bf16;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ushort lane = tiitg % 32;
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            if (gm < M && gn < N)
+                Y[gm * N + gn] = my_sc[local_m * 16 + local_n];
+        }
+    }
+}
+
+// ============================================================================
+// tiled_matmul_bf16_residual: Tiled GEMM with BF16 weights + residual add
+//
+// Y[m,n] = X[M,K] * W^T[N,K] + R[m,n]
+//
+// Same as tiled_matmul_bf16 but fuses residual addition at writeback.
+// ============================================================================
+
+kernel void tiled_matmul_bf16_residual(
+    device const ushort* W   [[buffer(0)]],   // [N, K] weights (BF16 as u16)
+    device const float*  X   [[buffer(1)]],   // [M, K] input batch (float)
+    device float*        Y   [[buffer(2)]],   // [M, N] output (float)
+    constant uint&       M   [[buffer(3)]],
+    constant uint&       N   [[buffer(4)]],
+    constant uint&       K   [[buffer(5)]],
+    device const float*  R   [[buffer(6)]],   // [M, N] residual to add
+    uint2 tg_pos              [[threadgroup_position_in_grid]],
+    ushort tiitg              [[thread_index_in_threadgroup]],
+    ushort sgitg              [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup bfloat shmem_bf16r[2048];
+    threadgroup bfloat* sa = shmem_bf16r;
+    threadgroup bfloat* sb = shmem_bf16r + TILE_M * TILE_K;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_k_tiles = (K + TILE_K - 1) / TILE_K;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K;
+
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 3;
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup bfloat* sa_ptr = sa + row * TILE_K + k_start;
+
+            if (gm < M && gk + 7 < K) {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                sa_ptr[0] = (bfloat)v0.x; sa_ptr[1] = (bfloat)v0.y;
+                sa_ptr[2] = (bfloat)v0.z; sa_ptr[3] = (bfloat)v0.w;
+                sa_ptr[4] = (bfloat)v1.x; sa_ptr[5] = (bfloat)v1.y;
+                sa_ptr[6] = (bfloat)v1.z; sa_ptr[7] = (bfloat)v1.w;
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    uint gk_i = gk + i;
+                    sa_ptr[i] = (gm < M && gk_i < K) ? (bfloat)X[gm * K + gk_i] : (bfloat)0.0f;
+                }
+            }
+        }
+
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 3;
+
+            uint gn = tile_n_start + row;
+            uint gk = k_base + k_start;
+            threadgroup bfloat* sb_ptr = sb + row * TILE_K + k_start;
+
+            if (gn < N && gk + 7 < K) {
+                device const ushort* w_ptr = W + gn * K + gk;
+                sb_ptr[0] = bf16_bits_to_bfloat(w_ptr[0]);
+                sb_ptr[1] = bf16_bits_to_bfloat(w_ptr[1]);
+                sb_ptr[2] = bf16_bits_to_bfloat(w_ptr[2]);
+                sb_ptr[3] = bf16_bits_to_bfloat(w_ptr[3]);
+                sb_ptr[4] = bf16_bits_to_bfloat(w_ptr[4]);
+                sb_ptr[5] = bf16_bits_to_bfloat(w_ptr[5]);
+                sb_ptr[6] = bf16_bits_to_bfloat(w_ptr[6]);
+                sb_ptr[7] = bf16_bits_to_bfloat(w_ptr[7]);
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    uint gk_i = gk + i;
+                    sb_ptr[i] = (gn < N && gk_i < K)
+                        ? bf16_bits_to_bfloat(W[gn * K + gk_i])
+                        : (bfloat)0.0f;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K; ks += 8) {
+            simdgroup_bfloat8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K + ks, TILE_K);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K + ks, TILE_K);
+
+            simdgroup_bfloat8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    {
+        threadgroup float* sc = (threadgroup float*)shmem_bf16r;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ushort lane = tiitg % 32;
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            if (gm < M && gn < N)
+                Y[gm * N + gn] = my_sc[local_m * 16 + local_n] + R[gm * N + gn];
+        }
+    }
+}
+
+// ============================================================================
+// tiled_matmul_bf16_k64: TILE_K=64 variant for BF16 -- fewer barriers
+// ============================================================================
+
+kernel void tiled_matmul_bf16_k64(
+    device const ushort* W   [[buffer(0)]],
+    device const float*  X   [[buffer(1)]],
+    device float*        Y   [[buffer(2)]],
+    constant uint&       M   [[buffer(3)]],
+    constant uint&       N   [[buffer(4)]],
+    constant uint&       K   [[buffer(5)]],
+    uint2 tg_pos              [[threadgroup_position_in_grid]],
+    ushort tiitg              [[thread_index_in_threadgroup]],
+    ushort sgitg              [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup bfloat shmem_bf16_k64[4096];
+    threadgroup bfloat* sa = shmem_bf16_k64;
+    threadgroup bfloat* sb = shmem_bf16_k64 + TILE_M * TILE_K_64;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_k_tiles = (K + TILE_K_64 - 1) / TILE_K_64;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K_64;
+
+        // Load A tile (X): float -> bfloat conversion
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 4;
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup bfloat* sa_ptr = sa + row * TILE_K_64 + k_start;
+
+            if (FC_BC_M || FC_BC_K) {
+                if (gm < M && gk + 15 < K) {
+                    device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                    float4 v0 = x_ptr[0];
+                    float4 v1 = x_ptr[1];
+                    float4 v2 = x_ptr[2];
+                    float4 v3 = x_ptr[3];
+                    sa_ptr[0]  = (bfloat)v0.x; sa_ptr[1]  = (bfloat)v0.y;
+                    sa_ptr[2]  = (bfloat)v0.z; sa_ptr[3]  = (bfloat)v0.w;
+                    sa_ptr[4]  = (bfloat)v1.x; sa_ptr[5]  = (bfloat)v1.y;
+                    sa_ptr[6]  = (bfloat)v1.z; sa_ptr[7]  = (bfloat)v1.w;
+                    sa_ptr[8]  = (bfloat)v2.x; sa_ptr[9]  = (bfloat)v2.y;
+                    sa_ptr[10] = (bfloat)v2.z; sa_ptr[11] = (bfloat)v2.w;
+                    sa_ptr[12] = (bfloat)v3.x; sa_ptr[13] = (bfloat)v3.y;
+                    sa_ptr[14] = (bfloat)v3.z; sa_ptr[15] = (bfloat)v3.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sa_ptr[i] = (gm < M && gk_i < K) ? (bfloat)X[gm * K + gk_i] : (bfloat)0.0f;
+                    }
+                }
+            } else {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                float4 v2 = x_ptr[2];
+                float4 v3 = x_ptr[3];
+                sa_ptr[0]  = (bfloat)v0.x; sa_ptr[1]  = (bfloat)v0.y;
+                sa_ptr[2]  = (bfloat)v0.z; sa_ptr[3]  = (bfloat)v0.w;
+                sa_ptr[4]  = (bfloat)v1.x; sa_ptr[5]  = (bfloat)v1.y;
+                sa_ptr[6]  = (bfloat)v1.z; sa_ptr[7]  = (bfloat)v1.w;
+                sa_ptr[8]  = (bfloat)v2.x; sa_ptr[9]  = (bfloat)v2.y;
+                sa_ptr[10] = (bfloat)v2.z; sa_ptr[11] = (bfloat)v2.w;
+                sa_ptr[12] = (bfloat)v3.x; sa_ptr[13] = (bfloat)v3.y;
+                sa_ptr[14] = (bfloat)v3.z; sa_ptr[15] = (bfloat)v3.w;
+            }
+        }
+
+        // Load B tile (W): u16 reinterpret as bfloat.
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 4;
+
+            uint gn = tile_n_start + row;
+            uint gk = k_base + k_start;
+            threadgroup bfloat* sb_ptr = sb + row * TILE_K_64 + k_start;
+
+            if (FC_BC_N || FC_BC_K) {
+                if (gn < N && gk + 15 < K) {
+                    device const ushort* w_ptr = W + gn * K + gk;
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        sb_ptr[i] = bf16_bits_to_bfloat(w_ptr[i]);
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sb_ptr[i] = (gn < N && gk_i < K)
+                            ? bf16_bits_to_bfloat(W[gn * K + gk_i])
+                            : (bfloat)0.0f;
+                    }
+                }
+            } else {
+                device const ushort* w_ptr = W + gn * K + gk;
+                FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                    sb_ptr[i] = bf16_bits_to_bfloat(w_ptr[i]);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K_64; ks += 8) {
+            simdgroup_bfloat8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K_64 + ks, TILE_K_64);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K_64 + ks, TILE_K_64);
+
+            simdgroup_bfloat8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    if (FC_BC_M || FC_BC_N) {
+        if (sg_m_base + 16 <= M && sg_n_base + 16 <= N) {
+            FOR_UNROLL (ushort i = 0; i < 2; i++)
+                FOR_UNROLL (ushort j = 0; j < 2; j++)
+                    simdgroup_store(mc[i][j], Y + (sg_m_base + i * 8) * N + (sg_n_base + j * 8), N);
+        } else {
+            threadgroup float* sc = (threadgroup float*)shmem_bf16_k64;
+            threadgroup float* my_sc = sc + sgitg * 256;
+            FOR_UNROLL (ushort i = 0; i < 2; i++)
+                FOR_UNROLL (ushort j = 0; j < 2; j++)
+                    simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            ushort lane = tiitg % 32;
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                if (gm < M && gn < N) {
+                    Y[gm * N + gn] = my_sc[local_m * 16 + local_n];
+                }
+            }
+        }
+    } else {
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], Y + (sg_m_base + i * 8) * N + (sg_n_base + j * 8), N);
+    }
+}
+
+// ============================================================================
+// tiled_matmul_bf16_k64_residual: TILE_K=64 variant for BF16 + residual add
+// ============================================================================
+
+kernel void tiled_matmul_bf16_k64_residual(
+    device const ushort* W   [[buffer(0)]],
+    device const float*  X   [[buffer(1)]],
+    device float*        Y   [[buffer(2)]],
+    constant uint&       M   [[buffer(3)]],
+    constant uint&       N   [[buffer(4)]],
+    constant uint&       K   [[buffer(5)]],
+    device const float*  R   [[buffer(6)]],
+    uint2 tg_pos              [[threadgroup_position_in_grid]],
+    ushort tiitg              [[thread_index_in_threadgroup]],
+    ushort sgitg              [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup bfloat shmem_bf16_k64r[4096];
+    threadgroup bfloat* sa = shmem_bf16_k64r;
+    threadgroup bfloat* sb = shmem_bf16_k64r + TILE_M * TILE_K_64;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_k_tiles = (K + TILE_K_64 - 1) / TILE_K_64;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K_64;
+
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 4;
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup bfloat* sa_ptr = sa + row * TILE_K_64 + k_start;
+
+            if (FC_BC_M || FC_BC_K) {
+                if (gm < M && gk + 15 < K) {
+                    device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                    float4 v0 = x_ptr[0];
+                    float4 v1 = x_ptr[1];
+                    float4 v2 = x_ptr[2];
+                    float4 v3 = x_ptr[3];
+                    sa_ptr[0]  = (bfloat)v0.x; sa_ptr[1]  = (bfloat)v0.y;
+                    sa_ptr[2]  = (bfloat)v0.z; sa_ptr[3]  = (bfloat)v0.w;
+                    sa_ptr[4]  = (bfloat)v1.x; sa_ptr[5]  = (bfloat)v1.y;
+                    sa_ptr[6]  = (bfloat)v1.z; sa_ptr[7]  = (bfloat)v1.w;
+                    sa_ptr[8]  = (bfloat)v2.x; sa_ptr[9]  = (bfloat)v2.y;
+                    sa_ptr[10] = (bfloat)v2.z; sa_ptr[11] = (bfloat)v2.w;
+                    sa_ptr[12] = (bfloat)v3.x; sa_ptr[13] = (bfloat)v3.y;
+                    sa_ptr[14] = (bfloat)v3.z; sa_ptr[15] = (bfloat)v3.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sa_ptr[i] = (gm < M && gk_i < K) ? (bfloat)X[gm * K + gk_i] : (bfloat)0.0f;
+                    }
+                }
+            } else {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                float4 v2 = x_ptr[2];
+                float4 v3 = x_ptr[3];
+                sa_ptr[0]  = (bfloat)v0.x; sa_ptr[1]  = (bfloat)v0.y;
+                sa_ptr[2]  = (bfloat)v0.z; sa_ptr[3]  = (bfloat)v0.w;
+                sa_ptr[4]  = (bfloat)v1.x; sa_ptr[5]  = (bfloat)v1.y;
+                sa_ptr[6]  = (bfloat)v1.z; sa_ptr[7]  = (bfloat)v1.w;
+                sa_ptr[8]  = (bfloat)v2.x; sa_ptr[9]  = (bfloat)v2.y;
+                sa_ptr[10] = (bfloat)v2.z; sa_ptr[11] = (bfloat)v2.w;
+                sa_ptr[12] = (bfloat)v3.x; sa_ptr[13] = (bfloat)v3.y;
+                sa_ptr[14] = (bfloat)v3.z; sa_ptr[15] = (bfloat)v3.w;
+            }
+        }
+
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 4;
+
+            uint gn = tile_n_start + row;
+            uint gk = k_base + k_start;
+            threadgroup bfloat* sb_ptr = sb + row * TILE_K_64 + k_start;
+
+            if (FC_BC_N || FC_BC_K) {
+                if (gn < N && gk + 15 < K) {
+                    device const ushort* w_ptr = W + gn * K + gk;
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        sb_ptr[i] = bf16_bits_to_bfloat(w_ptr[i]);
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sb_ptr[i] = (gn < N && gk_i < K)
+                            ? bf16_bits_to_bfloat(W[gn * K + gk_i])
+                            : (bfloat)0.0f;
+                    }
+                }
+            } else {
+                device const ushort* w_ptr = W + gn * K + gk;
+                FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                    sb_ptr[i] = bf16_bits_to_bfloat(w_ptr[i]);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K_64; ks += 8) {
+            simdgroup_bfloat8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K_64 + ks, TILE_K_64);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K_64 + ks, TILE_K_64);
+
+            simdgroup_bfloat8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    {
+        threadgroup float* sc = (threadgroup float*)shmem_bf16_k64r;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ushort lane = tiitg % 32;
+        if (FC_BC_M || FC_BC_N) {
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                if (gm < M && gn < N) {
+                    Y[gm * N + gn] = my_sc[local_m * 16 + local_n] + R[gm * N + gn];
+                }
+            }
+        } else {
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                Y[gm * N + gn] = my_sc[local_m * 16 + local_n] + R[gm * N + gn];
+            }
+        }
+    }
+}
+
+// ============================================================================
+// bf16_matmul_k64_splitk: BF16 K64 Split-K GEMM.
+//
+// Same as `tiled_matmul_bf16_k64` but adds a 3D dispatch on `k_splits` to raise
+// the threadgroup count on memory-bound shapes (large K, small M). Designed
+// for the FFN-down geometry (K=12288, N=hidden_dim=4096, M=batch_size <= 192).
+//
+// Grid: (ceil(N/TILE_N), ceil(M/TILE_M), k_splits)
+// Each TG writes to Y_partial[split_idx * M * N + m * N + n] for its K range.
+// k_per_split is rounded up to a multiple of TILE_K_64 (= 64).
+//
+// Designed to be paired with `reduce_splitk_add_residual` (defined in
+// gemm_q8_0.msl; quant-agnostic, takes F32 partials) to compute the final
+//   Y[m,n] = sum_s(Y_partial[s,m,n]) + R[m,n]
+// in a single output pass.
+//
+// Threadgroup memory: 4 KB (sa) + 4 KB (sb) = 8 KB. Same as the K64 BF16
+// baseline kernel; well below the M3 Ultra 12 KB occupancy knee.
+// ============================================================================
+
+kernel void bf16_matmul_k64_splitk(
+    device const ushort* W        [[buffer(0)]],   // [N, K] weights (BF16 as u16)
+    device const float*  X        [[buffer(1)]],   // [M, K] input batch
+    device float*        Y_partial [[buffer(2)]],  // [k_splits, M, N] partial results
+    constant uint&       M        [[buffer(3)]],   // batch size
+    constant uint&       N        [[buffer(4)]],   // output dim
+    constant uint&       K        [[buffer(5)]],   // input dim (elements)
+    constant uint&       k_splits [[buffer(6)]],   // number of K splits
+    uint3 tg_pos                  [[threadgroup_position_in_grid]],
+    ushort tiitg                  [[thread_index_in_threadgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup bfloat shmem_bf16_sp[4096];
+    threadgroup bfloat* sa = shmem_bf16_sp;
+    threadgroup bfloat* sb = shmem_bf16_sp + TILE_M * TILE_K_64;
+
+    uint tile_n_start = tg_pos.x * TILE_N;
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint split_idx    = tg_pos.z;
+
+    // K range for this split: aligned to TILE_K_64 (64-element multiples).
+    uint k_per_split = ((K + k_splits - 1) / k_splits);
+    k_per_split = ((k_per_split + TILE_K_64 - 1) / TILE_K_64) * TILE_K_64;
+    uint k_start = split_idx * k_per_split;
+    uint k_end = min(k_start + k_per_split, K);
+    if (k_start >= K) {
+        // No work for this split: zero its output tile so reduce sees zero.
+        uint partial_offset = split_idx * M * N;
+        for (ushort idx = tiitg; idx < TILE_M * TILE_N; idx += TG_SIZE) {
+            uint m_local = idx / TILE_N;
+            uint n_local = idx % TILE_N;
+            uint gm = tile_m_start + m_local;
+            uint gn = tile_n_start + n_local;
+            if (gm < M && gn < N)
+                Y_partial[partial_offset + gm * N + gn] = 0.0f;
+        }
+        return;
+    }
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint first_kt = k_start / TILE_K_64;
+    uint last_kt = (k_end + TILE_K_64 - 1) / TILE_K_64;
+
+    for (uint kt = first_kt; kt < last_kt; kt++) {
+        uint k_base = kt * TILE_K_64;
+
+        // --- Load A tile (X): 32 rows x 64 cols, float -> bfloat. ---
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_local = col_group << 4;          // col_group * 16
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_local;
+            threadgroup bfloat* sa_ptr = sa + row * TILE_K_64 + k_local;
+
+            if (gm < M && gk + 15 < K && gk >= k_start && gk + 15 < k_end) {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                float4 v2 = x_ptr[2];
+                float4 v3 = x_ptr[3];
+                sa_ptr[0]  = (bfloat)v0.x; sa_ptr[1]  = (bfloat)v0.y;
+                sa_ptr[2]  = (bfloat)v0.z; sa_ptr[3]  = (bfloat)v0.w;
+                sa_ptr[4]  = (bfloat)v1.x; sa_ptr[5]  = (bfloat)v1.y;
+                sa_ptr[6]  = (bfloat)v1.z; sa_ptr[7]  = (bfloat)v1.w;
+                sa_ptr[8]  = (bfloat)v2.x; sa_ptr[9]  = (bfloat)v2.y;
+                sa_ptr[10] = (bfloat)v2.z; sa_ptr[11] = (bfloat)v2.w;
+                sa_ptr[12] = (bfloat)v3.x; sa_ptr[13] = (bfloat)v3.y;
+                sa_ptr[14] = (bfloat)v3.z; sa_ptr[15] = (bfloat)v3.w;
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                    uint gk_i = gk + i;
+                    sa_ptr[i] = (gm < M && gk_i < K && gk_i >= k_start && gk_i < k_end)
+                        ? (bfloat)X[gm * K + gk_i]
+                        : (bfloat)0.0f;
+                }
+            }
+        }
+
+        // --- Load B tile (W): 32 rows x 64 cols, u16 -> bfloat. ---
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_local = col_group << 4;
+
+            uint gn = tile_n_start + row;
+            uint gk = k_base + k_local;
+            threadgroup bfloat* sb_ptr = sb + row * TILE_K_64 + k_local;
+
+            if (gn < N && gk + 15 < K && gk >= k_start && gk + 15 < k_end) {
+                device const ushort* w_ptr = W + gn * K + gk;
+                FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                    sb_ptr[i] = bf16_bits_to_bfloat(w_ptr[i]);
+                }
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                    uint gk_i = gk + i;
+                    sb_ptr[i] = (gn < N && gk_i < K && gk_i >= k_start && gk_i < k_end)
+                        ? bf16_bits_to_bfloat(W[gn * K + gk_i])
+                        : (bfloat)0.0f;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // MMA: same as K64 path.
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K_64; ks += 8) {
+            simdgroup_bfloat8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K_64 + ks, TILE_K_64);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K_64 + ks, TILE_K_64);
+
+            simdgroup_bfloat8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store to partial buffer at offset split_idx * M * N (reduce adds residual).
+    uint partial_offset = split_idx * M * N;
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    if (sg_m_base + 16 <= M && sg_n_base + 16 <= N) {
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], Y_partial + partial_offset + (sg_m_base + i * 8) * N + (sg_n_base + j * 8), N);
+    } else {
+        threadgroup float* sc = (threadgroup float*)shmem_bf16_sp;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ushort lane = tiitg % 32;
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            if (gm < M && gn < N) {
+                Y_partial[partial_offset + gm * N + gn] = my_sc[local_m * 16 + local_n];
+            }
+        }
+    }
+}
+
+// ============================================================================
+// bf16_matmul_gate_up_swiglu_fused: Joint dual-output gate+up BF16 GEMM with
+// register-resident SwiGLU writeback.
+//
+// Replaces the three-dispatch chain (gate GEMM, up GEMM, swiglu_batched) used
+// by the BF16 FFN prefill path with a single kernel that:
+//   1. Reads the A-tile (token activations) once into shmem.
+//   2. Reinterprets BOTH gate and up BF16 weight tiles into separate shmem regions.
+//   3. Computes both gate and up output tiles via simdgroup BF16 MMA in registers.
+//   4. Applies SwiGLU (silu(gate) * up) in registers at the epilogue.
+//   5. Writes only the SwiGLU activation to global memory.
+//
+// Threadgroup memory:
+//   sa[TILE_M * TILE_K_64]      = 32 * 64 = 2048 bfloats = 4 KB  (shared A tile)
+//   sb_gate[TILE_N * TILE_K_64] = 32 * 64 = 2048 bfloats = 4 KB
+//   sb_up  [TILE_N * TILE_K_64] = 32 * 64 = 2048 bfloats = 4 KB
+//   total = 6144 bfloats = 12 KB
+// Same 12 KB shmem footprint as the Q8 fused kernel — same M3 Ultra
+// occupancy knee (2 TG/CU) holds.
+//
+// Output: writes [M, N] float activation to Y. Eliminates the gate_buf and
+// up_buf hidden_inter (M * inter_dim) writes and reads, plus the standalone
+// swiglu_batched activation dispatch.
+//
+// Bandwidth model on Qwen3.5-9B BF16 (M=131 inter_dim=12288 hidden_dim=4096):
+//   Saved:  2 * M * N * sizeof(float) = 2 * 131 * 12288 * 4 = ~12.6 MB / layer
+//           = ~400 MB across 32 layers at ~210 GB/s effective = ~2 ms saved.
+//   Plus 2 fewer compute encoder submissions per layer = ~64 fewer dispatches
+//   over the prefill iteration. Each dispatch saves ~5-20 us of overhead.
+//
+// FC_BC_M / FC_BC_N / FC_BC_K function constants control boundary handling
+// (shared with the rest of the gemm_residual_bf16 family).
+// ============================================================================
+
+kernel void bf16_matmul_gate_up_swiglu_fused(
+    device const ushort* W_gate [[buffer(0)]],   // [N, K] gate weights (BF16 as u16)
+    device const float*  X      [[buffer(1)]],   // [M, K] input activations
+    device float*        Y      [[buffer(2)]],   // [M, N] SwiGLU output
+    constant uint&       M      [[buffer(3)]],   // batch size
+    constant uint&       N      [[buffer(4)]],   // inter_dim
+    constant uint&       K      [[buffer(5)]],   // hidden_dim
+    device const ushort* W_up   [[buffer(6)]],   // [N, K] up weights (BF16 as u16)
+    uint2 tg_pos                [[threadgroup_position_in_grid]],
+    ushort tiitg                [[thread_index_in_threadgroup]],
+    ushort sgitg                [[simdgroup_index_in_threadgroup]])
+{
+    // 6144 bfloats = 12 KB threadgroup memory (matches Q8 fused layout).
+    threadgroup bfloat shmem_gus_bf16[6144];
+    threadgroup bfloat* sa   = shmem_gus_bf16;
+    threadgroup bfloat* sb_g = shmem_gus_bf16 + TILE_M * TILE_K_64;
+    threadgroup bfloat* sb_u = shmem_gus_bf16 + TILE_M * TILE_K_64 + TILE_N * TILE_K_64;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    // Two output accumulators: gate and up.
+    simdgroup_float8x8 mc_g[2][2];
+    simdgroup_float8x8 mc_u[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++) {
+            mc_g[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+            mc_u[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        }
+
+    uint num_k_tiles = (K + TILE_K_64 - 1) / TILE_K_64;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K_64;
+
+        // ---- Load A tile (X): 32 rows x 64 cols, float -> bfloat. ----
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 4;   // col_group * 16
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup bfloat* sa_ptr = sa + row * TILE_K_64 + k_start;
+
+            if (FC_BC_M || FC_BC_K) {
+                if (gm < M && gk + 15 < K) {
+                    device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                    float4 v0 = x_ptr[0];
+                    float4 v1 = x_ptr[1];
+                    float4 v2 = x_ptr[2];
+                    float4 v3 = x_ptr[3];
+                    sa_ptr[0]  = (bfloat)v0.x; sa_ptr[1]  = (bfloat)v0.y;
+                    sa_ptr[2]  = (bfloat)v0.z; sa_ptr[3]  = (bfloat)v0.w;
+                    sa_ptr[4]  = (bfloat)v1.x; sa_ptr[5]  = (bfloat)v1.y;
+                    sa_ptr[6]  = (bfloat)v1.z; sa_ptr[7]  = (bfloat)v1.w;
+                    sa_ptr[8]  = (bfloat)v2.x; sa_ptr[9]  = (bfloat)v2.y;
+                    sa_ptr[10] = (bfloat)v2.z; sa_ptr[11] = (bfloat)v2.w;
+                    sa_ptr[12] = (bfloat)v3.x; sa_ptr[13] = (bfloat)v3.y;
+                    sa_ptr[14] = (bfloat)v3.z; sa_ptr[15] = (bfloat)v3.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sa_ptr[i] = (gm < M && gk_i < K) ? (bfloat)X[gm * K + gk_i] : (bfloat)0.0f;
+                    }
+                }
+            } else {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                float4 v2 = x_ptr[2];
+                float4 v3 = x_ptr[3];
+                sa_ptr[0]  = (bfloat)v0.x; sa_ptr[1]  = (bfloat)v0.y;
+                sa_ptr[2]  = (bfloat)v0.z; sa_ptr[3]  = (bfloat)v0.w;
+                sa_ptr[4]  = (bfloat)v1.x; sa_ptr[5]  = (bfloat)v1.y;
+                sa_ptr[6]  = (bfloat)v1.z; sa_ptr[7]  = (bfloat)v1.w;
+                sa_ptr[8]  = (bfloat)v2.x; sa_ptr[9]  = (bfloat)v2.y;
+                sa_ptr[10] = (bfloat)v2.z; sa_ptr[11] = (bfloat)v2.w;
+                sa_ptr[12] = (bfloat)v3.x; sa_ptr[13] = (bfloat)v3.y;
+                sa_ptr[14] = (bfloat)v3.z; sa_ptr[15] = (bfloat)v3.w;
+            }
+        }
+
+        // ---- Load B-gate + B-up tile (W): u16 reinterpret as bfloat. ----
+        // Both weights share the same access pattern as tiled_matmul_bf16_k64
+        // but for two distinct weight buffers stored to separate shmem regions.
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 4;
+
+            uint gn = tile_n_start + row;
+            uint gk = k_base + k_start;
+            threadgroup bfloat* sb_g_ptr = sb_g + row * TILE_K_64 + k_start;
+            threadgroup bfloat* sb_u_ptr = sb_u + row * TILE_K_64 + k_start;
+
+            if (FC_BC_N || FC_BC_K) {
+                if (gn < N && gk + 15 < K) {
+                    device const ushort* wg_ptr = W_gate + gn * K + gk;
+                    device const ushort* wu_ptr = W_up   + gn * K + gk;
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        sb_g_ptr[i] = bf16_bits_to_bfloat(wg_ptr[i]);
+                        sb_u_ptr[i] = bf16_bits_to_bfloat(wu_ptr[i]);
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        bool in_bounds = (gn < N && gk_i < K);
+                        sb_g_ptr[i] = in_bounds
+                            ? bf16_bits_to_bfloat(W_gate[gn * K + gk_i])
+                            : (bfloat)0.0f;
+                        sb_u_ptr[i] = in_bounds
+                            ? bf16_bits_to_bfloat(W_up[gn * K + gk_i])
+                            : (bfloat)0.0f;
+                    }
+                }
+            } else {
+                device const ushort* wg_ptr = W_gate + gn * K + gk;
+                device const ushort* wu_ptr = W_up   + gn * K + gk;
+                FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                    sb_g_ptr[i] = bf16_bits_to_bfloat(wg_ptr[i]);
+                    sb_u_ptr[i] = bf16_bits_to_bfloat(wu_ptr[i]);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- MMA: accumulate BOTH gate and up outputs in parallel. ----
+        // The A tile is read once per ks step and shared between gate and up.
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K_64; ks += 8) {
+            simdgroup_bfloat8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K_64 + ks, TILE_K_64);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K_64 + ks, TILE_K_64);
+
+            // Gate B tile.
+            simdgroup_bfloat8x8 mb_g[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb_g[0], sb_g + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb_g[1], sb_g + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc_g[0][0], ma[0], mb_g[0], mc_g[0][0]);
+            simdgroup_multiply_accumulate(mc_g[0][1], ma[0], mb_g[1], mc_g[0][1]);
+            simdgroup_multiply_accumulate(mc_g[1][0], ma[1], mb_g[0], mc_g[1][0]);
+            simdgroup_multiply_accumulate(mc_g[1][1], ma[1], mb_g[1], mc_g[1][1]);
+
+            // Up B tile (re-uses ma loads above).
+            simdgroup_bfloat8x8 mb_u[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb_u[0], sb_u + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb_u[1], sb_u + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc_u[0][0], ma[0], mb_u[0], mc_u[0][0]);
+            simdgroup_multiply_accumulate(mc_u[0][1], ma[0], mb_u[1], mc_u[0][1]);
+            simdgroup_multiply_accumulate(mc_u[1][0], ma[1], mb_u[0], mc_u[1][0]);
+            simdgroup_multiply_accumulate(mc_u[1][1], ma[1], mb_u[1], mc_u[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ---- SwiGLU epilogue: store gate and up tiles to shmem scratch, read
+    // them back as floats, apply silu(gate) * up, and write the activation
+    // to Y. ----
+    //
+    // We reuse the 12 KB shmem region: per-SG, we need 256 floats for gate
+    // and 256 floats for up; with 4 SGs that's 4 * (256 + 256) = 2048 floats
+    // = 8 KB. The 12 KB shmem buffer (6144 bfloats = 3072 floats) is not
+    // large enough to hold both 4-SG gate AND up scratch (which needs
+    // 4 * 256 + 4 * 256 = 2048 floats = 8 KB ≤ 12 KB only if floats are
+    // 4 bytes; let's recheck: 12 KB / 4 = 3072 floats. We need 2048 floats.
+    // So the 12 KB shmem region accommodates BOTH 4-SG gate and 4-SG up
+    // scratch with 1024 floats to spare. The layout is:
+    //   sc_gate: floats 0..1023      (4 SGs * 256)
+    //   sc_up:   floats 1024..2047   (4 SGs * 256)
+
+    threadgroup float* sc_gate = (threadgroup float*)shmem_gus_bf16;
+    threadgroup float* sc_up   = (threadgroup float*)shmem_gus_bf16 + 4 * 256;
+    threadgroup float* my_sc_gate = sc_gate + sgitg * 256;
+    threadgroup float* my_sc_up   = sc_up   + sgitg * 256;
+
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++) {
+            simdgroup_store(mc_g[i][j], my_sc_gate + (i * 8) * 16 + (j * 8), 16);
+            simdgroup_store(mc_u[i][j], my_sc_up   + (i * 8) * 16 + (j * 8), 16);
+        }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    ushort lane = tiitg % 32;
+    if (FC_BC_M || FC_BC_N) {
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            if (gm < M && gn < N) {
+                float g = my_sc_gate[local_m * 16 + local_n];
+                float u = my_sc_up  [local_m * 16 + local_n];
+                float sig = 1.0f / (1.0f + exp(-g));
+                Y[gm * N + gn] = g * sig * u;
+            }
+        }
+    } else {
+        // Aligned fast path: skip per-thread bounds.
+        for (ushort idx = lane; idx < 256; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            float g = my_sc_gate[local_m * 16 + local_n];
+            float u = my_sc_up  [local_m * 16 + local_n];
+            float sig = 1.0f / (1.0f + exp(-g));
+            Y[gm * N + gn] = g * sig * u;
+        }
+    }
+}
+
+// ============================================================================
+// NR-tile sweep variants of bf16_matmul_gate_up_swiglu_fused.
+//
+// The baseline kernel (above) uses NR=2: each TG covers a 32x32 output, each
+// simdgroup owns a 16x16 sub-tile = 2 rows x 2 cols of 8x8 simdgroup MMA
+// accumulators (mc[2][2]). Shmem footprint: 32*64 + 32*64 + 32*64 = 6144 bf
+// = 12 KB. Holds 2 TG/CU at the M3 Ultra occupancy knee.
+//
+// NR refers to the number of 8x8 MMA rows owned per simdgroup along the M
+// axis. Higher NR = larger M-tile per TG = more accumulators per SG = more
+// per-output-element amortisation of weight-load cost. NSG=4 GDN port
+// found this trade-off can backfire when shared-L1 already amortises across
+// adjacent TGs; the BF16 fused FFN gate+up shape (M=131 K=4096 N=12288)
+// should be more memory-bandwidth bound than the GDN qkv shape (M=131 K=2048
+// N=8192) it operates on, justifying a re-sweep here.
+//
+// Variants:
+//   NR=1 (TILE_M=16, TILE_N=32): shmem 16*64 + 32*64 + 32*64 = 5120 bf = 10 KB.
+//         Each SG owns 8x16 sub-tile = mc[1][2]. 3 TG/CU possible.
+//         More TGs/CU = better latency hiding when waves stall on shmem load.
+//   NR=4 (TILE_M=64, TILE_N=32): shmem 64*64 + 32*64 + 32*64 = 8192 bf = 16 KB.
+//         Each SG owns 32x16 sub-tile = mc[4][2]. 1 TG/CU at the 16 KB knee.
+//         Each TG processes 2x more output rows -> 2x fewer TG launches and
+//         2x better weight-load amortisation, at the cost of halving occupancy
+//         and 2x the accumulator register pressure (16 sg-tiles vs 8).
+//
+// NR=8 is intentionally NOT implemented:
+//   TILE_M=128 -> shmem 128*64 + 32*64 + 32*64 = 12288 bf = 24 KB. Above the
+//   16 KB knee, forces 1 TG/CU AND introduces register spilling risk (32
+//   per-SG sg-tiles, 4 KB of register state per SG). Doubling shmem on
+//   Apple AGX halves occupancy and serialises waves.
+// ============================================================================
+
+// ============================================================================
+// bf16_matmul_gate_up_swiglu_fused_nr1: TILE_M=16 variant.
+// ============================================================================
+constant constexpr uint TILE_M_NR1 = 16;
+constant constexpr uint TILE_N_NR1 = 32;
+
+kernel void bf16_matmul_gate_up_swiglu_fused_nr1(
+    device const ushort* W_gate [[buffer(0)]],   // [N, K] gate weights (BF16 as u16)
+    device const float*  X      [[buffer(1)]],   // [M, K] input activations
+    device float*        Y      [[buffer(2)]],   // [M, N] SwiGLU output
+    constant uint&       M      [[buffer(3)]],   // batch size
+    constant uint&       N      [[buffer(4)]],   // inter_dim
+    constant uint&       K      [[buffer(5)]],   // hidden_dim
+    device const ushort* W_up   [[buffer(6)]],   // [N, K] up weights (BF16 as u16)
+    uint2 tg_pos                [[threadgroup_position_in_grid]],
+    ushort tiitg                [[thread_index_in_threadgroup]],
+    ushort sgitg                [[simdgroup_index_in_threadgroup]])
+{
+    // 5120 bfloats = 10 KB. 3 TG/CU on M3 Ultra (16 KB shmem-per-CU knee).
+    threadgroup bfloat shmem_gus_bf16_nr1[5120];
+    threadgroup bfloat* sa   = shmem_gus_bf16_nr1;
+    threadgroup bfloat* sb_g = shmem_gus_bf16_nr1 + TILE_M_NR1 * TILE_K_64;
+    threadgroup bfloat* sb_u = shmem_gus_bf16_nr1 + TILE_M_NR1 * TILE_K_64 + TILE_N_NR1 * TILE_K_64;
+
+    uint tile_m_start = tg_pos.y * TILE_M_NR1;
+    uint tile_n_start = tg_pos.x * TILE_N_NR1;
+
+    ushort sg_r = sgitg / SG_COLS;  // 0..1
+    ushort sg_c = sgitg % SG_COLS;  // 0..1
+
+    // NR=1: each SG owns an 8x16 sub-tile = 1 row x 2 cols of 8x8 MMA tiles.
+    // BUT we still have 4 simdgroups; sg_r=0/1 partitions the M=16 rows into
+    // two halves (each SG owns 8 M-rows). So mc[1][2] per SG actually means
+    // "single row of 8x8 accumulators along M, two columns along N".
+    simdgroup_float8x8 mc_g[1][2];
+    simdgroup_float8x8 mc_u[1][2];
+    FOR_UNROLL (ushort j = 0; j < 2; j++) {
+        mc_g[0][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        mc_u[0][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    uint num_k_tiles = (K + TILE_K_64 - 1) / TILE_K_64;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K_64;
+
+        // ---- Load A tile (X): 16 rows x 64 cols = 1024 elements / 128 thr = 8 elem/thr.
+        // tiitg is 0..127. Layout: thr_i = (row, col_group) with col_group * 16 cols.
+        // 16 rows x 4 col_groups = 64 thread slots; we have 128 threads, so 2 elements per slot.
+        // Cleaner mapping: thread idx -> row in [0,16), 8-wide column stripe.
+        // 16 rows * 8 stripes-per-row = 128 thread slots, 8 floats each.
+        // ----
+        {
+            ushort row = tiitg >> 3;   // 0..15
+            ushort stripe = tiitg & 7;  // 0..7
+            ushort k_start = stripe << 3;  // stripe * 8
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup bfloat* sa_ptr = sa + row * TILE_K_64 + k_start;
+
+            if (FC_BC_M || FC_BC_K) {
+                if (gm < M && gk + 7 < K) {
+                    device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                    float4 v0 = x_ptr[0];
+                    float4 v1 = x_ptr[1];
+                    sa_ptr[0] = (bfloat)v0.x; sa_ptr[1] = (bfloat)v0.y;
+                    sa_ptr[2] = (bfloat)v0.z; sa_ptr[3] = (bfloat)v0.w;
+                    sa_ptr[4] = (bfloat)v1.x; sa_ptr[5] = (bfloat)v1.y;
+                    sa_ptr[6] = (bfloat)v1.z; sa_ptr[7] = (bfloat)v1.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                        uint gk_i = gk + i;
+                        sa_ptr[i] = (gm < M && gk_i < K) ? (bfloat)X[gm * K + gk_i] : (bfloat)0.0f;
+                    }
+                }
+            } else {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                sa_ptr[0] = (bfloat)v0.x; sa_ptr[1] = (bfloat)v0.y;
+                sa_ptr[2] = (bfloat)v0.z; sa_ptr[3] = (bfloat)v0.w;
+                sa_ptr[4] = (bfloat)v1.x; sa_ptr[5] = (bfloat)v1.y;
+                sa_ptr[6] = (bfloat)v1.z; sa_ptr[7] = (bfloat)v1.w;
+            }
+        }
+
+        // ---- Load B-gate + B-up tile (W): 32 rows x 64 cols = 2048 elements
+        // per buffer / 128 thr = 16 elem/thr per buffer. ----
+        {
+            ushort row = tiitg >> 2;        // 0..31
+            ushort col_group = tiitg & 3;   // 0..3
+            ushort k_start = col_group << 4;  // col_group * 16
+
+            uint gn = tile_n_start + row;
+            uint gk = k_base + k_start;
+            threadgroup bfloat* sb_g_ptr = sb_g + row * TILE_K_64 + k_start;
+            threadgroup bfloat* sb_u_ptr = sb_u + row * TILE_K_64 + k_start;
+
+            if (FC_BC_N || FC_BC_K) {
+                if (gn < N && gk + 15 < K) {
+                    device const ushort* wg_ptr = W_gate + gn * K + gk;
+                    device const ushort* wu_ptr = W_up   + gn * K + gk;
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        sb_g_ptr[i] = bf16_bits_to_bfloat(wg_ptr[i]);
+                        sb_u_ptr[i] = bf16_bits_to_bfloat(wu_ptr[i]);
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        bool in_bounds = (gn < N && gk_i < K);
+                        sb_g_ptr[i] = in_bounds
+                            ? bf16_bits_to_bfloat(W_gate[gn * K + gk_i])
+                            : (bfloat)0.0f;
+                        sb_u_ptr[i] = in_bounds
+                            ? bf16_bits_to_bfloat(W_up[gn * K + gk_i])
+                            : (bfloat)0.0f;
+                    }
+                }
+            } else {
+                device const ushort* wg_ptr = W_gate + gn * K + gk;
+                device const ushort* wu_ptr = W_up   + gn * K + gk;
+                FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                    sb_g_ptr[i] = bf16_bits_to_bfloat(wg_ptr[i]);
+                    sb_u_ptr[i] = bf16_bits_to_bfloat(wu_ptr[i]);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- MMA: NR=1 -> single row of 8x8 tiles in M, 2 cols in N. ----
+        // sg_r partitions M=16 rows into halves of 8 each (sg_r=0 owns rows 0..7).
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K_64; ks += 8) {
+            simdgroup_bfloat8x8 ma;
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma, sa + (sg_r * 8) * TILE_K_64 + ks, TILE_K_64);
+
+            // Gate B tile.
+            simdgroup_bfloat8x8 mb_g[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb_g[0], sb_g + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb_g[1], sb_g + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc_g[0][0], ma, mb_g[0], mc_g[0][0]);
+            simdgroup_multiply_accumulate(mc_g[0][1], ma, mb_g[1], mc_g[0][1]);
+
+            // Up B tile.
+            simdgroup_bfloat8x8 mb_u[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb_u[0], sb_u + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb_u[1], sb_u + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc_u[0][0], ma, mb_u[0], mc_u[0][0]);
+            simdgroup_multiply_accumulate(mc_u[0][1], ma, mb_u[1], mc_u[0][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ---- SwiGLU epilogue. Each SG holds 1x2 = 2 sg-tiles for gate and 2 for up.
+    // Per-SG scratch: 2 * 64 = 128 floats. 4 SGs -> 4 * 128 * 2 (g+u) = 1024 floats
+    // = 4 KB. Fits comfortably in our 10 KB shmem region.
+    threadgroup float* sc_gate = (threadgroup float*)shmem_gus_bf16_nr1;
+    threadgroup float* sc_up   = (threadgroup float*)shmem_gus_bf16_nr1 + 4 * 128;
+    threadgroup float* my_sc_gate = sc_gate + sgitg * 128;
+    threadgroup float* my_sc_up   = sc_up   + sgitg * 128;
+
+    FOR_UNROLL (ushort j = 0; j < 2; j++) {
+        simdgroup_store(mc_g[0][j], my_sc_gate + (j * 8), 16);
+        simdgroup_store(mc_u[0][j], my_sc_up   + (j * 8), 16);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Output sub-tile is 8 rows x 16 cols = 128 elements per SG. 32 lanes write
+    // 4 elements each.
+    uint sg_m_base = tile_m_start + sg_r * 8;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    ushort lane = tiitg % 32;
+    if (FC_BC_M || FC_BC_N) {
+        for (ushort idx = lane; idx < 128; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            if (gm < M && gn < N) {
+                float g = my_sc_gate[local_m * 16 + local_n];
+                float u = my_sc_up  [local_m * 16 + local_n];
+                float sig = 1.0f / (1.0f + exp(-g));
+                Y[gm * N + gn] = g * sig * u;
+            }
+        }
+    } else {
+        for (ushort idx = lane; idx < 128; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            float g = my_sc_gate[local_m * 16 + local_n];
+            float u = my_sc_up  [local_m * 16 + local_n];
+            float sig = 1.0f / (1.0f + exp(-g));
+            Y[gm * N + gn] = g * sig * u;
+        }
+    }
+}
+
+// ============================================================================
+// bf16_matmul_gate_up_swiglu_fused_nr4: TILE_M=64 variant.
+// ============================================================================
+constant constexpr uint TILE_M_NR4 = 64;
+constant constexpr uint TILE_N_NR4 = 32;
+
+kernel void bf16_matmul_gate_up_swiglu_fused_nr4(
+    device const ushort* W_gate [[buffer(0)]],
+    device const float*  X      [[buffer(1)]],
+    device float*        Y      [[buffer(2)]],
+    constant uint&       M      [[buffer(3)]],
+    constant uint&       N      [[buffer(4)]],
+    constant uint&       K      [[buffer(5)]],
+    device const ushort* W_up   [[buffer(6)]],
+    uint2 tg_pos                [[threadgroup_position_in_grid]],
+    ushort tiitg                [[thread_index_in_threadgroup]],
+    ushort sgitg                [[simdgroup_index_in_threadgroup]])
+{
+    // 8192 bfloats = 16 KB. 1 TG/CU on M3 Ultra at the occupancy knee.
+    threadgroup bfloat shmem_gus_bf16_nr4[8192];
+    threadgroup bfloat* sa   = shmem_gus_bf16_nr4;
+    threadgroup bfloat* sb_g = shmem_gus_bf16_nr4 + TILE_M_NR4 * TILE_K_64;
+    threadgroup bfloat* sb_u = shmem_gus_bf16_nr4 + TILE_M_NR4 * TILE_K_64 + TILE_N_NR4 * TILE_K_64;
+
+    uint tile_m_start = tg_pos.y * TILE_M_NR4;
+    uint tile_n_start = tg_pos.x * TILE_N_NR4;
+
+    ushort sg_r = sgitg / SG_COLS;  // 0..1
+    ushort sg_c = sgitg % SG_COLS;  // 0..1
+
+    // NR=4: each SG owns 32x16 sub-tile = 4 rows x 2 cols of 8x8 MMA tiles.
+    // mc[4][2] = 8 accumulators per SG for gate + 8 for up = 16 per SG total
+    // (2x the baseline's 8). Register pressure: 16 * 64 floats = 1024 floats
+    // = 4 KB of register state per SG. Apple AGX has 32 KB register file per
+    // simdgroup so this leaves room for other live variables.
+    simdgroup_float8x8 mc_g[4][2];
+    simdgroup_float8x8 mc_u[4][2];
+    FOR_UNROLL (ushort i = 0; i < 4; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++) {
+            mc_g[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+            mc_u[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        }
+
+    uint num_k_tiles = (K + TILE_K_64 - 1) / TILE_K_64;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K_64;
+
+        // ---- Load A tile (X): 64 rows x 64 cols = 4096 elements / 128 thr = 32 elem/thr.
+        // Layout: thr_i = (row_pair, col_group), row_pair * 4 + col_group < 128.
+        // Each thread loads 32 elements = 2 rows x 16 cols (col_group * 16). ----
+        {
+            ushort row_pair = tiitg >> 2;    // 0..31, owns rows [2*row_pair, 2*row_pair+1]
+            ushort col_group = tiitg & 3;    // 0..3
+            ushort k_start = col_group << 4; // col_group * 16
+
+            uint gk = k_base + k_start;
+
+            FOR_UNROLL (ushort r = 0; r < 2; r++) {
+                ushort row = row_pair * 2 + r;
+                uint gm = tile_m_start + row;
+                threadgroup bfloat* sa_ptr = sa + row * TILE_K_64 + k_start;
+
+                if (FC_BC_M || FC_BC_K) {
+                    if (gm < M && gk + 15 < K) {
+                        device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                        float4 v0 = x_ptr[0];
+                        float4 v1 = x_ptr[1];
+                        float4 v2 = x_ptr[2];
+                        float4 v3 = x_ptr[3];
+                        sa_ptr[0]  = (bfloat)v0.x; sa_ptr[1]  = (bfloat)v0.y;
+                        sa_ptr[2]  = (bfloat)v0.z; sa_ptr[3]  = (bfloat)v0.w;
+                        sa_ptr[4]  = (bfloat)v1.x; sa_ptr[5]  = (bfloat)v1.y;
+                        sa_ptr[6]  = (bfloat)v1.z; sa_ptr[7]  = (bfloat)v1.w;
+                        sa_ptr[8]  = (bfloat)v2.x; sa_ptr[9]  = (bfloat)v2.y;
+                        sa_ptr[10] = (bfloat)v2.z; sa_ptr[11] = (bfloat)v2.w;
+                        sa_ptr[12] = (bfloat)v3.x; sa_ptr[13] = (bfloat)v3.y;
+                        sa_ptr[14] = (bfloat)v3.z; sa_ptr[15] = (bfloat)v3.w;
+                    } else {
+                        FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                            uint gk_i = gk + i;
+                            sa_ptr[i] = (gm < M && gk_i < K) ? (bfloat)X[gm * K + gk_i] : (bfloat)0.0f;
+                        }
+                    }
+                } else {
+                    device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                    float4 v0 = x_ptr[0];
+                    float4 v1 = x_ptr[1];
+                    float4 v2 = x_ptr[2];
+                    float4 v3 = x_ptr[3];
+                    sa_ptr[0]  = (bfloat)v0.x; sa_ptr[1]  = (bfloat)v0.y;
+                    sa_ptr[2]  = (bfloat)v0.z; sa_ptr[3]  = (bfloat)v0.w;
+                    sa_ptr[4]  = (bfloat)v1.x; sa_ptr[5]  = (bfloat)v1.y;
+                    sa_ptr[6]  = (bfloat)v1.z; sa_ptr[7]  = (bfloat)v1.w;
+                    sa_ptr[8]  = (bfloat)v2.x; sa_ptr[9]  = (bfloat)v2.y;
+                    sa_ptr[10] = (bfloat)v2.z; sa_ptr[11] = (bfloat)v2.w;
+                    sa_ptr[12] = (bfloat)v3.x; sa_ptr[13] = (bfloat)v3.y;
+                    sa_ptr[14] = (bfloat)v3.z; sa_ptr[15] = (bfloat)v3.w;
+                }
+            }
+        }
+
+        // ---- Load B-gate + B-up tile (W): identical to baseline (32x64). ----
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 4;
+
+            uint gn = tile_n_start + row;
+            uint gk = k_base + k_start;
+            threadgroup bfloat* sb_g_ptr = sb_g + row * TILE_K_64 + k_start;
+            threadgroup bfloat* sb_u_ptr = sb_u + row * TILE_K_64 + k_start;
+
+            if (FC_BC_N || FC_BC_K) {
+                if (gn < N && gk + 15 < K) {
+                    device const ushort* wg_ptr = W_gate + gn * K + gk;
+                    device const ushort* wu_ptr = W_up   + gn * K + gk;
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        sb_g_ptr[i] = bf16_bits_to_bfloat(wg_ptr[i]);
+                        sb_u_ptr[i] = bf16_bits_to_bfloat(wu_ptr[i]);
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        bool in_bounds = (gn < N && gk_i < K);
+                        sb_g_ptr[i] = in_bounds
+                            ? bf16_bits_to_bfloat(W_gate[gn * K + gk_i])
+                            : (bfloat)0.0f;
+                        sb_u_ptr[i] = in_bounds
+                            ? bf16_bits_to_bfloat(W_up[gn * K + gk_i])
+                            : (bfloat)0.0f;
+                    }
+                }
+            } else {
+                device const ushort* wg_ptr = W_gate + gn * K + gk;
+                device const ushort* wu_ptr = W_up   + gn * K + gk;
+                FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                    sb_g_ptr[i] = bf16_bits_to_bfloat(wg_ptr[i]);
+                    sb_u_ptr[i] = bf16_bits_to_bfloat(wu_ptr[i]);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- MMA: NR=4 -> 4 rows of 8x8 tiles in M, 2 cols in N. ----
+        // sg_r=0 owns M-rows 0..31 (4 sg-tiles), sg_r=1 owns M-rows 32..63.
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K_64; ks += 8) {
+            simdgroup_bfloat8x8 ma[4];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 32 +  0) * TILE_K_64 + ks, TILE_K_64);
+            simdgroup_load(ma[1], sa + (sg_r * 32 +  8) * TILE_K_64 + ks, TILE_K_64);
+            simdgroup_load(ma[2], sa + (sg_r * 32 + 16) * TILE_K_64 + ks, TILE_K_64);
+            simdgroup_load(ma[3], sa + (sg_r * 32 + 24) * TILE_K_64 + ks, TILE_K_64);
+
+            // Gate B tile.
+            simdgroup_bfloat8x8 mb_g[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb_g[0], sb_g + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb_g[1], sb_g + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL (ushort i = 0; i < 4; i++) {
+                simdgroup_multiply_accumulate(mc_g[i][0], ma[i], mb_g[0], mc_g[i][0]);
+                simdgroup_multiply_accumulate(mc_g[i][1], ma[i], mb_g[1], mc_g[i][1]);
+            }
+
+            // Up B tile (re-uses ma loads).
+            simdgroup_bfloat8x8 mb_u[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb_u[0], sb_u + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb_u[1], sb_u + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL (ushort i = 0; i < 4; i++) {
+                simdgroup_multiply_accumulate(mc_u[i][0], ma[i], mb_u[0], mc_u[i][0]);
+                simdgroup_multiply_accumulate(mc_u[i][1], ma[i], mb_u[1], mc_u[i][1]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ---- SwiGLU epilogue. Per SG: 4x2 = 8 sg-tiles for gate + 8 for up.
+    // Scratch needed per SG: 8 * 64 = 512 floats for gate + 512 for up = 1024 floats
+    // = 4 KB per SG. 4 SGs -> 16 KB total scratch. Exactly matches our 16 KB shmem.
+    // Layout:
+    //   sc_gate: floats 0..2047       (4 SGs * 512 each)
+    //   sc_up:   floats 2048..4095    (4 SGs * 512 each)
+    threadgroup float* sc_gate = (threadgroup float*)shmem_gus_bf16_nr4;
+    threadgroup float* sc_up   = (threadgroup float*)shmem_gus_bf16_nr4 + 4 * 512;
+    threadgroup float* my_sc_gate = sc_gate + sgitg * 512;
+    threadgroup float* my_sc_up   = sc_up   + sgitg * 512;
+
+    // Each SG's 32x16 output sub-tile is laid out as a 32-row x 16-col block
+    // of floats in scratch. sg-tile (i,j) lives at offset (i*8) * 16 + j*8.
+    FOR_UNROLL (ushort i = 0; i < 4; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++) {
+            simdgroup_store(mc_g[i][j], my_sc_gate + (i * 8) * 16 + (j * 8), 16);
+            simdgroup_store(mc_u[i][j], my_sc_up   + (i * 8) * 16 + (j * 8), 16);
+        }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Output sub-tile is 32 rows x 16 cols = 512 elements per SG. 32 lanes
+    // write 16 elements each.
+    uint sg_m_base = tile_m_start + sg_r * 32;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+
+    ushort lane = tiitg % 32;
+    if (FC_BC_M || FC_BC_N) {
+        for (ushort idx = lane; idx < 512; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            if (gm < M && gn < N) {
+                float g = my_sc_gate[local_m * 16 + local_n];
+                float u = my_sc_up  [local_m * 16 + local_n];
+                float sig = 1.0f / (1.0f + exp(-g));
+                Y[gm * N + gn] = g * sig * u;
+            }
+        }
+    } else {
+        for (ushort idx = lane; idx < 512; idx += 32) {
+            ushort local_m = idx / 16;
+            ushort local_n = idx % 16;
+            uint gm = sg_m_base + local_m;
+            uint gn = sg_n_base + local_n;
+            float g = my_sc_gate[local_m * 16 + local_n];
+            float u = my_sc_up  [local_m * 16 + local_n];
+            float sig = 1.0f / (1.0f + exp(-g));
+            Y[gm * N + gn] = g * sig * u;
+        }
+    }
+}
+
+// ============================================================================
+// tiled_matmul_bf16_k64_qkv_gate_paired
+//
+// Pair-packed BF16 GEMM for the GDN qkv-proj + attn-gate-proj pair. The two
+// weight tensors are concatenated along the output (N) dimension at load time
+// into a single virtual matrix `W_combined[N_total = N_qkv + N_gate, K]`. The
+// concatenated tensor is byte-permuted into the stripe layout
+// (`repack_bf16_qkv_gate_concat` in `repack_bf16.rs`):
+//
+//   stripe_stride (bytes) = (K / 64) * 4096
+//   block_base            = row_group * stripe_stride + k_block * 4096
+//   row_tile              = block_base + r * 128   (32 rows x 128 bytes each)
+//
+// The kernel dispatches over `(N_total / TILE_N) x (M / TILE_M)`. The output
+// goes to `Y_qkv[M, N_qkv]` when `gn < N_qkv`, otherwise to
+// `Y_gate[M, N_qkv .. N_total]` at offset `gn - N_qkv`. Two output buffers
+// preserve the existing downstream consumers (qkv_buf and gate_all_buf)
+// without requiring a separate split pass.
+//
+// Algorithm is bit-identical to two separate `tiled_matmul_bf16_k64`
+// dispatches against `W_qkv` and `W_gate`: identical MMA loop, identical
+// accumulator type, identical FMA order. Only the B-side load addressing
+// and the writeback target branch differ. The (concatenated, then striped)
+// byte arrangement preserves every BF16 weight verbatim.
+//
+// Performance mechanism:
+// 1. X is loaded into shmem ONCE per K-tile and reused across both projections,
+//    halving the L1/L2 read traffic for `normed_buf` in Phase 1.
+// 2. The W buffer is a single contiguous allocation: better TLB locality vs
+//    two separate buffer allocations.
+// 3. A single grid dispatch eliminates one dispatch overhead per GDN layer.
+//
+// VRAM cost: 96 MB per GDN layer x 24 layers = 2.3 GB extra resident. Well
+// under the Apple AGX TLB threshold (4.8 GB).
+// ============================================================================
+
+kernel void tiled_matmul_bf16_k64_qkv_gate_paired(
+    device const ushort* W       [[buffer(0)]],   // Concat-then-stripe BF16 weights
+    device const float*  X       [[buffer(1)]],   // [M, K] normed input
+    device float*        Y_qkv   [[buffer(2)]],   // [M, N_qkv] qkv output
+    device float*        Y_gate  [[buffer(3)]],   // [M, N_gate] attn_gate output
+    constant uint&       M       [[buffer(4)]],
+    constant uint&       N_qkv   [[buffer(5)]],
+    constant uint&       N_gate  [[buffer(6)]],
+    constant uint&       K       [[buffer(7)]],
+    uint2 tg_pos                  [[threadgroup_position_in_grid]],
+    ushort tiitg                  [[thread_index_in_threadgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup bfloat shmem_bf16_k64qg[4096];
+    threadgroup bfloat* sa = shmem_bf16_k64qg;
+    threadgroup bfloat* sb = shmem_bf16_k64qg + TILE_M * TILE_K_64;
+
+    uint N_total = N_qkv + N_gate;
+
+    uint tile_m_start = tg_pos.y * TILE_M;
+    uint tile_n_start = tg_pos.x * TILE_N;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    // Packed-layout stripe parameters. tile_n_start is always a multiple of
+    // TILE_N=32 (one row-group per N-tile); k_block index = kt directly.
+    uint num_k_tiles = (K + TILE_K_64 - 1) / TILE_K_64;
+    // stripe_stride in BF16 elements (W is `ushort*`, advance in elements).
+    // 4096 bytes / 2 bytes/elem = 2048 elements per (rg, kb).
+    uint stripe_stride_elems = num_k_tiles * 2048u;
+    uint row_group = tile_n_start / 32u;
+    uint rg_base_elems = row_group * stripe_stride_elems;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K_64;
+
+        // ---- Load A tile (X): identical to row-major k64 path. ----
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 4;
+
+            uint gm = tile_m_start + row;
+            uint gk = k_base + k_start;
+            threadgroup bfloat* sa_ptr = sa + row * TILE_K_64 + k_start;
+
+            if (FC_BC_M || FC_BC_K) {
+                if (gm < M && gk + 15 < K) {
+                    device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                    float4 v0 = x_ptr[0];
+                    float4 v1 = x_ptr[1];
+                    float4 v2 = x_ptr[2];
+                    float4 v3 = x_ptr[3];
+                    sa_ptr[0]  = (bfloat)v0.x; sa_ptr[1]  = (bfloat)v0.y;
+                    sa_ptr[2]  = (bfloat)v0.z; sa_ptr[3]  = (bfloat)v0.w;
+                    sa_ptr[4]  = (bfloat)v1.x; sa_ptr[5]  = (bfloat)v1.y;
+                    sa_ptr[6]  = (bfloat)v1.z; sa_ptr[7]  = (bfloat)v1.w;
+                    sa_ptr[8]  = (bfloat)v2.x; sa_ptr[9]  = (bfloat)v2.y;
+                    sa_ptr[10] = (bfloat)v2.z; sa_ptr[11] = (bfloat)v2.w;
+                    sa_ptr[12] = (bfloat)v3.x; sa_ptr[13] = (bfloat)v3.y;
+                    sa_ptr[14] = (bfloat)v3.z; sa_ptr[15] = (bfloat)v3.w;
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sa_ptr[i] = (gm < M && gk_i < K) ? (bfloat)X[gm * K + gk_i] : (bfloat)0.0f;
+                    }
+                }
+            } else {
+                device const float4* x_ptr = (device const float4*)(X + gm * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                float4 v2 = x_ptr[2];
+                float4 v3 = x_ptr[3];
+                sa_ptr[0]  = (bfloat)v0.x; sa_ptr[1]  = (bfloat)v0.y;
+                sa_ptr[2]  = (bfloat)v0.z; sa_ptr[3]  = (bfloat)v0.w;
+                sa_ptr[4]  = (bfloat)v1.x; sa_ptr[5]  = (bfloat)v1.y;
+                sa_ptr[6]  = (bfloat)v1.z; sa_ptr[7]  = (bfloat)v1.w;
+                sa_ptr[8]  = (bfloat)v2.x; sa_ptr[9]  = (bfloat)v2.y;
+                sa_ptr[10] = (bfloat)v2.z; sa_ptr[11] = (bfloat)v2.w;
+                sa_ptr[12] = (bfloat)v3.x; sa_ptr[13] = (bfloat)v3.y;
+                sa_ptr[14] = (bfloat)v3.z; sa_ptr[15] = (bfloat)v3.w;
+            }
+        }
+
+        // ---- Load B tile from PACKED layout: 32 rows x 64 K-elems. ----
+        // Block base in BF16 element offsets.
+        //   block_base_elems = rg_base_elems + kt * 2048
+        //   row_tile_elems   = block_base_elems + n_local * 64
+        //   load_start_elems = row_tile_elems + k_start
+        {
+            ushort n_local = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 4;
+
+            uint block_base_elems = rg_base_elems + kt * 2048u;
+            uint row_tile_elems = block_base_elems + n_local * 64u;
+
+            uint gn = tile_n_start + n_local;
+            uint gk = k_base + k_start;
+            threadgroup bfloat* sb_ptr = sb + n_local * TILE_K_64 + k_start;
+
+            if (FC_BC_N || FC_BC_K) {
+                if (gn < N_total && gk + 15 < K) {
+                    device const ushort* w_ptr = W + row_tile_elems + k_start;
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        sb_ptr[i] = bf16_bits_to_bfloat(w_ptr[i]);
+                    }
+                } else {
+                    FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                        uint gk_i = gk + i;
+                        sb_ptr[i] = (gn < N_total && gk_i < K)
+                            ? bf16_bits_to_bfloat(W[row_tile_elems + k_start + i])
+                            : (bfloat)0.0f;
+                    }
+                }
+            } else {
+                device const ushort* w_ptr = W + row_tile_elems + k_start;
+                FOR_UNROLL (ushort i = 0; i < 16; i++) {
+                    sb_ptr[i] = bf16_bits_to_bfloat(w_ptr[i]);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- MMA: identical to row-major k64 path. ----
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K_64; ks += 8) {
+            simdgroup_bfloat8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K_64 + ks, TILE_K_64);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K_64 + ks, TILE_K_64);
+
+            simdgroup_bfloat8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K_64 + ks, TILE_K_64, ulong2(0,0), true);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ---- Split writeback: route by row-group (whole tile lives in one output). ----
+    // Whole row-group lies entirely in either Y_qkv (if its first row is
+    // strictly below N_qkv) or entirely in Y_gate (if its first row is at or
+    // above N_qkv). The repack invariant requires N_qkv % TILE_N == 0 so
+    // there is never a split row-group; this is also asserted host-side.
+    // Storing the per-tile accumulators to a single shmem scratch and reading
+    // back from a single branch per (gm, gn) keeps the writeback path
+    // identical in cost to the un-paired residual kernel.
+    uint sg_m_base = tile_m_start + sg_r * 16;
+    uint sg_n_base = tile_n_start + sg_c * 16;
+    {
+        threadgroup float* sc = (threadgroup float*)shmem_bf16_k64qg;
+        threadgroup float* my_sc = sc + sgitg * 256;
+        FOR_UNROLL (ushort i = 0; i < 2; i++)
+            FOR_UNROLL (ushort j = 0; j < 2; j++)
+                simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ushort lane = tiitg % 32;
+        bool is_gate_tile = tile_n_start >= N_qkv;
+        if (FC_BC_M || FC_BC_N) {
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                if (gm < M) {
+                    float val = my_sc[local_m * 16 + local_n];
+                    if (!is_gate_tile) {
+                        if (gn < N_qkv) {
+                            Y_qkv[gm * N_qkv + gn] = val;
+                        }
+                    } else {
+                        uint gn_gate = gn - N_qkv;
+                        if (gn_gate < N_gate) {
+                            Y_gate[gm * N_gate + gn_gate] = val;
+                        }
+                    }
+                }
+            }
+        } else {
+            for (ushort idx = lane; idx < 256; idx += 32) {
+                ushort local_m = idx / 16;
+                ushort local_n = idx % 16;
+                uint gm = sg_m_base + local_m;
+                uint gn = sg_n_base + local_n;
+                float val = my_sc[local_m * 16 + local_n];
+                if (!is_gate_tile) {
+                    Y_qkv[gm * N_qkv + gn] = val;
+                } else {
+                    Y_gate[gm * N_gate + (gn - N_qkv)] = val;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// bf16_paired_warmup
+//
+// Minimal warmup kernel for the BF16 GDN paired repack buffer. Dispatched
+// once per `lumen` process at the tail of `preload_weights_gpu_resident` to
+// force Apple's Metal driver to commit the GPU page-table mapping for the
+// 96 MB packed buffer per GDN layer. Without this warmup, the FIRST production
+// paired dispatch in each fresh process must pay a one-time ~280 ms cost
+//
+// Algorithm: a SINGLE thread reads the first BF16 element of the buffer and
+// accumulates into a sink that is forced live by writing to `out_sink[0]`.
+// The read is necessary so the compiler cannot eliminate the load; the write
+// to the sink is necessary so the compiler cannot eliminate the kernel.
+// Cost: O(1) per layer, ~1µs per dispatch.
+//
+// Dispatch: one threadgroup of (1, 1, 1) per layer. Grid = (1, 1, 1).
+// ============================================================================
+
+kernel void bf16_paired_warmup(
+    device const ushort* W      [[buffer(0)]],
+    device float*        sink   [[buffer(1)]],
+    uint tid                     [[thread_position_in_grid]])
+{
+    if (tid == 0) {
+        bfloat first = bf16_bits_to_bfloat(W[0]);
+        sink[0] = (float)first;
+    }
+}

@@ -1,5 +1,6 @@
 use crate::help::print_convert_usage;
 
+use lumen_convert::convert::ConvertTarget;
 use lumen_format::quantization::QuantScheme;
 use std::path::Path;
 
@@ -10,6 +11,11 @@ pub(crate) fn convert_cmd(args: &[String]) {
     let mut output_path: Option<String> = None;
     let mut dequantize = false;
     let mut requant: Option<QuantScheme> = None;
+    // Default convert target follows the host OS: on macOS we want Metal
+    // K-quant upcast so any Q6_K layer tensor in the source GGUF lands as
+    // Q8_0 in the LBC (Metal backend has no K-quant kernels). On Linux
+    // (CUDA host) we keep the legacy Generic behaviour.
+    let mut target: ConvertTarget = default_target_for_host();
 
     let mut i = 0;
     while i < args.len() {
@@ -42,6 +48,21 @@ pub(crate) fn convert_cmd(args: &[String]) {
                     "q8_0" | "q8" => Some(QuantScheme::Q8_0),
                     other => {
                         eprintln!("Error: unsupported requant target: {other} (supported: q4_0, q8_0)");
+                        std::process::exit(1);
+                    }
+                };
+            }
+            "--target" => {
+                i += 1;
+                let val = args.get(i).unwrap_or_else(|| {
+                    eprintln!("Error: --target requires a value (metal | generic)");
+                    std::process::exit(1);
+                });
+                target = match val.to_lowercase().as_str() {
+                    "metal" => ConvertTarget::Metal,
+                    "generic" | "cuda" => ConvertTarget::Generic,
+                    other => {
+                        eprintln!("Error: unsupported target: {other} (supported: metal, generic)");
                         std::process::exit(1);
                     }
                 };
@@ -83,9 +104,10 @@ pub(crate) fn convert_cmd(args: &[String]) {
         alignment: 128 * 1024,
         dequantize_to_f32: dequantize,
         requant_to: requant,
+        target,
     };
 
-    println!("Converting: {input_path} -> {output_path}");
+    println!("Converting: {input_path} -> {output_path} (target={target:?})");
 
     match convert_gguf_to_lbc(input, Path::new(&output_path), &opts) {
         Ok(stats) => {
@@ -97,4 +119,20 @@ pub(crate) fn convert_cmd(args: &[String]) {
             std::process::exit(1);
         }
     }
+}
+
+/// Pick the default `ConvertTarget` for the host the converter is running on.
+///
+/// On macOS the only available GPU backend is Metal, and Metal has no
+/// K-quant dispatch kernels. So we default to `Metal` to ensure any K-quant
+/// layer tensor (e.g. the Q6_K `attn_q` in the Q4 MoE-30B GGUF) gets upcast to Q8_0 at convert
+/// time -- matches what CUDA's K-quant dequant kernels do implicitly.
+///
+/// On Linux/Windows the host is presumed to be CUDA-capable, so we keep
+/// the legacy `Generic` behaviour (K-quant layer tensors pass through).
+pub(crate) fn default_target_for_host() -> ConvertTarget {
+    #[cfg(target_os = "macos")]
+    { ConvertTarget::Metal }
+    #[cfg(not(target_os = "macos"))]
+    { ConvertTarget::Generic }
 }

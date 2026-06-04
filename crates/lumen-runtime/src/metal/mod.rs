@@ -1,5 +1,15 @@
 //! Metal GPU F32 compute backend for Apple Silicon.
 //!
+//! Metal inference is active and validated against the CPU and HF FP16
+//! references. The default-on Metal opt-ins deliver Q8 prefill at 0.95× the
+//! llama.cpp baseline, BF16 prefill at 0.96× the baseline, and decode that
+//! beats the baseline on Q8/Q4.
+//!
+//! The `qwen35moe` Metal-only forward path is retained as a reference for
+//! the future CUDA MoE implementation.
+//!
+//! ---
+//!
 //! Implements `ComputeBackend` using Metal GPU compute shaders. On Apple Silicon
 //! unified memory, weight data from mmap is already in GPU-accessible memory,
 //! enabling zero-copy weight access via `MTLBuffer(bytesNoCopy:)`.
@@ -17,18 +27,38 @@
 //! - Activation buffers: Metal shared-mode buffers (CPU/GPU zero-copy)
 
 pub(crate) mod ffi;
+// Apple MPSGraph BF16 GEMM bindings (env-gated opt-in path).
+// Provides `MpsGraphContext` + `encode_bf16_matmul_to_command_buffer`
+// for the GDN qkv-proj and ssm-out matmuls when
+// `LUMEN_METAL_BF16_MPS=1`. Default OFF.
+pub(crate) mod mps_graph_ffi;
 pub(crate) mod shaders;
 pub(crate) mod io;
 mod decode_greedy;
 mod decode_single_cb;
+// disk-KV sync helpers (GPU<->CPU KV mirror + GDN state).
+mod disk_sync;
 mod gdn;
 mod gpu_resident;
+mod graph_reorder;
 mod moe;
 mod pipelines;
 mod prefill;
 mod prefill_encode;
+pub(crate) mod profile;
+// runtime Q8_0 hot-weight repack for FFN tensors (env-gated).
+pub(crate) mod repack_q8;
+// runtime Q4_0 hot-weight repack (Q4 port of), env-gated.
+pub(crate) mod repack_q4;
+// runtime BF16 GDN qkv+attn_gate concat-then-stripe repack
+// (24-GDN-layer subset under the 4.8 GB Apple AGX TLB threshold), env-gated.
+pub(crate) mod repack_bf16;
 pub(crate) mod types;
 mod backend_impl;
+// ssm_out_gemm microbench: standalone perf harness for the GDN hot-spot.
+// Exposes a single `#[doc(hidden)] pub fn run_ssm_out_microbench` entry
+// point; no production code path touches this module.
+pub mod ssm_out_microbench;
 pub use types::*;
 
 use crate::weight::cache::LayerView;
@@ -45,10 +75,68 @@ use lumen_format::quantization::QuantScheme;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Page size for alignment checks (4 KiB on all Apple Silicon).
 const PAGE_SIZE: usize = 4096;
+
+/// Per-process cached resolver for `LUMEN_METAL_DECODE_DELAY_US`.
+///
+/// Falls through to `runtime_defaults::metal_decode_delay_us_default()` when
+/// the env var is unset (server → 50 µs, CLI → 0). An explicit env value
+/// always wins so A/B benchmark drivers and CI can pin it. The `OnceLock`
+/// cache keeps the hot decode path to a single integer load after the first
+/// decode token of the process.
+fn metal_decode_delay_us() -> u64 {
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("LUMEN_METAL_DECODE_DELAY_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(crate::runtime_defaults::metal_decode_delay_us_default)
+    })
+}
+
+/// Apply the decode-delay after a per-token `commit_and_wait()`.
+///
+/// When the resolved delay is `0` this is a single integer load + branch with
+/// no syscall — the path stays bit-exact and the only cost is one comparison.
+/// When non-zero it issues a CPU `thread::sleep` for the configured number of
+/// microseconds, which stabilises the GPU-scheduler wall-clock window that
+/// otherwise lets a near-tie top-1/top-2 logit pair resolve differently across
+/// repeated in-process decode calls (greedy-decode determinism guard).
+#[inline(always)]
+fn maybe_apply_metal_decode_delay() {
+    let delay_us = metal_decode_delay_us();
+    if delay_us > 0 {
+        std::thread::sleep(std::time::Duration::from_micros(delay_us));
+    }
+}
+
+/// Env-var gated opt-in: use the ggml-metal-ported Q8_0 × F32 GEMM kernel.
+///
+/// When `LUMEN_METAL_GEMM_GGML_PORT=1` (or any non-empty value), Lumen swaps
+/// the Q8_0 prefill GEMM dispatch from the in-tree `dequant_tiled_matmul_q8_0_k64`
+/// to the upstream-derived `kernel_mul_mm_q8_0_f32_ported` (see
+/// `shaders/gemm_q8_0_ported.msl`). Default OFF.
+///
+/// Resolved once at startup (atomic) so dispatch sites don't pay an env lookup.
+#[inline]
+pub(crate) fn use_ggml_ported_q8_0_gemm() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // 0 = unknown, 1 = false, 2 = true
+    static CACHE: AtomicU8 = AtomicU8::new(0);
+    let cur = CACHE.load(Ordering::Relaxed);
+    if cur != 0 {
+        return cur == 2;
+    }
+    let v = std::env::var("LUMEN_METAL_GEMM_GGML_PORT")
+        .map(|s| !s.is_empty() && s != "0")
+        .unwrap_or(false);
+    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+    v
+}
 
 /// Async expert prefetch state for one-layer lookahead.
 ///
@@ -86,7 +174,15 @@ pub struct MetalF32Backend {
     final_norm_buf: Option<MetalBuffer>,
     output_proj_buf: Option<MetalBuffer>,
 
-    // Keep CPU copies for set_global_tensors / embed_token fallback
+    // CPU F32 copies of the global tensors (set via set_global_tensors).
+    //
+    // `final_norm` is always retained (tiny). For QUANTIZED models (Q8_0/Q4_0/
+    // F16/BF16) `init()` builds the GPU embedding/output_proj buffers from the
+    // raw native-quant bytes and then FREES `embedding`/`output_proj` (sets them
+    // to empty Vecs) — every reachable Metal path reads the GPU buffers or the
+    // raw bytes, never these F32 Vecs, so retaining them wasted ~4 GB. They stay
+    // populated ONLY for non-quantized (pure-F32) models, where `init()` uploads
+    // them directly and the embed_token CPU fallback may index `embedding`.
     embedding: Vec<f32>,
     final_norm: Vec<f32>,
     output_proj: Vec<f32>,
@@ -210,7 +306,7 @@ pub struct MetalF32Backend {
 impl MetalF32Backend {
     /// Create a new Metal compute backend.
     ///
-    /// Returns an error if Metal is not available.
+    /// Returns an error if Metal is not available on this system.
     pub fn new() -> Result<Self, RuntimeError> {
         let device = MetalDevice::system_default().ok_or_else(|| {
             RuntimeError::Compute("Metal GPU not available on this system".into())
@@ -219,6 +315,10 @@ impl MetalF32Backend {
         let queue = device.new_command_queue().ok_or_else(|| {
             RuntimeError::Compute("Failed to create Metal command queue".into())
         })?;
+
+        // Pick up LUMEN_METAL_PROFILE=1 if set in the environment. The
+        // CLI's `--profile` flag also routes through `set_profile()`.
+        profile::init_from_env();
 
         // Attempt to create a Metal IO command queue (Metal 3 / macOS 13+).
         // This enables direct NVMe-to-GPU DMA for streaming expert loading.
@@ -319,8 +419,10 @@ impl MetalF32Backend {
     ///
     /// When called, compute_final() will use the fused dequant_matmul_q8_0
     /// kernel instead of matmul_f32, reducing bandwidth 3.76x.
-    /// The F32 `output_proj` from set_global_tensors is still needed for
-    /// CPU-side embed_token (if output_proj is tied to embedding).
+    /// For quantized output_proj the F32 `self.output_proj` from
+    /// set_global_tensors is dead and is freed in `init()` once the GPU
+    /// buffer is built — weight tying reuses the embedding GPU buffer offset
+    /// and never reads the F32 Vec.
     pub fn set_output_proj_q8(&mut self, raw_bytes: Vec<u8>, quant: QuantScheme) {
         self.output_proj_quant = quant;
         self.output_proj_raw = Some(raw_bytes);
@@ -329,6 +431,24 @@ impl MetalF32Backend {
     /// Get the device name (for diagnostics).
     pub fn device_name(&self) -> String {
         self.device.name()
+    }
+
+    /// Current Metal-driver-reported allocated bytes for THIS
+    /// backend's MTLDevice (in-process).
+    ///
+    /// Returns the same figure as `MTLDevice.currentAllocatedSize` — total
+    /// bytes outstanding for all MTLBuffer / MTLTexture / MTLHeap objects
+    /// the process holds. On Apple Silicon unified memory this is the
+    /// authoritative measure of GPU residency; on the soak-harness host
+    /// process it captures the lumen-server's own footprint (an external
+    /// Swift probe would see its own process's allocations, not the
+    /// server's).
+    ///
+    /// Used by the `/debug/memory_breakdown` server endpoint to
+    /// distinguish "Metal driver state" growth from "Rust heap state"
+    /// growth in the long-session RSS leak root-cause hunt.
+    pub fn current_allocated_bytes(&self) -> u64 {
+        self.device.current_allocated_size()
     }
 
     /// Upload f32 data to a GPU buffer.

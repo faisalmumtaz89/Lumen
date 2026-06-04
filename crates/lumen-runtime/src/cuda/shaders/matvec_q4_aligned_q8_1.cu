@@ -36,7 +36,7 @@
 //   - Same dp4a core as the unaligned version
 //
 // Architecture: NR=4 rows per block, 256 threads (8 warps).
-// Requires compute capability >= 6.1 for __dp4a() (Pascal+).
+// Requires compute capability >= 6.1 for dp4a_s32() (Pascal+).
 // in_dim must be a multiple of 32 (Q4_0 block size).
 //
 // Two kernels:
@@ -62,6 +62,15 @@ __device__ __forceinline__ float f16_bits_to_f32(unsigned short bits) {
     float result;
     asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(bits));
     return result;
+}
+
+// inline-PTX dp4a wrapper. The `__dp4a` intrinsic NVRTC-fails in
+// this build env (driver 580.126.20 / CUDA 12.2 / sm_80). The inline
+// `dp4a.s32.s32` opcode loads cleanly on compute_80.
+__device__ __forceinline__ int dp4a_s32(int a, int b, int c) {
+    int d;
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
 }
 
 // Warp-level reduction: sum all lanes in a warp using butterfly shuffle.
@@ -172,8 +181,8 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_ali
                 unsigned int packed = w_nibbles[k];
                 int w_lo, w_hi;
                 unpack_nibbles_4bytes_deinterleaved(packed, w_lo, w_hi);
-                acc = __dp4a(w_lo, xv[k],     acc);
-                acc = __dp4a(w_hi, xv[k + 4], acc);
+                acc = dp4a_s32(w_lo, xv[k],     acc);
+                acc = dp4a_s32(w_hi, xv[k + 4], acc);
             }
 
             // Combined result with zero-point correction:
@@ -279,8 +288,8 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_ali
                 unsigned int packed = w_nibbles[k];
                 int w_lo, w_hi;
                 unpack_nibbles_4bytes_deinterleaved(packed, w_lo, w_hi);
-                acc = __dp4a(w_lo, xv[k],     acc);
-                acc = __dp4a(w_hi, xv[k + 4], acc);
+                acc = dp4a_s32(w_lo, xv[k],     acc);
+                acc = dp4a_s32(w_hi, xv[k + 4], acc);
             }
 
             sumf[row] += w_scale * (x_scale * (float)acc - 8.0f * x_sum);

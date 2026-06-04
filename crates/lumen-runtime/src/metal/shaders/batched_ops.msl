@@ -206,6 +206,19 @@ kernel void add_residual_batched(
     dst[gid] += src[gid];
 }
 
+// Determinism diagnostic: zero a half-precision buffer of `len` elements.
+// Used (env-gated) to clear the batched-attention scores buffer before each
+// attention block, to test whether stale/uninitialized scores reads are the
+// prefill non-determinism source.
+kernel void memset_half_zero(
+    device half*   dst [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid           [[thread_position_in_grid]])
+{
+    if (gid >= len) return;
+    dst[gid] = (half)0.0h;
+}
+
 // ============================================================================
 // swiglu_batched: Fused SiLU(gate) * up for batched activations
 //
@@ -269,6 +282,32 @@ kernel void embed_tokens_batched_f16(
 
     uint tok = token_ids[token_idx];
     out[gid] = float(embedding_f16[tok * hidden_dim + dim_idx]);
+}
+
+// ============================================================================
+// embed_tokens_batched_bf16: BF16 batch token embedding lookup (prefill)
+//
+// Reads bfloat16 embedding as u16 raw bits, converts to F32 via the
+// `bits << 16` reinterpret (matches host-side `bf16_to_f32`).
+// ============================================================================
+
+kernel void embed_tokens_batched_bf16(
+    device const ushort* embedding_bf16 [[buffer(0)]],
+    device float*        out            [[buffer(1)]],
+    device const uint*   token_ids      [[buffer(2)]],
+    constant uint&       hidden_dim     [[buffer(3)]],
+    constant uint&       batch_size     [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch_size * hidden_dim;
+    if (gid >= total) return;
+
+    uint token_idx = gid / hidden_dim;
+    uint dim_idx   = gid % hidden_dim;
+
+    uint tok = token_ids[token_idx];
+    ushort bits = embedding_bf16[tok * hidden_dim + dim_idx];
+    out[gid] = as_type<float>((uint(bits)) << 16);
 }
 
 // ============================================================================

@@ -1,8 +1,8 @@
-// Q8_0 matrix-vector multiply (GEMV) dp4a: INT8 dot product via __dp4a().
+// Q8_0 matrix-vector multiply (GEMV) dp4a: INT8 dot product via dp4a_s32().
 //
 // Key optimization: instead of dequantizing int8 weights to float and doing
 // float multiply-accumulate, we quantize x on-the-fly to int8 (Q8_1 style)
-// and use __dp4a() for native INT8 dot products. This is the same approach
+// and use dp4a_s32() for native INT8 dot products. This is the same approach
 // used for efficient Q8_0 x Q8_1 CUDA decode.
 //
 // Per Q8_0 block (32 elements):
@@ -13,7 +13,7 @@
 //      x_scale = x_amax / 127.0
 //      x_q[i] = round(x[i] / x_scale)   (clamped to [-127, 127])
 //   4. Pack 4 x_q values into int32
-//   5. Use __dp4a(w_packed, x_packed, acc) for 4 products at once
+//   5. Use dp4a_s32(w_packed, x_packed, acc) for 4 products at once
 //      (8 dp4a calls per block = 32 products)
 //   6. Final: sum += w_scale * x_scale * (float)acc
 //
@@ -35,7 +35,7 @@
 // Input vector:  [in_dim] f32
 // Output vector: [out_dim] f32
 //
-// Requires compute capability >= 6.1 for __dp4a() (Pascal+).
+// Requires compute capability >= 6.1 for dp4a_s32() (Pascal+).
 //
 // in_dim must be a multiple of Q8_0_BLOCK_SIZE (32).
 //
@@ -56,6 +56,15 @@ __device__ __forceinline__ float f16_bits_to_f32(unsigned short bits) {
     return result;
 }
 
+// inline-PTX dp4a wrapper. The `__dp4a` intrinsic NVRTC-fails in
+// this build env (driver 580.126.20 / CUDA 12.2 / sm_80). The inline
+// `dp4a.s32.s32` opcode loads cleanly on compute_80.
+__device__ __forceinline__ int dp4a_s32(int a, int b, int c) {
+    int d;
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+
 // Warp-level reduction: sum all lanes in a warp using butterfly shuffle.
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     val += __shfl_xor_sync(0xffffffff, val, 16);
@@ -66,7 +75,7 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
-// Pack 4 signed bytes into one int32 for __dp4a().
+// Pack 4 signed bytes into one int32 for dp4a_s32().
 // dp4a interprets each byte of the int32 as a signed 8-bit integer.
 __device__ __forceinline__ int pack_i8x4(int a, int b, int c, int d) {
     return (a & 0xFF) | ((b & 0xFF) << 8) | ((c & 0xFF) << 16) | ((d & 0xFF) << 24);
@@ -176,7 +185,7 @@ extern "C" __global__ void matvec_q8_0_dp4a(
             #pragma unroll
             for (int k = 0; k < 8; k++) {
                 int w_word = (int)w16[k * 2] | ((int)w16[k * 2 + 1] << 16);
-                acc = __dp4a(w_word, x_packed[k], acc);
+                acc = dp4a_s32(w_word, x_packed[k], acc);
             }
 
             // Combined scale: w_scale * x_scale * int_dot_product
@@ -317,7 +326,7 @@ extern "C" __global__ void matvec_q8_0_dp4a_residual(
             #pragma unroll
             for (int k = 0; k < 8; k++) {
                 int w_word = (int)w16[k * 2] | ((int)w16[k * 2 + 1] << 16);
-                acc = __dp4a(w_word, x_packed[k], acc);
+                acc = dp4a_s32(w_word, x_packed[k], acc);
             }
 
             sumf[row] += w_scale * x_scale * (float)acc;

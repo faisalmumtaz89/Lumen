@@ -349,7 +349,7 @@ kernel void dequant_matmul_q8_0_residual_4row(
 }
 
 // ============================================================================
-// dequant_matmul_q8_0_deferred: Deferred-reduction Q8_0 matvec (llama.cpp pattern)
+// dequant_matmul_q8_0_deferred: Deferred-reduction Q8_0 matvec
 //
 // Key insight: Instead of calling simd_sum() once per Q8_0 block (64 syncs for
 // hidden_dim=2048), each thread processes NQ=8 elements from the SAME block

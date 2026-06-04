@@ -1,6 +1,6 @@
 // STATUS: DISABLED — regressive on A100. 75% lane waste (8 of 32 lanes active per
 // K-tile iteration). Decode 30% slower than v1. Needs redesign: wider tiles or
-// different thread mapping. See tracker.md Wave C8.
+// different thread mapping.
 //
 // matvec_q8_0_v4: High-throughput Q8_0 matrix-vector multiply for CUDA (SM 6.1+)
 //
@@ -17,7 +17,7 @@
 //   [f16 scale (2 bytes)] [32 x int8 quantized values (32 bytes)]
 //   dequantized value = scale * (float)int8_val
 //
-// Dispatch: grid = (ceil(out_dim / NR),), block = (BLOCK_DIM,)
+// Dispatch: grid = (ceil(out_dim / NR)), block = (BLOCK_DIM)
 //
 // Performance target: ~65-70% DRAM bandwidth utilization on A100 (2 TB/s)
 // via dp4a INT8 compute + cooperative x quantization + coalesced weight loads.
@@ -36,6 +36,15 @@ __device__ __forceinline__ float f16_bits_to_f32(unsigned short bits) {
     float result;
     asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(bits));
     return result;
+}
+
+// inline-PTX dp4a wrapper. The `__dp4a` intrinsic NVRTC-fails in
+// this build env (driver 580.126.20 / CUDA 12.2 / sm_80). The inline
+// `dp4a.s32.s32` opcode loads cleanly on compute_80.
+__device__ __forceinline__ int dp4a_s32(int a, int b, int c) {
+    int d;
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
 }
 
 // Quantize a single float to int8 given inverse scale, clamp to [-127, 127]
@@ -225,7 +234,7 @@ extern "C" __global__ void matvec_q8_0_v4(
                               | ((int)(signed char)wq[i * 4 + 2] << 16)
                               | ((int)(signed char)wq[i * 4 + 3] << 24);
 
-                    dp_sum = __dp4a(w_word, x_packed[b * 8 + i], dp_sum);
+                    dp_sum = dp4a_s32(w_word, x_packed[b * 8 + i], dp_sum);
                 }
 
                 // Scale correction: result = w_scale * x_scale * dp4a_sum
@@ -379,7 +388,7 @@ extern "C" __global__ void matvec_q8_0_v4_residual(
                               | ((int)(signed char)wq[i * 4 + 2] << 16)
                               | ((int)(signed char)wq[i * 4 + 3] << 24);
 
-                    dp_sum = __dp4a(w_word, x_packed[b * 8 + i], dp_sum);
+                    dp_sum = dp4a_s32(w_word, x_packed[b * 8 + i], dp_sum);
                 }
 
                 float x_scale = x_scales[b];
