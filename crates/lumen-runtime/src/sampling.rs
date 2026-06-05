@@ -205,7 +205,8 @@ pub struct SamplingParams {
     /// every other shaping step.
     pub temperature: f32,
 
-    /// Optional RNG seed. `None` -> use a default constant (42).
+    /// Optional RNG seed. `None` falls back to a fixed constant (42) at the
+    /// engine layer; the server/CLI inject a random-by-default seed upstream.
     pub seed: Option<u64>,
 
     /// Nucleus sampling: keep the smallest prefix of sorted tokens whose

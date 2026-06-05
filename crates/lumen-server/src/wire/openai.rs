@@ -99,9 +99,13 @@ impl ChatCompletionRequest {
         // default applies only on the server-internal codepath. When the
         // client explicitly sends `temperature=0`, greedy decoding takes
         // over and the repetition penalty is a no-op for argmax anyway.
+        //
+        // An omitted `seed` resolves to a fresh per-request random seed (the
+        // OpenAI/llama.cpp convention) so identical requests vary; pass an
+        // explicit `seed` for reproducible output.
         let sampling = SamplingParams {
             temperature: self.temperature.unwrap_or(0.7),
-            seed: self.seed,
+            seed: Some(self.seed.unwrap_or_else(super::next_random_seed)),
             repetition_penalty: Some(1.05),
             ..Default::default()
         };
@@ -155,10 +159,12 @@ impl CompletionRequest {
         let eos = engine.eos_tokens_for_request();
         let max_tokens = self.max_tokens.unwrap_or(256);
         // server-internal sampler defaults (see
-        // ChatCompletionRequest::into_job for the full rationale).
+        // ChatCompletionRequest::into_job for the full rationale). An omitted
+        // `seed` resolves to a fresh per-request random seed; pass an explicit
+        // `seed` for reproducible output.
         let sampling = SamplingParams {
             temperature: self.temperature.unwrap_or(0.7),
-            seed: self.seed,
+            seed: Some(self.seed.unwrap_or_else(super::next_random_seed)),
             repetition_penalty: Some(1.05),
             ..Default::default()
         };
@@ -335,7 +341,7 @@ async fn drive_chat_stream(
     created: u64,
     chat: bool,
 ) {
-    let id = format!("chatcmpl-lumen-{created:x}");
+    let id = format!("chatcmpl-lumen-{created:x}-{:x}", super::next_response_seq());
     let mut emitter = SseSafeEmitter::new();
     let mut stop_matcher = StopMatcher::new(Vec::new());
     let mut finish_reason: Option<FinishReason> = None;
@@ -570,7 +576,7 @@ pub async fn collect_chat(
         })
     };
     Ok(json!({
-        "id": format!("chatcmpl-lumen-{created:x}"),
+        "id": format!("chatcmpl-lumen-{created:x}-{:x}", super::next_response_seq()),
         "object": "chat.completion",
         "created": created,
         "model": model,
@@ -649,7 +655,7 @@ pub async fn collect_completion(
     text.push_str(&residual.text);
 
     Ok(json!({
-        "id": format!("cmpl-lumen-{created:x}"),
+        "id": format!("cmpl-lumen-{created:x}-{:x}", super::next_response_seq()),
         "object": "text_completion",
         "created": created,
         "model": model,

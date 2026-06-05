@@ -37,6 +37,29 @@ GET  /v1/models             # Model list
 
 Both wire formats support SSE streaming. Tool-call parsing is template-driven: v1 (current) ships the Qwen3.5 `<tool_call>` / `</tool_call>` marker pattern with a streaming parser that uses partial-marker hold-back; additional templates are registered as new model families ship. Reference embedder: [`crates/lumen-server/tests/server_integration.rs`](../crates/lumen-server/tests/server_integration.rs). Reference binary: [`crates/lumen-server/src/bin/lumen-server.rs`](../crates/lumen-server/src/bin/lumen-server.rs).
 
+## Sampling & reproducibility
+
+Sampling defaults are resolved per request from the wire payload:
+
+| Field | Default when omitted | Notes |
+|---|---|---|
+| `temperature` | `0.7` | `0` = greedy (argmax) |
+| `seed` | **fresh random per request** | so identical requests **vary** |
+| `repetition_penalty` | `1.05` (server-internal) | not exposed in the OpenAI/Anthropic request schema |
+
+The server follows the OpenAI / llama.cpp convention: **with no `seed`, every request samples from a fresh random seed, so the same prompt returns different text each time.** For reproducible output, pass an explicit `seed` (OpenAI `/v1/chat/completions` and `/v1/completions`):
+
+```bash
+# Reproducible: same seed + params => identical output. Repeat to confirm.
+curl -fsS http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"Hi"}],"seed":42,"temperature":0.7}'
+```
+
+- `temperature: 0` is greedy/deterministic **regardless of seed**.
+- The Anthropic `/v1/messages` schema has no `seed` field, so it always uses a fresh random seed (matching the upstream Anthropic API).
+- These are two independent properties: the **kernels** are byte-deterministic for fixed inputs (same seed + params ⇒ same tokens), while **sampling output varies by default** because the seed is randomized per request. Pin the `seed` to combine both into reproducible output.
+
 ## Embed as a library
 
 Custom embedders own the tokenizer and weight provider; the runtime owns the GPU.
@@ -63,4 +86,3 @@ axum::serve(listener, router).await?;
 
 - **Authorization / CORS / per-request timeout** are not implemented; deploy behind a reverse proxy that enforces auth, CORS, and request deadlines.
 - **Mid-stream client disconnect** can wedge the engine worker. Pending fix; work around with a reverse-proxy that buffers SSE responses.
-- **OpenAI chunk `id` uniqueness** under sub-second concurrent burst collides. Single-tenant deployments unaffected.

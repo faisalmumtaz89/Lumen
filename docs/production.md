@@ -38,7 +38,6 @@ Operational policy items required before production deployment:
 - **PURE-greedy long-form (≥ 512 tokens)** deterministically loops on all 4 quants. Use sampling or repetition penalty in production.
 - **`lumen-server` mid-stream client disconnect** can wedge the engine worker. Pending fix; work around with a reverse-proxy that buffers SSE responses.
 - **`lumen-server` Authorization / CORS / per-request timeout** are not implemented; deploy behind a reverse proxy that enforces auth, CORS, and request deadlines.
-- **OpenAI chunk `id` uniqueness** under sub-second concurrent burst collides. Single-tenant deployments unaffected.
 - **Lumen chat template forces `<think>\n` open for the v1 Qwen3.5 family**, the `--prompt` path on `lumen run` bypasses the template; for server use, the production behavior is the chat-templated path. Future model families will register their own chat templates without changing the dispatch layer.
 
 ## GPU memory peaks
@@ -65,9 +64,9 @@ The matrix below summarizes the validation state across operational dimensions a
 | Correctness suite | Greedy parity differs from llama.cpp (root cause: chat template) |
 | KV cache & memory | Validated (single-tenant) |
 | Long-form generation | PURE-greedy loops; BF16 first-token argmax is context-length-sensitive — pin `--context-len` |
-| Streaming & server protocol | Mid-stream disconnect can wedge the worker; OpenAI chunk `id` collides under sub-second burst |
+| Streaming & server protocol | Mid-stream disconnect can wedge the worker |
 | Concurrency & multi-request | Validated (no 503 + Retry-After backpressure header) |
 | Stability & soak | Validated (CLI per-process); a 16-client burst against `lumen run` fails by design — use `lumen-server` |
 | Error handling & edge cases | Four protocol-completeness gaps remain; deploy behind a reverse proxy |
-| Determinism & reproducibility | Validated |
+| Determinism & reproducibility | Validated — kernels byte-deterministic at a fixed seed; server + CLI randomize the seed by default, so pin `seed` / `--seed` (or `temperature 0`) to reproduce |
 | Perf parity vs llama.cpp | BF16 0.90×; Q8 / Q4 at their structural gates |

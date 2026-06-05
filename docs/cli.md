@@ -21,7 +21,7 @@ The canonical, always-up-to-date reference is `lumen run --help` (printed by [`c
 | `--temperature <f>` | Sampling temperature (0 = greedy, default 0.8) |
 | `--top-p` / `--top-k` / `--min-p` | Nucleus / top-K / min-prob cutoffs |
 | `--repetition-penalty` / `--presence-penalty` / `--frequency-penalty` | Sampling penalties |
-| `--seed <n>` | Random seed for reproducibility |
+| `--seed <n>` | Sampling seed (default: random each run; set a fixed value for reproducible output) |
 | `--cuda` / `--metal` / `--simd` | Force a backend |
 | `--cuda-device <n>` | CUDA device ordinal (default 0) |
 | `--context-len <n>` | KV cache size (auto-sized by default) |

@@ -33,3 +33,4 @@ __pycache__/
 /.claude/
 /.codecompass/
 /modal/
+codecompass.config.json

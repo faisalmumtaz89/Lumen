@@ -36,10 +36,15 @@ The BF16 mmvf kernel produces different first-token argmax at different KV-cache
 
 ## Decode output differs across identical runs
 
-Decode is byte-deterministic by default on both backends:
+**Most common cause — no seed pinned.** By default the server and `lumen run` sample with a **random seed per request/run** (the OpenAI/llama.cpp convention), so the same prompt returns different text each time. This is expected, not a bug. To reproduce a specific output:
 
-- **Metal** — the GPU races that once caused this are fixed in the kernels. No knob is required; `LUMEN_METAL_DECODE_DELAY_US` defaults to `0`.
-- **CUDA** — `lumen-server` applies `LUMEN_CUDA_DECODE_DELAY_US=50` automatically to serialize inter-step decode submission for MoE Q4; `lumen run` (CLI) defaults to `0` and is deterministic without it. If you see run-to-run variation on a CUDA server, confirm the delay has not been overridden to `0`.
+- **Server**: pass an explicit `"seed": <n>` (OpenAI `/v1/chat/completions`, `/v1/completions`) — same seed + params ⇒ identical output. (Anthropic `/v1/messages` has no seed field, so it is always randomized.)
+- **CLI**: pass `--seed <n>`, or `--temperature 0` for greedy/argmax (deterministic regardless of seed).
+
+**At a fixed seed, the kernels are byte-deterministic** on both backends:
+
+- **Metal** — the GPU races that once broke this are fixed in the kernels. No knob is required; `LUMEN_METAL_DECODE_DELAY_US` defaults to `0`.
+- **CUDA** — `lumen-server` applies `LUMEN_CUDA_DECODE_DELAY_US=50` automatically to serialize inter-step decode submission for MoE Q4; `lumen run` (CLI) defaults to `0` and is deterministic without it. If you see run-to-run variation on a CUDA server *with a pinned seed*, confirm the delay has not been overridden to `0`.
 
 ## Concurrent `lumen run` invocations time out
 

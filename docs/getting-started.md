@@ -44,10 +44,11 @@ Need Qwen3.5-9B at Q4_0 (not in the registry today)? Derive it from the Q8_0 sou
 ## 3. Run inference
 
 ```bash
-# Greedy default (deterministic; pass `--temperature 0` to make it explicit)
+# Default sampling: temperature 0.8 with a random seed — output varies each run.
+# For reproducible output add `--seed <n>`; for greedy/argmax use `--temperature 0`.
 lumen run qwen3.5-9b:q8_0 "Write a haiku about Rust"
 
-# With production-safe sampling
+# Longer answer with an explicit temperature
 lumen run qwen3.5-9b:q8_0 "Explain quantum computing" \
   --max-tokens 200 --temperature 0.7
 

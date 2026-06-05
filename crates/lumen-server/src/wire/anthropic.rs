@@ -87,12 +87,14 @@ impl MessagesRequest {
         let prompt_tokens = engine.tokenize_for_request(&prompt);
         let eos = engine.eos_tokens_for_request();
         // server-internal sampler defaults aligned with CLI's
-        // production defaults. Anthropic Messages API does not
-        // expose repetition_penalty in its request schema, so this default
-        // applies server-internal only.
+        // production defaults. Anthropic Messages API does not expose
+        // repetition_penalty or seed in its request schema, so the defaults
+        // apply server-internal only: every request gets a fresh random seed,
+        // so identical requests vary (matching the real Anthropic API's
+        // non-deterministic behavior).
         let sampling = SamplingParams {
             temperature: self.temperature.unwrap_or(0.7),
-            seed: None,
+            seed: Some(super::next_random_seed()),
             repetition_penalty: Some(1.05),
             ..Default::default()
         };
@@ -201,9 +203,9 @@ async fn drive_messages_stream(
     tx: mpsc::Sender<Vec<u8>>,
     model: String,
 ) {
-    let msg_id = format!("msg_lumen_{:x}", std::time::SystemTime::now()
+    let msg_id = format!("msg_lumen_{:x}-{:x}", std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64).unwrap_or(0));
+        .map(|d| d.as_micros() as u64).unwrap_or(0), super::next_response_seq());
     let mut emitter = SseSafeEmitter::new();
     let mut stop_matcher = StopMatcher::new(Vec::new());
     let mut finish_reason: Option<FinishReason> = None;
@@ -408,9 +410,9 @@ pub async fn collect_messages(
     content_blocks.extend(tool_blocks);
 
     Ok(json!({
-        "id": format!("msg_lumen_{:x}", std::time::SystemTime::now()
+        "id": format!("msg_lumen_{:x}-{:x}", std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64).unwrap_or(0)),
+            .map(|d| d.as_micros() as u64).unwrap_or(0), super::next_response_seq()),
         "type": "message",
         "role": "assistant",
         "model": model,

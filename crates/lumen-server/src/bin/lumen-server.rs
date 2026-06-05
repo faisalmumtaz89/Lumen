@@ -128,10 +128,10 @@ ENVIRONMENT VARIABLES (CUDA backend):
     LUMEN_CUDA_DECODE_DELAY_US=<N>
                            Per-decode-step CPU sleep in microseconds, applied
                            after `cudaDeviceSynchronize` in the CUDA decode
-                           paths. Default `0` (OFF) is bit-exact. Set `=50`
-                           to mitigate a CUDA-scheduler timing race seen under
-                           heavy MoE Q4 server concurrency. CLI is deterministic
-                           without this knob. Cost <=1% TPOT.
+                           paths. `lumen-server` defaults to `50` (auto-applied)
+                           to mitigate a CUDA-scheduler timing race under heavy
+                           MoE Q4 concurrency; the `lumen run` CLI defaults to
+                           `0`. Set `=0` to disable on the server. Cost <=1% TPOT.
 
 EXAMPLES:
     # Auto-detect backend, default port 8000

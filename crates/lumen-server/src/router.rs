@@ -125,14 +125,8 @@ fn map_serde_error(e: serde_json::Error) -> ServerError {
         );
     }
     if msg.starts_with("invalid type") {
-        // Best-effort: trim the trailing "at line N column M" so the
-        // message focuses on the type mismatch.
-        let trimmed = msg
-            .find(" at line ")
-            .map(|i| &msg[..i])
-            .unwrap_or(&msg)
-            .to_string();
-        return ServerError::bad_request_field(trimmed, "", "invalid_type");
+        // Focus on the type mismatch; drop serde's parser-position suffix.
+        return ServerError::bad_request_field(strip_location(&msg).to_string(), "", "invalid_type");
     }
     // Classify the rest by serde_json category.
     let code = match e.classify() {
@@ -141,7 +135,31 @@ fn map_serde_error(e: serde_json::Error) -> ServerError {
         | serde_json::error::Category::Eof
         | serde_json::error::Category::Io => "invalid_json",
     };
-    ServerError::bad_request_field(format!("malformed request body: {msg}"), "", code)
+    ServerError::bad_request_field(
+        format!("malformed request body: {}", strip_location(&msg)),
+        "",
+        code,
+    )
+}
+
+/// Strip serde_json's trailing `" at line N column M"` location suffix so error
+/// messages returned to clients never leak parser positions.
+fn strip_location(msg: &str) -> &str {
+    msg.find(" at line ").map(|i| &msg[..i]).unwrap_or(msg)
+}
+
+#[cfg(test)]
+mod serde_error_tests {
+    use super::strip_location;
+
+    #[test]
+    fn strip_location_removes_parser_position() {
+        assert_eq!(
+            strip_location("invalid value: integer `-1`, expected u64 at line 1 column 75"),
+            "invalid value: integer `-1`, expected u64"
+        );
+        assert_eq!(strip_location("no position here"), "no position here");
+    }
 }
 
 /// Extract the first backtick-quoted token after the given prefix.
