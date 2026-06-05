@@ -602,10 +602,6 @@ pub(crate) struct KernelSet {
     // Computes x = residual + Σ_k expert_weights[k] * expert_outputs[k].
     pub(crate) moe_expert_accum_option_a: Option<CudaFunction>,
 
-    // MoE weighted accumulation (sparse num_experts layout; batched path).
-    // Indexes via expert_ids[k] into a [num_experts * hidden_dim] buffer.
-    pub(crate) moe_expert_accum_batched_b: Option<CudaFunction>,
-
     // MoE batched-expert FFN kernels.
     // Single-launch processing of all top_k active experts; eliminates
     // K-fold launch overhead vs the per-expert path. Gated behind
@@ -623,7 +619,6 @@ pub(crate) struct KernelSet {
     pub(crate) moe_router_fused_atomic_v2: Option<CudaFunction>,
     pub(crate) moe_batched_gate_up_swiglu_q8_0_v2: Option<CudaFunction>,
     pub(crate) moe_batched_down_v2: Option<CudaFunction>,
-    pub(crate) moe_batched_down_accum_v2: Option<CudaFunction>,
     pub(crate) moe_batched_gate_up_swiglu_q8_0_v3: Option<CudaFunction>,
     pub(crate) moe_batched_down_v3: Option<CudaFunction>,
     // fused persistent gate+up+SwiGLU+down+accum kernel (Q8_0).
@@ -1659,13 +1654,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             Ok(f) => { cuda_log!("[CUDA] moe_expert_accum_option_a: OK"); Some(f) }
             Err(e) => { cuda_log!("[CUDA] moe_expert_accum_option_a: FAILED: {e}"); None }
         },
-        moe_expert_accum_batched_b: match load_fn(
-            shaders::MOE_ACCUM_KERNEL_SOURCE,
-            "moe_expert_accum_batched_b",
-        ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_expert_accum_batched_b: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_expert_accum_batched_b: FAILED: {e}"); None }
-        },
         // Sub-phase F: batched-expert FFN kernels (opt-in via env var).
         // Batched kernels are INCLUDED in this revision.
         moe_batched_gate_up_swiglu_q8_0: match load_fn(
@@ -1725,13 +1713,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         ) {
             Ok(f) => { cuda_log!("[CUDA] moe_batched_down_v2: OK"); Some(f) }
             Err(e) => { cuda_log!("[CUDA] moe_batched_down_v2: FAILED: {e}"); None }
-        },
-        moe_batched_down_accum_v2: match load_fn(
-            shaders::MOE_BATCHED_KERNEL_SOURCE,
-            "moe_batched_down_accum_v2",
-        ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_down_accum_v2: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_down_accum_v2: FAILED: {e}"); None }
         },
         moe_batched_gate_up_swiglu_q8_0_v3: match load_fn(
             shaders::MOE_BATCHED_KERNEL_SOURCE,

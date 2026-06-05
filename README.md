@@ -158,7 +158,7 @@ Real signatures: `EngineWorker::spawn(config, hyperparams, backend, weights, tok
 
 Endpoints:
 
-```
+```text
 POST /v1/chat/completions   # OpenAI-compatible, SSE streaming
 POST /v1/completions        # OpenAI-compatible
 POST /v1/messages           # Anthropic-compatible, SSE streaming
@@ -168,7 +168,7 @@ Both wire formats support SSE streaming. The tool-call parser is template-driven
 
 ## Architecture
 
-```
+```text
 lumen-format      LBC binary format, quantization descriptors, test model generators
 lumen-convert     GGUF -> LBC converter (v1 architectures: qwen35 dense, qwen35moe MoE)
 lumen-runtime     CUDA backend (200+ NVRTC kernels across ~34 families), Metal backend (MSL shaders),

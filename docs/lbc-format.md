@@ -16,7 +16,7 @@ The Layer-Blob Container (`.lbc`) is Lumen's on-disk model format. It is designe
 
 ## Layout (high level)
 
-```
+```text
 +----------------------+
 | Magic + version      |
 | CRC32 header         |

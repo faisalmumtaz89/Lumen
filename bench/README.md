@@ -73,7 +73,7 @@ CUDA-via-Modal (legacy) flag list is preserved in `modal/bench_real_models.py` s
 
 `run_bench.sh` writes per-run results under `bench/results/<timestamp>/`:
 
-```
+```text
 bench/results/
   <timestamp>/
     results.md       # human-readable summary

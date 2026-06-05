@@ -252,6 +252,23 @@ impl BpeTokenizer {
         }
     }
 
+    /// Decode token ids to RAW bytes (no lossy U+FFFD substitution).
+    ///
+    /// The incremental/streaming decoder must reassemble multi-token UTF-8
+    /// codepoints (emoji, rare CJK, byte-fallback) ACROSS token boundaries.
+    /// Decoding each token in isolation via `decode` lossy-converts a partial
+    /// codepoint to U+FFFD before it can be completed — batch `decode` is
+    /// unaffected because it runs `from_utf8_lossy` ONCE over the full byte run.
+    /// Returning raw bytes lets the caller buffer and flush only the longest
+    /// valid UTF-8 prefix (see `lumen-server` `decode_incremental`).
+    pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
+        if self.model_type == "llama" {
+            self.decode_spm_bytes(ids)
+        } else {
+            self.decode_tiktoken_bytes(ids)
+        }
+    }
+
     /// Apply chat template and return the full prompt string.
     pub fn apply_chat_template(&self, prompt: &str) -> String {
         self.apply_chat_template_with_system(prompt, None)
@@ -459,6 +476,13 @@ impl BpeTokenizer {
     }
 
     fn decode_tiktoken(&self, ids: &[u32]) -> String {
+        // Batch decode is lossy ONCE over the full byte run (correct: complete
+        // codepoints are intact). The incremental path uses `decode_bytes`.
+        String::from_utf8_lossy(&self.decode_tiktoken_bytes(ids)).to_string()
+    }
+
+    /// Raw bytes for the tiktoken / byte-level-BPE path (no lossy conversion).
+    fn decode_tiktoken_bytes(&self, ids: &[u32]) -> Vec<u8> {
         let mut bytes = Vec::new();
         for &id in ids {
             if let Some(tok_str) = self.vocab.get(id as usize) {
@@ -469,7 +493,27 @@ impl BpeTokenizer {
                 }
             }
         }
-        String::from_utf8_lossy(&bytes).to_string()
+        bytes
+    }
+
+    /// Raw bytes for the SPM path: byte-fallback `<0xHH>` tokens contribute
+    /// their byte value; other tokens contribute their UTF-8 bytes (▁→space).
+    /// Mirrors `decode_spm` minus the once-per-flush lossy conversion so the
+    /// incremental decoder can reassemble split codepoints.
+    fn decode_spm_bytes(&self, ids: &[u32]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        for &id in ids {
+            if let Some(tok_str) = self.vocab.get(id as usize) {
+                if tok_str.starts_with("<0x") && tok_str.ends_with('>') && tok_str.len() == 6 {
+                    if let Ok(byte_val) = u8::from_str_radix(&tok_str[3..5], 16) {
+                        out.push(byte_val);
+                        continue;
+                    }
+                }
+                out.extend_from_slice(tok_str.replace('\u{2581}', " ").as_bytes());
+            }
+        }
+        out
     }
 
     // =========================================================================

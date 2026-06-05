@@ -177,7 +177,7 @@ Determinism across G is verified separately in the release-level harnesses (`scr
 
 ## Comparison Ratios
 
-```
+```text
 Ratio = Lumen / baseline
 ```
 
@@ -239,7 +239,7 @@ LUMEN_CUDA_MMV_Q_MOE_DP4A=1               # default ON — +11.7% Q4
 
 > **Warning:** the Modal invocation block below targets dense-9B and uses the legacy opt-in set. It is **NOT** the current production stack. For current main, the 12-flag stack documented above is **default-ON** and out-of-the-box `lumen run` reproduces the published numbers. Critically, the legacy block below explicitly sets `LUMEN_CUDA_BF16_GEMMEX=1` (the legacy default); the **current production requirement is `LUMEN_CUDA_BF16_GEMMEX=0`** for BF16 P3 correctness on MoE. Do not copy this stanza into new deployments.
 
-```
+```bash
 modal run modal/bench_real_models.py --models qwen3.5-9b --quants q8_0,q4_0 \
   --lumen-env "LUMEN_CUDA_GDN_SPLIT=1,LUMEN_CUDA_Q8_SPLIT=1,LUMEN_CUDA_Q4_SPLIT=1,\
 LUMEN_CUDA_OUTPUT_PROJ_SPLIT=1,LUMEN_CUDA_Q8_SCALE_HW=1,LUMEN_CUDA_GDN_REGISTER_RESIDENT=1,\
@@ -248,7 +248,7 @@ LUMEN_CUDA_OUTPUT_PROJ_NR=16,LUMEN_CUDA_BF16_GEMMEX=1"   # legacy value; current
 
 For BF16 specifically (legacy):
 
-```
+```bash
 modal run modal/bf16_industry_bench.py
 ```
 

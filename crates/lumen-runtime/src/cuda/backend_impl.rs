@@ -887,9 +887,6 @@ struct MutableState {
     /// (used in `prefill_moe_ffn_layer`) and `cudarc::CudaSlice<u64>` is not
     /// `Clone`.
     moe_batched_offsets: Vec<Option<super::moe::CudaMoeBatchedOffsets>>,
-    /// Opt-in expert-LFU cache configuration (set via `configure_expert_cache`).
-    /// `None` = GPU-resident-all. `Some(_)` = streaming with cache.
-    expert_cache_config: Option<super::moe::CudaExpertCacheConfig>,
 
     // split-layout integration::
     // env-var flags read once at session start. All default to OFF so the
@@ -8123,92 +8120,6 @@ impl CudaBackend {
         st.decode_token_count += 1;
         Ok(Logits { data: logits_host })
     }
-
-    // -----------------------------------------------------------------------
-    // Public MoE cache configuration surface (opt-in only).
-    // Mirrors `metal::MetalF32Backend::configure_expert_cache` / `_warmup`.
-    // -----------------------------------------------------------------------
-
-    /// Configure MoE expert-LFU cache for streaming decode (opt-in).
-    ///
-    /// Must be called BEFORE `init()` is fully populated (during the
-    /// pre-init configuration phase). After this call, the CUDA MoE forward
-    /// path will:
-    /// - check the cache on each per-expert dispatch,
-    /// - on miss: `ExpertReader::load_expert(layer, eid)` -> `htod` upload ->
-    ///   dispatch FFN against a per-layer assembled scratch buffer ->
-    ///   `cache.insert(...)`,
-    /// - on hit: dispatch against the cached bytes (Arc<Vec<u8>>).
-    ///
-    /// `lbc_path`: Path to the LBC model file for per-expert byte-range
-    /// reads. `cache_capacity`: maximum number of (layer, expert) entries to
-    /// hold in the LFU cache. Default = GPU-resident-all (no cache).
-    ///
-    /// Per the user binding (#3): cache is **opt-in only**; calling this
-    /// activates it. No auto-enable from VRAM headroom.
-    pub fn configure_expert_cache(
-        &mut self,
-        lbc_path: &std::path::Path,
-        cache_capacity: usize,
-    ) -> Result<(), RuntimeError> {
-        let hp = self.hyperparams.as_ref().ok_or_else(|| {
-            RuntimeError::Compute(
-                "configure_expert_cache: backend not initialized yet (call init() first)".into(),
-            )
-        })?;
-        let num_experts = hp.num_experts.map(|v| v as usize).unwrap_or(0);
-        let num_layers = hp.num_layers as usize;
-        if num_experts == 0 {
-            return Err(RuntimeError::Compute(
-                "configure_expert_cache: model is not MoE (num_experts == 0)".into(),
-            ));
-        }
-        let cfg = super::moe_cache::build_cache_config(
-            lbc_path,
-            cache_capacity,
-            num_layers,
-            num_experts,
-        )?;
-        let mut guard = self.state.lock().unwrap();
-        let st = guard.as_mut().ok_or_else(|| {
-            RuntimeError::Compute(
-                "configure_expert_cache: backend not initialized (call init() first)".into(),
-            )
-        })?;
-        st.expert_cache_config = Some(cfg);
-        Ok(())
-    }
-
-    /// Configure profiling-based cache warm-up.
-    ///
-    /// After `profiling_tokens` tokens have been decoded with cache OFF, the
-    /// `ExpertActivationProfiler`'s per-(layer, expert) counts are used to
-    /// pre-populate the cache with the top-K hottest experts per layer.
-    ///
-    /// Must be called AFTER `configure_expert_cache`. Has no effect if the
-    /// cache is not configured. Default state (`configure_expert_cache`
-    /// without a follow-on `configure_expert_warmup`): warm-up disabled,
-    /// `warmup_complete=true` (the cache is queried directly without a
-    /// profiling phase).
-    pub fn configure_expert_warmup(
-        &mut self,
-        profiling_tokens: usize,
-        top_k_per_layer: usize,
-    ) -> Result<(), RuntimeError> {
-        let mut guard = self.state.lock().unwrap();
-        let st = guard.as_mut().ok_or_else(|| {
-            RuntimeError::Compute(
-                "configure_expert_warmup: backend not initialized yet".into(),
-            )
-        })?;
-        let cfg = st.expert_cache_config.as_mut().ok_or_else(|| {
-            RuntimeError::Compute(
-                "configure_expert_warmup: call configure_expert_cache first".into(),
-            )
-        })?;
-        super::moe_cache::configure_warmup(cfg, profiling_tokens, top_k_per_layer);
-        Ok(())
-    }
 }
 
 /// Launch a matvec kernel for the given weight buffer (F32, F16, Q8_0, or Q4_0).
@@ -13205,7 +13116,6 @@ impl ComputeBackend for CudaBackend {
             moe_scratch,
             moe_meta_cache,
             moe_batched_offsets,
-            expert_cache_config: None,
             use_q8_scale_hw,
             use_q8_split,
             use_q4_split,

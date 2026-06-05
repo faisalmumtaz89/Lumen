@@ -347,8 +347,8 @@ impl Tokenize for BpeTokenizerAdapter {
     }
 
     fn decode_incremental(&self, state: &mut Vec<u8>, token_id: u32) -> String {
-        let frag = self.inner.decode(&[token_id]);
-        state.extend_from_slice(frag.as_bytes());
+        let frag_bytes = self.inner.decode_bytes(&[token_id]);
+        state.extend_from_slice(&frag_bytes);
         match std::str::from_utf8(state) {
             Ok(_) => {
                 let bytes = std::mem::take(state);
@@ -487,24 +487,49 @@ impl ServerWeights {
 fn wire_global_tensors_and_raw(
     backend: &mut dyn ComputeBackend,
     g: &WeightGlobals<'_>,
+    skip_f32_when_raw: bool,
 ) {
-    backend.set_global_tensors(
-        g.embedding.to_vec(),
-        g.final_norm.to_vec(),
-        g.output_proj.to_vec(),
-    );
-    if matches!(
+    // When a native-quant raw blob is present for a scheme the backend uploads
+    // directly (Q8_0/Q4_0/F16), `init()` builds the GPU buffer straight from the
+    // raw bytes and never needs the F32 dequant. Materializing that F32 here via
+    // `.to_vec()` then allocates a large heap copy (~3.8 GB each for
+    // embedding/output_proj on Qwen3.5-9B) that the backend holds resident (CUDA)
+    // or frees unused at init (Metal, backend_impl.rs:67/102) — a multi-GB
+    // boot-time memory spike either way.
+    //
+    // `skip_f32_when_raw` passes an empty Vec instead, but ONLY where the upload
+    // path is RUNTIME-VALIDATED to never read the F32 again: Metal (true) frees
+    // `self.embedding` post-init and `embed_token` uses the GPU buffer — proven
+    // byte-identical + ~1.6 GB lower phys_footprint peak. CUDA (false) is kept
+    // byte-identical to its long-standing path: its `embed_token` CPU fallback
+    // (cuda/backend_impl.rs:13240) still reads `self.embedding`, so dropping it
+    // is deferred until it can be validated on real CUDA hardware. The raw upload
+    // itself is gated only on `*_has_raw` so BOTH backends always receive it.
+    let embedding_has_raw = matches!(
         g.embedding_quant,
         QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16
-    ) && !g.embedding_raw.is_empty()
-    {
-        backend.set_embedding_raw(g.embedding_raw.to_vec(), g.embedding_quant);
-    }
-    if matches!(
+    ) && !g.embedding_raw.is_empty();
+    let output_proj_has_raw = matches!(
         g.output_proj_quant,
         QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16
-    ) && !g.output_proj_raw.is_empty()
-    {
+    ) && !g.output_proj_raw.is_empty();
+    backend.set_global_tensors(
+        if skip_f32_when_raw && embedding_has_raw {
+            Vec::new()
+        } else {
+            g.embedding.to_vec()
+        },
+        g.final_norm.to_vec(),
+        if skip_f32_when_raw && output_proj_has_raw {
+            Vec::new()
+        } else {
+            g.output_proj.to_vec()
+        },
+    );
+    if embedding_has_raw {
+        backend.set_embedding_raw(g.embedding_raw.to_vec(), g.embedding_quant);
+    }
+    if output_proj_has_raw {
         backend.set_output_proj_raw(g.output_proj_raw.to_vec(), g.output_proj_quant);
     }
     if g.weight_tying {
@@ -646,7 +671,9 @@ async fn run(args: Args) -> Result<(), String> {
             {
                 let mut metal = MetalF32Backend::new()
                     .map_err(|e| format!("Metal backend unavailable: {e}"))?;
-                wire_global_tensors_and_raw(&mut metal, &provider.globals());
+                // Metal: skip the unused F32 dequant when the native-quant raw
+                // is present — runtime-validated byte-identical (see fn doc).
+                wire_global_tensors_and_raw(&mut metal, &provider.globals(), true);
                 metal
                     .init(&hyperparams_capped)
                     .map_err(|e| format!("Metal init: {e}"))?;
@@ -666,7 +693,10 @@ async fn run(args: Args) -> Result<(), String> {
             {
                 let mut cuda = CudaBackend::new(args.backend_device)
                     .map_err(|e| format!("CUDA backend unavailable (device {}): {e}", args.backend_device))?;
-                wire_global_tensors_and_raw(&mut cuda, &provider.globals());
+                // CUDA: keep the F32 dequant (skip=false) — byte-identical to
+                // the long-standing path until validated on real CUDA hardware
+                // (its embed_token CPU fallback still reads self.embedding).
+                wire_global_tensors_and_raw(&mut cuda, &provider.globals(), false);
                 cuda.init(&hyperparams_capped)
                     .map_err(|e| format!("CUDA init: {e}"))?;
                 cuda.preload_weights(provider.as_dyn())
@@ -684,7 +714,9 @@ async fn run(args: Args) -> Result<(), String> {
         }
         BackendChoice::Cpu => {
             let mut cpu = NaiveF32Backend::new();
-            wire_global_tensors_and_raw(&mut cpu, &provider.globals());
+            // CPU: keep the F32 dequant (skip=false) — the CPU backend reads it
+            // directly and does not build a GPU buffer from the raw.
+            wire_global_tensors_and_raw(&mut cpu, &provider.globals(), false);
             cpu.init(&hyperparams_capped)
                 .map_err(|e| format!("CPU init: {e}"))?;
             (Box::new(cpu), KvPrecision::F32)

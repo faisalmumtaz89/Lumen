@@ -71,6 +71,18 @@ impl ComputeBackend for MetalF32Backend {
         } else {
             self.embedding_buf = Some(self.upload_f32(&self.embedding)?);
         }
+        // The raw native-quant embedding bytes have served their sole purpose:
+        // they were copied into `embedding_buf` (the GPU MTLBuffer) in the
+        // quant branch above. Every reachable Metal path post-init sources the
+        // GPU buffer — embed_token GPU branch (backend_impl.rs ~L2515 reads
+        // `embedding_buf`/the unified buffer + `embedding_quant`), and the
+        // GPU-resident preload blits from `embedding_buf.contents()`
+        // (gpu_resident.rs ~L446), never `embedding_raw`. A full grep of
+        // `self.embedding_raw` in metal/ shows L50 above is the ONLY reader.
+        // Freeing it here mirrors the F32 `self.embedding` free above (L67) —
+        // the raw sibling was simply missed. ~0.66 GB (Q8). For non-quantized
+        // models this is already None (no-op).
+        self.embedding_raw = None;
         self.final_norm_buf = Some(self.upload_f32(&self.final_norm)?);
         // Upload output_proj: use raw Q8_0 bytes if available, else F32
         if let Some(ref raw) = self.output_proj_raw {
@@ -94,6 +106,15 @@ impl ComputeBackend for MetalF32Backend {
         } else {
             self.output_proj_buf = Some(self.upload_f32(&self.output_proj)?);
         }
+        // Symmetric to `embedding_raw` above: the raw output_proj bytes were
+        // copied into `output_proj_buf` (L78) and have no other reader (full
+        // grep of `self.output_proj_raw` in metal/ shows L76 is the ONLY read;
+        // compute_final reads `output_proj_buf`, the GPU-resident preload blits
+        // from `output_proj_buf.contents()`, and weight tying reuses the
+        // embedding offset without touching this). Under weight tying this Vec
+        // is typically empty already; freeing is still correct. ~0 GB tied,
+        // up to ~0.66 GB untied. Non-quantized models: already None (no-op).
+        self.output_proj_raw = None;
 
         // Compute dimensions
         let hidden_dim = hyperparams.hidden_dim as usize;

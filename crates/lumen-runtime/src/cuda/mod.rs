@@ -31,8 +31,6 @@ pub(crate) mod prefill;
 pub(crate) mod prefill_attention;
 /// CUDA MoE forward-path types.
 pub(crate) mod moe;
-/// CUDA expert-LFU cache adapter.
-pub(crate) mod moe_cache;
 mod backend_impl;
 
 pub use backend_impl::CudaBackend;

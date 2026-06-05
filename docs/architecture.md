@@ -6,7 +6,7 @@ Lumen is an LLM inference engine written from scratch in Rust for Apple Silicon 
 
 ## Crate layout
 
-```
+```text
 lumen-format      LBC binary format, quantization descriptors, test model generators
 lumen-convert     GGUF -> LBC converter (v1: qwen35 dense, qwen35moe MoE; additional
                   families planned)

@@ -28,7 +28,7 @@ The bin is gated behind the `bin` Cargo feature so library embedders that wire t
 
 ## Endpoints
 
-```
+```text
 POST /v1/chat/completions   # OpenAI-compatible, SSE streaming
 POST /v1/completions        # OpenAI-compatible
 POST /v1/messages           # Anthropic-compatible, SSE streaming

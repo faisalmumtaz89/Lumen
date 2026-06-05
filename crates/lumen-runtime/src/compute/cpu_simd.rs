@@ -26,6 +26,8 @@ use crate::thread_pool::ThreadPool;
 use lumen_format::hyperparams::ModelHyperparams;
 use lumen_format::quantization::QuantScheme;
 use std::cell::UnsafeCell;
+// Atomic quant-state spinlock used only by the aarch64 NEON Q8_0 path.
+#[cfg(target_arch = "aarch64")]
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
@@ -163,12 +165,16 @@ struct ComputeScratch {
     // then reuse for all matmuls that share the same input vector.
     // Eliminates 3 redundant quantizations + 3 heap allocations for Q/K/V projections
     // and 2 redundant quantizations for fused gate+up, per layer.
-    normed_q8: Vec<u8>,  // Pre-quantized normed for Q/K/V and gate+up projections
-    gate_q8: Vec<u8>,    // Pre-quantized gate for w_down matmul
-    /// Pre-quantized attn_out for wo projection (aarch64 Q8_0 path)
-    attn_out_q8: Vec<u8>,
-    /// Pre-quantized normed for output projection (aarch64 Q8_0 path)
-    final_normed_q8: Vec<u8>,
+    // These four Q8_0 scratch buffers feed the aarch64 NEON Q8_0 path only;
+    // the x86_64 AVX path quantizes inline and never reads them (dead there).
+    #[allow(dead_code)]
+    normed_q8: Vec<u8>, // Pre-quantized normed for Q/K/V and gate+up projections
+    #[allow(dead_code)]
+    gate_q8: Vec<u8>, // Pre-quantized gate for w_down matmul
+    #[allow(dead_code)]
+    attn_out_q8: Vec<u8>, // Pre-quantized attn_out for wo projection
+    #[allow(dead_code)]
+    final_normed_q8: Vec<u8>, // Pre-quantized normed for output projection
     // Cached model dimensions (computed once in init, never changes).
     // Eliminates per-call hp() Option check, as-usize casts, and derived multiplications.
     hidden_dim: usize,
@@ -514,6 +520,8 @@ pub struct SimdF32Backend {
     /// Quantized once during init() from the F32 output_proj when hidden_dim is a
     /// multiple of 32. Reduces memory bandwidth by ~4x in compute_final().
     /// Empty when hidden_dim is not Q8_0-compatible (e.g., test models with dim=8).
+    /// aarch64-only Q8_0 path (x86_64 AVX path quantizes inline; dead there).
+    #[allow(dead_code)]
     output_proj_q8: Vec<u8>,
     // SAFETY: SimdF32Backend is only accessed from the inference engine's
     // generate() loop, which is single-threaded. The &self in ComputeBackend

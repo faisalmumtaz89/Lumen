@@ -14,21 +14,12 @@
 //! Batched-expert kernels (opt-in via `LUMEN_CUDA_MOE_BATCHED=1`):
 //! dispatch all K experts in one launch via `moe_batched_gate_up_swiglu_*` +
 //! `moe_batched_down_accum_*`, eliminating K-fold launch overhead.
-//!
-//! Expert-LFU cache integration: when configured via
-//! `configure_expert_cache(path, capacity)`, cold experts are streamed from
-//! disk on miss and inserted into the LFU cache; hot experts hit the cache
-//! and dispatch against the per-layer GPU-resident weight buffer.
 
 use crate::error::RuntimeError;
-use crate::expert::cache::ExpertLfuCache;
-use crate::expert::profiler::ExpertActivationProfiler;
-use crate::expert::reader::ExpertReader;
 use cudarc::driver::{CudaSlice, CudaView, CudaViewMut};
-use lumen_format::index::{ExpertSlice, TensorSlice};
+use lumen_format::index::TensorSlice;
 use lumen_format::quantization::QuantScheme;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 
 /// AUDIT (ported to): per-process MoE-FFN-decode call counter for the
 /// `LUMEN_DUMP_EXPERTS` expert-ID dump. Increments once per MoE layer per
@@ -65,9 +56,6 @@ pub(crate) struct CudaMoeMeta {
     pub(crate) shared_down: Option<TensorSlice>,
     /// Shared-expert sigmoid gate weight (`ffn_gate_inp_shexp`); F32 `[hidden_dim]`.
     pub(crate) ffn_gate_inp_shexp: Option<TensorSlice>,
-
-    /// Per-expert slice metadata (preserved for the LFU-miss reader path).
-    pub(crate) expert_slices: Vec<ExpertSlice>,
 }
 
 /// Per-layer GPU-resident offset tables for the Phase-F batched-expert
@@ -141,26 +129,6 @@ pub(crate) struct CudaMoeScratch {
     pub(crate) mmv_q_moe_swiglu_q8_1: CudaSlice<u8>,
 }
 
-/// Configuration for the CUDA expert-LFU cache (opt-in only).
-///
-/// User opts in via `CudaBackend::configure_expert_cache(path, capacity)`.
-/// Default: GPU-resident-all (no cache, no profiling, no SSD I/O).
-pub(crate) struct CudaExpertCacheConfig {
-    /// LFU cache wrapper (capacity-bounded; protected by Mutex for single-thread access).
-    pub(crate) cache: Mutex<ExpertLfuCache>,
-    /// Per-MoE-layer activation profiler used for warm-up.
-    pub(crate) profiler: Mutex<ExpertActivationProfiler>,
-    /// Disk reader for per-expert byte-range I/O.
-    pub(crate) reader: Mutex<ExpertReader>,
-    /// Tokens remaining in the profiling phase. When this reaches 0, the cache
-    /// is bulk-warmed from the profiler's top-K-per-layer report.
-    pub(crate) profiling_tokens_remaining: AtomicUsize,
-    /// Top-K per layer to warm.
-    pub(crate) profiling_top_k: usize,
-    /// Set once warm-up has been triggered (prevents re-running).
-    pub(crate) warmup_complete: AtomicBool,
-}
-
 /// Build per-layer MoE metadata from a layer's subtensor offsets.
 ///
 /// Called once during `preload_weights` for each layer where
@@ -207,7 +175,6 @@ pub(crate) fn build_moe_meta(
         shared_up: subtensors.shared_expert_up,
         shared_down: subtensors.shared_expert_down,
         ffn_gate_inp_shexp: subtensors.ffn_gate_inp_shexp,
-        expert_slices: experts.clone(),
     })
 }
 
@@ -4220,7 +4187,7 @@ pub(crate) fn encode_shared_expert_ffn_decode_fused(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lumen_format::index::SubtensorOffsets;
+    use lumen_format::index::{ExpertSlice, SubtensorOffsets};
 
     fn dummy_slice(offset: u64, length: u64, quant: QuantScheme) -> TensorSlice {
         TensorSlice { offset, length, quant }
@@ -4285,7 +4252,6 @@ mod tests {
         assert_eq!(meta.expert_down_offs, vec![3024, 5024]);
         assert_eq!(meta.expert_gate_quant, QuantScheme::Q8_0);
         assert_eq!(meta.expert_down_quant, QuantScheme::Q8_0);
-        assert_eq!(meta.expert_slices.len(), 2);
     }
 
     /// Verify `moe_batched_enabled` defaults to OFF.
@@ -4851,21 +4817,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Verify the build_cache_config path errors on a missing LBC file.
-    /// This exercises Sub-phase E's error reporting at the surface level.
-    #[test]
-    fn expert_cache_config_validates_path() {
-        let result = super::super::moe_cache::build_cache_config(
-            std::path::Path::new("/nonexistent/path/to/missing.lbc"),
-            32,
-            4,
-            8,
-        );
-        assert!(
-            result.is_err(),
-            "build_cache_config must error on missing LBC path",
-        );
     }
 }

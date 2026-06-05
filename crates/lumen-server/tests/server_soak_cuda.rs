@@ -129,8 +129,8 @@ impl Tokenize for BpeTokenizerAdapter {
     }
 
     fn decode_incremental(&self, state: &mut Vec<u8>, token_id: u32) -> String {
-        let frag = self.inner.decode(&[token_id]);
-        state.extend_from_slice(frag.as_bytes());
+        let frag_bytes = self.inner.decode_bytes(&[token_id]);
+        state.extend_from_slice(&frag_bytes);
         match std::str::from_utf8(state) {
             Ok(_) => {
                 let bytes = std::mem::take(state);

@@ -218,6 +218,20 @@ fn render_chat_prompt(messages: &[ChatMessage], tools: &[ToolDef]) -> Result<Str
     let mut system: Option<String> = None;
     let mut transcript = String::new();
     for m in messages.iter() {
+        // ROBUST-007: `content` must be a string or a content-parts array (or
+        // null). A bare number/bool would otherwise be silently coerced by
+        // `content_to_string`'s `other => to_string()` arm and accepted (HTTP
+        // 200); OpenAI requires string|array, so reject it as a 400 instead.
+        match &m.content {
+            Value::String(_) | Value::Array(_) | Value::Null => {}
+            _ => {
+                return Err(ServerError::bad_request_field(
+                    "message 'content' must be a string or a content-parts array",
+                    "messages.content",
+                    "invalid_type",
+                ))
+            }
+        }
         match m.role.as_str() {
             "system" => system = Some(content_to_string(&m.content)),
             "user" => {

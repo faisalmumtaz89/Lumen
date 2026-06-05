@@ -1353,8 +1353,10 @@ fn print_banner(model_name: &str, backend: &str, metrics_summary: &str) {
 ///
 /// Extracted so that both `#[cfg(feature = "cuda")]` and `#[cfg(not(feature = "cuda"))]`
 /// branches can call it without duplicating the platform-specific Metal logic.
+// `use_metal`/`verbose` are used only on the macOS/Metal build path.
+#[allow(unused_variables)]
 fn create_cpu_or_metal_backend(
-    #[allow(unused_variables)] use_metal: bool,
+    use_metal: bool,
     use_simd: bool,
     threads: usize,
     verbose: bool,
@@ -1676,6 +1678,9 @@ fn run_with_sync(
 }
 
 #[allow(clippy::too_many_arguments)]
+// option_a / verbose_routing / routing_bias / verbose are used on the
+// Metal / non-CUDA decode paths; unused on the CUDA decode path.
+#[allow(unused_variables)]
 fn run_with_mmap(
     path: &Path,
     use_simd: bool,
