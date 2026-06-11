@@ -22,9 +22,11 @@ PURE-greedy (`--temperature 0` + no repetition penalty) deterministically loops 
 
 ```bash
 --temperature 0.7                        # sample instead of greedy
-# OR
+# OR (DENSE models only)
 --repetition-penalty 1.05 --repeat-last-n 64    # cap repetition explicitly
 ```
+
+When `--repetition-penalty` is omitted, the server/CLI apply a **model-aware** default (1.05 dense / **1.03 MoE**, resolved by `runtime_defaults::repetition_penalty_default`). The `1.05` recommendation above is for **DENSE models only** — MoE (Qwen3.5-MoE class) must stay **≤ 1.03**, because a penalty of 1.05+ corrupts MoE arithmetic ("17 × 20 = … = 39"). On MoE, leave `--repetition-penalty` unset so the 1.03 default applies.
 
 ## Multilingual / long-form prompt returns empty or truncated output
 
@@ -56,7 +58,7 @@ Mid-stream client disconnect can wedge the engine worker that buffers SSE respon
 
 ## "Unsupported quantization" error
 
-Run `lumen models` to see registry-declared cells. For Qwen3.5-9B only Q8_0 is in the registry today; a Q4_0 LBC is produced via `lumen convert --requant q4_0` from the Q8_0 source. (`--requant` accepts `q4_0` and `q8_0`.)
+Run `lumen models` to see registry-declared cells. All three Qwen3.5-9B quants (Q8_0, Q4_0, BF16) are directly downloadable from the registry — use `lumen pull qwen3.5-9b:<quant>`. Avoid deriving Q4_0 via `lumen convert --requant q4_0` from a Q8_0 source: the requant route double-quantizes and is quality-broken on the CUDA target (see model_registry.toml notes); the registry's direct Q4_0 is the supported path.
 
 ## "Unsupported architecture" error at conversion
 
@@ -64,4 +66,4 @@ The converter currently accepts the v1 architecture set (`qwen35` and `qwen35moe
 
 ## `LBC_VERSION` mismatch
 
-`LBC_VERSION = 3` is current. The reader rejects newer-than-current with `UnsupportedVersion`; backward-compat for v1 / v2 is in the code path but unverified at runtime. Policy: rebuild LBCs after major Lumen upgrades via `lumen convert` or `lumen pull --quant <scheme>`.
+`LBC_VERSION = 4` is current. The reader rejects newer-than-current with `UnsupportedVersion`; backward-compat for v1 / v2 is in the code path but unverified at runtime. Policy: rebuild LBCs after major Lumen upgrades via `lumen convert` or `lumen pull --quant <scheme>`.

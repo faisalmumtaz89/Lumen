@@ -24,6 +24,84 @@ use lumen_format::quantization::QuantScheme;
 
 use std::path::Path;
 
+/// Set to `true` when the operator passes `--repeat-penalty`/`--repetition-penalty`
+/// on the CLI. When `false` (operator did not override), `effective_sampling`
+/// substitutes the model-aware `repetition_penalty` default once the LBC has
+/// been opened and `runtime_defaults::set_model_is_moe` recorded the MoE flag
+/// (MoE → 1.03, dense → 1.05). Process-global to avoid threading a bool through
+/// every `run_with_*` signature; mirrors the `runtime_defaults` set-once-in-main
+/// atomic pattern and is written exactly once during arg parsing.
+static REPETITION_PENALTY_EXPLICIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// F4: caller-supplied textual stop sequences (`--stop`), recorded once during
+/// arg parsing. Process-global (same set-once rationale as
+/// `REPETITION_PENALTY_EXPLICIT`) so `print_generated_text` can truncate the
+/// answer at the first matched stop string WITHOUT threading a `Vec<String>`
+/// through every `run_with_*` / `run_engine` signature. Empty / unset → the
+/// answer prints verbatim (byte-identical to pre-F4).
+static STOP_SEQUENCES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Returns the sampling params to actually run with. Identical to `base` except
+/// that, when the operator did NOT pass `--repeat-penalty` explicitly, the
+/// `repetition_penalty` is resolved model-aware via
+/// `runtime_defaults::repetition_penalty_default()` (MoE → 1.03, all quants;
+/// dense → 1.05, unchanged). The MoE value is capped at 1.03 because the GDN
+/// decode parity stack now lands the math near-tie at greedy, and a penalty of
+/// 1.05+ corrupts MoE arithmetic ("17 x 20 = … = 39"); see
+/// `repetition_penalty_default` for the source-of-truth rationale.
+///
+/// Must be called AFTER `runtime_defaults::set_model_is_moe(..)` (i.e. after the
+/// LBC is opened) so the MoE flag is populated. A pure-greedy override
+/// (`--repeat-penalty 1.0` → `repetition_penalty = None`) is preserved because
+/// it sets the explicit flag and is therefore not substituted.
+fn effective_sampling(base: &SamplingParams) -> SamplingParams {
+    // The greedy anti-degeneration guard is resolved from the MoE flag (+
+    // LUMEN_ANTI_RESTATE override) regardless of whether the operator pinned an
+    // explicit repetition penalty — it is an orthogonal, backend-agnostic veto
+    // and a `--repeat-penalty 1.0` pure-greedy run still wants the doubling
+    // gone.
+    let anti_restate = lumen_runtime::runtime_defaults::anti_restate_default();
+    if REPETITION_PENALTY_EXPLICIT.load(std::sync::atomic::Ordering::Relaxed) {
+        return SamplingParams { anti_restate, ..base.clone() };
+    }
+    SamplingParams {
+        repetition_penalty: Some(lumen_runtime::runtime_defaults::repetition_penalty_default()),
+        anti_restate,
+        ..base.clone()
+    }
+}
+
+/// Resolves the CLI-effective `frequency_penalty`. When the operator passed
+/// `--frequency-penalty` (`explicit == true`) the parsed value wins (an
+/// explicit flag always overrides the env). Otherwise the shared
+/// `runtime_defaults::frequency_penalty_resolved()` is consulted so the CLI
+/// honours `LUMEN_FREQUENCY_PENALTY` IDENTICALLY to the server wire
+/// (`diag_frequency_penalty`). The resolved value is zero-normalized to `None`
+/// (CLI convention; `Some(0.0)` and `None` are byte-identical for
+/// `penalties_active` / `apply_penalties`), so an unset env stays a no-op.
+fn cli_resolve_frequency_penalty(parsed: Option<f32>, explicit: bool) -> Option<f32> {
+    if explicit {
+        return parsed;
+    }
+    match lumen_runtime::runtime_defaults::frequency_penalty_resolved() {
+        v if v == 0.0 => None,
+        v => Some(v),
+    }
+}
+
+/// Resolves the CLI-effective `repeat_last_n`. When the operator passed
+/// `--repeat-last-n` (`explicit == true`) the parsed value wins. Otherwise the
+/// shared `runtime_defaults::repeat_last_n_resolved()` is consulted so the CLI
+/// honours `LUMEN_REPEAT_LAST_N` IDENTICALLY to the server wire
+/// (`diag_repeat_last_n`); an unset env yields `None` (full-history window).
+fn cli_resolve_repeat_last_n(parsed: Option<usize>, explicit: bool) -> Option<usize> {
+    if explicit {
+        return parsed;
+    }
+    lumen_runtime::runtime_defaults::repeat_last_n_resolved()
+}
+
 pub(crate) fn parse_arg(args: &[String], i: usize, name: &str) -> String {
     args.get(i).unwrap_or_else(|| {
         eprintln!("Error: {name} requires a value");
@@ -108,8 +186,20 @@ pub(crate) fn run_inference(args: &[String]) {
     let mut tokens_str: Option<String> = None;
     let mut prompt_str: Option<String> = None;
     let mut system_str: Option<String> = None;
+    // Per-invocation reasoning toggle. `None` = not passed on the CLI → defer
+    // to the shared resolver (env `LUMEN_CHAT_ENABLE_THINKING`, then the
+    // default `false`). `--think` sets it to `Some(true)`. Resolved AFTER arg
+    // parsing via `resolve_enable_thinking`, keeping CLI/server identical.
+    let mut think_flag: Option<bool> = None;
     let mut max_tokens: usize = usize::MAX; // unlimited by default, stops at EOS
-    let mut temperature: f32 = 0.8;
+    // F4: caller-supplied textual stop sequences (`--stop`), repeatable /
+    // comma-list. Empty by default → no textual stop (the EOS/max-tokens
+    // behaviour is byte-identical to pre-F4).
+    let mut stop_text: Vec<String> = Vec::new();
+    // No-temperature default sourced from the SINGLE canonical
+    // `runtime_defaults::default_temperature()` (0.7) so the CLI matches both
+    // wire surfaces; an explicit `--temperature` still overrides below.
+    let mut temperature: f32 = lumen_runtime::runtime_defaults::default_temperature();
     let mut seed: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -130,10 +220,28 @@ pub(crate) fn run_inference(args: &[String]) {
     let mut top_k: Option<usize> = None;
     let mut top_p: Option<f32> = None;
     let mut min_p: Option<f32> = None;
+    // `repetition_penalty` default is resolved model-aware AFTER the LBC is
+    // opened (see `run_engine`): dense → 1.05, MoE → 1.03 (all quants). We start
+    // from the dense default here; if the operator does NOT pass
+    // `--repeat-penalty`, `run_engine` substitutes the MoE default once
+    // `model_is_moe()` is known. (The GDN decode parity stack lands the MoE math
+    // near-tie at greedy; the MoE value is capped at 1.03 because 1.05+ corrupts
+    // MoE arithmetic to "= 39" — mirrors the server wire default.) An explicit
+    // `--repeat-penalty` flips the process-global REPETITION_PENALTY_EXPLICIT
+    // (mirroring the `runtime_defaults` set-once-in-main atomic pattern) so the
+    // model-aware substitution is suppressed.
     let mut repetition_penalty: Option<f32> = Some(1.05);
     let mut presence_penalty: Option<f32> = None;
     let mut frequency_penalty: Option<f32> = None;
     let mut repeat_last_n: Option<usize> = None;
+    // Track whether the operator passed the flag at all (an explicit
+    // `--frequency-penalty 0` / `--repeat-last-n 0` both normalize to `None`,
+    // so `None` alone cannot distinguish "unset" from "explicitly disabled").
+    // When the flag is NOT passed, the build site below falls back to the
+    // shared env resolvers (`LUMEN_FREQUENCY_PENALTY` / `LUMEN_REPEAT_LAST_N`)
+    // so the CLI honours the same env as the server; an explicit flag wins.
+    let mut frequency_penalty_explicit = false;
+    let mut repeat_last_n_explicit = false;
     let mut use_sync = false;
     let mut use_async = false;
     let mut use_simd = false;
@@ -209,6 +317,25 @@ pub(crate) fn run_inference(args: &[String]) {
                     std::process::exit(1);
                 });
             }
+            "--stop" => {
+                // F4 CLI parity with the server `stop` / `stop_sequences`. The
+                // flag is REPEATABLE and also accepts a comma-separated list, so
+                // `--stop A --stop B` and `--stop A,B` are equivalent. The
+                // truncation is applied at the print layer (see
+                // `print_generated_text`): the decoded answer is cut at the first
+                // matched stop string, matching the server's user-visible
+                // semantics. Empty entries are ignored.
+                i += 1;
+                let val = args.get(i).unwrap_or_else(|| {
+                    eprintln!("Error: --stop requires a stop string");
+                    std::process::exit(1);
+                });
+                for part in val.split(',') {
+                    if !part.is_empty() {
+                        stop_text.push(part.to_string());
+                    }
+                }
+            }
             "--temperature" => {
                 i += 1;
                 let val = args.get(i).unwrap_or_else(|| {
@@ -276,6 +403,7 @@ pub(crate) fn run_inference(args: &[String]) {
                     std::process::exit(1);
                 });
                 repetition_penalty = if (p - 1.0).abs() < f32::EPSILON { None } else { Some(p) };
+                REPETITION_PENALTY_EXPLICIT.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             "--repeat-last-n" => {
                 i += 1;
@@ -288,6 +416,7 @@ pub(crate) fn run_inference(args: &[String]) {
                 });
                 // 0 or negative = disable windowing (use full history); -1 also disables.
                 repeat_last_n = if n <= 0 { None } else { Some(n as usize) };
+                repeat_last_n_explicit = true;
             }
             "--presence-penalty" => {
                 i += 1;
@@ -310,6 +439,7 @@ pub(crate) fn run_inference(args: &[String]) {
                     std::process::exit(1);
                 });
                 frequency_penalty = if p == 0.0 { None } else { Some(p) };
+                frequency_penalty_explicit = true;
             }
             "--threads" => {
                 i += 1;
@@ -365,6 +495,16 @@ pub(crate) fn run_inference(args: &[String]) {
             }
             "--option-a" => {
                 option_a = true;
+            }
+            "--think" => {
+                // Opt into the Qwen3.5 reasoning trace: opens a `<think>`
+                // block in the prompt; the trace is routed to stderr (the
+                // answer stays on stdout) via the shared ReasoningExtractor.
+                think_flag = Some(true);
+            }
+            "--no-think" => {
+                // Explicit opt-out (overrides LUMEN_CHAT_ENABLE_THINKING).
+                think_flag = Some(false);
             }
             "--profile" => {
                 profile = true;
@@ -554,6 +694,18 @@ pub(crate) fn run_inference(args: &[String]) {
         eprintln!("Error: --prompt and --tokens are mutually exclusive");
         std::process::exit(1);
     }
+
+    // Resolve the reasoning toggle ONCE via the single shared resolver, so the
+    // CLI honours `--think` / `--no-think` (explicit) then
+    // `LUMEN_CHAT_ENABLE_THINKING` (env) then the default — identically to the
+    // server. Used both for the chat-template `<think>` tail and to drive the
+    // shared ReasoningExtractor in `print_generated_text`.
+    let enable_thinking =
+        lumen_runtime::runtime_defaults::resolve_enable_thinking(think_flag);
+
+    // F4: record the parsed `--stop` list process-globally so the answer printer
+    // can truncate at the first match. Set exactly once; ignored if already set.
+    let _ = STOP_SEQUENCES.set(stop_text);
 
     // Validate `--cuda-device <N>` upfront against
     // `cudaGetDeviceCount()` before any model loading or CUDA backend
@@ -763,13 +915,23 @@ pub(crate) fn run_inference(args: &[String]) {
             chat_template: tok_section.chat_template,
         };
         let tokenizer = crate::tokenize::BpeTokenizer::from_tokenizer_data(&tok_data);
-        let templated = tokenizer.apply_chat_template_with_system(prompt, system_str.as_deref());
+        let templated = tokenizer.apply_chat_template_with_system(
+            prompt,
+            system_str.as_deref(),
+            enable_thinking,
+        );
         let ids = tokenizer.encode(&templated);
         if ids.is_empty() {
             eprintln!("Error: prompt produced no tokens after tokenization");
             std::process::exit(1);
         }
         if verbose { eprintln!("Tokenized prompt: {} tokens", ids.len()); }
+        // [XCHK] Echo the exact chat-templated prompt token IDs (env LUMEN_XCHK=1,
+        // default OFF). Lets the cross-backend forensic diff verify Metal and CUDA
+        // ingest byte-identical inputs before comparing per-op sumsq trajectories.
+        if std::env::var("LUMEN_XCHK").as_deref() == Ok("1") {
+            eprintln!("[XCHK] prompt_tokens count={} ids={ids:?}", ids.len());
+        }
         (ids, Some(tokenizer))
     } else {
         eprintln!("No prompt provided.\n");
@@ -833,6 +995,15 @@ pub(crate) fn run_inference(args: &[String]) {
         }
     }
 
+    // When the operator did NOT pass the flag, honour the shared env resolvers
+    // so the CLI matches the server wire (`diag_frequency_penalty` /
+    // `diag_repeat_last_n`, which delegate to the same resolvers). An explicit
+    // flag wins (the `_explicit` guard). Centralised in pure helpers so the
+    // precedence is unit-testable and identical for both fields.
+    let frequency_penalty =
+        cli_resolve_frequency_penalty(frequency_penalty, frequency_penalty_explicit);
+    let repeat_last_n = cli_resolve_repeat_last_n(repeat_last_n, repeat_last_n_explicit);
+
     let sampling = SamplingParams {
         temperature,
         seed: Some(seed),
@@ -843,6 +1014,9 @@ pub(crate) fn run_inference(args: &[String]) {
         presence_penalty,
         frequency_penalty,
         repeat_last_n,
+        // Resolved later in `effective_sampling` from the MoE flag +
+        // LUMEN_ANTI_RESTATE; this base literal just satisfies the field.
+        anti_restate: false,
     };
     let stop = if let Some(ref tok) = tokenizer {
         let eos_ids = tok.stop_token_ids.clone();
@@ -893,11 +1067,11 @@ pub(crate) fn run_inference(args: &[String]) {
     };
 
     if use_async {
-        run_with_async(path, use_simd, use_metal, use_cuda, cuda_device, use_accelerate, threads, profile, verbose, &prompt_tokens, &stop, &sampling, context_len, tokenizer.as_ref(), &model_display, backend_name, kv_precision, &session_flags);
+        run_with_async(path, use_simd, use_metal, use_cuda, cuda_device, use_accelerate, threads, profile, verbose, &prompt_tokens, &stop, &sampling, context_len, tokenizer.as_ref(), &model_display, backend_name, kv_precision, &session_flags, enable_thinking);
     } else if use_sync {
-        run_with_sync(path, use_simd, use_metal, use_cuda, cuda_device, use_accelerate, threads, profile, verbose, &prompt_tokens, &stop, &sampling, context_len, tokenizer.as_ref(), &model_display, backend_name, kv_precision, &session_flags);
+        run_with_sync(path, use_simd, use_metal, use_cuda, cuda_device, use_accelerate, threads, profile, verbose, &prompt_tokens, &stop, &sampling, context_len, tokenizer.as_ref(), &model_display, backend_name, kv_precision, &session_flags, enable_thinking);
     } else {
-        run_with_mmap(path, use_simd, use_metal, use_cuda, cuda_device, use_accelerate, gpu_resident, option_a, threads, profile, verbose, verbose_routing, routing_bias, &prompt_tokens, &stop, &sampling, context_len, tokenizer.as_ref(), &model_display, backend_name, kv_precision, &session_flags);
+        run_with_mmap(path, use_simd, use_metal, use_cuda, cuda_device, use_accelerate, gpu_resident, option_a, threads, profile, verbose, verbose_routing, routing_bias, &prompt_tokens, &stop, &sampling, context_len, tokenizer.as_ref(), &model_display, backend_name, kv_precision, &session_flags, enable_thinking);
     }
 }
 
@@ -1303,13 +1477,108 @@ fn resolve_convert_to_lbc(gguf_path: &std::path::Path, lbc_out: &std::path::Path
 }
 
 /// Decode and print generated tokens as text when a tokenizer is available.
-/// Only the generated text goes to stdout (for piping). No headers or decoration.
-fn print_generated_text(tokens: &[u32], tokenizer: Option<&crate::tokenize::BpeTokenizer>) {
+/// Only the generated ANSWER goes to stdout (for piping). When
+/// `enable_thinking` is set, the model's `<think>...</think>` reasoning trace
+/// is split off via the SAME shared [`lumen_runtime::tooling::ReasoningExtractor`]
+/// the server uses and routed to stderr under a `[reasoning]` label, so it
+/// never pollutes the piped answer. No headers or decoration on the answer.
+///
+/// With `enable_thinking == false` (the default) the extractor is a pure
+/// passthrough, so this is byte-identical to the prior `println!("{text}")`.
+fn print_generated_text(
+    tokens: &[u32],
+    tokenizer: Option<&crate::tokenize::BpeTokenizer>,
+    enable_thinking: bool,
+) {
     if let Some(tok) = tokenizer {
         let stop_ids = &tok.stop_token_ids;
         let clean: Vec<u32> = tokens.iter().copied().filter(|t| !stop_ids.contains(t)).collect();
+        // Diagnostic (default OFF): dump raw generated token ids plus the
+        // per-id decoded byte string, so a model-decode degenerate token
+        // (e.g. an extra "lication" id) is distinguishable from any
+        // detokenizer effect. The streaming detok is a pure per-id byte
+        // concat, so a doubled sub-word here means the model emitted it.
+        if std::env::var("LUMEN_DUMP_TOKEN_IDS").is_ok() {
+            eprintln!("[DUMP_TOKEN_IDS] count={}", clean.len());
+            eprintln!("[DUMP_TOKEN_IDS] ids={clean:?}");
+            for &id in &clean {
+                let frag = String::from_utf8_lossy(&tok.decode_bytes(&[id])).to_string();
+                eprintln!("[DUMP_TOKEN_IDS] id={id} frag={frag:?}");
+            }
+        }
         let text = tok.decode(&clean);
-        println!("{text}");
+        if !enable_thinking {
+            // F8: strip `<tool_call>...</tool_call>` blocks from stdout via the
+            // SAME shared parser both server surfaces use, so the CLI answer
+            // matches the server `content`. BYTE-IDENTITY: `parse_final` on text
+            // with no `<tool_call>` returns `content == input` verbatim, so plain
+            // (non-tool) output is identical to the historical `println!("{text}")`.
+            let parsed = lumen_runtime::tooling::parse_final(&text);
+            print_parsed_tool_calls(&parsed.tool_calls);
+            // F4: truncate the answer at the first `--stop` match (no-op when no
+            // `--stop` was passed → byte-identical).
+            println!("{}", apply_stop_truncation(&parsed.content));
+            return;
+        }
+        // Split reasoning from answer with the shared extractor (batch decode,
+        // so one feed + finish reconstructs the full split).
+        let mut extractor = lumen_runtime::tooling::ReasoningExtractor::new(true);
+        let mut delta = extractor.feed(&text);
+        let tail = extractor.finish();
+        delta.reasoning.push_str(&tail.reasoning);
+        delta.content.push_str(&tail.content);
+        if !delta.reasoning.is_empty() {
+            eprintln!("[reasoning] {}", delta.reasoning);
+        }
+        // F8: strip tool-call blocks from the ANSWER content too (the reasoning
+        // trace already went to stderr above). Same byte-identity guarantee for
+        // tool-free content.
+        let parsed = lumen_runtime::tooling::parse_final(&delta.content);
+        print_parsed_tool_calls(&parsed.tool_calls);
+        // F4: stop truncation applies to the answer, not the reasoning trace.
+        println!("{}", apply_stop_truncation(&parsed.content));
+    }
+}
+
+/// F4: truncate `content` at the earliest occurrence of any process-global
+/// `--stop` string (the matched bytes and everything after are dropped, exactly
+/// like the server's "emit up-to-but-excluding the stop" rule). Because the CLI
+/// prints the FULL generated answer in one batch, a simple earliest-substring
+/// search is sufficient (no cross-chunk straddle to handle). Returns `content`
+/// UNCHANGED when no `--stop` was passed, so non-stop output is byte-identical.
+fn apply_stop_truncation(content: &str) -> &str {
+    match STOP_SEQUENCES.get() {
+        Some(stops) => truncate_at_first_stop(content, stops),
+        None => content,
+    }
+}
+
+/// Pure earliest-stop truncation over an explicit stop list, factored out so it
+/// is unit-testable without the process-global `STOP_SEQUENCES` OnceLock. Empty
+/// list (or no match) → `content` returned verbatim (byte-identity guarantee).
+fn truncate_at_first_stop<'a>(content: &'a str, stops: &[String]) -> &'a str {
+    let mut cut: Option<usize> = None;
+    for s in stops {
+        if s.is_empty() {
+            continue;
+        }
+        if let Some(pos) = content.find(s.as_str()) {
+            cut = Some(cut.map_or(pos, |c: usize| c.min(pos)));
+        }
+    }
+    match cut {
+        Some(pos) => &content[..pos],
+        None => content,
+    }
+}
+
+/// F8: surface parsed tool calls to STDERR (mirroring the `[reasoning]`
+/// channel), so stdout carries only the assistant's plain-text answer — the
+/// same split both server wire surfaces apply. No-op when there are no calls,
+/// so tool-free output is byte-identical.
+fn print_parsed_tool_calls(calls: &[lumen_runtime::tooling::ParsedToolCall]) {
+    for call in calls {
+        eprintln!("[tool_call] {}({})", call.name, call.arguments_json);
     }
 }
 
@@ -1498,6 +1767,7 @@ fn run_with_async(
     backend_name: &str,
     kv_precision: KvPrecision,
     session_flags: &SessionFlags,
+    enable_thinking: bool,
 ) {
     let provider = AsyncWeightProvider::open(path).unwrap_or_else(|e| {
         eprintln!("Error opening model: {e}");
@@ -1511,6 +1781,9 @@ fn run_with_async(
     // on `set_path_is_server(false)` (set in `main`) so the decode-delay
     // default remains 0 µs — CLI is fork-deterministic.
     lumen_runtime::runtime_defaults::set_model_dense_quant(provider.output_proj_quant);
+    lumen_runtime::runtime_defaults::set_model_block_count(
+        provider.lbc().header.hyperparams.num_layers,
+    );
     // Feed the MoE flag into the runtime defaults so the Q8-only
     // resolvers (Q8_SPLIT / OUTPUT_PROJ_SPLIT / Q8_SCALE_HW /
     // OUTPUT_PROJ_NR / FFN_FUSED_GLU_SKIP) stay OFF on MoE 30B-A3B.
@@ -1557,7 +1830,13 @@ fn run_with_async(
         collect_per_layer_timings: profile,
     };
 
-    let engine = InferenceEngine::new(config, hyperparams_capped);
+    let mut engine = InferenceEngine::new(config, hyperparams_capped);
+    // Install the anti-restate guard's per-token-id byte decoder (powers the
+    // sub-word-doubling rule). No-op for the id-only n-gram restate rule and
+    // when the guard is disabled (dense / LUMEN_ANTI_RESTATE=0).
+    if let Some(tok) = tokenizer {
+        engine.set_token_decoder(tok.byte_decoder_fn());
+    }
     let live = LiveModel::from_lbc(provider.lbc(), provider.output_proj_quant);
     run_engine(
         &engine, &provider, backend.as_ref(), use_accelerate,
@@ -1565,7 +1844,7 @@ fn run_with_async(
         &provider.embedding, &provider.final_norm,
         prompt_tokens, stop, sampling, tokenizer,
         verbose, model_display, backend_name,
-        session_flags, &live,
+        session_flags, &live, enable_thinking,
     );
 }
 
@@ -1589,6 +1868,7 @@ fn run_with_sync(
     backend_name: &str,
     kv_precision: KvPrecision,
     session_flags: &SessionFlags,
+    enable_thinking: bool,
 ) {
     let provider = SyncWeightProvider::open(path).unwrap_or_else(|e| {
         eprintln!("Error opening model: {e}");
@@ -1599,6 +1879,9 @@ fn run_with_sync(
     // sync provider follows the same pattern — set the model-aware
     // defaults BEFORE any backend constructor runs.
     lumen_runtime::runtime_defaults::set_model_dense_quant(provider.output_proj_quant);
+    lumen_runtime::runtime_defaults::set_model_block_count(
+        provider.lbc().header.hyperparams.num_layers,
+    );
     // Feed the MoE flag alongside the dense-quant hint.
     lumen_runtime::runtime_defaults::set_model_is_moe(
         provider.lbc().header.hyperparams.num_experts.unwrap_or(0) > 0,
@@ -1665,7 +1948,13 @@ fn run_with_sync(
         collect_per_layer_timings: profile,
     };
 
-    let engine = InferenceEngine::new(config, hyperparams_capped);
+    let mut engine = InferenceEngine::new(config, hyperparams_capped);
+    // Install the anti-restate guard's per-token-id byte decoder (powers the
+    // sub-word-doubling rule). No-op for the id-only n-gram restate rule and
+    // when the guard is disabled (dense / LUMEN_ANTI_RESTATE=0).
+    if let Some(tok) = tokenizer {
+        engine.set_token_decoder(tok.byte_decoder_fn());
+    }
     let live = LiveModel::from_lbc(provider.lbc(), provider.output_proj_quant);
     run_engine(
         &engine, &provider, backend.as_ref(), use_accelerate,
@@ -1673,7 +1962,7 @@ fn run_with_sync(
         &provider.embedding, &provider.final_norm,
         prompt_tokens, stop, sampling, tokenizer,
         verbose, model_display, backend_name,
-        session_flags, &live,
+        session_flags, &live, enable_thinking,
     );
 }
 
@@ -1704,6 +1993,7 @@ fn run_with_mmap(
     backend_name: &str,
     kv_precision: KvPrecision,
     session_flags: &SessionFlags,
+    enable_thinking: bool,
 ) {
     let mmap_config = MmapConfig {
         prefetch_window: 2,
@@ -1717,6 +2007,9 @@ fn run_with_mmap(
 
     // see the AsyncWeightProvider branch for rationale.
     lumen_runtime::runtime_defaults::set_model_dense_quant(provider.output_proj_quant);
+    lumen_runtime::runtime_defaults::set_model_block_count(
+        provider.lbc().header.hyperparams.num_layers,
+    );
     // Feed the MoE flag alongside the dense-quant hint.
     lumen_runtime::runtime_defaults::set_model_is_moe(
         provider.lbc().header.hyperparams.num_experts.unwrap_or(0) > 0,
@@ -1738,7 +2031,13 @@ fn run_with_mmap(
         collect_per_layer_timings: profile,
     };
 
-    let engine = InferenceEngine::new(config, hyperparams_capped);
+    let mut engine = InferenceEngine::new(config, hyperparams_capped);
+    // Install the anti-restate guard's per-token-id byte decoder (powers the
+    // sub-word-doubling rule). No-op for the id-only n-gram restate rule and
+    // when the guard is disabled (dense / LUMEN_ANTI_RESTATE=0).
+    if let Some(tok) = tokenizer {
+        engine.set_token_decoder(tok.byte_decoder_fn());
+    }
 
     // Metal path: use concrete MetalF32Backend for both batched prefill + decode
     #[cfg(target_os = "macos")]
@@ -1833,6 +2132,10 @@ fn run_with_mmap(
         // --session-resume / --session-save is set; otherwise use the
         // legacy direct-KV `engine.generate` path. Both produce a
         // `GenerationResult` of the same shape.
+        // This Metal batched-prefill path bypasses `run_engine`, so resolve
+        // the model-aware `repetition_penalty` default here too (MoE → 1.03
+        // when the operator did not pass `--repeat-penalty`).
+        let resolved_sampling = effective_sampling(sampling);
         let live = LiveModel::from_lbc(provider.lbc(), provider.output_proj_quant);
         let gen_result = run_generation(
             &engine,
@@ -1840,14 +2143,14 @@ fn run_with_mmap(
             &metal as &dyn ComputeBackend,
             prompt_tokens,
             stop,
-            sampling,
+            &resolved_sampling,
             session_flags,
             &live,
             verbose,
         );
         match gen_result {
             Ok(result) => {
-                print_generated_text(&result.tokens, tokenizer);
+                print_generated_text(&result.tokens, tokenizer, enable_thinking);
                 if verbose {
                     eprintln!("Generated tokens: {:?}", result.tokens);
                     eprintln!("\n--- Metrics ---");
@@ -1938,7 +2241,7 @@ fn run_with_mmap(
         &provider.embedding, &provider.final_norm,
         prompt_tokens, stop, sampling, tokenizer,
         verbose, model_display, backend_name,
-        session_flags, &live,
+        session_flags, &live, enable_thinking,
     );
 }
 
@@ -1964,8 +2267,18 @@ fn run_engine(
     backend_name: &str,
     session_flags: &SessionFlags,
     live: &LiveModel,
+    enable_thinking: bool,
 ) {
     if verbose { eprintln!("Prompt tokens: {prompt_tokens:?}"); }
+
+    // Resolve the model-aware `repetition_penalty` default now that the LBC is
+    // open and `runtime_defaults::set_model_is_moe` has run (called by every
+    // `run_with_*` before reaching here). When the operator did not pass
+    // `--repeat-penalty`, MoE models get 1.03 (the GDN parity stack lands the
+    // math at greedy; 1.05+ corrupts MoE arithmetic); dense and explicit-override
+    // paths are unchanged.
+    let resolved_sampling = effective_sampling(sampling);
+    let sampling = &resolved_sampling;
 
     // Metal batched prefill is handled in the run_with_* functions directly,
     // not here, to avoid creating a second Metal backend.
@@ -1996,7 +2309,7 @@ fn run_engine(
         );
         match engine.generate_with_prefill(prompt_tokens, weights, backend, &mut accel, stop, sampling) {
             Ok(result) => {
-                print_generated_text(&result.tokens, tokenizer);
+                print_generated_text(&result.tokens, tokenizer, enable_thinking);
                 if verbose {
                     eprintln!("Generated tokens: {:?}", result.tokens);
                     eprintln!("\n--- Metrics ---");
@@ -2034,7 +2347,7 @@ fn run_engine(
     );
     match gen_result {
         Ok(result) => {
-            print_generated_text(&result.tokens, tokenizer);
+            print_generated_text(&result.tokens, tokenizer, enable_thinking);
             if verbose {
                 eprintln!("Generated tokens: {:?}", result.tokens);
                 eprintln!("\n--- Metrics ---");
@@ -2178,23 +2491,171 @@ mod tests {
 
     #[test]
     fn resolve_kv_precision_metal_defaults_to_f16() {
-        // Clear env to ensure backend default takes effect.
+        // Clear env to ensure backend default takes effect. Serialise on the
+        // shared ENV_LOCK and restore the prior value before asserting so this
+        // mutation never races (or leaks to) a sibling env-reading test.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var("LUMEN_KV_PRECISION").ok();
         std::env::remove_var("LUMEN_KV_PRECISION");
         let p = resolve_kv_precision(None, true, false, false);
+        if let Some(v) = saved {
+            std::env::set_var("LUMEN_KV_PRECISION", v);
+        }
         assert_eq!(p, KvPrecision::F16);
     }
 
     #[test]
     fn resolve_kv_precision_cuda_defaults_to_f32() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var("LUMEN_KV_PRECISION").ok();
         std::env::remove_var("LUMEN_KV_PRECISION");
         let p = resolve_kv_precision(None, false, true, false);
+        if let Some(v) = saved {
+            std::env::set_var("LUMEN_KV_PRECISION", v);
+        }
         assert_eq!(p, KvPrecision::F32);
     }
 
     #[test]
     fn resolve_kv_precision_cpu_defaults_to_f32() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var("LUMEN_KV_PRECISION").ok();
         std::env::remove_var("LUMEN_KV_PRECISION");
         let p = resolve_kv_precision(None, false, false, false);
+        if let Some(v) = saved {
+            std::env::set_var("LUMEN_KV_PRECISION", v);
+        }
         assert_eq!(p, KvPrecision::F32);
+    }
+
+    // --- F1: CLI honours LUMEN_FREQUENCY_PENALTY / LUMEN_REPEAT_LAST_N when
+    // the flag is unset, and an explicit flag overrides the env. These mutate
+    // process env, so serialise on a module-local lock to avoid cross-test
+    // interference.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn cli_frequency_penalty_honors_env_when_flag_unset_but_flag_overrides() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var("LUMEN_FREQUENCY_PENALTY").ok();
+
+        // Flag unset (explicit=false) + env set → CLI adopts the env value,
+        // matching the server wire.
+        std::env::set_var("LUMEN_FREQUENCY_PENALTY", "0.4");
+        let env_set = cli_resolve_frequency_penalty(None, false);
+
+        // Flag passed (explicit=true) → the parsed value wins over the env.
+        // (--frequency-penalty 0 normalizes to None at the parser, i.e. an
+        // explicit disable that must NOT be re-enabled by the env.)
+        let flag_disable = cli_resolve_frequency_penalty(None, true);
+        let flag_value = cli_resolve_frequency_penalty(Some(0.2), true);
+
+        // Flag unset + env unset → no-op (None), byte-identical to today.
+        std::env::remove_var("LUMEN_FREQUENCY_PENALTY");
+        let env_unset = cli_resolve_frequency_penalty(None, false);
+
+        // Restore BEFORE asserting so a failed assert cannot leak env state.
+        match saved {
+            Some(v) => std::env::set_var("LUMEN_FREQUENCY_PENALTY", v),
+            None => std::env::remove_var("LUMEN_FREQUENCY_PENALTY"),
+        }
+
+        assert_eq!(env_set, Some(0.4));
+        assert_eq!(flag_disable, None);
+        assert_eq!(flag_value, Some(0.2));
+        assert_eq!(env_unset, None);
+    }
+
+    #[test]
+    fn cli_repeat_last_n_honors_env_when_flag_unset_but_flag_overrides() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var("LUMEN_REPEAT_LAST_N").ok();
+
+        // Flag unset + env set → CLI adopts the env window.
+        std::env::set_var("LUMEN_REPEAT_LAST_N", "64");
+        let env_set = cli_resolve_repeat_last_n(None, false);
+
+        // Flag passed wins over env (an explicit `--repeat-last-n 0` → None
+        // disable must not be re-windowed by the env).
+        let flag_disable = cli_resolve_repeat_last_n(None, true);
+        let flag_value = cli_resolve_repeat_last_n(Some(32), true);
+
+        // Flag unset + env unset → None (full-history), byte-identical.
+        std::env::remove_var("LUMEN_REPEAT_LAST_N");
+        let env_unset = cli_resolve_repeat_last_n(None, false);
+
+        // Restore BEFORE asserting so a failed assert cannot leak env state.
+        match saved {
+            Some(v) => std::env::set_var("LUMEN_REPEAT_LAST_N", v),
+            None => std::env::remove_var("LUMEN_REPEAT_LAST_N"),
+        }
+
+        assert_eq!(env_set, Some(64));
+        assert_eq!(flag_disable, None);
+        assert_eq!(flag_value, Some(32));
+        assert_eq!(env_unset, None);
+    }
+
+    // --- F8: CLI strips <tool_call> blocks from stdout via the shared
+    // `parse_final`, byte-identical for tool-free text. These assert the exact
+    // text the CLI prints (`parse_final(...).content`) on the default
+    // (thinking-off) answer path.
+
+    #[test]
+    fn f8_parse_final_plain_text_is_byte_identical() {
+        // The load-bearing F8 invariant: text with NO <tool_call> round-trips
+        // verbatim, so the historical `println!("{text}")` output is unchanged.
+        for s in [
+            "Hello, world.",
+            "multi\nline\noutput",
+            "trailing newline\n",
+            "ends with an angle bracket <",
+            "less-than in math: a < b and c > d",
+            "",
+        ] {
+            let parsed = lumen_runtime::tooling::parse_final(s);
+            assert_eq!(parsed.content, s, "parse_final must echo tool-free text verbatim: {s:?}");
+            assert!(parsed.tool_calls.is_empty());
+        }
+    }
+
+    #[test]
+    fn f8_parse_final_strips_tool_call_block_from_content() {
+        // A <tool_call> block is removed from the printed content and surfaced
+        // as a structured call (mirrors both server surfaces).
+        let text = "Sure.<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call> Done.";
+        let parsed = lumen_runtime::tooling::parse_final(text);
+        assert!(!parsed.content.contains("<tool_call>"), "marker must be stripped");
+        assert!(!parsed.content.contains("get_weather"), "tool JSON must not leak to stdout");
+        assert!(parsed.content.contains("Sure."));
+        assert!(parsed.content.contains("Done."));
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "get_weather");
+    }
+
+    // --- F4: CLI `--stop` truncation (batch). Tested through the pure
+    // `truncate_at_first_stop` helper so the process-global OnceLock is not
+    // disturbed.
+
+    #[test]
+    fn f4_cli_empty_stop_list_is_byte_identical() {
+        // No --stop (empty list) → content returned verbatim, byte-identical.
+        let full = "alpha STOP beta";
+        assert_eq!(truncate_at_first_stop(full, &[]), full);
+        assert_eq!(truncate_at_first_stop(full, &["".to_string()]), full, "empty stop entries are ignored");
+        assert_eq!(truncate_at_first_stop(full, &["ZZZ".to_string()]), full, "no match → verbatim");
+    }
+
+    #[test]
+    fn f4_cli_stop_truncates_at_first_match() {
+        let full = "keep this STOP drop this";
+        assert_eq!(truncate_at_first_stop(full, &["STOP".to_string()]), "keep this ");
+        // Earliest of multiple stops wins.
+        let two = "aaa END bbb STOP ccc";
+        assert_eq!(
+            truncate_at_first_stop(two, &["STOP".to_string(), "END".to_string()]),
+            "aaa ",
+            "the earliest-starting stop string must win"
+        );
     }
 }

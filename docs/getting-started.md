@@ -66,7 +66,7 @@ A coherent text stream, token by token, on your GPU (Metal on Apple Silicon, CUD
 
 ## 5. Before you deploy
 
-Read [`docs/production.md`](production.md) before putting Lumen on real traffic — it covers serving-mode choice (`lumen-server` vs `lumen run`), per-quant GPU sizing, and known limitations. One gotcha worth knowing on day one: PURE-greedy (`--temperature 0`, no penalty) deterministically loops on long generations (≥512 tokens) — use `--temperature 0.7` OR `--repetition-penalty 1.05 --repeat-last-n 64`.
+Read [`docs/production.md`](production.md) before putting Lumen on real traffic — it covers serving-mode choice (`lumen-server` vs `lumen run`), per-quant GPU sizing, and known limitations. One gotcha worth knowing on day one: PURE-greedy (`--temperature 0`, no penalty) deterministically loops on long generations (≥512 tokens) — use `--temperature 0.7` OR, on DENSE models, `--repetition-penalty 1.05 --repeat-last-n 64`. (When the flag is omitted the server/CLI apply a model-aware penalty: 1.05 dense / 1.03 MoE; MoE must stay ≤ 1.03.)
 
 ## Next steps
 

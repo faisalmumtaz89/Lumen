@@ -55,7 +55,7 @@ The 12-flag CUDA production stack is **default-ON** (set any to `=0` to opt out)
 | `LUMEN_CUDA_FA2_BLOCKSKIP` | FA2 prefill with block-skip causal kernel |
 | `LUMEN_CUDA_FFN_FUSED_GLU` | Fused gate+up+SwiGLU FFN variant |
 | `LUMEN_CUDA_GDN_AB_F32` | F32 A-tile / B-tile accumulators in GDN |
-| `LUMEN_CUDA_GDN_F64_ACCUM` | F64 accumulator in GDN (numerical-stability scratch) |
+| `LUMEN_CUDA_GDN_F64_ACCUM` | F64 GDN delta-rule accumulator; **default-ON for MoE** — the decode-vs-prefill parity fix that lands MoE arithmetic at greedy; no-op/OFF for dense (see [MoE correctness defaults](#cuda--moe-correctness-defaults-auto-on-for-moe-no-op-for-dense)) |
 | `LUMEN_CUDA_GDN_PHASE4_COAL` | GDN phase-4 coalesced dispatch |
 | `LUMEN_CUDA_GDN_SPLIT` | Split layout for GDN tensors (Q4; +2.6% Q4 decode) |
 | `LUMEN_CUDA_L2NORM_RSQRTF` | Two-step rsqrtf L2 norm variant (`rsqrtf(fmaxf(ss,eps^2))`, one HW op) |
@@ -82,6 +82,25 @@ The 12-flag CUDA production stack is **default-ON** (set any to `=0` to opt out)
 | `LUMEN_CUDA_RMSNORM_RSQRTF` | rsqrtf + block-wide warp-shuffle RMSNorm kernel |
 | `LUMEN_CUDA_SKIP_BF16_PROBE` | Skip BF16 GemmEx capability probe at startup |
 | `LUMEN_CUDA_SKIP_SHARED_EXPERT` / `_GATE` | Skip shared-expert path / gate (debug) |
+
+### CUDA — MoE correctness defaults (auto-ON for MoE, no-op for dense)
+
+These flags fix the MoE GDN decode-vs-prefill divergence that the 256-expert
+router amplifies into garble. Each is **default-ON only for MoE models** (gated
+on `model_is_moe()`); for dense models the gate forces them OFF so dense output
+stays **byte-identical** to history regardless of the env (`LUMEN_ANTI_RESTATE`
+narrows further to BF16 MoE only — see its row). Source of truth:
+`runtime_defaults` (`gdn_ab_f16_default`, `gdn_decode_via_prefill_default`,
+`gdn_convstate_parity_default`, `gdn_f64_accum_default`, `anti_restate_default`).
+Set any to `=0` to opt out on MoE, `=1` to force on.
+
+| Variable | Description |
+|---|---|
+| `LUMEN_CUDA_GDN_AB_F16` | Route the GDN `ssm_alpha`/`ssm_beta` projections through the same F16-cache `cublasGemmEx` recipe in BOTH decode and prefill, making alpha/beta bit-identical decode-vs-prefill; **default-ON for MoE**, no-op for dense |
+| `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL` | Run the whole MoE GDN decode recurrence block (conv1d + gates + L2-norm + delta-rule + norm-gate) through the PREFILL fused kernels at `T=1`, so GDN-decode == GDN-prefill by construction; **default-ON for MoE**, no-op for dense |
+| `LUMEN_CUDA_GDN_CONVSTATE_PARITY` | Compute the decode GDN qkv projection via the prefill `launch_gemm_projection` path at `batch=1` so the new conv-ring slot's `conv_state` bit-matches a true prefill; **default-ON for MoE** (requires `GDN_DECODE_VIA_PREFILL`), no-op for dense |
+| `LUMEN_CUDA_GDN_F64_ACCUM` | F64 GDN delta-rule accumulator — the foundational decode-vs-prefill parity fix that lands MoE arithmetic at greedy; **default-ON for MoE**, no-op/OFF for dense |
+| `LUMEN_ANTI_RESTATE` | Deterministic greedy anti-degeneration veto applied after argmax; suppresses a single near-tie sub-word doubling / n-gram restate the MoE decode picks but llama.cpp does not. **Default-ON for BF16 MoE only** (the resolver keeps it effectively off for q8/q4 MoE, whose math basin needs the un-vetoed token); OFF for dense |
 
 ### CUDA — diagnostics & legacy
 

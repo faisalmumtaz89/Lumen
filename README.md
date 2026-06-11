@@ -166,6 +166,8 @@ POST /v1/messages           # Anthropic-compatible, SSE streaming
 
 Both wire formats support SSE streaming. The tool-call parser is template-driven; v1 (current) ships the Qwen3.5 `<tool_call>` / `</tool_call>` marker pattern with streaming partial-marker hold-back, and additional templates are straightforward to register as more model families ship. Reference embedder: `crates/lumen-server/tests/server_integration.rs`. Reference binary: `crates/lumen-server/src/bin/lumen-server.rs`.
 
+Optional per-request **reasoning / extended thinking** (default OFF, separate `reasoning_budget` from `max_tokens`): OpenAI `enable_thinking` (+ vLLM `chat_template_kwargs.enable_thinking`) surfacing `reasoning_content`, Anthropic `thinking.type` surfacing a `thinking` block, and the CLI `--think` flag; `LUMEN_CHAT_ENABLE_THINKING` overrides the default. See [HTTP server → Reasoning / extended thinking](docs/server.md#reasoning--extended-thinking).
+
 ## Architecture
 
 ```text
@@ -237,7 +239,7 @@ Full operator runbook lives in [`docs/production.md`](docs/production.md). Key r
 - For concurrent clients deploy `lumen-server`, not repeated `lumen run` invocations (the CLI cold-loads ~60–120 s per call; 16-client burst measured 82.4% timeout rate).
 - **BF16 MoE-30B-A3B requires a dedicated 80 GB+ GPU** — peak VRAM 72.4 GB on 80 GB A100. No co-tenant workloads.
 - For multilingual / long-form prompts pass `--max-tokens 512` minimum (chat template opens `<think>…</think>`).
-- PURE-greedy (`--temperature 0`) on long generations (≥512 tokens) deterministically loops; use `--temperature 0.7` OR `--repetition-penalty 1.05 --repeat-last-n 64`.
+- PURE-greedy (`--temperature 0`) on long generations (≥512 tokens) deterministically loops; use `--temperature 0.7` OR, on DENSE models, `--repetition-penalty 1.05 --repeat-last-n 64`. The server and CLI already apply a **model-aware** penalty when the flag is omitted (1.05 dense / **1.03 MoE**); MoE must stay ≤ 1.03 — `1.05` corrupts MoE arithmetic. Source of truth: `runtime_defaults::repetition_penalty_default`.
 - Canonical env stack (CUDA, MoE-30B-A3B BF16 0.9× llama.cpp gate): all 12 flags default-ON. Critically **`LUMEN_CUDA_BF16_GEMMEX=0`** is required for BF16 P3 correctness. Full stack in [`bench/METHODOLOGY.md`](bench/METHODOLOGY.md).
 - LBC format compatibility: `LBC_VERSION = 3`. Rebuild LBCs after major Lumen upgrades via `lumen convert` or `lumen pull`.
 

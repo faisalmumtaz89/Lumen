@@ -517,3 +517,274 @@ extern "C" __global__ void gdn_decode_megakernel_graph(
         output[h * head_dim + vj] = my_out;
     }
 }
+
+
+// ============================================================================
+// F64-internal-accumulator twins of the decode megakernel.
+//
+// PURPOSE: restore DECODE/PREFILL PRECISION PARITY on the LIVE MoE decode path.
+//
+// The F32 `gdn_decode_megakernel` above is the active default MoE decode kernel.
+// The batched MoE PREFILL scan, by contrast, runs F64-accum
+// (`gdn_prefill_fused_v3_f64accum` + `l2_normalize_qk_strided_f64accum`,
+// selected by `gdn_f64_accum_enabled() = model_is_moe()`). Same decay-first
+// FORM, different PRECISION (decode F32 vs prefill F64). The per-step F32-ULP
+// rounding makes the decode-built recurrent `h_state` drift away from the
+// prefill-built state; the 256-expert MoE router amplifies the drift into
+// expert-selection flips → cascaded garble.
+//
+// These twins keep the EXACT same structure / dispatch geometry / shmem layout
+// as the F32 megakernels but accumulate the L2-norm sum-of-squares and the
+// delta-rule recurrence (decay / retrieval / v_delta / state) in F64 in
+// registers, writing F32 back to `h_state` — mirroring the prefill F64 kernels
+// bit-for-bit in arithmetic. Conv1D+SiLU stays F32 (the prefill conv is F32 in
+// `ssm_conv1d_silu_prefill`); the alpha/beta gates stay F32 (matching the F32
+// `gdn_compute_gates_batched` the prefill uses). Only the two F64-sensitive
+// stages — L2-norm reduction and the recurrent state update — are promoted, so
+// the decode state tracks the prefill state to F64 rounding.
+//
+// Gated MoE-only (env `LUMEN_CUDA_GDN_DECODE_MEGAKERNEL_F64`); OFF is
+// byte-identical to the F32 path (these kernels are simply not dispatched).
+//
+// NVRTC-compatible: no system includes, extern "C" linkage.
+// ============================================================================
+
+// Block-level F64 sum reduction. Same butterfly-XOR ordering pattern as
+// `block_reduce_sum_mega` but accumulates in double. `warp_scratch_d` is a
+// double scratch region in shmem (the megakernel's shmem is laid out as float;
+// we reinterpret the first 32 floats = 16 doubles, enough for <=16 warps).
+__device__ __forceinline__ double warp_reduce_sum_mega_f64(double val) {
+    val += __shfl_xor_sync(0xffffffff, val, 16);
+    val += __shfl_xor_sync(0xffffffff, val, 8);
+    val += __shfl_xor_sync(0xffffffff, val, 4);
+    val += __shfl_xor_sync(0xffffffff, val, 2);
+    val += __shfl_xor_sync(0xffffffff, val, 1);
+    return val;
+}
+
+__device__ __forceinline__ double block_reduce_sum_mega_f64(
+    double val, double* warp_scratch_d,
+    unsigned int tid, unsigned int block_size)
+{
+    unsigned int warp_id = tid >> 5;
+    unsigned int lane_id = tid & 31u;
+    unsigned int num_warps = block_size >> 5;
+
+    val = warp_reduce_sum_mega_f64(val);
+    if (lane_id == 0) warp_scratch_d[warp_id] = val;
+    __syncthreads();
+
+    double total = 0.0;
+    if (warp_id == 0) {
+        total = (lane_id < num_warps) ? warp_scratch_d[lane_id] : 0.0;
+        total = warp_reduce_sum_mega_f64(total);
+    }
+    if (tid == 0) warp_scratch_d[0] = total;
+    __syncthreads();
+    return warp_scratch_d[0];
+}
+
+// Shared body for both the eager and graph F64 megakernel variants. The only
+// difference between the two public entry points is how `state_pos` is sourced
+// (scalar arg vs device pointer), exactly as for the F32 pair.
+__device__ __forceinline__ void gdn_decode_megakernel_f64accum_body(
+    float* __restrict__ conv_state,
+    float* __restrict__ h_state,
+    const float* __restrict__ qkv_buf,
+    const float* __restrict__ alpha_raw,
+    const float* __restrict__ beta_raw,
+    const float* __restrict__ conv_weight,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ ssm_a,
+    float* __restrict__ output,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int qkv_dim,
+    unsigned int qk_dim,
+    unsigned int value_dim,
+    unsigned int kernel_size,
+    unsigned int state_pos)
+{
+    extern __shared__ float shmem[];
+
+    unsigned int h = blockIdx.x;
+    if (h >= num_heads) return;
+
+    unsigned int tid = threadIdx.x;
+    unsigned int block_size = blockDim.x;
+    unsigned int buf_slots = kernel_size - 1;
+    unsigned int kv_head = h % num_kv_heads;
+
+    // Shared memory layout (identical to F32 megakernel):
+    //   warp_scratch[32]   -- reduction temporaries (reinterpreted as 16 doubles)
+    //   q_shmem[head_dim]  -- Q for this head's kv_head (after conv+silu+norm)
+    //   k_shmem[head_dim]  -- K for this head's kv_head (after conv+silu+norm)
+    float* warp_scratch = shmem;
+    double* warp_scratch_d = (double*)shmem;  // first 32 floats = 16 doubles
+    float* q_shmem = shmem + 32;
+    float* k_shmem = shmem + 32 + head_dim;
+
+    // ====================================================================
+    // Phase 1: Conv1D + SiLU (F32, matches prefill ssm_conv1d_silu_prefill).
+    // ====================================================================
+    unsigned int q_base = kv_head * head_dim;
+    unsigned int k_base = qk_dim + kv_head * head_dim;
+    unsigned int v_base = 2 * qk_dim + h * head_dim;
+
+    for (unsigned int i = tid; i < head_dim; i += block_size) {
+        q_shmem[i] = conv1d_silu_update(
+            q_base + i, qkv_buf, conv_weight, conv_state,
+            qkv_dim, kernel_size, buf_slots, state_pos);
+        k_shmem[i] = conv1d_silu_update(
+            k_base + i, qkv_buf, conv_weight, conv_state,
+            qkv_dim, kernel_size, buf_slots, state_pos);
+        output[h * head_dim + i] = conv1d_silu_update(
+            v_base + i, qkv_buf, conv_weight, conv_state,
+            qkv_dim, kernel_size, buf_slots, state_pos);
+    }
+    __syncthreads();
+
+    // ====================================================================
+    // Phase 2: Gates (F32, matches prefill gdn_compute_gates_batched).
+    // ====================================================================
+    float alpha_val, beta_val;
+    if (tid == 0) {
+        float sp_input = alpha_raw[h] + dt_bias[h];
+        float sp = (sp_input > 20.0f) ? sp_input : logf(1.0f + expf(sp_input));
+        warp_scratch[0] = expf(ssm_a[h] * sp);                  // alpha
+        warp_scratch[1] = 1.0f / (1.0f + expf(-beta_raw[h]));   // beta
+    }
+    __syncthreads();
+    alpha_val = warp_scratch[0];
+    beta_val = warp_scratch[1];
+    __syncthreads();  // protect warp_scratch reuse as double scratch below
+
+    // ====================================================================
+    // Phase 3: L2-normalize Q and K per head — F64 reduction
+    // (mirrors l2_normalize_qk_strided_f64accum: double ss, sqrt, 1/norm,
+    //  eps = 1e-12, F32 write-back).
+    // ====================================================================
+    {
+        double ss = 0.0;
+        for (unsigned int i = tid; i < head_dim; i += block_size) {
+            double v = (double)q_shmem[i];
+            ss += v * v;
+        }
+        double total = block_reduce_sum_mega_f64(ss, warp_scratch_d, tid, block_size);
+        double norm = sqrt(total);
+        double inv = (norm > 1e-12) ? (1.0 / norm) : (1.0 / 1e-12);
+        for (unsigned int i = tid; i < head_dim; i += block_size) {
+            q_shmem[i] = (float)((double)q_shmem[i] * inv);
+        }
+    }
+    __syncthreads();
+    {
+        double ss = 0.0;
+        for (unsigned int i = tid; i < head_dim; i += block_size) {
+            double v = (double)k_shmem[i];
+            ss += v * v;
+        }
+        double total = block_reduce_sum_mega_f64(ss, warp_scratch_d, tid, block_size);
+        double norm = sqrt(total);
+        double inv = (norm > 1e-12) ? (1.0 / norm) : (1.0 / 1e-12);
+        for (unsigned int i = tid; i < head_dim; i += block_size) {
+            k_shmem[i] = (float)((double)k_shmem[i] * inv);
+        }
+    }
+    __syncthreads();
+
+    // ====================================================================
+    // Phase 4: Delta-rule state update + output query — F64 recurrence
+    // (mirrors gdn_prefill_fused_v3_f64accum: double decay/retrieval/v_delta/
+    //  state, q_scale = 1/sqrt((double)head_dim), F32 state write-back).
+    //
+    // One thread per val_dim element (scalar loop form, identical to the
+    // graph F32 variant; mathematically equal to the float4 eager form).
+    // ====================================================================
+    if (tid < head_dim) {
+        unsigned int vj = tid;
+        double q_scale = 1.0 / sqrt((double)head_dim);
+        double v_val = (double)output[h * head_dim + vj];  // V from phase 1 temp
+
+        float* h_row = h_state + (unsigned long long)h * head_dim * head_dim
+                                + (unsigned long long)vj * head_dim;
+
+        // Decay + retrieve from decayed state (F64).
+        double a = (double)alpha_val;
+        double retrieval = 0.0;
+        for (unsigned int ki = 0; ki < head_dim; ki++) {
+            double h_decayed = a * (double)h_row[ki];
+            h_row[ki] = (float)h_decayed;
+            retrieval += h_decayed * (double)k_shmem[ki];
+        }
+
+        // Delta update + output query (F64).
+        double v_delta = (double)beta_val * (v_val - retrieval);
+        double my_out = 0.0;
+        for (unsigned int ki = 0; ki < head_dim; ki++) {
+            double h_updated = (double)h_row[ki] + (double)k_shmem[ki] * v_delta;
+            h_row[ki] = (float)h_updated;
+            my_out += h_updated * (double)q_shmem[ki];
+        }
+
+        output[h * head_dim + vj] = (float)(my_out * q_scale);
+    }
+}
+
+// Eager F64 megakernel: scalar state_pos (byte-identical-OFF twin of
+// gdn_decode_megakernel). Same signature/argument order as the F32 eager kernel.
+extern "C" __global__ void gdn_decode_megakernel_f64accum(
+    float* __restrict__ conv_state,
+    float* __restrict__ h_state,
+    const float* __restrict__ qkv_buf,
+    const float* __restrict__ alpha_raw,
+    const float* __restrict__ beta_raw,
+    const float* __restrict__ conv_weight,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ ssm_a,
+    float* __restrict__ output,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int qkv_dim,
+    unsigned int qk_dim,
+    unsigned int value_dim,
+    unsigned int kernel_size,
+    unsigned int state_pos)
+{
+    gdn_decode_megakernel_f64accum_body(
+        conv_state, h_state, qkv_buf, alpha_raw, beta_raw,
+        conv_weight, dt_bias, ssm_a, output,
+        num_heads, num_kv_heads, head_dim, qkv_dim, qk_dim,
+        value_dim, kernel_size, state_pos);
+}
+
+// Graph F64 megakernel: device-pointer state_pos (byte-identical-OFF twin of
+// gdn_decode_megakernel_graph). Same signature/argument order as the F32 graph
+// kernel.
+extern "C" __global__ void gdn_decode_megakernel_graph_f64accum(
+    float* __restrict__ conv_state,
+    float* __restrict__ h_state,
+    const float* __restrict__ qkv_buf,
+    const float* __restrict__ alpha_raw,
+    const float* __restrict__ beta_raw,
+    const float* __restrict__ conv_weight,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ ssm_a,
+    float* __restrict__ output,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int qkv_dim,
+    unsigned int qk_dim,
+    unsigned int value_dim,
+    unsigned int kernel_size,
+    const unsigned int* __restrict__ p_state_pos)
+{
+    gdn_decode_megakernel_f64accum_body(
+        conv_state, h_state, qkv_buf, alpha_raw, beta_raw,
+        conv_weight, dt_bias, ssm_a, output,
+        num_heads, num_kv_heads, head_dim, qkv_dim, qk_dim,
+        value_dim, kernel_size, *p_state_pos);
+}

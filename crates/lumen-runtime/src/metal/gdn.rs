@@ -45,21 +45,21 @@ impl MetalF32Backend {
         gdn_idx: usize,
     ) -> Result<u32, RuntimeError> {
         let hidden_dim = s.hidden_dim;
-        // GDN uses different head/dim layout than full-attention layers.
-        // GGUF: ssm.time_step_rank=32, ssm.state_size=128, ssm.group_count=16, ssm.inner_size=4096
+        // GDN uses a different head/dim layout than full-attention layers, taken
+        // from the resolved SSM dims (9B {32,16,128,4} default, 27B {48,16,128,4}).
         //
         // Reference (Qwen3_5MoeGatedDeltaNet in transformers):
-        //   Q+K: num_kv_heads=16 heads × 128 each (repeated_interleave to 32 before GDN)
-        //   V:   num_v_heads=32  heads × 128 each (no repeat)
-        //   conv_dim = Q(2048) + K(2048) + V(4096) = 8192
-        //   value_dim (inner_size) = 4096 — gate and output projection output size
-        let num_heads = 32usize;      // ssm.time_step_rank = num_v_heads (state/V heads)
-        let num_kv_heads = 16usize;   // ssm.group_count = num_k_heads (Q and K pre-repeat heads)
-        let head_dim = 128usize;      // ssm.state_size
-        let qk_dim = 2048usize;       // Q and K each: num_kv_heads * head_dim = 16 * 128
-        let value_dim = 4096usize;    // V: num_heads * head_dim = 32 * 128 = inner_size
-        let q_dim = value_dim;        // alias: gate/output projection size = value_dim = 4096
-        let qkv_dim = 8192usize;      // Q(2048) + K(2048) + V(4096) = 8192
+        //   Q+K: num_k_heads heads × head_dim each (repeated_interleave to num_v_heads before GDN)
+        //   V:   num_v_heads  heads × head_dim each (no repeat)
+        //   conv_dim  = 2*qk_dim + value_dim  (9B = 8192, 27B = 10240)
+        //   value_dim = num_v_heads*head_dim — gate and output projection output size
+        let num_heads = s.gdn_num_v_heads;   // ssm.time_step_rank = num_v_heads (state/V heads)
+        let num_kv_heads = s.gdn_num_k_heads; // ssm.group_count = num_k_heads (Q and K pre-repeat heads)
+        let head_dim = s.gdn_head_dim;       // ssm.state_size
+        let qk_dim = num_kv_heads * head_dim; // Q and K each: num_k_heads * head_dim (9B = 2048)
+        let value_dim = num_heads * head_dim; // V: num_v_heads * head_dim (9B = 4096, 27B = 6144)
+        let q_dim = value_dim;               // alias: gate/output projection size = value_dim
+        let qkv_dim = 2 * qk_dim + value_dim; // Q + K + V (9B = 8192, 27B = 10240)
         let eps = s.eps;
         let norm_tg_size = s.norm_tg_size;
         let matmul_tg_size = s.matmul_tg_size;
@@ -524,15 +524,16 @@ impl MetalF32Backend {
         gdn_idx: usize,
     ) -> Result<u32, RuntimeError> {
         let hidden_dim = s.hidden_dim;
-        // Reference layout: Q(2048) + K(2048) + V(4096) = 8192
-        // Q and K each have num_kv_heads=16 pre-repeat heads; V has num_heads=32 heads.
-        let num_heads = 32usize;      // num_v_heads = state/V heads
-        let num_kv_heads = 16usize;   // num_k_heads = Q and K pre-repeat heads
-        let head_dim = 128usize;
-        let qk_dim = 2048usize;       // Q and K each: 16 * 128
-        let value_dim = 4096usize;    // V: 32 * 128 (= inner_size)
-        let q_dim = value_dim;        // alias for gate/output projection size
-        let qkv_dim = 8192usize;
+        // Resolved SSM dims (9B {32,16,128,4} default, 27B {48,16,128,4}).
+        // Q and K each have num_k_heads pre-repeat heads; V has num_v_heads heads.
+        // qkv_dim = 2*qk_dim + value_dim (9B = 8192, 27B = 10240).
+        let num_heads = s.gdn_num_v_heads;    // num_v_heads = state/V heads
+        let num_kv_heads = s.gdn_num_k_heads; // num_k_heads = Q and K pre-repeat heads
+        let head_dim = s.gdn_head_dim;
+        let qk_dim = num_kv_heads * head_dim; // Q and K each: num_k_heads * head_dim
+        let value_dim = num_heads * head_dim; // V: num_v_heads * head_dim (= inner_size)
+        let q_dim = value_dim;                // alias for gate/output projection size
+        let qkv_dim = 2 * qk_dim + value_dim;
         let eps = s.eps;
         let norm_tg_size = s.norm_tg_size;
         let conv_kernel_size = s.gdn_conv_kernel_size;
@@ -1439,13 +1440,15 @@ impl MetalF32Backend {
     ) -> Result<u32, RuntimeError> {
         let hidden_dim = s.hidden_dim;
         let matmul_tg_size = s.matmul_tg_size;
-        let num_heads = 32usize;
-        let num_kv_heads = 16usize;
-        let head_dim = 128usize;
-        let qk_dim = 2048usize;
-        let value_dim = 4096usize;
+        // Resolved SSM dims (9B {32,16,128,4} default, 27B {48,16,128,4}).
+        // qkv_dim = 2*qk_dim + value_dim (9B = 8192, 27B = 10240).
+        let num_heads = s.gdn_num_v_heads;
+        let num_kv_heads = s.gdn_num_k_heads;
+        let head_dim = s.gdn_head_dim;
+        let qk_dim = num_kv_heads * head_dim;
+        let value_dim = num_heads * head_dim;
         let q_dim = value_dim;
-        let qkv_dim = 8192usize;
+        let qkv_dim = 2 * qk_dim + value_dim;
         let eps = s.eps;
         let norm_tg_size = s.norm_tg_size;
         let conv_kernel_size = s.gdn_conv_kernel_size;
@@ -2378,13 +2381,16 @@ impl MetalF32Backend {
         if let Some(ref mut s) = *scratch_guard {
             if s.gdn_num_layers > 0 {
                 // GDN-specific dimensions — must NOT use s.num_heads / s.head_dim / s.kv_dim
-                // which are full-attention hyperparams. GDN uses different per-model constants.
-                const GDN_NUM_HEADS: usize = 32;    // ssm.time_step_rank
-                const GDN_HEAD_DIM: usize = 128;    // ssm.state_size
-                const GDN_QKV_DIM: usize = 8192;    // Q(2048)+K(2048)+V(4096)
+                // which are full-attention hyperparams. Use the resolved SSM dims
+                // (9B {32,16,128,4} default, 27B {48,16,128,4}). These MUST match
+                // the sizes used at allocation so reset zeroes the exact buffers.
+                let gdn_num_v_heads = s.gdn_num_v_heads; // ssm.time_step_rank
+                let gdn_num_k_heads = s.gdn_num_k_heads; // ssm.group_count
+                let gdn_head_dim = s.gdn_head_dim;       // ssm.state_size
                 let conv_kernel_size = s.gdn_conv_kernel_size;
-                let h_state_size = GDN_NUM_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM;
-                let conv_state_size = (conv_kernel_size - 1) * GDN_QKV_DIM;
+                let h_state_size = gdn_num_v_heads * gdn_head_dim * gdn_head_dim;
+                let gdn_qkv_dim = 2 * gdn_num_k_heads * gdn_head_dim + gdn_num_v_heads * gdn_head_dim;
+                let conv_state_size = (conv_kernel_size - 1) * gdn_qkv_dim;
 
                 for h_buf in &s.gdn_h_states {
                     h_buf.write_f32(&vec![0.0f32; h_state_size]);

@@ -31,6 +31,7 @@ Metal (Apple Silicon, M-series; benchmarked on M3 Ultra):
 - Disk-persistent KV cache with eviction policy (`--kv-disk-dir`, `--kv-disk-space-mb`)
 - Session save/resume with suffix-prefill cache (a cache-hit turn skips reprocessing the shared prefix; cache-reuse throughput is not part of the published benchmark suite)
 - HTTP server (`lumen-server`) with OpenAI + Anthropic wire formats, SSE streaming, template-driven tool-call parser (v1 ships the Qwen3.5 `<tool_call>` marker pattern)
+- Per-request reasoning / extended-thinking control (default OFF): OpenAI `enable_thinking` (+ vLLM `chat_template_kwargs.enable_thinking`) with `delta.reasoning_content`, Anthropic `thinking.type` with a `thinking` content block, CLI `--think`, and a separate `reasoning_budget` (distinct from `max_tokens`); `LUMEN_CHAT_ENABLE_THINKING` overrides the default (see `docs/server.md` and `.artifacts/REASONING-CONTROL-DESIGN.md`)
 - BPE tokenizer embedded in LBC v3 (no Python at runtime)
 - GGUF → LBC converter supporting K-quants (Q4_K, Q5_K, Q6_K, Q2_K, Q3_K) and MXFP4 via dequant on import
 - `Configuration precedence: CLI flag > env var > built-in default` documented end-to-end
@@ -39,7 +40,7 @@ Metal (Apple Silicon, M-series; benchmarked on M3 Ultra):
 
 - Concurrent CLI bursts (≥4) per GPU are unsupported by design — use `lumen-server`
 - Q8 / Q4 prefill × llama.cpp ratios are structurally below 1.0 on the current NVRTC compute_61 stack
-- PURE-greedy long-form generation (≥512 tokens) deterministically loops — use `--temperature 0.7` or `--repetition-penalty 1.05 --repeat-last-n 64`
+- PURE-greedy long-form generation (≥512 tokens) deterministically loops — use `--temperature 0.7` or, on DENSE models, `--repetition-penalty 1.05 --repeat-last-n 64` (when omitted the server/CLI apply a model-aware penalty: 1.05 dense / 1.03 MoE — MoE must stay ≤ 1.03 or arithmetic corrupts)
 - BF16 MoE-30B-A3B requires a dedicated 80 GB+ GPU (peak VRAM 72.4 GB)
 - `lumen-server` Authorization / CORS / per-request timeout are not implemented; deploy behind a reverse proxy
 - BF16-dense / Q8-MoE / Q4-MoE on Metal require `LUMEN_METAL_MMAP_ONLY=1` (M3 Ultra 96 GB residency budget)

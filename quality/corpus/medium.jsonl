@@ -1,0 +1,8 @@
+{"id": "med-explain-01", "gate": "GQ-002", "prompt": "Explain step by step why the sky appears blue during the day.", "is_math": false, "anchors": ["rayleigh", "scatter", "wavelength"], "max_tokens": 400}
+{"id": "med-explain-02", "gate": "GQ-002", "prompt": "Explain how a bicycle stays upright while moving, in a few short paragraphs.", "is_math": false, "anchors": ["balance", "wheel", "steer"], "max_tokens": 400}
+{"id": "med-reason-01", "gate": "GQ-002", "prompt": "A farmer has 17 sheep. All but 9 run away. How many are left? Explain your reasoning step by step.", "is_math": true, "answers": ["9"], "anchors": ["all but"], "max_tokens": 384}
+{"id": "med-howto-01", "gate": "GQ-002", "prompt": "Describe step by step how to make a simple cup of tea.", "is_math": false, "anchors": ["water", "tea"], "max_tokens": 384}
+{"id": "med-summ-01", "gate": "GQ-002", "prompt": "Summarize the water cycle in about 150 words, covering evaporation, condensation, and precipitation.", "is_math": false, "anchors": ["evaporation", "condensation", "precipitation"], "max_tokens": 400}
+{"id": "med-reason-02", "gate": "GQ-002", "prompt": "Compute 17 times 23 step by step using the distributive property, then state the final answer.", "is_math": true, "answers": ["391"], "anchors": ["distributive"], "max_tokens": 384}
+{"id": "med-code-01", "gate": "GQ-002", "prompt": "Write a short Python function that returns the nth Fibonacci number, and briefly explain how it works.", "is_math": false, "anchors": ["def", "fib"], "max_tokens": 400}
+{"id": "med-explain-03", "gate": "GQ-002", "prompt": "Explain the difference between RAM and an SSD in a computer, in a few short paragraphs.", "is_math": false, "anchors": ["memory", "storage"], "max_tokens": 400}

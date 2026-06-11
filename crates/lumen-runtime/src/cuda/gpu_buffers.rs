@@ -498,33 +498,49 @@ fn dequant_kquant_to_f32(
         QuantScheme::Q2_K => {
             // Q2_K: 256 elements per block, 84 bytes per block.
             // Layout: [16B scales, 64B qs, 2B f16 d, 2B f16 dmin]
+            //
+            // qs traversal MUST follow GGML's `dequantize_row_q2_K`: two
+            // 128-value groups, four shift passes (0,2,4,6) over the same 32 qs
+            // bytes per group, two 16-value runs (`q[l]`, `q[l+16]`) per pass.
+            // A naive linear byte scan corrupts ~74% of any real Q2_K block
+            // (agrees only on degenerate uniform blocks). See the matching
+            // converter fix in lumen-convert/src/dequant.rs::dequantize_q2_k.
             let block_size = 84;
             let n_blocks = raw.len() / block_size;
             let mut written = 0usize;
-            for b in 0..n_blocks {
+            'blocks: for b in 0..n_blocks {
                 let bp = &raw[b * block_size..];
                 let scales = &bp[0..16];
                 let qs = &bp[16..80];
                 let d = f16_to_f32(u16::from_le_bytes([bp[80], bp[81]]));
                 let dmin = f16_to_f32(u16::from_le_bytes([bp[82], bp[83]]));
 
-                // 16 sub-blocks of 16 values = 256 values
-                let mut q_idx = 0usize;
-                for &scale_byte in scales.iter().take(16) {
-                    let sc = d * (scale_byte & 0x0F) as f32;
-                    let m = dmin * ((scale_byte >> 4) & 0x0F) as f32;
-                    // 16 values, 2-bit each = 4 bytes
-                    for _ in 0..4 {
-                        if written >= n_elements { break; }
-                        let byte = qs[q_idx];
-                        q_idx += 1;
-                        for shift in [0, 2, 4, 6] {
-                            if written >= n_elements { break; }
-                            let q = ((byte >> shift) & 3) as f32;
-                            out[written] = sc * q - m;
+                let mut q_off = 0usize;
+                let mut is = 0usize;
+                for _group in 0..2 {
+                    let mut shift = 0u8;
+                    for _j in 0..4 {
+                        let sc0 = scales[is];
+                        is += 1;
+                        let dl0 = d * (sc0 & 0x0F) as f32;
+                        let ml0 = dmin * ((sc0 >> 4) & 0x0F) as f32;
+                        for l in 0..16usize {
+                            if written >= n_elements { break 'blocks; }
+                            out[written] = dl0 * (((qs[q_off + l] >> shift) & 3) as f32) - ml0;
                             written += 1;
                         }
+                        let sc1 = scales[is];
+                        is += 1;
+                        let dl1 = d * (sc1 & 0x0F) as f32;
+                        let ml1 = dmin * ((sc1 >> 4) & 0x0F) as f32;
+                        for l in 0..16usize {
+                            if written >= n_elements { break 'blocks; }
+                            out[written] = dl1 * (((qs[q_off + l + 16] >> shift) & 3) as f32) - ml1;
+                            written += 1;
+                        }
+                        shift += 2;
                     }
+                    q_off += 32;
                 }
             }
         }
@@ -557,28 +573,40 @@ fn dequant_kquant_to_f32(
                     *sc |= ((scale_bytes[byte_idx] >> bit_shift) & 3) << 4;
                 }
 
-                // Process 256 values in 16 sub-blocks of 16
-                let mut q_byte_idx = 0usize;
-                let mut q_bit_shift = 0u8;
-                let mut val_idx = 0usize;
-                for &sc_val in &sc_arr {
-                    let scale = d * (sc_val as i8 as f32 - 32.0);
-                    for _ in 0..16 {
-                        if written >= n_elements { break; }
-                        let q_lo = (qs[q_byte_idx] >> q_bit_shift) & 3;
-                        q_bit_shift += 2;
-                        if q_bit_shift >= 8 {
-                            q_bit_shift = 0;
-                            q_byte_idx += 1;
+                // GGML `dequantize_row_q3_K` traversal: same grouped/shifted
+                // scheme as Q2_K (two 128-value groups; four shift passes over
+                // the same 32 qs bytes; `q[l]`/`q[l+16]` runs; hmask selector
+                // `m` advances per pass). The naive linear scan corrupts ~82%
+                // of values. See the converter fix in
+                // lumen-convert/src/dequant.rs::dequantize_q3_k.
+                let mut q_off = 0usize;
+                let mut is = 0usize;
+                let mut hbit = 1u8;
+                'q3blocks: for _group in 0..2 {
+                    let mut shift = 0u8;
+                    for _j in 0..4 {
+                        let scale0 = d * (sc_arr[is] as i8 as f32 - 32.0);
+                        is += 1;
+                        for l in 0..16usize {
+                            if written >= n_elements { break 'q3blocks; }
+                            let q_lo = (qs[q_off + l] >> shift) & 3;
+                            let h = u8::from((hmask[l] & hbit) != 0);
+                            out[written] = scale0 * ((q_lo | (h << 2)) as i32 - 4) as f32;
+                            written += 1;
                         }
-                        let hmask_byte = val_idx / 8;
-                        let hmask_bit = val_idx % 8;
-                        let h = (hmask[hmask_byte] >> hmask_bit) & 1;
-                        let q = (q_lo | (h << 2)) as i32 - 4;
-                        out[written] = scale * q as f32;
-                        written += 1;
-                        val_idx += 1;
+                        let scale1 = d * (sc_arr[is] as i8 as f32 - 32.0);
+                        is += 1;
+                        for l in 0..16usize {
+                            if written >= n_elements { break 'q3blocks; }
+                            let q_lo = (qs[q_off + l + 16] >> shift) & 3;
+                            let h = u8::from((hmask[l + 16] & hbit) != 0);
+                            out[written] = scale1 * ((q_lo | (h << 2)) as i32 - 4) as f32;
+                            written += 1;
+                        }
+                        shift += 2;
+                        hbit <<= 1;
                     }
+                    q_off += 32;
                 }
             }
         }
@@ -796,7 +824,7 @@ fn upload_norm_tensor(
 pub fn upload_layer_weights(
     device: &CudaDevice,
     weights: &LayerView,
-    _hp: &ModelHyperparams,
+    hp: &ModelHyperparams,
 ) -> Result<LayerWeightsGpu, RuntimeError> {
     let subs = &weights.subtensors;
 
@@ -920,8 +948,12 @@ pub fn upload_layer_weights(
                 let raw = weights.subtensor_bytes(s)?;
                 let norm_f32 = bytes_as_f32(raw)?;
                 let head_dim = norm_f32.len();
-                // Tile from [head_dim] to [value_dim = num_heads * head_dim]
-                let num_heads = 16 * 2; // GDN: group_count=16 * GQA ratio 2 = 32 (NOT model's num_kv_heads)
+                // Tile from [head_dim] to [value_dim = num_v_heads * head_dim].
+                // num_v_heads is the GDN SSM state/V-head count (ssm.time_step_rank):
+                // 32 for Qwen3.5-9B, 48 for Qwen3.6-27B. It is NOT the model's
+                // attention num_kv_heads. Resolve from hyperparams so 27B tiles to
+                // value_dim=6144 (was hardcoded 16*2=32 → 4096, correct only for 9B).
+                let num_heads = hp.gdn_dims().num_v_heads as usize;
                 let value_dim = num_heads * head_dim;
                 let mut tiled = vec![0.0f32; value_dim];
                 for h in 0..num_heads {

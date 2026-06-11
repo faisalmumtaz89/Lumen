@@ -23,12 +23,12 @@ Operational policy items required before production deployment:
 2. **Pre-warm LBC into OS page cache** at service start: `cat /path/to/model.lbc > /dev/null` before accepting traffic. Avoids 30–70 s NVMe penalty on first request.
 3. **For concurrent clients**: deploy `lumen-server` (NOT repeated `lumen run` invocations).
 4. **For multilingual prompts**: pass `--max-tokens 512` minimum. Below ~256 the model may burn the full budget in `<think>...</think>` reasoning before producing the answer in the target language.
-5. **For long-form generation (≥ 512 tokens)**: avoid PURE-greedy (`--temperature 0` + no penalty) — deterministically loops. Use sampling (`--temperature 0.7`) OR `--repetition-penalty 1.05 --repeat-last-n 64`.
+5. **For long-form generation (≥ 512 tokens)**: avoid PURE-greedy (`--temperature 0` + no penalty) — deterministically loops. Use sampling (`--temperature 0.7`) OR, **on DENSE models only**, `--repetition-penalty 1.05 --repeat-last-n 64`. When `--repetition-penalty` is omitted the server/CLI apply a **model-aware** default (1.05 dense / **1.03 MoE**, resolved by `runtime_defaults::repetition_penalty_default`); **MoE must stay ≤ 1.03** — a penalty of 1.05+ corrupts MoE arithmetic ("17 × 20 = … = 39"). Leave the flag unset on MoE so the 1.03 default applies.
 6. **Pin `--context-len`** for BF16 deployments. The BF16 mmvf kernel produces different first-token argmax at different KV-cache layout sizes. Fix at a single value (e.g. `--context-len 8192`) per deployment.
 7. **Canonical env stack**: the 12-flag CUDA production stack is **default-ON**, so out-of-the-box `lumen run` reproduces the published gate-clear numbers. The one value you must not change is `LUMEN_CUDA_BF16_GEMMEX=0` (the explicit value required for BF16 P3 correctness on MoE). Full annotated stack with per-flag gains: [`bench/METHODOLOGY.md`](../bench/METHODOLOGY.md#required-env-vars-for-full-performance).
 8. **Metal BF16-dense / Q8-MoE / Q4-MoE require `LUMEN_METAL_MMAP_ONLY=1`** to fit in the M3 Ultra 96 GB residency budget. This is a documented operating requirement, not a defect.
 9. **CUDA driver / CUDA runtime**: validated on driver 580.126.20, CUDA 12.2.140, sm_80 (A100). NVRTC compiles kernels at runtime; no build-time CUDA SDK required.
-10. **LBC format compatibility**: current `LBC_VERSION = 3`. Reader rejects newer-than-current with `UnsupportedVersion`; backward-compat for v1/v2 is in the code path but unverified at runtime. **Policy: rebuild LBCs after major Lumen upgrades** via `lumen convert` or `lumen pull --quant <scheme>`.
+10. **LBC format compatibility**: current `LBC_VERSION = 4`. Reader rejects newer-than-current with `UnsupportedVersion`; backward-compat for v1/v2 is in the code path but unverified at runtime. **Policy: rebuild LBCs after major Lumen upgrades** via `lumen convert` or `lumen pull --quant <scheme>`.
 
 ## Known limitations (will NOT be fixed in v0.1.0)
 

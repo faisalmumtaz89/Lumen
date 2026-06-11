@@ -1587,6 +1587,10 @@ fn make_job_request(max_tokens: usize) -> JobRequest {
             ..SamplingParams::default()
         },
         suffix_threshold: 32,
+        // Reasoning-control fields (Part-4-pending): default to disabled so
+        // these engine-mechanics gates are unaffected.
+        enable_thinking: false,
+        reasoning_budget: 0,
     }
 }
 
@@ -2248,4 +2252,410 @@ async fn sampler_anthropic_default_sampler_accepts_request_without_params() {
         matches!(stop_reason, "end_turn" | "max_tokens"),
         "Anthropic stop_reason must be a valid value"
     );
+}
+
+// =========================================================================
+// F4: textual stop-sequence support (OpenAI `stop` / Anthropic
+// `stop_sequences`).
+//
+// Before F4 the `stop` list was schema-accepted and threaded into
+// `JobRequest.stop_text` but honored by NOBODY: the decode loop only
+// checked `eos_token_ids` and the wire-layer `StopMatcher` was constructed
+// empty. F4 closes that with two coordinated changes:
+//
+//   (1) WORKER (engine.rs `process_job`): a `StopMatcher` over the rolling
+//       DECODED answer text; on a hit it emits the prefix up-to-but-
+//       excluding the stop and breaks with `FinishReason::StopSequence`.
+//   (2) WIRE (openai.rs / anthropic.rs): the streaming/collecting
+//       `StopMatcher` is seeded from the request stop list (redundant
+//       safety net + OpenAI "matched bytes never reach the client"
+//       semantics).
+//
+// The INVARIANT these tests pin down: when the stop list is EMPTY, the
+// decode loop + emitter are byte-identical to the pre-F4 behaviour (the
+// new matching is fully inert). The `scripted_*` tests drive a backend
+// whose `compute_final` forces a known byte string so the assertions are
+// exact rather than model-dependent.
+// =========================================================================
+
+// `AtomicUsize` / `AtomicBool` / `Ordering` are already imported above for the
+// panic-backend block.
+
+/// Test-only backend that wraps a real `NaiveF32Backend` for KV/layer
+/// correctness but OVERRIDES `compute_final` to force a deterministic output
+/// byte stream: the Nth `compute_final` call returns logits whose argmax is
+/// `script[N]` (token id == byte, matching `IdentityByteTokenizer`). Past the
+/// end of the script it parks on byte 0. This makes stop-truncation assertions
+/// exact without depending on the synthetic model's learned logits.
+struct ScriptedBackend {
+    inner: NaiveF32Backend,
+    script: Vec<u8>,
+    step: Arc<AtomicUsize>,
+    vocab: usize,
+}
+
+impl ScriptedBackend {
+    fn new(inner: NaiveF32Backend, script: &str, vocab: usize) -> Self {
+        Self {
+            inner,
+            script: script.as_bytes().to_vec(),
+            step: Arc::new(AtomicUsize::new(0)),
+            vocab,
+        }
+    }
+}
+
+impl ComputeBackend for ScriptedBackend {
+    fn init(&mut self, hyperparams: &ModelHyperparams) -> Result<(), lumen_runtime::RuntimeError> {
+        self.inner.init(hyperparams)
+    }
+    fn compute_layer(
+        &self,
+        layer_idx: usize,
+        x: &mut ActivationBuffer,
+        weights: &LayerView,
+        kv: Option<&mut KvCacheView>,
+        seq_pos: usize,
+    ) -> Result<(), lumen_runtime::RuntimeError> {
+        self.inner.compute_layer(layer_idx, x, weights, kv, seq_pos)
+    }
+    fn compute_final(&self, _x: &ActivationBuffer) -> Result<Logits, lumen_runtime::RuntimeError> {
+        // The position in the script for THIS forward pass. Prefill produces the
+        // first decode token's logits (step 0) for the CPU per-token path; each
+        // subsequent `next_token` advances the counter.
+        let n = self.step.fetch_add(1, Ordering::Relaxed);
+        let byte = self.script.get(n).copied().unwrap_or(0) as usize;
+        let mut data = vec![0.0f32; self.vocab];
+        if byte < self.vocab {
+            data[byte] = 100.0; // dominate argmax decisively
+        }
+        Ok(Logits { data })
+    }
+    fn embed_token(&self, token_id: u32) -> Result<ActivationBuffer, lumen_runtime::RuntimeError> {
+        self.inner.embed_token(token_id)
+    }
+    fn set_global_tensors(&mut self, embedding: Vec<f32>, final_norm: Vec<f32>, output_proj: Vec<f32>) {
+        self.inner.set_global_tensors(embedding, final_norm, output_proj)
+    }
+    fn set_output_proj_raw(&mut self, raw: Vec<u8>, quant: QuantScheme) {
+        self.inner.set_output_proj_raw(raw, quant)
+    }
+    fn set_embedding_raw(&mut self, raw: Vec<u8>, quant: QuantScheme) {
+        self.inner.set_embedding_raw(raw, quant)
+    }
+    fn set_weight_tying(&mut self, enabled: bool) {
+        self.inner.set_weight_tying(enabled)
+    }
+    fn caps(&self) -> BackendCaps {
+        self.inner.caps()
+    }
+}
+
+/// Boot a server whose model emits a fixed byte `script` deterministically.
+/// Returns `(addr, http client, tempdir, engine handle)` like `boot_server`.
+async fn boot_server_scripted(
+    script: &str,
+) -> (
+    SocketAddr,
+    Client<HttpConnector, Full<bytes::Bytes>>,
+    tempfile::TempDir,
+    EngineHandle,
+) {
+    let vocab = 256usize;
+    let cfg = TestModelConfig {
+        vocab_size: vocab as u32,
+        max_seq_len: 256,
+        ..TestModelConfig::default()
+    };
+    let bytes = generate_test_model(&cfg);
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let path = tmp.path().join("test_model.lbc");
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&bytes).unwrap();
+    }
+    let provider = SyncWeightProvider::open(&path).unwrap();
+    let mut inner = NaiveF32Backend::new();
+    inner.set_global_tensors(
+        provider.embedding.clone(),
+        provider.final_norm.clone(),
+        provider.output_proj.clone(),
+    );
+    inner.init(&provider.lbc().header.hyperparams).unwrap();
+    let backend = ScriptedBackend::new(inner, script, vocab);
+    let hyperparams = provider.lbc().header.hyperparams;
+    let runtime_cfg = RuntimeConfig {
+        pipeline_mode: PipelineMode::MinMem,
+        prefetch_distance: 1,
+        kv_precision: KvPrecision::F32,
+        max_seq_len: 256,
+        collect_per_layer_timings: false,
+    };
+    let model_info = ModelInfo {
+        id: MODEL_ID.into(),
+        owned_by: "lumen-test".into(),
+        created: 0,
+        context_length: 256,
+    };
+    let tokenizer: Arc<dyn Tokenize> = Arc::new(IdentityByteTokenizer::default());
+    let handle = EngineWorker::spawn(
+        runtime_cfg,
+        hyperparams,
+        Box::new(backend),
+        Arc::new(provider),
+        tokenizer,
+        model_info,
+        4,
+    );
+    let app = build_router(handle.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let client: Client<HttpConnector, Full<bytes::Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+    (addr, client, tmp, handle)
+}
+
+/// Build a JobRequest with an explicit stop list, no EOS (so only stop or
+/// max_tokens can terminate), greedy decode.
+fn make_stop_job_request(max_tokens: usize, stop: Vec<String>) -> JobRequest {
+    JobRequest {
+        prompt_tokens: vec![104, 105], // "hi"
+        max_tokens,
+        stop_text: stop,
+        eos_token_ids: Vec::new(),
+        sampling: SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..SamplingParams::default()
+        },
+        suffix_threshold: 32,
+        enable_thinking: false,
+        reasoning_budget: 0,
+    }
+}
+
+/// Drain every `TokenEvent::Token.delta_text` from the engine into one string,
+/// returning `(concatenated_text, finish_reason, completion_tokens)`.
+async fn drain_engine_text(
+    handle: &EngineHandle,
+    req: JobRequest,
+) -> (String, FinishReason, usize) {
+    let mut rx = handle.submit(req, 128).await.expect("submit");
+    let mut text = String::new();
+    let mut reason = FinishReason::Stop;
+    let mut completion = 0usize;
+    while let Some(evt) = rx.recv().await {
+        match evt {
+            TokenEvent::PrefillDone { .. } => {}
+            TokenEvent::Token { delta_text, .. } => text.push_str(&delta_text),
+            TokenEvent::Done { finish_reason, completion_tokens, .. } => {
+                reason = finish_reason;
+                completion = completion_tokens;
+                break;
+            }
+            TokenEvent::Error(msg) => panic!("unexpected engine error: {msg}"),
+        }
+    }
+    (text, reason, completion)
+}
+
+/// F4-A (worker): a non-empty stop list truncates the emitted text at the
+/// FIRST stop occurrence (matched bytes excluded) and reports
+/// `FinishReason::Stop`. The scripted model emits "Hello STOP World"; with
+/// stop=["STOP"] the worker must emit exactly "Hello " and stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f4_worker_stop_truncates_decoded_text() {
+    let (_addr, _client, _tmp, handle) = boot_server_scripted("Hello STOP World").await;
+    let (text, reason, _completion) =
+        drain_engine_text(&handle, make_stop_job_request(64, vec!["STOP".into()])).await;
+    assert_eq!(text, "Hello ", "worker must emit prefix up-to-but-excluding the stop");
+    assert!(!text.contains("STOP"), "matched stop bytes must never be emitted");
+    assert_eq!(
+        reason,
+        FinishReason::StopSequence,
+        "finish_reason must be StopSequence on a textual stop hit (renders OpenAI \"stop\" / Anthropic \"stop_sequence\")"
+    );
+}
+
+/// F4-B (worker, BYTE-IDENTITY INVARIANT): with an EMPTY stop list the worker
+/// emits the FULL scripted string and the stop machinery is fully inert. This
+/// is the load-bearing guarantee that F4 does not perturb the validated
+/// MoE/CUDA GQ path (which sends no stop sequences).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f4_worker_empty_stop_is_byte_identical_full_text() {
+    let script = "Hello STOP World"; // same script as F4-A
+    let (_addr, _client, _tmp, handle) = boot_server_scripted(script).await;
+    // Generate exactly the script length so the comparison is total.
+    let n = script.len();
+    let (text, reason, completion) =
+        drain_engine_text(&handle, make_stop_job_request(n, Vec::new())).await;
+    assert_eq!(
+        text, script,
+        "EMPTY stop must yield the FULL decoded text byte-for-byte (no truncation, no held bytes lost)"
+    );
+    assert_eq!(completion, n, "completion_tokens unchanged by the inert stop path");
+    assert_eq!(
+        reason,
+        FinishReason::Length,
+        "hitting max_tokens (== script len) without EOS reports Length, exactly as pre-F4"
+    );
+}
+
+/// F4-C (worker): a stop sequence that STRADDLES the token/decode boundary is
+/// still caught (the matcher buffers the ambiguous tail). The IdentityByte
+/// tokenizer decodes 1 byte/token, so "STOP" arrives as four separate
+/// fragments S, T, O, P — the worst case for straddle handling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f4_worker_stop_straddling_tokens_is_caught() {
+    let (_addr, _client, _tmp, handle) = boot_server_scripted("abcSTOPdef").await;
+    let (text, reason, _c) =
+        drain_engine_text(&handle, make_stop_job_request(64, vec!["STOP".into()])).await;
+    assert_eq!(text, "abc", "straddled stop across 1-byte tokens must truncate at 'abc'");
+    assert_eq!(reason, FinishReason::StopSequence);
+}
+
+/// F4-D (OpenAI non-stream): the HTTP `stop` field truncates the chat
+/// completion content and the response reports `finish_reason:"stop"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f4_openai_chat_nonstream_honors_stop() {
+    let (addr, client, _tmp, _h) = boot_server_scripted("Answer END trailing").await;
+    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let body = serde_json::json!({
+        "model": MODEL_ID,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 64,
+        "stop": ["END"],
+        "stream": false,
+    });
+    let v = post_json(&client, uri, body).await;
+    let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+    assert_eq!(content, "Answer ", "OpenAI non-stream content truncated at stop");
+    assert!(!content.contains("END"));
+    assert_eq!(v["choices"][0]["finish_reason"], "stop", "finish_reason must be stop");
+}
+
+/// F4-E (OpenAI stream): the streamed content chunks truncate at the stop and
+/// the terminal chunk carries `finish_reason:"stop"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f4_openai_chat_stream_honors_stop() {
+    let (addr, client, _tmp, _h) = boot_server_scripted("Answer END trailing").await;
+    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let body = serde_json::json!({
+        "model": MODEL_ID,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 64,
+        "stop": ["END"],
+        "stream": true,
+    });
+    let sse = post_sse(&client, uri, body).await;
+    // Reassemble all streamed `delta.content` fragments.
+    let mut content = String::new();
+    for line in sse.lines() {
+        let payload = match line.strip_prefix("data: ") {
+            Some(p) if p != "[DONE]" => p,
+            _ => continue,
+        };
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if let Some(s) = v["choices"][0]["delta"]["content"].as_str() {
+                content.push_str(s);
+            }
+        }
+    }
+    assert_eq!(content, "Answer ", "OpenAI stream content truncated at stop");
+    assert!(!sse.contains("END"), "stop bytes must not appear anywhere in the stream");
+    assert!(
+        sse.contains("\"finish_reason\":\"stop\""),
+        "stream must carry a finish_reason:stop chunk, got:\n{sse}"
+    );
+}
+
+/// F4-F (Anthropic non-stream): `stop_sequences` truncates the text content
+/// block and the response reports `stop_reason:"stop_sequence"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f4_anthropic_messages_nonstream_honors_stop() {
+    let (addr, client, _tmp, _h) = boot_server_scripted("Reply HALT tail").await;
+    let uri: Uri = format!("http://{addr}/v1/messages").parse().unwrap();
+    let body = serde_json::json!({
+        "model": MODEL_ID,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 64,
+        "stop_sequences": ["HALT"],
+        "stream": false,
+    });
+    let v = post_json(&client, uri, body).await;
+    // First text block.
+    let text = v["content"]
+        .as_array()
+        .and_then(|blocks| blocks.iter().find(|b| b["type"] == "text"))
+        .and_then(|b| b["text"].as_str())
+        .unwrap_or("");
+    assert_eq!(text, "Reply ", "Anthropic non-stream text truncated at stop");
+    assert!(!text.contains("HALT"));
+    assert_eq!(
+        v["stop_reason"], "stop_sequence",
+        "Anthropic stop_reason must be stop_sequence on a textual stop hit"
+    );
+}
+
+/// F4-G (Anthropic stream): the streamed `text_delta`s truncate at the stop
+/// and the `message_delta` carries `stop_reason:"stop_sequence"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f4_anthropic_messages_stream_honors_stop() {
+    let (addr, client, _tmp, _h) = boot_server_scripted("Reply HALT tail").await;
+    let uri: Uri = format!("http://{addr}/v1/messages").parse().unwrap();
+    let body = serde_json::json!({
+        "model": MODEL_ID,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 64,
+        "stop_sequences": ["HALT"],
+        "stream": true,
+    });
+    let sse = post_sse(&client, uri, body).await;
+    let mut text = String::new();
+    for line in sse.lines() {
+        let payload = match line.strip_prefix("data: ") {
+            Some(p) => p,
+            None => continue,
+        };
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if v["type"] == "content_block_delta" {
+                if let Some(s) = v["delta"]["text"].as_str() {
+                    text.push_str(s);
+                }
+            }
+        }
+    }
+    assert_eq!(text, "Reply ", "Anthropic stream text truncated at stop");
+    assert!(!sse.contains("HALT"), "stop bytes must not appear anywhere in the stream");
+    assert!(
+        sse.contains("\"stop_reason\":\"stop_sequence\""),
+        "stream must carry stop_reason:stop_sequence, got:\n{sse}"
+    );
+}
+
+/// F4-H (OpenAI, EMPTY-STOP HTTP byte-identity): an empty/absent `stop` field
+/// streams the FULL scripted text with no truncation — the end-to-end mirror of
+/// F4-B at the wire boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f4_openai_chat_empty_stop_streams_full_text() {
+    let script = "Answer END trailing";
+    let (addr, client, _tmp, _h) = boot_server_scripted(script).await;
+    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let body = serde_json::json!({
+        "model": MODEL_ID,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": script.len(),
+        "stream": false,
+    });
+    let v = post_json(&client, uri, body).await;
+    let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+    assert_eq!(
+        content, script,
+        "EMPTY stop must stream the FULL text verbatim (byte-identity at the wire)"
+    );
+    assert_eq!(v["choices"][0]["finish_reason"], "length");
 }

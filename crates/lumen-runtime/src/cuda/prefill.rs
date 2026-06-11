@@ -333,6 +333,36 @@ pub(crate) unsafe fn launch_rmsnorm_batched(
     Ok(())
 }
 
+/// MoE BF16 fidelity routing: is this projection a native-BF16 weight on a MoE
+/// model that should bypass the F16-cache fast path?
+///
+/// Empirical (2026-06-09, GQ-001 MoE-bf16 precision sweep): the F16-cache path
+/// (`launch_cublas_hgemm`: F16 weights + `FAST_16F` reduced-precision
+/// accumulation) makes the MoE BF16 model emit WRONG arithmetic — e.g. it reads
+/// the input "1000 - 37" as "100 - 37" = 63, and degenerates into repetition —
+/// whereas the native BF16 arm (`launch_cublas_gemm_bf16`: BF16 weights + full
+/// `CUBLAS_COMPUTE_32F` accumulation) yields the correct answer (963). Routing
+/// MoE BF16 to the native arm moves GQ-001 from 13/15 FAIL to 14/15 PASS (the
+/// residual is a cosmetic near-tie intermediate slip inherent to the 7-bit BF16
+/// mantissa; final answers are correct). AND-gated on `model_is_moe()` so DENSE
+/// BF16 models keep the F16-cache fast path BYTE-IDENTICAL. The env override
+/// `LUMEN_CUDA_MOE_BF16_NATIVE=0` restores the F16-cache path for MoE BF16 too.
+fn moe_bf16_native_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        !matches!(
+            std::env::var("LUMEN_CUDA_MOE_BF16_NATIVE").ok().as_deref(),
+            Some("0") | Some("false") | Some("FALSE")
+        )
+    })
+}
+
+fn moe_bf16_native_path(weight: &GpuWeightBuf) -> bool {
+    matches!(weight, GpuWeightBuf::Bf16Raw(_))
+        && crate::runtime_defaults::model_is_moe()
+        && moe_bf16_native_enabled()
+}
+
 /// Batched GEMM projection: out = input * weight^T.
 ///
 /// For F32 weights, uses cuBLAS SGEMM directly. For Q8_0 weights with a
@@ -409,14 +439,25 @@ pub(crate) unsafe fn launch_gemm_projection(
     // Lumen's MoE converter force-requantizes them to Q8_0 at LBC creation
     // time (see `crates/lumen-convert/src/arch/gdn_gates.rs`), so the runtime
     // path runs them through HGEMM-F16 / MMQ-Q8 — both of which introduce
-    // ~0.4-3.4% per-element rounding noise from the requant step. When
-    // LUMEN_CUDA_GDN_AB_F32=1 (or the combined gate LUMEN_CUDA_NORM_RSQRTF_BUNDLE=1) is
-    // set AND the projection label is `gdn_alpha` or `gdn_beta`, dequantize
-    // the Q8 weight to F32 scratch and route through cuBLAS SGEMM, matching
-    // the F32 SGEMM data path bit-for-bit (modulo SGEMM accumulator order).
-    let gdn_ab_f32 = (std::env::var("LUMEN_CUDA_GDN_AB_F32").is_ok()
-        || std::env::var("LUMEN_CUDA_NORM_RSQRTF_BUNDLE").is_ok())
-        && (label == "gdn_alpha" || label == "gdn_beta");
+    // ~0.4-3.4% per-element rounding noise from the requant step. When the
+    // `gdn_alpha`/`gdn_beta` projection is routed through F32 SGEMM, it matches
+    // that canonical F32 path (modulo SGEMM accumulator order).
+    //
+    // Default-ON for MoE BF16 (`model_is_moe_bf16()`): empirically this F32
+    // alpha/beta path is what kills the BF16 GQ-001 arith-05 repetition that the
+    // `moe_bf16_native` main-projection routing alone leaves — taking MoE bf16 to
+    // 14/15 PASS. It is gated to BF16 models because the same lever REGRESSES MoE
+    // q8 (adds a DD-REP). Env override: `LUMEN_CUDA_GDN_AB_F32=0` forces OFF, any
+    // other value forces ON; `LUMEN_CUDA_NORM_RSQRTF_BUNDLE` also forces it ON.
+    let gdn_ab_f32_on = match std::env::var("LUMEN_CUDA_GDN_AB_F32").ok().as_deref() {
+        Some("0") | Some("false") | Some("FALSE") => false,
+        Some(_) => true,
+        None => {
+            crate::runtime_defaults::model_is_moe_bf16()
+                || std::env::var("LUMEN_CUDA_NORM_RSQRTF_BUNDLE").is_ok()
+        }
+    };
+    let gdn_ab_f32 = gdn_ab_f32_on && (label == "gdn_alpha" || label == "gdn_beta");
     let force_alpha_beta_f32 = gdn_ab_f32 && weight_is_q8raw;
 
     // Fast path: HGEMM with pre-dequanted F16 weights (tensor core, 312 TFLOPS on A100).
@@ -424,6 +465,7 @@ pub(crate) unsafe fn launch_gemm_projection(
     // and F32 compute/accumulate for numerical stability.
     let f16_cache_active = !force_f32 && !prefer_mmq_over_f16cache
         && !force_alpha_beta_f32
+        && !moe_bf16_native_path(weight)
         && weight_f16_cache.is_some();
     if let Some(w_f16) = weight_f16_cache.filter(|_| f16_cache_active) {
         static HGEMM_LOGGED: std::sync::atomic::AtomicBool =
@@ -493,7 +535,20 @@ pub(crate) unsafe fn launch_gemm_projection(
             // forces the Q8 -> F32-dequant -> SGEMM-F32 path, restoring the
             // F32 SGEMM data path for these tensors (the GGUF source weight
             // is F32).
-            let use_mmq = std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").is_ok()
+            // MoE models DEFAULT to the MMQ (INT8 dp4a) Q8 projection path.
+            // llama.cpp computes Q8 matmuls in INT8 dp4a; lumen's default
+            // dequant->F16->HGEMM path drifts ~5.85e-2 max-abs from that, which
+            // is harmless for dense models but the 256-expert top-K router
+            // AMPLIFIES it into flipped expert selection -> degenerate math on
+            // Qwen3.5-MoE-35B-A3B (q8 writes "17x20=140" instead of 340). MMQ
+            // restores llama-matching INT8 numerics so the products are correct.
+            // Dense q8 keeps the faster HGEMM path (no router to amplify drift).
+            // Env `LUMEN_CUDA_Q8_PROJ_MMQ=0|1` overrides the per-model default.
+            let mmq_enabled = match std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").ok().as_deref() {
+                Some(v) => !matches!(v, "0" | "false" | "no"),
+                None => crate::runtime_defaults::model_is_moe(),
+            };
+            let use_mmq = mmq_enabled
                 && !force_alpha_beta_f32
                 && kernels.mmq_q8_0_batched.is_some()
                 && in_dim % 32 == 0;
@@ -625,6 +680,61 @@ pub(crate) unsafe fn launch_gemm_projection(
             )?;
         }
         GpuWeightBuf::Q4Raw(w_q4) => {
+            // MoE q4 routes the Q4 projection through the MMQ INT4 dp4a path
+            // (de-interleaved nibbles x per-token INT8 activation -> INT32-exact
+            // dp4a -> once-only F32 scale + -8 zero-point), matching llama.cpp
+            // `mul_mat_q` INT4 numerics. The default dequant->F16->HGEMM path is
+            // F16-grade and the 256-expert top-K router AMPLIFIES its rounding
+            // into flipped expert selection -> garbled arithmetic on
+            // Qwen3.5-MoE-35B-A3B (q4 writes "17 x 23 = 491 x 23 = 391"). This
+            // is the q4 twin of the proven Q8 MMQ projection fix (use_mmq above).
+            // Dense q4 keeps the faster HGEMM path (no router to amplify drift).
+            // Raising precision instead (PREFILL_F32) made q4 WORSE -- this
+            // matches llama INT4 numerics, it does NOT just raise precision.
+            //
+            // EMPIRICAL STATUS (A100, MoE-35B q4, temp=0, validated): this MMQ
+            // INT4 path ELIMINATES the q4-specific "491" garble and produces
+            // CORRECT distributive reasoning with correct sub-products (340, 51),
+            // matching q8's reasoning -- confirming the diverging surface was the
+            // F16-grade Q4 projections. A MOE_PROBE sumsq sweep shows q4 (MMQ)
+            // now within a few % of q8 at every prefill position (the residual
+            // gap is the irreducible Q4 4-bit quant floor, not a kernel bug).
+            // HOWEVER it does NOT make q4 fully pristine: the SHARED restate-loop
+            // (component-i, also present as q8's "multiplicationlication"
+            // doubling) lands on the final "340 + 51" add and q4 loops without
+            // emitting 391 within budget (rep ~12 vs baseline rep 4). No
+            // rep_penalty value recovers it (1.04 loops, >=1.045 corrupts the
+            // product, >=1.05 -> bullet-spam), and extra precision (the F64
+            // phase123 CANDIDATE A) regresses it. Because it trades the garble
+            // for a worse rep number without reaching pristine, this path is
+            // DEFAULT-OFF (opt-in `LUMEN_CUDA_Q4_PROJ_MMQ=1`) so the working
+            // tree stays non-regressing vs the q4 baseline. The kernel is the
+            // architecturally-correct llama-numerics fix and is retained for the
+            // follow-up that closes the shared restate-loop.
+            let q4_mmq_enabled = match std::env::var("LUMEN_CUDA_Q4_PROJ_MMQ").ok().as_deref() {
+                Some(v) => !matches!(v, "0" | "false" | "no"),
+                None => false,
+            };
+            let use_q4_mmq = q4_mmq_enabled
+                && crate::runtime_defaults::model_is_moe()
+                && !force_f32
+                && kernels.mmq_q4_0_batched.is_some()
+                && in_dim % 32 == 0;
+            if use_q4_mmq {
+                static Q4_MMQ_LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !Q4_MMQ_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[CUDA]: Prefill Q4 MMQ: ACTIVE ({label}, batch={batch}, \
+                         out_dim={out_dim}, in_dim={in_dim})"
+                    );
+                }
+                launch_mmq_q4_0_batched(
+                    device, kernels, w_q4, input, output,
+                    out_dim, in_dim, batch, label,
+                )?;
+                return Ok(());
+            }
             // Dequantize Q4_0 weights to F16 scratch, then cuBLAS HGEMM (tensor cores).
             //
             // Same pattern as Q8Raw HGEMM: replaces `batch` sequential matvec launches with:
@@ -873,7 +983,8 @@ pub(crate) unsafe fn launch_gemm_residual(
 
     // Fast path: HGEMM residual with pre-dequanted F16 weights.
     // Copy residual to output first, then HGEMM with beta=1.0.
-    let f16_cache_active = !force_f32 && !prefer_mmq_over_f16cache && weight_f16_cache.is_some();
+    let f16_cache_active = !force_f32 && !prefer_mmq_over_f16cache
+        && !moe_bf16_native_path(weight) && weight_f16_cache.is_some();
     if let Some(w_f16) = weight_f16_cache.filter(|_| f16_cache_active) {
         // Copy residual -> output for beta=1.0 accumulation.
         device
@@ -1064,6 +1175,42 @@ pub(crate) unsafe fn launch_gemm_residual(
             )?;
         }
         GpuWeightBuf::Q4Raw(w_q4) => {
+            // MoE q4 routes the Q4 residual GEMM (GDN-block exit ssm_out +
+            // FFN-down) through the MMQ INT4 dp4a path with fused residual add,
+            // matching llama `mul_mat_q` INT4 numerics. Twin of the Q8 MMQ
+            // residual path above. DEFAULT-OFF: see the non-residual Q4Raw arm
+            // in `launch_gemm` for the full empirical status (this MMQ INT4 path
+            // fixes the q4 "491" garble + restores correct reasoning but does
+            // not reach pristine because of the shared restate-loop, so it is
+            // opt-in to keep the working tree non-regressing). Parent gate
+            // `LUMEN_CUDA_Q4_PROJ_MMQ=1` enables; sub-gate
+            // `LUMEN_CUDA_Q4_SSM_OUT_MMQ_OFF=1` disables ONLY this residual arm.
+            let q4_mmq_enabled = match std::env::var("LUMEN_CUDA_Q4_PROJ_MMQ").ok().as_deref() {
+                Some(v) => !matches!(v, "0" | "false" | "no"),
+                None => false,
+            };
+            let q4_ssm_out_mmq_off = std::env::var("LUMEN_CUDA_Q4_SSM_OUT_MMQ_OFF").is_ok();
+            let use_q4_mmq = q4_mmq_enabled
+                && crate::runtime_defaults::model_is_moe()
+                && !q4_ssm_out_mmq_off
+                && !force_f32
+                && kernels.mmq_q4_0_batched_residual.is_some()
+                && in_dim % 32 == 0;
+            if use_q4_mmq {
+                static Q4_MMQ_RES_LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !Q4_MMQ_RES_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[CUDA]: Prefill Q4 MMQ+residual: ACTIVE ({label}, batch={batch}, \
+                         out_dim={out_dim}, in_dim={in_dim})"
+                    );
+                }
+                launch_mmq_q4_0_batched_residual(
+                    device, kernels, w_q4, input, residual, output,
+                    out_dim, in_dim, batch, label,
+                )?;
+                return Ok(());
+            }
             // Dequantize Q4_0 -> F16, then cuBLAS HGEMM with fused residual (tensor cores).
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
@@ -1876,6 +2023,130 @@ pub(crate) unsafe fn launch_mmq_q8_0_batched_residual(
     Ok(())
 }
 
+/// MMQ Q4_0 batched matmul: `out = W @ x` with INT4 dp4a numerics.
+///
+/// q4-specific twin of `launch_mmq_q8_0_batched`: the kernel quantizes each
+/// activation block to INT8 on the fly, dp4a's it against the de-interleaved
+/// Q4_0 weight nibbles (INT32-exact), and applies `w_scale * x_scale` once at
+/// sum-time with the GGML -8 zero-point correction folded in. This matches
+/// llama.cpp `mul_mat_q` INT4 numerics, fixing the garbled MoE q4 arithmetic
+/// the dequant->F16->HGEMM default produces (the 256-expert router amplifies
+/// F16-grade matmul drift). Same grid/block geometry as the Q8 MMQ kernel.
+///
+/// `in_dim` must be a multiple of 32 (Q4_0 block size).
+///
+/// # Safety
+///
+/// `weight_q4` must contain `out_dim * (in_dim/32) * 18` bytes of Q4_0 data.
+/// `x` must have `batch * in_dim` F32 elements; `out` must have
+/// `batch * out_dim` F32 elements.
+pub(crate) unsafe fn launch_mmq_q4_0_batched(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    weight_q4: &CudaSlice<u8>,
+    x: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    out_dim: usize,
+    in_dim: usize,
+    batch: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    if in_dim % 32 != 0 {
+        return Err(RuntimeError::Compute(format!(
+            "mmq_q4_0_batched {label}: in_dim ({in_dim}) must be a multiple of 32"
+        )));
+    }
+    let f = kernels.mmq_q4_0_batched.as_ref().ok_or_else(|| {
+        RuntimeError::Compute(format!(
+            "mmq_q4_0_batched {label}: kernel not loaded (requires SM 6.1+ for dp4a)"
+        ))
+    })?;
+    const NR: usize = 2;
+    let grid_x = (out_dim + NR - 1) / NR;
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (grid_x as u32, batch as u32, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let out_dim_u32 = out_dim as u32;
+    let in_dim_u32 = in_dim as u32;
+    let batch_u32 = batch as u32;
+    device
+        .stream
+        .launch_builder(f)
+        .arg(weight_q4)
+        .arg(x)
+        .arg(out)
+        .arg(&out_dim_u32)
+        .arg(&in_dim_u32)
+        .arg(&batch_u32)
+        .launch(launch_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("mmq_q4_0_batched {label}: {e}")))?;
+    Ok(())
+}
+
+/// MMQ Q4_0 batched matmul WITH RESIDUAL ADD: `out = residual + W @ x`.
+///
+/// Same INT4 dp4a path as `launch_mmq_q4_0_batched`, except the kernel fuses
+/// the residual add into the final store site (matches HGEMM beta=1.0). Used
+/// for the GDN-block exit (ssm_out) and FFN-down Q4 projections.
+///
+/// `in_dim` must be a multiple of 32 (Q4_0 block size).
+///
+/// # Safety
+///
+/// `weight_q4` must contain `out_dim * (in_dim/32) * 18` bytes of Q4_0 data.
+/// `x` must have `batch * in_dim` F32 elements. `residual` and `out` must have
+/// `batch * out_dim` F32 elements. `out` and `residual` may alias safely
+/// (residual read once at the store site after all reductions).
+pub(crate) unsafe fn launch_mmq_q4_0_batched_residual(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    weight_q4: &CudaSlice<u8>,
+    x: &CudaSlice<f32>,
+    residual: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    out_dim: usize,
+    in_dim: usize,
+    batch: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    if in_dim % 32 != 0 {
+        return Err(RuntimeError::Compute(format!(
+            "mmq_q4_0_batched_residual {label}: in_dim ({in_dim}) must be a multiple of 32"
+        )));
+    }
+    let f = kernels.mmq_q4_0_batched_residual.as_ref().ok_or_else(|| {
+        RuntimeError::Compute(format!(
+            "mmq_q4_0_batched_residual {label}: kernel not loaded \
+             (requires SM 6.1+ for dp4a + the MMQ residual variant)"
+        ))
+    })?;
+    const NR: usize = 2;
+    let grid_x = (out_dim + NR - 1) / NR;
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (grid_x as u32, batch as u32, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let out_dim_u32 = out_dim as u32;
+    let in_dim_u32 = in_dim as u32;
+    let batch_u32 = batch as u32;
+    device
+        .stream
+        .launch_builder(f)
+        .arg(weight_q4)
+        .arg(x)
+        .arg(residual)
+        .arg(out)
+        .arg(&out_dim_u32)
+        .arg(&in_dim_u32)
+        .arg(&batch_u32)
+        .launch(launch_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("mmq_q4_0_batched_residual {label}: {e}")))?;
+    Ok(())
+}
+
 unsafe fn launch_dequant_q8_0_to_f32(
     device: &CudaDevice,
     kernels: &KernelSet,
@@ -2437,6 +2708,183 @@ pub(crate) unsafe fn launch_flash_attention_wmma(
         .launch(launch_cfg)
         .map_err(|e| RuntimeError::Compute(format!("flash_attention_wmma launch: {e}")))?;
 
+    Ok(())
+}
+
+/// Launch a precision-localization WMMA attention variant (qkf32 or pvf32).
+///
+/// `variant` selects the kernel/shared-bytes pair. Same buffer constraints and
+/// launch geometry as `launch_flash_attention_wmma`; only the per-tile matmul
+/// precision differs (see flash_attention_wmma.cu). Diagnostic-only.
+///
+/// # Safety
+/// Same as `launch_flash_attention_wmma`.
+pub(crate) unsafe fn launch_flash_attention_wmma_variant(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    q_batch: &CudaSlice<f32>,
+    kv_cache: &KvCacheGpu,
+    attn_out: &mut CudaSlice<f32>,
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    pos_start: usize,
+    qkf32: bool,
+) -> Result<(), RuntimeError> {
+    use super::decode::{
+        FA_TC_BR, flash_attention_wmma_block_size,
+        flash_attention_wmma_qkf32_shared_bytes, flash_attention_wmma_pvf32_shared_bytes,
+    };
+
+    let q_dim = num_heads * head_dim;
+    let needed = batch * q_dim;
+    if q_batch.len() < needed || attn_out.len() < needed {
+        return Err(RuntimeError::Compute(format!(
+            "flash_attention_wmma_variant: buffer too small (need {needed})"
+        )));
+    }
+
+    let block_size = flash_attention_wmma_block_size();
+    let shared_bytes = if qkf32 {
+        flash_attention_wmma_qkf32_shared_bytes(head_dim as u32)
+    } else {
+        flash_attention_wmma_pvf32_shared_bytes(head_dim as u32)
+    };
+    let q_tiles = (batch as u32 + FA_TC_BR - 1) / FA_TC_BR;
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (num_heads as u32, q_tiles, 1),
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: shared_bytes,
+    };
+
+    let batch_u32 = batch as u32;
+    let nh = num_heads as u32;
+    let nkvh = num_kv_heads as u32;
+    let hd = head_dim as u32;
+    let ps = pos_start as u32;
+    let msl = kv_cache.max_seq_len as u32;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let kfn = if qkf32 {
+        kernels.flash_attention_wmma_qkf32.as_ref()
+    } else {
+        kernels.flash_attention_wmma_pvf32.as_ref()
+    }.ok_or_else(|| RuntimeError::Compute(
+        "flash_attention_wmma_variant: kernel not available".into()
+    ))?;
+
+    // Opt the variant kernel into its dynamic-smem requirement. NVRTC kernels
+    // default to a conservative max dynamic shared size; the qkf32 variant
+    // (~30 KB at head_dim=128) can exceed it, yielding CUDA_ERROR_INVALID_VALUE
+    // at launch. Raising the cap to exactly the requested bytes is the
+    // codebase-blessed pattern (cf. opt_in_attention_decode_dyn_shmem).
+    {
+        use cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
+        let setres = kfn.set_attribute(
+            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            shared_bytes as i32,
+        );
+        static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DBG.get_or_init(|| std::env::var("LUMEN_CUDA_ATTN_PRECISE_DBG").as_deref() == Ok("1")) {
+            eprintln!(
+                "[ATTNPRECISE] variant qkf32={qkf32} head_dim={head_dim} \
+                 shared_bytes={shared_bytes} batch={batch} num_heads={num_heads} \
+                 set_attr_ok={}",
+                setres.is_ok()
+            );
+        }
+    }
+
+    device
+        .stream
+        .launch_builder(kfn)
+        .arg(q_batch)
+        .arg(&kv_cache.k_cache)
+        .arg(&kv_cache.v_cache)
+        .arg(attn_out)
+        .arg(&batch_u32)
+        .arg(&nh)
+        .arg(&nkvh)
+        .arg(&hd)
+        .arg(&ps)
+        .arg(&msl)
+        .arg(&scale)
+        .launch(launch_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("flash_attention_wmma_variant launch: {e}")))?;
+
+    Ok(())
+}
+
+/// Launch the split-F16 (hi+lo) WMMA attention fix. Same buffer constraints
+/// and geometry as `launch_flash_attention_wmma`; QK^T and P@V each run as 3
+/// F16 tensor-core MMAs over split operands, recovering ~20-bit mantissa.
+///
+/// # Safety
+/// Same as `launch_flash_attention_wmma`.
+pub(crate) unsafe fn launch_flash_attention_wmma_split(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    q_batch: &CudaSlice<f32>,
+    kv_cache: &KvCacheGpu,
+    attn_out: &mut CudaSlice<f32>,
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    pos_start: usize,
+) -> Result<(), RuntimeError> {
+    use super::decode::{
+        FA_TC_BR, flash_attention_wmma_block_size, flash_attention_wmma_split_shared_bytes,
+    };
+    let q_dim = num_heads * head_dim;
+    let needed = batch * q_dim;
+    if q_batch.len() < needed || attn_out.len() < needed {
+        return Err(RuntimeError::Compute(format!(
+            "flash_attention_wmma_split: buffer too small (need {needed})"
+        )));
+    }
+    let block_size = flash_attention_wmma_block_size();
+    let shared_bytes = flash_attention_wmma_split_shared_bytes(head_dim as u32);
+    let q_tiles = (batch as u32 + FA_TC_BR - 1) / FA_TC_BR;
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (num_heads as u32, q_tiles, 1),
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: shared_bytes,
+    };
+    let batch_u32 = batch as u32;
+    let nh = num_heads as u32;
+    let nkvh = num_kv_heads as u32;
+    let hd = head_dim as u32;
+    let ps = pos_start as u32;
+    let msl = kv_cache.max_seq_len as u32;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let kfn = kernels.flash_attention_wmma_split.as_ref().ok_or_else(|| {
+        RuntimeError::Compute("flash_attention_wmma_split: kernel not available".into())
+    })?;
+    {
+        use cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
+        let _ = kfn.set_attribute(
+            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            shared_bytes as i32,
+        );
+    }
+    device
+        .stream
+        .launch_builder(kfn)
+        .arg(q_batch)
+        .arg(&kv_cache.k_cache)
+        .arg(&kv_cache.v_cache)
+        .arg(attn_out)
+        .arg(&batch_u32)
+        .arg(&nh)
+        .arg(&nkvh)
+        .arg(&hd)
+        .arg(&ps)
+        .arg(&msl)
+        .arg(&scale)
+        .launch(launch_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("flash_attention_wmma_split launch: {e}")))?;
     Ok(())
 }
 
@@ -3190,7 +3638,7 @@ pub(crate) unsafe fn launch_f32_to_bf16_fast(
 /// `w_bf16` must be `out_dim * in_dim` BF16 elements (2 bytes each).
 /// `a_bf16` must be `batch * in_dim` BF16 elements.
 /// `output` must be `batch * out_dim` F32 elements.
-unsafe fn launch_cublas_gemm_bf16(
+pub(crate) unsafe fn launch_cublas_gemm_bf16(
     device: &CudaDevice,
     w_bf16: &CudaSlice<u8>,
     a_bf16: &CudaSlice<u8>,

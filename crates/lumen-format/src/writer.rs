@@ -297,6 +297,28 @@ fn serialize_hyperparams(buf: &mut Vec<u8>, hp: &ModelHyperparams) {
     buf.extend_from_slice(&hp.num_experts.unwrap_or(0).to_le_bytes());
     buf.extend_from_slice(&hp.num_active_experts.unwrap_or(0).to_le_bytes());
     buf.extend_from_slice(&hp.norm_eps.to_le_bytes());
+
+    // v4: Gated-DeltaNet (GDN/SSM) dimensions, appended AFTER all v1-v3 fields.
+    // Layout: presence(1 byte) + [num_v_heads, num_k_heads, head_dim, conv_kernel]
+    // (4 * u32 LE = 16 bytes) only when present.
+    //   - absent  => 1 byte total  (just the 0 presence flag)
+    //   - present => 17 bytes total (1 flag + 16 data)
+    // The reader only consumes these bytes when the header version >= 4, so v3
+    // files (which never carried this block) parse identically. Appending here
+    // grows the hyperparams block; peek_header_offsets() accounts for the new
+    // size by re-deriving the skip from the version it reads.
+    match &hp.gdn {
+        Some(g) => {
+            buf.push(1);
+            buf.extend_from_slice(&g.num_v_heads.to_le_bytes());
+            buf.extend_from_slice(&g.num_k_heads.to_le_bytes());
+            buf.extend_from_slice(&g.head_dim.to_le_bytes());
+            buf.extend_from_slice(&g.conv_kernel.to_le_bytes());
+        }
+        None => {
+            buf.push(0);
+        }
+    }
 }
 
 fn serialize_quant_desc(buf: &mut Vec<u8>, qd: &QuantizationDescriptor) {
@@ -484,6 +506,7 @@ mod tests {
             norm_eps: 1e-5,
             rotary_dim: None,
             rope_neox: false,
+            gdn: None,
         };
         let qd = QuantizationDescriptor {
             scheme: QuantScheme::F32,

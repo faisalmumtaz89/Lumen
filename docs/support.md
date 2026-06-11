@@ -18,6 +18,9 @@ Benchmarked on an A100-80GB; see [`bench/RESULTS.md`](../bench/RESULTS.md) for t
 | Qwen3.5-MoE-35B-A3B | Q8_0 | Production-ready (functional) | 0.584× llama.cpp | MoE_Q8_SPLIT=OFF default validated |
 | Qwen3.5-MoE-35B-A3B | Q4_0 | Production-ready (functional) | 0.674× llama.cpp | Same MoE setup path as Q8 MoE |
 | Qwen3.5-MoE-35B-A3B | BF16 | Production-ready with caveats | 0.902× llama.cpp (recommended) | Requires dedicated 80 GB+ GPU (peak 72.4 GB) |
+| Qwen3.6-27B dense | Q8_0 | Production-ready | 0.85× llama.cpp | All quality gates pristine (2026-06-11 checklist) |
+| Qwen3.6-27B dense | Q4_0 | Production-ready | 0.66× llama.cpp | All quality gates pristine |
+| Qwen3.6-27B dense | BF16 | Production-ready | 0.89× llama.cpp | All quality gates pristine |
 
 ### Metal (Apple Silicon, M-series)
 
@@ -27,9 +30,12 @@ Benchmarked on an M3 Ultra; see [`bench/RESULTS.md`](../bench/RESULTS.md) for th
 |-------|-------|--------|------:|------:|---|
 | Qwen3.5-9B dense | Q8_0 | Production-ready (default) | **0.98×** | 0.95× | Cleared 0.9× decode gate |
 | Qwen3.5-9B dense | Q4_0 | Production-ready | **1.02×** / **1.17×** (beats llama.cpp) | 0.88× | Below 0.9× prefill (structural) |
-| Qwen3.5-9B dense | BF16 | Production-ready (functional) | 0.83× | 0.66× (up from 0.31×) | Requires `LUMEN_METAL_MMAP_ONLY=1` |
-| Qwen3.5-MoE-35B-A3B | Q8_0 | Production-ready (functional) | — | — | Requires `LUMEN_METAL_MMAP_ONLY=1`. llama.cpp build 8680 cannot load this arch — **Lumen is the sole provider on Apple Silicon**. |
-| Qwen3.5-MoE-35B-A3B | Q4_0 | Production-ready (functional) | — | — | Same `MMAP_ONLY=1` requirement; sole provider on Apple Silicon |
+| Qwen3.5-9B dense | BF16 | Production-ready (functional) | 0.83× | 0.66× (up from 0.31×) | mmap zero-copy load (the default on Metal) |
+| Qwen3.5-MoE-35B-A3B | Q8_0 | Production-ready (functional) | 0.21× | 0.09× | mmap zero-copy load (the default on Metal). (llama.cpp build 8680 could not load this arch; current llama.cpp builds can — ratios vs a 2026-06-11 build. MoE perf on Metal is a known optimization target.) |
+| Qwen3.5-MoE-35B-A3B | Q4_0 | Production-ready (functional) | 0.18× | 0.08× | Same mmap default; same MoE-perf caveat |
+| Qwen3.6-27B dense | Q8_0 | Production-ready | **1.03× (beats llama.cpp)** | 0.86× | All quality gates pristine (2026-06-11) |
+| Qwen3.6-27B dense | Q4_0 | Production-ready | 0.99× | 0.82× | All quality gates pristine |
+| Qwen3.6-27B dense | BF16 | Production-ready | — | — | All quality gates pristine; perf row pending |
 
 ## What is not (yet) supported
 

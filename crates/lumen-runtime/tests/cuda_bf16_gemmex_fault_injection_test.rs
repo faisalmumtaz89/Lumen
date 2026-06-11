@@ -120,6 +120,7 @@ fn minimal_test_hyperparams() -> ModelHyperparams {
         norm_eps: 1e-6,
         rotary_dim: None,
         rope_neox: false,
+        gdn: None,
     }
 }
 

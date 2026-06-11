@@ -50,9 +50,9 @@ pub use error::RuntimeError;
 pub use kv::{KvCache, KvCacheConfig, KvPrecision};
 pub use session::{PrefillResult, Session, SuffixPrefillResult, TokenStream};
 pub use tooling::{
-    parse_final, ParsedAssistant, ParsedToolCall, Qwen35Renderer, StreamingDelta,
-    StreamingFinish, StreamingParser, ToolResult, ToolSchema,
-    TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
+    parse_final, ParsedAssistant, ParsedToolCall, Qwen35Renderer, ReasoningDelta,
+    ReasoningExtractor, StreamingDelta, StreamingFinish, StreamingParser, ToolResult,
+    ToolSchema, THINK_CLOSE, TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
 };
 pub use pipeline::PipelineMode;
 pub use storage::{IoSnapshot, IoTracker, MmapPageCacheBackend, StorageBackend};

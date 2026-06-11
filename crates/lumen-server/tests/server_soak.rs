@@ -156,7 +156,8 @@ impl Tokenize for BpeTokenizerAdapter {
     }
 
     fn apply_chat_template(&self, system: Option<&str>, user: &str) -> Option<String> {
-        Some(self.inner.apply_chat_template_with_system(user, system))
+        // Soak harness: reasoning off (closed think tail), byte-identical.
+        Some(self.inner.apply_chat_template_with_system(user, system, false))
     }
 
     fn eos_tokens(&self) -> Vec<u32> {

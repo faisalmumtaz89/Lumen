@@ -116,8 +116,11 @@ impl Qwen35Renderer {
         out
     }
 
-    /// Convenience for tests: produce the exact text the model is expected
-    /// to emit when calling `name` with `arguments` (a JSON string).
+    /// Render the exact ChatML text the model emits when calling `name` with
+    /// `arguments` (a JSON string). This is the shared primitive used by both
+    /// the wire tool-call renderer [`render_assistant_tool_call_segment`] (the
+    /// OpenAI and Anthropic surfaces) and the tooling tests; it is a
+    /// load-bearing production codepath, not a test-only convenience.
     pub fn render_one_call(name: &str, arguments_json: &str) -> String {
         let mut out = String::with_capacity(64 + arguments_json.len());
         out.push_str(TOOL_CALL_OPEN);
@@ -340,6 +343,152 @@ impl StreamingParser {
             out.incomplete_tool_call = Some(self.current_body);
         }
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning ("thinking") extraction
+// ---------------------------------------------------------------------------
+
+/// The literal closing marker of a Qwen3.5 reasoning block. The opening
+/// `<think>` is part of the *prompt* tail (see
+/// `runtime_defaults::think_prompt_tail`); the assistant's emitted stream
+/// therefore begins *inside* the reasoning block (when thinking is enabled)
+/// and the first thing we must detect in its output is this close marker.
+pub const THINK_CLOSE: &str = "</think>";
+
+/// What [`ReasoningExtractor::feed`] / [`ReasoningExtractor::finish`] produce
+/// from one chunk: the portion that belongs to the reasoning trace and the
+/// portion that belongs to the user-visible answer.
+///
+/// Invariant: concatenating every delta's `reasoning` reconstructs the full
+/// reasoning trace (the text the model emitted before `</think>`, with the
+/// marker itself dropped); concatenating every delta's `content` reconstructs
+/// the answer (everything after `</think>`). With thinking disabled, all input
+/// flows to `content` and `reasoning` is always empty.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ReasoningDelta {
+    /// Text belonging to the reasoning trace (Qwen3.5 `<think>...</think>`
+    /// interior), safe to forward right now. Routed to `reasoning_content`
+    /// (OpenAI), a `thinking` block (Anthropic), or a labelled stderr section
+    /// (CLI) by the caller.
+    pub reasoning: String,
+
+    /// User-visible answer text (everything after the reasoning block), safe
+    /// to forward right now.
+    pub content: String,
+}
+
+/// Streaming splitter that separates a model's reasoning trace from its
+/// answer, mirroring [`StreamingParser`]'s hold-back state machine.
+///
+/// # Why it mirrors `StreamingParser`
+///
+/// The reasoning/answer boundary is exactly the tool-call problem rotated 90°:
+/// a single marker (`</think>` here, `<tool_call>` there) can straddle two SSE
+/// chunks, so a partial `</thi` arriving at the end of one feed must NOT be
+/// emitted as reasoning until the next feed confirms whether it completes into
+/// the marker. We reuse the same `find_subslice` / `longest_marker_prefix`
+/// hold-back primitives so the two state machines have identical
+/// chunk-boundary semantics.
+///
+/// # Outermost-first composition
+///
+/// Reasoning is the OUTERMOST structure: the trace is split off FIRST, then
+/// the answer text is handed to the tool-call [`StreamingParser`] (see
+/// `lumen-server::sse::SseSafeEmitter`). Tool calls live in the answer, never
+/// in the reasoning trace, so this ordering is correct for Qwen3.5.
+///
+/// # Contract
+///
+/// - `new(thinking)` starts the machine `in_reasoning = thinking`. When
+///   `thinking == false` the extractor is a pure passthrough: `feed` returns
+///   all input as `content`, `reasoning` always empty, NO bytes are ever held
+///   back — byte-identical to feeding the same text straight through.
+/// - The same instance is fed the assistant's decoded text as it streams.
+/// - At end-of-stream the caller MUST call [`finish`](Self::finish) to flush
+///   any held-back partial marker (which, having not completed, is real text).
+#[derive(Debug, Clone)]
+pub struct ReasoningExtractor {
+    /// True while we are still inside the reasoning block (before `</think>`).
+    /// Initialised to the request's `thinking` flag.
+    in_reasoning: bool,
+    /// Pending reasoning text we cannot yet emit because it MIGHT extend into
+    /// the `</think>` close marker. Always shorter than `THINK_CLOSE`. Only
+    /// ever non-empty while `in_reasoning` is true.
+    held_back: String,
+}
+
+impl ReasoningExtractor {
+    /// Construct an extractor. `thinking` is the resolved per-request flag
+    /// (see `runtime_defaults::resolve_enable_thinking`): `true` means the
+    /// prompt opened a `<think>` block so the stream starts in reasoning;
+    /// `false` means the closed empty-think tail was used so there is no
+    /// reasoning and this is a passthrough.
+    pub fn new(thinking: bool) -> Self {
+        Self {
+            in_reasoning: thinking,
+            held_back: String::new(),
+        }
+    }
+
+    /// Feed the next chunk of decoded assistant text. Returns the
+    /// reasoning/answer split that is safe to forward right now.
+    pub fn feed(&mut self, chunk: &str) -> ReasoningDelta {
+        let mut delta = ReasoningDelta::default();
+        if chunk.is_empty() {
+            return delta;
+        }
+
+        if !self.in_reasoning {
+            // Passthrough: everything is answer content. No marker to scan
+            // for, nothing held back — byte-identical to a raw forward.
+            delta.content.push_str(chunk);
+            return delta;
+        }
+
+        // Inside the reasoning block: prepend whatever partial-marker tail we
+        // held back last time, then scan for the `</think>` close marker.
+        let mut input = String::with_capacity(self.held_back.len() + chunk.len());
+        input.push_str(&self.held_back);
+        input.push_str(chunk);
+        self.held_back.clear();
+
+        let bytes = input.as_bytes();
+        let marker = THINK_CLOSE.as_bytes();
+        if let Some(pos) = find_subslice(bytes, marker) {
+            // Reasoning ends here. Text before the marker is reasoning; DROP
+            // the marker itself; everything after is answer content.
+            delta.reasoning.push_str(&input[..pos]);
+            self.in_reasoning = false;
+            let tail = &input[pos + marker.len()..];
+            delta.content.push_str(tail);
+        } else {
+            // No full marker. Hold back the longest suffix that COULD be the
+            // start of `</think>` so we never truncate it across feeds; emit
+            // the rest as reasoning.
+            let hold_len = longest_marker_prefix(bytes, marker);
+            let safe_end = bytes.len() - hold_len;
+            delta.reasoning.push_str(&input[..safe_end]);
+            self.held_back.push_str(&input[safe_end..]);
+        }
+        delta
+    }
+
+    /// Flush at end-of-stream. Any text still held back never completed into
+    /// `</think>`, so it is genuine reasoning text and is emitted as such.
+    /// (If the stream already left the reasoning block, `held_back` is empty
+    /// and the returned delta is empty.)
+    pub fn finish(mut self) -> ReasoningDelta {
+        let mut delta = ReasoningDelta::default();
+        if !self.held_back.is_empty() {
+            // We can only be holding back while still in_reasoning (the
+            // passthrough and post-marker paths never populate held_back), so
+            // the residue belongs to the reasoning trace.
+            delta.reasoning.push_str(&self.held_back);
+            self.held_back.clear();
+        }
+        delta
     }
 }
 
@@ -647,6 +796,61 @@ pub struct ToolResult<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Wire-level ChatML tool-turn rendering (SINGLE source of truth)
+// ---------------------------------------------------------------------------
+//
+// Both wire surfaces (OpenAI `/v1/chat/completions` and Anthropic
+// `/v1/messages`) must CONSUME a tool round-trip and re-render it into the
+// exact same Qwen3.5 ChatML transcript so the model sees a byte-identical
+// prompt regardless of which API the caller used. These two helpers are that
+// single source of truth: the OpenAI path used to inline the byte sequences
+// and the Anthropic path dropped tool blocks entirely. Routing both through
+// here makes their tool transcripts byte-identical by construction.
+
+/// Render one assistant tool-call as the ChatML segment that is appended to
+/// the assistant turn (AFTER any assistant text content, BEFORE the closing
+/// `<|im_end|>`): a leading newline, then the `<tool_call>...</tool_call>`
+/// block from [`Qwen35Renderer::render_one_call`].
+///
+/// `arguments_json` is the raw on-wire JSON value for the call arguments
+/// (OpenAI carries it as a JSON *string*; Anthropic carries an `input`
+/// *object* the caller serializes to JSON first). The name is JSON-escaped by
+/// `render_one_call`, so a name containing a quote can never break the block.
+///
+/// Output (for `name="get_weather"`, `arguments_json="{\"city\": \"Paris\"}"`):
+/// ```text
+/// \n<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>
+/// ```
+pub fn render_assistant_tool_call_segment(name: &str, arguments_json: &str) -> String {
+    let mut out = String::with_capacity(1 + 64 + arguments_json.len());
+    out.push('\n');
+    out.push_str(&Qwen35Renderer::render_one_call(name, arguments_json));
+    out
+}
+
+/// Render a tool-result turn as a full ChatML user message wrapping a single
+/// `<tool_response>` block. This is the consume side of the round-trip
+/// (matching how the model is taught to emit calls and read responses).
+///
+/// Output (for `content="{\"temp\": 18}"`):
+/// ```text
+/// <|im_start|>user\n<tool_response>\n{"temp": 18}\n</tool_response><|im_end|>\n
+/// ```
+///
+/// Note the byte layout deliberately matches the OpenAI surface's prior inline
+/// form (no newline between `</tool_response>` and `<|im_end|>`), NOT
+/// [`format_tool_responses`] (which appends a trailing newline and is used on
+/// a different, non-wire codepath); changing that helper would ripple into
+/// unrelated callers.
+pub fn render_tool_response_turn(content: &str) -> String {
+    let mut out = String::with_capacity(48 + content.len());
+    out.push_str("<|im_start|>user\n<tool_response>\n");
+    out.push_str(content);
+    out.push_str("\n</tool_response><|im_end|>\n");
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Utility: schema map for callers that look up by name
 // ---------------------------------------------------------------------------
 
@@ -872,6 +1076,36 @@ mod tests {
         assert!(s.contains("\"value\": 7"));
     }
 
+    // ---- Wire-level ChatML tool-turn rendering (shared by both surfaces) ----
+
+    #[test]
+    fn assistant_tool_call_segment_is_leading_nl_plus_render_one_call() {
+        // The segment is exactly a leading '\n' followed by render_one_call —
+        // the byte sequence the OpenAI surface used to inline, with the name
+        // now JSON-escaped.
+        let seg = render_assistant_tool_call_segment("get_weather", "{\"city\": \"Paris\"}");
+        assert_eq!(
+            seg,
+            "\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>"
+        );
+        // Equivalence to the underlying primitive.
+        assert_eq!(
+            seg,
+            format!("\n{}", Qwen35Renderer::render_one_call("get_weather", "{\"city\": \"Paris\"}"))
+        );
+    }
+
+    #[test]
+    fn tool_response_turn_matches_openai_inline_byte_layout() {
+        // No newline between </tool_response> and <|im_end|>, trailing newline
+        // after <|im_end|> — exactly the OpenAI surface's prior inline form.
+        let turn = render_tool_response_turn("{\"temp\": 18}");
+        assert_eq!(
+            turn,
+            "<|im_start|>user\n<tool_response>\n{\"temp\": 18}\n</tool_response><|im_end|>\n"
+        );
+    }
+
     // ---- JSON helper unit tests ----
 
     #[test]
@@ -893,5 +1127,126 @@ mod tests {
         let body = "{\"name\": \"with \\\"q\\\"\", \"arguments\": {}}";
         let v = extract_json_string_field(body, "name").unwrap();
         assert_eq!(v, "with \"q\"");
+    }
+
+    // ---- ReasoningExtractor ----
+    //
+    // These mirror the StreamingParser tests above: same structural cases
+    // (one-shot, marker split across chunks, char-by-char recoverability)
+    // plus the thinking=false passthrough that has no StreamingParser analogue.
+
+    #[test]
+    fn reasoning_disabled_is_pure_passthrough() {
+        // thinking=false: everything is content, reasoning always empty, and
+        // nothing is held back even when the answer text itself contains a
+        // literal `</think>` (there is no reasoning block to close).
+        let mut r = ReasoningExtractor::new(false);
+        let d = r.feed("plain answer with a </think> literal");
+        assert_eq!(d.reasoning, "");
+        assert_eq!(d.content, "plain answer with a </think> literal");
+        let f = r.finish();
+        assert_eq!(f.reasoning, "");
+        assert_eq!(f.content, "");
+    }
+
+    #[test]
+    fn reasoning_enabled_splits_in_one_chunk() {
+        let mut r = ReasoningExtractor::new(true);
+        let d = r.feed("let me think step by step</think>The answer is 42.");
+        assert_eq!(d.reasoning, "let me think step by step");
+        assert_eq!(d.content, "The answer is 42.");
+        // After the marker we are in content; the close marker is dropped.
+        let d2 = r.feed(" More answer.");
+        assert_eq!(d2.reasoning, "");
+        assert_eq!(d2.content, " More answer.");
+        let f = r.finish();
+        assert_eq!(f.reasoning, "");
+        assert_eq!(f.content, "");
+    }
+
+    #[test]
+    fn reasoning_close_marker_split_across_chunks() {
+        // "</thi" arrives in one chunk, "nk>answer" in the next. The partial
+        // "</thi" must be held back (NOT emitted as reasoning) until resolved.
+        let mut r = ReasoningExtractor::new(true);
+        let d1 = r.feed("reasoning text</thi");
+        assert_eq!(d1.reasoning, "reasoning text", "partial marker held back");
+        assert_eq!(d1.content, "");
+        let d2 = r.feed("nk>visible answer");
+        assert_eq!(d2.reasoning, "");
+        assert_eq!(d2.content, "visible answer");
+    }
+
+    #[test]
+    fn reasoning_partial_marker_that_is_not_the_marker_is_flushed_as_reasoning() {
+        // A held-back partial that turns out to be ordinary reasoning text
+        // (e.g. "</thinking" — a different word) must be re-emitted to
+        // reasoning, never lost. We feed "</thi" (held back) then "s" which
+        // makes "</this" — not the marker — so all of it is reasoning.
+        let mut r = ReasoningExtractor::new(true);
+        let d1 = r.feed("note </thi");
+        assert_eq!(d1.reasoning, "note ");
+        let d2 = r.feed("s is reasoning");
+        assert_eq!(d2.reasoning, "</this is reasoning");
+        assert_eq!(d2.content, "");
+        // Never closed -> finish flushes any residue (none here).
+        let f = r.finish();
+        assert_eq!(f.reasoning, "");
+    }
+
+    #[test]
+    fn reasoning_finish_flushes_held_partial_marker_as_text() {
+        // Stream ends mid-partial-marker: the held-back "</thi" never
+        // completed, so finish() emits it as reasoning text.
+        let mut r = ReasoningExtractor::new(true);
+        let d = r.feed("thinking</thi");
+        assert_eq!(d.reasoning, "thinking");
+        let f = r.finish();
+        assert_eq!(f.reasoning, "</thi");
+        assert_eq!(f.content, "");
+    }
+
+    #[test]
+    fn reasoning_no_close_marker_all_reasoning() {
+        // The whole stream is reasoning (model never emitted </think>): every
+        // byte is reasoning, content stays empty.
+        let mut r = ReasoningExtractor::new(true);
+        let d = r.feed("still thinking and thinking");
+        assert_eq!(d.reasoning, "still thinking and thinking");
+        assert_eq!(d.content, "");
+        let f = r.finish();
+        assert_eq!(f.reasoning, "");
+    }
+
+    #[test]
+    fn reasoning_byte_for_byte_emission_recoverable() {
+        // Feed one char at a time and verify the assembled reasoning/content
+        // match a single-shot split — the same recoverability guarantee the
+        // StreamingParser test asserts for tool calls.
+        let full = "chain of thought here</think>final answer text";
+        let mut r = ReasoningExtractor::new(true);
+        let mut reasoning_acc = String::new();
+        let mut content_acc = String::new();
+        for ch in full.chars() {
+            let buf = ch.to_string();
+            let d = r.feed(&buf);
+            reasoning_acc.push_str(&d.reasoning);
+            content_acc.push_str(&d.content);
+        }
+        let f = r.finish();
+        reasoning_acc.push_str(&f.reasoning);
+        content_acc.push_str(&f.content);
+        assert_eq!(reasoning_acc, "chain of thought here");
+        assert_eq!(content_acc, "final answer text");
+    }
+
+    #[test]
+    fn reasoning_empty_marker_immediately_at_start() {
+        // Edge: the model emits </think> with no reasoning content at all
+        // (empty trace), then the answer. reasoning is empty, content is all.
+        let mut r = ReasoningExtractor::new(true);
+        let d = r.feed("</think>direct answer");
+        assert_eq!(d.reasoning, "");
+        assert_eq!(d.content, "direct answer");
     }
 }

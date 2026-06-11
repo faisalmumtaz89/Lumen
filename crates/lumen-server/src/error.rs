@@ -73,6 +73,36 @@ impl ServerError {
         }
     }
 
+    /// Classify a runtime failure message into the right HTTP-shaped error.
+    ///
+    /// The engine surfaces some *client-input* faults as runtime errors (they
+    /// only become detectable once the prompt is sized against the loaded
+    /// model's `max_seq_len`): an over-long prompt and an empty prompt are the
+    /// caller's fault (400), not a server bug (500). This is the single
+    /// classifier both the `From<RuntimeError>` conversion AND the wire layer's
+    /// `TokenEvent::Error(msg)` handlers route through, so a given runtime
+    /// message maps to the same status regardless of which path surfaces it.
+    ///
+    /// Matching is by stable sentinel substring:
+    /// - `"would exceed max_seq_len"` (the KV-overflow formatter in
+    ///   `kv::mod.rs::advance_seq_len`) OR `"max_seq_len is"` (the proactive
+    ///   prompt-length guard in `engine.rs::run_job`) → 400
+    ///   `code="context_length_exceeded"`.
+    /// - `"prompt is empty"` (an empty tokenized prompt) → 400
+    ///   `code="empty_prompt"`.
+    /// - everything else (genuine `Compute` / `StorageIo` / pipeline failures)
+    ///   stays a `Runtime` error → 500.
+    pub fn classify_runtime(message: impl Into<String>) -> Self {
+        let message = message.into();
+        if message.contains("would exceed max_seq_len") || message.contains("max_seq_len is") {
+            Self::bad_request_field(message, "messages", "context_length_exceeded")
+        } else if message.contains("prompt is empty") {
+            Self::bad_request_field(message, "messages", "empty_prompt")
+        } else {
+            Self::Runtime(message)
+        }
+    }
+
     fn status(&self) -> StatusCode {
         match self {
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
@@ -126,6 +156,8 @@ impl IntoResponse for ServerError {
 
 impl From<lumen_runtime::RuntimeError> for ServerError {
     fn from(e: lumen_runtime::RuntimeError) -> Self {
-        Self::Runtime(e.to_string())
+        // Route through the shared classifier: a context-length / empty-prompt
+        // runtime error is a client 400, genuine compute/IO failures stay 500.
+        Self::classify_runtime(e.to_string())
     }
 }

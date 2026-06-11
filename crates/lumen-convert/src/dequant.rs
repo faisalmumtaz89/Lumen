@@ -501,14 +501,44 @@ pub(crate) fn dequantize_q6_k(src: &[u8], n_elements: u64) -> Vec<u8> {
 }
 
 /// Dequantize Q2_K: block_size=256, type_size=84.
-/// Layout: [16 bytes scales] [16 bytes zero-points] [64 bytes qs] [2 bytes f16 d] [2 bytes f16 dmin]
+/// Layout: [16 bytes scales] [64 bytes qs] [2 bytes f16 d] [2 bytes f16 dmin]
 ///
 /// scales: 16 x uint8. Each byte has a 4-bit scale (low) and 4-bit min (high)
 /// packed per 16-value sub-block.
-/// qs: 64 bytes, 2-bit packed (4 values per byte).
+/// qs: 64 bytes, 2-bit packed.
+///
+/// CRITICAL — the qs traversal order is GGML's `dequantize_row_q2_K`, NOT a
+/// naive linear "byte 0 -> values 0..3, byte 1 -> values 4..7" scan. GGML
+/// processes the 256 values as two 128-value groups; within a group it makes
+/// four passes (shift = 0,2,4,6) over the SAME 32 qs bytes, emitting two runs
+/// of 16 values per pass (`q[l]` then `q[l+16]`) and consuming two scale
+/// sub-blocks per pass. A naive linear scan happens to agree only when every
+/// quant and every scale in the block is identical (the degenerate case the
+/// old unit test used), which is why this bug shipped: it corrupts ~74% of the
+/// values in any real Q2_K block. The 27B (Qwen3.6) GGUF is Q2_K, so the
+/// converter dequant->Q8_0 produced corrupted weights -> token salad; the 9B
+/// is Q8_0-sourced and never reaches this code, so it is byte-unaffected.
+///
+/// Reference (ggml-quants.c, stable across llama.cpp builds incl. b9430):
+/// ```c
+/// const uint8_t * q = x[i].qs; int is = 0; float dl, ml;
+/// for (int n = 0; n < QK_K; n += 128) {
+///     int shift = 0;
+///     for (int j = 0; j < 4; ++j) {
+///         uint8_t sc = x[i].scales[is++];
+///         dl = d * (sc & 0xF); ml = dmin * (sc >> 4);
+///         for (int l = 0; l < 16; ++l) *y++ = dl * ((q[l]    >> shift) & 3) - ml;
+///         sc = x[i].scales[is++];
+///         dl = d * (sc & 0xF); ml = dmin * (sc >> 4);
+///         for (int l = 0; l < 16; ++l) *y++ = dl * ((q[l+16] >> shift) & 3) - ml;
+///         shift += 2;
+///     }
+///     q += 32;
+/// }
+/// ```
 pub(crate) fn dequantize_q2_k(src: &[u8], n_elements: u64) -> Vec<u8> {
     let n = n_elements as usize;
-    let mut out = Vec::with_capacity(n * 4);
+    let mut out = vec![0u8; n * 4];
     let block_size = 84;
     let mut written = 0usize;
     let mut offset = 0usize;
@@ -518,30 +548,50 @@ pub(crate) fn dequantize_q2_k(src: &[u8], n_elements: u64) -> Vec<u8> {
         let d = f16_to_f32(u16::from_le_bytes([src[offset + 80], src[offset + 81]]));
         let dmin = f16_to_f32(u16::from_le_bytes([src[offset + 82], src[offset + 83]]));
 
-        // 16 sub-blocks of 16 values = 256 values
-        // Each scales[j] byte: low 4 bits = scale, high 4 bits = min
-        let mut q_idx = 0usize;
-        for &scale_byte in scales.iter().take(16) {
-            let sc = d * (scale_byte & 0x0F) as f32;
-            let m = dmin * ((scale_byte >> 4) & 0x0F) as f32;
-            // 16 values, 2-bit each = 4 bytes
-            for _l in 0..4 {
-                if written >= n {
-                    break;
-                }
-                let byte = qs[q_idx];
-                q_idx += 1;
-                for shift in [0, 2, 4, 6] {
+        // Block-local output index (0..256). The caller may request fewer than
+        // 256 elements on the final block; `written < n` guards every store.
+        let mut y_local = 0usize;
+        let mut q_off = 0usize; // qs byte offset for the current 128-value group
+        let mut is = 0usize; // scale sub-block cursor
+        // Two groups of 128 values; q pointer advances 32 bytes per group.
+        for _group in 0..2 {
+            let mut shift = 0u8;
+            for _j in 0..4 {
+                let sc0 = scales[is];
+                is += 1;
+                let dl0 = d * (sc0 & 0x0F) as f32;
+                let ml0 = dmin * ((sc0 >> 4) & 0x0F) as f32;
+                for l in 0..16usize {
                     if written >= n {
-                        break;
+                        return out;
                     }
-                    let q = ((byte >> shift) & 3) as f32;
-                    let val = sc * q - m;
-                    out.extend_from_slice(&val.to_le_bytes());
+                    let q = ((qs[q_off + l] >> shift) & 3) as f32;
+                    let val = dl0 * q - ml0;
+                    let o = (written) * 4;
+                    out[o..o + 4].copy_from_slice(&val.to_le_bytes());
                     written += 1;
+                    y_local += 1;
                 }
+                let sc1 = scales[is];
+                is += 1;
+                let dl1 = d * (sc1 & 0x0F) as f32;
+                let ml1 = dmin * ((sc1 >> 4) & 0x0F) as f32;
+                for l in 0..16usize {
+                    if written >= n {
+                        return out;
+                    }
+                    let q = ((qs[q_off + l + 16] >> shift) & 3) as f32;
+                    let val = dl1 * q - ml1;
+                    let o = (written) * 4;
+                    out[o..o + 4].copy_from_slice(&val.to_le_bytes());
+                    written += 1;
+                    y_local += 1;
+                }
+                shift += 2;
             }
+            q_off += 32;
         }
+        let _ = y_local;
         offset += block_size;
     }
     out
@@ -561,63 +611,99 @@ pub(crate) fn dequantize_q3_k(src: &[u8], n_elements: u64) -> Vec<u8> {
         let scale_bytes = &src[offset + 96..offset + 108];
         let d = f16_to_f32(u16::from_le_bytes([src[offset + 108], src[offset + 109]]));
 
-        // Decode 16 6-bit scales from 12 bytes
-        // The packing is the same as K-quant scales but for 16 values from 12 bytes:
-        // Q3_K encodes 16 signed 6-bit scales into 12 bytes (GGML layout):
-        //   scales[0..3]  = low nibbles of aux8[0..3]
-        //   scales[4..7]  = high nibbles of aux8[0..3]
-        //   scales[8..11] = low nibbles of aux8[4..7]
-        //   scales[12..15]= high nibbles of aux8[4..7]
-        //   high 2 bits:    scales[j] |= ((aux8[8 + j/4] >> (2*(j%4))) & 3) << 4
-        //   convert signed: scales[j] = (scales[j] as i8 - 32)
-
+        // Decode 16 6-bit scales from 12 bytes using GGML's EXACT `aux`
+        // uint32 shuffle (ggml-quants.c `dequantize_row_q3_K`). The previous
+        // nibble-by-nibble decode produced a DIFFERENT 16-scale permutation
+        // than ggml (verified against llama.cpp reference activations: it gave the wrong ffn_out;
+        // the aux shuffle reproduces llama's ffn_out-0 = 0.005 byte-for-byte).
+        // This corrupted every Q3_K tensor (e.g. all ffn_down on the 27B).
+        //
+        // Reference:
+        //   const uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
+        //   memcpy(aux, scales, 12);
+        //   uint32_t tmp = aux[2];
+        //   aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        //   aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        //   aux[0] = (aux[0]      & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        //   aux[1] = (aux[1]      & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        //   scales = (const int8_t*)aux;  // 16 bytes, each used as (sc - 32)
+        const KMASK1: u32 = 0x0303_0303;
+        const KMASK2: u32 = 0x0f0f_0f0f;
+        let a0 = u32::from_le_bytes([scale_bytes[0], scale_bytes[1], scale_bytes[2], scale_bytes[3]]);
+        let a1 = u32::from_le_bytes([scale_bytes[4], scale_bytes[5], scale_bytes[6], scale_bytes[7]]);
+        let tmp = u32::from_le_bytes([scale_bytes[8], scale_bytes[9], scale_bytes[10], scale_bytes[11]]);
+        let out0 = (a0 & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+        let out1 = (a1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+        let out2 = ((a0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+        let out3 = ((a1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
         let mut sc_arr = [0u8; 16];
-        // Low nibbles and high nibbles from first 8 bytes
-        for j in 0..4 {
-            sc_arr[j] = scale_bytes[j] & 0x0F;
-            sc_arr[j + 4] = (scale_bytes[j] >> 4) & 0x0F;
-        }
-        for j in 0..4 {
-            sc_arr[j + 8] = scale_bytes[4 + j] & 0x0F;
-            sc_arr[j + 12] = (scale_bytes[4 + j] >> 4) & 0x0F;
-        }
-        // High 2 bits from bytes 8..12
-        for (j, sc) in sc_arr.iter_mut().enumerate() {
-            let byte_idx = 8 + j / 4;
-            let bit_shift = 2 * (j % 4);
-            *sc |= ((scale_bytes[byte_idx] >> bit_shift) & 3) << 4;
-        }
+        sc_arr[0..4].copy_from_slice(&out0.to_le_bytes());
+        sc_arr[4..8].copy_from_slice(&out1.to_le_bytes());
+        sc_arr[8..12].copy_from_slice(&out2.to_le_bytes());
+        sc_arr[12..16].copy_from_slice(&out3.to_le_bytes());
 
-        // Process 256 values in 16 sub-blocks of 16
-        // hmask: 32 bytes = 256 bits, one per value (the high bit)
-        // qs: 64 bytes = 256 2-bit values (4 per byte)
-        let mut q_byte_idx = 0usize;
-        let mut q_bit_shift = 0u8;
-        let mut val_idx = 0usize;
-        for &sc_val in &sc_arr {
-            let scale = d * (sc_val as i8 as f32 - 32.0);
-            for _l in 0..16 {
-                if written >= n {
-                    break;
+        // qs / hmask traversal follows GGML's `dequantize_row_q3_K`, which is
+        // the SAME grouped/shifted scheme as Q2_K (NOT a linear byte scan): two
+        // 128-value groups; within a group, four passes (shift = 0,2,4,6) over
+        // the same 32 qs bytes, two 16-value runs (`q[l]`, `q[l+16]`) per pass,
+        // consuming two scale sub-blocks per pass. The hmask high-bit selector
+        // `m` advances ONCE per pass (`m <<= 1`), so all 32 values of a pass
+        // share the same hmask bit position; the hmask BYTE is the in-run index
+        // `l` (0..31). The naive linear scan corrupts ~82% of values on a real
+        // block (matches only the degenerate uniform case the old test used).
+        //
+        // Reference (ggml-quants.c):
+        // ```c
+        // const uint8_t * q = x[i].qs; const uint8_t * hm = x[i].hmask; uint8_t m = 1;
+        // for (int n = 0; n < QK_K; n += 128) {
+        //   int shift = 0;
+        //   for (int j = 0; j < 4; ++j) {
+        //     int8_t sc = scales[is++]; float dl = d_all * (sc - 32);
+        //     for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t)((q[l]    >> shift) & 3) - ((hm[l]    & m) ? 0 : 4));
+        //     sc = scales[is++]; dl = d_all * (sc - 32);
+        //     for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t)((q[l+16] >> shift) & 3) - ((hm[l+16] & m) ? 0 : 4));
+        //     shift += 2; m <<= 1;
+        //   }
+        //   q += 32;
+        // }
+        // ```
+        // `(int8_t)(q2 & 3) - (h ? 0 : 4)` is algebraically `(q_lo | (h<<2)) - 4`.
+        let mut q_off = 0usize; // qs byte offset for the current 128-value group
+        let mut is = 0usize; // scale sub-block cursor
+        let mut hbit = 1u8; // hmask high-bit selector, advances per pass
+        for _group in 0..2 {
+            let mut shift = 0u8;
+            for _j in 0..4 {
+                let scale0 = d * (sc_arr[is] as i8 as f32 - 32.0);
+                is += 1;
+                for l in 0..16usize {
+                    if written >= n {
+                        return out;
+                    }
+                    let q_lo = (qs[q_off + l] >> shift) & 3;
+                    let h = u8::from((hmask[l] & hbit) != 0);
+                    let q = (q_lo | (h << 2)) as i32 - 4;
+                    let val = scale0 * q as f32;
+                    out.extend_from_slice(&val.to_le_bytes());
+                    written += 1;
                 }
-                // Get 2-bit low value from qs
-                let q_lo = (qs[q_byte_idx] >> q_bit_shift) & 3;
-                q_bit_shift += 2;
-                if q_bit_shift >= 8 {
-                    q_bit_shift = 0;
-                    q_byte_idx += 1;
+                let scale1 = d * (sc_arr[is] as i8 as f32 - 32.0);
+                is += 1;
+                for l in 0..16usize {
+                    if written >= n {
+                        return out;
+                    }
+                    let q_lo = (qs[q_off + l + 16] >> shift) & 3;
+                    let h = u8::from((hmask[l + 16] & hbit) != 0);
+                    let q = (q_lo | (h << 2)) as i32 - 4;
+                    let val = scale1 * q as f32;
+                    out.extend_from_slice(&val.to_le_bytes());
+                    written += 1;
                 }
-                // Get high bit from hmask
-                let hmask_byte = val_idx / 8;
-                let hmask_bit = val_idx % 8;
-                let h = (hmask[hmask_byte] >> hmask_bit) & 1;
-                // Combine: 3-bit value = q_lo | (h << 2), then subtract 4 to center
-                let q = (q_lo | (h << 2)) as i32 - 4;
-                let val = scale * q as f32;
-                out.extend_from_slice(&val.to_le_bytes());
-                written += 1;
-                val_idx += 1;
+                shift += 2;
+                hbit <<= 1;
             }
+            q_off += 32;
         }
         offset += block_size;
     }
@@ -648,8 +734,29 @@ pub(crate) fn f32_to_f16_bits_convert(val: f32) -> u16 {
         return ((sign << 15) | (0x1F << 10)) as u16;
     }
     if new_exp <= 0 {
-        // Underflow -> zero (subnormals not handled for quantization scale)
-        return (sign << 15) as u16;
+        // f16 subnormal range. Flushing these to zero silently destroys any
+        // Q8_0/Q4_0 block whose per-block scale (amax/127 or amax/7) lands
+        // below the smallest NORMAL f16 (2^-14 ≈ 6.10e-5). For Q2_K/Q4_K
+        // tensors upcast to Q8_0 (Metal path), small-magnitude weight blocks
+        // produce exactly such scales, so flush-to-zero wiped ~50-90% of the
+        // blocks in low-magnitude rows -> token salad on the 27B.
+        //
+        // f16 subnormals represent values down to 2^-24 ≈ 5.96e-8 with a
+        // 10-bit fraction and implicit exponent 2^-14. Encode them properly:
+        //   value = frac/1024 * 2^-14, where frac is the 10-bit mantissa.
+        // `new_exp <= 0` means the unbiased f32 exponent E = exp-127 satisfies
+        // E <= -15. The subnormal fraction is the full mantissa (with the
+        // implicit leading 1) right-shifted by (1 - new_exp) bits.
+        if new_exp < -10 {
+            // Below the smallest representable subnormal (2^-24): true underflow.
+            return (sign << 15) as u16;
+        }
+        // Restore the implicit leading 1, then shift into the 10-bit subnormal
+        // field. shift = 14 (frac is 23-bit) - 10 (target) + (1 - new_exp).
+        let mantissa = frac | 0x0080_0000; // 24-bit significand (1.fff...)
+        let shift = (14 - new_exp) as u32; // new_exp in [-10, 0] -> shift in [14, 24]
+        let f16_frac = mantissa >> shift; // truncation, consistent with normal path
+        return ((sign << 15) | (f16_frac & 0x3FF)) as u16;
     }
 
     let f16_frac = frac >> 13;
@@ -684,7 +791,12 @@ pub(crate) fn quantize_f32_to_q4_0(f32_bytes: &[u8], n_elements: usize) -> Vec<u
         // Scale: map [-amax, amax] to [-8, 7] (4-bit signed range with offset)
         // Q4_0 stores nibbles as unsigned 0..15, dequant subtracts 8: value = (nibble - 8) * scale
         // So nibble = round(value / scale) + 8, clamped to [0, 15]
-        let scale = if amax == 0.0 { 1.0 } else { amax / 7.0 }; // 7 because max positive nibble-8 = 7
+        // 7 because max positive nibble-8 = 7. Clamp to the f16 max normal
+        // (65504): the scale is STORED as f16, so amax > ~4.59e5 would make
+        // amax/7 overflow f16 to Inf and the whole block dequantize to NaN
+        // (reproduced 2026-06-10 with a synthetic high-amplitude block). With the
+        // clamp, out-of-range values saturate at the nibble bounds instead.
+        let scale = if amax == 0.0 { 1.0 } else { (amax / 7.0).min(65504.0) };
         let inv_scale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
 
         // Write f16 scale
@@ -917,37 +1029,50 @@ pub(crate) fn quantize_f32_to_q3_k(f32_bytes: &[u8], n_elements: usize) -> Vec<u
             }
         }
 
-        // 5) Encode into GGML Q3_K block layout.
+        // 5) Encode into GGML Q3_K block layout. The qs/hmask placement is the
+        // exact inverse of `dequantize_q3_k`'s GGML traversal: emit `q3` in the
+        // decoder's (group, pass, run, l) order and write each code's 2 low bits
+        // + high bit to the position the decoder reads them from:
+        //   qs    byte = group*32 + run*16 + l ,  2-bit shift = 2*pass
+        //   hmask byte = run*16 + l ,             bit = group*4 + pass
+        // (Previously this packed qs/hmask sequentially, matching the OLD linear
+        // decoder; that mismatched GGML and only round-tripped against the buggy
+        // dequant.)
         let bp = &mut out[blk * 110..(blk + 1) * 110];
 
-        // hmask (32B): 1 bit per element, the high bit of q3 (bit 2).
-        for idx in 0..256 {
-            let h = (q3[idx] >> 2) & 1;
-            bp[idx / 8] |= h << (idx % 8);
+        let mut p = 0usize; // sequential q3 index in decoder emit order
+        for group in 0..2usize {
+            for pass in 0..4usize {
+                let shift = (2 * pass) as u8;
+                for run in 0..2usize {
+                    for l in 0..16usize {
+                        let code = q3[p];
+                        let qs_byte = group * 32 + run * 16 + l;
+                        bp[32 + qs_byte] |= (code & 3) << shift;
+                        let hmask_byte = run * 16 + l;
+                        let hmask_bit = (group * 4 + pass) as u8;
+                        bp[hmask_byte] |= ((code >> 2) & 1) << hmask_bit;
+                        p += 1;
+                    }
+                }
+            }
         }
 
-        // qs (64B): 2 bits per element, sequential packing matching dequantizer.
-        let mut q_byte_idx = 0usize;
-        let mut q_bit_shift = 0u8;
-        for idx in 0..256 {
-            bp[32 + q_byte_idx] |= (q3[idx] & 3) << q_bit_shift;
-            q_bit_shift += 2;
-            if q_bit_shift >= 8 { q_bit_shift = 0; q_byte_idx += 1; }
-        }
-
-        // scales (12B): 6-bit packed.
-        //   sb_scale[0..4] = (sc6[0..4] & 0x0F) | ((sc6[4..8] & 0x0F) << 4)
-        //   sb_scale[4..8] = (sc6[8..12] & 0x0F) | ((sc6[12..16] & 0x0F) << 4)
-        //   sb_scale[8..12] = high 2 bits of all 16 scales, 4 per byte at 2-bit shifts.
+        // scales (12B): exact INVERSE of the GGML aux uint32 decode shuffle
+        // (see `dequantize_q3_k`). The decode reconstructs 16 6-bit scales as:
+        //   s[0..4]   low4 = b[0..4]&0xF       high2 = (b[8..12]>>0)&3
+        //   s[4..8]   low4 = b[4..8]&0xF       high2 = (b[8..12]>>2)&3
+        //   s[8..12]  low4 = (b[0..4]>>4)&0xF  high2 = (b[8..12]>>4)&3
+        //   s[12..16] low4 = (b[4..8]>>4)&0xF  high2 = (b[8..12]>>6)&3
+        // so the inverse pack is:
         let sb_scale_bytes = &mut bp[96..108];
-        for j in 0..4 {
-            sb_scale_bytes[j] = (sc6[j] & 0x0F) | ((sc6[j + 4] & 0x0F) << 4);
-        }
-        for j in 0..4 {
-            sb_scale_bytes[4 + j] = (sc6[j + 8] & 0x0F) | ((sc6[j + 12] & 0x0F) << 4);
-        }
-        for (j, &sc) in sc6.iter().enumerate() {
-            sb_scale_bytes[8 + j / 4] |= ((sc >> 4) & 3) << (2 * (j % 4));
+        for k in 0..4 {
+            sb_scale_bytes[k]     = (sc6[k]     & 0x0F) | ((sc6[k + 8]  & 0x0F) << 4);
+            sb_scale_bytes[4 + k] = (sc6[4 + k] & 0x0F) | ((sc6[12 + k] & 0x0F) << 4);
+            sb_scale_bytes[8 + k] = ((sc6[k]      >> 4) & 3)
+                | (((sc6[4 + k]  >> 4) & 3) << 2)
+                | (((sc6[8 + k]  >> 4) & 3) << 4)
+                | (((sc6[12 + k] >> 4) & 3) << 6);
         }
 
         // f16 d

@@ -368,8 +368,14 @@ impl Tokenize for BpeTokenizerAdapter {
         }
     }
 
+    fn decode_id_bytes(&self, token_id: u32) -> Vec<u8> {
+        self.inner.decode_bytes(&[token_id])
+    }
+
     fn apply_chat_template(&self, system: Option<&str>, user: &str) -> Option<String> {
-        Some(self.inner.apply_chat_template_with_system(user, system))
+        // Soak/bench harness: reasoning off (closed think tail), byte-identical
+        // to the pre-reasoning-control template.
+        Some(self.inner.apply_chat_template_with_system(user, system, false))
     }
 
     fn eos_tokens(&self) -> Vec<u32> {
@@ -627,6 +633,11 @@ async fn run(args: Args) -> Result<(), String> {
     // and is when the cached env-or-default helpers latch.
     lumen_runtime::runtime_defaults::set_path_is_server(true);
     lumen_runtime::runtime_defaults::set_model_dense_quant(provider.globals().output_proj_quant);
+    // Model-size discriminator for the per-class attention-precision default
+    // (9B = 32 layers -> pvf32; 27B = 64 -> legacy WMMA; validated 2026-06-11).
+    lumen_runtime::runtime_defaults::set_model_block_count(
+        provider.lbc().header.hyperparams.num_layers,
+    );
     // Feed the MoE flag alongside the dense-quant hint so
     // the Q8-only flag resolvers (`q8_split_default` and the chain that
     // delegates to it) stay OFF on MoE 30B-A3B. Without this gate, MoE

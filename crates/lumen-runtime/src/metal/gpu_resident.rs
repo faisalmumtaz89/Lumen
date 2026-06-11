@@ -601,16 +601,22 @@ impl MetalF32Backend {
         {
             let n_linear = s.cached_layer_meta.iter().filter(|m| m.layer_type == Some(1)).count();
             if n_linear > 0 {
-                const GDN_NUM_HEADS: usize = 32;    // ssm.time_step_rank
-                const GDN_HEAD_DIM: usize = 128;    // ssm.state_size
-                const GDN_QKV_DIM: usize = 8192;    // Q(2048) + K(2048) + V(4096)
-                let conv_kernel_size: usize = 4;    // Qwen3.5 uses kernel_size=4
+                // GDN dims from the resolved SSM dims (9B {32,16,128,4} default,
+                // 27B {48,16,128,4}), populated in init() from hyperparams.gdn_dims().
+                let gdn_num_v_heads = s.gdn_num_v_heads;  // ssm.time_step_rank
+                let gdn_num_k_heads = s.gdn_num_k_heads;  // ssm.group_count
+                let gdn_head_dim = s.gdn_head_dim;        // ssm.state_size
+                let conv_kernel_size = s.gdn_conv_kernel_size; // ssm.conv_kernel
+                // Fused QKV channels: 2*qk_dim + v_dim (9B=8192, 27B=10240).
+                let gdn_qkv_dim = 2 * gdn_num_k_heads * gdn_head_dim + gdn_num_v_heads * gdn_head_dim;
+                // V / gate / output-projection width = num_v_heads*head_dim (9B=4096, 27B=6144).
+                let gdn_q_dim = gdn_num_v_heads * gdn_head_dim;
                 let hidden = s.hidden_dim;
 
-                // h_state: [GDN_NUM_HEADS, GDN_HEAD_DIM, GDN_HEAD_DIM] per GDN layer
-                let h_state_size = GDN_NUM_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM;
-                // conv_state: [(kernel_size - 1) * GDN_QKV_DIM] per GDN layer
-                let conv_state_size = (conv_kernel_size - 1) * GDN_QKV_DIM;
+                // h_state: [num_v_heads, head_dim, head_dim] per GDN layer
+                let h_state_size = gdn_num_v_heads * gdn_head_dim * gdn_head_dim;
+                // conv_state: [(kernel_size - 1) * qkv_dim] per GDN layer
+                let conv_state_size = (conv_kernel_size - 1) * gdn_qkv_dim;
 
                 let mut h_states = Vec::with_capacity(n_linear);
                 let mut conv_states = Vec::with_capacity(n_linear);
@@ -636,14 +642,14 @@ impl MetalF32Backend {
                 s.gdn_num_layers = n_linear;
 
                 // Allocate GDN scratch buffers using GDN-specific dimensions
-                let gdn_q_dim = GDN_NUM_HEADS * GDN_HEAD_DIM; // 4096
-                s.gdn_alpha_buf = Some(self.device.new_buffer(GDN_NUM_HEADS * 4).ok_or_else(|| {
+                // (gdn_q_dim = num_v_heads*head_dim, computed above).
+                s.gdn_alpha_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN alpha buffer".into())
                 })?);
-                s.gdn_beta_buf = Some(self.device.new_buffer(GDN_NUM_HEADS * 4).ok_or_else(|| {
+                s.gdn_beta_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN beta buffer".into())
                 })?);
-                // Output of state query: [GDN_NUM_HEADS * GDN_HEAD_DIM] = 4096
+                // Output of state query: [num_v_heads * head_dim] (9B=4096, 27B=6144)
                 s.gdn_output_buf = Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN output buffer".into())
                 })?);
@@ -651,23 +657,23 @@ impl MetalF32Backend {
                 s.gdn_ssm_proj_buf = Some(self.device.new_buffer(hidden * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN ssm_proj buffer".into())
                 })?);
-                // Attention gate sigmoid output: [q_dim=4096] (gate applied BEFORE ssm_out_proj)
+                // Attention gate sigmoid output: [v_dim] (gate applied BEFORE ssm_out_proj)
                 s.gdn_gate_sigmoid_buf = Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN gate_sigmoid buffer".into())
                 })?);
-                // L2-norm scaled output: [GDN_NUM_HEADS * GDN_HEAD_DIM] = 4096
+                // L2-norm scaled output: [num_v_heads * head_dim] (9B=4096, 27B=6144)
                 s.gdn_normed_out_buf = Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN normed_out buffer".into())
                 })?);
-                // Q8_0 matvec outputs for alpha/beta gate projections [GDN_NUM_HEADS] f32
-                s.gdn_alpha_raw_buf = Some(self.device.new_buffer(GDN_NUM_HEADS * 4).ok_or_else(|| {
+                // Q8_0 matvec outputs for alpha/beta gate projections [num_v_heads] f32
+                s.gdn_alpha_raw_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN alpha_raw buffer".into())
                 })?);
-                s.gdn_beta_raw_buf = Some(self.device.new_buffer(GDN_NUM_HEADS * 4).ok_or_else(|| {
+                s.gdn_beta_raw_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN beta_raw buffer".into())
                 })?);
-                // Conv1d output for all QKV channels [GDN_QKV_DIM=8192] f32
-                s.gdn_qkv_conv_buf = Some(self.device.new_buffer(GDN_QKV_DIM * 4).ok_or_else(|| {
+                // Conv1d output for all QKV channels [qkv_dim] f32 (9B=8192, 27B=10240)
+                s.gdn_qkv_conv_buf = Some(self.device.new_buffer(gdn_qkv_dim * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN qkv_conv buffer".into())
                 })?);
 

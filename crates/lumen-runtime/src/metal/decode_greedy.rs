@@ -1371,6 +1371,106 @@ impl MetalF32Backend {
         // in-process decode calls (no-op when the delay resolves to 0).
         super::maybe_apply_metal_decode_delay();
 
+        // [XCHK] Cross-backend per-op forensic probe (env LUMEN_XCHK=1, default
+        // OFF -> byte-identical). Dumps layout-INDEPENDENT whole-buffer sumsq +
+        // absmax of the SAME logical tensors the CUDA backend dumps, so the two
+        // backends' decode trajectories can be aligned offline op-for-op and the
+        // FIRST structurally-divergent (step, layer, tensor) located. The sharpest
+        // signal is the per-MoE-layer top-K EXPERT IDS (router-flip origin); the
+        // GDN h_state sumsq is the prime suspect to walk back to. Persistent GPU
+        // buffers (gdn_h_states, gdn_conv_states, moe_per_layer_expert_ids,
+        // logits_buf) are valid here after commit_and_wait(). Metal is the
+        // PRISTINE reference (GQ-001 15/15 on the same weights).
+        if {
+            use std::sync::OnceLock;
+            static XK: OnceLock<bool> = OnceLock::new();
+            *XK.get_or_init(|| std::env::var("LUMEN_XCHK").as_deref() == Ok("1"))
+        } {
+            let sumsq_absmax = |v: &[f32]| -> (f64, f32) {
+                let mut sq = 0f64;
+                let mut mx = 0f32;
+                for &e in v {
+                    sq += (e as f64) * (e as f64);
+                    let a = e.abs();
+                    if a > mx { mx = a; }
+                }
+                (sq, mx)
+            };
+            // step = 0-based DECODE ordinal (first generated token = step 0), so
+            // it aligns byte-for-byte with the CUDA backend's `decode_token_count`
+            // (which also starts at 0 for the first generated token) regardless of
+            // prompt length. abs_pos is the KV position for cross-reference.
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static XCHK_STEP: AtomicUsize = AtomicUsize::new(0);
+            let step = XCHK_STEP.fetch_add(1, Ordering::Relaxed);
+            let abs_pos = seq_pos;
+            eprintln!("[XCHK] step={step} abs_pos={abs_pos} === BEGIN decode-step ===");
+            // Per-layer: GDN h_state / conv_state sumsq + MoE expert ids/weights.
+            for layer_idx in 0..num_layers {
+                let meta = &s.cached_layer_meta[layer_idx];
+                if let Some(gdn_idx) = meta.gdn_layer_idx {
+                    if gdn_idx < s.gdn_h_states.len() {
+                        let hb = &s.gdn_h_states[gdn_idx];
+                        let mut h = vec![0f32; (hb.length() / 4) as usize];
+                        hb.read_f32(&mut h);
+                        let (hsq, hmx) = sumsq_absmax(&h);
+                        let cb = &s.gdn_conv_states[gdn_idx];
+                        let mut c = vec![0f32; (cb.length() / 4) as usize];
+                        cb.read_f32(&mut c);
+                        let (csq, cmx) = sumsq_absmax(&c);
+                        eprintln!(
+                            "[XCHK] step={step} L={layer_idx} gdn_h_state sumsq={hsq:.6} absmax={hmx:.6}"
+                        );
+                        eprintln!(
+                            "[XCHK] step={step} L={layer_idx} gdn_conv_state sumsq={csq:.6} absmax={cmx:.6}"
+                        );
+                    }
+                }
+                if meta.moe_meta.is_some() {
+                    if let Some(Some(ids_buf)) = s.moe_per_layer_expert_ids.get(layer_idx) {
+                        let mut ids = vec![0u32; s.moe_num_active_experts.max(1)];
+                        ids_buf.read_u32(&mut ids);
+                        // Router weights only if the per-layer weights buffer exists
+                        // (router_debug). Otherwise dump ids alone (the decisive signal).
+                        if let Some(Some(wts_buf)) = s.moe_per_layer_expert_weights.get(layer_idx) {
+                            let mut wts = vec![0f32; s.moe_num_active_experts.max(1)];
+                            wts_buf.read_f32(&mut wts);
+                            eprintln!(
+                                "[XCHK] step={step} L={layer_idx} moe_expert_ids={ids:?} gate_w={wts:?}"
+                            );
+                        } else {
+                            eprintln!(
+                                "[XCHK] step={step} L={layer_idx} moe_expert_ids={ids:?}"
+                            );
+                        }
+                    }
+                }
+            }
+            // Final pre-lm_head hidden (final-norm output = normed_buf after the
+            // last layer wrote it for the logits projection).
+            {
+                let mut nb = vec![0f32; hidden_dim];
+                s.normed_buf.read_f32(&mut nb);
+                let (nsq, nmx) = sumsq_absmax(&nb);
+                eprintln!(
+                    "[XCHK] step={step} final_hidden sumsq={nsq:.6} absmax={nmx:.6}"
+                );
+            }
+            // Final LOGITS: whole-buffer sumsq + the top-8 (id, value).
+            {
+                let mut lg = vec![0f32; vocab_size];
+                s.logits_buf.read_f32(&mut lg);
+                let (lsq, lmx) = sumsq_absmax(&lg);
+                let mut idx: Vec<usize> = (0..vocab_size).collect();
+                idx.sort_by(|&a, &b| lg[b].partial_cmp(&lg[a]).unwrap_or(std::cmp::Ordering::Equal));
+                let top: Vec<(usize, f32)> =
+                    idx.iter().take(8).map(|&i| (i, lg[i])).collect();
+                eprintln!(
+                    "[XCHK] step={step} logits sumsq={lsq:.6} absmax={lmx:.6} top8={top:?}"
+                );
+            }
+        }
+
         // Record MoE expert activations for ALL layers (per-layer profiling).
         if s.moe_num_experts > 0 {
             if let Some(ref profiler) = self.expert_profiler {

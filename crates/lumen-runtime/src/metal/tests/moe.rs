@@ -1054,6 +1054,7 @@ fn test_hyperparams() -> ModelHyperparams {
         num_experts: None,
         num_active_experts: None,
         rotary_dim: None, rope_neox: false,
+        gdn: None,
     }
 }
 
@@ -1136,7 +1137,7 @@ fn test_moe_hw_benchmark() {
     use std::path::Path;
     use std::time::Instant;
 
-    let lbc_path = Path::new("/tmp/lumen-bench/mixtral-7bx2-moe-v2.lbc");
+    let lbc_path = Path::new("/tmp/lumen-bench/qwen3-5-moe-35b-a3b-Q4_0.lbc");
     if !lbc_path.exists() {
         eprintln!(
             "SKIP: MoE benchmark file not found at {}",
@@ -1855,24 +1856,24 @@ fn test_router_debug_summary_diverse() {
     eprintln!("router_debug_summary (diverse):\n{summary}");
 }
 
-/// Integration test: run moe_router_softmax on Mixtral 8x7B and check routing entropy.
+/// Integration test: run moe_router_softmax on the supported MoE model and check routing entropy.
 /// Requires the LBC model file at the expected path.
-/// Run with: cargo test -p lumen-runtime -- --ignored test_moe_mixtral_routing_entropy
+/// Run with: cargo test -p lumen-runtime -- --ignored test_moe_routing_entropy
 #[ignore = "requires external model file at runtime"]
 #[test]
-fn test_moe_mixtral_routing_entropy() {
+fn test_moe_routing_entropy() {
     use std::path::Path;
 
-    let lbc_path = Path::new("/tmp/lumen-bench/mixtral-8x7b-v0.1.lbc");
+    let lbc_path = Path::new("/tmp/lumen-bench/qwen3-5-moe-35b-a3b-Q4_0.lbc");
     if !lbc_path.exists() {
         eprintln!(
-            "SKIP: Mixtral 8x7B LBC file not found at {}",
+            "SKIP: MoE LBC file not found at {}",
             lbc_path.display()
         );
         return;
     }
 
-    eprintln!("=== Mixtral 8x7B Routing Entropy Test ===");
+    eprintln!("=== MoE Routing Entropy Test ===");
 
     // Open the model.
     let mmap_config = crate::storage::MmapConfig {
@@ -1998,7 +1999,7 @@ fn test_moe_mixtral_routing_entropy() {
         eprintln!("\nRouting shows diversity (at least one layer selects different experts).");
     }
 
-    eprintln!("\n=== Mixtral Routing Entropy Test COMPLETE ===");
+    eprintln!("\n=== MoE Routing Entropy Test COMPLETE ===");
 }
 
 // ============================================================================

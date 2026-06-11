@@ -6,7 +6,7 @@ use crate::quantization::{QuantScheme, QuantizationDescriptor};
 /// Magic bytes identifying an LBC file: "LBC\x01" in little-endian u32.
 pub const LBC_MAGIC: u32 = 0x01_43_42_4C; // 'L' 'B' 'C' 0x01
 
-pub const LBC_VERSION: u32 = 3;
+pub const LBC_VERSION: u32 = 4;
 
 /// Default alignment for layer blobs (128 KiB).
 pub const DEFAULT_ALIGNMENT: u64 = 128 * 1024;
@@ -156,6 +156,7 @@ mod tests {
             num_active_experts: None,
             norm_eps: 1e-5,
             rotary_dim: None, rope_neox: false,
+            gdn: None,
         }
     }
 
@@ -184,16 +185,16 @@ mod tests {
 
     #[test]
     fn version_validation() {
-        // Version 0 through 3 pass (≤ LBC_VERSION which is 3)
-        for v in 0..=3 {
+        // Version 0 through 4 pass (≤ LBC_VERSION which is 4)
+        for v in 0..=4 {
             let mut header = LbcHeader::new(test_hyperparams(), test_quant());
             header.version = v;
             header.validate().unwrap();
         }
 
-        // Version 4 fails (> LBC_VERSION)
+        // Version 5 fails (> LBC_VERSION)
         let mut header = LbcHeader::new(test_hyperparams(), test_quant());
-        header.version = 4;
+        header.version = 5;
         let err = header.validate().unwrap_err();
         assert!(matches!(err, crate::FormatError::UnsupportedVersion { .. }));
     }

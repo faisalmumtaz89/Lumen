@@ -4,7 +4,7 @@ use crate::convert::ConvertError;
 use crate::gguf::GgufFile;
 use crate::tensor_names::*;
 use crate::tensor_io::{layer_tensor_name, expert_tensor_name};
-use lumen_format::hyperparams::{ModelHyperparams, RopeParams, RopeScalingType};
+use lumen_format::hyperparams::{GdnDims, ModelHyperparams, RopeParams, RopeScalingType};
 use lumen_format::quantization::{QuantGroupSize, QuantScheme, QuantizationDescriptor};
 
 // ---------------------------------------------------------------------------
@@ -133,6 +133,35 @@ pub(crate) fn extract_hyperparams(gguf: &GgufFile) -> Result<(ModelHyperparams, 
         }
     }
 
+    // Gated-DeltaNet (GDN/SSM) dimensions. Qwen3.5/3.6 GDN layers carry their
+    // SSM shape in GGUF metadata under `{arch}.ssm.*`. These differ from the
+    // attention head counts above and were previously hardcoded to the 9B shape
+    // in the runtime. GGUF key -> GdnDims field mapping:
+    //   ssm.time_step_rank -> num_v_heads  (state / V heads:  32 for 9B, 48 for 27B)
+    //   ssm.group_count    -> num_k_heads  (Q/K pre-repeat heads: 16 for both)
+    //   ssm.state_size     -> head_dim     (per-head dim:      128 for both)
+    //   ssm.conv_kernel    -> conv_kernel  (conv1d kernel:     4 for both)
+    // We treat `ssm.time_step_rank` as the presence signal for a GDN model.
+    // When any of the remaining keys are missing we fall back to the Qwen3.5-9B
+    // defaults so partial metadata still yields a usable shape (and `None`
+    // models keep resolving to the 9B default at the runtime use sites).
+    let ssm_time_step_rank = gguf.get_u32(&format!("{prefix}.ssm.time_step_rank"));
+    let gdn = ssm_time_step_rank.map(|num_v_heads| {
+        let default = GdnDims::QWEN35_9B;
+        GdnDims {
+            num_v_heads,
+            num_k_heads: gguf
+                .get_u32(&format!("{prefix}.ssm.group_count"))
+                .unwrap_or(default.num_k_heads),
+            head_dim: gguf
+                .get_u32(&format!("{prefix}.ssm.state_size"))
+                .unwrap_or(default.head_dim),
+            conv_kernel: gguf
+                .get_u32(&format!("{prefix}.ssm.conv_kernel"))
+                .unwrap_or(default.conv_kernel),
+        }
+    });
+
     let hp = ModelHyperparams {
         num_layers,
         num_heads,
@@ -152,6 +181,7 @@ pub(crate) fn extract_hyperparams(gguf: &GgufFile) -> Result<(ModelHyperparams, 
         norm_eps,
         rotary_dim,
         rope_neox: matches!(arch.as_str(), "qwen35" | "qwen35moe" | "qwen3_5_moe" | "qwen3.5_moe"),
+        gdn,
     };
 
     Ok((hp, arch))

@@ -129,6 +129,39 @@ pub fn set_model_dense_quant(scheme: QuantScheme) {
     MODEL_DENSE_QUANT_HINT.store(hint, Ordering::Relaxed);
 }
 
+/// Records the loaded model's transformer block count (9B = 32 layers,
+/// 27B = 64). Called from the CLI / server alongside `set_model_dense_quant`.
+/// This is the model-SIZE discriminator the per-class attention-precision
+/// default needs: 9B and 27B are otherwise indistinguishable to the resolvers
+/// (both dense + same quant hints). 0 = never set (legacy-safe fallback).
+pub fn set_model_block_count(num_layers: u32) {
+    MODEL_BLOCK_COUNT.store(num_layers, Ordering::Relaxed);
+}
+
+static MODEL_BLOCK_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn model_block_count() -> u32 {
+    MODEL_BLOCK_COUNT.load(Ordering::Relaxed)
+}
+
+/// Per-class default for `LUMEN_CUDA_ATTN_PRECISE` (prefill WMMA attention
+/// precision). `2` = pvf32 (exact-F32 P@V, F16 QK^T — heals the WMMA F16
+/// P@V-mantissa token-flips at 94.6% of WMMA prefill perf); `0` = legacy
+/// F16 WMMA.
+///
+/// Validated 2026-06-11 (N=3 byte-deterministic quality runs per cell):
+/// pvf32 for MoE (all quants) + dense ≤32-layer (9B class) — strict wins
+/// everywhere (9B-q8 and MoE cells all reach pristine quality gates; MoE-q8
+/// long-form heals fully); default WMMA for the 27B class (64 layers) —
+/// pvf32 measurably regresses 27B long-form output (bf16 verylong 3/3→1/3)
+/// and softly regresses 27b-q8 shorts.
+/// Unset block count (0, legacy callers) → conservative legacy WMMA.
+/// `LUMEN_CUDA_ATTN_PRECISE=<0|1|2|3|4>` overrides either way.
+pub fn attn_precise_default() -> u8 {
+    let layers = model_block_count();
+    if model_is_moe() || (layers > 0 && layers <= 32) { 2 } else { 0 }
+}
+
 /// Records whether the loaded LBC declares MoE experts. Called from the
 /// CLI / server `main()` immediately after `SyncWeightProvider::open` and
 /// alongside `set_model_dense_quant`. The signal feeds the Q8-only flag
@@ -151,6 +184,243 @@ pub fn set_model_is_moe(is_moe: bool) {
 /// Split-K defaults OFF for MoE, mirroring CUDA's pattern).
 pub(crate) fn model_is_moe() -> bool {
     MODEL_IS_MOE.load(Ordering::Relaxed)
+}
+
+/// True iff the loaded model is a MoE whose primary weights are BF16 (the
+/// `MODEL_DENSE_QUANT_HINT` set at load from `output_proj_quant`). Used to gate
+/// the GDN alpha/beta → F32-SGEMM fidelity lever ON for MoE BF16 ONLY: it kills
+/// the BF16 arith-05 repetition that bf16-native alone leaves, but REGRESSES MoE
+/// q8 (adds a DD-REP), so it must not fire on q8/q4 MoE models. Dense BF16
+/// (`!model_is_moe()`) and all quantised models return false.
+///
+/// Referenced only from the CUDA prefill path (`cuda/prefill.rs`), which is
+/// gated behind `#[cfg(feature = "cuda")]`. On the default/Metal build the
+/// `cuda` module is excluded, leaving this function unreferenced; the
+/// `allow(dead_code)` (applied only when `cuda` is OFF) silences the lint
+/// without removing the definition, so a future non-cuda caller stays valid
+/// and the cuda build is byte-identical (no attribute applied under `cuda`).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn model_is_moe_bf16() -> bool {
+    model_is_moe() && MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) == HINT_BF16
+}
+
+/// Resolves the per-process default sampler `repetition_penalty` used by the
+/// server wire layer (and the CLI's `--repeat-penalty` default) when the
+/// operator does not set one explicitly.
+///
+/// * MoE (Qwen3.5-MoE-35B-A3B class) → `1.03`.
+/// * Dense / unset → `1.05` (unchanged — preserves dense behaviour).
+///
+/// **The 1.08 band-aid is gone; the root cause is fixed.** The MoE q8
+/// math-prompt ("Compute 17 times 23 …") computes *correct* products but pure
+/// greedy decode used to fall into a near-tie "restate" attractor at the
+/// post-`=` token ("17 x 20 = 17 x 20 = …", 4-gram rep ≥ 15, never reaching
+/// 391). An elevated `1.08` MoE-only default masked it. The actual root cause
+/// is the GatedDeltaNet (GDN) single-token DECODE recurrence, NOT the
+/// decode-attention kernel: three structurally different decode-attention
+/// kernels (single-block materialise-all, CUDA-graph single-block, FA2
+/// split-K online softmax) ALL produced the identical loop, while running the
+/// GDN delta-rule state update in F64 (`LUMEN_CUDA_GDN_F64_ACCUM`, now
+/// default-ON for MoE via [`gdn_f64_accum_default`]) breaks it and reaches a
+/// clean `340 + 51 = 391` at **pure greedy `rp = 1.0`** (A100, q8). The
+/// `force_prefill`-clean observation that pointed at "the decode attention
+/// kernel" was a mis-localisation: force_prefill rebatches the GDN recurrence.
+///
+/// **Why 1.03 for MoE (not 1.0, not the dense 1.05) — measured.** With the F64
+/// fix the math near-tie now lands correctly at `rp = 1.0`, and a penalty
+/// pushes it back OFF: A100 q8 sweep on the math prompt (greedy, temp 0) —
+/// `rp = 1.0` → clean 391; `rp = 1.03` → clean 391; `rp = 1.05`
+/// (windowed repeat-last-n 64 AND full-history) → CORRUPTED `17 x 20 = 140`,
+/// `= 39`. So the dense 1.05 actively breaks MoE arithmetic and cannot be
+/// reused. A small residual long-form repetition persists at `rp = 1.0`,
+/// independent of the fix — the *sky* prompt loops on a "### N. Scattering"
+/// tail at `rp = 1.0` in BOTH the F32 baseline (rep 7) and the F64 build
+/// (rep 5). `rp = 1.03` is the empirically-found floor that BOTH preserves the
+/// math (clean 391) AND renders the sky cleanly (rep 1). It is a generic
+/// long-form guard, NOT a fix for the (now-fixed) math loop.
+///
+/// Dense keeps 1.05 (no GDN recurrence, not in the restate-loop regime, and
+/// dense arithmetic is unaffected by 1.05). The env override
+/// (`LUMEN_REPETITION_PENALTY` / `--repeat-penalty`) still wins. Operators who
+/// want byte-pure greedy can pass `--repeat-penalty 1.0` and rely on the F64
+/// fix for correct math.
+pub fn repetition_penalty_default() -> f32 {
+    if model_is_moe() {
+        // MoE penalty windows are DISJOINT by quant (empirically mapped on
+        // Qwen3.5-MoE-35B-A3B, A100; GDN-F64 default-ON lands the math at greedy):
+        //   - q8/q4 math is penalty-SENSITIVE: rp>=1.05 penalizes legitimate
+        //     digit repetition and corrupts arithmetic ("=39"); 1.03 is the
+        //     floor that keeps math correct AND tames q8 long-form (sky rep=1).
+        //   - bf16: RE-TUNED 2026-06-09 to 1.03 (was 1.06). The 1.06 was chosen
+        //     for bf16 long-form back when bf16 ran the F16-cache FAST_16F GEMM;
+        //     with the bf16-native (BF16+F32) MoE projection path now default-ON,
+        //     1.06 CORRUPTS bf16 GQ arithmetic (conv-01 "2x100=20", arith-05
+        //     misread → 13/15 FAIL) while long-form stays clean at 1.03 (GQ-004
+        //     verylong 3/3 over 3072 tokens; GQ-001 14/15 PASS at 1.03).
+        // All MoE quants now share 1.03: keeps the F64-fixed math correct
+        // (rp>=1.05 corrupts it to "39") AND tames long-form repetition.
+        match MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) {
+            HINT_BF16 => 1.03,
+            _ => 1.03, // q8 / q4 / other quantised MoE
+        }
+    } else {
+        1.05 // dense unchanged
+    }
+}
+
+/// Per-process default for the server-internal `frequency_penalty` (count-based:
+/// `logit[t] -= frequency_penalty * count[t]`). Unlike `repetition_penalty`
+/// (penalizes ANY previously-seen token, which corrupts short arithmetic where a
+/// digit legitimately repeats once → the 1.03 floor), `frequency_penalty` scales
+/// by occurrence COUNT, so a digit repeated once in short math is barely touched
+/// while a phrase looped many times in long-form is strongly penalized.
+/// `LUMEN_FREQUENCY_PENALTY` overrides. Stays 0.0 (no-op, byte-identical): the
+/// 2026-06-09 GQ sweep {0.2,0.4,0.6} REJECTED a nonzero MoE default — it corrupts
+/// short arithmetic (0.4 breaks arith-03, 0.6 breaks three) AND does not fix
+/// verylong, because the verylong miss is a MODEL failure-to-terminate on long
+/// greedy creative generation (the model writes a coherent story then degenerates
+/// into a hallucinated fake-conversation tail), not token-frequency repetition.
+/// Kept as an opt-in env lever only.
+pub fn frequency_penalty_default() -> f32 {
+    0.0
+}
+
+/// Process-wide default sampling `temperature` used by every surface (CLI
+/// `--temperature`, server OpenAI `temperature`, server Anthropic
+/// `temperature`) when the operator / client does NOT supply one.
+///
+/// **`0.7`** — the documented production value. An OpenAI-/Anthropic-style
+/// endpoint defaults to *varied* output, and pure-greedy (`temperature 0` + no
+/// penalty) deterministically loops on long-form generation, so a small
+/// non-zero default keeps out-of-the-box serving coherent. This is the SINGLE
+/// canonical no-temperature default; the CLI `--temperature` flag default and
+/// both wire surfaces (`unwrap_or_else(default_temperature)`) source it here so
+/// they cannot drift (previously the CLI defaulted `0.8` while both wire
+/// surfaces used `0.7`, and the CLI help text contradicted its own example).
+/// An explicit `temperature` (flag or request field) still wins; `0` selects
+/// greedy decoding.
+pub fn default_temperature() -> f32 {
+    0.7
+}
+
+/// Resolves the effective server/CLI-internal `frequency_penalty` when the
+/// operator does not pass an explicit flag / the client omits the field.
+///
+/// Precedence: `LUMEN_FREQUENCY_PENALTY` env (parsed `f32`, kept only when
+/// `is_finite() && >= 0.0`) → [`frequency_penalty_default`] (`0.0`, no-op).
+/// This is the ONLY place `LUMEN_FREQUENCY_PENALTY` is read; the server wire
+/// (`wire::diag_frequency_penalty`) and the CLI (`run.rs`, when `--frequency-
+/// penalty` is absent) both delegate here so the env is honoured IDENTICALLY on
+/// every surface and is read in exactly one place.
+pub fn frequency_penalty_resolved() -> f32 {
+    std::env::var("LUMEN_FREQUENCY_PENALTY")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or_else(frequency_penalty_default)
+}
+
+/// Resolves the effective server/CLI-internal `repeat_last_n` (the recent-window
+/// size for the repetition penalty) when the operator does not pass an explicit
+/// flag / the client omits the field.
+///
+/// Precedence: `LUMEN_REPEAT_LAST_N` env (parsed `usize`) → `None` (the
+/// production-identical full-history window). This is the ONLY place
+/// `LUMEN_REPEAT_LAST_N` is read; the server wire (`wire::diag_repeat_last_n`)
+/// and the CLI (`run.rs`, when `--repeat-last-n` is absent) both delegate here
+/// so the env is honoured IDENTICALLY on every surface and is read in exactly
+/// one place.
+pub fn repeat_last_n_resolved() -> Option<usize> {
+    std::env::var("LUMEN_REPEAT_LAST_N")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning ("thinking") control — the SINGLE shared source of truth used
+// identically by every Lumen surface (CLI `apply_chat_template`, server
+// OpenAI `render_chat_prompt`, server Anthropic `render_prompt`, and the
+// `ReasoningExtractor` in `tooling`). Lives here in `lumen-runtime` rather
+// than in `lumen-server::wire` because the CLI crate depends on
+// `lumen-runtime` but NOT on `lumen-server`; co-locating it here is what
+// makes the resolver a literally-shared implementation across all three
+// surfaces (the hard consistency requirement) instead of three copies.
+// ---------------------------------------------------------------------------
+
+/// Process-wide default for chat "thinking" (reasoning trace) when neither a
+/// per-request field nor the `LUMEN_CHAT_ENABLE_THINKING` env override is set.
+///
+/// **Default `false`** (no reasoning trace; the closed empty-`<think>` tail).
+/// MoE and dense share the same default — reasoning is a per-request opt-in,
+/// not a model property — so this is intentionally model-agnostic. With the
+/// default in force, every surface emits the historical closed
+/// `<think>\n\n</think>\n\n` prompt tail and performs NO reasoning extraction,
+/// i.e. behaviour is byte-identical to the pre-reasoning-control codebase.
+pub fn chat_enable_thinking_default() -> bool {
+    false
+}
+
+/// Resolves whether chat "thinking" is enabled for a request, applying the
+/// canonical precedence used by EVERY surface:
+///
+/// 1. `per_request` — an explicit per-request field (OpenAI `enable_thinking`
+///    / `chat_template_kwargs.enable_thinking`, Anthropic `thinking.type`,
+///    CLI `--think`) wins when present.
+/// 2. `LUMEN_CHAT_ENABLE_THINKING` env override — applied only when the
+///    request did not specify. Accepts `1`/`true`/`yes`/`on` (case-insensitive)
+///    as ON and `0`/`false`/`no`/`off` as OFF; any other value is ignored and
+///    falls through to the default.
+/// 3. [`chat_enable_thinking_default`] (`false`).
+///
+/// This is the ONLY place the env var is consulted for the prompt tail — the
+/// former OpenAI-inline `LUMEN_CHAT_ENABLE_THINKING == "1"` check is folded in
+/// here so the three wire/CLI surfaces cannot drift.
+pub fn resolve_enable_thinking(per_request: Option<bool>) -> bool {
+    if let Some(v) = per_request {
+        return v;
+    }
+    match std::env::var("LUMEN_CHAT_ENABLE_THINKING").ok().as_deref() {
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => chat_enable_thinking_default(),
+        },
+        None => chat_enable_thinking_default(),
+    }
+}
+
+/// Process-wide default reasoning ("thinking") token budget used when a
+/// request enables thinking but supplies no explicit `reasoning_budget`.
+///
+/// This is a SEPARATE budget from the answer `max_tokens` (industry-convergent
+/// with Anthropic `thinking.budget_tokens` / Gemini `thinking_budget`) so the
+/// answer is never starved by a long reasoning trace. **Part 4** (the decode
+/// loop) enforces it via a forced-close; Parts 1-3 only carry it on the
+/// request DTO / `JobRequest`. `2048` is a middle-of-the-road default that
+/// fits a multi-step reasoning trace without unbounded runaway. The
+/// budget is irrelevant (and unused) when thinking is disabled.
+pub fn chat_reasoning_budget_default() -> usize {
+    2048
+}
+
+/// The assistant prompt tail appended after `<|im_start|>assistant\n` for a
+/// Qwen3.5-style ChatML template, selected by the resolved `enable_thinking`
+/// flag. This is the SINGLE definition of the open-vs-closed `<think>` tail;
+/// the CLI and both wire formats call it so they cannot diverge.
+///
+/// * `enable_thinking == false` → `"<think>\n\n</think>\n\n"` — the closed
+///   empty-think block (Qwen3.5 `enable_thinking=false`): the model skips the
+///   reasoning scratchpad and answers directly. This is the historical default
+///   and is byte-identical to every surface's prior hardcoded string.
+/// * `enable_thinking == true` → `"<think>\n"` — an OPEN think block
+///   (Qwen3.5 `enable_thinking=true`): the model emits a reasoning trace which
+///   the [`tooling::ReasoningExtractor`] then routes to `reasoning_content`.
+pub fn think_prompt_tail(enable_thinking: bool) -> &'static str {
+    if enable_thinking {
+        "<think>\n"
+    } else {
+        "<think>\n\n</think>\n\n"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -227,8 +497,28 @@ pub fn bf16_gemmex_default() -> bool {
 /// dense returns `true` (graph capture is a +13% TPOT win on
 /// BF16 dense); Q8/Q4 / unset returns `false` (graph capture is a measured
 /// regression on quantised configurations).
+///
+/// **MoE models force graph OFF.** The captured decode graph bakes the
+/// MoE routed-expert dispatch (router top-K → per-token expert kernels) and
+/// replays the SAME experts every subsequent token, corrupting generation —
+/// empirically Qwen3.5-MoE-35B-A3B at BF16 (the only config that turns graph
+/// capture on by default) loops on the "sky" prompt and never reaches the math
+/// answer, while `LUMEN_CUDA_DECODE_GRAPH=0` is fully coherent (sky correct,
+/// math reaches 391). q8/q4 already run eager (graph default off) and route
+/// experts correctly. Gate it OFF for MoE so BF16-dense keeps its graph win
+/// while BF16-MoE runs the eager (correct) routed-expert path.
 pub fn decode_graph_default() -> bool {
-    MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) == HINT_BF16
+    // Validated 2026-06-11: the dense-bf16 graph default is
+    // now OFF too — the captured-graph decode replay diverges from eager
+    // decode (per-token state read from device pointers captured once),
+    // driving medium-length generations into DD-REP and flipping short
+    // answers (9b-bf16 13/15·5/8 → 14/15·7/8 with graph OFF, N=3 byte-id;
+    // 27b-bf16 with graph-OFF+F64 = PERFECT 15/15·8/8·3/3 from 12/15·7/8·0/3).
+    // Decode perf cost: −6.2% (68.89 → 64.63 tok/s, N=5) — correctness wins.
+    // COUPLED with `gdn_f64_accum_default` (graph-ON + F64 = 0/3 catastrophic;
+    // the two must flip together). No class defaults
+    // graph ON anymore; `LUMEN_CUDA_DECODE_GRAPH=1` opts back in.
+    false
 }
 
 /// Resolves the per-process default for `LUMEN_CUDA_DECODE_GRAPH_QGATE`
@@ -305,6 +595,391 @@ pub fn moe_router_parallel_default() -> bool { canonical_default_on() }
 /// Finding: the two-launch phase 4 update is byte-identical to the reference
 /// path.
 pub fn gdn_register_resident_default() -> bool { canonical_default_on() }
+
+/// Per-process default for `LUMEN_CUDA_GDN_F64_ACCUM` when the operator does
+/// not set it explicitly.
+///
+/// * MoE GDN-hybrid (Qwen3.5-MoE-35B-A3B class) → ON.
+/// * Dense / non-MoE → OFF (byte-identical to the historical default; dense
+///   has no GDN delta-rule recurrence so the F64 kernels never dispatch
+///   anyway — the gate is belt-and-suspenders).
+///
+/// **Why the MoE GDN model needs F64 accumulation.** The Qwen3.5-MoE-35B is a
+/// GatedDeltaNet:full-attn ratio-3 hybrid. Its single-token DECODE path runs
+/// the delta-rule recurrence
+/// `s = alpha*s + k*((v - alpha*(s·k))*beta)` once per token, accumulating F32
+/// rounding into the recurrent state `h_state`. Over a generation the F32 ULP
+/// drift diverges from the batched-prefill GDN (which `force_prefill` rebuilds
+/// from scratch each step), perturbing the *input* to the next full-attn layer
+/// and flipping a near-tie at the post-`=` token. The 256-expert MoE router
+/// amplifies that flip into the "17 x 20 = 17 x 20 = …" restate-loop on the
+/// math prompt (4-gram rep 15-16, never reaches 391).
+///
+/// **Empirical isolation (A100, q8, pure greedy rp=1.0).** Three structurally
+/// different decode-attention kernels — single-block materialise-all
+/// (`attention_decode`), CUDA-graph single-block, and FA2 split-K online
+/// softmax (`LUMEN_CUDA_FA2_ATTN=1`) — ALL produce the identical loop, ruling
+/// the attention kernel OUT as the cause. Enabling F64 on the GDN phase-4
+/// state update (`gdn_phase4_register_resident_f64accum`, the default
+/// register-resident decode path) breaks the loop and reaches a clean,
+/// arithmetically-correct `340 + 51 = 391` (4-gram rep ≤ 2). The
+/// `force_prefill`-clean observation that previously pointed at "the decode
+/// attention kernel" was a mis-localisation: force_prefill rebatches the GDN
+/// recurrence, which is what it actually fixes.
+///
+/// The env override (`LUMEN_CUDA_GDN_F64_ACCUM=0/1`) still wins over this
+/// default. F64 dispatches only the tiny per-head GDN state-update / norm-gate
+/// kernels (not the MoE GEMMs), so the A100 decode-throughput cost is in the
+/// noise.
+pub fn gdn_f64_accum_default() -> bool {
+    // MoE (original) + dense-bf16 (validated 2026-06-11): the
+    // F32 GDN delta-rule decode recurrence accumulates ULP drift over long
+    // generations into a repetition attractor on dense bf16; F64 heals it —
+    // but ONLY with decode-graph OFF (graph-ON + F64 = 0/3 catastrophic:
+    // the captured graph replays the F32 kernel and desyncs). COUPLED with
+    // `decode_graph_default` — the two must flip together.
+    model_is_moe() || MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) == HINT_BF16
+}
+
+/// Per-process default for `LUMEN_CUDA_GDN_DECODE_PROJ_MMQ` when the operator
+/// does not set it explicitly.
+///
+/// * MoE GDN-hybrid (Qwen3.5-MoE-35B-A3B class) → ON.
+/// * Dense / non-MoE → OFF (byte-identical to the historical decode path).
+///
+/// **Why the MoE GDN model needs the decode GDN projection to match prefill.**
+/// The Qwen3.5-MoE-35B single-token DECODE path computes the GDN q/k/v/gate/
+/// alpha/beta projections via the per-token pre-quantized-Q8_1 *tile* matvec
+/// (`matvec_q8_0_q8_1` / split / tile kernels), whereas the batched PREFILL
+/// path computes the SAME projections through `mmq_q8_0_batched` (the MMQ
+/// INT8-dp4a kernel, which `LUMEN_CUDA_Q8_PROJ_MMQ` defaults ON for MoE).
+/// These two kernels quantize the activation at a different granularity and
+/// reduce in a different order, so the decode GDN output diverges from the
+/// (llama-matching) prefill GDN output starting at layer 0. The 256-expert
+/// top-K MoE router AMPLIFIES that sub-ULP divergence: at the math near-tie
+/// (after id 44896 " multiplication") the decode path flips 7-of-8 expert
+/// selections at L0, cascading through all 40 MoE layers and inflating the
+/// final `logit[1633]` ("lication") by ~+17 vs prefill — the cosmetic
+/// "multiplicationlication" doubling.
+///
+/// **Empirical isolation (A100, q8, temp 0, raw-token-id dumps).** Re-feeding
+/// the identical 44-token prefix as a fresh PREFILL gives `margin(1633−1083) =
+/// −19.62` (clean, argmax 1608, matches llama −18.42); the incremental DECODE
+/// gives `+10.47` (picks 1633). The flip is 100% in the decode path. Routing
+/// the decode GDN projections through the SAME `mmq_q8_0_batched` kernel
+/// (batch = 1) the prefill uses aligns the projection numerics, so the router
+/// selects the prefill expert set and the final logits match the clean
+/// prefill.
+///
+/// Distinct from `LUMEN_CUDA_GDN_PHASE123_F64` (raising the *recurrence*
+/// precision, which REGRESSED): this aligns the *projection GEMM* to the
+/// prefill, it does not add precision. The env override
+/// (`LUMEN_CUDA_GDN_DECODE_PROJ_MMQ=0/1`) wins.
+///
+/// **REFUTED / DEFAULT-OFF (2026-06-08).** Routing the decode GDN projection
+/// through `mmq_q8_0_batched` at batch=1 did NOT match the batched (batch=N)
+/// prefill MMQ numerics — empirically it made q8 math WORSE ("17×23 … = 39",
+/// arithmetic broken) while the doubling persisted, i.e. the MMQ kernel has a
+/// batch-dependent reduction so batch=1 ≠ batch=N. The projection is therefore
+/// NOT the sole decode-vs-prefill divergence (the incremental-vs-batched GDN
+/// recurrence also contributes). Kept as opt-in for the record; default OFF so
+/// MoE q8 stays at its rep2/391 baseline. The real fix must make decode GDN
+/// (projection AND recurrence) numerically equal prefill.
+pub fn gdn_decode_proj_mmq_default() -> bool { false }
+
+/// Per-process default for `LUMEN_CUDA_GDN_DECODE_AB_MMQ` (alpha/beta-only
+/// decode-vs-prefill projection alignment) when the operator does not set it.
+///
+/// * MoE (Qwen3.5-MoE-35B-A3B class) → ON.
+/// * Dense / non-MoE → OFF (dense decode stays byte-identical to history).
+///
+/// **What it fixes (empirically isolated, A100, 2026-06-08).** On the MoE
+/// GDN-hybrid, the `ssm_alpha` / `ssm_beta` GDN gate-projection weights are
+/// stored `Q8Raw` in *every* LBC quant (the GGUF source is F32; the MoE
+/// converter force-requantizes them to Q8_0 — see
+/// `lumen-convert/src/arch/gdn_gates.rs`). The single-token DECODE projects
+/// them through the per-token Q8_1/dp4a `matvec_q8_0_q8_1` kernel, while the
+/// batched PREFILL projects them through `mmq_q8_0_batched` (the MMQ
+/// INT8→INT32→F32-scale path, default-ON for MoE Q8 via
+/// `LUMEN_CUDA_Q8_PROJ_MMQ`). The two INT8 kernels differ in activation-quant
+/// granularity and reduction order, so the decode alpha/beta output diverges
+/// ~20% from the (llama-matching) prefill output **at layer 0** — where the
+/// projection input is the bit-identical token embedding, so the delta is
+/// *pure projection kernel*. (The qkv/gate projections were measured
+/// bit-identical between decode and prefill — they are NOT the source.) The
+/// 20% alpha/beta perturbation propagates through the GDN delta-rule
+/// recurrence (`s = α·s + k·((v − α·(s·k))·β)`); the layer-0 GDN output
+/// diverges ~28%; the 256-expert top-K router then flips 5-of-8 expert
+/// selections at L0 and the error cascades through all 40 layers, derailing
+/// greedy decode (sub-word doubling, false products, restate loops).
+///
+/// **The fix:** route the DECODE alpha/beta projection through the SAME
+/// `mmq_q8_0_batched` kernel (batch = 1) the prefill uses, from the F32
+/// RMSNorm output — matching the INT8 reduction order decode==prefill. The
+/// MMQ kernel is per-token-independent (each `(token, row-group)` CUDA block
+/// reads only its own `x_row`, with no cross-token coupling), so batch=1
+/// is bit-identical to row 0 of batch=N — the projection delta at L0 goes to
+/// zero. qkv/gate are left on their existing (bit-identical) decode paths.
+///
+/// **Distinct from the REFUTED `gdn_decode_proj_mmq`** (which MMQ'd *all four*
+/// qkv/alpha/beta/gate and required all-four-Q8Raw so it never engaged for
+/// bf16, and on q8 MMQ'd the large qkv projection — that broke q8 math). This
+/// is alpha/beta-ONLY and engages for any quant whose alpha/beta are Q8Raw
+/// (bf16, q8, q4). Distinct from `LUMEN_CUDA_GDN_PHASE123_F64` (raising
+/// recurrence precision, which REGRESSED): this aligns the projection GEMM to
+/// prefill, it does not add precision. The env override
+/// (`LUMEN_CUDA_GDN_DECODE_AB_MMQ=0/1`) wins.
+///
+/// **MEASURED / DEFAULT-OFF (2026-06-08, A100, GQ-001).** Engagement CONFIRMED
+/// (one-shot `[ABMMQENG]` probe: `gdn_decode_ab_mmq=true` for bf16, all guards
+/// pass, `gdn_use_preq=false` so the bf16 `else` branch MMQs alpha/beta), but
+/// the projection alignment is **necessary-but-not-sufficient** and net-zero
+/// to net-negative on the suite:
+///   * **bf16 11/15 → 11/15 (byte-identical** — the "multiplicationulation"
+///     doubling and "10246" garble survive UNCHANGED even though decode
+///     alpha/beta now go through the SAME MMQ as prefill). This proves the GDN
+///     **recurrence** (incremental single-token vs batched scan — the diag's
+///     2nd divergence; L0 output relD 28% ≫ the 20% projection relD) dominates
+///     the residual divergence, NOT the projection. The defect is the diffuse
+///     decode-vs-prefill GDN fidelity gap amplified by the 256-expert router,
+///     not a single projection kernel.
+///   * **q8 10/15 → 9/15 (REGRESSED** — 144/12 newly loops; 1000−37 newly
+///     digit-spams "1000000…" / DD-CHARSPAM). The alignment shifted the q8
+///     near-tie into a worse basin — same failure class as the refuted
+///     `gdn_decode_proj_mmq` "=39" and `GDN_PHASE123_F64`.
+///   * **q4 9/15 → 11/15 (IMPROVED** — 144/12 and 256+768 now clean).
+/// Mixed across quants with a NEW catastrophic q8 mode ⟹ default OFF (no quant
+/// regresses; all three stay at their baseline). Kept as an opt-in env lever
+/// for the record (architecturally-correct prefill-matching projection; helps
+/// q4 in isolation). The true fix requires aligning the decode GDN RECURRENCE
+/// to prefill (the dominant remaining divergence), which prior work
+/// (`GDN_PHASE123_F64`) found regresses — i.e. it is the documented diffuse
+/// cross-engine numeric-fidelity problem, not closable by this projection
+/// lever alone.
+pub fn gdn_decode_ab_mmq_default() -> bool { false }
+
+/// Per-process default for `LUMEN_CUDA_GDN_AB_F16` — route the GDN
+/// `ssm_alpha` / `ssm_beta` projections through a pre-dequanted **F16**
+/// cache and cuBLAS `cublasGemmEx` (HGEMV in decode, HGEMM in prefill) in
+/// BOTH paths, MoE-gated.
+///
+/// The GDN `ssm_alpha` / `ssm_beta` weights are stored `Q8Raw` in every LBC
+/// quant (the GGUF source is F32; the MoE converter force-requantizes them to
+/// Q8_0). With the keeper Q8-prefill-MMQ default ON, the batched PREFILL
+/// projects them via `mmq_q8_0_batched` (INT8 MMA) while the single-token
+/// DECODE uses the per-token Q8_1/dp4a `matvec_q8_0_q8_1` tile matvec — a
+/// DIFFERENT activation-quant granularity + INT8 reduction order. The
+/// `[GDNPROJSS]` whole-buffer-sumsq probe at GDN L0 measured this as
+/// alpha relD 19.45% / beta relD 20.96% decode-vs-prefill, while the
+/// (F16/bf16) qkv + gate projections were 0.000% (BIT-IDENTICAL). The
+/// 256-expert top-K router amplifies the ~20% alpha/beta divergence into a
+/// 5-of-8 expert flip that cascades 40 layers and derails greedy decode.
+///
+/// This lever dequant the `Q8Raw` alpha/beta weights to an F16 cache once at
+/// load (mirroring the existing GDN F16 weight-cache mechanism) and routes
+/// BOTH decode (`cublasGemmEx` N=1, `CUDA_R_16F` × `CUDA_R_16F`,
+/// `COMPUTE_32F_FAST_16F`) and prefill (`cublasGemmEx` N=batch, identical
+/// dtypes/compute-type) through it — the EXACT recipe that makes qkv/gate
+/// bit-identical. batch=1 == row 0 of batch=N under the same GEMM, so the L0
+/// alpha/beta delta collapses to ~0% at its source. Distinct from the refuted
+/// `gdn_decode_ab_mmq` (which used INT8 MMQ batch=1, found net-negative) and
+/// from `GDN_PHASE123_F64` (recurrence precision, regressed).
+///
+/// MoE-default-ON (2026-06-09 GQ validation: the parity stack makes MoE q8/q4
+/// PRISTINE and clears bf16 gross garble); dense byte-identical (gate requires
+/// `model_is_moe()`). Set `LUMEN_CUDA_GDN_AB_F16=0|1` to override the per-model default.
+pub fn gdn_ab_f16_default() -> bool { true }
+
+/// Per-process default for `LUMEN_CUDA_GDN_RECUR_PREFILL_ORDER` — route the GDN
+/// **decode** delta-rule state update through a variant whose arithmetic is
+/// reordered to match the **prefill** batched-scan single-token step
+/// bit-for-bit, MoE-gated.
+///
+/// Once the `ssm_alpha`/`ssm_beta` projection is made bit-identical
+/// decode-vs-prefill (`LUMEN_CUDA_GDN_AB_F16`), the residual GDN L0 divergence
+/// is the RECURRENCE: the decode F64 phase4 kernel
+/// (`gdn_phase4_register_resident_f64accum`) and the prefill F64 scan
+/// (`gdn_prefill_fused_v3_f64accum`) are the SAME precision (F64) and SAME
+/// warp-reduce structure but apply the alpha decay in a DIFFERENT algebraic
+/// order: prefill folds `alpha` into each state element BEFORE the K reduction
+/// (`retrieval = SUM (alpha*s_r)*k_r`), while decode reduces the raw `S.k`
+/// first and multiplies by `alpha` ONCE after (`delta = (v - alpha*SUM s_r*k_r)*beta`).
+/// These are algebraically equal but round differently even in F64; the
+/// 256-expert router amplifies the last-bit delta into expert flips. This
+/// lever swaps in `gdn_phase4_register_resident_f64accum_prefillorder`, which
+/// uses the prefill ordering exactly so the decode recurrence step == the
+/// prefill recurrence step. Distinct from `GDN_PHASE123_F64` (which RAISES the
+/// conv1d/L2 precision and REGRESSED) — this changes ONLY the delta-rule order,
+/// matching prefill rather than exceeding it.
+///
+/// Default-OFF until proven net-positive on the GQ suite; dense byte-identical
+/// (gate requires `model_is_moe()`). Set
+/// `LUMEN_CUDA_GDN_RECUR_PREFILL_ORDER=0|1` to override the per-model default.
+pub fn gdn_recur_prefill_order_default() -> bool { false }
+
+/// Per-process default for `LUMEN_CUDA_GDN_PHASE123_ALIGN` — align the GDN
+/// **decode** phase123 (conv1d + SiLU + L2-norm) to the **prefill** phase123
+/// bit-for-bit, MoE-gated.
+///
+/// Source localization (after `LUMEN_CUDA_GDN_AB_F16` made the projection
+/// bit-identical and phase4-reorder proved net-zero): the default MoE decode
+/// runs the F32 `gdn_phase123_register_resident` (conv1d F32 + L2-norm F32),
+/// while the MoE prefill runs `ssm_conv1d_silu_prefill` (conv1d F32) +
+/// `l2_normalize_qk_strided_f64accum` (L2-norm **F64**, engaged because
+/// `gdn_f64_accum_default()` = `model_is_moe()` = true). The conv1d is already
+/// bit-identical (both F32, identical tap order); the SOLE phase123 divergence
+/// is the L2-norm PRECISION/reduction (decode F32 vs prefill F64). This lever
+/// swaps in `gdn_phase123_register_resident_alignl2`, which keeps conv1d in F32
+/// (so it is NOT the regressed `GDN_PHASE123_F64`, which raised conv1d to F64
+/// too) and computes the per-head L2-norm with the EXACT F64 reduction of the
+/// prefill `l2_normalize_qk_strided_f64accum`. The decode q_norm/k_norm then
+/// match a prefill of the same token bit-for-bit, collapsing the residual GDN
+/// L0-output divergence (a_sumsq/x_sumsq relD ~27-28%) at its true source.
+///
+/// Default-OFF until proven net-positive on the GQ suite; dense byte-identical
+/// (gate requires `model_is_moe()`). Run together with `LUMEN_CUDA_GDN_AB_F16=1`
+/// (projection prerequisite). Set `LUMEN_CUDA_GDN_PHASE123_ALIGN=0|1` to
+/// override the per-model default.
+pub fn gdn_phase123_align_default() -> bool { false }
+
+/// Per-process default for `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL` — the combined
+/// GDN-decode==GDN-prefill structural-parity lever (ALL GDN models).
+///
+/// All prior single-lever fixes (AB_F16 projection, phase123-align L2-norm,
+/// phase4-reorder, F64-megakernel) each aligned ONE decode-vs-prefill
+/// divergence and only SHUFFLED near-ties because the divergence is DIFFUSE.
+/// This lever makes the WHOLE GDN decode recurrence block byte-equivalent to a
+/// prefill of the same single position AT ONCE: for MoE GDN layers in decode it
+/// dispatches the PREFILL fused kernels (`ssm_conv1d_silu_prefill` +
+/// `gdn_compute_gates_batched` + `l2_normalize_qk_strided[_f64accum]` +
+/// `gdn_prefill_fused_v3[_f64accum]` + `gdn_prefill_norm_gate[_f64accum]`) at
+/// `T=1` on the single new token, carrying the persistent `h_state` /
+/// `conv_state`, INSTEAD of the decode megakernel / register-resident phase4
+/// recurrence (which compute a structurally different update — ~0.98%/step
+/// `h_state` drift vs the prefill scan, NOT a precision artefact). Combined with
+/// `LUMEN_CUDA_GDN_AB_F16=1` (alpha/beta projection → F16, collapsing the L0
+/// ~20% projection divergence), GDN-decode == GDN-prefill BY CONSTRUCTION.
+///
+/// MoE-default-ON (2026-06-09 GQ validation: the parity stack makes MoE q8/q4
+/// PRISTINE and clears bf16 gross garble). DENSE-default-ON for NON-BF16
+/// quants since 2026-06-10 (validated N≥3 byte-deterministic):
+/// the same per-step recurrence drift accumulates on dense over long
+/// generations — 9B-q8 GQ-004 verylong 0/3 (deterministic N=3, stuck at token
+/// cap in a DD-REP/CHARSPAM attractor) flips to 3/3 with clean EOS under
+/// via-prefill ALONE (N=5 incl. 27B; 27b-q4 goes PRISTINE); decode tok/s flat
+/// (-0.6%). AB_F16/CONVSTATE_PARITY stay MoE-only (dense ablation:
+/// unnecessary; CONVSTATE-without-AB is harmful).
+///
+/// **DENSE BF16 ≥33-layer stays on the legacy decode path (ablation 2026-06-10):**
+/// via-prefill-alone CORRUPTS dense bf16 — 9b-bf16 4/15·0/8·0/3 and 27b-bf16
+/// 0✓/3✗ with every DD detector firing, vs the legacy path's sane-but-imperfect
+/// 13/15·5/8·2/3. `LUMEN_CUDA_GDN_F64_ACCUM=1` does NOT rescue it (still 0/3),
+/// so the interaction is not a precision artefact of the recurrence; the
+/// difference vs MoE-bf16 (where via-prefill works) is the MoE-only projection
+/// aligners (AB_F16/CONVSTATE) — root-cause investigation tracked separately.
+/// Set `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL=0|1` to override either way.
+pub fn gdn_decode_via_prefill_default() -> bool {
+    // Dense bf16 carve-back (validated 2026-06-11): on the
+    // production binary (pvf32 per-class attention), via-prefill HEALS the
+    // 9B-bf16 verylong attractor (1/3 -> 3/3, N=3 byte-identical, matches
+    // llama.cpp bf16) — the earlier "via-prefill catastrophic on dense bf16"
+    // result was measured on the pre-pvf32 binary and is OBSOLETE for the 9B
+    // class. 27B-bf16 is the refutation boundary: via-prefill regresses its
+    // pristine short gate (15/15 -> 14/15), so the bf16 enable is scoped to
+    // the same <=32-layer class as `attn_precise_default()`. Unset block
+    // count (legacy callers) keeps bf16 on the legacy decode path.
+    let dense_bf16 = MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) == HINT_BF16;
+    let small = { let l = model_block_count(); l > 0 && l <= 32 };
+    model_is_moe() || !dense_bf16 || small
+}
+
+/// Per-process default for `LUMEN_CUDA_GDN_CONVSTATE_PARITY` — make the decode
+/// GDN `conv_state` bit-match a true prefill of the same position (MoE-gated).
+///
+/// With `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL=1` the decode conv1d runs the EXACT
+/// prefill `ssm_conv1d_silu_prefill` kernel on the conv ring buffer, so the only
+/// residual decode-vs-prefill divergence is the SINGLE new ring slot — the qkv
+/// projection of the new token. The decode qkv projection uses a different
+/// cuBLAS kernel/algo (N=1 GEMV: native-BF16 `cublasGemmEx` with the autotuned
+/// `bf16_algo_for` algo / per-token Q8_1 dp4a / aligned-Q8 matvec) than the
+/// prefill (N=batch GEMM via `launch_gemm_projection`: `CUBLAS_GEMM_DEFAULT_`
+/// `TENSOR_OP` BF16 GemmEx for bf16, MMQ INT8/INT4 for q8/q4). That kernel-class
+/// mismatch injects a ~0.0014% per-element qkv delta that the conv1d window
+/// dot-product + SiLU amplify into a ~5% `conv_state` divergence at L0 — which
+/// the 256-expert router then turns into expert-rank swaps and a mild
+/// number-misread / arithmetic-slip degeneration (the genuine bf16 residual).
+///
+/// When ON, the decode GDN qkv projection (the buffer that feeds the conv ring,
+/// `gdn.qkv_buf`) is computed via the SAME `launch_gemm_projection` path the
+/// prefill uses, at `batch = 1` — same cuBLAS algo (DEFAULT_TENSOR_OP) for bf16,
+/// same MMQ INT8/INT4 reduction for q8/q4 — exactly as `GDN_AB_F16` already does
+/// for the alpha/beta projection. This collapses the new-slot qkv delta, so the
+/// decode `conv_state` (whose carried-in slots are already prefill-written and
+/// bit-identical) bit-matches a true prefill of that position; `h_state` and the
+/// router then follow toward the prefill trajectory. Only the qkv projection is
+/// rerouted (gate/alpha/beta keep their existing, already-aligned paths).
+///
+/// MoE-default-ON (2026-06-09 GQ validation: bit-identical decode conv_state
+/// lifted MoE q8 to PRISTINE; q4 byte-identical via the Q4Raw exclusion); dense
+/// byte-identical (gate requires `model_is_moe()`). Requires
+/// `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL` to be effective (it only matters for the
+/// via-prefill conv consume). Set `LUMEN_CUDA_GDN_CONVSTATE_PARITY=0|1` to override.
+pub fn gdn_convstate_parity_default() -> bool { true }
+
+/// Per-process default for the greedy anti-degeneration guard
+/// (`SamplingParams::anti_restate`).
+///
+/// * MoE (Qwen3.5-MoE-35B-A3B class) → ON.
+/// * Dense / non-MoE → OFF (dense decode stays byte-identical to history).
+///
+/// **What it fixes.** On the MoE GDN-hybrid the per-quant CUDA decode forward
+/// produces a single near-tie at one step where Lumen's top-1 logit is a
+/// degenerate continuation of the just-emitted text that llama.cpp does NOT
+/// pick: a sub-word doubling (" multiplication" → "lication", rendering
+/// "multiplicationlication") and a short n-gram restate ("17 × 20 = 17 × 20",
+/// the q4 "340 + 51 = 340 + 51" loop). This is a *near-tie flip*, not a
+/// magnitude error — confirmed by bf16 (near-full precision) reproducing the
+/// doubling and by F64 GDN accumulation shifting but not removing it. Because
+/// the divergence is a sub-ULP logit-margin disagreement at a single greedy
+/// step, no precision lever or repetition-penalty value removes it without
+/// collateral arithmetic corruption (rp ≥ 1.05 breaks the math).
+///
+/// The guard is a deterministic, backend-agnostic veto applied AFTER the
+/// argmax: it only fires on a genuine degenerate restatement and otherwise
+/// returns the plain argmax unchanged, so it never perturbs coherent text and
+/// is safe to default ON for MoE. The override (`LUMEN_ANTI_RESTATE=0/1`)
+/// wins; operators who want byte-pure greedy can disable it.
+pub fn anti_restate_default() -> bool {
+    match std::env::var("LUMEN_ANTI_RESTATE").ok().as_deref() {
+        Some("0" | "false" | "no" | "off") => false,
+        Some(_) => true,
+        // BF16 MoE ONLY. The anti-degeneration veto is INCOMPATIBLE with the
+        // QUANTISED (q8/q4) MoE math path: token-level A/B on Qwen3.5-MoE-35B
+        // (A100, temp 0, raw-token-id dumps) proves the q8/q4 "Compute 17×23"
+        // greedy trajectory reaches the correct `…= 340 + 51 = 391` ONLY when
+        // the veto is OFF. The veto's sub-word-doubling rule flips the single
+        // token at the word "multiplication" (id 44896 → 1633 "…lication"
+        // vs 2820); the 1633 branch carries BOTH the cosmetic doubling AND the
+        // arithmetic that lands 391, while the vetoed 2820 branch deterministly
+        // routes into a "17×20 = 17×20 = …" loop that never emits 391. The
+        // loop/ngram id-level rules likewise veto the high-frequency digit /
+        // space / operator tokens the answer needs, redirecting the bounded
+        // fallback into the same loop. So for q8/q4 MoE every rule combination
+        // REGRESSES a passing rep≤2 / 391 baseline into a non-terminating loop;
+        // the documented baseline (veto OFF) is the correct, PASSING state and
+        // its only blemish is a cosmetic doubling inside an English WORD, not
+        // the arithmetic (391 is present and correct).
+        //
+        // BF16 MoE reaches 391 from a DIFFERENT basin whose token at "multipl-
+        // ication" is not the vetoed near-tie, so there the veto cleanly removes
+        // the doubling AND keeps 391 — a genuine win. BF16 is distinguishable
+        // from q8/q4 by the dense-quant hint (`HINT_BF16` vs `HINT_QUANTISED`),
+        // so no expert-quant probe is needed for this gate (the MMQ-Q4-default
+        // gate DOES need one because q8/q4 share `HINT_QUANTISED`). Operators
+        // who want the veto on a quantised MoE anyway can force `=1`.
+        None => model_is_moe() && MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) == HINT_BF16,
+    }
+}
 
 /// Per-process default for `LUMEN_CUDA_BF16_MOE_V3` when unset. ON by
 /// default — fires only for BF16 MoE expert dispatch.
@@ -409,12 +1084,17 @@ pub fn moe_decode_graph_default() -> bool { canonical_default_on() }
 const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_AB_ITERATIONS",
     "LUMEN_AB_WARMUP",
+    "LUMEN_ANTI_RESTATE",
+    "LUMEN_ANTI_RESTATE_SUBWORD",
+    "LUMEN_ANTI_RESTATE_NGRAM",
+    "LUMEN_ANTI_RESTATE_LOOP",
     "LUMEN_BASE_URL",
     "LUMEN_BENCH_ITERATIONS",
     "LUMEN_BENCH_SCALE",
     "LUMEN_BENCH_TOKENS",
     "LUMEN_BENCH_WARMUP",
     "LUMEN_CACHE_DIR",
+    "LUMEN_CHAT_ENABLE_THINKING",
     "LUMEN_CUDA_BF16_AUTOTUNE",
     "LUMEN_CUDA_BF16_GEMMEX",
     "LUMEN_CUDA_BF16_MOE_V3",
@@ -427,8 +1107,17 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_FA2_ATTN",
     "LUMEN_CUDA_FA2_BLOCKSKIP",
     "LUMEN_CUDA_FFN_FUSED_GLU",
+    "LUMEN_CUDA_GDN_AB_F16",
     "LUMEN_CUDA_GDN_AB_F32",
+    "LUMEN_CUDA_GDN_CONVSTATE_PARITY",
+    "LUMEN_CUDA_GDN_DECODE_AB_MMQ",
+    "LUMEN_CUDA_GDN_DECODE_MEGAKERNEL_F64",
+    "LUMEN_CUDA_GDN_DECODE_PROJ_MMQ",
+    "LUMEN_CUDA_GDN_DECODE_VIA_PREFILL",
     "LUMEN_CUDA_GDN_F64_ACCUM",
+    "LUMEN_CUDA_GDN_PHASE123_ALIGN",
+    "LUMEN_CUDA_GDN_PHASE123_F64",
+    "LUMEN_CUDA_GDN_RECUR_PREFILL_ORDER",
     "LUMEN_CUDA_GDN_REGISTER_RESIDENT",
     "LUMEN_CUDA_GDN_PHASE4_COAL",
     "LUMEN_CUDA_GDN_SPLIT",
@@ -443,7 +1132,10 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_MOE_BATCHED",
     "LUMEN_CUDA_MOE_BATCHED_V2",
     "LUMEN_CUDA_MOE_BATCHED_V3",
+    "LUMEN_CUDA_MOE_BF16_NATIVE",
     "LUMEN_CUDA_MOE_DEBUG_DUMP",
+    "LUMEN_CUDA_MOE_DECODE_F32",
+    "LUMEN_CUDA_MOE_DECODE_F32_FFN",
     "LUMEN_CUDA_MOE_DECODE_GRAPH",
     "LUMEN_CUDA_MOE_FUSED_NORM_ROUTER",
     "LUMEN_CUDA_MOE_FUSED_PERSISTENT",
@@ -480,8 +1172,17 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_DUMP_GDN_L0_BIN",
     "LUMEN_DUMP_NORMED",
     "LUMEN_DUMP_RUNTIME_Q8_SCALES",
+    "LUMEN_FORCE_PREFILL_DECODE",
+    "LUMEN_FREQUENCY_PENALTY",
     "LUMEN_GRAPH_DIAGNOSTIC",
     "LUMEN_KV_PRECISION",
+    "LUMEN_CUDA_ATTN_PRECISE",
+    "LUMEN_CUDA_ATTN_PRECISE_DBG",
+    "LUMEN_LOGIT_DUMP",
+    "LUMEN_LOGIT_DUMP_A",
+    "LUMEN_LOGIT_DUMP_B",
+    "LUMEN_METAL_ATTN_PRECISE",
+    "LUMEN_METAL_ATTN_PRECISE_DBG",
     "LUMEN_METAL_BF16_GATE_UP_NR",
     "LUMEN_METAL_BF16_GDN_FULL_PREFILL_WARMUP",
     "LUMEN_METAL_BF16_GDN_QKV_GATE_PAIRED",
@@ -521,10 +1222,13 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_METAL_Q8_REPACKED_FFN_DOWN",
     "LUMEN_METAL_Q8_REPACKED_GATE_UP",
     "LUMEN_METAL_UNRETAINED_CMDBUFS",
+    "LUMEN_MOE_PROBE",
     "LUMEN_QWEN35_9B_BF16",
     "LUMEN_QWEN35_9B_PATH",
     "LUMEN_QWEN35_9B_Q4",
     "LUMEN_QWEN35_9B_Q8",
+    "LUMEN_REPEAT_LAST_N",
+    "LUMEN_REPETITION_PENALTY",
     "LUMEN_SERVER_DEBUG_MEM",
     "LUMEN_SERVER_PANIC_MAX",
     "LUMEN_SERVER_PANIC_WINDOW_SECS",
@@ -721,6 +1425,7 @@ pub fn reset_for_tests() {
     PATH_IS_SERVER.store(false, Ordering::Relaxed);
     MODEL_DENSE_QUANT_HINT.store(HINT_UNSET, Ordering::Relaxed);
     MODEL_IS_MOE.store(false, Ordering::Relaxed);
+    MODEL_BLOCK_COUNT.store(0, Ordering::Relaxed);
 }
 
 /// A `OnceLock` "validator-ran" sentinel. Allows tests to assert that the
@@ -792,9 +1497,32 @@ mod tests {
         reset_for_tests();
         set_model_dense_quant(QuantScheme::Bf16);
         assert!(bf16_gemmex_default());
-        assert!(decode_graph_default());
-        assert!(decode_graph_qgate_default());
-        assert!(decode_graph_tiled_default());
+        // Validated 2026-06-11: graph capture is OFF for dense
+        // bf16 too — the captured-graph decode replay diverges from eager
+        // decode (DD-REP on medium gens; 27b-bf16 graph-OFF+F64 = PERFECT).
+        assert!(!decode_graph_default());
+        assert!(!decode_graph_qgate_default());
+        assert!(!decode_graph_tiled_default());
+    }
+
+    #[test]
+    fn attn_precise_default_per_class() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        // Validated 2026-06-11: pvf32 (2) for MoE + dense
+        // <=32-layer (9B); legacy WMMA (0) for the 27B class and for legacy
+        // callers that never set the block count.
+        reset_for_tests();
+        assert_eq!(attn_precise_default(), 0, "unset block count -> legacy WMMA");
+        reset_for_tests();
+        set_model_block_count(32);
+        assert_eq!(attn_precise_default(), 2, "dense 9B (32 layers) -> pvf32");
+        reset_for_tests();
+        set_model_block_count(64);
+        assert_eq!(attn_precise_default(), 0, "dense 27B (64 layers) -> legacy WMMA");
+        reset_for_tests();
+        set_model_block_count(64);
+        set_model_is_moe(true);
+        assert_eq!(attn_precise_default(), 2, "MoE -> pvf32 regardless of size");
     }
 
     #[test]
@@ -930,6 +1658,135 @@ mod tests {
     }
 
     #[test]
+    fn repetition_penalty_default_moe_per_quant_dense_1_05() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+
+        // Dense keeps 1.05 (no GDN recurrence; arithmetic unaffected).
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Q8_0);
+        assert!(
+            (repetition_penalty_default() - 1.05).abs() < f32::EPSILON,
+            "dense Q8 keeps repetition_penalty default 1.05"
+        );
+
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Bf16);
+        assert!(
+            (repetition_penalty_default() - 1.05).abs() < f32::EPSILON,
+            "dense BF16 keeps repetition_penalty default 1.05"
+        );
+
+        // MoE is PER-QUANT (the 1.08 band-aid is removed; GDN F64 fixes the math
+        // loop at rp=1.0). All MoE quants → 1.03: the floor that preserves the
+        // F64-fixed math (rp>=1.05 corrupts it to "39") while taming long-form.
+        // bf16 was RE-TUNED 1.06→1.03 on 2026-06-09 (the bf16-native path makes
+        // 1.03 sufficient for long-form — GQ-004 verylong 3/3 — and 1.06 was
+        // corrupting bf16 GQ arithmetic).
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Q8_0);
+        set_model_is_moe(true);
+        assert!(
+            (repetition_penalty_default() - 1.03).abs() < f32::EPSILON,
+            "MoE Q8 must default repetition_penalty to 1.03 (>=1.05 breaks math)"
+        );
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Bf16);
+        set_model_is_moe(true);
+        assert!(
+            (repetition_penalty_default() - 1.03).abs() < f32::EPSILON,
+            "MoE BF16 must default repetition_penalty to 1.03 (1.06 corrupted GQ arithmetic; long-form clean at 1.03)"
+        );
+
+        // Unset (no setters): dense 1.05.
+        reset_for_tests();
+        assert!(
+            (repetition_penalty_default() - 1.05).abs() < f32::EPSILON,
+            "unset hint defaults to dense 1.05"
+        );
+
+        reset_for_tests();
+    }
+
+    #[test]
+    fn gdn_f64_accum_default_is_moe_gated() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+
+        // Dense (set_model_is_moe NOT called → false): OFF. Dense models have
+        // no GDN delta-rule recurrence, so the F64 kernels never dispatch; the
+        // gate is belt-and-suspenders and must stay OFF for byte-identity.
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Q8_0);
+        assert!(!gdn_f64_accum_default(), "dense Q8 must default GDN_F64_ACCUM OFF");
+
+        // Validated 2026-06-11: dense BF16 now defaults F64 ON —
+        // the F32 GDN delta-rule decode recurrence accumulates ULP drift into
+        // a repetition attractor on long generations; F64 heals it (coupled
+        // with decode-graph OFF).
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Bf16);
+        assert!(gdn_f64_accum_default(), "dense BF16 must default GDN_F64_ACCUM ON (GAP-D)");
+
+        // MoE (set_model_is_moe(true)): ON for both q8 and bf16 — F64 on the
+        // GDN single-token state update removes the decode-vs-prefill ULP
+        // drift that triggered the q8 greedy restate-loop.
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Q8_0);
+        set_model_is_moe(true);
+        assert!(gdn_f64_accum_default(), "MoE Q8 must default GDN_F64_ACCUM ON");
+
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Bf16);
+        set_model_is_moe(true);
+        assert!(gdn_f64_accum_default(), "MoE BF16 must default GDN_F64_ACCUM ON");
+
+        // Unset (no setters): OFF (dense default).
+        reset_for_tests();
+        assert!(!gdn_f64_accum_default(), "unset hint defaults GDN_F64_ACCUM OFF");
+
+        reset_for_tests();
+    }
+
+    #[test]
+    fn gdn_decode_ab_mmq_default_is_off() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+
+        // Default OFF for EVERY model class. Empirically (A100 GQ-001,
+        // 2026-06-08) the alpha/beta projection→MMQ alignment is net-zero on
+        // bf16 (recurrence dominates), REGRESSES q8 (new DD-CHARSPAM), and only
+        // helps q4 — mixed across quants with a new catastrophic q8 mode, so it
+        // stays OFF (no quant regresses). Kept as an opt-in env lever
+        // (`LUMEN_CUDA_GDN_DECODE_AB_MMQ=1`). Must be OFF for dense AND MoE.
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Q8_0);
+        assert!(!gdn_decode_ab_mmq_default(), "dense Q8 must default GDN_DECODE_AB_MMQ OFF");
+
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Bf16);
+        assert!(!gdn_decode_ab_mmq_default(), "dense BF16 must default GDN_DECODE_AB_MMQ OFF");
+
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Q8_0);
+        set_model_is_moe(true);
+        assert!(!gdn_decode_ab_mmq_default(), "MoE Q8 must default GDN_DECODE_AB_MMQ OFF (regresses)");
+
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Bf16);
+        set_model_is_moe(true);
+        assert!(!gdn_decode_ab_mmq_default(), "MoE BF16 must default GDN_DECODE_AB_MMQ OFF (net-zero)");
+
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Q4_0);
+        set_model_is_moe(true);
+        assert!(!gdn_decode_ab_mmq_default(), "MoE Q4 must default GDN_DECODE_AB_MMQ OFF (lever opt-in)");
+
+        // Unset (no setters): OFF.
+        reset_for_tests();
+        assert!(!gdn_decode_ab_mmq_default(), "unset hint defaults GDN_DECODE_AB_MMQ OFF");
+
+        reset_for_tests();
+    }
+
+    #[test]
     fn validator_detects_missing_suffix_with_lumen_prefix() {
         let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         // Mis-spelled SUFFIX (correct LUMEN_ prefix present): canonical name
@@ -987,6 +1844,32 @@ mod tests {
     }
 
     #[test]
+    fn gdn_phase123_align_default_is_off_and_env_is_known() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        // Default-OFF: the lever must not engage unless explicitly enabled
+        // (the MoE gating is applied separately in backend_impl's resolver).
+        assert!(
+            !gdn_phase123_align_default(),
+            "GDN_PHASE123_ALIGN must default OFF (net-positive-only rule)"
+        );
+        // The env var must be in the canonical allowlist so it does not
+        // false-fire the unknown-LUMEN-var validator when set on the server.
+        assert!(
+            KNOWN_LUMEN_ENV_VARS.contains(&"LUMEN_CUDA_GDN_PHASE123_ALIGN"),
+            "LUMEN_CUDA_GDN_PHASE123_ALIGN must be in KNOWN_LUMEN_ENV_VARS"
+        );
+        std::env::set_var("LUMEN_CUDA_GDN_PHASE123_ALIGN", "1");
+        let warnings = collect_unknown_lumen_env_vars();
+        std::env::remove_var("LUMEN_CUDA_GDN_PHASE123_ALIGN");
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("LUMEN_CUDA_GDN_PHASE123_ALIGN")),
+            "known env should not warn; warnings = {warnings:?}"
+        );
+    }
+
+    #[test]
     fn closest_match_finds_canonical_for_missing_prefix() {
         // Bare suffix → no LUMEN_ prefix → validator doesn't catch this
         // (no LUMEN_ prefix means it's filtered out before suggestion),
@@ -1002,5 +1885,213 @@ mod tests {
             matches.iter().any(|m| *m == canonical),
             "matches = {matches:?}"
         );
+    }
+
+    // ---- Reasoning ("thinking") control ----
+
+    #[test]
+    fn chat_enable_thinking_default_is_false() {
+        // The default MUST be false so every surface stays byte-identical to
+        // the pre-reasoning-control behaviour when nothing opts in.
+        assert!(!chat_enable_thinking_default());
+    }
+
+    #[test]
+    fn think_prompt_tail_open_vs_closed_strings_are_exact() {
+        // These two literals are the SINGLE source of the open/closed tail
+        // that the CLI, OpenAI, and Anthropic surfaces all append. Pin them
+        // byte-for-byte; the closed form must match the historical hardcoded
+        // string in every surface's prior implementation.
+        assert_eq!(think_prompt_tail(false), "<think>\n\n</think>\n\n");
+        assert_eq!(think_prompt_tail(true), "<think>\n");
+    }
+
+    #[test]
+    fn resolve_enable_thinking_per_request_wins_over_env_and_default() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        // Save & restore the env var so we never leak global state to a
+        // sibling test (the SERIAL lock makes this safe to mutate here).
+        let saved = std::env::var("LUMEN_CHAT_ENABLE_THINKING").ok();
+
+        // Per-request Some(_) is authoritative regardless of env.
+        std::env::set_var("LUMEN_CHAT_ENABLE_THINKING", "1");
+        assert!(!resolve_enable_thinking(Some(false)), "per-request false beats env=1");
+        std::env::set_var("LUMEN_CHAT_ENABLE_THINKING", "0");
+        assert!(resolve_enable_thinking(Some(true)), "per-request true beats env=0");
+
+        match saved {
+            Some(v) => std::env::set_var("LUMEN_CHAT_ENABLE_THINKING", v),
+            None => std::env::remove_var("LUMEN_CHAT_ENABLE_THINKING"),
+        }
+    }
+
+    #[test]
+    fn resolve_enable_thinking_env_override_when_request_absent() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var("LUMEN_CHAT_ENABLE_THINKING").ok();
+
+        // Env override applies only when per_request is None. Accept the
+        // canonical truthy/falsy spellings; bogus values fall to the default.
+        for truthy in ["1", "true", "yes", "on", "ON", "True"] {
+            std::env::set_var("LUMEN_CHAT_ENABLE_THINKING", truthy);
+            assert!(resolve_enable_thinking(None), "env '{truthy}' should enable");
+        }
+        for falsy in ["0", "false", "no", "off", "OFF"] {
+            std::env::set_var("LUMEN_CHAT_ENABLE_THINKING", falsy);
+            assert!(!resolve_enable_thinking(None), "env '{falsy}' should disable");
+        }
+        std::env::set_var("LUMEN_CHAT_ENABLE_THINKING", "garbage");
+        assert_eq!(
+            resolve_enable_thinking(None),
+            chat_enable_thinking_default(),
+            "unparseable env falls through to the default"
+        );
+        std::env::remove_var("LUMEN_CHAT_ENABLE_THINKING");
+        assert_eq!(
+            resolve_enable_thinking(None),
+            chat_enable_thinking_default(),
+            "absent env + absent request == default"
+        );
+
+        match saved {
+            Some(v) => std::env::set_var("LUMEN_CHAT_ENABLE_THINKING", v),
+            None => std::env::remove_var("LUMEN_CHAT_ENABLE_THINKING"),
+        }
+    }
+
+    // ---- F3: canonical no-temperature default ----
+
+    #[test]
+    fn default_temperature_is_0_7() {
+        // The SINGLE canonical no-temperature default sourced by the CLI flag
+        // default and both wire surfaces. Pin it so the CLI and wire cannot
+        // silently diverge again (the bug was CLI 0.8 vs wire 0.7).
+        assert_eq!(default_temperature(), 0.7);
+    }
+
+    // ---- F1: shared env resolvers (read in exactly ONE place) ----
+
+    #[test]
+    fn frequency_penalty_resolved_env_precedence() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var("LUMEN_FREQUENCY_PENALTY").ok();
+
+        // Absent env → the default (0.0, no-op).
+        std::env::remove_var("LUMEN_FREQUENCY_PENALTY");
+        assert_eq!(frequency_penalty_resolved(), frequency_penalty_default());
+        assert_eq!(frequency_penalty_resolved(), 0.0);
+
+        // A finite, >= 0.0 env value wins over the default.
+        std::env::set_var("LUMEN_FREQUENCY_PENALTY", "0.4");
+        assert_eq!(frequency_penalty_resolved(), 0.4);
+        std::env::set_var("LUMEN_FREQUENCY_PENALTY", "0");
+        assert_eq!(frequency_penalty_resolved(), 0.0);
+
+        // Invalid / out-of-range values are rejected and fall through to the
+        // default (the `is_finite() && >= 0.0` filter): negative, NaN, garbage.
+        for bogus in ["-1.0", "NaN", "inf", "not-a-number", ""] {
+            std::env::set_var("LUMEN_FREQUENCY_PENALTY", bogus);
+            assert_eq!(
+                frequency_penalty_resolved(),
+                frequency_penalty_default(),
+                "bogus env '{bogus}' must fall through to the default"
+            );
+        }
+
+        match saved {
+            Some(v) => std::env::set_var("LUMEN_FREQUENCY_PENALTY", v),
+            None => std::env::remove_var("LUMEN_FREQUENCY_PENALTY"),
+        }
+    }
+
+    #[test]
+    fn repeat_last_n_resolved_env_precedence() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var("LUMEN_REPEAT_LAST_N").ok();
+
+        // Absent env → None (full-history window, production-identical).
+        std::env::remove_var("LUMEN_REPEAT_LAST_N");
+        assert_eq!(repeat_last_n_resolved(), None);
+
+        // A parseable usize env value wins.
+        std::env::set_var("LUMEN_REPEAT_LAST_N", "64");
+        assert_eq!(repeat_last_n_resolved(), Some(64));
+        std::env::set_var("LUMEN_REPEAT_LAST_N", "0");
+        assert_eq!(repeat_last_n_resolved(), Some(0));
+
+        // Unparseable values (negative, float, garbage) fall through to None.
+        for bogus in ["-1", "12.5", "garbage", ""] {
+            std::env::set_var("LUMEN_REPEAT_LAST_N", bogus);
+            assert_eq!(
+                repeat_last_n_resolved(),
+                None,
+                "bogus env '{bogus}' must fall through to None"
+            );
+        }
+
+        match saved {
+            Some(v) => std::env::set_var("LUMEN_REPEAT_LAST_N", v),
+            None => std::env::remove_var("LUMEN_REPEAT_LAST_N"),
+        }
+    }
+
+    // ---- F1 + F2: allowlist membership (no false unknown-env typo warning) ----
+
+    #[test]
+    fn newly_documented_env_vars_are_in_allowlist_and_do_not_warn() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+
+        // F1: LUMEN_FREQUENCY_PENALTY (honoured by both wire + CLI) and
+        // F2: LUMEN_CUDA_MOE_BF16_NATIVE (documented bf16-MoE restore-path flag)
+        // must be in the canonical allowlist so they do not false-fire the
+        // unknown-LUMEN-var validator when an operator sets them.
+        for name in ["LUMEN_FREQUENCY_PENALTY", "LUMEN_CUDA_MOE_BF16_NATIVE"] {
+            assert!(
+                KNOWN_LUMEN_ENV_VARS.contains(&name),
+                "{name} must be in KNOWN_LUMEN_ENV_VARS"
+            );
+            let saved = std::env::var(name).ok();
+            std::env::set_var(name, "1");
+            let warnings = collect_unknown_lumen_env_vars();
+            match saved {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+            assert!(
+                !warnings.iter().any(|w| w.contains(name)),
+                "known env '{name}' must not warn; warnings = {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowlist_members_do_not_warn_when_set() {
+        // Completeness check that iterates the allowlist rather than hard-coding
+        // a single var: EVERY canonical name, when present in the env, must be
+        // recognised by the validator (pass-1 membership) so it never emits a
+        // false unknown-env typo warning. This guards against a future entry
+        // being added with a subtle mismatch (trailing whitespace, wrong case,
+        // a stray character) that would slip the prefix-membership check.
+        //
+        // Unlike a self-membership assertion (which is a tautology — every
+        // element trivially equals itself), this drives the REAL validator:
+        // set each var, call `collect_unknown_lumen_env_vars()`, and assert no
+        // emitted warning names it.
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        for name in KNOWN_LUMEN_ENV_VARS {
+            let saved = std::env::var(name).ok();
+            std::env::set_var(name, "1");
+            let warnings = collect_unknown_lumen_env_vars();
+            // Restore BEFORE asserting so a failure cannot leak this var into
+            // the process env for sibling tests.
+            match saved {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+            assert!(
+                !warnings.iter().any(|w| w.contains(name)),
+                "allowlist member '{name}' must not warn; warnings = {warnings:?}"
+            );
+        }
     }
 }

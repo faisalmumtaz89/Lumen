@@ -164,11 +164,25 @@ pub fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes every test that reads or mutates the process-global
+    /// `LUMEN_CACHE_DIR` (and the `HOME` fallback `cache_dir` consults). Under
+    /// the default multithreaded test runner a `set_var`/`remove_var` in one
+    /// test races siblings that call `cache_dir()` (directly or via
+    /// `cached_lbc`/`lbc_path`/`gguf_path`/`list_cached`). Every such test
+    /// holds this lock for the full set→compute→restore window, and restores
+    /// the prior value *before* asserting so a failed assertion cannot leak
+    /// state to a sibling. Poison-tolerant, mirroring the per-crate `SERIAL`
+    /// pattern used elsewhere in the workspace. Test-only.
+    static SERIAL: Mutex<()> = Mutex::new(());
 
     #[test]
     fn cache_dir_returns_valid_path() {
-        // Note: other tests may set LUMEN_CACHE_DIR, so we just verify
-        // the returned path is non-empty and absolute or contains "lumen".
+        // Read under SERIAL so a sibling's transient LUMEN_CACHE_DIR mutation
+        // is never observed here. We only assert structural properties (the
+        // value depends on the ambient env, which other tests may have set).
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let dir = cache_dir();
         let dir_str = dir.to_string_lossy();
         assert!(!dir_str.is_empty(), "cache_dir must return non-empty path");
@@ -180,51 +194,55 @@ mod tests {
 
     #[test]
     fn lumen_cache_dir_env_override() {
-        // This test uses a unique env var value to avoid collision with other tests.
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let original = std::env::var("LUMEN_CACHE_DIR").ok();
         std::env::set_var("LUMEN_CACHE_DIR", "/tmp/lumen-test-cache-env-override");
         let dir = cache_dir();
-        assert_eq!(dir, PathBuf::from("/tmp/lumen-test-cache-env-override"));
-        // Restore.
+        // Restore BEFORE asserting so a failed assert cannot leak env state.
         match original {
             Some(val) => std::env::set_var("LUMEN_CACHE_DIR", val),
             None => std::env::remove_var("LUMEN_CACHE_DIR"),
         }
+        assert_eq!(dir, PathBuf::from("/tmp/lumen-test-cache-env-override"));
     }
 
     #[test]
     fn cached_lbc_returns_none_for_nonexistent() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let original = std::env::var("LUMEN_CACHE_DIR").ok();
         std::env::set_var("LUMEN_CACHE_DIR", "/tmp/lumen-nonexistent-dir-for-test");
-        assert!(cached_lbc("nonexistent-model", "Q8_0").is_none());
+        let found = cached_lbc("nonexistent-model", "Q8_0");
         match original {
             Some(val) => std::env::set_var("LUMEN_CACHE_DIR", val),
             None => std::env::remove_var("LUMEN_CACHE_DIR"),
         }
+        assert!(found.is_none());
     }
 
     #[test]
     fn lbc_path_format() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let original = std::env::var("LUMEN_CACHE_DIR").ok();
         std::env::set_var("LUMEN_CACHE_DIR", "/tmp/lumen-test-cache");
         let path = lbc_path("qwen3-5-9b", "Q8_0");
-        assert_eq!(path, PathBuf::from("/tmp/lumen-test-cache/qwen3-5-9b-Q8_0.lbc"));
         match original {
             Some(val) => std::env::set_var("LUMEN_CACHE_DIR", val),
             None => std::env::remove_var("LUMEN_CACHE_DIR"),
         }
+        assert_eq!(path, PathBuf::from("/tmp/lumen-test-cache/qwen3-5-9b-Q8_0.lbc"));
     }
 
     #[test]
     fn gguf_path_format() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let original = std::env::var("LUMEN_CACHE_DIR").ok();
         std::env::set_var("LUMEN_CACHE_DIR", "/tmp/lumen-test-cache");
         let path = gguf_path("model.Q8_0.gguf");
-        assert_eq!(path, PathBuf::from("/tmp/lumen-test-cache/model.Q8_0.gguf"));
         match original {
             Some(val) => std::env::set_var("LUMEN_CACHE_DIR", val),
             None => std::env::remove_var("LUMEN_CACHE_DIR"),
         }
+        assert_eq!(path, PathBuf::from("/tmp/lumen-test-cache/model.Q8_0.gguf"));
     }
 
     #[test]
@@ -249,13 +267,14 @@ mod tests {
 
     #[test]
     fn list_cached_empty_dir() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let original = std::env::var("LUMEN_CACHE_DIR").ok();
         std::env::set_var("LUMEN_CACHE_DIR", "/tmp/lumen-nonexistent-dir-for-test");
         let entries = list_cached();
-        assert!(entries.is_empty());
         match original {
             Some(val) => std::env::set_var("LUMEN_CACHE_DIR", val),
             None => std::env::remove_var("LUMEN_CACHE_DIR"),
         }
+        assert!(entries.is_empty());
     }
 }

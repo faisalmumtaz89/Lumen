@@ -9,7 +9,7 @@
 //!
 //! The Rust test is in-process server + in-process workload (so the
 //! "single long-running lumen-server process" property holds end-to-end).
-//! The Modal Python supervisor at `modal/server_soak.py` reads
+//! An external supervisor process (any orchestrator) reads
 //! `LUMEN_SOAK_OUT_DIR/soak-port.txt` and `LUMEN_SOAK_OUT_DIR/soak-pid.txt`
 //! to know which port + PID to drive against and sample from.
 //!
@@ -151,7 +151,8 @@ impl Tokenize for BpeTokenizerAdapter {
     }
 
     fn apply_chat_template(&self, system: Option<&str>, user: &str) -> Option<String> {
-        Some(self.inner.apply_chat_template_with_system(user, system))
+        // Soak harness: reasoning off (closed think tail), byte-identical.
+        Some(self.inner.apply_chat_template_with_system(user, system, false))
     }
 
     fn eos_tokens(&self) -> Vec<u32> {

@@ -207,14 +207,23 @@ async fn chat_completions(
 ) -> Result<Response, ServerError> {
     let model_id = state.engine.model_info().id.clone();
     let stream = req.stream.unwrap_or(false);
+    // Resolve the reasoning flag from the request BEFORE `into_job` consumes
+    // it, so the wire emitter and the prompt tail agree (both call the single
+    // shared resolver with the same inputs → same result).
+    let thinking = req.resolve_thinking();
     let job = req.into_job(&state.engine)?;
+    // Clone the stop list before `job` is moved into `submit`; the wire layer
+    // seeds its redundant stop matcher from it (the worker enforces the actual
+    // stop). Empty list => no-op, byte-identical streaming.
+    let stop = job.stop_text.clone();
     let rx = state.engine.submit(job, 128).await?;
 
     if stream {
-        let body = wire::openai::stream_chat(rx, model_id, current_unix_time());
+        let body = wire::openai::stream_chat(rx, model_id, current_unix_time(), thinking, stop);
         Ok(sse_response(body))
     } else {
-        let resp = wire::openai::collect_chat(rx, model_id, current_unix_time()).await?;
+        let resp =
+            wire::openai::collect_chat(rx, model_id, current_unix_time(), thinking, stop).await?;
         Ok((StatusCode::OK, Json(resp)).into_response())
     }
 }
@@ -228,12 +237,14 @@ async fn completions(
     let model_id = state.engine.model_info().id.clone();
     let stream = req.stream.unwrap_or(false);
     let job = req.into_job(&state.engine)?;
+    let stop = job.stop_text.clone();
     let rx = state.engine.submit(job, 128).await?;
     if stream {
-        let body = wire::openai::stream_completion(rx, model_id, current_unix_time());
+        let body = wire::openai::stream_completion(rx, model_id, current_unix_time(), stop);
         Ok(sse_response(body))
     } else {
-        let resp = wire::openai::collect_completion(rx, model_id, current_unix_time()).await?;
+        let resp =
+            wire::openai::collect_completion(rx, model_id, current_unix_time(), stop).await?;
         Ok((StatusCode::OK, Json(resp)).into_response())
     }
 }
@@ -246,13 +257,17 @@ async fn messages(
 ) -> Result<Response, ServerError> {
     let model_id = state.engine.model_info().id.clone();
     let stream = req.stream.unwrap_or(false);
+    // Resolve reasoning before `into_job` consumes the request (same shared
+    // resolver as the prompt tail -> consistent result).
+    let thinking = req.resolve_thinking();
     let job = req.into_job(&state.engine)?;
+    let stop = job.stop_text.clone();
     let rx = state.engine.submit(job, 128).await?;
     if stream {
-        let body = wire::anthropic::stream_messages(rx, model_id);
+        let body = wire::anthropic::stream_messages(rx, model_id, thinking, stop);
         Ok(sse_response(body))
     } else {
-        let resp = wire::anthropic::collect_messages(rx, model_id).await?;
+        let resp = wire::anthropic::collect_messages(rx, model_id, thinking, stop).await?;
         Ok((StatusCode::OK, Json(resp)).into_response())
     }
 }

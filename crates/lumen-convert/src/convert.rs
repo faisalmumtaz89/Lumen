@@ -1288,6 +1288,167 @@ mod tests {
         }
     }
 
+    /// Non-degenerate Q2_K block: exercises the GGML qs traversal ORDER, which
+    /// the uniform-block tests above cannot (any traversal agrees when every
+    /// quant + scale is identical). Reference values come from GGML's
+    /// `dequantize_row_q2_K` (two 128-value groups; four shift passes 0,2,4,6
+    /// over the same 32 qs bytes per group; `q[l]` then `q[l+16]`). Regression
+    /// guard for the byte-traversal bug that corrupted every Q2_K tensor in the
+    /// Qwen3.6-27B LBC and produced token salad.
+    #[test]
+    fn dequantize_q2_k_non_degenerate_traversal() {
+        // scales[j]: low nibble = scale, high nibble = min, both varied.
+        let mut block = Vec::with_capacity(84);
+        for j in 0..16u8 {
+            block.push((j & 0x0F) | (((15 - j) & 0x0F) << 4));
+        }
+        // qs: 64 varied bytes.
+        for i in 0..64u8 {
+            block.push(i.wrapping_mul(37).wrapping_add(11));
+        }
+        block.extend_from_slice(&f32_to_f16_bits(0.05).to_le_bytes()); // d
+        block.extend_from_slice(&f32_to_f16_bits(0.02).to_le_bytes()); // dmin
+        assert_eq!(block.len(), 84);
+
+        let values: Vec<f32> = dequantize_q2_k(&block, 256)
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), 256);
+
+        // Independent re-implementation of the canonical GGML traversal.
+        let d = f16(0.05);
+        let dmin = f16(0.02);
+        let scales: Vec<u8> = (0..16u8).map(|j| (j & 0x0F) | (((15 - j) & 0x0F) << 4)).collect();
+        let qs: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+        let mut expected = [0f32; 256];
+        let mut yi = 0usize;
+        let mut q_off = 0usize;
+        let mut is = 0usize;
+        for _g in 0..2 {
+            let mut shift = 0u8;
+            for _j in 0..4 {
+                let sc = scales[is]; is += 1;
+                let (dl, ml) = (d * (sc & 0xF) as f32, dmin * (sc >> 4) as f32);
+                for l in 0..16 { expected[yi] = dl * (((qs[q_off + l] >> shift) & 3) as f32) - ml; yi += 1; }
+                let sc = scales[is]; is += 1;
+                let (dl, ml) = (d * (sc & 0xF) as f32, dmin * (sc >> 4) as f32);
+                for l in 0..16 { expected[yi] = dl * (((qs[q_off + l + 16] >> shift) & 3) as f32) - ml; yi += 1; }
+                shift += 2;
+            }
+            q_off += 32;
+        }
+        for i in 0..256 {
+            assert!(
+                (values[i] - expected[i]).abs() < 1e-5,
+                "Q2_K traversal mismatch at {i}: got {}, expected {}",
+                values[i], expected[i]
+            );
+        }
+        // Sanity: this block is genuinely non-uniform, so a naive linear scan
+        // would have diverged (guards against the test degenerating).
+        assert!(
+            values.iter().cloned().fold(f32::MIN, f32::max)
+                - values.iter().cloned().fold(f32::MAX, f32::min)
+                > 1.0,
+            "test block must be non-degenerate"
+        );
+    }
+
+    // f16 decode helper mirroring dequant.rs::f16_to_f32, for the test's
+    // independent reference computation.
+    fn f16(v: f32) -> f32 {
+        let h = f32_to_f16_bits(v);
+        let sign = ((h >> 15) & 1) as u32;
+        let exp = ((h >> 10) & 0x1f) as u32;
+        let mant = (h & 0x3ff) as u32;
+        let bits = if exp == 0 {
+            if mant == 0 { sign << 31 } else {
+                let mut e = exp as i32; let mut m = mant;
+                while (m & 0x400) == 0 { m <<= 1; e -= 1; }
+                e += 1; m &= 0x3ff;
+                (sign << 31) | (((e + 112) as u32) << 23) | (m << 13)
+            }
+        } else if exp == 0x1f {
+            (sign << 31) | (0xff << 23) | (mant << 13)
+        } else {
+            (sign << 31) | ((exp + 112) << 23) | (mant << 13)
+        };
+        f32::from_bits(bits)
+    }
+
+    /// Non-degenerate Q3_K block: exercises the GGML qs/hmask traversal order.
+    /// Regression guard for the linear-scan bug that corrupted the Qwen3.6-27B
+    /// ffn_down (Q3_K) tensors. Reference = GGML `dequantize_row_q3_K`.
+    #[test]
+    fn dequantize_q3_k_non_degenerate_traversal() {
+        let mut block = Vec::with_capacity(110);
+        for i in 0..32u8 { block.push(i.wrapping_mul(53).wrapping_add(7)); }   // hmask
+        for i in 0..64u8 { block.push(i.wrapping_mul(29).wrapping_add(3)); }   // qs
+        for i in 0..12u8 { block.push(i.wrapping_mul(17).wrapping_add(5)); }   // scales
+        block.extend_from_slice(&f32_to_f16_bits(0.1).to_le_bytes());          // d
+        assert_eq!(block.len(), 110);
+
+        let values: Vec<f32> = dequantize_q3_k(&block, 256)
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), 256);
+
+        // Independent GGML reference.
+        let hmask = &block[0..32];
+        let qs = &block[32..96];
+        let scale_bytes = &block[96..108];
+        let d = f16(0.1);
+        // GGML aux uint32 shuffle for the 16 6-bit Q3_K scales (matches the
+        // production decode in dequant.rs and llama.cpp byte-for-byte).
+        const KMASK1: u32 = 0x0303_0303;
+        const KMASK2: u32 = 0x0f0f_0f0f;
+        let a0 = u32::from_le_bytes([scale_bytes[0], scale_bytes[1], scale_bytes[2], scale_bytes[3]]);
+        let a1 = u32::from_le_bytes([scale_bytes[4], scale_bytes[5], scale_bytes[6], scale_bytes[7]]);
+        let tmp = u32::from_le_bytes([scale_bytes[8], scale_bytes[9], scale_bytes[10], scale_bytes[11]]);
+        let out0 = (a0 & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+        let out1 = (a1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+        let out2 = ((a0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+        let out3 = ((a1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+        let mut sc = [0u8; 16];
+        sc[0..4].copy_from_slice(&out0.to_le_bytes());
+        sc[4..8].copy_from_slice(&out1.to_le_bytes());
+        sc[8..12].copy_from_slice(&out2.to_le_bytes());
+        sc[12..16].copy_from_slice(&out3.to_le_bytes());
+        let mut expected = [0f32; 256];
+        let mut yi = 0usize;
+        let mut q_off = 0usize;
+        let mut is = 0usize;
+        let mut m = 1u8;
+        for _g in 0..2 {
+            let mut shift = 0u8;
+            for _j in 0..4 {
+                let dl = d * (sc[is] as i8 as f32 - 32.0); is += 1;
+                for l in 0..16 {
+                    let qb = ((qs[q_off + l] >> shift) & 3) as i32;
+                    let sub = if (hmask[l] & m) != 0 { 0 } else { 4 };
+                    expected[yi] = dl * (qb - sub) as f32; yi += 1;
+                }
+                let dl = d * (sc[is] as i8 as f32 - 32.0); is += 1;
+                for l in 0..16 {
+                    let qb = ((qs[q_off + l + 16] >> shift) & 3) as i32;
+                    let sub = if (hmask[l + 16] & m) != 0 { 0 } else { 4 };
+                    expected[yi] = dl * (qb - sub) as f32; yi += 1;
+                }
+                shift += 2; m <<= 1;
+            }
+            q_off += 32;
+        }
+        for i in 0..256 {
+            assert!(
+                (values[i] - expected[i]).abs() < 1e-4,
+                "Q3_K traversal mismatch at {i}: got {}, expected {}",
+                values[i], expected[i]
+            );
+        }
+    }
+
     #[test]
     fn dequantize_q3_k_known_block() {
         let mut block = Vec::new();

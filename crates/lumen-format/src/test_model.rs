@@ -127,6 +127,7 @@ pub fn generate_test_model(config: &TestModelConfig) -> Vec<u8> {
         num_active_experts: None,
         norm_eps: 1e-5,
         rotary_dim: None, rope_neox: false,
+        gdn: None,
     };
     let qd = QuantizationDescriptor {
         scheme: QuantScheme::F32,
@@ -280,6 +281,7 @@ pub fn generate_test_model_q8_0(config: &TestModelQ8Config) -> Vec<u8> {
         num_active_experts: None,
         norm_eps: 1e-5,
         rotary_dim: None, rope_neox: false,
+        gdn: None,
     };
     let qd = QuantizationDescriptor {
         scheme: QuantScheme::Q8_0,
@@ -440,6 +442,7 @@ pub fn generate_test_model_q8_0_gdn(config: &TestModelQ8Config) -> Vec<u8> {
         num_active_experts: None,
         norm_eps: 1e-5,
         rotary_dim: None, rope_neox: false,
+        gdn: None,
     };
     let qd = QuantizationDescriptor {
         scheme: QuantScheme::Q8_0,
@@ -589,6 +592,7 @@ pub fn generate_test_model_f16(config: &TestModelF16Config) -> Vec<u8> {
         num_active_experts: None,
         norm_eps: 1e-5,
         rotary_dim: None, rope_neox: false,
+        gdn: None,
     };
     let qd = QuantizationDescriptor {
         scheme: QuantScheme::F16,
@@ -739,6 +743,7 @@ pub fn generate_test_model_q4_0(config: &TestModelQ4Config) -> Vec<u8> {
         num_active_experts: None,
         norm_eps: 1e-5,
         rotary_dim: None, rope_neox: false,
+        gdn: None,
     };
     let qd = QuantizationDescriptor {
         scheme: QuantScheme::Q4_0,

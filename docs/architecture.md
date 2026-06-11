@@ -34,7 +34,7 @@ Lumen's Layer-Blob Container (`.lbc`) format:
 - CRC32 header
 - Zero-copy mmap
 - Per-tensor quantization (mix BF16 / Q8_0 / Q4_0 in one file)
-- Current version: `LBC_VERSION = 3`
+- Current version: `LBC_VERSION = 4`
 
 The converter accepts GGUF v2/v3, streams one layer at a time, dequantizes K-quants (Q4_K, Q5_K, Q6_K, Q2_K, Q3_K) and MXFP4 to runtime-supported formats, and filters the MTP (Next-N) head.
 

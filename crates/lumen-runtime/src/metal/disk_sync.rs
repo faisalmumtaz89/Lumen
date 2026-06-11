@@ -708,6 +708,7 @@ mod tests {
             num_active_experts: None,
             rotary_dim: None,
             rope_neox: false,
+            gdn: None,
         };
         match MetalF32Backend::new() {
             Ok(mut b) => match ComputeBackend::init(&mut b, &hp) {

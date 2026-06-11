@@ -66,6 +66,18 @@ pub struct ToolDefFunction {
     pub parameters: Value,
 }
 
+/// vLLM-/SGLang-compatible `chat_template_kwargs`. The only field Lumen reads
+/// is `enable_thinking`; any other keys pass through and are ignored (the
+/// struct is permissive — NOT `deny_unknown_fields` — so forward-compatible
+/// extras don't 400). This mirrors the vLLM OpenAI server, which accepts
+/// `{"chat_template_kwargs": {"enable_thinking": false}}` to toggle the
+/// Qwen3.5 reasoning block.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ChatTemplateKwargs {
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
@@ -77,18 +89,85 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Nucleus-sampling cutoff (OpenAI `top_p`). Honored on the CLI today but
+    /// previously HTTP-400-rejected here by `deny_unknown_fields`. `None`
+    /// (omitted) leaves the sampler default untouched.
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Top-k logit cut. Not a standard OpenAI field, but vLLM/llama.cpp accept
+    /// it and the CLI honors it; carried here for surface parity.
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    /// Min-p relative cutoff. As with `top_k`, CLI-honored and accepted by
+    /// vLLM/llama.cpp.
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    /// OpenAI `presence_penalty`. Zero-normalized to `None` (CLI parity) so an
+    /// explicit `0` stays a no-op identical to the default path.
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    /// OpenAI `frequency_penalty`. Zero-normalized to `None` (CLI parity);
+    /// when supplied non-zero it overrides the server-internal
+    /// `diag_frequency_penalty` default.
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
     pub stop: Option<Value>,
     #[serde(default)]
     pub tools: Vec<ToolDef>,
+    /// Per-request reasoning toggle. `Some(true)` opens the `<think>` block so
+    /// the model emits a reasoning trace (surfaced as `reasoning_content`);
+    /// `Some(false)` forces the closed empty-think tail. `None` defers to the
+    /// `LUMEN_CHAT_ENABLE_THINKING` env override, then the process default
+    /// (`false`). Resolved via the shared
+    /// [`lumen_runtime::runtime_defaults::resolve_enable_thinking`].
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    /// Separate reasoning-token budget (industry-convergent with Anthropic
+    /// `thinking.budget_tokens` / Gemini `thinking_budget`). Carried on the
+    /// request DTO now; the decode-loop enforcement is Part 4 (separate work).
+    #[serde(default)]
+    pub reasoning_budget: Option<usize>,
+    /// vLLM-compatible `{"chat_template_kwargs": {"enable_thinking": ...}}`.
+    /// The top-level `enable_thinking` field wins when both are present.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
 impl ChatCompletionRequest {
+    /// Resolve the per-request reasoning toggle using the single shared
+    /// resolver. Precedence: top-level `enable_thinking` → vLLM
+    /// `chat_template_kwargs.enable_thinking` → env override → default. The
+    /// per-request `Option` is collapsed here, then handed to the one resolver
+    /// so the env/default fall-through is identical to every other surface.
+    pub fn resolve_thinking(&self) -> bool {
+        let per_request = self.enable_thinking.or_else(|| {
+            self.chat_template_kwargs
+                .as_ref()
+                .and_then(|k| k.enable_thinking)
+        });
+        super::resolve_enable_thinking(per_request)
+    }
+
     pub fn into_job(self, engine: &EngineHandle) -> Result<JobRequest, ServerError> {
-        let prompt = render_chat_prompt(&self.messages, &self.tools)?;
+        // ROBUST-007 (2026-06-11 checklist): out-of-range sampler params and
+        // empty `messages` must 400 like other malformed fields, not be
+        // silently accepted/clamped.
+        validate_sampler_ranges(self.temperature, self.top_p)?;
+        if self.messages.is_empty() {
+            return Err(ServerError::bad_request_field(
+                "messages must be a non-empty array",
+                "messages",
+                "invalid_value",
+            ));
+        }
+        let enable_thinking = self.resolve_thinking();
+        let prompt = render_chat_prompt(&self.messages, &self.tools, enable_thinking)?;
         let prompt_tokens = engine.tokenize_for_request(&prompt);
+        // Synchronous oversize guard: 400 BEFORE the 200/SSE stream opens.
+        super::check_prompt_length(prompt_tokens.len(), engine.context_length())?;
         let stop_text = parse_stop_field(self.stop);
         let eos = engine.eos_tokens_for_request();
         let max_tokens = self.max_tokens.unwrap_or(256);
@@ -103,10 +182,28 @@ impl ChatCompletionRequest {
         // An omitted `seed` resolves to a fresh per-request random seed (the
         // OpenAI/llama.cpp convention) so identical requests vary; pass an
         // explicit `seed` for reproducible output.
+        // Client-supplied additive penalties are zero-normalized to `None`
+        // (CLI parity, run.rs:357,368): an explicit `0` is a no-op identical
+        // to the default path. `frequency_penalty` OVERRIDES the
+        // server-internal `diag_frequency_penalty` default ONLY when the
+        // client sends a non-zero value; otherwise the default stands so the
+        // all-zero / omitted request stays byte-identical to today.
+        let presence_penalty = super::normalize_zero_penalty(self.presence_penalty);
+        let frequency_penalty = super::normalize_zero_penalty(self.frequency_penalty)
+            .unwrap_or_else(super::diag_frequency_penalty);
         let sampling = SamplingParams {
-            temperature: self.temperature.unwrap_or(0.7),
+            temperature: self
+                .temperature
+                .unwrap_or_else(lumen_runtime::runtime_defaults::default_temperature),
             seed: Some(self.seed.unwrap_or_else(super::next_random_seed)),
-            repetition_penalty: Some(1.05),
+            top_p: self.top_p,
+            top_k: self.top_k,
+            min_p: self.min_p,
+            repetition_penalty: Some(super::diag_repetition_penalty()),
+            presence_penalty,
+            frequency_penalty: Some(frequency_penalty),
+            repeat_last_n: super::diag_repeat_last_n(),
+            anti_restate: super::diag_anti_restate(),
             ..Default::default()
         };
         Ok(JobRequest {
@@ -116,6 +213,10 @@ impl ChatCompletionRequest {
             eos_token_ids: eos,
             sampling,
             suffix_threshold: lumen_runtime::session::Session::DEFAULT_SUFFIX_THRESHOLD,
+            enable_thinking,
+            reasoning_budget: self
+                .reasoning_budget
+                .unwrap_or_else(lumen_runtime::runtime_defaults::chat_reasoning_budget_default),
         })
     }
 }
@@ -131,6 +232,20 @@ pub struct CompletionRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Mirror of the OpenAI-valid sampler set carried on chat completions
+    /// (see `ChatCompletionRequest`): honored on the CLI, previously
+    /// 400-rejected here by `deny_unknown_fields`. Same zero-normalization /
+    /// override semantics as the chat path.
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
@@ -139,6 +254,8 @@ pub struct CompletionRequest {
 
 impl CompletionRequest {
     pub fn into_job(self, engine: &EngineHandle) -> Result<JobRequest, ServerError> {
+        // ROBUST-007: same sampler-range guard as the chat endpoint.
+        validate_sampler_ranges(self.temperature, self.top_p)?;
         let text = match self.prompt {
             Value::String(s) => s,
             Value::Array(arr) => arr
@@ -155,6 +272,8 @@ impl CompletionRequest {
             }
         };
         let prompt_tokens = engine.tokenize_for_request(&text);
+        // Synchronous oversize guard: 400 BEFORE the 200/SSE stream opens.
+        super::check_prompt_length(prompt_tokens.len(), engine.context_length())?;
         let stop_text = parse_stop_field(self.stop);
         let eos = engine.eos_tokens_for_request();
         let max_tokens = self.max_tokens.unwrap_or(256);
@@ -162,10 +281,24 @@ impl CompletionRequest {
         // ChatCompletionRequest::into_job for the full rationale). An omitted
         // `seed` resolves to a fresh per-request random seed; pass an explicit
         // `seed` for reproducible output.
+        // Same CLI-parity zero-normalization + frequency-penalty override as
+        // the chat path (see `ChatCompletionRequest::into_job`).
+        let presence_penalty = super::normalize_zero_penalty(self.presence_penalty);
+        let frequency_penalty = super::normalize_zero_penalty(self.frequency_penalty)
+            .unwrap_or_else(super::diag_frequency_penalty);
         let sampling = SamplingParams {
-            temperature: self.temperature.unwrap_or(0.7),
+            temperature: self
+                .temperature
+                .unwrap_or_else(lumen_runtime::runtime_defaults::default_temperature),
             seed: Some(self.seed.unwrap_or_else(super::next_random_seed)),
-            repetition_penalty: Some(1.05),
+            top_p: self.top_p,
+            top_k: self.top_k,
+            min_p: self.min_p,
+            repetition_penalty: Some(super::diag_repetition_penalty()),
+            presence_penalty,
+            frequency_penalty: Some(frequency_penalty),
+            repeat_last_n: super::diag_repeat_last_n(),
+            anti_restate: super::diag_anti_restate(),
             ..Default::default()
         };
         Ok(JobRequest {
@@ -175,8 +308,40 @@ impl CompletionRequest {
             eos_token_ids: eos,
             sampling,
             suffix_threshold: lumen_runtime::session::Session::DEFAULT_SUFFIX_THRESHOLD,
+            // Legacy text-completions have no chat template / `<think>` block,
+            // so reasoning is never enabled on this path.
+            enable_thinking: false,
+            reasoning_budget: 0,
         })
     }
+}
+
+/// ROBUST-007 (2026-06-11 production checklist): reject out-of-range sampler
+/// parameters with HTTP 400 (OpenAI-spec ranges: `temperature` in [0, 2],
+/// `top_p` in [0, 1]) instead of silently accepting/clamping. NaN rejected.
+fn validate_sampler_ranges(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+) -> Result<(), ServerError> {
+    if let Some(t) = temperature {
+        if !t.is_finite() || !(0.0..=2.0).contains(&t) {
+            return Err(ServerError::bad_request_field(
+                "temperature must be between 0 and 2",
+                "temperature",
+                "invalid_value",
+            ));
+        }
+    }
+    if let Some(p) = top_p {
+        if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+            return Err(ServerError::bad_request_field(
+                "top_p must be between 0 and 1",
+                "top_p",
+                "invalid_value",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_stop_field(v: Option<Value>) -> Vec<String> {
@@ -204,57 +369,57 @@ fn parse_stop_field(v: Option<Value>) -> Vec<String> {
 /// custom tokenizer with `apply_chat_template`, the worker can override
 /// this in a later iteration.
 ///
-/// emit the canonical Qwen3.5 `enable_thinking=false` empty-think
-/// tail (`<think>\n\n</think>\n\n`) so server output matches the CLI's
-/// post- chat template. Previously the wire layer ended the prompt
-/// at `<|im_start|>assistant\n` with no think block, causing Qwen3.5 to
-/// either enter open-think metacommentary (gen budget burn) OR diverge from
-/// the CLI's enable_thinking=false canonical pattern. The closed empty-think
-/// tail is a no-op for non-Qwen3.5 ChatML models that do not treat
+/// Emit the Qwen3.5 assistant prompt tail selected by `enable_thinking`:
+/// the closed empty-think tail (`<think>\n\n</think>\n\n`) when `false` so the
+/// model answers directly (matching the CLI's `enable_thinking=false` chat
+/// template), or the OPEN `<think>\n` tail when `true` so the model emits a
+/// reasoning trace (surfaced as `reasoning_content` by the
+/// [`crate::sse::SseSafeEmitter`]). The open/closed string is chosen by the
+/// single shared [`lumen_runtime::runtime_defaults::think_prompt_tail`] helper
+/// so the CLI, OpenAI, and Anthropic surfaces cannot drift.
+///
+/// The tail is a no-op for non-Qwen3.5 ChatML models that do not treat
 /// `<think>`/`</think>` as special tokens — they render as literal text and
 /// are stripped by the wire layer's StopMatcher / SseSafeEmitter only on
 /// Qwen3.5 (because only Qwen3.5's special-token map contains them).
-fn render_chat_prompt(messages: &[ChatMessage], tools: &[ToolDef]) -> Result<String, ServerError> {
+fn render_chat_prompt(
+    messages: &[ChatMessage],
+    tools: &[ToolDef],
+    enable_thinking: bool,
+) -> Result<String, ServerError> {
     let mut system: Option<String> = None;
     let mut transcript = String::new();
     for m in messages.iter() {
-        // ROBUST-007: `content` must be a string or a content-parts array (or
-        // null). A bare number/bool would otherwise be silently coerced by
-        // `content_to_string`'s `other => to_string()` arm and accepted (HTTP
-        // 200); OpenAI requires string|array, so reject it as a 400 instead.
-        match &m.content {
-            Value::String(_) | Value::Array(_) | Value::Null => {}
-            _ => {
-                return Err(ServerError::bad_request_field(
-                    "message 'content' must be a string or a content-parts array",
-                    "messages.content",
-                    "invalid_type",
-                ))
-            }
-        }
+        // `flatten_content` enforces the ROBUST-007 numeric-type-guard (a bare
+        // number/bool `content` 400s instead of being coerced) AND flattens
+        // content-parts via the single shared key set — the SAME helper the
+        // Anthropic surface uses, so the two cannot diverge.
         match m.role.as_str() {
-            "system" => system = Some(content_to_string(&m.content)),
+            "system" => system = Some(super::flatten_content(&m.content, "messages.content")?),
             "user" => {
                 transcript.push_str("<|im_start|>user\n");
-                transcript.push_str(&content_to_string(&m.content));
+                transcript.push_str(&super::flatten_content(&m.content, "messages.content")?);
                 transcript.push_str("<|im_end|>\n");
             }
             "assistant" => {
                 transcript.push_str("<|im_start|>assistant\n");
-                transcript.push_str(&content_to_string(&m.content));
+                transcript.push_str(&super::flatten_content(&m.content, "messages.content")?);
+                // Tool calls render through the shared tooling helper so the
+                // assistant tool-call transcript is byte-identical to the one
+                // the Anthropic surface emits for an equivalent round-trip.
                 for tc in &m.tool_calls {
-                    transcript.push_str("\n<tool_call>\n{\"name\": \"");
-                    transcript.push_str(&tc.function.name);
-                    transcript.push_str("\", \"arguments\": ");
-                    transcript.push_str(&tc.function.arguments);
-                    transcript.push_str("}\n</tool_call>");
+                    transcript.push_str(&lumen_runtime::tooling::render_assistant_tool_call_segment(
+                        &tc.function.name,
+                        &tc.function.arguments,
+                    ));
                 }
                 transcript.push_str("<|im_end|>\n");
             }
             "tool" => {
-                transcript.push_str("<|im_start|>user\n<tool_response>\n");
-                transcript.push_str(&content_to_string(&m.content));
-                transcript.push_str("\n</tool_response><|im_end|>\n");
+                // Shared tool-response turn (single source of truth in tooling).
+                transcript.push_str(&lumen_runtime::tooling::render_tool_response_turn(
+                    &super::flatten_content(&m.content, "messages.content")?,
+                ));
             }
             other => {
                 return Err(ServerError::bad_request_field(
@@ -284,29 +449,14 @@ fn render_chat_prompt(messages: &[ChatMessage], tools: &[ToolDef]) -> Result<Str
         prompt.push_str("<|im_end|>\n");
     }
     prompt.push_str(&transcript);
-    prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    // Open vs closed `<think>` tail comes from the single shared resolver/
+    // helper (see `ChatCompletionRequest::resolve_thinking`). The former
+    // OpenAI-only inline `LUMEN_CHAT_ENABLE_THINKING == "1"` check is GONE —
+    // the env override now lives in `resolve_enable_thinking` so the CLI and
+    // both wire formats honour it identically.
+    prompt.push_str("<|im_start|>assistant\n");
+    prompt.push_str(lumen_runtime::runtime_defaults::think_prompt_tail(enable_thinking));
     Ok(prompt)
-}
-
-fn content_to_string(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Array(arr) => {
-            let mut out = String::new();
-            for piece in arr {
-                if let Some(s) = piece.as_str() {
-                    out.push_str(s);
-                } else if let Some(obj) = piece.as_object() {
-                    if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                        out.push_str(text);
-                    }
-                }
-            }
-            out
-        }
-        Value::Null => String::new(),
-        other => other.to_string(),
-    }
 }
 
 // ----------------------------- SSE streaming chat ------------------------
@@ -336,15 +486,28 @@ fn body_from_byte_stream(rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> Body {
     Body::from_stream(stream)
 }
 
-pub fn stream_chat(rx: JobResponseChannel, model: String, created: u64) -> Body {
+pub fn stream_chat(
+    rx: JobResponseChannel,
+    model: String,
+    created: u64,
+    thinking: bool,
+    stop: Vec<String>,
+) -> Body {
     let (tx, body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    tokio::spawn(drive_chat_stream(rx, tx, model, created, true));
+    tokio::spawn(drive_chat_stream(rx, tx, model, created, true, thinking, stop));
     body_from_byte_stream(body_rx)
 }
 
-pub fn stream_completion(rx: JobResponseChannel, model: String, created: u64) -> Body {
+pub fn stream_completion(
+    rx: JobResponseChannel,
+    model: String,
+    created: u64,
+    stop: Vec<String>,
+) -> Body {
     let (tx, body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    tokio::spawn(drive_chat_stream(rx, tx, model, created, false));
+    // Legacy completions have no chat template / `<think>` block: thinking is
+    // always off, so the emitter's reasoning stage is a passthrough.
+    tokio::spawn(drive_chat_stream(rx, tx, model, created, false, false, stop));
     body_from_byte_stream(body_rx)
 }
 
@@ -354,10 +517,19 @@ async fn drive_chat_stream(
     model: String,
     created: u64,
     chat: bool,
+    thinking: bool,
+    stop: Vec<String>,
 ) {
     let id = format!("chatcmpl-lumen-{created:x}-{:x}", super::next_response_seq());
-    let mut emitter = SseSafeEmitter::new();
-    let mut stop_matcher = StopMatcher::new(Vec::new());
+    let mut emitter = SseSafeEmitter::new(thinking);
+    // F4: seed the streaming stop matcher from the request stop list. The
+    // worker already truncates generation at the stop string (and reports
+    // `FinishReason::StopSequence`, which it forwards via `TokenEvent::Done`);
+    // this wire-side matcher is the redundant safety net that strips any stop
+    // bytes the worker forwarded and keeps the OpenAI semantics (matched bytes
+    // never reach the client). When `stop` is empty the matcher passes every
+    // fragment through verbatim — byte-identical.
+    let mut stop_matcher = StopMatcher::new(stop);
     let mut finish_reason: Option<FinishReason> = None;
     let mut tool_call_index = 0usize;
     let mut emitted_any_tool_call = false;
@@ -384,6 +556,27 @@ async fn drive_chat_stream(
             TokenEvent::PrefillDone { .. } => {}
             TokenEvent::Token { delta_text, .. } => {
                 let delta = emitter.push(&delta_text);
+                // Reasoning trace (chat only): emit `delta.reasoning_content`
+                // chunks BEFORE answer content. The trace bypasses the stop
+                // matcher (stop sequences apply to the answer, not the trace).
+                // `delta.reasoning` is always empty when thinking is off, so
+                // this block never fires on the default path.
+                if chat && !delta.reasoning.is_empty() {
+                    let frame = json!({
+                        "id": id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": { "reasoning_content": delta.reasoning },
+                            "finish_reason": null
+                        }],
+                    });
+                    if tx.send(sse_frame(&frame.to_string())).await.is_err() {
+                        return;
+                    }
+                }
                 let (safe_text, hit_stop) = stop_matcher.push(&delta.text);
                 if !safe_text.is_empty() {
                     let frame = if chat {
@@ -446,7 +639,10 @@ async fn drive_chat_stream(
                     }
                 }
                 if hit_stop {
-                    finish_reason = Some(FinishReason::Stop);
+                    // Wire-side stop (redundant safety net; the worker normally
+                    // hits it first and sends Done{StopSequence}). Report
+                    // StopSequence so OpenAI renders "stop".
+                    finish_reason = Some(FinishReason::StopSequence);
                     break;
                 }
             }
@@ -464,7 +660,44 @@ async fn drive_chat_stream(
     }
 
     let (residual, _incomplete) = emitter.finish();
-    if !residual.text.is_empty() {
+    // Flush any residual reasoning trace (chat only) before the residual
+    // answer text. Empty on the thinking-off default path.
+    if chat && !residual.reasoning.is_empty() {
+        let frame = json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": { "reasoning_content": residual.reasoning },
+                "finish_reason": null
+            }],
+        });
+        if tx.send(sse_frame(&frame.to_string())).await.is_err() {
+            return;
+        }
+    }
+    // Residual ANSWER text. Once a stop sequence has fired, EVERYTHING from the
+    // stop onward is dropped — including any tail the emitter was still holding
+    // (which is post-stop content) — so we skip the residual entirely in that
+    // case. Otherwise route the emitter residual through the stop matcher (a
+    // stop could straddle the emitter's held tail) and drain the matcher. With
+    // an empty stop list this is `(residual.text, "")`: byte-identical.
+    let stopped_by_sequence = finish_reason == Some(FinishReason::StopSequence);
+    let final_content = if stopped_by_sequence {
+        String::new()
+    } else {
+        let (residual_safe, _residual_hit) = if stop_matcher.is_active() {
+            stop_matcher.push(&residual.text)
+        } else {
+            (residual.text.clone(), false)
+        };
+        let mut c = residual_safe;
+        c.push_str(&stop_matcher.finish());
+        c
+    };
+    if !final_content.is_empty() {
         let frame = if chat {
             json!({
                 "id": id,
@@ -473,7 +706,7 @@ async fn drive_chat_stream(
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "delta": { "content": residual.text },
+                    "delta": { "content": final_content },
                     "finish_reason": null
                 }],
             })
@@ -485,7 +718,7 @@ async fn drive_chat_stream(
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "text": residual.text,
+                    "text": final_content,
                     "finish_reason": null,
                 }],
             })
@@ -534,10 +767,17 @@ pub async fn collect_chat(
     mut rx: JobResponseChannel,
     model: String,
     created: u64,
+    thinking: bool,
+    stop: Vec<String>,
 ) -> Result<Value, ServerError> {
-    let mut emitter = SseSafeEmitter::new();
-    let mut stop_matcher = StopMatcher::new(Vec::new());
+    let mut emitter = SseSafeEmitter::new(thinking);
+    // F4: seed from the request stop list (see `drive_chat_stream`). Empty =>
+    // verbatim passthrough, byte-identical to the pre-F4 response.
+    let mut stop_matcher = StopMatcher::new(stop);
     let mut content = String::new();
+    // Reasoning trace accumulated separately from `content`; surfaced as
+    // `reasoning_content` (omitted when empty, i.e. on the thinking-off path).
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut prompt_tokens = 0usize;
     let mut completion_tokens = 0usize;
@@ -548,6 +788,7 @@ pub async fn collect_chat(
             TokenEvent::PrefillDone { .. } => {}
             TokenEvent::Token { delta_text, .. } => {
                 let delta = emitter.push(&delta_text);
+                reasoning.push_str(&delta.reasoning);
                 let (safe_text, hit_stop) = stop_matcher.push(&delta.text);
                 content.push_str(&safe_text);
                 for tc in delta.tool_calls {
@@ -561,6 +802,8 @@ pub async fn collect_chat(
                     }));
                 }
                 if hit_stop {
+                    // Wire-side stop match -> StopSequence (renders OpenAI "stop").
+                    finish = FinishReason::StopSequence;
                     break;
                 }
             }
@@ -570,17 +813,32 @@ pub async fn collect_chat(
                 completion_tokens = c;
                 break;
             }
-            TokenEvent::Error(msg) => return Err(ServerError::Runtime(msg)),
+            // Classify: an oversize / empty-prompt runtime error from the
+            // worker is a client 400 (context_length_exceeded), not a 500.
+            TokenEvent::Error(msg) => return Err(ServerError::classify_runtime(msg)),
         }
     }
     let (residual, _) = emitter.finish();
-    content.push_str(&residual.text);
+    reasoning.push_str(&residual.reasoning);
+    // Once a stop sequence fired, drop the residual answer text (post-stop
+    // content). Otherwise pass the emitter residual through the stop matcher
+    // (catches a stop straddling the emitter's held tail) and drain it. Empty
+    // stop => appends `residual.text` verbatim + nothing, byte-identical.
+    if finish != FinishReason::StopSequence {
+        let (residual_safe, _) = if stop_matcher.is_active() {
+            stop_matcher.push(&residual.text)
+        } else {
+            (residual.text.clone(), false)
+        };
+        content.push_str(&residual_safe);
+        content.push_str(&stop_matcher.finish());
+    }
 
     if !tool_calls.is_empty() && finish == FinishReason::Stop {
         finish = FinishReason::ToolCalls;
     }
 
-    let msg = if tool_calls.is_empty() {
+    let mut msg = if tool_calls.is_empty() {
         json!({ "role": "assistant", "content": content })
     } else {
         json!({
@@ -589,6 +847,13 @@ pub async fn collect_chat(
             "tool_calls": tool_calls,
         })
     };
+    // Attach the reasoning trace as `reasoning_content`, OMITTED when empty so
+    // the thinking-off default response is byte-identical to before.
+    if !reasoning.is_empty() {
+        if let Value::Object(ref mut map) = msg {
+            map.insert("reasoning_content".to_string(), Value::String(reasoning));
+        }
+    }
     Ok(json!({
         "id": format!("chatcmpl-lumen-{created:x}-{:x}", super::next_response_seq()),
         "object": "chat.completion",
@@ -615,11 +880,27 @@ pub async fn collect_chat(
 /// wraps the raw `mpsc::Receiver` in an unpooled `PooledReceiver`
 /// (pool=None) so the test helper's signature matches the real
 /// `collect_chat` (which now expects `JobResponseChannel`).
+/// `thinking` selects whether the emitter splits a `<think>` trace into
+/// `reasoning_content` (mirrors a request with `enable_thinking=true`).
 #[cfg(any(test, doctest))]
 pub async fn collect_chat_from_events(
     events: Vec<TokenEvent>,
     model: String,
     created: u64,
+    thinking: bool,
+) -> Result<Value, ServerError> {
+    collect_chat_from_events_with_stop(events, model, created, thinking, Vec::new()).await
+}
+
+/// `collect_chat_from_events` with an explicit stop list, so F4 stop-truncation
+/// tests can exercise the seeded wire-side matcher without a live engine.
+#[cfg(any(test, doctest))]
+pub async fn collect_chat_from_events_with_stop(
+    events: Vec<TokenEvent>,
+    model: String,
+    created: u64,
+    thinking: bool,
+    stop: Vec<String>,
 ) -> Result<Value, ServerError> {
     let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
     let return_sender = tx.clone();
@@ -630,16 +911,19 @@ pub async fn collect_chat_from_events(
     // test helper; no cancellation guard needed (no live
     // worker, no client-disconnect path).
     let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
-    collect_chat(pooled, model, created).await
+    collect_chat(pooled, model, created, thinking, stop).await
 }
 
 pub async fn collect_completion(
     mut rx: JobResponseChannel,
     model: String,
     created: u64,
+    stop: Vec<String>,
 ) -> Result<Value, ServerError> {
-    let mut emitter = SseSafeEmitter::new();
-    let mut stop_matcher = StopMatcher::new(Vec::new());
+    // Legacy completions have no `<think>` block: thinking off (passthrough).
+    let mut emitter = SseSafeEmitter::new(false);
+    // F4: seed from the request stop list. Empty => verbatim, byte-identical.
+    let mut stop_matcher = StopMatcher::new(stop);
     let mut text = String::new();
     let mut prompt_tokens = 0usize;
     let mut completion_tokens = 0usize;
@@ -653,6 +937,8 @@ pub async fn collect_completion(
                 let (safe_text, hit_stop) = stop_matcher.push(&delta.text);
                 text.push_str(&safe_text);
                 if hit_stop {
+                    // Wire-side stop match -> StopSequence (renders OpenAI "stop").
+                    finish = FinishReason::StopSequence;
                     break;
                 }
             }
@@ -662,11 +948,21 @@ pub async fn collect_completion(
                 completion_tokens = c;
                 break;
             }
-            TokenEvent::Error(msg) => return Err(ServerError::Runtime(msg)),
+            // Classify: an oversize / empty-prompt runtime error from the
+            // worker is a client 400 (context_length_exceeded), not a 500.
+            TokenEvent::Error(msg) => return Err(ServerError::classify_runtime(msg)),
         }
     }
     let (residual, _) = emitter.finish();
-    text.push_str(&residual.text);
+    if finish != FinishReason::StopSequence {
+        let (residual_safe, _) = if stop_matcher.is_active() {
+            stop_matcher.push(&residual.text)
+        } else {
+            (residual.text.clone(), false)
+        };
+        text.push_str(&residual_safe);
+        text.push_str(&stop_matcher.finish());
+    }
 
     Ok(json!({
         "id": format!("cmpl-lumen-{created:x}-{:x}", super::next_response_seq()),
@@ -708,7 +1004,7 @@ mod tests {
                 completion_tokens: 12,
             },
         ];
-        let resp = collect_chat_from_events(events, "test-model".into(), 1234).await.unwrap();
+        let resp = collect_chat_from_events(events, "test-model".into(), 1234, false).await.unwrap();
         // Tool calls present -> finish_reason becomes tool_calls automatically.
         assert_eq!(resp["choices"][0]["finish_reason"], "tool_calls");
         let tcs = &resp["choices"][0]["message"]["tool_calls"];
@@ -733,7 +1029,7 @@ mod tests {
                 completion_tokens: 2,
             },
         ];
-        let resp = collect_chat_from_events(events, "test".into(), 1).await.unwrap();
+        let resp = collect_chat_from_events(events, "test".into(), 1, false).await.unwrap();
         let content = resp["choices"][0]["message"]["content"].as_str().unwrap();
         // The literal "<tool" must not appear in user-visible content.
         assert!(!content.contains("<tool"));
@@ -750,14 +1046,126 @@ mod tests {
                 completion_tokens: 5,
             },
         ];
-        let resp = collect_chat_from_events(events, "test".into(), 1).await.unwrap();
+        let resp = collect_chat_from_events(events, "test".into(), 1, false).await.unwrap();
         assert_eq!(resp["choices"][0]["finish_reason"], "length");
+    }
+
+    // ---- F4: wire-side stop matcher seeding (non-streaming chat) ----
+
+    /// A seeded stop matcher strips the matched bytes (and everything after) and
+    /// renders `finish_reason:"stop"`. Models the case where the worker forwarded
+    /// text containing the stop (the wire net catches it); the worker's own
+    /// truncation is covered by the engine-direct integration tests.
+    #[tokio::test]
+    async fn collect_chat_wire_stop_truncates_and_reports_stop() {
+        let events = vec![
+            tok("keep this STOP drop this"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: 1,
+                completion_tokens: 9,
+            },
+        ];
+        let resp = collect_chat_from_events_with_stop(
+            events,
+            "test".into(),
+            1,
+            false,
+            vec!["STOP".into()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["choices"][0]["message"]["content"], "keep this ");
+        // Wire-side stop overrides the worker's Length: a matched stop string wins.
+        assert_eq!(resp["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// EMPTY stop list => the seeded matcher is inert and the content is the full
+    /// text byte-for-byte, with the worker's finish reason untouched. This is the
+    /// wire-layer mirror of the engine-direct byte-identity invariant.
+    #[tokio::test]
+    async fn collect_chat_wire_empty_stop_is_byte_identical() {
+        let full = "keep this STOP drop this";
+        let events = vec![
+            tok(full),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: 1,
+                completion_tokens: 9,
+            },
+        ];
+        // Same events, empty stop list.
+        let resp = collect_chat_from_events_with_stop(events, "test".into(), 1, false, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp["choices"][0]["message"]["content"], full,
+            "empty stop must pass the full text through verbatim"
+        );
+        assert_eq!(resp["choices"][0]["finish_reason"], "length");
+    }
+
+    /// Post-stop content the EMITTER might hold (a trailing `<` that looks like a
+    /// possible `<tool_call>` prefix) must NOT leak after a stop hit. Guards the
+    /// residual-drop rule in `collect_chat`.
+    #[tokio::test]
+    async fn collect_chat_wire_no_post_stop_residual_leak() {
+        let events = vec![
+            // The whole answer arrives in one delta; "STOP" is mid-string and the
+            // text ends with a `<` that the emitter would otherwise hold back.
+            tok("visible STOP hidden <"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: 1,
+                completion_tokens: 4,
+            },
+        ];
+        let resp = collect_chat_from_events_with_stop(
+            events,
+            "test".into(),
+            1,
+            false,
+            vec!["STOP".into()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resp["choices"][0]["message"]["content"], "visible ",
+            "no post-stop bytes (not even an emitter-held trailing '<') may leak"
+        );
+        assert_eq!(resp["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// A stop that straddles two token deltas is still caught by the wire matcher
+    /// (window buffering), proving the seeded matcher handles split fragments.
+    #[tokio::test]
+    async fn collect_chat_wire_stop_straddles_token_deltas() {
+        let events = vec![
+            tok("alpha ST"),
+            tok("OP omega"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: 1,
+                completion_tokens: 4,
+            },
+        ];
+        let resp = collect_chat_from_events_with_stop(
+            events,
+            "test".into(),
+            1,
+            false,
+            vec!["STOP".into()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["choices"][0]["message"]["content"], "alpha ");
+        assert_eq!(resp["choices"][0]["finish_reason"], "stop");
     }
 
     #[tokio::test]
     async fn collect_chat_passes_through_error_event() {
         let events = vec![TokenEvent::Error("model exploded".into())];
-        let r = collect_chat_from_events(events, "test".into(), 1).await;
+        let r = collect_chat_from_events(events, "test".into(), 1, false).await;
         assert!(r.is_err());
     }
 
@@ -796,9 +1204,11 @@ mod tests {
     }
 
     #[test]
-    fn render_chat_prompt_user_only_emits_closed_think() {
+    fn render_chat_prompt_user_only_emits_closed_think_when_disabled() {
+        // enable_thinking=false (the default) MUST emit the closed empty-think
+        // tail, byte-identical to the pre-reasoning-control behaviour.
         let messages = vec![user_msg("Hello")];
-        let out = render_chat_prompt(&messages, &[]).unwrap();
+        let out = render_chat_prompt(&messages, &[], false).unwrap();
         // CLI's `apply_chat_template_with_system("Hello", None)` for qwen35
         // post- produces exactly this string (see crates/lumen-cli
         // /src/tokenize.rs:273-292).
@@ -808,13 +1218,33 @@ mod tests {
     }
 
     #[test]
-    fn render_chat_prompt_system_plus_user_emits_closed_think() {
+    fn render_chat_prompt_user_only_emits_open_think_when_enabled() {
+        // enable_thinking=true MUST emit the OPEN `<think>\n` tail so the
+        // model produces a reasoning trace.
+        let messages = vec![user_msg("Hello")];
+        let out = render_chat_prompt(&messages, &[], true).unwrap();
+        let expected = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        assert_eq!(out, expected, "render_chat_prompt user-only enabled != open think tail");
+    }
+
+    #[test]
+    fn render_chat_prompt_system_plus_user_emits_closed_think_when_disabled() {
         let messages = vec![system_msg("You are helpful."), user_msg("Hi")];
-        let out = render_chat_prompt(&messages, &[]).unwrap();
+        let out = render_chat_prompt(&messages, &[], false).unwrap();
         let expected = "<|im_start|>system\nYou are helpful.<|im_end|>\n\
                         <|im_start|>user\nHi<|im_end|>\n\
                         <|im_start|>assistant\n<think>\n\n</think>\n\n";
         assert_eq!(out, expected, "render_chat_prompt system+user != CLI output");
+    }
+
+    #[test]
+    fn render_chat_prompt_system_plus_user_emits_open_think_when_enabled() {
+        let messages = vec![system_msg("You are helpful."), user_msg("Hi")];
+        let out = render_chat_prompt(&messages, &[], true).unwrap();
+        let expected = "<|im_start|>system\nYou are helpful.<|im_end|>\n\
+                        <|im_start|>user\nHi<|im_end|>\n\
+                        <|im_start|>assistant\n<think>\n";
+        assert_eq!(out, expected, "render_chat_prompt system+user enabled != open think tail");
     }
 
     #[test]
@@ -827,7 +1257,7 @@ mod tests {
             assistant_msg("A1"),
             user_msg("Q2"),
         ];
-        let out = render_chat_prompt(&messages, &[]).unwrap();
+        let out = render_chat_prompt(&messages, &[], false).unwrap();
         let expected = "<|im_start|>user\nQ1<|im_end|>\n\
                         <|im_start|>assistant\nA1<|im_end|>\n\
                         <|im_start|>user\nQ2<|im_end|>\n\
@@ -846,12 +1276,174 @@ mod tests {
         // (The unit test in tokenize.rs guards the CLI side; this guards
         // the server side; they must produce byte-identical strings.)
         let messages = vec![user_msg("Hello")];
-        let server_out = render_chat_prompt(&messages, &[]).unwrap();
+        let server_out = render_chat_prompt(&messages, &[], false).unwrap();
         let cli_out = format!(
             "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
             prompt = "Hello"
         );
         assert_eq!(server_out, cli_out, "server render must match CLI render byte-for-byte");
+    }
+
+    // ---- reasoning_content extraction (non-stream collect_chat) ----
+
+    #[tokio::test]
+    async fn collect_chat_thinking_off_has_no_reasoning_content() {
+        // Byte-identity guard: thinking off => the message has NO
+        // reasoning_content key even if the model literally emits </think>.
+        let events = vec![
+            tok("plain answer </think> still answer"),
+            TokenEvent::Done { finish_reason: FinishReason::Stop, prompt_tokens: 1, completion_tokens: 4 },
+        ];
+        let resp = collect_chat_from_events(events, "test".into(), 1, false).await.unwrap();
+        let msg = &resp["choices"][0]["message"];
+        assert!(msg.get("reasoning_content").is_none(), "no reasoning_content when thinking off");
+        assert_eq!(msg["content"], "plain answer </think> still answer");
+    }
+
+    #[tokio::test]
+    async fn collect_chat_thinking_on_splits_reasoning_content() {
+        let events = vec![
+            tok("let me think"),
+            tok(" carefully</think>The answer is 42."),
+            TokenEvent::Done { finish_reason: FinishReason::Stop, prompt_tokens: 1, completion_tokens: 6 },
+        ];
+        let resp = collect_chat_from_events(events, "test".into(), 1, true).await.unwrap();
+        let msg = &resp["choices"][0]["message"];
+        assert_eq!(msg["reasoning_content"], "let me think carefully");
+        assert_eq!(msg["content"], "The answer is 42.");
+    }
+
+    // ---- F5: standard sampler params accepted (no 400) + reach SamplingParams ----
+
+    #[test]
+    fn chat_request_with_sampler_params_deserializes_not_400() {
+        // Previously these fields tripped `deny_unknown_fields` -> HTTP 400.
+        // They must now deserialize cleanly onto the DTO.
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_p": 0.9,
+            "top_k": 40,
+            "min_p": 0.05,
+            "presence_penalty": 0.5,
+            "frequency_penalty": 0.7
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(body)
+            .expect("sampler params must deserialize, not 400");
+        assert_eq!(req.top_p, Some(0.9));
+        assert_eq!(req.top_k, Some(40));
+        assert_eq!(req.min_p, Some(0.05));
+        assert_eq!(req.presence_penalty, Some(0.5));
+        assert_eq!(req.frequency_penalty, Some(0.7));
+    }
+
+    #[tokio::test]
+    async fn chat_sampler_params_reach_sampling_params_via_into_job() {
+        let engine = EngineHandle::new_for_test(4096);
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_p": 0.9, "top_k": 40, "min_p": 0.05,
+            "presence_penalty": 0.5, "frequency_penalty": 0.7
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let job = req.into_job(&engine).unwrap();
+        assert_eq!(job.sampling.top_p, Some(0.9));
+        assert_eq!(job.sampling.top_k, Some(40));
+        assert_eq!(job.sampling.min_p, Some(0.05));
+        assert_eq!(job.sampling.presence_penalty, Some(0.5));
+        // A supplied non-zero frequency_penalty OVERRIDES the diag default.
+        assert_eq!(job.sampling.frequency_penalty, Some(0.7));
+    }
+
+    #[tokio::test]
+    async fn chat_all_zero_penalties_normalize_to_default_path() {
+        // CLI parity: presence/frequency == 0.0 -> None (no-op). The all-zero
+        // request must be byte-identical to omitting the fields: presence_penalty
+        // None, frequency_penalty == the server-internal diag default.
+        let engine = EngineHandle::new_for_test(4096);
+        let zero_body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "presence_penalty": 0.0, "frequency_penalty": 0.0
+        });
+        let omitted_body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let zero_req: ChatCompletionRequest = serde_json::from_value(zero_body).unwrap();
+        let omitted_req: ChatCompletionRequest = serde_json::from_value(omitted_body).unwrap();
+        let zero_job = zero_req.into_job(&engine).unwrap();
+        let omitted_job = omitted_req.into_job(&engine).unwrap();
+        assert_eq!(zero_job.sampling.presence_penalty, None, "zero presence -> None");
+        assert_eq!(
+            zero_job.sampling.frequency_penalty, omitted_job.sampling.frequency_penalty,
+            "all-zero freq penalty must equal the omitted (diag-default) path"
+        );
+        assert_eq!(zero_job.sampling.top_p, None);
+        assert_eq!(zero_job.sampling.top_k, None);
+    }
+
+    #[test]
+    fn completion_request_with_sampler_params_deserializes_not_400() {
+        let body = serde_json::json!({
+            "model": "m",
+            "prompt": "hi",
+            "top_p": 0.8, "presence_penalty": 0.3, "frequency_penalty": 0.4
+        });
+        let req: CompletionRequest = serde_json::from_value(body)
+            .expect("completion sampler params must deserialize, not 400");
+        assert_eq!(req.top_p, Some(0.8));
+        assert_eq!(req.presence_penalty, Some(0.3));
+        assert_eq!(req.frequency_penalty, Some(0.4));
+    }
+
+    #[test]
+    fn unknown_field_still_400s_deny_unknown_fields_intact() {
+        // Guard: adding the sampler fields must NOT loosen deny_unknown_fields.
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "definitely_not_a_field": 1
+        });
+        let r: Result<ChatCompletionRequest, _> = serde_json::from_value(body);
+        assert!(r.is_err(), "unknown top-level field must still be rejected");
+    }
+
+    // ---- F16(b): synchronous oversize-prompt guard returns 400 in into_job ----
+
+    #[tokio::test]
+    async fn chat_oversize_prompt_returns_400_before_submit() {
+        // context_length is tiny; the IdentityByteTokenizer maps 1 byte -> 1
+        // token, so a long content overflows it. into_job must 400 (NOT 500,
+        // NOT 200) BEFORE any stream/submit.
+        let engine = EngineHandle::new_for_test(8);
+        let long = "x".repeat(500);
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": long}]
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let err = req.into_job(&engine).expect_err("oversize prompt must 400");
+        match err {
+            ServerError::BadRequest { code, message, .. } => {
+                assert_eq!(code.as_deref(), Some("context_length_exceeded"));
+                assert!(message.contains("max_seq_len is"), "msg carries the sentinel: {message}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_within_context_length_is_ok() {
+        // A short prompt under the window must NOT be rejected by the guard.
+        let engine = EngineHandle::new_for_test(4096);
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        assert!(req.into_job(&engine).is_ok(), "short prompt must pass the guard");
     }
 }
 

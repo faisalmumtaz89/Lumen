@@ -53,6 +53,13 @@ pub const DEQUANT_Q8_0_KERNEL_SOURCE: &str = include_str!("dequant_q8_0_f16.cu")
 /// kernel. Default OFF preserves byte-identical behaviour vs main.
 pub const MMQ_Q8_0_KERNEL_SOURCE: &str = include_str!("mmq_q8_0.cu");
 
+/// q4-specific MMQ twin of `MMQ_Q8_0_KERNEL_SOURCE`: Q4_0 weights x
+/// per-token-INT8-quantized activation via dp4a (de-interleaved nibbles + -8
+/// zero-point), matching llama.cpp `mul_mat_q` INT4 numerics for MoE q4
+/// prefill projections. Default OFF; MoE-gated. Two extern "C" kernels:
+/// `mmq_q4_0_batched` and `mmq_q4_0_batched_residual`.
+pub const MMQ_Q4_0_KERNEL_SOURCE: &str = include_str!("mmq_q4_0.cu");
+
 /// Q8_1-activation x {Q8_0,Q4_0}-weight matvec with dp4a INT8
 /// dot-product, plus the `quantize_q8_1` activation pre-pass.
 ///

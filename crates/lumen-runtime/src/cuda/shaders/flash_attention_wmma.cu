@@ -651,6 +651,584 @@ extern "C" __global__ void flash_attention_wmma(
     }
 }
 
+// =================================================================
+// PRECISION-LOCALIZATION + FIX VARIANTS (WMMA-PRECISION-FIX-RCA)
+//
+// These kernels share the helper functions above. They exist to (a) localize
+// WHETHER the token-flipping F16 precision loss is in the QK^T operands or the
+// P@V operands, and (b) provide the candidate faithful fix that stays on tensor
+// cores. Dispatched via env from Rust (no-op when unset); diagnostic-only until
+// the user's gate.
+//
+//   flash_attention_wmma_qkf32 : QK^T in scalar F32 (exact), P@V in WMMA-F16.
+//                                Isolates hypothesis H1 (QK^T operand mantissa).
+//   flash_attention_wmma_pvf32 : QK^T in WMMA-F16, P@V in scalar F32 (exact).
+//                                Isolates hypothesis H2 (P operand mantissa).
+//   flash_attention_wmma_split : the FIX — error-free split-F16 (hi+lo) operands
+//                                for BOTH QK^T and P@V, recovering ~20-bit
+//                                mantissa while staying on tensor cores.
+//
+// Error-free F16 split (Markidis / Dekker-style for tensor cores):
+//   For an F32 value x:  hi = f16(x);  lo = f16(x - f32(hi))
+//   Then  x ≈ f32(hi) + f32(lo)  with ~20 effective mantissa bits.
+//   A @ B = (Ahi+Alo) @ (Bhi+Blo) = Ahi@Bhi + Ahi@Blo + Alo@Bhi  (+ Alo@Blo, dropped)
+//   The dropped Alo@Blo term is ~2^-20 relative — far below the ~6.5-nat error.
+//   QK^T uses 3 MMAs per k-chunk (vs 1); P@V likewise. Cost ~3x F16-WMMA FLOPs,
+//   still >> scalar throughput because it stays on the tensor-core datapath.
+// =================================================================
+
+// Split an F32 value into hi/lo F16 halves (error-free transform).
+__device__ __forceinline__ void f32_split_f16(float x, half_raw& hi, half_raw& lo) {
+    hi = f32_to_f16(x);
+    float r = x - f16_to_f32(hi);
+    lo = f32_to_f16(r);
+}
+
+// -----------------------------------------------------------------
+// Variant: QK^T exact (scalar F32), P@V on tensor cores (F16).
+// Identical structure to flash_attention_wmma except Phase 2 computes
+// S = Q@K^T with full F32 scalar dot products (Q is NOT pre-truncated to F16).
+// -----------------------------------------------------------------
+extern "C" __global__ void flash_attention_wmma_qkf32(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
+    unsigned int batch,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int pos_start,
+    unsigned int max_seq_len,
+    float scale)
+{
+    unsigned int head = blockIdx.x;
+    unsigned int q_tile_idx = blockIdx.y;
+    if (head >= num_heads) return;
+
+    unsigned int tid = threadIdx.x;
+    unsigned int warp_id = tid >> 5;
+    unsigned int lane = tid & 31u;
+
+    unsigned int gqa_ratio = num_heads / num_kv_heads;
+    unsigned int kv_h = head / gqa_ratio;
+
+    unsigned int q_row_start = q_tile_idx * FA_TC_BR;
+    if (q_row_start >= batch) return;
+    unsigned int q_row_end = q_row_start + FA_TC_BR;
+    if (q_row_end > batch) q_row_end = batch;
+    unsigned int num_q_rows = q_row_end - q_row_start;
+
+    unsigned int q_dim = num_heads * head_dim;
+    unsigned int kv_stride = max_seq_len * head_dim;
+    const float* k_base = K + (unsigned long long)kv_h * kv_stride;
+    const float* v_base = V + (unsigned long long)kv_h * kv_stride;
+
+    // Shared mem: Q_f32[BR*hd], K_f32[BC*hd], S[BR*BC], P_f16[BR*BC],
+    //             V_f16[BC*hd], O_acc[BR*hd], rowmax[BR], rowsum[BR]
+    extern __shared__ char smem_raw[];
+    float* Q_f32 = (float*)smem_raw;
+    float* K_f32 = Q_f32 + FA_TC_BR * head_dim;
+    float* S_sh  = K_f32 + FA_TC_BC * head_dim;
+    half_raw* P_sh = (half_raw*)(S_sh + FA_TC_BR * FA_TC_BC);
+    half_raw* V_sh = P_sh + FA_TC_BR * FA_TC_BC;
+    float* O_acc = (float*)(V_sh + FA_TC_BC * head_dim);
+    float* rowmax = O_acc + FA_TC_BR * head_dim;
+    float* rowsum = rowmax + FA_TC_BR;
+
+    for (unsigned int i = tid; i < FA_TC_BR * head_dim; i += blockDim.x) {
+        unsigned int r = i / head_dim, d = i % head_dim;
+        float val = 0.0f;
+        if (r < num_q_rows) val = Q[(unsigned long long)(q_row_start + r) * q_dim + head * head_dim + d];
+        Q_f32[i] = val * scale; // pre-scale, full F32
+        O_acc[i] = 0.0f;
+    }
+    for (unsigned int i = tid; i < FA_TC_BR; i += blockDim.x) {
+        rowmax[i] = -3.402823466e+38f; rowsum[i] = 0.0f;
+    }
+    __syncthreads();
+
+    unsigned int max_kv_pos = pos_start + q_row_end;
+    unsigned int num_kv_tiles = (max_kv_pos + FA_TC_BC - 1) / FA_TC_BC;
+
+    for (unsigned int kv_tile = 0; kv_tile < num_kv_tiles; kv_tile++) {
+        unsigned int kv_start = kv_tile * FA_TC_BC;
+        unsigned int kv_end = kv_start + FA_TC_BC;
+        if (kv_end > max_kv_pos) kv_end = max_kv_pos;
+        unsigned int kv_len = kv_end - kv_start;
+
+        for (unsigned int i = tid; i < FA_TC_BC * head_dim; i += blockDim.x) {
+            unsigned int j = i / head_dim, d = i % head_dim;
+            float val = 0.0f;
+            if (j < kv_len) val = k_base[(kv_start + j) * head_dim + d];
+            K_f32[i] = val; // full F32
+        }
+        __syncthreads();
+
+        // Phase 2: exact scalar F32 QK^T. 256 cells, 128 threads.
+        for (unsigned int idx = tid; idx < FA_TC_BR * FA_TC_BC; idx += blockDim.x) {
+            unsigned int r = idx / FA_TC_BC, c = idx % FA_TC_BC;
+            float acc = 0.0f;
+            if (r < num_q_rows && c < kv_len) {
+                const float* qr = Q_f32 + r * head_dim;
+                const float* kr = K_f32 + c * head_dim;
+                for (unsigned int d = 0; d < head_dim; d++) acc += qr[d] * kr[d];
+            }
+            S_sh[idx] = acc;
+        }
+        __syncthreads();
+
+        // Phase 3: causal mask + online softmax (identical to default)
+        for (unsigned int i = tid; i < FA_TC_BR * FA_TC_BC; i += blockDim.x) {
+            unsigned int r = i / FA_TC_BC, c = i % FA_TC_BC;
+            unsigned int q_pos = pos_start + q_row_start + r;
+            unsigned int kv_pos = kv_start + c;
+            if (r >= num_q_rows || c >= kv_len || kv_pos > q_pos)
+                S_sh[r * FA_TC_BC + c] = -3.402823466e+38f;
+        }
+        __syncthreads();
+        for (unsigned int r = tid; r < FA_TC_BR; r += blockDim.x) {
+            if (r >= num_q_rows) continue;
+            float m_old = rowmax[r], local_max = -3.402823466e+38f;
+            for (unsigned int c = 0; c < FA_TC_BC; c++) local_max = fmaxf(local_max, S_sh[r * FA_TC_BC + c]);
+            float m_new = fmaxf(m_old, local_max);
+            float rescale_factor = expf(m_old - m_new), psum = 0.0f;
+            for (unsigned int c = 0; c < FA_TC_BC; c++) {
+                float p = expf(S_sh[r * FA_TC_BC + c] - m_new);
+                S_sh[r * FA_TC_BC + c] = p; psum += p;
+            }
+            for (unsigned int d = 0; d < head_dim; d++) O_acc[r * head_dim + d] *= rescale_factor;
+            rowmax[r] = m_new; rowsum[r] = rescale_factor * rowsum[r] + psum;
+        }
+        __syncthreads();
+        for (unsigned int i = tid; i < FA_TC_BR * FA_TC_BC; i += blockDim.x) {
+            unsigned int r = i / FA_TC_BC;
+            P_sh[i] = (r < num_q_rows) ? f32_to_f16(S_sh[i]) : (half_raw)0;
+        }
+        __syncthreads();
+
+        // Phase 4: load V (F16) + P@V on tensor cores (F16) — identical to default
+        for (unsigned int i = tid; i < FA_TC_BC * head_dim; i += blockDim.x) {
+            unsigned int j = i / head_dim, d = i % head_dim;
+            float val = 0.0f;
+            if (j < kv_len) val = v_base[(kv_start + j) * head_dim + d];
+            V_sh[i] = f32_to_f16(val);
+        }
+        __syncthreads();
+        {
+            unsigned int group_id = lane >> 2, tid_in_grp = lane & 3u;
+            unsigned int num_d_chunks = (head_dim + 7u) / 8u;
+            for (unsigned int dc = warp_id; dc < num_d_chunks; dc += 4u) {
+                unsigned int d_off = dc * 8u;
+                auto read_p = [&](unsigned int row, unsigned int col) -> half_raw {
+                    return (col < FA_TC_BC) ? P_sh[row * FA_TC_BC + col] : (half_raw)0; };
+                unsigned int a0 = pack_f16x2(read_p(group_id, tid_in_grp*2u), read_p(group_id, tid_in_grp*2u+1u));
+                unsigned int a1 = pack_f16x2(read_p(group_id, tid_in_grp*2u+8u), read_p(group_id, tid_in_grp*2u+9u));
+                unsigned int a2 = pack_f16x2(read_p(group_id+8u, tid_in_grp*2u), read_p(group_id+8u, tid_in_grp*2u+1u));
+                unsigned int a3 = pack_f16x2(read_p(group_id+8u, tid_in_grp*2u+8u), read_p(group_id+8u, tid_in_grp*2u+9u));
+                auto read_v = [&](unsigned int k_idx, unsigned int n_idx) -> half_raw {
+                    unsigned int d_idx = d_off + n_idx;
+                    return (k_idx < FA_TC_BC && d_idx < head_dim) ? V_sh[k_idx * head_dim + d_idx] : (half_raw)0; };
+                unsigned int b0 = pack_f16x2(read_v(tid_in_grp*2u, group_id), read_v(tid_in_grp*2u+1u, group_id));
+                unsigned int b1 = pack_f16x2(read_v(tid_in_grp*2u+8u, group_id), read_v(tid_in_grp*2u+9u, group_id));
+                float od0=0,od1=0,od2=0,od3=0;
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                    : "=f"(od0),"=f"(od1),"=f"(od2),"=f"(od3)
+                    : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"f"(od0),"f"(od1),"f"(od2),"f"(od3));
+                unsigned int oc0 = d_off + tid_in_grp*2u, oc1 = oc0 + 1u;
+                if (oc0 < head_dim) { O_acc[group_id*head_dim+oc0] += od0; O_acc[(group_id+8u)*head_dim+oc0] += od2; }
+                if (oc1 < head_dim) { O_acc[group_id*head_dim+oc1] += od1; O_acc[(group_id+8u)*head_dim+oc1] += od3; }
+            }
+        }
+        __syncthreads();
+    }
+    for (unsigned int i = tid; i < FA_TC_BR * head_dim; i += blockDim.x) {
+        unsigned int r = i / head_dim, d = i % head_dim;
+        if (r < num_q_rows) {
+            float l = rowsum[r];
+            O[(unsigned long long)(q_row_start + r) * q_dim + head * head_dim + d] = (l > 0.0f) ? O_acc[i] / l : 0.0f;
+        }
+    }
+}
+
+// -----------------------------------------------------------------
+// Variant: QK^T on tensor cores (F16), P@V exact (scalar F32).
+// Identical structure to flash_attention_wmma except Phase 4 computes
+// O += P@V with full F32 scalar accumulation (P kept in F32 S_sh).
+// -----------------------------------------------------------------
+extern "C" __global__ void flash_attention_wmma_pvf32(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
+    unsigned int batch,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int pos_start,
+    unsigned int max_seq_len,
+    float scale)
+{
+    unsigned int head = blockIdx.x;
+    unsigned int q_tile_idx = blockIdx.y;
+    if (head >= num_heads) return;
+    unsigned int tid = threadIdx.x;
+    unsigned int warp_id = tid >> 5;
+    unsigned int lane = tid & 31u;
+    unsigned int gqa_ratio = num_heads / num_kv_heads;
+    unsigned int kv_h = head / gqa_ratio;
+    unsigned int q_row_start = q_tile_idx * FA_TC_BR;
+    if (q_row_start >= batch) return;
+    unsigned int q_row_end = q_row_start + FA_TC_BR;
+    if (q_row_end > batch) q_row_end = batch;
+    unsigned int num_q_rows = q_row_end - q_row_start;
+    unsigned int q_dim = num_heads * head_dim;
+    unsigned int kv_stride = max_seq_len * head_dim;
+    const float* k_base = K + (unsigned long long)kv_h * kv_stride;
+    const float* v_base = V + (unsigned long long)kv_h * kv_stride;
+
+    // Shared mem: Q_f16[BR*hd], KV_f16[BC*hd], S[BR*BC] (kept F32 as P),
+    //             V_f32[BC*hd], O_acc[BR*hd], rowmax[BR], rowsum[BR]
+    extern __shared__ char smem_raw[];
+    half_raw* Q_sh = (half_raw*)smem_raw;
+    half_raw* KV_sh = Q_sh + FA_TC_BR * head_dim;
+    float* S_sh = (float*)(KV_sh + FA_TC_BC * head_dim);
+    float* V_f32 = S_sh + FA_TC_BR * FA_TC_BC;
+    float* O_acc = V_f32 + FA_TC_BC * head_dim;
+    float* rowmax = O_acc + FA_TC_BR * head_dim;
+    float* rowsum = rowmax + FA_TC_BR;
+
+    for (unsigned int i = tid; i < FA_TC_BR * head_dim; i += blockDim.x) {
+        unsigned int r = i / head_dim, d = i % head_dim;
+        float val = 0.0f;
+        if (r < num_q_rows) val = Q[(unsigned long long)(q_row_start + r) * q_dim + head * head_dim + d];
+        Q_sh[i] = f32_to_f16(val * scale);
+        O_acc[i] = 0.0f;
+    }
+    for (unsigned int i = tid; i < FA_TC_BR; i += blockDim.x) { rowmax[i] = -3.402823466e+38f; rowsum[i] = 0.0f; }
+    __syncthreads();
+
+    unsigned int max_kv_pos = pos_start + q_row_end;
+    unsigned int num_kv_tiles = (max_kv_pos + FA_TC_BC - 1) / FA_TC_BC;
+    for (unsigned int kv_tile = 0; kv_tile < num_kv_tiles; kv_tile++) {
+        unsigned int kv_start = kv_tile * FA_TC_BC;
+        unsigned int kv_end = kv_start + FA_TC_BC;
+        if (kv_end > max_kv_pos) kv_end = max_kv_pos;
+        unsigned int kv_len = kv_end - kv_start;
+
+        for (unsigned int i = tid; i < FA_TC_BC * head_dim; i += blockDim.x) {
+            unsigned int j = i / head_dim, d = i % head_dim;
+            float val = 0.0f;
+            if (j < kv_len) val = k_base[(kv_start + j) * head_dim + d];
+            KV_sh[i] = f32_to_f16(val);
+        }
+        __syncthreads();
+
+        for (unsigned int i = tid; i < FA_TC_BR * FA_TC_BC; i += blockDim.x) S_sh[i] = 0.0f;
+        __syncthreads();
+        {
+            unsigned int group_id = lane >> 2, tid_in_grp = lane & 3u;
+            unsigned int s_col_offset = (warp_id & 1u) * 8u;
+            float d0=0,d1=0,d2=0,d3=0;
+            unsigned int num_k_tiles = (head_dim + FA_TC_BK - 1) / FA_TC_BK;
+            for (unsigned int kt = 0; kt < num_k_tiles; kt++) {
+                unsigned int k_off = kt * FA_TC_BK;
+                unsigned int k_remaining = head_dim - k_off; if (k_remaining > FA_TC_BK) k_remaining = FA_TC_BK;
+                auto read_q = [&](unsigned int row, unsigned int kcol) -> half_raw {
+                    return (kcol < k_remaining) ? Q_sh[row * head_dim + k_off + kcol] : (half_raw)0; };
+                unsigned int a0 = pack_f16x2(read_q(group_id, tid_in_grp*2u), read_q(group_id, tid_in_grp*2u+1u));
+                unsigned int a1 = pack_f16x2(read_q(group_id, tid_in_grp*2u+8u), read_q(group_id, tid_in_grp*2u+9u));
+                unsigned int a2 = pack_f16x2(read_q(group_id+8u, tid_in_grp*2u), read_q(group_id+8u, tid_in_grp*2u+1u));
+                unsigned int a3 = pack_f16x2(read_q(group_id+8u, tid_in_grp*2u+8u), read_q(group_id+8u, tid_in_grp*2u+9u));
+                auto read_kt = [&](unsigned int k_idx, unsigned int n_idx) -> half_raw {
+                    unsigned int kv_col = s_col_offset + n_idx;
+                    return (k_idx < k_remaining && kv_col < FA_TC_BC) ? KV_sh[kv_col * head_dim + k_off + k_idx] : (half_raw)0; };
+                unsigned int b0 = pack_f16x2(read_kt(tid_in_grp*2u, group_id), read_kt(tid_in_grp*2u+1u, group_id));
+                unsigned int b1 = pack_f16x2(read_kt(tid_in_grp*2u+8u, group_id), read_kt(tid_in_grp*2u+9u, group_id));
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                    : "=f"(d0),"=f"(d1),"=f"(d2),"=f"(d3)
+                    : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"f"(d0),"f"(d1),"f"(d2),"f"(d3));
+            }
+            if (warp_id < 2u) {
+                unsigned int s_c0 = s_col_offset + tid_in_grp*2u, s_c1 = s_c0 + 1u;
+                if (s_c0 < FA_TC_BC) { S_sh[group_id*FA_TC_BC+s_c0] = d0; S_sh[(group_id+8u)*FA_TC_BC+s_c0] = d2; }
+                if (s_c1 < FA_TC_BC) { S_sh[group_id*FA_TC_BC+s_c1] = d1; S_sh[(group_id+8u)*FA_TC_BC+s_c1] = d3; }
+            }
+        }
+        __syncthreads();
+
+        for (unsigned int i = tid; i < FA_TC_BR * FA_TC_BC; i += blockDim.x) {
+            unsigned int r = i / FA_TC_BC, c = i % FA_TC_BC;
+            unsigned int q_pos = pos_start + q_row_start + r, kv_pos = kv_start + c;
+            if (r >= num_q_rows || c >= kv_len || kv_pos > q_pos) S_sh[r * FA_TC_BC + c] = -3.402823466e+38f;
+        }
+        __syncthreads();
+        for (unsigned int r = tid; r < FA_TC_BR; r += blockDim.x) {
+            if (r >= num_q_rows) continue;
+            float m_old = rowmax[r], local_max = -3.402823466e+38f;
+            for (unsigned int c = 0; c < FA_TC_BC; c++) local_max = fmaxf(local_max, S_sh[r * FA_TC_BC + c]);
+            float m_new = fmaxf(m_old, local_max);
+            float rescale_factor = expf(m_old - m_new), psum = 0.0f;
+            for (unsigned int c = 0; c < FA_TC_BC; c++) {
+                float p = expf(S_sh[r * FA_TC_BC + c] - m_new);
+                S_sh[r * FA_TC_BC + c] = p; psum += p; // P kept in F32
+            }
+            for (unsigned int d = 0; d < head_dim; d++) O_acc[r * head_dim + d] *= rescale_factor;
+            rowmax[r] = m_new; rowsum[r] = rescale_factor * rowsum[r] + psum;
+        }
+        __syncthreads();
+
+        // Phase 4: load V as F32, compute O += P@V exact scalar F32.
+        for (unsigned int i = tid; i < FA_TC_BC * head_dim; i += blockDim.x) {
+            unsigned int j = i / head_dim, d = i % head_dim;
+            float val = 0.0f;
+            if (j < kv_len) val = v_base[(kv_start + j) * head_dim + d];
+            V_f32[i] = val;
+        }
+        __syncthreads();
+        // O_acc[r][d] += sum_c P[r][c] * V[c][d]; 16*hd cells over 128 threads
+        for (unsigned int idx = tid; idx < FA_TC_BR * head_dim; idx += blockDim.x) {
+            unsigned int r = idx / head_dim, d = idx % head_dim;
+            if (r >= num_q_rows) continue;
+            float acc = 0.0f;
+            const float* pr = S_sh + r * FA_TC_BC;
+            for (unsigned int c = 0; c < kv_len; c++) acc += pr[c] * V_f32[c * head_dim + d];
+            O_acc[idx] += acc;
+        }
+        __syncthreads();
+    }
+    for (unsigned int i = tid; i < FA_TC_BR * head_dim; i += blockDim.x) {
+        unsigned int r = i / head_dim, d = i % head_dim;
+        if (r < num_q_rows) {
+            float l = rowsum[r];
+            O[(unsigned long long)(q_row_start + r) * q_dim + head * head_dim + d] = (l > 0.0f) ? O_acc[i] / l : 0.0f;
+        }
+    }
+}
+
+// -----------------------------------------------------------------
+// FIX VARIANT: split-F16 (hi+lo) operands on BOTH QK^T and P@V.
+//
+// Recovers ~20-bit effective mantissa while staying on tensor cores.
+// QK^T:  S = (Qhi+Qlo)(Khi+Klo)^T ≈ Qhi@Khi + Qhi@Klo + Qlo@Khi  (3 MMAs)
+// P@V:   O = (Phi+Plo)(Vhi+Vlo)   ≈ Phi@Vhi + Phi@Vlo + Plo@Vhi  (3 MMAs)
+// The dropped lo@lo cross-term is ~2^-20 relative (far below the ~6.5-nat
+// F16 error). KV_hi/KV_lo buffers are reused for K (QK^T) then V (P@V).
+// -----------------------------------------------------------------
+extern "C" __global__ void flash_attention_wmma_split(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
+    unsigned int batch,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int pos_start,
+    unsigned int max_seq_len,
+    float scale)
+{
+    unsigned int head = blockIdx.x;
+    unsigned int q_tile_idx = blockIdx.y;
+    if (head >= num_heads) return;
+    unsigned int tid = threadIdx.x;
+    unsigned int warp_id = tid >> 5;
+    unsigned int lane = tid & 31u;
+    unsigned int gqa_ratio = num_heads / num_kv_heads;
+    unsigned int kv_h = head / gqa_ratio;
+    unsigned int q_row_start = q_tile_idx * FA_TC_BR;
+    if (q_row_start >= batch) return;
+    unsigned int q_row_end = q_row_start + FA_TC_BR;
+    if (q_row_end > batch) q_row_end = batch;
+    unsigned int num_q_rows = q_row_end - q_row_start;
+    unsigned int q_dim = num_heads * head_dim;
+    unsigned int kv_stride = max_seq_len * head_dim;
+    const float* k_base = K + (unsigned long long)kv_h * kv_stride;
+    const float* v_base = V + (unsigned long long)kv_h * kv_stride;
+
+    // Shared mem: Qhi[BR*hd], Qlo[BR*hd], KVhi[BC*hd], KVlo[BC*hd] (all half),
+    //   S[BR*BC] (float), Phi[BR*BC], Plo[BR*BC] (half), O_acc[BR*hd] (float),
+    //   rowmax[BR], rowsum[BR] (float)
+    extern __shared__ char smem_raw[];
+    half_raw* Q_hi = (half_raw*)smem_raw;
+    half_raw* Q_lo = Q_hi + FA_TC_BR * head_dim;
+    half_raw* KV_hi = Q_lo + FA_TC_BR * head_dim;
+    half_raw* KV_lo = KV_hi + FA_TC_BC * head_dim;
+    float* S_sh = (float*)(KV_lo + FA_TC_BC * head_dim);
+    half_raw* P_hi = (half_raw*)(S_sh + FA_TC_BR * FA_TC_BC);
+    half_raw* P_lo = P_hi + FA_TC_BR * FA_TC_BC;
+    float* O_acc = (float*)(P_lo + FA_TC_BR * FA_TC_BC);
+    float* rowmax = O_acc + FA_TC_BR * head_dim;
+    float* rowsum = rowmax + FA_TC_BR;
+
+    for (unsigned int i = tid; i < FA_TC_BR * head_dim; i += blockDim.x) {
+        unsigned int r = i / head_dim, d = i % head_dim;
+        float val = 0.0f;
+        if (r < num_q_rows) val = Q[(unsigned long long)(q_row_start + r) * q_dim + head * head_dim + d] * scale;
+        f32_split_f16(val, Q_hi[i], Q_lo[i]);
+        O_acc[i] = 0.0f;
+    }
+    for (unsigned int i = tid; i < FA_TC_BR; i += blockDim.x) { rowmax[i] = -3.402823466e+38f; rowsum[i] = 0.0f; }
+    __syncthreads();
+
+    unsigned int max_kv_pos = pos_start + q_row_end;
+    unsigned int num_kv_tiles = (max_kv_pos + FA_TC_BC - 1) / FA_TC_BC;
+    for (unsigned int kv_tile = 0; kv_tile < num_kv_tiles; kv_tile++) {
+        unsigned int kv_start = kv_tile * FA_TC_BC;
+        unsigned int kv_end = kv_start + FA_TC_BC;
+        if (kv_end > max_kv_pos) kv_end = max_kv_pos;
+        unsigned int kv_len = kv_end - kv_start;
+
+        // Load K split into KV_hi/KV_lo
+        for (unsigned int i = tid; i < FA_TC_BC * head_dim; i += blockDim.x) {
+            unsigned int j = i / head_dim, d = i % head_dim;
+            float val = 0.0f;
+            if (j < kv_len) val = k_base[(kv_start + j) * head_dim + d];
+            f32_split_f16(val, KV_hi[i], KV_lo[i]);
+        }
+        for (unsigned int i = tid; i < FA_TC_BR * FA_TC_BC; i += blockDim.x) S_sh[i] = 0.0f;
+        __syncthreads();
+
+        // QK^T = Qhi@Khi + Qhi@Klo + Qlo@Khi  (3 MMAs, F32 accum)
+        {
+            unsigned int group_id = lane >> 2, tid_in_grp = lane & 3u;
+            unsigned int s_col_offset = (warp_id & 1u) * 8u;
+            float d0=0,d1=0,d2=0,d3=0;
+            unsigned int num_k_tiles = (head_dim + FA_TC_BK - 1) / FA_TC_BK;
+            for (unsigned int kt = 0; kt < num_k_tiles; kt++) {
+                unsigned int k_off = kt * FA_TC_BK;
+                unsigned int k_remaining = head_dim - k_off; if (k_remaining > FA_TC_BK) k_remaining = FA_TC_BK;
+                // helper to build A frag from a given half buffer
+                #define BUILD_A(BUF, A0,A1,A2,A3) \
+                    A0 = pack_f16x2(((tid_in_grp*2u   <k_remaining)?BUF[group_id*head_dim+k_off+tid_in_grp*2u]:(half_raw)0), \
+                                    ((tid_in_grp*2u+1u<k_remaining)?BUF[group_id*head_dim+k_off+tid_in_grp*2u+1u]:(half_raw)0)); \
+                    A1 = pack_f16x2(((tid_in_grp*2u+8u<k_remaining)?BUF[group_id*head_dim+k_off+tid_in_grp*2u+8u]:(half_raw)0), \
+                                    ((tid_in_grp*2u+9u<k_remaining)?BUF[group_id*head_dim+k_off+tid_in_grp*2u+9u]:(half_raw)0)); \
+                    A2 = pack_f16x2(((tid_in_grp*2u   <k_remaining)?BUF[(group_id+8u)*head_dim+k_off+tid_in_grp*2u]:(half_raw)0), \
+                                    ((tid_in_grp*2u+1u<k_remaining)?BUF[(group_id+8u)*head_dim+k_off+tid_in_grp*2u+1u]:(half_raw)0)); \
+                    A3 = pack_f16x2(((tid_in_grp*2u+8u<k_remaining)?BUF[(group_id+8u)*head_dim+k_off+tid_in_grp*2u+8u]:(half_raw)0), \
+                                    ((tid_in_grp*2u+9u<k_remaining)?BUF[(group_id+8u)*head_dim+k_off+tid_in_grp*2u+9u]:(half_raw)0));
+                #define BUILD_B(BUF, B0,B1) { \
+                    unsigned int _kc0=s_col_offset+group_id; \
+                    B0 = pack_f16x2(((tid_in_grp*2u   <k_remaining&&_kc0<FA_TC_BC)?BUF[_kc0*head_dim+k_off+tid_in_grp*2u]:(half_raw)0), \
+                                    ((tid_in_grp*2u+1u<k_remaining&&_kc0<FA_TC_BC)?BUF[_kc0*head_dim+k_off+tid_in_grp*2u+1u]:(half_raw)0)); \
+                    B1 = pack_f16x2(((tid_in_grp*2u+8u<k_remaining&&_kc0<FA_TC_BC)?BUF[_kc0*head_dim+k_off+tid_in_grp*2u+8u]:(half_raw)0), \
+                                    ((tid_in_grp*2u+9u<k_remaining&&_kc0<FA_TC_BC)?BUF[_kc0*head_dim+k_off+tid_in_grp*2u+9u]:(half_raw)0)); }
+                unsigned int a0,a1,a2,a3,b0,b1;
+                // term1: Qhi @ Khi
+                BUILD_A(Q_hi, a0,a1,a2,a3) BUILD_B(KV_hi, b0,b1)
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                    : "=f"(d0),"=f"(d1),"=f"(d2),"=f"(d3) : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"f"(d0),"f"(d1),"f"(d2),"f"(d3));
+                // term2: Qhi @ Klo
+                BUILD_B(KV_lo, b0,b1)
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                    : "=f"(d0),"=f"(d1),"=f"(d2),"=f"(d3) : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"f"(d0),"f"(d1),"f"(d2),"f"(d3));
+                // term3: Qlo @ Khi
+                BUILD_A(Q_lo, a0,a1,a2,a3) BUILD_B(KV_hi, b0,b1)
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                    : "=f"(d0),"=f"(d1),"=f"(d2),"=f"(d3) : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"f"(d0),"f"(d1),"f"(d2),"f"(d3));
+                #undef BUILD_A
+                #undef BUILD_B
+            }
+            if (warp_id < 2u) {
+                unsigned int s_c0 = s_col_offset + tid_in_grp*2u, s_c1 = s_c0 + 1u;
+                if (s_c0 < FA_TC_BC) { S_sh[group_id*FA_TC_BC+s_c0] = d0; S_sh[(group_id+8u)*FA_TC_BC+s_c0] = d2; }
+                if (s_c1 < FA_TC_BC) { S_sh[group_id*FA_TC_BC+s_c1] = d1; S_sh[(group_id+8u)*FA_TC_BC+s_c1] = d3; }
+            }
+        }
+        __syncthreads();
+
+        // causal mask + online softmax
+        for (unsigned int i = tid; i < FA_TC_BR * FA_TC_BC; i += blockDim.x) {
+            unsigned int r = i / FA_TC_BC, c = i % FA_TC_BC;
+            unsigned int q_pos = pos_start + q_row_start + r, kv_pos = kv_start + c;
+            if (r >= num_q_rows || c >= kv_len || kv_pos > q_pos) S_sh[r * FA_TC_BC + c] = -3.402823466e+38f;
+        }
+        __syncthreads();
+        for (unsigned int r = tid; r < FA_TC_BR; r += blockDim.x) {
+            if (r >= num_q_rows) continue;
+            float m_old = rowmax[r], local_max = -3.402823466e+38f;
+            for (unsigned int c = 0; c < FA_TC_BC; c++) local_max = fmaxf(local_max, S_sh[r * FA_TC_BC + c]);
+            float m_new = fmaxf(m_old, local_max);
+            float rescale_factor = expf(m_old - m_new), psum = 0.0f;
+            for (unsigned int c = 0; c < FA_TC_BC; c++) {
+                float p = expf(S_sh[r * FA_TC_BC + c] - m_new);
+                S_sh[r * FA_TC_BC + c] = p; psum += p;
+            }
+            for (unsigned int d = 0; d < head_dim; d++) O_acc[r * head_dim + d] *= rescale_factor;
+            rowmax[r] = m_new; rowsum[r] = rescale_factor * rowsum[r] + psum;
+        }
+        __syncthreads();
+        // split P into Phi/Plo (zero pad rows >= num_q_rows)
+        for (unsigned int i = tid; i < FA_TC_BR * FA_TC_BC; i += blockDim.x) {
+            unsigned int r = i / FA_TC_BC;
+            if (r < num_q_rows) f32_split_f16(S_sh[i], P_hi[i], P_lo[i]);
+            else { P_hi[i] = (half_raw)0; P_lo[i] = (half_raw)0; }
+        }
+        __syncthreads();
+
+        // Load V split into KV_hi/KV_lo (reuse)
+        for (unsigned int i = tid; i < FA_TC_BC * head_dim; i += blockDim.x) {
+            unsigned int j = i / head_dim, d = i % head_dim;
+            float val = 0.0f;
+            if (j < kv_len) val = v_base[(kv_start + j) * head_dim + d];
+            f32_split_f16(val, KV_hi[i], KV_lo[i]);
+        }
+        __syncthreads();
+
+        // O += P@V = Phi@Vhi + Phi@Vlo + Plo@Vhi  (3 MMAs)
+        {
+            unsigned int group_id = lane >> 2, tid_in_grp = lane & 3u;
+            unsigned int num_d_chunks = (head_dim + 7u) / 8u;
+            for (unsigned int dc = warp_id; dc < num_d_chunks; dc += 4u) {
+                unsigned int d_off = dc * 8u;
+                #define BUILD_PA(BUF, A0,A1,A2,A3) \
+                    A0 = pack_f16x2(BUF[group_id*FA_TC_BC+tid_in_grp*2u], BUF[group_id*FA_TC_BC+tid_in_grp*2u+1u]); \
+                    A1 = pack_f16x2(BUF[group_id*FA_TC_BC+tid_in_grp*2u+8u], BUF[group_id*FA_TC_BC+tid_in_grp*2u+9u]); \
+                    A2 = pack_f16x2(BUF[(group_id+8u)*FA_TC_BC+tid_in_grp*2u], BUF[(group_id+8u)*FA_TC_BC+tid_in_grp*2u+1u]); \
+                    A3 = pack_f16x2(BUF[(group_id+8u)*FA_TC_BC+tid_in_grp*2u+8u], BUF[(group_id+8u)*FA_TC_BC+tid_in_grp*2u+9u]);
+                #define BUILD_VB(BUF, B0,B1) { \
+                    unsigned int _d0=d_off+group_id; \
+                    B0 = pack_f16x2(((tid_in_grp*2u   <FA_TC_BC&&_d0<head_dim)?BUF[(tid_in_grp*2u)*head_dim+_d0]:(half_raw)0), \
+                                    ((tid_in_grp*2u+1u<FA_TC_BC&&_d0<head_dim)?BUF[(tid_in_grp*2u+1u)*head_dim+_d0]:(half_raw)0)); \
+                    B1 = pack_f16x2(((tid_in_grp*2u+8u<FA_TC_BC&&_d0<head_dim)?BUF[(tid_in_grp*2u+8u)*head_dim+_d0]:(half_raw)0), \
+                                    ((tid_in_grp*2u+9u<FA_TC_BC&&_d0<head_dim)?BUF[(tid_in_grp*2u+9u)*head_dim+_d0]:(half_raw)0)); }
+                unsigned int a0,a1,a2,a3,b0,b1;
+                float od0=0,od1=0,od2=0,od3=0;
+                // Phi@Vhi
+                BUILD_PA(P_hi, a0,a1,a2,a3) BUILD_VB(KV_hi, b0,b1)
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                    : "=f"(od0),"=f"(od1),"=f"(od2),"=f"(od3) : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"f"(od0),"f"(od1),"f"(od2),"f"(od3));
+                // Phi@Vlo
+                BUILD_VB(KV_lo, b0,b1)
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                    : "=f"(od0),"=f"(od1),"=f"(od2),"=f"(od3) : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"f"(od0),"f"(od1),"f"(od2),"f"(od3));
+                // Plo@Vhi
+                BUILD_PA(P_lo, a0,a1,a2,a3) BUILD_VB(KV_hi, b0,b1)
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                    : "=f"(od0),"=f"(od1),"=f"(od2),"=f"(od3) : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"f"(od0),"f"(od1),"f"(od2),"f"(od3));
+                #undef BUILD_PA
+                #undef BUILD_VB
+                unsigned int oc0 = d_off + tid_in_grp*2u, oc1 = oc0 + 1u;
+                if (oc0 < head_dim) { O_acc[group_id*head_dim+oc0] += od0; O_acc[(group_id+8u)*head_dim+oc0] += od2; }
+                if (oc1 < head_dim) { O_acc[group_id*head_dim+oc1] += od1; O_acc[(group_id+8u)*head_dim+oc1] += od3; }
+            }
+        }
+        __syncthreads();
+    }
+    for (unsigned int i = tid; i < FA_TC_BR * head_dim; i += blockDim.x) {
+        unsigned int r = i / head_dim, d = i % head_dim;
+        if (r < num_q_rows) {
+            float l = rowsum[r];
+            O[(unsigned long long)(q_row_start + r) * q_dim + head * head_dim + d] = (l > 0.0f) ? O_acc[i] / l : 0.0f;
+        }
+    }
+}
+
 // ---------------------------------------------------------------
 // Fallback: Scalar Flash Attention with F16 compute via __half intrinsics
 //

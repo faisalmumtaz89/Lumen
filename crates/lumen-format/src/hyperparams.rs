@@ -33,6 +33,63 @@ pub struct ModelHyperparams {
     /// NeoX-style (half-split) RoPE: pairs at (d, d+half_rot) instead of interleaved (2d, 2d+1).
     /// True for Qwen2, Qwen3.5 architectures. False for Llama, Mistral.
     pub rope_neox: bool,
+    /// Gated-DeltaNet (linear-attention / SSM) dimensions, carried from GGUF
+    /// metadata (`{arch}.ssm.*`). `None` for models without GDN layers OR for
+    /// older (v3) LBC files that predate this field — in both cases the runtime
+    /// falls back to the Qwen3.5-9B defaults via [`ModelHyperparams::gdn_dims`].
+    pub gdn: Option<GdnDims>,
+}
+
+/// Gated-DeltaNet (GDN) per-model dimensions.
+///
+/// These come from GGUF SSM metadata and differ from the standard attention
+/// head counts. The mapping from GGUF keys is:
+/// - `{arch}.ssm.time_step_rank` -> `num_v_heads` (state / V heads)
+/// - `{arch}.ssm.group_count`     -> `num_k_heads` (Q and K pre-repeat heads)
+/// - `{arch}.ssm.state_size`      -> `head_dim`
+/// - `{arch}.ssm.conv_kernel`     -> `conv_kernel`
+///
+/// Known shapes:
+/// - Qwen3.5-9B:  num_v_heads=32, num_k_heads=16, head_dim=128, conv_kernel=4
+///   => v_dim=4096, qk_dim=2048, qkv_dim=8192
+/// - Qwen3.6-27B: num_v_heads=48, num_k_heads=16, head_dim=128, conv_kernel=4
+///   => v_dim=6144, qk_dim=2048, qkv_dim=10240
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GdnDims {
+    /// Number of state / V heads (`ssm.time_step_rank`). 32 for 9B, 48 for 27B.
+    pub num_v_heads: u32,
+    /// Number of Q/K heads before GQA repeat (`ssm.group_count`). 16 for both.
+    pub num_k_heads: u32,
+    /// Per-head dimension (`ssm.state_size`). 128 for both.
+    pub head_dim: u32,
+    /// Conv1d kernel size (`ssm.conv_kernel`). 4 for both.
+    pub conv_kernel: u32,
+}
+
+impl GdnDims {
+    /// Qwen3.5-9B default GDN shape. Used whenever `ModelHyperparams.gdn` is
+    /// `None` so that 9B models (and v3 LBC files) stay byte-identical.
+    pub const QWEN35_9B: GdnDims = GdnDims {
+        num_v_heads: 32,
+        num_k_heads: 16,
+        head_dim: 128,
+        conv_kernel: 4,
+    };
+
+    /// V projection dimension: `num_v_heads * head_dim` (4096 for 9B, 6144 for 27B).
+    pub fn v_dim(&self) -> u32 {
+        self.num_v_heads * self.head_dim
+    }
+
+    /// Q (and K) projection dimension: `num_k_heads * head_dim` (2048 for both).
+    pub fn qk_dim(&self) -> u32 {
+        self.num_k_heads * self.head_dim
+    }
+
+    /// Fused QKV dimension: `2 * qk_dim + v_dim` (8192 for 9B, 10240 for 27B).
+    pub fn qkv_dim(&self) -> u32 {
+        2 * self.qk_dim() + self.v_dim()
+    }
 }
 
 /// RoPE (Rotary Position Embedding) configuration.
@@ -70,5 +127,16 @@ impl Default for RopeParams {
 impl ModelHyperparams {
     pub fn is_moe(&self) -> bool {
         self.num_experts.is_some()
+    }
+
+    /// Resolved Gated-DeltaNet dimensions for this model.
+    ///
+    /// Returns the explicit [`GdnDims`] carried in `self.gdn` when present, or
+    /// the Qwen3.5-9B default ([`GdnDims::QWEN35_9B`]) when `None`. The default
+    /// fallback guarantees that 9B models and v3 LBC files (which never stored
+    /// GDN dims) keep their exact historical shape, so their GPU buffers and
+    /// kernel dispatches remain byte-identical.
+    pub fn gdn_dims(&self) -> GdnDims {
+        self.gdn.unwrap_or(GdnDims::QWEN35_9B)
     }
 }

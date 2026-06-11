@@ -25,6 +25,21 @@
 //! historical path (`use crate::engine::{Xorshift64, softmax_inplace};`).
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Opaque per-token-id byte decoder used by the anti-degeneration guard.
+///
+/// The runtime crate is intentionally tokenizer-agnostic (it only ever
+/// receives token-id slices). The greedy anti-restate guard, however, needs
+/// to know the DECODED BYTES of the candidate token and of recently emitted
+/// tokens to recognise sub-word doubling like " multiplication" -> "lication".
+/// Rather than pull a vocab into the runtime, the embedder (CLI / server,
+/// which already own a `BpeTokenizer`) installs a closure on `SamplerState`
+/// that maps a single token id to its decoded UTF-8 bytes. When no decoder is
+/// installed the byte-level veto rule is simply skipped (the id-only n-gram
+/// restate rule still works), so the guard degrades gracefully and the
+/// default no-guard path is byte-identical to before.
+pub type TokenByteDecoder = Arc<dyn Fn(u32) -> Vec<u8> + Send + Sync>;
 
 /// Minimal xorshift64 PRNG -- deterministic, zero deps.
 pub struct Xorshift64 {
@@ -242,6 +257,33 @@ pub struct SamplingParams {
     /// tokens). `None` or `Some(0)` -> consider the full history. `Some(64)`
     /// is a sensible anti-degeneration window for Lumen MoE.
     pub repeat_last_n: Option<usize>,
+
+    /// Greedy anti-degeneration guard (default OFF).
+    ///
+    /// When `true` AND `temperature <= 0.0` (greedy), `sample_logits` does a
+    /// guarded argmax: after picking the top-1 logit it checks two
+    /// degeneration patterns and, if the top candidate matches, vetoes it and
+    /// advances to the next-best candidate (bounded retries, falling back to
+    /// the raw argmax if every candidate is degenerate so the loop can never
+    /// hang):
+    ///
+    /// 1. **Sub-word doubling** — the candidate's decoded bytes re-state a
+    ///    suffix of the word just emitted (e.g. token " multiplication"
+    ///    followed by token "lication"). Requires a `TokenByteDecoder` on
+    ///    `SamplerState`; skipped when none is installed.
+    /// 2. **Short n-gram restate** — appending the candidate id would make the
+    ///    last `k` token ids an exact repeat of the immediately preceding `k`
+    ///    ids for some `2 <= k <= 4` (e.g. "17 × 20 = 17 × 20", the
+    ///    "340 + 51 = 340 + 51" loop). Operates on `history` ids only — needs
+    ///    no decoder.
+    ///
+    /// This is a deterministic, backend-agnostic complement to the repetition
+    /// penalty: it surgically removes the shared MoE decode-step doubling /
+    /// restate near-tie without the magnitude-distorting collateral of a
+    /// blanket logit penalty. It only ever fires on genuine degeneration, so
+    /// it is safe to leave enabled for normal generation. It is a no-op when
+    /// `false` or when `temperature > 0.0` (sampling already breaks ties).
+    pub anti_restate: bool,
 }
 
 impl Default for SamplingParams {
@@ -256,6 +298,7 @@ impl Default for SamplingParams {
             presence_penalty: None,
             frequency_penalty: None,
             repeat_last_n: None,
+            anti_restate: false,
         }
     }
 }
@@ -277,15 +320,41 @@ impl SamplingParams {
 ///
 /// The `freq` map lets `frequency_penalty` scale by occurrence count
 /// without rescanning `history` each step.
-#[derive(Debug, Default, Clone)]
+///
+/// `decoder` is an optional per-token-id byte decoder installed by the
+/// embedder (CLI / server) to power the sub-word-doubling veto of the greedy
+/// anti-restate guard. It is intentionally NOT part of `Debug`/`Default`/
+/// `Clone`-by-value semantics that matter for history: cloning a state clones
+/// the `Arc` (cheap, shared), `Default` leaves it `None`, and `Debug` renders
+/// only its presence. `clear()` keeps the decoder (it is a per-session
+/// capability, not per-sequence history).
+#[derive(Default, Clone)]
 pub struct SamplerState {
     pub history: Vec<u32>,
     pub freq: HashMap<u32, u32>,
+    /// Optional decoder for the anti-restate guard's byte-level rule.
+    pub decoder: Option<TokenByteDecoder>,
+}
+
+impl std::fmt::Debug for SamplerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SamplerState")
+            .field("history", &self.history)
+            .field("freq", &self.freq)
+            .field("decoder", &self.decoder.as_ref().map(|_| "<fn>"))
+            .finish()
+    }
 }
 
 impl SamplerState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Install (or replace) the per-token-id byte decoder used by the
+    /// anti-restate guard's sub-word-doubling rule. Idempotent.
+    pub fn set_decoder(&mut self, decoder: TokenByteDecoder) {
+        self.decoder = Some(decoder);
     }
 
     /// Append `token` to history and bump its frequency counter.
@@ -294,7 +363,8 @@ impl SamplerState {
         *self.freq.entry(token).or_insert(0) += 1;
     }
 
-    /// Reset between sequences.
+    /// Reset between sequences. Retains the installed `decoder` (a
+    /// per-session capability, not per-sequence history).
     pub fn clear(&mut self) {
         self.history.clear();
         self.freq.clear();
@@ -374,6 +444,9 @@ pub fn sample_logits(
         if params.penalties_active() {
             apply_penalties(logits, params, state);
         }
+        if params.anti_restate {
+            return guarded_argmax(logits, state);
+        }
         return argmax(logits) as u32;
     }
 
@@ -436,6 +509,291 @@ fn argmax(logits: &[f32]) -> usize {
         .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(i, _)| i)
         .unwrap_or(0)
+}
+
+/// Maximum candidate tokens to skip per step before falling back to the raw
+/// argmax. Bounds the guard's cost and guarantees termination even in the
+/// pathological case where every high-probability candidate is degenerate.
+const ANTI_RESTATE_MAX_SKIP: usize = 8;
+
+/// Greedy argmax with the anti-degeneration veto.
+///
+/// Picks the top-1 logit; if it is a degenerate continuation of the recent
+/// history it advances to the next-best logit, up to `ANTI_RESTATE_MAX_SKIP`
+/// times. If every probed candidate is degenerate it returns the raw argmax
+/// (rank 0) so behaviour can never be *worse* than plain greedy and the call
+/// always terminates. The probe over the top few logits is O(n * skip) in the
+/// worst case (a bounded number of single-pass argmax-with-exclusion scans),
+/// which is negligible next to the forward pass that produced `logits`.
+fn guarded_argmax(logits: &[f32], state: &SamplerState) -> u32 {
+    let raw = argmax(logits);
+    // Cheap exits: nothing to compare against, or no degeneration possible.
+    if state.history.is_empty() {
+        return raw as u32;
+    }
+
+    let mut excluded: Vec<usize> = Vec::new();
+    let mut cand = raw;
+    for _ in 0..ANTI_RESTATE_MAX_SKIP {
+        if !is_degenerate_candidate(cand as u32, state) {
+            return cand as u32;
+        }
+        // Veto this candidate and find the next-best logit not yet excluded.
+        excluded.push(cand);
+        match argmax_excluding(logits, &excluded) {
+            Some(next) => cand = next,
+            None => break, // no more finite candidates
+        }
+    }
+    // Everything degenerate (or ran out of candidates): never worse than greedy.
+    raw as u32
+}
+
+/// Argmax over `logits` skipping any index in `excluded` (small set, linear
+/// membership is fine) AND any non-finite logit (`-inf` masked tokens / NaN).
+/// Returns `None` when no finite, non-excluded candidate remains — the signal
+/// for `guarded_argmax` to stop probing and fall back to the raw argmax rather
+/// than promote a masked / impossible token over plain greedy.
+fn argmax_excluding(logits: &[f32], excluded: &[usize]) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &v) in logits.iter().enumerate() {
+        if !v.is_finite() || excluded.contains(&i) {
+            continue;
+        }
+        match best {
+            Some((_, bv)) if !v.total_cmp(&bv).is_gt() => {}
+            _ => best = Some((i, v)),
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// Per-rule enable flags for the anti-degeneration veto, resolved once from the
+/// environment. ALL THREE DEFAULT ON (the shipped behaviour); the env overrides
+/// exist purely to A/B the contribution of each rule without a rebuild. Setting
+/// a variable to `0`/`false`/`no`/`off` disables that single rule.
+///
+///   * `LUMEN_ANTI_RESTATE_SUBWORD` — byte-level sub-word doubling rule
+///     (`restates_subword`); the cosmetic "multiplicationlication" fix.
+///   * `LUMEN_ANTI_RESTATE_NGRAM`   — exact back-to-back span restate rule
+///     (`restates_ngram`).
+///   * `LUMEN_ANTI_RESTATE_LOOP`    — dense single-token runaway-loop rule
+///     (`runaway_loop`).
+///
+/// The empirical finding behind the override: on MoE-35B q8/q4 the `LOOP` and
+/// `NGRAM` id-level rules can veto the high-frequency digit / space / operator
+/// tokens that legitimate step-by-step arithmetic must re-emit to write the
+/// final answer ("340", "391"), redirecting the bounded fallback into a deeper
+/// loop. The byte-level `SUBWORD` rule cannot do this — it only vetoes a
+/// within-word continuation that re-emits the just-completed word's own tail —
+/// so it is the safe one to keep on by default.
+struct AntiRestateRules {
+    subword: bool,
+    ngram: bool,
+    loop_: bool,
+}
+
+fn rule_enabled(name: &str) -> bool {
+    match std::env::var(name).ok().as_deref() {
+        Some("0" | "false" | "no" | "off") => false,
+        _ => true,
+    }
+}
+
+fn anti_restate_rules() -> AntiRestateRules {
+    use std::sync::OnceLock;
+    static RULES: OnceLock<AntiRestateRules> = OnceLock::new();
+    let r = RULES.get_or_init(|| AntiRestateRules {
+        subword: rule_enabled("LUMEN_ANTI_RESTATE_SUBWORD"),
+        ngram: rule_enabled("LUMEN_ANTI_RESTATE_NGRAM"),
+        loop_: rule_enabled("LUMEN_ANTI_RESTATE_LOOP"),
+    });
+    AntiRestateRules { subword: r.subword, ngram: r.ngram, loop_: r.loop_ }
+}
+
+/// True iff selecting `cand` next would produce a degenerate sub-word
+/// doubling, a back-to-back span restate, or extend a dense runaway repeat
+/// loop, given `state.history`. Each rule is independently gateable via the
+/// `LUMEN_ANTI_RESTATE_{SUBWORD,NGRAM,LOOP}` env vars (all default ON).
+fn is_degenerate_candidate(cand: u32, state: &SamplerState) -> bool {
+    let rules = anti_restate_rules();
+    (rules.subword && restates_subword(cand, state))
+        || (rules.ngram && restates_ngram(cand, state))
+        || (rules.loop_ && runaway_loop(cand, state))
+}
+
+/// Recent window (tokens) the runaway-loop guard counts occurrences over.
+/// Kept at 28 (a wider 40-token window with the same threshold began catching
+/// legitimate operand reuse in the honest derivation, regressing the clean
+/// bf16 path into a loop). At 28 the guard only trips on genuinely dense
+/// short-cycle repetition.
+const ANTI_RESTATE_LOOP_WINDOW: usize = 28;
+
+/// Occurrence threshold within `ANTI_RESTATE_LOOP_WINDOW` above which the
+/// candidate is treated as a runaway-loop driver. Set high enough that honest
+/// step-by-step arithmetic — which reuses an operand/operator at most ~3 times
+/// inside a 28-token span — never trips it, but a degenerate
+/// "17 \times 20 = 17 \times 20 = …" loop (where each of "17"/"\times"/"="
+/// recurs 5+ times densely) does. This catches the interleaved loop the
+/// brittle back-to-back rule misses (the loop carries stray "$$"/"\n"/"(" /")"
+/// tokens between iterations that break exact span adjacency). Empirically the
+/// floor that breaks dense loops without distorting legitimate digit reuse.
+const ANTI_RESTATE_LOOP_THRESH: usize = 5;
+
+/// Dense runaway-repeat rule (id-level; no decoder needed).
+///
+/// Vetoes `cand` when it has ALREADY occurred at least
+/// `ANTI_RESTATE_LOOP_THRESH` times within the last
+/// `ANTI_RESTATE_LOOP_WINDOW` history tokens — the alignment-independent
+/// signature of a loop that is re-emitting the same small token set over and
+/// over. Unlike a repetition PENALTY (which perturbs every repeated token's
+/// logit and was shown to corrupt the arithmetic at rp ≥ 1.05) this is a hard
+/// veto that fires ONLY past a high density threshold and only redirects to the
+/// next-best in-distribution token, so it breaks the loop without distorting
+/// legitimate digit reuse below the threshold.
+fn runaway_loop(cand: u32, state: &SamplerState) -> bool {
+    let h = &state.history;
+    if h.len() < ANTI_RESTATE_LOOP_THRESH {
+        return false;
+    }
+    let start = h.len().saturating_sub(ANTI_RESTATE_LOOP_WINDOW);
+    let count = h[start..].iter().filter(|&&id| id == cand).count();
+    count >= ANTI_RESTATE_LOOP_THRESH
+}
+
+/// Minimum length of the re-stated word-tail the sub-word-doubling rule
+/// requires before vetoing. 4 bytes is long enough to exclude coincidental
+/// short overlaps between an honest continuation and the prior word's ending,
+/// while catching the observed degeneracies ("multiplication" -> "lication" /
+/// "lications", both of which begin with the 8-byte tail "lication").
+const ANTI_RESTATE_MIN_SUFFIX: usize = 4;
+
+/// Sub-word-doubling rule (byte-level; needs an installed decoder).
+///
+/// Fires when the candidate token is a within-word continuation that BEGINS BY
+/// REPRODUCING the trailing slice of the word just emitted. Concretely: let
+/// `prev_word` be the trailing whitespace-delimited word of the most recently
+/// emitted token and `c` the candidate's decoded bytes. We veto when `c` is a
+/// within-word continuation (non-empty, no ASCII whitespace) and there exists a
+/// suffix `s` of `prev_word` with `len(s) >= ANTI_RESTATE_MIN_SUFFIX` such that
+/// `c` STARTS WITH `s`. Examples (the exact MoE-35B near-tie family):
+///   - prev " multiplication" (word "multiplication"), candidate "lication"  ->
+///     "lication" starts with the suffix "lication" -> veto ("…multiplicationlication").
+///   - same prev, candidate "lications" -> still starts with the suffix
+///     "lication" -> veto ("…multiplicationlications"). The earlier exact
+///     `ends_with` form missed this because the trailing 's' broke the match;
+///     the prefix-of-candidate form catches the whole doubling family.
+///
+/// Why this does not veto legitimate multi-token words: an honest continuation
+/// EXTENDS the word with NEW letters (e.g. "distrib" + "utive", "multipl" +
+/// "ication"), so the continuation does NOT begin by repeating the prefix
+/// token's own tail. The rule fires only when the candidate re-emits a chunk
+/// the just-completed word already ends with — definitionally a doubling. It is
+/// skipped entirely when no decoder is installed.
+fn restates_subword(cand: u32, state: &SamplerState) -> bool {
+    let decoder = match &state.decoder {
+        Some(d) => d,
+        None => return false,
+    };
+    let last_id = match state.history.last() {
+        Some(&id) => id,
+        None => return false,
+    };
+
+    let c = decoder(cand);
+    if c.is_empty() {
+        return false;
+    }
+    // Candidate must be a within-word continuation: no leading or internal
+    // ASCII whitespace. A token that starts a new word (leading space) or
+    // spans a word boundary cannot be a pure suffix doubling.
+    if c.iter().any(|b| b.is_ascii_whitespace()) {
+        return false;
+    }
+
+    let prev = decoder(last_id);
+    if prev.is_empty() {
+        return false;
+    }
+    // Trailing word of the previous token = bytes after its last whitespace.
+    let tail_start = prev
+        .iter()
+        .rposition(|b| b.is_ascii_whitespace())
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let prev_word = &prev[tail_start..];
+    if prev_word.len() < ANTI_RESTATE_MIN_SUFFIX {
+        return false;
+    }
+
+    // Veto if the candidate begins with ANY suffix of `prev_word` of length
+    // >= ANTI_RESTATE_MIN_SUFFIX. Scan from the longest such suffix down; the
+    // first (longest) match is enough to decide. Bounded by `prev_word.len()`,
+    // trivially cheap.
+    let max_s = prev_word.len();
+    for s_len in (ANTI_RESTATE_MIN_SUFFIX..=max_s).rev() {
+        let suffix = &prev_word[prev_word.len() - s_len..];
+        if c.starts_with(suffix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Minimum span length (in tokens) for the back-to-back restate rule. Set to 3
+/// so the rule NEVER fires on the short, legitimately-recurring 1-2 token
+/// arithmetic fragments ("17", " \\", "times", " =") that valid step-by-step
+/// math reuses constantly — only a genuine multi-token span repeated VERBATIM
+/// AND BACK-TO-BACK trips it. (A no-repeat-ngram at n=3 was empirically fatal
+/// here: it blocked honest 3-grams like "17 \times 20" the second time the
+/// model legitimately needed them, corrupting the arithmetic.)
+const ANTI_RESTATE_MIN_SPAN: usize = 3;
+
+/// Maximum span length the back-to-back restate rule checks. Covers the
+/// observed repeating LOOP unit "340 + 51 = " / "17 \times 20 = " (~4-6 BPE
+/// pieces) with headroom. Kept at 8: empirically, raising it to 16 (to chase a
+/// longer q8 loop) combined with a tighter runaway threshold began vetoing
+/// legitimate forward-progress tokens and pushed the OTHERWISE-CLEAN bf16 path
+/// into a loop — a strict regression. The conservative ceiling preserves the
+/// clean bf16 result; the residual q8 long-period loop is left to the
+/// principled cross-engine logit fix (option A) rather than risk corrupting a
+/// working configuration with an over-aggressive heuristic.
+const ANTI_RESTATE_MAX_SPAN: usize = 8;
+
+/// Back-to-back span-restate rule (id-level; no decoder needed).
+///
+/// Vetoes `cand` when emitting it would complete a span of length
+/// `ANTI_RESTATE_MIN_SPAN..=ANTI_RESTATE_MAX_SPAN` that EXACTLY repeats the
+/// span IMMEDIATELY PRECEDING it — i.e. the model is about to close a
+/// back-to-back verbatim duplicate `… S S` where `|S| = k`. With history `h`
+/// and candidate `c`, the proposed tail of length `k` is
+/// `h[len-(k-1)..] ++ [c]`; we compare it against `h[len-(2k-1)..len-(k-1)]`
+/// (the `k` ids right before it). A match means the loop unit just repeated.
+///
+/// This is the precise signature of the MoE restate attractor: the q4
+/// "340 + 51 = 340 + 51 = …" functional loop and the "17 \times 20 = 17 \times
+/// 20" restate both repeat a multi-token unit back-to-back. Requiring an EXACT,
+/// ADJACENT, ≥3-token repeat is what makes the rule safe for legitimate math —
+/// honest step-by-step arithmetic reuses short fragments but does not emit the
+/// same ≥3-token span twice in a row. Catching the closing token of the second
+/// copy breaks the loop the instant it would begin its next iteration.
+fn restates_ngram(cand: u32, state: &SamplerState) -> bool {
+    let h = &state.history;
+    for k in ANTI_RESTATE_MIN_SPAN..=ANTI_RESTATE_MAX_SPAN {
+        // Need the proposed last-k window plus the k ids before it: 2k-1
+        // existing history ids (the candidate supplies the final slot).
+        if h.len() + 1 < 2 * k {
+            continue;
+        }
+        let w_start = h.len() - (k - 1);
+        let p_start = h.len() - (2 * k - 1);
+        let preceding = &h[p_start..w_start]; // length k
+        let recent = &h[w_start..]; // length k-1 (the candidate is the k-th)
+        if recent == &preceding[..k - 1] && cand == preceding[k - 1] {
+            return true;
+        }
+    }
+    false
 }
 
 /// Apply repetition / presence / frequency penalties to raw logits.
@@ -1151,5 +1509,321 @@ mod tests {
             assert_eq!(s.sample(&mut logits.clone()), 0,
                 "min_p=0.1 should leave only token 0 (logit 5.0 above the log-shift bound)");
         }
+    }
+
+    // ---- anti-restate guard ----
+
+    /// Tiny fixed vocab decoder for the byte-rule tests. Maps a handful of
+    /// token ids to bytes mirroring the real MoE-35B near-tie case.
+    fn test_decoder() -> TokenByteDecoder {
+        Arc::new(|id: u32| -> Vec<u8> {
+            match id {
+                10 => b" multiplication".to_vec(), // the complete word, one token
+                11 => b"lication".to_vec(),          // degenerate suffix doubling
+                12 => b" into".to_vec(),             // the llama-correct continuation
+                13 => b"ing".to_vec(),               // legit continuation (not a suffix of prev word)
+                14 => b" running".to_vec(),
+                15 => b"lications".to_vec(),         // doubling + trailing 's' (real 2nd near-tie)
+                16 => b" distrib".to_vec(),          // legit prefix piece of "distributive"
+                17 => b"utive".to_vec(),             // legit continuation -> "distributive"
+                20 => b"17".to_vec(),
+                21 => b" times".to_vec(),
+                22 => b" 23".to_vec(),
+                _ => Vec::new(),
+            }
+        })
+    }
+
+    #[test]
+    fn anti_restate_is_noop_without_flag() {
+        // With anti_restate=false the greedy path is the plain argmax even
+        // when the top candidate would double a suffix.
+        let params = SamplingParams { temperature: 0.0, ..SamplingParams::default() };
+        let mut state = SamplerState::new();
+        state.set_decoder(test_decoder());
+        state.record(10); // just emitted " multiplication"
+        let mut rng = Xorshift64::new(1);
+        // logits favour id 11 ("lication"), then id 12 (" into").
+        let mut logits = vec![0.0; 32];
+        logits[11] = 5.0;
+        logits[12] = 4.9;
+        let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
+        assert_eq!(t, 11, "no guard -> raw argmax picks the doubling token");
+    }
+
+    #[test]
+    fn anti_restate_vetoes_subword_doubling() {
+        // anti_restate=true: the " multiplication" -> "lication" doubling is
+        // vetoed and the next-best non-degenerate candidate (" into") wins.
+        let params = SamplingParams {
+            temperature: 0.0,
+            anti_restate: true,
+            ..SamplingParams::default()
+        };
+        let mut state = SamplerState::new();
+        state.set_decoder(test_decoder());
+        state.record(10); // " multiplication"
+        let mut rng = Xorshift64::new(1);
+        let mut logits = vec![0.0; 32];
+        logits[11] = 5.0; // "lication" (degenerate, would be argmax)
+        logits[12] = 4.9; // " into"   (llama-correct)
+        let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
+        assert_eq!(t, 12, "guard must skip the suffix-doubling token and pick ' into'");
+    }
+
+    #[test]
+    fn anti_restate_vetoes_subword_doubling_with_trailing_char() {
+        // The real second near-tie: after " multiplication" the next-best token
+        // is "lications" (suffix "lication" + trailing 's'). The generalized
+        // prefix-of-candidate rule must veto it too and reach " into".
+        let params = SamplingParams {
+            temperature: 0.0,
+            anti_restate: true,
+            ..SamplingParams::default()
+        };
+        let mut state = SamplerState::new();
+        state.set_decoder(test_decoder());
+        state.record(10); // " multiplication"
+        let mut rng = Xorshift64::new(1);
+        let mut logits = vec![0.0; 32];
+        logits[11] = 5.0; // "lication"  (degenerate, top-1)
+        logits[15] = 4.9; // "lications" (degenerate, top-2 — escaped the old rule)
+        logits[12] = 4.8; // " into"     (clean)
+        let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
+        assert_eq!(t, 12, "both 'lication' and 'lications' doublings must be vetoed");
+    }
+
+    #[test]
+    fn anti_restate_allows_legit_multitoken_word() {
+        // "distrib" + "utive" -> "distributive" is an honest multi-token word.
+        // The continuation extends with NEW letters and does NOT begin by
+        // repeating "distrib"'s tail, so it must NOT be vetoed.
+        let params = SamplingParams {
+            temperature: 0.0,
+            anti_restate: true,
+            ..SamplingParams::default()
+        };
+        let mut state = SamplerState::new();
+        state.set_decoder(test_decoder());
+        state.record(16); // " distrib"
+        let mut rng = Xorshift64::new(1);
+        let mut logits = vec![0.0; 32];
+        logits[17] = 5.0; // "utive"
+        let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
+        assert_eq!(t, 17, "legit continuation 'utive' after 'distrib' must be allowed");
+    }
+
+    #[test]
+    fn anti_restate_allows_legit_word_continuation() {
+        // "ing" after a token that does NOT already end in "ing" is a genuine
+        // continuation and must NOT be vetoed.
+        let params = SamplingParams {
+            temperature: 0.0,
+            anti_restate: true,
+            ..SamplingParams::default()
+        };
+        let mut state = SamplerState::new();
+        state.set_decoder(test_decoder());
+        state.record(14); // " running" (already a full word; ends in "ing")
+        // Here picking "ing" (13) WOULD double — verify that case is vetoed —
+        // but first confirm a non-doubling continuation is allowed: emit a
+        // word that does not end in the candidate.
+        state.clear();
+        state.set_decoder(test_decoder());
+        state.record(20); // "17" — does not end in "ing"
+        let mut rng = Xorshift64::new(1);
+        let mut logits = vec![0.0; 32];
+        logits[13] = 5.0; // "ing"
+        let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
+        assert_eq!(t, 13, "legit continuation 'ing' after '17' must be allowed");
+    }
+
+    #[test]
+    fn anti_restate_vetoes_ngram_restate_without_decoder() {
+        // id-only rule: history "17 times 23 17 times" + candidate "23" would
+        // repeat the 3-gram [17, times, 23]. Vetoed even with NO decoder.
+        let params = SamplingParams {
+            temperature: 0.0,
+            anti_restate: true,
+            ..SamplingParams::default()
+        };
+        let mut state = SamplerState::new();
+        // NOTE: no decoder installed.
+        for id in [20u32, 21, 22, 20, 21] {
+            state.record(id); // 17 times 23 17 times
+        }
+        let mut rng = Xorshift64::new(1);
+        let mut logits = vec![0.0; 32];
+        logits[22] = 5.0; // "23" closes the [17, times, 23] 3-gram repeat
+        logits[12] = 4.0; // " into" — a non-restating alternative
+        let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
+        assert_ne!(t, 22, "n-gram restate of [17,times,23] must be vetoed");
+        assert_eq!(t, 12, "guard falls through to the non-restating alternative");
+    }
+
+    #[test]
+    fn anti_restate_allows_legit_short_repeat() {
+        // A single legitimate token repeat that does NOT form a >=2-gram
+        // contiguous restart must be allowed (e.g. "the the" is degenerate but
+        // an isolated digit reuse like "= 20 ... = 20" only trips when the
+        // FULL preceding span repeats). Here history is [20, 21] and the
+        // candidate 20 does NOT reproduce a contiguous 2-gram, so it is kept.
+        let params = SamplingParams {
+            temperature: 0.0,
+            anti_restate: true,
+            ..SamplingParams::default()
+        };
+        let mut state = SamplerState::new();
+        state.record(20); // 17
+        state.record(21); // times
+        let mut rng = Xorshift64::new(1);
+        let mut logits = vec![0.0; 32];
+        logits[20] = 5.0; // candidate "17" — proposed tail [..,21,20];
+                          // preceding [20,21] != [21,20] so NOT a restate.
+        let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
+        assert_eq!(t, 20, "isolated non-contiguous repeat must be allowed");
+    }
+
+    #[test]
+    fn anti_restate_allows_legit_two_token_repeat() {
+        // SAFETY: legitimate math reuses short fragments. A back-to-back
+        // 2-token repeat (below ANTI_RESTATE_MIN_SPAN=3) must NOT be vetoed —
+        // this is exactly the honest-arithmetic case a too-aggressive
+        // no-repeat-ngram destroyed. History [20,21,20] + candidate 21 forms
+        // the 2-token span [20,21] twice back-to-back; it must be allowed.
+        let params = SamplingParams {
+            temperature: 0.0,
+            anti_restate: true,
+            ..SamplingParams::default()
+        };
+        let mut state = SamplerState::new();
+        state.record(20);
+        state.record(21);
+        state.record(20);
+        let mut rng = Xorshift64::new(1);
+        let mut logits = vec![0.0; 32];
+        logits[21] = 5.0; // closes [20,21][20,21] — a 2-token repeat, allowed
+        let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
+        assert_eq!(t, 21, "2-token back-to-back repeat is below MIN_SPAN -> allowed");
+    }
+
+    #[test]
+    fn anti_restate_vetoes_backtoback_multitoken_loop() {
+        // The q4 loop unit: "340 + 51 =" repeating back-to-back. Model ids
+        // [340=30, +=31, 51=32, ==33] then again [30,31,32] and about to emit
+        // 33 to close the SECOND copy -> veto (breaks the loop).
+        let params = SamplingParams {
+            temperature: 0.0,
+            anti_restate: true,
+            ..SamplingParams::default()
+        };
+        let mut state = SamplerState::new();
+        for id in [30u32, 31, 32, 33, 30, 31, 32] {
+            state.record(id); // 340 + 51 = 340 + 51
+        }
+        let mut rng = Xorshift64::new(1);
+        let mut logits = vec![0.0; 64];
+        logits[33] = 5.0; // "=" would close the 2nd "340 + 51 =" (4-token loop)
+        logits[12] = 4.0; // " into" — a non-looping escape
+        let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
+        assert_ne!(t, 33, "back-to-back 4-token loop unit must be vetoed");
+        assert_eq!(t, 12, "guard escapes the loop via the next-best token");
+    }
+
+    #[test]
+    fn anti_restate_breaks_dense_runaway_loop() {
+        // The interleaved "17 \times 20 = …" loop: id 16 ("1"/"17") recurs
+        // densely. Once it has appeared >= THRESH(5) times in the recent
+        // window, the guard vetoes another and escapes.
+        let params = SamplingParams {
+            temperature: 0.0,
+            anti_restate: true,
+            ..SamplingParams::default()
+        };
+        let mut state = SamplerState::new();
+        // 5 prior occurrences of id 16 interleaved with filler.
+        for _ in 0..5 {
+            state.record(16);
+            state.record(99);
+        }
+        let mut rng = Xorshift64::new(1);
+        let mut logits = vec![0.0; 128];
+        logits[16] = 5.0; // would be the 6th dense occurrence -> veto
+        logits[12] = 4.0; // escape token
+        let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
+        assert_ne!(t, 16, "6th dense occurrence within window must be vetoed");
+        assert_eq!(t, 12, "guard escapes the runaway loop");
+    }
+
+    #[test]
+    fn anti_restate_allows_sparse_legit_reuse() {
+        // Honest math reuses an operand a few times. Below THRESH(5)
+        // occurrences in the window it must be allowed (no corruption).
+        let params = SamplingParams {
+            temperature: 0.0,
+            anti_restate: true,
+            ..SamplingParams::default()
+        };
+        let mut state = SamplerState::new();
+        // id 16 appears 4 times but embedded in NON-repeating, varied context
+        // (no back-to-back span repeat, no >=THRESH density) — legitimate.
+        for ctx in [[16u32, 40, 41], [16, 42, 43], [16, 44, 45], [16, 46, 47]] {
+            for id in ctx {
+                state.record(id);
+            }
+        }
+        // history now has id 16 x4 in last 12 tokens (window 28) -> 4 < THRESH 5.
+        let mut rng = Xorshift64::new(1);
+        let mut logits = vec![0.0; 128];
+        logits[50] = 5.0; // a fresh non-repeating continuation -> allowed
+        let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
+        assert_eq!(t, 50, "varied context with sparse id-16 reuse must be allowed");
+    }
+
+    #[test]
+    fn anti_restate_falls_back_when_all_degenerate() {
+        // If every probed candidate is degenerate the guard returns the raw
+        // argmax (never worse than greedy, always terminates).
+        let params = SamplingParams {
+            temperature: 0.0,
+            anti_restate: true,
+            ..SamplingParams::default()
+        };
+        let mut state = SamplerState::new();
+        state.set_decoder(test_decoder());
+        state.record(10); // " multiplication"
+        let mut rng = Xorshift64::new(1);
+        // Only id 11 ("lication", degenerate) has any probability mass; every
+        // other logit is -inf so there is no alternative.
+        let mut logits = vec![f32::NEG_INFINITY; 32];
+        logits[11] = 5.0;
+        let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
+        assert_eq!(t, 11, "no alternative -> fall back to raw argmax (never hang)");
+    }
+
+    #[test]
+    fn anti_restate_noop_on_empty_history() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            anti_restate: true,
+            ..SamplingParams::default()
+        };
+        let mut state = SamplerState::new();
+        state.set_decoder(test_decoder());
+        let mut rng = Xorshift64::new(1);
+        let mut logits = vec![0.0; 32];
+        logits[11] = 5.0;
+        let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
+        assert_eq!(t, 11, "empty history -> plain argmax");
+    }
+
+    #[test]
+    fn anti_restate_clear_keeps_decoder() {
+        let mut state = SamplerState::new();
+        state.set_decoder(test_decoder());
+        state.record(10);
+        state.clear();
+        assert!(state.decoder.is_some(), "clear() must retain the per-session decoder");
+        assert!(state.history.is_empty(), "clear() must drop per-sequence history");
     }
 }

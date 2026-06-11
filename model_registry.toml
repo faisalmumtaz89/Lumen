@@ -31,6 +31,16 @@ tokenizer = "Qwen/Qwen3.5-9B"
 
     [models.qwen3-5-9b.gguf_files]
     Q8_0 = { repo = "bartowski/Qwen_Qwen3.5-9B-GGUF", file = "Qwen_Qwen3.5-9B-Q8_0.gguf" }
+    # Q4_0 direct from the provider. Do NOT derive 9B q4 via
+    # `lumen convert --requant q4_0` for the generic/CUDA target: the requant
+    # LBC is catastrophically broken on CUDA (2026-06-10 isolation: requant
+    # 1/15 short-prompts vs direct-GGUF 13/15 — same near-tie profile as q8).
+    Q4_0 = { repo = "bartowski/Qwen_Qwen3.5-9B-GGUF", file = "Qwen_Qwen3.5-9B-Q4_0.gguf" }
+    # BF16 is a single flat file (~18 GB) — true bf16 weights from the
+    # provider. (The old quickstart "requant bf16 from Q8_0" route never
+    # existed in `lumen convert` — requant supports q4_0/q8_0 only — and a
+    # q8 upcast would not be real bf16 anyway.)
+    BF16 = { repo = "bartowski/Qwen_Qwen3.5-9B-GGUF", file = "Qwen_Qwen3.5-9B-bf16.gguf" }
 
 
 [models.qwen3-5-moe-35b-a3b]
@@ -44,17 +54,31 @@ tokenizer = "Qwen/Qwen3.5-35B-A3B"
     # Q4_0 entry — same provider, Q4_0 quant.
     Q4_0 = { repo = "bartowski/Qwen_Qwen3.5-35B-A3B-GGUF", file = "Qwen_Qwen3.5-35B-A3B-Q4_0.gguf" }
     # BF16 ships as a 2-shard split GGUF (~39 GB + ~31 GB = ~70 GB)
-    # because HuggingFace caps single GGUFs at ~50 GB. The multi-shard reader
-    # auto-discovers the second shard from the first; both filenames are
-    # declared here so the CLI can pre-fetch every shard before conversion.
-    # Note: bartowski's repo nests BF16 inside a subdirectory
-    # (`Qwen_Qwen3.5-35B-A3B-bf16/`). Local cache must keep shards adjacent
-    # (flat or both inside the same subdir); fresh-download support for this
-    # nested layout is deferred (current `download_gguf` rejects '/' in
-    # filenames for path-traversal safety).
+    # because HuggingFace caps single GGUFs at ~50 GB. bartowski's repo nests
+    # the shards inside a subdirectory (`Qwen_Qwen3.5-35B-A3B-bf16/`); the
+    # downloader uses the nested path on the URL side only and caches each
+    # shard flat under its basename, keeping shards adjacent for the
+    # multi-shard reader's auto-discovery.
     BF16 = { repo = "bartowski/Qwen_Qwen3.5-35B-A3B-GGUF", files = [
-        "Qwen_Qwen3.5-35B-A3B-bf16-00001-of-00002.gguf",
-        "Qwen_Qwen3.5-35B-A3B-bf16-00002-of-00002.gguf",
+        "Qwen_Qwen3.5-35B-A3B-bf16/Qwen_Qwen3.5-35B-A3B-bf16-00001-of-00002.gguf",
+        "Qwen_Qwen3.5-35B-A3B-bf16/Qwen_Qwen3.5-35B-A3B-bf16-00002-of-00002.gguf",
+    ] }
+
+
+[models.qwen3-6-27b]
+display_name = "Qwen3.6 27B"
+architecture = "qwen35"          # Qwen3.6-27B ships the qwen35 (GatedDeltaNet, dense) GGUF arch
+parameters = "27B"
+tokenizer = "Qwen/Qwen3.6-27B"
+
+    [models.qwen3-6-27b.gguf_files]
+    Q8_0 = { repo = "bartowski/Qwen_Qwen3.6-27B-GGUF", file = "Qwen_Qwen3.6-27B-Q8_0.gguf" }
+    Q4_0 = { repo = "bartowski/Qwen_Qwen3.6-27B-GGUF", file = "Qwen_Qwen3.6-27B-Q4_0.gguf" }
+    # BF16: 2-shard split GGUF nested under a HF subdir (same shape as the MoE
+    # BF16). Both shards declared; the multi-shard reader auto-discovers shard 2.
+    BF16 = { repo = "bartowski/Qwen_Qwen3.6-27B-GGUF", files = [
+        "Qwen_Qwen3.6-27B-bf16/Qwen_Qwen3.6-27B-bf16-00001-of-00002.gguf",
+        "Qwen_Qwen3.6-27B-bf16/Qwen_Qwen3.6-27B-bf16-00002-of-00002.gguf",
     ] }
 
 
@@ -66,3 +90,5 @@ tokenizer = "Qwen/Qwen3.5-35B-A3B"
 "qwen3.5-9b" = "qwen3-5-9b"
 "qwen3.5-moe-35b-a3b" = "qwen3-5-moe-35b-a3b"
 "qwen3.5-moe" = "qwen3-5-moe-35b-a3b"
+"qwen3.6-27b" = "qwen3-6-27b"
+"qwen3-6-27b" = "qwen3-6-27b"

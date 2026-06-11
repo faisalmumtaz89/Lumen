@@ -402,6 +402,7 @@ mod tests {
             num_active_experts: Some(2),
             norm_eps: 1e-5,
             rotary_dim: None, rope_neox: false,
+            gdn: None,
         };
         let qd = QuantizationDescriptor {
             scheme: QuantScheme::F32,
@@ -684,6 +685,7 @@ mod tests {
             num_active_experts: None,
             norm_eps: 1e-5,
             rotary_dim: None, rope_neox: false,
+            gdn: None,
         };
         let qd = QuantizationDescriptor {
             scheme: QuantScheme::F32,
@@ -854,14 +856,14 @@ mod tests {
     /// Benchmark sequential vs parallel pread throughput on a real LBC file.
     /// Measures bandwidth in GB/s for single-thread vs multi-thread reads.
     ///
-    /// Requires: `/tmp/lumen-bench/mixtral-8x7b-v0.1.lbc`
+    /// Requires a converted LBC at `/tmp/lumen-bench/qwen3-5-moe-35b-a3b-Q4_0.lbc`
     /// Run with: cargo test -p lumen-runtime -- --ignored test_parallel_pread_bandwidth
     #[test]
     #[ignore]
     fn test_parallel_pread_bandwidth() {
         use std::time::Instant;
 
-        let lbc_path = std::path::Path::new("/tmp/lumen-bench/mixtral-8x7b-v0.1.lbc");
+        let lbc_path = std::path::Path::new("/tmp/lumen-bench/qwen3-5-moe-35b-a3b-Q4_0.lbc");
         if !lbc_path.exists() {
             eprintln!(
                 "SKIP: benchmark file not found at {}",

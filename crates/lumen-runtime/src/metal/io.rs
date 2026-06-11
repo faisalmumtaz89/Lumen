@@ -317,14 +317,15 @@ mod tests {
 
     /// Benchmark Metal IO vs pread for streaming expert loading.
     ///
-    /// Requires: `/tmp/lumen-bench/mixtral-8x7b-v0.1.lbc`
+    /// Requires a converted LBC at `/tmp/lumen-bench/qwen3-5-moe-35b-a3b-Q4_0.lbc`
+    /// (produce via `lumen pull qwen3.5-moe-35b-a3b:q4_0`).
     /// Run with: cargo test -p lumen-runtime -- --ignored test_metal_io_bandwidth
     #[test]
     #[ignore]
     fn test_metal_io_bandwidth() {
         use std::time::Instant;
 
-        let lbc_path = std::path::Path::new("/tmp/lumen-bench/mixtral-8x7b-v0.1.lbc");
+        let lbc_path = std::path::Path::new("/tmp/lumen-bench/qwen3-5-moe-35b-a3b-Q4_0.lbc");
         if !lbc_path.exists() {
             eprintln!(
                 "SKIP: benchmark file not found at {}",

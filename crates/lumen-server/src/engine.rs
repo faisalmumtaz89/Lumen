@@ -28,6 +28,7 @@ use lumen_format::ModelHyperparams;
 use tokio::sync::mpsc;
 
 use crate::error::ServerError;
+use crate::tokenstop::StopMatcher;
 
 /// Per-request channel pool.
 ///
@@ -210,16 +211,26 @@ pub enum TokenEvent {
 /// Why a generation stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishReason {
+    /// Natural end of turn: the model emitted an EOS / role-end token.
     Stop,
+    /// Hit the answer-token budget (`max_tokens`) or the KV context window.
     Length,
+    /// A tool-call block was emitted (and not interrupted).
     ToolCalls,
+    /// A caller-supplied textual stop sequence (OpenAI `stop` /
+    /// Anthropic `stop_sequences`) was matched in the decoded answer text.
+    /// Distinct from `Stop` so Anthropic can report the spec-correct
+    /// `stop_reason: "stop_sequence"` (OpenAI collapses both to `"stop"`).
+    StopSequence,
 }
 
 impl FinishReason {
     /// String form for OpenAI / Anthropic finish_reason fields.
     pub fn as_openai(&self) -> &'static str {
         match self {
-            Self::Stop => "stop",
+            // OpenAI's ChatCompletion schema has a single "stop" value covering
+            // both natural EOS and a matched `stop` string.
+            Self::Stop | Self::StopSequence => "stop",
             Self::Length => "length",
             Self::ToolCalls => "tool_calls",
         }
@@ -231,6 +242,8 @@ impl FinishReason {
             Self::Stop => "end_turn",
             Self::Length => "max_tokens",
             Self::ToolCalls => "tool_use",
+            // Anthropic distinguishes a stop-sequence hit from a natural turn end.
+            Self::StopSequence => "stop_sequence",
         }
     }
 }
@@ -263,6 +276,19 @@ pub struct JobRequest {
     /// decode rather than dispatching the batched prefill kernel. Set to
     /// 0 to always use batched prefill; default 32.
     pub suffix_threshold: usize,
+
+    /// Whether the prompt opened a `<think>` reasoning block (resolved via
+    /// `runtime_defaults::resolve_enable_thinking`). Carried for the Part-4
+    /// decode-loop reasoning-budget / forced-close work; the current decode
+    /// loop does not yet read it. Default `false` (no reasoning).
+    pub enable_thinking: bool,
+
+    /// Maximum reasoning ("thinking") tokens before the decode loop force-
+    /// closes the `<think>` block (Part 4). Separate from `max_tokens` (the
+    /// answer budget) so the answer is never starved. `0` = unbounded /
+    /// unused (Part-4-pending). Carried now so Part 4 can wire enforcement
+    /// without touching every constructor again.
+    pub reasoning_budget: usize,
 }
 
 /// The reply channel the worker uses for token events.
@@ -652,6 +678,47 @@ impl EngineHandle {
         Arc::clone(&self.model_info)
     }
 
+    /// Maximum context length (in tokens) the loaded model / KV cache admits.
+    ///
+    /// Backed by `model_info.context_length`, which is set from the server's
+    /// `context_length` at startup and equals the worker's
+    /// `config.max_seq_len` (both flow from the same value in
+    /// `lumen-server.rs`). Exposed so the wire layer can reject an over-long
+    /// prompt SYNCHRONOUSLY in `into_job` — returning a 400 before the 200 OK
+    /// / SSE stream opens — instead of relying solely on the worker's
+    /// backstop guard (which, on the streaming path, can only surface as a
+    /// mid-stream error frame after headers are already sent).
+    pub fn context_length(&self) -> usize {
+        self.model_info.context_length
+    }
+
+    /// Test-only: build a minimal `EngineHandle` backed by an
+    /// [`IdentityByteTokenizer`] and NO live worker, so wire-layer unit tests
+    /// can exercise `into_job` / `context_length` / `tokenize_for_request`
+    /// without booting an engine. `submit` is unusable on this handle (the
+    /// worker sender is dropped), which is fine — `into_job` never calls it.
+    /// `context_length` is configurable so the synchronous oversize guard can
+    /// be unit-tested at a chosen window.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(context_length: usize) -> Self {
+        // Capacity-1 channel whose receiver is dropped immediately: no worker
+        // consumes jobs, but `into_job` only reads tokenizer / model_info.
+        let (sender, _job_inbox_rx) = mpsc::channel::<WorkerJob>(1);
+        Self {
+            sender,
+            model_info: Arc::new(ModelInfo {
+                id: "lumen-test:unit".into(),
+                owned_by: "lumen-test".into(),
+                created: 0,
+                context_length,
+            }),
+            tokenizer: Arc::new(IdentityByteTokenizer::default()) as Arc<dyn Tokenize>,
+            breakdown: Arc::new(Mutex::new(ServerMemoryBreakdown::default())),
+            channel_pool: Arc::new(Mutex::new(VecDeque::new())),
+            pool_cap: 2,
+        }
+    }
+
     /// Tokenize a rendered prompt string. Called by request handlers.
     pub fn tokenize_for_request(&self, prompt: &str) -> Vec<u32> {
         self.tokenizer.encode(prompt)
@@ -732,6 +799,19 @@ pub trait Tokenize: Send + Sync + 'static {
     /// reasonable convention is to keep raw bytes here and re-decode on
     /// each call.
     fn decode_incremental(&self, state: &mut Vec<u8>, token_id: u32) -> String;
+
+    /// Decode a SINGLE token id to its raw bytes (no UTF-8 buffering / no
+    /// lossy substitution). Powers the greedy anti-restate guard's sub-word
+    /// doubling rule, which needs the bytes of the candidate and of the
+    /// just-emitted token to recognise " multiplication" → "lication".
+    ///
+    /// Default impl returns an empty `Vec` so tokenizers that do not override
+    /// it simply disable the byte-level rule (the id-only n-gram restate rule
+    /// still works). Real BPE/SPM tokenizers should return the token's
+    /// per-id bytes (e.g. `BpeTokenizer::decode_bytes(&[id])`).
+    fn decode_id_bytes(&self, _token_id: u32) -> Vec<u8> {
+        Vec::new()
+    }
 
     /// Encode + apply chat template for a system+user pair. Default impl
     /// returns `None` so callers that just want raw completion don't have
@@ -877,6 +957,16 @@ impl EngineWorker {
                 return;
             }
         };
+
+        // Install the per-token-id byte decoder for the greedy anti-restate
+        // guard's sub-word-doubling rule. The closure captures an `Arc` clone
+        // of the worker's tokenizer and maps a token id to its raw decoded
+        // bytes. When the guard is disabled (dense, or LUMEN_ANTI_RESTATE=0)
+        // the closure is simply never invoked.
+        {
+            let tok = Arc::clone(&self.tokenizer);
+            session.set_token_decoder(Arc::new(move |id: u32| tok.decode_id_bytes(id)));
+        }
 
         // validate KV precision against backend once at worker
         // startup so a misconfigured server fails fast with a clear error
@@ -1353,9 +1443,68 @@ impl EngineWorker {
         // Decode loop.
         let mut bytes_state: Vec<u8> = Vec::new();
         let mut generated = 0usize;
+        // -- F4: textual stop-sequence matcher over the rolling DECODED text.
+        //
+        // Seeded from `request.stop_text` (the OpenAI `stop` / Anthropic
+        // `stop_sequences` list). When a stop string appears in the cumulative
+        // answer text, the loop emits the prefix UP-TO-BUT-EXCLUDING the stop
+        // and terminates with `FinishReason::StopSequence`. The matcher buffers the
+        // ambiguous tail across token boundaries so a stop straddling two
+        // decoded fragments is still caught (same window logic the wire layer
+        // uses, so worker and wire agree byte-for-byte).
+        //
+        // EMPTY-STOP BYTE-IDENTITY: when `request.stop_text` is empty,
+        // `StopMatcher::push` returns `(fragment, false)` verbatim and
+        // `finish()` returns "" — so every emitted `delta_text`, the token
+        // count, and the finish reason are byte-identical to the pre-F4 loop.
+        // The matcher is only consulted in the ANSWER phase, mirroring the wire
+        // layer (stop sequences bound the answer, never the `<think>` trace);
+        // on the thinking-off default path the loop is always in the answer
+        // phase so this is a no-op distinction.
+        let mut stop_matcher = StopMatcher::new(request.stop_text.clone());
+        // `Stop` is the value only for the degenerate `max_tokens == 0` answer
+        // budget (the entry guard breaks emitting nothing — byte-identical to
+        // the pre-Part-4 `for _ in 0..0`). Every other exit reassigns it.
         let mut finish_reason = FinishReason::Stop;
 
-        for _ in 0..request.max_tokens {
+        // -- Part 4: reasoning-phase state machine + forced-close -----------
+        //
+        // The decode loop runs in one of two phases:
+        //   * Reasoning  — inside the `<think>` block (only entered when the
+        //                  request resolved `enable_thinking == true`).
+        //   * Answer     — after `</think>` (natural OR forced).
+        // The ANSWER budget (`request.max_tokens`) bounds ONLY answer tokens,
+        // so a long reasoning trace can never starve the answer. The reasoning
+        // trace is bounded SEPARATELY by `request.reasoning_budget`; on
+        // overrun the loop FORCE-CLOSES by injecting `</think>\n\n` ids
+        // (advancing the KV via `session.extend`) and switches to the answer
+        // phase.
+        //
+        // THINKING-OFF byte-identity: when `enable_thinking` is false the
+        // phase starts at `Answer`, the detector / forced-close are never
+        // consulted (both gated on the reasoning phase), and the answer budget
+        // is the SAME post-emission `>= max_tokens` bound the pre-Part-4 loop
+        // used. The emitted token stream, count, and finish reason are
+        // therefore identical. (Guarded by `tests/reasoning_budget_test.rs`.)
+        let mut phase = if request.enable_thinking {
+            ReasoningPhase::Reasoning
+        } else {
+            ReasoningPhase::Answer
+        };
+        let mut reasoning_generated = 0usize;
+        let mut answer_generated = 0usize;
+        // Detects the model-emitted `</think>` close. Resolves the marker's
+        // token id(s) from the tokenizer ONCE (lazily) and matches by id when
+        // the tokenizer encodes `</think>` as a single special token (the
+        // Qwen3.5 production case), falling back to a straddle-safe text scan
+        // when it does not (e.g. a byte-level tokenizer). Only consulted in the
+        // reasoning phase.
+        let mut close_detector = ThinkCloseDetector::new();
+        // Forced-close injection ids, computed lazily so the thinking-off path
+        // never tokenizes the marker.
+        let mut close_ids: Option<Vec<u32>> = None;
+
+        loop {
             // Check cancel BEFORE running the decode
             // kernel.  A long max_tokens (e.g. max_tokens=10000)
             // would otherwise burn one full token's worth of GPU time
@@ -1373,6 +1522,69 @@ impl EngineWorker {
             // dominates the delay so the wedge-detection bound stays tight.
             if cancel.load(Ordering::Relaxed) {
                 return;
+            }
+            // Degenerate-answer-budget entry guard: in the answer phase with
+            // the budget already met and nothing emitted (the `max_tokens == 0`
+            // case, firing on iteration 0 with `answer_generated == 0`), fall
+            // out emitting nothing — byte-identical to the pre-Part-4
+            // `for _ in 0..0` (`{stop, completion=0}`). For `max_tokens >= 1`
+            // this never fires at entry (post-emission bound enforces it).
+            if phase == ReasoningPhase::Answer && answer_generated >= request.max_tokens {
+                break;
+            }
+            // FORCED-CLOSE: reasoning budget exhausted while still reasoning.
+            // Inject `</think>\n\n` (advances KV so decode resumes past the
+            // closed block), emit those bytes, switch to the answer phase.
+            // Gated on the reasoning phase, so never fires when thinking off.
+            if phase == ReasoningPhase::Reasoning
+                && request.reasoning_budget > 0
+                && reasoning_generated >= request.reasoning_budget
+            {
+                let ids = close_ids.get_or_insert_with(|| self.tokenizer.encode("</think>\n\n"));
+                if !ids.is_empty() {
+                    if session.kv().seq_len() + ids.len() > self.config.max_seq_len {
+                        finish_reason = FinishReason::Length;
+                        break;
+                    }
+                    match session.extend(ids, self.backend.as_ref(), self.weights.as_ref()) {
+                        Ok(_) => {
+                            let mut inject_text = String::new();
+                            for &id in ids.iter() {
+                                inject_text.push_str(
+                                    &self.tokenizer.decode_incremental(&mut bytes_state, id),
+                                );
+                            }
+                            if !inject_text.is_empty()
+                                && self
+                                    .send_event_polling_cancel(
+                                        &tokens_tx,
+                                        &cancel,
+                                        TokenEvent::Token {
+                                            token_id: *ids.last().unwrap(),
+                                            delta_text: inject_text,
+                                        },
+                                    )
+                                    .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            if matches!(&e, RuntimeError::KvCache(msg) if msg.contains("would exceed max_seq_len"))
+                            {
+                                finish_reason = FinishReason::Length;
+                                break;
+                            }
+                            let _ = self.send_event_polling_cancel(
+                                &tokens_tx,
+                                &cancel,
+                                TokenEvent::Error(format!("forced-close inject: {e}")),
+                            );
+                            return;
+                        }
+                    }
+                }
+                phase = ReasoningPhase::Answer;
             }
             // Proactive KV-overflow check BEFORE
             // dispatching the decode kernel.
@@ -1455,6 +1667,13 @@ impl EngineWorker {
                 }
             };
             generated += 1;
+            // Charge the token to the active phase. A token that carries (or
+            // completes) `</think>` is the last reasoning token; the answer
+            // begins on the following token.
+            match phase {
+                ReasoningPhase::Reasoning => reasoning_generated += 1,
+                ReasoningPhase::Answer => answer_generated += 1,
+            }
 
             // EOS check (token-id based).
             if request.eos_token_ids.contains(&token_id) {
@@ -1468,7 +1687,53 @@ impl EngineWorker {
                 .tokenizer
                 .decode_incremental(&mut bytes_state, token_id);
 
-            if self
+            // Phase transition: detect the model-emitted `</think>` close by
+            // token id (special-token fast path) or straddle-safe text scan
+            // (fallback). Only while reasoning. The FULL `delta` is observed so
+            // the close detector sees every byte even when the stop matcher
+            // (below) holds part of it back.
+            if phase == ReasoningPhase::Reasoning
+                && close_detector.observe(token_id, &delta, self.tokenizer.as_ref())
+            {
+                phase = ReasoningPhase::Answer;
+            }
+
+            // F4 textual stop. ONLY engaged when the matcher is active (a
+            // non-empty `stop_text`) AND we are in the answer phase. The
+            // EMPTY-STOP / reasoning-phase path takes the `else` branch which
+            // emits `delta` verbatim — byte-identical to the pre-F4 loop
+            // (including empty deltas from partial-UTF-8 tokens, which the
+            // matcher branch would otherwise suppress).
+            if stop_matcher.is_active() && phase == ReasoningPhase::Answer {
+                let (safe, hit_stop) = stop_matcher.push(&delta);
+                // Emit the safe prefix (the matcher holds back any tail that
+                // could still complete a stop sequence). Skip empty fragments —
+                // the wire layer suppresses empty-content frames anyway, and an
+                // active stop matcher is never on the byte-identity path.
+                if !safe.is_empty()
+                    && self
+                        .send_event_polling_cancel(
+                            &tokens_tx,
+                            &cancel,
+                            TokenEvent::Token {
+                                token_id,
+                                delta_text: safe,
+                            },
+                        )
+                        .is_err()
+                {
+                    return;
+                }
+                if hit_stop {
+                    // The matched stop bytes (and anything after) are dropped
+                    // per stop semantics; the prefix before it was already
+                    // emitted above. Report StopSequence (OpenAI "stop" /
+                    // Anthropic "stop_sequence") to distinguish a caller stop
+                    // string from a natural EOS end-of-turn.
+                    finish_reason = FinishReason::StopSequence;
+                    break;
+                }
+            } else if self
                 .send_event_polling_cancel(
                     &tokens_tx,
                     &cancel,
@@ -1482,10 +1747,34 @@ impl EngineWorker {
                 return;
             }
 
-            if generated >= request.max_tokens {
+            // ANSWER budget: bounds ONLY answer-phase tokens. On the
+            // thinking-off path `answer_generated == generated`, so this is the
+            // SAME stop as the pre-Part-4 loop.
+            if phase == ReasoningPhase::Answer && answer_generated >= request.max_tokens {
                 finish_reason = FinishReason::Length;
                 break;
             }
+        }
+
+        // F4 residual flush: drain any bytes the stop matcher held back across
+        // the final iteration (a partial stop-prefix that the natural EOS /
+        // max-tokens / KV-overflow termination never completed — so those bytes
+        // are genuine answer content and safe to emit). On a `hit_stop` exit the
+        // matcher's window was already cleared, so this yields "". On the
+        // EMPTY-STOP path `finish()` always yields "" (the matcher never holds
+        // anything), so NO event is emitted and the stream stays byte-identical.
+        let residual_stop = stop_matcher.finish();
+        if !residual_stop.is_empty() {
+            // The held tail belongs to the last decoded token; report its id for
+            // logging parity. The wire layer keys only on `delta_text`.
+            let _ = self.send_event_polling_cancel(
+                &tokens_tx,
+                &cancel,
+                TokenEvent::Token {
+                    token_id: 0,
+                    delta_text: residual_stop,
+                },
+            );
         }
 
         let _ = self.send_event_polling_cancel(
@@ -1505,6 +1794,90 @@ impl EngineWorker {
 }
 
 // -- helpers --
+
+/// Decode-loop reasoning phase (Part 4). Starts at `Reasoning` only when the
+/// request resolved `enable_thinking == true`; otherwise the loop runs
+/// entirely in `Answer`, which is byte-identical to the pre-Part-4 behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningPhase {
+    Reasoning,
+    Answer,
+}
+
+/// Detects the model-emitted `</think>` close marker during decode so the loop
+/// can flip from the reasoning phase to the answer phase.
+///
+/// Detection is hybrid: it resolves the marker's token id(s) ONCE from the
+/// tokenizer and, when `</think>` encodes to a SINGLE id (the Qwen3.5
+/// special-token case), matches by that id — exact and free. When the
+/// tokenizer does not have `</think>` as one token (e.g. a byte-level
+/// tokenizer), it falls back to a straddle-safe scan of the decoded text using
+/// the same `tooling::THINK_CLOSE` constant the wire-layer `ReasoningExtractor`
+/// splits on, so the decode-loop boundary matches the downstream split.
+struct ThinkCloseDetector {
+    /// The marker's token id IFF `</think>` encodes to exactly one token.
+    /// Resolved lazily on first `observe` (so the thinking-off path never
+    /// tokenizes it). `None` until resolved; `Some(None)` = resolved to "not a
+    /// single token" (use the text fallback); `Some(Some(id))` = match by id.
+    marker_id: Option<Option<u32>>,
+    /// Trailing bytes from the previous fragment that could begin the marker
+    /// (text-fallback carry). At most `THINK_CLOSE.len() - 1`.
+    carry: String,
+}
+
+impl ThinkCloseDetector {
+    fn new() -> Self {
+        Self { marker_id: None, carry: String::new() }
+    }
+
+    /// Observe one decoded token (its id + decoded fragment). Returns `true`
+    /// the first time `</think>` is recognised.
+    fn observe(&mut self, token_id: u32, fragment: &str, tok: &dyn Tokenize) -> bool {
+        // Resolve the single-token marker id on first use.
+        let marker_id = *self.marker_id.get_or_insert_with(|| {
+            let ids = tok.encode(lumen_runtime::tooling::THINK_CLOSE);
+            if ids.len() == 1 {
+                Some(ids[0])
+            } else {
+                None
+            }
+        });
+        // Fast path: exact special-token id.
+        if let Some(id) = marker_id {
+            if token_id == id {
+                return true;
+            }
+            // Even with a single-token marker, also run the text fallback in
+            // case the model spelled the marker out as separate sub-tokens.
+        }
+        // Text fallback: straddle-safe scan.
+        let marker = lumen_runtime::tooling::THINK_CLOSE;
+        let mut buf = String::with_capacity(self.carry.len() + fragment.len());
+        buf.push_str(&self.carry);
+        buf.push_str(fragment);
+        self.carry.clear();
+        if buf.contains(marker) {
+            return true;
+        }
+        let keep = marker_prefix_overlap(buf.as_bytes(), marker.as_bytes());
+        if keep > 0 {
+            self.carry.push_str(&buf[buf.len() - keep..]);
+        }
+        false
+    }
+}
+
+/// Length of the longest suffix of `tail` that is a prefix of `marker`
+/// (capped at `marker.len() - 1`). Pure helper for the text fallback.
+fn marker_prefix_overlap(tail: &[u8], marker: &[u8]) -> usize {
+    let max = tail.len().min(marker.len().saturating_sub(1));
+    for k in (1..=max).rev() {
+        if tail[tail.len() - k..] == marker[..k] {
+            return k;
+        }
+    }
+    0
+}
 
 /// Best-effort extraction of a human-readable message from a
 /// `Box<dyn Any + Send>` panic payload as returned by
@@ -1994,5 +2367,103 @@ mod panic_supervisor_tests {
         std::env::remove_var("LUMEN_SERVER_PANIC_MAX");
         assert_eq!(panic_window().as_secs(), DEFAULT_PANIC_WINDOW_SECS);
         assert_eq!(max_panics_in_window(), DEFAULT_MAX_PANICS_IN_WINDOW);
+    }
+}
+
+// =========================================================================
+// Part 4: `ThinkCloseDetector` unit tests.
+//
+// Cover both detection paths: the special-token id fast path (Qwen3.5
+// production tokeniser) and the straddle-safe text fallback (byte-level
+// tokeniser). The end-to-end budget / forced-close behaviour is covered in
+// `tests/reasoning_budget_test.rs`.
+// =========================================================================
+#[cfg(test)]
+mod think_close_detector_tests {
+    use super::*;
+
+    /// Tokeniser that encodes `</think>` as ONE special id (id 7), everything
+    /// else as bytes — mirrors the real Qwen3.5 special-token registration.
+    struct SpecialThinkTokenizer;
+    impl Tokenize for SpecialThinkTokenizer {
+        fn encode(&self, text: &str) -> Vec<u32> {
+            if text == lumen_runtime::tooling::THINK_CLOSE {
+                vec![7]
+            } else {
+                text.bytes().map(|b| b as u32).collect()
+            }
+        }
+        fn decode_incremental(&self, _s: &mut Vec<u8>, id: u32) -> String {
+            if id == 7 { "</think>".to_string() } else { ((id & 0xff) as u8 as char).to_string() }
+        }
+        fn eos_tokens(&self) -> Vec<u32> { vec![0] }
+    }
+
+    /// Byte tokeniser: `</think>` is NOT a single token (forces the text
+    /// fallback). `encode("</think>")` returns 8 byte ids.
+    struct ByteTokenizer;
+    impl Tokenize for ByteTokenizer {
+        fn encode(&self, text: &str) -> Vec<u32> {
+            text.bytes().map(|b| b as u32).collect()
+        }
+        fn decode_incremental(&self, _s: &mut Vec<u8>, id: u32) -> String {
+            ((id & 0xff) as u8 as char).to_string()
+        }
+        fn eos_tokens(&self) -> Vec<u32> { vec![0] }
+    }
+
+    #[test]
+    fn special_token_id_fast_path() {
+        let tok = SpecialThinkTokenizer;
+        let mut d = ThinkCloseDetector::new();
+        // A normal token does not match.
+        assert!(!d.observe(104, "h", &tok));
+        // The special `</think>` id matches immediately.
+        assert!(d.observe(7, "</think>", &tok));
+    }
+
+    #[test]
+    fn byte_tokenizer_text_fallback_one_fragment() {
+        let tok = ByteTokenizer;
+        let mut d = ThinkCloseDetector::new();
+        // Feed the whole marker as one (multi-byte) fragment via a single
+        // observe; the id won't match (no single-token marker) but the text
+        // scan catches it.
+        assert!(d.observe(62, "reasoning</think>", &tok));
+    }
+
+    #[test]
+    fn byte_tokenizer_text_fallback_split() {
+        let tok = ByteTokenizer;
+        let mut d = ThinkCloseDetector::new();
+        assert!(!d.observe(105, "</thi", &tok));
+        assert!(d.observe(62, "nk>", &tok));
+    }
+
+    #[test]
+    fn special_tokenizer_also_catches_spelled_out_marker() {
+        // Even when `</think>` has a single id, a model that spells it out as
+        // separate sub-tokens is still caught via the text fallback.
+        let tok = SpecialThinkTokenizer;
+        let mut d = ThinkCloseDetector::new();
+        // Decoded text spells the marker without ever using id 7.
+        assert!(d.observe(62, "thinking</think>", &tok));
+    }
+
+    #[test]
+    fn near_miss_is_not_a_false_positive() {
+        let tok = ByteTokenizer;
+        let mut d = ThinkCloseDetector::new();
+        assert!(!d.observe(105, "</thi", &tok));
+        assert!(!d.observe(110, "nking", &tok));
+    }
+
+    #[test]
+    fn marker_prefix_overlap_basic() {
+        let m = b"</think>";
+        assert_eq!(marker_prefix_overlap(b"x</thi", m), 5);
+        assert_eq!(marker_prefix_overlap(b"x<", m), 1);
+        assert_eq!(marker_prefix_overlap(b"xyz", m), 0);
+        assert_eq!(marker_prefix_overlap(b"</think>", m), 0); // full match handled by contains
     }
 }

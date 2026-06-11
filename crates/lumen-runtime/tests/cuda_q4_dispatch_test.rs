@@ -264,6 +264,7 @@ fn test_hyperparams() -> lumen_format::hyperparams::ModelHyperparams {
         num_active_experts: None,
         norm_eps: 1e-5,
         rotary_dim: None, rope_neox: false,
+        gdn: None,
     }
 }
 

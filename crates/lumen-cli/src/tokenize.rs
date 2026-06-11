@@ -269,12 +269,75 @@ impl BpeTokenizer {
         }
     }
 
-    /// Apply chat template and return the full prompt string.
-    pub fn apply_chat_template(&self, prompt: &str) -> String {
-        self.apply_chat_template_with_system(prompt, None)
+    /// Build a self-contained, `'static` per-token-id byte decoder closure for
+    /// the runtime's greedy anti-restate guard.
+    ///
+    /// The runtime crate is tokenizer-agnostic and the guard's
+    /// sub-word-doubling rule needs to decode a single candidate token id to
+    /// its raw bytes from inside the sampler. `BpeTokenizer` itself is not
+    /// `Clone` (it holds a compiled regex), so instead of cloning the whole
+    /// tokenizer we capture ONLY the byte-decode inputs — the `vocab` strings,
+    /// the `unicode_to_byte` map, and the `model_type` discriminator — into an
+    /// owned closure. The closure reproduces `decode_bytes(&[id])` exactly for
+    /// a single id, so the guard sees identical bytes to the streaming
+    /// detokenizer. Cost is a one-time clone of the vocab at engine setup.
+    pub fn byte_decoder_fn(&self) -> std::sync::Arc<dyn Fn(u32) -> Vec<u8> + Send + Sync> {
+        let vocab = self.vocab.clone();
+        let unicode_to_byte = self.unicode_to_byte.clone();
+        let is_spm = self.model_type == "llama";
+        std::sync::Arc::new(move |id: u32| {
+            let tok_str = match vocab.get(id as usize) {
+                Some(s) => s,
+                None => return Vec::new(),
+            };
+            if is_spm {
+                // SPM byte-fallback `<0xHH>` -> byte; ▁ -> space; else UTF-8.
+                if tok_str.starts_with("<0x")
+                    && tok_str.ends_with('>')
+                    && tok_str.len() == 6
+                {
+                    if let Ok(byte_val) = u8::from_str_radix(&tok_str[3..5], 16) {
+                        return vec![byte_val];
+                    }
+                }
+                tok_str.replace('\u{2581}', " ").into_bytes()
+            } else {
+                // tiktoken / byte-level BPE: map each char through the
+                // GPT-2 unicode->byte table.
+                let mut bytes = Vec::new();
+                for c in tok_str.chars() {
+                    if let Some(&b) = unicode_to_byte.get(&c) {
+                        bytes.push(b);
+                    }
+                }
+                bytes
+            }
+        })
     }
 
-    pub fn apply_chat_template_with_system(&self, prompt: &str, system: Option<&str>) -> String {
+    /// Apply chat template and return the full prompt string.
+    ///
+    /// Defaults `enable_thinking` to `false` (the closed empty-think tail) so
+    /// existing callers stay byte-identical. Use
+    /// [`apply_chat_template_with_system`](Self::apply_chat_template_with_system)
+    /// to control reasoning.
+    pub fn apply_chat_template(&self, prompt: &str) -> String {
+        self.apply_chat_template_with_system(prompt, None, false)
+    }
+
+    /// Apply the chat template with an optional system prompt and an
+    /// `enable_thinking` flag. For the Qwen3.5 path the flag selects the
+    /// open vs closed `<think>` tail via the SAME shared
+    /// [`lumen_runtime::runtime_defaults::think_prompt_tail`] helper the
+    /// OpenAI / Anthropic wire surfaces use, so the CLI cannot drift. The flag
+    /// is a no-op for templates that have no `<think>` block (Llama-3, Qwen2.5,
+    /// TinyLlama), matching their upstream chat templates.
+    pub fn apply_chat_template_with_system(
+        &self,
+        prompt: &str,
+        system: Option<&str>,
+        enable_thinking: bool,
+    ) -> String {
         if self.token_to_id.contains_key("<|begin_of_text|>") {
             // Llama-3 style
             let sys = system.unwrap_or(
@@ -288,19 +351,18 @@ impl BpeTokenizer {
                  {prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
             )
         } else if self.pre_tokenizer == "qwen35" {
-            // Qwen3.5: ChatML. The official Qwen3.5 jinja template emits an
-            // empty `<think>\n\n</think>\n\n` block when `enable_thinking=false`
-            // is set. Previously this code unconditionally pre-filled an OPEN
-            // `<think>\n` which forced the model into thinking mode for every
-            // prompt and burned the gen budget on metacommentary (
-            // root cause for an earlier coherence-test failure).
-            // We now emit the closed empty-think prefix so the model proceeds
-            // straight to the answer, matching the official Qwen3.5
-            // `enable_thinking=false` chat-template output.
+            // Qwen3.5: ChatML. The `<think>` tail is selected by the shared
+            // `think_prompt_tail` helper: closed `<think>\n\n</think>\n\n` when
+            // reasoning is off (the default — model answers directly, matching
+            // the official `enable_thinking=false` template) or open `<think>\n`
+            // when on (model emits a reasoning trace, extracted into
+            // `reasoning_content` / a labelled CLI section by the shared
+            // ReasoningExtractor).
+            let tail = lumen_runtime::runtime_defaults::think_prompt_tail(enable_thinking);
             if let Some(sys) = system {
-                format!("<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+                format!("<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{tail}")
             } else {
-                format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+                format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{tail}")
             }
         } else if self.pre_tokenizer == "qwen2" {
             // Qwen2.5: ChatML with system message
@@ -714,6 +776,69 @@ enum Segment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal Qwen3.5-pretokenizer `BpeTokenizer` with no model file.
+    /// Enough to exercise `apply_chat_template_with_system`'s string formatting
+    /// (which only inspects `token_to_id`/`pre_tokenizer`, not the vocab).
+    fn minimal_qwen35_tokenizer() -> BpeTokenizer {
+        let data = lumen_convert::tokenizer_data::TokenizerData {
+            model_type: "gpt2".into(),
+            pre_tokenizer: "qwen35".into(),
+            tokens: vec!["a".into(), "b".into()],
+            token_types: vec![1, 1],
+            scores: vec![0.0, 0.0],
+            merges: Vec::new(),
+            bos_token_id: 0,
+            eos_token_id: 1,
+            pad_token_id: None,
+            add_bos_token: false,
+            add_eos_token: false,
+            add_space_prefix: false,
+            chat_template: None,
+        };
+        BpeTokenizer::from_tokenizer_data(&data)
+    }
+
+    #[test]
+    fn qwen35_template_closed_think_tail_when_thinking_off() {
+        // enable_thinking=false (default) MUST emit the closed empty-think
+        // tail — byte-identical to the pre-reasoning-control CLI behaviour and
+        // to the server `render_chat_prompt` user-only output.
+        let tok = minimal_qwen35_tokenizer();
+        let out = tok.apply_chat_template_with_system("Hello", None, false);
+        assert_eq!(
+            out,
+            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        // The zero-arg convenience wrapper must default to thinking-off.
+        assert_eq!(tok.apply_chat_template("Hello"), out);
+    }
+
+    #[test]
+    fn qwen35_template_open_think_tail_when_thinking_on() {
+        // enable_thinking=true MUST emit the OPEN `<think>\n` tail.
+        let tok = minimal_qwen35_tokenizer();
+        let out = tok.apply_chat_template_with_system("Hello", None, true);
+        assert_eq!(
+            out,
+            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+    }
+
+    #[test]
+    fn qwen35_template_with_system_honours_thinking_flag() {
+        let tok = minimal_qwen35_tokenizer();
+        let off = tok.apply_chat_template_with_system("Hi", Some("Sys"), false);
+        assert_eq!(
+            off,
+            "<|im_start|>system\nSys<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        let on = tok.apply_chat_template_with_system("Hi", Some("Sys"), true);
+        assert_eq!(
+            on,
+            "<|im_start|>system\nSys<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+    }
 
     /// Fixture format matching the JSON test files.
     #[derive(serde::Deserialize)]

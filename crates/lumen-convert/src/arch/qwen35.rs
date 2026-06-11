@@ -278,10 +278,19 @@ fn compute_layer_shape_qwen35(
     // SSM_OUT: Qwen3.5 GDN runtime has fast Q8_0 / Q4_0 paths (gdn.rs:1955-1999)
     // and a slow per-token F32 fallback. Default SSM_OUT to Q8_0 even when the
     // user did not pass `--requant`, so the runtime never falls into the F32
-    // path. If the user asked for `--requant q4_0`, honor it (Q4_0 SSM_OUT has
-    // its own fast tiled GEMM). The previous default ("force F32 unless requant
-    // handles it") shipped LBCs that lost 100%+ Metal prefill on Qwen3.5-9B.
-    let ssm_out_target = requant_to.or(Some(QuantScheme::Q8_0));
+    // path. FLOOR at Q8_0 even under `--requant q4_0`: 4-bit ssm_out corrupts
+    // the GDN recurrence into degenerate output (measured 2026-06-10:
+    // a requant-q4 LBC passed 1/15 short prompts vs 13/15 for an LBC
+    // converted from the provider's direct Q4_0 GGUF, which ships Q8-class
+    // ssm_out). Cost of the floor: +202 MB on 9B (24 layers × 17.8 vs
+    // 9.4 MB) — correctness wins; ssm_out quantization is empirically the
+    // dominant quality lever on this architecture. (The even-older default
+    // "force F32 unless requant handles it" shipped LBCs that lost 100%+
+    // Metal prefill on Qwen3.5-9B.)
+    let ssm_out_target = match requant_to {
+        Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
+        other => other.or(Some(QuantScheme::Q8_0)),
+    };
     let ssm_out = compute_slice_with_requant(gguf, layer, SSM_OUT, &mut blob_size, ssm_out_target)?;
 
     // Dense FFN weights (present in all layers)
@@ -382,12 +391,16 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
     {
         let name = layer_tensor_name(layer, SSM_OUT);
         if gguf.find_tensor(&name).is_some() {
-            // SSM_OUT: route through the runtime's fast Q8_0 / Q4_0 GDN paths.
-            // Default to Q8_0 when no `--requant` was given; honor Q4_0 when
-            // the user requested it. Must match compute_slice_with_requant
-            // above for layer-shape symmetry. (Target is irrelevant here:
-            // ssm_out is always force-requanted regardless of target.)
-            let ssm_out_target = requant_to.or(Some(QuantScheme::Q8_0));
+            // SSM_OUT: route through the runtime's fast Q8_0 GDN path.
+            // FLOORED at Q8_0 even under `--requant q4_0` — 4-bit ssm_out
+            // corrupts the GDN recurrence (2026-06-10 RCA; see the matching
+            // floor + evidence in compute_slice_with_requant above; the two
+            // MUST stay in sync for layer-shape symmetry). (Target is
+            // irrelevant here: ssm_out is always force-requanted.)
+            let ssm_out_target = match requant_to {
+                Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
+                other => other.or(Some(QuantScheme::Q8_0)),
+            };
             append_tensor_to_blob_requant(blob, reader, gguf, &name, /*dequantize=*/ false, ssm_out_target)?;
         }
     }

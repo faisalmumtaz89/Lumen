@@ -171,8 +171,26 @@ impl Session {
         self.sampling = sampling;
         // Reset penalty history on sampling-param change; the next
         // next_token() call's sync_sampler_state will re-seed it from
-        // self.tokens.
+        // self.tokens. Preserve the installed anti-restate byte decoder — it
+        // is a per-session capability, not per-sequence state, so a per-job
+        // `set_sampling` must not silently disable the sub-word-doubling rule.
+        let decoder = self.sampler_state.decoder.take();
         self.sampler_state = SamplerState::new();
+        self.sampler_state.decoder = decoder;
+    }
+
+    /// Install the per-token-id byte decoder used by the greedy anti-restate
+    /// guard's sub-word-doubling rule (see [`crate::sampling::SamplerState`]).
+    ///
+    /// The runtime is tokenizer-agnostic, so the embedder (CLI / server, which
+    /// own a `BpeTokenizer`) passes a closure mapping a token id to its decoded
+    /// UTF-8 bytes. This is a per-session capability and survives the
+    /// `sampler_state` re-seeding that `set_sampling` / `sync_sampler_state`
+    /// perform (those reset history, not the decoder). Call once after
+    /// constructing the session. A no-op-safe choice: if never called, the
+    /// byte-level rule is skipped and only the id-only n-gram restate rule runs.
+    pub fn set_token_decoder(&mut self, decoder: crate::sampling::TokenByteDecoder) {
+        self.sampler_state.set_decoder(decoder);
     }
 
     /// refresh `sampler_state` from `tokens` when out of sync.
@@ -187,6 +205,16 @@ impl Session {
         for &t in tokens.iter() {
             state.record(t);
         }
+    }
+
+    /// DIAGNOSTIC gate (default OFF): when `LUMEN_FORCE_PREFILL_DECODE=1`,
+    /// `next_token` generates every token via full re-prefill instead of the
+    /// single-token decode path. Used to isolate decode-vs-prefill defects
+    /// (CUDA MoE-35B router-flip root cause). Remove before commit.
+    fn force_prefill_decode() -> bool {
+        use std::sync::OnceLock;
+        static G: OnceLock<bool> = OnceLock::new();
+        *G.get_or_init(|| std::env::var("LUMEN_FORCE_PREFILL_DECODE").as_deref() == Ok("1"))
     }
 
     /// Total length of the token history (prompt + generated).
@@ -1131,6 +1159,33 @@ impl Session {
         // the rolling repeat-last-n window see prompt + previously generated
         // tokens regardless of which extend path was taken.
         Self::sync_sampler_state(&self.tokens, &mut self.sampler_state);
+
+        // DIAGNOSTIC (env LUMEN_FORCE_PREFILL_DECODE=1, default OFF): generate
+        // EVERY token by re-prefilling the full sequence from scratch (fresh KV,
+        // reset recurrent state) using ONLY the batched prefill path -- the
+        // single-token `decode_token` path is never called. This isolates
+        // whether the prefill path is a coherent generator vs. the decode path.
+        // Empirical CUDA MoE-35B root-cause probe; remove before commit.
+        if Self::force_prefill_decode() {
+            let start = Instant::now();
+            let full = self.tokens.clone();
+            self.truncate_to(0); // kv.seq_len -> 0, clears pending_logits & tokens
+            backend.reset_recurrent_state(); // GDN h_state/conv_state reset
+            let last_hidden = backend.prefill(&full, weights, &mut self.kv)?;
+            let mut cx = ActivationBuffer::zeros(last_hidden.len(), ComputeDtype::F32);
+            cx.write_f32_from(&last_hidden);
+            let mut logits = backend.compute_final(&cx)?;
+            let token = sample_token_with_state(
+                &mut logits, &self.sampling, &mut self.sampler_state, &mut self.rng,
+            );
+            // Restore the full token history + the freshly sampled token so the
+            // next call re-prefills prompt+generated-so-far.
+            self.tokens = full;
+            self.tokens.push(token);
+            self.decode_time += start.elapsed();
+            return Ok(token);
+        }
+
         let last = match self.pending_logits.take() {
             Some(mut logits) => {
                 // Path A -- sample the logits left by `extend` (or a previous
@@ -1359,6 +1414,7 @@ mod tests {
     use lumen_format::ModelHyperparams;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     use crate::compute::cpu_naive::NaiveF32Backend;
     use crate::compute::ComputeBackend;
@@ -1366,6 +1422,16 @@ mod tests {
     use crate::weight::provider_sync::SyncWeightProvider;
 
     static SESSION_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Serializes the tests that mutate process-global environment variables
+    /// (currently `LUMEN_SUFFIX_THRESHOLD`, via `with_suffix_env`). Under the
+    /// default multithreaded test runner, an env `set_var`/`remove_var` in one
+    /// test races sibling tests reading the same variable. Every env-mutating
+    /// test in this module holds this lock for the full set→read→restore window
+    /// so the mutation is never observed concurrently. Mirrors the per-crate
+    /// `SERIAL` pattern in `runtime_defaults.rs`. Test-only; no production code
+    /// path takes this lock.
+    static SERIAL: Mutex<()> = Mutex::new(());
 
     fn synthetic_setup() -> (SyncWeightProvider, NaiveF32Backend, ModelHyperparams) {
         let cfg = TestModelConfig::default();
@@ -1469,6 +1535,7 @@ mod tests {
             norm_eps: 1e-5,
             rotary_dim: None,
             rope_neox: false,
+            gdn: None,
         }
     }
 
@@ -1796,6 +1863,13 @@ mod tests {
     /// value and restores the prior state on drop.
     fn with_suffix_env<F: FnOnce() -> usize>(value: Option<&str>, body: F) -> usize {
         const ENV: &str = "LUMEN_SUFFIX_THRESHOLD";
+        // Hold SERIAL for the whole set→read→restore window so a concurrent
+        // sibling never observes the mutated value (poison-tolerant, matching
+        // the runtime_defaults SERIAL pattern). `body` here is a pure parse
+        // (`resolve_suffix_threshold`) that cannot panic, and the callers'
+        // assertions run after this helper has already restored the prior
+        // value, so env state can never leak to a sibling.
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let prior = std::env::var(ENV).ok();
         match value {
             Some(v) => std::env::set_var(ENV, v),

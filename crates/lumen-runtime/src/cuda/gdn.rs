@@ -55,21 +55,26 @@ pub struct GdnParams {
 impl GdnParams {
     /// Derive GDN parameters from model hyperparameters.
     ///
-    /// GDN dimensions come from SSM metadata, NOT from the model's attention head count:
+    /// GDN dimensions come from SSM metadata (carried in `ModelHyperparams.gdn`),
+    /// NOT from the model's attention head count:
     /// - num_kv_heads = ssm.group_count (16 for Qwen3.5-9B, NOT model's num_kv_heads=4)
-    /// - num_heads = 2 * num_kv_heads = 32 (GQA repeat factor 2)
-    /// - head_dim = ssm.state_size = 128 (NOT model's head_dim=256)
-    /// - inner_size = num_heads * head_dim = 4096
-    /// - conv_kernel_size = 4
+    /// - num_heads    = ssm.time_step_rank (32 for 9B, 48 for Qwen3.6-27B)
+    /// - head_dim     = ssm.state_size (128, NOT model's head_dim=256)
+    /// - inner_size   = num_heads * head_dim (4096 for 9B, 6144 for 27B)
+    /// - conv_kernel_size = ssm.conv_kernel (4)
     ///
-    /// The model hyperparams only provide hidden_dim (4096) and eps. The SSM-specific
-    /// dimensions are hardcoded here because ModelHyperparams doesn't carry them.
+    /// `hp.gdn_dims()` returns the explicit dims when present, or the Qwen3.5-9B
+    /// default ({32,16,128,4}) when absent, so 9B models stay byte-identical.
     pub fn from_hyperparams(hp: &ModelHyperparams) -> Self {
-        // Qwen3.5-9B GDN: group_count=16, state_size=128, inner_size=4096
-        let num_kv_heads = 16;  // ssm.group_count
-        let head_dim = 128;     // ssm.state_size
-        let num_heads = num_kv_heads * 2; // GQA repeat factor 2 = 32
-        Self::with_dims(num_heads, num_kv_heads, head_dim, 4, hp.hidden_dim as usize, hp.norm_eps)
+        let g = hp.gdn_dims();
+        Self::with_dims(
+            g.num_v_heads as usize,
+            g.num_k_heads as usize,
+            g.head_dim as usize,
+            g.conv_kernel as usize,
+            hp.hidden_dim as usize,
+            hp.norm_eps,
+        )
     }
 
     /// Construct GDN parameters with explicit dimensions.
@@ -659,6 +664,7 @@ mod tests {
             num_active_experts: None,
             norm_eps: 1e-6,
             rotary_dim: None, rope_neox: false,
+            gdn: None,
         };
         let p = GdnParams::from_hyperparams(&hp);
         assert_eq!(p.num_kv_heads, 16);

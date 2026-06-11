@@ -1,0 +1,15 @@
+{"id": "short-arith-01", "gate": "GQ-001", "prompt": "Compute 17 times 23 and give the final numeric answer.", "is_math": true, "answers": ["391"], "max_tokens": 384}
+{"id": "short-arith-02", "gate": "GQ-001", "prompt": "What is 144 divided by 12? Give only the number.", "is_math": true, "answers": ["12"], "max_tokens": 256}
+{"id": "short-arith-03", "gate": "GQ-001", "prompt": "Compute 256 plus 768 and state the result.", "is_math": true, "answers": ["1024", "1,024"], "max_tokens": 512}
+{"id": "short-arith-04", "gate": "GQ-001", "prompt": "What is 13 squared?", "is_math": true, "answers": ["169"], "max_tokens": 384}
+{"id": "short-arith-05", "gate": "GQ-001", "prompt": "Compute 1000 minus 37.", "is_math": true, "answers": ["963"], "max_tokens": 512}
+{"id": "short-arith-06", "gate": "GQ-001", "prompt": "What is 7 factorial (7!)? Give the final number.", "is_math": true, "answers": ["5040", "5,040"], "max_tokens": 384}
+{"id": "short-fact-01", "gate": "GQ-001", "prompt": "What is the capital of France? Answer in one word.", "is_math": false, "answers": ["paris"], "max_tokens": 64}
+{"id": "short-fact-02", "gate": "GQ-001", "prompt": "What is the chemical symbol for gold? Give only the symbol.", "is_math": false, "answers": ["au"], "max_tokens": 64}
+{"id": "short-fact-03", "gate": "GQ-001", "prompt": "How many continents are there on Earth? Give the number.", "is_math": false, "answers": ["7", "seven"], "max_tokens": 96}
+{"id": "short-fact-04", "gate": "GQ-001", "prompt": "Which planet is known as the Red Planet? One word.", "is_math": false, "answers": ["mars"], "max_tokens": 64}
+{"id": "short-fact-05", "gate": "GQ-001", "prompt": "In what year did the first human land on the Moon?", "is_math": false, "answers": ["1969"], "max_tokens": 128}
+{"id": "short-conv-01", "gate": "GQ-001", "prompt": "How many centimeters are in 2 meters? Give the number.", "is_math": true, "answers": ["200"], "max_tokens": 320}
+{"id": "short-conv-02", "gate": "GQ-001", "prompt": "How many minutes are in 3 hours?", "is_math": true, "answers": ["180"], "max_tokens": 256}
+{"id": "short-def-01", "gate": "GQ-001", "prompt": "Define the word 'photosynthesis' in one sentence.", "is_math": false, "answers": ["light", "energy", "sunlight"], "max_tokens": 160}
+{"id": "short-reason-01", "gate": "GQ-001", "prompt": "If a train travels 60 km in 30 minutes, what is its speed in km/h?", "is_math": true, "answers": ["120"], "max_tokens": 512}

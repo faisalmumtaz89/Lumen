@@ -4,6 +4,36 @@
 //! When the feature is disabled, only the `sanitize_filename` function
 //! (used for path traversal prevention) is available.
 
+/// Split a registry-declared GGUF path into `(url_path, local_basename)`.
+///
+/// Registry entries may nest shards under a repo subdirectory (e.g.
+/// `"Qwen_Qwen3.6-27B-bf16/Qwen_Qwen3.6-27B-bf16-00001-of-00002.gguf"`).
+/// The subdirectory is used only on the URL side; locally every shard is
+/// cached flat under its basename so multi-shard siblings stay adjacent
+/// (which is what the multi-shard reader's auto-discovery expects).
+///
+/// Every path segment is individually validated with [`sanitize_filename`]
+/// (rejects `".."`, null bytes, control characters); backslashes and empty
+/// segments (leading/trailing/double `/`) are rejected outright, so path
+/// traversal cannot reach the filesystem or the URL.
+pub fn split_repo_path(path: &str) -> Result<(String, String), String> {
+    if path.contains('\\') {
+        return Err(format!("path contains backslash: {path:?}"));
+    }
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.len() > 4 {
+        return Err(format!("path nests too deep ({} segments): {path:?}", segments.len()));
+    }
+    for seg in &segments {
+        if seg.is_empty() {
+            return Err(format!("path contains empty segment: {path:?}"));
+        }
+        sanitize_filename(seg)?;
+    }
+    let basename = segments[segments.len() - 1];
+    Ok((path.to_owned(), basename.to_owned()))
+}
+
 /// Validate that a filename is safe for use as a cache key.
 ///
 /// Rejects filenames containing path traversal sequences, directory separators,
@@ -108,7 +138,11 @@ mod inner {
     ///
     /// # Arguments
     /// - `repo`: HuggingFace repo (e.g. `"bartowski/Qwen2.5-3B-Instruct-GGUF"`)
-    /// - `filename`: GGUF filename (e.g. `"Qwen2.5-3B-Instruct-Q8_0.gguf"`)
+    /// - `filename`: GGUF filename, optionally nested under a repo
+    ///   subdirectory (e.g. `"Qwen2.5-3B-Instruct-Q8_0.gguf"` or
+    ///   `"subdir/model-00001-of-00002.gguf"`). The subdirectory applies to
+    ///   the download URL only; the local cache file is always the flat
+    ///   basename so multi-shard siblings stay adjacent.
     /// - `dest_dir`: Directory to download into (typically the cache dir)
     /// - `skip_confirm`: If true, skip the `[Y/n]` prompt
     pub fn download_gguf(
@@ -117,8 +151,10 @@ mod inner {
         dest_dir: &Path,
         skip_confirm: bool,
     ) -> Result<PathBuf, DownloadError> {
-        // Sanitize filename to prevent path traversal.
-        sanitize_filename(filename).map_err(DownloadError::InvalidFilename)?;
+        // Validate (traversal-safe) and split into URL path + local basename.
+        let (url_path, local_name) =
+            super::split_repo_path(filename).map_err(DownloadError::InvalidFilename)?;
+        let filename = local_name.as_str();
 
         let final_path = dest_dir.join(filename);
         let part_path = dest_dir.join(format!("{filename}.part"));
@@ -134,8 +170,9 @@ mod inner {
             }
         }
 
-        // Build the HuggingFace download URL.
-        let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
+        // Build the HuggingFace download URL (uses the full repo path, which
+        // may include a subdirectory; the local file is the flat basename).
+        let url = format!("https://huggingface.co/{repo}/resolve/main/{url_path}");
 
         // Get file size for confirmation and progress bar.
         let size = get_remote_size(&url)?;
@@ -349,6 +386,37 @@ mod tests {
         // Single dots are fine, only ".." is rejected.
         assert!(sanitize_filename("file.name.with.dots.gguf").is_ok());
         assert!(sanitize_filename(".hidden-file.gguf").is_ok());
+    }
+
+    // -- split_repo_path tests --
+
+    #[test]
+    fn split_accepts_flat_filename() {
+        let (url, local) = split_repo_path("Qwen_Qwen3.5-9B-Q8_0.gguf").unwrap();
+        assert_eq!(url, "Qwen_Qwen3.5-9B-Q8_0.gguf");
+        assert_eq!(local, "Qwen_Qwen3.5-9B-Q8_0.gguf");
+    }
+
+    #[test]
+    fn split_accepts_nested_shard() {
+        let (url, local) = split_repo_path(
+            "Qwen_Qwen3.6-27B-bf16/Qwen_Qwen3.6-27B-bf16-00001-of-00002.gguf",
+        )
+        .unwrap();
+        assert_eq!(url, "Qwen_Qwen3.6-27B-bf16/Qwen_Qwen3.6-27B-bf16-00001-of-00002.gguf");
+        assert_eq!(local, "Qwen_Qwen3.6-27B-bf16-00001-of-00002.gguf");
+    }
+
+    #[test]
+    fn split_rejects_traversal_and_malformed() {
+        assert!(split_repo_path("../etc/passwd").is_err());
+        assert!(split_repo_path("subdir/../escape.gguf").is_err());
+        assert!(split_repo_path("/abs/path.gguf").is_err());      // leading slash -> empty segment
+        assert!(split_repo_path("trailing/").is_err());           // trailing slash -> empty segment
+        assert!(split_repo_path("double//slash.gguf").is_err());  // empty middle segment
+        assert!(split_repo_path("back\\slash.gguf").is_err());
+        assert!(split_repo_path("a/b/c/d/e.gguf").is_err());      // too deep
+        assert!(split_repo_path("").is_err());
     }
 
     // -- download feature tests --

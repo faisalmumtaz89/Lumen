@@ -1144,6 +1144,280 @@ fn cuda_decode_graph_tiled_enabled() -> bool {
     })
 }
 
+/// Resolves `LUMEN_CUDA_GDN_F64_ACCUM`. Unset → model-aware default
+/// (`runtime_defaults::gdn_f64_accum_default`, ON for MoE GDN-hybrid models).
+///
+/// Routes the GDN delta-rule decode/prefill kernels to their F64-internal
+/// accumulator variants. F64 on the per-token recurrent state update removes
+/// the F32-ULP drift that otherwise diverges single-token decode from batched
+/// prefill and triggers the MoE q8 greedy restate-loop. Cached because the
+/// gate is consulted per-GDN-layer per-token and `set_model_is_moe` is
+/// established before the first decode call.
+fn gdn_f64_accum_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_env_truthy("LUMEN_CUDA_GDN_F64_ACCUM")
+            .unwrap_or_else(crate::runtime_defaults::gdn_f64_accum_default)
+    })
+}
+
+/// Resolves `LUMEN_CUDA_GDN_DECODE_MEGAKERNEL_F64`. Unset → model-aware default
+/// (MoE-on via `gdn_f64_accum_default`, i.e. precision parity with the prefill
+/// F64 scan).
+///
+/// The active default MoE single-token DECODE kernel is the F32
+/// `gdn_decode_megakernel` (the register-resident phase4 path where the prior
+/// AB_F16 / PHASE123_ALIGN / prefill-order levers live is NOT engaged at decode
+/// for MoE-35B — `q_norm_buf_rr` is unallocated, so dispatch falls through to
+/// the megakernel). Meanwhile the batched MoE PREFILL scan runs F64-accum
+/// (`gdn_prefill_fused_v3_f64accum` + `l2_normalize_qk_strided_f64accum`,
+/// `gdn_f64_accum_enabled() = model_is_moe()`). Same decay-first FORM, different
+/// PRECISION: the F32 decode recurrence accumulates per-step ULP drift that the
+/// prefill F64 scan does not, so the decode-built `h_state` diverges from the
+/// prefill-built state and the 256-expert router amplifies the drift into
+/// expert-selection flips → garble. When ON, decode dispatches the
+/// `gdn_decode_megakernel_f64accum` / `..._graph_f64accum` twins (identical
+/// structure, F64 L2-norm + F64 delta-rule recurrence, F32 state write-back),
+/// restoring decode/prefill precision parity exactly as Metal has by default
+/// (Metal runs BOTH decode and prefill GDN in the same F32). Cached because the
+/// gate is consulted per-GDN-layer per-token and `set_model_is_moe` is
+/// established before the first decode call. OFF is byte-identical to the F32
+/// megakernel; dense (non-MoE) is byte-identical by default.
+fn gdn_decode_megakernel_f64_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_env_truthy("LUMEN_CUDA_GDN_DECODE_MEGAKERNEL_F64")
+            .unwrap_or_else(crate::runtime_defaults::gdn_f64_accum_default)
+    })
+}
+
+/// Resolves `LUMEN_CUDA_GDN_DECODE_PROJ_MMQ`. Unset → model-aware default
+/// (`runtime_defaults::gdn_decode_proj_mmq_default`, ON for MoE GDN-hybrid).
+///
+/// When ON, the single-token DECODE GDN q/k/v/gate/alpha/beta projections are
+/// routed through `mmq_q8_0_batched` (batch = 1) — the SAME MMQ INT8-dp4a
+/// kernel the batched PREFILL uses for MoE Q8 GDN projections — instead of the
+/// per-token pre-quantized-Q8_1 tile matvec. This aligns the decode GDN
+/// projection numerics with prefill (which match llama.cpp), so the 256-expert
+/// MoE router selects the prefill expert set and the final logits match the
+/// clean prefill. Only the Q8Raw GDN projection weights take this path; any
+/// non-Q8Raw weight (Q4, Q8Aligned, F16, …) falls through to the existing
+/// dispatch. Cached because the gate is consulted per-GDN-layer per-token and
+/// `set_model_is_moe` is established before the first decode call.
+fn gdn_decode_proj_mmq_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_env_truthy("LUMEN_CUDA_GDN_DECODE_PROJ_MMQ")
+            .unwrap_or_else(crate::runtime_defaults::gdn_decode_proj_mmq_default)
+    })
+}
+
+/// Resolves `LUMEN_CUDA_GDN_DECODE_AB_MMQ`. Unset → model-aware default
+/// (`runtime_defaults::gdn_decode_ab_mmq_default`, ON for MoE GDN-hybrid).
+///
+/// When ON, ONLY the single-token DECODE GDN `ssm_alpha` / `ssm_beta`
+/// projections (which are `Q8Raw` in every LBC quant) are routed through
+/// `mmq_q8_0_batched` (batch = 1) — the SAME MMQ INT8-dp4a kernel the batched
+/// PREFILL uses — instead of the per-token Q8_1/dp4a `matvec_q8_0_q8_1` tile
+/// matvec. The MMQ kernel is per-token-independent so batch=1 is bit-identical
+/// to row 0 of the batch=N prefill, eliminating the ~20% alpha/beta
+/// decode-vs-prefill divergence at GDN layer 0 that the 256-expert router
+/// amplifies into expert-selection flips. qkv/gate are left untouched (they
+/// were measured bit-identical decode-vs-prefill). Distinct from the refuted
+/// `gdn_decode_proj_mmq` (which MMQ'd all four projections and required
+/// all-four-Q8Raw). Cached because the gate is consulted per-GDN-layer
+/// per-token and `set_model_is_moe` is established before the first decode.
+fn gdn_decode_ab_mmq_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_env_truthy("LUMEN_CUDA_GDN_DECODE_AB_MMQ")
+            .unwrap_or_else(crate::runtime_defaults::gdn_decode_ab_mmq_default)
+    })
+}
+
+/// Resolves `LUMEN_CUDA_GDN_AB_F16`. Unset → model-aware default
+/// (`runtime_defaults::gdn_ab_f16_default`, currently ON for MoE; dense
+/// byte-identical via the `model_is_moe()` AND-gate) so DENSE models stay
+/// byte-identical regardless of the env.
+///
+/// When ON, the GDN `ssm_alpha` / `ssm_beta` projections route through a
+/// pre-dequanted F16 cache + cuBLAS `cublasGemmEx` (HGEMV N=1 in decode,
+/// HGEMM N=batch in prefill) in BOTH paths — the proven-clean qkv/gate recipe
+/// — making them bit-identical decode-vs-prefill (collapsing the measured
+/// ~20% L0 alpha/beta divergence that the 256-expert router amplifies). The
+/// F16 cache is populated only when this gate is ON (see `preload_weights`),
+/// so OFF keeps the caches `None` and the legacy Q8 dp4a (decode) / MMQ
+/// (prefill) paths byte-identical. Cached because the gate is consulted
+/// per-GDN-layer per-token and at load; `set_model_is_moe` is established
+/// before the first read.
+fn gdn_ab_f16_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        crate::runtime_defaults::model_is_moe()
+            && parse_env_truthy("LUMEN_CUDA_GDN_AB_F16")
+                .unwrap_or_else(crate::runtime_defaults::gdn_ab_f16_default)
+    })
+}
+
+/// Resolves `LUMEN_CUDA_GDN_RECUR_PREFILL_ORDER`. Unset → model-aware default
+/// (`runtime_defaults::gdn_recur_prefill_order_default`, currently OFF)
+/// AND-gated on `model_is_moe()` so DENSE models stay byte-identical.
+///
+/// When ON, the GDN decode delta-rule state update routes through
+/// `gdn_phase4_register_resident_f64accum_prefillorder` whose arithmetic order
+/// matches the prefill batched-scan single-token step bit-for-bit (decay state
+/// FIRST → `retrieval = SUM (alpha*s_r)*k_r`, then `v_delta = b*(v-retrieval)`),
+/// instead of the base decode order (`delta = (v - alpha*SUM s_r*k_r)*beta`).
+/// This aligns the residual decode-vs-prefill GDN RECURRENCE divergence that
+/// survives the `GDN_AB_F16` projection fix. OFF keeps the existing F64 phase4
+/// kernel and is byte-identical to history. Cached because the gate is read
+/// per-GDN-layer per-token; `set_model_is_moe` is established before first read.
+fn gdn_recur_prefill_order_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        crate::runtime_defaults::model_is_moe()
+            && parse_env_truthy("LUMEN_CUDA_GDN_RECUR_PREFILL_ORDER")
+                .unwrap_or_else(crate::runtime_defaults::gdn_recur_prefill_order_default)
+    })
+}
+
+/// Resolves `LUMEN_CUDA_GDN_PHASE123_ALIGN`. Unset → model-aware default
+/// (`runtime_defaults::gdn_phase123_align_default`, currently OFF) AND-gated on
+/// `model_is_moe()` so DENSE models stay byte-identical regardless of the env.
+///
+/// When ON, the GDN decode phase123 (conv1d + SiLU + L2-norm) routes through
+/// `gdn_phase123_register_resident_alignl2` (and its graph twin): conv1d + SiLU
+/// stay F32 (bit-identical to the prefill `ssm_conv1d_silu_prefill` single-token
+/// step) while the per-head L2-norm of Q/K is computed with the EXACT F64
+/// reduction of the prefill `l2_normalize_qk_strided_f64accum` (which the MoE
+/// prefill already runs by default via `gdn_f64_accum_enabled()`). This makes
+/// the decode q_norm/k_norm bit-identical to a prefill of the same token,
+/// collapsing the residual GDN L0-output divergence (a_sumsq/x_sumsq relD
+/// ~27-28%) that survives the `GDN_AB_F16` projection fix and the phase4
+/// reorder. Distinct from `GDN_PHASE123_F64` (which raised conv1d to F64 too and
+/// REGRESSED) — this aligns ONLY the L2-norm reduction order/precision to
+/// prefill, NOT the conv1d. Cached because the gate is read per-GDN-layer
+/// per-token; `set_model_is_moe` is established before the first decode call.
+fn gdn_phase123_align_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        crate::runtime_defaults::model_is_moe()
+            && parse_env_truthy("LUMEN_CUDA_GDN_PHASE123_ALIGN")
+                .unwrap_or_else(crate::runtime_defaults::gdn_phase123_align_default)
+    })
+}
+
+/// Resolves `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL`. Unset → quant-aware default
+/// (`runtime_defaults::gdn_decode_via_prefill_default`): ON for MoE (all
+/// quants) + dense non-bf16-large; quant/size-aware (see the default fn's
+/// doc for the measured evidence).
+///
+/// Dense default-ON since 2026-06-10 (validated N≥3 byte-deterministic):
+/// the legacy decode path's
+/// per-step recurrence divergence accumulates over long generations into
+/// repetition/charspam on DENSE models too — 9B-q8 GQ-004 verylong was 0/3
+/// (deterministic, N=3) with 2/3 prompts stuck at the token cap inside a
+/// DD-REP/DD-CHARSPAM attractor; via-prefill ALONE flips it to 3/3 with clean
+/// EOS termination (N=5 observations incl. 27B), decode tok/s flat (-0.6%).
+/// AB_F16/CONVSTATE_PARITY remain MoE-only: the dense ablation showed they are
+/// unnecessary on dense, and CONVSTATE-without-AB is actively harmful there.
+///
+/// When ON, the single GDN decode token is routed through the PREFILL fused
+/// GDN recurrence kernels at `T=1` (`ssm_conv1d_silu_prefill` +
+/// `gdn_compute_gates_batched` + `l2_normalize_qk_strided[_f64accum]` +
+/// `gdn_prefill_fused_v3[_f64accum]` + `gdn_prefill_norm_gate[_f64accum]`),
+/// carrying the persistent `h_state` / `conv_state`, INSTEAD of the decode
+/// megakernel / register-resident phase4 recurrence. Because the projection
+/// (qkv/gate already F16/bf16-bit-identical, alpha/beta made bit-identical by
+/// `gdn_ab_f16_enabled()`) and now the conv1d + gates + L2-norm + delta-rule
+/// recurrence + norm-gate all run the EXACT prefill kernels at batch=1, the GDN
+/// decode block is byte-equivalent to a prefill of the same position by
+/// construction — collapsing the diffuse decode-vs-prefill divergence (alpha/beta
+/// ~20% + per-step recurrence ~0.98%) that the 256-expert router amplifies into
+/// garble. The F64 variants are selected exactly as the MoE prefill selects them
+/// (`gdn_f64_accum_enabled()`), so the recurrence matches the F64 prefill scan to
+/// F64 rounding. OFF / missing-prefill-kernels → byte-identical legacy
+/// decode path (the missing-kernel fallback logs a one-shot warning at the
+/// dispatch site). Cached because the gate is read per-GDN-layer per-token.
+fn gdn_decode_via_prefill_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_env_truthy("LUMEN_CUDA_GDN_DECODE_VIA_PREFILL")
+            .unwrap_or_else(crate::runtime_defaults::gdn_decode_via_prefill_default)
+    })
+}
+
+/// Resolves `LUMEN_CUDA_GDN_CONVSTATE_PARITY`. Unset → model-aware default
+/// (`runtime_defaults::gdn_convstate_parity_default`, currently ON for MoE;
+/// dense byte-identical via the `model_is_moe()` AND-gate) so DENSE models stay
+/// byte-identical regardless of the env.
+///
+/// When ON (with `GDN_DECODE_VIA_PREFILL` ON), the decode GDN **qkv** projection
+/// — the buffer (`gdn.qkv_buf`) that feeds the conv ring consumed by
+/// `ssm_conv1d_silu_prefill` at `T=1` — is computed via the SAME
+/// `launch_gemm_projection` path the batched prefill uses, at `batch = 1`,
+/// instead of the decode-only GEMV/dp4a matvec (`launch_matvec` →
+/// native-BF16 HGEMV with the autotuned `bf16_algo_for` algo / per-token Q8_1
+/// dp4a / aligned-Q8 matvec / MMQ). The prefill path dispatches `cublasGemmEx`
+/// BF16 GEMM with `CUBLAS_GEMM_DEFAULT_TENSOR_OP` for bf16 and the MMQ INT8/INT4
+/// kernel for q8/q4 — the exact reductions the prefill row 0 uses — so the new
+/// ring slot's qkv becomes bit-equivalent to a prefill of the same token (the
+/// other ring slots are already prefill-written and bit-identical). This is the
+/// qkv twin of `gdn_ab_f16_enabled()` (which already routes alpha/beta through
+/// the prefill GemmEx). The forensic-localized cause of the residual bf16
+/// `conv_state` relD ~5% at L0: the decode GEMV vs prefill GEMM kernel-class
+/// mismatch injects a ~0.0014% qkv delta that the conv1d window + SiLU amplify.
+///
+/// Only the qkv projection is rerouted; gate/alpha/beta keep their existing
+/// (already-aligned) paths. OFF / dense / via-prefill-off → byte-identical.
+/// Cached because the gate is read per-GDN-layer per-token; `set_model_is_moe`
+/// is established before the first decode call.
+fn gdn_convstate_parity_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        // Stays MoE-only by design: the 2026-06-10 dense ablation showed
+        // CONVSTATE-without-AB_F16 is actively harmful on dense (GQ-004 0/3,
+        // off-topic), and AB_F16 is also MoE-only — the MoE gate here makes
+        // that harmful combination structurally unreachable on dense.
+        crate::runtime_defaults::model_is_moe()
+            && parse_env_truthy("LUMEN_CUDA_GDN_CONVSTATE_PARITY")
+                .unwrap_or_else(crate::runtime_defaults::gdn_convstate_parity_default)
+    })
+}
+
+/// Resolves `LUMEN_CUDA_MOE_DECODE_F32`. Unset → OFF; AND-gated on
+/// `model_is_moe()` so DENSE models stay byte-identical regardless of the env.
+///
+/// === UNIFORM-F32 CUDA MoE DECODE (MoE-gated) ===
+/// The single-token DECODE numerics diverge from the batched PREFILL because the
+/// decode matmuls take precision-reducing shortcuts that prefill (which matches
+/// llama.cpp) does not. For the **bf16** quant the dominant such shortcut is the
+/// cuBLAS `cublasGemmEx` path in `CUBLAS_COMPUTE_32F_FAST_16F` mode: it converts
+/// the bf16 weights (1 sign / 8 exp / 7 mant) to F16 (1/5/10) and multiplies on
+/// F16 tensor cores. That DOWNCAST drops bf16's 8-bit-exponent dynamic range on
+/// large-magnitude weights and uses a different (tensor-core, N=1 GEMV-tiled)
+/// reduction than prefill. The residual it injects is amplified by the
+/// 256-expert MoE router into a flipped expert selection that cascades 40 layers
+/// into garbled arithmetic. The legacy `matvec_bf16` kernel instead upcasts
+/// bf16→f32 EXACTLY (`bits << 16`, lossless because bf16 is the top 16 bits of an
+/// IEEE binary32) and accumulates the dot product in F32 — i.e. it IS the
+/// true-F32 path matching the F32 GGUF source precision. When this gate is ON it
+/// forces every bf16 DECODE projection (full-attention QKV+O, GDN qkv/gate) onto
+/// that F32-exact kernel by closing the `bf16_gemmex_enabled()` gate inside the
+/// two BF16 fallback wrappers (`launch_bf16_matvec_with_fallback` and its
+/// residual twin) — the single chokepoints for all GEMV-shaped (N=1) bf16 decode
+/// matmuls. The batched PREFILL bf16 GEMM (N=batch) does NOT route through those
+/// wrappers, so prefill stays byte-identical. OFF is byte-identical to history.
+/// Cached because the gate is read per-projection per-token; `set_model_is_moe`
+/// is established before the first decode call.
+fn moe_decode_f32_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        crate::runtime_defaults::model_is_moe()
+            && parse_env_truthy("LUMEN_CUDA_MOE_DECODE_F32").unwrap_or(false)
+    })
+}
+
 /// Apply the decode-delay if configured.
 ///
 /// Called immediately after the terminal `device.synchronize()` in the
@@ -2737,6 +3011,101 @@ impl CudaBackend {
                 }
             }
 
+            // [PROBE] Decode-vs-prefill localization (env LUMEN_MOE_PROBE=1).
+            // compute_layer_gpu is the DECODE path (1 token). Dumps this token's
+            // post-layer residual (x_gpu) and attention output (attn_proj) so it
+            // can be compared against the batched prefill of the same position.
+            if {
+                use std::sync::OnceLock;
+                static PF: OnceLock<bool> = OnceLock::new();
+                *PF.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
+            } {
+                let xh = self.device.dtoh_copy(&st.scratch.x_gpu)?;
+                let ah = self.device.dtoh_copy(&st.scratch.attn_proj)?;
+                let k = 16usize;
+                eprintln!(
+                    "[PROBE] mode=D pos={seq_pos} layer={layer_idx} attn16={:?} x16={:?}",
+                    &ah[..k.min(ah.len())], &xh[..k.min(xh.len())]
+                );
+                // [CHK] mode=D whole-buffer sumsq (layout-independent) of this
+                // decode token's post-layer residual (x = l_out) and attention
+                // output (a). Mirrors the prefill [CHK] mode=P so lumen-decode vs
+                // lumen-prefill (and vs llama l_out/attn_output) can be compared
+                // per-layer to localize the prefill-vs-decode divergence that
+                // flips the near-tie. hidden_dim-sized slices.
+                let sumsq = |v: &[f32], n: usize| -> (f64, f64, f32) {
+                    let mut s = 0f64; let mut sq = 0f64; let mut mx = 0f32;
+                    for &e in &v[..n.min(v.len())] {
+                        s += e as f64; sq += (e as f64) * (e as f64);
+                        if e.abs() > mx { mx = e.abs(); }
+                    }
+                    (s, sq, mx)
+                };
+                let (xs, xsq, xmx) = sumsq(&xh, hidden_dim);
+                let (as_, asq, amx) = sumsq(&ah, hidden_dim);
+                eprintln!(
+                    "[CHK] mode=D pos={seq_pos} layer={layer_idx} \
+                     x_sum={xs:.5} x_sumsq={xsq:.5} x_absmax={xmx:.6} \
+                     a_sum={as_:.5} a_sumsq={asq:.5} a_absmax={amx:.6}"
+                );
+                // Routing probe: selected expert IDs + gate weights for this token.
+                let ids = self.device.dtoh_copy(&moe_scratch.expert_ids)?;
+                let ws = self.device.dtoh_copy(&moe_scratch.expert_weights)?;
+                eprintln!(
+                    "[PROBE-RT] mode=D pos={seq_pos} layer={layer_idx} ids={ids:?} w={ws:?}"
+                );
+                // [MOE-SUMSQ] mode=D decode expert-combine sumsq (= Σ_k gw[k]*eo[k]),
+                // matching the prefill [MOE-SUMSQ] and llama ffn_moe_out, so the
+                // expert-combine reduction can be ruled in/out as the flip site.
+                let eo = self.device.dtoh_copy(&moe_scratch.expert_output_buf)?;
+                let rl = self.device.dtoh_copy(&moe_scratch.router_logits)?;
+                let router_logits_sumsq: f64 = rl.iter().map(|&e| (e as f64) * (e as f64)).sum();
+                let gate_w_sumsq: f64 = ws.iter().map(|&e| (e as f64) * (e as f64)).sum();
+                let expert_out_sumsq: f64 = eo.iter().map(|&e| (e as f64) * (e as f64)).sum();
+                let mut ffn_moe_out_sumsq = 0f64;
+                let tk = ws.len();
+                for i in 0..hidden_dim {
+                    let mut acc = 0f64;
+                    for kk in 0..tk {
+                        let idx = kk * hidden_dim + i;
+                        if idx < eo.len() { acc += (ws[kk] as f64) * (eo[idx] as f64); }
+                    }
+                    ffn_moe_out_sumsq += acc * acc;
+                }
+                eprintln!(
+                    "[MOE-SUMSQ] mode=D pos={seq_pos} layer={layer_idx} \
+                     router_logits_sumsq={router_logits_sumsq:.6} \
+                     gate_w_sumsq={gate_w_sumsq:.6} \
+                     expert_out_sumsq={expert_out_sumsq:.6} \
+                     ffn_moe_out_sumsq={ffn_moe_out_sumsq:.6}"
+                );
+            }
+
+            // [XCHK] Cross-backend forensic probe (env LUMEN_XCHK=1, default OFF
+            // -> byte-identical). Per-MoE-layer top-K expert IDs + gate weights +
+            // router-logits sumsq, in the SAME schema as the Metal [XCHK] dump,
+            // keyed by the 0-based decode ordinal (decode_token_count). The
+            // expert-ID list is the SHARPEST cross-backend divergence signal.
+            if {
+                use std::sync::OnceLock;
+                static XKM: OnceLock<bool> = OnceLock::new();
+                *XKM.get_or_init(|| std::env::var("LUMEN_XCHK").as_deref() == Ok("1"))
+            } {
+                let ids = self.device.dtoh_copy(&moe_scratch.expert_ids)?;
+                let ws = self.device.dtoh_copy(&moe_scratch.expert_weights)?;
+                let rl = self.device.dtoh_copy(&moe_scratch.router_logits)?;
+                let rlsq: f64 = rl.iter().map(|&e| (e as f64) * (e as f64)).sum();
+                let mut rlmx = 0f32;
+                for &e in &rl { let a = e.abs(); if a > rlmx { rlmx = a; } }
+                let step = st.decode_token_count;
+                eprintln!(
+                    "[XCHK] step={step} L={layer_idx} router_logits sumsq={rlsq:.6} absmax={rlmx:.6}"
+                );
+                eprintln!(
+                    "[XCHK] step={step} L={layer_idx} moe_expert_ids={ids:?} gate_w={ws:?}"
+                );
+            }
+
             // MoE branch is complete; skip the dense FFN block below.
             return Ok(());
         }
@@ -3971,10 +4340,218 @@ impl CudaBackend {
             && st.scratch.input_q8_1.is_some()
             && st.kernels.quantize_f32_to_q8_1.is_some();
 
-        if gdn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
+        // === DECODE GDN projection alignment with PREFILL (MoE-gated) ===
+        // The batched PREFILL computes the GDN q/k/v/gate/alpha/beta
+        // projections through `mmq_q8_0_batched` for MoE Q8 models (see
+        // `launch_gemm_projection`'s Q8Raw arm + `LUMEN_CUDA_Q8_PROJ_MMQ`
+        // defaulting ON for MoE). The single-token decode otherwise uses the
+        // per-token pre-quantized-Q8_1 tile matvec, a DIFFERENT INT8 kernel
+        // with a different activation-quant granularity and reduction order.
+        // That mismatch makes the decode GDN output diverge from the
+        // (llama-matching) prefill GDN output at layer 0; the 256-expert MoE
+        // router amplifies it into flipped expert selection and the math
+        // "multiplicationlication" near-tie flip. Routing the decode
+        // projections through the SAME `mmq_q8_0_batched` kernel (batch = 1)
+        // aligns the numerics. Gate ON for MoE only; requires all four GDN
+        // projection weights to be Q8Raw (the MoE Q8 GDN case — repack is
+        // skipped for GDN models so they stay Q8Raw) and the MMQ kernel to be
+        // loaded. Dense models keep the existing path byte-identical.
+        let gdn_decode_proj_mmq = gdn_decode_proj_mmq_enabled()
+            && st.kernels.mmq_q8_0_batched.is_some()
+            && matches!(lw.wq, GpuWeightBuf::Q8Raw(_))
+            && matches!(ssm_alpha_w, GpuWeightBuf::Q8Raw(_))
+            && matches!(ssm_beta_w, GpuWeightBuf::Q8Raw(_))
+            && matches!(attn_gate_w, GpuWeightBuf::Q8Raw(_))
+            && hidden_dim % 32 == 0;
+
+        // === DECODE GDN alpha/beta-ONLY MMQ alignment (MoE-gated) ===
+        // The TARGETED, empirically-isolated lever (2026-06-08): only the
+        // `ssm_alpha` / `ssm_beta` projections diverge decode-vs-prefill (~20%
+        // at L0); qkv/gate are bit-identical. alpha/beta are stored Q8Raw in
+        // EVERY LBC quant (the GGUF source is F32; the MoE converter
+        // force-requantizes them to Q8_0), so prefill projects them via
+        // `mmq_q8_0_batched` (MMQ, default-ON for MoE Q8) while decode uses the
+        // per-token Q8_1/dp4a matvec — a different INT8 reduction order. This
+        // gate routes ONLY the decode alpha/beta through the SAME
+        // `mmq_q8_0_batched` (batch = 1) the prefill uses, regardless of the
+        // qkv/gate weight class (so it engages for bf16 — where qkv/gate are
+        // Bf16Raw — as well as q8/q4). The MMQ kernel is per-token-independent
+        // so batch=1 == row 0 of batch=N: the L0 alpha/beta delta -> 0, the
+        // router stops flipping. Disjoint from the (refuted, default-OFF)
+        // `gdn_decode_proj_mmq` which MMQ'd all four projections; mutually
+        // exclusive with it below (that branch already MMQs alpha/beta).
+        // === DECODE GDN alpha/beta F16 alignment (MoE-gated; LUMEN_CUDA_GDN_AB_F16) ===
+        // The SHARP UNTRIED LEVER (2026-06-08): route ONLY the decode alpha/beta
+        // through the pre-dequanted `ssm_{alpha,beta}_f16` cache + cuBLAS
+        // `cublasGemmEx` HGEMV (N=1, CUDA_R_16F × CUDA_R_16F, COMPUTE_32F_FAST_16F)
+        // — the EXACT GEMM the batched PREFILL F16-cache fast path uses with
+        // N=batch. batch=1 == row 0 of batch=N under the same GemmEx, so the L0
+        // alpha/beta projection delta (measured 19-21% vs the MMQ/dp4a mismatch)
+        // collapses to ~0% decode-vs-prefill, exactly like qkv/gate (which are
+        // F16/bf16 and ARE bit-identical). Highest priority — takes precedence
+        // over both `gdn_decode_proj_mmq` and `gdn_decode_ab_mmq` (INT8 MMQ,
+        // refuted net-negative). Guarded on the caches being present (only
+        // populated at load when the gate is ON), so OFF is byte-identical and
+        // dense is byte-identical (gate AND-folds `model_is_moe()`).
+        let gdn_ab_f16 = gdn_ab_f16_enabled()
+            && lw.ssm_alpha_f16.is_some()
+            && lw.ssm_beta_f16.is_some();
+
+        let gdn_decode_ab_mmq = gdn_decode_ab_mmq_enabled()
+            && !gdn_decode_proj_mmq
+            && !gdn_ab_f16
+            && st.kernels.mmq_q8_0_batched.is_some()
+            && matches!(ssm_alpha_w, GpuWeightBuf::Q8Raw(_))
+            && matches!(ssm_beta_w, GpuWeightBuf::Q8Raw(_))
+            && hidden_dim % 32 == 0;
+
+        // === DECODE GDN conv_state PARITY (MoE-gated; LUMEN_CUDA_GDN_CONVSTATE_PARITY) ===
+        // Re-project the GDN qkv (the buffer that feeds the conv ring consumed by
+        // `ssm_conv1d_silu_prefill` at T=1 in the via-prefill arm) through the
+        // SAME kernel the batched prefill uses, at batch = 1, so the single new
+        // conv-ring slot bit-matches a true prefill of this token (the carried-in
+        // slots are already prefill-written). bf16 → `launch_cublas_gemm_bf16`
+        // (CUBLAS_GEMM_DEFAULT_TENSOR_OP, the prefill BF16 GEMM) vs the decode-only
+        // autotuned `bf16_algo_for` GEMV; Q8Raw → `launch_mmq_q8_0_batched` (the
+        // MoE-default prefill Q8 MMQ) vs the decode per-token Q8_1/dp4a matvec.
+        // The reprojection OVERWRITES `gdn.qkv_buf` after the normal projection
+        // chain (alpha/beta/gate keep their already-aligned paths). Only engaged
+        // when the via-prefill conv consume is active (it is the only conv path
+        // that reads the ring), the qkv weight is Bf16Raw or Q8Raw, and the
+        // matching prefill kernel is loaded. q4 qkv is intentionally NOT rerouted
+        // (q4 is already pristine and its prefill default is HGEMM, not MMQ —
+        // leaving it byte-identical avoids a regression). OFF → byte-identical.
+        let gdn_convstate_parity_qkv = gdn_convstate_parity_enabled()
+            && gdn_decode_via_prefill_enabled()
+            && st.kernels.ssm_conv1d_silu_prefill.is_some()
+            && match &lw.wq {
+                GpuWeightBuf::Bf16Raw(_) => st.scratch.input_f16.len() >= hidden_dim * 2,
+                GpuWeightBuf::Q8Raw(_) => {
+                    st.kernels.mmq_q8_0_batched.is_some() && hidden_dim % 32 == 0
+                }
+                _ => false,
+            };
+
+        if gdn_decode_proj_mmq {
+            // === PREFILL-MATCHING: RMSNorm (F32) + MMQ INT8 projections ===
+            // Step 1: RMSNorm into the F32 `normed` scratch (NOT Q8_1) so the
+            // MMQ kernel performs its OWN per-token Q8_1 activation quant —
+            // byte-identical to the prefill MMQ activation path.
+            {
+                let block_size = rmsnorm_block_size(hidden_dim);
+                let shared_bytes = rmsnorm_shared_bytes(block_size);
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: shared_bytes,
+                };
+                let dim = hidden_dim as u32;
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(&st.kernels.rmsnorm)
+                        .arg(&st.scratch.x_gpu)
+                        .arg(&lw.attn_norm)
+                        .arg(&mut st.scratch.normed)
+                        .arg(&eps)
+                        .arg(&dim)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!(
+                    "GDN rmsnorm (mmq decode) L{layer_idx}: {e}",
+                )))?;
+            }
+
+            // The Q8Raw byte slices for each projection weight. The outer
+            // `matches!` guards guarantee these patterns hold.
+            let wq_q8 = match &lw.wq {
+                GpuWeightBuf::Q8Raw(b) => b,
+                _ => unreachable!("gdn_decode_proj_mmq guards wq is Q8Raw"),
+            };
+            let alpha_q8 = match ssm_alpha_w {
+                GpuWeightBuf::Q8Raw(b) => b,
+                _ => unreachable!("gdn_decode_proj_mmq guards ssm_alpha is Q8Raw"),
+            };
+            let beta_q8 = match ssm_beta_w {
+                GpuWeightBuf::Q8Raw(b) => b,
+                _ => unreachable!("gdn_decode_proj_mmq guards ssm_beta is Q8Raw"),
+            };
+            let gate_q8 = match attn_gate_w {
+                GpuWeightBuf::Q8Raw(b) => b,
+                _ => unreachable!("gdn_decode_proj_mmq guards attn_gate is Q8Raw"),
+            };
+
+            // Step 2: fused QKV projection (out = qkv_dim) via MMQ, batch = 1.
+            unsafe {
+                super::prefill::launch_mmq_q8_0_batched(
+                    &self.device, &st.kernels, wq_q8,
+                    &st.scratch.normed, &mut gdn.qkv_buf,
+                    p.qkv_dim, hidden_dim, 1, "gdn_qkv_decode_mmq",
+                )?;
+            }
+            // Step 3: alpha projection (out = num_heads).
+            unsafe {
+                super::prefill::launch_mmq_q8_0_batched(
+                    &self.device, &st.kernels, alpha_q8,
+                    &st.scratch.normed, &mut gdn.alpha_raw_buf,
+                    p.num_heads, hidden_dim, 1, "gdn_alpha_decode_mmq",
+                )?;
+            }
+            // Step 4: beta projection (out = num_heads).
+            unsafe {
+                super::prefill::launch_mmq_q8_0_batched(
+                    &self.device, &st.kernels, beta_q8,
+                    &st.scratch.normed, &mut gdn.beta_raw_buf,
+                    p.num_heads, hidden_dim, 1, "gdn_beta_decode_mmq",
+                )?;
+            }
+            // Step 5: gate projection (out = value_dim).
+            unsafe {
+                super::prefill::launch_mmq_q8_0_batched(
+                    &self.device, &st.kernels, gate_q8,
+                    &st.scratch.normed, &mut gdn.gate_buf,
+                    p.value_dim, hidden_dim, 1, "gdn_gate_decode_mmq",
+                )?;
+            }
+        } else if gdn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
             // === FUSED: RMSNorm + Q8_1 quantize in 1 dispatch ===
             // Then all 3 matvecs (QKV, alpha, beta) use launch_matvec_preq8_1
             // sharing the single quantized input. Saves 4 separate quantize dispatches.
+
+            // alpha/beta alignment (MoE-gated, q8/q4 path): when MMQ or F16
+            // alignment is ON, project alpha/beta from the F32 RMSNorm output
+            // (MMQ does its OWN per-row Q8_1 quant; F16 HGEMV converts F32->F16)
+            // instead of the per-token pre-Q8_1 tile matvec. Either way we need
+            // the F32 `normed` materialized here with a plain RMSNorm dispatch
+            // (the fused rmsnorm_to_q8_1 below only writes the quantized buffer
+            // used by qkv/gate). One extra 2048-wide RMSNorm per GDN decode step
+            // — negligible cost. Done BEFORE the `q8_1_buf` mutable borrow so
+            // the two scratch fields are accessed sequentially.
+            if gdn_decode_ab_mmq || gdn_ab_f16 {
+                let block_size = rmsnorm_block_size(hidden_dim);
+                let shared_bytes = rmsnorm_shared_bytes(block_size);
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: shared_bytes,
+                };
+                let dim = hidden_dim as u32;
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(&st.kernels.rmsnorm)
+                        .arg(&st.scratch.x_gpu)
+                        .arg(&lw.attn_norm)
+                        .arg(&mut st.scratch.normed)
+                        .arg(&eps)
+                        .arg(&dim)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!(
+                    "GDN rmsnorm (ab-mmq decode) L{layer_idx}: {e}",
+                )))?;
+            }
+
             let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
             let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
             let bs = rmsnorm_block_size(hidden_dim);
@@ -4009,25 +4586,79 @@ impl CudaBackend {
 
             // Alpha matvec with shared pre-quantized input.
             // GDN_SPLIT: prefer Q4 split sibling.
-            unsafe {
-                launch_matvec_preq8_1_tile(
-                    &self.device, &st.kernels, ssm_alpha_w,
-                    None, None,
-                    None, lw.q4_split_ssm_alpha.as_ref(),
-                    q8_1_buf, &mut gdn.alpha_raw_buf,
-                    p.num_heads, hidden_dim, "gdn_alpha",
-                )?;
-            }
+            // alpha/beta alignment priority: (1) F16 HGEMV via the
+            // `ssm_{alpha,beta}_f16` cache (the proven-clean qkv/gate recipe —
+            // cublasGemmEx N=1 reads the F32 `normed` materialized above and
+            // matches the prefill F16 HGEMM bit-for-bit), else (2) MMQ INT8
+            // (`mmq_q8_0_batched`, batch=1, from F32 `normed`), else (3) the
+            // per-token pre-Q8_1 tile matvec. `ssm_alpha_w`/`ssm_beta_w` are
+            // Q8Raw; the F16/MMQ branches use the dequanted cache / Q8 bytes
+            // respectively.
+            if gdn_ab_f16 {
+                let alpha_f16 = lw.ssm_alpha_f16.as_ref().expect("gdn_ab_f16 guards Some");
+                unsafe {
+                    launch_hgemv_f16(
+                        &self.device, &st.kernels, alpha_f16,
+                        &st.scratch.normed, &mut gdn.alpha_raw_buf,
+                        &mut st.scratch.input_f16,
+                        p.num_heads, hidden_dim, "gdn_alpha_f16",
+                        cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+                    )?;
+                }
+                let beta_f16 = lw.ssm_beta_f16.as_ref().expect("gdn_ab_f16 guards Some");
+                unsafe {
+                    launch_hgemv_f16(
+                        &self.device, &st.kernels, beta_f16,
+                        &st.scratch.normed, &mut gdn.beta_raw_buf,
+                        &mut st.scratch.input_f16,
+                        p.num_heads, hidden_dim, "gdn_beta_f16",
+                        cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+                    )?;
+                }
+            } else if gdn_decode_ab_mmq {
+                let alpha_q8 = match ssm_alpha_w {
+                    GpuWeightBuf::Q8Raw(b) => b,
+                    _ => unreachable!("gdn_decode_ab_mmq guards ssm_alpha is Q8Raw"),
+                };
+                let beta_q8 = match ssm_beta_w {
+                    GpuWeightBuf::Q8Raw(b) => b,
+                    _ => unreachable!("gdn_decode_ab_mmq guards ssm_beta is Q8Raw"),
+                };
+                unsafe {
+                    super::prefill::launch_mmq_q8_0_batched(
+                        &self.device, &st.kernels, alpha_q8,
+                        &st.scratch.normed, &mut gdn.alpha_raw_buf,
+                        p.num_heads, hidden_dim, 1, "gdn_alpha_decode_ab_mmq",
+                    )?;
+                }
+                unsafe {
+                    super::prefill::launch_mmq_q8_0_batched(
+                        &self.device, &st.kernels, beta_q8,
+                        &st.scratch.normed, &mut gdn.beta_raw_buf,
+                        p.num_heads, hidden_dim, 1, "gdn_beta_decode_ab_mmq",
+                    )?;
+                }
+            } else {
+                unsafe {
+                    launch_matvec_preq8_1_tile(
+                        &self.device, &st.kernels, ssm_alpha_w,
+                        None, None,
+                        None, lw.q4_split_ssm_alpha.as_ref(),
+                        q8_1_buf, &mut gdn.alpha_raw_buf,
+                        p.num_heads, hidden_dim, "gdn_alpha",
+                    )?;
+                }
 
-            // Beta matvec with shared pre-quantized input.
-            unsafe {
-                launch_matvec_preq8_1_tile(
-                    &self.device, &st.kernels, ssm_beta_w,
-                    None, None,
-                    None, lw.q4_split_ssm_beta.as_ref(),
-                    q8_1_buf, &mut gdn.beta_raw_buf,
-                    p.num_heads, hidden_dim, "gdn_beta",
-                )?;
+                // Beta matvec with shared pre-quantized input.
+                unsafe {
+                    launch_matvec_preq8_1_tile(
+                        &self.device, &st.kernels, ssm_beta_w,
+                        None, None,
+                        None, lw.q4_split_ssm_beta.as_ref(),
+                        q8_1_buf, &mut gdn.beta_raw_buf,
+                        p.num_heads, hidden_dim, "gdn_beta",
+                    )?;
+                }
             }
 
             // Gate matvec with shared pre-quantized input.
@@ -4082,38 +4713,108 @@ impl CudaBackend {
                 )?;
             }
 
-            // Alpha matvec
-            unsafe {
-                launch_matvec(
-                    &self.device,
-                    &st.kernels,
-                    ssm_alpha_w,
-                    &st.scratch.normed,
-                    &mut gdn.alpha_raw_buf,
-                    p.num_heads,
-                    hidden_dim,
-                    "gdn_alpha",
-                    lw.ssm_alpha_f16.as_ref(),
-                    Some(&mut st.scratch.input_f16),
-                    st.scratch.input_q8_1.as_mut(),
-                )?;
-            }
+            // Alpha + Beta matvec.
+            // === GDN_AB_F16 (MoE-gated; env LUMEN_CUDA_GDN_AB_F16) ===
+            // HIGHEST-PRIORITY alpha/beta path. Routes BOTH alpha and beta
+            // through `launch_hgemv_f16` (cublasGemmEx N=1, CUDA_R_16F weight ×
+            // CUDA_R_16F activation, COMPUTE_32F_FAST_16F) reading the
+            // pre-dequanted `ssm_{alpha,beta}_f16` caches populated at load.
+            // This is the SAME cuBLAS GemmEx F16 GEMM the batched prefill uses
+            // (N=batch, via `launch_gemm_projection`'s F16-cache fast path), so
+            // batch=1 == row 0 of batch=N: the L0 alpha/beta projection delta
+            // collapses to ~0% decode-vs-prefill (the proven-clean qkv/gate
+            // recipe). Guarded on the caches being present (only populated when
+            // the gate is ON), so OFF is byte-identical. Takes precedence over
+            // both `gdn_decode_ab_mmq` (INT8 MMQ, refuted) and the legacy
+            // Q8_1/dp4a `launch_matvec`. Reads the F32 `normed` scratch computed
+            // by the unfused RMSNorm above (same input as the matvec path);
+            // `input_f16` is the F32->F16 conversion scratch. `gdn_ab_f16` is
+            // resolved once above the fused/unfused split.
+            if gdn_ab_f16 {
+                let alpha_f16 = lw.ssm_alpha_f16.as_ref().expect("gdn_ab_f16 guards Some");
+                unsafe {
+                    launch_hgemv_f16(
+                        &self.device, &st.kernels, alpha_f16,
+                        &st.scratch.normed, &mut gdn.alpha_raw_buf,
+                        &mut st.scratch.input_f16,
+                        p.num_heads, hidden_dim, "gdn_alpha_f16",
+                        cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+                    )?;
+                }
+                let beta_f16 = lw.ssm_beta_f16.as_ref().expect("gdn_ab_f16 guards Some");
+                unsafe {
+                    launch_hgemv_f16(
+                        &self.device, &st.kernels, beta_f16,
+                        &st.scratch.normed, &mut gdn.beta_raw_buf,
+                        &mut st.scratch.input_f16,
+                        p.num_heads, hidden_dim, "gdn_beta_f16",
+                        cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+                    )?;
+                }
+            } else if gdn_decode_ab_mmq {
+            // alpha/beta MMQ alignment (MoE-gated; the bf16 path lands here
+            // because qkv/gate are Bf16Raw so `gdn_use_preq` is false): route
+            // alpha/beta through `mmq_q8_0_batched` (batch=1, from the F32
+            // `normed` already computed above) to match the prefill MMQ INT8
+            // reduction order instead of the per-token Q8_1/dp4a matvec. This
+            // is the empirically-isolated first-flipping-stage fix; qkv/gate
+            // (bit-identical decode-vs-prefill) keep their existing path.
+                let alpha_q8 = match ssm_alpha_w {
+                    GpuWeightBuf::Q8Raw(b) => b,
+                    _ => unreachable!("gdn_decode_ab_mmq guards ssm_alpha is Q8Raw"),
+                };
+                let beta_q8 = match ssm_beta_w {
+                    GpuWeightBuf::Q8Raw(b) => b,
+                    _ => unreachable!("gdn_decode_ab_mmq guards ssm_beta is Q8Raw"),
+                };
+                unsafe {
+                    super::prefill::launch_mmq_q8_0_batched(
+                        &self.device, &st.kernels, alpha_q8,
+                        &st.scratch.normed, &mut gdn.alpha_raw_buf,
+                        p.num_heads, hidden_dim, 1, "gdn_alpha_decode_ab_mmq",
+                    )?;
+                }
+                unsafe {
+                    super::prefill::launch_mmq_q8_0_batched(
+                        &self.device, &st.kernels, beta_q8,
+                        &st.scratch.normed, &mut gdn.beta_raw_buf,
+                        p.num_heads, hidden_dim, 1, "gdn_beta_decode_ab_mmq",
+                    )?;
+                }
+            } else {
+                // Alpha matvec
+                unsafe {
+                    launch_matvec(
+                        &self.device,
+                        &st.kernels,
+                        ssm_alpha_w,
+                        &st.scratch.normed,
+                        &mut gdn.alpha_raw_buf,
+                        p.num_heads,
+                        hidden_dim,
+                        "gdn_alpha",
+                        lw.ssm_alpha_f16.as_ref(),
+                        Some(&mut st.scratch.input_f16),
+                        st.scratch.input_q8_1.as_mut(),
+                    )?;
+                }
 
-            // Beta matvec
-            unsafe {
-                launch_matvec(
-                    &self.device,
-                    &st.kernels,
-                    ssm_beta_w,
-                    &st.scratch.normed,
-                    &mut gdn.beta_raw_buf,
-                    p.num_heads,
-                    hidden_dim,
-                    "gdn_beta",
-                    lw.ssm_beta_f16.as_ref(),
-                    Some(&mut st.scratch.input_f16),
-                    st.scratch.input_q8_1.as_mut(),
-                )?;
+                // Beta matvec
+                unsafe {
+                    launch_matvec(
+                        &self.device,
+                        &st.kernels,
+                        ssm_beta_w,
+                        &st.scratch.normed,
+                        &mut gdn.beta_raw_buf,
+                        p.num_heads,
+                        hidden_dim,
+                        "gdn_beta",
+                        lw.ssm_beta_f16.as_ref(),
+                        Some(&mut st.scratch.input_f16),
+                        st.scratch.input_q8_1.as_mut(),
+                    )?;
+                }
             }
 
             // Gate matvec (moved here from step 9 to share quantized input)
@@ -4134,6 +4835,85 @@ impl CudaBackend {
             }
         }
 
+        // === DECODE GDN conv_state PARITY: re-project qkv via the PREFILL kernel ===
+        // (MoE-gated; LUMEN_CUDA_GDN_CONVSTATE_PARITY). OVERWRITES `gdn.qkv_buf`
+        // (already filled by the decode projection above) with the prefill's
+        // batch=1 projection so the new conv-ring slot bit-matches a true prefill.
+        // Reads the F32 `normed` RMSNorm output materialized above (guaranteed
+        // populated on every path this runs with: bf16 → unfused branch; q8 →
+        // preq branch's `gdn_ab_f16` RMSNorm, since CONVSTATE_PARITY is intended
+        // to run with GDN_AB_F16=1). Alpha/beta/gate keep their aligned values.
+        if gdn_convstate_parity_qkv {
+            match &lw.wq {
+                GpuWeightBuf::Bf16Raw(w_bf16) => {
+                    // PREFILL BF16 path: F32->BF16 activation + cublasGemmEx
+                    // (CUBLAS_GEMM_DEFAULT_TENSOR_OP) at batch=1 — exactly
+                    // `launch_gemm_projection`'s Bf16Raw arm, vs the decode-only
+                    // autotuned `bf16_algo_for` GEMV. Reuses `input_f16` scratch
+                    // for the BF16 activation (u8; cuBLAS interprets as CUDA_R_16BF).
+                    unsafe {
+                        super::prefill::launch_f32_to_bf16_fast(
+                            &self.device, &st.kernels,
+                            &st.scratch.normed, &mut st.scratch.input_f16,
+                            hidden_dim, "gdn_qkv_convparity",
+                        )?;
+                    }
+                    unsafe {
+                        super::prefill::launch_cublas_gemm_bf16(
+                            &self.device, w_bf16, &st.scratch.input_f16,
+                            &mut gdn.qkv_buf,
+                            p.qkv_dim, 1, hidden_dim, 0.0, "gdn_qkv_convparity",
+                        )?;
+                    }
+                }
+                GpuWeightBuf::Q8Raw(w_q8) => {
+                    // PREFILL Q8 path: MMQ INT8 dp4a (per-block INT32 accumulate,
+                    // single F32 scale) at batch=1 — exactly `launch_gemm_`
+                    // `projection`'s Q8Raw MMQ arm (the MoE default), vs the decode
+                    // per-token Q8_1/dp4a tile matvec.
+                    unsafe {
+                        super::prefill::launch_mmq_q8_0_batched(
+                            &self.device, &st.kernels, w_q8,
+                            &st.scratch.normed, &mut gdn.qkv_buf,
+                            p.qkv_dim, hidden_dim, 1, "gdn_qkv_convparity",
+                        )?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // [GDNPROJSS] DECODE GDN projection-output whole-buffer sumsq (env
+        // LUMEN_MOE_PROBE=1, default OFF -> byte-identical). Captures the GDN
+        // q/k/v (qkv_buf), gate, alpha, beta projection outputs IMMEDIATELY
+        // after the projection GEMV/matvec and BEFORE the conv1d/recurrence.
+        // At layer 0 the projection INPUT is just the token embedding (identical
+        // for decode and a fresh prefill of the same prefix), so any decode-vs-
+        // prefill divergence in THIS dump isolates the projection KERNEL
+        // (decode bf16 cuBLAS GEMV N=1 vs prefill bf16 cuBLAS GEMM N=batch),
+        // separated from the GDN recurrence (incremental vs batched scan).
+        // Mirrors the prefill [GDNPROJSS] dump in prefill_gdn_layer.
+        if {
+            use std::sync::OnceLock;
+            static GP: OnceLock<bool> = OnceLock::new();
+            *GP.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
+        } {
+            let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+            let qkv_h = self.device.dtoh_copy(&gdn.qkv_buf)?;
+            let alpha_h = self.device.dtoh_copy(&gdn.alpha_raw_buf)?;
+            let beta_h = self.device.dtoh_copy(&gdn.beta_raw_buf)?;
+            let gate_h = self.device.dtoh_copy(&gdn.gate_buf)?;
+            eprintln!(
+                "[GDNPROJSS] mode=D step={} layer={layer_idx} \
+                 qkv_sumsq={:.6} alpha_sumsq={:.6} beta_sumsq={:.6} gate_sumsq={:.6}",
+                st.decode_token_count,
+                ss(&qkv_h[..p.qkv_dim.min(qkv_h.len())]),
+                ss(&alpha_h[..p.num_heads.min(alpha_h.len())]),
+                ss(&beta_h[..p.num_heads.min(beta_h.len())]),
+                ss(&gate_h[..p.value_dim.min(gate_h.len())]),
+            );
+        }
+
 
         // --- Steps 3a-7: Fused megakernel path (conv1d+silu, gates, L2, state update) ---
         // Falls back to unfused path if megakernel failed to compile.
@@ -4150,6 +4930,47 @@ impl CudaBackend {
                 "GDN L{layer_idx}: ssm_a missing",
             )))?;
 
+        // === DECODE-VIA-PREFILL: GDN-decode==GDN-prefill structural parity ===
+        // gated behind LUMEN_CUDA_GDN_DECODE_VIA_PREFILL (MoE-gated, default OFF).
+        // Routes the single new decode token through the PREFILL fused GDN
+        // recurrence kernels at T=1 — conv1d+SiLU (`ssm_conv1d_silu_prefill`),
+        // gates (`gdn_compute_gates_batched`), L2-norm
+        // (`l2_normalize_qk_strided[_f64accum]`), delta-rule recurrence
+        // (`gdn_prefill_fused_v3[_f64accum]`) and norm-gate
+        // (`gdn_prefill_norm_gate[_f64accum]`) — carrying the persistent
+        // `h_state` / `conv_state`, INSTEAD of the decode megakernel /
+        // register-resident phase4. Because qkv/gate are F16/bf16-bit-identical,
+        // alpha/beta are bit-identical under `gdn_ab_f16_enabled()`, and now the
+        // recurrence runs the EXACT prefill kernels at batch=1, the GDN decode
+        // block is byte-equivalent to a prefill of the same position by
+        // construction. Requires the five prefill fused kernels to be loaded.
+        // Highest priority — preempts register-resident and megakernel paths.
+        // Writes the FINAL norm-gated output straight into `normed_out_buf`
+        // (the prefill norm-gate fuses RMSNorm + SiLU(gate)), so the decode
+        // Steps 8/10 norm-gate is skipped and Step 11 (ssm_out) reads
+        // `normed_out_buf`. OFF / missing-kernels → byte-identical.
+        let gdn_decode_via_prefill = gdn_decode_via_prefill_enabled()
+            && st.kernels.ssm_conv1d_silu_prefill.is_some()
+            && st.kernels.gdn_compute_gates_batched.is_some()
+            && st.kernels.l2_normalize_qk_strided.is_some()
+            && st.kernels.gdn_prefill_fused_v3.is_some()
+            && st.kernels.gdn_prefill_norm_gate.is_some();
+        // The legacy decode path's recurrence diverges from prefill and
+        // accumulates over long generations (repetition/charspam) — if the
+        // parity path was requested but a prefill kernel failed to load, the
+        // silent fallback would quietly reintroduce that defect. Surface it
+        // once so a degraded-quality report is diagnosable from the log.
+        if gdn_decode_via_prefill_enabled() && !gdn_decode_via_prefill {
+            static FALLBACK_WARNED: std::sync::Once = std::sync::Once::new();
+            FALLBACK_WARNED.call_once(|| {
+                eprintln!(
+                    "[CUDA] WARNING: GDN decode-via-prefill enabled but prefill kernels \
+                     unavailable — falling back to the legacy decode path (long-form \
+                     output quality may degrade: per-step recurrence divergence)"
+                );
+            });
+        }
+
         // Two-launch path: gated behind LUMEN_CUDA_GDN_REGISTER_RESIDENT=1.
         // Splits the existing megakernel into two: Phases 1-3 (same logic as
         // the existing megakernel, but materializes Q_norm/K_norm to device
@@ -4162,13 +4983,274 @@ impl CudaBackend {
             Some(v) => matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"),
             None => crate::runtime_defaults::gdn_register_resident_default(),
         };
-        let use_register_resident_phase4 = register_resident_env
+        let use_register_resident_phase4 = !gdn_decode_via_prefill
+            && register_resident_env
             && st.kernels.gdn_phase123_register_resident.is_some()
             && st.kernels.gdn_phase4_register_resident.is_some()
             && gdn.q_norm_buf_rr.is_some()
             && gdn.k_norm_buf_rr.is_some();
 
-        if use_register_resident_phase4 {
+        if gdn_decode_via_prefill {
+            // === GDN DECODE VIA PREFILL KERNELS @ T=1 (structural parity) ===
+            // Dispatch the five PREFILL fused GDN kernels on the single new
+            // token. Buffer mapping (decode `gdn` scratch -> prefill role):
+            //   qkv_buf       [qkv_dim]   -> prefill `input`/`qkv`
+            //   qkv_conv_buf  [qkv_dim]   -> prefill `conv_out`
+            //   alpha_raw_buf [num_heads] -> prefill `alpha_raw`
+            //   beta_raw_buf  [num_heads] -> prefill `beta_raw`
+            //   alpha_buf     [num_heads] -> prefill `alpha_out`
+            //   beta_buf      [num_heads] -> prefill `beta_out`
+            //   output_buf    [value_dim] -> prefill `raw_out` (T=1 => value_dim)
+            //   gate_buf      [value_dim] -> prefill `gate_all`
+            //   normed_out_buf[value_dim] -> prefill `ssm_out`/`gdn_out` (final)
+            // At T=1 every prefill kernel collapses to the single-token step:
+            // identical arithmetic to a true prefill of this position, carrying
+            // h_states[gdn_idx] / conv_states[gdn_idx] exactly as prefill does.
+            let ssm_norm = lw.ssm_norm_tiled.as_ref()
+                .ok_or_else(|| RuntimeError::Compute(format!(
+                    "GDN L{layer_idx}: ssm_norm_tiled missing (decode-via-prefill)",
+                )))?;
+
+            let num_heads_u32 = p.num_heads as u32;
+            let num_kv_heads_u32 = p.num_kv_heads as u32;
+            let head_dim_u32 = p.head_dim as u32;
+            let qkv_dim_u32 = p.qkv_dim as u32;
+            let qk_dim_u32 = p.qk_dim as u32;
+            let kernel_size_u32 = p.conv_kernel_size as u32;
+            let buf_slots = (p.conv_kernel_size - 1) as u32;
+            let batch_u32 = 1u32;
+            let state_pos = gdn.conv_positions[gdn_idx];
+
+            // F64-accum gate: mirror the MoE prefill selection EXACTLY so the
+            // single-token decode recurrence matches the F64 prefill scan to
+            // F64 rounding (the MoE prefill runs these F64 variants by default
+            // via gdn_f64_accum_enabled()). When OFF / twin-missing, use F32.
+            let use_prefill_f64 = gdn_f64_accum_enabled()
+                && st.kernels.l2_normalize_qk_strided_f64accum.is_some()
+                && st.kernels.gdn_prefill_fused_v3_f64accum.is_some()
+                && st.kernels.gdn_prefill_norm_gate_f64accum.is_some();
+
+            // [GDNSTATE] one-time path diagnostic (env LUMEN_MOE_PROBE=1).
+            {
+                use std::sync::OnceLock;
+                static PD: OnceLock<bool> = OnceLock::new();
+                let probe = *PD.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"));
+                static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if probe && !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[GDNSTATE] PATH=decode-via-prefill use_prefill_f64={} f64_enabled={} graph_mode={}",
+                        use_prefill_f64, gdn_f64_accum_enabled(), graph_mode,
+                    );
+                }
+            }
+
+            // 1. ssm_conv1d_silu_prefill: conv1d + SiLU, advances conv_state.
+            {
+                let conv_fn = st.kernels.ssm_conv1d_silu_prefill.as_ref().unwrap();
+                let config = LaunchConfig::for_elements(p.qkv_dim);
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (config.grid_dim, 1, 1),
+                    block_dim: (config.block_dim, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device.stream.launch_builder(conv_fn)
+                        .arg(&gdn.qkv_buf)
+                        .arg(&mut gdn.conv_states[gdn_idx])
+                        .arg(conv1d_weight)
+                        .arg(&mut gdn.qkv_conv_buf)
+                        .arg(&qkv_dim_u32)
+                        .arg(&kernel_size_u32)
+                        .arg(&state_pos)
+                        .arg(&batch_u32)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!(
+                    "GDN decode-via-prefill conv1d_silu L{layer_idx}: {e}"
+                )))?;
+                gdn.conv_positions[gdn_idx] = (state_pos + batch_u32) % buf_slots;
+            }
+
+            // 2. gdn_compute_gates_batched: alpha/beta gates (-> alpha_buf/beta_buf).
+            {
+                let gates_fn = st.kernels.gdn_compute_gates_batched.as_ref().unwrap();
+                let config = LaunchConfig::for_elements(p.num_heads);
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (config.grid_dim, 1, 1),
+                    block_dim: (config.block_dim, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device.stream.launch_builder(gates_fn)
+                        .arg(dt_bias)
+                        .arg(ssm_a)
+                        .arg(&gdn.beta_raw_buf)
+                        .arg(&gdn.alpha_raw_buf)
+                        .arg(&mut gdn.alpha_buf)
+                        .arg(&mut gdn.beta_buf)
+                        .arg(&num_heads_u32)
+                        .arg(&batch_u32)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!(
+                    "GDN decode-via-prefill gates_batched L{layer_idx}: {e}"
+                )))?;
+            }
+
+            // 3. l2_normalize_qk_strided[_f64accum]: L2-norm Q/K in-place on conv_out.
+            {
+                let l2_fn = if use_prefill_f64 {
+                    st.kernels.l2_normalize_qk_strided_f64accum.as_ref().unwrap()
+                } else {
+                    st.kernels.l2_normalize_qk_strided.as_ref().unwrap()
+                };
+                let l2_block_dim = (p.head_dim as u32).min(1024);
+                let bytes_per_elem: u32 = if use_prefill_f64 { 8 } else { 4 };
+                let l2_shared = ((l2_block_dim + 31) / 32 + 1) * bytes_per_elem;
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (num_kv_heads_u32 * batch_u32, 1, 1),
+                    block_dim: (l2_block_dim, 1, 1),
+                    shared_mem_bytes: l2_shared,
+                };
+                let q_offset = 0u32;
+                let k_offset = p.qk_dim as u32;
+                unsafe {
+                    self.device.stream.launch_builder(l2_fn)
+                        .arg(&mut gdn.qkv_conv_buf)
+                        .arg(&num_kv_heads_u32)
+                        .arg(&head_dim_u32)
+                        .arg(&batch_u32)
+                        .arg(&qkv_dim_u32)
+                        .arg(&q_offset)
+                        .arg(&k_offset)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!(
+                    "GDN decode-via-prefill l2_norm_qk L{layer_idx}: {e}"
+                )))?;
+            }
+
+            // [GDNSTATE] mode=D phase=before (env LUMEN_MOE_PROBE=1).
+            let gdnstate_probe_vp = {
+                use std::sync::OnceLock;
+                static GSV: OnceLock<bool> = OnceLock::new();
+                *GSV.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
+            };
+            if gdnstate_probe_vp {
+                let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                let h_before = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
+                let conv_h = self.device.dtoh_copy(&gdn.conv_states[gdn_idx])?;
+                eprintln!(
+                    "[GDNSTATE] mode=D phase=before step={} layer={layer_idx} \
+                     state_pos={state_pos} h_sumsq={:.6} h_len={} conv_sumsq={:.6} conv_len={}",
+                    st.decode_token_count,
+                    ss(&h_before), h_before.len(),
+                    ss(&conv_h), conv_h.len(),
+                );
+            }
+
+            // 4. gdn_prefill_fused_v3[_f64accum]: delta-rule recurrence.
+            //    Reads conv_out + alpha_out + beta_out, writes raw_out
+            //    (output_buf), updates h_states[gdn_idx] in place.
+            {
+                let state_fn = if use_prefill_f64 {
+                    st.kernels.gdn_prefill_fused_v3_f64accum.as_ref().unwrap()
+                } else {
+                    st.kernels.gdn_prefill_fused_v3.as_ref().unwrap()
+                };
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (head_dim_u32, num_heads_u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device.stream.launch_builder(state_fn)
+                        .arg(&mut gdn.h_states[gdn_idx])
+                        .arg(&gdn.qkv_conv_buf)
+                        .arg(&gdn.alpha_buf)
+                        .arg(&gdn.beta_buf)
+                        .arg(&mut gdn.output_buf)
+                        .arg(&num_heads_u32)
+                        .arg(&head_dim_u32)
+                        .arg(&head_dim_u32) // val_dim per head = head_dim
+                        .arg(&num_kv_heads_u32)
+                        .arg(&batch_u32)
+                        .arg(&qk_dim_u32)
+                        .arg(&qkv_dim_u32)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!(
+                    "GDN decode-via-prefill fused_v3 L{layer_idx}: {e}"
+                )))?;
+            }
+
+            // [GDNSTATE] mode=D phase=after + [XCHK] (env LUMEN_MOE_PROBE / LUMEN_XCHK).
+            if gdnstate_probe_vp {
+                let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                let h_after = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
+                let out_h = self.device.dtoh_copy(&gdn.output_buf)?;
+                eprintln!(
+                    "[GDNSTATE] mode=D phase=after step={} layer={layer_idx} \
+                     h_sumsq={:.6} out_sumsq={:.6}",
+                    st.decode_token_count,
+                    ss(&h_after),
+                    ss(&out_h[..p.value_dim.min(out_h.len())]),
+                );
+            }
+            if {
+                use std::sync::OnceLock;
+                static XK: OnceLock<bool> = OnceLock::new();
+                *XK.get_or_init(|| std::env::var("LUMEN_XCHK").as_deref() == Ok("1"))
+            } {
+                let sa = |v: &[f32]| -> (f64, f32) {
+                    let mut sq = 0f64; let mut mx = 0f32;
+                    for &e in v { sq += (e as f64) * (e as f64); let a = e.abs(); if a > mx { mx = a; } }
+                    (sq, mx)
+                };
+                let h_after = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
+                let conv_h = self.device.dtoh_copy(&gdn.conv_states[gdn_idx])?;
+                let (hsq, hmx) = sa(&h_after);
+                let (csq, cmx) = sa(&conv_h);
+                let step = st.decode_token_count;
+                eprintln!("[XCHK] step={step} L={layer_idx} gdn_h_state sumsq={hsq:.6} absmax={hmx:.6}");
+                eprintln!("[XCHK] step={step} L={layer_idx} gdn_conv_state sumsq={csq:.6} absmax={cmx:.6}");
+            }
+
+            // 5. gdn_prefill_norm_gate[_f64accum]: RMSNorm + SiLU(gate) ->
+            //    normed_out_buf (the FINAL norm-gated GDN output). Step 11
+            //    (ssm_out) reads normed_out_buf via used_fused_norm_gate=true.
+            {
+                let norm_fn = if use_prefill_f64 {
+                    st.kernels.gdn_prefill_norm_gate_f64accum.as_ref().unwrap()
+                } else {
+                    st.kernels.gdn_prefill_norm_gate.as_ref().unwrap()
+                };
+                let block_dim = (p.head_dim as u32).min(1024);
+                let bytes_per_elem_norm: u32 = if use_prefill_f64 { 8 } else { 4 };
+                let norm_shared = ((block_dim + 31) / 32 + 1) * bytes_per_elem_norm;
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (num_heads_u32, batch_u32, 1),
+                    block_dim: (block_dim, 1, 1),
+                    shared_mem_bytes: norm_shared,
+                };
+                unsafe {
+                    self.device.stream.launch_builder(norm_fn)
+                        .arg(&gdn.output_buf)
+                        .arg(&gdn.gate_buf)
+                        .arg(ssm_norm)
+                        .arg(&mut gdn.normed_out_buf)
+                        .arg(&num_heads_u32)
+                        .arg(&head_dim_u32) // val_dim per head = head_dim
+                        .arg(&eps)
+                        .arg(&num_heads_u32) // scale_n_heads
+                        .arg(&batch_u32)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!(
+                    "GDN decode-via-prefill norm_gate L{layer_idx}: {e}"
+                )))?;
+            }
+        } else if use_register_resident_phase4 {
             // === TWO-LAUNCH PATH: Phase 1-3 + Phase 4 (2 launches; replaces megakernel) ===
             // Optional Phase-4 variant: coalesced lane mapping (env-gated default OFF).
             // Selected when LUMEN_CUDA_GDN_PHASE4_COAL=1 AND the coal kernel is loaded.
@@ -4185,10 +5267,48 @@ impl CudaBackend {
             // kernel with the F64-state F64-reduce variant; the coal/strided
             // ownership pattern is irrelevant once F64 is the accumulator (the
             // F64 variant uses the strided lane pattern like F32 base).
-            let use_phase4_f64 = std::env::var("LUMEN_CUDA_GDN_F64_ACCUM")
-                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
-                .unwrap_or(false)
+            let use_phase4_f64 = gdn_f64_accum_enabled()
                 && st.kernels.gdn_phase4_register_resident_f64accum.is_some();
+            // Prefill-order F64 phase4: reorders the delta-rule arithmetic to
+            // match the prefill batched-scan single-token step bit-for-bit,
+            // aligning the residual decode-vs-prefill GDN RECURRENCE divergence
+            // that survives the GDN_AB_F16 projection fix. Requires the F64
+            // phase4 path (same precision as prefill's F64 scan); when ON it
+            // SUBSTITUTES the base F64 phase4 kernel (identical args/grid).
+            // Default OFF (`LUMEN_CUDA_GDN_RECUR_PREFILL_ORDER`, MoE-gated).
+            let use_phase4_prefillorder = use_phase4_f64
+                && gdn_recur_prefill_order_enabled()
+                && st.kernels.gdn_phase4_register_resident_f64accum_prefillorder.is_some();
+            // F64-internal-accumulator variant for Phase 1-3 (conv1d+SiLU+L2-norm).
+            // DEFAULT OFF on its OWN gate `LUMEN_CUDA_GDN_PHASE123_F64=1`,
+            // deliberately DECOUPLED from `gdn_f64_accum_enabled()` (which keeps
+            // the 5 proven F64 kernels -- phase4, prefill v3, norm_gate, l2norm,
+            // rmsnorm_silu_gate -- ON for MoE).
+            //
+            // EMPIRICAL (Jun 8, A100, MoE-35B, both runs byte-deterministic):
+            // routing decode phase123 through F64 REGRESSED both quants vs F32:
+            //   q4 math: rep 4->26, LOST 391 (hard "17x20=17x20" loop)
+            //   q8 math: rep 2->12, LOST 391, "multiplicationlication" doubling
+            //            UNCHANGED (so phase123 F32 drift is NOT the cause).
+            // The extra precision shifts the near-tie token landscape into worse
+            // repetition basins -- same failure class as "generic PREFILL_F32 made
+            // q4 rep30". Hence default OFF; kept opt-in for further investigation.
+            // Falls back to the F32 phase123 when the kernel did not compile.
+            let use_phase123_f64 = parse_env_truthy("LUMEN_CUDA_GDN_PHASE123_F64").unwrap_or(false)
+                && st.kernels.gdn_phase123_register_resident_f64accum.is_some();
+            // PHASE123 decode->prefill L2-norm ALIGNMENT (MoE-gated;
+            // LUMEN_CUDA_GDN_PHASE123_ALIGN). Routes the decode phase123 through
+            // `gdn_phase123_register_resident_alignl2`: conv1d+SiLU stay F32
+            // (bit-identical to ssm_conv1d_silu_prefill single token) and the
+            // per-head L2-norm matches the prefill `l2_normalize_qk_strided_f64accum`
+            // F64 reduction bit-for-bit. Mutually exclusive with the F32-conv
+            // PHASE123_F64 (that raises conv1d precision and regressed): when both
+            // are requested, ALIGN takes precedence below. OFF is byte-identical
+            // (falls back to the F32 base phase123). The MoE prefill's L2-norm is
+            // already F64 by default (gdn_f64_accum_enabled()), so this is the
+            // matching half on the decode side.
+            let use_phase123_align = gdn_phase123_align_enabled()
+                && st.kernels.gdn_phase123_register_resident_alignl2.is_some();
             // when running inside an active CUDA graph capture
             // region (graph_mode == true) AND the graph-capturable variant of
             // phase123 is available AND `conv_positions_gpu` is allocated,
@@ -4200,13 +5320,24 @@ impl CudaBackend {
                 && st.kernels.gdn_phase123_register_resident_graph.is_some()
                 && gdn.conv_positions_gpu.is_some();
 
-            let p4_fn = if use_phase4_f64 {
+            let p4_fn = if use_phase4_prefillorder {
+                st.kernels.gdn_phase4_register_resident_f64accum_prefillorder.as_ref().unwrap()
+            } else if use_phase4_f64 {
                 st.kernels.gdn_phase4_register_resident_f64accum.as_ref().unwrap()
             } else if use_phase4_coal {
                 st.kernels.gdn_phase4_register_resident_coal.as_ref().unwrap()
             } else {
                 st.kernels.gdn_phase4_register_resident.as_ref().unwrap()
             };
+            if use_phase4_prefillorder {
+                static RECUR_PO_LOGGED: AtomicBool = AtomicBool::new(false);
+                if !RECUR_PO_LOGGED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[CUDA] GDN_RECUR_PREFILL_ORDER: ACTIVE — decode phase4 \
+                         delta-rule reordered to match prefill batched-scan (F64)"
+                    );
+                }
+            }
 
             let num_heads_u32 = p.num_heads as u32;
             let num_kv_heads_u32 = p.num_kv_heads as u32;
@@ -4221,7 +5352,40 @@ impl CudaBackend {
             // Same grid/block as existing megakernel; writes Q_norm, K_norm,
             // V, alpha, beta to device buffers.
             let block_dim = (p.head_dim as u32).max(128).min(1024);
-            let shared_bytes = (32 + 2 * p.head_dim as u32) * 4;
+            // The graph path can only run F64 if the graph-capturable F64 twin
+            // compiled; otherwise the graph branch falls back to the F32 graph
+            // kernel (so resolve F64-for-graph separately).
+            let use_phase123_graph_f64 = use_phase123_graph
+                && use_phase123_f64
+                && st.kernels.gdn_phase123_register_resident_graph_f64accum.is_some();
+            // ALIGN graph twin (only when the graph-capturable align kernel
+            // compiled; otherwise the graph branch falls back to F32 base).
+            // ALIGN takes precedence over PHASE123_F64 if both requested.
+            let use_phase123_graph_align = use_phase123_graph
+                && use_phase123_align
+                && st.kernels.gdn_phase123_register_resident_graph_alignl2.is_some();
+            // F64 shmem doubles q_shmem/k_shmem/warp_scratch element size.
+            // Non-graph dispatch uses F64 whenever `use_phase123_f64`; graph
+            // dispatch uses F64 only when the graph F64 twin is present.
+            let phase123_is_f64 = if use_phase123_graph {
+                use_phase123_graph_f64
+            } else {
+                use_phase123_f64
+            };
+            // Whether THIS dispatch will run the align kernel (non-graph: any
+            // time use_phase123_align; graph: only when the align graph twin
+            // exists). The align kernel uses the SAME all-double shmem layout as
+            // the F64-base variant: (32 + 2*head_dim) doubles (it differs from
+            // the F64-base ONLY in computing conv1d in F32 before promoting).
+            let phase123_is_align = if use_phase123_graph {
+                use_phase123_graph_align
+            } else {
+                use_phase123_align
+            };
+            // F64 shmem (8 bytes/elem) whenever the dispatch runs the F64-base
+            // OR the align kernel (both use all-double shmem); F32 otherwise.
+            let elem_bytes = if phase123_is_f64 || phase123_is_align { 8u32 } else { 4u32 };
+            let shared_bytes = (32 + 2 * p.head_dim as u32) * elem_bytes;
             let p123_cfg = CudarcLaunchConfig {
                 grid_dim: (num_heads_u32, 1, 1),
                 block_dim: (block_dim, 1, 1),
@@ -4240,7 +5404,13 @@ impl CudaBackend {
                 // begin_capture(), so its current value matches the host
                 // state_pos at capture time. The advance_conv_position kernel
                 // (dispatched after phase4 below) increments it per-replay.
-                let p123_graph_fn = st.kernels.gdn_phase123_register_resident_graph.as_ref().unwrap();
+                let p123_graph_fn = if use_phase123_graph_align {
+                    st.kernels.gdn_phase123_register_resident_graph_alignl2.as_ref().unwrap()
+                } else if use_phase123_graph_f64 {
+                    st.kernels.gdn_phase123_register_resident_graph_f64accum.as_ref().unwrap()
+                } else {
+                    st.kernels.gdn_phase123_register_resident_graph.as_ref().unwrap()
+                };
                 let gpu_pos_slice = &mut gdn.conv_positions_gpu.as_mut().unwrap()[gdn_idx];
                 unsafe {
                     self.device.stream.launch_builder(p123_graph_fn)
@@ -4268,7 +5438,13 @@ impl CudaBackend {
                 }
                 .map_err(|e| RuntimeError::Compute(format!("GDN phase123 register_resident graph L{layer_idx}: {e}")))?;
             } else {
-                let p123_fn = st.kernels.gdn_phase123_register_resident.as_ref().unwrap();
+                let p123_fn = if use_phase123_align {
+                    st.kernels.gdn_phase123_register_resident_alignl2.as_ref().unwrap()
+                } else if use_phase123_f64 {
+                    st.kernels.gdn_phase123_register_resident_f64accum.as_ref().unwrap()
+                } else {
+                    st.kernels.gdn_phase123_register_resident.as_ref().unwrap()
+                };
                 unsafe {
                     self.device.stream.launch_builder(p123_fn)
                         .arg(&mut gdn.conv_states[gdn_idx])
@@ -4296,6 +5472,17 @@ impl CudaBackend {
                 .map_err(|e| RuntimeError::Compute(format!("GDN phase123 register_resident L{layer_idx}: {e}")))?;
             }
 
+            if phase123_is_align {
+                static PHASE123_ALIGN_LOGGED: AtomicBool = AtomicBool::new(false);
+                if !PHASE123_ALIGN_LOGGED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[CUDA] GDN_PHASE123_ALIGN: ACTIVE — decode phase123 L2-norm \
+                         reduction aligned to prefill l2_normalize_qk_strided_f64accum \
+                         (conv1d kept F32; q_norm/k_norm bit-identical decode-vs-prefill)"
+                    );
+                }
+            }
+
             // --- Phase 4: register-resident delta-rule ---
             // Grid: (num_heads, 1, ceil(head_dim / num_warps)); Block: (32, 4, 1)
             // For Qwen3.5-9B (head_dim=128, num_warps=4): grid (32, 1, 32), block (32, 4, 1).
@@ -4307,6 +5494,32 @@ impl CudaBackend {
                 block_dim: (warp_size_p4, num_warps_p4, 1),
                 shared_mem_bytes: 0,
             };
+            // [GDNSTATE] DECODE recurrent-state probe (env LUMEN_MOE_PROBE=1,
+            // default OFF -> byte-identical). Dumps whole-buffer sumsq of the
+            // recurrent h_state CARRIED INTO phase4 (i.e. the state built by the
+            // prompt prefill scan through pos N-1) and the conv_state circular
+            // buffer, then the UPDATED h_state AFTER the single-token phase4
+            // step. Comparing the BEFORE value to a force-prefill's pre-final-
+            // token state discriminates H1 (carried-state-build differs) from
+            // H2 (per-step update differs given equal prior state). Mirrors the
+            // prefill [GDNSTATE] dump in prefill_gdn_layer.
+            let gdnstate_probe = {
+                use std::sync::OnceLock;
+                static GS: OnceLock<bool> = OnceLock::new();
+                *GS.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
+            };
+            if gdnstate_probe {
+                let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                let h_before = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
+                let conv_h = self.device.dtoh_copy(&gdn.conv_states[gdn_idx])?;
+                eprintln!(
+                    "[GDNSTATE] mode=D phase=before step={} layer={layer_idx} \
+                     state_pos={state_pos} h_sumsq={:.6} h_len={} conv_sumsq={:.6} conv_len={}",
+                    st.decode_token_count,
+                    ss(&h_before), h_before.len(),
+                    ss(&conv_h), conv_h.len(),
+                );
+            }
             unsafe {
                 self.device.stream.launch_builder(p4_fn)
                     .arg(&mut gdn.h_states[gdn_idx])
@@ -4322,6 +5535,40 @@ impl CudaBackend {
                     .launch(p4_cfg)
             }
             .map_err(|e| RuntimeError::Compute(format!("GDN phase4 register_resident L{layer_idx}: {e}")))?;
+            if gdnstate_probe {
+                let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                let h_after = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
+                let out_h = self.device.dtoh_copy(&gdn.output_buf)?;
+                eprintln!(
+                    "[GDNSTATE] mode=D phase=after step={} layer={layer_idx} \
+                     h_sumsq={:.6} out_sumsq={:.6}",
+                    st.decode_token_count,
+                    ss(&h_after),
+                    ss(&out_h[..p.value_dim.min(out_h.len())]),
+                );
+            }
+            // [XCHK] GDN h_state/conv_state on the register-resident decode path
+            // (env LUMEN_XCHK=1, default OFF). Same schema as the megakernel-path
+            // [XCHK] so the cross-backend diff fires regardless of which CUDA GDN
+            // decode path is live.
+            if {
+                use std::sync::OnceLock;
+                static XKR: OnceLock<bool> = OnceLock::new();
+                *XKR.get_or_init(|| std::env::var("LUMEN_XCHK").as_deref() == Ok("1"))
+            } {
+                let sa = |v: &[f32]| -> (f64, f32) {
+                    let mut sq = 0f64; let mut mx = 0f32;
+                    for &e in v { sq += (e as f64) * (e as f64); let a = e.abs(); if a > mx { mx = a; } }
+                    (sq, mx)
+                };
+                let h_after = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
+                let conv_h = self.device.dtoh_copy(&gdn.conv_states[gdn_idx])?;
+                let (hsq, hmx) = sa(&h_after);
+                let (csq, cmx) = sa(&conv_h);
+                let step = st.decode_token_count;
+                eprintln!("[XCHK] step={step} L={layer_idx} gdn_h_state sumsq={hsq:.6} absmax={hmx:.6}");
+                eprintln!("[XCHK] step={step} L={layer_idx} gdn_conv_state sumsq={csq:.6} absmax={cmx:.6}");
+            }
 
             // Advance circular buffer position.
             let buf_slots = (p.conv_kernel_size - 1) as u32;
@@ -4353,9 +5600,43 @@ impl CudaBackend {
             }
 
             gdn.conv_positions[gdn_idx] = (state_pos + 1) % buf_slots;
-        } else if let Some(ref mega_fn) = st.kernels.gdn_decode_megakernel {
+        } else if let Some(ref mega_fn_f32) = st.kernels.gdn_decode_megakernel {
             // === FUSED PATH: 8 launches -> 2 ===
             // Kernel 1 (gdn_decode_megakernel): conv1d+silu, gates, L2 norm, state update.
+            //
+            // MoE decode/prefill PRECISION PARITY: when
+            // `gdn_decode_megakernel_f64_enabled()` (MoE default; env
+            // `LUMEN_CUDA_GDN_DECODE_MEGAKERNEL_F64` override) AND the F64 twin
+            // compiled, dispatch the F64-accum megakernel (F64 L2-norm + F64
+            // delta-rule recurrence, F32 state write-back) so the decode-built
+            // `h_state` tracks the F64 prefill scan to F64 rounding. The eager
+            // and graph variants each pick their respective F64 twin. OFF /
+            // dense / missing-twin → byte-identical F32 path.
+            let use_mega_f64 = gdn_decode_megakernel_f64_enabled()
+                && st.kernels.gdn_decode_megakernel_f64accum.is_some();
+            let mega_fn = if use_mega_f64 {
+                st.kernels.gdn_decode_megakernel_f64accum.as_ref().unwrap()
+            } else {
+                mega_fn_f32
+            };
+            // [GDNSTATE] one-time path diagnostic (env LUMEN_MOE_PROBE=1, default
+            // OFF -> byte-identical). Confirms the megakernel eager branch is the
+            // ACTIVE decode path AND whether the F64 twin is selected/compiled.
+            {
+                use std::sync::OnceLock;
+                static PD: OnceLock<bool> = OnceLock::new();
+                let probe = *PD.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"));
+                static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if probe && !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[GDNSTATE] PATH=megakernel-eager use_mega_f64={} f64_enabled={} f64_twin_compiled={} graph_mode={}",
+                        use_mega_f64,
+                        gdn_decode_megakernel_f64_enabled(),
+                        st.kernels.gdn_decode_megakernel_f64accum.is_some(),
+                        graph_mode,
+                    );
+                }
+            }
             //
             // when running inside an active
             // CUDA graph capture region (graph_mode == true) AND the graph
@@ -4383,8 +5664,16 @@ impl CudaBackend {
                 shared_mem_bytes: shared_bytes,
             };
 
+            // When the F64 twin is engaged, the graph path requires the F64
+            // graph twin (the F32 graph kernel would re-introduce the F32 decode
+            // recurrence). If F64 is off, use the F32 graph kernel as before.
+            let graph_twin_available = if use_mega_f64 {
+                st.kernels.gdn_decode_megakernel_graph_f64accum.is_some()
+            } else {
+                st.kernels.gdn_decode_megakernel_graph.is_some()
+            };
             let use_graph_mega = graph_mode
-                && st.kernels.gdn_decode_megakernel_graph.is_some()
+                && graph_twin_available
                 && gdn.conv_positions_gpu.is_some();
 
             if use_graph_mega {
@@ -4393,7 +5682,11 @@ impl CudaBackend {
                 // conv_positions_gpu[gdn_idx] was pre-populated via htod_copy
                 // before begin_capture(), so its current value matches the
                 // host state_pos at capture time.
-                let mega_graph_fn = st.kernels.gdn_decode_megakernel_graph.as_ref().unwrap();
+                let mega_graph_fn = if use_mega_f64 {
+                    st.kernels.gdn_decode_megakernel_graph_f64accum.as_ref().unwrap()
+                } else {
+                    st.kernels.gdn_decode_megakernel_graph.as_ref().unwrap()
+                };
                 // Borrow conv_positions_gpu separately for the megakernel arg
                 // — the borrow checker requires we split mutable borrows on
                 // the GdnScratchGpu fields. The `.as_mut().unwrap()` pattern
@@ -4463,6 +5756,30 @@ impl CudaBackend {
             } else {
                 // Eager path (graph_mode == false OR graph kernel unavailable).
                 // bit-exact when disabled: host-scalar state_pos.
+                // [GDNSTATE] DECODE recurrent-state probe (env LUMEN_MOE_PROBE=1,
+                // default OFF -> byte-identical). h_state CARRIED INTO the
+                // megakernel (= state built by prompt prefill scan thru pos N-1)
+                // + conv_state, then UPDATED h_state after the single-token
+                // megakernel step. The H1/H2 discriminator vs the prefill
+                // [GDNSTATE] mode=P dump. (This is the ACTIVE default decode
+                // path: gdn_decode_megakernel, eager.)
+                let gdnstate_probe_mega = {
+                    use std::sync::OnceLock;
+                    static GSM: OnceLock<bool> = OnceLock::new();
+                    *GSM.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
+                };
+                if gdnstate_probe_mega {
+                    let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                    let h_before = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
+                    let conv_h = self.device.dtoh_copy(&gdn.conv_states[gdn_idx])?;
+                    eprintln!(
+                        "[GDNSTATE] mode=D phase=before step={} layer={layer_idx} \
+                         state_pos={state_pos} h_sumsq={:.6} h_len={} conv_sumsq={:.6} conv_len={}",
+                        st.decode_token_count,
+                        ss(&h_before), h_before.len(),
+                        ss(&conv_h), conv_h.len(),
+                    );
+                }
                 unsafe {
                     self.device
                         .stream
@@ -4487,6 +5804,42 @@ impl CudaBackend {
                         .launch(launch_cfg)
                 }
                 .map_err(|e| RuntimeError::Compute(format!("GDN megakernel L{layer_idx}: {e}")))?;
+                if gdnstate_probe_mega {
+                    let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                    let h_after = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
+                    let out_h = self.device.dtoh_copy(&gdn.output_buf)?;
+                    eprintln!(
+                        "[GDNSTATE] mode=D phase=after step={} layer={layer_idx} \
+                         h_sumsq={:.6} out_sumsq={:.6}",
+                        st.decode_token_count,
+                        ss(&h_after),
+                        ss(&out_h[..p.value_dim.min(out_h.len())]),
+                    );
+                }
+                // [XCHK] Cross-backend forensic probe (env LUMEN_XCHK=1, default
+                // OFF -> byte-identical). GDN post-update h_state + conv_state in
+                // the SAME layout-independent sumsq/absmax schema as the Metal
+                // [XCHK] dump, keyed by the 0-based decode ordinal
+                // (decode_token_count) so the two backends align op-for-op. This
+                // is the LIVE megakernel decode path (gdn_decode_megakernel).
+                if {
+                    use std::sync::OnceLock;
+                    static XK: OnceLock<bool> = OnceLock::new();
+                    *XK.get_or_init(|| std::env::var("LUMEN_XCHK").as_deref() == Ok("1"))
+                } {
+                    let sa = |v: &[f32]| -> (f64, f32) {
+                        let mut sq = 0f64; let mut mx = 0f32;
+                        for &e in v { sq += (e as f64) * (e as f64); let a = e.abs(); if a > mx { mx = a; } }
+                        (sq, mx)
+                    };
+                    let h_after = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
+                    let conv_h = self.device.dtoh_copy(&gdn.conv_states[gdn_idx])?;
+                    let (hsq, hmx) = sa(&h_after);
+                    let (csq, cmx) = sa(&conv_h);
+                    let step = st.decode_token_count;
+                    eprintln!("[XCHK] step={step} L={layer_idx} gdn_h_state sumsq={hsq:.6} absmax={hmx:.6}");
+                    eprintln!("[XCHK] step={step} L={layer_idx} gdn_conv_state sumsq={csq:.6} absmax={cmx:.6}");
+                }
 
                 // Advance circular buffer position (host-scalar path).
                 let buf_slots = (p.conv_kernel_size - 1) as u32;
@@ -4660,7 +6013,13 @@ impl CudaBackend {
         // Unfused path: writes to output_buf (via silu_elementwise_mul).
         let used_fused_norm_gate;
 
-        if let Some(ref fused_fn) = st.kernels.gdn_rmsnorm_silu_gate {
+        if gdn_decode_via_prefill {
+            // The decode-via-prefill branch already ran the prefill
+            // `gdn_prefill_norm_gate` (RMSNorm + SiLU(gate)) and wrote the FINAL
+            // gated output to `normed_out_buf`. Skip the decode norm-gate
+            // entirely and signal Step 11 to read `normed_out_buf`.
+            used_fused_norm_gate = true;
+        } else if let Some(ref fused_fn) = st.kernels.gdn_rmsnorm_silu_gate {
             // === FUSED: RMSNorm + SiLU(gate) * normed in one kernel ===
             let ssm_norm = lw.ssm_norm_tiled.as_ref()
                 .ok_or_else(|| RuntimeError::Compute(format!(
@@ -4669,9 +6028,7 @@ impl CudaBackend {
 
             // when LUMEN_CUDA_GDN_F64_ACCUM=1, prefer F64 variant.
             // Shared-mem doubles (8 bytes per warp slot vs 4).
-            let use_norm_gate_f64 = std::env::var("LUMEN_CUDA_GDN_F64_ACCUM")
-                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
-                .unwrap_or(false)
+            let use_norm_gate_f64 = gdn_f64_accum_enabled()
                 && st.kernels.gdn_rmsnorm_silu_gate_f64accum.is_some();
             let chosen_fn = if use_norm_gate_f64 {
                 st.kernels.gdn_rmsnorm_silu_gate_f64accum.as_ref().unwrap()
@@ -5062,6 +6419,40 @@ impl CudaBackend {
             }
         }
 
+        // [GDNPROJSS] PREFILL GDN projection-output whole-buffer sumsq per
+        // position (env LUMEN_MOE_PROBE=1, default OFF -> byte-identical).
+        // Mirrors the decode [GDNPROJSS] dump in compute_gdn_attention_gpu_impl.
+        // Dumps the per-position slice of the batched projection outputs
+        // (qkv/alpha/beta/gate) BEFORE conv1d/recurrence, so decode mode=D
+        // step=k can be compared against prefill mode=P pos=(27+k) to isolate
+        // the projection KERNEL divergence (GEMV N=1 vs GEMM N=batch) from the
+        // recurrence. Only layer 0 (where the projection input is just the
+        // token embedding) gives a clean kernel-only comparison.
+        if {
+            use std::sync::OnceLock;
+            static GPP: OnceLock<bool> = OnceLock::new();
+            *GPP.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
+        } {
+            let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+            let qkv_h = self.device.dtoh_copy(&gdn_pf.qkv)?;
+            let alpha_h = self.device.dtoh_copy(&gdn_pf.alpha_raw)?;
+            let beta_h = self.device.dtoh_copy(&gdn_pf.beta_raw)?;
+            let gate_h = self.device.dtoh_copy(&gdn_pf.gate)?;
+            for t in 0..batch {
+                let qo = t * p.qkv_dim;
+                let ao = t * p.num_heads;
+                let go = t * p.value_dim;
+                eprintln!(
+                    "[GDNPROJSS] mode=P pos={t} layer={layer_idx} \
+                     qkv_sumsq={:.6} alpha_sumsq={:.6} beta_sumsq={:.6} gate_sumsq={:.6}",
+                    ss(&qkv_h[qo..(qo + p.qkv_dim).min(qkv_h.len())]),
+                    ss(&alpha_h[ao..(ao + p.num_heads).min(alpha_h.len())]),
+                    ss(&beta_h[ao..(ao + p.num_heads).min(beta_h.len())]),
+                    ss(&gate_h[go..(go + p.value_dim).min(gate_h.len())]),
+                );
+            }
+        }
+
         // ================================================================
         // PHASE 2: GDN state update -- fused batched path or per-token fallback
         // ================================================================
@@ -5247,9 +6638,7 @@ impl CudaBackend {
             // When ON: route l2_normalize_qk_strided + gdn_prefill_fused_v3 +
             // gdn_prefill_norm_gate to the F64 variants. Note shared-mem size
             // doubles for the f64 variants (double = 8 bytes vs float = 4).
-            let use_prefill_f64 = std::env::var("LUMEN_CUDA_GDN_F64_ACCUM")
-                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
-                .unwrap_or(false)
+            let use_prefill_f64 = gdn_f64_accum_enabled()
                 && st.kernels.l2_normalize_qk_strided_f64accum.is_some()
                 && st.kernels.gdn_prefill_fused_v3_f64accum.is_some()
                 && st.kernels.gdn_prefill_norm_gate_f64accum.is_some();
@@ -5363,6 +6752,34 @@ impl CudaBackend {
                     let bytes: Vec<u8> = host[..n].iter().flat_map(|f| f.to_le_bytes()).collect();
                     std::fs::write(&path, &bytes).map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
                     eprintln!("[gdn-dump] L{layer_idx} raw_out shape=[{batch}, {}] -> {path}", p.value_dim);
+                }
+
+                // [GDNSTATE] PREFILL recurrent-state probe (env
+                // LUMEN_MOE_PROBE=1, default OFF -> byte-identical). Dumps the
+                // FINAL h_state (after scanning all `batch` tokens, i.e. the
+                // state through the last token of this prefill) and the
+                // conv_state circular buffer. Under LUMEN_FORCE_PREFILL_DECODE
+                // each decode step re-prefills the whole growing prefix from a
+                // fresh-zeroed state, so this final h_state == "state through
+                // pos N" via the pure scan. Comparing it to the decode
+                // [GDNSTATE] mode=D phase=after (state through pos N via the
+                // incremental recurrence) is the H1/H2 discriminator. Mirrors
+                // the decode [GDNSTATE] dump in compute_gdn_attention_gpu_impl.
+                {
+                    use std::sync::OnceLock;
+                    static GSP: OnceLock<bool> = OnceLock::new();
+                    let on = *GSP.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"));
+                    if on {
+                        let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                        let h_final = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
+                        let conv_h = self.device.dtoh_copy(&gdn.conv_states[gdn_idx])?;
+                        eprintln!(
+                            "[GDNSTATE] mode=P phase=final batch={batch} layer={layer_idx} \
+                             h_sumsq={:.6} h_len={} conv_sumsq={:.6} conv_len={}",
+                            ss(&h_final), h_final.len(),
+                            ss(&conv_h), conv_h.len(),
+                        );
+                    }
                 }
             }
 
@@ -5897,6 +7314,68 @@ impl CudaBackend {
                 top_k,
             )?;
 
+            // [MOE-SUMSQ] MoE-FFN sub-op whole-buffer sumsq dumps for the LAST token
+            // of each MoE layer (env LUMEN_MOE_PROBE=1). All four quantities are
+            // layout-independent (sum of squares over the whole buffer) and are
+            // captured BEFORE the shared-expert add below, so `ffn_moe_out`
+            // is exactly the routed-expert combine added to the residual stream:
+            //   ffn_moe_out[i] = Σ_k expert_weights[k] * expert_output_buf[k*H+i]
+            // (the value `moe_expert_accum_option_a` adds to `residual[i]`).
+            // Probed from `moe_scratch` only (no `pf` borrow conflict). For the
+            // default prefill V2 path: `router_logits` is populated by the
+            // parallel `moe_router_logits_v2` launch, `expert_weights` by the
+            // top-K finalize, and `expert_output_buf` by the batched-down launch.
+            if t + 1 == batch && {
+                use std::sync::OnceLock;
+                static MS: OnceLock<bool> = OnceLock::new();
+                *MS.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
+            } {
+                // Ensure all router/FFN kernels for this token have completed
+                // before reading their output buffers back to the host.
+                self.device.synchronize()?;
+                let rl = self.device.dtoh_copy(&moe_scratch.router_logits)?;
+                let gw = self.device.dtoh_copy(&moe_scratch.expert_weights)?;
+                let eo = self.device.dtoh_copy(&moe_scratch.expert_output_buf)?;
+                let sumsq = |v: &[f32]| -> f64 {
+                    v.iter().map(|&e| (e as f64) * (e as f64)).sum()
+                };
+                let router_logits_sumsq = sumsq(&rl);
+                let gate_w_sumsq = sumsq(&gw);
+                let expert_out_sumsq = sumsq(&eo);
+                // ffn_moe_out = Σ_k gw[k] * expert_output_buf[k*H + i] (the
+                // routed MoE contribution added to the residual stream).
+                let mut ffn_moe_out_sumsq = 0f64;
+                for i in 0..hidden_dim {
+                    let mut acc = 0f64;
+                    for k in 0..top_k {
+                        let idx = k * hidden_dim + i;
+                        if idx < eo.len() && k < gw.len() {
+                            acc += (gw[k] as f64) * (eo[idx] as f64);
+                        }
+                    }
+                    ffn_moe_out_sumsq += acc * acc;
+                }
+                eprintln!(
+                    "[MOE-SUMSQ] mode=P pos={t} layer={layer_idx} \
+                     router_logits_sumsq={router_logits_sumsq:.6} \
+                     gate_w_sumsq={gate_w_sumsq:.6} \
+                     expert_out_sumsq={expert_out_sumsq:.6} \
+                     ffn_moe_out_sumsq={ffn_moe_out_sumsq:.6}"
+                );
+            }
+
+            // [PROBE-RT] prefill routing: selected expert IDs + gate weights per
+            // token, to compare against the decode router (env LUMEN_MOE_PROBE=1).
+            if {
+                use std::sync::OnceLock;
+                static RT: OnceLock<bool> = OnceLock::new();
+                *RT.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
+            } {
+                let ids = self.device.dtoh_copy(&moe_scratch.expert_ids)?;
+                let ws = self.device.dtoh_copy(&moe_scratch.expert_weights)?;
+                eprintln!("[PROBE-RT] mode=P pos={t} layer={layer_idx} ids={ids:?} w={ws:?}");
+            }
+
             // FIX: shared-expert FFN dispatch (Qwen3.5-MoE always-active
             // expert). Mirrors the decode-path dispatch at compute_layer_gpu.
             // Each prefill token runs the shared expert sigmoid-gated and
@@ -5938,6 +7417,53 @@ impl CudaBackend {
                         &mut output_view2,
                         hidden_dim,
                     )?;
+                }
+            }
+        }
+
+        // [PROBE] prefill-side localization (env LUMEN_MOE_PROBE=1). pf.x = the
+        // per-token layer-output residual; pf.attn_proj = attention output
+        // (still intact before Step 3). Dump EVERY position so a single prefill
+        // run gives the no-cache reference for every decode position.
+        if {
+            use std::sync::OnceLock;
+            static PF2: OnceLock<bool> = OnceLock::new();
+            *PF2.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
+        } {
+            let xh = self.device.dtoh_copy(&pf.x)?;
+            let ah = self.device.dtoh_copy(&pf.attn_proj)?;
+            let k = 16usize;
+            // Full-vector checksums per position (layout-independent, precise
+            // cross-engine localization). sum / sumsq / absmax over hidden_dim.
+            let chk = |v: &[f32], o: usize| -> (f64, f64, f32) {
+                let mut s = 0f64;
+                let mut sq = 0f64;
+                let mut mx = 0f32;
+                for &e in &v[o..o + hidden_dim] {
+                    s += e as f64;
+                    sq += (e as f64) * (e as f64);
+                    if e.abs() > mx { mx = e.abs(); }
+                }
+                (s, sq, mx)
+            };
+            for t in 0..batch {
+                let o = t * hidden_dim;
+                if o + hidden_dim > xh.len() || o + hidden_dim > ah.len() {
+                    break;
+                }
+                let (xs, xsq, xmx) = chk(&xh, o);
+                let (as_, asq, amx) = chk(&ah, o);
+                eprintln!(
+                    "[CHK] mode=P pos={t} layer={layer_idx} \
+                     x_sum={xs:.5} x_sumsq={xsq:.5} x_absmax={xmx:.6} \
+                     a_sum={as_:.5} a_sumsq={asq:.5} a_absmax={amx:.6}"
+                );
+                if t + 1 == batch {
+                    eprintln!(
+                        "[PROBE] mode=P pos={t} layer={layer_idx} attn16={:?} x16={:?}",
+                        &ah[o..o + k],
+                        &xh[o..o + k]
+                    );
                 }
             }
         }
@@ -7952,7 +9478,17 @@ impl CudaBackend {
             //
             // Grid: (vocab_size, 1, 1)  block: (32, 4, 1) = 128 thr.
             // Smem: 32 * 4 = 128 bytes (buf_iw[WARP_SIZE]).
-            if super::moe::mmv_bf16_output_proj_enabled() {
+            //
+            // WHOLE-DECODE-F32 (LUMEN_CUDA_MOE_DECODE_F32_FFN): suppress the
+            // dedicated `mul_mat_vec_f_bf16` (128-thread block-strided reduction)
+            // so the lm_head falls through to `launch_bf16_matvec_with_fallback`
+            // below, which under MOE_DECODE_F32 dispatches the single-block
+            // `matvec_bf16` (linear reference-order accumulation). Makes the
+            // entire bf16 decode forward share one linear F32 reduction order
+            // (airtight precision test). OFF = byte-identical (gate AND-ed).
+            if super::moe::mmv_bf16_output_proj_enabled()
+                && !super::moe::moe_decode_f32_ffn_enabled()
+            {
                 if let Some(mv_fn) = st.kernels.mul_mat_vec_f_bf16.as_ref() {
                     // tracer: emit a single one-shot log so
                     // operators can confirm the dispatch path is active.
@@ -8116,6 +9652,64 @@ impl CudaBackend {
         // established the empirical precedent for this mitigation.
         maybe_apply_cuda_decode_delay();
         let logits_host = self.device.dtoh_copy(&st.logits_gpu)?;
+        // [XCHK] Cross-backend forensic probe (env LUMEN_XCHK=1, default OFF ->
+        // byte-identical). Final whole-vocab logits sumsq/absmax + top-8 (id,val)
+        // and the residual-stream sumsq, in the SAME schema as the Metal [XCHK]
+        // dump, keyed by the 0-based decode ordinal (decode_token_count). This is
+        // the decode-step END-STATE: where the two backends' top-8 diverge is the
+        // generated-token flip; walk back to the first per-layer expert-id flip.
+        if {
+            use std::sync::OnceLock;
+            static XKL: OnceLock<bool> = OnceLock::new();
+            *XKL.get_or_init(|| std::env::var("LUMEN_XCHK").as_deref() == Ok("1"))
+        } {
+            let sa = |v: &[f32]| -> (f64, f32) {
+                let mut sq = 0f64; let mut mx = 0f32;
+                for &e in v { sq += (e as f64) * (e as f64); let a = e.abs(); if a > mx { mx = a; } }
+                (sq, mx)
+            };
+            let (lsq, lmx) = sa(&logits_host);
+            let mut idx: Vec<usize> = (0..logits_host.len()).collect();
+            idx.sort_unstable_by(|&i, &j| logits_host[j].total_cmp(&logits_host[i]));
+            let top8: Vec<(usize, f32)> = idx.iter().take(8).map(|&i| (i, logits_host[i])).collect();
+            let xh = self.device.dtoh_copy(&st.scratch.x_gpu)?;
+            let (xsq, xmx) = sa(&xh[..hp.hidden_dim.min(xh.len() as u32) as usize]);
+            let step = st.decode_token_count;
+            eprintln!(
+                "[XCHK] step={step} residual_x sumsq={xsq:.6} absmax={xmx:.6}"
+            );
+            eprintln!(
+                "[XCHK] step={step} logits sumsq={lsq:.6} absmax={lmx:.6} top8={top8:?}"
+            );
+        }
+        // [LOGITDUMP] DECODE-path near-tie dump (env LUMEN_LOGIT_DUMP=1, default
+        // OFF -> byte-identical). Same format as the compute_final hook; fires
+        // once per CPU-readback decode step so the near-tie step (after id
+        // 44896) is captured under the REAL incremental-decode KV state. Tagged
+        // mode=D and includes the decode_token_count step index.
+        if {
+            use std::sync::OnceLock;
+            static LD2: OnceLock<bool> = OnceLock::new();
+            *LD2.get_or_init(|| std::env::var("LUMEN_LOGIT_DUMP").as_deref() == Ok("1"))
+        } {
+            let sumsq = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+            let logits_sumsq = sumsq(&logits_host);
+            let id_a = std::env::var("LUMEN_LOGIT_DUMP_A").ok()
+                .and_then(|s| s.parse::<usize>().ok()).unwrap_or(1633);
+            let id_b = std::env::var("LUMEN_LOGIT_DUMP_B").ok()
+                .and_then(|s| s.parse::<usize>().ok()).unwrap_or(1083);
+            let la = logits_host.get(id_a).copied().unwrap_or(f32::NAN);
+            let lb = logits_host.get(id_b).copied().unwrap_or(f32::NAN);
+            let mut idx: Vec<usize> = (0..logits_host.len()).collect();
+            idx.sort_unstable_by(|&i, &j| logits_host[j].total_cmp(&logits_host[i]));
+            let topk: Vec<(usize, f32)> = idx.iter().take(8).map(|&i| (i, logits_host[i])).collect();
+            eprintln!(
+                "[LOGITDUMP] mode=D step={} logits_sumsq={logits_sumsq:.6} \
+                 id_a={id_a} logit_a={la:.6} id_b={id_b} logit_b={lb:.6} \
+                 margin_a_minus_b={:.6} top8={topk:?}",
+                st.decode_token_count, (la as f64) - (lb as f64)
+            );
+        }
         kv.advance_seq_len()?;
         st.decode_token_count += 1;
         Ok(Logits { data: logits_host })
@@ -11721,7 +13315,12 @@ unsafe fn launch_bf16_matvec_with_fallback(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
-    if bf16_gemmex_enabled() {
+    // UNIFORM-F32 CUDA MoE DECODE (env LUMEN_CUDA_MOE_DECODE_F32, MoE-gated):
+    // when ON, bypass the cuBLAS GemmEx F16-tensor-core downcast and dispatch the
+    // F32-exact `matvec_bf16` kernel (lossless bf16→f32 upcast + F32 accumulate)
+    // so single-token decode matches the F32 GGUF source precision. OFF is
+    // byte-identical (the `&&` short-circuits before the atomic loads).
+    if bf16_gemmex_enabled() && !moe_decode_f32_enabled() {
         match launch_hgemv_bf16(
             device,
             kernels,
@@ -11774,7 +13373,12 @@ unsafe fn launch_bf16_matvec_residual_with_fallback(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
-    if bf16_gemmex_enabled() {
+    // UNIFORM-F32 CUDA MoE DECODE (env LUMEN_CUDA_MOE_DECODE_F32, MoE-gated):
+    // mirrors `launch_bf16_matvec_with_fallback` for the fused
+    // `out = W^T*in + residual` decode projection (the full-attention output
+    // proj `wo`). When ON, route through the F32-exact `matvec_bf16_residual`
+    // instead of the GemmEx F16 downcast. OFF is byte-identical.
+    if bf16_gemmex_enabled() && !moe_decode_f32_enabled() {
         match launch_hgemv_bf16_residual(
             device,
             kernels,
@@ -14096,6 +15700,47 @@ impl ComputeBackend for CudaBackend {
         self.device.synchronize()?;
         let logits_host = self.device.dtoh_copy(&st.logits_gpu)?;
 
+        // [LOGITDUMP] Cross-engine near-tie localization (env LUMEN_LOGIT_DUMP=1,
+        // default OFF -> byte-identical). Dumps the final-position next-token
+        // top-K logits plus the two specific near-tie ids and their margin, AND
+        // layout-independent whole-buffer sumsq of the lm_head INPUT (final hidden
+        // `x` and its post-final-RMSNorm `normed`) and the OUTPUT logits. This is
+        // the single hook that decides (a) the margin sign and (b) whether the
+        // divergence is at the lm_head/output_proj GEMM (input matches llama
+        // `result_norm` but output `result_output` diverges) or upstream (input
+        // already diverges -> walk back via [CHK] mode=P per-layer dumps).
+        if {
+            use std::sync::OnceLock;
+            static LD: OnceLock<bool> = OnceLock::new();
+            *LD.get_or_init(|| std::env::var("LUMEN_LOGIT_DUMP").as_deref() == Ok("1"))
+        } {
+            // Whole-buffer sumsq (layout-independent) of lm_head input/output.
+            let sumsq = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+            let x_slice = x.as_f32_slice();
+            let x_sumsq = sumsq(x_slice);
+            let normed_host = self.device.dtoh_copy(&st.scratch.normed).unwrap_or_default();
+            let normed_sumsq = sumsq(&normed_host);
+            let logits_sumsq = sumsq(&logits_host);
+            // Specific near-tie ids and margin.
+            let id_a = std::env::var("LUMEN_LOGIT_DUMP_A").ok()
+                .and_then(|s| s.parse::<usize>().ok()).unwrap_or(1633);
+            let id_b = std::env::var("LUMEN_LOGIT_DUMP_B").ok()
+                .and_then(|s| s.parse::<usize>().ok()).unwrap_or(1083);
+            let la = logits_host.get(id_a).copied().unwrap_or(f32::NAN);
+            let lb = logits_host.get(id_b).copied().unwrap_or(f32::NAN);
+            // Top-K by value (full vocab argsort, K small).
+            let mut idx: Vec<usize> = (0..logits_host.len()).collect();
+            idx.sort_unstable_by(|&i, &j| logits_host[j].total_cmp(&logits_host[i]));
+            let topk: Vec<(usize, f32)> = idx.iter().take(8).map(|&i| (i, logits_host[i])).collect();
+            eprintln!(
+                "[LOGITDUMP] x_sumsq={x_sumsq:.6} normed_sumsq={normed_sumsq:.6} \
+                 logits_sumsq={logits_sumsq:.6} id_a={id_a} logit_a={la:.6} \
+                 id_b={id_b} logit_b={lb:.6} margin_a_minus_b={:.6}",
+                (la as f64) - (lb as f64)
+            );
+            eprintln!("[LOGITDUMP] top8={topk:?}");
+        }
+
         Ok(Logits { data: logits_host })
     }
 
@@ -14522,6 +16167,20 @@ impl ComputeBackend for CudaBackend {
 
                 // 2c. Batched RoPE (within qgate branch)
                 let rotary_dim_pf = hp.rotary_dim.unwrap_or(0) as u32;
+                // [ROPEPROBE] dump pre/post-rope Q for full-attn layers (last token,
+                // head 0, first 16 dims) to compare vs llama.cpp Qcur_normed/Qcur.
+                let ropeprobe = {
+                    use std::sync::OnceLock;
+                    static RP: OnceLock<bool> = OnceLock::new();
+                    *RP.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
+                };
+                let qd = num_heads * head_dim;
+                if ropeprobe && batch > 1 {
+                    let qh = self.device.dtoh_copy(&pf.q)?;
+                    let o = (batch - 1) * qd;
+                    eprintln!("[ROPEPROBE] layer={layer_idx} rotary_dim={rotary_dim_pf} head_dim={head_dim} neox={} PRE q_h0[0..16]={:?}",
+                        hp.rope_neox, &qh[o..o + 16.min(qd)]);
+                }
                 unsafe {
                     super::prefill::launch_rope_batched(
                         &self.device, &st.kernels,
@@ -14530,6 +16189,25 @@ impl ComputeBackend for CudaBackend {
                         num_heads, num_kv_heads, head_dim, theta,
                         hp.rope_neox, rotary_dim_pf,
                     )?;
+                }
+                if ropeprobe && batch > 1 {
+                    let qh = self.device.dtoh_copy(&pf.q)?;
+                    let o = (batch - 1) * qd;
+                    // dump dims 0..8, 30..38, 62..70 to see split-half (d,d+32) pairing
+                    let s = |a: usize, b: usize| qh[o + a..o + b.min(qd)].to_vec();
+                    eprintln!("[ROPEPROBE] layer={layer_idx} POST q_h0 d0-7={:?} d30-37={:?} d62-69={:?}",
+                        s(0, 8), s(30, 38), s(62, 70));
+                    // post-rope K (cached) + V, last token, kv-head 0, first 3
+                    let kvd = num_kv_heads * head_dim;
+                    let kh = self.device.dtoh_copy(&pf.k)?;
+                    let vh = self.device.dtoh_copy(&pf.v)?;
+                    let ko = (batch - 1) * kvd;
+                    eprintln!("[KVPROBE] layer={layer_idx} POST k_h0[0..3]={:?} v_h0[0..3]={:?}",
+                        &kh[ko..ko + 3.min(kvd)], &vh[ko..ko + 3.min(kvd)]);
+                    // whole-buffer sumsq (LAYOUT-INDEPENDENT) for Q/K/V across all tokens.
+                    let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                    eprintln!("[QKVSS] layer={layer_idx} q_sumsq={:.4} k_sumsq={:.4} v_sumsq={:.4}",
+                        ss(&qh[..batch * qd]), ss(&kh[..batch * kvd]), ss(&vh[..batch * kvd]));
                 }
 
                 // 2d. Batch KV cache write
@@ -14558,8 +16236,32 @@ impl ComputeBackend for CudaBackend {
                 // FA2_SPLITK_MIN_SEQ to fan out across SMs.
                 // 2. WMMA tensor cores (SM 80+) when batch >= 16.
                 // 3. Scalar Br=4 fallback.
+                // DIAGNOSTIC (env LUMEN_CUDA_FORCE_SCALAR_ATTN=1): bypass FA2/WMMA
+                // and use the F32 scalar Br=4 attention. Tests whether the
+                // batch>=16 WMMA(F16) path is the source of the full-attn
+                // long-context divergence. Remove before commit.
+                let force_scalar_attn = {
+                    use std::sync::OnceLock;
+                    static FS: OnceLock<bool> = OnceLock::new();
+                    *FS.get_or_init(|| std::env::var("LUMEN_CUDA_FORCE_SCALAR_ATTN").as_deref() == Ok("1"))
+                };
+                // WMMA-PRECISION-FIX-RCA precision-localization selector (no-op
+                // when unset). 0=default WMMA-F16, 1=qkf32 (exact QK^T), 2=pvf32
+                // (exact P@V), 3=both exact (qkf32+pvf32 == full F32 = scalar-equiv).
+                // Diagnostic-only until the user's gate.
+                let attn_precise: u8 = {
+                    use std::sync::OnceLock;
+                    static AP: OnceLock<u8> = OnceLock::new();
+                    *AP.get_or_init(|| match std::env::var("LUMEN_CUDA_ATTN_PRECISE").as_deref() {
+                        Ok("1") => 1, Ok("2") => 2, Ok("3") => 3, Ok("4") => 4,
+                        Ok("0") => 0,
+                        // Unset → ratified per-class default (pvf32 for MoE +
+                        // dense ≤32 layers; legacy WMMA for the 27B class).
+                        _ => crate::runtime_defaults::attn_precise_default(),
+                    })
+                };
                 unsafe {
-                    if st.kernels.use_fa2_blockskip_dispatch {
+                    if !force_scalar_attn && st.kernels.use_fa2_blockskip_dispatch {
                         let causal_max = (pos_start + batch) as u32;
                         if causal_max >= super::decode::FA2_SPLITK_MIN_SEQ
                             && st.kernels.flash_attention_fa2_splitk_partial.is_some()
@@ -14578,12 +16280,45 @@ impl ComputeBackend for CudaBackend {
                                 batch, num_heads, num_kv_heads, head_dim, pos_start,
                             )?;
                         }
-                    } else if batch >= 16 && st.kernels.flash_attention_wmma.is_some() {
-                        super::prefill::launch_flash_attention_wmma(
-                            &self.device, &st.kernels,
-                            &pf.q, kv_cache, &mut pf.attn_out,
-                            batch, num_heads, num_kv_heads, head_dim, pos_start,
-                        )?;
+                    } else if !force_scalar_attn && batch >= 16 && st.kernels.flash_attention_wmma.is_some() {
+                        match attn_precise {
+                            1 if st.kernels.flash_attention_wmma_qkf32.is_some() => {
+                                super::prefill::launch_flash_attention_wmma_variant(
+                                    &self.device, &st.kernels,
+                                    &pf.q, kv_cache, &mut pf.attn_out,
+                                    batch, num_heads, num_kv_heads, head_dim, pos_start, true,
+                                )?;
+                            }
+                            2 if st.kernels.flash_attention_wmma_pvf32.is_some() => {
+                                super::prefill::launch_flash_attention_wmma_variant(
+                                    &self.device, &st.kernels,
+                                    &pf.q, kv_cache, &mut pf.attn_out,
+                                    batch, num_heads, num_kv_heads, head_dim, pos_start, false,
+                                )?;
+                            }
+                            3 => {
+                                // both exact == full F32 == scalar br4 (validated path)
+                                super::prefill::launch_flash_attention_br4(
+                                    &self.device, &st.kernels,
+                                    &pf.q, kv_cache, &mut pf.attn_out,
+                                    batch, num_heads, num_kv_heads, head_dim, pos_start,
+                                )?;
+                            }
+                            4 if st.kernels.flash_attention_wmma_split.is_some() => {
+                                super::prefill::launch_flash_attention_wmma_split(
+                                    &self.device, &st.kernels,
+                                    &pf.q, kv_cache, &mut pf.attn_out,
+                                    batch, num_heads, num_kv_heads, head_dim, pos_start,
+                                )?;
+                            }
+                            _ => {
+                                super::prefill::launch_flash_attention_wmma(
+                                    &self.device, &st.kernels,
+                                    &pf.q, kv_cache, &mut pf.attn_out,
+                                    batch, num_heads, num_kv_heads, head_dim, pos_start,
+                                )?;
+                            }
+                        }
                     } else {
                         super::prefill::launch_flash_attention_br4(
                             &self.device, &st.kernels,
@@ -14591,6 +16326,14 @@ impl ComputeBackend for CudaBackend {
                             batch, num_heads, num_kv_heads, head_dim, pos_start,
                         )?;
                     }
+                }
+
+                // [ATTNPROBE] dump raw attention output (pre-gate) for full-attn
+                // layers (last token, head 0, first 3 dims) vs llama attn_pregate.
+                if ropeprobe && batch > 1 {
+                    let ah = self.device.dtoh_copy(&pf.attn_out)?;
+                    let o = (batch - 1) * qd;
+                    eprintln!("[ATTNPROBE] layer={layer_idx} attn_out_h0[0..3]={:?}", &ah[o..o + 3.min(qd)]);
                 }
 
                 // 2e.5. Sigmoid gating: attn_out = sigmoid(gate) * attn_out (per token)
@@ -14818,11 +16561,52 @@ impl ComputeBackend for CudaBackend {
                         )?;
                     }
                 } else if batch >= 16 && st.kernels.flash_attention_wmma.is_some() {
-                    super::prefill::launch_flash_attention_wmma(
-                        &self.device, &st.kernels,
-                        &pf.q, kv_cache, &mut pf.attn_out,
-                        batch, num_heads, num_kv_heads, head_dim, pos_start,
-                    )?;
+                    // WMMA-PRECISION-FIX-RCA: honor LUMEN_CUDA_ATTN_PRECISE on
+                    // this secondary prefill-attention dispatch as well, so the
+                    // eventual default change is complete across both sites.
+                    let attn_precise: u8 = {
+                        use std::sync::OnceLock;
+                        static AP2: OnceLock<u8> = OnceLock::new();
+                        *AP2.get_or_init(|| match std::env::var("LUMEN_CUDA_ATTN_PRECISE").as_deref() {
+                            Ok("1") => 1, Ok("2") => 2, Ok("3") => 3, Ok("4") => 4,
+                            Ok("0") => 0,
+                            // Unset → per-class default (must mirror the AP
+                            // site above; both dispatch sites stay in sync).
+                            _ => crate::runtime_defaults::attn_precise_default(),
+                        })
+                    };
+                    match attn_precise {
+                        1 if st.kernels.flash_attention_wmma_qkf32.is_some() => {
+                            super::prefill::launch_flash_attention_wmma_variant(
+                                &self.device, &st.kernels, &pf.q, kv_cache, &mut pf.attn_out,
+                                batch, num_heads, num_kv_heads, head_dim, pos_start, true,
+                            )?;
+                        }
+                        2 if st.kernels.flash_attention_wmma_pvf32.is_some() => {
+                            super::prefill::launch_flash_attention_wmma_variant(
+                                &self.device, &st.kernels, &pf.q, kv_cache, &mut pf.attn_out,
+                                batch, num_heads, num_kv_heads, head_dim, pos_start, false,
+                            )?;
+                        }
+                        3 => {
+                            super::prefill::launch_flash_attention_br4(
+                                &self.device, &st.kernels, &pf.q, kv_cache, &mut pf.attn_out,
+                                batch, num_heads, num_kv_heads, head_dim, pos_start,
+                            )?;
+                        }
+                        4 if st.kernels.flash_attention_wmma_split.is_some() => {
+                            super::prefill::launch_flash_attention_wmma_split(
+                                &self.device, &st.kernels, &pf.q, kv_cache, &mut pf.attn_out,
+                                batch, num_heads, num_kv_heads, head_dim, pos_start,
+                            )?;
+                        }
+                        _ => {
+                            super::prefill::launch_flash_attention_wmma(
+                                &self.device, &st.kernels, &pf.q, kv_cache, &mut pf.attn_out,
+                                batch, num_heads, num_kv_heads, head_dim, pos_start,
+                            )?;
+                        }
+                    }
                 } else {
                     super::prefill::launch_flash_attention_br4(
                         &self.device, &st.kernels,
@@ -15038,6 +16822,67 @@ impl ComputeBackend for CudaBackend {
             (mem_after_f16_cache as f64) / 1.0e9,
             (mem_before_f16_cache.saturating_sub(mem_after_f16_cache) as f64) / 1.0e9
         );
+
+        // GDN ssm_alpha / ssm_beta F16 cache (env LUMEN_CUDA_GDN_AB_F16, MoE-gated,
+        // default OFF -> byte-identical). `dequant_layer_q8_to_f16` above
+        // EARLY-RETURNS for GDN layers (layer_type == 1) to avoid OOM from the
+        // full per-layer F16 weight set, so the GDN F16 caches stay `None` by
+        // default. Here we dequant ONLY the two TINY ssm_alpha / ssm_beta
+        // projections (out_dim = num_heads ~32, in_dim = hidden ~2048 =>
+        // ~64K params each, ~128 KB F16 per tensor per layer) to F16. The decode
+        // GDN projection (per-token Q8_1/dp4a matvec) and the batched prefill GDN
+        // projection (MMQ INT8 for MoE Q8) DIVERGE ~20% at L0 on these two
+        // tensors because they use different INT8 activation-quant + reduction
+        // orders; the 256-expert router amplifies that into expert-selection
+        // flips. With this cache populated, BOTH the decode `launch_matvec`
+        // alpha/beta arm (-> `launch_hgemv_f16`, cublasGemmEx N=1) AND the
+        // prefill `launch_gemm_projection` Q8Raw arm (-> the F16-cache HGEMM
+        // fast path, cublasGemmEx N=batch) read this SAME F16 weight, making the
+        // projections bit-identical decode-vs-prefill (the proven-clean qkv/gate
+        // recipe). Cost is negligible (~6 MB total across 40 GDN layers).
+        if gdn_ab_f16_enabled() {
+            use super::gpu_buffers::{dequant_q8_to_f16_gpu, GpuWeightBuf};
+            // Q8_0: 34 bytes per block of 32 elements.
+            let q8_elems = |q8: &CudaSlice<u8>| -> usize { (q8.len() / 34) * 32 };
+            let mut n_cached = 0usize;
+            for layer in cache.iter_mut() {
+                if layer.layer_type != 1 {
+                    continue;
+                }
+                if let Some(GpuWeightBuf::Q8Raw(q8)) = layer.ssm_alpha.as_ref() {
+                    let n = q8_elems(q8);
+                    let f16 = dequant_q8_to_f16_gpu(
+                        &self.device,
+                        &st.kernels.dequant_q8_0_to_f16,
+                        q8,
+                        n,
+                    )
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("GDN_AB_F16 ssm_alpha dequant: {e}"))
+                    })?;
+                    layer.ssm_alpha_f16 = Some(f16);
+                    n_cached += 1;
+                }
+                if let Some(GpuWeightBuf::Q8Raw(q8)) = layer.ssm_beta.as_ref() {
+                    let n = q8_elems(q8);
+                    let f16 = dequant_q8_to_f16_gpu(
+                        &self.device,
+                        &st.kernels.dequant_q8_0_to_f16,
+                        q8,
+                        n,
+                    )
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("GDN_AB_F16 ssm_beta dequant: {e}"))
+                    })?;
+                    layer.ssm_beta_f16 = Some(f16);
+                    n_cached += 1;
+                }
+            }
+            eprintln!(
+                "[CUDA] GDN_AB_F16: ACTIVE — dequanted {n_cached} ssm_alpha/ssm_beta \
+                 weights to F16 (decode+prefill bit-identical projection path)"
+            );
+        }
 
         // Tile ssm_norm from [head_dim] to [value_dim] for GDN layers.
         // This allows the standard rmsnorm kernel to be used on the [value_dim] output.
@@ -16181,6 +18026,37 @@ impl ComputeBackend for CudaBackend {
         // Set `LUMEN_CUDA_DECODE_DELAY_US=50` to opt in (Metal precedent).
         maybe_apply_cuda_decode_delay();
         let logits_host = self.device.dtoh_copy(&st.logits_gpu)?;
+
+        // [LOGITDUMP] DECODE-path near-tie dump (env LUMEN_LOGIT_DUMP=1, default
+        // OFF -> byte-identical). This is the ACTUAL incremental-decode logit
+        // production for GDN/MoE models (can_use_graph=false -> the non-graph
+        // else branch above). Fires once per decode step so the near-tie step
+        // (predicting the token after id 44896) is captured under the REAL
+        // incremental-decode KV state, which is where the 1633-vs-1083 flip
+        // lives (a fresh PREFILL of the same prefix does NOT flip).
+        if {
+            use std::sync::OnceLock;
+            static LD3: OnceLock<bool> = OnceLock::new();
+            *LD3.get_or_init(|| std::env::var("LUMEN_LOGIT_DUMP").as_deref() == Ok("1"))
+        } {
+            let sumsq = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+            let logits_sumsq = sumsq(&logits_host);
+            let id_a = std::env::var("LUMEN_LOGIT_DUMP_A").ok()
+                .and_then(|s| s.parse::<usize>().ok()).unwrap_or(1633);
+            let id_b = std::env::var("LUMEN_LOGIT_DUMP_B").ok()
+                .and_then(|s| s.parse::<usize>().ok()).unwrap_or(1083);
+            let la = logits_host.get(id_a).copied().unwrap_or(f32::NAN);
+            let lb = logits_host.get(id_b).copied().unwrap_or(f32::NAN);
+            let mut idx: Vec<usize> = (0..logits_host.len()).collect();
+            idx.sort_unstable_by(|&i, &j| logits_host[j].total_cmp(&logits_host[i]));
+            let topk: Vec<(usize, f32)> = idx.iter().take(8).map(|&i| (i, logits_host[i])).collect();
+            eprintln!(
+                "[LOGITDUMP] mode=D step={} logits_sumsq={logits_sumsq:.6} \
+                 id_a={id_a} logit_a={la:.6} id_b={id_b} logit_b={lb:.6} \
+                 margin_a_minus_b={:.6} top8={topk:?}",
+                st.decode_token_count, (la as f64) - (lb as f64)
+            );
+        }
 
         // Advance host-side KV cache seq_len and decode counter.
         kv.advance_seq_len()?;

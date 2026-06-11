@@ -4,7 +4,7 @@ The Layer-Blob Container (`.lbc`) is Lumen's on-disk model format. It is designe
 
 ## Current version
 
-`LBC_VERSION = 3`. Source-of-truth: [`crates/lumen-format/`](../crates/lumen-format/).
+`LBC_VERSION = 4`. Source-of-truth: [`crates/lumen-format/`](../crates/lumen-format/).
 
 ## Properties
 

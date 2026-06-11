@@ -15,6 +15,58 @@ use super::graph_reorder::{
     self, Access, AccessList, BufferId, LayerOp, OrderClass, gdn_concurrent_encoder_enabled,
 };
 
+/// Prefill full-attention P@V precision mode (diagnostic, no-op when unset).
+///
+/// Mirrors CUDA's `LUMEN_CUDA_ATTN_PRECISE` (exact-F32 P@V attention variant).
+/// The default prefill P@V kernel `attention_output_tiled` truncates the softmax
+/// probabilities P and V to F16 simdgroup-matrix operands (F32 accumulate). Since
+/// P ∈ [0,1], the F16 mantissa cannot represent the near-1.0 dominant weight plus
+/// the small tail, distorting the V-weighted sum — the same mantissa defect the
+/// CUDA RCA localized to P@V.
+///
+/// `LUMEN_METAL_ATTN_PRECISE=2` routes the prefill P@V to the exact-F32 scalar
+/// kernel `attention_output_batched`, which accumulates `(float)P * (float)V` with
+/// no F16 operand truncation (QK^T stays on the default F16 tensor-core path).
+/// Unset (or any other value) = byte-identical legacy `attention_output_tiled`.
+#[inline]
+fn metal_attn_precise_pvf32() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let on = std::env::var("LUMEN_METAL_ATTN_PRECISE").ok().as_deref() == Some("2");
+        if on {
+            eprintln!("[ATTN_PRECISE] LUMEN_METAL_ATTN_PRECISE=2 ACTIVE: prefill P@V -> exact-F32 attention_output_batched");
+        }
+        on
+    })
+}
+
+/// Diagnostic-only engagement counter (no-op unless `LUMEN_METAL_ATTN_PRECISE_DBG=1`).
+/// Proves at runtime that the exact-F32 P@V kernel actually dispatches on the
+/// full-attention prefill layers of the loaded model (and how many times), as
+/// opposed to the env-read print which only confirms the lever was enabled.
+/// Emits a `[ATTN_PRECISE_DBG]` line on each engagement with the running count.
+/// PRODUCES evidence only; changes no computation.
+fn metal_attn_precise_dbg() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("LUMEN_METAL_ATTN_PRECISE_DBG").ok().as_deref() == Some("1")
+    })
+}
+
+fn metal_attn_precise_engage(path: &str, layer_idx: usize, batch_size: usize, num_heads: usize, head_dim: usize) {
+    if !metal_attn_precise_dbg() {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "[ATTN_PRECISE_DBG] F32 P@V engaged #{n} path={path} layer={layer_idx} batch={batch_size} num_heads={num_heads} head_dim={head_dim}"
+    );
+}
+
 /// Dispatch a Q8_0 × F32 → F32 batched-prefill GEMM.
 ///
 /// When `LUMEN_METAL_GEMM_GGML_PORT=1` AND the underlying weight is Q8_0,
@@ -81,19 +133,54 @@ impl MetalF32Backend {
                 })
             };
 
+            // GDN (Gated-DeltaNet) projection dims, resolved from the SSM head
+            // counts on `scratch` (9B {32,16,128} → v=4096/qk=2048/qkv=8192;
+            // 27B {48,16,128} → v=6144/qk=2048/qkv=10240). These are INDEPENDENT
+            // of the full-attention dims above: 27B full-attn q_dim=6144 with
+            // hidden=5120, while GDN qkv_dim=10240. Several batched-GDN-prefill
+            // scratch buffers are SHARED with the full-attention roles (sized
+            // below via max(...)), and the dedicated GDN buffers must be sized
+            // from these, not from the full-attn q_dim/qkv_dim/num_heads (which
+            // only coincide with the GDN dims for the 9B).
+            let gdn_v_dim = scratch.gdn_num_v_heads * scratch.gdn_head_dim;
+            let gdn_qk_dim = scratch.gdn_num_k_heads * scratch.gdn_head_dim;
+            let gdn_qkv_dim = 2 * gdn_qk_dim + gdn_v_dim;
+            let gdn_nheads = scratch.gdn_num_v_heads;
+
             scratch.batch_x_buf = Some(make(batch_size * hidden_dim)?);
             scratch.batch_normed_buf = Some(make(batch_size * hidden_dim)?);
             // Q+gate fusion (Qwen3.5 full-attention layers): attn_q.weight outputs
             // 2*q_dim interleaved Q+gate, larger than qkv_dim. Allocate the max.
+            // GDN also writes this buffer: Phase-1 QKV needs gdn_qkv_dim, and the
+            // LEGACY (non-concurrent-encoder) path additionally stores Phase-2a
+            // raw_out at byte offset batch*gdn_v_dim with width gdn_v_dim, so the
+            // GDN role requires batch*max(gdn_qkv_dim, 2*gdn_v_dim). For the 9B
+            // these GDN terms are <= qgate_dim, so the value is unchanged.
             let qgate_dim = q_dim * 2;
-            scratch.batch_qkv_buf = Some(make(batch_size * qkv_dim.max(qgate_dim))?);
+            let qkv_buf_elems = qkv_dim
+                .max(qgate_dim)
+                .max(gdn_qkv_dim)
+                .max(2 * gdn_v_dim);
+            scratch.batch_qkv_buf = Some(make(batch_size * qkv_buf_elems)?);
             scratch.batch_q_buf = Some(make(batch_size * q_dim)?);
             scratch.batch_k_buf = Some(make(batch_size * kv_dim)?);
             scratch.batch_v_buf = Some(make(batch_size * kv_dim)?);
-            scratch.batch_attn_out_buf = Some(make(batch_size * q_dim)?);
+            // attn_out_buf doubles as the GDN attn-gate holder (`gate_all_buf`),
+            // written at width gdn_v_dim (= GDN value/q dim). For the 9B
+            // gdn_v_dim == q_dim, so the allocation is unchanged.
+            scratch.batch_attn_out_buf = Some(make(batch_size * q_dim.max(gdn_v_dim))?);
             scratch.batch_attn_proj_buf = Some(make(batch_size * hidden_dim)?);
-            // Gate buf must hold max(inter_dim, q_dim) for FFN gate and Q+gate fusion.
-            scratch.batch_gate_buf = Some(make(batch_size * inter_dim.max(q_dim))?);
+            // Gate buf must hold max(inter_dim, q_dim) for FFN gate and Q+gate
+            // fusion. It is ALSO passed to the batched GDN prefill as the
+            // `scratch_buf` role: in the LEGACY path it packs alpha [batch*gdn_nheads]
+            // at offset 0, beta [batch*gdn_nheads] at offset batch*gdn_nheads, and
+            // conv_out [batch*gdn_qkv_dim] at offset 2*batch*gdn_nheads, so it must
+            // hold batch*(2*gdn_nheads + gdn_qkv_dim). For the 9B this is <=
+            // inter_dim, so the allocation is unchanged.
+            let gate_buf_elems = inter_dim
+                .max(q_dim)
+                .max(2 * gdn_nheads + gdn_qkv_dim);
+            scratch.batch_gate_buf = Some(make(batch_size * gate_buf_elems)?);
             scratch.batch_up_buf = Some(make(batch_size * inter_dim)?);
             scratch.batch_down_buf = Some(make(batch_size * hidden_dim)?);
             // Scores buffer for batched attention (f16). The scores stride is padded
@@ -109,24 +196,25 @@ impl MetalF32Backend {
             // De-aliased GDN scratch buffers. Allocated when the GDN
             // concurrent-encoder path is enabled so the GDN prefill chain can issue
             // resource-scoped barriers per role (vs whole-MTLBuffer
-            // serialisation). The GDN dispatch uses Qwen3.5-specific
-            // dimensions: num_heads=32, head_dim=128, qkv_dim=8192,
-            // q_dim=value_dim=4096. We allocate from the runtime constants
-            // so the layout follows the rest of the scratch.
+            // serialisation). These hold GDN-SSM roles ONLY, so they are sized
+            // from the resolved GDN dims (gdn_v_dim/gdn_qkv_dim/gdn_nheads), NOT
+            // the full-attention q_dim/qkv_dim/num_heads. For the 9B the GDN dims
+            // equal the full-attn dims (q_dim=4096, qkv_dim=8192, num_heads=32),
+            // so the allocations are byte-identical; for the 27B they are larger
+            // (gdn_v_dim=6144, gdn_qkv_dim=10240, gdn_nheads=48).
             if gdn_concurrent_encoder_enabled() {
-                // Phase 2a raw_out [batch * q_dim] and Phase 2b ssm_in
-                // [batch * q_dim] each hold a single role across the chain.
-                scratch.batch_gdn_raw_out_buf = Some(make(batch_size * q_dim)?);
-                scratch.batch_gdn_ssm_in_buf = Some(make(batch_size * q_dim)?);
-                // Alpha/beta tile each carry [batch * num_heads] floats.
-                // GDN's num_heads is the SSM time_step_rank (32 for
-                // Qwen3.5), not the attention num_heads. Both are 32 in
-                // practice; we size against the runtime num_heads which
-                // matches scratch.num_heads = attn_num_heads = 32.
-                scratch.batch_gdn_alpha_buf = Some(make(batch_size * num_heads)?);
-                scratch.batch_gdn_beta_buf = Some(make(batch_size * num_heads)?);
-                // Conv1d+SiLU output is [batch * qkv_dim] = [batch * 8192].
-                scratch.batch_gdn_conv_out_buf = Some(make(batch_size * qkv_dim)?);
+                // Phase 2a raw_out [batch * gdn_v_dim] and Phase 2b ssm_in
+                // [batch * gdn_v_dim] each hold a single role across the chain.
+                scratch.batch_gdn_raw_out_buf = Some(make(batch_size * gdn_v_dim)?);
+                scratch.batch_gdn_ssm_in_buf = Some(make(batch_size * gdn_v_dim)?);
+                // Alpha/beta tile each carry [batch * gdn_nheads] floats, where
+                // gdn_nheads is the SSM V-head count (time_step_rank): 32 for 9B,
+                // 48 for 27B.
+                scratch.batch_gdn_alpha_buf = Some(make(batch_size * gdn_nheads)?);
+                scratch.batch_gdn_beta_buf = Some(make(batch_size * gdn_nheads)?);
+                // Conv1d+SiLU output is [batch * gdn_qkv_dim] (8192 for 9B,
+                // 10240 for 27B).
+                scratch.batch_gdn_conv_out_buf = Some(make(batch_size * gdn_qkv_dim)?);
             }
 
             // MoE batched scratch buffers (only when model has experts)
@@ -1312,28 +1400,56 @@ impl MetalF32Backend {
                 // Barrier: softmax must complete before attention output reads scores_buf
                 enc.memory_barrier_with_scope(1); // MTLBarrierScope.buffers
 
-                // 6c. Attention output (tiled GEMM): Scores * V
-                // Dispatch: (ceil(head_dim/32), ceil(batch_size/32), num_heads)
-                enc.set_pipeline_state(&pipelines.attention_output_tiled);
-                enc.set_buffer(scores_buf, 0, 0);
-                enc.set_buffer(&scratch.gpu_v_cache[layer_idx], 0, 1);
-                enc.set_buffer(attn_out_buf, 0, 2);
-                enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
-                enc.set_bytes(&kv_dim_u32.to_le_bytes(), 4);
-                enc.set_bytes(&num_heads_u32.to_le_bytes(), 5);
-                enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 6);
-                enc.set_bytes(&start_pos_u32.to_le_bytes(), 7);
-                enc.set_bytes(&scores_stride_u32.to_le_bytes(), 8);
-                enc.set_bytes(&batch_size_u32.to_le_bytes(), 9);
-                enc.set_bytes(&(max_seq_len as u32).to_le_bytes(), 10);
-                enc.dispatch_threadgroups(
-                    MTLSize::new(
-                        (head_dim as u64).div_ceil(32),
-                        (batch_size as u64).div_ceil(32),
-                        num_heads as u64,
-                    ),
-                    MTLSize::new(128, 1, 1),
-                );
+                // 6c. Attention output: Scores * V
+                // Default: tiled GEMM (F16 simdgroup operands, F32 accumulate).
+                // LUMEN_METAL_ATTN_PRECISE=2: exact-F32 scalar P@V (no F16
+                // operand truncation) — diagnostic precision lever, see
+                // metal_attn_precise_pvf32 (exact-F32 P@V; diagnostic, default-off).
+                if metal_attn_precise_pvf32() {
+                    // attention_output_batched: one thread per output element,
+                    // accumulates (float)P * (float)V in F32. Same 11 buffers.
+                    metal_attn_precise_engage("legacy", layer_idx, batch_size, num_heads as usize, head_dim);
+                    let total_elems = (batch_size * num_heads as usize * head_dim) as u64;
+                    let pv_tg = 256u64.min(total_elems).max(1);
+                    enc.set_pipeline_state(&pipelines.attention_output_batched);
+                    enc.set_buffer(scores_buf, 0, 0);
+                    enc.set_buffer(&scratch.gpu_v_cache[layer_idx], 0, 1);
+                    enc.set_buffer(attn_out_buf, 0, 2);
+                    enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
+                    enc.set_bytes(&kv_dim_u32.to_le_bytes(), 4);
+                    enc.set_bytes(&num_heads_u32.to_le_bytes(), 5);
+                    enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 6);
+                    enc.set_bytes(&start_pos_u32.to_le_bytes(), 7);
+                    enc.set_bytes(&scores_stride_u32.to_le_bytes(), 8);
+                    enc.set_bytes(&batch_size_u32.to_le_bytes(), 9);
+                    enc.set_bytes(&(max_seq_len as u32).to_le_bytes(), 10);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(total_elems.div_ceil(pv_tg), 1, 1),
+                        MTLSize::new(pv_tg, 1, 1),
+                    );
+                } else {
+                    // Dispatch: (ceil(head_dim/32), ceil(batch_size/32), num_heads)
+                    enc.set_pipeline_state(&pipelines.attention_output_tiled);
+                    enc.set_buffer(scores_buf, 0, 0);
+                    enc.set_buffer(&scratch.gpu_v_cache[layer_idx], 0, 1);
+                    enc.set_buffer(attn_out_buf, 0, 2);
+                    enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
+                    enc.set_bytes(&kv_dim_u32.to_le_bytes(), 4);
+                    enc.set_bytes(&num_heads_u32.to_le_bytes(), 5);
+                    enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 6);
+                    enc.set_bytes(&start_pos_u32.to_le_bytes(), 7);
+                    enc.set_bytes(&scores_stride_u32.to_le_bytes(), 8);
+                    enc.set_bytes(&batch_size_u32.to_le_bytes(), 9);
+                    enc.set_bytes(&(max_seq_len as u32).to_le_bytes(), 10);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(
+                            (head_dim as u64).div_ceil(32),
+                            (batch_size as u64).div_ceil(32),
+                            num_heads as u64,
+                        ),
+                        MTLSize::new(128, 1, 1),
+                    );
+                }
             }
 
             enc.end_encoding();
@@ -3342,7 +3458,15 @@ impl MetalF32Backend {
         });
 
         // Op 14: Attn output (Strict — reads softmax probs, V cache; writes attn_out)
-        let p_attn_out = &pipelines.attention_output_tiled;
+        // Default: tiled GEMM (F16 simdgroup P@V). LUMEN_METAL_ATTN_PRECISE=2 routes
+        // to the exact-F32 scalar attention_output_batched (no F16 P@V truncation).
+        let pv_precise = metal_attn_precise_pvf32();
+        let p_attn_out = if pv_precise {
+            metal_attn_precise_engage("concurrent", layer_idx, batch_size, num_heads, head_dim);
+            &pipelines.attention_output_batched
+        } else {
+            &pipelines.attention_output_tiled
+        };
         plan.push(LayerOp {
             label: "attn_output",
             accesses: AccessList::from_iter_inline([
@@ -3364,14 +3488,23 @@ impl MetalF32Backend {
                 enc.set_bytes(&scores_stride_u32.to_le_bytes(), 8);
                 enc.set_bytes(&batch_size_u32.to_le_bytes(), 9);
                 enc.set_bytes(&max_seq_len_u32.to_le_bytes(), 10);
-                enc.dispatch_threadgroups(
-                    MTLSize::new(
-                        (head_dim as u64).div_ceil(32),
-                        (batch_size as u64).div_ceil(32),
-                        num_heads as u64,
-                    ),
-                    MTLSize::new(128, 1, 1),
-                );
+                if pv_precise {
+                    let total_elems = (batch_size * num_heads as usize * head_dim) as u64;
+                    let pv_tg = 256u64.min(total_elems).max(1);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(total_elems.div_ceil(pv_tg), 1, 1),
+                        MTLSize::new(pv_tg, 1, 1),
+                    );
+                } else {
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(
+                            (head_dim as u64).div_ceil(32),
+                            (batch_size as u64).div_ceil(32),
+                            num_heads as u64,
+                        ),
+                        MTLSize::new(128, 1, 1),
+                    );
+                }
                 Ok(())
             }),
         });

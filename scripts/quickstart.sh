@@ -216,11 +216,12 @@ EXAMPLES:
     ./scripts/quickstart.sh --build-only --yes
 
 MODELS (registry source of truth: model_registry.toml):
-    qwen3.5-9b            Q8_0 downloadable (~10 GB). Q4_0/BF16 are derived
-                         locally via 'lumen convert --requant', not downloaded.
-    qwen3.5-moe-35b-a3b  Q8_0 (~37 GB), Q4_0 (~19 GB) downloadable. BF16 is a
-                         ~70 GB 2-shard split GGUF not yet fetchable by 'lumen
-                         pull' — convert it manually from the shards instead.
+    qwen3.5-9b            Q8_0 (~10 GB), Q4_0 (~5.4 GB), BF16 (~18 GB) all
+                         downloadable.
+    qwen3.5-moe-35b-a3b  Q8_0 (~37 GB), Q4_0 (~19 GB), BF16 (~71 GB 2-shard)
+                         all downloadable.
+    qwen3.6-27b          Q8_0 (~29 GB), Q4_0 (~15 GB), BF16 (~55 GB 2-shard)
+                         all downloadable.
 
     Quickstart only auto-pulls the combos above; any other (model, quant) is
     refused with guidance (prepare it yourself, then re-run --model <path.lbc>).
@@ -355,11 +356,10 @@ confirm() {
 #  Mirrors model_registry.toml. bash 3.2 has no associative arrays, so we use
 #  parallel indexed arrays keyed by the same index. Each entry records whether
 #  the (model, quant) pair is DOWNLOADABLE from the registry — pairs that are
-#  only reachable via 'lumen convert --requant' (9B Q4_0/BF16) or whose fresh
-#  download is not yet supported (MoE BF16: 2-shard split GGUF in a nested HF
-#  subdir; download_gguf rejects '/' for path-traversal safety, so fresh fetch
-#  is deferred per model_registry.toml) are flagged so the menu never offers an
-#  action that the CLI would reject.
+#  not downloadable would be flagged here (none currently are — every combo
+#  is a direct registry pull). Nested-subdir
+#  2-shard BF16 splits are downloadable (download_gguf validates each path
+#  segment and caches shards flat + adjacent).
 #
 #  IMPORTANT — two DIFFERENT physical quantities, never conflate them:
 #    * CAT_NEED  = peak RAM/VRAM RESIDENCY when serving (≈ LBC size + overhead).
@@ -396,30 +396,34 @@ build_catalog() {
   # LBC footprint and the transient-disk peak. Peaks rounded UP for safety:
   #   combo               src GGUF   LBC out   transient peak (CAT_DISK)
   #   9B  q8_0             8.89 GiB   9.98 GiB  ~19 GiB  (download + convert)
-  #   9B  q4_0   (local)      —       5.37 GiB  ~12 GiB  (q8_0 src + q4 out)
-  #   9B  bf16   (local)      —      16.33 GiB  ~26 GiB  (q8_0 src + bf16 out)
+  #   9B  q4_0             5.35 GiB   5.37 GiB  ~12 GiB  (direct download)
+  #   9B  bf16            17.14 GiB  ~17 GiB    ~35 GiB  (single flat GGUF)
   #   MoE q4_0           19.41 GiB  19.31 GiB  ~39 GiB
   #   MoE q8_0           35.22 GiB  35.00 GiB  ~71 GiB
-  #   MoE bf16  (2-shard)~70 GB GGUF + ~70 GB LBC → ~140 GiB (NOT pullable)
+  #   MoE bf16  (2-shard) 66.2 GiB  ~66 GiB   ~140 GiB
+  #   27B q8_0            27.1 GiB  ~27 GiB    ~56 GiB
+  #   27B q4_0            13.7 GiB  ~14 GiB    ~29 GiB
+  #   27B bf16  (2-shard) 50.9 GiB  ~51 GiB   ~105 GiB
   #
-  # Dense Qwen3.5-9B. Only Q8_0 is in the registry (downloadable). Q4_0/BF16
-  # exist solely as locally-converted LBCs (lumen convert --requant); the menu
-  # offers them only if already cached. Their CAT_DISK assumes converting FROM
-  # the cached Q8_0 GGUF (~9 GiB) to the target LBC.
+  # Dense Qwen3.5-9B. All three quants downloadable (BF16 is the provider's
+  # true-bf16 single-file GGUF; Q4_0 is the provider's direct Q4_0 — never
+  # derive it via --requant for the generic/CUDA target, the requant LBC is
+  # broken there: 2026-06-10 isolation, requant 1/15 vs direct 13/15).
   _catalog_add "qwen3.5-9b:q8_0" "~10 GB" "~11 GB" "~19 GB" "Dense 9B, production default (best quality)" "1"
-  _catalog_add "qwen3.5-9b:q4_0" "~5.4 GB" "~6 GB" "~12 GB" "Dense 9B, 4-bit (smaller; local-convert only)" "0"
-  _catalog_add "qwen3.5-9b:bf16" "~16 GB" "~17 GB" "~26 GB" "Dense 9B, full precision (local-convert only)" "0"
-  # MoE 30B-A3B (3B active). Q8_0 + Q4_0 downloadable. CAT_DISK is the true
-  # transient peak (source GGUF + converted LBC held simultaneously).
+  _catalog_add "qwen3.5-9b:q4_0" "~5.4 GB" "~6 GB" "~12 GB" "Dense 9B, 4-bit (smaller)" "1"
+  _catalog_add "qwen3.5-9b:bf16" "~18 GB" "~19 GB" "~35 GB" "Dense 9B, full precision" "1"
+  # MoE 30B-A3B (3B active). All three quants downloadable. CAT_DISK is the
+  # true transient peak (source GGUF + converted LBC held simultaneously).
+  # BF16 is a 2-shard split GGUF nested in a HF subdirectory; the downloader
+  # fetches each shard from its nested URL and caches them flat + adjacent.
   _catalog_add "qwen3.5-moe-35b-a3b:q4_0" "~19 GB" "~21 GB" "~39 GB" "MoE 30B (3B active), 4-bit" "1"
   _catalog_add "qwen3.5-moe-35b-a3b:q8_0" "~37 GB" "~38 GB" "~71 GB" "MoE 30B (3B active), 8-bit" "1"
-  # MoE BF16: a ~70 GB 2-shard split GGUF nested in a HF subdirectory. Fresh
-  # download is DEFERRED in the CLI (download_gguf rejects '/' in filenames for
-  # path-traversal safety — model_registry.toml), so a pull cannot succeed. It
-  # is catalogued (so the size/need are honest and the disk check is real) but
-  # flagged NOT pullable; validate_selection refuses it from the pull path with
-  # a precise message. Convert it locally from the manually-fetched shards.
-  _catalog_add "qwen3.5-moe-35b-a3b:bf16" "~70 GB" "~72 GB" "~140 GB" "MoE 30B (3B active), full precision (manual convert only)" "0"
+  _catalog_add "qwen3.5-moe-35b-a3b:bf16" "~71 GB" "~72 GB" "~140 GB" "MoE 30B (3B active), full precision" "1"
+  # Dense Qwen3.6-27B (GDN ratio-3). All three quants downloadable; BF16 is a
+  # 2-shard split GGUF (same nested HF-subdir layout as the MoE BF16).
+  _catalog_add "qwen3.6-27b:q8_0" "~29 GB" "~30 GB" "~56 GB" "Dense 27B, 8-bit (best quality)" "1"
+  _catalog_add "qwen3.6-27b:q4_0" "~15 GB" "~16 GB" "~29 GB" "Dense 27B, 4-bit (smaller)" "1"
+  _catalog_add "qwen3.6-27b:bf16" "~55 GB" "~56 GB" "~105 GB" "Dense 27B, full precision" "1"
 }
 
 # Find the catalog index for a "<model>:<quant>" spec. Echoes index or "-1".
@@ -443,8 +447,6 @@ print_supported_combos() {
   while [ "$i" -lt "${#CAT_SPEC[@]}" ]; do
     if [ "${CAT_PULL[$i]}" = "1" ]; then
       tag="downloadable"
-    elif [ "${CAT_SPEC[$i]}" = "qwen3.5-moe-35b-a3b:bf16" ]; then
-      tag="manual shard convert only"
     else
       tag="local convert only"
     fi
@@ -1191,26 +1193,9 @@ validate_selection() {
       return 0
     fi
 
-    # BF16 MoE is special: it is NOT a requant of Q8_0. It ships as a ~70 GB
-    # 2-shard split GGUF nested in a HF subdirectory, and fresh download is
-    # deferred (download_gguf rejects '/' in filenames — model_registry.toml).
-    # `lumen pull qwen3.5-moe-35b-a3b:bf16` therefore cannot succeed. Tell the
-    # user the truth and the only working path (manual shard fetch + convert).
-    if [ "$SEL_SPEC" = "qwen3.5-moe-35b-a3b:bf16" ]; then
-      log_error "$SEL_SPEC is a ~70 GB 2-shard split GGUF that 'lumen pull' cannot fetch yet."
-      log_error "The shards live in a nested HuggingFace subdirectory and fresh download is"
-      log_error "deferred for path-traversal safety (see model_registry.toml). To use it:"
-      log_error "  1) Manually download BOTH shards from bartowski/Qwen_Qwen3.5-35B-A3B-GGUF:"
-      log_error "       Qwen_Qwen3.5-35B-A3B-bf16/Qwen_Qwen3.5-35B-A3B-bf16-00001-of-00002.gguf"
-      log_error "       Qwen_Qwen3.5-35B-A3B-bf16/Qwen_Qwen3.5-35B-A3B-bf16-00002-of-00002.gguf"
-      log_error "     keeping them adjacent (the multi-shard reader finds shard 2 from shard 1)."
-      log_error "  2) $(lumen_cmd_hint) convert --input <shard-00001-of-00002.gguf> --output <out.lbc>"
-      log_error "  3) Re-run:  $0 --model <out.lbc>"
-      log_error "Or pick a pullable MoE quant instead: qwen3.5-moe-35b-a3b:q4_0 / :q8_0."
-      die "qwen3.5-moe-35b-a3b:bf16 is not pullable (manual convert required)"
-    fi
-
-    # Dense 9B q4_0 / bf16: derived locally by re-quantizing the Q8_0 source.
+    # Dense 9B q4_0: derived locally by re-quantizing the Q8_0 source.
+    # (BF16 everywhere — incl. the 2-shard MoE/27B splits — is pullable: the
+    # downloader fetches nested-subdir shards and caches them flat.)
     local lumen_hint ; lumen_hint="$(lumen_cmd_hint)"
     log_error "$SEL_SPEC is not downloadable from the registry (derive it locally)."
     log_error "Build it from the Q8_0 source, then re-run with --skip-build:"

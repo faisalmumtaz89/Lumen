@@ -614,6 +614,9 @@ fn setup_test_model_metal() -> (SyncWeightProvider, MetalF32Backend) {
         provider.output_proj.clone(),
     );
     backend.init(&provider.lbc().header.hyperparams).unwrap();
+    // The Metal decode path requires GPU-resident weights; every production
+    // path calls preload_weights after init (lumen-server.rs:687, run.rs:1931).
+    backend.preload_weights(&provider).unwrap();
 
     (provider, backend)
 }
@@ -624,7 +627,7 @@ fn e2e_metal_matches_naive() {
     let rt_config = RuntimeConfig {
         pipeline_mode: PipelineMode::MinMem,
         prefetch_distance: 1,
-        kv_precision: KvPrecision::F32,
+        kv_precision: KvPrecision::F16, // Metal KV is F16-only by design; naive supports F16 too
         max_seq_len: 128,
         collect_per_layer_timings: false,
     };
@@ -671,7 +674,7 @@ fn e2e_metal_single_token_prompt() {
     let rt_config = RuntimeConfig {
         pipeline_mode: PipelineMode::MinMem,
         prefetch_distance: 1,
-        kv_precision: KvPrecision::F32,
+        kv_precision: KvPrecision::F16, // Metal KV is F16-only by design; naive supports F16 too
         max_seq_len: 128,
         collect_per_layer_timings: false,
     };

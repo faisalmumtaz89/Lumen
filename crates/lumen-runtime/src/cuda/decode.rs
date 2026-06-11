@@ -193,6 +193,21 @@ pub(crate) struct KernelSet {
     // differs (load residual, add MMQ result, store sum).
     pub(crate) mmq_q8_0_batched_residual: Option<CudaFunction>,
 
+    // MMQ-style Q4_0 batched matmul (dp4a INT4 path). q4-specific twin of
+    // `mmq_q8_0_batched`: Q4_0 weights x per-token-INT8-quantized activation,
+    // INT32-exact dp4a with de-interleaved nibbles + -8 zero-point + once-only
+    // per-block F32 scale. Matches llama `mul_mat_q` INT4 numerics so MoE q4
+    // prefill projection products are correct (the dequant->F16->HGEMM default
+    // is F16-grade and the 256-expert router amplifies its drift into garbled
+    // arithmetic). MoE-gated, default ON for MoE q4; env override. SM 6.1+.
+    pub(crate) mmq_q4_0_batched: Option<CudaFunction>,
+
+    // MMQ-style Q4_0 batched matmul WITH RESIDUAL ADD (out = residual + W @ x).
+    // Same dp4a INT4 kernel class as `mmq_q4_0_batched`; final store adds the
+    // residual. Used by `launch_gemm_residual` for the GDN-block exit (ssm_out)
+    // and FFN-down projections, mirroring `mmq_q8_0_batched_residual`.
+    pub(crate) mmq_q4_0_batched_residual: Option<CudaFunction>,
+
     // Q8_0 native warp-cooperative: scalar dequant+FMA, no x-quantization.
     // 2 warps per row, deferred reduction. Reads 1.0625 bytes/elem.
     // Superseded by dp4a/HGEMV paths; kept for fallback.
@@ -251,6 +266,15 @@ pub(crate) struct KernelSet {
     // with `advance_conv_position` (compiled in graph::GraphKernelSet) which
     // increments the GPU-resident counter inside the captured graph.
     pub(crate) gdn_decode_megakernel_graph: Option<CudaFunction>,
+
+    // F64-internal-accumulator twins of the decode megakernels (MoE decode/prefill
+    // precision parity). Same structure/geometry/shmem as the F32 megakernels but
+    // the L2-norm reduction and the delta-rule recurrence accumulate in F64,
+    // mirroring `gdn_prefill_fused_v3_f64accum` + `l2_normalize_qk_strided_f64accum`.
+    // Engaged only when `gdn_decode_megakernel_f64_enabled()` (MoE default, env
+    // `LUMEN_CUDA_GDN_DECODE_MEGAKERNEL_F64` override). OFF is byte-identical.
+    pub(crate) gdn_decode_megakernel_f64accum: Option<CudaFunction>,
+    pub(crate) gdn_decode_megakernel_graph_f64accum: Option<CudaFunction>,
 
     // GDN two-launch decode kernel pair (env-gated alternative to gdn_decode_megakernel).
     // gdn_phase123_register_resident: conv1d+silu+gates+L2-norm; writes Q/K/V/alpha/beta
@@ -312,12 +336,53 @@ pub(crate) struct KernelSet {
     pub(crate) gdn_prefill_fused_v3_f64accum: Option<CudaFunction>,
     pub(crate) gdn_prefill_norm_gate_f64accum: Option<CudaFunction>,
     pub(crate) gdn_phase4_register_resident_f64accum: Option<CudaFunction>,
+    /// Prefill-order twin of `gdn_phase4_register_resident_f64accum`: the
+    /// delta-rule arithmetic is reordered to match the prefill batched-scan
+    /// single-token step (`gdn_prefill_fused_v3_f64accum`) bit-for-bit (decay
+    /// state FIRST -> retrieval = SUM(d.k), then v_delta = b*(v-retrieval)),
+    /// eliminating the residual decode-vs-prefill GDN recurrence divergence.
+    /// Engaged on the decode phase4 site when `gdn_recur_prefill_order_enabled()`
+    /// (MoE-gated, env `LUMEN_CUDA_GDN_RECUR_PREFILL_ORDER`, default OFF).
+    pub(crate) gdn_phase4_register_resident_f64accum_prefillorder: Option<CudaFunction>,
     pub(crate) gdn_rmsnorm_silu_gate_f64accum: Option<CudaFunction>,
+    /// F64-internal-accumulator twin of `gdn_phase123_register_resident`
+    /// (conv1d + SiLU + L2-norm + gates in double, F32 write-back). Engaged on
+    /// the decode phase123 site when `gdn_f64_accum_enabled()` is true. Added so
+    /// the post-conv1d/SiLU/L2 Q/K consumed by the F64 phase4 are no longer
+    /// re-rounded through F32 reductions.
+    pub(crate) gdn_phase123_register_resident_f64accum: Option<CudaFunction>,
+    /// CUDA-graph-capturable twin (`state_pos` from device pointer).
+    pub(crate) gdn_phase123_register_resident_graph_f64accum: Option<CudaFunction>,
+
+    /// PHASE123 decode->prefill L2-norm ALIGNMENT twin of
+    /// `gdn_phase123_register_resident` (`LUMEN_CUDA_GDN_PHASE123_ALIGN`).
+    /// conv1d + SiLU stay F32 (bit-identical to the prefill
+    /// `ssm_conv1d_silu_prefill` single-token step) but the per-head L2-norm of
+    /// Q/K is computed with the EXACT F64 reduction of the prefill
+    /// `l2_normalize_qk_strided_f64accum` (which the MoE prefill already runs by
+    /// default). Engaged on the decode phase123 site when
+    /// `gdn_phase123_align_enabled()` is true; makes the decode q_norm/k_norm
+    /// bit-identical to a prefill of the same token. Distinct from the regressed
+    /// PHASE123_F64 (which raised conv1d to F64 too). Loaded best-effort.
+    pub(crate) gdn_phase123_register_resident_alignl2: Option<CudaFunction>,
+    /// CUDA-graph-capturable twin (`state_pos` from device pointer).
+    pub(crate) gdn_phase123_register_resident_graph_alignl2: Option<CudaFunction>,
 
     // Tensor-core Flash Attention (WMMA via inline PTX, SM 80+).
     // 16x16 query tiles via mma.sync.aligned.m16n8k16 for QK^T and PV.
     // Optional: compilation requires SM 8.0+; falls back to scalar flash_attention_br4 if unavailable.
     pub(crate) flash_attention_wmma: Option<CudaFunction>,
+
+    // Precision-localization / fix variants of the WMMA prefill attention
+    // (WMMA-PRECISION-FIX-RCA). Dispatched via env from backend_impl; no-op
+    // when unset. `qkf32` = exact scalar F32 QK^T + F16-WMMA P@V; `pvf32` =
+    // F16-WMMA QK^T + exact scalar F32 P@V. Used to isolate whether the
+    // token-flipping F16 precision loss is in the QK^T or P@V operands.
+    pub(crate) flash_attention_wmma_qkf32: Option<CudaFunction>,
+    pub(crate) flash_attention_wmma_pvf32: Option<CudaFunction>,
+    // Performant fix: split-F16 (hi+lo) operands on BOTH QK^T and P@V,
+    // recovering ~20-bit mantissa while staying on tensor cores.
+    pub(crate) flash_attention_wmma_split: Option<CudaFunction>,
 
     // Flash Attention 2 with mask block-skip (P1-3, long-context prefill).
     // Br=4 rows per block, Bc=64 KV positions per tile. The kernel iterates
@@ -946,6 +1011,22 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             Ok(f) => Some(f),
             Err(e) => { cuda_log!("[CUDA] MMQ Q8_0 batched_residual: FAILED: {e}"); None }
         },
+        // q4-specific MMQ INT4 batched matmul (mul_mat_q-grade numerics).
+        mmq_q4_0_batched: match load_fn_sm80(
+            shaders::MMQ_Q4_0_KERNEL_SOURCE,
+            "mmq_q4_0_batched",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] mmq_q4_0_batched: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] mmq_q4_0_batched: FAILED: {e}"); None }
+        },
+        // residual variant. Same kernel source compiles both entry points.
+        mmq_q4_0_batched_residual: match load_fn_sm80(
+            shaders::MMQ_Q4_0_KERNEL_SOURCE,
+            "mmq_q4_0_batched_residual",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] mmq_q4_0_batched_residual: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] mmq_q4_0_batched_residual: FAILED: {e}"); None }
+        },
         matvec_q8_0_aligned: match load_fn_sm80(
             shaders::MATVEC_Q8_0_ALIGNED_KERNEL_SOURCE,
             "matvec_q8_0_aligned",
@@ -982,6 +1063,18 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             Ok(f) => Some(f),
             Err(e) => { cuda_log!("[CUDA] WMMA flash attention: FAILED: {e}"); None }
         },
+        flash_attention_wmma_qkf32: load_fn_sm80(
+            shaders::FLASH_ATTENTION_WMMA_KERNEL_SOURCE,
+            "flash_attention_wmma_qkf32",
+        ).ok(),
+        flash_attention_wmma_pvf32: load_fn_sm80(
+            shaders::FLASH_ATTENTION_WMMA_KERNEL_SOURCE,
+            "flash_attention_wmma_pvf32",
+        ).ok(),
+        flash_attention_wmma_split: load_fn_sm80(
+            shaders::FLASH_ATTENTION_WMMA_KERNEL_SOURCE,
+            "flash_attention_wmma_split",
+        ).ok(),
         flash_attention_fa2_causal: match load_fn(
             shaders::FLASH_ATTENTION_FA2_KERNEL_SOURCE,
             "flash_attention_fa2_causal",
@@ -1064,6 +1157,21 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             Ok(f) => { cuda_log!("[CUDA] gdn_decode_megakernel_graph: OK"); Some(f) }
             Err(e) => { cuda_log!("[CUDA] gdn_decode_megakernel_graph: FAILED: {e}"); None }
         },
+        // F64-accum decode megakernel twins (MoE decode/prefill precision parity)
+        gdn_decode_megakernel_f64accum: match load_fn(
+            shaders::GDN_MEGAKERNEL_SOURCE,
+            "gdn_decode_megakernel_f64accum",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] gdn_decode_megakernel_f64accum: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] gdn_decode_megakernel_f64accum: FAILED: {e}"); None }
+        },
+        gdn_decode_megakernel_graph_f64accum: match load_fn(
+            shaders::GDN_MEGAKERNEL_SOURCE,
+            "gdn_decode_megakernel_graph_f64accum",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] gdn_decode_megakernel_graph_f64accum: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] gdn_decode_megakernel_graph_f64accum: FAILED: {e}"); None }
+        },
         // GDN two-launch decode kernel pair (env-gated alternative)
         gdn_phase123_register_resident: match load_fn(
             shaders::GDN_REGISTER_RESIDENT_KERNEL_SOURCE,
@@ -1134,12 +1242,47 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             Ok(f) => { cuda_log!("[CUDA] gdn_phase4_register_resident_f64accum: OK"); Some(f) }
             Err(e) => { cuda_log!("[CUDA] gdn_phase4_register_resident_f64accum: FAILED: {e}"); None }
         },
+        gdn_phase4_register_resident_f64accum_prefillorder: match load_fn(
+            shaders::GDN_F64ACCUM_KERNEL_SOURCE,
+            "gdn_phase4_register_resident_f64accum_prefillorder",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] gdn_phase4_register_resident_f64accum_prefillorder: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] gdn_phase4_register_resident_f64accum_prefillorder: FAILED: {e}"); None }
+        },
         gdn_rmsnorm_silu_gate_f64accum: match load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,
             "gdn_rmsnorm_silu_gate_f64accum",
         ) {
             Ok(f) => { cuda_log!("[CUDA] gdn_rmsnorm_silu_gate_f64accum: OK"); Some(f) }
             Err(e) => { cuda_log!("[CUDA] gdn_rmsnorm_silu_gate_f64accum: FAILED: {e}"); None }
+        },
+        gdn_phase123_register_resident_f64accum: match load_fn(
+            shaders::GDN_F64ACCUM_KERNEL_SOURCE,
+            "gdn_phase123_register_resident_f64accum",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] gdn_phase123_register_resident_f64accum: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] gdn_phase123_register_resident_f64accum: FAILED: {e}"); None }
+        },
+        gdn_phase123_register_resident_graph_f64accum: match load_fn(
+            shaders::GDN_F64ACCUM_KERNEL_SOURCE,
+            "gdn_phase123_register_resident_graph_f64accum",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] gdn_phase123_register_resident_graph_f64accum: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] gdn_phase123_register_resident_graph_f64accum: FAILED: {e}"); None }
+        },
+        gdn_phase123_register_resident_alignl2: match load_fn(
+            shaders::GDN_F64ACCUM_KERNEL_SOURCE,
+            "gdn_phase123_register_resident_alignl2",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] gdn_phase123_register_resident_alignl2: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] gdn_phase123_register_resident_alignl2: FAILED: {e}"); None }
+        },
+        gdn_phase123_register_resident_graph_alignl2: match load_fn(
+            shaders::GDN_F64ACCUM_KERNEL_SOURCE,
+            "gdn_phase123_register_resident_graph_alignl2",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] gdn_phase123_register_resident_graph_alignl2: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] gdn_phase123_register_resident_graph_alignl2: FAILED: {e}"); None }
         },
         // Fused F16 decode kernels (dispatch count reduction)
         fused_rmsnorm_f16: match load_fn(
@@ -2748,6 +2891,44 @@ pub(crate) fn flash_attention_wmma_shared_bytes(head_dim: u32) -> u32 {
     let rowsum = br * 4;            // float rowsum[BR]
 
     q_sh + kv_sh + s_sh + p_sh + o_acc + rowmax + rowsum
+}
+
+/// Shared memory bytes for flash_attention_wmma_qkf32 (precision-localization).
+///
+/// Layout: Q_f32[BR*hd]*4 + K_f32[BC*hd]*4 + S[BR*BC]*4 + P_f16[BR*BC]*2
+///       + V_f16[BC*hd]*2 + O_acc[BR*hd]*4 + rowmax[BR]*4 + rowsum[BR]*4
+pub(crate) fn flash_attention_wmma_qkf32_shared_bytes(head_dim: u32) -> u32 {
+    let br = FA_TC_BR;
+    let bc = FA_TC_BC;
+    let hd = head_dim;
+    (br * hd * 4) + (bc * hd * 4) + (br * bc * 4) + (br * bc * 2)
+        + (bc * hd * 2) + (br * hd * 4) + (br * 4) + (br * 4)
+}
+
+/// Shared memory bytes for flash_attention_wmma_pvf32 (precision-localization).
+///
+/// Layout: Q_f16[BR*hd]*2 + KV_f16[BC*hd]*2 + S[BR*BC]*4 + V_f32[BC*hd]*4
+///       + O_acc[BR*hd]*4 + rowmax[BR]*4 + rowsum[BR]*4
+pub(crate) fn flash_attention_wmma_pvf32_shared_bytes(head_dim: u32) -> u32 {
+    let br = FA_TC_BR;
+    let bc = FA_TC_BC;
+    let hd = head_dim;
+    (br * hd * 2) + (bc * hd * 2) + (br * bc * 4) + (bc * hd * 4)
+        + (br * hd * 4) + (br * 4) + (br * 4)
+}
+
+/// Shared memory bytes for flash_attention_wmma_split (performant fix).
+///
+/// Layout: Qhi[BR*hd]*2 + Qlo[BR*hd]*2 + KVhi[BC*hd]*2 + KVlo[BC*hd]*2
+///       + S[BR*BC]*4 + Phi[BR*BC]*2 + Plo[BR*BC]*2 + O_acc[BR*hd]*4
+///       + rowmax[BR]*4 + rowsum[BR]*4   (KV buffers reused for K then V)
+pub(crate) fn flash_attention_wmma_split_shared_bytes(head_dim: u32) -> u32 {
+    let br = FA_TC_BR;
+    let bc = FA_TC_BC;
+    let hd = head_dim;
+    (br * hd * 2) + (br * hd * 2) + (bc * hd * 2) + (bc * hd * 2)
+        + (br * bc * 4) + (br * bc * 2) + (br * bc * 2)
+        + (br * hd * 4) + (br * 4) + (br * 4)
 }
 
 // ------------------------------------------------------------------

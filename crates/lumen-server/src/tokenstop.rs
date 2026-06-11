@@ -25,6 +25,16 @@ pub struct StopMatcher {
 }
 
 impl StopMatcher {
+    /// Build a matcher from textual stop sequences.
+    ///
+    /// PRECONDITION: each sequence is valid UTF-8 (it is — both the JSON
+    /// `stop` field, a `serde` `Value::String`, and the CLI `--stop` arg are
+    /// guaranteed-valid Rust `String`s). UTF-8 self-synchronization then
+    /// guarantees a valid stop string can never match aligned on a
+    /// continuation byte, so the safe-prefix slices in `push`/`finish` always
+    /// land on a char boundary. Those decodes use `from_utf8_lossy` anyway, so
+    /// a future non-UTF-8 caller degrades gracefully rather than silently
+    /// dropping a whole prefix.
     pub fn new(sequences: Vec<String>) -> Self {
         let bytes: Vec<Vec<u8>> = sequences.into_iter().map(|s| s.into_bytes()).collect();
         let max_len = bytes.iter().map(|s| s.len()).max().unwrap_or(0);
@@ -66,9 +76,14 @@ impl StopMatcher {
 
         if let Some((match_start, _)) = best {
             // Emit everything BEFORE the match. The matched bytes and any
-            // trailing data are dropped per stop semantics.
-            let safe = String::from_utf8(combined[..match_start].to_vec())
-                .unwrap_or_default();
+            // trailing data are dropped per stop semantics. `from_utf8_lossy`
+            // rather than `from_utf8(..).unwrap_or_default()`: for the
+            // guaranteed-valid-UTF-8 stop strings this matcher is built from
+            // (see `StopMatcher::new`) the prefix is always a clean boundary,
+            // but lossy decoding degrades gracefully (it never silently drops
+            // the WHOLE prefix) should a future caller ever feed bytes that
+            // split a codepoint.
+            let safe = String::from_utf8_lossy(&combined[..match_start]).into_owned();
             self.window.clear();
             // Suppress unused warning when window_len happens not to bind.
             let _ = window_len;
@@ -92,7 +107,9 @@ impl StopMatcher {
         hold_len = hold_len.min(combined.len());
 
         let safe_end = combined.len() - hold_len;
-        let safe = String::from_utf8(combined[..safe_end].to_vec()).unwrap_or_default();
+        // Lossy decode (see the match-hit branch): graceful on a split
+        // codepoint instead of dropping the whole safe prefix.
+        let safe = String::from_utf8_lossy(&combined[..safe_end]).into_owned();
         self.window.extend_from_slice(&combined[safe_end..]);
         (safe, false)
     }
@@ -106,7 +123,11 @@ impl StopMatcher {
     /// the stream ends naturally (EOS or end-of-tokens) without having
     /// matched a stop sequence -- the held bytes are then safe to emit.
     pub fn finish(self) -> String {
-        String::from_utf8(self.window).unwrap_or_default()
+        // Lossy decode (see `push`): the held window is byte-identical to the
+        // input slices, so for the valid-UTF-8 stop strings this matcher is
+        // built from it round-trips exactly; lossy only matters as graceful
+        // degradation for a hypothetical non-UTF-8 caller.
+        String::from_utf8_lossy(&self.window).into_owned()
     }
 }
 
@@ -209,5 +230,46 @@ mod tests {
         assert_eq!(longest_suffix_prefix(b"helloS", b"STOP"), 1);
         assert_eq!(longest_suffix_prefix(b"hello", b"STOP"), 0);
         assert_eq!(longest_suffix_prefix(b"xxxSTO", b"STOP"), 3);
+    }
+
+    /// A multi-byte (3-byte) Unicode stop sequence is matched on its byte
+    /// boundary and the preceding multi-byte content round-trips intact. The
+    /// `€` (E2 82 AC) before the stop spans the emit, and the stop itself is a
+    /// multi-byte string — proving the byte-level windowing + `from_utf8_lossy`
+    /// decode never corrupt a real Unicode prefix into U+FFFD.
+    #[test]
+    fn multibyte_unicode_stop_and_prefix_roundtrip() {
+        let mut m = StopMatcher::new(vec!["。".into()]); // U+3002, 3 bytes
+        let (t, stop) = m.push("価格は€です。あと");
+        assert!(stop, "the multi-byte stop must be detected");
+        assert_eq!(
+            t, "価格は€です",
+            "the multi-byte prefix (incl. €) is emitted intact up-to-but-excluding the stop"
+        );
+    }
+
+    /// A multi-byte char held in the window (because its leading bytes look
+    /// like the start of a longer stop sequence) is reassembled and flushed
+    /// without corruption when the next push fails to complete the stop.
+    #[test]
+    fn multibyte_char_in_window_reassembles() {
+        // Stop is "€END" (€ = E2 82 AC). Pushing "a€" holds the full € (its
+        // 3 bytes are a prefix of the stop); "more" then fails to complete it.
+        let mut m = StopMatcher::new(vec!["€END".into()]);
+        let (t1, s1) = m.push("a€");
+        assert!(!s1);
+        assert_eq!(t1, "a", "the € is held back as a possible stop prefix");
+        let (t2, s2) = m.push("more");
+        assert!(!s2);
+        assert_eq!(t2, "€more", "the held € is flushed intact, not corrupted");
+    }
+
+    /// `finish()` flushing a held multi-byte char yields it intact.
+    #[test]
+    fn finish_drains_multibyte_char_intact() {
+        let mut m = StopMatcher::new(vec!["€END".into()]);
+        let (t, _) = m.push("x€");
+        assert_eq!(t, "x");
+        assert_eq!(m.finish(), "€", "held multi-byte tail flushed intact on finish()");
     }
 }

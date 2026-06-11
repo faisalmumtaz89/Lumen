@@ -76,24 +76,41 @@ OPTIONS:
     --model <name|path>   Model name from registry (e.g. qwen3-5-9b:q8_0) or path to .lbc/.gguf file
     --prompt <text>       Text prompt (requires LBC with embedded tokenizer)
     --system <text>       System prompt (optional, overrides default)
+    --think               Enable the Qwen3.5 reasoning trace: opens a <think> block; the
+                          reasoning is printed to stderr ([reasoning] ...) and the answer to
+                          stdout. Default OFF (closed empty-think tail). --no-think forces OFF
+                          (overrides LUMEN_CHAT_ENABLE_THINKING).
     --tokens <ids>        Space-separated token IDs (--prompt and --tokens are mutually exclusive)
     --max-tokens <n>      Max tokens to generate (default: unlimited, stops at EOS)
                           PRODUCTION: pass --max-tokens 512 (minimum) for multilingual prompts;
                           the Qwen3.5 chat template opens a <think>...</think> block that may
                           consume the budget before producing the answer in the target language.
-    --temperature <f>     Sampling temperature (default: 0.8, 0=greedy)
+    --stop <text>         Textual stop sequence (mirrors the server OpenAI `stop` /
+                          Anthropic `stop_sequences`). The answer is cut at the first matched
+                          stop string; the match and everything after it are dropped. Repeatable
+                          and accepts a comma-separated list, so `--stop A --stop B` and
+                          `--stop A,B` are equivalent. Default: none (answer prints to EOS).
+    --temperature <f>     Sampling temperature (default: 0.7, 0=greedy)
                           PRODUCTION: PURE-greedy (--temperature 0 + no penalty) deterministically
-                          loops on long-form generation (>=512 tokens). Use sampling (0.7) OR
-                          --repetition-penalty 1.05 --repeat-last-n 64 for production.
+                          loops on long-form generation (>=512 tokens). Use sampling (0.7); for a
+                          greedy long-form penalty use --repetition-penalty 1.05 --repeat-last-n 64
+                          on DENSE models only (MoE must stay <= 1.03 — leave the flag unset so the
+                          model-aware default applies).
     --top-p <f>           Nucleus sampling cutoff (default: 1.0 = disabled)
     --top-k <n>           Top-K sampling cutoff (default: 0 = disabled)
     --min-p <f>           Min-probability sampling cutoff (default: 0.0 = disabled)
     --repetition-penalty <f>
-                          Multiplicative penalty for tokens in the recent window (default: 1.0).
+                          Multiplicative penalty for tokens in the recent window. When this flag
+                          is OMITTED the default is MODEL-AWARE (resolved by
+                          runtime_defaults::repetition_penalty_default): 1.05 dense / 1.03 MoE.
                           --repeat-penalty is an accepted alias.
-                          PRODUCTION recommendation for long-form greedy: 1.05.
+                          PRODUCTION recommendation for long-form greedy on DENSE models: 1.05.
+                          MoE (Qwen3.5-MoE class) MUST stay <= 1.03: 1.05 corrupts MoE arithmetic
+                          (matrix-proven '17 x 20 = ... = 39') — leave the flag unset so the
+                          model-aware 1.03 default applies.
     --repeat-last-n <n>   Window size for --repetition-penalty (default: 0 = disabled).
-                          PRODUCTION recommendation paired with --repetition-penalty 1.05: 64.
+                          PRODUCTION recommendation paired with --repetition-penalty 1.05 on
+                          DENSE models: 64. (Does not apply to the MoE 1.03 default.)
     --presence-penalty <f>
                           Additive penalty for tokens already in the context (default: 0.0).
     --frequency-penalty <f>

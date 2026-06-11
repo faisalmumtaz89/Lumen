@@ -5,7 +5,7 @@
 
 use crate::crc::{crc32, crc32_finalize, crc32_update, CRC32_INIT};
 use crate::header::{Endianness, GlobalTensorRange, LbcHeader, LBC_MAGIC, LBC_VERSION};
-use crate::hyperparams::{ModelHyperparams, RopeParams, RopeScalingType};
+use crate::hyperparams::{GdnDims, ModelHyperparams, RopeParams, RopeScalingType};
 use crate::index::{ExpertSlice, LayerIndex, SubtensorOffsets, TensorSlice};
 use crate::quantization::{QuantGroupSize, QuantScheme, QuantizationDescriptor};
 use crate::tokenizer::TokenizerSection;
@@ -158,10 +158,23 @@ impl LbcFile {
 fn peek_header_offsets(data: &[u8]) -> Result<(u64, u32), FormatError> {
     let mut c = Cursor::new(data);
 
-    // magic(4) + version(4) + endianness(1) + padding(3) + checksum(4) = 16
-    c.skip(16)?;
-    // hyperparams: 8 * u32(4) + has_rope(1) + rope_block(11) + 3 * u32(4) = 56
+    // magic(4)
+    c.skip(4)?;
+    // version(4) — needed to know whether the v4 GDN hyperparams block exists.
+    let version = c.read_u32()?;
+    // endianness(1) + padding(3) + checksum(4) = 8
+    c.skip(8)?;
+    // hyperparams v1-v3 fixed part: 8 * u32(4) + has_rope(1) + rope_block(11)
+    //   + 3 * u32(4) = 56
     c.skip(56)?;
+    // hyperparams v4 GDN block: presence(1) + optional [4 * u32 = 16] when set.
+    // Must mirror serialize_hyperparams so the cursor lands on the quant desc.
+    if version >= 4 {
+        let present = c.read_u8()? != 0;
+        if present {
+            c.skip(16)?;
+        }
+    }
     // quantization descriptor: 1+1+4+4+1+4 = 15
     c.skip(15)?;
     // alignment(8)
@@ -213,7 +226,7 @@ fn parse_lbc(data: &[u8]) -> Result<(LbcHeader, Vec<LayerIndex>), FormatError> {
     // Verify checksum: compute CRC32 over header bytes with checksum field zeroed
     // We'll verify checksum after parsing the full header
 
-    let hyperparams = parse_hyperparams(&mut cursor)?;
+    let hyperparams = parse_hyperparams(&mut cursor, version)?;
     let quantization = parse_quant_desc(&mut cursor)?;
 
     let alignment = cursor.read_u64()?;
@@ -339,7 +352,7 @@ fn parse_tokenizer_section(
     Ok(tok)
 }
 
-fn parse_hyperparams(c: &mut Cursor<'_>) -> Result<ModelHyperparams, FormatError> {
+fn parse_hyperparams(c: &mut Cursor<'_>, version: u32) -> Result<ModelHyperparams, FormatError> {
     let num_layers = c.read_u32()?;
     let num_heads = c.read_u32()?;
     let num_kv_heads = c.read_u32()?;
@@ -380,6 +393,30 @@ fn parse_hyperparams(c: &mut Cursor<'_>) -> Result<ModelHyperparams, FormatError
     let num_active_raw = c.read_u32()?;
     let norm_eps = c.read_f32()?;
 
+    // v4: Gated-DeltaNet (GDN/SSM) dimensions. Only present in version >= 4
+    // files (mirrors the writer's append). For v3 files the block is absent —
+    // the bytes here belong to the next header field, so we MUST NOT read it.
+    // gdn = None then resolves to the Qwen3.5-9B defaults at use sites.
+    let gdn = if version >= 4 {
+        let present = c.read_u8()? != 0;
+        if present {
+            let num_v_heads = c.read_u32()?;
+            let num_k_heads = c.read_u32()?;
+            let head_dim_gdn = c.read_u32()?;
+            let conv_kernel = c.read_u32()?;
+            Some(GdnDims {
+                num_v_heads,
+                num_k_heads,
+                head_dim: head_dim_gdn,
+                conv_kernel,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(ModelHyperparams {
         num_layers,
         num_heads,
@@ -395,6 +432,7 @@ fn parse_hyperparams(c: &mut Cursor<'_>) -> Result<ModelHyperparams, FormatError
         norm_eps,
         rotary_dim: if rotary_dim_raw > 0 { Some(rotary_dim_raw as u32) } else { None },
         rope_neox,
+        gdn,
     })
 }
 
@@ -632,6 +670,7 @@ mod tests {
             norm_eps: 1e-5,
             rotary_dim: None,
             rope_neox: false,
+            gdn: None,
         };
         let qd = QuantizationDescriptor {
             scheme: QuantScheme::F32,
@@ -758,6 +797,7 @@ mod tests {
             norm_eps: 1e-5,
             rotary_dim: None,
             rope_neox: false,
+            gdn: None,
         };
         let qd = QuantizationDescriptor {
             scheme: QuantScheme::F32,
@@ -1146,6 +1186,7 @@ mod tests {
             norm_eps: 1e-5,
             rotary_dim: None,
             rope_neox: false,
+            gdn: None,
         };
         let qd = QuantizationDescriptor {
             scheme: QuantScheme::F32,
@@ -1393,5 +1434,59 @@ mod tests {
         let alignment = lbc.header.alignment;
         assert_eq!(tok_off % alignment, 0,
             "tokenizer offset {} not aligned to {}", tok_off, alignment);
+    }
+
+    /// v4 Gated-DeltaNet dims survive a write/read round-trip, and the
+    /// header byte layout is exactly +16 bytes when present vs absent.
+    /// `gdn=None` resolves to the Qwen3.5-9B default (byte-identical fallback).
+    #[test]
+    fn v4_gdn_dims_roundtrip() {
+        use crate::hyperparams::GdnDims;
+        use crate::writer::serialize_header;
+
+        // Derived-dim math for the two known shapes.
+        let n9 = GdnDims::QWEN35_9B;
+        assert_eq!((n9.v_dim(), n9.qk_dim(), n9.qkv_dim()), (4096, 2048, 8192));
+        let g27 = GdnDims { num_v_heads: 48, num_k_heads: 16, head_dim: 128, conv_kernel: 4 };
+        assert_eq!((g27.v_dim(), g27.qk_dim(), g27.qkv_dim()), (6144, 2048, 10240));
+
+        // Byte-layout delta: a present GDN block adds exactly the 16-byte payload.
+        let (mut h_none, _) = make_test_header();
+        h_none.hyperparams.gdn = None;
+        let bytes_none = serialize_header(&h_none);
+        let mut h_some = h_none.clone();
+        h_some.hyperparams.gdn = Some(g27);
+        let bytes_some = serialize_header(&h_some);
+        assert_eq!(bytes_some.len(), bytes_none.len() + 16, "GDN-present adds 16 bytes");
+
+        // Full file round-trip with gdn=Some, exercising the peek_header_offsets
+        // scan that locates the layer index after the (now larger) header.
+        let (mut header, indices) = make_test_header();
+        header.hyperparams.gdn = Some(g27);
+        let globals = GlobalTensors {
+            embedding: vec![1u8; 32 * 8 * 4],
+            final_norm: vec![2u8; 8 * 4],
+            output_proj: vec![3u8; 32 * 8 * 4],
+        };
+        let layer_blob = vec![42u8; 1344];
+        let blobs: Vec<&[u8]> = vec![&layer_blob, &layer_blob];
+        let mut out = Vec::new();
+        write_lbc(&mut out, &header, &indices, &globals, &blobs, None).unwrap();
+        let lbc = LbcFile::from_bytes(&out, PathBuf::from("gdn4.lbc")).unwrap();
+        assert_eq!(lbc.header.hyperparams.gdn, Some(g27));
+        assert_eq!(lbc.header.hyperparams.gdn_dims(), g27);
+        assert_eq!(lbc.layer_indices.len(), 2);
+        let (lio, nl) = peek_header_offsets(&out).unwrap();
+        assert_eq!(nl, 2);
+        assert_eq!(lio, lbc.header.layer_index_offset);
+
+        // gdn=None round-trips and resolves to the 9B default at use sites.
+        let (h2, idx2) = make_test_header(); // make_test_header sets gdn: None
+        assert_eq!(h2.hyperparams.gdn, None);
+        let mut out2 = Vec::new();
+        write_lbc(&mut out2, &h2, &idx2, &globals, &blobs, None).unwrap();
+        let lbc2 = LbcFile::from_bytes(&out2, PathBuf::from("gdn_none.lbc")).unwrap();
+        assert_eq!(lbc2.header.hyperparams.gdn, None);
+        assert_eq!(lbc2.header.hyperparams.gdn_dims(), GdnDims::QWEN35_9B);
     }
 }

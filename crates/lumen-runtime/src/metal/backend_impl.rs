@@ -137,6 +137,20 @@ impl ComputeBackend for MetalF32Backend {
         let gqa_ratio = num_heads / num_kv_heads;
         let attn_scale = 1.0 / (head_dim as f32).sqrt();
 
+        // Resolved Gated-DeltaNet (GDN/SSM) dims. These are independent of the
+        // attention head counts above and come from the LBC hyperparams (or the
+        // Qwen3.5-9B default {32,16,128,4} when the model carries none, which
+        // keeps 9B models byte-identical). Used to size GDN scratch/state buffers
+        // and to drive GDN kernel dispatch for both 9B and 27B shapes.
+        let gdn_dims = hyperparams.gdn_dims();
+        let gdn_num_v_heads = gdn_dims.num_v_heads as usize;
+        let gdn_num_k_heads = gdn_dims.num_k_heads as usize;
+        let gdn_head_dim = gdn_dims.head_dim as usize;
+        let gdn_conv_kernel = gdn_dims.conv_kernel as usize;
+        // Fused QKV channel count for GDN: 2*qk_dim + v_dim
+        //   9B  = 2*2048 + 4096 = 8192 ; 27B = 2*2048 + 6144 = 10240.
+        let gdn_qkv_dim = gdn_dims.qkv_dim() as usize;
+
         // MoE dimensions (0 for dense models)
         let moe_num_experts = hyperparams.num_experts.unwrap_or(0) as usize;
         let moe_num_active_experts = hyperparams.num_active_experts.unwrap_or(0) as usize;
@@ -211,7 +225,7 @@ impl ComputeBackend for MetalF32Backend {
             // Persistent activation buffer: allocated once, reused every layer.
             x_buf: make_buf(hidden_dim)?,
             normed_buf: make_buf(hidden_dim)?,
-            qkv_buf: make_buf(qkv_dim.max(8192))?,   // GDN needs 8192 (Q4096+K2048+V2048)
+            qkv_buf: make_buf(qkv_dim.max(gdn_qkv_dim))?,   // GDN needs gdn_qkv_dim (9B=8192, 27B=10240)
             q_buf: make_buf(q_dim)?,
             k_buf: make_buf(kv_dim.max(2048))?,    // GDN needs 2048 (16 KV heads * 128 dim)
             v_buf: make_buf(kv_dim.max(2048))?,    // GDN needs 2048 (16 KV heads * 128 dim)
@@ -369,7 +383,10 @@ impl ComputeBackend for MetalF32Backend {
             gdn_alpha_raw_buf: None,
             gdn_beta_raw_buf: None,
             gdn_qkv_conv_buf: None,
-            gdn_conv_kernel_size: 4,
+            gdn_conv_kernel_size: gdn_conv_kernel,
+            gdn_num_v_heads,
+            gdn_num_k_heads,
+            gdn_head_dim,
             gdn_num_layers: 0,
             gdn_layer_idx_map: Vec::new(),
 
@@ -603,14 +620,21 @@ impl ComputeBackend for MetalF32Backend {
                 let gdn_idx = s.gdn_h_states.len();
                 s.gdn_layer_idx_map[layer_idx] = Some(gdn_idx);
 
-                // GDN dimensions differ from full-attention hyperparams.
-                const GDN_NUM_HEADS: usize = 32;    // ssm.time_step_rank
-                const GDN_HEAD_DIM: usize = 128;    // ssm.state_size
-                const GDN_QKV_DIM: usize = 8192;    // Q(2048) + K(2048) + V(4096)
-                let gdn_q_dim = GDN_NUM_HEADS * GDN_HEAD_DIM; // 4096
-                let conv_kernel_size = 4usize;
-                let h_state_size = GDN_NUM_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM; // 32*128*128
-                let conv_state_size = (conv_kernel_size - 1) * GDN_QKV_DIM;     // 3*8192
+                // GDN dimensions differ from full-attention hyperparams; they
+                // come from the resolved SSM dims (9B {32,16,128,4} default, or
+                // 27B {48,16,128,4}) populated in init() from hyperparams.gdn_dims().
+                let gdn_num_v_heads = s.gdn_num_v_heads; // ssm.time_step_rank
+                let gdn_num_k_heads = s.gdn_num_k_heads; // ssm.group_count
+                let gdn_head_dim = s.gdn_head_dim;       // ssm.state_size
+                // Fused QKV channels: 2 * (num_k_heads*head_dim) + num_v_heads*head_dim
+                //   9B = 8192, 27B = 10240.
+                let gdn_qkv_dim = 2 * gdn_num_k_heads * gdn_head_dim + gdn_num_v_heads * gdn_head_dim;
+                // V / gate / output-projection width = num_v_heads * head_dim
+                //   9B = 4096, 27B = 6144.
+                let gdn_q_dim = gdn_num_v_heads * gdn_head_dim;
+                let conv_kernel_size = s.gdn_conv_kernel_size;
+                let h_state_size = gdn_num_v_heads * gdn_head_dim * gdn_head_dim;
+                let conv_state_size = (conv_kernel_size - 1) * gdn_qkv_dim;
 
                 let h_buf = self.device.new_buffer(h_state_size * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN h_state".into())
@@ -630,10 +654,10 @@ impl ComputeBackend for MetalF32Backend {
 
                 // Allocate GDN scratch buffers if not yet done (first GDN layer).
                 if s.gdn_alpha_buf.is_none() {
-                    s.gdn_alpha_buf = Some(self.device.new_buffer(GDN_NUM_HEADS * 4).ok_or_else(|| {
+                    s.gdn_alpha_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
                         RuntimeError::Compute("Failed to allocate GDN alpha buf".into())
                     })?);
-                    s.gdn_beta_buf = Some(self.device.new_buffer(GDN_NUM_HEADS * 4).ok_or_else(|| {
+                    s.gdn_beta_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
                         RuntimeError::Compute("Failed to allocate GDN beta buf".into())
                     })?);
                     s.gdn_output_buf = Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
@@ -648,13 +672,13 @@ impl ComputeBackend for MetalF32Backend {
                     s.gdn_normed_out_buf = Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
                         RuntimeError::Compute("Failed to allocate GDN normed_out buf".into())
                     })?);
-                    s.gdn_alpha_raw_buf = Some(self.device.new_buffer(GDN_NUM_HEADS * 4).ok_or_else(|| {
+                    s.gdn_alpha_raw_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
                         RuntimeError::Compute("Failed to allocate GDN alpha_raw buf".into())
                     })?);
-                    s.gdn_beta_raw_buf = Some(self.device.new_buffer(GDN_NUM_HEADS * 4).ok_or_else(|| {
+                    s.gdn_beta_raw_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
                         RuntimeError::Compute("Failed to allocate GDN beta_raw buf".into())
                     })?);
-                    s.gdn_qkv_conv_buf = Some(self.device.new_buffer(GDN_QKV_DIM * 4).ok_or_else(|| {
+                    s.gdn_qkv_conv_buf = Some(self.device.new_buffer(gdn_qkv_dim * 4).ok_or_else(|| {
                         RuntimeError::Compute("Failed to allocate GDN qkv_conv buf".into())
                     })?);
                 }
@@ -2783,17 +2807,19 @@ impl ComputeBackend for MetalF32Backend {
         if s.gdn_num_layers == 0 {
             return None;
         }
-        // GDN constants mirror the per-layer allocator at line ~568 of this
-        // file. They are Qwen3.5-9B-tuned and not part of generic hyperparams.
-        const GDN_NUM_HEADS: u32 = 32;
-        const GDN_HEAD_DIM: u32 = 128;
-        const GDN_QKV_DIM: u32 = 8192;
+        // GDN dims mirror the per-layer allocator and come from the resolved
+        // SSM dims (9B {32,16,128,4} default, or 27B {48,16,128,4}). Derived
+        // qkv channel count = 2*num_k_heads*head_dim + num_v_heads*head_dim.
+        let gdn_num_v_heads = s.gdn_num_v_heads as u32;
+        let gdn_head_dim = s.gdn_head_dim as u32;
+        let gdn_qkv_dim =
+            (2 * s.gdn_num_k_heads * s.gdn_head_dim + s.gdn_num_v_heads * s.gdn_head_dim) as u32;
         Some(crate::kv::disk::GdnLayout {
             num_gdn_layers: s.gdn_num_layers as u32,
-            gdn_num_heads: GDN_NUM_HEADS,
-            gdn_head_dim: GDN_HEAD_DIM,
+            gdn_num_heads: gdn_num_v_heads,
+            gdn_head_dim,
             gdn_conv_kernel_size: s.gdn_conv_kernel_size as u32,
-            gdn_conv_qkv_dim: GDN_QKV_DIM,
+            gdn_conv_qkv_dim: gdn_qkv_dim,
             gdn_dtype_tag: crate::kv::disk::RECURRENT_DTYPE_F32,
         })
     }

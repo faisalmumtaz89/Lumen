@@ -805,8 +805,15 @@ pub(crate) struct MetalScratch {
     pub(crate) gdn_beta_raw_buf: Option<MetalBuffer>,
     /// GDN scratch: conv1d output for all QKV channels [GDN_QKV_DIM=8192] f32.
     pub(crate) gdn_qkv_conv_buf: Option<MetalBuffer>,
-    /// GDN conv kernel size (typically 4).
+    /// GDN conv kernel size (`ssm.conv_kernel`, typically 4).
     pub(crate) gdn_conv_kernel_size: usize,
+    /// GDN number of state / V heads (`ssm.time_step_rank`): 32 for Qwen3.5-9B,
+    /// 48 for Qwen3.6-27B. Resolved from `hyperparams.gdn_dims()` at init.
+    pub(crate) gdn_num_v_heads: usize,
+    /// GDN number of Q/K heads before GQA repeat (`ssm.group_count`, 16).
+    pub(crate) gdn_num_k_heads: usize,
+    /// GDN per-head dimension (`ssm.state_size`, 128).
+    pub(crate) gdn_head_dim: usize,
     /// Number of GDN layers in the model (layer_type=1 count).
     pub(crate) gdn_num_layers: usize,
     /// Maps layer_idx -> gdn_idx for streaming path lazy allocation.

@@ -325,21 +325,35 @@ pub(crate) fn mmv_q_dp4a_enabled() -> bool {
 /// matvec for ~2-3x arithmetic throughput on the FFN path (which is 31.6%
 /// TPOT measured).
 ///
-/// **default ON** (Q4 is the load-bearing beneficiary per brief).
-/// 5-trial bench: Q4 OFF 86.6 → ON 96.7 tok/s = **+11.7%** meaningful;
-/// Q8 OFF 76.0 → ON 76.3 = +0.4% noise (inert on Q8 path); BF16 inert (BF16
-/// weights skip the MoE Q-port path). Q4 COH (both ON/OFF with near-tie token
-/// drift, V3b precedent). Operators may opt out with
-/// `LUMEN_CUDA_MMV_Q_MOE_DP4A=0` for A/B testing.
+/// **default OFF for MoE** (correctness keeper, 2026-06-07). The dp4a path
+/// re-quantizes each expert's F32 activation to Q8_1 (8-bit) before the
+/// INT8×INT4 dot product. On Qwen3.5-MoE-35B-A3B **Q4**, that extra 8-bit
+/// activation quantization — stacked on the Q4_0 weight error and amplified by
+/// the 256-expert top-K router — derails arithmetic reasoning: the model
+/// hard-loops "17 × 23 = 17 × 23 = …" and never computes a product (4-gram
+/// rep ~35, never reaches 391), while llama-q4 cleanly reaches 391. EMPIRICAL
+/// PROOF (A100, default env, temp 0): dp4a ON → 0/4 reach 391 (rep 6–35); dp4a
+/// OFF → 4/4 reach 391 (rep 2–4). With dp4a OFF the Q4 expert FFN falls through
+/// to the V3 cooperative-CTA **F16-accumulation** kernel — the SAME kernel
+/// family the Q8 MoE path uses (Q8 deliberately never enabled dp4a here; see
+/// the comment at the Q8 dispatch site). Defaulting OFF for MoE makes Q4 use
+/// the proven-correct Q8 path. Q8 is inert to this flag (+0.4% noise) and BF16
+/// skips the Q-port path, so MoE-gating OFF only trades the Q4 +11.7% decode
+/// speedup for correct math — a correctness-first choice. The earlier "Q4 COH
+/// both ON/OFF" note was a measurement gap (assessed on non-arithmetic prompts
+/// where the drift is harmless). Operators may force the fast path back ON with
+/// `LUMEN_CUDA_MMV_Q_MOE_DP4A=1`; dense models are unaffected (path is MoE-only).
 pub(crate) fn mmv_q_moe_dp4a_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
-        std::env::var("LUMEN_CUDA_MMV_Q_MOE_DP4A")
-            .ok()
-            .as_deref()
-            .map(|v| !matches!(v, "0" | "false" | "no"))
-            .unwrap_or(true)
+        match std::env::var("LUMEN_CUDA_MMV_Q_MOE_DP4A").ok().as_deref() {
+            Some(v) => !matches!(v, "0" | "false" | "no"),
+            // MoE: default OFF (route Q4 experts through the V3 F16-accum
+            // kernel that Q8 uses → correct math). Non-MoE: the dp4a MoE path
+            // is never reached, so the value is inert; keep the historical ON.
+            None => !crate::runtime_defaults::model_is_moe(),
+        }
     })
 }
 
@@ -379,6 +393,45 @@ pub(crate) fn moe_bf16_v3_enabled() -> bool {
             // default ON (no-op on dense / Q8 / Q4 models).
             None => crate::runtime_defaults::bf16_moe_v3_default(),
         }
+    })
+}
+
+/// === WHOLE-DECODE-F32 bf16 expert-FFN / lm_head exactness (MoE-gated) ===
+/// Resolves `LUMEN_CUDA_MOE_DECODE_F32_FFN`. Unset → OFF; AND-gated on
+/// `model_is_moe()` so DENSE models stay byte-identical regardless of the env.
+///
+/// **Why this exists.** `LUMEN_CUDA_MOE_DECODE_F32` already forces every bf16
+/// DECODE PROJECTION (full-attn QKV+O, GDN qkv/gate) onto the F32-exact
+/// `matvec_bf16` kernel. By source inspection the bf16 EXPERT-FFN
+/// (`moe_batched_bf16.cu`) and the default bf16 lm_head (`mul_mat_vec_f_bf16.cu`)
+/// are ALREADY F32-exact (lossless `bits<<16` upcast + F32 accumulate), and the
+/// prefill MoE FFN reuses the SAME `encode_moe_ffn_decode` per token — so the
+/// expert-FFN decode is byte-identical to prefill by construction. The only two
+/// residual numeric DIFFERENCES vs the per-token prefill reference are
+/// reassociation-order:
+///   (a) the bf16 expert-FFN V3/V1 batched kernels use a warp-tree reduction
+///       (sub-1e-6 reorder vs the per-expert linear-accumulation reference), and
+///   (b) the default lm_head `mul_mat_vec_f_bf16` uses a 128-thread block-strided
+///       reduction (different order than the single-block `matvec_bf16`).
+/// This flag drives the WHOLE bf16 decode forward to the SIMPLEST, linear,
+/// reference-order F32 path: the bf16 expert-FFN takes the PER-EXPERT reference
+/// kernels (`moe_expert_gate_up_swiglu_bf16` + `moe_expert_down_bf16`, scalar
+/// linear accumulation) and the lm_head takes the gated `matvec_bf16` wrapper
+/// (single-block linear accumulation). It is the airtight test of the precision
+/// hypothesis: if bf16 is STILL not pristine with the ENTIRE decode forward in
+/// linear-order F32, precision is DEFINITIVELY ruled out and the remaining
+/// "10246"/digit-split garble is a genuine algorithmic decode-vs-prefill
+/// difference (the GDN single-token recurrence). OFF is byte-identical to
+/// history. Read per-layer per-token; cached via OnceLock.
+pub(crate) fn moe_decode_f32_ffn_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        crate::runtime_defaults::model_is_moe()
+            && matches!(
+                std::env::var("LUMEN_CUDA_MOE_DECODE_F32_FFN").ok().as_deref(),
+                Some("1" | "true" | "yes")
+            )
     })
 }
 
@@ -2491,7 +2544,16 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
     // V3 three-launch structure: gate_up_v3 -> down_v3 (per-expert outputs) ->
     // moe_expert_accum_option_a. F32 activation preserved (P3-coherent). Opt-in
     // `LUMEN_CUDA_BF16_MOE_V3=1`; default OFF (byte-identical baseline).
-    let use_bf16_v3 = moe_bf16_v3_enabled()
+    //
+    // WHOLE-DECODE-F32 (LUMEN_CUDA_MOE_DECODE_F32_FFN): force the simplest
+    // PER-EXPERT reference path (scalar linear accumulation) by suppressing both
+    // the V3 cooperative and the V1 batched paths below. This removes the
+    // warp-tree reassociation so the bf16 expert-FFN decode matches the
+    // per-token prefill reference order exactly (airtight precision test).
+    // OFF = byte-identical to history (the `&&` short-circuits on the env miss).
+    let force_ref_ffn = moe_decode_f32_ffn_enabled();
+    let use_bf16_v3 = !force_ref_ffn
+        && moe_bf16_v3_enabled()
         && batched_offsets.is_some()
         && kernels.moe_batched_gate_up_swiglu_bf16_v3.is_some()
         && kernels.moe_batched_down_bf16_v3.is_some()
@@ -2601,7 +2663,9 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
     }
 
     // ---- batched dispatch (when opt-in + kernels + offsets present ----
-    let use_batched_bf16 = moe_batched_enabled()
+    // (suppressed under MOE_DECODE_F32_FFN so the per-expert reference path runs.)
+    let use_batched_bf16 = !force_ref_ffn
+        && moe_batched_enabled()
         && batched_offsets.is_some()
         && kernels.moe_batched_gate_up_swiglu_bf16.is_some()
         && kernels.moe_batched_down_accum_bf16.is_some();
