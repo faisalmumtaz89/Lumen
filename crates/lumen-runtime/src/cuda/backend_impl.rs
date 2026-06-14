@@ -887,6 +887,12 @@ struct MutableState {
     /// (used in `prefill_moe_ffn_layer`) and `cudarc::CudaSlice<u64>` is not
     /// `Clone`.
     moe_batched_offsets: Vec<Option<super::moe::CudaMoeBatchedOffsets>>,
+    /// Per-layer REPACKED aligned down-weight planes for the fast-down
+    /// (and IMMA) kernels. `Some(_)` iff the layer is MoE AND
+    /// `moe_down_fast_bn128_enabled()` (the gate that justifies the ~738 MB/layer
+    /// cost). Built at preload after the layer blob upload. `None` otherwise (the
+    /// default f32act/per-column down path needs no repack). Empty for dense.
+    moe_repacked: Vec<Option<super::moe::CudaMoeRepacked>>,
 
     // split-layout integration::
     // env-var flags read once at session start. All default to OFF so the
@@ -1158,6 +1164,52 @@ fn gdn_f64_accum_enabled() -> bool {
     *CACHED.get_or_init(|| {
         parse_env_truthy("LUMEN_CUDA_GDN_F64_ACCUM")
             .unwrap_or_else(crate::runtime_defaults::gdn_f64_accum_default)
+    })
+}
+
+/// PREFILL-SCOPED F64 gate for the GDN batched prefill scan
+/// (`gdn_prefill_fused_v3` + `l2_normalize_qk_strided` + `gdn_prefill_norm_gate`).
+///
+/// Historically the batched MoE PREFILL scan ran the F64 accumulator twins by
+/// default (`gdn_f64_accum_enabled() == model_is_moe()`).
+/// The F64 prefill scan is ~2× slower (F64 ops at half rate on A100) AND its
+/// kernel is NOT 4×-unrolled (the F32 twin is), so the F64 path costs the floor
+/// ~22 ms / 1334-tok prefill (floor 544.8→522.4 ms, +4.3%). Runtime-validated:
+/// the F32 prefill scan is GQ-PRISTINE ×3 (15/15·8/8·3/3)
+/// and the 17×23 router canary stays EXACT — the 256-expert top-K selection
+/// is robust to the F32-ULP drift in the prefill scan output. The F64 was added
+/// for *decode-vs-prefill* h_state parity; the MoE default single-token DECODE
+/// path is the F32 megakernel (see `gdn_decode_megakernel`), so the prefill F64
+/// was a one-sided cost. This gate is DELIBERATELY DECOUPLED from
+/// `gdn_f64_accum_enabled()` (decode + the decode-graph coupling keep that): it
+/// only governs the batched prefill scan precision.
+///
+/// Default: F32 (returns `false`) for MoE — the validated floor win.
+/// Override: `LUMEN_CUDA_GDN_PREFILL_F64=1` restores the F64 prefill scan;
+/// an explicit `LUMEN_CUDA_GDN_F64_ACCUM=0|1` also governs the prefill scan
+/// (preserving the documented global override for every model class).
+fn gdn_prefill_f64_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        // The prefill-scoped flag wins outright when set.
+        if let Some(v) = parse_env_truthy("LUMEN_CUDA_GDN_PREFILL_F64") {
+            return v;
+        }
+        // An EXPLICIT global `LUMEN_CUDA_GDN_F64_ACCUM=0|1` still governs the
+        // prefill scan too (preserves the documented global override semantics
+        // for every model class, MoE and non-MoE alike).
+        if let Some(v) = parse_env_truthy("LUMEN_CUDA_GDN_F64_ACCUM") {
+            return v;
+        }
+        // No env set → MoE defaults to F32 prefill scan (the PRISTINE-validated
+        // floor win). NON-MoE models keep their prior GDN
+        // accumulator default (e.g. dense-bf16's decode repetition-attractor
+        // F64) — only the MoE prefill scan was floor-validated here, so non-MoE
+        // behaviour is byte-unchanged.
+        if crate::runtime_defaults::model_is_moe() {
+            return false;
+        }
+        crate::runtime_defaults::gdn_f64_accum_default()
     })
 }
 
@@ -6259,6 +6311,34 @@ impl CudaBackend {
                 "prefill_gdn_layer: layer {layer_idx} is not a GDN layer",
             )))?;
 
+        // GDN sub-stage timing (diagnostic, no-op when unset). When
+        // LUMEN_CUDA_GDN_SUBSTAGE_TIMING=1, syncs at phase boundaries and
+        // prints per-substage ms for layer 0 (projections vs conv/l2/gates vs
+        // scan-v3 vs norm-gate). Localizes WHICH GDN substage dominates and why
+        // MoE GDN is slower per-layer than dense. Byte-identical output.
+        let gdn_sub_timing = {
+            use std::sync::OnceLock;
+            static GS: OnceLock<bool> = OnceLock::new();
+            *GS.get_or_init(|| {
+                std::env::var("LUMEN_CUDA_GDN_SUBSTAGE_TIMING").as_deref() == Ok("1")
+            })
+        } && layer_idx == 0;
+        macro_rules! gdn_sub_ms {
+            ($t0:expr, $name:expr) => {{
+                if gdn_sub_timing {
+                    self.device.synchronize()?;
+                    let ms = $t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!(
+                        "[GDN-SUBSTAGE] L0 {:<16} {ms:>8.3} ms  (batch={batch}, \
+                         num_v_heads={}, value_dim={}, qkv_dim={})",
+                        $name, p.num_heads, p.value_dim, p.qkv_dim,
+                    );
+                    $t0 = std::time::Instant::now();
+                }
+            }};
+        }
+        let mut _gsub_t = std::time::Instant::now();
+
         // ================================================================
         // PHASE 1: Batched projections across all T tokens
         // ================================================================
@@ -6418,6 +6498,8 @@ impl CudaBackend {
                 )?;
             }
         }
+
+        gdn_sub_ms!(_gsub_t, "phase1_proj");
 
         // [GDNPROJSS] PREFILL GDN projection-output whole-buffer sumsq per
         // position (env LUMEN_MOE_PROBE=1, default OFF -> byte-identical).
@@ -6638,7 +6720,11 @@ impl CudaBackend {
             // When ON: route l2_normalize_qk_strided + gdn_prefill_fused_v3 +
             // gdn_prefill_norm_gate to the F64 variants. Note shared-mem size
             // doubles for the f64 variants (double = 8 bytes vs float = 4).
-            let use_prefill_f64 = gdn_f64_accum_enabled()
+            //
+            // Use the PREFILL-SCOPED gate (default F32 for MoE, the validated
+            // floor win) — decoupled from the global decode F64
+            // (`gdn_f64_accum_enabled()`). See `gdn_prefill_f64_enabled`.
+            let use_prefill_f64 = gdn_prefill_f64_enabled()
                 && st.kernels.l2_normalize_qk_strided_f64accum.is_some()
                 && st.kernels.gdn_prefill_fused_v3_f64accum.is_some()
                 && st.kernels.gdn_prefill_norm_gate_f64accum.is_some();
@@ -6706,6 +6792,8 @@ impl CudaBackend {
                     eprintln!("[gdn-dump] L{layer_idx} conv_l2norm shape=[{batch}, {}] -> {path}", p.qkv_dim);
                 }
             }
+
+            gdn_sub_ms!(_gsub_t, "phase2_conv_l2");
 
             // 4. gdn_prefill_fused_v3: warp-parallel fused state update
             // Grid: (val_dim, num_heads), Block: (32, 1, 1)
@@ -6782,6 +6870,8 @@ impl CudaBackend {
                     }
                 }
             }
+
+            gdn_sub_ms!(_gsub_t, "scan_v3");
 
             // 5. gdn_prefill_norm_gate: batched RMSNorm + SiLU gate on raw output
             // Grid: (num_heads, T_chunk, 1), Block: (val_dim)
@@ -7046,6 +7136,8 @@ impl CudaBackend {
             }
         }
 
+        gdn_sub_ms!(_gsub_t, "norm_gate");
+
         // ================================================================
         // PHASE 3: Batched SSM out GEMM + residual
         // ================================================================
@@ -7152,6 +7244,8 @@ impl CudaBackend {
                     RuntimeError::Compute(format!("dtod x<-attn_proj GDN prefill L{layer_idx}: {e}"))
                 })?;
         }
+
+        gdn_sub_ms!(_gsub_t, "phase3_out_gemm");
 
         Ok(())
     }
@@ -7286,15 +7380,175 @@ impl CudaBackend {
             .get(layer_idx)
             .and_then(|b| b.as_ref());
 
+        // Disjoint borrow of the repacked down planes (same NLL
+        // pattern as batched_offsets — disjoint from st.kernels/&st.moe_scratch).
+        let repacked = st
+            .moe_repacked
+            .get(layer_idx)
+            .and_then(|r| r.as_ref());
+
         let moe_scratch = st.moe_scratch.as_mut().ok_or_else(|| {
             RuntimeError::Compute(
                 "MoE prefill requires moe_scratch (allocated in init for MoE models)".into(),
             )
         })?;
 
+        // ---- Batched/grouped routed-FFN path. ----
+        //
+        // When `LUMEN_CUDA_MOE_PREFILL_BATCHED=1` AND the experts are Q8_0 AND
+        // the grouped kernels are loaded, replace the per-token routed-FFN loop
+        // with a single grouped dispatch over all `batch` tokens (weights read
+        // once per expert). The SHARED expert is still run per-token below
+        // (byte-identical to the legacy path); only the routed expert FFN is
+        // batched. Result `pf.x = residual + Σ routed`, bit-identical to the
+        // per-token oracle, validated via the `[CHK]` x_sumsq dump.
+        // Q8_0: batched/grouped tiled path. Q4_0: grouped
+        // f32act tiled path (REQUIRES the parent tiled flag + the q4 f32act tiled
+        // kernels; there is no q4 per-column grouped fallback, so q4 engages only
+        // when `moe_grouped_tiled_enabled()` AND the q4 kernels loaded AND the
+        // Qwen3.5-MoE shapes are tiled-compatible — else it stays on the per-token
+        // loop). bf16 uses its own grouped tiled f32act path.
+        let q8_routed = moe_meta.expert_gate_quant == QuantScheme::Q8_0
+            && moe_meta.expert_down_quant == QuantScheme::Q8_0
+            && st.kernels.moe_grouped_gate_up_swiglu_q8_0.is_some()
+            && st.kernels.moe_grouped_down_q8_0.is_some();
+        let q4_routed = moe_meta.expert_gate_quant == QuantScheme::Q4_0
+            && moe_meta.expert_down_quant == QuantScheme::Q4_0
+            && super::moe::moe_grouped_tiled_enabled()
+            && st.kernels.moe_grouped_gate_up_swiglu_q4_0_tiled_f32act.is_some()
+            && st.kernels.moe_grouped_down_q4_0_tiled_f32act.is_some()
+            && hidden_dim % 256 == 0
+            && inter_dim % 32 == 0;
+        let bf16_routed = moe_meta.expert_gate_quant == QuantScheme::Bf16
+            && moe_meta.expert_down_quant == QuantScheme::Bf16
+            && super::moe::moe_grouped_tiled_enabled()
+            && st.kernels.moe_grouped_gate_up_swiglu_bf16_tiled_f32act.is_some()
+            && st.kernels.moe_grouped_down_bf16_tiled_f32act.is_some()
+            && hidden_dim % 256 == 0
+            && inter_dim % 16 == 0;
+        let use_batched_routed = super::moe::moe_prefill_batched_enabled()
+            && (q8_routed || q4_routed || bf16_routed)
+            && batched_offsets.is_some()
+            && st.kernels.moe_router_logits_batched.is_some()
+            && st.kernels.moe_grouped_scatter_accum_q8_0.is_some()
+            && super::moe::topk_moe_fused_kernel_for(&st.kernels, num_experts).is_some();
+
+        // Diagnostic (no-op unless set; PRODUCES GARBAGE OUTPUT — profiling only):
+        // skip the grouped routed FFN to measure the non-routed-FFN prefill floor
+        // (attention + GDN + router + norm + shared). Quantifies whether the
+        // remaining gap to 0.9× LC is the routed grouped GEMM
+        // or attention/GDN.
+        let skip_routed_diag = {
+            use std::sync::OnceLock;
+            static SR: OnceLock<bool> = OnceLock::new();
+            *SR.get_or_init(|| std::env::var("LUMEN_CUDA_MOE_SKIP_ROUTED").as_deref() == Ok("1"))
+        };
+        if use_batched_routed && !skip_routed_diag {
+            // Engagement probe (no-op unless LUMEN_MOE_PROBE=1): definitively
+            // proves the batched/grouped routed-FFN path ran for this layer.
+            if {
+                use std::sync::OnceLock;
+                static BP: OnceLock<bool> = OnceLock::new();
+                *BP.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
+            } {
+                eprintln!(
+                    "[BATCHED-ROUTED] layer={layer_idx} batch={batch} top_k={top_k} \
+                     num_experts={num_experts} engaged=1"
+                );
+            }
+            super::moe::encode_moe_ffn_prefill_grouped(
+                &self.device,
+                &st.kernels,
+                moe_scratch,
+                &moe_meta,
+                batched_offsets,
+                repacked,
+                &moe_layer_blob,
+                &pf.normed,
+                &pf.attn_proj,
+                &mut pf.x,
+                batch,
+                hidden_dim,
+                inter_dim,
+                num_experts,
+                top_k,
+            )?;
+        }
+
+        // Batched SHARED-expert FFN (replaces the per-token shared loop).
+        // Engages only on the batched-routed path AND when the batched shared
+        // kernels are loaded AND the shared expert is present. Bit-identical to
+        // the per-token unfused shared path. Skipped by LUMEN_CUDA_SKIP_SHARED_EXPERT.
+        let skip_shared_pf = std::env::var("LUMEN_CUDA_SKIP_SHARED_EXPERT")
+            .ok()
+            .as_deref()
+            .map(|v| matches!(v, "1" | "true" | "yes"))
+            .unwrap_or(false);
+        // The batched shared-expert kernels are Q4_0-only (the shared expert is Q4_0
+        // in q8/q4 models). Guard on the shared gate's quant so a model whose shared
+        // expert is NOT Q4_0 (e.g. a hypothetical bf16 shared) falls back to the
+        // per-token shared path instead of erroring out of the batched dispatch.
+        let shared_is_q4 = moe_meta
+            .shared_gate
+            .as_ref()
+            .map(|s| s.quant == QuantScheme::Q4_0)
+            .unwrap_or(false);
+        let use_batched_shared = use_batched_routed
+            && !skip_shared_pf
+            && shared_is_q4
+            && st.kernels.shared_glu_gemv_q4_0_batched.is_some()
+            && st.kernels.shared_dot_f32_batched.is_some()
+            && st.kernels.shared_down_q4_0_sigmoid_accum_batched.is_some()
+            && st.kernels.shared_down_q4_0_residual_accum_batched.is_some();
+        if use_batched_shared {
+            super::moe::encode_shared_expert_ffn_prefill_batched(
+                &self.device,
+                &st.kernels,
+                moe_scratch,
+                &moe_meta,
+                &moe_layer_blob,
+                &pf.normed,
+                &mut pf.x,
+                batch,
+                hidden_dim,
+            )?;
+        }
+
         for t in 0..batch {
+            // In the batched-routed path, the routed FFN is already done above;
+            // this loop runs ONLY the shared expert per token (UNLESS the batched
+            // shared path handled it). Otherwise it runs the legacy per-token
+            // routed dispatch then the shared expert.
             let off = t * hidden_dim;
             let end = off + hidden_dim;
+            if use_batched_routed {
+                // If the batched shared expert ran, nothing left to do per token.
+                if use_batched_shared {
+                    continue;
+                }
+                // Skip the per-token routed dispatch + its probes; jump to the
+                // shared-expert block below using the same (off,end) slices.
+                if moe_meta.shared_gate.is_some() && !skip_shared_pf {
+                    let normed_view2 = pf.normed.slice(off..end);
+                    let mut output_view2 = pf.x.slice_mut(off..end);
+                    let use_fused = super::moe::moe_shared_fused_enabled()
+                        && st.kernels.fused_glu_gemv_q4_0_prenormed_no_norm.is_some()
+                        && st.kernels.moe_shared_down_q4_0_sigmoid_accum.is_some()
+                        && st.kernels.moe_shared_down_q4_0_residual_accum.is_some();
+                    if use_fused {
+                        super::moe::encode_shared_expert_ffn_decode_fused(
+                            &self.device, &st.kernels, moe_scratch, &moe_meta,
+                            &moe_layer_blob, &normed_view2, &mut output_view2, hidden_dim,
+                        )?;
+                    } else {
+                        super::moe::encode_shared_expert_ffn_decode(
+                            &self.device, &st.kernels, moe_scratch, &moe_meta,
+                            &moe_layer_blob, &normed_view2, &mut output_view2, hidden_dim,
+                        )?;
+                    }
+                }
+                continue;
+            }
             let normed_view = pf.normed.slice(off..end);
             let residual_view = pf.attn_proj.slice(off..end);
             let mut output_view = pf.x.slice_mut(off..end);
@@ -14697,6 +14951,9 @@ impl ComputeBackend for CudaBackend {
         // before indexing (mirrored alongside moe_meta_cache).
         let moe_batched_offsets: Vec<Option<super::moe::CudaMoeBatchedOffsets>> =
             (0..num_layers).map(|_| None).collect();
+        // Per-layer repacked down planes (gated, built at preload).
+        let moe_repacked: Vec<Option<super::moe::CudaMoeRepacked>> =
+            (0..num_layers).map(|_| None).collect();
 
         *self.state.lock().unwrap() = Some(MutableState {
             kernels,
@@ -14720,6 +14977,7 @@ impl ComputeBackend for CudaBackend {
             moe_scratch,
             moe_meta_cache,
             moe_batched_offsets,
+            moe_repacked,
             use_q8_scale_hw,
             use_q8_split,
             use_q4_split,
@@ -16011,21 +16269,55 @@ impl ComputeBackend for CudaBackend {
             )?;
         }
 
+        // PREFILL STAGE TIMING (diagnostic, no-op when unset). When
+        // LUMEN_CUDA_PREFILL_STAGE_TIMING=1, the layer loop synchronizes the
+        // device around each stage class (GDN layer, full-attn block, FFN) and
+        // accumulates wall-clock ms per class, printed once on prefill exit.
+        // Purely produces evidence (added syncs perturb timing but localize the
+        // floor cost between GDN vs full-attn vs FFN). Byte-identical output.
+        let stage_timing = {
+            use std::sync::OnceLock;
+            static ST: OnceLock<bool> = OnceLock::new();
+            *ST.get_or_init(|| {
+                std::env::var("LUMEN_CUDA_PREFILL_STAGE_TIMING").as_deref() == Ok("1")
+            })
+        };
+        let mut stage_ms: std::collections::BTreeMap<&'static str, f64> =
+            std::collections::BTreeMap::new();
+        // Helper: when timing, sync + return elapsed ms since `t0`; else 0.0.
+        macro_rules! stage_sync_ms {
+            ($t0:expr) => {{
+                if stage_timing {
+                    self.device.synchronize()?;
+                    $t0.elapsed().as_secs_f64() * 1000.0
+                } else {
+                    0.0
+                }
+            }};
+        }
+
         // Step 2: Process all layers with batched GEMM for projections.
         for layer_idx in 0..num_layers {
             let lw = &st.layer_weights_cache[layer_idx];
 
             // ---- GDN LAYER: batched projections + sequential state update ----
             if lw.layer_type == 1 {
+                let _t0 = std::time::Instant::now();
                 self.prefill_gdn_layer(
                     layer_idx, batch, st, &mut pf,
                     gdn_pf.as_mut().unwrap(),
                     eps,
                 )?;
+                if stage_timing {
+                    *stage_ms.entry("gdn_layer").or_default() += stage_sync_ms!(_t0);
+                }
                 continue;
             }
 
             // ---- STANDARD ATTENTION LAYER ----
+
+            // Stage-timing: mark start of attention portion (qkv proj + attn + wo).
+            let _t_attn = std::time::Instant::now();
 
             // 2a. Batched RMSNorm for QKV projections (always F32 path for precision).
             unsafe {
@@ -16386,6 +16678,12 @@ impl ComputeBackend for CudaBackend {
                     )?;
                 }
 
+                // Stage-timing: attention portion done; FFN begins.
+                if stage_timing {
+                    *stage_ms.entry("full_attn").or_default() += stage_sync_ms!(_t_attn);
+                }
+                let _t_ffn = std::time::Instant::now();
+
                 // 2g-2j. FFN (same as standard path) — MoE branch OR
                 // dense. See `prefill_moe_ffn_layer` doc-comment for context.
                 let is_moe_layer = lw.moe_layer_blob.is_some();
@@ -16438,6 +16736,9 @@ impl ComputeBackend for CudaBackend {
                         .stream
                         .memcpy_dtod(&pf.attn_proj, &mut pf.x)
                         .map_err(|e| RuntimeError::Compute(format!("dtod x<-attn_proj qgate prefill: {e}")))?;
+                }
+                if stage_timing {
+                    *stage_ms.entry("ffn").or_default() += stage_sync_ms!(_t_ffn);
                 }
                 continue; // Skip the standard path below
             }
@@ -16627,6 +16928,12 @@ impl ComputeBackend for CudaBackend {
                 )?;
             }
 
+            // Stage-timing: attention portion done; FFN begins (standard path).
+            if stage_timing {
+                *stage_ms.entry("full_attn").or_default() += stage_sync_ms!(_t_attn);
+            }
+            let _t_ffn = std::time::Instant::now();
+
             // 2g-2j. FFN — MoE branch OR dense.
             //
             // See `prefill_moe_ffn_layer` doc-comment for the design-gap
@@ -16694,6 +17001,29 @@ impl ComputeBackend for CudaBackend {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("dtod x<-attn_proj prefill: {e}"))
                     })?;
+            }
+            if stage_timing {
+                *stage_ms.entry("ffn").or_default() += stage_sync_ms!(_t_ffn);
+            }
+        }
+
+        // Stage-timing summary (diagnostic). Printed once per prefill when
+        // LUMEN_CUDA_PREFILL_STAGE_TIMING=1. ms totals are over all layers;
+        // per-token = total / batch. Localizes the prefill floor across the
+        // GDN / full-attn / FFN stage classes.
+        if stage_timing {
+            let total: f64 = stage_ms.values().sum();
+            eprintln!(
+                "[PREFILL-STAGE-TIMING] batch={batch} num_layers={num_layers} \
+                 total_ms={total:.2}"
+            );
+            for (name, ms) in &stage_ms {
+                eprintln!(
+                    "[PREFILL-STAGE-TIMING]   {name:<12} {ms:>9.2} ms  \
+                     {:>5.1}%  {:>7.4} ms/tok",
+                    100.0 * ms / total.max(1e-9),
+                    ms / batch as f64,
+                );
             }
         }
 
@@ -16775,6 +17105,55 @@ impl ComputeBackend for CudaBackend {
                 }
             }
             let gpu_weights = upload_layer_weights(&self.device, &layer_view, &hp_copy)?;
+
+            // Build the REPACKED aligned down-weight planes for the
+            // fast-down kernel. Gated by `LUMEN_CUDA_MOE_DOWN_FAST_BN128` (the
+            // planes cost ~738 MB/layer, so only allocate when the path is on).
+            // Runs AFTER upload so the GPU blob exists; reads the raw Q8_0 down
+            // blocks via the `moe_repack_down_q8_0` kernel into aligned d_q/d_s.
+            // Leaves the original blob byte-untouched.
+            if super::moe::moe_repack_needed()
+                && layer_idx < st.moe_meta_cache.len()
+            {
+                if let Some(meta_ref) = st.moe_meta_cache[layer_idx].as_ref() {
+                    let num_experts = meta_ref.expert_down_offs.len();
+                    let hidden_dim = hp_copy.hidden_dim as usize;
+                    let inter_dim = hp_copy.intermediate_dim as usize;
+                    let build_down = super::moe::moe_down_fast_bn128_enabled();
+                    // The wide-M gate+up path shares the IMMA gu_q/gu_s repacked planes.
+                    let build_gate_up = super::moe::moe_gate_up_imma_enabled()
+                        || super::moe::moe_gate_up_w10_enabled();
+                    let repack_fn = st.kernels.moe_repack_down_q8_0.as_ref();
+                    let repack_gu_fn = st.kernels.moe_repack_gate_up_q8_0.as_ref();
+                    let offs = st.moe_batched_offsets[layer_idx].as_ref();
+                    if let (Some(repack_fn), Some(offs), Some(blob)) =
+                        (repack_fn, offs, gpu_weights.moe_layer_blob.as_ref())
+                    {
+                        let rp = super::moe::build_repacked_down(
+                            &self.device,
+                            repack_fn,
+                            repack_gu_fn,
+                            blob,
+                            &offs.down_offsets,
+                            &offs.gate_up_offsets,
+                            num_experts,
+                            hidden_dim,
+                            inter_dim,
+                            build_down,
+                            build_gate_up,
+                        )?;
+                        st.moe_repacked[layer_idx] = Some(rp);
+                        if layer_idx == 0 {
+                            eprintln!(
+                                "[CUDA] W-infra: repacked planes built (layer 0: \
+                                 E={num_experts} H={hidden_dim} I={inter_dim} \
+                                 down={build_down} gate_up={build_gate_up})"
+                            );
+                        }
+                    }
+                }
+            }
+
             cache.push(gpu_weights);
             // Print every 4 layers to avoid log flooding while still catching OOM zones.
             if (layer_idx + 1) % 4 == 0 || layer_idx + 1 == num_layers {

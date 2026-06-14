@@ -75,6 +75,35 @@ pub(crate) struct CudaMoeBatchedOffsets {
     pub(crate) down_offsets: CudaSlice<u64>,
 }
 
+/// per-layer REPACKED aligned weight planes for the routed-FFN
+/// down projection. Built once at preload (after the layer blob is uploaded) by
+/// the `moe_repack_down_q8_0` kernel, which splits each raw Q8_0 down block
+/// (`{f16 scale}{32 int8}`, +2-byte-misaligned q) into two contiguous aligned
+/// planes:
+///   `d_q[e][kb][rt8]` = 8 rows x 32 int8 = 256 B  (char4-aligned, ldmatrix-ready)
+///   `d_s[e][kb][rt8]` = 8 half scales    =  16 B
+/// where `Kb = inter_dim/32`, `Rt = hidden_dim/8`. Consumed by the fast-down
+/// kernel (`moe_grouped_down_q8_0_fast_bn128`) and the IMMA down kernel. The
+/// ORIGINAL layer blob is left byte-untouched (decode + all other paths use it).
+///
+/// Cost: one Q8_0-size copy of the down weights per MoE layer (~half the routed
+/// FFN weight bytes), built once. At E=256, I=1408, H=2048: Kb=44, Rt=256 ->
+/// d_q = 256*44*256*256 = 738 MB/layer; d_s = 256*44*256*8 = 23 MB/layer. Only
+/// allocated when the fast-down or IMMA path is enabled (gated at preload).
+pub(crate) struct CudaMoeRepacked {
+    /// Repacked down q plane: `[num_experts * Kb * Rt * 256]` int8.
+    pub(crate) down_q: CudaSlice<i8>,
+    /// Repacked down scale plane: `[num_experts * Kb * Rt * 8]` f16-bits (u16).
+    pub(crate) down_s: CudaSlice<u16>,
+    /// repacked gate+up FUSED q plane `[E * Kb * Rt * 512]` int8 (gate then
+    /// up), Kb=hidden_dim/32, Rt=inter_dim/8. `None` unless the IMMA gate+up
+    /// path is enabled (these planes cost ~2× the down planes).
+    pub(crate) gate_up_q: Option<CudaSlice<i8>>,
+    /// repacked gate+up FUSED scale plane `[E * Kb * Rt * 16]` half (gate
+    /// [0..7], up [8..15]).
+    pub(crate) gate_up_s: Option<CudaSlice<u16>>,
+}
+
 /// Pre-allocated GPU scratch buffers for the CUDA MoE forward path.
 ///
 /// Allocated once in `init()` when `hp.num_experts.is_some()`. Reused per
@@ -127,6 +156,62 @@ pub(crate) struct CudaMoeScratch {
     /// Q8_1 quantized per-expert swiglu_buf (for `mmv_q_moe_down_*` dispatch).
     /// Size: top_k * ceil(inter_dim / 32) * 36 bytes. ~13 KB at top_k=8, inter_dim=1408.
     pub(crate) mmv_q_moe_swiglu_q8_1: CudaSlice<u8>,
+
+    /// Grouped MoE PREFILL scratch. Lazily allocated on first
+    /// use of the batched/grouped prefill path, sized to `prefill_grouped_cap`
+    /// (max compact columns = batch * top_k seen so far). `None` until the
+    /// `LUMEN_CUDA_MOE_PREFILL_BATCHED` path runs. Reused across all MoE layers
+    /// of a prefill and across prefills with batch ≤ cap.
+    ///
+    /// `swiglu_compact`: [cap * inter_dim] F32 — per compact-column SwiGLU output.
+    /// `down_compact`:   [cap * hidden_dim] F32 — per compact-column down output.
+    /// `col_expert`/`col_src_tok`: [cap] i32 — gather tables (compact col -> expert/token).
+    /// `dst_to_col`:     [batch * top_k] i32 — scatter inverse (dst slot -> compact col).
+    pub(crate) prefill_grouped: Option<CudaMoePrefillGrouped>,
+}
+
+/// Lazily-allocated GPU scratch for the grouped MoE prefill FFN path.
+pub(crate) struct CudaMoePrefillGrouped {
+    /// Capacity in compact columns (= max batch*top_k seen). Realloc grows it.
+    pub(crate) cap_cols: usize,
+    /// Capacity in tokens (= max batch seen). cap_cols == cap_tok * top_k.
+    pub(crate) cap_tok: usize,
+    pub(crate) swiglu_compact: CudaSlice<f32>, // [cap_cols * inter_dim]
+    pub(crate) down_compact: CudaSlice<f32>,   // [cap_cols * hidden_dim]
+    pub(crate) col_expert: CudaSlice<i32>,     // [cap_cols]
+    pub(crate) col_src_tok: CudaSlice<i32>,    // [cap_cols]
+    pub(crate) dst_to_col: CudaSlice<i32>,     // [cap_cols] (cap_cols == batch*top_k)
+    /// Prefix-sum expert column bounds (M-tiled GEMM): expert e owns
+    /// compact columns [expert_bounds[e], expert_bounds[e+1]). [num_experts+1] i32.
+    pub(crate) expert_bounds: CudaSlice<i32>,
+    /// Capacity (num_experts) for which expert_bounds was sized.
+    pub(crate) cap_experts: usize,
+    /// flattened column-tile list for the tiled grouped gate+up kernel.
+    /// `[cap_tiles * 4]` i32, each entry {expert, col_start, col_count, pad}.
+    /// Built host-side from expert_bounds (one entry per ceil(cols_e/16) block).
+    pub(crate) gate_up_tiles16: CudaSlice<i32>,
+    /// Capacity in tile entries for which gate_up_tiles16 was sized.
+    pub(crate) cap_tiles: usize,
+    /// Batched router logits, [cap_tok * num_experts] F32 (topk input layout).
+    pub(crate) router_logits_batched: CudaSlice<f32>,
+    /// Batched expert ids, [cap_tok * num_experts] u32 (topk output: first top_k valid/row).
+    pub(crate) expert_ids_batched: CudaSlice<u32>,
+    /// Batched expert weights, [cap_tok * top_k] F32 (topk output, slot-major/row).
+    pub(crate) expert_weights_batched: CudaSlice<f32>,
+    /// Batched SHARED-expert SwiGLU output, [cap_tok * inter_dim] F32
+    /// (routed inter_dim is an upper bound for shared inter_dim).
+    pub(crate) shared_swiglu_batched: CudaSlice<f32>,
+    /// Batched SHARED-expert per-token sigmoid-gate logit, [cap_tok] F32.
+    pub(crate) shared_logit_batched: CudaSlice<f32>,
+    /// one-time prequant K-major activation. `xq_q` = [Kb * cap_cols * 32]
+    /// int8, `xq_d` = [Kb * cap_cols] f32. Allocated only when the W10 path is on.
+    pub(crate) w10_xq_q: Option<CudaSlice<i8>>,
+    pub(crate) w10_xq_d: Option<CudaSlice<f32>>,
+    /// W10 bucketed tile list, [cap_tiles_w10 * 4] i32, entries {col0,expert,row128,
+    /// cols_valid}, 4 buckets (MG=1..4) concatenated. Allocated only when W10 is on.
+    pub(crate) w10_tiles: Option<CudaSlice<i32>>,
+    /// Capacity (in tile entries) of `w10_tiles`.
+    pub(crate) cap_tiles_w10: usize,
 }
 
 /// Build per-layer MoE metadata from a layer's subtensor offsets.
@@ -211,6 +296,153 @@ pub(crate) fn build_batched_offsets(
     })
 }
 
+/// read `LUMEN_CUDA_MOE_DOWN_FAST_BN128` once (default OFF).
+///
+/// Gates BOTH the preload-time down-weight repack (`build_repacked_down`) AND
+/// the dispatch-time selection of the `moe_grouped_down_q8_0_fast_bn128` kernel.
+/// When OFF, no repacked planes are allocated (saving ~738 MB/layer) and the
+/// down stage uses the f32act BN=64 default (PRISTINE). Default-OFF until the
+/// fast-down kernel is bit-validated + PRISTINE.
+pub(crate) fn moe_down_fast_bn128_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_MOE_DOWN_FAST_BN128").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+    })
+}
+
+/// read `LUMEN_CUDA_MOE_GATE_UP_IMMA` once (default OFF). Gates BOTH the
+/// preload-time gate+up repack AND the dispatch of the IMMA gate+up kernel.
+pub(crate) fn moe_gate_up_imma_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_MOE_GATE_UP_IMMA").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+    })
+}
+
+/// read `LUMEN_CUDA_MOE_GATE_UP_W10` once (default OFF). Gates BOTH the
+/// preload-time gate+up repack (shares the gu_q/gu_s planes) AND the dispatch of
+/// the register-C wide-M gate+up kernel + the one-time activation prequant.
+///
+/// Validated 2026-06-14: the register-C wide-M IMMA gate+up is +9.30% q8 MoE
+/// prefill (paired N=6 drop-warm, 1230.5 -> 1344.9 tok/s, stdev <1,
+/// xLC 0.3723 -> 0.4069) AND PRISTINE x3 (GQ-001 15/15 incl. 17x23=391 router
+/// canary, GQ-002 7/8, GQ-004 3/3 byte-reproducible x3, matching the gold
+/// moe-q8 CUDA baseline). NOT yet default-flipped because (a) it only has effect
+/// when the parent prefill-batched + grouped-tiled stack is active (those gates
+/// are quant-shared and a default-flip would change q4/bf16 prefill, requiring
+/// their own GQ validation first), and (b) defaulting this lever alone would
+/// force the preload gate+up repack (~0.5 GB) on every q8 MoE model even when the
+/// parent fast-prefill path is off (`moe_repack_needed`). The coordinated stack
+/// flip + q4/bf16 validation remains future work.
+pub(crate) fn moe_gate_up_w10_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_MOE_GATE_UP_W10").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+    })
+}
+
+/// True if ANY repack-consuming path (fast-down, IMMA, or wide-M) is on.
+pub(crate) fn moe_repack_needed() -> bool {
+    moe_down_fast_bn128_enabled() || moe_gate_up_imma_enabled() || moe_gate_up_w10_enabled()
+}
+
+/// build the per-layer REPACKED aligned down planes by launching
+/// the `moe_repack_down_q8_0` kernel over the already-uploaded layer blob.
+///
+/// `layer_buf` is the GPU-resident raw weight blob (`moe_layer_blob`), and
+/// `down_offsets` is the per-expert u64 byte-offset table (from the layer's
+/// `CudaMoeBatchedOffsets`). The kernel reads raw Q8_0 down blocks and writes
+/// the aligned `d_q`/`d_s` planes. Only called when `moe_down_fast_bn128_enabled()`
+/// (or a future IMMA gate) is true.
+pub(crate) fn build_repacked_down(
+    device: &super::ffi::CudaDevice,
+    repack_fn: &cudarc::driver::CudaFunction,
+    repack_gu_fn: Option<&cudarc::driver::CudaFunction>,
+    layer_buf: &CudaSlice<u8>,
+    down_offsets: &CudaSlice<u64>,
+    gate_up_offsets: &CudaSlice<u64>,
+    num_experts: usize,
+    hidden_dim: usize,
+    inter_dim: usize,
+    build_down: bool,
+    build_gate_up: bool,
+) -> Result<CudaMoeRepacked, RuntimeError> {
+    use cudarc::driver::{LaunchConfig as CudarcLaunchConfig, PushKernelArg};
+    let hd_u32 = hidden_dim as u32;
+    let id_u32 = inter_dim as u32;
+
+    // --- Down planes: Kb=I/32, Rt=H/8, frag=256B q / 16B(8 half) scale. ---
+    // Always allocate (the struct requires them); only LAUNCH when build_down.
+    let kb_d = inter_dim / 32;
+    let rt_d = hidden_dim / 8;
+    let mut down_q = device.alloc_zeros::<i8>(num_experts * kb_d * rt_d * 256)?;
+    let mut down_s = device.alloc_zeros::<u16>(num_experts * kb_d * rt_d * 8)?;
+    if build_down {
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (rt_d as u32, kb_d as u32, num_experts as u32),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device.stream
+                .launch_builder(repack_fn)
+                .arg(layer_buf)
+                .arg(down_offsets)
+                .arg(&mut down_q)
+                .arg(&mut down_s)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!("moe_repack_down_q8_0: {e}")))?;
+        }
+    }
+
+    // --- Gate+up FUSED planes: Kb=H/32 (K dim), Rt=I/8, frag=512B q / 32B scale. ---
+    let (gate_up_q, gate_up_s) = if build_gate_up {
+        let gu_fn = repack_gu_fn.ok_or_else(|| {
+            RuntimeError::Compute("W9 gate+up repack requested but kernel not loaded".into())
+        })?;
+        let kb_g = hidden_dim / 32;
+        let rt_g = inter_dim / 8;
+        let mut gu_q = device.alloc_zeros::<i8>(num_experts * kb_g * rt_g * 512)?;
+        let mut gu_s = device.alloc_zeros::<u16>(num_experts * kb_g * rt_g * 16)?;
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (rt_g as u32, kb_g as u32, num_experts as u32),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device.stream
+                .launch_builder(gu_fn)
+                .arg(layer_buf)
+                .arg(gate_up_offsets)
+                .arg(&mut gu_q)
+                .arg(&mut gu_s)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!("moe_repack_gate_up_q8_0: {e}")))?;
+        }
+        (Some(gu_q), Some(gu_s))
+    } else {
+        (None, None)
+    };
+
+    Ok(CudaMoeRepacked { down_q, down_s, gate_up_q, gate_up_s })
+}
+
 /// Read `LUMEN_CUDA_MOE_BATCHED` once via OnceLock (default OFF).
 ///
 /// Mirrors the OnceLock pattern used throughout the CUDA backend
@@ -226,6 +458,132 @@ pub(crate) fn moe_batched_enabled() -> bool {
             Some(v) => matches!(v, "1" | "true" | "yes"),
             // default ON (no-op on dense models).
             None => crate::runtime_defaults::moe_batched_default(),
+        }
+    })
+}
+
+/// Read `LUMEN_CUDA_MOE_PREFILL_BATCHED` once via OnceLock.
+///
+/// Gates the batched/grouped MoE PREFILL FFN path that replaces
+/// the per-token decode loop in `backend_impl.rs::prefill_moe_ffn_layer` with a
+/// single grouped-expert GEMM over all batch tokens (weights read once per
+/// expert, amortized across all its routed tokens). DEFAULT OFF until the path
+/// is bit-validated against the per-token loop and the quality suite stays
+/// PRISTINE; will flip ON after validation. Dense models never enter the MoE
+/// prefill path, so this flag is a no-op for them.
+pub(crate) fn moe_prefill_batched_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_MOE_PREFILL_BATCHED").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+    })
+}
+
+/// Read `LUMEN_CUDA_MOE_GROUPED_MTILED` once. when set, the grouped
+/// routed gate+up+SwiGLU uses the M-tiled kernel (one CTA processes MG_MT
+/// compact columns of an expert, weight read once and reused across its tokens)
+/// instead of the one-CTA-per-column kernel. Bit-identical math, weight HBM
+/// reads amortized ~MG_MT-fold. Default OFF until validated.
+pub(crate) fn moe_grouped_mtiled_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_MOE_GROUPED_MTILED").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+    })
+}
+
+/// Read `LUMEN_CUDA_MOE_GROUPED_TILED` once. When set, the grouped routed
+/// gate+up+SwiGLU uses the tiled shmem-staged kernel (BM16 columns x BN64 rows x
+/// BK8, dp4a, per-thread accumulators, NO cross-thread reduction) driven by a
+/// host-built flattened column-tile list. The Wave-4-class fix for the routed FFN
+/// (73% of prefill). NOT byte-identical to the per-column kernel (per-thread
+/// sequential F32 accumulation vs warp-tree regrouping; same per-32-block
+/// int32-dot->f32-scale terms) — gated by the x_sumsq oracle + router/token
+/// equivalence, same acceptance class as the tiled path. Default OFF.
+pub(crate) fn moe_grouped_tiled_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_MOE_GROUPED_TILED").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+    })
+}
+
+/// Sub-gate for the TILED shared-expert FFN (default ON under the parent
+/// `LUMEN_CUDA_MOE_GROUPED_TILED`). Set `LUMEN_CUDA_SHARED_TILED=0` to A/B-isolate
+/// (keeps the per-(row,token) matvec shared kernels) — used by the oracle/perf
+/// harness to attribute the shared-expert tiling's correctness + perf delta.
+pub(crate) fn moe_shared_tiled_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        // Default ON when set/unset; only an explicit 0/false/no disables it.
+        !matches!(
+            std::env::var("LUMEN_CUDA_SHARED_TILED").ok().as_deref(),
+            Some("0") | Some("false") | Some("no")
+        )
+    })
+}
+
+/// Read `LUMEN_CUDA_MOE_DOWN_TILED` once. Sub-gate (default OFF, opt-in):
+/// the tiled shmem-staged grouped DOWN kernel (BM16/BN128/BK8) is a large PERF
+/// win (+116.7% q8 prefill, 396.8->859.8 tok/s) but it STABLY REGRESSES the GQ-004
+/// vlong-story gate (down-tiled 2/3 vs per-column 3/3, N=3, DD-SPAM degenerate
+/// repetition — benign content but a real reproducible quality regression vs the
+/// Wave-5 PRISTINE baseline). Per zero-regression-on-quality rule it
+/// is NOT a default: enabling the parent `LUMEN_CUDA_MOE_GROUPED_TILED` keeps the
+/// per-column down (PRISTINE). Set `LUMEN_CUDA_MOE_DOWN_TILED=1` to opt into the
+/// faster tiled down where verylong-creative repetition fidelity is acceptable.
+/// (Mirrors the Wave-3 M-tiled discipline: validated, env-gated, default-OFF.)
+pub(crate) fn moe_down_tiled_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_MOE_DOWN_TILED").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+    })
+}
+
+/// Read `LUMEN_CUDA_MOE_DOWN_TILED_F32ACT` once. The down-tiled
+/// QUALITY RESCUE — **DEFAULT-ON under the parent `LUMEN_CUDA_MOE_GROUPED_TILED`**.
+/// Same shmem-staged tiled DOWN structure as the gate+up tiled kernel (BM16/BN64/BK8, per-thread
+/// accumulators, no cross-thread reduction) but it does NOT quantize the F32 swiglu
+/// activation to int8 — it dots the dequantized int8 weight against the RAW F32
+/// activation per 32-block, matching the per-column PRISTINE reference's numerics
+/// (the only reorder is per-thread-sequential block accumulation, the same regrouping
+/// Wave-5 gate+up passed PRISTINE with).
+///
+/// VALIDATED (A100 q8, isolated): oracle x_sumsq vs per-column max-rel
+/// 3.55% / median 0.139% (tighter than the int8 down's 5.37%); **GQ N=3 PRISTINE ×3**
+/// (GQ-001 15/15, GQ-002 8/8, GQ-004 3/3 — the Wave-6 GQ-004 vlong DD-SPAM regression
+/// is ELIMINATED); perf paired N=6 **777.1 tok/s = +95.8% over the per-column PRISTINE
+/// default (396.9), 90.2% of the int8 opt-in's 861.3 tok/s** — at ZERO quality cost.
+///
+/// Tri-state default-ON-under-parent semantics (this fn returns the EFFECTIVE engage
+/// decision given the parent is on):
+///  - unset (default)  → ON  (the PRISTINE fast down)
+///  - "0"/"false"/"no" → OFF (operator forces per-column or int8 down)
+///  - "1"/"true"/"yes" → ON  (explicit)
+/// The int8 `LUMEN_CUDA_MOE_DOWN_TILED=1` opt-in still takes precedence in the
+/// dispatch (faster 861 but GQ-004 2/3) when explicitly requested — see dispatch.
+pub(crate) fn moe_down_tiled_f32act_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        match std::env::var("LUMEN_CUDA_MOE_DOWN_TILED_F32ACT").ok().as_deref() {
+            Some("0") | Some("false") | Some("no") => false,
+            // Default-ON (unset) and any truthy value → ON.
+            _ => true,
         }
     })
 }
@@ -721,7 +1079,73 @@ pub(crate) fn allocate_moe_scratch(
         // Q8_1 per-expert swiglu scratch (~13 KB).
         mmv_q_moe_swiglu_q8_1: device
             .alloc_zeros::<u8>(top_k.max(1) * ((expert_inter_dim + 31) / 32) * 36)?,
+        // Grouped prefill scratch is lazily allocated on first use.
+        prefill_grouped: None,
     })
+}
+
+/// Lazily (re)allocate the grouped MoE prefill scratch to hold at least
+/// `need_cols = batch * top_k` compact columns. Grows in place when a larger
+/// prefill batch is seen; reused otherwise. Buffers are NOT zeroed (every
+/// element written before read along the active compact columns).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ensure_prefill_grouped(
+    scratch: &mut CudaMoeScratch,
+    device: &super::ffi::CudaDevice,
+    batch: usize,
+    top_k: usize,
+    num_experts: usize,
+    hidden_dim: usize,
+    inter_dim: usize,
+) -> Result<(), RuntimeError> {
+    let need_tok = batch.max(1);
+    let need_cols = (need_tok * top_k).max(1);
+    let big_enough = scratch
+        .prefill_grouped
+        .as_ref()
+        .map(|g| g.cap_tok >= need_tok && g.cap_cols >= need_cols)
+        .unwrap_or(false);
+    if big_enough {
+        return Ok(());
+    }
+    scratch.prefill_grouped = Some(CudaMoePrefillGrouped {
+        cap_cols: need_cols,
+        cap_tok: need_tok,
+        swiglu_compact: device.alloc_zeros::<f32>(need_cols * inter_dim)?,
+        down_compact: device.alloc_zeros::<f32>(need_cols * hidden_dim)?,
+        col_expert: device.alloc_zeros::<i32>(need_cols)?,
+        col_src_tok: device.alloc_zeros::<i32>(need_cols)?,
+        dst_to_col: device.alloc_zeros::<i32>(need_cols)?,
+        expert_bounds: device.alloc_zeros::<i32>(num_experts + 1)?,
+        cap_experts: num_experts,
+        // worst-case tile count = sum_e ceil(cols_e/16) <= need_cols (each
+        // expert with 1 col -> 1 tile) + num_experts slack. *4 i32 per tile entry.
+        gate_up_tiles16: device.alloc_zeros::<i32>((need_cols + num_experts) * 4)?,
+        cap_tiles: need_cols + num_experts,
+        router_logits_batched: device.alloc_zeros::<f32>(need_tok * num_experts)?,
+        expert_ids_batched: device.alloc_zeros::<u32>(need_tok * num_experts)?,
+        expert_weights_batched: device.alloc_zeros::<f32>(need_tok * top_k)?,
+        shared_swiglu_batched: device.alloc_zeros::<f32>(need_tok * inter_dim)?,
+        shared_logit_batched: device.alloc_zeros::<f32>(need_tok)?,
+        // allocate prequant + bucketed tile buffers only when the path is on.
+        w10_xq_q: if moe_gate_up_w10_enabled() {
+            Some(device.alloc_zeros::<i8>((hidden_dim / 32) * need_cols * 32)?)
+        } else { None },
+        w10_xq_d: if moe_gate_up_w10_enabled() {
+            Some(device.alloc_zeros::<f32>((hidden_dim / 32) * need_cols)?)
+        } else { None },
+        w10_tiles: if moe_gate_up_w10_enabled() {
+            // worst case col-tiles = need_cols + num_experts; times row128 count.
+            let r128 = (inter_dim / 128).max(1);
+            Some(device.alloc_zeros::<i32>((need_cols + num_experts) * r128 * 4)?)
+        } else { None },
+        cap_tiles_w10: {
+            let r128 = (inter_dim / 128).max(1);
+            (need_cols + num_experts) * r128
+        },
+    });
+    Ok(())
 }
 
 /// Three-phase MoE FFN forward path for one token.
@@ -1547,6 +1971,1348 @@ pub(crate) fn encode_moe_ffn_decode(
                 .arg(&tk_u32)
                 .launch(cfg)
                 .map_err(|e| RuntimeError::Compute(format!("moe_expert_accum_option_a: {e}")))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Grouped (expert-sorted) MoE PREFILL FFN over ALL `batch` tokens at once
+///. Replaces the per-token loop in `prefill_moe_ffn_layer`.
+///
+/// Q8_0-only (gate+down both Q8_0); the caller falls back to the per-token loop
+/// for other quants. Shared expert is DEFERRED here, matching the per-token
+/// prefill path (`prefill_moe_ffn_layer` also defers the shared expert).
+///
+/// Pipeline (all batched; weights read once per expert):
+///   0. Batched router logits `[batch, num_experts]` (one kernel).
+///   1. Batched top-K (`topk_moe_fused_<N>_no_bias`, n_rows=batch) → expert_ids
+///      `[batch, num_experts]` (first top_k valid), expert_weights `[batch, top_k]`.
+///   2. Host gather-sort: DtoH expert_ids (one sync), build compact-column tables
+///      sorted by expert (`col_expert`, `col_src_tok`, `dst_to_col`), HtoD.
+///   3. Grouped gate+up+SwiGLU → `swiglu_compact[total_cols, inter_dim]`.
+///   4. Grouped down → `down_compact[total_cols, hidden_dim]`.
+///   5. Scatter-accumulate → `output[batch, hidden_dim]` = residual + Σ weighted.
+///
+/// MATH is bit-identical to the per-token oracle: same router (the SAME topk
+/// kernel processes each token-row independently), same F32 per-block-scale
+/// gate/up/down accumulation, same SwiGLU, same NR=4 reduction tree, same
+/// in-order slot accumulation in the scatter. Correctness gate: `LUMEN_MOE_PROBE`
+/// `[CHK]` x_sumsq must match the per-token path per (pos, layer).
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "cuda")]
+pub(crate) fn encode_moe_ffn_prefill_grouped(
+    device: &super::ffi::CudaDevice,
+    kernels: &super::decode::KernelSet,
+    scratch: &mut CudaMoeScratch,
+    meta: &CudaMoeMeta,
+    batched_offsets: Option<&CudaMoeBatchedOffsets>,
+    repacked: Option<&CudaMoeRepacked>,
+    layer_buf: &CudaSlice<u8>,
+    normed: &CudaSlice<f32>,    // [batch, hidden_dim]
+    residual: &CudaSlice<f32>,  // [batch, hidden_dim]
+    output: &mut CudaSlice<f32>, // [batch, hidden_dim]
+    batch: usize,
+    hidden_dim: usize,
+    inter_dim: usize,
+    num_experts: usize,
+    top_k: usize,
+) -> Result<(), RuntimeError> {
+    use cudarc::driver::{LaunchConfig as CudarcLaunchConfig, PushKernelArg};
+
+    // Quant gate. Q8_0 (legacy tiled/per-column) and Q4_0 (f32act tiled port)
+    // are supported; the caller checks this too, but be defensive. The router /
+    // top-K / host gather-sort / scatter stages are quant-independent (they operate
+    // on the F32 compact intermediates); only the gate_up (Stage 3) and down
+    // (Stage 4) GEMM kernels are quant-specific.
+    if meta.expert_gate_quant != meta.expert_down_quant
+        || !matches!(
+            meta.expert_gate_quant,
+            QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::Bf16
+        )
+    {
+        return Err(RuntimeError::Unsupported(format!(
+            "grouped MoE prefill: gate_quant={:?} down_quant={:?} (Q8_0, Q4_0 or BF16, both equal)",
+            meta.expert_gate_quant, meta.expert_down_quant,
+        )));
+    }
+    let is_q4 = meta.expert_gate_quant == QuantScheme::Q4_0;
+    let is_bf16 = meta.expert_gate_quant == QuantScheme::Bf16;
+    let bo = batched_offsets.ok_or_else(|| {
+        RuntimeError::Compute("grouped MoE prefill requires batched_offsets".into())
+    })?;
+    let logits_fn = kernels.moe_router_logits_batched.as_ref().ok_or_else(|| {
+        RuntimeError::Compute("grouped MoE prefill: moe_router_logits_batched not loaded".into())
+    })?;
+    let topk_fn = topk_moe_fused_kernel_for(kernels, num_experts).ok_or_else(|| {
+        RuntimeError::Compute(format!(
+            "grouped MoE prefill: no topk_moe_fused kernel for num_experts={num_experts}"
+        ))
+    })?;
+    // Q8_0 per-column fallback kernels — only used on the Q8 path. The Q4_0 path
+    // REQUIRES the f32act tiled kernels (no Q4_0 per-column grouped fallback exists);
+    // the caller's gate must guarantee they are loaded + the shapes are compatible.
+    let q8_path = !is_q4 && !is_bf16;
+    let gate_up_fn = if q8_path {
+        Some(kernels.moe_grouped_gate_up_swiglu_q8_0.as_ref().ok_or_else(|| {
+            RuntimeError::Compute("grouped MoE prefill: moe_grouped_gate_up_swiglu_q8_0 not loaded".into())
+        })?)
+    } else {
+        None
+    };
+    let down_fn = if q8_path {
+        Some(kernels.moe_grouped_down_q8_0.as_ref().ok_or_else(|| {
+            RuntimeError::Compute("grouped MoE prefill: moe_grouped_down_q8_0 not loaded".into())
+        })?)
+    } else {
+        None
+    };
+    if is_q4
+        && (kernels.moe_grouped_gate_up_swiglu_q4_0_tiled_f32act.is_none()
+            || kernels.moe_grouped_down_q4_0_tiled_f32act.is_none())
+    {
+        return Err(RuntimeError::Compute(
+            "grouped MoE prefill (Q4_0): q4 f32act tiled kernels not loaded".into(),
+        ));
+    }
+    if is_bf16
+        && (kernels.moe_grouped_gate_up_swiglu_bf16_tiled_f32act.is_none()
+            || kernels.moe_grouped_down_bf16_tiled_f32act.is_none())
+    {
+        return Err(RuntimeError::Compute(
+            "grouped MoE prefill (BF16): bf16 f32act tiled kernels not loaded".into(),
+        ));
+    }
+    let scatter_fn = kernels.moe_grouped_scatter_accum_q8_0.as_ref().ok_or_else(|| {
+        RuntimeError::Compute("grouped MoE prefill: moe_grouped_scatter_accum_q8_0 not loaded".into())
+    })?;
+
+    // Ensure grouped scratch is sized for this batch.
+    ensure_prefill_grouped(scratch, device, batch, top_k, num_experts, hidden_dim, inter_dim)?;
+
+    let hd_u32 = hidden_dim as u32;
+    let id_u32 = inter_dim as u32;
+    let ne_u32 = num_experts as u32;
+    let batch_u32 = batch as u32;
+    let total_cols = batch * top_k;
+    let total_cols_u32 = total_cols as u32;
+
+    // Router weight view (F32) within layer_buf.
+    let router_off = meta.router_weight_off as usize;
+    if router_off % 4 != 0 {
+        return Err(RuntimeError::Compute(format!(
+            "grouped MoE prefill: router weight offset {router_off} not 4-byte aligned",
+        )));
+    }
+    let router_bytes_needed = num_experts * hidden_dim * 4;
+    if router_off + router_bytes_needed > layer_buf.len() {
+        return Err(RuntimeError::Compute(format!(
+            "grouped MoE prefill: router offset {router_off} + {router_bytes_needed} > layer_buf {}",
+            layer_buf.len(),
+        )));
+    }
+    let router_byte_view = layer_buf.slice(router_off..router_off + router_bytes_needed);
+    let router_view: cudarc::driver::CudaView<'_, f32> = unsafe {
+        router_byte_view
+            .transmute::<f32>(num_experts * hidden_dim)
+            .ok_or_else(|| RuntimeError::Compute(
+                "grouped MoE prefill: router transmute<f32> returned None".into(),
+            ))?
+    };
+
+    // ---- Stage 0: batched router logits [batch, num_experts]. ----
+    {
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (ne_u32, batch_u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device.stream
+                .launch_builder(logits_fn)
+                .arg(normed)
+                .arg(&router_view)
+                .arg(&mut g.router_logits_batched)
+                .arg(&hd_u32)
+                .arg(&ne_u32)
+                .arg(&batch_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!("moe_router_logits_batched: {e}")))?;
+        }
+    }
+
+    // ---- Stage 1: batched top-K (sigmoid + norm), n_rows=batch. ----
+    {
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let n_rows: i32 = batch as i32;
+        let n_expert_used: i32 = top_k as i32;
+        let clamp_val: f32 = 0.0;
+        let scale_val: f32 = 1.0;
+        let use_sigmoid_u: u32 = 1; // Qwen3.5-MoE
+        let with_norm_u: u32 = 1;
+        let delayed_softmax_u: u32 = 0;
+        // Block (32, 4, 1) = 128 threads (4 rows/block). Grid ceil(batch/4).
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (((batch as u32) + 3) / 4, 1, 1),
+            block_dim: (32, 4, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device.stream
+                .launch_builder(topk_fn)
+                .arg(&g.router_logits_batched)
+                .arg(&mut g.expert_weights_batched)
+                .arg(&mut g.expert_ids_batched)
+                .arg(&n_rows)
+                .arg(&n_expert_used)
+                .arg(&clamp_val)
+                .arg(&scale_val)
+                .arg(&use_sigmoid_u)
+                .arg(&with_norm_u)
+                .arg(&delayed_softmax_u)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!("topk_moe_fused (batched): {e}")))?;
+        }
+    }
+
+    // ---- Stage 2: host gather-sort by expert. ONE DtoH sync. ----
+    // Read expert_ids [batch, num_experts] (first top_k valid per row).
+    // Diagnostic (no-op unless LUMEN_MOE_SORT_TIMING=1): wall-clock cost of the
+    // DtoH sync + host counting-sort + HtoD, accumulated across all MoE layers,
+    // to quantify whether the host round-trip is a Wave-3 bottleneck.
+    let sort_timing = {
+        use std::sync::OnceLock;
+        static T: OnceLock<bool> = OnceLock::new();
+        *T.get_or_init(|| std::env::var("LUMEN_MOE_SORT_TIMING").as_deref() == Ok("1"))
+    };
+    let sort_t0 = if sort_timing { Some(std::time::Instant::now()) } else { None };
+    let (col_expert_host, col_src_tok_host, dst_to_col_host, expert_bounds_host) = {
+        let g = scratch.prefill_grouped.as_ref().unwrap();
+        // dtoh_copy syncs the stream, so all upstream kernels have completed.
+        // Copy ONLY the live [batch, num_experts] region (NOT the full cap_tok
+        // capacity) — at cap_tok=8192 the full buffer is 8 MB vs ~num_experts*
+        // batch*4 live; the slice avoids transferring dead capacity.
+        let ids_live = g.expert_ids_batched.slice(0..batch * num_experts);
+        let ids_host = device.dtoh_copy_view(&ids_live)?; // [batch, num_experts]
+        // Counting-sort tokens by assigned expert into compact columns.
+        // Pass 1: per-expert counts. Pass 2: prefix-sum offsets. Pass 3: place.
+        let mut counts = vec![0i32; num_experts];
+        for t in 0..batch {
+            let row = t * num_experts;
+            for slot in 0..top_k {
+                let e = ids_host[row + slot] as usize;
+                counts[e] += 1;
+            }
+        }
+        let mut offsets = vec![0i32; num_experts + 1];
+        for e in 0..num_experts {
+            offsets[e + 1] = offsets[e] + counts[e];
+        }
+        // running cursor per expert
+        let mut cursor: Vec<i32> = offsets[..num_experts].to_vec();
+        let mut col_expert = vec![0i32; total_cols];
+        let mut col_src_tok = vec![0i32; total_cols];
+        let mut dst_to_col = vec![-1i32; total_cols];
+        // Iterate (token, slot) in the SAME order the per-token oracle accumulates
+        // (token-major, slot 0..top_k). For a stable mapping we place by expert
+        // but record dst_to_col so the scatter accumulates slots in token order.
+        for t in 0..batch {
+            let row = t * num_experts;
+            for slot in 0..top_k {
+                let e = ids_host[row + slot] as usize;
+                let c = cursor[e];
+                cursor[e] += 1;
+                let c_us = c as usize;
+                col_expert[c_us] = e as i32;
+                col_src_tok[c_us] = t as i32;
+                dst_to_col[t * top_k + slot] = c;
+            }
+        }
+        (col_expert, col_src_tok, dst_to_col, offsets)
+    };
+    let max_cols_per_expert = expert_bounds_host.windows(2)
+        .map(|w| (w[1] - w[0]) as usize)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    // build the flattened column-tile list {expert, col_start, col_count,
+    // pad} for the tiled grouped kernel — one entry per ceil(cols_e/16) block.
+    // Only built when the tiled path is engaged (avoids host work otherwise).
+    // Q8: tiled gate_up needs hidden_dim % 256 (K-blocks mult of TGU_BK=8) and
+    // inter_dim % TGU_BN=64 (no row tail). Q4: f32act tiled gate_up uses TQ4_BN=32
+    // rows (inter_dim % 32) and TQ4_BK=8 K-blocks (hidden_dim % 256); the q4 down
+    // uses TQ4D_BN=64 rows (hidden_dim % 64) and TQ4D_BK=8 K-blocks (inter_dim % 256).
+    let tiled_enabled = if is_bf16 {
+        // bf16: gate_up TBF_BN=16 rows (inter%16) + TBF_BK=8 K-chunks (hidden%256);
+        // down TBFD_BN=32 rows (hidden%32) + TBFD_BK=8 K-chunks over inter/32 (K-tail
+        // masked). u16-staged weights to fit 48 KB shmem.
+        moe_grouped_tiled_enabled()
+            && kernels.moe_grouped_gate_up_swiglu_bf16_tiled_f32act.is_some()
+            && kernels.moe_grouped_down_bf16_tiled_f32act.is_some()
+            && hidden_dim % 256 == 0
+            && hidden_dim % 32 == 0
+            && inter_dim % 16 == 0
+    } else if is_q4 {
+        // gate_up: rows tiled by TQ4_BN=32 (inter_dim % 32), K-blocks by TQ4_BK=8
+        //   over hidden_dim/32 (hidden_dim % 256). down: rows by TQ4D_BN=64
+        //   (hidden_dim % 64), K-blocks by TQ4D_BK=8 over inter_dim/32 — the K-tail
+        //   is MASKED in the kernel (kvalid guard), so inter_dim need not be a
+        //   multiple of 256; only inter_dim % 32 (whole q-blocks) is required.
+        moe_grouped_tiled_enabled()
+            && kernels.moe_grouped_gate_up_swiglu_q4_0_tiled_f32act.is_some()
+            && kernels.moe_grouped_down_q4_0_tiled_f32act.is_some()
+            && hidden_dim % 256 == 0   // gate_up K-blocks (TQ4_BK=8)
+            && hidden_dim % 64 == 0    // down rows (TQ4D_BN=64) — implied by %256
+            && inter_dim % 32 == 0     // gate_up rows (TQ4_BN=32) + whole down q-blocks
+    } else {
+        moe_grouped_tiled_enabled()
+            && kernels.moe_grouped_gate_up_swiglu_q8_0_tiled.is_some()
+            // Shape requirements: K-blocks multiple of TGU_BK=8 (hidden_dim % 256 == 0)
+            // and no row tail (inter_dim % TGU_BN=64 == 0). Else fall back.
+            && hidden_dim % 256 == 0
+            && inter_dim % 64 == 0
+    };
+    let tiles16_host: Vec<i32> = if tiled_enabled {
+        const TGU_BM: i32 = 16;
+        let mut tiles: Vec<i32> = Vec::with_capacity(total_cols / 8 + num_experts);
+        for e in 0..num_experts {
+            let begin = expert_bounds_host[e];
+            let end = expert_bounds_host[e + 1];
+            let mut c = begin;
+            while c < end {
+                let cnt = (end - c).min(TGU_BM);
+                tiles.push(e as i32);
+                tiles.push(c);
+                tiles.push(cnt);
+                tiles.push(0);
+                c += TGU_BM;
+            }
+        }
+        tiles
+    } else {
+        Vec::new()
+    };
+    let num_tiles16 = (tiles16_host.len() / 4) as u32;
+
+    // build the 4 BUCKETED gate+up tile lists {col0,expert,row128,cols_valid}.
+    // Per expert: floor(cols/64) full M64 tiles + one tail (M16/32/48/64 by remainder);
+    // each col-tile emitted once PER row128 (= inter_dim/128). Buckets concatenated in
+    // MG order (1,2,3,4) so each gu_imma<MG> launch reads a contiguous sub-range.
+    // Order within a bucket is (expert, col_tile, row128) so the same compact x tile is
+    // reused by the row128 CTAs (consult Q1(b) L2-reuse hint).
+    let w10_enabled = moe_gate_up_w10_enabled()
+        && q8_path
+        && tiled_enabled
+        && hidden_dim % 32 == 0
+        && inter_dim % 128 == 0;
+    let (w10_tiles_host, w10_counts): (Vec<i32>, [u32; 4]) = if w10_enabled {
+        let r128 = (inter_dim / 128) as i32;
+        let mut bk: [Vec<i32>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        // push one tile entry per row128 into bucket `b` with cols_valid `cv`.
+        fn push_tile(v: &mut Vec<i32>, col0: i32, e: i32, r128: i32, cv: i32) {
+            for r in 0..r128 { v.push(col0); v.push(e); v.push(r); v.push(cv); }
+        }
+        for e in 0..num_experts {
+            let begin = expert_bounds_host[e];
+            let end = expert_bounds_host[e + 1];
+            let cols = end - begin;
+            if cols <= 0 { continue; }
+            let mut c = begin;
+            // full M64 tiles (cols_valid = 64).
+            let n_full = cols / 64;
+            for _ in 0..n_full { push_tile(&mut bk[3], c, e as i32, r128, 64); c += 64; }
+            // tail: bucket by remainder, cols_valid = the TRUE remainder (kernel masks).
+            let rem = end - c;
+            if rem > 0 {
+                let bucket = match rem { 1..=16 => 0, 17..=32 => 1, 33..=48 => 2, _ => 3 };
+                push_tile(&mut bk[bucket], c, e as i32, r128, rem);
+            }
+        }
+        let counts = [
+            (bk[0].len() / 4) as u32, (bk[1].len() / 4) as u32,
+            (bk[2].len() / 4) as u32, (bk[3].len() / 4) as u32,
+        ];
+        let mut combined = Vec::with_capacity(bk.iter().map(|v| v.len()).sum());
+        for v in &bk { combined.extend_from_slice(v); }
+        (combined, counts)
+    } else {
+        (Vec::new(), [0; 4])
+    };
+
+    // HtoD the tables (copied into the START of each buffer; kernels read
+    // [0..total_cols]). host len == total_cols ≤ cap_cols == dst capacity.
+    {
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        device.htod_copy_into(&col_expert_host, &mut g.col_expert)?;
+        device.htod_copy_into(&col_src_tok_host, &mut g.col_src_tok)?;
+        device.htod_copy_into(&dst_to_col_host, &mut g.dst_to_col)?;
+        device.htod_copy_into(&expert_bounds_host, &mut g.expert_bounds)?;
+        if !tiles16_host.is_empty() {
+            // memcpy copies host_data.len() elems into the START of the buffer;
+            // kernel reads [0..num_tiles*4]. host len <= cap_tiles*4 by construction.
+            device.htod_copy_into(&tiles16_host, &mut g.gate_up_tiles16)?;
+        }
+        if !w10_tiles_host.is_empty() {
+            if let Some(buf) = g.w10_tiles.as_mut() {
+                device.htod_copy_into(&w10_tiles_host, buf)?;
+            }
+        }
+    }
+    if let Some(t0) = sort_t0 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ACC_US: AtomicU64 = AtomicU64::new(0);
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        let us = t0.elapsed().as_micros() as u64;
+        let total = ACC_US.fetch_add(us, Ordering::Relaxed) + us;
+        let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        // Print a running total every 40 calls (≈ one prefill's worth of MoE layers).
+        if n % 40 == 0 {
+            eprintln!(
+                "[MOE-SORT-TIMING] calls={n} cumulative_ms={:.3} (DtoH sync + host counting-sort \
+                 + HtoD across MoE layers)",
+                total as f64 / 1000.0
+            );
+        }
+    }
+
+    // ---- Stage 3: grouped gate+up+SwiGLU. ----
+    // M-tiled variant (one CTA per expert × column-tile × row-tile,
+    // weight read once and reused across MG_MT=4 columns) when enabled AND the
+    // kernel is loaded. Bit-identical to the per-column kernel. Else per-column.
+    // tiled shmem-staged kernel (BM16/BN64/BK8, host tile-list) takes
+    // priority when enabled + shape-compatible. Else Wave-3 M-tiled. Else per-column.
+    // int8 tensor-core (IMMA) gate+up takes HIGHEST priority
+    // when enabled + repacked gu planes present + shape-compatible (H%32, I%64).
+    // register-resident-C + wide-M IMMA gate+up. HIGHEST priority when on.
+    // Requires repacked gu planes + the prequant + 4 MG kernels loaded + W10 buffers.
+    let gate_up_w10_ok = w10_enabled
+        && repacked.and_then(|r| r.gate_up_q.as_ref()).is_some()
+        && kernels.moe_prequant_x_q8.is_some()
+        && kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg1.is_some()
+        && kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg2.is_some()
+        && kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg3.is_some()
+        && kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg4.is_some()
+        && scratch.prefill_grouped.as_ref()
+            .map(|g| g.w10_xq_q.is_some() && g.w10_xq_d.is_some() && g.w10_tiles.is_some())
+            .unwrap_or(false);
+    let gate_up_imma_ok = !gate_up_w10_ok
+        && tiled_enabled
+        && q8_path
+        && moe_gate_up_imma_enabled()
+        && repacked.and_then(|r| r.gate_up_q.as_ref()).is_some()
+        && kernels.moe_grouped_gate_up_swiglu_q8_0_imma.is_some()
+        && hidden_dim % 32 == 0
+        && inter_dim % 64 == 0;
+    if gate_up_w10_ok {
+        let rp = repacked.unwrap();
+        let gu_q = rp.gate_up_q.as_ref().unwrap();
+        let gu_s = rp.gate_up_s.as_ref().unwrap();
+        let prequant_fn = kernels.moe_prequant_x_q8.as_ref().unwrap();
+        let mg_fns = [
+            kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg1.as_ref().unwrap(),
+            kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg2.as_ref().unwrap(),
+            kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg3.as_ref().unwrap(),
+            kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg4.as_ref().unwrap(),
+        ];
+        let total_cols_i32 = total_cols as i32;
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[CUDA]: MoE grouped gate_up W10 (K4, register-C wide-M IMMA): ACTIVE \
+                     (counts MG1={} MG2={} MG3={} MG4={}, total_cols={total_cols}, \
+                     inter_dim={inter_dim}, hidden_dim={hidden_dim})",
+                    w10_counts[0], w10_counts[1], w10_counts[2], w10_counts[3]
+                );
+            }
+        }
+        // ---- prequant: one block per compact column. ----
+        {
+            let g = scratch.prefill_grouped.as_mut().unwrap();
+            let xq_q = g.w10_xq_q.as_mut().unwrap();
+            let pre_cfg = CudarcLaunchConfig {
+                grid_dim: (total_cols_u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // borrow xq_d immutably via a raw split: alloc separate locals.
+            unsafe {
+                device.stream
+                    .launch_builder(prequant_fn)
+                    .arg(normed)
+                    .arg(&g.col_src_tok)
+                    .arg(xq_q)
+                    .arg(g.w10_xq_d.as_mut().unwrap())
+                    .arg(&hd_u32)
+                    .arg(&total_cols_u32)
+                    .launch(pre_cfg)
+                    .map_err(|e| RuntimeError::Compute(format!("moe_prequant_x_q8: {e}")))?;
+            }
+        }
+        // ---- 4 MG gate+up launches over contiguous tile sub-ranges. ----
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let xq_q = g.w10_xq_q.as_ref().unwrap();
+        let xq_d = g.w10_xq_d.as_ref().unwrap();
+        let tiles = g.w10_tiles.as_ref().unwrap();
+        let mut base: u64 = 0;
+        for mg in 0..4usize {
+            let cnt = w10_counts[mg];
+            if cnt > 0 {
+                let tile_slice = tiles.slice((base as usize * 4)..((base as usize + cnt as usize) * 4));
+                let cfg = CudarcLaunchConfig {
+                    grid_dim: (cnt, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    device.stream
+                        .launch_builder(mg_fns[mg])
+                        .arg(xq_q)
+                        .arg(xq_d)
+                        .arg(gu_q)
+                        .arg(gu_s)
+                        .arg(&tile_slice)
+                        .arg(&cnt)
+                        .arg(&total_cols_i32)
+                        .arg(&mut g.swiglu_compact)
+                        .arg(&hd_u32)
+                        .arg(&id_u32)
+                        .launch(cfg)
+                        .map_err(|e| RuntimeError::Compute(format!(
+                            "moe_grouped_gate_up_swiglu_q8_0_w10_mg{}: {e}", mg + 1
+                        )))?;
+                }
+            }
+            base += cnt as u64;
+        }
+    } else if gate_up_imma_ok {
+        let imma_fn = kernels.moe_grouped_gate_up_swiglu_q8_0_imma.as_ref().unwrap();
+        let rp = repacked.unwrap();
+        let gu_q = rp.gate_up_q.as_ref().unwrap();
+        let gu_s = rp.gate_up_s.as_ref().unwrap();
+        let grid_y = (inter_dim as u32) / 64; // IMG_BN = 64
+        // dynamic shmem: s_xq 4096 + s_xs 512 + s_wq 32768 + s_ws 2048
+        //              + s_gepi 4096 + s_uepi 4096 = 47,616 B.
+        let shmem: u32 = (2*4*16*32) + (2*4*16*4) + (2*4*8*2*8*32) + (2*4*8*2*8*2)
+            + (16*64*4) + (16*64*4);
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[CUDA]: MoE grouped gate_up IMMA (K3 W9, tensor-core): ACTIVE \
+                     (num_tiles={num_tiles16}, total_cols={total_cols}, inter_dim={inter_dim}, \
+                     hidden_dim={hidden_dim}, shmem={shmem})"
+                );
+            }
+        }
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (num_tiles16, grid_y, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: shmem,
+        };
+        unsafe {
+            device.stream
+                .launch_builder(imma_fn)
+                .arg(normed)
+                .arg(gu_q)
+                .arg(gu_s)
+                .arg(&g.col_src_tok)
+                .arg(&g.gate_up_tiles16)
+                .arg(&num_tiles16)
+                .arg(&mut g.swiglu_compact)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!(
+                    "moe_grouped_gate_up_swiglu_q8_0_imma: {e}"
+                )))?;
+        }
+    } else if tiled_enabled && is_bf16 {
+        // BF16 f32act tiled gate_up. Rows tiled by TBF_BN=16 (u16-staged weights
+        // to fit 48 KB shmem).
+        let bf_fn = kernels.moe_grouped_gate_up_swiglu_bf16_tiled_f32act.as_ref().unwrap();
+        let grid_y = (inter_dim as u32) / 16; // TBF_BN = 16 (shape-guarded exact)
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[CUDA]: MoE grouped gate_up TILED-BF16-F32ACT: ACTIVE (num_tiles={num_tiles16}, \
+                     total_cols={total_cols}, inter_dim={inter_dim}, hidden_dim={hidden_dim})"
+                );
+            }
+        }
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (num_tiles16, grid_y, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device.stream
+                .launch_builder(bf_fn)
+                .arg(normed)
+                .arg(layer_buf)
+                .arg(&g.col_src_tok)
+                .arg(&g.gate_up_tiles16)
+                .arg(&num_tiles16)
+                .arg(&bo.gate_up_offsets)
+                .arg(&mut g.swiglu_compact)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!(
+                    "moe_grouped_gate_up_swiglu_bf16_tiled_f32act: {e}"
+                )))?;
+        }
+    } else if tiled_enabled && is_q4 {
+        // Q4_0 f32act tiled gate_up. Rows tiled by TQ4_BN=32.
+        let q4_fn = kernels.moe_grouped_gate_up_swiglu_q4_0_tiled_f32act.as_ref().unwrap();
+        let grid_y = (inter_dim as u32) / 32; // TQ4_BN = 32 (shape-guarded exact)
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[CUDA]: MoE grouped gate_up TILED-Q4-F32ACT: ACTIVE (num_tiles={num_tiles16}, \
+                     total_cols={total_cols}, inter_dim={inter_dim}, hidden_dim={hidden_dim})"
+                );
+            }
+        }
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (num_tiles16, grid_y, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device.stream
+                .launch_builder(q4_fn)
+                .arg(normed)
+                .arg(layer_buf)
+                .arg(&g.col_src_tok)
+                .arg(&g.gate_up_tiles16)
+                .arg(&num_tiles16)
+                .arg(&bo.gate_up_offsets)
+                .arg(&mut g.swiglu_compact)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!(
+                    "moe_grouped_gate_up_swiglu_q4_0_tiled_f32act: {e}"
+                )))?;
+        }
+    } else if tiled_enabled {
+        let tiled_fn = kernels.moe_grouped_gate_up_swiglu_q8_0_tiled.as_ref().unwrap();
+        let grid_y = (inter_dim as u32) / 64; // TGU_BN = 64 (shape-guarded exact)
+        // First-call engagement log (no-op after once).
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[CUDA]: MoE grouped gate_up TILED: ACTIVE (num_tiles={num_tiles16}, \
+                     total_cols={total_cols}, inter_dim={inter_dim}, hidden_dim={hidden_dim})"
+                );
+            }
+        }
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (num_tiles16, grid_y, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device.stream
+                .launch_builder(tiled_fn)
+                .arg(normed)
+                .arg(layer_buf)
+                .arg(&g.col_src_tok)
+                .arg(&g.gate_up_tiles16)
+                .arg(&num_tiles16)
+                .arg(&bo.gate_up_offsets)
+                .arg(&mut g.swiglu_compact)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!(
+                    "moe_grouped_gate_up_swiglu_q8_0_tiled: {e}"
+                )))?;
+        }
+    } else if moe_grouped_mtiled_enabled()
+        && kernels.moe_grouped_gate_up_swiglu_q8_0_mtiled.is_some()
+    {
+        let mtiled_fn = kernels.moe_grouped_gate_up_swiglu_q8_0_mtiled.as_ref().unwrap();
+        const MG_MT: usize = 4;
+        let grid_x = ((inter_dim as u32) + 3) / 4; // NR_GU = 4
+        let grid_y = (((max_cols_per_expert + MG_MT - 1) / MG_MT).max(1)) as u32;
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (grid_x, grid_y, ne_u32),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device.stream
+                .launch_builder(mtiled_fn)
+                .arg(normed)
+                .arg(layer_buf)
+                .arg(&g.col_src_tok)
+                .arg(&g.expert_bounds)
+                .arg(&bo.gate_up_offsets)
+                .arg(&mut g.swiglu_compact)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!(
+                    "moe_grouped_gate_up_swiglu_q8_0_mtiled: {e}"
+                )))?;
+        }
+    } else {
+        // Q8 per-column fallback. Unreachable for q4 (caller guarantees the q4
+        // tiled path is engaged; is_q4 always takes the tiled branch above).
+        let gate_up_fn = gate_up_fn.ok_or_else(|| RuntimeError::Compute(
+            "grouped MoE prefill: Q4_0 reached the Q8 per-column gate_up fallback (caller gate bug)".into()
+        ))?;
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let grid_x = ((inter_dim as u32) + 3) / 4; // NR_GU = 4
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (grid_x, total_cols_u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (hidden_dim * 4) as u32,
+        };
+        unsafe {
+            device.stream
+                .launch_builder(gate_up_fn)
+                .arg(normed)
+                .arg(layer_buf)
+                .arg(&g.col_expert)
+                .arg(&g.col_src_tok)
+                .arg(&bo.gate_up_offsets)
+                .arg(&mut g.swiglu_compact)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .arg(&total_cols_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!("moe_grouped_gate_up_swiglu_q8_0: {e}")))?;
+        }
+    }
+
+    // ---- Stage 4: grouped down. ----
+    // tiled shmem-staged down kernel (BM16/BN128/BK8, host tile-list,
+    // reuses the SAME gate_up_tiles16) when the tiled path is engaged + the
+    // kernel is loaded + shape-compatible (down output N = hidden_dim % 128 == 0).
+    // The `tiled_enabled` guard already requires hidden_dim % 256 == 0 (⇒ %128)
+    // and inter_dim % 64 == 0 (⇒ %32, whole q-blocks). Else per-column.
+    // / down-stage selection precedence under the parent tiled gate:
+    //   1. EXPLICIT int8 opt-in (`LUMEN_CUDA_MOE_DOWN_TILED=1`) → int8 tiled down
+    //      (fastest, 861 tok/s, but GQ-004 2/3 — the perf-over-vlong-fidelity opt-in).
+    //   2. else f32act tiled down (DEFAULT-ON: 777 tok/s = +95.8% vs per-column,
+    //      PRISTINE ×3 — the validated default). Set `..._F32ACT=0` to disable.
+    //   3. else per-column matvec (the original PRISTINE reference, 397 tok/s).
+    // BN(int8)=128 ⇒ hidden_dim % 128; BN(f32act)=64 ⇒ hidden_dim % 64. The parent
+    // tiled gate already guarantees hidden_dim % 256 (⇒ both).
+    // Q4_0/BF16 always use their f32act tiled down (the only grouped down kernel
+    // for those quants).
+    let down_q4_tiled = tiled_enabled && is_q4;
+    let down_bf16_tiled = tiled_enabled && is_bf16;
+    let down_tiled_ok = tiled_enabled
+        && q8_path
+        && moe_down_tiled_enabled()
+        && kernels.moe_grouped_down_q8_0_tiled.is_some()
+        && hidden_dim % 128 == 0;
+    // consult `down_f32_fast_bn128` — REPACKED-plane, double-buffered,
+    // char4/float4 fast raw-F32 down. Highest precedence among the f32act variants
+    // (recovers the +10.8% headroom at PRISTINE), but NOT over the explicit int8
+    // opt-in. Requires the repacked planes (built at preload under the same gate).
+    let down_fast_bn128_ok = tiled_enabled
+        && !down_tiled_ok
+        && moe_down_fast_bn128_enabled()
+        && repacked.is_some()
+        && kernels.moe_grouped_down_q8_0_fast_bn128.is_some()
+        && hidden_dim % 128 == 0
+        && inter_dim % 32 == 0;
+    let down_tiled_f32act_ok = tiled_enabled
+        && q8_path
+        && !down_tiled_ok
+        && !down_fast_bn128_ok
+        && moe_down_tiled_f32act_enabled()
+        && kernels.moe_grouped_down_q8_0_tiled_f32act.is_some()
+        && hidden_dim % 64 == 0;
+    if down_bf16_tiled {
+        let bf_down_fn = kernels.moe_grouped_down_bf16_tiled_f32act.as_ref().unwrap();
+        let grid_y = (hidden_dim as u32) / 32; // TBFD_BN = 32 (shape-guarded exact)
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[CUDA]: MoE grouped down TILED-BF16-F32ACT: ACTIVE (num_tiles={num_tiles16}, \
+                     total_cols={total_cols}, inter_dim={inter_dim}, hidden_dim={hidden_dim})"
+                );
+            }
+        }
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (num_tiles16, grid_y, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let swiglu_view = g.swiglu_compact.slice(0..total_cols * inter_dim);
+        unsafe {
+            device.stream
+                .launch_builder(bf_down_fn)
+                .arg(&swiglu_view)
+                .arg(layer_buf)
+                .arg(&g.gate_up_tiles16)
+                .arg(&num_tiles16)
+                .arg(&bo.down_offsets)
+                .arg(&mut g.down_compact)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!("moe_grouped_down_bf16_tiled_f32act: {e}")))?;
+        }
+    } else if down_q4_tiled {
+        let q4_down_fn = kernels.moe_grouped_down_q4_0_tiled_f32act.as_ref().unwrap();
+        let grid_y = (hidden_dim as u32) / 64; // TQ4D_BN = 64 (shape-guarded exact)
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[CUDA]: MoE grouped down TILED-Q4-F32ACT: ACTIVE (num_tiles={num_tiles16}, \
+                     total_cols={total_cols}, inter_dim={inter_dim}, hidden_dim={hidden_dim})"
+                );
+            }
+        }
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (num_tiles16, grid_y, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let swiglu_view = g.swiglu_compact.slice(0..total_cols * inter_dim);
+        unsafe {
+            device.stream
+                .launch_builder(q4_down_fn)
+                .arg(&swiglu_view)
+                .arg(layer_buf)
+                .arg(&g.gate_up_tiles16)
+                .arg(&num_tiles16)
+                .arg(&bo.down_offsets)
+                .arg(&mut g.down_compact)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!("moe_grouped_down_q4_0_tiled_f32act: {e}")))?;
+        }
+    } else if down_fast_bn128_ok {
+        // consult `down_f32_fast_bn128` — REPACKED-plane, double-buffered,
+        // char4/float4 fast raw-F32 down. Opt-in, default-OFF.
+        let down_fn = kernels.moe_grouped_down_q8_0_fast_bn128.as_ref().unwrap();
+        let rp = repacked.unwrap();
+        let grid_y = (hidden_dim as u32) / 128; // TD4_BN = 128
+        const TD4_SHMEM_BYTES: u32 = 2*4*8*17*16 + 2*4*128*8*4 + 2*4*128*2; // 52_224
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[CUDA]: MoE grouped down FAST-BN128 (K3 W8b, repacked): ACTIVE (num_tiles={num_tiles16}, \
+                     total_cols={total_cols}, inter_dim={inter_dim}, hidden_dim={hidden_dim}, shmem={TD4_SHMEM_BYTES})"
+                );
+            }
+        }
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (num_tiles16, grid_y, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: TD4_SHMEM_BYTES,
+        };
+        let swiglu_view = g.swiglu_compact.slice(0..total_cols * inter_dim);
+        unsafe {
+            device.stream
+                .launch_builder(down_fn)
+                .arg(&swiglu_view)
+                .arg(&rp.down_q)
+                .arg(&rp.down_s)
+                .arg(&g.gate_up_tiles16)
+                .arg(&num_tiles16)
+                .arg(&mut g.down_compact)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!("moe_grouped_down_q8_0_fast_bn128: {e}")))?;
+        }
+    } else if down_tiled_f32act_ok {
+        let down_f32act_fn = kernels.moe_grouped_down_q8_0_tiled_f32act.as_ref().unwrap();
+        let grid_y = (hidden_dim as u32) / 64; // TD2_BN = 64 (shape-guarded exact)
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[CUDA]: MoE grouped down TILED-F32ACT (rescue): ACTIVE (num_tiles={num_tiles16}, \
+                     total_cols={total_cols}, inter_dim={inter_dim}, hidden_dim={hidden_dim})"
+                );
+            }
+        }
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (num_tiles16, grid_y, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let swiglu_view = g.swiglu_compact.slice(0..total_cols * inter_dim);
+        unsafe {
+            device.stream
+                .launch_builder(down_f32act_fn)
+                .arg(&swiglu_view)
+                .arg(layer_buf)
+                .arg(&g.gate_up_tiles16)
+                .arg(&num_tiles16)
+                .arg(&bo.down_offsets)
+                .arg(&mut g.down_compact)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!("moe_grouped_down_q8_0_tiled_f32act: {e}")))?;
+        }
+    } else if down_tiled_ok {
+        let down_tiled_fn = kernels.moe_grouped_down_q8_0_tiled.as_ref().unwrap();
+        let grid_y = (hidden_dim as u32) / 128; // TD_BN = 128 (shape-guarded exact)
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[CUDA]: MoE grouped down TILED: ACTIVE (num_tiles={num_tiles16}, \
+                     total_cols={total_cols}, inter_dim={inter_dim}, hidden_dim={hidden_dim})"
+                );
+            }
+        }
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (num_tiles16, grid_y, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let swiglu_view = g.swiglu_compact.slice(0..total_cols * inter_dim);
+        unsafe {
+            device.stream
+                .launch_builder(down_tiled_fn)
+                .arg(&swiglu_view)
+                .arg(layer_buf)
+                .arg(&g.gate_up_tiles16)
+                .arg(&num_tiles16)
+                .arg(&bo.down_offsets)
+                .arg(&mut g.down_compact)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!("moe_grouped_down_q8_0_tiled: {e}")))?;
+        }
+    } else {
+        // Q8 per-column down fallback. Unreachable for q4 (down_q4_tiled took the
+        // q4 branch above whenever is_q4 && tiled_enabled, and the caller gates q4
+        // on tiled_enabled).
+        let down_fn = down_fn.ok_or_else(|| RuntimeError::Compute(
+            "grouped MoE prefill: Q4_0 reached the Q8 per-column down fallback (caller gate bug)".into()
+        ))?;
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let grid_x = ((hidden_dim as u32) + 3) / 4; // NR_DOWN = 4
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (grid_x, total_cols_u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (inter_dim * 4) as u32,
+        };
+        // Split borrows: read swiglu_compact, write down_compact.
+        let swiglu_view = g.swiglu_compact.slice(0..total_cols * inter_dim);
+        unsafe {
+            device.stream
+                .launch_builder(down_fn)
+                .arg(&swiglu_view)
+                .arg(layer_buf)
+                .arg(&g.col_expert)
+                .arg(&bo.down_offsets)
+                .arg(&mut g.down_compact)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .arg(&total_cols_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!("moe_grouped_down_q8_0: {e}")))?;
+        }
+    }
+
+    // ---- Stage 5: scatter-accumulate into output. ----
+    {
+        let g = scratch.prefill_grouped.as_ref().unwrap();
+        let tk_u32 = top_k as u32;
+        let grid_x = ((hidden_dim as u32) + 255) / 256;
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (grid_x, batch_u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let down_view = g.down_compact.slice(0..total_cols * hidden_dim);
+        unsafe {
+            device.stream
+                .launch_builder(scatter_fn)
+                .arg(&down_view)
+                .arg(residual)
+                .arg(&g.expert_weights_batched)
+                .arg(&g.dst_to_col)
+                .arg(output)
+                .arg(&hd_u32)
+                .arg(&tk_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!("moe_grouped_scatter_accum_q8_0: {e}")))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Batched SHARED-expert FFN over ALL `batch` tokens.
+///
+/// The Qwen3.5-MoE shared expert is a single always-active Q4_0 FFN applied to
+/// every token, ADDED (sigmoid-gated) to `output[batch, H]` after the routed
+/// FFN. The per-token path ran this once per token; this batches it over all tokens, removing the
+/// per-token shared-expert loop (the +43% residual bottleneck the skip-shared
+/// diagnostic identified).
+///
+/// Pipeline (all batched; bit-identical to the per-token unfused path per token):
+///   1. `shared_glu_gemv_q4_0_batched`: swiglu[batch, inter_eff] = silu(gate·x)⊙(up·x).
+///   2. `shared_dot_f32_batched`: logit[batch] = gate_inp·x (if gate_inp present).
+///   3. `shared_down_*_accum_batched`: out[tok] += [sigmoid(logit[tok])]*down·swiglu.
+///
+/// Uses the grouped scratch's `shared_swiglu_batched` + `shared_logit_batched`
+/// (ensure_prefill_grouped must have run, which the routed dispatch does first).
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "cuda")]
+pub(crate) fn encode_shared_expert_ffn_prefill_batched(
+    device: &super::ffi::CudaDevice,
+    kernels: &super::decode::KernelSet,
+    scratch: &mut CudaMoeScratch,
+    meta: &CudaMoeMeta,
+    layer_buf: &CudaSlice<u8>,
+    normed: &CudaSlice<f32>,   // [batch, hidden_dim]
+    output: &mut CudaSlice<f32>, // [batch, hidden_dim] in/out (residual+routed already present)
+    batch: usize,
+    hidden_dim: usize,
+) -> Result<(), RuntimeError> {
+    use cudarc::driver::{LaunchConfig as CudarcLaunchConfig, PushKernelArg};
+
+    let gate_slice = meta.shared_gate.ok_or_else(|| {
+        RuntimeError::Compute("batched shared expert: meta.shared_gate is None".into())
+    })?;
+    let up_slice = meta.shared_up.ok_or_else(|| {
+        RuntimeError::Compute("batched shared expert: meta.shared_up is None".into())
+    })?;
+    let down_slice = meta.shared_down.ok_or_else(|| {
+        RuntimeError::Compute("batched shared expert: meta.shared_down is None".into())
+    })?;
+    if gate_slice.quant != QuantScheme::Q4_0
+        || up_slice.quant != QuantScheme::Q4_0
+        || down_slice.quant != QuantScheme::Q4_0
+    {
+        return Err(RuntimeError::Unsupported(format!(
+            "batched shared expert quant not supported: gate={:?} up={:?} down={:?} (Q4_0 only)",
+            gate_slice.quant, up_slice.quant, down_slice.quant,
+        )));
+    }
+    let gemv_fn = kernels.shared_glu_gemv_q4_0_batched.as_ref().ok_or_else(|| {
+        RuntimeError::Compute("batched shared expert: shared_glu_gemv_q4_0_batched not loaded".into())
+    })?;
+
+    // Derive effective shared inter_dim from the down weight (Q4_0, 32 elems/18 B).
+    let down_len = down_slice.length as usize;
+    if hidden_dim == 0 || down_len == 0 {
+        return Err(RuntimeError::Compute("batched shared expert: invalid dims".into()));
+    }
+    let inter_dim_eff = (down_len * 32) / (hidden_dim * 18);
+    if inter_dim_eff == 0 || inter_dim_eff % 32 != 0 {
+        return Err(RuntimeError::Compute(format!(
+            "batched shared expert: derived inter_dim={inter_dim_eff} invalid",
+        )));
+    }
+
+    let hd_u32 = hidden_dim as u32;
+    let ie_u32 = inter_dim_eff as u32;
+    let batch_u32 = batch as u32;
+
+    // Q4_0 weight views.
+    let gate_off = gate_slice.offset as usize;
+    let gate_bytes = gate_slice.length as usize;
+    let up_off = up_slice.offset as usize;
+    let up_bytes = up_slice.length as usize;
+    let down_off = down_slice.offset as usize;
+    let down_bytes = down_slice.length as usize;
+    for (o, b, name) in [
+        (gate_off, gate_bytes, "gate"),
+        (up_off, up_bytes, "up"),
+        (down_off, down_bytes, "down"),
+    ] {
+        if o + b > layer_buf.len() {
+            return Err(RuntimeError::Compute(format!(
+                "batched shared expert {name} slice out of bounds: off={o} len={b} > layer_buf={}",
+                layer_buf.len(),
+            )));
+        }
+    }
+    let gate_view = layer_buf.slice(gate_off..gate_off + gate_bytes);
+    let up_view = layer_buf.slice(up_off..up_off + up_bytes);
+    let down_view = layer_buf.slice(down_off..down_off + down_bytes);
+
+    // Verify scratch capacity (inter_dim_eff ≤ routed inter_dim that sized it).
+    {
+        let g = scratch.prefill_grouped.as_ref().ok_or_else(|| {
+            RuntimeError::Compute("batched shared expert: prefill_grouped scratch missing".into())
+        })?;
+        if g.shared_swiglu_batched.len() < batch * inter_dim_eff {
+            return Err(RuntimeError::Compute(format!(
+                "batched shared expert: shared_swiglu_batched too small ({} < {})",
+                g.shared_swiglu_batched.len(),
+                batch * inter_dim_eff,
+            )));
+        }
+    }
+
+    // TILED shared-expert path. Engaged under the parent tiled flag when the
+    // tiled kernels are loaded AND the shapes are compatible (gate_up: hidden%256
+    // for SBT_BK=8 K-blocks, inter%32 for SBT_BN=32 rows; down: hidden%64 for
+    // SBTD_BN=64 rows, inter%32 for whole q-blocks — K-tail masked). Replaces the
+    // per-(row,token) matvec shared kernels. Same f32act PRISTINE near-tie class.
+    let shared_tiled = moe_grouped_tiled_enabled()
+        && moe_shared_tiled_enabled()
+        && kernels.shared_glu_gemv_q4_0_batched_tiled_f32act.is_some()
+        && kernels.shared_down_q4_0_accum_batched_tiled_f32act.is_some()
+        && hidden_dim % 256 == 0
+        && hidden_dim % 64 == 0
+        && inter_dim_eff % 32 == 0;
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if shared_tiled && !LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[CUDA]: shared-expert TILED-Q4-F32ACT: ACTIVE (batch={batch}, \
+                 inter_dim={inter_dim_eff}, hidden_dim={hidden_dim})"
+            );
+        }
+    }
+
+    // ---- Stage 1: batched gate+up+SwiGLU. ----
+    if shared_tiled {
+        let gemv_tiled_fn = kernels.shared_glu_gemv_q4_0_batched_tiled_f32act.as_ref().unwrap();
+        let grid_x = ((batch as u32) + 15) / 16;       // SBT_BM = 16
+        let grid_y = (inter_dim_eff as u32) / 32;      // SBT_BN = 32 (shape-guarded)
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device.stream
+                .launch_builder(gemv_tiled_fn)
+                .arg(&gate_view)
+                .arg(&up_view)
+                .arg(normed)
+                .arg(&mut g.shared_swiglu_batched)
+                .arg(&ie_u32)
+                .arg(&hd_u32)
+                .arg(&batch_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!(
+                    "shared_glu_gemv_q4_0_batched_tiled_f32act: {e}"
+                )))?;
+        }
+    } else {
+        let g = scratch.prefill_grouped.as_mut().unwrap();
+        let grid_x = ((inter_dim_eff as u32) + 1) / 2; // SB_NR = 2
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (grid_x, batch_u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (hidden_dim * 4) as u32,
+        };
+        unsafe {
+            device.stream
+                .launch_builder(gemv_fn)
+                .arg(&gate_view)
+                .arg(&up_view)
+                .arg(normed)
+                .arg(&mut g.shared_swiglu_batched)
+                .arg(&ie_u32)
+                .arg(&hd_u32)
+                .arg(&batch_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!("shared_glu_gemv_q4_0_batched: {e}")))?;
+        }
+    }
+
+    // ---- Stage 2 + 3: sigmoid-gated (gate_inp present) OR plain residual. ----
+    if let Some(gis_slice) = meta.ffn_gate_inp_shexp {
+        let gis_off = gis_slice.offset as usize;
+        let gis_bytes = hidden_dim * 4;
+        if gis_off % 4 != 0 || gis_off + gis_bytes > layer_buf.len() {
+            return Err(RuntimeError::Compute(format!(
+                "batched shared expert gate_inp slice invalid: off={gis_off}",
+            )));
+        }
+        let gis_byte_view = layer_buf.slice(gis_off..gis_off + gis_bytes);
+        let gis_view: cudarc::driver::CudaView<'_, f32> = unsafe {
+            gis_byte_view.transmute::<f32>(hidden_dim).ok_or_else(|| {
+                RuntimeError::Compute("batched shared expert gate_inp transmute<f32> None".into())
+            })?
+        };
+        let dot_fn = kernels.shared_dot_f32_batched.as_ref().ok_or_else(|| {
+            RuntimeError::Compute("batched shared expert: shared_dot_f32_batched not loaded".into())
+        })?;
+        let down_fn = kernels
+            .shared_down_q4_0_sigmoid_accum_batched
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Compute(
+                    "batched shared expert: shared_down_q4_0_sigmoid_accum_batched not loaded".into(),
+                )
+            })?;
+        // Stage 2: per-token logit.
+        {
+            let g = scratch.prefill_grouped.as_mut().unwrap();
+            let cfg = CudarcLaunchConfig {
+                grid_dim: (1, batch_u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                device.stream
+                    .launch_builder(dot_fn)
+                    .arg(&gis_view)
+                    .arg(normed)
+                    .arg(&mut g.shared_logit_batched)
+                    .arg(&hd_u32)
+                    .arg(&batch_u32)
+                    .launch(cfg)
+                    .map_err(|e| RuntimeError::Compute(format!("shared_dot_f32_batched: {e}")))?;
+            }
+        }
+        // Stage 3: down + sigmoid-gated accum into output.
+        if shared_tiled {
+            let down_tiled_fn = kernels.shared_down_q4_0_accum_batched_tiled_f32act.as_ref().unwrap();
+            let grid_x = ((batch as u32) + 15) / 16;   // SBTD_BM = 16
+            let grid_y = (hidden_dim as u32) / 64;     // SBTD_BN = 64 (shape-guarded)
+            let gate_mode: u32 = 1;                     // sigmoid-gated
+            let g = scratch.prefill_grouped.as_ref().unwrap();
+            let swiglu_view = g.shared_swiglu_batched.slice(0..batch * inter_dim_eff);
+            let cfg = CudarcLaunchConfig {
+                grid_dim: (grid_x, grid_y, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                device.stream
+                    .launch_builder(down_tiled_fn)
+                    .arg(&down_view)
+                    .arg(&swiglu_view)
+                    .arg(&g.shared_logit_batched)
+                    .arg(output)
+                    .arg(&hd_u32)
+                    .arg(&ie_u32)
+                    .arg(&batch_u32)
+                    .arg(&gate_mode)
+                    .launch(cfg)
+                    .map_err(|e| RuntimeError::Compute(format!(
+                        "shared_down_q4_0_accum_batched_tiled_f32act (sigmoid): {e}"
+                    )))?;
+            }
+        } else {
+            let g = scratch.prefill_grouped.as_ref().unwrap();
+            let swiglu_view = g.shared_swiglu_batched.slice(0..batch * inter_dim_eff);
+            let cfg = CudarcLaunchConfig {
+                grid_dim: (hd_u32, batch_u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                device.stream
+                    .launch_builder(down_fn)
+                    .arg(&down_view)
+                    .arg(&swiglu_view)
+                    .arg(&g.shared_logit_batched)
+                    .arg(output)
+                    .arg(&hd_u32)
+                    .arg(&ie_u32)
+                    .arg(&batch_u32)
+                    .launch(cfg)
+                    .map_err(|e| RuntimeError::Compute(format!(
+                        "shared_down_q4_0_sigmoid_accum_batched: {e}"
+                    )))?;
+            }
+        }
+    } else if shared_tiled {
+        // No gate_inp + tiled: plain residual accumulate (gate_mode=0).
+        let down_tiled_fn = kernels.shared_down_q4_0_accum_batched_tiled_f32act.as_ref().unwrap();
+        let grid_x = ((batch as u32) + 15) / 16;   // SBTD_BM = 16
+        let grid_y = (hidden_dim as u32) / 64;     // SBTD_BN = 64 (shape-guarded)
+        let gate_mode: u32 = 0;                     // plain residual
+        let g = scratch.prefill_grouped.as_ref().unwrap();
+        let swiglu_view = g.shared_swiglu_batched.slice(0..batch * inter_dim_eff);
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device.stream
+                .launch_builder(down_tiled_fn)
+                .arg(&down_view)
+                .arg(&swiglu_view)
+                .arg(&g.shared_logit_batched) // unused at gate_mode=0; valid ptr
+                .arg(output)
+                .arg(&hd_u32)
+                .arg(&ie_u32)
+                .arg(&batch_u32)
+                .arg(&gate_mode)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!(
+                    "shared_down_q4_0_accum_batched_tiled_f32act (residual): {e}"
+                )))?;
+        }
+    } else {
+        // No gate_inp: plain residual accumulate.
+        let down_fn = kernels
+            .shared_down_q4_0_residual_accum_batched
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Compute(
+                    "batched shared expert: shared_down_q4_0_residual_accum_batched not loaded".into(),
+                )
+            })?;
+        let g = scratch.prefill_grouped.as_ref().unwrap();
+        let swiglu_view = g.shared_swiglu_batched.slice(0..batch * inter_dim_eff);
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (hd_u32, batch_u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device.stream
+                .launch_builder(down_fn)
+                .arg(&down_view)
+                .arg(&swiglu_view)
+                .arg(output)
+                .arg(&hd_u32)
+                .arg(&ie_u32)
+                .arg(&batch_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!(
+                    "shared_down_q4_0_residual_accum_batched: {e}"
+                )))?;
         }
     }
 

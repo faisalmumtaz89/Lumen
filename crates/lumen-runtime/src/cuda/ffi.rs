@@ -205,6 +205,20 @@ impl CudaDevice {
             .map_err(cuda_driver_err)
     }
 
+    /// Copy a device VIEW (sub-slice) back to host. Lets callers transfer only
+    /// the live region of an over-allocated scratch buffer instead of the whole
+    /// capacity (e.g. the [batch, num_experts] live region of a [cap_tok,
+    /// num_experts] grouped-prefill scratch).
+    pub fn dtoh_copy_view<T, Src>(&self, device_view: &Src) -> Result<Vec<T>, RuntimeError>
+    where
+        T: DeviceRepr,
+        Src: cudarc::driver::DevicePtr<T>,
+    {
+        self.stream
+            .clone_dtoh(device_view)
+            .map_err(cuda_driver_err)
+    }
+
     /// Synchronize the default stream (wait for all pending GPU work).
     pub fn synchronize(&self) -> Result<(), RuntimeError> {
         self.stream.synchronize().map_err(cuda_driver_err)

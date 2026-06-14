@@ -193,6 +193,21 @@ pub(crate) struct KernelSet {
     // differs (load residual, add MMQ result, store sum).
     pub(crate) mmq_q8_0_batched_residual: Option<CudaFunction>,
 
+    // Tiled shared-memory-staged MMQ Q8_0 GEMM. Drop-in fast
+    // replacement for `mmq_q8_0_batched`: same Q8_0/Q8_1 INT8 dp4a numerics,
+    // but stages activation + weight tiles in shared memory (BM=32 x BN=128 x
+    // BK=8, 512 threads) with no cross-thread reduction, eliminating the
+    // matvec's redundant per-row-tile activation re-quant. Env-gated
+    // `LUMEN_CUDA_MMQ_TILED=1`.
+    pub(crate) mmq_q8_0_tiled: Option<CudaFunction>,
+    // Residual-add variant of `mmq_q8_0_tiled` (out = residual + W @ x).
+    pub(crate) mmq_q8_0_tiled_residual: Option<CudaFunction>,
+    // LEVER C: int8 tensor-core (mma.sync m16n8k32) dense Q8_0 GEMM. Numerics-
+    // identical drop-in for `mmq_q8_0_tiled` on the dense GDN/full-attn
+    // projections (validated BYTE-IDENTICAL to the dp4a kernel on 10 shapes).
+    // Env-gated `LUMEN_CUDA_MMQ_IMMA=1` (default OFF).
+    pub(crate) mmq_q8_0_imma: Option<CudaFunction>,
+
     // MMQ-style Q4_0 batched matmul (dp4a INT4 path). q4-specific twin of
     // `mmq_q8_0_batched`: Q4_0 weights x per-token-INT8-quantized activation,
     // INT32-exact dp4a with de-interleaved nibbles + -8 zero-point + once-only
@@ -686,6 +701,78 @@ pub(crate) struct KernelSet {
     pub(crate) moe_batched_down_v2: Option<CudaFunction>,
     pub(crate) moe_batched_gate_up_swiglu_q8_0_v3: Option<CudaFunction>,
     pub(crate) moe_batched_down_v3: Option<CudaFunction>,
+    // Grouped (expert-sorted) MoE PREFILL FFN kernels.
+    // Replace the per-token loop in `prefill_moe_ffn_layer` with a batched,
+    // expert-grouped dispatch. Gated behind `LUMEN_CUDA_MOE_PREFILL_BATCHED=1`.
+    pub(crate) moe_router_logits_batched: Option<CudaFunction>,
+    pub(crate) moe_grouped_gate_up_swiglu_q8_0: Option<CudaFunction>,
+    pub(crate) moe_grouped_gate_up_swiglu_q8_0_mtiled: Option<CudaFunction>,
+    /// Tiled shmem-staged grouped gate+up+SwiGLU (BM16/BN64/BK8, dp4a,
+    /// no cross-thread reduction). Engaged by `LUMEN_CUDA_MOE_GROUPED_TILED=1`.
+    pub(crate) moe_grouped_gate_up_swiglu_q8_0_tiled: Option<CudaFunction>,
+    pub(crate) moe_grouped_down_q8_0: Option<CudaFunction>,
+    /// Tiled shmem-staged grouped DOWN projection (BM16/BN128/BK8, dp4a,
+    /// no cross-thread reduction). Engaged by `LUMEN_CUDA_MOE_GROUPED_TILED=1`
+    /// (shares the gate+up tile gate + the same host `tiles16` column-tile list).
+    pub(crate) moe_grouped_down_q8_0_tiled: Option<CudaFunction>,
+    /// Tiled grouped DOWN with EXACT F32 activation (the
+    /// down-tiled quality rescue — same tile structure, BM16/BN64/BK8, but raw
+    /// F32 activation dot instead of int8-quantized, matching the per-column
+    /// reference numerics). Opt-in via `LUMEN_CUDA_MOE_DOWN_TILED_F32ACT=1`.
+    pub(crate) moe_grouped_down_q8_0_tiled_f32act: Option<CudaFunction>,
+    /// Q4_0 grouped TILED FFN, f32-activation design. Same tile
+    /// structure as the Q8 f32act kernels but the weight staging decodes Q4_0
+    /// nibbles `(n-8)` to int8 (de-interleaved 18-byte blocks). Engaged when the
+    /// MoE experts are Q4_0 under the parent `LUMEN_CUDA_MOE_GROUPED_TILED=1`.
+    pub(crate) moe_grouped_gate_up_swiglu_q4_0_tiled_f32act: Option<CudaFunction>,
+    pub(crate) moe_grouped_down_q4_0_tiled_f32act: Option<CudaFunction>,
+    /// BF16 grouped TILED FFN (f32act). bf16 weights are contiguous
+    /// unsigned short (no blocks/scales); staging converts bits<<16 -> f32, flat F32
+    /// dot. Engaged when MoE experts are BF16 under the parent tiled flag.
+    pub(crate) moe_grouped_gate_up_swiglu_bf16_tiled_f32act: Option<CudaFunction>,
+    pub(crate) moe_grouped_down_bf16_tiled_f32act: Option<CudaFunction>,
+    /// Offline aligned-plane weight REPACK for the routed-FFN down
+    /// projection. Runs once per MoE layer at preload, reading raw Q8_0 down
+    /// weights from the layer blob into aligned `d_q`/`d_s` planes consumed by
+    /// `moe_grouped_down_q8_0_fast_bn128` and the IMMA down kernel.
+    pub(crate) moe_repack_down_q8_0: Option<CudaFunction>,
+    /// Numerics-preserving fast down (`down_f32_fast_bn128`).
+    /// BM16/BN128/BK4, double-buffered, reads REPACKED aligned planes,
+    /// `char4`/`float4` vectorized staging. Recovers the +10.8% down headroom at
+    /// PRISTINE numerics (raw-F32 act, no int8 quant). Requires dynamic shmem
+    /// (52,224 B). Opt-in via `LUMEN_CUDA_MOE_DOWN_FAST_BN128=1`.
+    pub(crate) moe_grouped_down_q8_0_fast_bn128: Option<CudaFunction>,
+    /// Offline aligned-plane REPACK for the routed-FFN gate+up (fused).
+    /// Builds the `gu_q`/`gu_s` planes consumed by the IMMA gate+up kernel.
+    pub(crate) moe_repack_gate_up_q8_0: Option<CudaFunction>,
+    /// int8 TENSOR-CORE (IMMA) grouped gate+up+SwiGLU GEMM.
+    /// `mma.sync.m16n8k32.s8.s8.s32`, validated int8 tile maps (load_generic),
+    /// BM16/BN64/BK4, on-the-fly int8 x quant, per-block int32->f32 scale
+    /// (BIT-IDENTICAL to dp4a). Reads REPACKED gu_q/gu_s. Requires dynamic shmem
+    /// (47,616 B). Opt-in via `LUMEN_CUDA_MOE_GATE_UP_IMMA=1`.
+    pub(crate) moe_grouped_gate_up_swiglu_q8_0_imma: Option<CudaFunction>,
+    /// One-time compact K-major activation prequant (`xq_q`/`xq_d`) so
+    /// the register-C gate+up GEMM never re-quantizes x across row-tiles. Bit-
+    /// identical activation quant rule to the IMMA on-the-fly path.
+    pub(crate) moe_prequant_x_q8: Option<CudaFunction>,
+    /// Register-resident-C + wide-M (bucketed {16,32,48,64} cols × N=128
+    /// rows) IMMA gate+up (no stream-K). Tile-validated
+    /// 13/13. Opt-in via `LUMEN_CUDA_MOE_GATE_UP_W10=1`.
+    pub(crate) moe_grouped_gate_up_swiglu_q8_0_w10_mg1: Option<CudaFunction>,
+    pub(crate) moe_grouped_gate_up_swiglu_q8_0_w10_mg2: Option<CudaFunction>,
+    pub(crate) moe_grouped_gate_up_swiglu_q8_0_w10_mg3: Option<CudaFunction>,
+    pub(crate) moe_grouped_gate_up_swiglu_q8_0_w10_mg4: Option<CudaFunction>,
+    pub(crate) moe_grouped_scatter_accum_q8_0: Option<CudaFunction>,
+    // Batched shared-expert FFN kernels.
+    pub(crate) shared_glu_gemv_q4_0_batched: Option<CudaFunction>,
+    pub(crate) shared_dot_f32_batched: Option<CudaFunction>,
+    pub(crate) shared_down_q4_0_sigmoid_accum_batched: Option<CudaFunction>,
+    pub(crate) shared_down_q4_0_residual_accum_batched: Option<CudaFunction>,
+    // TILED shared-expert FFN (f32act, Q4_0 dense). Engaged under
+    // the parent `LUMEN_CUDA_MOE_GROUPED_TILED=1` when shapes are compatible —
+    // replaces the per-(row,token) matvec shared kernels. Helps every quant.
+    pub(crate) shared_glu_gemv_q4_0_batched_tiled_f32act: Option<CudaFunction>,
+    pub(crate) shared_down_q4_0_accum_batched_tiled_f32act: Option<CudaFunction>,
     // fused persistent gate+up+SwiGLU+down+accum kernel (Q8_0).
     // Eliminates the HBM round-trip on swiglu_buf by keeping the K-expert
     // SwiGLU intermediate in shmem. One launch replaces the
@@ -1010,6 +1097,29 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         ) {
             Ok(f) => Some(f),
             Err(e) => { cuda_log!("[CUDA] MMQ Q8_0 batched_residual: FAILED: {e}"); None }
+        },
+        // Tiled shared-memory-staged MMQ Q8_0 GEMM + residual variant.
+        mmq_q8_0_tiled: match load_fn_sm80(
+            shaders::MMQ_Q8_0_TILED_KERNEL_SOURCE,
+            "mmq_q8_0_tiled",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] mmq_q8_0_tiled: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] mmq_q8_0_tiled: FAILED: {e}"); None }
+        },
+        mmq_q8_0_tiled_residual: match load_fn_sm80(
+            shaders::MMQ_Q8_0_TILED_KERNEL_SOURCE,
+            "mmq_q8_0_tiled_residual",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] mmq_q8_0_tiled_residual: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] mmq_q8_0_tiled_residual: FAILED: {e}"); None }
+        },
+        // LEVER C int8-TC dense Q8_0 GEMM (mma.sync) — same source file.
+        mmq_q8_0_imma: match load_fn_sm80(
+            shaders::MMQ_Q8_0_TILED_KERNEL_SOURCE,
+            "mmq_q8_0_imma",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] mmq_q8_0_imma: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] mmq_q8_0_imma: FAILED: {e}"); None }
         },
         // q4-specific MMQ INT4 batched matmul (mul_mat_q-grade numerics).
         mmq_q4_0_batched: match load_fn_sm80(
@@ -1871,6 +1981,197 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             Ok(f) => { cuda_log!("[CUDA] moe_batched_down_v3: OK"); Some(f) }
             Err(e) => { cuda_log!("[CUDA] moe_batched_down_v3: FAILED: {e}"); None }
         },
+        // Grouped MoE prefill FFN kernels.
+        moe_router_logits_batched: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_router_logits_batched",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_router_logits_batched: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_router_logits_batched: FAILED: {e}"); None }
+        },
+        moe_grouped_gate_up_swiglu_q8_0: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_gate_up_swiglu_q8_0",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0: FAILED: {e}"); None }
+        },
+        moe_grouped_gate_up_swiglu_q8_0_mtiled: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_gate_up_swiglu_q8_0_mtiled",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_mtiled: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_mtiled: FAILED: {e}"); None }
+        },
+        moe_grouped_gate_up_swiglu_q8_0_tiled: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_gate_up_swiglu_q8_0_tiled",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_tiled: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_tiled: FAILED: {e}"); None }
+        },
+        moe_grouped_down_q8_0: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_down_q8_0",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_down_q8_0: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_down_q8_0: FAILED: {e}"); None }
+        },
+        moe_grouped_down_q8_0_tiled: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_down_q8_0_tiled",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_down_q8_0_tiled: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_down_q8_0_tiled: FAILED: {e}"); None }
+        },
+        moe_grouped_down_q8_0_tiled_f32act: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_down_q8_0_tiled_f32act",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_down_q8_0_tiled_f32act: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_down_q8_0_tiled_f32act: FAILED: {e}"); None }
+        },
+        moe_grouped_gate_up_swiglu_q4_0_tiled_f32act: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_gate_up_swiglu_q4_0_tiled_f32act",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q4_0_tiled_f32act: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q4_0_tiled_f32act: FAILED: {e}"); None }
+        },
+        moe_grouped_down_q4_0_tiled_f32act: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_down_q4_0_tiled_f32act",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_down_q4_0_tiled_f32act: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_down_q4_0_tiled_f32act: FAILED: {e}"); None }
+        },
+        // bf16 grouped tiled f32act (no dp4a; mov.b32 PTX universal -> load_fn_sm80
+        // for consistency with the rest of the grouped source unit).
+        moe_grouped_gate_up_swiglu_bf16_tiled_f32act: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_gate_up_swiglu_bf16_tiled_f32act",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_bf16_tiled_f32act: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_bf16_tiled_f32act: FAILED: {e}"); None }
+        },
+        moe_grouped_down_bf16_tiled_f32act: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_down_bf16_tiled_f32act",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_down_bf16_tiled_f32act: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_down_bf16_tiled_f32act: FAILED: {e}"); None }
+        },
+        moe_repack_down_q8_0: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_repack_down_q8_0",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_repack_down_q8_0: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_repack_down_q8_0: FAILED: {e}"); None }
+        },
+        moe_grouped_down_q8_0_fast_bn128: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_down_q8_0_fast_bn128",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_down_q8_0_fast_bn128: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_down_q8_0_fast_bn128: FAILED: {e}"); None }
+        },
+        moe_repack_gate_up_q8_0: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_repack_gate_up_q8_0",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_repack_gate_up_q8_0: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_repack_gate_up_q8_0: FAILED: {e}"); None }
+        },
+        moe_grouped_gate_up_swiglu_q8_0_imma: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_gate_up_swiglu_q8_0_imma",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_imma: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_imma: FAILED: {e}"); None }
+        },
+        // Activation prequant + register-C wide-M gate+up (MG 1..4).
+        // mma.sync requires sm80 codegen → load_fn_sm80.
+        moe_prequant_x_q8: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE, "moe_prequant_x_q8",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_prequant_x_q8: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_prequant_x_q8: FAILED: {e}"); None }
+        },
+        moe_grouped_gate_up_swiglu_q8_0_w10_mg1: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE, "moe_grouped_gate_up_swiglu_q8_0_w10_mg1",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg1: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg1: FAILED: {e}"); None }
+        },
+        moe_grouped_gate_up_swiglu_q8_0_w10_mg2: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE, "moe_grouped_gate_up_swiglu_q8_0_w10_mg2",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg2: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg2: FAILED: {e}"); None }
+        },
+        moe_grouped_gate_up_swiglu_q8_0_w10_mg3: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE, "moe_grouped_gate_up_swiglu_q8_0_w10_mg3",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg3: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg3: FAILED: {e}"); None }
+        },
+        moe_grouped_gate_up_swiglu_q8_0_w10_mg4: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE, "moe_grouped_gate_up_swiglu_q8_0_w10_mg4",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg4: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg4: FAILED: {e}"); None }
+        },
+        moe_grouped_scatter_accum_q8_0: match load_fn_sm80(
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_scatter_accum_q8_0",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] moe_grouped_scatter_accum_q8_0: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] moe_grouped_scatter_accum_q8_0: FAILED: {e}"); None }
+        },
+        // Batched shared-expert FFN kernels.
+        shared_glu_gemv_q4_0_batched: match load_fn(
+            shaders::MOE_SHARED_BATCHED_KERNEL_SOURCE,
+            "shared_glu_gemv_q4_0_batched",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] shared_glu_gemv_q4_0_batched: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] shared_glu_gemv_q4_0_batched: FAILED: {e}"); None }
+        },
+        shared_dot_f32_batched: match load_fn(
+            shaders::MOE_SHARED_BATCHED_KERNEL_SOURCE,
+            "shared_dot_f32_batched",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] shared_dot_f32_batched: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] shared_dot_f32_batched: FAILED: {e}"); None }
+        },
+        shared_down_q4_0_sigmoid_accum_batched: match load_fn(
+            shaders::MOE_SHARED_BATCHED_KERNEL_SOURCE,
+            "shared_down_q4_0_sigmoid_accum_batched",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] shared_down_q4_0_sigmoid_accum_batched: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] shared_down_q4_0_sigmoid_accum_batched: FAILED: {e}"); None }
+        },
+        shared_down_q4_0_residual_accum_batched: match load_fn(
+            shaders::MOE_SHARED_BATCHED_KERNEL_SOURCE,
+            "shared_down_q4_0_residual_accum_batched",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] shared_down_q4_0_residual_accum_batched: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] shared_down_q4_0_residual_accum_batched: FAILED: {e}"); None }
+        },
+        // Tiled shared-expert f32act (F32 dot, no dp4a -> default arch load_fn).
+        shared_glu_gemv_q4_0_batched_tiled_f32act: match load_fn(
+            shaders::MOE_SHARED_BATCHED_KERNEL_SOURCE,
+            "shared_glu_gemv_q4_0_batched_tiled_f32act",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] shared_glu_gemv_q4_0_batched_tiled_f32act: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] shared_glu_gemv_q4_0_batched_tiled_f32act: FAILED: {e}"); None }
+        },
+        shared_down_q4_0_accum_batched_tiled_f32act: match load_fn(
+            shaders::MOE_SHARED_BATCHED_KERNEL_SOURCE,
+            "shared_down_q4_0_accum_batched_tiled_f32act",
+        ) {
+            Ok(f) => { cuda_log!("[CUDA] shared_down_q4_0_accum_batched_tiled_f32act: OK"); Some(f) }
+            Err(e) => { cuda_log!("[CUDA] shared_down_q4_0_accum_batched_tiled_f32act: FAILED: {e}"); None }
+        },
         // fused persistent gate+up+SwiGLU+down+accum.
         moe_batched_persistent_gate_up_swiglu_down_accum_q8_0: match load_fn(
             shaders::MOE_BATCHED_KERNEL_SOURCE,
@@ -2210,6 +2511,55 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
     // cannot service the request keep the default cap and only long-context
     // decode is affected.
     opt_in_attention_decode_dyn_shmem(&[&kernels.attention_decode])?;
+
+    // The `down_f32_fast_bn128` kernel needs 52,224 B of dynamic
+    // shared memory (> the 48 KB static cap) and PreferredSharedMemoryCarveout=100
+    // to fit 3 CTAs/SM. Best-effort (non-fatal): if declined the kernel won't
+    // launch and dispatch falls back to the f32act / per-column path.
+    if let Some(f) = kernels.moe_grouped_down_q8_0_fast_bn128.as_ref() {
+        use cudarc::driver::sys::CUfunction_attribute_enum::{
+            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+        };
+        if let Err(e) = f.set_attribute(
+            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            56 * 1024_i32,
+        ) {
+            eprintln!(
+                "[lumen-cuda] moe_grouped_down_q8_0_fast_bn128 dyn-shmem opt-in \
+                 declined ({e}); fast BN=128 down disabled"
+            );
+        } else {
+            // Carveout=100 -> prefer max shared (occupancy: 3*52224 < 163840).
+            let _ = f.set_attribute(
+                CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                100_i32,
+            );
+        }
+    }
+
+    // The IMMA gate+up kernel uses 47,616 B dynamic shmem. Raise the
+    // limit + carveout=100 for 3 CTAs/SM. Best-effort (non-fatal).
+    if let Some(f) = kernels.moe_grouped_gate_up_swiglu_q8_0_imma.as_ref() {
+        use cudarc::driver::sys::CUfunction_attribute_enum::{
+            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+        };
+        if let Err(e) = f.set_attribute(
+            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            49_152_i32,
+        ) {
+            eprintln!(
+                "[lumen-cuda] moe_grouped_gate_up_swiglu_q8_0_imma dyn-shmem opt-in \
+                 declined ({e}); IMMA gate+up disabled"
+            );
+        } else {
+            let _ = f.set_attribute(
+                CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                100_i32,
+            );
+        }
+    }
 
     Ok(kernels)
 }

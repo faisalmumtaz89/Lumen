@@ -544,14 +544,74 @@ pub(crate) unsafe fn launch_gemm_projection(
             // restores llama-matching INT8 numerics so the products are correct.
             // Dense q8 keeps the faster HGEMM path (no router to amplify drift).
             // Env `LUMEN_CUDA_Q8_PROJ_MMQ=0|1` overrides the per-model default.
-            let mmq_enabled = match std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").ok().as_deref() {
+            let mut mmq_enabled = match std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").ok().as_deref() {
                 Some(v) => !matches!(v, "0" | "false" | "no"),
                 None => crate::runtime_defaults::model_is_moe(),
             };
+            // DIAGNOSTIC (LUMEN_CUDA_GDN_PROJ_HGEMM=1, no-op when unset): route
+            // ONLY the GDN-block projections (labels starting "gdn_") through the
+            // fast dequant->F16->HGEMM path, while FFN/expert/router projections
+            // keep MMQ INT8. Tests whether the GDN-projection INT8 fidelity is
+            // load-bearing for the 256-expert router (the documented reason MoE
+            // defaults ALL Q8 projections to MMQ). If the oracle stays
+            // byte-identical, GDN-only HGEMM is a safe ~+38% prefill win.
+            if label.starts_with("gdn_")
+                && std::env::var("LUMEN_CUDA_GDN_PROJ_HGEMM").as_deref() == Ok("1")
+            {
+                mmq_enabled = false;
+            }
             let use_mmq = mmq_enabled
                 && !force_alpha_beta_f32
                 && kernels.mmq_q8_0_batched.is_some()
                 && in_dim % 32 == 0;
+            // Tiled shmem-staged MMQ replaces the matvec when
+            // LUMEN_CUDA_MMQ_TILED=1 (same INT8 numerics, ~order-of-magnitude
+            // faster). Falls back to the matvec when the tiled kernel is
+            // unavailable. Default OFF preserves the matvec path.
+            let use_tiled = use_mmq
+                && std::env::var("LUMEN_CUDA_MMQ_TILED").as_deref() == Ok("1")
+                && kernels.mmq_q8_0_tiled.is_some();
+            if use_tiled {
+                // LEVER C: int8 tensor-core (mma.sync) dense GEMM takes priority
+                // over the dp4a tiled kernel when LUMEN_CUDA_MMQ_IMMA=1 AND the
+                // kernel is loaded AND the shape is supported (out_dim % 64 for
+                // a full N-tile; the kernel masks the row/token tails internally
+                // but the N64 weight-stage stride assumes whole 64-row tiles, so
+                // we only require out_dim multiple of 64 — GDN proj out dims are).
+                // BYTE-IDENTICAL to the dp4a kernel (validated 10 shapes), so this
+                // is a pure throughput swap with no numeric change. Default OFF.
+                let use_imma = std::env::var("LUMEN_CUDA_MMQ_IMMA").as_deref() == Ok("1")
+                    && kernels.mmq_q8_0_imma.is_some()
+                    && out_dim % 64 == 0;
+                if use_imma {
+                    static IMMA_LOGGED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !IMMA_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!(
+                            "[CUDA]: Prefill Q8 MMQ-IMMA (int8 tensor-core): ACTIVE \
+                             ({label}, batch={batch}, out_dim={out_dim}, in_dim={in_dim})"
+                        );
+                    }
+                    launch_mmq_q8_0_imma(
+                        device, kernels, w_q8, input, output,
+                        out_dim, in_dim, batch, label,
+                    )?;
+                    return Ok(());
+                }
+                static TILED_LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !TILED_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[CUDA]: Prefill Q8 MMQ-TILED: ACTIVE ({label}, batch={batch}, \
+                         out_dim={out_dim}, in_dim={in_dim})"
+                    );
+                }
+                launch_mmq_q8_0_tiled(
+                    device, kernels, w_q8, input, output,
+                    out_dim, in_dim, batch, label,
+                )?;
+                return Ok(());
+            }
             if use_mmq {
                 static MMQ_LOGGED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
@@ -1055,6 +1115,25 @@ pub(crate) unsafe fn launch_gemm_residual(
             let use_mmq = q8_residual_mmq
                 && kernels.mmq_q8_0_batched_residual.is_some()
                 && in_dim % 32 == 0;
+            // Tiled shmem-staged MMQ residual when LUMEN_CUDA_MMQ_TILED=1.
+            let use_tiled = use_mmq
+                && std::env::var("LUMEN_CUDA_MMQ_TILED").as_deref() == Ok("1")
+                && kernels.mmq_q8_0_tiled_residual.is_some();
+            if use_tiled {
+                static TILED_RES_LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !TILED_RES_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[CUDA]: Prefill Q8 MMQ-TILED+residual: ACTIVE ({label}, batch={batch}, \
+                         out_dim={out_dim}, in_dim={in_dim})"
+                    );
+                }
+                launch_mmq_q8_0_tiled_residual(
+                    device, kernels, w_q8, input, residual, output,
+                    out_dim, in_dim, batch, label,
+                )?;
+                return Ok(());
+            }
             if use_mmq {
                 static MMQ_RES_LOGGED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
@@ -1954,6 +2033,172 @@ pub(crate) unsafe fn launch_mmq_q8_0_batched(
         .arg(&batch_u32)
         .launch(launch_cfg)
         .map_err(|e| RuntimeError::Compute(format!("mmq_q8_0_batched {label}: {e}")))?;
+    Ok(())
+}
+
+/// Tile constants for the Wave-4 tiled MMQ Q8_0 GEMM. MUST match the `#define`s
+/// in `shaders/mmq_q8_0_tiled.cu`.
+const TMMQ_BM: usize = 32;
+const TMMQ_BN: usize = 128;
+
+/// Tiled shared-memory-staged MMQ Q8_0 GEMM: `out = W @ x`. Fast replacement
+/// for `launch_mmq_q8_0_batched` (same INT8 dp4a numerics, no redundant
+/// activation re-quant). grid = (ceil(out_dim/BN), ceil(batch/BM)), 512 threads.
+///
+/// # Safety
+/// `weight_q8` must contain `out_dim * (in_dim/32) * 34` bytes of Q8_0 data;
+/// `x` must have `batch * in_dim` F32 elements; `out` must have
+/// `batch * out_dim` F32 elements. `in_dim` must be a multiple of 32.
+pub(crate) unsafe fn launch_mmq_q8_0_tiled(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    weight_q8: &CudaSlice<u8>,
+    x: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    out_dim: usize,
+    in_dim: usize,
+    batch: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    if in_dim % 32 != 0 {
+        return Err(RuntimeError::Compute(format!(
+            "mmq_q8_0_tiled {label}: in_dim ({in_dim}) must be a multiple of 32"
+        )));
+    }
+    let f = kernels.mmq_q8_0_tiled.as_ref().ok_or_else(|| {
+        RuntimeError::Compute(format!("mmq_q8_0_tiled {label}: kernel not loaded"))
+    })?;
+    let grid_x = (out_dim + TMMQ_BN - 1) / TMMQ_BN;
+    let grid_y = (batch + TMMQ_BM - 1) / TMMQ_BM;
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (grid_x as u32, grid_y as u32, 1),
+        block_dim: (512, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let out_dim_u32 = out_dim as u32;
+    let in_dim_u32 = in_dim as u32;
+    let batch_u32 = batch as u32;
+    device
+        .stream
+        .launch_builder(f)
+        .arg(weight_q8)
+        .arg(x)
+        .arg(out)
+        .arg(&out_dim_u32)
+        .arg(&in_dim_u32)
+        .arg(&batch_u32)
+        .launch(launch_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("mmq_q8_0_tiled {label}: {e}")))?;
+    Ok(())
+}
+
+/// LEVER C: int8 tensor-core (mma.sync m16n8k32) dense Q8_0 GEMM. Numerics-
+/// identical drop-in for `launch_mmq_q8_0_tiled` (validated BYTE-IDENTICAL to
+/// the dp4a kernel on 10 shapes incl the real prefill 2048×2048×1714). Same
+/// Q8_0 weight format, same per-32-block int32-then-f32-scale contract. CTA =
+/// M16 tokens × N64 rows, 256 threads. grid = (ceil(out/64), ceil(batch/16)).
+///
+/// # Safety
+/// `weight_q8` must hold `out_dim*(in_dim/32)*34` bytes (Q8_0 row-major).
+/// `x` must hold `batch*in_dim` F32. `out` must hold `batch*out_dim` F32.
+/// `in_dim` must be a multiple of 32. Caller owns the streams.
+pub(crate) unsafe fn launch_mmq_q8_0_imma(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    weight_q8: &CudaSlice<u8>,
+    x: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    out_dim: usize,
+    in_dim: usize,
+    batch: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    if in_dim % 32 != 0 {
+        return Err(RuntimeError::Compute(format!(
+            "mmq_q8_0_imma {label}: in_dim ({in_dim}) must be a multiple of 32"
+        )));
+    }
+    let f = kernels.mmq_q8_0_imma.as_ref().ok_or_else(|| {
+        RuntimeError::Compute(format!("mmq_q8_0_imma {label}: kernel not loaded"))
+    })?;
+    const IMC_BM: usize = 16;
+    const IMC_BN: usize = 64;
+    let grid_x = (out_dim + IMC_BN - 1) / IMC_BN;
+    let grid_y = (batch + IMC_BM - 1) / IMC_BM;
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (grid_x as u32, grid_y as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let out_dim_u32 = out_dim as u32;
+    let in_dim_u32 = in_dim as u32;
+    let batch_u32 = batch as u32;
+    device
+        .stream
+        .launch_builder(f)
+        .arg(weight_q8)
+        .arg(x)
+        .arg(out)
+        .arg(&out_dim_u32)
+        .arg(&in_dim_u32)
+        .arg(&batch_u32)
+        .launch(launch_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("mmq_q8_0_imma {label}: {e}")))?;
+    Ok(())
+}
+
+/// Tiled MMQ Q8_0 GEMM WITH RESIDUAL ADD: `out = residual + W @ x`. Fast
+/// replacement for `launch_mmq_q8_0_batched_residual`.
+///
+/// # Safety
+/// As `launch_mmq_q8_0_tiled`, plus `residual` must have `batch * out_dim` F32
+/// elements. `out` and `residual` may alias only at distinct indices; the
+/// kernel reads `residual[idx]` and writes `out[idx]` in the epilogue, so
+/// distinct buffers are required (the Lumen caller always passes distinct).
+pub(crate) unsafe fn launch_mmq_q8_0_tiled_residual(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    weight_q8: &CudaSlice<u8>,
+    x: &CudaSlice<f32>,
+    residual: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    out_dim: usize,
+    in_dim: usize,
+    batch: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    if in_dim % 32 != 0 {
+        return Err(RuntimeError::Compute(format!(
+            "mmq_q8_0_tiled_residual {label}: in_dim ({in_dim}) must be a multiple of 32"
+        )));
+    }
+    let f = kernels.mmq_q8_0_tiled_residual.as_ref().ok_or_else(|| {
+        RuntimeError::Compute(format!(
+            "mmq_q8_0_tiled_residual {label}: kernel not loaded"
+        ))
+    })?;
+    let grid_x = (out_dim + TMMQ_BN - 1) / TMMQ_BN;
+    let grid_y = (batch + TMMQ_BM - 1) / TMMQ_BM;
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (grid_x as u32, grid_y as u32, 1),
+        block_dim: (512, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let out_dim_u32 = out_dim as u32;
+    let in_dim_u32 = in_dim as u32;
+    let batch_u32 = batch as u32;
+    device
+        .stream
+        .launch_builder(f)
+        .arg(weight_q8)
+        .arg(x)
+        .arg(residual)
+        .arg(out)
+        .arg(&out_dim_u32)
+        .arg(&in_dim_u32)
+        .arg(&batch_u32)
+        .launch(launch_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("mmq_q8_0_tiled_residual {label}: {e}")))?;
     Ok(())
 }
 

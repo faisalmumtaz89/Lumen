@@ -1425,6 +1425,21 @@ impl EngineWorker {
             }
         };
 
+        // Diagnostic-only (no-op when env unset): emit prefill tok/s so the
+        // MoE-prefill path can be measured comparably to llama.cpp's
+        // `llama-bench pp@1334`. `suffix_len` is the number of freshly
+        // prefilled tokens (cold prefill => full prompt). Produces evidence
+        // only; does not alter generation behavior.
+        if std::env::var("LUMEN_PREFILL_TIMING").is_ok() {
+            let secs = prefill.prefill_time.as_secs_f64();
+            let n = prefill.suffix_len.max(1);
+            let tps = n as f64 / secs.max(1e-9);
+            eprintln!(
+                "[prefill-timing] suffix_len={} reused_prefix={} prefill_ms={:.3} prefill_tok_s={:.2}",
+                prefill.suffix_len, prefill.reused_prefix_len, secs * 1e3, tps
+            );
+        }
+
         if self
             .send_event_polling_cancel(
                 &tokens_tx,

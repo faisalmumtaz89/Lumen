@@ -53,6 +53,16 @@ pub const DEQUANT_Q8_0_KERNEL_SOURCE: &str = include_str!("dequant_q8_0_f16.cu")
 /// kernel. Default OFF preserves byte-identical behaviour vs main.
 pub const MMQ_Q8_0_KERNEL_SOURCE: &str = include_str!("mmq_q8_0.cu");
 
+/// Tiled shared-memory-staged MMQ Q8_0 GEMM. Replaces the slow
+/// `mmq_q8_0_batched` matvec for large prefill projections: stages a
+/// [BM=32 tokens x BK=8 k-blocks] quantized activation tile and a
+/// [BN=128 rows x BK] weight tile in shared memory, each thread owning
+/// 1 token x 8 rows with NO cross-thread reduction. Same per-32-block
+/// int32-dot-then-f32-scale numerics as the matvec (MoE-router-fidelity
+/// preserving). Two extern "C" kernels: `mmq_q8_0_tiled` and
+/// `mmq_q8_0_tiled_residual`. Env-gated `LUMEN_CUDA_MMQ_TILED=1` (default OFF).
+pub const MMQ_Q8_0_TILED_KERNEL_SOURCE: &str = include_str!("mmq_q8_0_tiled.cu");
+
 /// q4-specific MMQ twin of `MMQ_Q8_0_KERNEL_SOURCE`: Q4_0 weights x
 /// per-token-INT8-quantized activation via dp4a (de-interleaved nibbles + -8
 /// zero-point), matching llama.cpp `mul_mat_q` INT4 numerics for MoE q4
@@ -590,6 +600,31 @@ pub const MOE_ACCUM_KERNEL_SOURCE: &str = include_str!("moe_accum.cu");
 /// Gated behind `LUMEN_CUDA_MOE_BATCHED=1` env var (default OFF).
 /// validates correctness equivalence and measures decode delta vs per-expert.
 pub const MOE_BATCHED_KERNEL_SOURCE: &str = include_str!("moe_batched.cu");
+
+/// Grouped (expert-sorted) MoE PREFILL FFN kernels.
+///
+/// Replaces the per-token Rust loop in `prefill_moe_ffn_layer` with a batched,
+/// expert-grouped dispatch (llama.cpp `mul_mat_id` / Metal `moe_prefill_grouped`
+/// design). Three kernels:
+/// - `moe_grouped_gate_up_swiglu_q8_0`: per compact-column SwiGLU over the
+///   column's expert weights (read once per expert, amortized across its tokens).
+/// - `moe_grouped_down_q8_0`: per compact-column down projection (no accumulate).
+/// - `moe_grouped_scatter_accum_q8_0`: scatter compact down outputs back into the
+///   token stream, weighted by the router weights, added to the residual.
+///
+/// Math is bit-identical to the per-token oracle (same F32 per-block-scale
+/// accumulation, same SwiGLU SiLU form, same NR=4 reduction tree as v3).
+/// Gated behind `LUMEN_CUDA_MOE_PREFILL_BATCHED=1` (default OFF until validated).
+pub const MOE_GROUPED_KERNEL_SOURCE: &str = include_str!("moe_grouped.cu");
+
+/// Batched shared-expert FFN kernels.
+///
+/// Batches the Qwen3.5-MoE always-active shared expert (Q4_0) over all prefill
+/// tokens, replacing the per-token shared-expert loop. Bit-identical to the
+/// per-token `matvec_q4_0` gate/up/down + swiglu + sigmoid-gated accum math,
+/// with an added blockIdx.y=token dimension. Gated behind the same
+/// `LUMEN_CUDA_MOE_PREFILL_BATCHED=1` flag as the grouped routed path.
+pub const MOE_SHARED_BATCHED_KERNEL_SOURCE: &str = include_str!("moe_shared_batched.cu");
 
 /// MoE BF16 expert FFN kernels.
 ///
