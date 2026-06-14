@@ -851,3 +851,164 @@ fn test_gdn_state_output_norm_delta_rule() {
     }
     eprintln!("test_gdn_state_output_norm_delta_rule: PASS");
 }
+
+// ============================================================================
+// CHUNK-PARALLEL DELTA-RULE — CPU reference prototype (Step 0)
+//
+// Validates the chunk-parallel form of the gated delta-rule against the
+// token-serial reference BEFORE any MSL work.
+// Single head, single value-index (the per-(h,vj) recurrence). Proves the
+// chunk equations + forward-solve reproduce the serial output to FP32 drift.
+// ============================================================================
+
+/// Token-serial reference: exactly the math in `gdn_prefill_fused_v3_chunked`
+/// for one (head, vj) row. state s[D]; per token a,b scalars, q,k[D], v scalar.
+/// out_t = <s_t, q_t> * q_scale. Returns (out[T], final_state[D]).
+fn gdn_serial_ref(
+    q: &[Vec<f32>], k: &[Vec<f32>], v: &[f32], a: &[f32], b: &[f32], d: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let t = q.len();
+    let q_scale = 1.0f32 / (d as f32).sqrt();
+    let mut s = vec![0.0f32; d];
+    let mut out = vec![0.0f32; t];
+    for ti in 0..t {
+        // d_vec = a*s ; retrieval = <d_vec, k> ; v_delta = b*(v - retrieval)
+        let mut dvec = vec![0.0f32; d];
+        for i in 0..d { dvec[i] = a[ti] * s[i]; }
+        let mut retrieval = 0.0f32;
+        for i in 0..d { retrieval += dvec[i] * k[ti][i]; }
+        let v_delta = b[ti] * (v[ti] - retrieval);
+        for i in 0..d { s[i] = dvec[i] + k[ti][i] * v_delta; }
+        let mut o = 0.0f32;
+        for i in 0..d { o += s[i] * q[ti][i]; }
+        out[ti] = o * q_scale;
+    }
+    (out, s)
+}
+
+/// Chunk-parallel form, C-token chunks, single (head,vj) row.
+/// Uses prefix/relative/suffix decays built by serial multiplication, forward
+/// solve for u, online output + state accumulation. Decays applied before the
+/// reduction. q_scale applied at the very end. Tail handled by serial fallback.
+fn gdn_chunk_ref(
+    q: &[Vec<f32>], k: &[Vec<f32>], v: &[f32], a: &[f32], b: &[f32], d: usize, c: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let t = q.len();
+    let q_scale = 1.0f32 / (d as f32).sqrt();
+    let mut s = vec![0.0f32; d];          // S_in carried across chunks (D-vector for this vj)
+    let mut out = vec![0.0f32; t];
+    let mut start = 0usize;
+    while start < t {
+        let m = c.min(t - start);
+        // Local token slices.
+        let kk = |i: usize| &k[start + i];
+        let qq = |i: usize| &q[start + i];
+        let aa = |i: usize| a[start + i];
+        let bb = |i: usize| b[start + i];
+        let vv = |i: usize| v[start + i];
+
+        // prefix p_i = prod_{r=0..i} a_r  (serial mult order)
+        let mut p = vec![0.0f32; m];
+        p[0] = aa(0);
+        for i in 1..m { p[i] = p[i - 1] * aa(i); }
+        // suffix sigma_j = prod_{r=j+1..m-1} a_r ; sigma_{m-1}=1
+        let mut sig = vec![0.0f32; m];
+        sig[m - 1] = 1.0;
+        for j in (0..m - 1).rev() { sig[j] = aa(j + 1) * sig[j + 1]; }
+        // relative gamma_ij = prod_{r=j+1..i} a_r (i>j); gamma_ii=1
+        // gamma[i][j]; built by gamma_ij = a_i * gamma_{i-1,j} for j<i.
+        let mut gamma = vec![vec![0.0f32; m]; m];
+        for i in 0..m {
+            gamma[i][i] = 1.0;
+            for j in (0..i).rev() {
+                // gamma_ij = a_i * gamma_{i-1,j}
+                gamma[i][j] = aa(i) * gamma[i - 1][j];
+            }
+        }
+        // T_ij = gamma_ij <k_i, k_j> (strict lower, i>j); H not needed (online).
+        // RHS terms: rhs_i = b_i*(v_i - <S_in, p_i k_i>)
+        // oin_i = <S_in, p_i q_i>
+        // Build u via forward solve; accumulate output and state online.
+        let mut u = vec![0.0f32; m];
+        let mut o_acc = vec![0.0f32; m];
+        // Pre-scale state for chunk end: S <- p_{m-1} * S happens at end (we keep
+        // S_in separate for projections, then add the U^T Σ K term).
+        for i in 0..m {
+            // oin_i = <S_in, p_i q_i> (decay before reduction)
+            let mut oin = 0.0f32;
+            for r in 0..d { oin += s[r] * (p[i] * qq(i)[r]); }
+            o_acc[i] = oin;
+        }
+        for j in 0..m {
+            // rhs_j = b_j*(v_j - <S_in, p_j k_j>)
+            let mut sk = 0.0f32;
+            for r in 0..d { sk += s[r] * (p[j] * kk(j)[r]); }
+            let mut hist = 0.0f32;
+            for l in 0..j {
+                // T_jl = gamma_jl <k_j, k_l> (decay before reduction)
+                let mut kkdot = 0.0f32;
+                for r in 0..d { kkdot += kk(j)[r] * (gamma[j][l] * kk(l)[r]); }
+                hist += kkdot * u[l];
+            }
+            u[j] = bb(j) * (vv(j) - sk - hist);
+            // online output update for rows i>=j: O_i += H_ij u_j,
+            // H_ij = gamma_ij <q_i, k_j> (decay before reduction)
+            for i in j..m {
+                let mut qkdot = 0.0f32;
+                for r in 0..d { qkdot += qq(i)[r] * (gamma[i][j] * kk(j)[r]); }
+                o_acc[i] += qkdot * u[j];
+            }
+        }
+        // write outputs
+        for i in 0..m { out[start + i] = o_acc[i] * q_scale; }
+        // state update: S_out = p_{m-1} S_in + sum_j (sigma_j u_j) k_j
+        for r in 0..d { s[r] *= p[m - 1]; }
+        for j in 0..m {
+            let coef = sig[j] * u[j];
+            for r in 0..d { s[r] += coef * kk(j)[r]; }
+        }
+        start += m;
+    }
+    (out, s)
+}
+
+#[test]
+fn test_gdn_chunk_scan_matches_serial_cpu() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    // Deterministic pseudo-random generator (no external rng dep).
+    let mut seed = 0x9E3779B97F4A7C15u64;
+    let mut next = || { let mut h = DefaultHasher::new(); seed.hash(&mut h); seed = h.finish(); (seed >> 11) as f32 / (1u64 << 53) as f32 };
+
+    let d = 128usize;            // key_dim = val_dim
+    for &t in &[16usize, 17, 31, 48, 100, 200, 1208] {
+        // Build inputs. a in (0,1) decay; b in (0,1) mixing; q,k L2-ish small.
+        let q: Vec<Vec<f32>> = (0..t).map(|_| (0..d).map(|_| next() - 0.5).collect()).collect();
+        // L2-normalize k (the kernel feeds L2-normed conv outputs as q/k).
+        let k: Vec<Vec<f32>> = (0..t).map(|_| {
+            let raw: Vec<f32> = (0..d).map(|_| next() - 0.5).collect();
+            let n = (raw.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1e-6);
+            raw.iter().map(|x| x / n).collect()
+        }).collect();
+        let qn: Vec<Vec<f32>> = q.iter().map(|row| {
+            let n = (row.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1e-6);
+            row.iter().map(|x| x / n).collect()
+        }).collect();
+        let v: Vec<f32> = (0..t).map(|_| next() - 0.5).collect();
+        let a: Vec<f32> = (0..t).map(|_| 0.85 + 0.14 * next()).collect();   // (0.85,0.99)
+        let b: Vec<f32> = (0..t).map(|_| 0.1 + 0.8 * next()).collect();     // (0.1,0.9)
+
+        let (out_s, st_s) = gdn_serial_ref(&qn, &k, &v, &a, &b, d);
+        for &c in &[8usize, 16] {
+            let (out_c, st_c) = gdn_chunk_ref(&qn, &k, &v, &a, &b, d, c);
+            let mut max_out = 0.0f32;
+            for i in 0..t { max_out = max_out.max((out_s[i] - out_c[i]).abs()); }
+            let mut max_st = 0.0f32;
+            for r in 0..d { max_st = max_st.max((st_s[r] - st_c[r]).abs()); }
+            eprintln!("T={t} C={c}: max_out_abs={max_out:.3e} max_state_abs={max_st:.3e}");
+            assert!(max_out < 2e-3, "T={t} C={c} output drift too large: {max_out:.3e}");
+            assert!(max_st < 2e-3, "T={t} C={c} state drift too large: {max_st:.3e}");
+        }
+    }
+    eprintln!("test_gdn_chunk_scan_matches_serial_cpu: PASS");
+}

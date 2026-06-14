@@ -67,6 +67,30 @@ const HINT_UNSET: u8 = 0;
 const HINT_BF16: u8 = 1;
 const HINT_QUANTISED: u8 = 2;
 
+/// Stores the EXACT **primary / bulk** model `QuantScheme` (the body
+/// attention+FFN weight scheme, `lbc.header.quantization.scheme`), via
+/// `QuantScheme::to_u8` (range 0..=11), so resolvers that must distinguish
+/// *within* the "quantised" bucket (e.g. Q4_0-vs-Q8_0 attention-precision
+/// tuning) can do so.
+///
+/// **Why the PRIMARY scheme, not `output_proj_quant`.** The coarse
+/// `MODEL_DENSE_QUANT_HINT` is fed from `output_proj_quant` (the lm_head),
+/// which only needs the BF16-vs-quantised split for the GemmEx / graph
+/// resolvers. But GGUF keeps the lm_head at higher precision than the body:
+/// the "27B-Q4_0" LBC has `output_proj_quant == Q8_0` — IDENTICAL to the
+/// "27B-Q8_0" LBC's lm_head. So `output_proj_quant` CANNOT separate q4 from q8
+/// (verified at runtime, `dump_quant_hint`: q4 primary=Q4_0/outproj=Q8_0;
+/// q8 primary=Q8_0/outproj=Q8_0). The body scheme `header.quantization.scheme`
+/// is the correct discriminator and is what this atomic carries. It is set by
+/// the separate `set_model_primary_quant` (fed the bulk scheme) and read by
+/// `model_dense_quant()`; it NEVER feeds the coarse-hint resolvers, so they
+/// stay byte-identical. `255` = unset sentinel (no LBC opened, or a legacy
+/// caller that never invoked the setter) — can never collide with a real
+/// `to_u8` tag (max 11).
+static MODEL_PRIMARY_QUANT_SCHEME: AtomicU8 = AtomicU8::new(QUANT_SCHEME_UNSET);
+
+const QUANT_SCHEME_UNSET: u8 = 255;
+
 /// Tracks whether the loaded LBC declares MoE experts (i.e. Qwen3.5-MoE-30B-A3B
 /// class). `false` = dense; `true` = experts > 0 reported by the LBC
 /// hyperparams. Finding: the Q8 "split sibling" weight clone path
@@ -129,6 +153,43 @@ pub fn set_model_dense_quant(scheme: QuantScheme) {
     MODEL_DENSE_QUANT_HINT.store(hint, Ordering::Relaxed);
 }
 
+/// Records the EXACT **primary / bulk** model quant scheme
+/// (`lbc.header.quantization.scheme` — the body attention+FFN weight scheme),
+/// which is what `attn_precise_default()` reads to distinguish Q4_0 from Q8_0
+/// within the 27B (64-layer) dense class. This is a SEPARATE signal from
+/// `set_model_dense_quant` (fed `output_proj_quant`): the lm_head is kept at
+/// higher precision than the body in GGUF, so `output_proj_quant` is Q8_0 for
+/// BOTH 27B-q4 and 27B-q8 and cannot tell them apart — the body scheme can.
+///
+/// Idempotent. Called from `lumen-server::run` and `lumen-cli::run`
+/// immediately after `SyncWeightProvider::open` returns, alongside
+/// `set_model_dense_quant` / `set_model_block_count`.
+pub fn set_model_primary_quant(scheme: QuantScheme) {
+    MODEL_PRIMARY_QUANT_SCHEME.store(scheme.to_u8(), Ordering::Relaxed);
+}
+
+/// Reports the EXACT primary/bulk model quant scheme recorded by
+/// `set_model_primary_quant`, or `None` if the setter was never called (legacy
+/// caller / no LBC opened). Used by `attn_precise_default()` to distinguish
+/// Q4_0 from Q8_0 within the 27B (64-layer) dense class. One relaxed atomic
+/// load + a `from_u8` decode.
+pub(crate) fn model_dense_quant() -> Option<QuantScheme> {
+    let tag = MODEL_PRIMARY_QUANT_SCHEME.load(Ordering::Relaxed);
+    if tag == QUANT_SCHEME_UNSET {
+        None
+    } else {
+        QuantScheme::from_u8(tag).ok()
+    }
+}
+
+/// Public diagnostic wrapper over [`model_dense_quant`] for the
+/// `dump_quant_hint` example (which lives outside the crate and so cannot see
+/// the `pub(crate)` accessor). Behaviourally identical; not used on any hot
+/// path.
+pub fn model_dense_quant_pub() -> Option<QuantScheme> {
+    model_dense_quant()
+}
+
 /// Records the loaded model's transformer block count (9B = 32 layers,
 /// 27B = 64). Called from the CLI / server alongside `set_model_dense_quant`.
 /// This is the model-SIZE discriminator the per-class attention-precision
@@ -153,13 +214,99 @@ pub(crate) fn model_block_count() -> u32 {
 /// pvf32 for MoE (all quants) + dense ≤32-layer (9B class) — strict wins
 /// everywhere (9B-q8 and MoE cells all reach pristine quality gates; MoE-q8
 /// long-form heals fully); default WMMA for the 27B class (64 layers) —
-/// pvf32 measurably regresses 27B long-form output (bf16 verylong 3/3→1/3)
-/// and softly regresses 27b-q8 shorts.
+/// pvf32 measurably regressed 27B long-form output on bf16/q8 (bf16 verylong
+/// 3/3→1/3, q8 shorts softened) when the default keyed purely on layer count.
+///
+/// **2026-06-12 (GQ-014 multi-turn fidelity fix):**
+/// the 27B layer-count carve-out was too coarse — it lumped all 27B quants
+/// onto legacy all-F16 WMMA, but that path FAILS the multi-turn gate (GQ-014)
+/// on the quantised 27B cells: an F16-WMMA near-tie flip early in a longer
+/// (multi-turn) prefill derails the conversation (27b-q4 4/8, 27b-q8 6/8).
+/// The correct discriminator is **per (class × quant)** — and the lever's
+/// net effect is quant-specific, so it was decided empirically per quant
+/// (reference GPU, N≥3, runtime evidence; full validation matrix):
+///
+///   * 27B (64-layer) dense **Q4_0** → `2` (pvf32). pvf32 heals GQ-014
+///     4/8→8/8 with ZERO single-prompt regression (15/15·7/8·3/3 →
+///     15/15·8/8·3/3, GQ-002 even improves +1), N=3 cross-process
+///     byte-identical. Re-confirmed here. **THE FIX.**
+///   * 27B (64-layer) dense **Q8_0** → `2` (pvf32). **2026-06-12
+///     re-classification**: the prior
+///     branch excluded q8 because pvf32 appeared to regress GQ-001
+///     (short-arith-05) + GQ-004 (vlong-explain-01) DD-REP. Further analysis
+///     PROVED both are DETECTOR FALSE-POSITIVES on gold-standard outputs
+///     (full-text: short-arith-05 = `963` correct, finish=stop, the DD-REP
+///     fires on 3 CORRECT borrowing lines where the n=4 window clips one token
+///     before the diverging content word; vlong-explain-01 = coherent
+///     finish=stop, word-granularity dd_rep PASS 0.991). Cross-backend
+///     corroboration: Metal 27b-q8 fires the SAME short-arith-05 DD-REP while
+///     passing GQ-014 8/8 → detector-sensitivity, not a CUDA defect. The lever
+///     bisect on the minimal failing prefix isolates the carrier as
+///     prefill-attention P@V F16 mantissa (AP=1 QK^T-only does NOT heal, AP=2
+///     P@V-exact DOES). With the harness-only detector calibration that lands
+///     alongside this change, q8 → 15/15·8/8·3/3 + GQ-014 8/8. **THE FIX (q8).**
+///   * 27B (64-layer) dense **BF16** → `2` (pvf32) **paired with via-prefill
+///     ON** (see `gdn_decode_via_prefill_default`, whose 27B-bf16 carve-out is
+///     removed alongside this). bf16 has TWO coupled carriers: prefill
+///     attention P@V F16 (healed by AP=2) + GDN decode-recurrence per-step
+///     drift over long generations (healed by via-prefill ON). The prior
+///     branch's "AP=2 wrecks bf16 verylong 3/3→1/3" was part detector-FP, part
+///     a GENUINE long-form stutter (`Moka, Moka, …` ×20) that via-prefill ON
+///     eliminates. AP=2 ALONE leaves the stutter; via-prefill ALONE leaves the
+///     t3 prefill-attention near-tie; ONLY the COMBINATION heals every
+///     symptom — exactly the validated 9b-bf16 stack. With the full stack:
+///     GQ-014 4/8→8/8 N=3, GQ-004 3/3 (stutter gone). One honest cost: GQ-002
+///     8/8→7/8 (med-reason-02, a verbosity truncation near-tie — 391 still
+///     computed; validated against the LC reference-hardness check).
+///     **THE FIX (bf16).**
+///   * MoE (any quant) + dense ≤32-layer (9B) → `2` (pvf32), unchanged.
+///   * dense 27B with any OTHER quant, or unset/legacy → `0` (conservative WMMA).
+///
 /// Unset block count (0, legacy callers) → conservative legacy WMMA.
-/// `LUMEN_CUDA_ATTN_PRECISE=<0|1|2|3|4>` overrides either way.
+/// CUDA-only: the sole consumers are the two `flash_attention_wmma_*` dispatch
+/// sites in `cuda/backend_impl.rs` (both `#[cfg(feature = "cuda")]`). Metal
+/// reads its OWN env (`LUMEN_METAL_ATTN_PRECISE`) in `metal/prefill_encode.rs`
+/// and never calls this function, so this default is a no-op on the Metal/CPU
+/// build. `LUMEN_CUDA_ATTN_PRECISE=<0|1|2|3|4>` overrides either way.
 pub fn attn_precise_default() -> u8 {
     let layers = model_block_count();
-    if model_is_moe() || (layers > 0 && layers <= 32) { 2 } else { 0 }
+    // MoE (any quant) + dense 9B class (≤32 layers): ratified pvf32.
+    if model_is_moe() || (layers > 0 && layers <= 32) {
+        return 2;
+    }
+    // 27B (64-layer) dense class: pvf32 heals the GQ-014 multi-turn F16-WMMA
+    // near-tie flip. The per-QUANT structure is retained so future evidence can
+    // re-split, but the 2026-06-12 follow-up analysis
+    // proved AP=2 is the correct default
+    // for ALL three 27B quants:
+    //   * Q4_0 → 2 (pvf32). Re-confirmed N=3: GQ-014 4/8→8/8 with
+    //     ZERO single-prompt regression. (unchanged from the prior branch.)
+    //   * Q8_0 → 2 (pvf32). The carrier is prefill-attention P@V F16 mantissa
+    //     (lever bisect: AP=1 QK^T-only does NOT heal, AP=2 P@V-exact DOES;
+    //     GQ-014 6/8→8/8 N=3). The two prior "regressions" that excluded q8
+    //     (GQ-001 short-arith-05 + GQ-004 vlong-explain-01 DD-REP) were proven
+    //     DETECTOR FALSE-POSITIVES on gold-standard outputs (full-text: 963
+    //     correct, finish=stop; coherent DNS explanation) — fixed by the
+    //     harness-only detector calibration that lands with this change.
+    //   * Bf16 → 2 (pvf32) AND `gdn_decode_via_prefill_default` carved back IN
+    //     for the 27B class (see that fn). bf16 has TWO coupled carriers:
+    //     prefill-attention P@V F16 (healed by AP=2) + GDN decode-recurrence
+    //     per-step drift over long gens (healed by via-prefill ON). ONLY the
+    //     combination heals every symptom — exactly the validated 9b-bf16 stack
+    //     (AP=2 + via-prefill, both ON). GQ-014 4/8→8/8 N=3, GQ-004 Moka
+    //     stutter eliminated. The earlier "AP=2 wrecks bf16 verylong 3/3→1/3"
+    //     was part detector-FP, part a genuine stutter that via-prefill ON
+    //     removes; with the FULL stack GQ-004 is 3/3.
+    // Other quants / unset → conservative WMMA.
+    if layers > 32 {
+        match model_dense_quant() {
+            Some(QuantScheme::Q4_0) | Some(QuantScheme::Q8_0) | Some(QuantScheme::Bf16) => {
+                return 2;
+            }
+            _ => {}
+        }
+    }
+    0
 }
 
 /// Records whether the loaded LBC declares MoE experts. Called from the
@@ -870,27 +1017,56 @@ pub fn gdn_phase123_align_default() -> bool { false }
 /// (-0.6%). AB_F16/CONVSTATE_PARITY stay MoE-only (dense ablation:
 /// unnecessary; CONVSTATE-without-AB is harmful).
 ///
-/// **DENSE BF16 ≥33-layer stays on the legacy decode path (ablation 2026-06-10):**
-/// via-prefill-alone CORRUPTS dense bf16 — 9b-bf16 4/15·0/8·0/3 and 27b-bf16
-/// 0✓/3✗ with every DD detector firing, vs the legacy path's sane-but-imperfect
-/// 13/15·5/8·2/3. `LUMEN_CUDA_GDN_F64_ACCUM=1` does NOT rescue it (still 0/3),
-/// so the interaction is not a precision artefact of the recurrence; the
-/// difference vs MoE-bf16 (where via-prefill works) is the MoE-only projection
-/// aligners (AB_F16/CONVSTATE) — root-cause investigation tracked separately.
+/// **DENSE BF16 ≥33-layer NOW ON (2026-06-12 follow-up analysis, supersedes the
+/// 2026-06-10 ablation):** the old ablation found via-prefill-alone CORRUPTS
+/// dense bf16 (9b-bf16 4/15·0/8·0/3, 27b-bf16 0✓/3✗) — but that was measured
+/// "alone" on the PRE-pvf32 binary. The follow-up analysis proved via-prefill must be
+/// paired with AP=2 for the 27B-bf16 class: AP=2 alone leaves a genuine
+/// long-form Moka stutter; via-prefill alone leaves the prefill-attention
+/// near-tie; the COMBINATION (mirroring the validated 9b-bf16 stack) heals
+/// GQ-014 4/8→8/8 (N=3) AND restores GQ-004 verylong to 3/3. The 27B-bf16
+/// carve-out is removed accordingly (see the resolver body). 9B-bf16 was
+/// already ON via the ≤32 carve-back and is byte-unchanged.
 /// Set `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL=0|1` to override either way.
 pub fn gdn_decode_via_prefill_default() -> bool {
-    // Dense bf16 carve-back (validated 2026-06-11): on the
-    // production binary (pvf32 per-class attention), via-prefill HEALS the
-    // 9B-bf16 verylong attractor (1/3 -> 3/3, N=3 byte-identical, matches
-    // llama.cpp bf16) — the earlier "via-prefill catastrophic on dense bf16"
-    // result was measured on the pre-pvf32 binary and is OBSOLETE for the 9B
-    // class. 27B-bf16 is the refutation boundary: via-prefill regresses its
-    // pristine short gate (15/15 -> 14/15), so the bf16 enable is scoped to
-    // the same <=32-layer class as `attn_precise_default()`. Unset block
-    // count (legacy callers) keeps bf16 on the legacy decode path.
+    // 27B-bf16 carve-OUT REMOVED (2026-06-12 follow-up analysis).
+    // via-prefill is now ON for ALL
+    // classes — MoE, every dense quant, and dense bf16 at any layer count.
+    //
+    // History of this predicate:
+    //   * MoE + dense non-bf16: always ON (validated; the per-step GDN
+    //     recurrence drift accumulates into a DD-REP/CHARSPAM attractor over
+    //     long gens — 9B-q8 GQ-004 0/3→3/3 under via-prefill alone).
+    //   * 9B-bf16 (≤32 layers): ON since the 2026-06-11 carve-back (on the
+    //     pvf32 binary, via-prefill HEALS the 9B-bf16 verylong attractor
+    //     1/3→3/3, N=3 byte-identical, matches llama.cpp bf16).
+    //   * 27B-bf16 (>32 layers): was the SOLE carve-OUT (returned false),
+    //     because on the PRE-pvf32 binary via-prefill ALONE regressed it. The
+    //     follow-up analysis proved that boundary OBSOLETE: paired with AP=2 (which
+    //     this branch now sets for 27B-bf16, see `attn_precise_default`),
+    //     via-prefill ON is REQUIRED — it removes the genuine long-form Moka
+    //     stutter (GQ-004 back to 3/3) and the `<think>` reasoning-leak entry,
+    //     while AP=2 fixes the prefill-attention near-ties. Both levers are
+    //     load-bearing and independent; together they mirror the validated
+    //     9b-bf16 winning stack and take 27b-bf16 GQ-014 4/8→8/8 (N=3). The
+    //     prior "short 15/15→14/15" regression was measured at AP=0+viapre;
+    //     with AP=2 the 27b-bf16 short gate is pristine 15/15.
+    //
+    // The predicate is therefore now unconditional ON. The branches below are
+    // retained as documentation of the (now-collapsed) per-class structure so
+    // future evidence can re-split a class back OUT without reconstructing the
+    // reasoning. CUDA-only: the SOLE consumer is `gdn_decode_via_prefill_`
+    // `enabled()` in `cuda/backend_impl.rs` (`#[cfg(feature = "cuda")]`); Metal
+    // runs its OWN GDN decode path (`metal/gdn.rs` megakernel/dual-gates tiers)
+    // and never reads this resolver or `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL`, so
+    // removing the carve-out is a provable no-op on the Metal/CPU build.
+    // `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL=0|1` overrides either way.
     let dense_bf16 = MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) == HINT_BF16;
     let small = { let l = model_block_count(); l > 0 && l <= 32 };
-    model_is_moe() || !dense_bf16 || small
+    // 27B-bf16 large carve-out removed: `|| (dense_bf16 && large)` folded in,
+    // making the expression total. Kept factored for readability + future
+    // re-split.
+    model_is_moe() || !dense_bf16 || small || (dense_bf16 && !small)
 }
 
 /// Per-process default for `LUMEN_CUDA_GDN_CONVSTATE_PARITY` — make the decode
@@ -1205,14 +1381,29 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_METAL_GDN_CONCURRENT_ENCODER",
     "LUMEN_METAL_GDN_CONCURRENT_ENCODER_VALIDATE",
     "LUMEN_METAL_GDN_PHASE2A_NSG4",
+    "LUMEN_METAL_GDN_PREFILL_CHUNKED",
+    "LUMEN_METAL_GDN_PREFILL_CHUNK_C",
+    "LUMEN_METAL_GDN_DIAG_SKIP",
     "LUMEN_METAL_GDN_SSM_OUT_F32_BATCHED",
     "LUMEN_METAL_GEMM_GGML_PORT",
     "LUMEN_METAL_MMAP_ONLY",
+    "LUMEN_METAL_MOE_DOWN_SGROW",
+    "LUMEN_METAL_MOE_GATEUP_SGROW",
+    "LUMEN_METAL_MOE_ROUTER_PARALLEL",
+    "LUMEN_METAL_MOE_ROUTER_FUSED",
+    "LUMEN_METAL_MOE_ROUTER_TOPK_TGS",
+    "LUMEN_METAL_MOE_DIAG_SKIP",
+    "LUMEN_METAL_MOE_PREFILL_DIAG",
+    "LUMEN_METAL_MOE_PREFILL_GROUPED",
+    "LUMEN_METAL_MOE_GRP_THEN_B",
     "LUMEN_METAL_MULTI_CB",
     "LUMEN_METAL_NAN_DUMP",
     "LUMEN_METAL_MULTI_CB_N",
     "LUMEN_METAL_DEFAULTS_OFF",
     "LUMEN_METAL_PROFILE",
+    "LUMEN_METAL_DECODE_PROFILE",
+    "LUMEN_METAL_DECODE_GPUTIME",
+    "LUMEN_METAL_PREFILL_GPUTIME",
     "LUMEN_METAL_PROFILE_DEEP",
     "LUMEN_METAL_PROFILE_GDN",
     "LUMEN_METAL_Q4_REPACKED",
@@ -1424,6 +1615,7 @@ fn common_suffix_len(a: &str, b: &str) -> usize {
 pub fn reset_for_tests() {
     PATH_IS_SERVER.store(false, Ordering::Relaxed);
     MODEL_DENSE_QUANT_HINT.store(HINT_UNSET, Ordering::Relaxed);
+    MODEL_PRIMARY_QUANT_SCHEME.store(QUANT_SCHEME_UNSET, Ordering::Relaxed);
     MODEL_IS_MOE.store(false, Ordering::Relaxed);
     MODEL_BLOCK_COUNT.store(0, Ordering::Relaxed);
 }
@@ -1509,20 +1701,159 @@ mod tests {
     fn attn_precise_default_per_class() {
         let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         // Validated 2026-06-11: pvf32 (2) for MoE + dense
-        // <=32-layer (9B); legacy WMMA (0) for the 27B class and for legacy
-        // callers that never set the block count.
+        // <=32-layer (9B). 2026-06-12 follow-up: the 27B (64-layer) class is
+        // now pvf32 (2) for ALL THREE quants — Q4_0 (proven, zero
+        // regression), Q8_0 (carrier = prefill P@V F16; prior "regressions"
+        // were detector false-positives, fixed by harness calibration), and BF16 (paired
+        // with via-prefill ON). Legacy callers that never set the block count
+        // still get conservative WMMA (0). The per-quant `match` arm is kept so
+        // a class can be re-split out on future evidence.
         reset_for_tests();
         assert_eq!(attn_precise_default(), 0, "unset block count -> legacy WMMA");
+
+        // 9B (32-layer) dense: pvf32 regardless of quant.
         reset_for_tests();
         set_model_block_count(32);
         assert_eq!(attn_precise_default(), 2, "dense 9B (32 layers) -> pvf32");
         reset_for_tests();
+        set_model_block_count(32);
+        set_model_primary_quant(QuantScheme::Bf16);
+        assert_eq!(attn_precise_default(), 2, "dense 9B bf16 -> pvf32 (size wins)");
+
+        // 27B (64-layer) dense, per-quant discrimination — keyed on the PRIMARY
+        // (bulk) scheme, NOT output_proj (which is Q8_0 for both q4 and q8).
+        reset_for_tests();
         set_model_block_count(64);
-        assert_eq!(attn_precise_default(), 0, "dense 27B (64 layers) -> legacy WMMA");
+        // No primary-quant set (legacy 27B caller) -> conservative legacy WMMA.
+        assert_eq!(attn_precise_default(), 0, "dense 27B, quant unset -> legacy WMMA");
+        reset_for_tests();
+        set_model_block_count(64);
+        set_model_primary_quant(QuantScheme::Q4_0);
+        assert_eq!(attn_precise_default(), 2, "dense 27B Q4_0 -> pvf32 (GQ-014 heal, no regression)");
+        reset_for_tests();
+        set_model_block_count(64);
+        set_model_primary_quant(QuantScheme::Q8_0);
+        assert_eq!(attn_precise_default(), 2, "dense 27B Q8_0 -> pvf32 (GQ-014 heal, prior regressions were detector false-positives)");
+        reset_for_tests();
+        set_model_block_count(64);
+        set_model_primary_quant(QuantScheme::Bf16);
+        assert_eq!(attn_precise_default(), 2, "dense 27B bf16 -> pvf32 (paired with via-prefill ON)");
+        // The crux of the 2026-06-12 root-cause: output_proj (Q8_0) must NOT be
+        // what drives this — only the primary bulk scheme. Set the coarse
+        // output_proj hint to Q8_0 (as a real q4 LBC does) WITHOUT a primary
+        // scheme: must stay legacy WMMA (no q4 signal present).
+        reset_for_tests();
+        set_model_block_count(64);
+        set_model_dense_quant(QuantScheme::Q8_0); // output_proj hint only
+        assert_eq!(
+            attn_precise_default(),
+            0,
+            "dense 27B with only output_proj=Q8_0 hint (no primary) -> legacy WMMA"
+        );
+
+        // MoE: pvf32 regardless of size or quant.
         reset_for_tests();
         set_model_block_count(64);
         set_model_is_moe(true);
         assert_eq!(attn_precise_default(), 2, "MoE -> pvf32 regardless of size");
+        reset_for_tests();
+        set_model_block_count(64);
+        set_model_is_moe(true);
+        set_model_primary_quant(QuantScheme::Bf16);
+        assert_eq!(attn_precise_default(), 2, "MoE bf16 -> pvf32 (MoE wins over bf16 carve-out)");
+    }
+
+    #[test]
+    fn gdn_decode_via_prefill_default_per_class() {
+        // 2026-06-12 follow-up: the 27B-bf16 carve-OUT is removed, so
+        // via-prefill is now ON for EVERY class. The bf16 dimension is driven by
+        // the COARSE `MODEL_DENSE_QUANT_HINT` (set via `set_model_dense_quant`
+        // from output_proj), NOT the primary-quant atomic — bf16 LBCs report
+        // output_proj == Bf16, so the coarse hint is the right signal here.
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+
+        // Unset (legacy caller, no LBC): non-bf16 hint -> ON.
+        reset_for_tests();
+        assert!(
+            gdn_decode_via_prefill_default(),
+            "unset hint (non-bf16) -> via-prefill ON"
+        );
+
+        // Dense non-bf16 (q8/q4), any layer count: ON (unchanged).
+        reset_for_tests();
+        set_model_block_count(64);
+        set_model_dense_quant(QuantScheme::Q8_0);
+        assert!(
+            gdn_decode_via_prefill_default(),
+            "dense 27B q8 -> via-prefill ON (unchanged)"
+        );
+        reset_for_tests();
+        set_model_block_count(64);
+        set_model_dense_quant(QuantScheme::Q4_0);
+        assert!(
+            gdn_decode_via_prefill_default(),
+            "dense 27B q4 -> via-prefill ON (unchanged)"
+        );
+
+        // 9B bf16 (<=32 layers): ON — MUST stay ON byte-identically (validated
+        // 9b-bf16 stack; this is the behavior the follow-up analysis must not change).
+        reset_for_tests();
+        set_model_block_count(32);
+        set_model_dense_quant(QuantScheme::Bf16);
+        assert!(
+            gdn_decode_via_prefill_default(),
+            "dense 9B bf16 (<=32 layers) -> via-prefill ON (PRESERVED, validated stack)"
+        );
+
+        // 27B bf16 (>32 layers): ON — THE CHANGE. Previously the sole carve-OUT
+        // (returned false); follow-up analysis proved it must be ON, paired with AP=2.
+        reset_for_tests();
+        set_model_block_count(64);
+        set_model_dense_quant(QuantScheme::Bf16);
+        assert!(
+            gdn_decode_via_prefill_default(),
+            "dense 27B bf16 (>32 layers) -> via-prefill ON (carve-out REMOVED)"
+        );
+
+        // MoE (any quant, any size): ON.
+        reset_for_tests();
+        set_model_block_count(64);
+        set_model_is_moe(true);
+        set_model_dense_quant(QuantScheme::Bf16); // MoE bf16 -> still ON (MoE wins)
+        assert!(
+            gdn_decode_via_prefill_default(),
+            "MoE bf16 -> via-prefill ON"
+        );
+    }
+
+    #[test]
+    fn model_primary_quant_accessor_roundtrips() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset_for_tests();
+        assert_eq!(model_dense_quant(), None, "unset -> None");
+        // The output_proj setter must NOT populate the primary-scheme accessor.
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Q8_0);
+        assert_eq!(
+            model_dense_quant(),
+            None,
+            "set_model_dense_quant (output_proj) must not feed the primary-quant accessor"
+        );
+        for scheme in [
+            QuantScheme::Q4_0,
+            QuantScheme::Q8_0,
+            QuantScheme::Bf16,
+            QuantScheme::Q4_K,
+            QuantScheme::F32,
+        ] {
+            reset_for_tests();
+            set_model_primary_quant(scheme);
+            assert_eq!(
+                model_dense_quant(),
+                Some(scheme),
+                "primary scheme must round-trip for {scheme:?}"
+            );
+        }
     }
 
     #[test]

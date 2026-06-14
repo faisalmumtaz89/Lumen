@@ -318,11 +318,30 @@ pub(crate) struct MetalPipelines {
     // Option to allow graceful error messages if shader compilation fails.
     // The MoE kernels are included in METAL_SHADER_SOURCE.
     pub(crate) moe_router_softmax: Option<MetalPipelineState>,
+    // Parallel router — per-expert logits + small top-k softmax.
+    pub(crate) moe_router_logits_f32: Option<MetalPipelineState>,
+    pub(crate) moe_router_topk_softmax: Option<MetalPipelineState>,
+    // Fused single-dispatch router (logits + top-k, grid=experts,
+    // last-TG reduction) — eliminates the 1-TG top-k drain bubble on decode.
+    pub(crate) moe_router_fused_topk: Option<MetalPipelineState>,
     pub(crate) moe_router_softmax_batched: Option<MetalPipelineState>,
     pub(crate) moe_router_softmax_biased: Option<MetalPipelineState>,
     pub(crate) moe_expert_accum: Option<MetalPipelineState>,
     pub(crate) moe_expert_accum_batched: Option<MetalPipelineState>,
     pub(crate) moe_expert_accum_option_a: Option<MetalPipelineState>,
+    // Expert-grouped prefill MoE (mul_mat_id style) index/copy kernels.
+    pub(crate) moe_prefill_route_sort: Option<MetalPipelineState>,
+    pub(crate) moe_prefill_route_sort_par: Option<MetalPipelineState>,
+    pub(crate) moe_prefill_route_sort_atomic: Option<MetalPipelineState>,
+    pub(crate) moe_prefill_gather: Option<MetalPipelineState>,
+    pub(crate) moe_prefill_gather_vec4: Option<MetalPipelineState>,
+    pub(crate) moe_prefill_scatter_vec4: Option<MetalPipelineState>,
+    pub(crate) moe_prefill_scatter: Option<MetalPipelineState>,
+    pub(crate) moe_prefill_assign_expert: Option<MetalPipelineState>,
+    pub(crate) moe_grouped_gemm_q8_0: Option<MetalPipelineState>,
+    pub(crate) moe_grouped_gemm_q8_0_tilemap: Option<MetalPipelineState>,
+    pub(crate) moe_grouped_gemm_q4_0_tilemap: Option<MetalPipelineState>,
+    pub(crate) moe_prefill_build_tile_map: Option<MetalPipelineState>,
     // Batched MoE expert FFN — GPU-side routing, no CPU readback.
     pub(crate) moe_batched_gate_up_swiglu_q4_0: Option<MetalPipelineState>,
     pub(crate) moe_batched_gate_up_swiglu_q4_1: Option<MetalPipelineState>,
@@ -330,9 +349,13 @@ pub(crate) struct MetalPipelines {
     pub(crate) moe_batched_down_accum_q4_0: Option<MetalPipelineState>,
     pub(crate) moe_batched_down_accum_q4_1: Option<MetalPipelineState>,
     pub(crate) moe_batched_down_accum_q8_0: Option<MetalPipelineState>,
+    // One-simdgroup-per-row redesign of routed gate+up+swiglu (q8).
+    pub(crate) moe_batched_gate_up_swiglu_q8_0_v2: Option<MetalPipelineState>,
     // Fused down+accum+shared_expert kernels (eliminates 3 dispatches per MoE layer)
     pub(crate) moe_batched_down_accum_shared_q8_0: Option<MetalPipelineState>,
     pub(crate) moe_batched_down_accum_shared_q8_0_se_q4_0: Option<MetalPipelineState>,
+    // One-simdgroup-per-row redesign of the mixed q8/q4 down kernel.
+    pub(crate) moe_batched_down_accum_shared_q8_0_se_q4_0_v2: Option<MetalPipelineState>,
     pub(crate) moe_batched_down_accum_shared_q4_0: Option<MetalPipelineState>,
     pub(crate) sigmoid_scale_add: Option<MetalPipelineState>,
 
@@ -408,6 +431,11 @@ pub(crate) struct MetalPipelines {
     /// simdgroups share Q/K HBM fetches via L1. Opt-in via
     /// `LUMEN_METAL_GDN_PHASE2A_NSG4=1`.
     pub(crate) gdn_prefill_fused_v3_chunked_nsg4: Option<MetalPipelineState>,
+    /// Chunk-parallel gated-delta-rule Phase 2a. One TG per
+    /// (head, 32-value-tile); builds the per-chunk T/H matrices once and
+    /// forward-solves over C tokens, cutting the O(T)-serial recurrence to
+    /// O(T/C) serial chunks. Opt-in via `LUMEN_METAL_GDN_PREFILL_CHUNKED=1`.
+    pub(crate) gdn_prefill_chunkscan: Option<MetalPipelineState>,
     pub(crate) gdn_prefill_norm_gate: Option<MetalPipelineState>,
     pub(crate) ssm_conv1d_prefill: Option<MetalPipelineState>,
     pub(crate) ssm_conv1d_silu_prefill: Option<MetalPipelineState>,
@@ -417,6 +445,11 @@ pub(crate) struct MetalPipelines {
     pub(crate) ssm_conv1d_state_update: Option<MetalPipelineState>,
     pub(crate) l2_normalize_heads_batched: Option<MetalPipelineState>,
     pub(crate) l2_normalize_qk_strided: Option<MetalPipelineState>,
+    pub(crate) l2_normalize_qk_strided_sg: Option<MetalPipelineState>,
+    /// Fused conv1d+SiLU+L2 for Q/K (collapses the conv->L2 spine).
+    pub(crate) conv1d_silu_l2_qk_fused: Option<MetalPipelineState>,
+    /// Conv1d+SiLU for the V channel sub-range (no L2).
+    pub(crate) conv1d_silu_vrange: Option<MetalPipelineState>,
     pub(crate) gdn_compute_gates_batched: Option<MetalPipelineState>,
     pub(crate) dequant_batched_matvec_q8_0: Option<MetalPipelineState>,
     pub(crate) dequant_batched_matvec_q8_0_dual: Option<MetalPipelineState>,
@@ -708,6 +741,10 @@ pub(crate) struct MetalScratch {
     // Decode scratch buffers (single token)
     /// Router logits: [num_experts] f32 -- output of router matmul
     pub(crate) moe_router_logits: Option<MetalBuffer>,
+    /// Grid-wide finish counter (atomic_uint, 1 elem) for the
+    /// fused single-dispatch router's last-threadgroup reduction. Zeroed each
+    /// layer before the dispatch.
+    pub(crate) moe_router_counter: Option<MetalBuffer>,
     /// Selected expert IDs after top-K: [top_k] u32
     pub(crate) moe_expert_ids: Option<MetalBuffer>,
     /// Routing weights for selected experts: [top_k] f32
@@ -725,6 +762,30 @@ pub(crate) struct MetalScratch {
     pub(crate) moe_batch_expert_weights: Option<MetalBuffer>,
     /// Batched per-expert FFN output: [max_batch * num_experts * hidden_dim] f32
     pub(crate) moe_batch_expert_output: Option<MetalBuffer>,
+
+    // Expert-grouped prefill MoE scratch (mul_mat_id style).
+    // Sized for max_batch * top_k assignments. Far smaller than the dense
+    // [batch * num_experts * hidden] expert_output (which we still write into for
+    // the byte-identical accum).
+    /// Per-expert segment offsets (prefix sums): [num_experts+1] u32.
+    pub(crate) moe_grp_seg_off: Option<MetalBuffer>,
+    /// Token index per assignment, grouped by expert: [max_batch * top_k] u32.
+    pub(crate) moe_grp_tok: Option<MetalBuffer>,
+    /// Slot (k) per assignment: [max_batch * top_k] u32.
+    pub(crate) moe_grp_slot: Option<MetalBuffer>,
+    /// Expert id per assignment (expanded from seg_off): [max_batch * top_k] u32.
+    pub(crate) moe_grp_assign_expert: Option<MetalBuffer>,
+    /// Gathered per-assignment normed input: [max_batch * top_k * hidden] f32.
+    pub(crate) moe_grp_in: Option<MetalBuffer>,
+    /// Per-assignment SwiGLU activation: [max_batch * top_k * inter] f32.
+    pub(crate) moe_grp_swiglu: Option<MetalBuffer>,
+    /// Per-assignment down output (pre-scatter): [max_batch * top_k * hidden] f32.
+    pub(crate) moe_grp_down: Option<MetalBuffer>,
+    /// Flattened grouped-GEMM work-tile map. Entry 0 =
+    /// n_work_tiles; entries 1.. = packed (expert<<16)|m_tile_local. Lets the
+    /// grouped GEMM dispatch exactly the non-empty M-tiles instead of
+    /// max_m_tiles*num_experts (19.5x over-subscription at batch=1239/256e).
+    pub(crate) moe_grp_tile_map: Option<MetalBuffer>,
 
     /// Per-layer expert IDs buffers for GPU-resident decode profiling.
     /// When allocated, each MoE layer writes its top-K expert selections to

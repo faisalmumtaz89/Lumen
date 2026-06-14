@@ -1177,10 +1177,24 @@ impl MetalF32Backend {
             let top_k = s.moe_num_active_experts;
 
             // Dispatch 1: Batched gate+up+SwiGLU (routed experts) -- reads normed_buf
-            {
-                let pipeline = match moe_meta.expert_gate_quant {
-                    QuantScheme::Q8_0 => pipelines.moe_batched_gate_up_swiglu_q8_0.as_ref().unwrap(),
-                    _ => pipelines.moe_batched_gate_up_swiglu_q4_0.as_ref().unwrap(),
+            if super::moe_diag_skip() != 2 {
+                // One-simdgroup-per-row redesign for the q8 routed
+                // gate+up+swiglu (LUMEN_METAL_MOE_GATEUP_SGROW=1). Default OFF.
+                let use_gateup_v2 = matches!(moe_meta.expert_gate_quant, QuantScheme::Q8_0)
+                    && pipelines.moe_batched_gate_up_swiglu_q8_0_v2.is_some()
+                    && super::moe_gateup_sgrow_enabled();
+                let (pipeline, gu_threads, gu_n_tg) = if use_gateup_v2 {
+                    (
+                        pipelines.moe_batched_gate_up_swiglu_q8_0_v2.as_ref().unwrap(),
+                        128u64,
+                        (((top_k * inter_dim) as u64) + 3) / 4,
+                    )
+                } else {
+                    let p = match moe_meta.expert_gate_quant {
+                        QuantScheme::Q8_0 => pipelines.moe_batched_gate_up_swiglu_q8_0.as_ref().unwrap(),
+                        _ => pipelines.moe_batched_gate_up_swiglu_q4_0.as_ref().unwrap(),
+                    };
+                    (p, 128u64, (top_k * inter_dim) as u64)
                 };
                 enc.set_pipeline_state(pipeline);
                 enc.set_buffer(layer_buf, 0, 0);
@@ -1191,15 +1205,14 @@ impl MetalF32Backend {
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 5);
                 enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 6);
                 enc.set_bytes(&(top_k as u32).to_le_bytes(), 7);
-                let n_tg = (top_k * inter_dim) as u64;
                 enc.dispatch_threadgroups(
-                    MTLSize::new(n_tg, 1, 1),
-                    MTLSize::new(128, 1, 1),
+                    MTLSize::new(gu_n_tg, 1, 1),
+                    MTLSize::new(gu_threads, 1, 1),
                 );
             }
 
             // Dispatch 2: Shared expert gate+up+SwiGLU -- reads normed_buf (parallel with dispatch 1)
-            {
+            if super::moe_diag_skip() != 3 {
                 let (se_ffn_tg, se_ffn_n_tg) = match gate_quant {
                     QuantScheme::Q8_0 => {
                         enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q8_0_2sg);
@@ -1240,7 +1253,7 @@ impl MetalF32Backend {
 
             // Dispatch 3: Gating dot product (if gate_inp_shexp exists) -- reads normed_buf (parallel)
             let has_gating = meta.ffn_gate_inp_shexp_off.is_some();
-            if let Some(gis_off) = meta.ffn_gate_inp_shexp_off {
+            if let (Some(gis_off), true) = (meta.ffn_gate_inp_shexp_off, super::moe_diag_skip() != 4) {
                 enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
                 enc.set_buffer(layer_buf, gis_off, 0);
                 enc.set_buffer(&s.normed_buf, 0, 1);
@@ -1252,14 +1265,34 @@ impl MetalF32Backend {
             // Barrier: wait for all 3 parallel dispatches before fused phase 2
             enc.memory_barrier_with_scope(1);
 
+            // [diag] LUMEN_METAL_MOE_DIAG_SKIP={down|gateup}: skip a dispatch to
+            // attribute its GPU-time share (produces garbage output; profiling only).
+            let diag_skip_down = super::moe_diag_skip() == 1;
             // Dispatch 4: Fused down+accum+shared
-            {
+            if !diag_skip_down {
                 let down_quant = moe_meta.expert_down_quant;
                 let se_down_quant = meta.shared_expert_down_quant.unwrap_or(QuantScheme::F32);
-                let pipeline = match (down_quant, se_down_quant) {
-                    (QuantScheme::Q8_0, QuantScheme::Q8_0) => pipelines.moe_batched_down_accum_shared_q8_0.as_ref().unwrap(),
-                    (QuantScheme::Q8_0, QuantScheme::Q4_0) => pipelines.moe_batched_down_accum_shared_q8_0_se_q4_0.as_ref().unwrap(),
-                    _ => pipelines.moe_batched_down_accum_shared_q4_0.as_ref().unwrap(),
+                // When LUMEN_METAL_MOE_DOWN_SGROW=1 AND this is the
+                // mixed q8-routed / q4-shared production case, use the
+                // one-simdgroup-per-row redesign (2 rows/TG, 64 threads/TG,
+                // grid=ceil(hidden/2)). Default OFF -> original byte path.
+                let use_sgrow_v2 = matches!((down_quant, se_down_quant),
+                    (QuantScheme::Q8_0, QuantScheme::Q4_0))
+                    && pipelines.moe_batched_down_accum_shared_q8_0_se_q4_0_v2.is_some()
+                    && super::moe_down_sgrow_enabled();
+                let (pipeline, tg_threads, n_tg) = if use_sgrow_v2 {
+                    (
+                        pipelines.moe_batched_down_accum_shared_q8_0_se_q4_0_v2.as_ref().unwrap(),
+                        64u64,
+                        ((hidden_dim as u64) + 1) / 2,
+                    )
+                } else {
+                    let p = match (down_quant, se_down_quant) {
+                        (QuantScheme::Q8_0, QuantScheme::Q8_0) => pipelines.moe_batched_down_accum_shared_q8_0.as_ref().unwrap(),
+                        (QuantScheme::Q8_0, QuantScheme::Q4_0) => pipelines.moe_batched_down_accum_shared_q8_0_se_q4_0.as_ref().unwrap(),
+                        _ => pipelines.moe_batched_down_accum_shared_q4_0.as_ref().unwrap(),
+                    };
+                    (p, 128u64, ((hidden_dim as u64) + 3) / 4)
                 };
                 enc.set_pipeline_state(pipeline);
                 enc.set_buffer(layer_buf, 0, 0);          // layer_buf
@@ -1278,10 +1311,9 @@ impl MetalF32Backend {
                 enc.set_bytes(&(se_inter as u32).to_le_bytes(), 13);
                 let use_sigmoid: u32 = if has_gating { 1 } else { 0 };
                 enc.set_bytes(&use_sigmoid.to_le_bytes(), 14);
-                let n_tg = ((hidden_dim as u64) + 3) / 4;
                 enc.dispatch_threadgroups(
                     MTLSize::new(n_tg, 1, 1),
-                    MTLSize::new(128, 1, 1),
+                    MTLSize::new(tg_threads, 1, 1),
                 );
             }
         } else {
@@ -1497,6 +1529,7 @@ impl MetalF32Backend {
     /// For each token in the batch, the router selects top-K experts independently.
     /// Option B: dispatch ALL experts for ALL tokens.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_moe_ffn_batched(
         cmd: &MetalCommandBuffer,
         pipelines: &MetalPipelines,
@@ -1510,6 +1543,7 @@ impl MetalF32Backend {
         expert_down_offs: &[u64],
         expert_gate_quant: QuantScheme,
         expert_down_quant: QuantScheme,
+        device: &super::ffi::MetalDevice,
     ) -> Result<(), RuntimeError> {
         let hidden_dim = scratch.hidden_dim;
         let inter_dim = scratch.moe_expert_inter_dim;
@@ -1576,11 +1610,57 @@ impl MetalF32Backend {
             enc.end_encoding();
         }
 
-        // ---- Step 2: Expert FFN dispatch (Option B: ALL experts for ALL tokens) ----
+        // ---- Step 2: Expert FFN dispatch ----
         const TILE_M: u64 = 32;
         const TILE_N: u64 = 32;
 
-        for expert_idx in 0..num_experts {
+        // Expert-grouped path (mul_mat_id style). When enabled
+        // and the experts are Q8_0, compute ONLY each token's routed experts via
+        // gather-sort + grouped GEMM + scatter into the SAME
+        // moe_batch_expert_output layout, then fall through to the unchanged
+        // Step 3 accum (byte-identical). Default OFF.
+        // Expert-grouped prefill (mul_mat_id style). DEFAULT ON; kill switch
+        // LUMEN_METAL_MOE_PREFILL_GROUPED=0. Q8_0 (legacy + tile-map) or Q4_0
+        // (tile-map only) experts; other quants use Option B.
+        // Byte-identical to Option B (validated md5-equal). Q4_0 requires the
+        // tile-map path (no legacy dense-grid Q4 grouped GEMM).
+        let uniform_q8 = expert_gate_quant == QuantScheme::Q8_0
+            && expert_down_quant == QuantScheme::Q8_0;
+        let uniform_q4 = expert_gate_quant == QuantScheme::Q4_0
+            && expert_down_quant == QuantScheme::Q4_0;
+        let grouped_enabled = super::moe_prefill_grouped_enabled()
+            && (uniform_q8
+                || (uniform_q4
+                    && super::moe_gemm_tilemap_enabled()
+                    && pipelines.moe_grouped_gemm_q4_0_tilemap.is_some()));
+        // DIAGNOSTIC (LUMEN_METAL_MOE_GRP_THEN_B=1): force the Option-B branch even
+        // when grouped is enabled (used during bring-up to isolate grouped bugs).
+        let grouped_then_optionb = std::env::var("LUMEN_METAL_MOE_GRP_THEN_B")
+            .ok().as_deref() == Some("1");
+
+        if grouped_enabled && !grouped_then_optionb {
+            // Populate moe_batch_expert_output at routed (expert, token) slots
+            // only; Step 3 accum below reads it byte-identically.
+            Self::encode_moe_prefill_grouped_q8_0(
+                cmd, pipelines, scratch, layer_buf, batch_size,
+                expert_gate_offs, expert_up_offs, expert_down_offs,
+                expert_gate_quant, device,
+            )?;
+        } else {
+
+        // DIAGNOSTIC (no-op when unset, profiling only — produces GARBAGE output):
+        // LUMEN_METAL_MOE_PREFILL_DIAG=N caps the expert FFN loop at N experts
+        // instead of all `num_experts`. Used to isolate the cost attributable to
+        // the redundant experts (Option B computes all 256, only top_k are used).
+        // Comparing N=num_experts (default) vs N=top_k quantifies the wasted
+        // (num_experts - top_k)/num_experts ≈ 96.9% expert compute.
+        let expert_loop_cap = std::env::var("LUMEN_METAL_MOE_PREFILL_DIAG")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|n| n.min(num_experts))
+            .unwrap_or(num_experts);
+
+        for expert_idx in 0..expert_loop_cap {
             let gate_off = expert_gate_offs[expert_idx];
             let up_off = expert_up_offs[expert_idx];
             let down_off = expert_down_offs[expert_idx];
@@ -1735,6 +1815,7 @@ impl MetalF32Backend {
                 enc.end_encoding();
             }
         }
+        } // end else (Option B expert loop)
 
         // ---- Step 3: Batched weighted accumulation + residual ----
         {
@@ -1758,6 +1839,326 @@ impl MetalF32Backend {
             );
             enc.end_encoding();
         }
+
+        Ok(())
+    }
+
+    /// Expert-grouped prefill MoE FFN (llama.cpp mul_mat_id style).
+    ///
+    /// Replaces Option B's all-experts-all-tokens loop. Pipeline (all on-GPU,
+    /// single CB, no CPU sync):
+    ///   1. route_sort:   counting-sort the (token, slot) assignments by expert
+    ///                    -> seg_off[ne+1], grouped_tok[A], grouped_slot[A].
+    ///   2. assign_expert: expand seg_off -> assign_expert[A] (expert per row).
+    ///   3. gather:       grouped_in[A, hidden] = normed[grouped_tok[a]].
+    ///   4. grouped GEMM gate -> grp_swiglu[A, inter]; up -> grp_down[A, inter].
+    ///   5. swiglu:       grp_swiglu = silu(grp_swiglu) * grp_down (over A*inter).
+    ///   6. grouped GEMM down(grp_swiglu) -> grp_down[A, hidden].
+    ///   7. scatter:      moe_batch_expert_output[e, tok, :] = grp_down[a, :].
+    /// The caller then runs the UNCHANGED Step 3 accum on moe_batch_expert_output,
+    /// so the routed result is byte-identical to Option B (same weights, same
+    /// per-row tiled-GEMM math, same per-token weighted sum).
+    ///
+    /// A = batch_size * top_k assignments. Each expert's GEMM processes only its
+    /// routed rows (avg ~A/ne), versus Option B's full batch_size per expert.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_moe_prefill_grouped_q8_0(
+        cmd: &MetalCommandBuffer,
+        pipelines: &MetalPipelines,
+        scratch: &MetalScratch,
+        layer_buf: &MetalBuffer,
+        batch_size: usize,
+        expert_gate_offs: &[u64],
+        expert_up_offs: &[u64],
+        expert_down_offs: &[u64],
+        quant: QuantScheme,
+        device: &super::ffi::MetalDevice,
+    ) -> Result<(), RuntimeError> {
+        let is_q4 = quant == QuantScheme::Q4_0;
+        let hidden_dim = scratch.hidden_dim;
+        let inter_dim = scratch.moe_expert_inter_dim;
+        let num_experts = scratch.moe_num_experts;
+        let top_k = scratch.moe_num_active_experts;
+        let total_assign = batch_size * top_k;
+
+        macro_rules! pso {
+            ($field:ident, $name:expr) => {
+                pipelines.$field.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute(concat!("MoE grouped: ", $name, " pipeline not compiled").into())
+                })?
+            };
+        }
+        macro_rules! buf {
+            ($field:ident, $name:expr) => {
+                scratch.$field.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute(concat!("MoE grouped: ", $name, " buffer not allocated").into())
+                })?
+            };
+        }
+
+        let route_sort = match super::moe_route_sort_mode() {
+            2 => pso!(moe_prefill_route_sort_atomic, "route_sort_atomic"),
+            1 => pso!(moe_prefill_route_sort_par, "route_sort_par"),
+            _ => pso!(moe_prefill_route_sort, "route_sort"),
+        };
+        let assign_expert_pso = pso!(moe_prefill_assign_expert, "assign_expert");
+        // Float4-vectorized gather/scatter when hidden_dim % 4 == 0.
+        let vec4 = super::moe_gather_vec4_enabled()
+            && hidden_dim % 4 == 0
+            && pipelines.moe_prefill_gather_vec4.is_some()
+            && pipelines.moe_prefill_scatter_vec4.is_some();
+        let gather = if vec4 {
+            pso!(moe_prefill_gather_vec4, "gather_vec4")
+        } else {
+            pso!(moe_prefill_gather, "gather")
+        };
+        let scatter = if vec4 {
+            pso!(moe_prefill_scatter_vec4, "scatter_vec4")
+        } else {
+            pso!(moe_prefill_scatter, "scatter")
+        };
+        let grouped_gemm = pso!(moe_grouped_gemm_q8_0, "grouped_gemm_q8_0");
+        let swiglu = &pipelines.swiglu_batched;
+
+        // Flattened work-tile-map dispatch (avoids ~19.5x M-tile
+        // over-subscription). DEFAULT ON for Q8; REQUIRED for Q4 (no legacy
+        // dense-grid Q4 grouped GEMM). The tile-map GEMM kernel is quant-specific.
+        let grouped_gemm_tm = if is_q4 {
+            pipelines.moe_grouped_gemm_q4_0_tilemap.as_ref()
+        } else {
+            pipelines.moe_grouped_gemm_q8_0_tilemap.as_ref()
+        };
+        let tilemap_enabled = (is_q4 || super::moe_gemm_tilemap_enabled())
+            && grouped_gemm_tm.is_some()
+            && pipelines.moe_prefill_build_tile_map.is_some()
+            && scratch.moe_grp_tile_map.is_some();
+
+        let expert_ids = buf!(moe_batch_expert_ids, "expert_ids");
+        let normed = buf!(batch_normed_buf, "normed");
+        let seg_off = buf!(moe_grp_seg_off, "seg_off");
+        let grp_tok = buf!(moe_grp_tok, "grp_tok");
+        let grp_slot = buf!(moe_grp_slot, "grp_slot");
+        let assign_expert = buf!(moe_grp_assign_expert, "assign_expert");
+        let grp_in = buf!(moe_grp_in, "grp_in");
+        let grp_swiglu = buf!(moe_grp_swiglu, "grp_swiglu");
+        let grp_down = buf!(moe_grp_down, "grp_down");
+        let expert_output = buf!(moe_batch_expert_output, "expert_output");
+
+        // Per-expert weight byte-offsets. CRITICAL: these are written by the CPU
+        // at ENCODE time, but the CB executes all 40 layers AFTER encoding
+        // completes. A single shared woff buffer would therefore be clobbered by
+        // every later layer's CPU write, so all layers would read the LAST
+        // layer's offsets. We allocate a FRESH buffer per call (via
+        // new_buffer_with_bytes); the encoder retains it until the CB completes,
+        // so each layer's GEMM reads its own offsets. (The other grouped scratch
+        // buffers are safe to share because they are written by GPU kernels
+        // during CB execution, hence ordered per-layer.)
+        let offs_to_bytes = |offs: &[u64]| -> Vec<u8> {
+            offs.iter().flat_map(|v| v.to_le_bytes()).collect()
+        };
+        let gate_woff = device.new_buffer_with_bytes(&offs_to_bytes(expert_gate_offs))
+            .ok_or_else(|| RuntimeError::Compute("MoE grouped: gate_woff alloc".into()))?;
+        let up_woff = device.new_buffer_with_bytes(&offs_to_bytes(expert_up_offs))
+            .ok_or_else(|| RuntimeError::Compute("MoE grouped: up_woff alloc".into()))?;
+        let down_woff = device.new_buffer_with_bytes(&offs_to_bytes(expert_down_offs))
+            .ok_or_else(|| RuntimeError::Compute("MoE grouped: down_woff alloc".into()))?;
+        let gate_woff = &gate_woff;
+        let up_woff = &up_woff;
+        let down_woff = &down_woff;
+
+        let ne_u32 = num_experts as u32;
+        let bs_u32 = batch_size as u32;
+        let tk_u32 = top_k as u32;
+        let hidden_u32 = hidden_dim as u32;
+        let inter_u32 = inter_dim as u32;
+        let total_u32 = total_assign as u32;
+
+        // Single serial encoder for the whole grouped pipeline, with explicit
+        // memory_barrier_with_scope(1) between dependent stages. This matches the
+        // validated unit-test dispatch sequence (test_moe_prefill_grouped_end_to_end)
+        // exactly; using one encoder rather than several makes every cross-stage
+        // buffer hazard explicit via the barriers below rather than relying on
+        // cross-encoder hazard tracking.
+        //
+        // CENSUS (no-op in production): when the GDN deep-profile is enabled
+        // (LUMEN_METAL_PROFILE_GDN[_DEFER]=1), the seven grouped sub-stages are
+        // split into separate per-section CBs so the per-section GPU-TIME census
+        // attributes the 483ms grouped block. The split path ends the current
+        // encoder, announces the next section label, and opens a fresh encoder
+        // (which triggers ffi::profile_split_if_needed -> a new CB). Cross-encoder
+        // RAW hazards are then handled by Metal's between-encoder hazard tracker
+        // on the single FIFO queue, so the math is identical to the production
+        // single-encoder + explicit-barrier path. Gated entirely on the deep
+        // profile flag; production keeps ONE encoder with explicit barriers.
+        let census = super::profile::is_gdn_deep_enabled();
+        let max_m_tiles = (batch_size as u64).div_ceil(32);
+        let mut enc = cmd.new_compute_encoder().ok_or_else(|| {
+            RuntimeError::Compute("MoE grouped: encoder".into())
+        })?;
+        let tg_ne = (256u64).min(num_experts as u64).max(1);
+        // Number of work-tiles to dispatch when the tile-map path is
+        // on. Bound = ceil(total_assign/TILE_M) + num_experts (each expert adds
+        // at most one partial tile beyond its full tiles). TILE_M = 32.
+        let tile_bound = ((total_assign as u64).div_ceil(32)) + num_experts as u64;
+        // grouped_gemm_tm selected above (quant-specific).
+        let build_tile_map = pipelines.moe_prefill_build_tile_map.as_ref();
+        let tile_map_buf = scratch.moe_grp_tile_map.as_ref();
+
+        // Helper: in census mode, end the current encoder, announce the next
+        // section label, and open a fresh encoder (auto-splitting the CB). In
+        // production this is a no-op (keeps the single encoder).
+        macro_rules! census_boundary {
+            ($label:expr) => {
+                if census {
+                    enc.end_encoding();
+                    super::profile::set_section($label);
+                    enc = cmd.new_compute_encoder().ok_or_else(|| {
+                        RuntimeError::Compute("MoE grouped: census encoder".into())
+                    })?;
+                }
+            };
+        }
+        if census {
+            super::profile::set_section("moe/grp_1_route_sort");
+        }
+
+        // ---- 1. route_sort ----
+        enc.set_pipeline_state(route_sort);
+        enc.set_buffer(expert_ids, 0, 0);
+        enc.set_buffer(seg_off, 0, 1);
+        enc.set_buffer(grp_tok, 0, 2);
+        enc.set_buffer(grp_slot, 0, 3);
+        enc.set_bytes(&bs_u32.to_le_bytes(), 4);
+        enc.set_bytes(&tk_u32.to_le_bytes(), 5);
+        enc.set_bytes(&ne_u32.to_le_bytes(), 6);
+        enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(tg_ne, 1, 1));
+        enc.memory_barrier_with_scope(1);
+        census_boundary!("moe/grp_2_assign_expert");
+
+        // ---- 2. assign_expert ----
+        enc.set_pipeline_state(assign_expert_pso);
+        enc.set_buffer(seg_off, 0, 0);
+        enc.set_buffer(assign_expert, 0, 1);
+        enc.set_bytes(&ne_u32.to_le_bytes(), 2);
+        enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(tg_ne, 1, 1));
+
+        // ---- 2b. build_tile_map: flattened non-empty work-tile
+        // list for the grouped GEMM. Reads seg_off (already produced by
+        // route_sort, the prior barrier). Independent of assign_expert (both
+        // only read seg_off), so it shares this encoder; the barrier below
+        // covers both before the GEMM consumes them. ---
+        if tilemap_enabled {
+            let tm_pso = build_tile_map.unwrap();
+            let tm_buf = tile_map_buf.unwrap();
+            let tile_m_u32: u32 = 32;
+            enc.set_pipeline_state(tm_pso);
+            enc.set_buffer(seg_off, 0, 0);
+            enc.set_buffer(tm_buf, 0, 1);
+            enc.set_bytes(&ne_u32.to_le_bytes(), 2);
+            enc.set_bytes(&tile_m_u32.to_le_bytes(), 3);
+            enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(tg_ne, 1, 1));
+        }
+        enc.memory_barrier_with_scope(1);
+        census_boundary!("moe/grp_3_gather");
+
+        // ---- 3. gather normed rows -> grp_in[A, hidden] ----
+        enc.set_pipeline_state(gather);
+        enc.set_buffer(normed, 0, 0);
+        enc.set_buffer(grp_tok, 0, 1);
+        enc.set_buffer(grp_in, 0, 2);
+        enc.set_bytes(&hidden_u32.to_le_bytes(), 3);
+        enc.set_bytes(&total_u32.to_le_bytes(), 4);
+        let gather_elems = if vec4 {
+            (total_assign * (hidden_dim / 4)) as u64
+        } else {
+            (total_assign * hidden_dim) as u64
+        };
+        enc.dispatch_threadgroups(
+            MTLSize::new(gather_elems.div_ceil(256), 1, 1),
+            MTLSize::new(256, 1, 1));
+        enc.memory_barrier_with_scope(1);
+        census_boundary!("moe/grp_4_gate_up_gemm");
+
+        // ---- 4. grouped gate -> grp_swiglu;  up -> grp_down (as up tmp) ----
+        // grouped_gemm_dispatch!(out_buf, woff_buf, N, K): dispatches one grouped
+        // GEMM, picking the tile-map kernel (exact non-empty tiles) or the legacy
+        // dense grid (N/32 * max_m_tiles * num_experts) per `tilemap_enabled`.
+        macro_rules! grouped_gemm_dispatch {
+            ($src:expr, $out:expr, $woff:expr, $n:expr, $k:expr) => {
+                if tilemap_enabled {
+                    enc.set_pipeline_state(grouped_gemm_tm.unwrap());
+                    enc.set_buffer(layer_buf, 0, 0);
+                    enc.set_buffer($src, 0, 1);
+                    enc.set_buffer($out, 0, 2);
+                    enc.set_bytes(&($n).to_le_bytes(), 3);
+                    enc.set_bytes(&($k).to_le_bytes(), 4);
+                    enc.set_buffer(seg_off, 0, 5);
+                    enc.set_buffer($woff, 0, 6);
+                    enc.set_bytes(&ne_u32.to_le_bytes(), 7);
+                    enc.set_buffer(tile_map_buf.unwrap(), 0, 8);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(($n as u64).div_ceil(32), tile_bound, 1),
+                        MTLSize::new(128, 1, 1));
+                } else {
+                    enc.set_pipeline_state(grouped_gemm);
+                    enc.set_buffer(layer_buf, 0, 0);
+                    enc.set_buffer($src, 0, 1);
+                    enc.set_buffer($out, 0, 2);
+                    enc.set_bytes(&($n).to_le_bytes(), 3);
+                    enc.set_bytes(&($k).to_le_bytes(), 4);
+                    enc.set_buffer(seg_off, 0, 5);
+                    enc.set_buffer($woff, 0, 6);
+                    enc.set_bytes(&ne_u32.to_le_bytes(), 7);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(($n as u64).div_ceil(32), max_m_tiles, num_experts as u64),
+                        MTLSize::new(128, 1, 1));
+                }
+            };
+        }
+        // gate: N = inter, K = hidden, src = grp_in, dst = grp_swiglu
+        grouped_gemm_dispatch!(grp_in, grp_swiglu, gate_woff, inter_u32, hidden_u32);
+        // up:   N = inter, K = hidden, src = grp_in, dst = grp_down (up tmp)
+        grouped_gemm_dispatch!(grp_in, grp_down, up_woff, inter_u32, hidden_u32);
+        enc.memory_barrier_with_scope(1);
+        census_boundary!("moe/grp_5_swiglu");
+
+        // ---- 5. swiglu: grp_swiglu = silu(grp_swiglu) * grp_down ----
+        let total_elems = (total_assign * inter_dim) as u32;
+        enc.set_pipeline_state(swiglu);
+        enc.set_buffer(grp_swiglu, 0, 0);
+        enc.set_buffer(grp_down, 0, 1);
+        enc.set_bytes(&total_elems.to_le_bytes(), 2);
+        let tg_sw = 256u64.min(total_elems as u64).max(1);
+        enc.dispatch_threadgroups(
+            MTLSize::new((total_elems as u64).div_ceil(tg_sw), 1, 1),
+            MTLSize::new(tg_sw, 1, 1));
+        enc.memory_barrier_with_scope(1);
+        census_boundary!("moe/grp_6_down_gemm");
+
+        // ---- 6. grouped down(grp_swiglu) -> grp_down[A, hidden] ----
+        // N = hidden, K = inter, src = grp_swiglu, dst = grp_down
+        grouped_gemm_dispatch!(grp_swiglu, grp_down, down_woff, hidden_u32, inter_u32);
+        enc.memory_barrier_with_scope(1);
+        census_boundary!("moe/grp_7_scatter");
+
+        // ---- 7. scatter grp_down -> moe_batch_expert_output[e, tok, :] ----
+        enc.set_pipeline_state(scatter);
+        enc.set_buffer(grp_down, 0, 0);
+        enc.set_buffer(grp_tok, 0, 1);
+        enc.set_buffer(assign_expert, 0, 2);
+        enc.set_buffer(expert_output, 0, 3);
+        enc.set_bytes(&hidden_u32.to_le_bytes(), 4);
+        enc.set_bytes(&bs_u32.to_le_bytes(), 5);
+        enc.set_bytes(&total_u32.to_le_bytes(), 6);
+        let scatter_elems = if vec4 {
+            (total_assign * (hidden_dim / 4)) as u64
+        } else {
+            (total_assign * hidden_dim) as u64
+        };
+        enc.dispatch_threadgroups(
+            MTLSize::new(scatter_elems.div_ceil(256), 1, 1),
+            MTLSize::new(256, 1, 1));
+        enc.end_encoding();
 
         Ok(())
     }

@@ -1,3 +1,168 @@
+// ============================================================================
+// moe_grouped_gemm_q4_0_tilemap: Q4_0 grouped-expert GEMM for MoE prefill,
+// flattened work-tile-map dispatch. Q4 analog of moe_grouped_gemm_q8_0_tilemap.
+//
+// Per expert e (from tile_map): grouped_out[seg] = grp_in[seg] * dequant(W_q4_e)^T.
+// Grid (N/TILE_N, n_work_tiles_bound, 1); tg_pos.y indexes tile_map. B-tile uses
+// the Q4_0 de-interleaved nibble dequant (same as dequant_tiled_matmul_q4_0).
+// Byte-identical per-tile MMA; each work-tile writes a disjoint output block.
+//
+// Extends the Q8-only grouped prefill path to Q4_0 experts so
+// moe-q4 prefill leaves the slow Option-B (all-experts) regime.
+// ============================================================================
+kernel void moe_grouped_gemm_q4_0_tilemap(
+    device const uchar* layer_buf   [[buffer(0)]],
+    device const float* grouped_in  [[buffer(1)]],
+    device float*       grouped_out [[buffer(2)]],
+    constant uint&      N           [[buffer(3)]],
+    constant uint&      K           [[buffer(4)]],
+    device const uint*  seg_off     [[buffer(5)]],
+    device const ulong* w_off       [[buffer(6)]],
+    constant uint&      num_experts [[buffer(7)]],
+    device const uint*  tile_map    [[buffer(8)]],
+    uint3 tg_pos                    [[threadgroup_position_in_grid]],
+    ushort tiitg                    [[thread_index_in_threadgroup]],
+    ushort sgitg                    [[simdgroup_index_in_threadgroup]])
+{
+    uint n_work_tiles = tile_map[0];
+    if (tg_pos.y >= n_work_tiles) return;
+    uint packed = tile_map[1 + tg_pos.y];
+    uint e = packed >> 16;
+    uint m_tile_local_idx = packed & 0xFFFFu;
+
+    uint seg_start = seg_off[e];
+    uint cnt_e = seg_off[e + 1] - seg_start;
+
+    uint tile_m_local = m_tile_local_idx * TILE_M;
+    threadgroup half shmem[2048];
+    threadgroup half* sa = shmem;
+    threadgroup half* sb = shmem + TILE_M * TILE_K;
+
+    uint global_m_start = seg_start + tile_m_local;
+    uint tile_n_start   = tg_pos.x * TILE_N;
+    device const uchar* W_q4 = layer_buf + w_off[e];
+
+    uint m_local_limit = cnt_e - tile_m_local;
+
+    ushort sg_r = sgitg / SG_COLS;
+    ushort sg_c = sgitg % SG_COLS;
+
+    simdgroup_float8x8 mc[2][2];
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    uint num_blocks_per_row = (K + Q4_GROUP_SIZE - 1) / Q4_GROUP_SIZE;
+    uint row_bytes = num_blocks_per_row * Q4_BLOCK_SIZE;
+    uint num_k_tiles = (K + TILE_K - 1) / TILE_K;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_base = kt * TILE_K;
+        // A tile
+        {
+            ushort row = tiitg >> 2;
+            ushort col_group = tiitg & 3;
+            ushort k_start = col_group << 3;
+            uint gk = k_base + k_start;
+            threadgroup half* sa_ptr = sa + row * TILE_K + k_start;
+            if (row < m_local_limit && gk + 7 < K) {
+                device const float4* x_ptr =
+                    (device const float4*)(grouped_in + (global_m_start + row) * K + gk);
+                float4 v0 = x_ptr[0];
+                float4 v1 = x_ptr[1];
+                sa_ptr[0] = (half)v0.x; sa_ptr[1] = (half)v0.y;
+                sa_ptr[2] = (half)v0.z; sa_ptr[3] = (half)v0.w;
+                sa_ptr[4] = (half)v1.x; sa_ptr[5] = (half)v1.y;
+                sa_ptr[6] = (half)v1.z; sa_ptr[7] = (half)v1.w;
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) {
+                    uint gk_i = gk + i;
+                    sa_ptr[i] = (row < m_local_limit && gk_i < K)
+                        ? (half)grouped_in[(global_m_start + row) * K + gk_i]
+                        : (half)0.0h;
+                }
+            }
+        }
+        // B tile: Q4_0 de-interleaved nibbles (one block = TILE_K = 32 elems)
+        {
+            uint block_idx = k_base / Q4_GROUP_SIZE;
+            ushort n_local = tiitg / 4;
+            ushort t_in_row = tiitg % 4;
+            ushort k_offset = t_in_row * 8;
+            uint gn = tile_n_start + n_local;
+            threadgroup half* sb_row = sb + n_local * TILE_K + k_offset;
+            if (gn < N && k_base + k_offset < K) {
+                uint block_offset = gn * row_bytes + block_idx * Q4_BLOCK_SIZE;
+                half scale = as_type<half>(*(device const ushort*)(W_q4 + block_offset));
+                device const uchar* qdata = W_q4 + block_offset + 2;
+                uint k_remaining = K - (k_base + k_offset);
+                ushort count = (k_remaining >= 8) ? 8 : (ushort)k_remaining;
+                ushort byte_start = (k_offset < 16) ? k_offset : (k_offset - 16);
+                bool use_hi = (k_offset >= 16);
+                if (count == 8) {
+                    if (use_hi) {
+                        FOR_UNROLL (ushort i = 0; i < 8; i++)
+                            sb_row[i] = scale * (half)(int((qdata[byte_start + i] >> 4) & 0xF) - 8);
+                    } else {
+                        FOR_UNROLL (ushort i = 0; i < 8; i++)
+                            sb_row[i] = scale * (half)(int(qdata[byte_start + i] & 0xF) - 8);
+                    }
+                } else {
+                    for (ushort i = 0; i < count; i++) {
+                        ushort elem_idx = k_offset + i;
+                        ushort byte_idx = (elem_idx < 16) ? elem_idx : (elem_idx - 16);
+                        uchar raw = qdata[byte_idx];
+                        int nibble = (elem_idx >= 16) ? int((raw >> 4) & 0xF) : int(raw & 0xF);
+                        sb_row[i] = scale * (half)(nibble - 8);
+                    }
+                    for (ushort i = count; i < 8; i++) sb_row[i] = (half)0.0h;
+                }
+            } else {
+                FOR_UNROLL (ushort i = 0; i < 8; i++) sb_row[i] = (half)0.0h;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (ushort ks = 0; ks < TILE_K; ks += 8) {
+            simdgroup_half8x8 ma[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(ma[0], sa + (sg_r * 16 + 0) * TILE_K + ks, TILE_K);
+            simdgroup_load(ma[1], sa + (sg_r * 16 + 8) * TILE_K + ks, TILE_K);
+            simdgroup_half8x8 mb[2];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_load(mb[0], sb + (sg_c * 16 + 0) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+            simdgroup_load(mb[1], sb + (sg_c * 16 + 8) * TILE_K + ks, TILE_K, ulong2(0,0), true);
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mc[0][0], ma[0], mb[0], mc[0][0]);
+            simdgroup_multiply_accumulate(mc[0][1], ma[0], mb[1], mc[0][1]);
+            simdgroup_multiply_accumulate(mc[1][0], ma[1], mb[0], mc[1][0]);
+            simdgroup_multiply_accumulate(mc[1][1], ma[1], mb[1], mc[1][1]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint sg_m_local = tile_m_local + sg_r * 16;
+    uint sg_n_base  = tile_n_start + sg_c * 16;
+    threadgroup float* sc = (threadgroup float*)shmem;
+    threadgroup float* my_sc = sc + sgitg * 256;
+    FOR_UNROLL (ushort i = 0; i < 2; i++)
+        FOR_UNROLL (ushort j = 0; j < 2; j++)
+            simdgroup_store(mc[i][j], my_sc + (i * 8) * 16 + (j * 8), 16);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ushort lane = tiitg % 32;
+    for (ushort idx = lane; idx < 256; idx += 32) {
+        ushort local_m = idx / 16;
+        ushort local_n = idx % 16;
+        uint m_local = sg_m_local + local_m;
+        uint gn = sg_n_base + local_n;
+        if (m_local < cnt_e && gn < N) {
+            uint grow = seg_start + m_local;
+            grouped_out[grow * N + gn] = my_sc[local_m * 16 + local_n];
+        }
+    }
+}
+
 kernel void dequant_tiled_matmul_q4_0(
     device const uchar* W_q4     [[buffer(0)]],   // Q4_0 weights [N, K_bytes]
     device const float* X        [[buffer(1)]],   // [M, K] input batch

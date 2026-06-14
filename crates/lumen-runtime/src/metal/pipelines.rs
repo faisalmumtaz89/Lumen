@@ -263,6 +263,12 @@ impl MetalF32Backend {
             // Option to provide clear runtime error if Metal compilation fails.
             moe_router_softmax: lib.get_function("moe_router_softmax")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_router_logits_f32: lib.get_function("moe_router_logits_f32")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_router_topk_softmax: lib.get_function("moe_router_topk_softmax")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_router_fused_topk: lib.get_function("moe_router_fused_topk")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             moe_router_softmax_batched: lib.get_function("moe_router_softmax_batched")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             moe_router_softmax_biased: lib.get_function("moe_router_softmax_biased")
@@ -273,12 +279,39 @@ impl MetalF32Backend {
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             moe_expert_accum_option_a: lib.get_function("moe_expert_accum_option_a")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // Expert-grouped prefill index/copy kernels.
+            moe_prefill_route_sort: lib.get_function("moe_prefill_route_sort")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_prefill_route_sort_par: lib.get_function("moe_prefill_route_sort_par")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_prefill_route_sort_atomic: lib.get_function("moe_prefill_route_sort_atomic")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_prefill_gather: lib.get_function("moe_prefill_gather")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_prefill_gather_vec4: lib.get_function("moe_prefill_gather_vec4")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_prefill_scatter_vec4: lib.get_function("moe_prefill_scatter_vec4")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_prefill_scatter: lib.get_function("moe_prefill_scatter")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_prefill_assign_expert: lib.get_function("moe_prefill_assign_expert")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_grouped_gemm_q8_0: lib.get_function("moe_grouped_gemm_q8_0")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_grouped_gemm_q8_0_tilemap: lib.get_function("moe_grouped_gemm_q8_0_tilemap")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_grouped_gemm_q4_0_tilemap: lib.get_function("moe_grouped_gemm_q4_0_tilemap")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_prefill_build_tile_map: lib.get_function("moe_prefill_build_tile_map")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             // Batched MoE expert FFN kernels.
             moe_batched_gate_up_swiglu_q4_0: lib.get_function("moe_batched_gate_up_swiglu_q4_0")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             moe_batched_gate_up_swiglu_q4_1: lib.get_function("moe_batched_gate_up_swiglu_q4_1")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             moe_batched_gate_up_swiglu_q8_0: lib.get_function("moe_batched_gate_up_swiglu_q8_0")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_batched_gate_up_swiglu_q8_0_v2: lib.get_function("moe_batched_gate_up_swiglu_q8_0_v2")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             moe_batched_down_accum_q4_0: lib.get_function("moe_batched_down_accum_q4_0")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
@@ -289,6 +322,8 @@ impl MetalF32Backend {
             moe_batched_down_accum_shared_q8_0: lib.get_function("moe_batched_down_accum_shared_q8_0")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             moe_batched_down_accum_shared_q8_0_se_q4_0: lib.get_function("moe_batched_down_accum_shared_q8_0_se_q4_0")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            moe_batched_down_accum_shared_q8_0_se_q4_0_v2: lib.get_function("moe_batched_down_accum_shared_q8_0_se_q4_0_v2")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             moe_batched_down_accum_shared_q4_0: lib.get_function("moe_batched_down_accum_shared_q4_0")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
@@ -399,6 +434,9 @@ impl MetalF32Backend {
             // (32, NSG=4, 1) threadgroup geometry for Phase 2a.
             gdn_prefill_fused_v3_chunked_nsg4: lib.get_function("gdn_prefill_fused_v3_chunked_nsg4")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // Chunk-parallel delta-rule Phase 2a.
+            gdn_prefill_chunkscan: lib.get_function("gdn_prefill_chunkscan")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             gdn_prefill_norm_gate: lib.get_function("gdn_prefill_norm_gate")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             ssm_conv1d_prefill: lib.get_function("ssm_conv1d_prefill")
@@ -412,6 +450,12 @@ impl MetalF32Backend {
             l2_normalize_heads_batched: lib.get_function("l2_normalize_heads_batched")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             l2_normalize_qk_strided: lib.get_function("l2_normalize_qk_strided")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            l2_normalize_qk_strided_sg: lib.get_function("l2_normalize_qk_strided_sg")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            conv1d_silu_l2_qk_fused: lib.get_function("conv1d_silu_l2_qk_fused")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            conv1d_silu_vrange: lib.get_function("conv1d_silu_vrange")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             gdn_compute_gates_batched: lib.get_function("gdn_compute_gates_batched")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),

@@ -79,12 +79,22 @@ impl MetalF32Backend {
         warmup_iters: usize,
         timed_iters: usize,
     ) -> Result<MicrobenchReport, RuntimeError> {
-        // Production Qwen3.5-9B ssm_out_gemm shape.
-        // M = batch_size (deep-profile run used 128).
-        // N = hidden_dim, K = q_dim. Qwen3.5-9B: hidden_dim=4096, q_dim=4096.
-        const M: usize = 128;
-        const N: usize = 4096;
-        const K: usize = 4096;
+        // Production Qwen3.5-MoE-35B-A3B ssm_out_gemm shape (GPU-time census).
+        // M = batch_size (the prefill prompt = 1239 tokens, UNALIGNED:
+        // 1239 % 32 = 23, so production dispatches the NON-aligned residual
+        // kernel with FC boundary checks ON). N = hidden_dim = 2048,
+        // K = q_dim = value_dim = 4096. Overridable via env for sweeps:
+        //   LUMEN_SSMBENCH_M / _N / _K.
+        let env_usize = |k: &str, d: usize| {
+            std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d)
+        };
+        // GEMM-convention upper-case dim names (M/N/K) kept for readability.
+        #[allow(non_snake_case)]
+        let (M, N, K) = (
+            env_usize("LUMEN_SSMBENCH_M", 1239),
+            env_usize("LUMEN_SSMBENCH_N", 2048),
+            env_usize("LUMEN_SSMBENCH_K", 4096),
+        );
 
         // Compile pipelines on demand (the production init() compiles them
         // through ComputeBackend::init, which the microbench harness does
@@ -141,12 +151,16 @@ impl MetalF32Backend {
         //            `gdn/ssm_out_gemm` at ~9.8 ms / call in production).
         // Variant 3: residual aligned k64 + zero R (cold-cache control).
 
-        // Validate alignment (this kernel set requires M, N, K all multiples
-        // of TILE_{M,N,K}=32 and additionally K divisible by 64 for the
-        // _aligned k64 variant).
-        debug_assert_eq!(M % 32, 0);
-        debug_assert_eq!(N % 32, 0);
-        debug_assert_eq!(K % 64, 0);
+        // Production selects the `_aligned` k64 variant only when
+        // M%32==0 && N%32==0 && K%32==0 (and K%64==0); otherwise the
+        // NON-aligned variant (FC boundary checks ON). The default
+        // (M=1239) is UNALIGNED so the non-aligned kernel is exercised —
+        // exactly what production dispatches for ssm_out at T=1239.
+        let aligned = M % 32 == 0 && N % 32 == 0 && K % 32 == 0 && K % 64 == 0;
+        eprintln!(
+            "[ssm-bench] shape M={M} N={N} K={K} aligned={aligned} \
+             (production ssm_out at T=1239 is UNALIGNED)"
+        );
 
         let plain = run_scenario_plain(
             "plain_aligned",
@@ -226,7 +240,12 @@ fn encode_plain(
     n: u32,
     k: u32,
 ) {
-    enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q8_0_k64_aligned);
+    let aligned = m % 32 == 0 && n % 32 == 0 && k % 32 == 0 && k % 64 == 0;
+    if aligned {
+        enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q8_0_k64_aligned);
+    } else {
+        enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q8_0_k64);
+    }
     enc.set_threadgroup_memory_length(8192, 0);
     enc.set_buffer(w_buf, 0, 0);
     enc.set_buffer(x_buf, 0, 1);
@@ -254,7 +273,12 @@ fn encode_residual(
     n: u32,
     k: u32,
 ) {
-    enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q8_0_k64_residual_batched_aligned);
+    let aligned = m % 32 == 0 && n % 32 == 0 && k % 32 == 0 && k % 64 == 0;
+    if aligned {
+        enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q8_0_k64_residual_batched_aligned);
+    } else {
+        enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q8_0_k64_residual_batched);
+    }
     enc.set_threadgroup_memory_length(8192, 0);
     enc.set_buffer(w_buf, 0, 0);
     enc.set_buffer(x_buf, 0, 1);

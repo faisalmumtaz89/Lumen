@@ -633,8 +633,16 @@ async fn run(args: Args) -> Result<(), String> {
     // and is when the cached env-or-default helpers latch.
     lumen_runtime::runtime_defaults::set_path_is_server(true);
     lumen_runtime::runtime_defaults::set_model_dense_quant(provider.globals().output_proj_quant);
+    // PRIMARY (bulk) quant — the body attn/FFN scheme, NOT output_proj. This is
+    // the discriminator the per-quant attention-precision default needs:
+    // output_proj is Q8_0 for BOTH 27B-q4 and 27B-q8, so only the primary
+    // scheme distinguishes a real model from a legacy caller that never set it
+    // (27B q4/q8/bf16 all -> pvf32 heals GQ-014; quant unset -> legacy WMMA).
+    lumen_runtime::runtime_defaults::set_model_primary_quant(
+        provider.lbc().header.quantization.scheme,
+    );
     // Model-size discriminator for the per-class attention-precision default
-    // (9B = 32 layers -> pvf32; 27B = 64 -> legacy WMMA; validated 2026-06-11).
+    // (9B = 32 layers -> pvf32; 27B = 64 -> per-quant; validated 2026-06-12).
     lumen_runtime::runtime_defaults::set_model_block_count(
         provider.lbc().header.hyperparams.num_layers,
     );

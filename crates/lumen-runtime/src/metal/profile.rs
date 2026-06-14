@@ -82,6 +82,13 @@ pub(crate) fn init_from_env() {
         set_enabled(true);
         PROFILE_GDN_ENABLED.store(true, Ordering::Relaxed);
     }
+    // Commit-all-wait-once deferred census: removes the
+    // per-CB wait that injects bogus GPU idle into the split census.
+    if std::env::var("LUMEN_METAL_PROFILE_GDN_DEFER").ok().as_deref() == Some("1") {
+        set_enabled(true);
+        PROFILE_GDN_ENABLED.store(true, Ordering::Relaxed);
+        DEFER_ENABLED.store(true, Ordering::Relaxed);
+    }
 }
 
 thread_local! {
@@ -105,6 +112,93 @@ thread_local! {
     /// Instant of the last `mark_section_start()` call. Used to time the
     /// commit-and-wait that closes the prior CB.
     static LAST_MARK: RefCell<Option<Instant>> = const { RefCell::new(None) };
+
+    /// GPU-time accumulator: section_label -> (total_gpu_seconds, call_count).
+    /// Populated by `record_section_gpu_time()` which the FFI split hook calls
+    /// with the just-committed CB's true GPU wall time (GPUEndTime-GPUStartTime).
+    /// This is the CONTAMINATION-FREE per-kernel census: it reads the kernel's
+    /// own GPU execution time with real data flowing through (no value
+    /// corruption, unlike subskip), so MoE-routing data-dependence cannot poison
+    /// it. The CPU-side ACCUM above includes commit/wait sync overhead; this one
+    /// is the pure GPU cost per split CB.
+    static GPU_ACCUM: RefCell<HashMap<&'static str, (f64, u64)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Record the true GPU wall time (seconds) of the just-committed split CB
+/// under the CURRENT in-flight section label. Called by the FFI split hook
+/// right after `wait_until_completed` and before the CB is released, reading
+/// `GPUEndTime - GPUStartTime`. No-op when profiling is disabled.
+pub(crate) fn record_section_gpu_time(gpu_secs: f64) {
+    if !is_enabled() {
+        return;
+    }
+    let label = IN_FLIGHT_SECTION.with(|s| *s.borrow());
+    GPU_ACCUM.with(|a| {
+        let mut a = a.borrow_mut();
+        let entry = a.entry(label).or_insert((0.0, 0));
+        entry.0 += gpu_secs;
+        entry.1 += 1;
+    });
+}
+
+thread_local! {
+    /// Deferred per-CB GPU-time registry for the COMMIT-ALL-WAIT-ONCE census
+    /// The FFI split hook commits each split CB WITHOUT
+    /// waiting (Metal executes CBs on one queue in FIFO order, so ordering/RAW
+    /// correctness is preserved), records the raw CB pointer + its section label
+    /// here, and continues. At prefill end `drain_deferred_cbs()` waits on the
+    /// LAST committed CB and reads GPUStartTime/GPUEndTime of every CB, attributing
+    /// each to its label. This removes the per-CB `wait_until_completed` that
+    /// injected ~per-dispatch GPU-idle (the ssm_out 40ms artifact — a
+    /// dependency-tail kernel absorbed the drain/refill bubble of the forced sync).
+    /// Each entry: (raw MTLCommandBuffer ptr [retained], section label).
+    static DEFERRED_CBS: RefCell<Vec<(usize, &'static str)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Returns whether the commit-all-wait-once deferred census is enabled.
+/// Gated by `LUMEN_METAL_PROFILE_GDN_DEFER=1` (implies deep profiling). When
+/// OFF the legacy per-CB commit+wait path is used (kept for A/B of the method
+/// itself). When ON the FFI split hook defers the wait.
+#[inline]
+pub(crate) fn is_defer_enabled() -> bool {
+    DEFER_ENABLED.load(Ordering::Relaxed)
+}
+
+static DEFER_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Register a committed-but-not-waited split CB (raw retained ptr) under the
+/// current in-flight label, for deferred GPU-time read. Called by the FFI
+/// split hook in defer mode. The caller MUST have retained the ptr and MUST
+/// NOT release it; `drain_deferred_cbs` releases it after reading its time.
+pub(crate) fn register_deferred_cb(raw_ptr: usize) {
+    if !is_enabled() {
+        return;
+    }
+    let label = IN_FLIGHT_SECTION.with(|s| *s.borrow());
+    DEFERRED_CBS.with(|v| v.borrow_mut().push((raw_ptr, label)));
+}
+
+/// Take the deferred-CB list (raw ptr, label), clearing the registry. The
+/// FFI layer waits on the last CB, reads each CB's GPU time, records it under
+/// its label via `record_section_gpu_time_for`, and releases each CB.
+pub(crate) fn take_deferred_cbs() -> Vec<(usize, &'static str)> {
+    DEFERRED_CBS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+/// Record GPU time under an EXPLICIT label (used by the deferred drain, where
+/// the in-flight label has already moved on).
+pub(crate) fn record_section_gpu_time_for(label: &'static str, gpu_secs: f64) {
+    if !is_enabled() {
+        return;
+    }
+    GPU_ACCUM.with(|a| {
+        let mut a = a.borrow_mut();
+        let entry = a.entry(label).or_insert((0.0, 0));
+        entry.0 += gpu_secs;
+        entry.1 += 1;
+    });
 }
 
 /// Announce the label for the section that will be encoded NEXT (the one
@@ -168,9 +262,26 @@ pub(crate) fn record_section_end() {
 /// Reset the accumulator. Called before a new profiling run.
 pub(crate) fn reset_accum() {
     ACCUM.with(|a| a.borrow_mut().clear());
+    GPU_ACCUM.with(|a| a.borrow_mut().clear());
     LAST_MARK.with(|m| *m.borrow_mut() = None);
     NEXT_SECTION.with(|n| *n.borrow_mut() = None);
     IN_FLIGHT_SECTION.with(|s| *s.borrow_mut() = "(unlabelled)");
+    // Deferred CBs are drained by the FFI layer each prefill; clear any stragglers.
+    DEFERRED_CBS.with(|v| v.borrow_mut().clear());
+}
+
+/// Snapshot of the GPU-time accumulator, sorted by total GPU time descending.
+/// `(label, total_gpu_seconds, call_count)`.
+pub(crate) fn gpu_snapshot() -> Vec<(&'static str, f64, u64)> {
+    GPU_ACCUM.with(|a| {
+        let mut v: Vec<(&'static str, f64, u64)> = a
+            .borrow()
+            .iter()
+            .map(|(k, (d, n))| (*k, *d, *n))
+            .collect();
+        v.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    })
 }
 
 /// Returns a snapshot of the accumulator, sorted by total time descending.
@@ -229,7 +340,42 @@ pub(crate) fn print_report() {
     );
     eprintln!();
     eprintln!("NOTE: Option A profiler (split CB + commit_and_wait per section).");
-    eprintln!("      Absolute total > production prefill (sync overhead added).");
-    eprintln!("      Relative ranking remains informative for hot-kernel triage.");
+    eprintln!("      CPU total above includes commit/wait sync overhead.");
     eprintln!();
+
+    // ---- GPU-TIME CENSUS (contamination-free per-kernel GPU wall) ----
+    let gsnap = gpu_snapshot();
+    if !gsnap.is_empty() {
+        let gtotal: f64 = gsnap.iter().map(|(_, d, _)| *d).sum();
+        eprintln!("===== Metal prefill per-section GPU-TIME census (GPUEndTime-GPUStartTime) =====");
+        eprintln!(
+            "{:<40} {:>12} {:>10} {:>9} {:>12}",
+            "section", "gpu_total_ms", "calls", "% gpu", "gpu_ms/call"
+        );
+        eprintln!("{}", "-".repeat(86));
+        for (label, gsec, n) in &gsnap {
+            let ms = gsec * 1000.0;
+            let pct = if gtotal > 0.0 { (gsec / gtotal) * 100.0 } else { 0.0 };
+            let per_call = if *n > 0 { ms / *n as f64 } else { 0.0 };
+            eprintln!(
+                "{:<40} {:>12.3} {:>10} {:>8.2}% {:>12.4}",
+                label, ms, n, pct, per_call
+            );
+        }
+        eprintln!("{}", "-".repeat(86));
+        eprintln!(
+            "{:<40} {:>12.3} {:>10}",
+            "GPU TOTAL (sum of isolated per-section GPU wall)",
+            gtotal * 1000.0,
+            gsnap.iter().map(|(_, _, n)| n).sum::<u64>(),
+        );
+        eprintln!();
+        eprintln!("NOTE: each section's gpu_ms is its TRUE isolated GPU execution time");
+        eprintln!("      (real data flows; no value corruption => immune to MoE-routing");
+        eprintln!("      contamination that poisons subskip). Splitting serializes, so the");
+        eprintln!("      SUM over-counts vs the production concurrent-encoder whole gpu_busy");
+        eprintln!("      by the amount the production schedule overlaps. Compare GPU TOTAL");
+        eprintln!("      here to production single-CB gpu_busy to size the overlap benefit.");
+        eprintln!();
+    }
 }

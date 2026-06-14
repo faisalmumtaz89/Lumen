@@ -1771,6 +1771,224 @@ kernel void gdn_prefill_fused_v3_chunked(
 }
 
 // ============================================================================
+// gdn_prefill_chunkscan: chunk-PARALLEL gated-delta-rule
+//
+// Replaces the O(T)-serial recurrence with the chunk-parallel form
+// (validated CPU-side to ~5e-9 output drift). Per (head, value-tile of
+// MT=32 rows): build per-chunk decays + the strictly-lower T matrix once, then
+// forward-solve for u over only C tokens, and accumulate output + state online.
+// K/a/b/decays are SHARED across all 32 value rows of the head (the structural
+// win: the per-(h,vj) kernel reloaded K/a/b for every one of 128 value rows).
+//
+// Geometry:
+//   grid        (n_heads, val_dim/MT, 1)            = (32, 4, 1) = 128 TGs
+//   threadgroup (32, NSG=4, 1)                      = 128 threads
+//   Each simdgroup (ty in 0..3) owns ROWS_PER_SG=8 value rows: vj in
+//     [vt*MT + ty*8 .. +7]. 32 lanes cooperate over key_dim (4 elems/lane).
+//   State: float4 s_reg[8] per lane (8 rows x 4 key-elems) = 32 floats/lane.
+//
+// Constants C (chunk) and MT come from buffer args so the host can sweep.
+// Requires key_dim==val_dim==128, threads (32,4,1). Falls back (host side) to
+// the serial kernel when those don't hold.
+// ============================================================================
+#define GDN_CS_MAXC 16u
+#define GDN_CS_ROWS_PER_SG 8u
+#define GDN_CS_NSG 4u
+
+kernel void gdn_prefill_chunkscan(
+    device       float* h_state        [[buffer(0)]],
+    device const float* conv_out_all   [[buffer(1)]],
+    device const float* alpha_all      [[buffer(2)]],
+    device const float* beta_all       [[buffer(3)]],
+    device       float* raw_out        [[buffer(4)]],
+    constant     uint&  n_heads        [[buffer(5)]],
+    constant     uint&  key_dim        [[buffer(6)]],
+    constant     uint&  val_dim        [[buffer(7)]],
+    constant     uint&  n_kv_heads     [[buffer(8)]],
+    constant     uint&  T              [[buffer(9)]],
+    constant     uint&  qk_dim         [[buffer(10)]],
+    constant     uint&  qkv_dim        [[buffer(11)]],
+    constant     uint&  chunk_C        [[buffer(12)]],
+    threadgroup  float* K_tg           [[threadgroup(0)]],  // [C * key_dim]
+    uint3 tg_pos                       [[threadgroup_position_in_grid]],
+    uint3 tp_in_tg                     [[thread_position_in_threadgroup]],
+    uint  lane                         [[thread_index_in_simdgroup]])
+{
+    const uint h  = tg_pos.x;
+    const uint vt = tg_pos.y;            // value-tile index (0..val_dim/MT-1)
+    const uint ty = tp_in_tg.y;          // simdgroup index (0..NSG-1)
+    if (h >= n_heads) return;
+
+    const uint C = min(chunk_C, GDN_CS_MAXC);
+    const uint MT = GDN_CS_NSG * GDN_CS_ROWS_PER_SG;   // 32 value rows per TG
+    const uint kv_head = h % n_kv_heads;
+    const float q_scale = rsqrt((float)key_dim);
+    const uint k_base = lane * 4;        // this lane owns key cols [k_base..k_base+3]
+
+    // The 8 value rows this simdgroup owns.
+    const uint row0 = vt * MT + ty * GDN_CS_ROWS_PER_SG;
+
+    // Offsets within conv_out_all for this head.
+    const uint q_head_off = kv_head * key_dim + k_base;
+    const uint v_head_base = qk_dim + qk_dim + h * val_dim;   // + vj
+    const uint out_stride = n_heads * val_dim;
+    const uint out_base = h * val_dim;                        // + vj
+
+    // Persistent state in registers: s_reg[r] holds key cols [k_base..k_base+3]
+    // of value row (row0 + r). Load from device (transposed layout).
+    float4 s_reg[GDN_CS_ROWS_PER_SG];
+    for (uint r = 0; r < GDN_CS_ROWS_PER_SG; ++r) {
+        device const float* hr = h_state + h * val_dim * key_dim + (row0 + r) * key_dim;
+        s_reg[r] = float4(hr[k_base + 0], hr[k_base + 1], hr[k_base + 2], hr[k_base + 3]);
+    }
+
+    // Shared per-chunk scalars + the T/H matrices (built ONCE per chunk, reused
+    // across all 32 value rows — the structural win). T_jl = gamma_jl<k_j,k_l>
+    // (strict lower); H_ij = gamma_ij<q_i,k_j> (lower, i>=j).
+    threadgroup float a_sh[GDN_CS_MAXC];
+    threadgroup float b_sh[GDN_CS_MAXC];
+    threadgroup float pref[GDN_CS_MAXC];   // prefix p_i
+    threadgroup float suf[GDN_CS_MAXC];    // suffix sigma_j
+    threadgroup float T_sh[GDN_CS_MAXC * GDN_CS_MAXC];
+    threadgroup float H_sh[GDN_CS_MAXC * GDN_CS_MAXC];
+
+    uint start = 0;
+    while (start < T) {
+        const uint m = min(C, T - start);
+
+        // ---- Cooperative load of K chunk + a/b into TG memory ----
+        for (uint idx = tp_in_tg.x + ty * 32u; idx < m * key_dim; idx += 128u) {
+            uint i = idx / key_dim;
+            uint col = idx % key_dim;
+            K_tg[idx] = conv_out_all[(start + i) * qkv_dim + qk_dim + kv_head * key_dim + col];
+        }
+        if (ty == 0 && lane < m) {
+            a_sh[lane] = alpha_all[(start + lane) * n_heads + h];
+            b_sh[lane] = beta_all[(start + lane) * n_heads + h];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- Build prefix/suffix decays (serial multiplication order) ----
+        if (tp_in_tg.x == 0 && ty == 0) {
+            pref[0] = a_sh[0];
+            for (uint i = 1; i < m; ++i) pref[i] = pref[i - 1] * a_sh[i];
+            suf[m - 1] = 1.0f;
+            for (int j = (int)m - 2; j >= 0; --j) suf[j] = a_sh[j + 1] * suf[j + 1];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- Build T (k.k) and H (q.k) ONCE per chunk, shared by all rows. ----
+        // Distribute the m*m (i,j) entries across the 4 simdgroups. Each entry is
+        // a 128-dim dot computed cooperatively by the simdgroup's 32 lanes.
+        // simdgroup `ty` handles entries where (i % NSG == ty).
+        for (uint i = ty; i < m; i += GDN_CS_NSG) {
+            threadgroup const float* ki = K_tg + i * key_dim;
+            float4 kiv = float4(ki[k_base+0], ki[k_base+1], ki[k_base+2], ki[k_base+3]);
+            device const float* cq = conv_out_all + (start + i) * qkv_dim;
+            float4 qiv = float4(cq[q_head_off+0], cq[q_head_off+1], cq[q_head_off+2], cq[q_head_off+3]);
+            // relative decay gamma_{i,j} for j<=i, built by descending product.
+            float gam = 1.0f;   // gamma_{i,i}=1
+            for (int j = (int)i; j >= 0; --j) {
+                if ((uint)j < i) gam *= a_sh[j + 1];   // gamma_{i,j}=a_i..a_{j+1}
+                threadgroup const float* kj = K_tg + j * key_dim;
+                float4 kjv = float4(kj[k_base+0], kj[k_base+1], kj[k_base+2], kj[k_base+3]);
+                // H_ij = gamma_ij <q_i, k_j> for j<=i
+                float pq = fma(qiv.x, gam*kjv.x, fma(qiv.y, gam*kjv.y,
+                           fma(qiv.z, gam*kjv.z, qiv.w*(gam*kjv.w))));
+                float hval = simd_sum(pq);
+                // T_ij = gamma_ij <k_i, k_j> for j<i (strict lower)
+                float tval = 0.0f;
+                if ((uint)j < i) {
+                    float pk = fma(kiv.x, gam*kjv.x, fma(kiv.y, gam*kjv.y,
+                               fma(kiv.z, gam*kjv.z, kiv.w*(gam*kjv.w))));
+                    tval = simd_sum(pk);
+                }
+                if (lane == 0) {
+                    H_sh[i * GDN_CS_MAXC + (uint)j] = hval;
+                    T_sh[i * GDN_CS_MAXC + (uint)j] = tval;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Per-row chunk solve. T/H are now shared; each simdgroup solves its 8
+        // rows reusing T_sh/H_sh (no recomputation of the k.k / q.k dots).
+        for (uint r = 0; r < GDN_CS_ROWS_PER_SG; ++r) {
+            const uint vj = row0 + r;
+            float4 s = s_reg[r];
+            float u_row[GDN_CS_MAXC];
+            float o_row[GDN_CS_MAXC];
+
+            // oin_i = <s, p_i q_i> for all i (decay before reduction).
+            for (uint i = 0; i < m; ++i) {
+                device const float* cq = conv_out_all + (start + i) * qkv_dim;
+                float4 qv = float4(cq[q_head_off + 0], cq[q_head_off + 1],
+                                   cq[q_head_off + 2], cq[q_head_off + 3]);
+                float pi = pref[i];
+                float partial = fma(s.x, pi*qv.x, fma(s.y, pi*qv.y,
+                                 fma(s.z, pi*qv.z, s.w*(pi*qv.w))));
+                o_row[i] = simd_sum(partial);
+            }
+
+            // Forward solve for u_j + online output update (using T_sh/H_sh).
+            for (uint j = 0; j < m; ++j) {
+                threadgroup const float* kj = K_tg + j * key_dim;
+                float pj = pref[j];
+                float4 kjv = float4(kj[k_base + 0], kj[k_base + 1], kj[k_base + 2], kj[k_base + 3]);
+                float partial_sk = fma(s.x, pj*kjv.x, fma(s.y, pj*kjv.y,
+                                    fma(s.z, pj*kjv.z, s.w*(pj*kjv.w))));
+                float sk = simd_sum(partial_sk);
+
+                float hist = 0.0f;
+                for (uint l = 0; l < j; ++l) {
+                    hist += T_sh[j * GDN_CS_MAXC + l] * u_row[l];
+                }
+
+                device const float* cv = conv_out_all + (start + j) * qkv_dim;
+                float vj_val = cv[v_head_base + vj];
+                float uj = b_sh[j] * (vj_val - sk - hist);
+                u_row[j] = uj;
+
+                for (uint i = j; i < m; ++i) {
+                    o_row[i] += H_sh[i * GDN_CS_MAXC + j] * uj;
+                }
+            }
+
+            if (lane == 0) {
+                for (uint i = 0; i < m; ++i) {
+                    raw_out[(start + i) * out_stride + out_base + vj] = o_row[i] * q_scale;
+                }
+            }
+
+            // State update: s <- p_{m-1} s + sum_j (suf[j] u_j) k_j
+            float pm = pref[m - 1];
+            s *= pm;
+            for (uint j = 0; j < m; ++j) {
+                threadgroup const float* kj = K_tg + j * key_dim;
+                float coef = suf[j] * u_row[j];
+                s.x += coef * kj[k_base + 0];
+                s.y += coef * kj[k_base + 1];
+                s.z += coef * kj[k_base + 2];
+                s.w += coef * kj[k_base + 3];
+            }
+            s_reg[r] = s;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        start += m;
+    }
+
+    // Write state back to device memory (transposed layout, contiguous).
+    for (uint r = 0; r < GDN_CS_ROWS_PER_SG; ++r) {
+        device float* hr = h_state + h * val_dim * key_dim + (row0 + r) * key_dim;
+        hr[k_base + 0] = s_reg[r].x;
+        hr[k_base + 1] = s_reg[r].y;
+        hr[k_base + 2] = s_reg[r].z;
+        hr[k_base + 3] = s_reg[r].w;
+    }
+}
+
+// ============================================================================
 // gdn_prefill_fused_v3_chunked_nsg4: (32, NSG=4, 1) threadgroup geometry
 //
 // Algorithmically bit-identical to gdn_prefill_fused_v3_chunked (same simd_sum
@@ -2072,6 +2290,178 @@ kernel void gdn_prefill_norm_gate(
 
         ssm_out[idx] = silu_gate * normed;
     }
+}
+
+// ============================================================================
+// conv1d_silu_l2_qk_fused: fused causal conv1d + SiLU + per-head L2 for Q AND K.
+//
+// Fused conv1d+SiLU+L2 path: collapses the
+// conv1d -> BARRIER -> L2 spine into ONE dispatch, removing the standalone
+// L2 dispatch boundary that the subskip attribution + L2-SG null proved is
+// the dominant GDN-block stall (~200ms "L2" cost is the dispatch/epoch
+// boundary, NOT L2 compute). This kernel produces the FINAL conv->silu->L2
+// Q/K values; V is produced by a separate conv+silu dispatch (no L2 on V).
+//
+// BIT-IDENTICAL to (ssm_conv1d_silu_prefill_parallel on Q/K) followed by
+// (l2_normalize_qk_strided): same conv tap order (no bias), same SiLU
+// (x/(1+exp(-x))), same F32 storage (conv_out is F32 — no half rounding
+// point), same L2 reduction tree (per-simdgroup simd_sum -> 4 tg partials
+// -> simdgroup 0 simd_sum -> rsqrt(max(.,1e-12))).
+//
+// Grid: (num_kv_heads, T, 1). Threadgroup: (head_dim, 1, 1) = 128 threads.
+// Each TG owns one (kv_head h, token t); thread tid = channel within head.
+// Each thread handles BOTH its Q channel and K channel (mirrors the standard
+// L2 kernel which normalizes q_head and k_head in the same TG).
+//
+// buffer(0): input        [T * dim] float -- pre-conv qkv (qkv_buf)
+// buffer(1): conv_state   [(kernel_size-1) * dim] float -- read-only here
+// buffer(2): kernel_w     [dim * kernel_size] float -- [dim, kernel_size]
+// buffer(3): conv_out     [T * dim] float -- OUTPUT (Q,K regions written)
+// buffer(4): dim          (uint) -- full qkv_dim (stride between tokens)
+// buffer(5): kernel_size  (uint) -- 4
+// buffer(6): state_pos    (uint)
+// buffer(7): T            (uint)
+// buffer(8): num_kv_heads (uint)
+// buffer(9): head_dim     (uint)
+// buffer(10): q_offset    (uint) -- channel offset of Q region (0)
+// buffer(11): k_offset    (uint) -- channel offset of K region (qk_dim)
+// ============================================================================
+kernel void conv1d_silu_l2_qk_fused(
+    device const float* input       [[buffer(0)]],
+    device const float* conv_state  [[buffer(1)]],
+    device const float* kernel_w    [[buffer(2)]],
+    device       float* conv_out    [[buffer(3)]],
+    constant     uint&  dim         [[buffer(4)]],
+    constant     uint&  kernel_size [[buffer(5)]],
+    constant     uint&  state_pos   [[buffer(6)]],
+    constant     uint&  T           [[buffer(7)]],
+    constant     uint&  num_kv_heads[[buffer(8)]],
+    constant     uint&  head_dim    [[buffer(9)]],
+    constant     uint&  q_offset    [[buffer(10)]],
+    constant     uint&  k_offset    [[buffer(11)]],
+    uint2 group_pos  [[threadgroup_position_in_grid]],
+    uint  tid        [[thread_index_in_threadgroup]],
+    uint  simd_lane  [[thread_index_in_simdgroup]],
+    uint  simd_group [[simdgroup_index_in_threadgroup]])
+{
+    uint h = group_pos.x;   // kv head index
+    uint t = group_pos.y;   // token
+    if (h >= num_kv_heads || t >= T) return;
+
+    uint buf_slots = kernel_size - 1;
+
+    // Absolute channel for this thread's Q and K element.
+    uint q_ch = q_offset + h * head_dim + tid;
+    uint k_ch = k_offset + h * head_dim + tid;
+
+    // --- conv1d + SiLU for the Q channel (exact tap order, NO bias) ---
+    float q_val = 0.0f;
+    float k_val = 0.0f;
+    if (tid < head_dim) {
+        float q_sum = 0.0f;
+        float k_sum = 0.0f;
+        for (uint tap = 0; tap < kernel_size; tap++) {
+            int tokens_back = (int)(kernel_size - 1 - tap);
+            int source_t = (int)t - tokens_back;
+            float q_in, k_in;
+            if (source_t >= 0) {
+                q_in = input[(uint)source_t * dim + q_ch];
+                k_in = input[(uint)source_t * dim + k_ch];
+            } else {
+                uint slot = (state_pos + buf_slots + (uint)((int)buf_slots + source_t)) % buf_slots;
+                q_in = conv_state[slot * dim + q_ch];
+                k_in = conv_state[slot * dim + k_ch];
+            }
+            q_sum += kernel_w[q_ch * kernel_size + tap] * q_in;
+            k_sum += kernel_w[k_ch * kernel_size + tap] * k_in;
+        }
+        // SiLU
+        q_val = q_sum / (1.0f + exp(-q_sum));
+        k_val = k_sum / (1.0f + exp(-k_sum));
+    }
+
+    // --- per-head L2 (exact reduction tree from l2_normalize_qk_strided) ---
+    float q_sq = q_val * q_val;
+    float k_sq = k_val * k_val;
+    q_sq = simd_sum(q_sq);
+    k_sq = simd_sum(k_sq);
+
+    uint num_sg = (head_dim + 31) / 32;
+    threadgroup float tg_q[4];
+    threadgroup float tg_k[4];
+    if (simd_lane == 0) {
+        tg_q[simd_group] = q_sq;
+        tg_k[simd_group] = k_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float total_q_sq;
+    threadgroup float total_k_sq;
+    if (simd_group == 0) {
+        float qv = (simd_lane < num_sg) ? tg_q[simd_lane] : 0.0f;
+        float kv = (simd_lane < num_sg) ? tg_k[simd_lane] : 0.0f;
+        qv = simd_sum(qv);
+        kv = simd_sum(kv);
+        if (simd_lane == 0) {
+            float l2_eps = 1e-12f;
+            total_q_sq = rsqrt(max(qv, l2_eps));
+            total_k_sq = rsqrt(max(kv, l2_eps));
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < head_dim) {
+        conv_out[t * dim + q_ch] = q_val * total_q_sq;
+        conv_out[t * dim + k_ch] = k_val * total_k_sq;
+    }
+}
+
+// ============================================================================
+// conv1d_silu_vrange: causal conv1d + SiLU for a CONTIGUOUS channel sub-range.
+//
+// Companion to conv1d_silu_l2_qk_fused: produces the V region (no L2). Same
+// math as ssm_conv1d_silu_prefill_parallel but restricted to channels
+// [ch_base, ch_base+ch_count). Bit-identical to the full conv on those
+// channels. Grid: (ceil(ch_count/TG), T). conv_state update is the existing
+// separate ssm_conv1d_state_update dispatch (unchanged).
+//
+// buffer(0): input, (1) conv_state, (2) kernel_w, (3) output, (4) dim (stride),
+// (5) kernel_size, (6) state_pos, (7) T, (8) ch_base, (9) ch_count
+// ============================================================================
+kernel void conv1d_silu_vrange(
+    device const float* input       [[buffer(0)]],
+    device const float* conv_state  [[buffer(1)]],
+    device const float* kernel_w    [[buffer(2)]],
+    device       float* output      [[buffer(3)]],
+    constant     uint&  dim         [[buffer(4)]],
+    constant     uint&  kernel_size [[buffer(5)]],
+    constant     uint&  state_pos   [[buffer(6)]],
+    constant     uint&  T           [[buffer(7)]],
+    constant     uint&  ch_base     [[buffer(8)]],
+    constant     uint&  ch_count    [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint local = gid.x;
+    if (local >= ch_count) return;
+    uint d = ch_base + local;
+    uint t = gid.y;
+    if (t >= T) return;
+    uint buf_slots = kernel_size - 1;
+
+    float sum = 0.0f;
+    for (uint tap = 0; tap < kernel_size; tap++) {
+        int tokens_back = (int)(kernel_size - 1 - tap);
+        int source_t = (int)t - tokens_back;
+        float input_val;
+        if (source_t >= 0) {
+            input_val = input[(uint)source_t * dim + d];
+        } else {
+            uint slot = (state_pos + buf_slots + (uint)((int)buf_slots + source_t)) % buf_slots;
+            input_val = conv_state[slot * dim + d];
+        }
+        sum += kernel_w[d * kernel_size + tap] * input_val;
+    }
+    output[t * dim + d] = sum / (1.0f + exp(-sum));
 }
 
 // ============================================================================
@@ -2482,6 +2872,72 @@ kernel void l2_normalize_qk_strided(
     if (tid < head_dim) {
         q_head[tid] *= total_q_sq;
         k_head[tid] *= total_k_sq;
+    }
+}
+
+// ============================================================================
+// l2_normalize_qk_strided_sg: simdgroup-per-head L2 normalize (K2 Wave-1)
+//
+// Bit-identical to l2_normalize_qk_strided (same per-head sum-of-squares,
+// same rsqrt(max(.,1e-12)), same in-place scale) but:
+//   - ONE simdgroup (32 threads) owns one (token, head); 32 lanes each handle
+//     head_dim/32 elements (=4 at head_dim=128).
+//   - Reductions use ONLY simd_sum (within-simdgroup) — NO threadgroup_barrier,
+//     NO threadgroup scratch. The original used 128-thread TGs with 2
+//     threadgroup_barriers per (token,head) over 19824 TGs/layer (barrier-bound,
+//     273ms single-biggest GDN kernel). This packs SG_PER_TG heads per TG and
+//     drops both barriers.
+// Requires head_dim % 32 == 0 (head_dim/32 elems per lane, <= 8 supported here).
+//
+// grid: ceil(n_heads*T / SG_PER_TG) TGs ; threadgroup: (32 * SG_PER_TG, 1, 1)
+// ============================================================================
+kernel void l2_normalize_qk_strided_sg(
+    device       float* data      [[buffer(0)]],
+    constant     uint&  n_heads   [[buffer(1)]],
+    constant     uint&  head_dim  [[buffer(2)]],
+    constant     uint&  T         [[buffer(3)]],
+    constant     uint&  stride    [[buffer(4)]],
+    constant     uint&  q_offset  [[buffer(5)]],
+    constant     uint&  k_offset  [[buffer(6)]],
+    uint  tg_idx                 [[threadgroup_position_in_grid]],
+    uint  simd_lane              [[thread_index_in_simdgroup]],
+    uint  simd_group             [[simdgroup_index_in_threadgroup]],
+    uint  sgs_per_tg             [[simdgroups_per_threadgroup]])
+{
+    // Global (token,head) index = which simdgroup this is, across the grid.
+    uint th = tg_idx * sgs_per_tg + simd_group;
+    uint total = n_heads * T;
+    if (th >= total) return;
+
+    uint t = th / n_heads;
+    uint h = th % n_heads;
+
+    device float* q_head = data + t * stride + q_offset + h * head_dim;
+    device float* k_head = data + t * stride + k_offset + h * head_dim;
+
+    // Each lane owns elements [simd_lane, simd_lane+32, ...] up to head_dim.
+    const uint EPL = head_dim / 32u;  // elements per lane (4 at head_dim=128)
+    float q_sq = 0.0f;
+    float k_sq = 0.0f;
+    #pragma clang loop unroll(full)
+    for (uint e = 0; e < EPL; ++e) {
+        uint idx = simd_lane + e * 32u;
+        float qv = q_head[idx];
+        float kv = k_head[idx];
+        q_sq += qv * qv;
+        k_sq += kv * kv;
+    }
+    // Within-simdgroup reductions — no threadgroup barrier needed.
+    q_sq = simd_sum(q_sq);
+    k_sq = simd_sum(k_sq);
+    const float l2_eps = 1e-12f;
+    float q_inv = rsqrt(max(q_sq, l2_eps));
+    float k_inv = rsqrt(max(k_sq, l2_eps));
+    #pragma clang loop unroll(full)
+    for (uint e = 0; e < EPL; ++e) {
+        uint idx = simd_lane + e * 32u;
+        q_head[idx] *= q_inv;
+        k_head[idx] *= k_inv;
     }
 }
 

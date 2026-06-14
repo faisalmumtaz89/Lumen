@@ -1,3 +1,361 @@
+// ============================================================================
+// Parallel MoE router (split into two kernels).
+//
+// The original `moe_router_softmax` uses ONE threadgroup to compute all
+// `num_experts` logits SERIALLY (a `for e in 0..num_experts` loop with a
+// threadgroup_barrier per expert). For Qwen3.5-35B-A3B (256 experts,
+// hidden=2048) measured profiling attributes ~1232 us / 1314 us (94%) of the
+// whole MoE-FFN GPU time to this single-threadgroup router — it runs at ~1.25%
+// GPU occupancy (1 of 80 cores) and pays 256 barriers.
+//
+// Kernel 1 `moe_router_logits_f32`: grid = num_experts threadgroups, one TG per
+// expert, 256 threads cooperating on that expert's dot product over hidden_dim.
+// Writes logits[e]. Full GPU occupancy, no serial expert loop, no per-expert
+// barrier across experts.
+//
+// Kernel 2 `moe_router_topk_softmax`: 1 TG, reads the precomputed logits and
+// performs the (cheap) max-subtract softmax + top-k argmax + renormalisation,
+// identical math to the original Phases 2-4.
+//
+// Numerics: logits are the same dot products; softmax/top-k math is byte-for-
+// byte the original Phase 2-4 code. Selected only when
+// LUMEN_METAL_MOE_ROUTER_PARALLEL=1; else the original single-TG kernel runs.
+// ============================================================================
+kernel void moe_router_logits_f32(
+    device const float* hidden_state   [[buffer(0)]],
+    device const float* gate_weight    [[buffer(1)]],
+    device float*       logits_out     [[buffer(2)]],
+    constant uint&      hidden_dim     [[buffer(3)]],
+    constant uint&      num_experts    [[buffer(4)]],
+    uint tgpig                         [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_index_in_threadgroup]],
+    uint tg_size                       [[threads_per_threadgroup]],
+    uint simd_lane                     [[thread_index_in_simdgroup]],
+    uint simd_group                    [[simdgroup_index_in_threadgroup]])
+{
+    uint e = tgpig;
+    if (e >= num_experts) return;
+
+    threadgroup float partial_sums[32];
+    uint num_simd_groups = (tg_size + 31) / 32;
+
+    device const float* w_row = gate_weight + (ulong)e * hidden_dim;
+    float sum = 0.0f;
+    for (uint j = tid; j < hidden_dim; j += tg_size) {
+        sum += w_row[j] * hidden_state[j];
+    }
+    sum = simd_sum(sum);
+    if (simd_lane == 0) partial_sums[simd_group] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) logits_out[e] = val;
+    }
+}
+
+// PARALLEL top-k softmax (the decode win, +41%).
+// The original kernel did the softmax in parallel but the top-k argmax SERIALLY
+// on a single thread (8 picks × 256-scan = 2048 sequential ops). Measured cost:
+// ~5 ms/token (15.31 -> 10.42 ms GPU_busy when parallelized) = the dominant
+// decode bottleneck. This version parallelizes the argmax: each of the top_k
+// picks is a threadgroup-wide max reduction (simd_shuffle tree + cross-simdgroup
+// merge), lowest-index-on-ties to match the serial strict-`>` ascending scan.
+// Same selection, same renorm. Only TG 0 writes (tgpig guard preserved; the
+// dispatch is grid=1 in production, the tgpig guard supports the replicated
+// experiment too).
+kernel void moe_router_topk_softmax(
+    device const float* logits_in      [[buffer(0)]],
+    device uint*        expert_ids     [[buffer(1)]],
+    device float*       expert_weights [[buffer(2)]],
+    constant uint&      num_experts    [[buffer(3)]],
+    constant uint&      top_k          [[buffer(4)]],
+    uint tgpig                         [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_index_in_threadgroup]],
+    uint tg_size                       [[threads_per_threadgroup]],
+    uint simd_lane                     [[thread_index_in_simdgroup]],
+    uint simd_group                    [[simdgroup_index_in_threadgroup]])
+{
+    // Parallel softmax over num_experts (one TG, num_experts<=256 threads), then
+    // serial top-k argmax (only top_k=8 iterations). The original did all of
+    // this on a single thread, which profiling showed costs ~218 us/layer with
+    // 256 experts (256 exp() + scans serialized on one core). Same math; the
+    // softmax max/sum are now threadgroup reductions.
+    threadgroup float logits[256];
+    threadgroup float red[32];
+
+    // Load logits into shared memory (coalesced).
+    for (uint e = tid; e < num_experts; e += tg_size) logits[e] = logits_in[e];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_sg = (tg_size + 31) / 32;
+
+    // --- Parallel max reduction ---
+    float m = -INFINITY;
+    for (uint e = tid; e < num_experts; e += tg_size) m = max(m, logits[e]);
+    m = simd_max(m);
+    if (simd_lane == 0) red[simd_group] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        float v = (simd_lane < num_sg) ? red[simd_lane] : -INFINITY;
+        v = simd_max(v);
+        if (simd_lane == 0) red[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_logit = red[0];
+    // All threads must finish reading red[0] above before any simdgroup overwrites
+    // red[] for the sum reduction below. Without this barrier a fast simdgroup can
+    // write red[] while a slow simdgroup is still reading red[0] as max_logit,
+    // corrupting the softmax and flipping near-tie argmax -> non-deterministic
+    // greedy decode. The scratch is reused across the max and sum reduction phases.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Parallel exp + sum reduction ---
+    float s = 0.0f;
+    for (uint e = tid; e < num_experts; e += tg_size) {
+        float val = exp(logits[e] - max_logit);
+        logits[e] = val;
+        s += val;
+    }
+    s = simd_sum(s);
+    if (simd_lane == 0) red[simd_group] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        float v = (simd_lane < num_sg) ? red[simd_lane] : 0.0f;
+        v = simd_sum(v);
+        if (simd_lane == 0) red[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_sum = 1.0f / red[0];
+
+    for (uint e = tid; e < num_experts; e += tg_size) logits[e] *= inv_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // PARALLEL top-k argmax. Replaces the 8×256=2048-op serial
+    // scan on a single thread with 8 sequential PARALLEL argmax reductions over
+    // the threadgroup. Each of the top_k picks: every thread tracks its local
+    // (max_val, idx) over its strided slice, then a simd_max tree + threadgroup
+    // reduction finds the global best; thread 0 records it and masks it out
+    // (logits[best]=-1) for the next pick. Same selection (softmax probs, strict
+    // first-index tie-break via index-as-tiebreaker), byte-identical to serial.
+    threadgroup float bestval_sg[32];
+    threadgroup uint  bestidx_sg[32];
+    threadgroup float g_best_val;
+    threadgroup uint  g_best_idx;
+    uint nsg = (tg_size + 31) / 32;
+
+    float renorm_sum = 0.0f;
+    for (uint k = 0; k < top_k; k++) {
+        // Each thread's local argmax over its strided slice. Tie-break: lowest
+        // index wins (matches the serial strict-`>` ascending scan).
+        float lv = -1.0f; uint li = 0xffffffffu;
+        for (uint e = tid; e < num_experts; e += tg_size) {
+            float v = logits[e];
+            if (v > lv) { lv = v; li = e; }
+        }
+        // simd reduce: pick max value, lowest index on ties.
+        for (uint off = 16; off > 0; off >>= 1) {
+            float ov = simd_shuffle_down(lv, off);
+            uint  oi = simd_shuffle_down(li, off);
+            if (ov > lv || (ov == lv && oi < li)) { lv = ov; li = oi; }
+        }
+        if (simd_lane == 0) { bestval_sg[simd_group] = lv; bestidx_sg[simd_group] = li; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            float v2 = (simd_lane < nsg) ? bestval_sg[simd_lane] : -1.0f;
+            uint  i2 = (simd_lane < nsg) ? bestidx_sg[simd_lane] : 0xffffffffu;
+            for (uint off = 16; off > 0; off >>= 1) {
+                float ov = simd_shuffle_down(v2, off);
+                uint  oi = simd_shuffle_down(i2, off);
+                if (ov > v2 || (ov == v2 && oi < i2)) { v2 = ov; i2 = oi; }
+            }
+            if (simd_lane == 0) { g_best_val = v2; g_best_idx = i2; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tgpig == 0 && tid == 0) {
+            expert_ids[k] = g_best_idx;
+            expert_weights[k] = g_best_val;
+        }
+        renorm_sum += g_best_val;
+        // Mask the chosen expert so it isn't picked again.
+        if (tid == 0) logits[g_best_idx] = -1.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tgpig == 0 && tid == 0 && renorm_sum > 0.0f) {
+        float inv_renorm = 1.0f / renorm_sum;
+        for (uint k = 0; k < top_k; k++) expert_weights[k] *= inv_renorm;
+    }
+}
+
+// ============================================================================
+// FUSED single-dispatch MoE router (logits + top-k softmax in
+// ONE grid=num_experts dispatch).
+//
+// PROBLEM (measured): the two-kernel router leaves the top-k softmax
+// as a SEPARATE grid=(1,1,1) dispatch. On the serial GDN decode encoder that
+// 1-TG dispatch drains the whole GPU (uses ~1/640 of the machine), runs alone,
+// then refills -- a per-layer bubble measured at ~151 us/layer = 6 ms/token =
+// 39% of total decode GPU time (skip-attribution: skipping ONLY this kernel
+// drops GPU_busy 15.31 -> 9.27 ms/tok). Its sibling logits kernel (grid=256) is
+// ~free. The cost is the 1-TG drain, not arithmetic.
+//
+// FIX: fold the top-k softmax into the TAIL of the grid=num_experts logits
+// kernel via the classic grid-wide "last-threadgroup" reduction pattern:
+//   - Every TG e computes logits_out[e] = dot(W[e], hidden) exactly as before.
+//   - Each TG's leader does a DEVICE-memory release store of its logit, then
+//     atomically increments a global counter (relaxed) with device memory
+//     ordering. The TG that observes the counter reach (num_experts-1) -> it is
+//     the LAST finisher, so all logits are visible. It alone runs the softmax +
+//     top-k + renorm over all num_experts logits and writes expert_ids/weights.
+//   - No separate 1-TG dispatch, hence NO drain bubble. The selection math is
+//     byte-identical to moe_router_topk_softmax (same softmax-over-all, same
+//     serial argmax top-k, same renorm).
+//
+// Numerics: logits are the same dot products as moe_router_logits_f32 (same
+// reduction order). The softmax/top-k is the exact code of
+// moe_router_topk_softmax. => top-1-stable / byte-identical selection by design.
+//
+// Counter buffer (`router_counter`, device atomic_uint) MUST be zero-initialized
+// before this dispatch each layer (a tiny fill). grid = num_experts TGs of
+// `tg_size` threads (typically 256).
+// ============================================================================
+kernel void moe_router_fused_topk(
+    device const float*   hidden_state    [[buffer(0)]],
+    device const float*   gate_weight     [[buffer(1)]],
+    device float*         logits_out      [[buffer(2)]],
+    device uint*          expert_ids      [[buffer(3)]],
+    device float*         expert_weights  [[buffer(4)]],
+    device atomic_uint*   router_counter  [[buffer(5)]],
+    constant uint&        hidden_dim      [[buffer(6)]],
+    constant uint&        num_experts     [[buffer(7)]],
+    constant uint&        top_k           [[buffer(8)]],
+    uint tgpig                            [[threadgroup_position_in_grid]],
+    uint tid                              [[thread_index_in_threadgroup]],
+    uint tg_size                          [[threads_per_threadgroup]],
+    uint simd_lane                        [[thread_index_in_simdgroup]],
+    uint simd_group                       [[simdgroup_index_in_threadgroup]])
+{
+    uint e = tgpig;
+
+    threadgroup float partial_sums[32];
+    threadgroup uint  is_last_tg;
+    uint num_simd_groups = (tg_size + 31) / 32;
+
+    // ---- Phase A: this TG computes logit for expert e (same as logits kernel) ----
+    if (e < num_experts) {
+        device const float* w_row = gate_weight + (ulong)e * hidden_dim;
+        float sum = 0.0f;
+        for (uint j = tid; j < hidden_dim; j += tg_size) {
+            sum += w_row[j] * hidden_state[j];
+        }
+        sum = simd_sum(sum);
+        if (simd_lane == 0) partial_sums[simd_group] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            float val = (simd_lane < num_simd_groups) ? partial_sums[simd_lane] : 0.0f;
+            val = simd_sum(val);
+            if (simd_lane == 0) logits_out[e] = val;
+        }
+    }
+
+    // ---- Phase B: grid-wide "last TG" arbitration ----
+    // Ensure logits_out[e] is visible to other TGs (device-scope release), then
+    // bump the global finish counter. The last TG to arrive does the reduction.
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        // Metal only exposes memory_order_relaxed for device atomics. The
+        // device-scope threadgroup_barrier above flushes this TG's logit store
+        // to device memory before we increment, so the last finisher observes
+        // all logits (L2 is coherent). Relaxed is the codebase convention for
+        // device atomics (see the prefill route_sort kernels).
+        uint prev = atomic_fetch_add_explicit(router_counter, 1u,
+                                               memory_order_relaxed);
+        is_last_tg = (prev == (num_experts - 1)) ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (is_last_tg == 0u) return;
+
+    // Device-memory barrier so this finalizer TG observes all other TGs' logit
+    // stores (which were flushed before each TG's relaxed increment) before we
+    // re-read them from device memory. L2 is coherent across threadgroups.
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    // ---- Phase C: the last TG runs softmax + top-k over ALL logits ----
+    // (byte-identical to moe_router_topk_softmax). All num_experts logits are
+    // now visible in device memory because every other TG passed the device
+    // memory barrier + acq_rel increment before we observed the full count.
+    threadgroup float logits[256];
+    threadgroup float red[32];
+
+    for (uint i = tid; i < num_experts; i += tg_size) logits[i] = logits_out[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_sg = (tg_size + 31) / 32;
+
+    // Parallel max reduction.
+    float m = -INFINITY;
+    for (uint i = tid; i < num_experts; i += tg_size) m = max(m, logits[i]);
+    m = simd_max(m);
+    if (simd_lane == 0) red[simd_group] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        float v = (simd_lane < num_sg) ? red[simd_lane] : -INFINITY;
+        v = simd_max(v);
+        if (simd_lane == 0) red[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_logit = red[0];
+    // Barrier so all threads finish reading red[0] before any simdgroup overwrites
+    // red[] in the sum reduction below (intra-threadgroup race on the reused scratch,
+    // same hazard as moe_router_topk_softmax).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Parallel exp + sum reduction.
+    float s = 0.0f;
+    for (uint i = tid; i < num_experts; i += tg_size) {
+        float val = exp(logits[i] - max_logit);
+        logits[i] = val;
+        s += val;
+    }
+    s = simd_sum(s);
+    if (simd_lane == 0) red[simd_group] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        float v = (simd_lane < num_sg) ? red[simd_lane] : 0.0f;
+        v = simd_sum(v);
+        if (simd_lane == 0) red[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_sum = 1.0f / red[0];
+
+    for (uint i = tid; i < num_experts; i += tg_size) logits[i] *= inv_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Serial top-k argmax (exact same selection as moe_router_topk_softmax).
+    if (tid == 0) {
+        float renorm_sum = 0.0f;
+        for (uint k = 0; k < top_k; k++) {
+            float best_val = -1.0f;
+            uint best_idx = 0;
+            for (uint i = 0; i < num_experts; i++) {
+                if (logits[i] > best_val) { best_val = logits[i]; best_idx = i; }
+            }
+            expert_ids[k] = best_idx;
+            expert_weights[k] = best_val;
+            renorm_sum += best_val;
+            logits[best_idx] = -1.0f;
+        }
+        if (renorm_sum > 0.0f) {
+            float inv_renorm = 1.0f / renorm_sum;
+            for (uint k = 0; k < top_k; k++) expert_weights[k] *= inv_renorm;
+        }
+        // Self-reset the counter to 0 for the NEXT layer's dispatch. Safe: we are
+        // the last finisher this layer, and the next layer's router dispatch is
+        // separated by a memory_barrier, so no other TG reads/writes it between.
+        atomic_store_explicit(router_counter, 0u, memory_order_relaxed);
+    }
+}
+
 kernel void moe_router_softmax(
     device const float* hidden_state   [[buffer(0)]],
     device const float* gate_weight    [[buffer(1)]],
@@ -841,6 +1199,97 @@ kernel void moe_batched_gate_up_swiglu_q8_0(
 }
 
 // ============================================================================
+// One-simdgroup-per-row redesign of the routed gate+up+swiglu.
+//
+// moe_batched_gate_up_swiglu_q8_0_v2
+//
+// Identical math to moe_batched_gate_up_swiglu_q8_0 but with utilization-fixed
+// geometry. The original spends 4 simdgroups cooperating on ONE output row
+// (each thread does only ~2 block iterations for hidden=2048→64 blocks), then a
+// threadgroup barrier + cross-SG reduction per row. Measured profile shows the
+// MoE FFN runs at ~4% of peak bandwidth (latency/occupancy bound, not BW bound).
+//
+// New geometry: ONE simdgroup OWNS one (expert,row) output. 4 rows/TG,
+// 128 threads/TG (= 4 simdgroups), grid = ceil(top_k*inter_dim/4) (= 1024 for
+// top_k=8, inter=512). Inner loop `ib = ix; ib < num_blocks; ib += 8` so every
+// lane does num_blocks/8 = 8 iterations (8x more in-flight work/thread than the
+// original's 2). Reduction is one simd_sum per row — no tgmem, no barrier.
+//
+// Numerics: identical per-(block,quarter) partial products; only the cross-lane
+// reduction tree differs (FP reassociation, within 1e-2 decode tolerance).
+// Dispatched only when LUMEN_METAL_MOE_GATEUP_SGROW=1; else the original runs.
+// ============================================================================
+kernel void moe_batched_gate_up_swiglu_q8_0_v2(
+    device const uchar*  layer_buf      [[buffer(0)]],
+    device const float*  x              [[buffer(1)]],
+    device float*        swiglu_out     [[buffer(2)]],
+    device const uint*   expert_ids     [[buffer(3)]],
+    device const ulong*  expert_offsets [[buffer(4)]],
+    constant uint&       hidden_dim     [[buffer(5)]],
+    constant uint&       inter_dim      [[buffer(6)]],
+    constant uint&       top_k          [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    // One simdgroup owns one (expert_slot,row) output. 4 outputs/TG (4 SGs).
+    uint out_idx = tgpig * 4u + sgitg;
+    uint total_out = top_k * inter_dim;
+    if (out_idx >= total_out) return;
+
+    uint expert_slot = out_idx / inter_dim;
+    uint row = out_idx % inter_dim;
+
+    uint expert_id = expert_ids[expert_slot];
+    ulong gate_off = expert_offsets[expert_id * 2 + 0];
+    ulong up_off   = expert_offsets[expert_id * 2 + 1];
+
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = hidden_dim >> 5;  // = 64
+    uint row_bytes = num_blocks * Q8_BLOCK_SIZE;
+
+    device const uchar* gate_row_ptr = layer_buf + gate_off + row * row_bytes;
+    device const uchar* up_row_ptr   = layer_buf + up_off   + row * row_bytes;
+
+    uint ix = tiisg / 4;   // 0..7 : which block (stride 8)
+    uint il = tiisg % 4;   // 0..3 : which 8-byte quarter
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+
+    for (uint ib = ix; ib < num_blocks; ib += 8) {
+        uint x_base = ib * 32 + il * 8;
+        float yl[8];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) yl[i] = x[x_base + i];
+
+        device const uchar* gate_bp = gate_row_ptr + ib * Q8_BLOCK_SIZE;
+        half gate_scale = as_type<half>(*(device const ushort*)gate_bp);
+        device const char* gate_qs = (device const char*)(gate_bp + 2) + il * 8;
+        float gate_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) gate_dot += float(gate_qs[i]) * yl[i];
+        gate_sum += gate_dot * float(gate_scale);
+
+        device const uchar* up_bp = up_row_ptr + ib * Q8_BLOCK_SIZE;
+        half up_scale = as_type<half>(*(device const ushort*)up_bp);
+        device const char* up_qs = (device const char*)(up_bp + 2) + il * 8;
+        float up_dot = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) up_dot += float(up_qs[i]) * yl[i];
+        up_sum += up_dot * float(up_scale);
+    }
+
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+
+    if (tiisg == 0) {
+        float sigmoid = 1.0f / (1.0f + exp(-gate_sum));
+        swiglu_out[expert_slot * inter_dim + row] = gate_sum * sigmoid * up_sum;
+    }
+}
+
+// ============================================================================
 // Phase 2: Batched down projection + weighted accumulation for top_k experts (Q8_0)
 //
 // For each output element d, computes:
@@ -1497,6 +1946,127 @@ kernel void moe_batched_down_accum_shared_q8_0_se_q4_0(
 }
 
 // ============================================================================
+// One-simdgroup-per-row redesign of the mixed-quant down+accum.
+//
+// moe_batched_down_accum_shared_q8_0_se_q4_0_v2
+//
+// Identical math to moe_batched_down_accum_shared_q8_0_se_q4_0 but with a
+// utilization-fixed geometry (measured profile: the original
+// splits one output row across simdgroups 0/1 while SGs 2/3 sit idle, because
+// num_blocks = inter_dim/32 = 16 < the stride-32 lane layout; only ~2% of peak
+// bandwidth is achieved).
+//
+// New geometry: ONE simdgroup OWNS one output row. 2 rows/TG, 64 threads/TG
+// (= 2 simdgroups), grid = ceil(hidden_dim/2) threadgroups (1024 for hidden
+// 2048). Inner loop walks ALL blocks within one simdgroup via
+// `ib = ix; ib < num_blocks; ib += 8` (ix in 0..7 → 8 lanes wide), so every
+// lane does num_blocks/8 iterations (2 for the routed q8 path, fully utilized).
+// Reduction is a single simd_sum per row — no threadgroup memory, no barrier.
+//
+// Numerics: the per-(block,quarter) partial products are identical to the
+// original; only the cross-lane reduction tree differs (FP reassociation, well
+// within the 1e-2 decode tolerance). Dispatched ONLY when
+// LUMEN_METAL_MOE_DOWN_SGROW=1; otherwise the original kernel runs (byte path
+// unchanged).
+// ============================================================================
+kernel void moe_batched_down_accum_shared_q8_0_se_q4_0_v2(
+    device const uchar*  layer_buf        [[buffer(0)]],
+    device const float*  swiglu_in        [[buffer(1)]],
+    device float*        output           [[buffer(2)]],
+    device const float*  residual         [[buffer(3)]],
+    device const uint*   expert_ids       [[buffer(4)]],
+    device const float*  expert_weights   [[buffer(5)]],
+    device const ulong*  down_offsets     [[buffer(6)]],
+    constant uint&       inter_dim        [[buffer(7)]],
+    constant uint&       hidden_dim       [[buffer(8)]],
+    constant uint&       top_k            [[buffer(9)]],
+    device const float*  se_swiglu        [[buffer(10)]],
+    device const ulong*  se_down_off_ptr  [[buffer(11)]],
+    device const float*  se_gate_scalar   [[buffer(12)]],
+    constant uint&       se_inter_dim     [[buffer(13)]],
+    constant uint&       se_use_sigmoid   [[buffer(14)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    // One simdgroup owns one output row. 2 rows/TG (2 simdgroups).
+    uint row = tgpig * 2u + sgitg;
+    if (row >= hidden_dim) return;
+
+    uint ix = tiisg / 4;   // 0..7 : which block (stride 8)
+    uint il = tiisg % 4;   // 0..3 : which 8-byte quarter within the 32-elem block
+
+    // ---- Routed experts: Q8_0 ----
+    const uint Q8_BLOCK_SIZE = 34;
+    uint num_blocks = inter_dim >> 5;
+    uint row_bytes = num_blocks * Q8_BLOCK_SIZE;
+
+    float routed = 0.0f;
+    for (uint k = 0; k < top_k; k++) {
+        uint expert_id = expert_ids[k];
+        ulong down_off = down_offsets[expert_id];
+        float w_k = expert_weights[k];
+        device const float* swiglu_k = swiglu_in + k * inter_dim;
+        device const uchar* row_ptr = layer_buf + down_off + row * row_bytes;
+
+        float dot = 0.0f;
+        for (uint ib = ix; ib < num_blocks; ib += 8) {
+            uint x_base = ib * 32 + il * 8;
+            float yl[8];
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; i++) yl[i] = swiglu_k[x_base + i];
+
+            device const uchar* bp = row_ptr + ib * Q8_BLOCK_SIZE;
+            half scale = as_type<half>(*(device const ushort*)bp);
+            device const char* qs = (device const char*)(bp + 2) + il * 8;
+            float d = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; i++) d += float(qs[i]) * yl[i];
+            dot += d * float(scale);
+        }
+        routed += w_k * dot;
+    }
+
+    // ---- Shared expert: Q4_0 ----
+    ulong se_off = se_down_off_ptr[0];
+    uint se_num_blocks = se_inter_dim >> 5;
+    uint se_row_bytes = se_num_blocks * 18u;
+    device const uchar* se_row_ptr = layer_buf + se_off + row * se_row_bytes;
+
+    float se = 0.0f;
+    for (uint ib = ix; ib < se_num_blocks; ib += 8) {
+        uint block_base = ib * 32;
+        float yl_lo[4], yl_hi[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            yl_lo[i] = se_swiglu[block_base + il * 4 + i];
+            yl_hi[i] = se_swiglu[block_base + il * 4 + 16 + i];
+        }
+        device const uchar* bp = se_row_ptr + ib * 18u;
+        float scale = float(as_type<half>(*(device const ushort*)bp));
+        device const uchar* qdata = (device const uchar*)(bp + 2) + il * 4;
+        float d = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            uchar bv = qdata[i];
+            float lo = float(bv & 0x0F) - 8.0f;
+            float hi = float(bv >> 4) - 8.0f;
+            d += lo * yl_lo[i] + hi * yl_hi[i];
+        }
+        se += d * scale;
+    }
+
+    // Single-simdgroup reductions (no threadgroup memory / barrier).
+    routed = simd_sum(routed);
+    se     = simd_sum(se);
+
+    if (tiisg == 0) {
+        float se_gate = se_use_sigmoid ? (1.0f / (1.0f + exp(-se_gate_scalar[0]))) : 1.0f;
+        output[row] = residual[row] + routed + se_gate * se;
+    }
+}
+
+// ============================================================================
 // Phase 2+SE: Batched down + accum + shared expert (Q4_0)
 // Same as Q8_0 variant but uses Q4_0 block layout for both routed and shared experts.
 // ============================================================================
@@ -1674,4 +2244,443 @@ kernel void moe_batched_down_accum_shared_q4_0(
 //
 // grid: (ceil(dim/256), 1, 1), threadgroup: (256, 1, 1)
 // ============================================================================
+
+// ============================================================================
+// EXPERT-GROUPED PREFILL MoE FFN (llama.cpp mul_mat_id style).
+//
+// Problem: the legacy prefill MoE (`encode_moe_ffn_batched`, "Option B") runs
+// the gate+up+swiglu+down GEMMs for ALL `num_experts` (256) over ALL tokens,
+// then keeps only each token's top_k (8). 96.9% of that expert compute is
+// discarded. Runtime-measured: capping the loop at 8 experts gives 4.9× prefill.
+//
+// Fix: gather tokens by their assigned expert into contiguous per-expert
+// segments, run ONE grouped GEMM per non-empty expert over only its routed
+// tokens (M = count, not batch), then scatter the weighted outputs back to the
+// existing [num_experts, batch, hidden] expert_output layout so the UNCHANGED,
+// byte-identical `moe_expert_accum_batched` produces the same result.
+//
+// Three small index/copy kernels below; the GEMMs reuse `dequant_tiled_matmul_*`
+// (the same kernel Option B already uses) so the numerics are identical.
+// ============================================================================
+
+// moe_prefill_route_sort: counting-sort the (token, slot) assignments by expert.
+//
+// Single threadgroup. Reads expert_ids[batch*top_k] and produces, grouped by
+// expert id:
+//   seg_off[num_experts+1] : prefix-sum of per-expert assignment counts
+//   grouped_tok[batch*top_k]: token index for each assignment, expert-grouped
+//   grouped_slot[batch*top_k]: the k-slot (0..top_k) for each assignment
+// Assignments for a given expert appear in increasing (token, slot) order so
+// the gather/scatter are deterministic and stable.
+//
+// buffer(0): expert_ids   [batch*top_k] uint
+// buffer(1): seg_off       [num_experts+1] uint  — OUTPUT (prefix sums)
+// buffer(2): grouped_tok   [batch*top_k] uint     — OUTPUT
+// buffer(3): grouped_slot  [batch*top_k] uint     — OUTPUT
+// buffer(4): batch_size (uint)
+// buffer(5): top_k (uint)
+// buffer(6): num_experts (uint)
+//
+// grid: (1,1,1), threadgroup: (min(256, num_experts) ,1,1)
+// ============================================================================
+kernel void moe_prefill_route_sort(
+    device const uint*  expert_ids   [[buffer(0)]],
+    device uint*        seg_off      [[buffer(1)]],
+    device uint*        grouped_tok  [[buffer(2)]],
+    device uint*        grouped_slot [[buffer(3)]],
+    constant uint&      batch_size   [[buffer(4)]],
+    constant uint&      top_k        [[buffer(5)]],
+    constant uint&      num_experts  [[buffer(6)]],
+    uint tid                         [[thread_index_in_threadgroup]],
+    uint tg_size                     [[threads_per_threadgroup]])
+{
+    // counts[e] in threadgroup memory; supports up to 256 experts.
+    threadgroup atomic_uint counts[256];
+    threadgroup uint        offs[257];
+
+    // Zero counts.
+    for (uint e = tid; e < num_experts; e += tg_size) {
+        atomic_store_explicit(&counts[e], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Count assignments per expert (parallel over all batch*top_k entries).
+    uint total = batch_size * top_k;
+    for (uint i = tid; i < total; i += tg_size) {
+        uint e = expert_ids[i];
+        if (e < num_experts) {
+            atomic_fetch_add_explicit(&counts[e], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Exclusive prefix sum (serial on thread 0 — num_experts is small, ≤256).
+    if (tid == 0) {
+        uint acc = 0;
+        for (uint e = 0; e < num_experts; e++) {
+            offs[e] = acc;
+            acc += atomic_load_explicit(&counts[e], memory_order_relaxed);
+            seg_off[e] = offs[e];
+        }
+        offs[num_experts] = acc;
+        seg_off[num_experts] = acc;
+        // Reset counts to 0 to reuse as per-expert running cursors.
+        for (uint e = 0; e < num_experts; e++) {
+            atomic_store_explicit(&counts[e], 0u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stable scatter: iterate assignments in (token, slot) order. To keep the
+    // per-expert order deterministic across threads, do the placement serially
+    // on thread 0. total ≤ batch*top_k (e.g. 1300*8 = 10400) — cheap vs GEMMs.
+    if (tid == 0) {
+        for (uint t = 0; t < batch_size; t++) {
+            for (uint k = 0; k < top_k; k++) {
+                uint e = expert_ids[t * top_k + k];
+                if (e >= num_experts) continue;
+                uint cur = atomic_fetch_add_explicit(&counts[e], 1u, memory_order_relaxed);
+                uint pos = offs[e] + cur;
+                grouped_tok[pos]  = t;
+                grouped_slot[pos] = k;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// moe_prefill_route_sort_par: identical contract to moe_prefill_route_sort but
+// the final stable scatter is PARALLELIZED ONE-THREAD-PER-EXPERT instead of
+// running serially on thread 0.
+//
+// The serial thread-0 scatter was measured at ~135ms = 15% of MoE-q8
+// prefill GPU time (clean DEFER census) — a single GPU lane stepping
+// batch*top_k (~9912) assignments while the other ~3000 ALUs idle. Each thread
+// here owns one expert e, scans the assignment list in ascending (token,slot)
+// order, and places ONLY its expert's entries contiguously at offs[e]+local.
+// Because each expert's entries are emitted in the same ascending-i order as the
+// serial version, the output (grouped_tok / grouped_slot / seg_off) is
+// BYTE-IDENTICAL — the gather/GEMM/scatter downstream therefore see identical
+// data. The trade is O(num_experts * total) reads of the tiny, cache-resident
+// expert_ids array (parallel across experts) vs O(total) serial atomics.
+// ============================================================================
+kernel void moe_prefill_route_sort_par(
+    device const uint*  expert_ids   [[buffer(0)]],
+    device uint*        seg_off      [[buffer(1)]],
+    device uint*        grouped_tok  [[buffer(2)]],
+    device uint*        grouped_slot [[buffer(3)]],
+    constant uint&      batch_size   [[buffer(4)]],
+    constant uint&      top_k        [[buffer(5)]],
+    constant uint&      num_experts  [[buffer(6)]],
+    uint tid                         [[thread_index_in_threadgroup]],
+    uint tg_size                     [[threads_per_threadgroup]])
+{
+    threadgroup atomic_uint counts[256];
+    threadgroup uint        offs[257];
+
+    for (uint e = tid; e < num_experts; e += tg_size) {
+        atomic_store_explicit(&counts[e], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint total = batch_size * top_k;
+    for (uint i = tid; i < total; i += tg_size) {
+        uint e = expert_ids[i];
+        if (e < num_experts) {
+            atomic_fetch_add_explicit(&counts[e], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Exclusive prefix sum (serial on thread 0 — num_experts is small, ≤256).
+    if (tid == 0) {
+        uint acc = 0;
+        for (uint e = 0; e < num_experts; e++) {
+            offs[e] = acc;
+            acc += atomic_load_explicit(&counts[e], memory_order_relaxed);
+            seg_off[e] = offs[e];
+        }
+        offs[num_experts] = acc;
+        seg_off[num_experts] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // PARALLEL stable scatter: one thread per expert. Each thread scans the
+    // assignment list in ascending i = t*top_k + k order and appends ITS
+    // expert's entries contiguously. Same per-expert ordering as the serial
+    // version => byte-identical grouped_tok/grouped_slot.
+    for (uint e = tid; e < num_experts; e += tg_size) {
+        uint pos = offs[e];
+        for (uint t = 0; t < batch_size; t++) {
+            uint base = t * top_k;
+            for (uint k = 0; k < top_k; k++) {
+                if (expert_ids[base + k] == e) {
+                    grouped_tok[pos]  = t;
+                    grouped_slot[pos] = k;
+                    pos++;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// moe_prefill_route_sort_atomic: fully-parallel single-TG route-sort. Count +
+// prefix-sum as in _par, but the scatter is parallel over ALL assignments
+// (tg_size threads stride the assignment list) using the per-expert threadgroup
+// counts[] as ATOMIC cursors. The within-expert order is whatever the atomic
+// race produces (NON-stable), but every downstream stage keys off the same
+// grouped_tok permutation (gather -> GEMM -> scatter writes
+// expert_output[e, grouped_tok[r]]), so any permutation cancels => final
+// expert_output BYTE-IDENTICAL. This removes route_sort_par's 256x redundant
+// per-expert scan (each of 256 threads scanned all ~9912 assignments); here the
+// scatter is O(total/tg_size) per thread.
+//
+// Determinism: the permutation may vary run-to-run (atomic order), but the
+// final logits do not — greedy decode stays deterministic (DET-001 safe).
+// ============================================================================
+kernel void moe_prefill_route_sort_atomic(
+    device const uint*  expert_ids   [[buffer(0)]],
+    device uint*        seg_off      [[buffer(1)]],
+    device uint*        grouped_tok  [[buffer(2)]],
+    device uint*        grouped_slot [[buffer(3)]],
+    constant uint&      batch_size   [[buffer(4)]],
+    constant uint&      top_k        [[buffer(5)]],
+    constant uint&      num_experts  [[buffer(6)]],
+    uint tid                         [[thread_index_in_threadgroup]],
+    uint tg_size                     [[threads_per_threadgroup]])
+{
+    threadgroup atomic_uint counts[256];
+    threadgroup uint        offs[257];
+
+    for (uint e = tid; e < num_experts; e += tg_size) {
+        atomic_store_explicit(&counts[e], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint total = batch_size * top_k;
+    for (uint i = tid; i < total; i += tg_size) {
+        uint e = expert_ids[i];
+        if (e < num_experts) {
+            atomic_fetch_add_explicit(&counts[e], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Exclusive prefix sum (serial on thread 0 — num_experts <= 256).
+    if (tid == 0) {
+        uint acc = 0;
+        for (uint e = 0; e < num_experts; e++) {
+            offs[e] = acc;
+            acc += atomic_load_explicit(&counts[e], memory_order_relaxed);
+            seg_off[e] = offs[e];
+        }
+        offs[num_experts] = acc;
+        seg_off[num_experts] = acc;
+        // Reset counts to reuse as per-expert atomic placement cursors.
+        for (uint e = 0; e < num_experts; e++) {
+            atomic_store_explicit(&counts[e], 0u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // PARALLEL scatter over all assignments. Each thread grabs a slot in its
+    // expert's segment via an atomic cursor increment (order non-deterministic
+    // but irrelevant — see header).
+    for (uint i = tid; i < total; i += tg_size) {
+        uint e = expert_ids[i];
+        if (e >= num_experts) continue;
+        uint cur = atomic_fetch_add_explicit(&counts[e], 1u, memory_order_relaxed);
+        uint pos = offs[e] + cur;
+        grouped_tok[pos]  = i / top_k;   // token
+        grouped_slot[pos] = i % top_k;   // slot
+    }
+}
+
+// moe_prefill_gather: build grouped_in[total_assign, hidden] = normed[tok] rows.
+//
+// grid: (total_assign, ceil(hidden/256)? ) — we dispatch (total_assign,1,1) with
+// a 1-D threadgroup of min(256,hidden) and a loop, OR flat over total elements.
+// Here: flat over total_assign*hidden elements.
+//
+// buffer(0): normed       [batch*hidden] float
+// buffer(1): grouped_tok  [total_assign] uint
+// buffer(2): grouped_in   [total_assign*hidden] float — OUTPUT
+// buffer(3): hidden_dim (uint)
+// buffer(4): total_assign (uint)
+// ============================================================================
+kernel void moe_prefill_gather(
+    device const float* normed       [[buffer(0)]],
+    device const uint*  grouped_tok  [[buffer(1)]],
+    device float*       grouped_in   [[buffer(2)]],
+    constant uint&      hidden_dim   [[buffer(3)]],
+    constant uint&      total_assign [[buffer(4)]],
+    uint gid                         [[thread_position_in_grid]])
+{
+    uint total = total_assign * hidden_dim;
+    if (gid >= total) return;
+    uint a = gid / hidden_dim;     // assignment index
+    uint d = gid % hidden_dim;     // element within hidden
+    uint tok = grouped_tok[a];
+    grouped_in[gid] = normed[tok * hidden_dim + d];
+}
+
+// moe_prefill_gather_vec4: float4-vectorized gather. One thread per
+// 4 contiguous hidden elements (requires hidden_dim % 4 == 0). 128-bit loads/
+// stores, 4x fewer threads. Byte-exact (pure copy). Buffer contract identical to
+// moe_prefill_gather but hidden_dim is the ELEMENT count; grid = total_assign *
+// (hidden_dim/4).
+kernel void moe_prefill_gather_vec4(
+    device const float4* normed      [[buffer(0)]],
+    device const uint*   grouped_tok [[buffer(1)]],
+    device float4*       grouped_in  [[buffer(2)]],
+    constant uint&       hidden_dim  [[buffer(3)]],
+    constant uint&       total_assign[[buffer(4)]],
+    uint gid                         [[thread_position_in_grid]])
+{
+    uint hidden4 = hidden_dim >> 2;       // hidden_dim / 4
+    uint total4 = total_assign * hidden4;
+    if (gid >= total4) return;
+    uint a = gid / hidden4;
+    uint d4 = gid % hidden4;
+    uint tok = grouped_tok[a];
+    grouped_in[gid] = normed[tok * hidden4 + d4];
+}
+
+// moe_prefill_scatter: write grouped_out[total_assign, hidden] back into the
+// existing dense [num_experts, batch, hidden] expert_output layout so the
+// unchanged moe_expert_accum_batched reads it byte-identically.
+//
+// For assignment a in expert e's segment, with token = grouped_tok[a]:
+//   expert_output[e*batch*hidden + token*hidden + d] = grouped_out[a*hidden + d]
+//
+// buffer(0): grouped_out    [total_assign*hidden] float
+// buffer(1): grouped_tok    [total_assign] uint
+// buffer(2): assign_expert  [total_assign] uint  — expert id per assignment
+// buffer(3): expert_output  [num_experts*batch*hidden] float — OUTPUT (sparse write)
+// buffer(4): hidden_dim (uint)
+// buffer(5): batch_size (uint)
+// buffer(6): total_assign (uint)
+// ============================================================================
+kernel void moe_prefill_scatter(
+    device const float* grouped_out   [[buffer(0)]],
+    device const uint*  grouped_tok   [[buffer(1)]],
+    device const uint*  assign_expert [[buffer(2)]],
+    device float*       expert_output [[buffer(3)]],
+    constant uint&      hidden_dim    [[buffer(4)]],
+    constant uint&      batch_size    [[buffer(5)]],
+    constant uint&      total_assign  [[buffer(6)]],
+    uint gid                          [[thread_position_in_grid]])
+{
+    uint total = total_assign * hidden_dim;
+    if (gid >= total) return;
+    uint a = gid / hidden_dim;
+    uint d = gid % hidden_dim;
+    uint tok = grouped_tok[a];
+    uint e   = assign_expert[a];
+    ulong dst = (ulong)e * batch_size * hidden_dim + (ulong)tok * hidden_dim + d;
+    expert_output[dst] = grouped_out[a * hidden_dim + d];
+}
+
+// moe_prefill_scatter_vec4: float4-vectorized scatter. One thread
+// per 4 contiguous hidden elements (requires hidden_dim % 4 == 0). Byte-exact.
+// grid = total_assign * (hidden_dim/4).
+kernel void moe_prefill_scatter_vec4(
+    device const float4* grouped_out   [[buffer(0)]],
+    device const uint*   grouped_tok   [[buffer(1)]],
+    device const uint*   assign_expert [[buffer(2)]],
+    device float4*       expert_output [[buffer(3)]],
+    constant uint&       hidden_dim    [[buffer(4)]],
+    constant uint&       batch_size    [[buffer(5)]],
+    constant uint&       total_assign  [[buffer(6)]],
+    uint gid                           [[thread_position_in_grid]])
+{
+    uint hidden4 = hidden_dim >> 2;
+    uint total4 = total_assign * hidden4;
+    if (gid >= total4) return;
+    uint a = gid / hidden4;
+    uint d4 = gid % hidden4;
+    uint tok = grouped_tok[a];
+    uint e   = assign_expert[a];
+    ulong dst = (ulong)e * batch_size * hidden4 + (ulong)tok * hidden4 + d4;
+    expert_output[dst] = grouped_out[(ulong)a * hidden4 + d4];
+}
+
+// moe_prefill_assign_expert: expand seg_off into a per-assignment expert id
+// array (assign_expert[a] = e for a in [seg_off[e], seg_off[e+1])). Lets the
+// scatter kernel be a flat elementwise pass. Single TG.
+//
+// buffer(0): seg_off        [num_experts+1] uint
+// buffer(1): assign_expert  [total_assign] uint — OUTPUT
+// buffer(2): num_experts (uint)
+// ============================================================================
+kernel void moe_prefill_assign_expert(
+    device const uint* seg_off       [[buffer(0)]],
+    device uint*       assign_expert [[buffer(1)]],
+    constant uint&     num_experts   [[buffer(2)]],
+    uint tid                         [[thread_index_in_threadgroup]],
+    uint tg_size                     [[threads_per_threadgroup]])
+{
+    for (uint e = tid; e < num_experts; e += tg_size) {
+        uint s = seg_off[e];
+        uint en = seg_off[e + 1];
+        for (uint a = s; a < en; a++) {
+            assign_expert[a] = e;
+        }
+    }
+}
+
+// ============================================================================
+// moe_prefill_build_tile_map: build a flattened work-tile list for the grouped
+// GEMM so we dispatch only the NON-EMPTY M-tiles instead of
+// max_m_tiles * num_experts (which is ~19.5x over-subscribed at batch=1239 /
+// 256 experts: avg ~2 real m-tiles/expert vs max_m_tiles=39).
+//
+// Each expert e owns ceil(cnt_e / TILE_M) work-tiles. This kernel (1 TG, one
+// thread per expert) atomically appends one packed entry per work-tile:
+//   tile_map[1 + idx] = (e << 16) | m_tile_local   (m_tile_local in tiles, not rows)
+// and writes the total count to tile_map[0]. The GEMM then dispatches
+// (N/TILE_N, count_bound, 1) and each TG reads its (e, m_tile_local) from
+// tile_map[1 + tg_pos.y]; tg_pos.y >= n_work_tiles early-exits.
+//
+// Tile ORDER is non-deterministic (atomic append across experts) but that is
+// irrelevant: each work-tile writes a DISJOINT block of grouped_out rows, so
+// the final buffer is identical regardless of which TG ran first. The GEMM math
+// per tile is unchanged => byte-identical output.
+//
+// buffer(0): seg_off      [num_experts+1] uint
+// buffer(1): tile_map      [1 + bound] uint — OUTPUT (slot 0 = count)
+// buffer(2): num_experts (uint)
+// buffer(3): tile_m (uint)  — TILE_M (rows per m-tile)
+// grid: (1,1,1); threadgroup (min(256,num_experts),1,1)
+// ============================================================================
+kernel void moe_prefill_build_tile_map(
+    device const uint*  seg_off     [[buffer(0)]],
+    device uint*        tile_map    [[buffer(1)]],
+    constant uint&      num_experts [[buffer(2)]],
+    constant uint&      tile_m      [[buffer(3)]],
+    uint tid                        [[thread_index_in_threadgroup]],
+    uint tg_size                    [[threads_per_threadgroup]])
+{
+    threadgroup atomic_uint next;
+    if (tid == 0) {
+        atomic_store_explicit(&next, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint e = tid; e < num_experts; e += tg_size) {
+        uint cnt_e = seg_off[e + 1] - seg_off[e];
+        if (cnt_e == 0) continue;
+        uint n_tiles_e = (cnt_e + tile_m - 1) / tile_m;
+        uint base = atomic_fetch_add_explicit(&next, n_tiles_e, memory_order_relaxed);
+        for (uint mt = 0; mt < n_tiles_e; mt++) {
+            tile_map[1 + base + mt] = (e << 16) | mt;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        tile_map[0] = atomic_load_explicit(&next, memory_order_relaxed);
+    }
+}
 

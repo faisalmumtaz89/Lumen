@@ -39,6 +39,17 @@ GATES = {
     "GQ-001": ("short.jsonl", 14 / 15, "short"),
     "GQ-002": ("medium.jsonl", 9 / 10, "generation"),
     "GQ-004": ("verylong.jsonl", 5 / 5, "verylong"),
+    # GQ-014 (multi-turn conversation fidelity): stateless chat protocol — each
+    # turn re-POSTs the FULL alternating history. A conversation passes only if
+    # EVERY turn passes (DD-* + answer/anchor + the per-turn cross-turn check);
+    # the gate passes only if ALL conversations pass (threshold 1.0, like GQ-004).
+    # It exercises chat-history templating, growing-prefix KV reuse, and
+    # cross-turn context (anaphora, state tracking, recall, running constraints,
+    # big-prefix recall) that the single-turn gates never touch.
+    # NOTE: numbered GQ-014, NOT GQ-005 — GQ-005 is the pre-existing FOUNDATIONAL
+    # reference-greedy-fidelity-vs-llama gate (Section 10), referenced throughout
+    # the suite docs and the MoE near-tie analysis; reusing 005 would collide.
+    "GQ-014": ("multiturn.jsonl", 1.0, "multiturn"),
 }
 
 
@@ -96,6 +107,30 @@ def query(base: str, prompt: str, max_tokens: int, temperature: float = 0.0) -> 
     req = urllib.request.Request(f"{base}/v1/chat/completions", data=body,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=900) as r:
+        resp = json.loads(r.read())
+    choice = resp["choices"][0]
+    return choice["message"]["content"], choice.get("finish_reason", "")
+
+
+def query_messages(base: str, messages: list[dict], max_tokens: int,
+                   temperature: float = 0.0) -> tuple[str, str]:
+    """Multi-turn variant: POST the FULL alternating user/assistant history.
+
+    The protocol is intentionally STATELESS at the HTTP layer — the client owns
+    the transcript and re-sends it every turn (no server-side session id). This
+    is the standard OpenAI chat-completions shape and is exactly what stresses
+    chat-history templating + growing-prefix KV-cache reuse: turn N re-prefills
+    turns 1..N-1 as the prefix and decodes only the new assistant reply.
+    """
+    body = json.dumps({
+        "model": "x",
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }).encode()
+    req = urllib.request.Request(f"{base}/v1/chat/completions", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=1800) as r:
         resp = json.loads(r.read())
     choice = resp["choices"][0]
     return choice["message"]["content"], choice.get("finish_reason", "")
@@ -201,6 +236,195 @@ def run_gate(base: str, gate: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# GQ-014 — multi-turn conversation fidelity
+# ---------------------------------------------------------------------------
+
+def _word_count(text: str) -> int:
+    """Constraint-checking word count: strip markdown emphasis/punctuation so
+    "**Blue**." and "Blue" both count as 1, matching how a human reads a
+    'three words' answer. Used only by the expect_words cross-turn check."""
+    cleaned = re.sub(r"[*_`#>~]", " ", text)
+    cleaned = re.sub(r"[^\w\s'-]", " ", cleaned)  # drop standalone punctuation
+    return len([w for w in cleaned.split() if any(c.isalnum() for c in w)])
+
+
+def score_turn(text: str, finish: str, turn: dict) -> dict:
+    """Score one assistant reply: DD-* (windowed) + answer-key + anchors + the
+    optional per-turn cross-turn check (expect_words). Mirrors run_prompt's
+    semantics so the multi-turn gate is as strict as the single-turn gates —
+    a degenerate loop or a wrong cross-turn answer FAILs the turn (and thus the
+    whole conversation). DD-TERM is opt-in (require_eos) since short
+    constrained answers legitimately may not emit EOS within the cap."""
+    v = window_detectors(text)
+    if v.passed and turn.get("require_eos", False):
+        tv = dd.dd_term(finish, expect_eos=True)
+        if not tv.passed:
+            v = dd.QualityVerdict(passed=False, results=v.results + [tv])
+    correct = answer_ok(text, turn)
+    ontopic = anchors_ok(text, turn)
+    # cross-turn brevity constraint: a running "answer tersely" instruction set in
+    # an EARLIER turn must still be honored on THIS turn. We gate on a CEILING
+    # (max_words), not exact equality, because exact word-count adherence is a
+    # model-quality property that even the llama.cpp reference does not hit ("exactly
+    # three words" -> both Lumen and LC produced 1-6 words on the SAME conversation,
+    # 9b-q8, GQ-014 control 2026-06-12). The DEFECT the gate must catch is the model
+    # FORGETTING the brevity constraint and rambling (constraint dropped across the
+    # growing prefix) — a ceiling catches that robustly without false-firing on terse
+    # variance both engines share. `expect_words` (exact target) is recorded for
+    # diagnostics but does NOT gate.
+    constraint_ok = True
+    constraint_detail = None
+    n = _word_count(text)
+    mw = turn.get("max_words")
+    ew = turn.get("expect_words")
+    if mw is not None:
+        constraint_ok = (0 < n <= mw)
+        constraint_detail = f"words={n} (ceiling {mw}" + (f", target {ew}" if ew else "") + ")"
+    elif ew is not None:  # diagnostic-only target: record, never gate
+        constraint_detail = f"words={n} (target {ew}, advisory)"
+    ok = v.passed and correct and ontopic and constraint_ok
+    return {
+        "passed": ok,
+        "dd_passed": v.passed,
+        "dd_fired": v.failed_names(),
+        "answer_correct": correct,
+        "on_topic": ontopic,
+        "constraint_ok": constraint_ok,
+        "constraint_detail": constraint_detail,
+        "finish_reason": finish,
+        "text": text,
+        "snippet": text[:160].replace("\n", " "),
+    }
+
+
+def run_conversation(base: str, convo: dict) -> dict:
+    """Drive one scripted conversation turn-by-turn over the stateless protocol.
+    Returns per-turn results, the full transcript (for determinism hashing /
+    cache-equivalence), and a conversation-level pass = ALL turns pass."""
+    messages: list[dict] = []
+    turn_results = []
+    for ti, turn in enumerate(convo["turns"]):
+        messages.append({"role": "user", "content": turn["user"]})
+        text, finish = query_messages(base, messages, turn.get("max_tokens", 256))
+        messages.append({"role": "assistant", "content": text})
+        r = score_turn(text, finish, turn)
+        r["turn"] = ti
+        turn_results.append(r)
+    passed = all(r["passed"] for r in turn_results)
+    transcript = [r["text"] for r in turn_results]
+    return {
+        "id": convo["id"],
+        "passed": passed,
+        "turns": turn_results,
+        "transcript": transcript,
+        "final_messages": messages,
+    }
+
+
+def _transcript_hash(transcript: list[str]) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    for t in transcript:
+        h.update(t.encode("utf-8"))
+        h.update(b"\x00")  # turn separator (avoids boundary-merge collisions)
+    return h.hexdigest()
+
+
+def run_gq005(base: str, convos: list[dict], variants: set[str],
+              respin=None, teardown_warm=None) -> dict:
+    """GQ-014 driver.
+
+    Base run: every conversation, every turn scored; conversation passes iff
+    all turns pass; gate passes iff all conversations pass.
+
+    variant 'determinism': re-run each conversation a SECOND time; the two
+    transcripts must be byte-identical (sha256). Non-determinism across an
+    identical stateless replay is a real defect (links DET-001).
+
+    variant 'cache-equiv': re-issue the FINAL turn of each conversation against
+    a FRESHLY RESTARTED server (cold prefill of the SAME full history). The
+    final answer must be token-identical to the warm-cache base run. This is the
+    multi-turn analog of CORR-010 KV-cache equivalence: a divergence between a
+    warm growing-prefix cache and a cold full re-prefill of the same context is
+    a KV / cache-management bug (high severity). `respin` is a zero-arg callable
+    returning a fresh base URL (server restarted); None disables the variant.
+    """
+    base_runs = [run_conversation(base, c) for c in convos]
+    npass = sum(1 for r in base_runs if r["passed"])
+    n = len(base_runs)
+
+    det = None
+    if "determinism" in variants:
+        det = []
+        for c, br in zip(convos, base_runs):
+            r2 = run_conversation(base, c)
+            h1 = _transcript_hash(br["transcript"])
+            h2 = _transcript_hash(r2["transcript"])
+            det.append({"id": c["id"], "identical": h1 == h2, "h1": h1[:12], "h2": h2[:12]})
+
+    cache = None
+    if "cache-equiv" in variants and respin is not None:
+        # Tear the WARM server down BEFORE spawning the cold one. The warm
+        # transcripts are already captured in base_runs, so we no longer need the
+        # warm process — and for large models (e.g. 27B bf16 ~52 GB) a second
+        # full-precision server cannot co-reside with the warm one on a single
+        # 80 GB GPU (the cold respawn OOMs). Freeing the warm server first makes
+        # the cold cold-prefill memory-safe on one GPU.
+        if teardown_warm is not None:
+            teardown_warm()
+        cold_base = respin()
+        cache = []
+        for c, br in zip(convos, base_runs):
+            msgs = br["final_messages"][:-1]  # drop the warm assistant reply
+            final_turn = c["turns"][-1]
+            cold_text, _ = query_messages(cold_base, msgs, final_turn.get("max_tokens", 256))
+            warm_text = br["transcript"][-1]
+            cache.append({
+                "id": c["id"],
+                "identical": cold_text == warm_text,
+                "warm": warm_text[:100].replace("\n", " "),
+                "cold": cold_text[:100].replace("\n", " "),
+            })
+
+    base_ok = npass == n
+    det_ok = det is None or all(d["identical"] for d in det)
+    cache_ok = cache is None or all(c["identical"] for c in cache)
+    passed = base_ok and det_ok and cache_ok
+    status = "PASS" if passed else "FAIL"
+
+    ev = f"{npass}/{n} conversations pass (all-turns, threshold 1.00). "
+    fails = [r for r in base_runs if not r["passed"]]
+    if fails:
+        parts = []
+        for r in fails[:6]:
+            bad = [f"t{t['turn']}[" +
+                   ",".join(filter(None, [
+                       ("dd:" + ",".join(t["dd_fired"])) if t["dd_fired"] else "",
+                       "ans✗" if not t["answer_correct"] else "",
+                       "topic✗" if not t["on_topic"] else "",
+                       ("constr✗ " + (t["constraint_detail"] or "")) if not t["constraint_ok"] else "",
+                   ])) + "]"
+                   for t in r["turns"] if not t["passed"]]
+            parts.append(f"{r['id']}: " + " ".join(bad))
+        ev += "Fails: " + " | ".join(parts)
+    if det is not None:
+        ndet = sum(1 for d in det if d["identical"])
+        ev += f" | determinism {ndet}/{len(det)} byte-identical"
+        if ndet != len(det):
+            ev += " [" + ",".join(d["id"] for d in det if not d["identical"]) + "]"
+    if cache is not None:
+        ncache = sum(1 for c in cache if c["identical"])
+        ev += f" | cache-equiv {ncache}/{len(cache)} final-turn token-identical"
+        if ncache != len(cache):
+            ev += " [" + ",".join(c["id"] for c in cache if not c["identical"]) + "]"
+
+    return {
+        "gate": "GQ-014", "status": status, "evidence": ev,
+        "results": base_runs, "determinism": det, "cache_equiv": cache,
+    }
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -214,19 +438,62 @@ def main() -> int:
     ap.add_argument("--gates", default="GQ-001,GQ-002,GQ-004")
     ap.add_argument("--out", default="/tmp/qsuite")
     ap.add_argument("--server-bin", default=None)
+    ap.add_argument("--ctx", type=int, default=4096,
+                    help="server context length (GQ-014 long-context turn needs >=4096)")
+    ap.add_argument("--mt-variants", default="determinism,cache-equiv",
+                    help="GQ-014 extra variants (comma): determinism, cache-equiv. "
+                         "cache-equiv needs a respawnable server (--model, not --server).")
     args = ap.parse_args()
 
-    proc = None
+    proc_holder = [None]  # warm server process (None when --server / torn down)
     base = args.server
     try:
         if not base:
             if not args.model:
                 sys.exit("need --server or --model")
-            proc = spin_server(args.model, args.backend, args.port, server_bin=args.server_bin)
+            proc_holder[0] = spin_server(args.model, args.backend, args.port, ctx=args.ctx,
+                                         server_bin=args.server_bin)
             base = f"http://127.0.0.1:{args.port}"
             if not wait_ready(base):
                 print(f"[{args.cell}] SERVER_NOT_READY (see /tmp/qsuite-server-{args.port}.log)")
                 return 2
+
+        # cache-equiv variant needs to restart THIS server on a fresh port; only
+        # possible when we own the process (--model spin, not an external --server).
+        mt_variants = {v.strip() for v in args.mt_variants.split(",") if v.strip()}
+        respin = None
+        teardown_warm = None
+        cold = {"proc": None}
+        if "cache-equiv" in mt_variants and proc_holder[0] is not None and args.model:
+            def _respin():
+                cold_port = args.port + 100
+                if cold["proc"] is not None:
+                    try:
+                        os.killpg(os.getpgid(cold["proc"].pid), signal.SIGKILL)
+                    except Exception:
+                        pass
+                cold["proc"] = spin_server(args.model, args.backend, cold_port,
+                                           ctx=args.ctx, server_bin=args.server_bin)
+                cold_base = f"http://127.0.0.1:{cold_port}"
+                if not wait_ready(cold_base):
+                    raise RuntimeError("cold respawn server not ready")
+                return cold_base
+            respin = _respin
+
+            def _teardown_warm():
+                # Free the warm server's GPU memory before the cold respawn so a
+                # large model's cold-prefill server can fit on the same GPU
+                # (27B bf16 ~52 GB cannot co-reside twice on one 80 GB GPU).
+                if proc_holder[0] is not None:
+                    try:
+                        os.killpg(os.getpgid(proc_holder[0].pid), signal.SIGKILL)
+                    except Exception:
+                        pass
+                    proc_holder[0] = None  # also prevents double-kill in finally
+            teardown_warm = _teardown_warm
+        elif "cache-equiv" in mt_variants:
+            print(f"[{args.cell}] NOTE: cache-equiv variant disabled (needs --model spin, not external --server)")
+            mt_variants.discard("cache-equiv")
 
         rows = []
         for gate in args.gates.split(","):
@@ -235,7 +502,20 @@ def main() -> int:
                 rows.append({"gate": gate, "status": "DEFERRED", "evidence": "not a self-contained gate (needs llama / tools / judge driver)"})
                 continue
             print(f"[{args.cell}] running {gate} ...", flush=True)
-            rows.append(run_gate(base, gate))
+            if gate == "GQ-014":
+                convos = load_corpus(GATES["GQ-014"][0])
+                if not convos:
+                    rows.append({"gate": gate, "status": "DEFERRED", "evidence": "no corpus multiturn.jsonl"})
+                    continue
+                rows.append(run_gq005(base, convos, mt_variants, respin=respin,
+                                      teardown_warm=teardown_warm))
+            else:
+                rows.append(run_gate(base, gate))
+        if cold["proc"] is not None:
+            try:
+                os.killpg(os.getpgid(cold["proc"].pid), signal.SIGKILL)
+            except Exception:
+                pass
 
         # results table
         outdir = Path(args.out)
@@ -254,9 +534,9 @@ def main() -> int:
         print(f"\nCELL {args.cell}: {npass} ✓ / {nfail} ✗  → {verdict}")
         return 0 if nfail == 0 else 1
     finally:
-        if proc is not None:
+        if proc_holder[0] is not None:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(proc_holder[0].pid), signal.SIGKILL)
             except Exception:
                 pass
 

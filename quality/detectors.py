@@ -73,8 +73,8 @@ def dd_rep(text: str, token_ids: list[int] | None = None) -> DetectorResult:
     # alignment row "| :--- | :--- | :--- | :--- |" repeats the structural
     # 4-gram ('|', ':---', '|', ':---') once per table — 3 tables in a
     # 256-word window exceeds the windowed max_allowed of 2 and false-fired
-    # on a clean, complete, finish=stop coffee guide (GAP-9B-VERYLONG RCA,
-    # 2026-06-11, N=3 byte-identical capture). Only CONTENT-carrying 4-grams
+    # on a clean, complete, finish=stop coffee guide (2026-06-11 fidelity
+    # calibration, N=3 byte-identical capture). Only CONTENT-carrying 4-grams
     # (any unit with an alphanumeric char) count toward the top-count gate;
     # real degenerate loops repeat words/numbers, and pure punctuation spam
     # is still caught by DD-CHARSPAM. The distinct-ratio floor below is
@@ -84,7 +84,7 @@ def dd_rep(text: str, token_ids: list[int] | None = None) -> DetectorResult:
     content_counts = {g: c for g, c in counts.items() if not _is_structural(g)}
     if not content_counts:
         content_counts = counts
-    # Shared-stem guard (METAL-MOEQ8-VLONG-RCA, 2026-06-11): a real degenerate
+    # Shared-stem guard (2026-06-11 fidelity calibration): a real degenerate
     # loop repeats the stem AND its continuation ("17 times 20 = 17 times 20
     # = ..."); natural technical prose repeats a stem with DISTINCT correct
     # continuations ("The browser sends a" -> TCP SYN / TCP ACK / TLS Client
@@ -93,12 +93,43 @@ def dd_rep(text: str, token_ids: list[int] | None = None) -> DetectorResult:
     # top-count gate if its occurrences share continuations (i.e. the
     # follow-up unit is NOT distinct each time). Identical-continuation loops
     # still fire; the distinct-ratio floor below is unaffected.
+    #
+    # n=4 WINDOW-CLIP fix (2026-06-12 fidelity calibration): the diverging
+    # content word can sit ONE token PAST the immediate continuation, so a
+    # single-offset look-ahead mis-classifies natural enumeration as a loop.
+    # short-arith-05 (27b @ AP=2, finish=stop, answer 963 CORRECT) emits three
+    # correct borrowing lines:
+    #     * The $0$ in the hundreds place becomes $9$ ...
+    #     * The $0$ in the tens     place becomes $9$ ...
+    #     * The $0$ in the ones     place becomes $10$.
+    # The 4-gram ('*','The','$0$','in') repeats 3x and its IMMEDIATE next word
+    # is 'the' all three times (single-offset diversity 0.33 -> looks looped),
+    # but the genuinely diverging content word (hundreds / tens / ones) is the
+    # NEXT token, i.e. offset +2 from the gram. Computing diversity over a SHORT
+    # look-ahead WINDOW (offsets +1..+WIN) and taking the MAX recovers the real
+    # divergence: a true loop repeats the SAME sequence at every offset (window
+    # diversity stays ~0 -> still fires), while natural enumeration diverges
+    # within a couple tokens (window diversity >= 0.75 -> suppressed). The
+    # distinct-ratio floor below is unaffected and a genuinely high repeat count
+    # over a SHORT output is still caught by that floor.
+    _CONT_WINDOW = 2
+
     def _continuation_diversity(g: tuple) -> float:
-        nexts = [units[i + n] for i in range(len(units) - n)
-                 if tuple(units[i:i + n]) == g]
-        if len(nexts) <= 1:
+        starts = [i for i in range(len(units) - n)
+                  if tuple(units[i:i + n]) == g]
+        if len(starts) <= 1:
             return 1.0
-        return len(set(nexts)) / len(nexts)
+        best = 0.0
+        for off in range(1, _CONT_WINDOW + 1):
+            nexts = [units[i + n + off - 1] for i in starts
+                     if i + n + off - 1 < len(units)]
+            if len(nexts) <= 1:
+                # not enough tail to judge this offset; treat as diverse so we
+                # never UPGRADE a near-end stem into a loop on missing context.
+                best = max(best, 1.0)
+                continue
+            best = max(best, len(set(nexts)) / len(nexts))
+        return best
     top_gram, top_count = max(content_counts.items(), key=lambda kv: kv[1])
     max_allowed = max(2, len(units) // 200)
     if top_count > max_allowed and _continuation_diversity(top_gram) >= 0.75:
@@ -458,6 +489,117 @@ _SELFTEST = [
         "little patient practice you will develop a reliable instinct for the small "
         "adjustments that matter most. Happy brewing!",
         False, False, set(),
+    ),
+    (
+        # GQ-005 multi-turn shape: a single reply under a running "answer in
+        # exactly three words" constraint. Detectors run PER TURN, so each reply
+        # is scored in isolation — a legitimately terse 3-word answer must NOT
+        # false-fire any DD. (The word-count constraint itself is enforced by the
+        # driver's expect_words check, not by the detectors.) Brevity is not
+        # degeneration; this guards the constraint conversations (mt-constraint-3words).
+        "multiturn_3word_answer (GQ-005 brevity guard, should PASS)",
+        "The capital is Paris.",
+        False, False, set(),
+    ),
+    (
+        # GQ-005 multi-turn shape: a real WITHIN-REPLY degenerate loop must still
+        # fire even though the reply is short. A constrained conversation that
+        # collapses into "blue blue blue ..." is a genuine defect, not brevity.
+        # Locks in that the brevity guard above did not soften strictness.
+        "multiturn_short_loop (GQ-005 real-loop must fire, should FAIL)",
+        "blue blue blue blue blue blue blue blue blue blue blue blue",
+        False, True, {"DD-REP", "DD-LOOP"},
+    ),
+    (
+        # REAL capture (27b-q8/q4 short-arith-05 "Compute 1000 minus 37" @ AP=2,
+        # finish=stop, answer 963 CORRECT — 2026-06-12 fidelity calibration).
+        # The 4-gram ('*','The','$0$','in') repeats 3x across three CORRECT
+        # borrowing lines; the diverging content word (hundreds/tens/ones) sits
+        # at look-ahead offset +2, so the single-offset shared-stem guard
+        # mis-fired DD-REP. The window-diversity fix (offsets +1..+2) suppresses
+        # it. Pure correct math pedagogy — must PASS.
+        "short_arith_borrowing (REAL 27b short-arith-05 DD-REP FP, should PASS)",
+        r"To compute 1000 minus 37, I will use subtraction with borrowing. "
+        r"Since 1000 has zeros, we borrow across the places: "
+        r"* The $0$ in the hundreds place becomes $9$ after borrowing. "
+        r"* The $0$ in the tens place becomes $9$ after borrowing. "
+        r"* The $0$ in the ones place becomes $10$ before subtracting. "
+        r"Now subtract: $10 - 7 = 3$ in the ones, $9 - 3 = 6$ in the tens, "
+        r"$9 - 0 = 9$ in the hundreds, and $0$ thousands. So the answer is $963$.",
+        False, False, set(),
+    ),
+    (
+        # REAL capture (27b vlong-explain-01 "what happens when you type a URL"
+        # @ AP=2, finish=stop, coherent — 2026-06-12 fidelity calibration). The DNS
+        # recursion chain repeats the stem "the resolver queries the" with
+        # DISTINCT correct continuations (root / TLD / authoritative servers).
+        # The shared-stem continuation-diversity guard already passes this at
+        # WORD granularity (the suite gate); this positive control LOCKS that in
+        # so the window-diversity change does not regress it.
+        "dns_recursion_stem (REAL 27b vlong-explain-01 DD-REP FP, should PASS)",
+        "When you type a URL, the computer must resolve the domain name to an IP "
+        "address. First, the resolver queries the root servers to find the "
+        "responsible TLD. Then, the resolver queries the TLD servers to find the "
+        "authoritative name server. Finally, the resolver queries the "
+        "authoritative servers to obtain the final IP address. This recursive "
+        "process resolves the hostname quickly thanks to layered caching.",
+        False, False, set(),
+    ),
+    (
+        # POSITIVE CONTROL: a GENUINE
+        # degenerate loop must NOT slip through the relaxed window-diversity
+        # guard. Here a stem with an IDENTICAL full continuation sequence is
+        # looped 4x amid all-unique padding so the distinct-ratio stays HIGH
+        # (the ratio floor does NOT catch it) — the ONLY thing that can catch it
+        # is the top-count gate. A true loop repeats the same sequence at EVERY
+        # look-ahead offset, so window-diversity stays ~0 and the gate fires.
+        # This proves the window relaxation did not open a hole for real loops.
+        "identical_loop (positive control: real loop must still fire, should FAIL)",
+        " ".join(f"uniqueword{i}" for i in range(300))
+        + " " + ("the cache stores the value forever and " * 4),
+        False, True, {"DD-REP"},
+    ),
+    (
+        # Positive control #1 (2026-06-12): a degenerate loop whose ONLY
+        # variation is a throwaway COUNTER token at look-ahead offset +2 — the
+        # exact inverse of the short-arith-05 FP (which diverges in content at +2).
+        # This is the case most likely to slip the window-MAX relaxation: if the
+        # guard wrongly rescued any gram with high diversity at ONE offset, the
+        # "...batch N of the queue..." stutter would pass. It must FAIL: the tail
+        # 4-gram after the counter re-converges identically, so a real loop always
+        # leaves a caught gram. Proves the relaxation cannot be defeated by a
+        # single varying token inside an otherwise-identical repeated phrase.
+        "counter_loop (positive control: varying-token loop must fire, should FAIL)",
+        "System busy. " + " ".join(f"x{i}" for i in range(60)) + " "
+        + " ".join(f"please wait while processing batch {i} of the queue now"
+                   for i in range(1, 6)),
+        False, True, {"DD-REP"},
+    ),
+    (
+        # Positive control #2 (2026-06-12): a genuine loop buried in a LONG
+        # all-unique prefix so the distinct-4gram ratio stays well above the floor
+        # (the ratio floor canNOT catch it) AND the loop count sits just past the
+        # max_allowed boundary (max(2, len//200)). Only the per-gram top-count gate
+        # can catch it. Locks in that a high-ratio output is not a free pass for a
+        # real repeated degenerate phrase.
+        "highratio_buried_loop (positive control: buried real loop must fire, should FAIL)",
+        " ".join(f"token{i}" for i in range(400)) + " "
+        + ("error code seven occurred during the read and " * 4),
+        False, True, {"DD-REP"},
+    ),
+    (
+        # Positive control #3 (2026-06-12): a near-boundary loop — exactly
+        # 3 repeats of an identical-continuation 4-gram in a medium output, sitting
+        # right at max_allowed=2 (3 > 2). Confirms the gate fires at the MINIMUM
+        # loop count the relaxation could have softened, not only on egregious 4-5x
+        # loops. Proves the window-diversity change did not raise the effective
+        # firing threshold for genuine short loops.
+        "near_boundary_loop (positive control: 3x identical loop must fire, should FAIL)",
+        "Here is the analysis of the dataset over several dimensions and metrics. "
+        + " ".join(f"w{i}" for i in range(40)) + " "
+        + ("the value diverges to infinity rapidly " * 3)
+        + " ".join(f"v{i}" for i in range(10)),
+        False, True, {"DD-REP"},
     ),
 ]
 

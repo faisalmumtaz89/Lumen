@@ -165,6 +165,10 @@ mod cached_sel {
     cached_sel!(memory_barrier_with_scope, "memoryBarrierWithScope:");
     cached_sel!(memory_barrier_with_resources, "memoryBarrierWithResources:count:");
 
+    // -- GPU timing (zero-overhead, read on a completed CB) --
+    cached_sel!(gpu_start_time, "GPUStartTime");
+    cached_sel!(gpu_end_time, "GPUEndTime");
+
     // -- Blit encoder --
     cached_sel!(copy_from_buffer, "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:");
 
@@ -201,6 +205,22 @@ mod cached_sel {
     // -- Device / queue --
     cached_sel!(new_command_queue, "newCommandQueue");
     cached_sel!(name, "name");
+
+    // -- MTLSharedEvent (cross-queue GPU↔GPU synchronization) --
+    //
+    // Used by the dual-queue GDN branch-overlap path
+    // (`LUMEN_METAL_GDN_DUAL_QUEUE=1`). `newSharedEvent` allocates a
+    // device-shared event whose 64-bit `signaledValue` is monotonically
+    // advanced by `encodeSignalEvent:value:` on a producer command buffer
+    // and waited on by `encodeWaitForEvent:value:` on a consumer command
+    // buffer (possibly on a DIFFERENT MTLCommandQueue). This is the only
+    // Apple-supported mechanism to express a cross-queue dependency; CBs on
+    // the SAME queue are FIFO and CBs on DIFFERENT queues are otherwise
+    // unordered.
+    cached_sel!(new_shared_event, "newSharedEvent");
+    cached_sel!(encode_signal_event_value, "encodeSignalEvent:value:");
+    cached_sel!(encode_wait_for_event_value, "encodeWaitForEvent:value:");
+    cached_sel!(signaled_value, "signaledValue");
 
     // -- NSString --
     cached_sel!(string_with_utf8_string, "stringWithUTF8String:");
@@ -244,6 +264,17 @@ mod cached_sel {
 unsafe fn msg_send_0_raw(obj: ObjcId, s: ObjcSel) -> ObjcId {
     type MsgSend0Fn = unsafe extern "C" fn(ObjcId, ObjcSel) -> ObjcId;
     let f: MsgSend0Fn = std::mem::transmute(objc_msgSend as *const c_void);
+    f(obj, s)
+}
+
+/// Send a 0-arg message that returns a `double` (CFTimeInterval). Used for
+/// `GPUStartTime` / `GPUEndTime` on a completed MTLCommandBuffer. On AArch64
+/// the float return uses the FP registers, so a distinct fn signature is
+/// required (cannot transmute the ObjcId-returning variant).
+#[inline]
+unsafe fn msg_send_0_f64(obj: ObjcId, s: ObjcSel) -> f64 {
+    type MsgSend0F64Fn = unsafe extern "C" fn(ObjcId, ObjcSel) -> f64;
+    let f: MsgSend0F64Fn = std::mem::transmute(objc_msgSend as *const c_void);
     f(obj, s)
 }
 
@@ -365,6 +396,21 @@ impl MetalDevice {
         } else {
             // newCommandQueue returns a retained object.
             Some(MetalCommandQueue { raw })
+        }
+    }
+
+    /// Create a new `MTLSharedEvent` for cross-queue GPU synchronization.
+    ///
+    /// Returns `None` if the driver could not allocate the event. The event
+    /// is retained by the returned wrapper and released on `Drop`.
+    pub fn new_shared_event(&self) -> Option<MetalSharedEvent> {
+        let raw = unsafe { msg_send_0_raw(self.raw, cached_sel::new_shared_event()) };
+        if raw.is_null() {
+            None
+        } else {
+            // newSharedEvent returns a retained (+1) object per the
+            // `new`-prefix Cocoa naming convention; do NOT retain again.
+            Some(MetalSharedEvent { raw })
         }
     }
 
@@ -749,6 +795,53 @@ impl fmt::Debug for MetalCommandQueue {
 }
 
 // ============================================================================
+// MetalSharedEvent — wraps MTLSharedEvent (cross-queue GPU↔GPU sync)
+// ============================================================================
+
+/// A device-shared event whose 64-bit `signaledValue` is advanced by
+/// `MetalCommandBuffer::encode_signal_event` on a producer command buffer and
+/// awaited by `MetalCommandBuffer::encode_wait_for_event` on a consumer command
+/// buffer. The producer and consumer may be on DIFFERENT `MetalCommandQueue`s;
+/// this is the only Apple-supported mechanism to express a cross-queue
+/// ordering dependency. Used by the dual-queue GDN branch-overlap path.
+pub struct MetalSharedEvent {
+    raw: ObjcId,
+}
+
+impl MetalSharedEvent {
+    /// Current signaled value (host read). Valid any time; mainly for
+    /// debugging — the GPU advances it asynchronously.
+    #[allow(dead_code)]
+    pub fn signaled_value(&self) -> u64 {
+        unsafe {
+            type SignaledValueFn = unsafe extern "C" fn(ObjcId, ObjcSel) -> u64;
+            let f: SignaledValueFn = std::mem::transmute(objc_msgSend as *const c_void);
+            f(self.raw, cached_sel::signaled_value())
+        }
+    }
+
+    #[inline]
+    fn raw(&self) -> ObjcId {
+        self.raw
+    }
+}
+
+impl Drop for MetalSharedEvent {
+    fn drop(&mut self) {
+        unsafe { release(self.raw) }
+    }
+}
+
+unsafe impl Send for MetalSharedEvent {}
+unsafe impl Sync for MetalSharedEvent {}
+
+impl fmt::Debug for MetalSharedEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MetalSharedEvent").finish()
+    }
+}
+
+// ============================================================================
 // MetalCommandBuffer — wraps MTLCommandBuffer
 // ============================================================================
 
@@ -802,15 +895,41 @@ impl MetalCommandBuffer {
         if cur.is_null() {
             return;
         }
-        // Commit + wait the in-flight CB (records GPU work done since the
-        // last split). The encoder for this CB has already had
-        // end_encoding() called by the prior call site.
-        unsafe {
-            msg_send_0_raw(cur, cached_sel::commit());
-            msg_send_0_raw(cur, cached_sel::wait_until_completed());
-            release(cur);
+        // Close the in-flight CB. The encoder has already had end_encoding()
+        // called by the prior call site.
+        //
+        // DEFER MODE (LUMEN_METAL_PROFILE_GDN_DEFER=1): commit
+        // WITHOUT waiting. Metal executes CBs on one queue in FIFO commit
+        // order, so the next CB's reads see this CB's writes (ordering/RAW
+        // correctness preserved) — but no per-CB GPU-idle is injected. Retain
+        // the CB and register its ptr for a single deferred GPU-time read at
+        // prefill end. This removes the bogus drain/refill bubble that the
+        // legacy per-CB wait charged to dependency-tail kernels (the ssm_out
+        // 40ms artifact). `drain_deferred_cbs` (called at prefill end) waits
+        // once and reads every CB's GPUEndTime-GPUStartTime.
+        //
+        // LEGACY MODE (LUMEN_METAL_PROFILE_GDN=1 without DEFER): commit + wait
+        // each CB, read its GPU wall immediately. Kept for A/B of the method.
+        if super::profile::is_defer_enabled() {
+            // Commit (no wait). Transfer the wrapper's existing +1 reference to
+            // the deferred registry (do NOT release here); `drain_deferred_cbs`
+            // reads its GPU time and releases it after the single final wait.
+            unsafe {
+                msg_send_0_raw(cur, cached_sel::commit());
+            }
+            super::profile::register_deferred_cb(cur as usize);
+            super::profile::record_section_end();
+        } else {
+            unsafe {
+                msg_send_0_raw(cur, cached_sel::commit());
+                msg_send_0_raw(cur, cached_sel::wait_until_completed());
+                let start = msg_send_0_f64(cur, cached_sel::gpu_start_time());
+                let end = msg_send_0_f64(cur, cached_sel::gpu_end_time());
+                super::profile::record_section_gpu_time((end - start).max(0.0));
+                release(cur);
+            }
+            super::profile::record_section_end();
         }
-        super::profile::record_section_end();
 
         // Allocate a fresh CB from the parent queue.
         let fresh = unsafe { msg_send_0_raw(q, cached_sel::command_buffer()) };
@@ -890,6 +1009,51 @@ impl MetalCommandBuffer {
     pub fn commit(&self) {
         unsafe {
             msg_send_0_raw(self.raw(), cached_sel::commit());
+        }
+    }
+
+    /// Encode a GPU-side signal of `event` to `value` at this point in the
+    /// command buffer's execution. After the GPU reaches this point (all
+    /// previously-encoded work on THIS command buffer has retired), the
+    /// event's `signaledValue` is set to `value`, unblocking any command
+    /// buffer (on any queue) waiting for `>= value`.
+    ///
+    /// Must be called when NO compute/blit encoder is currently open on this
+    /// command buffer — signal/wait operate at command-buffer granularity,
+    /// between encoders. The caller is responsible for `end_encoding()` on
+    /// any open encoder first.
+    pub fn encode_signal_event(&self, event: &MetalSharedEvent, value: u64) {
+        unsafe {
+            type SignalFn = unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId, u64);
+            let f: SignalFn = std::mem::transmute(objc_msgSend as *const c_void);
+            f(self.raw(), cached_sel::encode_signal_event_value(), event.raw(), value);
+        }
+    }
+
+    /// Encode a GPU-side wait: the command buffer will not begin executing
+    /// work encoded AFTER this point until `event.signaledValue >= value`.
+    /// Work encoded BEFORE this point on the same CB is unaffected.
+    ///
+    /// Must be called when no encoder is open (see `encode_signal_event`).
+    pub fn encode_wait_for_event(&self, event: &MetalSharedEvent, value: u64) {
+        unsafe {
+            type WaitFn = unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId, u64);
+            let f: WaitFn = std::mem::transmute(objc_msgSend as *const c_void);
+            f(self.raw(), cached_sel::encode_wait_for_event_value(), event.raw(), value);
+        }
+    }
+
+    /// True GPU execution wall time (seconds) for this command buffer.
+    /// Valid only AFTER the CB has completed (`commit_and_wait`/
+    /// `wait_until_completed`). Reads `GPUEndTime - GPUStartTime`; these are
+    /// host-clock CFTimeIntervals captured by the GPU driver with zero added
+    /// dispatch overhead (unlike split-CB profiling). Returns 0.0 if the
+    /// driver did not populate the timestamps.
+    pub fn gpu_elapsed_secs(&self) -> f64 {
+        unsafe {
+            let start = msg_send_0_f64(self.raw(), cached_sel::gpu_start_time());
+            let end = msg_send_0_f64(self.raw(), cached_sel::gpu_end_time());
+            (end - start).max(0.0)
         }
     }
 
@@ -1008,6 +1172,39 @@ impl Drop for MetalCommandBuffer {
 // &self; ordering is the caller's responsibility) is preserved.
 unsafe impl Send for MetalCommandBuffer {}
 unsafe impl Sync for MetalCommandBuffer {}
+
+/// Drain the deferred per-CB GPU-time registry (commit-all-wait-once
+/// census). Called once at prefill end in defer mode. Waits on the LAST
+/// committed split CB (which, on a single FIFO queue, implies all prior CBs
+/// completed), then reads each CB's `GPUEndTime - GPUStartTime`, attributes it
+/// to its recorded section label, and releases the CB (the registry owns the
+/// wrapper's original +1). No-op when the registry is empty / profiling off.
+///
+/// This is the contamination-free per-kernel census WITHOUT the per-CB-wait
+/// idle confound: kernels run back-to-back on the GPU (no forced drain between
+/// dispatches), so each CB's GPU wall is its true serial service time. The
+/// sum is additive to a serial schedule; compare to production single-CB
+/// gpu_busy for the overlap credit (two-metric model).
+pub(crate) fn drain_deferred_cbs() {
+    let cbs = super::profile::take_deferred_cbs();
+    if cbs.is_empty() {
+        return;
+    }
+    unsafe {
+        // Wait on the last committed CB; FIFO single-queue ⇒ all prior done.
+        let (last_ptr, _) = cbs[cbs.len() - 1];
+        let last = last_ptr as ObjcId;
+        msg_send_0_raw(last, cached_sel::wait_until_completed());
+        // Read each CB's GPU wall, attribute to its label, release it.
+        for (ptr, label) in cbs {
+            let cb = ptr as ObjcId;
+            let start = msg_send_0_f64(cb, cached_sel::gpu_start_time());
+            let end = msg_send_0_f64(cb, cached_sel::gpu_end_time());
+            super::profile::record_section_gpu_time_for(label, (end - start).max(0.0));
+            release(cb);
+        }
+    }
+}
 
 // ============================================================================
 // MetalBlitEncoder -- wraps MTLBlitCommandEncoder

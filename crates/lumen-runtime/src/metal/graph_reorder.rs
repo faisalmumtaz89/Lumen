@@ -458,6 +458,37 @@ pub(crate) fn gdn_concurrent_encoder_validate_serial() -> bool {
     v
 }
 
+/// Whether the dual-queue GDN branch-overlap prefill path is enabled.
+///
+/// Resolved once via `LUMEN_METAL_GDN_DUAL_QUEUE=1`. **Default OFF** until
+/// PRISTINE×3 + bit-identity validation. When ON, the per-GDN-layer block is
+/// split across two command queues coordinated by `MetalSharedEvent`: the main
+/// queue carries RMSNorm(E0), branch A (qkv→conv1d→state-update→L2), the
+/// recurrence, and the join+FFN-norm tail; a second `gdn_aux_queue` carries the
+/// independent branches B (alpha/beta GEMM + compute-gates) and C (attn-gate
+/// GEMM). Three per-prefill events (norm-ready / ab-ready / gate-ready, value =
+/// gdn_ord) enforce the exact DAG dependencies, so the schedule changes but the
+/// kernels, dispatch arguments, and FP accumulation order are byte-identical to
+/// the single-encoder path. The win is hiding max(B, C) under branch A's
+/// shadow (intra-layer ceiling ~50-150ms; no cross-layer
+/// overlap is available because the residual stream serializes layers).
+///
+/// Requires the de-aliased role buffers (same precondition as the concurrent
+/// encoder) AND deep-profile OFF AND the multi-CB split OFF (the dual-queue path
+/// owns CB management). Falls back to the single-CB concurrent-encoder path when
+/// any precondition is unmet.
+#[inline]
+pub(crate) fn gdn_dual_queue_enabled() -> bool {
+    static CACHE: AtomicU8 = AtomicU8::new(0);
+    let cur = CACHE.load(AOrd::Relaxed);
+    if cur != 0 { return cur == 2; }
+    let v = std::env::var("LUMEN_METAL_GDN_DUAL_QUEUE")
+        .map(|s| !s.is_empty() && s != "0")
+        .unwrap_or(false);
+    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
+    v
+}
+
 /// Whether the GDN Phase 2a (32, NSG=4, 1) threadgroup geometry
 /// is enabled.
 ///
@@ -483,6 +514,122 @@ pub(crate) fn gdn_phase2a_nsg4_enabled() -> bool {
         .unwrap_or(false);
     CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
     v
+}
+
+/// Whether the chunk-parallel gated-delta-rule Phase 2a kernel is enabled.
+///
+/// Resolved once via `LUMEN_METAL_GDN_PREFILL_CHUNKED=1`. **Default OFF** until
+/// the reference-token gate validates it on the MoE model. When ON,
+/// `encode_batched_gdn_prefill` dispatches `gdn_prefill_chunkscan` (one TG per
+/// (head, 32-value-tile), C-token chunks) in place of the O(T)-serial
+/// `gdn_prefill_fused_v3_chunked`. Bit-exact path when OFF.
+#[inline]
+pub(crate) fn gdn_prefill_chunked_enabled() -> bool {
+    static CACHE: AtomicU8 = AtomicU8::new(0);
+    let cur = CACHE.load(AOrd::Relaxed);
+    if cur != 0 { return cur == 2; }
+    let v = std::env::var("LUMEN_METAL_GDN_PREFILL_CHUNKED")
+        .map(|s| !s.is_empty() && s != "0")
+        .unwrap_or(false);
+    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
+    v
+}
+
+/// Chunk size C for the chunk-parallel Phase 2a kernel.
+///
+/// Resolved once via `LUMEN_METAL_GDN_PREFILL_CHUNK_C=<8|16>` (default 16,
+/// clamped to {8,16} which the kernel's `GDN_CS_MAXC=16` supports).
+#[inline]
+pub(crate) fn gdn_prefill_chunk_c() -> u32 {
+    static CACHE: AtomicU8 = AtomicU8::new(0);
+    let cur = CACHE.load(AOrd::Relaxed);
+    if cur != 0 { return cur as u32; }
+    let v: u32 = std::env::var("LUMEN_METAL_GDN_PREFILL_CHUNK_C")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+    let v = if v == 8 { 8 } else { 16 };
+    CACHE.store(v as u8, AOrd::Relaxed);
+    v
+}
+
+/// Diagnostic: which GDN prefill phase to SKIP (no-op when unset).
+///
+/// Resolved once via `LUMEN_METAL_GDN_DIAG_SKIP=<phase>`. Profiling only —
+/// skipping a phase produces garbage output but lets the per-phase GPU cost be
+/// attributed by the delta in the measured non-expert prefill floor. Returns a
+/// small integer code; 0 = no skip (default). Recognised values:
+///   `phase2a` → 1 (the v3-chunked state-update recurrence kernel)
+///   `phase3`  → 2 (the ssm_out GEMM + residual)
+///   `phase1qkv` → 3 (the QKV GEMM)
+/// Any unrecognised / empty value is treated as no-skip.
+#[inline]
+pub(crate) fn gdn_diag_skip() -> u8 {
+    static CACHE: AtomicU8 = AtomicU8::new(255);
+    let cur = CACHE.load(AOrd::Relaxed);
+    if cur != 255 { return cur; }
+    let v = match std::env::var("LUMEN_METAL_GDN_DIAG_SKIP").ok().as_deref() {
+        Some("phase2a") => 1,
+        Some("phase3") => 2,
+        Some("phase1qkv") => 3,
+        Some("wholeattn") => 4,
+        Some("ffnblock") => 5,
+        _ => 0,
+    };
+    CACHE.store(v, AOrd::Relaxed);
+    v
+}
+
+/// K2 diagnostic bitmask `LUMEN_METAL_GDN_SUBSKIP=<n>` to attribute the
+/// NON-recurrence GDN-block GPU cost across its sub-dispatch groups. Profiling
+/// ONLY (garbage output when any bit set); read once and cached. Bits:
+///   1 = QKV-proj GEMM (Phase 1, qkv_buf)
+///   2 = alpha/beta GEMMs + compute-gates
+///   4 = conv1d + SiLU (+ conv_state update)
+///   8 = L2-norm (q/k)
+///  16 = norm_gate (Phase 2b)
+///  32 = ssm_out GEMM + residual (Phase 3)
+/// 0 = no skip (default, production path unchanged).
+#[inline]
+pub(crate) fn gdn_subskip() -> u32 {
+    static CACHE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+    let cur = CACHE.load(AOrd::Relaxed);
+    if cur != u32::MAX { return cur; }
+    let v = std::env::var("LUMEN_METAL_GDN_SUBSKIP")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    CACHE.store(v, AOrd::Relaxed);
+    v
+}
+
+/// K2 Wave-1: use the simdgroup-per-head L2-normalize kernel
+/// (`l2_normalize_qk_strided_sg`, no threadgroup barriers) instead of the
+/// 128-thread/2-barrier `l2_normalize_qk_strided`. Bit-identical math.
+/// `LUMEN_METAL_GDN_L2_SG=1` → ON, `=0` → OFF. Default OFF until A/B-validated.
+#[inline]
+pub(crate) fn gdn_l2_sg_enabled() -> bool {
+    static CACHE: AtomicU8 = AtomicU8::new(255);
+    let cur = CACHE.load(AOrd::Relaxed);
+    if cur != 255 { return cur != 0; }
+    let on = std::env::var("LUMEN_METAL_GDN_L2_SG").ok().as_deref() == Some("1");
+    CACHE.store(on as u8, AOrd::Relaxed);
+    on
+}
+
+/// Whether to use the fused conv1d+SiLU+L2(Q/K) kernel that
+/// collapses the conv1d -> L2 dispatch boundary (the dominant GDN-block stall
+/// per the per-substage attribution + L2-SG null). When ON, the GDN prefill
+/// path replaces the {full conv+silu, conv_state_update, standalone L2} trio
+/// with {fused conv+silu+L2 for Q/K, conv+silu for V, conv_state_update}.
+/// Bit-identical math (same conv tap order, SiLU, F32 storage, L2 reduction
+/// tree). Resolved once via `LUMEN_METAL_GDN_CONV_L2_FUSED=1`. **Default OFF**
+/// until paired-perf + PRISTINE x3 validation promotes it.
+pub(crate) fn gdn_conv_l2_fused_enabled() -> bool {
+    static CACHE: AtomicU8 = AtomicU8::new(255);
+    let cur = CACHE.load(AOrd::Relaxed);
+    if cur != 255 { return cur != 0; }
+    let on = std::env::var("LUMEN_METAL_GDN_CONV_L2_FUSED").ok().as_deref() == Some("1");
+    CACHE.store(on as u8, AOrd::Relaxed);
+    on
 }
 
 /// Whether the GDN `ssm_out` projection uses the F32-batched residual kernel.

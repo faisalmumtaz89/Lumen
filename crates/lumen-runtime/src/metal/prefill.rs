@@ -534,6 +534,59 @@ impl MetalF32Backend {
                         );
                     }
                 } else {
+                    // DIAG (no-op when LUMEN_METAL_PREFILL_GPUTIME unset): split
+                    // the CPU-side encode loop from the GPU commit_and_wait so we
+                    // can read true GPU busy time (GPUEndTime-GPUStartTime) and the
+                    // CPU encode wall separately. The production path is bit-exact
+                    // when the env is absent (single CB, single commit_and_wait).
+                    let gputime = std::env::var("LUMEN_METAL_PREFILL_GPUTIME")
+                        .ok().as_deref() == Some("1");
+
+                    // Dual-queue GDN branch-overlap setup
+                    // (`LUMEN_METAL_GDN_DUAL_QUEUE=1`). When enabled, allocate a
+                    // second command queue + a whole-prefill aux command buffer +
+                    // 3 per-prefill shared events, and install them as the
+                    // thread-local dual-queue context. GDN layers route their
+                    // independent branches (B: alpha/beta/gates, C: attn-gate) onto
+                    // the aux CB; the main CB carries E0/A/recurrence/join. AGX runs
+                    // the two queues concurrently; the events enforce the exact DAG.
+                    // Skipped under profile mode (the profiler owns CB splitting).
+                    let dual_queue = super::graph_reorder::gdn_dual_queue_enabled()
+                        && !super::profile::is_enabled();
+                    let dq_installed = if dual_queue {
+                        let aux_queue = self.device.new_command_queue().ok_or_else(|| {
+                            RuntimeError::Compute("dual-queue: failed to create aux command queue".into())
+                        })?;
+                        let aux_cmd = aux_queue.new_command_buffer().ok_or_else(|| {
+                            RuntimeError::Compute("dual-queue: failed to create aux command buffer".into())
+                        })?;
+                        let ev_norm = self.device.new_shared_event().ok_or_else(|| {
+                            RuntimeError::Compute("dual-queue: failed to create norm-ready event".into())
+                        })?;
+                        let ev_ab = self.device.new_shared_event().ok_or_else(|| {
+                            RuntimeError::Compute("dual-queue: failed to create ab-ready event".into())
+                        })?;
+                        let ev_gate = self.device.new_shared_event().ok_or_else(|| {
+                            RuntimeError::Compute("dual-queue: failed to create gate-ready event".into())
+                        })?;
+                        // The aux queue must outlive its command buffer; leak its
+                        // Rust handle into the ctx via a Box kept alive by the
+                        // closure scope below. Simpler: hold the queue in a local
+                        // that lives to the end of this block (after the final
+                        // wait), so its Drop (release) runs only post-completion.
+                        super::gdn::dual_queue_ctx_set(super::gdn::DualQueueCtx {
+                            aux_cmd,
+                            ev_norm_ready: ev_norm,
+                            ev_ab_ready: ev_ab,
+                            ev_gate_ready: ev_gate,
+                            ord: 0,
+                        });
+                        Some(aux_queue)
+                    } else {
+                        None
+                    };
+
+                    let enc_start = if gputime { Some(std::time::Instant::now()) } else { None };
                     for layer in 0..num_layers {
                         let mut kv_view = kv.view_mut(layer)?;
                         self.encode_layer_batched(
@@ -542,7 +595,46 @@ impl MetalF32Backend {
                         )?;
                         kv.commit_view(kv_view)?;
                     }
-                    cmd.commit_and_wait();
+
+                    if let Some(ctx) = super::gdn::dual_queue_ctx_take() {
+                        // Dual-queue commit ordering: commit the aux CB (no wait),
+                        // then commit+wait the main CB. The main CB contains waits
+                        // on every aux-signaled event, so main completion implies
+                        // aux completion. Keep ctx (aux CB + events) and the aux
+                        // queue handle alive through GPU execution, then drop.
+                        ctx.aux_cmd.commit();
+                        if let Some(t0) = enc_start {
+                            let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                            let commit_t0 = std::time::Instant::now();
+                            cmd.commit_and_wait();
+                            let commit_ms = commit_t0.elapsed().as_secs_f64() * 1000.0;
+                            let gpu_ms = cmd.gpu_elapsed_secs() * 1000.0;
+                            eprintln!(
+                                "[prefill-gputime] (dual-queue) batch={batch_size} \
+                                 cpu_encode={encode_ms:.2}ms commit_wait={commit_ms:.2}ms \
+                                 gpu_busy={gpu_ms:.2}ms gpu_util={:.1}%",
+                                100.0 * gpu_ms / (encode_ms + commit_ms)
+                            );
+                        } else {
+                            cmd.commit_and_wait();
+                        }
+                        drop(ctx);
+                        drop(dq_installed);
+                    } else if let Some(t0) = enc_start {
+                        let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        let commit_t0 = std::time::Instant::now();
+                        cmd.commit_and_wait();
+                        let commit_ms = commit_t0.elapsed().as_secs_f64() * 1000.0;
+                        let gpu_ms = cmd.gpu_elapsed_secs() * 1000.0;
+                        eprintln!(
+                            "[prefill-gputime] batch={batch_size} cpu_encode={encode_ms:.2}ms \
+                             commit_wait={commit_ms:.2}ms gpu_busy={gpu_ms:.2}ms \
+                             gpu_util={:.1}%",
+                            100.0 * gpu_ms / (encode_ms + commit_ms)
+                        );
+                    } else {
+                        cmd.commit_and_wait();
+                    }
                 }
             }
         }
@@ -559,6 +651,20 @@ impl MetalF32Backend {
         // (the one that did not get a follow-up `new_compute_encoder` call
         // to split it). No-op when profiling is OFF.
         super::profile::record_section_end();
+
+        // DIAG (K2, no-op when LUMEN_METAL_PROFILE_GDN unset): print the
+        // accumulated per-sub-dispatch GDN deep-profile from the SERVER path
+        // (the CLI prints it via print_profile(); the server never calls that).
+        // Produces evidence only; zero behaviour change when the env is absent.
+        if super::profile::is_gdn_deep_enabled() {
+            // Commit-all-wait-once census: drain the deferred split
+            // CBs — wait once on the last and read every CB's GPU wall — BEFORE
+            // printing, so the GPU-time table reflects back-to-back serial
+            // service time without the per-CB-wait idle confound. No-op in
+            // legacy (non-defer) mode where each CB was already waited inline.
+            super::ffi::drain_deferred_cbs();
+            super::profile::print_report();
+        }
 
         // LayerViews are dropped here, after GPU has finished.
         // This is the key safety guarantee: backing memory was alive

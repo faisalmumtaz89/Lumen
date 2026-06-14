@@ -10,6 +10,7 @@ use crate::metal::ffi::{
     MetalBuffer, MTLSize,
 };
 use lumen_format::quantization::QuantScheme;
+use crate::metal::decode_profile;
 use super::{MetalF32Backend, RouterLayerStats};
 
 impl MetalF32Backend {
@@ -91,7 +92,7 @@ impl MetalF32Backend {
         // ONE command buffer for embed + ALL layers + final projection + argmax.
         // Single CONCURRENT encoder for entire token. Uses
         // MTLDispatchTypeConcurrent to allow GPU overlap of non-dependent dispatches.
-        let cmd = self.queue.new_command_buffer().ok_or_else(|| {
+        let mut cmd = self.queue.new_command_buffer().ok_or_else(|| {
             RuntimeError::Compute("Failed to create command buffer for greedy decode".into())
         })?;
 
@@ -130,6 +131,9 @@ impl MetalF32Backend {
                 RuntimeError::Compute("Failed to create concurrent encoder".into())
             })?
         };
+
+        // [decode-profile] Start timing with the embed section in-flight.
+        decode_profile::begin("embed");
 
         {
             match self.embedding_quant {
@@ -178,6 +182,21 @@ impl MetalF32Backend {
             let v_byte_off: u64 = ((q_dim + kv_dim) * 4) as u64;
 
             // Reuse the single concurrent encoder (no per-layer encoder creation).
+
+            // [decode-profile] Section boundary at attention-block start.
+            // Splits the in-flight CB so the prior section's GPU time is timed.
+            if decode_profile::is_enabled() {
+                enc.end_encoding();
+                cmd.commit_and_wait();
+                let lbl = if meta.gdn_layer_idx.is_some() { "gdn_attn" } else { "full_attn" };
+                decode_profile::record_and_advance(lbl);
+                cmd = self.queue.new_command_buffer().ok_or_else(|| {
+                    RuntimeError::Compute("decode-profile: failed to create CB".into())
+                })?;
+                enc = cmd.new_compute_encoder().ok_or_else(|| {
+                    RuntimeError::Compute("decode-profile: failed to create encoder".into())
+                })?;
+            }
 
             // ================================================================
             // ATTENTION BLOCK
@@ -966,6 +985,22 @@ impl MetalF32Backend {
                 s.gdn_conv_positions[gdn_idx] = new_conv_pos;
             }
 
+            // [decode-profile] Section boundary between attention and FFN.
+            // The section that just finished IS the attention block; advance the
+            // in-flight label to the FFN type so the FFN time accrues next.
+            if decode_profile::is_enabled() {
+                enc.end_encoding();
+                cmd.commit_and_wait();
+                let ffn_lbl = if meta.moe_meta.is_some() { "moe_ffn" } else { "dense_ffn" };
+                decode_profile::record_and_advance(ffn_lbl);
+                cmd = self.queue.new_command_buffer().ok_or_else(|| {
+                    RuntimeError::Compute("decode-profile: failed to create CB".into())
+                })?;
+                enc = cmd.new_compute_encoder().ok_or_else(|| {
+                    RuntimeError::Compute("decode-profile: failed to create encoder".into())
+                })?;
+            }
+
             // ================================================================
             // FFN BLOCK
             // ================================================================
@@ -1033,8 +1068,41 @@ impl MetalF32Backend {
                     let gate_up_off_buf = s.moe_gate_up_offsets[layer_idx].as_ref().unwrap();
                     let down_off_buf = s.moe_down_offsets[layer_idx].as_ref().unwrap();
 
-                    // Router dispatch (all within same encoder)
-                    {
+                    // Router dispatch (all within same encoder).
+                    // Parallel two-kernel router when enabled.
+                    let use_router_parallel = super::moe_router_parallel_enabled()
+                        && pipelines.moe_router_logits_f32.is_some()
+                        && pipelines.moe_router_topk_softmax.is_some()
+                        && s.moe_router_logits.is_some();
+                    if use_router_parallel {
+                        let logits_buf = s.moe_router_logits.as_ref().unwrap();
+                        {
+                            let pso = pipelines.moe_router_logits_f32.as_ref().unwrap();
+                            enc.set_pipeline_state(pso);
+                            enc.set_buffer(&s.normed_buf, 0, 0);
+                            enc.set_buffer(layer_buf, moe_meta.router_weight_off, 1);
+                            enc.set_buffer(logits_buf, 0, 2);
+                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                            enc.set_bytes(&(s.moe_num_experts as u32).to_le_bytes(), 4);
+                            let tg = 256u64.min(hidden_dim as u64).max(1);
+                            enc.dispatch_threadgroups(
+                                MTLSize::new(s.moe_num_experts as u64, 1, 1),
+                                MTLSize::new(tg, 1, 1),
+                            );
+                        }
+                        enc.memory_barrier_with_scope(1);
+                        {
+                            let pso = pipelines.moe_router_topk_softmax.as_ref().unwrap();
+                            enc.set_pipeline_state(pso);
+                            enc.set_buffer(logits_buf, 0, 0);
+                            enc.set_buffer(expert_ids_buf, 0, 1);
+                            enc.set_buffer(expert_weights_buf, 0, 2);
+                            enc.set_bytes(&(s.moe_num_experts as u32).to_le_bytes(), 3);
+                            enc.set_bytes(&(s.moe_num_active_experts as u32).to_le_bytes(), 4);
+                            let topk_tg = 256u64.min(s.moe_num_experts as u64).max(32);
+                            enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(topk_tg, 1, 1));
+                        }
+                    } else {
                         let router_softmax = pipelines.moe_router_softmax.as_ref().ok_or_else(|| {
                             RuntimeError::Compute("MoE router_softmax pipeline not compiled.".into())
                         })?;
@@ -1283,6 +1351,20 @@ impl MetalF32Backend {
             if needs_barriers { enc.memory_barrier_with_scope(1); }
         } // end layer loop
 
+        // [decode-profile] Boundary before final norm + lm_head + argmax.
+        // The just-finished section is the last layer's FFN; advance to "lm_head".
+        if decode_profile::is_enabled() {
+            enc.end_encoding();
+            cmd.commit_and_wait();
+            decode_profile::record_and_advance("lm_head");
+            cmd = self.queue.new_command_buffer().ok_or_else(|| {
+                RuntimeError::Compute("decode-profile: failed to create CB".into())
+            })?;
+            enc = cmd.new_compute_encoder().ok_or_else(|| {
+                RuntimeError::Compute("decode-profile: failed to create encoder".into())
+            })?;
+        }
+
         // Resolve global tensor buffers for final norm + output projection
         let (sc_norm_buf, sc_norm_off): (&MetalBuffer, u64) =
             if let Some((_, norm_o, _)) = s.gpu_global_offsets {
@@ -1367,6 +1449,12 @@ impl MetalF32Backend {
 
         // Single sync point for the entire token.
         cmd.commit_and_wait();
+        // [decode-profile] Record the final lm_head section and print a report
+        // every 64 tokens (cheap; only when LUMEN_METAL_DECODE_PROFILE=1).
+        if decode_profile::is_enabled() {
+            decode_profile::record_final();
+            decode_profile::maybe_report_and_reset(64);
+        }
         // DET-001: stabilise the GPU-scheduler near-tie window on repeated
         // in-process decode calls (no-op when the delay resolves to 0).
         super::maybe_apply_metal_decode_delay();

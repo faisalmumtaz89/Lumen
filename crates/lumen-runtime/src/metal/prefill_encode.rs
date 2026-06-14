@@ -229,6 +229,51 @@ impl MetalF32Backend {
                 );
                 scratch.moe_batch_expert_weights = Some(make(batch_size * top_k)?);
                 scratch.moe_batch_expert_output = Some(make(batch_size * ne * hidden_dim)?);
+
+                // Expert-grouped prefill scratch. Allocated
+                // unconditionally with the other MoE batch buffers; only USED
+                // when LUMEN_METAL_MOE_PREFILL_GROUPED=1. Sized for the worst
+                // case batch_size * top_k assignments.
+                let inter_dim = scratch.moe_expert_inter_dim;
+                let n_assign = batch_size * top_k;
+                scratch.moe_grp_seg_off = Some(
+                    self.device.new_buffer((ne + 1).max(1) * 4).ok_or_else(|| {
+                        RuntimeError::Compute("Failed to allocate MoE grp seg_off".into())
+                    })?
+                );
+                scratch.moe_grp_tok = Some(
+                    self.device.new_buffer(n_assign.max(1) * 4).ok_or_else(|| {
+                        RuntimeError::Compute("Failed to allocate MoE grp tok".into())
+                    })?
+                );
+                scratch.moe_grp_slot = Some(
+                    self.device.new_buffer(n_assign.max(1) * 4).ok_or_else(|| {
+                        RuntimeError::Compute("Failed to allocate MoE grp slot".into())
+                    })?
+                );
+                scratch.moe_grp_assign_expert = Some(
+                    self.device.new_buffer(n_assign.max(1) * 4).ok_or_else(|| {
+                        RuntimeError::Compute("Failed to allocate MoE grp assign_expert".into())
+                    })?
+                );
+                scratch.moe_grp_in = Some(make(n_assign * hidden_dim)?);
+                scratch.moe_grp_swiglu = Some(make(n_assign * inter_dim)?);
+                scratch.moe_grp_down = Some(make(n_assign * hidden_dim)?);
+                // Flattened work-tile map for the grouped GEMM.
+                // Entry 0 = n_work_tiles (count); entries 1.. = packed
+                // (expert<<16)|m_tile_local. Bound = ceil(n_assign/32)+ne work
+                // tiles (each expert adds at most 1 partial tile beyond its
+                // full tiles) + 1 header slot. u32 each.
+                let tile_map_cap = (n_assign.div_ceil(32) + ne + 1).max(1);
+                scratch.moe_grp_tile_map = Some(
+                    self.device.new_buffer(tile_map_cap * 4).ok_or_else(|| {
+                        RuntimeError::Compute("Failed to allocate MoE grp tile_map".into())
+                    })?
+                );
+                // NOTE: per-expert weight-offset buffers are allocated fresh PER
+                // LAYER inside encode_moe_prefill_grouped_q8_0 (they carry the
+                // layer's base offset and are written by the CPU at encode time,
+                // so a shared buffer would be clobbered by later layers).
             }
 
             scratch.current_max_batch = batch_size;
@@ -1719,12 +1764,54 @@ impl MetalF32Backend {
                     // instead of 128*(15+2) per-token dispatches.
                     // FFN RMSNorm is fused into the same encoder (saves 1 encoder boundary).
                     super::profile::set_section("gdn/batched_prefill");
-                    let new_conv_pos = Self::encode_batched_gdn_prefill(
-                        cmd, None, pipelines, scratch, layer_buf, &gdn_meta, gdn_idx,
-                        x_buf, normed_buf, qkv_buf, attn_out_buf, gate_buf, attn_proj_buf,
-                        batch_size,
-                    )?;
-                    scratch.gdn_conv_positions[gdn_idx] = new_conv_pos;
+                    // DIAG wholeattn (no-op unless LUMEN_METAL_GDN_DIAG_SKIP=wholeattn):
+                    // skip the entire GDN attention megakernel to attribute its
+                    // total GPU share (garbage output; profiling only).
+                    if super::graph_reorder::gdn_diag_skip() == 4 {
+                        scratch.gdn_conv_positions[gdn_idx] = scratch.gdn_conv_positions[gdn_idx];
+                    } else {
+                        // Dual-queue GDN branch-overlap path
+                        // (`LUMEN_METAL_GDN_DUAL_QUEUE=1`): route to the dual-queue
+                        // variant ONLY when a per-prefill dual-queue context is
+                        // installed AND this layer's wq/attn_gate/ssm_out are all Q8
+                        // AND the de-aliased role buffers + parallel conv1d exist.
+                        // Otherwise fall through to the bit-exact production path.
+                        let dq_eligible = super::gdn::dual_queue_ctx_active()
+                            && matches!(gdn_meta.wq_quant, QuantScheme::Q8_0)
+                            && matches!(gdn_meta.attn_gate_quant, Some(QuantScheme::Q8_0))
+                            && matches!(gdn_meta.ssm_out_quant, Some(QuantScheme::Q8_0))
+                            && scratch.batch_gdn_alpha_buf.is_some()
+                            && scratch.batch_gdn_beta_buf.is_some()
+                            && scratch.batch_gdn_conv_out_buf.is_some()
+                            && scratch.batch_gdn_raw_out_buf.is_some()
+                            && scratch.batch_gdn_ssm_in_buf.is_some()
+                            && pipelines.ssm_conv1d_silu_prefill_parallel.is_some()
+                            && pipelines.ssm_conv1d_state_update.is_some();
+                        if dq_eligible {
+                            // Take the ctx out of the thread-local for the duration
+                            // of the call (so we can borrow its fields immutably
+                            // alongside `scratch`), bump ord, then re-install it.
+                            let mut ctx = super::gdn::dual_queue_ctx_take().unwrap();
+                            ctx.ord += 1;
+                            let ord = ctx.ord;
+                            let new_conv_pos = Self::encode_batched_gdn_prefill_dual_queue(
+                                cmd, &ctx.aux_cmd,
+                                &ctx.ev_norm_ready, &ctx.ev_ab_ready, &ctx.ev_gate_ready, ord,
+                                pipelines, scratch, layer_buf, &gdn_meta, gdn_idx,
+                                x_buf, normed_buf, qkv_buf, attn_out_buf, attn_proj_buf,
+                                batch_size,
+                            )?;
+                            scratch.gdn_conv_positions[gdn_idx] = new_conv_pos;
+                            super::gdn::dual_queue_ctx_set(ctx);
+                        } else {
+                            let new_conv_pos = Self::encode_batched_gdn_prefill(
+                                cmd, None, pipelines, scratch, layer_buf, &gdn_meta, gdn_idx,
+                                x_buf, normed_buf, qkv_buf, attn_out_buf, gate_buf, attn_proj_buf,
+                                batch_size,
+                            )?;
+                            scratch.gdn_conv_positions[gdn_idx] = new_conv_pos;
+                        }
+                    }
                 } else {
                     // Fallback: token-by-token processing using single-token decode path.
                     let tok_bytes = (hidden_dim * 4) as u64;
@@ -1792,6 +1879,13 @@ impl MetalF32Backend {
                 let up_offs: Vec<u64> = experts.iter().map(|e| base_off + e.up.offset).collect();
                 let down_offs: Vec<u64> = experts.iter().map(|e| base_off + e.down.offset).collect();
                 let first = &experts[0];
+                // GPU-time census (no-op unless LUMEN_METAL_PROFILE_GDN=1): label the
+                // MoE grouped-expert FFN so its GPU wall is split out of the
+                // preceding GDN Phase-3 CB. The first new_compute_encoder inside
+                // encode_moe_ffn_batched triggers the split.
+                if super::profile::is_gdn_deep_enabled() {
+                    super::profile::set_section("moe/ffn_grouped_experts");
+                }
                 Self::encode_moe_ffn_batched(
                     &cmd, pipelines, scratch, layer_buf, batch_size,
                     base_off + router.offset,
@@ -1801,6 +1895,7 @@ impl MetalF32Backend {
                     &down_offs,
                     first.gate.quant,
                     first.down.quant,
+                    &self.device,
                 )?;
 
                 // ---- Shared expert FFN (batched prefill) ----
@@ -1821,6 +1916,12 @@ impl MetalF32Backend {
 
                     const TILE_M_SE: u64 = 32;
                     const TILE_N_SE: u64 = 32;
+
+                    // GPU-time census: label the shared-expert FFN so its GPU wall is
+                    // split out of the grouped-expert CB. No-op when off.
+                    if super::profile::is_gdn_deep_enabled() {
+                        super::profile::set_section("moe/shared_expert");
+                    }
 
                     // Step SE-1: Gate+Up+SwiGLU (batched tiled GEMM)
                     // gate_buf = gate_shexp @ normed_buf  [batch, se_inter]

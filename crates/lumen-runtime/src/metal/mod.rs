@@ -35,6 +35,7 @@ pub(crate) mod mps_graph_ffi;
 pub(crate) mod shaders;
 pub(crate) mod io;
 mod decode_greedy;
+pub(crate) mod decode_profile;
 mod decode_single_cb;
 // disk-KV sync helpers (GPU<->CPU KV mirror + GDN state).
 mod disk_sync;
@@ -135,6 +136,222 @@ pub(crate) fn use_ggml_ported_q8_0_gemm() -> bool {
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
     CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+    v
+}
+
+/// When `LUMEN_METAL_MOE_DOWN_SGROW=1`, the mixed q8/q4 MoE
+/// down+accum dispatch uses the one-simdgroup-per-row redesigned kernel
+/// (`moe_batched_down_accum_shared_q8_0_se_q4_0_v2`). Default OFF → the
+/// original kernel runs (byte-identical path). Cached after first read.
+pub(crate) fn moe_down_sgrow_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(0);
+    let cur = CACHE.load(Ordering::Relaxed);
+    if cur != 0 {
+        return cur == 2;
+    }
+    let v = std::env::var("LUMEN_METAL_MOE_DOWN_SGROW")
+        .map(|s| !s.is_empty() && s != "0")
+        .unwrap_or(false);
+    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+    v
+}
+
+/// When `LUMEN_METAL_MOE_GATEUP_SGROW=1`, the routed
+/// gate+up+swiglu dispatch uses the one-simdgroup-per-row redesigned kernel
+/// (`moe_batched_gate_up_swiglu_q8_0_v2`). Default OFF → original kernel
+/// (byte-identical path). Cached after first read.
+pub(crate) fn moe_gateup_sgrow_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(0);
+    let cur = CACHE.load(Ordering::Relaxed);
+    if cur != 0 {
+        return cur == 2;
+    }
+    let v = std::env::var("LUMEN_METAL_MOE_GATEUP_SGROW")
+        .map(|s| !s.is_empty() && s != "0")
+        .unwrap_or(false);
+    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+    v
+}
+
+/// Parallel two-kernel MoE router (per-expert logits across the
+/// grid + small top-k softmax) instead of the single-threadgroup serial router.
+/// Measured +198% decode on Qwen3.5-MoE-35B-A3B Metal, byte-identical greedy
+/// output, PRISTINE quality. **DEFAULT ON**; set
+/// `LUMEN_METAL_MOE_ROUTER_PARALLEL=0` to force the legacy serial router.
+/// Cached after first read.
+pub(crate) fn moe_router_parallel_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(0);
+    let cur = CACHE.load(Ordering::Relaxed);
+    if cur != 0 {
+        return cur == 2;
+    }
+    // Default ON: only the explicit "0"/"false"/"off" disables it.
+    let v = match std::env::var("LUMEN_METAL_MOE_ROUTER_PARALLEL") {
+        Ok(s) => !(s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off")),
+        Err(_) => true,
+    };
+    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+    v
+}
+
+/// Fused single-dispatch MoE router (logits + top-k in ONE
+/// grid=num_experts dispatch via last-threadgroup reduction). Eliminates the
+/// separate grid=1 top-k dispatch whose drain bubble was measured at ~6 ms/token
+/// (39% of decode) on the serial GDN decode encoder. Default OFF until validated;
+/// set `LUMEN_METAL_MOE_ROUTER_FUSED=1` to enable. Falls back to the two-kernel
+/// parallel router when off or when the pipeline/counter is unavailable.
+/// Cached after first read.
+pub(crate) fn moe_router_fused_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(0);
+    let cur = CACHE.load(Ordering::Relaxed);
+    if cur != 0 {
+        return cur == 2;
+    }
+    let v = std::env::var("LUMEN_METAL_MOE_ROUTER_FUSED")
+        .map(|s| !s.is_empty() && s != "0")
+        .unwrap_or(false);
+    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+    v
+}
+
+/// Number of threadgroups to dispatch for the (replicated) MoE
+/// router top-k softmax kernel. Default 1 (original single-TG behavior). Setting
+/// N>1 dispatches N redundant TGs (all compute the identical top-k; only TG 0
+/// writes) to keep the GPU occupied and avoid the 1-TG drain bubble on the serial
+/// decode encoder. Env `LUMEN_METAL_MOE_ROUTER_TOPK_TGS=N`. Cached after first read.
+pub(crate) fn moe_router_topk_tgs() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CACHE: AtomicU32 = AtomicU32::new(0);
+    let cur = CACHE.load(Ordering::Relaxed);
+    if cur != 0 {
+        return cur;
+    }
+    let v = std::env::var("LUMEN_METAL_MOE_ROUTER_TOPK_TGS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
+    CACHE.store(v, Ordering::Relaxed);
+    v
+}
+
+/// Expert-grouped prefill MoE FFN (mul_mat_id style) instead of
+/// Option B (all-experts-all-tokens). Measured +308% prefill (159→649 tok/s) on
+/// Qwen3.5-MoE-35B-A3B Metal Q8, byte-identical greedy output vs Option B (10/10
+/// prompts md5-equal), PRISTINE quality by equivalence. **DEFAULT ON**;
+/// set `LUMEN_METAL_MOE_PREFILL_GROUPED=0` to force Option B.
+/// Cached after first read. (Q8_0 experts only; non-Q8 layers fall back to
+/// Option B regardless.)
+pub(crate) fn moe_prefill_grouped_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(0);
+    let cur = CACHE.load(Ordering::Relaxed);
+    if cur != 0 {
+        return cur == 2;
+    }
+    let v = match std::env::var("LUMEN_METAL_MOE_PREFILL_GROUPED") {
+        Ok(s) => !(s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off")),
+        Err(_) => true,
+    };
+    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+    v
+}
+
+/// Route-sort scatter mode for the grouped MoE prefill.
+///   0 = serial   (legacy `moe_prefill_route_sort`, scatter on GPU thread 0)
+///   1 = par      (Wave-1 `moe_prefill_route_sort_par`, one thread/expert scan)
+///   2 = atomic   (Wave-3 `moe_prefill_route_sort_atomic`, fully-parallel
+///                 atomic-cursor scatter — removes the 256x per-expert scan)
+/// DEFAULT = atomic. Env `LUMEN_METAL_MOE_ROUTE_SORT=serial|par|atomic`. The
+/// legacy `LUMEN_METAL_MOE_ROUTE_SORT_PAR=0` is honored as a serial override.
+/// All three produce byte-identical final logits (atomic/par permute within an
+/// expert segment, which cancels through gather->GEMM->scatter).
+pub(crate) fn moe_route_sort_mode() -> u8 {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(255);
+    let cur = CACHE.load(Ordering::Relaxed);
+    if cur != 255 {
+        return cur;
+    }
+    // Legacy kill switch takes priority: PAR=0 forces serial.
+    let v = if matches!(std::env::var("LUMEN_METAL_MOE_ROUTE_SORT_PAR").as_deref(), Ok("0")) {
+        0u8
+    } else {
+        match std::env::var("LUMEN_METAL_MOE_ROUTE_SORT").as_deref() {
+            Ok("serial") | Ok("0") => 0,
+            Ok("par") | Ok("1") => 1,
+            _ => 2, // atomic default
+        }
+    };
+    CACHE.store(v, Ordering::Relaxed);
+    v
+}
+
+/// Flattened work-tile-map dispatch for the grouped MoE GEMM.
+/// The legacy grid is (N/32, max_m_tiles, num_experts) = ~19.5x over-subscribed
+/// at batch=1239/256e (avg ~2 real m-tiles/expert vs max_m_tiles=39). The
+/// tile-map path builds the exact non-empty (expert, m_tile) list on GPU and
+/// dispatches (N/32, n_work_tiles_bound, 1). Byte-identical (only changes WHICH
+/// TG computes which output tile; per-tile MMA order unchanged). DEFAULT ON,
+/// kill switch `LUMEN_METAL_MOE_GEMM_TILEMAP=0`.
+pub(crate) fn moe_gemm_tilemap_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(0);
+    let cur = CACHE.load(Ordering::Relaxed);
+    if cur != 0 {
+        return cur == 2;
+    }
+    let v = match std::env::var("LUMEN_METAL_MOE_GEMM_TILEMAP") {
+        Ok(s) => !(s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off")),
+        Err(_) => true,
+    };
+    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+    v
+}
+
+/// Float4-vectorized grouped gather/scatter (128-bit copies,
+/// 4x fewer threads; byte-exact). Requires hidden_dim % 4 == 0. DEFAULT ON,
+/// kill switch `LUMEN_METAL_MOE_GATHER_VEC4=0`.
+pub(crate) fn moe_gather_vec4_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(0);
+    let cur = CACHE.load(Ordering::Relaxed);
+    if cur != 0 {
+        return cur == 2;
+    }
+    let v = match std::env::var("LUMEN_METAL_MOE_GATHER_VEC4") {
+        Ok(s) => !(s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off")),
+        Err(_) => true,
+    };
+    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+    v
+}
+
+/// [diag] Returns which MoE sub-dispatch to SKIP for GPU-time attribution
+/// (LUMEN_METAL_MOE_DIAG_SKIP=down→1, =gateup→2, else 0). Produces garbage
+/// output when set; use only with the decode profiler to read GPU timings.
+pub(crate) fn moe_diag_skip() -> u8 {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(255);
+    let cur = CACHE.load(Ordering::Relaxed);
+    if cur != 255 {
+        return cur;
+    }
+    let v = match std::env::var("LUMEN_METAL_MOE_DIAG_SKIP").ok().as_deref() {
+        Some("down") => 1u8,
+        Some("gateup") => 2u8,
+        Some("shared") => 3u8,
+        Some("gating") => 4u8,
+        Some("router") => 5u8,
+        Some("rtopk") => 6u8,    // skip only the top-k softmax kernel
+        Some("rlogits") => 7u8,  // skip only the per-expert logits kernel
+        _ => 0u8,
+    };
+    CACHE.store(v, Ordering::Relaxed);
     v
 }
 
@@ -319,6 +536,7 @@ impl MetalF32Backend {
         // Pick up LUMEN_METAL_PROFILE=1 if set in the environment. The
         // CLI's `--profile` flag also routes through `set_profile()`.
         profile::init_from_env();
+        decode_profile::init_from_env();
 
         // Attempt to create a Metal IO command queue (Metal 3 / macOS 13+).
         // This enables direct NVMe-to-GPU DMA for streaming expert loading.

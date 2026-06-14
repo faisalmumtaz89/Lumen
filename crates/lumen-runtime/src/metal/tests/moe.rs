@@ -268,6 +268,471 @@ fn test_moe_expert_accum_batched_correctness() {
     );
 }
 
+/// Verify moe_prefill_route_sort produces correct per-expert
+/// segments (counting sort) and grouped (tok, slot) lists.
+#[test]
+fn test_moe_prefill_route_sort() {
+    let backend = MetalF32Backend::new().unwrap();
+    let lib = backend.device.new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let func = lib.get_function("moe_prefill_route_sort").unwrap();
+    let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
+
+    let num_experts: usize = 6;
+    let batch_size: usize = 4;
+    let top_k: usize = 2;
+    // token 0 -> [3,1]; token 1 -> [1,5]; token 2 -> [3,0]; token 3 -> [1,3]
+    let expert_ids: Vec<u32> = vec![3,1, 1,5, 3,0, 1,3];
+    let a = batch_size * top_k;
+
+    let eid_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(expert_ids.as_ptr() as *const u8, expert_ids.len()*4) };
+    let eid_buf = backend.device.new_buffer_with_bytes(eid_bytes).unwrap();
+    let seg_off_buf = backend.device.new_buffer((num_experts+1)*4).unwrap();
+    let tok_buf = backend.device.new_buffer(a*4).unwrap();
+    let slot_buf = backend.device.new_buffer(a*4).unwrap();
+
+    let cmd = backend.queue.new_command_buffer().unwrap();
+    let enc = cmd.new_compute_encoder().unwrap();
+    enc.set_pipeline_state(&pso);
+    enc.set_buffer(&eid_buf, 0, 0);
+    enc.set_buffer(&seg_off_buf, 0, 1);
+    enc.set_buffer(&tok_buf, 0, 2);
+    enc.set_buffer(&slot_buf, 0, 3);
+    enc.set_bytes(&(batch_size as u32).to_le_bytes(), 4);
+    enc.set_bytes(&(top_k as u32).to_le_bytes(), 5);
+    enc.set_bytes(&(num_experts as u32).to_le_bytes(), 6);
+    enc.dispatch_threadgroups(MTLSize::new(1,1,1), MTLSize::new(num_experts as u64,1,1));
+    enc.end_encoding();
+    cmd.commit_and_wait();
+
+    let mut seg = vec![0u32; num_experts+1];
+    seg_off_buf.read_u32(&mut seg);
+    let mut tok = vec![0u32; a];
+    tok_buf.read_u32(&mut tok);
+    let mut slot = vec![0u32; a];
+    slot_buf.read_u32(&mut slot);
+
+    // CPU counting-sort reference.
+    let mut counts = vec![0u32; num_experts];
+    for &e in &expert_ids { counts[e as usize] += 1; }
+    let mut exp_seg = vec![0u32; num_experts+1];
+    for e in 0..num_experts { exp_seg[e+1] = exp_seg[e] + counts[e]; }
+    assert_eq!(seg, exp_seg, "seg_off mismatch: got {seg:?} exp {exp_seg:?}");
+
+    // For each expert segment, the (tok,slot) entries must all route to e.
+    for e in 0..num_experts {
+        for p in seg[e]..seg[e+1] {
+            let t = tok[p as usize] as usize;
+            let k = slot[p as usize] as usize;
+            assert_eq!(expert_ids[t*top_k + k] as usize, e,
+                "expert {e} seg pos {p}: tok {t} slot {k} routes to {} not {e}",
+                expert_ids[t*top_k+k]);
+        }
+    }
+    eprintln!("moe_prefill_route_sort: seg={seg:?} -- PASS");
+}
+
+/// Verify moe_grouped_gemm_q8_0 computes Y_seg = X_seg @ W_e^T
+/// over per-expert segments, matching a CPU reference.
+#[test]
+fn test_moe_grouped_gemm_q8_0() {
+    let backend = MetalF32Backend::new().unwrap();
+    let lib = backend.device.new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let func = lib.get_function("moe_grouped_gemm_q8_0").unwrap();
+    let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
+
+    // 2 experts. seg_off = [0, 3, 5] => expert0 has rows 0..3 (3 rows),
+    // expert1 has rows 3..5 (2 rows). total_assign=5.
+    let num_experts: usize = 2;
+    let n: usize = 64;   // output dim (inter)
+    let k: usize = 64;   // input dim (hidden)
+    let total_assign: usize = 5;
+    let seg_off: Vec<u32> = vec![0, 3, 5];
+
+    // Weights: expert e gate matrix [N, K] = constant (e+1)*0.1
+    let blocks_per_row = k / 32;
+    let q8b = 34usize;
+    let ebytes = n * blocks_per_row * q8b;
+    let mut layer = vec![0u8; num_experts * ebytes];
+    let mut woff = vec![0u64; num_experts];
+    let evals = [0.1f32, 0.2f32];
+    for e in 0..num_experts {
+        woff[e] = (e * ebytes) as u64;
+        let w = vec![evals[e]; n * k];
+        let enc = encode_q8_0_matrix(&w, n, k);
+        layer[e*ebytes..(e+1)*ebytes].copy_from_slice(&enc);
+    }
+
+    // Input: row r has constant value (r+1)*1.0
+    let mut x = vec![0.0f32; total_assign * k];
+    for r in 0..total_assign {
+        for c in 0..k { x[r*k+c] = (r+1) as f32; }
+    }
+
+    let layer_buf = backend.device.new_buffer_with_bytes(&layer).unwrap();
+    let x_buf = backend.upload_f32(&x).unwrap();
+    let y_buf = backend.device.new_buffer(total_assign * n * 4).unwrap();
+    let seg_bytes: Vec<u8> = seg_off.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let seg_buf = backend.device.new_buffer_with_bytes(&seg_bytes).unwrap();
+    let woff_bytes: Vec<u8> = woff.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let woff_buf = backend.device.new_buffer_with_bytes(&woff_bytes).unwrap();
+
+    let cmd = backend.queue.new_command_buffer().unwrap();
+    let enc = cmd.new_compute_encoder().unwrap();
+    enc.set_pipeline_state(&pso);
+    enc.set_buffer(&layer_buf, 0, 0);
+    enc.set_buffer(&x_buf, 0, 1);
+    enc.set_buffer(&y_buf, 0, 2);
+    enc.set_bytes(&(n as u32).to_le_bytes(), 3);
+    enc.set_bytes(&(k as u32).to_le_bytes(), 4);
+    enc.set_buffer(&seg_buf, 0, 5);
+    enc.set_buffer(&woff_buf, 0, 6);
+    enc.set_bytes(&(num_experts as u32).to_le_bytes(), 7);
+    let max_m_tiles = ((total_assign as u64) + 31) / 32;
+    enc.dispatch_threadgroups(
+        MTLSize::new(((n as u64)+31)/32, max_m_tiles.max(1), num_experts as u64),
+        MTLSize::new(128, 1, 1));
+    enc.end_encoding();
+    cmd.commit_and_wait();
+
+    let mut y = vec![0.0f32; total_assign * n];
+    y_buf.read_f32(&mut y);
+
+    // CPU ref: row r in expert e => Y[r,j] = sum_c x[r,c]*w_e = K * (r+1) * evals[e]
+    let mut max_err = 0.0f32;
+    for e in 0..num_experts {
+        for r in seg_off[e]..seg_off[e+1] {
+            let r = r as usize;
+            let expected = (k as f32) * (r+1) as f32 * evals[e];
+            for j in 0..n {
+                let got = y[r*n+j];
+                let err = (got-expected).abs() / expected.max(1e-3);
+                if err > max_err { max_err = err; }
+                assert!(err < 0.02,
+                    "grouped_gemm e={e} r={r} j={j}: got {got} exp {expected} rel_err {err}");
+            }
+        }
+    }
+    eprintln!("moe_grouped_gemm_q8_0: total_assign={total_assign} max_rel_err={max_err:.5} -- PASS");
+}
+
+/// Gather + scatter roundtrip + assign_expert.
+/// Verifies the full index plumbing reproduces the [num_experts,batch,hidden]
+/// dense layout that moe_expert_accum_batched expects.
+#[test]
+fn test_moe_prefill_gather_scatter() {
+    let backend = MetalF32Backend::new().unwrap();
+    let lib = backend.device.new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let sort = backend.device.new_compute_pipeline_state(
+        &lib.get_function("moe_prefill_route_sort").unwrap()).unwrap();
+    let assign = backend.device.new_compute_pipeline_state(
+        &lib.get_function("moe_prefill_assign_expert").unwrap()).unwrap();
+    let gather = backend.device.new_compute_pipeline_state(
+        &lib.get_function("moe_prefill_gather").unwrap()).unwrap();
+    let scatter = backend.device.new_compute_pipeline_state(
+        &lib.get_function("moe_prefill_scatter").unwrap()).unwrap();
+
+    let num_experts: usize = 4;
+    let batch_size: usize = 3;
+    let hidden: usize = 8;
+    let top_k: usize = 2;
+    let a = batch_size * top_k;
+    // tok0->[2,0], tok1->[1,2], tok2->[0,3]
+    let expert_ids: Vec<u32> = vec![2,0, 1,2, 0,3];
+
+    // normed[tok][h] = tok*100 + h
+    let mut normed = vec![0.0f32; batch_size*hidden];
+    for t in 0..batch_size { for h in 0..hidden { normed[t*hidden+h] = (t*100+h) as f32; } }
+
+    let eid_bytes: &[u8] = unsafe { std::slice::from_raw_parts(expert_ids.as_ptr() as *const u8, a*4) };
+    let eid_buf = backend.device.new_buffer_with_bytes(eid_bytes).unwrap();
+    let seg_buf = backend.device.new_buffer((num_experts+1)*4).unwrap();
+    let tok_buf = backend.device.new_buffer(a*4).unwrap();
+    let slot_buf = backend.device.new_buffer(a*4).unwrap();
+    let ae_buf = backend.device.new_buffer(a*4).unwrap();
+    let normed_buf = backend.upload_f32(&normed).unwrap();
+    let grp_in_buf = backend.device.new_buffer(a*hidden*4).unwrap();
+    // grouped "down output" = the gathered input itself (identity), to test scatter roundtrip.
+    let eout_buf = backend.upload_f32(&vec![-1.0f32; num_experts*batch_size*hidden]).unwrap();
+
+    let cmd = backend.queue.new_command_buffer().unwrap();
+    let enc = cmd.new_compute_encoder().unwrap();
+    enc.set_pipeline_state(&sort);
+    enc.set_buffer(&eid_buf,0,0); enc.set_buffer(&seg_buf,0,1);
+    enc.set_buffer(&tok_buf,0,2); enc.set_buffer(&slot_buf,0,3);
+    enc.set_bytes(&(batch_size as u32).to_le_bytes(),4);
+    enc.set_bytes(&(top_k as u32).to_le_bytes(),5);
+    enc.set_bytes(&(num_experts as u32).to_le_bytes(),6);
+    enc.dispatch_threadgroups(MTLSize::new(1,1,1), MTLSize::new(num_experts as u64,1,1));
+    enc.memory_barrier_with_scope(1);
+    enc.set_pipeline_state(&assign);
+    enc.set_buffer(&seg_buf,0,0); enc.set_buffer(&ae_buf,0,1);
+    enc.set_bytes(&(num_experts as u32).to_le_bytes(),2);
+    enc.dispatch_threadgroups(MTLSize::new(1,1,1), MTLSize::new(num_experts as u64,1,1));
+    enc.memory_barrier_with_scope(1);
+    enc.set_pipeline_state(&gather);
+    enc.set_buffer(&normed_buf,0,0); enc.set_buffer(&tok_buf,0,1); enc.set_buffer(&grp_in_buf,0,2);
+    enc.set_bytes(&(hidden as u32).to_le_bytes(),3);
+    enc.set_bytes(&(a as u32).to_le_bytes(),4);
+    enc.dispatch_threadgroups(MTLSize::new(((a*hidden) as u64+255)/256,1,1), MTLSize::new(256,1,1));
+    enc.memory_barrier_with_scope(1);
+    // scatter grp_in (identity "output") into eout
+    enc.set_pipeline_state(&scatter);
+    enc.set_buffer(&grp_in_buf,0,0); enc.set_buffer(&tok_buf,0,1); enc.set_buffer(&ae_buf,0,2);
+    enc.set_buffer(&eout_buf,0,3);
+    enc.set_bytes(&(hidden as u32).to_le_bytes(),4);
+    enc.set_bytes(&(batch_size as u32).to_le_bytes(),5);
+    enc.set_bytes(&(a as u32).to_le_bytes(),6);
+    enc.dispatch_threadgroups(MTLSize::new(((a*hidden) as u64+255)/256,1,1), MTLSize::new(256,1,1));
+    enc.end_encoding();
+    cmd.commit_and_wait();
+
+    let mut eout = vec![0.0f32; num_experts*batch_size*hidden];
+    eout_buf.read_f32(&mut eout);
+
+    // For each routed (token, expert), eout[e*batch*hidden + tok*hidden + h] == normed[tok][h].
+    for t in 0..batch_size {
+        for k in 0..top_k {
+            let e = expert_ids[t*top_k+k] as usize;
+            for h in 0..hidden {
+                let got = eout[e*batch_size*hidden + t*hidden + h];
+                let exp = normed[t*hidden+h];
+                assert!((got-exp).abs() < 1e-4,
+                    "scatter (t={t},e={e},h={h}): got {got} exp {exp}");
+            }
+        }
+    }
+    eprintln!("moe_prefill_gather_scatter: roundtrip OK -- PASS");
+}
+
+/// FULL grouped prefill pipeline (sort->assign->gather->gate->
+/// up->swiglu->down->scatter->accum) vs a CPU reference computing the same MoE
+/// FFN. This mirrors the exact dispatch sequence in encode_moe_prefill_grouped_q8_0
+/// and validates the routed result is correct end-to-end.
+#[test]
+fn test_moe_prefill_grouped_end_to_end() {
+    let backend = MetalF32Backend::new().unwrap();
+    let lib = backend.device.new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let p = |n: &str| backend.device.new_compute_pipeline_state(&lib.get_function(n).unwrap()).unwrap();
+    let sort = p("moe_prefill_route_sort");
+    let assign = p("moe_prefill_assign_expert");
+    let gather = p("moe_prefill_gather");
+    let ggemm = p("moe_grouped_gemm_q8_0");
+    let swiglu = p("swiglu_batched");
+    let scatter = p("moe_prefill_scatter");
+    let accum = p("moe_expert_accum_batched");
+
+    // EXACT Qwen3.5-MoE server scenario: ne=256, top_k=8, hidden=2048, inter=512,
+    // small batch=21 (most of the 256 experts get ZERO tokens — the empty-segment
+    // early-exit path). This reproduces the real prefill the server runs.
+    let ne: usize = 256;
+    let batch: usize = 21;
+    let hidden: usize = 2048;
+    let inter: usize = 512;
+    let top_k: usize = 8;
+    let a = batch * top_k;
+
+    // Routing: deterministic distinct top_k experts per token, spread over 256.
+    let mut expert_ids: Vec<u32> = Vec::with_capacity(a);
+    let mut expert_weights: Vec<f32> = Vec::with_capacity(a);
+    for t in 0..batch {
+        let mut ws = 0.0f32;
+        let mut chosen = Vec::new();
+        for k in 0..top_k {
+            let mut e = ((t*13 + k*29 + 1) % ne) as u32;
+            while chosen.contains(&e) { e = (e + 1) % ne as u32; }
+            chosen.push(e);
+            let w = ((t + k + 1) % 7 + 1) as f32;
+            ws += w;
+            expert_ids.push(e);
+            expert_weights.push(w);
+        }
+        for k in 0..top_k { expert_weights[t*top_k+k] /= ws; }
+    }
+
+    // normed[token][h] in [-1,1] deterministic.
+    let mut normed = vec![0.0f32; batch*hidden];
+    for t in 0..batch { for h in 0..hidden {
+        normed[t*hidden+h] = (((t*7 + h*3) % 13) as f32 / 13.0) - 0.5;
+    }}
+    // Per-expert gate/up/down weights, [N,K] each, small deterministic values.
+    let wval = |e: usize, kind: usize, r: usize, c: usize| -> f32 {
+        (((e*31 + kind*17 + r*5 + c*2) % 19) as f32 / 19.0) - 0.5
+    };
+    let bpr = hidden/32; let q8b = 34usize;
+    let gate_bytes = inter*bpr*q8b;       // [inter, hidden]
+    let down_bytes = hidden*(inter/32)*q8b; // [hidden, inter]
+    // Pack layer buffer: for each expert: gate | up | down.
+    let estride = gate_bytes*2 + down_bytes;
+    let mut layer = vec![0u8; ne*estride];
+    let mut gate_woff = vec![0u64; ne];
+    let mut up_woff = vec![0u64; ne];
+    let mut down_woff = vec![0u64; ne];
+    for e in 0..ne {
+        let base = e*estride;
+        gate_woff[e] = base as u64;
+        up_woff[e] = (base+gate_bytes) as u64;
+        down_woff[e] = (base+gate_bytes*2) as u64;
+        let g: Vec<f32> = (0..inter*hidden).map(|i| wval(e,0,i/hidden,i%hidden)).collect();
+        let u: Vec<f32> = (0..inter*hidden).map(|i| wval(e,1,i/hidden,i%hidden)).collect();
+        let d: Vec<f32> = (0..hidden*inter).map(|i| wval(e,2,i/inter,i%inter)).collect();
+        layer[base..base+gate_bytes].copy_from_slice(&encode_q8_0_matrix(&g, inter, hidden));
+        layer[base+gate_bytes..base+gate_bytes*2].copy_from_slice(&encode_q8_0_matrix(&u, inter, hidden));
+        layer[base+gate_bytes*2..base+estride].copy_from_slice(&encode_q8_0_matrix(&d, hidden, inter));
+    }
+
+    // ---- GPU buffers ----
+    let mkbuf = |n: usize| backend.device.new_buffer(n*4).unwrap();
+    let eid_bytes: &[u8] = unsafe { std::slice::from_raw_parts(expert_ids.as_ptr() as *const u8, a*4) };
+    let eid_buf = backend.device.new_buffer_with_bytes(eid_bytes).unwrap();
+    let ew_buf = backend.upload_f32(&expert_weights).unwrap();
+    let normed_buf = backend.upload_f32(&normed).unwrap();
+    let layer_buf = backend.device.new_buffer_with_bytes(&layer).unwrap();
+    let seg_buf = mkbuf(ne+1);
+    let tok_buf = mkbuf(a); let slot_buf = mkbuf(a); let ae_buf = mkbuf(a);
+    let grp_in = mkbuf(a*hidden); let grp_sw = mkbuf(a*inter); let grp_dn = mkbuf(a*hidden);
+    let gate_woff_buf = backend.device.new_buffer_with_bytes(
+        &gate_woff.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    let up_woff_buf = backend.device.new_buffer_with_bytes(
+        &up_woff.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    let down_woff_buf = backend.device.new_buffer_with_bytes(
+        &down_woff.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    let eout = backend.upload_f32(&vec![0.0f32; ne*batch*hidden]).unwrap();
+    let residual = backend.upload_f32(&vec![0.0f32; batch*hidden]).unwrap();
+    let final_out = mkbuf(batch*hidden);
+
+    let cmd = backend.queue.new_command_buffer().unwrap();
+    let enc = cmd.new_compute_encoder().unwrap();
+    let u32b = |v: usize| (v as u32).to_le_bytes();
+    let mm = |v: usize| ((v as u64)+31)/32;
+    // sort + assign
+    enc.set_pipeline_state(&sort);
+    enc.set_buffer(&eid_buf,0,0); enc.set_buffer(&seg_buf,0,1);
+    enc.set_buffer(&tok_buf,0,2); enc.set_buffer(&slot_buf,0,3);
+    enc.set_bytes(&u32b(batch),4); enc.set_bytes(&u32b(top_k),5); enc.set_bytes(&u32b(ne),6);
+    enc.dispatch_threadgroups(MTLSize::new(1,1,1), MTLSize::new(ne as u64,1,1));
+    enc.memory_barrier_with_scope(1);
+    enc.set_pipeline_state(&assign);
+    enc.set_buffer(&seg_buf,0,0); enc.set_buffer(&ae_buf,0,1); enc.set_bytes(&u32b(ne),2);
+    enc.dispatch_threadgroups(MTLSize::new(1,1,1), MTLSize::new(ne as u64,1,1));
+    enc.memory_barrier_with_scope(1);
+    // gather
+    enc.set_pipeline_state(&gather);
+    enc.set_buffer(&normed_buf,0,0); enc.set_buffer(&tok_buf,0,1); enc.set_buffer(&grp_in,0,2);
+    enc.set_bytes(&u32b(hidden),3); enc.set_bytes(&u32b(a),4);
+    enc.dispatch_threadgroups(MTLSize::new(((a*hidden) as u64+255)/256,1,1), MTLSize::new(256,1,1));
+    enc.memory_barrier_with_scope(1);
+    // gate -> grp_sw ; up -> grp_dn
+    for (woff, out) in [(&gate_woff_buf,&grp_sw),(&up_woff_buf,&grp_dn)] {
+        enc.set_pipeline_state(&ggemm);
+        enc.set_buffer(&layer_buf,0,0); enc.set_buffer(&grp_in,0,1); enc.set_buffer(out,0,2);
+        enc.set_bytes(&u32b(inter),3); enc.set_bytes(&u32b(hidden),4);
+        enc.set_buffer(&seg_buf,0,5); enc.set_buffer(woff,0,6); enc.set_bytes(&u32b(ne),7);
+        enc.dispatch_threadgroups(MTLSize::new(mm(inter),mm(batch),ne as u64), MTLSize::new(128,1,1));
+    }
+    enc.memory_barrier_with_scope(1);
+    // swiglu grp_sw = silu(grp_sw)*grp_dn
+    enc.set_pipeline_state(&swiglu);
+    enc.set_buffer(&grp_sw,0,0); enc.set_buffer(&grp_dn,0,1); enc.set_bytes(&u32b(a*inter),2);
+    enc.dispatch_threadgroups(MTLSize::new(((a*inter) as u64+255)/256,1,1), MTLSize::new(256,1,1));
+    enc.memory_barrier_with_scope(1);
+    // down grp_sw -> grp_dn
+    enc.set_pipeline_state(&ggemm);
+    enc.set_buffer(&layer_buf,0,0); enc.set_buffer(&grp_sw,0,1); enc.set_buffer(&grp_dn,0,2);
+    enc.set_bytes(&u32b(hidden),3); enc.set_bytes(&u32b(inter),4);
+    enc.set_buffer(&seg_buf,0,5); enc.set_buffer(&down_woff_buf,0,6); enc.set_bytes(&u32b(ne),7);
+    enc.dispatch_threadgroups(MTLSize::new(mm(hidden),mm(batch),ne as u64), MTLSize::new(128,1,1));
+    enc.memory_barrier_with_scope(1);
+    // scatter -> eout
+    enc.set_pipeline_state(&scatter);
+    enc.set_buffer(&grp_dn,0,0); enc.set_buffer(&tok_buf,0,1); enc.set_buffer(&ae_buf,0,2);
+    enc.set_buffer(&eout,0,3); enc.set_bytes(&u32b(hidden),4); enc.set_bytes(&u32b(batch),5);
+    enc.set_bytes(&u32b(a),6);
+    enc.dispatch_threadgroups(MTLSize::new(((a*hidden) as u64+255)/256,1,1), MTLSize::new(256,1,1));
+    enc.memory_barrier_with_scope(1);
+    // accum -> final_out
+    enc.set_pipeline_state(&accum);
+    enc.set_buffer(&eout,0,0); enc.set_buffer(&ew_buf,0,1); enc.set_buffer(&eid_buf,0,2);
+    enc.set_buffer(&final_out,0,3); enc.set_buffer(&residual,0,4);
+    enc.set_bytes(&u32b(hidden),5); enc.set_bytes(&u32b(top_k),6); enc.set_bytes(&u32b(batch),7);
+    enc.dispatch_threadgroups(MTLSize::new(((batch*hidden) as u64+255)/256,1,1), MTLSize::new(256,1,1));
+    enc.end_encoding();
+    cmd.commit_and_wait();
+
+    let mut got = vec![0.0f32; batch*hidden];
+    final_out.read_f32(&mut got);
+
+    // CPU reference using the DEQUANTIZED Q8 weights (exact values the GPU
+    // reads), so Q8 quantization error is removed from the comparison and only
+    // fp-order / f16-scale differences (~1e-3) remain. This isolates kernel
+    // correctness from quantization noise (which catastrophic cancellation in
+    // this synthetic test would otherwise amplify).
+    let deq = |bytes: &[u8], rows: usize, cols: usize| -> Vec<f32> {
+        let bpr = cols/32; let mut out = vec![0.0f32; rows*cols];
+        for r in 0..rows { for b in 0..bpr {
+            let bs = (r*bpr+b)*34;
+            let scale = f16_bits_to_f32_moe(u16::from_le_bytes([bytes[bs], bytes[bs+1]]));
+            for j in 0..32 {
+                let q = bytes[bs+2+j] as i8;
+                out[r*cols + b*32 + j] = scale * q as f32;
+            }
+        }}
+        out
+    };
+    // Dequantize each expert's gate/up/down from the packed layer buffer.
+    let mut dq_gate = vec![Vec::new(); ne];
+    let mut dq_up = vec![Vec::new(); ne];
+    let mut dq_down = vec![Vec::new(); ne];
+    for e in 0..ne {
+        let base = e*estride;
+        dq_gate[e] = deq(&layer[base..base+gate_bytes], inter, hidden);
+        dq_up[e]   = deq(&layer[base+gate_bytes..base+gate_bytes*2], inter, hidden);
+        dq_down[e] = deq(&layer[base+gate_bytes*2..base+estride], hidden, inter);
+    }
+    let silu = |x: f32| x / (1.0 + (-x).exp());
+    let mut max_rel = 0.0f32;
+    let mut nfail = 0;
+    for t in 0..batch {
+        let mut out = vec![0.0f32; hidden];
+        for k in 0..top_k {
+            let e = expert_ids[t*top_k+k] as usize;
+            let w = expert_weights[t*top_k+k];
+            let mut sw = vec![0.0f32; inter];
+            for r in 0..inter {
+                let mut g = 0.0; let mut u = 0.0;
+                for c in 0..hidden {
+                    g += dq_gate[e][r*hidden+c] * normed[t*hidden+c];
+                    u += dq_up[e][r*hidden+c] * normed[t*hidden+c];
+                }
+                sw[r] = silu(g) * u;
+            }
+            for r in 0..hidden {
+                let mut d = 0.0;
+                for c in 0..inter { d += dq_down[e][r*inter+c] * sw[c]; }
+                out[r] += w * d;
+            }
+        }
+        for h in 0..hidden {
+            let g = got[t*hidden+h];
+            // Mixed tolerance: kernel correctness is judged on max(rel, abs).
+            // Down outputs are O(100) and the weighted sum cancels to O(0.01..3),
+            // so fp-order differences between tiled-GPU and sequential-CPU give
+            // ~1e-2 absolute deltas on heavily-cancelled elements. Accept if
+            // EITHER abs<0.05 OR rel<6%.
+            let abs = (g - out[h]).abs();
+            let rel = abs / out[h].abs().max(1e-6);
+            let ok = abs < 0.05 || rel < 0.06;
+            if rel > max_rel && abs >= 0.05 { max_rel = rel; }
+            if !ok && nfail < 12 {
+                eprintln!("  FAIL t={t} h={h}: got {g:.5} exp {:.5} abs {abs:.5} rel {rel:.3}", out[h]);
+                nfail += 1;
+            }
+        }
+    }
+    eprintln!("moe_prefill_grouped_end_to_end: batch={batch} max_rel={max_rel:.4} nfail={nfail}");
+    assert!(nfail == 0, "grouped e2e had {nfail}+ failures, max_rel={max_rel:.4}");
+}
+
 // ====================================================================
 // Partial layer loading tests
 // ====================================================================
@@ -1394,6 +1859,90 @@ fn test_moe_router_correct_topk() {
 }
 
 #[test]
+fn test_moe_router_parallel_matches_serial() {
+    // The parallel two-kernel router (moe_router_logits_f32 +
+    // moe_router_topk_softmax) must select the SAME top-k experts and weights as
+    // the legacy single-threadgroup moe_router_softmax, for a 256-expert config
+    // mirroring Qwen3.5-35B-A3B. This locks in the runtime byte-identity result.
+    let backend = MetalF32Backend::new().unwrap();
+    let lib = backend.device.new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let serial = backend.device
+        .new_compute_pipeline_state(&lib.get_function("moe_router_softmax").unwrap()).unwrap();
+    let logits_pso = backend.device
+        .new_compute_pipeline_state(&lib.get_function("moe_router_logits_f32").unwrap()).unwrap();
+    let topk_pso = backend.device
+        .new_compute_pipeline_state(&lib.get_function("moe_router_topk_softmax").unwrap()).unwrap();
+
+    let hidden_dim: usize = 2048;
+    let num_experts: usize = 256;
+    let top_k: usize = 8;
+
+    // Deterministic pseudo-random hidden + gate weights.
+    let mut seed: u32 = 0x1234_5678;
+    let mut rng = || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); (seed >> 8) as f32 / 16_777_216.0 - 0.5 };
+    let hidden: Vec<f32> = (0..hidden_dim).map(|_| rng()).collect();
+    let gate: Vec<f32> = (0..num_experts * hidden_dim).map(|_| rng()).collect();
+
+    let hidden_buf = backend.upload_f32(&hidden).unwrap();
+    let gate_buf = backend.upload_f32(&gate).unwrap();
+
+    let run = |parallel: bool| -> (Vec<u32>, Vec<f32>) {
+        let ids_buf = backend.device.new_buffer(top_k * 4).unwrap();
+        let wts_buf = backend.device.new_buffer(top_k * 4).unwrap();
+        let cmd = backend.queue.new_command_buffer().unwrap();
+        let enc = cmd.new_compute_encoder().unwrap();
+        if parallel {
+            let logits_buf = backend.device.new_buffer(num_experts * 4).unwrap();
+            enc.set_pipeline_state(&logits_pso);
+            enc.set_buffer(&hidden_buf, 0, 0);
+            enc.set_buffer(&gate_buf, 0, 1);
+            enc.set_buffer(&logits_buf, 0, 2);
+            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+            enc.set_bytes(&(num_experts as u32).to_le_bytes(), 4);
+            enc.dispatch_threadgroups(MTLSize::new(num_experts as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.memory_barrier_with_scope(1);
+            enc.set_pipeline_state(&topk_pso);
+            enc.set_buffer(&logits_buf, 0, 0);
+            enc.set_buffer(&ids_buf, 0, 1);
+            enc.set_buffer(&wts_buf, 0, 2);
+            enc.set_bytes(&(num_experts as u32).to_le_bytes(), 3);
+            enc.set_bytes(&(top_k as u32).to_le_bytes(), 4);
+            enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+        } else {
+            enc.set_pipeline_state(&serial);
+            enc.set_buffer(&hidden_buf, 0, 0);
+            enc.set_buffer(&gate_buf, 0, 1);
+            enc.set_buffer(&ids_buf, 0, 2);
+            enc.set_buffer(&wts_buf, 0, 3);
+            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
+            enc.set_bytes(&(num_experts as u32).to_le_bytes(), 5);
+            enc.set_bytes(&(top_k as u32).to_le_bytes(), 6);
+            enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+        }
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        let mut ids = vec![0u32; top_k];
+        let mut wts = vec![0.0f32; top_k];
+        ids_buf.read_u32(&mut ids);
+        wts_buf.read_f32(&mut wts);
+        (ids, wts)
+    };
+
+    let (ids_s, wts_s) = run(false);
+    let (ids_p, wts_p) = run(true);
+
+    assert_eq!(ids_s, ids_p, "parallel router selected different experts: serial={ids_s:?} parallel={ids_p:?}");
+    for k in 0..top_k {
+        assert!(
+            (wts_s[k] - wts_p[k]).abs() < 1e-5,
+            "weight mismatch at k={k}: serial={} parallel={}", wts_s[k], wts_p[k]
+        );
+    }
+    eprintln!("router_parallel_matches_serial: ids={ids_p:?} weights match within 1e-5 -- PASS");
+}
+
+#[test]
 fn test_moe_router_diversity_non_degenerate() {
     // Verify that different hidden states produce different expert selections.
     // This proves the router kernel is sensitive to input, ruling out
@@ -2007,6 +2556,28 @@ fn test_moe_routing_entropy() {
 // ============================================================================
 
 /// Helper: convert f32 to f16 bit pattern (simplified, matches basic.rs)
+fn f16_bits_to_f32_moe(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1F) as u32;
+    let frac = (bits & 0x3FF) as u32;
+    let out = if exp == 0 {
+        if frac == 0 { sign << 31 } else {
+            // subnormal
+            let mut e = -1i32; let mut f = frac;
+            while (f & 0x400) == 0 { f <<= 1; e -= 1; }
+            f &= 0x3FF;
+            let new_exp = (e + 127 + 1 - 15) as u32;
+            (sign << 31) | (new_exp << 23) | (f << 13)
+        }
+    } else if exp == 0x1F {
+        (sign << 31) | 0x7F80_0000 | (frac << 13)
+    } else {
+        let new_exp = exp + 127 - 15;
+        (sign << 31) | (new_exp << 23) | (frac << 13)
+    };
+    f32::from_bits(out)
+}
+
 fn f32_to_f16_bits_moe(val: f32) -> u16 {
     let bits = val.to_bits();
     let sign = (bits >> 31) & 1;

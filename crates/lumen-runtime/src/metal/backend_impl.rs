@@ -150,6 +150,12 @@ impl ComputeBackend for MetalF32Backend {
         // Fused QKV channel count for GDN: 2*qk_dim + v_dim
         //   9B  = 2*2048 + 4096 = 8192 ; 27B = 2*2048 + 6144 = 10240.
         let gdn_qkv_dim = gdn_dims.qkv_dim() as usize;
+        if std::env::var("LUMEN_METAL_PREFILL_GPUTIME").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[gdn-dims] num_v_heads={gdn_num_v_heads} num_k_heads={gdn_num_k_heads} \
+                 head_dim={gdn_head_dim} conv_kernel={gdn_conv_kernel} qkv_dim={gdn_qkv_dim}"
+            );
+        }
 
         // MoE dimensions (0 for dense models)
         let moe_num_experts = hyperparams.num_experts.unwrap_or(0) as usize;
@@ -208,6 +214,10 @@ impl ComputeBackend for MetalF32Backend {
                 eprintln!(
                     "MoE model detected: {} experts, top-{} active. Allocating MoE scratch buffers.",
                     moe_num_experts, moe_num_active_experts,
+                );
+                eprintln!(
+                    "[moe-dims] hidden_dim={} expert_inter_dim={} num_layers={} (diagnostic)",
+                    hidden_dim, moe_expert_inter_dim, num_layers,
                 );
                 (
                     Some(make_buf(moe_num_experts)?),                           // [num_experts] f32
@@ -308,6 +318,14 @@ impl ComputeBackend for MetalF32Backend {
             moe_num_active_experts,
             moe_expert_inter_dim,
             moe_router_logits,
+            // 1-element atomic counter for the fused router.
+            moe_router_counter: if moe_num_experts > 0 {
+                Some(self.device.new_buffer(4).ok_or_else(|| {
+                    RuntimeError::Compute("Failed to allocate MoE router_counter buffer".into())
+                })?)
+            } else {
+                None
+            },
             moe_expert_ids,
             moe_expert_weights,
             moe_expert_output,
@@ -316,6 +334,15 @@ impl ComputeBackend for MetalF32Backend {
             moe_batch_expert_ids: None,
             moe_batch_expert_weights: None,
             moe_batch_expert_output: None,
+            // Expert-grouped prefill scratch.
+            moe_grp_seg_off: None,
+            moe_grp_tok: None,
+            moe_grp_slot: None,
+            moe_grp_assign_expert: None,
+            moe_grp_in: None,
+            moe_grp_swiglu: None,
+            moe_grp_down: None,
+            moe_grp_tile_map: None,
 
             // Per-layer expert IDs buffers for GPU-resident profiling.
             // Allocated for MoE models so each layer's expert selections are preserved.
