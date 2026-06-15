@@ -6,7 +6,7 @@
 #
 # Downloads the latest (or $LUMEN_TAG) macOS arm64 tarball, verifies its
 # SHA-256, installs the two binaries to a prefix, and clears the Gatekeeper
-# quarantine bit (the artifacts are unsigned — Phase 1, see packaging/REPORT).
+# quarantine bit (the artifacts are unsigned — Phase 1; notarization is deferred).
 #
 # This mirrors the README single-command flow: after install, `lumen pull` +
 # `lumen "<prompt>"` or `lumen-server --model …` work immediately.
@@ -14,7 +14,7 @@
 set -euo pipefail
 
 # ── Config (override via env) ────────────────────────────────────────────────
-RELEASE_BASE="${LUMEN_RELEASE_BASE:-https://github.com/OWNER/REPO/releases}"
+RELEASE_BASE="${LUMEN_RELEASE_BASE:-https://github.com/faisalmumtaz89/Lumen/releases}"
 LUMEN_TAG="${LUMEN_TAG:-latest}"
 PREFIX="${LUMEN_PREFIX:-/usr/local/bin}"
 
@@ -31,14 +31,16 @@ if (( OSMAJ < 14 )); then
     echo "error: macOS 14 (Sonoma) or newer required; found $OSVER." >&2; exit 1
 fi
 
-ASSET="lumen-${LUMEN_TAG}-macos-arm64-metal.tar.gz"
 if [[ "$LUMEN_TAG" == "latest" ]]; then
-    URL="$RELEASE_BASE/latest/download/lumen-latest-macos-arm64-metal.tar.gz"
-    SHA_URL="$URL.sha256"
+    # The release publishes a tag-LESS alias asset (lumen-macos-arm64-metal.tar.gz)
+    # alongside the tagged one; GitHub's /releases/latest/download/ redirect resolves
+    # it to the newest release. (The old hard-coded "lumen-latest-..." name was never
+    # produced -> 404.)
+    URL="$RELEASE_BASE/latest/download/lumen-macos-arm64-metal.tar.gz"
 else
-    URL="$RELEASE_BASE/download/$LUMEN_TAG/$ASSET"
-    SHA_URL="$URL.sha256"
+    URL="$RELEASE_BASE/download/$LUMEN_TAG/lumen-${LUMEN_TAG}-macos-arm64-metal.tar.gz"
 fi
+SHA_URL="$URL.sha256"
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 echo "[install] downloading $URL"

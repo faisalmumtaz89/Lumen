@@ -6,9 +6,11 @@
 # NVIDIA silicon — run + byte-determinism (DET-001) + coherence + PTX-cache —
 # across compute capabilities, without an always-on exposed GPU box.
 #
-# Cost control: PRs, push-to-main, and manual runs validate ONE arch (A100); the
-# full sm_75..sm_90 matrix runs only on release tags. A change-detection job skips
-# Modal entirely for docs-/tooling-only PRs.
+# Cost control: PRs, push-to-main, and manual runs validate ONE arch (A100). A
+# change-detection job skips Modal entirely for docs-/tooling-only PRs. The full
+# sm_75..sm_90 matrix runs (a) on demand via workflow_dispatch (arches=...), and
+# (b) at release time in release.yml — which validates the EXACT promoted artifact,
+# so tags are intentionally NOT a trigger here (no duplicate / validated!=shipped).
 #
 # PR gating: runs on pull_request, but the modal job runs ONLY for same-repo
 # branches (the `if` skips fork PRs — head repo != this repo — and GitHub withholds
@@ -24,8 +26,7 @@ name: validate-cuda-modal
 
 on:
   push:
-    branches: [main]
-    tags: ['b*', 'v*']
+    branches: [main]   # tags are validated by release.yml (the promoted artifact)
   pull_request:
     branches: [main]
   schedule:

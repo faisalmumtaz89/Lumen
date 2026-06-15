@@ -19,8 +19,7 @@ name: validate-metal
 on:
   workflow_dispatch:
   push:
-    branches: [main]
-    tags: ['b*', 'v*']
+    branches: [main]   # tags validated by release.yml's validate-macos (the promoted tarball)
   # NOTE: intentionally NO `pull_request:` trigger — a fork PR must never run on
   # your Mac (see SECURITY note above). Unlike CUDA (which validates on Modal, so
   # fork PRs are safely skippable), Metal runs on the physical self-hosted Mac, so

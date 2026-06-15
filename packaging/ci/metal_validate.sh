@@ -9,8 +9,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-SERVER="$ROOT/target/release/lumen-server"
-LUMEN="$ROOT/target/release/lumen"
+# Default to the freshly-built binary, but allow an override so release.yml can
+# validate the EXACT binary extracted from the shipping tarball (artifact promotion).
+SERVER="${LUMEN_SERVER_BIN:-$ROOT/target/release/lumen-server}"
+LUMEN="${LUMEN_BIN:-$ROOT/target/release/lumen}"
 OUT="${RUNNER_TEMP:-/tmp}/metal-val"; mkdir -p "$OUT"
 PORT=8533
 PROMPT='What is the capital of France?'

@@ -9,8 +9,8 @@
 #   LICENSE            (if present at repo root)
 #
 # The Metal backend compiles its MSL shaders at runtime from source embedded in
-# the binary (sub-second; see packaging/REPORT). There is NO separate .metallib
-# or shader directory to ship — the binaries are self-contained.
+# the binary (sub-second). There is NO separate .metallib or shader directory to
+# ship — the binaries are self-contained.
 #
 # Usage:
 #   packaging/macos/build-tarball.sh            # tag = b<git-rev-count>
@@ -74,10 +74,11 @@ INSTALL
     sudo cp bin/lumen bin/lumen-server /usr/local/bin/
   (or add this folder's bin/ to your PATH).
 
-  Gatekeeper note: these binaries are unsigned (ad-hoc). On first launch macOS
-  may quarantine them. Clear it with:
+  Gatekeeper note: these binaries are unsigned (ad-hoc, not notarized). After
+  download macOS quarantines them; clear the bit BEFORE first run (the install.sh
+  installer and Homebrew do this for you):
     xattr -dr com.apple.quarantine bin/lumen bin/lumen-server
-  or right-click → Open once in Finder.
+  (A CLI binary has no Finder "Open" dialog, so clear it from the terminal.)
 
 RUN (chat in one command)
   lumen pull qwen3.5-9b:q8_0          # downloads + converts to ~/.cache/lumen
@@ -102,3 +103,11 @@ echo "[build-tarball] wrote $TARBALL ($(du -h "$TARBALL" | cut -f1))"
 # user who downloads it next to the tarball (an absolute path would only verify
 # on this build host). install.sh parses column 1 only, so both forms work there.
 ( cd "$OUT_DIR" && shasum -a 256 "$(basename "$TARBALL")" | tee "$(basename "$TARBALL").sha256" )
+
+# Also emit a tag-LESS alias so install.sh's "latest" channel can fetch a stable
+# asset name via GitHub's /releases/latest/download/ redirect (the old hard-coded
+# "lumen-latest-..." name was never produced -> the one-line installer 404'd).
+ALIAS="$OUT_DIR/lumen-macos-arm64-metal.tar.gz"
+cp "$TARBALL" "$ALIAS"
+( cd "$OUT_DIR" && shasum -a 256 "$(basename "$ALIAS")" | tee "$(basename "$ALIAS").sha256" )
+echo "[build-tarball] alias: $ALIAS"
