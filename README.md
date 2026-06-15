@@ -4,159 +4,87 @@
 [Models](docs/support.md) ·
 [Server](docs/server.md) ·
 [Production](docs/production.md) ·
-[Bench](bench/RESULTS.md) ·
-[Contributing](CONTRIBUTING.md) ·
+[Benchmarks](bench/RESULTS.md) ·
+[Releases](RELEASING.md) ·
 [Changelog](CHANGELOG.md)
 
-LLM inference in Rust, for **Apple Silicon** and **NVIDIA CUDA**.
+**LLM inference in Rust, for Apple Silicon and NVIDIA CUDA.**
 
-Built from scratch in Rust with zero ML dependencies — no PyTorch, no ONNX, no Python runtime. Native CUDA C and Metal MSL kernels, native tokenizer, native model format. A single binary that downloads a model, runs GPU-resident inference, and prints text. v1 (current) ships Qwen3.5; additional model families are planned.
+A single binary that downloads a model, runs it GPU-resident, and prints text — built from scratch with zero ML dependencies (no PyTorch, no ONNX, no Python), native CUDA C and Metal kernels, a native tokenizer, and a native model format.
 
-> **Status:** Production-ready for the currently-shipped Qwen3.5 family (dense 9B and MoE-30B-A3B) on NVIDIA CUDA (compute capability 8.0+) and Apple Silicon (M-series), with decode throughput competitive with llama.cpp on the benchmarked configs — see [benchmarks](bench/RESULTS.md). The public API and the binary `.lbc` format are not yet stable. **Read [Production deployment](docs/production.md) before deploying.**
+```bash
+lumen run qwen3.5-9b:q8_0 "Write a haiku about Rust"
+```
 
-## Supported models
+That one command downloads the model on first use, converts it, picks your backend (Metal on Apple Silicon, CUDA on NVIDIA), and streams tokens.
 
-The runtime is built around two architecture classes (a dense GDN-hybrid and an MoE GDN-hybrid). v1 ships verified support for the Qwen3.5 family; additional model families are planned in future releases.
-
-### v1 (current) — verified-against-llama.cpp
-
-| Name | Architecture | Parameters | Quants (registry) | GGUF source |
-|------|--------------|------------|--------|-------------|
-| `qwen3.5-9b` | Qwen3.5 (GDN hybrid + dense FFN) | 9B | Q8_0 in the registry. A Q4_0 LBC is reachable out-of-registry via `lumen convert --requant q4_0` (`--requant` accepts `q4_0` / `q8_0`). | [`bartowski/Qwen_Qwen3.5-9B-GGUF`](https://huggingface.co/bartowski/Qwen_Qwen3.5-9B-GGUF) |
-| `qwen3.5-moe-35b-a3b` | Qwen3.5 MoE (GDN hybrid + sparse FFN) | 30B total / 3B active (registry label retains `35b-a3b`; architecture-truthful active-parameter count is 30B) | Q8_0, Q4_0, BF16 | [`bartowski/Qwen_Qwen3.5-35B-A3B-GGUF`](https://huggingface.co/bartowski/Qwen_Qwen3.5-35B-A3B-GGUF) |
-
-**Registry source of truth**: `model_registry.toml`. Run `lumen models` for current cells, aliases (e.g. `qwen3.5-moe`), and disk-cached LBCs. Unsupported `(model, quant)` combinations are rejected with a clear error message listing available alternatives.
-
-Architectures outside the v1 set (llama, mistral, qwen2, etc.) are currently rejected at conversion — they are not yet verified-against-llama.cpp on this runtime. K-quant and MXFP4 GGUFs are accepted and converted on import. Additional model families are on the roadmap; see [`docs/support.md`](docs/support.md) for the live verified-against-llama.cpp matrix.
-
-## Supported backends
-
-| Backend | Hardware | Status |
-|---------|----------|--------|
-| **CUDA** | NVIDIA, compute capability 8.0+ (Ampere / Hopper — e.g. A100, H100) | Production-ready |
-| **Metal** | Apple Silicon (M-series) | Production-ready |
-| **CPU** | Scalar reference + SIMD NEON | Correctness reference; not optimized for throughput |
-
-CUDA is enabled at build time with `--features cuda`. Metal compiles automatically on macOS targets.
-
-Hardware below NVIDIA compute capability 8.0, or Apple Silicon outside the M-series, is untested — kernels may compile and run, but no correctness/performance gate covers them.
+> **Status:** Production-ready for the shipped Qwen3.5 / Qwen3.6 models (dense 9B, dense 27B, and MoE-30B-A3B) on NVIDIA CUDA (compute capability 8.0+) and Apple Silicon (M-series). The public API and the binary `.lbc` format are not yet stable — **read [Production deployment](docs/production.md) before deploying.**
 
 ## Quick start
 
-**One command, clone to running server** — detects your backend (Metal/CUDA/CPU), builds the binaries, downloads + converts a model, and starts the OpenAI-compatible server with copy-paste `curl` examples:
+Get Lumen one of two ways, then run.
+
+**Option A — pre-built binary** (no Rust toolchain). One command detects your platform (macOS → Metal, Linux x86_64 + NVIDIA → CUDA), installs the matching validated binary, and helps you set up a model:
 
 ```bash
-./scripts/quickstart.sh            # interactive; pick a model and go
-./scripts/quickstart.sh --yes      # non-interactive (defaults: qwen3.5-9b q8_0)
-./scripts/quickstart.sh --help     # all flags (--model, --quant, --backend, --port, --dry-run, …)
+curl -fsSL https://raw.githubusercontent.com/faisalmumtaz89/Lumen/main/packaging/macos/install.sh | bash
 ```
 
-It auto-pulls the downloadable combos (`qwen3.5-9b:q8_0`, `qwen3.5-moe-35b-a3b:{q4_0,q8_0}`) and checks free disk against the true download+convert peak; any other model/quant (including the ~70 GB 2-shard `qwen3.5-moe-35b-a3b:bf16`) is refused with instructions to prepare it via `lumen convert` and re-run with `--model <path.lbc>`.
-
-Or do it by hand:
+**Option B — build from source** (Rust toolchain):
 
 ```bash
-# Install (CUDA on Linux)
-cargo install --path crates/lumen-cli --features cuda
+git clone https://github.com/faisalmumtaz89/Lumen && cd Lumen
+cargo install --path crates/lumen-cli                  # Apple Silicon (Metal)
+cargo install --path crates/lumen-cli --features cuda   # NVIDIA Linux (CUDA)
+```
 
-# Install (Metal on macOS)
-cargo install --path crates/lumen-cli
+(That installs the `lumen` CLI. For the `lumen-server` binary too: `cargo install --path crates/lumen-server --features bin` — append `,cuda` on NVIDIA. Option A installs both.)
 
-# Auto-downloads ~10 GB on first use, converts GGUF -> LBC, caches, runs
+**Run** — the model auto-downloads + converts on first use, then runs GPU-resident on your backend (Metal on Apple Silicon, CUDA on NVIDIA):
+
+```bash
 lumen run qwen3.5-9b:q8_0 "Write a haiku about Rust"
-
-# MoE — Q8_0 and Q4_0 auto-download from the registry
-lumen run qwen3.5-moe-35b-a3b:q8_0 "Hello"
-lumen run qwen3.5-moe-35b-a3b:q4_0 "Explain quantum computing in one paragraph"
+lumen run qwen3.5-moe:q4_0 "Explain quantum computing in one paragraph"   # mixture-of-experts
 ```
 
-A Q4_0 LBC for `qwen3.5-9b` (not published in the registry today) is produced from the registry's Q8_0 source via `lumen convert --requant q4_0`. `--requant` accepts `q4_0` and `q8_0`.
+More install paths (Docker, the one-command `clone → running server` script): **[Getting started](docs/getting-started.md)**.
 
-The MoE BF16 build (~70 GB, highest quality) is a 2-shard split GGUF that is **not auto-downloaded** today; fetch the shards manually, convert with `lumen convert`, and run with `--model <path.lbc>`.
+## What it is
 
-The backend is auto-detected: macOS → Metal, Linux with a CUDA device → CUDA, else SIMD CPU. Force a backend with `--cuda`, `--metal`, or `--simd`. Pick a CUDA device with `--cuda-device <n>`.
+- **One self-contained binary, zero ML dependencies** — native CUDA C and Metal MSL kernels, a native BPE tokenizer, and the native `.lbc` model format, all in Rust. No PyTorch, no ONNX, no Python runtime.
+- **No build-time CUDA SDK** — kernels JIT-compile at runtime via NVRTC, so one CUDA build runs on any compute-capability-8.0+ device (driver-only).
+- **Download → convert → run** in a single command; weights stay GPU-resident for fast batch-1 decode.
+- **OpenAI- and Anthropic-compatible HTTP server** with SSE streaming and template-driven tool calls; optional per-request reasoning / extended thinking.
+- **Runs on NVIDIA cc 8.0+ (Ampere / Hopper) and Apple Silicon (M-series)**; a scalar + SIMD CPU path is the correctness reference.
+- **Tuned for interactive serving** — single-stream, GPU-resident decode latency, not large-batch throughput.
 
-## CLI
+## Supported models & hardware
 
-```bash
-# Download / pre-convert without running
-lumen pull qwen3.5-9b:q8_0
+v1 (current) verifies the Qwen3.5 family and the Qwen3.6-27B dense model end-to-end; more model families are planned.
 
-# List cached + available models
-lumen models
+| Model | Architecture | Parameters | Quants |
+|-------|--------------|------------|--------|
+| `qwen3.5-9b` | Dense GDN-hybrid | 9B | Q8_0, Q4_0, BF16 |
+| `qwen3.6-27b` | Dense GDN-hybrid | 27B | Q8_0, Q4_0, BF16 |
+| `qwen3.5-moe` | MoE GDN-hybrid | 30B total / 3B active | Q8_0, Q4_0, BF16 |
 
-# Raw token mode
-lumen run --model /path/to/model.lbc --tokens "1 2 3" --max-tokens 128 --cuda
+| Backend | Hardware | Status |
+|---------|----------|--------|
+| **CUDA** | NVIDIA, compute capability 8.0+ (e.g. A100, H100) | Production-ready |
+| **Metal** | Apple Silicon (M-series) | Production-ready |
+| **CPU** | Scalar reference + SIMD NEON | Correctness reference, not throughput-optimized |
 
-# Convert GGUF -> LBC manually (with optional requant)
-lumen convert --input model.gguf --output model.lbc
-lumen convert --input model.gguf --output model.lbc --requant q4_0
-```
-
-| Flag | Description |
-|------|-------------|
-| `--system <text>` | System prompt |
-| `--max-tokens <n>` | Tokens to generate (default: unlimited, stops at EOS) |
-| `--temperature <f>` | Sampling temperature (0 = greedy, default 0.8) |
-| `--top-p` / `--top-k` / `--min-p` | Nucleus / top-K / min-prob cutoffs |
-| `--repetition-penalty` / `--presence-penalty` / `--frequency-penalty` | Sampling penalties |
-| `--seed <n>` | Sampling seed (default: random each run; set a fixed value for reproducible output) |
-| `--cuda` / `--metal` / `--simd` | Force a backend |
-| `--cuda-device <n>` | CUDA device ordinal (default 0) |
-| `--context-len <n>` | KV cache size (auto-sized by default) |
-| `--kv-disk-dir <path>` | Directory for disk-persistent KV cache |
-| `--session-save <p>` / `--session-resume <p>` | Persist / restore a Session across runs (Metal today) |
-| `--no-gpu-resident` | Stream weights from disk instead of GPU memory |
-| `--verbose` | Show diagnostics and metrics |
-| `--profile` | Per-operation timing breakdown |
-
-**Configuration precedence:** CLI flag > environment variable > built-in default. For example, `--kv-precision f32` overrides `LUMEN_KV_PRECISION=f16`; with neither set the per-backend default applies (Metal `f16`, CUDA/CPU `f32`).
-
-Full reference: `lumen run --help`.
+`lumen models` lists what is available and disk-cached. Live support matrix and per-config verification status: **[docs/support.md](docs/support.md)**.
 
 ## HTTP server
 
-`lumen-server` ships both a library crate and an opt-in standalone binary that exposes an axum-based router with OpenAI and Anthropic wire formats. **Use this (not repeated `lumen run`) for any concurrent-client deployment** — see [Production deployment](#production-deployment) for the rationale.
+For concurrent clients, run the long-lived server (not repeated `lumen run`):
 
 ```bash
-# Pre-download a model (one-time, ~10 GB for Qwen3.5-9B Q8_0)
 lumen pull qwen3.5-9b:q8_0
-
-# Boot the server (Metal on macOS, CUDA on Linux with --features cuda)
-cargo run --release --bin lumen-server --features bin -- \
-  --model qwen3.5-9b --quant q8_0 --port 8000
-
-# Or against an explicit LBC path
-cargo run --release --bin lumen-server --features bin -- \
-  --model /path/to/qwen3-5-9b-Q8_0.lbc
-
-# Try it
+lumen-server --model qwen3.5-9b --quant q8_0 --port 8000
 curl http://localhost:8000/v1/models
 ```
-
-The bin is gated behind the `bin` Cargo feature so library embedders that wire their own tokenizer / backend keep the lumen-server dep graph minimal. `lumen-server --help` lists all flags.
-
-Custom embedders own the tokenizer and weight provider; the runtime owns the GPU.
-
-```rust
-use lumen_server::{build_router, EngineWorker};
-
-let handle = EngineWorker::spawn(
-    runtime_config,
-    hyperparams,
-    backend,
-    weights,
-    tokenizer,
-    model_info,
-    /* inbox_size */ 32,
-);
-let router = build_router(handle);
-axum::serve(listener, router).await?;
-```
-
-Real signatures: `EngineWorker::spawn(config, hyperparams, backend, weights, tokenizer, model_info, inbox_size) -> EngineHandle` (`crates/lumen-server/src/engine.rs`) and `build_router(engine: EngineHandle)` (`crates/lumen-server/src/router.rs`). See `crates/lumen-server/tests/server_integration.rs` for a fully wired reference.
-
-Endpoints:
 
 ```text
 POST /v1/chat/completions   # OpenAI-compatible, SSE streaming
@@ -164,120 +92,59 @@ POST /v1/completions        # OpenAI-compatible
 POST /v1/messages           # Anthropic-compatible, SSE streaming
 ```
 
-Both wire formats support SSE streaming. The tool-call parser is template-driven; v1 (current) ships the Qwen3.5 `<tool_call>` / `</tool_call>` marker pattern with streaming partial-marker hold-back, and additional templates are straightforward to register as more model families ship. Reference embedder: `crates/lumen-server/tests/server_integration.rs`. Reference binary: `crates/lumen-server/src/bin/lumen-server.rs`.
+Wire formats, reasoning / extended thinking, sampling & reproducibility, and embedding the engine as a library: **[docs/server.md](docs/server.md)**.
 
-Optional per-request **reasoning / extended thinking** (default OFF, separate `reasoning_budget` from `max_tokens`): OpenAI `enable_thinking` (+ vLLM `chat_template_kwargs.enable_thinking`) surfacing `reasoning_content`, Anthropic `thinking.type` surfacing a `thinking` block, and the CLI `--think` flag; `LUMEN_CHAT_ENABLE_THINKING` overrides the default. See [HTTP server → Reasoning / extended thinking](docs/server.md#reasoning--extended-thinking).
+## Performance
+
+Lumen optimizes for **batch-1, GPU-resident decode latency** — single-stream interactive serving.
+
+Workload-weighted decode (Qwen3.5-MoE-30B-A3B, A100-80GB, mean across short / medium / long / code / multi-turn):
+
+| Quant | Decode (tok/s) |
+|-------|---------------:|
+| Q8_0  | 76.4 |
+| Q4_0  | 99.5 |
+| BF16  | 87.4 |
+
+Full per-cell decode + prefill numbers (every model × quant, on A100-80GB and M3 Ultra), methodology, and baseline comparisons: **[bench/RESULTS.md](bench/RESULTS.md)**. Long-context decode is validated to 65K+ tokens.
 
 ## Architecture
 
 ```text
 lumen-format      LBC binary format, quantization descriptors, test model generators
-lumen-convert     GGUF -> LBC converter (v1 architectures: qwen35 dense, qwen35moe MoE)
-lumen-runtime     CUDA backend (200+ NVRTC kernels across ~34 families), Metal backend (MSL shaders),
-                  naive CPU + SIMD NEON references, KV cache (memory + disk),
+lumen-convert     GGUF -> LBC converter (qwen35 dense, qwen35moe MoE)
+lumen-runtime     CUDA backend (200+ NVRTC kernels), Metal backend (MSL shaders),
+                  CPU + SIMD NEON references, KV cache (memory + disk),
                   GDN recurrent state, sampling, sessions, suffix prefill
 lumen-server      axum HTTP server: OpenAI + Anthropic SSE endpoints, tool calling
 lumen-bench       benchmark harness with JSON + table output
 lumen-cli         CLI: built-in BPE tokenizer, model registry, HuggingFace downloader
 ```
 
-**Forward pass.** v1's shipped instances (Qwen3.5-9B dense, Qwen3.5-MoE) share an L=32 layer stack of hybrid GDN linear-attention layers (24) interleaved with full-attention layers (8), with a fused gate+up+SwiGLU+down FFN (dense) or top-k expert dispatch (MoE).
+Shipped instances share an L=32 stack of GDN linear-attention layers interleaved with full-attention layers, with a fused gate+up+SwiGLU+down FFN (dense) or top-k expert dispatch (MoE). Forward-pass details, the `.lbc` on-disk format, and suffix-prefill cache reuse: **[docs/architecture.md](docs/architecture.md)**.
 
-For the forward-pass details, the `.lbc` on-disk format, and suffix-prefill cache reuse, see [`docs/architecture.md`](docs/architecture.md).
+## Building & testing
 
-## Performance
-
-Source: [`bench/RESULTS.md`](bench/RESULTS.md). Methodology: [`bench/METHODOLOGY.md`](bench/METHODOLOGY.md). 5-trial median, batch=1, `--temperature 0 --seed 42`.
-
-### Performance summary (2026-06-02)
-
-| Hardware | Model | Quant | Decode × llama.cpp | Prefill × llama.cpp |
-|---|---|---|---|---|
-| A100-80GB PCIe | Qwen3.5-9B dense | Q8_0 | **0.91×** | (structural < 1.0×) |
-| A100-80GB PCIe | Qwen3.5-9B dense | BF16 | **0.93–0.94×** | (structural < 1.0×) |
-| A100-80GB PCIe | Qwen3.5-9B dense | Q4_0 | 0.64× | (structural < 1.0×) |
-| A100-80GB PCIe | MoE-30B-A3B | BF16 (recommended) | **0.902×** | (structural < 1.0×) |
-| A100-80GB PCIe | MoE-30B-A3B | Q8_0 | 0.584× | — |
-| A100-80GB PCIe | MoE-30B-A3B | Q4_0 | 0.674× | — |
-| M3 Ultra | Qwen3.5-9B dense | Q8_0 | **0.98×** | **0.95×** |
-| M3 Ultra | Qwen3.5-9B dense | Q4_0 | **1.02×** / **1.17×** (beats llama.cpp) | 0.88× |
-| M3 Ultra | Qwen3.5-9B dense | BF16 | 0.83× | 0.66× |
-| M3 Ultra | MoE-30B-A3B (Q8/Q4) | — | functional, Lumen is **sole provider on Apple Silicon** (llama-bench 8680 cannot load GDN MoE) | — |
-
-**Workload-weighted decode** (mean across short/medium/long/code/multi-turn): Q8 76.4 = 0.551× llama.cpp, Q4 99.5 = 0.640× llama.cpp, BF16 87.4 = 0.883× llama.cpp. Realistic workload-weighted decode runs 3-7% below the canonical 5-trial median.
-
-**Prefill ratio versus llama.cpp** is structurally below 1.0× across all CUDA cells (NVRTC compute_61 PTX ISA + non-monolithic encoder ceiling). Lumen wins on decode latency at batch=1.
-
-BF16 MoE prefill uses an llama.cpp-port mmvf kernel; **`LUMEN_CUDA_BF16_GEMMEX=0`** is required for BF16 P3 correctness on MoE. See [bench/METHODOLOGY.md](bench/METHODOLOGY.md) for the full 12-flag canonical env stack.
-
-### Long context
-
-Tiled streaming-softmax decode kernel is the default for all sequence lengths (`ATTN_DECODE_TILED_DEFAULT_THRESHOLD = 0` at `crates/lumen-runtime/src/cuda/decode.rs`). To force the legacy single-block path, set `LUMEN_CUDA_DECODE_TILED_THRESHOLD=4294967295`. End-to-end decode at 65,536 tokens validated on A100-80GB across Q8_0 / Q4_0 / BF16; 98,304-token decode validated for Q4_0 / Q8_0. The GDN prefill grid-Y limit at 98K+ tokens was closed by sub-batched dispatch.
-
-## Comparison & benchmarks
-
-The `bench/` directory contains the canonical benchmark harness. The published benchmark suite is currently scoped to the v1 model family (Qwen3.5); benchmarks for additional model families will be added as they ship. See [`bench/RESULTS.md`](bench/RESULTS.md) for the full numbers and [`bench/METHODOLOGY.md`](bench/METHODOLOGY.md) for the methodology. On the measured Qwen3.5-9B BF16 cell at batch=1, Lumen's decode is **3.05× vLLM 0.21.0** and prefill is **2.62× vLLM** (`bench/RESULTS.md` § "BF16 — Lumen vs vLLM 0.21.0"). llama.cpp ratios are in the summary table above. vLLM's strengths surface at larger batch sizes, which is not the configuration measured here.
-
-## GPU memory
-
-| Quant | Qwen3.5-9B (peak VRAM) | Qwen3.5-MoE-30B-A3B (peak VRAM, 5-trial) |
-|-------|-----------------------:|-------------------------------------------:|
-| Q4_0  | ~5.1 GB                | **24.1 GB** (LBC 20.7 GB)                  |
-| Q8_0  | ~10.0 GB / ~22.9 GB (with cuBLAS workspace + cache) | **54.3 GB** (LBC 37.6 GB) |
-| BF16  | ~17.8 GB               | **72.4 GB** (LBC 69.7 GB) — see warning below |
-
-Qwen3.5-MoE-30B-A3B at all three quants fits on a single A100-80GB (validated).
-
-**BF16 MoE-30B-A3B headroom warning**: peak 72.4 GB on 80 GB A100 leaves only ~7.6 GB headroom. Any concurrent process consuming >5 GB can race `cuMemAlloc` and cause OOM mid-upload. **In a multi-tenant deployment, BF16 MoE requires a dedicated 80 GB+ GPU reservation.** No co-tenant workloads. For shared-GPU deployments, use Q8 (54 GB peak) or Q4 (24 GB peak).
-
-KV cache is auto-sized to fit remaining VRAM; `--context-len` overrides. KV growth is bit-perfect to the theoretical formula: `max_seq_len × num_layers × num_kv_heads × head_dim × 4 (F32) × 2 (K+V)`.
-
-## Production deployment
-
-Full operator runbook lives in [`docs/production.md`](docs/production.md). Key requirements before deploying:
-
-- For concurrent clients deploy `lumen-server`, not repeated `lumen run` invocations (the CLI cold-loads ~60–120 s per call; 16-client burst measured 82.4% timeout rate).
-- **BF16 MoE-30B-A3B requires a dedicated 80 GB+ GPU** — peak VRAM 72.4 GB on 80 GB A100. No co-tenant workloads.
-- For multilingual / long-form prompts pass `--max-tokens 512` minimum (chat template opens `<think>…</think>`).
-- PURE-greedy (`--temperature 0`) on long generations (≥512 tokens) deterministically loops; use `--temperature 0.7` OR, on DENSE models, `--repetition-penalty 1.05 --repeat-last-n 64`. The server and CLI already apply a **model-aware** penalty when the flag is omitted (1.05 dense / **1.03 MoE**); MoE must stay ≤ 1.03 — `1.05` corrupts MoE arithmetic. Source of truth: `runtime_defaults::repetition_penalty_default`.
-- Canonical env stack (CUDA, MoE-30B-A3B BF16 0.9× llama.cpp gate): all 12 flags default-ON. Critically **`LUMEN_CUDA_BF16_GEMMEX=0`** is required for BF16 P3 correctness. Full stack in [`bench/METHODOLOGY.md`](bench/METHODOLOGY.md).
-- LBC format compatibility: `LBC_VERSION = 3`. Rebuild LBCs after major Lumen upgrades via `lumen convert` or `lumen pull`.
-
-See [`docs/production.md`](docs/production.md) for serving-mode selection, GPU-reservation policy per quant, and known limitations.
-
-## Build
-
-**Requirements:**
-- Rust 1.75+
-- For CUDA: an NVIDIA GPU + driver, plus the CUDA runtime libraries `libnvrtc` and `libcublas` present at run time (loaded dynamically; no build-time CUDA SDK needed — kernels compile at runtime via NVRTC). Driver ≥ 525 recommended.
-- For Metal: macOS on Apple Silicon (no extra deps; ships with the OS)
+For development — build the workspace and run the test suite (the install commands are in [Quick start](#quick-start) above):
 
 ```bash
-# CUDA (Linux)
-cargo build --release --features cuda
-
-# Metal (macOS)
-cargo build --release
-
-# Workspace tests (no GPU required for the CPU reference suite)
-cargo test --workspace --release
+cargo build --release                  # Metal (macOS)
+cargo build --release --features cuda  # CUDA (Linux)
+cargo test --workspace --release       # CPU reference suite needs no GPU
 ```
 
-`cargo install --path crates/lumen-cli --features cuda` produces a single static `lumen` binary.
+Rust is pinned via `rust-toolchain.toml`; CUDA needs `libnvrtc` + `libcublas` present at run time (no build-time SDK). Dev workflow: **[CONTRIBUTING.md](CONTRIBUTING.md)**.
 
-## Tests
+## Documentation
 
-```bash
-cargo test --workspace --release
-```
-
-The CPU reference suite (`lumen-convert`, `lumen-cli`, `lumen-format`) runs without a GPU; the `lumen-runtime` GPU paths require the matching backend (Apple Silicon for Metal, an NVIDIA GPU + `--features cuda` for CUDA) and SKIP without the driver. CI runs the workspace minus the GPU-required tests. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the build-and-test workflow.
-
-## Status
-
-Production-ready on both NVIDIA CUDA (compute capability 8.0+) and Apple Silicon (M-series) for the Qwen3.5 family. Decode throughput relative to llama.cpp is reported in [benchmarks](bench/RESULTS.md). The public API and the binary `.lbc` format are not yet stable.
-
-Roadmap and history: [`CHANGELOG.md`](CHANGELOG.md).
+- [Getting started](docs/getting-started.md) — install, pull, run (binaries, Docker, source)
+- [CLI reference](docs/cli.md) — all subcommands and flags (or `lumen run --help`)
+- [HTTP server](docs/server.md) — endpoints, reasoning, library embedding
+- [Model support](docs/support.md) — live support matrix and verification status
+- [Production deployment](docs/production.md) — serving mode, GPU sizing, known limitations
+- [Environment variables](docs/environment-variables.md) — all `LUMEN_*` flags
+- [Benchmarks](bench/RESULTS.md) — per-cell numbers and methodology
+- [Releases & versioning](RELEASING.md) · [Changelog](CHANGELOG.md)
 
 ## License
 

@@ -34,7 +34,7 @@ USAGE:
     lumen pull <model-name> [OPTIONS]
 
 ARGUMENTS:
-    <model-name>          Model name or alias from the registry (currently: qwen3-5-9b, qwen3.5-9b)
+    <model-name>          Model name or alias from the registry: qwen3.5-9b, qwen3.6-27b, qwen3.5-moe
 
 OPTIONS:
     --quant <scheme>      Quantization format (default: Q8_0). Available: Q8_0, Q4_0, BF16, F16
