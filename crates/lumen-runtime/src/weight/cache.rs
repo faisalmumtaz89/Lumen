@@ -23,10 +23,7 @@ enum LayerBacking {
     ///
     /// The mmap region MUST outlive all LayerViews. This is guaranteed by the
     /// engine's borrow of `&dyn WeightProvider` during `generate()`.
-    ZeroCopy {
-        ptr: *const u8,
-        len: usize,
-    },
+    ZeroCopy { ptr: *const u8, len: usize },
 }
 
 // SAFETY: The raw pointer in ZeroCopy points to read-only mmap memory.
@@ -38,7 +35,10 @@ impl Clone for LayerBacking {
     fn clone(&self) -> Self {
         match self {
             LayerBacking::Owned(arc) => LayerBacking::Owned(Arc::clone(arc)),
-            LayerBacking::ZeroCopy { ptr, len } => LayerBacking::ZeroCopy { ptr: *ptr, len: *len },
+            LayerBacking::ZeroCopy { ptr, len } => LayerBacking::ZeroCopy {
+                ptr: *ptr,
+                len: *len,
+            },
         }
     }
 }
@@ -136,7 +136,9 @@ impl LayerView {
         if end > bytes.len() {
             return Err(RuntimeError::Compute(format!(
                 "subtensor out of bounds: offset={}, length={}, blob_size={}",
-                slice.offset, slice.length, bytes.len(),
+                slice.offset,
+                slice.length,
+                bytes.len(),
             )));
         }
         Ok(&bytes[start..end])
@@ -317,7 +319,9 @@ pub trait WeightProvider: Send + Sync {
     fn num_layers(&self) -> usize;
 
     /// Returns an I/O snapshot from the underlying storage backend.
-    fn io_snapshot(&self) -> Option<IoSnapshot> { None }
+    fn io_snapshot(&self) -> Option<IoSnapshot> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -327,19 +331,41 @@ mod tests {
     use lumen_format::QuantScheme;
 
     fn dummy_subtensors() -> SubtensorOffsets {
-        let s = TensorSlice { offset: 0, length: 0, quant: QuantScheme::F32 };
+        let s = TensorSlice {
+            offset: 0,
+            length: 0,
+            quant: QuantScheme::F32,
+        };
         SubtensorOffsets {
-            wq: s, wk: s, wv: s, wo: s,
-            bq: None, bk: None, bv: None,
-            w_gate: s, w_up: s, w_down: s,
-            attn_norm: s, ffn_norm: s,
+            wq: s,
+            wk: s,
+            wv: s,
+            wo: s,
+            bq: None,
+            bk: None,
+            bv: None,
+            w_gate: s,
+            w_up: s,
+            w_down: s,
+            attn_norm: s,
+            ffn_norm: s,
             router_weight: None,
             experts: None,
-            shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-            attn_gate: None, attn_post_norm: None,
-            ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-            ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-            attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            ffn_gate_inp_shexp: None,
             layer_type: None,
         }
     }
@@ -363,7 +389,11 @@ mod tests {
     fn layer_view_subtensor_bytes_valid() {
         let data = vec![0u8; 100];
         let view = LayerView::from_owned(0, data, dummy_subtensors());
-        let slice = TensorSlice { offset: 10, length: 20, quant: QuantScheme::F32 };
+        let slice = TensorSlice {
+            offset: 10,
+            length: 20,
+            quant: QuantScheme::F32,
+        };
         let bytes = view.subtensor_bytes(&slice).unwrap();
         assert_eq!(bytes.len(), 20);
     }
@@ -372,7 +402,11 @@ mod tests {
     fn layer_view_subtensor_bytes_out_of_bounds() {
         let data = vec![0u8; 50];
         let view = LayerView::from_owned(0, data, dummy_subtensors());
-        let slice = TensorSlice { offset: 40, length: 20, quant: QuantScheme::F32 };
+        let slice = TensorSlice {
+            offset: 40,
+            length: 20,
+            quant: QuantScheme::F32,
+        };
         assert!(view.subtensor_bytes(&slice).is_err());
     }
 
@@ -380,7 +414,11 @@ mod tests {
     fn layer_view_subtensor_bytes_overflow() {
         let data = vec![0u8; 100];
         let view = LayerView::from_owned(0, data, dummy_subtensors());
-        let slice = TensorSlice { offset: u64::MAX, length: 1, quant: QuantScheme::F32 };
+        let slice = TensorSlice {
+            offset: u64::MAX,
+            length: 1,
+            quant: QuantScheme::F32,
+        };
         assert!(view.subtensor_bytes(&slice).is_err());
     }
 
@@ -388,7 +426,11 @@ mod tests {
     fn layer_view_subtensor_bytes_exact_boundary() {
         let data = vec![0u8; 100];
         let view = LayerView::from_owned(0, data, dummy_subtensors());
-        let slice = TensorSlice { offset: 0, length: 100, quant: QuantScheme::F32 };
+        let slice = TensorSlice {
+            offset: 0,
+            length: 100,
+            quant: QuantScheme::F32,
+        };
         let bytes = view.subtensor_bytes(&slice).unwrap();
         assert_eq!(bytes.len(), 100);
     }
@@ -397,7 +439,11 @@ mod tests {
     fn layer_view_subtensor_bytes_zero_length() {
         let data = vec![0u8; 10];
         let view = LayerView::from_owned(0, data, dummy_subtensors());
-        let slice = TensorSlice { offset: 5, length: 0, quant: QuantScheme::F32 };
+        let slice = TensorSlice {
+            offset: 5,
+            length: 0,
+            quant: QuantScheme::F32,
+        };
         let bytes = view.subtensor_bytes(&slice).unwrap();
         assert_eq!(bytes.len(), 0);
     }
@@ -433,22 +479,38 @@ mod tests {
         assert_eq!(stats.hit_rate(), 0.0);
 
         // All hits → 1.0
-        let stats = CacheStats { hits: 100, misses: 0, ..Default::default() };
+        let stats = CacheStats {
+            hits: 100,
+            misses: 0,
+            ..Default::default()
+        };
         assert_eq!(stats.hit_rate(), 1.0);
 
         // 50/50 → 0.5
-        let stats = CacheStats { hits: 50, misses: 50, ..Default::default() };
+        let stats = CacheStats {
+            hits: 50,
+            misses: 50,
+            ..Default::default()
+        };
         assert!((stats.hit_rate() - 0.5).abs() < 1e-10);
     }
 
     #[test]
     fn cache_stats_utilization() {
         // Zero capacity → 0.0
-        let stats = CacheStats { capacity_bytes: 0, bytes_cached: 100, ..Default::default() };
+        let stats = CacheStats {
+            capacity_bytes: 0,
+            bytes_cached: 100,
+            ..Default::default()
+        };
         assert_eq!(stats.utilization(), 0.0);
 
         // Half full
-        let stats = CacheStats { capacity_bytes: 200, bytes_cached: 100, ..Default::default() };
+        let stats = CacheStats {
+            capacity_bytes: 200,
+            bytes_cached: 100,
+            ..Default::default()
+        };
         assert!((stats.utilization() - 0.5).abs() < 1e-10);
     }
 }

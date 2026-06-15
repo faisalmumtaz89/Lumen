@@ -140,8 +140,11 @@ unsafe fn nsnumber_with_uinteger(value: u64) -> ObjcId {
     let ns_number_cls = cls("NSNumber");
     type Fn1 = unsafe extern "C" fn(ObjcId, ObjcSel, u64) -> ObjcId;
     let f: Fn1 = std::mem::transmute(objc_msgSend as *const c_void);
-    let n = f(ns_number_cls as ObjcId,
-        sel_cached(&SEL_NUM, "numberWithUnsignedInteger:"), value);
+    let n = f(
+        ns_number_cls as ObjcId,
+        sel_cached(&SEL_NUM, "numberWithUnsignedInteger:"),
+        value,
+    );
     // numberWithUnsignedInteger: returns autoreleased — retain to extend
     // lifetime beyond the autoreleasepool boundary.
     retain(n);
@@ -287,7 +290,9 @@ impl Drop for MpsGraphContext {
         unsafe {
             if let Ok(mut views) = self.view_buf_cache.lock() {
                 for (_, buf) in views.drain() {
-                    if !buf.is_null() { release(buf) };
+                    if !buf.is_null() {
+                        release(buf)
+                    };
                 }
             }
             // `cmd_queue_wrapper` drop releases the queue itself.
@@ -450,7 +455,10 @@ fn build_graph(m: u32, k: u32, n: u32) -> Option<CompiledGraph> {
         let f_trans: FnTrans = std::mem::transmute(objc_msgSend as *const c_void);
         let w_t = f_trans(
             graph,
-            sel_cached(&SEL_TRANSPOSE, "transposeTensor:dimension:withDimension:name:"),
+            sel_cached(
+                &SEL_TRANSPOSE,
+                "transposeTensor:dimension:withDimension:name:",
+            ),
             w_ph,
             0,
             1,
@@ -468,7 +476,10 @@ fn build_graph(m: u32, k: u32, n: u32) -> Option<CompiledGraph> {
         let f_mm: FnMM = std::mem::transmute(objc_msgSend as *const c_void);
         let y_bf = f_mm(
             graph,
-            sel_cached(&SEL_MATMUL, "matrixMultiplicationWithPrimaryTensor:secondaryTensor:name:"),
+            sel_cached(
+                &SEL_MATMUL,
+                "matrixMultiplicationWithPrimaryTensor:secondaryTensor:name:",
+            ),
             x_bf,
             w_t,
             ptr::null_mut(),
@@ -654,8 +665,12 @@ pub fn encode_bf16_matmul_into_cb(
         let x_data = make_tensor_data(x_buf, &[m as u64, k as u64], MPS_DTYPE_F32);
         let w_data = ctx.make_w_tensor_data(w_buf, w_buf_offset, n, k);
         if x_data.is_null() || w_data.is_null() {
-            if !x_data.is_null() { release(x_data); }
-            if !w_data.is_null() { release(w_data); }
+            if !x_data.is_null() {
+                release(x_data);
+            }
+            if !w_data.is_null() {
+                release(w_data);
+            }
             release(feeds);
             release(mcb);
             return Err("tensor data alloc failed");
@@ -666,8 +681,12 @@ pub fn encode_bf16_matmul_into_cb(
         let results = nsmutdict_new();
         let y_data = make_tensor_data(y_buf, &[m as u64, n as u64], MPS_DTYPE_F32);
         if results.is_null() || y_data.is_null() {
-            if !y_data.is_null() { release(y_data); }
-            if !results.is_null() { release(results); }
+            if !y_data.is_null() {
+                release(y_data);
+            }
+            if !results.is_null() {
+                release(results);
+            }
             release(x_data);
             release(w_data);
             release(feeds);
@@ -681,9 +700,7 @@ pub fn encode_bf16_matmul_into_cb(
         // buffer. MPSGraph MAY call commitAndContinue internally
         // for large graphs; we cope by reading rootCommandBuffer
         // afterwards.
-        type FnEnc = unsafe extern "C" fn(
-            ObjcId, ObjcSel, ObjcId, ObjcId, ObjcId, ObjcId, ObjcId,
-        );
+        type FnEnc = unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId, ObjcId, ObjcId, ObjcId, ObjcId);
         let f_enc: FnEnc = std::mem::transmute(objc_msgSend as *const c_void);
         f_enc(
             cg.graph,
@@ -749,10 +766,20 @@ pub fn encode_bf16_matmul_sync(
         if x_data.is_null() || w_data.is_null() {
             let xr = x_data.is_null();
             let wr = w_data.is_null();
-            if !x_data.is_null() { release(x_data); }
-            if !w_data.is_null() { release(w_data); }
+            if !x_data.is_null() {
+                release(x_data);
+            }
+            if !w_data.is_null() {
+                release(w_data);
+            }
             release(feeds);
-            return Err(if xr { "x_data alloc failed" } else if wr { "w_data alloc failed" } else { "tensor data alloc failed" });
+            return Err(if xr {
+                "x_data alloc failed"
+            } else if wr {
+                "w_data alloc failed"
+            } else {
+                "tensor data alloc failed"
+            });
         }
         nsmutdict_set(feeds, x_data, cg.x_placeholder);
         nsmutdict_set(feeds, w_data, cg.w_placeholder);
@@ -761,8 +788,12 @@ pub fn encode_bf16_matmul_sync(
         let results = nsmutdict_new();
         let y_data = make_tensor_data(y_buf, &[m as u64, n as u64], MPS_DTYPE_F32);
         if results.is_null() || y_data.is_null() {
-            if !y_data.is_null() { release(y_data); }
-            if !results.is_null() { release(results); }
+            if !y_data.is_null() {
+                release(y_data);
+            }
+            if !results.is_null() {
+                release(results);
+            }
             release(x_data);
             release(w_data);
             release(feeds);
@@ -774,14 +805,14 @@ pub fn encode_bf16_matmul_sync(
         // This variant submits its work to the queue and blocks until
         // the GPU has written into the resultsDictionary buffers.
         // Apple's MPSGraph.h marks this as the synchronous run path.
-        type FnRun = unsafe extern "C" fn(
-            ObjcId, ObjcSel, ObjcId, ObjcId, ObjcId, ObjcId,
-        );
+        type FnRun = unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId, ObjcId, ObjcId, ObjcId);
         let f: FnRun = std::mem::transmute(objc_msgSend as *const c_void);
         f(
             cg.graph,
-            sel_cached(&SEL_RUN,
-                "runWithMTLCommandQueue:feeds:targetOperations:resultsDictionary:"),
+            sel_cached(
+                &SEL_RUN,
+                "runWithMTLCommandQueue:feeds:targetOperations:resultsDictionary:",
+            ),
             ctx.cmd_queue_raw,
             feeds,
             ptr::null_mut(),
@@ -857,7 +888,11 @@ impl MpsGraphContext {
         // offset (private mode). Either form is stable for the
         // process lifetime.
         let src_contents = w_buf.contents() as usize;
-        let key_base = if src_contents != 0 { src_contents } else { w_buf.raw() as usize };
+        let key_base = if src_contents != 0 {
+            src_contents
+        } else {
+            w_buf.raw() as usize
+        };
         let key = (key_base, byte_offset, elem_bytes);
 
         let mut cache = self.view_buf_cache.lock().ok()?;
@@ -917,13 +952,14 @@ impl MpsGraphContext {
             }
             retain(enc);
             // -[MTLBlitCommandEncoder copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:]
-            type FnCopy = unsafe extern "C" fn(
-                ObjcId, ObjcSel, ObjcId, u64, ObjcId, u64, u64,
-            );
+            type FnCopy = unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId, u64, ObjcId, u64, u64);
             let f_copy: FnCopy = std::mem::transmute(objc_msgSend as *const c_void);
             f_copy(
                 enc,
-                sel_cached(&SEL_COPY, "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:"),
+                sel_cached(
+                    &SEL_COPY,
+                    "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:",
+                ),
                 w_buf.raw(),
                 byte_offset,
                 dst_buf,

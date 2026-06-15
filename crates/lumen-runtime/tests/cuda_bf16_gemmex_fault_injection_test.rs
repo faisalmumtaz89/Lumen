@@ -65,11 +65,8 @@
 use lumen_format::ModelHyperparams;
 use lumen_runtime::compute::ComputeBackend;
 use lumen_runtime::cuda::{
-    bf16_gemmex_fallback_armed_for_tests,
-    bf16_gemmex_runtime_warning_emitted_for_tests,
-    inject_next_bf16_cublas_failure,
-    reset_bf16_gemmex_state_for_tests,
-    CudaBackend,
+    bf16_gemmex_fallback_armed_for_tests, bf16_gemmex_runtime_warning_emitted_for_tests,
+    inject_next_bf16_cublas_failure, reset_bf16_gemmex_state_for_tests, CudaBackend,
 };
 use std::sync::{Mutex, OnceLock};
 
@@ -89,9 +86,7 @@ fn test_lock() -> &'static Mutex<()> {
 /// `catch_unwind` so these tests skip cleanly on dev hosts. Mirrors the
 /// pattern used by `cuda_bf16_gemmex_fallback_test.rs`.
 fn try_cuda_backend() -> Option<CudaBackend> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        CudaBackend::new(0)
-    })) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| CudaBackend::new(0))) {
         Ok(Ok(b)) => Some(b),
         Ok(Err(_)) | Err(_) => None,
     }
@@ -183,9 +178,7 @@ fn bf16_runtime_failure_triggers_legacy_fallback_and_request_survives() {
     // the GemmEx path and the legacy path to compute identically.
     let in_dim = 16usize;
     let out_dim = 32usize;
-    let weight_f32: Vec<f32> = (0..out_dim * in_dim)
-        .map(|i| (i as f32) * 0.01)
-        .collect();
+    let weight_f32: Vec<f32> = (0..out_dim * in_dim).map(|i| (i as f32) * 0.01).collect();
     let weight_bf16 = f32_to_bf16_bytes(&weight_f32);
     let input_f32: Vec<f32> = (0..in_dim).map(|i| 1.0 + (i as f32) * 0.1).collect();
 
@@ -193,7 +186,11 @@ fn bf16_runtime_failure_triggers_legacy_fallback_and_request_survives() {
     // expected output the legacy kernel must match.
     let baseline = backend
         .dispatch_bf16_matvec_for_tests(
-            &weight_bf16, &input_f32, out_dim, in_dim, None,
+            &weight_bf16,
+            &input_f32,
+            out_dim,
+            in_dim,
+            None,
             "fault_inject_test1_baseline",
         )
         .expect("baseline GemmEx dispatch must succeed");
@@ -215,7 +212,11 @@ fn bf16_runtime_failure_triggers_legacy_fallback_and_request_survives() {
     inject_next_bf16_cublas_failure();
     let fallback = backend
         .dispatch_bf16_matvec_for_tests(
-            &weight_bf16, &input_f32, out_dim, in_dim, None,
+            &weight_bf16,
+            &input_f32,
+            out_dim,
+            in_dim,
+            None,
             "fault_inject_test1_after_inject",
         )
         .expect(
@@ -256,7 +257,11 @@ fn bf16_runtime_failure_triggers_legacy_fallback_and_request_survives() {
     // must still match the baseline within tolerance.
     let post_fallback = backend
         .dispatch_bf16_matvec_for_tests(
-            &weight_bf16, &input_f32, out_dim, in_dim, None,
+            &weight_bf16,
+            &input_f32,
+            out_dim,
+            in_dim,
+            None,
             "fault_inject_test1_post_fallback",
         )
         .expect("post-fallback dispatch must succeed on the legacy path");
@@ -293,16 +298,18 @@ fn bf16_inject_residual_variant_triggers_legacy_fallback() {
 
     let in_dim = 16usize;
     let out_dim = 32usize;
-    let weight_f32: Vec<f32> = (0..out_dim * in_dim)
-        .map(|i| (i as f32) * 0.005)
-        .collect();
+    let weight_f32: Vec<f32> = (0..out_dim * in_dim).map(|i| (i as f32) * 0.005).collect();
     let weight_bf16 = f32_to_bf16_bytes(&weight_f32);
     let input_f32: Vec<f32> = (0..in_dim).map(|i| 0.5 + (i as f32) * 0.05).collect();
     let residual_f32: Vec<f32> = (0..out_dim).map(|i| (i as f32) * 0.03).collect();
 
     let baseline = backend
         .dispatch_bf16_matvec_for_tests(
-            &weight_bf16, &input_f32, out_dim, in_dim, Some(&residual_f32),
+            &weight_bf16,
+            &input_f32,
+            out_dim,
+            in_dim,
+            Some(&residual_f32),
             "fault_inject_test2_residual_baseline",
         )
         .expect("residual baseline GemmEx dispatch must succeed");
@@ -314,7 +321,11 @@ fn bf16_inject_residual_variant_triggers_legacy_fallback() {
     inject_next_bf16_cublas_failure();
     let fallback = backend
         .dispatch_bf16_matvec_for_tests(
-            &weight_bf16, &input_f32, out_dim, in_dim, Some(&residual_f32),
+            &weight_bf16,
+            &input_f32,
+            out_dim,
+            in_dim,
+            Some(&residual_f32),
             "fault_inject_test2_residual_after_inject",
         )
         .expect(
@@ -369,7 +380,11 @@ fn bf16_inject_clears_after_single_use() {
     inject_next_bf16_cublas_failure();
     let _first = backend
         .dispatch_bf16_matvec_for_tests(
-            &weight_bf16, &input_f32, out_dim, in_dim, None,
+            &weight_bf16,
+            &input_f32,
+            out_dim,
+            in_dim,
+            None,
             "fault_inject_test3_first",
         )
         .expect("first dispatch must survive the injected failure");
@@ -387,7 +402,11 @@ fn bf16_inject_clears_after_single_use() {
     // dispatch succeeds AND no panic/error/inject-cascade occurs.
     let _second = backend
         .dispatch_bf16_matvec_for_tests(
-            &weight_bf16, &input_f32, out_dim, in_dim, None,
+            &weight_bf16,
+            &input_f32,
+            out_dim,
+            in_dim,
+            None,
             "fault_inject_test3_second",
         )
         .expect("second dispatch (no fresh inject) must succeed via legacy path");
@@ -410,7 +429,11 @@ fn bf16_inject_clears_after_single_use() {
     );
     let _third = backend
         .dispatch_bf16_matvec_for_tests(
-            &weight_bf16, &input_f32, out_dim, in_dim, None,
+            &weight_bf16,
+            &input_f32,
+            out_dim,
+            in_dim,
+            None,
             "fault_inject_test3_third_post_reset",
         )
         .expect("post-reset dispatch must succeed via GemmEx (no inject left)");
@@ -450,7 +473,11 @@ fn bf16_warning_emitted_exactly_once_across_repeated_failures() {
     inject_next_bf16_cublas_failure();
     let _ = backend
         .dispatch_bf16_matvec_for_tests(
-            &weight_bf16, &input_f32, out_dim, in_dim, None,
+            &weight_bf16,
+            &input_f32,
+            out_dim,
+            in_dim,
+            None,
             "warning_emitted_first",
         )
         .expect("first dispatch must survive injected failure");
@@ -472,7 +499,11 @@ fn bf16_warning_emitted_exactly_once_across_repeated_failures() {
     inject_next_bf16_cublas_failure();
     let _ = backend
         .dispatch_bf16_matvec_for_tests(
-            &weight_bf16, &input_f32, out_dim, in_dim, None,
+            &weight_bf16,
+            &input_f32,
+            out_dim,
+            in_dim,
+            None,
             "warning_emitted_second_arm_attempt",
         )
         .expect("second dispatch with re-injected failure must survive");

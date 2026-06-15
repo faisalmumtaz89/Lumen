@@ -4,20 +4,27 @@ use crate::results::BenchSummary;
 
 /// Print results as a human-readable table.
 pub fn print_table(summaries: &[BenchSummary]) {
-    println!("{:<40} {:>10} {:>10} {:>10} {:>8} {:>10} {:>10} {:>10}",
-        "Config", "TPOT(ms)", "p95(ms)", "stddev", "CV%", "BW(GiB/s)", "Stall%", "Time(ms)");
+    println!(
+        "{:<40} {:>10} {:>10} {:>10} {:>8} {:>10} {:>10} {:>10}",
+        "Config", "TPOT(ms)", "p95(ms)", "stddev", "CV%", "BW(GiB/s)", "Stall%", "Time(ms)"
+    );
     println!("{}", "-".repeat(128));
 
     for s in summaries {
         let cache_hit = if s.results.is_empty() {
             0.0
         } else {
-            s.results.iter().map(|r| r.weight_cache_hit_rate).sum::<f64>()
-                / s.results.len() as f64 * 100.0
+            s.results
+                .iter()
+                .map(|r| r.weight_cache_hit_rate)
+                .sum::<f64>()
+                / s.results.len() as f64
+                * 100.0
         };
         let _ = cache_hit; // available for verbose mode
 
-        println!("{:<40} {:>10.2} {:>10.2} {:>10.2} {:>7.1}% {:>10.3} {:>10.1} {:>10.1}",
+        println!(
+            "{:<40} {:>10.2} {:>10.2} {:>10.2} {:>7.1}% {:>10.3} {:>10.1} {:>10.1}",
             s.label,
             s.median_tpot_ms(),
             s.p95_tpot_ms(),
@@ -46,21 +53,45 @@ pub fn print_json(summaries: &[BenchSummary]) {
         println!("      \"p95_tpot_ms\": {:.2},", s.p95_tpot_ms());
         println!("      \"std_dev_tpot_ms\": {:.4},", s.std_dev_tpot_ms());
         println!("      \"cv_tpot_percent\": {:.2},", s.cv_tpot_percent());
-        println!("      \"mean_bandwidth_gibs\": {:.4},", s.mean_bandwidth_gibs());
-        println!("      \"mean_stall_fraction\": {:.4},", s.mean_stall_fraction());
-        println!("      \"mean_total_time_ms\": {:.2},", s.mean_total_time().as_secs_f64() * 1000.0);
+        println!(
+            "      \"mean_bandwidth_gibs\": {:.4},",
+            s.mean_bandwidth_gibs()
+        );
+        println!(
+            "      \"mean_stall_fraction\": {:.4},",
+            s.mean_stall_fraction()
+        );
+        println!(
+            "      \"mean_total_time_ms\": {:.2},",
+            s.mean_total_time().as_secs_f64() * 1000.0
+        );
         println!("      \"results\": [");
         for (j, r) in s.results.iter().enumerate() {
             println!("        {{");
-            println!("          \"total_time_ms\": {:.2},", r.total_time.as_secs_f64() * 1000.0);
-            println!("          \"prefill_time_ms\": {:.2},", r.prefill_time.as_secs_f64() * 1000.0);
-            println!("          \"decode_time_ms\": {:.2},", r.decode_time.as_secs_f64() * 1000.0);
+            println!(
+                "          \"total_time_ms\": {:.2},",
+                r.total_time.as_secs_f64() * 1000.0
+            );
+            println!(
+                "          \"prefill_time_ms\": {:.2},",
+                r.prefill_time.as_secs_f64() * 1000.0
+            );
+            println!(
+                "          \"decode_time_ms\": {:.2},",
+                r.decode_time.as_secs_f64() * 1000.0
+            );
             println!("          \"tpot_ms\": {:.2},", r.tpot_ms);
             println!("          \"bytes_read\": {},", r.bytes_read);
             println!("          \"read_ops\": {},", r.read_ops);
             println!("          \"bandwidth_gibs\": {:.4},", r.bandwidth_gibs);
-            println!("          \"weight_cache_hit_rate\": {:.4},", r.weight_cache_hit_rate);
-            println!("          \"initial_residency\": {:.4},", r.initial_residency);
+            println!(
+                "          \"weight_cache_hit_rate\": {:.4},",
+                r.weight_cache_hit_rate
+            );
+            println!(
+                "          \"initial_residency\": {:.4},",
+                r.initial_residency
+            );
             println!("          \"final_residency\": {:.4},", r.final_residency);
             println!("          \"stall_fraction\": {:.4},", r.stall_fraction);
             println!("          \"prompt_tokens\": {},", r.prompt_tokens);

@@ -279,10 +279,7 @@ impl Session {
     /// `extend` / `extend_with_cache` call to fail fast at the engine layer
     /// instead of corrupting KV at a downstream blit or attention dispatch.
     ///
-    pub fn validate_backend(
-        &self,
-        backend: &dyn ComputeBackend,
-    ) -> Result<(), RuntimeError> {
+    pub fn validate_backend(&self, backend: &dyn ComputeBackend) -> Result<(), RuntimeError> {
         backend.validate_kv_precision(self.config.kv_precision)
     }
 
@@ -365,7 +362,10 @@ impl Session {
                 let tail: Vec<u32> = prompt.iter().rev().take(6).rev().copied().collect();
                 let hsum: f64 = last_hidden.iter().map(|&v| v as f64).sum();
                 let hmin = last_hidden.iter().cloned().fold(f32::INFINITY, f32::min);
-                let hmax = last_hidden.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let hmax = last_hidden
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
                 eprintln!(
                     "[provider-debug] extend prompt_len={n} head={head:?} tail={tail:?} hidden_len={} hidden_sum={hsum:.4} hidden_min={hmin:.4} hidden_max={hmax:.4}",
                     last_hidden.len()
@@ -375,8 +375,17 @@ impl Session {
             x.write_f32_from(&last_hidden);
             let lg = backend.compute_final(&x)?;
             if std::env::var("LUMEN_PROVIDER_DEBUG").is_ok() {
-                let argmax = lg.data.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(i, _)| i).unwrap_or(0);
-                eprintln!("[provider-debug] extend first_logits_argmax={argmax} logit_val={:.4}", lg.data.get(argmax).copied().unwrap_or(0.0));
+                let argmax = lg
+                    .data
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                eprintln!(
+                    "[provider-debug] extend first_logits_argmax={argmax} logit_val={:.4}",
+                    lg.data.get(argmax).copied().unwrap_or(0.0)
+                );
             }
             lg
         } else {
@@ -849,12 +858,8 @@ impl Session {
         F: FnOnce() -> Result<Session, RuntimeError>,
     {
         // Suffix-prefill path (the candidate under test).
-        let suffix_result = self.extend_with_cache(
-            new_full_prompt,
-            backend,
-            weights,
-            suffix_threshold,
-        )?;
+        let suffix_result =
+            self.extend_with_cache(new_full_prompt, backend, weights, suffix_threshold)?;
 
         // Snapshot the candidate's next-token argmax. We can't `decode` here
         // because `self` may already have `pending_logits` queued from Path
@@ -980,10 +985,8 @@ impl Session {
         // resumed session falls into Path B (an extra forward pass at the
         // last prompt token's position) which corrupts the KV at the
         // boundary and diverges immediately.
-        let pending_logits_data: Option<Vec<f32>> = self
-            .pending_logits
-            .as_ref()
-            .map(|l| l.data.clone());
+        let pending_logits_data: Option<Vec<f32>> =
+            self.pending_logits.as_ref().map(|l| l.data.clone());
         let pending_slice = pending_logits_data.as_deref();
 
         // Invariant repair: after the last
@@ -1176,7 +1179,10 @@ impl Session {
             cx.write_f32_from(&last_hidden);
             let mut logits = backend.compute_final(&cx)?;
             let token = sample_token_with_state(
-                &mut logits, &self.sampling, &mut self.sampler_state, &mut self.rng,
+                &mut logits,
+                &self.sampling,
+                &mut self.sampler_state,
+                &mut self.rng,
             );
             // Restore the full token history + the freshly sampled token so the
             // next call re-prefills prompt+generated-so-far.
@@ -1191,7 +1197,12 @@ impl Session {
                 // Path A -- sample the logits left by `extend` (or a previous
                 // GPU-decode step). No backend call needed.
                 let start = Instant::now();
-                let token = sample_token_with_state(&mut logits, &self.sampling, &mut self.sampler_state, &mut self.rng);
+                let token = sample_token_with_state(
+                    &mut logits,
+                    &self.sampling,
+                    &mut self.sampler_state,
+                    &mut self.rng,
+                );
                 self.decode_time += start.elapsed();
                 self.tokens.push(token);
                 token
@@ -1199,17 +1210,18 @@ impl Session {
             None => {
                 // Path B -- execute one decode step using the last sampled
                 // token as input. Dispatch on caps; sample if needed.
-                let prev = *self
-                    .tokens
-                    .last()
-                    .ok_or_else(|| RuntimeError::Compute(
+                let prev = *self.tokens.last().ok_or_else(|| {
+                    RuntimeError::Compute(
                         "next_token called with no tokens -- call extend first".into(),
-                    ))?;
+                    )
+                })?;
                 let caps = backend.caps();
                 // disable GPU-argmax fast path when a penalty is
                 // active (must apply penalty on CPU before argmax).
                 let use_gpu_greedy = crate::engine::use_gpu_greedy_predicate(
-                    &self.sampling, caps.gpu_resident, caps.gpu_argmax,
+                    &self.sampling,
+                    caps.gpu_resident,
+                    caps.gpu_argmax,
                 );
 
                 let start = Instant::now();
@@ -1221,7 +1233,12 @@ impl Session {
                 } else if caps.gpu_resident {
                     // GPU returns logits; sample on CPU. KV advanced inside.
                     let mut logits = backend.decode_token(prev, weights, &mut self.kv)?;
-                    sample_token_with_state(&mut logits, &self.sampling, &mut self.sampler_state, &mut self.rng)
+                    sample_token_with_state(
+                        &mut logits,
+                        &self.sampling,
+                        &mut self.sampler_state,
+                        &mut self.rng,
+                    )
                 } else {
                     // CPU streaming path: per-layer forward + compute_final.
                     let x = forward_pass(
@@ -1235,7 +1252,12 @@ impl Session {
                     )?;
                     self.kv.advance_seq_len()?;
                     let mut logits = backend.compute_final(&x)?;
-                    sample_token_with_state(&mut logits, &self.sampling, &mut self.sampler_state, &mut self.rng)
+                    sample_token_with_state(
+                        &mut logits,
+                        &self.sampling,
+                        &mut self.sampler_state,
+                        &mut self.rng,
+                    )
                 };
                 self.decode_time += start.elapsed();
                 self.tokens.push(token);
@@ -1362,7 +1384,11 @@ fn forward_pass(
 
         // Ensure current layer weights are available. Gate Instant::now()
         // behind collect_timings -- it is a syscall.
-        let load_start = if collect_timings { Some(Instant::now()) } else { None };
+        let load_start = if collect_timings {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let (layer_view, weight_cache_hit) = match weights.try_get_layer(layer) {
             Some(view) => (view, true),
             None => (weights.get_layer_blocking(layer)?, false),
@@ -1371,12 +1397,20 @@ fn forward_pass(
 
         // Compute with KV cache.
         let mut kv_view = kv.view_mut(layer)?;
-        let compute_start = if collect_timings { Some(Instant::now()) } else { None };
+        let compute_start = if collect_timings {
+            Some(Instant::now())
+        } else {
+            None
+        };
         backend.compute_layer(layer, &mut x, &layer_view, Some(&mut kv_view), seq_pos)?;
         let compute_time = compute_start.map(|t| t.elapsed());
 
         // Commit KV updates.
-        let kv_save_start = if collect_timings { Some(Instant::now()) } else { None };
+        let kv_save_start = if collect_timings {
+            Some(Instant::now())
+        } else {
+            None
+        };
         kv.commit_view(kv_view)?;
         let kv_save_time = kv_save_start.map(|t| t.elapsed());
 
@@ -1470,7 +1504,11 @@ mod tests {
     fn session_stream_yields_requested_tokens() {
         let (provider, backend, hp) = synthetic_setup();
         let config = baseline_config(64);
-        let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let mut session = Session::new(config, hp, sampling).unwrap();
         let prompt = vec![0u32, 1, 2];
         session.extend(&prompt, &backend, &provider).unwrap();
@@ -1487,7 +1525,11 @@ mod tests {
     fn session_stream_stops_on_eos() {
         let (provider, backend, hp) = synthetic_setup();
         let config = baseline_config(64);
-        let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let mut session = Session::new(config, hp, sampling).unwrap();
         let prompt = vec![0u32, 1, 2];
         session.extend(&prompt, &backend, &provider).unwrap();
@@ -1504,7 +1546,11 @@ mod tests {
         let mut session2 = Session::new(
             baseline_config(64),
             hp2,
-            SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() },
+            SamplingParams {
+                temperature: 0.0,
+                seed: Some(42),
+                ..Default::default()
+            },
         )
         .unwrap();
         session2.extend(&prompt, &backend2, &provider2).unwrap();
@@ -1571,11 +1617,20 @@ mod tests {
     fn session_extend_with_cache_cold_path() {
         let (provider, backend, hp) = synthetic_setup();
         let cfg = baseline_config(64);
-        let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let mut session = Session::new(cfg, hp, sampling).unwrap();
         let prompt = vec![0u32, 1, 2, 3];
         let r = session
-            .extend_with_cache(&prompt, &backend, &provider, Session::DEFAULT_SUFFIX_THRESHOLD)
+            .extend_with_cache(
+                &prompt,
+                &backend,
+                &provider,
+                Session::DEFAULT_SUFFIX_THRESHOLD,
+            )
             .unwrap();
         assert!(r.fell_back_to_cold);
         assert_eq!(r.reused_prefix_len, 0);
@@ -1589,13 +1644,22 @@ mod tests {
     fn session_extend_with_cache_exact_match_is_noop() {
         let (provider, backend, hp) = synthetic_setup();
         let cfg = baseline_config(64);
-        let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let mut session = Session::new(cfg, hp, sampling).unwrap();
         let prompt = vec![0u32, 1, 2, 3];
         session.extend(&prompt, &backend, &provider).unwrap();
         let prior_len = session.token_count();
         let r = session
-            .extend_with_cache(&prompt, &backend, &provider, Session::DEFAULT_SUFFIX_THRESHOLD)
+            .extend_with_cache(
+                &prompt,
+                &backend,
+                &provider,
+                Session::DEFAULT_SUFFIX_THRESHOLD,
+            )
             .unwrap();
         assert_eq!(r.reused_prefix_len, prior_len);
         assert_eq!(r.suffix_len, 0);
@@ -1609,7 +1673,11 @@ mod tests {
     fn session_extend_with_cache_extension_reuses_kv() {
         let (provider, backend, hp) = synthetic_setup();
         let cfg = baseline_config(64);
-        let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let mut session = Session::new(cfg, hp, sampling).unwrap();
         let base = vec![0u32, 1, 2];
         session.extend(&base, &backend, &provider).unwrap();
@@ -1617,7 +1685,12 @@ mod tests {
         // Suffix below the default threshold -- single-token decode path.
         let extended = vec![0u32, 1, 2, 3, 4];
         let r = session
-            .extend_with_cache(&extended, &backend, &provider, Session::DEFAULT_SUFFIX_THRESHOLD)
+            .extend_with_cache(
+                &extended,
+                &backend,
+                &provider,
+                Session::DEFAULT_SUFFIX_THRESHOLD,
+            )
             .unwrap();
         assert_eq!(r.reused_prefix_len, base.len());
         assert_eq!(r.suffix_len, extended.len() - base.len());
@@ -1634,14 +1707,23 @@ mod tests {
     fn session_extend_with_cache_divergence_rolls_back() {
         let (provider, backend, hp) = synthetic_setup();
         let cfg = baseline_config(64);
-        let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let mut session = Session::new(cfg, hp, sampling).unwrap();
         let original = vec![0u32, 1, 2, 3, 4];
         session.extend(&original, &backend, &provider).unwrap();
 
         let diverged = vec![0u32, 1, 2, 9, 8];
         let r = session
-            .extend_with_cache(&diverged, &backend, &provider, Session::DEFAULT_SUFFIX_THRESHOLD)
+            .extend_with_cache(
+                &diverged,
+                &backend,
+                &provider,
+                Session::DEFAULT_SUFFIX_THRESHOLD,
+            )
             .unwrap();
         // Naive backend has no GDN, so divergence is recoverable: common = 3,
         // suffix = 2.
@@ -1662,19 +1744,30 @@ mod tests {
         let threshold = 3usize;
 
         // Path A: suffix below threshold -> single-token decode.
-        let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let mut session_a = Session::new(cfg.clone(), hp, sampling.clone()).unwrap();
-        session_a.extend(&[0u32, 1, 2], &backend, &provider).unwrap();
+        session_a
+            .extend(&[0u32, 1, 2], &backend, &provider)
+            .unwrap();
         let extended_short = vec![0u32, 1, 2, 3, 4]; // suffix = 2 < threshold
         let r_a = session_a
             .extend_with_cache(&extended_short, &backend, &provider, threshold)
             .unwrap();
-        assert!(r_a.used_single_token_path, "suffix < threshold must use decode path");
+        assert!(
+            r_a.used_single_token_path,
+            "suffix < threshold must use decode path"
+        );
 
         // Path B: suffix == threshold -> batched prefill path (if backend supports it).
         let (provider2, backend2, hp2) = synthetic_setup();
         let mut session_b = Session::new(cfg, hp2, sampling).unwrap();
-        session_b.extend(&[0u32, 1, 2], &backend2, &provider2).unwrap();
+        session_b
+            .extend(&[0u32, 1, 2], &backend2, &provider2)
+            .unwrap();
         let extended_long = vec![0u32, 1, 2, 3, 4, 5]; // suffix = 3 == threshold
         let r_b = session_b
             .extend_with_cache(&extended_long, &backend2, &provider2, threshold)
@@ -1682,7 +1775,10 @@ mod tests {
         // The naive backend has batched_prefill = false, so it also goes via
         // forward_pass per token; the spec is that we did NOT explicitly take
         // the "single-token decode" early-exit.
-        assert!(!r_b.used_single_token_path, "suffix >= threshold must skip early-exit");
+        assert!(
+            !r_b.used_single_token_path,
+            "suffix >= threshold must skip early-exit"
+        );
     }
 
     // ---- validate_backend tests --------------------------------------
@@ -1691,12 +1787,7 @@ mod tests {
     fn validate_backend_accepts_f32_on_cpu_naive() {
         // CPU naive backend supports both F32 and F16 (default trait impl).
         let (_, backend, hp) = synthetic_setup();
-        let session = Session::new(
-            baseline_config(64),
-            hp,
-            SamplingParams::default(),
-        )
-        .unwrap();
+        let session = Session::new(baseline_config(64), hp, SamplingParams::default()).unwrap();
         assert!(session.validate_backend(&backend).is_ok());
     }
 
@@ -1751,7 +1842,9 @@ mod tests {
         };
         let mut session = Session::new(cfg, hp, SamplingParams::default()).unwrap();
         // First prompt fits.
-        session.extend(&[0u32, 1, 2, 3], &backend, &provider).unwrap();
+        session
+            .extend(&[0u32, 1, 2, 3], &backend, &provider)
+            .unwrap();
         // Second extend would push total past max_seq_len.
         let next = vec![4u32, 5, 6, 7, 8];
         let result = session.extend(&next, &backend, &provider);
@@ -1804,7 +1897,10 @@ mod tests {
         assert!(result.is_err());
         match result {
             Err(RuntimeError::Unsupported(msg)) => {
-                assert!(msg.contains("Int8"), "error message should mention precision: {msg}");
+                assert!(
+                    msg.contains("Int8"),
+                    "error message should mention precision: {msg}"
+                );
             }
             Err(other) => panic!("expected Unsupported, got {other:?}"),
             Ok(()) => panic!("expected error, got Ok"),
@@ -1821,7 +1917,11 @@ mod tests {
     fn extend_with_cache_empty_prompt_is_noop_on_warm_session() {
         let (provider, backend, hp) = synthetic_setup();
         let config = baseline_config(64);
-        let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let mut session = Session::new(config, hp, sampling).unwrap();
         let prompt = vec![0u32, 1, 2, 3];
         session.extend(&prompt, &backend, &provider).unwrap();
@@ -1847,8 +1947,8 @@ mod tests {
         let config = baseline_config(64);
         let sampling = SamplingParams::default();
         let mut session = Session::new(config, hp, sampling).unwrap();
-        let r = session
-            .extend_with_cache(&[], &backend, &provider, Session::DEFAULT_SUFFIX_THRESHOLD);
+        let r =
+            session.extend_with_cache(&[], &backend, &provider, Session::DEFAULT_SUFFIX_THRESHOLD);
         assert!(r.is_err());
         let msg = format!("{}", r.unwrap_err());
         assert!(
@@ -1956,7 +2056,11 @@ mod tests {
     fn extend_with_cache_strict_passes_on_clean_prefill() {
         let (provider, backend, hp) = synthetic_setup();
         let config = baseline_config(64);
-        let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let mut session = Session::new(config.clone(), hp, sampling.clone()).unwrap();
         let prompt = vec![0u32, 1, 2, 3, 4, 5, 6, 7];
         let cfg2 = config.clone();
@@ -1969,7 +2073,10 @@ mod tests {
             Session::DEFAULT_SUFFIX_THRESHOLD,
             || Session::new(cfg2.clone(), hp2, samp2.clone()),
         );
-        assert!(r.is_ok(), "strict check must pass on bit-exact CPU path: {r:?}");
+        assert!(
+            r.is_ok(),
+            "strict check must pass on bit-exact CPU path: {r:?}"
+        );
         let result = r.unwrap();
         // Cold path: full prompt processed, no reuse (fresh session).
         assert!(result.fell_back_to_cold);
@@ -2030,7 +2137,11 @@ mod tests {
     fn session_save_load_round_trip_cpu_naive() {
         let (provider, backend, hp) = synthetic_setup();
         let config = baseline_config(64);
-        let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let mut session = Session::new(config.clone(), hp, sampling.clone()).unwrap();
         let prompt = vec![0u32, 1, 2, 3];
         session.extend(&prompt, &backend, &provider).unwrap();
@@ -2083,7 +2194,11 @@ mod tests {
     fn session_load_rejects_fingerprint_mismatch() {
         let (provider, backend, hp) = synthetic_setup();
         let config = baseline_config(64);
-        let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let mut session = Session::new(config.clone(), hp, sampling.clone()).unwrap();
         let prompt = vec![0u32, 1, 2];
         session.extend(&prompt, &backend, &provider).unwrap();
@@ -2132,7 +2247,11 @@ mod tests {
     fn session_save_is_idempotent() {
         let (provider, backend, hp) = synthetic_setup();
         let config = baseline_config(64);
-        let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let mut session = Session::new(config, hp, sampling).unwrap();
         let prompt = vec![5u32, 6, 7];
         session.extend(&prompt, &backend, &provider).unwrap();
@@ -2183,7 +2302,11 @@ mod tests {
     fn empty_suffix_strict_prefix_returns_ok() {
         let (provider, backend, hp) = synthetic_setup();
         let cfg = baseline_config(64);
-        let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let mut session = Session::new(cfg, hp, sampling).unwrap();
 
         // Prior prompt + 2 generated tokens (simulated by extend + 2 next_token).
@@ -2192,17 +2315,29 @@ mod tests {
         let _ = session.next_token(&backend, &provider).unwrap();
         let _ = session.next_token(&backend, &provider).unwrap();
         let prior_len = session.token_count();
-        assert!(prior_len > prompt.len(), "test setup must extend past prompt");
+        assert!(
+            prior_len > prompt.len(),
+            "test setup must extend past prompt"
+        );
 
         // Now resubmit the bare prompt -- empty-suffix Case 3.
         let r = session
-            .extend_with_cache(&prompt, &backend, &provider, Session::DEFAULT_SUFFIX_THRESHOLD)
+            .extend_with_cache(
+                &prompt,
+                &backend,
+                &provider,
+                Session::DEFAULT_SUFFIX_THRESHOLD,
+            )
             .expect("empty-suffix path must return Ok, not panic");
         // The fix re-runs the last prompt token's forward pass so the
         // post-state matches a cold-prefill state exactly. That means
         // `reused_prefix_len = common - 1` (we rolled back one) and
         // `processed_tokens = 1` (we re-ran that token).
-        assert_eq!(r.reused_prefix_len, prompt.len() - 1, "rolled back one position");
+        assert_eq!(
+            r.reused_prefix_len,
+            prompt.len() - 1,
+            "rolled back one position"
+        );
         assert_eq!(r.suffix_len, 0, "suffix is empty");
         assert_eq!(r.processed_tokens, 1, "redid the last prompt token");
         assert!(!r.fell_back_to_cold, "did not cold-restart");
@@ -2222,7 +2357,11 @@ mod tests {
     fn empty_suffix_repeated_resubmissions_no_panic() {
         let (provider, backend, hp) = synthetic_setup();
         let cfg = baseline_config(64);
-        let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let mut session = Session::new(cfg, hp, sampling).unwrap();
         let prompt = vec![0u32, 1, 2, 3];
         session.extend(&prompt, &backend, &provider).unwrap();
@@ -2243,7 +2382,10 @@ mod tests {
             assert_eq!(r.suffix_len, 0, "cycle {cycle}: suffix must be empty");
             // the fix re-runs the last prompt token's forward
             // pass to match cold-prefill semantics, so processed_tokens == 1.
-            assert_eq!(r.processed_tokens, 1, "cycle {cycle}: redid last prompt token");
+            assert_eq!(
+                r.processed_tokens, 1,
+                "cycle {cycle}: redid last prompt token"
+            );
             assert_eq!(session.tokens(), &prompt[..], "cycle {cycle}: tokens reset");
         }
     }
@@ -2259,7 +2401,11 @@ mod tests {
     fn empty_suffix_next_token_matches_cold_prefill() {
         let (provider, backend, hp) = synthetic_setup();
         let cfg = baseline_config(64);
-        let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let prompt = vec![0u32, 1, 2, 3];
 
         // Reference: cold prefill, then sample 4 tokens.
@@ -2279,7 +2425,12 @@ mod tests {
         let _ = warm_session.next_token(&backend2, &provider2).unwrap();
         let _ = warm_session.next_token(&backend2, &provider2).unwrap();
         warm_session
-            .extend_with_cache(&prompt, &backend2, &provider2, Session::DEFAULT_SUFFIX_THRESHOLD)
+            .extend_with_cache(
+                &prompt,
+                &backend2,
+                &provider2,
+                Session::DEFAULT_SUFFIX_THRESHOLD,
+            )
             .unwrap();
         // NB: the warm path has consumed 2 RNG samples that the cold path
         // hasn't; with temperature=0 argmax sampling neither path consumes

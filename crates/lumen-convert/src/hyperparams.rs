@@ -2,8 +2,8 @@
 
 use crate::convert::ConvertError;
 use crate::gguf::GgufFile;
+use crate::tensor_io::{expert_tensor_name, layer_tensor_name};
 use crate::tensor_names::*;
-use crate::tensor_io::{layer_tensor_name, expert_tensor_name};
 use lumen_format::hyperparams::{GdnDims, ModelHyperparams, RopeParams, RopeScalingType};
 use lumen_format::quantization::{QuantGroupSize, QuantScheme, QuantizationDescriptor};
 
@@ -16,7 +16,9 @@ fn get_required_u32(gguf: &GgufFile, key: &str) -> Result<u32, ConvertError> {
         .ok_or_else(|| ConvertError::MissingMetadata(key.to_string()))
 }
 
-pub(crate) fn extract_hyperparams(gguf: &GgufFile) -> Result<(ModelHyperparams, String), ConvertError> {
+pub(crate) fn extract_hyperparams(
+    gguf: &GgufFile,
+) -> Result<(ModelHyperparams, String), ConvertError> {
     let arch = gguf
         .get_string("general.architecture")
         .ok_or_else(|| ConvertError::MissingMetadata("general.architecture".into()))?
@@ -79,7 +81,9 @@ pub(crate) fn extract_hyperparams(gguf: &GgufFile) -> Result<(ModelHyperparams, 
     // Dense models use feed_forward_length. Try both, preferring expert_feed_forward_length
     // for MoE models so that if BOTH fields exist, we get the per-expert (not shared-expert) dim.
     let num_experts_hint = gguf.get_u32(&format!("{prefix}.expert_count")).is_some()
-        || gguf.get_u32(&format!("{prefix}.expert_feed_forward_length")).is_some();
+        || gguf
+            .get_u32(&format!("{prefix}.expert_feed_forward_length"))
+            .is_some();
     let intermediate_dim = if num_experts_hint {
         gguf.get_u32(&format!("{prefix}.expert_feed_forward_length"))
             .or_else(|| gguf.get_u32(&format!("{prefix}.feed_forward_length")))
@@ -124,12 +128,14 @@ pub(crate) fn extract_hyperparams(gguf: &GgufFile) -> Result<(ModelHyperparams, 
 
     // Partial RoPE: some models (e.g. Qwen3.5) only rotate a subset of head dimensions.
     // GGUF key: {arch}.rope.dimension_count. None/0 = full head_dim (most models).
-    let rotary_dim = gguf.get_u32(&format!("{prefix}.rope.dimension_count"))
+    let rotary_dim = gguf
+        .get_u32(&format!("{prefix}.rope.dimension_count"))
         .filter(|&v| v > 0 && v < head_dim);
     if let Some(d) = rotary_dim {
         if d > 255 {
-            return Err(ConvertError::MissingMetadata(
-                format!("{prefix}.rope.dimension_count={d} exceeds u8 wire limit (255)")));
+            return Err(ConvertError::MissingMetadata(format!(
+                "{prefix}.rope.dimension_count={d} exceeds u8 wire limit (255)"
+            )));
         }
     }
 
@@ -180,7 +186,10 @@ pub(crate) fn extract_hyperparams(gguf: &GgufFile) -> Result<(ModelHyperparams, 
         num_active_experts,
         norm_eps,
         rotary_dim,
-        rope_neox: matches!(arch.as_str(), "qwen35" | "qwen35moe" | "qwen3_5_moe" | "qwen3.5_moe"),
+        rope_neox: matches!(
+            arch.as_str(),
+            "qwen35" | "qwen35moe" | "qwen3_5_moe" | "qwen3.5_moe"
+        ),
         gdn,
     };
 
@@ -241,8 +250,7 @@ fn real_main_layer_count(gguf: &GgufFile) -> Option<u32> {
             // consecutively so we can't safely extend past a missing layer.
             break;
         };
-        let has_attn = suffixes.contains("attn_q.weight")
-            || suffixes.contains("attn_qkv.weight");
+        let has_attn = suffixes.contains("attn_q.weight") || suffixes.contains("attn_qkv.weight");
         let has_nextn = suffixes.iter().any(|s| s.starts_with("nextn."));
         if !has_attn || has_nextn {
             break;
@@ -265,7 +273,15 @@ pub(crate) fn detect_quant_scheme(gguf: &GgufFile, num_layers: u32) -> QuantSche
     }
 
     // Check the first layer's attention Q weight as representative
-    let weight_suffixes = [ATTN_Q, ATTN_K, ATTN_V, ATTN_OUTPUT, FFN_GATE, FFN_UP, FFN_DOWN];
+    let weight_suffixes = [
+        ATTN_Q,
+        ATTN_K,
+        ATTN_V,
+        ATTN_OUTPUT,
+        FFN_GATE,
+        FFN_UP,
+        FFN_DOWN,
+    ];
 
     for suffix in &weight_suffixes {
         let name = layer_tensor_name(0, suffix);

@@ -101,10 +101,7 @@ impl MessagesRequest {
     /// other explicit value to `Some(false)`, and an absent `thinking` field to
     /// `None` (defer to env/default).
     pub fn resolve_thinking(&self) -> bool {
-        let per_request = self
-            .thinking
-            .as_ref()
-            .map(|t| t.thinking_type == "enabled");
+        let per_request = self.thinking.as_ref().map(|t| t.thinking_type == "enabled");
         super::resolve_enable_thinking(per_request)
     }
 
@@ -201,7 +198,9 @@ fn render_prompt(
     // off — the default — so this path is byte-identical to before). See
     // render_chat_prompt in wire/openai.rs for the full rationale.
     prompt.push_str("<|im_start|>assistant\n");
-    prompt.push_str(lumen_runtime::runtime_defaults::think_prompt_tail(enable_thinking));
+    prompt.push_str(lumen_runtime::runtime_defaults::think_prompt_tail(
+        enable_thinking,
+    ));
     Ok(prompt)
 }
 
@@ -271,9 +270,7 @@ fn partition_tool_use_blocks(
     match content {
         // No typed blocks possible in a string/null: reuse the shared text
         // flattener verbatim (also enforces ROBUST-007 on scalars).
-        Value::String(_) | Value::Null => {
-            Ok((super::flatten_content(content, param)?, Vec::new()))
-        }
+        Value::String(_) | Value::Null => Ok((super::flatten_content(content, param)?, Vec::new())),
         Value::Array(arr) => {
             let mut text = String::new();
             let mut tool_uses = Vec::new();
@@ -326,9 +323,7 @@ fn partition_tool_result_blocks(
     param: &str,
 ) -> Result<(String, Vec<String>), ServerError> {
     match content {
-        Value::String(_) | Value::Null => {
-            Ok((super::flatten_content(content, param)?, Vec::new()))
-        }
+        Value::String(_) | Value::Null => Ok((super::flatten_content(content, param)?, Vec::new())),
         Value::Array(arr) => {
             let mut text = String::new();
             let mut tool_results = Vec::new();
@@ -380,10 +375,12 @@ fn sse_event(event: &str, payload: &str) -> Vec<u8> {
 
 fn body_from_byte_stream(rx: mpsc::Receiver<Vec<u8>>) -> Body {
     let stream = futures::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|chunk| (
-            Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(chunk)),
-            rx,
-        ))
+        rx.recv().await.map(|chunk| {
+            (
+                Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(chunk)),
+                rx,
+            )
+        })
     });
     Body::from_stream(stream)
 }
@@ -406,9 +403,14 @@ async fn drive_messages_stream(
     thinking: bool,
     stop: Vec<String>,
 ) {
-    let msg_id = format!("msg_lumen_{:x}-{:x}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64).unwrap_or(0), super::next_response_seq());
+    let msg_id = format!(
+        "msg_lumen_{:x}-{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0),
+        super::next_response_seq()
+    );
     let mut emitter = SseSafeEmitter::new(thinking);
     // F4: seed the streaming stop matcher from `stop_sequences`. Empty =>
     // verbatim passthrough (byte-identical); see the OpenAI `drive_chat_stream`
@@ -438,7 +440,11 @@ async fn drive_messages_stream(
             "usage": { "input_tokens": 0, "output_tokens": 0 }
         }
     });
-    if tx.send(sse_event("message_start", &start.to_string())).await.is_err() {
+    if tx
+        .send(sse_event("message_start", &start.to_string()))
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -457,7 +463,11 @@ async fn drive_messages_stream(
                             "index": block_count,
                             "content_block": { "type": "thinking", "thinking": "" }
                         });
-                        if tx.send(sse_event("content_block_start", &b.to_string())).await.is_err() {
+                        if tx
+                            .send(sse_event("content_block_start", &b.to_string()))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                         thinking_block_open = true;
@@ -467,7 +477,11 @@ async fn drive_messages_stream(
                         "index": block_count,
                         "delta": { "type": "thinking_delta", "thinking": delta.reasoning }
                     });
-                    if tx.send(sse_event("content_block_delta", &d.to_string())).await.is_err() {
+                    if tx
+                        .send(sse_event("content_block_delta", &d.to_string()))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -476,7 +490,11 @@ async fn drive_messages_stream(
                     // The reasoning block (if any) must close before answer text.
                     if thinking_block_open {
                         let s = json!({ "type": "content_block_stop", "index": block_count });
-                        if tx.send(sse_event("content_block_stop", &s.to_string())).await.is_err() {
+                        if tx
+                            .send(sse_event("content_block_stop", &s.to_string()))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                         thinking_block_open = false;
@@ -489,7 +507,11 @@ async fn drive_messages_stream(
                             "index": block_count,
                             "content_block": { "type": "text", "text": "" }
                         });
-                        if tx.send(sse_event("content_block_start", &b.to_string())).await.is_err() {
+                        if tx
+                            .send(sse_event("content_block_start", &b.to_string()))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                         text_block_open = true;
@@ -499,7 +521,11 @@ async fn drive_messages_stream(
                         "index": block_count,
                         "delta": { "type": "text_delta", "text": safe_text }
                     });
-                    if tx.send(sse_event("content_block_delta", &d.to_string())).await.is_err() {
+                    if tx
+                        .send(sse_event("content_block_delta", &d.to_string()))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -508,7 +534,11 @@ async fn drive_messages_stream(
                     // (reasoning precedes all answer content).
                     if thinking_block_open {
                         let s = json!({ "type": "content_block_stop", "index": block_count });
-                        if tx.send(sse_event("content_block_stop", &s.to_string())).await.is_err() {
+                        if tx
+                            .send(sse_event("content_block_stop", &s.to_string()))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                         thinking_block_open = false;
@@ -517,7 +547,11 @@ async fn drive_messages_stream(
                     // Close any open text block before opening the tool block.
                     if text_block_open {
                         let s = json!({ "type": "content_block_stop", "index": block_count });
-                        if tx.send(sse_event("content_block_stop", &s.to_string())).await.is_err() {
+                        if tx
+                            .send(sse_event("content_block_stop", &s.to_string()))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                         text_block_open = false;
@@ -534,7 +568,11 @@ async fn drive_messages_stream(
                             "input": {},
                         }
                     });
-                    if tx.send(sse_event("content_block_start", &start_block.to_string())).await.is_err() {
+                    if tx
+                        .send(sse_event("content_block_start", &start_block.to_string()))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     // Emit the JSON arguments as a single input_json_delta.
@@ -543,11 +581,19 @@ async fn drive_messages_stream(
                         "index": idx,
                         "delta": { "type": "input_json_delta", "partial_json": tc.arguments_json }
                     });
-                    if tx.send(sse_event("content_block_delta", &d.to_string())).await.is_err() {
+                    if tx
+                        .send(sse_event("content_block_delta", &d.to_string()))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     let stop_block = json!({ "type": "content_block_stop", "index": idx });
-                    if tx.send(sse_event("content_block_stop", &stop_block.to_string())).await.is_err() {
+                    if tx
+                        .send(sse_event("content_block_stop", &stop_block.to_string()))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     block_count += 1;
@@ -559,14 +605,19 @@ async fn drive_messages_stream(
                     break;
                 }
             }
-            TokenEvent::Done { finish_reason: fr, prompt_tokens, completion_tokens } => {
+            TokenEvent::Done {
+                finish_reason: fr,
+                prompt_tokens,
+                completion_tokens,
+            } => {
                 finish_reason = Some(fr);
                 input_tokens = prompt_tokens;
                 output_tokens = completion_tokens;
                 break;
             }
             TokenEvent::Error(msg) => {
-                let err = json!({"type": "error", "error": { "type": "api_error", "message": msg }});
+                let err =
+                    json!({"type": "error", "error": { "type": "api_error", "message": msg }});
                 let _ = tx.send(sse_event("error", &err.to_string())).await;
                 return;
             }
@@ -583,7 +634,9 @@ async fn drive_messages_stream(
                 "index": block_count,
                 "content_block": { "type": "thinking", "thinking": "" }
             });
-            let _ = tx.send(sse_event("content_block_start", &b.to_string())).await;
+            let _ = tx
+                .send(sse_event("content_block_start", &b.to_string()))
+                .await;
             thinking_block_open = true;
         }
         let d = json!({
@@ -591,7 +644,9 @@ async fn drive_messages_stream(
             "index": block_count,
             "delta": { "type": "thinking_delta", "thinking": residual.reasoning }
         });
-        let _ = tx.send(sse_event("content_block_delta", &d.to_string())).await;
+        let _ = tx
+            .send(sse_event("content_block_delta", &d.to_string()))
+            .await;
     }
     // Drop the residual answer text once a stop sequence fired (post-stop
     // content); otherwise route the emitter residual through the stop matcher
@@ -614,7 +669,9 @@ async fn drive_messages_stream(
         // Close the reasoning block before residual answer text.
         if thinking_block_open {
             let s = json!({ "type": "content_block_stop", "index": block_count });
-            let _ = tx.send(sse_event("content_block_stop", &s.to_string())).await;
+            let _ = tx
+                .send(sse_event("content_block_stop", &s.to_string()))
+                .await;
             thinking_block_open = false;
             block_count += 1;
         }
@@ -624,7 +681,9 @@ async fn drive_messages_stream(
                 "index": block_count,
                 "content_block": { "type": "text", "text": "" }
             });
-            let _ = tx.send(sse_event("content_block_start", &b.to_string())).await;
+            let _ = tx
+                .send(sse_event("content_block_start", &b.to_string()))
+                .await;
             text_block_open = true;
         }
         let d = json!({
@@ -632,12 +691,16 @@ async fn drive_messages_stream(
             "index": block_count,
             "delta": { "type": "text_delta", "text": final_text }
         });
-        let _ = tx.send(sse_event("content_block_delta", &d.to_string())).await;
+        let _ = tx
+            .send(sse_event("content_block_delta", &d.to_string()))
+            .await;
     }
     // Close whichever block is still open (thinking-only reply, or text).
     if thinking_block_open || text_block_open {
         let s = json!({ "type": "content_block_stop", "index": block_count });
-        let _ = tx.send(sse_event("content_block_stop", &s.to_string())).await;
+        let _ = tx
+            .send(sse_event("content_block_stop", &s.to_string()))
+            .await;
     }
     let reason = finish_reason.unwrap_or(FinishReason::Stop);
     let delta_msg = json!({
@@ -648,8 +711,12 @@ async fn drive_messages_stream(
         },
         "usage": { "output_tokens": output_tokens, "input_tokens": input_tokens }
     });
-    let _ = tx.send(sse_event("message_delta", &delta_msg.to_string())).await;
-    let _ = tx.send(sse_event("message_stop", "{\"type\":\"message_stop\"}")).await;
+    let _ = tx
+        .send(sse_event("message_delta", &delta_msg.to_string()))
+        .await;
+    let _ = tx
+        .send(sse_event("message_stop", "{\"type\":\"message_stop\"}"))
+        .await;
 }
 
 // ----------------------------- Non-streaming ----------------------------
@@ -696,7 +763,11 @@ pub async fn collect_messages(
                     break;
                 }
             }
-            TokenEvent::Done { finish_reason, prompt_tokens: p, completion_tokens: c } => {
+            TokenEvent::Done {
+                finish_reason,
+                prompt_tokens: p,
+                completion_tokens: c,
+            } => {
                 finish = finish_reason;
                 prompt_tokens = p;
                 completion_tokens = c;
@@ -759,15 +830,15 @@ mod tests {
     use super::*;
 
     fn tok(text: &str) -> TokenEvent {
-        TokenEvent::Token { token_id: 0, delta_text: text.to_string() }
+        TokenEvent::Token {
+            token_id: 0,
+            delta_text: text.to_string(),
+        }
     }
 
     /// Build an unpooled `JobResponseChannel` from a fixed event list (mirrors
     /// the OpenAI `collect_chat_from_events` helper).
-    async fn collect_messages_from_events(
-        events: Vec<TokenEvent>,
-        thinking: bool,
-    ) -> Value {
+    async fn collect_messages_from_events(events: Vec<TokenEvent>, thinking: bool) -> Value {
         collect_messages_from_events_with_stop(events, thinking, Vec::new()).await
     }
 
@@ -783,11 +854,16 @@ mod tests {
         }
         drop(tx);
         let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
-        collect_messages(pooled, "test".into(), thinking, stop).await.unwrap()
+        collect_messages(pooled, "test".into(), thinking, stop)
+            .await
+            .unwrap()
     }
 
     fn user(text: &str) -> AnthropicMessage {
-        AnthropicMessage { role: "user".into(), content: Value::String(text.into()) }
+        AnthropicMessage {
+            role: "user".into(),
+            content: Value::String(text.into()),
+        }
     }
 
     #[test]
@@ -822,14 +898,27 @@ mod tests {
         // type=="enabled" -> true; type=="disabled" -> false. Absent -> env/
         // default (false here, no env set in the test process).
         let enabled = MessagesRequest {
-            model: "m".into(), messages: vec![], max_tokens: 1, system: None,
-            temperature: None, top_p: None, top_k: None, stream: None,
-            stop_sequences: vec![], tools: vec![],
-            thinking: Some(ThinkingConfig { thinking_type: "enabled".into(), budget_tokens: None }),
+            model: "m".into(),
+            messages: vec![],
+            max_tokens: 1,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stream: None,
+            stop_sequences: vec![],
+            tools: vec![],
+            thinking: Some(ThinkingConfig {
+                thinking_type: "enabled".into(),
+                budget_tokens: None,
+            }),
         };
         assert!(enabled.resolve_thinking());
         let disabled = MessagesRequest {
-            thinking: Some(ThinkingConfig { thinking_type: "disabled".into(), budget_tokens: None }),
+            thinking: Some(ThinkingConfig {
+                thinking_type: "disabled".into(),
+                budget_tokens: None,
+            }),
             ..enabled.clone()
         };
         assert!(!disabled.resolve_thinking());
@@ -841,7 +930,11 @@ mod tests {
         // when the model literally emits </think>.
         let events = vec![
             tok("answer </think> still answer"),
-            TokenEvent::Done { finish_reason: FinishReason::Stop, prompt_tokens: 1, completion_tokens: 4 },
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 4,
+            },
         ];
         let resp = collect_messages_from_events(events, false).await;
         let blocks = resp["content"].as_array().unwrap();
@@ -855,7 +948,11 @@ mod tests {
     async fn collect_messages_thinking_on_emits_thinking_block_before_text() {
         let events = vec![
             tok("reasoning here</think>The answer."),
-            TokenEvent::Done { finish_reason: FinishReason::Stop, prompt_tokens: 1, completion_tokens: 5 },
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 5,
+            },
         ];
         let resp = collect_messages_from_events(events, true).await;
         let blocks = resp["content"].as_array().unwrap();
@@ -874,10 +971,13 @@ mod tests {
     async fn collect_messages_wire_stop_truncates_and_reports_stop_sequence() {
         let events = vec![
             tok("visible HALT hidden"),
-            TokenEvent::Done { finish_reason: FinishReason::Length, prompt_tokens: 1, completion_tokens: 3 },
+            TokenEvent::Done {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: 1,
+                completion_tokens: 3,
+            },
         ];
-        let resp =
-            collect_messages_from_events_with_stop(events, false, vec!["HALT".into()]).await;
+        let resp = collect_messages_from_events_with_stop(events, false, vec!["HALT".into()]).await;
         let blocks = resp["content"].as_array().unwrap();
         assert_eq!(blocks[0]["type"], "text");
         assert_eq!(blocks[0]["text"], "visible ");
@@ -893,11 +993,18 @@ mod tests {
         let full = "visible HALT hidden";
         let events = vec![
             tok(full),
-            TokenEvent::Done { finish_reason: FinishReason::Length, prompt_tokens: 1, completion_tokens: 3 },
+            TokenEvent::Done {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: 1,
+                completion_tokens: 3,
+            },
         ];
         let resp = collect_messages_from_events_with_stop(events, false, Vec::new()).await;
         let blocks = resp["content"].as_array().unwrap();
-        assert_eq!(blocks[0]["text"], full, "empty stop passes full text through verbatim");
+        assert_eq!(
+            blocks[0]["text"], full,
+            "empty stop passes full text through verbatim"
+        );
         assert_eq!(resp["stop_reason"], "max_tokens");
     }
 
@@ -907,10 +1014,13 @@ mod tests {
         let events = vec![
             tok("alpha HA"),
             tok("LT omega"),
-            TokenEvent::Done { finish_reason: FinishReason::Length, prompt_tokens: 1, completion_tokens: 4 },
+            TokenEvent::Done {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: 1,
+                completion_tokens: 4,
+            },
         ];
-        let resp =
-            collect_messages_from_events_with_stop(events, false, vec!["HALT".into()]).await;
+        let resp = collect_messages_from_events_with_stop(events, false, vec!["HALT".into()]).await;
         let blocks = resp["content"].as_array().unwrap();
         assert_eq!(blocks[0]["text"], "alpha ");
         assert_eq!(resp["stop_reason"], "stop_sequence");
@@ -927,8 +1037,8 @@ mod tests {
             "top_p": 0.9,
             "top_k": 50
         });
-        let req: MessagesRequest = serde_json::from_value(body)
-            .expect("Anthropic top_p/top_k must deserialize, not 400");
+        let req: MessagesRequest =
+            serde_json::from_value(body).expect("Anthropic top_p/top_k must deserialize, not 400");
         assert_eq!(req.top_p, Some(0.9));
         assert_eq!(req.top_k, Some(50));
     }
@@ -1026,11 +1136,23 @@ mod tests {
             },
         ];
         let out = render_prompt("", &messages, false).unwrap();
-        assert!(out.contains("<tool_call>"), "tool_use must render a tool_call: {out}");
+        assert!(
+            out.contains("<tool_call>"),
+            "tool_use must render a tool_call: {out}"
+        );
         assert!(out.contains("get_weather"), "tool name present");
         // `input` object serializes COMPACT via serde_json::Value::to_string().
-        assert!(out.contains("{\"city\":\"Paris\"}"), "input serialized as compact arguments");
-        assert!(out.contains("<tool_response>"), "tool_result must render a tool_response");
-        assert!(out.contains("{\"temp\": 18}"), "tool result content present");
+        assert!(
+            out.contains("{\"city\":\"Paris\"}"),
+            "input serialized as compact arguments"
+        );
+        assert!(
+            out.contains("<tool_response>"),
+            "tool_result must render a tool_response"
+        );
+        assert!(
+            out.contains("{\"temp\": 18}"),
+            "tool result content present"
+        );
     }
 }

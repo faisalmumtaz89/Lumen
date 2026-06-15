@@ -130,9 +130,7 @@ fn compute_chunk_range(
     let total_pairs = total_rows / 2;
     let odd_tail = total_rows % 2; // 0 or 1
 
-    let (pair_start, pair_end) = compute_pair_range(
-        thread_id, total_threads, total_pairs, n_fast,
-    );
+    let (pair_start, pair_end) = compute_pair_range(thread_id, total_threads, total_pairs, n_fast);
 
     let start = pair_start * 2;
     let mut end = pair_end * 2;
@@ -209,7 +207,7 @@ impl ThreadPool {
     pub fn new(num_threads: usize) -> Self {
         let num_threads = num_threads.max(1);
         let total_threads = num_threads + 1; // workers + caller
-        // Clamp n_fast to total_threads (can't have more fast cores than threads).
+                                             // Clamp n_fast to total_threads (can't have more fast cores than threads).
         let n_fast = N_FAST_CORES.min(total_threads);
 
         let shared = Arc::new(SharedState {
@@ -340,7 +338,9 @@ impl ThreadPool {
             work.asymmetric = true;
             work.generation += 1;
             // Atomic mirror: Release pairs with workers' Acquire load.
-            self.shared.generation.store(work.generation, Ordering::Release);
+            self.shared
+                .generation
+                .store(work.generation, Ordering::Release);
         }
         // Wake workers that fell through to condvar sleep.
         self.shared.work_ready.notify_all();
@@ -348,9 +348,8 @@ impl ThreadPool {
         // Caller thread does the last chunk while workers handle the first N chunks.
         // Workers are thread_ids 0..num_workers, caller is thread_id num_workers.
         let n_fast = self.shared.n_fast;
-        let (caller_start, caller_end) = compute_chunk_range(
-            num_workers, total_threads, total_rows, n_fast,
-        );
+        let (caller_start, caller_end) =
+            compute_chunk_range(num_workers, total_threads, total_rows, n_fast);
         if caller_start < caller_end {
             f(caller_start, caller_end);
         }
@@ -368,9 +367,13 @@ impl ThreadPool {
             } else {
                 // Fall back to condvar to avoid wasting CPU.
                 let guard = self.shared.work.lock().unwrap();
-                let _guard = self.shared.work_done.wait_while(guard, |_| {
-                    self.shared.remaining.load(Ordering::Acquire) != 0
-                }).unwrap();
+                let _guard = self
+                    .shared
+                    .work_done
+                    .wait_while(guard, |_| {
+                        self.shared.remaining.load(Ordering::Acquire) != 0
+                    })
+                    .unwrap();
                 break;
             }
         }
@@ -419,7 +422,9 @@ impl ThreadPool {
             work.total_rows = total_items;
             work.asymmetric = false;
             work.generation += 1;
-            self.shared.generation.store(work.generation, Ordering::Release);
+            self.shared
+                .generation
+                .store(work.generation, Ordering::Release);
         }
         self.shared.work_ready.notify_all();
 
@@ -427,9 +432,8 @@ impl ThreadPool {
         // parallel_for_heads uses symmetric partitioning (n_fast=0) because
         // attention heads are coarse-grained work items (typically 16-32),
         // and asymmetric splitting of discrete heads provides negligible benefit.
-        let (caller_start, caller_end) = compute_chunk_range(
-            num_workers, total_threads, total_items, 0,
-        );
+        let (caller_start, caller_end) =
+            compute_chunk_range(num_workers, total_threads, total_items, 0);
         if caller_start < caller_end {
             f(caller_start, caller_end);
         }
@@ -442,9 +446,13 @@ impl ThreadPool {
                 spins += 1;
             } else {
                 let guard = self.shared.work.lock().unwrap();
-                let _guard = self.shared.work_done.wait_while(guard, |_| {
-                    self.shared.remaining.load(Ordering::Acquire) != 0
-                }).unwrap();
+                let _guard = self
+                    .shared
+                    .work_done
+                    .wait_while(guard, |_| {
+                        self.shared.remaining.load(Ordering::Acquire) != 0
+                    })
+                    .unwrap();
                 break;
             }
         }
@@ -531,9 +539,7 @@ fn worker_loop(state: Arc<SharedState>, worker_id: usize) {
         // for matmul rows (parallel_for), symmetric for heads (parallel_for_heads).
         let total_threads = state.num_workers + 1; // workers + caller
         let n_fast = if asymmetric { state.n_fast } else { 0 };
-        let (start, end) = compute_chunk_range(
-            worker_id, total_threads, total_rows, n_fast,
-        );
+        let (start, end) = compute_chunk_range(worker_id, total_threads, total_rows, n_fast);
 
         // Reconstruct the closure from the type-erased pointer and call it.
         // SAFETY: fn_ptr is a pointer to `&dyn Fn(usize, usize)` on the caller's stack.
@@ -543,9 +549,8 @@ fn worker_loop(state: Arc<SharedState>, worker_id: usize) {
         // because F: Sync.
         if start < end {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let fn_ref: &dyn Fn(usize, usize) = unsafe {
-                    *(fn_ptr as *const &dyn Fn(usize, usize))
-                };
+                let fn_ref: &dyn Fn(usize, usize) =
+                    unsafe { *(fn_ptr as *const &dyn Fn(usize, usize)) };
                 fn_ref(start, end);
             }));
             if result.is_err() {
@@ -708,7 +713,9 @@ mod tests {
     unsafe impl Sync for TestSyncPtr {}
     impl TestSyncPtr {
         #[inline(always)]
-        fn ptr(self) -> *mut f32 { self.0 }
+        fn ptr(self) -> *mut f32 {
+            self.0
+        }
     }
 
     #[test]
@@ -795,7 +802,10 @@ mod tests {
                 let mut covered = vec![false; total_rows];
                 for tid in 0..total_threads {
                     let (start, end) = compute_chunk_range(tid, total_threads, total_rows, 0);
-                    assert!(start <= end, "start > end for tid={tid}, total={total_rows}, threads={total_threads}");
+                    assert!(
+                        start <= end,
+                        "start > end for tid={tid}, total={total_rows}, threads={total_threads}"
+                    );
                     assert!(end <= total_rows, "end > total for tid={tid}");
                     for i in start..end {
                         assert!(!covered[i], "row {i} covered twice (symmetric, total={total_rows}, threads={total_threads})");
@@ -815,10 +825,13 @@ mod tests {
         for total_rows in [1, 7, 10, 100, 1000, 1001, 2048, 5632] {
             for total_threads in [2, 3, 4, 5, 7, 10] {
                 for n_fast in [1, 2, 3, 4] {
-                    if n_fast >= total_threads { continue; }
+                    if n_fast >= total_threads {
+                        continue;
+                    }
                     let mut covered = vec![false; total_rows];
                     for tid in 0..total_threads {
-                        let (start, end) = compute_chunk_range(tid, total_threads, total_rows, n_fast);
+                        let (start, end) =
+                            compute_chunk_range(tid, total_threads, total_rows, n_fast);
                         assert!(start <= end, "start > end for tid={tid}, total={total_rows}, threads={total_threads}, n_fast={n_fast}");
                         assert!(end <= total_rows, "end > total for tid={tid}");
                         for i in start..end {

@@ -39,7 +39,11 @@ pub fn async_comparison_suite(model_dir: &Path, size: &str) -> Vec<BenchConfig> 
 
     let mut configs = Vec::new();
 
-    for &backend in &[BackendChoice::Sync, BackendChoice::Mmap, BackendChoice::AsyncSync] {
+    for &backend in &[
+        BackendChoice::Sync,
+        BackendChoice::Mmap,
+        BackendChoice::AsyncSync,
+    ] {
         let backend_name = match backend {
             BackendChoice::Sync => "sync",
             BackendChoice::Mmap => "mmap",
@@ -78,7 +82,11 @@ pub fn ssd_hypothesis_suite(model_dir: &Path, size: &str) -> Vec<BenchConfig> {
 
     let mut configs = Vec::new();
 
-    for &backend in &[BackendChoice::Sync, BackendChoice::Mmap, BackendChoice::AsyncSync] {
+    for &backend in &[
+        BackendChoice::Sync,
+        BackendChoice::Mmap,
+        BackendChoice::AsyncSync,
+    ] {
         let backend_name = match backend {
             BackendChoice::Sync => "sync",
             BackendChoice::Mmap => "mmap",
@@ -106,7 +114,9 @@ pub fn ssd_hypothesis_suite(model_dir: &Path, size: &str) -> Vec<BenchConfig> {
                         pipeline_mode: mode,
                         prefetch_distance: prefetch,
                         cold_start: cold,
-                        label: format!("{size}-{backend_name}-{mode_name}-{cold_name}-pf{prefetch}"),
+                        label: format!(
+                            "{size}-{backend_name}-{mode_name}-{cold_name}-pf{prefetch}"
+                        ),
                         ..Default::default()
                     });
                 }

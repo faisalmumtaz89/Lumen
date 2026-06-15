@@ -145,7 +145,9 @@ fn run_attention_kernel(
     .expect("Kernel launch failed");
 
     device.synchronize().expect("Synchronize failed");
-    device.dtoh_copy(&out_gpu).expect("Failed to download output")
+    device
+        .dtoh_copy(&out_gpu)
+        .expect("Failed to download output")
 }
 
 #[test]

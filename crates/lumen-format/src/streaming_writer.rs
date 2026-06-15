@@ -7,7 +7,9 @@ use crate::crc::crc32;
 use crate::header::{GlobalTensorRange, LbcHeader};
 use crate::index::LayerIndex;
 use crate::tokenizer::TokenizerSection;
-use crate::writer::{align_up, serialize_header, serialize_layer_indices, write_zeros, GlobalTensors};
+use crate::writer::{
+    align_up, serialize_header, serialize_layer_indices, write_zeros, GlobalTensors,
+};
 use std::io::{self, Write};
 
 /// Pre-computed shape for a single layer blob.
@@ -50,7 +52,8 @@ impl<W: Write> StreamingLbcWriter<W> {
                 io::ErrorKind::InvalidInput,
                 format!(
                     "layer_shapes.len()={} != header.num_layers={}",
-                    layer_shapes.len(), num_layers
+                    layer_shapes.len(),
+                    num_layers
                 ),
             ));
         }
@@ -58,14 +61,20 @@ impl<W: Write> StreamingLbcWriter<W> {
         let alignment: usize = header.alignment.try_into().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("alignment {} exceeds platform pointer size", header.alignment),
+                format!(
+                    "alignment {} exceeds platform pointer size",
+                    header.alignment
+                ),
             )
         })?;
 
         // --- Phase 1: compute layout (same as writer.rs) ---
         let header_bytes = serialize_header(header);
         let index_bytes = serialize_layer_indices(
-            &layer_shapes.iter().map(|s| s.index.clone()).collect::<Vec<_>>(),
+            &layer_shapes
+                .iter()
+                .map(|s| s.index.clone())
+                .collect::<Vec<_>>(),
         );
 
         let raw_prefix = header_bytes.len() + index_bytes.len();
@@ -111,7 +120,8 @@ impl<W: Write> StreamingLbcWriter<W> {
         }
 
         // Fix up layer indices
-        let mut fixed_indices: Vec<LayerIndex> = layer_shapes.iter().map(|s| s.index.clone()).collect();
+        let mut fixed_indices: Vec<LayerIndex> =
+            layer_shapes.iter().map(|s| s.index.clone()).collect();
         let mut layer_cursor = layers_start as u64;
         for (i, idx) in fixed_indices.iter_mut().enumerate() {
             idx.layer_offset_bytes = layer_cursor;
@@ -239,15 +249,17 @@ impl<W: Write> StreamingLbcWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reader::LbcFile;
-    use crate::test_model::{generate_test_model, TestModelConfig};
     use crate::hyperparams::{ModelHyperparams, RopeParams};
     use crate::index::{SubtensorOffsets, TensorSlice};
     use crate::quantization::{QuantGroupSize, QuantScheme, QuantizationDescriptor};
+    use crate::reader::LbcFile;
     use crate::rng::WeightRng;
+    use crate::test_model::{generate_test_model, TestModelConfig};
     use std::path::PathBuf;
 
-    fn make_test_layer_shape(config: &TestModelConfig) -> (LayerShape, impl Fn(&mut WeightRng) -> Vec<u8>) {
+    fn make_test_layer_shape(
+        config: &TestModelConfig,
+    ) -> (LayerShape, impl Fn(&mut WeightRng) -> Vec<u8>) {
         let hidden = config.hidden_dim as usize;
         let inter = config.intermediate_dim as usize;
         let heads = config.num_heads as usize;
@@ -267,7 +279,17 @@ mod tests {
         let attn_norm_n = hidden;
         let ffn_norm_n = hidden;
 
-        let sizes = [wq_n, wk_n, wv_n, wo_n, w_gate_n, w_up_n, w_down_n, attn_norm_n, ffn_norm_n];
+        let sizes = [
+            wq_n,
+            wk_n,
+            wv_n,
+            wo_n,
+            w_gate_n,
+            w_up_n,
+            w_down_n,
+            attn_norm_n,
+            ffn_norm_n,
+        ];
         let mut offset = 0u64;
         let mut slices = Vec::new();
         for &n in &sizes {
@@ -282,17 +304,35 @@ mod tests {
 
         let blob_size = offset;
         let subtensors = SubtensorOffsets {
-            wq: slices[0], wk: slices[1], wv: slices[2], wo: slices[3],
-            bq: None, bk: None, bv: None,
-            w_gate: slices[4], w_up: slices[5], w_down: slices[6],
-            attn_norm: slices[7], ffn_norm: slices[8],
+            wq: slices[0],
+            wk: slices[1],
+            wv: slices[2],
+            wo: slices[3],
+            bq: None,
+            bk: None,
+            bv: None,
+            w_gate: slices[4],
+            w_up: slices[5],
+            w_down: slices[6],
+            attn_norm: slices[7],
+            ffn_norm: slices[8],
             router_weight: None,
             experts: None,
-            shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-            attn_gate: None, attn_post_norm: None,
-            ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-            ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-            attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            ffn_gate_inp_shexp: None,
             layer_type: None,
         };
 
@@ -338,7 +378,11 @@ mod tests {
         let final_norm = rng.gen_norm_bytes(hidden);
         let output_proj = rng.gen_f32_bytes(vocab * hidden);
 
-        let globals = GlobalTensors { embedding, final_norm, output_proj };
+        let globals = GlobalTensors {
+            embedding,
+            final_norm,
+            output_proj,
+        };
 
         let (shape, gen_blob) = make_test_layer_shape(&config);
         let layer_shapes: Vec<LayerShape> = (0..config.num_layers).map(|_| shape.clone()).collect();
@@ -356,7 +400,8 @@ mod tests {
             num_experts: None,
             num_active_experts: None,
             norm_eps: 1e-5,
-            rotary_dim: None, rope_neox: false,
+            rotary_dim: None,
+            rope_neox: false,
             gdn: None,
         };
         let qd = QuantizationDescriptor {
@@ -368,7 +413,8 @@ mod tests {
         let header = LbcHeader::new(hp, qd);
 
         let mut out = Vec::new();
-        let mut sw = StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, None).unwrap();
+        let mut sw =
+            StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, None).unwrap();
         for _ in 0..config.num_layers {
             let blob = gen_blob(&mut rng);
             sw.write_layer(&blob).unwrap();
@@ -376,7 +422,10 @@ mod tests {
         sw.finish().unwrap();
 
         assert_eq!(out.len(), expected.len(), "size mismatch");
-        assert_eq!(out, expected, "streaming writer must produce identical bytes");
+        assert_eq!(
+            out, expected,
+            "streaming writer must produce identical bytes"
+        );
     }
 
     #[test]
@@ -419,7 +468,8 @@ mod tests {
             num_experts: None,
             num_active_experts: None,
             norm_eps: 1e-5,
-            rotary_dim: None, rope_neox: false,
+            rotary_dim: None,
+            rope_neox: false,
             gdn: None,
         };
         let qd = QuantizationDescriptor {
@@ -431,7 +481,8 @@ mod tests {
         let header = LbcHeader::new(hp, qd);
 
         let mut out = Vec::new();
-        let mut sw = StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, None).unwrap();
+        let mut sw =
+            StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, None).unwrap();
         for _ in 0..config.num_layers {
             sw.write_layer(&gen_blob(&mut rng)).unwrap();
         }
@@ -475,7 +526,8 @@ mod tests {
             num_experts: None,
             num_active_experts: None,
             norm_eps: 1e-5,
-            rotary_dim: None, rope_neox: false,
+            rotary_dim: None,
+            rope_neox: false,
             gdn: None,
         };
         let qd = QuantizationDescriptor {
@@ -487,7 +539,8 @@ mod tests {
         let header = LbcHeader::new(hp, qd);
 
         let mut out = Vec::new();
-        let mut sw = StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, None).unwrap();
+        let mut sw =
+            StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, None).unwrap();
         for _ in 0..config.num_layers {
             sw.write_layer(&gen_blob(&mut rng)).unwrap();
         }
@@ -527,7 +580,8 @@ mod tests {
             num_experts: None,
             num_active_experts: None,
             norm_eps: 1e-5,
-            rotary_dim: None, rope_neox: false,
+            rotary_dim: None,
+            rope_neox: false,
             gdn: None,
         };
         let qd = QuantizationDescriptor {
@@ -539,7 +593,8 @@ mod tests {
         let header = LbcHeader::new(hp, qd);
 
         let mut out = Vec::new();
-        let mut sw = StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, None).unwrap();
+        let mut sw =
+            StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, None).unwrap();
         // Write only 1 of 2 layers
         sw.write_layer(&gen_blob(&mut rng)).unwrap();
         let err = sw.finish();
@@ -576,7 +631,8 @@ mod tests {
             num_experts: None,
             num_active_experts: None,
             norm_eps: 1e-5,
-            rotary_dim: None, rope_neox: false,
+            rotary_dim: None,
+            rope_neox: false,
             gdn: None,
         };
         let qd = QuantizationDescriptor {
@@ -588,7 +644,8 @@ mod tests {
         let header = LbcHeader::new(hp, qd);
 
         let mut out = Vec::new();
-        let mut sw = StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, None).unwrap();
+        let mut sw =
+            StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, None).unwrap();
         let err = sw.write_layer(&[0u8; 17]); // Wrong size
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("blob size mismatch"));

@@ -16,6 +16,9 @@ impl LaunchConfig {
     pub(crate) fn for_elements(num_elements: usize) -> Self {
         let block_dim = 256u32;
         let grid_dim = (num_elements as u32).div_ceil(block_dim);
-        Self { grid_dim, block_dim }
+        Self {
+            grid_dim,
+            block_dim,
+        }
     }
 }

@@ -18,13 +18,13 @@
 //!   token = sample(logits)
 //! ```
 
-use crate::weight::cache::{PrefetchPriority, WeightProvider};
 use crate::compute::{ActivationBuffer, ComputeBackend, ComputeDtype, Logits};
 use crate::config::RuntimeConfig;
 use crate::error::RuntimeError;
 use crate::kv::{KvCache, KvCacheConfig};
 use crate::pipeline::PipelineMode;
 use crate::telemetry::{InferenceMetrics, IoMetrics, PerLayerTiming};
+use crate::weight::cache::{PrefetchPriority, WeightProvider};
 use lumen_format::ModelHyperparams;
 use std::time::Instant;
 
@@ -107,7 +107,11 @@ pub fn sample_token_with_state(
 /// explicitly here. Dense models keep `anti_restate=false`, so this term leaves
 /// every non-MoE greedy path byte-identical, and CUDA was already on the CPU
 /// path (`gpu_argmax=false`) so its behaviour is unchanged.
-pub fn use_gpu_greedy_predicate(params: &SamplingParams, gpu_resident: bool, gpu_argmax: bool) -> bool {
+pub fn use_gpu_greedy_predicate(
+    params: &SamplingParams,
+    gpu_resident: bool,
+    gpu_argmax: bool,
+) -> bool {
     gpu_resident
         && gpu_argmax
         && params.temperature <= 0.0
@@ -137,9 +141,10 @@ impl StopCondition {
         match self {
             Self::MaxTokens(max) => generated_count >= *max,
             Self::EosTokens(eos) => eos.contains(&token),
-            Self::MaxTokensOrEos { max_tokens, eos_tokens } => {
-                generated_count >= *max_tokens || eos_tokens.contains(&token)
-            }
+            Self::MaxTokensOrEos {
+                max_tokens,
+                eos_tokens,
+            } => generated_count >= *max_tokens || eos_tokens.contains(&token),
         }
     }
 }
@@ -289,7 +294,10 @@ impl InferenceEngine {
                 let tail: Vec<u32> = prompt_tokens.iter().rev().take(6).rev().copied().collect();
                 let hsum: f64 = last_hidden.iter().map(|&v| v as f64).sum();
                 let hmin = last_hidden.iter().cloned().fold(f32::INFINITY, f32::min);
-                let hmax = last_hidden.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let hmax = last_hidden
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
                 eprintln!(
                     "[prefill-debug] generate prompt_len={n} head={head:?} tail={tail:?} hidden_len={} hidden_sum={hsum:.4} hidden_min={hmin:.4} hidden_max={hmax:.4}",
                     last_hidden.len()
@@ -299,8 +307,17 @@ impl InferenceEngine {
             current_x.write_f32_from(&last_hidden);
             let lg = backend.compute_final(&current_x)?;
             if std::env::var("LUMEN_PREFILL_DEBUG").is_ok() {
-                let argmax = lg.data.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(i, _)| i).unwrap_or(0);
-                eprintln!("[prefill-debug] generate first_logits_argmax={argmax} logit_val={:.4}", lg.data.get(argmax).copied().unwrap_or(0.0));
+                let argmax = lg
+                    .data
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                eprintln!(
+                    "[prefill-debug] generate first_logits_argmax={argmax} logit_val={:.4}",
+                    lg.data.get(argmax).copied().unwrap_or(0.0)
+                );
             }
             lg
         } else {
@@ -331,7 +348,8 @@ impl InferenceEngine {
 
         // first token comes from the prefill logits; history-aware
         // penalties + history append happen via sample_token_with_state.
-        let mut next_token = sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
+        let mut next_token =
+            sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
         generated_tokens.push(next_token);
 
         // GPU-argmax fast path requires NO active penalty (it
@@ -376,7 +394,8 @@ impl InferenceEngine {
             // decode_token() advances kv.seq_len() internally.
             while !stop.should_stop(next_token, generated_tokens.len()) {
                 logits = backend.decode_token(next_token, weights, &mut kv)?;
-                next_token = sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
+                next_token =
+                    sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
                 generated_tokens.push(next_token);
             }
         } else {
@@ -394,7 +413,8 @@ impl InferenceEngine {
                 kv.advance_seq_len()?;
 
                 logits = backend.compute_final(&x)?;
-                next_token = sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
+                next_token =
+                    sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
                 generated_tokens.push(next_token);
             }
         }
@@ -541,7 +561,8 @@ impl InferenceEngine {
         let decode_start = Instant::now();
 
         let mut logits = backend.compute_final(&current_x)?;
-        let mut next_token = sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
+        let mut next_token =
+            sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
         generated_tokens.push(next_token);
 
         while !stop.should_stop(next_token, generated_tokens.len()) {
@@ -556,7 +577,8 @@ impl InferenceEngine {
             kv.advance_seq_len()?;
 
             logits = backend.compute_final(&current_x)?;
-            next_token = sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
+            next_token =
+                sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
             generated_tokens.push(next_token);
         }
 
@@ -656,7 +678,11 @@ impl InferenceEngine {
 
             // Ensure current layer weights are available.
             // Gate Instant::now() behind collect_timings -- it is a syscall.
-            let load_start = if collect_timings { Some(Instant::now()) } else { None };
+            let load_start = if collect_timings {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let (layer_view, weight_cache_hit) = match weights.try_get_layer(layer) {
                 Some(view) => (view, true),
                 None => (weights.get_layer_blocking(layer)?, false),
@@ -666,12 +692,20 @@ impl InferenceEngine {
 
             // Compute with KV cache.
             let mut kv_view = kv.view_mut(layer)?;
-            let compute_start = if collect_timings { Some(Instant::now()) } else { None };
+            let compute_start = if collect_timings {
+                Some(Instant::now())
+            } else {
+                None
+            };
             backend.compute_layer(layer, &mut x, &layer_view, Some(&mut kv_view), seq_pos)?;
             let compute_time = compute_start.map(|t| t.elapsed());
 
             // Commit KV updates.
-            let kv_save_start = if collect_timings { Some(Instant::now()) } else { None };
+            let kv_save_start = if collect_timings {
+                Some(Instant::now())
+            } else {
+                None
+            };
             kv.commit_view(kv_view)?;
             let kv_save_time = kv_save_start.map(|t| t.elapsed());
 
@@ -774,12 +808,7 @@ impl InferenceEngine {
                 // Resumed-from-disk path: try to reuse the cached prefix
                 // for any common-prefix tokens, fall back to cold restart
                 // on divergence (the standard `extend_with_cache` matrix).
-                session.extend_with_cache(
-                    prompt_tokens,
-                    backend,
-                    weights,
-                    suffix_threshold,
-                )?;
+                session.extend_with_cache(prompt_tokens, backend, weights, suffix_threshold)?;
             }
         } else if session.token_count() == 0 {
             // Edge case: empty prompt on a fresh session. Mirror the
@@ -799,9 +828,10 @@ impl InferenceEngine {
         let (max_tokens, eos_tokens): (usize, Vec<u32>) = match stop {
             StopCondition::MaxTokens(n) => (*n, Vec::new()),
             StopCondition::EosTokens(eos) => (usize::MAX, eos.clone()),
-            StopCondition::MaxTokensOrEos { max_tokens, eos_tokens } => {
-                (*max_tokens, eos_tokens.clone())
-            }
+            StopCondition::MaxTokensOrEos {
+                max_tokens,
+                eos_tokens,
+            } => (*max_tokens, eos_tokens.clone()),
         };
         let mut generated_tokens: Vec<u32> = Vec::new();
         // Track the pre-stream count so the generated-only slice excludes
@@ -980,29 +1010,47 @@ mod tests {
     #[test]
     fn sample_token_empty_logits() {
         let mut logits = Logits { data: vec![] };
-        let params = SamplingParams { temperature: 1.0, seed: None, ..Default::default() };
+        let params = SamplingParams {
+            temperature: 1.0,
+            seed: None,
+            ..Default::default()
+        };
         let mut rng = Xorshift64::new(42);
         assert_eq!(sample_token(&mut logits, &params, &mut rng), 0);
     }
 
     #[test]
     fn sample_token_greedy_returns_argmax() {
-        let mut logits = Logits { data: vec![1.0, 5.0, 3.0, 2.0] };
-        let params = SamplingParams { temperature: 0.0, seed: None, ..Default::default() };
+        let mut logits = Logits {
+            data: vec![1.0, 5.0, 3.0, 2.0],
+        };
+        let params = SamplingParams {
+            temperature: 0.0,
+            seed: None,
+            ..Default::default()
+        };
         let mut rng = Xorshift64::new(42);
         assert_eq!(sample_token(&mut logits, &params, &mut rng), 1);
     }
 
     #[test]
     fn sample_token_deterministic_with_seed() {
-        let params = SamplingParams { temperature: 0.8, seed: Some(42), ..Default::default() };
+        let params = SamplingParams {
+            temperature: 0.8,
+            seed: Some(42),
+            ..Default::default()
+        };
 
         let mut rng1 = Xorshift64::new(42);
-        let mut logits1 = Logits { data: vec![1.0, 2.0, 3.0, 4.0] };
+        let mut logits1 = Logits {
+            data: vec![1.0, 2.0, 3.0, 4.0],
+        };
         let t1 = sample_token(&mut logits1, &params, &mut rng1);
 
         let mut rng2 = Xorshift64::new(42);
-        let mut logits2 = Logits { data: vec![1.0, 2.0, 3.0, 4.0] };
+        let mut logits2 = Logits {
+            data: vec![1.0, 2.0, 3.0, 4.0],
+        };
         let t2 = sample_token(&mut logits2, &params, &mut rng2);
 
         assert_eq!(t1, t2);

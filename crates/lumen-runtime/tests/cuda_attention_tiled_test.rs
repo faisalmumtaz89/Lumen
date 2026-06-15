@@ -45,9 +45,7 @@
 #![cfg(feature = "cuda")]
 
 use lumen_runtime::cuda::ffi::CudaDevice;
-use lumen_runtime::cuda::shaders::{
-    ATTENTION_DECODE_TILED_KERNEL_SOURCE, ATTENTION_KERNEL_SOURCE,
-};
+use lumen_runtime::cuda::shaders::{ATTENTION_DECODE_TILED_KERNEL_SOURCE, ATTENTION_KERNEL_SOURCE};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
@@ -300,9 +298,7 @@ fn assert_close(label: &str, got: &[f32], expected: &[f32], eps: f32) {
         if diff >= eps {
             total_fail += 1;
             if shown < 5 {
-                eprintln!(
-                    "[{label}] mismatch at i={i}: got={g} expected={e} diff={diff}"
-                );
+                eprintln!("[{label}] mismatch at i={i}: got={g} expected={e} diff={diff}");
                 shown += 1;
             }
         }
@@ -320,7 +316,10 @@ fn assert_close(label: &str, got: &[f32], expected: &[f32], eps: f32) {
 
 #[test]
 fn tiled_decode_tiny_hand_verified() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
 
     let num_heads = 1u32;
     let num_kv_heads = 1u32;
@@ -333,21 +332,39 @@ fn tiled_decode_tiny_hand_verified() {
     let q = vec![1.0, 0.0, 1.0, 0.0];
     let mut k_cache = vec![0.0f32; (max_seq_len * head_dim) as usize];
     k_cache[0] = 1.0;
-    k_cache[4 + 1] = 1.0; k_cache[4 + 3] = 1.0;
-    k_cache[8] = 1.0; k_cache[9] = 1.0; k_cache[10] = 1.0; k_cache[11] = 1.0;
+    k_cache[4 + 1] = 1.0;
+    k_cache[4 + 3] = 1.0;
+    k_cache[8] = 1.0;
+    k_cache[9] = 1.0;
+    k_cache[10] = 1.0;
+    k_cache[11] = 1.0;
     let mut v_cache = vec![0.0f32; (max_seq_len * head_dim) as usize];
     v_cache[0] = 10.0;
     v_cache[4 + 1] = 20.0;
     v_cache[8 + 2] = 30.0;
 
     let expected = cpu_attention(
-        &q, &k_cache, &v_cache,
-        num_heads as usize, num_kv_heads as usize, head_dim as usize,
-        seq_len as usize, max_seq_len as usize, scale,
+        &q,
+        &k_cache,
+        &v_cache,
+        num_heads as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+        seq_len as usize,
+        max_seq_len as usize,
+        scale,
     );
     let got = run_tiled(
-        &device, &q, &k_cache, &v_cache,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k_cache,
+        &v_cache,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     assert_close("tiny_hand_verified", &got, &expected, 1e-5);
 }
@@ -358,7 +375,10 @@ fn tiled_decode_tiny_hand_verified() {
 
 #[test]
 fn tiled_decode_seq_len_1() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
 
     // seq_len = 1: softmax of single score = 1.0; output = V[0] exactly.
     // This exercises the partial-tile path with tile_len = 1.
@@ -381,8 +401,16 @@ fn tiled_decode_seq_len_1() {
     v_cache[h1..h1 + 4].copy_from_slice(&[10.0, 20.0, 30.0, 40.0]);
 
     let got = run_tiled(
-        &device, &q, &k_cache, &v_cache,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k_cache,
+        &v_cache,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
 
     let expected = vec![100.0, 200.0, 300.0, 400.0, 10.0, 20.0, 30.0, 40.0];
@@ -395,7 +423,10 @@ fn tiled_decode_seq_len_1() {
 
 #[test]
 fn tiled_decode_seq_len_2() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
 
     let num_heads = 4u32;
     let num_kv_heads = 2u32;
@@ -407,13 +438,27 @@ fn tiled_decode_seq_len_2() {
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0xCAFE);
 
     let expected = cpu_attention(
-        &q, &k, &v,
-        num_heads as usize, num_kv_heads as usize, head_dim as usize,
-        seq_len as usize, max_seq_len as usize, scale,
+        &q,
+        &k,
+        &v,
+        num_heads as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+        seq_len as usize,
+        max_seq_len as usize,
+        scale,
     );
     let got = run_tiled(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     assert_close("seq_len_2", &got, &expected, 1e-4);
 }
@@ -424,18 +469,35 @@ fn tiled_decode_seq_len_2() {
 
 #[test]
 fn tiled_decode_seq_len_3() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
     let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) = (4u32, 2u32, 8u32, 3u32, 16u32);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0xBEEF);
     let expected = cpu_attention(
-        &q, &k, &v,
-        num_heads as usize, num_kv_heads as usize, head_dim as usize,
-        seq_len as usize, max_seq_len as usize, scale,
+        &q,
+        &k,
+        &v,
+        num_heads as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+        seq_len as usize,
+        max_seq_len as usize,
+        scale,
     );
     let got = run_tiled(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     assert_close("seq_len_3", &got, &expected, 1e-4);
 }
@@ -446,18 +508,36 @@ fn tiled_decode_seq_len_3() {
 
 #[test]
 fn tiled_decode_seq_len_64() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
-    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) = (4u32, 1u32, 64u32, 64u32, 128u32);
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
+    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) =
+        (4u32, 1u32, 64u32, 64u32, 128u32);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0x1234);
     let expected = cpu_attention(
-        &q, &k, &v,
-        num_heads as usize, num_kv_heads as usize, head_dim as usize,
-        seq_len as usize, max_seq_len as usize, scale,
+        &q,
+        &k,
+        &v,
+        num_heads as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+        seq_len as usize,
+        max_seq_len as usize,
+        scale,
     );
     let got = run_tiled(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     assert_close("seq_len_64", &got, &expected, 1e-4);
 }
@@ -471,18 +551,36 @@ fn tiled_decode_seq_len_64() {
 
 #[test]
 fn tiled_decode_seq_len_127() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
-    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) = (4u32, 2u32, 128u32, 127u32, 256u32);
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
+    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) =
+        (4u32, 2u32, 128u32, 127u32, 256u32);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0x5678);
     let expected = cpu_attention(
-        &q, &k, &v,
-        num_heads as usize, num_kv_heads as usize, head_dim as usize,
-        seq_len as usize, max_seq_len as usize, scale,
+        &q,
+        &k,
+        &v,
+        num_heads as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+        seq_len as usize,
+        max_seq_len as usize,
+        scale,
     );
     let got = run_tiled(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     assert_close("seq_len_127", &got, &expected, 1e-4);
 }
@@ -493,18 +591,36 @@ fn tiled_decode_seq_len_127() {
 
 #[test]
 fn tiled_decode_seq_len_128() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
-    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) = (4u32, 2u32, 128u32, 128u32, 256u32);
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
+    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) =
+        (4u32, 2u32, 128u32, 128u32, 256u32);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0xABCD);
     let expected = cpu_attention(
-        &q, &k, &v,
-        num_heads as usize, num_kv_heads as usize, head_dim as usize,
-        seq_len as usize, max_seq_len as usize, scale,
+        &q,
+        &k,
+        &v,
+        num_heads as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+        seq_len as usize,
+        max_seq_len as usize,
+        scale,
     );
     let got = run_tiled(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     assert_close("seq_len_128", &got, &expected, 1e-4);
 }
@@ -517,18 +633,36 @@ fn tiled_decode_seq_len_128() {
 
 #[test]
 fn tiled_decode_seq_len_129() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
-    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) = (4u32, 2u32, 128u32, 129u32, 256u32);
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
+    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) =
+        (4u32, 2u32, 128u32, 129u32, 256u32);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0xFACE);
     let expected = cpu_attention(
-        &q, &k, &v,
-        num_heads as usize, num_kv_heads as usize, head_dim as usize,
-        seq_len as usize, max_seq_len as usize, scale,
+        &q,
+        &k,
+        &v,
+        num_heads as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+        seq_len as usize,
+        max_seq_len as usize,
+        scale,
     );
     let got = run_tiled(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     assert_close("seq_len_129", &got, &expected, 1e-4);
 }
@@ -539,18 +673,36 @@ fn tiled_decode_seq_len_129() {
 
 #[test]
 fn tiled_decode_seq_len_512() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
-    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) = (8u32, 2u32, 128u32, 512u32, 1024u32);
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
+    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) =
+        (8u32, 2u32, 128u32, 512u32, 1024u32);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0x9999);
     let expected = cpu_attention(
-        &q, &k, &v,
-        num_heads as usize, num_kv_heads as usize, head_dim as usize,
-        seq_len as usize, max_seq_len as usize, scale,
+        &q,
+        &k,
+        &v,
+        num_heads as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+        seq_len as usize,
+        max_seq_len as usize,
+        scale,
     );
     let got = run_tiled(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     assert_close("seq_len_512", &got, &expected, 1e-4);
 }
@@ -561,17 +713,37 @@ fn tiled_decode_seq_len_512() {
 
 #[test]
 fn tiled_decode_matches_single_block_at_4k() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
-    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) = (8u32, 2u32, 128u32, 4096u32, 4096u32);
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
+    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) =
+        (8u32, 2u32, 128u32, 4096u32, 4096u32);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0x4096);
     let single = run_single_block(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     let tiled = run_tiled(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     assert_close("single_block_vs_tiled_4k", &tiled, &single, 1e-4);
 }
@@ -582,17 +754,37 @@ fn tiled_decode_matches_single_block_at_4k() {
 
 #[test]
 fn tiled_decode_matches_single_block_at_8k() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
-    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) = (8u32, 2u32, 128u32, 8192u32, 8192u32);
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
+    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) =
+        (8u32, 2u32, 128u32, 8192u32, 8192u32);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0x8192);
     let single = run_single_block(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     let tiled = run_tiled(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     assert_close("single_block_vs_tiled_8k", &tiled, &single, 1e-4);
 }
@@ -603,7 +795,10 @@ fn tiled_decode_matches_single_block_at_8k() {
 
 #[test]
 fn tiled_decode_matches_single_block_at_default_threshold() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
     // Cross-validates tiled vs single-block at seq_len = 36_864 (the
     // original ATTN_DECODE_TILED_DEFAULT_THRESHOLD; lowered to 0 by the
     // empirical "tiled-faster-everywhere" data). Single-block can still
@@ -613,12 +808,28 @@ fn tiled_decode_matches_single_block_at_default_threshold() {
     let scale = 1.0 / (head_dim as f32).sqrt();
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0xDEADBEEF);
     let single = run_single_block(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     let tiled = run_tiled(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     assert_close("at_default_threshold", &tiled, &single, 1e-4);
 }
@@ -629,17 +840,37 @@ fn tiled_decode_matches_single_block_at_default_threshold() {
 
 #[test]
 fn tiled_decode_qwen3_5_shape_seq_len_4096() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
-    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) = (64u32, 4u32, 128u32, 4096u32, 4096u32);
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
+    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) =
+        (64u32, 4u32, 128u32, 4096u32, 4096u32);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0x95_40_96);
     let single = run_single_block(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     let tiled = run_tiled(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     assert_close("qwen3_5_4k", &tiled, &single, 1e-4);
 }
@@ -650,17 +881,37 @@ fn tiled_decode_qwen3_5_shape_seq_len_4096() {
 
 #[test]
 fn tiled_decode_qwen3_5_shape_seq_len_8192() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
-    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) = (64u32, 4u32, 128u32, 8192u32, 8192u32);
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
+    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) =
+        (64u32, 4u32, 128u32, 8192u32, 8192u32);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0x95_81_92);
     let single = run_single_block(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     let tiled = run_tiled(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     assert_close("qwen3_5_8k", &tiled, &single, 1e-4);
 }
@@ -676,18 +927,36 @@ fn tiled_decode_qwen3_5_shape_seq_len_8192() {
 
 #[test]
 fn tiled_decode_long_64k_vs_cpu() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
-    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) = (8u32, 2u32, 64u32, 65_536u32, 65_536u32);
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
+    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) =
+        (8u32, 2u32, 64u32, 65_536u32, 65_536u32);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0x6464);
     let expected = cpu_attention(
-        &q, &k, &v,
-        num_heads as usize, num_kv_heads as usize, head_dim as usize,
-        seq_len as usize, max_seq_len as usize, scale,
+        &q,
+        &k,
+        &v,
+        num_heads as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+        seq_len as usize,
+        max_seq_len as usize,
+        scale,
     );
     let got = run_tiled(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     // Slightly looser tolerance at long context: 512 tiles of FP-reassociated
     // accumulation introduce ~512x the per-tile ULP. 5e-4 keeps the test
@@ -715,39 +984,75 @@ fn tiled_decode_long_64k_vs_cpu() {
 
 #[test]
 fn tiled_decode_head_dim_invariant_divisible() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
     // head_dim = 128 is divisible by BLOCK_DIM = 128 → must pass.
-    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) = (4u32, 2u32, 128u32, 256u32, 512u32);
+    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) =
+        (4u32, 2u32, 128u32, 256u32, 512u32);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0xCC11_2200);
     let expected = cpu_attention(
-        &q, &k, &v,
-        num_heads as usize, num_kv_heads as usize, head_dim as usize,
-        seq_len as usize, max_seq_len as usize, scale,
+        &q,
+        &k,
+        &v,
+        num_heads as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+        seq_len as usize,
+        max_seq_len as usize,
+        scale,
     );
     let got = run_tiled(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     assert_close("head_dim_invariant_divisible", &got, &expected, 1e-4);
 }
 
 #[test]
 fn tiled_decode_head_dim_invariant_256_divisible() {
-    let device = match try_cuda_device() { Some(d) => d, None => return };
+    let device = match try_cuda_device() {
+        Some(d) => d,
+        None => return,
+    };
     // head_dim = 256 is divisible by BLOCK_DIM = 128 → must pass with
     // num_slots = 2 in the kernel.
-    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) = (4u32, 2u32, 256u32, 256u32, 512u32);
+    let (num_heads, num_kv_heads, head_dim, seq_len, max_seq_len) =
+        (4u32, 2u32, 256u32, 256u32, 512u32);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0xCC25_6444);
     let expected = cpu_attention(
-        &q, &k, &v,
-        num_heads as usize, num_kv_heads as usize, head_dim as usize,
-        seq_len as usize, max_seq_len as usize, scale,
+        &q,
+        &k,
+        &v,
+        num_heads as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+        seq_len as usize,
+        max_seq_len as usize,
+        scale,
     );
     let got = run_tiled(
-        &device, &q, &k, &v,
-        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, scale,
+        &device,
+        &q,
+        &k,
+        &v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
     );
     assert_close("head_dim_invariant_256_divisible", &got, &expected, 1e-4);
 }

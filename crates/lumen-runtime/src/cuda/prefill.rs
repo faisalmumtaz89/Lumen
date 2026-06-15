@@ -20,17 +20,16 @@
 //! m=out_dim, n=batch, k=in_dim
 //! A(cublas)=W, lda=in_dim, B(cublas)=A, ldb=in_dim, C(cublas)=C, ldc=out_dim
 
-use cudarc::cublas::{Gemm, GemmConfig, sys as cublas_sys};
+use cudarc::cublas::{sys as cublas_sys, Gemm, GemmConfig};
 use cudarc::driver::{CudaSlice, LaunchConfig as CudarcLaunchConfig, PushKernelArg};
 
 use crate::error::RuntimeError;
 
 use super::decode::{
-    AttentionDecodeVariant, KernelSet, attention_block_size, attention_shared_bytes,
-    attention_decode_tiled_shared_bytes, attention_decode_tiled_supports_head_dim,
-    attention_decode_variant, decode_tiled_force_enabled,
-    decode_tiled_threshold, matvec_block_size, rmsnorm_block_size, rmsnorm_shared_bytes,
-    ATTN_DECODE_TILED_BLOCK_DIM,
+    attention_block_size, attention_decode_tiled_shared_bytes,
+    attention_decode_tiled_supports_head_dim, attention_decode_variant, attention_shared_bytes,
+    decode_tiled_force_enabled, decode_tiled_threshold, matvec_block_size, rmsnorm_block_size,
+    rmsnorm_shared_bytes, AttentionDecodeVariant, KernelSet, ATTN_DECODE_TILED_BLOCK_DIM,
 };
 use super::ffi::CudaDevice;
 use super::gpu_buffers::GpuWeightBuf;
@@ -174,13 +173,13 @@ pub(crate) fn alloc_prefill_scratch(
     let gdn_qkv = gdn_qkv_dim.unwrap_or(0);
     let gdn_value = gdn_value_dim.unwrap_or(0);
     let max_weight_elems = [
-        q_dim * hidden_dim,         // wq
-        kv_dim * hidden_dim,        // wk, wv
-        hidden_dim * q_dim,         // wo
-        inter_dim * hidden_dim,     // w_gate, w_up
-        hidden_dim * inter_dim,     // w_down
-        gdn_qkv * hidden_dim,       // GDN fused QKV projection (out=qkv_dim, in=hidden_dim)
-        hidden_dim * gdn_value,     // GDN SSM output projection (out=hidden_dim, in=value_dim)
+        q_dim * hidden_dim,     // wq
+        kv_dim * hidden_dim,    // wk, wv
+        hidden_dim * q_dim,     // wo
+        inter_dim * hidden_dim, // w_gate, w_up
+        hidden_dim * inter_dim, // w_down
+        gdn_qkv * hidden_dim,   // GDN fused QKV projection (out=qkv_dim, in=hidden_dim)
+        hidden_dim * gdn_value, // GDN SSM output projection (out=hidden_dim, in=value_dim)
     ]
     .into_iter()
     .max()
@@ -189,12 +188,10 @@ pub(crate) fn alloc_prefill_scratch(
     // F16 activation buffer must cover the largest activation row across all
     // kernels: standard attention/FFN inputs, plus GDN value-side inputs when
     // present (e.g. ssm_out reads activations of width `value_dim`).
-    let max_in_dim = [
-        hidden_dim, inter_dim, q_dim, gdn_value,
-    ]
-    .into_iter()
-    .max()
-    .unwrap_or(hidden_dim);
+    let max_in_dim = [hidden_dim, inter_dim, q_dim, gdn_value]
+        .into_iter()
+        .max()
+        .unwrap_or(hidden_dim);
 
     Ok(PrefillScratch {
         x: device.alloc_zeros(batch * hidden_dim)?,
@@ -431,8 +428,8 @@ pub(crate) unsafe fn launch_gemm_projection(
     // short-circuit before the match arm.
     let q8_proj_mmq = std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").is_ok();
     let weight_is_q8raw = matches!(weight, GpuWeightBuf::Q8Raw(_));
-    let prefer_mmq_over_f16cache = q8_proj_mmq && weight_is_q8raw && in_dim % 32 == 0
-        && kernels.mmq_q8_0_batched.is_some();
+    let prefer_mmq_over_f16cache =
+        q8_proj_mmq && weight_is_q8raw && in_dim % 32 == 0 && kernels.mmq_q8_0_batched.is_some();
 
     // `ssm_alpha` and `ssm_beta` weights are stored as F32 in the
     // GGUF source and an F32 SGEMM dispatch is the canonical reference path.
@@ -463,7 +460,8 @@ pub(crate) unsafe fn launch_gemm_projection(
     // Fast path: HGEMM with pre-dequanted F16 weights (tensor core, 312 TFLOPS on A100).
     // Converts F32 activations to F16 on the fly, uses cublasGemmEx with F16 inputs
     // and F32 compute/accumulate for numerical stability.
-    let f16_cache_active = !force_f32 && !prefer_mmq_over_f16cache
+    let f16_cache_active = !force_f32
+        && !prefer_mmq_over_f16cache
         && !force_alpha_beta_f32
         && !moe_bf16_native_path(weight)
         && weight_f16_cache.is_some();
@@ -475,12 +473,26 @@ pub(crate) unsafe fn launch_gemm_projection(
         }
 
         // Step 1: Convert F32 activation to F16 via vectorized kernel (4 elems/thread).
-        launch_f32_to_f16_fast(device, kernels, input, activation_f16, batch * in_dim, label)?;
+        launch_f32_to_f16_fast(
+            device,
+            kernels,
+            input,
+            activation_f16,
+            batch * in_dim,
+            label,
+        )?;
 
         // Step 2: cublasGemmEx HGEMM (F16 weight + F16 activation -> F32 output).
         launch_cublas_hgemm(
-            device, w_f16, activation_f16, output,
-            out_dim, batch, in_dim, 0.0, label,
+            device,
+            w_f16,
+            activation_f16,
+            output,
+            out_dim,
+            batch,
+            in_dim,
+            0.0,
+            label,
         )?;
         return Ok(());
     }
@@ -518,9 +530,7 @@ pub(crate) unsafe fn launch_gemm_projection(
             device
                 .blas
                 .gemm(cfg, w_f32, input, output)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("cuBLAS SGEMM {label}: {e}"))
-                })?;
+                .map_err(|e| RuntimeError::Compute(format!("cuBLAS SGEMM {label}: {e}")))?;
         }
         GpuWeightBuf::Q8Raw(w_q8) => {
             // when LUMEN_CUDA_Q8_PROJ_MMQ=1, route Q8 projection
@@ -593,8 +603,7 @@ pub(crate) unsafe fn launch_gemm_projection(
                         );
                     }
                     launch_mmq_q8_0_imma(
-                        device, kernels, w_q8, input, output,
-                        out_dim, in_dim, batch, label,
+                        device, kernels, w_q8, input, output, out_dim, in_dim, batch, label,
                     )?;
                     return Ok(());
                 }
@@ -607,8 +616,7 @@ pub(crate) unsafe fn launch_gemm_projection(
                     );
                 }
                 launch_mmq_q8_0_tiled(
-                    device, kernels, w_q8, input, output,
-                    out_dim, in_dim, batch, label,
+                    device, kernels, w_q8, input, output, out_dim, in_dim, batch, label,
                 )?;
                 return Ok(());
             }
@@ -622,8 +630,7 @@ pub(crate) unsafe fn launch_gemm_projection(
                     );
                 }
                 launch_mmq_q8_0_batched(
-                    device, kernels, w_q8, input, output,
-                    out_dim, in_dim, batch, label,
+                    device, kernels, w_q8, input, output, out_dim, in_dim, batch, label,
                 )?;
                 return Ok(());
             }
@@ -665,7 +672,12 @@ pub(crate) unsafe fn launch_gemm_projection(
                     )));
                 }
                 launch_dequant_q8_0_to_f32(
-                    device, kernels, w_q8, dequant_scratch, num_elements, label,
+                    device,
+                    kernels,
+                    w_q8,
+                    dequant_scratch,
+                    num_elements,
+                    label,
                 )?;
                 let cfg = GemmConfig {
                     transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
@@ -696,16 +708,35 @@ pub(crate) unsafe fn launch_gemm_projection(
 
                 // Step 1: Dequantize Q8_0 -> F16 in scratch buffer.
                 launch_dequant_q8_0_to_f16(
-                    device, kernels, w_q8, dequant_f16, num_elements, label,
+                    device,
+                    kernels,
+                    w_q8,
+                    dequant_f16,
+                    num_elements,
+                    label,
                 )?;
 
                 // Step 2: Convert F32 activation to F16.
-                launch_f32_to_f16_fast(device, kernels, input, activation_f16, batch * in_dim, label)?;
+                launch_f32_to_f16_fast(
+                    device,
+                    kernels,
+                    input,
+                    activation_f16,
+                    batch * in_dim,
+                    label,
+                )?;
 
                 // Step 3: cublasGemmEx HGEMM (F16 weight + F16 activation -> F32 output).
                 launch_cublas_hgemm(
-                    device, dequant_f16, activation_f16, output,
-                    out_dim, batch, in_dim, 0.0, label,
+                    device,
+                    dequant_f16,
+                    activation_f16,
+                    output,
+                    out_dim,
+                    batch,
+                    in_dim,
+                    0.0,
+                    label,
                 )?;
             }
         }
@@ -731,12 +762,26 @@ pub(crate) unsafe fn launch_gemm_projection(
             }
 
             // Step 1: Convert F32 activation to F16 via vectorized kernel.
-            launch_f32_to_f16_fast(device, kernels, input, activation_f16, batch * in_dim, label)?;
+            launch_f32_to_f16_fast(
+                device,
+                kernels,
+                input,
+                activation_f16,
+                batch * in_dim,
+                label,
+            )?;
 
             // Step 2: cublasGemmEx HGEMM (F16 weight + F16 activation -> F32 output).
             launch_cublas_hgemm(
-                device, w_f16, activation_f16, output,
-                out_dim, batch, in_dim, 0.0, label,
+                device,
+                w_f16,
+                activation_f16,
+                output,
+                out_dim,
+                batch,
+                in_dim,
+                0.0,
+                label,
             )?;
         }
         GpuWeightBuf::Q4Raw(w_q4) => {
@@ -790,8 +835,7 @@ pub(crate) unsafe fn launch_gemm_projection(
                     );
                 }
                 launch_mmq_q4_0_batched(
-                    device, kernels, w_q4, input, output,
-                    out_dim, in_dim, batch, label,
+                    device, kernels, w_q4, input, output, out_dim, in_dim, batch, label,
                 )?;
                 return Ok(());
             }
@@ -817,7 +861,12 @@ pub(crate) unsafe fn launch_gemm_projection(
                     )));
                 }
                 launch_dequant_q4_0_to_f32(
-                    device, kernels, w_q4, dequant_scratch, num_elements, label,
+                    device,
+                    kernels,
+                    w_q4,
+                    dequant_scratch,
+                    num_elements,
+                    label,
                 )?;
                 let cfg = GemmConfig {
                     transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
@@ -848,16 +897,35 @@ pub(crate) unsafe fn launch_gemm_projection(
 
                 // Step 1: Dequantize Q4_0 -> F16 in scratch buffer.
                 launch_dequant_q4_0_to_f16(
-                    device, kernels, w_q4, dequant_f16, num_elements, label,
+                    device,
+                    kernels,
+                    w_q4,
+                    dequant_f16,
+                    num_elements,
+                    label,
                 )?;
 
                 // Step 2: Convert F32 activation to F16.
-                launch_f32_to_f16_fast(device, kernels, input, activation_f16, batch * in_dim, label)?;
+                launch_f32_to_f16_fast(
+                    device,
+                    kernels,
+                    input,
+                    activation_f16,
+                    batch * in_dim,
+                    label,
+                )?;
 
                 // Step 3: cublasGemmEx HGEMM (F16 weight + F16 activation -> F32 output).
                 launch_cublas_hgemm(
-                    device, dequant_f16, activation_f16, output,
-                    out_dim, batch, in_dim, 0.0, label,
+                    device,
+                    dequant_f16,
+                    activation_f16,
+                    output,
+                    out_dim,
+                    batch,
+                    in_dim,
+                    0.0,
+                    label,
                 )?;
             }
         }
@@ -868,8 +936,8 @@ pub(crate) unsafe fn launch_gemm_projection(
                 let in_offset = row * in_dim;
                 let out_offset = row * out_dim;
                 launch_matvec_slice(
-                    device, kernels, weight, input, output, in_offset, out_offset,
-                    out_dim, in_dim, label,
+                    device, kernels, weight, input, output, in_offset, out_offset, out_dim, in_dim,
+                    label,
                 )?;
             }
         }
@@ -907,12 +975,26 @@ pub(crate) unsafe fn launch_gemm_projection(
             }
 
             // Step 1: Convert F32 activation to BF16 via vectorized kernel.
-            launch_f32_to_bf16_fast(device, kernels, input, activation_f16, batch * in_dim, label)?;
+            launch_f32_to_bf16_fast(
+                device,
+                kernels,
+                input,
+                activation_f16,
+                batch * in_dim,
+                label,
+            )?;
 
             // Step 2: cublasGemmEx (BF16 weight + BF16 activation -> F32 output).
             launch_cublas_gemm_bf16(
-                device, w_bf16, activation_f16, output,
-                out_dim, batch, in_dim, 0.0, label,
+                device,
+                w_bf16,
+                activation_f16,
+                output,
+                out_dim,
+                batch,
+                in_dim,
+                0.0,
+                label,
             )?;
         }
         // split-layout: / TILE: prefill never dispatches against
@@ -920,8 +1002,10 @@ pub(crate) unsafe fn launch_gemm_projection(
         // reorganizations; the prefill path operates on the original AoS
         // Q8Raw/Q4Raw via dequant->F16->cuBLAS HGEMM. If we somehow get
         // here the caller has confused decode/prefill dispatch.
-        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_)
-        | GpuWeightBuf::Q8Tile(_)  | GpuWeightBuf::Q4Tile(_) => {
+        GpuWeightBuf::Q8Split(_)
+        | GpuWeightBuf::Q4Split(_)
+        | GpuWeightBuf::Q8Tile(_)
+        | GpuWeightBuf::Q4Tile(_) => {
             return Err(RuntimeError::Compute(format!(
                 "prefill GEMM {label}: Q8Split/Q4Split/Q8Tile/Q4Tile sibling \
                  routed to prefill; prefill must use the original Q8Raw/Q4Raw \
@@ -1014,7 +1098,9 @@ pub(crate) unsafe fn launch_gemm_residual(
     let ssm_out_mmq_off = std::env::var("LUMEN_CUDA_Q8_SSM_OUT_MMQ_OFF").is_ok();
     let q8_residual_mmq = q8_proj_mmq && !ssm_out_mmq_off;
     let weight_is_q8raw = matches!(weight, GpuWeightBuf::Q8Raw(_));
-    let prefer_mmq_over_f16cache = q8_residual_mmq && weight_is_q8raw && in_dim % 32 == 0
+    let prefer_mmq_over_f16cache = q8_residual_mmq
+        && weight_is_q8raw
+        && in_dim % 32 == 0
         && kernels.mmq_q8_0_batched_residual.is_some();
 
     // diagnostic: log weight variant + gate decision on FIRST entry to
@@ -1043,24 +1129,38 @@ pub(crate) unsafe fn launch_gemm_residual(
 
     // Fast path: HGEMM residual with pre-dequanted F16 weights.
     // Copy residual to output first, then HGEMM with beta=1.0.
-    let f16_cache_active = !force_f32 && !prefer_mmq_over_f16cache
-        && !moe_bf16_native_path(weight) && weight_f16_cache.is_some();
+    let f16_cache_active = !force_f32
+        && !prefer_mmq_over_f16cache
+        && !moe_bf16_native_path(weight)
+        && weight_f16_cache.is_some();
     if let Some(w_f16) = weight_f16_cache.filter(|_| f16_cache_active) {
         // Copy residual -> output for beta=1.0 accumulation.
         device
             .stream
             .memcpy_dtod(residual, output)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "dtod residual copy {label}: {e}"
-            )))?;
+            .map_err(|e| RuntimeError::Compute(format!("dtod residual copy {label}: {e}")))?;
 
         // Convert F32 activation to F16 via vectorized kernel.
-        launch_f32_to_f16_fast(device, kernels, input, activation_f16, batch * in_dim, label)?;
+        launch_f32_to_f16_fast(
+            device,
+            kernels,
+            input,
+            activation_f16,
+            batch * in_dim,
+            label,
+        )?;
 
         // cublasGemmEx with beta=1.0 for residual accumulation.
         launch_cublas_hgemm(
-            device, w_f16, activation_f16, output,
-            out_dim, batch, in_dim, 1.0, label,
+            device,
+            w_f16,
+            activation_f16,
+            output,
+            out_dim,
+            batch,
+            in_dim,
+            1.0,
+            label,
         )?;
         return Ok(());
     }
@@ -1077,14 +1177,9 @@ pub(crate) unsafe fn launch_gemm_residual(
                 )));
             }
             // Copy residual -> output so SGEMM can accumulate with beta=1.0.
-            device
-                .stream
-                .memcpy_dtod(residual, output)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!(
-                        "dtod residual copy for {label}: {e}"
-                    ))
-                })?;
+            device.stream.memcpy_dtod(residual, output).map_err(|e| {
+                RuntimeError::Compute(format!("dtod residual copy for {label}: {e}"))
+            })?;
 
             let cfg = GemmConfig {
                 transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
@@ -1098,12 +1193,9 @@ pub(crate) unsafe fn launch_gemm_residual(
                 beta: 1.0f32,
                 ldc: out_dim as i32,
             };
-            device
-                .blas
-                .gemm(cfg, w_f32, input, output)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("cuBLAS SGEMM+residual {label}: {e}"))
-                })?;
+            device.blas.gemm(cfg, w_f32, input, output).map_err(|e| {
+                RuntimeError::Compute(format!("cuBLAS SGEMM+residual {label}: {e}"))
+            })?;
         }
         GpuWeightBuf::Q8Raw(w_q8) => {
             // when LUMEN_CUDA_Q8_PROJ_MMQ=1 (and the sub-gate to disable
@@ -1112,9 +1204,8 @@ pub(crate) unsafe fn launch_gemm_residual(
             // add. Default OFF preserves byte-identical behavior vs main;
             // ENV-ON closes the `linear_attn_out` ~0.226 max-abs drift that
             // survives's projection-only fix.
-            let use_mmq = q8_residual_mmq
-                && kernels.mmq_q8_0_batched_residual.is_some()
-                && in_dim % 32 == 0;
+            let use_mmq =
+                q8_residual_mmq && kernels.mmq_q8_0_batched_residual.is_some() && in_dim % 32 == 0;
             // Tiled shmem-staged MMQ residual when LUMEN_CUDA_MMQ_TILED=1.
             let use_tiled = use_mmq
                 && std::env::var("LUMEN_CUDA_MMQ_TILED").as_deref() == Ok("1")
@@ -1129,8 +1220,7 @@ pub(crate) unsafe fn launch_gemm_residual(
                     );
                 }
                 launch_mmq_q8_0_tiled_residual(
-                    device, kernels, w_q8, input, residual, output,
-                    out_dim, in_dim, batch, label,
+                    device, kernels, w_q8, input, residual, output, out_dim, in_dim, batch, label,
                 )?;
                 return Ok(());
             }
@@ -1144,8 +1234,7 @@ pub(crate) unsafe fn launch_gemm_residual(
                     );
                 }
                 launch_mmq_q8_0_batched_residual(
-                    device, kernels, w_q8, input, residual, output,
-                    out_dim, in_dim, batch, label,
+                    device, kernels, w_q8, input, residual, output, out_dim, in_dim, batch, label,
                 )?;
                 return Ok(());
             }
@@ -1164,16 +1253,18 @@ pub(crate) unsafe fn launch_gemm_residual(
                     )));
                 }
                 launch_dequant_q8_0_to_f32(
-                    device, kernels, w_q8, dequant_scratch, num_elements, label,
+                    device,
+                    kernels,
+                    w_q8,
+                    dequant_scratch,
+                    num_elements,
+                    label,
                 )?;
-                device
-                    .stream
-                    .memcpy_dtod(residual, output)
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!(
-                            "dtod residual copy (dequant Q8_0 fallback) {label}: {e}"
-                        ))
-                    })?;
+                device.stream.memcpy_dtod(residual, output).map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "dtod residual copy (dequant Q8_0 fallback) {label}: {e}"
+                    ))
+                })?;
                 let cfg = GemmConfig {
                     transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
                     transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
@@ -1196,27 +1287,41 @@ pub(crate) unsafe fn launch_gemm_residual(
                     })?;
             } else {
                 // Step 1: Copy residual -> output for beta=1.0 accumulation.
-                device
-                    .stream
-                    .memcpy_dtod(residual, output)
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!(
-                            "dtod residual copy (dequant Q8_0) {label}: {e}"
-                        ))
-                    })?;
+                device.stream.memcpy_dtod(residual, output).map_err(|e| {
+                    RuntimeError::Compute(format!("dtod residual copy (dequant Q8_0) {label}: {e}"))
+                })?;
 
                 // Step 2: Dequantize Q8_0 -> F16 in scratch buffer.
                 launch_dequant_q8_0_to_f16(
-                    device, kernels, w_q8, dequant_f16, num_elements, label,
+                    device,
+                    kernels,
+                    w_q8,
+                    dequant_f16,
+                    num_elements,
+                    label,
                 )?;
 
                 // Step 3: Convert F32 activation to F16.
-                launch_f32_to_f16_fast(device, kernels, input, activation_f16, batch * in_dim, label)?;
+                launch_f32_to_f16_fast(
+                    device,
+                    kernels,
+                    input,
+                    activation_f16,
+                    batch * in_dim,
+                    label,
+                )?;
 
                 // Step 4: cublasGemmEx HGEMM with beta=1.0 for residual accumulation.
                 launch_cublas_hgemm(
-                    device, dequant_f16, activation_f16, output,
-                    out_dim, batch, in_dim, 1.0, label,
+                    device,
+                    dequant_f16,
+                    activation_f16,
+                    output,
+                    out_dim,
+                    batch,
+                    in_dim,
+                    1.0,
+                    label,
                 )?;
             }
         }
@@ -1237,20 +1342,31 @@ pub(crate) unsafe fn launch_gemm_residual(
             }
 
             // Step 1: Copy residual -> output for beta=1.0 accumulation.
-            device
-                .stream
-                .memcpy_dtod(residual, output)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "dtod residual copy F16Raw {label}: {e}"
-                )))?;
+            device.stream.memcpy_dtod(residual, output).map_err(|e| {
+                RuntimeError::Compute(format!("dtod residual copy F16Raw {label}: {e}"))
+            })?;
 
             // Step 2: Convert F32 activation to F16 via vectorized kernel.
-            launch_f32_to_f16_fast(device, kernels, input, activation_f16, batch * in_dim, label)?;
+            launch_f32_to_f16_fast(
+                device,
+                kernels,
+                input,
+                activation_f16,
+                batch * in_dim,
+                label,
+            )?;
 
             // Step 3: cublasGemmEx with beta=1.0 for residual accumulation.
             launch_cublas_hgemm(
-                device, w_f16, activation_f16, output,
-                out_dim, batch, in_dim, 1.0, label,
+                device,
+                w_f16,
+                activation_f16,
+                output,
+                out_dim,
+                batch,
+                in_dim,
+                1.0,
+                label,
             )?;
         }
         GpuWeightBuf::Q4Raw(w_q4) => {
@@ -1285,8 +1401,7 @@ pub(crate) unsafe fn launch_gemm_residual(
                     );
                 }
                 launch_mmq_q4_0_batched_residual(
-                    device, kernels, w_q4, input, residual, output,
-                    out_dim, in_dim, batch, label,
+                    device, kernels, w_q4, input, residual, output, out_dim, in_dim, batch, label,
                 )?;
                 return Ok(());
             }
@@ -1305,16 +1420,18 @@ pub(crate) unsafe fn launch_gemm_residual(
                     )));
                 }
                 launch_dequant_q4_0_to_f32(
-                    device, kernels, w_q4, dequant_scratch, num_elements, label,
+                    device,
+                    kernels,
+                    w_q4,
+                    dequant_scratch,
+                    num_elements,
+                    label,
                 )?;
-                device
-                    .stream
-                    .memcpy_dtod(residual, output)
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!(
-                            "dtod residual copy (dequant Q4_0 fallback) {label}: {e}"
-                        ))
-                    })?;
+                device.stream.memcpy_dtod(residual, output).map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "dtod residual copy (dequant Q4_0 fallback) {label}: {e}"
+                    ))
+                })?;
                 let cfg = GemmConfig {
                     transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
                     transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
@@ -1337,27 +1454,41 @@ pub(crate) unsafe fn launch_gemm_residual(
                     })?;
             } else {
                 // Step 1: Copy residual -> output for beta=1.0 accumulation.
-                device
-                    .stream
-                    .memcpy_dtod(residual, output)
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!(
-                            "dtod residual copy (dequant Q4_0) {label}: {e}"
-                        ))
-                    })?;
+                device.stream.memcpy_dtod(residual, output).map_err(|e| {
+                    RuntimeError::Compute(format!("dtod residual copy (dequant Q4_0) {label}: {e}"))
+                })?;
 
                 // Step 2: Dequantize Q4_0 -> F16 in scratch buffer.
                 launch_dequant_q4_0_to_f16(
-                    device, kernels, w_q4, dequant_f16, num_elements, label,
+                    device,
+                    kernels,
+                    w_q4,
+                    dequant_f16,
+                    num_elements,
+                    label,
                 )?;
 
                 // Step 3: Convert F32 activation to F16.
-                launch_f32_to_f16_fast(device, kernels, input, activation_f16, batch * in_dim, label)?;
+                launch_f32_to_f16_fast(
+                    device,
+                    kernels,
+                    input,
+                    activation_f16,
+                    batch * in_dim,
+                    label,
+                )?;
 
                 // Step 4: cublasGemmEx HGEMM with beta=1.0 for residual accumulation.
                 launch_cublas_hgemm(
-                    device, dequant_f16, activation_f16, output,
-                    out_dim, batch, in_dim, 1.0, label,
+                    device,
+                    dequant_f16,
+                    activation_f16,
+                    output,
+                    out_dim,
+                    batch,
+                    in_dim,
+                    1.0,
+                    label,
                 )?;
             }
         }
@@ -1368,8 +1499,8 @@ pub(crate) unsafe fn launch_gemm_residual(
                 let res_offset = row * out_dim;
                 let out_offset = row * out_dim;
                 launch_matvec_residual_slice(
-                    device, kernels, weight, input, residual, output, in_offset,
-                    res_offset, out_offset, out_dim, in_dim, label,
+                    device, kernels, weight, input, residual, output, in_offset, res_offset,
+                    out_offset, out_dim, in_dim, label,
                 )?;
             }
         }
@@ -1395,26 +1526,39 @@ pub(crate) unsafe fn launch_gemm_residual(
             }
 
             // Step 1: Copy residual -> output for beta=1.0 accumulation.
-            device
-                .stream
-                .memcpy_dtod(residual, output)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "dtod residual copy Bf16Raw {label}: {e}"
-                )))?;
+            device.stream.memcpy_dtod(residual, output).map_err(|e| {
+                RuntimeError::Compute(format!("dtod residual copy Bf16Raw {label}: {e}"))
+            })?;
 
             // Step 2: Convert F32 activation to BF16 via vectorized kernel.
-            launch_f32_to_bf16_fast(device, kernels, input, activation_f16, batch * in_dim, label)?;
+            launch_f32_to_bf16_fast(
+                device,
+                kernels,
+                input,
+                activation_f16,
+                batch * in_dim,
+                label,
+            )?;
 
             // Step 3: cublasGemmEx BF16 with beta=1.0 for residual accumulation.
             launch_cublas_gemm_bf16(
-                device, w_bf16, activation_f16, output,
-                out_dim, batch, in_dim, 1.0, label,
+                device,
+                w_bf16,
+                activation_f16,
+                output,
+                out_dim,
+                batch,
+                in_dim,
+                1.0,
+                label,
             )?;
         }
         // split-layout: / TILE: prefill never dispatches against
         // Q8Split/Q4Split/Q8Tile/Q4Tile siblings.
-        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_)
-        | GpuWeightBuf::Q8Tile(_)  | GpuWeightBuf::Q4Tile(_) => {
+        GpuWeightBuf::Q8Split(_)
+        | GpuWeightBuf::Q4Split(_)
+        | GpuWeightBuf::Q8Tile(_)
+        | GpuWeightBuf::Q4Tile(_) => {
             return Err(RuntimeError::Compute(format!(
                 "prefill residual GEMM {label}: Q8Split/Q4Split/Q8Tile/Q4Tile \
                  sibling routed to prefill; prefill must use the original \
@@ -1445,7 +1589,11 @@ pub(crate) unsafe fn launch_rope_batched(
     rotary_dim: u32,
 ) -> Result<(), RuntimeError> {
     // For partial RoPE (rotary_dim > 0), only rotate first rotary_dim dims per head.
-    let actual_rot = if rotary_dim > 0 && (rotary_dim as usize) < head_dim { rotary_dim as usize } else { head_dim };
+    let actual_rot = if rotary_dim > 0 && (rotary_dim as usize) < head_dim {
+        rotary_dim as usize
+    } else {
+        head_dim
+    };
     let half_rot = actual_rot / 2;
     let total_q_pairs = num_q_heads * half_rot;
     let total_work = batch * total_q_pairs;
@@ -1716,13 +1864,16 @@ pub(crate) unsafe fn launch_attention_for_token(
         msl,
         scale,
     )
-    .map_err(|e| {
-        RuntimeError::Compute(format!("attention_decode prefill t={token_idx}: {e}"))
-    })?;
+    .map_err(|e| RuntimeError::Compute(format!("attention_decode prefill t={token_idx}: {e}")))?;
 
     // Scatter-write attn_out_single back into the batch matrix at row token_idx.
     launch_scatter_row(
-        device, kernels, attn_out_batch, &*attn_out_single, token_idx, q_dim,
+        device,
+        kernels,
+        attn_out_batch,
+        &*attn_out_single,
+        token_idx,
+        q_dim,
     )?;
 
     Ok(())
@@ -1913,7 +2064,9 @@ pub(crate) unsafe fn launch_attention_decode_gated(
     // (tiny test models with seq_len << 36_864 already routed
     // SingleBlock); the default of 0 made them route Tiled at
     // seq_len > 0, which previously broke at launch.
-    if variant == AttentionDecodeVariant::Tiled && !attention_decode_tiled_supports_head_dim(head_dim) {
+    if variant == AttentionDecodeVariant::Tiled
+        && !attention_decode_tiled_supports_head_dim(head_dim)
+    {
         variant = AttentionDecodeVariant::SingleBlock;
     }
 
@@ -1943,9 +2096,7 @@ pub(crate) unsafe fn launch_attention_decode_gated(
                 .arg(&max_seq_len)
                 .arg(&scale)
                 .launch(launch_cfg)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("attention_decode launch: {e}"))
-                })?;
+                .map_err(|e| RuntimeError::Compute(format!("attention_decode launch: {e}")))?;
         }
         AttentionDecodeVariant::Tiled => {
             launch_attention_decode_tiled(
@@ -2414,9 +2565,7 @@ unsafe fn launch_dequant_q8_0_to_f32(
         .arg(f32_out)
         .arg(&n)
         .launch(launch_cfg)
-        .map_err(|e| {
-            RuntimeError::Compute(format!("dequant_q8_0_to_f32 {label}: {e}"))
-        })?;
+        .map_err(|e| RuntimeError::Compute(format!("dequant_q8_0_to_f32 {label}: {e}")))?;
     Ok(())
 }
 
@@ -2451,9 +2600,7 @@ unsafe fn launch_dequant_q4_0_to_f32(
         .arg(f32_out)
         .arg(&n)
         .launch(launch_cfg)
-        .map_err(|e| {
-            RuntimeError::Compute(format!("dequant_q4_0_to_f32 {label}: {e}"))
-        })?;
+        .map_err(|e| RuntimeError::Compute(format!("dequant_q4_0_to_f32 {label}: {e}")))?;
     Ok(())
 }
 
@@ -2489,9 +2636,7 @@ unsafe fn launch_dequant_q8_0_to_f16(
         .arg(f16_out)
         .arg(&n)
         .launch(launch_cfg)
-        .map_err(|e| {
-            RuntimeError::Compute(format!("dequant_q8_0_to_f16 {label}: {e}"))
-        })?;
+        .map_err(|e| RuntimeError::Compute(format!("dequant_q8_0_to_f16 {label}: {e}")))?;
     Ok(())
 }
 
@@ -2527,9 +2672,7 @@ unsafe fn launch_dequant_q4_0_to_f16(
         .arg(f16_out)
         .arg(&n)
         .launch(launch_cfg)
-        .map_err(|e| {
-            RuntimeError::Compute(format!("dequant_q4_0_to_f16 {label}: {e}"))
-        })?;
+        .map_err(|e| RuntimeError::Compute(format!("dequant_q4_0_to_f16 {label}: {e}")))?;
     Ok(())
 }
 
@@ -2556,14 +2699,18 @@ unsafe fn launch_matvec_slice(
     // For the non-F32 fallback, we use try_slice to get views at the correct offsets.
     let in_view = input
         .try_slice(_in_offset.._in_offset + in_dim)
-        .ok_or_else(|| RuntimeError::Compute(format!(
-            "matvec_slice input slice out of bounds: offset={_in_offset} dim={in_dim}",
-        )))?;
+        .ok_or_else(|| {
+            RuntimeError::Compute(format!(
+                "matvec_slice input slice out of bounds: offset={_in_offset} dim={in_dim}",
+            ))
+        })?;
     let mut out_view = output
         .try_slice_mut(_out_offset.._out_offset + out_dim)
-        .ok_or_else(|| RuntimeError::Compute(format!(
-            "matvec_slice output slice out of bounds: offset={_out_offset} dim={out_dim}",
-        )))?;
+        .ok_or_else(|| {
+            RuntimeError::Compute(format!(
+                "matvec_slice output slice out of bounds: offset={_out_offset} dim={out_dim}",
+            ))
+        })?;
 
     let mv_block = matvec_block_size();
     let launch_cfg = CudarcLaunchConfig {
@@ -2586,14 +2733,14 @@ unsafe fn launch_matvec_slice(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("matvec F16 {label} prefill: {e}"))
-                })?;
+                .map_err(|e| RuntimeError::Compute(format!("matvec F16 {label} prefill: {e}")))?;
         }
         GpuWeightBuf::Q8Aligned(w_q8a) => {
             // Q8_0 aligned prefill: dp4a with native int* loads.
             use super::decode::{matvec_q8_0_grid, Q8_0_BLOCK_DIM};
-            let q8a_fn = kernels.matvec_q8_0_aligned.as_ref()
+            let q8a_fn = kernels
+                .matvec_q8_0_aligned
+                .as_ref()
                 .or(kernels.matvec_q8_0_dp4a.as_ref())
                 .unwrap_or(&kernels.matvec_q8_0);
             let q8_grid = matvec_q8_0_grid(out_dim as u32);
@@ -2618,7 +2765,9 @@ unsafe fn launch_matvec_slice(
         GpuWeightBuf::Q8Raw(w_q8) => {
             // Q8_0 prefill: dp4a -> v1 fallback.
             use super::decode::{matvec_q8_0_grid, Q8_0_BLOCK_DIM};
-            let q8_fn = kernels.matvec_q8_0_dp4a.as_ref()
+            let q8_fn = kernels
+                .matvec_q8_0_dp4a
+                .as_ref()
                 .unwrap_or(&kernels.matvec_q8_0);
             let q8_grid = matvec_q8_0_grid(out_dim as u32);
             let shmem = 0u32;
@@ -2636,9 +2785,7 @@ unsafe fn launch_matvec_slice(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(q8_launch)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("matvec Q8_0 {label} prefill: {e}"))
-                })?;
+                .map_err(|e| RuntimeError::Compute(format!("matvec Q8_0 {label} prefill: {e}")))?;
         }
         GpuWeightBuf::Q4Raw(w_q4) => {
             device
@@ -2650,9 +2797,7 @@ unsafe fn launch_matvec_slice(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("matvec Q4_0 {label} prefill: {e}"))
-                })?;
+                .map_err(|e| RuntimeError::Compute(format!("matvec Q4_0 {label} prefill: {e}")))?;
         }
         GpuWeightBuf::Q4Aligned(_) => {
             return Err(RuntimeError::Compute(format!(
@@ -2669,14 +2814,14 @@ unsafe fn launch_matvec_slice(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("matvec BF16 {label} prefill: {e}"))
-                })?;
+                .map_err(|e| RuntimeError::Compute(format!("matvec BF16 {label} prefill: {e}")))?;
         }
         // split-layout: / TILE: prefill never dispatches against
         // Q8Split/Q4Split/Q8Tile/Q4Tile siblings.
-        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_)
-        | GpuWeightBuf::Q8Tile(_)  | GpuWeightBuf::Q4Tile(_) => {
+        GpuWeightBuf::Q8Split(_)
+        | GpuWeightBuf::Q4Split(_)
+        | GpuWeightBuf::Q8Tile(_)
+        | GpuWeightBuf::Q4Tile(_) => {
             return Err(RuntimeError::Compute(format!(
                 "matvec prefill fallback {label}: Q8Split/Q4Split/Q8Tile/Q4Tile \
                  sibling routed to prefill",
@@ -2734,14 +2879,16 @@ pub(crate) unsafe fn launch_flash_attention_v2(
         return Err(RuntimeError::Compute(format!(
             "flash_attention_v2: q_batch too small: have {} elements, \
              need {} (batch={batch}, q_dim={q_dim})",
-            q_batch.len(), needed,
+            q_batch.len(),
+            needed,
         )));
     }
     if attn_out.len() < needed {
         return Err(RuntimeError::Compute(format!(
             "flash_attention_v2: attn_out too small: have {} elements, \
              need {} (batch={batch}, q_dim={q_dim})",
-            attn_out.len(), needed,
+            attn_out.len(),
+            needed,
         )));
     }
 
@@ -2812,7 +2959,7 @@ pub(crate) unsafe fn launch_flash_attention_br4(
     head_dim: usize,
     pos_start: usize,
 ) -> Result<(), RuntimeError> {
-    use super::decode::{FA_BR, flash_attention_br4_block_size, flash_attention_br4_shared_bytes};
+    use super::decode::{flash_attention_br4_block_size, flash_attention_br4_shared_bytes, FA_BR};
 
     let q_dim = num_heads * head_dim;
     let needed = batch * q_dim;
@@ -2820,14 +2967,16 @@ pub(crate) unsafe fn launch_flash_attention_br4(
         return Err(RuntimeError::Compute(format!(
             "flash_attention_br4: q_batch too small: have {} elements, \
              need {} (batch={batch}, q_dim={q_dim})",
-            q_batch.len(), needed,
+            q_batch.len(),
+            needed,
         )));
     }
     if attn_out.len() < needed {
         return Err(RuntimeError::Compute(format!(
             "flash_attention_br4: attn_out too small: have {} elements, \
              need {} (batch={batch}, q_dim={q_dim})",
-            attn_out.len(), needed,
+            attn_out.len(),
+            needed,
         )));
     }
 
@@ -2895,7 +3044,9 @@ pub(crate) unsafe fn launch_flash_attention_wmma(
     head_dim: usize,
     pos_start: usize,
 ) -> Result<(), RuntimeError> {
-    use super::decode::{FA_TC_BR, flash_attention_wmma_block_size, flash_attention_wmma_shared_bytes};
+    use super::decode::{
+        flash_attention_wmma_block_size, flash_attention_wmma_shared_bytes, FA_TC_BR,
+    };
 
     let q_dim = num_heads * head_dim;
     let needed = batch * q_dim;
@@ -2903,14 +3054,16 @@ pub(crate) unsafe fn launch_flash_attention_wmma(
         return Err(RuntimeError::Compute(format!(
             "flash_attention_wmma: q_batch too small: have {} elements, \
              need {} (batch={batch}, q_dim={q_dim})",
-            q_batch.len(), needed,
+            q_batch.len(),
+            needed,
         )));
     }
     if attn_out.len() < needed {
         return Err(RuntimeError::Compute(format!(
             "flash_attention_wmma: attn_out too small: have {} elements, \
              need {} (batch={batch}, q_dim={q_dim})",
-            attn_out.len(), needed,
+            attn_out.len(),
+            needed,
         )));
     }
 
@@ -2931,10 +3084,11 @@ pub(crate) unsafe fn launch_flash_attention_wmma(
     let msl = kv_cache.max_seq_len as u32;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
 
-    let wmma_fn = kernels.flash_attention_wmma.as_ref()
-        .ok_or_else(|| RuntimeError::Compute(
-            "flash_attention_wmma: kernel not available (SM 8.0+ required)".into()
-        ))?;
+    let wmma_fn = kernels.flash_attention_wmma.as_ref().ok_or_else(|| {
+        RuntimeError::Compute(
+            "flash_attention_wmma: kernel not available (SM 8.0+ required)".into(),
+        )
+    })?;
 
     device
         .stream
@@ -2978,8 +3132,8 @@ pub(crate) unsafe fn launch_flash_attention_wmma_variant(
     qkf32: bool,
 ) -> Result<(), RuntimeError> {
     use super::decode::{
-        FA_TC_BR, flash_attention_wmma_block_size,
-        flash_attention_wmma_qkf32_shared_bytes, flash_attention_wmma_pvf32_shared_bytes,
+        flash_attention_wmma_block_size, flash_attention_wmma_pvf32_shared_bytes,
+        flash_attention_wmma_qkf32_shared_bytes, FA_TC_BR,
     };
 
     let q_dim = num_heads * head_dim;
@@ -3015,9 +3169,10 @@ pub(crate) unsafe fn launch_flash_attention_wmma_variant(
         kernels.flash_attention_wmma_qkf32.as_ref()
     } else {
         kernels.flash_attention_wmma_pvf32.as_ref()
-    }.ok_or_else(|| RuntimeError::Compute(
-        "flash_attention_wmma_variant: kernel not available".into()
-    ))?;
+    }
+    .ok_or_else(|| {
+        RuntimeError::Compute("flash_attention_wmma_variant: kernel not available".into())
+    })?;
 
     // Opt the variant kernel into its dynamic-smem requirement. NVRTC kernels
     // default to a conservative max dynamic shared size; the qkf32 variant
@@ -3080,7 +3235,7 @@ pub(crate) unsafe fn launch_flash_attention_wmma_split(
     pos_start: usize,
 ) -> Result<(), RuntimeError> {
     use super::decode::{
-        FA_TC_BR, flash_attention_wmma_block_size, flash_attention_wmma_split_shared_bytes,
+        flash_attention_wmma_block_size, flash_attention_wmma_split_shared_bytes, FA_TC_BR,
     };
     let q_dim = num_heads * head_dim;
     let needed = batch * q_dim;
@@ -3158,9 +3313,7 @@ pub(crate) unsafe fn launch_flash_attention_fa2(
     head_dim: usize,
     pos_start: usize,
 ) -> Result<(), RuntimeError> {
-    use super::decode::{
-        FA2_BR, flash_attention_fa2_block_size, flash_attention_fa2_shared_bytes,
-    };
+    use super::decode::{flash_attention_fa2_block_size, flash_attention_fa2_shared_bytes, FA2_BR};
 
     let q_dim = num_heads * head_dim;
     let needed = batch * q_dim;
@@ -3181,14 +3334,9 @@ pub(crate) unsafe fn launch_flash_attention_fa2(
         )));
     }
 
-    let fa2_fn = kernels
-        .flash_attention_fa2_causal
-        .as_ref()
-        .ok_or_else(|| {
-            RuntimeError::Compute(
-                "flash_attention_fa2: kernel not available (compile failure)".into(),
-            )
-        })?;
+    let fa2_fn = kernels.flash_attention_fa2_causal.as_ref().ok_or_else(|| {
+        RuntimeError::Compute("flash_attention_fa2: kernel not available (compile failure)".into())
+    })?;
 
     let block_size = flash_attention_fa2_block_size();
     let shared_bytes = flash_attention_fa2_shared_bytes(head_dim as u32);
@@ -3290,21 +3438,23 @@ pub(crate) unsafe fn launch_flash_attention_fa2_splitk_decode(
     if q.len() < needed || attn_out.len() < needed {
         return Err(RuntimeError::Compute(format!(
             "fa2_splitk_decode: q/attn_out too small (have {}/{}, need {})",
-            q.len(), attn_out.len(), needed,
+            q.len(),
+            attn_out.len(),
+            needed,
         )));
     }
     let partial_fn = kernels
         .flash_attention_fa2_splitk_partial
         .as_ref()
-        .ok_or_else(|| RuntimeError::Compute(
-            "fa2_splitk_decode: partial kernel not available".into()
-        ))?;
+        .ok_or_else(|| {
+            RuntimeError::Compute("fa2_splitk_decode: partial kernel not available".into())
+        })?;
     let reduce_fn = kernels
         .flash_attention_fa2_splitk_reduce
         .as_ref()
-        .ok_or_else(|| RuntimeError::Compute(
-            "fa2_splitk_decode: reduce kernel not available".into()
-        ))?;
+        .ok_or_else(|| {
+            RuntimeError::Compute("fa2_splitk_decode: reduce kernel not available".into())
+        })?;
 
     // For decode, the causal upper bound is `seq_len` itself (the current
     // token attends to KV positions [0, seq_len-1] inclusive plus its OWN
@@ -3316,7 +3466,7 @@ pub(crate) unsafe fn launch_flash_attention_fa2_splitk_decode(
     let causal_max = seq_len;
     if causal_max == 0 || slice_size == 0 {
         return Err(RuntimeError::Compute(
-            "fa2_splitk_decode: seq_len or slice_size is zero".into()
+            "fa2_splitk_decode: seq_len or slice_size is zero".into(),
         ));
     }
     let num_splits = ((causal_max + slice_size - 1) / slice_size).max(1);
@@ -3424,15 +3574,11 @@ pub(crate) unsafe fn launch_flash_attention_fa2_splitk(
     let partial_fn = kernels
         .flash_attention_fa2_splitk_partial
         .as_ref()
-        .ok_or_else(|| {
-            RuntimeError::Compute("fa2_splitk: partial kernel not available".into())
-        })?;
+        .ok_or_else(|| RuntimeError::Compute("fa2_splitk: partial kernel not available".into()))?;
     let reduce_fn = kernels
         .flash_attention_fa2_splitk_reduce
         .as_ref()
-        .ok_or_else(|| {
-            RuntimeError::Compute("fa2_splitk: reduce kernel not available".into())
-        })?;
+        .ok_or_else(|| RuntimeError::Compute("fa2_splitk: reduce kernel not available".into()))?;
 
     let causal_max = (pos_start + batch) as u32;
     if causal_max == 0 || slice_size == 0 {
@@ -3542,19 +3688,25 @@ unsafe fn launch_matvec_residual_slice(
 ) -> Result<(), RuntimeError> {
     let in_view = input
         .try_slice(in_offset..in_offset + in_dim)
-        .ok_or_else(|| RuntimeError::Compute(format!(
-            "matvec_res input slice out of bounds: offset={in_offset} dim={in_dim}",
-        )))?;
+        .ok_or_else(|| {
+            RuntimeError::Compute(format!(
+                "matvec_res input slice out of bounds: offset={in_offset} dim={in_dim}",
+            ))
+        })?;
     let res_view = residual
         .try_slice(res_offset..res_offset + out_dim)
-        .ok_or_else(|| RuntimeError::Compute(format!(
-            "matvec_res residual slice out of bounds: offset={res_offset} dim={out_dim}",
-        )))?;
+        .ok_or_else(|| {
+            RuntimeError::Compute(format!(
+                "matvec_res residual slice out of bounds: offset={res_offset} dim={out_dim}",
+            ))
+        })?;
     let mut out_view = output
         .try_slice_mut(out_offset..out_offset + out_dim)
-        .ok_or_else(|| RuntimeError::Compute(format!(
-            "matvec_res output slice out of bounds: offset={out_offset} dim={out_dim}",
-        )))?;
+        .ok_or_else(|| {
+            RuntimeError::Compute(format!(
+                "matvec_res output slice out of bounds: offset={out_offset} dim={out_dim}",
+            ))
+        })?;
 
     let mv_block = matvec_block_size();
     let launch_cfg = CudarcLaunchConfig {
@@ -3570,7 +3722,9 @@ unsafe fn launch_matvec_residual_slice(
         GpuWeightBuf::Q8Aligned(w_q8a) => {
             // Q8_0 aligned residual prefill: dp4a with native int* loads.
             use super::decode::{matvec_q8_0_grid, Q8_0_BLOCK_DIM};
-            let q8a_fn = kernels.matvec_q8_0_aligned_residual.as_ref()
+            let q8a_fn = kernels
+                .matvec_q8_0_aligned_residual
+                .as_ref()
                 .or(kernels.matvec_q8_0_dp4a_residual.as_ref())
                 .unwrap_or(&kernels.matvec_q8_0_residual);
             let q8_grid = matvec_q8_0_grid(out_dim as u32);
@@ -3596,7 +3750,9 @@ unsafe fn launch_matvec_residual_slice(
         GpuWeightBuf::Q8Raw(w_q8) => {
             // Q8_0 residual prefill: dp4a -> v1 fallback.
             use super::decode::{matvec_q8_0_grid, Q8_0_BLOCK_DIM};
-            let q8_fn = kernels.matvec_q8_0_dp4a_residual.as_ref()
+            let q8_fn = kernels
+                .matvec_q8_0_dp4a_residual
+                .as_ref()
                 .unwrap_or(&kernels.matvec_q8_0_residual);
             let q8_grid = matvec_q8_0_grid(out_dim as u32);
             let shmem = 0u32;
@@ -3671,8 +3827,10 @@ unsafe fn launch_matvec_residual_slice(
         }
         // split-layout: / TILE: prefill never dispatches against
         // Q8Split/Q4Split/Q8Tile/Q4Tile siblings.
-        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_)
-        | GpuWeightBuf::Q8Tile(_)  | GpuWeightBuf::Q4Tile(_) => {
+        GpuWeightBuf::Q8Split(_)
+        | GpuWeightBuf::Q4Split(_)
+        | GpuWeightBuf::Q8Tile(_)
+        | GpuWeightBuf::Q4Tile(_) => {
             return Err(RuntimeError::Compute(format!(
                 "matvec+residual prefill fallback {label}: Q8Split/Q4Split/Q8Tile/Q4Tile \
                  sibling routed to prefill",
@@ -3720,9 +3878,7 @@ pub(crate) unsafe fn launch_f32_to_f16_fast(
             .arg(dst)
             .arg(&n)
             .launch(cfg)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "f32_to_f16_vec4 {label}: {e}",
-            )))?;
+            .map_err(|e| RuntimeError::Compute(format!("f32_to_f16_vec4 {label}: {e}",)))?;
     } else {
         // Fallback: scalar kernel (still uses hardware PTX cvt.rn.f16.f32).
         let block_size = 256u32;
@@ -3739,9 +3895,7 @@ pub(crate) unsafe fn launch_f32_to_f16_fast(
             .arg(dst)
             .arg(&n)
             .launch(cfg)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "f32_to_f16_vec {label}: {e}",
-            )))?;
+            .map_err(|e| RuntimeError::Compute(format!("f32_to_f16_vec {label}: {e}",)))?;
     }
     Ok(())
 }
@@ -3839,9 +3993,7 @@ pub(crate) unsafe fn launch_f32_to_bf16_fast(
             .arg(dst)
             .arg(&n)
             .launch(cfg)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "f32_to_bf16_vec4 {label}: {e}",
-            )))?;
+            .map_err(|e| RuntimeError::Compute(format!("f32_to_bf16_vec4 {label}: {e}",)))?;
     } else {
         let block_size = 256u32;
         let grid_size = (n + block_size - 1) / block_size;
@@ -3857,9 +4009,7 @@ pub(crate) unsafe fn launch_f32_to_bf16_fast(
             .arg(dst)
             .arg(&n)
             .launch(cfg)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "f32_to_bf16_vec {label}: {e}",
-            )))?;
+            .map_err(|e| RuntimeError::Compute(format!("f32_to_bf16_vec {label}: {e}",)))?;
     }
     Ok(())
 }
@@ -3930,4 +4080,3 @@ pub(crate) unsafe fn launch_cublas_gemm_bf16(
     }
     Ok(())
 }
-

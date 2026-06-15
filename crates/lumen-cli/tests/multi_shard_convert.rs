@@ -76,8 +76,10 @@ fn lumen_convert_multi_shard_routes_through_merger() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(!output.status.success(),
-        "lumen convert should fail on unsupported arch (gpt2): stdout={stdout}, stderr={stderr}");
+    assert!(
+        !output.status.success(),
+        "lumen convert should fail on unsupported arch (gpt2): stdout={stdout}, stderr={stderr}"
+    );
     // The downstream converter must surface the architecture error -- this
     // proves the multi-shard reader successfully merged both shards and
     // reached extract_hyperparams.
@@ -119,8 +121,10 @@ fn lumen_convert_multi_shard_missing_sibling_errors_cleanly() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!output.status.success(),
-        "convert must fail when a sibling shard is missing: stdout={stdout}, stderr={stderr}");
+    assert!(
+        !output.status.success(),
+        "convert must fail when a sibling shard is missing: stdout={stdout}, stderr={stderr}"
+    );
     let combined = format!("{stdout}{stderr}");
     // The error should mention the shard count mismatch in some form.
     assert!(

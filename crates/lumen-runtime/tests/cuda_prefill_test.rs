@@ -15,9 +15,9 @@
 use lumen_format::test_model::{generate_test_model, TestModelConfig};
 use lumen_runtime::compute::cpu_naive::NaiveF32Backend;
 use lumen_runtime::compute::{ActivationBuffer, ComputeBackend};
+use lumen_runtime::config::RuntimeConfig;
 use lumen_runtime::cuda::CudaBackend;
 use lumen_runtime::engine::{InferenceEngine, SamplingParams, StopCondition};
-use lumen_runtime::config::RuntimeConfig;
 use lumen_runtime::error::RuntimeError;
 use lumen_runtime::kv::{KvCache, KvCacheConfig, KvPrecision};
 use lumen_runtime::pipeline::PipelineMode;
@@ -81,9 +81,7 @@ fn assert_f32_close(label: &str, actual: &[f32], expected: &[f32], tolerance: f3
         let diff = (a - e).abs();
         if diff > tolerance {
             if mismatches < 5 {
-                eprintln!(
-                    "  {label}[{i}]: CUDA={a:.6}, CPU={e:.6}, diff={diff:.2e}"
-                );
+                eprintln!("  {label}[{i}]: CUDA={a:.6}, CPU={e:.6}, diff={diff:.2e}");
             }
             mismatches += 1;
         }
@@ -139,8 +137,7 @@ fn test_prefill_matches_token_at_a_time_4_tokens() {
     let prompt = vec![0, 1, 2, 3];
 
     // CPU reference: token-at-a-time
-    let cpu_hidden = cpu_prefill_reference(&provider, &cpu, &prompt)
-        .expect("CPU prefill failed");
+    let cpu_hidden = cpu_prefill_reference(&provider, &cpu, &prompt).expect("CPU prefill failed");
 
     // CUDA prefill
     let hp = provider.lbc().header.hyperparams;
@@ -166,8 +163,7 @@ fn test_prefill_matches_token_at_a_time_8_tokens() {
     let (provider, cpu, cuda) = setup_backends().expect("failed to set up backends");
     let prompt: Vec<u32> = (0..8).collect();
 
-    let cpu_hidden = cpu_prefill_reference(&provider, &cpu, &prompt)
-        .expect("CPU prefill failed");
+    let cpu_hidden = cpu_prefill_reference(&provider, &cpu, &prompt).expect("CPU prefill failed");
 
     let hp = provider.lbc().header.hyperparams;
     let num_layers = hp.num_layers as usize;
@@ -192,8 +188,7 @@ fn test_prefill_matches_token_at_a_time_16_tokens() {
     let (provider, cpu, cuda) = setup_backends().expect("failed to set up backends");
     let prompt: Vec<u32> = (0..16).collect();
 
-    let cpu_hidden = cpu_prefill_reference(&provider, &cpu, &prompt)
-        .expect("CPU prefill failed");
+    let cpu_hidden = cpu_prefill_reference(&provider, &cpu, &prompt).expect("CPU prefill failed");
 
     let hp = provider.lbc().header.hyperparams;
     let num_layers = hp.num_layers as usize;
@@ -218,8 +213,7 @@ fn test_prefill_single_token() {
     let (provider, cpu, cuda) = setup_backends().expect("failed to set up backends");
     let prompt = vec![5];
 
-    let cpu_hidden = cpu_prefill_reference(&provider, &cpu, &prompt)
-        .expect("CPU prefill failed");
+    let cpu_hidden = cpu_prefill_reference(&provider, &cpu, &prompt).expect("CPU prefill failed");
 
     let hp = provider.lbc().header.hyperparams;
     let num_layers = hp.num_layers as usize;
@@ -327,16 +321,11 @@ fn test_engine_uses_prefill_path() {
         .expect("generate failed");
 
     // Verify we got 3 generated tokens.
-    assert_eq!(
-        result.tokens.len(),
-        3,
-        "should generate exactly 3 tokens"
-    );
+    assert_eq!(result.tokens.len(), 3, "should generate exactly 3 tokens");
 
     // Verify metrics report prompt tokens.
     assert_eq!(
-        result.metrics.prompt_tokens,
-        4,
+        result.metrics.prompt_tokens, 4,
         "metrics should report 4 prompt tokens"
     );
 }

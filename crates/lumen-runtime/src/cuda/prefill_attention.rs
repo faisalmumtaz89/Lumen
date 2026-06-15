@@ -143,14 +143,7 @@ pub fn prefill_attention_sequential(
 
         // 3. Scatter-write the attention output back into the batch matrix.
         unsafe {
-            launch_scatter_row(
-                device,
-                kernels,
-                attn_out_batch,
-                &*attn_out_single,
-                t,
-                q_dim,
-            )?;
+            launch_scatter_row(device, kernels, attn_out_batch, &*attn_out_single, t, q_dim)?;
         }
     }
 
@@ -258,9 +251,7 @@ mod tests {
 
         // Create deterministic test data.
         // Q: [batch, q_dim] -- each element is (token_idx * q_dim + elem) * 0.1
-        let q_data: Vec<f32> = (0..batch * q_dim)
-            .map(|i| (i as f32) * 0.1)
-            .collect();
+        let q_data: Vec<f32> = (0..batch * q_dim).map(|i| (i as f32) * 0.1).collect();
 
         // K and V: we need to fill the KV cache for positions 0..batch-1.
         // K/V data per token: [kv_dim]
@@ -331,16 +322,13 @@ mod tests {
                 let mut v_matrix = vec![0.0f32; seq_len * head_dim];
                 for p in 0..seq_len {
                     for d in 0..head_dim {
-                        k_matrix[p * head_dim + d] =
-                            k_data[p * kv_dim + kv_h * head_dim + d];
-                        v_matrix[p * head_dim + d] =
-                            v_data[p * kv_dim + kv_h * head_dim + d];
+                        k_matrix[p * head_dim + d] = k_data[p * kv_dim + kv_h * head_dim + d];
+                        v_matrix[p * head_dim + d] = v_data[p * kv_dim + kv_h * head_dim + d];
                     }
                 }
 
-                let expected = cpu_attention_single_head(
-                    q_head, &k_matrix, &v_matrix, seq_len, head_dim,
-                );
+                let expected =
+                    cpu_attention_single_head(q_head, &k_matrix, &v_matrix, seq_len, head_dim);
 
                 // Compare against GPU output.
                 let out_offset = t * q_dim + h * head_dim;
@@ -495,9 +483,7 @@ mod tests {
         }
 
         // Q for the 2 new tokens.
-        let q_data: Vec<f32> = (0..batch * q_dim)
-            .map(|i| (i as f32) * 0.3)
-            .collect();
+        let q_data: Vec<f32> = (0..batch * q_dim).map(|i| (i as f32) * 0.3).collect();
 
         let q_batch = device.htod_copy(&q_data).unwrap();
         let mut attn_out_batch = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
@@ -536,16 +522,13 @@ mod tests {
                 let mut v_matrix = vec![0.0f32; seq_len * head_dim];
                 for p in 0..seq_len {
                     for d in 0..head_dim {
-                        k_matrix[p * head_dim + d] =
-                            all_k[p * kv_dim + kv_h * head_dim + d];
-                        v_matrix[p * head_dim + d] =
-                            all_v[p * kv_dim + kv_h * head_dim + d];
+                        k_matrix[p * head_dim + d] = all_k[p * kv_dim + kv_h * head_dim + d];
+                        v_matrix[p * head_dim + d] = all_v[p * kv_dim + kv_h * head_dim + d];
                     }
                 }
 
-                let expected = cpu_attention_single_head(
-                    q_head, &k_matrix, &v_matrix, seq_len, head_dim,
-                );
+                let expected =
+                    cpu_attention_single_head(q_head, &k_matrix, &v_matrix, seq_len, head_dim);
 
                 let out_offset = t * q_dim + h * head_dim;
                 for d in 0..head_dim {
@@ -600,9 +583,7 @@ mod tests {
         let pos_start = 0;
         let max_seq_len = 16;
 
-        let q_data: Vec<f32> = (0..batch * q_dim)
-            .map(|i| (i as f32) * 0.1)
-            .collect();
+        let q_data: Vec<f32> = (0..batch * q_dim).map(|i| (i as f32) * 0.1).collect();
         let k_data: Vec<f32> = (0..batch * kv_dim)
             .map(|i| ((i as f32) * 0.05 + 0.3).sin())
             .collect();
@@ -613,21 +594,31 @@ mod tests {
         let q_batch = device.htod_copy(&q_data).unwrap();
         let mut attn_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
 
-        let mut kv_cache = KvCacheGpu::new(
-            &device, num_kv_heads, max_seq_len, head_dim,
-        ).unwrap();
+        let mut kv_cache = KvCacheGpu::new(&device, num_kv_heads, max_seq_len, head_dim).unwrap();
         for t in 0..batch {
-            let k_gpu = device.htod_copy(&k_data[t * kv_dim..(t + 1) * kv_dim]).unwrap();
-            let v_gpu = device.htod_copy(&v_data[t * kv_dim..(t + 1) * kv_dim]).unwrap();
+            let k_gpu = device
+                .htod_copy(&k_data[t * kv_dim..(t + 1) * kv_dim])
+                .unwrap();
+            let v_gpu = device
+                .htod_copy(&v_data[t * kv_dim..(t + 1) * kv_dim])
+                .unwrap();
             kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
         }
 
         unsafe {
             super::super::prefill::launch_flash_attention_v2(
-                &device, &kernels,
-                &q_batch, &kv_cache, &mut attn_out,
-                batch, num_heads, num_kv_heads, head_dim, pos_start,
-            ).unwrap();
+                &device,
+                &kernels,
+                &q_batch,
+                &kv_cache,
+                &mut attn_out,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                pos_start,
+            )
+            .unwrap();
         }
         device.synchronize().unwrap();
         let gpu_results = device.dtoh_copy(&attn_out).unwrap();
@@ -643,16 +634,13 @@ mod tests {
                 let mut v_matrix = vec![0.0f32; seq_len * head_dim];
                 for p in 0..seq_len {
                     for d in 0..head_dim {
-                        k_matrix[p * head_dim + d] =
-                            k_data[p * kv_dim + kv_h * head_dim + d];
-                        v_matrix[p * head_dim + d] =
-                            v_data[p * kv_dim + kv_h * head_dim + d];
+                        k_matrix[p * head_dim + d] = k_data[p * kv_dim + kv_h * head_dim + d];
+                        v_matrix[p * head_dim + d] = v_data[p * kv_dim + kv_h * head_dim + d];
                     }
                 }
 
-                let expected = cpu_attention_single_head(
-                    q_head, &k_matrix, &v_matrix, seq_len, head_dim,
-                );
+                let expected =
+                    cpu_attention_single_head(q_head, &k_matrix, &v_matrix, seq_len, head_dim);
 
                 let out_offset = t * q_dim + h * head_dim;
                 for d in 0..head_dim {
@@ -715,21 +703,31 @@ mod tests {
         let q_batch = device.htod_copy(&q_data).unwrap();
         let mut attn_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
 
-        let mut kv_cache = KvCacheGpu::new(
-            &device, num_kv_heads, max_seq_len, head_dim,
-        ).unwrap();
+        let mut kv_cache = KvCacheGpu::new(&device, num_kv_heads, max_seq_len, head_dim).unwrap();
         for t in 0..batch {
-            let k_gpu = device.htod_copy(&k_data[t * kv_dim..(t + 1) * kv_dim]).unwrap();
-            let v_gpu = device.htod_copy(&v_data[t * kv_dim..(t + 1) * kv_dim]).unwrap();
+            let k_gpu = device
+                .htod_copy(&k_data[t * kv_dim..(t + 1) * kv_dim])
+                .unwrap();
+            let v_gpu = device
+                .htod_copy(&v_data[t * kv_dim..(t + 1) * kv_dim])
+                .unwrap();
             kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
         }
 
         unsafe {
             super::super::prefill::launch_flash_attention_br4(
-                &device, &kernels,
-                &q_batch, &kv_cache, &mut attn_out,
-                batch, num_heads, num_kv_heads, head_dim, pos_start,
-            ).unwrap();
+                &device,
+                &kernels,
+                &q_batch,
+                &kv_cache,
+                &mut attn_out,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                pos_start,
+            )
+            .unwrap();
         }
         device.synchronize().unwrap();
         let gpu_results = device.dtoh_copy(&attn_out).unwrap();
@@ -745,16 +743,13 @@ mod tests {
                 let mut v_matrix = vec![0.0f32; seq_len * head_dim];
                 for p in 0..seq_len {
                     for d in 0..head_dim {
-                        k_matrix[p * head_dim + d] =
-                            k_data[p * kv_dim + kv_h * head_dim + d];
-                        v_matrix[p * head_dim + d] =
-                            v_data[p * kv_dim + kv_h * head_dim + d];
+                        k_matrix[p * head_dim + d] = k_data[p * kv_dim + kv_h * head_dim + d];
+                        v_matrix[p * head_dim + d] = v_data[p * kv_dim + kv_h * head_dim + d];
                     }
                 }
 
-                let expected = cpu_attention_single_head(
-                    q_head, &k_matrix, &v_matrix, seq_len, head_dim,
-                );
+                let expected =
+                    cpu_attention_single_head(q_head, &k_matrix, &v_matrix, seq_len, head_dim);
 
                 let out_offset = t * q_dim + h * head_dim;
                 for d in 0..head_dim {
@@ -805,9 +800,7 @@ mod tests {
         let pos_start = pre_existing;
         let max_seq_len = 16;
 
-        let mut kv_cache = KvCacheGpu::new(
-            &device, num_kv_heads, max_seq_len, head_dim,
-        ).unwrap();
+        let mut kv_cache = KvCacheGpu::new(&device, num_kv_heads, max_seq_len, head_dim).unwrap();
 
         let all_k: Vec<f32> = (0..(pre_existing + batch) * kv_dim)
             .map(|i| ((i as f32) * 0.05 + 0.1).sin())
@@ -817,24 +810,34 @@ mod tests {
             .collect();
 
         for t in 0..(pre_existing + batch) {
-            let k_gpu = device.htod_copy(&all_k[t * kv_dim..(t + 1) * kv_dim]).unwrap();
-            let v_gpu = device.htod_copy(&all_v[t * kv_dim..(t + 1) * kv_dim]).unwrap();
+            let k_gpu = device
+                .htod_copy(&all_k[t * kv_dim..(t + 1) * kv_dim])
+                .unwrap();
+            let v_gpu = device
+                .htod_copy(&all_v[t * kv_dim..(t + 1) * kv_dim])
+                .unwrap();
             kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
         }
 
-        let q_data: Vec<f32> = (0..batch * q_dim)
-            .map(|i| (i as f32) * 0.3)
-            .collect();
+        let q_data: Vec<f32> = (0..batch * q_dim).map(|i| (i as f32) * 0.3).collect();
 
         let q_batch = device.htod_copy(&q_data).unwrap();
         let mut attn_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
 
         unsafe {
             super::super::prefill::launch_flash_attention_v2(
-                &device, &kernels,
-                &q_batch, &kv_cache, &mut attn_out,
-                batch, num_heads, num_kv_heads, head_dim, pos_start,
-            ).unwrap();
+                &device,
+                &kernels,
+                &q_batch,
+                &kv_cache,
+                &mut attn_out,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                pos_start,
+            )
+            .unwrap();
         }
         device.synchronize().unwrap();
         let gpu_results = device.dtoh_copy(&attn_out).unwrap();
@@ -850,16 +853,13 @@ mod tests {
                 let mut v_matrix = vec![0.0f32; seq_len * head_dim];
                 for p in 0..seq_len {
                     for d in 0..head_dim {
-                        k_matrix[p * head_dim + d] =
-                            all_k[p * kv_dim + kv_h * head_dim + d];
-                        v_matrix[p * head_dim + d] =
-                            all_v[p * kv_dim + kv_h * head_dim + d];
+                        k_matrix[p * head_dim + d] = all_k[p * kv_dim + kv_h * head_dim + d];
+                        v_matrix[p * head_dim + d] = all_v[p * kv_dim + kv_h * head_dim + d];
                     }
                 }
 
-                let expected = cpu_attention_single_head(
-                    q_head, &k_matrix, &v_matrix, seq_len, head_dim,
-                );
+                let expected =
+                    cpu_attention_single_head(q_head, &k_matrix, &v_matrix, seq_len, head_dim);
 
                 let out_offset = t * q_dim + h * head_dim;
                 for d in 0..head_dim {
@@ -921,12 +921,14 @@ mod tests {
             .collect();
 
         // Setup KV cache
-        let mut kv_cache = KvCacheGpu::new(
-            &device, num_kv_heads, max_seq_len, head_dim,
-        ).unwrap();
+        let mut kv_cache = KvCacheGpu::new(&device, num_kv_heads, max_seq_len, head_dim).unwrap();
         for t in 0..batch {
-            let k_gpu = device.htod_copy(&k_data[t * kv_dim..(t + 1) * kv_dim]).unwrap();
-            let v_gpu = device.htod_copy(&v_data[t * kv_dim..(t + 1) * kv_dim]).unwrap();
+            let k_gpu = device
+                .htod_copy(&k_data[t * kv_dim..(t + 1) * kv_dim])
+                .unwrap();
+            let v_gpu = device
+                .htod_copy(&v_data[t * kv_dim..(t + 1) * kv_dim])
+                .unwrap();
             kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
         }
 
@@ -937,11 +939,20 @@ mod tests {
         let mut attn_out_single = device.alloc_zeros::<f32>(q_dim).unwrap();
 
         prefill_attention_sequential(
-            &device, &kernels,
-            &q_batch, &kv_cache, &mut seq_out,
-            batch, num_heads, num_kv_heads, head_dim, pos_start,
-            &mut q_single, &mut attn_out_single,
-        ).unwrap();
+            &device,
+            &kernels,
+            &q_batch,
+            &kv_cache,
+            &mut seq_out,
+            batch,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            pos_start,
+            &mut q_single,
+            &mut attn_out_single,
+        )
+        .unwrap();
         device.synchronize().unwrap();
         let seq_results = device.dtoh_copy(&seq_out).unwrap();
 
@@ -949,10 +960,18 @@ mod tests {
         let mut flash_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
         unsafe {
             super::super::prefill::launch_flash_attention_v2(
-                &device, &kernels,
-                &q_batch, &kv_cache, &mut flash_out,
-                batch, num_heads, num_kv_heads, head_dim, pos_start,
-            ).unwrap();
+                &device,
+                &kernels,
+                &q_batch,
+                &kv_cache,
+                &mut flash_out,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                pos_start,
+            )
+            .unwrap();
         }
         device.synchronize().unwrap();
         let flash_results = device.dtoh_copy(&flash_out).unwrap();
@@ -966,7 +985,8 @@ mod tests {
                 diff < 1e-3,
                 "flash vs sequential mismatch at index {i}: \
                  seq={}, flash={}, diff={diff}",
-                seq_results[i], flash_results[i],
+                seq_results[i],
+                flash_results[i],
             );
         }
         eprintln!("flash_v2 vs sequential: max diff = {max_diff:.6e}");
@@ -988,11 +1008,17 @@ mod tests {
         }
         let device = match super::super::ffi::CudaDevice::new(0) {
             Ok(d) => d,
-            Err(e) => { eprintln!("Skipping: device init: {e}"); return; }
+            Err(e) => {
+                eprintln!("Skipping: device init: {e}");
+                return;
+            }
         };
         let kernels = match super::super::decode::compile_all_kernels(&device) {
             Ok(k) => k,
-            Err(e) => { eprintln!("Skipping: compile: {e}"); return; }
+            Err(e) => {
+                eprintln!("Skipping: compile: {e}");
+                return;
+            }
         };
         if kernels.flash_attention_fa2_causal.is_none() {
             eprintln!("Skipping: flash_attention_fa2_causal not loaded");
@@ -1018,12 +1044,14 @@ mod tests {
             .map(|i| ((i as f32) * 0.09 + 1.4).sin())
             .collect();
 
-        let mut kv_cache = KvCacheGpu::new(
-            &device, num_kv_heads, max_seq_len, head_dim,
-        ).unwrap();
+        let mut kv_cache = KvCacheGpu::new(&device, num_kv_heads, max_seq_len, head_dim).unwrap();
         for t in 0..batch {
-            let k_gpu = device.htod_copy(&k_data[t * kv_dim..(t + 1) * kv_dim]).unwrap();
-            let v_gpu = device.htod_copy(&v_data[t * kv_dim..(t + 1) * kv_dim]).unwrap();
+            let k_gpu = device
+                .htod_copy(&k_data[t * kv_dim..(t + 1) * kv_dim])
+                .unwrap();
+            let v_gpu = device
+                .htod_copy(&v_data[t * kv_dim..(t + 1) * kv_dim])
+                .unwrap();
             kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
         }
 
@@ -1033,9 +1061,18 @@ mod tests {
         let mut ref_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
         unsafe {
             super::super::prefill::launch_flash_attention_v2(
-                &device, &kernels, &q_batch, &kv_cache, &mut ref_out,
-                batch, num_heads, num_kv_heads, head_dim, pos_start,
-            ).unwrap();
+                &device,
+                &kernels,
+                &q_batch,
+                &kv_cache,
+                &mut ref_out,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                pos_start,
+            )
+            .unwrap();
         }
         device.synchronize().unwrap();
         let ref_results = device.dtoh_copy(&ref_out).unwrap();
@@ -1044,9 +1081,18 @@ mod tests {
         let mut fa2_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
         unsafe {
             super::super::prefill::launch_flash_attention_fa2(
-                &device, &kernels, &q_batch, &kv_cache, &mut fa2_out,
-                batch, num_heads, num_kv_heads, head_dim, pos_start,
-            ).unwrap();
+                &device,
+                &kernels,
+                &q_batch,
+                &kv_cache,
+                &mut fa2_out,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                pos_start,
+            )
+            .unwrap();
         }
         device.synchronize().unwrap();
         let fa2_results = device.dtoh_copy(&fa2_out).unwrap();
@@ -1059,7 +1105,8 @@ mod tests {
                 diff < 1e-3,
                 "fa2_blockskip vs flash_v2 mismatch at index {i}: \
                  ref={}, fa2={}, diff={diff}",
-                ref_results[i], fa2_results[i],
+                ref_results[i],
+                fa2_results[i],
             );
         }
         eprintln!("fa2_blockskip vs flash_v2: max diff = {max_diff:.6e}");
@@ -1076,11 +1123,17 @@ mod tests {
         }
         let device = match super::super::ffi::CudaDevice::new(0) {
             Ok(d) => d,
-            Err(e) => { eprintln!("Skipping: device init: {e}"); return; }
+            Err(e) => {
+                eprintln!("Skipping: device init: {e}");
+                return;
+            }
         };
         let kernels = match super::super::decode::compile_all_kernels(&device) {
             Ok(k) => k,
-            Err(e) => { eprintln!("Skipping: compile: {e}"); return; }
+            Err(e) => {
+                eprintln!("Skipping: compile: {e}");
+                return;
+            }
         };
         if kernels.flash_attention_fa2_causal.is_none() {
             eprintln!("Skipping: flash_attention_fa2_causal not loaded");
@@ -1105,12 +1158,14 @@ mod tests {
             .map(|i| ((i as f32) * 0.07 + 0.2).cos())
             .collect();
 
-        let mut kv_cache = KvCacheGpu::new(
-            &device, num_kv_heads, max_seq_len, head_dim,
-        ).unwrap();
+        let mut kv_cache = KvCacheGpu::new(&device, num_kv_heads, max_seq_len, head_dim).unwrap();
         for t in 0..total {
-            let k_gpu = device.htod_copy(&all_k[t * kv_dim..(t + 1) * kv_dim]).unwrap();
-            let v_gpu = device.htod_copy(&all_v[t * kv_dim..(t + 1) * kv_dim]).unwrap();
+            let k_gpu = device
+                .htod_copy(&all_k[t * kv_dim..(t + 1) * kv_dim])
+                .unwrap();
+            let v_gpu = device
+                .htod_copy(&all_v[t * kv_dim..(t + 1) * kv_dim])
+                .unwrap();
             kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
         }
 
@@ -1122,9 +1177,18 @@ mod tests {
         let mut ref_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
         unsafe {
             super::super::prefill::launch_flash_attention_v2(
-                &device, &kernels, &q_batch, &kv_cache, &mut ref_out,
-                batch, num_heads, num_kv_heads, head_dim, pos_start,
-            ).unwrap();
+                &device,
+                &kernels,
+                &q_batch,
+                &kv_cache,
+                &mut ref_out,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                pos_start,
+            )
+            .unwrap();
         }
         device.synchronize().unwrap();
         let ref_results = device.dtoh_copy(&ref_out).unwrap();
@@ -1132,9 +1196,18 @@ mod tests {
         let mut fa2_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
         unsafe {
             super::super::prefill::launch_flash_attention_fa2(
-                &device, &kernels, &q_batch, &kv_cache, &mut fa2_out,
-                batch, num_heads, num_kv_heads, head_dim, pos_start,
-            ).unwrap();
+                &device,
+                &kernels,
+                &q_batch,
+                &kv_cache,
+                &mut fa2_out,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                pos_start,
+            )
+            .unwrap();
         }
         device.synchronize().unwrap();
         let fa2_results = device.dtoh_copy(&fa2_out).unwrap();
@@ -1147,7 +1220,8 @@ mod tests {
                 diff < 1e-3,
                 "fa2 pos_offset mismatch at index {i}: \
                  ref={}, fa2={}, diff={diff}",
-                ref_results[i], fa2_results[i],
+                ref_results[i],
+                fa2_results[i],
             );
         }
         eprintln!("fa2 pos_offset: max diff = {max_diff:.6e}");
@@ -1165,11 +1239,17 @@ mod tests {
         }
         let device = match super::super::ffi::CudaDevice::new(0) {
             Ok(d) => d,
-            Err(e) => { eprintln!("Skipping: device init: {e}"); return; }
+            Err(e) => {
+                eprintln!("Skipping: device init: {e}");
+                return;
+            }
         };
         let kernels = match super::super::decode::compile_all_kernels(&device) {
             Ok(k) => k,
-            Err(e) => { eprintln!("Skipping: compile: {e}"); return; }
+            Err(e) => {
+                eprintln!("Skipping: compile: {e}");
+                return;
+            }
         };
         if kernels.flash_attention_fa2_splitk_partial.is_none()
             || kernels.flash_attention_fa2_splitk_reduce.is_none()
@@ -1197,12 +1277,14 @@ mod tests {
             .map(|i| ((i as f32) * 0.08 + 0.6).sin())
             .collect();
 
-        let mut kv_cache = KvCacheGpu::new(
-            &device, num_kv_heads, max_seq_len, head_dim,
-        ).unwrap();
+        let mut kv_cache = KvCacheGpu::new(&device, num_kv_heads, max_seq_len, head_dim).unwrap();
         for t in 0..batch {
-            let k_gpu = device.htod_copy(&k_data[t * kv_dim..(t + 1) * kv_dim]).unwrap();
-            let v_gpu = device.htod_copy(&v_data[t * kv_dim..(t + 1) * kv_dim]).unwrap();
+            let k_gpu = device
+                .htod_copy(&k_data[t * kv_dim..(t + 1) * kv_dim])
+                .unwrap();
+            let v_gpu = device
+                .htod_copy(&v_data[t * kv_dim..(t + 1) * kv_dim])
+                .unwrap();
             kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
         }
 
@@ -1211,9 +1293,18 @@ mod tests {
         let mut ref_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
         unsafe {
             super::super::prefill::launch_flash_attention_v2(
-                &device, &kernels, &q_batch, &kv_cache, &mut ref_out,
-                batch, num_heads, num_kv_heads, head_dim, pos_start,
-            ).unwrap();
+                &device,
+                &kernels,
+                &q_batch,
+                &kv_cache,
+                &mut ref_out,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                pos_start,
+            )
+            .unwrap();
         }
         device.synchronize().unwrap();
         let ref_results = device.dtoh_copy(&ref_out).unwrap();
@@ -1222,10 +1313,19 @@ mod tests {
         let mut split_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
         unsafe {
             super::super::prefill::launch_flash_attention_fa2_splitk(
-                &device, &kernels, &q_batch, &kv_cache, &mut split_out,
-                batch, num_heads, num_kv_heads, head_dim, pos_start,
+                &device,
+                &kernels,
+                &q_batch,
+                &kv_cache,
+                &mut split_out,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                pos_start,
                 /* slice_size = */ 2,
-            ).unwrap();
+            )
+            .unwrap();
         }
         device.synchronize().unwrap();
         let split_results = device.dtoh_copy(&split_out).unwrap();
@@ -1238,7 +1338,8 @@ mod tests {
                 diff < 1e-3,
                 "fa2_splitk vs flash_v2 mismatch at index {i}: \
                  ref={}, split={}, diff={diff}",
-                ref_results[i], split_results[i],
+                ref_results[i],
+                split_results[i],
             );
         }
         eprintln!("fa2_splitk vs flash_v2: max diff = {max_diff:.6e}");

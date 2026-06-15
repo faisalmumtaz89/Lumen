@@ -11,7 +11,9 @@ use lumen_runtime::runtime_defaults as rd;
 use lumen_runtime::weight::provider_sync::SyncWeightProvider;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: dump_quant_hint <lbc>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: dump_quant_hint <lbc>");
     let provider = SyncWeightProvider::open(std::path::Path::new(&path)).expect("open LBC");
     let opq = provider.output_proj_quant;
     let num_layers = provider.lbc().header.hyperparams.num_layers;
@@ -31,7 +33,16 @@ fn main() {
     println!("  output_proj_quant (-> set_model_dense_quant) = {opq:?}");
     println!("  num_layers        (-> set_model_block_count)  = {num_layers}");
     println!("  num_experts                                   = {num_experts} (is_moe={is_moe})");
-    println!("  model_dense_quant()                           = {:?}", rd::model_dense_quant_pub());
-    println!("  attn_precise_default()                        = {}", rd::attn_precise_default());
-    println!("  gdn_decode_via_prefill_default()              = {}", rd::gdn_decode_via_prefill_default());
+    println!(
+        "  model_dense_quant()                           = {:?}",
+        rd::model_dense_quant_pub()
+    );
+    println!(
+        "  attn_precise_default()                        = {}",
+        rd::attn_precise_default()
+    );
+    println!(
+        "  gdn_decode_via_prefill_default()              = {}",
+        rd::gdn_decode_via_prefill_default()
+    );
 }

@@ -2,8 +2,8 @@
 //!
 //! Pure functions with no state.
 
-use crate::gguf::GgmlType;
 use crate::convert::ConvertError;
+use crate::gguf::GgmlType;
 
 // ---------------------------------------------------------------------------
 // F16/BF16 -> F32 conversion
@@ -39,7 +39,11 @@ pub(crate) fn f16_to_f32(bits: u16) -> f32 {
     let e = (exp as i32) - 15;
     let f = 1.0 + frac as f32 / 1024.0;
     let v = f * 2.0f32.powi(e);
-    if sign == 1 { -v } else { v }
+    if sign == 1 {
+        -v
+    } else {
+        v
+    }
 }
 
 /// Convert a bfloat16 value to f32 (zero-extend the lower 16 bits).
@@ -553,7 +557,7 @@ pub(crate) fn dequantize_q2_k(src: &[u8], n_elements: u64) -> Vec<u8> {
         let mut y_local = 0usize;
         let mut q_off = 0usize; // qs byte offset for the current 128-value group
         let mut is = 0usize; // scale sub-block cursor
-        // Two groups of 128 values; q pointer advances 32 bytes per group.
+                             // Two groups of 128 values; q pointer advances 32 bytes per group.
         for _group in 0..2 {
             let mut shift = 0u8;
             for _j in 0..4 {
@@ -629,9 +633,24 @@ pub(crate) fn dequantize_q3_k(src: &[u8], n_elements: u64) -> Vec<u8> {
         //   scales = (const int8_t*)aux;  // 16 bytes, each used as (sc - 32)
         const KMASK1: u32 = 0x0303_0303;
         const KMASK2: u32 = 0x0f0f_0f0f;
-        let a0 = u32::from_le_bytes([scale_bytes[0], scale_bytes[1], scale_bytes[2], scale_bytes[3]]);
-        let a1 = u32::from_le_bytes([scale_bytes[4], scale_bytes[5], scale_bytes[6], scale_bytes[7]]);
-        let tmp = u32::from_le_bytes([scale_bytes[8], scale_bytes[9], scale_bytes[10], scale_bytes[11]]);
+        let a0 = u32::from_le_bytes([
+            scale_bytes[0],
+            scale_bytes[1],
+            scale_bytes[2],
+            scale_bytes[3],
+        ]);
+        let a1 = u32::from_le_bytes([
+            scale_bytes[4],
+            scale_bytes[5],
+            scale_bytes[6],
+            scale_bytes[7],
+        ]);
+        let tmp = u32::from_le_bytes([
+            scale_bytes[8],
+            scale_bytes[9],
+            scale_bytes[10],
+            scale_bytes[11],
+        ]);
         let out0 = (a0 & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
         let out1 = (a1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
         let out2 = ((a0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
@@ -710,7 +729,6 @@ pub(crate) fn dequantize_q3_k(src: &[u8], n_elements: u64) -> Vec<u8> {
     out
 }
 
-
 // ---------------------------------------------------------------------------
 // F32 -> Q4_0 quantization (for requantization during conversion)
 // ---------------------------------------------------------------------------
@@ -767,7 +785,10 @@ pub(crate) fn f32_to_f16_bits_convert(val: f32) -> u16 {
 /// Input: raw F32 bytes (little-endian), n_elements must be divisible by 32.
 /// Output: Q4_0 bytes ([f16 scale][16 bytes nibbles] per 32-element block).
 pub(crate) fn quantize_f32_to_q4_0(f32_bytes: &[u8], n_elements: usize) -> Vec<u8> {
-    assert!(n_elements % 32 == 0, "Q4_0 quantization requires elements divisible by 32");
+    assert!(
+        n_elements % 32 == 0,
+        "Q4_0 quantization requires elements divisible by 32"
+    );
     let num_blocks = n_elements / 32;
     let mut out = Vec::with_capacity(num_blocks * 18);
 
@@ -778,7 +799,10 @@ pub(crate) fn quantize_f32_to_q4_0(f32_bytes: &[u8], n_elements: usize) -> Vec<u
         for i in 0..32 {
             let off = (base + i) * 4;
             vals[i] = f32::from_le_bytes([
-                f32_bytes[off], f32_bytes[off + 1], f32_bytes[off + 2], f32_bytes[off + 3],
+                f32_bytes[off],
+                f32_bytes[off + 1],
+                f32_bytes[off + 2],
+                f32_bytes[off + 3],
             ]);
         }
 
@@ -796,7 +820,11 @@ pub(crate) fn quantize_f32_to_q4_0(f32_bytes: &[u8], n_elements: usize) -> Vec<u
         // amax/7 overflow f16 to Inf and the whole block dequantize to NaN
         // (reproduced 2026-06-10 with a synthetic high-amplitude block). With the
         // clamp, out-of-range values saturate at the nibble bounds instead.
-        let scale = if amax == 0.0 { 1.0 } else { (amax / 7.0).min(65504.0) };
+        let scale = if amax == 0.0 {
+            1.0
+        } else {
+            (amax / 7.0).min(65504.0)
+        };
         let inv_scale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
 
         // Write f16 scale
@@ -820,7 +848,10 @@ pub(crate) fn quantize_f32_to_q4_0(f32_bytes: &[u8], n_elements: usize) -> Vec<u
 /// Input: raw F32 bytes (little-endian), n_elements must be divisible by 32.
 /// Output: Q8_0 bytes ([f16 scale][32 x i8 quants] per 32-element block = 34 bytes/block).
 pub(crate) fn quantize_f32_to_q8_0(f32_bytes: &[u8], n_elements: usize) -> Vec<u8> {
-    assert!(n_elements % 32 == 0, "Q8_0 quantization requires elements divisible by 32");
+    assert!(
+        n_elements % 32 == 0,
+        "Q8_0 quantization requires elements divisible by 32"
+    );
     let num_blocks = n_elements / 32;
     // Q8_0 block = 2 bytes (f16 scale) + 32 bytes (i8 quants) = 34 bytes
     let mut out = Vec::with_capacity(num_blocks * 34);
@@ -832,7 +863,10 @@ pub(crate) fn quantize_f32_to_q8_0(f32_bytes: &[u8], n_elements: usize) -> Vec<u
         for i in 0..32 {
             let off = (base + i) * 4;
             vals[i] = f32::from_le_bytes([
-                f32_bytes[off], f32_bytes[off + 1], f32_bytes[off + 2], f32_bytes[off + 3],
+                f32_bytes[off],
+                f32_bytes[off + 1],
+                f32_bytes[off + 2],
+                f32_bytes[off + 3],
             ]);
         }
 
@@ -887,7 +921,10 @@ pub(crate) fn e8m0_to_f32_half(e: u8) -> f32 {
 /// and the high nibble (qs[j] >> 4) maps to output[j + 16].
 pub(crate) fn dequantize_mxfp4(src: &[u8], n_elements: u64) -> Vec<u8> {
     let n = n_elements as usize;
-    assert!(n % 32 == 0, "MXFP4 dequantization requires elements divisible by 32");
+    assert!(
+        n % 32 == 0,
+        "MXFP4 dequantization requires elements divisible by 32"
+    );
     let num_blocks = n / 32;
     let mut out = Vec::with_capacity(n * 4);
 
@@ -974,7 +1011,10 @@ pub(crate) fn dequantize_to_f32_bytes(
 // requantisation against Q3_K-quantised GGUFs.
 #[cfg(test)]
 pub(crate) fn quantize_f32_to_q3_k(f32_bytes: &[u8], n_elements: usize) -> Vec<u8> {
-    assert!(n_elements % 256 == 0, "Q3_K quantization requires elements divisible by 256");
+    assert!(
+        n_elements % 256 == 0,
+        "Q3_K quantization requires elements divisible by 256"
+    );
     let num_blocks = n_elements / 256;
     let mut out = vec![0u8; num_blocks * 110];
     let mut vals = [0.0f32; 256];
@@ -984,8 +1024,10 @@ pub(crate) fn quantize_f32_to_q3_k(f32_bytes: &[u8], n_elements: usize) -> Vec<u
         for i in 0..256 {
             let off = (base + i) * 4;
             vals[i] = f32::from_le_bytes([
-                f32_bytes[off], f32_bytes[off + 1],
-                f32_bytes[off + 2], f32_bytes[off + 3],
+                f32_bytes[off],
+                f32_bytes[off + 1],
+                f32_bytes[off + 2],
+                f32_bytes[off + 3],
             ]);
         }
 
@@ -996,7 +1038,9 @@ pub(crate) fn quantize_f32_to_q3_k(f32_bytes: &[u8], n_elements: usize) -> Vec<u
             let s = make_qx_quants_q3(&vals[sb * 16..(sb + 1) * 16]);
             sub_scale[sb] = s;
             let a = s.abs();
-            if a > max_abs_scale { max_abs_scale = a; }
+            if a > max_abs_scale {
+                max_abs_scale = a;
+            }
         }
 
         // 2) Super-block iscale (GGML Q3_K sign convention).
@@ -1023,8 +1067,12 @@ pub(crate) fn quantize_f32_to_q3_k(f32_bytes: &[u8], n_elements: usize) -> Vec<u
             for k in 0..16 {
                 let idx = sb * 16 + k;
                 let mut q = (vals[idx] * inv_eff).round() as i32;
-                if q < -4 { q = -4; }
-                if q > 3 { q = 3; }
+                if q < -4 {
+                    q = -4;
+                }
+                if q > 3 {
+                    q = 3;
+                }
                 q3[idx] = (q + 4) as u8;
             }
         }
@@ -1067,11 +1115,11 @@ pub(crate) fn quantize_f32_to_q3_k(f32_bytes: &[u8], n_elements: usize) -> Vec<u
         // so the inverse pack is:
         let sb_scale_bytes = &mut bp[96..108];
         for k in 0..4 {
-            sb_scale_bytes[k]     = (sc6[k]     & 0x0F) | ((sc6[k + 8]  & 0x0F) << 4);
+            sb_scale_bytes[k] = (sc6[k] & 0x0F) | ((sc6[k + 8] & 0x0F) << 4);
             sb_scale_bytes[4 + k] = (sc6[4 + k] & 0x0F) | ((sc6[12 + k] & 0x0F) << 4);
-            sb_scale_bytes[8 + k] = ((sc6[k]      >> 4) & 3)
-                | (((sc6[4 + k]  >> 4) & 3) << 2)
-                | (((sc6[8 + k]  >> 4) & 3) << 4)
+            sb_scale_bytes[8 + k] = ((sc6[k] >> 4) & 3)
+                | (((sc6[4 + k] >> 4) & 3) << 2)
+                | (((sc6[8 + k] >> 4) & 3) << 4)
                 | (((sc6[12 + k] >> 4) & 3) << 6);
         }
 
@@ -1094,9 +1142,14 @@ fn make_qx_quants_q3(x: &[f32]) -> f32 {
     let mut max_signed = 0.0f32;
     for &v in x {
         let av = v.abs();
-        if av > amax { amax = av; max_signed = v; }
+        if av > amax {
+            amax = av;
+            max_signed = v;
+        }
     }
-    if amax == 0.0 { return 0.0; }
+    if amax == 0.0 {
+        return 0.0;
+    }
 
     // Initial iscale (per the GGML Q3_K reference encoder): -nmax / max(x).
     let iscale_initial = -(NMAX as f32) / max_signed;
@@ -1105,7 +1158,9 @@ fn make_qx_quants_q3(x: &[f32]) -> f32 {
 
     // Sweep small perturbations: is in [-9..9] except 0.
     for is in -9..=9i32 {
-        if is == 0 { continue; }
+        if is == 0 {
+            continue;
+        }
         let iscale = -(NMAX as f32 + 0.1f32 * is as f32) / max_signed;
         let s = q3_iscale_score(x, iscale, NMAX);
         if s > best_score {
@@ -1113,7 +1168,11 @@ fn make_qx_quants_q3(x: &[f32]) -> f32 {
             best_iscale = iscale;
         }
     }
-    if best_iscale == 0.0 { 0.0 } else { 1.0 / best_iscale }
+    if best_iscale == 0.0 {
+        0.0
+    } else {
+        1.0 / best_iscale
+    }
 }
 
 #[cfg(test)]
@@ -1126,7 +1185,11 @@ fn q3_iscale_score(x: &[f32], iscale: f32, nmax: i32) -> f32 {
         sum_xq += v * l;
         sum_qq += l * l;
     }
-    if sum_qq > 0.0 { sum_xq * sum_xq / sum_qq } else { 0.0 }
+    if sum_qq > 0.0 {
+        sum_xq * sum_xq / sum_qq
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]
@@ -1135,15 +1198,17 @@ mod q3_k_encoder_tests {
 
     fn vec_to_f32_bytes(v: &[f32]) -> Vec<u8> {
         let mut out = Vec::with_capacity(v.len() * 4);
-        for &x in v { out.extend_from_slice(&x.to_le_bytes()); }
+        for &x in v {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
         out
     }
 
     fn dequant_to_vec(q3_bytes: &[u8], n: usize) -> Vec<f32> {
         let dq = dequantize_q3_k(q3_bytes, n as u64);
-        (0..n).map(|i| f32::from_le_bytes([
-            dq[i*4], dq[i*4+1], dq[i*4+2], dq[i*4+3]
-        ])).collect()
+        (0..n)
+            .map(|i| f32::from_le_bytes([dq[i * 4], dq[i * 4 + 1], dq[i * 4 + 2], dq[i * 4 + 3]]))
+            .collect()
     }
 
     #[test]
@@ -1153,7 +1218,9 @@ mod q3_k_encoder_tests {
         let q3 = quantize_f32_to_q3_k(&vec_to_f32_bytes(&zeros), n);
         assert_eq!(q3.len(), 110);
         let rt = dequant_to_vec(&q3, n);
-        for &v in &rt { assert_eq!(v, 0.0); }
+        for &v in &rt {
+            assert_eq!(v, 0.0);
+        }
     }
 
     #[test]
@@ -1177,10 +1244,12 @@ mod q3_k_encoder_tests {
         // Smooth input is easier than i.i.d. Gaussian. We expect Q3_K to
         // achieve >= 20 dB SNR here; this guards the encoder from gross bugs.
         let n = 4096;
-        let v: Vec<f32> = (0..n).map(|i| {
-            let t = i as f32 / n as f32;
-            (t * 8.0 * std::f32::consts::PI).sin() * 1.5
-        }).collect();
+        let v: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / n as f32;
+                (t * 8.0 * std::f32::consts::PI).sin() * 1.5
+            })
+            .collect();
         let q3 = quantize_f32_to_q3_k(&vec_to_f32_bytes(&v), n);
         let rt = dequant_to_vec(&q3, n);
         let mut sig = 0.0f32;

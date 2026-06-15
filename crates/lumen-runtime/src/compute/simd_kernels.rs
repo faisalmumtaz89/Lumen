@@ -341,13 +341,7 @@ pub fn matmul_bytes_simd_2row(
 /// 4-accumulator pattern identical to matmul_bytes_simd.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub fn matmul_simd(
-    out: &mut [f32],
-    w: &[f32],
-    x: &[f32],
-    out_dim: usize,
-    in_dim: usize,
-) {
+pub fn matmul_simd(out: &mut [f32], w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) {
     assert!(out.len() >= out_dim);
     assert!(w.len() >= out_dim * in_dim);
     assert!(x.len() >= in_dim);
@@ -412,13 +406,7 @@ pub fn matmul_simd(
 
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
-pub fn matmul_simd(
-    out: &mut [f32],
-    w: &[f32],
-    x: &[f32],
-    out_dim: usize,
-    in_dim: usize,
-) {
+pub fn matmul_simd(out: &mut [f32], w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) {
     matmul_fallback(out, w, x, out_dim, in_dim);
 }
 
@@ -429,13 +417,7 @@ pub fn matmul_simd(
 /// Same 4-accumulator ILP pattern as matmul_simd, extended to 2 rows sharing x loads.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub fn matmul_simd_2row(
-    out: &mut [f32],
-    w: &[f32],
-    x: &[f32],
-    out_dim: usize,
-    in_dim: usize,
-) {
+pub fn matmul_simd_2row(out: &mut [f32], w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) {
     assert!(out.len() >= out_dim);
     assert!(w.len() >= out_dim * in_dim);
     assert!(x.len() >= in_dim);
@@ -568,13 +550,7 @@ pub fn matmul_simd_2row(
 
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
-pub fn matmul_simd_2row(
-    out: &mut [f32],
-    w: &[f32],
-    x: &[f32],
-    out_dim: usize,
-    in_dim: usize,
-) {
+pub fn matmul_simd_2row(out: &mut [f32], w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) {
     matmul_fallback(out, w, x, out_dim, in_dim);
 }
 
@@ -622,9 +598,8 @@ pub fn matmul_bytes_simd_parallel(
         // SAFETY: Each thread writes to a disjoint contiguous range of `out`.
         // The ranges [start..end) are non-overlapping by construction of parallel_for.
         // w_bytes and x are read-only shared references (safe to read concurrently).
-        let out_slice = unsafe {
-            std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), chunk_len)
-        };
+        let out_slice =
+            unsafe { std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), chunk_len) };
 
         // Compute the sub-range using the byte offset into w_bytes
         let w_byte_offset = start * in_dim * 4;
@@ -664,9 +639,8 @@ pub fn matmul_simd_parallel(
         }
 
         // SAFETY: Disjoint output ranges. w and x are read-only shared references.
-        let out_slice = unsafe {
-            std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), chunk_len)
-        };
+        let out_slice =
+            unsafe { std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), chunk_len) };
 
         let w_offset = start * in_dim;
         let w_sub = &w[w_offset..w_offset + chunk_len * in_dim];
@@ -811,7 +785,11 @@ pub(crate) fn f16_to_f32_inline(bits: u16) -> f32 {
     }
     if exp == 31 {
         return if frac == 0 {
-            if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY }
+            if sign == 1 {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            }
         } else {
             f32::NAN
         };
@@ -820,7 +798,11 @@ pub(crate) fn f16_to_f32_inline(bits: u16) -> f32 {
     let e = (exp as i32) - 15;
     let f = 1.0 + frac as f32 / 1024.0;
     let v = f * 2.0f32.powi(e);
-    if sign == 1 { -v } else { v }
+    if sign == 1 {
+        -v
+    } else {
+        v
+    }
 }
 
 /// Q8_0 matrix-vector multiply using widening-chain approach (i8->i16->i32->f32).
@@ -854,7 +836,8 @@ pub fn matmul_q8_0_simd_widen(
     assert!(
         w_q8.len() >= out_dim * row_bytes,
         "w_q8 too short: {} < {} (out_dim={out_dim}, in_dim={in_dim}, num_blocks={num_blocks})",
-        w_q8.len(), out_dim * row_bytes,
+        w_q8.len(),
+        out_dim * row_bytes,
     );
 
     for i in 0..out_dim {
@@ -953,7 +936,8 @@ pub fn matmul_q8_0_simd_2row_widen(
     assert!(
         w_q8.len() >= out_dim * row_bytes,
         "w_q8 too short: {} < {} (out_dim={out_dim}, in_dim={in_dim}, num_blocks={num_blocks})",
-        w_q8.len(), out_dim * row_bytes,
+        w_q8.len(),
+        out_dim * row_bytes,
     );
 
     let row_pairs = out_dim / 2;
@@ -1112,19 +1096,51 @@ pub fn matmul_q8_0_simd_2row_widen(
                 let q16_lo_0 = vmovl_s8(vget_low_s8(q8_0));
                 let q16_hi_0 = vmovl_s8(vget_high_s8(q8_0));
 
-                block_acc0 = vfmaq_f32(block_acc0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_lo_0))), vld1q_f32(x.as_ptr().add(x_base)));
-                block_acc1 = vfmaq_f32(block_acc1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_lo_0))), vld1q_f32(x.as_ptr().add(x_base + 4)));
-                block_acc0 = vfmaq_f32(block_acc0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_hi_0))), vld1q_f32(x.as_ptr().add(x_base + 8)));
-                block_acc1 = vfmaq_f32(block_acc1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_hi_0))), vld1q_f32(x.as_ptr().add(x_base + 12)));
+                block_acc0 = vfmaq_f32(
+                    block_acc0,
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_lo_0))),
+                    vld1q_f32(x.as_ptr().add(x_base)),
+                );
+                block_acc1 = vfmaq_f32(
+                    block_acc1,
+                    vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_lo_0))),
+                    vld1q_f32(x.as_ptr().add(x_base + 4)),
+                );
+                block_acc0 = vfmaq_f32(
+                    block_acc0,
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_hi_0))),
+                    vld1q_f32(x.as_ptr().add(x_base + 8)),
+                );
+                block_acc1 = vfmaq_f32(
+                    block_acc1,
+                    vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_hi_0))),
+                    vld1q_f32(x.as_ptr().add(x_base + 12)),
+                );
 
                 let q8_1 = vld1q_s8(q_ptr.add(16) as *const i8);
                 let q16_lo_1 = vmovl_s8(vget_low_s8(q8_1));
                 let q16_hi_1 = vmovl_s8(vget_high_s8(q8_1));
 
-                block_acc0 = vfmaq_f32(block_acc0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_lo_1))), vld1q_f32(x.as_ptr().add(x_base + 16)));
-                block_acc1 = vfmaq_f32(block_acc1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_lo_1))), vld1q_f32(x.as_ptr().add(x_base + 20)));
-                block_acc0 = vfmaq_f32(block_acc0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_hi_1))), vld1q_f32(x.as_ptr().add(x_base + 24)));
-                block_acc1 = vfmaq_f32(block_acc1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_hi_1))), vld1q_f32(x.as_ptr().add(x_base + 28)));
+                block_acc0 = vfmaq_f32(
+                    block_acc0,
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_lo_1))),
+                    vld1q_f32(x.as_ptr().add(x_base + 16)),
+                );
+                block_acc1 = vfmaq_f32(
+                    block_acc1,
+                    vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_lo_1))),
+                    vld1q_f32(x.as_ptr().add(x_base + 20)),
+                );
+                block_acc0 = vfmaq_f32(
+                    block_acc0,
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_hi_1))),
+                    vld1q_f32(x.as_ptr().add(x_base + 24)),
+                );
+                block_acc1 = vfmaq_f32(
+                    block_acc1,
+                    vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_hi_1))),
+                    vld1q_f32(x.as_ptr().add(x_base + 28)),
+                );
 
                 let block_sum = vaddq_f32(block_acc0, block_acc1);
                 row_acc = vfmaq_f32(row_acc, block_sum, scale_v);
@@ -1428,10 +1444,7 @@ fn precompute_x_scales(x_q8: &[u8], num_blocks: usize, scales: &mut [f32]) {
     unsafe {
         for b in 0..num_blocks {
             let off = b * Q8_0_BLOCK_SIZE;
-            let bits = u16::from_le_bytes([
-                *x_q8.get_unchecked(off),
-                *x_q8.get_unchecked(off + 1),
-            ]);
+            let bits = u16::from_le_bytes([*x_q8.get_unchecked(off), *x_q8.get_unchecked(off + 1)]);
             *scales.get_unchecked_mut(b) = f16_to_f32_hw(bits);
         }
     }
@@ -1988,13 +2001,7 @@ const Q8_0_STACK_BUF_SIZE: usize = 256 * Q8_0_BLOCK_SIZE; // 8704 bytes
 /// standard quantize-then-dot trade-off used by mainstream Q8_0 inference
 /// kernels and is acceptable for inference.
 #[cfg(target_arch = "aarch64")]
-pub fn matmul_q8_0_simd(
-    out: &mut [f32],
-    w_q8: &[u8],
-    x: &[f32],
-    out_dim: usize,
-    in_dim: usize,
-) {
+pub fn matmul_q8_0_simd(out: &mut [f32], w_q8: &[u8], x: &[f32], out_dim: usize, in_dim: usize) {
     assert!(out.len() >= out_dim);
     assert!(x.len() >= in_dim);
     let num_blocks = in_dim.div_ceil(Q8_0_GROUP_SIZE);
@@ -2002,7 +2009,8 @@ pub fn matmul_q8_0_simd(
     assert!(
         w_q8.len() >= out_dim * row_bytes,
         "w_q8 too short: {} < {} (out_dim={out_dim}, in_dim={in_dim}, num_blocks={num_blocks})",
-        w_q8.len(), out_dim * row_bytes,
+        w_q8.len(),
+        out_dim * row_bytes,
     );
 
     let x_q8_len = num_blocks * Q8_0_BLOCK_SIZE;
@@ -2039,7 +2047,8 @@ pub fn matmul_q8_0_simd_2row(
     assert!(
         w_q8.len() >= out_dim * row_bytes,
         "w_q8 too short: {} < {} (out_dim={out_dim}, in_dim={in_dim}, num_blocks={num_blocks})",
-        w_q8.len(), out_dim * row_bytes,
+        w_q8.len(),
+        out_dim * row_bytes,
     );
 
     let x_q8_len = num_blocks * Q8_0_BLOCK_SIZE;
@@ -2058,13 +2067,7 @@ pub fn matmul_q8_0_simd_2row(
 
 /// Scalar fallback for Q8_0 matmul on non-aarch64 targets.
 #[cfg(not(target_arch = "aarch64"))]
-pub fn matmul_q8_0_simd(
-    out: &mut [f32],
-    w_q8: &[u8],
-    x: &[f32],
-    out_dim: usize,
-    in_dim: usize,
-) {
+pub fn matmul_q8_0_simd(out: &mut [f32], w_q8: &[u8], x: &[f32], out_dim: usize, in_dim: usize) {
     let num_blocks = in_dim.div_ceil(Q8_0_GROUP_SIZE);
     let row_bytes = num_blocks * Q8_0_BLOCK_SIZE;
     assert!(out.len() >= out_dim);
@@ -2193,7 +2196,8 @@ pub fn matmul_q8_0_simd_parallel(
     assert!(
         w_q8.len() >= out_dim * row_bytes,
         "w_q8 too short: {} < {} (out_dim={out_dim}, in_dim={in_dim})",
-        w_q8.len(), out_dim * row_bytes,
+        w_q8.len(),
+        out_dim * row_bytes,
     );
 
     // Quantize x ONCE on the calling thread (amortized across all rows + threads).
@@ -2217,9 +2221,8 @@ pub fn matmul_q8_0_simd_parallel(
         }
 
         // SAFETY: Each thread writes to a disjoint contiguous range of `out`.
-        let out_slice = unsafe {
-            std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), chunk_len)
-        };
+        let out_slice =
+            unsafe { std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), chunk_len) };
 
         let w_byte_offset = start * row_bytes;
         let w_sub = &w_q8[w_byte_offset..w_byte_offset + chunk_len * row_bytes];
@@ -2662,7 +2665,10 @@ pub fn swiglu_inplace_simd(gate: &mut [f32], up: &[f32]) {
             let result2 = vmulq_f32(vld1q_f32(s2.as_ptr()), vld1q_f32(up.as_ptr().add(base + 8)));
             vst1q_f32(gate.as_mut_ptr().add(base + 8), result2);
 
-            let result3 = vmulq_f32(vld1q_f32(s3.as_ptr()), vld1q_f32(up.as_ptr().add(base + 12)));
+            let result3 = vmulq_f32(
+                vld1q_f32(s3.as_ptr()),
+                vld1q_f32(up.as_ptr().add(base + 12)),
+            );
             vst1q_f32(gate.as_mut_ptr().add(base + 12), result3);
         }
     }
@@ -2872,13 +2878,7 @@ fn matmul_bytes_fallback(
 
 /// Scalar matmul -- matches cpu_naive::matmul exactly.
 #[cfg(any(not(target_arch = "aarch64"), test))]
-fn matmul_fallback(
-    out: &mut [f32],
-    w: &[f32],
-    x: &[f32],
-    out_dim: usize,
-    in_dim: usize,
-) {
+fn matmul_fallback(out: &mut [f32], w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) {
     for i in 0..out_dim {
         let row = &w[i * in_dim..(i + 1) * in_dim];
         out[i] = row.iter().zip(x.iter()).map(|(&w, &x)| w * x).sum();
@@ -2997,7 +2997,8 @@ pub fn matmul_q8_0_preq_parallel(
     assert!(
         w_q8.len() >= out_dim * row_bytes,
         "w_q8 too short: {} < {} (out_dim={out_dim}, in_dim={in_dim})",
-        w_q8.len(), out_dim * row_bytes,
+        w_q8.len(),
+        out_dim * row_bytes,
     );
 
     let out_addr = out.as_mut_ptr() as usize;
@@ -3009,9 +3010,8 @@ pub fn matmul_q8_0_preq_parallel(
         }
 
         // SAFETY: Each thread writes to a disjoint contiguous range of `out`.
-        let out_slice = unsafe {
-            std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), chunk_len)
-        };
+        let out_slice =
+            unsafe { std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), chunk_len) };
 
         let w_byte_offset = start * row_bytes;
         let w_sub = &w_q8[w_byte_offset..w_byte_offset + chunk_len * row_bytes];
@@ -3024,13 +3024,7 @@ pub fn matmul_q8_0_preq_parallel(
 /// Used for small output dimensions or inside parallel closures where threads
 /// already have their own chunk.
 #[cfg(target_arch = "aarch64")]
-pub fn matmul_q8_0_preq(
-    out: &mut [f32],
-    w_q8: &[u8],
-    x_q8: &[u8],
-    out_dim: usize,
-    in_dim: usize,
-) {
+pub fn matmul_q8_0_preq(out: &mut [f32], w_q8: &[u8], x_q8: &[u8], out_dim: usize, in_dim: usize) {
     let num_blocks = in_dim.div_ceil(Q8_0_GROUP_SIZE);
     let row_bytes = num_blocks * Q8_0_BLOCK_SIZE;
     assert!(out.len() >= out_dim);
@@ -3038,7 +3032,8 @@ pub fn matmul_q8_0_preq(
     assert!(
         w_q8.len() >= out_dim * row_bytes,
         "w_q8 too short: {} < {} (out_dim={out_dim}, in_dim={in_dim})",
-        w_q8.len(), out_dim * row_bytes,
+        w_q8.len(),
+        out_dim * row_bytes,
     );
     matmul_q8_0_rows_preq_4row(out, w_q8, x_q8, out_dim, num_blocks, row_bytes);
 }
@@ -3095,7 +3090,8 @@ pub fn matmul_q8_0_fused_quant_parallel(
     assert!(
         w_q8.len() >= out_dim * row_bytes,
         "w_q8 too short: {} < {} (out_dim={out_dim}, in_dim={in_dim})",
-        w_q8.len(), out_dim * row_bytes,
+        w_q8.len(),
+        out_dim * row_bytes,
     );
 
     let out_addr = out.as_mut_ptr() as usize;
@@ -3151,16 +3147,22 @@ pub fn matmul_q8_0_fused_quant_parallel(
         }
 
         // ---- Phase 2: Matmul using the now-complete x_q8 ----
-        let out_slice = unsafe {
-            std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), chunk_len)
-        };
+        let out_slice =
+            unsafe { std::slice::from_raw_parts_mut((out_addr as *mut f32).add(start), chunk_len) };
         let x_q8_shared = unsafe {
             std::slice::from_raw_parts(x_q8_ptr as *const u8, num_blocks * Q8_0_BLOCK_SIZE)
         };
         let w_byte_offset = start * row_bytes;
         let w_sub = &w_q8[w_byte_offset..w_byte_offset + chunk_len * row_bytes];
 
-        matmul_q8_0_rows_preq_4row(out_slice, w_sub, x_q8_shared, chunk_len, num_blocks, row_bytes);
+        matmul_q8_0_rows_preq_4row(
+            out_slice,
+            w_sub,
+            x_q8_shared,
+            chunk_len,
+            num_blocks,
+            row_bytes,
+        );
     });
 }
 
@@ -3618,10 +3620,7 @@ mod tests {
         let mut v = [f32::NAN; 3];
         softmax_inplace_simd(&mut v);
         for &p in &v {
-            assert!(
-                (p - 1.0 / 3.0).abs() < 1e-6,
-                "expected uniform, got {p}"
-            );
+            assert!((p - 1.0 / 3.0).abs() < 1e-6, "expected uniform, got {p}");
         }
     }
 
@@ -3630,10 +3629,7 @@ mod tests {
         let mut v = [f32::NEG_INFINITY; 3];
         softmax_inplace_simd(&mut v);
         for &p in &v {
-            assert!(
-                (p - 1.0 / 3.0).abs() < 1e-6,
-                "expected uniform, got {p}"
-            );
+            assert!((p - 1.0 / 3.0).abs() < 1e-6, "expected uniform, got {p}");
         }
     }
 
@@ -3717,7 +3713,9 @@ mod tests {
 
     #[test]
     fn test_matmul_bytes_simd_negative_values() {
-        let w_f32: Vec<f32> = (0..20).map(|i| if i % 2 == 0 { -(i as f32) } else { i as f32 }).collect();
+        let w_f32: Vec<f32> = (0..20)
+            .map(|i| if i % 2 == 0 { -(i as f32) } else { i as f32 })
+            .collect();
         let w = f32_to_le_bytes(&w_f32);
         let x: Vec<f32> = (0..5).map(|i| (i as f32) - 2.0).collect();
 
@@ -3737,7 +3735,10 @@ mod tests {
         let up = [1.0f32; 4];
         swiglu_inplace_simd(&mut gate, &up);
         for &v in &gate {
-            assert!(v.is_finite(), "swiglu with large negative should be finite, got {v}");
+            assert!(
+                v.is_finite(),
+                "swiglu with large negative should be finite, got {v}"
+            );
         }
     }
 
@@ -4035,7 +4036,9 @@ mod tests {
             .map(|i| ((i % 97) as f32 - 48.0) * 0.001)
             .collect();
         let w = f32_to_le_bytes(&w_f32);
-        let x: Vec<f32> = (0..in_dim).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i % 31) as f32 - 15.0) * 0.1)
+            .collect();
 
         let mut out_simd = vec![0.0f32; out_dim];
         let mut out_naive = vec![0.0f32; out_dim];
@@ -4043,7 +4046,12 @@ mod tests {
         matmul_bytes_simd(&mut out_simd, &w, &x, out_dim, in_dim);
         matmul_bytes_fallback(&mut out_naive, &w, &x, out_dim, in_dim);
 
-        assert_slices_close(&out_simd, &out_naive, 1e-4, "precision matmul_bytes dim=1024");
+        assert_slices_close(
+            &out_simd,
+            &out_naive,
+            1e-4,
+            "precision matmul_bytes dim=1024",
+        );
     }
 
     #[test]
@@ -4054,7 +4062,9 @@ mod tests {
             .map(|i| ((i % 97) as f32 - 48.0) * 0.001)
             .collect();
         let w = f32_to_le_bytes(&w_f32);
-        let x: Vec<f32> = (0..in_dim).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i % 31) as f32 - 15.0) * 0.1)
+            .collect();
 
         let mut out_simd = vec![0.0f32; out_dim];
         let mut out_naive = vec![0.0f32; out_dim];
@@ -4062,7 +4072,12 @@ mod tests {
         matmul_bytes_simd(&mut out_simd, &w, &x, out_dim, in_dim);
         matmul_bytes_fallback(&mut out_naive, &w, &x, out_dim, in_dim);
 
-        assert_slices_close(&out_simd, &out_naive, 1e-4, "precision matmul_bytes dim=2048");
+        assert_slices_close(
+            &out_simd,
+            &out_naive,
+            1e-4,
+            "precision matmul_bytes dim=2048",
+        );
     }
 
     #[test]
@@ -4073,7 +4088,9 @@ mod tests {
             .map(|i| ((i % 97) as f32 - 48.0) * 0.001)
             .collect();
         let w = f32_to_le_bytes(&w_f32);
-        let x: Vec<f32> = (0..in_dim).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i % 31) as f32 - 15.0) * 0.1)
+            .collect();
 
         let mut out_simd = vec![0.0f32; out_dim];
         let mut out_naive = vec![0.0f32; out_dim];
@@ -4081,7 +4098,12 @@ mod tests {
         matmul_bytes_simd(&mut out_simd, &w, &x, out_dim, in_dim);
         matmul_bytes_fallback(&mut out_naive, &w, &x, out_dim, in_dim);
 
-        assert_slices_close(&out_simd, &out_naive, 2e-4, "precision matmul_bytes dim=4096");
+        assert_slices_close(
+            &out_simd,
+            &out_naive,
+            2e-4,
+            "precision matmul_bytes dim=4096",
+        );
     }
 
     #[test]
@@ -4091,7 +4113,9 @@ mod tests {
         let w: Vec<f32> = (0..out_dim * in_dim)
             .map(|i| ((i % 97) as f32 - 48.0) * 0.001)
             .collect();
-        let x: Vec<f32> = (0..in_dim).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i % 31) as f32 - 15.0) * 0.1)
+            .collect();
 
         let mut out_simd = vec![0.0f32; out_dim];
         let mut out_naive = vec![0.0f32; out_dim];
@@ -4109,7 +4133,9 @@ mod tests {
         let w: Vec<f32> = (0..out_dim * in_dim)
             .map(|i| ((i % 97) as f32 - 48.0) * 0.001)
             .collect();
-        let x: Vec<f32> = (0..in_dim).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i % 31) as f32 - 15.0) * 0.1)
+            .collect();
 
         let mut out_simd = vec![0.0f32; out_dim];
         let mut out_naive = vec![0.0f32; out_dim];
@@ -4127,7 +4153,9 @@ mod tests {
         let w: Vec<f32> = (0..out_dim * in_dim)
             .map(|i| ((i % 97) as f32 - 48.0) * 0.001)
             .collect();
-        let x: Vec<f32> = (0..in_dim).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i % 31) as f32 - 15.0) * 0.1)
+            .collect();
 
         let mut out_simd = vec![0.0f32; out_dim];
         let mut out_naive = vec![0.0f32; out_dim];
@@ -4170,7 +4198,9 @@ mod tests {
             .map(|i| ((i % 97) as f32 - 48.0) * 0.001)
             .collect();
         let w = f32_to_le_bytes(&w_f32);
-        let x: Vec<f32> = (0..in_dim).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i % 31) as f32 - 15.0) * 0.1)
+            .collect();
 
         let mut out_2row = vec![0.0f32; out_dim];
         let mut out_naive = vec![0.0f32; out_dim];
@@ -4178,7 +4208,12 @@ mod tests {
         matmul_bytes_simd_2row(&mut out_2row, &w, &x, out_dim, in_dim);
         matmul_bytes_fallback(&mut out_naive, &w, &x, out_dim, in_dim);
 
-        assert_slices_close(&out_2row, &out_naive, 1e-4, "precision matmul_2row dim=1024");
+        assert_slices_close(
+            &out_2row,
+            &out_naive,
+            1e-4,
+            "precision matmul_2row dim=1024",
+        );
     }
 
     #[test]
@@ -4189,7 +4224,9 @@ mod tests {
             .map(|i| ((i % 97) as f32 - 48.0) * 0.001)
             .collect();
         let w = f32_to_le_bytes(&w_f32);
-        let x: Vec<f32> = (0..in_dim).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i % 31) as f32 - 15.0) * 0.1)
+            .collect();
 
         let mut out_2row = vec![0.0f32; out_dim];
         let mut out_naive = vec![0.0f32; out_dim];
@@ -4197,7 +4234,12 @@ mod tests {
         matmul_bytes_simd_2row(&mut out_2row, &w, &x, out_dim, in_dim);
         matmul_bytes_fallback(&mut out_naive, &w, &x, out_dim, in_dim);
 
-        assert_slices_close(&out_2row, &out_naive, 2e-4, "precision matmul_2row dim=4096 odd");
+        assert_slices_close(
+            &out_2row,
+            &out_naive,
+            2e-4,
+            "precision matmul_2row dim=4096 odd",
+        );
     }
 
     // ==================== Fuzz tests: random inputs, SIMD vs naive ====================
@@ -4244,9 +4286,7 @@ mod tests {
             let out_dim = rng.next_range(1, 129);
             let in_dim = rng.next_range(1, 129);
 
-            let w_f32: Vec<f32> = (0..out_dim * in_dim)
-                .map(|_| rng.next_f32(1.0))
-                .collect();
+            let w_f32: Vec<f32> = (0..out_dim * in_dim).map(|_| rng.next_f32(1.0)).collect();
             let w_bytes = f32_to_le_bytes(&w_f32);
             let x: Vec<f32> = (0..in_dim).map(|_| rng.next_f32(1.0)).collect();
 
@@ -4268,7 +4308,8 @@ mod tests {
                     rel < 1e-5 || diff < abs_tol,
                     "fuzz_matmul_bytes trial {trial} ({out_dim}x{in_dim}) elem {i}: \
                      simd={}, naive={}, diff={diff}, rel={rel}",
-                    out_simd[i], out_naive[i]
+                    out_simd[i],
+                    out_naive[i]
                 );
             }
         }
@@ -4299,7 +4340,8 @@ mod tests {
                     rel < 1e-5 || diff < 1e-6,
                     "fuzz_rmsnorm trial {trial} (dim={dim}) elem {i}: \
                      simd={}, naive={}, diff={diff}, rel={rel}",
-                    out_simd[i], out_naive[i]
+                    out_simd[i],
+                    out_naive[i]
                 );
             }
         }
@@ -4353,7 +4395,8 @@ mod tests {
                     rel < 1e-5 || diff < 1e-6,
                     "fuzz_swiglu trial {trial} (len={len}) elem {i}: \
                      simd={}, naive={}, diff={diff}, rel={rel}",
-                    gate_simd[i], gate_naive[i]
+                    gate_simd[i],
+                    gate_naive[i]
                 );
             }
         }
@@ -4367,9 +4410,7 @@ mod tests {
             let out_dim = rng.next_range(1, 65);
             let in_dim = rng.next_range(1, 129);
 
-            let w_f32: Vec<f32> = (0..out_dim * in_dim)
-                .map(|_| rng.next_f32(1.0))
-                .collect();
+            let w_f32: Vec<f32> = (0..out_dim * in_dim).map(|_| rng.next_f32(1.0)).collect();
             let w_bytes = f32_to_le_bytes(&w_f32);
             let x: Vec<f32> = (0..in_dim).map(|_| rng.next_f32(1.0)).collect();
 
@@ -4388,7 +4429,8 @@ mod tests {
                     rel < 1e-5 || diff < abs_tol,
                     "fuzz_matmul_2row trial {trial} ({out_dim}x{in_dim}) elem {i}: \
                      2row={}, naive={}, diff={diff}, rel={rel}",
-                    out_2row[i], out_naive[i]
+                    out_2row[i],
+                    out_naive[i]
                 );
             }
         }
@@ -4531,7 +4573,9 @@ mod tests {
         let w: Vec<f32> = (0..out_dim * in_dim)
             .map(|i| ((i % 97) as f32 - 48.0) * 0.001)
             .collect();
-        let x: Vec<f32> = (0..in_dim).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i % 31) as f32 - 15.0) * 0.1)
+            .collect();
 
         let mut out_2row = vec![0.0f32; out_dim];
         let mut out_naive = vec![0.0f32; out_dim];
@@ -4539,7 +4583,12 @@ mod tests {
         matmul_simd_2row(&mut out_2row, &w, &x, out_dim, in_dim);
         matmul_fallback(&mut out_naive, &w, &x, out_dim, in_dim);
 
-        assert_slices_close(&out_2row, &out_naive, 1e-4, "precision matmul_f32_2row dim=1024");
+        assert_slices_close(
+            &out_2row,
+            &out_naive,
+            1e-4,
+            "precision matmul_f32_2row dim=1024",
+        );
     }
 
     #[test]
@@ -4549,7 +4598,9 @@ mod tests {
         let w: Vec<f32> = (0..out_dim * in_dim)
             .map(|i| ((i % 97) as f32 - 48.0) * 0.001)
             .collect();
-        let x: Vec<f32> = (0..in_dim).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i % 31) as f32 - 15.0) * 0.1)
+            .collect();
 
         let mut out_2row = vec![0.0f32; out_dim];
         let mut out_naive = vec![0.0f32; out_dim];
@@ -4557,7 +4608,12 @@ mod tests {
         matmul_simd_2row(&mut out_2row, &w, &x, out_dim, in_dim);
         matmul_fallback(&mut out_naive, &w, &x, out_dim, in_dim);
 
-        assert_slices_close(&out_2row, &out_naive, 2e-4, "precision matmul_f32_2row dim=4096 odd");
+        assert_slices_close(
+            &out_2row,
+            &out_naive,
+            2e-4,
+            "precision matmul_f32_2row dim=4096 odd",
+        );
     }
 
     #[test]
@@ -4568,9 +4624,7 @@ mod tests {
             let out_dim = rng.next_range(1, 65);
             let in_dim = rng.next_range(1, 129);
 
-            let w: Vec<f32> = (0..out_dim * in_dim)
-                .map(|_| rng.next_f32(1.0))
-                .collect();
+            let w: Vec<f32> = (0..out_dim * in_dim).map(|_| rng.next_f32(1.0)).collect();
             let x: Vec<f32> = (0..in_dim).map(|_| rng.next_f32(1.0)).collect();
 
             let mut out_2row = vec![0.0f32; out_dim];
@@ -4588,7 +4642,8 @@ mod tests {
                     rel < 1e-5 || diff < abs_tol,
                     "fuzz_matmul_f32_2row trial {trial} ({out_dim}x{in_dim}) elem {i}: \
                      2row={}, naive={}, diff={diff}, rel={rel}",
-                    out_2row[i], out_naive[i]
+                    out_2row[i],
+                    out_naive[i]
                 );
             }
         }
@@ -4935,7 +4990,12 @@ mod tests {
         matmul_bytes_fallback(&mut out_ref, &w_dequant_bytes, &x, out_dim, in_dim);
 
         // Relaxed tolerance: double quantization (w + x) adds ~1% error
-        assert_slices_close(&out_sdot, &out_ref, 1e-2, "Q8_0 sdot matmul 1x32 vs dequant+F32");
+        assert_slices_close(
+            &out_sdot,
+            &out_ref,
+            1e-2,
+            "Q8_0 sdot matmul 1x32 vs dequant+F32",
+        );
     }
 
     #[test]
@@ -4958,7 +5018,12 @@ mod tests {
         let mut out_ref = vec![0.0f32; out_dim];
         matmul_bytes_fallback(&mut out_ref, &w_dequant_bytes, &x, out_dim, in_dim);
 
-        assert_slices_close(&out_sdot, &out_ref, 1e-2, "Q8_0 sdot matmul 4x64 vs dequant+F32");
+        assert_slices_close(
+            &out_sdot,
+            &out_ref,
+            1e-2,
+            "Q8_0 sdot matmul 4x64 vs dequant+F32",
+        );
     }
 
     #[test]
@@ -5007,7 +5072,10 @@ mod tests {
         matmul_q8_0_simd(&mut out, &w_q8, &x, out_dim, in_dim);
 
         for (i, &v) in out.iter().enumerate() {
-            assert_eq!(v, 0.0, "Q8_0 sdot zero weights: out[{i}] should be 0, got {v}");
+            assert_eq!(
+                v, 0.0,
+                "Q8_0 sdot zero weights: out[{i}] should be 0, got {v}"
+            );
         }
     }
 
@@ -5023,7 +5091,10 @@ mod tests {
         matmul_q8_0_simd(&mut out, &w_q8, &x, out_dim, in_dim);
 
         for (i, &v) in out.iter().enumerate() {
-            assert_eq!(v, 0.0, "Q8_0 sdot zero input: out[{i}] should be 0, got {v}");
+            assert_eq!(
+                v, 0.0,
+                "Q8_0 sdot zero input: out[{i}] should be 0, got {v}"
+            );
         }
     }
 
@@ -5040,9 +5111,7 @@ mod tests {
                 phase * 0.5
             })
             .collect();
-        let x: Vec<f32> = (0..in_dim)
-            .map(|i| ((i % 17) as f32 - 8.0) * 0.1)
-            .collect();
+        let x: Vec<f32> = (0..in_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
 
         let w_q8 = encode_q8_0_blocks(&w_f32);
 
@@ -5118,9 +5187,7 @@ mod tests {
                 phase * 0.5
             })
             .collect();
-        let x: Vec<f32> = (0..in_dim)
-            .map(|i| ((i % 17) as f32 - 8.0) * 0.1)
-            .collect();
+        let x: Vec<f32> = (0..in_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
 
         let w_q8 = encode_q8_0_blocks(&w_f32);
 
@@ -5153,7 +5220,8 @@ mod tests {
         let w_dequant = dequant_q8_0_reference(&w_q8, n);
         let ms: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
         let inv_rms = 1.0 / (ms + 1e-5f32).sqrt();
-        let out_ref: Vec<f32> = x.iter()
+        let out_ref: Vec<f32> = x
+            .iter()
             .zip(w_dequant.iter())
             .map(|(&xi, &wi)| xi * inv_rms * wi)
             .collect();
@@ -5175,7 +5243,8 @@ mod tests {
         let w_dequant = dequant_q8_0_reference(&w_q8, n);
         let ms: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
         let inv_rms = 1.0 / (ms + 1e-5f32).sqrt();
-        let out_ref: Vec<f32> = x.iter()
+        let out_ref: Vec<f32> = x
+            .iter()
             .zip(w_dequant.iter())
             .map(|(&xi, &wi)| xi * inv_rms * wi)
             .collect();
@@ -5194,7 +5263,10 @@ mod tests {
         rmsnorm_q8_0_simd(&mut out, &x, &w_q8, 1e-5);
 
         for (i, &v) in out.iter().enumerate() {
-            assert!(v.is_finite(), "rmsnorm Q8_0 zero input [{i}] should be finite, got {v}");
+            assert!(
+                v.is_finite(),
+                "rmsnorm Q8_0 zero input [{i}] should be finite, got {v}"
+            );
             assert_eq!(v, 0.0, "rmsnorm Q8_0 zero input [{i}] should be 0");
         }
     }
@@ -5328,7 +5400,12 @@ mod tests {
         matmul_q8_0_simd_widen(&mut out_widen, &w_q8, &x, out_dim, in_dim);
 
         // Tolerance: sdot quantizes x to int8, widen uses exact f32 x
-        assert_slices_close(&out_sdot, &out_widen, 1e-2, "Q8_0 4row sdot vs widen 128x256");
+        assert_slices_close(
+            &out_sdot,
+            &out_widen,
+            1e-2,
+            "Q8_0 4row sdot vs widen 128x256",
+        );
     }
 
     #[test]

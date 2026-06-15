@@ -8,9 +8,7 @@
 
 use crate::error::RuntimeError;
 use cudarc::cublas::CudaBlas;
-use cudarc::driver::{
-    CudaContext, CudaModule, CudaSlice, CudaStream, DeviceRepr, ValidAsZeroBits,
-};
+use cudarc::driver::{CudaContext, CudaModule, CudaSlice, CudaStream, DeviceRepr, ValidAsZeroBits};
 use std::sync::Arc;
 
 /// Wraps cudarc handles for a single CUDA device.
@@ -45,9 +43,7 @@ impl CudaDevice {
     /// Initializes a cuBLAS handle bound to the device's default stream.
     pub fn new(device_id: usize) -> Result<Self, RuntimeError> {
         let count = device_count().map_err(|_| {
-            RuntimeError::Compute(
-                "No CUDA driver found -- is the NVIDIA driver installed?".into(),
-            )
+            RuntimeError::Compute("No CUDA driver found -- is the NVIDIA driver installed?".into())
         })?;
 
         if count == 0 {
@@ -78,7 +74,9 @@ impl CudaDevice {
         // memcpy, cuBLAS). Single-stream execution is inherently ordered --
         // operations on the same stream execute in submission order. No
         // cross-stream synchronization is needed.
-        unsafe { ctx.disable_event_tracking(); }
+        unsafe {
+            ctx.disable_event_tracking();
+        }
 
         // Use a NEW stream (not default_stream) -- the legacy default stream
         // (stream 0) does NOT support CUDA graph capture. A non-default stream
@@ -96,15 +94,13 @@ impl CudaDevice {
 
     /// Query total device memory in bytes (VRAM).
     pub fn total_memory(&self) -> Result<usize, RuntimeError> {
-        let (_free, total) =
-            cudarc::driver::result::mem_get_info().map_err(cuda_driver_err)?;
+        let (_free, total) = cudarc::driver::result::mem_get_info().map_err(cuda_driver_err)?;
         Ok(total)
     }
 
     /// Query free device memory in bytes.
     pub fn free_memory(&self) -> Result<usize, RuntimeError> {
-        let (free, _total) =
-            cudarc::driver::result::mem_get_info().map_err(cuda_driver_err)?;
+        let (free, _total) = cudarc::driver::result::mem_get_info().map_err(cuda_driver_err)?;
         Ok(free)
     }
 
@@ -119,10 +115,7 @@ impl CudaDevice {
     /// compile is skipped and the cached PTX is handed straight to
     /// `cuModuleLoadData` (the driver JIT still runs and is itself cached by
     /// the driver's compute cache). See [`super::ptx_cache`].
-    pub fn compile_and_load(
-        &self,
-        cuda_source: &str,
-    ) -> Result<Arc<CudaModule>, RuntimeError> {
+    pub fn compile_and_load(&self, cuda_source: &str) -> Result<Arc<CudaModule>, RuntimeError> {
         self.compile_and_load_cached(cuda_source, None, false)
     }
 
@@ -290,10 +283,7 @@ impl CudaDevice {
     }
 
     /// Copy host data to a new device buffer.
-    pub fn htod_copy<T: DeviceRepr>(
-        &self,
-        host_data: &[T],
-    ) -> Result<CudaSlice<T>, RuntimeError> {
+    pub fn htod_copy<T: DeviceRepr>(&self, host_data: &[T]) -> Result<CudaSlice<T>, RuntimeError> {
         self.stream.clone_htod(host_data).map_err(cuda_driver_err)
     }
 
@@ -324,9 +314,7 @@ impl CudaDevice {
         &self,
         device_buf: &CudaSlice<T>,
     ) -> Result<Vec<T>, RuntimeError> {
-        self.stream
-            .clone_dtoh(device_buf)
-            .map_err(cuda_driver_err)
+        self.stream.clone_dtoh(device_buf).map_err(cuda_driver_err)
     }
 
     /// Copy a device VIEW (sub-slice) back to host. Lets callers transfer only
@@ -338,9 +326,7 @@ impl CudaDevice {
         T: DeviceRepr,
         Src: cudarc::driver::DevicePtr<T>,
     {
-        self.stream
-            .clone_dtoh(device_view)
-            .map_err(cuda_driver_err)
+        self.stream.clone_dtoh(device_view).map_err(cuda_driver_err)
     }
 
     /// Synchronize the default stream (wait for all pending GPU work).
@@ -380,10 +366,7 @@ impl CudaDevice {
     ///
     /// The buffer must remain allocated for the lifetime of the stream attribute.
     /// The attribute persists until explicitly reset or the stream is destroyed.
-    pub fn set_l2_persistence(
-        &self,
-        buffer: &CudaSlice<u8>,
-    ) -> Result<(), RuntimeError> {
+    pub fn set_l2_persistence(&self, buffer: &CudaSlice<u8>) -> Result<(), RuntimeError> {
         use cudarc::driver::sys as cuda_sys;
         use cudarc::driver::DevicePtr;
 
@@ -410,9 +393,7 @@ impl CudaDevice {
 
         // CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW = 1 in all CUDA versions.
         // Use the type alias which maps to the correct enum for the compiled CUDA version.
-        let attr_id = unsafe {
-            std::mem::transmute::<u32, cuda_sys::CUstreamAttrID>(1u32)
-        };
+        let attr_id = unsafe { std::mem::transmute::<u32, cuda_sys::CUstreamAttrID>(1u32) };
 
         let result = unsafe {
             cuda_sys::cuStreamSetAttribute(
@@ -439,18 +420,15 @@ impl CudaDevice {
         Ok(())
     }
 
-    pub fn set_cublas_workspace(
-        &self,
-        workspace: &CudaSlice<u8>,
-    ) -> Result<(), RuntimeError> {
+    pub fn set_cublas_workspace(&self, workspace: &CudaSlice<u8>) -> Result<(), RuntimeError> {
         use cudarc::cublas::sys as cublas_sys;
         use cudarc::driver::DevicePtr;
         let (ptr, _sync) = workspace.device_ptr(&self.stream);
         let size_bytes = workspace.len(); // CudaSlice<u8>.len() = number of bytes
-        // SAFETY: workspace is a valid device allocation of `size_bytes` bytes.
-        // cuBLAS stores the pointer and size internally for subsequent operations.
-        // The workspace buffer must outlive the cuBLAS handle (guaranteed by
-        // storing it in MutableState alongside the CudaDevice).
+                                          // SAFETY: workspace is a valid device allocation of `size_bytes` bytes.
+                                          // cuBLAS stores the pointer and size internally for subsequent operations.
+                                          // The workspace buffer must outlive the cuBLAS handle (guaranteed by
+                                          // storing it in MutableState alongside the CudaDevice).
         let status = unsafe {
             cublas_sys::cublasSetWorkspace_v2(
                 *self.blas.handle(),

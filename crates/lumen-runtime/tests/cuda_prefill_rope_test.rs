@@ -25,13 +25,7 @@ fn create_context() -> (Arc<CudaContext>, Arc<CudaStream>) {
 /// CPU reference RoPE for a single token (interleaved pair layout).
 ///
 /// Applies rotation in-place to `vec` which has layout [num_heads * head_dim].
-fn cpu_rope_apply(
-    vec: &mut [f32],
-    pos: usize,
-    num_heads: usize,
-    head_dim: usize,
-    theta: f32,
-) {
+fn cpu_rope_apply(vec: &mut [f32], pos: usize, num_heads: usize, head_dim: usize, theta: f32) {
     let half_dim = head_dim / 2;
     for h in 0..num_heads {
         let head_start = h * head_dim;
@@ -55,8 +49,8 @@ fn cpu_rope_apply(
 fn run_sequential_rope(
     ctx: &Arc<CudaContext>,
     stream: &Arc<CudaStream>,
-    q_flat: &[f32],      // [batch, q_dim]
-    k_flat: &[f32],      // [batch, kv_dim]
+    q_flat: &[f32], // [batch, q_dim]
+    k_flat: &[f32], // [batch, kv_dim]
     pos_start: u32,
     batch: usize,
     num_q_heads: u32,
@@ -187,9 +181,7 @@ fn assert_f32_close(label: &str, actual: &[f32], expected: &[f32], tol: f32) {
         let diff = (a - e).abs();
         if diff > tol {
             if mismatches < 5 {
-                eprintln!(
-                    "  {label}[{i}]: batched={a:.8}, sequential={e:.8}, diff={diff:.2e}"
-                );
+                eprintln!("  {label}[{i}]: batched={a:.8}, sequential={e:.8}, diff={diff:.2e}");
             }
             mismatches += 1;
         }
@@ -207,7 +199,9 @@ fn generate_test_data(len: usize, seed: u32) -> Vec<f32> {
     // Simple LCG PRNG for reproducibility without rand crate.
     let mut state = seed as u64;
     for _ in 0..len {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         // Map to [-1.0, 1.0].
         let val = ((state >> 33) as f32) / (u32::MAX as f32 / 2.0) - 1.0;
         data.push(val);
@@ -289,12 +283,28 @@ fn test_batched_rope_nonzero_pos_start() {
     let k_data = generate_test_data(batch * kv_dim, 200);
 
     let (q_seq, k_seq) = run_sequential_rope(
-        &ctx, &stream, &q_data, &k_data, pos_start, batch,
-        num_q_heads, num_kv_heads, head_dim, theta,
+        &ctx,
+        &stream,
+        &q_data,
+        &k_data,
+        pos_start,
+        batch,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        theta,
     );
     let (q_bat, k_bat) = run_batched_rope(
-        &ctx, &stream, &q_data, &k_data, pos_start, batch as u32,
-        num_q_heads, num_kv_heads, head_dim, theta,
+        &ctx,
+        &stream,
+        &q_data,
+        &k_data,
+        pos_start,
+        batch as u32,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        theta,
     );
 
     assert_f32_close("Q pos_start=50", &q_bat, &q_seq, 1e-6);
@@ -320,12 +330,28 @@ fn test_batched_rope_gqa() {
     let k_data = generate_test_data(batch * kv_dim, 666);
 
     let (q_seq, k_seq) = run_sequential_rope(
-        &ctx, &stream, &q_data, &k_data, pos_start, batch,
-        num_q_heads, num_kv_heads, head_dim, theta,
+        &ctx,
+        &stream,
+        &q_data,
+        &k_data,
+        pos_start,
+        batch,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        theta,
     );
     let (q_bat, k_bat) = run_batched_rope(
-        &ctx, &stream, &q_data, &k_data, pos_start, batch as u32,
-        num_q_heads, num_kv_heads, head_dim, theta,
+        &ctx,
+        &stream,
+        &q_data,
+        &k_data,
+        pos_start,
+        batch as u32,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        theta,
     );
 
     assert_f32_close("Q GQA 8q/2kv", &q_bat, &q_seq, 1e-6);
@@ -350,12 +376,28 @@ fn test_batched_rope_single_token() {
     let k_data = generate_test_data(batch * kv_dim, 67890);
 
     let (q_seq, k_seq) = run_sequential_rope(
-        &ctx, &stream, &q_data, &k_data, pos_start, batch,
-        num_q_heads, num_kv_heads, head_dim, theta,
+        &ctx,
+        &stream,
+        &q_data,
+        &k_data,
+        pos_start,
+        batch,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        theta,
     );
     let (q_bat, k_bat) = run_batched_rope(
-        &ctx, &stream, &q_data, &k_data, pos_start, batch as u32,
-        num_q_heads, num_kv_heads, head_dim, theta,
+        &ctx,
+        &stream,
+        &q_data,
+        &k_data,
+        pos_start,
+        batch as u32,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        theta,
     );
 
     assert_f32_close("Q batch=1", &q_bat, &q_seq, 1e-6);
@@ -379,8 +421,16 @@ fn test_batched_rope_preserves_magnitude() {
     let k_data = generate_test_data(batch * (num_kv_heads * head_dim) as usize, 88);
 
     let (q_result, _) = run_batched_rope(
-        &ctx, &stream, &q_data, &k_data, pos_start, batch as u32,
-        num_q_heads, num_kv_heads, head_dim, theta,
+        &ctx,
+        &stream,
+        &q_data,
+        &k_data,
+        pos_start,
+        batch as u32,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        theta,
     );
 
     // Check every pair in every token and head.
@@ -425,8 +475,16 @@ fn test_batched_rope_matches_cpu_reference() {
 
     // GPU batched result.
     let (q_gpu, k_gpu) = run_batched_rope(
-        &ctx, &stream, &q_data, &k_data, pos_start, batch as u32,
-        num_q_heads, num_kv_heads, head_dim, theta,
+        &ctx,
+        &stream,
+        &q_data,
+        &k_data,
+        pos_start,
+        batch as u32,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        theta,
     );
 
     // CPU reference: apply rope to each token independently.

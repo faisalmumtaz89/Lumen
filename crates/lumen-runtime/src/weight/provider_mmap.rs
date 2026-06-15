@@ -7,12 +7,12 @@
 //! drive prefetch and `madvise(DONTNEED)` hints release pages after use,
 //! enabling windowed streaming for models larger than available RAM.
 
+use crate::error::RuntimeError;
+use crate::storage::mmap::MmapStorageBackend;
+use crate::storage::{IoSnapshot, MmapConfig, MmapPageCacheBackend, StorageBackend};
 use crate::weight::cache::{
     CacheStats, LayerView, PrefetchHandle, PrefetchPriority, WeightProvider,
 };
-use crate::error::RuntimeError;
-use crate::storage::{IoSnapshot, MmapConfig, MmapPageCacheBackend, StorageBackend};
-use crate::storage::mmap::MmapStorageBackend;
 use crate::weight::provider_sync::{bytes_to_f32, read_embedding_global, read_output_proj_global};
 use lumen_format::quantization::QuantScheme;
 use lumen_format::reader::LbcFile;
@@ -114,19 +114,21 @@ impl MmapWeightProvider {
 
         let embed_header_quant = lbc.header.embedding.quant;
         let outproj_header_quant = lbc.header.output_proj.quant;
-        let embedding_bytes = backend.read_range(
-            lbc.header.embedding.offset, lbc.header.embedding.length,
-        )?;
+        let embedding_bytes =
+            backend.read_range(lbc.header.embedding.offset, lbc.header.embedding.length)?;
         let (embedding, embedding_raw, embedding_quant) =
             read_embedding_global(embedding_bytes, vocab_size, hidden_dim, embed_header_quant);
         let final_norm = bytes_to_f32(
             &backend.read_range(lbc.header.final_norm.offset, lbc.header.final_norm.length)?,
         );
-        let output_proj_bytes = backend.read_range(
-            lbc.header.output_proj.offset, lbc.header.output_proj.length,
-        )?;
-        let (output_proj, output_proj_raw, output_proj_quant) =
-            read_output_proj_global(output_proj_bytes, vocab_size, hidden_dim, outproj_header_quant);
+        let output_proj_bytes =
+            backend.read_range(lbc.header.output_proj.offset, lbc.header.output_proj.length)?;
+        let (output_proj, output_proj_raw, output_proj_quant) = read_output_proj_global(
+            output_proj_bytes,
+            vocab_size,
+            hidden_dim,
+            outproj_header_quant,
+        );
 
         let prefetch_window = mmap_config.prefetch_window;
 
@@ -167,7 +169,6 @@ impl MmapWeightProvider {
     pub fn lbc(&self) -> &LbcFile {
         &self.lbc
     }
-
 }
 
 impl WeightProvider for MmapWeightProvider {
@@ -236,7 +237,9 @@ impl WeightProvider for MmapWeightProvider {
         // to reclaim memory for models that exceed available RAM.
         if layer < self.lbc.layer_indices.len() {
             let idx = &self.lbc.layer_indices[layer];
-            let _ = self.backend.advise_dontneed(idx.layer_offset_bytes, idx.layer_length_bytes);
+            let _ = self
+                .backend
+                .advise_dontneed(idx.layer_offset_bytes, idx.layer_length_bytes);
         }
     }
 
@@ -331,9 +334,14 @@ mod tests {
         let idx = &provider.lbc().layer_indices[0];
         let mut backend = MmapStorageBackend::new();
         backend.open(&path).unwrap();
-        let copied_bytes = backend.read_range(idx.layer_offset_bytes, idx.layer_length_bytes).unwrap();
+        let copied_bytes = backend
+            .read_range(idx.layer_offset_bytes, idx.layer_length_bytes)
+            .unwrap();
 
-        assert_eq!(zero_copy_bytes, copied_bytes, "zero-copy and copied data must be identical");
+        assert_eq!(
+            zero_copy_bytes, copied_bytes,
+            "zero-copy and copied data must be identical"
+        );
     }
 
     #[test]

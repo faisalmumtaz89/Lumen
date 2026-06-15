@@ -117,7 +117,7 @@ pub(crate) struct MetalPipelines {
     // Q4_1 kernels
     pub(crate) dequant_tiled_matmul_q4_1: MetalPipelineState,
     pub(crate) dequant_tiled_matmul_q4_1_residual_batched: MetalPipelineState,
-    pub(crate) dequant_matmul_q4_1_deferred: MetalPipelineState,  // decode matvec
+    pub(crate) dequant_matmul_q4_1_deferred: MetalPipelineState, // decode matvec
     pub(crate) tiled_matmul_bytes_f32_residual: MetalPipelineState,
     pub(crate) tiled_matmul_f16: MetalPipelineState,
     pub(crate) tiled_matmul_f16_residual: MetalPipelineState,
@@ -625,7 +625,7 @@ pub(crate) struct MetalScratch {
     pub(crate) eps: f32,
     pub(crate) q_dim: usize,
     pub(crate) kv_dim: usize,
-    pub(crate) qkv_dim: usize,  // q_dim + 2 * kv_dim (for fused QKV projection)
+    pub(crate) qkv_dim: usize, // q_dim + 2 * kv_dim (for fused QKV projection)
     pub(crate) gqa_ratio: usize,
     pub(crate) vocab_size: usize,
     pub(crate) half_dim: usize,
@@ -646,7 +646,7 @@ pub(crate) struct MetalScratch {
 
     /// Cached per-layer zero-copy Metal buffers (avoid re-creating on every call).
     /// Indexed by layer_idx. Populated lazily on first access per layer.
-    pub(crate) layer_buf_cache: Vec<Option<(usize, MetalBuffer)>>,  // (ptr, buffer)
+    pub(crate) layer_buf_cache: Vec<Option<(usize, MetalBuffer)>>, // (ptr, buffer)
 
     /// Cached partial (non-expert) Metal buffers for MoE streaming.
     /// For MoE layers with expert caching active, this stores a smaller buffer
@@ -672,19 +672,19 @@ pub(crate) struct MetalScratch {
 
     // Batched prefill scratch buffers (allocated for max_batch_size)
     // These are Option so they can be lazily initialized when prefill is first called.
-    pub(crate) batch_x_buf: Option<MetalBuffer>,         // [batch, hidden_dim]
-    pub(crate) batch_normed_buf: Option<MetalBuffer>,     // [batch, hidden_dim]
-    pub(crate) batch_qkv_buf: Option<MetalBuffer>,        // [batch, qkv_dim] fused QKV output
-    pub(crate) batch_q_buf: Option<MetalBuffer>,          // [batch, q_dim]
-    pub(crate) batch_k_buf: Option<MetalBuffer>,          // [batch, kv_dim]
-    pub(crate) batch_v_buf: Option<MetalBuffer>,          // [batch, kv_dim]
-    pub(crate) batch_attn_out_buf: Option<MetalBuffer>,   // [batch, q_dim]
-    pub(crate) batch_attn_proj_buf: Option<MetalBuffer>,  // [batch, hidden_dim]
-    pub(crate) batch_gate_buf: Option<MetalBuffer>,       // [batch, inter_dim]
-    pub(crate) batch_up_buf: Option<MetalBuffer>,         // [batch, inter_dim]
-    pub(crate) batch_down_buf: Option<MetalBuffer>,       // [batch, hidden_dim]
-    pub(crate) batch_scores_buf: Option<MetalBuffer>,     // [batch, num_heads, max_seq_len]
-    pub(crate) splitk_partial_buf: Option<MetalBuffer>,   // [K_SPLITS * max_M * max_N] floats for Split-K
+    pub(crate) batch_x_buf: Option<MetalBuffer>, // [batch, hidden_dim]
+    pub(crate) batch_normed_buf: Option<MetalBuffer>, // [batch, hidden_dim]
+    pub(crate) batch_qkv_buf: Option<MetalBuffer>, // [batch, qkv_dim] fused QKV output
+    pub(crate) batch_q_buf: Option<MetalBuffer>, // [batch, q_dim]
+    pub(crate) batch_k_buf: Option<MetalBuffer>, // [batch, kv_dim]
+    pub(crate) batch_v_buf: Option<MetalBuffer>, // [batch, kv_dim]
+    pub(crate) batch_attn_out_buf: Option<MetalBuffer>, // [batch, q_dim]
+    pub(crate) batch_attn_proj_buf: Option<MetalBuffer>, // [batch, hidden_dim]
+    pub(crate) batch_gate_buf: Option<MetalBuffer>, // [batch, inter_dim]
+    pub(crate) batch_up_buf: Option<MetalBuffer>, // [batch, inter_dim]
+    pub(crate) batch_down_buf: Option<MetalBuffer>, // [batch, hidden_dim]
+    pub(crate) batch_scores_buf: Option<MetalBuffer>, // [batch, num_heads, max_seq_len]
+    pub(crate) splitk_partial_buf: Option<MetalBuffer>, // [K_SPLITS * max_M * max_N] floats for Split-K
 
     // ====================================================================
     // de-aliased GDN scratch buffers
@@ -706,14 +706,14 @@ pub(crate) struct MetalScratch {
     //
     // Allocated only when the GDN concurrent-encoder path is enabled
     // (`LUMEN_METAL_GDN_CONCURRENT_ENCODER=1`). Default OFF preserves legacy behaviour.
-    pub(crate) batch_gdn_raw_out_buf: Option<MetalBuffer>,   // [batch * q_dim] Phase 2a state-update output
-    pub(crate) batch_gdn_ssm_in_buf: Option<MetalBuffer>,    // [batch * q_dim] Phase 2b ssm_in / Phase 3 input
-    pub(crate) batch_gdn_alpha_buf: Option<MetalBuffer>,     // [batch * num_heads] alpha gate (Phase 1 -> Phase 2a)
-    pub(crate) batch_gdn_beta_buf: Option<MetalBuffer>,      // [batch * num_heads] beta gate (Phase 1 -> Phase 2a)
-    pub(crate) batch_gdn_conv_out_buf: Option<MetalBuffer>,  // [batch * qkv_dim] post-conv1d SiLU+L2-normalized QKV
+    pub(crate) batch_gdn_raw_out_buf: Option<MetalBuffer>, // [batch * q_dim] Phase 2a state-update output
+    pub(crate) batch_gdn_ssm_in_buf: Option<MetalBuffer>, // [batch * q_dim] Phase 2b ssm_in / Phase 3 input
+    pub(crate) batch_gdn_alpha_buf: Option<MetalBuffer>, // [batch * num_heads] alpha gate (Phase 1 -> Phase 2a)
+    pub(crate) batch_gdn_beta_buf: Option<MetalBuffer>, // [batch * num_heads] beta gate (Phase 1 -> Phase 2a)
+    pub(crate) batch_gdn_conv_out_buf: Option<MetalBuffer>, // [batch * qkv_dim] post-conv1d SiLU+L2-normalized QKV
 
-    pub(crate) splitk_alloc_elems: usize,                 // tracks allocated Split-K buffer capacity (in floats)
-    pub(crate) current_max_batch: usize,                  // tracks allocated batch size
+    pub(crate) splitk_alloc_elems: usize, // tracks allocated Split-K buffer capacity (in floats)
+    pub(crate) current_max_batch: usize,  // tracks allocated batch size
 
     /// Pre-allocated logits readback buffer: [vocab_size] floats.
     /// Reused every decode token to avoid a 128 KB heap allocation per token.
@@ -728,7 +728,6 @@ pub(crate) struct MetalScratch {
     // MoE (Mixture of Experts) scratch buffers and parameters
     // ====================================================================
     // Only allocated when the model has num_experts > 0.
-
     /// Number of experts in the MoE layer (e.g., 8 for Mixtral).
     /// 0 for dense models.
     pub(crate) moe_num_experts: usize,
@@ -816,7 +815,6 @@ pub(crate) struct MetalScratch {
     // ====================================================================
     // Qwen3.5-MoE scratch
     // ====================================================================
-
     /// RoPE theta value from hyperparams. Used for RoPE table recomputation in gpu_resident.
     pub(crate) rope_theta: f64,
     /// True when the model uses NeoX-style half-split RoPE (e.g. Qwen2, Qwen3.5).
@@ -837,7 +835,6 @@ pub(crate) struct MetalScratch {
     // ====================================================================
     // GatedDeltaNet (linear attention) persistent state
     // ====================================================================
-
     /// Persistent GDN recurrent state: one buffer per GDN layer.
     /// Shape: [num_heads, head_dim, head_dim] f32 per layer (head_dim x head_dim matrix per head).
     /// These MUST persist across tokens and be reset between sequences.
@@ -896,7 +893,6 @@ pub(crate) struct MetalScratch {
     //
     // Allocated once at `preload_weights_gpu_resident` time. Stays alive for
     // the lifetime of the backend instance.
-
     /// Per-layer FFN-down (`w_down`) repacked Q8_0 buffer.
     /// Shape per layer: same bytes as raw Q8_0, restructured into stripes of
     /// 32 rows × 32 K-elements. Set when `LUMEN_METAL_Q8_REPACKED_FFN_DOWN=1`.
@@ -914,7 +910,6 @@ pub(crate) struct MetalScratch {
     // single-tensor (row_group, k_block); 1152 vs 2176 for pair-packed).
     //
     // Allocated when `LUMEN_METAL_Q4_REPACKED=1` is set at load time.
-
     /// Per-layer FFN-down (`w_down`) repacked Q4_0 buffer.
     /// Set when `LUMEN_METAL_Q4_REPACKED_FFN_DOWN=1`.
     pub(crate) repacked_ffn_down_q4: Vec<Option<MetalBuffer>>,

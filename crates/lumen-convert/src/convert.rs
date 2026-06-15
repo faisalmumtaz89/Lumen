@@ -9,8 +9,8 @@ use crate::dequant::*;
 use crate::gguf::{GgmlType, GgufError, GgufFile};
 use crate::hyperparams::{detect_quant_scheme, extract_hyperparams, quant_descriptor_for};
 use crate::sharded::{MultiShardReader, ShardError, ShardedGguf};
-use crate::tensor_names::*;
 use crate::tensor_io::read_tensor_data;
+use crate::tensor_names::*;
 use lumen_format::header::LbcHeader;
 use lumen_format::quantization::QuantScheme;
 use lumen_format::streaming_writer::StreamingLbcWriter;
@@ -282,8 +282,11 @@ fn do_convert_from_reader<R: Read + Seek>(
     // The runtime will use GPU dequant kernels for embedding lookup.
     let (embedding, embedding_quant) = match embedding_ggml_type {
         GgmlType::F16 => {
-            eprintln!("  Keeping embedding as F16 ({} bytes, {} elements)",
-                embedding_bytes.len(), embedding_n_elements);
+            eprintln!(
+                "  Keeping embedding as F16 ({} bytes, {} elements)",
+                embedding_bytes.len(),
+                embedding_n_elements
+            );
             (embedding_bytes, QuantScheme::F16)
         }
         GgmlType::BF16 => {
@@ -291,18 +294,27 @@ fn do_convert_from_reader<R: Read + Seek>(
             // Storing as F32 instead (the prior default fall-through) would
             // double the embedding size and trip A100-80GB OOM on Qwen3.5-9B
             // (2 GB BF16 -> 4 GB F32 just for embedding + same for output_proj).
-            eprintln!("  Keeping embedding as Bf16 ({} bytes, {} elements)",
-                embedding_bytes.len(), embedding_n_elements);
+            eprintln!(
+                "  Keeping embedding as Bf16 ({} bytes, {} elements)",
+                embedding_bytes.len(),
+                embedding_n_elements
+            );
             (embedding_bytes, QuantScheme::Bf16)
         }
         GgmlType::Q8_0 => {
-            eprintln!("  Keeping embedding as Q8_0 ({} bytes, {} elements)",
-                embedding_bytes.len(), embedding_n_elements);
+            eprintln!(
+                "  Keeping embedding as Q8_0 ({} bytes, {} elements)",
+                embedding_bytes.len(),
+                embedding_n_elements
+            );
             (embedding_bytes, QuantScheme::Q8_0)
         }
         GgmlType::Q4_0 => {
-            eprintln!("  Keeping embedding as Q4_0 ({} bytes, {} elements)",
-                embedding_bytes.len(), embedding_n_elements);
+            eprintln!(
+                "  Keeping embedding as Q4_0 ({} bytes, {} elements)",
+                embedding_bytes.len(),
+                embedding_n_elements
+            );
             (embedding_bytes, QuantScheme::Q4_0)
         }
         _ => {
@@ -329,84 +341,114 @@ fn do_convert_from_reader<R: Read + Seek>(
 
     // Weight tying: if output.weight is absent, use dedup (store once, share at runtime).
     let requant_target = opts.requant_to;
-    let (output_proj, weight_tying, output_proj_quant) = if let Some(output_proj_tensor) = gguf.find_tensor(OUTPUT_PROJ_NAME) {
-        let output_proj_bytes = read_tensor_data(reader, gguf, output_proj_tensor)?;
-        // Handle requantization of output_proj
-        if let Some(QuantScheme::Q4_0) = requant_target {
-            let f32_data = ensure_f32_global(
-                output_proj_bytes.clone(),
-                output_proj_tensor.ggml_type,
-                OUTPUT_PROJ_NAME,
-                output_proj_tensor.n_elements(),
-            )?;
-            let n_elems = output_proj_tensor.n_elements() as usize;
-            let q4_data = quantize_f32_to_q4_0(&f32_data, n_elems);
-            eprintln!("  Requantized output.weight to Q4_0 ({} bytes, {} elements)",
-                q4_data.len(), n_elems);
-            (q4_data, false, QuantScheme::Q4_0)
-        } else if output_proj_tensor.ggml_type == GgmlType::Q8_0 {
-            eprintln!("  Keeping output.weight as Q8_0 ({} bytes, {} elements)",
-                output_proj_bytes.len(), output_proj_tensor.n_elements());
-            (output_proj_bytes, false, QuantScheme::Q8_0)
-        } else if output_proj_tensor.ggml_type == GgmlType::Q4_0 {
-            eprintln!("  Keeping output.weight as Q4_0 ({} bytes, {} elements)",
-                output_proj_bytes.len(), output_proj_tensor.n_elements());
-            (output_proj_bytes, false, QuantScheme::Q4_0)
-        } else if output_proj_tensor.ggml_type == GgmlType::F16 {
-            eprintln!("  Keeping output.weight as F16 ({} bytes, {} elements)",
-                output_proj_bytes.len(), output_proj_tensor.n_elements());
-            (output_proj_bytes, false, QuantScheme::F16)
-        } else if output_proj_tensor.ggml_type == GgmlType::BF16 {
-            // BF16 output_proj: 2 bytes/elem, fits in the runtime's Bf16Raw
-            // upload path. Keeping the source bytes avoids the F32 inflation
-            // that previously caused A100-80GB OOM during preload_weights on
-            // Qwen3.5-9B BF16 (embedding 2 GB + output_proj 2 GB + 30+ GB of
-            // F32-inflated layer weights blew past free VRAM).
-            eprintln!("  Keeping output.weight as Bf16 ({} bytes, {} elements)",
-                output_proj_bytes.len(), output_proj_tensor.n_elements());
-            (output_proj_bytes, false, QuantScheme::Bf16)
-        } else if matches!(output_proj_tensor.ggml_type,
-            GgmlType::Q6_K | GgmlType::Q5_K | GgmlType::Q4_K |
-            GgmlType::Q3_K | GgmlType::Q2_K | GgmlType::Q8_K)
-        {
-            // K-quant output.weight: dequantize and requantize to a supported format.
-            // llama-quantize often keeps output.weight as Q6_K even in Q4_0 GGUFs.
-            // The runtime only has fast dispatch kernels for Q8_0/Q4_0/F16/F32,
-            // so storing K-quant as-is would hit the slow F32 fallback path.
-            let f32_data = ensure_f32_global(
-                output_proj_bytes,
-                output_proj_tensor.ggml_type,
-                OUTPUT_PROJ_NAME,
-                output_proj_tensor.n_elements(),
-            )?;
-            let n_elems = output_proj_tensor.n_elements() as usize;
-            if requant_target == Some(QuantScheme::Q4_0) {
+    let (output_proj, weight_tying, output_proj_quant) =
+        if let Some(output_proj_tensor) = gguf.find_tensor(OUTPUT_PROJ_NAME) {
+            let output_proj_bytes = read_tensor_data(reader, gguf, output_proj_tensor)?;
+            // Handle requantization of output_proj
+            if let Some(QuantScheme::Q4_0) = requant_target {
+                let f32_data = ensure_f32_global(
+                    output_proj_bytes.clone(),
+                    output_proj_tensor.ggml_type,
+                    OUTPUT_PROJ_NAME,
+                    output_proj_tensor.n_elements(),
+                )?;
+                let n_elems = output_proj_tensor.n_elements() as usize;
                 let q4_data = quantize_f32_to_q4_0(&f32_data, n_elems);
-                eprintln!("  K-quant output.weight ({:?}): requantized to Q4_0 ({} bytes)",
-                    output_proj_tensor.ggml_type, q4_data.len());
+                eprintln!(
+                    "  Requantized output.weight to Q4_0 ({} bytes, {} elements)",
+                    q4_data.len(),
+                    n_elems
+                );
                 (q4_data, false, QuantScheme::Q4_0)
+            } else if output_proj_tensor.ggml_type == GgmlType::Q8_0 {
+                eprintln!(
+                    "  Keeping output.weight as Q8_0 ({} bytes, {} elements)",
+                    output_proj_bytes.len(),
+                    output_proj_tensor.n_elements()
+                );
+                (output_proj_bytes, false, QuantScheme::Q8_0)
+            } else if output_proj_tensor.ggml_type == GgmlType::Q4_0 {
+                eprintln!(
+                    "  Keeping output.weight as Q4_0 ({} bytes, {} elements)",
+                    output_proj_bytes.len(),
+                    output_proj_tensor.n_elements()
+                );
+                (output_proj_bytes, false, QuantScheme::Q4_0)
+            } else if output_proj_tensor.ggml_type == GgmlType::F16 {
+                eprintln!(
+                    "  Keeping output.weight as F16 ({} bytes, {} elements)",
+                    output_proj_bytes.len(),
+                    output_proj_tensor.n_elements()
+                );
+                (output_proj_bytes, false, QuantScheme::F16)
+            } else if output_proj_tensor.ggml_type == GgmlType::BF16 {
+                // BF16 output_proj: 2 bytes/elem, fits in the runtime's Bf16Raw
+                // upload path. Keeping the source bytes avoids the F32 inflation
+                // that previously caused A100-80GB OOM during preload_weights on
+                // Qwen3.5-9B BF16 (embedding 2 GB + output_proj 2 GB + 30+ GB of
+                // F32-inflated layer weights blew past free VRAM).
+                eprintln!(
+                    "  Keeping output.weight as Bf16 ({} bytes, {} elements)",
+                    output_proj_bytes.len(),
+                    output_proj_tensor.n_elements()
+                );
+                (output_proj_bytes, false, QuantScheme::Bf16)
+            } else if matches!(
+                output_proj_tensor.ggml_type,
+                GgmlType::Q6_K
+                    | GgmlType::Q5_K
+                    | GgmlType::Q4_K
+                    | GgmlType::Q3_K
+                    | GgmlType::Q2_K
+                    | GgmlType::Q8_K
+            ) {
+                // K-quant output.weight: dequantize and requantize to a supported format.
+                // llama-quantize often keeps output.weight as Q6_K even in Q4_0 GGUFs.
+                // The runtime only has fast dispatch kernels for Q8_0/Q4_0/F16/F32,
+                // so storing K-quant as-is would hit the slow F32 fallback path.
+                let f32_data = ensure_f32_global(
+                    output_proj_bytes,
+                    output_proj_tensor.ggml_type,
+                    OUTPUT_PROJ_NAME,
+                    output_proj_tensor.n_elements(),
+                )?;
+                let n_elems = output_proj_tensor.n_elements() as usize;
+                if requant_target == Some(QuantScheme::Q4_0) {
+                    let q4_data = quantize_f32_to_q4_0(&f32_data, n_elems);
+                    eprintln!(
+                        "  K-quant output.weight ({:?}): requantized to Q4_0 ({} bytes)",
+                        output_proj_tensor.ggml_type,
+                        q4_data.len()
+                    );
+                    (q4_data, false, QuantScheme::Q4_0)
+                } else {
+                    let q8_data = quantize_f32_to_q8_0(&f32_data, n_elems);
+                    eprintln!(
+                        "  K-quant output.weight ({:?}): requantized to Q8_0 ({} bytes)",
+                        output_proj_tensor.ggml_type,
+                        q8_data.len()
+                    );
+                    (q8_data, false, QuantScheme::Q8_0)
+                }
             } else {
-                let q8_data = quantize_f32_to_q8_0(&f32_data, n_elems);
-                eprintln!("  K-quant output.weight ({:?}): requantized to Q8_0 ({} bytes)",
-                    output_proj_tensor.ggml_type, q8_data.len());
-                (q8_data, false, QuantScheme::Q8_0)
+                let data = ensure_f32_global(
+                    output_proj_bytes,
+                    output_proj_tensor.ggml_type,
+                    OUTPUT_PROJ_NAME,
+                    output_proj_tensor.n_elements(),
+                )?;
+                (data, false, QuantScheme::F32)
             }
         } else {
-            let data = ensure_f32_global(
-                output_proj_bytes,
-                output_proj_tensor.ggml_type,
-                OUTPUT_PROJ_NAME,
-                output_proj_tensor.n_elements(),
-            )?;
-            (data, false, QuantScheme::F32)
-        }
-    } else {
-        // Weight tying: output_proj shares embedding storage (zero-copy dedup).
-        // Runtime uses the embedding buffer for both lookup and logits projection.
-        let embed_size_mb = embedding.len() as f64 / 1_048_576.0;
-        eprintln!("  Weight tying: output_proj shares embedding storage ({:.1} MB saved)", embed_size_mb);
-        (Vec::new(), true, embedding_quant)
-    };
+            // Weight tying: output_proj shares embedding storage (zero-copy dedup).
+            // Runtime uses the embedding buffer for both lookup and logits projection.
+            let embed_size_mb = embedding.len() as f64 / 1_048_576.0;
+            eprintln!(
+                "  Weight tying: output_proj shares embedding storage ({:.1} MB saved)",
+                embed_size_mb
+            );
+            (Vec::new(), true, embedding_quant)
+        };
 
     // Select architecture-specific converter
     let converter = arch::select_converter(&arch, hp.num_experts);
@@ -415,7 +457,11 @@ fn do_convert_from_reader<R: Read + Seek>(
     let mut layer_shapes = Vec::with_capacity(num_layers);
     for layer in 0..num_layers {
         layer_shapes.push(converter.compute_layer_shape(
-            gguf, layer, opts.dequantize_to_f32, opts.requant_to, opts.target,
+            gguf,
+            layer,
+            opts.dequantize_to_f32,
+            opts.requant_to,
+            opts.target,
         )?);
     }
 
@@ -439,8 +485,14 @@ fn do_convert_from_reader<R: Read + Seek>(
 
     // Extract tokenizer data from GGUF and embed in LBC v3.
     let tokenizer_section = crate::tokenizer_data::extract_tokenizer(gguf).map(|td| {
-        eprintln!("  Tokenizer: model={} pre={} vocab={} merges={} scores={}",
-            td.model_type, td.pre_tokenizer, td.tokens.len(), td.merges.len(), td.scores.len());
+        eprintln!(
+            "  Tokenizer: model={} pre={} vocab={} merges={} scores={}",
+            td.model_type,
+            td.pre_tokenizer,
+            td.tokens.len(),
+            td.merges.len(),
+            td.scores.len()
+        );
         TokenizerSection {
             model_type: td.model_type,
             pre_tokenizer: td.pre_tokenizer,
@@ -458,16 +510,26 @@ fn do_convert_from_reader<R: Read + Seek>(
         }
     });
 
-    let mut streaming =
-        StreamingLbcWriter::begin(writer, &header, &layer_shapes, &global_tensors, tokenizer_section.as_ref())?;
+    let mut streaming = StreamingLbcWriter::begin(
+        writer,
+        &header,
+        &layer_shapes,
+        &global_tensors,
+        tokenizer_section.as_ref(),
+    )?;
 
     // Write each layer blob (stream from GGUF file)
     for (layer, shape) in layer_shapes.iter().enumerate().take(num_layers) {
-        let mut layer_blob =
-            Vec::with_capacity(shape.blob_size as usize);
+        let mut layer_blob = Vec::with_capacity(shape.blob_size as usize);
 
         converter.write_layer_blob(
-            &mut layer_blob, reader, gguf, layer, opts.dequantize_to_f32, opts.requant_to, opts.target,
+            &mut layer_blob,
+            reader,
+            gguf,
+            layer,
+            opts.dequantize_to_f32,
+            opts.requant_to,
+            opts.target,
         )?;
 
         streaming.write_layer(&layer_blob)?;
@@ -512,8 +574,8 @@ fn do_convert_from_reader<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gguf::{GgufBuilder, GgmlType};
-    use crate::tensor_io::{layer_tensor_name, expert_tensor_name};
+    use crate::gguf::{GgmlType, GgufBuilder};
+    use crate::tensor_io::{expert_tensor_name, layer_tensor_name};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -596,7 +658,10 @@ mod tests {
         let rope = hp.rope_params.unwrap();
         assert!((rope.theta - 10000.0).abs() < 0.01);
         assert!((rope.scaling_factor - 1.0).abs() < 0.01);
-        assert_eq!(rope.scaling_type, lumen_format::hyperparams::RopeScalingType::None);
+        assert_eq!(
+            rope.scaling_type,
+            lumen_format::hyperparams::RopeScalingType::None
+        );
     }
 
     #[test]
@@ -677,9 +742,9 @@ mod tests {
         let result = convert_gguf_to_lbc(&p1, &lbc_path, &ConvertOptions::default());
         match result {
             Err(ConvertError::UnsupportedArchitecture(a)) => assert_eq!(a, "gpt2"),
-            other => panic!(
-                "expected UnsupportedArchitecture after multi-shard merge, got: {other:?}"
-            ),
+            other => {
+                panic!("expected UnsupportedArchitecture after multi-shard merge, got: {other:?}")
+            }
         }
 
         // Sanity: the test really exercised the multi-shard path -- the same
@@ -688,9 +753,7 @@ mod tests {
         let result_from_p2 = convert_gguf_to_lbc(&p2, &lbc_path, &ConvertOptions::default());
         match result_from_p2 {
             Err(ConvertError::UnsupportedArchitecture(a)) => assert_eq!(a, "gpt2"),
-            other => panic!(
-                "expected UnsupportedArchitecture from shard 2 entry, got: {other:?}"
-            ),
+            other => panic!("expected UnsupportedArchitecture from shard 2 entry, got: {other:?}"),
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -789,12 +852,12 @@ mod tests {
         // Sanity: metadata really says 33.
         assert_eq!(gguf.get_u32("qwen35.block_count"), Some(33));
 
-        let (hp, _arch) = extract_hyperparams(&gguf)
-            .expect("extract_hyperparams should succeed");
+        let (hp, _arch) = extract_hyperparams(&gguf).expect("extract_hyperparams should succeed");
         assert_eq!(
             hp.num_layers, 32,
             "num_layers must reflect the 32 real layers, ignoring the MTP head at blk.32 \
-             (metadata block_count=33). Got {}", hp.num_layers,
+             (metadata block_count=33). Got {}",
+            hp.num_layers,
         );
     }
 
@@ -832,8 +895,11 @@ mod tests {
         let gguf = crate::gguf::GgufFile::parse(&mut cur).unwrap();
 
         let (hp, _arch) = extract_hyperparams(&gguf).unwrap();
-        assert_eq!(hp.num_layers, 2,
-                   "expected truncation to 2 real layers, got {}", hp.num_layers);
+        assert_eq!(
+            hp.num_layers, 2,
+            "expected truncation to 2 real layers, got {}",
+            hp.num_layers
+        );
     }
 
     /// `block_count` matches the actual count: no warning, no surprise.
@@ -1017,7 +1083,8 @@ mod tests {
             assert!(
                 (values[16 + i] - expected_hi).abs() < 1e-2,
                 "Q4_0 hi mismatch at index {}: got {}, expected {expected_hi}",
-                16 + i, values[16 + i]
+                16 + i,
+                values[16 + i]
             );
         }
     }
@@ -1110,9 +1177,15 @@ mod tests {
         block.extend_from_slice(&dmin_bits.to_le_bytes());
 
         let mut scales = [0u8; 12];
-        for s in &mut scales[..4] { *s = 2; }
-        for s in &mut scales[4..8] { *s = 3; }
-        for s in &mut scales[8..12] { *s = 0x32; }
+        for s in &mut scales[..4] {
+            *s = 2;
+        }
+        for s in &mut scales[4..8] {
+            *s = 3;
+        }
+        for s in &mut scales[8..12] {
+            *s = 0x32;
+        }
         block.extend_from_slice(&scales);
         block.resize(block.len() + 128, 0x44);
         assert_eq!(block.len(), 144);
@@ -1319,8 +1392,12 @@ mod tests {
         // Independent re-implementation of the canonical GGML traversal.
         let d = f16(0.05);
         let dmin = f16(0.02);
-        let scales: Vec<u8> = (0..16u8).map(|j| (j & 0x0F) | (((15 - j) & 0x0F) << 4)).collect();
-        let qs: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+        let scales: Vec<u8> = (0..16u8)
+            .map(|j| (j & 0x0F) | (((15 - j) & 0x0F) << 4))
+            .collect();
+        let qs: Vec<u8> = (0..64u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(11))
+            .collect();
         let mut expected = [0f32; 256];
         let mut yi = 0usize;
         let mut q_off = 0usize;
@@ -1328,12 +1405,20 @@ mod tests {
         for _g in 0..2 {
             let mut shift = 0u8;
             for _j in 0..4 {
-                let sc = scales[is]; is += 1;
+                let sc = scales[is];
+                is += 1;
                 let (dl, ml) = (d * (sc & 0xF) as f32, dmin * (sc >> 4) as f32);
-                for l in 0..16 { expected[yi] = dl * (((qs[q_off + l] >> shift) & 3) as f32) - ml; yi += 1; }
-                let sc = scales[is]; is += 1;
+                for l in 0..16 {
+                    expected[yi] = dl * (((qs[q_off + l] >> shift) & 3) as f32) - ml;
+                    yi += 1;
+                }
+                let sc = scales[is];
+                is += 1;
                 let (dl, ml) = (d * (sc & 0xF) as f32, dmin * (sc >> 4) as f32);
-                for l in 0..16 { expected[yi] = dl * (((qs[q_off + l + 16] >> shift) & 3) as f32) - ml; yi += 1; }
+                for l in 0..16 {
+                    expected[yi] = dl * (((qs[q_off + l + 16] >> shift) & 3) as f32) - ml;
+                    yi += 1;
+                }
                 shift += 2;
             }
             q_off += 32;
@@ -1342,7 +1427,8 @@ mod tests {
             assert!(
                 (values[i] - expected[i]).abs() < 1e-5,
                 "Q2_K traversal mismatch at {i}: got {}, expected {}",
-                values[i], expected[i]
+                values[i],
+                expected[i]
             );
         }
         // Sanity: this block is genuinely non-uniform, so a naive linear scan
@@ -1363,10 +1449,17 @@ mod tests {
         let exp = ((h >> 10) & 0x1f) as u32;
         let mant = (h & 0x3ff) as u32;
         let bits = if exp == 0 {
-            if mant == 0 { sign << 31 } else {
-                let mut e = exp as i32; let mut m = mant;
-                while (m & 0x400) == 0 { m <<= 1; e -= 1; }
-                e += 1; m &= 0x3ff;
+            if mant == 0 {
+                sign << 31
+            } else {
+                let mut e = exp as i32;
+                let mut m = mant;
+                while (m & 0x400) == 0 {
+                    m <<= 1;
+                    e -= 1;
+                }
+                e += 1;
+                m &= 0x3ff;
                 (sign << 31) | (((e + 112) as u32) << 23) | (m << 13)
             }
         } else if exp == 0x1f {
@@ -1383,10 +1476,16 @@ mod tests {
     #[test]
     fn dequantize_q3_k_non_degenerate_traversal() {
         let mut block = Vec::with_capacity(110);
-        for i in 0..32u8 { block.push(i.wrapping_mul(53).wrapping_add(7)); }   // hmask
-        for i in 0..64u8 { block.push(i.wrapping_mul(29).wrapping_add(3)); }   // qs
-        for i in 0..12u8 { block.push(i.wrapping_mul(17).wrapping_add(5)); }   // scales
-        block.extend_from_slice(&f32_to_f16_bits(0.1).to_le_bytes());          // d
+        for i in 0..32u8 {
+            block.push(i.wrapping_mul(53).wrapping_add(7));
+        } // hmask
+        for i in 0..64u8 {
+            block.push(i.wrapping_mul(29).wrapping_add(3));
+        } // qs
+        for i in 0..12u8 {
+            block.push(i.wrapping_mul(17).wrapping_add(5));
+        } // scales
+        block.extend_from_slice(&f32_to_f16_bits(0.1).to_le_bytes()); // d
         assert_eq!(block.len(), 110);
 
         let values: Vec<f32> = dequantize_q3_k(&block, 256)
@@ -1404,9 +1503,24 @@ mod tests {
         // production decode in dequant.rs and llama.cpp byte-for-byte).
         const KMASK1: u32 = 0x0303_0303;
         const KMASK2: u32 = 0x0f0f_0f0f;
-        let a0 = u32::from_le_bytes([scale_bytes[0], scale_bytes[1], scale_bytes[2], scale_bytes[3]]);
-        let a1 = u32::from_le_bytes([scale_bytes[4], scale_bytes[5], scale_bytes[6], scale_bytes[7]]);
-        let tmp = u32::from_le_bytes([scale_bytes[8], scale_bytes[9], scale_bytes[10], scale_bytes[11]]);
+        let a0 = u32::from_le_bytes([
+            scale_bytes[0],
+            scale_bytes[1],
+            scale_bytes[2],
+            scale_bytes[3],
+        ]);
+        let a1 = u32::from_le_bytes([
+            scale_bytes[4],
+            scale_bytes[5],
+            scale_bytes[6],
+            scale_bytes[7],
+        ]);
+        let tmp = u32::from_le_bytes([
+            scale_bytes[8],
+            scale_bytes[9],
+            scale_bytes[10],
+            scale_bytes[11],
+        ]);
         let out0 = (a0 & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
         let out1 = (a1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
         let out2 = ((a0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
@@ -1424,19 +1538,24 @@ mod tests {
         for _g in 0..2 {
             let mut shift = 0u8;
             for _j in 0..4 {
-                let dl = d * (sc[is] as i8 as f32 - 32.0); is += 1;
+                let dl = d * (sc[is] as i8 as f32 - 32.0);
+                is += 1;
                 for l in 0..16 {
                     let qb = ((qs[q_off + l] >> shift) & 3) as i32;
                     let sub = if (hmask[l] & m) != 0 { 0 } else { 4 };
-                    expected[yi] = dl * (qb - sub) as f32; yi += 1;
+                    expected[yi] = dl * (qb - sub) as f32;
+                    yi += 1;
                 }
-                let dl = d * (sc[is] as i8 as f32 - 32.0); is += 1;
+                let dl = d * (sc[is] as i8 as f32 - 32.0);
+                is += 1;
                 for l in 0..16 {
                     let qb = ((qs[q_off + l + 16] >> shift) & 3) as i32;
                     let sub = if (hmask[l + 16] & m) != 0 { 0 } else { 4 };
-                    expected[yi] = dl * (qb - sub) as f32; yi += 1;
+                    expected[yi] = dl * (qb - sub) as f32;
+                    yi += 1;
                 }
-                shift += 2; m <<= 1;
+                shift += 2;
+                m <<= 1;
             }
             q_off += 32;
         }
@@ -1444,7 +1563,8 @@ mod tests {
             assert!(
                 (values[i] - expected[i]).abs() < 1e-4,
                 "Q3_K traversal mismatch at {i}: got {}, expected {}",
-                values[i], expected[i]
+                values[i],
+                expected[i]
             );
         }
     }
@@ -1505,8 +1625,7 @@ mod tests {
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        let result =
-            dequantize_to_f32_bytes(&input, GgmlType::F32, 3, "test").unwrap();
+        let result = dequantize_to_f32_bytes(&input, GgmlType::F32, 3, "test").unwrap();
         assert_eq!(result, input);
     }
 
@@ -1516,8 +1635,7 @@ mod tests {
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        let result =
-            dequantize_to_f32_bytes(&input, GgmlType::F16, 2, "test").unwrap();
+        let result = dequantize_to_f32_bytes(&input, GgmlType::F16, 2, "test").unwrap();
         let values: Vec<f32> = result
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
@@ -1609,7 +1727,8 @@ mod tests {
 
         let result = dequantize_to_f32_bytes(&block, GgmlType::Q8_1, 32, "test");
         assert!(result.is_ok(), "Q8_1 should be supported in dispatcher");
-        let values: Vec<f32> = result.unwrap()
+        let values: Vec<f32> = result
+            .unwrap()
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
@@ -1714,12 +1833,14 @@ mod tests {
         // Element 0: scale * (0 | (1 << 4)) + min = 1.0 * 16 + 10.0 = 26.0
         assert!(
             (values[0] - 26.0).abs() < 1e-2,
-            "Q5_1 high-bit mismatch: got {}, expected 26.0", values[0]
+            "Q5_1 high-bit mismatch: got {}, expected 26.0",
+            values[0]
         );
         // Element 1: scale * (0 | (0 << 4)) + min = 0 + 10.0 = 10.0
         assert!(
             (values[1] - 10.0).abs() < 1e-2,
-            "Q5_1 no-high-bit mismatch: got {}, expected 10.0", values[1]
+            "Q5_1 no-high-bit mismatch: got {}, expected 10.0",
+            values[1]
         );
     }
 
@@ -1741,12 +1862,20 @@ mod tests {
     fn has_dequant_path_covers_all_supported_types() {
         // Every type handled by dequantize_to_f32_bytes must return true
         let supported = [
-            GgmlType::F32, GgmlType::F16, GgmlType::BF16,
-            GgmlType::Q8_0, GgmlType::Q8_1,
-            GgmlType::Q4_0, GgmlType::Q4_1,
-            GgmlType::Q5_0, GgmlType::Q5_1,
-            GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K,
-            GgmlType::Q2_K, GgmlType::Q3_K,
+            GgmlType::F32,
+            GgmlType::F16,
+            GgmlType::BF16,
+            GgmlType::Q8_0,
+            GgmlType::Q8_1,
+            GgmlType::Q4_0,
+            GgmlType::Q4_1,
+            GgmlType::Q5_0,
+            GgmlType::Q5_1,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+            GgmlType::Q2_K,
+            GgmlType::Q3_K,
             GgmlType::MXFP4,
         ];
         for t in supported {
@@ -1755,16 +1884,28 @@ mod tests {
 
         // Types without dequant path
         let unsupported = [
-            GgmlType::Q8_K, GgmlType::F64,
-            GgmlType::I8, GgmlType::I16, GgmlType::I32, GgmlType::I64,
-            GgmlType::IQ2_XXS, GgmlType::IQ2_XS, GgmlType::IQ2_S,
-            GgmlType::IQ3_XXS, GgmlType::IQ3_S,
-            GgmlType::IQ1_S, GgmlType::IQ1_M,
-            GgmlType::IQ4_NL, GgmlType::IQ4_XS,
+            GgmlType::Q8_K,
+            GgmlType::F64,
+            GgmlType::I8,
+            GgmlType::I16,
+            GgmlType::I32,
+            GgmlType::I64,
+            GgmlType::IQ2_XXS,
+            GgmlType::IQ2_XS,
+            GgmlType::IQ2_S,
+            GgmlType::IQ3_XXS,
+            GgmlType::IQ3_S,
+            GgmlType::IQ1_S,
+            GgmlType::IQ1_M,
+            GgmlType::IQ4_NL,
+            GgmlType::IQ4_XS,
             GgmlType::Unknown(9999),
         ];
         for t in unsupported {
-            assert!(!t.has_dequant_path(), "{t:?} should NOT have a dequant path");
+            assert!(
+                !t.has_dequant_path(),
+                "{t:?} should NOT have a dequant path"
+            );
         }
     }
 
@@ -1780,10 +1921,14 @@ mod tests {
         let scale_bits = f32_to_f16_bits(1.0);
         let mut data = Vec::new();
         data.extend_from_slice(&scale_bits.to_le_bytes());
-        for i in 0..32i8 { data.push(i as u8); }
+        for i in 0..32i8 {
+            data.push(i as u8);
+        }
         let scale2_bits = f32_to_f16_bits(0.5);
         data.extend_from_slice(&scale2_bits.to_le_bytes());
-        for i in 0..32i8 { data.push((i * 2) as u8); }
+        for i in 0..32i8 {
+            data.push((i * 2) as u8);
+        }
 
         let result = dequantize_q8_0(&data, 64);
         let values: Vec<f32> = result
@@ -1793,11 +1938,17 @@ mod tests {
 
         assert_eq!(values.len(), 64);
         for (i, &v) in values[..32].iter().enumerate() {
-            assert!((v - i as f32).abs() < 1e-2, "block1[{i}]: got {v}, expected {i}");
+            assert!(
+                (v - i as f32).abs() < 1e-2,
+                "block1[{i}]: got {v}, expected {i}"
+            );
         }
         for (i, &v) in values[32..64].iter().enumerate() {
             let expected = 0.5 * (i * 2) as f32;
-            assert!((v - expected).abs() < 1e-2, "block2[{i}]: got {v}, expected {expected}");
+            assert!(
+                (v - expected).abs() < 1e-2,
+                "block2[{i}]: got {v}, expected {expected}"
+            );
         }
     }
 
@@ -1866,7 +2017,10 @@ mod tests {
     /// implementation; they are pure string-builder utilities.
     #[test]
     fn moe_tensor_naming() {
-        assert_eq!(layer_tensor_name(0, FFN_GATE_INP), "blk.0.ffn_gate_inp.weight");
+        assert_eq!(
+            layer_tensor_name(0, FFN_GATE_INP),
+            "blk.0.ffn_gate_inp.weight"
+        );
         assert_eq!(expert_tensor_name(0, "gate", 0), "blk.0.ffn_gate.0.weight");
         assert_eq!(expert_tensor_name(0, "up", 3), "blk.0.ffn_up.3.weight");
         assert_eq!(expert_tensor_name(1, "down", 7), "blk.1.ffn_down.7.weight");
@@ -1888,10 +2042,15 @@ mod tests {
         block[0] = 128;
         block[1] = 0x10;
         block[2] = 0x32;
-        for i in 3..17 { block[i] = 0x00; }
+        for i in 3..17 {
+            block[i] = 0x00;
+        }
 
         let out = dequantize_mxfp4(&block, 32);
-        let f32s: Vec<f32> = out.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let f32s: Vec<f32> = out
+            .chunks(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
 
         assert_eq!(f32s.len(), 32);
         assert_eq!(f32s[0], 0.0);
@@ -1909,10 +2068,15 @@ mod tests {
         block[0] = 128;
         block[1] = 0x9A;
         block[2] = 0xFE;
-        for i in 3..17 { block[i] = 0x00; }
+        for i in 3..17 {
+            block[i] = 0x00;
+        }
 
         let out = dequantize_mxfp4(&block, 32);
-        let f32s: Vec<f32> = out.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let f32s: Vec<f32> = out
+            .chunks(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
 
         assert_eq!(f32s[0], -2.0);
         assert_eq!(f32s[1], -8.0);
@@ -1925,10 +2089,15 @@ mod tests {
         let mut block = [0u8; 17];
         block[0] = 126;
         block[1] = 0x47;
-        for i in 2..17 { block[i] = 0x00; }
+        for i in 2..17 {
+            block[i] = 0x00;
+        }
 
         let out = dequantize_mxfp4(&block, 32);
-        let f32s: Vec<f32> = out.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let f32s: Vec<f32> = out
+            .chunks(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
 
         assert_eq!(f32s[0], 12.0 * 0.25);
         assert_eq!(f32s[16], 4.0 * 0.25);
@@ -1943,7 +2112,10 @@ mod tests {
         data[18] = 0x05;
 
         let out = dequantize_mxfp4(&data, 64);
-        let f32s: Vec<f32> = out.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let f32s: Vec<f32> = out
+            .chunks(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
 
         assert_eq!(f32s.len(), 64);
         assert_eq!(f32s[0], 1.0);
@@ -1959,7 +2131,10 @@ mod tests {
         let result = dequantize_to_f32_bytes(&block, GgmlType::MXFP4, 32, "test");
         assert!(result.is_ok());
         let bytes = result.unwrap();
-        let f32s: Vec<f32> = bytes.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let f32s: Vec<f32> = bytes
+            .chunks(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
         assert_eq!(f32s[0], 1.0);
         assert_eq!(f32s[16], 3.0);
     }

@@ -4,9 +4,9 @@ use crate::config::{BackendChoice, BenchConfig, BenchPipelineMode, ModelSpec};
 use crate::results::{BenchResult, BenchSummary};
 
 use lumen_format::large_model::{self, LargeModelConfig};
-use lumen_runtime::compute::ComputeBackend;
 use lumen_runtime::compute::cpu_naive::NaiveF32Backend;
 use lumen_runtime::compute::cpu_simd::SimdF32Backend;
+use lumen_runtime::compute::ComputeBackend;
 use lumen_runtime::config::RuntimeConfig;
 use lumen_runtime::engine::{GenerationResult, InferenceEngine, SamplingParams, StopCondition};
 use lumen_runtime::kv::KvPrecision;
@@ -72,11 +72,15 @@ impl std::error::Error for BenchError {
 }
 
 impl From<std::io::Error> for BenchError {
-    fn from(e: std::io::Error) -> Self { Self::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
 }
 
 impl From<lumen_runtime::RuntimeError> for BenchError {
-    fn from(e: lumen_runtime::RuntimeError) -> Self { Self::Runtime(e) }
+    fn from(e: lumen_runtime::RuntimeError) -> Self {
+        Self::Runtime(e)
+    }
 }
 
 /// Resolve a `ModelSpec` to a path, generating the model if needed.
@@ -84,7 +88,10 @@ pub fn ensure_model(spec: &ModelSpec) -> Result<PathBuf, BenchError> {
     match spec {
         ModelSpec::Path(p) => {
             if !p.exists() {
-                return Err(BenchError::Config(format!("model not found: {}", p.display())));
+                return Err(BenchError::Config(format!(
+                    "model not found: {}",
+                    p.display()
+                )));
             }
             Ok(p.clone())
         }
@@ -182,13 +189,28 @@ fn run_single_iteration(
 ) -> Result<BenchResult, BenchError> {
     match config.backend {
         BackendChoice::Mmap => run_mmap_iteration(
-            model_path, config, pipeline_mode, prompt_tokens, stop, sampling,
+            model_path,
+            config,
+            pipeline_mode,
+            prompt_tokens,
+            stop,
+            sampling,
         ),
         BackendChoice::Sync => run_sync_iteration(
-            model_path, config, pipeline_mode, prompt_tokens, stop, sampling,
+            model_path,
+            config,
+            pipeline_mode,
+            prompt_tokens,
+            stop,
+            sampling,
         ),
         BackendChoice::AsyncSync => run_async_iteration(
-            model_path, config, pipeline_mode, prompt_tokens, stop, sampling,
+            model_path,
+            config,
+            pipeline_mode,
+            prompt_tokens,
+            stop,
+            sampling,
         ),
     }
 }
@@ -203,10 +225,7 @@ fn run_single_iteration(
 /// cross-trial determinism check, plus the backend's end-of-gen
 /// `peak_memory_bytes`.  Both fields are additive — older callers that
 /// constructed `BenchResult` literals are unaffected.
-fn metrics_to_bench_result(
-    result: &GenerationResult,
-    initial_residency: f64,
-) -> BenchResult {
+fn metrics_to_bench_result(result: &GenerationResult, initial_residency: f64) -> BenchResult {
     let m = &result.metrics;
     let total_stall: Duration = m.per_layer_timings.iter().map(|t| t.stall_time).sum();
     let total_compute: Duration = m.per_layer_timings.iter().map(|t| t.total_time()).sum();
@@ -311,7 +330,13 @@ fn run_mmap_iteration(
         provider.embedding.clone(),
         provider.final_norm.clone(),
         provider.output_proj.clone(),
-        &hp, config, pipeline_mode, prompt_tokens, stop, sampling, initial_residency,
+        &hp,
+        config,
+        pipeline_mode,
+        prompt_tokens,
+        stop,
+        sampling,
+        initial_residency,
     )
 }
 
@@ -330,7 +355,13 @@ fn run_async_iteration(
         provider.embedding.clone(),
         provider.final_norm.clone(),
         provider.output_proj.clone(),
-        &hp, config, pipeline_mode, prompt_tokens, stop, sampling, 0.0,
+        &hp,
+        config,
+        pipeline_mode,
+        prompt_tokens,
+        stop,
+        sampling,
+        0.0,
     )
 }
 
@@ -349,6 +380,12 @@ fn run_sync_iteration(
         provider.embedding.clone(),
         provider.final_norm.clone(),
         provider.output_proj.clone(),
-        &hp, config, pipeline_mode, prompt_tokens, stop, sampling, 0.0,
+        &hp,
+        config,
+        pipeline_mode,
+        prompt_tokens,
+        stop,
+        sampling,
+        0.0,
     )
 }

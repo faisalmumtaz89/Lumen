@@ -14,9 +14,9 @@
 //!   cargo test --release --lib -p lumen-runtime \
 //!     metal::tests::paired_dispatch -- --nocapture
 
-use crate::metal::MetalF32Backend;
 use crate::metal::ffi::{MTLSize, MetalFunctionConstantValues};
 use crate::metal::shaders::METAL_SHADER_SOURCE;
+use crate::metal::MetalF32Backend;
 
 /// Convert a float to a BF16 bit pattern (round-to-nearest-even).
 fn f32_to_bf16_bits(f: f32) -> u16 {
@@ -34,7 +34,9 @@ fn make_synthetic_bf16(n_rows: usize, k_cols: usize, seed: u32) -> Vec<u16> {
     let mut s: u64 = seed as u64;
     let mut out = Vec::with_capacity(n_rows * k_cols);
     for _ in 0..(n_rows * k_cols) {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (s >> 32) as u32;
         let f = ((u as f32) / (u32::MAX as f32) * 0.2 - 0.1) as f32;
         out.push(f32_to_bf16_bits(f));
@@ -46,7 +48,9 @@ fn make_random_f32_small(n: usize, seed: u32) -> Vec<f32> {
     let mut s: u64 = seed as u64;
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (s >> 32) as u32;
         let f = (u as f32) / (u32::MAX as f32) - 0.5;
         v.push(f);
@@ -80,7 +84,9 @@ fn paired_run(m: usize, k: usize, n_qkv: usize, n_gate: usize) {
     let k_u32 = k as u32;
     let n_qkv_u32 = n_qkv as u32;
     let n_gate_u32 = n_gate as u32;
-    paired_run_impl(m, k, n_qkv, n_gate, n_total, m_u32, k_u32, n_qkv_u32, n_gate_u32, true);
+    paired_run_impl(
+        m, k, n_qkv, n_gate, n_total, m_u32, k_u32, n_qkv_u32, n_gate_u32, true,
+    );
 }
 
 fn paired_run_aligned(m: usize, k: usize, n_qkv: usize, n_gate: usize) {
@@ -89,18 +95,27 @@ fn paired_run_aligned(m: usize, k: usize, n_qkv: usize, n_gate: usize) {
     let k_u32 = k as u32;
     let n_qkv_u32 = n_qkv as u32;
     let n_gate_u32 = n_gate as u32;
-    paired_run_impl(m, k, n_qkv, n_gate, n_total, m_u32, k_u32, n_qkv_u32, n_gate_u32, false);
+    paired_run_impl(
+        m, k, n_qkv, n_gate, n_total, m_u32, k_u32, n_qkv_u32, n_gate_u32, false,
+    );
 }
 
 #[allow(non_snake_case)] // M/K = GEMM dims, N_* = output widths (math convention)
 fn paired_run_impl(
-    M: usize, K: usize, N_QKV: usize, N_GATE: usize, N_TOTAL: usize,
-    m_u32: u32, k_u32: u32, n_qkv_u32: u32, n_gate_u32: u32,
+    M: usize,
+    K: usize,
+    N_QKV: usize,
+    N_GATE: usize,
+    N_TOTAL: usize,
+    m_u32: u32,
+    k_u32: u32,
+    n_qkv_u32: u32,
+    n_gate_u32: u32,
     use_bc: bool,
 ) {
-
     let backend = MetalF32Backend::new().expect("Metal backend create");
-    let lib = backend.device
+    let lib = backend
+        .device
         .new_library_with_source(METAL_SHADER_SOURCE)
         .expect("Metal lib compile");
 
@@ -114,35 +129,53 @@ fn paired_run_impl(
     fcv.set_bool(use_bc, 12);
 
     // Reference: tiled_matmul_bf16_k64 (single output).
-    let f_ref = lib.get_function_with_constants("tiled_matmul_bf16_k64", &fcv)
+    let f_ref = lib
+        .get_function_with_constants("tiled_matmul_bf16_k64", &fcv)
         .expect("ref kernel function");
-    let pso_ref = backend.device.new_compute_pipeline_state(&f_ref)
+    let pso_ref = backend
+        .device
+        .new_compute_pipeline_state(&f_ref)
         .expect("ref PSO");
 
     // Treatment: tiled_matmul_bf16_k64_qkv_gate_paired (dual output).
-    let f_pair = lib.get_function_with_constants("tiled_matmul_bf16_k64_qkv_gate_paired", &fcv)
+    let f_pair = lib
+        .get_function_with_constants("tiled_matmul_bf16_k64_qkv_gate_paired", &fcv)
         .expect("paired kernel function");
-    let pso_pair = backend.device.new_compute_pipeline_state(&f_pair)
+    let pso_pair = backend
+        .device
+        .new_compute_pipeline_state(&f_pair)
         .expect("paired PSO");
 
     // Synthetic inputs.
-    let w_qkv  = make_synthetic_bf16(N_QKV, K, 1);
+    let w_qkv = make_synthetic_bf16(N_QKV, K, 1);
     let w_gate = make_synthetic_bf16(N_GATE, K, 2);
-    let x      = make_random_f32_small(M * K, 3);
+    let x = make_random_f32_small(M * K, 3);
 
     // ---- REF: two separate dispatches ----
-    let w_qkv_buf = backend.device.new_buffer_with_bytes(unsafe {
-        std::slice::from_raw_parts(w_qkv.as_ptr() as *const u8, w_qkv.len() * 2)
-    }).expect("w_qkv buf");
-    let w_gate_buf = backend.device.new_buffer_with_bytes(unsafe {
-        std::slice::from_raw_parts(w_gate.as_ptr() as *const u8, w_gate.len() * 2)
-    }).expect("w_gate buf");
-    let x_buf = backend.device.new_buffer_with_bytes(unsafe {
-        std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4)
-    }).expect("x buf");
+    let w_qkv_buf = backend
+        .device
+        .new_buffer_with_bytes(unsafe {
+            std::slice::from_raw_parts(w_qkv.as_ptr() as *const u8, w_qkv.len() * 2)
+        })
+        .expect("w_qkv buf");
+    let w_gate_buf = backend
+        .device
+        .new_buffer_with_bytes(unsafe {
+            std::slice::from_raw_parts(w_gate.as_ptr() as *const u8, w_gate.len() * 2)
+        })
+        .expect("w_gate buf");
+    let x_buf = backend
+        .device
+        .new_buffer_with_bytes(unsafe {
+            std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4)
+        })
+        .expect("x buf");
 
-    let y_ref_qkv  = backend.device.new_buffer(M * N_QKV * 4).expect("y_ref_qkv");
-    let y_ref_gate = backend.device.new_buffer(M * N_GATE * 4).expect("y_ref_gate");
+    let y_ref_qkv = backend.device.new_buffer(M * N_QKV * 4).expect("y_ref_qkv");
+    let y_ref_gate = backend
+        .device
+        .new_buffer(M * N_GATE * 4)
+        .expect("y_ref_gate");
 
     // Dispatch QKV
     let cmd = backend.queue.new_command_buffer().expect("cmd buf");
@@ -176,27 +209,38 @@ fn paired_run_impl(
     enc.end_encoding();
     cmd.commit_and_wait();
 
-    let mut ref_qkv_out  = vec![0.0f32; M * N_QKV];
+    let mut ref_qkv_out = vec![0.0f32; M * N_QKV];
     let mut ref_gate_out = vec![0.0f32; M * N_GATE];
     y_ref_qkv.read_f32(&mut ref_qkv_out);
     y_ref_gate.read_f32(&mut ref_gate_out);
 
     // ---- TREATMENT: paired dispatch ----
     // Build the concat-then-stripe packed buffer via the repack helper.
-    let w_qkv_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(w_qkv.as_ptr() as *const u8, w_qkv.len() * 2)
-    };
-    let w_gate_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(w_gate.as_ptr() as *const u8, w_gate.len() * 2)
-    };
+    let w_qkv_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(w_qkv.as_ptr() as *const u8, w_qkv.len() * 2) };
+    let w_gate_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(w_gate.as_ptr() as *const u8, w_gate.len() * 2) };
     let packed = crate::metal::repack_bf16::repack_bf16_qkv_gate_concat(
-        w_qkv_bytes, w_gate_bytes, N_QKV, N_GATE, K
-    ).expect("concat repack");
-    let w_packed_buf = backend.device.new_buffer_with_bytes(&packed)
+        w_qkv_bytes,
+        w_gate_bytes,
+        N_QKV,
+        N_GATE,
+        K,
+    )
+    .expect("concat repack");
+    let w_packed_buf = backend
+        .device
+        .new_buffer_with_bytes(&packed)
         .expect("packed buf");
 
-    let y_pair_qkv  = backend.device.new_buffer(M * N_QKV * 4).expect("y_pair_qkv");
-    let y_pair_gate = backend.device.new_buffer(M * N_GATE * 4).expect("y_pair_gate");
+    let y_pair_qkv = backend
+        .device
+        .new_buffer(M * N_QKV * 4)
+        .expect("y_pair_qkv");
+    let y_pair_gate = backend
+        .device
+        .new_buffer(M * N_GATE * 4)
+        .expect("y_pair_gate");
 
     let cmd2 = backend.queue.new_command_buffer().expect("cmd buf2");
     let enc2 = cmd2.new_compute_encoder().expect("enc2");
@@ -217,17 +261,21 @@ fn paired_run_impl(
     enc2.end_encoding();
     cmd2.commit_and_wait();
 
-    let mut pair_qkv_out  = vec![0.0f32; M * N_QKV];
+    let mut pair_qkv_out = vec![0.0f32; M * N_QKV];
     let mut pair_gate_out = vec![0.0f32; M * N_GATE];
     y_pair_qkv.read_f32(&mut pair_qkv_out);
     y_pair_gate.read_f32(&mut pair_gate_out);
 
     // ---- Compare ----
     let _ = (bf16_bits_to_f32(0u16),); // unused-import guard
-    let max_qkv_diff = ref_qkv_out.iter().zip(pair_qkv_out.iter())
+    let max_qkv_diff = ref_qkv_out
+        .iter()
+        .zip(pair_qkv_out.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    let max_gate_diff = ref_gate_out.iter().zip(pair_gate_out.iter())
+    let max_gate_diff = ref_gate_out
+        .iter()
+        .zip(pair_gate_out.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
 
@@ -236,14 +284,18 @@ fn paired_run_impl(
     for (i, (a, b)) in ref_qkv_out.iter().zip(pair_qkv_out.iter()).enumerate() {
         if (a - b).abs() > 1e-5 {
             qkv_mismatch.push((i, *a, *b));
-            if qkv_mismatch.len() >= 8 { break; }
+            if qkv_mismatch.len() >= 8 {
+                break;
+            }
         }
     }
     let mut gate_mismatch = Vec::new();
     for (i, (a, b)) in ref_gate_out.iter().zip(pair_gate_out.iter()).enumerate() {
         if (a - b).abs() > 1e-5 {
             gate_mismatch.push((i, *a, *b));
-            if gate_mismatch.len() >= 8 { break; }
+            if gate_mismatch.len() >= 8 {
+                break;
+            }
         }
     }
 
@@ -264,6 +316,14 @@ fn paired_run_impl(
 
     // Bit-identical comparison: identical FMA order, identical accumulators.
     // Allow a small floating-point tolerance for any reorder Apple may introduce.
-    assert!(max_qkv_diff <= 1e-5, "QKV output diverges (max_diff = {})", max_qkv_diff);
-    assert!(max_gate_diff <= 1e-5, "Gate output diverges (max_diff = {})", max_gate_diff);
+    assert!(
+        max_qkv_diff <= 1e-5,
+        "QKV output diverges (max_diff = {})",
+        max_qkv_diff
+    );
+    assert!(
+        max_gate_diff <= 1e-5,
+        "Gate output diverges (max_diff = {})",
+        max_gate_diff
+    );
 }

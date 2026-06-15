@@ -200,11 +200,10 @@ async fn get_status_and_body(
 }
 
 /// Send one chat-completion to populate session state, ignore the body.
-async fn one_chat(
-    client: &Client<HttpConnector, Full<bytes::Bytes>>,
-    addr: SocketAddr,
-) {
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+async fn one_chat(client: &Client<HttpConnector, Full<bytes::Bytes>>, addr: SocketAddr) {
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     let body = serde_json::json!({
         "model": MODEL_ID,
         "messages": [{"role": "user", "content": "x"}],
@@ -239,7 +238,9 @@ async fn one_chat(
 async fn default_path_returns_404() {
     let _env = EnvGuard::set(None);
     let (addr, client, _h, _tmp) = boot().await;
-    let uri: Uri = format!("http://{addr}/debug/memory_breakdown").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/debug/memory_breakdown")
+        .parse()
+        .unwrap();
     let (status, body) = get_status_and_body(&client, uri).await;
     assert_eq!(
         status,
@@ -258,14 +259,19 @@ async fn default_path_returns_404() {
 async fn enabled_returns_zero_snapshot_before_jobs() {
     let _env = EnvGuard::set(Some("1"));
     let (addr, client, _h, _tmp) = boot().await;
-    let uri: Uri = format!("http://{addr}/debug/memory_breakdown").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/debug/memory_breakdown")
+        .parse()
+        .unwrap();
     let (status, body) = get_status_and_body(&client, uri).await;
     assert_eq!(status, hyper::StatusCode::OK, "enabled must return 200");
     let v: Value = serde_json::from_slice(&body).expect("body is JSON");
 
     // engine_inbox_capacity is set at spawn time to INBOX_SIZE; everything
     // else stays zero until process_job runs at least once.
-    assert_eq!(v["engine_inbox_capacity"].as_u64().unwrap(), INBOX_SIZE as u64);
+    assert_eq!(
+        v["engine_inbox_capacity"].as_u64().unwrap(),
+        INBOX_SIZE as u64
+    );
     assert_eq!(v["update_count"].as_u64().unwrap(), 0);
     assert_eq!(v["last_update_unix"].as_u64().unwrap(), 0);
     assert_eq!(v["kv_used_bytes"].as_u64().unwrap(), 0);
@@ -281,7 +287,9 @@ async fn enabled_returns_zero_snapshot_before_jobs() {
 async fn enabled_zero_disables_endpoint() {
     let _env = EnvGuard::set(Some("0"));
     let (addr, client, _h, _tmp) = boot().await;
-    let uri: Uri = format!("http://{addr}/debug/memory_breakdown").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/debug/memory_breakdown")
+        .parse()
+        .unwrap();
     let (status, _body) = get_status_and_body(&client, uri).await;
     assert_eq!(
         status,
@@ -303,7 +311,9 @@ async fn snapshot_updates_after_request() {
     one_chat(&client, addr).await;
 
     // Then sample the breakdown.
-    let uri: Uri = format!("http://{addr}/debug/memory_breakdown").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/debug/memory_breakdown")
+        .parse()
+        .unwrap();
     let (status, body) = get_status_and_body(&client, uri).await;
     assert_eq!(status, hyper::StatusCode::OK);
     let v: Value = serde_json::from_slice(&body).expect("body is JSON");
@@ -314,18 +324,29 @@ async fn snapshot_updates_after_request() {
     let session_tokens_len = v["session_tokens_len"].as_u64().unwrap();
     let pending_logits_bytes = v["session_pending_logits_bytes"].as_u64().unwrap();
 
-    assert!(update_count >= 1, "update_count must be >= 1 after a job, got {update_count}: full body={}", String::from_utf8_lossy(&body));
-    assert!(last_update > 0, "last_update_unix must be a real epoch ts, got {last_update}");
+    assert!(
+        update_count >= 1,
+        "update_count must be >= 1 after a job, got {update_count}: full body={}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        last_update > 0,
+        "last_update_unix must be a real epoch ts, got {last_update}"
+    );
     // Identity byte tokenizer + "x" prompt + chat template adds a handful of
     // tokens; whatever the exact count, it must be > 0 after a job.
-    assert!(session_tokens_len > 0, "session_tokens_len must be > 0 after a job");
+    assert!(
+        session_tokens_len > 0,
+        "session_tokens_len must be > 0 after a job"
+    );
     // KV seq_len matches the token count for the simple identity tokenizer
     // path (no chat template).
     assert!(kv_seq_len > 0, "kv_seq_len must be > 0 after a job");
     // pending_logits is vocab*4 by the conservative steady-state estimate;
     // the synthetic test model has vocab_size=256 so the value is exactly 1024.
     assert_eq!(
-        pending_logits_bytes, 256 * 4,
+        pending_logits_bytes,
+        256 * 4,
         "session_pending_logits_bytes must equal vocab*4, got {pending_logits_bytes}",
     );
 }

@@ -64,7 +64,10 @@ fn write_gqa_q8_model() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("lumen_det_gqa_q8_{id}"));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("model_q8.lbc");
-    std::fs::File::create(&path).unwrap().write_all(&data).unwrap();
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(&data)
+        .unwrap();
     path
 }
 
@@ -91,7 +94,9 @@ fn generate_tokens(model_path: &std::path::Path, prompt: &[u32], max_new: usize)
         backend.set_weight_tying(true);
     }
     backend.init(&hyper).expect("Metal init failed");
-    backend.preload_weights(&provider).expect("Metal preload_weights failed");
+    backend
+        .preload_weights(&provider)
+        .expect("Metal preload_weights failed");
 
     let engine = InferenceEngine::new(
         RuntimeConfig {
@@ -104,9 +109,19 @@ fn generate_tokens(model_path: &std::path::Path, prompt: &[u32], max_new: usize)
         hyper,
     );
 
-    let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        seed: Some(42),
+        ..Default::default()
+    };
     let result = engine
-        .generate(prompt, &provider, &backend, &StopCondition::MaxTokens(max_new), &sampling)
+        .generate(
+            prompt,
+            &provider,
+            &backend,
+            &StopCondition::MaxTokens(max_new),
+            &sampling,
+        )
         .expect("generate failed");
     result.tokens
 }
@@ -120,7 +135,10 @@ fn metal_greedy_decode_is_byte_deterministic_across_repeats() {
 
     // Reference run.
     let reference = generate_tokens(&model, &prompt, max_new);
-    assert!(!reference.is_empty(), "reference generation produced no tokens");
+    assert!(
+        !reference.is_empty(),
+        "reference generation produced no tokens"
+    );
 
     // N repeats MUST match the reference token-for-token. A divergence is a
     // DET-001-class non-determinism regression in the shared decode CB.

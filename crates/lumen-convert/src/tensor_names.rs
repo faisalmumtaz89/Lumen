@@ -74,9 +74,9 @@ pub(crate) const ATTN_QKV: &str = "attn_qkv.weight";
 // SSM / linear attention tensor names (Qwen3.5-MoE GatedDeltaNet layers)
 // ---------------------------------------------------------------------------
 
-pub(crate) const SSM_A: &str = "ssm_a";           // no .weight suffix in GGUF
+pub(crate) const SSM_A: &str = "ssm_a"; // no .weight suffix in GGUF
 pub(crate) const SSM_CONV1D: &str = "ssm_conv1d.weight";
-pub(crate) const SSM_DT: &str = "ssm_dt.bias";   // .bias not .weight in GGUF
+pub(crate) const SSM_DT: &str = "ssm_dt.bias"; // .bias not .weight in GGUF
 pub(crate) const SSM_BETA: &str = "ssm_beta.weight";
 pub(crate) const SSM_ALPHA: &str = "ssm_alpha.weight";
 pub(crate) const SSM_NORM: &str = "ssm_norm.weight";

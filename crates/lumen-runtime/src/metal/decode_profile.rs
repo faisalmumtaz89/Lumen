@@ -76,15 +76,30 @@ pub(crate) fn record_gpu_time(gpu_secs: f64) {
         a.1 >= 64
     });
     if fire {
-        let (gpu_sum, n) = GPU_ACC.with(|a| { let v = *a.borrow(); v });
+        let (gpu_sum, n) = GPU_ACC.with(|a| {
+            let v = *a.borrow();
+            v
+        });
         let wall_sum = GPU_WALL_ACC.with(|a| *a.borrow());
         let gpu_ms = gpu_sum / n as f64 * 1000.0;
-        let wall_ms = if n > 1 { wall_sum / (n as f64 - 1.0) * 1000.0 } else { 0.0 };
-        let util = if wall_ms > 0.0 { gpu_ms / wall_ms * 100.0 } else { 0.0 };
+        let wall_ms = if n > 1 {
+            wall_sum / (n as f64 - 1.0) * 1000.0
+        } else {
+            0.0
+        };
+        let util = if wall_ms > 0.0 {
+            gpu_ms / wall_ms * 100.0
+        } else {
+            0.0
+        };
         eprintln!(
             "[decode-gputime] over {} tokens: GPU_busy={:.3} ms/tok  wall={:.3} ms/tok  \
              GPU_util={:.1}%  (idle/CPU gap={:.3} ms/tok)",
-            n, gpu_ms, wall_ms, util, (wall_ms - gpu_ms).max(0.0)
+            n,
+            gpu_ms,
+            wall_ms,
+            util,
+            (wall_ms - gpu_ms).max(0.0)
         );
         GPU_ACC.with(|a| *a.borrow_mut() = (0.0, 0));
         GPU_WALL_ACC.with(|a| *a.borrow_mut() = 0.0);
@@ -113,7 +128,12 @@ pub(crate) fn maybe_report_and_reset(every: u64) {
     let fire = TOK_COUNT.with(|c| {
         let mut c = c.borrow_mut();
         *c += 1;
-        if *c >= every { *c = 0; true } else { false }
+        if *c >= every {
+            *c = 0;
+            true
+        } else {
+            false
+        }
     });
     if fire {
         print_report();
@@ -137,7 +157,12 @@ pub(crate) fn record_and_advance(next_label: &'static str) {
     if !is_enabled() {
         return;
     }
-    let elapsed = MARK.with(|m| m.borrow_mut().take().map(|t| t.elapsed()).unwrap_or_default());
+    let elapsed = MARK.with(|m| {
+        m.borrow_mut()
+            .take()
+            .map(|t| t.elapsed())
+            .unwrap_or_default()
+    });
     let label = IN_FLIGHT.with(|s| *s.borrow());
     ACCUM.with(|a| {
         let mut a = a.borrow_mut();
@@ -194,7 +219,12 @@ pub(crate) fn record_final() {
     if !is_enabled() {
         return;
     }
-    let elapsed = MARK.with(|m| m.borrow_mut().take().map(|t| t.elapsed()).unwrap_or_default());
+    let elapsed = MARK.with(|m| {
+        m.borrow_mut()
+            .take()
+            .map(|t| t.elapsed())
+            .unwrap_or_default()
+    });
     let label = IN_FLIGHT.with(|s| *s.borrow());
     ACCUM.with(|a| {
         let mut a = a.borrow_mut();
@@ -216,9 +246,8 @@ pub(crate) fn print_report() {
     if !is_enabled() {
         return;
     }
-    let mut v: Vec<(&'static str, Duration, u64)> = ACCUM.with(|a| {
-        a.borrow().iter().map(|(k, (d, n))| (*k, *d, *n)).collect()
-    });
+    let mut v: Vec<(&'static str, Duration, u64)> =
+        ACCUM.with(|a| a.borrow().iter().map(|(k, (d, n))| (*k, *d, *n)).collect());
     if v.is_empty() {
         eprintln!("[decode-profile] no samples");
         return;
@@ -227,15 +256,27 @@ pub(crate) fn print_report() {
     let total: Duration = v.iter().map(|(_, d, _)| *d).sum();
     eprintln!();
     eprintln!("===== Metal DECODE per-section profile (split-CB, Option A) =====");
-    eprintln!("{:<24} {:>12} {:>10} {:>9} {:>12}", "section", "total_ms", "calls", "% tok", "us/call");
+    eprintln!(
+        "{:<24} {:>12} {:>10} {:>9} {:>12}",
+        "section", "total_ms", "calls", "% tok", "us/call"
+    );
     eprintln!("{}", "-".repeat(72));
     for (label, dur, n) in &v {
         let ms = dur.as_secs_f64() * 1000.0;
         let pct = if total.as_nanos() > 0 {
             (dur.as_nanos() as f64 / total.as_nanos() as f64) * 100.0
-        } else { 0.0 };
-        let us_call = if *n > 0 { (ms * 1000.0) / *n as f64 } else { 0.0 };
-        eprintln!("{:<24} {:>12.3} {:>10} {:>8.2}% {:>12.2}", label, ms, n, pct, us_call);
+        } else {
+            0.0
+        };
+        let us_call = if *n > 0 {
+            (ms * 1000.0) / *n as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "{:<24} {:>12.3} {:>10} {:>8.2}% {:>12.2}",
+            label, ms, n, pct, us_call
+        );
     }
     eprintln!("{}", "-".repeat(72));
     eprintln!("{:<24} {:>12.3}", "TOTAL", total.as_secs_f64() * 1000.0);
@@ -244,20 +285,29 @@ pub(crate) fn print_report() {
     eprintln!();
 
     // TRUE GPU-time table (overhead-free; the accurate per-section breakdown).
-    let mut g: Vec<(&'static str, f64, u64)> = GPU_SECTION.with(|a| {
-        a.borrow().iter().map(|(k, (s, n))| (*k, *s, *n)).collect()
-    });
+    let mut g: Vec<(&'static str, f64, u64)> =
+        GPU_SECTION.with(|a| a.borrow().iter().map(|(k, (s, n))| (*k, *s, *n)).collect());
     if !g.is_empty() {
         g.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
         let gtotal: f64 = g.iter().map(|(_, s, _)| *s).sum();
         eprintln!("===== Metal DECODE per-section TRUE GPU time (GPUStartTime/EndTime) =====");
-        eprintln!("{:<24} {:>12} {:>10} {:>9} {:>12}", "section", "gpu_ms", "calls", "% gpu", "us/call");
+        eprintln!(
+            "{:<24} {:>12} {:>10} {:>9} {:>12}",
+            "section", "gpu_ms", "calls", "% gpu", "us/call"
+        );
         eprintln!("{}", "-".repeat(72));
         for (label, secs, n) in &g {
             let ms = secs * 1000.0;
-            let pct = if gtotal > 0.0 { secs / gtotal * 100.0 } else { 0.0 };
+            let pct = if gtotal > 0.0 {
+                secs / gtotal * 100.0
+            } else {
+                0.0
+            };
             let us_call = if *n > 0 { ms * 1000.0 / *n as f64 } else { 0.0 };
-            eprintln!("{:<24} {:>12.3} {:>10} {:>8.2}% {:>12.2}", label, ms, n, pct, us_call);
+            eprintln!(
+                "{:<24} {:>12.3} {:>10} {:>8.2}% {:>12.2}",
+                label, ms, n, pct, us_call
+            );
         }
         eprintln!("{}", "-".repeat(72));
         eprintln!("{:<24} {:>12.3}", "GPU TOTAL", gtotal * 1000.0);

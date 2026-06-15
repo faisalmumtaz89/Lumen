@@ -85,7 +85,10 @@ impl ExpertReader {
 
     /// Create an ExpertReader from pre-parsed LBC metadata.
     /// Useful for tests where the LBC is already in memory.
-    pub fn from_lbc(path: &Path, layer_indices: Vec<LayerIndex>) -> Result<Self, ExpertReaderError> {
+    pub fn from_lbc(
+        path: &Path,
+        layer_indices: Vec<LayerIndex>,
+    ) -> Result<Self, ExpertReaderError> {
         let file = std::fs::File::open(path)?;
         set_no_cache(&file);
         Ok(Self {
@@ -164,12 +167,14 @@ impl ExpertReader {
             let handles: Vec<_> = plans
                 .into_iter()
                 .map(|plan| {
-                    scope.spawn(move || -> Result<(Vec<u8>, ExpertSlice), ExpertReaderError> {
-                        let plan = plan?;
-                        let mut file = std::fs::File::open(path)?;
-                        set_no_cache(&file);
-                        Self::execute_read_plan(&mut file, &plan)
-                    })
+                    scope.spawn(
+                        move || -> Result<(Vec<u8>, ExpertSlice), ExpertReaderError> {
+                            let plan = plan?;
+                            let mut file = std::fs::File::open(path)?;
+                            set_no_cache(&file);
+                            Self::execute_read_plan(&mut file, &plan)
+                        },
+                    )
                 })
                 .collect();
 
@@ -240,11 +245,7 @@ impl ExpertReader {
     }
 
     /// Build a read plan for parallel execution (validates without doing I/O).
-    fn build_read_plan(
-        &self,
-        layer: usize,
-        expert: u32,
-    ) -> Result<ReadPlan, ExpertReaderError> {
+    fn build_read_plan(&self, layer: usize, expert: u32) -> Result<ReadPlan, ExpertReaderError> {
         let (layer_idx, expert_slice) = self.validate_expert(layer, expert)?;
         let blob_offset = layer_idx.layer_offset_bytes;
         Ok(ReadPlan {
@@ -278,9 +279,7 @@ impl ExpertReader {
 
         // Read down.
         file.seek(SeekFrom::Start(plan.down_offset))?;
-        file.read_exact(
-            &mut data[plan.gate_length + plan.up_length..],
-        )?;
+        file.read_exact(&mut data[plan.gate_length + plan.up_length..])?;
 
         let local_slices = ExpertSlice {
             gate: lumen_format::index::TensorSlice {
@@ -401,7 +400,8 @@ mod tests {
             num_experts: Some(num_experts as u32),
             num_active_experts: Some(2),
             norm_eps: 1e-5,
-            rotary_dim: None, rope_neox: false,
+            rotary_dim: None,
+            rope_neox: false,
             gdn: None,
         };
         let qd = QuantizationDescriptor {
@@ -510,11 +510,21 @@ mod tests {
                 ffn_norm,
                 router_weight: Some(router),
                 experts: Some(expert_slices),
-                shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-                attn_gate: None, attn_post_norm: None,
-                ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-                ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-                attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+                shared_expert_gate: None,
+                shared_expert_up: None,
+                shared_expert_down: None,
+                attn_gate: None,
+                attn_post_norm: None,
+                ssm_a: None,
+                ssm_conv1d: None,
+                ssm_dt: None,
+                ssm_beta: None,
+                ssm_alpha: None,
+                ssm_norm: None,
+                ssm_out: None,
+                attn_q_norm: None,
+                attn_k_norm: None,
+                ffn_gate_inp_shexp: None,
                 layer_type: None,
             };
             layer_indices.push(LayerIndex {
@@ -533,7 +543,15 @@ mod tests {
 
         let blob_refs: Vec<&[u8]> = layer_blobs.iter().map(|b| b.as_slice()).collect();
         let mut out = Vec::new();
-        write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs, None).unwrap();
+        write_lbc(
+            &mut out,
+            &header,
+            &layer_indices,
+            &globals,
+            &blob_refs,
+            None,
+        )
+        .unwrap();
 
         // Write to a temp file with unique name per test.
         let dir = std::env::temp_dir();
@@ -684,7 +702,8 @@ mod tests {
             num_experts: None,
             num_active_experts: None,
             norm_eps: 1e-5,
-            rotary_dim: None, rope_neox: false,
+            rotary_dim: None,
+            rope_neox: false,
             gdn: None,
         };
         let qd = QuantizationDescriptor {
@@ -709,11 +728,21 @@ mod tests {
             ffn_norm: make_slice(1312, 32),
             router_weight: None,
             experts: None,
-            shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-            attn_gate: None, attn_post_norm: None,
-            ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-            ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-            attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            ffn_gate_inp_shexp: None,
             layer_type: None,
         };
         let idx = LayerIndex {
@@ -743,7 +772,10 @@ mod tests {
 
         let mut reader = ExpertReader::open(&path).unwrap();
         let result = reader.load_router(0);
-        assert!(matches!(result, Err(ExpertReaderError::NoRouterWeight { .. })));
+        assert!(matches!(
+            result,
+            Err(ExpertReaderError::NoRouterWeight { .. })
+        ));
 
         let result = reader.load_expert(0, 0);
         assert!(matches!(result, Err(ExpertReaderError::NotMoeLayer { .. })));
@@ -772,8 +804,7 @@ mod tests {
             for expert in 0..3u32 {
                 let (data, _) = reader.load_expert(layer, expert).unwrap();
                 assert_eq!(
-                    data,
-                    expected[layer][expert as usize],
+                    data, expected[layer][expert as usize],
                     "data mismatch at layer={layer}, expert={expert}"
                 );
 
@@ -811,7 +842,11 @@ mod tests {
 
         // Read a sub-range (offset 1000, length 2000).
         let result2 = parallel_pread(&path, 1000, 2000, 3).unwrap();
-        assert_eq!(result2, &data[1000..3000], "sub-range parallel_pread must match");
+        assert_eq!(
+            result2,
+            &data[1000..3000],
+            "sub-range parallel_pread must match"
+        );
 
         // Edge case: single thread.
         let result3 = parallel_pread(&path, 0, data.len(), 1).unwrap();
@@ -865,10 +900,7 @@ mod tests {
 
         let lbc_path = std::path::Path::new("/tmp/lumen-bench/qwen3-5-moe-35b-a3b-Q4_0.lbc");
         if !lbc_path.exists() {
-            eprintln!(
-                "SKIP: benchmark file not found at {}",
-                lbc_path.display()
-            );
+            eprintln!("SKIP: benchmark file not found at {}", lbc_path.display());
             return;
         }
 
@@ -933,10 +965,18 @@ mod tests {
         // Also benchmark ExpertReader parallel vs sequential.
         let reader = ExpertReader::open(lbc_path).unwrap();
         let num_experts = lbc.header.hyperparams.num_experts.unwrap_or(0) as usize;
-        let top_k = lbc.header.hyperparams.num_active_experts.unwrap_or(2).min(num_experts as u32) as usize;
+        let top_k = lbc
+            .header
+            .hyperparams
+            .num_active_experts
+            .unwrap_or(2)
+            .min(num_experts as u32) as usize;
 
         if num_experts > 0 && top_k > 0 {
-            eprintln!("\n--- ExpertReader: sequential vs parallel (layer 0, top-{}) ---", top_k);
+            eprintln!(
+                "\n--- ExpertReader: sequential vs parallel (layer 0, top-{}) ---",
+                top_k
+            );
 
             // Sequential.
             let mut seq_reader = ExpertReader::open(lbc_path).unwrap();
@@ -961,7 +1001,8 @@ mod tests {
             let start = Instant::now();
             let results = reader.load_experts_parallel(&requests);
             let elapsed_par_expert = start.elapsed();
-            let par_bytes: u64 = results.iter()
+            let par_bytes: u64 = results
+                .iter()
                 .filter_map(|r| r.as_ref().ok().map(|(d, _)| d.len() as u64))
                 .sum();
             eprintln!(

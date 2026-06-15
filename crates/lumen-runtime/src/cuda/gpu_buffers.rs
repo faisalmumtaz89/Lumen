@@ -374,7 +374,9 @@ fn dequant_kquant_to_f32(
 
                     // Group 0: low nibbles of ql[0..32], qh bits [0..1]
                     for j in 0..32 {
-                        if written + idx >= n_elements { break; }
+                        if written + idx >= n_elements {
+                            break;
+                        }
                         let q_lo = ql_ptr[j] & 0x0F;
                         let q_hi = (qh_ptr[j] & 3) << 4;
                         let q = (q_lo | q_hi) as i32 - 32;
@@ -384,7 +386,9 @@ fn dequant_kquant_to_f32(
                     }
                     // Group 1: high nibbles of ql[0..32], qh bits [2..3]
                     for j in 0..32 {
-                        if written + idx >= n_elements { break; }
+                        if written + idx >= n_elements {
+                            break;
+                        }
                         let q_lo = (ql_ptr[j] >> 4) & 0x0F;
                         let q_hi = ((qh_ptr[j] >> 2) & 3) << 4;
                         let q = (q_lo | q_hi) as i32 - 32;
@@ -394,7 +398,9 @@ fn dequant_kquant_to_f32(
                     }
                     // Group 2: low nibbles of ql[32..64], qh bits [4..5]
                     for j in 0..32 {
-                        if written + idx >= n_elements { break; }
+                        if written + idx >= n_elements {
+                            break;
+                        }
                         let q_lo = ql_ptr[32 + j] & 0x0F;
                         let q_hi = ((qh_ptr[j] >> 4) & 3) << 4;
                         let q = (q_lo | q_hi) as i32 - 32;
@@ -404,7 +410,9 @@ fn dequant_kquant_to_f32(
                     }
                     // Group 3: high nibbles of ql[32..64], qh bits [6..7]
                     for j in 0..32 {
-                        if written + idx >= n_elements { break; }
+                        if written + idx >= n_elements {
+                            break;
+                        }
                         let q_lo = (ql_ptr[32 + j] >> 4) & 0x0F;
                         let q_hi = ((qh_ptr[j] >> 6) & 3) << 4;
                         let q = (q_lo | q_hi) as i32 - 32;
@@ -440,13 +448,17 @@ fn dequant_kquant_to_f32(
 
                     // First 32 values: low nibbles
                     for l in 0..32 {
-                        if written >= n_elements { break; }
+                        if written >= n_elements {
+                            break;
+                        }
                         out[written] = d1 * (qs[qs_offset + l] & 0x0F) as f32 - m1;
                         written += 1;
                     }
                     // Second 32 values: high nibbles
                     for l in 0..32 {
-                        if written >= n_elements { break; }
+                        if written >= n_elements {
+                            break;
+                        }
                         out[written] = d2 * ((qs[qs_offset + l] >> 4) & 0x0F) as f32 - m2;
                         written += 1;
                     }
@@ -480,16 +492,21 @@ fn dequant_kquant_to_f32(
 
                     // First 32 values: low nibbles + high bit
                     for l in 0..32 {
-                        if written >= n_elements { break; }
+                        if written >= n_elements {
+                            break;
+                        }
                         let h_bit = (qh[l] >> u1) & 1;
                         out[written] = d1 * ((qs[qs_offset + l] & 0x0F) | (h_bit << 4)) as f32 - m1;
                         written += 1;
                     }
                     // Second 32 values: high nibbles + high bit
                     for l in 0..32 {
-                        if written >= n_elements { break; }
+                        if written >= n_elements {
+                            break;
+                        }
                         let h_bit = (qh[l] >> u2) & 1;
-                        out[written] = d2 * (((qs[qs_offset + l] >> 4) & 0x0F) | (h_bit << 4)) as f32 - m2;
+                        out[written] =
+                            d2 * (((qs[qs_offset + l] >> 4) & 0x0F) | (h_bit << 4)) as f32 - m2;
                         written += 1;
                     }
                 }
@@ -525,7 +542,9 @@ fn dequant_kquant_to_f32(
                         let dl0 = d * (sc0 & 0x0F) as f32;
                         let ml0 = dmin * ((sc0 >> 4) & 0x0F) as f32;
                         for l in 0..16usize {
-                            if written >= n_elements { break 'blocks; }
+                            if written >= n_elements {
+                                break 'blocks;
+                            }
                             out[written] = dl0 * (((qs[q_off + l] >> shift) & 3) as f32) - ml0;
                             written += 1;
                         }
@@ -534,7 +553,9 @@ fn dequant_kquant_to_f32(
                         let dl1 = d * (sc1 & 0x0F) as f32;
                         let ml1 = dmin * ((sc1 >> 4) & 0x0F) as f32;
                         for l in 0..16usize {
-                            if written >= n_elements { break 'blocks; }
+                            if written >= n_elements {
+                                break 'blocks;
+                            }
                             out[written] = dl1 * (((qs[q_off + l + 16] >> shift) & 3) as f32) - ml1;
                             written += 1;
                         }
@@ -588,7 +609,9 @@ fn dequant_kquant_to_f32(
                         let scale0 = d * (sc_arr[is] as i8 as f32 - 32.0);
                         is += 1;
                         for l in 0..16usize {
-                            if written >= n_elements { break 'q3blocks; }
+                            if written >= n_elements {
+                                break 'q3blocks;
+                            }
                             let q_lo = (qs[q_off + l] >> shift) & 3;
                             let h = u8::from((hmask[l] & hbit) != 0);
                             out[written] = scale0 * ((q_lo | (h << 2)) as i32 - 4) as f32;
@@ -597,7 +620,9 @@ fn dequant_kquant_to_f32(
                         let scale1 = d * (sc_arr[is] as i8 as f32 - 32.0);
                         is += 1;
                         for l in 0..16usize {
-                            if written >= n_elements { break 'q3blocks; }
+                            if written >= n_elements {
+                                break 'q3blocks;
+                            }
                             let q_lo = (qs[q_off + l + 16] >> shift) & 3;
                             let h = u8::from((hmask[l + 16] & hbit) != 0);
                             out[written] = scale1 * ((q_lo | (h << 2)) as i32 - 4) as f32;
@@ -673,12 +698,20 @@ fn upload_tensor(
                 let exp = ((bits >> 10) & 0x1f) as u32;
                 let frac = (bits & 0x3ff) as u32;
                 if exp == 0 {
-                    if frac == 0 { return if sign == 1 { -0.0 } else { 0.0 }; }
+                    if frac == 0 {
+                        return if sign == 1 { -0.0 } else { 0.0 };
+                    }
                     let v = (frac as f32) * 6.103515625e-05 / 1024.0;
                     return if sign == 1 { -v } else { v };
                 }
                 if exp == 31 {
-                    return if frac != 0 { f32::NAN } else if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY };
+                    return if frac != 0 {
+                        f32::NAN
+                    } else if sign == 1 {
+                        f32::NEG_INFINITY
+                    } else {
+                        f32::INFINITY
+                    };
                 }
                 let f32_bits = (sign << 31) | ((exp - 15 + 127) << 23) | (frac << 13);
                 f32::from_bits(f32_bits)
@@ -711,12 +744,20 @@ fn upload_tensor(
                 let exp = ((bits >> 10) & 0x1f) as u32;
                 let frac = (bits & 0x3ff) as u32;
                 if exp == 0 {
-                    if frac == 0 { return if sign == 1 { -0.0 } else { 0.0 }; }
+                    if frac == 0 {
+                        return if sign == 1 { -0.0 } else { 0.0 };
+                    }
                     let v = (frac as f32) * 6.103515625e-05 / 1024.0;
                     return if sign == 1 { -v } else { v };
                 }
                 if exp == 31 {
-                    return if frac != 0 { f32::NAN } else if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY };
+                    return if frac != 0 {
+                        f32::NAN
+                    } else if sign == 1 {
+                        f32::NEG_INFINITY
+                    } else {
+                        f32::INFINITY
+                    };
                 }
                 f32::from_bits((sign << 31) | ((exp - 15 + 127) << 23) | (frac << 13))
             }
@@ -725,8 +766,10 @@ fn upload_tensor(
                 let bp = &raw[b * 22..];
                 let scale = f16_to_f32_q5((bp[0] as u16) | ((bp[1] as u16) << 8));
                 // 4 bytes of high bits (1 bit per element, packed as u32)
-                let qh = (bp[2] as u32) | ((bp[3] as u32) << 8)
-                    | ((bp[4] as u32) << 16) | ((bp[5] as u32) << 24);
+                let qh = (bp[2] as u32)
+                    | ((bp[3] as u32) << 8)
+                    | ((bp[4] as u32) << 16)
+                    | ((bp[5] as u32) << 24);
                 let qs = &bp[6..]; // 16 nibble-pair bytes
                 for i in 0..16 {
                     let byte = qs[i];
@@ -772,12 +815,20 @@ fn upload_tensor(
                 let exp = ((bits >> 10) & 0x1f) as u32;
                 let frac = (bits & 0x3ff) as u32;
                 if exp == 0 {
-                    if frac == 0 { return if sign == 1 { -0.0 } else { 0.0 }; }
+                    if frac == 0 {
+                        return if sign == 1 { -0.0 } else { 0.0 };
+                    }
                     let v = (frac as f32) * 6.103515625e-05 / 1024.0;
                     return if sign == 1 { -v } else { v };
                 }
                 if exp == 31 {
-                    return if frac != 0 { f32::NAN } else if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY };
+                    return if frac != 0 {
+                        f32::NAN
+                    } else if sign == 1 {
+                        f32::NEG_INFINITY
+                    } else {
+                        f32::INFINITY
+                    };
                 }
                 f32::from_bits((sign << 31) | ((exp - 15 + 127) << 23) | (frac << 13))
             }
@@ -994,7 +1045,8 @@ pub fn upload_layer_weights(
             }
             Some(s) => {
                 return Err(RuntimeError::Compute(format!(
-                    "attn_q_norm requires F32 quant, got {:?}", s.quant,
+                    "attn_q_norm requires F32 quant, got {:?}",
+                    s.quant,
                 )));
             }
             None => None,
@@ -1006,7 +1058,8 @@ pub fn upload_layer_weights(
             }
             Some(s) => {
                 return Err(RuntimeError::Compute(format!(
-                    "attn_k_norm requires F32 quant, got {:?}", s.quant,
+                    "attn_k_norm requires F32 quant, got {:?}",
+                    s.quant,
                 )));
             }
             None => None,
@@ -1106,14 +1159,18 @@ pub fn dequant_layer_q8_to_f16(
     // cache is created (HGEMM prefill path will dequant via a separate path).
     // For F32 weights (e.g. Q4_1/Q6_K dequanted to F32), create F16 via f32_to_f16_vec.
     let f32_to_f16_fn = &kernels.f32_to_f16_vec;
-    let dequant_weight = |w: &GpuWeightBuf, n: usize| -> Result<Option<CudaSlice<u8>>, RuntimeError> {
+    let dequant_weight = |w: &GpuWeightBuf,
+                          n: usize|
+     -> Result<Option<CudaSlice<u8>>, RuntimeError> {
         match w {
             GpuWeightBuf::Q8Raw(q8) => Ok(Some(dequant_q8_to_f16_gpu(device, kernel, q8, n)?)),
             GpuWeightBuf::Q4Raw(q4) => Ok(Some(dequant_q8_to_f16_gpu(device, q4_kernel, q4, n)?)),
             GpuWeightBuf::F32(f32_buf) => {
                 // F32 weights (possibly from Q4_1/Q6_K host dequant) -- convert to F16 for HGEMV.
                 use cudarc::driver::PushKernelArg;
-                if f32_buf.len() == 0 { return Ok(None); }
+                if f32_buf.len() == 0 {
+                    return Ok(None);
+                }
                 let mut f16_buf: CudaSlice<u8> = device.alloc_zeros(n * 2)?;
                 let n_u32 = n as u32;
                 let block = 256u32;
@@ -1124,7 +1181,8 @@ pub fn dequant_layer_q8_to_f16(
                     shared_mem_bytes: 0,
                 };
                 unsafe {
-                    device.stream
+                    device
+                        .stream
                         .launch_builder(f32_to_f16_fn)
                         .arg(f32_buf)
                         .arg(&mut f16_buf)
@@ -1188,7 +1246,11 @@ pub fn dequant_layer_q8_to_f16(
         //
         // Qwen3.5 full-attention layers: wq is [q_dim*2, hidden] (fused Q+gate),
         // so element count must be doubled when attn_q_norm is present.
-        let wq_out_dim = if layer.attn_q_norm.is_some() { q_dim * 2 } else { q_dim };
+        let wq_out_dim = if layer.attn_q_norm.is_some() {
+            q_dim * 2
+        } else {
+            q_dim
+        };
         layer.wq_f16 = dequant_weight(&layer.wq, wq_out_dim * hidden)?;
         layer.wk_f16 = dequant_weight(&layer.wk, kv_dim * hidden)?;
         layer.wv_f16 = dequant_weight(&layer.wv, kv_dim * hidden)?;
@@ -1303,7 +1365,11 @@ pub fn repack_layer_q8_to_aligned(
 
     // Non-GDN models: repack all projections for dp4a int* loads.
     // Qwen3.5 full-attention layers: wq is [q_dim*2, hidden] (fused Q+gate).
-    let wq_out_dim = if layer.attn_q_norm.is_some() { q_dim * 2 } else { q_dim };
+    let wq_out_dim = if layer.attn_q_norm.is_some() {
+        q_dim * 2
+    } else {
+        q_dim
+    };
     repack_weight(device, repack_kernel, &mut layer.wq, wq_out_dim * hidden)?;
     repack_weight(device, repack_kernel, &mut layer.wk, kv_dim * hidden)?;
     repack_weight(device, repack_kernel, &mut layer.wv, kv_dim * hidden)?;
@@ -1418,7 +1484,11 @@ pub fn repack_layer_q4_to_aligned(
 
     // Non-GDN models: repack all projections for dp4a int* loads.
     // Qwen3.5 full-attention layers: wq is [q_dim*2, hidden] (fused Q+gate).
-    let wq_out_dim = if layer.attn_q_norm.is_some() { q_dim * 2 } else { q_dim };
+    let wq_out_dim = if layer.attn_q_norm.is_some() {
+        q_dim * 2
+    } else {
+        q_dim
+    };
     repack_weight(device, repack_kernel, &mut layer.wq, wq_out_dim * hidden)?;
     repack_weight(device, repack_kernel, &mut layer.wk, kv_dim * hidden)?;
     repack_weight(device, repack_kernel, &mut layer.wv, kv_dim * hidden)?;
@@ -1475,13 +1545,13 @@ mod tests {
 
         // Canonical pairs: (bf16 bits, expected f32).
         let cases: &[(u16, f32)] = &[
-            (0x3F80, 1.0),    // 1.0
-            (0xBF80, -1.0),   // -1.0
-            (0x4000, 2.0),    // 2.0
-            (0x0000, 0.0),    // +0.0
-            (0x8000, -0.0),   // -0.0
-            (0x3F00, 0.5),    // 0.5
-            (0xC000, -2.0),   // -2.0
+            (0x3F80, 1.0),  // 1.0
+            (0xBF80, -1.0), // -1.0
+            (0x4000, 2.0),  // 2.0
+            (0x0000, 0.0),  // +0.0
+            (0x8000, -0.0), // -0.0
+            (0x3F00, 0.5),  // 0.5
+            (0xC000, -2.0), // -2.0
         ];
         for &(bits, expected) in cases {
             let got = bf16_to_f32_host(bits);
@@ -1516,5 +1586,4 @@ mod tests {
             );
         }
     }
-
 }

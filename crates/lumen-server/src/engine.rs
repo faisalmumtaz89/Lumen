@@ -18,12 +18,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use lumen_format::ModelHyperparams;
 use lumen_runtime::compute::ComputeBackend;
 use lumen_runtime::engine::SamplingParams;
 use lumen_runtime::session::{Session, SuffixPrefillResult};
 use lumen_runtime::weight::cache::WeightProvider;
 use lumen_runtime::{RuntimeConfig, RuntimeError, ServerMemoryBreakdown};
-use lumen_format::ModelHyperparams;
 
 use tokio::sync::mpsc;
 
@@ -191,10 +191,7 @@ pub enum TokenEvent {
     /// A single decoded token, both as id and as the incremental decoded
     /// UTF-8 fragment (may be empty if the byte boundary did not yet
     /// resolve to a complete character).
-    Token {
-        token_id: u32,
-        delta_text: String,
-    },
+    Token { token_id: u32, delta_text: String },
     /// Generation ended cleanly. `finish_reason` is one of
     /// `"stop"` (EOS or stop sequence), `"length"` (max tokens reached),
     /// or `"tool_calls"` (the model emitted at least one tool call).
@@ -607,7 +604,9 @@ impl EngineHandle {
                 drop(return_sender);
                 drop(rx);
                 drop(pool_handle);
-                Err(ServerError::EngineUnavailable("worker channel closed".into()))
+                Err(ServerError::EngineUnavailable(
+                    "worker channel closed".into(),
+                ))
             }
         }
     }
@@ -648,7 +647,12 @@ impl EngineHandle {
                 // Pool hit: clone the sender for the worker, return the
                 // original (which will go back into the pool) plus rx.
                 let worker_tx = return_sender.clone();
-                (worker_tx, rx, return_sender, Some(Arc::clone(&self.channel_pool)))
+                (
+                    worker_tx,
+                    rx,
+                    return_sender,
+                    Some(Arc::clone(&self.channel_pool)),
+                )
             }
             None => {
                 // Pool miss (overflow): allocate a fresh pair.  Honors
@@ -868,7 +872,14 @@ impl EngineWorker {
         inbox_size: usize,
     ) -> EngineHandle {
         Self::spawn_with_disk_cache(
-            config, hyperparams, backend, weights, tokenizer, model_info, inbox_size, None,
+            config,
+            hyperparams,
+            backend,
+            weights,
+            tokenizer,
+            model_info,
+            inbox_size,
+            None,
         )
     }
 
@@ -974,11 +985,9 @@ impl EngineWorker {
         // corrupting KV writes inside the first job.
         if let Err(e) = session.validate_backend(self.backend.as_ref()) {
             while let Some(job) = self.inbox.blocking_recv() {
-                let _ = job
-                    .tokens_tx
-                    .blocking_send(TokenEvent::Error(format!(
-                        "backend / KV precision mismatch: {e}"
-                    )));
+                let _ = job.tokens_tx.blocking_send(TokenEvent::Error(format!(
+                    "backend / KV precision mismatch: {e}"
+                )));
             }
             return;
         }
@@ -1247,7 +1256,9 @@ impl EngineWorker {
     /// genuinely starving for budget the live entry can still go, but
     /// only after every cold entry has been evicted).
     fn disk_kv_housekeeping(&self, phase: &str, session: &Session) {
-        let Some(cfg) = self.disk_kv.as_ref() else { return };
+        let Some(cfg) = self.disk_kv.as_ref() else {
+            return;
+        };
         match lumen_runtime::kv::disk::purge_stale_tmp(&cfg.dir) {
             Ok(n) if n > 0 => {
                 eprintln!(
@@ -1405,13 +1416,12 @@ impl EngineWorker {
 
         // Suffix prefill: reuses KV when the new prompt extends the prior
         // job's tokens; falls back to cold prefill otherwise.
-        let suffix_result: Result<SuffixPrefillResult, RuntimeError> = session
-            .extend_with_cache(
-                &request.prompt_tokens,
-                self.backend.as_ref(),
-                self.weights.as_ref(),
-                request.suffix_threshold.max(1),
-            );
+        let suffix_result: Result<SuffixPrefillResult, RuntimeError> = session.extend_with_cache(
+            &request.prompt_tokens,
+            self.backend.as_ref(),
+            self.weights.as_ref(),
+            request.suffix_threshold.max(1),
+        );
 
         let prefill = match suffix_result {
             Ok(r) => r,
@@ -1693,7 +1703,9 @@ impl EngineWorker {
             // EOS check (token-id based).
             if request.eos_token_ids.contains(&token_id) {
                 // Emit the residual decoded text but NOT the EOS token text.
-                let _ = self.tokenizer.decode_incremental(&mut bytes_state, token_id);
+                let _ = self
+                    .tokenizer
+                    .decode_incremental(&mut bytes_state, token_id);
                 finish_reason = FinishReason::Stop;
                 break;
             }
@@ -1842,7 +1854,10 @@ struct ThinkCloseDetector {
 
 impl ThinkCloseDetector {
     fn new() -> Self {
-        Self { marker_id: None, carry: String::new() }
+        Self {
+            marker_id: None,
+            carry: String::new(),
+        }
     }
 
     /// Observe one decoded token (its id + decoded fragment). Returns `true`
@@ -2048,7 +2063,13 @@ mod pool_tests {
     /// `EngineHandle::take_channel_pair` minus the fall-back-to-fresh
     /// branch.  Returns None when the pool is empty (so tests can assert
     /// on it directly).
-    fn pop_pair(pool: &ChannelPool) -> Option<(mpsc::Sender<TokenEvent>, mpsc::Sender<TokenEvent>, mpsc::Receiver<TokenEvent>)> {
+    fn pop_pair(
+        pool: &ChannelPool,
+    ) -> Option<(
+        mpsc::Sender<TokenEvent>,
+        mpsc::Sender<TokenEvent>,
+        mpsc::Receiver<TokenEvent>,
+    )> {
         let mut guard = pool.lock().unwrap();
         guard.pop_front().map(|(return_sender, rx)| {
             let worker_tx = return_sender.clone();
@@ -2086,7 +2107,11 @@ mod pool_tests {
 
         // Receiver-handler exits scope -> PooledReceiver dropped -> pool returns to 1.
         drop(pooled);
-        assert_eq!(pool.lock().unwrap().len(), 1, "pool must have recycled the pair");
+        assert_eq!(
+            pool.lock().unwrap().len(),
+            1,
+            "pool must have recycled the pair"
+        );
     }
 
     /// PooledReceiver::drop drains any leftover events from the channel
@@ -2116,8 +2141,7 @@ mod pool_tests {
         drop(pooled);
 
         // Pop the recycled pair and verify the receiver is clean.
-        let (_worker_tx, _return_sender, mut rx) =
-            pop_pair(&pool).expect("recycled pair present");
+        let (_worker_tx, _return_sender, mut rx) = pop_pair(&pool).expect("recycled pair present");
         match rx.try_recv() {
             Err(mpsc::error::TryRecvError::Empty)
             | Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -2144,7 +2168,8 @@ mod pool_tests {
         let (extra_tx, extra_rx) = mpsc::channel::<TokenEvent>(POOL_CHANNEL_CAPACITY);
         let return_sender = extra_tx.clone();
         let worker_tx = extra_tx.clone();
-        let pooled = PooledReceiver::new(extra_rx, return_sender, Some(Arc::clone(&pool)), cap, None);
+        let pooled =
+            PooledReceiver::new(extra_rx, return_sender, Some(Arc::clone(&pool)), cap, None);
 
         // Drop everything; the pool should NOT grow above cap.
         drop(worker_tx);
@@ -2248,8 +2273,7 @@ mod pool_tests {
         );
         // Even after dropping the PooledReceiver, the pool stays empty.
         // (The PooledReceiver's pool=None means drop doesn't push back.)
-        let pooled =
-            PooledReceiver::new(_rx, _return_sender, pool_handle, handle.pool_cap, None);
+        let pooled = PooledReceiver::new(_rx, _return_sender, pool_handle, handle.pool_cap, None);
         drop(pooled);
         assert_eq!(
             handle.channel_pool_len(),
@@ -2314,7 +2338,10 @@ mod panic_supervisor_tests {
     fn payload_message_extracts_str_literal() {
         let res = panic::catch_unwind(|| panic!("static str payload"));
         let payload = res.unwrap_err();
-        assert_eq!(panic_payload_message(payload.as_ref()), "static str payload");
+        assert_eq!(
+            panic_payload_message(payload.as_ref()),
+            "static str payload"
+        );
     }
 
     #[test]
@@ -2409,9 +2436,15 @@ mod think_close_detector_tests {
             }
         }
         fn decode_incremental(&self, _s: &mut Vec<u8>, id: u32) -> String {
-            if id == 7 { "</think>".to_string() } else { ((id & 0xff) as u8 as char).to_string() }
+            if id == 7 {
+                "</think>".to_string()
+            } else {
+                ((id & 0xff) as u8 as char).to_string()
+            }
         }
-        fn eos_tokens(&self) -> Vec<u32> { vec![0] }
+        fn eos_tokens(&self) -> Vec<u32> {
+            vec![0]
+        }
     }
 
     /// Byte tokeniser: `</think>` is NOT a single token (forces the text
@@ -2424,7 +2457,9 @@ mod think_close_detector_tests {
         fn decode_incremental(&self, _s: &mut Vec<u8>, id: u32) -> String {
             ((id & 0xff) as u8 as char).to_string()
         }
-        fn eos_tokens(&self) -> Vec<u32> { vec![0] }
+        fn eos_tokens(&self) -> Vec<u32> {
+            vec![0]
+        }
     }
 
     #[test]

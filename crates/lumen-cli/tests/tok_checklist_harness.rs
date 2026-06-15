@@ -16,8 +16,8 @@ use unicode_normalization::UnicodeNormalization;
 const QWEN35_GGUF: &str = "/tmp/lumen-bench/Qwen_Qwen3.5-9B-Q8_0.gguf";
 
 fn load() -> BpeTokenizer {
-    let data = std::fs::read(QWEN35_GGUF)
-        .unwrap_or_else(|e| panic!("read GGUF {QWEN35_GGUF}: {e}"));
+    let data =
+        std::fs::read(QWEN35_GGUF).unwrap_or_else(|e| panic!("read GGUF {QWEN35_GGUF}: {e}"));
     let gguf = lumen_convert::gguf::GgufFile::parse(&mut data.as_slice())
         .unwrap_or_else(|e| panic!("parse GGUF: {e}"));
     let tok = lumen_convert::tokenizer_data::extract_tokenizer(&gguf)
@@ -93,9 +93,16 @@ fn corr009_special_token_handling() {
             fail.push(format!("(c) roundtrip({wrapped:?}) = {rt:?}"));
         }
     }
-    assert!(checked >= 3, "expected >=3 special tokens in vocab, checked {checked}");
-    assert!(fail.is_empty(), "CORR-009 failures ({}/{checked} special tokens):\n{}",
-        fail.len(), fail.join("\n"));
+    assert!(
+        checked >= 3,
+        "expected >=3 special tokens in vocab, checked {checked}"
+    );
+    assert!(
+        fail.is_empty(),
+        "CORR-009 failures ({}/{checked} special tokens):\n{}",
+        fail.len(),
+        fail.join("\n")
+    );
     println!("CORR-009 PASS: {checked} special tokens, all 3 properties (a/b/c) hold");
 }
 
@@ -116,12 +123,21 @@ fn tok005_empty_and_whitespace_tokenizer_level() {
         let want: String = c.nfc().collect();
         let got: String = dec.nfc().collect();
         if got != want {
-            fail.push(format!("{c:?}: encode->{ids:?}->decode {got:?} != {want:?}"));
+            fail.push(format!(
+                "{c:?}: encode->{ids:?}->decode {got:?} != {want:?}"
+            ));
         }
     }
-    assert!(fail.is_empty(), "TOK-005 tokenizer-level failures:\n{}", fail.join("\n"));
-    println!("TOK-005 PASS (tokenizer-level): {}/{} empty/whitespace round-trip; no panic",
-        cases.len(), cases.len());
+    assert!(
+        fail.is_empty(),
+        "TOK-005 tokenizer-level failures:\n{}",
+        fail.join("\n")
+    );
+    println!(
+        "TOK-005 PASS (tokenizer-level): {}/{} empty/whitespace round-trip; no panic",
+        cases.len(),
+        cases.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -147,12 +163,17 @@ fn tok006_byte_fallback_all_bytes() {
     let want: String = s.nfc().collect();
     let got: String = dec.nfc().collect();
     assert_eq!(
-        got, want,
+        got,
+        want,
         "TOK-006 byte-fallback round-trip mismatch\n  ids[..16]={:?}\n  want_len={} got_len={}",
-        &ids[..ids.len().min(16)], want.len(), got.len()
+        &ids[..ids.len().min(16)],
+        want.len(),
+        got.len()
     );
-    println!("TOK-006 PASS: 255 bytes (0x01-0xFF) -> {} tokens -> byte-identical NFC round-trip",
-        ids.len());
+    println!(
+        "TOK-006 PASS: 255 bytes (0x01-0xFF) -> {} tokens -> byte-identical NFC round-trip",
+        ids.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +197,7 @@ fn tok008_streaming_decode_alignment() {
         "The quick brown fox jumps over the lazy dog.",
         "def foo(x):\n    return x * 2\n",
         "don't won't can't",
-        "🇺🇸🇯🇵",       // regional-indicator flags
+        "🇺🇸🇯🇵",               // regional-indicator flags
         "a\u{0301}e\u{0301}", // combining acute on a, e
     ];
     let mut mismatch = Vec::new();

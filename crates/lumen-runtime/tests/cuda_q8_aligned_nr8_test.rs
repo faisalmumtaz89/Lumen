@@ -73,7 +73,10 @@ fn f32_to_f16_bits(val: f32) -> u16 {
 
 /// Encode F32 values as Q8Aligned 36-byte blocks (scale[2] + pad[2] + quants[32]).
 fn encode_q8_aligned(values: &[f32]) -> Vec<u8> {
-    assert!(values.len() % Q8_BLOCK == 0, "encoder requires whole blocks");
+    assert!(
+        values.len() % Q8_BLOCK == 0,
+        "encoder requires whole blocks"
+    );
     let n_blocks = values.len() / Q8_BLOCK;
     let mut out = vec![0u8; n_blocks * Q8_ALIGNED_BYTES];
     for b in 0..n_blocks {
@@ -118,9 +121,7 @@ fn run_aos_nr8_vs_aligned(out_dim: usize, in_dim: usize, seed: u64, tol: f32) {
     let aligned_module = ctx
         .load_module(compile_sm80(aligned_src))
         .expect("aligned load");
-    let lc_module = ctx
-        .load_module(compile_sm80(lc_src))
-        .expect("aos_nr8 load");
+    let lc_module = ctx.load_module(compile_sm80(lc_src)).expect("aos_nr8 load");
 
     let aligned_fn = aligned_module
         .load_function("matvec_q8_aligned_q8_1")

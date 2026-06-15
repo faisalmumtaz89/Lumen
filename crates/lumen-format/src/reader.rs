@@ -58,8 +58,8 @@ impl LbcFile {
         // layer_index_offset and num_layers so we know how much more to read.
         let (layer_index_offset, num_layers) = peek_header_offsets(&header_buf)?;
 
-        let index_end = layer_index_offset as usize
-            + (num_layers as usize) * MAX_LAYER_INDEX_ENTRY_SIZE;
+        let index_end =
+            layer_index_offset as usize + (num_layers as usize) * MAX_LAYER_INDEX_ENTRY_SIZE;
 
         // Step 3: If the initial read already covers everything, parse from it.
         // Otherwise, read the additional bytes we need.
@@ -83,28 +83,27 @@ impl LbcFile {
         let (header, layer_indices) = parse_lbc(&data)?;
 
         // Read tokenizer section from disk if present (v3+)
-        let tokenizer = if header.tokenizer_section_offset != 0
-            && header.tokenizer_section_length != 0
-        {
-            let tok_start = header.tokenizer_section_offset;
-            let tok_len = header.tokenizer_section_length;
-            if tok_start + tok_len > file_len {
-                return Err(FormatError::UnexpectedEof {
-                    needed: tok_start + tok_len,
-                    available: file_len,
-                });
-            }
-            let mut tok_buf = vec![0u8; tok_len as usize];
-            file.seek(SeekFrom::Start(tok_start))?;
-            file.read_exact(&mut tok_buf)?;
-            Some(parse_tokenizer_section(
-                &tok_buf,
-                header.tokenizer_section_crc32,
-                header.hyperparams.vocab_size,
-            )?)
-        } else {
-            None
-        };
+        let tokenizer =
+            if header.tokenizer_section_offset != 0 && header.tokenizer_section_length != 0 {
+                let tok_start = header.tokenizer_section_offset;
+                let tok_len = header.tokenizer_section_length;
+                if tok_start + tok_len > file_len {
+                    return Err(FormatError::UnexpectedEof {
+                        needed: tok_start + tok_len,
+                        available: file_len,
+                    });
+                }
+                let mut tok_buf = vec![0u8; tok_len as usize];
+                file.seek(SeekFrom::Start(tok_start))?;
+                file.read_exact(&mut tok_buf)?;
+                Some(parse_tokenizer_section(
+                    &tok_buf,
+                    header.tokenizer_section_crc32,
+                    header.hyperparams.vocab_size,
+                )?)
+            } else {
+                None
+            };
 
         Ok(Self {
             header,
@@ -119,29 +118,29 @@ impl LbcFile {
         let (header, layer_indices) = parse_lbc(data)?;
 
         // Parse tokenizer section from the same buffer (v3+)
-        let tokenizer = if header.tokenizer_section_offset != 0
-            && header.tokenizer_section_length != 0
-        {
-            let start = header.tokenizer_section_offset as usize;
-            let end = start.checked_add(header.tokenizer_section_length as usize)
-                .ok_or_else(|| FormatError::UnexpectedEof {
-                    needed: header.tokenizer_section_offset + header.tokenizer_section_length,
-                    available: data.len() as u64,
-                })?;
-            if end > data.len() {
-                return Err(FormatError::UnexpectedEof {
-                    needed: end as u64,
-                    available: data.len() as u64,
-                });
-            }
-            Some(parse_tokenizer_section(
-                &data[start..end],
-                header.tokenizer_section_crc32,
-                header.hyperparams.vocab_size,
-            )?)
-        } else {
-            None
-        };
+        let tokenizer =
+            if header.tokenizer_section_offset != 0 && header.tokenizer_section_length != 0 {
+                let start = header.tokenizer_section_offset as usize;
+                let end = start
+                    .checked_add(header.tokenizer_section_length as usize)
+                    .ok_or_else(|| FormatError::UnexpectedEof {
+                        needed: header.tokenizer_section_offset + header.tokenizer_section_length,
+                        available: data.len() as u64,
+                    })?;
+                if end > data.len() {
+                    return Err(FormatError::UnexpectedEof {
+                        needed: end as u64,
+                        available: data.len() as u64,
+                    });
+                }
+                Some(parse_tokenizer_section(
+                    &data[start..end],
+                    header.tokenizer_section_crc32,
+                    header.hyperparams.vocab_size,
+                )?)
+            } else {
+                None
+            };
 
         Ok(Self {
             header,
@@ -257,9 +256,21 @@ fn parse_lbc(data: &[u8]) -> Result<(LbcHeader, Vec<LayerIndex>), FormatError> {
         (QuantScheme::F32, QuantScheme::F32, QuantScheme::F32, false)
     };
 
-    let embedding = GlobalTensorRange { offset: embed_offset, length: embed_length, quant: embed_quant };
-    let final_norm = GlobalTensorRange { offset: norm_offset, length: norm_length, quant: norm_quant };
-    let output_proj = GlobalTensorRange { offset: proj_offset, length: proj_length, quant: proj_quant };
+    let embedding = GlobalTensorRange {
+        offset: embed_offset,
+        length: embed_length,
+        quant: embed_quant,
+    };
+    let final_norm = GlobalTensorRange {
+        offset: norm_offset,
+        length: norm_length,
+        quant: norm_quant,
+    };
+    let output_proj = GlobalTensorRange {
+        offset: proj_offset,
+        length: proj_length,
+        quant: proj_quant,
+    };
 
     // v3: tokenizer section pointers (20 bytes + 4 reserved)
     let (tok_offset, tok_length, tok_crc) = if version >= 3 {
@@ -276,8 +287,8 @@ fn parse_lbc(data: &[u8]) -> Result<(LbcHeader, Vec<LayerIndex>), FormatError> {
 
     // Verify CRC32 checksum (streaming — no heap allocation)
     let mut state = CRC32_INIT;
-    state = crc32_update(state, &data[..12]);          // bytes before checksum field
-    state = crc32_update(state, &[0u8; 4]);            // zeroed checksum field
+    state = crc32_update(state, &data[..12]); // bytes before checksum field
+    state = crc32_update(state, &[0u8; 4]); // zeroed checksum field
     state = crc32_update(state, &data[16..header_size]); // bytes after checksum field
     let computed_checksum = crc32_finalize(state);
     if stored_checksum != computed_checksum {
@@ -378,11 +389,15 @@ fn parse_hyperparams(c: &mut Cursor<'_>, version: u32) -> Result<ModelHyperparam
         let rope_neox = c.read_u8()? != 0;
         // rotary_dim as u8: 0 = full head_dim, N = partial.
         let rotary_dim_u8 = c.read_u8()?;
-        (Some(RopeParams {
-            theta,
-            scaling_factor,
-            scaling_type,
-        }), rope_neox, rotary_dim_u8)
+        (
+            Some(RopeParams {
+                theta,
+                scaling_factor,
+                scaling_type,
+            }),
+            rope_neox,
+            rotary_dim_u8,
+        )
     } else {
         // Must match present-path size: theta(4) + scaling_factor(4) + type(1) + rope_neox(1) + rotary_dim(1) = 11
         c.skip(11)?;
@@ -427,10 +442,22 @@ fn parse_hyperparams(c: &mut Cursor<'_>, version: u32) -> Result<ModelHyperparam
         vocab_size,
         max_seq_len,
         rope_params,
-        num_experts: if num_experts_raw > 0 { Some(num_experts_raw) } else { None },
-        num_active_experts: if num_active_raw > 0 { Some(num_active_raw) } else { None },
+        num_experts: if num_experts_raw > 0 {
+            Some(num_experts_raw)
+        } else {
+            None
+        },
+        num_active_experts: if num_active_raw > 0 {
+            Some(num_active_raw)
+        } else {
+            None
+        },
         norm_eps,
-        rotary_dim: if rotary_dim_raw > 0 { Some(rotary_dim_raw as u32) } else { None },
+        rotary_dim: if rotary_dim_raw > 0 {
+            Some(rotary_dim_raw as u32)
+        } else {
+            None
+        },
         rope_neox,
         gdn,
     })
@@ -444,9 +471,11 @@ fn parse_quant_desc(c: &mut Cursor<'_>) -> Result<QuantizationDescriptor, Format
         0 => QuantGroupSize::PerTensor,
         1 => QuantGroupSize::PerChannel,
         2 => QuantGroupSize::Group(group_value),
-        _ => return Err(FormatError::UnsupportedQuantization(
-            format!("unknown group size tag: {group_tag}"),
-        )),
+        _ => {
+            return Err(FormatError::UnsupportedQuantization(format!(
+                "unknown group size tag: {group_tag}"
+            )))
+        }
     };
     let block_byte_size = c.read_u32()?;
     let has_scale = c.read_u8()? != 0;
@@ -466,7 +495,11 @@ fn parse_tensor_slice(c: &mut Cursor<'_>) -> Result<TensorSlice, FormatError> {
     let length = c.read_u64()?;
     let quant = QuantScheme::from_u8(c.read_u8()?)?;
     c.skip(7)?; // padding
-    Ok(TensorSlice { offset, length, quant })
+    Ok(TensorSlice {
+        offset,
+        length,
+        quant,
+    })
 }
 
 fn parse_layer_index(c: &mut Cursor<'_>) -> Result<LayerIndex, FormatError> {
@@ -488,9 +521,21 @@ fn parse_layer_index(c: &mut Cursor<'_>) -> Result<LayerIndex, FormatError> {
     let (bq, bk, bv) = if c.pos + 8 <= c.data.len() {
         let bias_flags = c.read_u8()?;
         c.skip(7)?; // padding to 8 bytes
-        let bq = if bias_flags & 0x01 != 0 { Some(parse_tensor_slice(c)?) } else { None };
-        let bk = if bias_flags & 0x02 != 0 { Some(parse_tensor_slice(c)?) } else { None };
-        let bv = if bias_flags & 0x04 != 0 { Some(parse_tensor_slice(c)?) } else { None };
+        let bq = if bias_flags & 0x01 != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
+        let bk = if bias_flags & 0x02 != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
+        let bv = if bias_flags & 0x04 != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
         (bq, bk, bv)
     } else {
         (None, None, None)
@@ -529,26 +574,87 @@ fn parse_layer_index(c: &mut Cursor<'_>) -> Result<LayerIndex, FormatError> {
 
     // Read optional extended fields: ext_flags(4) + padding(4) = 8 bytes.
     // For backward compatibility with pre-extended LBC files, check remaining data.
-    let (shared_expert_gate, shared_expert_up, shared_expert_down,
-         attn_gate, attn_post_norm,
-         ssm_a, ssm_conv1d, ssm_dt, ssm_beta, ssm_alpha, ssm_norm, ssm_out,
-         layer_type,
-         attn_q_norm, attn_k_norm, ffn_gate_inp_shexp) = if c.pos + 8 <= c.data.len() {
+    let (
+        shared_expert_gate,
+        shared_expert_up,
+        shared_expert_down,
+        attn_gate,
+        attn_post_norm,
+        ssm_a,
+        ssm_conv1d,
+        ssm_dt,
+        ssm_beta,
+        ssm_alpha,
+        ssm_norm,
+        ssm_out,
+        layer_type,
+        attn_q_norm,
+        attn_k_norm,
+        ffn_gate_inp_shexp,
+    ) = if c.pos + 8 <= c.data.len() {
         let ext_flags = c.read_u32()?;
         c.skip(4)?; // padding
 
-        let shared_expert_gate = if ext_flags & (1 << 0) != 0 { Some(parse_tensor_slice(c)?) } else { None };
-        let shared_expert_up = if ext_flags & (1 << 1) != 0 { Some(parse_tensor_slice(c)?) } else { None };
-        let shared_expert_down = if ext_flags & (1 << 2) != 0 { Some(parse_tensor_slice(c)?) } else { None };
-        let attn_gate = if ext_flags & (1 << 3) != 0 { Some(parse_tensor_slice(c)?) } else { None };
-        let attn_post_norm = if ext_flags & (1 << 4) != 0 { Some(parse_tensor_slice(c)?) } else { None };
-        let ssm_a = if ext_flags & (1 << 5) != 0 { Some(parse_tensor_slice(c)?) } else { None };
-        let ssm_conv1d = if ext_flags & (1 << 6) != 0 { Some(parse_tensor_slice(c)?) } else { None };
-        let ssm_dt = if ext_flags & (1 << 7) != 0 { Some(parse_tensor_slice(c)?) } else { None };
-        let ssm_beta = if ext_flags & (1 << 8) != 0 { Some(parse_tensor_slice(c)?) } else { None };
-        let ssm_alpha = if ext_flags & (1 << 9) != 0 { Some(parse_tensor_slice(c)?) } else { None };
-        let ssm_norm = if ext_flags & (1 << 10) != 0 { Some(parse_tensor_slice(c)?) } else { None };
-        let ssm_out = if ext_flags & (1 << 11) != 0 { Some(parse_tensor_slice(c)?) } else { None };
+        let shared_expert_gate = if ext_flags & (1 << 0) != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
+        let shared_expert_up = if ext_flags & (1 << 1) != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
+        let shared_expert_down = if ext_flags & (1 << 2) != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
+        let attn_gate = if ext_flags & (1 << 3) != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
+        let attn_post_norm = if ext_flags & (1 << 4) != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
+        let ssm_a = if ext_flags & (1 << 5) != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
+        let ssm_conv1d = if ext_flags & (1 << 6) != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
+        let ssm_dt = if ext_flags & (1 << 7) != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
+        let ssm_beta = if ext_flags & (1 << 8) != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
+        let ssm_alpha = if ext_flags & (1 << 9) != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
+        let ssm_norm = if ext_flags & (1 << 10) != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
+        let ssm_out = if ext_flags & (1 << 11) != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
         let layer_type = if ext_flags & (1 << 12) != 0 {
             let lt = c.read_u8()?;
             c.skip(7)?; // padding
@@ -556,34 +662,80 @@ fn parse_layer_index(c: &mut Cursor<'_>) -> Result<LayerIndex, FormatError> {
         } else {
             None
         };
-        let attn_q_norm = if ext_flags & (1 << 13) != 0 { Some(parse_tensor_slice(c)?) } else { None };
-        let attn_k_norm = if ext_flags & (1 << 14) != 0 { Some(parse_tensor_slice(c)?) } else { None };
-        let ffn_gate_inp_shexp = if ext_flags & (1 << 15) != 0 { Some(parse_tensor_slice(c)?) } else { None };
+        let attn_q_norm = if ext_flags & (1 << 13) != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
+        let attn_k_norm = if ext_flags & (1 << 14) != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
+        let ffn_gate_inp_shexp = if ext_flags & (1 << 15) != 0 {
+            Some(parse_tensor_slice(c)?)
+        } else {
+            None
+        };
 
-        (shared_expert_gate, shared_expert_up, shared_expert_down,
-         attn_gate, attn_post_norm,
-         ssm_a, ssm_conv1d, ssm_dt, ssm_beta, ssm_alpha, ssm_norm, ssm_out,
-         layer_type,
-         attn_q_norm, attn_k_norm, ffn_gate_inp_shexp)
+        (
+            shared_expert_gate,
+            shared_expert_up,
+            shared_expert_down,
+            attn_gate,
+            attn_post_norm,
+            ssm_a,
+            ssm_conv1d,
+            ssm_dt,
+            ssm_beta,
+            ssm_alpha,
+            ssm_norm,
+            ssm_out,
+            layer_type,
+            attn_q_norm,
+            attn_k_norm,
+            ffn_gate_inp_shexp,
+        )
     } else {
-        (None, None, None, None, None, None, None, None, None, None, None, None, None,
-         None, None, None)
+        (
+            None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None,
+        )
     };
 
     Ok(LayerIndex {
         layer_offset_bytes,
         layer_length_bytes,
         subtensors: SubtensorOffsets {
-            wq, wk, wv, wo,
-            bq, bk, bv,
-            w_gate, w_up, w_down,
-            attn_norm, ffn_norm,
+            wq,
+            wk,
+            wv,
+            wo,
+            bq,
+            bk,
+            bv,
+            w_gate,
+            w_up,
+            w_down,
+            attn_norm,
+            ffn_norm,
             router_weight,
             experts,
-            shared_expert_gate, shared_expert_up, shared_expert_down,
-            attn_gate, attn_post_norm,
-            ssm_a, ssm_conv1d, ssm_dt, ssm_beta, ssm_alpha, ssm_norm, ssm_out,
-            attn_q_norm, attn_k_norm, ffn_gate_inp_shexp,
+            shared_expert_gate,
+            shared_expert_up,
+            shared_expert_down,
+            attn_gate,
+            attn_post_norm,
+            ssm_a,
+            ssm_conv1d,
+            ssm_dt,
+            ssm_beta,
+            ssm_alpha,
+            ssm_norm,
+            ssm_out,
+            attn_q_norm,
+            attn_k_norm,
+            ffn_gate_inp_shexp,
             layer_type,
         },
     })
@@ -691,7 +843,9 @@ mod tests {
             wk: make_slice(128, 128),
             wv: make_slice(256, 128),
             wo: make_slice(384, 128),
-            bq: None, bk: None, bv: None,
+            bq: None,
+            bk: None,
+            bv: None,
             w_gate: make_slice(512, 256),
             w_up: make_slice(768, 256),
             w_down: make_slice(1024, 256),
@@ -699,11 +853,21 @@ mod tests {
             ffn_norm: make_slice(1312, 32),
             router_weight: None,
             experts: None,
-            shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-            attn_gate: None, attn_post_norm: None,
-            ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-            ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-            attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            ffn_gate_inp_shexp: None,
             layer_type: None,
         };
         let idx = LayerIndex {
@@ -820,37 +984,63 @@ mod tests {
         };
 
         let mut offset = 0u64;
-        let wq = make_slice(offset, 128); offset += 128;
-        let wk = make_slice(offset, 128); offset += 128;
-        let wv = make_slice(offset, 128); offset += 128;
-        let wo = make_slice(offset, 128); offset += 128;
-        let attn_norm = make_slice(offset, 32); offset += 32;
-        let ffn_norm = make_slice(offset, 32); offset += 32;
-        let router = make_slice(offset, 128); offset += 128;
+        let wq = make_slice(offset, 128);
+        offset += 128;
+        let wk = make_slice(offset, 128);
+        offset += 128;
+        let wv = make_slice(offset, 128);
+        offset += 128;
+        let wo = make_slice(offset, 128);
+        offset += 128;
+        let attn_norm = make_slice(offset, 32);
+        offset += 32;
+        let ffn_norm = make_slice(offset, 32);
+        offset += 32;
+        let router = make_slice(offset, 128);
+        offset += 128;
 
         let mut experts = Vec::new();
         for _ in 0..4 {
-            let gate = make_slice(offset, 512); offset += 512;
-            let up = make_slice(offset, 512); offset += 512;
-            let down = make_slice(offset, 512); offset += 512;
+            let gate = make_slice(offset, 512);
+            offset += 512;
+            let up = make_slice(offset, 512);
+            offset += 512;
+            let down = make_slice(offset, 512);
+            offset += 512;
             experts.push(ExpertSlice { gate, up, down });
         }
 
         let blob_size = offset;
         let subtensors = SubtensorOffsets {
-            wq, wk, wv, wo,
-            bq: None, bk: None, bv: None,
+            wq,
+            wk,
+            wv,
+            wo,
+            bq: None,
+            bk: None,
+            bv: None,
             w_gate: make_slice(0, 0),
             w_up: make_slice(0, 0),
             w_down: make_slice(0, 0),
-            attn_norm, ffn_norm,
+            attn_norm,
+            ffn_norm,
             router_weight: Some(router),
             experts: Some(experts),
-            shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-            attn_gate: None, attn_post_norm: None,
-            ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-            ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-            attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            ffn_gate_inp_shexp: None,
             layer_type: None,
         };
         let idx = LayerIndex {
@@ -968,8 +1158,10 @@ mod tests {
         assert!(parsed_tok.add_bos_token);
         assert!(!parsed_tok.add_eos_token);
         assert!(parsed_tok.add_space_prefix);
-        assert_eq!(parsed_tok.chat_template.as_deref(),
-            Some("{% for msg in messages %}{{msg}}{% endfor %}"));
+        assert_eq!(
+            parsed_tok.chat_template.as_deref(),
+            Some("{% for msg in messages %}{{msg}}{% endfor %}")
+        );
 
         // Verify header tokenizer pointers are valid
         assert_ne!(lbc.header.tokenizer_section_offset, 0);
@@ -1168,8 +1360,8 @@ mod tests {
 
     #[test]
     fn v3_streaming_writer_with_tokenizer() {
-        use crate::streaming_writer::{StreamingLbcWriter, LayerShape};
         use crate::index::SubtensorOffsets;
+        use crate::streaming_writer::{LayerShape, StreamingLbcWriter};
 
         let hp = ModelHyperparams {
             num_layers: 2,
@@ -1198,21 +1390,40 @@ mod tests {
         let tok = make_test_tokenizer(32);
 
         let make_slice = |off: u64, len: u64| TensorSlice {
-            offset: off, length: len, quant: QuantScheme::F32,
+            offset: off,
+            length: len,
+            quant: QuantScheme::F32,
         };
         let subtensors = SubtensorOffsets {
-            wq: make_slice(0, 128), wk: make_slice(128, 128),
-            wv: make_slice(256, 128), wo: make_slice(384, 128),
-            bq: None, bk: None, bv: None,
-            w_gate: make_slice(512, 256), w_up: make_slice(768, 256),
+            wq: make_slice(0, 128),
+            wk: make_slice(128, 128),
+            wv: make_slice(256, 128),
+            wo: make_slice(384, 128),
+            bq: None,
+            bk: None,
+            bv: None,
+            w_gate: make_slice(512, 256),
+            w_up: make_slice(768, 256),
             w_down: make_slice(1024, 256),
-            attn_norm: make_slice(1280, 32), ffn_norm: make_slice(1312, 32),
-            router_weight: None, experts: None,
-            shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-            attn_gate: None, attn_post_norm: None,
-            ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-            ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-            attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+            attn_norm: make_slice(1280, 32),
+            ffn_norm: make_slice(1312, 32),
+            router_weight: None,
+            experts: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            ffn_gate_inp_shexp: None,
             layer_type: None,
         };
         let shape = LayerShape {
@@ -1232,9 +1443,9 @@ mod tests {
         };
 
         let mut out = Vec::new();
-        let mut sw = StreamingLbcWriter::begin(
-            &mut out, &header, &layer_shapes, &globals, Some(&tok),
-        ).unwrap();
+        let mut sw =
+            StreamingLbcWriter::begin(&mut out, &header, &layer_shapes, &globals, Some(&tok))
+                .unwrap();
         for _ in 0..2 {
             sw.write_layer(&vec![42u8; 1344]).unwrap();
         }
@@ -1320,14 +1531,17 @@ mod tests {
         write_lbc(&mut out, &header, &indices, &globals, &blobs, Some(&tok)).unwrap();
 
         let result = LbcFile::from_bytes(&out, PathBuf::from("bad_vocab.lbc"));
-        assert!(result.is_err(), "should fail: tokenizer has 16 tokens, header expects 32");
+        assert!(
+            result.is_err(),
+            "should fail: tokenizer has 16 tokens, header expects 32"
+        );
     }
 
     #[test]
     fn v3_tokenizer_write_lbc_vs_streaming_identical() {
         // Verify write_lbc and StreamingLbcWriter produce identical output
-        use crate::streaming_writer::{StreamingLbcWriter, LayerShape};
         use crate::index::SubtensorOffsets;
+        use crate::streaming_writer::{LayerShape, StreamingLbcWriter};
 
         let (header, indices) = make_test_header();
         let tok = make_test_tokenizer(32);
@@ -1345,21 +1559,40 @@ mod tests {
 
         // StreamingLbcWriter path
         let make_slice = |off: u64, len: u64| TensorSlice {
-            offset: off, length: len, quant: QuantScheme::F32,
+            offset: off,
+            length: len,
+            quant: QuantScheme::F32,
         };
         let subtensors = SubtensorOffsets {
-            wq: make_slice(0, 128), wk: make_slice(128, 128),
-            wv: make_slice(256, 128), wo: make_slice(384, 128),
-            bq: None, bk: None, bv: None,
-            w_gate: make_slice(512, 256), w_up: make_slice(768, 256),
+            wq: make_slice(0, 128),
+            wk: make_slice(128, 128),
+            wv: make_slice(256, 128),
+            wo: make_slice(384, 128),
+            bq: None,
+            bk: None,
+            bv: None,
+            w_gate: make_slice(512, 256),
+            w_up: make_slice(768, 256),
             w_down: make_slice(1024, 256),
-            attn_norm: make_slice(1280, 32), ffn_norm: make_slice(1312, 32),
-            router_weight: None, experts: None,
-            shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-            attn_gate: None, attn_post_norm: None,
-            ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-            ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-            attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+            attn_norm: make_slice(1280, 32),
+            ffn_norm: make_slice(1312, 32),
+            router_weight: None,
+            experts: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            ffn_gate_inp_shexp: None,
             layer_type: None,
         };
         let shape = LayerShape {
@@ -1373,15 +1606,17 @@ mod tests {
         let shapes = vec![shape.clone(), shape];
 
         let mut out_sw = Vec::new();
-        let mut sw = StreamingLbcWriter::begin(
-            &mut out_sw, &header, &shapes, &globals, Some(&tok),
-        ).unwrap();
+        let mut sw =
+            StreamingLbcWriter::begin(&mut out_sw, &header, &shapes, &globals, Some(&tok)).unwrap();
         sw.write_layer(&layer_blob).unwrap();
         sw.write_layer(&layer_blob).unwrap();
         sw.finish().unwrap();
 
         assert_eq!(out_wl.len(), out_sw.len(), "size mismatch");
-        assert_eq!(out_wl, out_sw, "write_lbc and StreamingLbcWriter must produce identical bytes");
+        assert_eq!(
+            out_wl, out_sw,
+            "write_lbc and StreamingLbcWriter must produce identical bytes"
+        );
     }
 
     #[test]
@@ -1432,8 +1667,13 @@ mod tests {
         let lbc = LbcFile::from_bytes(&out, PathBuf::from("align.lbc")).unwrap();
         let tok_off = lbc.header.tokenizer_section_offset;
         let alignment = lbc.header.alignment;
-        assert_eq!(tok_off % alignment, 0,
-            "tokenizer offset {} not aligned to {}", tok_off, alignment);
+        assert_eq!(
+            tok_off % alignment,
+            0,
+            "tokenizer offset {} not aligned to {}",
+            tok_off,
+            alignment
+        );
     }
 
     /// v4 Gated-DeltaNet dims survive a write/read round-trip, and the
@@ -1447,8 +1687,16 @@ mod tests {
         // Derived-dim math for the two known shapes.
         let n9 = GdnDims::QWEN35_9B;
         assert_eq!((n9.v_dim(), n9.qk_dim(), n9.qkv_dim()), (4096, 2048, 8192));
-        let g27 = GdnDims { num_v_heads: 48, num_k_heads: 16, head_dim: 128, conv_kernel: 4 };
-        assert_eq!((g27.v_dim(), g27.qk_dim(), g27.qkv_dim()), (6144, 2048, 10240));
+        let g27 = GdnDims {
+            num_v_heads: 48,
+            num_k_heads: 16,
+            head_dim: 128,
+            conv_kernel: 4,
+        };
+        assert_eq!(
+            (g27.v_dim(), g27.qk_dim(), g27.qkv_dim()),
+            (6144, 2048, 10240)
+        );
 
         // Byte-layout delta: a present GDN block adds exactly the 16-byte payload.
         let (mut h_none, _) = make_test_header();
@@ -1457,7 +1705,11 @@ mod tests {
         let mut h_some = h_none.clone();
         h_some.hyperparams.gdn = Some(g27);
         let bytes_some = serialize_header(&h_some);
-        assert_eq!(bytes_some.len(), bytes_none.len() + 16, "GDN-present adds 16 bytes");
+        assert_eq!(
+            bytes_some.len(),
+            bytes_none.len() + 16,
+            "GDN-present adds 16 bytes"
+        );
 
         // Full file round-trip with gdn=Some, exercising the peek_header_offsets
         // scan that locates the layer index after the (now larger) header.

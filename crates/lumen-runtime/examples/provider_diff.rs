@@ -8,15 +8,18 @@
 //!   3. Per-layer get_layer_blocking() bytes (the CPU-dequant path).
 //! Prints the FIRST divergence found with full detail, then a summary.
 
+use lumen_format::{SubtensorOffsets, TensorSlice};
 use lumen_runtime::storage::MmapConfig;
+use lumen_runtime::weight::cache::WeightProvider;
 use lumen_runtime::weight::provider_mmap::MmapWeightProvider;
 use lumen_runtime::weight::provider_sync::SyncWeightProvider;
-use lumen_runtime::weight::cache::WeightProvider;
-use lumen_format::{SubtensorOffsets, TensorSlice};
 use std::path::Path;
 
 fn slice_summary(name: &str, s: &TensorSlice) -> String {
-    format!("{name}: off={} len={} quant={:?}", s.offset, s.length, s.quant)
+    format!(
+        "{name}: off={} len={} quant={:?}",
+        s.offset, s.length, s.quant
+    )
 }
 
 fn opt_slice_summary(name: &str, s: &Option<TensorSlice>) -> String {
@@ -95,7 +98,10 @@ fn main() {
         mmap.output_proj_quant,
         sync.output_proj_raw == mmap.output_proj_raw
     );
-    println!("weight_tying: sync={} mmap={}", sync.weight_tying, mmap.weight_tying);
+    println!(
+        "weight_tying: sync={} mmap={}",
+        sync.weight_tying, mmap.weight_tying
+    );
 
     // 2. Per-layer get_layer_raw comparison.
     println!("\n=== PER-LAYER get_layer_raw() ===");
@@ -123,8 +129,13 @@ fn main() {
         // Detect empty mandatory subtensors (the suspected cpu_naive panic cause).
         let st = &sv.subtensors;
         for (nm, t) in [
-            ("wq", &st.wq), ("wk", &st.wk), ("wv", &st.wv), ("wo", &st.wo),
-            ("w_gate", &st.w_gate), ("w_up", &st.w_up), ("w_down", &st.w_down),
+            ("wq", &st.wq),
+            ("wk", &st.wk),
+            ("wv", &st.wv),
+            ("wo", &st.wo),
+            ("w_gate", &st.w_gate),
+            ("w_up", &st.w_up),
+            ("w_down", &st.w_down),
         ] {
             if t.length == 0 {
                 empty_mandatory_layers.push((l, format!("{nm} (layer_type={:?})", st.layer_type)));
@@ -137,7 +148,10 @@ fn main() {
         for (l, what) in empty_mandatory_layers.iter().take(10) {
             println!("  layer {l}: {what}");
         }
-        println!("  ...total {} empty-mandatory entries", empty_mandatory_layers.len());
+        println!(
+            "  ...total {} empty-mandatory entries",
+            empty_mandatory_layers.len()
+        );
     }
 
     // 3. Per-layer get_layer_blocking comparison (CPU dequant path).
@@ -153,8 +167,13 @@ fn main() {
         let m_st = &mv.subtensors;
         // The telling metric: does sync's blocking path leave any MANDATORY slice empty?
         for (nm, t) in [
-            ("wq", &s_st.wq), ("wk", &s_st.wk), ("wv", &s_st.wv), ("wo", &s_st.wo),
-            ("w_gate", &s_st.w_gate), ("w_up", &s_st.w_up), ("w_down", &s_st.w_down),
+            ("wq", &s_st.wq),
+            ("wk", &s_st.wk),
+            ("wv", &s_st.wv),
+            ("wo", &s_st.wo),
+            ("w_gate", &s_st.w_gate),
+            ("w_up", &s_st.w_up),
+            ("w_down", &s_st.w_down),
         ] {
             if t.length == 0 && blk_mismatch < 8 {
                 println!(

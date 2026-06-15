@@ -89,17 +89,34 @@ pub fn generate_test_model(config: &TestModelConfig) -> Vec<u8> {
         let ffn_norm = add_tensor(rng.gen_norm_bytes(hidden));
 
         let subtensors = SubtensorOffsets {
-            wq, wk, wv, wo,
-            bq: None, bk: None, bv: None,
-            w_gate, w_up, w_down,
-            attn_norm, ffn_norm,
+            wq,
+            wk,
+            wv,
+            wo,
+            bq: None,
+            bk: None,
+            bv: None,
+            w_gate,
+            w_up,
+            w_down,
+            attn_norm,
+            ffn_norm,
             router_weight: None,
             experts: None,
-            shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-            attn_gate: None, attn_post_norm: None,
-            ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-            ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-            attn_q_norm: None, attn_k_norm: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
             ffn_gate_inp_shexp: None,
             layer_type: None,
         };
@@ -126,7 +143,8 @@ pub fn generate_test_model(config: &TestModelConfig) -> Vec<u8> {
         num_experts: None,
         num_active_experts: None,
         norm_eps: 1e-5,
-        rotary_dim: None, rope_neox: false,
+        rotary_dim: None,
+        rope_neox: false,
         gdn: None,
     };
     let qd = QuantizationDescriptor {
@@ -146,8 +164,15 @@ pub fn generate_test_model(config: &TestModelConfig) -> Vec<u8> {
     let blob_refs: Vec<&[u8]> = layer_blobs.iter().map(|b| b.as_slice()).collect();
 
     let mut out = Vec::new();
-    write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs, None)
-        .expect("failed to write test model");
+    write_lbc(
+        &mut out,
+        &header,
+        &layer_indices,
+        &globals,
+        &blob_refs,
+        None,
+    )
+    .expect("failed to write test model");
 
     out
 }
@@ -217,7 +242,11 @@ pub fn generate_test_model_q8_0(config: &TestModelQ8Config) -> Vec<u8> {
 
         let mut add_q8 = |data: Vec<u8>| -> TensorSlice {
             let len = data.len() as u64;
-            let slice = TensorSlice { offset, length: len, quant: QuantScheme::Q8_0 };
+            let slice = TensorSlice {
+                offset,
+                length: len,
+                quant: QuantScheme::Q8_0,
+            };
             blob.extend_from_slice(&data);
             offset += len;
             slice
@@ -234,7 +263,11 @@ pub fn generate_test_model_q8_0(config: &TestModelQ8Config) -> Vec<u8> {
         // Norms are always F32
         let mut add_f32 = |data: Vec<u8>| -> TensorSlice {
             let len = data.len() as u64;
-            let slice = TensorSlice { offset, length: len, quant: QuantScheme::F32 };
+            let slice = TensorSlice {
+                offset,
+                length: len,
+                quant: QuantScheme::F32,
+            };
             blob.extend_from_slice(&data);
             offset += len;
             slice
@@ -244,17 +277,34 @@ pub fn generate_test_model_q8_0(config: &TestModelQ8Config) -> Vec<u8> {
         let ffn_norm = add_f32(rng.gen_norm_bytes(hidden));
 
         let subtensors = SubtensorOffsets {
-            wq, wk, wv, wo,
-            bq: None, bk: None, bv: None,
-            w_gate, w_up, w_down,
-            attn_norm, ffn_norm,
+            wq,
+            wk,
+            wv,
+            wo,
+            bq: None,
+            bk: None,
+            bv: None,
+            w_gate,
+            w_up,
+            w_down,
+            attn_norm,
+            ffn_norm,
             router_weight: None,
             experts: None,
-            shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-            attn_gate: None, attn_post_norm: None,
-            ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-            ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-            attn_q_norm: None, attn_k_norm: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
             ffn_gate_inp_shexp: None,
             layer_type: None,
         };
@@ -280,7 +330,8 @@ pub fn generate_test_model_q8_0(config: &TestModelQ8Config) -> Vec<u8> {
         num_experts: None,
         num_active_experts: None,
         norm_eps: 1e-5,
-        rotary_dim: None, rope_neox: false,
+        rotary_dim: None,
+        rope_neox: false,
         gdn: None,
     };
     let qd = QuantizationDescriptor {
@@ -294,12 +345,23 @@ pub fn generate_test_model_q8_0(config: &TestModelQ8Config) -> Vec<u8> {
     header.output_proj.quant = QuantScheme::Q8_0;
     header.final_norm.quant = QuantScheme::F32;
 
-    let globals = GlobalTensors { embedding, final_norm, output_proj };
+    let globals = GlobalTensors {
+        embedding,
+        final_norm,
+        output_proj,
+    };
     let blob_refs: Vec<&[u8]> = layer_blobs.iter().map(|b| b.as_slice()).collect();
 
     let mut out = Vec::new();
-    write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs, None)
-        .expect("failed to write Q8_0 test model");
+    write_lbc(
+        &mut out,
+        &header,
+        &layer_indices,
+        &globals,
+        &blob_refs,
+        None,
+    )
+    .expect("failed to write Q8_0 test model");
     out
 }
 
@@ -333,7 +395,10 @@ pub fn generate_test_model_q8_0(config: &TestModelQ8Config) -> Vec<u8> {
 /// `ssm_a`/`ssm_dt`/`ssm_norm` are F32 (the runtime's SSM-scalar precision);
 /// `ssm_out` is Q8_0 (the runtime re-quantizes this tensor from F32 to Q8_0).
 pub fn generate_test_model_q8_0_gdn(config: &TestModelQ8Config) -> Vec<u8> {
-    assert!(config.num_layers >= 2, "GDN hybrid test model needs >= 2 layers (1 GDN + 1 full-attn)");
+    assert!(
+        config.num_layers >= 2,
+        "GDN hybrid test model needs >= 2 layers (1 GDN + 1 full-attn)"
+    );
     let mut rng = WeightRng::new(config.seed);
 
     let hidden = config.hidden_dim as usize;
@@ -359,20 +424,52 @@ pub fn generate_test_model_q8_0_gdn(config: &TestModelQ8Config) -> Vec<u8> {
 
         let mut add = |blob: &mut Vec<u8>, data: Vec<u8>, quant: QuantScheme| -> TensorSlice {
             let len = data.len() as u64;
-            let slice = TensorSlice { offset, length: len, quant };
+            let slice = TensorSlice {
+                offset,
+                length: len,
+                quant,
+            };
             blob.extend_from_slice(&data);
             offset += len;
             slice
         };
 
         // Mandatory projection weights: Q8_0 (drives `needs_dequant = true`).
-        let wq = add(&mut blob, rng.gen_q8_0_bytes(q_dim * hidden), QuantScheme::Q8_0);
-        let wk = add(&mut blob, rng.gen_q8_0_bytes(kv_dim * hidden), QuantScheme::Q8_0);
-        let wv = add(&mut blob, rng.gen_q8_0_bytes(kv_dim * hidden), QuantScheme::Q8_0);
-        let wo = add(&mut blob, rng.gen_q8_0_bytes(hidden * q_dim), QuantScheme::Q8_0);
-        let w_gate = add(&mut blob, rng.gen_q8_0_bytes(inter * hidden), QuantScheme::Q8_0);
-        let w_up = add(&mut blob, rng.gen_q8_0_bytes(inter * hidden), QuantScheme::Q8_0);
-        let w_down = add(&mut blob, rng.gen_q8_0_bytes(hidden * inter), QuantScheme::Q8_0);
+        let wq = add(
+            &mut blob,
+            rng.gen_q8_0_bytes(q_dim * hidden),
+            QuantScheme::Q8_0,
+        );
+        let wk = add(
+            &mut blob,
+            rng.gen_q8_0_bytes(kv_dim * hidden),
+            QuantScheme::Q8_0,
+        );
+        let wv = add(
+            &mut blob,
+            rng.gen_q8_0_bytes(kv_dim * hidden),
+            QuantScheme::Q8_0,
+        );
+        let wo = add(
+            &mut blob,
+            rng.gen_q8_0_bytes(hidden * q_dim),
+            QuantScheme::Q8_0,
+        );
+        let w_gate = add(
+            &mut blob,
+            rng.gen_q8_0_bytes(inter * hidden),
+            QuantScheme::Q8_0,
+        );
+        let w_up = add(
+            &mut blob,
+            rng.gen_q8_0_bytes(inter * hidden),
+            QuantScheme::Q8_0,
+        );
+        let w_down = add(
+            &mut blob,
+            rng.gen_q8_0_bytes(hidden * inter),
+            QuantScheme::Q8_0,
+        );
         // Norms: always F32.
         let attn_norm = add(&mut blob, rng.gen_norm_bytes(hidden), QuantScheme::F32);
         let ffn_norm = add(&mut blob, rng.gen_norm_bytes(hidden), QuantScheme::F32);
@@ -384,38 +481,64 @@ pub fn generate_test_model_q8_0_gdn(config: &TestModelQ8Config) -> Vec<u8> {
         // wrong content in the rebuilt blob. Layer 1 stays full-attention (no
         // ssm_*) so the model is a genuine hybrid like Qwen3.5-9B.
         let is_gdn = layer == 0;
-        let (
-            ssm_a, ssm_conv1d, ssm_dt, ssm_beta, ssm_alpha, ssm_norm, ssm_out, layer_type,
-        ) = if is_gdn {
-            // ssm_conv1d: short conv kernel; ssm_a/dt/norm: F32 scalars.
-            let ssm_conv1d = add(&mut blob, rng.gen_norm_bytes(hidden), QuantScheme::F32);
-            let ssm_a = add(&mut blob, rng.gen_norm_bytes(head_dim), QuantScheme::F32);
-            let ssm_dt = add(&mut blob, rng.gen_norm_bytes(head_dim), QuantScheme::F32);
-            let ssm_norm = add(&mut blob, rng.gen_norm_bytes(hidden), QuantScheme::F32);
-            // ssm_alpha / ssm_beta / ssm_out: Q8_0 (force-Q8 in the converter).
-            let ssm_alpha = add(&mut blob, rng.gen_q8_0_bytes(hidden), QuantScheme::Q8_0);
-            let ssm_beta = add(&mut blob, rng.gen_q8_0_bytes(hidden), QuantScheme::Q8_0);
-            let ssm_out = add(&mut blob, rng.gen_q8_0_bytes(hidden * hidden), QuantScheme::Q8_0);
-            (
-                Some(ssm_a), Some(ssm_conv1d), Some(ssm_dt), Some(ssm_beta),
-                Some(ssm_alpha), Some(ssm_norm), Some(ssm_out), Some(1u8),
-            )
-        } else {
-            (None, None, None, None, None, None, None, Some(0u8))
-        };
+        let (ssm_a, ssm_conv1d, ssm_dt, ssm_beta, ssm_alpha, ssm_norm, ssm_out, layer_type) =
+            if is_gdn {
+                // ssm_conv1d: short conv kernel; ssm_a/dt/norm: F32 scalars.
+                let ssm_conv1d = add(&mut blob, rng.gen_norm_bytes(hidden), QuantScheme::F32);
+                let ssm_a = add(&mut blob, rng.gen_norm_bytes(head_dim), QuantScheme::F32);
+                let ssm_dt = add(&mut blob, rng.gen_norm_bytes(head_dim), QuantScheme::F32);
+                let ssm_norm = add(&mut blob, rng.gen_norm_bytes(hidden), QuantScheme::F32);
+                // ssm_alpha / ssm_beta / ssm_out: Q8_0 (force-Q8 in the converter).
+                let ssm_alpha = add(&mut blob, rng.gen_q8_0_bytes(hidden), QuantScheme::Q8_0);
+                let ssm_beta = add(&mut blob, rng.gen_q8_0_bytes(hidden), QuantScheme::Q8_0);
+                let ssm_out = add(
+                    &mut blob,
+                    rng.gen_q8_0_bytes(hidden * hidden),
+                    QuantScheme::Q8_0,
+                );
+                (
+                    Some(ssm_a),
+                    Some(ssm_conv1d),
+                    Some(ssm_dt),
+                    Some(ssm_beta),
+                    Some(ssm_alpha),
+                    Some(ssm_norm),
+                    Some(ssm_out),
+                    Some(1u8),
+                )
+            } else {
+                (None, None, None, None, None, None, None, Some(0u8))
+            };
 
         let subtensors = SubtensorOffsets {
-            wq, wk, wv, wo,
-            bq: None, bk: None, bv: None,
-            w_gate, w_up, w_down,
-            attn_norm, ffn_norm,
+            wq,
+            wk,
+            wv,
+            wo,
+            bq: None,
+            bk: None,
+            bv: None,
+            w_gate,
+            w_up,
+            w_down,
+            attn_norm,
+            ffn_norm,
             router_weight: None,
             experts: None,
-            shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-            attn_gate: None, attn_post_norm: None,
-            ssm_a, ssm_conv1d, ssm_dt,
-            ssm_beta, ssm_alpha, ssm_norm, ssm_out,
-            attn_q_norm: None, attn_k_norm: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a,
+            ssm_conv1d,
+            ssm_dt,
+            ssm_beta,
+            ssm_alpha,
+            ssm_norm,
+            ssm_out,
+            attn_q_norm: None,
+            attn_k_norm: None,
             ffn_gate_inp_shexp: None,
             layer_type,
         };
@@ -441,7 +564,8 @@ pub fn generate_test_model_q8_0_gdn(config: &TestModelQ8Config) -> Vec<u8> {
         num_experts: None,
         num_active_experts: None,
         norm_eps: 1e-5,
-        rotary_dim: None, rope_neox: false,
+        rotary_dim: None,
+        rope_neox: false,
         gdn: None,
     };
     let qd = QuantizationDescriptor {
@@ -455,12 +579,23 @@ pub fn generate_test_model_q8_0_gdn(config: &TestModelQ8Config) -> Vec<u8> {
     header.output_proj.quant = QuantScheme::Q8_0;
     header.final_norm.quant = QuantScheme::F32;
 
-    let globals = GlobalTensors { embedding, final_norm, output_proj };
+    let globals = GlobalTensors {
+        embedding,
+        final_norm,
+        output_proj,
+    };
     let blob_refs: Vec<&[u8]> = layer_blobs.iter().map(|b| b.as_slice()).collect();
 
     let mut out = Vec::new();
-    write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs, None)
-        .expect("failed to write Q8_0 GDN test model");
+    write_lbc(
+        &mut out,
+        &header,
+        &layer_indices,
+        &globals,
+        &blob_refs,
+        None,
+    )
+    .expect("failed to write Q8_0 GDN test model");
     out
 }
 
@@ -528,7 +663,11 @@ pub fn generate_test_model_f16(config: &TestModelF16Config) -> Vec<u8> {
 
         let mut add_f16 = |data: Vec<u8>| -> TensorSlice {
             let len = data.len() as u64;
-            let slice = TensorSlice { offset, length: len, quant: QuantScheme::F16 };
+            let slice = TensorSlice {
+                offset,
+                length: len,
+                quant: QuantScheme::F16,
+            };
             blob.extend_from_slice(&data);
             offset += len;
             slice
@@ -545,7 +684,11 @@ pub fn generate_test_model_f16(config: &TestModelF16Config) -> Vec<u8> {
         // Norms are always F32
         let mut add_f32 = |data: Vec<u8>| -> TensorSlice {
             let len = data.len() as u64;
-            let slice = TensorSlice { offset, length: len, quant: QuantScheme::F32 };
+            let slice = TensorSlice {
+                offset,
+                length: len,
+                quant: QuantScheme::F32,
+            };
             blob.extend_from_slice(&data);
             offset += len;
             slice
@@ -555,17 +698,34 @@ pub fn generate_test_model_f16(config: &TestModelF16Config) -> Vec<u8> {
         let ffn_norm = add_f32(rng.gen_norm_bytes(hidden));
 
         let subtensors = SubtensorOffsets {
-            wq, wk, wv, wo,
-            bq: None, bk: None, bv: None,
-            w_gate, w_up, w_down,
-            attn_norm, ffn_norm,
+            wq,
+            wk,
+            wv,
+            wo,
+            bq: None,
+            bk: None,
+            bv: None,
+            w_gate,
+            w_up,
+            w_down,
+            attn_norm,
+            ffn_norm,
             router_weight: None,
             experts: None,
-            shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-            attn_gate: None, attn_post_norm: None,
-            ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-            ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-            attn_q_norm: None, attn_k_norm: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
             ffn_gate_inp_shexp: None,
             layer_type: None,
         };
@@ -591,7 +751,8 @@ pub fn generate_test_model_f16(config: &TestModelF16Config) -> Vec<u8> {
         num_experts: None,
         num_active_experts: None,
         norm_eps: 1e-5,
-        rotary_dim: None, rope_neox: false,
+        rotary_dim: None,
+        rope_neox: false,
         gdn: None,
     };
     let qd = QuantizationDescriptor {
@@ -605,12 +766,23 @@ pub fn generate_test_model_f16(config: &TestModelF16Config) -> Vec<u8> {
     header.output_proj.quant = QuantScheme::F16;
     header.final_norm.quant = QuantScheme::F32;
 
-    let globals = GlobalTensors { embedding, final_norm, output_proj };
+    let globals = GlobalTensors {
+        embedding,
+        final_norm,
+        output_proj,
+    };
     let blob_refs: Vec<&[u8]> = layer_blobs.iter().map(|b| b.as_slice()).collect();
 
     let mut out = Vec::new();
-    write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs, None)
-        .expect("failed to write F16 test model");
+    write_lbc(
+        &mut out,
+        &header,
+        &layer_indices,
+        &globals,
+        &blob_refs,
+        None,
+    )
+    .expect("failed to write F16 test model");
     out
 }
 
@@ -679,7 +851,11 @@ pub fn generate_test_model_q4_0(config: &TestModelQ4Config) -> Vec<u8> {
 
         let mut add_q4 = |data: Vec<u8>| -> TensorSlice {
             let len = data.len() as u64;
-            let slice = TensorSlice { offset, length: len, quant: QuantScheme::Q4_0 };
+            let slice = TensorSlice {
+                offset,
+                length: len,
+                quant: QuantScheme::Q4_0,
+            };
             blob.extend_from_slice(&data);
             offset += len;
             slice
@@ -696,7 +872,11 @@ pub fn generate_test_model_q4_0(config: &TestModelQ4Config) -> Vec<u8> {
         // Norms are always F32
         let mut add_f32 = |data: Vec<u8>| -> TensorSlice {
             let len = data.len() as u64;
-            let slice = TensorSlice { offset, length: len, quant: QuantScheme::F32 };
+            let slice = TensorSlice {
+                offset,
+                length: len,
+                quant: QuantScheme::F32,
+            };
             blob.extend_from_slice(&data);
             offset += len;
             slice
@@ -706,17 +886,34 @@ pub fn generate_test_model_q4_0(config: &TestModelQ4Config) -> Vec<u8> {
         let ffn_norm = add_f32(rng.gen_norm_bytes(hidden));
 
         let subtensors = SubtensorOffsets {
-            wq, wk, wv, wo,
-            bq: None, bk: None, bv: None,
-            w_gate, w_up, w_down,
-            attn_norm, ffn_norm,
+            wq,
+            wk,
+            wv,
+            wo,
+            bq: None,
+            bk: None,
+            bv: None,
+            w_gate,
+            w_up,
+            w_down,
+            attn_norm,
+            ffn_norm,
             router_weight: None,
             experts: None,
-            shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-            attn_gate: None, attn_post_norm: None,
-            ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-            ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-            attn_q_norm: None, attn_k_norm: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
             ffn_gate_inp_shexp: None,
             layer_type: None,
         };
@@ -742,7 +939,8 @@ pub fn generate_test_model_q4_0(config: &TestModelQ4Config) -> Vec<u8> {
         num_experts: None,
         num_active_experts: None,
         norm_eps: 1e-5,
-        rotary_dim: None, rope_neox: false,
+        rotary_dim: None,
+        rope_neox: false,
         gdn: None,
     };
     let qd = QuantizationDescriptor {
@@ -756,12 +954,23 @@ pub fn generate_test_model_q4_0(config: &TestModelQ4Config) -> Vec<u8> {
     header.output_proj.quant = QuantScheme::Q4_0;
     header.final_norm.quant = QuantScheme::F32;
 
-    let globals = GlobalTensors { embedding, final_norm, output_proj };
+    let globals = GlobalTensors {
+        embedding,
+        final_norm,
+        output_proj,
+    };
     let blob_refs: Vec<&[u8]> = layer_blobs.iter().map(|b| b.as_slice()).collect();
 
     let mut out = Vec::new();
-    write_lbc(&mut out, &header, &layer_indices, &globals, &blob_refs, None)
-        .expect("failed to write Q4_0 test model");
+    write_lbc(
+        &mut out,
+        &header,
+        &layer_indices,
+        &globals,
+        &blob_refs,
+        None,
+    )
+    .expect("failed to write Q4_0 test model");
     out
 }
 
@@ -832,7 +1041,10 @@ mod tests {
         let config = TestModelQ8Config::default();
         let data1 = generate_test_model_q8_0(&config);
         let data2 = generate_test_model_q8_0(&config);
-        assert_eq!(data1, data2, "Q8_0: same seed should produce identical output");
+        assert_eq!(
+            data1, data2,
+            "Q8_0: same seed should produce identical output"
+        );
     }
 
     // ---- Q8_0 GDN-hybrid tests ----
@@ -856,18 +1068,32 @@ mod tests {
         // Layer 0 = GDN: layer_type Some(1) + populated ssm_* subtensors.
         let l0 = &lbc.layer_indices[0].subtensors;
         assert_eq!(l0.layer_type, Some(1), "layer 0 must be GDN (layer_type=1)");
-        assert!(l0.ssm_conv1d.is_some(), "GDN layer must populate ssm_conv1d");
+        assert!(
+            l0.ssm_conv1d.is_some(),
+            "GDN layer must populate ssm_conv1d"
+        );
         assert!(l0.ssm_a.is_some(), "GDN layer must populate ssm_a");
         assert!(l0.ssm_out.is_some(), "GDN layer must populate ssm_out");
-        assert_eq!(l0.wq.quant, QuantScheme::Q8_0, "GDN mandatory weights stay Q8_0");
+        assert_eq!(
+            l0.wq.quant,
+            QuantScheme::Q8_0,
+            "GDN mandatory weights stay Q8_0"
+        );
         // ssm_out is Q8_0 (re-quantized from F32 at conversion); ssm_a is F32.
         assert_eq!(l0.ssm_out.unwrap().quant, QuantScheme::Q8_0);
         assert_eq!(l0.ssm_a.unwrap().quant, QuantScheme::F32);
 
         // Layer 1 = full attention: layer_type Some(0), no ssm_*.
         let l1 = &lbc.layer_indices[1].subtensors;
-        assert_eq!(l1.layer_type, Some(0), "layer 1 must be full-attention (layer_type=0)");
-        assert!(l1.ssm_conv1d.is_none(), "full-attn layer must NOT populate ssm_*");
+        assert_eq!(
+            l1.layer_type,
+            Some(0),
+            "layer 1 must be full-attention (layer_type=0)"
+        );
+        assert!(
+            l1.ssm_conv1d.is_none(),
+            "full-attn layer must NOT populate ssm_*"
+        );
         assert!(l1.ssm_out.is_none());
     }
 
@@ -876,7 +1102,10 @@ mod tests {
         let config = TestModelQ8Config::default();
         let data1 = generate_test_model_q8_0_gdn(&config);
         let data2 = generate_test_model_q8_0_gdn(&config);
-        assert_eq!(data1, data2, "Q8_0 GDN: same seed should produce identical output");
+        assert_eq!(
+            data1, data2,
+            "Q8_0 GDN: same seed should produce identical output"
+        );
     }
 
     // ---- F16 tests ----
@@ -915,8 +1144,7 @@ mod tests {
         let q_dim = heads * head_dim;
         let expected_wq_bytes = q_dim * hidden * 2;
         assert_eq!(
-            lbc.layer_indices[0].subtensors.wq.length,
-            expected_wq_bytes as u64,
+            lbc.layer_indices[0].subtensors.wq.length, expected_wq_bytes as u64,
             "wq F16 byte size mismatch"
         );
     }
@@ -926,7 +1154,10 @@ mod tests {
         let config = TestModelF16Config::default();
         let data1 = generate_test_model_f16(&config);
         let data2 = generate_test_model_f16(&config);
-        assert_eq!(data1, data2, "F16: same seed should produce identical output");
+        assert_eq!(
+            data1, data2,
+            "F16: same seed should produce identical output"
+        );
     }
 
     // ---- Q4_0 tests ----
@@ -966,8 +1197,7 @@ mod tests {
         let n_elements = q_dim * hidden;
         let expected_wq_bytes = (n_elements / 32) * 18;
         assert_eq!(
-            lbc.layer_indices[0].subtensors.wq.length,
-            expected_wq_bytes as u64,
+            lbc.layer_indices[0].subtensors.wq.length, expected_wq_bytes as u64,
             "wq Q4_0 byte size mismatch"
         );
     }
@@ -977,6 +1207,9 @@ mod tests {
         let config = TestModelQ4Config::default();
         let data1 = generate_test_model_q4_0(&config);
         let data2 = generate_test_model_q4_0(&config);
-        assert_eq!(data1, data2, "Q4_0: same seed should produce identical output");
+        assert_eq!(
+            data1, data2,
+            "Q4_0: same seed should produce identical output"
+        );
     }
 }

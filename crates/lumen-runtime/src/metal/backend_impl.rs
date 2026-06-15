@@ -11,10 +11,10 @@ use crate::kv::{KvCache, KvCacheView, KvPrecision};
 use crate::weight::cache::{LayerView, WeightProvider};
 use lumen_format::hyperparams::ModelHyperparams;
 use lumen_format::quantization::QuantScheme;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 
-use super::ffi::{autoreleasepool, MetalBuffer, MTLSize};
+use super::ffi::{autoreleasepool, MTLSize, MetalBuffer};
 use super::types::{CachedLayerMeta, CachedMoeMeta, MetalScratch};
 use super::{MetalF32Backend, PrefetchState, PAGE_SIZE};
 impl ComputeBackend for MetalF32Backend {
@@ -33,13 +33,16 @@ impl ComputeBackend for MetalF32Backend {
         let pipelines = self.compile_pipelines()?;
 
         // Determine threadgroup sizes based on pipeline capabilities
-        let matmul_tg_size = pipelines.matmul_bytes_f32
+        let matmul_tg_size = pipelines
+            .matmul_bytes_f32
             .max_total_threads_per_threadgroup()
             .min(256); // cap at 256 for matmul (good balance)
-        let norm_tg_size = pipelines.rmsnorm_bytes
+        let norm_tg_size = pipelines
+            .rmsnorm_bytes
             .max_total_threads_per_threadgroup()
             .min(256);
-        let mha_tg_size = pipelines.multi_head_attention
+        let mha_tg_size = pipelines
+            .multi_head_attention
             .max_total_threads_per_threadgroup()
             .min(256); // threads per head in multi_head_attention
 
@@ -48,12 +51,14 @@ impl ComputeBackend for MetalF32Backend {
         // Upload global tensors to GPU
         // Upload embedding: use raw quantized bytes if available, else F32
         if let Some(ref raw) = self.embedding_raw {
-            if matches!(self.embedding_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
-                self.embedding_buf = Some(
-                    self.device.new_buffer_with_bytes(raw).ok_or_else(|| {
+            if matches!(
+                self.embedding_quant,
+                QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
+            ) {
+                self.embedding_buf =
+                    Some(self.device.new_buffer_with_bytes(raw).ok_or_else(|| {
                         RuntimeError::Compute("Failed to create quantized embedding buffer".into())
-                    })?
-                );
+                    })?);
                 // The GPU embedding buffer now holds the native-quant table and
                 // every reachable Metal path (embed_token GPU branch, decode_*,
                 // prefill, weight tying, preload) reads it (or `embedding_raw`),
@@ -86,12 +91,14 @@ impl ComputeBackend for MetalF32Backend {
         self.final_norm_buf = Some(self.upload_f32(&self.final_norm)?);
         // Upload output_proj: use raw Q8_0 bytes if available, else F32
         if let Some(ref raw) = self.output_proj_raw {
-            if matches!(self.output_proj_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
-                self.output_proj_buf = Some(
-                    self.device.new_buffer_with_bytes(raw).ok_or_else(|| {
+            if matches!(
+                self.output_proj_quant,
+                QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
+            ) {
+                self.output_proj_buf =
+                    Some(self.device.new_buffer_with_bytes(raw).ok_or_else(|| {
                         RuntimeError::Compute("Failed to create Q8_0 output_proj buffer".into())
-                    })?
-                );
+                    })?);
                 // Symmetric to the embedding case above: compute_final and the
                 // GPU-resident decode paths read `output_proj_buf` (or
                 // `output_proj_raw`); weight tying reuses the embedding buffer
@@ -167,7 +174,11 @@ impl ComputeBackend for MetalF32Backend {
         // Pre-compute RoPE tables and upload to GPU (f64 precision for intermediate math,
         // stored as f32. Matches the Qwen3.5 path in gpu_resident.rs and avoids accumulated
         // f32 powf rounding error that causes degeneration on high-theta models like Llama 3.1.)
-        let theta: f64 = hyperparams.rope_params.as_ref().map(|r| r.theta as f64).unwrap_or(10000.0);
+        let theta: f64 = hyperparams
+            .rope_params
+            .as_ref()
+            .map(|r| r.theta as f64)
+            .unwrap_or(10000.0);
         let mut rope_cos = vec![0.0f32; max_seq_len * half_dim];
         let mut rope_sin = vec![0.0f32; max_seq_len * half_dim];
         for pos in 0..max_seq_len {
@@ -220,12 +231,18 @@ impl ComputeBackend for MetalF32Backend {
                     hidden_dim, moe_expert_inter_dim, num_layers,
                 );
                 (
-                    Some(make_buf(moe_num_experts)?),                           // [num_experts] f32
-                    Some(self.device.new_buffer((moe_num_active_experts.max(1)) * 4).ok_or_else(|| {
-                        RuntimeError::Compute("Failed to allocate MoE expert_ids buffer".into())
-                    })?),                                                       // [top_k] u32
-                    Some(make_buf(moe_num_active_experts)?),                    // [top_k] f32
-                    Some(make_buf(moe_num_experts * hidden_dim)?),              // [num_experts * hidden_dim] f32
+                    Some(make_buf(moe_num_experts)?), // [num_experts] f32
+                    Some(
+                        self.device
+                            .new_buffer((moe_num_active_experts.max(1)) * 4)
+                            .ok_or_else(|| {
+                                RuntimeError::Compute(
+                                    "Failed to allocate MoE expert_ids buffer".into(),
+                                )
+                            })?,
+                    ), // [top_k] u32
+                    Some(make_buf(moe_num_active_experts)?), // [top_k] f32
+                    Some(make_buf(moe_num_experts * hidden_dim)?), // [num_experts * hidden_dim] f32
                 )
             } else {
                 (None, None, None, None)
@@ -235,14 +252,14 @@ impl ComputeBackend for MetalF32Backend {
             // Persistent activation buffer: allocated once, reused every layer.
             x_buf: make_buf(hidden_dim)?,
             normed_buf: make_buf(hidden_dim)?,
-            qkv_buf: make_buf(qkv_dim.max(gdn_qkv_dim))?,   // GDN needs gdn_qkv_dim (9B=8192, 27B=10240)
+            qkv_buf: make_buf(qkv_dim.max(gdn_qkv_dim))?, // GDN needs gdn_qkv_dim (9B=8192, 27B=10240)
             q_buf: make_buf(q_dim)?,
-            k_buf: make_buf(kv_dim.max(2048))?,    // GDN needs 2048 (16 KV heads * 128 dim)
-            v_buf: make_buf(kv_dim.max(2048))?,    // GDN needs 2048 (16 KV heads * 128 dim)
+            k_buf: make_buf(kv_dim.max(2048))?, // GDN needs 2048 (16 KV heads * 128 dim)
+            v_buf: make_buf(kv_dim.max(2048))?, // GDN needs 2048 (16 KV heads * 128 dim)
             attn_out_buf: make_buf(q_dim)?,
             scores_buf: make_buf(max_seq_len)?,
             attn_proj_buf: make_buf(hidden_dim)?,
-            gate_buf: make_buf(inter_dim.max(q_dim))?,  // max of FFN inter_dim and attn q_dim (Q+gate deinterleave)
+            gate_buf: make_buf(inter_dim.max(q_dim))?, // max of FFN inter_dim and attn q_dim (Q+gate deinterleave)
             up_buf: make_buf(inter_dim)?,
             down_buf: make_buf(hidden_dim)?,
             logits_buf: make_buf(vocab_size)?,
@@ -257,7 +274,7 @@ impl ComputeBackend for MetalF32Backend {
             // Flash decode: tile_size=256, max_tiles = ceil(max_seq/256)
             // Each tile: head_dim + 2 floats (weighted_v + max + sum)
             flash_decode_partial_buf: make_buf(
-                num_heads * ((max_seq_len + 255) / 256) * (head_dim + 2)
+                num_heads * ((max_seq_len + 255) / 256) * (head_dim + 2),
             )?,
             hidden_dim,
             num_heads,
@@ -347,11 +364,16 @@ impl ComputeBackend for MetalF32Backend {
             // Per-layer expert IDs buffers for GPU-resident profiling.
             // Allocated for MoE models so each layer's expert selections are preserved.
             moe_per_layer_expert_ids: if moe_num_experts > 0 {
-                (0..num_layers).map(|_| {
-                    // Each layer gets its own [top_k] u32 buffer.
-                    Some(self.device.new_buffer((moe_num_active_experts.max(1)) * 4)
-                        .expect("Failed to allocate per-layer MoE expert_ids buffer"))
-                }).collect()
+                (0..num_layers)
+                    .map(|_| {
+                        // Each layer gets its own [top_k] u32 buffer.
+                        Some(
+                            self.device
+                                .new_buffer((moe_num_active_experts.max(1)) * 4)
+                                .expect("Failed to allocate per-layer MoE expert_ids buffer"),
+                        )
+                    })
+                    .collect()
             } else {
                 Vec::new()
             },
@@ -359,10 +381,15 @@ impl ComputeBackend for MetalF32Backend {
             // Per-layer expert weights buffers for router diagnostics.
             // Allocated for MoE models when router_debug is enabled.
             moe_per_layer_expert_weights: if moe_num_experts > 0 && self.router_debug_enabled {
-                (0..num_layers).map(|_| {
-                    Some(self.device.new_buffer((moe_num_active_experts.max(1)) * 4)
-                        .expect("Failed to allocate per-layer MoE expert_weights buffer"))
-                }).collect()
+                (0..num_layers)
+                    .map(|_| {
+                        Some(
+                            self.device
+                                .new_buffer((moe_num_active_experts.max(1)) * 4)
+                                .expect("Failed to allocate per-layer MoE expert_weights buffer"),
+                        )
+                    })
+                    .collect()
             } else {
                 Vec::new()
             },
@@ -371,8 +398,11 @@ impl ComputeBackend for MetalF32Backend {
             moe_gate_up_offsets: Vec::new(),
             moe_down_offsets: Vec::new(),
             moe_batched_swiglu_buf: if moe_num_experts > 0 && moe_num_active_experts > 0 {
-                Some(self.device.new_buffer((moe_num_active_experts * moe_expert_inter_dim * 4).max(4))
-                    .expect("Failed to allocate batched swiglu buffer"))
+                Some(
+                    self.device
+                        .new_buffer((moe_num_active_experts * moe_expert_inter_dim * 4).max(4))
+                        .expect("Failed to allocate batched swiglu buffer"),
+                )
             } else {
                 None
             },
@@ -380,15 +410,22 @@ impl ComputeBackend for MetalF32Backend {
             moe_shared_down_offsets: Vec::new(),
             moe_shared_gate_scalar_buf: if moe_num_experts > 0 {
                 // Single f32 for shared expert gating scalar
-                Some(self.device.new_buffer(4)
-                    .expect("Failed to allocate shared expert gate scalar buffer"))
+                Some(
+                    self.device
+                        .new_buffer(4)
+                        .expect("Failed to allocate shared expert gate scalar buffer"),
+                )
             } else {
                 None
             },
 
             // Qwen3.5-MoE scratch: defaults for non-hybrid models.
             // Overridden in preload_weights_gpu_resident when hybrid model is detected.
-            rope_theta: hyperparams.rope_params.as_ref().map(|r| r.theta as f64).unwrap_or(10000.0),
+            rope_theta: hyperparams
+                .rope_params
+                .as_ref()
+                .map(|r| r.theta as f64)
+                .unwrap_or(10000.0),
             rope_neox: hyperparams.rope_neox,
             rotary_dim: head_dim,
             shared_expert_inter_dim: 0,
@@ -449,9 +486,10 @@ impl ComputeBackend for MetalF32Backend {
         // Only activated for MoE models (num_experts > 0).
         if moe_num_experts > 0 {
             // Always initialize the profiler for MoE models.
-            self.expert_profiler = Some(Mutex::new(
-                ExpertActivationProfiler::new(num_layers, moe_num_experts),
-            ));
+            self.expert_profiler = Some(Mutex::new(ExpertActivationProfiler::new(
+                num_layers,
+                moe_num_experts,
+            )));
 
             // Initialize ExpertReader if LBC path was provided via configure_expert_cache.
             if let Some(ref path) = self.lbc_path {
@@ -478,7 +516,11 @@ impl ComputeBackend for MetalF32Backend {
                 eprintln!(
                     "MoE expert cache: capacity={} experts, reader={}",
                     stats.capacity,
-                    if self.expert_reader.is_some() { "active" } else { "inactive" },
+                    if self.expert_reader.is_some() {
+                        "active"
+                    } else {
+                        "inactive"
+                    },
                 );
             }
         }
@@ -546,7 +588,8 @@ impl ComputeBackend for MetalF32Backend {
                 base_off = 0;
             } else {
                 return Err(RuntimeError::Compute(format!(
-                    "gpu_resident_layers missing layer {}", layer_idx
+                    "gpu_resident_layers missing layer {}",
+                    layer_idx
                 )));
             }
         } else {
@@ -570,7 +613,10 @@ impl ComputeBackend for MetalF32Backend {
             if use_partial {
                 // Partial buffer: only non-expert bytes.
                 let non_exp_end = Self::non_expert_byte_end(&weights.subtensors);
-                let cached = s.moe_partial_buf_cache.get(layer_idx).and_then(|c| c.as_ref());
+                let cached = s
+                    .moe_partial_buf_cache
+                    .get(layer_idx)
+                    .and_then(|c| c.as_ref());
                 let need_create = match cached {
                     Some((ptr, end, _)) => *ptr != blob_ptr || *end != non_exp_end,
                     None => true,
@@ -614,7 +660,7 @@ impl ComputeBackend for MetalF32Backend {
         let st = &weights.subtensors;
 
         let attn_norm_off = base_off + st.attn_norm.offset;
-        let wq_off = base_off + st.wq.offset;  // Wq/Wk/Wv are contiguous; wq_off is the fused QKV start
+        let wq_off = base_off + st.wq.offset; // Wq/Wk/Wv are contiguous; wq_off is the fused QKV start
         let wo_off = base_off + st.wo.offset;
         // Prefer attn_post_norm when ffn_norm is the zero-sentinel (Qwen3.5-35B-A3B).
         let ffn_norm_off = if st.ffn_norm.length == 0 {
@@ -628,9 +674,8 @@ impl ComputeBackend for MetalF32Backend {
 
         let is_gdn_layer = st.layer_type == Some(1);
 
-        let kv = kv.ok_or_else(|| {
-            RuntimeError::Compute("KV cache view required for attention".into())
-        })?;
+        let kv =
+            kv.ok_or_else(|| RuntimeError::Compute("KV cache view required for attention".into()))?;
         let new_seq_len = kv.seq_len + 1;
 
         // ================================================================
@@ -652,10 +697,11 @@ impl ComputeBackend for MetalF32Backend {
                 // 27B {48,16,128,4}) populated in init() from hyperparams.gdn_dims().
                 let gdn_num_v_heads = s.gdn_num_v_heads; // ssm.time_step_rank
                 let gdn_num_k_heads = s.gdn_num_k_heads; // ssm.group_count
-                let gdn_head_dim = s.gdn_head_dim;       // ssm.state_size
-                // Fused QKV channels: 2 * (num_k_heads*head_dim) + num_v_heads*head_dim
-                //   9B = 8192, 27B = 10240.
-                let gdn_qkv_dim = 2 * gdn_num_k_heads * gdn_head_dim + gdn_num_v_heads * gdn_head_dim;
+                let gdn_head_dim = s.gdn_head_dim; // ssm.state_size
+                                                   // Fused QKV channels: 2 * (num_k_heads*head_dim) + num_v_heads*head_dim
+                                                   //   9B = 8192, 27B = 10240.
+                let gdn_qkv_dim =
+                    2 * gdn_num_k_heads * gdn_head_dim + gdn_num_v_heads * gdn_head_dim;
                 // V / gate / output-projection width = num_v_heads * head_dim
                 //   9B = 4096, 27B = 6144.
                 let gdn_q_dim = gdn_num_v_heads * gdn_head_dim;
@@ -681,33 +727,42 @@ impl ComputeBackend for MetalF32Backend {
 
                 // Allocate GDN scratch buffers if not yet done (first GDN layer).
                 if s.gdn_alpha_buf.is_none() {
-                    s.gdn_alpha_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
-                        RuntimeError::Compute("Failed to allocate GDN alpha buf".into())
-                    })?);
-                    s.gdn_beta_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
-                        RuntimeError::Compute("Failed to allocate GDN beta buf".into())
-                    })?);
-                    s.gdn_output_buf = Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
-                        RuntimeError::Compute("Failed to allocate GDN output buf".into())
-                    })?);
-                    s.gdn_ssm_proj_buf = Some(self.device.new_buffer(hidden_dim * 4).ok_or_else(|| {
-                        RuntimeError::Compute("Failed to allocate GDN ssm_proj buf".into())
-                    })?);
-                    s.gdn_gate_sigmoid_buf = Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
-                        RuntimeError::Compute("Failed to allocate GDN gate sigmoid buf".into())
-                    })?);
-                    s.gdn_normed_out_buf = Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
-                        RuntimeError::Compute("Failed to allocate GDN normed_out buf".into())
-                    })?);
-                    s.gdn_alpha_raw_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
-                        RuntimeError::Compute("Failed to allocate GDN alpha_raw buf".into())
-                    })?);
-                    s.gdn_beta_raw_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
-                        RuntimeError::Compute("Failed to allocate GDN beta_raw buf".into())
-                    })?);
-                    s.gdn_qkv_conv_buf = Some(self.device.new_buffer(gdn_qkv_dim * 4).ok_or_else(|| {
-                        RuntimeError::Compute("Failed to allocate GDN qkv_conv buf".into())
-                    })?);
+                    s.gdn_alpha_buf =
+                        Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
+                            RuntimeError::Compute("Failed to allocate GDN alpha buf".into())
+                        })?);
+                    s.gdn_beta_buf =
+                        Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
+                            RuntimeError::Compute("Failed to allocate GDN beta buf".into())
+                        })?);
+                    s.gdn_output_buf =
+                        Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
+                            RuntimeError::Compute("Failed to allocate GDN output buf".into())
+                        })?);
+                    s.gdn_ssm_proj_buf =
+                        Some(self.device.new_buffer(hidden_dim * 4).ok_or_else(|| {
+                            RuntimeError::Compute("Failed to allocate GDN ssm_proj buf".into())
+                        })?);
+                    s.gdn_gate_sigmoid_buf =
+                        Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
+                            RuntimeError::Compute("Failed to allocate GDN gate sigmoid buf".into())
+                        })?);
+                    s.gdn_normed_out_buf =
+                        Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
+                            RuntimeError::Compute("Failed to allocate GDN normed_out buf".into())
+                        })?);
+                    s.gdn_alpha_raw_buf =
+                        Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
+                            RuntimeError::Compute("Failed to allocate GDN alpha_raw buf".into())
+                        })?);
+                    s.gdn_beta_raw_buf =
+                        Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
+                            RuntimeError::Compute("Failed to allocate GDN beta_raw buf".into())
+                        })?);
+                    s.gdn_qkv_conv_buf =
+                        Some(self.device.new_buffer(gdn_qkv_dim * 4).ok_or_else(|| {
+                            RuntimeError::Compute("Failed to allocate GDN qkv_conv buf".into())
+                        })?);
                 }
             }
         }
@@ -717,9 +772,10 @@ impl ComputeBackend for MetalF32Backend {
         // Previous: 3 command buffers × 22 layers = 66 sync barriers/token.
         // Now: 1 command buffer × 22 layers = 22 sync barriers/token.
         // ================================================================
-        let cmd = self.queue.new_command_buffer().ok_or_else(|| {
-            RuntimeError::Compute("Failed to create command buffer".into())
-        })?;
+        let cmd = self
+            .queue
+            .new_command_buffer()
+            .ok_or_else(|| RuntimeError::Compute("Failed to create command buffer".into()))?;
 
         // ================================================================
         // GDN vs softmax attention routing.
@@ -777,591 +833,727 @@ impl ComputeBackend for MetalF32Backend {
                 ffn_gate_inp_shexp_off: st.ffn_gate_inp_shexp.map(|t| base_off + t.offset),
             };
 
-            let new_conv_pos = Self::encode_gdn_layer_decode(
-                &cmd, pipelines, s, layer_buf, &gdn_meta, gdn_idx,
-            )?;
+            let new_conv_pos =
+                Self::encode_gdn_layer_decode(&cmd, pipelines, s, layer_buf, &gdn_meta, gdn_idx)?;
             s.gdn_conv_positions[gdn_idx] = new_conv_pos;
         } else {
-        // --- Encoder 1: Attention RMSNorm ---
-        {
-            let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder".into())
-            })?;
-            let dim_u32 = hidden_dim as u32;
-            enc.set_pipeline_state(&pipelines.rmsnorm_bytes);
-            enc.set_buffer(&s.x_buf, 0, 0);
-            enc.set_buffer(layer_buf, attn_norm_off, 1);
-            enc.set_buffer(&s.normed_buf, 0, 2);
-            enc.set_bytes(&dim_u32.to_le_bytes(), 3);
-            enc.set_bytes(&eps.to_le_bytes(), 4);
-            enc.dispatch_threadgroups(
-                MTLSize::new(1, 1, 1),
-                MTLSize::new(norm_tg_size, 1, 1),
-            );
-            enc.end_encoding();
-        }
+            // --- Encoder 1: Attention RMSNorm ---
+            {
+                let enc = cmd
+                    .new_compute_encoder()
+                    .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
+                let dim_u32 = hidden_dim as u32;
+                enc.set_pipeline_state(&pipelines.rmsnorm_bytes);
+                enc.set_buffer(&s.x_buf, 0, 0);
+                enc.set_buffer(layer_buf, attn_norm_off, 1);
+                enc.set_buffer(&s.normed_buf, 0, 2);
+                enc.set_bytes(&dim_u32.to_le_bytes(), 3);
+                enc.set_bytes(&eps.to_le_bytes(), 4);
+                enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(norm_tg_size, 1, 1));
+                enc.end_encoding();
+            }
 
-        // --- Encoder 2: QKV projection ---
-        // Two paths: Q+gate fusion (Qwen3.5 full-attention) vs fused QKV (standard).
-        let has_qgate_fusion = st.attn_q_norm.is_some();
-        let q_byte_off: u64 = 0;
-        let k_byte_off: u64 = (q_dim * 4) as u64;
-        let v_byte_off: u64 = ((q_dim + kv_dim) * 4) as u64;
-        // Use partial rotary dimension when set (e.g. Qwen3.5: rotary_dim=64, not head_dim=256).
-        let rope_half_dim = if s.rotary_dim > 0 && s.rotary_dim < head_dim { s.rotary_dim / 2 } else { half_dim };
-        let use_partial_rope = rope_half_dim != half_dim;
+            // --- Encoder 2: QKV projection ---
+            // Two paths: Q+gate fusion (Qwen3.5 full-attention) vs fused QKV (standard).
+            let has_qgate_fusion = st.attn_q_norm.is_some();
+            let q_byte_off: u64 = 0;
+            let k_byte_off: u64 = (q_dim * 4) as u64;
+            let v_byte_off: u64 = ((q_dim + kv_dim) * 4) as u64;
+            // Use partial rotary dimension when set (e.g. Qwen3.5: rotary_dim=64, not head_dim=256).
+            let rope_half_dim = if s.rotary_dim > 0 && s.rotary_dim < head_dim {
+                s.rotary_dim / 2
+            } else {
+                half_dim
+            };
+            let use_partial_rope = rope_half_dim != half_dim;
 
-        if has_qgate_fusion {
-            // Q+gate fusion path (Qwen3.5 full-attention layers).
-            // Q weight [hidden, q_dim*2] produces interleaved [Q_h0, gate_h0, Q_h1, gate_h1, ...].
-            // K and V come from separate wk, wv weights.
-            let qgate_dim = q_dim * 2;
-            {
-                let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder for Q+gate matmul".into())
-                })?;
-                let tg = match st.wq.quant {
-                    QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2); 128u64 },
-                    QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); 128u64 },
-                    QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2); 128u64 },
-                    QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2); 128u64 },
-                    _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32); matmul_tg_size },
-                };
-                enc.set_buffer(layer_buf, wq_off, 0);
-                enc.set_buffer(&s.normed_buf, 0, 1);
-                enc.set_buffer(&s.qkv_buf, 0, 2);
-                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                if matches!(st.wq.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
-                    enc.set_bytes(&(qgate_dim as u32).to_le_bytes(), 4);
-                }
-                let n_tg = match st.wq.quant {
-                    QuantScheme::Q8_0 => ((qgate_dim as u64) + 1) / 2,
-                    QuantScheme::Q4_0 => ((qgate_dim as u64) + 1) / 2,
-                    QuantScheme::F16 => ((qgate_dim as u64) + 1) / 2,
-                    QuantScheme::Bf16 => ((qgate_dim as u64) + 1) / 2,
-                    _ => qgate_dim as u64,
-                };
-                enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(tg, 1, 1));
-                enc.end_encoding();
-            }
-            // De-interleave Q+gate -> q_buf + gate_buf
-            {
-                let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder for deinterleave".into())
-                })?;
-                let pso = pipelines.deinterleave_qgate.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute("deinterleave_qgate pipeline not compiled".into())
-                })?;
-                enc.set_pipeline_state(pso);
-                enc.set_buffer(&s.qkv_buf, 0, 0);
-                enc.set_buffer(&s.q_buf, 0, 1);
-                enc.set_buffer(&s.gate_buf, 0, 2);
-                enc.set_bytes(&(head_dim as u32).to_le_bytes(), 3);
-                enc.set_bytes(&(num_heads as u32).to_le_bytes(), 4);
-                let di_tg = 256u64.min(q_dim as u64).max(1);
-                enc.dispatch_threadgroups(
-                    MTLSize::new((q_dim as u64).div_ceil(di_tg), 1, 1),
-                    MTLSize::new(di_tg, 1, 1),
-                );
-                enc.end_encoding();
-            }
-            // Project K from wk
-            {
-                let wk_off_val = base_off + st.wk.offset;
-                let wk_quant = st.wk.quant;
-                let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder for K matmul".into())
-                })?;
-                let tg = match wk_quant {
-                    QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2); 128u64 },
-                    QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); 128u64 },
-                    QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2); 128u64 },
-                    QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2); 128u64 },
-                    _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32); matmul_tg_size },
-                };
-                enc.set_buffer(layer_buf, wk_off_val, 0);
-                enc.set_buffer(&s.normed_buf, 0, 1);
-                enc.set_buffer(&s.k_buf, 0, 2);
-                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                if matches!(wk_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
-                    enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
-                }
-                let n_tg = match wk_quant {
-                    QuantScheme::Q8_0 => ((kv_dim as u64) + 1) / 2,
-                    QuantScheme::Q4_0 => ((kv_dim as u64) + 1) / 2,
-                    QuantScheme::F16 => ((kv_dim as u64) + 1) / 2,
-                    QuantScheme::Bf16 => ((kv_dim as u64) + 1) / 2,
-                    _ => kv_dim as u64,
-                };
-                enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(tg, 1, 1));
-                enc.end_encoding();
-            }
-            // Project V from wv
-            {
-                let wv_off_val = base_off + st.wv.offset;
-                let wv_quant = st.wv.quant;
-                let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder for V matmul".into())
-                })?;
-                let tg = match wv_quant {
-                    QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2); 128u64 },
-                    QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); 128u64 },
-                    QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2); 128u64 },
-                    QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2); 128u64 },
-                    _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32); matmul_tg_size },
-                };
-                enc.set_buffer(layer_buf, wv_off_val, 0);
-                enc.set_buffer(&s.normed_buf, 0, 1);
-                enc.set_buffer(&s.v_buf, 0, 2);
-                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                if matches!(wv_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
-                    enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
-                }
-                let n_tg = match wv_quant {
-                    QuantScheme::Q8_0 => ((kv_dim as u64) + 1) / 2,
-                    QuantScheme::Q4_0 => ((kv_dim as u64) + 1) / 2,
-                    QuantScheme::F16 => ((kv_dim as u64) + 1) / 2,
-                    QuantScheme::Bf16 => ((kv_dim as u64) + 1) / 2,
-                    _ => kv_dim as u64,
-                };
-                enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(tg, 1, 1));
-                enc.end_encoding();
-            }
-            // Per-head Q/K RMSNorm
-            if let (Some(ref q_norm), Some(ref k_norm)) = (&st.attn_q_norm, &st.attn_k_norm) {
-                let q_norm_off = base_off + q_norm.offset;
-                let k_norm_off = base_off + k_norm.offset;
-                let pso = pipelines.rmsnorm_per_head.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute("rmsnorm_per_head pipeline not compiled".into())
-                })?;
-                let head_dim_u32 = head_dim as u32;
-                let tg_rms = 256u64.min(head_dim as u64).max(32);
-                // Q RMSNorm
+            if has_qgate_fusion {
+                // Q+gate fusion path (Qwen3.5 full-attention layers).
+                // Q weight [hidden, q_dim*2] produces interleaved [Q_h0, gate_h0, Q_h1, gate_h1, ...].
+                // K and V come from separate wk, wv weights.
+                let qgate_dim = q_dim * 2;
                 {
                     let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                        RuntimeError::Compute("Failed to create encoder for Q RMSNorm".into())
+                        RuntimeError::Compute("Failed to create encoder for Q+gate matmul".into())
+                    })?;
+                    let tg = match st.wq.quant {
+                        QuantScheme::Q8_0 => {
+                            enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2);
+                            128u64
+                        }
+                        QuantScheme::Q4_0 => {
+                            enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2);
+                            128u64
+                        }
+                        QuantScheme::F16 => {
+                            enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
+                            128u64
+                        }
+                        QuantScheme::Bf16 => {
+                            enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                            128u64
+                        }
+                        _ => {
+                            enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
+                            matmul_tg_size
+                        }
+                    };
+                    enc.set_buffer(layer_buf, wq_off, 0);
+                    enc.set_buffer(&s.normed_buf, 0, 1);
+                    enc.set_buffer(&s.qkv_buf, 0, 2);
+                    enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                    if matches!(
+                        st.wq.quant,
+                        QuantScheme::Q8_0
+                            | QuantScheme::Q4_0
+                            | QuantScheme::F16
+                            | QuantScheme::Bf16
+                    ) {
+                        enc.set_bytes(&(qgate_dim as u32).to_le_bytes(), 4);
+                    }
+                    let n_tg = match st.wq.quant {
+                        QuantScheme::Q8_0 => ((qgate_dim as u64) + 1) / 2,
+                        QuantScheme::Q4_0 => ((qgate_dim as u64) + 1) / 2,
+                        QuantScheme::F16 => ((qgate_dim as u64) + 1) / 2,
+                        QuantScheme::Bf16 => ((qgate_dim as u64) + 1) / 2,
+                        _ => qgate_dim as u64,
+                    };
+                    enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(tg, 1, 1));
+                    enc.end_encoding();
+                }
+                // De-interleave Q+gate -> q_buf + gate_buf
+                {
+                    let enc = cmd.new_compute_encoder().ok_or_else(|| {
+                        RuntimeError::Compute("Failed to create encoder for deinterleave".into())
+                    })?;
+                    let pso = pipelines.deinterleave_qgate.as_ref().ok_or_else(|| {
+                        RuntimeError::Compute("deinterleave_qgate pipeline not compiled".into())
                     })?;
                     enc.set_pipeline_state(pso);
-                    enc.set_buffer(&s.q_buf, 0, 0);
-                    enc.set_buffer(layer_buf, q_norm_off, 1);
-                    enc.set_buffer(&s.q_buf, 0, 2);
-                    enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
-                    enc.set_bytes(&eps.to_le_bytes(), 4);
+                    enc.set_buffer(&s.qkv_buf, 0, 0);
+                    enc.set_buffer(&s.q_buf, 0, 1);
+                    enc.set_buffer(&s.gate_buf, 0, 2);
+                    enc.set_bytes(&(head_dim as u32).to_le_bytes(), 3);
+                    enc.set_bytes(&(num_heads as u32).to_le_bytes(), 4);
+                    let di_tg = 256u64.min(q_dim as u64).max(1);
                     enc.dispatch_threadgroups(
-                        MTLSize::new(num_heads as u64, 1, 1),
-                        MTLSize::new(tg_rms, 1, 1),
+                        MTLSize::new((q_dim as u64).div_ceil(di_tg), 1, 1),
+                        MTLSize::new(di_tg, 1, 1),
                     );
                     enc.end_encoding();
                 }
-                // K RMSNorm
+                // Project K from wk
                 {
+                    let wk_off_val = base_off + st.wk.offset;
+                    let wk_quant = st.wk.quant;
                     let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                        RuntimeError::Compute("Failed to create encoder for K RMSNorm".into())
+                        RuntimeError::Compute("Failed to create encoder for K matmul".into())
                     })?;
-                    enc.set_pipeline_state(pso);
-                    enc.set_buffer(&s.k_buf, 0, 0);
-                    enc.set_buffer(layer_buf, k_norm_off, 1);
+                    let tg = match wk_quant {
+                        QuantScheme::Q8_0 => {
+                            enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2);
+                            128u64
+                        }
+                        QuantScheme::Q4_0 => {
+                            enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2);
+                            128u64
+                        }
+                        QuantScheme::F16 => {
+                            enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
+                            128u64
+                        }
+                        QuantScheme::Bf16 => {
+                            enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                            128u64
+                        }
+                        _ => {
+                            enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
+                            matmul_tg_size
+                        }
+                    };
+                    enc.set_buffer(layer_buf, wk_off_val, 0);
+                    enc.set_buffer(&s.normed_buf, 0, 1);
                     enc.set_buffer(&s.k_buf, 0, 2);
-                    enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
-                    enc.set_bytes(&eps.to_le_bytes(), 4);
+                    enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                    if matches!(
+                        wk_quant,
+                        QuantScheme::Q8_0
+                            | QuantScheme::Q4_0
+                            | QuantScheme::F16
+                            | QuantScheme::Bf16
+                    ) {
+                        enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
+                    }
+                    let n_tg = match wk_quant {
+                        QuantScheme::Q8_0 => ((kv_dim as u64) + 1) / 2,
+                        QuantScheme::Q4_0 => ((kv_dim as u64) + 1) / 2,
+                        QuantScheme::F16 => ((kv_dim as u64) + 1) / 2,
+                        QuantScheme::Bf16 => ((kv_dim as u64) + 1) / 2,
+                        _ => kv_dim as u64,
+                    };
+                    enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(tg, 1, 1));
+                    enc.end_encoding();
+                }
+                // Project V from wv
+                {
+                    let wv_off_val = base_off + st.wv.offset;
+                    let wv_quant = st.wv.quant;
+                    let enc = cmd.new_compute_encoder().ok_or_else(|| {
+                        RuntimeError::Compute("Failed to create encoder for V matmul".into())
+                    })?;
+                    let tg = match wv_quant {
+                        QuantScheme::Q8_0 => {
+                            enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2);
+                            128u64
+                        }
+                        QuantScheme::Q4_0 => {
+                            enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2);
+                            128u64
+                        }
+                        QuantScheme::F16 => {
+                            enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
+                            128u64
+                        }
+                        QuantScheme::Bf16 => {
+                            enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                            128u64
+                        }
+                        _ => {
+                            enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
+                            matmul_tg_size
+                        }
+                    };
+                    enc.set_buffer(layer_buf, wv_off_val, 0);
+                    enc.set_buffer(&s.normed_buf, 0, 1);
+                    enc.set_buffer(&s.v_buf, 0, 2);
+                    enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                    if matches!(
+                        wv_quant,
+                        QuantScheme::Q8_0
+                            | QuantScheme::Q4_0
+                            | QuantScheme::F16
+                            | QuantScheme::Bf16
+                    ) {
+                        enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
+                    }
+                    let n_tg = match wv_quant {
+                        QuantScheme::Q8_0 => ((kv_dim as u64) + 1) / 2,
+                        QuantScheme::Q4_0 => ((kv_dim as u64) + 1) / 2,
+                        QuantScheme::F16 => ((kv_dim as u64) + 1) / 2,
+                        QuantScheme::Bf16 => ((kv_dim as u64) + 1) / 2,
+                        _ => kv_dim as u64,
+                    };
+                    enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(tg, 1, 1));
+                    enc.end_encoding();
+                }
+                // Per-head Q/K RMSNorm
+                if let (Some(ref q_norm), Some(ref k_norm)) = (&st.attn_q_norm, &st.attn_k_norm) {
+                    let q_norm_off = base_off + q_norm.offset;
+                    let k_norm_off = base_off + k_norm.offset;
+                    let pso = pipelines.rmsnorm_per_head.as_ref().ok_or_else(|| {
+                        RuntimeError::Compute("rmsnorm_per_head pipeline not compiled".into())
+                    })?;
+                    let head_dim_u32 = head_dim as u32;
+                    let tg_rms = 256u64.min(head_dim as u64).max(32);
+                    // Q RMSNorm
+                    {
+                        let enc = cmd.new_compute_encoder().ok_or_else(|| {
+                            RuntimeError::Compute("Failed to create encoder for Q RMSNorm".into())
+                        })?;
+                        enc.set_pipeline_state(pso);
+                        enc.set_buffer(&s.q_buf, 0, 0);
+                        enc.set_buffer(layer_buf, q_norm_off, 1);
+                        enc.set_buffer(&s.q_buf, 0, 2);
+                        enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
+                        enc.set_bytes(&eps.to_le_bytes(), 4);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(num_heads as u64, 1, 1),
+                            MTLSize::new(tg_rms, 1, 1),
+                        );
+                        enc.end_encoding();
+                    }
+                    // K RMSNorm
+                    {
+                        let enc = cmd.new_compute_encoder().ok_or_else(|| {
+                            RuntimeError::Compute("Failed to create encoder for K RMSNorm".into())
+                        })?;
+                        enc.set_pipeline_state(pso);
+                        enc.set_buffer(&s.k_buf, 0, 0);
+                        enc.set_buffer(layer_buf, k_norm_off, 1);
+                        enc.set_buffer(&s.k_buf, 0, 2);
+                        enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
+                        enc.set_bytes(&eps.to_le_bytes(), 4);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(num_kv_heads as u64, 1, 1),
+                            MTLSize::new(tg_rms, 1, 1),
+                        );
+                        enc.end_encoding();
+                    }
+                }
+                // Assemble Q|K|V into qkv_buf for RoPE/attention
+                {
+                    let enc = cmd.new_compute_encoder().ok_or_else(|| {
+                        RuntimeError::Compute("Failed to create encoder for QKV assembly".into())
+                    })?;
+                    enc.set_pipeline_state(&pipelines.copy_buffer);
+                    // Copy Q
+                    enc.set_buffer(&s.q_buf, 0, 0);
+                    enc.set_buffer(&s.qkv_buf, 0, 1);
+                    let tg_q = 256u64.min(q_dim as u64).max(1);
                     enc.dispatch_threadgroups(
-                        MTLSize::new(num_kv_heads as u64, 1, 1),
-                        MTLSize::new(tg_rms, 1, 1),
+                        MTLSize::new((q_dim as u64).div_ceil(tg_q), 1, 1),
+                        MTLSize::new(tg_q, 1, 1),
+                    );
+                    // Copy K
+                    enc.set_buffer(&s.k_buf, 0, 0);
+                    enc.set_buffer(&s.qkv_buf, k_byte_off, 1);
+                    let tg_k = 256u64.min(kv_dim as u64).max(1);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new((kv_dim as u64).div_ceil(tg_k), 1, 1),
+                        MTLSize::new(tg_k, 1, 1),
+                    );
+                    // Copy V
+                    enc.set_buffer(&s.v_buf, 0, 0);
+                    enc.set_buffer(&s.qkv_buf, v_byte_off, 1);
+                    let tg_v = 256u64.min(kv_dim as u64).max(1);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new((kv_dim as u64).div_ceil(tg_v), 1, 1),
+                        MTLSize::new(tg_v, 1, 1),
                     );
                     enc.end_encoding();
                 }
-            }
-            // Assemble Q|K|V into qkv_buf for RoPE/attention
-            {
+            } else {
+                // Fused QKV projection (standard path: Wq|Wk|Wv contiguous).
+                {
+                    let has_bias = st.bq.is_some() && st.bk.is_some() && st.bv.is_some();
+                    let enc = cmd
+                        .new_compute_encoder()
+                        .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
+                    let in_dim_u32 = hidden_dim as u32;
+
+                    let tg = if has_bias
+                        && matches!(
+                            st.wq.quant,
+                            QuantScheme::Q8_0
+                                | QuantScheme::Q4_0
+                                | QuantScheme::F16
+                                | QuantScheme::Bf16
+                        ) {
+                        match st.wq.quant {
+                            QuantScheme::Q8_0 => enc.set_pipeline_state(
+                                &pipelines.dequant_matmul_q8_0_deferred_bias_nr2,
+                            ),
+                            QuantScheme::Q4_0 => enc.set_pipeline_state(
+                                &pipelines.dequant_matmul_q4_0_deferred_bias_nr2,
+                            ),
+                            QuantScheme::F16 => {
+                                enc.set_pipeline_state(&pipelines.matmul_f16_deferred_bias_nr2)
+                            }
+                            QuantScheme::Bf16 => {
+                                enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_bias_nr2)
+                            }
+                            _ => unreachable!(),
+                        };
+                        128u64
+                    } else {
+                        match st.wq.quant {
+                            QuantScheme::Q8_0 => {
+                                enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2);
+                                128u64
+                            }
+                            QuantScheme::Q4_0 => {
+                                enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2);
+                                128u64
+                            }
+                            QuantScheme::F16 => {
+                                enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
+                                128u64
+                            }
+                            QuantScheme::Bf16 => {
+                                enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                                128u64
+                            }
+                            _ => {
+                                enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
+                                matmul_tg_size
+                            }
+                        }
+                    };
+                    // Weight pointer starts at Wq; contiguous through Wk, Wv
+                    enc.set_buffer(layer_buf, wq_off, 0);
+                    enc.set_buffer(&s.normed_buf, 0, 1);
+                    enc.set_buffer(&s.qkv_buf, 0, 2);
+                    enc.set_bytes(&in_dim_u32.to_le_bytes(), 3);
+                    let qkv_out_dim_u32 = qkv_dim as u32;
+                    if matches!(
+                        st.wq.quant,
+                        QuantScheme::Q8_0
+                            | QuantScheme::Q4_0
+                            | QuantScheme::F16
+                            | QuantScheme::Bf16
+                    ) {
+                        enc.set_bytes(&qkv_out_dim_u32.to_le_bytes(), 4);
+                    }
+                    if has_bias
+                        && matches!(
+                            st.wq.quant,
+                            QuantScheme::Q8_0
+                                | QuantScheme::Q4_0
+                                | QuantScheme::F16
+                                | QuantScheme::Bf16
+                        )
+                    {
+                        let bq_off_abs = base_off + st.bq.as_ref().unwrap().offset;
+                        let bk_off_abs = base_off + st.bk.as_ref().unwrap().offset;
+                        let bv_off_abs = base_off + st.bv.as_ref().unwrap().offset;
+                        enc.set_buffer(layer_buf, bq_off_abs, 5);
+                        enc.set_buffer(layer_buf, bk_off_abs, 6);
+                        enc.set_buffer(layer_buf, bv_off_abs, 7);
+                        enc.set_bytes(&(q_dim as u32).to_le_bytes(), 8);
+                        let qk_dim = (q_dim + kv_dim) as u32;
+                        enc.set_bytes(&qk_dim.to_le_bytes(), 9);
+                    }
+                    let n_tg_qkv = if tg == 64 {
+                        ((qkv_dim as u64) + 7) / 8 // (dead path: Q8_0 now uses deferred with tg=128)
+                    } else {
+                        match st.wq.quant {
+                            QuantScheme::Q8_0 => ((qkv_dim as u64) + 1) / 2,
+                            QuantScheme::Q4_0 => ((qkv_dim as u64) + 1) / 2,
+                            QuantScheme::F16 => ((qkv_dim as u64) + 1) / 2,
+                            QuantScheme::Bf16 => ((qkv_dim as u64) + 1) / 2,
+                            _ => qkv_dim as u64,
+                        }
+                    };
+                    enc.dispatch_threadgroups(MTLSize::new(n_tg_qkv, 1, 1), MTLSize::new(tg, 1, 1));
+
+                    enc.end_encoding();
+                }
+
+                // --- QKV bias addition fallback (F32 weights with bias only) ---
+                if !matches!(
+                    st.wq.quant,
+                    QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
+                ) && (st.bq.is_some() || st.bk.is_some() || st.bv.is_some())
+                {
+                    let enc = cmd.new_compute_encoder().ok_or_else(|| {
+                        RuntimeError::Compute("Failed to create encoder for QKV bias".into())
+                    })?;
+                    enc.set_pipeline_state(&pipelines.bias_add);
+                    if let Some(ref bq) = st.bq {
+                        let bq_off = base_off + bq.offset;
+                        enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
+                        enc.set_buffer(layer_buf, bq_off, 1);
+                        enc.set_bytes(&(q_dim as u32).to_le_bytes(), 2);
+                        let n_tg_bq = (q_dim as u64 + 255) / 256;
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(n_tg_bq, 1, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                    }
+                    if let Some(ref bk) = st.bk {
+                        let bk_off = base_off + bk.offset;
+                        enc.set_buffer(&s.qkv_buf, k_byte_off, 0);
+                        enc.set_buffer(layer_buf, bk_off, 1);
+                        enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 2);
+                        let n_tg_bk = (kv_dim as u64 + 255) / 256;
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(n_tg_bk, 1, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                    }
+                    if let Some(ref bv) = st.bv {
+                        let bv_off = base_off + bv.offset;
+                        enc.set_buffer(&s.qkv_buf, v_byte_off, 0);
+                        enc.set_buffer(layer_buf, bv_off, 1);
+                        enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 2);
+                        let n_tg_bv = (kv_dim as u64 + 255) / 256;
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(n_tg_bv, 1, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                    }
+                    enc.end_encoding();
+                }
+            } // end if has_qgate_fusion else
+
+            // --- RoPE + KV cache write ---
+            // For partial RoPE (Qwen3.5: rotary_dim=64 < head_dim=256), use separate dispatches.
+            // For full RoPE, use fused dispatch.
+            if use_partial_rope {
+                // Separate RoPE Q + RoPE K + KV cache write (partial rotary dim).
                 let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder for QKV assembly".into())
+                    RuntimeError::Compute("Failed to create encoder for partial RoPE".into())
                 })?;
-                enc.set_pipeline_state(&pipelines.copy_buffer);
-                // Copy Q
-                enc.set_buffer(&s.q_buf, 0, 0);
-                enc.set_buffer(&s.qkv_buf, 0, 1);
-                let tg_q = 256u64.min(q_dim as u64).max(1);
+                let pos_offset_u32 = (seq_pos * rope_half_dim) as u32;
+                let rope_pipe = if s.rope_neox {
+                    pipelines.rope_neox.as_ref().unwrap_or(&pipelines.rope)
+                } else {
+                    &pipelines.rope
+                };
+                // RoPE Q
+                enc.set_pipeline_state(rope_pipe);
+                enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
+                enc.set_buffer(&s.rope_cos_buf, 0, 1);
+                enc.set_buffer(&s.rope_sin_buf, 0, 2);
+                enc.set_bytes(&(num_heads as u32).to_le_bytes(), 3);
+                enc.set_bytes(&(head_dim as u32).to_le_bytes(), 4);
+                enc.set_bytes(&(rope_half_dim as u32).to_le_bytes(), 5);
+                enc.set_bytes(&pos_offset_u32.to_le_bytes(), 6);
+                let q_total_half = (num_heads * rope_half_dim) as u64;
+                let tg_q = 64u64.min(q_total_half.max(1));
                 enc.dispatch_threadgroups(
-                    MTLSize::new((q_dim as u64).div_ceil(tg_q), 1, 1),
+                    MTLSize::new(q_total_half.div_ceil(tg_q), 1, 1),
                     MTLSize::new(tg_q, 1, 1),
                 );
-                // Copy K
-                enc.set_buffer(&s.k_buf, 0, 0);
-                enc.set_buffer(&s.qkv_buf, k_byte_off, 1);
-                let tg_k = 256u64.min(kv_dim as u64).max(1);
+                // RoPE K
+                enc.set_buffer(&s.qkv_buf, k_byte_off, 0);
+                enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 3);
+                let k_total_half = (num_kv_heads * rope_half_dim) as u64;
+                let tg_k = 64u64.min(k_total_half.max(1));
                 enc.dispatch_threadgroups(
-                    MTLSize::new((kv_dim as u64).div_ceil(tg_k), 1, 1),
+                    MTLSize::new(k_total_half.div_ceil(tg_k), 1, 1),
                     MTLSize::new(tg_k, 1, 1),
                 );
-                // Copy V
-                enc.set_buffer(&s.v_buf, 0, 0);
+                // KV cache write
+                enc.set_pipeline_state(&pipelines.write_kv_cache);
+                enc.set_buffer(&s.qkv_buf, k_byte_off, 0);
                 enc.set_buffer(&s.qkv_buf, v_byte_off, 1);
-                let tg_v = 256u64.min(kv_dim as u64).max(1);
+                enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 2);
+                enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 3);
+                enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
+                enc.set_bytes(&(seq_pos as u32).to_le_bytes(), 5);
+                enc.set_bytes(&(s.max_seq_len as u32).to_le_bytes(), 6);
+                let tg_kv = 64u64.min(kv_dim as u64).max(1);
                 enc.dispatch_threadgroups(
-                    MTLSize::new((kv_dim as u64).div_ceil(tg_v), 1, 1),
-                    MTLSize::new(tg_v, 1, 1),
+                    MTLSize::new((kv_dim as u64).div_ceil(tg_kv), 1, 1),
+                    MTLSize::new(tg_kv, 1, 1),
+                );
+                enc.end_encoding();
+            } else {
+                // Fused RoPE Q + RoPE K + KV cache write (full rotary dim).
+                let enc = cmd
+                    .new_compute_encoder()
+                    .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
+                let pos_offset_u32 = (seq_pos * half_dim) as u32;
+                let fused_pipe = if s.rope_neox {
+                    pipelines
+                        .fused_rope_neox_kv_write
+                        .as_ref()
+                        .unwrap_or(&pipelines.fused_rope_kv_write)
+                } else {
+                    &pipelines.fused_rope_kv_write
+                };
+                enc.set_pipeline_state(fused_pipe);
+                enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
+                enc.set_buffer(&s.qkv_buf, k_byte_off, 1);
+                enc.set_buffer(&s.qkv_buf, v_byte_off, 2);
+                enc.set_buffer(&s.rope_cos_buf, 0, 3);
+                enc.set_buffer(&s.rope_sin_buf, 0, 4);
+                enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 5);
+                enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 6);
+                enc.set_bytes(&(num_heads as u32).to_le_bytes(), 7);
+                enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 8);
+                enc.set_bytes(&(head_dim as u32).to_le_bytes(), 9);
+                enc.set_bytes(&(half_dim as u32).to_le_bytes(), 10);
+                enc.set_bytes(&pos_offset_u32.to_le_bytes(), 11);
+                enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 12);
+                enc.set_bytes(&(seq_pos as u32).to_le_bytes(), 13);
+                enc.set_bytes(&(s.max_seq_len as u32).to_le_bytes(), 14);
+                let total_threads =
+                    (num_heads * half_dim + num_kv_heads * half_dim + kv_dim) as u64;
+                let tg = 64u64.min(total_threads.max(1));
+                enc.dispatch_threadgroups(
+                    MTLSize::new(total_threads.div_ceil(tg), 1, 1),
+                    MTLSize::new(tg, 1, 1),
                 );
                 enc.end_encoding();
             }
-        } else {
-        // Fused QKV projection (standard path: Wq|Wk|Wv contiguous).
-        {
-            let has_bias = st.bq.is_some() && st.bk.is_some() && st.bv.is_some();
-            let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder".into())
-            })?;
-            let in_dim_u32 = hidden_dim as u32;
 
-            let tg = if has_bias && matches!(st.wq.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
-                match st.wq.quant {
-                    QuantScheme::Q8_0 => enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_bias_nr2),
-                    QuantScheme::Q4_0 => enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_bias_nr2),
-                    QuantScheme::F16 => enc.set_pipeline_state(&pipelines.matmul_f16_deferred_bias_nr2),
-                    QuantScheme::Bf16 => enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_bias_nr2),
-                    _ => unreachable!(),
-                };
-                128u64
-            } else {
-                match st.wq.quant {
-                    QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2); 128u64 },
-                    QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); 128u64 },
-                    QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2); 128u64 },
-                    QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2); 128u64 },
-                    _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32); matmul_tg_size },
-                }
-            };
-            // Weight pointer starts at Wq; contiguous through Wk, Wv
-            enc.set_buffer(layer_buf, wq_off, 0);
-            enc.set_buffer(&s.normed_buf, 0, 1);
-            enc.set_buffer(&s.qkv_buf, 0, 2);
-            enc.set_bytes(&in_dim_u32.to_le_bytes(), 3);
-            let qkv_out_dim_u32 = qkv_dim as u32;
-            if matches!(st.wq.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
-                enc.set_bytes(&qkv_out_dim_u32.to_le_bytes(), 4);
-            }
-            if has_bias && matches!(st.wq.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
-                let bq_off_abs = base_off + st.bq.as_ref().unwrap().offset;
-                let bk_off_abs = base_off + st.bk.as_ref().unwrap().offset;
-                let bv_off_abs = base_off + st.bv.as_ref().unwrap().offset;
-                enc.set_buffer(layer_buf, bq_off_abs, 5);
-                enc.set_buffer(layer_buf, bk_off_abs, 6);
-                enc.set_buffer(layer_buf, bv_off_abs, 7);
-                enc.set_bytes(&(q_dim as u32).to_le_bytes(), 8);
-                let qk_dim = (q_dim + kv_dim) as u32;
-                enc.set_bytes(&qk_dim.to_le_bytes(), 9);
-            }
-            let n_tg_qkv = if tg == 64 {
-                ((qkv_dim as u64) + 7) / 8  // (dead path: Q8_0 now uses deferred with tg=128)
-            } else {
-                match st.wq.quant {
-                    QuantScheme::Q8_0 => ((qkv_dim as u64) + 1) / 2,
-                    QuantScheme::Q4_0 => ((qkv_dim as u64) + 1) / 2,
-                    QuantScheme::F16 => ((qkv_dim as u64) + 1) / 2,
-                    QuantScheme::Bf16 => ((qkv_dim as u64) + 1) / 2,
-                    _ => qkv_dim as u64,
-                }
-            };
-            enc.dispatch_threadgroups(
-                MTLSize::new(n_tg_qkv, 1, 1),
-                MTLSize::new(tg, 1, 1),
-            );
+            // --- Encoder 8: Attention (flash decode for long KV, original for short) ---
+            //
+            // Flash Decoding splits the KV sequence into tiles processed by separate
+            // threadgroups, then reduces. This provides parallelism across the KV
+            // dimension which is critical when seq_len is large (e.g., 512+).
+            // For short sequences (<=128), the original single-threadgroup kernel
+            // is used since the overhead of the two-phase approach is not justified.
+            {
+                let num_heads_u32 = num_heads as u32;
+                let num_kv_heads_u32 = num_kv_heads as u32;
+                let head_dim_u32 = head_dim as u32;
+                let kv_dim_u32 = kv_dim as u32;
+                let seq_len_u32 = new_seq_len as u32;
+                let max_seq_len_u32 = s.max_seq_len as u32;
 
-            enc.end_encoding();
-        }
+                const FLASH_DECODE_TILE_SIZE: u32 = 256;
+                const FLASH_DECODE_THRESHOLD: usize = FLASH_DECODE_TILE_SIZE as usize + 1; // 257: single-tile is a no-op reduce
 
-        // --- QKV bias addition fallback (F32 weights with bias only) ---
-        if !matches!(st.wq.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16)
-            && (st.bq.is_some() || st.bk.is_some() || st.bv.is_some())
-        {
-            let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder for QKV bias".into())
-            })?;
-            enc.set_pipeline_state(&pipelines.bias_add);
-            if let Some(ref bq) = st.bq {
-                let bq_off = base_off + bq.offset;
-                enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
-                enc.set_buffer(layer_buf, bq_off, 1);
-                enc.set_bytes(&(q_dim as u32).to_le_bytes(), 2);
-                let n_tg_bq = (q_dim as u64 + 255) / 256;
-                enc.dispatch_threadgroups(MTLSize::new(n_tg_bq, 1, 1), MTLSize::new(256, 1, 1));
-            }
-            if let Some(ref bk) = st.bk {
-                let bk_off = base_off + bk.offset;
-                enc.set_buffer(&s.qkv_buf, k_byte_off, 0);
-                enc.set_buffer(layer_buf, bk_off, 1);
-                enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 2);
-                let n_tg_bk = (kv_dim as u64 + 255) / 256;
-                enc.dispatch_threadgroups(MTLSize::new(n_tg_bk, 1, 1), MTLSize::new(256, 1, 1));
-            }
-            if let Some(ref bv) = st.bv {
-                let bv_off = base_off + bv.offset;
-                enc.set_buffer(&s.qkv_buf, v_byte_off, 0);
-                enc.set_buffer(layer_buf, bv_off, 1);
-                enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 2);
-                let n_tg_bv = (kv_dim as u64 + 255) / 256;
-                enc.dispatch_threadgroups(MTLSize::new(n_tg_bv, 1, 1), MTLSize::new(256, 1, 1));
-            }
-            enc.end_encoding();
-        }
-        } // end if has_qgate_fusion else
+                if new_seq_len >= FLASH_DECODE_THRESHOLD {
+                    // --- Flash Decode Phase 1: tiled attention ---
+                    let tile_size_u32 = FLASH_DECODE_TILE_SIZE;
+                    let num_tiles = ((new_seq_len as u32) + tile_size_u32 - 1) / tile_size_u32;
+                    let num_tiles_u32 = num_tiles;
 
-        // --- RoPE + KV cache write ---
-        // For partial RoPE (Qwen3.5: rotary_dim=64 < head_dim=256), use separate dispatches.
-        // For full RoPE, use fused dispatch.
-        if use_partial_rope {
-            // Separate RoPE Q + RoPE K + KV cache write (partial rotary dim).
-            let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder for partial RoPE".into())
-            })?;
-            let pos_offset_u32 = (seq_pos * rope_half_dim) as u32;
-            let rope_pipe = if s.rope_neox {
-                pipelines.rope_neox.as_ref().unwrap_or(&pipelines.rope)
-            } else {
-                &pipelines.rope
-            };
-            // RoPE Q
-            enc.set_pipeline_state(rope_pipe);
-            enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
-            enc.set_buffer(&s.rope_cos_buf, 0, 1);
-            enc.set_buffer(&s.rope_sin_buf, 0, 2);
-            enc.set_bytes(&(num_heads as u32).to_le_bytes(), 3);
-            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 4);
-            enc.set_bytes(&(rope_half_dim as u32).to_le_bytes(), 5);
-            enc.set_bytes(&pos_offset_u32.to_le_bytes(), 6);
-            let q_total_half = (num_heads * rope_half_dim) as u64;
-            let tg_q = 64u64.min(q_total_half.max(1));
-            enc.dispatch_threadgroups(
-                MTLSize::new(q_total_half.div_ceil(tg_q), 1, 1),
-                MTLSize::new(tg_q, 1, 1),
-            );
-            // RoPE K
-            enc.set_buffer(&s.qkv_buf, k_byte_off, 0);
-            enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 3);
-            let k_total_half = (num_kv_heads * rope_half_dim) as u64;
-            let tg_k = 64u64.min(k_total_half.max(1));
-            enc.dispatch_threadgroups(
-                MTLSize::new(k_total_half.div_ceil(tg_k), 1, 1),
-                MTLSize::new(tg_k, 1, 1),
-            );
-            // KV cache write
-            enc.set_pipeline_state(&pipelines.write_kv_cache);
-            enc.set_buffer(&s.qkv_buf, k_byte_off, 0);
-            enc.set_buffer(&s.qkv_buf, v_byte_off, 1);
-            enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 2);
-            enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 3);
-            enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
-            enc.set_bytes(&(seq_pos as u32).to_le_bytes(), 5);
-            enc.set_bytes(&(s.max_seq_len as u32).to_le_bytes(), 6);
-            let tg_kv = 64u64.min(kv_dim as u64).max(1);
-            enc.dispatch_threadgroups(
-                MTLSize::new((kv_dim as u64).div_ceil(tg_kv), 1, 1),
-                MTLSize::new(tg_kv, 1, 1),
-            );
-            enc.end_encoding();
-        } else {
-            // Fused RoPE Q + RoPE K + KV cache write (full rotary dim).
-            let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder".into())
-            })?;
-            let pos_offset_u32 = (seq_pos * half_dim) as u32;
-            let fused_pipe = if s.rope_neox {
-                pipelines.fused_rope_neox_kv_write.as_ref().unwrap_or(&pipelines.fused_rope_kv_write)
-            } else {
-                &pipelines.fused_rope_kv_write
-            };
-            enc.set_pipeline_state(fused_pipe);
-            enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
-            enc.set_buffer(&s.qkv_buf, k_byte_off, 1);
-            enc.set_buffer(&s.qkv_buf, v_byte_off, 2);
-            enc.set_buffer(&s.rope_cos_buf, 0, 3);
-            enc.set_buffer(&s.rope_sin_buf, 0, 4);
-            enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 5);
-            enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 6);
-            enc.set_bytes(&(num_heads as u32).to_le_bytes(), 7);
-            enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 8);
-            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 9);
-            enc.set_bytes(&(half_dim as u32).to_le_bytes(), 10);
-            enc.set_bytes(&pos_offset_u32.to_le_bytes(), 11);
-            enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 12);
-            enc.set_bytes(&(seq_pos as u32).to_le_bytes(), 13);
-            enc.set_bytes(&(s.max_seq_len as u32).to_le_bytes(), 14);
-            let total_threads = (num_heads * half_dim + num_kv_heads * half_dim + kv_dim) as u64;
-            let tg = 64u64.min(total_threads.max(1));
-            enc.dispatch_threadgroups(
-                MTLSize::new(total_threads.div_ceil(tg), 1, 1),
-                MTLSize::new(tg, 1, 1),
-            );
-            enc.end_encoding();
-        }
+                    {
+                        let enc = cmd.new_compute_encoder().ok_or_else(|| {
+                            RuntimeError::Compute("Failed to create encoder".into())
+                        })?;
+                        enc.set_pipeline_state(&pipelines.flash_decode_attention);
+                        enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
+                        enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 1);
+                        enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 2);
+                        enc.set_buffer(&s.flash_decode_partial_buf, 0, 3);
+                        enc.set_bytes(&num_heads_u32.to_le_bytes(), 4);
+                        enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 5);
+                        enc.set_bytes(&head_dim_u32.to_le_bytes(), 6);
+                        enc.set_bytes(&kv_dim_u32.to_le_bytes(), 7);
+                        enc.set_bytes(&seq_len_u32.to_le_bytes(), 8);
+                        enc.set_bytes(&attn_scale.to_le_bytes(), 9);
+                        enc.set_bytes(&tile_size_u32.to_le_bytes(), 10);
+                        enc.set_bytes(&num_tiles_u32.to_le_bytes(), 11);
+                        enc.set_bytes(&max_seq_len_u32.to_le_bytes(), 12);
+                        // Each threadgroup gets 128 threads (tile_size=256, each thread handles multiple scores)
+                        // Use flattened 1D grid: threadgroup i = head * num_tiles + tile_idx
+                        let tg_threads = 128u64;
+                        let total_tgs = (num_heads as u64) * (num_tiles as u64);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(total_tgs, 1, 1),
+                            MTLSize::new(tg_threads, 1, 1),
+                        );
+                        enc.end_encoding();
+                    }
 
-        // --- Encoder 8: Attention (flash decode for long KV, original for short) ---
-        //
-        // Flash Decoding splits the KV sequence into tiles processed by separate
-        // threadgroups, then reduces. This provides parallelism across the KV
-        // dimension which is critical when seq_len is large (e.g., 512+).
-        // For short sequences (<=128), the original single-threadgroup kernel
-        // is used since the overhead of the two-phase approach is not justified.
-        {
-            let num_heads_u32 = num_heads as u32;
-            let num_kv_heads_u32 = num_kv_heads as u32;
-            let head_dim_u32 = head_dim as u32;
-            let kv_dim_u32 = kv_dim as u32;
-            let seq_len_u32 = new_seq_len as u32;
-            let max_seq_len_u32 = s.max_seq_len as u32;
-
-            const FLASH_DECODE_TILE_SIZE: u32 = 256;
-            const FLASH_DECODE_THRESHOLD: usize = FLASH_DECODE_TILE_SIZE as usize + 1; // 257: single-tile is a no-op reduce
-
-            if new_seq_len >= FLASH_DECODE_THRESHOLD {
-                // --- Flash Decode Phase 1: tiled attention ---
-                let tile_size_u32 = FLASH_DECODE_TILE_SIZE;
-                let num_tiles = ((new_seq_len as u32) + tile_size_u32 - 1) / tile_size_u32;
-                let num_tiles_u32 = num_tiles;
-
-                {
-                    let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                        RuntimeError::Compute("Failed to create encoder".into())
-                    })?;
-                    enc.set_pipeline_state(&pipelines.flash_decode_attention);
+                    // --- Flash Decode Phase 2: reduce across tiles ---
+                    {
+                        let enc = cmd.new_compute_encoder().ok_or_else(|| {
+                            RuntimeError::Compute("Failed to create encoder".into())
+                        })?;
+                        enc.set_pipeline_state(&pipelines.flash_decode_reduce);
+                        enc.set_buffer(&s.flash_decode_partial_buf, 0, 0);
+                        enc.set_buffer(&s.attn_out_buf, 0, 1);
+                        enc.set_bytes(&num_heads_u32.to_le_bytes(), 2);
+                        enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
+                        enc.set_bytes(&num_tiles_u32.to_le_bytes(), 4);
+                        // One threadgroup per head, enough threads for head_dim
+                        let tg_threads = (head_dim as u64).max(1).min(256);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(num_heads as u64, 1, 1),
+                            MTLSize::new(tg_threads, 1, 1),
+                        );
+                        enc.end_encoding();
+                    }
+                } else {
+                    // --- Original single-threadgroup MHA for short sequences ---
+                    let mha_tg_size = s.mha_tg_size;
+                    let enc = cmd
+                        .new_compute_encoder()
+                        .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
+                    enc.set_pipeline_state(&pipelines.multi_head_attention);
                     enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
                     enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 1);
                     enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 2);
-                    enc.set_buffer(&s.flash_decode_partial_buf, 0, 3);
-                    enc.set_bytes(&num_heads_u32.to_le_bytes(), 4);
-                    enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 5);
-                    enc.set_bytes(&head_dim_u32.to_le_bytes(), 6);
-                    enc.set_bytes(&kv_dim_u32.to_le_bytes(), 7);
-                    enc.set_bytes(&seq_len_u32.to_le_bytes(), 8);
-                    enc.set_bytes(&attn_scale.to_le_bytes(), 9);
-                    enc.set_bytes(&tile_size_u32.to_le_bytes(), 10);
-                    enc.set_bytes(&num_tiles_u32.to_le_bytes(), 11);
-                    enc.set_bytes(&max_seq_len_u32.to_le_bytes(), 12);
-                    // Each threadgroup gets 128 threads (tile_size=256, each thread handles multiple scores)
-                    // Use flattened 1D grid: threadgroup i = head * num_tiles + tile_idx
-                    let tg_threads = 128u64;
-                    let total_tgs = (num_heads as u64) * (num_tiles as u64);
-                    enc.dispatch_threadgroups(
-                        MTLSize::new(total_tgs, 1, 1),
-                        MTLSize::new(tg_threads, 1, 1),
-                    );
-                    enc.end_encoding();
-                }
-
-                // --- Flash Decode Phase 2: reduce across tiles ---
-                {
-                    let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                        RuntimeError::Compute("Failed to create encoder".into())
-                    })?;
-                    enc.set_pipeline_state(&pipelines.flash_decode_reduce);
-                    enc.set_buffer(&s.flash_decode_partial_buf, 0, 0);
-                    enc.set_buffer(&s.attn_out_buf, 0, 1);
-                    enc.set_bytes(&num_heads_u32.to_le_bytes(), 2);
-                    enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
-                    enc.set_bytes(&num_tiles_u32.to_le_bytes(), 4);
-                    // One threadgroup per head, enough threads for head_dim
-                    let tg_threads = (head_dim as u64).max(1).min(256);
+                    enc.set_buffer(&s.attn_out_buf, 0, 3);
+                    enc.set_buffer(&s.mha_scores_buf, 0, 4);
+                    enc.set_bytes(&num_heads_u32.to_le_bytes(), 5);
+                    enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 6);
+                    enc.set_bytes(&head_dim_u32.to_le_bytes(), 7);
+                    enc.set_bytes(&kv_dim_u32.to_le_bytes(), 8);
+                    enc.set_bytes(&seq_len_u32.to_le_bytes(), 9);
+                    enc.set_bytes(&attn_scale.to_le_bytes(), 10);
+                    enc.set_bytes(&max_seq_len_u32.to_le_bytes(), 11);
+                    let tg_threads = mha_tg_size.min((head_dim.max(new_seq_len) as u64).max(1));
                     enc.dispatch_threadgroups(
                         MTLSize::new(num_heads as u64, 1, 1),
                         MTLSize::new(tg_threads, 1, 1),
                     );
                     enc.end_encoding();
                 }
-            } else {
-                // --- Original single-threadgroup MHA for short sequences ---
-                let mha_tg_size = s.mha_tg_size;
+            }
+
+            // --- Sigmoid gate for Q+gate fusion (Qwen3.5 full-attention) ---
+            // sigmoid(gate_buf) * attn_out_buf -> attn_out_buf (in-place)
+            if has_qgate_fusion {
                 let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder".into())
+                    RuntimeError::Compute("Failed to create encoder for sigmoid gate".into())
                 })?;
-                enc.set_pipeline_state(&pipelines.multi_head_attention);
-                enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
-                enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 1);
-                enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 2);
-                enc.set_buffer(&s.attn_out_buf, 0, 3);
-                enc.set_buffer(&s.mha_scores_buf, 0, 4);
-                enc.set_bytes(&num_heads_u32.to_le_bytes(), 5);
-                enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 6);
-                enc.set_bytes(&head_dim_u32.to_le_bytes(), 7);
-                enc.set_bytes(&kv_dim_u32.to_le_bytes(), 8);
-                enc.set_bytes(&seq_len_u32.to_le_bytes(), 9);
-                enc.set_bytes(&attn_scale.to_le_bytes(), 10);
-                enc.set_bytes(&max_seq_len_u32.to_le_bytes(), 11);
-                let tg_threads = mha_tg_size.min(
-                    (head_dim.max(new_seq_len) as u64).max(1)
-                );
+                let pso = pipelines.sigmoid_mul_fused.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute("sigmoid_mul_fused pipeline not compiled".into())
+                })?;
+                enc.set_pipeline_state(pso);
+                enc.set_buffer(&s.gate_buf, 0, 0); // gate [q_dim]
+                enc.set_buffer(&s.attn_out_buf, 0, 1); // attn output [q_dim]
+                enc.set_buffer(&s.attn_out_buf, 0, 2); // output (in-place)
+                let total_gate_elems = q_dim as u32;
+                enc.set_bytes(&total_gate_elems.to_le_bytes(), 3);
+                let tg = 256u64.min(total_gate_elems as u64).max(1);
                 enc.dispatch_threadgroups(
-                    MTLSize::new(num_heads as u64, 1, 1),
-                    MTLSize::new(tg_threads, 1, 1),
+                    MTLSize::new((total_gate_elems as u64).div_ceil(tg), 1, 1),
+                    MTLSize::new(tg, 1, 1),
                 );
                 enc.end_encoding();
             }
-        }
 
-        // --- Sigmoid gate for Q+gate fusion (Qwen3.5 full-attention) ---
-        // sigmoid(gate_buf) * attn_out_buf -> attn_out_buf (in-place)
-        if has_qgate_fusion {
-            let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder for sigmoid gate".into())
-            })?;
-            let pso = pipelines.sigmoid_mul_fused.as_ref().ok_or_else(|| {
-                RuntimeError::Compute("sigmoid_mul_fused pipeline not compiled".into())
-            })?;
-            enc.set_pipeline_state(pso);
-            enc.set_buffer(&s.gate_buf, 0, 0);       // gate [q_dim]
-            enc.set_buffer(&s.attn_out_buf, 0, 1);   // attn output [q_dim]
-            enc.set_buffer(&s.attn_out_buf, 0, 2);   // output (in-place)
-            let total_gate_elems = q_dim as u32;
-            enc.set_bytes(&total_gate_elems.to_le_bytes(), 3);
-            let tg = 256u64.min(total_gate_elems as u64).max(1);
-            enc.dispatch_threadgroups(
-                MTLSize::new((total_gate_elems as u64).div_ceil(tg), 1, 1),
-                MTLSize::new(tg, 1, 1),
-            );
-            enc.end_encoding();
-        }
-
-        // --- Encoder 6: Wo projection + Residual 1 (fused) ---
-        // attn_proj_buf = Wo * attn_out + x_buf  (eliminates separate add_residual)
-        {
-            let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder".into())
-            })?;
-            let in_dim_u32 = q_dim as u32;
-            let tg_wo = match st.wo.quant {
-                QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_residual_nr2); 128u64 },
-                QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_residual_nr2); 128u64 },
-                QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_residual_nr2); 128u64 },
-                QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_residual_nr2); 128u64 },
-                _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32_residual); matmul_tg_size },
-            };
-            enc.set_buffer(layer_buf, wo_off, 0);
-            enc.set_buffer(&s.attn_out_buf, 0, 1);
-            enc.set_buffer(&s.attn_proj_buf, 0, 2);
-            enc.set_bytes(&in_dim_u32.to_le_bytes(), 3);
-            enc.set_buffer(&s.x_buf, 0, 4);  // residual input
-            if matches!(st.wo.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
-                let wo_out_dim_u32 = hidden_dim as u32;
-                enc.set_bytes(&wo_out_dim_u32.to_le_bytes(), 5);
+            // --- Encoder 6: Wo projection + Residual 1 (fused) ---
+            // attn_proj_buf = Wo * attn_out + x_buf  (eliminates separate add_residual)
+            {
+                let enc = cmd
+                    .new_compute_encoder()
+                    .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
+                let in_dim_u32 = q_dim as u32;
+                let tg_wo = match st.wo.quant {
+                    QuantScheme::Q8_0 => {
+                        enc.set_pipeline_state(
+                            &pipelines.dequant_matmul_q8_0_deferred_residual_nr2,
+                        );
+                        128u64
+                    }
+                    QuantScheme::Q4_0 => {
+                        enc.set_pipeline_state(
+                            &pipelines.dequant_matmul_q4_0_deferred_residual_nr2,
+                        );
+                        128u64
+                    }
+                    QuantScheme::F16 => {
+                        enc.set_pipeline_state(&pipelines.matmul_f16_deferred_residual_nr2);
+                        128u64
+                    }
+                    QuantScheme::Bf16 => {
+                        enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_residual_nr2);
+                        128u64
+                    }
+                    _ => {
+                        enc.set_pipeline_state(&pipelines.matmul_bytes_f32_residual);
+                        matmul_tg_size
+                    }
+                };
+                enc.set_buffer(layer_buf, wo_off, 0);
+                enc.set_buffer(&s.attn_out_buf, 0, 1);
+                enc.set_buffer(&s.attn_proj_buf, 0, 2);
+                enc.set_bytes(&in_dim_u32.to_le_bytes(), 3);
+                enc.set_buffer(&s.x_buf, 0, 4); // residual input
+                if matches!(
+                    st.wo.quant,
+                    QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
+                ) {
+                    let wo_out_dim_u32 = hidden_dim as u32;
+                    enc.set_bytes(&wo_out_dim_u32.to_le_bytes(), 5);
+                }
+                let n_tg_wo = match st.wo.quant {
+                    QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2,
+                    QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2,
+                    QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2,
+                    QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2,
+                    _ => hidden_dim as u64,
+                };
+                enc.dispatch_threadgroups(MTLSize::new(n_tg_wo, 1, 1), MTLSize::new(tg_wo, 1, 1));
+                enc.end_encoding();
             }
-            let n_tg_wo = match st.wo.quant {
-                QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2,
-                QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2,
-                QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2,
-                QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2,
-                _ => hidden_dim as u64,
-            };
-            enc.dispatch_threadgroups(
-                MTLSize::new(n_tg_wo, 1, 1),
-                MTLSize::new(tg_wo, 1, 1),
-            );
-            enc.end_encoding();
-        }
         } // end if !is_gdn_layer (softmax attention block)
 
         // --- Encoder 11: FFN RMSNorm ---
         {
-            let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder".into())
-            })?;
+            let enc = cmd
+                .new_compute_encoder()
+                .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
             let dim_u32 = hidden_dim as u32;
             enc.set_pipeline_state(&pipelines.rmsnorm_bytes);
             enc.set_buffer(&s.attn_proj_buf, 0, 0);
@@ -1369,10 +1561,7 @@ impl ComputeBackend for MetalF32Backend {
             enc.set_buffer(&s.normed_buf, 0, 2);
             enc.set_bytes(&dim_u32.to_le_bytes(), 3);
             enc.set_bytes(&eps.to_le_bytes(), 4);
-            enc.dispatch_threadgroups(
-                MTLSize::new(1, 1, 1),
-                MTLSize::new(norm_tg_size, 1, 1),
-            );
+            enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(norm_tg_size, 1, 1));
             enc.end_encoding();
         }
 
@@ -1396,8 +1585,8 @@ impl ComputeBackend for MetalF32Backend {
         // Check if Option A is active for this layer.
         // Option A requires: (1) use_option_a flag, (2) streaming mode (not GPU-resident),
         // (3) MoE model with expert cache or reader available.
-        let is_streaming_mode = s.gpu_unified_weight_buf.is_none()
-            && s.gpu_resident_layers.is_none();
+        let is_streaming_mode =
+            s.gpu_unified_weight_buf.is_none() && s.gpu_resident_layers.is_none();
         let option_a_active = self.use_option_a
             && is_streaming_mode
             && s.moe_num_experts > 0
@@ -1423,31 +1612,50 @@ impl ComputeBackend for MetalF32Backend {
                         {
                             let cache = self.expert_cache.as_ref().unwrap().lock().unwrap();
                             let is_cached_data: Vec<u8> = (0..num_experts)
-                                .map(|e| if cache.contains(&(layer_idx, e as u32)) { 1u8 } else { 0u8 })
+                                .map(|e| {
+                                    if cache.contains(&(layer_idx, e as u32)) {
+                                        1u8
+                                    } else {
+                                        0u8
+                                    }
+                                })
                                 .collect();
                             drop(cache);
-                            (self.device.new_buffer_with_bytes(&is_cached_data), self.cache_bias_lambda)
+                            (
+                                self.device.new_buffer_with_bytes(&is_cached_data),
+                                self.cache_bias_lambda,
+                            )
                         } else {
                             (None, 0.0)
                         };
 
                         let use_biased = bias_lambda > 0.0 && is_cached_buf.is_some();
                         let router_softmax = if use_biased {
-                            pipelines.moe_router_softmax_biased.as_ref().ok_or_else(|| {
-                                RuntimeError::Compute("MoE router_softmax_biased pipeline not compiled.".into())
-                            })?
+                            pipelines
+                                .moe_router_softmax_biased
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    RuntimeError::Compute(
+                                        "MoE router_softmax_biased pipeline not compiled.".into(),
+                                    )
+                                })?
                         } else {
                             pipelines.moe_router_softmax.as_ref().ok_or_else(|| {
-                                RuntimeError::Compute("MoE router_softmax pipeline not compiled.".into())
+                                RuntimeError::Compute(
+                                    "MoE router_softmax pipeline not compiled.".into(),
+                                )
                             })?
                         };
 
                         let expert_ids_buf = s.moe_expert_ids.as_ref().ok_or_else(|| {
                             RuntimeError::Compute("MoE expert_ids buffer not allocated".into())
                         })?;
-                        let expert_weights_buf = s.moe_expert_weights.as_ref().ok_or_else(|| {
-                            RuntimeError::Compute("MoE expert_weights buffer not allocated".into())
-                        })?;
+                        let expert_weights_buf =
+                            s.moe_expert_weights.as_ref().ok_or_else(|| {
+                                RuntimeError::Compute(
+                                    "MoE expert_weights buffer not allocated".into(),
+                                )
+                            })?;
 
                         let enc = cmd.new_compute_encoder().ok_or_else(|| {
                             RuntimeError::Compute("Failed to create encoder for MoE router".into())
@@ -1500,11 +1708,14 @@ impl ComputeBackend for MetalF32Backend {
                                     let down_start = expert_slice.down.offset as usize;
                                     let down_end = down_start + expert_slice.down.length as usize;
 
-                                    if gate_end <= blob.len() && up_end <= blob.len() && down_end <= blob.len() {
+                                    if gate_end <= blob.len()
+                                        && up_end <= blob.len()
+                                        && down_end <= blob.len()
+                                    {
                                         let mut data = Vec::with_capacity(
                                             expert_slice.gate.length as usize
-                                            + expert_slice.up.length as usize
-                                            + expert_slice.down.length as usize
+                                                + expert_slice.up.length as usize
+                                                + expert_slice.down.length as usize,
                                         );
                                         data.extend_from_slice(&blob[gate_start..gate_end]);
                                         data.extend_from_slice(&blob[up_start..up_end]);
@@ -1522,7 +1733,8 @@ impl ComputeBackend for MetalF32Backend {
                                                 quant: expert_slice.up.quant,
                                             },
                                             down: lumen_format::index::TensorSlice {
-                                                offset: expert_slice.gate.length + expert_slice.up.length,
+                                                offset: expert_slice.gate.length
+                                                    + expert_slice.up.length,
                                                 length: expert_slice.down.length,
                                                 quant: expert_slice.down.quant,
                                             },
@@ -1553,11 +1765,18 @@ impl ComputeBackend for MetalF32Backend {
                                                 // Find which slot k this expert corresponds to.
                                                 for (k, &cpu_eid) in cpu_ids.iter().enumerate() {
                                                     if cpu_eid == eid && prefetched[k].is_none() {
-                                                        self.expert_bytes_from_disk.fetch_add(data.len() as u64, Ordering::Relaxed);
+                                                        self.expert_bytes_from_disk.fetch_add(
+                                                            data.len() as u64,
+                                                            Ordering::Relaxed,
+                                                        );
                                                         // Also insert into cache.
                                                         if let Some(ref cm) = self.expert_cache {
                                                             let mut c = cm.lock().unwrap();
-                                                            c.insert((layer_idx, eid), data.clone(), slices.clone());
+                                                            c.insert(
+                                                                (layer_idx, eid),
+                                                                data.clone(),
+                                                                slices.clone(),
+                                                            );
                                                         }
                                                         prefetched[k] = Some((data, slices));
                                                         break;
@@ -1584,8 +1803,9 @@ impl ComputeBackend for MetalF32Backend {
                     // Two-pass assembly: prefetch hits + cache hits first, then disk for misses.
                     if let Some(ref cache_mutex) = self.expert_cache {
                         // Pass 1: collect from prefetch and cache, identify misses.
-                        let mut per_expert: Vec<Option<(Vec<u8>, lumen_format::index::ExpertSlice)>> =
-                            (0..top_k).map(|_| None).collect();
+                        let mut per_expert: Vec<
+                            Option<(Vec<u8>, lumen_format::index::ExpertSlice)>,
+                        > = (0..top_k).map(|_| None).collect();
                         let mut miss_indices: Vec<usize> = Vec::new();
 
                         // Use prefetch hits first.
@@ -1603,7 +1823,8 @@ impl ComputeBackend for MetalF32Backend {
                                 }
                                 let key = (layer_idx, eid);
                                 if let Some((data, slices)) = cache.get_with_slices(&key) {
-                                    self.expert_bytes_from_cache.fetch_add(data.len() as u64, Ordering::Relaxed);
+                                    self.expert_bytes_from_cache
+                                        .fetch_add(data.len() as u64, Ordering::Relaxed);
                                     per_expert[k] = Some((data.to_vec(), slices));
                                 } else {
                                     miss_indices.push(k);
@@ -1618,8 +1839,10 @@ impl ComputeBackend for MetalF32Backend {
                         // Metal shared buffer, bypassing CPU memory allocation and page
                         // faults. Falls back to load_experts_parallel (pread).
                         if !miss_indices.is_empty() {
-                            let loaded_via_metal_io = if let (Some(ref io_queue), Some(ref lbc_path)) =
-                                (&self.metal_io_queue, &self.lbc_path)
+                            let loaded_via_metal_io = if let (
+                                Some(ref io_queue),
+                                Some(ref lbc_path),
+                            ) = (&self.metal_io_queue, &self.lbc_path)
                             {
                                 // Metal IO DMA path for cache misses.
                                 // Build read plans using ExpertReader's validation,
@@ -1629,25 +1852,42 @@ impl ComputeBackend for MetalF32Backend {
                                     let layer_indices = reader.layer_indices();
 
                                     // Validate layer and build file offsets for each miss.
-                                    let mut dma_plans: Vec<(usize, u32, u64, u64, u64, u64, u64, u64,
+                                    let mut dma_plans: Vec<(
+                                        usize,
+                                        u32,
+                                        u64,
+                                        u64,
+                                        u64,
+                                        u64,
+                                        u64,
+                                        u64,
                                         lumen_format::quantization::QuantScheme,
                                         lumen_format::quantization::QuantScheme,
-                                        lumen_format::quantization::QuantScheme)> = Vec::new();
+                                        lumen_format::quantization::QuantScheme,
+                                    )> = Vec::new();
                                     let mut plans_ok = true;
 
                                     if let Some(layer_idx_entry) = layer_indices.get(layer_idx) {
                                         let blob_off = layer_idx_entry.layer_offset_bytes;
-                                        if let Some(ref expert_entries) = layer_idx_entry.subtensors.experts {
+                                        if let Some(ref expert_entries) =
+                                            layer_idx_entry.subtensors.experts
+                                        {
                                             for &k in &miss_indices {
                                                 let eid = cpu_ids[k] as usize;
                                                 if eid < expert_entries.len() {
                                                     let es = &expert_entries[eid];
                                                     dma_plans.push((
-                                                        k, cpu_ids[k],
-                                                        blob_off + es.gate.offset, es.gate.length,
-                                                        blob_off + es.up.offset, es.up.length,
-                                                        blob_off + es.down.offset, es.down.length,
-                                                        es.gate.quant, es.up.quant, es.down.quant,
+                                                        k,
+                                                        cpu_ids[k],
+                                                        blob_off + es.gate.offset,
+                                                        es.gate.length,
+                                                        blob_off + es.up.offset,
+                                                        es.up.length,
+                                                        blob_off + es.down.offset,
+                                                        es.down.length,
+                                                        es.gate.quant,
+                                                        es.up.quant,
+                                                        es.down.quant,
                                                     ));
                                                 } else {
                                                     plans_ok = false;
@@ -1665,14 +1905,32 @@ impl ComputeBackend for MetalF32Backend {
                                     if plans_ok && !dma_plans.is_empty() {
                                         // Compute total size and build DMA ranges.
                                         let mut total_dma_bytes: u64 = 0;
-                                        let mut range_info: Vec<(usize, u32, u64, u64, u64, u64,
+                                        let mut range_info: Vec<(
+                                            usize,
+                                            u32,
+                                            u64,
+                                            u64,
+                                            u64,
+                                            u64,
                                             lumen_format::quantization::QuantScheme,
                                             lumen_format::quantization::QuantScheme,
-                                            lumen_format::quantization::QuantScheme)> = Vec::new();
+                                            lumen_format::quantization::QuantScheme,
+                                        )> = Vec::new();
                                         let mut io_ranges: Vec<(u64, u64, u64)> = Vec::new();
 
-                                        for &(k, eid, gate_off, gate_len, up_off, up_len, down_off, down_len,
-                                              gq, uq, dq) in &dma_plans
+                                        for &(
+                                            k,
+                                            eid,
+                                            gate_off,
+                                            gate_len,
+                                            up_off,
+                                            up_len,
+                                            down_off,
+                                            down_len,
+                                            gq,
+                                            uq,
+                                            dq,
+                                        ) in &dma_plans
                                         {
                                             let base = total_dma_bytes;
                                             // gate
@@ -1680,24 +1938,49 @@ impl ComputeBackend for MetalF32Backend {
                                             // up
                                             io_ranges.push((base + gate_len, up_off, up_len));
                                             // down
-                                            io_ranges.push((base + gate_len + up_len, down_off, down_len));
+                                            io_ranges.push((
+                                                base + gate_len + up_len,
+                                                down_off,
+                                                down_len,
+                                            ));
                                             let expert_total = gate_len + up_len + down_len;
-                                            range_info.push((k, eid, base, gate_len, up_len, down_len, gq, uq, dq));
+                                            range_info.push((
+                                                k, eid, base, gate_len, up_len, down_len, gq, uq,
+                                                dq,
+                                            ));
                                             total_dma_bytes += expert_total;
                                         }
 
                                         // Allocate a shared Metal buffer and DMA load all ranges.
                                         if total_dma_bytes > 0 {
-                                            if let Some(dma_buf) = self.device.new_buffer(total_dma_bytes as usize) {
+                                            if let Some(dma_buf) =
+                                                self.device.new_buffer(total_dma_bytes as usize)
+                                            {
                                                 match io_queue.load_ranges_sync(
-                                                    &self.device, &dma_buf, lbc_path, &io_ranges,
+                                                    &self.device,
+                                                    &dma_buf,
+                                                    lbc_path,
+                                                    &io_ranges,
                                                 ) {
                                                     Ok(()) => {
                                                         // DMA succeeded. Read back into per_expert
                                                         // and populate cache.
                                                         let ptr = dma_buf.contents() as *const u8;
-                                                        for &(k, eid, base, gate_len, up_len, down_len, gq, uq, dq) in &range_info {
-                                                            let expert_total = (gate_len + up_len + down_len) as usize;
+                                                        for &(
+                                                            k,
+                                                            eid,
+                                                            base,
+                                                            gate_len,
+                                                            up_len,
+                                                            down_len,
+                                                            gq,
+                                                            uq,
+                                                            dq,
+                                                        ) in &range_info
+                                                        {
+                                                            let expert_total =
+                                                                (gate_len + up_len + down_len)
+                                                                    as usize;
                                                             let mut data = vec![0u8; expert_total];
                                                             unsafe {
                                                                 std::ptr::copy_nonoverlapping(
@@ -1723,10 +2006,18 @@ impl ComputeBackend for MetalF32Backend {
                                                                     quant: dq,
                                                                 },
                                                             };
-                                                            self.expert_bytes_from_disk.fetch_add(expert_total as u64, Ordering::Relaxed);
-                                                            if let Some(ref cm) = self.expert_cache {
+                                                            self.expert_bytes_from_disk.fetch_add(
+                                                                expert_total as u64,
+                                                                Ordering::Relaxed,
+                                                            );
+                                                            if let Some(ref cm) = self.expert_cache
+                                                            {
                                                                 let mut c = cm.lock().unwrap();
-                                                                c.insert((layer_idx, eid), data.clone(), slices.clone());
+                                                                c.insert(
+                                                                    (layer_idx, eid),
+                                                                    data.clone(),
+                                                                    slices.clone(),
+                                                                );
                                                             }
                                                             per_expert[k] = Some((data, slices));
                                                         }
@@ -1764,12 +2055,20 @@ impl ComputeBackend for MetalF32Backend {
                                         let eid = cpu_ids[k];
                                         match &results[ri] {
                                             Ok((data, slices)) => {
-                                                self.expert_bytes_from_disk.fetch_add(data.len() as u64, Ordering::Relaxed);
+                                                self.expert_bytes_from_disk.fetch_add(
+                                                    data.len() as u64,
+                                                    Ordering::Relaxed,
+                                                );
                                                 if let Some(ref cm) = self.expert_cache {
                                                     let mut c = cm.lock().unwrap();
-                                                    c.insert((layer_idx, eid), data.clone(), slices.clone());
+                                                    c.insert(
+                                                        (layer_idx, eid),
+                                                        data.clone(),
+                                                        slices.clone(),
+                                                    );
                                                 }
-                                                per_expert[k] = Some((data.clone(), slices.clone()));
+                                                per_expert[k] =
+                                                    Some((data.clone(), slices.clone()));
                                             }
                                             Err(_) => {
                                                 assembly_ok = false;
@@ -1814,18 +2113,25 @@ impl ComputeBackend for MetalF32Backend {
                         };
 
                         let cmd2 = self.queue.new_command_buffer().ok_or_else(|| {
-                            RuntimeError::Compute("Failed to create CB2 for Option A expert FFNs".into())
+                            RuntimeError::Compute(
+                                "Failed to create CB2 for Option A expert FFNs".into(),
+                            )
                         })?;
                         match self.device.new_buffer_with_bytes(&assembled) {
                             Some(ewb) => {
                                 Self::encode_moe_ffn_decode(
-                                    &cmd2, pipelines, s, layer_buf, &moe_meta,
+                                    &cmd2,
+                                    pipelines,
+                                    s,
+                                    layer_buf,
+                                    &moe_meta,
                                     None,
                                     Some(&ewb),
-                                    None, 0.0,
+                                    None,
+                                    0.0,
                                     Some(&cpu_ids),
-                                    true,  // Skip router (already ran in CB1)
-                                    None,  // No per-layer routing weights in streaming
+                                    true, // Skip router (already ran in CB1)
+                                    None, // No per-layer routing weights in streaming
                                 )?;
                                 cmd2.commit();
                                 cmd2.wait_until_completed();
@@ -1834,19 +2140,34 @@ impl ComputeBackend for MetalF32Backend {
                                 // Buffer creation failed -- fall back to full blob in CB2.
                                 let moe_meta_blob = CachedMoeMeta {
                                     router_weight_off: base_off + router.offset,
-                                            expert_gate_offs: experts.iter().map(|e| base_off + e.gate.offset).collect(),
-                                    expert_up_offs: experts.iter().map(|e| base_off + e.up.offset).collect(),
-                                    expert_down_offs: experts.iter().map(|e| base_off + e.down.offset).collect(),
+                                    expert_gate_offs: experts
+                                        .iter()
+                                        .map(|e| base_off + e.gate.offset)
+                                        .collect(),
+                                    expert_up_offs: experts
+                                        .iter()
+                                        .map(|e| base_off + e.up.offset)
+                                        .collect(),
+                                    expert_down_offs: experts
+                                        .iter()
+                                        .map(|e| base_off + e.down.offset)
+                                        .collect(),
                                     expert_gate_quant: first.gate.quant,
-                                            expert_down_quant: first.down.quant,
+                                    expert_down_quant: first.down.quant,
                                 };
                                 Self::encode_moe_ffn_decode(
-                                    &cmd2, pipelines, s, layer_buf, &moe_meta_blob,
-                                    None, None,
-                                    None, 0.0,
+                                    &cmd2,
+                                    pipelines,
+                                    s,
+                                    layer_buf,
+                                    &moe_meta_blob,
+                                    None,
+                                    None,
+                                    None,
+                                    0.0,
                                     Some(&cpu_ids),
                                     true,
-                                    None,  // No per-layer routing weights in streaming
+                                    None, // No per-layer routing weights in streaming
                                 )?;
                                 cmd2.commit();
                                 cmd2.wait_until_completed();
@@ -1856,28 +2177,47 @@ impl ComputeBackend for MetalF32Backend {
                         // Fallback: assemble from full blob for top-K only.
                         let moe_meta_blob = CachedMoeMeta {
                             router_weight_off: base_off + router.offset,
-                            expert_gate_offs: experts.iter().map(|e| base_off + e.gate.offset).collect(),
-                            expert_up_offs: experts.iter().map(|e| base_off + e.up.offset).collect(),
-                            expert_down_offs: experts.iter().map(|e| base_off + e.down.offset).collect(),
+                            expert_gate_offs: experts
+                                .iter()
+                                .map(|e| base_off + e.gate.offset)
+                                .collect(),
+                            expert_up_offs: experts
+                                .iter()
+                                .map(|e| base_off + e.up.offset)
+                                .collect(),
+                            expert_down_offs: experts
+                                .iter()
+                                .map(|e| base_off + e.down.offset)
+                                .collect(),
                             expert_gate_quant: first.gate.quant,
                             expert_down_quant: first.down.quant,
                         };
-                        let expert_blob_bytes: u64 = cpu_ids.iter()
+                        let expert_blob_bytes: u64 = cpu_ids
+                            .iter()
                             .filter_map(|&eid| experts.get(eid as usize))
                             .map(|e| (e.gate.length + e.up.length + e.down.length) as u64)
                             .sum();
-                        self.expert_bytes_from_blob.fetch_add(expert_blob_bytes, Ordering::Relaxed);
+                        self.expert_bytes_from_blob
+                            .fetch_add(expert_blob_bytes, Ordering::Relaxed);
 
                         let cmd2 = self.queue.new_command_buffer().ok_or_else(|| {
-                            RuntimeError::Compute("Failed to create CB2 for Option A fallback".into())
+                            RuntimeError::Compute(
+                                "Failed to create CB2 for Option A fallback".into(),
+                            )
                         })?;
                         Self::encode_moe_ffn_decode(
-                            &cmd2, pipelines, s, layer_buf, &moe_meta_blob,
-                            None, None,
-                            None, 0.0,
+                            &cmd2,
+                            pipelines,
+                            s,
+                            layer_buf,
+                            &moe_meta_blob,
+                            None,
+                            None,
+                            None,
+                            0.0,
                             Some(&cpu_ids),
-                            true,  // Skip router
-                            None,  // No per-layer routing weights in streaming
+                            true, // Skip router
+                            None, // No per-layer routing weights in streaming
                         )?;
                         cmd2.commit();
                         cmd2.wait_until_completed();
@@ -1888,7 +2228,9 @@ impl ComputeBackend for MetalF32Backend {
                     // routed experts. Its output is added to x_buf after the routed
                     // expert accumulation. Uses CB3 since CB2 is already committed.
                     if let (Some(se_gate), Some(se_up), Some(se_down)) = (
-                        &st.shared_expert_gate, &st.shared_expert_up, &st.shared_expert_down,
+                        &st.shared_expert_gate,
+                        &st.shared_expert_up,
+                        &st.shared_expert_down,
                     ) {
                         let cmd3 = self.queue.new_command_buffer().ok_or_else(|| {
                             RuntimeError::Compute(
@@ -1896,7 +2238,10 @@ impl ComputeBackend for MetalF32Backend {
                             )
                         })?;
                         Self::encode_shared_expert_ffn_decode_raw(
-                            &cmd3, pipelines, s, layer_buf,
+                            &cmd3,
+                            pipelines,
+                            s,
+                            layer_buf,
                             base_off + se_gate.offset,
                             base_off + se_up.offset,
                             base_off + se_down.offset,
@@ -1960,7 +2305,9 @@ impl ComputeBackend for MetalF32Backend {
                 // ==============================================================
                 // Option B: Original full-dispatch path (all experts)
                 // ==============================================================
-                let cache_assembled_buf: Option<MetalBuffer> = if let Some(ref cache_mutex) = self.expert_cache {
+                let cache_assembled_buf: Option<MetalBuffer> = if let Some(ref cache_mutex) =
+                    self.expert_cache
+                {
                     let mut cache = cache_mutex.lock().unwrap();
 
                     // Classify each expert as cached or not.
@@ -1978,7 +2325,8 @@ impl ComputeBackend for MetalF32Backend {
                     let is_cached_buf: Option<MetalBuffer> = if self.cache_bias_lambda > 0.0
                         && self.warmup_complete.load(Ordering::Relaxed)
                     {
-                        let is_cached_data: Vec<u8> = cached_mask.iter()
+                        let is_cached_data: Vec<u8> = cached_mask
+                            .iter()
                             .map(|&c| if c { 1u8 } else { 0u8 })
                             .collect();
                         self.device.new_buffer_with_bytes(&is_cached_data)
@@ -2011,25 +2359,29 @@ impl ComputeBackend for MetalF32Backend {
 
                         if ok {
                             // Tier 1 -- all bytes from cache.
-                            self.expert_bytes_from_cache.fetch_add(
-                                assembled.len() as u64, Ordering::Relaxed,
-                            );
+                            self.expert_bytes_from_cache
+                                .fetch_add(assembled.len() as u64, Ordering::Relaxed);
                             let moe_meta = CachedMoeMeta {
                                 router_weight_off: base_off + router.offset,
-                                    expert_gate_offs,
+                                expert_gate_offs,
                                 expert_up_offs,
                                 expert_down_offs,
                                 expert_gate_quant: first.gate.quant,
-                                    expert_down_quant: first.down.quant,
+                                expert_down_quant: first.down.quant,
                             };
                             drop(cache);
                             match self.device.new_buffer_with_bytes(&assembled) {
                                 Some(buf) => {
                                     Self::encode_moe_ffn_decode(
-                                        &cmd, pipelines, s, layer_buf, &moe_meta,
+                                        &cmd,
+                                        pipelines,
+                                        s,
+                                        layer_buf,
+                                        &moe_meta,
                                         None,
                                         Some(&buf),
-                                        is_cached_buf.as_ref(), bias_lambda,
+                                        is_cached_buf.as_ref(),
+                                        bias_lambda,
                                         None,  // Option A handled below after readback
                                         false, // Do not skip router
                                         None,  // No per-layer routing weights in streaming
@@ -2053,8 +2405,9 @@ impl ComputeBackend for MetalF32Backend {
                         let mut tier2_disk_bytes = 0u64;
 
                         // Collect cached experts first (holding cache lock).
-                        let mut per_expert: Vec<Option<(Vec<u8>, lumen_format::index::ExpertSlice)>> =
-                            (0..num_experts).map(|_| None).collect();
+                        let mut per_expert: Vec<
+                            Option<(Vec<u8>, lumen_format::index::ExpertSlice)>,
+                        > = (0..num_experts).map(|_| None).collect();
                         for eid in 0..num_experts {
                             if cached_mask[eid] {
                                 let key = (layer_idx, eid as u32);
@@ -2077,7 +2430,11 @@ impl ComputeBackend for MetalF32Backend {
                                             // Insert into cache for future tokens.
                                             if let Some(ref cm) = self.expert_cache {
                                                 let mut c = cm.lock().unwrap();
-                                                c.insert((layer_idx, eid as u32), data.clone(), slices.clone());
+                                                c.insert(
+                                                    (layer_idx, eid as u32),
+                                                    data.clone(),
+                                                    slices.clone(),
+                                                );
                                             }
                                             per_expert[eid] = Some((data, slices));
                                         }
@@ -2091,8 +2448,10 @@ impl ComputeBackend for MetalF32Backend {
                         }
 
                         // Tier 2 I/O counters.
-                        self.expert_bytes_from_cache.fetch_add(tier2_cache_bytes, Ordering::Relaxed);
-                        self.expert_bytes_from_disk.fetch_add(tier2_disk_bytes, Ordering::Relaxed);
+                        self.expert_bytes_from_cache
+                            .fetch_add(tier2_cache_bytes, Ordering::Relaxed);
+                        self.expert_bytes_from_disk
+                            .fetch_add(tier2_disk_bytes, Ordering::Relaxed);
 
                         if ok {
                             for eid in 0..num_experts {
@@ -2106,19 +2465,24 @@ impl ComputeBackend for MetalF32Backend {
 
                             let moe_meta = CachedMoeMeta {
                                 router_weight_off: base_off + router.offset,
-                                    expert_gate_offs,
+                                expert_gate_offs,
                                 expert_up_offs,
                                 expert_down_offs,
                                 expert_gate_quant: first.gate.quant,
-                                    expert_down_quant: first.down.quant,
+                                expert_down_quant: first.down.quant,
                             };
                             match self.device.new_buffer_with_bytes(&assembled) {
                                 Some(buf) => {
                                     Self::encode_moe_ffn_decode(
-                                        &cmd, pipelines, s, layer_buf, &moe_meta,
+                                        &cmd,
+                                        pipelines,
+                                        s,
+                                        layer_buf,
+                                        &moe_meta,
                                         None,
                                         Some(&buf),
-                                        is_cached_buf.as_ref(), bias_lambda,
+                                        is_cached_buf.as_ref(),
+                                        bias_lambda,
                                         None,  // Option A handled below after readback
                                         false, // Do not skip router
                                         None,  // No per-layer routing weights in streaming
@@ -2140,24 +2504,30 @@ impl ComputeBackend for MetalF32Backend {
                 // Tier 3 fallback: expert weights from full layer blob.
                 if cache_assembled_buf.is_none() {
                     // Tier 3 -- all expert bytes from full blob.
-                    let expert_blob_bytes: u64 = experts.iter()
+                    let expert_blob_bytes: u64 = experts
+                        .iter()
                         .map(|e| (e.gate.length + e.up.length + e.down.length) as u64)
                         .sum();
-                    self.expert_bytes_from_blob.fetch_add(expert_blob_bytes, Ordering::Relaxed);
+                    self.expert_bytes_from_blob
+                        .fetch_add(expert_blob_bytes, Ordering::Relaxed);
 
                     let moe_meta = CachedMoeMeta {
                         router_weight_off: base_off + router.offset,
-                        expert_gate_offs: experts.iter().map(|e| base_off + e.gate.offset).collect(),
+                        expert_gate_offs: experts
+                            .iter()
+                            .map(|e| base_off + e.gate.offset)
+                            .collect(),
                         expert_up_offs: experts.iter().map(|e| base_off + e.up.offset).collect(),
-                        expert_down_offs: experts.iter().map(|e| base_off + e.down.offset).collect(),
+                        expert_down_offs: experts
+                            .iter()
+                            .map(|e| base_off + e.down.offset)
+                            .collect(),
                         expert_gate_quant: first.gate.quant,
                         expert_down_quant: first.down.quant,
                     };
                     Self::encode_moe_ffn_decode(
-                        &cmd, pipelines, s, layer_buf, &moe_meta,
-                        None,
-                        None,
-                        None, 0.0,  // No cache bias in Tier 3 fallback
+                        &cmd, pipelines, s, layer_buf, &moe_meta, None, None, None,
+                        0.0,   // No cache bias in Tier 3 fallback
                         None,  // No Option A in Tier 3 fallback
                         false, // Do not skip router
                         None,  // No per-layer routing weights in streaming
@@ -2168,7 +2538,8 @@ impl ComputeBackend for MetalF32Backend {
             } else {
                 return Err(RuntimeError::Compute(
                     "Model has num_experts > 0 but layer is missing router_weight/experts \
-                     in SubtensorOffsets. The LBC file may need re-conversion.".into()
+                     in SubtensorOffsets. The LBC file may need re-conversion."
+                        .into(),
                 ));
             }
         } else {
@@ -2177,119 +2548,139 @@ impl ComputeBackend for MetalF32Backend {
 
         // --- Dense FFN path: only executed for non-MoE layers ---
         if !moe_handled {
-
-        // --- Fused Gate + Up + SwiGLU (single dispatch for Q8_0, deferred reduction) ---
-        // Prefill uses original fused kernel (batched GEMM style, 4 rows/TG)
-        if st.w_gate.quant == QuantScheme::Q8_0 && st.w_up.quant == QuantScheme::Q8_0 {
-            let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder".into())
-            })?;
-            enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q8_0);
-            enc.set_buffer(layer_buf, w_gate_off, 0);
-            enc.set_buffer(&s.normed_buf, 0, 1);
-            enc.set_buffer(&s.gate_buf, 0, 2);
-            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-            enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 4);
-            enc.set_buffer(layer_buf, w_up_off, 5);
-            enc.dispatch_threadgroups(
-                MTLSize::new(((inter_dim as u64) + 3) / 4, 1, 1),
-                MTLSize::new(128, 1, 1),
-            );
-            enc.end_encoding();
-        } else if st.w_gate.quant == QuantScheme::Q4_0 && st.w_up.quant == QuantScheme::Q4_0 {
-            // Q4_0: fused Gate + Up + SwiGLU with deferred reduction (1 row/TG)
-            let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder".into())
-            })?;
-            enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q4_0_deferred);
-            enc.set_buffer(layer_buf, w_gate_off, 0);    // gate weights
-            enc.set_buffer(&s.normed_buf, 0, 1);         // normed input x
-            enc.set_buffer(&s.gate_buf, 0, 2);           // output (SwiGLU result)
-            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-            enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 4);
-            enc.set_buffer(layer_buf, w_up_off, 5);      // up weights
-            enc.dispatch_threadgroups(
-                MTLSize::new(inter_dim as u64, 1, 1),
-                MTLSize::new(128, 1, 1),
-            );
-            enc.end_encoding();
-        } else {
-            // Fallback: separate Gate + Up + SwiGLU for F32
-            {
-                let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder".into())
-                })?;
-                let in_dim_u32 = hidden_dim as u32;
-                enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
+            // --- Fused Gate + Up + SwiGLU (single dispatch for Q8_0, deferred reduction) ---
+            // Prefill uses original fused kernel (batched GEMM style, 4 rows/TG)
+            if st.w_gate.quant == QuantScheme::Q8_0 && st.w_up.quant == QuantScheme::Q8_0 {
+                let enc = cmd
+                    .new_compute_encoder()
+                    .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
+                enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q8_0);
                 enc.set_buffer(layer_buf, w_gate_off, 0);
                 enc.set_buffer(&s.normed_buf, 0, 1);
                 enc.set_buffer(&s.gate_buf, 0, 2);
-                enc.set_bytes(&in_dim_u32.to_le_bytes(), 3);
+                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 4);
+                enc.set_buffer(layer_buf, w_up_off, 5);
                 enc.dispatch_threadgroups(
-                    MTLSize::new(inter_dim as u64, 1, 1),
-                    MTLSize::new(matmul_tg_size, 1, 1),
-                );
-                enc.set_buffer(layer_buf, w_up_off, 0);
-                enc.set_buffer(&s.up_buf, 0, 2);
-                enc.dispatch_threadgroups(
-                    MTLSize::new(inter_dim as u64, 1, 1),
-                    MTLSize::new(matmul_tg_size, 1, 1),
+                    MTLSize::new(((inter_dim as u64) + 3) / 4, 1, 1),
+                    MTLSize::new(128, 1, 1),
                 );
                 enc.end_encoding();
+            } else if st.w_gate.quant == QuantScheme::Q4_0 && st.w_up.quant == QuantScheme::Q4_0 {
+                // Q4_0: fused Gate + Up + SwiGLU with deferred reduction (1 row/TG)
+                let enc = cmd
+                    .new_compute_encoder()
+                    .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
+                enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q4_0_deferred);
+                enc.set_buffer(layer_buf, w_gate_off, 0); // gate weights
+                enc.set_buffer(&s.normed_buf, 0, 1); // normed input x
+                enc.set_buffer(&s.gate_buf, 0, 2); // output (SwiGLU result)
+                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 4);
+                enc.set_buffer(layer_buf, w_up_off, 5); // up weights
+                enc.dispatch_threadgroups(
+                    MTLSize::new(inter_dim as u64, 1, 1),
+                    MTLSize::new(128, 1, 1),
+                );
+                enc.end_encoding();
+            } else {
+                // Fallback: separate Gate + Up + SwiGLU for F32
+                {
+                    let enc = cmd
+                        .new_compute_encoder()
+                        .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
+                    let in_dim_u32 = hidden_dim as u32;
+                    enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
+                    enc.set_buffer(layer_buf, w_gate_off, 0);
+                    enc.set_buffer(&s.normed_buf, 0, 1);
+                    enc.set_buffer(&s.gate_buf, 0, 2);
+                    enc.set_bytes(&in_dim_u32.to_le_bytes(), 3);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(inter_dim as u64, 1, 1),
+                        MTLSize::new(matmul_tg_size, 1, 1),
+                    );
+                    enc.set_buffer(layer_buf, w_up_off, 0);
+                    enc.set_buffer(&s.up_buf, 0, 2);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(inter_dim as u64, 1, 1),
+                        MTLSize::new(matmul_tg_size, 1, 1),
+                    );
+                    enc.end_encoding();
+                }
+                {
+                    let enc = cmd
+                        .new_compute_encoder()
+                        .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
+                    enc.set_pipeline_state(&pipelines.swiglu);
+                    enc.set_buffer(&s.gate_buf, 0, 0);
+                    enc.set_buffer(&s.up_buf, 0, 1);
+                    enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 2);
+                    let tg = 256u64.min(inter_dim as u64).max(1);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new((inter_dim as u64).div_ceil(tg), 1, 1),
+                        MTLSize::new(tg, 1, 1),
+                    );
+                    enc.end_encoding();
+                }
             }
+
+            // --- Encoder 11: Down projection + Residual 2 (fused) ---
+            // x_buf = W_down * gate + attn_proj_buf  (eliminates separate add_write)
             {
-                let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder".into())
-                })?;
-                enc.set_pipeline_state(&pipelines.swiglu);
-                enc.set_buffer(&s.gate_buf, 0, 0);
-                enc.set_buffer(&s.up_buf, 0, 1);
-                enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 2);
-                let tg = 256u64.min(inter_dim as u64).max(1);
+                let enc = cmd
+                    .new_compute_encoder()
+                    .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
+                let tg_down = match st.w_down.quant {
+                    QuantScheme::Q8_0 => {
+                        enc.set_pipeline_state(
+                            &pipelines.dequant_matmul_q8_0_deferred_residual_nr2,
+                        );
+                        128u64
+                    }
+                    QuantScheme::Q4_0 => {
+                        enc.set_pipeline_state(
+                            &pipelines.dequant_matmul_q4_0_deferred_residual_nr2,
+                        );
+                        128u64
+                    }
+                    QuantScheme::F16 => {
+                        enc.set_pipeline_state(&pipelines.matmul_f16_deferred_residual_nr2);
+                        128u64
+                    }
+                    QuantScheme::Bf16 => {
+                        enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_residual_nr2);
+                        128u64
+                    }
+                    _ => {
+                        enc.set_pipeline_state(&pipelines.matmul_bytes_f32_residual);
+                        matmul_tg_size
+                    }
+                };
+                enc.set_buffer(layer_buf, w_down_off, 0);
+                enc.set_buffer(&s.gate_buf, 0, 1);
+                enc.set_buffer(&s.x_buf, 0, 2); // write directly to x_buf
+                enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 3);
+                enc.set_buffer(&s.attn_proj_buf, 0, 4); // residual input
+                if matches!(
+                    st.w_down.quant,
+                    QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
+                ) {
+                    let down_out_dim_u32 = hidden_dim as u32;
+                    enc.set_bytes(&down_out_dim_u32.to_le_bytes(), 5);
+                }
+                let n_tg_down = match st.w_down.quant {
+                    QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2,
+                    QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2,
+                    QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2,
+                    QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2,
+                    _ => hidden_dim as u64,
+                };
                 enc.dispatch_threadgroups(
-                    MTLSize::new((inter_dim as u64).div_ceil(tg), 1, 1),
-                    MTLSize::new(tg, 1, 1),
+                    MTLSize::new(n_tg_down, 1, 1),
+                    MTLSize::new(tg_down, 1, 1),
                 );
                 enc.end_encoding();
             }
-        }
-
-                // --- Encoder 11: Down projection + Residual 2 (fused) ---
-        // x_buf = W_down * gate + attn_proj_buf  (eliminates separate add_write)
-        {
-            let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder".into())
-            })?;
-            let tg_down = match st.w_down.quant {
-                QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_residual_nr2); 128u64 },
-                QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_residual_nr2); 128u64 },
-                QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_residual_nr2); 128u64 },
-                QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_residual_nr2); 128u64 },
-                _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32_residual); matmul_tg_size },
-            };
-            enc.set_buffer(layer_buf, w_down_off, 0);
-            enc.set_buffer(&s.gate_buf, 0, 1);
-            enc.set_buffer(&s.x_buf, 0, 2);  // write directly to x_buf
-            enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 3);
-            enc.set_buffer(&s.attn_proj_buf, 0, 4);  // residual input
-            if matches!(st.w_down.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
-                let down_out_dim_u32 = hidden_dim as u32;
-                enc.set_bytes(&down_out_dim_u32.to_le_bytes(), 5);
-            }
-            let n_tg_down = match st.w_down.quant {
-                QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2,
-                QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2,
-                QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2,
-                QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2,
-                _ => hidden_dim as u64,
-            };
-            enc.dispatch_threadgroups(
-                MTLSize::new(n_tg_down, 1, 1),
-                MTLSize::new(tg_down, 1, 1),
-            );
-            enc.end_encoding();
-        }
-
         } // end if !moe_handled (dense FFN path)
 
         // For MoE layers in streaming mode: commit synchronously so we can
@@ -2342,11 +2733,14 @@ impl ComputeBackend for MetalF32Backend {
                                     let down_start = expert_slice.down.offset as usize;
                                     let down_end = down_start + expert_slice.down.length as usize;
 
-                                    if gate_end <= blob.len() && up_end <= blob.len() && down_end <= blob.len() {
+                                    if gate_end <= blob.len()
+                                        && up_end <= blob.len()
+                                        && down_end <= blob.len()
+                                    {
                                         let mut data = Vec::with_capacity(
                                             expert_slice.gate.length as usize
-                                            + expert_slice.up.length as usize
-                                            + expert_slice.down.length as usize
+                                                + expert_slice.up.length as usize
+                                                + expert_slice.down.length as usize,
                                         );
                                         data.extend_from_slice(&blob[gate_start..gate_end]);
                                         data.extend_from_slice(&blob[up_start..up_end]);
@@ -2366,7 +2760,8 @@ impl ComputeBackend for MetalF32Backend {
                                                 quant: expert_slice.up.quant,
                                             },
                                             down: lumen_format::index::TensorSlice {
-                                                offset: expert_slice.gate.length + expert_slice.up.length,
+                                                offset: expert_slice.gate.length
+                                                    + expert_slice.up.length,
                                                 length: expert_slice.down.length,
                                                 quant: expert_slice.down.quant,
                                             },
@@ -2409,14 +2804,15 @@ impl ComputeBackend for MetalF32Backend {
     }
 
     fn compute_final(&self, x: &ActivationBuffer) -> Result<Logits, RuntimeError> {
-        let pipelines = self.pipelines.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("Metal pipelines not initialized".into())
-        })?;
+        let pipelines = self
+            .pipelines
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("Metal pipelines not initialized".into()))?;
 
         let mut scratch_guard = self.scratch.lock().unwrap();
-        let s = scratch_guard.as_mut().ok_or_else(|| {
-            RuntimeError::Compute("Metal scratch not initialized".into())
-        })?;
+        let s = scratch_guard
+            .as_mut()
+            .ok_or_else(|| RuntimeError::Compute("Metal scratch not initialized".into()))?;
 
         let hidden_dim = s.hidden_dim;
         let vocab_size = s.vocab_size;
@@ -2480,10 +2876,7 @@ impl ComputeBackend for MetalF32Backend {
             enc.set_buffer(&s.normed_buf, 0, 2);
             enc.set_bytes(&dim_u32.to_le_bytes(), 3);
             enc.set_bytes(&eps.to_le_bytes(), 4);
-            enc.dispatch_threadgroups(
-                MTLSize::new(1, 1, 1),
-                MTLSize::new(norm_tg_size, 1, 1),
-            );
+            enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(norm_tg_size, 1, 1));
             enc.end_encoding();
         }
 
@@ -2521,10 +2914,7 @@ impl ComputeBackend for MetalF32Backend {
             enc.set_bytes(&in_dim_u32.to_le_bytes(), 3);
             enc.set_bytes(&(vocab_size as u32).to_le_bytes(), 4);
             let n_tg = ((vocab_size as u64) + proj_rows_per_tg - 1) / proj_rows_per_tg;
-            enc.dispatch_threadgroups(
-                MTLSize::new(n_tg, 1, 1),
-                MTLSize::new(proj_tg, 1, 1),
-            );
+            enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(proj_tg, 1, 1));
             enc.end_encoding();
         }
 
@@ -2722,16 +3112,11 @@ impl ComputeBackend for MetalF32Backend {
         })
     }
 
-    fn preload_weights(
-        &mut self,
-        weights: &dyn WeightProvider,
-    ) -> Result<(), RuntimeError> {
+    fn preload_weights(&mut self, weights: &dyn WeightProvider) -> Result<(), RuntimeError> {
         // Drain autoreleased Metal objects from one-shot
         // weight upload. preload_weights_gpu_resident creates many command
         // buffers and encoders during the multi-second upload pass.
-        autoreleasepool(|| {
-            self.preload_weights_gpu_resident(weights)
-        })
+        autoreleasepool(|| self.preload_weights_gpu_resident(weights))
     }
 
     fn decode_token(
@@ -2742,9 +3127,7 @@ impl ComputeBackend for MetalF32Backend {
     ) -> Result<Logits, RuntimeError> {
         // Drain autoreleased Metal objects at every token
         // boundary. This is the dominant leak site (~120 MB/h per a prior leak attribution).
-        autoreleasepool(|| {
-            self.decode_token_single_cb(token_id, weights, kv)
-        })
+        autoreleasepool(|| self.decode_token_single_cb(token_id, weights, kv))
     }
 
     fn decode_token_greedy(
@@ -2756,9 +3139,7 @@ impl ComputeBackend for MetalF32Backend {
         // Drain autoreleased Metal objects at every token
         // boundary (greedy path delegates to decode_token_greedy or the
         // option-a-gpu-resident fallback; both create CBs + encoders).
-        autoreleasepool(|| {
-            MetalF32Backend::decode_token_greedy(self, token_id, weights, kv)
-        })
+        autoreleasepool(|| MetalF32Backend::decode_token_greedy(self, token_id, weights, kv))
     }
 
     fn reset_recurrent_state(&self) {
@@ -2777,9 +3158,7 @@ impl ComputeBackend for MetalF32Backend {
         // Drain autoreleased Metal objects from the
         // sync-drain path (creates a CB to wait on pending GPU work plus
         // blit encoders to copy KV bytes back).
-        autoreleasepool(|| {
-            self.sync_kv_to_cpu_impl(kv, recurrent)
-        })
+        autoreleasepool(|| self.sync_kv_to_cpu_impl(kv, recurrent))
     }
 
     /// inverse of `sync_kv_to_cpu` — drain pending work,
@@ -2793,9 +3172,7 @@ impl ComputeBackend for MetalF32Backend {
     ) -> Result<(), RuntimeError> {
         // Drain autoreleased Metal objects from the
         // sync-restore path (mirror of sync_kv_to_cpu).
-        autoreleasepool(|| {
-            self.sync_kv_from_cpu_impl(kv, recurrent)
-        })
+        autoreleasepool(|| self.sync_kv_from_cpu_impl(kv, recurrent))
     }
 
     /// Report current MTLDevice allocated bytes for the

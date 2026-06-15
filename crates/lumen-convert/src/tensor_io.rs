@@ -21,8 +21,12 @@ use std::io::{Read, Seek, SeekFrom};
 pub(crate) fn is_k_quant(t: GgmlType) -> bool {
     matches!(
         t,
-        GgmlType::Q2_K | GgmlType::Q3_K | GgmlType::Q4_K
-            | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_K
+        GgmlType::Q2_K
+            | GgmlType::Q3_K
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q6_K
+            | GgmlType::Q8_K
     )
 }
 
@@ -75,7 +79,13 @@ pub(crate) fn append_tensor_to_blob<R: Read + Seek>(
     dequantize: bool,
 ) -> Result<(), ConvertError> {
     append_tensor_to_blob_requant_with_target(
-        blob, reader, gguf, tensor_name, dequantize, None, ConvertTarget::Generic,
+        blob,
+        reader,
+        gguf,
+        tensor_name,
+        dequantize,
+        None,
+        ConvertTarget::Generic,
     )
 }
 
@@ -94,7 +104,13 @@ pub(crate) fn append_tensor_to_blob_requant<R: Read + Seek>(
     requant_to: Option<QuantScheme>,
 ) -> Result<(), ConvertError> {
     append_tensor_to_blob_requant_with_target(
-        blob, reader, gguf, tensor_name, dequantize, requant_to, ConvertTarget::Generic,
+        blob,
+        reader,
+        gguf,
+        tensor_name,
+        dequantize,
+        requant_to,
+        ConvertTarget::Generic,
     )
 }
 
@@ -117,7 +133,8 @@ pub(crate) fn append_tensor_to_blob_requant_with_target<R: Read + Seek>(
     requant_to: Option<QuantScheme>,
     target: ConvertTarget,
 ) -> Result<(), ConvertError> {
-    let tensor = gguf.find_tensor(tensor_name)
+    let tensor = gguf
+        .find_tensor(tensor_name)
         .ok_or_else(|| ConvertError::MissingTensor(tensor_name.to_string()))?;
     let data = read_tensor_data(reader, gguf, tensor)?;
     let is_norm = tensor_name.contains("norm");
@@ -133,14 +150,16 @@ pub(crate) fn append_tensor_to_blob_requant_with_target<R: Read + Seek>(
         && requant_to.is_none()
         && is_k_quant(tensor.ggml_type);
     if needs_metal_kquant_upcast {
-        let f32_data = dequantize_to_f32_bytes(
-            &data, tensor.ggml_type, tensor.n_elements(), tensor_name,
-        )?;
+        let f32_data =
+            dequantize_to_f32_bytes(&data, tensor.ggml_type, tensor.n_elements(), tensor_name)?;
         let n_elems = tensor.n_elements() as usize;
         let q8_data = quantize_f32_to_q8_0(&f32_data, n_elems);
         eprintln!(
             "    Metal upcast: {} ({:?} -> Q8_0, {} -> {} bytes)",
-            tensor_name, tensor.ggml_type, data.len(), q8_data.len()
+            tensor_name,
+            tensor.ggml_type,
+            data.len(),
+            q8_data.len()
         );
         blob.extend_from_slice(&q8_data);
         return Ok(());
@@ -149,18 +168,16 @@ pub(crate) fn append_tensor_to_blob_requant_with_target<R: Read + Seek>(
     if let Some(target) = requant_to {
         if is_norm || dequantize {
             // Norm tensors always stay as F32
-            let f32_data = dequantize_to_f32_bytes(
-                &data, tensor.ggml_type, tensor.n_elements(), tensor_name,
-            )?;
+            let f32_data =
+                dequantize_to_f32_bytes(&data, tensor.ggml_type, tensor.n_elements(), tensor_name)?;
             blob.extend_from_slice(&f32_data);
         } else if tensor.ggml_type.to_lbc_quant() == Some(target) {
             // Already in target format
             blob.extend_from_slice(&data);
         } else {
             // Dequant -> F32 -> target
-            let f32_data = dequantize_to_f32_bytes(
-                &data, tensor.ggml_type, tensor.n_elements(), tensor_name,
-            )?;
+            let f32_data =
+                dequantize_to_f32_bytes(&data, tensor.ggml_type, tensor.n_elements(), tensor_name)?;
             let n_elems = tensor.n_elements() as usize;
             match target {
                 QuantScheme::Q4_0 => {
@@ -178,40 +195,45 @@ pub(crate) fn append_tensor_to_blob_requant_with_target<R: Read + Seek>(
             }
         }
     } else if dequantize {
-        let f32_data = dequantize_to_f32_bytes(
-            &data, tensor.ggml_type, tensor.n_elements(), tensor_name,
-        )?;
+        let f32_data =
+            dequantize_to_f32_bytes(&data, tensor.ggml_type, tensor.n_elements(), tensor_name)?;
         blob.extend_from_slice(&f32_data);
     } else if tensor.ggml_type == crate::gguf::GgmlType::Q4_1 {
         // Q4_1 has no dedicated GPU kernel (neither Metal nor CUDA).
         // Requantize to Q4_0: dequant Q4_1 -> F32 -> quantize Q4_0.
-        let f32_data = dequantize_to_f32_bytes(
-            &data, tensor.ggml_type, tensor.n_elements(), tensor_name,
-        )?;
+        let f32_data =
+            dequantize_to_f32_bytes(&data, tensor.ggml_type, tensor.n_elements(), tensor_name)?;
         let n_elems = tensor.n_elements() as usize;
         let q4_data = quantize_f32_to_q4_0(&f32_data, n_elems);
-        eprintln!("    Requantized Q4_1 -> Q4_0: {tensor_name} ({} -> {} bytes)",
-            data.len(), q4_data.len());
+        eprintln!(
+            "    Requantized Q4_1 -> Q4_0: {tensor_name} ({} -> {} bytes)",
+            data.len(),
+            q4_data.len()
+        );
         blob.extend_from_slice(&q4_data);
     } else if tensor.ggml_type == crate::gguf::GgmlType::Q8_1 {
         // Q8_1 has no LBC QuantScheme and no dedicated GPU kernel.
         // Requantize to Q8_0: dequant Q8_1 -> F32 -> quantize Q8_0.
-        let f32_data = dequantize_to_f32_bytes(
-            &data, tensor.ggml_type, tensor.n_elements(), tensor_name,
-        )?;
+        let f32_data =
+            dequantize_to_f32_bytes(&data, tensor.ggml_type, tensor.n_elements(), tensor_name)?;
         let n_elems = tensor.n_elements() as usize;
         let q8_data = quantize_f32_to_q8_0(&f32_data, n_elems);
-        eprintln!("    Requantized Q8_1 -> Q8_0: {tensor_name} ({} -> {} bytes)",
-            data.len(), q8_data.len());
+        eprintln!(
+            "    Requantized Q8_1 -> Q8_0: {tensor_name} ({} -> {} bytes)",
+            data.len(),
+            q8_data.len()
+        );
         blob.extend_from_slice(&q8_data);
     } else if tensor.ggml_type == crate::gguf::GgmlType::Q5_1 {
         // Q5_1 has no LBC QuantScheme and no dedicated GPU kernel.
         // Dequantize to F32.
-        let f32_data = dequantize_to_f32_bytes(
-            &data, tensor.ggml_type, tensor.n_elements(), tensor_name,
-        )?;
-        eprintln!("    Dequantized Q5_1 -> F32: {tensor_name} ({} -> {} bytes)",
-            data.len(), f32_data.len());
+        let f32_data =
+            dequantize_to_f32_bytes(&data, tensor.ggml_type, tensor.n_elements(), tensor_name)?;
+        eprintln!(
+            "    Dequantized Q5_1 -> F32: {tensor_name} ({} -> {} bytes)",
+            data.len(),
+            f32_data.len()
+        );
         blob.extend_from_slice(&f32_data);
     } else {
         blob.extend_from_slice(&data);

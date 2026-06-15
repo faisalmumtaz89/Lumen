@@ -8,10 +8,10 @@ pub mod cpu_naive;
 pub mod cpu_simd;
 pub mod simd_kernels;
 
-use crate::weight::cache::{LayerView, WeightProvider};
 use crate::error::RuntimeError;
 use crate::kv::disk::RecurrentState;
 use crate::kv::{KvCache, KvCacheView, KvPrecision};
+use crate::weight::cache::{LayerView, WeightProvider};
 use lumen_format::hyperparams::ModelHyperparams;
 use lumen_format::quantization::QuantScheme;
 
@@ -316,7 +316,9 @@ pub trait ComputeBackend: Send + Sync {
         _weights: &dyn WeightProvider,
         _kv: &mut KvCache,
     ) -> Result<Vec<f32>, RuntimeError> {
-        Err(RuntimeError::Compute("batched prefill not supported".into()))
+        Err(RuntimeError::Compute(
+            "batched prefill not supported".into(),
+        ))
     }
 
     /// Batched prefill resuming from `start_pos`, used by suffix prefill /
@@ -354,10 +356,7 @@ pub trait ComputeBackend: Send + Sync {
     }
 
     /// Preload weights to GPU memory.
-    fn preload_weights(
-        &mut self,
-        _weights: &dyn WeightProvider,
-    ) -> Result<(), RuntimeError> {
+    fn preload_weights(&mut self, _weights: &dyn WeightProvider) -> Result<(), RuntimeError> {
         Ok(())
     }
 
@@ -373,7 +372,9 @@ pub trait ComputeBackend: Send + Sync {
         _weights: &dyn WeightProvider,
         _kv: &mut KvCache,
     ) -> Result<Logits, RuntimeError> {
-        Err(RuntimeError::Compute("GPU-resident decode not supported".into()))
+        Err(RuntimeError::Compute(
+            "GPU-resident decode not supported".into(),
+        ))
     }
 
     /// GPU-side greedy decode returning token ID directly.
@@ -388,7 +389,9 @@ pub trait ComputeBackend: Send + Sync {
         _weights: &dyn WeightProvider,
         _kv: &mut KvCache,
     ) -> Result<u32, RuntimeError> {
-        Err(RuntimeError::Compute("GPU-side argmax not supported".into()))
+        Err(RuntimeError::Compute(
+            "GPU-side argmax not supported".into(),
+        ))
     }
 
     /// Reset recurrent state (GDN h_state, conv_state).

@@ -4,9 +4,9 @@
 //! functions for launching individual kernels. The backend_impl module
 //! orchestrates these into the full compute_layer/compute_final pipeline.
 
-use crate::error::RuntimeError;
 use super::ffi::CudaDevice;
 use super::shaders;
+use crate::error::RuntimeError;
 use cudarc::driver::CudaFunction;
 
 /// kernel-load chatter throttle.
@@ -33,7 +33,12 @@ fn cuda_verbose() -> bool {
     static CHECKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CHECKED.get_or_init(|| {
         std::env::var("LUMEN_CUDA_VERBOSE")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false)
     })
 }
@@ -432,12 +437,14 @@ pub(crate) struct KernelSet {
     // fused_residual_rmsnorm_f32: Residual add + RMSNorm (F32 output) in one kernel.
     // For Q8_0/Q4_0 inter-layer: fuses residual_add_copy + rmsnorm.
     // Saves 1 dispatch per inter-layer boundary (47 fewer for 48-layer models).
-    #[allow(dead_code)] // Compiled but not yet wired into dispatch; kept for future inter-layer fusion.
+    #[allow(dead_code)]
+    // Compiled but not yet wired into dispatch; kept for future inter-layer fusion.
     pub(crate) fused_residual_rmsnorm_f32: Option<CudaFunction>,
     // fused_residual_rms_scale: Residual add + compute_rms_scale (scalar output).
     // For fused_glu_gemv inter-layer: fuses residual_add_copy + compute_rms_scale.
     // Saves 1 dispatch per inter-layer boundary.
-    #[allow(dead_code)] // Compiled but not yet wired into dispatch; kept for future inter-layer fusion.
+    #[allow(dead_code)]
+    // Compiled but not yet wired into dispatch; kept for future inter-layer fusion.
     pub(crate) fused_residual_rms_scale: Option<CudaFunction>,
 
     // Fused F16 prefill kernels (dispatch count reduction for F16 HGEMM path).
@@ -778,8 +785,7 @@ pub(crate) struct KernelSet {
     // SwiGLU intermediate in shmem. One launch replaces the
     // (gate_up_v3 + down_v3 + accum_option_a) trio. Gated behind
     // `LUMEN_CUDA_MOE_FUSED_PERSISTENT=1` (default OFF; opt-in).
-    pub(crate) moe_batched_persistent_gate_up_swiglu_down_accum_q8_0:
-        Option<CudaFunction>,
+    pub(crate) moe_batched_persistent_gate_up_swiglu_down_accum_q8_0: Option<CudaFunction>,
     // fused FFN-norm + router single-launch kernel.
     // Replaces (standalone `rmsnorm` writing `normed_out` + `moe_router_fused_atomic_v2`)
     // pair with one launch. Saves ~1 µs/layer launch overhead + the global write/read
@@ -886,9 +892,9 @@ pub(crate) struct KernelSet {
 pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, RuntimeError> {
     let load_fn = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
         let module = device.compile_and_load(source)?;
-        module.load_function(name).map_err(|e| {
-            RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}"))
-        })
+        module
+            .load_function(name)
+            .map_err(|e| RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}")))
     };
 
     // For kernels needing SM 80+ features (dp4a, WMMA tensor cores).
@@ -918,7 +924,9 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
     let load_fn_sm80_fast_math = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
         let module = device.compile_and_load_with_arch_fast_math(source, "compute_80")?;
         module.load_function(name).map_err(|e| {
-            RuntimeError::Compute(format!("Failed to load SM80 fast_math CUDA kernel '{name}': {e}"))
+            RuntimeError::Compute(format!(
+                "Failed to load SM80 fast_math CUDA kernel '{name}': {e}"
+            ))
         })
     };
 
@@ -926,15 +934,9 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         rmsnorm: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm")?,
         rmsnorm_per_head: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm_per_head")?,
         matvec_f32: load_fn(shaders::MATVEC_F32_KERNEL_SOURCE, "matvec_f32")?,
-        matvec_f32_residual: load_fn(
-            shaders::MATVEC_F32_KERNEL_SOURCE,
-            "matvec_f32_residual",
-        )?,
+        matvec_f32_residual: load_fn(shaders::MATVEC_F32_KERNEL_SOURCE, "matvec_f32_residual")?,
         matvec_f16: load_fn(shaders::MATVEC_F16_KERNEL_SOURCE, "matvec_f16")?,
-        matvec_f16_residual: load_fn(
-            shaders::MATVEC_F16_KERNEL_SOURCE,
-            "matvec_f16_residual",
-        )?,
+        matvec_f16_residual: load_fn(shaders::MATVEC_F16_KERNEL_SOURCE, "matvec_f16_residual")?,
         matvec_bf16: {
             let f = load_fn(shaders::MATVEC_BF16_KERNEL_SOURCE, "matvec_bf16")?;
             cuda_log!("[CUDA] matvec_bf16: OK");
@@ -955,16 +957,10 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         },
         f32_to_bf16_vec4: load_fn(shaders::CONVERT_BF16_KERNEL_SOURCE, "f32_to_bf16_vec4").ok(),
         matvec_q8_0: load_fn(shaders::MATVEC_Q8_0_KERNEL_SOURCE, "matvec_q8_0")?,
-        matvec_q8_0_residual: load_fn(
-            shaders::MATVEC_Q8_0_KERNEL_SOURCE,
-            "matvec_q8_0_residual",
-        )?,
+        matvec_q8_0_residual: load_fn(shaders::MATVEC_Q8_0_KERNEL_SOURCE, "matvec_q8_0_residual")?,
         // v2, v3 removed (dead code — never dispatched, wastes compile time + GPU memory)
         matvec_q4_0: load_fn(shaders::MATVEC_Q4_0_KERNEL_SOURCE, "matvec_q4_0")?,
-        matvec_q4_0_residual: load_fn(
-            shaders::MATVEC_Q4_0_KERNEL_SOURCE,
-            "matvec_q4_0_residual",
-        )?,
+        matvec_q4_0_residual: load_fn(shaders::MATVEC_Q4_0_KERNEL_SOURCE, "matvec_q4_0_residual")?,
         rope_apply: load_fn(shaders::ROPE_KERNEL_SOURCE, "rope_apply")?,
         swiglu_inplace: load_fn(shaders::ACTIVATIONS_KERNEL_SOURCE, "swiglu_inplace")?,
         residual_add: load_fn(shaders::ACTIVATIONS_KERNEL_SOURCE, "residual_add")?,
@@ -1009,18 +1005,15 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         rmsnorm_batched: load_fn(shaders::PREFILL_KERNEL_SOURCE, "rmsnorm_batched")?,
         rope_apply_batched: load_fn(shaders::PREFILL_KERNEL_SOURCE, "rope_apply_batched")?,
         rope_apply_neox: load_fn(shaders::ROPE_KERNEL_SOURCE, "rope_apply_neox")?,
-        rope_apply_batched_neox: load_fn(shaders::PREFILL_KERNEL_SOURCE, "rope_apply_batched_neox")?,
+        rope_apply_batched_neox: load_fn(
+            shaders::PREFILL_KERNEL_SOURCE,
+            "rope_apply_batched_neox",
+        )?,
         bias_add_batched: load_fn(shaders::PREFILL_KERNEL_SOURCE, "bias_add_batched")?,
         bias_add: load_fn(shaders::PREFILL_KERNEL_SOURCE, "bias_add")?,
-        kv_cache_write_batch: load_fn(
-            shaders::PREFILL_KERNEL_SOURCE,
-            "kv_cache_write_batch",
-        )?,
+        kv_cache_write_batch: load_fn(shaders::PREFILL_KERNEL_SOURCE, "kv_cache_write_batch")?,
         swiglu_batched: load_fn(shaders::PREFILL_KERNEL_SOURCE, "swiglu_batched")?,
-        residual_add_batched: load_fn(
-            shaders::PREFILL_KERNEL_SOURCE,
-            "residual_add_batched",
-        )?,
+        residual_add_batched: load_fn(shaders::PREFILL_KERNEL_SOURCE, "residual_add_batched")?,
         extract_row: load_fn(shaders::PREFILL_KERNEL_SOURCE, "extract_row")?,
         scatter_row: load_fn(shaders::PREFILL_KERNEL_SOURCE, "scatter_row")?,
         flash_attention_v2: load_fn(
@@ -1031,14 +1024,8 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::FLASH_ATTENTION_KERNEL_SOURCE,
             "flash_attention_causal_br4",
         )?,
-        dequant_q8_0_to_f16: load_fn(
-            shaders::DEQUANT_Q8_0_KERNEL_SOURCE,
-            "dequant_q8_0_to_f16",
-        )?,
-        dequant_q8_0_to_f32: load_fn(
-            shaders::DEQUANT_Q8_0_KERNEL_SOURCE,
-            "dequant_q8_0_to_f32",
-        )?,
+        dequant_q8_0_to_f16: load_fn(shaders::DEQUANT_Q8_0_KERNEL_SOURCE, "dequant_q8_0_to_f16")?,
+        dequant_q8_0_to_f32: load_fn(shaders::DEQUANT_Q8_0_KERNEL_SOURCE, "dequant_q8_0_to_f32")?,
         dequant_q4_0_to_f16: load_fn(
             shaders::DEQUANT_Q4_0_F16_KERNEL_SOURCE,
             "dequant_q4_0_to_f16",
@@ -1052,28 +1039,40 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             "matvec_q8_0_native",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] Q8_0 native warp kernel: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] Q8_0 native warp kernel: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_0_native_residual: match load_fn(
             shaders::MATVEC_Q8_0_NATIVE_KERNEL_SOURCE,
             "matvec_q8_0_native_residual",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] Q8_0 native warp residual: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] Q8_0 native warp residual: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_0_dp4a: match load_fn_sm80(
             shaders::MATVEC_Q8_0_DP4A_KERNEL_SOURCE,
             "matvec_q8_0_dp4a",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] dp4a kernel: FAILED (fallback to v1): {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] dp4a kernel: FAILED (fallback to v1): {e}");
+                None
+            }
         },
         matvec_q8_0_dp4a_residual: match load_fn_sm80(
             shaders::MATVEC_Q8_0_DP4A_KERNEL_SOURCE,
             "matvec_q8_0_dp4a_residual",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] dp4a_residual: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] dp4a_residual: FAILED: {e}");
+                None
+            }
         },
 
         // MMQ-style batched Q8_0 matmul via dp4a.
@@ -1083,12 +1082,12 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         // function '_Z6__dp4aiii'` failure that affects existing dp4a kernels
         // in this build environment and instead emits the PTX dp4a opcode
         // directly, which the driver JIT accepts on compute_80.
-        mmq_q8_0_batched: match load_fn_sm80(
-            shaders::MMQ_Q8_0_KERNEL_SOURCE,
-            "mmq_q8_0_batched",
-        ) {
+        mmq_q8_0_batched: match load_fn_sm80(shaders::MMQ_Q8_0_KERNEL_SOURCE, "mmq_q8_0_batched") {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] MMQ Q8_0 batched: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] MMQ Q8_0 batched: FAILED: {e}");
+                None
+            }
         },
         // residual variant. Same kernel source compiles both entry points.
         mmq_q8_0_batched_residual: match load_fn_sm80(
@@ -1096,146 +1095,207 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             "mmq_q8_0_batched_residual",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] MMQ Q8_0 batched_residual: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] MMQ Q8_0 batched_residual: FAILED: {e}");
+                None
+            }
         },
         // Tiled shared-memory-staged MMQ Q8_0 GEMM + residual variant.
-        mmq_q8_0_tiled: match load_fn_sm80(
-            shaders::MMQ_Q8_0_TILED_KERNEL_SOURCE,
-            "mmq_q8_0_tiled",
-        ) {
-            Ok(f) => { cuda_log!("[CUDA] mmq_q8_0_tiled: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] mmq_q8_0_tiled: FAILED: {e}"); None }
+        mmq_q8_0_tiled: match load_fn_sm80(shaders::MMQ_Q8_0_TILED_KERNEL_SOURCE, "mmq_q8_0_tiled")
+        {
+            Ok(f) => {
+                cuda_log!("[CUDA] mmq_q8_0_tiled: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] mmq_q8_0_tiled: FAILED: {e}");
+                None
+            }
         },
         mmq_q8_0_tiled_residual: match load_fn_sm80(
             shaders::MMQ_Q8_0_TILED_KERNEL_SOURCE,
             "mmq_q8_0_tiled_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] mmq_q8_0_tiled_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] mmq_q8_0_tiled_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] mmq_q8_0_tiled_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] mmq_q8_0_tiled_residual: FAILED: {e}");
+                None
+            }
         },
         // LEVER C int8-TC dense Q8_0 GEMM (mma.sync) — same source file.
-        mmq_q8_0_imma: match load_fn_sm80(
-            shaders::MMQ_Q8_0_TILED_KERNEL_SOURCE,
-            "mmq_q8_0_imma",
-        ) {
-            Ok(f) => { cuda_log!("[CUDA] mmq_q8_0_imma: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] mmq_q8_0_imma: FAILED: {e}"); None }
+        mmq_q8_0_imma: match load_fn_sm80(shaders::MMQ_Q8_0_TILED_KERNEL_SOURCE, "mmq_q8_0_imma") {
+            Ok(f) => {
+                cuda_log!("[CUDA] mmq_q8_0_imma: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] mmq_q8_0_imma: FAILED: {e}");
+                None
+            }
         },
         // q4-specific MMQ INT4 batched matmul (mul_mat_q-grade numerics).
-        mmq_q4_0_batched: match load_fn_sm80(
-            shaders::MMQ_Q4_0_KERNEL_SOURCE,
-            "mmq_q4_0_batched",
-        ) {
-            Ok(f) => { cuda_log!("[CUDA] mmq_q4_0_batched: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] mmq_q4_0_batched: FAILED: {e}"); None }
+        mmq_q4_0_batched: match load_fn_sm80(shaders::MMQ_Q4_0_KERNEL_SOURCE, "mmq_q4_0_batched") {
+            Ok(f) => {
+                cuda_log!("[CUDA] mmq_q4_0_batched: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] mmq_q4_0_batched: FAILED: {e}");
+                None
+            }
         },
         // residual variant. Same kernel source compiles both entry points.
         mmq_q4_0_batched_residual: match load_fn_sm80(
             shaders::MMQ_Q4_0_KERNEL_SOURCE,
             "mmq_q4_0_batched_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] mmq_q4_0_batched_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] mmq_q4_0_batched_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] mmq_q4_0_batched_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] mmq_q4_0_batched_residual: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_0_aligned: match load_fn_sm80(
             shaders::MATVEC_Q8_0_ALIGNED_KERNEL_SOURCE,
             "matvec_q8_0_aligned",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] Q8_0 aligned dp4a kernel: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] Q8_0 aligned dp4a kernel: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_0_aligned_residual: match load_fn_sm80(
             shaders::MATVEC_Q8_0_ALIGNED_KERNEL_SOURCE,
             "matvec_q8_0_aligned_residual",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] Q8_0 aligned dp4a residual: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] Q8_0 aligned dp4a residual: FAILED: {e}");
+                None
+            }
         },
         repack_q8_0_to_aligned36: match load_fn(
             shaders::REPACK_Q8_ALIGNED_KERNEL_SOURCE,
             "repack_q8_0_to_aligned36",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] repack_q8_0_to_aligned36: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] repack_q8_0_to_aligned36: FAILED: {e}");
+                None
+            }
         },
-        matvec_q8_0_v4: load_fn_sm80(
-            shaders::MATVEC_Q8_0_V4_KERNEL_SOURCE,
-            "matvec_q8_0_v4",
-        ).ok(),
+        matvec_q8_0_v4: load_fn_sm80(shaders::MATVEC_Q8_0_V4_KERNEL_SOURCE, "matvec_q8_0_v4").ok(),
         matvec_q8_0_v4_residual: load_fn_sm80(
             shaders::MATVEC_Q8_0_V4_KERNEL_SOURCE,
             "matvec_q8_0_v4_residual",
-        ).ok(),
+        )
+        .ok(),
         flash_attention_wmma: match load_fn_sm80(
             shaders::FLASH_ATTENTION_WMMA_KERNEL_SOURCE,
             "flash_attention_wmma",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] WMMA flash attention: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] WMMA flash attention: FAILED: {e}");
+                None
+            }
         },
         flash_attention_wmma_qkf32: load_fn_sm80(
             shaders::FLASH_ATTENTION_WMMA_KERNEL_SOURCE,
             "flash_attention_wmma_qkf32",
-        ).ok(),
+        )
+        .ok(),
         flash_attention_wmma_pvf32: load_fn_sm80(
             shaders::FLASH_ATTENTION_WMMA_KERNEL_SOURCE,
             "flash_attention_wmma_pvf32",
-        ).ok(),
+        )
+        .ok(),
         flash_attention_wmma_split: load_fn_sm80(
             shaders::FLASH_ATTENTION_WMMA_KERNEL_SOURCE,
             "flash_attention_wmma_split",
-        ).ok(),
+        )
+        .ok(),
         flash_attention_fa2_causal: match load_fn(
             shaders::FLASH_ATTENTION_FA2_KERNEL_SOURCE,
             "flash_attention_fa2_causal",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] FA2 block-skip: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] FA2 block-skip: FAILED: {e}");
+                None
+            }
         },
         flash_attention_fa2_splitk_partial: match load_fn(
             shaders::FLASH_ATTENTION_FA2_KERNEL_SOURCE,
             "flash_attention_fa2_splitk_partial",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] FA2 Split-K partial: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] FA2 Split-K partial: FAILED: {e}");
+                None
+            }
         },
         flash_attention_fa2_splitk_reduce: match load_fn(
             shaders::FLASH_ATTENTION_FA2_KERNEL_SOURCE,
             "flash_attention_fa2_splitk_reduce",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] FA2 Split-K reduce: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] FA2 Split-K reduce: FAILED: {e}");
+                None
+            }
         },
         argmax_f32: load_fn(shaders::ARGMAX_KERNEL_SOURCE, "argmax_f32")?,
         // Q8_0 shared-memory matvec (PRIMARY Q8_0 decode path)
-        matvec_q8_0_smem: match load_fn(
-            shaders::MATVEC_Q8_0_SMEM_KERNEL_SOURCE,
-            "matvec_q8_0_smem",
-        ) {
-            Ok(f) => { cuda_log!("[CUDA] Q8_0 smem matvec: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] Q8_0 smem matvec: FAILED: {e}"); None }
+        matvec_q8_0_smem: match load_fn(shaders::MATVEC_Q8_0_SMEM_KERNEL_SOURCE, "matvec_q8_0_smem")
+        {
+            Ok(f) => {
+                cuda_log!("[CUDA] Q8_0 smem matvec: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] Q8_0 smem matvec: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_0_smem_residual: match load_fn(
             shaders::MATVEC_Q8_0_SMEM_KERNEL_SOURCE,
             "matvec_q8_0_smem_residual",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] Q8_0 smem matvec residual: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] Q8_0 smem matvec residual: FAILED: {e}");
+                None
+            }
         },
         // Q4_0 shared-memory matvec (PRIMARY Q4_0 decode path)
-        matvec_q4_0_smem: match load_fn(
-            shaders::MATVEC_Q4_0_SMEM_KERNEL_SOURCE,
-            "matvec_q4_0_smem",
-        ) {
-            Ok(f) => { cuda_log!("[CUDA] Q4_0 smem matvec: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] Q4_0 smem matvec: FAILED: {e}"); None }
+        matvec_q4_0_smem: match load_fn(shaders::MATVEC_Q4_0_SMEM_KERNEL_SOURCE, "matvec_q4_0_smem")
+        {
+            Ok(f) => {
+                cuda_log!("[CUDA] Q4_0 smem matvec: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] Q4_0 smem matvec: FAILED: {e}");
+                None
+            }
         },
         matvec_q4_0_smem_residual: match load_fn(
             shaders::MATVEC_Q4_0_SMEM_KERNEL_SOURCE,
             "matvec_q4_0_smem_residual",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] Q4_0 smem matvec residual: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] Q4_0 smem matvec residual: FAILED: {e}");
+                None
+            }
         },
         // GDN kernels (for Qwen3.5 hybrid layers)
         ssm_conv1d_decode: load_fn(shaders::GDN_KERNEL_SOURCE, "ssm_conv1d_decode").ok(),
@@ -1243,237 +1303,407 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         l2_normalize_heads: load_fn(shaders::GDN_KERNEL_SOURCE, "l2_normalize_heads").ok(),
         gdn_state_update: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_state_update").ok(),
         silu_inplace: load_fn(shaders::ACTIVATIONS_KERNEL_SOURCE, "silu_inplace").ok(),
-        silu_elementwise_mul: load_fn(shaders::ACTIVATIONS_KERNEL_SOURCE, "silu_elementwise_mul").ok(),
+        silu_elementwise_mul: load_fn(shaders::ACTIVATIONS_KERNEL_SOURCE, "silu_elementwise_mul")
+            .ok(),
         // GDN fused decode megakernels (8 -> 2 launches per GDN layer)
         gdn_decode_megakernel: match load_fn(
             shaders::GDN_MEGAKERNEL_SOURCE,
             "gdn_decode_megakernel",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_decode_megakernel: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_decode_megakernel: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_decode_megakernel: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_decode_megakernel: FAILED: {e}");
+                None
+            }
         },
         gdn_rmsnorm_silu_gate: match load_fn(
             shaders::GDN_MEGAKERNEL_SOURCE,
             "gdn_rmsnorm_silu_gate",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_rmsnorm_silu_gate: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_rmsnorm_silu_gate: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_rmsnorm_silu_gate: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_rmsnorm_silu_gate: FAILED: {e}");
+                None
+            }
         },
         // graph-compatible megakernel (state_pos via device pointer).
         gdn_decode_megakernel_graph: match load_fn(
             shaders::GDN_MEGAKERNEL_SOURCE,
             "gdn_decode_megakernel_graph",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_decode_megakernel_graph: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_decode_megakernel_graph: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_decode_megakernel_graph: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_decode_megakernel_graph: FAILED: {e}");
+                None
+            }
         },
         // F64-accum decode megakernel twins (MoE decode/prefill precision parity)
         gdn_decode_megakernel_f64accum: match load_fn(
             shaders::GDN_MEGAKERNEL_SOURCE,
             "gdn_decode_megakernel_f64accum",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_decode_megakernel_f64accum: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_decode_megakernel_f64accum: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_decode_megakernel_f64accum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_decode_megakernel_f64accum: FAILED: {e}");
+                None
+            }
         },
         gdn_decode_megakernel_graph_f64accum: match load_fn(
             shaders::GDN_MEGAKERNEL_SOURCE,
             "gdn_decode_megakernel_graph_f64accum",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_decode_megakernel_graph_f64accum: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_decode_megakernel_graph_f64accum: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_decode_megakernel_graph_f64accum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_decode_megakernel_graph_f64accum: FAILED: {e}");
+                None
+            }
         },
         // GDN two-launch decode kernel pair (env-gated alternative)
         gdn_phase123_register_resident: match load_fn(
             shaders::GDN_REGISTER_RESIDENT_KERNEL_SOURCE,
             "gdn_phase123_register_resident",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_phase123_register_resident: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_phase123_register_resident: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_phase123_register_resident: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_phase123_register_resident: FAILED: {e}");
+                None
+            }
         },
         gdn_phase4_register_resident: match load_fn(
             shaders::GDN_REGISTER_RESIDENT_KERNEL_SOURCE,
             "gdn_phase4_register_resident",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_phase4_register_resident: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_phase4_register_resident: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_phase4_register_resident: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_phase4_register_resident: FAILED: {e}");
+                None
+            }
         },
         // CUDA graph-capturable variant (device-pointer state_pos)
         gdn_phase123_register_resident_graph: match load_fn(
             shaders::GDN_REGISTER_RESIDENT_KERNEL_SOURCE,
             "gdn_phase123_register_resident_graph",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_phase123_register_resident_graph: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_phase123_register_resident_graph: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_phase123_register_resident_graph: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_phase123_register_resident_graph: FAILED: {e}");
+                None
+            }
         },
         // GDN Phase 4 coalesced variant (env-gated default OFF)
         gdn_phase4_register_resident_coal: match load_fn(
             shaders::GDN_REGISTER_RESIDENT_KERNEL_SOURCE,
             "gdn_phase4_register_resident_coal",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_phase4_register_resident_coal: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_phase4_register_resident_coal: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_phase4_register_resident_coal: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_phase4_register_resident_coal: FAILED: {e}");
+                None
+            }
         },
         // GDN fused prefill kernels
-        ssm_conv1d_silu_prefill: load_fn(shaders::GDN_KERNEL_SOURCE, "ssm_conv1d_silu_prefill").ok(),
-        gdn_compute_gates_batched: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_compute_gates_batched").ok(),
-        l2_normalize_qk_strided: load_fn(shaders::GDN_KERNEL_SOURCE, "l2_normalize_qk_strided").ok(),
-        l2_normalize_qk_strided_rsqrtf: load_fn(shaders::GDN_KERNEL_SOURCE, "l2_normalize_qk_strided_rsqrtf").ok(),
+        ssm_conv1d_silu_prefill: load_fn(shaders::GDN_KERNEL_SOURCE, "ssm_conv1d_silu_prefill")
+            .ok(),
+        gdn_compute_gates_batched: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_compute_gates_batched")
+            .ok(),
+        l2_normalize_qk_strided: load_fn(shaders::GDN_KERNEL_SOURCE, "l2_normalize_qk_strided")
+            .ok(),
+        l2_normalize_qk_strided_rsqrtf: load_fn(
+            shaders::GDN_KERNEL_SOURCE,
+            "l2_normalize_qk_strided_rsqrtf",
+        )
+        .ok(),
         gdn_prefill_fused_v3: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_fused_v3").ok(),
         gdn_prefill_norm_gate: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_norm_gate").ok(),
         // RMSNorm + SiLU-gate variant. Loaded best-effort;
         // engaged only when LUMEN_CUDA_RMSNORM_RSQRTF=1 is set.
-        gdn_prefill_norm_gate_rsqrtf: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_norm_gate_rsqrtf").ok(),
+        gdn_prefill_norm_gate_rsqrtf: load_fn(
+            shaders::GDN_KERNEL_SOURCE,
+            "gdn_prefill_norm_gate_rsqrtf",
+        )
+        .ok(),
         // accumulator variants. Default-OFF; loaded best-effort.
         l2_normalize_qk_strided_f64accum: match load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,
             "l2_normalize_qk_strided_f64accum",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] l2_normalize_qk_strided_f64accum: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] l2_normalize_qk_strided_f64accum: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] l2_normalize_qk_strided_f64accum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] l2_normalize_qk_strided_f64accum: FAILED: {e}");
+                None
+            }
         },
         gdn_prefill_fused_v3_f64accum: match load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,
             "gdn_prefill_fused_v3_f64accum",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_prefill_fused_v3_f64accum: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_prefill_fused_v3_f64accum: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_prefill_fused_v3_f64accum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_prefill_fused_v3_f64accum: FAILED: {e}");
+                None
+            }
         },
         gdn_prefill_norm_gate_f64accum: match load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,
             "gdn_prefill_norm_gate_f64accum",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_prefill_norm_gate_f64accum: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_prefill_norm_gate_f64accum: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_prefill_norm_gate_f64accum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_prefill_norm_gate_f64accum: FAILED: {e}");
+                None
+            }
         },
         gdn_phase4_register_resident_f64accum: match load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,
             "gdn_phase4_register_resident_f64accum",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_phase4_register_resident_f64accum: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_phase4_register_resident_f64accum: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_phase4_register_resident_f64accum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_phase4_register_resident_f64accum: FAILED: {e}");
+                None
+            }
         },
         gdn_phase4_register_resident_f64accum_prefillorder: match load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,
             "gdn_phase4_register_resident_f64accum_prefillorder",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_phase4_register_resident_f64accum_prefillorder: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_phase4_register_resident_f64accum_prefillorder: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_phase4_register_resident_f64accum_prefillorder: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_phase4_register_resident_f64accum_prefillorder: FAILED: {e}");
+                None
+            }
         },
         gdn_rmsnorm_silu_gate_f64accum: match load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,
             "gdn_rmsnorm_silu_gate_f64accum",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_rmsnorm_silu_gate_f64accum: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_rmsnorm_silu_gate_f64accum: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_rmsnorm_silu_gate_f64accum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_rmsnorm_silu_gate_f64accum: FAILED: {e}");
+                None
+            }
         },
         gdn_phase123_register_resident_f64accum: match load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,
             "gdn_phase123_register_resident_f64accum",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_phase123_register_resident_f64accum: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_phase123_register_resident_f64accum: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_phase123_register_resident_f64accum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_phase123_register_resident_f64accum: FAILED: {e}");
+                None
+            }
         },
         gdn_phase123_register_resident_graph_f64accum: match load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,
             "gdn_phase123_register_resident_graph_f64accum",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_phase123_register_resident_graph_f64accum: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_phase123_register_resident_graph_f64accum: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_phase123_register_resident_graph_f64accum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_phase123_register_resident_graph_f64accum: FAILED: {e}");
+                None
+            }
         },
         gdn_phase123_register_resident_alignl2: match load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,
             "gdn_phase123_register_resident_alignl2",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_phase123_register_resident_alignl2: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_phase123_register_resident_alignl2: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_phase123_register_resident_alignl2: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_phase123_register_resident_alignl2: FAILED: {e}");
+                None
+            }
         },
         gdn_phase123_register_resident_graph_alignl2: match load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,
             "gdn_phase123_register_resident_graph_alignl2",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] gdn_phase123_register_resident_graph_alignl2: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] gdn_phase123_register_resident_graph_alignl2: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] gdn_phase123_register_resident_graph_alignl2: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] gdn_phase123_register_resident_graph_alignl2: FAILED: {e}");
+                None
+            }
         },
         // Fused F16 decode kernels (dispatch count reduction)
-        fused_rmsnorm_f16: match load_fn(
-            shaders::FUSED_F16_KERNEL_SOURCE,
-            "fused_rmsnorm_f16",
-        ) {
-            Ok(f) => { cuda_log!("[CUDA] fused_rmsnorm_f16: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] fused_rmsnorm_f16: FAILED: {e}"); None }
+        fused_rmsnorm_f16: match load_fn(shaders::FUSED_F16_KERNEL_SOURCE, "fused_rmsnorm_f16") {
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_rmsnorm_f16: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_rmsnorm_f16: FAILED: {e}");
+                None
+            }
         },
-        swiglu_f32_to_f16: match load_fn(
-            shaders::FUSED_F16_KERNEL_SOURCE,
-            "swiglu_f32_to_f16",
-        ) {
-            Ok(f) => { cuda_log!("[CUDA] swiglu_f32_to_f16: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] swiglu_f32_to_f16: FAILED: {e}"); None }
+        swiglu_f32_to_f16: match load_fn(shaders::FUSED_F16_KERNEL_SOURCE, "swiglu_f32_to_f16") {
+            Ok(f) => {
+                cuda_log!("[CUDA] swiglu_f32_to_f16: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] swiglu_f32_to_f16: FAILED: {e}");
+                None
+            }
         },
         fused_residual_rmsnorm_f16: match load_fn(
             shaders::FUSED_F16_KERNEL_SOURCE,
             "fused_residual_rmsnorm_f16",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] fused_residual_rmsnorm_f16: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] fused_residual_rmsnorm_f16: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_residual_rmsnorm_f16: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_residual_rmsnorm_f16: FAILED: {e}");
+                None
+            }
         },
         fused_residual_rmsnorm_f32: match load_fn(
             shaders::NORM_KERNEL_SOURCE,
             "fused_residual_rmsnorm_f32",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] fused_residual_rmsnorm_f32: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] fused_residual_rmsnorm_f32: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_residual_rmsnorm_f32: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_residual_rmsnorm_f32: FAILED: {e}");
+                None
+            }
         },
         fused_residual_rms_scale: match load_fn(
             shaders::NORM_KERNEL_SOURCE,
             "fused_residual_rms_scale",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] fused_residual_rms_scale: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] fused_residual_rms_scale: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_residual_rms_scale: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_residual_rms_scale: FAILED: {e}");
+                None
+            }
         },
         // Fused F16 prefill kernels (dispatch count reduction for batched HGEMM)
         fused_rmsnorm_f16_batched: match load_fn(
             shaders::FUSED_F16_KERNEL_SOURCE,
             "fused_rmsnorm_f16_batched",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] fused_rmsnorm_f16_batched: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] fused_rmsnorm_f16_batched: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_rmsnorm_f16_batched: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_rmsnorm_f16_batched: FAILED: {e}");
+                None
+            }
         },
         swiglu_f32_to_f16_batched: match load_fn(
             shaders::FUSED_F16_KERNEL_SOURCE,
             "swiglu_f32_to_f16_batched",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] swiglu_f32_to_f16_batched: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] swiglu_f32_to_f16_batched: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] swiglu_f32_to_f16_batched: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] swiglu_f32_to_f16_batched: FAILED: {e}");
+                None
+            }
         },
         // Q8_0 dequant-in-register HGEMV (F16 x-vector shmem, NR=4)
-        hgemv_q8_0: match load_fn(
-            shaders::HGEMV_Q8_0_KERNEL_SOURCE,
-            "hgemv_q8_0",
-        ) {
-            Ok(f) => { cuda_log!("[CUDA] hgemv_q8_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] hgemv_q8_0: FAILED: {e}"); None }
+        hgemv_q8_0: match load_fn(shaders::HGEMV_Q8_0_KERNEL_SOURCE, "hgemv_q8_0") {
+            Ok(f) => {
+                cuda_log!("[CUDA] hgemv_q8_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] hgemv_q8_0: FAILED: {e}");
+                None
+            }
         },
-        hgemv_q8_0_residual: match load_fn(
-            shaders::HGEMV_Q8_0_KERNEL_SOURCE,
-            "hgemv_q8_0_residual",
-        ) {
+        hgemv_q8_0_residual: match load_fn(shaders::HGEMV_Q8_0_KERNEL_SOURCE, "hgemv_q8_0_residual")
+        {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] hgemv_q8_0_residual: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] hgemv_q8_0_residual: FAILED: {e}");
+                None
+            }
         },
         // Q4_0 dequant-in-register HGEMV (F16 x-vector shmem, NR=4)
-        hgemv_q4_0: match load_fn(
-            shaders::HGEMV_Q4_0_KERNEL_SOURCE,
-            "hgemv_q4_0",
-        ) {
-            Ok(f) => { cuda_log!("[CUDA] hgemv_q4_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] hgemv_q4_0: FAILED: {e}"); None }
+        hgemv_q4_0: match load_fn(shaders::HGEMV_Q4_0_KERNEL_SOURCE, "hgemv_q4_0") {
+            Ok(f) => {
+                cuda_log!("[CUDA] hgemv_q4_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] hgemv_q4_0: FAILED: {e}");
+                None
+            }
         },
-        hgemv_q4_0_residual: match load_fn(
-            shaders::HGEMV_Q4_0_KERNEL_SOURCE,
-            "hgemv_q4_0_residual",
-        ) {
+        hgemv_q4_0_residual: match load_fn(shaders::HGEMV_Q4_0_KERNEL_SOURCE, "hgemv_q4_0_residual")
+        {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] hgemv_q4_0_residual: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] hgemv_q4_0_residual: FAILED: {e}");
+                None
+            }
         },
         // dp4a with pre-quantized Q8_1 input
         // Compiled with --use_fast_math for accelerated scale multiplication.
@@ -1481,22 +1711,37 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MATVEC_DP4A_Q8_1_KERNEL_SOURCE,
             "quantize_f32_to_q8_1",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] quantize_f32_to_q8_1: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] quantize_f32_to_q8_1: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] quantize_f32_to_q8_1: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] quantize_f32_to_q8_1: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_0_q8_1: match load_fn_sm80_fast_math(
             shaders::MATVEC_DP4A_Q8_1_KERNEL_SOURCE,
             "matvec_q8_0_q8_1",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_0_q8_1: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_0_q8_1: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_0_q8_1: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_0_q8_1: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_0_q8_1_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_DP4A_Q8_1_KERNEL_SOURCE,
             "matvec_q8_0_q8_1_residual",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_0_q8_1_residual: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_0_q8_1_residual: FAILED: {e}");
+                None
+            }
         },
         // Q4_0 dp4a with pre-quantized Q8_1 input (NR=4, nibble unpack + dp4a)
         // Compiled with --use_fast_math for accelerated scale multiplication.
@@ -1504,15 +1749,27 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MATVEC_Q4_0_DP4A_KERNEL_SOURCE,
             "matvec_q4_0_dp4a",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q4_0_dp4a: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q4_0_dp4a: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_0_dp4a: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_0_dp4a: FAILED: {e}");
+                None
+            }
         },
         matvec_q4_0_dp4a_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_0_DP4A_KERNEL_SOURCE,
             "matvec_q4_0_dp4a_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q4_0_dp4a_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q4_0_dp4a_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_0_dp4a_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_0_dp4a_residual: FAILED: {e}");
+                None
+            }
         },
         // Q4Aligned + Q8_1 input dp4a (NR=4, aligned int* nibble loads)
         // Compiled with --use_fast_math for accelerated scale multiplication.
@@ -1520,15 +1777,27 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MATVEC_Q4_ALIGNED_Q8_1_KERNEL_SOURCE,
             "matvec_q4_aligned_q8_1",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q4_aligned_q8_1: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q4_aligned_q8_1: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_aligned_q8_1: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_aligned_q8_1: FAILED: {e}");
+                None
+            }
         },
         matvec_q4_aligned_q8_1_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_ALIGNED_Q8_1_KERNEL_SOURCE,
             "matvec_q4_aligned_q8_1_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q4_aligned_q8_1_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q4_aligned_q8_1_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_aligned_q8_1_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_aligned_q8_1_residual: FAILED: {e}");
+                None
+            }
         },
         // Repack Q4_0 to 20-byte aligned blocks
         repack_q4_0_to_aligned20: match load_fn(
@@ -1536,7 +1805,10 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             "repack_q4_0_to_aligned20",
         ) {
             Ok(f) => Some(f),
-            Err(e) => { cuda_log!("[CUDA] repack_q4_0_to_aligned20: FAILED: {e}"); None }
+            Err(e) => {
+                cuda_log!("[CUDA] repack_q4_0_to_aligned20: FAILED: {e}");
+                None
+            }
         },
         // Optimal Q8Aligned + Q8_1 input dp4a (NR=2, both sides aligned)
         // Compiled with --use_fast_math for accelerated scale multiplication.
@@ -1544,15 +1816,27 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MATVEC_Q8_ALIGNED_Q8_1_KERNEL_SOURCE,
             "matvec_q8_aligned_q8_1",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_aligned_q8_1: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_aligned_q8_1: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_q8_1: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_q8_1: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_aligned_q8_1_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_ALIGNED_Q8_1_KERNEL_SOURCE,
             "matvec_q8_aligned_q8_1_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_aligned_q8_1_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_aligned_q8_1_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_q8_1_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_q8_1_residual: FAILED: {e}");
+                None
+            }
         },
         // split-layout integration: NVRTC compile of split-layout, scale-HW, and
         // output_proj split kernels. All `Option<CudaFunction>` so the failure
@@ -1563,58 +1847,106 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MATVEC_Q8_ALIGNED_Q8_1_HW_KERNEL_SOURCE,
             "matvec_q8_aligned_q8_1_hw",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_aligned_q8_1_hw: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_aligned_q8_1_hw: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_q8_1_hw: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_q8_1_hw: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_aligned_q8_1_hw_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_ALIGNED_Q8_1_HW_KERNEL_SOURCE,
             "matvec_q8_aligned_q8_1_hw_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_aligned_q8_1_hw_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_aligned_q8_1_hw_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_q8_1_hw_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_q8_1_hw_residual: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_split_q8_1: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_SPLIT_Q8_1_KERNEL_SOURCE,
             "matvec_q8_split_q8_1",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_split_q8_1: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_split_q8_1: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_split_q8_1_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_SPLIT_Q8_1_KERNEL_SOURCE,
             "matvec_q8_split_q8_1_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_split_q8_1_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_split_q8_1_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_residual: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_split_q8_1_4thread: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_SPLIT_Q8_1_4THREAD_KERNEL_SOURCE,
             "matvec_q8_split_q8_1_4thread",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_split_q8_1_4thread: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_split_q8_1_4thread: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_4thread: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_4thread: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_split_q8_1_4thread_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_SPLIT_Q8_1_4THREAD_KERNEL_SOURCE,
             "matvec_q8_split_q8_1_4thread_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_split_q8_1_4thread_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_split_q8_1_4thread_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_4thread_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_4thread_residual: FAILED: {e}");
+                None
+            }
         },
         // NR=8 split-Q8 matvec (4-threads-per-block, NR=8 rows/CTA).
         matvec_q8_split_q8_1_nr8: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_SPLIT_Q8_1_NR8_KERNEL_SOURCE,
             "matvec_q8_split_q8_1_nr8",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_split_q8_1_nr8: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_split_q8_1_nr8: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_nr8: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_nr8: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_split_q8_1_nr8_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_SPLIT_Q8_1_NR8_KERNEL_SOURCE,
             "matvec_q8_split_q8_1_nr8_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_split_q8_1_nr8_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_split_q8_1_nr8_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_nr8_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_nr8_residual: FAILED: {e}");
+                None
+            }
         },
         // AoS NR=8 matvec (4-threads-per-block thread mapping on Lumen's
         // 36-byte aligned block layout).
@@ -1622,29 +1954,53 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MATVEC_Q8_ALIGNED_NR8_KERNEL_SOURCE,
             "matvec_q8_aligned_nr8",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_aligned_nr8: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_aligned_nr8: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_nr8: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_nr8: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_aligned_nr8_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_ALIGNED_NR8_KERNEL_SOURCE,
             "matvec_q8_aligned_nr8_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_aligned_nr8_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_aligned_nr8_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_nr8_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_nr8_residual: FAILED: {e}");
+                None
+            }
         },
         matvec_q4_split_q8_1: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE,
             "matvec_q4_split_q8_1",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q4_split_q8_1: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q4_split_q8_1: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1: FAILED: {e}");
+                None
+            }
         },
         matvec_q4_split_q8_1_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE,
             "matvec_q4_split_q8_1_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q4_split_q8_1_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q4_split_q8_1_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_residual: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_split_output_proj: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_SPLIT_OUTPUT_PROJ_KERNEL_SOURCE,
@@ -1652,8 +2008,14 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         ) {
             // The .cu file exports nr16/nr32/nr64/nr128 variants -- pick nr32 as
             // a reasonable middle ground for Qwen3.5-9B's 248320x4096 shape.
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_split_output_proj (nr32): OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_split_output_proj_nr32: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_split_output_proj (nr32): OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_split_output_proj_nr32: FAILED: {e}");
+                None
+            }
         },
         // explicit NR=8/16/64/128 handles for `LUMEN_CUDA_OUTPUT_PROJ_NR`.
         // Failure to load is non-fatal; dispatch falls back to nr32 above.
@@ -1661,43 +2023,79 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MATVEC_Q8_SPLIT_OUTPUT_PROJ_KERNEL_SOURCE,
             "matvec_q8_split_output_proj_nr8",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_split_output_proj_nr8: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_split_output_proj_nr8: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_split_output_proj_nr8: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_split_output_proj_nr8: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_split_output_proj_nr16: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_SPLIT_OUTPUT_PROJ_KERNEL_SOURCE,
             "matvec_q8_split_output_proj_nr16",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_split_output_proj_nr16: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_split_output_proj_nr16: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_split_output_proj_nr16: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_split_output_proj_nr16: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_split_output_proj_nr64: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_SPLIT_OUTPUT_PROJ_KERNEL_SOURCE,
             "matvec_q8_split_output_proj_nr64",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_split_output_proj_nr64: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_split_output_proj_nr64: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_split_output_proj_nr64: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_split_output_proj_nr64: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_split_output_proj_nr128: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_SPLIT_OUTPUT_PROJ_KERNEL_SOURCE,
             "matvec_q8_split_output_proj_nr128",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_split_output_proj_nr128: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_split_output_proj_nr128: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_split_output_proj_nr128: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_split_output_proj_nr128: FAILED: {e}");
+                None
+            }
         },
         repack_q8_raw_to_split: match load_fn(
             shaders::REPACK_Q8_RAW_TO_SPLIT_KERNEL_SOURCE,
             "repack_q8_raw_to_split",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] repack_q8_raw_to_split: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] repack_q8_raw_to_split: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] repack_q8_raw_to_split: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] repack_q8_raw_to_split: FAILED: {e}");
+                None
+            }
         },
         repack_q4_raw_to_split: match load_fn(
             shaders::REPACK_Q4_RAW_TO_SPLIT_KERNEL_SOURCE,
             "repack_q4_raw_to_split",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] repack_q4_raw_to_split: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] repack_q4_raw_to_split: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] repack_q4_raw_to_split: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] repack_q4_raw_to_split: FAILED: {e}");
+                None
+            }
         },
         // TILE: tile-grouped Q8 / Q4 matvec kernels + one-time repack
         // kernels. Failures are non-fatal -- caller falls back to SPLIT /
@@ -1706,94 +2104,172 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MATVEC_Q8_TILE_Q8_1_KERNEL_SOURCE,
             "matvec_q8_tile_q8_1",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_tile_q8_1: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_tile_q8_1: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_tile_q8_1: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_tile_q8_1: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_tile_q8_1_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_TILE_Q8_1_KERNEL_SOURCE,
             "matvec_q8_tile_q8_1_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_tile_q8_1_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_tile_q8_1_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_tile_q8_1_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_tile_q8_1_residual: FAILED: {e}");
+                None
+            }
         },
         matvec_q4_tile_q8_1: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_TILE_Q8_1_KERNEL_SOURCE,
             "matvec_q4_tile_q8_1",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q4_tile_q8_1: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q4_tile_q8_1: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_tile_q8_1: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_tile_q8_1: FAILED: {e}");
+                None
+            }
         },
         matvec_q4_tile_q8_1_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_TILE_Q8_1_KERNEL_SOURCE,
             "matvec_q4_tile_q8_1_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q4_tile_q8_1_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q4_tile_q8_1_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_tile_q8_1_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_tile_q8_1_residual: FAILED: {e}");
+                None
+            }
         },
         repack_q8_raw_to_tile: match load_fn(
             shaders::REPACK_Q8_TILE_KERNEL_SOURCE,
             "repack_q8_raw_to_tile",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] repack_q8_raw_to_tile: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] repack_q8_raw_to_tile: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] repack_q8_raw_to_tile: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] repack_q8_raw_to_tile: FAILED: {e}");
+                None
+            }
         },
         repack_q4_raw_to_tile: match load_fn(
             shaders::REPACK_Q4_TILE_KERNEL_SOURCE,
             "repack_q4_raw_to_tile",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] repack_q4_raw_to_tile: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] repack_q4_raw_to_tile: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] repack_q4_raw_to_tile: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] repack_q4_raw_to_tile: FAILED: {e}");
+                None
+            }
         },
         // Fused gate+up+SwiGLU GEMV with inline RMSNorm
         fused_glu_gemv_q8_0: match load_fn(
             shaders::FUSED_GLU_GEMV_KERNEL_SOURCE,
             "fused_glu_gemv_q8_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] fused_glu_gemv_q8_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] fused_glu_gemv_q8_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q8_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q8_0: FAILED: {e}");
+                None
+            }
         },
         fused_glu_gemv_q4_0: match load_fn(
             shaders::FUSED_GLU_GEMV_KERNEL_SOURCE,
             "fused_glu_gemv_q4_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] fused_glu_gemv_q4_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] fused_glu_gemv_q4_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q4_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q4_0: FAILED: {e}");
+                None
+            }
         },
         fused_glu_gemv_f16: match load_fn(
             shaders::FUSED_GLU_GEMV_KERNEL_SOURCE,
             "fused_glu_gemv_f16",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] fused_glu_gemv_f16: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] fused_glu_gemv_f16: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_glu_gemv_f16: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_glu_gemv_f16: FAILED: {e}");
+                None
+            }
         },
         fused_glu_gemv_q8_0_hg: match load_fn(
             shaders::FUSED_GLU_GEMV_KERNEL_SOURCE,
             "fused_glu_gemv_q8_0_hg",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] fused_glu_gemv_q8_0_hg: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] fused_glu_gemv_q8_0_hg: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q8_0_hg: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q8_0_hg: FAILED: {e}");
+                None
+            }
         },
         fused_glu_gemv_q4_0_hg: match load_fn(
             shaders::FUSED_GLU_GEMV_KERNEL_SOURCE,
             "fused_glu_gemv_q4_0_hg",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] fused_glu_gemv_q4_0_hg: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] fused_glu_gemv_q4_0_hg: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q4_0_hg: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q4_0_hg: FAILED: {e}");
+                None
+            }
         },
         // Fused gate+up+SwiGLU GEMV for Q8Aligned (36-byte blocks)
         fused_glu_gemv_q8_aligned: match load_fn(
             shaders::FUSED_GLU_GEMV_KERNEL_SOURCE,
             "fused_glu_gemv_q8_aligned",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] fused_glu_gemv_q8_aligned: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] fused_glu_gemv_q8_aligned: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q8_aligned: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q8_aligned: FAILED: {e}");
+                None
+            }
         },
         fused_glu_gemv_q8_aligned_hg: match load_fn(
             shaders::FUSED_GLU_GEMV_KERNEL_SOURCE,
             "fused_glu_gemv_q8_aligned_hg",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] fused_glu_gemv_q8_aligned_hg: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] fused_glu_gemv_q8_aligned_hg: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q8_aligned_hg: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q8_aligned_hg: FAILED: {e}");
+                None
+            }
         },
         // Fused down projection: inline F32->Q8_1 quantize + dp4a matvec
         // Compiled with --use_fast_math for accelerated scale multiplication.
@@ -1801,29 +2277,53 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MATVEC_Q8_ALIGNED_FUSED_DOWN_KERNEL_SOURCE,
             "matvec_q8_aligned_f32",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_aligned_f32: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_aligned_f32: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_f32: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_f32: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_aligned_f32_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_ALIGNED_FUSED_DOWN_KERNEL_SOURCE,
             "matvec_q8_aligned_f32_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_aligned_f32_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_aligned_f32_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_f32_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_f32_residual: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_aligned_f32_swiglu: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_ALIGNED_FUSED_DOWN_KERNEL_SOURCE,
             "matvec_q8_aligned_f32_swiglu",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_aligned_f32_swiglu: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_aligned_f32_swiglu: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_f32_swiglu: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_f32_swiglu: FAILED: {e}");
+                None
+            }
         },
         matvec_q8_aligned_f32_swiglu_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_ALIGNED_FUSED_DOWN_KERNEL_SOURCE,
             "matvec_q8_aligned_f32_swiglu_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q8_aligned_f32_swiglu_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q8_aligned_f32_swiglu_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_f32_swiglu_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_f32_swiglu_residual: FAILED: {e}");
+                None
+            }
         },
         // Fused down projection for Q4Aligned: inline F32->Q8_1 quantize + dp4a.
         // Compiled with --use_fast_math for accelerated scale multiplication.
@@ -1831,81 +2331,136 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MATVEC_Q4_ALIGNED_FUSED_DOWN_KERNEL_SOURCE,
             "matvec_q4_aligned_f32",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q4_aligned_f32: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q4_aligned_f32: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_aligned_f32: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_aligned_f32: FAILED: {e}");
+                None
+            }
         },
         matvec_q4_aligned_f32_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_ALIGNED_FUSED_DOWN_KERNEL_SOURCE,
             "matvec_q4_aligned_f32_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q4_aligned_f32_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q4_aligned_f32_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_aligned_f32_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_aligned_f32_residual: FAILED: {e}");
+                None
+            }
         },
         matvec_q4_aligned_f32_swiglu: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_ALIGNED_FUSED_DOWN_KERNEL_SOURCE,
             "matvec_q4_aligned_f32_swiglu",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q4_aligned_f32_swiglu: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q4_aligned_f32_swiglu: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_aligned_f32_swiglu: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_aligned_f32_swiglu: FAILED: {e}");
+                None
+            }
         },
         matvec_q4_aligned_f32_swiglu_residual: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_ALIGNED_FUSED_DOWN_KERNEL_SOURCE,
             "matvec_q4_aligned_f32_swiglu_residual",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] matvec_q4_aligned_f32_swiglu_residual: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] matvec_q4_aligned_f32_swiglu_residual: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_aligned_f32_swiglu_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_aligned_f32_swiglu_residual: FAILED: {e}");
+                None
+            }
         },
         // Fused RMSNorm + Q8_1 quantization (dispatch count reduction for Q8_0 dp4a path)
-        rmsnorm_to_q8_1: match load_fn(
-            shaders::RMSNORM_Q8_1_KERNEL_SOURCE,
-            "rmsnorm_to_q8_1",
-        ) {
-            Ok(f) => { cuda_log!("[CUDA] rmsnorm_to_q8_1: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] rmsnorm_to_q8_1: FAILED: {e}"); None }
+        rmsnorm_to_q8_1: match load_fn(shaders::RMSNORM_Q8_1_KERNEL_SOURCE, "rmsnorm_to_q8_1") {
+            Ok(f) => {
+                cuda_log!("[CUDA] rmsnorm_to_q8_1: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] rmsnorm_to_q8_1: FAILED: {e}");
+                None
+            }
         },
         fused_residual_rmsnorm_q8_1: match load_fn(
             shaders::RMSNORM_Q8_1_KERNEL_SOURCE,
             "fused_residual_rmsnorm_q8_1",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] fused_residual_rmsnorm_q8_1: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] fused_residual_rmsnorm_q8_1: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_residual_rmsnorm_q8_1: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_residual_rmsnorm_q8_1: FAILED: {e}");
+                None
+            }
         },
         // Qwen3.5 Q+gate fusion kernels (full-attention layers)
-        deinterleave_qgate: match load_fn(
-            shaders::QGATE_FUSION_KERNEL_SOURCE,
-            "deinterleave_qgate",
-        ) {
-            Ok(f) => { cuda_log!("[CUDA] deinterleave_qgate: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] deinterleave_qgate: FAILED: {e}"); None }
+        deinterleave_qgate: match load_fn(shaders::QGATE_FUSION_KERNEL_SOURCE, "deinterleave_qgate")
+        {
+            Ok(f) => {
+                cuda_log!("[CUDA] deinterleave_qgate: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] deinterleave_qgate: FAILED: {e}");
+                None
+            }
         },
-        sigmoid_mul: match load_fn(
-            shaders::QGATE_FUSION_KERNEL_SOURCE,
-            "sigmoid_mul",
-        ) {
-            Ok(f) => { cuda_log!("[CUDA] sigmoid_mul: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] sigmoid_mul: FAILED: {e}"); None }
+        sigmoid_mul: match load_fn(shaders::QGATE_FUSION_KERNEL_SOURCE, "sigmoid_mul") {
+            Ok(f) => {
+                cuda_log!("[CUDA] sigmoid_mul: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] sigmoid_mul: FAILED: {e}");
+                None
+            }
         },
         rmsnorm_per_head_inplace: match load_fn(
             shaders::QGATE_FUSION_KERNEL_SOURCE,
             "rmsnorm_per_head_inplace",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] rmsnorm_per_head_inplace: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] rmsnorm_per_head_inplace: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] rmsnorm_per_head_inplace: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] rmsnorm_per_head_inplace: FAILED: {e}");
+                None
+            }
         },
         // MoE top-K router + accumulator (per-expert path mandatory; batched opt-in).
-        moe_router_softmax: match load_fn(
-            shaders::MOE_ROUTER_KERNEL_SOURCE,
-            "moe_router_softmax",
-        ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_router_softmax: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_router_softmax: FAILED: {e}"); None }
+        moe_router_softmax: match load_fn(shaders::MOE_ROUTER_KERNEL_SOURCE, "moe_router_softmax") {
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_router_softmax: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_router_softmax: FAILED: {e}");
+                None
+            }
         },
         moe_expert_accum_option_a: match load_fn(
             shaders::MOE_ACCUM_KERNEL_SOURCE,
             "moe_expert_accum_option_a",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_expert_accum_option_a: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_expert_accum_option_a: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_expert_accum_option_a: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_expert_accum_option_a: FAILED: {e}");
+                None
+            }
         },
         // Sub-phase F: batched-expert FFN kernels (opt-in via env var).
         // Batched kernels are INCLUDED in this revision.
@@ -1913,15 +2468,27 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MOE_BATCHED_KERNEL_SOURCE,
             "moe_batched_gate_up_swiglu_q8_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q8_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q8_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q8_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q8_0: FAILED: {e}");
+                None
+            }
         },
         moe_batched_down_accum_q8_0: match load_fn(
             shaders::MOE_BATCHED_KERNEL_SOURCE,
             "moe_batched_down_accum_q8_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_down_accum_q8_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_down_accum_q8_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_down_accum_q8_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_down_accum_q8_0: FAILED: {e}");
+                None
+            }
         },
         // V2 kernels: cooperative-CTA-per-row-tile MoE path.
         // Gated behind LUMEN_CUDA_MOE_BATCHED_V2=1 (under MOE_BATCHED=1).
@@ -1929,121 +2496,223 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MOE_BATCHED_KERNEL_SOURCE,
             "moe_router_logits_v2",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_router_logits_v2: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_router_logits_v2: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_router_logits_v2: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_router_logits_v2: FAILED: {e}");
+                None
+            }
         },
         moe_router_softmax_finalize_v2: match load_fn(
             shaders::MOE_BATCHED_KERNEL_SOURCE,
             "moe_router_softmax_finalize_v2",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_router_softmax_finalize_v2: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_router_softmax_finalize_v2: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_router_softmax_finalize_v2: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_router_softmax_finalize_v2: FAILED: {e}");
+                None
+            }
         },
         moe_router_fused_v2: match load_fn(
             shaders::MOE_BATCHED_KERNEL_SOURCE,
             "moe_router_fused_v2",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_router_fused_v2: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_router_fused_v2: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_router_fused_v2: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_router_fused_v2: FAILED: {e}");
+                None
+            }
         },
         moe_router_fused_atomic_v2: match load_fn(
             shaders::MOE_BATCHED_KERNEL_SOURCE,
             "moe_router_fused_atomic_v2",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_router_fused_atomic_v2: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_router_fused_atomic_v2: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_router_fused_atomic_v2: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_router_fused_atomic_v2: FAILED: {e}");
+                None
+            }
         },
         moe_batched_gate_up_swiglu_q8_0_v2: match load_fn(
             shaders::MOE_BATCHED_KERNEL_SOURCE,
             "moe_batched_gate_up_swiglu_q8_0_v2",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q8_0_v2: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q8_0_v2: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q8_0_v2: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q8_0_v2: FAILED: {e}");
+                None
+            }
         },
         moe_batched_down_v2: match load_fn(
             shaders::MOE_BATCHED_KERNEL_SOURCE,
             "moe_batched_down_v2",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_down_v2: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_down_v2: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_down_v2: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_down_v2: FAILED: {e}");
+                None
+            }
         },
         moe_batched_gate_up_swiglu_q8_0_v3: match load_fn(
             shaders::MOE_BATCHED_KERNEL_SOURCE,
             "moe_batched_gate_up_swiglu_q8_0_v3",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q8_0_v3: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q8_0_v3: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q8_0_v3: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q8_0_v3: FAILED: {e}");
+                None
+            }
         },
         moe_batched_down_v3: match load_fn(
             shaders::MOE_BATCHED_KERNEL_SOURCE,
             "moe_batched_down_v3",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_down_v3: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_down_v3: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_down_v3: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_down_v3: FAILED: {e}");
+                None
+            }
         },
         // Grouped MoE prefill FFN kernels.
         moe_router_logits_batched: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_router_logits_batched",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_router_logits_batched: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_router_logits_batched: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_router_logits_batched: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_router_logits_batched: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_gate_up_swiglu_q8_0: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_grouped_gate_up_swiglu_q8_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_gate_up_swiglu_q8_0_mtiled: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_grouped_gate_up_swiglu_q8_0_mtiled",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_mtiled: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_mtiled: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_mtiled: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_mtiled: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_gate_up_swiglu_q8_0_tiled: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_grouped_gate_up_swiglu_q8_0_tiled",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_tiled: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_tiled: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_tiled: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_tiled: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_down_q8_0: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_grouped_down_q8_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_down_q8_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_down_q8_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_down_q8_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_down_q8_0: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_down_q8_0_tiled: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_grouped_down_q8_0_tiled",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_down_q8_0_tiled: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_down_q8_0_tiled: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_down_q8_0_tiled: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_down_q8_0_tiled: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_down_q8_0_tiled_f32act: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_grouped_down_q8_0_tiled_f32act",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_down_q8_0_tiled_f32act: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_down_q8_0_tiled_f32act: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_down_q8_0_tiled_f32act: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_down_q8_0_tiled_f32act: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_gate_up_swiglu_q4_0_tiled_f32act: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_grouped_gate_up_swiglu_q4_0_tiled_f32act",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q4_0_tiled_f32act: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q4_0_tiled_f32act: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q4_0_tiled_f32act: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q4_0_tiled_f32act: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_down_q4_0_tiled_f32act: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_grouped_down_q4_0_tiled_f32act",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_down_q4_0_tiled_f32act: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_down_q4_0_tiled_f32act: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_down_q4_0_tiled_f32act: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_down_q4_0_tiled_f32act: FAILED: {e}");
+                None
+            }
         },
         // bf16 grouped tiled f32act (no dp4a; mov.b32 PTX universal -> load_fn_sm80
         // for consistency with the rest of the grouped source unit).
@@ -2051,126 +2720,239 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_grouped_gate_up_swiglu_bf16_tiled_f32act",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_bf16_tiled_f32act: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_bf16_tiled_f32act: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_bf16_tiled_f32act: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_bf16_tiled_f32act: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_down_bf16_tiled_f32act: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_grouped_down_bf16_tiled_f32act",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_down_bf16_tiled_f32act: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_down_bf16_tiled_f32act: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_down_bf16_tiled_f32act: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_down_bf16_tiled_f32act: FAILED: {e}");
+                None
+            }
         },
         moe_repack_down_q8_0: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_repack_down_q8_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_repack_down_q8_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_repack_down_q8_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_repack_down_q8_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_repack_down_q8_0: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_down_q8_0_fast_bn128: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_grouped_down_q8_0_fast_bn128",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_down_q8_0_fast_bn128: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_down_q8_0_fast_bn128: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_down_q8_0_fast_bn128: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_down_q8_0_fast_bn128: FAILED: {e}");
+                None
+            }
         },
         moe_repack_gate_up_q8_0: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_repack_gate_up_q8_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_repack_gate_up_q8_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_repack_gate_up_q8_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_repack_gate_up_q8_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_repack_gate_up_q8_0: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_gate_up_swiglu_q8_0_imma: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_grouped_gate_up_swiglu_q8_0_imma",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_imma: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_imma: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_imma: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_imma: FAILED: {e}");
+                None
+            }
         },
         // Activation prequant + register-C wide-M gate+up (MG 1..4).
         // mma.sync requires sm80 codegen → load_fn_sm80.
         moe_prequant_x_q8: match load_fn_sm80(
-            shaders::MOE_GROUPED_KERNEL_SOURCE, "moe_prequant_x_q8",
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_prequant_x_q8",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_prequant_x_q8: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_prequant_x_q8: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_prequant_x_q8: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_prequant_x_q8: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_gate_up_swiglu_q8_0_w10_mg1: match load_fn_sm80(
-            shaders::MOE_GROUPED_KERNEL_SOURCE, "moe_grouped_gate_up_swiglu_q8_0_w10_mg1",
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_gate_up_swiglu_q8_0_w10_mg1",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg1: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg1: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg1: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg1: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_gate_up_swiglu_q8_0_w10_mg2: match load_fn_sm80(
-            shaders::MOE_GROUPED_KERNEL_SOURCE, "moe_grouped_gate_up_swiglu_q8_0_w10_mg2",
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_gate_up_swiglu_q8_0_w10_mg2",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg2: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg2: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg2: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg2: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_gate_up_swiglu_q8_0_w10_mg3: match load_fn_sm80(
-            shaders::MOE_GROUPED_KERNEL_SOURCE, "moe_grouped_gate_up_swiglu_q8_0_w10_mg3",
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_gate_up_swiglu_q8_0_w10_mg3",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg3: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg3: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg3: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg3: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_gate_up_swiglu_q8_0_w10_mg4: match load_fn_sm80(
-            shaders::MOE_GROUPED_KERNEL_SOURCE, "moe_grouped_gate_up_swiglu_q8_0_w10_mg4",
+            shaders::MOE_GROUPED_KERNEL_SOURCE,
+            "moe_grouped_gate_up_swiglu_q8_0_w10_mg4",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg4: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg4: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg4: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_w10_mg4: FAILED: {e}");
+                None
+            }
         },
         moe_grouped_scatter_accum_q8_0: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_grouped_scatter_accum_q8_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_grouped_scatter_accum_q8_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_grouped_scatter_accum_q8_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_grouped_scatter_accum_q8_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_grouped_scatter_accum_q8_0: FAILED: {e}");
+                None
+            }
         },
         // Batched shared-expert FFN kernels.
         shared_glu_gemv_q4_0_batched: match load_fn(
             shaders::MOE_SHARED_BATCHED_KERNEL_SOURCE,
             "shared_glu_gemv_q4_0_batched",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] shared_glu_gemv_q4_0_batched: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] shared_glu_gemv_q4_0_batched: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] shared_glu_gemv_q4_0_batched: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] shared_glu_gemv_q4_0_batched: FAILED: {e}");
+                None
+            }
         },
         shared_dot_f32_batched: match load_fn(
             shaders::MOE_SHARED_BATCHED_KERNEL_SOURCE,
             "shared_dot_f32_batched",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] shared_dot_f32_batched: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] shared_dot_f32_batched: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] shared_dot_f32_batched: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] shared_dot_f32_batched: FAILED: {e}");
+                None
+            }
         },
         shared_down_q4_0_sigmoid_accum_batched: match load_fn(
             shaders::MOE_SHARED_BATCHED_KERNEL_SOURCE,
             "shared_down_q4_0_sigmoid_accum_batched",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] shared_down_q4_0_sigmoid_accum_batched: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] shared_down_q4_0_sigmoid_accum_batched: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] shared_down_q4_0_sigmoid_accum_batched: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] shared_down_q4_0_sigmoid_accum_batched: FAILED: {e}");
+                None
+            }
         },
         shared_down_q4_0_residual_accum_batched: match load_fn(
             shaders::MOE_SHARED_BATCHED_KERNEL_SOURCE,
             "shared_down_q4_0_residual_accum_batched",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] shared_down_q4_0_residual_accum_batched: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] shared_down_q4_0_residual_accum_batched: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] shared_down_q4_0_residual_accum_batched: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] shared_down_q4_0_residual_accum_batched: FAILED: {e}");
+                None
+            }
         },
         // Tiled shared-expert f32act (F32 dot, no dp4a -> default arch load_fn).
         shared_glu_gemv_q4_0_batched_tiled_f32act: match load_fn(
             shaders::MOE_SHARED_BATCHED_KERNEL_SOURCE,
             "shared_glu_gemv_q4_0_batched_tiled_f32act",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] shared_glu_gemv_q4_0_batched_tiled_f32act: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] shared_glu_gemv_q4_0_batched_tiled_f32act: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] shared_glu_gemv_q4_0_batched_tiled_f32act: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] shared_glu_gemv_q4_0_batched_tiled_f32act: FAILED: {e}");
+                None
+            }
         },
         shared_down_q4_0_accum_batched_tiled_f32act: match load_fn(
             shaders::MOE_SHARED_BATCHED_KERNEL_SOURCE,
             "shared_down_q4_0_accum_batched_tiled_f32act",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] shared_down_q4_0_accum_batched_tiled_f32act: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] shared_down_q4_0_accum_batched_tiled_f32act: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] shared_down_q4_0_accum_batched_tiled_f32act: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] shared_down_q4_0_accum_batched_tiled_f32act: FAILED: {e}");
+                None
+            }
         },
         // fused persistent gate+up+SwiGLU+down+accum.
         moe_batched_persistent_gate_up_swiglu_down_accum_q8_0: match load_fn(
@@ -2178,9 +2960,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             "moe_batched_persistent_gate_up_swiglu_down_accum_q8_0",
         ) {
             Ok(f) => {
-                cuda_log!(
-                    "[CUDA] moe_batched_persistent_gate_up_swiglu_down_accum_q8_0: OK"
-                );
+                cuda_log!("[CUDA] moe_batched_persistent_gate_up_swiglu_down_accum_q8_0: OK");
                 Some(f)
             }
             Err(e) => {
@@ -2198,8 +2978,14 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MOE_BATCHED_KERNEL_SOURCE,
             "moe_router_rmsnorm_atomic_v3",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_router_rmsnorm_atomic_v3: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_router_rmsnorm_atomic_v3: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_router_rmsnorm_atomic_v3: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_router_rmsnorm_atomic_v3: FAILED: {e}");
+                None
+            }
         },
         // fused-topK MoE router (sigmoid+top-K+renorm).
         // Three instantiations cover all production num_experts. NVRTC failure
@@ -2208,22 +2994,40 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::TOPK_MOE_FUSED_KERNEL_SOURCE,
             "topk_moe_fused_64_no_bias",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] topk_moe_fused_64_no_bias: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] topk_moe_fused_64_no_bias: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] topk_moe_fused_64_no_bias: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] topk_moe_fused_64_no_bias: FAILED: {e}");
+                None
+            }
         },
         topk_moe_fused_128_no_bias: match load_fn(
             shaders::TOPK_MOE_FUSED_KERNEL_SOURCE,
             "topk_moe_fused_128_no_bias",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] topk_moe_fused_128_no_bias: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] topk_moe_fused_128_no_bias: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] topk_moe_fused_128_no_bias: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] topk_moe_fused_128_no_bias: FAILED: {e}");
+                None
+            }
         },
         topk_moe_fused_256_no_bias: match load_fn(
             shaders::TOPK_MOE_FUSED_KERNEL_SOURCE,
             "topk_moe_fused_256_no_bias",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] topk_moe_fused_256_no_bias: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] topk_moe_fused_256_no_bias: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] topk_moe_fused_256_no_bias: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] topk_moe_fused_256_no_bias: FAILED: {e}");
+                None
+            }
         },
         // dispatch the Q-quant decode matvec + quantize_q8_1 kernels.
         // Uses load_fn_sm61 (PTX JIT workaround) because compute_80 PTX
@@ -2233,22 +3037,40 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MMV_Q_DP4A_KERNEL_SOURCE,
             "quantize_q8_1_rawsum",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] quantize_q8_1_rawsum: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] quantize_q8_1_rawsum: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] quantize_q8_1_rawsum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] quantize_q8_1_rawsum: FAILED: {e}");
+                None
+            }
         },
         mul_mat_vec_q_q8_0: match load_fn_sm61(
             shaders::MMV_Q_DP4A_KERNEL_SOURCE,
             "mul_mat_vec_q_q8_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] mul_mat_vec_q_q8_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] mul_mat_vec_q_q8_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] mul_mat_vec_q_q8_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] mul_mat_vec_q_q8_0: FAILED: {e}");
+                None
+            }
         },
         mul_mat_vec_q_q4_0: match load_fn_sm61(
             shaders::MMV_Q_DP4A_KERNEL_SOURCE,
             "mul_mat_vec_q_q4_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] mul_mat_vec_q_q4_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] mul_mat_vec_q_q4_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] mul_mat_vec_q_q4_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] mul_mat_vec_q_q4_0: FAILED: {e}");
+                None
+            }
         },
         // mmv_q_moe kernels (batched MoE FFN matvec).
         // Same sm_61 workaround.
@@ -2256,43 +3078,79 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "quantize_q8_1_moe",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] quantize_q8_1_moe: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] quantize_q8_1_moe: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] quantize_q8_1_moe: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] quantize_q8_1_moe: FAILED: {e}");
+                None
+            }
         },
         quantize_q8_1_moe_swiglu: match load_fn_sm61(
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "quantize_q8_1_moe_swiglu",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] quantize_q8_1_moe_swiglu: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] quantize_q8_1_moe_swiglu: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] quantize_q8_1_moe_swiglu: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] quantize_q8_1_moe_swiglu: FAILED: {e}");
+                None
+            }
         },
         mmv_q_moe_gate_up_swiglu_q8_0: match load_fn_sm61(
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "mmv_q_moe_gate_up_swiglu_q8_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] mmv_q_moe_gate_up_swiglu_q8_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] mmv_q_moe_gate_up_swiglu_q8_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] mmv_q_moe_gate_up_swiglu_q8_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] mmv_q_moe_gate_up_swiglu_q8_0: FAILED: {e}");
+                None
+            }
         },
         mmv_q_moe_down_q8_0: match load_fn_sm61(
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "mmv_q_moe_down_q8_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] mmv_q_moe_down_q8_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] mmv_q_moe_down_q8_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] mmv_q_moe_down_q8_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] mmv_q_moe_down_q8_0: FAILED: {e}");
+                None
+            }
         },
         mmv_q_moe_gate_up_swiglu_q4_0: match load_fn_sm61(
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "mmv_q_moe_gate_up_swiglu_q4_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] mmv_q_moe_gate_up_swiglu_q4_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] mmv_q_moe_gate_up_swiglu_q4_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] mmv_q_moe_gate_up_swiglu_q4_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] mmv_q_moe_gate_up_swiglu_q4_0: FAILED: {e}");
+                None
+            }
         },
         mmv_q_moe_down_q4_0: match load_fn_sm61(
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "mmv_q_moe_down_q4_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] mmv_q_moe_down_q4_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] mmv_q_moe_down_q4_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] mmv_q_moe_down_q4_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] mmv_q_moe_down_q4_0: FAILED: {e}");
+                None
+            }
         },
         // BF16 output_proj matvec dispatch.
         // Uses load_fn_sm61 (compute_80 PTX JIT workaround).
@@ -2303,23 +3161,41 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MMV_F_BF16_KERNEL_SOURCE,
             "mul_mat_vec_f_bf16",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] mul_mat_vec_f_bf16: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] mul_mat_vec_f_bf16: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] mul_mat_vec_f_bf16: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] mul_mat_vec_f_bf16: FAILED: {e}");
+                None
+            }
         },
         // Sub-phase B: per-expert FFN kernels (default dispatch path).
         moe_expert_gate_up_swiglu_q8_0: match load_fn(
             shaders::MOE_EXPERT_KERNEL_SOURCE,
             "moe_expert_gate_up_swiglu_q8_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_expert_gate_up_swiglu_q8_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_expert_gate_up_swiglu_q8_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_expert_gate_up_swiglu_q8_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_expert_gate_up_swiglu_q8_0: FAILED: {e}");
+                None
+            }
         },
         moe_expert_down_q8_0: match load_fn(
             shaders::MOE_EXPERT_KERNEL_SOURCE,
             "moe_expert_down_q8_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_expert_down_q8_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_expert_down_q8_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_expert_down_q8_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_expert_down_q8_0: FAILED: {e}");
+                None
+            }
         },
         // MoE BF16 per-expert + batched FFN kernels.
         // Per-expert kernels mirror moe_expert_q8_0 but read plain BF16 row-
@@ -2330,118 +3206,214 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MOE_BATCHED_BF16_KERNEL_SOURCE,
             "moe_expert_gate_up_swiglu_bf16",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_expert_gate_up_swiglu_bf16: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_expert_gate_up_swiglu_bf16: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_expert_gate_up_swiglu_bf16: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_expert_gate_up_swiglu_bf16: FAILED: {e}");
+                None
+            }
         },
         moe_expert_down_bf16: match load_fn(
             shaders::MOE_BATCHED_BF16_KERNEL_SOURCE,
             "moe_expert_down_bf16",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_expert_down_bf16: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_expert_down_bf16: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_expert_down_bf16: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_expert_down_bf16: FAILED: {e}");
+                None
+            }
         },
         moe_batched_gate_up_swiglu_bf16: match load_fn(
             shaders::MOE_BATCHED_BF16_KERNEL_SOURCE,
             "moe_batched_gate_up_swiglu_bf16",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_bf16: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_bf16: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_bf16: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_bf16: FAILED: {e}");
+                None
+            }
         },
         moe_batched_down_accum_bf16: match load_fn(
             shaders::MOE_BATCHED_BF16_KERNEL_SOURCE,
             "moe_batched_down_accum_bf16",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_down_accum_bf16: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_down_accum_bf16: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_down_accum_bf16: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_down_accum_bf16: FAILED: {e}");
+                None
+            }
         },
         // cooperative-CTA BF16 V3 kernels.
         moe_batched_gate_up_swiglu_bf16_v3: match load_fn(
             shaders::MOE_BATCHED_BF16_KERNEL_SOURCE,
             "moe_batched_gate_up_swiglu_bf16_v3",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_bf16_v3: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_bf16_v3: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_bf16_v3: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_bf16_v3: FAILED: {e}");
+                None
+            }
         },
         moe_batched_down_bf16_v3: match load_fn(
             shaders::MOE_BATCHED_BF16_KERNEL_SOURCE,
             "moe_batched_down_bf16_v3",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_down_bf16_v3: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_down_bf16_v3: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_down_bf16_v3: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_down_bf16_v3: FAILED: {e}");
+                None
+            }
         },
         // MoE per-expert FFN kernels — Q4_0 variant.
         moe_expert_gate_up_swiglu_q4_0: match load_fn(
             shaders::MOE_EXPERT_Q4_0_KERNEL_SOURCE,
             "moe_expert_gate_up_swiglu_q4_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_expert_gate_up_swiglu_q4_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_expert_gate_up_swiglu_q4_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_expert_gate_up_swiglu_q4_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_expert_gate_up_swiglu_q4_0: FAILED: {e}");
+                None
+            }
         },
         moe_expert_down_q4_0: match load_fn(
             shaders::MOE_EXPERT_Q4_0_KERNEL_SOURCE,
             "moe_expert_down_q4_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_expert_down_q4_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_expert_down_q4_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_expert_down_q4_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_expert_down_q4_0: FAILED: {e}");
+                None
+            }
         },
         // MoE batched-expert FFN kernels — Q4_0 variant.
         moe_batched_gate_up_swiglu_q4_0: match load_fn(
             shaders::MOE_BATCHED_Q4_0_KERNEL_SOURCE,
             "moe_batched_gate_up_swiglu_q4_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0: FAILED: {e}");
+                None
+            }
         },
         moe_batched_down_accum_q4_0: match load_fn(
             shaders::MOE_BATCHED_Q4_0_KERNEL_SOURCE,
             "moe_batched_down_accum_q4_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_down_accum_q4_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_down_accum_q4_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_down_accum_q4_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_down_accum_q4_0: FAILED: {e}");
+                None
+            }
         },
         moe_batched_gate_up_swiglu_q4_0_v2: match load_fn(
             shaders::MOE_BATCHED_Q4_0_KERNEL_SOURCE,
             "moe_batched_gate_up_swiglu_q4_0_v2",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0_v2: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0_v2: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0_v2: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0_v2: FAILED: {e}");
+                None
+            }
         },
         moe_batched_down_v2_q4_0: match load_fn(
             shaders::MOE_BATCHED_Q4_0_KERNEL_SOURCE,
             "moe_batched_down_v2_q4_0",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_down_v2_q4_0: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_down_v2_q4_0: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_down_v2_q4_0: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_down_v2_q4_0: FAILED: {e}");
+                None
+            }
         },
         // Q4_0 V3 cooperative-CTA (NR=4) kernels.
         moe_batched_gate_up_swiglu_q4_0_v3: match load_fn(
             shaders::MOE_BATCHED_Q4_0_KERNEL_SOURCE,
             "moe_batched_gate_up_swiglu_q4_0_v3",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0_v3: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0_v3: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0_v3: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0_v3: FAILED: {e}");
+                None
+            }
         },
         moe_batched_down_q4_0_v3: match load_fn(
             shaders::MOE_BATCHED_Q4_0_KERNEL_SOURCE,
             "moe_batched_down_q4_0_v3",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_down_q4_0_v3: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_down_q4_0_v3: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_down_q4_0_v3: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_down_q4_0_v3: FAILED: {e}");
+                None
+            }
         },
         // V3b: high-MLP element-cooperative Q4_0 kernels.
         moe_batched_gate_up_swiglu_q4_0_v3b: match load_fn(
             shaders::MOE_BATCHED_Q4_0_KERNEL_SOURCE,
             "moe_batched_gate_up_swiglu_q4_0_v3b",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0_v3b: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0_v3b: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0_v3b: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_gate_up_swiglu_q4_0_v3b: FAILED: {e}");
+                None
+            }
         },
         moe_batched_down_q4_0_v3b: match load_fn(
             shaders::MOE_BATCHED_Q4_0_KERNEL_SOURCE,
             "moe_batched_down_q4_0_v3b",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_batched_down_q4_0_v3b: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_batched_down_q4_0_v3b: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_batched_down_q4_0_v3b: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_batched_down_q4_0_v3b: FAILED: {e}");
+                None
+            }
         },
         // FIX: MoE shared-expert auxiliary kernels.
         // The shared expert reuses matvec_q4_0 + swiglu_inplace for the heavy
@@ -2450,44 +3422,80 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::MOE_SHARED_ACCUM_KERNEL_SOURCE,
             "moe_shared_dot_f32",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_shared_dot_f32: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_shared_dot_f32: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_shared_dot_f32: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_shared_dot_f32: FAILED: {e}");
+                None
+            }
         },
         moe_shared_sigmoid_gated_accum: match load_fn(
             shaders::MOE_SHARED_ACCUM_KERNEL_SOURCE,
             "moe_shared_sigmoid_gated_accum",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_shared_sigmoid_gated_accum: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_shared_sigmoid_gated_accum: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_shared_sigmoid_gated_accum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_shared_sigmoid_gated_accum: FAILED: {e}");
+                None
+            }
         },
         moe_shared_residual_accum: match load_fn(
             shaders::MOE_SHARED_ACCUM_KERNEL_SOURCE,
             "moe_shared_residual_accum",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_shared_residual_accum: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_shared_residual_accum: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_shared_residual_accum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_shared_residual_accum: FAILED: {e}");
+                None
+            }
         },
         // fused shared-expert FFN kernels (NVRTC; silent-disable on fail).
         fused_glu_gemv_q4_0_prenormed_no_norm: match load_fn(
             shaders::MOE_SHARED_ACCUM_KERNEL_SOURCE,
             "fused_glu_gemv_q4_0_prenormed_no_norm",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] fused_glu_gemv_q4_0_prenormed_no_norm: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] fused_glu_gemv_q4_0_prenormed_no_norm: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q4_0_prenormed_no_norm: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q4_0_prenormed_no_norm: FAILED: {e}");
+                None
+            }
         },
         moe_shared_down_q4_0_sigmoid_accum: match load_fn(
             shaders::MOE_SHARED_ACCUM_KERNEL_SOURCE,
             "moe_shared_down_q4_0_sigmoid_accum",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_shared_down_q4_0_sigmoid_accum: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_shared_down_q4_0_sigmoid_accum: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_shared_down_q4_0_sigmoid_accum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_shared_down_q4_0_sigmoid_accum: FAILED: {e}");
+                None
+            }
         },
         moe_shared_down_q4_0_residual_accum: match load_fn(
             shaders::MOE_SHARED_ACCUM_KERNEL_SOURCE,
             "moe_shared_down_q4_0_residual_accum",
         ) {
-            Ok(f) => { cuda_log!("[CUDA] moe_shared_down_q4_0_residual_accum: OK"); Some(f) }
-            Err(e) => { cuda_log!("[CUDA] moe_shared_down_q4_0_residual_accum: FAILED: {e}"); None }
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_shared_down_q4_0_residual_accum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_shared_down_q4_0_residual_accum: FAILED: {e}");
+                None
+            }
         },
         // split-layout integration: feature flags. Start OFF; flipped on in
         // `CudaBackend::init()` after reading LUMEN_CUDA_* env vars and
@@ -2531,10 +3539,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             );
         } else {
             // Carveout=100 -> prefer max shared (occupancy: 3*52224 < 163840).
-            let _ = f.set_attribute(
-                CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
-                100_i32,
-            );
+            let _ = f.set_attribute(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100_i32);
         }
     }
 
@@ -2545,19 +3550,14 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
         };
-        if let Err(e) = f.set_attribute(
-            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            49_152_i32,
-        ) {
+        if let Err(e) = f.set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 49_152_i32)
+        {
             eprintln!(
                 "[lumen-cuda] moe_grouped_gate_up_swiglu_q8_0_imma dyn-shmem opt-in \
                  declined ({e}); IMMA gate+up disabled"
             );
         } else {
-            let _ = f.set_attribute(
-                CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
-                100_i32,
-            );
+            let _ = f.set_attribute(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100_i32);
         }
     }
 
@@ -2634,9 +3634,7 @@ pub(crate) fn attention_decode_can_launch(seq_len: u32) -> bool {
 /// the default 48 KB to [`ATTN_DECODE_EXTENDED_SHMEM_BYTES`]. Failure is
 /// non-fatal: the kernel keeps its default cap and only the long-context
 /// decode path is affected.
-pub(crate) fn opt_in_attention_decode_dyn_shmem(
-    fns: &[&CudaFunction],
-) -> Result<(), RuntimeError> {
+pub(crate) fn opt_in_attention_decode_dyn_shmem(fns: &[&CudaFunction]) -> Result<(), RuntimeError> {
     use cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
     for f in fns {
         if let Err(e) = f.set_attribute(
@@ -2727,8 +3725,7 @@ pub(crate) const fn attention_decode_tiled_shared_bytes(head_dim: u32) -> u32 {
 /// preserves the "tiled-always" default while keeping small
 /// test models working.
 pub(crate) const fn attention_decode_tiled_supports_head_dim(head_dim: u32) -> bool {
-    head_dim >= ATTN_DECODE_TILED_BLOCK_DIM
-        && head_dim % ATTN_DECODE_TILED_BLOCK_DIM == 0
+    head_dim >= ATTN_DECODE_TILED_BLOCK_DIM && head_dim % ATTN_DECODE_TILED_BLOCK_DIM == 0
 }
 
 /// Default threshold at which the gate auto-routes to the tiled kernel.
@@ -2850,8 +3847,8 @@ mod attention_decode_variant_tests {
     //! suite during `cargo test --release -p lumen-runtime --features cuda`.
 
     use super::{
-        attention_decode_variant, AttentionDecodeVariant,
-        ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN, ATTN_DECODE_TILED_DEFAULT_THRESHOLD,
+        attention_decode_variant, AttentionDecodeVariant, ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN,
+        ATTN_DECODE_TILED_DEFAULT_THRESHOLD,
     };
 
     /// Default production threshold (0 = "tiled-always" —
@@ -3014,7 +4011,9 @@ mod attention_decode_tiled_head_dim_tests {
     /// head_dim = BLOCK_DIM (= 128) is the minimum supported. PASS.
     #[test]
     fn supports_head_dim_equal_to_block_dim() {
-        assert!(attention_decode_tiled_supports_head_dim(ATTN_DECODE_TILED_BLOCK_DIM));
+        assert!(attention_decode_tiled_supports_head_dim(
+            ATTN_DECODE_TILED_BLOCK_DIM
+        ));
     }
 
     /// head_dim = 384 = 3 * BLOCK_DIM. PASS.
@@ -3040,13 +4039,17 @@ mod attention_decode_tiled_head_dim_tests {
     /// head_dim = 127 (one below BLOCK_DIM): NOT supported.
     #[test]
     fn rejects_just_below_block_dim() {
-        assert!(!attention_decode_tiled_supports_head_dim(ATTN_DECODE_TILED_BLOCK_DIM - 1));
+        assert!(!attention_decode_tiled_supports_head_dim(
+            ATTN_DECODE_TILED_BLOCK_DIM - 1
+        ));
     }
 
     /// head_dim = 129 (just above BLOCK_DIM but not a multiple): NOT supported.
     #[test]
     fn rejects_just_above_block_dim_non_multiple() {
-        assert!(!attention_decode_tiled_supports_head_dim(ATTN_DECODE_TILED_BLOCK_DIM + 1));
+        assert!(!attention_decode_tiled_supports_head_dim(
+            ATTN_DECODE_TILED_BLOCK_DIM + 1
+        ));
     }
 
     /// head_dim = 0 (degenerate): NOT supported (`0 % anything == 0` but
@@ -3066,8 +4069,7 @@ mod attention_decode_tiled_const_tests {
     //! the change loudly so the operator can re-validate.
 
     use super::{
-        attention_decode_tiled_shared_bytes, ATTN_DECODE_TILED_BLOCK_DIM,
-        ATTN_DECODE_TILED_T_C,
+        attention_decode_tiled_shared_bytes, ATTN_DECODE_TILED_BLOCK_DIM, ATTN_DECODE_TILED_T_C,
     };
 
     /// At Qwen3.5-9B's `head_dim = 256`, tiled shmem must be small (< 4 KB)
@@ -3232,13 +4234,13 @@ pub(crate) fn flash_attention_wmma_shared_bytes(head_dim: u32) -> u32 {
     let bc = FA_TC_BC;
     let hd = head_dim;
 
-    let q_sh = br * hd * 2;         // half Q_sh[BR][hd]
-    let kv_sh = bc * hd * 2;        // half KV_sh[BC][hd]
-    let s_sh = br * bc * 4;         // float S_sh[BR][BC]
-    let p_sh = br * bc * 2;         // half P_sh[BR][BC]
-    let o_acc = br * hd * 4;        // float O_acc[BR][hd]
-    let rowmax = br * 4;            // float rowmax[BR]
-    let rowsum = br * 4;            // float rowsum[BR]
+    let q_sh = br * hd * 2; // half Q_sh[BR][hd]
+    let kv_sh = bc * hd * 2; // half KV_sh[BC][hd]
+    let s_sh = br * bc * 4; // float S_sh[BR][BC]
+    let p_sh = br * bc * 2; // half P_sh[BR][BC]
+    let o_acc = br * hd * 4; // float O_acc[BR][hd]
+    let rowmax = br * 4; // float rowmax[BR]
+    let rowsum = br * 4; // float rowsum[BR]
 
     q_sh + kv_sh + s_sh + p_sh + o_acc + rowmax + rowsum
 }
@@ -3251,8 +4253,14 @@ pub(crate) fn flash_attention_wmma_qkf32_shared_bytes(head_dim: u32) -> u32 {
     let br = FA_TC_BR;
     let bc = FA_TC_BC;
     let hd = head_dim;
-    (br * hd * 4) + (bc * hd * 4) + (br * bc * 4) + (br * bc * 2)
-        + (bc * hd * 2) + (br * hd * 4) + (br * 4) + (br * 4)
+    (br * hd * 4)
+        + (bc * hd * 4)
+        + (br * bc * 4)
+        + (br * bc * 2)
+        + (bc * hd * 2)
+        + (br * hd * 4)
+        + (br * 4)
+        + (br * 4)
 }
 
 /// Shared memory bytes for flash_attention_wmma_pvf32 (precision-localization).
@@ -3263,8 +4271,13 @@ pub(crate) fn flash_attention_wmma_pvf32_shared_bytes(head_dim: u32) -> u32 {
     let br = FA_TC_BR;
     let bc = FA_TC_BC;
     let hd = head_dim;
-    (br * hd * 2) + (bc * hd * 2) + (br * bc * 4) + (bc * hd * 4)
-        + (br * hd * 4) + (br * 4) + (br * 4)
+    (br * hd * 2)
+        + (bc * hd * 2)
+        + (br * bc * 4)
+        + (bc * hd * 4)
+        + (br * hd * 4)
+        + (br * 4)
+        + (br * 4)
 }
 
 /// Shared memory bytes for flash_attention_wmma_split (performant fix).
@@ -3276,9 +4289,16 @@ pub(crate) fn flash_attention_wmma_split_shared_bytes(head_dim: u32) -> u32 {
     let br = FA_TC_BR;
     let bc = FA_TC_BC;
     let hd = head_dim;
-    (br * hd * 2) + (br * hd * 2) + (bc * hd * 2) + (bc * hd * 2)
-        + (br * bc * 4) + (br * bc * 2) + (br * bc * 2)
-        + (br * hd * 4) + (br * 4) + (br * 4)
+    (br * hd * 2)
+        + (br * hd * 2)
+        + (bc * hd * 2)
+        + (bc * hd * 2)
+        + (br * bc * 4)
+        + (br * bc * 2)
+        + (br * bc * 2)
+        + (br * hd * 4)
+        + (br * 4)
+        + (br * 4)
 }
 
 // ------------------------------------------------------------------

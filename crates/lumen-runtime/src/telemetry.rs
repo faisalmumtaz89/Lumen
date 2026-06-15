@@ -335,7 +335,10 @@ mod tests {
         let m = InferenceMetrics::default().with_kv(stats);
         let s = m.summary();
         assert!(s.contains("KV:"), "summary must report KV: {s}");
-        assert!(s.contains("4/64"), "summary must report seq_len/max_seq_len: {s}");
+        assert!(
+            s.contains("4/64"),
+            "summary must report seq_len/max_seq_len: {s}"
+        );
     }
 
     // ---- per-component server memory breakdown tests ----
@@ -381,11 +384,20 @@ mod tests {
         b.last_update_unix = 14;
         let s = b.to_jsonl();
         for k in [
-            "kv_used_bytes", "kv_allocated_bytes", "kv_seq_len", "kv_max_seq_len",
-            "session_tokens_len", "session_pending_logits_bytes", "session_timings_bytes",
-            "metal_current_allocated_bytes", "tokio_active_tasks",
-            "engine_inbox_capacity", "engine_inbox_len",
-            "disk_kv_used_bytes", "update_count", "last_update_unix",
+            "kv_used_bytes",
+            "kv_allocated_bytes",
+            "kv_seq_len",
+            "kv_max_seq_len",
+            "session_tokens_len",
+            "session_pending_logits_bytes",
+            "session_timings_bytes",
+            "metal_current_allocated_bytes",
+            "tokio_active_tasks",
+            "engine_inbox_capacity",
+            "engine_inbox_len",
+            "disk_kv_used_bytes",
+            "update_count",
+            "last_update_unix",
         ] {
             assert!(
                 s.contains(&format!("\"{}\":", k)),
@@ -402,7 +414,10 @@ mod tests {
         assert!(!s.contains('\n'), "to_jsonl must be single-line: {s}");
         // Output must start with `{` and end with `}` so the JSONL is
         // well-formed without needing string-trimming.
-        assert!(s.starts_with('{') && s.ends_with('}'), "malformed JSON: {s}");
+        assert!(
+            s.starts_with('{') && s.ends_with('}'),
+            "malformed JSON: {s}"
+        );
     }
 }
 

@@ -1,17 +1,19 @@
 // GatedDeltaNet (Linear Attention) kernel tests
 // Extracted from mod.rs for modularity.
 
-use crate::metal::*;
-use crate::metal::shaders::METAL_SHADER_SOURCE;
 use crate::metal::ffi::MTLSize;
+use crate::metal::shaders::METAL_SHADER_SOURCE;
+use crate::metal::*;
 
 #[test]
 fn test_gated_delta_net_state_update_beta_one() {
     // With beta=1.0 and h_state starting at zero, after one step:
     // h_state[h, ki, vj] = outer(k, v)[ki, vj] = k[ki] * v[vj]
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("gated_delta_net_state_update").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -56,10 +58,10 @@ fn test_gated_delta_net_state_update_beta_one() {
     for h in 0..n_heads as usize {
         for ki in 0..key_dim as usize {
             for vj in 0..val_dim as usize {
-                let expected = k_norm[h * key_dim as usize + ki]
-                    * v_tokens[h * val_dim as usize + vj];
-                let actual = result[h * (val_dim as usize * key_dim as usize)
-                    + vj * key_dim as usize + ki];
+                let expected =
+                    k_norm[h * key_dim as usize + ki] * v_tokens[h * val_dim as usize + vj];
+                let actual =
+                    result[h * (val_dim as usize * key_dim as usize) + vj * key_dim as usize + ki];
                 assert!(
                     (actual - expected).abs() < 1e-5,
                     "state_update beta=1: h={h} ki={ki} vj={vj}: got {actual}, expected {expected}"
@@ -74,8 +76,10 @@ fn test_gated_delta_net_state_update_beta_one() {
 fn test_gated_delta_net_state_update_beta_zero() {
     // With beta=0.0, h_state should be unchanged
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("gated_delta_net_state_update").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -121,7 +125,8 @@ fn test_gated_delta_net_state_update_beta_zero() {
         assert!(
             (result[i] - h_state_copy[i]).abs() < 1e-6,
             "state_update beta=0: index {i}: got {}, expected {}",
-            result[i], h_state_copy[i]
+            result[i],
+            h_state_copy[i]
         );
     }
     eprintln!("gated_delta_net_state_update (beta=0.0): PASS");
@@ -131,8 +136,10 @@ fn test_gated_delta_net_state_update_beta_zero() {
 fn test_gated_delta_net_state_update_beta_half() {
     // With beta=0.5, h = 0.5*h_old + 0.5*outer(k,v)
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("gated_delta_net_state_update").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -184,7 +191,8 @@ fn test_gated_delta_net_state_update_beta_half() {
         assert!(
             (result[i] - expected[i]).abs() < 1e-5,
             "state_update beta=0.5: index {i}: got {}, expected {}",
-            result[i], expected[i]
+            result[i],
+            expected[i]
         );
     }
     eprintln!("gated_delta_net_state_update (beta=0.5): PASS");
@@ -194,8 +202,10 @@ fn test_gated_delta_net_state_update_beta_half() {
 fn test_gated_delta_net_output_identity_state() {
     // h_state = identity matrix per head -> output should equal q
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("gated_delta_net_output").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -228,10 +238,7 @@ fn test_gated_delta_net_output_identity_state() {
     enc.set_bytes(&key_dim.to_le_bytes(), 4);
     enc.set_bytes(&val_dim.to_le_bytes(), 5);
     let num_tg = (n_heads * val_dim) as u64;
-    enc.dispatch_threadgroups(
-        MTLSize::new(num_tg, 1, 1),
-        MTLSize::new(32, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(num_tg, 1, 1), MTLSize::new(32, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -242,7 +249,8 @@ fn test_gated_delta_net_output_identity_state() {
         assert!(
             (result[i] - q_norm[i]).abs() < 1e-5,
             "delta_net_output identity: index {i}: got {}, expected {}",
-            result[i], q_norm[i]
+            result[i],
+            q_norm[i]
         );
     }
     eprintln!("gated_delta_net_output (identity state): PASS");
@@ -252,8 +260,10 @@ fn test_gated_delta_net_output_identity_state() {
 fn test_gated_delta_net_output_known_state() {
     // Known h_state, verify dot product correctness
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("gated_delta_net_output").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -281,10 +291,7 @@ fn test_gated_delta_net_output_known_state() {
     enc.set_bytes(&n_heads.to_le_bytes(), 3);
     enc.set_bytes(&key_dim.to_le_bytes(), 4);
     enc.set_bytes(&val_dim.to_le_bytes(), 5);
-    enc.dispatch_threadgroups(
-        MTLSize::new(2, 1, 1),
-        MTLSize::new(32, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(2, 1, 1), MTLSize::new(32, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -293,11 +300,13 @@ fn test_gated_delta_net_output_known_state() {
 
     assert!(
         (result[0] - 4.0).abs() < 1e-5,
-        "delta_net_output known: [0] got {}, expected 4.0", result[0]
+        "delta_net_output known: [0] got {}, expected 4.0",
+        result[0]
     );
     assert!(
         (result[1] - 6.0).abs() < 1e-5,
-        "delta_net_output known: [1] got {}, expected 6.0", result[1]
+        "delta_net_output known: [1] got {}, expected 6.0",
+        result[1]
     );
     eprintln!("gated_delta_net_output (known state): PASS");
 }
@@ -306,8 +315,10 @@ fn test_gated_delta_net_output_known_state() {
 fn test_l2_normalize_heads() {
     // Verify L2 normalization produces unit-norm vectors
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("l2_normalize_heads").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -340,13 +351,25 @@ fn test_l2_normalize_heads() {
 
     let norm0: f32 = result[0..4].iter().map(|v| v * v).sum::<f32>().sqrt();
     assert!((norm0 - 1.0).abs() < 1e-5, "l2_norm head 0: norm={norm0}");
-    assert!((result[0] - 0.6).abs() < 1e-5, "l2_norm [0]: got {}", result[0]);
-    assert!((result[1] - 0.8).abs() < 1e-5, "l2_norm [1]: got {}", result[1]);
+    assert!(
+        (result[0] - 0.6).abs() < 1e-5,
+        "l2_norm [0]: got {}",
+        result[0]
+    );
+    assert!(
+        (result[1] - 0.8).abs() < 1e-5,
+        "l2_norm [1]: got {}",
+        result[1]
+    );
 
     let norm1: f32 = result[4..8].iter().map(|v| v * v).sum::<f32>().sqrt();
     assert!((norm1 - 1.0).abs() < 1e-5, "l2_norm head 1: norm={norm1}");
     for i in 4..8 {
-        assert!((result[i] - 0.5).abs() < 1e-5, "l2_norm [{i}]: got {}", result[i]);
+        assert!(
+            (result[i] - 0.5).abs() < 1e-5,
+            "l2_norm [{i}]: got {}",
+            result[i]
+        );
     }
     eprintln!("l2_normalize_heads: PASS");
 }
@@ -355,8 +378,10 @@ fn test_l2_normalize_heads() {
 fn test_l2_normalize_heads_zero_vector() {
     // Zero vector should not produce NaN
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("l2_normalize_heads").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -373,10 +398,7 @@ fn test_l2_normalize_heads_zero_vector() {
     enc.set_bytes(&n_heads.to_le_bytes(), 1);
     enc.set_bytes(&head_dim.to_le_bytes(), 2);
     enc.set_bytes(&eps.to_le_bytes(), 3);
-    enc.dispatch_threadgroups(
-        MTLSize::new(1, 1, 1),
-        MTLSize::new(head_dim as u64, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(head_dim as u64, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -384,7 +406,11 @@ fn test_l2_normalize_heads_zero_vector() {
     x_buf.read_f32(&mut result);
 
     for i in 0..4 {
-        assert!(result[i].is_finite(), "l2_norm zero [{i}]: got {} (not finite)", result[i]);
+        assert!(
+            result[i].is_finite(),
+            "l2_norm zero [{i}]: got {} (not finite)",
+            result[i]
+        );
     }
     eprintln!("l2_normalize_heads (zero vector): PASS");
 }
@@ -393,8 +419,10 @@ fn test_l2_normalize_heads_zero_vector() {
 fn test_ssm_conv1d_decode() {
     // Causal 1D convolution with kernel_size=4, uniform weights
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("ssm_conv1d_decode").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -403,9 +431,7 @@ fn test_ssm_conv1d_decode() {
     let state_pos: u32 = 0;
 
     let conv_state = vec![
-        1.0f32, 1.0, 1.0, 1.0,
-        2.0, 2.0, 2.0, 2.0,
-        3.0, 3.0, 3.0, 3.0,
+        1.0f32, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0,
     ];
     let input_val = vec![4.0f32; 4];
     let kernel_w = vec![1.0f32; 16];
@@ -425,10 +451,7 @@ fn test_ssm_conv1d_decode() {
     enc.set_bytes(&dim.to_le_bytes(), 4);
     enc.set_bytes(&kernel_size.to_le_bytes(), 5);
     enc.set_bytes(&state_pos.to_le_bytes(), 6);
-    enc.dispatch_threadgroups(
-        MTLSize::new(1, 1, 1),
-        MTLSize::new(4, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(4, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -436,13 +459,21 @@ fn test_ssm_conv1d_decode() {
     output_buf.read_f32(&mut result);
 
     for i in 0..4 {
-        assert!((result[i] - 10.0).abs() < 1e-5, "conv1d [{i}]: got {}, expected 10.0", result[i]);
+        assert!(
+            (result[i] - 10.0).abs() < 1e-5,
+            "conv1d [{i}]: got {}, expected 10.0",
+            result[i]
+        );
     }
 
     let mut state_result = vec![0.0f32; 12];
     state_buf.read_f32(&mut state_result);
     for i in 0..4 {
-        assert!((state_result[i] - 4.0).abs() < 1e-5, "conv1d state [{i}]: got {}", state_result[i]);
+        assert!(
+            (state_result[i] - 4.0).abs() < 1e-5,
+            "conv1d state [{i}]: got {}",
+            state_result[i]
+        );
     }
     eprintln!("ssm_conv1d_decode: PASS");
 }
@@ -451,8 +482,10 @@ fn test_ssm_conv1d_decode() {
 fn test_ssm_conv1d_decode_weighted() {
     // Non-uniform weights with circular buffer wrap-around
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("ssm_conv1d_decode").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -492,16 +525,26 @@ fn test_ssm_conv1d_decode_weighted() {
     let mut result = vec![0.0f32; 2];
     output_buf.read_f32(&mut result);
 
-    assert!((result[0] - 200.0).abs() < 1e-4, "conv1d weighted [0]: got {}", result[0]);
-    assert!((result[1] - 620.0).abs() < 1e-4, "conv1d weighted [1]: got {}", result[1]);
+    assert!(
+        (result[0] - 200.0).abs() < 1e-4,
+        "conv1d weighted [0]: got {}",
+        result[0]
+    );
+    assert!(
+        (result[1] - 620.0).abs() < 1e-4,
+        "conv1d weighted [1]: got {}",
+        result[1]
+    );
     eprintln!("ssm_conv1d_decode (weighted, wrap-around): PASS");
 }
 
 #[test]
 fn test_sigmoid_gate_correctness() {
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("sigmoid_gate").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -530,7 +573,9 @@ fn test_sigmoid_gate_correctness() {
         let expected = 1.0f32 / (1.0 + (-input[i]).exp());
         assert!(
             (result[i] - expected).abs() < 1e-5,
-            "sigmoid [{i}]: got {}, expected {}", result[i], expected
+            "sigmoid [{i}]: got {}, expected {}",
+            result[i],
+            expected
         );
     }
     eprintln!("sigmoid_gate: PASS");
@@ -539,8 +584,10 @@ fn test_sigmoid_gate_correctness() {
 #[test]
 fn test_silu_elementwise_mul_correctness() {
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("silu_elementwise_mul").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -559,10 +606,7 @@ fn test_silu_elementwise_mul_correctness() {
     enc.set_buffer(&x_buf, 0, 1);
     enc.set_buffer(&output_buf, 0, 2);
     enc.set_bytes(&dim.to_le_bytes(), 3);
-    enc.dispatch_threads(
-        MTLSize::new(4, 1, 1),
-        MTLSize::new(4, 1, 1),
-    );
+    enc.dispatch_threads(MTLSize::new(4, 1, 1), MTLSize::new(4, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -575,7 +619,9 @@ fn test_silu_elementwise_mul_correctness() {
         let expected = a * sig * x[i];
         assert!(
             (result[i] - expected).abs() < 1e-5,
-            "silu_mul [{i}]: got {}, expected {}", result[i], expected
+            "silu_mul [{i}]: got {}, expected {}",
+            result[i],
+            expected
         );
     }
     eprintln!("silu_elementwise_mul: PASS");
@@ -586,12 +632,20 @@ fn test_gated_delta_net_roundtrip() {
     // Full roundtrip: state_update then output, verify mathematical consistency.
     // h = outer(k, v), output = h^T @ q = v * dot(k, q)
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let update_func = lib.get_function("gated_delta_net_state_update").unwrap();
-    let update_pso = backend.device.new_compute_pipeline_state(&update_func).unwrap();
+    let update_pso = backend
+        .device
+        .new_compute_pipeline_state(&update_func)
+        .unwrap();
     let output_func = lib.get_function("gated_delta_net_output").unwrap();
-    let output_pso = backend.device.new_compute_pipeline_state(&output_func).unwrap();
+    let output_pso = backend
+        .device
+        .new_compute_pipeline_state(&output_func)
+        .unwrap();
 
     let n_heads: u32 = 1;
     let key_dim: u32 = 4;
@@ -643,10 +697,7 @@ fn test_gated_delta_net_roundtrip() {
         enc.set_bytes(&n_heads.to_le_bytes(), 3);
         enc.set_bytes(&key_dim.to_le_bytes(), 4);
         enc.set_bytes(&val_dim.to_le_bytes(), 5);
-        enc.dispatch_threadgroups(
-            MTLSize::new(4, 1, 1),
-            MTLSize::new(32, 1, 1),
-        );
+        enc.dispatch_threadgroups(MTLSize::new(4, 1, 1), MTLSize::new(32, 1, 1));
         enc.end_encoding();
     }
 
@@ -659,7 +710,9 @@ fn test_gated_delta_net_roundtrip() {
     for i in 0..4 {
         assert!(
             (result[i] - expected[i]).abs() < 1e-4,
-            "roundtrip [{i}]: got {}, expected {}", result[i], expected[i]
+            "roundtrip [{i}]: got {}, expected {}",
+            result[i],
+            expected[i]
         );
     }
     eprintln!("gated_delta_net roundtrip (update+output): PASS");
@@ -685,7 +738,10 @@ fn test_gated_delta_net_roundtrip() {
 #[test]
 fn test_gdn_state_output_norm_simple() {
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device.new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("gdn_state_output_norm").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -693,15 +749,15 @@ fn test_gdn_state_output_norm_simple() {
     let key_dim: u32 = 4;
     let val_dim: u32 = 4;
     let n_kv_heads: u32 = 1;
-    let eps: f32 = 1e-6;  // small epsilon to avoid divide by zero
+    let eps: f32 = 1e-6; // small epsilon to avoid divide by zero
 
     let h_state = vec![0.0f32; (n_heads * key_dim * val_dim) as usize];
-    let k_norm = vec![1.0f32, 0.0, 0.0, 0.0];   // k = e_0
+    let k_norm = vec![1.0f32, 0.0, 0.0, 0.0]; // k = e_0
     let v_tokens = vec![0.0f32, 1.0, 0.0, 0.0]; // v = e_1
-    let alpha = vec![1.0f32];  // no decay
-    let beta = vec![1.0f32];   // full update
-    let q_norm = vec![1.0f32, 0.0, 0.0, 0.0];   // q = e_0
-    let scale = vec![1.0f32, 1.0, 1.0, 1.0];    // identity scale
+    let alpha = vec![1.0f32]; // no decay
+    let beta = vec![1.0f32]; // full update
+    let q_norm = vec![1.0f32, 0.0, 0.0, 0.0]; // q = e_0
+    let scale = vec![1.0f32, 1.0, 1.0, 1.0]; // identity scale
 
     let h_buf = backend.upload_f32(&h_state).unwrap();
     let k_buf = backend.upload_f32(&k_norm).unwrap();
@@ -748,7 +804,9 @@ fn test_gdn_state_output_norm_simple() {
     for i in 0..4 {
         assert!(
             (result[i] - expected[i]).abs() < 1e-3,
-            "gdn_state_output_norm [{i}]: got {}, expected {}", result[i], expected[i]
+            "gdn_state_output_norm [{i}]: got {}, expected {}",
+            result[i],
+            expected[i]
         );
     }
     eprintln!("test_gdn_state_output_norm_simple: PASS");
@@ -777,7 +835,10 @@ fn test_gdn_state_output_norm_simple() {
 #[test]
 fn test_gdn_state_output_norm_delta_rule() {
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device.new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("gdn_state_output_norm").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -846,7 +907,9 @@ fn test_gdn_state_output_norm_delta_rule() {
     for i in 0..2 {
         assert!(
             (result[i] - expected[i]).abs() < 1e-3,
-            "gdn_delta_rule [{i}]: got {}, expected {}", result[i], expected[i]
+            "gdn_delta_rule [{i}]: got {}, expected {}",
+            result[i],
+            expected[i]
         );
     }
     eprintln!("test_gdn_state_output_norm_delta_rule: PASS");
@@ -865,7 +928,12 @@ fn test_gdn_state_output_norm_delta_rule() {
 /// for one (head, vj) row. state s[D]; per token a,b scalars, q,k[D], v scalar.
 /// out_t = <s_t, q_t> * q_scale. Returns (out[T], final_state[D]).
 fn gdn_serial_ref(
-    q: &[Vec<f32>], k: &[Vec<f32>], v: &[f32], a: &[f32], b: &[f32], d: usize,
+    q: &[Vec<f32>],
+    k: &[Vec<f32>],
+    v: &[f32],
+    a: &[f32],
+    b: &[f32],
+    d: usize,
 ) -> (Vec<f32>, Vec<f32>) {
     let t = q.len();
     let q_scale = 1.0f32 / (d as f32).sqrt();
@@ -874,13 +942,21 @@ fn gdn_serial_ref(
     for ti in 0..t {
         // d_vec = a*s ; retrieval = <d_vec, k> ; v_delta = b*(v - retrieval)
         let mut dvec = vec![0.0f32; d];
-        for i in 0..d { dvec[i] = a[ti] * s[i]; }
+        for i in 0..d {
+            dvec[i] = a[ti] * s[i];
+        }
         let mut retrieval = 0.0f32;
-        for i in 0..d { retrieval += dvec[i] * k[ti][i]; }
+        for i in 0..d {
+            retrieval += dvec[i] * k[ti][i];
+        }
         let v_delta = b[ti] * (v[ti] - retrieval);
-        for i in 0..d { s[i] = dvec[i] + k[ti][i] * v_delta; }
+        for i in 0..d {
+            s[i] = dvec[i] + k[ti][i] * v_delta;
+        }
         let mut o = 0.0f32;
-        for i in 0..d { o += s[i] * q[ti][i]; }
+        for i in 0..d {
+            o += s[i] * q[ti][i];
+        }
         out[ti] = o * q_scale;
     }
     (out, s)
@@ -891,11 +967,17 @@ fn gdn_serial_ref(
 /// solve for u, online output + state accumulation. Decays applied before the
 /// reduction. q_scale applied at the very end. Tail handled by serial fallback.
 fn gdn_chunk_ref(
-    q: &[Vec<f32>], k: &[Vec<f32>], v: &[f32], a: &[f32], b: &[f32], d: usize, c: usize,
+    q: &[Vec<f32>],
+    k: &[Vec<f32>],
+    v: &[f32],
+    a: &[f32],
+    b: &[f32],
+    d: usize,
+    c: usize,
 ) -> (Vec<f32>, Vec<f32>) {
     let t = q.len();
     let q_scale = 1.0f32 / (d as f32).sqrt();
-    let mut s = vec![0.0f32; d];          // S_in carried across chunks (D-vector for this vj)
+    let mut s = vec![0.0f32; d]; // S_in carried across chunks (D-vector for this vj)
     let mut out = vec![0.0f32; t];
     let mut start = 0usize;
     while start < t {
@@ -910,11 +992,15 @@ fn gdn_chunk_ref(
         // prefix p_i = prod_{r=0..i} a_r  (serial mult order)
         let mut p = vec![0.0f32; m];
         p[0] = aa(0);
-        for i in 1..m { p[i] = p[i - 1] * aa(i); }
+        for i in 1..m {
+            p[i] = p[i - 1] * aa(i);
+        }
         // suffix sigma_j = prod_{r=j+1..m-1} a_r ; sigma_{m-1}=1
         let mut sig = vec![0.0f32; m];
         sig[m - 1] = 1.0;
-        for j in (0..m - 1).rev() { sig[j] = aa(j + 1) * sig[j + 1]; }
+        for j in (0..m - 1).rev() {
+            sig[j] = aa(j + 1) * sig[j + 1];
+        }
         // relative gamma_ij = prod_{r=j+1..i} a_r (i>j); gamma_ii=1
         // gamma[i][j]; built by gamma_ij = a_i * gamma_{i-1,j} for j<i.
         let mut gamma = vec![vec![0.0f32; m]; m];
@@ -936,18 +1022,24 @@ fn gdn_chunk_ref(
         for i in 0..m {
             // oin_i = <S_in, p_i q_i> (decay before reduction)
             let mut oin = 0.0f32;
-            for r in 0..d { oin += s[r] * (p[i] * qq(i)[r]); }
+            for r in 0..d {
+                oin += s[r] * (p[i] * qq(i)[r]);
+            }
             o_acc[i] = oin;
         }
         for j in 0..m {
             // rhs_j = b_j*(v_j - <S_in, p_j k_j>)
             let mut sk = 0.0f32;
-            for r in 0..d { sk += s[r] * (p[j] * kk(j)[r]); }
+            for r in 0..d {
+                sk += s[r] * (p[j] * kk(j)[r]);
+            }
             let mut hist = 0.0f32;
             for l in 0..j {
                 // T_jl = gamma_jl <k_j, k_l> (decay before reduction)
                 let mut kkdot = 0.0f32;
-                for r in 0..d { kkdot += kk(j)[r] * (gamma[j][l] * kk(l)[r]); }
+                for r in 0..d {
+                    kkdot += kk(j)[r] * (gamma[j][l] * kk(l)[r]);
+                }
                 hist += kkdot * u[l];
             }
             u[j] = bb(j) * (vv(j) - sk - hist);
@@ -955,17 +1047,25 @@ fn gdn_chunk_ref(
             // H_ij = gamma_ij <q_i, k_j> (decay before reduction)
             for i in j..m {
                 let mut qkdot = 0.0f32;
-                for r in 0..d { qkdot += qq(i)[r] * (gamma[i][j] * kk(j)[r]); }
+                for r in 0..d {
+                    qkdot += qq(i)[r] * (gamma[i][j] * kk(j)[r]);
+                }
                 o_acc[i] += qkdot * u[j];
             }
         }
         // write outputs
-        for i in 0..m { out[start + i] = o_acc[i] * q_scale; }
+        for i in 0..m {
+            out[start + i] = o_acc[i] * q_scale;
+        }
         // state update: S_out = p_{m-1} S_in + sum_j (sigma_j u_j) k_j
-        for r in 0..d { s[r] *= p[m - 1]; }
+        for r in 0..d {
+            s[r] *= p[m - 1];
+        }
         for j in 0..m {
             let coef = sig[j] * u[j];
-            for r in 0..d { s[r] += coef * kk(j)[r]; }
+            for r in 0..d {
+                s[r] += coef * kk(j)[r];
+            }
         }
         start += m;
     }
@@ -978,36 +1078,58 @@ fn test_gdn_chunk_scan_matches_serial_cpu() {
     use std::hash::{Hash, Hasher};
     // Deterministic pseudo-random generator (no external rng dep).
     let mut seed = 0x9E3779B97F4A7C15u64;
-    let mut next = || { let mut h = DefaultHasher::new(); seed.hash(&mut h); seed = h.finish(); (seed >> 11) as f32 / (1u64 << 53) as f32 };
+    let mut next = || {
+        let mut h = DefaultHasher::new();
+        seed.hash(&mut h);
+        seed = h.finish();
+        (seed >> 11) as f32 / (1u64 << 53) as f32
+    };
 
-    let d = 128usize;            // key_dim = val_dim
+    let d = 128usize; // key_dim = val_dim
     for &t in &[16usize, 17, 31, 48, 100, 200, 1208] {
         // Build inputs. a in (0,1) decay; b in (0,1) mixing; q,k L2-ish small.
-        let q: Vec<Vec<f32>> = (0..t).map(|_| (0..d).map(|_| next() - 0.5).collect()).collect();
+        let q: Vec<Vec<f32>> = (0..t)
+            .map(|_| (0..d).map(|_| next() - 0.5).collect())
+            .collect();
         // L2-normalize k (the kernel feeds L2-normed conv outputs as q/k).
-        let k: Vec<Vec<f32>> = (0..t).map(|_| {
-            let raw: Vec<f32> = (0..d).map(|_| next() - 0.5).collect();
-            let n = (raw.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1e-6);
-            raw.iter().map(|x| x / n).collect()
-        }).collect();
-        let qn: Vec<Vec<f32>> = q.iter().map(|row| {
-            let n = (row.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1e-6);
-            row.iter().map(|x| x / n).collect()
-        }).collect();
+        let k: Vec<Vec<f32>> = (0..t)
+            .map(|_| {
+                let raw: Vec<f32> = (0..d).map(|_| next() - 0.5).collect();
+                let n = (raw.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1e-6);
+                raw.iter().map(|x| x / n).collect()
+            })
+            .collect();
+        let qn: Vec<Vec<f32>> = q
+            .iter()
+            .map(|row| {
+                let n = (row.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1e-6);
+                row.iter().map(|x| x / n).collect()
+            })
+            .collect();
         let v: Vec<f32> = (0..t).map(|_| next() - 0.5).collect();
-        let a: Vec<f32> = (0..t).map(|_| 0.85 + 0.14 * next()).collect();   // (0.85,0.99)
-        let b: Vec<f32> = (0..t).map(|_| 0.1 + 0.8 * next()).collect();     // (0.1,0.9)
+        let a: Vec<f32> = (0..t).map(|_| 0.85 + 0.14 * next()).collect(); // (0.85,0.99)
+        let b: Vec<f32> = (0..t).map(|_| 0.1 + 0.8 * next()).collect(); // (0.1,0.9)
 
         let (out_s, st_s) = gdn_serial_ref(&qn, &k, &v, &a, &b, d);
         for &c in &[8usize, 16] {
             let (out_c, st_c) = gdn_chunk_ref(&qn, &k, &v, &a, &b, d, c);
             let mut max_out = 0.0f32;
-            for i in 0..t { max_out = max_out.max((out_s[i] - out_c[i]).abs()); }
+            for i in 0..t {
+                max_out = max_out.max((out_s[i] - out_c[i]).abs());
+            }
             let mut max_st = 0.0f32;
-            for r in 0..d { max_st = max_st.max((st_s[r] - st_c[r]).abs()); }
+            for r in 0..d {
+                max_st = max_st.max((st_s[r] - st_c[r]).abs());
+            }
             eprintln!("T={t} C={c}: max_out_abs={max_out:.3e} max_state_abs={max_st:.3e}");
-            assert!(max_out < 2e-3, "T={t} C={c} output drift too large: {max_out:.3e}");
-            assert!(max_st < 2e-3, "T={t} C={c} state drift too large: {max_st:.3e}");
+            assert!(
+                max_out < 2e-3,
+                "T={t} C={c} output drift too large: {max_out:.3e}"
+            );
+            assert!(
+                max_st < 2e-3,
+                "T={t} C={c} state drift too large: {max_st:.3e}"
+            );
         }
     }
     eprintln!("test_gdn_chunk_scan_matches_serial_cpu: PASS");

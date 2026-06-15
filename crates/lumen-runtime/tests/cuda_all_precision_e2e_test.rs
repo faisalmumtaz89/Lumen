@@ -23,10 +23,9 @@
 #![cfg(feature = "cuda")]
 
 use lumen_format::test_model::{
-    generate_test_model, TestModelConfig,
-    generate_test_model_f16, TestModelF16Config,
-    generate_test_model_q8_0, TestModelQ8Config,
-    generate_test_model_q4_0, TestModelQ4Config,
+    generate_test_model, generate_test_model_f16, generate_test_model_q4_0,
+    generate_test_model_q8_0, TestModelConfig, TestModelF16Config, TestModelQ4Config,
+    TestModelQ8Config,
 };
 use lumen_runtime::compute::cpu_naive::NaiveF32Backend;
 use lumen_runtime::compute::ComputeBackend;
@@ -81,8 +80,13 @@ fn dequant_q8_0_to_f32(q8_bytes: &[u8], out_dim: usize, in_dim: usize) -> Vec<f3
     assert_eq!(in_dim % Q8_0_BLOCK_SIZE, 0);
     let blocks_per_row = in_dim / Q8_0_BLOCK_SIZE;
     let expected_bytes = out_dim * blocks_per_row * Q8_0_BYTES_PER_BLOCK;
-    assert_eq!(q8_bytes.len(), expected_bytes,
-        "Q8_0 byte length mismatch: got {} expected {}", q8_bytes.len(), expected_bytes);
+    assert_eq!(
+        q8_bytes.len(),
+        expected_bytes,
+        "Q8_0 byte length mismatch: got {} expected {}",
+        q8_bytes.len(),
+        expected_bytes
+    );
 
     let mut result = Vec::with_capacity(out_dim * in_dim);
     for row in 0..out_dim {
@@ -109,8 +113,13 @@ fn dequant_q4_0_to_f32(q4_bytes: &[u8], out_dim: usize, in_dim: usize) -> Vec<f3
     assert_eq!(in_dim % Q4_0_BLOCK_SIZE, 0);
     let blocks_per_row = in_dim / Q4_0_BLOCK_SIZE;
     let expected_bytes = out_dim * blocks_per_row * Q4_0_BYTES_PER_BLOCK;
-    assert_eq!(q4_bytes.len(), expected_bytes,
-        "Q4_0 byte length mismatch: got {} expected {}", q4_bytes.len(), expected_bytes);
+    assert_eq!(
+        q4_bytes.len(),
+        expected_bytes,
+        "Q4_0 byte length mismatch: got {} expected {}",
+        q4_bytes.len(),
+        expected_bytes
+    );
 
     let mut result = Vec::with_capacity(out_dim * in_dim);
     for row in 0..out_dim {
@@ -177,7 +186,11 @@ fn dequant_tensor_append(
     };
     let f32_bytes: Vec<u8> = f32_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
     let len = f32_bytes.len() as u64;
-    let ts = TensorSlice { offset: *offset, length: len, quant: QuantScheme::F32 };
+    let ts = TensorSlice {
+        offset: *offset,
+        length: len,
+        quant: QuantScheme::F32,
+    };
     blob.extend_from_slice(&f32_bytes);
     *offset += len;
     ts
@@ -193,7 +206,11 @@ fn copy_f32_tensor(
 ) -> TensorSlice {
     let raw = view.subtensor_bytes(slice).unwrap();
     let len = raw.len() as u64;
-    let ts = TensorSlice { offset: *offset, length: len, quant: QuantScheme::F32 };
+    let ts = TensorSlice {
+        offset: *offset,
+        length: len,
+        quant: QuantScheme::F32,
+    };
     blob.extend_from_slice(raw);
     *offset += len;
     ts
@@ -219,24 +236,62 @@ fn dequant_layer_to_f32(
     let wk = dequant_tensor_append(&view, &mut blob, &mut offset, &st.wk, kv_dim, hidden_dim);
     let wv = dequant_tensor_append(&view, &mut blob, &mut offset, &st.wv, kv_dim, hidden_dim);
     let wo = dequant_tensor_append(&view, &mut blob, &mut offset, &st.wo, hidden_dim, q_dim);
-    let w_gate = dequant_tensor_append(&view, &mut blob, &mut offset, &st.w_gate, inter_dim, hidden_dim);
-    let w_up = dequant_tensor_append(&view, &mut blob, &mut offset, &st.w_up, inter_dim, hidden_dim);
-    let w_down = dequant_tensor_append(&view, &mut blob, &mut offset, &st.w_down, hidden_dim, inter_dim);
+    let w_gate = dequant_tensor_append(
+        &view,
+        &mut blob,
+        &mut offset,
+        &st.w_gate,
+        inter_dim,
+        hidden_dim,
+    );
+    let w_up = dequant_tensor_append(
+        &view,
+        &mut blob,
+        &mut offset,
+        &st.w_up,
+        inter_dim,
+        hidden_dim,
+    );
+    let w_down = dequant_tensor_append(
+        &view,
+        &mut blob,
+        &mut offset,
+        &st.w_down,
+        hidden_dim,
+        inter_dim,
+    );
     let attn_norm = copy_f32_tensor(&view, &mut blob, &mut offset, &st.attn_norm);
     let ffn_norm = copy_f32_tensor(&view, &mut blob, &mut offset, &st.ffn_norm);
 
     let subs = SubtensorOffsets {
-        wq, wk, wv, wo,
-        bq: None, bk: None, bv: None,
-        w_gate, w_up, w_down,
-        attn_norm, ffn_norm,
+        wq,
+        wk,
+        wv,
+        wo,
+        bq: None,
+        bk: None,
+        bv: None,
+        w_gate,
+        w_up,
+        w_down,
+        attn_norm,
+        ffn_norm,
         router_weight: None,
         experts: None,
-        shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-        attn_gate: None, attn_post_norm: None,
-        ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-        ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-        attn_q_norm: None, attn_k_norm: None,
+        shared_expert_gate: None,
+        shared_expert_up: None,
+        shared_expert_down: None,
+        attn_gate: None,
+        attn_post_norm: None,
+        ssm_a: None,
+        ssm_conv1d: None,
+        ssm_dt: None,
+        ssm_beta: None,
+        ssm_alpha: None,
+        ssm_norm: None,
+        ssm_out: None,
+        attn_q_norm: None,
+        attn_k_norm: None,
         ffn_gate_inp_shexp: None,
         layer_type: None,
     };
@@ -280,10 +335,7 @@ fn run_generate(
     max_tokens: usize,
 ) -> Vec<u32> {
     let hp = provider.lbc().header.hyperparams;
-    let engine = InferenceEngine::new(
-        test_rt_config(hp.max_seq_len as usize),
-        hp,
-    );
+    let engine = InferenceEngine::new(test_rt_config(hp.max_seq_len as usize), hp);
 
     let stop = StopCondition::MaxTokens(max_tokens);
     let sampling = SamplingParams {
@@ -357,8 +409,16 @@ fn e2e_f32_matches_cpu() {
     let cpu_tokens = run_generate(&provider, &cpu, &prompt, max_tokens);
     let cuda_tokens = run_generate(&provider, &cuda, &prompt, max_tokens);
 
-    assert_eq!(cpu_tokens.len(), max_tokens, "CPU should generate {max_tokens} tokens");
-    assert_eq!(cuda_tokens.len(), max_tokens, "CUDA should generate {max_tokens} tokens");
+    assert_eq!(
+        cpu_tokens.len(),
+        max_tokens,
+        "CPU should generate {max_tokens} tokens"
+    );
+    assert_eq!(
+        cuda_tokens.len(),
+        max_tokens,
+        "CUDA should generate {max_tokens} tokens"
+    );
     assert_eq!(
         cpu_tokens, cuda_tokens,
         "CUDA must produce identical tokens to CPU (greedy, F32)\n\
@@ -418,7 +478,11 @@ fn e2e_f16_matches_cpu() {
 
     let cuda_tokens = run_generate(&provider, &cuda, &prompt, max_tokens);
 
-    assert_eq!(cuda_tokens.len(), max_tokens, "CUDA should generate {max_tokens} tokens");
+    assert_eq!(
+        cuda_tokens.len(),
+        max_tokens,
+        "CUDA should generate {max_tokens} tokens"
+    );
 
     // Verify all tokens within vocab range
     let vocab_size = hp.vocab_size;
@@ -482,7 +546,11 @@ fn e2e_q8_0_matches_cpu() {
 
     let cuda_tokens = run_generate(&provider, &cuda, &prompt, max_tokens);
 
-    assert_eq!(cuda_tokens.len(), max_tokens, "CUDA should generate {max_tokens} tokens");
+    assert_eq!(
+        cuda_tokens.len(),
+        max_tokens,
+        "CUDA should generate {max_tokens} tokens"
+    );
 
     // Verify all tokens within vocab range
     let vocab_size = hp.vocab_size;
@@ -539,7 +607,11 @@ fn e2e_q4_0_matches_cpu() {
 
     let cuda_tokens = run_generate(&provider, &cuda, &prompt, max_tokens);
 
-    assert_eq!(cuda_tokens.len(), max_tokens, "CUDA should generate {max_tokens} tokens");
+    assert_eq!(
+        cuda_tokens.len(),
+        max_tokens,
+        "CUDA should generate {max_tokens} tokens"
+    );
 
     // Verify all tokens within vocab range
     let vocab_size = hp.vocab_size;
@@ -776,14 +848,15 @@ fn e2e_metrics_populated() {
     );
     cuda.init(&hp).unwrap();
 
-    let engine = InferenceEngine::new(
-        test_rt_config(hp.max_seq_len as usize),
-        hp,
-    );
+    let engine = InferenceEngine::new(test_rt_config(hp.max_seq_len as usize), hp);
 
     let prompt = vec![0u32, 1, 2];
     let stop = StopCondition::MaxTokens(5);
-    let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        seed: Some(42),
+        ..Default::default()
+    };
 
     let result = engine
         .generate(&prompt, &provider, &cuda, &stop, &sampling)
@@ -792,13 +865,21 @@ fn e2e_metrics_populated() {
     assert_eq!(result.tokens.len(), 5);
     assert_eq!(result.metrics.prompt_tokens, 3);
     assert_eq!(result.metrics.generated_tokens, 5);
-    assert!(result.metrics.total_time.as_nanos() > 0, "total_time should be > 0");
-    assert!(result.metrics.prefill_time.as_nanos() > 0, "prefill_time should be > 0");
-    assert!(result.metrics.decode_time.as_nanos() > 0, "decode_time should be > 0");
+    assert!(
+        result.metrics.total_time.as_nanos() > 0,
+        "total_time should be > 0"
+    );
+    assert!(
+        result.metrics.prefill_time.as_nanos() > 0,
+        "prefill_time should be > 0"
+    );
+    assert!(
+        result.metrics.decode_time.as_nanos() > 0,
+        "decode_time should be > 0"
+    );
 
     eprintln!(
         "e2e_metrics_populated: decode={:.1} tok/s, prefill={:.1} tok/s",
-        result.metrics.decode_tokens_per_sec,
-        result.metrics.prefill_tokens_per_sec,
+        result.metrics.decode_tokens_per_sec, result.metrics.prefill_tokens_per_sec,
     );
 }

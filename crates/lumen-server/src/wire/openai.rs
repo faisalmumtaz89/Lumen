@@ -408,10 +408,12 @@ fn render_chat_prompt(
                 // assistant tool-call transcript is byte-identical to the one
                 // the Anthropic surface emits for an equivalent round-trip.
                 for tc in &m.tool_calls {
-                    transcript.push_str(&lumen_runtime::tooling::render_assistant_tool_call_segment(
-                        &tc.function.name,
-                        &tc.function.arguments,
-                    ));
+                    transcript.push_str(
+                        &lumen_runtime::tooling::render_assistant_tool_call_segment(
+                            &tc.function.name,
+                            &tc.function.arguments,
+                        ),
+                    );
                 }
                 transcript.push_str("<|im_end|>\n");
             }
@@ -455,7 +457,9 @@ fn render_chat_prompt(
     // the env override now lives in `resolve_enable_thinking` so the CLI and
     // both wire formats honour it identically.
     prompt.push_str("<|im_start|>assistant\n");
-    prompt.push_str(lumen_runtime::runtime_defaults::think_prompt_tail(enable_thinking));
+    prompt.push_str(lumen_runtime::runtime_defaults::think_prompt_tail(
+        enable_thinking,
+    ));
     Ok(prompt)
 }
 
@@ -478,10 +482,12 @@ fn sse_done() -> Vec<u8> {
 /// the streaming state machine.
 fn body_from_byte_stream(rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> Body {
     let stream = futures::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|chunk| (
-            Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(chunk)),
-            rx,
-        ))
+        rx.recv().await.map(|chunk| {
+            (
+                Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(chunk)),
+                rx,
+            )
+        })
     });
     Body::from_stream(stream)
 }
@@ -494,7 +500,9 @@ pub fn stream_chat(
     stop: Vec<String>,
 ) -> Body {
     let (tx, body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    tokio::spawn(drive_chat_stream(rx, tx, model, created, true, thinking, stop));
+    tokio::spawn(drive_chat_stream(
+        rx, tx, model, created, true, thinking, stop,
+    ));
     body_from_byte_stream(body_rx)
 }
 
@@ -507,7 +515,9 @@ pub fn stream_completion(
     let (tx, body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     // Legacy completions have no chat template / `<think>` block: thinking is
     // always off, so the emitter's reasoning stage is a passthrough.
-    tokio::spawn(drive_chat_stream(rx, tx, model, created, false, false, stop));
+    tokio::spawn(drive_chat_stream(
+        rx, tx, model, created, false, false, stop,
+    ));
     body_from_byte_stream(body_rx)
 }
 
@@ -520,7 +530,10 @@ async fn drive_chat_stream(
     thinking: bool,
     stop: Vec<String>,
 ) {
-    let id = format!("chatcmpl-lumen-{created:x}-{:x}", super::next_response_seq());
+    let id = format!(
+        "chatcmpl-lumen-{created:x}-{:x}",
+        super::next_response_seq()
+    );
     let mut emitter = SseSafeEmitter::new(thinking);
     // F4: seed the streaming stop matcher from the request stop list. The
     // worker already truncates generation at the stop string (and reports
@@ -646,7 +659,9 @@ async fn drive_chat_stream(
                     break;
                 }
             }
-            TokenEvent::Done { finish_reason: fr, .. } => {
+            TokenEvent::Done {
+                finish_reason: fr, ..
+            } => {
                 finish_reason = Some(fr);
                 break;
             }
@@ -807,7 +822,11 @@ pub async fn collect_chat(
                     break;
                 }
             }
-            TokenEvent::Done { finish_reason, prompt_tokens: p, completion_tokens: c } => {
+            TokenEvent::Done {
+                finish_reason,
+                prompt_tokens: p,
+                completion_tokens: c,
+            } => {
                 finish = finish_reason;
                 prompt_tokens = p;
                 completion_tokens = c;
@@ -942,7 +961,11 @@ pub async fn collect_completion(
                     break;
                 }
             }
-            TokenEvent::Done { finish_reason, prompt_tokens: p, completion_tokens: c } => {
+            TokenEvent::Done {
+                finish_reason,
+                prompt_tokens: p,
+                completion_tokens: c,
+            } => {
                 finish = finish_reason;
                 prompt_tokens = p;
                 completion_tokens = c;
@@ -988,7 +1011,10 @@ mod tests {
     use lumen_runtime::tooling::Qwen35Renderer;
 
     fn tok(text: &str) -> TokenEvent {
-        TokenEvent::Token { token_id: 0, delta_text: text.to_string() }
+        TokenEvent::Token {
+            token_id: 0,
+            delta_text: text.to_string(),
+        }
     }
 
     #[tokio::test]
@@ -1004,7 +1030,9 @@ mod tests {
                 completion_tokens: 12,
             },
         ];
-        let resp = collect_chat_from_events(events, "test-model".into(), 1234, false).await.unwrap();
+        let resp = collect_chat_from_events(events, "test-model".into(), 1234, false)
+            .await
+            .unwrap();
         // Tool calls present -> finish_reason becomes tool_calls automatically.
         assert_eq!(resp["choices"][0]["finish_reason"], "tool_calls");
         let tcs = &resp["choices"][0]["message"]["tool_calls"];
@@ -1029,11 +1057,16 @@ mod tests {
                 completion_tokens: 2,
             },
         ];
-        let resp = collect_chat_from_events(events, "test".into(), 1, false).await.unwrap();
+        let resp = collect_chat_from_events(events, "test".into(), 1, false)
+            .await
+            .unwrap();
         let content = resp["choices"][0]["message"]["content"].as_str().unwrap();
         // The literal "<tool" must not appear in user-visible content.
         assert!(!content.contains("<tool"));
-        assert_eq!(resp["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "f");
+        assert_eq!(
+            resp["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "f"
+        );
     }
 
     #[tokio::test]
@@ -1046,7 +1079,9 @@ mod tests {
                 completion_tokens: 5,
             },
         ];
-        let resp = collect_chat_from_events(events, "test".into(), 1, false).await.unwrap();
+        let resp = collect_chat_from_events(events, "test".into(), 1, false)
+            .await
+            .unwrap();
         assert_eq!(resp["choices"][0]["finish_reason"], "length");
     }
 
@@ -1224,7 +1259,10 @@ mod tests {
         let messages = vec![user_msg("Hello")];
         let out = render_chat_prompt(&messages, &[], true).unwrap();
         let expected = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n";
-        assert_eq!(out, expected, "render_chat_prompt user-only enabled != open think tail");
+        assert_eq!(
+            out, expected,
+            "render_chat_prompt user-only enabled != open think tail"
+        );
     }
 
     #[test]
@@ -1234,7 +1272,10 @@ mod tests {
         let expected = "<|im_start|>system\nYou are helpful.<|im_end|>\n\
                         <|im_start|>user\nHi<|im_end|>\n\
                         <|im_start|>assistant\n<think>\n\n</think>\n\n";
-        assert_eq!(out, expected, "render_chat_prompt system+user != CLI output");
+        assert_eq!(
+            out, expected,
+            "render_chat_prompt system+user != CLI output"
+        );
     }
 
     #[test]
@@ -1244,7 +1285,10 @@ mod tests {
         let expected = "<|im_start|>system\nYou are helpful.<|im_end|>\n\
                         <|im_start|>user\nHi<|im_end|>\n\
                         <|im_start|>assistant\n<think>\n";
-        assert_eq!(out, expected, "render_chat_prompt system+user enabled != open think tail");
+        assert_eq!(
+            out, expected,
+            "render_chat_prompt system+user enabled != open think tail"
+        );
     }
 
     #[test]
@@ -1252,11 +1296,7 @@ mod tests {
         // Three-turn: user, assistant, user. The empty-think tail must
         // appear ONLY at the final assistant prefix, NOT at the previous
         // assistant turn (which carries real content).
-        let messages = vec![
-            user_msg("Q1"),
-            assistant_msg("A1"),
-            user_msg("Q2"),
-        ];
+        let messages = vec![user_msg("Q1"), assistant_msg("A1"), user_msg("Q2")];
         let out = render_chat_prompt(&messages, &[], false).unwrap();
         let expected = "<|im_start|>user\nQ1<|im_end|>\n\
                         <|im_start|>assistant\nA1<|im_end|>\n\
@@ -1281,7 +1321,10 @@ mod tests {
             "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
             prompt = "Hello"
         );
-        assert_eq!(server_out, cli_out, "server render must match CLI render byte-for-byte");
+        assert_eq!(
+            server_out, cli_out,
+            "server render must match CLI render byte-for-byte"
+        );
     }
 
     // ---- reasoning_content extraction (non-stream collect_chat) ----
@@ -1292,11 +1335,20 @@ mod tests {
         // reasoning_content key even if the model literally emits </think>.
         let events = vec![
             tok("plain answer </think> still answer"),
-            TokenEvent::Done { finish_reason: FinishReason::Stop, prompt_tokens: 1, completion_tokens: 4 },
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 4,
+            },
         ];
-        let resp = collect_chat_from_events(events, "test".into(), 1, false).await.unwrap();
+        let resp = collect_chat_from_events(events, "test".into(), 1, false)
+            .await
+            .unwrap();
         let msg = &resp["choices"][0]["message"];
-        assert!(msg.get("reasoning_content").is_none(), "no reasoning_content when thinking off");
+        assert!(
+            msg.get("reasoning_content").is_none(),
+            "no reasoning_content when thinking off"
+        );
         assert_eq!(msg["content"], "plain answer </think> still answer");
     }
 
@@ -1305,9 +1357,15 @@ mod tests {
         let events = vec![
             tok("let me think"),
             tok(" carefully</think>The answer is 42."),
-            TokenEvent::Done { finish_reason: FinishReason::Stop, prompt_tokens: 1, completion_tokens: 6 },
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 6,
+            },
         ];
-        let resp = collect_chat_from_events(events, "test".into(), 1, true).await.unwrap();
+        let resp = collect_chat_from_events(events, "test".into(), 1, true)
+            .await
+            .unwrap();
         let msg = &resp["choices"][0]["message"];
         assert_eq!(msg["reasoning_content"], "let me think carefully");
         assert_eq!(msg["content"], "The answer is 42.");
@@ -1328,8 +1386,8 @@ mod tests {
             "presence_penalty": 0.5,
             "frequency_penalty": 0.7
         });
-        let req: ChatCompletionRequest = serde_json::from_value(body)
-            .expect("sampler params must deserialize, not 400");
+        let req: ChatCompletionRequest =
+            serde_json::from_value(body).expect("sampler params must deserialize, not 400");
         assert_eq!(req.top_p, Some(0.9));
         assert_eq!(req.top_k, Some(40));
         assert_eq!(req.min_p, Some(0.05));
@@ -1375,7 +1433,10 @@ mod tests {
         let omitted_req: ChatCompletionRequest = serde_json::from_value(omitted_body).unwrap();
         let zero_job = zero_req.into_job(&engine).unwrap();
         let omitted_job = omitted_req.into_job(&engine).unwrap();
-        assert_eq!(zero_job.sampling.presence_penalty, None, "zero presence -> None");
+        assert_eq!(
+            zero_job.sampling.presence_penalty, None,
+            "zero presence -> None"
+        );
         assert_eq!(
             zero_job.sampling.frequency_penalty, omitted_job.sampling.frequency_penalty,
             "all-zero freq penalty must equal the omitted (diag-default) path"
@@ -1428,7 +1489,10 @@ mod tests {
         match err {
             ServerError::BadRequest { code, message, .. } => {
                 assert_eq!(code.as_deref(), Some("context_length_exceeded"));
-                assert!(message.contains("max_seq_len is"), "msg carries the sentinel: {message}");
+                assert!(
+                    message.contains("max_seq_len is"),
+                    "msg carries the sentinel: {message}"
+                );
             }
             other => panic!("expected BadRequest, got {other:?}"),
         }
@@ -1443,7 +1507,9 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
         let req: ChatCompletionRequest = serde_json::from_value(body).unwrap();
-        assert!(req.into_job(&engine).is_ok(), "short prompt must pass the guard");
+        assert!(
+            req.into_job(&engine).is_ok(),
+            "short prompt must pass the guard"
+        );
     }
 }
-

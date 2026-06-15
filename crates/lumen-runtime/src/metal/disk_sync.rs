@@ -248,10 +248,20 @@ impl MetalF32Backend {
                 }
             }
             Self::transpose_gpu_k_to_cpu_f16(
-                &k_src, k_dst, seq_len, num_kv_heads, head_dim, max_seq_len,
+                &k_src,
+                k_dst,
+                seq_len,
+                num_kv_heads,
+                head_dim,
+                max_seq_len,
             );
             Self::transpose_gpu_v_to_cpu_f16(
-                &v_src, v_dst, seq_len, num_kv_heads, head_dim, max_seq_len,
+                &v_src,
+                v_dst,
+                seq_len,
+                num_kv_heads,
+                head_dim,
+                max_seq_len,
             );
         }
 
@@ -358,20 +368,26 @@ impl MetalF32Backend {
             let mut k_gpu = vec![0u16; expected_words];
             let mut v_gpu = vec![0u16; expected_words];
             Self::transpose_cpu_k_to_gpu_f16(
-                k_src, &mut k_gpu, seq_len, num_kv_heads, head_dim, max_seq_len,
+                k_src,
+                &mut k_gpu,
+                seq_len,
+                num_kv_heads,
+                head_dim,
+                max_seq_len,
             );
             Self::transpose_cpu_v_to_gpu_f16(
-                v_src, &mut v_gpu, seq_len, num_kv_heads, head_dim, max_seq_len,
+                v_src,
+                &mut v_gpu,
+                seq_len,
+                num_kv_heads,
+                head_dim,
+                max_seq_len,
             );
             let scratch_guard = self.scratch.lock().map_err(|_| {
-                RuntimeError::Compute(
-                    "Metal sync_kv_from_cpu: scratch lock poisoned".into(),
-                )
+                RuntimeError::Compute("Metal sync_kv_from_cpu: scratch lock poisoned".into())
             })?;
             let s = scratch_guard.as_ref().ok_or_else(|| {
-                RuntimeError::Compute(
-                    "Metal sync_kv_from_cpu: scratch not initialised".into(),
-                )
+                RuntimeError::Compute("Metal sync_kv_from_cpu: scratch not initialised".into())
             })?;
             let k_buf = &s.gpu_k_cache[layer];
             let v_buf = &s.gpu_v_cache[layer];
@@ -455,17 +471,12 @@ impl MetalF32Backend {
     /// caller MUST `reset_recurrent_state` and `ensure_gdn_storage_for_layout`
     /// again to switch layouts — but in practice the engine never does
     /// because GDN layout is model-fixed).
-    fn ensure_gdn_storage_for_layout(
-        &self,
-        layout: &GdnLayout,
-    ) -> Result<(), RuntimeError> {
+    fn ensure_gdn_storage_for_layout(&self, layout: &GdnLayout) -> Result<(), RuntimeError> {
         let mut scratch_guard = self.scratch.lock().map_err(|_| {
             RuntimeError::Compute("ensure_gdn_storage_for_layout: scratch lock poisoned".into())
         })?;
         let s = scratch_guard.as_mut().ok_or_else(|| {
-            RuntimeError::Compute(
-                "ensure_gdn_storage_for_layout: scratch not initialised".into(),
-            )
+            RuntimeError::Compute("ensure_gdn_storage_for_layout: scratch not initialised".into())
         })?;
         let want_layers = layout.num_gdn_layers as usize;
         let h_state_size = layout.h_state_bytes_per_layer() / 4;
@@ -475,21 +486,13 @@ impl MetalF32Backend {
             // First touch — allocate from scratch in the layout the caller
             // declares (matches the per-layer allocator in compute_layer).
             for _ in 0..want_layers {
-                let h_buf = self
-                    .device
-                    .new_buffer(h_state_size * 4)
-                    .ok_or_else(|| {
-                        RuntimeError::Compute("disk-restore: failed to allocate GDN h_state".into())
-                    })?;
+                let h_buf = self.device.new_buffer(h_state_size * 4).ok_or_else(|| {
+                    RuntimeError::Compute("disk-restore: failed to allocate GDN h_state".into())
+                })?;
                 h_buf.write_f32(&vec![0.0f32; h_state_size]);
-                let c_buf = self
-                    .device
-                    .new_buffer(conv_state_size * 4)
-                    .ok_or_else(|| {
-                        RuntimeError::Compute(
-                            "disk-restore: failed to allocate GDN conv_state".into(),
-                        )
-                    })?;
+                let c_buf = self.device.new_buffer(conv_state_size * 4).ok_or_else(|| {
+                    RuntimeError::Compute("disk-restore: failed to allocate GDN conv_state".into())
+                })?;
                 c_buf.write_f32(&vec![0.0f32; conv_state_size]);
                 s.gdn_h_states.push(h_buf);
                 s.gdn_conv_states.push(c_buf);
@@ -639,8 +642,10 @@ mod tests {
             for d in 0..head_dim {
                 for pos in 0..seq_len {
                     let i = (h * head_dim + d) * max_seq_len + pos;
-                    assert_eq!(gpu_src[i], gpu_round[i],
-                        "V round-trip differs at h={h} d={d} pos={pos}");
+                    assert_eq!(
+                        gpu_src[i], gpu_round[i],
+                        "V round-trip differs at h={h} d={d} pos={pos}"
+                    );
                 }
                 for pos in seq_len..max_seq_len {
                     let i = (h * head_dim + d) * max_seq_len + pos;
@@ -666,7 +671,12 @@ mod tests {
         gpu_src[1 * (num_kv_heads * head_dim) + 1 * head_dim + 2] = marker;
         let mut cpu_bytes = vec![0u8; total * 2];
         MetalF32Backend::transpose_gpu_k_to_cpu_f16(
-            &gpu_src, &mut cpu_bytes, seq_len, num_kv_heads, head_dim, max_seq_len,
+            &gpu_src,
+            &mut cpu_bytes,
+            seq_len,
+            num_kv_heads,
+            head_dim,
+            max_seq_len,
         );
         // CPU expects `[head=1, pos=1, d=2]` at byte offset
         // `(1*max_seq_len*head_dim + 1*head_dim + 2) * 2`.
@@ -831,7 +841,10 @@ mod tests {
         ComputeBackend::sync_kv_from_cpu(&backend, &kv, Some(&rec)).unwrap();
 
         // Now restore with 3 GDN layers should reject.
-        let mismatched_layout = GdnLayout { num_gdn_layers: 3, ..layout };
+        let mismatched_layout = GdnLayout {
+            num_gdn_layers: 3,
+            ..layout
+        };
         let bad = RecurrentState::zeroed(mismatched_layout);
         let err = ComputeBackend::sync_kv_from_cpu(&backend, &kv, Some(&bad)).unwrap_err();
         let msg = format!("{err}");
@@ -868,7 +881,10 @@ mod tests {
         .unwrap();
         ComputeBackend::sync_kv_from_cpu(&backend, &kv, Some(&rec)).unwrap();
 
-        let mismatched_layout = GdnLayout { gdn_head_dim: 8, ..layout };
+        let mismatched_layout = GdnLayout {
+            gdn_head_dim: 8,
+            ..layout
+        };
         let bad = RecurrentState::zeroed(mismatched_layout);
         let err = ComputeBackend::sync_kv_from_cpu(&backend, &kv, Some(&bad)).unwrap_err();
         let msg = format!("{err}");

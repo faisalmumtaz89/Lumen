@@ -80,8 +80,8 @@ pub const DEFAULT_PRINTABLE_MIN: f64 = 0.70;
 pub fn coherence_score(tokens: &[u32], decoded: &str) -> CoherenceVerdict {
     let repetition_score = repetition(tokens);
     let printable_text_ratio = printable_ratio(decoded);
-    let pass = repetition_score >= DEFAULT_REPETITION_MIN
-        && printable_text_ratio >= DEFAULT_PRINTABLE_MIN;
+    let pass =
+        repetition_score >= DEFAULT_REPETITION_MIN && printable_text_ratio >= DEFAULT_PRINTABLE_MIN;
     CoherenceVerdict {
         repetition_score,
         printable_text_ratio,
@@ -216,8 +216,7 @@ mod tests {
         // token-id 5396 + 8 distinct lead-in tokens.
         let mut tokens = vec![1u32, 2, 3, 4, 5, 6, 7, 8];
         tokens.extend(std::iter::repeat(5396u32).take(120));
-        let decoded = "好的，我来回答这个问题。".to_string()
-            + &"跟".repeat(120);
+        let decoded = "好的，我来回答这个问题。".to_string() + &"跟".repeat(120);
         let v = coherence_score(&tokens, &decoded);
         // Unique = 9; total = 128 → 9/128 ≈ 0.07, below 0.30.
         assert!(
@@ -232,7 +231,9 @@ mod tests {
         // Diverse multi-byte UTF-8 + ASCII.  Tokens model a ~50-token
         // decode window with ~40 distinct IDs (realistic for English
         // narrative text).
-        let tokens: Vec<u32> = (1u32..=50u32).chain(std::iter::repeat(7u32).take(10)).collect();
+        let tokens: Vec<u32> = (1u32..=50u32)
+            .chain(std::iter::repeat(7u32).take(10))
+            .collect();
         let decoded = "The answer is 42 because computational complexity \
                        theory predicts that exhaustive search over a finite \
                        state space terminates.";

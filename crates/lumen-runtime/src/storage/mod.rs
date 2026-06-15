@@ -76,7 +76,9 @@ pub trait StorageBackend: Send + Sync {
     fn is_open(&self) -> bool;
 
     /// Returns the I/O tracker for this backend, if instrumented.
-    fn io_tracker(&self) -> Option<&IoTracker> { None }
+    fn io_tracker(&self) -> Option<&IoTracker> {
+        None
+    }
 }
 
 /// Configuration for the mmap-based storage backend.
@@ -170,7 +172,9 @@ pub fn purge_file_cache(path: &Path) -> Result<(), RuntimeError> {
     // Get file size
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut stat) } != 0 {
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         return Err(RuntimeError::StorageIo(std::io::Error::last_os_error()));
     }
     let len = stat.st_size as u64;
@@ -199,9 +203,7 @@ pub fn purge_file_cache(path: &Path) -> Result<(), RuntimeError> {
         let mut remaining = len as usize;
         while remaining > 0 {
             let to_read = remaining.min(CHUNK);
-            let n = unsafe {
-                libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, to_read)
-            };
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, to_read) };
             if n <= 0 {
                 break; // EOF or error -- best-effort
             }
@@ -209,12 +211,15 @@ pub fn purge_file_cache(path: &Path) -> Result<(), RuntimeError> {
         }
     }
 
-    unsafe { libc::close(fd); }
+    unsafe {
+        libc::close(fd);
+    }
     Ok(())
 }
 
 #[cfg(not(unix))]
 pub fn purge_file_cache(_path: &Path) -> Result<(), RuntimeError> {
-    Err(RuntimeError::Unsupported("purge_file_cache not available on this platform".into()))
+    Err(RuntimeError::Unsupported(
+        "purge_file_cache not available on this platform".into(),
+    ))
 }
-

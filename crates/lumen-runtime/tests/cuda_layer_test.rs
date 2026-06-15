@@ -75,9 +75,7 @@ fn assert_f32_close(label: &str, actual: &[f32], expected: &[f32], tolerance: f3
         let diff = (a - e).abs();
         if diff > tolerance {
             if mismatches < 5 {
-                eprintln!(
-                    "  {label}[{i}]: CUDA={a:.6}, CPU={e:.6}, diff={diff:.2e}"
-                );
+                eprintln!("  {label}[{i}]: CUDA={a:.6}, CPU={e:.6}, diff={diff:.2e}");
             }
             mismatches += 1;
         }
@@ -175,28 +173,35 @@ fn test_cuda_compute_layer_matches_cpu() {
         // CPU compute_layer
         {
             let mut kv_view = cpu_kv.view_mut(layer_idx).unwrap();
-            cpu.compute_layer(layer_idx, &mut cpu_x, &layer_view, Some(&mut kv_view), seq_pos)
-                .unwrap();
+            cpu.compute_layer(
+                layer_idx,
+                &mut cpu_x,
+                &layer_view,
+                Some(&mut kv_view),
+                seq_pos,
+            )
+            .unwrap();
             cpu_kv.commit_view(kv_view).unwrap();
         }
 
         // CUDA compute_layer
         {
             let mut kv_view = cuda_kv.view_mut(layer_idx).unwrap();
-            cuda.compute_layer(layer_idx, &mut cuda_x, &layer_view, Some(&mut kv_view), seq_pos)
-                .unwrap();
+            cuda.compute_layer(
+                layer_idx,
+                &mut cuda_x,
+                &layer_view,
+                Some(&mut kv_view),
+                seq_pos,
+            )
+            .unwrap();
             cuda_kv.commit_view(kv_view).unwrap();
         }
 
         // Compare layer outputs.
         let cpu_vals = cpu_x.as_f32_slice();
         let cuda_vals = cuda_x.as_f32_slice();
-        assert_f32_close(
-            &format!("layer_{layer_idx}"),
-            cuda_vals,
-            cpu_vals,
-            1e-3,
-        );
+        assert_f32_close(&format!("layer_{layer_idx}"), cuda_vals, cpu_vals, 1e-3);
     }
 
     // Advance KV cache seq_len for both.
@@ -256,15 +261,27 @@ fn test_cuda_multi_token_decode() {
 
             {
                 let mut kv_view = cpu_kv.view_mut(layer_idx).unwrap();
-                cpu.compute_layer(layer_idx, &mut cpu_x, &layer_view, Some(&mut kv_view), seq_pos)
-                    .unwrap();
+                cpu.compute_layer(
+                    layer_idx,
+                    &mut cpu_x,
+                    &layer_view,
+                    Some(&mut kv_view),
+                    seq_pos,
+                )
+                .unwrap();
                 cpu_kv.commit_view(kv_view).unwrap();
             }
 
             {
                 let mut kv_view = cuda_kv.view_mut(layer_idx).unwrap();
-                cuda.compute_layer(layer_idx, &mut cuda_x, &layer_view, Some(&mut kv_view), seq_pos)
-                    .unwrap();
+                cuda.compute_layer(
+                    layer_idx,
+                    &mut cuda_x,
+                    &layer_view,
+                    Some(&mut kv_view),
+                    seq_pos,
+                )
+                .unwrap();
                 cuda_kv.commit_view(kv_view).unwrap();
             }
         }

@@ -90,10 +90,7 @@ fn encode_q8_0(values: &[f32]) -> Vec<u8> {
         let block_values = &values[start..end];
 
         // Find the absolute max to compute scale.
-        let amax = block_values
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0f32, f32::max);
+        let amax = block_values.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
 
         let scale = if amax == 0.0 { 0.0 } else { amax / 127.0 };
         let inv_scale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
@@ -165,8 +162,8 @@ fn cpu_matvec_q8_0(weight_bytes: &[u8], x: &[f32], out_dim: usize, in_dim: usize
 
         for b in 0..blocks_per_row {
             let block_start = row_start + b * 34;
-            let scale_bits = (weight_bytes[block_start] as u16)
-                | ((weight_bytes[block_start + 1] as u16) << 8);
+            let scale_bits =
+                (weight_bytes[block_start] as u16) | ((weight_bytes[block_start + 1] as u16) << 8);
             let scale = f16_bits_to_f32_cpu(scale_bits);
 
             let base_idx = b * 32;
@@ -195,7 +192,9 @@ fn test_cuda_matvec_q8_0_small() {
 
     let src = lumen_runtime::cuda::shaders::MATVEC_Q8_0_KERNEL_SOURCE;
     let ptx = compile_ptx(src).expect("NVRTC compile failed for matvec_q8_0.cu");
-    let module = ctx.load_module(ptx).expect("Failed to load matvec_q8_0 module");
+    let module = ctx
+        .load_module(ptx)
+        .expect("Failed to load matvec_q8_0 module");
     let func = module
         .load_function("matvec_q8_0")
         .expect("Failed to load matvec_q8_0");
@@ -208,7 +207,9 @@ fn test_cuda_matvec_q8_0_small() {
     // Create known f32 weight values, then encode to Q8_0.
     let weight_f32: Vec<Vec<f32>> = vec![
         (0..32).map(|i| (i as f32 + 1.0) * 0.25).collect(),
-        (0..32).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect(),
+        (0..32)
+            .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
+            .collect(),
         {
             let mut v = vec![0.0f32; 32];
             v[0] = 1.0;
@@ -596,7 +597,9 @@ fn test_cuda_matvec_q8_0_v2_small() {
 
     let src = lumen_runtime::cuda::shaders::MATVEC_Q8_0_V2_KERNEL_SOURCE;
     let ptx = compile_ptx(src).expect("NVRTC compile failed for matvec_q8_0_v2.cu");
-    let module = ctx.load_module(ptx).expect("Failed to load matvec_q8_0_v2 module");
+    let module = ctx
+        .load_module(ptx)
+        .expect("Failed to load matvec_q8_0_v2 module");
     let func = module
         .load_function("matvec_q8_0_v2")
         .expect("Failed to load matvec_q8_0_v2");
@@ -606,7 +609,9 @@ fn test_cuda_matvec_q8_0_v2_small() {
 
     let weight_f32: Vec<Vec<f32>> = vec![
         (0..32).map(|i| (i as f32 + 1.0) * 0.25).collect(),
-        (0..32).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect(),
+        (0..32)
+            .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
+            .collect(),
         {
             let mut v = vec![0.0f32; 32];
             v[0] = 1.0;

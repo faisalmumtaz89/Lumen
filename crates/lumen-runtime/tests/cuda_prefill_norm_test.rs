@@ -54,12 +54,12 @@ fn create_context() -> (
 }
 
 /// Compile the batched RMSNorm kernel and return the function handle.
-fn compile_rmsnorm_batched(
-    ctx: &std::sync::Arc<CudaContext>,
-) -> cudarc::driver::CudaFunction {
+fn compile_rmsnorm_batched(ctx: &std::sync::Arc<CudaContext>) -> cudarc::driver::CudaFunction {
     let src = lumen_runtime::cuda::shaders::PREFILL_NORM_KERNEL_SOURCE;
     let ptx = compile_ptx(src).expect("NVRTC compile failed for prefill_norm.cu");
-    let module = ctx.load_module(ptx).expect("Failed to load prefill_norm module");
+    let module = ctx
+        .load_module(ptx)
+        .expect("Failed to load prefill_norm module");
     module
         .load_function("rmsnorm_batched")
         .expect("Failed to load rmsnorm_batched function")
@@ -131,9 +131,7 @@ fn assert_f32_close(label: &str, actual: &[f32], expected: &[f32], tolerance: f3
         let diff = (a - e).abs();
         if diff > tolerance {
             if mismatches < 5 {
-                eprintln!(
-                    "  {label}[{i}]: GPU={a:.8}, CPU={e:.8}, diff={diff:.2e}"
-                );
+                eprintln!("  {label}[{i}]: GPU={a:.8}, CPU={e:.8}, diff={diff:.2e}");
             }
             mismatches += 1;
         }
@@ -161,9 +159,7 @@ fn test_rmsnorm_batched_128x2048() {
     let eps = 1e-5f32;
 
     // Deterministic input: each element = sin(index) to avoid trivial zeros.
-    let x: Vec<f32> = (0..batch * dim)
-        .map(|i| (i as f32 * 0.01).sin())
-        .collect();
+    let x: Vec<f32> = (0..batch * dim).map(|i| (i as f32 * 0.01).sin()).collect();
     let weight: Vec<f32> = (0..dim).map(|i| 0.5 + (i as f32 * 0.001).cos()).collect();
 
     let expected = cpu_rmsnorm_batched(&x, &weight, eps, batch, dim);
@@ -269,10 +265,7 @@ fn test_rmsnorm_batched_zero_input() {
 
     // All outputs should be exactly 0.0 since x[i]=0 and 0*anything=0.
     for (i, &v) in actual.iter().enumerate() {
-        assert!(
-            v == 0.0,
-            "zero_input[{i}]: expected 0.0, got {v}"
-        );
+        assert!(v == 0.0, "zero_input[{i}]: expected 0.0, got {v}");
     }
 }
 
@@ -320,9 +313,7 @@ fn test_rmsnorm_batched_matches_prefill_kernels() {
     let dim = 2048;
     let eps = 1e-5f32;
 
-    let x: Vec<f32> = (0..batch * dim)
-        .map(|i| (i as f32 * 0.013).sin())
-        .collect();
+    let x: Vec<f32> = (0..batch * dim).map(|i| (i as f32 * 0.013).sin()).collect();
     let weight: Vec<f32> = (0..dim).map(|i| 1.0 + (i as f32 * 0.001).cos()).collect();
 
     let standalone_out =
@@ -332,9 +323,6 @@ fn test_rmsnorm_batched_matches_prefill_kernels() {
 
     // Both GPU implementations must produce bit-identical output (same PTX code path).
     for (i, (&s, &m)) in standalone_out.iter().zip(monolithic_out.iter()).enumerate() {
-        assert!(
-            s == m,
-            "standalone vs monolithic[{i}]: {s} != {m}"
-        );
+        assert!(s == m, "standalone vs monolithic[{i}]: {s} != {m}");
     }
 }

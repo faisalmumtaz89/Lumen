@@ -93,9 +93,7 @@ pub struct BpeTokenizer {
 
 /// Pre-tokenizer regex shared by llama-bpe, qwen2, and qwen35.
 /// Uses negative lookahead `(?!\S)` which requires fancy-regex.
-const PRETOKENIZER_REGEX: &str =
-    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-
+const PRETOKENIZER_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 impl BpeTokenizer {
     /// Build a tokenizer from extracted GGUF tokenizer data.
@@ -153,11 +151,7 @@ impl BpeTokenizer {
         // Type 3 = control, type 4 = user_defined — both are special tokens.
         for (id, tok_str) in vocab.iter().enumerate() {
             let id = id as u32;
-            let token_type = data
-                .token_types
-                .get(id as usize)
-                .copied()
-                .unwrap_or(1);
+            let token_type = data.token_types.get(id as usize).copied().unwrap_or(1);
             let is_special = token_type == 3 || token_type == 4;
             if is_special && tok_str.starts_with('<') && tok_str.ends_with('>') {
                 special_tokens.push((tok_str.clone(), id));
@@ -292,10 +286,7 @@ impl BpeTokenizer {
             };
             if is_spm {
                 // SPM byte-fallback `<0xHH>` -> byte; ▁ -> space; else UTF-8.
-                if tok_str.starts_with("<0x")
-                    && tok_str.ends_with('>')
-                    && tok_str.len() == 6
-                {
+                if tok_str.starts_with("<0x") && tok_str.ends_with('>') && tok_str.len() == 6 {
                     if let Ok(byte_val) = u8::from_str_radix(&tok_str[3..5], 16) {
                         return vec![byte_val];
                     }
@@ -342,7 +333,7 @@ impl BpeTokenizer {
             // Llama-3 style
             let sys = system.unwrap_or(
                 "Cutting Knowledge Date: December 2023\n\
-                 Today Date: 26 Jul 2024\n\n"
+                 Today Date: 26 Jul 2024\n\n",
             );
             format!(
                 "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n\
@@ -366,9 +357,8 @@ impl BpeTokenizer {
             }
         } else if self.pre_tokenizer == "qwen2" {
             // Qwen2.5: ChatML with system message
-            let sys = system.unwrap_or(
-                "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
-            );
+            let sys = system
+                .unwrap_or("You are Qwen, created by Alibaba Cloud. You are a helpful assistant.");
             format!(
                 "<|im_start|>system\n\
                  {sys}<|im_end|>\n\
@@ -613,8 +603,7 @@ impl BpeTokenizer {
         // If add_space_prefix is true AND this is the first segment
         // AND text does NOT start with space or ▁, prepend a space.
         let text = if self.add_space_prefix && add_prefix {
-            let starts_with_space =
-                text.starts_with(' ') || text.starts_with('\u{2581}');
+            let starts_with_space = text.starts_with(' ') || text.starts_with('\u{2581}');
             if starts_with_space {
                 text.to_string()
             } else {
@@ -952,10 +941,8 @@ mod tests {
         include_str!("../../../tests/fixtures/tokenizer_tinyllama.json");
     const LLAMA3_FIXTURE: &str =
         include_str!("../../../tests/fixtures/tokenizer_llama_3_1_8b.json");
-    const QWEN25_FIXTURE: &str =
-        include_str!("../../../tests/fixtures/tokenizer_qwen2_5_3b.json");
-    const QWEN35_FIXTURE: &str =
-        include_str!("../../../tests/fixtures/tokenizer_qwen3_5_9b.json");
+    const QWEN25_FIXTURE: &str = include_str!("../../../tests/fixtures/tokenizer_qwen2_5_3b.json");
+    const QWEN35_FIXTURE: &str = include_str!("../../../tests/fixtures/tokenizer_qwen3_5_9b.json");
 
     /// Run all test cases from a fixture against a loaded tokenizer.
     fn run_fixture_tests(tokenizer: &BpeTokenizer, fixture: &Fixture) {
@@ -978,7 +965,10 @@ mod tests {
             if got_decoded != tc.decoded {
                 decode_failures.push(format!(
                     "  DECODE [{}] ids={:?}\n    expected: {:?}\n    got:      {:?}",
-                    tc.id, &tc.token_ids[..tc.token_ids.len().min(10)], tc.decoded, got_decoded
+                    tc.id,
+                    &tc.token_ids[..tc.token_ids.len().min(10)],
+                    tc.decoded,
+                    got_decoded
                 ));
             }
 
@@ -1003,9 +993,18 @@ mod tests {
                 "Tokenizer {} failed {} checks:\n",
                 fixture.model_key, total_failures
             );
-            for f in &encode_failures { msg.push_str(f); msg.push('\n'); }
-            for f in &decode_failures { msg.push_str(f); msg.push('\n'); }
-            for f in &roundtrip_failures { msg.push_str(f); msg.push('\n'); }
+            for f in &encode_failures {
+                msg.push_str(f);
+                msg.push('\n');
+            }
+            for f in &decode_failures {
+                msg.push_str(f);
+                msg.push('\n');
+            }
+            for f in &roundtrip_failures {
+                msg.push_str(f);
+                msg.push('\n');
+            }
             panic!("{msg}");
         }
     }

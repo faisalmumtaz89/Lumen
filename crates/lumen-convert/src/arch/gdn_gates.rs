@@ -38,7 +38,11 @@ pub(crate) fn compute_ssm_tensor_slice(
     if dequantize {
         let n_elements = tensor.n_elements();
         let size = n_elements * 4;
-        let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::F32 };
+        let slice = TensorSlice {
+            offset: *blob_offset,
+            length: size,
+            quant: QuantScheme::F32,
+        };
         *blob_offset += size;
         return Ok(Some(slice));
     }
@@ -51,8 +55,7 @@ pub(crate) fn compute_ssm_tensor_slice(
     // typed `Option<CudaSlice<f32>>` — they only accept F32. If the GGUF
     // stores them in F16 / BF16 / quantized format, we must dequantize at
     // convert time so the runtime can upload them without misinterpretation.
-    let needs_f32_force =
-        !is_alpha_or_beta
+    let needs_f32_force = !is_alpha_or_beta
         && !matches!(tensor.ggml_type, GgmlType::F32)
         && matches!(suffix, SSM_A | SSM_CONV1D | SSM_DT | SSM_NORM);
 
@@ -60,13 +63,19 @@ pub(crate) fn compute_ssm_tensor_slice(
         if !tensor.ggml_type.has_dequant_path() {
             return Err(ConvertError::UnsupportedTensorType {
                 tensor: name.to_string(),
-                ggml_type: format!("{:?} (cannot force-dequant SSM scalar to F32)",
-                                   tensor.ggml_type),
+                ggml_type: format!(
+                    "{:?} (cannot force-dequant SSM scalar to F32)",
+                    tensor.ggml_type
+                ),
             });
         }
         let n_elements = tensor.n_elements();
         let size = n_elements * 4;
-        let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::F32 };
+        let slice = TensorSlice {
+            offset: *blob_offset,
+            length: size,
+            quant: QuantScheme::F32,
+        };
         *blob_offset += size;
         return Ok(Some(slice));
     }
@@ -76,11 +85,17 @@ pub(crate) fn compute_ssm_tensor_slice(
         None if is_alpha_or_beta && tensor.ggml_type.has_dequant_path() => {
             // No LBC mapping but dequantizable: force-requant to Q8_0 via dequant->F32->Q8_0
             let n_elements = tensor.n_elements() as usize;
-            assert!(n_elements % 32 == 0,
-                "Q8_0 requires elements divisible by 32, got {n_elements} for {name}");
+            assert!(
+                n_elements % 32 == 0,
+                "Q8_0 requires elements divisible by 32, got {n_elements} for {name}"
+            );
             let num_blocks = n_elements / 32;
             let size = (num_blocks * 34) as u64;
-            let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::Q8_0 };
+            let slice = TensorSlice {
+                offset: *blob_offset,
+                length: size,
+                quant: QuantScheme::Q8_0,
+            };
             *blob_offset += size;
             return Ok(Some(slice));
         }
@@ -88,7 +103,11 @@ pub(crate) fn compute_ssm_tensor_slice(
             // Non-alpha/beta SSM tensor with dequantizable but non-LBC type: force F32
             let n_elements = tensor.n_elements();
             let size = n_elements * 4;
-            let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::F32 };
+            let slice = TensorSlice {
+                offset: *blob_offset,
+                length: size,
+                quant: QuantScheme::F32,
+            };
             *blob_offset += size;
             return Ok(Some(slice));
         }
@@ -102,19 +121,31 @@ pub(crate) fn compute_ssm_tensor_slice(
 
     if is_alpha_or_beta && !matches!(quant, QuantScheme::Q8_0) {
         let n_elements = tensor.n_elements() as usize;
-        assert!(n_elements % 32 == 0,
-            "Q8_0 requires elements divisible by 32, got {n_elements} for {name}");
+        assert!(
+            n_elements % 32 == 0,
+            "Q8_0 requires elements divisible by 32, got {n_elements} for {name}"
+        );
         let num_blocks = n_elements / 32;
         let size = (num_blocks * 34) as u64; // Q8_0: 34 bytes per 32 elements
-        let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::Q8_0 };
+        let slice = TensorSlice {
+            offset: *blob_offset,
+            length: size,
+            quant: QuantScheme::Q8_0,
+        };
         *blob_offset += size;
         Ok(Some(slice))
     } else {
-        let size = tensor.byte_size().ok_or_else(|| ConvertError::UnsupportedTensorType {
-            tensor: name.to_string(),
-            ggml_type: format!("{:?} (unknown block geometry)", tensor.ggml_type),
-        })?;
-        let slice = TensorSlice { offset: *blob_offset, length: size, quant };
+        let size = tensor
+            .byte_size()
+            .ok_or_else(|| ConvertError::UnsupportedTensorType {
+                tensor: name.to_string(),
+                ggml_type: format!("{:?} (unknown block geometry)", tensor.ggml_type),
+            })?;
+        let slice = TensorSlice {
+            offset: *blob_offset,
+            length: size,
+            quant,
+        };
         *blob_offset += size;
         Ok(Some(slice))
     }
@@ -142,12 +173,12 @@ pub(crate) fn compute_ssm_slices(
     dequantize: bool,
 ) -> Result<SsmSlices, ConvertError> {
     Ok(SsmSlices {
-        ssm_a:      compute_ssm_tensor_slice(gguf, layer, SSM_A,      blob_offset, dequantize)?,
+        ssm_a: compute_ssm_tensor_slice(gguf, layer, SSM_A, blob_offset, dequantize)?,
         ssm_conv1d: compute_ssm_tensor_slice(gguf, layer, SSM_CONV1D, blob_offset, dequantize)?,
-        ssm_dt:     compute_ssm_tensor_slice(gguf, layer, SSM_DT,     blob_offset, dequantize)?,
-        ssm_beta:   compute_ssm_tensor_slice(gguf, layer, SSM_BETA,   blob_offset, dequantize)?,
-        ssm_alpha:  compute_ssm_tensor_slice(gguf, layer, SSM_ALPHA,  blob_offset, dequantize)?,
-        ssm_norm:   compute_ssm_tensor_slice(gguf, layer, SSM_NORM,   blob_offset, dequantize)?,
+        ssm_dt: compute_ssm_tensor_slice(gguf, layer, SSM_DT, blob_offset, dequantize)?,
+        ssm_beta: compute_ssm_tensor_slice(gguf, layer, SSM_BETA, blob_offset, dequantize)?,
+        ssm_alpha: compute_ssm_tensor_slice(gguf, layer, SSM_ALPHA, blob_offset, dequantize)?,
+        ssm_norm: compute_ssm_tensor_slice(gguf, layer, SSM_NORM, blob_offset, dequantize)?,
     })
 }
 
@@ -177,12 +208,23 @@ pub(crate) fn write_ssm_tensors<R: Read + Seek>(
             let src_quant = tensor.ggml_type.to_lbc_quant();
             if is_alpha_or_beta && !matches!(src_quant, Some(QuantScheme::Q8_0)) {
                 // Force-requantize to Q8_0 (dequant to F32 first, then quantize to Q8_0)
-                append_tensor_to_blob_requant(blob, reader, gguf, &name, false, Some(QuantScheme::Q8_0))?;
+                append_tensor_to_blob_requant(
+                    blob,
+                    reader,
+                    gguf,
+                    &name,
+                    false,
+                    Some(QuantScheme::Q8_0),
+                )?;
             } else if needs_f32_force {
                 // Dequantize F16/BF16/quant to F32 for runtime compatibility.
-                append_tensor_to_blob_requant(blob, reader, gguf, &name, /*dequantize=*/ true, /*requant_to=*/ None)?;
+                append_tensor_to_blob_requant(
+                    blob, reader, gguf, &name, /*dequantize=*/ true, /*requant_to=*/ None,
+                )?;
             } else {
-                append_tensor_to_blob_requant(blob, reader, gguf, &name, dequantize, /*requant_to=*/ None)?;
+                append_tensor_to_blob_requant(
+                    blob, reader, gguf, &name, dequantize, /*requant_to=*/ None,
+                )?;
             }
         }
     }

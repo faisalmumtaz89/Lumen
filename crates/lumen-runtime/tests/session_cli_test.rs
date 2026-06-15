@@ -42,7 +42,10 @@ fn synthetic_model_path() -> (std::path::PathBuf, std::path::PathBuf) {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("test_model.lbc");
     let bytes = generate_test_model(&TestModelConfig::default());
-    std::fs::File::create(&path).unwrap().write_all(&bytes).unwrap();
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
     (dir, path)
 }
 
@@ -88,12 +91,7 @@ fn live_fingerprint(provider: &SyncWeightProvider) -> ModelFingerprint {
     // Vocab bytes: synthetic model has no real tokenizer, use empty.
     let vocab: &[u8] = &[];
     let quant_tag = provider.output_proj_quant.to_u8() as u32;
-    ModelFingerprint::from_live_model(
-        &hp_bytes,
-        vocab,
-        quant_tag,
-        lumen_format::LBC_VERSION,
-    )
+    ModelFingerprint::from_live_model(&hp_bytes, vocab, quant_tag, lumen_format::LBC_VERSION)
 }
 
 /// `Session::load_from_disk` on a nonexistent path produces a
@@ -165,11 +163,11 @@ fn s5_save_to_disk_writes_valid_v2_file() {
     let mut f = std::fs::File::open(&save_path).unwrap();
     let mut header_buf = [0u8; HEADER_SIZE];
     f.read_exact(&mut header_buf).unwrap();
-    let header = DiskKvHeader::from_bytes(&header_buf)
-        .expect("header MUST parse as v2");
+    let header = DiskKvHeader::from_bytes(&header_buf).expect("header MUST parse as v2");
     assert_eq!(header.version, 2, "expected v2, got v{}", header.version);
     assert_eq!(
-        header.seq_len, prompt.len() as u64,
+        header.seq_len,
+        prompt.len() as u64,
         "header.seq_len must match prompt"
     );
     // CPU naive has no GDN; recurrent state byte must be 0.
@@ -293,14 +291,8 @@ fn s5_fingerprint_mismatch_rejected_on_load() {
         weight_quant_tag: fp_a.weight_quant_tag,
         lumen_format_version: fp_a.lumen_format_version,
     };
-    let result = Session::load_from_disk(
-        &path,
-        make_config(),
-        hp,
-        greedy_sampling(),
-        &backend,
-        &fp_b,
-    );
+    let result =
+        Session::load_from_disk(&path, make_config(), hp, greedy_sampling(), &backend, &fp_b);
     assert!(
         result.is_err(),
         "fingerprint mismatch must be rejected on load"
@@ -369,7 +361,9 @@ fn s5_resume_continues_from_cache_on_empty_prompt() {
     let mut sess_a = Session::new(make_config(), hp, greedy_sampling()).unwrap();
     sess_a.extend(&prompt, &backend, &provider).unwrap();
     let save_path = dir.join("continue.kv");
-    sess_a.save_to_disk(&save_path, &backend, &fingerprint).unwrap();
+    sess_a
+        .save_to_disk(&save_path, &backend, &fingerprint)
+        .unwrap();
     // Sample 8 tokens continuously for the baseline.
     let mut continuous: Vec<u32> = Vec::with_capacity(8);
     for _ in 0..8 {
@@ -456,11 +450,9 @@ fn s5_multi_quant_hardware_gate() {
         ran_any = true;
         eprintln!("[gate {label}] {model_path}");
 
-        let provider = MmapWeightProvider::open(
-            std::path::Path::new(&model_path),
-            MmapConfig::default(),
-        )
-        .unwrap();
+        let provider =
+            MmapWeightProvider::open(std::path::Path::new(&model_path), MmapConfig::default())
+                .unwrap();
         let hp = provider.lbc().header.hyperparams;
 
         // Build the Metal backend.
@@ -496,8 +488,10 @@ fn s5_multi_quant_hardware_gate() {
         drop(sess_cont);
 
         // Save + restore + sample.
-        let dir = std::env::temp_dir()
-            .join(format!("lumen_session_metal_{label}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "lumen_session_metal_{label}_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.kv");
         let hp_bytes = serialize_hyperparams_le(&hp);

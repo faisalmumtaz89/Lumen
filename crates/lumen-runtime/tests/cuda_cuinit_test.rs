@@ -63,9 +63,7 @@ fn device_count_idempotent() {
             // Both failed (no driver) -- consistent behavior, acceptable.
         }
         _ => {
-            panic!(
-                "device_count() was inconsistent: first={first:?}, second={second:?}"
-            );
+            panic!("device_count() was inconsistent: first={first:?}, second={second:?}");
         }
     }
 }

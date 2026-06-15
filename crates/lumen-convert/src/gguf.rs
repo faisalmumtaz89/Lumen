@@ -308,14 +308,23 @@ impl GgmlType {
     /// decide whether a tensor with no direct LBC mapping can be force-
     /// dequantized to F32 during conversion (vs. silently skipped).
     pub fn has_dequant_path(&self) -> bool {
-        matches!(self,
-            Self::F32 | Self::F16 | Self::BF16
-            | Self::Q8_0 | Self::Q8_1
-            | Self::Q4_0 | Self::Q4_1
-            | Self::Q5_0 | Self::Q5_1
-            | Self::Q4_K | Self::Q5_K | Self::Q6_K
-            | Self::Q2_K | Self::Q3_K
-            | Self::MXFP4
+        matches!(
+            self,
+            Self::F32
+                | Self::F16
+                | Self::BF16
+                | Self::Q8_0
+                | Self::Q8_1
+                | Self::Q4_0
+                | Self::Q4_1
+                | Self::Q5_0
+                | Self::Q5_1
+                | Self::Q4_K
+                | Self::Q5_K
+                | Self::Q6_K
+                | Self::Q2_K
+                | Self::Q3_K
+                | Self::MXFP4
         )
     }
 }
@@ -530,10 +539,7 @@ impl GgufFile {
 
     /// Look up a metadata value by key.
     pub fn get_metadata(&self, key: &str) -> Option<&GgufValue> {
-        self.metadata
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v)
+        self.metadata.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
 
     /// Get a string metadata value.
@@ -841,45 +847,38 @@ impl GgufBuilder {
 
     /// Add a string metadata key-value pair.
     pub fn add_string(&mut self, key: &str, value: &str) -> &mut Self {
-        self.metadata.push((
-            key.to_string(),
-            GgufValue::String(value.to_string()),
-        ));
+        self.metadata
+            .push((key.to_string(), GgufValue::String(value.to_string())));
         self
     }
 
     /// Add a u32 metadata key-value pair.
     pub fn add_u32(&mut self, key: &str, value: u32) -> &mut Self {
-        self.metadata
-            .push((key.to_string(), GgufValue::U32(value)));
+        self.metadata.push((key.to_string(), GgufValue::U32(value)));
         self
     }
 
     /// Add a u64 metadata key-value pair.
     pub fn add_u64(&mut self, key: &str, value: u64) -> &mut Self {
-        self.metadata
-            .push((key.to_string(), GgufValue::U64(value)));
+        self.metadata.push((key.to_string(), GgufValue::U64(value)));
         self
     }
 
     /// Add a u16 metadata key-value pair (used for `split.no` and `split.count`).
     pub fn add_u16(&mut self, key: &str, value: u16) -> &mut Self {
-        self.metadata
-            .push((key.to_string(), GgufValue::U16(value)));
+        self.metadata.push((key.to_string(), GgufValue::U16(value)));
         self
     }
 
     /// Add an i32 metadata key-value pair.
     pub fn add_i32(&mut self, key: &str, value: i32) -> &mut Self {
-        self.metadata
-            .push((key.to_string(), GgufValue::I32(value)));
+        self.metadata.push((key.to_string(), GgufValue::I32(value)));
         self
     }
 
     /// Add an f32 metadata key-value pair.
     pub fn add_f32(&mut self, key: &str, value: f32) -> &mut Self {
-        self.metadata
-            .push((key.to_string(), GgufValue::F32(value)));
+        self.metadata.push((key.to_string(), GgufValue::F32(value)));
         self
     }
 
@@ -896,8 +895,7 @@ impl GgufBuilder {
             element_type: 6, // F32
             values: values.iter().map(|v| GgufValue::F32(*v)).collect(),
         };
-        self.metadata
-            .push((key.to_string(), GgufValue::Array(arr)));
+        self.metadata.push((key.to_string(), GgufValue::Array(arr)));
         self
     }
 
@@ -907,8 +905,7 @@ impl GgufBuilder {
             element_type: 4, // U32
             values: values.iter().map(|v| GgufValue::U32(*v)).collect(),
         };
-        self.metadata
-            .push((key.to_string(), GgufValue::Array(arr)));
+        self.metadata.push((key.to_string(), GgufValue::Array(arr)));
         self
     }
 
@@ -921,8 +918,7 @@ impl GgufBuilder {
                 .map(|s| GgufValue::String(s.to_string()))
                 .collect(),
         };
-        self.metadata
-            .push((key.to_string(), GgufValue::Array(arr)));
+        self.metadata.push((key.to_string(), GgufValue::Array(arr)));
         self
     }
 
@@ -1477,14 +1473,36 @@ mod tests {
     #[test]
     fn ggml_type_roundtrip() {
         let types = [
-            GgmlType::F32,  GgmlType::F16,  GgmlType::Q4_0, GgmlType::Q4_1,
-            GgmlType::Q5_0, GgmlType::Q5_1, GgmlType::Q8_0, GgmlType::Q8_1,
-            GgmlType::Q2_K, GgmlType::Q3_K, GgmlType::Q4_K, GgmlType::Q5_K,
-            GgmlType::Q6_K, GgmlType::Q8_K,
-            GgmlType::IQ2_XXS, GgmlType::IQ2_XS, GgmlType::IQ3_XXS, GgmlType::IQ1_S,
-            GgmlType::IQ4_NL, GgmlType::IQ3_S, GgmlType::IQ2_S, GgmlType::IQ4_XS,
-            GgmlType::I8, GgmlType::I16, GgmlType::I32, GgmlType::I64,
-            GgmlType::F64, GgmlType::IQ1_M, GgmlType::BF16, GgmlType::MXFP4,
+            GgmlType::F32,
+            GgmlType::F16,
+            GgmlType::Q4_0,
+            GgmlType::Q4_1,
+            GgmlType::Q5_0,
+            GgmlType::Q5_1,
+            GgmlType::Q8_0,
+            GgmlType::Q8_1,
+            GgmlType::Q2_K,
+            GgmlType::Q3_K,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+            GgmlType::Q8_K,
+            GgmlType::IQ2_XXS,
+            GgmlType::IQ2_XS,
+            GgmlType::IQ3_XXS,
+            GgmlType::IQ1_S,
+            GgmlType::IQ4_NL,
+            GgmlType::IQ3_S,
+            GgmlType::IQ2_S,
+            GgmlType::IQ4_XS,
+            GgmlType::I8,
+            GgmlType::I16,
+            GgmlType::I32,
+            GgmlType::I64,
+            GgmlType::F64,
+            GgmlType::IQ1_M,
+            GgmlType::BF16,
+            GgmlType::MXFP4,
         ];
         for t in types {
             let tag = t.to_u32();
@@ -1965,9 +1983,9 @@ mod tests {
         write_test_string_v2(&mut buf, "token_embd.weight");
         buf.extend_from_slice(&2u32.to_le_bytes()); // n_dims
         buf.extend_from_slice(&32u64.to_le_bytes()); // dim 0
-        buf.extend_from_slice(&8u64.to_le_bytes());  // dim 1
-        buf.extend_from_slice(&0u32.to_le_bytes());  // ggml_type = F32
-        buf.extend_from_slice(&0u64.to_le_bytes());  // offset
+        buf.extend_from_slice(&8u64.to_le_bytes()); // dim 1
+        buf.extend_from_slice(&0u32.to_le_bytes()); // ggml_type = F32
+        buf.extend_from_slice(&0u64.to_le_bytes()); // offset
 
         pad_to_alignment(&mut buf, 32);
         buf.extend_from_slice(&vec![0u8; 1024]);

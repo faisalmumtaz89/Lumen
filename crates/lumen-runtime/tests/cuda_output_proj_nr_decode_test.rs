@@ -109,9 +109,7 @@ fn run_nr_vs_nr2(out_dim: usize, in_dim: usize, seed: u64, rel_tol: f32) {
     let split_module = ctx
         .load_module(compile_for_a100(split_src))
         .expect("split load");
-    let nr_module = ctx
-        .load_module(compile_for_a100(nr_src))
-        .expect("nr load");
+    let nr_module = ctx.load_module(compile_for_a100(nr_src)).expect("nr load");
     let repack_module = ctx
         .load_module(compile_for_a100(repack_src))
         .expect("repack load");

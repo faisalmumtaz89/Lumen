@@ -22,25 +22,23 @@ use lumen_format::quantization::QuantScheme;
 use std::sync::Mutex;
 
 use super::decode::{
-    self, KernelSet, fused_norm_matvec_block_size,
-    hgemv_grid, hgemv_shared_bytes, HGEMV_BLOCK_DIM, HGEMV_SHMEM_LIMIT,
+    self, dp4a_q4_grid, dp4a_q8_1_grid, fused_glu_grid, fused_glu_shared_bytes_f16,
+    fused_glu_shared_bytes_f32, fused_norm_matvec_block_size, hgemv_grid, hgemv_shared_bytes,
     matvec_block_size, matvec_q8_0_grid, matvec_smem_grid, matvec_smem_shared_bytes,
-    rmsnorm_block_size, rmsnorm_shared_bytes, Q8_0_BLOCK_DIM, SMEM_BLOCK_DIM,
-    fused_glu_grid, fused_glu_shared_bytes_f32, fused_glu_shared_bytes_f16,
-    FUSED_GLU_BLOCK_DIM, FUSED_GLU_SHMEM_LIMIT,
-    q8_1_quant_grid, dp4a_q8_1_grid, dp4a_q4_grid,
-    Q8_1_QUANT_BLOCK_DIM, DP4A_Q8_1_BLOCK_DIM, DP4A_Q4_BLOCK_DIM,
+    q8_1_quant_grid, rmsnorm_block_size, rmsnorm_shared_bytes, KernelSet, DP4A_Q4_BLOCK_DIM,
+    DP4A_Q8_1_BLOCK_DIM, FUSED_GLU_BLOCK_DIM, FUSED_GLU_SHMEM_LIMIT, HGEMV_BLOCK_DIM,
+    HGEMV_SHMEM_LIMIT, Q8_0_BLOCK_DIM, Q8_1_QUANT_BLOCK_DIM, SMEM_BLOCK_DIM,
 };
 use super::ffi::CudaDevice;
-use super::gpu_buffers::{GpuWeightBuf, LayerWeightsGpu, upload_layer_weights};
+use super::gpu_buffers::{upload_layer_weights, GpuWeightBuf, LayerWeightsGpu};
 use super::kv_cache::KvCacheGpu;
 use super::shaders::EMBED_KERNEL_SOURCE;
 use super::types::LaunchConfig;
-use cudarc::cublas::{Gemv, GemvConfig, sys as cublas_sys};
+use cudarc::cublas::{sys as cublas_sys, Gemv, GemvConfig};
 use cudarc::driver::{CudaFunction, CudaSlice, LaunchConfig as CudarcLaunchConfig, PushKernelArg};
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 /// Cached cuBLAS algorithm selection for HGEMV (M, N=1, K) shapes.
 ///
@@ -149,11 +147,11 @@ fn autotune_cublas_algos_bf16(
 
     let mut proxy_to_originals: HashMap<(usize, usize), Vec<(usize, usize)>> = HashMap::new();
     for &(out_dim, in_dim) in shapes {
-        let proxy = (
-            out_dim.min(AUTOTUNE_DIM_CAP),
-            in_dim.min(AUTOTUNE_DIM_CAP),
-        );
-        proxy_to_originals.entry(proxy).or_default().push((out_dim, in_dim));
+        let proxy = (out_dim.min(AUTOTUNE_DIM_CAP), in_dim.min(AUTOTUNE_DIM_CAP));
+        proxy_to_originals
+            .entry(proxy)
+            .or_default()
+            .push((out_dim, in_dim));
     }
 
     let proxy_shapes: Vec<(usize, usize)> = proxy_to_originals.keys().copied().collect();
@@ -194,18 +192,17 @@ fn autotune_cublas_algos_bf16(
         // BF16 has the same 2 B/elem footprint as F16. Reuse buffer sizes.
         let w_bytes = proxy_out * proxy_in * 2;
         let x_bytes = proxy_in * 2;
-        let w_buf: CudaSlice<u8> = device.alloc_zeros(w_bytes)
-            .map_err(|e| RuntimeError::Compute(format!(
+        let w_buf: CudaSlice<u8> = device.alloc_zeros(w_bytes).map_err(|e| {
+            RuntimeError::Compute(format!(
                 "bf16_autotune: alloc weight ({proxy_out}x{proxy_in}): {e}"
-            )))?;
-        let x_buf: CudaSlice<u8> = device.alloc_zeros(x_bytes)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "bf16_autotune: alloc input ({proxy_in}): {e}"
-            )))?;
-        let y_buf: CudaSlice<f32> = device.alloc_zeros(proxy_out)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "bf16_autotune: alloc output ({proxy_out}): {e}"
-            )))?;
+            ))
+        })?;
+        let x_buf: CudaSlice<u8> = device.alloc_zeros(x_bytes).map_err(|e| {
+            RuntimeError::Compute(format!("bf16_autotune: alloc input ({proxy_in}): {e}"))
+        })?;
+        let y_buf: CudaSlice<f32> = device.alloc_zeros(proxy_out).map_err(|e| {
+            RuntimeError::Compute(format!("bf16_autotune: alloc output ({proxy_out}): {e}"))
+        })?;
 
         let (w_ptr, _) = w_buf.device_ptr(&device.stream);
         let (x_ptr, _) = x_buf.device_ptr(&device.stream);
@@ -249,14 +246,16 @@ fn autotune_cublas_algos_bf16(
                 continue;
             }
 
-            device.synchronize()
-                .map_err(|e| RuntimeError::Compute(format!("bf16_autotune: sync before timing: {e}")))?;
+            device.synchronize().map_err(|e| {
+                RuntimeError::Compute(format!("bf16_autotune: sync before timing: {e}"))
+            })?;
 
             let mut times = Vec::with_capacity(TRIALS);
             for _ in 0..TRIALS {
                 unsafe {
-                    event::record(start_event, raw_stream)
-                        .map_err(|e| RuntimeError::Compute(format!("bf16_autotune: record start: {e}")))?;
+                    event::record(start_event, raw_stream).map_err(|e| {
+                        RuntimeError::Compute(format!("bf16_autotune: record start: {e}"))
+                    })?;
                     let status = cublas_sys::cublasGemmEx(
                         *device.blas.handle(),
                         cublas_sys::cublasOperation_t::CUBLAS_OP_T,
@@ -281,12 +280,15 @@ fn autotune_cublas_algos_bf16(
                     if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
                         break;
                     }
-                    event::record(end_event, raw_stream)
-                        .map_err(|e| RuntimeError::Compute(format!("bf16_autotune: record end: {e}")))?;
-                    event::synchronize(end_event)
-                        .map_err(|e| RuntimeError::Compute(format!("bf16_autotune: sync end: {e}")))?;
-                    let ms = event::elapsed(start_event, end_event)
-                        .map_err(|e| RuntimeError::Compute(format!("bf16_autotune: elapsed: {e}")))?;
+                    event::record(end_event, raw_stream).map_err(|e| {
+                        RuntimeError::Compute(format!("bf16_autotune: record end: {e}"))
+                    })?;
+                    event::synchronize(end_event).map_err(|e| {
+                        RuntimeError::Compute(format!("bf16_autotune: sync end: {e}"))
+                    })?;
+                    let ms = event::elapsed(start_event, end_event).map_err(|e| {
+                        RuntimeError::Compute(format!("bf16_autotune: elapsed: {e}"))
+                    })?;
                     times.push(ms);
                 }
             }
@@ -302,7 +304,9 @@ fn autotune_cublas_algos_bf16(
         }
 
         let algo_name = match best_algo {
-            cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP => "DEFAULT_TENSOR_OP".to_string(),
+            cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP => {
+                "DEFAULT_TENSOR_OP".to_string()
+            }
             other => format!("ALGO{}_TENSOR_OP", other as i32 - 100),
         };
 
@@ -371,10 +375,7 @@ fn autotune_cublas_algos(
     // and (4096, 8192) both map to (4096, 4096)). Benchmark each proxy once.
     let mut proxy_to_originals: HashMap<(usize, usize), Vec<(usize, usize)>> = HashMap::new();
     for &(out_dim, in_dim) in shapes {
-        let proxy = (
-            out_dim.min(AUTOTUNE_DIM_CAP),
-            in_dim.min(AUTOTUNE_DIM_CAP),
-        );
+        let proxy = (out_dim.min(AUTOTUNE_DIM_CAP), in_dim.min(AUTOTUNE_DIM_CAP));
         proxy_to_originals
             .entry(proxy)
             .or_default()
@@ -421,19 +422,18 @@ fn autotune_cublas_algos(
     for &(proxy_out, proxy_in) in &proxy_shapes {
         // Allocate temporary buffers for this proxy shape (F16 weight, F16 input, F32 output).
         let w_bytes = proxy_out * proxy_in * 2; // F16
-        let x_bytes = proxy_in * 2;             // F16
-        let w_buf: CudaSlice<u8> = device.alloc_zeros(w_bytes)
-            .map_err(|e| RuntimeError::Compute(format!(
+        let x_bytes = proxy_in * 2; // F16
+        let w_buf: CudaSlice<u8> = device.alloc_zeros(w_bytes).map_err(|e| {
+            RuntimeError::Compute(format!(
                 "autotune: alloc weight ({proxy_out}x{proxy_in}): {e}"
-            )))?;
-        let x_buf: CudaSlice<u8> = device.alloc_zeros(x_bytes)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "autotune: alloc input ({proxy_in}): {e}"
-            )))?;
-        let y_buf: CudaSlice<f32> = device.alloc_zeros(proxy_out)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "autotune: alloc output ({proxy_out}): {e}"
-            )))?;
+            ))
+        })?;
+        let x_buf: CudaSlice<u8> = device.alloc_zeros(x_bytes).map_err(|e| {
+            RuntimeError::Compute(format!("autotune: alloc input ({proxy_in}): {e}"))
+        })?;
+        let y_buf: CudaSlice<f32> = device.alloc_zeros(proxy_out).map_err(|e| {
+            RuntimeError::Compute(format!("autotune: alloc output ({proxy_out}): {e}"))
+        })?;
 
         let (w_ptr, _) = w_buf.device_ptr(&device.stream);
         let (x_ptr, _) = x_buf.device_ptr(&device.stream);
@@ -479,15 +479,17 @@ fn autotune_cublas_algos(
             }
 
             // Sync before timing to avoid overlap with warmup.
-            device.synchronize()
+            device
+                .synchronize()
                 .map_err(|e| RuntimeError::Compute(format!("autotune: sync before timing: {e}")))?;
 
             // Timed trials: use CUDA events for precise GPU timing.
             let mut times = Vec::with_capacity(TRIALS);
             for _ in 0..TRIALS {
                 unsafe {
-                    event::record(start_event, raw_stream)
-                        .map_err(|e| RuntimeError::Compute(format!("autotune: record start: {e}")))?;
+                    event::record(start_event, raw_stream).map_err(|e| {
+                        RuntimeError::Compute(format!("autotune: record start: {e}"))
+                    })?;
 
                     let status = cublas_sys::cublasGemmEx(
                         *device.blas.handle(),
@@ -540,7 +542,9 @@ fn autotune_cublas_algos(
         }
 
         let algo_name = match best_algo {
-            cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP => "DEFAULT_TENSOR_OP".to_string(),
+            cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP => {
+                "DEFAULT_TENSOR_OP".to_string()
+            }
             other => format!("ALGO{}_TENSOR_OP", other as i32 - 100),
         };
 
@@ -741,7 +745,6 @@ struct GdnScratchGpu {
     params: super::gdn::GdnParams,
 
     // --- Per-layer persistent state ---
-
     /// Recurrent hidden state per GDN layer.
     /// Each entry: [num_heads * head_dim * head_dim] f32, transposed layout.
     /// Persists across tokens, reset between sequences.
@@ -766,7 +769,6 @@ struct GdnScratchGpu {
     gdn_layer_map: Vec<Option<usize>>,
 
     // --- Ephemeral per-dispatch buffers (shared across GDN layers) ---
-
     /// QKV matvec output: [qkv_dim] f32.
     qkv_buf: CudaSlice<f32>,
     /// Conv1d output + SiLU activation: [qkv_dim] f32.
@@ -1117,9 +1119,12 @@ fn cuda_decode_delay_us() -> u64 {
 // ---------------------------------------------------------------------------
 
 fn parse_env_truthy(name: &str) -> Option<bool> {
-    std::env::var(name)
-        .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+    std::env::var(name).ok().map(|v| {
+        matches!(
+            v.as_str(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        )
+    })
 }
 
 /// Resolves `LUMEN_CUDA_DECODE_GRAPH` (master). Unset → BF16-aware
@@ -1736,7 +1741,9 @@ impl CudaBackend {
                     *device.blas.handle(),
                     cublas_sys::cublasOperation_t::CUBLAS_OP_T,
                     cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-                    m, n, k,
+                    m,
+                    n,
+                    k,
                     &alpha as *const f32 as *const std::ffi::c_void,
                     w_ptr as *const std::ffi::c_void,
                     cublas_sys::cudaDataType_t::CUDA_R_16BF,
@@ -1873,30 +1880,27 @@ impl CudaBackend {
                     .into(),
             )
         })?;
-        let w_dev: CudaSlice<u8> = self
-            .device
-            .htod_copy(weight_bf16_bytes)
-            .map_err(|e| RuntimeError::Compute(format!(
+        let w_dev: CudaSlice<u8> = self.device.htod_copy(weight_bf16_bytes).map_err(|e| {
+            RuntimeError::Compute(format!(
                 "dispatch_bf16_matvec_for_tests {label}: htod_copy weight: {e}",
-            )))?;
-        let input_dev: CudaSlice<f32> = self
-            .device
-            .htod_copy(input_f32)
-            .map_err(|e| RuntimeError::Compute(format!(
+            ))
+        })?;
+        let input_dev: CudaSlice<f32> = self.device.htod_copy(input_f32).map_err(|e| {
+            RuntimeError::Compute(format!(
                 "dispatch_bf16_matvec_for_tests {label}: htod_copy input: {e}",
-            )))?;
-        let mut output_dev: CudaSlice<f32> = self
-            .device
-            .alloc_zeros(out_dim)
-            .map_err(|e| RuntimeError::Compute(format!(
+            ))
+        })?;
+        let mut output_dev: CudaSlice<f32> = self.device.alloc_zeros(out_dim).map_err(|e| {
+            RuntimeError::Compute(format!(
                 "dispatch_bf16_matvec_for_tests {label}: alloc output: {e}",
-            )))?;
-        let mut input_bf16_scratch: CudaSlice<u8> = self
-            .device
-            .alloc_zeros(in_dim * 2)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "dispatch_bf16_matvec_for_tests {label}: alloc scratch: {e}",
-            )))?;
+            ))
+        })?;
+        let mut input_bf16_scratch: CudaSlice<u8> =
+            self.device.alloc_zeros(in_dim * 2).map_err(|e| {
+                RuntimeError::Compute(format!(
+                    "dispatch_bf16_matvec_for_tests {label}: alloc scratch: {e}",
+                ))
+            })?;
         match residual {
             None => unsafe {
                 launch_bf16_matvec_with_fallback(
@@ -1912,12 +1916,11 @@ impl CudaBackend {
                 )?;
             },
             Some(r) => {
-                let residual_dev: CudaSlice<f32> = self
-                    .device
-                    .htod_copy(r)
-                    .map_err(|e| RuntimeError::Compute(format!(
+                let residual_dev: CudaSlice<f32> = self.device.htod_copy(r).map_err(|e| {
+                    RuntimeError::Compute(format!(
                         "dispatch_bf16_matvec_for_tests {label}: htod_copy residual: {e}",
-                    )))?;
+                    ))
+                })?;
                 unsafe {
                     launch_bf16_matvec_residual_with_fallback(
                         &self.device,
@@ -1934,17 +1937,16 @@ impl CudaBackend {
                 }
             }
         }
-        self.device
-            .synchronize()
-            .map_err(|e| RuntimeError::Compute(format!(
+        self.device.synchronize().map_err(|e| {
+            RuntimeError::Compute(format!(
                 "dispatch_bf16_matvec_for_tests {label}: synchronize: {e}",
-            )))?;
-        let out_host: Vec<f32> = self
-            .device
-            .dtoh_copy(&output_dev)
-            .map_err(|e| RuntimeError::Compute(format!(
+            ))
+        })?;
+        let out_host: Vec<f32> = self.device.dtoh_copy(&output_dev).map_err(|e| {
+            RuntimeError::Compute(format!(
                 "dispatch_bf16_matvec_for_tests {label}: dtoh output: {e}",
-            )))?;
+            ))
+        })?;
         Ok(out_host)
     }
 
@@ -1952,11 +1954,7 @@ impl CudaBackend {
     ///
     /// This is the GPU-resident counterpart of `embed_token`. Instead of syncing
     /// and copying back to host, it leaves the embedding in `st.scratch.x_gpu`.
-    fn embed_token_gpu(
-        &self,
-        token_id: u32,
-        st: &mut MutableState,
-    ) -> Result<(), RuntimeError> {
+    fn embed_token_gpu(&self, token_id: u32, st: &mut MutableState) -> Result<(), RuntimeError> {
         let hidden_dim = self.cached_hidden_dim;
         let vocab_size = self.cached_vocab_size;
 
@@ -1991,9 +1989,7 @@ impl CudaBackend {
                     .arg(&hd)
                     .launch(launch_cfg)
             }
-            .map_err(|e| {
-                RuntimeError::Compute(format!("CUDA embed_token_bf16 gpu launch: {e}"))
-            })?;
+            .map_err(|e| RuntimeError::Compute(format!("CUDA embed_token_bf16 gpu launch: {e}")))?;
         } else if let Some(ref emb_f16) = st.globals.embedding_f16 {
             let func = self.embed_f16_func.as_ref().ok_or_else(|| {
                 RuntimeError::Compute("embed_token_f16 kernel not compiled".into())
@@ -2009,9 +2005,7 @@ impl CudaBackend {
                     .arg(&hd)
                     .launch(launch_cfg)
             }
-            .map_err(|e| {
-                RuntimeError::Compute(format!("CUDA embed_token_f16 gpu launch: {e}"))
-            })?;
+            .map_err(|e| RuntimeError::Compute(format!("CUDA embed_token_f16 gpu launch: {e}")))?;
         } else if let Some(ref emb_q4) = st.globals.embedding_q4 {
             let func = self.embed_q4_0_func.as_ref().ok_or_else(|| {
                 RuntimeError::Compute("embed_token_q4_0 kernel not compiled".into())
@@ -2029,9 +2023,7 @@ impl CudaBackend {
                     .arg(&hd)
                     .launch(launch_cfg)
             }
-            .map_err(|e| {
-                RuntimeError::Compute(format!("CUDA embed_token_q4_0 gpu launch: {e}"))
-            })?;
+            .map_err(|e| RuntimeError::Compute(format!("CUDA embed_token_q4_0 gpu launch: {e}")))?;
         } else if let Some(ref emb_q8) = st.globals.embedding_q8 {
             let func = self.embed_q8_0_func.as_ref().ok_or_else(|| {
                 RuntimeError::Compute("embed_token_q8_0 kernel not compiled".into())
@@ -2049,9 +2041,7 @@ impl CudaBackend {
                     .arg(&hd)
                     .launch(launch_cfg)
             }
-            .map_err(|e| {
-                RuntimeError::Compute(format!("CUDA embed_token_q8_0 gpu launch: {e}"))
-            })?;
+            .map_err(|e| RuntimeError::Compute(format!("CUDA embed_token_q8_0 gpu launch: {e}")))?;
         } else {
             let func = self.embed_f32_func.as_ref().ok_or_else(|| {
                 RuntimeError::Compute("embed_token_f32 kernel not compiled".into())
@@ -2069,9 +2059,7 @@ impl CudaBackend {
                     .arg(&hd)
                     .launch(launch_cfg)
             }
-            .map_err(|e| {
-                RuntimeError::Compute(format!("CUDA embed_token_f32 gpu launch: {e}"))
-            })?;
+            .map_err(|e| RuntimeError::Compute(format!("CUDA embed_token_f32 gpu launch: {e}")))?;
         }
 
         Ok(())
@@ -2122,769 +2110,1009 @@ impl CudaBackend {
             // to x_gpu after the full layer (GDN attention + FFN) completes.
             self.compute_gdn_attention_gpu(layer_idx, st)?;
         } else {
-
-        let lw: &LayerWeightsGpu = st
-            .layer_weights_cache
-            .get(layer_idx)
-            .ok_or_else(|| RuntimeError::Compute(format!(
-                "compute_layer_gpu: layer {layer_idx} not in GPU-resident cache",
-            )))?;
-
-        // Q+gate fusion detection: Qwen3.5 full-attention layers have fused Q+gate
-        // in wq with output dimension q_dim*2. When active, wq projects to q_gate
-        // scratch buffer, then deinterleave + per-head norm produces final Q and gate.
-        let has_qgate_fusion = lw.attn_q_norm.is_some();
-        let wq_out_dim = if has_qgate_fusion { q_dim * 2 } else { q_dim };
-
-        // 1. Fused RMSNorm + QKV projections (same logic as compute_layer).
-        // For mixed-precision models (e.g. Qwen3.5-9B Q4 LBC where wq is
-        // dequantized from Q6_K to F32 but wk/wv remain Q4_0 as Q4Raw),
-        // checking only wq would cause `if let GpuWeightBuf::F32 = wk` bindings
-        // below to silently fail and skip wk/wv matvec dispatch, leaving
-        // st.scratch.k/v with stale state from a prior layer and producing
-        // request-N-dependent non-determinism. Require all three F32 here so
-        // mixed-precision falls through to the F32+f16-cache HGEMV batched path.
-        if matches!(&lw.wq, GpuWeightBuf::F32(_))
-            && matches!(&lw.wk, GpuWeightBuf::F32(_))
-            && matches!(&lw.wv, GpuWeightBuf::F32(_))
-        {
-            // SAFETY: x_gpu is [hidden_dim], rms_scale is [1]. Both allocated in init.
-            unsafe {
-                launch_compute_rms_scale(
-                    &self.device,
-                    &st.kernels,
-                    &st.scratch.x_gpu,
-                    &mut st.scratch.rms_scale,
-                    eps,
-                    hidden_dim,
-                )?;
-            }
-            if let GpuWeightBuf::F32(ref wq_f32) = lw.wq {
-                // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
-                let (wq_out_buf, wq_od) = if has_qgate_fusion {
-                    (st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>, wq_out_dim)
-                } else {
-                    (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
-                };
-                unsafe {
-                    launch_fused_norm_matvec_f32(
-                        &self.device,
-                        &st.kernels,
-                        &st.scratch.x_gpu,
-                        &st.scratch.rms_scale,
-                        &lw.attn_norm,
-                        wq_f32,
-                        wq_out_buf,
-                        wq_od,
-                        hidden_dim,
-                        "wq",
-                    )?;
-                }
-            }
-            if let GpuWeightBuf::F32(ref wk_f32) = lw.wk {
-                unsafe {
-                    launch_fused_norm_matvec_f32(
-                        &self.device,
-                        &st.kernels,
-                        &st.scratch.x_gpu,
-                        &st.scratch.rms_scale,
-                        &lw.attn_norm,
-                        wk_f32,
-                        &mut st.scratch.k,
-                        kv_dim,
-                        hidden_dim,
-                        "wk",
-                    )?;
-                }
-            }
-            if let GpuWeightBuf::F32(ref wv_f32) = lw.wv {
-                unsafe {
-                    launch_fused_norm_matvec_f32(
-                        &self.device,
-                        &st.kernels,
-                        &st.scratch.x_gpu,
-                        &st.scratch.rms_scale,
-                        &lw.attn_norm,
-                        wv_f32,
-                        &mut st.scratch.v,
-                        kv_dim,
-                        hidden_dim,
-                        "wv",
-                    )?;
-                }
-            }
-        } else if matches!(&lw.wq, GpuWeightBuf::F16Raw(_)) {
-            // F16 HGEMV path: Fused RMSNorm + F32->F16 in ONE kernel (saves 1 dispatch),
-            // then cuBLAS HGEMV for all QKV projections (cached F16 input).
-            unsafe {
-                launch_fused_rmsnorm_f16(
-                    &self.device, &st.kernels,
-                    &st.scratch.x_gpu, &lw.attn_norm,
-                    &mut st.scratch.input_f16,
-                    eps, hidden_dim, "attn F16",
-                )?;
-            }
-            // QKV projections: use pre-computed pointers if available.
-            if let Some(ref pcp) = st.precomputed_ptrs {
-                // Pre-computed batched: Q separate + KV batched (no htod).
-                if let GpuWeightBuf::F16Raw(ref wq_f16) = lw.wq {
-                    // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
-                    let (wq_out_buf, wq_od) = if has_qgate_fusion {
-                        (st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>, wq_out_dim)
-                    } else {
-                        (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
-                    };
-                    unsafe {
-                        launch_hgemv_f16_preconverted(
-                            &self.device, wq_f16, &st.scratch.input_f16,
-                            wq_out_buf, wq_od, hidden_dim, "wq",
-                            st.algo_cache.get(wq_od, hidden_dim),
-                        )?;
-                    }
-                }
-                unsafe {
-                    launch_hgemv_f16_batched_precomputed(
-                        &self.device,
-                        &pcp.kv_a_ptrs[layer_idx],
-                        &pcp.kv_b_ptrs[layer_idx],
-                        &pcp.kv_c_ptrs[layer_idx],
-                        2, kv_dim, hidden_dim, "kv",
-                        st.algo_cache.get(kv_dim, hidden_dim),
-                    )?;
-                }
-            } else {
-                // Fallback: original per-layer htod path.
-                if let GpuWeightBuf::F16Raw(ref wq_f16) = lw.wq {
-                    // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
-                    let (wq_out_buf, wq_od) = if has_qgate_fusion {
-                        (st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>, wq_out_dim)
-                    } else {
-                        (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
-                    };
-                    unsafe {
-                        launch_hgemv_f16_preconverted(
-                            &self.device, wq_f16, &st.scratch.input_f16,
-                            wq_out_buf, wq_od, hidden_dim, "wq",
-                            st.algo_cache.get(wq_od, hidden_dim),
-                        )?;
-                    }
-                }
-                if let (GpuWeightBuf::F16Raw(ref wk_f16), GpuWeightBuf::F16Raw(ref wv_f16)) = (&lw.wk, &lw.wv) {
-                    unsafe {
-                        let w_slices: &[&CudaSlice<u8>] = &[wk_f16, wv_f16];
-                        let mut out_slices: [&mut CudaSlice<f32>; 2] = [&mut st.scratch.k, &mut st.scratch.v];
-                        launch_hgemv_f16_batched(
-                            &self.device,
-                            w_slices,
-                            &st.scratch.input_f16,
-                            &mut out_slices,
-                            &mut st.scratch.batched_a_ptrs,
-                            &mut st.scratch.batched_b_ptrs,
-                            &mut st.scratch.batched_c_ptrs,
-                            kv_dim,
-                            hidden_dim,
-                            "kv",
-                            st.algo_cache.get(kv_dim, hidden_dim),
-                        )?;
-                    }
-                }
-            }
-        } else if matches!(&lw.wq, GpuWeightBuf::F32(_))
-            && lw.wq_f16.is_some() && lw.wk_f16.is_some() && lw.wv_f16.is_some()
-        {
-            // cuBLAS HGEMV fast path for F32 weights with pre-dequanted F16 caches.
-            // CUBLAS_COMPUTE_32F_FAST_16F exploits tensor cores (312 TFLOPS on A100).
-            // Only used for F32 weights where F16 HGEMV halves bandwidth (4 -> 2 B/elem).
-            // Q8/Q4/Q8Aligned weights fall through to launch_matvec() which dispatches
-            // native dp4a kernels reading 1.06 B/elem -- 1.9x less bandwidth than HGEMV.
-            unsafe {
-                launch_fused_rmsnorm_f16(
-                    &self.device, &st.kernels,
-                    &st.scratch.x_gpu, &lw.attn_norm,
-                    &mut st.scratch.input_f16,
-                    eps, hidden_dim, "attn HGEMV",
-                )?;
-            }
-            // QKV projections: use pre-computed pointers if available (same logic as F16 native path).
-            if let Some(ref pcp) = st.precomputed_ptrs {
-                // Pre-computed batched: Q separate + KV batched (no htod).
-                if let Some(ref wq_f16) = lw.wq_f16 {
-                    // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
-                    let (wq_out_buf, wq_od) = if has_qgate_fusion {
-                        (st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>, wq_out_dim)
-                    } else {
-                        (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
-                    };
-                    unsafe {
-                        launch_hgemv_f16_preconverted(
-                            &self.device, wq_f16, &st.scratch.input_f16,
-                            wq_out_buf, wq_od, hidden_dim, "wq",
-                            st.algo_cache.get(wq_od, hidden_dim),
-                        )?;
-                    }
-                }
-                unsafe {
-                    launch_hgemv_f16_batched_precomputed(
-                        &self.device,
-                        &pcp.kv_a_ptrs[layer_idx],
-                        &pcp.kv_b_ptrs[layer_idx],
-                        &pcp.kv_c_ptrs[layer_idx],
-                        2, kv_dim, hidden_dim, "kv",
-                        st.algo_cache.get(kv_dim, hidden_dim),
-                    )?;
-                }
-            } else {
-                // Fallback: Q separate + KV batched with per-layer htod.
-                if let Some(ref wq_f16) = lw.wq_f16 {
-                    // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
-                    let (wq_out_buf, wq_od) = if has_qgate_fusion {
-                        (st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>, wq_out_dim)
-                    } else {
-                        (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
-                    };
-                    unsafe {
-                        launch_hgemv_f16_preconverted(
-                            &self.device, wq_f16, &st.scratch.input_f16,
-                            wq_out_buf, wq_od, hidden_dim, "wq",
-                            st.algo_cache.get(wq_od, hidden_dim),
-                        )?;
-                    }
-                }
-                if let (Some(ref wk_f16), Some(ref wv_f16)) = (&lw.wk_f16, &lw.wv_f16) {
-                    unsafe {
-                        let w_slices: &[&CudaSlice<u8>] = &[wk_f16, wv_f16];
-                        let mut out_slices: [&mut CudaSlice<f32>; 2] = [&mut st.scratch.k, &mut st.scratch.v];
-                        launch_hgemv_f16_batched(
-                            &self.device,
-                            w_slices,
-                            &st.scratch.input_f16,
-                            &mut out_slices,
-                            &mut st.scratch.batched_a_ptrs,
-                            &mut st.scratch.batched_b_ptrs,
-                            &mut st.scratch.batched_c_ptrs,
-                            kv_dim,
-                            hidden_dim,
-                            "kv",
-                            st.algo_cache.get(kv_dim, hidden_dim),
-                        )?;
-                    }
-                }
-            }
-        } else {
-            // Q8_0/Q4_0/Q8Aligned/Q4Aligned/F32: native-quant decode via launch_matvec().
-            // Priority: dp4a Q8_1 > smem > hgemv > cuBLAS HGEMV > dp4a/scalar.
-            // Native kernels read quantized weights directly (1.06 B/elem for Q8, 0.56 for Q4)
-            // vs HGEMV's 2 B/elem from pre-dequanted F16 cache -- 1.9x-3.6x less bandwidth.
-            // F16 caches are passed as last-resort fallback only.
-            // Shared-quantization optimization: if all QKV weights use dp4a Q8_1 path,
-            // quantize the normed input ONCE and reuse across Q, K, V projections.
-            // Saves 2 quantize_f32_to_q8_1 launches per layer.
-            let qkv_use_preq = weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
-                && weight_uses_dp4a_q8_1(&lw.wk, &st.kernels)
-                && weight_uses_dp4a_q8_1(&lw.wv, &st.kernels)
-                && st.scratch.input_q8_1.is_some()
-                && st.kernels.quantize_f32_to_q8_1.is_some();
-
-            // Fused RMSNorm + Q8_1: skip separate rmsnorm + quantize_f32_to_q8_1
-            // when the fused kernel is available. Saves 1 dispatch per norm site.
-            if qkv_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
-                let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
-                let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                let block_size = rmsnorm_block_size(hidden_dim);
-                let shared_bytes = rmsnorm_shared_bytes(block_size);
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: shared_bytes,
-                };
-                let dim = hidden_dim as u32;
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(fused_fn)
-                        .arg(&st.scratch.x_gpu)
-                        .arg(&lw.attn_norm)
-                        .arg(&mut *q8_1_buf)
-                        .arg(&eps)
-                        .arg(&dim)
-                        .launch(launch_cfg)
-                }
-                .map_err(|e| RuntimeError::Compute(format!("rmsnorm_to_q8_1 attn: {e}")))?;
-                unsafe {
-                    // split-layout: prefer Q8Split/Q4Split sibling buffers on QKV when set.
-                    // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
-                    if has_qgate_fusion {
-                        launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wq, lw.q8_tile_wq.as_ref(), lw.q4_tile_wq.as_ref(), lw.q8_split_wq.as_ref(), lw.q4_split_wq.as_ref(), q8_1_buf, st.scratch.q_gate.as_mut().unwrap(), wq_out_dim, hidden_dim, "wq")?;
-                    } else {
-                        launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wq, lw.q8_tile_wq.as_ref(), lw.q4_tile_wq.as_ref(), lw.q8_split_wq.as_ref(), lw.q4_split_wq.as_ref(), q8_1_buf, &mut st.scratch.q, q_dim, hidden_dim, "wq")?;
-                    }
-                    launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wk, lw.q8_tile_wk.as_ref(), lw.q4_tile_wk.as_ref(), lw.q8_split_wk.as_ref(), lw.q4_split_wk.as_ref(), q8_1_buf, &mut st.scratch.k, kv_dim, hidden_dim, "wk")?;
-                    launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wv, lw.q8_tile_wv.as_ref(), lw.q4_tile_wv.as_ref(), lw.q8_split_wv.as_ref(), lw.q4_split_wv.as_ref(), q8_1_buf, &mut st.scratch.v, kv_dim, hidden_dim, "wv")?;
-                }
-            } else if qkv_use_preq {
-                // Fallback: separate rmsnorm + quantize_f32_to_q8_1 (fused kernel unavailable).
-                {
-                    let block_size = rmsnorm_block_size(hidden_dim);
-                    let shared_bytes = rmsnorm_shared_bytes(block_size);
-                    let launch_cfg = CudarcLaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (block_size, 1, 1),
-                        shared_mem_bytes: shared_bytes,
-                    };
-                    let dim = hidden_dim as u32;
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(&st.kernels.rmsnorm)
-                            .arg(&st.scratch.x_gpu)
-                            .arg(&lw.attn_norm)
-                            .arg(&mut st.scratch.normed)
-                            .arg(&eps)
-                            .arg(&dim)
-                            .launch(launch_cfg)
-                    }
-                    .map_err(|e| RuntimeError::Compute(format!("rmsnorm attn launch: {e}")))?;
-                }
-                let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref().unwrap();
-                let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                unsafe {
-                    launch_quantize_input_q8_1(&self.device, quant_fn, &st.scratch.normed, q8_1_buf, hidden_dim, "qkv")?;
-                    // split-layout: prefer Q8Split/Q4Split sibling buffers on QKV when set.
-                    // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
-                    if has_qgate_fusion {
-                        launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wq, lw.q8_tile_wq.as_ref(), lw.q4_tile_wq.as_ref(), lw.q8_split_wq.as_ref(), lw.q4_split_wq.as_ref(), q8_1_buf, st.scratch.q_gate.as_mut().unwrap(), wq_out_dim, hidden_dim, "wq")?;
-                    } else {
-                        launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wq, lw.q8_tile_wq.as_ref(), lw.q4_tile_wq.as_ref(), lw.q8_split_wq.as_ref(), lw.q4_split_wq.as_ref(), q8_1_buf, &mut st.scratch.q, q_dim, hidden_dim, "wq")?;
-                    }
-                    launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wk, lw.q8_tile_wk.as_ref(), lw.q4_tile_wk.as_ref(), lw.q8_split_wk.as_ref(), lw.q4_split_wk.as_ref(), q8_1_buf, &mut st.scratch.k, kv_dim, hidden_dim, "wk")?;
-                    launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wv, lw.q8_tile_wv.as_ref(), lw.q4_tile_wv.as_ref(), lw.q8_split_wv.as_ref(), lw.q4_split_wv.as_ref(), q8_1_buf, &mut st.scratch.v, kv_dim, hidden_dim, "wv")?;
-                }
-            } else {
-                // Non-preq path: separate rmsnorm + launch_matvec (with internal quantization).
-                {
-                    let block_size = rmsnorm_block_size(hidden_dim);
-                    let shared_bytes = rmsnorm_shared_bytes(block_size);
-                    let launch_cfg = CudarcLaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (block_size, 1, 1),
-                        shared_mem_bytes: shared_bytes,
-                    };
-                    let dim = hidden_dim as u32;
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(&st.kernels.rmsnorm)
-                            .arg(&st.scratch.x_gpu)
-                            .arg(&lw.attn_norm)
-                            .arg(&mut st.scratch.normed)
-                            .arg(&eps)
-                            .arg(&dim)
-                            .launch(launch_cfg)
-                    }
-                    .map_err(|e| RuntimeError::Compute(format!("rmsnorm attn launch: {e}")))?;
-                }
-                unsafe {
-                    // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
-                    if has_qgate_fusion {
-                        launch_matvec(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wq,
-                            &st.scratch.normed,
-                            st.scratch.q_gate.as_mut().unwrap(),
-                            wq_out_dim,
-                            hidden_dim,
-                            "wq",
-                            lw.wq_f16.as_ref(),
-                            Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut(),
-                        )?;
-                    } else {
-                        launch_matvec(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wq,
-                            &st.scratch.normed,
-                            &mut st.scratch.q,
-                            q_dim,
-                            hidden_dim,
-                            "wq",
-                            lw.wq_f16.as_ref(),
-                            Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut(),
-                        )?;
-                    }
-                    launch_matvec(
-                        &self.device,
-                        &st.kernels,
-                        &lw.wk,
-                        &st.scratch.normed,
-                        &mut st.scratch.k,
-                        kv_dim,
-                        hidden_dim,
-                        "wk",
-                        lw.wk_f16.as_ref(),
-                        Some(&mut st.scratch.input_f16),
-                        st.scratch.input_q8_1.as_mut(),
-                    )?;
-                    launch_matvec(
-                        &self.device,
-                        &st.kernels,
-                        &lw.wv,
-                        &st.scratch.normed,
-                        &mut st.scratch.v,
-                        kv_dim,
-                        hidden_dim,
-                        "wv",
-                        lw.wv_f16.as_ref(),
-                        Some(&mut st.scratch.input_f16),
-                        st.scratch.input_q8_1.as_mut(),
-                    )?;
-                }
-            }
-        }
-
-        // Q+gate fusion post-processing: deinterleave q_gate -> q + gate_buf,
-        // then per-head RMSNorm on Q (attn_q_norm) and K (attn_k_norm).
-        // Must run AFTER all QKV projection branches and BEFORE RoPE.
-        if has_qgate_fusion {
-            let q_gate_buf = st.scratch.q_gate.as_ref().unwrap();
-            let gate_buf = st.scratch.gate_buf.as_mut().unwrap();
-
-            // 1a. Deinterleave: q_gate [q_dim*2] -> q [q_dim] + gate_buf [q_dim]
-            if let Some(ref deinterleave_fn) = st.kernels.deinterleave_qgate {
-                let block = 256u32;
-                let grid = ((q_dim as u32) + block - 1) / block;
-                let hd = head_dim as u32;
-                let nh = num_heads as u32;
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(deinterleave_fn)
-                        .arg(q_gate_buf)
-                        .arg(&mut st.scratch.q)
-                        .arg(gate_buf)
-                        .arg(&hd)
-                        .arg(&nh)
-                        .launch(launch_cfg)
-                }
-                .map_err(|e| RuntimeError::Compute(format!("deinterleave_qgate launch: {e}")))?;
-            } else {
-                return Err(RuntimeError::Compute(
-                    "Q+gate fusion requires deinterleave_qgate kernel".into(),
-                ));
-            }
-
-            // 1b. Per-head RMSNorm on Q using attn_q_norm [head_dim]
-            if let Some(ref q_norm_w) = lw.attn_q_norm {
-                let norm_fn = st.kernels.rmsnorm_per_head_inplace.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute("Q+gate fusion requires rmsnorm_per_head_inplace kernel".into())
-                })?;
-                let hd = head_dim as u32;
-                let nh = num_heads as u32;
-                let block = (head_dim as u32).min(1024).max(32);
-                let block = (block / 32) * 32; // Round down to warp multiple
-                let shared_bytes = (block / 32) * 4; // One float per warp
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (nh, 1, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: shared_bytes,
-                };
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(norm_fn)
-                        .arg(&mut st.scratch.q)
-                        .arg(q_norm_w)
-                        .arg(&nh)
-                        .arg(&hd)
-                        .arg(&eps)
-                        .launch(launch_cfg)
-                }
-                .map_err(|e| RuntimeError::Compute(format!("rmsnorm_per_head Q launch: {e}")))?;
-            }
-
-            // 1c. Per-head RMSNorm on K using attn_k_norm [head_dim]
-            if let Some(ref k_norm_w) = lw.attn_k_norm {
-                let norm_fn = st.kernels.rmsnorm_per_head_inplace.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute("Q+gate fusion requires rmsnorm_per_head_inplace kernel".into())
-                })?;
-                let hd = head_dim as u32;
-                let nkvh = num_kv_heads as u32;
-                let block = (head_dim as u32).min(1024).max(32);
-                let block = (block / 32) * 32;
-                let shared_bytes = (block / 32) * 4;
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (nkvh, 1, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: shared_bytes,
-                };
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(norm_fn)
-                        .arg(&mut st.scratch.k)
-                        .arg(k_norm_w)
-                        .arg(&nkvh)
-                        .arg(&hd)
-                        .arg(&eps)
-                        .launch(launch_cfg)
-                }
-                .map_err(|e| RuntimeError::Compute(format!("rmsnorm_per_head K launch: {e}")))?;
-            }
-        }
-
-        // QKV bias (Qwen2-family, decode).
-        if lw.bq.is_some() || lw.bk.is_some() || lw.bv.is_some() {
-            let block = 256u32;
-            unsafe {
-                if let Some(ref bq) = lw.bq {
-                    let d = q_dim as u32; let g = (d + block - 1) / block;
-                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.q).arg(bq).arg(&d)
-                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
-                        .map_err(|e| RuntimeError::Compute(format!("bias_add bq decode: {e}")))?;
-                }
-                if let Some(ref bk) = lw.bk {
-                    let d = kv_dim as u32; let g = (d + block - 1) / block;
-                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.k).arg(bk).arg(&d)
-                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
-                        .map_err(|e| RuntimeError::Compute(format!("bias_add bk decode: {e}")))?;
-                }
-                if let Some(ref bv) = lw.bv {
-                    let d = kv_dim as u32; let g = (d + block - 1) / block;
-                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.v).arg(bv).arg(&d)
-                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
-                        .map_err(|e| RuntimeError::Compute(format!("bias_add bv decode: {e}")))?;
-                }
-            }
-        }
-
-        // 2. RoPE.
-        {
-            let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
-            let actual_rot = if rotary_dim > 0 && rotary_dim < head_dim as u32 { rotary_dim as usize } else { head_dim };
-            let half_rot = actual_rot / 2;
-            let total_q_pairs = num_heads * half_rot;
-            let total_k_pairs = num_kv_heads * half_rot;
-            let max_pairs = total_q_pairs.max(total_k_pairs);
-            let config = LaunchConfig::for_elements(max_pairs);
-            let launch_cfg = CudarcLaunchConfig {
-                grid_dim: (config.grid_dim, 1, 1),
-                block_dim: (config.block_dim, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let pos = seq_pos as u32;
-            let nqh = num_heads as u32;
-            let nkvh = num_kv_heads as u32;
-            let hd = head_dim as u32;
-            // NeoX RoPE: models with partial rotary_dim (e.g. Qwen3.5) use half-offset
-            // dimension pairing instead of standard interleaved pairing.
-            let rope_neox = hp.rope_neox;
-            let rope_fn = if rope_neox {
-                &st.kernels.rope_apply_neox
-            } else {
-                &st.kernels.rope_apply
-            };
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(rope_fn)
-                    .arg(&mut st.scratch.q)
-                    .arg(&mut st.scratch.k)
-                    .arg(&pos)
-                    .arg(&nqh)
-                    .arg(&nkvh)
-                    .arg(&hd)
-                    .arg(&theta)
-                    .arg(&rotary_dim)
-                    .launch(launch_cfg)
-            }
-            .map_err(|e| RuntimeError::Compute(format!("rope launch: {e}")))?;
-        }
-
-        // 3. KV cache write.
-        {
-            let kv_cache = st.kv_caches.get_mut(layer_idx).ok_or_else(|| {
-                RuntimeError::Compute(format!("no KV cache for layer {layer_idx}"))
+            let lw: &LayerWeightsGpu = st.layer_weights_cache.get(layer_idx).ok_or_else(|| {
+                RuntimeError::Compute(format!(
+                    "compute_layer_gpu: layer {layer_idx} not in GPU-resident cache",
+                ))
             })?;
-            kv_cache.append_kv(&self.device, &st.scratch.k, &st.scratch.v)?;
-        }
 
-        // 4. Attention. gate: routes to the tiled streaming-softmax
-        // kernel at long context (seq_len > LUMEN_CUDA_DECODE_TILED_THRESHOLD,
-        // default 0 = "tiled-always") or when LUMEN_CUDA_DECODE_TILED=1
-        // forces it. Operators can set `LUMEN_CUDA_DECODE_TILED_THRESHOLD=
-        // 4294967295` to opt out (force single-block below the 40_950 ceiling).
-        {
-            let kv_cache = &st.kv_caches[layer_idx];
-            let attn_seq_len = kv_cache.seq_len() as u32;
-            let nh = num_heads as u32;
-            let nkvh = num_kv_heads as u32;
-            let hd = head_dim as u32;
-            let msl = kv_cache.max_seq_len as u32;
-            let scale = 1.0f32 / (head_dim as f32).sqrt();
-            unsafe {
-                super::prefill::launch_attention_decode_gated(
-                    &self.device,
-                    &st.kernels,
-                    &st.scratch.q,
-                    &kv_cache.k_cache,
-                    &kv_cache.v_cache,
-                    &mut st.scratch.attn_out,
-                    nh,
-                    nkvh,
-                    hd,
-                    attn_seq_len,
-                    msl,
-                    scale,
-                )
-            }
-            .map_err(|e| RuntimeError::Compute(format!("attention_decode launch: {e}")))?;
-        }
+            // Q+gate fusion detection: Qwen3.5 full-attention layers have fused Q+gate
+            // in wq with output dimension q_dim*2. When active, wq projects to q_gate
+            // scratch buffer, then deinterleave + per-head norm produces final Q and gate.
+            let has_qgate_fusion = lw.attn_q_norm.is_some();
+            let wq_out_dim = if has_qgate_fusion { q_dim * 2 } else { q_dim };
 
-        // 4b. Q+gate sigmoid gating: attn_out = sigmoid(gate_buf) * attn_out.
-        // Applied AFTER attention, BEFORE output projection.
-        //
-        // FIX-3: write through `st.scratch.q` (already sized [q_dim] and
-        // unused after attention) and then memcpy back to attn_out. Previously
-        // the temp was `normed` which is sized `[hidden_dim]`; this overflowed
-        // for Qwen3.5-MoE-35B-A3B where `q_dim=4096 > hidden_dim=2048`,
-        // corrupting adjacent GPU memory and producing gibberish output.
-        if has_qgate_fusion {
-            if let Some(ref sigmoid_fn) = st.kernels.sigmoid_mul {
-                let gate_buf = st.scratch.gate_buf.as_ref().unwrap();
-                let n = q_dim as u32;
-                let block = 256u32;
-                let grid = (n + block - 1) / block;
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                // Step 1: sigmoid(gate) * attn_out -> q (temp, sized [q_dim]).
-                // st.scratch.q is consumed by attention_decode_gated above; safe to reuse.
+            // 1. Fused RMSNorm + QKV projections (same logic as compute_layer).
+            // For mixed-precision models (e.g. Qwen3.5-9B Q4 LBC where wq is
+            // dequantized from Q6_K to F32 but wk/wv remain Q4_0 as Q4Raw),
+            // checking only wq would cause `if let GpuWeightBuf::F32 = wk` bindings
+            // below to silently fail and skip wk/wv matvec dispatch, leaving
+            // st.scratch.k/v with stale state from a prior layer and producing
+            // request-N-dependent non-determinism. Require all three F32 here so
+            // mixed-precision falls through to the F32+f16-cache HGEMV batched path.
+            if matches!(&lw.wq, GpuWeightBuf::F32(_))
+                && matches!(&lw.wk, GpuWeightBuf::F32(_))
+                && matches!(&lw.wv, GpuWeightBuf::F32(_))
+            {
+                // SAFETY: x_gpu is [hidden_dim], rms_scale is [1]. Both allocated in init.
                 unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(sigmoid_fn)
-                        .arg(gate_buf)
-                        .arg(&st.scratch.attn_out)
-                        .arg(&mut st.scratch.q)
-                        .arg(&n)
-                        .launch(launch_cfg)
+                    launch_compute_rms_scale(
+                        &self.device,
+                        &st.kernels,
+                        &st.scratch.x_gpu,
+                        &mut st.scratch.rms_scale,
+                        eps,
+                        hidden_dim,
+                    )?;
                 }
-                .map_err(|e| RuntimeError::Compute(format!("sigmoid_mul launch: {e}")))?;
-                // Step 2: copy q -> attn_out (both [q_dim])
-                self.device
-                    .stream
-                    .memcpy_dtod(&st.scratch.q, &mut st.scratch.attn_out)
-                    .map_err(|e| RuntimeError::Compute(format!("sigmoid_mul dtod copy: {e}")))?;
+                if let GpuWeightBuf::F32(ref wq_f32) = lw.wq {
+                    // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                    let (wq_out_buf, wq_od) = if has_qgate_fusion {
+                        (
+                            st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>,
+                            wq_out_dim,
+                        )
+                    } else {
+                        (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
+                    };
+                    unsafe {
+                        launch_fused_norm_matvec_f32(
+                            &self.device,
+                            &st.kernels,
+                            &st.scratch.x_gpu,
+                            &st.scratch.rms_scale,
+                            &lw.attn_norm,
+                            wq_f32,
+                            wq_out_buf,
+                            wq_od,
+                            hidden_dim,
+                            "wq",
+                        )?;
+                    }
+                }
+                if let GpuWeightBuf::F32(ref wk_f32) = lw.wk {
+                    unsafe {
+                        launch_fused_norm_matvec_f32(
+                            &self.device,
+                            &st.kernels,
+                            &st.scratch.x_gpu,
+                            &st.scratch.rms_scale,
+                            &lw.attn_norm,
+                            wk_f32,
+                            &mut st.scratch.k,
+                            kv_dim,
+                            hidden_dim,
+                            "wk",
+                        )?;
+                    }
+                }
+                if let GpuWeightBuf::F32(ref wv_f32) = lw.wv {
+                    unsafe {
+                        launch_fused_norm_matvec_f32(
+                            &self.device,
+                            &st.kernels,
+                            &st.scratch.x_gpu,
+                            &st.scratch.rms_scale,
+                            &lw.attn_norm,
+                            wv_f32,
+                            &mut st.scratch.v,
+                            kv_dim,
+                            hidden_dim,
+                            "wv",
+                        )?;
+                    }
+                }
+            } else if matches!(&lw.wq, GpuWeightBuf::F16Raw(_)) {
+                // F16 HGEMV path: Fused RMSNorm + F32->F16 in ONE kernel (saves 1 dispatch),
+                // then cuBLAS HGEMV for all QKV projections (cached F16 input).
+                unsafe {
+                    launch_fused_rmsnorm_f16(
+                        &self.device,
+                        &st.kernels,
+                        &st.scratch.x_gpu,
+                        &lw.attn_norm,
+                        &mut st.scratch.input_f16,
+                        eps,
+                        hidden_dim,
+                        "attn F16",
+                    )?;
+                }
+                // QKV projections: use pre-computed pointers if available.
+                if let Some(ref pcp) = st.precomputed_ptrs {
+                    // Pre-computed batched: Q separate + KV batched (no htod).
+                    if let GpuWeightBuf::F16Raw(ref wq_f16) = lw.wq {
+                        // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                        let (wq_out_buf, wq_od) = if has_qgate_fusion {
+                            (
+                                st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>,
+                                wq_out_dim,
+                            )
+                        } else {
+                            (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
+                        };
+                        unsafe {
+                            launch_hgemv_f16_preconverted(
+                                &self.device,
+                                wq_f16,
+                                &st.scratch.input_f16,
+                                wq_out_buf,
+                                wq_od,
+                                hidden_dim,
+                                "wq",
+                                st.algo_cache.get(wq_od, hidden_dim),
+                            )?;
+                        }
+                    }
+                    unsafe {
+                        launch_hgemv_f16_batched_precomputed(
+                            &self.device,
+                            &pcp.kv_a_ptrs[layer_idx],
+                            &pcp.kv_b_ptrs[layer_idx],
+                            &pcp.kv_c_ptrs[layer_idx],
+                            2,
+                            kv_dim,
+                            hidden_dim,
+                            "kv",
+                            st.algo_cache.get(kv_dim, hidden_dim),
+                        )?;
+                    }
+                } else {
+                    // Fallback: original per-layer htod path.
+                    if let GpuWeightBuf::F16Raw(ref wq_f16) = lw.wq {
+                        // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                        let (wq_out_buf, wq_od) = if has_qgate_fusion {
+                            (
+                                st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>,
+                                wq_out_dim,
+                            )
+                        } else {
+                            (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
+                        };
+                        unsafe {
+                            launch_hgemv_f16_preconverted(
+                                &self.device,
+                                wq_f16,
+                                &st.scratch.input_f16,
+                                wq_out_buf,
+                                wq_od,
+                                hidden_dim,
+                                "wq",
+                                st.algo_cache.get(wq_od, hidden_dim),
+                            )?;
+                        }
+                    }
+                    if let (GpuWeightBuf::F16Raw(ref wk_f16), GpuWeightBuf::F16Raw(ref wv_f16)) =
+                        (&lw.wk, &lw.wv)
+                    {
+                        unsafe {
+                            let w_slices: &[&CudaSlice<u8>] = &[wk_f16, wv_f16];
+                            let mut out_slices: [&mut CudaSlice<f32>; 2] =
+                                [&mut st.scratch.k, &mut st.scratch.v];
+                            launch_hgemv_f16_batched(
+                                &self.device,
+                                w_slices,
+                                &st.scratch.input_f16,
+                                &mut out_slices,
+                                &mut st.scratch.batched_a_ptrs,
+                                &mut st.scratch.batched_b_ptrs,
+                                &mut st.scratch.batched_c_ptrs,
+                                kv_dim,
+                                hidden_dim,
+                                "kv",
+                                st.algo_cache.get(kv_dim, hidden_dim),
+                            )?;
+                        }
+                    }
+                }
+            } else if matches!(&lw.wq, GpuWeightBuf::F32(_))
+                && lw.wq_f16.is_some()
+                && lw.wk_f16.is_some()
+                && lw.wv_f16.is_some()
+            {
+                // cuBLAS HGEMV fast path for F32 weights with pre-dequanted F16 caches.
+                // CUBLAS_COMPUTE_32F_FAST_16F exploits tensor cores (312 TFLOPS on A100).
+                // Only used for F32 weights where F16 HGEMV halves bandwidth (4 -> 2 B/elem).
+                // Q8/Q4/Q8Aligned weights fall through to launch_matvec() which dispatches
+                // native dp4a kernels reading 1.06 B/elem -- 1.9x less bandwidth than HGEMV.
+                unsafe {
+                    launch_fused_rmsnorm_f16(
+                        &self.device,
+                        &st.kernels,
+                        &st.scratch.x_gpu,
+                        &lw.attn_norm,
+                        &mut st.scratch.input_f16,
+                        eps,
+                        hidden_dim,
+                        "attn HGEMV",
+                    )?;
+                }
+                // QKV projections: use pre-computed pointers if available (same logic as F16 native path).
+                if let Some(ref pcp) = st.precomputed_ptrs {
+                    // Pre-computed batched: Q separate + KV batched (no htod).
+                    if let Some(ref wq_f16) = lw.wq_f16 {
+                        // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                        let (wq_out_buf, wq_od) = if has_qgate_fusion {
+                            (
+                                st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>,
+                                wq_out_dim,
+                            )
+                        } else {
+                            (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
+                        };
+                        unsafe {
+                            launch_hgemv_f16_preconverted(
+                                &self.device,
+                                wq_f16,
+                                &st.scratch.input_f16,
+                                wq_out_buf,
+                                wq_od,
+                                hidden_dim,
+                                "wq",
+                                st.algo_cache.get(wq_od, hidden_dim),
+                            )?;
+                        }
+                    }
+                    unsafe {
+                        launch_hgemv_f16_batched_precomputed(
+                            &self.device,
+                            &pcp.kv_a_ptrs[layer_idx],
+                            &pcp.kv_b_ptrs[layer_idx],
+                            &pcp.kv_c_ptrs[layer_idx],
+                            2,
+                            kv_dim,
+                            hidden_dim,
+                            "kv",
+                            st.algo_cache.get(kv_dim, hidden_dim),
+                        )?;
+                    }
+                } else {
+                    // Fallback: Q separate + KV batched with per-layer htod.
+                    if let Some(ref wq_f16) = lw.wq_f16 {
+                        // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                        let (wq_out_buf, wq_od) = if has_qgate_fusion {
+                            (
+                                st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>,
+                                wq_out_dim,
+                            )
+                        } else {
+                            (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
+                        };
+                        unsafe {
+                            launch_hgemv_f16_preconverted(
+                                &self.device,
+                                wq_f16,
+                                &st.scratch.input_f16,
+                                wq_out_buf,
+                                wq_od,
+                                hidden_dim,
+                                "wq",
+                                st.algo_cache.get(wq_od, hidden_dim),
+                            )?;
+                        }
+                    }
+                    if let (Some(ref wk_f16), Some(ref wv_f16)) = (&lw.wk_f16, &lw.wv_f16) {
+                        unsafe {
+                            let w_slices: &[&CudaSlice<u8>] = &[wk_f16, wv_f16];
+                            let mut out_slices: [&mut CudaSlice<f32>; 2] =
+                                [&mut st.scratch.k, &mut st.scratch.v];
+                            launch_hgemv_f16_batched(
+                                &self.device,
+                                w_slices,
+                                &st.scratch.input_f16,
+                                &mut out_slices,
+                                &mut st.scratch.batched_a_ptrs,
+                                &mut st.scratch.batched_b_ptrs,
+                                &mut st.scratch.batched_c_ptrs,
+                                kv_dim,
+                                hidden_dim,
+                                "kv",
+                                st.algo_cache.get(kv_dim, hidden_dim),
+                            )?;
+                        }
+                    }
+                }
             } else {
-                return Err(RuntimeError::Compute(
-                    "Q+gate fusion requires sigmoid_mul kernel".into(),
-                ));
-            }
-        }
+                // Q8_0/Q4_0/Q8Aligned/Q4Aligned/F32: native-quant decode via launch_matvec().
+                // Priority: dp4a Q8_1 > smem > hgemv > cuBLAS HGEMV > dp4a/scalar.
+                // Native kernels read quantized weights directly (1.06 B/elem for Q8, 0.56 for Q4)
+                // vs HGEMV's 2 B/elem from pre-dequanted F16 cache -- 1.9x-3.6x less bandwidth.
+                // F16 caches are passed as last-resort fallback only.
+                // Shared-quantization optimization: if all QKV weights use dp4a Q8_1 path,
+                // quantize the normed input ONCE and reuse across Q, K, V projections.
+                // Saves 2 quantize_f32_to_q8_1 launches per layer.
+                let qkv_use_preq = weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
+                    && weight_uses_dp4a_q8_1(&lw.wk, &st.kernels)
+                    && weight_uses_dp4a_q8_1(&lw.wv, &st.kernels)
+                    && st.scratch.input_q8_1.is_some()
+                    && st.kernels.quantize_f32_to_q8_1.is_some();
 
-        // 5. Output projection + residual: attn_proj = wo * attn_out + x_gpu.
-        if let GpuWeightBuf::F16Raw(ref wo_f16) = lw.wo {
-            unsafe {
-                launch_hgemv_f16_residual(
-                    &self.device,
-                    &st.kernels,
-                    wo_f16,
-                    &st.scratch.attn_out,
-                    &st.scratch.x_gpu,
-                    &mut st.scratch.attn_proj,
-                    &mut st.scratch.input_f16,
-                    hidden_dim,
-                    q_dim,
-                    "wo",
-                    st.algo_cache.get(hidden_dim, q_dim),
-                )?;
-            }
-        } else if matches!(&lw.wo, GpuWeightBuf::F32(_))
-            && lw.wo_f16.is_some()
-        {
-            // cuBLAS HGEMV fast path for F32 weights with pre-dequanted F16 caches.
-            // Q8/Q4 weights fall through to launch_matvec_residual() for native dp4a.
-            let wo_f16 = lw.wo_f16.as_ref().unwrap();
-            unsafe {
-                launch_hgemv_f16_residual(
-                    &self.device,
-                    &st.kernels,
-                    wo_f16,
-                    &st.scratch.attn_out,
-                    &st.scratch.x_gpu,
-                    &mut st.scratch.attn_proj,
-                    &mut st.scratch.input_f16,
-                    hidden_dim,
-                    q_dim,
-                    "wo",
-                    st.algo_cache.get(hidden_dim, q_dim),
-                )?;
-            }
-        } else {
-            // split-layout: when a Q8/Q4 split sibling is available for wo, route
-            // through `launch_matvec_residual_split` -- requires quantizing the
-            // attention output to Q8_1 inline. Otherwise fall through to the
-            // existing `launch_matvec_residual` path.
-            let use_split_wo = (st.kernels.use_q8_split_dispatch && lw.q8_split_wo.is_some())
-                || (st.kernels.use_q4_split_dispatch && lw.q4_split_wo.is_some());
-            if use_split_wo {
-                // Quantize attention output to Q8_1 in scratch, then split residual matvec.
-                let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref();
-                let q8_1_scratch = st.scratch.input_q8_1.as_mut();
-                if let (Some(quant_fn), Some(q8_1_buf)) = (quant_fn, q8_1_scratch) {
+                // Fused RMSNorm + Q8_1: skip separate rmsnorm + quantize_f32_to_q8_1
+                // when the fused kernel is available. Saves 1 dispatch per norm site.
+                if qkv_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
+                    let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
+                    let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
+                    let block_size = rmsnorm_block_size(hidden_dim);
+                    let shared_bytes = rmsnorm_shared_bytes(block_size);
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (block_size, 1, 1),
+                        shared_mem_bytes: shared_bytes,
+                    };
+                    let dim = hidden_dim as u32;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(fused_fn)
+                            .arg(&st.scratch.x_gpu)
+                            .arg(&lw.attn_norm)
+                            .arg(&mut *q8_1_buf)
+                            .arg(&eps)
+                            .arg(&dim)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| RuntimeError::Compute(format!("rmsnorm_to_q8_1 attn: {e}")))?;
+                    unsafe {
+                        // split-layout: prefer Q8Split/Q4Split sibling buffers on QKV when set.
+                        // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                        if has_qgate_fusion {
+                            launch_matvec_preq8_1_tile(
+                                &self.device,
+                                &st.kernels,
+                                &lw.wq,
+                                lw.q8_tile_wq.as_ref(),
+                                lw.q4_tile_wq.as_ref(),
+                                lw.q8_split_wq.as_ref(),
+                                lw.q4_split_wq.as_ref(),
+                                q8_1_buf,
+                                st.scratch.q_gate.as_mut().unwrap(),
+                                wq_out_dim,
+                                hidden_dim,
+                                "wq",
+                            )?;
+                        } else {
+                            launch_matvec_preq8_1_tile(
+                                &self.device,
+                                &st.kernels,
+                                &lw.wq,
+                                lw.q8_tile_wq.as_ref(),
+                                lw.q4_tile_wq.as_ref(),
+                                lw.q8_split_wq.as_ref(),
+                                lw.q4_split_wq.as_ref(),
+                                q8_1_buf,
+                                &mut st.scratch.q,
+                                q_dim,
+                                hidden_dim,
+                                "wq",
+                            )?;
+                        }
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wk,
+                            lw.q8_tile_wk.as_ref(),
+                            lw.q4_tile_wk.as_ref(),
+                            lw.q8_split_wk.as_ref(),
+                            lw.q4_split_wk.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.k,
+                            kv_dim,
+                            hidden_dim,
+                            "wk",
+                        )?;
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wv,
+                            lw.q8_tile_wv.as_ref(),
+                            lw.q4_tile_wv.as_ref(),
+                            lw.q8_split_wv.as_ref(),
+                            lw.q4_split_wv.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.v,
+                            kv_dim,
+                            hidden_dim,
+                            "wv",
+                        )?;
+                    }
+                } else if qkv_use_preq {
+                    // Fallback: separate rmsnorm + quantize_f32_to_q8_1 (fused kernel unavailable).
+                    {
+                        let block_size = rmsnorm_block_size(hidden_dim);
+                        let shared_bytes = rmsnorm_shared_bytes(block_size);
+                        let launch_cfg = CudarcLaunchConfig {
+                            grid_dim: (1, 1, 1),
+                            block_dim: (block_size, 1, 1),
+                            shared_mem_bytes: shared_bytes,
+                        };
+                        let dim = hidden_dim as u32;
+                        unsafe {
+                            self.device
+                                .stream
+                                .launch_builder(&st.kernels.rmsnorm)
+                                .arg(&st.scratch.x_gpu)
+                                .arg(&lw.attn_norm)
+                                .arg(&mut st.scratch.normed)
+                                .arg(&eps)
+                                .arg(&dim)
+                                .launch(launch_cfg)
+                        }
+                        .map_err(|e| RuntimeError::Compute(format!("rmsnorm attn launch: {e}")))?;
+                    }
+                    let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref().unwrap();
+                    let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
                     unsafe {
                         launch_quantize_input_q8_1(
-                            &self.device, quant_fn, &st.scratch.attn_out, q8_1_buf,
-                            q_dim, "wo split",
+                            &self.device,
+                            quant_fn,
+                            &st.scratch.normed,
+                            q8_1_buf,
+                            hidden_dim,
+                            "qkv",
                         )?;
-                        launch_matvec_preq8_1_residual_tile(
-                            &self.device, &st.kernels, &lw.wo,
-                            lw.q8_tile_wo.as_ref(),  lw.q4_tile_wo.as_ref(),
-                            lw.q8_split_wo.as_ref(), lw.q4_split_wo.as_ref(),
-                            q8_1_buf, &st.scratch.x_gpu, &mut st.scratch.attn_proj,
-                            hidden_dim, q_dim, "wo",
+                        // split-layout: prefer Q8Split/Q4Split sibling buffers on QKV when set.
+                        // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                        if has_qgate_fusion {
+                            launch_matvec_preq8_1_tile(
+                                &self.device,
+                                &st.kernels,
+                                &lw.wq,
+                                lw.q8_tile_wq.as_ref(),
+                                lw.q4_tile_wq.as_ref(),
+                                lw.q8_split_wq.as_ref(),
+                                lw.q4_split_wq.as_ref(),
+                                q8_1_buf,
+                                st.scratch.q_gate.as_mut().unwrap(),
+                                wq_out_dim,
+                                hidden_dim,
+                                "wq",
+                            )?;
+                        } else {
+                            launch_matvec_preq8_1_tile(
+                                &self.device,
+                                &st.kernels,
+                                &lw.wq,
+                                lw.q8_tile_wq.as_ref(),
+                                lw.q4_tile_wq.as_ref(),
+                                lw.q8_split_wq.as_ref(),
+                                lw.q4_split_wq.as_ref(),
+                                q8_1_buf,
+                                &mut st.scratch.q,
+                                q_dim,
+                                hidden_dim,
+                                "wq",
+                            )?;
+                        }
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wk,
+                            lw.q8_tile_wk.as_ref(),
+                            lw.q4_tile_wk.as_ref(),
+                            lw.q8_split_wk.as_ref(),
+                            lw.q4_split_wk.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.k,
+                            kv_dim,
+                            hidden_dim,
+                            "wk",
                         )?;
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wv,
+                            lw.q8_tile_wv.as_ref(),
+                            lw.q4_tile_wv.as_ref(),
+                            lw.q8_split_wv.as_ref(),
+                            lw.q4_split_wv.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.v,
+                            kv_dim,
+                            hidden_dim,
+                            "wv",
+                        )?;
+                    }
+                } else {
+                    // Non-preq path: separate rmsnorm + launch_matvec (with internal quantization).
+                    {
+                        let block_size = rmsnorm_block_size(hidden_dim);
+                        let shared_bytes = rmsnorm_shared_bytes(block_size);
+                        let launch_cfg = CudarcLaunchConfig {
+                            grid_dim: (1, 1, 1),
+                            block_dim: (block_size, 1, 1),
+                            shared_mem_bytes: shared_bytes,
+                        };
+                        let dim = hidden_dim as u32;
+                        unsafe {
+                            self.device
+                                .stream
+                                .launch_builder(&st.kernels.rmsnorm)
+                                .arg(&st.scratch.x_gpu)
+                                .arg(&lw.attn_norm)
+                                .arg(&mut st.scratch.normed)
+                                .arg(&eps)
+                                .arg(&dim)
+                                .launch(launch_cfg)
+                        }
+                        .map_err(|e| RuntimeError::Compute(format!("rmsnorm attn launch: {e}")))?;
+                    }
+                    unsafe {
+                        // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                        if has_qgate_fusion {
+                            launch_matvec(
+                                &self.device,
+                                &st.kernels,
+                                &lw.wq,
+                                &st.scratch.normed,
+                                st.scratch.q_gate.as_mut().unwrap(),
+                                wq_out_dim,
+                                hidden_dim,
+                                "wq",
+                                lw.wq_f16.as_ref(),
+                                Some(&mut st.scratch.input_f16),
+                                st.scratch.input_q8_1.as_mut(),
+                            )?;
+                        } else {
+                            launch_matvec(
+                                &self.device,
+                                &st.kernels,
+                                &lw.wq,
+                                &st.scratch.normed,
+                                &mut st.scratch.q,
+                                q_dim,
+                                hidden_dim,
+                                "wq",
+                                lw.wq_f16.as_ref(),
+                                Some(&mut st.scratch.input_f16),
+                                st.scratch.input_q8_1.as_mut(),
+                            )?;
+                        }
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wk,
+                            &st.scratch.normed,
+                            &mut st.scratch.k,
+                            kv_dim,
+                            hidden_dim,
+                            "wk",
+                            lw.wk_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wv,
+                            &st.scratch.normed,
+                            &mut st.scratch.v,
+                            kv_dim,
+                            hidden_dim,
+                            "wv",
+                            lw.wv_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
+                    }
+                }
+            }
+
+            // Q+gate fusion post-processing: deinterleave q_gate -> q + gate_buf,
+            // then per-head RMSNorm on Q (attn_q_norm) and K (attn_k_norm).
+            // Must run AFTER all QKV projection branches and BEFORE RoPE.
+            if has_qgate_fusion {
+                let q_gate_buf = st.scratch.q_gate.as_ref().unwrap();
+                let gate_buf = st.scratch.gate_buf.as_mut().unwrap();
+
+                // 1a. Deinterleave: q_gate [q_dim*2] -> q [q_dim] + gate_buf [q_dim]
+                if let Some(ref deinterleave_fn) = st.kernels.deinterleave_qgate {
+                    let block = 256u32;
+                    let grid = ((q_dim as u32) + block - 1) / block;
+                    let hd = head_dim as u32;
+                    let nh = num_heads as u32;
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(deinterleave_fn)
+                            .arg(q_gate_buf)
+                            .arg(&mut st.scratch.q)
+                            .arg(gate_buf)
+                            .arg(&hd)
+                            .arg(&nh)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("deinterleave_qgate launch: {e}"))
+                    })?;
+                } else {
+                    return Err(RuntimeError::Compute(
+                        "Q+gate fusion requires deinterleave_qgate kernel".into(),
+                    ));
+                }
+
+                // 1b. Per-head RMSNorm on Q using attn_q_norm [head_dim]
+                if let Some(ref q_norm_w) = lw.attn_q_norm {
+                    let norm_fn =
+                        st.kernels
+                            .rmsnorm_per_head_inplace
+                            .as_ref()
+                            .ok_or_else(|| {
+                                RuntimeError::Compute(
+                                    "Q+gate fusion requires rmsnorm_per_head_inplace kernel".into(),
+                                )
+                            })?;
+                    let hd = head_dim as u32;
+                    let nh = num_heads as u32;
+                    let block = (head_dim as u32).min(1024).max(32);
+                    let block = (block / 32) * 32; // Round down to warp multiple
+                    let shared_bytes = (block / 32) * 4; // One float per warp
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (nh, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: shared_bytes,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(norm_fn)
+                            .arg(&mut st.scratch.q)
+                            .arg(q_norm_w)
+                            .arg(&nh)
+                            .arg(&hd)
+                            .arg(&eps)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("rmsnorm_per_head Q launch: {e}"))
+                    })?;
+                }
+
+                // 1c. Per-head RMSNorm on K using attn_k_norm [head_dim]
+                if let Some(ref k_norm_w) = lw.attn_k_norm {
+                    let norm_fn =
+                        st.kernels
+                            .rmsnorm_per_head_inplace
+                            .as_ref()
+                            .ok_or_else(|| {
+                                RuntimeError::Compute(
+                                    "Q+gate fusion requires rmsnorm_per_head_inplace kernel".into(),
+                                )
+                            })?;
+                    let hd = head_dim as u32;
+                    let nkvh = num_kv_heads as u32;
+                    let block = (head_dim as u32).min(1024).max(32);
+                    let block = (block / 32) * 32;
+                    let shared_bytes = (block / 32) * 4;
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (nkvh, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: shared_bytes,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(norm_fn)
+                            .arg(&mut st.scratch.k)
+                            .arg(k_norm_w)
+                            .arg(&nkvh)
+                            .arg(&hd)
+                            .arg(&eps)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("rmsnorm_per_head K launch: {e}"))
+                    })?;
+                }
+            }
+
+            // QKV bias (Qwen2-family, decode).
+            if lw.bq.is_some() || lw.bk.is_some() || lw.bv.is_some() {
+                let block = 256u32;
+                unsafe {
+                    if let Some(ref bq) = lw.bq {
+                        let d = q_dim as u32;
+                        let g = (d + block - 1) / block;
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.bias_add)
+                            .arg(&mut st.scratch.q)
+                            .arg(bq)
+                            .arg(&d)
+                            .launch(CudarcLaunchConfig {
+                                grid_dim: (g, 1, 1),
+                                block_dim: (block, 1, 1),
+                                shared_mem_bytes: 0,
+                            })
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!("bias_add bq decode: {e}"))
+                            })?;
+                    }
+                    if let Some(ref bk) = lw.bk {
+                        let d = kv_dim as u32;
+                        let g = (d + block - 1) / block;
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.bias_add)
+                            .arg(&mut st.scratch.k)
+                            .arg(bk)
+                            .arg(&d)
+                            .launch(CudarcLaunchConfig {
+                                grid_dim: (g, 1, 1),
+                                block_dim: (block, 1, 1),
+                                shared_mem_bytes: 0,
+                            })
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!("bias_add bk decode: {e}"))
+                            })?;
+                    }
+                    if let Some(ref bv) = lw.bv {
+                        let d = kv_dim as u32;
+                        let g = (d + block - 1) / block;
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.bias_add)
+                            .arg(&mut st.scratch.v)
+                            .arg(bv)
+                            .arg(&d)
+                            .launch(CudarcLaunchConfig {
+                                grid_dim: (g, 1, 1),
+                                block_dim: (block, 1, 1),
+                                shared_mem_bytes: 0,
+                            })
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!("bias_add bv decode: {e}"))
+                            })?;
+                    }
+                }
+            }
+
+            // 2. RoPE.
+            {
+                let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
+                let actual_rot = if rotary_dim > 0 && rotary_dim < head_dim as u32 {
+                    rotary_dim as usize
+                } else {
+                    head_dim
+                };
+                let half_rot = actual_rot / 2;
+                let total_q_pairs = num_heads * half_rot;
+                let total_k_pairs = num_kv_heads * half_rot;
+                let max_pairs = total_q_pairs.max(total_k_pairs);
+                let config = LaunchConfig::for_elements(max_pairs);
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (config.grid_dim, 1, 1),
+                    block_dim: (config.block_dim, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let pos = seq_pos as u32;
+                let nqh = num_heads as u32;
+                let nkvh = num_kv_heads as u32;
+                let hd = head_dim as u32;
+                // NeoX RoPE: models with partial rotary_dim (e.g. Qwen3.5) use half-offset
+                // dimension pairing instead of standard interleaved pairing.
+                let rope_neox = hp.rope_neox;
+                let rope_fn = if rope_neox {
+                    &st.kernels.rope_apply_neox
+                } else {
+                    &st.kernels.rope_apply
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(rope_fn)
+                        .arg(&mut st.scratch.q)
+                        .arg(&mut st.scratch.k)
+                        .arg(&pos)
+                        .arg(&nqh)
+                        .arg(&nkvh)
+                        .arg(&hd)
+                        .arg(&theta)
+                        .arg(&rotary_dim)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!("rope launch: {e}")))?;
+            }
+
+            // 3. KV cache write.
+            {
+                let kv_cache = st.kv_caches.get_mut(layer_idx).ok_or_else(|| {
+                    RuntimeError::Compute(format!("no KV cache for layer {layer_idx}"))
+                })?;
+                kv_cache.append_kv(&self.device, &st.scratch.k, &st.scratch.v)?;
+            }
+
+            // 4. Attention. gate: routes to the tiled streaming-softmax
+            // kernel at long context (seq_len > LUMEN_CUDA_DECODE_TILED_THRESHOLD,
+            // default 0 = "tiled-always") or when LUMEN_CUDA_DECODE_TILED=1
+            // forces it. Operators can set `LUMEN_CUDA_DECODE_TILED_THRESHOLD=
+            // 4294967295` to opt out (force single-block below the 40_950 ceiling).
+            {
+                let kv_cache = &st.kv_caches[layer_idx];
+                let attn_seq_len = kv_cache.seq_len() as u32;
+                let nh = num_heads as u32;
+                let nkvh = num_kv_heads as u32;
+                let hd = head_dim as u32;
+                let msl = kv_cache.max_seq_len as u32;
+                let scale = 1.0f32 / (head_dim as f32).sqrt();
+                unsafe {
+                    super::prefill::launch_attention_decode_gated(
+                        &self.device,
+                        &st.kernels,
+                        &st.scratch.q,
+                        &kv_cache.k_cache,
+                        &kv_cache.v_cache,
+                        &mut st.scratch.attn_out,
+                        nh,
+                        nkvh,
+                        hd,
+                        attn_seq_len,
+                        msl,
+                        scale,
+                    )
+                }
+                .map_err(|e| RuntimeError::Compute(format!("attention_decode launch: {e}")))?;
+            }
+
+            // 4b. Q+gate sigmoid gating: attn_out = sigmoid(gate_buf) * attn_out.
+            // Applied AFTER attention, BEFORE output projection.
+            //
+            // FIX-3: write through `st.scratch.q` (already sized [q_dim] and
+            // unused after attention) and then memcpy back to attn_out. Previously
+            // the temp was `normed` which is sized `[hidden_dim]`; this overflowed
+            // for Qwen3.5-MoE-35B-A3B where `q_dim=4096 > hidden_dim=2048`,
+            // corrupting adjacent GPU memory and producing gibberish output.
+            if has_qgate_fusion {
+                if let Some(ref sigmoid_fn) = st.kernels.sigmoid_mul {
+                    let gate_buf = st.scratch.gate_buf.as_ref().unwrap();
+                    let n = q_dim as u32;
+                    let block = 256u32;
+                    let grid = (n + block - 1) / block;
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    // Step 1: sigmoid(gate) * attn_out -> q (temp, sized [q_dim]).
+                    // st.scratch.q is consumed by attention_decode_gated above; safe to reuse.
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(sigmoid_fn)
+                            .arg(gate_buf)
+                            .arg(&st.scratch.attn_out)
+                            .arg(&mut st.scratch.q)
+                            .arg(&n)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| RuntimeError::Compute(format!("sigmoid_mul launch: {e}")))?;
+                    // Step 2: copy q -> attn_out (both [q_dim])
+                    self.device
+                        .stream
+                        .memcpy_dtod(&st.scratch.q, &mut st.scratch.attn_out)
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("sigmoid_mul dtod copy: {e}"))
+                        })?;
+                } else {
+                    return Err(RuntimeError::Compute(
+                        "Q+gate fusion requires sigmoid_mul kernel".into(),
+                    ));
+                }
+            }
+
+            // 5. Output projection + residual: attn_proj = wo * attn_out + x_gpu.
+            if let GpuWeightBuf::F16Raw(ref wo_f16) = lw.wo {
+                unsafe {
+                    launch_hgemv_f16_residual(
+                        &self.device,
+                        &st.kernels,
+                        wo_f16,
+                        &st.scratch.attn_out,
+                        &st.scratch.x_gpu,
+                        &mut st.scratch.attn_proj,
+                        &mut st.scratch.input_f16,
+                        hidden_dim,
+                        q_dim,
+                        "wo",
+                        st.algo_cache.get(hidden_dim, q_dim),
+                    )?;
+                }
+            } else if matches!(&lw.wo, GpuWeightBuf::F32(_)) && lw.wo_f16.is_some() {
+                // cuBLAS HGEMV fast path for F32 weights with pre-dequanted F16 caches.
+                // Q8/Q4 weights fall through to launch_matvec_residual() for native dp4a.
+                let wo_f16 = lw.wo_f16.as_ref().unwrap();
+                unsafe {
+                    launch_hgemv_f16_residual(
+                        &self.device,
+                        &st.kernels,
+                        wo_f16,
+                        &st.scratch.attn_out,
+                        &st.scratch.x_gpu,
+                        &mut st.scratch.attn_proj,
+                        &mut st.scratch.input_f16,
+                        hidden_dim,
+                        q_dim,
+                        "wo",
+                        st.algo_cache.get(hidden_dim, q_dim),
+                    )?;
+                }
+            } else {
+                // split-layout: when a Q8/Q4 split sibling is available for wo, route
+                // through `launch_matvec_residual_split` -- requires quantizing the
+                // attention output to Q8_1 inline. Otherwise fall through to the
+                // existing `launch_matvec_residual` path.
+                let use_split_wo = (st.kernels.use_q8_split_dispatch && lw.q8_split_wo.is_some())
+                    || (st.kernels.use_q4_split_dispatch && lw.q4_split_wo.is_some());
+                if use_split_wo {
+                    // Quantize attention output to Q8_1 in scratch, then split residual matvec.
+                    let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref();
+                    let q8_1_scratch = st.scratch.input_q8_1.as_mut();
+                    if let (Some(quant_fn), Some(q8_1_buf)) = (quant_fn, q8_1_scratch) {
+                        unsafe {
+                            launch_quantize_input_q8_1(
+                                &self.device,
+                                quant_fn,
+                                &st.scratch.attn_out,
+                                q8_1_buf,
+                                q_dim,
+                                "wo split",
+                            )?;
+                            launch_matvec_preq8_1_residual_tile(
+                                &self.device,
+                                &st.kernels,
+                                &lw.wo,
+                                lw.q8_tile_wo.as_ref(),
+                                lw.q4_tile_wo.as_ref(),
+                                lw.q8_split_wo.as_ref(),
+                                lw.q4_split_wo.as_ref(),
+                                q8_1_buf,
+                                &st.scratch.x_gpu,
+                                &mut st.scratch.attn_proj,
+                                hidden_dim,
+                                q_dim,
+                                "wo",
+                            )?;
+                        }
+                    } else {
+                        unsafe {
+                            launch_matvec_residual(
+                                &self.device,
+                                &st.kernels,
+                                &lw.wo,
+                                &st.scratch.attn_out,
+                                &st.scratch.x_gpu,
+                                &mut st.scratch.attn_proj,
+                                hidden_dim,
+                                q_dim,
+                                "wo",
+                                lw.wo_f16.as_ref(),
+                                Some(&mut st.scratch.input_f16),
+                                st.scratch.input_q8_1.as_mut(),
+                            )?;
+                        }
                     }
                 } else {
                     unsafe {
                         launch_matvec_residual(
-                            &self.device, &st.kernels, &lw.wo,
-                            &st.scratch.attn_out, &st.scratch.x_gpu,
-                            &mut st.scratch.attn_proj, hidden_dim, q_dim, "wo",
+                            &self.device,
+                            &st.kernels,
+                            &lw.wo,
+                            &st.scratch.attn_out,
+                            &st.scratch.x_gpu,
+                            &mut st.scratch.attn_proj,
+                            hidden_dim,
+                            q_dim,
+                            "wo",
                             lw.wo_f16.as_ref(),
                             Some(&mut st.scratch.input_f16),
                             st.scratch.input_q8_1.as_mut(),
                         )?;
                     }
                 }
-            } else {
-                unsafe {
-                    launch_matvec_residual(
-                        &self.device,
-                        &st.kernels,
-                        &lw.wo,
-                        &st.scratch.attn_out,
-                        &st.scratch.x_gpu,
-                        &mut st.scratch.attn_proj,
-                        hidden_dim,
-                        q_dim,
-                        "wo",
-                        lw.wo_f16.as_ref(),
-                        Some(&mut st.scratch.input_f16),
-                    st.scratch.input_q8_1.as_mut(),
-                    )?;
-                }
             }
-        }
         } // end else (standard attention path — skipped for GDN layers)
 
         // Re-borrow layer weights for the FFN block (shared between standard and GDN layers).
@@ -2901,7 +3129,11 @@ impl CudaBackend {
                 ))
             })?;
             let num_experts = moe_meta.expert_gate_offs.len();
-            let top_k = self.hp()?.num_active_experts.map(|v| v as usize).unwrap_or(0);
+            let top_k = self
+                .hp()?
+                .num_active_experts
+                .map(|v| v as usize)
+                .unwrap_or(0);
             if top_k == 0 {
                 return Err(RuntimeError::Compute(
                     "MoE layer present but hyperparams.num_active_experts not set".into(),
@@ -2912,7 +3144,9 @@ impl CudaBackend {
             if {
                 use std::sync::OnceLock;
                 static FLAG: OnceLock<bool> = OnceLock::new();
-                *FLAG.get_or_init(|| std::env::var("LUMEN_CUDA_MOE_DEBUG_DUMP").as_deref() == Ok("1"))
+                *FLAG.get_or_init(|| {
+                    std::env::var("LUMEN_CUDA_MOE_DEBUG_DUMP").as_deref() == Ok("1")
+                })
             } {
                 use std::sync::atomic::{AtomicUsize, Ordering};
                 static PRE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -2922,14 +3156,30 @@ impl CudaBackend {
                     let ap_host = self.device.dtoh_copy(&st.scratch.attn_proj)?;
                     let ffn_host = self.device.dtoh_copy(&lw.ffn_norm)?;
                     let attn_norm_host = self.device.dtoh_copy(&lw.attn_norm)?;
-                    let mut xg_max = 0.0f32; let mut xg_sum = 0.0f64;
-                    for v in &xg_host { xg_max = xg_max.max(v.abs()); xg_sum += v.abs() as f64; }
-                    let mut ap_max = 0.0f32; let mut ap_sum = 0.0f64;
-                    for v in &ap_host { ap_max = ap_max.max(v.abs()); ap_sum += v.abs() as f64; }
-                    let mut fn_max = 0.0f32; let mut fn_sum = 0.0f64;
-                    for v in &ffn_host { fn_max = fn_max.max(v.abs()); fn_sum += v.abs() as f64; }
-                    let mut an_max = 0.0f32; let mut an_sum = 0.0f64;
-                    for v in &attn_norm_host { an_max = an_max.max(v.abs()); an_sum += v.abs() as f64; }
+                    let mut xg_max = 0.0f32;
+                    let mut xg_sum = 0.0f64;
+                    for v in &xg_host {
+                        xg_max = xg_max.max(v.abs());
+                        xg_sum += v.abs() as f64;
+                    }
+                    let mut ap_max = 0.0f32;
+                    let mut ap_sum = 0.0f64;
+                    for v in &ap_host {
+                        ap_max = ap_max.max(v.abs());
+                        ap_sum += v.abs() as f64;
+                    }
+                    let mut fn_max = 0.0f32;
+                    let mut fn_sum = 0.0f64;
+                    for v in &ffn_host {
+                        fn_max = fn_max.max(v.abs());
+                        fn_sum += v.abs() as f64;
+                    }
+                    let mut an_max = 0.0f32;
+                    let mut an_sum = 0.0f64;
+                    for v in &attn_norm_host {
+                        an_max = an_max.max(v.abs());
+                        an_sum += v.abs() as f64;
+                    }
                     eprintln!(
                         "[MoE-PRE] call={n} layer={layer_idx} | x_gpu_pre: max={xg_max:.3} mean={:.4} first5={:?} | attn_proj_pre: max={ap_max:.3} mean={:.3} | attn_norm: max={an_max:.3} mean={:.3} | ffn_norm: max={fn_max:.3} mean={:.3} first5={:?}",
                         xg_sum / hidden_dim as f64,
@@ -2953,7 +3203,8 @@ impl CudaBackend {
                 .and_then(|b| b.as_ref());
             let moe_scratch = st.moe_scratch.as_mut().ok_or_else(|| {
                 RuntimeError::Compute(
-                    "MoE layer dispatch requires moe_scratch (allocated in init for MoE models)".into(),
+                    "MoE layer dispatch requires moe_scratch (allocated in init for MoE models)"
+                        .into(),
                 )
             })?;
 
@@ -3040,7 +3291,9 @@ impl CudaBackend {
             if {
                 use std::sync::OnceLock;
                 static FLAG: OnceLock<bool> = OnceLock::new();
-                *FLAG.get_or_init(|| std::env::var("LUMEN_CUDA_MOE_DEBUG_DUMP").as_deref() == Ok("1"))
+                *FLAG.get_or_init(|| {
+                    std::env::var("LUMEN_CUDA_MOE_DEBUG_DUMP").as_deref() == Ok("1")
+                })
             } {
                 use std::sync::atomic::{AtomicUsize, Ordering};
                 static COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -3049,12 +3302,28 @@ impl CudaBackend {
                     let x_host = self.device.dtoh_copy(&st.scratch.x_gpu)?;
                     let ap_host = self.device.dtoh_copy(&st.scratch.attn_proj)?;
                     let normed_host = self.device.dtoh_copy(&st.scratch.normed)?;
-                    let mut x_max = 0.0f32; let mut x_sum = 0.0f64; let mut x_nan = 0;
-                    for v in &x_host { x_max = x_max.max(v.abs()); x_sum += v.abs() as f64; if !v.is_finite() { x_nan += 1; } }
-                    let mut ap_max = 0.0f32; let mut ap_sum = 0.0f64;
-                    for v in &ap_host { ap_max = ap_max.max(v.abs()); ap_sum += v.abs() as f64; }
-                    let mut n_max = 0.0f32; let mut n_sum = 0.0f64;
-                    for v in &normed_host { n_max = n_max.max(v.abs()); n_sum += v.abs() as f64; }
+                    let mut x_max = 0.0f32;
+                    let mut x_sum = 0.0f64;
+                    let mut x_nan = 0;
+                    for v in &x_host {
+                        x_max = x_max.max(v.abs());
+                        x_sum += v.abs() as f64;
+                        if !v.is_finite() {
+                            x_nan += 1;
+                        }
+                    }
+                    let mut ap_max = 0.0f32;
+                    let mut ap_sum = 0.0f64;
+                    for v in &ap_host {
+                        ap_max = ap_max.max(v.abs());
+                        ap_sum += v.abs() as f64;
+                    }
+                    let mut n_max = 0.0f32;
+                    let mut n_sum = 0.0f64;
+                    for v in &normed_host {
+                        n_max = n_max.max(v.abs());
+                        n_sum += v.abs() as f64;
+                    }
                     eprintln!(
                         "[MoE-DEBUG] call={n} layer={layer_idx} hidden={hidden_dim} | normed: max={n_max:.3} mean={:.3} | attn_proj: max={ap_max:.3} mean={:.3} | x_gpu: max={x_max:.3} mean={:.3} nans={x_nan} | first_5={:?}",
                         n_sum / hidden_dim as f64, ap_sum / hidden_dim as f64, x_sum / hidden_dim as f64,
@@ -3077,7 +3346,8 @@ impl CudaBackend {
                 let k = 16usize;
                 eprintln!(
                     "[PROBE] mode=D pos={seq_pos} layer={layer_idx} attn16={:?} x16={:?}",
-                    &ah[..k.min(ah.len())], &xh[..k.min(xh.len())]
+                    &ah[..k.min(ah.len())],
+                    &xh[..k.min(xh.len())]
                 );
                 // [CHK] mode=D whole-buffer sumsq (layout-independent) of this
                 // decode token's post-layer residual (x = l_out) and attention
@@ -3086,10 +3356,15 @@ impl CudaBackend {
                 // per-layer to localize the prefill-vs-decode divergence that
                 // flips the near-tie. hidden_dim-sized slices.
                 let sumsq = |v: &[f32], n: usize| -> (f64, f64, f32) {
-                    let mut s = 0f64; let mut sq = 0f64; let mut mx = 0f32;
+                    let mut s = 0f64;
+                    let mut sq = 0f64;
+                    let mut mx = 0f32;
                     for &e in &v[..n.min(v.len())] {
-                        s += e as f64; sq += (e as f64) * (e as f64);
-                        if e.abs() > mx { mx = e.abs(); }
+                        s += e as f64;
+                        sq += (e as f64) * (e as f64);
+                        if e.abs() > mx {
+                            mx = e.abs();
+                        }
                     }
                     (s, sq, mx)
                 };
@@ -3103,9 +3378,7 @@ impl CudaBackend {
                 // Routing probe: selected expert IDs + gate weights for this token.
                 let ids = self.device.dtoh_copy(&moe_scratch.expert_ids)?;
                 let ws = self.device.dtoh_copy(&moe_scratch.expert_weights)?;
-                eprintln!(
-                    "[PROBE-RT] mode=D pos={seq_pos} layer={layer_idx} ids={ids:?} w={ws:?}"
-                );
+                eprintln!("[PROBE-RT] mode=D pos={seq_pos} layer={layer_idx} ids={ids:?} w={ws:?}");
                 // [MOE-SUMSQ] mode=D decode expert-combine sumsq (= Σ_k gw[k]*eo[k]),
                 // matching the prefill [MOE-SUMSQ] and llama ffn_moe_out, so the
                 // expert-combine reduction can be ruled in/out as the flip site.
@@ -3120,7 +3393,9 @@ impl CudaBackend {
                     let mut acc = 0f64;
                     for kk in 0..tk {
                         let idx = kk * hidden_dim + i;
-                        if idx < eo.len() { acc += (ws[kk] as f64) * (eo[idx] as f64); }
+                        if idx < eo.len() {
+                            acc += (ws[kk] as f64) * (eo[idx] as f64);
+                        }
                     }
                     ffn_moe_out_sumsq += acc * acc;
                 }
@@ -3148,14 +3423,17 @@ impl CudaBackend {
                 let rl = self.device.dtoh_copy(&moe_scratch.router_logits)?;
                 let rlsq: f64 = rl.iter().map(|&e| (e as f64) * (e as f64)).sum();
                 let mut rlmx = 0f32;
-                for &e in &rl { let a = e.abs(); if a > rlmx { rlmx = a; } }
+                for &e in &rl {
+                    let a = e.abs();
+                    if a > rlmx {
+                        rlmx = a;
+                    }
+                }
                 let step = st.decode_token_count;
                 eprintln!(
                     "[XCHK] step={step} L={layer_idx} router_logits sumsq={rlsq:.6} absmax={rlmx:.6}"
                 );
-                eprintln!(
-                    "[XCHK] step={step} L={layer_idx} moe_expert_ids={ids:?} gate_w={ws:?}"
-                );
+                eprintln!("[XCHK] step={step} L={layer_idx} moe_expert_ids={ids:?} gate_w={ws:?}");
             }
 
             // MoE branch is complete; skip the dense FFN block below.
@@ -3204,14 +3482,20 @@ impl CudaBackend {
                 (&lw.w_gate, &lw.w_up)
             {
                 // F32 shmem variant: hidden_dim * 4 <= 48KB.
-                if let Some(ref fused_fn) = st.kernels.fused_glu_gemv_q8_0.as_ref()
+                if let Some(ref fused_fn) = st
+                    .kernels
+                    .fused_glu_gemv_q8_0
+                    .as_ref()
                     .filter(|_| shmem_f32 <= FUSED_GLU_SHMEM_LIMIT)
                 {
                     unsafe {
                         launch_compute_rms_scale(
-                            &self.device, &st.kernels,
-                            &st.scratch.attn_proj, &mut st.scratch.rms_scale,
-                            eps, hidden_dim,
+                            &self.device,
+                            &st.kernels,
+                            &st.scratch.attn_proj,
+                            &mut st.scratch.rms_scale,
+                            eps,
+                            hidden_dim,
                         )?;
                         let inter_u32 = inter_dim as u32;
                         let hd_u32 = hidden_dim as u32;
@@ -3221,7 +3505,8 @@ impl CudaBackend {
                             block_dim: (FUSED_GLU_BLOCK_DIM, 1, 1),
                             shared_mem_bytes: shmem_f32,
                         };
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(fused_fn)
                             .arg(wg_q8)
                             .arg(wu_q8)
@@ -3232,21 +3517,29 @@ impl CudaBackend {
                             .arg(&inter_u32)
                             .arg(&hd_u32)
                             .launch(launch_cfg)
-                            .map_err(|e| RuntimeError::Compute(format!(
-                                "fused_glu_gemv_q8_0 L{layer_idx}: {e}",
-                            )))?;
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!(
+                                    "fused_glu_gemv_q8_0 L{layer_idx}: {e}",
+                                ))
+                            })?;
                     }
                     break 'fused_glu true;
                 }
                 // F16 shmem variant: hidden_dim * 2 <= 48KB (large dims).
-                if let Some(ref fused_fn) = st.kernels.fused_glu_gemv_q8_0_hg.as_ref()
+                if let Some(ref fused_fn) = st
+                    .kernels
+                    .fused_glu_gemv_q8_0_hg
+                    .as_ref()
                     .filter(|_| shmem_f16 <= FUSED_GLU_SHMEM_LIMIT)
                 {
                     unsafe {
                         launch_compute_rms_scale(
-                            &self.device, &st.kernels,
-                            &st.scratch.attn_proj, &mut st.scratch.rms_scale,
-                            eps, hidden_dim,
+                            &self.device,
+                            &st.kernels,
+                            &st.scratch.attn_proj,
+                            &mut st.scratch.rms_scale,
+                            eps,
+                            hidden_dim,
                         )?;
                         let inter_u32 = inter_dim as u32;
                         let hd_u32 = hidden_dim as u32;
@@ -3256,7 +3549,8 @@ impl CudaBackend {
                             block_dim: (FUSED_GLU_BLOCK_DIM, 1, 1),
                             shared_mem_bytes: shmem_f16,
                         };
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(fused_fn)
                             .arg(wg_q8)
                             .arg(wu_q8)
@@ -3267,9 +3561,11 @@ impl CudaBackend {
                             .arg(&inter_u32)
                             .arg(&hd_u32)
                             .launch(launch_cfg)
-                            .map_err(|e| RuntimeError::Compute(format!(
-                                "fused_glu_gemv_q8_0_hg L{layer_idx}: {e}",
-                            )))?;
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!(
+                                    "fused_glu_gemv_q8_0_hg L{layer_idx}: {e}",
+                                ))
+                            })?;
                     }
                     break 'fused_glu true;
                 }
@@ -3283,14 +3579,20 @@ impl CudaBackend {
                 (&lw.w_gate, &lw.w_up)
             {
                 // F32 shmem variant: hidden_dim * 4 <= 48KB.
-                if let Some(ref fused_fn) = st.kernels.fused_glu_gemv_q8_aligned.as_ref()
+                if let Some(ref fused_fn) = st
+                    .kernels
+                    .fused_glu_gemv_q8_aligned
+                    .as_ref()
                     .filter(|_| shmem_f32 <= FUSED_GLU_SHMEM_LIMIT)
                 {
                     unsafe {
                         launch_compute_rms_scale(
-                            &self.device, &st.kernels,
-                            &st.scratch.attn_proj, &mut st.scratch.rms_scale,
-                            eps, hidden_dim,
+                            &self.device,
+                            &st.kernels,
+                            &st.scratch.attn_proj,
+                            &mut st.scratch.rms_scale,
+                            eps,
+                            hidden_dim,
                         )?;
                         let inter_u32 = inter_dim as u32;
                         let hd_u32 = hidden_dim as u32;
@@ -3300,7 +3602,8 @@ impl CudaBackend {
                             block_dim: (FUSED_GLU_BLOCK_DIM, 1, 1),
                             shared_mem_bytes: shmem_f32,
                         };
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(fused_fn)
                             .arg(wg_q8a)
                             .arg(wu_q8a)
@@ -3311,21 +3614,29 @@ impl CudaBackend {
                             .arg(&inter_u32)
                             .arg(&hd_u32)
                             .launch(launch_cfg)
-                            .map_err(|e| RuntimeError::Compute(format!(
-                                "fused_glu_gemv_q8_aligned L{layer_idx}: {e}",
-                            )))?;
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!(
+                                    "fused_glu_gemv_q8_aligned L{layer_idx}: {e}",
+                                ))
+                            })?;
                     }
                     break 'fused_glu true;
                 }
                 // F16 shmem variant: hidden_dim * 2 <= 48KB (large dims).
-                if let Some(ref fused_fn) = st.kernels.fused_glu_gemv_q8_aligned_hg.as_ref()
+                if let Some(ref fused_fn) = st
+                    .kernels
+                    .fused_glu_gemv_q8_aligned_hg
+                    .as_ref()
                     .filter(|_| shmem_f16 <= FUSED_GLU_SHMEM_LIMIT)
                 {
                     unsafe {
                         launch_compute_rms_scale(
-                            &self.device, &st.kernels,
-                            &st.scratch.attn_proj, &mut st.scratch.rms_scale,
-                            eps, hidden_dim,
+                            &self.device,
+                            &st.kernels,
+                            &st.scratch.attn_proj,
+                            &mut st.scratch.rms_scale,
+                            eps,
+                            hidden_dim,
                         )?;
                         let inter_u32 = inter_dim as u32;
                         let hd_u32 = hidden_dim as u32;
@@ -3335,7 +3646,8 @@ impl CudaBackend {
                             block_dim: (FUSED_GLU_BLOCK_DIM, 1, 1),
                             shared_mem_bytes: shmem_f16,
                         };
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(fused_fn)
                             .arg(wg_q8a)
                             .arg(wu_q8a)
@@ -3346,9 +3658,11 @@ impl CudaBackend {
                             .arg(&inter_u32)
                             .arg(&hd_u32)
                             .launch(launch_cfg)
-                            .map_err(|e| RuntimeError::Compute(format!(
-                                "fused_glu_gemv_q8_aligned_hg L{layer_idx}: {e}",
-                            )))?;
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!(
+                                    "fused_glu_gemv_q8_aligned_hg L{layer_idx}: {e}",
+                                ))
+                            })?;
                     }
                     break 'fused_glu true;
                 }
@@ -3358,14 +3672,20 @@ impl CudaBackend {
             if let (GpuWeightBuf::Q4Raw(ref wg_q4), GpuWeightBuf::Q4Raw(ref wu_q4)) =
                 (&lw.w_gate, &lw.w_up)
             {
-                if let Some(ref fused_fn) = st.kernels.fused_glu_gemv_q4_0.as_ref()
+                if let Some(ref fused_fn) = st
+                    .kernels
+                    .fused_glu_gemv_q4_0
+                    .as_ref()
                     .filter(|_| shmem_f32 <= FUSED_GLU_SHMEM_LIMIT)
                 {
                     unsafe {
                         launch_compute_rms_scale(
-                            &self.device, &st.kernels,
-                            &st.scratch.attn_proj, &mut st.scratch.rms_scale,
-                            eps, hidden_dim,
+                            &self.device,
+                            &st.kernels,
+                            &st.scratch.attn_proj,
+                            &mut st.scratch.rms_scale,
+                            eps,
+                            hidden_dim,
                         )?;
                         let inter_u32 = inter_dim as u32;
                         let hd_u32 = hidden_dim as u32;
@@ -3375,7 +3695,8 @@ impl CudaBackend {
                             block_dim: (FUSED_GLU_BLOCK_DIM, 1, 1),
                             shared_mem_bytes: shmem_f32,
                         };
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(fused_fn)
                             .arg(wg_q4)
                             .arg(wu_q4)
@@ -3386,20 +3707,28 @@ impl CudaBackend {
                             .arg(&inter_u32)
                             .arg(&hd_u32)
                             .launch(launch_cfg)
-                            .map_err(|e| RuntimeError::Compute(format!(
-                                "fused_glu_gemv_q4_0 L{layer_idx}: {e}",
-                            )))?;
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!(
+                                    "fused_glu_gemv_q4_0 L{layer_idx}: {e}",
+                                ))
+                            })?;
                     }
                     break 'fused_glu true;
                 }
-                if let Some(ref fused_fn) = st.kernels.fused_glu_gemv_q4_0_hg.as_ref()
+                if let Some(ref fused_fn) = st
+                    .kernels
+                    .fused_glu_gemv_q4_0_hg
+                    .as_ref()
                     .filter(|_| shmem_f16 <= FUSED_GLU_SHMEM_LIMIT)
                 {
                     unsafe {
                         launch_compute_rms_scale(
-                            &self.device, &st.kernels,
-                            &st.scratch.attn_proj, &mut st.scratch.rms_scale,
-                            eps, hidden_dim,
+                            &self.device,
+                            &st.kernels,
+                            &st.scratch.attn_proj,
+                            &mut st.scratch.rms_scale,
+                            eps,
+                            hidden_dim,
                         )?;
                         let inter_u32 = inter_dim as u32;
                         let hd_u32 = hidden_dim as u32;
@@ -3409,7 +3738,8 @@ impl CudaBackend {
                             block_dim: (FUSED_GLU_BLOCK_DIM, 1, 1),
                             shared_mem_bytes: shmem_f16,
                         };
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(fused_fn)
                             .arg(wg_q4)
                             .arg(wu_q4)
@@ -3420,9 +3750,11 @@ impl CudaBackend {
                             .arg(&inter_u32)
                             .arg(&hd_u32)
                             .launch(launch_cfg)
-                            .map_err(|e| RuntimeError::Compute(format!(
-                                "fused_glu_gemv_q4_0_hg L{layer_idx}: {e}",
-                            )))?;
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!(
+                                    "fused_glu_gemv_q4_0_hg L{layer_idx}: {e}",
+                                ))
+                            })?;
                     }
                     break 'fused_glu true;
                 }
@@ -3432,14 +3764,20 @@ impl CudaBackend {
             if let (GpuWeightBuf::F16Raw(ref wg_f16), GpuWeightBuf::F16Raw(ref wu_f16)) =
                 (&lw.w_gate, &lw.w_up)
             {
-                if let Some(ref fused_fn) = st.kernels.fused_glu_gemv_f16.as_ref()
+                if let Some(ref fused_fn) = st
+                    .kernels
+                    .fused_glu_gemv_f16
+                    .as_ref()
                     .filter(|_| shmem_f32 <= FUSED_GLU_SHMEM_LIMIT)
                 {
                     unsafe {
                         launch_compute_rms_scale(
-                            &self.device, &st.kernels,
-                            &st.scratch.attn_proj, &mut st.scratch.rms_scale,
-                            eps, hidden_dim,
+                            &self.device,
+                            &st.kernels,
+                            &st.scratch.attn_proj,
+                            &mut st.scratch.rms_scale,
+                            eps,
+                            hidden_dim,
                         )?;
                         let inter_u32 = inter_dim as u32;
                         let hd_u32 = hidden_dim as u32;
@@ -3450,7 +3788,8 @@ impl CudaBackend {
                             shared_mem_bytes: shmem_f32,
                         };
                         // F16 weights passed as u8 slices, cast to unsigned short* in kernel.
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(fused_fn)
                             .arg(wg_f16)
                             .arg(wu_f16)
@@ -3461,9 +3800,11 @@ impl CudaBackend {
                             .arg(&inter_u32)
                             .arg(&hd_u32)
                             .launch(launch_cfg)
-                            .map_err(|e| RuntimeError::Compute(format!(
-                                "fused_glu_gemv_f16 L{layer_idx}: {e}",
-                            )))?;
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!(
+                                    "fused_glu_gemv_f16 L{layer_idx}: {e}",
+                                ))
+                            })?;
                     }
                     break 'fused_glu true;
                 }
@@ -3475,172 +3816,172 @@ impl CudaBackend {
 
         // If fused kernel did NOT fire, use existing separate gate+up dispatch.
         if !fused_glu_fired {
-        if matches!(&lw.w_gate, GpuWeightBuf::F32(_))
-            && matches!(&lw.w_up, GpuWeightBuf::F32(_))
-        {
-            unsafe {
-                launch_compute_rms_scale(
-                    &self.device,
-                    &st.kernels,
-                    &st.scratch.attn_proj,
-                    &mut st.scratch.rms_scale,
-                    eps,
-                    hidden_dim,
-                )?;
-            }
-            if let (GpuWeightBuf::F32(ref wg_f32), GpuWeightBuf::F32(ref wu_f32)) =
-                (&lw.w_gate, &lw.w_up)
+            if matches!(&lw.w_gate, GpuWeightBuf::F32(_))
+                && matches!(&lw.w_up, GpuWeightBuf::F32(_))
             {
                 unsafe {
-                    launch_fused_norm_dual_matvec_f32(
+                    launch_compute_rms_scale(
                         &self.device,
                         &st.kernels,
                         &st.scratch.attn_proj,
-                        &st.scratch.rms_scale,
+                        &mut st.scratch.rms_scale,
+                        eps,
+                        hidden_dim,
+                    )?;
+                }
+                if let (GpuWeightBuf::F32(ref wg_f32), GpuWeightBuf::F32(ref wu_f32)) =
+                    (&lw.w_gate, &lw.w_up)
+                {
+                    unsafe {
+                        launch_fused_norm_dual_matvec_f32(
+                            &self.device,
+                            &st.kernels,
+                            &st.scratch.attn_proj,
+                            &st.scratch.rms_scale,
+                            &lw.ffn_norm,
+                            wg_f32,
+                            wu_f32,
+                            &mut st.scratch.gate,
+                            &mut st.scratch.up,
+                            inter_dim,
+                            hidden_dim,
+                        )?;
+                    }
+                }
+            } else if matches!(&lw.w_gate, GpuWeightBuf::F16Raw(_))
+                && matches!(&lw.w_up, GpuWeightBuf::F16Raw(_))
+            {
+                // F16 HGEMV path for FFN gate/up: Fused RMSNorm + F32->F16 in ONE kernel
+                // (saves 1 dispatch), then cuBLAS HGEMV for gate and up.
+                unsafe {
+                    launch_fused_rmsnorm_f16(
+                        &self.device,
+                        &st.kernels,
+                        &st.scratch.attn_proj,
                         &lw.ffn_norm,
-                        wg_f32,
-                        wu_f32,
-                        &mut st.scratch.gate,
-                        &mut st.scratch.up,
-                        inter_dim,
+                        &mut st.scratch.input_f16,
+                        eps,
                         hidden_dim,
+                        "ffn F16",
                     )?;
                 }
-            }
-        } else if matches!(&lw.w_gate, GpuWeightBuf::F16Raw(_))
-            && matches!(&lw.w_up, GpuWeightBuf::F16Raw(_))
-        {
-            // F16 HGEMV path for FFN gate/up: Fused RMSNorm + F32->F16 in ONE kernel
-            // (saves 1 dispatch), then cuBLAS HGEMV for gate and up.
-            unsafe {
-                launch_fused_rmsnorm_f16(
-                    &self.device, &st.kernels,
-                    &st.scratch.attn_proj, &lw.ffn_norm,
-                    &mut st.scratch.input_f16,
-                    eps, hidden_dim, "ffn F16",
-                )?;
-            }
-            // Gate+up: use pre-computed pointers if available.
-            if let Some(ref pcp) = st.precomputed_ptrs {
-                unsafe {
-                    launch_hgemv_f16_batched_precomputed(
-                        &self.device,
-                        &pcp.ffn_a_ptrs[layer_idx],
-                        &pcp.ffn_b_ptrs[layer_idx],
-                        &pcp.ffn_c_ptrs[layer_idx],
-                        2, inter_dim, hidden_dim, "gate_up",
-                        st.algo_cache.get(inter_dim, hidden_dim),
-                    )?;
+                // Gate+up: use pre-computed pointers if available.
+                if let Some(ref pcp) = st.precomputed_ptrs {
+                    unsafe {
+                        launch_hgemv_f16_batched_precomputed(
+                            &self.device,
+                            &pcp.ffn_a_ptrs[layer_idx],
+                            &pcp.ffn_b_ptrs[layer_idx],
+                            &pcp.ffn_c_ptrs[layer_idx],
+                            2,
+                            inter_dim,
+                            hidden_dim,
+                            "gate_up",
+                            st.algo_cache.get(inter_dim, hidden_dim),
+                        )?;
+                    }
+                } else if let (GpuWeightBuf::F16Raw(ref wg_f16), GpuWeightBuf::F16Raw(ref wu_f16)) =
+                    (&lw.w_gate, &lw.w_up)
+                {
+                    unsafe {
+                        let w_slices: &[&CudaSlice<u8>] = &[wg_f16, wu_f16];
+                        let mut out_slices: [&mut CudaSlice<f32>; 2] =
+                            [&mut st.scratch.gate, &mut st.scratch.up];
+                        launch_hgemv_f16_batched(
+                            &self.device,
+                            w_slices,
+                            &st.scratch.input_f16,
+                            &mut out_slices,
+                            &mut st.scratch.batched_a_ptrs,
+                            &mut st.scratch.batched_b_ptrs,
+                            &mut st.scratch.batched_c_ptrs,
+                            inter_dim,
+                            hidden_dim,
+                            "gate_up",
+                            st.algo_cache.get(inter_dim, hidden_dim),
+                        )?;
+                    }
                 }
-            } else if let (GpuWeightBuf::F16Raw(ref wg_f16), GpuWeightBuf::F16Raw(ref wu_f16)) = (&lw.w_gate, &lw.w_up) {
+            } else if matches!(&lw.w_gate, GpuWeightBuf::F32(_))
+                && lw.w_gate_f16.is_some()
+                && lw.w_up_f16.is_some()
+            {
+                // cuBLAS HGEMV for F32 weights with F16 caches (halves F32 bandwidth).
+                // Q8/Q4 weights fall through to launch_matvec() for native dp4a (1.06 B/elem).
                 unsafe {
-                    let w_slices: &[&CudaSlice<u8>] = &[wg_f16, wu_f16];
-                    let mut out_slices: [&mut CudaSlice<f32>; 2] = [&mut st.scratch.gate, &mut st.scratch.up];
-                    launch_hgemv_f16_batched(
+                    launch_fused_rmsnorm_f16(
                         &self.device,
-                        w_slices,
-                        &st.scratch.input_f16,
-                        &mut out_slices,
-                        &mut st.scratch.batched_a_ptrs,
-                        &mut st.scratch.batched_b_ptrs,
-                        &mut st.scratch.batched_c_ptrs,
-                        inter_dim,
+                        &st.kernels,
+                        &st.scratch.attn_proj,
+                        &lw.ffn_norm,
+                        &mut st.scratch.input_f16,
+                        eps,
                         hidden_dim,
-                        "gate_up",
-                        st.algo_cache.get(inter_dim, hidden_dim),
+                        "ffn HGEMV",
                     )?;
                 }
-            }
-        } else if matches!(&lw.w_gate, GpuWeightBuf::F32(_))
-            && lw.w_gate_f16.is_some() && lw.w_up_f16.is_some()
-        {
-            // cuBLAS HGEMV for F32 weights with F16 caches (halves F32 bandwidth).
-            // Q8/Q4 weights fall through to launch_matvec() for native dp4a (1.06 B/elem).
-            unsafe {
-                launch_fused_rmsnorm_f16(
-                    &self.device, &st.kernels,
-                    &st.scratch.attn_proj, &lw.ffn_norm,
-                    &mut st.scratch.input_f16,
-                    eps, hidden_dim, "ffn HGEMV",
-                )?;
-            }
-            // Gate+up: use pre-computed pointers if available (batched = 1 cuBLAS call).
-            if let Some(ref pcp) = st.precomputed_ptrs {
-                unsafe {
-                    launch_hgemv_f16_batched_precomputed(
-                        &self.device,
-                        &pcp.ffn_a_ptrs[layer_idx],
-                        &pcp.ffn_b_ptrs[layer_idx],
-                        &pcp.ffn_c_ptrs[layer_idx],
-                        2, inter_dim, hidden_dim, "gate_up",
-                        st.algo_cache.get(inter_dim, hidden_dim),
-                    )?;
+                // Gate+up: use pre-computed pointers if available (batched = 1 cuBLAS call).
+                if let Some(ref pcp) = st.precomputed_ptrs {
+                    unsafe {
+                        launch_hgemv_f16_batched_precomputed(
+                            &self.device,
+                            &pcp.ffn_a_ptrs[layer_idx],
+                            &pcp.ffn_b_ptrs[layer_idx],
+                            &pcp.ffn_c_ptrs[layer_idx],
+                            2,
+                            inter_dim,
+                            hidden_dim,
+                            "gate_up",
+                            st.algo_cache.get(inter_dim, hidden_dim),
+                        )?;
+                    }
+                } else {
+                    // Fallback: separate gate + up HGEMV calls.
+                    if let Some(ref wg_f16) = lw.w_gate_f16 {
+                        unsafe {
+                            launch_hgemv_f16_preconverted(
+                                &self.device,
+                                wg_f16,
+                                &st.scratch.input_f16,
+                                &mut st.scratch.gate,
+                                inter_dim,
+                                hidden_dim,
+                                "gate",
+                                st.algo_cache.get(inter_dim, hidden_dim),
+                            )?;
+                        }
+                    }
+                    if let Some(ref wu_f16) = lw.w_up_f16 {
+                        unsafe {
+                            launch_hgemv_f16_preconverted(
+                                &self.device,
+                                wu_f16,
+                                &st.scratch.input_f16,
+                                &mut st.scratch.up,
+                                inter_dim,
+                                hidden_dim,
+                                "up",
+                                st.algo_cache.get(inter_dim, hidden_dim),
+                            )?;
+                        }
+                    }
                 }
             } else {
-                // Fallback: separate gate + up HGEMV calls.
-                if let Some(ref wg_f16) = lw.w_gate_f16 {
-                    unsafe {
-                        launch_hgemv_f16_preconverted(
-                            &self.device, wg_f16, &st.scratch.input_f16,
-                            &mut st.scratch.gate, inter_dim, hidden_dim, "gate",
-                            st.algo_cache.get(inter_dim, hidden_dim),
-                        )?;
-                    }
-                }
-                if let Some(ref wu_f16) = lw.w_up_f16 {
-                    unsafe {
-                        launch_hgemv_f16_preconverted(
-                            &self.device, wu_f16, &st.scratch.input_f16,
-                            &mut st.scratch.up, inter_dim, hidden_dim, "up",
-                            st.algo_cache.get(inter_dim, hidden_dim),
-                        )?;
-                    }
-                }
-            }
-        } else {
-            // Q8_0/Q4_0/Q8Aligned/Q4Aligned/F32: native-quant FFN gate/up via launch_matvec().
-            // Priority: dp4a Q8_1 > smem > hgemv > cuBLAS HGEMV > dp4a/scalar.
-            // F16 caches are passed as last-resort fallback only.
+                // Q8_0/Q4_0/Q8Aligned/Q4Aligned/F32: native-quant FFN gate/up via launch_matvec().
+                // Priority: dp4a Q8_1 > smem > hgemv > cuBLAS HGEMV > dp4a/scalar.
+                // F16 caches are passed as last-resort fallback only.
 
-            // Shared-quantization optimization: quantize normed FFN input ONCE,
-            // reuse across gate and up projections. Saves 1 quantize launch per layer.
-            let ffn_use_preq = weight_uses_dp4a_q8_1(&lw.w_gate, &st.kernels)
-                && weight_uses_dp4a_q8_1(&lw.w_up, &st.kernels)
-                && st.scratch.input_q8_1.is_some()
-                && st.kernels.quantize_f32_to_q8_1.is_some();
+                // Shared-quantization optimization: quantize normed FFN input ONCE,
+                // reuse across gate and up projections. Saves 1 quantize launch per layer.
+                let ffn_use_preq = weight_uses_dp4a_q8_1(&lw.w_gate, &st.kernels)
+                    && weight_uses_dp4a_q8_1(&lw.w_up, &st.kernels)
+                    && st.scratch.input_q8_1.is_some()
+                    && st.kernels.quantize_f32_to_q8_1.is_some();
 
-            // Fused RMSNorm + Q8_1 for FFN: saves 1 dispatch per layer.
-            if ffn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
-                let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
-                let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                let block_size = rmsnorm_block_size(hidden_dim);
-                let shared_bytes = rmsnorm_shared_bytes(block_size);
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: shared_bytes,
-                };
-                let dim = hidden_dim as u32;
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(fused_fn)
-                        .arg(&st.scratch.attn_proj)
-                        .arg(&lw.ffn_norm)
-                        .arg(&mut *q8_1_buf)
-                        .arg(&eps)
-                        .arg(&dim)
-                        .launch(launch_cfg)
-                }
-                .map_err(|e| RuntimeError::Compute(format!("rmsnorm_to_q8_1 ffn: {e}")))?;
-                unsafe {
-                    // split-layout: prefer Q8Split/Q4Split sibling buffers on FFN gate/up when set.
-                    launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.w_gate, lw.q8_tile_w_gate.as_ref(), lw.q4_tile_w_gate.as_ref(), lw.q8_split_w_gate.as_ref(), lw.q4_split_w_gate.as_ref(), q8_1_buf, &mut st.scratch.gate, inter_dim, hidden_dim, "gate")?;
-                    launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.w_up, lw.q8_tile_w_up.as_ref(), lw.q4_tile_w_up.as_ref(), lw.q8_split_w_up.as_ref(), lw.q4_split_w_up.as_ref(), q8_1_buf, &mut st.scratch.up, inter_dim, hidden_dim, "up")?;
-                }
-            } else if ffn_use_preq {
-                // Fallback: separate rmsnorm + quantize_f32_to_q8_1 (fused kernel unavailable).
-                {
+                // Fused RMSNorm + Q8_1 for FFN: saves 1 dispatch per layer.
+                if ffn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
+                    let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
+                    let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
                     let block_size = rmsnorm_block_size(hidden_dim);
                     let shared_bytes = rmsnorm_shared_bytes(block_size);
                     let launch_cfg = CudarcLaunchConfig {
@@ -3652,78 +3993,165 @@ impl CudaBackend {
                     unsafe {
                         self.device
                             .stream
-                            .launch_builder(&st.kernels.rmsnorm)
+                            .launch_builder(fused_fn)
                             .arg(&st.scratch.attn_proj)
                             .arg(&lw.ffn_norm)
-                            .arg(&mut st.scratch.normed)
+                            .arg(&mut *q8_1_buf)
                             .arg(&eps)
                             .arg(&dim)
                             .launch(launch_cfg)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!("rmsnorm ffn launch: {e}")))?;
-                }
-                let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref().unwrap();
-                let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                unsafe {
-                    launch_quantize_input_q8_1(&self.device, quant_fn, &st.scratch.normed, q8_1_buf, hidden_dim, "ffn gate_up")?;
-                    // split-layout: prefer Q8Split/Q4Split sibling buffers on FFN gate/up when set.
-                    launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.w_gate, lw.q8_tile_w_gate.as_ref(), lw.q4_tile_w_gate.as_ref(), lw.q8_split_w_gate.as_ref(), lw.q4_split_w_gate.as_ref(), q8_1_buf, &mut st.scratch.gate, inter_dim, hidden_dim, "gate")?;
-                    launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.w_up, lw.q8_tile_w_up.as_ref(), lw.q4_tile_w_up.as_ref(), lw.q8_split_w_up.as_ref(), lw.q4_split_w_up.as_ref(), q8_1_buf, &mut st.scratch.up, inter_dim, hidden_dim, "up")?;
-                }
-            } else {
-                // Non-preq path: separate rmsnorm + launch_matvec.
-                {
-                    let block_size = rmsnorm_block_size(hidden_dim);
-                    let shared_bytes = rmsnorm_shared_bytes(block_size);
-                    let launch_cfg = CudarcLaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (block_size, 1, 1),
-                        shared_mem_bytes: shared_bytes,
-                    };
-                    let dim = hidden_dim as u32;
+                    .map_err(|e| RuntimeError::Compute(format!("rmsnorm_to_q8_1 ffn: {e}")))?;
                     unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(&st.kernels.rmsnorm)
-                            .arg(&st.scratch.attn_proj)
-                            .arg(&lw.ffn_norm)
-                            .arg(&mut st.scratch.normed)
-                            .arg(&eps)
-                            .arg(&dim)
-                            .launch(launch_cfg)
+                        // split-layout: prefer Q8Split/Q4Split sibling buffers on FFN gate/up when set.
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_gate,
+                            lw.q8_tile_w_gate.as_ref(),
+                            lw.q4_tile_w_gate.as_ref(),
+                            lw.q8_split_w_gate.as_ref(),
+                            lw.q4_split_w_gate.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.gate,
+                            inter_dim,
+                            hidden_dim,
+                            "gate",
+                        )?;
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_up,
+                            lw.q8_tile_w_up.as_ref(),
+                            lw.q4_tile_w_up.as_ref(),
+                            lw.q8_split_w_up.as_ref(),
+                            lw.q4_split_w_up.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.up,
+                            inter_dim,
+                            hidden_dim,
+                            "up",
+                        )?;
                     }
-                    .map_err(|e| RuntimeError::Compute(format!("rmsnorm ffn launch: {e}")))?;
-                }
-                unsafe {
-                    launch_matvec(
-                        &self.device,
-                        &st.kernels,
-                        &lw.w_gate,
-                        &st.scratch.normed,
-                        &mut st.scratch.gate,
-                        inter_dim,
-                        hidden_dim,
-                        "gate",
-                        lw.w_gate_f16.as_ref(),
-                        Some(&mut st.scratch.input_f16),
-                        st.scratch.input_q8_1.as_mut(),
-                    )?;
-                    launch_matvec(
-                        &self.device,
-                        &st.kernels,
-                        &lw.w_up,
-                        &st.scratch.normed,
-                        &mut st.scratch.up,
-                        inter_dim,
-                        hidden_dim,
-                        "up",
-                        lw.w_up_f16.as_ref(),
-                        Some(&mut st.scratch.input_f16),
-                        st.scratch.input_q8_1.as_mut(),
-                    )?;
+                } else if ffn_use_preq {
+                    // Fallback: separate rmsnorm + quantize_f32_to_q8_1 (fused kernel unavailable).
+                    {
+                        let block_size = rmsnorm_block_size(hidden_dim);
+                        let shared_bytes = rmsnorm_shared_bytes(block_size);
+                        let launch_cfg = CudarcLaunchConfig {
+                            grid_dim: (1, 1, 1),
+                            block_dim: (block_size, 1, 1),
+                            shared_mem_bytes: shared_bytes,
+                        };
+                        let dim = hidden_dim as u32;
+                        unsafe {
+                            self.device
+                                .stream
+                                .launch_builder(&st.kernels.rmsnorm)
+                                .arg(&st.scratch.attn_proj)
+                                .arg(&lw.ffn_norm)
+                                .arg(&mut st.scratch.normed)
+                                .arg(&eps)
+                                .arg(&dim)
+                                .launch(launch_cfg)
+                        }
+                        .map_err(|e| RuntimeError::Compute(format!("rmsnorm ffn launch: {e}")))?;
+                    }
+                    let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref().unwrap();
+                    let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
+                    unsafe {
+                        launch_quantize_input_q8_1(
+                            &self.device,
+                            quant_fn,
+                            &st.scratch.normed,
+                            q8_1_buf,
+                            hidden_dim,
+                            "ffn gate_up",
+                        )?;
+                        // split-layout: prefer Q8Split/Q4Split sibling buffers on FFN gate/up when set.
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_gate,
+                            lw.q8_tile_w_gate.as_ref(),
+                            lw.q4_tile_w_gate.as_ref(),
+                            lw.q8_split_w_gate.as_ref(),
+                            lw.q4_split_w_gate.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.gate,
+                            inter_dim,
+                            hidden_dim,
+                            "gate",
+                        )?;
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_up,
+                            lw.q8_tile_w_up.as_ref(),
+                            lw.q4_tile_w_up.as_ref(),
+                            lw.q8_split_w_up.as_ref(),
+                            lw.q4_split_w_up.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.up,
+                            inter_dim,
+                            hidden_dim,
+                            "up",
+                        )?;
+                    }
+                } else {
+                    // Non-preq path: separate rmsnorm + launch_matvec.
+                    {
+                        let block_size = rmsnorm_block_size(hidden_dim);
+                        let shared_bytes = rmsnorm_shared_bytes(block_size);
+                        let launch_cfg = CudarcLaunchConfig {
+                            grid_dim: (1, 1, 1),
+                            block_dim: (block_size, 1, 1),
+                            shared_mem_bytes: shared_bytes,
+                        };
+                        let dim = hidden_dim as u32;
+                        unsafe {
+                            self.device
+                                .stream
+                                .launch_builder(&st.kernels.rmsnorm)
+                                .arg(&st.scratch.attn_proj)
+                                .arg(&lw.ffn_norm)
+                                .arg(&mut st.scratch.normed)
+                                .arg(&eps)
+                                .arg(&dim)
+                                .launch(launch_cfg)
+                        }
+                        .map_err(|e| RuntimeError::Compute(format!("rmsnorm ffn launch: {e}")))?;
+                    }
+                    unsafe {
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_gate,
+                            &st.scratch.normed,
+                            &mut st.scratch.gate,
+                            inter_dim,
+                            hidden_dim,
+                            "gate",
+                            lw.w_gate_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_up,
+                            &st.scratch.normed,
+                            &mut st.scratch.up,
+                            inter_dim,
+                            hidden_dim,
+                            "up",
+                            lw.w_up_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
+                    }
                 }
             }
-        }
         } // end if !fused_glu_fired
 
         // SwiGLU + Down projection.
@@ -3753,7 +4181,8 @@ impl CudaBackend {
                 };
                 let n = inter_dim as u32;
                 unsafe {
-                    self.device.stream
+                    self.device
+                        .stream
                         .launch_builder(&st.kernels.f32_to_f16_vec)
                         .arg(&st.scratch.gate)
                         .arg(&mut st.scratch.input_f16)
@@ -3763,14 +4192,17 @@ impl CudaBackend {
                 .map_err(|e| RuntimeError::Compute(format!("f32_to_f16 fused_glu down: {e}")))?;
                 unsafe {
                     launch_hgemv_f16_preconverted(
-                        &self.device, wd_f16, &st.scratch.input_f16,
-                        &mut st.scratch.down, hidden_dim, inter_dim, "down",
+                        &self.device,
+                        wd_f16,
+                        &st.scratch.input_f16,
+                        &mut st.scratch.down,
+                        hidden_dim,
+                        inter_dim,
+                        "down",
                         st.algo_cache.get(hidden_dim, inter_dim),
                     )?;
                 }
-            } else if matches!(&lw.w_down, GpuWeightBuf::F32(_))
-                && lw.w_down_f16.is_some()
-            {
+            } else if matches!(&lw.w_down, GpuWeightBuf::F32(_)) && lw.w_down_f16.is_some() {
                 // cuBLAS HGEMV fast path for F32 weights with pre-dequanted F16 caches.
                 // Convert fused output F32 -> F16, then cuBLAS HGEMV with FAST_16F.
                 // Q8/Q4 weights fall through to launch_matvec() for native dp4a.
@@ -3783,18 +4215,26 @@ impl CudaBackend {
                 };
                 let n = inter_dim as u32;
                 unsafe {
-                    self.device.stream
+                    self.device
+                        .stream
                         .launch_builder(&st.kernels.f32_to_f16_vec)
                         .arg(&st.scratch.gate)
                         .arg(&mut st.scratch.input_f16)
                         .arg(&n)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!("f32_to_f16 fused_glu down HGEMV: {e}")))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("f32_to_f16 fused_glu down HGEMV: {e}"))
+                })?;
                 unsafe {
                     launch_hgemv_f16_preconverted(
-                        &self.device, wd_f16, &st.scratch.input_f16,
-                        &mut st.scratch.down, hidden_dim, inter_dim, "down",
+                        &self.device,
+                        wd_f16,
+                        &st.scratch.input_f16,
+                        &mut st.scratch.down,
+                        hidden_dim,
+                        inter_dim,
+                        "down",
                         st.algo_cache.get(hidden_dim, inter_dim),
                     )?;
                 }
@@ -3811,7 +4251,8 @@ impl CudaBackend {
                         shared_mem_bytes: 0,
                     };
                     unsafe {
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(fused_fn)
                             .arg(wd_q8a)
                             .arg(&st.scratch.gate)
@@ -3820,17 +4261,25 @@ impl CudaBackend {
                             .arg(&in_dim_u32)
                             .launch(launch_cfg)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q8_aligned_f32 down L{layer_idx}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec_q8_aligned_f32 down L{layer_idx}: {e}",
+                        ))
+                    })?;
                 } else {
                     // Fallback: quantize + dp4a (2 dispatches).
                     unsafe {
                         launch_matvec(
-                            &self.device, &st.kernels, &lw.w_down,
-                            &st.scratch.gate, &mut st.scratch.down,
-                            hidden_dim, inter_dim, "down",
-                            lw.w_down_f16.as_ref(), Some(&mut st.scratch.input_f16),
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_down,
+                            &st.scratch.gate,
+                            &mut st.scratch.down,
+                            hidden_dim,
+                            inter_dim,
+                            "down",
+                            lw.w_down_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
                             st.scratch.input_q8_1.as_mut(),
                         )?;
                     }
@@ -3848,7 +4297,8 @@ impl CudaBackend {
                         shared_mem_bytes: 0,
                     };
                     unsafe {
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(fused_fn)
                             .arg(wd_q4a)
                             .arg(&st.scratch.gate)
@@ -3857,17 +4307,25 @@ impl CudaBackend {
                             .arg(&in_dim_u32)
                             .launch(launch_cfg)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q4_aligned_f32 down L{layer_idx}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec_q4_aligned_f32 down L{layer_idx}: {e}",
+                        ))
+                    })?;
                 } else {
                     // Fallback: quantize + dp4a (2 dispatches).
                     unsafe {
                         launch_matvec(
-                            &self.device, &st.kernels, &lw.w_down,
-                            &st.scratch.gate, &mut st.scratch.down,
-                            hidden_dim, inter_dim, "down",
-                            lw.w_down_f16.as_ref(), Some(&mut st.scratch.input_f16),
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_down,
+                            &st.scratch.gate,
+                            &mut st.scratch.down,
+                            hidden_dim,
+                            inter_dim,
+                            "down",
+                            lw.w_down_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
                             st.scratch.input_q8_1.as_mut(),
                         )?;
                     }
@@ -3878,7 +4336,8 @@ impl CudaBackend {
                 // route via launch_matvec_preq8_1_split (requires inline F32->Q8_1
                 // quantization since the existing fused-down kernels target
                 // Q8Aligned/Q4Aligned which we skipped under SPLIT).
-                let use_split_down = (st.kernels.use_q8_split_dispatch && lw.q8_split_w_down.is_some())
+                let use_split_down = (st.kernels.use_q8_split_dispatch
+                    && lw.q8_split_w_down.is_some())
                     || (st.kernels.use_q4_split_dispatch && lw.q4_split_w_down.is_some());
                 if use_split_down {
                     let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref();
@@ -3886,24 +4345,41 @@ impl CudaBackend {
                     if let (Some(quant_fn), Some(q8_1_buf)) = (quant_fn, q8_1_scratch) {
                         unsafe {
                             launch_quantize_input_q8_1(
-                                &self.device, quant_fn, &st.scratch.gate, q8_1_buf,
-                                inter_dim, "down split",
+                                &self.device,
+                                quant_fn,
+                                &st.scratch.gate,
+                                q8_1_buf,
+                                inter_dim,
+                                "down split",
                             )?;
                             launch_matvec_preq8_1_tile(
-                                &self.device, &st.kernels, &lw.w_down,
-                                lw.q8_tile_w_down.as_ref(),  lw.q4_tile_w_down.as_ref(),
-                                lw.q8_split_w_down.as_ref(), lw.q4_split_w_down.as_ref(),
-                                q8_1_buf, &mut st.scratch.down,
-                                hidden_dim, inter_dim, "down",
+                                &self.device,
+                                &st.kernels,
+                                &lw.w_down,
+                                lw.q8_tile_w_down.as_ref(),
+                                lw.q4_tile_w_down.as_ref(),
+                                lw.q8_split_w_down.as_ref(),
+                                lw.q4_split_w_down.as_ref(),
+                                q8_1_buf,
+                                &mut st.scratch.down,
+                                hidden_dim,
+                                inter_dim,
+                                "down",
                             )?;
                         }
                     } else {
                         unsafe {
                             launch_matvec(
-                                &self.device, &st.kernels, &lw.w_down,
-                                &st.scratch.gate, &mut st.scratch.down,
-                                hidden_dim, inter_dim, "down",
-                                lw.w_down_f16.as_ref(), Some(&mut st.scratch.input_f16),
+                                &self.device,
+                                &st.kernels,
+                                &lw.w_down,
+                                &st.scratch.gate,
+                                &mut st.scratch.down,
+                                hidden_dim,
+                                inter_dim,
+                                "down",
+                                lw.w_down_f16.as_ref(),
+                                Some(&mut st.scratch.input_f16),
                                 st.scratch.input_q8_1.as_mut(),
                             )?;
                         }
@@ -3911,11 +4387,17 @@ impl CudaBackend {
                 } else {
                     unsafe {
                         launch_matvec(
-                            &self.device, &st.kernels, &lw.w_down,
-                            &st.scratch.gate, &mut st.scratch.down,
-                            hidden_dim, inter_dim, "down",
-                            lw.w_down_f16.as_ref(), Some(&mut st.scratch.input_f16),
-                        st.scratch.input_q8_1.as_mut(),
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_down,
+                            &st.scratch.gate,
+                            &mut st.scratch.down,
+                            hidden_dim,
+                            inter_dim,
+                            "down",
+                            lw.w_down_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
                         )?;
                     }
                 }
@@ -3924,8 +4406,10 @@ impl CudaBackend {
             // Fused SwiGLU + F32->F16: gate/up -> gate (F32) + input_f16 (F16).
             unsafe {
                 launch_swiglu_f32_to_f16(
-                    &self.device, &st.kernels,
-                    &mut st.scratch.gate, &st.scratch.up,
+                    &self.device,
+                    &st.kernels,
+                    &mut st.scratch.gate,
+                    &st.scratch.up,
                     &mut st.scratch.input_f16,
                     inter_dim,
                 )?;
@@ -3943,15 +4427,15 @@ impl CudaBackend {
                     st.algo_cache.get(hidden_dim, inter_dim),
                 )?;
             }
-        } else if matches!(&lw.w_down, GpuWeightBuf::F32(_))
-            && lw.w_down_f16.is_some()
-        {
+        } else if matches!(&lw.w_down, GpuWeightBuf::F32(_)) && lw.w_down_f16.is_some() {
             // cuBLAS HGEMV for F32 down weights with F16 caches.
             // Q8/Q4 weights fall through to launch_matvec() for native dp4a.
             unsafe {
                 launch_swiglu_f32_to_f16(
-                    &self.device, &st.kernels,
-                    &mut st.scratch.gate, &st.scratch.up,
+                    &self.device,
+                    &st.kernels,
+                    &mut st.scratch.gate,
+                    &st.scratch.up,
                     &mut st.scratch.input_f16,
                     inter_dim,
                 )?;
@@ -3985,7 +4469,8 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 };
                 unsafe {
-                    self.device.stream
+                    self.device
+                        .stream
                         .launch_builder(fused_fn)
                         .arg(wd_q8a)
                         .arg(&st.scratch.gate)
@@ -3995,9 +4480,11 @@ impl CudaBackend {
                         .arg(&in_dim_u32)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec_q8_aligned_f32_swiglu down L{layer_idx}: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "matvec_q8_aligned_f32_swiglu down L{layer_idx}: {e}",
+                    ))
+                })?;
             } else {
                 // Fallback: separate SwiGLU + quantize + dp4a (3 dispatches).
                 {
@@ -4021,10 +4508,16 @@ impl CudaBackend {
                 }
                 unsafe {
                     launch_matvec(
-                        &self.device, &st.kernels, &lw.w_down,
-                        &st.scratch.gate, &mut st.scratch.down,
-                        hidden_dim, inter_dim, "down",
-                        lw.w_down_f16.as_ref(), Some(&mut st.scratch.input_f16),
+                        &self.device,
+                        &st.kernels,
+                        &lw.w_down,
+                        &st.scratch.gate,
+                        &mut st.scratch.down,
+                        hidden_dim,
+                        inter_dim,
+                        "down",
+                        lw.w_down_f16.as_ref(),
+                        Some(&mut st.scratch.input_f16),
                         st.scratch.input_q8_1.as_mut(),
                     )?;
                 }
@@ -4044,7 +4537,8 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 };
                 unsafe {
-                    self.device.stream
+                    self.device
+                        .stream
                         .launch_builder(fused_fn)
                         .arg(wd_q4a)
                         .arg(&st.scratch.gate)
@@ -4054,9 +4548,11 @@ impl CudaBackend {
                         .arg(&in_dim_u32)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec_q4_aligned_f32_swiglu down L{layer_idx}: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "matvec_q4_aligned_f32_swiglu down L{layer_idx}: {e}",
+                    ))
+                })?;
             } else {
                 // Fallback: separate SwiGLU + quantize + dp4a (3 dispatches).
                 {
@@ -4080,10 +4576,16 @@ impl CudaBackend {
                 }
                 unsafe {
                     launch_matvec(
-                        &self.device, &st.kernels, &lw.w_down,
-                        &st.scratch.gate, &mut st.scratch.down,
-                        hidden_dim, inter_dim, "down",
-                        lw.w_down_f16.as_ref(), Some(&mut st.scratch.input_f16),
+                        &self.device,
+                        &st.kernels,
+                        &lw.w_down,
+                        &st.scratch.gate,
+                        &mut st.scratch.down,
+                        hidden_dim,
+                        inter_dim,
+                        "down",
+                        lw.w_down_f16.as_ref(),
+                        Some(&mut st.scratch.input_f16),
                         st.scratch.input_q8_1.as_mut(),
                     )?;
                 }
@@ -4120,24 +4622,41 @@ impl CudaBackend {
                 if let (Some(quant_fn), Some(q8_1_buf)) = (quant_fn, q8_1_scratch) {
                     unsafe {
                         launch_quantize_input_q8_1(
-                            &self.device, quant_fn, &st.scratch.gate, q8_1_buf,
-                            inter_dim, "down split (sep swiglu)",
+                            &self.device,
+                            quant_fn,
+                            &st.scratch.gate,
+                            q8_1_buf,
+                            inter_dim,
+                            "down split (sep swiglu)",
                         )?;
                         launch_matvec_preq8_1_tile(
-                            &self.device, &st.kernels, &lw.w_down,
-                            lw.q8_tile_w_down.as_ref(),  lw.q4_tile_w_down.as_ref(),
-                            lw.q8_split_w_down.as_ref(), lw.q4_split_w_down.as_ref(),
-                            q8_1_buf, &mut st.scratch.down,
-                            hidden_dim, inter_dim, "down",
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_down,
+                            lw.q8_tile_w_down.as_ref(),
+                            lw.q4_tile_w_down.as_ref(),
+                            lw.q8_split_w_down.as_ref(),
+                            lw.q4_split_w_down.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.down,
+                            hidden_dim,
+                            inter_dim,
+                            "down",
                         )?;
                     }
                 } else {
                     unsafe {
                         launch_matvec(
-                            &self.device, &st.kernels, &lw.w_down,
-                            &st.scratch.gate, &mut st.scratch.down,
-                            hidden_dim, inter_dim, "down",
-                            lw.w_down_f16.as_ref(), Some(&mut st.scratch.input_f16),
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_down,
+                            &st.scratch.gate,
+                            &mut st.scratch.down,
+                            hidden_dim,
+                            inter_dim,
+                            "down",
+                            lw.w_down_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
                             st.scratch.input_q8_1.as_mut(),
                         )?;
                     }
@@ -4155,7 +4674,7 @@ impl CudaBackend {
                         "down",
                         lw.w_down_f16.as_ref(),
                         Some(&mut st.scratch.input_f16),
-                    st.scratch.input_q8_1.as_mut(),
+                        st.scratch.input_q8_1.as_mut(),
                     )?;
                 }
             }
@@ -4192,10 +4711,7 @@ impl CudaBackend {
     /// Scans layer_weights_cache to identify GDN layers (layer_type == 1),
     /// builds the layer index mapping, and allocates all persistent state
     /// (h_states, conv_states) and ephemeral scratch buffers on the GPU.
-    fn ensure_gdn_scratch(
-        &self,
-        st: &mut MutableState,
-    ) -> Result<(), RuntimeError> {
+    fn ensure_gdn_scratch(&self, st: &mut MutableState) -> Result<(), RuntimeError> {
         if st.gdn_scratch_gpu.is_some() {
             return Ok(());
         }
@@ -4224,7 +4740,10 @@ impl CudaBackend {
         let mut conv_states = Vec::with_capacity(gdn_count);
         for _ in 0..gdn_count {
             h_states.push(self.device.alloc_zeros::<f32>(params.h_state_elements())?);
-            conv_states.push(self.device.alloc_zeros::<f32>(params.conv_state_elements())?);
+            conv_states.push(
+                self.device
+                    .alloc_zeros::<f32>(params.conv_state_elements())?,
+            );
         }
         let conv_positions = vec![0u32; gdn_count];
 
@@ -4249,27 +4768,41 @@ impl CudaBackend {
             for _ in 0..gdn_count {
                 match self.device.alloc_zeros::<u32>(1) {
                     Ok(s) => v.push(s),
-                    Err(_) => { alloc_ok = false; break; }
+                    Err(_) => {
+                        alloc_ok = false;
+                        break;
+                    }
                 }
             }
-            if alloc_ok { Some(v) } else { None }
+            if alloc_ok {
+                Some(v)
+            } else {
+                None
+            }
         };
 
         // Allocate ephemeral scratch buffers (shared across layers).
         // Q_norm/K_norm buffers are allocated only when LUMEN_CUDA_GDN_REGISTER_RESIDENT=1
         // because they are unused by the existing megakernel path.
         // default ON (no-op for non-GDN models).
-        let use_gdn_register_resident = match std::env::var("LUMEN_CUDA_GDN_REGISTER_RESIDENT").ok().as_deref() {
+        let use_gdn_register_resident = match std::env::var("LUMEN_CUDA_GDN_REGISTER_RESIDENT")
+            .ok()
+            .as_deref()
+        {
             Some(v) => matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"),
             None => crate::runtime_defaults::gdn_register_resident_default(),
         };
         let qk_norm_elements = params.num_kv_heads * params.head_dim;
         let q_norm_buf_rr = if use_gdn_register_resident {
             Some(self.device.alloc_zeros::<f32>(qk_norm_elements)?)
-        } else { None };
+        } else {
+            None
+        };
         let k_norm_buf_rr = if use_gdn_register_resident {
             Some(self.device.alloc_zeros::<f32>(qk_norm_elements)?)
-        } else { None };
+        } else {
+            None
+        };
 
         let gdn = GdnScratchGpu {
             params,
@@ -4364,26 +4897,24 @@ impl CudaBackend {
         let gdn = st.gdn_scratch_gpu.as_mut().unwrap();
         let p = gdn.params;
 
-        let gdn_idx = gdn.gdn_layer_map[layer_idx]
-            .ok_or_else(|| RuntimeError::Compute(format!(
+        let gdn_idx = gdn.gdn_layer_map[layer_idx].ok_or_else(|| {
+            RuntimeError::Compute(format!(
                 "compute_gdn_attention_gpu: layer {layer_idx} is not a GDN layer",
-            )))?;
+            ))
+        })?;
 
         // --- Step 1+2: RMSNorm + QKV matvec ---
         // Detect if all GDN matvec consumers (QKV, alpha, beta) use dp4a Q8_1
         // so we can fuse RMSNorm + Q8_1 quantization and share the quantized input.
-        let ssm_alpha_w = lw.ssm_alpha.as_ref()
-            .ok_or_else(|| RuntimeError::Compute(format!(
-                "GDN L{layer_idx}: ssm_alpha weight missing",
-            )))?;
-        let ssm_beta_w = lw.ssm_beta.as_ref()
-            .ok_or_else(|| RuntimeError::Compute(format!(
-                "GDN L{layer_idx}: ssm_beta weight missing",
-            )))?;
-        let attn_gate_w = lw.attn_gate.as_ref()
-            .ok_or_else(|| RuntimeError::Compute(format!(
-                "GDN L{layer_idx}: attn_gate weight missing",
-            )))?;
+        let ssm_alpha_w = lw.ssm_alpha.as_ref().ok_or_else(|| {
+            RuntimeError::Compute(format!("GDN L{layer_idx}: ssm_alpha weight missing",))
+        })?;
+        let ssm_beta_w = lw.ssm_beta.as_ref().ok_or_else(|| {
+            RuntimeError::Compute(format!("GDN L{layer_idx}: ssm_beta weight missing",))
+        })?;
+        let attn_gate_w = lw.attn_gate.as_ref().ok_or_else(|| {
+            RuntimeError::Compute(format!("GDN L{layer_idx}: attn_gate weight missing",))
+        })?;
 
         let gdn_use_preq = weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
             && weight_uses_dp4a_q8_1(ssm_alpha_w, &st.kernels)
@@ -4445,9 +4976,8 @@ impl CudaBackend {
         // refuted net-negative). Guarded on the caches being present (only
         // populated at load when the gate is ON), so OFF is byte-identical and
         // dense is byte-identical (gate AND-folds `model_is_moe()`).
-        let gdn_ab_f16 = gdn_ab_f16_enabled()
-            && lw.ssm_alpha_f16.is_some()
-            && lw.ssm_beta_f16.is_some();
+        let gdn_ab_f16 =
+            gdn_ab_f16_enabled() && lw.ssm_alpha_f16.is_some() && lw.ssm_beta_f16.is_some();
 
         let gdn_decode_ab_mmq = gdn_decode_ab_mmq_enabled()
             && !gdn_decode_proj_mmq
@@ -4509,9 +5039,9 @@ impl CudaBackend {
                         .arg(&dim)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "GDN rmsnorm (mmq decode) L{layer_idx}: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN rmsnorm (mmq decode) L{layer_idx}: {e}",))
+                })?;
             }
 
             // The Q8Raw byte slices for each projection weight. The outer
@@ -4536,33 +5066,57 @@ impl CudaBackend {
             // Step 2: fused QKV projection (out = qkv_dim) via MMQ, batch = 1.
             unsafe {
                 super::prefill::launch_mmq_q8_0_batched(
-                    &self.device, &st.kernels, wq_q8,
-                    &st.scratch.normed, &mut gdn.qkv_buf,
-                    p.qkv_dim, hidden_dim, 1, "gdn_qkv_decode_mmq",
+                    &self.device,
+                    &st.kernels,
+                    wq_q8,
+                    &st.scratch.normed,
+                    &mut gdn.qkv_buf,
+                    p.qkv_dim,
+                    hidden_dim,
+                    1,
+                    "gdn_qkv_decode_mmq",
                 )?;
             }
             // Step 3: alpha projection (out = num_heads).
             unsafe {
                 super::prefill::launch_mmq_q8_0_batched(
-                    &self.device, &st.kernels, alpha_q8,
-                    &st.scratch.normed, &mut gdn.alpha_raw_buf,
-                    p.num_heads, hidden_dim, 1, "gdn_alpha_decode_mmq",
+                    &self.device,
+                    &st.kernels,
+                    alpha_q8,
+                    &st.scratch.normed,
+                    &mut gdn.alpha_raw_buf,
+                    p.num_heads,
+                    hidden_dim,
+                    1,
+                    "gdn_alpha_decode_mmq",
                 )?;
             }
             // Step 4: beta projection (out = num_heads).
             unsafe {
                 super::prefill::launch_mmq_q8_0_batched(
-                    &self.device, &st.kernels, beta_q8,
-                    &st.scratch.normed, &mut gdn.beta_raw_buf,
-                    p.num_heads, hidden_dim, 1, "gdn_beta_decode_mmq",
+                    &self.device,
+                    &st.kernels,
+                    beta_q8,
+                    &st.scratch.normed,
+                    &mut gdn.beta_raw_buf,
+                    p.num_heads,
+                    hidden_dim,
+                    1,
+                    "gdn_beta_decode_mmq",
                 )?;
             }
             // Step 5: gate projection (out = value_dim).
             unsafe {
                 super::prefill::launch_mmq_q8_0_batched(
-                    &self.device, &st.kernels, gate_q8,
-                    &st.scratch.normed, &mut gdn.gate_buf,
-                    p.value_dim, hidden_dim, 1, "gdn_gate_decode_mmq",
+                    &self.device,
+                    &st.kernels,
+                    gate_q8,
+                    &st.scratch.normed,
+                    &mut gdn.gate_buf,
+                    p.value_dim,
+                    hidden_dim,
+                    1,
+                    "gdn_gate_decode_mmq",
                 )?;
             }
         } else if gdn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
@@ -4599,9 +5153,9 @@ impl CudaBackend {
                         .arg(&dim)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "GDN rmsnorm (ab-mmq decode) L{layer_idx}: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN rmsnorm (ab-mmq decode) L{layer_idx}: {e}",))
+                })?;
             }
 
             let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
@@ -4614,7 +5168,9 @@ impl CudaBackend {
             };
             let dim = hidden_dim as u32;
             unsafe {
-                self.device.stream.launch_builder(fused_fn)
+                self.device
+                    .stream
+                    .launch_builder(fused_fn)
                     .arg(&st.scratch.x_gpu)
                     .arg(&lw.attn_norm)
                     .arg(&mut *q8_1_buf)
@@ -4628,11 +5184,18 @@ impl CudaBackend {
             // split-layout: prefer Q8/Q4 split siblings for the fused QKV weight.
             unsafe {
                 launch_matvec_preq8_1_tile(
-                    &self.device, &st.kernels, &lw.wq,
-                    lw.q8_tile_wq.as_ref(),  lw.q4_tile_wq.as_ref(),
-                    lw.q8_split_wq.as_ref(), lw.q4_split_wq.as_ref(),
-                    q8_1_buf, &mut gdn.qkv_buf,
-                    p.qkv_dim, hidden_dim, "gdn_qkv",
+                    &self.device,
+                    &st.kernels,
+                    &lw.wq,
+                    lw.q8_tile_wq.as_ref(),
+                    lw.q4_tile_wq.as_ref(),
+                    lw.q8_split_wq.as_ref(),
+                    lw.q4_split_wq.as_ref(),
+                    q8_1_buf,
+                    &mut gdn.qkv_buf,
+                    p.qkv_dim,
+                    hidden_dim,
+                    "gdn_qkv",
                 )?;
             }
 
@@ -4650,20 +5213,30 @@ impl CudaBackend {
                 let alpha_f16 = lw.ssm_alpha_f16.as_ref().expect("gdn_ab_f16 guards Some");
                 unsafe {
                     launch_hgemv_f16(
-                        &self.device, &st.kernels, alpha_f16,
-                        &st.scratch.normed, &mut gdn.alpha_raw_buf,
+                        &self.device,
+                        &st.kernels,
+                        alpha_f16,
+                        &st.scratch.normed,
+                        &mut gdn.alpha_raw_buf,
                         &mut st.scratch.input_f16,
-                        p.num_heads, hidden_dim, "gdn_alpha_f16",
+                        p.num_heads,
+                        hidden_dim,
+                        "gdn_alpha_f16",
                         cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
                     )?;
                 }
                 let beta_f16 = lw.ssm_beta_f16.as_ref().expect("gdn_ab_f16 guards Some");
                 unsafe {
                     launch_hgemv_f16(
-                        &self.device, &st.kernels, beta_f16,
-                        &st.scratch.normed, &mut gdn.beta_raw_buf,
+                        &self.device,
+                        &st.kernels,
+                        beta_f16,
+                        &st.scratch.normed,
+                        &mut gdn.beta_raw_buf,
                         &mut st.scratch.input_f16,
-                        p.num_heads, hidden_dim, "gdn_beta_f16",
+                        p.num_heads,
+                        hidden_dim,
+                        "gdn_beta_f16",
                         cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
                     )?;
                 }
@@ -4678,37 +5251,63 @@ impl CudaBackend {
                 };
                 unsafe {
                     super::prefill::launch_mmq_q8_0_batched(
-                        &self.device, &st.kernels, alpha_q8,
-                        &st.scratch.normed, &mut gdn.alpha_raw_buf,
-                        p.num_heads, hidden_dim, 1, "gdn_alpha_decode_ab_mmq",
+                        &self.device,
+                        &st.kernels,
+                        alpha_q8,
+                        &st.scratch.normed,
+                        &mut gdn.alpha_raw_buf,
+                        p.num_heads,
+                        hidden_dim,
+                        1,
+                        "gdn_alpha_decode_ab_mmq",
                     )?;
                 }
                 unsafe {
                     super::prefill::launch_mmq_q8_0_batched(
-                        &self.device, &st.kernels, beta_q8,
-                        &st.scratch.normed, &mut gdn.beta_raw_buf,
-                        p.num_heads, hidden_dim, 1, "gdn_beta_decode_ab_mmq",
+                        &self.device,
+                        &st.kernels,
+                        beta_q8,
+                        &st.scratch.normed,
+                        &mut gdn.beta_raw_buf,
+                        p.num_heads,
+                        hidden_dim,
+                        1,
+                        "gdn_beta_decode_ab_mmq",
                     )?;
                 }
             } else {
                 unsafe {
                     launch_matvec_preq8_1_tile(
-                        &self.device, &st.kernels, ssm_alpha_w,
-                        None, None,
-                        None, lw.q4_split_ssm_alpha.as_ref(),
-                        q8_1_buf, &mut gdn.alpha_raw_buf,
-                        p.num_heads, hidden_dim, "gdn_alpha",
+                        &self.device,
+                        &st.kernels,
+                        ssm_alpha_w,
+                        None,
+                        None,
+                        None,
+                        lw.q4_split_ssm_alpha.as_ref(),
+                        q8_1_buf,
+                        &mut gdn.alpha_raw_buf,
+                        p.num_heads,
+                        hidden_dim,
+                        "gdn_alpha",
                     )?;
                 }
 
                 // Beta matvec with shared pre-quantized input.
                 unsafe {
                     launch_matvec_preq8_1_tile(
-                        &self.device, &st.kernels, ssm_beta_w,
-                        None, None,
-                        None, lw.q4_split_ssm_beta.as_ref(),
-                        q8_1_buf, &mut gdn.beta_raw_buf,
-                        p.num_heads, hidden_dim, "gdn_beta",
+                        &self.device,
+                        &st.kernels,
+                        ssm_beta_w,
+                        None,
+                        None,
+                        None,
+                        lw.q4_split_ssm_beta.as_ref(),
+                        q8_1_buf,
+                        &mut gdn.beta_raw_buf,
+                        p.num_heads,
+                        hidden_dim,
+                        "gdn_beta",
                     )?;
                 }
             }
@@ -4716,11 +5315,18 @@ impl CudaBackend {
             // Gate matvec with shared pre-quantized input.
             unsafe {
                 launch_matvec_preq8_1_tile(
-                    &self.device, &st.kernels, attn_gate_w,
-                    None, None,
-                    None, lw.q4_split_attn_gate.as_ref(),
-                    q8_1_buf, &mut gdn.gate_buf,
-                    p.value_dim, hidden_dim, "gdn_gate",
+                    &self.device,
+                    &st.kernels,
+                    attn_gate_w,
+                    None,
+                    None,
+                    None,
+                    lw.q4_split_attn_gate.as_ref(),
+                    q8_1_buf,
+                    &mut gdn.gate_buf,
+                    p.value_dim,
+                    hidden_dim,
+                    "gdn_gate",
                 )?;
             }
         } else {
@@ -4745,7 +5351,9 @@ impl CudaBackend {
                         .arg(&dim)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!("GDN rmsnorm attn L{layer_idx}: {e}")))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN rmsnorm attn L{layer_idx}: {e}"))
+                })?;
             }
 
             // QKV matvec
@@ -4786,31 +5394,41 @@ impl CudaBackend {
                 let alpha_f16 = lw.ssm_alpha_f16.as_ref().expect("gdn_ab_f16 guards Some");
                 unsafe {
                     launch_hgemv_f16(
-                        &self.device, &st.kernels, alpha_f16,
-                        &st.scratch.normed, &mut gdn.alpha_raw_buf,
+                        &self.device,
+                        &st.kernels,
+                        alpha_f16,
+                        &st.scratch.normed,
+                        &mut gdn.alpha_raw_buf,
                         &mut st.scratch.input_f16,
-                        p.num_heads, hidden_dim, "gdn_alpha_f16",
+                        p.num_heads,
+                        hidden_dim,
+                        "gdn_alpha_f16",
                         cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
                     )?;
                 }
                 let beta_f16 = lw.ssm_beta_f16.as_ref().expect("gdn_ab_f16 guards Some");
                 unsafe {
                     launch_hgemv_f16(
-                        &self.device, &st.kernels, beta_f16,
-                        &st.scratch.normed, &mut gdn.beta_raw_buf,
+                        &self.device,
+                        &st.kernels,
+                        beta_f16,
+                        &st.scratch.normed,
+                        &mut gdn.beta_raw_buf,
                         &mut st.scratch.input_f16,
-                        p.num_heads, hidden_dim, "gdn_beta_f16",
+                        p.num_heads,
+                        hidden_dim,
+                        "gdn_beta_f16",
                         cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
                     )?;
                 }
             } else if gdn_decode_ab_mmq {
-            // alpha/beta MMQ alignment (MoE-gated; the bf16 path lands here
-            // because qkv/gate are Bf16Raw so `gdn_use_preq` is false): route
-            // alpha/beta through `mmq_q8_0_batched` (batch=1, from the F32
-            // `normed` already computed above) to match the prefill MMQ INT8
-            // reduction order instead of the per-token Q8_1/dp4a matvec. This
-            // is the empirically-isolated first-flipping-stage fix; qkv/gate
-            // (bit-identical decode-vs-prefill) keep their existing path.
+                // alpha/beta MMQ alignment (MoE-gated; the bf16 path lands here
+                // because qkv/gate are Bf16Raw so `gdn_use_preq` is false): route
+                // alpha/beta through `mmq_q8_0_batched` (batch=1, from the F32
+                // `normed` already computed above) to match the prefill MMQ INT8
+                // reduction order instead of the per-token Q8_1/dp4a matvec. This
+                // is the empirically-isolated first-flipping-stage fix; qkv/gate
+                // (bit-identical decode-vs-prefill) keep their existing path.
                 let alpha_q8 = match ssm_alpha_w {
                     GpuWeightBuf::Q8Raw(b) => b,
                     _ => unreachable!("gdn_decode_ab_mmq guards ssm_alpha is Q8Raw"),
@@ -4821,16 +5439,28 @@ impl CudaBackend {
                 };
                 unsafe {
                     super::prefill::launch_mmq_q8_0_batched(
-                        &self.device, &st.kernels, alpha_q8,
-                        &st.scratch.normed, &mut gdn.alpha_raw_buf,
-                        p.num_heads, hidden_dim, 1, "gdn_alpha_decode_ab_mmq",
+                        &self.device,
+                        &st.kernels,
+                        alpha_q8,
+                        &st.scratch.normed,
+                        &mut gdn.alpha_raw_buf,
+                        p.num_heads,
+                        hidden_dim,
+                        1,
+                        "gdn_alpha_decode_ab_mmq",
                     )?;
                 }
                 unsafe {
                     super::prefill::launch_mmq_q8_0_batched(
-                        &self.device, &st.kernels, beta_q8,
-                        &st.scratch.normed, &mut gdn.beta_raw_buf,
-                        p.num_heads, hidden_dim, 1, "gdn_beta_decode_ab_mmq",
+                        &self.device,
+                        &st.kernels,
+                        beta_q8,
+                        &st.scratch.normed,
+                        &mut gdn.beta_raw_buf,
+                        p.num_heads,
+                        hidden_dim,
+                        1,
+                        "gdn_beta_decode_ab_mmq",
                     )?;
                 }
             } else {
@@ -4905,16 +5535,25 @@ impl CudaBackend {
                     // for the BF16 activation (u8; cuBLAS interprets as CUDA_R_16BF).
                     unsafe {
                         super::prefill::launch_f32_to_bf16_fast(
-                            &self.device, &st.kernels,
-                            &st.scratch.normed, &mut st.scratch.input_f16,
-                            hidden_dim, "gdn_qkv_convparity",
+                            &self.device,
+                            &st.kernels,
+                            &st.scratch.normed,
+                            &mut st.scratch.input_f16,
+                            hidden_dim,
+                            "gdn_qkv_convparity",
                         )?;
                     }
                     unsafe {
                         super::prefill::launch_cublas_gemm_bf16(
-                            &self.device, w_bf16, &st.scratch.input_f16,
+                            &self.device,
+                            w_bf16,
+                            &st.scratch.input_f16,
                             &mut gdn.qkv_buf,
-                            p.qkv_dim, 1, hidden_dim, 0.0, "gdn_qkv_convparity",
+                            p.qkv_dim,
+                            1,
+                            hidden_dim,
+                            0.0,
+                            "gdn_qkv_convparity",
                         )?;
                     }
                 }
@@ -4925,9 +5564,15 @@ impl CudaBackend {
                     // per-token Q8_1/dp4a tile matvec.
                     unsafe {
                         super::prefill::launch_mmq_q8_0_batched(
-                            &self.device, &st.kernels, w_q8,
-                            &st.scratch.normed, &mut gdn.qkv_buf,
-                            p.qkv_dim, hidden_dim, 1, "gdn_qkv_convparity",
+                            &self.device,
+                            &st.kernels,
+                            w_q8,
+                            &st.scratch.normed,
+                            &mut gdn.qkv_buf,
+                            p.qkv_dim,
+                            hidden_dim,
+                            1,
+                            "gdn_qkv_convparity",
                         )?;
                     }
                 }
@@ -4966,21 +5611,18 @@ impl CudaBackend {
             );
         }
 
-
         // --- Steps 3a-7: Fused megakernel path (conv1d+silu, gates, L2, state update) ---
         // Falls back to unfused path if megakernel failed to compile.
-        let conv1d_weight = lw.ssm_conv1d.as_ref()
-            .ok_or_else(|| RuntimeError::Compute(format!(
-                "GDN L{layer_idx}: ssm_conv1d weight missing",
-            )))?;
-        let dt_bias = lw.ssm_dt_bias.as_ref()
-            .ok_or_else(|| RuntimeError::Compute(format!(
-                "GDN L{layer_idx}: ssm_dt_bias missing",
-            )))?;
-        let ssm_a = lw.ssm_a.as_ref()
-            .ok_or_else(|| RuntimeError::Compute(format!(
-                "GDN L{layer_idx}: ssm_a missing",
-            )))?;
+        let conv1d_weight = lw.ssm_conv1d.as_ref().ok_or_else(|| {
+            RuntimeError::Compute(format!("GDN L{layer_idx}: ssm_conv1d weight missing",))
+        })?;
+        let dt_bias = lw.ssm_dt_bias.as_ref().ok_or_else(|| {
+            RuntimeError::Compute(format!("GDN L{layer_idx}: ssm_dt_bias missing",))
+        })?;
+        let ssm_a = lw
+            .ssm_a
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute(format!("GDN L{layer_idx}: ssm_a missing",)))?;
 
         // === DECODE-VIA-PREFILL: GDN-decode==GDN-prefill structural parity ===
         // gated behind LUMEN_CUDA_GDN_DECODE_VIA_PREFILL (MoE-gated, default OFF).
@@ -5031,7 +5673,10 @@ impl CudaBackend {
         // to have been allocated at ensure_gdn_scratch time (gated on the
         // same env var).
         // default ON (matches init-site resolver).
-        let register_resident_env = match std::env::var("LUMEN_CUDA_GDN_REGISTER_RESIDENT").ok().as_deref() {
+        let register_resident_env = match std::env::var("LUMEN_CUDA_GDN_REGISTER_RESIDENT")
+            .ok()
+            .as_deref()
+        {
             Some(v) => matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"),
             None => crate::runtime_defaults::gdn_register_resident_default(),
         };
@@ -5058,10 +5703,11 @@ impl CudaBackend {
             // At T=1 every prefill kernel collapses to the single-token step:
             // identical arithmetic to a true prefill of this position, carrying
             // h_states[gdn_idx] / conv_states[gdn_idx] exactly as prefill does.
-            let ssm_norm = lw.ssm_norm_tiled.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(format!(
+            let ssm_norm = lw.ssm_norm_tiled.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!(
                     "GDN L{layer_idx}: ssm_norm_tiled missing (decode-via-prefill)",
-                )))?;
+                ))
+            })?;
 
             let num_heads_u32 = p.num_heads as u32;
             let num_kv_heads_u32 = p.num_kv_heads as u32;
@@ -5086,8 +5732,10 @@ impl CudaBackend {
             {
                 use std::sync::OnceLock;
                 static PD: OnceLock<bool> = OnceLock::new();
-                let probe = *PD.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"));
-                static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                let probe =
+                    *PD.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"));
+                static SHOWN: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
                 if probe && !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     eprintln!(
                         "[GDNSTATE] PATH=decode-via-prefill use_prefill_f64={} f64_enabled={} graph_mode={}",
@@ -5106,7 +5754,9 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 };
                 unsafe {
-                    self.device.stream.launch_builder(conv_fn)
+                    self.device
+                        .stream
+                        .launch_builder(conv_fn)
                         .arg(&gdn.qkv_buf)
                         .arg(&mut gdn.conv_states[gdn_idx])
                         .arg(conv1d_weight)
@@ -5117,9 +5767,11 @@ impl CudaBackend {
                         .arg(&batch_u32)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "GDN decode-via-prefill conv1d_silu L{layer_idx}: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "GDN decode-via-prefill conv1d_silu L{layer_idx}: {e}"
+                    ))
+                })?;
                 gdn.conv_positions[gdn_idx] = (state_pos + batch_u32) % buf_slots;
             }
 
@@ -5133,7 +5785,9 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 };
                 unsafe {
-                    self.device.stream.launch_builder(gates_fn)
+                    self.device
+                        .stream
+                        .launch_builder(gates_fn)
                         .arg(dt_bias)
                         .arg(ssm_a)
                         .arg(&gdn.beta_raw_buf)
@@ -5144,15 +5798,20 @@ impl CudaBackend {
                         .arg(&batch_u32)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "GDN decode-via-prefill gates_batched L{layer_idx}: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "GDN decode-via-prefill gates_batched L{layer_idx}: {e}"
+                    ))
+                })?;
             }
 
             // 3. l2_normalize_qk_strided[_f64accum]: L2-norm Q/K in-place on conv_out.
             {
                 let l2_fn = if use_prefill_f64 {
-                    st.kernels.l2_normalize_qk_strided_f64accum.as_ref().unwrap()
+                    st.kernels
+                        .l2_normalize_qk_strided_f64accum
+                        .as_ref()
+                        .unwrap()
                 } else {
                     st.kernels.l2_normalize_qk_strided.as_ref().unwrap()
                 };
@@ -5167,7 +5826,9 @@ impl CudaBackend {
                 let q_offset = 0u32;
                 let k_offset = p.qk_dim as u32;
                 unsafe {
-                    self.device.stream.launch_builder(l2_fn)
+                    self.device
+                        .stream
+                        .launch_builder(l2_fn)
                         .arg(&mut gdn.qkv_conv_buf)
                         .arg(&num_kv_heads_u32)
                         .arg(&head_dim_u32)
@@ -5177,9 +5838,11 @@ impl CudaBackend {
                         .arg(&k_offset)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "GDN decode-via-prefill l2_norm_qk L{layer_idx}: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "GDN decode-via-prefill l2_norm_qk L{layer_idx}: {e}"
+                    ))
+                })?;
             }
 
             // [GDNSTATE] mode=D phase=before (env LUMEN_MOE_PROBE=1).
@@ -5196,8 +5859,10 @@ impl CudaBackend {
                     "[GDNSTATE] mode=D phase=before step={} layer={layer_idx} \
                      state_pos={state_pos} h_sumsq={:.6} h_len={} conv_sumsq={:.6} conv_len={}",
                     st.decode_token_count,
-                    ss(&h_before), h_before.len(),
-                    ss(&conv_h), conv_h.len(),
+                    ss(&h_before),
+                    h_before.len(),
+                    ss(&conv_h),
+                    conv_h.len(),
                 );
             }
 
@@ -5216,7 +5881,9 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 };
                 unsafe {
-                    self.device.stream.launch_builder(state_fn)
+                    self.device
+                        .stream
+                        .launch_builder(state_fn)
                         .arg(&mut gdn.h_states[gdn_idx])
                         .arg(&gdn.qkv_conv_buf)
                         .arg(&gdn.alpha_buf)
@@ -5231,9 +5898,11 @@ impl CudaBackend {
                         .arg(&qkv_dim_u32)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "GDN decode-via-prefill fused_v3 L{layer_idx}: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "GDN decode-via-prefill fused_v3 L{layer_idx}: {e}"
+                    ))
+                })?;
             }
 
             // [GDNSTATE] mode=D phase=after + [XCHK] (env LUMEN_MOE_PROBE / LUMEN_XCHK).
@@ -5255,8 +5924,15 @@ impl CudaBackend {
                 *XK.get_or_init(|| std::env::var("LUMEN_XCHK").as_deref() == Ok("1"))
             } {
                 let sa = |v: &[f32]| -> (f64, f32) {
-                    let mut sq = 0f64; let mut mx = 0f32;
-                    for &e in v { sq += (e as f64) * (e as f64); let a = e.abs(); if a > mx { mx = a; } }
+                    let mut sq = 0f64;
+                    let mut mx = 0f32;
+                    for &e in v {
+                        sq += (e as f64) * (e as f64);
+                        let a = e.abs();
+                        if a > mx {
+                            mx = a;
+                        }
+                    }
                     (sq, mx)
                 };
                 let h_after = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
@@ -5264,7 +5940,9 @@ impl CudaBackend {
                 let (hsq, hmx) = sa(&h_after);
                 let (csq, cmx) = sa(&conv_h);
                 let step = st.decode_token_count;
-                eprintln!("[XCHK] step={step} L={layer_idx} gdn_h_state sumsq={hsq:.6} absmax={hmx:.6}");
+                eprintln!(
+                    "[XCHK] step={step} L={layer_idx} gdn_h_state sumsq={hsq:.6} absmax={hmx:.6}"
+                );
                 eprintln!("[XCHK] step={step} L={layer_idx} gdn_conv_state sumsq={csq:.6} absmax={cmx:.6}");
             }
 
@@ -5286,7 +5964,9 @@ impl CudaBackend {
                     shared_mem_bytes: norm_shared,
                 };
                 unsafe {
-                    self.device.stream.launch_builder(norm_fn)
+                    self.device
+                        .stream
+                        .launch_builder(norm_fn)
                         .arg(&gdn.output_buf)
                         .arg(&gdn.gate_buf)
                         .arg(ssm_norm)
@@ -5298,9 +5978,11 @@ impl CudaBackend {
                         .arg(&batch_u32)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "GDN decode-via-prefill norm_gate L{layer_idx}: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "GDN decode-via-prefill norm_gate L{layer_idx}: {e}"
+                    ))
+                })?;
             }
         } else if use_register_resident_phase4 {
             // === TWO-LAUNCH PATH: Phase 1-3 + Phase 4 (2 launches; replaces megakernel) ===
@@ -5311,7 +5993,12 @@ impl CudaBackend {
             // which converts strided LDG.E.32 (4 sectors/r) into a single coalesced
             // 128B transaction per r. ADD-only: falls back to gdn_phase4_register_resident.
             let use_phase4_coal = std::env::var("LUMEN_CUDA_GDN_PHASE4_COAL")
-                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+                .map(|v| {
+                    matches!(
+                        v.as_str(),
+                        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+                    )
+                })
                 .unwrap_or(false)
                 && st.kernels.gdn_phase4_register_resident_coal.is_some();
             // F64-internal-accumulator variant for Phase 4 (decode path).
@@ -5330,7 +6017,10 @@ impl CudaBackend {
             // Default OFF (`LUMEN_CUDA_GDN_RECUR_PREFILL_ORDER`, MoE-gated).
             let use_phase4_prefillorder = use_phase4_f64
                 && gdn_recur_prefill_order_enabled()
-                && st.kernels.gdn_phase4_register_resident_f64accum_prefillorder.is_some();
+                && st
+                    .kernels
+                    .gdn_phase4_register_resident_f64accum_prefillorder
+                    .is_some();
             // F64-internal-accumulator variant for Phase 1-3 (conv1d+SiLU+L2-norm).
             // DEFAULT OFF on its OWN gate `LUMEN_CUDA_GDN_PHASE123_F64=1`,
             // deliberately DECOUPLED from `gdn_f64_accum_enabled()` (which keeps
@@ -5373,11 +6063,20 @@ impl CudaBackend {
                 && gdn.conv_positions_gpu.is_some();
 
             let p4_fn = if use_phase4_prefillorder {
-                st.kernels.gdn_phase4_register_resident_f64accum_prefillorder.as_ref().unwrap()
+                st.kernels
+                    .gdn_phase4_register_resident_f64accum_prefillorder
+                    .as_ref()
+                    .unwrap()
             } else if use_phase4_f64 {
-                st.kernels.gdn_phase4_register_resident_f64accum.as_ref().unwrap()
+                st.kernels
+                    .gdn_phase4_register_resident_f64accum
+                    .as_ref()
+                    .unwrap()
             } else if use_phase4_coal {
-                st.kernels.gdn_phase4_register_resident_coal.as_ref().unwrap()
+                st.kernels
+                    .gdn_phase4_register_resident_coal
+                    .as_ref()
+                    .unwrap()
             } else {
                 st.kernels.gdn_phase4_register_resident.as_ref().unwrap()
             };
@@ -5409,13 +6108,19 @@ impl CudaBackend {
             // kernel (so resolve F64-for-graph separately).
             let use_phase123_graph_f64 = use_phase123_graph
                 && use_phase123_f64
-                && st.kernels.gdn_phase123_register_resident_graph_f64accum.is_some();
+                && st
+                    .kernels
+                    .gdn_phase123_register_resident_graph_f64accum
+                    .is_some();
             // ALIGN graph twin (only when the graph-capturable align kernel
             // compiled; otherwise the graph branch falls back to F32 base).
             // ALIGN takes precedence over PHASE123_F64 if both requested.
             let use_phase123_graph_align = use_phase123_graph
                 && use_phase123_align
-                && st.kernels.gdn_phase123_register_resident_graph_alignl2.is_some();
+                && st
+                    .kernels
+                    .gdn_phase123_register_resident_graph_alignl2
+                    .is_some();
             // F64 shmem doubles q_shmem/k_shmem/warp_scratch element size.
             // Non-graph dispatch uses F64 whenever `use_phase123_f64`; graph
             // dispatch uses F64 only when the graph F64 twin is present.
@@ -5436,7 +6141,11 @@ impl CudaBackend {
             };
             // F64 shmem (8 bytes/elem) whenever the dispatch runs the F64-base
             // OR the align kernel (both use all-double shmem); F32 otherwise.
-            let elem_bytes = if phase123_is_f64 || phase123_is_align { 8u32 } else { 4u32 };
+            let elem_bytes = if phase123_is_f64 || phase123_is_align {
+                8u32
+            } else {
+                4u32
+            };
             let shared_bytes = (32 + 2 * p.head_dim as u32) * elem_bytes;
             let p123_cfg = CudarcLaunchConfig {
                 grid_dim: (num_heads_u32, 1, 1),
@@ -5457,15 +6166,26 @@ impl CudaBackend {
                 // state_pos at capture time. The advance_conv_position kernel
                 // (dispatched after phase4 below) increments it per-replay.
                 let p123_graph_fn = if use_phase123_graph_align {
-                    st.kernels.gdn_phase123_register_resident_graph_alignl2.as_ref().unwrap()
+                    st.kernels
+                        .gdn_phase123_register_resident_graph_alignl2
+                        .as_ref()
+                        .unwrap()
                 } else if use_phase123_graph_f64 {
-                    st.kernels.gdn_phase123_register_resident_graph_f64accum.as_ref().unwrap()
+                    st.kernels
+                        .gdn_phase123_register_resident_graph_f64accum
+                        .as_ref()
+                        .unwrap()
                 } else {
-                    st.kernels.gdn_phase123_register_resident_graph.as_ref().unwrap()
+                    st.kernels
+                        .gdn_phase123_register_resident_graph
+                        .as_ref()
+                        .unwrap()
                 };
                 let gpu_pos_slice = &mut gdn.conv_positions_gpu.as_mut().unwrap()[gdn_idx];
                 unsafe {
-                    self.device.stream.launch_builder(p123_graph_fn)
+                    self.device
+                        .stream
+                        .launch_builder(p123_graph_fn)
                         .arg(&mut gdn.conv_states[gdn_idx])
                         .arg(&gdn.qkv_buf)
                         .arg(&gdn.alpha_raw_buf)
@@ -5475,7 +6195,7 @@ impl CudaBackend {
                         .arg(ssm_a)
                         .arg(gdn.q_norm_buf_rr.as_mut().unwrap())
                         .arg(gdn.k_norm_buf_rr.as_mut().unwrap())
-                        .arg(&mut gdn.normed_out_buf)   // V buf
+                        .arg(&mut gdn.normed_out_buf) // V buf
                         .arg(&mut gdn.alpha_buf)
                         .arg(&mut gdn.beta_buf)
                         .arg(&num_heads_u32)
@@ -5488,17 +6208,29 @@ impl CudaBackend {
                         .arg(&*gpu_pos_slice)
                         .launch(p123_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!("GDN phase123 register_resident graph L{layer_idx}: {e}")))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "GDN phase123 register_resident graph L{layer_idx}: {e}"
+                    ))
+                })?;
             } else {
                 let p123_fn = if use_phase123_align {
-                    st.kernels.gdn_phase123_register_resident_alignl2.as_ref().unwrap()
+                    st.kernels
+                        .gdn_phase123_register_resident_alignl2
+                        .as_ref()
+                        .unwrap()
                 } else if use_phase123_f64 {
-                    st.kernels.gdn_phase123_register_resident_f64accum.as_ref().unwrap()
+                    st.kernels
+                        .gdn_phase123_register_resident_f64accum
+                        .as_ref()
+                        .unwrap()
                 } else {
                     st.kernels.gdn_phase123_register_resident.as_ref().unwrap()
                 };
                 unsafe {
-                    self.device.stream.launch_builder(p123_fn)
+                    self.device
+                        .stream
+                        .launch_builder(p123_fn)
                         .arg(&mut gdn.conv_states[gdn_idx])
                         .arg(&gdn.qkv_buf)
                         .arg(&gdn.alpha_raw_buf)
@@ -5508,7 +6240,7 @@ impl CudaBackend {
                         .arg(ssm_a)
                         .arg(gdn.q_norm_buf_rr.as_mut().unwrap())
                         .arg(gdn.k_norm_buf_rr.as_mut().unwrap())
-                        .arg(&mut gdn.normed_out_buf)   // V buf
+                        .arg(&mut gdn.normed_out_buf) // V buf
                         .arg(&mut gdn.alpha_buf)
                         .arg(&mut gdn.beta_buf)
                         .arg(&num_heads_u32)
@@ -5521,7 +6253,11 @@ impl CudaBackend {
                         .arg(&state_pos)
                         .launch(p123_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!("GDN phase123 register_resident L{layer_idx}: {e}")))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "GDN phase123 register_resident L{layer_idx}: {e}"
+                    ))
+                })?;
             }
 
             if phase123_is_align {
@@ -5568,25 +6304,31 @@ impl CudaBackend {
                     "[GDNSTATE] mode=D phase=before step={} layer={layer_idx} \
                      state_pos={state_pos} h_sumsq={:.6} h_len={} conv_sumsq={:.6} conv_len={}",
                     st.decode_token_count,
-                    ss(&h_before), h_before.len(),
-                    ss(&conv_h), conv_h.len(),
+                    ss(&h_before),
+                    h_before.len(),
+                    ss(&conv_h),
+                    conv_h.len(),
                 );
             }
             unsafe {
-                self.device.stream.launch_builder(p4_fn)
+                self.device
+                    .stream
+                    .launch_builder(p4_fn)
                     .arg(&mut gdn.h_states[gdn_idx])
                     .arg(gdn.q_norm_buf_rr.as_ref().unwrap())
                     .arg(gdn.k_norm_buf_rr.as_ref().unwrap())
-                    .arg(&gdn.normed_out_buf)   // V (read; written by phase123)
+                    .arg(&gdn.normed_out_buf) // V (read; written by phase123)
                     .arg(&gdn.alpha_buf)
                     .arg(&gdn.beta_buf)
-                    .arg(&mut gdn.output_buf)   // output (written by phase4)
+                    .arg(&mut gdn.output_buf) // output (written by phase4)
                     .arg(&num_heads_u32)
                     .arg(&num_kv_heads_u32)
                     .arg(&head_dim_u32)
                     .launch(p4_cfg)
             }
-            .map_err(|e| RuntimeError::Compute(format!("GDN phase4 register_resident L{layer_idx}: {e}")))?;
+            .map_err(|e| {
+                RuntimeError::Compute(format!("GDN phase4 register_resident L{layer_idx}: {e}"))
+            })?;
             if gdnstate_probe {
                 let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
                 let h_after = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
@@ -5609,8 +6351,15 @@ impl CudaBackend {
                 *XKR.get_or_init(|| std::env::var("LUMEN_XCHK").as_deref() == Ok("1"))
             } {
                 let sa = |v: &[f32]| -> (f64, f32) {
-                    let mut sq = 0f64; let mut mx = 0f32;
-                    for &e in v { sq += (e as f64) * (e as f64); let a = e.abs(); if a > mx { mx = a; } }
+                    let mut sq = 0f64;
+                    let mut mx = 0f32;
+                    for &e in v {
+                        sq += (e as f64) * (e as f64);
+                        let a = e.abs();
+                        if a > mx {
+                            mx = a;
+                        }
+                    }
                     (sq, mx)
                 };
                 let h_after = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
@@ -5618,7 +6367,9 @@ impl CudaBackend {
                 let (hsq, hmx) = sa(&h_after);
                 let (csq, cmx) = sa(&conv_h);
                 let step = st.decode_token_count;
-                eprintln!("[XCHK] step={step} L={layer_idx} gdn_h_state sumsq={hsq:.6} absmax={hmx:.6}");
+                eprintln!(
+                    "[XCHK] step={step} L={layer_idx} gdn_h_state sumsq={hsq:.6} absmax={hmx:.6}"
+                );
                 eprintln!("[XCHK] step={step} L={layer_idx} gdn_conv_state sumsq={csq:.6} absmax={cmx:.6}");
             }
 
@@ -5631,9 +6382,11 @@ impl CudaBackend {
             // counter advance below remains in lockstep so any subsequent
             // eager-fallback path reads a consistent host counter.
             if use_phase123_graph {
-                let gk = st.graph_kernels.as_ref().ok_or_else(|| RuntimeError::Compute(
-                    "graph mode requires graph_kernels (advance_conv_position)".into(),
-                ))?;
+                let gk = st.graph_kernels.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute(
+                        "graph mode requires graph_kernels (advance_conv_position)".into(),
+                    )
+                })?;
                 let advance_cfg = CudarcLaunchConfig {
                     grid_dim: (1, 1, 1),
                     block_dim: (1, 1, 1),
@@ -5641,14 +6394,16 @@ impl CudaBackend {
                 };
                 let gpu_pos_slice2 = &mut gdn.conv_positions_gpu.as_mut().unwrap()[gdn_idx];
                 unsafe {
-                    self.device.stream.launch_builder(&gk.advance_conv_position)
+                    self.device
+                        .stream
+                        .launch_builder(&gk.advance_conv_position)
                         .arg(&mut *gpu_pos_slice2)
                         .arg(&buf_slots)
                         .launch(advance_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "GDN advance_conv_position L{layer_idx}: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN advance_conv_position L{layer_idx}: {e}",))
+                })?;
             }
 
             gdn.conv_positions[gdn_idx] = (state_pos + 1) % buf_slots;
@@ -5677,8 +6432,10 @@ impl CudaBackend {
             {
                 use std::sync::OnceLock;
                 static PD: OnceLock<bool> = OnceLock::new();
-                let probe = *PD.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"));
-                static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                let probe =
+                    *PD.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"));
+                static SHOWN: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
                 if probe && !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     eprintln!(
                         "[GDNSTATE] PATH=megakernel-eager use_mega_f64={} f64_enabled={} f64_twin_compiled={} graph_mode={}",
@@ -5724,9 +6481,8 @@ impl CudaBackend {
             } else {
                 st.kernels.gdn_decode_megakernel_graph.is_some()
             };
-            let use_graph_mega = graph_mode
-                && graph_twin_available
-                && gdn.conv_positions_gpu.is_some();
+            let use_graph_mega =
+                graph_mode && graph_twin_available && gdn.conv_positions_gpu.is_some();
 
             if use_graph_mega {
                 // dispatch the graph-capturable variant with
@@ -5735,7 +6491,10 @@ impl CudaBackend {
                 // before begin_capture(), so its current value matches the
                 // host state_pos at capture time.
                 let mega_graph_fn = if use_mega_f64 {
-                    st.kernels.gdn_decode_megakernel_graph_f64accum.as_ref().unwrap()
+                    st.kernels
+                        .gdn_decode_megakernel_graph_f64accum
+                        .as_ref()
+                        .unwrap()
                 } else {
                     st.kernels.gdn_decode_megakernel_graph.as_ref().unwrap()
                 };
@@ -5767,16 +6526,18 @@ impl CudaBackend {
                         .arg(&*gpu_pos_slice)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "GDN megakernel_graph L{layer_idx}: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN megakernel_graph L{layer_idx}: {e}",))
+                })?;
 
                 // Follow-up: advance_conv_position kernel inside the captured
                 // graph. Single thread, single block — trivially cheap.
                 let buf_slots = (p.conv_kernel_size - 1) as u32;
-                let gk = st.graph_kernels.as_ref().ok_or_else(|| RuntimeError::Compute(
-                    "graph mode requires graph_kernels (advance_conv_position)".into(),
-                ))?;
+                let gk = st.graph_kernels.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute(
+                        "graph mode requires graph_kernels (advance_conv_position)".into(),
+                    )
+                })?;
                 let advance_cfg = CudarcLaunchConfig {
                     grid_dim: (1, 1, 1),
                     block_dim: (1, 1, 1),
@@ -5791,9 +6552,9 @@ impl CudaBackend {
                         .arg(&buf_slots)
                         .launch(advance_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "GDN advance_conv_position L{layer_idx}: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN advance_conv_position L{layer_idx}: {e}",))
+                })?;
 
                 // Host counter is advanced by the CALLER post-replay (see
                 // `decode_token` graph-replay path), NOT here, because this
@@ -5821,15 +6582,18 @@ impl CudaBackend {
                     *GSM.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
                 };
                 if gdnstate_probe_mega {
-                    let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                    let ss =
+                        |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
                     let h_before = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
                     let conv_h = self.device.dtoh_copy(&gdn.conv_states[gdn_idx])?;
                     eprintln!(
                         "[GDNSTATE] mode=D phase=before step={} layer={layer_idx} \
                          state_pos={state_pos} h_sumsq={:.6} h_len={} conv_sumsq={:.6} conv_len={}",
                         st.decode_token_count,
-                        ss(&h_before), h_before.len(),
-                        ss(&conv_h), conv_h.len(),
+                        ss(&h_before),
+                        h_before.len(),
+                        ss(&conv_h),
+                        conv_h.len(),
                     );
                 }
                 unsafe {
@@ -5857,7 +6621,8 @@ impl CudaBackend {
                 }
                 .map_err(|e| RuntimeError::Compute(format!("GDN megakernel L{layer_idx}: {e}")))?;
                 if gdnstate_probe_mega {
-                    let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                    let ss =
+                        |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
                     let h_after = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
                     let out_h = self.device.dtoh_copy(&gdn.output_buf)?;
                     eprintln!(
@@ -5880,8 +6645,15 @@ impl CudaBackend {
                     *XK.get_or_init(|| std::env::var("LUMEN_XCHK").as_deref() == Ok("1"))
                 } {
                     let sa = |v: &[f32]| -> (f64, f32) {
-                        let mut sq = 0f64; let mut mx = 0f32;
-                        for &e in v { sq += (e as f64) * (e as f64); let a = e.abs(); if a > mx { mx = a; } }
+                        let mut sq = 0f64;
+                        let mut mx = 0f32;
+                        for &e in v {
+                            sq += (e as f64) * (e as f64);
+                            let a = e.abs();
+                            if a > mx {
+                                mx = a;
+                            }
+                        }
                         (sq, mx)
                     };
                     let h_after = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
@@ -5901,10 +6673,9 @@ impl CudaBackend {
             // === UNFUSED FALLBACK PATH ===
             // Step 3a: Conv1D decode
             {
-                let conv1d_fn = st.kernels.ssm_conv1d_decode.as_ref()
-                    .ok_or_else(|| RuntimeError::Compute(
-                        "GDN ssm_conv1d_decode kernel not compiled".into(),
-                    ))?;
+                let conv1d_fn = st.kernels.ssm_conv1d_decode.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute("GDN ssm_conv1d_decode kernel not compiled".into())
+                })?;
                 let config = LaunchConfig::for_elements(p.qkv_dim);
                 let launch_cfg = CudarcLaunchConfig {
                     grid_dim: (config.grid_dim, 1, 1),
@@ -5936,10 +6707,9 @@ impl CudaBackend {
 
             // Step 3b: SiLU activation on conv output
             {
-                let silu_fn = st.kernels.silu_inplace.as_ref()
-                    .ok_or_else(|| RuntimeError::Compute(
-                        "GDN silu_inplace kernel not compiled".into(),
-                    ))?;
+                let silu_fn = st.kernels.silu_inplace.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute("GDN silu_inplace kernel not compiled".into())
+                })?;
                 let config = LaunchConfig::for_elements(p.qkv_dim);
                 let launch_cfg = CudarcLaunchConfig {
                     grid_dim: (config.grid_dim, 1, 1),
@@ -5960,10 +6730,9 @@ impl CudaBackend {
 
             // Step 4c: Compute gates
             {
-                let gates_fn = st.kernels.gdn_compute_gates.as_ref()
-                    .ok_or_else(|| RuntimeError::Compute(
-                        "GDN gdn_compute_gates kernel not compiled".into(),
-                    ))?;
+                let gates_fn = st.kernels.gdn_compute_gates.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute("GDN gdn_compute_gates kernel not compiled".into())
+                })?;
                 let config = LaunchConfig::for_elements(p.num_heads);
                 let launch_cfg = CudarcLaunchConfig {
                     grid_dim: (config.grid_dim, 1, 1),
@@ -5984,15 +6753,16 @@ impl CudaBackend {
                         .arg(&num_heads)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!("GDN compute_gates L{layer_idx}: {e}")))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN compute_gates L{layer_idx}: {e}"))
+                })?;
             }
 
             // Step 5: L2-normalize Q and K per head
             {
-                let l2_fn = st.kernels.l2_normalize_heads.as_ref()
-                    .ok_or_else(|| RuntimeError::Compute(
-                        "GDN l2_normalize_heads kernel not compiled".into(),
-                    ))?;
+                let l2_fn = st.kernels.l2_normalize_heads.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute("GDN l2_normalize_heads kernel not compiled".into())
+                })?;
                 let num_kv_heads_u32 = p.num_kv_heads as u32;
                 let head_dim_u32 = p.head_dim as u32;
                 let l2_eps = 1e-12f32;
@@ -6006,29 +6776,42 @@ impl CudaBackend {
                 {
                     let mut q_view = gdn.qkv_conv_buf.slice_mut(0..p.qk_dim);
                     unsafe {
-                        self.device.stream.launch_builder(l2_fn)
-                            .arg(&mut q_view).arg(&num_kv_heads_u32).arg(&head_dim_u32).arg(&l2_eps)
+                        self.device
+                            .stream
+                            .launch_builder(l2_fn)
+                            .arg(&mut q_view)
+                            .arg(&num_kv_heads_u32)
+                            .arg(&head_dim_u32)
+                            .arg(&l2_eps)
                             .launch(launch_cfg)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!("GDN l2_norm Q L{layer_idx}: {e}")))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("GDN l2_norm Q L{layer_idx}: {e}"))
+                    })?;
                 }
                 {
                     let mut k_view = gdn.qkv_conv_buf.slice_mut(p.qk_dim..2 * p.qk_dim);
                     unsafe {
-                        self.device.stream.launch_builder(l2_fn)
-                            .arg(&mut k_view).arg(&num_kv_heads_u32).arg(&head_dim_u32).arg(&l2_eps)
+                        self.device
+                            .stream
+                            .launch_builder(l2_fn)
+                            .arg(&mut k_view)
+                            .arg(&num_kv_heads_u32)
+                            .arg(&head_dim_u32)
+                            .arg(&l2_eps)
                             .launch(launch_cfg)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!("GDN l2_norm K L{layer_idx}: {e}")))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("GDN l2_norm K L{layer_idx}: {e}"))
+                    })?;
                 }
             }
 
             // Steps 6+7: State update + output
             {
-                let state_fn = st.kernels.gdn_state_update.as_ref()
-                    .ok_or_else(|| RuntimeError::Compute(
-                        "GDN gdn_state_update kernel not compiled".into(),
-                    ))?;
+                let state_fn = st.kernels.gdn_state_update.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute("GDN gdn_state_update kernel not compiled".into())
+                })?;
                 let num_heads_u32 = p.num_heads as u32;
                 let val_dim_u32 = p.head_dim as u32;
                 let key_dim_u32 = p.head_dim as u32;
@@ -6043,14 +6826,25 @@ impl CudaBackend {
                 let v_view = gdn.qkv_conv_buf.slice(2 * p.qk_dim..p.qkv_dim);
                 let q_view = gdn.qkv_conv_buf.slice(0..p.qk_dim);
                 unsafe {
-                    self.device.stream.launch_builder(state_fn)
+                    self.device
+                        .stream
+                        .launch_builder(state_fn)
                         .arg(&mut gdn.h_states[gdn_idx])
-                        .arg(&k_view).arg(&v_view).arg(&gdn.alpha_buf).arg(&gdn.beta_buf)
-                        .arg(&q_view).arg(&mut gdn.output_buf)
-                        .arg(&num_heads_u32).arg(&val_dim_u32).arg(&key_dim_u32).arg(&num_kv_heads_u32)
+                        .arg(&k_view)
+                        .arg(&v_view)
+                        .arg(&gdn.alpha_buf)
+                        .arg(&gdn.beta_buf)
+                        .arg(&q_view)
+                        .arg(&mut gdn.output_buf)
+                        .arg(&num_heads_u32)
+                        .arg(&val_dim_u32)
+                        .arg(&key_dim_u32)
+                        .arg(&num_kv_heads_u32)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!("GDN state_update L{layer_idx}: {e}")))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN state_update L{layer_idx}: {e}"))
+                })?;
             }
         }
 
@@ -6073,15 +6867,14 @@ impl CudaBackend {
             used_fused_norm_gate = true;
         } else if let Some(ref fused_fn) = st.kernels.gdn_rmsnorm_silu_gate {
             // === FUSED: RMSNorm + SiLU(gate) * normed in one kernel ===
-            let ssm_norm = lw.ssm_norm_tiled.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(format!(
-                    "GDN L{layer_idx}: ssm_norm_tiled missing",
-                )))?;
+            let ssm_norm = lw.ssm_norm_tiled.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!("GDN L{layer_idx}: ssm_norm_tiled missing",))
+            })?;
 
             // when LUMEN_CUDA_GDN_F64_ACCUM=1, prefer F64 variant.
             // Shared-mem doubles (8 bytes per warp slot vs 4).
-            let use_norm_gate_f64 = gdn_f64_accum_enabled()
-                && st.kernels.gdn_rmsnorm_silu_gate_f64accum.is_some();
+            let use_norm_gate_f64 =
+                gdn_f64_accum_enabled() && st.kernels.gdn_rmsnorm_silu_gate_f64accum.is_some();
             let chosen_fn = if use_norm_gate_f64 {
                 st.kernels.gdn_rmsnorm_silu_gate_f64accum.as_ref().unwrap()
             } else {
@@ -6089,7 +6882,11 @@ impl CudaBackend {
             };
             let block_size = rmsnorm_block_size(p.value_dim);
             let base_shared = rmsnorm_shared_bytes(block_size);
-            let shared_bytes = if use_norm_gate_f64 { base_shared * 2 } else { base_shared };
+            let shared_bytes = if use_norm_gate_f64 {
+                base_shared * 2
+            } else {
+                base_shared
+            };
             let launch_cfg = CudarcLaunchConfig {
                 grid_dim: (1, 1, 1),
                 block_dim: (block_size, 1, 1),
@@ -6112,16 +6909,17 @@ impl CudaBackend {
                     .arg(&dim)
                     .launch(launch_cfg)
             }
-            .map_err(|e| RuntimeError::Compute(format!("GDN fused_rmsnorm_silu_gate L{layer_idx}: {e}")))?;
+            .map_err(|e| {
+                RuntimeError::Compute(format!("GDN fused_rmsnorm_silu_gate L{layer_idx}: {e}"))
+            })?;
             used_fused_norm_gate = true;
         } else {
             // === UNFUSED FALLBACK ===
             // Step 8: RMSNorm on output
             {
-                let ssm_norm = lw.ssm_norm_tiled.as_ref()
-                    .ok_or_else(|| RuntimeError::Compute(format!(
-                        "GDN L{layer_idx}: ssm_norm_tiled missing",
-                    )))?;
+                let ssm_norm = lw.ssm_norm_tiled.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute(format!("GDN L{layer_idx}: ssm_norm_tiled missing",))
+                })?;
                 let block_size = rmsnorm_block_size(p.value_dim);
                 let shared_bytes = rmsnorm_shared_bytes(block_size);
                 let launch_cfg = CudarcLaunchConfig {
@@ -6131,20 +6929,26 @@ impl CudaBackend {
                 };
                 let dim = p.value_dim as u32;
                 unsafe {
-                    self.device.stream.launch_builder(&st.kernels.rmsnorm)
-                        .arg(&gdn.output_buf).arg(ssm_norm).arg(&mut gdn.normed_out_buf)
-                        .arg(&eps).arg(&dim)
+                    self.device
+                        .stream
+                        .launch_builder(&st.kernels.rmsnorm)
+                        .arg(&gdn.output_buf)
+                        .arg(ssm_norm)
+                        .arg(&mut gdn.normed_out_buf)
+                        .arg(&eps)
+                        .arg(&dim)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!("GDN rmsnorm output L{layer_idx}: {e}")))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN rmsnorm output L{layer_idx}: {e}"))
+                })?;
             }
 
             // Step 10: SiLU(gate) * normed_output -> output_buf
             {
-                let silu_mul_fn = st.kernels.silu_elementwise_mul.as_ref()
-                    .ok_or_else(|| RuntimeError::Compute(
-                        "GDN silu_elementwise_mul kernel not compiled".into(),
-                    ))?;
+                let silu_mul_fn = st.kernels.silu_elementwise_mul.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute("GDN silu_elementwise_mul kernel not compiled".into())
+                })?;
                 let config = LaunchConfig::for_elements(p.value_dim);
                 let launch_cfg = CudarcLaunchConfig {
                     grid_dim: (config.grid_dim, 1, 1),
@@ -6153,8 +6957,12 @@ impl CudaBackend {
                 };
                 let n = p.value_dim as u32;
                 unsafe {
-                    self.device.stream.launch_builder(silu_mul_fn)
-                        .arg(&gdn.gate_buf).arg(&gdn.normed_out_buf).arg(&mut gdn.output_buf)
+                    self.device
+                        .stream
+                        .launch_builder(silu_mul_fn)
+                        .arg(&gdn.gate_buf)
+                        .arg(&gdn.normed_out_buf)
+                        .arg(&mut gdn.output_buf)
                         .arg(&n)
                         .launch(launch_cfg)
                 }
@@ -6163,47 +6971,62 @@ impl CudaBackend {
             used_fused_norm_gate = false;
         }
 
-
         // --- Step 11: Output projection -> ssm_proj ---
         // Fused path: reads from normed_out_buf. Unfused path: reads from output_buf.
         // GDN_SPLIT: when q4_split_ssm_out is set, route through
         // launch_matvec_preq8_1_split via inline Q8_1 quantization. Otherwise
         // fall through to launch_matvec as before.
         {
-            let ssm_out = lw.ssm_out.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(format!(
-                    "GDN L{layer_idx}: ssm_out weight missing",
-                )))?;
+            let ssm_out = lw.ssm_out.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!("GDN L{layer_idx}: ssm_out weight missing",))
+            })?;
             let ssm_input = if used_fused_norm_gate {
                 &gdn.normed_out_buf
             } else {
                 &gdn.output_buf
             };
-            let use_split_ssm_out = st.kernels.use_q4_split_dispatch
-                && lw.q4_split_ssm_out.is_some();
+            let use_split_ssm_out =
+                st.kernels.use_q4_split_dispatch && lw.q4_split_ssm_out.is_some();
             if use_split_ssm_out {
                 let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref();
                 let q8_1_scratch = st.scratch.input_q8_1.as_mut();
                 if let (Some(quant_fn), Some(q8_1_buf)) = (quant_fn, q8_1_scratch) {
                     unsafe {
                         launch_quantize_input_q8_1(
-                            &self.device, quant_fn, ssm_input, q8_1_buf,
-                            p.value_dim, "gdn_ssm_out split",
+                            &self.device,
+                            quant_fn,
+                            ssm_input,
+                            q8_1_buf,
+                            p.value_dim,
+                            "gdn_ssm_out split",
                         )?;
                         launch_matvec_preq8_1_tile(
-                            &self.device, &st.kernels, ssm_out,
-                            None, None,
-                            None, lw.q4_split_ssm_out.as_ref(),
-                            q8_1_buf, &mut gdn.ssm_proj_buf,
-                            hidden_dim, p.value_dim, "gdn_ssm_out",
+                            &self.device,
+                            &st.kernels,
+                            ssm_out,
+                            None,
+                            None,
+                            None,
+                            lw.q4_split_ssm_out.as_ref(),
+                            q8_1_buf,
+                            &mut gdn.ssm_proj_buf,
+                            hidden_dim,
+                            p.value_dim,
+                            "gdn_ssm_out",
                         )?;
                     }
                 } else {
                     unsafe {
                         launch_matvec(
-                            &self.device, &st.kernels, ssm_out, ssm_input,
-                            &mut gdn.ssm_proj_buf, hidden_dim, p.value_dim,
-                            "gdn_ssm_out", lw.ssm_out_f16.as_ref(),
+                            &self.device,
+                            &st.kernels,
+                            ssm_out,
+                            ssm_input,
+                            &mut gdn.ssm_proj_buf,
+                            hidden_dim,
+                            p.value_dim,
+                            "gdn_ssm_out",
+                            lw.ssm_out_f16.as_ref(),
                             Some(&mut st.scratch.input_f16),
                             st.scratch.input_q8_1.as_mut(),
                         )?;
@@ -6222,12 +7045,11 @@ impl CudaBackend {
                         "gdn_ssm_out",
                         lw.ssm_out_f16.as_ref(),
                         Some(&mut st.scratch.input_f16),
-                    st.scratch.input_q8_1.as_mut(),
+                        st.scratch.input_q8_1.as_mut(),
                     )?;
                 }
             }
         }
-
 
         // --- Step 12+13: Fused residual add + copy ---
         // attn_proj = x_gpu + ssm_proj (via residual_add_copy, 1 dispatch).
@@ -6252,9 +7074,10 @@ impl CudaBackend {
                     .arg(&n)
                     .launch(launch_cfg)
             }
-            .map_err(|e| RuntimeError::Compute(format!("GDN residual_add_copy L{layer_idx}: {e}")))?;
+            .map_err(|e| {
+                RuntimeError::Compute(format!("GDN residual_add_copy L{layer_idx}: {e}"))
+            })?;
         }
-
 
         Ok(())
     }
@@ -6306,10 +7129,11 @@ impl CudaBackend {
         let gdn = st.gdn_scratch_gpu.as_mut().unwrap();
         let p = gdn.params;
 
-        let gdn_idx = gdn.gdn_layer_map[layer_idx]
-            .ok_or_else(|| RuntimeError::Compute(format!(
+        let gdn_idx = gdn.gdn_layer_map[layer_idx].ok_or_else(|| {
+            RuntimeError::Compute(format!(
                 "prefill_gdn_layer: layer {layer_idx} is not a GDN layer",
-            )))?;
+            ))
+        })?;
 
         // GDN sub-stage timing (diagnostic, no-op when unset). When
         // LUMEN_CUDA_GDN_SUBSTAGE_TIMING=1, syncs at phase boundaries and
@@ -6346,9 +7170,14 @@ impl CudaBackend {
         // 1. Batched RMSNorm: x[T, hidden] -> normed[T, hidden]
         unsafe {
             super::prefill::launch_rmsnorm_batched(
-                &self.device, &st.kernels,
-                &pf.x, &lw.attn_norm, &mut pf.normed,
-                eps, batch, hidden_dim,
+                &self.device,
+                &st.kernels,
+                &pf.x,
+                &lw.attn_norm,
+                &mut pf.normed,
+                eps,
+                batch,
+                hidden_dim,
             )?;
         }
 
@@ -6356,54 +7185,79 @@ impl CudaBackend {
         // wq for GDN is the fused [qkv_dim, hidden_dim] weight.
         unsafe {
             super::prefill::launch_gemm_projection(
-                &self.device, &st.kernels, &lw.wq, lw.wq_f16.as_ref(),
-                &pf.normed, &mut gdn_pf.qkv,
-                &mut pf.dequant_f32, &mut pf.activation_f16,
+                &self.device,
+                &st.kernels,
+                &lw.wq,
+                lw.wq_f16.as_ref(),
+                &pf.normed,
+                &mut gdn_pf.qkv,
+                &mut pf.dequant_f32,
+                &mut pf.activation_f16,
                 &mut pf.dequant_f16,
-                batch, p.qkv_dim, hidden_dim, "gdn_qkv",
+                batch,
+                p.qkv_dim,
+                hidden_dim,
+                "gdn_qkv",
             )?;
         }
 
         // 3. Batched Gate GEMM: normed[T, hidden] @ attn_gate^T -> gate[T, value_dim]
         {
-            let attn_gate = lw.attn_gate.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(format!(
+            let attn_gate = lw.attn_gate.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!(
                     "GDN prefill L{layer_idx}: attn_gate weight missing",
-                )))?;
+                ))
+            })?;
             unsafe {
                 super::prefill::launch_gemm_projection(
-                    &self.device, &st.kernels, attn_gate, lw.attn_gate_f16.as_ref(),
-                    &pf.normed, &mut gdn_pf.gate,
-                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &self.device,
+                    &st.kernels,
+                    attn_gate,
+                    lw.attn_gate_f16.as_ref(),
+                    &pf.normed,
+                    &mut gdn_pf.gate,
+                    &mut pf.dequant_f32,
+                    &mut pf.activation_f16,
                     &mut pf.dequant_f16,
-                    batch, p.value_dim, hidden_dim, "gdn_gate",
+                    batch,
+                    p.value_dim,
+                    hidden_dim,
+                    "gdn_gate",
                 )?;
             }
         }
 
         // 4. Batched Alpha GEMM: normed[T, hidden] @ ssm_alpha^T -> alpha_raw[T, num_heads]
         {
-            let ssm_alpha = lw.ssm_alpha.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(format!(
+            let ssm_alpha = lw.ssm_alpha.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!(
                     "GDN prefill L{layer_idx}: ssm_alpha weight missing",
-                )))?;
+                ))
+            })?;
             unsafe {
                 super::prefill::launch_gemm_projection(
-                    &self.device, &st.kernels, ssm_alpha, lw.ssm_alpha_f16.as_ref(),
-                    &pf.normed, &mut gdn_pf.alpha_raw,
-                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &self.device,
+                    &st.kernels,
+                    ssm_alpha,
+                    lw.ssm_alpha_f16.as_ref(),
+                    &pf.normed,
+                    &mut gdn_pf.alpha_raw,
+                    &mut pf.dequant_f32,
+                    &mut pf.activation_f16,
                     &mut pf.dequant_f16,
-                    batch, p.num_heads, hidden_dim, "gdn_alpha",
+                    batch,
+                    p.num_heads,
+                    hidden_dim,
+                    "gdn_alpha",
                 )?;
             }
         }
 
         // 5. Batched Beta GEMM: normed[T, hidden] @ ssm_beta^T -> beta_raw[T, num_heads]
         {
-            let ssm_beta = lw.ssm_beta.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(format!(
-                    "GDN prefill L{layer_idx}: ssm_beta weight missing",
-                )))?;
+            let ssm_beta = lw.ssm_beta.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!("GDN prefill L{layer_idx}: ssm_beta weight missing",))
+            })?;
 
             // diagnostic: when LUMEN_DEBUG_DUMP_SSM_BETA_W=1 is set, dump the
             // first 64 Q8 blocks (= row 16) of the ssm_beta weight buffer for
@@ -6421,9 +7275,8 @@ impl CudaBackend {
                         let host = self.device.dtoh_copy(q8buf)?;
                         let total = host.len();
                         let path = "/tmp/ssm-beta-q8.bin".to_string();
-                        std::fs::write(&path, &host).map_err(|e| RuntimeError::Compute(
-                            format!("dump {path}: {e}")
-                        ))?;
+                        std::fs::write(&path, &host)
+                            .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
                         eprintln!(
                             "[scale-debug] L0 ssm_beta Q8 buf {} bytes -> {} \
                              (expected: 32 rows × 64 blocks × 34 bytes = 69632)",
@@ -6465,24 +7318,30 @@ impl CudaBackend {
                                 if scale == 0 {
                                     zero_scales += 1;
                                     let head = blk / blocks_per_row;
-                                    if head < 32 { per_head_zero[head] += 1; }
+                                    if head < 32 {
+                                        per_head_zero[head] += 1;
+                                    }
                                 }
                             }
                             eprintln!(
                                 "[scale-audit] L0 {} Q8: blocks={} zero_scales={} ({:.2}%)",
-                                name, n_blocks, zero_scales,
+                                name,
+                                n_blocks,
+                                zero_scales,
                                 100.0 * zero_scales as f64 / n_blocks as f64
                             );
                             for h in 0..32 {
                                 if per_head_zero[h] > 0 {
-                                    eprintln!("[scale-audit]   {} head {:2}: {} zero scales", name, h, per_head_zero[h]);
+                                    eprintln!(
+                                        "[scale-audit]   {} head {:2}: {} zero scales",
+                                        name, h, per_head_zero[h]
+                                    );
                                 }
                             }
                             // Write the buffer to a stable path for off-line verification.
                             let path = format!("/tmp/debug-{}-q8.bin", name);
-                            std::fs::write(&path, &host).map_err(|e| RuntimeError::Compute(
-                                format!("dump {path}: {e}")
-                            ))?;
+                            std::fs::write(&path, &host)
+                                .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
                         }
                     }
                 }
@@ -6490,11 +7349,19 @@ impl CudaBackend {
 
             unsafe {
                 super::prefill::launch_gemm_projection(
-                    &self.device, &st.kernels, ssm_beta, lw.ssm_beta_f16.as_ref(),
-                    &pf.normed, &mut gdn_pf.beta_raw,
-                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &self.device,
+                    &st.kernels,
+                    ssm_beta,
+                    lw.ssm_beta_f16.as_ref(),
+                    &pf.normed,
+                    &mut gdn_pf.beta_raw,
+                    &mut pf.dequant_f32,
+                    &mut pf.activation_f16,
                     &mut pf.dequant_f16,
-                    batch, p.num_heads, hidden_dim, "gdn_beta",
+                    batch,
+                    p.num_heads,
+                    hidden_dim,
+                    "gdn_beta",
                 )?;
             }
         }
@@ -6548,22 +7415,20 @@ impl CudaBackend {
         //
         // Fallback reuses single-token decode kernels in a per-token loop.
 
-        let conv1d_weight = lw.ssm_conv1d.as_ref()
-            .ok_or_else(|| RuntimeError::Compute(format!(
+        let conv1d_weight = lw.ssm_conv1d.as_ref().ok_or_else(|| {
+            RuntimeError::Compute(format!(
                 "GDN prefill L{layer_idx}: ssm_conv1d weight missing",
-            )))?;
-        let dt_bias = lw.ssm_dt_bias.as_ref()
-            .ok_or_else(|| RuntimeError::Compute(format!(
-                "GDN prefill L{layer_idx}: ssm_dt_bias missing",
-            )))?;
-        let ssm_a = lw.ssm_a.as_ref()
-            .ok_or_else(|| RuntimeError::Compute(format!(
-                "GDN prefill L{layer_idx}: ssm_a missing",
-            )))?;
-        let ssm_norm = lw.ssm_norm_tiled.as_ref()
-            .ok_or_else(|| RuntimeError::Compute(format!(
-                "GDN prefill L{layer_idx}: ssm_norm_tiled missing",
-            )))?;
+            ))
+        })?;
+        let dt_bias = lw.ssm_dt_bias.as_ref().ok_or_else(|| {
+            RuntimeError::Compute(format!("GDN prefill L{layer_idx}: ssm_dt_bias missing",))
+        })?;
+        let ssm_a = lw.ssm_a.as_ref().ok_or_else(|| {
+            RuntimeError::Compute(format!("GDN prefill L{layer_idx}: ssm_a missing",))
+        })?;
+        let ssm_norm = lw.ssm_norm_tiled.as_ref().ok_or_else(|| {
+            RuntimeError::Compute(format!("GDN prefill L{layer_idx}: ssm_norm_tiled missing",))
+        })?;
 
         let num_heads_u32 = p.num_heads as u32;
         let num_kv_heads_u32 = p.num_kv_heads as u32;
@@ -6581,8 +7446,12 @@ impl CudaBackend {
             let dir = dump_dir.as_ref().unwrap();
             let path = format!("{dir}/L{layer_idx}-qkv_pre_conv.bin");
             let bytes: Vec<u8> = host[..n].iter().flat_map(|f| f.to_le_bytes()).collect();
-            std::fs::write(&path, &bytes).map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
-            eprintln!("[gdn-dump] L{layer_idx} qkv_pre_conv shape=[{batch}, {}] -> {path}", p.qkv_dim);
+            std::fs::write(&path, &bytes)
+                .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
+            eprintln!(
+                "[gdn-dump] L{layer_idx} qkv_pre_conv shape=[{batch}, {}] -> {path}",
+                p.qkv_dim
+            );
         }
 
         let has_fused_prefill = st.kernels.ssm_conv1d_silu_prefill.is_some()
@@ -6606,7 +7475,9 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 };
                 unsafe {
-                    self.device.stream.launch_builder(conv_fn)
+                    self.device
+                        .stream
+                        .launch_builder(conv_fn)
                         .arg(&gdn_pf.qkv)
                         .arg(&mut gdn.conv_states[gdn_idx])
                         .arg(conv1d_weight)
@@ -6617,9 +7488,11 @@ impl CudaBackend {
                         .arg(&batch_u32)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "GDN prefill fused conv1d_silu L{layer_idx}: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "GDN prefill fused conv1d_silu L{layer_idx}: {e}"
+                    ))
+                })?;
 
                 // Advance conv position by batch tokens.
                 gdn.conv_positions[gdn_idx] = (state_pos + batch as u32) % buf_slots;
@@ -6632,8 +7505,12 @@ impl CudaBackend {
                     let dir = dump_dir.as_ref().unwrap();
                     let path = format!("{dir}/L{layer_idx}-conv_silu.bin");
                     let bytes: Vec<u8> = host[..n].iter().flat_map(|f| f.to_le_bytes()).collect();
-                    std::fs::write(&path, &bytes).map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
-                    eprintln!("[gdn-dump] L{layer_idx} conv_silu shape=[{batch}, {}] -> {path}", p.qkv_dim);
+                    std::fs::write(&path, &bytes)
+                        .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
+                    eprintln!(
+                        "[gdn-dump] L{layer_idx} conv_silu shape=[{batch}, {}] -> {path}",
+                        p.qkv_dim
+                    );
                 }
             }
 
@@ -6649,7 +7526,9 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 };
                 unsafe {
-                    self.device.stream.launch_builder(gates_fn)
+                    self.device
+                        .stream
+                        .launch_builder(gates_fn)
                         .arg(dt_bias)
                         .arg(ssm_a)
                         .arg(&gdn_pf.beta_raw)
@@ -6660,9 +7539,11 @@ impl CudaBackend {
                         .arg(&batch_u32)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "GDN prefill fused gates_batched L{layer_idx}: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "GDN prefill fused gates_batched L{layer_idx}: {e}"
+                    ))
+                })?;
 
                 // dump alpha + beta + ssm_a (weights). For ssm_a we
                 // also dump the per-head weight buffer so we can compare it
@@ -6674,44 +7555,80 @@ impl CudaBackend {
                     {
                         let host = self.device.dtoh_copy(&gdn_pf.alpha_out)?;
                         let path = format!("{dir}/L{layer_idx}-alpha.bin");
-                        let bytes: Vec<u8> = host[..n_heads].iter().flat_map(|f| f.to_le_bytes()).collect();
-                        std::fs::write(&path, &bytes).map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
-                        eprintln!("[gdn-dump] L{layer_idx} alpha shape=[{batch}, {}] -> {path}", p.num_heads);
+                        let bytes: Vec<u8> = host[..n_heads]
+                            .iter()
+                            .flat_map(|f| f.to_le_bytes())
+                            .collect();
+                        std::fs::write(&path, &bytes)
+                            .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
+                        eprintln!(
+                            "[gdn-dump] L{layer_idx} alpha shape=[{batch}, {}] -> {path}",
+                            p.num_heads
+                        );
                     }
                     {
                         let host = self.device.dtoh_copy(&gdn_pf.beta_out)?;
                         let path = format!("{dir}/L{layer_idx}-beta.bin");
-                        let bytes: Vec<u8> = host[..n_heads].iter().flat_map(|f| f.to_le_bytes()).collect();
-                        std::fs::write(&path, &bytes).map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
-                        eprintln!("[gdn-dump] L{layer_idx} beta shape=[{batch}, {}] -> {path}", p.num_heads);
+                        let bytes: Vec<u8> = host[..n_heads]
+                            .iter()
+                            .flat_map(|f| f.to_le_bytes())
+                            .collect();
+                        std::fs::write(&path, &bytes)
+                            .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
+                        eprintln!(
+                            "[gdn-dump] L{layer_idx} beta shape=[{batch}, {}] -> {path}",
+                            p.num_heads
+                        );
                     }
                     {
                         let host = self.device.dtoh_copy(ssm_a)?;
                         let path = format!("{dir}/L{layer_idx}-ssm_a.bin");
                         let bytes: Vec<u8> = host.iter().flat_map(|f| f.to_le_bytes()).collect();
-                        std::fs::write(&path, &bytes).map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
-                        eprintln!("[gdn-dump] L{layer_idx} ssm_a shape=[{}] -> {path}", host.len());
+                        std::fs::write(&path, &bytes)
+                            .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
+                        eprintln!(
+                            "[gdn-dump] L{layer_idx} ssm_a shape=[{}] -> {path}",
+                            host.len()
+                        );
                     }
                     {
                         let host = self.device.dtoh_copy(&gdn_pf.alpha_raw)?;
                         let path = format!("{dir}/L{layer_idx}-alpha_raw.bin");
-                        let bytes: Vec<u8> = host[..n_heads].iter().flat_map(|f| f.to_le_bytes()).collect();
-                        std::fs::write(&path, &bytes).map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
-                        eprintln!("[gdn-dump] L{layer_idx} alpha_raw shape=[{batch}, {}] -> {path}", p.num_heads);
+                        let bytes: Vec<u8> = host[..n_heads]
+                            .iter()
+                            .flat_map(|f| f.to_le_bytes())
+                            .collect();
+                        std::fs::write(&path, &bytes)
+                            .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
+                        eprintln!(
+                            "[gdn-dump] L{layer_idx} alpha_raw shape=[{batch}, {}] -> {path}",
+                            p.num_heads
+                        );
                     }
                     {
                         let host = self.device.dtoh_copy(&gdn_pf.beta_raw)?;
                         let path = format!("{dir}/L{layer_idx}-beta_raw.bin");
-                        let bytes: Vec<u8> = host[..n_heads].iter().flat_map(|f| f.to_le_bytes()).collect();
-                        std::fs::write(&path, &bytes).map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
-                        eprintln!("[gdn-dump] L{layer_idx} beta_raw shape=[{batch}, {}] -> {path}", p.num_heads);
+                        let bytes: Vec<u8> = host[..n_heads]
+                            .iter()
+                            .flat_map(|f| f.to_le_bytes())
+                            .collect();
+                        std::fs::write(&path, &bytes)
+                            .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
+                        eprintln!(
+                            "[gdn-dump] L{layer_idx} beta_raw shape=[{batch}, {}] -> {path}",
+                            p.num_heads
+                        );
                     }
                     {
                         let host = self.device.dtoh_copy(dt_bias)?;
                         let path = format!("{dir}/L{layer_idx}-dt_bias.bin");
                         let bytes: Vec<u8> = host.iter().flat_map(|f| f.to_le_bytes()).collect();
-                        std::fs::write(&path, &bytes).map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
-                        eprintln!("[gdn-dump] L{layer_idx} dt_bias shape=[{}] -> {path}", host.len());
+                        std::fs::write(&path, &bytes)
+                            .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
+                        eprintln!(
+                            "[gdn-dump] L{layer_idx} dt_bias shape=[{}] -> {path}",
+                            host.len()
+                        );
                     }
                 }
             }
@@ -6739,14 +7656,22 @@ impl CudaBackend {
             // instead of Lumen's historical eps=1e-12 +
             // (sqrt>eps ? 1/sqrt : 1/eps) two-op form.
             let l2norm_rsqrtf_on = std::env::var("LUMEN_CUDA_L2NORM_RSQRTF")
-                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+                .map(|v| {
+                    matches!(
+                        v.as_str(),
+                        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+                    )
+                })
                 .unwrap_or(false)
                 || std::env::var("LUMEN_CUDA_NORM_RSQRTF_BUNDLE").is_ok();
-            let use_l2norm_rsqrtf = l2norm_rsqrtf_on
-                && st.kernels.l2_normalize_qk_strided_rsqrtf.is_some();
+            let use_l2norm_rsqrtf =
+                l2norm_rsqrtf_on && st.kernels.l2_normalize_qk_strided_rsqrtf.is_some();
             {
                 let l2_fn = if use_prefill_f64 {
-                    st.kernels.l2_normalize_qk_strided_f64accum.as_ref().unwrap()
+                    st.kernels
+                        .l2_normalize_qk_strided_f64accum
+                        .as_ref()
+                        .unwrap()
                 } else if use_l2norm_rsqrtf {
                     st.kernels.l2_normalize_qk_strided_rsqrtf.as_ref().unwrap()
                 } else {
@@ -6765,7 +7690,9 @@ impl CudaBackend {
                 let q_offset = 0u32;
                 let k_offset = p.qk_dim as u32;
                 unsafe {
-                    self.device.stream.launch_builder(l2_fn)
+                    self.device
+                        .stream
+                        .launch_builder(l2_fn)
                         .arg(&mut gdn_pf.conv_out)
                         .arg(&num_kv_heads_u32)
                         .arg(&head_dim_u32)
@@ -6775,9 +7702,9 @@ impl CudaBackend {
                         .arg(&k_offset)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "GDN prefill fused l2_norm_qk L{layer_idx}: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN prefill fused l2_norm_qk L{layer_idx}: {e}"))
+                })?;
 
                 // dump post-L2-norm Q/K (conv_out is L2-normed in-place on QK,
                 // V channels untouched). This is the candidate-3 measurement point.
@@ -6788,8 +7715,12 @@ impl CudaBackend {
                     let dir = dump_dir.as_ref().unwrap();
                     let path = format!("{dir}/L{layer_idx}-conv_l2norm.bin");
                     let bytes: Vec<u8> = host[..n].iter().flat_map(|f| f.to_le_bytes()).collect();
-                    std::fs::write(&path, &bytes).map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
-                    eprintln!("[gdn-dump] L{layer_idx} conv_l2norm shape=[{batch}, {}] -> {path}", p.qkv_dim);
+                    std::fs::write(&path, &bytes)
+                        .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
+                    eprintln!(
+                        "[gdn-dump] L{layer_idx} conv_l2norm shape=[{batch}, {}] -> {path}",
+                        p.qkv_dim
+                    );
                 }
             }
 
@@ -6811,7 +7742,9 @@ impl CudaBackend {
                 let qk_dim_u32 = p.qk_dim as u32;
                 let qkv_dim_u32 = p.qkv_dim as u32;
                 unsafe {
-                    self.device.stream.launch_builder(state_fn)
+                    self.device
+                        .stream
+                        .launch_builder(state_fn)
                         .arg(&mut gdn.h_states[gdn_idx])
                         .arg(&gdn_pf.conv_out)
                         .arg(&gdn_pf.alpha_out)
@@ -6826,9 +7759,9 @@ impl CudaBackend {
                         .arg(&qkv_dim_u32)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "GDN prefill fused_v3 L{layer_idx}: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN prefill fused_v3 L{layer_idx}: {e}"))
+                })?;
 
                 // dump raw_out (post-state-update, pre-norm-gate)
                 if do_dump {
@@ -6838,8 +7771,12 @@ impl CudaBackend {
                     let dir = dump_dir.as_ref().unwrap();
                     let path = format!("{dir}/L{layer_idx}-raw_out.bin");
                     let bytes: Vec<u8> = host[..n].iter().flat_map(|f| f.to_le_bytes()).collect();
-                    std::fs::write(&path, &bytes).map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
-                    eprintln!("[gdn-dump] L{layer_idx} raw_out shape=[{batch}, {}] -> {path}", p.value_dim);
+                    std::fs::write(&path, &bytes)
+                        .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
+                    eprintln!(
+                        "[gdn-dump] L{layer_idx} raw_out shape=[{batch}, {}] -> {path}",
+                        p.value_dim
+                    );
                 }
 
                 // [GDNSTATE] PREFILL recurrent-state probe (env
@@ -6856,16 +7793,20 @@ impl CudaBackend {
                 {
                     use std::sync::OnceLock;
                     static GSP: OnceLock<bool> = OnceLock::new();
-                    let on = *GSP.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"));
+                    let on =
+                        *GSP.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"));
                     if on {
-                        let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                        let ss =
+                            |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
                         let h_final = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
                         let conv_h = self.device.dtoh_copy(&gdn.conv_states[gdn_idx])?;
                         eprintln!(
                             "[GDNSTATE] mode=P phase=final batch={batch} layer={layer_idx} \
                              h_sumsq={:.6} h_len={} conv_sumsq={:.6} conv_len={}",
-                            ss(&h_final), h_final.len(),
-                            ss(&conv_h), conv_h.len(),
+                            ss(&h_final),
+                            h_final.len(),
+                            ss(&conv_h),
+                            conv_h.len(),
                         );
                     }
                 }
@@ -6977,35 +7918,33 @@ impl CudaBackend {
                 let dir = dump_dir.as_ref().unwrap();
                 let path = format!("{dir}/L{layer_idx}-gdn_out.bin");
                 let bytes: Vec<u8> = host[..n].iter().flat_map(|f| f.to_le_bytes()).collect();
-                std::fs::write(&path, &bytes).map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
-                eprintln!("[gdn-dump] L{layer_idx} gdn_out shape=[{batch}, {}] -> {path}", p.value_dim);
+                std::fs::write(&path, &bytes)
+                    .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
+                eprintln!(
+                    "[gdn-dump] L{layer_idx} gdn_out shape=[{batch}, {}] -> {path}",
+                    p.value_dim
+                );
             }
         } else {
             // === UNFUSED FALLBACK: per-token loop using decode kernels ===
-            let conv1d_fn = st.kernels.ssm_conv1d_decode.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(
-                    "GDN ssm_conv1d_decode kernel not compiled".into(),
-                ))?;
-            let silu_fn = st.kernels.silu_inplace.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(
-                    "GDN silu_inplace kernel not compiled".into(),
-                ))?;
-            let gates_fn = st.kernels.gdn_compute_gates.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(
-                    "GDN gdn_compute_gates kernel not compiled".into(),
-                ))?;
-            let l2_fn = st.kernels.l2_normalize_heads.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(
-                    "GDN l2_normalize_heads kernel not compiled".into(),
-                ))?;
-            let state_fn = st.kernels.gdn_state_update.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(
-                    "GDN gdn_state_update kernel not compiled".into(),
-                ))?;
-            let silu_mul_fn = st.kernels.silu_elementwise_mul.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(
-                    "GDN silu_elementwise_mul kernel not compiled".into(),
-                ))?;
+            let conv1d_fn = st.kernels.ssm_conv1d_decode.as_ref().ok_or_else(|| {
+                RuntimeError::Compute("GDN ssm_conv1d_decode kernel not compiled".into())
+            })?;
+            let silu_fn = st.kernels.silu_inplace.as_ref().ok_or_else(|| {
+                RuntimeError::Compute("GDN silu_inplace kernel not compiled".into())
+            })?;
+            let gates_fn = st.kernels.gdn_compute_gates.as_ref().ok_or_else(|| {
+                RuntimeError::Compute("GDN gdn_compute_gates kernel not compiled".into())
+            })?;
+            let l2_fn = st.kernels.l2_normalize_heads.as_ref().ok_or_else(|| {
+                RuntimeError::Compute("GDN l2_normalize_heads kernel not compiled".into())
+            })?;
+            let state_fn = st.kernels.gdn_state_update.as_ref().ok_or_else(|| {
+                RuntimeError::Compute("GDN gdn_state_update kernel not compiled".into())
+            })?;
+            let silu_mul_fn = st.kernels.silu_elementwise_mul.as_ref().ok_or_else(|| {
+                RuntimeError::Compute("GDN silu_elementwise_mul kernel not compiled".into())
+            })?;
 
             let l2_eps = 1e-12f32;
             let conv_config = LaunchConfig::for_elements(p.qkv_dim);
@@ -7054,51 +7993,98 @@ impl CudaBackend {
                     let qkv_t = gdn_pf.qkv.slice(t * p.qkv_dim..(t + 1) * p.qkv_dim);
                     let state_pos = gdn.conv_positions[gdn_idx];
                     unsafe {
-                        self.device.stream.launch_builder(conv1d_fn)
-                            .arg(&mut gdn.conv_states[gdn_idx]).arg(&qkv_t).arg(conv1d_weight)
-                            .arg(&mut gdn.qkv_conv_buf).arg(&conv_dim_u32).arg(&kernel_size_u32).arg(&state_pos)
+                        self.device
+                            .stream
+                            .launch_builder(conv1d_fn)
+                            .arg(&mut gdn.conv_states[gdn_idx])
+                            .arg(&qkv_t)
+                            .arg(conv1d_weight)
+                            .arg(&mut gdn.qkv_conv_buf)
+                            .arg(&conv_dim_u32)
+                            .arg(&kernel_size_u32)
+                            .arg(&state_pos)
                             .launch(conv_launch)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!("GDN prefill conv1d t={t} L{layer_idx}: {e}")))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("GDN prefill conv1d t={t} L{layer_idx}: {e}"))
+                    })?;
                     gdn.conv_positions[gdn_idx] = (state_pos + 1) % buf_slots;
                 }
                 // SiLU
                 unsafe {
-                    self.device.stream.launch_builder(silu_fn)
-                        .arg(&mut gdn.qkv_conv_buf).arg(&conv_dim_u32)
+                    self.device
+                        .stream
+                        .launch_builder(silu_fn)
+                        .arg(&mut gdn.qkv_conv_buf)
+                        .arg(&conv_dim_u32)
                         .launch(silu_launch)
                 }
-                .map_err(|e| RuntimeError::Compute(format!("GDN prefill silu t={t} L{layer_idx}: {e}")))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN prefill silu t={t} L{layer_idx}: {e}"))
+                })?;
                 // Compute gates
                 {
-                    let alpha_raw_t = gdn_pf.alpha_raw.slice(t * p.num_heads..(t + 1) * p.num_heads);
-                    let beta_raw_t = gdn_pf.beta_raw.slice(t * p.num_heads..(t + 1) * p.num_heads);
+                    let alpha_raw_t = gdn_pf
+                        .alpha_raw
+                        .slice(t * p.num_heads..(t + 1) * p.num_heads);
+                    let beta_raw_t = gdn_pf
+                        .beta_raw
+                        .slice(t * p.num_heads..(t + 1) * p.num_heads);
                     unsafe {
-                        self.device.stream.launch_builder(gates_fn)
-                            .arg(dt_bias).arg(ssm_a).arg(&beta_raw_t).arg(&alpha_raw_t)
-                            .arg(&mut gdn.alpha_buf).arg(&mut gdn.beta_buf).arg(&num_heads_u32)
+                        self.device
+                            .stream
+                            .launch_builder(gates_fn)
+                            .arg(dt_bias)
+                            .arg(ssm_a)
+                            .arg(&beta_raw_t)
+                            .arg(&alpha_raw_t)
+                            .arg(&mut gdn.alpha_buf)
+                            .arg(&mut gdn.beta_buf)
+                            .arg(&num_heads_u32)
                             .launch(gates_launch)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!("GDN prefill compute_gates t={t} L{layer_idx}: {e}")))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "GDN prefill compute_gates t={t} L{layer_idx}: {e}"
+                        ))
+                    })?;
                 }
                 // L2-normalize Q and K
                 {
                     let mut q_view = gdn.qkv_conv_buf.slice_mut(0..p.qk_dim);
                     unsafe {
-                        self.device.stream.launch_builder(l2_fn)
-                            .arg(&mut q_view).arg(&num_kv_heads_u32).arg(&head_dim_u32).arg(&l2_eps)
+                        self.device
+                            .stream
+                            .launch_builder(l2_fn)
+                            .arg(&mut q_view)
+                            .arg(&num_kv_heads_u32)
+                            .arg(&head_dim_u32)
+                            .arg(&l2_eps)
                             .launch(l2_launch)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!("GDN prefill l2_norm Q t={t} L{layer_idx}: {e}")))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "GDN prefill l2_norm Q t={t} L{layer_idx}: {e}"
+                        ))
+                    })?;
                 }
                 {
                     let mut k_view = gdn.qkv_conv_buf.slice_mut(p.qk_dim..2 * p.qk_dim);
                     unsafe {
-                        self.device.stream.launch_builder(l2_fn)
-                            .arg(&mut k_view).arg(&num_kv_heads_u32).arg(&head_dim_u32).arg(&l2_eps)
+                        self.device
+                            .stream
+                            .launch_builder(l2_fn)
+                            .arg(&mut k_view)
+                            .arg(&num_kv_heads_u32)
+                            .arg(&head_dim_u32)
+                            .arg(&l2_eps)
                             .launch(l2_launch)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!("GDN prefill l2_norm K t={t} L{layer_idx}: {e}")))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "GDN prefill l2_norm K t={t} L{layer_idx}: {e}"
+                        ))
+                    })?;
                 }
                 // State update + output
                 {
@@ -7106,32 +8092,66 @@ impl CudaBackend {
                     let v_view = gdn.qkv_conv_buf.slice(2 * p.qk_dim..p.qkv_dim);
                     let q_view = gdn.qkv_conv_buf.slice(0..p.qk_dim);
                     unsafe {
-                        self.device.stream.launch_builder(state_fn)
-                            .arg(&mut gdn.h_states[gdn_idx]).arg(&k_view).arg(&v_view)
-                            .arg(&gdn.alpha_buf).arg(&gdn.beta_buf).arg(&q_view).arg(&mut gdn.output_buf)
-                            .arg(&num_heads_u32).arg(&head_dim_u32).arg(&head_dim_u32).arg(&num_kv_heads_u32)
+                        self.device
+                            .stream
+                            .launch_builder(state_fn)
+                            .arg(&mut gdn.h_states[gdn_idx])
+                            .arg(&k_view)
+                            .arg(&v_view)
+                            .arg(&gdn.alpha_buf)
+                            .arg(&gdn.beta_buf)
+                            .arg(&q_view)
+                            .arg(&mut gdn.output_buf)
+                            .arg(&num_heads_u32)
+                            .arg(&head_dim_u32)
+                            .arg(&head_dim_u32)
+                            .arg(&num_kv_heads_u32)
                             .launch(state_launch)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!("GDN prefill state_update t={t} L{layer_idx}: {e}")))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "GDN prefill state_update t={t} L{layer_idx}: {e}"
+                        ))
+                    })?;
                 }
                 // RMSNorm on output
                 unsafe {
-                    self.device.stream.launch_builder(&st.kernels.rmsnorm)
-                        .arg(&gdn.output_buf).arg(ssm_norm).arg(&mut gdn.normed_out_buf)
-                        .arg(&eps).arg(&value_dim_u32)
+                    self.device
+                        .stream
+                        .launch_builder(&st.kernels.rmsnorm)
+                        .arg(&gdn.output_buf)
+                        .arg(ssm_norm)
+                        .arg(&mut gdn.normed_out_buf)
+                        .arg(&eps)
+                        .arg(&value_dim_u32)
                         .launch(norm_launch)
                 }
-                .map_err(|e| RuntimeError::Compute(format!("GDN prefill rmsnorm output t={t} L{layer_idx}: {e}")))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "GDN prefill rmsnorm output t={t} L{layer_idx}: {e}"
+                    ))
+                })?;
                 // SiLU(gate) * normed_output -> batched output
                 {
                     let gate_t = gdn_pf.gate.slice(t * p.value_dim..(t + 1) * p.value_dim);
-                    let mut out_t = gdn_pf.gdn_out.slice_mut(t * p.value_dim..(t + 1) * p.value_dim);
+                    let mut out_t = gdn_pf
+                        .gdn_out
+                        .slice_mut(t * p.value_dim..(t + 1) * p.value_dim);
                     unsafe {
-                        self.device.stream.launch_builder(silu_mul_fn)
-                            .arg(&gate_t).arg(&gdn.normed_out_buf).arg(&mut out_t).arg(&value_dim_u32)
+                        self.device
+                            .stream
+                            .launch_builder(silu_mul_fn)
+                            .arg(&gate_t)
+                            .arg(&gdn.normed_out_buf)
+                            .arg(&mut out_t)
+                            .arg(&value_dim_u32)
                             .launch(silu_mul_launch)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!("GDN prefill silu_mul t={t} L{layer_idx}: {e}")))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "GDN prefill silu_mul t={t} L{layer_idx}: {e}"
+                        ))
+                    })?;
                 }
             }
         }
@@ -7145,17 +8165,25 @@ impl CudaBackend {
         // gdn_out[T, value_dim] @ ssm_out^T -> attn_proj[T, hidden_dim]
         // with residual: attn_proj += x
         {
-            let ssm_out = lw.ssm_out.as_ref()
-                .ok_or_else(|| RuntimeError::Compute(format!(
-                    "GDN prefill L{layer_idx}: ssm_out weight missing",
-                )))?;
+            let ssm_out = lw.ssm_out.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!("GDN prefill L{layer_idx}: ssm_out weight missing",))
+            })?;
             unsafe {
                 super::prefill::launch_gemm_residual(
-                    &self.device, &st.kernels, ssm_out, lw.ssm_out_f16.as_ref(),
-                    &gdn_pf.gdn_out, &pf.x, &mut pf.attn_proj,
-                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &self.device,
+                    &st.kernels,
+                    ssm_out,
+                    lw.ssm_out_f16.as_ref(),
+                    &gdn_pf.gdn_out,
+                    &pf.x,
+                    &mut pf.attn_proj,
+                    &mut pf.dequant_f32,
+                    &mut pf.activation_f16,
                     &mut pf.dequant_f16,
-                    batch, hidden_dim, p.value_dim, "gdn_ssm_out",
+                    batch,
+                    hidden_dim,
+                    p.value_dim,
+                    "gdn_ssm_out",
                 )?;
             }
 
@@ -7167,7 +8195,8 @@ impl CudaBackend {
                 let dir = dump_dir.as_ref().unwrap();
                 let path = format!("{dir}/L{layer_idx}-linear_attn_out.bin");
                 let bytes: Vec<u8> = host[..n].iter().flat_map(|f| f.to_le_bytes()).collect();
-                std::fs::write(&path, &bytes).map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
+                std::fs::write(&path, &bytes)
+                    .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
                 eprintln!("[gdn-dump] L{layer_idx} linear_attn_out shape=[{batch}, {hidden_dim}] -> {path}");
             }
         }
@@ -7191,57 +8220,96 @@ impl CudaBackend {
         } else {
             unsafe {
                 super::prefill::launch_rmsnorm_batched(
-                    &self.device, &st.kernels,
-                    &pf.attn_proj, &lw.ffn_norm, &mut pf.normed,
-                    eps, batch, hidden_dim,
+                    &self.device,
+                    &st.kernels,
+                    &pf.attn_proj,
+                    &lw.ffn_norm,
+                    &mut pf.normed,
+                    eps,
+                    batch,
+                    hidden_dim,
                 )?;
                 super::prefill::launch_gemm_projection(
-                    &self.device, &st.kernels, &lw.w_gate, lw.w_gate_f16.as_ref(),
-                    &pf.normed, &mut pf.gate,
-                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &self.device,
+                    &st.kernels,
+                    &lw.w_gate,
+                    lw.w_gate_f16.as_ref(),
+                    &pf.normed,
+                    &mut pf.gate,
+                    &mut pf.dequant_f32,
+                    &mut pf.activation_f16,
                     &mut pf.dequant_f16,
-                    batch, inter_dim, hidden_dim, "gate",
+                    batch,
+                    inter_dim,
+                    hidden_dim,
+                    "gate",
                 )?;
                 super::prefill::launch_gemm_projection(
-                    &self.device, &st.kernels, &lw.w_up, lw.w_up_f16.as_ref(),
-                    &pf.normed, &mut pf.up,
-                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &self.device,
+                    &st.kernels,
+                    &lw.w_up,
+                    lw.w_up_f16.as_ref(),
+                    &pf.normed,
+                    &mut pf.up,
+                    &mut pf.dequant_f32,
+                    &mut pf.activation_f16,
                     &mut pf.dequant_f16,
-                    batch, inter_dim, hidden_dim, "up",
+                    batch,
+                    inter_dim,
+                    hidden_dim,
+                    "up",
                 )?;
             }
 
             // Batched SwiGLU.
             unsafe {
                 super::prefill::launch_swiglu_batched(
-                    &self.device, &st.kernels,
-                    &mut pf.gate, &pf.up, batch, inter_dim,
+                    &self.device,
+                    &st.kernels,
+                    &mut pf.gate,
+                    &pf.up,
+                    batch,
+                    inter_dim,
                 )?;
             }
 
             // Batched down projection.
             unsafe {
                 super::prefill::launch_gemm_projection(
-                    &self.device, &st.kernels, &lw.w_down, lw.w_down_f16.as_ref(),
-                    &pf.gate, &mut pf.down,
-                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &self.device,
+                    &st.kernels,
+                    &lw.w_down,
+                    lw.w_down_f16.as_ref(),
+                    &pf.gate,
+                    &mut pf.down,
+                    &mut pf.dequant_f32,
+                    &mut pf.activation_f16,
                     &mut pf.dequant_f16,
-                    batch, hidden_dim, inter_dim, "down",
+                    batch,
+                    hidden_dim,
+                    inter_dim,
+                    "down",
                 )?;
             }
 
             // Batched residual add + swap for next layer.
             unsafe {
                 super::prefill::launch_residual_add_batched(
-                    &self.device, &st.kernels,
-                    &mut pf.attn_proj, &pf.down, batch, hidden_dim,
+                    &self.device,
+                    &st.kernels,
+                    &mut pf.attn_proj,
+                    &pf.down,
+                    batch,
+                    hidden_dim,
                 )?;
             }
             self.device
                 .stream
                 .memcpy_dtod(&pf.attn_proj, &mut pf.x)
                 .map_err(|e| {
-                    RuntimeError::Compute(format!("dtod x<-attn_proj GDN prefill L{layer_idx}: {e}"))
+                    RuntimeError::Compute(format!(
+                        "dtod x<-attn_proj GDN prefill L{layer_idx}: {e}"
+                    ))
                 })?;
         }
 
@@ -7382,10 +8450,7 @@ impl CudaBackend {
 
         // Disjoint borrow of the repacked down planes (same NLL
         // pattern as batched_offsets — disjoint from st.kernels/&st.moe_scratch).
-        let repacked = st
-            .moe_repacked
-            .get(layer_idx)
-            .and_then(|r| r.as_ref());
+        let repacked = st.moe_repacked.get(layer_idx).and_then(|r| r.as_ref());
 
         let moe_scratch = st.moe_scratch.as_mut().ok_or_else(|| {
             RuntimeError::Compute(
@@ -7415,14 +8480,20 @@ impl CudaBackend {
         let q4_routed = moe_meta.expert_gate_quant == QuantScheme::Q4_0
             && moe_meta.expert_down_quant == QuantScheme::Q4_0
             && super::moe::moe_grouped_tiled_enabled()
-            && st.kernels.moe_grouped_gate_up_swiglu_q4_0_tiled_f32act.is_some()
+            && st
+                .kernels
+                .moe_grouped_gate_up_swiglu_q4_0_tiled_f32act
+                .is_some()
             && st.kernels.moe_grouped_down_q4_0_tiled_f32act.is_some()
             && hidden_dim % 256 == 0
             && inter_dim % 32 == 0;
         let bf16_routed = moe_meta.expert_gate_quant == QuantScheme::Bf16
             && moe_meta.expert_down_quant == QuantScheme::Bf16
             && super::moe::moe_grouped_tiled_enabled()
-            && st.kernels.moe_grouped_gate_up_swiglu_bf16_tiled_f32act.is_some()
+            && st
+                .kernels
+                .moe_grouped_gate_up_swiglu_bf16_tiled_f32act
+                .is_some()
             && st.kernels.moe_grouped_down_bf16_tiled_f32act.is_some()
             && hidden_dim % 256 == 0
             && inter_dim % 16 == 0;
@@ -7537,13 +8608,25 @@ impl CudaBackend {
                         && st.kernels.moe_shared_down_q4_0_residual_accum.is_some();
                     if use_fused {
                         super::moe::encode_shared_expert_ffn_decode_fused(
-                            &self.device, &st.kernels, moe_scratch, &moe_meta,
-                            &moe_layer_blob, &normed_view2, &mut output_view2, hidden_dim,
+                            &self.device,
+                            &st.kernels,
+                            moe_scratch,
+                            &moe_meta,
+                            &moe_layer_blob,
+                            &normed_view2,
+                            &mut output_view2,
+                            hidden_dim,
                         )?;
                     } else {
                         super::moe::encode_shared_expert_ffn_decode(
-                            &self.device, &st.kernels, moe_scratch, &moe_meta,
-                            &moe_layer_blob, &normed_view2, &mut output_view2, hidden_dim,
+                            &self.device,
+                            &st.kernels,
+                            moe_scratch,
+                            &moe_meta,
+                            &moe_layer_blob,
+                            &normed_view2,
+                            &mut output_view2,
+                            hidden_dim,
                         )?;
                     }
                 }
@@ -7590,9 +8673,7 @@ impl CudaBackend {
                 let rl = self.device.dtoh_copy(&moe_scratch.router_logits)?;
                 let gw = self.device.dtoh_copy(&moe_scratch.expert_weights)?;
                 let eo = self.device.dtoh_copy(&moe_scratch.expert_output_buf)?;
-                let sumsq = |v: &[f32]| -> f64 {
-                    v.iter().map(|&e| (e as f64) * (e as f64)).sum()
-                };
+                let sumsq = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
                 let router_logits_sumsq = sumsq(&rl);
                 let gate_w_sumsq = sumsq(&gw);
                 let expert_out_sumsq = sumsq(&eo);
@@ -7696,7 +8777,9 @@ impl CudaBackend {
                 for &e in &v[o..o + hidden_dim] {
                     s += e as f64;
                     sq += (e as f64) * (e as f64);
-                    if e.abs() > mx { mx = e.abs(); }
+                    if e.abs() > mx {
+                        mx = e.abs();
+                    }
                 }
                 (s, sq, mx)
             };
@@ -7732,9 +8815,7 @@ impl CudaBackend {
             .stream
             .memcpy_dtod(&pf.x, &mut pf.attn_proj)
             .map_err(|e| {
-                RuntimeError::Compute(format!(
-                    "dtod attn_proj<-x MoE prefill L{layer_idx}: {e}"
-                ))
+                RuntimeError::Compute(format!("dtod attn_proj<-x MoE prefill L{layer_idx}: {e}"))
             })?;
 
         Ok(())
@@ -7754,16 +8835,52 @@ impl CudaBackend {
         let hd = hidden_dim as u32;
         let tid_ptr = gp.token_id_ptr();
         if let Some(ref emb_f16) = st.globals.embedding_f16 {
-            unsafe { self.device.stream.launch_builder(&gk.embed_f16).arg(emb_f16).arg(&mut st.scratch.x_gpu).arg(&tid_ptr).arg(&hd).launch(launch_cfg) }
+            unsafe {
+                self.device
+                    .stream
+                    .launch_builder(&gk.embed_f16)
+                    .arg(emb_f16)
+                    .arg(&mut st.scratch.x_gpu)
+                    .arg(&tid_ptr)
+                    .arg(&hd)
+                    .launch(launch_cfg)
+            }
             .map_err(|e| RuntimeError::Compute(format!("graph embed_f16: {e}")))?;
         } else if let Some(ref emb_q4) = st.globals.embedding_q4 {
-            unsafe { self.device.stream.launch_builder(&gk.embed_q4_0).arg(emb_q4).arg(&mut st.scratch.x_gpu).arg(&tid_ptr).arg(&hd).launch(launch_cfg) }
+            unsafe {
+                self.device
+                    .stream
+                    .launch_builder(&gk.embed_q4_0)
+                    .arg(emb_q4)
+                    .arg(&mut st.scratch.x_gpu)
+                    .arg(&tid_ptr)
+                    .arg(&hd)
+                    .launch(launch_cfg)
+            }
             .map_err(|e| RuntimeError::Compute(format!("graph embed_q4_0: {e}")))?;
         } else if let Some(ref emb_q8) = st.globals.embedding_q8 {
-            unsafe { self.device.stream.launch_builder(&gk.embed_q8_0).arg(emb_q8).arg(&mut st.scratch.x_gpu).arg(&tid_ptr).arg(&hd).launch(launch_cfg) }
+            unsafe {
+                self.device
+                    .stream
+                    .launch_builder(&gk.embed_q8_0)
+                    .arg(emb_q8)
+                    .arg(&mut st.scratch.x_gpu)
+                    .arg(&tid_ptr)
+                    .arg(&hd)
+                    .launch(launch_cfg)
+            }
             .map_err(|e| RuntimeError::Compute(format!("graph embed_q8_0: {e}")))?;
         } else {
-            unsafe { self.device.stream.launch_builder(&gk.embed_f32).arg(&st.globals.embedding).arg(&mut st.scratch.x_gpu).arg(&tid_ptr).arg(&hd).launch(launch_cfg) }
+            unsafe {
+                self.device
+                    .stream
+                    .launch_builder(&gk.embed_f32)
+                    .arg(&st.globals.embedding)
+                    .arg(&mut st.scratch.x_gpu)
+                    .arg(&tid_ptr)
+                    .arg(&hd)
+                    .launch(launch_cfg)
+            }
             .map_err(|e| RuntimeError::Compute(format!("graph embed_f32: {e}")))?;
         }
         Ok(())
@@ -7838,11 +8955,14 @@ impl CudaBackend {
                     // exhaustive; should never trip in practice.
                     GpuWeightBuf::Q8Split(_) => "Q8Split (sibling -- unexpected in lw.wq)",
                     GpuWeightBuf::Q4Split(_) => "Q4Split (sibling -- unexpected in lw.wq)",
-                    GpuWeightBuf::Q8Tile(_)  => "Q8Tile (sibling -- unexpected in lw.wq)",
-                    GpuWeightBuf::Q4Tile(_)  => "Q4Tile (sibling -- unexpected in lw.wq)",
+                    GpuWeightBuf::Q8Tile(_) => "Q8Tile (sibling -- unexpected in lw.wq)",
+                    GpuWeightBuf::Q4Tile(_) => "Q4Tile (sibling -- unexpected in lw.wq)",
                 };
                 eprintln!("[GRAPH-DIAG]     L0 weight format: {wq_type}");
-                eprintln!("[GRAPH-DIAG]     L0 has_precomputed_ptrs: {}", st.precomputed_ptrs.is_some());
+                eprintln!(
+                    "[GRAPH-DIAG]     L0 has_precomputed_ptrs: {}",
+                    st.precomputed_ptrs.is_some()
+                );
             }
         }
 
@@ -7853,10 +8973,14 @@ impl CudaBackend {
             if !skip_head_norm {
                 unsafe {
                     launch_fused_rmsnorm_f16(
-                        &self.device, &st.kernels,
-                        &st.scratch.x_gpu, &lw.attn_norm,
+                        &self.device,
+                        &st.kernels,
+                        &st.scratch.x_gpu,
+                        &lw.attn_norm,
                         &mut st.scratch.input_f16,
-                        eps, hidden_dim, "graph attn F16",
+                        eps,
+                        hidden_dim,
+                        "graph attn F16",
                     )?;
                 }
             }
@@ -7865,14 +8989,22 @@ impl CudaBackend {
             // qgate routes wq -> q_gate (q_dim*2). KV unchanged.
             if let GpuWeightBuf::F16Raw(ref wq_f16) = lw.wq {
                 let (wq_out_buf, wq_od) = if has_qgate_fusion {
-                    (st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>, wq_out_dim)
+                    (
+                        st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>,
+                        wq_out_dim,
+                    )
                 } else {
                     (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
                 };
                 unsafe {
                     launch_hgemv_f16_preconverted(
-                        &self.device, wq_f16, &st.scratch.input_f16,
-                        wq_out_buf, wq_od, hidden_dim, "graph wq",
+                        &self.device,
+                        wq_f16,
+                        &st.scratch.input_f16,
+                        wq_out_buf,
+                        wq_od,
+                        hidden_dim,
+                        "graph wq",
                         st.algo_cache.get(wq_od, hidden_dim),
                     )?;
                 }
@@ -7883,12 +9015,17 @@ impl CudaBackend {
                     &pcp.kv_a_ptrs[layer_idx],
                     &pcp.kv_b_ptrs[layer_idx],
                     &pcp.kv_c_ptrs[layer_idx],
-                    2, kv_dim, hidden_dim, "graph kv",
+                    2,
+                    kv_dim,
+                    hidden_dim,
+                    "graph kv",
                     st.algo_cache.get(kv_dim, hidden_dim),
                 )?;
             }
         } else if matches!(&lw.wq, GpuWeightBuf::F32(_))
-            && lw.wq_f16.is_some() && lw.wk_f16.is_some() && lw.wv_f16.is_some()
+            && lw.wq_f16.is_some()
+            && lw.wk_f16.is_some()
+            && lw.wv_f16.is_some()
         {
             // cuBLAS HGEMV fast path for F32 weights with pre-dequanted F16 caches.
             // Q8/Q4 weights fall through to launch_matvec() for native dp4a (1.06 B/elem).
@@ -7896,24 +9033,36 @@ impl CudaBackend {
             if !skip_head_norm {
                 unsafe {
                     launch_fused_rmsnorm_f16(
-                        &self.device, &st.kernels,
-                        &st.scratch.x_gpu, &lw.attn_norm,
+                        &self.device,
+                        &st.kernels,
+                        &st.scratch.x_gpu,
+                        &lw.attn_norm,
                         &mut st.scratch.input_f16,
-                        eps, hidden_dim, "graph attn HGEMV",
+                        eps,
+                        hidden_dim,
+                        "graph attn HGEMV",
                     )?;
                 }
             }
             // qgate routes wq -> q_gate (q_dim*2). KV unchanged.
             if let Some(ref wq_f16) = lw.wq_f16 {
                 let (wq_out_buf, wq_od) = if has_qgate_fusion {
-                    (st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>, wq_out_dim)
+                    (
+                        st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>,
+                        wq_out_dim,
+                    )
                 } else {
                     (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
                 };
                 unsafe {
                     launch_hgemv_f16_preconverted(
-                        &self.device, wq_f16, &st.scratch.input_f16,
-                        wq_out_buf, wq_od, hidden_dim, "graph wq",
+                        &self.device,
+                        wq_f16,
+                        &st.scratch.input_f16,
+                        wq_out_buf,
+                        wq_od,
+                        hidden_dim,
+                        "graph wq",
                         st.algo_cache.get(wq_od, hidden_dim),
                     )?;
                 }
@@ -7924,7 +9073,10 @@ impl CudaBackend {
                     &pcp.kv_a_ptrs[layer_idx],
                     &pcp.kv_b_ptrs[layer_idx],
                     &pcp.kv_c_ptrs[layer_idx],
-                    2, kv_dim, hidden_dim, "graph kv",
+                    2,
+                    kv_dim,
+                    hidden_dim,
+                    "graph kv",
                     st.algo_cache.get(kv_dim, hidden_dim),
                 )?;
             }
@@ -7946,23 +9098,89 @@ impl CudaBackend {
                         let q8_1_in = st.scratch.input_q8_1.as_ref().unwrap();
                         let q8_1_ptr: *const _ = q8_1_in;
                         let q_gate = st.scratch.q_gate.as_mut().unwrap();
-                        launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wq, lw.q8_tile_wq.as_ref(), lw.q4_tile_wq.as_ref(), lw.q8_split_wq.as_ref(), lw.q4_split_wq.as_ref(), &*q8_1_ptr, q_gate, wq_out_dim, hidden_dim, "graph wq qgate")?;
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wq,
+                            lw.q8_tile_wq.as_ref(),
+                            lw.q4_tile_wq.as_ref(),
+                            lw.q8_split_wq.as_ref(),
+                            lw.q4_split_wq.as_ref(),
+                            &*q8_1_ptr,
+                            q_gate,
+                            wq_out_dim,
+                            hidden_dim,
+                            "graph wq qgate",
+                        )?;
                     } else {
                         let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                        launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wq, lw.q8_tile_wq.as_ref(), lw.q4_tile_wq.as_ref(), lw.q8_split_wq.as_ref(), lw.q4_split_wq.as_ref(), q8_1_buf, &mut st.scratch.q, q_dim, hidden_dim, "graph wq")?;
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wq,
+                            lw.q8_tile_wq.as_ref(),
+                            lw.q4_tile_wq.as_ref(),
+                            lw.q8_split_wq.as_ref(),
+                            lw.q4_split_wq.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.q,
+                            q_dim,
+                            hidden_dim,
+                            "graph wq",
+                        )?;
                     }
                     let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                    launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wk, lw.q8_tile_wk.as_ref(), lw.q4_tile_wk.as_ref(), lw.q8_split_wk.as_ref(), lw.q4_split_wk.as_ref(), q8_1_buf, &mut st.scratch.k, kv_dim, hidden_dim, "graph wk")?;
-                    launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wv, lw.q8_tile_wv.as_ref(), lw.q4_tile_wv.as_ref(), lw.q8_split_wv.as_ref(), lw.q4_split_wv.as_ref(), q8_1_buf, &mut st.scratch.v, kv_dim, hidden_dim, "graph wv")?;
+                    launch_matvec_preq8_1_tile(
+                        &self.device,
+                        &st.kernels,
+                        &lw.wk,
+                        lw.q8_tile_wk.as_ref(),
+                        lw.q4_tile_wk.as_ref(),
+                        lw.q8_split_wk.as_ref(),
+                        lw.q4_split_wk.as_ref(),
+                        q8_1_buf,
+                        &mut st.scratch.k,
+                        kv_dim,
+                        hidden_dim,
+                        "graph wk",
+                    )?;
+                    launch_matvec_preq8_1_tile(
+                        &self.device,
+                        &st.kernels,
+                        &lw.wv,
+                        lw.q8_tile_wv.as_ref(),
+                        lw.q4_tile_wv.as_ref(),
+                        lw.q8_split_wv.as_ref(),
+                        lw.q4_split_wv.as_ref(),
+                        q8_1_buf,
+                        &mut st.scratch.v,
+                        kv_dim,
+                        hidden_dim,
+                        "graph wv",
+                    )?;
                 }
             } else if !skip_head_norm && qkv_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
                 // Fused RMSNorm + Q8_1 for graph decode: saves 1 dispatch per norm site.
                 let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
                 let q8_1_buf_init = st.scratch.input_q8_1.as_mut().unwrap();
                 let bs = rmsnorm_block_size(hidden_dim);
-                let lc = CudarcLaunchConfig { grid_dim: (1,1,1), block_dim: (bs,1,1), shared_mem_bytes: rmsnorm_shared_bytes(bs) };
+                let lc = CudarcLaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (bs, 1, 1),
+                    shared_mem_bytes: rmsnorm_shared_bytes(bs),
+                };
                 let dim = hidden_dim as u32;
-                unsafe { self.device.stream.launch_builder(fused_fn).arg(&st.scratch.x_gpu).arg(&lw.attn_norm).arg(&mut *q8_1_buf_init).arg(&eps).arg(&dim).launch(lc) }
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(fused_fn)
+                        .arg(&st.scratch.x_gpu)
+                        .arg(&lw.attn_norm)
+                        .arg(&mut *q8_1_buf_init)
+                        .arg(&eps)
+                        .arg(&dim)
+                        .launch(lc)
+                }
                 .map_err(|e| RuntimeError::Compute(format!("graph rmsnorm_to_q8_1 attn: {e}")))?;
                 // Drop the &mut borrow before re-borrowing for wq dispatch.
                 let _ = q8_1_buf_init;
@@ -7975,21 +9193,87 @@ impl CudaBackend {
                         // Use raw pointer to break the borrow chain for the &mut q_gate write.
                         let q8_1_ptr: *const _ = q8_1_in;
                         let q_gate = st.scratch.q_gate.as_mut().unwrap();
-                        launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wq, lw.q8_tile_wq.as_ref(), lw.q4_tile_wq.as_ref(), lw.q8_split_wq.as_ref(), lw.q4_split_wq.as_ref(), &*q8_1_ptr, q_gate, wq_out_dim, hidden_dim, "graph wq qgate")?;
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wq,
+                            lw.q8_tile_wq.as_ref(),
+                            lw.q4_tile_wq.as_ref(),
+                            lw.q8_split_wq.as_ref(),
+                            lw.q4_split_wq.as_ref(),
+                            &*q8_1_ptr,
+                            q_gate,
+                            wq_out_dim,
+                            hidden_dim,
+                            "graph wq qgate",
+                        )?;
                     } else {
                         let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                        launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wq, lw.q8_tile_wq.as_ref(), lw.q4_tile_wq.as_ref(), lw.q8_split_wq.as_ref(), lw.q4_split_wq.as_ref(), q8_1_buf, &mut st.scratch.q, q_dim, hidden_dim, "graph wq")?;
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wq,
+                            lw.q8_tile_wq.as_ref(),
+                            lw.q4_tile_wq.as_ref(),
+                            lw.q8_split_wq.as_ref(),
+                            lw.q4_split_wq.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.q,
+                            q_dim,
+                            hidden_dim,
+                            "graph wq",
+                        )?;
                     }
                     let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                    launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wk, lw.q8_tile_wk.as_ref(), lw.q4_tile_wk.as_ref(), lw.q8_split_wk.as_ref(), lw.q4_split_wk.as_ref(), q8_1_buf, &mut st.scratch.k, kv_dim, hidden_dim, "graph wk")?;
-                    launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wv, lw.q8_tile_wv.as_ref(), lw.q4_tile_wv.as_ref(), lw.q8_split_wv.as_ref(), lw.q4_split_wv.as_ref(), q8_1_buf, &mut st.scratch.v, kv_dim, hidden_dim, "graph wv")?;
+                    launch_matvec_preq8_1_tile(
+                        &self.device,
+                        &st.kernels,
+                        &lw.wk,
+                        lw.q8_tile_wk.as_ref(),
+                        lw.q4_tile_wk.as_ref(),
+                        lw.q8_split_wk.as_ref(),
+                        lw.q4_split_wk.as_ref(),
+                        q8_1_buf,
+                        &mut st.scratch.k,
+                        kv_dim,
+                        hidden_dim,
+                        "graph wk",
+                    )?;
+                    launch_matvec_preq8_1_tile(
+                        &self.device,
+                        &st.kernels,
+                        &lw.wv,
+                        lw.q8_tile_wv.as_ref(),
+                        lw.q4_tile_wv.as_ref(),
+                        lw.q8_split_wv.as_ref(),
+                        lw.q4_split_wv.as_ref(),
+                        q8_1_buf,
+                        &mut st.scratch.v,
+                        kv_dim,
+                        hidden_dim,
+                        "graph wv",
+                    )?;
                 }
             } else {
                 if !skip_head_norm {
                     let bs = rmsnorm_block_size(hidden_dim);
-                    let lc = CudarcLaunchConfig { grid_dim: (1,1,1), block_dim: (bs,1,1), shared_mem_bytes: rmsnorm_shared_bytes(bs) };
+                    let lc = CudarcLaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (bs, 1, 1),
+                        shared_mem_bytes: rmsnorm_shared_bytes(bs),
+                    };
                     let dim = hidden_dim as u32;
-                    unsafe { self.device.stream.launch_builder(&st.kernels.rmsnorm).arg(&st.scratch.x_gpu).arg(&lw.attn_norm).arg(&mut st.scratch.normed).arg(&eps).arg(&dim).launch(lc) }
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.rmsnorm)
+                            .arg(&st.scratch.x_gpu)
+                            .arg(&lw.attn_norm)
+                            .arg(&mut st.scratch.normed)
+                            .arg(&eps)
+                            .arg(&dim)
+                            .launch(lc)
+                    }
                     .map_err(|e| RuntimeError::Compute(format!("graph rmsnorm attn: {e}")))?;
                 }
                 if qkv_use_preq {
@@ -7997,7 +9281,14 @@ impl CudaBackend {
                     unsafe {
                         {
                             let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                            launch_quantize_input_q8_1(&self.device, quant_fn, &st.scratch.normed, q8_1_buf, hidden_dim, "graph qkv")?;
+                            launch_quantize_input_q8_1(
+                                &self.device,
+                                quant_fn,
+                                &st.scratch.normed,
+                                q8_1_buf,
+                                hidden_dim,
+                                "graph qkv",
+                            )?;
                         }
                         // split-layout: prefer Q8Split/Q4Split sibling buffers on QKV when set.
                         // qgate routes wq -> q_gate (q_dim*2); K/V unchanged.
@@ -8005,26 +9296,126 @@ impl CudaBackend {
                             let q8_1_in = st.scratch.input_q8_1.as_ref().unwrap();
                             let q8_1_ptr: *const _ = q8_1_in;
                             let q_gate = st.scratch.q_gate.as_mut().unwrap();
-                            launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wq, lw.q8_tile_wq.as_ref(), lw.q4_tile_wq.as_ref(), lw.q8_split_wq.as_ref(), lw.q4_split_wq.as_ref(), &*q8_1_ptr, q_gate, wq_out_dim, hidden_dim, "graph wq qgate")?;
+                            launch_matvec_preq8_1_tile(
+                                &self.device,
+                                &st.kernels,
+                                &lw.wq,
+                                lw.q8_tile_wq.as_ref(),
+                                lw.q4_tile_wq.as_ref(),
+                                lw.q8_split_wq.as_ref(),
+                                lw.q4_split_wq.as_ref(),
+                                &*q8_1_ptr,
+                                q_gate,
+                                wq_out_dim,
+                                hidden_dim,
+                                "graph wq qgate",
+                            )?;
                         } else {
                             let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                            launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wq, lw.q8_tile_wq.as_ref(), lw.q4_tile_wq.as_ref(), lw.q8_split_wq.as_ref(), lw.q4_split_wq.as_ref(), q8_1_buf, &mut st.scratch.q, q_dim, hidden_dim, "graph wq")?;
+                            launch_matvec_preq8_1_tile(
+                                &self.device,
+                                &st.kernels,
+                                &lw.wq,
+                                lw.q8_tile_wq.as_ref(),
+                                lw.q4_tile_wq.as_ref(),
+                                lw.q8_split_wq.as_ref(),
+                                lw.q4_split_wq.as_ref(),
+                                q8_1_buf,
+                                &mut st.scratch.q,
+                                q_dim,
+                                hidden_dim,
+                                "graph wq",
+                            )?;
                         }
                         let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                        launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wk, lw.q8_tile_wk.as_ref(), lw.q4_tile_wk.as_ref(), lw.q8_split_wk.as_ref(), lw.q4_split_wk.as_ref(), q8_1_buf, &mut st.scratch.k, kv_dim, hidden_dim, "graph wk")?;
-                        launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.wv, lw.q8_tile_wv.as_ref(), lw.q4_tile_wv.as_ref(), lw.q8_split_wv.as_ref(), lw.q4_split_wv.as_ref(), q8_1_buf, &mut st.scratch.v, kv_dim, hidden_dim, "graph wv")?;
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wk,
+                            lw.q8_tile_wk.as_ref(),
+                            lw.q4_tile_wk.as_ref(),
+                            lw.q8_split_wk.as_ref(),
+                            lw.q4_split_wk.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.k,
+                            kv_dim,
+                            hidden_dim,
+                            "graph wk",
+                        )?;
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wv,
+                            lw.q8_tile_wv.as_ref(),
+                            lw.q4_tile_wv.as_ref(),
+                            lw.q8_split_wv.as_ref(),
+                            lw.q4_split_wv.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.v,
+                            kv_dim,
+                            hidden_dim,
+                            "graph wv",
+                        )?;
                     }
                 } else {
                     // qgate routes wq -> q_gate (q_dim*2); K/V unchanged.
                     unsafe {
                         if has_qgate_fusion {
                             let q_gate = st.scratch.q_gate.as_mut().unwrap();
-                            launch_matvec(&self.device, &st.kernels, &lw.wq, &st.scratch.normed, q_gate, wq_out_dim, hidden_dim, "graph wq qgate", lw.wq_f16.as_ref(), Some(&mut st.scratch.input_f16), st.scratch.input_q8_1.as_mut())?;
+                            launch_matvec(
+                                &self.device,
+                                &st.kernels,
+                                &lw.wq,
+                                &st.scratch.normed,
+                                q_gate,
+                                wq_out_dim,
+                                hidden_dim,
+                                "graph wq qgate",
+                                lw.wq_f16.as_ref(),
+                                Some(&mut st.scratch.input_f16),
+                                st.scratch.input_q8_1.as_mut(),
+                            )?;
                         } else {
-                            launch_matvec(&self.device, &st.kernels, &lw.wq, &st.scratch.normed, &mut st.scratch.q, q_dim, hidden_dim, "graph wq", lw.wq_f16.as_ref(), Some(&mut st.scratch.input_f16), st.scratch.input_q8_1.as_mut())?;
+                            launch_matvec(
+                                &self.device,
+                                &st.kernels,
+                                &lw.wq,
+                                &st.scratch.normed,
+                                &mut st.scratch.q,
+                                q_dim,
+                                hidden_dim,
+                                "graph wq",
+                                lw.wq_f16.as_ref(),
+                                Some(&mut st.scratch.input_f16),
+                                st.scratch.input_q8_1.as_mut(),
+                            )?;
                         }
-                        launch_matvec(&self.device, &st.kernels, &lw.wk, &st.scratch.normed, &mut st.scratch.k, kv_dim, hidden_dim, "graph wk", lw.wk_f16.as_ref(), Some(&mut st.scratch.input_f16), st.scratch.input_q8_1.as_mut())?;
-                        launch_matvec(&self.device, &st.kernels, &lw.wv, &st.scratch.normed, &mut st.scratch.v, kv_dim, hidden_dim, "graph wv", lw.wv_f16.as_ref(), Some(&mut st.scratch.input_f16), st.scratch.input_q8_1.as_mut())?;
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wk,
+                            &st.scratch.normed,
+                            &mut st.scratch.k,
+                            kv_dim,
+                            hidden_dim,
+                            "graph wk",
+                            lw.wk_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wv,
+                            &st.scratch.normed,
+                            &mut st.scratch.v,
+                            kv_dim,
+                            hidden_dim,
+                            "graph wv",
+                            lw.wv_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
                     }
                 }
             }
@@ -8074,9 +9465,15 @@ impl CudaBackend {
 
             // 1b. Per-head RMSNorm on Q using attn_q_norm [head_dim].
             if let Some(ref q_norm_w) = lw.attn_q_norm {
-                let norm_fn = st.kernels.rmsnorm_per_head_inplace.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute("Q+gate fusion (graph) requires rmsnorm_per_head_inplace".into())
-                })?;
+                let norm_fn = st
+                    .kernels
+                    .rmsnorm_per_head_inplace
+                    .as_ref()
+                    .ok_or_else(|| {
+                        RuntimeError::Compute(
+                            "Q+gate fusion (graph) requires rmsnorm_per_head_inplace".into(),
+                        )
+                    })?;
                 let hd = head_dim as u32;
                 let nh = num_heads as u32;
                 let block = (head_dim as u32).min(1024).max(32);
@@ -8103,9 +9500,15 @@ impl CudaBackend {
 
             // 1c. Per-head RMSNorm on K using attn_k_norm [head_dim].
             if let Some(ref k_norm_w) = lw.attn_k_norm {
-                let norm_fn = st.kernels.rmsnorm_per_head_inplace.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute("Q+gate fusion (graph) requires rmsnorm_per_head_inplace".into())
-                })?;
+                let norm_fn = st
+                    .kernels
+                    .rmsnorm_per_head_inplace
+                    .as_ref()
+                    .ok_or_else(|| {
+                        RuntimeError::Compute(
+                            "Q+gate fusion (graph) requires rmsnorm_per_head_inplace".into(),
+                        )
+                    })?;
                 let hd = head_dim as u32;
                 let nkvh = num_kv_heads as u32;
                 let block = (head_dim as u32).min(1024).max(32);
@@ -8137,21 +9540,51 @@ impl CudaBackend {
             let block = 256u32;
             unsafe {
                 if let Some(ref bq) = lw.bq {
-                    let d = q_dim as u32; let g = (d + block - 1) / block;
-                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.q).arg(bq).arg(&d)
-                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
+                    let d = q_dim as u32;
+                    let g = (d + block - 1) / block;
+                    self.device
+                        .stream
+                        .launch_builder(&st.kernels.bias_add)
+                        .arg(&mut st.scratch.q)
+                        .arg(bq)
+                        .arg(&d)
+                        .launch(CudarcLaunchConfig {
+                            grid_dim: (g, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
                         .map_err(|e| RuntimeError::Compute(format!("bias_add bq graph: {e}")))?;
                 }
                 if let Some(ref bk) = lw.bk {
-                    let d = kv_dim as u32; let g = (d + block - 1) / block;
-                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.k).arg(bk).arg(&d)
-                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
+                    let d = kv_dim as u32;
+                    let g = (d + block - 1) / block;
+                    self.device
+                        .stream
+                        .launch_builder(&st.kernels.bias_add)
+                        .arg(&mut st.scratch.k)
+                        .arg(bk)
+                        .arg(&d)
+                        .launch(CudarcLaunchConfig {
+                            grid_dim: (g, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
                         .map_err(|e| RuntimeError::Compute(format!("bias_add bk graph: {e}")))?;
                 }
                 if let Some(ref bv) = lw.bv {
-                    let d = kv_dim as u32; let g = (d + block - 1) / block;
-                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.v).arg(bv).arg(&d)
-                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
+                    let d = kv_dim as u32;
+                    let g = (d + block - 1) / block;
+                    self.device
+                        .stream
+                        .launch_builder(&st.kernels.bias_add)
+                        .arg(&mut st.scratch.v)
+                        .arg(bv)
+                        .arg(&d)
+                        .launch(CudarcLaunchConfig {
+                            grid_dim: (g, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
                         .map_err(|e| RuntimeError::Compute(format!("bias_add bv graph: {e}")))?;
                 }
             }
@@ -8170,13 +9603,21 @@ impl CudaBackend {
             let msl = kvc.max_seq_len as u32;
             let hd = kvc.head_dim as u32;
             let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
-            let actual_rot = if rotary_dim > 0 && rotary_dim < head_dim as u32 { rotary_dim as usize } else { head_dim };
+            let actual_rot = if rotary_dim > 0 && rotary_dim < head_dim as u32 {
+                rotary_dim as usize
+            } else {
+                head_dim
+            };
             let half_rot = actual_rot / 2;
             let total_q_pairs = num_heads * half_rot;
             let total_k_pairs = num_kv_heads * half_rot;
             let max_pairs = total_q_pairs.max(total_k_pairs);
             let config = LaunchConfig::for_elements(max_pairs);
-            let lc = CudarcLaunchConfig { grid_dim: (config.grid_dim,1,1), block_dim: (config.block_dim,1,1), shared_mem_bytes: 0 };
+            let lc = CudarcLaunchConfig {
+                grid_dim: (config.grid_dim, 1, 1),
+                block_dim: (config.block_dim, 1, 1),
+                shared_mem_bytes: 0,
+            };
             // NeoX RoPE: models with partial rotary_dim use half-offset dimension pairing.
             let rope_neox = hp.rope_neox;
             let rope_kv_fn = if rope_neox {
@@ -8184,13 +9625,24 @@ impl CudaBackend {
             } else {
                 &gk.rope_kv_write
             };
-            unsafe { self.device.stream.launch_builder(rope_kv_fn)
-                .arg(&mut st.scratch.q).arg(&mut st.scratch.k).arg(&st.scratch.v)
-                .arg(&mut kvc.k_cache).arg(&mut kvc.v_cache)
-                .arg(&pos_ptr)
-                .arg(&(num_heads as u32)).arg(&nkv).arg(&hd).arg(&msl).arg(&theta)
-                .arg(&rotary_dim)
-                .launch(lc) }
+            unsafe {
+                self.device
+                    .stream
+                    .launch_builder(rope_kv_fn)
+                    .arg(&mut st.scratch.q)
+                    .arg(&mut st.scratch.k)
+                    .arg(&st.scratch.v)
+                    .arg(&mut kvc.k_cache)
+                    .arg(&mut kvc.v_cache)
+                    .arg(&pos_ptr)
+                    .arg(&(num_heads as u32))
+                    .arg(&nkv)
+                    .arg(&hd)
+                    .arg(&msl)
+                    .arg(&theta)
+                    .arg(&rotary_dim)
+                    .launch(lc)
+            }
             .map_err(|e| RuntimeError::Compute(format!("graph rope_kv_write L{layer_idx}: {e}")))?;
         }
 
@@ -8238,20 +9690,48 @@ impl CudaBackend {
                     shared_mem_bytes: shared,
                 };
                 let tiled_fn = gk.attention_decode_tiled.as_ref().unwrap();
-                unsafe { self.device.stream.launch_builder(tiled_fn)
-                    .arg(&st.scratch.q).arg(&kvc.k_cache).arg(&kvc.v_cache).arg(&mut st.scratch.attn_out)
-                    .arg(&(num_heads as u32)).arg(&(num_kv_heads as u32)).arg(&(head_dim as u32))
-                    .arg(&seq_len_ptr).arg(&msl).arg(&scale)
-                    .launch(lc) }
-                .map_err(|e| RuntimeError::Compute(format!("graph attn tiled L{layer_idx}: {e}")))?;
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(tiled_fn)
+                        .arg(&st.scratch.q)
+                        .arg(&kvc.k_cache)
+                        .arg(&kvc.v_cache)
+                        .arg(&mut st.scratch.attn_out)
+                        .arg(&(num_heads as u32))
+                        .arg(&(num_kv_heads as u32))
+                        .arg(&(head_dim as u32))
+                        .arg(&seq_len_ptr)
+                        .arg(&msl)
+                        .arg(&scale)
+                        .launch(lc)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("graph attn tiled L{layer_idx}: {e}"))
+                })?;
             } else {
                 let shared = super::graph::graph_attention_shared_bytes(msl);
-                let lc = CudarcLaunchConfig { grid_dim: (num_heads as u32,1,1), block_dim: (super::graph::GRAPH_ATTN_BLOCK_SIZE,1,1), shared_mem_bytes: shared };
-                unsafe { self.device.stream.launch_builder(&gk.attention_decode)
-                    .arg(&st.scratch.q).arg(&kvc.k_cache).arg(&kvc.v_cache).arg(&mut st.scratch.attn_out)
-                    .arg(&(num_heads as u32)).arg(&(num_kv_heads as u32)).arg(&(head_dim as u32))
-                    .arg(&seq_len_ptr).arg(&msl).arg(&scale)
-                    .launch(lc) }
+                let lc = CudarcLaunchConfig {
+                    grid_dim: (num_heads as u32, 1, 1),
+                    block_dim: (super::graph::GRAPH_ATTN_BLOCK_SIZE, 1, 1),
+                    shared_mem_bytes: shared,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(&gk.attention_decode)
+                        .arg(&st.scratch.q)
+                        .arg(&kvc.k_cache)
+                        .arg(&kvc.v_cache)
+                        .arg(&mut st.scratch.attn_out)
+                        .arg(&(num_heads as u32))
+                        .arg(&(num_kv_heads as u32))
+                        .arg(&(head_dim as u32))
+                        .arg(&seq_len_ptr)
+                        .arg(&msl)
+                        .arg(&scale)
+                        .launch(lc)
+                }
                 .map_err(|e| RuntimeError::Compute(format!("graph attn L{layer_idx}: {e}")))?;
             }
         }
@@ -8311,31 +9791,55 @@ impl CudaBackend {
             let max_dim = q_dim.max(hidden_dim);
             let block = 256u32;
             let grid = ((max_dim as u32) + block - 1) / block;
-            let lc = CudarcLaunchConfig { grid_dim: (grid,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 };
-            unsafe { self.device.stream.launch_builder(&gk.convert_f16_residual_copy)
-                .arg(&st.scratch.attn_out).arg(&mut st.scratch.input_f16)
-                .arg(&st.scratch.x_gpu).arg(&mut st.scratch.attn_proj)
-                .arg(&(q_dim as u32)).arg(&(hidden_dim as u32))
-                .launch(lc) }
-            .map_err(|e| RuntimeError::Compute(format!("graph convert_f16_residual L{layer_idx}: {e}")))?;
+            let lc = CudarcLaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.device
+                    .stream
+                    .launch_builder(&gk.convert_f16_residual_copy)
+                    .arg(&st.scratch.attn_out)
+                    .arg(&mut st.scratch.input_f16)
+                    .arg(&st.scratch.x_gpu)
+                    .arg(&mut st.scratch.attn_proj)
+                    .arg(&(q_dim as u32))
+                    .arg(&(hidden_dim as u32))
+                    .launch(lc)
+            }
+            .map_err(|e| {
+                RuntimeError::Compute(format!("graph convert_f16_residual L{layer_idx}: {e}"))
+            })?;
             // HGEMV with beta=1.0 (residual already in attn_proj).
-            unsafe { launch_hgemv_f16_preconverted_beta1(
-                &self.device, wo_f16, &st.scratch.input_f16,
-                &mut st.scratch.attn_proj, hidden_dim, q_dim, "graph wo",
-                st.algo_cache.get(hidden_dim, q_dim),
-            )?; }
-        } else if matches!(&lw.wo, GpuWeightBuf::F32(_))
-            && lw.wo_f16.is_some()
-        {
+            unsafe {
+                launch_hgemv_f16_preconverted_beta1(
+                    &self.device,
+                    wo_f16,
+                    &st.scratch.input_f16,
+                    &mut st.scratch.attn_proj,
+                    hidden_dim,
+                    q_dim,
+                    "graph wo",
+                    st.algo_cache.get(hidden_dim, q_dim),
+                )?;
+            }
+        } else if matches!(&lw.wo, GpuWeightBuf::F32(_)) && lw.wo_f16.is_some() {
             // cuBLAS HGEMV fast path for F32 weights with pre-dequanted F16 caches.
             // Q8/Q4 weights fall through to launch_matvec_residual() for native dp4a.
             let wo_f16 = lw.wo_f16.as_ref().unwrap();
             unsafe {
                 launch_hgemv_f16_residual(
-                    &self.device, &st.kernels,
-                    wo_f16, &st.scratch.attn_out, &st.scratch.x_gpu,
-                    &mut st.scratch.attn_proj, &mut st.scratch.input_f16,
-                    hidden_dim, q_dim, "graph wo",
+                    &self.device,
+                    &st.kernels,
+                    wo_f16,
+                    &st.scratch.attn_out,
+                    &st.scratch.x_gpu,
+                    &mut st.scratch.attn_proj,
+                    &mut st.scratch.input_f16,
+                    hidden_dim,
+                    q_dim,
+                    "graph wo",
                     st.algo_cache.get(hidden_dim, q_dim),
                 )?;
             }
@@ -8349,22 +9853,64 @@ impl CudaBackend {
                 if let (Some(quant_fn), Some(q8_1_buf)) = (quant_fn, q8_1_scratch) {
                     unsafe {
                         launch_quantize_input_q8_1(
-                            &self.device, quant_fn, &st.scratch.attn_out, q8_1_buf,
-                            q_dim, "graph wo split",
+                            &self.device,
+                            quant_fn,
+                            &st.scratch.attn_out,
+                            q8_1_buf,
+                            q_dim,
+                            "graph wo split",
                         )?;
                         launch_matvec_preq8_1_residual_tile(
-                            &self.device, &st.kernels, &lw.wo,
-                            lw.q8_tile_wo.as_ref(),  lw.q4_tile_wo.as_ref(),
-                            lw.q8_split_wo.as_ref(), lw.q4_split_wo.as_ref(),
-                            q8_1_buf, &st.scratch.x_gpu, &mut st.scratch.attn_proj,
-                            hidden_dim, q_dim, "graph wo",
+                            &self.device,
+                            &st.kernels,
+                            &lw.wo,
+                            lw.q8_tile_wo.as_ref(),
+                            lw.q4_tile_wo.as_ref(),
+                            lw.q8_split_wo.as_ref(),
+                            lw.q4_split_wo.as_ref(),
+                            q8_1_buf,
+                            &st.scratch.x_gpu,
+                            &mut st.scratch.attn_proj,
+                            hidden_dim,
+                            q_dim,
+                            "graph wo",
                         )?;
                     }
                 } else {
-                    unsafe { launch_matvec_residual(&self.device, &st.kernels, &lw.wo, &st.scratch.attn_out, &st.scratch.x_gpu, &mut st.scratch.attn_proj, hidden_dim, q_dim, "graph wo", lw.wo_f16.as_ref(), Some(&mut st.scratch.input_f16), st.scratch.input_q8_1.as_mut())?; }
+                    unsafe {
+                        launch_matvec_residual(
+                            &self.device,
+                            &st.kernels,
+                            &lw.wo,
+                            &st.scratch.attn_out,
+                            &st.scratch.x_gpu,
+                            &mut st.scratch.attn_proj,
+                            hidden_dim,
+                            q_dim,
+                            "graph wo",
+                            lw.wo_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
+                    }
                 }
             } else {
-                unsafe { launch_matvec_residual(&self.device, &st.kernels, &lw.wo, &st.scratch.attn_out, &st.scratch.x_gpu, &mut st.scratch.attn_proj, hidden_dim, q_dim, "graph wo", lw.wo_f16.as_ref(), Some(&mut st.scratch.input_f16), st.scratch.input_q8_1.as_mut())?; }
+                unsafe {
+                    launch_matvec_residual(
+                        &self.device,
+                        &st.kernels,
+                        &lw.wo,
+                        &st.scratch.attn_out,
+                        &st.scratch.x_gpu,
+                        &mut st.scratch.attn_proj,
+                        hidden_dim,
+                        q_dim,
+                        "graph wo",
+                        lw.wo_f16.as_ref(),
+                        Some(&mut st.scratch.input_f16),
+                        st.scratch.input_q8_1.as_mut(),
+                    )?;
+                }
             }
         }
 
@@ -8387,15 +9933,25 @@ impl CudaBackend {
         // the next layer's head-norm runs unconditionally.
         if st.layer_weights_cache[layer_idx].moe_layer_blob.is_some() {
             let lw_moe: &LayerWeightsGpu = &st.layer_weights_cache[layer_idx];
-            let moe_meta_ref = st.moe_meta_cache.get(layer_idx)
+            let moe_meta_ref = st
+                .moe_meta_cache
+                .get(layer_idx)
                 .and_then(|m| m.as_ref())
-                .ok_or_else(|| RuntimeError::Compute(format!(
-                    "MoE graph layer {layer_idx} missing moe_meta_cache entry",
-                )))?;
-            let moe_layer_blob = lw_moe.moe_layer_blob.as_ref()
+                .ok_or_else(|| {
+                    RuntimeError::Compute(format!(
+                        "MoE graph layer {layer_idx} missing moe_meta_cache entry",
+                    ))
+                })?;
+            let moe_layer_blob = lw_moe
+                .moe_layer_blob
+                .as_ref()
                 .expect("moe_layer_blob.is_some() verified above");
             let num_experts = moe_meta_ref.expert_gate_offs.len();
-            let top_k = self.hp()?.num_active_experts.map(|v| v as usize).unwrap_or(0);
+            let top_k = self
+                .hp()?
+                .num_active_experts
+                .map(|v| v as usize)
+                .unwrap_or(0);
             if top_k == 0 {
                 return Err(RuntimeError::Compute(
                     "MoE graph layer present but hyperparams.num_active_experts not set".into(),
@@ -8489,14 +10045,20 @@ impl CudaBackend {
         // Step 6: FFN -- RMSNorm+F16 -> batched cuBLAS HGEMV gate/up -> SwiGLU -> HGEMV down.
         let lw = &st.layer_weights_cache[layer_idx];
         let pcp = st.precomputed_ptrs.as_ref().unwrap();
-        if matches!((&lw.w_gate, &lw.w_up), (GpuWeightBuf::F16Raw(_), GpuWeightBuf::F16Raw(_)))
-        {
+        if matches!(
+            (&lw.w_gate, &lw.w_up),
+            (GpuWeightBuf::F16Raw(_), GpuWeightBuf::F16Raw(_))
+        ) {
             unsafe {
                 launch_fused_rmsnorm_f16(
-                    &self.device, &st.kernels,
-                    &st.scratch.attn_proj, &lw.ffn_norm,
+                    &self.device,
+                    &st.kernels,
+                    &st.scratch.attn_proj,
+                    &lw.ffn_norm,
                     &mut st.scratch.input_f16,
-                    eps, hidden_dim, "graph ffn F16",
+                    eps,
+                    hidden_dim,
+                    "graph ffn F16",
                 )?;
             }
             unsafe {
@@ -8505,21 +10067,29 @@ impl CudaBackend {
                     &pcp.ffn_a_ptrs[layer_idx],
                     &pcp.ffn_b_ptrs[layer_idx],
                     &pcp.ffn_c_ptrs[layer_idx],
-                    2, inter_dim, hidden_dim, "graph gate_up",
+                    2,
+                    inter_dim,
+                    hidden_dim,
+                    "graph gate_up",
                     st.algo_cache.get(inter_dim, hidden_dim),
                 )?;
             }
         } else if matches!(&lw.w_gate, GpuWeightBuf::F32(_))
-            && lw.w_gate_f16.is_some() && lw.w_up_f16.is_some()
+            && lw.w_gate_f16.is_some()
+            && lw.w_up_f16.is_some()
         {
             // cuBLAS HGEMV fast path for F32 weights with pre-dequanted F16 caches.
             // Q8/Q4 weights fall through to launch_matvec() for native dp4a.
             unsafe {
                 launch_fused_rmsnorm_f16(
-                    &self.device, &st.kernels,
-                    &st.scratch.attn_proj, &lw.ffn_norm,
+                    &self.device,
+                    &st.kernels,
+                    &st.scratch.attn_proj,
+                    &lw.ffn_norm,
                     &mut st.scratch.input_f16,
-                    eps, hidden_dim, "graph ffn HGEMV",
+                    eps,
+                    hidden_dim,
+                    "graph ffn HGEMV",
                 )?;
             }
             unsafe {
@@ -8528,7 +10098,10 @@ impl CudaBackend {
                     &pcp.ffn_a_ptrs[layer_idx],
                     &pcp.ffn_b_ptrs[layer_idx],
                     &pcp.ffn_c_ptrs[layer_idx],
-                    2, inter_dim, hidden_dim, "graph gate_up",
+                    2,
+                    inter_dim,
+                    hidden_dim,
+                    "graph gate_up",
                     st.algo_cache.get(inter_dim, hidden_dim),
                 )?;
             }
@@ -8545,35 +10118,146 @@ impl CudaBackend {
                 let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
                 let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
                 let bs = rmsnorm_block_size(hidden_dim);
-                let lc = CudarcLaunchConfig { grid_dim: (1,1,1), block_dim: (bs,1,1), shared_mem_bytes: rmsnorm_shared_bytes(bs) };
+                let lc = CudarcLaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (bs, 1, 1),
+                    shared_mem_bytes: rmsnorm_shared_bytes(bs),
+                };
                 let dim = hidden_dim as u32;
-                unsafe { self.device.stream.launch_builder(fused_fn).arg(&st.scratch.attn_proj).arg(&lw.ffn_norm).arg(&mut *q8_1_buf).arg(&eps).arg(&dim).launch(lc) }
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(fused_fn)
+                        .arg(&st.scratch.attn_proj)
+                        .arg(&lw.ffn_norm)
+                        .arg(&mut *q8_1_buf)
+                        .arg(&eps)
+                        .arg(&dim)
+                        .launch(lc)
+                }
                 .map_err(|e| RuntimeError::Compute(format!("graph rmsnorm_to_q8_1 ffn: {e}")))?;
                 unsafe {
                     // split-layout: prefer Q8Split/Q4Split sibling buffers on FFN gate/up when set.
-                    launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.w_gate, lw.q8_tile_w_gate.as_ref(), lw.q4_tile_w_gate.as_ref(), lw.q8_split_w_gate.as_ref(), lw.q4_split_w_gate.as_ref(), q8_1_buf, &mut st.scratch.gate, inter_dim, hidden_dim, "graph gate")?;
-                    launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.w_up, lw.q8_tile_w_up.as_ref(), lw.q4_tile_w_up.as_ref(), lw.q8_split_w_up.as_ref(), lw.q4_split_w_up.as_ref(), q8_1_buf, &mut st.scratch.up, inter_dim, hidden_dim, "graph up")?;
+                    launch_matvec_preq8_1_tile(
+                        &self.device,
+                        &st.kernels,
+                        &lw.w_gate,
+                        lw.q8_tile_w_gate.as_ref(),
+                        lw.q4_tile_w_gate.as_ref(),
+                        lw.q8_split_w_gate.as_ref(),
+                        lw.q4_split_w_gate.as_ref(),
+                        q8_1_buf,
+                        &mut st.scratch.gate,
+                        inter_dim,
+                        hidden_dim,
+                        "graph gate",
+                    )?;
+                    launch_matvec_preq8_1_tile(
+                        &self.device,
+                        &st.kernels,
+                        &lw.w_up,
+                        lw.q8_tile_w_up.as_ref(),
+                        lw.q4_tile_w_up.as_ref(),
+                        lw.q8_split_w_up.as_ref(),
+                        lw.q4_split_w_up.as_ref(),
+                        q8_1_buf,
+                        &mut st.scratch.up,
+                        inter_dim,
+                        hidden_dim,
+                        "graph up",
+                    )?;
                 }
             } else {
                 let bs = rmsnorm_block_size(hidden_dim);
-                let lc = CudarcLaunchConfig { grid_dim: (1,1,1), block_dim: (bs,1,1), shared_mem_bytes: rmsnorm_shared_bytes(bs) };
+                let lc = CudarcLaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (bs, 1, 1),
+                    shared_mem_bytes: rmsnorm_shared_bytes(bs),
+                };
                 let dim = hidden_dim as u32;
-                unsafe { self.device.stream.launch_builder(&st.kernels.rmsnorm).arg(&st.scratch.attn_proj).arg(&lw.ffn_norm).arg(&mut st.scratch.normed).arg(&eps).arg(&dim).launch(lc) }
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(&st.kernels.rmsnorm)
+                        .arg(&st.scratch.attn_proj)
+                        .arg(&lw.ffn_norm)
+                        .arg(&mut st.scratch.normed)
+                        .arg(&eps)
+                        .arg(&dim)
+                        .launch(lc)
+                }
                 .map_err(|e| RuntimeError::Compute(format!("graph rmsnorm ffn: {e}")))?;
 
                 if ffn_use_preq {
                     let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref().unwrap();
                     let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
                     unsafe {
-                        launch_quantize_input_q8_1(&self.device, quant_fn, &st.scratch.normed, q8_1_buf, hidden_dim, "graph ffn gate_up")?;
+                        launch_quantize_input_q8_1(
+                            &self.device,
+                            quant_fn,
+                            &st.scratch.normed,
+                            q8_1_buf,
+                            hidden_dim,
+                            "graph ffn gate_up",
+                        )?;
                         // split-layout: prefer Q8Split/Q4Split sibling buffers on FFN gate/up when set.
-                        launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.w_gate, lw.q8_tile_w_gate.as_ref(), lw.q4_tile_w_gate.as_ref(), lw.q8_split_w_gate.as_ref(), lw.q4_split_w_gate.as_ref(), q8_1_buf, &mut st.scratch.gate, inter_dim, hidden_dim, "graph gate")?;
-                        launch_matvec_preq8_1_tile(&self.device, &st.kernels, &lw.w_up, lw.q8_tile_w_up.as_ref(), lw.q4_tile_w_up.as_ref(), lw.q8_split_w_up.as_ref(), lw.q4_split_w_up.as_ref(), q8_1_buf, &mut st.scratch.up, inter_dim, hidden_dim, "graph up")?;
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_gate,
+                            lw.q8_tile_w_gate.as_ref(),
+                            lw.q4_tile_w_gate.as_ref(),
+                            lw.q8_split_w_gate.as_ref(),
+                            lw.q4_split_w_gate.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.gate,
+                            inter_dim,
+                            hidden_dim,
+                            "graph gate",
+                        )?;
+                        launch_matvec_preq8_1_tile(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_up,
+                            lw.q8_tile_w_up.as_ref(),
+                            lw.q4_tile_w_up.as_ref(),
+                            lw.q8_split_w_up.as_ref(),
+                            lw.q4_split_w_up.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.up,
+                            inter_dim,
+                            hidden_dim,
+                            "graph up",
+                        )?;
                     }
                 } else {
                     unsafe {
-                        launch_matvec(&self.device, &st.kernels, &lw.w_gate, &st.scratch.normed, &mut st.scratch.gate, inter_dim, hidden_dim, "graph gate", lw.w_gate_f16.as_ref(), Some(&mut st.scratch.input_f16), st.scratch.input_q8_1.as_mut())?;
-                        launch_matvec(&self.device, &st.kernels, &lw.w_up, &st.scratch.normed, &mut st.scratch.up, inter_dim, hidden_dim, "graph up", lw.w_up_f16.as_ref(), Some(&mut st.scratch.input_f16), st.scratch.input_q8_1.as_mut())?;
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_gate,
+                            &st.scratch.normed,
+                            &mut st.scratch.gate,
+                            inter_dim,
+                            hidden_dim,
+                            "graph gate",
+                            lw.w_gate_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_up,
+                            &st.scratch.normed,
+                            &mut st.scratch.up,
+                            inter_dim,
+                            hidden_dim,
+                            "graph up",
+                            lw.w_up_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
                     }
                 }
             }
@@ -8587,33 +10271,47 @@ impl CudaBackend {
         if let GpuWeightBuf::F16Raw(ref wd_f16) = lw.w_down {
             unsafe {
                 launch_swiglu_f32_to_f16(
-                    &self.device, &st.kernels,
-                    &mut st.scratch.gate, &st.scratch.up,
-                    &mut st.scratch.input_f16, inter_dim,
+                    &self.device,
+                    &st.kernels,
+                    &mut st.scratch.gate,
+                    &st.scratch.up,
+                    &mut st.scratch.input_f16,
+                    inter_dim,
                 )?;
             }
             unsafe {
                 launch_hgemv_f16_preconverted(
-                    &self.device, wd_f16, &st.scratch.input_f16,
-                    &mut st.scratch.down, hidden_dim, inter_dim, "graph down",
+                    &self.device,
+                    wd_f16,
+                    &st.scratch.input_f16,
+                    &mut st.scratch.down,
+                    hidden_dim,
+                    inter_dim,
+                    "graph down",
                     st.algo_cache.get(hidden_dim, inter_dim),
                 )?;
             }
-        } else if matches!(&lw.w_down, GpuWeightBuf::F32(_))
-            && lw.w_down_f16.is_some()
-        {
+        } else if matches!(&lw.w_down, GpuWeightBuf::F32(_)) && lw.w_down_f16.is_some() {
             unsafe {
                 launch_swiglu_f32_to_f16(
-                    &self.device, &st.kernels,
-                    &mut st.scratch.gate, &st.scratch.up,
-                    &mut st.scratch.input_f16, inter_dim,
+                    &self.device,
+                    &st.kernels,
+                    &mut st.scratch.gate,
+                    &st.scratch.up,
+                    &mut st.scratch.input_f16,
+                    inter_dim,
                 )?;
             }
             if let Some(ref wd_f16) = lw.w_down_f16 {
                 unsafe {
                     launch_hgemv_f16_preconverted(
-                        &self.device, wd_f16, &st.scratch.input_f16,
-                        &mut st.scratch.down, hidden_dim, inter_dim, "graph down",
+                        &self.device,
+                        wd_f16,
+                        &st.scratch.input_f16,
+                        &mut st.scratch.down,
+                        hidden_dim,
+                        inter_dim,
+                        "graph down",
                         st.algo_cache.get(hidden_dim, inter_dim),
                     )?;
                 }
@@ -8621,9 +10319,21 @@ impl CudaBackend {
         } else {
             // Non-F16: separate SwiGLU + launch_matvec down.
             let config = LaunchConfig::for_elements(inter_dim);
-            let lc = CudarcLaunchConfig { grid_dim: (config.grid_dim,1,1), block_dim: (config.block_dim,1,1), shared_mem_bytes: 0 };
+            let lc = CudarcLaunchConfig {
+                grid_dim: (config.grid_dim, 1, 1),
+                block_dim: (config.block_dim, 1, 1),
+                shared_mem_bytes: 0,
+            };
             let n = inter_dim as u32;
-            unsafe { self.device.stream.launch_builder(&st.kernels.swiglu_inplace).arg(&mut st.scratch.gate).arg(&st.scratch.up).arg(&n).launch(lc) }
+            unsafe {
+                self.device
+                    .stream
+                    .launch_builder(&st.kernels.swiglu_inplace)
+                    .arg(&mut st.scratch.gate)
+                    .arg(&st.scratch.up)
+                    .arg(&n)
+                    .launch(lc)
+            }
             .map_err(|e| RuntimeError::Compute(format!("graph swiglu L{layer_idx}: {e}")))?;
             // split-layout: prefer Q8/Q4 split sibling for w_down in graph path too.
             let use_split_down = (st.kernels.use_q8_split_dispatch && lw.q8_split_w_down.is_some())
@@ -8634,22 +10344,61 @@ impl CudaBackend {
                 if let (Some(quant_fn), Some(q8_1_buf)) = (quant_fn, q8_1_scratch) {
                     unsafe {
                         launch_quantize_input_q8_1(
-                            &self.device, quant_fn, &st.scratch.gate, q8_1_buf,
-                            inter_dim, "graph down split",
+                            &self.device,
+                            quant_fn,
+                            &st.scratch.gate,
+                            q8_1_buf,
+                            inter_dim,
+                            "graph down split",
                         )?;
                         launch_matvec_preq8_1_tile(
-                            &self.device, &st.kernels, &lw.w_down,
-                            lw.q8_tile_w_down.as_ref(),  lw.q4_tile_w_down.as_ref(),
-                            lw.q8_split_w_down.as_ref(), lw.q4_split_w_down.as_ref(),
-                            q8_1_buf, &mut st.scratch.down,
-                            hidden_dim, inter_dim, "graph down",
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_down,
+                            lw.q8_tile_w_down.as_ref(),
+                            lw.q4_tile_w_down.as_ref(),
+                            lw.q8_split_w_down.as_ref(),
+                            lw.q4_split_w_down.as_ref(),
+                            q8_1_buf,
+                            &mut st.scratch.down,
+                            hidden_dim,
+                            inter_dim,
+                            "graph down",
                         )?;
                     }
                 } else {
-                    unsafe { launch_matvec(&self.device, &st.kernels, &lw.w_down, &st.scratch.gate, &mut st.scratch.down, hidden_dim, inter_dim, "graph down", lw.w_down_f16.as_ref(), Some(&mut st.scratch.input_f16), st.scratch.input_q8_1.as_mut())?; }
+                    unsafe {
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_down,
+                            &st.scratch.gate,
+                            &mut st.scratch.down,
+                            hidden_dim,
+                            inter_dim,
+                            "graph down",
+                            lw.w_down_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
+                    }
                 }
             } else {
-                unsafe { launch_matvec(&self.device, &st.kernels, &lw.w_down, &st.scratch.gate, &mut st.scratch.down, hidden_dim, inter_dim, "graph down", lw.w_down_f16.as_ref(), Some(&mut st.scratch.input_f16), st.scratch.input_q8_1.as_mut())?; }
+                unsafe {
+                    launch_matvec(
+                        &self.device,
+                        &st.kernels,
+                        &lw.w_down,
+                        &st.scratch.gate,
+                        &mut st.scratch.down,
+                        hidden_dim,
+                        inter_dim,
+                        "graph down",
+                        lw.w_down_f16.as_ref(),
+                        Some(&mut st.scratch.input_f16),
+                        st.scratch.input_q8_1.as_mut(),
+                    )?;
+                }
             }
         }
         // Final step: residual add, with optional inter-layer fusion.
@@ -8663,7 +10412,9 @@ impl CudaBackend {
             // Check if next layer is F16 (HGEMV path).
             let next_is_f16 = matches!(&next_lw.wq, GpuWeightBuf::F16Raw(_))
                 || (matches!(&next_lw.wq, GpuWeightBuf::F32(_))
-                    && next_lw.wq_f16.is_some() && next_lw.wk_f16.is_some() && next_lw.wv_f16.is_some());
+                    && next_lw.wq_f16.is_some()
+                    && next_lw.wk_f16.is_some()
+                    && next_lw.wv_f16.is_some());
             // Check if next layer uses dp4a Q8_1 pre-quantized input.
             let next_uses_q8_preq = weight_uses_dp4a_q8_1(&next_lw.wq, &st.kernels)
                 && weight_uses_dp4a_q8_1(&next_lw.wk, &st.kernels)
@@ -8676,23 +10427,51 @@ impl CudaBackend {
                     let next_norm = &next_lw.attn_norm;
                     let bs = rmsnorm_block_size(hidden_dim);
                     let shared = rmsnorm_shared_bytes(bs);
-                    let lc = CudarcLaunchConfig { grid_dim: (1,1,1), block_dim: (bs,1,1), shared_mem_bytes: shared };
+                    let lc = CudarcLaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (bs, 1, 1),
+                        shared_mem_bytes: shared,
+                    };
                     let dim = hidden_dim as u32;
-                    unsafe { self.device.stream.launch_builder(func)
-                        .arg(&st.scratch.attn_proj).arg(&st.scratch.down)
-                        .arg(&mut st.scratch.x_gpu)
-                        .arg(next_norm)
-                        .arg(&mut st.scratch.input_f16)
-                        .arg(&eps).arg(&dim)
-                        .launch(lc) }
-                    .map_err(|e| RuntimeError::Compute(format!("graph fused_residual_rmsnorm_f16 L{layer_idx}: {e}")))?;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(func)
+                            .arg(&st.scratch.attn_proj)
+                            .arg(&st.scratch.down)
+                            .arg(&mut st.scratch.x_gpu)
+                            .arg(next_norm)
+                            .arg(&mut st.scratch.input_f16)
+                            .arg(&eps)
+                            .arg(&dim)
+                            .launch(lc)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "graph fused_residual_rmsnorm_f16 L{layer_idx}: {e}"
+                        ))
+                    })?;
                 } else {
                     let config = LaunchConfig::for_elements(hidden_dim);
-                    let lc = CudarcLaunchConfig { grid_dim: (config.grid_dim,1,1), block_dim: (config.block_dim,1,1), shared_mem_bytes: 0 };
+                    let lc = CudarcLaunchConfig {
+                        grid_dim: (config.grid_dim, 1, 1),
+                        block_dim: (config.block_dim, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
                     let n = hidden_dim as u32;
-                    unsafe { self.device.stream.launch_builder(&st.kernels.residual_add_copy)
-                        .arg(&st.scratch.attn_proj).arg(&st.scratch.down).arg(&mut st.scratch.x_gpu).arg(&n).launch(lc) }
-                    .map_err(|e| RuntimeError::Compute(format!("graph residual_add_copy L{layer_idx}: {e}")))?;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.residual_add_copy)
+                            .arg(&st.scratch.attn_proj)
+                            .arg(&st.scratch.down)
+                            .arg(&mut st.scratch.x_gpu)
+                            .arg(&n)
+                            .launch(lc)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("graph residual_add_copy L{layer_idx}: {e}"))
+                    })?;
                 }
             } else if next_uses_q8_preq {
                 if let Some(ref func) = st.kernels.fused_residual_rmsnorm_q8_1 {
@@ -8700,40 +10479,96 @@ impl CudaBackend {
                     let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
                     let bs = rmsnorm_block_size(hidden_dim);
                     let shared = rmsnorm_shared_bytes(bs);
-                    let lc = CudarcLaunchConfig { grid_dim: (1,1,1), block_dim: (bs,1,1), shared_mem_bytes: shared };
+                    let lc = CudarcLaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (bs, 1, 1),
+                        shared_mem_bytes: shared,
+                    };
                     let dim = hidden_dim as u32;
-                    unsafe { self.device.stream.launch_builder(func)
-                        .arg(&st.scratch.attn_proj).arg(&st.scratch.down)
-                        .arg(&mut st.scratch.x_gpu)
-                        .arg(next_norm)
-                        .arg(&mut *q8_1_buf)
-                        .arg(&eps).arg(&dim)
-                        .launch(lc) }
-                    .map_err(|e| RuntimeError::Compute(format!("graph fused_residual_rmsnorm_q8_1 L{layer_idx}: {e}")))?;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(func)
+                            .arg(&st.scratch.attn_proj)
+                            .arg(&st.scratch.down)
+                            .arg(&mut st.scratch.x_gpu)
+                            .arg(next_norm)
+                            .arg(&mut *q8_1_buf)
+                            .arg(&eps)
+                            .arg(&dim)
+                            .launch(lc)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "graph fused_residual_rmsnorm_q8_1 L{layer_idx}: {e}"
+                        ))
+                    })?;
                 } else {
                     let config = LaunchConfig::for_elements(hidden_dim);
-                    let lc = CudarcLaunchConfig { grid_dim: (config.grid_dim,1,1), block_dim: (config.block_dim,1,1), shared_mem_bytes: 0 };
+                    let lc = CudarcLaunchConfig {
+                        grid_dim: (config.grid_dim, 1, 1),
+                        block_dim: (config.block_dim, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
                     let n = hidden_dim as u32;
-                    unsafe { self.device.stream.launch_builder(&st.kernels.residual_add_copy)
-                        .arg(&st.scratch.attn_proj).arg(&st.scratch.down).arg(&mut st.scratch.x_gpu).arg(&n).launch(lc) }
-                    .map_err(|e| RuntimeError::Compute(format!("graph residual_add_copy L{layer_idx}: {e}")))?;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.residual_add_copy)
+                            .arg(&st.scratch.attn_proj)
+                            .arg(&st.scratch.down)
+                            .arg(&mut st.scratch.x_gpu)
+                            .arg(&n)
+                            .launch(lc)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("graph residual_add_copy L{layer_idx}: {e}"))
+                    })?;
                 }
             } else {
                 let config = LaunchConfig::for_elements(hidden_dim);
-                let lc = CudarcLaunchConfig { grid_dim: (config.grid_dim,1,1), block_dim: (config.block_dim,1,1), shared_mem_bytes: 0 };
+                let lc = CudarcLaunchConfig {
+                    grid_dim: (config.grid_dim, 1, 1),
+                    block_dim: (config.block_dim, 1, 1),
+                    shared_mem_bytes: 0,
+                };
                 let n = hidden_dim as u32;
-                unsafe { self.device.stream.launch_builder(&st.kernels.residual_add_copy)
-                    .arg(&st.scratch.attn_proj).arg(&st.scratch.down).arg(&mut st.scratch.x_gpu).arg(&n).launch(lc) }
-                .map_err(|e| RuntimeError::Compute(format!("graph residual_add_copy L{layer_idx}: {e}")))?;
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(&st.kernels.residual_add_copy)
+                        .arg(&st.scratch.attn_proj)
+                        .arg(&st.scratch.down)
+                        .arg(&mut st.scratch.x_gpu)
+                        .arg(&n)
+                        .launch(lc)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("graph residual_add_copy L{layer_idx}: {e}"))
+                })?;
             }
         } else {
             // Last layer: plain residual_add_copy (no fusion needed).
             let config = LaunchConfig::for_elements(hidden_dim);
-            let lc = CudarcLaunchConfig { grid_dim: (config.grid_dim,1,1), block_dim: (config.block_dim,1,1), shared_mem_bytes: 0 };
+            let lc = CudarcLaunchConfig {
+                grid_dim: (config.grid_dim, 1, 1),
+                block_dim: (config.block_dim, 1, 1),
+                shared_mem_bytes: 0,
+            };
             let n = hidden_dim as u32;
-            unsafe { self.device.stream.launch_builder(&st.kernels.residual_add_copy)
-                .arg(&st.scratch.attn_proj).arg(&st.scratch.down).arg(&mut st.scratch.x_gpu).arg(&n).launch(lc) }
-            .map_err(|e| RuntimeError::Compute(format!("graph residual_add_copy L{layer_idx}: {e}")))?;
+            unsafe {
+                self.device
+                    .stream
+                    .launch_builder(&st.kernels.residual_add_copy)
+                    .arg(&st.scratch.attn_proj)
+                    .arg(&st.scratch.down)
+                    .arg(&mut st.scratch.x_gpu)
+                    .arg(&n)
+                    .launch(lc)
+            }
+            .map_err(|e| {
+                RuntimeError::Compute(format!("graph residual_add_copy L{layer_idx}: {e}"))
+            })?;
         }
         Ok(())
     }
@@ -8746,10 +10581,7 @@ impl CudaBackend {
     /// Uses graph kernel variants for embed, RoPE, KV cache write, and attention.
     /// Everything else uses standard kernels (captured directly since they have
     /// no per-token-varying scalars).
-    fn run_graph_pipeline(
-        &self,
-        st: &mut MutableState,
-    ) -> Result<(), RuntimeError> {
+    fn run_graph_pipeline(&self, st: &mut MutableState) -> Result<(), RuntimeError> {
         let hp = self.hp()?;
         let num_layers = hp.num_layers as usize;
         let diag = std::env::var("LUMEN_GRAPH_DIAGNOSTIC")
@@ -8757,7 +10589,9 @@ impl CudaBackend {
             .unwrap_or(false);
 
         // Step 1: Embed using graph variant
-        if diag { eprintln!("[GRAPH-DIAG]   pipeline step 1: embed_token_gpu_graph"); }
+        if diag {
+            eprintln!("[GRAPH-DIAG]   pipeline step 1: embed_token_gpu_graph");
+        }
         self.embed_token_gpu_graph(st)?;
         if diag {
             let status = super::graph::query_capture_status(&self.device.stream);
@@ -8771,31 +10605,37 @@ impl CudaBackend {
         // Two fusion paths:
         // - F16: fused_residual_rmsnorm_f16 -> residual + RMSNorm + F16 output (for HGEMV paths)
         // - Q8_0: fused_residual_rmsnorm_q8_1 -> residual + RMSNorm + Q8_1 output (for dp4a paths)
-        let uses_f16: Vec<bool> = (0..num_layers).map(|l| {
-            let lw = &st.layer_weights_cache[l];
-            matches!(&lw.wq, GpuWeightBuf::F16Raw(_))
-                || (matches!(&lw.wq, GpuWeightBuf::F32(_))
-                    && lw.wq_f16.is_some() && lw.wk_f16.is_some() && lw.wv_f16.is_some())
-        }).collect();
+        let uses_f16: Vec<bool> = (0..num_layers)
+            .map(|l| {
+                let lw = &st.layer_weights_cache[l];
+                matches!(&lw.wq, GpuWeightBuf::F16Raw(_))
+                    || (matches!(&lw.wq, GpuWeightBuf::F32(_))
+                        && lw.wq_f16.is_some()
+                        && lw.wk_f16.is_some()
+                        && lw.wv_f16.is_some())
+            })
+            .collect();
 
         // Detect layers that use dp4a Q8_1 pre-quantized input for QKV (Q8_0/Q4_0/Q8Aligned/Q4Aligned).
-        let uses_q8_preq: Vec<bool> = (0..num_layers).map(|l| {
-            let lw = &st.layer_weights_cache[l];
-            weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
-                && weight_uses_dp4a_q8_1(&lw.wk, &st.kernels)
-                && weight_uses_dp4a_q8_1(&lw.wv, &st.kernels)
-                && st.scratch.input_q8_1.is_some()
-                && st.kernels.quantize_f32_to_q8_1.is_some()
-        }).collect();
+        let uses_q8_preq: Vec<bool> = (0..num_layers)
+            .map(|l| {
+                let lw = &st.layer_weights_cache[l];
+                weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
+                    && weight_uses_dp4a_q8_1(&lw.wk, &st.kernels)
+                    && weight_uses_dp4a_q8_1(&lw.wv, &st.kernels)
+                    && st.scratch.input_q8_1.is_some()
+                    && st.kernels.quantize_f32_to_q8_1.is_some()
+            })
+            .collect();
 
         let has_fused_f16 = st.kernels.fused_residual_rmsnorm_f16.is_some();
         let has_fused_q8_1 = st.kernels.fused_residual_rmsnorm_q8_1.is_some()
             && st.kernels.rmsnorm_to_q8_1.is_some(); // also need unfused for FFN norm
 
         // Detect GDN layers for graph-compatible routing.
-        let layer_types: Vec<u8> = (0..num_layers).map(|l| {
-            st.layer_weights_cache[l].layer_type
-        }).collect();
+        let layer_types: Vec<u8> = (0..num_layers)
+            .map(|l| st.layer_weights_cache[l].layer_type)
+            .collect();
 
         // conv_positions->GPU sync is now performed by the caller
         // (`decode_token`) BEFORE `begin_capture()`. Doing it here would
@@ -8807,8 +10647,10 @@ impl CudaBackend {
         let mut skip_head_norm = false;
         for layer in 0..num_layers {
             if diag && (layer < 2 || layer == num_layers - 1) {
-                eprintln!("[GRAPH-DIAG]   pipeline step 2: L{layer} type={} (skip_head={skip_head_norm})",
-                    layer_types[layer]);
+                eprintln!(
+                    "[GRAPH-DIAG]   pipeline step 2: L{layer} type={} (skip_head={skip_head_norm})",
+                    layer_types[layer]
+                );
             }
 
             // GDN layer routing: use the regular decode GDN path (non-graph-specific).
@@ -8850,12 +10692,18 @@ impl CudaBackend {
                     let inter_dim = hp.intermediate_dim as usize;
                     let eps = hp.norm_eps;
                     let lw_moe: &LayerWeightsGpu = &st.layer_weights_cache[layer];
-                    let moe_meta_ref = st.moe_meta_cache.get(layer)
+                    let moe_meta_ref = st
+                        .moe_meta_cache
+                        .get(layer)
                         .and_then(|m| m.as_ref())
-                        .ok_or_else(|| RuntimeError::Compute(format!(
-                            "MoE-on-GDN graph layer {layer} missing moe_meta_cache entry",
-                        )))?;
-                    let moe_layer_blob = lw_moe.moe_layer_blob.as_ref()
+                        .ok_or_else(|| {
+                            RuntimeError::Compute(format!(
+                                "MoE-on-GDN graph layer {layer} missing moe_meta_cache entry",
+                            ))
+                        })?;
+                    let moe_layer_blob = lw_moe
+                        .moe_layer_blob
+                        .as_ref()
                         .expect("moe_layer_blob.is_some() verified above");
                     let num_experts = moe_meta_ref.expert_gate_offs.len();
                     let top_k = hp.num_active_experts.map(|v| v as usize).unwrap_or(0);
@@ -8864,10 +10712,8 @@ impl CudaBackend {
                             "MoE-on-GDN graph layer present but hyperparams.num_active_experts not set".into(),
                         ));
                     }
-                    let batched_offsets = st
-                        .moe_batched_offsets
-                        .get(layer)
-                        .and_then(|b| b.as_ref());
+                    let batched_offsets =
+                        st.moe_batched_offsets.get(layer).and_then(|b| b.as_ref());
                     let has_shared = moe_meta_ref.shared_gate.is_some();
                     let moe_scratch = st.moe_scratch.as_mut().ok_or_else(|| {
                         RuntimeError::Compute(
@@ -8897,7 +10743,8 @@ impl CudaBackend {
                         static FLAG: OnceLock<bool> = OnceLock::new();
                         *FLAG.get_or_init(|| {
                             std::env::var("LUMEN_CUDA_SKIP_SHARED_EXPERT")
-                                .ok().as_deref()
+                                .ok()
+                                .as_deref()
                                 .map(|v| matches!(v, "1" | "true" | "yes"))
                                 .unwrap_or(false)
                         })
@@ -8953,7 +10800,9 @@ impl CudaBackend {
                     };
                     let dim = hidden_dim as u32;
                     unsafe {
-                        self.device.stream.launch_builder(&st.kernels.rmsnorm)
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.rmsnorm)
                             .arg(&st.scratch.attn_proj)
                             .arg(&lw.ffn_norm)
                             .arg(&mut st.scratch.normed)
@@ -8961,44 +10810,99 @@ impl CudaBackend {
                             .arg(&dim)
                             .launch(launch_cfg)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!("GDN graph FFN rmsnorm L{layer}: {e}")))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("GDN graph FFN rmsnorm L{layer}: {e}"))
+                    })?;
 
                     // Gate + Up + SwiGLU + Down projections
                     unsafe {
-                        launch_matvec(&self.device, &st.kernels, &lw.w_gate, &st.scratch.normed,
-                            &mut st.scratch.gate, inter_dim, hidden_dim, "graph gdn gate",
-                            lw.w_gate_f16.as_ref(), Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut())?;
-                        launch_matvec(&self.device, &st.kernels, &lw.w_up, &st.scratch.normed,
-                            &mut st.scratch.up, inter_dim, hidden_dim, "graph gdn up",
-                            lw.w_up_f16.as_ref(), Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut())?;
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_gate,
+                            &st.scratch.normed,
+                            &mut st.scratch.gate,
+                            inter_dim,
+                            hidden_dim,
+                            "graph gdn gate",
+                            lw.w_gate_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_up,
+                            &st.scratch.normed,
+                            &mut st.scratch.up,
+                            inter_dim,
+                            hidden_dim,
+                            "graph gdn up",
+                            lw.w_up_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
                     }
                     // SwiGLU
                     {
                         let config = LaunchConfig::for_elements(inter_dim);
-                        let lc = CudarcLaunchConfig { grid_dim: (config.grid_dim,1,1), block_dim: (config.block_dim,1,1), shared_mem_bytes: 0 };
+                        let lc = CudarcLaunchConfig {
+                            grid_dim: (config.grid_dim, 1, 1),
+                            block_dim: (config.block_dim, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
                         let n = inter_dim as u32;
-                        unsafe { self.device.stream.launch_builder(&st.kernels.swiglu_inplace).arg(&mut st.scratch.gate).arg(&st.scratch.up).arg(&n).launch(lc) }
-                        .map_err(|e| RuntimeError::Compute(format!("GDN graph swiglu L{layer}: {e}")))?;
+                        unsafe {
+                            self.device
+                                .stream
+                                .launch_builder(&st.kernels.swiglu_inplace)
+                                .arg(&mut st.scratch.gate)
+                                .arg(&st.scratch.up)
+                                .arg(&n)
+                                .launch(lc)
+                        }
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("GDN graph swiglu L{layer}: {e}"))
+                        })?;
                     }
                     // Down projection
                     unsafe {
-                        launch_matvec(&self.device, &st.kernels, &lw.w_down, &st.scratch.gate,
-                            &mut st.scratch.down, hidden_dim, inter_dim, "graph gdn down",
-                            lw.w_down_f16.as_ref(), Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut())?;
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_down,
+                            &st.scratch.gate,
+                            &mut st.scratch.down,
+                            hidden_dim,
+                            inter_dim,
+                            "graph gdn down",
+                            lw.w_down_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
                     }
                     // Residual add: x_gpu = attn_proj + down (attn_proj already has GDN attention output)
                     {
                         let config = LaunchConfig::for_elements(hidden_dim);
-                        let lc = CudarcLaunchConfig { grid_dim: (config.grid_dim,1,1), block_dim: (config.block_dim,1,1), shared_mem_bytes: 0 };
+                        let lc = CudarcLaunchConfig {
+                            grid_dim: (config.grid_dim, 1, 1),
+                            block_dim: (config.block_dim, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
                         let n = hidden_dim as u32;
-                        unsafe { self.device.stream.launch_builder(&st.kernels.residual_add_copy)
-                            .arg(&st.scratch.attn_proj).arg(&st.scratch.down)
-                            .arg(&mut st.scratch.x_gpu).arg(&n)
-                            .launch(lc) }
-                        .map_err(|e| RuntimeError::Compute(format!("GDN graph residual L{layer}: {e}")))?;
+                        unsafe {
+                            self.device
+                                .stream
+                                .launch_builder(&st.kernels.residual_add_copy)
+                                .arg(&st.scratch.attn_proj)
+                                .arg(&st.scratch.down)
+                                .arg(&mut st.scratch.x_gpu)
+                                .arg(&n)
+                                .launch(lc)
+                        }
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("GDN graph residual L{layer}: {e}"))
+                        })?;
                     }
                 }
                 // GDN layers break inter-layer fusion -- reset skip_head_norm.
@@ -9021,8 +10925,10 @@ impl CudaBackend {
             // also skip fusion if THIS layer is MoE (MoE writes x_gpu
             // directly with residual accumulated) or NEXT layer is MoE (MoE FFN
             // does its own RMSNorm internally).
-            let fuse_tail_next = if layer + 1 < num_layers && layer_types[layer + 1] != 1
-                && !is_moe_layer && !next_is_moe
+            let fuse_tail_next = if layer + 1 < num_layers
+                && layer_types[layer + 1] != 1
+                && !is_moe_layer
+                && !next_is_moe
             {
                 let next_f16 = uses_f16[layer + 1];
                 let next_q8 = uses_q8_preq[layer + 1];
@@ -9049,7 +10955,9 @@ impl CudaBackend {
         }
 
         // Step 3: Final RMSNorm + output projection (no per-token scalars)
-        if diag { eprintln!("[GRAPH-DIAG]   pipeline step 3: compute_final_gpu"); }
+        if diag {
+            eprintln!("[GRAPH-DIAG]   pipeline step 3: compute_final_gpu");
+        }
         self.compute_final_gpu(st)?;
         if diag {
             let status = super::graph::query_capture_status(&self.device.stream);
@@ -9057,7 +10965,9 @@ impl CudaBackend {
         }
 
         // Step 4: GPU argmax
-        if diag { eprintln!("[GRAPH-DIAG]   pipeline step 4: argmax"); }
+        if diag {
+            eprintln!("[GRAPH-DIAG]   pipeline step 4: argmax");
+        }
         {
             let vocab = hp.vocab_size;
             let launch_cfg = CudarcLaunchConfig {
@@ -9066,7 +10976,8 @@ impl CudaBackend {
                 shared_mem_bytes: 0,
             };
             unsafe {
-                self.device.stream
+                self.device
+                    .stream
                     .launch_builder(&st.kernels.argmax_f32)
                     .arg(&st.logits_gpu)
                     .arg(&mut st.argmax_result)
@@ -9088,10 +10999,7 @@ impl CudaBackend {
     ///
     /// Input: `st.scratch.x_gpu` (final hidden state, [hidden_dim]).
     /// Output: `st.logits_gpu` (logits, [vocab_size]).
-    fn compute_final_gpu(
-        &self,
-        st: &mut MutableState,
-    ) -> Result<(), RuntimeError> {
+    fn compute_final_gpu(&self, st: &mut MutableState) -> Result<(), RuntimeError> {
         let hp = self.hp()?;
         let hidden_dim = hp.hidden_dim as usize;
         let vocab_size = hp.vocab_size as usize;
@@ -9104,14 +11012,23 @@ impl CudaBackend {
             if st.kernels.fused_rmsnorm_f16.is_some() {
                 unsafe {
                     launch_fused_rmsnorm_f16(
-                        &self.device, &st.kernels,
-                        &st.scratch.x_gpu, &st.globals.final_norm,
+                        &self.device,
+                        &st.kernels,
+                        &st.scratch.x_gpu,
+                        &st.globals.final_norm,
                         &mut st.scratch.input_f16,
-                        eps, hidden_dim, "final F16",
+                        eps,
+                        hidden_dim,
+                        "final F16",
                     )?;
                     launch_hgemv_f16_preconverted(
-                        &self.device, proj_f16, &st.scratch.input_f16,
-                        &mut st.logits_gpu, vocab_size, hidden_dim, "output_proj",
+                        &self.device,
+                        proj_f16,
+                        &st.scratch.input_f16,
+                        &mut st.logits_gpu,
+                        vocab_size,
+                        hidden_dim,
+                        "output_proj",
                         st.algo_cache.get(vocab_size, hidden_dim),
                     )?;
                 }
@@ -9172,15 +11089,17 @@ impl CudaBackend {
                         shared_mem_bytes: 0,
                     };
                     unsafe {
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(quant_fn)
                             .arg(&st.scratch.normed)
                             .arg(&mut **q8_1_buf)
                             .arg(&in_dim_u32)
                             .launch(quant_cfg)
-                    }.map_err(|e| RuntimeError::Compute(format!(
-                        "quantize_q8_1_rawsum output_proj Q4: {e}"
-                    )))?;
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("quantize_q8_1_rawsum output_proj Q4: {e}"))
+                    })?;
 
                     let mv_cfg = CudarcLaunchConfig {
                         grid_dim: (out_dim_u32, 1, 1),
@@ -9188,7 +11107,8 @@ impl CudaBackend {
                         shared_mem_bytes: 128,
                     };
                     unsafe {
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(mv_fn)
                             .arg(proj_q4a)
                             .arg(&**q8_1_buf)
@@ -9196,9 +11116,10 @@ impl CudaBackend {
                             .arg(&in_dim_u32)
                             .arg(&out_dim_u32)
                             .launch(mv_cfg)
-                    }.map_err(|e| RuntimeError::Compute(format!(
-                        "mul_mat_vec_q_q4_0 output_proj: {e}"
-                    )))?;
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("mul_mat_vec_q_q4_0 output_proj: {e}"))
+                    })?;
                     return Ok(());
                 }
             }
@@ -9219,16 +11140,19 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 };
                 unsafe {
-                    self.device.stream
+                    self.device
+                        .stream
                         .launch_builder(quant_fn)
                         .arg(&st.scratch.normed)
                         .arg(&mut *q8_1_buf)
                         .arg(&in_dim)
                         .launch(quant_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "quantize_f32_to_q8_1 output_proj Q4Aligned: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "quantize_f32_to_q8_1 output_proj Q4Aligned: {e}",
+                    ))
+                })?;
                 // Step 2: dp4a Q4Aligned matvec (NR=4, 256 threads).
                 let mv_grid = dp4a_q4_grid(out_dim);
                 let mv_cfg = CudarcLaunchConfig {
@@ -9237,7 +11161,8 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 };
                 unsafe {
-                    self.device.stream
+                    self.device
+                        .stream
                         .launch_builder(mv_fn)
                         .arg(proj_q4a)
                         .arg(&*q8_1_buf)
@@ -9246,9 +11171,9 @@ impl CudaBackend {
                         .arg(&in_dim)
                         .launch(mv_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec_q4_aligned_q8_1 output_proj: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("matvec_q4_aligned_q8_1 output_proj: {e}",))
+                })?;
             }
         } else if let Some(ref proj_q4) = st.globals.output_proj_q4 {
             let out_dim = vocab_size as u32;
@@ -9278,15 +11203,19 @@ impl CudaBackend {
                         shared_mem_bytes: 0,
                     };
                     unsafe {
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(quant_fn)
                             .arg(&st.scratch.normed)
                             .arg(&mut **q8_1_buf)
                             .arg(&in_dim)
                             .launch(quant_cfg)
-                    }.map_err(|e| RuntimeError::Compute(format!(
-                        "quantize_q8_1_rawsum output_proj Q4 raw: {e}"
-                    )))?;
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "quantize_q8_1_rawsum output_proj Q4 raw: {e}"
+                        ))
+                    })?;
 
                     let mv_cfg = CudarcLaunchConfig {
                         grid_dim: (out_dim, 1, 1),
@@ -9294,7 +11223,8 @@ impl CudaBackend {
                         shared_mem_bytes: 128,
                     };
                     unsafe {
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(mv_fn)
                             .arg(proj_q4)
                             .arg(&**q8_1_buf)
@@ -9302,9 +11232,10 @@ impl CudaBackend {
                             .arg(&in_dim)
                             .arg(&out_dim)
                             .launch(mv_cfg)
-                    }.map_err(|e| RuntimeError::Compute(format!(
-                        "mul_mat_vec_q_q4_0 output_proj Q4 raw: {e}"
-                    )))?;
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("mul_mat_vec_q_q4_0 output_proj Q4 raw: {e}"))
+                    })?;
                     return Ok(());
                 }
             }
@@ -9393,9 +11324,7 @@ impl CudaBackend {
                     st.algo_cache.get(vocab_size, hidden_dim),
                 )?;
             }
-        } else if let Some(ref proj_f16_cache) =
-            st.globals.output_proj_q8_to_f16_cache
-        {
+        } else if let Some(ref proj_f16_cache) = st.globals.output_proj_q8_to_f16_cache {
             // cuBLAS HGEMV-N=1 against a pre-dequanted F16 cache of the
             // Q8_0 output projection. Same compute path as BF16 / native F16
             // output_proj (proven faster on this shape). Takes priority over
@@ -9431,9 +11360,7 @@ impl CudaBackend {
             let out_dim_u32 = vocab_size as u32;
             let in_dim_u32 = hidden_dim as u32;
             let (split_mv_fn, mv_grid): (&CudaFunction, u32) =
-                if let Some(proj_fn) = pick_output_proj_nr_kernel(
-                    &st.kernels, st.output_proj_nr,
-                ) {
+                if let Some(proj_fn) = pick_output_proj_nr_kernel(&st.kernels, st.output_proj_nr) {
                     let nr = st.output_proj_nr;
                     (proj_fn, (out_dim_u32 + nr - 1) / nr)
                 } else if let Some(ref proj_fn) = st.kernels.matvec_q8_split_output_proj {
@@ -9465,9 +11392,9 @@ impl CudaBackend {
                         .arg(&in_dim_u32)
                         .launch(quant_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "quantize_f32_to_q8_1 output_proj split: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("quantize_f32_to_q8_1 output_proj split: {e}",))
+                })?;
                 let mv_cfg = CudarcLaunchConfig {
                     grid_dim: (mv_grid, 1, 1),
                     block_dim: (DP4A_Q8_1_BLOCK_DIM, 1, 1),
@@ -9484,9 +11411,7 @@ impl CudaBackend {
                         .arg(&in_dim_u32)
                         .launch(mv_cfg)
                 }
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec_q8_split output_proj: {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("matvec_q8_split output_proj: {e}",)))?;
             } else {
                 return Err(RuntimeError::Compute(
                     "output_proj_q8_split present but quantize kernel unavailable".into(),
@@ -9525,15 +11450,17 @@ impl CudaBackend {
                         shared_mem_bytes: 0,
                     };
                     unsafe {
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(quant_fn)
                             .arg(&st.scratch.normed)
                             .arg(&mut **q8_1_buf)
                             .arg(&in_dim_u32)
                             .launch(quant_cfg)
-                    }.map_err(|e| RuntimeError::Compute(format!(
-                        "quantize_q8_1_rawsum output_proj: {e}"
-                    )))?;
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("quantize_q8_1_rawsum output_proj: {e}"))
+                    })?;
 
                     let mv_cfg = CudarcLaunchConfig {
                         grid_dim: (out_dim_u32, 1, 1),
@@ -9541,7 +11468,8 @@ impl CudaBackend {
                         shared_mem_bytes: 128,
                     };
                     unsafe {
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(mv_fn)
                             .arg(proj_q8a)
                             .arg(&**q8_1_buf)
@@ -9549,9 +11477,10 @@ impl CudaBackend {
                             .arg(&in_dim_u32)
                             .arg(&out_dim_u32)
                             .launch(mv_cfg)
-                    }.map_err(|e| RuntimeError::Compute(format!(
-                        "mul_mat_vec_q_q8_0 output_proj: {e}"
-                    )))?;
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("mul_mat_vec_q_q8_0 output_proj: {e}"))
+                    })?;
                     return Ok(());
                 }
             }
@@ -9559,7 +11488,9 @@ impl CudaBackend {
             // Path 0: Q8Aligned + pre-quantized Q8_1 input (NR=2, dp4a).
             // Q8_SCALE_HW: prefer halfword-scale variant for output_proj.
             let aligned_mv_fn = if st.kernels.use_q8_scale_hw {
-                st.kernels.matvec_q8_aligned_q8_1_hw.as_ref()
+                st.kernels
+                    .matvec_q8_aligned_q8_1_hw
+                    .as_ref()
                     .or(st.kernels.matvec_q8_aligned_q8_1.as_ref())
             } else {
                 st.kernels.matvec_q8_aligned_q8_1.as_ref()
@@ -9610,7 +11541,10 @@ impl CudaBackend {
                 })?;
             } else {
                 // Fallback: on-the-fly x quantization.
-                let q8a_fn = st.kernels.matvec_q8_0_aligned.as_ref()
+                let q8a_fn = st
+                    .kernels
+                    .matvec_q8_0_aligned
+                    .as_ref()
                     .or(st.kernels.matvec_q8_0_dp4a.as_ref())
                     .unwrap_or(&st.kernels.matvec_q8_0);
                 let grid = matvec_q8_0_grid(out_dim_u32);
@@ -9665,15 +11599,17 @@ impl CudaBackend {
                         shared_mem_bytes: 0,
                     };
                     unsafe {
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(quant_fn)
                             .arg(&st.scratch.normed)
                             .arg(&mut **q8_1_buf)
                             .arg(&in_dim_u32)
                             .launch(quant_cfg)
-                    }.map_err(|e| RuntimeError::Compute(format!(
-                        "quantize_q8_1_rawsum output_proj raw: {e}"
-                    )))?;
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("quantize_q8_1_rawsum output_proj raw: {e}"))
+                    })?;
 
                     let mv_cfg = CudarcLaunchConfig {
                         grid_dim: (out_dim_u32, 1, 1),
@@ -9681,7 +11617,8 @@ impl CudaBackend {
                         shared_mem_bytes: 128,
                     };
                     unsafe {
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(mv_fn)
                             .arg(proj_q8)
                             .arg(&**q8_1_buf)
@@ -9689,14 +11626,18 @@ impl CudaBackend {
                             .arg(&in_dim_u32)
                             .arg(&out_dim_u32)
                             .launch(mv_cfg)
-                    }.map_err(|e| RuntimeError::Compute(format!(
-                        "mul_mat_vec_q_q8_0 output_proj raw: {e}"
-                    )))?;
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("mul_mat_vec_q_q8_0 output_proj raw: {e}"))
+                    })?;
                     return Ok(());
                 }
             }
 
-            let q8_fn = st.kernels.matvec_q8_0_dp4a.as_ref()
+            let q8_fn = st
+                .kernels
+                .matvec_q8_0_dp4a
+                .as_ref()
                 .unwrap_or(&st.kernels.matvec_q8_0);
             let grid = matvec_q8_0_grid(out_dim_u32);
             let shmem = 0u32;
@@ -9716,9 +11657,7 @@ impl CudaBackend {
                     .arg(&in_dim_u32)
                     .launch(launch_cfg)
             }
-            .map_err(|e| {
-                RuntimeError::Compute(format!("matvec output_proj Q8_0 launch: {e}"))
-            })?;
+            .map_err(|e| RuntimeError::Compute(format!("matvec output_proj Q8_0 launch: {e}")))?;
         } else if let Some(ref proj_bf16) = st.globals.output_proj_bf16 {
             // Path -1: BF16 output_proj matvec dispatch.
             // Env-gated `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ=1`. Default OFF
@@ -9756,8 +11695,10 @@ impl CudaBackend {
                     });
                     let nrows_x = vocab_size as i32;
                     let ncols_x = hidden_dim as i32;
-                    debug_assert!(ncols_x % 2 == 0,
-                        "mul_mat_vec_f_bf16 requires hidden_dim % 2 == 0");
+                    debug_assert!(
+                        ncols_x % 2 == 0,
+                        "mul_mat_vec_f_bf16 requires hidden_dim % 2 == 0"
+                    );
                     let ncols2 = ncols_x / 2;
                     let stride_row = ncols_x;
 
@@ -9778,9 +11719,7 @@ impl CudaBackend {
                             .launch(mv_cfg)
                     }
                     .map_err(|e| {
-                        RuntimeError::Compute(format!(
-                            "mul_mat_vec_f_bf16 output_proj launch: {e}"
-                        ))
+                        RuntimeError::Compute(format!("mul_mat_vec_f_bf16 output_proj launch: {e}"))
                     })?;
                     return Ok(());
                 }
@@ -9830,18 +11769,14 @@ impl CudaBackend {
                 incy: 1,
             };
             unsafe {
-                self.device
-                    .blas
-                    .gemv(
-                        cfg,
-                        &st.globals.output_proj,
-                        &st.scratch.normed,
-                        &mut st.logits_gpu,
-                    )
+                self.device.blas.gemv(
+                    cfg,
+                    &st.globals.output_proj,
+                    &st.scratch.normed,
+                    &mut st.logits_gpu,
+                )
             }
-            .map_err(|e| {
-                RuntimeError::Compute(format!("cuBLAS GEMV output_proj: {e}"))
-            })?;
+            .map_err(|e| RuntimeError::Compute(format!("cuBLAS GEMV output_proj: {e}")))?;
         }
 
         Ok(())
@@ -9873,7 +11808,8 @@ impl CudaBackend {
                 .and_then(|m| m.as_ref())
                 .is_some();
             if !is_moe_layer {
-                self.device.stream
+                self.device
+                    .stream
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
                     .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
             }
@@ -9887,7 +11823,8 @@ impl CudaBackend {
                 shared_mem_bytes: 0,
             };
             unsafe {
-                self.device.stream
+                self.device
+                    .stream
                     .launch_builder(&st.kernels.argmax_f32)
                     .arg(&st.logits_gpu)
                     .arg(&mut st.argmax_result)
@@ -9918,23 +11855,27 @@ impl CudaBackend {
             *XKL.get_or_init(|| std::env::var("LUMEN_XCHK").as_deref() == Ok("1"))
         } {
             let sa = |v: &[f32]| -> (f64, f32) {
-                let mut sq = 0f64; let mut mx = 0f32;
-                for &e in v { sq += (e as f64) * (e as f64); let a = e.abs(); if a > mx { mx = a; } }
+                let mut sq = 0f64;
+                let mut mx = 0f32;
+                for &e in v {
+                    sq += (e as f64) * (e as f64);
+                    let a = e.abs();
+                    if a > mx {
+                        mx = a;
+                    }
+                }
                 (sq, mx)
             };
             let (lsq, lmx) = sa(&logits_host);
             let mut idx: Vec<usize> = (0..logits_host.len()).collect();
             idx.sort_unstable_by(|&i, &j| logits_host[j].total_cmp(&logits_host[i]));
-            let top8: Vec<(usize, f32)> = idx.iter().take(8).map(|&i| (i, logits_host[i])).collect();
+            let top8: Vec<(usize, f32)> =
+                idx.iter().take(8).map(|&i| (i, logits_host[i])).collect();
             let xh = self.device.dtoh_copy(&st.scratch.x_gpu)?;
             let (xsq, xmx) = sa(&xh[..hp.hidden_dim.min(xh.len() as u32) as usize]);
             let step = st.decode_token_count;
-            eprintln!(
-                "[XCHK] step={step} residual_x sumsq={xsq:.6} absmax={xmx:.6}"
-            );
-            eprintln!(
-                "[XCHK] step={step} logits sumsq={lsq:.6} absmax={lmx:.6} top8={top8:?}"
-            );
+            eprintln!("[XCHK] step={step} residual_x sumsq={xsq:.6} absmax={xmx:.6}");
+            eprintln!("[XCHK] step={step} logits sumsq={lsq:.6} absmax={lmx:.6} top8={top8:?}");
         }
         // [LOGITDUMP] DECODE-path near-tie dump (env LUMEN_LOGIT_DUMP=1, default
         // OFF -> byte-identical). Same format as the compute_final hook; fires
@@ -9948,20 +11889,26 @@ impl CudaBackend {
         } {
             let sumsq = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
             let logits_sumsq = sumsq(&logits_host);
-            let id_a = std::env::var("LUMEN_LOGIT_DUMP_A").ok()
-                .and_then(|s| s.parse::<usize>().ok()).unwrap_or(1633);
-            let id_b = std::env::var("LUMEN_LOGIT_DUMP_B").ok()
-                .and_then(|s| s.parse::<usize>().ok()).unwrap_or(1083);
+            let id_a = std::env::var("LUMEN_LOGIT_DUMP_A")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1633);
+            let id_b = std::env::var("LUMEN_LOGIT_DUMP_B")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1083);
             let la = logits_host.get(id_a).copied().unwrap_or(f32::NAN);
             let lb = logits_host.get(id_b).copied().unwrap_or(f32::NAN);
             let mut idx: Vec<usize> = (0..logits_host.len()).collect();
             idx.sort_unstable_by(|&i, &j| logits_host[j].total_cmp(&logits_host[i]));
-            let topk: Vec<(usize, f32)> = idx.iter().take(8).map(|&i| (i, logits_host[i])).collect();
+            let topk: Vec<(usize, f32)> =
+                idx.iter().take(8).map(|&i| (i, logits_host[i])).collect();
             eprintln!(
                 "[LOGITDUMP] mode=D step={} logits_sumsq={logits_sumsq:.6} \
                  id_a={id_a} logit_a={la:.6} id_b={id_b} logit_b={lb:.6} \
                  margin_a_minus_b={:.6} top8={topk:?}",
-                st.decode_token_count, (la as f64) - (lb as f64)
+                st.decode_token_count,
+                (la as f64) - (lb as f64)
             );
         }
         kv.advance_seq_len()?;
@@ -10049,9 +11996,9 @@ unsafe fn launch_matvec(
                     .arg(&mut *q8_1_buf)
                     .arg(&in_dim_u32)
                     .launch(quant_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "quantize_q8_1_rawsum {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("quantize_q8_1_rawsum {label}: {e}",))
+                    })?;
 
                 // mul_mat_vec_q_q8_0: grid=(nrows_x,1,1) block=(32, 4, 1) = 128 threads
                 let mv_cfg = CudarcLaunchConfig {
@@ -10068,9 +12015,9 @@ unsafe fn launch_matvec(
                     .arg(&in_dim_u32)
                     .arg(&out_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "mul_mat_vec_q_q8_0 {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("mul_mat_vec_q_q8_0 {label}: {e}",))
+                    })?;
                 return Ok(());
             }
         }
@@ -10100,9 +12047,9 @@ unsafe fn launch_matvec(
                 .arg(&mut *q8_1_buf)
                 .arg(&in_dim_u32)
                 .launch(quant_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "quantize_f32_to_q8_1 {label}: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("quantize_f32_to_q8_1 {label}: {e}",))
+                })?;
 
             // Step 2: dp4a matvec with Q8_1 input.
             let mv_grid = dp4a_q8_1_grid(out_dim_u32);
@@ -10120,14 +12067,16 @@ unsafe fn launch_matvec(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(mv_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec_q8_0_q8_1 {label}: {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("matvec_q8_0_q8_1 {label}: {e}",)))?;
             return Ok(());
         }
 
         // Path 1: smem kernel (F32 x, NR=2) — best for small dimensions.
-        if let Some(smem_fn) = kernels.matvec_q8_0_smem.as_ref().filter(|_| shmem_f32 <= 49152) {
+        if let Some(smem_fn) = kernels
+            .matvec_q8_0_smem
+            .as_ref()
+            .filter(|_| shmem_f32 <= 49152)
+        {
             let out_dim_u32 = out_dim as u32;
             let in_dim_u32 = in_dim as u32;
             let grid = matvec_smem_grid(out_dim_u32);
@@ -10146,15 +12095,19 @@ unsafe fn launch_matvec(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec Q8_0 smem {label} launch: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("matvec Q8_0 smem {label} launch: {e}",))
+                })?;
             return Ok(());
         }
 
         // Path 2: hgemv kernel (F16 x, NR=4) — covers 12288 < in_dim <= 24576.
         // Reads native Q8_0 (1.0625 B/elem) instead of HGEMV's 2 B/elem.
-        if let Some(hgemv_fn) = kernels.hgemv_q8_0.as_ref().filter(|_| shmem_f16 <= HGEMV_SHMEM_LIMIT) {
+        if let Some(hgemv_fn) = kernels
+            .hgemv_q8_0
+            .as_ref()
+            .filter(|_| shmem_f16 <= HGEMV_SHMEM_LIMIT)
+        {
             let out_dim_u32 = out_dim as u32;
             let in_dim_u32 = in_dim as u32;
             let grid = hgemv_grid(out_dim_u32);
@@ -10173,23 +12126,32 @@ unsafe fn launch_matvec(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "hgemv Q8_0 {label} launch: {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("hgemv Q8_0 {label} launch: {e}",)))?;
             return Ok(());
         }
 
         // Path 3: cuBLAS HGEMV via pre-dequanted F16 cache.
         // Uses DEFAULT_TENSOR_OP (fallback path for Q8/Q4 with F16 caches).
         if let (Some(w_f16), Some(scratch)) = (weight_f16_cache, input_f16_scratch) {
-            return launch_hgemv_f16(device, kernels, w_f16, input, output, scratch,
-                out_dim, in_dim, label,
-                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            return launch_hgemv_f16(
+                device,
+                kernels,
+                w_f16,
+                input,
+                output,
+                scratch,
+                out_dim,
+                in_dim,
+                label,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            );
         }
         // Path 4: dp4a or v1 scalar (last resort).
         let out_dim_u32 = out_dim as u32;
         let in_dim_u32 = in_dim as u32;
-        let q8_fn = kernels.matvec_q8_0_dp4a.as_ref()
+        let q8_fn = kernels
+            .matvec_q8_0_dp4a
+            .as_ref()
             .unwrap_or(&kernels.matvec_q8_0);
         let grid = matvec_q8_0_grid(out_dim_u32);
         let launch_cfg = CudarcLaunchConfig {
@@ -10206,9 +12168,7 @@ unsafe fn launch_matvec(
             .arg(&out_dim_u32)
             .arg(&in_dim_u32)
             .launch(launch_cfg)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "matvec Q8_0 {label} launch: {e}",
-            )))?;
+            .map_err(|e| RuntimeError::Compute(format!("matvec Q8_0 {label} launch: {e}",)))?;
         return Ok(());
     }
 
@@ -10242,9 +12202,9 @@ unsafe fn launch_matvec(
                     .arg(&mut *q8_1_buf)
                     .arg(&in_dim_u32)
                     .launch(quant_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "quantize_q8_1_rawsum Q4 {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("quantize_q8_1_rawsum Q4 {label}: {e}",))
+                    })?;
                 let mv_cfg = CudarcLaunchConfig {
                     grid_dim: (out_dim_u32, 1, 1),
                     block_dim: (32, 4, 1),
@@ -10259,9 +12219,9 @@ unsafe fn launch_matvec(
                     .arg(&in_dim_u32)
                     .arg(&out_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "mul_mat_vec_q_q4_0 {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("mul_mat_vec_q_q4_0 {label}: {e}",))
+                    })?;
                 return Ok(());
             }
         }
@@ -10272,7 +12232,9 @@ unsafe fn launch_matvec(
         ) {
             // Check which kernel to use: aligned or unaligned.
             let (mv_fn_opt, w_ptr) = match weight {
-                GpuWeightBuf::Q4Aligned(w) => (kernels.matvec_q4_aligned_q8_1.as_ref(), w as &CudaSlice<u8>),
+                GpuWeightBuf::Q4Aligned(w) => {
+                    (kernels.matvec_q4_aligned_q8_1.as_ref(), w as &CudaSlice<u8>)
+                }
                 GpuWeightBuf::Q4Raw(w) => (kernels.matvec_q4_0_dp4a.as_ref(), w as &CudaSlice<u8>),
                 _ => unreachable!(),
             };
@@ -10294,9 +12256,9 @@ unsafe fn launch_matvec(
                     .arg(&mut *q8_1_buf)
                     .arg(&in_dim_u32)
                     .launch(quant_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "quantize_f32_to_q8_1 Q4 {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("quantize_f32_to_q8_1 Q4 {label}: {e}",))
+                    })?;
 
                 // Step 2: dp4a matvec with Q8_1 input (NR=4, 256 threads).
                 let mv_grid = dp4a_q4_grid(out_dim_u32);
@@ -10314,9 +12276,7 @@ unsafe fn launch_matvec(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q4_dp4a {label}: {e}",
-                    )))?;
+                    .map_err(|e| RuntimeError::Compute(format!("matvec_q4_dp4a {label}: {e}",)))?;
                 return Ok(());
             }
         }
@@ -10329,7 +12289,11 @@ unsafe fn launch_matvec(
         let shmem_f16 = (in_dim as u32) * 2;
 
         // Path 1: smem kernel (F32 x, NR=2).
-        if let Some(smem_fn) = kernels.matvec_q4_0_smem.as_ref().filter(|_| shmem_f32 <= 49152) {
+        if let Some(smem_fn) = kernels
+            .matvec_q4_0_smem
+            .as_ref()
+            .filter(|_| shmem_f32 <= 49152)
+        {
             let out_dim_u32 = out_dim as u32;
             let in_dim_u32 = in_dim as u32;
             let grid = matvec_smem_grid(out_dim_u32);
@@ -10348,14 +12312,18 @@ unsafe fn launch_matvec(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec Q4_0 smem {label} launch: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("matvec Q4_0 smem {label} launch: {e}",))
+                })?;
             return Ok(());
         }
 
         // Path 2: hgemv kernel (F16 x, NR=4) — covers 12288 < in_dim <= 24576.
-        if let Some(hgemv_fn) = kernels.hgemv_q4_0.as_ref().filter(|_| shmem_f16 <= HGEMV_SHMEM_LIMIT) {
+        if let Some(hgemv_fn) = kernels
+            .hgemv_q4_0
+            .as_ref()
+            .filter(|_| shmem_f16 <= HGEMV_SHMEM_LIMIT)
+        {
             let out_dim_u32 = out_dim as u32;
             let in_dim_u32 = in_dim as u32;
             let grid = hgemv_grid(out_dim_u32);
@@ -10374,18 +12342,25 @@ unsafe fn launch_matvec(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "hgemv Q4_0 {label} launch: {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("hgemv Q4_0 {label} launch: {e}",)))?;
             return Ok(());
         }
 
         // Path 3: cuBLAS HGEMV via pre-dequanted F16 cache.
         // Uses DEFAULT_TENSOR_OP (fallback path for Q8/Q4 with F16 caches).
         if let (Some(w_f16), Some(scratch)) = (weight_f16_cache, input_f16_scratch) {
-            return launch_hgemv_f16(device, kernels, w_f16, input, output, scratch,
-                out_dim, in_dim, label,
-                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            return launch_hgemv_f16(
+                device,
+                kernels,
+                w_f16,
+                input,
+                output,
+                scratch,
+                out_dim,
+                in_dim,
+                label,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            );
         }
         // Path 4: scalar Q4_0 (last resort).
         let mv_block = matvec_block_size();
@@ -10405,9 +12380,7 @@ unsafe fn launch_matvec(
             .arg(&out_dim_u32)
             .arg(&in_dim_u32)
             .launch(launch_cfg)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "matvec Q4_0 {label} launch: {e}",
-            )))?;
+            .map_err(|e| RuntimeError::Compute(format!("matvec Q4_0 {label} launch: {e}",)))?;
         return Ok(());
     }
 
@@ -10427,8 +12400,7 @@ unsafe fn launch_matvec(
         (weight, input_f16_scratch.as_deref_mut())
     {
         return launch_bf16_matvec_with_fallback(
-            device, kernels, w_bf16, input, output, scratch,
-            out_dim, in_dim, label,
+            device, kernels, w_bf16, input, output, scratch, out_dim, in_dim, label,
         );
     }
 
@@ -10440,12 +12412,19 @@ unsafe fn launch_matvec(
     // fall through to the `match` below, which still needs `input_f16_scratch`
     // for the Bf16Raw fallback arm.
     if matches!(weight, GpuWeightBuf::F32(_)) {
-        if let (Some(w_f16), Some(scratch)) =
-            (weight_f16_cache, input_f16_scratch.as_deref_mut())
-        {
-            return launch_hgemv_f16(device, kernels, w_f16, input, output, scratch,
-                out_dim, in_dim, label,
-                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if let (Some(w_f16), Some(scratch)) = (weight_f16_cache, input_f16_scratch.as_deref_mut()) {
+            return launch_hgemv_f16(
+                device,
+                kernels,
+                w_f16,
+                input,
+                output,
+                scratch,
+                out_dim,
+                in_dim,
+                label,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            );
         }
     }
 
@@ -10464,9 +12443,7 @@ unsafe fn launch_matvec(
             device
                 .blas
                 .gemv(cfg, w_f32, input, output)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "cuBLAS GEMV {label}: {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("cuBLAS GEMV {label}: {e}",)))?;
         }
         GpuWeightBuf::F16Raw(w_f16) => {
             // Custom F16 matvec kernel (dequant f16→f32 on the fly).
@@ -10487,9 +12464,7 @@ unsafe fn launch_matvec(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec F16 {label} launch: {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("matvec F16 {label} launch: {e}",)))?;
         }
         GpuWeightBuf::Bf16Raw(w_bf16) => {
             // I-BF16 Phase-3 fallback: only reached when input_f16_scratch is
@@ -10512,9 +12487,9 @@ unsafe fn launch_matvec(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec BF16 fallback {label} launch: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("matvec BF16 fallback {label} launch: {e}",))
+                })?;
         }
         GpuWeightBuf::Q8Aligned(w_q8a) => {
             let out_dim_u32 = out_dim as u32;
@@ -10524,7 +12499,9 @@ unsafe fn launch_matvec(
             // Both weight and input use native int* loads. Zero byte-packing overhead.
             // Q8_SCALE_HW: prefer the halfword-scale variant.
             let aligned_mv_fn = if kernels.use_q8_scale_hw {
-                kernels.matvec_q8_aligned_q8_1_hw.as_ref()
+                kernels
+                    .matvec_q8_aligned_q8_1_hw
+                    .as_ref()
                     .or(kernels.matvec_q8_aligned_q8_1.as_ref())
             } else {
                 kernels.matvec_q8_aligned_q8_1.as_ref()
@@ -10548,9 +12525,9 @@ unsafe fn launch_matvec(
                     .arg(&mut *q8_1_buf)
                     .arg(&in_dim_u32)
                     .launch(quant_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "quantize_f32_to_q8_1 aligned {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("quantize_f32_to_q8_1 aligned {label}: {e}",))
+                    })?;
 
                 // Step 2: dp4a matvec with Q8Aligned weights + Q8_1 input (NR=2).
                 let mv_grid = dp4a_q8_1_grid(out_dim_u32);
@@ -10568,12 +12545,14 @@ unsafe fn launch_matvec(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q8_aligned_q8_1 {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec_q8_aligned_q8_1 {label}: {e}",))
+                    })?;
             } else {
                 // Fallback: Q8_0 aligned dp4a with on-the-fly x quantization (NR=2).
-                let q8a_fn = kernels.matvec_q8_0_aligned.as_ref()
+                let q8a_fn = kernels
+                    .matvec_q8_0_aligned
+                    .as_ref()
                     .or(kernels.matvec_q8_0_dp4a.as_ref())
                     .unwrap_or(&kernels.matvec_q8_0);
                 let grid = matvec_q8_0_grid(out_dim_u32);
@@ -10591,9 +12570,9 @@ unsafe fn launch_matvec(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(launch_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec Q8_0 aligned {label} launch: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec Q8_0 aligned {label} launch: {e}",))
+                    })?;
             }
         }
         // Q8Raw fallback: dp4a or v1 scalar (smem kernel not available).
@@ -10605,10 +12584,14 @@ unsafe fn launch_matvec(
                     block_dim: (Q8_0_BLOCK_DIM, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                device.stream
+                device
+                    .stream
                     .launch_builder(dp4a_fn)
-                    .arg(w_q8).arg(input).arg(output)
-                    .arg(&(out_dim as u32)).arg(&(in_dim as u32))
+                    .arg(w_q8)
+                    .arg(input)
+                    .arg(output)
+                    .arg(&(out_dim as u32))
+                    .arg(&(in_dim as u32))
                     .launch(launch_cfg)
                     .map_err(|e| RuntimeError::Compute(format!("matvec Q8_0 dp4a {label}: {e}")))?;
             } else {
@@ -10618,10 +12601,14 @@ unsafe fn launch_matvec(
                     block_dim: (mv_block, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                device.stream
+                device
+                    .stream
                     .launch_builder(&kernels.matvec_q8_0)
-                    .arg(w_q8).arg(input).arg(output)
-                    .arg(&(out_dim as u32)).arg(&(in_dim as u32))
+                    .arg(w_q8)
+                    .arg(input)
+                    .arg(output)
+                    .arg(&(out_dim as u32))
+                    .arg(&(in_dim as u32))
                     .launch(launch_cfg)
                     .map_err(|e| RuntimeError::Compute(format!("matvec Q8_0 v1 {label}: {e}")))?;
             }
@@ -10645,9 +12632,7 @@ unsafe fn launch_matvec(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec Q4_0 {label} launch: {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("matvec Q4_0 {label} launch: {e}",)))?;
         }
         GpuWeightBuf::Q4Aligned(_) => {
             // Should not reach here — Q4Aligned is handled by early-return above.
@@ -10659,8 +12644,10 @@ unsafe fn launch_matvec(
         // buffers consumed only by `launch_matvec_preq8_1_split` (or its
         // tile-aware wrapper). Reaching the base `launch_matvec` means the
         // caller passed a sibling as the base weight, which is a bug.
-        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_)
-        | GpuWeightBuf::Q8Tile(_)  | GpuWeightBuf::Q4Tile(_) => {
+        GpuWeightBuf::Q8Split(_)
+        | GpuWeightBuf::Q4Split(_)
+        | GpuWeightBuf::Q8Tile(_)
+        | GpuWeightBuf::Q4Tile(_) => {
             return Err(RuntimeError::Compute(format!(
                 "Q8Split/Q4Split/Q8Tile/Q4Tile sibling reached fallback match in matvec {label} — \
                  caller must dispatch via launch_matvec_preq8_1_split"
@@ -10725,9 +12712,9 @@ unsafe fn launch_matvec_residual(
                 .arg(&mut *q8_1_buf)
                 .arg(&in_dim_u32)
                 .launch(quant_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "quantize_f32_to_q8_1 residual {label}: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("quantize_f32_to_q8_1 residual {label}: {e}",))
+                })?;
 
             // Step 2: dp4a matvec + residual with Q8_1 input.
             let mv_grid = dp4a_q8_1_grid(out_dim_u32);
@@ -10746,14 +12733,18 @@ unsafe fn launch_matvec_residual(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(mv_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec_q8_0_q8_1_residual {label}: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("matvec_q8_0_q8_1_residual {label}: {e}",))
+                })?;
             return Ok(());
         }
 
         // Path 1: smem kernel (F32 x, NR=2).
-        if let Some(smem_fn) = kernels.matvec_q8_0_smem_residual.as_ref().filter(|_| shmem_f32 <= 49152) {
+        if let Some(smem_fn) = kernels
+            .matvec_q8_0_smem_residual
+            .as_ref()
+            .filter(|_| shmem_f32 <= 49152)
+        {
             let out_dim_u32 = out_dim as u32;
             let in_dim_u32 = in_dim as u32;
             let grid = matvec_smem_grid(out_dim_u32);
@@ -10773,14 +12764,18 @@ unsafe fn launch_matvec_residual(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec+residual Q8_0 smem {label} launch: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("matvec+residual Q8_0 smem {label} launch: {e}",))
+                })?;
             return Ok(());
         }
 
         // Path 2: hgemv kernel (F16 x, NR=4).
-        if let Some(hgemv_fn) = kernels.hgemv_q8_0_residual.as_ref().filter(|_| shmem_f16 <= HGEMV_SHMEM_LIMIT) {
+        if let Some(hgemv_fn) = kernels
+            .hgemv_q8_0_residual
+            .as_ref()
+            .filter(|_| shmem_f16 <= HGEMV_SHMEM_LIMIT)
+        {
             let out_dim_u32 = out_dim as u32;
             let in_dim_u32 = in_dim as u32;
             let grid = hgemv_grid(out_dim_u32);
@@ -10800,23 +12795,35 @@ unsafe fn launch_matvec_residual(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "hgemv+residual Q8_0 {label} launch: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("hgemv+residual Q8_0 {label} launch: {e}",))
+                })?;
             return Ok(());
         }
 
         // Path 3: cuBLAS HGEMV via pre-dequanted F16 cache.
         // Uses DEFAULT_TENSOR_OP (fallback path for Q8/Q4 with F16 caches).
         if let (Some(w_f16), Some(scratch)) = (weight_f16_cache, input_f16_scratch) {
-            return launch_hgemv_f16_residual(device, kernels, w_f16, input, residual, output,
-                scratch, out_dim, in_dim, label,
-                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            return launch_hgemv_f16_residual(
+                device,
+                kernels,
+                w_f16,
+                input,
+                residual,
+                output,
+                scratch,
+                out_dim,
+                in_dim,
+                label,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            );
         }
         // Path 4: dp4a or v1 scalar.
         let out_dim_u32 = out_dim as u32;
         let in_dim_u32 = in_dim as u32;
-        let q8_fn = kernels.matvec_q8_0_dp4a_residual.as_ref()
+        let q8_fn = kernels
+            .matvec_q8_0_dp4a_residual
+            .as_ref()
             .unwrap_or(&kernels.matvec_q8_0_residual);
         let grid = matvec_q8_0_grid(out_dim_u32);
         let launch_cfg = CudarcLaunchConfig {
@@ -10834,9 +12841,9 @@ unsafe fn launch_matvec_residual(
             .arg(&out_dim_u32)
             .arg(&in_dim_u32)
             .launch(launch_cfg)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "matvec+residual Q8_0 {label} launch: {e}",
-            )))?;
+            .map_err(|e| {
+                RuntimeError::Compute(format!("matvec+residual Q8_0 {label} launch: {e}",))
+            })?;
         return Ok(());
     }
 
@@ -10847,8 +12854,14 @@ unsafe fn launch_matvec_residual(
             input_q8_1_scratch.take(),
         ) {
             let (mv_fn_opt, w_ptr) = match weight {
-                GpuWeightBuf::Q4Aligned(w) => (kernels.matvec_q4_aligned_q8_1_residual.as_ref(), w as &CudaSlice<u8>),
-                GpuWeightBuf::Q4Raw(w) => (kernels.matvec_q4_0_dp4a_residual.as_ref(), w as &CudaSlice<u8>),
+                GpuWeightBuf::Q4Aligned(w) => (
+                    kernels.matvec_q4_aligned_q8_1_residual.as_ref(),
+                    w as &CudaSlice<u8>,
+                ),
+                GpuWeightBuf::Q4Raw(w) => (
+                    kernels.matvec_q4_0_dp4a_residual.as_ref(),
+                    w as &CudaSlice<u8>,
+                ),
                 _ => unreachable!(),
             };
             if let Some(mv_fn) = mv_fn_opt {
@@ -10869,9 +12882,11 @@ unsafe fn launch_matvec_residual(
                     .arg(&mut *q8_1_buf)
                     .arg(&in_dim_u32)
                     .launch(quant_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "quantize_f32_to_q8_1 Q4 residual {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "quantize_f32_to_q8_1 Q4 residual {label}: {e}",
+                        ))
+                    })?;
 
                 // Step 2: dp4a matvec + residual with Q8_1 input (NR=4, 256 threads).
                 let mv_grid = dp4a_q4_grid(out_dim_u32);
@@ -10890,9 +12905,9 @@ unsafe fn launch_matvec_residual(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q4_dp4a_residual {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec_q4_dp4a_residual {label}: {e}",))
+                    })?;
                 return Ok(());
             }
         }
@@ -10905,7 +12920,11 @@ unsafe fn launch_matvec_residual(
         let shmem_f16 = (in_dim as u32) * 2;
 
         // Path 1: smem kernel (F32 x, NR=2).
-        if let Some(smem_fn) = kernels.matvec_q4_0_smem_residual.as_ref().filter(|_| shmem_f32 <= 49152) {
+        if let Some(smem_fn) = kernels
+            .matvec_q4_0_smem_residual
+            .as_ref()
+            .filter(|_| shmem_f32 <= 49152)
+        {
             let out_dim_u32 = out_dim as u32;
             let in_dim_u32 = in_dim as u32;
             let grid = matvec_smem_grid(out_dim_u32);
@@ -10925,14 +12944,18 @@ unsafe fn launch_matvec_residual(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec+residual Q4_0 smem {label} launch: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("matvec+residual Q4_0 smem {label} launch: {e}",))
+                })?;
             return Ok(());
         }
 
         // Path 2: hgemv kernel (F16 x, NR=4).
-        if let Some(hgemv_fn) = kernels.hgemv_q4_0_residual.as_ref().filter(|_| shmem_f16 <= HGEMV_SHMEM_LIMIT) {
+        if let Some(hgemv_fn) = kernels
+            .hgemv_q4_0_residual
+            .as_ref()
+            .filter(|_| shmem_f16 <= HGEMV_SHMEM_LIMIT)
+        {
             let out_dim_u32 = out_dim as u32;
             let in_dim_u32 = in_dim as u32;
             let grid = hgemv_grid(out_dim_u32);
@@ -10952,9 +12975,9 @@ unsafe fn launch_matvec_residual(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "hgemv+residual Q4_0 {label} launch: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("hgemv+residual Q4_0 {label} launch: {e}",))
+                })?;
             return Ok(());
         }
 
@@ -10977,9 +13000,9 @@ unsafe fn launch_matvec_residual(
             .arg(&out_dim_u32)
             .arg(&in_dim_u32)
             .launch(launch_cfg)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "matvec+residual Q4_0 {label} launch: {e}",
-            )))?;
+            .map_err(|e| {
+                RuntimeError::Compute(format!("matvec+residual Q4_0 {label} launch: {e}",))
+            })?;
         return Ok(());
     }
 
@@ -10996,8 +13019,7 @@ unsafe fn launch_matvec_residual(
         (weight, input_f16_scratch.as_deref_mut())
     {
         return launch_bf16_matvec_residual_with_fallback(
-            device, kernels, w_bf16, input, residual, output, scratch,
-            out_dim, in_dim, label,
+            device, kernels, w_bf16, input, residual, output, scratch, out_dim, in_dim, label,
         );
     }
 
@@ -11007,24 +13029,29 @@ unsafe fn launch_matvec_residual(
     // Use `as_deref_mut()` to avoid consuming `input_f16_scratch` on the
     // non-F32 path -- symmetric to the launch_matvec fix.
     if matches!(weight, GpuWeightBuf::F32(_)) {
-        if let (Some(w_f16), Some(scratch)) =
-            (weight_f16_cache, input_f16_scratch.as_deref_mut())
-        {
-            return launch_hgemv_f16_residual(device, kernels, w_f16, input, residual, output,
-                scratch, out_dim, in_dim, label,
-                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if let (Some(w_f16), Some(scratch)) = (weight_f16_cache, input_f16_scratch.as_deref_mut()) {
+            return launch_hgemv_f16_residual(
+                device,
+                kernels,
+                w_f16,
+                input,
+                residual,
+                output,
+                scratch,
+                out_dim,
+                in_dim,
+                label,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            );
         }
     }
 
     match weight {
         GpuWeightBuf::F32(w_f32) => {
             // Copy residual into output so cuBLAS can accumulate: y = W*x + y.
-            device
-                .stream
-                .memcpy_dtod(residual, output)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "cuBLAS residual copy {label}: {e}",
-                )))?;
+            device.stream.memcpy_dtod(residual, output).map_err(|e| {
+                RuntimeError::Compute(format!("cuBLAS residual copy {label}: {e}",))
+            })?;
             let cfg = GemvConfig {
                 trans: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
                 m: in_dim as i32,
@@ -11035,12 +13062,9 @@ unsafe fn launch_matvec_residual(
                 beta: 1.0f32,
                 incy: 1,
             };
-            device
-                .blas
-                .gemv(cfg, w_f32, input, output)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "cuBLAS GEMV+residual {label}: {e}",
-                )))?;
+            device.blas.gemv(cfg, w_f32, input, output).map_err(|e| {
+                RuntimeError::Compute(format!("cuBLAS GEMV+residual {label}: {e}",))
+            })?;
         }
         GpuWeightBuf::Q8Aligned(w_q8a) => {
             let out_dim_u32 = out_dim as u32;
@@ -11049,7 +13073,9 @@ unsafe fn launch_matvec_residual(
             // Path 0 (priority): Q8Aligned + pre-quantized Q8_1 input + residual (dp4a, NR=2).
             // Q8_SCALE_HW: prefer the halfword-scale residual variant.
             let aligned_mv_residual = if kernels.use_q8_scale_hw {
-                kernels.matvec_q8_aligned_q8_1_hw_residual.as_ref()
+                kernels
+                    .matvec_q8_aligned_q8_1_hw_residual
+                    .as_ref()
                     .or(kernels.matvec_q8_aligned_q8_1_residual.as_ref())
             } else {
                 kernels.matvec_q8_aligned_q8_1_residual.as_ref()
@@ -11073,9 +13099,11 @@ unsafe fn launch_matvec_residual(
                     .arg(&mut *q8_1_buf)
                     .arg(&in_dim_u32)
                     .launch(quant_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "quantize_f32_to_q8_1 aligned residual {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "quantize_f32_to_q8_1 aligned residual {label}: {e}",
+                        ))
+                    })?;
 
                 // Step 2: dp4a matvec + residual with Q8Aligned weights + Q8_1 input (NR=2).
                 let mv_grid = dp4a_q8_1_grid(out_dim_u32);
@@ -11094,12 +13122,16 @@ unsafe fn launch_matvec_residual(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q8_aligned_q8_1_residual {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec_q8_aligned_q8_1_residual {label}: {e}",
+                        ))
+                    })?;
             } else {
                 // Fallback: Q8_0 aligned dp4a residual with on-the-fly x quantization.
-                let q8a_fn = kernels.matvec_q8_0_aligned_residual.as_ref()
+                let q8a_fn = kernels
+                    .matvec_q8_0_aligned_residual
+                    .as_ref()
                     .or(kernels.matvec_q8_0_dp4a_residual.as_ref())
                     .unwrap_or(&kernels.matvec_q8_0_residual);
                 let grid = matvec_q8_0_grid(out_dim_u32);
@@ -11118,16 +13150,20 @@ unsafe fn launch_matvec_residual(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(launch_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec+residual Q8_0 aligned {label} launch: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec+residual Q8_0 aligned {label} launch: {e}",
+                        ))
+                    })?;
             }
         }
         // Q8Raw fallback: dp4a or v1 scalar residual (unreachable — handled above).
         GpuWeightBuf::Q8Raw(w_q8) => {
             let out_dim_u32 = out_dim as u32;
             let in_dim_u32 = in_dim as u32;
-            let q8_fn = kernels.matvec_q8_0_dp4a_residual.as_ref()
+            let q8_fn = kernels
+                .matvec_q8_0_dp4a_residual
+                .as_ref()
                 .unwrap_or(&kernels.matvec_q8_0_residual);
             let grid = matvec_q8_0_grid(out_dim_u32);
             let launch_cfg = CudarcLaunchConfig {
@@ -11145,9 +13181,11 @@ unsafe fn launch_matvec_residual(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec+residual Q8_0 fallback {label} launch: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "matvec+residual Q8_0 fallback {label} launch: {e}",
+                    ))
+                })?;
         }
         GpuWeightBuf::F16Raw(w_f16) => {
             let mv_block = matvec_block_size();
@@ -11168,9 +13206,9 @@ unsafe fn launch_matvec_residual(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec+residual F16 {label} launch: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("matvec+residual F16 {label} launch: {e}",))
+                })?;
         }
         GpuWeightBuf::Bf16Raw(w_bf16) => {
             // BF16Raw fused matvec+residual: mirrors F16Raw path.
@@ -11192,9 +13230,9 @@ unsafe fn launch_matvec_residual(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec+residual BF16 {label} launch: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("matvec+residual BF16 {label} launch: {e}",))
+                })?;
         }
         // Q4Raw fallback: scalar Q4_0 residual (unreachable — handled above).
         GpuWeightBuf::Q4Raw(w_q4) => {
@@ -11216,9 +13254,11 @@ unsafe fn launch_matvec_residual(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "matvec+residual Q4_0 fallback {label} launch: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "matvec+residual Q4_0 fallback {label} launch: {e}",
+                    ))
+                })?;
         }
         GpuWeightBuf::Q4Aligned(_) => {
             // Should not reach here — Q4Aligned is handled by early-return above.
@@ -11230,8 +13270,10 @@ unsafe fn launch_matvec_residual(
         // buffers consumed only by `launch_matvec_residual_split` (or its
         // tile-aware wrapper). Reaching the base `launch_matvec_residual`
         // means the caller passed a sibling as the base weight, which is a bug.
-        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_)
-        | GpuWeightBuf::Q8Tile(_)  | GpuWeightBuf::Q4Tile(_) => {
+        GpuWeightBuf::Q8Split(_)
+        | GpuWeightBuf::Q4Split(_)
+        | GpuWeightBuf::Q8Tile(_)
+        | GpuWeightBuf::Q4Tile(_) => {
             return Err(RuntimeError::Compute(format!(
                 "Q8Split/Q4Split/Q8Tile/Q4Tile sibling reached fallback match in matvec+residual {label} — \
                  caller must dispatch via launch_matvec_residual_split"
@@ -11276,9 +13318,7 @@ unsafe fn launch_quantize_input_q8_1(
         .arg(q8_1_buf)
         .arg(&in_dim_u32)
         .launch(quant_cfg)
-        .map_err(|e| RuntimeError::Compute(format!(
-            "quantize_f32_to_q8_1 {label}: {e}",
-        )))?;
+        .map_err(|e| RuntimeError::Compute(format!("quantize_f32_to_q8_1 {label}: {e}",)))?;
     Ok(())
 }
 
@@ -11327,9 +13367,9 @@ unsafe fn launch_matvec_preq8_1(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q8_0_q8_1 preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec_q8_0_q8_1 preq {label}: {e}",))
+                    })?;
                 return Ok(());
             }
         }
@@ -11358,9 +13398,11 @@ unsafe fn launch_matvec_preq8_1(
                         .arg(&out_dim_u32)
                         .arg(&in_dim_u32)
                         .launch(mv_cfg)
-                        .map_err(|e| RuntimeError::Compute(format!(
-                            "matvec_q8_aligned_nr8 preq {label}: {e}",
-                        )))?;
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                "matvec_q8_aligned_nr8 preq {label}: {e}",
+                            ))
+                        })?;
                     return Ok(());
                 }
             }
@@ -11369,7 +13411,9 @@ unsafe fn launch_matvec_preq8_1(
             // Numerically equivalent to matvec_q8_aligned_q8_1 (replaces a
             // 2-byte OR of two byte loads with a single u16 load).
             let mv_fn_opt = if kernels.use_q8_scale_hw {
-                kernels.matvec_q8_aligned_q8_1_hw.as_ref()
+                kernels
+                    .matvec_q8_aligned_q8_1_hw
+                    .as_ref()
                     .or(kernels.matvec_q8_aligned_q8_1.as_ref())
             } else {
                 kernels.matvec_q8_aligned_q8_1.as_ref()
@@ -11390,9 +13434,9 @@ unsafe fn launch_matvec_preq8_1(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q8_aligned_q8_1 preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec_q8_aligned_q8_1 preq {label}: {e}",))
+                    })?;
                 return Ok(());
             }
         }
@@ -11413,9 +13457,9 @@ unsafe fn launch_matvec_preq8_1(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q4_aligned_q8_1 preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec_q4_aligned_q8_1 preq {label}: {e}",))
+                    })?;
                 return Ok(());
             }
         }
@@ -11436,9 +13480,9 @@ unsafe fn launch_matvec_preq8_1(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q4_0_dp4a preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec_q4_0_dp4a preq {label}: {e}",))
+                    })?;
                 return Ok(());
             }
         }
@@ -11492,9 +13536,11 @@ unsafe fn launch_matvec_preq8_1_residual(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q8_0_q8_1_residual preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec_q8_0_q8_1_residual preq {label}: {e}",
+                        ))
+                    })?;
                 return Ok(());
             }
         }
@@ -11519,15 +13565,19 @@ unsafe fn launch_matvec_preq8_1_residual(
                         .arg(&out_dim_u32)
                         .arg(&in_dim_u32)
                         .launch(mv_cfg)
-                        .map_err(|e| RuntimeError::Compute(format!(
-                            "matvec_q8_aligned_nr8_residual preq {label}: {e}",
-                        )))?;
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                "matvec_q8_aligned_nr8_residual preq {label}: {e}",
+                            ))
+                        })?;
                     return Ok(());
                 }
             }
             // Q8_SCALE_HW: prefer the halfword-scale residual variant.
             let mv_fn_opt = if kernels.use_q8_scale_hw {
-                kernels.matvec_q8_aligned_q8_1_hw_residual.as_ref()
+                kernels
+                    .matvec_q8_aligned_q8_1_hw_residual
+                    .as_ref()
                     .or(kernels.matvec_q8_aligned_q8_1_residual.as_ref())
             } else {
                 kernels.matvec_q8_aligned_q8_1_residual.as_ref()
@@ -11549,9 +13599,11 @@ unsafe fn launch_matvec_preq8_1_residual(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q8_aligned_q8_1_residual preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec_q8_aligned_q8_1_residual preq {label}: {e}",
+                        ))
+                    })?;
                 return Ok(());
             }
         }
@@ -11573,9 +13625,11 @@ unsafe fn launch_matvec_preq8_1_residual(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q4_aligned_q8_1_residual preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec_q4_aligned_q8_1_residual preq {label}: {e}",
+                        ))
+                    })?;
                 return Ok(());
             }
         }
@@ -11597,9 +13651,11 @@ unsafe fn launch_matvec_preq8_1_residual(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q4_0_dp4a_residual preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec_q4_0_dp4a_residual preq {label}: {e}",
+                        ))
+                    })?;
                 return Ok(());
             }
         }
@@ -11724,9 +13780,9 @@ unsafe fn launch_matvec_preq8_1_split(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q8_split_q8_1 preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec_q8_split_q8_1 preq {label}: {e}",))
+                    })?;
                 return Ok(());
             }
         }
@@ -11752,15 +13808,17 @@ unsafe fn launch_matvec_preq8_1_split(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q4_split_q8_1 preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec_q4_split_q8_1 preq {label}: {e}",))
+                    })?;
                 return Ok(());
             }
         }
     }
     // Fall-through: existing Q8Raw/Q8Aligned/Q4Raw/Q4Aligned base dispatch.
-    launch_matvec_preq8_1(device, kernels, weight, q8_1_buf, output, out_dim, in_dim, label)
+    launch_matvec_preq8_1(
+        device, kernels, weight, q8_1_buf, output, out_dim, in_dim, label,
+    )
 }
 
 /// Dispatch a dp4a matvec + fused residual, preferring the Q8Split or Q4Split
@@ -11832,9 +13890,11 @@ unsafe fn launch_matvec_preq8_1_residual_split(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q8_split_q8_1_residual preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec_q8_split_q8_1_residual preq {label}: {e}",
+                        ))
+                    })?;
                 return Ok(());
             }
         }
@@ -11860,9 +13920,11 @@ unsafe fn launch_matvec_preq8_1_residual_split(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q4_split_q8_1_residual preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec_q4_split_q8_1_residual preq {label}: {e}",
+                        ))
+                    })?;
                 return Ok(());
             }
         }
@@ -11913,7 +13975,8 @@ unsafe fn repack_q8_raw_to_split(
     if raw_buf.len() < expected_src_bytes {
         return Err(RuntimeError::Compute(format!(
             "Q8 split repack: source buffer has {} bytes, expected {} (out_dim={out_dim}, nb={nb})",
-            raw_buf.len(), expected_src_bytes,
+            raw_buf.len(),
+            expected_src_bytes,
         )));
     }
 
@@ -11977,7 +14040,8 @@ unsafe fn repack_q4_raw_to_split(
     if raw_buf.len() < expected_src_bytes {
         return Err(RuntimeError::Compute(format!(
             "Q4 split repack: source buffer has {} bytes, expected {} (out_dim={out_dim}, nb={nb})",
-            raw_buf.len(), expected_src_bytes,
+            raw_buf.len(),
+            expected_src_bytes,
         )));
     }
 
@@ -12039,7 +14103,15 @@ unsafe fn repack_all_layers_q8_clone_to_split(
     let kv_dim = kv_heads * head_dim;
 
     #[derive(Copy, Clone, Debug)]
-    enum SplitWeightKind { Wq, Wk, Wv, Wo, Gate, Up, Down }
+    enum SplitWeightKind {
+        Wq,
+        Wk,
+        Wv,
+        Wo,
+        Gate,
+        Up,
+        Down,
+    }
 
     struct Job {
         layer_idx: usize,
@@ -12060,11 +14132,21 @@ unsafe fn repack_all_layers_q8_clone_to_split(
         in_dim: usize,
     ) {
         if let GpuWeightBuf::Q8Raw(_) = w {
-            if in_dim % 32 != 0 { return; }
+            if in_dim % 32 != 0 {
+                return;
+            }
             let nb = in_dim / 32;
-            if nb % 2 != 0 { return; }
+            if nb % 2 != 0 {
+                return;
+            }
             let size_bytes = out_dim * nb * 34;
-            jobs.push(Job { layer_idx, kind, out_dim, in_dim, size_bytes });
+            jobs.push(Job {
+                layer_idx,
+                kind,
+                out_dim,
+                in_dim,
+                size_bytes,
+            });
         }
     }
 
@@ -12076,13 +14158,62 @@ unsafe fn repack_all_layers_q8_clone_to_split(
         } else {
             q_dim
         };
-        push_if_q8raw(&mut jobs, layer_idx, SplitWeightKind::Wq, &layer.wq, wq_out_dim, hidden);
-        push_if_q8raw(&mut jobs, layer_idx, SplitWeightKind::Wk, &layer.wk, kv_dim, hidden);
-        push_if_q8raw(&mut jobs, layer_idx, SplitWeightKind::Wv, &layer.wv, kv_dim, hidden);
-        push_if_q8raw(&mut jobs, layer_idx, SplitWeightKind::Wo, &layer.wo, hidden, q_dim);
-        push_if_q8raw(&mut jobs, layer_idx, SplitWeightKind::Gate, &layer.w_gate, inter, hidden);
-        push_if_q8raw(&mut jobs, layer_idx, SplitWeightKind::Up, &layer.w_up, inter, hidden);
-        push_if_q8raw(&mut jobs, layer_idx, SplitWeightKind::Down, &layer.w_down, hidden, inter);
+        push_if_q8raw(
+            &mut jobs,
+            layer_idx,
+            SplitWeightKind::Wq,
+            &layer.wq,
+            wq_out_dim,
+            hidden,
+        );
+        push_if_q8raw(
+            &mut jobs,
+            layer_idx,
+            SplitWeightKind::Wk,
+            &layer.wk,
+            kv_dim,
+            hidden,
+        );
+        push_if_q8raw(
+            &mut jobs,
+            layer_idx,
+            SplitWeightKind::Wv,
+            &layer.wv,
+            kv_dim,
+            hidden,
+        );
+        push_if_q8raw(
+            &mut jobs,
+            layer_idx,
+            SplitWeightKind::Wo,
+            &layer.wo,
+            hidden,
+            q_dim,
+        );
+        push_if_q8raw(
+            &mut jobs,
+            layer_idx,
+            SplitWeightKind::Gate,
+            &layer.w_gate,
+            inter,
+            hidden,
+        );
+        push_if_q8raw(
+            &mut jobs,
+            layer_idx,
+            SplitWeightKind::Up,
+            &layer.w_up,
+            inter,
+            hidden,
+        );
+        push_if_q8raw(
+            &mut jobs,
+            layer_idx,
+            SplitWeightKind::Down,
+            &layer.w_down,
+            hidden,
+            inter,
+        );
     }
 
     // Largest-first. Tie-break: full-attention layers before GDN (higher per-token
@@ -12091,8 +14222,16 @@ unsafe fn repack_all_layers_q8_clone_to_split(
         b.size_bytes
             .cmp(&a.size_bytes)
             .then_with(|| {
-                let pa = if layers[a.layer_idx].layer_type == 0 { 0u8 } else { 1u8 };
-                let pb = if layers[b.layer_idx].layer_type == 0 { 0u8 } else { 1u8 };
+                let pa = if layers[a.layer_idx].layer_type == 0 {
+                    0u8
+                } else {
+                    1u8
+                };
+                let pb = if layers[b.layer_idx].layer_type == 0 {
+                    0u8
+                } else {
+                    1u8
+                };
                 pa.cmp(&pb)
             })
             .then_with(|| a.layer_idx.cmp(&b.layer_idx))
@@ -12109,18 +14248,64 @@ unsafe fn repack_all_layers_q8_clone_to_split(
     let mut bytes_cloned: usize = 0;
 
     for job in &jobs {
-        if oom_layer.is_some() { break; }
-        if bytes_cloned + job.size_bytes > CLONE_BUDGET_BYTES { break; }
+        if oom_layer.is_some() {
+            break;
+        }
+        if bytes_cloned + job.size_bytes > CLONE_BUDGET_BYTES {
+            break;
+        }
 
         let layer = &mut layers[job.layer_idx];
         let src_ref: Option<&CudaSlice<u8>> = match job.kind {
-            SplitWeightKind::Wq => if let GpuWeightBuf::Q8Raw(b) = &layer.wq { Some(b) } else { None },
-            SplitWeightKind::Wk => if let GpuWeightBuf::Q8Raw(b) = &layer.wk { Some(b) } else { None },
-            SplitWeightKind::Wv => if let GpuWeightBuf::Q8Raw(b) = &layer.wv { Some(b) } else { None },
-            SplitWeightKind::Wo => if let GpuWeightBuf::Q8Raw(b) = &layer.wo { Some(b) } else { None },
-            SplitWeightKind::Gate => if let GpuWeightBuf::Q8Raw(b) = &layer.w_gate { Some(b) } else { None },
-            SplitWeightKind::Up => if let GpuWeightBuf::Q8Raw(b) = &layer.w_up { Some(b) } else { None },
-            SplitWeightKind::Down => if let GpuWeightBuf::Q8Raw(b) = &layer.w_down { Some(b) } else { None },
+            SplitWeightKind::Wq => {
+                if let GpuWeightBuf::Q8Raw(b) = &layer.wq {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            SplitWeightKind::Wk => {
+                if let GpuWeightBuf::Q8Raw(b) = &layer.wk {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            SplitWeightKind::Wv => {
+                if let GpuWeightBuf::Q8Raw(b) = &layer.wv {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            SplitWeightKind::Wo => {
+                if let GpuWeightBuf::Q8Raw(b) = &layer.wo {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            SplitWeightKind::Gate => {
+                if let GpuWeightBuf::Q8Raw(b) = &layer.w_gate {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            SplitWeightKind::Up => {
+                if let GpuWeightBuf::Q8Raw(b) = &layer.w_up {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            SplitWeightKind::Down => {
+                if let GpuWeightBuf::Q8Raw(b) = &layer.w_down {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
         };
         let Some(raw_buf) = src_ref else { continue };
         match repack_q8_raw_to_split(device, repack_kernel, raw_buf, job.out_dim, job.in_dim) {
@@ -12167,7 +14352,15 @@ unsafe fn repack_all_layers_q4_clone_to_split(
     let kv_dim = kv_heads * head_dim;
 
     #[derive(Copy, Clone, Debug)]
-    enum SplitWeightKind { Wq, Wk, Wv, Wo, Gate, Up, Down }
+    enum SplitWeightKind {
+        Wq,
+        Wk,
+        Wv,
+        Wo,
+        Gate,
+        Up,
+        Down,
+    }
 
     struct Job {
         layer_idx: usize,
@@ -12188,11 +14381,21 @@ unsafe fn repack_all_layers_q4_clone_to_split(
         in_dim: usize,
     ) {
         if let GpuWeightBuf::Q4Raw(_) = w {
-            if in_dim % 32 != 0 { return; }
+            if in_dim % 32 != 0 {
+                return;
+            }
             let nb = in_dim / 32;
-            if nb % 2 != 0 { return; }
+            if nb % 2 != 0 {
+                return;
+            }
             let size_bytes = out_dim * nb * 18;
-            jobs.push(Job { layer_idx, kind, out_dim, in_dim, size_bytes });
+            jobs.push(Job {
+                layer_idx,
+                kind,
+                out_dim,
+                in_dim,
+                size_bytes,
+            });
         }
     }
 
@@ -12204,21 +14407,78 @@ unsafe fn repack_all_layers_q4_clone_to_split(
         } else {
             q_dim
         };
-        push_if_q4raw(&mut jobs, layer_idx, SplitWeightKind::Wq, &layer.wq, wq_out_dim, hidden);
-        push_if_q4raw(&mut jobs, layer_idx, SplitWeightKind::Wk, &layer.wk, kv_dim, hidden);
-        push_if_q4raw(&mut jobs, layer_idx, SplitWeightKind::Wv, &layer.wv, kv_dim, hidden);
-        push_if_q4raw(&mut jobs, layer_idx, SplitWeightKind::Wo, &layer.wo, hidden, q_dim);
-        push_if_q4raw(&mut jobs, layer_idx, SplitWeightKind::Gate, &layer.w_gate, inter, hidden);
-        push_if_q4raw(&mut jobs, layer_idx, SplitWeightKind::Up, &layer.w_up, inter, hidden);
-        push_if_q4raw(&mut jobs, layer_idx, SplitWeightKind::Down, &layer.w_down, hidden, inter);
+        push_if_q4raw(
+            &mut jobs,
+            layer_idx,
+            SplitWeightKind::Wq,
+            &layer.wq,
+            wq_out_dim,
+            hidden,
+        );
+        push_if_q4raw(
+            &mut jobs,
+            layer_idx,
+            SplitWeightKind::Wk,
+            &layer.wk,
+            kv_dim,
+            hidden,
+        );
+        push_if_q4raw(
+            &mut jobs,
+            layer_idx,
+            SplitWeightKind::Wv,
+            &layer.wv,
+            kv_dim,
+            hidden,
+        );
+        push_if_q4raw(
+            &mut jobs,
+            layer_idx,
+            SplitWeightKind::Wo,
+            &layer.wo,
+            hidden,
+            q_dim,
+        );
+        push_if_q4raw(
+            &mut jobs,
+            layer_idx,
+            SplitWeightKind::Gate,
+            &layer.w_gate,
+            inter,
+            hidden,
+        );
+        push_if_q4raw(
+            &mut jobs,
+            layer_idx,
+            SplitWeightKind::Up,
+            &layer.w_up,
+            inter,
+            hidden,
+        );
+        push_if_q4raw(
+            &mut jobs,
+            layer_idx,
+            SplitWeightKind::Down,
+            &layer.w_down,
+            hidden,
+            inter,
+        );
     }
 
     jobs.sort_by(|a, b| {
         b.size_bytes
             .cmp(&a.size_bytes)
             .then_with(|| {
-                let pa = if layers[a.layer_idx].layer_type == 0 { 0u8 } else { 1u8 };
-                let pb = if layers[b.layer_idx].layer_type == 0 { 0u8 } else { 1u8 };
+                let pa = if layers[a.layer_idx].layer_type == 0 {
+                    0u8
+                } else {
+                    1u8
+                };
+                let pb = if layers[b.layer_idx].layer_type == 0 {
+                    0u8
+                } else {
+                    1u8
+                };
                 pa.cmp(&pb)
             })
             .then_with(|| a.layer_idx.cmp(&b.layer_idx))
@@ -12235,18 +14495,64 @@ unsafe fn repack_all_layers_q4_clone_to_split(
     let mut bytes_cloned: usize = 0;
 
     for job in &jobs {
-        if oom_layer.is_some() { break; }
-        if bytes_cloned + job.size_bytes > CLONE_BUDGET_BYTES { break; }
+        if oom_layer.is_some() {
+            break;
+        }
+        if bytes_cloned + job.size_bytes > CLONE_BUDGET_BYTES {
+            break;
+        }
 
         let layer = &mut layers[job.layer_idx];
         let src_ref: Option<&CudaSlice<u8>> = match job.kind {
-            SplitWeightKind::Wq => if let GpuWeightBuf::Q4Raw(b) = &layer.wq { Some(b) } else { None },
-            SplitWeightKind::Wk => if let GpuWeightBuf::Q4Raw(b) = &layer.wk { Some(b) } else { None },
-            SplitWeightKind::Wv => if let GpuWeightBuf::Q4Raw(b) = &layer.wv { Some(b) } else { None },
-            SplitWeightKind::Wo => if let GpuWeightBuf::Q4Raw(b) = &layer.wo { Some(b) } else { None },
-            SplitWeightKind::Gate => if let GpuWeightBuf::Q4Raw(b) = &layer.w_gate { Some(b) } else { None },
-            SplitWeightKind::Up => if let GpuWeightBuf::Q4Raw(b) = &layer.w_up { Some(b) } else { None },
-            SplitWeightKind::Down => if let GpuWeightBuf::Q4Raw(b) = &layer.w_down { Some(b) } else { None },
+            SplitWeightKind::Wq => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.wq {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            SplitWeightKind::Wk => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.wk {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            SplitWeightKind::Wv => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.wv {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            SplitWeightKind::Wo => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.wo {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            SplitWeightKind::Gate => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.w_gate {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            SplitWeightKind::Up => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.w_up {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            SplitWeightKind::Down => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.w_down {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
         };
         let Some(raw_buf) = src_ref else { continue };
         match repack_q4_raw_to_split(device, repack_kernel, raw_buf, job.out_dim, job.in_dim) {
@@ -12303,17 +14609,24 @@ unsafe fn repack_all_layers_gdn_q4_clone_to_split(
     let mut total_jobs: usize = 0;
 
     for layer in layers.iter_mut() {
-        if layer.layer_type != 1 { continue; }
+        if layer.layer_type != 1 {
+            continue;
+        }
 
         // Determine value_dim per layer from ssm_norm_tiled length (set in upload).
-        let value_dim = layer.ssm_norm_tiled.as_ref().map(|s| s.len()).unwrap_or(q_dim);
+        let value_dim = layer
+            .ssm_norm_tiled
+            .as_ref()
+            .map(|s| s.len())
+            .unwrap_or(q_dim);
 
         let mut layer_had_any = false;
 
         // ssm_out: [hidden, value_dim] Q4Raw
         if let Some(GpuWeightBuf::Q4Raw(ref raw)) = layer.ssm_out {
             total_jobs += 1;
-            if let Ok(split) = repack_q4_raw_to_split(device, repack_kernel, raw, hidden, value_dim) {
+            if let Ok(split) = repack_q4_raw_to_split(device, repack_kernel, raw, hidden, value_dim)
+            {
                 layer.q4_split_ssm_out = Some(split);
                 layer_had_any = true;
             }
@@ -12321,7 +14634,8 @@ unsafe fn repack_all_layers_gdn_q4_clone_to_split(
         // attn_gate: [value_dim, hidden] Q4Raw
         if let Some(GpuWeightBuf::Q4Raw(ref raw)) = layer.attn_gate {
             total_jobs += 1;
-            if let Ok(split) = repack_q4_raw_to_split(device, repack_kernel, raw, value_dim, hidden) {
+            if let Ok(split) = repack_q4_raw_to_split(device, repack_kernel, raw, value_dim, hidden)
+            {
                 layer.q4_split_attn_gate = Some(split);
                 layer_had_any = true;
             }
@@ -12338,7 +14652,9 @@ unsafe fn repack_all_layers_gdn_q4_clone_to_split(
                 let row_bytes = nb * 18;
                 if row_bytes > 0 && raw.len() % row_bytes == 0 {
                     let out_dim = raw.len() / row_bytes;
-                    if let Ok(split) = repack_q4_raw_to_split(device, repack_kernel, raw, out_dim, hidden) {
+                    if let Ok(split) =
+                        repack_q4_raw_to_split(device, repack_kernel, raw, out_dim, hidden)
+                    {
                         layer.q4_split_ssm_alpha = Some(split);
                         layer_had_any = true;
                     }
@@ -12353,7 +14669,9 @@ unsafe fn repack_all_layers_gdn_q4_clone_to_split(
                 let row_bytes = nb * 18;
                 if row_bytes > 0 && raw.len() % row_bytes == 0 {
                     let out_dim = raw.len() / row_bytes;
-                    if let Ok(split) = repack_q4_raw_to_split(device, repack_kernel, raw, out_dim, hidden) {
+                    if let Ok(split) =
+                        repack_q4_raw_to_split(device, repack_kernel, raw, out_dim, hidden)
+                    {
                         layer.q4_split_ssm_beta = Some(split);
                         layer_had_any = true;
                     }
@@ -12362,7 +14680,9 @@ unsafe fn repack_all_layers_gdn_q4_clone_to_split(
             let _ = head_dim;
         }
 
-        if layer_had_any { n_layers_with_split += 1; }
+        if layer_had_any {
+            n_layers_with_split += 1;
+        }
     }
     (n_layers_with_split, total_jobs)
 }
@@ -12448,9 +14768,9 @@ unsafe fn launch_matvec_preq8_1_tile(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q8_tile_q8_1 preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec_q8_tile_q8_1 preq {label}: {e}",))
+                    })?;
                 return Ok(());
             }
         }
@@ -12476,9 +14796,9 @@ unsafe fn launch_matvec_preq8_1_tile(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q4_tile_q8_1 preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec_q4_tile_q8_1 preq {label}: {e}",))
+                    })?;
                 return Ok(());
             }
         }
@@ -12487,9 +14807,16 @@ unsafe fn launch_matvec_preq8_1_tile(
     // base Q8Raw/Q8Aligned/Q4Raw/Q4Aligned path when neither SPLIT sibling
     // is present).
     launch_matvec_preq8_1_split(
-        device, kernels, weight,
-        q8_split_sibling, q4_split_sibling,
-        q8_1_buf, output, out_dim, in_dim, label,
+        device,
+        kernels,
+        weight,
+        q8_split_sibling,
+        q4_split_sibling,
+        q8_1_buf,
+        output,
+        out_dim,
+        in_dim,
+        label,
     )
 }
 
@@ -12533,9 +14860,11 @@ unsafe fn launch_matvec_preq8_1_residual_tile(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q8_tile_q8_1_residual preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec_q8_tile_q8_1_residual preq {label}: {e}",
+                        ))
+                    })?;
                 return Ok(());
             }
         }
@@ -12561,17 +14890,27 @@ unsafe fn launch_matvec_preq8_1_residual_tile(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q4_tile_q8_1_residual preq {label}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec_q4_tile_q8_1_residual preq {label}: {e}",
+                        ))
+                    })?;
                 return Ok(());
             }
         }
     }
     launch_matvec_preq8_1_residual_split(
-        device, kernels, weight,
-        q8_split_sibling, q4_split_sibling,
-        q8_1_buf, residual, output, out_dim, in_dim, label,
+        device,
+        kernels,
+        weight,
+        q8_split_sibling,
+        q4_split_sibling,
+        q8_1_buf,
+        residual,
+        output,
+        out_dim,
+        in_dim,
+        label,
     )
 }
 
@@ -12613,7 +14952,8 @@ unsafe fn repack_q8_raw_to_tile(
     if raw_buf.len() < expected_src_bytes {
         return Err(RuntimeError::Compute(format!(
             "Q8 tile repack: source buffer has {} bytes, expected {} (out_dim={out_dim}, nb={nb})",
-            raw_buf.len(), expected_src_bytes,
+            raw_buf.len(),
+            expected_src_bytes,
         )));
     }
 
@@ -12673,7 +15013,8 @@ unsafe fn repack_q4_raw_to_tile(
     if raw_buf.len() < expected_src_bytes {
         return Err(RuntimeError::Compute(format!(
             "Q4 tile repack: source buffer has {} bytes, expected {} (out_dim={out_dim}, nb={nb})",
-            raw_buf.len(), expected_src_bytes,
+            raw_buf.len(),
+            expected_src_bytes,
         )));
     }
 
@@ -12730,7 +15071,15 @@ unsafe fn repack_all_layers_q8_clone_to_tile(
     let kv_dim = kv_heads * head_dim;
 
     #[derive(Copy, Clone, Debug)]
-    enum TileWeightKind { Wq, Wk, Wv, Wo, Gate, Up, Down }
+    enum TileWeightKind {
+        Wq,
+        Wk,
+        Wv,
+        Wo,
+        Gate,
+        Up,
+        Down,
+    }
 
     struct Job {
         layer_idx: usize,
@@ -12751,12 +15100,22 @@ unsafe fn repack_all_layers_q8_clone_to_tile(
         in_dim: usize,
     ) {
         if let GpuWeightBuf::Q8Raw(_) = w {
-            if in_dim % 32 != 0 { return; }
+            if in_dim % 32 != 0 {
+                return;
+            }
             let nb = in_dim / 32;
             // Tile layout requires nb to be a multiple of 8 (8 blocks per tile).
-            if nb % 8 != 0 { return; }
+            if nb % 8 != 0 {
+                return;
+            }
             let size_bytes = out_dim * nb * 34;
-            jobs.push(Job { layer_idx, kind, out_dim, in_dim, size_bytes });
+            jobs.push(Job {
+                layer_idx,
+                kind,
+                out_dim,
+                in_dim,
+                size_bytes,
+            });
         }
     }
 
@@ -12768,21 +15127,78 @@ unsafe fn repack_all_layers_q8_clone_to_tile(
         } else {
             q_dim
         };
-        push_if_q8raw(&mut jobs, layer_idx, TileWeightKind::Wq,   &layer.wq,     wq_out_dim, hidden);
-        push_if_q8raw(&mut jobs, layer_idx, TileWeightKind::Wk,   &layer.wk,     kv_dim,     hidden);
-        push_if_q8raw(&mut jobs, layer_idx, TileWeightKind::Wv,   &layer.wv,     kv_dim,     hidden);
-        push_if_q8raw(&mut jobs, layer_idx, TileWeightKind::Wo,   &layer.wo,     hidden,     q_dim);
-        push_if_q8raw(&mut jobs, layer_idx, TileWeightKind::Gate, &layer.w_gate, inter,      hidden);
-        push_if_q8raw(&mut jobs, layer_idx, TileWeightKind::Up,   &layer.w_up,   inter,      hidden);
-        push_if_q8raw(&mut jobs, layer_idx, TileWeightKind::Down, &layer.w_down, hidden,     inter);
+        push_if_q8raw(
+            &mut jobs,
+            layer_idx,
+            TileWeightKind::Wq,
+            &layer.wq,
+            wq_out_dim,
+            hidden,
+        );
+        push_if_q8raw(
+            &mut jobs,
+            layer_idx,
+            TileWeightKind::Wk,
+            &layer.wk,
+            kv_dim,
+            hidden,
+        );
+        push_if_q8raw(
+            &mut jobs,
+            layer_idx,
+            TileWeightKind::Wv,
+            &layer.wv,
+            kv_dim,
+            hidden,
+        );
+        push_if_q8raw(
+            &mut jobs,
+            layer_idx,
+            TileWeightKind::Wo,
+            &layer.wo,
+            hidden,
+            q_dim,
+        );
+        push_if_q8raw(
+            &mut jobs,
+            layer_idx,
+            TileWeightKind::Gate,
+            &layer.w_gate,
+            inter,
+            hidden,
+        );
+        push_if_q8raw(
+            &mut jobs,
+            layer_idx,
+            TileWeightKind::Up,
+            &layer.w_up,
+            inter,
+            hidden,
+        );
+        push_if_q8raw(
+            &mut jobs,
+            layer_idx,
+            TileWeightKind::Down,
+            &layer.w_down,
+            hidden,
+            inter,
+        );
     }
 
     jobs.sort_by(|a, b| {
         b.size_bytes
             .cmp(&a.size_bytes)
             .then_with(|| {
-                let pa = if layers[a.layer_idx].layer_type == 0 { 0u8 } else { 1u8 };
-                let pb = if layers[b.layer_idx].layer_type == 0 { 0u8 } else { 1u8 };
+                let pa = if layers[a.layer_idx].layer_type == 0 {
+                    0u8
+                } else {
+                    1u8
+                };
+                let pb = if layers[b.layer_idx].layer_type == 0 {
+                    0u8
+                } else {
+                    1u8
+                };
                 pa.cmp(&pb)
             })
             .then_with(|| a.layer_idx.cmp(&b.layer_idx))
@@ -12800,29 +15216,75 @@ unsafe fn repack_all_layers_q8_clone_to_tile(
     let mut bytes_cloned: usize = 0;
 
     for job in &jobs {
-        if oom_layer.is_some() { break; }
-        if bytes_cloned + job.size_bytes > CLONE_BUDGET_BYTES { break; }
+        if oom_layer.is_some() {
+            break;
+        }
+        if bytes_cloned + job.size_bytes > CLONE_BUDGET_BYTES {
+            break;
+        }
 
         let layer = &mut layers[job.layer_idx];
         let src_ref: Option<&CudaSlice<u8>> = match job.kind {
-            TileWeightKind::Wq   => if let GpuWeightBuf::Q8Raw(b) = &layer.wq     { Some(b) } else { None },
-            TileWeightKind::Wk   => if let GpuWeightBuf::Q8Raw(b) = &layer.wk     { Some(b) } else { None },
-            TileWeightKind::Wv   => if let GpuWeightBuf::Q8Raw(b) = &layer.wv     { Some(b) } else { None },
-            TileWeightKind::Wo   => if let GpuWeightBuf::Q8Raw(b) = &layer.wo     { Some(b) } else { None },
-            TileWeightKind::Gate => if let GpuWeightBuf::Q8Raw(b) = &layer.w_gate { Some(b) } else { None },
-            TileWeightKind::Up   => if let GpuWeightBuf::Q8Raw(b) = &layer.w_up   { Some(b) } else { None },
-            TileWeightKind::Down => if let GpuWeightBuf::Q8Raw(b) = &layer.w_down { Some(b) } else { None },
+            TileWeightKind::Wq => {
+                if let GpuWeightBuf::Q8Raw(b) = &layer.wq {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            TileWeightKind::Wk => {
+                if let GpuWeightBuf::Q8Raw(b) = &layer.wk {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            TileWeightKind::Wv => {
+                if let GpuWeightBuf::Q8Raw(b) = &layer.wv {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            TileWeightKind::Wo => {
+                if let GpuWeightBuf::Q8Raw(b) = &layer.wo {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            TileWeightKind::Gate => {
+                if let GpuWeightBuf::Q8Raw(b) = &layer.w_gate {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            TileWeightKind::Up => {
+                if let GpuWeightBuf::Q8Raw(b) = &layer.w_up {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            TileWeightKind::Down => {
+                if let GpuWeightBuf::Q8Raw(b) = &layer.w_down {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
         };
         let Some(raw_buf) = src_ref else { continue };
         match repack_q8_raw_to_tile(device, repack_kernel, raw_buf, job.out_dim, job.in_dim) {
             Ok(tile_buf) => {
                 match job.kind {
-                    TileWeightKind::Wq   => layer.q8_tile_wq     = Some(tile_buf),
-                    TileWeightKind::Wk   => layer.q8_tile_wk     = Some(tile_buf),
-                    TileWeightKind::Wv   => layer.q8_tile_wv     = Some(tile_buf),
-                    TileWeightKind::Wo   => layer.q8_tile_wo     = Some(tile_buf),
+                    TileWeightKind::Wq => layer.q8_tile_wq = Some(tile_buf),
+                    TileWeightKind::Wk => layer.q8_tile_wk = Some(tile_buf),
+                    TileWeightKind::Wv => layer.q8_tile_wv = Some(tile_buf),
+                    TileWeightKind::Wo => layer.q8_tile_wo = Some(tile_buf),
                     TileWeightKind::Gate => layer.q8_tile_w_gate = Some(tile_buf),
-                    TileWeightKind::Up   => layer.q8_tile_w_up   = Some(tile_buf),
+                    TileWeightKind::Up => layer.q8_tile_w_up = Some(tile_buf),
                     TileWeightKind::Down => layer.q8_tile_w_down = Some(tile_buf),
                 }
                 layers_with_tile.insert(job.layer_idx);
@@ -12858,7 +15320,15 @@ unsafe fn repack_all_layers_q4_clone_to_tile(
     let kv_dim = kv_heads * head_dim;
 
     #[derive(Copy, Clone, Debug)]
-    enum TileWeightKind { Wq, Wk, Wv, Wo, Gate, Up, Down }
+    enum TileWeightKind {
+        Wq,
+        Wk,
+        Wv,
+        Wo,
+        Gate,
+        Up,
+        Down,
+    }
 
     struct Job {
         layer_idx: usize,
@@ -12879,11 +15349,21 @@ unsafe fn repack_all_layers_q4_clone_to_tile(
         in_dim: usize,
     ) {
         if let GpuWeightBuf::Q4Raw(_) = w {
-            if in_dim % 32 != 0 { return; }
+            if in_dim % 32 != 0 {
+                return;
+            }
             let nb = in_dim / 32;
-            if nb % 8 != 0 { return; }
+            if nb % 8 != 0 {
+                return;
+            }
             let size_bytes = out_dim * nb * 18;
-            jobs.push(Job { layer_idx, kind, out_dim, in_dim, size_bytes });
+            jobs.push(Job {
+                layer_idx,
+                kind,
+                out_dim,
+                in_dim,
+                size_bytes,
+            });
         }
     }
 
@@ -12895,21 +15375,78 @@ unsafe fn repack_all_layers_q4_clone_to_tile(
         } else {
             q_dim
         };
-        push_if_q4raw(&mut jobs, layer_idx, TileWeightKind::Wq,   &layer.wq,     wq_out_dim, hidden);
-        push_if_q4raw(&mut jobs, layer_idx, TileWeightKind::Wk,   &layer.wk,     kv_dim,     hidden);
-        push_if_q4raw(&mut jobs, layer_idx, TileWeightKind::Wv,   &layer.wv,     kv_dim,     hidden);
-        push_if_q4raw(&mut jobs, layer_idx, TileWeightKind::Wo,   &layer.wo,     hidden,     q_dim);
-        push_if_q4raw(&mut jobs, layer_idx, TileWeightKind::Gate, &layer.w_gate, inter,      hidden);
-        push_if_q4raw(&mut jobs, layer_idx, TileWeightKind::Up,   &layer.w_up,   inter,      hidden);
-        push_if_q4raw(&mut jobs, layer_idx, TileWeightKind::Down, &layer.w_down, hidden,     inter);
+        push_if_q4raw(
+            &mut jobs,
+            layer_idx,
+            TileWeightKind::Wq,
+            &layer.wq,
+            wq_out_dim,
+            hidden,
+        );
+        push_if_q4raw(
+            &mut jobs,
+            layer_idx,
+            TileWeightKind::Wk,
+            &layer.wk,
+            kv_dim,
+            hidden,
+        );
+        push_if_q4raw(
+            &mut jobs,
+            layer_idx,
+            TileWeightKind::Wv,
+            &layer.wv,
+            kv_dim,
+            hidden,
+        );
+        push_if_q4raw(
+            &mut jobs,
+            layer_idx,
+            TileWeightKind::Wo,
+            &layer.wo,
+            hidden,
+            q_dim,
+        );
+        push_if_q4raw(
+            &mut jobs,
+            layer_idx,
+            TileWeightKind::Gate,
+            &layer.w_gate,
+            inter,
+            hidden,
+        );
+        push_if_q4raw(
+            &mut jobs,
+            layer_idx,
+            TileWeightKind::Up,
+            &layer.w_up,
+            inter,
+            hidden,
+        );
+        push_if_q4raw(
+            &mut jobs,
+            layer_idx,
+            TileWeightKind::Down,
+            &layer.w_down,
+            hidden,
+            inter,
+        );
     }
 
     jobs.sort_by(|a, b| {
         b.size_bytes
             .cmp(&a.size_bytes)
             .then_with(|| {
-                let pa = if layers[a.layer_idx].layer_type == 0 { 0u8 } else { 1u8 };
-                let pb = if layers[b.layer_idx].layer_type == 0 { 0u8 } else { 1u8 };
+                let pa = if layers[a.layer_idx].layer_type == 0 {
+                    0u8
+                } else {
+                    1u8
+                };
+                let pb = if layers[b.layer_idx].layer_type == 0 {
+                    0u8
+                } else {
+                    1u8
+                };
                 pa.cmp(&pb)
             })
             .then_with(|| a.layer_idx.cmp(&b.layer_idx))
@@ -12922,29 +15459,75 @@ unsafe fn repack_all_layers_q4_clone_to_tile(
     let mut bytes_cloned: usize = 0;
 
     for job in &jobs {
-        if oom_layer.is_some() { break; }
-        if bytes_cloned + job.size_bytes > CLONE_BUDGET_BYTES { break; }
+        if oom_layer.is_some() {
+            break;
+        }
+        if bytes_cloned + job.size_bytes > CLONE_BUDGET_BYTES {
+            break;
+        }
 
         let layer = &mut layers[job.layer_idx];
         let src_ref: Option<&CudaSlice<u8>> = match job.kind {
-            TileWeightKind::Wq   => if let GpuWeightBuf::Q4Raw(b) = &layer.wq     { Some(b) } else { None },
-            TileWeightKind::Wk   => if let GpuWeightBuf::Q4Raw(b) = &layer.wk     { Some(b) } else { None },
-            TileWeightKind::Wv   => if let GpuWeightBuf::Q4Raw(b) = &layer.wv     { Some(b) } else { None },
-            TileWeightKind::Wo   => if let GpuWeightBuf::Q4Raw(b) = &layer.wo     { Some(b) } else { None },
-            TileWeightKind::Gate => if let GpuWeightBuf::Q4Raw(b) = &layer.w_gate { Some(b) } else { None },
-            TileWeightKind::Up   => if let GpuWeightBuf::Q4Raw(b) = &layer.w_up   { Some(b) } else { None },
-            TileWeightKind::Down => if let GpuWeightBuf::Q4Raw(b) = &layer.w_down { Some(b) } else { None },
+            TileWeightKind::Wq => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.wq {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            TileWeightKind::Wk => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.wk {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            TileWeightKind::Wv => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.wv {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            TileWeightKind::Wo => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.wo {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            TileWeightKind::Gate => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.w_gate {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            TileWeightKind::Up => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.w_up {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            TileWeightKind::Down => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.w_down {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
         };
         let Some(raw_buf) = src_ref else { continue };
         match repack_q4_raw_to_tile(device, repack_kernel, raw_buf, job.out_dim, job.in_dim) {
             Ok(tile_buf) => {
                 match job.kind {
-                    TileWeightKind::Wq   => layer.q4_tile_wq     = Some(tile_buf),
-                    TileWeightKind::Wk   => layer.q4_tile_wk     = Some(tile_buf),
-                    TileWeightKind::Wv   => layer.q4_tile_wv     = Some(tile_buf),
-                    TileWeightKind::Wo   => layer.q4_tile_wo     = Some(tile_buf),
+                    TileWeightKind::Wq => layer.q4_tile_wq = Some(tile_buf),
+                    TileWeightKind::Wk => layer.q4_tile_wk = Some(tile_buf),
+                    TileWeightKind::Wv => layer.q4_tile_wv = Some(tile_buf),
+                    TileWeightKind::Wo => layer.q4_tile_wo = Some(tile_buf),
                     TileWeightKind::Gate => layer.q4_tile_w_gate = Some(tile_buf),
-                    TileWeightKind::Up   => layer.q4_tile_w_up   = Some(tile_buf),
+                    TileWeightKind::Up => layer.q4_tile_w_up = Some(tile_buf),
                     TileWeightKind::Down => layer.q4_tile_w_down = Some(tile_buf),
                 }
                 layers_with_tile.insert(job.layer_idx);
@@ -12983,10 +15566,7 @@ fn weight_uses_dp4a_q8_1(weight: &GpuWeightBuf, kernels: &KernelSet) -> bool {
 /// when the requested NR variant didn't load. The caller falls back to nr32 in
 /// that case. For `nr == 2`, returns the generic `matvec_q8_split_q8_1` kernel
 /// (the pre-SPLIT-INTEGRATION default that delivered T3's +7.7%).
-fn pick_output_proj_nr_kernel(
-    kernels: &KernelSet,
-    nr: u32,
-) -> Option<&CudaFunction> {
+fn pick_output_proj_nr_kernel(kernels: &KernelSet, nr: u32) -> Option<&CudaFunction> {
     match nr {
         2 => kernels.matvec_q8_split_q8_1.as_ref(),
         8 => kernels.matvec_q8_split_output_proj_nr8.as_ref(),
@@ -13039,9 +15619,7 @@ unsafe fn launch_hgemv_f16(
         .arg(&mut *input_f16_scratch)
         .arg(&n)
         .launch(cvt_cfg)
-        .map_err(|e| RuntimeError::Compute(format!(
-            "f32_to_f16 HGEMV input {label}: {e}",
-        )))?;
+        .map_err(|e| RuntimeError::Compute(format!("f32_to_f16 HGEMV input {label}: {e}",)))?;
 
     // Step 2: cublasGemmEx with N=1 (triggers optimized GEMV path).
     // Row-major W[out_dim, in_dim] -> col-major W_cm[in_dim, out_dim].
@@ -13058,20 +15636,20 @@ unsafe fn launch_hgemv_f16(
         *device.blas.handle(),
         cublas_sys::cublasOperation_t::CUBLAS_OP_T,
         cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-        out_dim as i32,  // M
-        1i32,            // N = 1 (GEMV)
-        in_dim as i32,   // K
+        out_dim as i32, // M
+        1i32,           // N = 1 (GEMV)
+        in_dim as i32,  // K
         &alpha as *const f32 as *const std::ffi::c_void,
         w_ptr as *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32,   // lda
+        in_dim as i32, // lda
         a_ptr as *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32,   // ldb
+        in_dim as i32, // ldb
         &beta as *const f32 as *const std::ffi::c_void,
         c_ptr as *mut std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_32F,
-        out_dim as i32,  // ldc
+        out_dim as i32, // ldc
         cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
         algo,
     );
@@ -13108,9 +15686,7 @@ unsafe fn launch_hgemv_f16_residual(
     device
         .stream
         .memcpy_dtod(residual, output_f32)
-        .map_err(|e| RuntimeError::Compute(format!(
-            "dtod residual copy HGEMV {label}: {e}",
-        )))?;
+        .map_err(|e| RuntimeError::Compute(format!("dtod residual copy HGEMV {label}: {e}",)))?;
 
     // Step 2: Convert F32 input to F16.
     let n = in_dim as u32;
@@ -13128,9 +15704,9 @@ unsafe fn launch_hgemv_f16_residual(
         .arg(&mut *input_f16_scratch)
         .arg(&n)
         .launch(cvt_cfg)
-        .map_err(|e| RuntimeError::Compute(format!(
-            "f32_to_f16 HGEMV residual input {label}: {e}",
-        )))?;
+        .map_err(|e| {
+            RuntimeError::Compute(format!("f32_to_f16 HGEMV residual input {label}: {e}",))
+        })?;
 
     // Step 3: cublasGemmEx with N=1 and beta=1.0 for residual accumulation.
     let alpha: f32 = 1.0;
@@ -13145,20 +15721,20 @@ unsafe fn launch_hgemv_f16_residual(
         *device.blas.handle(),
         cublas_sys::cublasOperation_t::CUBLAS_OP_T,
         cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-        out_dim as i32,  // M
-        1i32,            // N = 1 (GEMV)
-        in_dim as i32,   // K
+        out_dim as i32, // M
+        1i32,           // N = 1 (GEMV)
+        in_dim as i32,  // K
         &alpha as *const f32 as *const std::ffi::c_void,
         w_ptr as *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32,   // lda
+        in_dim as i32, // lda
         a_ptr as *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32,   // ldb
+        in_dim as i32, // ldb
         &beta as *const f32 as *const std::ffi::c_void,
         c_ptr as *mut std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_32F,
-        out_dim as i32,  // ldc
+        out_dim as i32, // ldc
         cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
         algo,
     );
@@ -13254,9 +15830,9 @@ unsafe fn launch_hgemv_bf16(
             .arg(&mut *input_bf16_scratch)
             .arg(&n)
             .launch(cvt_cfg)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "f32_to_bf16_vec4 HGEMV input {label}: {e}",
-            )))?;
+            .map_err(|e| {
+                RuntimeError::Compute(format!("f32_to_bf16_vec4 HGEMV input {label}: {e}",))
+            })?;
     } else {
         let block = 256u32;
         let grid = (n + block - 1) / block;
@@ -13272,9 +15848,7 @@ unsafe fn launch_hgemv_bf16(
             .arg(&mut *input_bf16_scratch)
             .arg(&n)
             .launch(cvt_cfg)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "f32_to_bf16 HGEMV input {label}: {e}",
-            )))?;
+            .map_err(|e| RuntimeError::Compute(format!("f32_to_bf16 HGEMV input {label}: {e}",)))?;
     }
 
     // Step 2: cublasGemmEx with N=1 (triggers optimized GEMV path).
@@ -13292,20 +15866,20 @@ unsafe fn launch_hgemv_bf16(
         *device.blas.handle(),
         cublas_sys::cublasOperation_t::CUBLAS_OP_T,
         cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-        out_dim as i32,  // M
-        1i32,            // N = 1 (GEMV)
-        in_dim as i32,   // K
+        out_dim as i32, // M
+        1i32,           // N = 1 (GEMV)
+        in_dim as i32,  // K
         &alpha as *const f32 as *const std::ffi::c_void,
         w_ptr as *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16BF,
-        in_dim as i32,   // lda
+        in_dim as i32, // lda
         a_ptr as *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16BF,
-        in_dim as i32,   // ldb
+        in_dim as i32, // ldb
         &beta as *const f32 as *const std::ffi::c_void,
         c_ptr as *mut std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_32F,
-        out_dim as i32,  // ldc
+        out_dim as i32, // ldc
         cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
         // select algo from BF16_ALGO_CACHE (populated by
         // `autotune_cublas_algos_bf16` at session init when the model has
@@ -13362,9 +15936,9 @@ unsafe fn launch_hgemv_bf16_residual(
     device
         .stream
         .memcpy_dtod(residual, output_f32)
-        .map_err(|e| RuntimeError::Compute(format!(
-            "dtod residual copy HGEMV BF16 {label}: {e}",
-        )))?;
+        .map_err(|e| {
+            RuntimeError::Compute(format!("dtod residual copy HGEMV BF16 {label}: {e}",))
+        })?;
 
     // Step 2: Convert F32 input to BF16.
     let n = in_dim as u32;
@@ -13384,9 +15958,11 @@ unsafe fn launch_hgemv_bf16_residual(
             .arg(&mut *input_bf16_scratch)
             .arg(&n)
             .launch(cvt_cfg)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "f32_to_bf16_vec4 HGEMV residual input {label}: {e}",
-            )))?;
+            .map_err(|e| {
+                RuntimeError::Compute(format!(
+                    "f32_to_bf16_vec4 HGEMV residual input {label}: {e}",
+                ))
+            })?;
     } else {
         let block = 256u32;
         let grid = (n + block - 1) / block;
@@ -13402,9 +15978,9 @@ unsafe fn launch_hgemv_bf16_residual(
             .arg(&mut *input_bf16_scratch)
             .arg(&n)
             .launch(cvt_cfg)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "f32_to_bf16 HGEMV residual input {label}: {e}",
-            )))?;
+            .map_err(|e| {
+                RuntimeError::Compute(format!("f32_to_bf16 HGEMV residual input {label}: {e}",))
+            })?;
     }
 
     // Step 3: cublasGemmEx with N=1 and beta=1.0 for residual accumulation.
@@ -13487,9 +16063,7 @@ unsafe fn launch_legacy_matvec_bf16(
         .arg(&out_dim_u32)
         .arg(&in_dim_u32)
         .launch(launch_cfg)
-        .map_err(|e| RuntimeError::Compute(format!(
-            "matvec_bf16 fallback {label} launch: {e}",
-        )))?;
+        .map_err(|e| RuntimeError::Compute(format!("matvec_bf16 fallback {label} launch: {e}",)))?;
     Ok(())
 }
 
@@ -13531,9 +16105,9 @@ unsafe fn launch_legacy_matvec_bf16_residual(
         .arg(&out_dim_u32)
         .arg(&in_dim_u32)
         .launch(launch_cfg)
-        .map_err(|e| RuntimeError::Compute(format!(
-            "matvec_bf16_residual fallback {label} launch: {e}",
-        )))?;
+        .map_err(|e| {
+            RuntimeError::Compute(format!("matvec_bf16_residual fallback {label} launch: {e}",))
+        })?;
     Ok(())
 }
 
@@ -13594,14 +16168,7 @@ unsafe fn launch_bf16_matvec_with_fallback(
         }
     }
     launch_legacy_matvec_bf16(
-        device,
-        kernels,
-        w_bf16,
-        input_f32,
-        output_f32,
-        out_dim,
-        in_dim,
-        label,
+        device, kernels, w_bf16, input_f32, output_f32, out_dim, in_dim, label,
     )
 }
 
@@ -13653,15 +16220,7 @@ unsafe fn launch_bf16_matvec_residual_with_fallback(
         }
     }
     launch_legacy_matvec_bf16_residual(
-        device,
-        kernels,
-        w_bf16,
-        input_f32,
-        residual,
-        output_f32,
-        out_dim,
-        in_dim,
-        label,
+        device, kernels, w_bf16, input_f32, residual, output_f32, out_dim, in_dim, label,
     )
 }
 
@@ -13704,9 +16263,7 @@ unsafe fn launch_fused_rmsnorm_f16(
             .arg(&eps)
             .arg(&dim_u32)
             .launch(launch_cfg)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "fused_rmsnorm_f16 {label}: {e}",
-            )))?;
+            .map_err(|e| RuntimeError::Compute(format!("fused_rmsnorm_f16 {label}: {e}",)))?;
         Ok(())
     } else {
         Err(RuntimeError::Compute(format!(
@@ -13760,9 +16317,7 @@ unsafe fn launch_swiglu_f32_to_f16(
             .arg(out_f16)
             .arg(&n_u32)
             .launch(launch_cfg)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "swiglu_f32_to_f16: {e}",
-            )))?;
+            .map_err(|e| RuntimeError::Compute(format!("swiglu_f32_to_f16: {e}",)))?;
         Ok(())
     } else {
         Err(RuntimeError::Compute(
@@ -13804,20 +16359,20 @@ unsafe fn launch_hgemv_f16_preconverted(
         *device.blas.handle(),
         cublas_sys::cublasOperation_t::CUBLAS_OP_T,
         cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-        out_dim as i32,  // M
-        1i32,            // N = 1 (GEMV)
-        in_dim as i32,   // K
+        out_dim as i32, // M
+        1i32,           // N = 1 (GEMV)
+        in_dim as i32,  // K
         &alpha as *const f32 as *const std::ffi::c_void,
         w_ptr as *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32,   // lda
+        in_dim as i32, // lda
         a_ptr as *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32,   // ldb
+        in_dim as i32, // ldb
         &beta as *const f32 as *const std::ffi::c_void,
         c_ptr as *mut std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_32F,
-        out_dim as i32,  // ldc
+        out_dim as i32, // ldc
         cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
         algo,
     );
@@ -13863,20 +16418,20 @@ unsafe fn launch_hgemv_f16_preconverted_beta1(
         *device.blas.handle(),
         cublas_sys::cublasOperation_t::CUBLAS_OP_T,
         cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-        out_dim as i32,  // M
-        1i32,            // N = 1 (GEMV)
-        in_dim as i32,   // K
+        out_dim as i32, // M
+        1i32,           // N = 1 (GEMV)
+        in_dim as i32,  // K
         &alpha as *const f32 as *const std::ffi::c_void,
         w_ptr as *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32,   // lda
+        in_dim as i32, // lda
         a_ptr as *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32,   // ldb
+        in_dim as i32, // ldb
         &beta as *const f32 as *const std::ffi::c_void,
         c_ptr as *mut std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_32F,
-        out_dim as i32,  // ldc
+        out_dim as i32, // ldc
         cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
         algo,
     );
@@ -13913,9 +16468,11 @@ unsafe fn launch_hgemv_f16_residual_preconverted(
     device
         .stream
         .memcpy_dtod(residual, output_f32)
-        .map_err(|e| RuntimeError::Compute(format!(
-            "dtod residual copy HGEMV preconverted {label}: {e}",
-        )))?;
+        .map_err(|e| {
+            RuntimeError::Compute(format!(
+                "dtod residual copy HGEMV preconverted {label}: {e}",
+            ))
+        })?;
 
     let alpha: f32 = 1.0;
     let beta: f32 = 1.0;
@@ -13929,20 +16486,20 @@ unsafe fn launch_hgemv_f16_residual_preconverted(
         *device.blas.handle(),
         cublas_sys::cublasOperation_t::CUBLAS_OP_T,
         cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-        out_dim as i32,  // M
-        1i32,            // N = 1 (GEMV)
-        in_dim as i32,   // K
+        out_dim as i32, // M
+        1i32,           // N = 1 (GEMV)
+        in_dim as i32,  // K
         &alpha as *const f32 as *const std::ffi::c_void,
         w_ptr as *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32,   // lda
+        in_dim as i32, // lda
         a_ptr as *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32,   // ldb
+        in_dim as i32, // ldb
         &beta as *const f32 as *const std::ffi::c_void,
         c_ptr as *mut std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_32F,
-        out_dim as i32,  // ldc
+        out_dim as i32, // ldc
         cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
         algo,
     );
@@ -14009,11 +16566,17 @@ unsafe fn launch_hgemv_f16_batched(
     }
 
     // Upload pointer arrays to pre-allocated device buffers (24 bytes max).
-    device.stream.memcpy_htod(&host_a[..batch_count], dev_a_ptrs)
+    device
+        .stream
+        .memcpy_htod(&host_a[..batch_count], dev_a_ptrs)
         .map_err(|e| RuntimeError::Compute(format!("batched HGEMV {label} A ptrs: {e}")))?;
-    device.stream.memcpy_htod(&host_b[..batch_count], dev_b_ptrs)
+    device
+        .stream
+        .memcpy_htod(&host_b[..batch_count], dev_b_ptrs)
         .map_err(|e| RuntimeError::Compute(format!("batched HGEMV {label} B ptrs: {e}")))?;
-    device.stream.memcpy_htod(&host_c[..batch_count], dev_c_ptrs)
+    device
+        .stream
+        .memcpy_htod(&host_c[..batch_count], dev_c_ptrs)
         .map_err(|e| RuntimeError::Compute(format!("batched HGEMV {label} C ptrs: {e}")))?;
 
     let alpha: f32 = 1.0;
@@ -14027,20 +16590,20 @@ unsafe fn launch_hgemv_f16_batched(
         *device.blas.handle(),
         cublas_sys::cublasOperation_t::CUBLAS_OP_T,
         cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-        out_dim as i32,  // M
-        1i32,            // N = 1 (GEMV)
-        in_dim as i32,   // K
+        out_dim as i32, // M
+        1i32,           // N = 1 (GEMV)
+        in_dim as i32,  // K
         &alpha as *const f32 as *const std::ffi::c_void,
         a_dev_ptr as *const *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32,   // lda
+        in_dim as i32, // lda
         b_dev_ptr as *const *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32,   // ldb
+        in_dim as i32, // ldb
         &beta as *const f32 as *const std::ffi::c_void,
         c_dev_ptr as *const *mut std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_32F,
-        out_dim as i32,  // ldc
+        out_dim as i32, // ldc
         batch_count as i32,
         cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
         algo,
@@ -14088,20 +16651,20 @@ unsafe fn launch_hgemv_f16_batched_precomputed(
         *device.blas.handle(),
         cublas_sys::cublasOperation_t::CUBLAS_OP_T,
         cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-        out_dim as i32,  // M
-        1i32,            // N = 1 (GEMV)
-        in_dim as i32,   // K
+        out_dim as i32, // M
+        1i32,           // N = 1 (GEMV)
+        in_dim as i32,  // K
         &alpha as *const f32 as *const std::ffi::c_void,
         a_dev_ptr as *const *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32,   // lda
+        in_dim as i32, // lda
         b_dev_ptr as *const *const std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32,   // ldb
+        in_dim as i32, // ldb
         &beta as *const f32 as *const std::ffi::c_void,
         c_dev_ptr as *const *mut std::ffi::c_void,
         cublas_sys::cudaDataType_t::CUDA_R_32F,
-        out_dim as i32,  // ldc
+        out_dim as i32, // ldc
         batch_count as i32,
         cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
         algo,
@@ -14142,9 +16705,13 @@ fn build_precomputed_batch_ptrs(
     let num_layers = layer_weights.len();
     let has_grouped_gemm = probe_grouped_gemm(device);
     if has_grouped_gemm {
-        eprintln!("[CUDA] cublasGemmGroupedBatchedEx available (CUDA 12.5+) -- QKV grouped GEMM enabled");
+        eprintln!(
+            "[CUDA] cublasGemmGroupedBatchedEx available (CUDA 12.5+) -- QKV grouped GEMM enabled"
+        );
     } else {
-        eprintln!("[CUDA] cublasGemmGroupedBatchedEx not available -- using separate Q + batched KV");
+        eprintln!(
+            "[CUDA] cublasGemmGroupedBatchedEx not available -- using separate Q + batched KV"
+        );
     }
 
     // Get stable device pointers for scratch output buffers.
@@ -14209,7 +16776,8 @@ fn build_precomputed_batch_ptrs(
         if has_grouped_gemm {
             let wq_f16_ptr = get_f16_weight_ptr(device, &lw.wq, lw.wq_f16.as_ref());
 
-            if let (Some(wq_ptr), Some(wk_ptr), Some(wv_ptr)) = (wq_f16_ptr, wk_f16_ptr, wv_f16_ptr) {
+            if let (Some(wq_ptr), Some(wk_ptr), Some(wv_ptr)) = (wq_f16_ptr, wk_f16_ptr, wv_f16_ptr)
+            {
                 let host_a = [wq_ptr, wk_ptr, wv_ptr];
                 let host_b = [input_f16_ptr as u64; 3];
                 let host_c = [q_out_ptr as u64, k_out_ptr as u64, v_out_ptr as u64];
@@ -14255,12 +16823,10 @@ fn get_f16_weight_ptr(
             let (ptr, _) = w.device_ptr(&device.stream);
             Some(ptr as u64)
         }
-        _ => {
-            f16_cache.map(|cache| {
-                let (ptr, _) = cache.device_ptr(&device.stream);
-                ptr as u64
-            })
-        }
+        _ => f16_cache.map(|cache| {
+            let (ptr, _) = cache.device_ptr(&device.stream);
+            ptr as u64
+        }),
     }
 }
 
@@ -14341,9 +16907,9 @@ unsafe fn launch_fused_norm_matvec_f32(
         .arg(&dim_u32)
         .arg(&out_dim_u32)
         .launch(launch_cfg)
-        .map_err(|e| RuntimeError::Compute(format!(
-            "fused_norm_matvec_f32 {label} launch: {e}",
-        )))?;
+        .map_err(|e| {
+            RuntimeError::Compute(format!("fused_norm_matvec_f32 {label} launch: {e}",))
+        })?;
     Ok(())
 }
 
@@ -14392,9 +16958,9 @@ unsafe fn launch_fused_norm_dual_matvec_f32(
         .arg(&dim_u32)
         .arg(&out_dim_u32)
         .launch(launch_cfg)
-        .map_err(|e| RuntimeError::Compute(format!(
-            "fused_norm_dual_matvec_f32 gate+up launch: {e}",
-        )))?;
+        .map_err(|e| {
+            RuntimeError::Compute(format!("fused_norm_dual_matvec_f32 gate+up launch: {e}",))
+        })?;
     Ok(())
 }
 
@@ -14504,13 +17070,22 @@ impl ComputeBackend for CudaBackend {
             attn_proj: self.device.alloc_zeros(hidden_dim)?,
             rms_scale: self.device.alloc_zeros(1)?,
             // F16 scratch for HGEMV: max(hidden_dim, inter_dim) elements * 2 bytes each.
-            input_f16: self.device.alloc_zeros::<u8>(hidden_dim.max(inter_dim) * 2)?,
+            input_f16: self
+                .device
+                .alloc_zeros::<u8>(hidden_dim.max(inter_dim) * 2)?,
             // Q8_1 scratch for dp4a matvec: max(hidden_dim, inter_dim) / 32 * 36 bytes.
             // Only allocate if the dp4a Q8_1 kernels compiled successfully.
             // also allocate when mul_mat_vec_q_q{8,4}_0 compiled
             // (the dp4a-mmvq dispatch uses the same scratch layout).
-            input_q8_1: if (kernels.quantize_f32_to_q8_1.is_some() && (kernels.matvec_q8_0_q8_1.is_some() || kernels.matvec_q8_aligned_q8_1.is_some() || kernels.matvec_q4_0_dp4a.is_some() || kernels.matvec_q4_aligned_q8_1.is_some()))
-                || (kernels.quantize_q8_1_rawsum.is_some() && (kernels.mul_mat_vec_q_q8_0.is_some() || kernels.mul_mat_vec_q_q4_0.is_some())) {
+            input_q8_1: if (kernels.quantize_f32_to_q8_1.is_some()
+                && (kernels.matvec_q8_0_q8_1.is_some()
+                    || kernels.matvec_q8_aligned_q8_1.is_some()
+                    || kernels.matvec_q4_0_dp4a.is_some()
+                    || kernels.matvec_q4_aligned_q8_1.is_some()))
+                || (kernels.quantize_q8_1_rawsum.is_some()
+                    && (kernels.mul_mat_vec_q_q8_0.is_some()
+                        || kernels.mul_mat_vec_q_q4_0.is_some()))
+            {
                 let max_dim = hidden_dim.max(inter_dim) as u32;
                 let buf_bytes = decode::q8_1_buffer_bytes(max_dim) as usize;
                 match self.device.alloc_zeros::<u8>(buf_bytes) {
@@ -14572,41 +17147,42 @@ impl ComputeBackend for CudaBackend {
         // BF16 embedding now uploads RAW bytes (2 B/elem) instead of dequanting
         // to F32 (4 B/elem) — saves ~4 GB on Qwen3.5-9B (vocab=248320, hidden=4096).
         let has_raw_embedding = self.embedding_raw.is_some();
-        let (embedding_f32, embedding_q8, embedding_f16_raw, embedding_q4_raw, embedding_bf16_raw) = if has_raw_embedding {
-            let raw = self.embedding_raw.as_ref().unwrap();
-            let placeholder: CudaSlice<f32> = self.device.alloc_zeros(1)?;
-            match self.embedding_quant {
-                QuantScheme::Q8_0 => {
-                    let gpu_q8 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, Some(gpu_q8), None, None, None)
-                }
-                QuantScheme::F16 => {
-                    let gpu_f16 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, None, Some(gpu_f16), None, None)
-                }
-                QuantScheme::Q4_0 => {
-                    let gpu_q4 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, None, None, Some(gpu_q4), None)
-                }
-                QuantScheme::Bf16 => {
-                    // BF16 embedding: upload raw bytes (2 B/elem) and dispatch via
-                    // the dedicated embed_token_bf16 kernel. Saves ~4 GB GPU VRAM
-                    // vs the previous host-side BF16 -> F32 dequant path.
-                    let raw_mb = raw.len() as f64 / 1.0e6;
-                    eprintln!("[CUDA mem] uploading BF16 embedding raw: {raw_mb:.1} MB");
-                    let gpu_bf16 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, None, None, None, Some(gpu_bf16))
-                }
-                other => {
-                    return Err(RuntimeError::Compute(format!(
+        let (embedding_f32, embedding_q8, embedding_f16_raw, embedding_q4_raw, embedding_bf16_raw) =
+            if has_raw_embedding {
+                let raw = self.embedding_raw.as_ref().unwrap();
+                let placeholder: CudaSlice<f32> = self.device.alloc_zeros(1)?;
+                match self.embedding_quant {
+                    QuantScheme::Q8_0 => {
+                        let gpu_q8 = self.device.htod_copy(raw.as_slice())?;
+                        (placeholder, Some(gpu_q8), None, None, None)
+                    }
+                    QuantScheme::F16 => {
+                        let gpu_f16 = self.device.htod_copy(raw.as_slice())?;
+                        (placeholder, None, Some(gpu_f16), None, None)
+                    }
+                    QuantScheme::Q4_0 => {
+                        let gpu_q4 = self.device.htod_copy(raw.as_slice())?;
+                        (placeholder, None, None, Some(gpu_q4), None)
+                    }
+                    QuantScheme::Bf16 => {
+                        // BF16 embedding: upload raw bytes (2 B/elem) and dispatch via
+                        // the dedicated embed_token_bf16 kernel. Saves ~4 GB GPU VRAM
+                        // vs the previous host-side BF16 -> F32 dequant path.
+                        let raw_mb = raw.len() as f64 / 1.0e6;
+                        eprintln!("[CUDA mem] uploading BF16 embedding raw: {raw_mb:.1} MB");
+                        let gpu_bf16 = self.device.htod_copy(raw.as_slice())?;
+                        (placeholder, None, None, None, Some(gpu_bf16))
+                    }
+                    other => {
+                        return Err(RuntimeError::Compute(format!(
                         "CUDA init: embedding raw quant {other:?} not supported (only Q8_0, F16, Q4_0, Bf16)",
                     )));
+                    }
                 }
-            }
-        } else {
-            let gpu_f32 = self.device.htod_copy(&self.embedding)?;
-            (gpu_f32, None, None, None, None)
-        };
+            } else {
+                let gpu_f32 = self.device.htod_copy(&self.embedding)?;
+                (gpu_f32, None, None, None, None)
+            };
         let mem_after_embedding = self.device.free_memory().unwrap_or(0);
         eprintln!(
             "[CUDA mem] after embedding upload: {:.2} GB free (consumed: {:.2} GB)",
@@ -14618,7 +17194,13 @@ impl ComputeBackend for CudaBackend {
         // BF16 output_proj now uploads RAW bytes (2 B/elem) instead of dequanting
         // to F32 (4 B/elem) — saves ~4 GB on Qwen3.5-9B. Dispatched via the
         // matvec_bf16 kernel in compute_final_gpu.
-        let (output_proj_f32, output_proj_q8, output_proj_q4, output_proj_f16_raw, output_proj_bf16_raw) = if has_raw_output_proj {
+        let (
+            output_proj_f32,
+            output_proj_q8,
+            output_proj_q4,
+            output_proj_f16_raw,
+            output_proj_bf16_raw,
+        ) = if has_raw_output_proj {
             let raw = self.output_proj_raw.as_ref().unwrap();
             let placeholder: CudaSlice<f32> = self.device.alloc_zeros(1)?;
             match self.output_proj_quant {
@@ -14733,21 +17315,19 @@ impl ComputeBackend for CudaBackend {
         // headroom for all model sizes (up to hidden_dim=8192, inter_dim=28672).
         const CUBLAS_WORKSPACE_SIZE: usize = 32 * 1024 * 1024; // 32 MB
         let cublas_workspace = match self.device.alloc_zeros::<u8>(CUBLAS_WORKSPACE_SIZE) {
-            Ok(ws) => {
-                match self.device.set_cublas_workspace(&ws) {
-                    Ok(()) => {
-                        eprintln!(
-                            "[CUDA] cuBLAS workspace: {} MB (graph-capture ready)",
-                            CUBLAS_WORKSPACE_SIZE / (1024 * 1024),
-                        );
-                        Some(ws)
-                    }
-                    Err(e) => {
-                        eprintln!("[CUDA] cublasSetWorkspace failed (graph capture disabled): {e}");
-                        None
-                    }
+            Ok(ws) => match self.device.set_cublas_workspace(&ws) {
+                Ok(()) => {
+                    eprintln!(
+                        "[CUDA] cuBLAS workspace: {} MB (graph-capture ready)",
+                        CUBLAS_WORKSPACE_SIZE / (1024 * 1024),
+                    );
+                    Some(ws)
                 }
-            }
+                Err(e) => {
+                    eprintln!("[CUDA] cublasSetWorkspace failed (graph capture disabled): {e}");
+                    None
+                }
+            },
             Err(e) => {
                 eprintln!("[CUDA] cuBLAS workspace alloc failed (graph capture disabled): {e}");
                 None
@@ -14785,8 +17365,7 @@ impl ComputeBackend for CudaBackend {
         let use_q8_scale_hw = env_truthy_or_default(
             "LUMEN_CUDA_Q8_SCALE_HW",
             crate::runtime_defaults::q8_scale_hw_default,
-        )
-            && kernels.matvec_q8_aligned_q8_1_hw.is_some()
+        ) && kernels.matvec_q8_aligned_q8_1_hw.is_some()
             && kernels.matvec_q8_aligned_q8_1_hw_residual.is_some();
         if use_q8_scale_hw {
             eprintln!("[CUDA] LUMEN_CUDA_Q8_SCALE_HW: prefer matvec_q8_aligned_q8_1_hw on Q8Aligned dispatch");
@@ -14831,10 +17410,7 @@ impl ComputeBackend for CudaBackend {
         // pre-F2 dispatch). When `OUTPUT_PROJ_SPLIT=1` AND the requested NR
         // variant is loaded, dispatch routes through it.
         let output_proj_nr_default = crate::runtime_defaults::output_proj_nr_default();
-        let output_proj_nr: u32 = match std::env::var("LUMEN_CUDA_OUTPUT_PROJ_NR")
-            .ok()
-            .as_deref()
-        {
+        let output_proj_nr: u32 = match std::env::var("LUMEN_CUDA_OUTPUT_PROJ_NR").ok().as_deref() {
             Some("2") => 2,
             Some("8") => 8,
             Some("16") => 16,
@@ -14843,7 +17419,11 @@ impl ComputeBackend for CudaBackend {
             Some("128") => 128,
             None | Some("") => {
                 // 16 for Q8 dense, 32 legacy otherwise.
-                if output_proj_nr_default == 16 { 16 } else { 32 }
+                if output_proj_nr_default == 16 {
+                    16
+                } else {
+                    32
+                }
             }
             Some(other) => {
                 eprintln!(
@@ -14869,10 +17449,8 @@ impl ComputeBackend for CudaBackend {
         // `launch_matvec_preq8_1*` free functions can consult them without
         // taking an extra parameter at every call site.
         kernels.use_q8_scale_hw = use_q8_scale_hw;
-        kernels.use_q8_split_dispatch =
-            use_q8_split && kernels.matvec_q8_split_q8_1.is_some();
-        kernels.use_q4_split_dispatch =
-            use_q4_split && kernels.matvec_q4_split_q8_1.is_some();
+        kernels.use_q8_split_dispatch = use_q8_split && kernels.matvec_q8_split_q8_1.is_some();
+        kernels.use_q4_split_dispatch = use_q4_split && kernels.matvec_q4_split_q8_1.is_some();
 
         // 4-threads-per-block mmvq kernel selection.
         // Effective only when LUMEN_CUDA_Q8_SPLIT=1 is also set, since the
@@ -14899,7 +17477,9 @@ impl ComputeBackend for CudaBackend {
         if kernels.use_q8_split_nr8_dispatch {
             eprintln!("[CUDA] LUMEN_CUDA_Q8_SPLIT_NR8=1: SPLIT dispatch uses dp4a-mmvq kernel (NR=8 + 4-thread mapping)");
             if kernels.use_q8_split_4thread_dispatch {
-                eprintln!("[CUDA] NR8 takes priority over 4thread (FULL is the structural superset)");
+                eprintln!(
+                    "[CUDA] NR8 takes priority over 4thread (FULL is the structural superset)"
+                );
             }
         } else if use_q8_split_nr8 {
             eprintln!("[CUDA] LUMEN_CUDA_Q8_SPLIT_NR8=1 set but prerequisites missing (need Q8_SPLIT=1 + kernel load OK); using existing split kernel");
@@ -14916,15 +17496,13 @@ impl ComputeBackend for CudaBackend {
         } else if use_q8_aos_nr8 {
             eprintln!("[CUDA] LUMEN_CUDA_Q8_AOS_NR8=1 set but prerequisites missing (need matvec_q8_aligned_nr8 kernel load OK); using existing AoS kernel");
         }
-        kernels.use_q8_tile_dispatch =
-            use_q8_tile && kernels.matvec_q8_tile_q8_1.is_some();
-        kernels.use_q4_tile_dispatch =
-            use_q4_tile && kernels.matvec_q4_tile_q8_1.is_some();
+        kernels.use_q8_tile_dispatch = use_q8_tile && kernels.matvec_q8_tile_q8_1.is_some();
+        kernels.use_q4_tile_dispatch = use_q4_tile && kernels.matvec_q4_tile_q8_1.is_some();
         // P1-3 FA2 block-skip prefill kernel selection. Default OFF; the
         // env var routes prefill attention dispatch through the new kernel.
         let use_fa2_blockskip = env_truthy("LUMEN_CUDA_FA2_BLOCKSKIP");
-        kernels.use_fa2_blockskip_dispatch = use_fa2_blockskip
-            && kernels.flash_attention_fa2_causal.is_some();
+        kernels.use_fa2_blockskip_dispatch =
+            use_fa2_blockskip && kernels.flash_attention_fa2_causal.is_some();
         if kernels.use_fa2_blockskip_dispatch {
             eprintln!("[CUDA] LUMEN_CUDA_FA2_BLOCKSKIP=1: prefill attention dispatch uses FA2 mask block-skip kernel");
         } else if use_fa2_blockskip {
@@ -14935,9 +17513,9 @@ impl ComputeBackend for CudaBackend {
         // Sized from hyperparams: hidden_dim, expert inter_dim (or fallback to
         // model inter_dim), shared inter_dim (= model inter_dim per Qwen3.5-MoE
         // hyperparam encoding), num_experts, top_k. Dense models get `None`.
-        let moe_scratch = if let (Some(num_experts), Some(top_k)) = (
-            hyperparams.num_experts, hyperparams.num_active_experts,
-        ) {
+        let moe_scratch = if let (Some(num_experts), Some(top_k)) =
+            (hyperparams.num_experts, hyperparams.num_active_experts)
+        {
             if num_experts > 0 && top_k > 0 {
                 let n_e = num_experts as usize;
                 let k = top_k as usize;
@@ -14964,8 +17542,7 @@ impl ComputeBackend for CudaBackend {
             None
         };
         // moe_meta_cache size matches num_layers; populated in preload_weights.
-        let moe_meta_cache: Vec<Option<super::moe::CudaMoeMeta>> =
-            vec![None; num_layers];
+        let moe_meta_cache: Vec<Option<super::moe::CudaMoeMeta>> = vec![None; num_layers];
         // parallel cache for Phase-F batched-expert GPU offset tables.
         // Built lazily during preload_weights when an MoE layer is detected.
         // Vec::new() initialization is fine because populate calls .resize()
@@ -15043,8 +17620,13 @@ impl ComputeBackend for CudaBackend {
                 })?;
                 let hd = hidden_dim as u32;
                 unsafe {
-                    self.device.stream.launch_builder(func)
-                        .arg(emb_bf16).arg(&mut output_gpu).arg(&token_id).arg(&hd)
+                    self.device
+                        .stream
+                        .launch_builder(func)
+                        .arg(emb_bf16)
+                        .arg(&mut output_gpu)
+                        .arg(&token_id)
+                        .arg(&hd)
                         .launch(launch_cfg)
                 }
                 .map_err(|e| RuntimeError::Compute(format!("CUDA embed_token_bf16 launch: {e}")))?;
@@ -15054,8 +17636,13 @@ impl ComputeBackend for CudaBackend {
                 })?;
                 let hd = hidden_dim as u32;
                 unsafe {
-                    self.device.stream.launch_builder(func)
-                        .arg(emb_f16).arg(&mut output_gpu).arg(&token_id).arg(&hd)
+                    self.device
+                        .stream
+                        .launch_builder(func)
+                        .arg(emb_f16)
+                        .arg(&mut output_gpu)
+                        .arg(&token_id)
+                        .arg(&hd)
                         .launch(launch_cfg)
                 }
                 .map_err(|e| RuntimeError::Compute(format!("CUDA embed_token_f16 launch: {e}")))?;
@@ -15065,8 +17652,13 @@ impl ComputeBackend for CudaBackend {
                 })?;
                 let hd = hidden_dim as u32;
                 unsafe {
-                    self.device.stream.launch_builder(func)
-                        .arg(emb_q4).arg(&mut output_gpu).arg(&token_id).arg(&hd)
+                    self.device
+                        .stream
+                        .launch_builder(func)
+                        .arg(emb_q4)
+                        .arg(&mut output_gpu)
+                        .arg(&token_id)
+                        .arg(&hd)
                         .launch(launch_cfg)
                 }
                 .map_err(|e| RuntimeError::Compute(format!("CUDA embed_token_q4_0 launch: {e}")))?;
@@ -15076,8 +17668,13 @@ impl ComputeBackend for CudaBackend {
                 })?;
                 let hd = hidden_dim as u32;
                 unsafe {
-                    self.device.stream.launch_builder(func)
-                        .arg(emb_q8).arg(&mut output_gpu).arg(&token_id).arg(&hd)
+                    self.device
+                        .stream
+                        .launch_builder(func)
+                        .arg(emb_q8)
+                        .arg(&mut output_gpu)
+                        .arg(&token_id)
+                        .arg(&hd)
                         .launch(launch_cfg)
                 }
                 .map_err(|e| RuntimeError::Compute(format!("CUDA embed_token_q8_0 launch: {e}")))?;
@@ -15099,9 +17696,7 @@ impl ComputeBackend for CudaBackend {
                         .arg(&hd)
                         .launch(launch_cfg)
                 }
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("CUDA embed_token_f32 launch: {e}"))
-                })?;
+                .map_err(|e| RuntimeError::Compute(format!("CUDA embed_token_f32 launch: {e}")))?;
             }
 
             self.device.synchronize()?;
@@ -15143,14 +17738,13 @@ impl ComputeBackend for CudaBackend {
         let kv_dim = num_kv_heads * head_dim;
 
         // Require KV cache view to advance seq_len tracking.
-        let kv = kv.ok_or_else(|| {
-            RuntimeError::Compute("KV cache view required for attention".into())
-        })?;
+        let kv =
+            kv.ok_or_else(|| RuntimeError::Compute("KV cache view required for attention".into()))?;
 
         let mut state_guard = self.state.lock().unwrap();
-        let st = state_guard.as_mut().ok_or_else(|| {
-            RuntimeError::Compute("CUDA backend not initialized".into())
-        })?;
+        let st = state_guard
+            .as_mut()
+            .ok_or_else(|| RuntimeError::Compute("CUDA backend not initialized".into()))?;
 
         // Use GPU-resident cached weights if available (preloaded via preload_weights),
         // otherwise upload from LayerView on each call (streaming path).
@@ -15167,7 +17761,7 @@ impl ComputeBackend for CudaBackend {
         if lw.layer_type == 1 {
             if layer_idx >= st.layer_weights_cache.len() {
                 return Err(RuntimeError::Compute(
-                    "GDN layers require GPU-resident weights (call preload_weights first)".into()
+                    "GDN layers require GPU-resident weights (call preload_weights first)".into(),
                 ));
             }
             // Upload x to GPU, run GPU-resident compute, download result.
@@ -15196,9 +17790,12 @@ impl ComputeBackend for CudaBackend {
             // SAFETY: x_gpu is [hidden_dim], rms_scale is [1]. Both allocated in init.
             unsafe {
                 launch_compute_rms_scale(
-                    &self.device, &st.kernels,
-                    &st.scratch.x_gpu, &mut st.scratch.rms_scale,
-                    eps, hidden_dim,
+                    &self.device,
+                    &st.kernels,
+                    &st.scratch.x_gpu,
+                    &mut st.scratch.rms_scale,
+                    eps,
+                    hidden_dim,
                 )?;
             }
 
@@ -15208,30 +17805,48 @@ impl ComputeBackend for CudaBackend {
             if let GpuWeightBuf::F32(ref wq_f32) = lw.wq {
                 unsafe {
                     launch_fused_norm_matvec_f32(
-                        &self.device, &st.kernels,
-                        &st.scratch.x_gpu, &st.scratch.rms_scale,
-                        &lw.attn_norm, wq_f32, &mut st.scratch.q,
-                        q_dim, hidden_dim, "wq",
+                        &self.device,
+                        &st.kernels,
+                        &st.scratch.x_gpu,
+                        &st.scratch.rms_scale,
+                        &lw.attn_norm,
+                        wq_f32,
+                        &mut st.scratch.q,
+                        q_dim,
+                        hidden_dim,
+                        "wq",
                     )?;
                 }
             }
             if let GpuWeightBuf::F32(ref wk_f32) = lw.wk {
                 unsafe {
                     launch_fused_norm_matvec_f32(
-                        &self.device, &st.kernels,
-                        &st.scratch.x_gpu, &st.scratch.rms_scale,
-                        &lw.attn_norm, wk_f32, &mut st.scratch.k,
-                        kv_dim, hidden_dim, "wk",
+                        &self.device,
+                        &st.kernels,
+                        &st.scratch.x_gpu,
+                        &st.scratch.rms_scale,
+                        &lw.attn_norm,
+                        wk_f32,
+                        &mut st.scratch.k,
+                        kv_dim,
+                        hidden_dim,
+                        "wk",
                     )?;
                 }
             }
             if let GpuWeightBuf::F32(ref wv_f32) = lw.wv {
                 unsafe {
                     launch_fused_norm_matvec_f32(
-                        &self.device, &st.kernels,
-                        &st.scratch.x_gpu, &st.scratch.rms_scale,
-                        &lw.attn_norm, wv_f32, &mut st.scratch.v,
-                        kv_dim, hidden_dim, "wv",
+                        &self.device,
+                        &st.kernels,
+                        &st.scratch.x_gpu,
+                        &st.scratch.rms_scale,
+                        &lw.attn_norm,
+                        wv_f32,
+                        &mut st.scratch.v,
+                        kv_dim,
+                        hidden_dim,
+                        "wv",
                     )?;
                 }
             }
@@ -15264,34 +17879,49 @@ impl ComputeBackend for CudaBackend {
             // SAFETY: wq is [q_dim, hidden_dim], normed is [hidden_dim], q is [q_dim].
             unsafe {
                 launch_matvec(
-                    &self.device, &st.kernels, &lw.wq,
-                    &st.scratch.normed, &mut st.scratch.q,
-                    q_dim, hidden_dim, "wq",
+                    &self.device,
+                    &st.kernels,
+                    &lw.wq,
+                    &st.scratch.normed,
+                    &mut st.scratch.q,
+                    q_dim,
+                    hidden_dim,
+                    "wq",
                     lw.wq_f16.as_ref(),
                     Some(&mut st.scratch.input_f16),
-                st.scratch.input_q8_1.as_mut(),
+                    st.scratch.input_q8_1.as_mut(),
                 )?;
             }
             // SAFETY: wk is [kv_dim, hidden_dim], normed is [hidden_dim], k is [kv_dim].
             unsafe {
                 launch_matvec(
-                    &self.device, &st.kernels, &lw.wk,
-                    &st.scratch.normed, &mut st.scratch.k,
-                    kv_dim, hidden_dim, "wk",
+                    &self.device,
+                    &st.kernels,
+                    &lw.wk,
+                    &st.scratch.normed,
+                    &mut st.scratch.k,
+                    kv_dim,
+                    hidden_dim,
+                    "wk",
                     lw.wk_f16.as_ref(),
                     Some(&mut st.scratch.input_f16),
-                st.scratch.input_q8_1.as_mut(),
+                    st.scratch.input_q8_1.as_mut(),
                 )?;
             }
             // SAFETY: wv is [kv_dim, hidden_dim], normed is [hidden_dim], v is [kv_dim].
             unsafe {
                 launch_matvec(
-                    &self.device, &st.kernels, &lw.wv,
-                    &st.scratch.normed, &mut st.scratch.v,
-                    kv_dim, hidden_dim, "wv",
+                    &self.device,
+                    &st.kernels,
+                    &lw.wv,
+                    &st.scratch.normed,
+                    &mut st.scratch.v,
+                    kv_dim,
+                    hidden_dim,
+                    "wv",
                     lw.wv_f16.as_ref(),
                     Some(&mut st.scratch.input_f16),
-                st.scratch.input_q8_1.as_mut(),
+                    st.scratch.input_q8_1.as_mut(),
                 )?;
             }
         }
@@ -15301,22 +17931,58 @@ impl ComputeBackend for CudaBackend {
             let block = 256u32;
             unsafe {
                 if let Some(ref bq) = lw.bq {
-                    let d = q_dim as u32; let g = (d + block - 1) / block;
-                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.q).arg(bq).arg(&d)
-                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
-                        .map_err(|e| RuntimeError::Compute(format!("bias_add bq streaming: {e}")))?;
+                    let d = q_dim as u32;
+                    let g = (d + block - 1) / block;
+                    self.device
+                        .stream
+                        .launch_builder(&st.kernels.bias_add)
+                        .arg(&mut st.scratch.q)
+                        .arg(bq)
+                        .arg(&d)
+                        .launch(CudarcLaunchConfig {
+                            grid_dim: (g, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("bias_add bq streaming: {e}"))
+                        })?;
                 }
                 if let Some(ref bk) = lw.bk {
-                    let d = kv_dim as u32; let g = (d + block - 1) / block;
-                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.k).arg(bk).arg(&d)
-                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
-                        .map_err(|e| RuntimeError::Compute(format!("bias_add bk streaming: {e}")))?;
+                    let d = kv_dim as u32;
+                    let g = (d + block - 1) / block;
+                    self.device
+                        .stream
+                        .launch_builder(&st.kernels.bias_add)
+                        .arg(&mut st.scratch.k)
+                        .arg(bk)
+                        .arg(&d)
+                        .launch(CudarcLaunchConfig {
+                            grid_dim: (g, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("bias_add bk streaming: {e}"))
+                        })?;
                 }
                 if let Some(ref bv) = lw.bv {
-                    let d = kv_dim as u32; let g = (d + block - 1) / block;
-                    self.device.stream.launch_builder(&st.kernels.bias_add).arg(&mut st.scratch.v).arg(bv).arg(&d)
-                        .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
-                        .map_err(|e| RuntimeError::Compute(format!("bias_add bv streaming: {e}")))?;
+                    let d = kv_dim as u32;
+                    let g = (d + block - 1) / block;
+                    self.device
+                        .stream
+                        .launch_builder(&st.kernels.bias_add)
+                        .arg(&mut st.scratch.v)
+                        .arg(bv)
+                        .arg(&d)
+                        .launch(CudarcLaunchConfig {
+                            grid_dim: (g, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("bias_add bv streaming: {e}"))
+                        })?;
                 }
             }
         }
@@ -15324,7 +17990,11 @@ impl ComputeBackend for CudaBackend {
         // 4. RoPE: apply rotary position embeddings to q and k.
         {
             let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
-            let actual_rot = if rotary_dim > 0 && rotary_dim < head_dim as u32 { rotary_dim as usize } else { head_dim };
+            let actual_rot = if rotary_dim > 0 && rotary_dim < head_dim as u32 {
+                rotary_dim as usize
+            } else {
+                head_dim
+            };
             let half_rot = actual_rot / 2;
             let total_q_pairs = num_heads * half_rot;
             let total_k_pairs = num_kv_heads * half_rot;
@@ -15413,12 +18083,18 @@ impl ComputeBackend for CudaBackend {
         // attn_proj is [hidden_dim]. All allocated with matching sizes.
         unsafe {
             launch_matvec_residual(
-                &self.device, &st.kernels, &lw.wo,
-                &st.scratch.attn_out, &st.scratch.x_gpu, &mut st.scratch.attn_proj,
-                hidden_dim, q_dim, "wo",
+                &self.device,
+                &st.kernels,
+                &lw.wo,
+                &st.scratch.attn_out,
+                &st.scratch.x_gpu,
+                &mut st.scratch.attn_proj,
+                hidden_dim,
+                q_dim,
+                "wo",
                 lw.wo_f16.as_ref(),
                 Some(&mut st.scratch.input_f16),
-            st.scratch.input_q8_1.as_mut(),
+                st.scratch.input_q8_1.as_mut(),
             )?;
         }
 
@@ -15427,16 +18103,17 @@ impl ComputeBackend for CudaBackend {
         // For F32 weights: fused dual matvec computes both gate and up from the
         // same normalized input in a single dispatch (3 kernels -> 2: rms_scale + dual).
         // For non-F32 weights: fall back to separate rmsnorm + gate matvec + up matvec.
-        if matches!(&lw.w_gate, GpuWeightBuf::F32(_))
-            && matches!(&lw.w_up, GpuWeightBuf::F32(_))
-        {
+        if matches!(&lw.w_gate, GpuWeightBuf::F32(_)) && matches!(&lw.w_up, GpuWeightBuf::F32(_)) {
             // Pass 1: compute rms_scale from attn_proj.
             // SAFETY: attn_proj is [hidden_dim], rms_scale is [1]. Both allocated in init.
             unsafe {
                 launch_compute_rms_scale(
-                    &self.device, &st.kernels,
-                    &st.scratch.attn_proj, &mut st.scratch.rms_scale,
-                    eps, hidden_dim,
+                    &self.device,
+                    &st.kernels,
+                    &st.scratch.attn_proj,
+                    &mut st.scratch.rms_scale,
+                    eps,
+                    hidden_dim,
                 )?;
             }
 
@@ -15449,11 +18126,17 @@ impl ComputeBackend for CudaBackend {
             {
                 unsafe {
                     launch_fused_norm_dual_matvec_f32(
-                        &self.device, &st.kernels,
-                        &st.scratch.attn_proj, &st.scratch.rms_scale,
-                        &lw.ffn_norm, wg_f32, wu_f32,
-                        &mut st.scratch.gate, &mut st.scratch.up,
-                        inter_dim, hidden_dim,
+                        &self.device,
+                        &st.kernels,
+                        &st.scratch.attn_proj,
+                        &st.scratch.rms_scale,
+                        &lw.ffn_norm,
+                        wg_f32,
+                        wu_f32,
+                        &mut st.scratch.gate,
+                        &mut st.scratch.up,
+                        inter_dim,
+                        hidden_dim,
                     )?;
                 }
             }
@@ -15487,24 +18170,34 @@ impl ComputeBackend for CudaBackend {
             // gate is [inter_dim].
             unsafe {
                 launch_matvec(
-                    &self.device, &st.kernels, &lw.w_gate,
-                    &st.scratch.normed, &mut st.scratch.gate,
-                    inter_dim, hidden_dim, "gate",
+                    &self.device,
+                    &st.kernels,
+                    &lw.w_gate,
+                    &st.scratch.normed,
+                    &mut st.scratch.gate,
+                    inter_dim,
+                    hidden_dim,
+                    "gate",
                     lw.w_gate_f16.as_ref(),
                     Some(&mut st.scratch.input_f16),
-                st.scratch.input_q8_1.as_mut(),
+                    st.scratch.input_q8_1.as_mut(),
                 )?;
             }
             // SAFETY: w_up is [inter_dim, hidden_dim], normed is [hidden_dim],
             // up is [inter_dim].
             unsafe {
                 launch_matvec(
-                    &self.device, &st.kernels, &lw.w_up,
-                    &st.scratch.normed, &mut st.scratch.up,
-                    inter_dim, hidden_dim, "up",
+                    &self.device,
+                    &st.kernels,
+                    &lw.w_up,
+                    &st.scratch.normed,
+                    &mut st.scratch.up,
+                    inter_dim,
+                    hidden_dim,
+                    "up",
                     lw.w_up_f16.as_ref(),
                     Some(&mut st.scratch.input_f16),
-                st.scratch.input_q8_1.as_mut(),
+                    st.scratch.input_q8_1.as_mut(),
                 )?;
             }
         }
@@ -15535,12 +18228,17 @@ impl ComputeBackend for CudaBackend {
         // SAFETY: w_down is [hidden_dim, inter_dim], gate is [inter_dim], down is [hidden_dim].
         unsafe {
             launch_matvec(
-                &self.device, &st.kernels, &lw.w_down,
-                &st.scratch.gate, &mut st.scratch.down,
-                hidden_dim, inter_dim, "down",
+                &self.device,
+                &st.kernels,
+                &lw.w_down,
+                &st.scratch.gate,
+                &mut st.scratch.down,
+                hidden_dim,
+                inter_dim,
+                "down",
                 lw.w_down_f16.as_ref(),
                 Some(&mut st.scratch.input_f16),
-            st.scratch.input_q8_1.as_mut(),
+                st.scratch.input_q8_1.as_mut(),
             )?;
         }
 
@@ -15586,9 +18284,9 @@ impl ComputeBackend for CudaBackend {
         let eps = hp.norm_eps;
 
         let mut state_guard = self.state.lock().unwrap();
-        let st = state_guard.as_mut().ok_or_else(|| {
-            RuntimeError::Compute("CUDA backend not initialized".into())
-        })?;
+        let st = state_guard
+            .as_mut()
+            .ok_or_else(|| RuntimeError::Compute("CUDA backend not initialized".into()))?;
 
         // 1. Upload x to GPU.
         let x_f32 = x.as_f32_slice();
@@ -15639,16 +18337,19 @@ impl ComputeBackend for CudaBackend {
                         shared_mem_bytes: 0,
                     };
                     unsafe {
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(quant_fn)
                             .arg(&st.scratch.normed)
                             .arg(&mut *q8_1_buf)
                             .arg(&in_dim)
                             .launch(quant_cfg)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "quantize_f32_to_q8_1 gdn output_proj Q4Aligned: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "quantize_f32_to_q8_1 gdn output_proj Q4Aligned: {e}",
+                        ))
+                    })?;
                     let mv_grid = dp4a_q4_grid(out_dim);
                     let mv_cfg = CudarcLaunchConfig {
                         grid_dim: (mv_grid, 1, 1),
@@ -15656,7 +18357,8 @@ impl ComputeBackend for CudaBackend {
                         shared_mem_bytes: 0,
                     };
                     unsafe {
-                        self.device.stream
+                        self.device
+                            .stream
                             .launch_builder(mv_fn)
                             .arg(proj_q4a)
                             .arg(&*q8_1_buf)
@@ -15665,9 +18367,11 @@ impl ComputeBackend for CudaBackend {
                             .arg(&in_dim)
                             .launch(mv_cfg)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q4_aligned_q8_1 gdn output_proj: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec_q4_aligned_q8_1 gdn output_proj: {e}",
+                        ))
+                    })?;
                 }
             } else if let Some(ref proj_q4) = st.globals.output_proj_q4 {
                 // Q4_0 output projection: prefer smem kernel when in_dim fits.
@@ -15695,7 +18399,9 @@ impl ComputeBackend for CudaBackend {
                                 .launch(launch_cfg)
                         }
                         .map_err(|e| {
-                            RuntimeError::Compute(format!("matvec output_proj Q4_0 smem launch: {e}"))
+                            RuntimeError::Compute(format!(
+                                "matvec output_proj Q4_0 smem launch: {e}"
+                            ))
                         })?;
                     } else {
                         let mv_block = matvec_block_size();
@@ -15757,9 +18463,7 @@ impl ComputeBackend for CudaBackend {
                         st.algo_cache.get(vocab_size, hidden_dim),
                     )?;
                 }
-            } else if let Some(ref proj_f16_cache) =
-                st.globals.output_proj_q8_to_f16_cache
-            {
+            } else if let Some(ref proj_f16_cache) = st.globals.output_proj_q8_to_f16_cache {
                 // cuBLAS HGEMV-N=1 against pre-dequanted F16 cache.
                 // Mirrors the non-graph dispatch above. Same byte budget for
                 // the matvec (1.94 GB F16 vs 1.06 GB Q8) but cuBLAS GemmEx
@@ -15787,21 +18491,21 @@ impl ComputeBackend for CudaBackend {
                 // if requested and loaded.
                 let out_dim_u32 = vocab_size as u32;
                 let in_dim_u32 = hidden_dim as u32;
-                let (split_mv_fn, mv_grid): (&CudaFunction, u32) =
-                    if let Some(proj_fn) = pick_output_proj_nr_kernel(
-                        &st.kernels, st.output_proj_nr,
-                    ) {
-                        let nr = st.output_proj_nr;
-                        (proj_fn, (out_dim_u32 + nr - 1) / nr)
-                    } else if let Some(ref proj_fn) = st.kernels.matvec_q8_split_output_proj {
-                        (proj_fn, (out_dim_u32 + 31) / 32)
-                    } else if let Some(ref generic_fn) = st.kernels.matvec_q8_split_q8_1 {
-                        (generic_fn, dp4a_q8_1_grid(out_dim_u32))
-                    } else {
-                        return Err(RuntimeError::Compute(
-                            "graph output_proj_q8_split present but no split matvec kernel available".into(),
-                        ));
-                    };
+                let (split_mv_fn, mv_grid): (&CudaFunction, u32) = if let Some(proj_fn) =
+                    pick_output_proj_nr_kernel(&st.kernels, st.output_proj_nr)
+                {
+                    let nr = st.output_proj_nr;
+                    (proj_fn, (out_dim_u32 + nr - 1) / nr)
+                } else if let Some(ref proj_fn) = st.kernels.matvec_q8_split_output_proj {
+                    (proj_fn, (out_dim_u32 + 31) / 32)
+                } else if let Some(ref generic_fn) = st.kernels.matvec_q8_split_q8_1 {
+                    (generic_fn, dp4a_q8_1_grid(out_dim_u32))
+                } else {
+                    return Err(RuntimeError::Compute(
+                        "graph output_proj_q8_split present but no split matvec kernel available"
+                            .into(),
+                    ));
+                };
                 if let (Some(quant_fn), Some(ref mut q8_1_buf)) = (
                     st.kernels.quantize_f32_to_q8_1.as_ref(),
                     st.scratch.input_q8_1.as_mut(),
@@ -15821,9 +18525,11 @@ impl ComputeBackend for CudaBackend {
                             .arg(&in_dim_u32)
                             .launch(quant_cfg)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "quantize_f32_to_q8_1 graph output_proj split: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "quantize_f32_to_q8_1 graph output_proj split: {e}",
+                        ))
+                    })?;
                     let mv_cfg = CudarcLaunchConfig {
                         grid_dim: (mv_grid, 1, 1),
                         block_dim: (DP4A_Q8_1_BLOCK_DIM, 1, 1),
@@ -15840,9 +18546,9 @@ impl ComputeBackend for CudaBackend {
                             .arg(&in_dim_u32)
                             .launch(mv_cfg)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "matvec_q8_split graph output_proj: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec_q8_split graph output_proj: {e}",))
+                    })?;
                 } else {
                     return Err(RuntimeError::Compute(
                         "graph output_proj_q8_split present but quantize kernel unavailable".into(),
@@ -15895,10 +18601,15 @@ impl ComputeBackend for CudaBackend {
                             .launch(mv_cfg)
                     }
                     .map_err(|e| {
-                        RuntimeError::Compute(format!("matvec_q8_aligned_q8_1 gdn output_proj: {e}"))
+                        RuntimeError::Compute(format!(
+                            "matvec_q8_aligned_q8_1 gdn output_proj: {e}"
+                        ))
                     })?;
                 } else {
-                    let q8a_fn = st.kernels.matvec_q8_0_aligned.as_ref()
+                    let q8a_fn = st
+                        .kernels
+                        .matvec_q8_0_aligned
+                        .as_ref()
                         .or(st.kernels.matvec_q8_0_dp4a.as_ref())
                         .unwrap_or(&st.kernels.matvec_q8_0);
                     let grid = matvec_q8_0_grid(out_dim_u32);
@@ -15919,7 +18630,9 @@ impl ComputeBackend for CudaBackend {
                             .launch(launch_cfg)
                     }
                     .map_err(|e| {
-                        RuntimeError::Compute(format!("matvec output_proj Q8_0 aligned launch: {e}"))
+                        RuntimeError::Compute(format!(
+                            "matvec output_proj Q8_0 aligned launch: {e}"
+                        ))
                     })?;
                 }
             } else if let Some(ref proj_q8) = st.globals.output_proj_q8 {
@@ -15927,7 +18640,10 @@ impl ComputeBackend for CudaBackend {
                 // Fallback when aligned repack is unavailable.
                 let out_dim_u32 = vocab_size as u32;
                 let in_dim_u32 = hidden_dim as u32;
-                let q8_fn = st.kernels.matvec_q8_0_dp4a.as_ref()
+                let q8_fn = st
+                    .kernels
+                    .matvec_q8_0_dp4a
+                    .as_ref()
                     .unwrap_or(&st.kernels.matvec_q8_0);
                 let grid = matvec_q8_0_grid(out_dim_u32);
                 let shmem = 0u32;
@@ -15965,13 +18681,14 @@ impl ComputeBackend for CudaBackend {
                     incy: 1,
                 };
                 unsafe {
-                    self.device
-                        .blas
-                        .gemv(cfg, &st.globals.output_proj, &st.scratch.normed, &mut st.logits_gpu)
+                    self.device.blas.gemv(
+                        cfg,
+                        &st.globals.output_proj,
+                        &st.scratch.normed,
+                        &mut st.logits_gpu,
+                    )
                 }
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("cuBLAS GEMV output_proj: {e}"))
-                })?;
+                .map_err(|e| RuntimeError::Compute(format!("cuBLAS GEMV output_proj: {e}")))?;
             }
         }
 
@@ -15997,20 +18714,28 @@ impl ComputeBackend for CudaBackend {
             let sumsq = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
             let x_slice = x.as_f32_slice();
             let x_sumsq = sumsq(x_slice);
-            let normed_host = self.device.dtoh_copy(&st.scratch.normed).unwrap_or_default();
+            let normed_host = self
+                .device
+                .dtoh_copy(&st.scratch.normed)
+                .unwrap_or_default();
             let normed_sumsq = sumsq(&normed_host);
             let logits_sumsq = sumsq(&logits_host);
             // Specific near-tie ids and margin.
-            let id_a = std::env::var("LUMEN_LOGIT_DUMP_A").ok()
-                .and_then(|s| s.parse::<usize>().ok()).unwrap_or(1633);
-            let id_b = std::env::var("LUMEN_LOGIT_DUMP_B").ok()
-                .and_then(|s| s.parse::<usize>().ok()).unwrap_or(1083);
+            let id_a = std::env::var("LUMEN_LOGIT_DUMP_A")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1633);
+            let id_b = std::env::var("LUMEN_LOGIT_DUMP_B")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1083);
             let la = logits_host.get(id_a).copied().unwrap_or(f32::NAN);
             let lb = logits_host.get(id_b).copied().unwrap_or(f32::NAN);
             // Top-K by value (full vocab argsort, K small).
             let mut idx: Vec<usize> = (0..logits_host.len()).collect();
             idx.sort_unstable_by(|&i, &j| logits_host[j].total_cmp(&logits_host[i]));
-            let topk: Vec<(usize, f32)> = idx.iter().take(8).map(|&i| (i, logits_host[i])).collect();
+            let topk: Vec<(usize, f32)> =
+                idx.iter().take(8).map(|&i| (i, logits_host[i])).collect();
             eprintln!(
                 "[LOGITDUMP] x_sumsq={x_sumsq:.6} normed_sumsq={normed_sumsq:.6} \
                  logits_sumsq={logits_sumsq:.6} id_a={id_a} logit_a={la:.6} \
@@ -16049,7 +18774,10 @@ impl ComputeBackend for CudaBackend {
     }
 
     fn caps(&self) -> BackendCaps {
-        let is_preloaded = self.state.lock().unwrap()
+        let is_preloaded = self
+            .state
+            .lock()
+            .unwrap()
             .as_ref()
             .map(|st| !st.layer_weights_cache.is_empty())
             .unwrap_or(false);
@@ -16057,7 +18785,10 @@ impl ComputeBackend for CudaBackend {
         // is populated by `preload_weights` for each layer whose
         // `subtensors.experts.is_some()`. Before preload the cache is empty
         // (caps returns moe=false); after preload it reflects the model.
-        let has_moe = self.state.lock().unwrap()
+        let has_moe = self
+            .state
+            .lock()
+            .unwrap()
             .as_ref()
             .map(|st| st.moe_meta_cache.iter().any(|m| m.is_some()))
             .unwrap_or(false);
@@ -16068,7 +18799,10 @@ impl ComputeBackend for CudaBackend {
             // has its own GDN routing (prefill_gdn_layer) and uses F32 SGEMM
             // for standard attention layers.
             batched_prefill: {
-                let has_gdn = self.state.lock().unwrap()
+                let has_gdn = self
+                    .state
+                    .lock()
+                    .unwrap()
                     .as_ref()
                     .map(|st| st.layer_weights_cache.iter().any(|lw| lw.layer_type == 1))
                     .unwrap_or(false);
@@ -16173,7 +18907,8 @@ impl ComputeBackend for CudaBackend {
         Err(RuntimeError::Unsupported(
             "CUDA backend: sync_kv_to_cpu is not yet wired ( lands the \
              Metal path only; a CUDA equivalent needs cudaMemcpyDeviceToHost + GDN \
-             state DtoH which is planned for a future release)".into(),
+             state DtoH which is planned for a future release)"
+                .into(),
         ))
     }
 
@@ -16184,7 +18919,8 @@ impl ComputeBackend for CudaBackend {
     ) -> Result<(), RuntimeError> {
         Err(RuntimeError::Unsupported(
             "CUDA backend: sync_kv_from_cpu is not yet wired ( lands the \
-             Metal path only; CUDA disk-KV restore is planned for a future release)".into(),
+             Metal path only; CUDA disk-KV restore is planned for a future release)"
+                .into(),
         ))
     }
 
@@ -16224,9 +18960,9 @@ impl ComputeBackend for CudaBackend {
         let pos_start = kv.seq_len();
 
         let mut state_guard = self.state.lock().unwrap();
-        let st = state_guard.as_mut().ok_or_else(|| {
-            RuntimeError::Compute("CUDA backend not initialized".into())
-        })?;
+        let st = state_guard
+            .as_mut()
+            .ok_or_else(|| RuntimeError::Compute("CUDA backend not initialized".into()))?;
 
         // Require GPU-resident weights for the batched prefill path.
         if st.layer_weights_cache.len() < num_layers {
@@ -16250,7 +18986,12 @@ impl ComputeBackend for CudaBackend {
 
         // Allocate batch-sized scratch buffers.
         let mut pf = super::prefill::alloc_prefill_scratch(
-            &self.device, batch, hidden_dim, q_dim, kv_dim, inter_dim,
+            &self.device,
+            batch,
+            hidden_dim,
+            q_dim,
+            kv_dim,
+            inter_dim,
             gdn_dims.map(|(q, _)| q),
             gdn_dims.map(|(_, v)| v),
         )?;
@@ -16325,7 +19066,10 @@ impl ComputeBackend for CudaBackend {
             if lw.layer_type == 1 {
                 let _t0 = std::time::Instant::now();
                 self.prefill_gdn_layer(
-                    layer_idx, batch, st, &mut pf,
+                    layer_idx,
+                    batch,
+                    st,
+                    &mut pf,
                     gdn_pf.as_mut().unwrap(),
                     eps,
                 )?;
@@ -16343,9 +19087,14 @@ impl ComputeBackend for CudaBackend {
             // 2a. Batched RMSNorm for QKV projections (always F32 path for precision).
             unsafe {
                 super::prefill::launch_rmsnorm_batched(
-                    &self.device, &st.kernels,
-                    &pf.x, &lw.attn_norm, &mut pf.normed,
-                    eps, batch, hidden_dim,
+                    &self.device,
+                    &st.kernels,
+                    &pf.x,
+                    &lw.attn_norm,
+                    &mut pf.normed,
+                    eps,
+                    batch,
+                    hidden_dim,
                 )?;
             }
 
@@ -16358,25 +19107,49 @@ impl ComputeBackend for CudaBackend {
                 let mut pf_gate_buf: CudaSlice<f32> = self.device.alloc_zeros(batch * q_dim)?;
                 unsafe {
                     super::prefill::launch_gemm_projection(
-                        &self.device, &st.kernels, &lw.wq, None,
-                        &pf.normed, &mut pf_q_gate,
-                        &mut pf.dequant_f32, &mut pf.activation_f16,
+                        &self.device,
+                        &st.kernels,
+                        &lw.wq,
+                        None,
+                        &pf.normed,
+                        &mut pf_q_gate,
+                        &mut pf.dequant_f32,
+                        &mut pf.activation_f16,
                         &mut pf.dequant_f16,
-                        batch, q_gate_dim, hidden_dim, "wq_qgate",
+                        batch,
+                        q_gate_dim,
+                        hidden_dim,
+                        "wq_qgate",
                     )?;
                     super::prefill::launch_gemm_projection(
-                        &self.device, &st.kernels, &lw.wk, None,
-                        &pf.normed, &mut pf.k,
-                        &mut pf.dequant_f32, &mut pf.activation_f16,
+                        &self.device,
+                        &st.kernels,
+                        &lw.wk,
+                        None,
+                        &pf.normed,
+                        &mut pf.k,
+                        &mut pf.dequant_f32,
+                        &mut pf.activation_f16,
                         &mut pf.dequant_f16,
-                        batch, kv_dim, hidden_dim, "wk",
+                        batch,
+                        kv_dim,
+                        hidden_dim,
+                        "wk",
                     )?;
                     super::prefill::launch_gemm_projection(
-                        &self.device, &st.kernels, &lw.wv, None,
-                        &pf.normed, &mut pf.v,
-                        &mut pf.dequant_f32, &mut pf.activation_f16,
+                        &self.device,
+                        &st.kernels,
+                        &lw.wv,
+                        None,
+                        &pf.normed,
+                        &mut pf.v,
+                        &mut pf.dequant_f32,
+                        &mut pf.activation_f16,
                         &mut pf.dequant_f16,
-                        batch, kv_dim, hidden_dim, "wv",
+                        batch,
+                        kv_dim,
+                        hidden_dim,
+                        "wv",
                     )?;
                 }
                 // Batched deinterleave: treat batch as (batch * num_heads) total heads.
@@ -16404,7 +19177,9 @@ impl ComputeBackend for CudaBackend {
                             .arg(&total_heads)
                             .launch(launch_cfg)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!("deinterleave_qgate prefill: {e}")))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("deinterleave_qgate prefill: {e}"))
+                    })?;
                 } else {
                     return Err(RuntimeError::Compute(
                         "Q+gate fusion requires deinterleave_qgate kernel".into(),
@@ -16412,9 +19187,15 @@ impl ComputeBackend for CudaBackend {
                 }
                 // Batched per-head RMSNorm on Q and K.
                 if let Some(ref q_norm_w) = lw.attn_q_norm {
-                    let norm_fn = st.kernels.rmsnorm_per_head_inplace.as_ref().ok_or_else(|| {
-                        RuntimeError::Compute("Q+gate fusion requires rmsnorm_per_head_inplace kernel".into())
-                    })?;
+                    let norm_fn =
+                        st.kernels
+                            .rmsnorm_per_head_inplace
+                            .as_ref()
+                            .ok_or_else(|| {
+                                RuntimeError::Compute(
+                                    "Q+gate fusion requires rmsnorm_per_head_inplace kernel".into(),
+                                )
+                            })?;
                     let hd = head_dim as u32;
                     let total_heads = (batch * num_heads) as u32;
                     let block = (head_dim as u32).min(1024).max(32);
@@ -16436,12 +19217,20 @@ impl ComputeBackend for CudaBackend {
                             .arg(&eps)
                             .launch(launch_cfg)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!("rmsnorm_per_head Q prefill: {e}")))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("rmsnorm_per_head Q prefill: {e}"))
+                    })?;
                 }
                 if let Some(ref k_norm_w) = lw.attn_k_norm {
-                    let norm_fn = st.kernels.rmsnorm_per_head_inplace.as_ref().ok_or_else(|| {
-                        RuntimeError::Compute("Q+gate fusion requires rmsnorm_per_head_inplace kernel".into())
-                    })?;
+                    let norm_fn =
+                        st.kernels
+                            .rmsnorm_per_head_inplace
+                            .as_ref()
+                            .ok_or_else(|| {
+                                RuntimeError::Compute(
+                                    "Q+gate fusion requires rmsnorm_per_head_inplace kernel".into(),
+                                )
+                            })?;
                     let hd = head_dim as u32;
                     let total_kv_heads = (batch * num_kv_heads) as u32;
                     let block = (head_dim as u32).min(1024).max(32);
@@ -16463,7 +19252,9 @@ impl ComputeBackend for CudaBackend {
                             .arg(&eps)
                             .launch(launch_cfg)
                     }
-                    .map_err(|e| RuntimeError::Compute(format!("rmsnorm_per_head K prefill: {e}")))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("rmsnorm_per_head K prefill: {e}"))
+                    })?;
                 }
                 // Store gate_buf for later sigmoid gating after attention.
                 // We'll use it after flash attention, before the output projection.
@@ -16496,11 +19287,18 @@ impl ComputeBackend for CudaBackend {
                 }
                 unsafe {
                     super::prefill::launch_rope_batched(
-                        &self.device, &st.kernels,
-                        &mut pf.q, &mut pf.k,
-                        pos_start, batch,
-                        num_heads, num_kv_heads, head_dim, theta,
-                        hp.rope_neox, rotary_dim_pf,
+                        &self.device,
+                        &st.kernels,
+                        &mut pf.q,
+                        &mut pf.k,
+                        pos_start,
+                        batch,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        theta,
+                        hp.rope_neox,
+                        rotary_dim_pf,
                     )?;
                 }
                 if ropeprobe && batch > 1 {
@@ -16508,35 +19306,57 @@ impl ComputeBackend for CudaBackend {
                     let o = (batch - 1) * qd;
                     // dump dims 0..8, 30..38, 62..70 to see split-half (d,d+32) pairing
                     let s = |a: usize, b: usize| qh[o + a..o + b.min(qd)].to_vec();
-                    eprintln!("[ROPEPROBE] layer={layer_idx} POST q_h0 d0-7={:?} d30-37={:?} d62-69={:?}",
-                        s(0, 8), s(30, 38), s(62, 70));
+                    eprintln!(
+                        "[ROPEPROBE] layer={layer_idx} POST q_h0 d0-7={:?} d30-37={:?} d62-69={:?}",
+                        s(0, 8),
+                        s(30, 38),
+                        s(62, 70)
+                    );
                     // post-rope K (cached) + V, last token, kv-head 0, first 3
                     let kvd = num_kv_heads * head_dim;
                     let kh = self.device.dtoh_copy(&pf.k)?;
                     let vh = self.device.dtoh_copy(&pf.v)?;
                     let ko = (batch - 1) * kvd;
-                    eprintln!("[KVPROBE] layer={layer_idx} POST k_h0[0..3]={:?} v_h0[0..3]={:?}",
-                        &kh[ko..ko + 3.min(kvd)], &vh[ko..ko + 3.min(kvd)]);
+                    eprintln!(
+                        "[KVPROBE] layer={layer_idx} POST k_h0[0..3]={:?} v_h0[0..3]={:?}",
+                        &kh[ko..ko + 3.min(kvd)],
+                        &vh[ko..ko + 3.min(kvd)]
+                    );
                     // whole-buffer sumsq (LAYOUT-INDEPENDENT) for Q/K/V across all tokens.
-                    let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
-                    eprintln!("[QKVSS] layer={layer_idx} q_sumsq={:.4} k_sumsq={:.4} v_sumsq={:.4}",
-                        ss(&qh[..batch * qd]), ss(&kh[..batch * kvd]), ss(&vh[..batch * kvd]));
+                    let ss =
+                        |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                    eprintln!(
+                        "[QKVSS] layer={layer_idx} q_sumsq={:.4} k_sumsq={:.4} v_sumsq={:.4}",
+                        ss(&qh[..batch * qd]),
+                        ss(&kh[..batch * kvd]),
+                        ss(&vh[..batch * kvd])
+                    );
                 }
 
                 // 2d. Batch KV cache write
                 let kv_cache = &mut st.kv_caches[layer_idx];
                 unsafe {
                     super::prefill::launch_kv_cache_write_batch(
-                        &self.device, &st.kernels,
-                        &mut kv_cache.k_cache, &pf.k,
-                        pos_start, batch,
-                        num_kv_heads, kv_cache.max_seq_len, head_dim,
+                        &self.device,
+                        &st.kernels,
+                        &mut kv_cache.k_cache,
+                        &pf.k,
+                        pos_start,
+                        batch,
+                        num_kv_heads,
+                        kv_cache.max_seq_len,
+                        head_dim,
                     )?;
                     super::prefill::launch_kv_cache_write_batch(
-                        &self.device, &st.kernels,
-                        &mut kv_cache.v_cache, &pf.v,
-                        pos_start, batch,
-                        num_kv_heads, kv_cache.max_seq_len, head_dim,
+                        &self.device,
+                        &st.kernels,
+                        &mut kv_cache.v_cache,
+                        &pf.v,
+                        pos_start,
+                        batch,
+                        num_kv_heads,
+                        kv_cache.max_seq_len,
+                        head_dim,
                     )?;
                 }
                 kv_cache.advance_seq_len_by(batch);
@@ -16556,7 +19376,9 @@ impl ComputeBackend for CudaBackend {
                 let force_scalar_attn = {
                     use std::sync::OnceLock;
                     static FS: OnceLock<bool> = OnceLock::new();
-                    *FS.get_or_init(|| std::env::var("LUMEN_CUDA_FORCE_SCALAR_ATTN").as_deref() == Ok("1"))
+                    *FS.get_or_init(|| {
+                        std::env::var("LUMEN_CUDA_FORCE_SCALAR_ATTN").as_deref() == Ok("1")
+                    })
                 };
                 // WMMA-PRECISION-FIX-RCA precision-localization selector (no-op
                 // when unset). 0=default WMMA-F16, 1=qkf32 (exact QK^T), 2=pvf32
@@ -16565,13 +19387,18 @@ impl ComputeBackend for CudaBackend {
                 let attn_precise: u8 = {
                     use std::sync::OnceLock;
                     static AP: OnceLock<u8> = OnceLock::new();
-                    *AP.get_or_init(|| match std::env::var("LUMEN_CUDA_ATTN_PRECISE").as_deref() {
-                        Ok("1") => 1, Ok("2") => 2, Ok("3") => 3, Ok("4") => 4,
-                        Ok("0") => 0,
-                        // Unset → ratified per-class default (pvf32 for MoE +
-                        // dense ≤32 layers; legacy WMMA for the 27B class).
-                        _ => crate::runtime_defaults::attn_precise_default(),
-                    })
+                    *AP.get_or_init(
+                        || match std::env::var("LUMEN_CUDA_ATTN_PRECISE").as_deref() {
+                            Ok("1") => 1,
+                            Ok("2") => 2,
+                            Ok("3") => 3,
+                            Ok("4") => 4,
+                            Ok("0") => 0,
+                            // Unset → ratified per-class default (pvf32 for MoE +
+                            // dense ≤32 layers; legacy WMMA for the 27B class).
+                            _ => crate::runtime_defaults::attn_precise_default(),
+                        },
+                    )
                 };
                 unsafe {
                     if !force_scalar_attn && st.kernels.use_fa2_blockskip_dispatch {
@@ -16581,62 +19408,123 @@ impl ComputeBackend for CudaBackend {
                             && st.kernels.flash_attention_fa2_splitk_reduce.is_some()
                         {
                             super::prefill::launch_flash_attention_fa2_splitk(
-                                &self.device, &st.kernels,
-                                &pf.q, kv_cache, &mut pf.attn_out,
-                                batch, num_heads, num_kv_heads, head_dim, pos_start,
+                                &self.device,
+                                &st.kernels,
+                                &pf.q,
+                                kv_cache,
+                                &mut pf.attn_out,
+                                batch,
+                                num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                pos_start,
                                 super::decode::FA2_SPLITK_SLICE,
                             )?;
                         } else {
                             super::prefill::launch_flash_attention_fa2(
-                                &self.device, &st.kernels,
-                                &pf.q, kv_cache, &mut pf.attn_out,
-                                batch, num_heads, num_kv_heads, head_dim, pos_start,
+                                &self.device,
+                                &st.kernels,
+                                &pf.q,
+                                kv_cache,
+                                &mut pf.attn_out,
+                                batch,
+                                num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                pos_start,
                             )?;
                         }
-                    } else if !force_scalar_attn && batch >= 16 && st.kernels.flash_attention_wmma.is_some() {
+                    } else if !force_scalar_attn
+                        && batch >= 16
+                        && st.kernels.flash_attention_wmma.is_some()
+                    {
                         match attn_precise {
                             1 if st.kernels.flash_attention_wmma_qkf32.is_some() => {
                                 super::prefill::launch_flash_attention_wmma_variant(
-                                    &self.device, &st.kernels,
-                                    &pf.q, kv_cache, &mut pf.attn_out,
-                                    batch, num_heads, num_kv_heads, head_dim, pos_start, true,
+                                    &self.device,
+                                    &st.kernels,
+                                    &pf.q,
+                                    kv_cache,
+                                    &mut pf.attn_out,
+                                    batch,
+                                    num_heads,
+                                    num_kv_heads,
+                                    head_dim,
+                                    pos_start,
+                                    true,
                                 )?;
                             }
                             2 if st.kernels.flash_attention_wmma_pvf32.is_some() => {
                                 super::prefill::launch_flash_attention_wmma_variant(
-                                    &self.device, &st.kernels,
-                                    &pf.q, kv_cache, &mut pf.attn_out,
-                                    batch, num_heads, num_kv_heads, head_dim, pos_start, false,
+                                    &self.device,
+                                    &st.kernels,
+                                    &pf.q,
+                                    kv_cache,
+                                    &mut pf.attn_out,
+                                    batch,
+                                    num_heads,
+                                    num_kv_heads,
+                                    head_dim,
+                                    pos_start,
+                                    false,
                                 )?;
                             }
                             3 => {
                                 // both exact == full F32 == scalar br4 (validated path)
                                 super::prefill::launch_flash_attention_br4(
-                                    &self.device, &st.kernels,
-                                    &pf.q, kv_cache, &mut pf.attn_out,
-                                    batch, num_heads, num_kv_heads, head_dim, pos_start,
+                                    &self.device,
+                                    &st.kernels,
+                                    &pf.q,
+                                    kv_cache,
+                                    &mut pf.attn_out,
+                                    batch,
+                                    num_heads,
+                                    num_kv_heads,
+                                    head_dim,
+                                    pos_start,
                                 )?;
                             }
                             4 if st.kernels.flash_attention_wmma_split.is_some() => {
                                 super::prefill::launch_flash_attention_wmma_split(
-                                    &self.device, &st.kernels,
-                                    &pf.q, kv_cache, &mut pf.attn_out,
-                                    batch, num_heads, num_kv_heads, head_dim, pos_start,
+                                    &self.device,
+                                    &st.kernels,
+                                    &pf.q,
+                                    kv_cache,
+                                    &mut pf.attn_out,
+                                    batch,
+                                    num_heads,
+                                    num_kv_heads,
+                                    head_dim,
+                                    pos_start,
                                 )?;
                             }
                             _ => {
                                 super::prefill::launch_flash_attention_wmma(
-                                    &self.device, &st.kernels,
-                                    &pf.q, kv_cache, &mut pf.attn_out,
-                                    batch, num_heads, num_kv_heads, head_dim, pos_start,
+                                    &self.device,
+                                    &st.kernels,
+                                    &pf.q,
+                                    kv_cache,
+                                    &mut pf.attn_out,
+                                    batch,
+                                    num_heads,
+                                    num_kv_heads,
+                                    head_dim,
+                                    pos_start,
                                 )?;
                             }
                         }
                     } else {
                         super::prefill::launch_flash_attention_br4(
-                            &self.device, &st.kernels,
-                            &pf.q, kv_cache, &mut pf.attn_out,
-                            batch, num_heads, num_kv_heads, head_dim, pos_start,
+                            &self.device,
+                            &st.kernels,
+                            &pf.q,
+                            kv_cache,
+                            &mut pf.attn_out,
+                            batch,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            pos_start,
                         )?;
                     }
                 }
@@ -16646,7 +19534,10 @@ impl ComputeBackend for CudaBackend {
                 if ropeprobe && batch > 1 {
                     let ah = self.device.dtoh_copy(&pf.attn_out)?;
                     let o = (batch - 1) * qd;
-                    eprintln!("[ATTNPROBE] layer={layer_idx} attn_out_h0[0..3]={:?}", &ah[o..o + 3.min(qd)]);
+                    eprintln!(
+                        "[ATTNPROBE] layer={layer_idx} attn_out_h0[0..3]={:?}",
+                        &ah[o..o + 3.min(qd)]
+                    );
                 }
 
                 // 2e.5. Sigmoid gating: attn_out = sigmoid(gate) * attn_out (per token)
@@ -16681,7 +19572,9 @@ impl ComputeBackend for CudaBackend {
                     self.device
                         .stream
                         .memcpy_dtod(&pf.q, &mut pf.attn_out)
-                        .map_err(|e| RuntimeError::Compute(format!("sigmoid_mul prefill dtod: {e}")))?;
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("sigmoid_mul prefill dtod: {e}"))
+                        })?;
                 } else {
                     return Err(RuntimeError::Compute(
                         "Q+gate fusion requires sigmoid_mul kernel".into(),
@@ -16691,11 +19584,20 @@ impl ComputeBackend for CudaBackend {
                 // 2f. Output projection + residual
                 unsafe {
                     super::prefill::launch_gemm_residual(
-                        &self.device, &st.kernels, &lw.wo, None,
-                        &pf.attn_out, &pf.x, &mut pf.attn_proj,
-                        &mut pf.dequant_f32, &mut pf.activation_f16,
+                        &self.device,
+                        &st.kernels,
+                        &lw.wo,
+                        None,
+                        &pf.attn_out,
+                        &pf.x,
+                        &mut pf.attn_proj,
+                        &mut pf.dequant_f32,
+                        &mut pf.activation_f16,
                         &mut pf.dequant_f16,
-                        batch, hidden_dim, q_dim, "wo",
+                        batch,
+                        hidden_dim,
+                        q_dim,
+                        "wo",
                     )?;
                 }
 
@@ -16713,50 +19615,89 @@ impl ComputeBackend for CudaBackend {
                 } else {
                     unsafe {
                         super::prefill::launch_rmsnorm_batched(
-                            &self.device, &st.kernels,
-                            &pf.attn_proj, &lw.ffn_norm, &mut pf.normed,
-                            eps, batch, hidden_dim,
+                            &self.device,
+                            &st.kernels,
+                            &pf.attn_proj,
+                            &lw.ffn_norm,
+                            &mut pf.normed,
+                            eps,
+                            batch,
+                            hidden_dim,
                         )?;
                         super::prefill::launch_gemm_projection(
-                            &self.device, &st.kernels, &lw.w_gate, None,
-                            &pf.normed, &mut pf.gate,
-                            &mut pf.dequant_f32, &mut pf.activation_f16,
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_gate,
+                            None,
+                            &pf.normed,
+                            &mut pf.gate,
+                            &mut pf.dequant_f32,
+                            &mut pf.activation_f16,
                             &mut pf.dequant_f16,
-                            batch, inter_dim, hidden_dim, "gate",
+                            batch,
+                            inter_dim,
+                            hidden_dim,
+                            "gate",
                         )?;
                         super::prefill::launch_gemm_projection(
-                            &self.device, &st.kernels, &lw.w_up, None,
-                            &pf.normed, &mut pf.up,
-                            &mut pf.dequant_f32, &mut pf.activation_f16,
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_up,
+                            None,
+                            &pf.normed,
+                            &mut pf.up,
+                            &mut pf.dequant_f32,
+                            &mut pf.activation_f16,
                             &mut pf.dequant_f16,
-                            batch, inter_dim, hidden_dim, "up",
+                            batch,
+                            inter_dim,
+                            hidden_dim,
+                            "up",
                         )?;
                     }
                     unsafe {
                         super::prefill::launch_swiglu_batched(
-                            &self.device, &st.kernels,
-                            &mut pf.gate, &pf.up, batch, inter_dim,
+                            &self.device,
+                            &st.kernels,
+                            &mut pf.gate,
+                            &pf.up,
+                            batch,
+                            inter_dim,
                         )?;
                     }
                     unsafe {
                         super::prefill::launch_gemm_projection(
-                            &self.device, &st.kernels, &lw.w_down, None,
-                            &pf.gate, &mut pf.down,
-                            &mut pf.dequant_f32, &mut pf.activation_f16,
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_down,
+                            None,
+                            &pf.gate,
+                            &mut pf.down,
+                            &mut pf.dequant_f32,
+                            &mut pf.activation_f16,
                             &mut pf.dequant_f16,
-                            batch, hidden_dim, inter_dim, "down",
+                            batch,
+                            hidden_dim,
+                            inter_dim,
+                            "down",
                         )?;
                     }
                     unsafe {
                         super::prefill::launch_residual_add_batched(
-                            &self.device, &st.kernels,
-                            &mut pf.attn_proj, &pf.down, batch, hidden_dim,
+                            &self.device,
+                            &st.kernels,
+                            &mut pf.attn_proj,
+                            &pf.down,
+                            batch,
+                            hidden_dim,
                         )?;
                     }
                     self.device
                         .stream
                         .memcpy_dtod(&pf.attn_proj, &mut pf.x)
-                        .map_err(|e| RuntimeError::Compute(format!("dtod x<-attn_proj qgate prefill: {e}")))?;
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("dtod x<-attn_proj qgate prefill: {e}"))
+                        })?;
                 }
                 if stage_timing {
                     *stage_ms.entry("ffn").or_default() += stage_sync_ms!(_t_ffn);
@@ -16766,25 +19707,49 @@ impl ComputeBackend for CudaBackend {
 
             unsafe {
                 super::prefill::launch_gemm_projection(
-                    &self.device, &st.kernels, &lw.wq, None,
-                    &pf.normed, &mut pf.q,
-                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &self.device,
+                    &st.kernels,
+                    &lw.wq,
+                    None,
+                    &pf.normed,
+                    &mut pf.q,
+                    &mut pf.dequant_f32,
+                    &mut pf.activation_f16,
                     &mut pf.dequant_f16,
-                    batch, q_dim, hidden_dim, "wq",
+                    batch,
+                    q_dim,
+                    hidden_dim,
+                    "wq",
                 )?;
                 super::prefill::launch_gemm_projection(
-                    &self.device, &st.kernels, &lw.wk, None,
-                    &pf.normed, &mut pf.k,
-                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &self.device,
+                    &st.kernels,
+                    &lw.wk,
+                    None,
+                    &pf.normed,
+                    &mut pf.k,
+                    &mut pf.dequant_f32,
+                    &mut pf.activation_f16,
                     &mut pf.dequant_f16,
-                    batch, kv_dim, hidden_dim, "wk",
+                    batch,
+                    kv_dim,
+                    hidden_dim,
+                    "wk",
                 )?;
                 super::prefill::launch_gemm_projection(
-                    &self.device, &st.kernels, &lw.wv, None,
-                    &pf.normed, &mut pf.v,
-                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &self.device,
+                    &st.kernels,
+                    &lw.wv,
+                    None,
+                    &pf.normed,
+                    &mut pf.v,
+                    &mut pf.dequant_f32,
+                    &mut pf.activation_f16,
                     &mut pf.dequant_f16,
-                    batch, kv_dim, hidden_dim, "wv",
+                    batch,
+                    kv_dim,
+                    hidden_dim,
+                    "wv",
                 )?;
             }
 
@@ -16796,28 +19761,61 @@ impl ComputeBackend for CudaBackend {
                         let total = (batch * q_dim) as u32;
                         let dim_u32 = q_dim as u32;
                         let g = (total + block - 1) / block;
-                        self.device.stream.launch_builder(&st.kernels.bias_add_batched)
-                            .arg(&mut pf.q).arg(bq).arg(&total).arg(&dim_u32)
-                            .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
-                            .map_err(|e| RuntimeError::Compute(format!("bias_add_batched bq prefill: {e}")))?;
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.bias_add_batched)
+                            .arg(&mut pf.q)
+                            .arg(bq)
+                            .arg(&total)
+                            .arg(&dim_u32)
+                            .launch(CudarcLaunchConfig {
+                                grid_dim: (g, 1, 1),
+                                block_dim: (block, 1, 1),
+                                shared_mem_bytes: 0,
+                            })
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!("bias_add_batched bq prefill: {e}"))
+                            })?;
                     }
                     if let Some(ref bk) = lw.bk {
                         let total = (batch * kv_dim) as u32;
                         let dim_u32 = kv_dim as u32;
                         let g = (total + block - 1) / block;
-                        self.device.stream.launch_builder(&st.kernels.bias_add_batched)
-                            .arg(&mut pf.k).arg(bk).arg(&total).arg(&dim_u32)
-                            .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
-                            .map_err(|e| RuntimeError::Compute(format!("bias_add_batched bk prefill: {e}")))?;
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.bias_add_batched)
+                            .arg(&mut pf.k)
+                            .arg(bk)
+                            .arg(&total)
+                            .arg(&dim_u32)
+                            .launch(CudarcLaunchConfig {
+                                grid_dim: (g, 1, 1),
+                                block_dim: (block, 1, 1),
+                                shared_mem_bytes: 0,
+                            })
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!("bias_add_batched bk prefill: {e}"))
+                            })?;
                     }
                     if let Some(ref bv) = lw.bv {
                         let total = (batch * kv_dim) as u32;
                         let dim_u32 = kv_dim as u32;
                         let g = (total + block - 1) / block;
-                        self.device.stream.launch_builder(&st.kernels.bias_add_batched)
-                            .arg(&mut pf.v).arg(bv).arg(&total).arg(&dim_u32)
-                            .launch(CudarcLaunchConfig { grid_dim: (g,1,1), block_dim: (block,1,1), shared_mem_bytes: 0 })
-                            .map_err(|e| RuntimeError::Compute(format!("bias_add_batched bv prefill: {e}")))?;
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.bias_add_batched)
+                            .arg(&mut pf.v)
+                            .arg(bv)
+                            .arg(&total)
+                            .arg(&dim_u32)
+                            .launch(CudarcLaunchConfig {
+                                grid_dim: (g, 1, 1),
+                                block_dim: (block, 1, 1),
+                                shared_mem_bytes: 0,
+                            })
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!("bias_add_batched bv prefill: {e}"))
+                            })?;
                     }
                 }
             }
@@ -16826,11 +19824,18 @@ impl ComputeBackend for CudaBackend {
             let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
             unsafe {
                 super::prefill::launch_rope_batched(
-                    &self.device, &st.kernels,
-                    &mut pf.q, &mut pf.k,
-                    pos_start, batch,
-                    num_heads, num_kv_heads, head_dim, theta,
-                    hp.rope_neox, rotary_dim,
+                    &self.device,
+                    &st.kernels,
+                    &mut pf.q,
+                    &mut pf.k,
+                    pos_start,
+                    batch,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    theta,
+                    hp.rope_neox,
+                    rotary_dim,
                 )?;
             }
 
@@ -16838,16 +19843,26 @@ impl ComputeBackend for CudaBackend {
             let kv_cache = &mut st.kv_caches[layer_idx];
             unsafe {
                 super::prefill::launch_kv_cache_write_batch(
-                    &self.device, &st.kernels,
-                    &mut kv_cache.k_cache, &pf.k,
-                    pos_start, batch,
-                    num_kv_heads, kv_cache.max_seq_len, head_dim,
+                    &self.device,
+                    &st.kernels,
+                    &mut kv_cache.k_cache,
+                    &pf.k,
+                    pos_start,
+                    batch,
+                    num_kv_heads,
+                    kv_cache.max_seq_len,
+                    head_dim,
                 )?;
                 super::prefill::launch_kv_cache_write_batch(
-                    &self.device, &st.kernels,
-                    &mut kv_cache.v_cache, &pf.v,
-                    pos_start, batch,
-                    num_kv_heads, kv_cache.max_seq_len, head_dim,
+                    &self.device,
+                    &st.kernels,
+                    &mut kv_cache.v_cache,
+                    &pf.v,
+                    pos_start,
+                    batch,
+                    num_kv_heads,
+                    kv_cache.max_seq_len,
+                    head_dim,
                 )?;
             }
             kv_cache.advance_seq_len_by(batch);
@@ -16870,16 +19885,30 @@ impl ComputeBackend for CudaBackend {
                         && st.kernels.flash_attention_fa2_splitk_reduce.is_some()
                     {
                         super::prefill::launch_flash_attention_fa2_splitk(
-                            &self.device, &st.kernels,
-                            &pf.q, kv_cache, &mut pf.attn_out,
-                            batch, num_heads, num_kv_heads, head_dim, pos_start,
+                            &self.device,
+                            &st.kernels,
+                            &pf.q,
+                            kv_cache,
+                            &mut pf.attn_out,
+                            batch,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            pos_start,
                             super::decode::FA2_SPLITK_SLICE,
                         )?;
                     } else {
                         super::prefill::launch_flash_attention_fa2(
-                            &self.device, &st.kernels,
-                            &pf.q, kv_cache, &mut pf.attn_out,
-                            batch, num_heads, num_kv_heads, head_dim, pos_start,
+                            &self.device,
+                            &st.kernels,
+                            &pf.q,
+                            kv_cache,
+                            &mut pf.attn_out,
+                            batch,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            pos_start,
                         )?;
                     }
                 } else if batch >= 16 && st.kernels.flash_attention_wmma.is_some() {
@@ -16889,51 +19918,105 @@ impl ComputeBackend for CudaBackend {
                     let attn_precise: u8 = {
                         use std::sync::OnceLock;
                         static AP2: OnceLock<u8> = OnceLock::new();
-                        *AP2.get_or_init(|| match std::env::var("LUMEN_CUDA_ATTN_PRECISE").as_deref() {
-                            Ok("1") => 1, Ok("2") => 2, Ok("3") => 3, Ok("4") => 4,
-                            Ok("0") => 0,
-                            // Unset → per-class default (must mirror the AP
-                            // site above; both dispatch sites stay in sync).
-                            _ => crate::runtime_defaults::attn_precise_default(),
+                        *AP2.get_or_init(|| {
+                            match std::env::var("LUMEN_CUDA_ATTN_PRECISE").as_deref() {
+                                Ok("1") => 1,
+                                Ok("2") => 2,
+                                Ok("3") => 3,
+                                Ok("4") => 4,
+                                Ok("0") => 0,
+                                // Unset → per-class default (must mirror the AP
+                                // site above; both dispatch sites stay in sync).
+                                _ => crate::runtime_defaults::attn_precise_default(),
+                            }
                         })
                     };
                     match attn_precise {
                         1 if st.kernels.flash_attention_wmma_qkf32.is_some() => {
                             super::prefill::launch_flash_attention_wmma_variant(
-                                &self.device, &st.kernels, &pf.q, kv_cache, &mut pf.attn_out,
-                                batch, num_heads, num_kv_heads, head_dim, pos_start, true,
+                                &self.device,
+                                &st.kernels,
+                                &pf.q,
+                                kv_cache,
+                                &mut pf.attn_out,
+                                batch,
+                                num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                pos_start,
+                                true,
                             )?;
                         }
                         2 if st.kernels.flash_attention_wmma_pvf32.is_some() => {
                             super::prefill::launch_flash_attention_wmma_variant(
-                                &self.device, &st.kernels, &pf.q, kv_cache, &mut pf.attn_out,
-                                batch, num_heads, num_kv_heads, head_dim, pos_start, false,
+                                &self.device,
+                                &st.kernels,
+                                &pf.q,
+                                kv_cache,
+                                &mut pf.attn_out,
+                                batch,
+                                num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                pos_start,
+                                false,
                             )?;
                         }
                         3 => {
                             super::prefill::launch_flash_attention_br4(
-                                &self.device, &st.kernels, &pf.q, kv_cache, &mut pf.attn_out,
-                                batch, num_heads, num_kv_heads, head_dim, pos_start,
+                                &self.device,
+                                &st.kernels,
+                                &pf.q,
+                                kv_cache,
+                                &mut pf.attn_out,
+                                batch,
+                                num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                pos_start,
                             )?;
                         }
                         4 if st.kernels.flash_attention_wmma_split.is_some() => {
                             super::prefill::launch_flash_attention_wmma_split(
-                                &self.device, &st.kernels, &pf.q, kv_cache, &mut pf.attn_out,
-                                batch, num_heads, num_kv_heads, head_dim, pos_start,
+                                &self.device,
+                                &st.kernels,
+                                &pf.q,
+                                kv_cache,
+                                &mut pf.attn_out,
+                                batch,
+                                num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                pos_start,
                             )?;
                         }
                         _ => {
                             super::prefill::launch_flash_attention_wmma(
-                                &self.device, &st.kernels, &pf.q, kv_cache, &mut pf.attn_out,
-                                batch, num_heads, num_kv_heads, head_dim, pos_start,
+                                &self.device,
+                                &st.kernels,
+                                &pf.q,
+                                kv_cache,
+                                &mut pf.attn_out,
+                                batch,
+                                num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                pos_start,
                             )?;
                         }
                     }
                 } else {
                     super::prefill::launch_flash_attention_br4(
-                        &self.device, &st.kernels,
-                        &pf.q, kv_cache, &mut pf.attn_out,
-                        batch, num_heads, num_kv_heads, head_dim, pos_start,
+                        &self.device,
+                        &st.kernels,
+                        &pf.q,
+                        kv_cache,
+                        &mut pf.attn_out,
+                        batch,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        pos_start,
                     )?;
                 }
             }
@@ -16941,11 +20024,20 @@ impl ComputeBackend for CudaBackend {
             // 2f. Batched output projection + residual via GEMM (no F16 caches).
             unsafe {
                 super::prefill::launch_gemm_residual(
-                    &self.device, &st.kernels, &lw.wo, None,
-                    &pf.attn_out, &pf.x, &mut pf.attn_proj,
-                    &mut pf.dequant_f32, &mut pf.activation_f16,
+                    &self.device,
+                    &st.kernels,
+                    &lw.wo,
+                    None,
+                    &pf.attn_out,
+                    &pf.x,
+                    &mut pf.attn_proj,
+                    &mut pf.dequant_f32,
+                    &mut pf.activation_f16,
                     &mut pf.dequant_f16,
-                    batch, hidden_dim, q_dim, "wo",
+                    batch,
+                    hidden_dim,
+                    q_dim,
+                    "wo",
                 )?;
             }
 
@@ -16969,42 +20061,75 @@ impl ComputeBackend for CudaBackend {
                 // 2g. FFN: batched RMSNorm + GEMM gate/up (always F32 path for precision).
                 unsafe {
                     super::prefill::launch_rmsnorm_batched(
-                        &self.device, &st.kernels,
-                        &pf.attn_proj, &lw.ffn_norm, &mut pf.normed,
-                        eps, batch, hidden_dim,
+                        &self.device,
+                        &st.kernels,
+                        &pf.attn_proj,
+                        &lw.ffn_norm,
+                        &mut pf.normed,
+                        eps,
+                        batch,
+                        hidden_dim,
                     )?;
                     super::prefill::launch_gemm_projection(
-                        &self.device, &st.kernels, &lw.w_gate, None,
-                        &pf.normed, &mut pf.gate,
-                        &mut pf.dequant_f32, &mut pf.activation_f16,
+                        &self.device,
+                        &st.kernels,
+                        &lw.w_gate,
+                        None,
+                        &pf.normed,
+                        &mut pf.gate,
+                        &mut pf.dequant_f32,
+                        &mut pf.activation_f16,
                         &mut pf.dequant_f16,
-                        batch, inter_dim, hidden_dim, "gate",
+                        batch,
+                        inter_dim,
+                        hidden_dim,
+                        "gate",
                     )?;
                     super::prefill::launch_gemm_projection(
-                        &self.device, &st.kernels, &lw.w_up, None,
-                        &pf.normed, &mut pf.up,
-                        &mut pf.dequant_f32, &mut pf.activation_f16,
+                        &self.device,
+                        &st.kernels,
+                        &lw.w_up,
+                        None,
+                        &pf.normed,
+                        &mut pf.up,
+                        &mut pf.dequant_f32,
+                        &mut pf.activation_f16,
                         &mut pf.dequant_f16,
-                        batch, inter_dim, hidden_dim, "up",
+                        batch,
+                        inter_dim,
+                        hidden_dim,
+                        "up",
                     )?;
                 }
 
                 // 2h. Batched SwiGLU (standard path, no F16 fusion).
                 unsafe {
                     super::prefill::launch_swiglu_batched(
-                        &self.device, &st.kernels,
-                        &mut pf.gate, &pf.up, batch, inter_dim,
+                        &self.device,
+                        &st.kernels,
+                        &mut pf.gate,
+                        &pf.up,
+                        batch,
+                        inter_dim,
                     )?;
                 }
 
                 // 2i. Batched down projection via GEMM (no F16 caches).
                 unsafe {
                     super::prefill::launch_gemm_projection(
-                        &self.device, &st.kernels, &lw.w_down, None,
-                        &pf.gate, &mut pf.down,
-                        &mut pf.dequant_f32, &mut pf.activation_f16,
+                        &self.device,
+                        &st.kernels,
+                        &lw.w_down,
+                        None,
+                        &pf.gate,
+                        &mut pf.down,
+                        &mut pf.dequant_f32,
+                        &mut pf.activation_f16,
                         &mut pf.dequant_f16,
-                        batch, hidden_dim, inter_dim, "down",
+                        batch,
+                        hidden_dim,
+                        inter_dim,
+                        "down",
                     )?;
                 }
 
@@ -17012,8 +20137,12 @@ impl ComputeBackend for CudaBackend {
                 // Write result directly to pf.x (eliminates the separate memcpy_dtod).
                 unsafe {
                     super::prefill::launch_residual_add_batched(
-                        &self.device, &st.kernels,
-                        &mut pf.attn_proj, &pf.down, batch, hidden_dim,
+                        &self.device,
+                        &st.kernels,
+                        &mut pf.attn_proj,
+                        &pf.down,
+                        batch,
+                        hidden_dim,
                     )?;
                 }
                 self.device
@@ -17051,9 +20180,12 @@ impl ComputeBackend for CudaBackend {
         // Step 3: Extract last token's hidden state into decode scratch.
         unsafe {
             super::prefill::launch_extract_row(
-                &self.device, &st.kernels,
-                &pf.x, &mut st.scratch.x_gpu,
-                batch - 1, hidden_dim,
+                &self.device,
+                &st.kernels,
+                &pf.x,
+                &mut st.scratch.x_gpu,
+                batch - 1,
+                hidden_dim,
             )?;
         }
 
@@ -17069,10 +20201,7 @@ impl ComputeBackend for CudaBackend {
         Ok(result)
     }
 
-    fn preload_weights(
-        &mut self,
-        weights: &dyn WeightProvider,
-    ) -> Result<(), RuntimeError> {
+    fn preload_weights(&mut self, weights: &dyn WeightProvider) -> Result<(), RuntimeError> {
         let hp = self.hp()?;
         let num_layers = hp.num_layers as usize;
 
@@ -17133,9 +20262,7 @@ impl ComputeBackend for CudaBackend {
             // Runs AFTER upload so the GPU blob exists; reads the raw Q8_0 down
             // blocks via the `moe_repack_down_q8_0` kernel into aligned d_q/d_s.
             // Leaves the original blob byte-untouched.
-            if super::moe::moe_repack_needed()
-                && layer_idx < st.moe_meta_cache.len()
-            {
+            if super::moe::moe_repack_needed() && layer_idx < st.moe_meta_cache.len() {
                 if let Some(meta_ref) = st.moe_meta_cache[layer_idx].as_ref() {
                     let num_experts = meta_ref.expert_down_offs.len();
                     let hidden_dim = hp_copy.hidden_dim as usize;
@@ -17211,9 +20338,7 @@ impl ComputeBackend for CudaBackend {
                 &hp_copy,
             )
             .map_err(|e| {
-                RuntimeError::Compute(format!(
-                    "F16 pre-dequant layer {layer_idx}: {e}",
-                ))
+                RuntimeError::Compute(format!("F16 pre-dequant layer {layer_idx}: {e}",))
             })?;
         }
         let mem_after_f16_cache = self.device.free_memory().unwrap_or(0);
@@ -17251,29 +20376,21 @@ impl ComputeBackend for CudaBackend {
                 }
                 if let Some(GpuWeightBuf::Q8Raw(q8)) = layer.ssm_alpha.as_ref() {
                     let n = q8_elems(q8);
-                    let f16 = dequant_q8_to_f16_gpu(
-                        &self.device,
-                        &st.kernels.dequant_q8_0_to_f16,
-                        q8,
-                        n,
-                    )
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("GDN_AB_F16 ssm_alpha dequant: {e}"))
-                    })?;
+                    let f16 =
+                        dequant_q8_to_f16_gpu(&self.device, &st.kernels.dequant_q8_0_to_f16, q8, n)
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!("GDN_AB_F16 ssm_alpha dequant: {e}"))
+                            })?;
                     layer.ssm_alpha_f16 = Some(f16);
                     n_cached += 1;
                 }
                 if let Some(GpuWeightBuf::Q8Raw(q8)) = layer.ssm_beta.as_ref() {
                     let n = q8_elems(q8);
-                    let f16 = dequant_q8_to_f16_gpu(
-                        &self.device,
-                        &st.kernels.dequant_q8_0_to_f16,
-                        q8,
-                        n,
-                    )
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("GDN_AB_F16 ssm_beta dequant: {e}"))
-                    })?;
+                    let f16 =
+                        dequant_q8_to_f16_gpu(&self.device, &st.kernels.dequant_q8_0_to_f16, q8, n)
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!("GDN_AB_F16 ssm_beta dequant: {e}"))
+                            })?;
                     layer.ssm_beta_f16 = Some(f16);
                     n_cached += 1;
                 }
@@ -17317,7 +20434,10 @@ impl ComputeBackend for CudaBackend {
                 let mem_before_q8_split = self.device.free_memory().unwrap_or(0);
                 let (n_layers_split, oom_layer, oom_count, total_jobs) = unsafe {
                     repack_all_layers_q8_clone_to_split(
-                        &self.device, split_repack_fn, &mut cache, &hp_copy,
+                        &self.device,
+                        split_repack_fn,
+                        &mut cache,
+                        &hp_copy,
                     )
                 };
                 let mem_after_q8_split = self.device.free_memory().unwrap_or(0);
@@ -17333,9 +20453,12 @@ impl ComputeBackend for CudaBackend {
                 // skip the aligned repack below to save the ~12% memory cost
                 // (36-byte aligned vs 34-byte raw).
                 for (idx, lw) in cache.iter().enumerate() {
-                    if lw.q8_split_wq.is_some() || lw.q8_split_wk.is_some()
-                        || lw.q8_split_wv.is_some() || lw.q8_split_wo.is_some()
-                        || lw.q8_split_w_gate.is_some() || lw.q8_split_w_up.is_some()
+                    if lw.q8_split_wq.is_some()
+                        || lw.q8_split_wk.is_some()
+                        || lw.q8_split_wv.is_some()
+                        || lw.q8_split_wo.is_some()
+                        || lw.q8_split_w_gate.is_some()
+                        || lw.q8_split_w_up.is_some()
                         || lw.q8_split_w_down.is_some()
                     {
                         layers_with_q8_split.insert(idx);
@@ -17366,7 +20489,11 @@ impl ComputeBackend for CudaBackend {
                 let hidden = hp_copy.hidden_dim as usize;
                 match unsafe {
                     repack_q8_raw_to_split(
-                        &self.device, split_repack_fn, proj_q8, vocab_size, hidden,
+                        &self.device,
+                        split_repack_fn,
+                        proj_q8,
+                        vocab_size,
+                        hidden,
                     )
                 } {
                     Ok(split_buf) => {
@@ -17451,7 +20578,9 @@ impl ComputeBackend for CudaBackend {
         // the Q8Aligned path (which the aligned repack pre-stages).
         let _ = &layers_with_q8_split; // tracked for diagnostic logs; no longer gates aligned skip
         if let Some(ref repack_fn) = st.kernels.repack_q8_0_to_aligned36 {
-            if st.kernels.matvec_q8_0_aligned.is_some() || st.kernels.matvec_q8_aligned_q8_1.is_some() {
+            if st.kernels.matvec_q8_0_aligned.is_some()
+                || st.kernels.matvec_q8_aligned_q8_1.is_some()
+            {
                 for (layer_idx, layer) in cache.iter_mut().enumerate() {
                     super::gpu_buffers::repack_layer_q8_to_aligned(
                         &self.device,
@@ -17461,9 +20590,9 @@ impl ComputeBackend for CudaBackend {
                         has_gdn,
                     )
                     .map_err(|e| {
-                        RuntimeError::Compute(format!(
-                            "Q8_0 aligned repack layer {layer_idx}: {e}",
-                        ))
+                        RuntimeError::Compute(
+                            format!("Q8_0 aligned repack layer {layer_idx}: {e}",),
+                        )
                     })?;
                 }
                 // Skip output_proj repack for GDN models (too large, OOM risk, negligible impact).
@@ -17473,7 +20602,10 @@ impl ComputeBackend for CudaBackend {
                         let hidden = hp_copy.hidden_dim as usize;
                         let num_elements = vocab_size * hidden;
                         match super::gpu_buffers::repack_q8_to_aligned(
-                            &self.device, repack_fn, proj_q8, num_elements,
+                            &self.device,
+                            repack_fn,
+                            proj_q8,
+                            num_elements,
                         ) {
                             Ok(aligned) => {
                                 st.globals.output_proj_q8_aligned = Some(aligned);
@@ -17500,7 +20632,10 @@ impl ComputeBackend for CudaBackend {
                 let mem_before_q4_split = self.device.free_memory().unwrap_or(0);
                 let (n_layers_split, oom_layer, oom_count, total_jobs) = unsafe {
                     repack_all_layers_q4_clone_to_split(
-                        &self.device, split_repack_fn, &mut cache, &hp_copy,
+                        &self.device,
+                        split_repack_fn,
+                        &mut cache,
+                        &hp_copy,
                     )
                 };
                 let mem_after_q4_split = self.device.free_memory().unwrap_or(0);
@@ -17513,9 +20648,12 @@ impl ComputeBackend for CudaBackend {
                     oom_layer,
                 );
                 for (idx, lw) in cache.iter().enumerate() {
-                    if lw.q4_split_wq.is_some() || lw.q4_split_wk.is_some()
-                        || lw.q4_split_wv.is_some() || lw.q4_split_wo.is_some()
-                        || lw.q4_split_w_gate.is_some() || lw.q4_split_w_up.is_some()
+                    if lw.q4_split_wq.is_some()
+                        || lw.q4_split_wk.is_some()
+                        || lw.q4_split_wv.is_some()
+                        || lw.q4_split_wo.is_some()
+                        || lw.q4_split_w_gate.is_some()
+                        || lw.q4_split_w_up.is_some()
                         || lw.q4_split_w_down.is_some()
                     {
                         layers_with_q4_split.insert(idx);
@@ -17541,7 +20679,10 @@ impl ComputeBackend for CudaBackend {
                 let mem_before_gdn_split = self.device.free_memory().unwrap_or(0);
                 let (n_layers_split, total_jobs) = unsafe {
                     repack_all_layers_gdn_q4_clone_to_split(
-                        &self.device, split_repack_fn, &mut cache, &hp_copy,
+                        &self.device,
+                        split_repack_fn,
+                        &mut cache,
+                        &hp_copy,
                     )
                 };
                 let mem_after_gdn_split = self.device.free_memory().unwrap_or(0);
@@ -17559,9 +20700,7 @@ impl ComputeBackend for CudaBackend {
                 );
             }
         } else if st.use_gdn_split && !has_gdn {
-            eprintln!(
-                "[CUDA] LUMEN_CUDA_GDN_SPLIT=1 set but model has no GDN layers; ignored"
-            );
+            eprintln!("[CUDA] LUMEN_CUDA_GDN_SPLIT=1 set but model has no GDN layers; ignored");
         }
 
         // tile-layout integration: Q8 tile-grouped clone pass.
@@ -17578,7 +20717,10 @@ impl ComputeBackend for CudaBackend {
                 let mem_before_q8_tile = self.device.free_memory().unwrap_or(0);
                 let (n_layers_tile, oom_layer, oom_count, total_jobs) = unsafe {
                     repack_all_layers_q8_clone_to_tile(
-                        &self.device, tile_repack_fn, &mut cache, &hp_copy,
+                        &self.device,
+                        tile_repack_fn,
+                        &mut cache,
+                        &hp_copy,
                     )
                 };
                 let mem_after_q8_tile = self.device.free_memory().unwrap_or(0);
@@ -17616,9 +20758,9 @@ impl ComputeBackend for CudaBackend {
                         has_gdn,
                     )
                     .map_err(|e| {
-                        RuntimeError::Compute(format!(
-                            "Q4_0 aligned repack layer {layer_idx}: {e}",
-                        ))
+                        RuntimeError::Compute(
+                            format!("Q4_0 aligned repack layer {layer_idx}: {e}",),
+                        )
                     })?;
                 }
                 // Skip output_proj repack for GDN models (too large, OOM risk, negligible impact).
@@ -17628,7 +20770,10 @@ impl ComputeBackend for CudaBackend {
                         let hidden = hp_copy.hidden_dim as usize;
                         let num_elements = vocab_size * hidden;
                         match super::gpu_buffers::repack_q4_to_aligned(
-                            &self.device, repack_fn, proj_q4, num_elements,
+                            &self.device,
+                            repack_fn,
+                            proj_q4,
+                            num_elements,
                         ) {
                             Ok(aligned) => {
                                 st.globals.output_proj_q4_aligned = Some(aligned);
@@ -17655,7 +20800,10 @@ impl ComputeBackend for CudaBackend {
                 let mem_before_q4_tile = self.device.free_memory().unwrap_or(0);
                 let (n_layers_tile, oom_layer, oom_count, total_jobs) = unsafe {
                     repack_all_layers_q4_clone_to_tile(
-                        &self.device, tile_repack_fn, &mut cache, &hp_copy,
+                        &self.device,
+                        tile_repack_fn,
+                        &mut cache,
+                        &hp_copy,
                     )
                 };
                 let mem_after_q4_tile = self.device.free_memory().unwrap_or(0);
@@ -17682,7 +20830,9 @@ impl ComputeBackend for CudaBackend {
             let q_gate_dim = q_dim * 2;
             st.scratch.q_gate = Some(self.device.alloc_zeros(q_gate_dim)?);
             st.scratch.gate_buf = Some(self.device.alloc_zeros(q_dim)?);
-            eprintln!("[CUDA] Q+gate fusion scratch: q_gate={q_gate_dim}, gate_buf={q_dim} elements");
+            eprintln!(
+                "[CUDA] Q+gate fusion scratch: q_gate={q_gate_dim}, gate_buf={q_dim} elements"
+            );
         }
 
         // GDN layers are now graph-capturable
@@ -17700,7 +20850,10 @@ impl ComputeBackend for CudaBackend {
         st.has_moe_layers = has_moe;
         if has_gdn {
             // default ON.
-            let lc_active = match std::env::var("LUMEN_CUDA_GDN_REGISTER_RESIDENT").ok().as_deref() {
+            let lc_active = match std::env::var("LUMEN_CUDA_GDN_REGISTER_RESIDENT")
+                .ok()
+                .as_deref()
+            {
                 Some(v) => matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"),
                 None => crate::runtime_defaults::gdn_register_resident_default(),
             };
@@ -17751,10 +20904,10 @@ impl ComputeBackend for CudaBackend {
         // Benchmarks all 16 tensor-core algorithms + DEFAULT for each unique
         // (M=out_dim, K=in_dim) shape used during F16 decode. Caches the
         // fastest per shape. Only runs if any F16 weights are present.
-        let has_f16 = st.layer_weights_cache.iter().any(|lw| {
-            matches!(&lw.wq, GpuWeightBuf::F16Raw(_))
-                || lw.wq_f16.is_some()
-        });
+        let has_f16 = st
+            .layer_weights_cache
+            .iter()
+            .any(|lw| matches!(&lw.wq, GpuWeightBuf::F16Raw(_)) || lw.wq_f16.is_some());
         if has_f16 {
             let q_dim = hp_copy.num_heads as usize * hp_copy.head_dim as usize;
             let kv_dim = hp_copy.num_kv_heads as usize * hp_copy.head_dim as usize;
@@ -17766,14 +20919,18 @@ impl ComputeBackend for CudaBackend {
             // (~600+ MB for 150K vocab), and output projection is called only once
             // per token so the algorithm choice has negligible impact on throughput.
             let mut shapes: Vec<(usize, usize)> = vec![
-                (q_dim, hidden_dim),      // wq projection (x36 layers)
-                (kv_dim, hidden_dim),      // wk, wv projections (x36 layers)
-                (hidden_dim, q_dim),       // wo output projection (x36 layers)
-                (inter_dim, hidden_dim),   // gate, up projections (x36 layers)
-                (hidden_dim, inter_dim),   // down projection (x36 layers)
+                (q_dim, hidden_dim),     // wq projection (x36 layers)
+                (kv_dim, hidden_dim),    // wk, wv projections (x36 layers)
+                (hidden_dim, q_dim),     // wo output projection (x36 layers)
+                (inter_dim, hidden_dim), // gate, up projections (x36 layers)
+                (hidden_dim, inter_dim), // down projection (x36 layers)
             ];
             // Q+gate fusion: add (q_dim*2, hidden_dim) for fused Q+gate projection.
-            if st.layer_weights_cache.iter().any(|lw| lw.attn_q_norm.is_some()) {
+            if st
+                .layer_weights_cache
+                .iter()
+                .any(|lw| lw.attn_q_norm.is_some())
+            {
                 shapes.push((q_dim * 2, hidden_dim));
             }
             shapes.sort();
@@ -17805,9 +20962,10 @@ impl ComputeBackend for CudaBackend {
         // hardcoded `CUBLAS_GEMM_DEFAULT_TENSOR_OP` left this entire surface
         // un-optimized. Expected to close the 7 tok/s gap to the 0.9× llama.cpp
         // gate (66.0 -> 73.0 tok/s = +10.6%).
-        let has_bf16 = st.layer_weights_cache.iter().any(|lw| {
-            matches!(&lw.wq, GpuWeightBuf::Bf16Raw(_))
-        });
+        let has_bf16 = st
+            .layer_weights_cache
+            .iter()
+            .any(|lw| matches!(&lw.wq, GpuWeightBuf::Bf16Raw(_)));
         if has_bf16 && bf16_autotune_enabled() {
             let q_dim = hp_copy.num_heads as usize * hp_copy.head_dim as usize;
             let kv_dim = hp_copy.num_kv_heads as usize * hp_copy.head_dim as usize;
@@ -17822,14 +20980,18 @@ impl ComputeBackend for CudaBackend {
             // in `autotune_cublas_algos_bf16` keeps the temporary alloc at
             // ~32 MB max even for 248320 vocab.
             let mut shapes: Vec<(usize, usize)> = vec![
-                (q_dim, hidden_dim),       // wq projection
-                (kv_dim, hidden_dim),      // wk, wv projections
-                (hidden_dim, q_dim),       // wo output projection
-                (inter_dim, hidden_dim),   // gate, up projections
-                (hidden_dim, inter_dim),   // down projection
-                (vocab_size, hidden_dim),  // final output_proj (vocab head)
+                (q_dim, hidden_dim),      // wq projection
+                (kv_dim, hidden_dim),     // wk, wv projections
+                (hidden_dim, q_dim),      // wo output projection
+                (inter_dim, hidden_dim),  // gate, up projections
+                (hidden_dim, inter_dim),  // down projection
+                (vocab_size, hidden_dim), // final output_proj (vocab head)
             ];
-            if st.layer_weights_cache.iter().any(|lw| lw.attn_q_norm.is_some()) {
+            if st
+                .layer_weights_cache
+                .iter()
+                .any(|lw| lw.attn_q_norm.is_some())
+            {
                 shapes.push((q_dim * 2, hidden_dim));
             }
             shapes.sort();
@@ -17870,9 +21032,9 @@ impl ComputeBackend for CudaBackend {
         let seq_pos = kv.seq_len();
 
         let mut state_guard = self.state.lock().unwrap();
-        let st = state_guard.as_mut().ok_or_else(|| {
-            RuntimeError::Compute("CUDA backend not initialized".into())
-        })?;
+        let st = state_guard
+            .as_mut()
+            .ok_or_else(|| RuntimeError::Compute("CUDA backend not initialized".into()))?;
 
         // Require GPU-resident weights for the zero-sync decode path.
         if st.layer_weights_cache.len() < num_layers {
@@ -17945,10 +21107,8 @@ impl ComputeBackend for CudaBackend {
             super::decode::decode_tiled_force_enabled(),
             super::decode::decode_tiled_threshold(),
         );
-        let graph_eager_fallback_for_tiled = matches!(
-            decode_variant,
-            super::decode::AttentionDecodeVariant::Tiled
-        );
+        let graph_eager_fallback_for_tiled =
+            matches!(decode_variant, super::decode::AttentionDecodeVariant::Tiled);
 
         // GDN layers are now graph-capturable
         // when the device-resident conv_position infrastructure is wired up:
@@ -17970,7 +21130,10 @@ impl ComputeBackend for CudaBackend {
         // the conv_positions_gpu within. The graph path's
         // `run_graph_pipeline` calls ensure_gdn_scratch itself.
         // default ON (matches init-site resolver).
-        let register_resident_active = match std::env::var("LUMEN_CUDA_GDN_REGISTER_RESIDENT").ok().as_deref() {
+        let register_resident_active = match std::env::var("LUMEN_CUDA_GDN_REGISTER_RESIDENT")
+            .ok()
+            .as_deref()
+        {
             Some(v) => matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"),
             None => crate::runtime_defaults::gdn_register_resident_default(),
         };
@@ -17983,7 +21146,9 @@ impl ComputeBackend for CudaBackend {
         // loop becomes graph-capturable while preserving byte-identical
         // math vs the eager two-launch host-scalar kernel.
         let decode_graph_opt_in = cuda_decode_graph_enabled();
-        let conv_positions_gpu_ready = st.gdn_scratch_gpu.as_ref()
+        let conv_positions_gpu_ready = st
+            .gdn_scratch_gpu
+            .as_ref()
             .map(|g| g.conv_positions_gpu.is_some())
             .unwrap_or(false);
         let lc_graph_ready = register_resident_active
@@ -18019,7 +21184,9 @@ impl ComputeBackend for CudaBackend {
         // the legacy OFF.
         let allow_tiled_graph = cuda_decode_graph_tiled_enabled();
         let tiled_graph_ready = allow_tiled_graph
-            && st.graph_kernels.as_ref()
+            && st
+                .graph_kernels
+                .as_ref()
                 .map(|gk| gk.attention_decode_tiled.is_some())
                 .unwrap_or(false);
         // MoE decode graph gate. When the model has MoE layers AND
@@ -18048,14 +21215,34 @@ impl ComputeBackend for CudaBackend {
         if graph_diagnostic && st.decode_token_count == 0 {
             eprintln!("[GRAPH-DIAG] === CUDA Graph Diagnostic Mode Enabled ===");
             eprintln!("[GRAPH-DIAG] Prerequisites:");
-            eprintln!("[GRAPH-DIAG]   graph_kernels:    {}", st.graph_kernels.is_some());
-            eprintln!("[GRAPH-DIAG]   graph_params:     {}", st.graph_params.is_some());
-            eprintln!("[GRAPH-DIAG]   cublas_workspace: {}", st.cublas_workspace.is_some());
-            eprintln!("[GRAPH-DIAG]   precomputed_ptrs: {}", st.precomputed_ptrs.is_some());
+            eprintln!(
+                "[GRAPH-DIAG]   graph_kernels:    {}",
+                st.graph_kernels.is_some()
+            );
+            eprintln!(
+                "[GRAPH-DIAG]   graph_params:     {}",
+                st.graph_params.is_some()
+            );
+            eprintln!(
+                "[GRAPH-DIAG]   cublas_workspace: {}",
+                st.cublas_workspace.is_some()
+            );
+            eprintln!(
+                "[GRAPH-DIAG]   precomputed_ptrs: {}",
+                st.precomputed_ptrs.is_some()
+            );
             eprintln!("[GRAPH-DIAG]   has_gdn_layers:   {}", st.has_gdn_layers);
-            eprintln!("[GRAPH-DIAG]   has_qgate_layers: {}  (was blocker; ports qgate fusion into graph)", st.has_qgate_layers);
-            eprintln!("[GRAPH-DIAG]   has_moe_layers:   {}  (MoE-aware graph dispatch)", st.has_moe_layers);
-            eprintln!("[GRAPH-DIAG]   allow_moe_graph:  {allow_moe_graph}  (LUMEN_CUDA_MOE_DECODE_GRAPH)");
+            eprintln!(
+                "[GRAPH-DIAG]   has_qgate_layers: {}  (was blocker; ports qgate fusion into graph)",
+                st.has_qgate_layers
+            );
+            eprintln!(
+                "[GRAPH-DIAG]   has_moe_layers:   {}  (MoE-aware graph dispatch)",
+                st.has_moe_layers
+            );
+            eprintln!(
+                "[GRAPH-DIAG]   allow_moe_graph:  {allow_moe_graph}  (LUMEN_CUDA_MOE_DECODE_GRAPH)"
+            );
             eprintln!("[GRAPH-DIAG]   allow_qgate_graph: {allow_qgate_graph}  (LUMEN_CUDA_DECODE_GRAPH_QGATE)");
             eprintln!("[GRAPH-DIAG]   allow_tiled_graph: {allow_tiled_graph}  (LUMEN_CUDA_DECODE_GRAPH_TILED)");
             eprintln!("[GRAPH-DIAG]   tiled_graph_ready: {tiled_graph_ready}  (attention_decode_tiled_graph)");
@@ -18095,22 +21282,33 @@ impl ComputeBackend for CudaBackend {
             let diag = graph_diagnostic;
 
             // Check if we have a valid captured graph.
-            let have_valid_graph = st.captured_graph.as_ref()
+            let have_valid_graph = st
+                .captured_graph
+                .as_ref()
                 .map(|g| g.is_valid_for(num_layers, max_seq_len))
                 .unwrap_or(false);
 
             if have_valid_graph {
                 // --- GRAPH REPLAY PATH ---
                 if diag {
-                    eprintln!("[GRAPH-DIAG] === Graph REPLAY (token #{}, seq_pos={seq_pos}) ===",
-                        st.decode_token_count);
+                    eprintln!(
+                        "[GRAPH-DIAG] === Graph REPLAY (token #{}, seq_pos={seq_pos}) ===",
+                        st.decode_token_count
+                    );
                 }
 
                 // Update per-token scalars in device memory (3 x 4-byte htod).
                 match st.graph_params.as_mut().unwrap().update(
-                    &self.device, token_id, seq_pos as u32, attn_seq_len,
+                    &self.device,
+                    token_id,
+                    seq_pos as u32,
+                    attn_seq_len,
                 ) {
-                    Ok(()) => { if diag { eprintln!("[GRAPH-DIAG]   params update: OK"); } },
+                    Ok(()) => {
+                        if diag {
+                            eprintln!("[GRAPH-DIAG]   params update: OK");
+                        }
+                    }
                     Err(e) => {
                         eprintln!("[GRAPH-DIAG]   params update: FAILED: {e}");
                         return Err(e);
@@ -18138,7 +21336,11 @@ impl ComputeBackend for CudaBackend {
 
                 // Replay the captured graph (single API call, all kernels execute).
                 match st.captured_graph.as_ref().unwrap().launch() {
-                    Ok(()) => { if diag { eprintln!("[GRAPH-DIAG]   graph launch: OK"); } },
+                    Ok(()) => {
+                        if diag {
+                            eprintln!("[GRAPH-DIAG]   graph launch: OK");
+                        }
+                    }
                     Err(e) => {
                         eprintln!("[GRAPH-DIAG]   graph launch: FAILED: {e}");
                         eprintln!("[CUDA] Graph replay failed: {e} -- disabling graph capture for this session");
@@ -18157,7 +21359,8 @@ impl ComputeBackend for CudaBackend {
                             eprintln!("[GRAPH-DIAG]   This is the actual error -- graph kernels ran but produced an async fault.");
                             st.captured_graph = None;
                             st.decode_token_count = 0;
-                            return self.decode_token_normal(token_id, seq_pos, num_layers, hp, st, kv);
+                            return self
+                                .decode_token_normal(token_id, seq_pos, num_layers, hp, st, kv);
                         }
                     }
                 }
@@ -18185,16 +21388,25 @@ impl ComputeBackend for CudaBackend {
             } else {
                 // --- GRAPH CAPTURE PATH ---
                 if diag {
-                    eprintln!("[GRAPH-DIAG] === Graph CAPTURE (token #{}, seq_pos={seq_pos}) ===",
-                        st.decode_token_count);
+                    eprintln!(
+                        "[GRAPH-DIAG] === Graph CAPTURE (token #{}, seq_pos={seq_pos}) ===",
+                        st.decode_token_count
+                    );
                 }
 
                 // Update per-token scalars before capture (the graph will read
                 // from these fixed device pointers).
                 match st.graph_params.as_mut().unwrap().update(
-                    &self.device, token_id, seq_pos as u32, attn_seq_len,
+                    &self.device,
+                    token_id,
+                    seq_pos as u32,
+                    attn_seq_len,
                 ) {
-                    Ok(()) => { if diag { eprintln!("[GRAPH-DIAG]   params update: OK (token_id={token_id}, pos={seq_pos}, attn_seq_len={attn_seq_len})"); } },
+                    Ok(()) => {
+                        if diag {
+                            eprintln!("[GRAPH-DIAG]   params update: OK (token_id={token_id}, pos={seq_pos}, attn_seq_len={attn_seq_len})");
+                        }
+                    }
                     Err(e) => {
                         eprintln!("[GRAPH-DIAG]   params update: FAILED: {e}");
                         return Err(e);
@@ -18207,7 +21419,11 @@ impl ComputeBackend for CudaBackend {
                 // allocation, our single stream is self-consistent, but a device
                 // sync provides a clean capture boundary.
                 match cudarc::driver::result::ctx::synchronize() {
-                    Ok(()) => { if diag { eprintln!("[GRAPH-DIAG]   pre-capture device sync: OK"); } },
+                    Ok(()) => {
+                        if diag {
+                            eprintln!("[GRAPH-DIAG]   pre-capture device sync: OK");
+                        }
+                    }
                     Err(e) => {
                         let err = RuntimeError::Compute(format!("device sync failed: {e:?}"));
                         eprintln!("[GRAPH-DIAG]   pre-capture device sync: FAILED: {err}");
@@ -18241,7 +21457,11 @@ impl ComputeBackend for CudaBackend {
                 // Begin stream capture -- all subsequent kernel launches on this
                 // stream are recorded (not executed) into the graph.
                 match super::graph::begin_capture(&self.device.stream) {
-                    Ok(()) => { if diag { eprintln!("[GRAPH-DIAG]   begin_capture: OK"); } },
+                    Ok(()) => {
+                        if diag {
+                            eprintln!("[GRAPH-DIAG]   begin_capture: OK");
+                        }
+                    }
                     Err(e) => {
                         eprintln!("[GRAPH-DIAG]   begin_capture: FAILED: {e}");
                         st.decode_token_count = 0;
@@ -18260,7 +21480,11 @@ impl ComputeBackend for CudaBackend {
                     eprintln!("[GRAPH-DIAG]   running graph pipeline ({num_layers} layers)...");
                 }
                 match self.run_graph_pipeline(st) {
-                    Ok(()) => { if diag { eprintln!("[GRAPH-DIAG]   graph pipeline: OK"); } },
+                    Ok(()) => {
+                        if diag {
+                            eprintln!("[GRAPH-DIAG]   graph pipeline: OK");
+                        }
+                    }
                     Err(e) => {
                         // Capture failed -- end capture to restore the stream
                         // to non-capturing state, then fall through to normal path.
@@ -18269,13 +21493,25 @@ impl ComputeBackend for CudaBackend {
                         // Check stream capture status after failure
                         if diag {
                             let status = super::graph::query_capture_status(&self.device.stream);
-                            eprintln!("[GRAPH-DIAG]   stream status after pipeline failure: {status}");
+                            eprintln!(
+                                "[GRAPH-DIAG]   stream status after pipeline failure: {status}"
+                            );
                         }
 
                         // Try to end capture to clean up.
-                        match super::graph::end_capture(&self.device.stream, num_layers, max_seq_len) {
-                            Ok(_) => { if diag { eprintln!("[GRAPH-DIAG]   cleanup end_capture: OK"); } },
-                            Err(e2) => { eprintln!("[GRAPH-DIAG]   cleanup end_capture: FAILED: {e2}"); },
+                        match super::graph::end_capture(
+                            &self.device.stream,
+                            num_layers,
+                            max_seq_len,
+                        ) {
+                            Ok(_) => {
+                                if diag {
+                                    eprintln!("[GRAPH-DIAG]   cleanup end_capture: OK");
+                                }
+                            }
+                            Err(e2) => {
+                                eprintln!("[GRAPH-DIAG]   cleanup end_capture: FAILED: {e2}");
+                            }
                         }
 
                         st.decode_token_count = 0;
@@ -18290,9 +21526,7 @@ impl ComputeBackend for CudaBackend {
                 }
 
                 // End capture -- instantiate the graph for future replay.
-                match super::graph::end_capture(
-                    &self.device.stream, num_layers, max_seq_len,
-                ) {
+                match super::graph::end_capture(&self.device.stream, num_layers, max_seq_len) {
                     Ok(Some(graph)) => {
                         if diag {
                             eprintln!("[GRAPH-DIAG]   end_capture: OK (graph instantiated, {num_layers} layers)");
@@ -18305,12 +21539,18 @@ impl ComputeBackend for CudaBackend {
                             eprintln!("[GRAPH-DIAG]   launching freshly captured graph...");
                         }
                         match st.captured_graph.as_ref().unwrap().launch() {
-                            Ok(()) => { if diag { eprintln!("[GRAPH-DIAG]   first graph launch: OK"); } },
+                            Ok(()) => {
+                                if diag {
+                                    eprintln!("[GRAPH-DIAG]   first graph launch: OK");
+                                }
+                            }
                             Err(e) => {
                                 eprintln!("[GRAPH-DIAG]   first graph launch: FAILED: {e}");
                                 st.captured_graph = None;
                                 st.decode_token_count = 0;
-                                return self.decode_token_normal(token_id, seq_pos, num_layers, hp, st, kv);
+                                return self.decode_token_normal(
+                                    token_id, seq_pos, num_layers, hp, st, kv,
+                                );
                             }
                         }
 
@@ -18323,7 +21563,9 @@ impl ComputeBackend for CudaBackend {
                                     eprintln!("[GRAPH-DIAG]   ASYNC ERROR: Graph launched OK but kernels faulted during execution.");
                                     st.captured_graph = None;
                                     st.decode_token_count = 0;
-                                    return self.decode_token_normal(token_id, seq_pos, num_layers, hp, st, kv);
+                                    return self.decode_token_normal(
+                                        token_id, seq_pos, num_layers, hp, st, kv,
+                                    );
                                 }
                             }
                         }
@@ -18383,7 +21625,9 @@ impl ComputeBackend for CudaBackend {
                     self.device
                         .stream
                         .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
-                        .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}"))
+                        })?;
                 }
             }
 
@@ -18441,20 +21685,26 @@ impl ComputeBackend for CudaBackend {
         } {
             let sumsq = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
             let logits_sumsq = sumsq(&logits_host);
-            let id_a = std::env::var("LUMEN_LOGIT_DUMP_A").ok()
-                .and_then(|s| s.parse::<usize>().ok()).unwrap_or(1633);
-            let id_b = std::env::var("LUMEN_LOGIT_DUMP_B").ok()
-                .and_then(|s| s.parse::<usize>().ok()).unwrap_or(1083);
+            let id_a = std::env::var("LUMEN_LOGIT_DUMP_A")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1633);
+            let id_b = std::env::var("LUMEN_LOGIT_DUMP_B")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1083);
             let la = logits_host.get(id_a).copied().unwrap_or(f32::NAN);
             let lb = logits_host.get(id_b).copied().unwrap_or(f32::NAN);
             let mut idx: Vec<usize> = (0..logits_host.len()).collect();
             idx.sort_unstable_by(|&i, &j| logits_host[j].total_cmp(&logits_host[i]));
-            let topk: Vec<(usize, f32)> = idx.iter().take(8).map(|&i| (i, logits_host[i])).collect();
+            let topk: Vec<(usize, f32)> =
+                idx.iter().take(8).map(|&i| (i, logits_host[i])).collect();
             eprintln!(
                 "[LOGITDUMP] mode=D step={} logits_sumsq={logits_sumsq:.6} \
                  id_a={id_a} logit_a={la:.6} id_b={id_b} logit_b={lb:.6} \
                  margin_a_minus_b={:.6} top8={topk:?}",
-                st.decode_token_count, (la as f64) - (lb as f64)
+                st.decode_token_count,
+                (la as f64) - (lb as f64)
             );
         }
 
@@ -18464,7 +21714,6 @@ impl ComputeBackend for CudaBackend {
 
         Ok(Logits { data: logits_host })
     }
-
 }
 
 /// Create an ActivationBuffer from an f32 slice.
@@ -18512,8 +21761,14 @@ mod tests {
             moe: false,
             gpu_argmax: true,
         };
-        assert!(caps.gpu_resident, "CUDA backend must advertise gpu_resident=true");
-        assert!(caps.batched_prefill, "CUDA backend must advertise batched_prefill=true");
+        assert!(
+            caps.gpu_resident,
+            "CUDA backend must advertise gpu_resident=true"
+        );
+        assert!(
+            caps.batched_prefill,
+            "CUDA backend must advertise batched_prefill=true"
+        );
     }
 
     /// caps must advertise `moe: true` when the model has MoE layers.
@@ -18649,8 +21904,7 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             Self {
                 available: BF16_GEMMEX_AVAILABLE.load(Ordering::Relaxed),
-                runtime_fallback_armed: BF16_GEMMEX_FALLBACK_ARMED
-                    .load(Ordering::Relaxed),
+                runtime_fallback_armed: BF16_GEMMEX_FALLBACK_ARMED.load(Ordering::Relaxed),
                 _lock: lock,
             }
         }
@@ -18659,8 +21913,7 @@ mod tests {
     impl Drop for Bf16StatesnapshotGuard {
         fn drop(&mut self) {
             BF16_GEMMEX_AVAILABLE.store(self.available, Ordering::Relaxed);
-            BF16_GEMMEX_FALLBACK_ARMED
-                .store(self.runtime_fallback_armed, Ordering::Relaxed);
+            BF16_GEMMEX_FALLBACK_ARMED.store(self.runtime_fallback_armed, Ordering::Relaxed);
         }
     }
 

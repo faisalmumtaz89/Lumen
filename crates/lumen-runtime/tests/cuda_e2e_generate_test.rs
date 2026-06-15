@@ -121,8 +121,16 @@ fn cuda_e2e_f32_generate_matches_cpu() {
     let cpu_tokens = run_generate(&provider, &cpu, &prompt, max_tokens);
     let cuda_tokens = run_generate(&provider, &cuda, &prompt, max_tokens);
 
-    assert_eq!(cpu_tokens.len(), max_tokens, "CPU should generate {max_tokens} tokens");
-    assert_eq!(cuda_tokens.len(), max_tokens, "CUDA should generate {max_tokens} tokens");
+    assert_eq!(
+        cpu_tokens.len(),
+        max_tokens,
+        "CPU should generate {max_tokens} tokens"
+    );
+    assert_eq!(
+        cuda_tokens.len(),
+        max_tokens,
+        "CUDA should generate {max_tokens} tokens"
+    );
     assert_eq!(
         cpu_tokens, cuda_tokens,
         "CUDA must produce identical tokens to CPU (greedy, F32)\n\
@@ -193,8 +201,16 @@ fn cuda_e2e_f32_multi_token_stress() {
     let cpu_tokens = run_generate(&provider, &cpu, &prompt, max_tokens);
     let cuda_tokens = run_generate(&provider, &cuda, &prompt, max_tokens);
 
-    assert_eq!(cpu_tokens.len(), max_tokens, "CPU should generate {max_tokens} tokens");
-    assert_eq!(cuda_tokens.len(), max_tokens, "CUDA should generate {max_tokens} tokens");
+    assert_eq!(
+        cpu_tokens.len(),
+        max_tokens,
+        "CPU should generate {max_tokens} tokens"
+    );
+    assert_eq!(
+        cuda_tokens.len(),
+        max_tokens,
+        "CUDA should generate {max_tokens} tokens"
+    );
     assert_eq!(
         cpu_tokens, cuda_tokens,
         "CUDA must match CPU over 20 tokens (KV cache stress test)\n\
@@ -299,8 +315,7 @@ fn cuda_e2e_metrics_populated() {
 
     eprintln!(
         "cuda_e2e_metrics_populated: decode={:.1} tok/s, prefill={:.1} tok/s",
-        result.metrics.decode_tokens_per_sec,
-        result.metrics.prefill_tokens_per_sec,
+        result.metrics.decode_tokens_per_sec, result.metrics.prefill_tokens_per_sec,
     );
 }
 

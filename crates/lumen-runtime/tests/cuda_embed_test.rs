@@ -14,9 +14,9 @@
 
 #![cfg(feature = "cuda")]
 
+use lumen_format::hyperparams::{ModelHyperparams, RopeParams, RopeScalingType};
 use lumen_runtime::compute::{ComputeBackend, ComputeDtype};
 use lumen_runtime::cuda::CudaBackend;
-use lumen_format::hyperparams::{ModelHyperparams, RopeParams, RopeScalingType};
 
 /// Build minimal hyperparams for embed_token testing.
 fn test_hyperparams(vocab_size: u32, hidden_dim: u32) -> ModelHyperparams {
@@ -37,7 +37,8 @@ fn test_hyperparams(vocab_size: u32, hidden_dim: u32) -> ModelHyperparams {
         num_experts: None,
         num_active_experts: None,
         norm_eps: 1e-5,
-        rotary_dim: None, rope_neox: false,
+        rotary_dim: None,
+        rope_neox: false,
         gdn: None,
     }
 }
@@ -127,7 +128,10 @@ fn test_cuda_embed_token_out_of_range() {
 
     // Token ID 2 is out of range for vocab_size=2
     let result = backend.embed_token(2);
-    assert!(result.is_err(), "embed_token(2) should fail for vocab_size=2");
+    assert!(
+        result.is_err(),
+        "embed_token(2) should fail for vocab_size=2"
+    );
     let err_msg = format!("{}", result.unwrap_err());
     assert!(
         err_msg.contains("out of range"),

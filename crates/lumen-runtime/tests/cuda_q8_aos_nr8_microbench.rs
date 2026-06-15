@@ -15,9 +15,9 @@
 
 #![cfg(feature = "cuda")]
 
-use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
 use cudarc::driver::result::event;
 use cudarc::driver::sys as cuda_sys;
+use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
 fn compile_sm80(source: &str) -> cudarc::nvrtc::Ptx {
@@ -139,14 +139,17 @@ fn build_setup(out_dim: usize, in_dim: usize, seed: u64) -> Setup {
 
     let aligned_src = lumen_runtime::cuda::shaders::MATVEC_Q8_ALIGNED_Q8_1_KERNEL_SOURCE;
     let split_src = lumen_runtime::cuda::shaders::MATVEC_Q8_SPLIT_Q8_1_KERNEL_SOURCE;
-    let split_full_src =
-        lumen_runtime::cuda::shaders::MATVEC_Q8_SPLIT_Q8_1_NR8_KERNEL_SOURCE;
+    let split_full_src = lumen_runtime::cuda::shaders::MATVEC_Q8_SPLIT_Q8_1_NR8_KERNEL_SOURCE;
     let aos_full_src = lumen_runtime::cuda::shaders::MATVEC_Q8_ALIGNED_NR8_KERNEL_SOURCE;
     let raw_src = lumen_runtime::cuda::shaders::MATVEC_DP4A_Q8_1_KERNEL_SOURCE;
     let repack_src = lumen_runtime::cuda::shaders::REPACK_Q8_RAW_TO_SPLIT_KERNEL_SOURCE;
 
-    let aligned_module = ctx.load_module(compile_sm80(aligned_src)).expect("aligned load");
-    let split_module = ctx.load_module(compile_sm80(split_src)).expect("split load");
+    let aligned_module = ctx
+        .load_module(compile_sm80(aligned_src))
+        .expect("aligned load");
+    let split_module = ctx
+        .load_module(compile_sm80(split_src))
+        .expect("split load");
     let split_full_module = ctx
         .load_module(compile_sm80(split_full_src))
         .expect("split_full load");
@@ -154,7 +157,9 @@ fn build_setup(out_dim: usize, in_dim: usize, seed: u64) -> Setup {
         .load_module(compile_sm80(aos_full_src))
         .expect("aos_full load");
     let raw_module = ctx.load_module(compile_sm80(raw_src)).expect("raw load");
-    let repack_module = ctx.load_module(compile_sm80(repack_src)).expect("repack load");
+    let repack_module = ctx
+        .load_module(compile_sm80(repack_src))
+        .expect("repack load");
 
     let aos_prod_fn = aligned_module
         .load_function("matvec_q8_aligned_q8_1")
@@ -344,10 +349,10 @@ where
 {
     let mut events = Vec::with_capacity(NUM_TRIALS);
     for _ in 0..NUM_TRIALS {
-        let e0 = event::create(cuda_sys::CUevent_flags::CU_EVENT_DEFAULT)
-            .expect("event create start");
-        let e1 = event::create(cuda_sys::CUevent_flags::CU_EVENT_DEFAULT)
-            .expect("event create end");
+        let e0 =
+            event::create(cuda_sys::CUevent_flags::CU_EVENT_DEFAULT).expect("event create start");
+        let e1 =
+            event::create(cuda_sys::CUevent_flags::CU_EVENT_DEFAULT).expect("event create end");
         events.push((e0, e1));
     }
 
@@ -409,10 +414,10 @@ fn bench_shape(name: &str, out_dim: usize, in_dim: usize) {
 #[ignore]
 fn microbench_aos_nr8_vs_all() {
     // Qwen3.5-9B production shapes hit during decode.
-    bench_shape("4096x4096",    4096,  4096);   // FFN gate, up; QKV separated; GDN ssm_out
-    bench_shape("1024x4096",    1024,  4096);   // K, V proj
-    bench_shape("4096x12288",   4096, 12288);   // FFN down
-    bench_shape("12288x4096",  12288,  4096);   // FFN gate+up SEPARATED, each side
-    bench_shape("8192x4096",    8192,  4096);   // Qwen3.5 attn_q (Q+gate fused)
-    bench_shape("248320x4096", 248320, 4096);   // output_proj (full vocab)
+    bench_shape("4096x4096", 4096, 4096); // FFN gate, up; QKV separated; GDN ssm_out
+    bench_shape("1024x4096", 1024, 4096); // K, V proj
+    bench_shape("4096x12288", 4096, 12288); // FFN down
+    bench_shape("12288x4096", 12288, 4096); // FFN gate+up SEPARATED, each side
+    bench_shape("8192x4096", 8192, 4096); // Qwen3.5 attn_q (Q+gate fused)
+    bench_shape("248320x4096", 248320, 4096); // output_proj (full vocab)
 }

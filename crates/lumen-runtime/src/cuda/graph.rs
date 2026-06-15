@@ -129,9 +129,7 @@ pub(crate) fn compile_graph_kernels(device: &CudaDevice) -> Result<GraphKernelSe
         // the symbol (older NVRTC bundles, future ABI evolution) does not bomb
         // backend init. The dispatch site at backend_impl.rs falls back to the
         // host-scalar tiled kernel (which prevents capture) when this is None.
-        attention_decode_tiled: module
-            .load_function("attention_decode_tiled_graph")
-            .ok(),
+        attention_decode_tiled: module.load_function("attention_decode_tiled_graph").ok(),
     };
 
     // Same dynamic-shared-memory opt-in as the non-graph attention_decode
@@ -237,9 +235,9 @@ impl CapturedGraph {
     /// The caller MUST update GraphParamsBuf with the correct token_id, seq_pos,
     /// and attn_seq_len BEFORE calling this.
     pub(crate) fn launch(&self) -> Result<(), RuntimeError> {
-        self.graph.launch().map_err(|e| {
-            RuntimeError::Compute(format!("CUDA graph launch failed: {e}"))
-        })
+        self.graph
+            .launch()
+            .map_err(|e| RuntimeError::Compute(format!("CUDA graph launch failed: {e}")))
     }
 }
 
@@ -253,20 +251,19 @@ impl CapturedGraph {
 /// useful for debugging graph capture failures -- it confirms whether the
 /// stream is in capturing mode, and if so, whether the capture is active
 /// or has been invalidated.
-pub(crate) fn query_capture_status(
-    stream: &Arc<cudarc::driver::CudaStream>,
-) -> String {
+pub(crate) fn query_capture_status(stream: &Arc<cudarc::driver::CudaStream>) -> String {
     match stream.capture_status() {
-        Ok(status) => {
-            match status {
-                cuda_sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE =>
-                    "NONE (not capturing)".to_string(),
-                cuda_sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE =>
-                    "ACTIVE (capturing)".to_string(),
-                cuda_sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_INVALIDATED =>
-                    "INVALIDATED (capture broken by illegal operation)".to_string(),
+        Ok(status) => match status {
+            cuda_sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE => {
+                "NONE (not capturing)".to_string()
             }
-        }
+            cuda_sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE => {
+                "ACTIVE (capturing)".to_string()
+            }
+            cuda_sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_INVALIDATED => {
+                "INVALIDATED (capture broken by illegal operation)".to_string()
+            }
+        },
         Err(e) => format!("capture_status() FAILED: {e}"),
     }
 }
@@ -280,9 +277,7 @@ pub(crate) fn query_capture_status(
 /// With event tracking disabled in `CudaDevice::new()`, our single-stream
 /// allocations and kernel launches produce no cross-stream dependencies.
 /// cuBLAS internal stream usage may still benefit from relaxed mode.
-pub(crate) fn begin_capture(
-    stream: &Arc<cudarc::driver::CudaStream>,
-) -> Result<(), RuntimeError> {
+pub(crate) fn begin_capture(stream: &Arc<cudarc::driver::CudaStream>) -> Result<(), RuntimeError> {
     stream
         .begin_capture(cuda_sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
         .map_err(|e| RuntimeError::Compute(format!("CUDA graph begin_capture failed: {e}")))
@@ -297,8 +292,7 @@ pub(crate) fn end_capture(
     num_layers: usize,
     max_seq_len: usize,
 ) -> Result<Option<CapturedGraph>, RuntimeError> {
-    let flags =
-        cuda_sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+    let flags = cuda_sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
     let graph = stream
         .end_capture(flags)
         .map_err(|e| RuntimeError::Compute(format!("CUDA graph end_capture failed: {e}")))?;

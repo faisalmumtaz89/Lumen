@@ -123,15 +123,20 @@ pub(crate) fn repack_q4_single(
     if src.len() != expected_len {
         return Err(RuntimeError::Compute(format!(
             "repack_q4_single: src len {} != expected {} (n_rows={}, k_elems={})",
-            src.len(), expected_len, n_rows, k_elems
+            src.len(),
+            expected_len,
+            n_rows,
+            k_elems
         )));
     }
 
     let num_row_groups = n_rows / TILE_N;
     let stripe_stride: usize = num_blocks_per_row * STRIPE_BYTES_SINGLE;
     let total_out = num_row_groups * stripe_stride;
-    debug_assert_eq!(total_out, expected_len,
-        "Total bytes after repack must equal source length (pure transposition)");
+    debug_assert_eq!(
+        total_out, expected_len,
+        "Total bytes after repack must equal source length (pure transposition)"
+    );
 
     let mut dst = vec![0u8; total_out];
 
@@ -183,7 +188,8 @@ pub(crate) fn repack_q4_pair_gate_up(
     if src_gate.len() != src_up.len() {
         return Err(RuntimeError::Compute(format!(
             "repack_q4_pair_gate_up: gate len {} != up len {}",
-            src_gate.len(), src_up.len()
+            src_gate.len(),
+            src_up.len()
         )));
     }
     if n_rows % TILE_N != 0 {
@@ -204,15 +210,21 @@ pub(crate) fn repack_q4_pair_gate_up(
     if src_gate.len() != expected_len {
         return Err(RuntimeError::Compute(format!(
             "repack_q4_pair_gate_up: gate len {} != expected {} (n_rows={}, k_elems={})",
-            src_gate.len(), expected_len, n_rows, k_elems
+            src_gate.len(),
+            expected_len,
+            n_rows,
+            k_elems
         )));
     }
 
     let num_row_groups = n_rows / TILE_N;
     let stripe_stride: usize = num_blocks_per_row * STRIPE_BYTES_PAIR;
     let total_out = num_row_groups * stripe_stride;
-    debug_assert_eq!(total_out, 2 * expected_len,
-        "Pair-packed total bytes must equal 2× source length");
+    debug_assert_eq!(
+        total_out,
+        2 * expected_len,
+        "Pair-packed total bytes must equal 2× source length"
+    );
 
     let mut dst = vec![0u8; total_out];
 
@@ -256,7 +268,9 @@ pub(crate) fn build_repacked_buffer_single(
     device.new_buffer_with_bytes(&dst).ok_or_else(|| {
         RuntimeError::Compute(format!(
             "Failed to allocate Q4 repacked single buffer ({} bytes, n_rows={}, k_elems={})",
-            dst.len(), n_rows, k_elems
+            dst.len(),
+            n_rows,
+            k_elems
         ))
     })
 }
@@ -273,7 +287,9 @@ pub(crate) fn build_repacked_buffer_pair(
     device.new_buffer_with_bytes(&dst).ok_or_else(|| {
         RuntimeError::Compute(format!(
             "Failed to allocate Q4 repacked pair buffer ({} bytes, n_rows={}, k_elems={})",
-            dst.len(), n_rows, k_elems
+            dst.len(),
+            n_rows,
+            k_elems
         ))
     })
 }
@@ -313,7 +329,11 @@ mod tests {
         let repacked = repack_q4_single(&src, n_rows, k_elems).expect("repack_q4_single");
 
         // Verify total length
-        assert_eq!(repacked.len(), src.len(), "repack must preserve total bytes");
+        assert_eq!(
+            repacked.len(),
+            src.len(),
+            "repack must preserve total bytes"
+        );
 
         // Verify: for each (rg, kb), the scales are 32 contiguous f16s
         // and qdata is 32 contiguous 16-byte rows.
@@ -333,7 +353,10 @@ mod tests {
                         &repacked[dst_kb_base + r * 2..dst_kb_base + r * 2 + 2],
                         &src[src_block_off..src_block_off + 2],
                         "scale mismatch rg={} kb={} r={} (row={})",
-                        rg, kb, r, row
+                        rg,
+                        kb,
+                        r,
+                        row
                     );
                     // qdata at dst_kb_base + 64 + r*16 must match src[src_block_off+2..src_block_off+18]
                     let dst_qd = dst_kb_base + 64 + r * 16;
@@ -341,7 +364,10 @@ mod tests {
                         &repacked[dst_qd..dst_qd + 16],
                         &src[src_block_off + 2..src_block_off + 18],
                         "qdata mismatch rg={} kb={} r={} (row={})",
-                        rg, kb, r, row
+                        rg,
+                        kb,
+                        r,
+                        row
                     );
                 }
             }
@@ -379,27 +405,39 @@ mod tests {
                     assert_eq!(
                         &repacked[dst_kb_base + r * 2..dst_kb_base + r * 2 + 2],
                         &src_gate[src_block_off..src_block_off + 2],
-                        "gate scale mismatch rg={} kb={} r={}", rg, kb, r
+                        "gate scale mismatch rg={} kb={} r={}",
+                        rg,
+                        kb,
+                        r
                     );
                     // Up scale (offset 64)
                     assert_eq!(
                         &repacked[dst_kb_base + 64 + r * 2..dst_kb_base + 64 + r * 2 + 2],
                         &src_up[src_block_off..src_block_off + 2],
-                        "up scale mismatch rg={} kb={} r={}", rg, kb, r
+                        "up scale mismatch rg={} kb={} r={}",
+                        rg,
+                        kb,
+                        r
                     );
                     // Gate qdata (offset 128)
                     let dst_gd = dst_kb_base + 128 + r * 16;
                     assert_eq!(
                         &repacked[dst_gd..dst_gd + 16],
                         &src_gate[src_block_off + 2..src_block_off + 18],
-                        "gate qdata mismatch rg={} kb={} r={}", rg, kb, r
+                        "gate qdata mismatch rg={} kb={} r={}",
+                        rg,
+                        kb,
+                        r
                     );
                     // Up qdata (offset 640)
                     let dst_ud = dst_kb_base + 640 + r * 16;
                     assert_eq!(
                         &repacked[dst_ud..dst_ud + 16],
                         &src_up[src_block_off + 2..src_block_off + 18],
-                        "up qdata mismatch rg={} kb={} r={}", rg, kb, r
+                        "up qdata mismatch rg={} kb={} r={}",
+                        rg,
+                        kb,
+                        r
                     );
                 }
             }
@@ -422,7 +460,10 @@ mod tests {
         let num_blocks_per_row = k_elems / Q4_GROUP_SIZE;
         let row_bytes = num_blocks_per_row * Q4_BLOCK_SIZE;
         let src_off_row31_kb0 = 31 * row_bytes;
-        assert_eq!(&repacked[62..64], &src[src_off_row31_kb0..src_off_row31_kb0 + 2]);
+        assert_eq!(
+            &repacked[62..64],
+            &src[src_off_row31_kb0..src_off_row31_kb0 + 2]
+        );
     }
 
     #[test]

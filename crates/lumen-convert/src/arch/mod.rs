@@ -63,8 +63,12 @@ impl Converter {
         target: ConvertTarget,
     ) -> Result<LayerShape, ConvertError> {
         match self {
-            Converter::Qwen35(c) => c.compute_layer_shape(gguf, layer, dequantize, requant_to, target),
-            Converter::Qwen35Moe(c) => c.compute_layer_shape(gguf, layer, dequantize, requant_to, target),
+            Converter::Qwen35(c) => {
+                c.compute_layer_shape(gguf, layer, dequantize, requant_to, target)
+            }
+            Converter::Qwen35Moe(c) => {
+                c.compute_layer_shape(gguf, layer, dequantize, requant_to, target)
+            }
         }
     }
 
@@ -79,8 +83,12 @@ impl Converter {
         target: ConvertTarget,
     ) -> Result<(), ConvertError> {
         match self {
-            Converter::Qwen35(c) => c.write_layer_blob(blob, reader, gguf, layer, dequantize, requant_to, target),
-            Converter::Qwen35Moe(c) => c.write_layer_blob(blob, reader, gguf, layer, dequantize, requant_to, target),
+            Converter::Qwen35(c) => {
+                c.write_layer_blob(blob, reader, gguf, layer, dequantize, requant_to, target)
+            }
+            Converter::Qwen35Moe(c) => {
+                c.write_layer_blob(blob, reader, gguf, layer, dequantize, requant_to, target)
+            }
         }
     }
 
@@ -97,10 +105,7 @@ impl Converter {
 /// `num_experts` is forwarded to the MoE variant when the architecture is
 /// `qwen35moe` (also accepts the alternate GGUF spellings
 /// `qwen3_5_moe` and `qwen3.5_moe`). The dense `qwen35` path ignores it.
-pub(crate) fn select_converter(
-    arch: &str,
-    num_experts: Option<u32>,
-) -> Converter {
+pub(crate) fn select_converter(arch: &str, num_experts: Option<u32>) -> Converter {
     if matches!(arch, "qwen35moe" | "qwen3_5_moe" | "qwen3.5_moe") {
         Converter::Qwen35Moe(qwen35_moe::Qwen35MoeConverter {
             num_experts: num_experts.unwrap_or(0),

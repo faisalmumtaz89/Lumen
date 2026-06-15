@@ -85,8 +85,16 @@ fn metal_ssm_out_microbench() {
     // Per-trial detail (per-CB only — single-CB has only one trial)
     s.push_str("## Per-CB per-trial detail (ms) — first 10 of each scenario\n\n");
     for sc in &report.scenarios {
-        s.push_str(&format!("- {} (median = {:.4} ms):\n  ", sc.label, sc.per_cb_median_ms));
-        let take = sc.per_cb_trials_ms.iter().take(10).copied().collect::<Vec<_>>();
+        s.push_str(&format!(
+            "- {} (median = {:.4} ms):\n  ",
+            sc.label, sc.per_cb_median_ms
+        ));
+        let take = sc
+            .per_cb_trials_ms
+            .iter()
+            .take(10)
+            .copied()
+            .collect::<Vec<_>>();
         s.push_str(
             &take
                 .iter()
@@ -117,7 +125,11 @@ fn metal_ssm_out_microbench() {
     s.push_str(&format!(
         "Single-CB ratio (zeros R / random R):   {:.2}x ({} from random)\n",
         zeros_pc / resid_pc.max(1e-6),
-        if perdiff_zeros_vs_resid < 0.10 { "<10% delta" } else { ">=10% delta" }
+        if perdiff_zeros_vs_resid < 0.10 {
+            "<10% delta"
+        } else {
+            ">=10% delta"
+        }
     ));
     s.push_str(&format!(
         "Per-CB med  ratio (residual / plain):   {:.2}x\n\n",
@@ -182,7 +194,10 @@ fn metal_ssm_out_microbench() {
         let _ = fs::create_dir_all(parent);
     }
     fs::write(&artifact_path, &s).expect("failed to write microbench report");
-    eprintln!("[microbench] full report saved to {}", artifact_path.display());
+    eprintln!(
+        "[microbench] full report saved to {}",
+        artifact_path.display()
+    );
 
     // Sanity: the timings should be positive and the kernels should not panic.
     for sc in &report.scenarios {
