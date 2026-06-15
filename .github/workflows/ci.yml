@@ -37,15 +37,16 @@ jobs:
       - name: install pinned toolchain (rust-toolchain.toml -> 1.93.1 + rustfmt/clippy)
         run: rustup show
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      # fmt + clippy are ADVISORY for now: the repo predates these gates and isn't
-      # yet clean under the pinned toolchain (rust-toolchain.toml). They surface
-      # drift as warnings without failing CI. Flip to hard gates after a one-time
-      # `cargo fmt --all` + `cargo clippy --fix` (tracked in SETUP.md). The
-      # substantive gates below (build + tests) stay hard.
-      - name: fmt (advisory)
-        run: cargo fmt --all --check || echo "::warning title=rustfmt::formatting drift — run 'cargo fmt --all' (see SETUP.md)"
-      - name: clippy (advisory)
-        run: cargo clippy --locked -p lumen-format -p lumen-convert -p lumen-cli --release || echo "::warning title=clippy::lints present — run 'cargo clippy --fix' (see SETUP.md)"
+      # HARD gates. The repo is fmt-clean and clippy-clean under the pinned toolchain
+      # (rust-toolchain.toml 1.93.1). clippy uses the deliberate [workspace.lints]
+      # policy (deny clippy::all + a curated allow-list) — no `-D warnings` needed
+      # (and it must NOT be used: it would override the manifest's allow list).
+      # This ubuntu run covers the cross-platform + server code; the metal-only path
+      # (cfg(macos)) is clippy-checked in the build-macos-metal job below.
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy (workspace)
+        run: cargo clippy --locked --workspace --release
       - name: cpu test suite
         run: cargo test --locked -p lumen-format -p lumen-convert -p lumen-cli --release
       - name: detector self-test
@@ -87,6 +88,10 @@ jobs:
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup show
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # clippy the metal-only path here (cfg(macos) code is excluded on the ubuntu
+      # run). Same [workspace.lints] policy.
+      - name: clippy (workspace, metal path)
+        run: cargo clippy --locked --workspace --release
       - name: build server + cli (metal default)
         run: cargo build --release --locked -p lumen-server -p lumen-cli --features bin
       - name: link audit (system frameworks only)

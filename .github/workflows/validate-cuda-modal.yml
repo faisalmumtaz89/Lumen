@@ -79,10 +79,16 @@ jobs:
 
   modal-validate:
     needs: changes
-    # Run only when relevant AND same-repo. Fork PRs (head repo != this repo) are
-    # skipped so the Modal token is never exposed and untrusted code never spends GPU.
+    # Run only when relevant AND same-repo AND not a Dependabot PR. Fork PRs (head
+    # repo != this repo) are skipped so the Modal token is never exposed. Dependabot
+    # PRs are also skipped: GitHub withholds repo secrets from them, so this job
+    # would otherwise fail the secret-guard on every dep bump. cuda-gate treats a
+    # skipped modal-validate as a pass — dep PRs are still build+CPU-tested by ci.yml,
+    # and dependency bumps that affect the GPU runtime get re-validated on push-to-main
+    # (or a manual workflow_dispatch) before/after merge.
     if: >-
       needs.changes.outputs.relevant == 'true' &&
+      github.actor != 'dependabot[bot]' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
