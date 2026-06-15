@@ -107,7 +107,8 @@ jobs:
       - name: install modal
         run: pip install 'modal~=1.4'   # pinned minor; bump deliberately (Dependabot-tracked)
 
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (stable)
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: rustup show
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # --locked: the committed Cargo.lock is load-bearing (it pins cudarc 0.19.3,

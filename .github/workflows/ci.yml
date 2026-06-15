@@ -34,9 +34,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (stable)
-        with:
-          components: rustfmt, clippy
+      - name: install pinned toolchain (rust-toolchain.toml -> 1.93.1 + rustfmt/clippy)
+        run: rustup show
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # fmt + clippy are ADVISORY for now: the repo predates these gates and isn't
       # yet clean under the pinned toolchain (rust-toolchain.toml). They surface
@@ -60,7 +59,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (stable)
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: rustup show
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: build server (cuda)
         run: cargo build --release --locked -p lumen-server -p lumen-cli --features bin,cuda
@@ -84,7 +84,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (stable)
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: rustup show
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: build server + cli (metal default)
         run: cargo build --release --locked -p lumen-server -p lumen-cli --features bin
