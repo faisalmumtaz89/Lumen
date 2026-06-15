@@ -753,7 +753,7 @@ pub async fn collect_messages(
                         "id": format!("toolu_lumen_{}", tool_blocks.len() + 1),
                         "name": tc.name,
                         "input": serde_json::from_str::<Value>(&tc.arguments_json)
-                            .unwrap_or_else(|_| Value::String(tc.arguments_json)),
+                            .unwrap_or(Value::String(tc.arguments_json)),
                     }));
                 }
                 if hit_stop {

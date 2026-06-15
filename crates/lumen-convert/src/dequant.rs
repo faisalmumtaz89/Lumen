@@ -651,7 +651,7 @@ pub(crate) fn dequantize_q3_k(src: &[u8], n_elements: u64) -> Vec<u8> {
             scale_bytes[10],
             scale_bytes[11],
         ]);
-        let out0 = (a0 & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+        let out0 = (a0 & KMASK2) | ((tmp & KMASK1) << 4);
         let out1 = (a1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
         let out2 = ((a0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
         let out3 = ((a1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);

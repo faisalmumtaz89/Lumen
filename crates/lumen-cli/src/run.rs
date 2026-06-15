@@ -87,9 +87,11 @@ fn cli_resolve_frequency_penalty(parsed: Option<f32>, explicit: bool) -> Option<
     if explicit {
         return parsed;
     }
-    match lumen_runtime::runtime_defaults::frequency_penalty_resolved() {
-        v if v == 0.0 => None,
-        v => Some(v),
+    let v = lumen_runtime::runtime_defaults::frequency_penalty_resolved();
+    if v == 0.0 {
+        None
+    } else {
+        Some(v)
     }
 }
 
@@ -1398,8 +1400,8 @@ fn effective_max_seq_len(
         None => {
             // Right-size: actual usage + 256 headroom, minimum 512
             let needed = prompt_len.saturating_add(max_gen).saturating_add(256);
-            let capped = needed.max(512).min(model_max);
-            capped
+
+            needed.max(512).min(model_max)
         }
     };
     if verbose && effective < model_max {
@@ -1564,7 +1566,7 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
         if verbose {
             eprintln!("Ready: {}", lbc_out.display());
         }
-        return lbc_out.to_string_lossy().into_owned();
+        lbc_out.to_string_lossy().into_owned()
     }
 
     #[cfg(not(feature = "download"))]
@@ -2420,13 +2422,11 @@ fn run_with_mmap(
                         top_k
                     );
                 }
-            } else {
-                if verbose {
-                    eprintln!(
-                        "Option A enabled: top-{} expert dispatch (GPU-resident mode)",
-                        top_k
-                    );
-                }
+            } else if verbose {
+                eprintln!(
+                    "Option A enabled: top-{} expert dispatch (GPU-resident mode)",
+                    top_k
+                );
             }
         }
 

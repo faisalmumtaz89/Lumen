@@ -1962,7 +1962,8 @@ impl MetalF32Backend {
                     // skip the entire GDN attention megakernel to attribute its
                     // total GPU share (garbage output; profiling only).
                     if super::graph_reorder::gdn_diag_skip() == 4 {
-                        scratch.gdn_conv_positions[gdn_idx] = scratch.gdn_conv_positions[gdn_idx];
+                        // diag wholeattn: intentionally skip the GDN attention
+                        // megakernel (no-op; garbage output, profiling only).
                     } else {
                         // Dual-queue GDN branch-overlap path
                         // (`LUMEN_METAL_GDN_DUAL_QUEUE=1`): route to the dual-queue
