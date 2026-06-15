@@ -57,6 +57,10 @@ echo "distinct=$DISTINCT (want 1)" | tee "$OUT/det.result"
 echo "== coherence =="
 FR="$(gen "$PROMPT")"; echo "france -> $FR" | tee -a "$OUT/coherence.txt"
 echo "$FR" | grep -qi paris || { echo "::error::coherence: 'Paris' not in answer"; exit 1; }
-MATH="$(gen 'What is 17 times 23? Reply with only the number.')"; echo "17x23 -> $MATH" | tee -a "$OUT/coherence.txt"
+# ADVISORY (logged, NOT gated): a 9B at greedy temp-0 unreliably computes 17*23
+# (often answers a clean-but-wrong number). That's a model-capability nuance, not
+# binary health — DET-001 + the factual 'Paris' gate already catch a garbling build.
+# Mirrors the CUDA harness, where math_17x23 is advisory=True.
+MATH="$(gen 'What is 17 times 23? Reply with only the number.')"; echo "17x23 (advisory) -> $MATH" | tee -a "$OUT/coherence.txt"
 
 echo "METAL VALIDATION PASS (DET-001 1-distinct, coherent)"

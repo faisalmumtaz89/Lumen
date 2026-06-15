@@ -28,6 +28,13 @@
 #     -e LUMEN_CACHE_DIR=/cache \
 #     lumen-cuda:phase1 \
 #     --model /models/qwen3-5-9b-Q8_0.lbc --backend cuda --host 0.0.0.0 --port 8000
+#
+# NOTE: --model takes an LBC *path* here; a bare model NAME ("qwen3.5-9b") is a
+# registry lookup that does NOT auto-download in the container. To fetch a model
+# into a mounted cache first:
+#   docker run --rm -v lumen-models:/cache -e LUMEN_CACHE_DIR=/cache \
+#     --entrypoint /opt/lumen/bin/lumen lumen-cuda:phase1 pull qwen3.5-9b:q8_0
+# then run the server with --model <the .lbc path under /cache>.
 
 FROM nvidia/cuda:12.2.2-devel-ubuntu22.04
 

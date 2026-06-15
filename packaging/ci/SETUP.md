@@ -1,8 +1,8 @@
-# CI setup — Lumen Phase-1
+# CI setup — Lumen
 
-These workflow files live in `packaging/ci/` (staged, inert) on purpose: they do
-**not** run until you (1) add the Modal secret, (2) register the Mac runner, and
-(3) move them into `.github/workflows/`. That ordering avoids red first runs.
+This PR moves the workflows into `.github/workflows/` (they were staged inert in
+`packaging/ci/`), so **merging it activates CI**. The Modal secret and the Mac
+runner are one-time account/repo setup; the rest are repo *settings*.
 
 ## The design in one screen
 
@@ -12,86 +12,95 @@ free GitHub-hosted runners. GPUs are needed only to *validate*:
 
 | Workflow | Trigger | Runner | Cost / risk |
 |---|---|---|---|
-| `ci.yml` | every push + PR | hosted ubuntu + macos-14 | free — build, CPU tests, lint, link-audit, build-smoke |
-| `validate-cuda-modal.yml` | push main / manual / tag | hosted ubuntu → **Modal** | Modal $ (A100 smoke on main; full sm_75–90 matrix on tags) |
-| `validate-metal.yml` | manual / tag / push main | **self-hosted Mac** | your Mac's GPU; release-gated, never fork PRs |
-| `release.yml` | tag `b*`/`v*` | hosted | tarball + Homebrew + Docker→ghcr |
+| `ci.yml` | every push + PR | hosted ubuntu + macos-14 | free — build both binaries, CPU tests, lint, link-audit |
+| `validate-cuda-modal.yml` | push main / PR (same-repo) / weekly / manual | hosted ubuntu → **Modal** | Modal $ — A100 smoke; skips docs-only PRs; full matrix on manual dispatch |
+| `validate-metal.yml` | push main / manual | **self-hosted Mac** | your Mac's GPU; **never** fork PRs |
+| `release.yml` | tag `b*`/`v*` | hosted (+ Modal + Mac to validate) | **build → validate the exact bytes → publish only if green** |
 
-CUDA validation runs **on Modal**, driven from a free hosted runner that just holds
-the token — so there is **no always-on, exposed self-hosted GPU box**. The only
-self-hosted runner is the Mac, because hosted macOS runners have no usable Metal GPU.
+CUDA validation runs **on Modal**, driven from a hosted runner that just holds the
+token — no always-on exposed GPU box. The only self-hosted runner is the Mac
+(hosted macOS runners have no usable Metal GPU). Tags are validated by `release.yml`
+on the *promoted artifact*, so the two validate workflows don't trigger on tags.
 
-## Step 1 — Modal secret (for CUDA validation)
+## Step 1 — Modal secret (CUDA validation) — ✅ done this session
 
-`modal` auth is a token pair (see `~/.modal.toml` on your machine). Add them as
-**encrypted repo secrets** (Settings → Secrets and variables → Actions → New secret):
+`modal` auth is a token pair (`~/.modal.toml`). Added as encrypted repo secrets
+(Settings → Secrets and variables → Actions): `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`.
+GitHub encrypts them at rest, masks them in logs, withholds them from fork PRs, and
+they live only on the hosted runner — never on the Mac.
 
-- `MODAL_TOKEN_ID`
-- `MODAL_TOKEN_SECRET`
-
-The CUDA job exports them as env vars; the `modal` CLI reads them automatically.
-GitHub encrypts secrets at rest and masks them in logs. They live only on the
-hosted runner, never on the Mac.
-
-One-time, on your machine, seed the model volume the harness reads (9B-q8, ~9 GB):
+Seed the model volume the harness reads (one-time, ~9 GB — canonical command):
 
 ```bash
-modal volume put lumen-models 9bq8.lbc /9bq8.lbc   # path to a converted 9B-q8 .lbc
+modal volume put lumen-models <path-to-9B-q8.lbc> /9bq8.lbc   # dest key MUST be /9bq8.lbc
 ```
 
-## Step 2 — register the Mac as a self-hosted runner (for Metal validation)
+(The volume auto-creates; `modal volume create` is not needed.)
 
-On the Mac: Settings → Actions → Runners → New self-hosted runner (macOS/arm64),
-then run the shown commands with these **labels**:
+## Step 2 — Mac self-hosted runner (Metal validation) — ✅ done this session
+
+Registered as `<host>-metal` with labels `self-hosted,macos,arm64,metal`, installed
+as a launchd service (`./svc.sh install && ./svc.sh start`).
+
+**Strongly recommended:** point the runner at a cached model so the Metal gate
+doesn't pull 9 GB (and isn't coupled to registry availability) on every run — set in
+the runner's environment:
 
 ```bash
-./config.sh --url https://github.com/faisalmumtaz89/Lumen \
-            --token <one-time-registration-token> \
-            --labels self-hosted,macos,arm64,metal
-./svc.sh install && ./svc.sh start     # run as a launchd service
+export LUMEN_TEST_MODEL=/path/to/qwen3.5-9b-q8_0.lbc
 ```
 
-Optional: set a cached model so CI doesn't pull 9 GB each run —
-`export LUMEN_TEST_MODEL=/path/to/qwen3.5-9b-q8_0.lbc` in the runner's environment.
+## Step 3 — repo settings (do these in the GitHub UI)
 
-### ⚠ SECURITY — required for a public repo
+### Security (required for a public repo + self-hosted runner)
 
-A self-hosted runner executes whatever a workflow gives it, so a malicious **fork
-PR** could run code on your Mac. Mitigations (all of these):
-
-1. `validate-metal.yml` has **no `pull_request` trigger** — it fires only on tags,
-   manual dispatch, and push-to-main (owner-controlled). Keep it that way.
+1. `validate-metal.yml` has **no `pull_request` trigger** — fork code can never run
+   on your Mac. Keep it that way.
 2. Settings → Actions → General → "Fork pull request workflows from outside
    collaborators" → **Require approval for all outside collaborators**.
-3. Don't put secrets on the Mac runner; run it as a low-privilege user.
-4. Consider a dedicated runner user account, not your daily login.
+3. Run the Mac runner as a **dedicated low-privilege user**, not your daily login;
+   no secrets on the runner.
+4. *(Optional, stronger)* Put the Metal jobs behind a GitHub **Environment** named
+   `metal` with **required reviewers** — then even an owner/collaborator
+   `workflow_dispatch` on an arbitrary branch needs a human approval before it runs
+   on the Mac. (Add `environment: metal` to the metal jobs to enable.)
 
-## Step 3 — activate
+### Branch protection (makes "green = mergeable")
 
-```bash
-git mv packaging/ci/ci.yml                  .github/workflows/ci.yml
-git mv packaging/ci/validate-cuda-modal.yml .github/workflows/validate-cuda-modal.yml
-git mv packaging/ci/validate-metal.yml      .github/workflows/validate-metal.yml
-git mv packaging/ci/release.yml             .github/workflows/release.yml
-# keep metal_validate.sh where it is (the metal workflow calls packaging/ci/metal_validate.sh)
-```
+Settings → Branches → add a rule for `main` → **Require status checks to pass**, and
+select these checks:
 
-`ci.yml` runs on the next push (should be green: hosted build + CPU tests). The GPU
-workflows fire per their triggers once the secret + runner are in place.
+- `test-cpu` (from `ci.yml`)
+- **`cuda-gate`** — the always-running gate job. **Do NOT pick `modal cuda
+  validation`** as the required check: it is skipped on docs-only / fork PRs and a
+  skipped check never reports, which would deadlock the PR. `cuda-gate` always
+  reports (pass when validation succeeded *or* was legitimately skipped).
+
+Metal is intentionally *not* a required PR check (self-hosted; runs post-merge on
+`main`, or on-demand via `workflow_dispatch` against a branch before merging).
 
 ## Acceptance (Phase-1 "done")
 
 - `ci.yml` green on push: builds both binaries, CPU suite passes, link-audit clean.
-- `validate-cuda-modal.yml`: A100 smoke green on main; full sm_75–90 matrix green on
-  a tag (0 kernel-compile failures, DET-001 1-distinct per arch).
-- `validate-metal.yml`: DET-001 1-distinct + coherence on the self-hosted Mac.
-- `release.yml` on a tag: tarball + sha256 attached, Docker image on ghcr.io.
+- `validate-cuda-modal.yml`: A100 smoke green on a same-repo PR / push to main;
+  `VALIDATION PASSED`, DET-001 1-distinct, PTX cache cold→warm.
+- `validate-metal.yml`: DET-001 1-distinct + coherence on the Mac (push to main).
+- `release.yml` on a tag: build → CUDA full matrix + macOS DET-001 both green →
+  *then* publishes tarballs (macOS + Linux/CUDA) + filled `lumen.rb` + ghcr image.
 
-## Notes / open hardening
+## Deferred to a later phase (known, documented — not silently relied on)
 
-- `release.yml` Homebrew step is not wired to auto-bump the formula `sha256`/`url`
-  (left manual for the first release; `build-tarball.sh` prints the sha256). Add a
-  tap-update step when you publish a Homebrew tap.
-- `validate_arches.py` should exit non-zero on a hard gate failure; the workflow
-  also greps the emitted matrix as a belt-and-suspenders check — verify the exit
-  code on the first real run.
+- **macOS code signing / notarization.** Binaries are unsigned ad-hoc; `install.sh`
+  and Homebrew clear the quarantine bit (fine for those paths). A bare download
+  needs `xattr -dr com.apple.quarantine` from the terminal. Add Developer-ID
+  signing + `notarytool`/`stapler` when an Apple account is available.
+- **Homebrew tap.** `release.yml` generates a *correct* `dist/lumen.rb` (filled
+  url/version/sha256) and attaches it to the Release. Publishing it is one manual
+  step: create `faisalmumtaz89/homebrew-lumen` and copy `dist/lumen.rb` to
+  `Formula/lumen.rb` (or wire an auto-push later). Until then, `brew install` from a
+  tap is not advertised.
+- **Validation breadth.** CI validates 9B-q8 (the startup/determinism/coherence
+  class — quant/model-independent for the startup bug). q4/bf16 + MoE/27B
+  *correctness* is the manual gold-standard quality suite, not CI.
+- **Supply-chain provenance.** Actions are SHA-pinned + Dependabot-tracked; image
+  signing / SLSA attestation is a later add.
