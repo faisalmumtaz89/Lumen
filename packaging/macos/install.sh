@@ -5,19 +5,23 @@
 #   curl -fsSL https://raw.githubusercontent.com/faisalmumtaz89/Lumen/main/packaging/macos/install.sh | bash
 #
 # Detects your machine (macOS Apple Silicon -> Metal · Linux x86_64 + NVIDIA ->
-# CUDA), downloads the matching *validated* prebuilt binaries from the latest
-# GitHub release (verifying their SHA-256), installs `lumen` + `lumen-server`,
-# lets you pick one of the supported models and a quant, prepares it, and prints
-# the exact command to start. No Rust toolchain, no CUDA SDK.
+# CUDA), downloads the matching prebuilt binaries from the latest GitHub release,
+# checks their SHA-256 (integrity of the GitHub-hosted asset; authenticity comes
+# from HTTPS to github.com), installs `lumen` + `lumen-server`, lets you pick a
+# model + quant, prepares it, and prints the exact command to start. No Rust
+# toolchain, no CUDA SDK.
+#
+# Trust note: this pipes a script from the internet into your shell. To inspect
+# first:  curl -fsSL <url> -o install.sh && less install.sh && bash install.sh
 #
 # Non-interactive / overrides (flags after `bash -s --`, or env):
-#   --model <alias>   LUMEN_MODEL     (qwen3.5-9b | qwen3.5-moe | qwen3.6-27b; accepts name:quant)
-#   --quant <tag>     LUMEN_QUANT     (q8_0 | q4_0 | bf16; default q8_0)
-#   --yes, -y                          non-interactive (accept defaults, no prompts)
-#   --prefix <dir>    LUMEN_PREFIX    (install dir; default /usr/local/bin)
+#   --model <alias>   LUMEN_MODEL   (qwen3.5-9b | qwen3.5-moe | qwen3.6-27b; accepts name:quant)
+#   --quant <tag>     LUMEN_QUANT   (q8_0 | q4_0 | bf16; default q8_0)
+#   --yes, -y                        non-interactive (accept defaults, no prompts)
+#   --prefix <dir>    LUMEN_PREFIX  (install dir; default /usr/local/bin)
 #   LUMEN_TAG         pin a release tag (e.g. v0.1.0, or a v..-rc.N prerelease); default = latest
 #   LUMEN_CACHE_DIR   model cache location (passed through to lumen)
-#   LUMEN_RELEASE_BASE / LUMEN_INSECURE_SKIP_CHECKSUM   (advanced/testing)
+#   LUMEN_RELEASE_BASE / LUMEN_ALLOW_INSECURE_BASE / LUMEN_INSECURE_SKIP_CHECKSUM  (advanced/testing)
 #
 # (Path note: this script lives under packaging/macos/ for URL stability but is
 #  cross-platform — it serves both the macOS Metal and Linux CUDA binaries.)
@@ -30,6 +34,7 @@ TAG="${LUMEN_TAG:-latest}"
 PREFIX="${LUMEN_PREFIX:-/usr/local/bin}"
 DEFAULT_MODEL="qwen3.5-9b"
 DEFAULT_QUANT="q8_0"
+MOE_CANONICAL="qwen3.5-moe-35b-a3b"   # the alias that round-trips through pull, run AND lumen-server
 
 MODEL="${LUMEN_MODEL:-}"
 QUANT="${LUMEN_QUANT:-}"
@@ -39,6 +44,22 @@ say()  { printf '%s\n' "$*"; }
 info() { printf '[install] %s\n' "$*"; }
 err()  { printf 'error: %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  cat <<'EOF'
+Lumen installer — detects your platform, installs the prebuilt binaries, sets up a model.
+
+  curl -fsSL https://raw.githubusercontent.com/faisalmumtaz89/Lumen/main/packaging/macos/install.sh | bash
+
+Options (after `bash -s --`) / env:
+  --model <alias>   LUMEN_MODEL   qwen3.5-9b | qwen3.5-moe | qwen3.6-27b  (accepts name:quant)
+  --quant <tag>     LUMEN_QUANT   q8_0 | q4_0 | bf16        (default q8_0)
+  --yes, -y                       non-interactive (defaults, no prompts)
+  --prefix <dir>    LUMEN_PREFIX  install dir               (default /usr/local/bin)
+  LUMEN_TAG=<tag>   install a specific release (e.g. v0.1.0, or a v..-rc.N prerelease)
+EOF
+}
 
 # ── Arg parse ─────────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -50,8 +71,8 @@ while [ $# -gt 0 ]; do
     --prefix)  [ $# -ge 2 ] || die "--prefix needs a value"; PREFIX="$2"; shift 2 ;;
     --prefix=*) PREFIX="${1#*=}"; shift ;;
     --yes|-y)  ASSUME_YES=1; shift ;;
-    -h|--help) sed -n '2,28p' "$0" 2>/dev/null || say "see header"; exit 0 ;;
-    *) die "unknown option: $1" ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1 (try --help)" ;;
   esac
 done
 
@@ -60,8 +81,16 @@ case "$MODEL" in
   *:*) [ -n "$QUANT" ] || QUANT="${MODEL##*:}"; MODEL="${MODEL%%:*}" ;;
 esac
 
+# RELEASE_BASE must be an https GitHub origin (the .sha256 shares the asset's
+# origin, so a non-github base could serve a matching tarball+hash). Override for
+# local testing only.
+case "$RELEASE_BASE" in
+  https://github.com/*|https://*.githubusercontent.com/*) ;;
+  *) [ "${LUMEN_ALLOW_INSECURE_BASE:-0}" = "1" ] \
+       || die "LUMEN_RELEASE_BASE must be an https://github.com URL (got '$RELEASE_BASE'); set LUMEN_ALLOW_INSECURE_BASE=1 to override (testing only)." ;;
+esac
+
 # ── Step 0 · detect platform ──────────────────────────────────────────────────
-have() { command -v "$1" >/dev/null 2>&1; }
 has_nvidia() {
   [ -e /dev/nvidia0 ] && return 0
   have nvidia-smi && nvidia-smi >/dev/null 2>&1 && return 0
@@ -96,6 +125,10 @@ have shasum || have sha256sum || die "need 'shasum' or 'sha256sum' for checksum 
 
 # ── Step 1 · resolve the download URL (alias-first, GitHub-API tag fallback) ───
 url_ok() { curl -fsIL -o /dev/null "$1" >/dev/null 2>&1; }
+api_get() {  # honor GITHUB_TOKEN to dodge the 60-req/hr unauthenticated limit
+  if [ -n "${GITHUB_TOKEN:-}" ]; then curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$1" 2>/dev/null
+  else curl -fsSL "$1" 2>/dev/null; fi
+}
 resolve_asset_url() {
   local plat="$1"
   if [ "$TAG" != "latest" ]; then
@@ -103,11 +136,11 @@ resolve_asset_url() {
   fi
   local alias_url="$RELEASE_BASE/latest/download/lumen-$plat.tar.gz"
   if url_ok "$alias_url"; then printf '%s\n' "$alias_url"; return 0; fi
-  # Fallback: the latest *stable* (non-prerelease) tag from the API, then the tag-named asset.
+  # Fallback: latest *stable* (non-prerelease) tag from the API, then the tag-named asset.
   local tag
-  tag="$(curl -fsSL "$API_LATEST" 2>/dev/null | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/' || true)"
+  tag="$(api_get "$API_LATEST" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/' || true)"
   if [ -z "$tag" ]; then
-    die "could not resolve a stable release (no published release yet, or the GitHub API is rate-limited). Pin one with LUMEN_TAG=<tag>."
+    die "could not resolve a stable release (none published yet, only a pre-release, or the GitHub API is rate-limited). Pin one with LUMEN_TAG=<tag> (e.g. a v..-rc.N pre-release), or set GITHUB_TOKEN to raise the API limit."
   fi
   printf '%s\n' "$RELEASE_BASE/download/$tag/lumen-$tag-$plat.tar.gz"
 }
@@ -127,28 +160,25 @@ else
   die "no checksum (.sha256) for $URL; refusing. Set LUMEN_INSECURE_SKIP_CHECKSUM=1 to override."
 fi
 
-# ── Step 3 · install both binaries (version-agnostic glob; sudo / ~/.local fb) ─
+# ── Step 3 · install both binaries (version-agnostic glob; mkdir + sudo + ~/.local fb) ─
 tar -C "$TMP" -xzf "$TMP/pkg.tar.gz"
 SRC="$(find "$TMP" -maxdepth 1 -type d -name "lumen-*-$PLAT" | head -1)"
 [ -n "$SRC" ] && [ -d "$SRC/bin" ] || die "unexpected tarball layout under $TMP"
 
-put() { # $1=dir $2=sudo?
-  local d="$1" sudo="$2" b
+install_to() {  # $1=dir  $2=""|"sudo"  — creates the dir first (fixes missing-PREFIX)
+  local d="$1" S="$2" b
+  $S mkdir -p "$d" 2>/dev/null || return 1
   for b in lumen lumen-server; do
-    $sudo install -m 0755 "$SRC/bin/$b" "$d/$b" || return 1
+    $S install -m 0755 "$SRC/bin/$b" "$d/$b" || return 1
   done
+  return 0
 }
-DEST="$PREFIX"
-if [ -d "$PREFIX" ] && [ -w "$PREFIX" ]; then
-  put "$PREFIX" "" || die "install to $PREFIX failed"
-elif have sudo; then
-  info "installing to $PREFIX (sudo may prompt for your password)"
-  put "$PREFIX" "sudo" || die "sudo install to $PREFIX failed"
-else
-  DEST="$HOME/.local/bin"; mkdir -p "$DEST"
-  put "$DEST" "" || die "install to $DEST failed"
-  info "installed to $DEST ($PREFIX not writable and no sudo)"
-fi
+DEST=""
+if install_to "$PREFIX" ""; then DEST="$PREFIX"
+elif have sudo && { info "installing to $PREFIX (sudo may prompt for your password)"; install_to "$PREFIX" "sudo"; }; then DEST="$PREFIX"
+elif install_to "$HOME/.local/bin" ""; then DEST="$HOME/.local/bin"; info "$PREFIX not writable; installed to $DEST"
+else die "could not install to $PREFIX (and the $HOME/.local/bin fallback also failed)"; fi
+
 if [ "$BACKEND" = "metal" ]; then
   xattr -dr com.apple.quarantine "$DEST/lumen" "$DEST/lumen-server" 2>/dev/null || true
 fi
@@ -167,23 +197,29 @@ if [ "$INTERACTIVE" = "1" ]; then
   say ""
   say "  Which model?"
   say "    1) Qwen3.5 9B     (dense, ~10 GB at Q8 — fast, recommended)"
-  say "    2) Qwen3.5 MoE    (30B-A3B mixture-of-experts)"
+  say "    2) Qwen3.5 MoE    (30B-A3B mixture-of-experts, larger)"
   say "    3) Qwen3.6 27B    (dense, largest)"
   printf '  > '
   read -r pick < /dev/tty || pick=""
-  case "$pick" in 2) MODEL="qwen3.5-moe" ;; 3) MODEL="qwen3.6-27b" ;; *) MODEL="$DEFAULT_MODEL" ;; esac
-  say ""
-  say "  Which version (quant)?"
-  say "    1) Q8    (recommended — best quality/size balance)   [default]"
-  say "    2) Q4    (smaller, faster, slightly lower quality)"
-  say "    3) BF16  (full precision, largest — needs lots of memory)"
-  printf '  > '
-  read -r qpick < /dev/tty || qpick=""
-  case "$qpick" in 2) QUANT="q4_0" ;; 3) QUANT="bf16" ;; *) QUANT="$DEFAULT_QUANT" ;; esac
+  case "$pick" in 2) MODEL="$MOE_CANONICAL" ;; 3) MODEL="qwen3.6-27b" ;; *) MODEL="$DEFAULT_MODEL" ;; esac
+  if [ -z "$QUANT" ]; then   # honor an explicit --quant; only prompt if unset
+    say ""
+    say "  Which version (quant)?"
+    say "    1) Q8    (recommended — best quality/size balance)   [default]"
+    say "    2) Q4    (smaller, faster, slightly lower quality)"
+    say "    3) BF16  (full precision — ~18 GB for 9B, ~55-70 GB for MoE/27B; large, not resumable)"
+    printf '  > '
+    read -r qpick < /dev/tty || qpick=""
+    case "$qpick" in 2) QUANT="q4_0" ;; 3) QUANT="bf16" ;; *) QUANT="$DEFAULT_QUANT" ;; esac
+  fi
 else
   MODEL="${MODEL:-$DEFAULT_MODEL}"; QUANT="${QUANT:-$DEFAULT_QUANT}"
   [ "$ASSUME_YES" = "1" ] || info "no terminal: using default $MODEL:$QUANT (pass --model/--quant to choose)"
 fi
+# Canonicalize any MoE alias so pull, run AND lumen-server all agree on the cache stem.
+case "$MODEL" in
+  qwen3.5-moe|qwen3-5-moe|qwen3.5-moe-35b-a3b|qwen3-5-moe-35b-a3b) MODEL="$MOE_CANONICAL" ;;
+esac
 info "selected: $MODEL:$QUANT"
 
 # ── Step 5 · prepare the model (installer owns consent -> pull --yes) ─────────
@@ -192,9 +228,16 @@ if [ -z "$cache" ]; then
   case "$BACKEND" in metal) cache="$HOME/Library/Caches/lumen" ;; *) cache="${XDG_CACHE_HOME:-$HOME/.cache}/lumen" ;; esac
 fi
 mkdir -p "$cache" 2>/dev/null || true
+# Rough peak-disk guard (GGUF + converted LBC coexist during convert; not a catalog).
+need=12
+case "$QUANT" in
+  bf16) case "$MODEL" in *moe*|*27b*) need=150 ;; *) need=40 ;; esac ;;
+  q8_0) case "$MODEL" in *moe*) need=85 ;; *27b*) need=70 ;; *) need=24 ;; esac ;;
+  *)    case "$MODEL" in *moe*) need=48 ;; *27b*) need=40 ;; *) need=14 ;; esac ;;
+esac
 free_gb="$(df -Pk "$cache" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024}')"
-if [ -n "${free_gb:-}" ] && [ "$free_gb" -lt 15 ]; then
-  info "WARNING: only ~${free_gb} GB free at $cache; models need 5-70 GB (the source GGUF + converted LBC coexist during prepare, and downloads are not resumable)."
+if [ -n "${free_gb:-}" ] && [ "$free_gb" -lt "$need" ]; then
+  info "WARNING: ~${free_gb} GB free at $cache; $MODEL:$QUANT needs roughly ${need} GB peak (source GGUF + converted LBC coexist; downloads are NOT resumable)."
   if [ "$INTERACTIVE" = "1" ]; then
     printf '  Continue anyway? [y/N] '
     read -r go < /dev/tty || go=""
@@ -202,9 +245,10 @@ if [ -n "${free_gb:-}" ] && [ "$free_gb" -lt 15 ]; then
   fi
 fi
 info "preparing $MODEL:$QUANT (download + convert; one-time)"
-LUMEN_CACHE_DIR="$cache" "$LUMEN" pull "$MODEL:$QUANT" --yes
+LUMEN_CACHE_DIR="$cache" "$LUMEN" pull "$MODEL:$QUANT" --yes \
+  || die "model prepare failed for $MODEL:$QUANT. The binaries are installed at $DEST — re-run this installer (it restarts cleanly), or run: $DEST/lumen pull $MODEL:$QUANT --yes"
 
-# ── Step 6 · print the exact next steps (correct positional form) ─────────────
+# ── Step 6 · print the exact next steps (correct positional / server forms) ───
 say ""
 say "  Lumen is ready. The model is cached, so the server starts instantly."
 say ""
