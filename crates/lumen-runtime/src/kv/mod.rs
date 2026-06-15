@@ -10,8 +10,8 @@
 
 pub mod disk;
 
-use crate::error::RuntimeError;
 use crate::compute::simd_kernels;
+use crate::error::RuntimeError;
 
 /// Precision for KV cache storage.
 ///
@@ -157,8 +157,15 @@ fn scatter_write_f32(
     pos: usize,
     max_seq_len: usize,
 ) {
-    assert_eq!(data.len(), num_kv_heads * head_dim, "scatter_write_f32: data length mismatch");
-    debug_assert!(pos < max_seq_len, "scatter_write_f32: pos={pos} >= max_seq_len={max_seq_len}");
+    assert_eq!(
+        data.len(),
+        num_kv_heads * head_dim,
+        "scatter_write_f32: data length mismatch"
+    );
+    debug_assert!(
+        pos < max_seq_len,
+        "scatter_write_f32: pos={pos} >= max_seq_len={max_seq_len}"
+    );
     let head_bytes = head_dim * 4;
     #[cfg(target_endian = "little")]
     {
@@ -202,8 +209,15 @@ fn scatter_write_f16_from_f32(
     pos: usize,
     max_seq_len: usize,
 ) {
-    assert_eq!(data.len(), num_kv_heads * head_dim, "scatter_write_f16: data length mismatch");
-    debug_assert!(pos < max_seq_len, "scatter_write_f16: pos={pos} >= max_seq_len={max_seq_len}");
+    assert_eq!(
+        data.len(),
+        num_kv_heads * head_dim,
+        "scatter_write_f16: data length mismatch"
+    );
+    debug_assert!(
+        pos < max_seq_len,
+        "scatter_write_f16: pos={pos} >= max_seq_len={max_seq_len}"
+    );
     for h in 0..num_kv_heads {
         let src_offset = h * head_dim;
         let dst_byte = (h * max_seq_len * head_dim + pos * head_dim) * 2;
@@ -305,10 +319,7 @@ impl KvCacheView {
         let byte_start = start_element_idx * 4;
         debug_assert!(byte_start + count * 4 <= self.keys.len());
         unsafe {
-            std::slice::from_raw_parts(
-                self.keys.as_ptr().add(byte_start) as *const f32,
-                count,
-            )
+            std::slice::from_raw_parts(self.keys.as_ptr().add(byte_start) as *const f32, count)
         }
     }
 
@@ -321,10 +332,7 @@ impl KvCacheView {
         let byte_start = start_element_idx * 4;
         debug_assert!(byte_start + count * 4 <= self.values.len());
         unsafe {
-            std::slice::from_raw_parts(
-                self.values.as_ptr().add(byte_start) as *const f32,
-                count,
-            )
+            std::slice::from_raw_parts(self.values.as_ptr().add(byte_start) as *const f32, count)
         }
     }
 
@@ -389,8 +397,17 @@ impl KvCacheView {
     /// position in `[head][pos][dim]` layout.
     #[inline(always)]
     pub fn append_keys_f32(&mut self, data: &[f32]) {
-        if self.seq_len >= self.max_seq_len { return; }
-        scatter_write_f32(&mut self.keys, data, self.num_kv_heads, self.head_dim, self.seq_len, self.max_seq_len);
+        if self.seq_len >= self.max_seq_len {
+            return;
+        }
+        scatter_write_f32(
+            &mut self.keys,
+            data,
+            self.num_kv_heads,
+            self.head_dim,
+            self.seq_len,
+            self.max_seq_len,
+        );
     }
 
     /// Append f32 value data in head-first layout.
@@ -398,8 +415,17 @@ impl KvCacheView {
     /// Same scatter-write logic as `append_keys_f32`.
     #[inline(always)]
     pub fn append_values_f32(&mut self, data: &[f32]) {
-        if self.seq_len >= self.max_seq_len { return; }
-        scatter_write_f32(&mut self.values, data, self.num_kv_heads, self.head_dim, self.seq_len, self.max_seq_len);
+        if self.seq_len >= self.max_seq_len {
+            return;
+        }
+        scatter_write_f32(
+            &mut self.values,
+            data,
+            self.num_kv_heads,
+            self.head_dim,
+            self.seq_len,
+            self.max_seq_len,
+        );
     }
 
     // ---- F16 KV cache methods ------------------------------------------------
@@ -408,16 +434,34 @@ impl KvCacheView {
     /// Uses NEON FCVTN batch conversion on aarch64 for high throughput.
     #[inline(always)]
     pub fn append_keys_f16_from_f32(&mut self, data: &[f32]) {
-        if self.seq_len >= self.max_seq_len { return; }
-        scatter_write_f16_from_f32(&mut self.keys, data, self.num_kv_heads, self.head_dim, self.seq_len, self.max_seq_len);
+        if self.seq_len >= self.max_seq_len {
+            return;
+        }
+        scatter_write_f16_from_f32(
+            &mut self.keys,
+            data,
+            self.num_kv_heads,
+            self.head_dim,
+            self.seq_len,
+            self.max_seq_len,
+        );
     }
 
     /// Convert f32 input to f16 and scatter-write to value cache in head-first layout.
     /// Uses NEON FCVTN batch conversion on aarch64 for high throughput.
     #[inline(always)]
     pub fn append_values_f16_from_f32(&mut self, data: &[f32]) {
-        if self.seq_len >= self.max_seq_len { return; }
-        scatter_write_f16_from_f32(&mut self.values, data, self.num_kv_heads, self.head_dim, self.seq_len, self.max_seq_len);
+        if self.seq_len >= self.max_seq_len {
+            return;
+        }
+        scatter_write_f16_from_f32(
+            &mut self.values,
+            data,
+            self.num_kv_heads,
+            self.head_dim,
+            self.seq_len,
+            self.max_seq_len,
+        );
     }
 
     /// Precision-aware key append: dispatches to F32 or F16 path based on `self.precision`.
@@ -443,7 +487,12 @@ impl KvCacheView {
     /// Read F16 keys and dequantize to f32 into a pre-allocated buffer.
     /// Uses NEON FCVTL batch conversion on aarch64 for high throughput.
     #[inline(always)]
-    pub fn read_keys_f16_to_f32_into(&self, buf: &mut [f32], start_element_idx: usize, count: usize) {
+    pub fn read_keys_f16_to_f32_into(
+        &self,
+        buf: &mut [f32],
+        start_element_idx: usize,
+        count: usize,
+    ) {
         debug_assert!(buf.len() >= count);
         let byte_start = start_element_idx * 2;
         debug_assert!(byte_start + count * 2 <= self.keys.len());
@@ -464,7 +513,12 @@ impl KvCacheView {
     /// Read F16 values and dequantize to f32 into a pre-allocated buffer.
     /// Uses NEON FCVTL batch conversion on aarch64 for high throughput.
     #[inline(always)]
-    pub fn read_values_f16_to_f32_into(&self, buf: &mut [f32], start_element_idx: usize, count: usize) {
+    pub fn read_values_f16_to_f32_into(
+        &self,
+        buf: &mut [f32],
+        start_element_idx: usize,
+        count: usize,
+    ) {
         debug_assert!(buf.len() >= count);
         let byte_start = start_element_idx * 2;
         debug_assert!(byte_start + count * 2 <= self.values.len());
@@ -633,10 +687,7 @@ impl KvCache {
     /// budget, multiply by `max_seq_len / seq_len`, not by 1.
     pub fn total_bytes(&self) -> u64 {
         let bpe = self.config.precision.bytes_per_element() as u64;
-        let per_token = self.config.num_kv_heads as u64
-            * self.config.head_dim as u64
-            * bpe
-            * 2; // K + V
+        let per_token = self.config.num_kv_heads as u64 * self.config.head_dim as u64 * bpe * 2; // K + V
         self.seq_len as u64 * per_token * self.config.num_layers as u64
     }
 
@@ -655,10 +706,7 @@ impl KvCache {
     /// of memory pressure, not a precise VRAM ledger.
     pub fn allocated_bytes(&self) -> u64 {
         let bpe = self.config.precision.bytes_per_element() as u64;
-        let per_token = self.config.num_kv_heads as u64
-            * self.config.head_dim as u64
-            * bpe
-            * 2; // K + V
+        let per_token = self.config.num_kv_heads as u64 * self.config.head_dim as u64 * bpe * 2; // K + V
         self.config.max_seq_len as u64 * per_token * self.config.num_layers as u64
     }
 
@@ -893,7 +941,8 @@ mod tests {
             num_kv_heads: 1,
             head_dim: 2,
             precision: KvPrecision::F32,
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(kv.seq_len(), 0);
         kv.advance_seq_len().unwrap();
         assert_eq!(kv.seq_len(), 1);
@@ -963,12 +1012,21 @@ mod tests {
         // (head 1 base = 1 * 16 * 4 = 64 elements)
         for e in 0..4 {
             let got = view.read_key_f32(e);
-            assert_eq!(got, data[e], "head0 key[{e}]: expected {}, got {got}", data[e]);
+            assert_eq!(
+                got, data[e],
+                "head0 key[{e}]: expected {}, got {got}",
+                data[e]
+            );
         }
         let head1_base = 1 * 16 * 4; // 64
         for e in 0..4 {
             let got = view.read_key_f32(head1_base + e);
-            assert_eq!(got, data[4 + e], "head1 key[{e}]: expected {}, got {got}", data[4 + e]);
+            assert_eq!(
+                got,
+                data[4 + e],
+                "head1 key[{e}]: expected {}, got {got}",
+                data[4 + e]
+            );
         }
         kv.commit_view(view).unwrap();
     }
@@ -983,12 +1041,21 @@ mod tests {
 
         for e in 0..4 {
             let got = view.read_value_f32(e);
-            assert_eq!(got, data[e], "head0 value[{e}]: expected {}, got {got}", data[e]);
+            assert_eq!(
+                got, data[e],
+                "head0 value[{e}]: expected {}, got {got}",
+                data[e]
+            );
         }
         let head1_base = 1 * 16 * 4;
         for e in 0..4 {
             let got = view.read_value_f32(head1_base + e);
-            assert_eq!(got, data[4 + e], "head1 value[{e}]: expected {}, got {got}", data[4 + e]);
+            assert_eq!(
+                got,
+                data[4 + e],
+                "head1 value[{e}]: expected {}, got {got}",
+                data[4 + e]
+            );
         }
         kv.commit_view(view).unwrap();
     }
@@ -1008,13 +1075,21 @@ mod tests {
         view.append_keys_f32(&data1);
 
         // Head 0: pos 0 at element 0..4, pos 1 at element 4..8
-        for e in 0..4 { assert_eq!(view.read_key_f32(e), data0[e]); }
-        for e in 0..4 { assert_eq!(view.read_key_f32(4 + e), data1[e]); }
+        for e in 0..4 {
+            assert_eq!(view.read_key_f32(e), data0[e]);
+        }
+        for e in 0..4 {
+            assert_eq!(view.read_key_f32(4 + e), data1[e]);
+        }
 
         // Head 1: base = 64. pos 0 at 64..68, pos 1 at 68..72
         let h1 = 16 * 4; // 64
-        for e in 0..4 { assert_eq!(view.read_key_f32(h1 + e), data0[4 + e]); }
-        for e in 0..4 { assert_eq!(view.read_key_f32(h1 + 4 + e), data1[4 + e]); }
+        for e in 0..4 {
+            assert_eq!(view.read_key_f32(h1 + e), data0[4 + e]);
+        }
+        for e in 0..4 {
+            assert_eq!(view.read_key_f32(h1 + 4 + e), data1[4 + e]);
+        }
         kv.commit_view(view).unwrap();
     }
 
@@ -1160,7 +1235,8 @@ mod tests {
         for (i, &expected) in data[0..4].iter().enumerate() {
             assert!(
                 (buf[i] - expected).abs() < 0.01,
-                "head0 key[{i}]: expected {expected}, got {}", buf[i]
+                "head0 key[{i}]: expected {expected}, got {}",
+                buf[i]
             );
         }
 
@@ -1170,7 +1246,8 @@ mod tests {
         for (i, &expected) in data[4..8].iter().enumerate() {
             assert!(
                 (buf[i] - expected).abs() < 0.01,
-                "head1 key[{i}]: expected {expected}, got {}", buf[i]
+                "head1 key[{i}]: expected {expected}, got {}",
+                buf[i]
             );
         }
         kv.commit_view(view).unwrap();
@@ -1190,7 +1267,8 @@ mod tests {
             let tol = expected.abs() * 0.01 + 0.001;
             assert!(
                 (buf[i] - expected).abs() < tol,
-                "head0 value[{i}]: expected {expected}, got {}", buf[i]
+                "head0 value[{i}]: expected {expected}, got {}",
+                buf[i]
             );
         }
 
@@ -1200,7 +1278,8 @@ mod tests {
             let tol = expected.abs() * 0.01 + 0.001;
             assert!(
                 (buf[i] - expected).abs() < tol,
-                "head1 value[{i}]: expected {expected}, got {}", buf[i]
+                "head1 value[{i}]: expected {expected}, got {}",
+                buf[i]
             );
         }
         kv.commit_view(view).unwrap();
@@ -1223,12 +1302,14 @@ mod tests {
             assert!(
                 (kbuf[i] - data[i]).abs() < 0.01,
                 "key[{i}] mismatch: got {}, expected {}",
-                kbuf[i], data[i]
+                kbuf[i],
+                data[i]
             );
             assert!(
                 (vbuf[i] - data[i]).abs() < 0.01,
                 "value[{i}] mismatch: got {}, expected {}",
-                vbuf[i], data[i]
+                vbuf[i],
+                data[i]
             );
         }
         kv.commit_view(view).unwrap();
@@ -1264,9 +1345,13 @@ mod tests {
         // Head 0: pos 0 at element 0..4, pos 1 at element 4..8
         let mut buf = [0.0f32; 4];
         view.read_keys_f16_to_f32_into(&mut buf, 0, 4);
-        for i in 0..4 { assert!((buf[i] - data0[i]).abs() < 0.01); }
+        for i in 0..4 {
+            assert!((buf[i] - data0[i]).abs() < 0.01);
+        }
         view.read_keys_f16_to_f32_into(&mut buf, 4, 4);
-        for i in 0..4 { assert!((buf[i] - data1[i]).abs() < 0.01); }
+        for i in 0..4 {
+            assert!((buf[i] - data1[i]).abs() < 0.01);
+        }
 
         kv.commit_view(view).unwrap();
     }
@@ -1298,9 +1383,9 @@ mod tests {
 
         // Head 0 should be contiguous: pos0[0..4], pos1[0..4], pos2[0..4]
         let slice = view.keys_f32_slice(0, 12); // 3 positions × 4 elements
-        assert_eq!(slice[0], 10.0);  // pos0, head0, e0
-        assert_eq!(slice[4], 20.0);  // pos1, head0, e0
-        assert_eq!(slice[8], 30.0);  // pos2, head0, e0
+        assert_eq!(slice[0], 10.0); // pos0, head0, e0
+        assert_eq!(slice[4], 20.0); // pos1, head0, e0
+        assert_eq!(slice[8], 30.0); // pos2, head0, e0
 
         kv.commit_view(view).unwrap();
     }

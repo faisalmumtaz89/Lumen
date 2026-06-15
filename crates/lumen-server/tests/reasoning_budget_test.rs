@@ -130,11 +130,18 @@ async fn drain(handle: &EngineHandle, req: JobRequest) -> Drained {
     let mut completion_tokens = 0usize;
     loop {
         match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
-            Ok(Some(TokenEvent::Token { token_id, delta_text })) => {
+            Ok(Some(TokenEvent::Token {
+                token_id,
+                delta_text,
+            })) => {
                 token_ids.push(token_id);
                 fragments.push(delta_text);
             }
-            Ok(Some(TokenEvent::Done { finish_reason, completion_tokens: c, .. })) => {
+            Ok(Some(TokenEvent::Done {
+                finish_reason,
+                completion_tokens: c,
+                ..
+            })) => {
                 finish = finish_reason;
                 completion_tokens = c;
                 break;
@@ -145,7 +152,12 @@ async fn drain(handle: &EngineHandle, req: JobRequest) -> Drained {
             Err(_) => panic!("timed out draining job"),
         }
     }
-    Drained { fragments, token_ids, finish, completion_tokens }
+    Drained {
+        fragments,
+        token_ids,
+        finish,
+        completion_tokens,
+    }
 }
 
 // =========================================================================
@@ -163,12 +175,18 @@ async fn thinking_off_is_deterministic_and_budget_exact() {
     let b = drain(&handle, job(12, false, 0)).await;
 
     // Determinism: identical token streams.
-    assert_eq!(a.token_ids, b.token_ids, "thinking-off greedy must be deterministic");
+    assert_eq!(
+        a.token_ids, b.token_ids,
+        "thinking-off greedy must be deterministic"
+    );
     assert_eq!(a.full_text(), b.full_text());
 
     // Answer budget: exactly max_tokens tokens (no reasoning phase, so every
     // token is an answer token), finish_reason == Length.
-    assert_eq!(a.completion_tokens, 12, "thinking-off must emit exactly max_tokens");
+    assert_eq!(
+        a.completion_tokens, 12,
+        "thinking-off must emit exactly max_tokens"
+    );
     assert_eq!(a.token_event_count(), 12);
     assert_eq!(a.finish, FinishReason::Length);
 

@@ -36,7 +36,8 @@ fn test_hyperparams() -> ModelHyperparams {
         num_experts: None,
         num_active_experts: None,
         norm_eps: 1e-6,
-        rotary_dim: None, rope_neox: false,
+        rotary_dim: None,
+        rope_neox: false,
         gdn: None,
     }
 }
@@ -209,10 +210,22 @@ fn build_gdn_layer(layer_idx: usize, hp: &ModelHyperparams) -> LayerView {
     // wq for GDN is the fused QKV projection: [qkv_dim, hidden_dim]
     let wq = append_tensor(&mut data, gdn.qkv_dim * hidden_dim);
     // wk/wv not used for GDN but must be present in SubtensorOffsets
-    let wk = TensorSlice { offset: 0, length: 0, quant: QuantScheme::F32 };
-    let wv = TensorSlice { offset: 0, length: 0, quant: QuantScheme::F32 };
+    let wk = TensorSlice {
+        offset: 0,
+        length: 0,
+        quant: QuantScheme::F32,
+    };
+    let wv = TensorSlice {
+        offset: 0,
+        length: 0,
+        quant: QuantScheme::F32,
+    };
     // wo not used for GDN (ssm_out replaces it) but must be present
-    let wo = TensorSlice { offset: 0, length: 0, quant: QuantScheme::F32 };
+    let wo = TensorSlice {
+        offset: 0,
+        length: 0,
+        quant: QuantScheme::F32,
+    };
     let ffn_norm = append_tensor(&mut data, hidden_dim);
     let w_gate = append_tensor(&mut data, inter_dim * hidden_dim);
     let w_up = append_tensor(&mut data, inter_dim * hidden_dim);
@@ -310,15 +323,15 @@ fn test_cuda_backend_caps_gdn() {
 #[test]
 fn test_compute_layer_gdn_routing() {
     let hp = test_hyperparams();
-    let mut backend = lumen_runtime::CudaBackend::new(0)
-        .expect("CudaBackend::new(0) should succeed");
+    let mut backend =
+        lumen_runtime::CudaBackend::new(0).expect("CudaBackend::new(0) should succeed");
 
     // Set up minimal global tensors (required for init).
     let hidden_dim = hp.hidden_dim as usize;
     let vocab_size = hp.vocab_size as usize;
     backend.set_global_tensors(
         vec![0.01f32; vocab_size * hidden_dim], // embedding
-        vec![1.0f32; hidden_dim],                // final_norm
+        vec![1.0f32; hidden_dim],               // final_norm
         vec![0.01f32; vocab_size * hidden_dim], // output_proj
     );
 
@@ -358,8 +371,8 @@ fn test_compute_layer_gdn_routing() {
 #[test]
 fn test_reset_recurrent_state() {
     let hp = test_hyperparams();
-    let mut backend = lumen_runtime::CudaBackend::new(0)
-        .expect("CudaBackend::new(0) should succeed");
+    let mut backend =
+        lumen_runtime::CudaBackend::new(0).expect("CudaBackend::new(0) should succeed");
 
     let hidden_dim = hp.hidden_dim as usize;
     let vocab_size = hp.vocab_size as usize;
@@ -424,8 +437,8 @@ fn test_reset_recurrent_state() {
 #[test]
 fn test_hybrid_model_routing() {
     let hp = test_hyperparams();
-    let mut backend = lumen_runtime::CudaBackend::new(0)
-        .expect("CudaBackend::new(0) should succeed");
+    let mut backend =
+        lumen_runtime::CudaBackend::new(0).expect("CudaBackend::new(0) should succeed");
 
     let hidden_dim = hp.hidden_dim as usize;
     let vocab_size = hp.vocab_size as usize;
@@ -439,9 +452,9 @@ fn test_hybrid_model_routing() {
     // 4-layer hybrid model: GDN, Attn, GDN, Attn
     let layers: Vec<LayerView> = vec![
         build_gdn_layer(0, &hp),       // layer 0: GDN
-        build_attention_layer(1, &hp),  // layer 1: Attention
-        build_gdn_layer(2, &hp),        // layer 2: GDN
-        build_attention_layer(3, &hp),  // layer 3: Attention
+        build_attention_layer(1, &hp), // layer 1: Attention
+        build_gdn_layer(2, &hp),       // layer 2: GDN
+        build_attention_layer(3, &hp), // layer 3: Attention
     ];
 
     let x_values: Vec<f32> = (0..hidden_dim).map(|i| (i as f32) * 0.1 + 0.5).collect();
@@ -485,8 +498,8 @@ fn test_hybrid_model_routing() {
 #[test]
 fn test_gdn_state_persistence() {
     let hp = test_hyperparams();
-    let mut backend = lumen_runtime::CudaBackend::new(0)
-        .expect("CudaBackend::new(0) should succeed");
+    let mut backend =
+        lumen_runtime::CudaBackend::new(0).expect("CudaBackend::new(0) should succeed");
 
     let hidden_dim = hp.hidden_dim as usize;
     let vocab_size = hp.vocab_size as usize;
@@ -525,16 +538,8 @@ fn test_gdn_state_persistence() {
     let out2: Vec<f32> = x2.as_f32_slice().to_vec();
 
     // All outputs should be different due to state accumulation.
-    let diff_01: f32 = out0
-        .iter()
-        .zip(&out1)
-        .map(|(a, b)| (a - b).abs())
-        .sum();
-    let diff_12: f32 = out1
-        .iter()
-        .zip(&out2)
-        .map(|(a, b)| (a - b).abs())
-        .sum();
+    let diff_01: f32 = out0.iter().zip(&out1).map(|(a, b)| (a - b).abs()).sum();
+    let diff_12: f32 = out1.iter().zip(&out2).map(|(a, b)| (a - b).abs()).sum();
 
     assert!(
         diff_01 > 1e-6,

@@ -51,7 +51,10 @@ impl TimingStats {
     ///
     /// Panics if `times_us` is empty.
     fn from_us(times_us: &[f64]) -> Self {
-        assert!(!times_us.is_empty(), "no measurements to compute stats from");
+        assert!(
+            !times_us.is_empty(),
+            "no measurements to compute stats from"
+        );
         let count = times_us.len();
         let mean_us = times_us.iter().sum::<f64>() / count as f64;
         let min_us = times_us.iter().copied().fold(f64::INFINITY, f64::min);
@@ -67,7 +70,14 @@ impl TimingStats {
         let p99_idx = ((count as f64) * 0.99).ceil() as usize;
         let p99_us = sorted[p99_idx.min(count) - 1];
 
-        Self { mean_us, min_us, max_us, median_us, p99_us, count }
+        Self {
+            mean_us,
+            min_us,
+            max_us,
+            median_us,
+            p99_us,
+            count,
+        }
     }
 }
 
@@ -146,8 +156,12 @@ fn bench_cuda_decode() {
     eprintln!("=== CUDA Decode Benchmark ===");
     eprintln!(
         "  Model: {} layers, hidden_dim={}, heads={}, head_dim={}, inter_dim={}, vocab={}",
-        config.num_layers, config.hidden_dim, config.num_heads,
-        config.head_dim, config.intermediate_dim, config.vocab_size,
+        config.num_layers,
+        config.hidden_dim,
+        config.num_heads,
+        config.head_dim,
+        config.intermediate_dim,
+        config.vocab_size,
     );
     eprintln!("  Scale: {scale}");
     eprintln!("  Warmup tokens: {warmup_tokens}");
@@ -226,8 +240,14 @@ fn bench_cuda_decode() {
     eprintln!();
     eprintln!("=== Decode Results ===");
     eprintln!("  Tokens measured: {}", stats.count);
-    eprintln!("  Mean:   {:.1} us/tok  ({tok_per_sec:.1} tok/s)", stats.mean_us);
-    eprintln!("  Median: {:.1} us/tok  ({tok_per_sec_median:.1} tok/s)", stats.median_us);
+    eprintln!(
+        "  Mean:   {:.1} us/tok  ({tok_per_sec:.1} tok/s)",
+        stats.mean_us
+    );
+    eprintln!(
+        "  Median: {:.1} us/tok  ({tok_per_sec_median:.1} tok/s)",
+        stats.median_us
+    );
     eprintln!("  Min:    {:.1} us/tok", stats.min_us);
     eprintln!("  Max:    {:.1} us/tok", stats.max_us);
     eprintln!("  P99:    {:.1} us/tok", stats.p99_us);
@@ -323,27 +343,23 @@ fn bench_kernel_rmsnorm() {
         shared_mem_bytes: num_warps * 4,
     };
 
-    let (mean_us, _min_us, _max_us, elapsed) = bench_kernel_loop(
-        &stream, 100, iterations,
-        || {
-            unsafe {
-                stream
-                    .launch_builder(&func)
-                    .arg(&x_gpu)
-                    .arg(&w_gpu)
-                    .arg(&mut out_gpu)
-                    .arg(&eps)
-                    .arg(&(dim as u32))
-                    .launch(cfg)
-            }
-            .unwrap();
-        },
-    );
+    let (mean_us, _min_us, _max_us, elapsed) = bench_kernel_loop(&stream, 100, iterations, || {
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&x_gpu)
+                .arg(&w_gpu)
+                .arg(&mut out_gpu)
+                .arg(&eps)
+                .arg(&(dim as u32))
+                .launch(cfg)
+        }
+        .unwrap();
+    });
 
     // Memory traffic: read x (dim*4) + read weight (dim*4) + write out (dim*4)
     let bytes_per_op = 3 * dim * 4;
-    let bandwidth_gbs =
-        (bytes_per_op as f64 * iterations as f64) / elapsed.as_secs_f64() / 1e9;
+    let bandwidth_gbs = (bytes_per_op as f64 * iterations as f64) / elapsed.as_secs_f64() / 1e9;
 
     eprintln!();
     eprintln!("=== RMSNorm Benchmark (dim={dim}) ===");
@@ -366,8 +382,9 @@ fn bench_kernel_matvec_f32() {
     let module = ctx.load_module(ptx).unwrap();
     let func = module.load_function("matvec_f32").unwrap();
 
-    let weight: Vec<f32> =
-        (0..out_dim * in_dim).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+    let weight: Vec<f32> = (0..out_dim * in_dim)
+        .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+        .collect();
     let x: Vec<f32> = (0..in_dim).map(|i| (i as f32) * 0.001).collect();
 
     let w_gpu = stream.clone_htod(&weight).unwrap();
@@ -381,30 +398,26 @@ fn bench_kernel_matvec_f32() {
         shared_mem_bytes: 0,
     };
 
-    let (mean_us, _min_us, _max_us, elapsed) = bench_kernel_loop(
-        &stream, 100, iterations,
-        || {
-            unsafe {
-                stream
-                    .launch_builder(&func)
-                    .arg(&w_gpu)
-                    .arg(&x_gpu)
-                    .arg(&mut out_gpu)
-                    .arg(&(out_dim as u32))
-                    .arg(&(in_dim as u32))
-                    .launch(cfg)
-            }
-            .unwrap();
-        },
-    );
+    let (mean_us, _min_us, _max_us, elapsed) = bench_kernel_loop(&stream, 100, iterations, || {
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&w_gpu)
+                .arg(&x_gpu)
+                .arg(&mut out_gpu)
+                .arg(&(out_dim as u32))
+                .arg(&(in_dim as u32))
+                .launch(cfg)
+        }
+        .unwrap();
+    });
 
     let flops_per_op = 2.0 * out_dim as f64 * in_dim as f64;
     let gflops = (flops_per_op * iterations as f64) / elapsed.as_secs_f64() / 1e9;
     let tflops = gflops / 1000.0;
     // Memory traffic: read weight + read x + write out
     let bytes_per_op = (out_dim * in_dim + in_dim + out_dim) * 4;
-    let bandwidth_gbs =
-        (bytes_per_op as f64 * iterations as f64) / elapsed.as_secs_f64() / 1e9;
+    let bandwidth_gbs = (bytes_per_op as f64 * iterations as f64) / elapsed.as_secs_f64() / 1e9;
 
     eprintln!();
     eprintln!("=== MatVec F32 Benchmark ({out_dim}x{in_dim}) ===");
@@ -429,8 +442,9 @@ fn bench_kernel_matvec_f32_large() {
     let module = ctx.load_module(ptx).unwrap();
     let func = module.load_function("matvec_f32").unwrap();
 
-    let weight: Vec<f32> =
-        (0..out_dim * in_dim).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+    let weight: Vec<f32> = (0..out_dim * in_dim)
+        .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+        .collect();
     let x: Vec<f32> = (0..in_dim).map(|i| (i as f32) * 0.001).collect();
 
     let w_gpu = stream.clone_htod(&weight).unwrap();
@@ -444,29 +458,25 @@ fn bench_kernel_matvec_f32_large() {
         shared_mem_bytes: 0,
     };
 
-    let (mean_us, _min_us, _max_us, elapsed) = bench_kernel_loop(
-        &stream, 100, iterations,
-        || {
-            unsafe {
-                stream
-                    .launch_builder(&func)
-                    .arg(&w_gpu)
-                    .arg(&x_gpu)
-                    .arg(&mut out_gpu)
-                    .arg(&(out_dim as u32))
-                    .arg(&(in_dim as u32))
-                    .launch(cfg)
-            }
-            .unwrap();
-        },
-    );
+    let (mean_us, _min_us, _max_us, elapsed) = bench_kernel_loop(&stream, 100, iterations, || {
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&w_gpu)
+                .arg(&x_gpu)
+                .arg(&mut out_gpu)
+                .arg(&(out_dim as u32))
+                .arg(&(in_dim as u32))
+                .launch(cfg)
+        }
+        .unwrap();
+    });
 
     let flops_per_op = 2.0 * out_dim as f64 * in_dim as f64;
     let gflops = (flops_per_op * iterations as f64) / elapsed.as_secs_f64() / 1e9;
     let tflops = gflops / 1000.0;
     let bytes_per_op = (out_dim * in_dim + in_dim + out_dim) * 4;
-    let bandwidth_gbs =
-        (bytes_per_op as f64 * iterations as f64) / elapsed.as_secs_f64() / 1e9;
+    let bandwidth_gbs = (bytes_per_op as f64 * iterations as f64) / elapsed.as_secs_f64() / 1e9;
 
     eprintln!();
     eprintln!("=== MatVec F32 Benchmark ({out_dim}x{in_dim}, TinyLlama FFN scale) ===");
@@ -527,22 +537,19 @@ fn bench_kernel_matvec_q8_0() {
         shared_mem_bytes: 0,
     };
 
-    let (mean_us, _min_us, _max_us, elapsed) = bench_kernel_loop(
-        &stream, 100, iterations,
-        || {
-            unsafe {
-                stream
-                    .launch_builder(&func)
-                    .arg(&w_gpu)
-                    .arg(&x_gpu)
-                    .arg(&mut out_gpu)
-                    .arg(&(out_dim as u32))
-                    .arg(&(in_dim as u32))
-                    .launch(cfg)
-            }
-            .unwrap();
-        },
-    );
+    let (mean_us, _min_us, _max_us, elapsed) = bench_kernel_loop(&stream, 100, iterations, || {
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&w_gpu)
+                .arg(&x_gpu)
+                .arg(&mut out_gpu)
+                .arg(&(out_dim as u32))
+                .arg(&(in_dim as u32))
+                .launch(cfg)
+        }
+        .unwrap();
+    });
 
     // FLOPs: same as F32 matvec (2 * out * in), the dequant is pure overhead.
     let flops_per_op = 2.0 * out_dim as f64 * in_dim as f64;
@@ -550,8 +557,7 @@ fn bench_kernel_matvec_q8_0() {
     let tflops = gflops / 1000.0;
     // Memory traffic: read Q8_0 weight (total_bytes) + read x (in_dim*4) + write out (out_dim*4)
     let bytes_per_op = total_bytes + in_dim * 4 + out_dim * 4;
-    let bandwidth_gbs =
-        (bytes_per_op as f64 * iterations as f64) / elapsed.as_secs_f64() / 1e9;
+    let bandwidth_gbs = (bytes_per_op as f64 * iterations as f64) / elapsed.as_secs_f64() / 1e9;
 
     eprintln!();
     eprintln!("=== MatVec Q8_0 Benchmark ({out_dim}x{in_dim}) ===");
@@ -585,13 +591,14 @@ fn bench_kernel_attention_decode() {
     let max_seq_len = *seq_lengths.iter().max().unwrap();
 
     let q_size = (num_heads * head_dim) as usize;
-    let kv_cache_size =
-        (num_kv_heads as usize) * (max_seq_len as usize) * (head_dim as usize);
+    let kv_cache_size = (num_kv_heads as usize) * (max_seq_len as usize) * (head_dim as usize);
 
-    let q_data: Vec<f32> =
-        (0..q_size).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
-    let kv_data: Vec<f32> =
-        (0..kv_cache_size).map(|i| ((i % 61) as f32 - 30.0) * 0.01).collect();
+    let q_data: Vec<f32> = (0..q_size)
+        .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+        .collect();
+    let kv_data: Vec<f32> = (0..kv_cache_size)
+        .map(|i| ((i % 61) as f32 - 30.0) * 0.01)
+        .collect();
 
     let q_gpu = stream.clone_htod(&q_data).unwrap();
     let k_cache_gpu = stream.clone_htod(&kv_data).unwrap();
@@ -601,9 +608,7 @@ fn bench_kernel_attention_decode() {
     let scale = 1.0f32 / (head_dim as f32).sqrt();
 
     eprintln!();
-    eprintln!(
-        "=== Attention Decode Benchmark (heads={num_heads}, head_dim={head_dim}) ===",
-    );
+    eprintln!("=== Attention Decode Benchmark (heads={num_heads}, head_dim={head_dim}) ===",);
 
     for &seq_len in &seq_lengths {
         let block_size = {
@@ -622,9 +627,8 @@ fn bench_kernel_attention_decode() {
         // Fewer iterations for attention (more expensive per call).
         let attn_iters = iterations / 10;
 
-        let (mean_us, _min_us, _max_us, _elapsed) = bench_kernel_loop(
-            &stream, 50, attn_iters,
-            || {
+        let (mean_us, _min_us, _max_us, _elapsed) =
+            bench_kernel_loop(&stream, 50, attn_iters, || {
                 unsafe {
                     stream
                         .launch_builder(&func)
@@ -641,12 +645,9 @@ fn bench_kernel_attention_decode() {
                         .launch(cfg)
                 }
                 .unwrap();
-            },
-        );
+            });
 
-        eprintln!(
-            "  seq_len={seq_len:4}: {mean_us:8.1} us/op  ({attn_iters} iterations)",
-        );
+        eprintln!("  seq_len={seq_len:4}: {mean_us:8.1} us/op  ({attn_iters} iterations)",);
     }
 }
 
@@ -662,8 +663,7 @@ fn bench_kernel_swiglu() {
     let module = ctx.load_module(ptx).unwrap();
     let func = module.load_function("swiglu_inplace").unwrap();
 
-    let gate: Vec<f32> =
-        (0..dim).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+    let gate: Vec<f32> = (0..dim).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
     let up: Vec<f32> = (0..dim).map(|i| ((i % 61) as f32 - 30.0) * 0.01).collect();
 
     let mut gate_gpu = stream.clone_htod(&gate).unwrap();
@@ -678,25 +678,21 @@ fn bench_kernel_swiglu() {
         shared_mem_bytes: 0,
     };
 
-    let (mean_us, _min_us, _max_us, elapsed) = bench_kernel_loop(
-        &stream, 100, iterations,
-        || {
-            unsafe {
-                stream
-                    .launch_builder(&func)
-                    .arg(&mut gate_gpu)
-                    .arg(&up_gpu)
-                    .arg(&n)
-                    .launch(cfg)
-            }
-            .unwrap();
-        },
-    );
+    let (mean_us, _min_us, _max_us, elapsed) = bench_kernel_loop(&stream, 100, iterations, || {
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&mut gate_gpu)
+                .arg(&up_gpu)
+                .arg(&n)
+                .launch(cfg)
+        }
+        .unwrap();
+    });
 
     // Memory: read gate + read up + write gate = 3*dim*4 bytes
     let bytes_per_op = 3 * dim * 4;
-    let bandwidth_gbs =
-        (bytes_per_op as f64 * iterations as f64) / elapsed.as_secs_f64() / 1e9;
+    let bandwidth_gbs = (bytes_per_op as f64 * iterations as f64) / elapsed.as_secs_f64() / 1e9;
 
     eprintln!();
     eprintln!("=== SwiGLU Benchmark (dim={dim}) ===");
@@ -733,25 +729,21 @@ fn bench_kernel_residual_add() {
         shared_mem_bytes: 0,
     };
 
-    let (mean_us, _min_us, _max_us, elapsed) = bench_kernel_loop(
-        &stream, 100, iterations,
-        || {
-            unsafe {
-                stream
-                    .launch_builder(&func)
-                    .arg(&mut x_gpu)
-                    .arg(&res_gpu)
-                    .arg(&n)
-                    .launch(cfg)
-            }
-            .unwrap();
-        },
-    );
+    let (mean_us, _min_us, _max_us, elapsed) = bench_kernel_loop(&stream, 100, iterations, || {
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&mut x_gpu)
+                .arg(&res_gpu)
+                .arg(&n)
+                .launch(cfg)
+        }
+        .unwrap();
+    });
 
     // Memory: read x + read residual + write x = 3*dim*4
     let bytes_per_op = 3 * dim * 4;
-    let bandwidth_gbs =
-        (bytes_per_op as f64 * iterations as f64) / elapsed.as_secs_f64() / 1e9;
+    let bandwidth_gbs = (bytes_per_op as f64 * iterations as f64) / elapsed.as_secs_f64() / 1e9;
 
     eprintln!();
     eprintln!("=== Residual Add Benchmark (dim={dim}) ===");
@@ -779,10 +771,12 @@ fn bench_kernel_rope() {
     let q_size = (num_q_heads * head_dim) as usize;
     let k_size = (num_kv_heads * head_dim) as usize;
 
-    let q: Vec<f32> =
-        (0..q_size).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
-    let k: Vec<f32> =
-        (0..k_size).map(|i| ((i % 61) as f32 - 30.0) * 0.01).collect();
+    let q: Vec<f32> = (0..q_size)
+        .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+        .collect();
+    let k: Vec<f32> = (0..k_size)
+        .map(|i| ((i % 61) as f32 - 30.0) * 0.01)
+        .collect();
 
     let mut q_gpu = stream.clone_htod(&q).unwrap();
     let mut k_gpu = stream.clone_htod(&k).unwrap();
@@ -802,34 +796,28 @@ fn bench_kernel_rope() {
 
     let pos = 42u32;
 
-    let (mean_us, _min_us, _max_us, elapsed) = bench_kernel_loop(
-        &stream, 100, iterations,
-        || {
-            unsafe {
-                stream
-                    .launch_builder(&func)
-                    .arg(&mut q_gpu)
-                    .arg(&mut k_gpu)
-                    .arg(&pos)
-                    .arg(&num_q_heads)
-                    .arg(&num_kv_heads)
-                    .arg(&head_dim)
-                    .arg(&theta)
-                    .launch(cfg)
-            }
-            .unwrap();
-        },
-    );
+    let (mean_us, _min_us, _max_us, elapsed) = bench_kernel_loop(&stream, 100, iterations, || {
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&mut q_gpu)
+                .arg(&mut k_gpu)
+                .arg(&pos)
+                .arg(&num_q_heads)
+                .arg(&num_kv_heads)
+                .arg(&head_dim)
+                .arg(&theta)
+                .launch(cfg)
+        }
+        .unwrap();
+    });
 
     // Memory: read+write q + read+write k
     let bytes_per_op = (q_size + k_size) * 4 * 2;
-    let bandwidth_gbs =
-        (bytes_per_op as f64 * iterations as f64) / elapsed.as_secs_f64() / 1e9;
+    let bandwidth_gbs = (bytes_per_op as f64 * iterations as f64) / elapsed.as_secs_f64() / 1e9;
 
     eprintln!();
-    eprintln!(
-        "=== RoPE Benchmark (heads={num_q_heads}, head_dim={head_dim}) ===",
-    );
+    eprintln!("=== RoPE Benchmark (heads={num_q_heads}, head_dim={head_dim}) ===",);
     eprintln!("  Iterations: {iterations}");
     eprintln!("  Time/op:    {mean_us:.3} us");
     eprintln!("  Bandwidth:  {bandwidth_gbs:.1} GB/s");
@@ -849,14 +837,35 @@ fn bench_kernel_compilation_time() {
     eprintln!("=== Kernel Compilation Time ===");
 
     let kernel_sources = [
-        ("norm.cu (rmsnorm)", lumen_runtime::cuda::shaders::NORM_KERNEL_SOURCE),
-        ("matvec_f32.cu", lumen_runtime::cuda::shaders::MATVEC_F32_KERNEL_SOURCE),
-        ("matvec_q8_0.cu", lumen_runtime::cuda::shaders::MATVEC_Q8_0_KERNEL_SOURCE),
+        (
+            "norm.cu (rmsnorm)",
+            lumen_runtime::cuda::shaders::NORM_KERNEL_SOURCE,
+        ),
+        (
+            "matvec_f32.cu",
+            lumen_runtime::cuda::shaders::MATVEC_F32_KERNEL_SOURCE,
+        ),
+        (
+            "matvec_q8_0.cu",
+            lumen_runtime::cuda::shaders::MATVEC_Q8_0_KERNEL_SOURCE,
+        ),
         ("rope.cu", lumen_runtime::cuda::shaders::ROPE_KERNEL_SOURCE),
-        ("activations.cu", lumen_runtime::cuda::shaders::ACTIVATIONS_KERNEL_SOURCE),
-        ("attention.cu", lumen_runtime::cuda::shaders::ATTENTION_KERNEL_SOURCE),
-        ("kv_cache.cu", lumen_runtime::cuda::shaders::KV_CACHE_KERNEL_SOURCE),
-        ("embed.cu", lumen_runtime::cuda::shaders::EMBED_KERNEL_SOURCE),
+        (
+            "activations.cu",
+            lumen_runtime::cuda::shaders::ACTIVATIONS_KERNEL_SOURCE,
+        ),
+        (
+            "attention.cu",
+            lumen_runtime::cuda::shaders::ATTENTION_KERNEL_SOURCE,
+        ),
+        (
+            "kv_cache.cu",
+            lumen_runtime::cuda::shaders::KV_CACHE_KERNEL_SOURCE,
+        ),
+        (
+            "embed.cu",
+            lumen_runtime::cuda::shaders::EMBED_KERNEL_SOURCE,
+        ),
     ];
 
     let mut total_ms = 0.0f64;
@@ -874,9 +883,7 @@ fn bench_kernel_compilation_time() {
         let load_ms = load_time.as_secs_f64() * 1000.0;
         total_ms += compile_ms + load_ms;
 
-        eprintln!(
-            "  {name:30}  compile: {compile_ms:7.1} ms  load: {load_ms:6.1} ms",
-        );
+        eprintln!("  {name:30}  compile: {compile_ms:7.1} ms  load: {load_ms:6.1} ms",);
     }
 
     eprintln!("  {:<30}  total:  {total_ms:7.1} ms", "ALL KERNELS");

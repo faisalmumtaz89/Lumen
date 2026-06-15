@@ -205,7 +205,8 @@ pub fn sha1_hex(bytes: &[u8]) -> String {
                 40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDCu32),
                 _ => (b ^ c ^ d, 0xCA62_C1D6u32),
             };
-            let temp = a.rotate_left(5)
+            let temp = a
+                .rotate_left(5)
                 .wrapping_add(f)
                 .wrapping_add(e)
                 .wrapping_add(k)
@@ -257,21 +258,20 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     // SHA-256 round constants (first 32 bits of fractional parts of cube
     // roots of the first 64 primes, per FIPS 180-4 §4.2.2).
     const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
-        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
-        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
     ];
     let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
 
     // Pad: original || 0x80 || 0x00...0x00 || len_bits_be64.
@@ -288,9 +288,7 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
         let mut w = [0u32; 64];
         for i in 0..16 {
             let off = i * 4;
-            w[i] = u32::from_be_bytes([
-                chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3],
-            ]);
+            w[i] = u32::from_be_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -924,7 +922,7 @@ fn write_pending_logits_section<W: Write + Seek>(
     let mut meta = [0u8; PENDING_LOGITS_META_BYTES];
     meta[0..4].copy_from_slice(&vocab_size.to_le_bytes());
     meta[4..8].copy_from_slice(&0u32.to_le_bytes()); // CRC placeholder
-    // meta[8..12] left zeroed for forward-compat.
+                                                     // meta[8..12] left zeroed for forward-compat.
     f.write_all(&meta).map_err(RuntimeError::StorageIo)?;
 
     let mut crc = Crc32Stream::new();
@@ -1001,9 +999,8 @@ fn read_pending_logits_section<R: Read>(
 fn read_recurrent_section<R: Read>(f: &mut R) -> Result<RecurrentState, RuntimeError> {
     let mut meta = [0u8; RECURRENT_META_BYTES];
     f.read_exact(&mut meta).map_err(RuntimeError::StorageIo)?;
-    let take_u32 = |off: usize| -> u32 {
-        u32::from_le_bytes(meta[off..off + 4].try_into().unwrap())
-    };
+    let take_u32 =
+        |off: usize| -> u32 { u32::from_le_bytes(meta[off..off + 4].try_into().unwrap()) };
     let layout_version = take_u32(0);
     if layout_version != RECURRENT_LAYOUT_VERSION {
         return Err(RuntimeError::StorageIo(std::io::Error::new(
@@ -1048,7 +1045,8 @@ fn read_recurrent_section<R: Read>(f: &mut R) -> Result<RecurrentState, RuntimeE
             .map_err(RuntimeError::StorageIo)?;
         crc.update(&state.conv_states[layer]);
         let mut pos_bytes = [0u8; 4];
-        f.read_exact(&mut pos_bytes).map_err(RuntimeError::StorageIo)?;
+        f.read_exact(&mut pos_bytes)
+            .map_err(RuntimeError::StorageIo)?;
         crc.update(&pos_bytes);
         state.conv_positions[layer] = u32::from_le_bytes(pos_bytes);
     }
@@ -1118,7 +1116,15 @@ pub fn save_atomic(
     recurrent: Option<&RecurrentState>,
     pending_logits: Option<&[f32]>,
 ) -> Result<(), RuntimeError> {
-    save_atomic_inner(kv, tokens, path, hits, fingerprint, recurrent, pending_logits)
+    save_atomic_inner(
+        kv,
+        tokens,
+        path,
+        hits,
+        fingerprint,
+        recurrent,
+        pending_logits,
+    )
 }
 
 fn save_atomic_inner(
@@ -1151,15 +1157,12 @@ fn save_atomic_inner(
     })?;
     fs::create_dir_all(parent).map_err(RuntimeError::StorageIo)?;
     let pid = std::process::id();
-    let final_name = path
-        .file_name()
-        .map(|f| f.to_owned())
-        .ok_or_else(|| {
-            RuntimeError::StorageIo(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "disk KV save: path has no filename",
-            ))
-        })?;
+    let final_name = path.file_name().map(|f| f.to_owned()).ok_or_else(|| {
+        RuntimeError::StorageIo(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "disk KV save: path has no filename",
+        ))
+    })?;
     let mut tmp_name = final_name.clone();
     tmp_name.push(format!(".tmp.{pid}"));
     let tmp_path = parent.join(&tmp_name);
@@ -1221,7 +1224,8 @@ fn save_atomic_inner(
     // Per-layer payload (alternating K then V). Stream and CRC concurrently.
     let mut crc_state = Crc32Stream::new();
     for layer in 0..cfg.num_layers {
-        let (k_bytes, v_bytes) = kv.layer_raw_bytes(layer)
+        let (k_bytes, v_bytes) = kv
+            .layer_raw_bytes(layer)
             .map_err(|e| cleanup_on_err(e, &tmp_path))?;
         let expected = layer_payload_bytes(&cfg) / 2;
         if k_bytes.len() != expected || v_bytes.len() != expected {
@@ -1365,7 +1369,8 @@ pub fn load_into(
 ) -> Result<LoadedKv, RuntimeError> {
     let mut f = File::open(path).map_err(RuntimeError::StorageIo)?;
     let mut header_buf = [0u8; HEADER_SIZE];
-    f.read_exact(&mut header_buf).map_err(RuntimeError::StorageIo)?;
+    f.read_exact(&mut header_buf)
+        .map_err(RuntimeError::StorageIo)?;
     let header = DiskKvHeader::from_bytes(&header_buf)?;
 
     // fingerprint match BEFORE buffer allocation. A 50 GB
@@ -1428,9 +1433,15 @@ pub fn load_into(
                     "disk KV load: shape mismatch (file: num_layers={}, num_kv_heads={}, \
                      head_dim={}, max_seq_len={}, precision={:?}; live: num_layers={}, \
                      num_kv_heads={}, head_dim={}, max_seq_len={}, precision={:?})",
-                    cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len,
+                    cfg.num_layers,
+                    cfg.num_kv_heads,
+                    cfg.head_dim,
+                    cfg.max_seq_len,
                     cfg.precision,
-                    want.num_layers, want.num_kv_heads, want.head_dim, want.max_seq_len,
+                    want.num_layers,
+                    want.num_kv_heads,
+                    want.head_dim,
+                    want.max_seq_len,
                     want.precision,
                 ),
             )));
@@ -1449,7 +1460,8 @@ pub fn load_into(
         )));
     }
     let mut tok_bytes = vec![0u8; tok_count * 4];
-    f.read_exact(&mut tok_bytes).map_err(RuntimeError::StorageIo)?;
+    f.read_exact(&mut tok_bytes)
+        .map_err(RuntimeError::StorageIo)?;
     let mut tokens = Vec::with_capacity(tok_count);
     for chunk in tok_bytes.chunks_exact(4) {
         tokens.push(u32::from_le_bytes(chunk.try_into().unwrap()));
@@ -1516,7 +1528,10 @@ pub fn load_into(
     // recurrent section (either may be present alone); also CRC-validated
     // independently.
     let pending_logits = if header.has_pending_logits == 1 {
-        Some(read_pending_logits_section(&mut f, expected_pending_logits_vocab)?)
+        Some(read_pending_logits_section(
+            &mut f,
+            expected_pending_logits_vocab,
+        )?)
     } else {
         None
     };
@@ -1539,7 +1554,8 @@ pub fn load_into(
 fn read_header(path: &Path) -> Result<DiskKvHeader, RuntimeError> {
     let mut f = File::open(path).map_err(RuntimeError::StorageIo)?;
     let mut header_buf = [0u8; HEADER_SIZE];
-    f.read_exact(&mut header_buf).map_err(RuntimeError::StorageIo)?;
+    f.read_exact(&mut header_buf)
+        .map_err(RuntimeError::StorageIo)?;
     DiskKvHeader::from_bytes(&header_buf)
 }
 
@@ -1627,17 +1643,16 @@ pub struct EvictEntry {
 /// or DIVIDES the score. We multiply (0.25 * score) so the penalty makes the
 /// score smaller -> evicted sooner, matching the intuitive interpretation of
 /// "penalty".
-fn compute_score(
-    hits: u32,
-    seq_len: u64,
-    file_size: u64,
-    is_live_session: bool,
-) -> f64 {
+fn compute_score(hits: u32, seq_len: u64, file_size: u64, is_live_session: bool) -> f64 {
     if file_size == 0 {
         return f64::NEG_INFINITY;
     }
     let base = ((hits as f64) + 1.0) * (seq_len as f64) / (file_size as f64);
-    if is_live_session { base * 0.25 } else { base }
+    if is_live_session {
+        base * 0.25
+    } else {
+        base
+    }
 }
 
 /// Enumerate `.kv` files in `dir`, parse their headers, and produce one
@@ -1755,7 +1770,9 @@ pub fn purge_stale_tmp(dir: &Path) -> Result<usize, RuntimeError> {
         // Match `<anything>.kv.tmp.<digits>` -- avoid touching `.tmp.foo`
         // files that happen to share the suffix but were written by another
         // tool.
-        let Some(idx) = name.rfind(".tmp.") else { continue };
+        let Some(idx) = name.rfind(".tmp.") else {
+            continue;
+        };
         let tail = &name[idx + 5..];
         if !tail.chars().all(|c| c.is_ascii_digit()) {
             continue;
@@ -1836,14 +1853,8 @@ mod tests {
     #[test]
     fn sha1_known_vectors() {
         // RFC 3174 test vectors.
-        assert_eq!(
-            sha1_hex(b""),
-            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
-        );
-        assert_eq!(
-            sha1_hex(b"abc"),
-            "a9993e364706816aba3e25717850c26c9cd0d89d"
-        );
+        assert_eq!(sha1_hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
         assert_eq!(
             sha1_hex(b"The quick brown fox jumps over the lazy dog"),
             "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12"
@@ -1872,7 +1883,9 @@ mod tests {
     #[test]
     fn header_roundtrips_bitwise() {
         let mut model_hash = [0u8; 32];
-        for i in 0..32 { model_hash[i] = i as u8; }
+        for i in 0..32 {
+            model_hash[i] = i as u8;
+        }
         let h = DiskKvHeader {
             magic: MAGIC,
             version: VERSION,
@@ -1885,11 +1898,11 @@ mod tests {
             payload_crc32: 0xDEAD_BEEF,
             hits: 7,
             last_used_secs: 1_700_000_000,
-            weight_quant_tag: 3,        // C7: Q8_0 tag
-            lumen_format_version: 3,    // C7: matches LBC_VERSION
+            weight_quant_tag: 3,     // C7: Q8_0 tag
+            lumen_format_version: 3, // C7: matches LBC_VERSION
             model_hash,
-            has_recurrent_state: 1,     // C: flag round-trips
-            has_pending_logits: 1,      // C: flag round-trips
+            has_recurrent_state: 1, // C: flag round-trips
+            has_pending_logits: 1,  // C: flag round-trips
         };
         let bytes = h.to_bytes();
         let h2 = DiskKvHeader::from_bytes(&bytes).unwrap();
@@ -1947,7 +1960,16 @@ mod tests {
                 original_layers.push((k.to_vec(), v.to_vec()));
             }
 
-            save_atomic(&kv, &tokens, &path, 0, &ModelFingerprint::test_zero(), None, None).unwrap();
+            save_atomic(
+                &kv,
+                &tokens,
+                &path,
+                0,
+                &ModelFingerprint::test_zero(),
+                None,
+                None,
+            )
+            .unwrap();
             assert!(path.exists());
 
             let loaded = load_into(&path, None, None, None, None).unwrap();
@@ -1959,14 +1981,18 @@ mod tests {
             for (layer, (orig_k, orig_v)) in original_layers.iter().enumerate() {
                 let (loaded_k, loaded_v) = loaded.kv.layer_raw_bytes(layer).unwrap();
                 assert_eq!(
-                    loaded_k, orig_k.as_slice(),
+                    loaded_k,
+                    orig_k.as_slice(),
                     "{:?} layer {} keys must match byte-for-byte",
-                    precision, layer
+                    precision,
+                    layer
                 );
                 assert_eq!(
-                    loaded_v, orig_v.as_slice(),
+                    loaded_v,
+                    orig_v.as_slice(),
                     "{:?} layer {} values must match byte-for-byte",
-                    precision, layer
+                    precision,
+                    layer
                 );
             }
 
@@ -1981,7 +2007,16 @@ mod tests {
         populate_kv(&mut kv, 3);
         let tokens = vec![1u32, 2, 3];
         let path = dir.join(cache_filename(&tokens));
-        save_atomic(&kv, &tokens, &path, 0, &ModelFingerprint::test_zero(), None, None).unwrap();
+        save_atomic(
+            &kv,
+            &tokens,
+            &path,
+            0,
+            &ModelFingerprint::test_zero(),
+            None,
+            None,
+        )
+        .unwrap();
 
         let entries = fs::read_dir(&dir).unwrap().count();
         assert_eq!(entries, 1, "should have exactly 1 file (no .tmp leftover)");
@@ -1997,7 +2032,16 @@ mod tests {
         populate_kv(&mut kv, 3);
         let tokens = vec![10u32, 20, 30];
         let path = dir.join(cache_filename(&tokens));
-        save_atomic(&kv, &tokens, &path, 0, &ModelFingerprint::test_zero(), None, None).unwrap();
+        save_atomic(
+            &kv,
+            &tokens,
+            &path,
+            0,
+            &ModelFingerprint::test_zero(),
+            None,
+            None,
+        )
+        .unwrap();
 
         // Corrupt a payload byte (skip past header + tokens).
         let mut f = OpenOptions::new().write(true).open(&path).unwrap();
@@ -2029,21 +2073,48 @@ mod tests {
         let tokens_a = vec![1u32];
         let mut kv_a = KvCache::new(cfg.clone()).unwrap();
         populate_kv(&mut kv_a, 1);
-        save_atomic(&kv_a, &tokens_a, &dir.join(cache_filename(&tokens_a)), 0, &ModelFingerprint::test_zero(), None, None).unwrap();
+        save_atomic(
+            &kv_a,
+            &tokens_a,
+            &dir.join(cache_filename(&tokens_a)),
+            0,
+            &ModelFingerprint::test_zero(),
+            None,
+            None,
+        )
+        .unwrap();
 
         // File B: 3 tokens, 10 hits. Same file size (max_seq_len allocation),
         // higher score, must survive.
         let tokens_b = vec![2u32, 3, 4];
         let mut kv_b = KvCache::new(cfg.clone()).unwrap();
         populate_kv(&mut kv_b, 3);
-        save_atomic(&kv_b, &tokens_b, &dir.join(cache_filename(&tokens_b)), 10, &ModelFingerprint::test_zero(), None, None).unwrap();
+        save_atomic(
+            &kv_b,
+            &tokens_b,
+            &dir.join(cache_filename(&tokens_b)),
+            10,
+            &ModelFingerprint::test_zero(),
+            None,
+            None,
+        )
+        .unwrap();
 
         // File C: 5 tokens, 0 hits. Score is between A and B; might or might
         // not be evicted depending on budget headroom.
         let tokens_c = vec![5u32, 6, 7, 8, 9];
         let mut kv_c = KvCache::new(cfg.clone()).unwrap();
         populate_kv(&mut kv_c, 5);
-        save_atomic(&kv_c, &tokens_c, &dir.join(cache_filename(&tokens_c)), 0, &ModelFingerprint::test_zero(), None, None).unwrap();
+        save_atomic(
+            &kv_c,
+            &tokens_c,
+            &dir.join(cache_filename(&tokens_c)),
+            0,
+            &ModelFingerprint::test_zero(),
+            None,
+            None,
+        )
+        .unwrap();
 
         let live: HashSet<String> = HashSet::new();
         let evicted = evict_to_budget(&dir, budget, &live).unwrap();
@@ -2072,16 +2143,33 @@ mod tests {
         let tokens_y = vec![200u32];
         let mut kv_x = KvCache::new(cfg.clone()).unwrap();
         populate_kv(&mut kv_x, 1);
-        save_atomic(&kv_x, &tokens_x, &dir.join(cache_filename(&tokens_x)), 5, &ModelFingerprint::test_zero(), None, None).unwrap();
+        save_atomic(
+            &kv_x,
+            &tokens_x,
+            &dir.join(cache_filename(&tokens_x)),
+            5,
+            &ModelFingerprint::test_zero(),
+            None,
+            None,
+        )
+        .unwrap();
         let mut kv_y = KvCache::new(cfg.clone()).unwrap();
         populate_kv(&mut kv_y, 1);
-        save_atomic(&kv_y, &tokens_y, &dir.join(cache_filename(&tokens_y)), 5, &ModelFingerprint::test_zero(), None, None).unwrap();
+        save_atomic(
+            &kv_y,
+            &tokens_y,
+            &dir.join(cache_filename(&tokens_y)),
+            5,
+            &ModelFingerprint::test_zero(),
+            None,
+            None,
+        )
+        .unwrap();
 
         // Mark X as a live-session prefix -- its score drops to 0.25 of Y's.
-        let live: HashSet<String> =
-            [cache_filename(&tokens_x).trim_end_matches(".kv").to_owned()]
-                .into_iter()
-                .collect();
+        let live: HashSet<String> = [cache_filename(&tokens_x).trim_end_matches(".kv").to_owned()]
+            .into_iter()
+            .collect();
         let entries = enumerate_dir(&dir, &live).unwrap();
         let entry_x = entries
             .iter()
@@ -2094,7 +2182,8 @@ mod tests {
         assert!(
             entry_x.score < entry_y.score,
             "live-session entry must have lower score (X={}, Y={})",
-            entry_x.score, entry_y.score,
+            entry_x.score,
+            entry_y.score,
         );
         // The 0.25 factor must match (within float tolerance).
         let ratio = entry_x.score / entry_y.score;
@@ -2138,7 +2227,16 @@ mod tests {
         populate_kv(&mut kv, 3);
         let tokens = vec![1u32, 2]; // only 2 tokens for 3 KV positions
         let path = dir.join(cache_filename(&tokens));
-        let err = save_atomic(&kv, &tokens, &path, 0, &ModelFingerprint::test_zero(), None, None).unwrap_err();
+        let err = save_atomic(
+            &kv,
+            &tokens,
+            &path,
+            0,
+            &ModelFingerprint::test_zero(),
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(format!("{err}").contains("tokens.len()"));
 
         let _ = fs::remove_dir_all(&dir);
@@ -2174,25 +2272,25 @@ mod tests {
         // SHA-256 of empty string.
         let e = sha256(b"");
         let expected = [
-            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8,
-            0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
-            0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+            0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+            0x78, 0x52, 0xb8, 0x55,
         ];
         assert_eq!(e, expected);
         // SHA-256("abc")
         let abc = sha256(b"abc");
         let expected = [
-            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde,
-            0x5d, 0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
-            0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
         ];
         assert_eq!(abc, expected);
         // SHA-256("The quick brown fox jumps over the lazy dog")
         let fox = sha256(b"The quick brown fox jumps over the lazy dog");
         let expected = [
-            0xd7, 0xa8, 0xfb, 0xb3, 0x07, 0xd7, 0x80, 0x94, 0x69, 0xca, 0x9a, 0xbc,
-            0xb0, 0x08, 0x2e, 0x4f, 0x8d, 0x56, 0x51, 0xe4, 0x6d, 0x3c, 0xdb, 0x76,
-            0x2d, 0x02, 0xd0, 0xbf, 0x37, 0xc9, 0xe5, 0x92,
+            0xd7, 0xa8, 0xfb, 0xb3, 0x07, 0xd7, 0x80, 0x94, 0x69, 0xca, 0x9a, 0xbc, 0xb0, 0x08,
+            0x2e, 0x4f, 0x8d, 0x56, 0x51, 0xe4, 0x6d, 0x3c, 0xdb, 0x76, 0x2d, 0x02, 0xd0, 0xbf,
+            0x37, 0xc9, 0xe5, 0x92,
         ];
         assert_eq!(fox, expected);
     }
@@ -2221,7 +2319,9 @@ mod tests {
         let path = dir.join(cache_filename(&tokens));
 
         let mut model_hash = [0u8; 32];
-        for i in 0..32 { model_hash[i] = (i as u8).wrapping_mul(31); }
+        for i in 0..32 {
+            model_hash[i] = (i as u8).wrapping_mul(31);
+        }
         let fp = ModelFingerprint {
             model_hash,
             weight_quant_tag: 3, // Q8_0
@@ -2336,7 +2436,10 @@ mod tests {
         bytes[4..8].copy_from_slice(&1u32.to_le_bytes()); // v1
         let err = DiskKvHeader::from_bytes(&bytes).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("unsupported version 1"), "must call out v1: {msg}");
+        assert!(
+            msg.contains("unsupported version 1"),
+            "must call out v1: {msg}"
+        );
         assert!(
             msg.contains("regenerate"),
             "must suggest regeneration: {msg}"
@@ -2460,7 +2563,9 @@ mod tests {
         save_atomic(&kv, &tokens, &path, 0, &fp, Some(&state), None).unwrap();
         let loaded = load_into(&path, Some(&fp), Some(kv.config()), Some(&layout), None).unwrap();
 
-        let rec = loaded.recurrent.expect("recurrent section must survive load");
+        let rec = loaded
+            .recurrent
+            .expect("recurrent section must survive load");
         assert_eq!(rec.layout, layout);
         assert_eq!(rec.h_states.len(), state.h_states.len());
         assert_eq!(rec.conv_states.len(), state.conv_states.len());
@@ -2528,8 +2633,10 @@ mod tests {
 
         // Flip one byte INSIDE the per-layer payload (after the 32-byte meta).
         let mut f = OpenOptions::new().write(true).open(&path).unwrap();
-        f.seek(SeekFrom::Start((recurrent_start + RECURRENT_META_BYTES + 8) as u64))
-            .unwrap();
+        f.seek(SeekFrom::Start(
+            (recurrent_start + RECURRENT_META_BYTES + 8) as u64,
+        ))
+        .unwrap();
         f.write_all(&[0xFFu8]).unwrap();
         drop(f);
 
@@ -2558,15 +2665,30 @@ mod tests {
         save_atomic(&kv, &tokens, &path, 0, &fp, Some(&state), None).unwrap();
 
         let mismatches = [
-            GdnLayout { num_gdn_layers: 3, ..saved_layout },
-            GdnLayout { gdn_num_heads: 4, ..saved_layout },
-            GdnLayout { gdn_head_dim: 8, ..saved_layout },
-            GdnLayout { gdn_conv_kernel_size: 5, ..saved_layout },
-            GdnLayout { gdn_conv_qkv_dim: 32, ..saved_layout },
+            GdnLayout {
+                num_gdn_layers: 3,
+                ..saved_layout
+            },
+            GdnLayout {
+                gdn_num_heads: 4,
+                ..saved_layout
+            },
+            GdnLayout {
+                gdn_head_dim: 8,
+                ..saved_layout
+            },
+            GdnLayout {
+                gdn_conv_kernel_size: 5,
+                ..saved_layout
+            },
+            GdnLayout {
+                gdn_conv_qkv_dim: 32,
+                ..saved_layout
+            },
         ];
         for layout in mismatches {
-            let err = load_into(&path, Some(&fp), Some(kv.config()), Some(&layout), None)
-                .unwrap_err();
+            let err =
+                load_into(&path, Some(&fp), Some(kv.config()), Some(&layout), None).unwrap_err();
             let msg = format!("{err}");
             assert!(
                 msg.contains("recurrent-state layout mismatch"),
@@ -2590,8 +2712,14 @@ mod tests {
         save_atomic(&kv, &tokens, &path, 0, &fp, None, None).unwrap();
 
         let live_layout = tiny_gdn_layout(2);
-        let err = load_into(&path, Some(&fp), Some(kv.config()), Some(&live_layout), None)
-            .unwrap_err();
+        let err = load_into(
+            &path,
+            Some(&fp),
+            Some(kv.config()),
+            Some(&live_layout),
+            None,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("no recurrent state"),
@@ -2643,7 +2771,10 @@ mod tests {
         );
 
         // No final file and no tmp file should remain.
-        assert!(!path.exists(), "no final file should land on validation failure");
+        assert!(
+            !path.exists(),
+            "no final file should land on validation failure"
+        );
         let stray = fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -2694,7 +2825,16 @@ mod tests {
         let tokens = vec![1u32, 2];
         let path = dir.join(cache_filename(&tokens));
         // Save once successfully so we have a baseline directory.
-        save_atomic(&kv, &tokens, &path, 0, &ModelFingerprint::test_zero(), None, None).unwrap();
+        save_atomic(
+            &kv,
+            &tokens,
+            &path,
+            0,
+            &ModelFingerprint::test_zero(),
+            None,
+            None,
+        )
+        .unwrap();
         // Now provoke a save failure: pass tokens.len() != kv.seq_len().
         let bad_tokens = vec![1u32]; // 1 token, but kv.seq_len() == 2
         let bad_path = dir.join(cache_filename(&bad_tokens));

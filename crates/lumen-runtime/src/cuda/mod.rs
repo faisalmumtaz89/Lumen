@@ -17,23 +17,23 @@
 //!   GQA attention, SwiGLU MLP, residual connections).
 //! - `compute_final` (F32 + Q8_0): Final RMSNorm + output projection to logits.
 
+mod backend_impl;
+pub(crate) mod decode;
 /// CUDA device wrapper (context, stream, buffer management).
 pub mod ffi;
+pub(crate) mod gdn;
+pub(crate) mod gpu_buffers;
+pub(crate) mod graph;
+pub(crate) mod kv_cache;
+/// CUDA MoE forward-path types.
+pub(crate) mod moe;
+pub(crate) mod prefill;
+pub(crate) mod prefill_attention;
+/// Persistent on-disk cache for NVRTC-compiled kernel PTX (cold-start fix).
+pub(crate) mod ptx_cache;
 /// Embedded CUDA kernel source strings, compiled to PTX at runtime via NVRTC.
 pub mod shaders;
 pub(crate) mod types;
-/// Persistent on-disk cache for NVRTC-compiled kernel PTX (cold-start fix).
-pub(crate) mod ptx_cache;
-pub(crate) mod gpu_buffers;
-pub(crate) mod kv_cache;
-pub(crate) mod decode;
-pub(crate) mod gdn;
-pub(crate) mod graph;
-pub(crate) mod prefill;
-pub(crate) mod prefill_attention;
-/// CUDA MoE forward-path types.
-pub(crate) mod moe;
-mod backend_impl;
 
 pub use backend_impl::CudaBackend;
 
@@ -50,8 +50,6 @@ pub use backend_impl::CudaBackend;
 // fall-through arm under a real BF16 matvec dispatch on Modal A100.
 #[cfg(any(test, feature = "test-fault-injection"))]
 pub use backend_impl::{
-    bf16_gemmex_fallback_armed_for_tests,
-    bf16_gemmex_runtime_warning_emitted_for_tests,
-    inject_next_bf16_cublas_failure,
-    reset_bf16_gemmex_state_for_tests,
+    bf16_gemmex_fallback_armed_for_tests, bf16_gemmex_runtime_warning_emitted_for_tests,
+    inject_next_bf16_cublas_failure, reset_bf16_gemmex_state_for_tests,
 };

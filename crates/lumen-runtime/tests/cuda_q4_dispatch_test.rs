@@ -56,7 +56,9 @@ struct TestRng {
 
 impl TestRng {
     fn new(seed: u64) -> Self {
-        Self { state: if seed == 0 { 1 } else { seed } }
+        Self {
+            state: if seed == 0 { 1 } else { seed },
+        }
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -95,13 +97,19 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     let frac = bits & 0x7FFFFF;
 
     if exp == 0xFF {
-        if frac != 0 { return sign | 0x7E00; }
+        if frac != 0 {
+            return sign | 0x7E00;
+        }
         return sign | 0x7C00;
     }
     let new_exp = exp - 127 + 15;
-    if new_exp >= 31 { return sign | 0x7C00; }
+    if new_exp >= 31 {
+        return sign | 0x7C00;
+    }
     if new_exp <= 0 {
-        if new_exp < -10 { return sign; }
+        if new_exp < -10 {
+            return sign;
+        }
         let full_frac = frac | 0x800000;
         let shift = (1 - new_exp) as u32;
         let f16_frac = (full_frac >> (13 + shift)) as u16;
@@ -224,9 +232,11 @@ fn f32_to_le_bytes(data: &[f32]) -> Vec<u8> {
 /// Compare two f32 slices element-wise with a tolerance.
 fn assert_f32_close(label: &str, actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(
-        actual.len(), expected.len(),
+        actual.len(),
+        expected.len(),
         "{label}: length mismatch: actual={}, expected={}",
-        actual.len(), expected.len()
+        actual.len(),
+        expected.len()
     );
     let mut max_diff = 0.0f32;
     let mut mismatches = 0;
@@ -263,35 +273,36 @@ fn test_hyperparams() -> lumen_format::hyperparams::ModelHyperparams {
         num_experts: None,
         num_active_experts: None,
         norm_eps: 1e-5,
-        rotary_dim: None, rope_neox: false,
+        rotary_dim: None,
+        rope_neox: false,
         gdn: None,
     }
 }
 
 /// Build a Q4_0 LayerView from random weights. Returns the LayerView with Q4_0
 /// tensor slices and the dequantized F32 weights for CPU reference.
-fn build_q4_layer(
-    rng: &mut TestRng,
-    q_dim: usize,
-    kv_dim: usize,
-) -> (LayerView, Vec<f32>) {
+fn build_q4_layer(rng: &mut TestRng, q_dim: usize, kv_dim: usize) -> (LayerView, Vec<f32>) {
     let mut blob = Vec::new();
     let mut offset = 0u64;
     let mut deq_all = Vec::new();
 
     // Build one Q4_0 tensor: generate f32, quantize to Q4_0, dequantize for reference.
     let add_q4_tensor = |rng_ref: &mut TestRng,
-                              blob: &mut Vec<u8>,
-                              off: &mut u64,
-                              deq: &mut Vec<f32>,
-                              out_d: usize,
-                              in_d: usize|
+                         blob: &mut Vec<u8>,
+                         off: &mut u64,
+                         deq: &mut Vec<f32>,
+                         out_d: usize,
+                         in_d: usize|
      -> TensorSlice {
         let f32_vals = rng_ref.gen_f32_vec(out_d * in_d);
         let q4_bytes = quantize_f32_to_q4_0(&f32_vals, out_d, in_d);
         let deq_vals = dequant_q4_0_to_f32(&q4_bytes, out_d, in_d);
         let len = q4_bytes.len() as u64;
-        let ts = TensorSlice { offset: *off, length: len, quant: QuantScheme::Q4_0 };
+        let ts = TensorSlice {
+            offset: *off,
+            length: len,
+            quant: QuantScheme::Q4_0,
+        };
         blob.extend_from_slice(&q4_bytes);
         *off += len;
         deq.extend_from_slice(&deq_vals);
@@ -299,25 +310,61 @@ fn build_q4_layer(
     };
 
     // Build one F32 tensor (for norms).
-    let add_f32_tensor = |data: &[f32],
-                               blob: &mut Vec<u8>,
-                               off: &mut u64|
-     -> TensorSlice {
+    let add_f32_tensor = |data: &[f32], blob: &mut Vec<u8>, off: &mut u64| -> TensorSlice {
         let bytes = f32_to_le_bytes(data);
         let len = bytes.len() as u64;
-        let ts = TensorSlice { offset: *off, length: len, quant: QuantScheme::F32 };
+        let ts = TensorSlice {
+            offset: *off,
+            length: len,
+            quant: QuantScheme::F32,
+        };
         blob.extend_from_slice(&bytes);
         *off += len;
         ts
     };
 
     let wq = add_q4_tensor(rng, &mut blob, &mut offset, &mut deq_all, q_dim, HIDDEN_DIM);
-    let wk = add_q4_tensor(rng, &mut blob, &mut offset, &mut deq_all, kv_dim, HIDDEN_DIM);
-    let wv = add_q4_tensor(rng, &mut blob, &mut offset, &mut deq_all, kv_dim, HIDDEN_DIM);
+    let wk = add_q4_tensor(
+        rng,
+        &mut blob,
+        &mut offset,
+        &mut deq_all,
+        kv_dim,
+        HIDDEN_DIM,
+    );
+    let wv = add_q4_tensor(
+        rng,
+        &mut blob,
+        &mut offset,
+        &mut deq_all,
+        kv_dim,
+        HIDDEN_DIM,
+    );
     let wo = add_q4_tensor(rng, &mut blob, &mut offset, &mut deq_all, HIDDEN_DIM, q_dim);
-    let w_gate = add_q4_tensor(rng, &mut blob, &mut offset, &mut deq_all, INTER_DIM, HIDDEN_DIM);
-    let w_up = add_q4_tensor(rng, &mut blob, &mut offset, &mut deq_all, INTER_DIM, HIDDEN_DIM);
-    let w_down = add_q4_tensor(rng, &mut blob, &mut offset, &mut deq_all, HIDDEN_DIM, INTER_DIM);
+    let w_gate = add_q4_tensor(
+        rng,
+        &mut blob,
+        &mut offset,
+        &mut deq_all,
+        INTER_DIM,
+        HIDDEN_DIM,
+    );
+    let w_up = add_q4_tensor(
+        rng,
+        &mut blob,
+        &mut offset,
+        &mut deq_all,
+        INTER_DIM,
+        HIDDEN_DIM,
+    );
+    let w_down = add_q4_tensor(
+        rng,
+        &mut blob,
+        &mut offset,
+        &mut deq_all,
+        HIDDEN_DIM,
+        INTER_DIM,
+    );
 
     let attn_norm_vals = rng.gen_norm_vec(HIDDEN_DIM);
     let ffn_norm_vals = rng.gen_norm_vec(HIDDEN_DIM);
@@ -325,17 +372,34 @@ fn build_q4_layer(
     let ffn_norm = add_f32_tensor(&ffn_norm_vals, &mut blob, &mut offset);
 
     let subtensors = SubtensorOffsets {
-        wq, wk, wv, wo,
-        bq: None, bk: None, bv: None,
-        w_gate, w_up, w_down,
-        attn_norm, ffn_norm,
+        wq,
+        wk,
+        wv,
+        wo,
+        bq: None,
+        bk: None,
+        bv: None,
+        w_gate,
+        w_up,
+        w_down,
+        attn_norm,
+        ffn_norm,
         router_weight: None,
         experts: None,
-        shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-        attn_gate: None, attn_post_norm: None,
-        ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-        ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-        attn_q_norm: None, attn_k_norm: None,
+        shared_expert_gate: None,
+        shared_expert_up: None,
+        shared_expert_down: None,
+        attn_gate: None,
+        attn_post_norm: None,
+        ssm_a: None,
+        ssm_conv1d: None,
+        ssm_dt: None,
+        ssm_beta: None,
+        ssm_alpha: None,
+        ssm_norm: None,
+        ssm_out: None,
+        attn_q_norm: None,
+        attn_k_norm: None,
         ffn_gate_inp_shexp: None,
         layer_type: None,
     };
@@ -359,30 +423,38 @@ fn dequant_layer_to_f32(
     let mut offset = 0u64;
 
     let dequant_append = |view: &LayerView,
-                           blob: &mut Vec<u8>,
-                           off: &mut u64,
-                           slice: &TensorSlice,
-                           out_d: usize,
-                           in_d: usize|
+                          blob: &mut Vec<u8>,
+                          off: &mut u64,
+                          slice: &TensorSlice,
+                          out_d: usize,
+                          in_d: usize|
      -> Result<TensorSlice, RuntimeError> {
         let raw = view.subtensor_bytes(slice)?;
         let f32_vals = dequant_q4_0_to_f32(raw, out_d, in_d);
         let f32_bytes = f32_to_le_bytes(&f32_vals);
         let len = f32_bytes.len() as u64;
-        let ts = TensorSlice { offset: *off, length: len, quant: QuantScheme::F32 };
+        let ts = TensorSlice {
+            offset: *off,
+            length: len,
+            quant: QuantScheme::F32,
+        };
         blob.extend_from_slice(&f32_bytes);
         *off += len;
         Ok(ts)
     };
 
     let copy_f32 = |view: &LayerView,
-                     blob: &mut Vec<u8>,
-                     off: &mut u64,
-                     slice: &TensorSlice|
+                    blob: &mut Vec<u8>,
+                    off: &mut u64,
+                    slice: &TensorSlice|
      -> Result<TensorSlice, RuntimeError> {
         let raw = view.subtensor_bytes(slice)?;
         let len = raw.len() as u64;
-        let ts = TensorSlice { offset: *off, length: len, quant: QuantScheme::F32 };
+        let ts = TensorSlice {
+            offset: *off,
+            length: len,
+            quant: QuantScheme::F32,
+        };
         blob.extend_from_slice(raw);
         *off += len;
         Ok(ts)
@@ -392,24 +464,62 @@ fn dequant_layer_to_f32(
     let wk = dequant_append(q4_view, &mut blob, &mut offset, &st.wk, kv_dim, HIDDEN_DIM)?;
     let wv = dequant_append(q4_view, &mut blob, &mut offset, &st.wv, kv_dim, HIDDEN_DIM)?;
     let wo = dequant_append(q4_view, &mut blob, &mut offset, &st.wo, HIDDEN_DIM, q_dim)?;
-    let w_gate = dequant_append(q4_view, &mut blob, &mut offset, &st.w_gate, INTER_DIM, HIDDEN_DIM)?;
-    let w_up = dequant_append(q4_view, &mut blob, &mut offset, &st.w_up, INTER_DIM, HIDDEN_DIM)?;
-    let w_down = dequant_append(q4_view, &mut blob, &mut offset, &st.w_down, HIDDEN_DIM, INTER_DIM)?;
+    let w_gate = dequant_append(
+        q4_view,
+        &mut blob,
+        &mut offset,
+        &st.w_gate,
+        INTER_DIM,
+        HIDDEN_DIM,
+    )?;
+    let w_up = dequant_append(
+        q4_view,
+        &mut blob,
+        &mut offset,
+        &st.w_up,
+        INTER_DIM,
+        HIDDEN_DIM,
+    )?;
+    let w_down = dequant_append(
+        q4_view,
+        &mut blob,
+        &mut offset,
+        &st.w_down,
+        HIDDEN_DIM,
+        INTER_DIM,
+    )?;
     let attn_norm = copy_f32(q4_view, &mut blob, &mut offset, &st.attn_norm)?;
     let ffn_norm = copy_f32(q4_view, &mut blob, &mut offset, &st.ffn_norm)?;
 
     let subtensors = SubtensorOffsets {
-        wq, wk, wv, wo,
-        bq: None, bk: None, bv: None,
-        w_gate, w_up, w_down,
-        attn_norm, ffn_norm,
+        wq,
+        wk,
+        wv,
+        wo,
+        bq: None,
+        bk: None,
+        bv: None,
+        w_gate,
+        w_up,
+        w_down,
+        attn_norm,
+        ffn_norm,
         router_weight: None,
         experts: None,
-        shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-        attn_gate: None, attn_post_norm: None,
-        ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-        ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-        attn_q_norm: None, attn_k_norm: None,
+        shared_expert_gate: None,
+        shared_expert_up: None,
+        shared_expert_down: None,
+        attn_gate: None,
+        attn_post_norm: None,
+        ssm_a: None,
+        ssm_conv1d: None,
+        ssm_dt: None,
+        ssm_beta: None,
+        ssm_alpha: None,
+        ssm_norm: None,
+        ssm_out: None,
+        attn_q_norm: None,
+        attn_k_norm: None,
         ffn_gate_inp_shexp: None,
         layer_type: None,
     };
@@ -485,16 +595,28 @@ fn test_cuda_q4_0_compute_layer_matches_cpu_dequant() {
         // CPU compute_layer with dequantized F32 weights.
         {
             let mut kv_view = cpu_kv.view_mut(layer_idx).unwrap();
-            cpu.compute_layer(layer_idx, &mut cpu_x, &f32_layer_view, Some(&mut kv_view), seq_pos)
-                .unwrap();
+            cpu.compute_layer(
+                layer_idx,
+                &mut cpu_x,
+                &f32_layer_view,
+                Some(&mut kv_view),
+                seq_pos,
+            )
+            .unwrap();
             cpu_kv.commit_view(kv_view).unwrap();
         }
 
         // CUDA compute_layer with native Q4_0 weights.
         {
             let mut kv_view = cuda_kv.view_mut(layer_idx).unwrap();
-            cuda.compute_layer(layer_idx, &mut cuda_x, q4_layer_view, Some(&mut kv_view), seq_pos)
-                .unwrap();
+            cuda.compute_layer(
+                layer_idx,
+                &mut cuda_x,
+                q4_layer_view,
+                Some(&mut kv_view),
+                seq_pos,
+            )
+            .unwrap();
             cuda_kv.commit_view(kv_view).unwrap();
         }
 

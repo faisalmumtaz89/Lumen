@@ -11,8 +11,8 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::fmt;
 use std::ptr;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, Ordering as AOrdering};
+use std::sync::OnceLock;
 
 // ============================================================================
 // Objective-C runtime FFI
@@ -159,18 +159,30 @@ mod cached_sel {
     cached_sel!(set_compute_pipeline_state, "setComputePipelineState:");
     cached_sel!(set_buffer_offset_at_index, "setBuffer:offset:atIndex:");
     cached_sel!(set_bytes_length_at_index, "setBytes:length:atIndex:");
-    cached_sel!(dispatch_threadgroups, "dispatchThreadgroups:threadsPerThreadgroup:");
+    cached_sel!(
+        dispatch_threadgroups,
+        "dispatchThreadgroups:threadsPerThreadgroup:"
+    );
     cached_sel!(dispatch_threads, "dispatchThreads:threadsPerThreadgroup:");
-    cached_sel!(set_threadgroup_memory_length, "setThreadgroupMemoryLength:atIndex:");
+    cached_sel!(
+        set_threadgroup_memory_length,
+        "setThreadgroupMemoryLength:atIndex:"
+    );
     cached_sel!(memory_barrier_with_scope, "memoryBarrierWithScope:");
-    cached_sel!(memory_barrier_with_resources, "memoryBarrierWithResources:count:");
+    cached_sel!(
+        memory_barrier_with_resources,
+        "memoryBarrierWithResources:count:"
+    );
 
     // -- GPU timing (zero-overhead, read on a completed CB) --
     cached_sel!(gpu_start_time, "GPUStartTime");
     cached_sel!(gpu_end_time, "GPUEndTime");
 
     // -- Blit encoder --
-    cached_sel!(copy_from_buffer, "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:");
+    cached_sel!(
+        copy_from_buffer,
+        "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:"
+    );
 
     // -- Object lifecycle --
     cached_sel!(retain, "retain");
@@ -181,19 +193,34 @@ mod cached_sel {
     cached_sel!(length, "length");
 
     // -- Pipeline state queries --
-    cached_sel!(max_total_threads_per_threadgroup, "maxTotalThreadsPerThreadgroup");
+    cached_sel!(
+        max_total_threads_per_threadgroup,
+        "maxTotalThreadsPerThreadgroup"
+    );
     cached_sel!(thread_execution_width, "threadExecutionWidth");
 
     // -- Buffer creation --
     cached_sel!(new_buffer_with_length, "newBufferWithLength:options:");
     cached_sel!(new_buffer_with_bytes, "newBufferWithBytes:length:options:");
-    cached_sel!(new_buffer_with_bytes_no_copy, "newBufferWithBytesNoCopy:length:options:deallocator:");
+    cached_sel!(
+        new_buffer_with_bytes_no_copy,
+        "newBufferWithBytesNoCopy:length:options:deallocator:"
+    );
 
     // -- Library / function / pipeline creation --
-    cached_sel!(new_library_with_source, "newLibraryWithSource:options:error:");
-    cached_sel!(new_compute_pipeline_state, "newComputePipelineStateWithFunction:error:");
+    cached_sel!(
+        new_library_with_source,
+        "newLibraryWithSource:options:error:"
+    );
+    cached_sel!(
+        new_compute_pipeline_state,
+        "newComputePipelineStateWithFunction:error:"
+    );
     cached_sel!(new_function_with_name, "newFunctionWithName:");
-    cached_sel!(new_function_with_name_constant_values, "newFunctionWithName:constantValues:error:");
+    cached_sel!(
+        new_function_with_name_constant_values,
+        "newFunctionWithName:constantValues:error:"
+    );
     // -- MTLCompileOptions language version (Metal 3.0+ for bfloat support) --
     cached_sel!(compile_options_set_language_version, "setLanguageVersion:");
 
@@ -231,10 +258,16 @@ mod cached_sel {
     cached_sel!(file_url_with_path, "fileURLWithPath:");
 
     // -- MTLIOCommandQueue (Metal 3, macOS 13+) --
-    cached_sel!(new_io_command_queue, "newIOCommandQueueWithDescriptor:error:");
+    cached_sel!(
+        new_io_command_queue,
+        "newIOCommandQueueWithDescriptor:error:"
+    );
     cached_sel!(new_io_file_handle, "newIOFileHandleWithURL:error:");
-    cached_sel!(io_command_buffer, "commandBuffer");  // same selector as MTLCommandQueue
-    cached_sel!(load_buffer, "loadBuffer:offset:size:sourceHandle:sourceHandleOffset:");
+    cached_sel!(io_command_buffer, "commandBuffer"); // same selector as MTLCommandQueue
+    cached_sel!(
+        load_buffer,
+        "loadBuffer:offset:size:sourceHandle:sourceHandleOffset:"
+    );
     cached_sel!(set_type, "setType:");
     cached_sel!(status, "status");
 
@@ -299,7 +332,11 @@ unsafe fn nsstring(s: &str) -> ObjcId {
     let ns_class = cls("NSString");
     type StringWithUTF8Fn = unsafe extern "C" fn(ObjcId, ObjcSel, *const c_char) -> ObjcId;
     let f: StringWithUTF8Fn = std::mem::transmute(objc_msgSend as *const c_void);
-    f(ns_class, cached_sel::string_with_utf8_string(), cstr.as_ptr())
+    f(
+        ns_class,
+        cached_sel::string_with_utf8_string(),
+        cstr.as_ptr(),
+    )
 }
 
 /// Read an NSString into a Rust String.
@@ -444,11 +481,14 @@ impl MetalDevice {
             type SetLangVerFn = unsafe extern "C" fn(ObjcId, ObjcSel, usize);
             let set_lang_ver: SetLangVerFn = std::mem::transmute(objc_msgSend as *const c_void);
             const MTL_LANG_VERSION_3_1: usize = (3usize << 16) | 1;
-            set_lang_ver(opts, cached_sel::compile_options_set_language_version(), MTL_LANG_VERSION_3_1);
+            set_lang_ver(
+                opts,
+                cached_sel::compile_options_set_language_version(),
+                MTL_LANG_VERSION_3_1,
+            );
 
-            type NewLibFn = unsafe extern "C" fn(
-                ObjcId, ObjcSel, ObjcId, ObjcId, *mut ObjcId,
-            ) -> ObjcId;
+            type NewLibFn =
+                unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId, ObjcId, *mut ObjcId) -> ObjcId;
             let f: NewLibFn = std::mem::transmute(objc_msgSend as *const c_void);
             let lib = f(
                 self.raw,
@@ -479,9 +519,7 @@ impl MetalDevice {
     ) -> Result<MetalPipelineState, String> {
         unsafe {
             let mut error: ObjcId = ptr::null_mut();
-            type NewPSOFn = unsafe extern "C" fn(
-                ObjcId, ObjcSel, ObjcId, *mut ObjcId,
-            ) -> ObjcId;
+            type NewPSOFn = unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId, *mut ObjcId) -> ObjcId;
             let f: NewPSOFn = std::mem::transmute(objc_msgSend as *const c_void);
             let pso = f(
                 self.raw,
@@ -529,9 +567,8 @@ impl MetalDevice {
             return self.new_buffer(4); // Metal requires non-zero length
         }
         unsafe {
-            type NewBufferBytesFn = unsafe extern "C" fn(
-                ObjcId, ObjcSel, *const c_void, u64, u64,
-            ) -> ObjcId;
+            type NewBufferBytesFn =
+                unsafe extern "C" fn(ObjcId, ObjcSel, *const c_void, u64, u64) -> ObjcId;
             let f: NewBufferBytesFn = std::mem::transmute(objc_msgSend as *const c_void);
             let raw = f(
                 self.raw,
@@ -569,9 +606,8 @@ impl MetalDevice {
         // We pass nil because the mmap region owns this memory.
         let deallocator: ObjcId = ptr::null_mut();
 
-        type NewBufferNoCopyFn = unsafe extern "C" fn(
-            ObjcId, ObjcSel, *mut c_void, u64, u64, ObjcId,
-        ) -> ObjcId;
+        type NewBufferNoCopyFn =
+            unsafe extern "C" fn(ObjcId, ObjcSel, *mut c_void, u64, u64, ObjcId) -> ObjcId;
         let f: NewBufferNoCopyFn = std::mem::transmute(objc_msgSend as *const c_void);
         let raw = f(
             self.raw,
@@ -966,10 +1002,8 @@ impl MetalCommandBuffer {
     pub fn new_concurrent_compute_encoder(&self) -> Option<MetalComputeEncoder> {
         self.profile_split_if_needed();
         unsafe {
-            type EncoderWithDispatchTypeFn =
-                unsafe extern "C" fn(ObjcId, ObjcSel, u64) -> ObjcId;
-            let f: EncoderWithDispatchTypeFn =
-                std::mem::transmute(objc_msgSend as *const c_void);
+            type EncoderWithDispatchTypeFn = unsafe extern "C" fn(ObjcId, ObjcSel, u64) -> ObjcId;
+            let f: EncoderWithDispatchTypeFn = std::mem::transmute(objc_msgSend as *const c_void);
             let raw = f(
                 self.raw(),
                 sel("computeCommandEncoderWithDispatchType:"),
@@ -1026,7 +1060,12 @@ impl MetalCommandBuffer {
         unsafe {
             type SignalFn = unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId, u64);
             let f: SignalFn = std::mem::transmute(objc_msgSend as *const c_void);
-            f(self.raw(), cached_sel::encode_signal_event_value(), event.raw(), value);
+            f(
+                self.raw(),
+                cached_sel::encode_signal_event_value(),
+                event.raw(),
+                value,
+            );
         }
     }
 
@@ -1039,7 +1078,12 @@ impl MetalCommandBuffer {
         unsafe {
             type WaitFn = unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId, u64);
             let f: WaitFn = std::mem::transmute(objc_msgSend as *const c_void);
-            f(self.raw(), cached_sel::encode_wait_for_event_value(), event.raw(), value);
+            f(
+                self.raw(),
+                cached_sel::encode_wait_for_event_value(),
+                event.raw(),
+                value,
+            );
         }
     }
 
@@ -1233,9 +1277,7 @@ impl MetalBlitEncoder {
         size: u64,
     ) {
         unsafe {
-            type CopyFn = unsafe extern "C" fn(
-                ObjcId, ObjcSel, ObjcId, u64, ObjcId, u64, u64,
-            );
+            type CopyFn = unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId, u64, ObjcId, u64, u64);
             let f: CopyFn = std::mem::transmute(objc_msgSend as *const c_void);
             f(
                 self.raw,
@@ -1285,7 +1327,11 @@ pub struct MTLSize {
 
 impl MTLSize {
     pub fn new(width: u64, height: u64, depth: u64) -> Self {
-        Self { width, height, depth }
+        Self {
+            width,
+            height,
+            depth,
+        }
     }
 }
 
@@ -1334,11 +1380,7 @@ impl MetalComputeEncoder {
     /// Uses a typed function pointer cast because passing MTLSize structs
     /// through variadic objc_msgSend does not work on arm64 (structs larger
     /// than registers get misrouted through the variadic ABI).
-    pub fn dispatch_threadgroups(
-        &self,
-        threadgroups: MTLSize,
-        threads_per_threadgroup: MTLSize,
-    ) {
+    pub fn dispatch_threadgroups(&self, threadgroups: MTLSize, threads_per_threadgroup: MTLSize) {
         unsafe {
             type DispatchFn = unsafe extern "C" fn(ObjcId, ObjcSel, MTLSize, MTLSize);
             let f: DispatchFn = std::mem::transmute(objc_msgSend as *const c_void);
@@ -1354,11 +1396,7 @@ impl MetalComputeEncoder {
     /// Dispatch threads (non-uniform).
     ///
     /// Uses a typed function pointer cast (same reason as dispatch_threadgroups).
-    pub fn dispatch_threads(
-        &self,
-        threads: MTLSize,
-        threads_per_threadgroup: MTLSize,
-    ) {
+    pub fn dispatch_threads(&self, threads: MTLSize, threads_per_threadgroup: MTLSize) {
         unsafe {
             type DispatchFn = unsafe extern "C" fn(ObjcId, ObjcSel, MTLSize, MTLSize);
             let f: DispatchFn = std::mem::transmute(objc_msgSend as *const c_void);
@@ -1418,16 +1456,19 @@ impl MetalComputeEncoder {
     /// Slices longer than 32 entries are silently truncated; no per-layer
     /// plan in Lumen exceeds that. A zero-length slice is a no-op.
     pub fn memory_barrier_with_resources(&self, buffers: &[&MetalBuffer]) {
-        if buffers.is_empty() { return; }
+        if buffers.is_empty() {
+            return;
+        }
         // Stack-allocated buffer (avoids pulling in a smallvec crate just
         // for the barrier path). 32 is well above any realistic per-layer
         // distinct-mutable-buffer count.
         let mut raws: [ObjcId; 32] = [std::ptr::null_mut(); 32];
         let n = buffers.len().min(raws.len());
-        for i in 0..n { raws[i] = buffers[i].raw; }
+        for i in 0..n {
+            raws[i] = buffers[i].raw;
+        }
         unsafe {
-            type BarrierResFn =
-                unsafe extern "C" fn(ObjcId, ObjcSel, *const ObjcId, u64);
+            type BarrierResFn = unsafe extern "C" fn(ObjcId, ObjcSel, *const ObjcId, u64);
             let f: BarrierResFn = std::mem::transmute(objc_msgSend as *const c_void);
             f(
                 self.raw,
@@ -1493,9 +1534,8 @@ impl MetalLibrary {
         unsafe {
             let ns_name = nsstring(name);
             let mut error: ObjcId = ptr::null_mut();
-            type NewFuncConstFn = unsafe extern "C" fn(
-                ObjcId, ObjcSel, ObjcId, ObjcId, *mut ObjcId,
-            ) -> ObjcId;
+            type NewFuncConstFn =
+                unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId, ObjcId, *mut ObjcId) -> ObjcId;
             let f: NewFuncConstFn = std::mem::transmute(objc_msgSend as *const c_void);
             let func = f(
                 self.raw,
@@ -1510,10 +1550,7 @@ impl MetalLibrary {
                 if !error.is_null() {
                     release(error);
                 }
-                return Err(format!(
-                    "Function '{}' with constants failed: {desc}",
-                    name
-                ));
+                return Err(format!("Function '{}' with constants failed: {desc}", name));
             }
 
             Ok(MetalFunction { raw: func })
@@ -1562,8 +1599,7 @@ impl MetalFunctionConstantValues {
             // MTLDataType.bool = 53
             const MTL_DATA_TYPE_BOOL: u64 = 53;
             let val: u8 = if value { 1 } else { 0 };
-            type SetConstFn =
-                unsafe extern "C" fn(ObjcId, ObjcSel, *const c_void, u64, u64);
+            type SetConstFn = unsafe extern "C" fn(ObjcId, ObjcSel, *const c_void, u64, u64);
             let f: SetConstFn = std::mem::transmute(objc_msgSend as *const c_void);
             f(
                 self.raw,
@@ -1585,8 +1621,7 @@ impl MetalFunctionConstantValues {
         unsafe {
             // MTLDataType.short = 42
             const MTL_DATA_TYPE_SHORT: u64 = 42;
-            type SetConstFn =
-                unsafe extern "C" fn(ObjcId, ObjcSel, *const c_void, u64, u64);
+            type SetConstFn = unsafe extern "C" fn(ObjcId, ObjcSel, *const c_void, u64, u64);
             let f: SetConstFn = std::mem::transmute(objc_msgSend as *const c_void);
             f(
                 self.raw,
@@ -1903,9 +1938,8 @@ impl MetalIOCommandQueue {
 
             // Create the IO command queue.
             let mut error: ObjcId = ptr::null_mut();
-            type NewIOQueueFn = unsafe extern "C" fn(
-                ObjcId, ObjcSel, ObjcId, *mut ObjcId,
-            ) -> ObjcId;
+            type NewIOQueueFn =
+                unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId, *mut ObjcId) -> ObjcId;
             let f: NewIOQueueFn = std::mem::transmute(objc_msgSend as *const c_void);
             let io_queue = f(
                 device.raw(),
@@ -1939,9 +1973,8 @@ impl MetalIOCommandQueue {
             }
 
             let mut error: ObjcId = ptr::null_mut();
-            type NewFileHandleFn = unsafe extern "C" fn(
-                ObjcId, ObjcSel, ObjcId, *mut ObjcId,
-            ) -> ObjcId;
+            type NewFileHandleFn =
+                unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId, *mut ObjcId) -> ObjcId;
             let f: NewFileHandleFn = std::mem::transmute(objc_msgSend as *const c_void);
             let handle = f(
                 device.raw(),
@@ -2039,9 +2072,8 @@ impl MetalIOCommandBuffer {
         source_offset: u64,
     ) {
         unsafe {
-            type LoadBufferFn = unsafe extern "C" fn(
-                ObjcId, ObjcSel, ObjcId, u64, u64, ObjcId, u64,
-            );
+            type LoadBufferFn =
+                unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId, u64, u64, ObjcId, u64);
             let f: LoadBufferFn = std::mem::transmute(objc_msgSend as *const c_void);
             f(
                 self.raw,
@@ -2112,7 +2144,10 @@ mod tests {
     #[test]
     fn test_metal_device_available() {
         let device = MetalDevice::system_default();
-        assert!(device.is_some(), "Metal device should be available on macOS");
+        assert!(
+            device.is_some(),
+            "Metal device should be available on macOS"
+        );
         if let Some(dev) = &device {
             let name = dev.name();
             assert!(!name.is_empty(), "Device name should not be empty");
@@ -2145,9 +2180,8 @@ mod tests {
     fn test_metal_buffer_with_bytes() {
         let device = MetalDevice::system_default().unwrap();
         let data = [1.0f32, 2.0, 3.0, 4.0];
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-        };
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
         let buf = device.new_buffer_with_bytes(bytes).unwrap();
         assert!(buf.length() >= 16);
 
@@ -2166,30 +2200,51 @@ mod tests {
 
         // Verify we can get all expected kernel functions
         let kernel_names = [
-            "matmul_f32", "matmul_bytes_f32", "rmsnorm", "rmsnorm_bytes",
-            "rope", "swiglu", "softmax", "attention_scores",
-            "attention_output", "add_residual", "embed_token",
-            "dequant_tiled_matmul_q8_0_splitk", "reduce_splitk",
+            "matmul_f32",
+            "matmul_bytes_f32",
+            "rmsnorm",
+            "rmsnorm_bytes",
+            "rope",
+            "swiglu",
+            "softmax",
+            "attention_scores",
+            "attention_output",
+            "add_residual",
+            "embed_token",
+            "dequant_tiled_matmul_q8_0_splitk",
+            "reduce_splitk",
         ];
         for name in &kernel_names {
             let func = lib.get_function(name);
-            assert!(func.is_some(), "Kernel function '{name}' not found in compiled library");
+            assert!(
+                func.is_some(),
+                "Kernel function '{name}' not found in compiled library"
+            );
         }
     }
 
     #[test]
     fn test_pipeline_state_creation() {
         let device = MetalDevice::system_default().unwrap();
-        let lib = device.new_library_with_source(crate::metal::shaders::METAL_SHADER_SOURCE).unwrap();
+        let lib = device
+            .new_library_with_source(crate::metal::shaders::METAL_SHADER_SOURCE)
+            .unwrap();
         let func = lib.get_function("add_residual").unwrap();
         let pso = device.new_compute_pipeline_state(&func);
-        assert!(pso.is_ok(), "Pipeline state creation failed: {:?}", pso.err());
+        assert!(
+            pso.is_ok(),
+            "Pipeline state creation failed: {:?}",
+            pso.err()
+        );
 
         let pso = pso.unwrap();
         let max_threads = pso.max_total_threads_per_threadgroup();
         let simd_width = pso.thread_execution_width();
         eprintln!("add_residual pipeline: max_threads={max_threads}, simd_width={simd_width}");
-        assert!(max_threads >= 32, "Expected at least 32 threads per threadgroup");
+        assert!(
+            max_threads >= 32,
+            "Expected at least 32 threads per threadgroup"
+        );
         assert!(simd_width >= 32, "Expected SIMD width >= 32 on Apple GPU");
     }
 
@@ -2197,7 +2252,9 @@ mod tests {
     fn test_simple_add_residual_gpu() {
         let device = MetalDevice::system_default().unwrap();
         let queue = device.new_command_queue().unwrap();
-        let lib = device.new_library_with_source(crate::metal::shaders::METAL_SHADER_SOURCE).unwrap();
+        let lib = device
+            .new_library_with_source(crate::metal::shaders::METAL_SHADER_SOURCE)
+            .unwrap();
         let func = lib.get_function("add_residual").unwrap();
         let pso = device.new_compute_pipeline_state(&func).unwrap();
 
@@ -2231,8 +2288,15 @@ mod tests {
         let mut result = vec![0.0f32; 8];
         dst_buf.read_f32(&mut result);
 
-        let expected: Vec<f32> = dst_data.iter().zip(src_data.iter()).map(|(a, b)| a + b).collect();
-        assert_eq!(result, expected, "GPU add_residual should produce correct results");
+        let expected: Vec<f32> = dst_data
+            .iter()
+            .zip(src_data.iter())
+            .map(|(a, b)| a + b)
+            .collect();
+        assert_eq!(
+            result, expected,
+            "GPU add_residual should produce correct results"
+        );
     }
 
     #[test]
@@ -2241,7 +2305,9 @@ mod tests {
         // two independent add_residual operations to non-overlapping buffers.
         let device = MetalDevice::system_default().unwrap();
         let queue = device.new_command_queue().unwrap();
-        let lib = device.new_library_with_source(crate::metal::shaders::METAL_SHADER_SOURCE).unwrap();
+        let lib = device
+            .new_library_with_source(crate::metal::shaders::METAL_SHADER_SOURCE)
+            .unwrap();
         let func = lib.get_function("add_residual").unwrap();
         let pso = device.new_compute_pipeline_state(&func).unwrap();
 
@@ -2296,7 +2362,15 @@ mod tests {
         dst_a_buf.read_f32(&mut result_a);
         dst_b_buf.read_f32(&mut result_b);
 
-        assert_eq!(result_a, vec![11.0f32; 8], "Concurrent dispatch A should produce correct results");
-        assert_eq!(result_b, vec![300.0f32; 8], "Concurrent dispatch B should produce correct results");
+        assert_eq!(
+            result_a,
+            vec![11.0f32; 8],
+            "Concurrent dispatch A should produce correct results"
+        );
+        assert_eq!(
+            result_b,
+            vec![300.0f32; 8],
+            "Concurrent dispatch B should produce correct results"
+        );
     }
 }

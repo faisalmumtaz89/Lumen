@@ -42,17 +42,17 @@ extern "C" {
         order: CblasOrder,
         trans_a: CblasTranspose,
         trans_b: CblasTranspose,
-        m: i32,       // rows of op(A) and C
-        n: i32,       // cols of op(B) and C
-        k: i32,       // cols of op(A) / rows of op(B)
+        m: i32, // rows of op(A) and C
+        n: i32, // cols of op(B) and C
+        k: i32, // cols of op(A) / rows of op(B)
         alpha: f32,
         a: *const f32, // [lda x ...] matrix A
         lda: i32,      // leading dimension of A
         b: *const f32, // [ldb x ...] matrix B
         ldb: i32,      // leading dimension of B
         beta: f32,
-        c: *mut f32,   // [ldc x ...] matrix C (output)
-        ldc: i32,      // leading dimension of C
+        c: *mut f32, // [ldc x ...] matrix C (output)
+        ldc: i32,    // leading dimension of C
     );
 }
 
@@ -67,16 +67,10 @@ mod tests {
         // B = I_4x4
         // C should equal A.
         let a: [f32; 16] = [
-            1.0, 2.0, 3.0, 4.0,
-            5.0, 6.0, 7.0, 8.0,
-            9.0, 10.0, 11.0, 12.0,
-            13.0, 14.0, 15.0, 16.0,
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
         ];
         let b: [f32; 16] = [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ];
         let mut c = [0.0f32; 16];
 
@@ -85,19 +79,26 @@ mod tests {
                 CblasOrder::RowMajor,
                 CblasTranspose::NoTrans,
                 CblasTranspose::NoTrans,
-                4, 4, 4,  // M, N, K
-                1.0,      // alpha
-                a.as_ptr(), 4,
-                b.as_ptr(), 4,
-                0.0,      // beta
-                c.as_mut_ptr(), 4,
+                4,
+                4,
+                4,   // M, N, K
+                1.0, // alpha
+                a.as_ptr(),
+                4,
+                b.as_ptr(),
+                4,
+                0.0, // beta
+                c.as_mut_ptr(),
+                4,
             );
         }
 
         for i in 0..16 {
             assert!(
                 (c[i] - a[i]).abs() < 1e-6,
-                "c[{i}] = {}, expected {}", c[i], a[i]
+                "c[{i}] = {}, expected {}",
+                c[i],
+                a[i]
             );
         }
     }
@@ -116,12 +117,17 @@ mod tests {
                 CblasOrder::RowMajor,
                 CblasTranspose::NoTrans,
                 CblasTranspose::NoTrans,
-                2, 2, 2,
+                2,
+                2,
+                2,
                 1.0,
-                a.as_ptr(), 2,
-                b.as_ptr(), 2,
+                a.as_ptr(),
+                2,
+                b.as_ptr(),
+                2,
                 0.0,
-                c.as_mut_ptr(), 2,
+                c.as_mut_ptr(),
+                2,
             );
         }
 
@@ -129,7 +135,9 @@ mod tests {
         for i in 0..4 {
             assert!(
                 (c[i] - expected[i]).abs() < 1e-5,
-                "c[{i}] = {}, expected {}", c[i], expected[i]
+                "c[{i}] = {}, expected {}",
+                c[i],
+                expected[i]
             );
         }
     }
@@ -158,12 +166,17 @@ mod tests {
                 CblasOrder::RowMajor,
                 CblasTranspose::NoTrans,
                 CblasTranspose::Trans,
-                2, 2, 3,  // M, N, K
+                2,
+                2,
+                3, // M, N, K
                 1.0,
-                a.as_ptr(), 3,  // lda = K = 3
-                b.as_ptr(), 3,  // ldb = K = 3 (B is stored as N x K before transpose)
+                a.as_ptr(),
+                3, // lda = K = 3
+                b.as_ptr(),
+                3, // ldb = K = 3 (B is stored as N x K before transpose)
                 0.0,
-                c.as_mut_ptr(), 2,  // ldc = N = 2
+                c.as_mut_ptr(),
+                2, // ldc = N = 2
             );
         }
 
@@ -171,7 +184,9 @@ mod tests {
         for i in 0..4 {
             assert!(
                 (c[i] - expected[i]).abs() < 1e-4,
-                "c[{i}] = {}, expected {}", c[i], expected[i]
+                "c[{i}] = {}, expected {}",
+                c[i],
+                expected[i]
             );
         }
     }

@@ -9,7 +9,9 @@ pub(crate) struct WeightRng {
 
 impl WeightRng {
     pub fn new(seed: u64) -> Self {
-        Self { state: if seed == 0 { 1 } else { seed } }
+        Self {
+            state: if seed == 0 { 1 } else { seed },
+        }
     }
 
     pub fn next_u64(&mut self) -> u64 {
@@ -30,9 +32,7 @@ impl WeightRng {
 
     /// Generate n f32 values as bytes.
     pub fn gen_f32_bytes(&mut self, n: usize) -> Vec<u8> {
-        (0..n)
-            .flat_map(|_| self.next_f32().to_le_bytes())
-            .collect()
+        (0..n).flat_map(|_| self.next_f32().to_le_bytes()).collect()
     }
 
     /// Generate n f32 values centered around 1.0 (for norm weights).
@@ -59,7 +59,10 @@ impl WeightRng {
     /// Q4_0 block layout: [2 bytes f16 scale] [16 bytes packed nibbles] = 18 bytes per 32 elements.
     /// n MUST be a multiple of 32.
     pub fn gen_q4_0_bytes(&mut self, n: usize) -> Vec<u8> {
-        assert!(n % 32 == 0, "gen_q4_0_bytes: n={n} must be a multiple of 32");
+        assert!(
+            n % 32 == 0,
+            "gen_q4_0_bytes: n={n} must be a multiple of 32"
+        );
         let num_blocks = n / 32;
         let mut out = Vec::with_capacity(num_blocks * 18);
         for _ in 0..num_blocks {
@@ -94,7 +97,10 @@ impl WeightRng {
     /// Q8_0 block layout: [2 bytes f16 scale] [32 bytes int8 values] = 34 bytes per 32 elements.
     /// n MUST be a multiple of 32.
     pub fn gen_q8_0_bytes(&mut self, n: usize) -> Vec<u8> {
-        assert!(n % 32 == 0, "gen_q8_0_bytes: n={n} must be a multiple of 32");
+        assert!(
+            n % 32 == 0,
+            "gen_q8_0_bytes: n={n} must be a multiple of 32"
+        );
         let num_blocks = n / 32;
         let mut out = Vec::with_capacity(num_blocks * 34);
         for _ in 0..num_blocks {

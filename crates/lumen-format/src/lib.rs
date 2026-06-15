@@ -30,7 +30,7 @@ pub use error::FormatError;
 pub use header::{Endianness, GlobalTensorRange, LbcHeader, LBC_MAGIC, LBC_VERSION};
 pub use hyperparams::ModelHyperparams;
 pub use index::{ExpertSlice, LayerIndex, SubtensorOffsets, TensorSlice};
-pub use large_model::{LargeModelConfig, generate_large_model, generate_large_model_f16};
+pub use large_model::{generate_large_model, generate_large_model_f16, LargeModelConfig};
 pub use quantization::{QuantGroupSize, QuantScheme, QuantizationDescriptor};
 pub use reader::LbcFile;
 pub use streaming_writer::{LayerShape, StreamingLbcWriter};

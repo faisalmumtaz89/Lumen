@@ -31,12 +31,12 @@ pub(crate) mod ffi;
 // Provides `MpsGraphContext` + `encode_bf16_matmul_to_command_buffer`
 // for the GDN qkv-proj and ssm-out matmuls when
 // `LUMEN_METAL_BF16_MPS=1`. Default OFF.
-pub(crate) mod mps_graph_ffi;
-pub(crate) mod shaders;
-pub(crate) mod io;
 mod decode_greedy;
 pub(crate) mod decode_profile;
 mod decode_single_cb;
+pub(crate) mod io;
+pub(crate) mod mps_graph_ffi;
+pub(crate) mod shaders;
 // disk-KV sync helpers (GPU<->CPU KV mirror + GDN state).
 mod disk_sync;
 mod gdn;
@@ -53,31 +53,28 @@ pub(crate) mod repack_q8;
 pub(crate) mod repack_q4;
 // runtime BF16 GDN qkv+attn_gate concat-then-stripe repack
 // (24-GDN-layer subset under the 4.8 GB Apple AGX TLB threshold), env-gated.
+mod backend_impl;
 pub(crate) mod repack_bf16;
 pub(crate) mod types;
-mod backend_impl;
 // ssm_out_gemm microbench: standalone perf harness for the GDN hot-spot.
 // Exposes a single `#[doc(hidden)] pub fn run_ssm_out_microbench` entry
 // point; no production code path touches this module.
 pub mod ssm_out_microbench;
 pub use types::*;
 
-use crate::weight::cache::LayerView;
+use self::ffi::{MTLSize, MetalBuffer, MetalCommandQueue, MetalDevice};
+use self::io::MetalIOQueue;
 use crate::error::RuntimeError;
 use crate::expert::cache::ExpertLfuCache;
 use crate::expert::profiler::ExpertActivationProfiler;
 use crate::expert::reader::ExpertReader;
-use self::ffi::{
-    MetalBuffer, MetalCommandQueue,
-    MetalDevice, MTLSize,
-};
-use self::io::MetalIOQueue;
+use crate::weight::cache::LayerView;
 use lumen_format::quantization::QuantScheme;
 use std::ffi::c_void;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Page size for alignment checks (4 KiB on all Apple Silicon).
 const PAGE_SIZE: usize = 4096;
@@ -278,7 +275,10 @@ pub(crate) fn moe_route_sort_mode() -> u8 {
         return cur;
     }
     // Legacy kill switch takes priority: PAR=0 forces serial.
-    let v = if matches!(std::env::var("LUMEN_METAL_MOE_ROUTE_SORT_PAR").as_deref(), Ok("0")) {
+    let v = if matches!(
+        std::env::var("LUMEN_METAL_MOE_ROUTE_SORT_PAR").as_deref(),
+        Ok("0")
+    ) {
         0u8
     } else {
         match std::env::var("LUMEN_METAL_MOE_ROUTE_SORT").as_deref() {
@@ -347,8 +347,8 @@ pub(crate) fn moe_diag_skip() -> u8 {
         Some("shared") => 3u8,
         Some("gating") => 4u8,
         Some("router") => 5u8,
-        Some("rtopk") => 6u8,    // skip only the top-k softmax kernel
-        Some("rlogits") => 7u8,  // skip only the per-expert logits kernel
+        Some("rtopk") => 6u8,   // skip only the top-k softmax kernel
+        Some("rlogits") => 7u8, // skip only the per-expert logits kernel
         _ => 0u8,
     };
     CACHE.store(v, Ordering::Relaxed);
@@ -369,9 +369,16 @@ struct PrefetchState {
     expert_ids: Vec<u32>,
     /// Join handle resolving to prefetched expert data.
     /// Each result corresponds to the expert_ids in order.
-    handle: std::thread::JoinHandle<Vec<(u32, Result<(Vec<u8>, lumen_format::index::ExpertSlice), crate::expert::reader::ExpertReaderError>)>>,
+    handle: std::thread::JoinHandle<
+        Vec<(
+            u32,
+            Result<
+                (Vec<u8>, lumen_format::index::ExpertSlice),
+                crate::expert::reader::ExpertReaderError,
+            >,
+        )>,
+    >,
 }
-
 
 // ============================================================================
 // MetalF32Backend
@@ -424,7 +431,6 @@ pub struct MetalF32Backend {
     // Only active for MoE models in streaming mode (non-GPU-resident).
     // Records expert activation patterns and caches hot experts to avoid
     // redundant SSD reads on subsequent tokens.
-
     /// Expert activation profiler: tracks per-(layer, expert) activation counts.
     /// Initialized when the model has num_experts > 0.
     expert_profiler: Option<Mutex<ExpertActivationProfiler>>,
@@ -453,7 +459,6 @@ pub struct MetalF32Backend {
 
     // Cache-conditional routing bias
     // ====================================================================
-
     /// Bias magnitude for cache-conditional routing. When > 0.0, cached experts
     /// receive a logit boost of `cache_bias_lambda` before softmax in the MoE
     /// router, nudging borderline selections toward already-cached experts.
@@ -463,7 +468,6 @@ pub struct MetalF32Backend {
     // ====================================================================
     // MoE I/O instrumentation
     // ====================================================================
-
     /// Bytes of expert data loaded from disk via ExpertReader (Tier 2 misses).
     expert_bytes_from_disk: AtomicU64,
     /// Bytes of expert data served from ExpertLfuCache (Tier 1 + Tier 2 hits).
@@ -474,7 +478,6 @@ pub struct MetalF32Backend {
     // ====================================================================
     // Option A dispatch
     // ====================================================================
-
     /// When true, MoE decode dispatches only the top-K selected expert FFNs
     /// instead of all num_experts (Option B). In streaming mode, expert_ids are
     /// available CPU-side after synchronous router readback. In
@@ -486,7 +489,6 @@ pub struct MetalF32Backend {
     // ====================================================================
     // Async expert prefetching
     // ====================================================================
-
     /// One-layer lookahead prefetch handle. After layer N's router produces
     /// expert_ids, a background thread pre-reads the same experts for layer N+1
     /// from disk. At layer N+1, the prefetch result is checked before falling
@@ -499,7 +501,6 @@ pub struct MetalF32Backend {
     // ====================================================================
     // Router diagnostics
     // ====================================================================
-
     /// When true, router debug readback is active: after each decode token,
     /// expert_ids and expert_weights are read back for all MoE layers and
     /// stored in `router_debug_log`.
@@ -512,7 +513,6 @@ pub struct MetalF32Backend {
     // ====================================================================
     // Metal IO command queue for direct NVMe-to-GPU DMA
     // ====================================================================
-
     /// Metal IO command queue for direct file-to-GPU DMA transfers.
     /// Available on Metal 3 (M2+) with macOS 13+. When present, streaming
     /// expert loading bypasses CPU memory and loads directly from NVMe SSD
@@ -529,9 +529,9 @@ impl MetalF32Backend {
             RuntimeError::Compute("Metal GPU not available on this system".into())
         })?;
 
-        let queue = device.new_command_queue().ok_or_else(|| {
-            RuntimeError::Compute("Failed to create Metal command queue".into())
-        })?;
+        let queue = device
+            .new_command_queue()
+            .ok_or_else(|| RuntimeError::Compute("Failed to create Metal command queue".into()))?;
 
         // Pick up LUMEN_METAL_PROFILE=1 if set in the environment. The
         // CLI's `--profile` flag also routes through `set_profile()`.
@@ -580,9 +580,6 @@ impl MetalF32Backend {
         })
     }
 
-
-
-
     /// Returns whether expert cache warmup has been completed.
     pub fn is_warmup_complete(&self) -> bool {
         self.warmup_complete.load(Ordering::Relaxed)
@@ -591,13 +588,17 @@ impl MetalF32Backend {
     /// Returns a snapshot of expert activation profiler statistics.
     /// Returns None if the model is not MoE or profiler is not initialized.
     pub fn expert_profiler_summary(&self) -> Option<crate::expert::profiler::ProfilerSummary> {
-        self.expert_profiler.as_ref().map(|p| p.lock().unwrap().summary())
+        self.expert_profiler
+            .as_ref()
+            .map(|p| p.lock().unwrap().summary())
     }
 
     /// Returns a snapshot of expert cache statistics.
     /// Returns None if expert caching is not configured.
     pub fn expert_cache_stats(&self) -> Option<crate::expert::cache::CacheStats> {
-        self.expert_cache.as_ref().map(|c| c.lock().unwrap().stats())
+        self.expert_cache
+            .as_ref()
+            .map(|c| c.lock().unwrap().stats())
     }
 
     /// Returns cumulative MoE expert I/O byte counters.
@@ -631,7 +632,6 @@ impl MetalF32Backend {
         let mut log = self.router_debug_log.lock().unwrap();
         std::mem::take(&mut *log)
     }
-
 
     /// Set raw Q8_0 output projection bytes for GPU-native dequant-matmul.
     ///
@@ -671,12 +671,11 @@ impl MetalF32Backend {
 
     /// Upload f32 data to a GPU buffer.
     fn upload_f32(&self, data: &[f32]) -> Result<MetalBuffer, RuntimeError> {
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-        };
-        self.device.new_buffer_with_bytes(bytes).ok_or_else(|| {
-            RuntimeError::Compute("Failed to create Metal buffer".into())
-        })
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        self.device
+            .new_buffer_with_bytes(bytes)
+            .ok_or_else(|| RuntimeError::Compute("Failed to create Metal buffer".into()))
     }
 
     /// Create a zero-copy MetalBuffer wrapping the entire layer blob.
@@ -714,7 +713,8 @@ impl MetalF32Backend {
             // which keeps the mmap alive. The buffer is used only within this
             // compute_layer call and dropped before returning.
             let buf = unsafe {
-                self.device.new_buffer_no_copy(ptr as *mut c_void, aligned_len)
+                self.device
+                    .new_buffer_no_copy(ptr as *mut c_void, aligned_len)
             };
             if let Some(buf) = buf {
                 return Ok(buf);
@@ -759,7 +759,8 @@ impl MetalF32Backend {
             let aligned_len = aligned_len.min(max_aligned);
 
             let buf = unsafe {
-                self.device.new_buffer_no_copy(ptr as *mut c_void, aligned_len)
+                self.device
+                    .new_buffer_no_copy(ptr as *mut c_void, aligned_len)
             };
             if let Some(buf) = buf {
                 return Ok(buf);
@@ -767,9 +768,13 @@ impl MetalF32Backend {
         }
 
         // Not page-aligned: copy only the non-expert portion.
-        self.device.new_buffer_with_bytes(&blob[..len]).ok_or_else(|| {
-            RuntimeError::Compute("Failed to create partial layer buffer (copy fallback)".into())
-        })
+        self.device
+            .new_buffer_with_bytes(&blob[..len])
+            .ok_or_else(|| {
+                RuntimeError::Compute(
+                    "Failed to create partial layer buffer (copy fallback)".into(),
+                )
+            })
     }
 
     /// Compute the byte offset where expert data begins in a MoE layer blob.
@@ -819,7 +824,11 @@ impl MetalF32Backend {
         // Shared expert weights (always loaded, non-expert).
         // Qwen3.5-MoE has an always-active shared expert whose gate/up/down
         // weights live in the layer blob alongside attention/norm/router data.
-        for opt in &[&st.shared_expert_gate, &st.shared_expert_up, &st.shared_expert_down] {
+        for opt in &[
+            &st.shared_expert_gate,
+            &st.shared_expert_up,
+            &st.shared_expert_down,
+        ] {
             if let Some(s) = opt {
                 let s_end = s.offset + s.length;
                 if s_end > end {
@@ -841,7 +850,15 @@ impl MetalF32Backend {
 
         // SSM / linear attention fields (always loaded, non-expert).
         // These are per-layer tensors for GatedDeltaNet hybrid layers.
-        for opt in &[&st.ssm_a, &st.ssm_conv1d, &st.ssm_dt, &st.ssm_beta, &st.ssm_alpha, &st.ssm_norm, &st.ssm_out] {
+        for opt in &[
+            &st.ssm_a,
+            &st.ssm_conv1d,
+            &st.ssm_dt,
+            &st.ssm_beta,
+            &st.ssm_alpha,
+            &st.ssm_norm,
+            &st.ssm_out,
+        ] {
             if let Some(s) = opt {
                 let s_end = s.offset + s.length;
                 if s_end > end {
@@ -972,16 +989,11 @@ impl MetalF32Backend {
         scratch: &MetalScratch,
     ) -> Result<(), RuntimeError> {
         match quant {
-            QuantScheme::Q8_0 => {
-                self.dispatch_matmul_q8_0(
-                    pipelines, w_bytes, x_buf, out_buf, out_dim, in_dim, scratch,
-                )
-            }
-            _ => {
-                self.dispatch_matmul_bytes(
-                    pipelines, w_bytes, x_buf, out_buf, out_dim, in_dim, scratch,
-                )
-            }
+            QuantScheme::Q8_0 => self
+                .dispatch_matmul_q8_0(pipelines, w_bytes, x_buf, out_buf, out_dim, in_dim, scratch),
+            _ => self.dispatch_matmul_bytes(
+                pipelines, w_bytes, x_buf, out_buf, out_dim, in_dim, scratch,
+            ),
         }
     }
 
@@ -1026,8 +1038,6 @@ impl MetalF32Backend {
         Ok(())
     }
 }
-
-
 
 #[cfg(test)]
 mod tests;

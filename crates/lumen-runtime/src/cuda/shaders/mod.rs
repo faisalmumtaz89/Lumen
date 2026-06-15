@@ -117,8 +117,7 @@ pub const ATTENTION_KERNEL_SOURCE: &str = include_str!("attention.cu");
 /// 0 = "tiled-always") OR `LUMEN_CUDA_DECODE_TILED=1` is set. Operators can
 /// set `LUMEN_CUDA_DECODE_TILED_THRESHOLD=4294967295` to opt out (force
 /// single-block below the 40_950 structural ceiling).
-pub const ATTENTION_DECODE_TILED_KERNEL_SOURCE: &str =
-    include_str!("attention_decode_tiled.cu");
+pub const ATTENTION_DECODE_TILED_KERNEL_SOURCE: &str = include_str!("attention_decode_tiled.cu");
 
 /// Tiled GEMM F32 kernels for batched prefill (32x32 tiles, shared memory).
 pub const GEMM_F32_KERNEL_SOURCE: &str = include_str!("gemm_f32.cu");
@@ -193,8 +192,7 @@ pub const GDN_F64ACCUM_KERNEL_SOURCE: &str = include_str!("gdn_f64accum.cu");
 /// RMS scale as a single scalar, then normalizing `x` inline during the dot
 /// product. Saves 1 kernel launch + 2 * hidden_dim * 4 bytes of global memory
 /// traffic per fusion site.
-pub const FUSED_RMSNORM_MATVEC_KERNEL_SOURCE: &str =
-    include_str!("fused_rmsnorm_matvec.cu");
+pub const FUSED_RMSNORM_MATVEC_KERNEL_SOURCE: &str = include_str!("fused_rmsnorm_matvec.cu");
 
 /// Batched prefill kernels: embed_batch, rmsnorm_batched, rope_apply_batched,
 /// kv_cache_write_batch, swiglu_batched, residual_add_batched, extract_row.
@@ -356,8 +354,7 @@ pub const MATVEC_Q4_0_DP4A_KERNEL_SOURCE: &str = include_str!("matvec_q4_0_dp4a.
 /// Kernels: `matvec_q8_aligned_q8_1`, `matvec_q8_aligned_q8_1_residual`.
 /// Reuses `quantize_f32_to_q8_1` from MATVEC_DP4A_Q8_1_KERNEL_SOURCE.
 /// Requires SM 6.1+ (dp4a).
-pub const MATVEC_Q8_ALIGNED_Q8_1_KERNEL_SOURCE: &str =
-    include_str!("matvec_q8_aligned_q8_1.cu");
+pub const MATVEC_Q8_ALIGNED_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q8_aligned_q8_1.cu");
 
 /// Repack Q4_0 blocks from 18 bytes to 20 bytes (insert 2-byte padding for alignment).
 /// One-time kernel run during preload_weights, not on the decode hot path.
@@ -374,8 +371,7 @@ pub const REPACK_Q4_ALIGNED_KERNEL_SOURCE: &str = include_str!("repack_q4_aligne
 /// Kernels: `matvec_q4_aligned_q8_1`, `matvec_q4_aligned_q8_1_residual`.
 /// Reuses `quantize_f32_to_q8_1` from MATVEC_DP4A_Q8_1_KERNEL_SOURCE.
 /// Requires SM 6.1+ (dp4a).
-pub const MATVEC_Q4_ALIGNED_Q8_1_KERNEL_SOURCE: &str =
-    include_str!("matvec_q4_aligned_q8_1.cu");
+pub const MATVEC_Q4_ALIGNED_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q4_aligned_q8_1.cu");
 
 /// Fused down projection: inline F32->Q8_1 quantization + dp4a matvec.
 ///
@@ -436,8 +432,7 @@ pub const QGATE_FUSION_KERNEL_SOURCE: &str = include_str!("qgate_fusion.cu");
 ///
 /// Kernels: `matvec_q8_split_q8_1`, `matvec_q8_split_q8_1_residual`.
 /// Requires SM 6.1+ (dp4a).
-pub const MATVEC_Q8_SPLIT_Q8_1_KERNEL_SOURCE: &str =
-    include_str!("matvec_q8_split_q8_1.cu");
+pub const MATVEC_Q8_SPLIT_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q8_split_q8_1.cu");
 
 /// Q8_0 SPLIT matvec, 4-threads-per-block thread mapping (NR=2, 128 threads, K-trip=4+).
 ///
@@ -495,8 +490,7 @@ pub const MATVEC_Q8_SPLIT_Q8_1_NR8_KERNEL_SOURCE: &str =
 /// Mutually exclusive with `LUMEN_CUDA_Q8_SPLIT_NR8` (the SPLIT variant);
 /// if both are set the AoS path wins on the AoS dispatch.
 /// Requires SM 6.1+ (dp4a).
-pub const MATVEC_Q8_ALIGNED_NR8_KERNEL_SOURCE: &str =
-    include_str!("matvec_q8_aligned_nr8.cu");
+pub const MATVEC_Q8_ALIGNED_NR8_KERNEL_SOURCE: &str = include_str!("matvec_q8_aligned_nr8.cu");
 
 /// Q4_0 split (SoA) matvec against pre-quantized Q8_1 input (dp4a, NR=4).
 ///
@@ -507,8 +501,7 @@ pub const MATVEC_Q8_ALIGNED_NR8_KERNEL_SOURCE: &str =
 ///
 /// Kernels: `matvec_q4_split_q8_1`, `matvec_q4_split_q8_1_residual`.
 /// Requires SM 6.1+ (dp4a).
-pub const MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE: &str =
-    include_str!("matvec_q4_split_q8_1.cu");
+pub const MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q4_split_q8_1.cu");
 
 /// Q8_0 split matvec dedicated to the final `output_proj` shape.
 ///
@@ -520,13 +513,11 @@ pub const MATVEC_Q8_SPLIT_OUTPUT_PROJ_KERNEL_SOURCE: &str =
 
 /// One-time repack from Q8Raw (34-byte AoS) to per-row split (SoA) layout.
 /// Runs once during `preload_weights`, NOT on the decode hot path.
-pub const REPACK_Q8_RAW_TO_SPLIT_KERNEL_SOURCE: &str =
-    include_str!("repack_q8_raw_to_split.cu");
+pub const REPACK_Q8_RAW_TO_SPLIT_KERNEL_SOURCE: &str = include_str!("repack_q8_raw_to_split.cu");
 
 /// One-time repack from Q4Raw (18-byte AoS) to per-row split (SoA) layout.
 /// Runs once during `preload_weights`, NOT on the decode hot path.
-pub const REPACK_Q4_RAW_TO_SPLIT_KERNEL_SOURCE: &str =
-    include_str!("repack_q4_split.cu");
+pub const REPACK_Q4_RAW_TO_SPLIT_KERNEL_SOURCE: &str = include_str!("repack_q4_split.cu");
 
 /// Q8_0 aligned matvec with halfword (16-bit) scale loads.
 ///
@@ -546,8 +537,7 @@ pub const MATVEC_Q8_ALIGNED_Q8_1_HW_KERNEL_SOURCE: &str =
 ///
 /// Kernels: `matvec_q8_tile_q8_1`, `matvec_q8_tile_q8_1_residual`.
 /// Requires SM 6.1+ (dp4a) and `nb % 8 == 0` (every Qwen3.5-9B dim satisfies).
-pub const MATVEC_Q8_TILE_Q8_1_KERNEL_SOURCE: &str =
-    include_str!("matvec_q8_tile_q8_1.cu");
+pub const MATVEC_Q8_TILE_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q8_tile_q8_1.cu");
 
 /// Q4_0 tile-grouped matvec against pre-quantized Q8_1 input (dp4a, NR=4).
 ///
@@ -559,18 +549,15 @@ pub const MATVEC_Q8_TILE_Q8_1_KERNEL_SOURCE: &str =
 ///
 /// Kernels: `matvec_q4_tile_q8_1`, `matvec_q4_tile_q8_1_residual`.
 /// Requires SM 6.1+ (dp4a) and `nb % 8 == 0`.
-pub const MATVEC_Q4_TILE_Q8_1_KERNEL_SOURCE: &str =
-    include_str!("matvec_q4_tile_q8_1.cu");
+pub const MATVEC_Q4_TILE_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q4_tile_q8_1.cu");
 
 /// One-time repack from Q4Raw (18-byte AoS) to per-tile layout (144 B / 8 blocks).
 /// Runs once during `preload_weights`, NOT on the decode hot path.
-pub const REPACK_Q4_TILE_KERNEL_SOURCE: &str =
-    include_str!("repack_q4_tile.cu");
+pub const REPACK_Q4_TILE_KERNEL_SOURCE: &str = include_str!("repack_q4_tile.cu");
 
 /// One-time repack from Q8Raw (34-byte AoS) to per-tile layout (272 B / 8 blocks).
 /// Runs once during `preload_weights`, NOT on the decode hot path.
-pub const REPACK_Q8_TILE_KERNEL_SOURCE: &str =
-    include_str!("repack_q8_tile.cu");
+pub const REPACK_Q8_TILE_KERNEL_SOURCE: &str = include_str!("repack_q8_tile.cu");
 
 /// MoE top-K router kernel.
 ///

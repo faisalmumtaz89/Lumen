@@ -79,7 +79,10 @@ impl MmapStorageBackend {
         if end > self.len {
             return Err(RuntimeError::StorageIo(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                format!("slice_ref: offset={off} + length={len} > file_size={}", self.len),
+                format!(
+                    "slice_ref: offset={off} + length={len} > file_size={}",
+                    self.len
+                ),
             )));
         }
         self.io.record_read(length);
@@ -94,11 +97,9 @@ impl StorageBackend for MmapStorageBackend {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
 
-        let c_path = CString::new(path.as_os_str().as_bytes())
-            .map_err(|e| RuntimeError::StorageIo(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                e,
-            )))?;
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|e| {
+            RuntimeError::StorageIo(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
 
         // Open the file
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
@@ -109,13 +110,17 @@ impl StorageBackend for MmapStorageBackend {
         // Get file size
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(fd, &mut stat) } != 0 {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(RuntimeError::StorageIo(std::io::Error::last_os_error()));
         }
         let len = stat.st_size as usize;
 
         if len == 0 {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(RuntimeError::StorageIo(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "cannot mmap empty file",
@@ -134,7 +139,9 @@ impl StorageBackend for MmapStorageBackend {
             )
         };
         if ptr == libc::MAP_FAILED {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(RuntimeError::StorageIo(std::io::Error::last_os_error()));
         }
 
@@ -146,7 +153,11 @@ impl StorageBackend for MmapStorageBackend {
         // Apply sequential advice if configured
         if self.config.advise_sequential {
             unsafe {
-                libc::madvise(self.ptr as *mut libc::c_void, self.len, libc::MADV_SEQUENTIAL);
+                libc::madvise(
+                    self.ptr as *mut libc::c_void,
+                    self.len,
+                    libc::MADV_SEQUENTIAL,
+                );
             }
         }
 
@@ -155,7 +166,9 @@ impl StorageBackend for MmapStorageBackend {
 
     #[cfg(not(unix))]
     fn open(&mut self, _path: &Path) -> Result<(), RuntimeError> {
-        Err(RuntimeError::Unsupported("mmap not available on this platform".into()))
+        Err(RuntimeError::Unsupported(
+            "mmap not available on this platform".into(),
+        ))
     }
 
     fn close(&mut self) -> Result<(), RuntimeError> {
@@ -171,14 +184,18 @@ impl StorageBackend for MmapStorageBackend {
                 }
             }
             if self.fd >= 0 {
-                unsafe { libc::close(self.fd); }
+                unsafe {
+                    libc::close(self.fd);
+                }
             }
         }
 
         self.ptr = ptr::null_mut();
         self.len = 0;
         #[cfg(unix)]
-        { self.fd = -1; }
+        {
+            self.fd = -1;
+        }
         self.is_open = false;
         Ok(())
     }
@@ -195,7 +212,10 @@ impl StorageBackend for MmapStorageBackend {
         if end > self.len {
             return Err(RuntimeError::StorageIo(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                format!("read_range: offset={off} + length={len} > file_size={}", self.len),
+                format!(
+                    "read_range: offset={off} + length={len} > file_size={}",
+                    self.len
+                ),
             )));
         }
         // Copy from mmap region (Phase 1 does a copy; zero-copy comes later)
@@ -345,13 +365,8 @@ impl MmapPageCacheBackend for MmapStorageBackend {
 
         // MADV_DONTNEED evicts pages immediately on Linux;
         // on macOS it's advisory but combined with F_NOCACHE it helps.
-        let ret = unsafe {
-            libc::madvise(
-                self.ptr as *mut libc::c_void,
-                self.len,
-                libc::MADV_DONTNEED,
-            )
-        };
+        let ret =
+            unsafe { libc::madvise(self.ptr as *mut libc::c_void, self.len, libc::MADV_DONTNEED) };
         if ret != 0 {
             return Err(RuntimeError::StorageIo(std::io::Error::last_os_error()));
         }

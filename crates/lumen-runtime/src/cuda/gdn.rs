@@ -140,7 +140,6 @@ pub struct GdnScratch {
     pub conv_positions: Vec<u32>,
 
     // Shared scratch buffers (ephemeral, rewritten each layer)
-
     /// QKV matvec output: [qkv_dim] f32.
     pub qkv_buf: Vec<f32>,
 
@@ -185,8 +184,12 @@ impl GdnScratch {
 
         Self {
             params,
-            h_states: (0..num_gdn_layers).map(|_| vec![0.0f32; h_state_size]).collect(),
-            conv_states: (0..num_gdn_layers).map(|_| vec![0.0f32; conv_state_size]).collect(),
+            h_states: (0..num_gdn_layers)
+                .map(|_| vec![0.0f32; h_state_size])
+                .collect(),
+            conv_states: (0..num_gdn_layers)
+                .map(|_| vec![0.0f32; conv_state_size])
+                .collect(),
             conv_positions: vec![0u32; num_gdn_layers],
             qkv_buf: vec![0.0f32; params.qkv_dim],
             qkv_conv_buf: vec![0.0f32; params.qkv_dim],
@@ -403,7 +406,13 @@ pub fn rmsnorm_scale(x: &[f32], scale: &[f32], out: &mut [f32], eps: f32) {
 /// out[row] = dot(weight_row[row], input)
 /// Weight layout: [num_rows, in_dim] stored as LE f32 bytes.
 #[allow(dead_code)]
-fn matvec_bytes(out: &mut [f32], weight_bytes: &[u8], input: &[f32], num_rows: usize, in_dim: usize) {
+fn matvec_bytes(
+    out: &mut [f32],
+    weight_bytes: &[u8],
+    input: &[f32],
+    num_rows: usize,
+    in_dim: usize,
+) {
     let row_bytes = in_dim * 4;
     for row in 0..num_rows {
         let w_start = row * row_bytes;
@@ -486,12 +495,19 @@ pub fn dispatch_gdn_layer(
     let p = scratch.params;
 
     // Step 1: RMSNorm(x) -> normed
-    let norm_bytes = &layer_bytes[attn_norm_off as usize..(attn_norm_off as usize + p.hidden_dim * 4)];
+    let norm_bytes =
+        &layer_bytes[attn_norm_off as usize..(attn_norm_off as usize + p.hidden_dim * 4)];
     rmsnorm_bytes(normed, x, norm_bytes, p.eps);
 
     // Step 2: QKV matvec: normed @ attn_qkv^T -> qkv_buf
     let wq_bytes = &layer_bytes[wq_off as usize..];
-    matvec_bytes(&mut scratch.qkv_buf, wq_bytes, normed, p.qkv_dim, p.hidden_dim);
+    matvec_bytes(
+        &mut scratch.qkv_buf,
+        wq_bytes,
+        normed,
+        p.qkv_dim,
+        p.hidden_dim,
+    );
 
     // Step 3: Conv1d decode on QKV channels
     let conv_weight = read_f32_slice(layer_bytes, ssm_conv1d_off, p.conv_kernel_size * p.qkv_dim);
@@ -511,11 +527,23 @@ pub fn dispatch_gdn_layer(
 
     // Step 4a: alpha_raw = matvec(ssm_alpha, normed)
     let alpha_weight_bytes = &layer_bytes[ssm_alpha_off as usize..];
-    matvec_bytes(&mut scratch.alpha_raw_buf, alpha_weight_bytes, normed, p.num_heads, p.hidden_dim);
+    matvec_bytes(
+        &mut scratch.alpha_raw_buf,
+        alpha_weight_bytes,
+        normed,
+        p.num_heads,
+        p.hidden_dim,
+    );
 
     // Step 4b: beta_raw = matvec(ssm_beta, normed)
     let beta_weight_bytes = &layer_bytes[ssm_beta_off as usize..];
-    matvec_bytes(&mut scratch.beta_raw_buf, beta_weight_bytes, normed, p.num_heads, p.hidden_dim);
+    matvec_bytes(
+        &mut scratch.beta_raw_buf,
+        beta_weight_bytes,
+        normed,
+        p.num_heads,
+        p.hidden_dim,
+    );
 
     // Step 4c: Compute gates (alpha, beta) from SSM parameters
     let dt_bias = read_f32_slice(layer_bytes, ssm_dt_off, p.num_heads);
@@ -532,8 +560,18 @@ pub fn dispatch_gdn_layer(
 
     // Step 5: L2-normalize Q and K per head
     // Q is at qkv_conv_buf[0..qk_dim], K at [qk_dim..2*qk_dim]
-    l2_normalize_heads(&mut scratch.qkv_conv_buf[..p.qk_dim], p.num_kv_heads, p.head_dim, 1e-12);
-    l2_normalize_heads(&mut scratch.qkv_conv_buf[p.qk_dim..2 * p.qk_dim], p.num_kv_heads, p.head_dim, 1e-12);
+    l2_normalize_heads(
+        &mut scratch.qkv_conv_buf[..p.qk_dim],
+        p.num_kv_heads,
+        p.head_dim,
+        1e-12,
+    );
+    l2_normalize_heads(
+        &mut scratch.qkv_conv_buf[p.qk_dim..2 * p.qk_dim],
+        p.num_kv_heads,
+        p.head_dim,
+        1e-12,
+    );
 
     // Steps 6+7: State update + output
     let q_norm = &scratch.qkv_conv_buf[..p.qk_dim];
@@ -562,11 +600,22 @@ pub fn dispatch_gdn_layer(
 
     // Step 8: RMSNorm + scale on output
     let ssm_norm = read_f32_slice(layer_bytes, ssm_norm_off, p.head_dim);
-    rmsnorm_scale(&scratch.output_buf, &ssm_norm, &mut scratch.normed_out_buf, p.eps);
+    rmsnorm_scale(
+        &scratch.output_buf,
+        &ssm_norm,
+        &mut scratch.normed_out_buf,
+        p.eps,
+    );
 
     // Step 9: Attention gate: gate = silu(attn_gate_weight * normed)
     let attn_gate_bytes = &layer_bytes[attn_gate_off as usize..];
-    matvec_bytes(&mut scratch.gate_sigmoid_buf, attn_gate_bytes, normed, p.value_dim, p.hidden_dim);
+    matvec_bytes(
+        &mut scratch.gate_sigmoid_buf,
+        attn_gate_bytes,
+        normed,
+        p.value_dim,
+        p.hidden_dim,
+    );
     // Apply silu-gated multiply: gate_sigmoid = silu(gate) * normed_out
     for i in 0..p.value_dim {
         let gate = scratch.gate_sigmoid_buf[i];
@@ -576,7 +625,13 @@ pub fn dispatch_gdn_layer(
 
     // Step 10: Output projection: ssm_proj = ssm_out_weight * gate_sigmoid
     let ssm_out_bytes = &layer_bytes[ssm_out_off as usize..];
-    matvec_bytes(&mut scratch.ssm_proj_buf, ssm_out_bytes, &scratch.gate_sigmoid_buf, p.hidden_dim, p.value_dim);
+    matvec_bytes(
+        &mut scratch.ssm_proj_buf,
+        ssm_out_bytes,
+        &scratch.gate_sigmoid_buf,
+        p.hidden_dim,
+        p.value_dim,
+    );
 
     // Step 11: Residual: x += ssm_proj
     for i in 0..p.hidden_dim {
@@ -595,10 +650,10 @@ pub fn dispatch_gdn_layer(
 /// Returns the new conv_position after processing all T tokens.
 #[allow(dead_code)]
 pub fn conv1d_silu_prefill(
-    input: &[f32],       // [T * dim]
+    input: &[f32],          // [T * dim]
     conv_state: &mut [f32], // [(kernel_size-1) * dim]
-    conv_weight: &[f32],  // [dim * kernel_size]
-    output: &mut [f32],   // [T * dim]
+    conv_weight: &[f32],    // [dim * kernel_size]
+    output: &mut [f32],     // [T * dim]
     dim: usize,
     kernel_size: usize,
     conv_pos: u32,
@@ -617,8 +672,10 @@ pub fn conv1d_silu_prefill(
                 let input_val = if source_t >= 0 {
                     input[source_t as usize * dim + d]
                 } else {
-                    let slot = (conv_pos as usize + buf_slots as usize
-                        + (buf_slots as i32 + source_t) as usize) % buf_slots as usize;
+                    let slot = (conv_pos as usize
+                        + buf_slots as usize
+                        + (buf_slots as i32 + source_t) as usize)
+                        % buf_slots as usize;
                     conv_state[slot * dim + d]
                 };
 
@@ -663,7 +720,8 @@ mod tests {
             num_experts: None,
             num_active_experts: None,
             norm_eps: 1e-6,
-            rotary_dim: None, rope_neox: false,
+            rotary_dim: None,
+            rope_neox: false,
             gdn: None,
         };
         let p = GdnParams::from_hyperparams(&hp);
@@ -737,7 +795,9 @@ mod tests {
         let beta_raw = vec![0.0f32]; // sigmoid(0) = 0.5
         let mut alpha = vec![0.0f32];
         let mut beta = vec![0.0f32];
-        compute_gates(&dt_bias, &ssm_a, &alpha_raw, &beta_raw, &mut alpha, &mut beta, 1);
+        compute_gates(
+            &dt_bias, &ssm_a, &alpha_raw, &beta_raw, &mut alpha, &mut beta, 1,
+        );
         // alpha = decay * sigmoid(alpha_raw) = 0.5 * 0.5 = 0.25
         assert!((alpha[0] - 0.25).abs() < 1e-3);
         assert!((beta[0] - 0.5).abs() < 1e-3);
@@ -768,8 +828,13 @@ mod tests {
         for t in 0..t_count {
             let token_input = &input[t * dim..(t + 1) * dim];
             seq_pos = conv1d_decode(
-                token_input, &mut seq_state, &conv_weight,
-                &mut conv_out, dim, kernel_size, seq_pos,
+                token_input,
+                &mut seq_state,
+                &conv_weight,
+                &mut conv_out,
+                dim,
+                kernel_size,
+                seq_pos,
             );
             silu_inplace(&mut conv_out);
             seq_output[t * dim..(t + 1) * dim].copy_from_slice(&conv_out);
@@ -779,8 +844,14 @@ mod tests {
         let mut batch_state = vec![0.0f32; buf_slots * dim];
         let mut batch_output = vec![0.0f32; t_count * dim];
         let batch_new_pos = conv1d_silu_prefill(
-            &input, &mut batch_state, &conv_weight,
-            &mut batch_output, dim, kernel_size, 0, t_count,
+            &input,
+            &mut batch_state,
+            &conv_weight,
+            &mut batch_output,
+            dim,
+            kernel_size,
+            0,
+            t_count,
         );
 
         // Verify outputs match
@@ -788,20 +859,24 @@ mod tests {
             assert!(
                 (seq_output[i] - batch_output[i]).abs() < 1e-5,
                 "Mismatch at index {i}: seq={} batch={}",
-                seq_output[i], batch_output[i]
+                seq_output[i],
+                batch_output[i]
             );
         }
 
         // Verify final conv position matches
-        assert_eq!(seq_pos, batch_new_pos,
-            "Conv positions differ: seq={seq_pos} batch={batch_new_pos}");
+        assert_eq!(
+            seq_pos, batch_new_pos,
+            "Conv positions differ: seq={seq_pos} batch={batch_new_pos}"
+        );
 
         // Verify conv_state matches
         for i in 0..buf_slots * dim {
             assert!(
                 (seq_state[i] - batch_state[i]).abs() < 1e-6,
                 "Conv state mismatch at index {i}: seq={} batch={}",
-                seq_state[i], batch_state[i]
+                seq_state[i],
+                batch_state[i]
             );
         }
     }

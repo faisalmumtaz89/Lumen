@@ -120,8 +120,8 @@ impl LargeModelConfig {
             + hidden * q_dim                 // wo
             + inter * hidden                 // w_gate
             + inter * hidden                 // w_up
-            + hidden * inter;               // w_down
-        // F32 norms: 4 bytes per element
+            + hidden * inter; // w_down
+                              // F32 norms: 4 bytes per element
         let norm_elements = hidden + hidden; // attn_norm + ffn_norm
 
         proj_elements * 2 + norm_elements * 4
@@ -170,7 +170,8 @@ impl LargeModelConfig {
             num_experts: None,
             num_active_experts: None,
             norm_eps: 1e-5,
-            rotary_dim: None, rope_neox: false,
+            rotary_dim: None,
+            rope_neox: false,
             gdn: None,
         }
     }
@@ -184,15 +185,15 @@ pub fn compute_layer_shape(config: &LargeModelConfig) -> LayerShape {
     let kv_dim = (config.num_kv_heads * config.head_dim) as usize;
 
     let sizes = [
-        q_dim * hidden,   // wq
-        kv_dim * hidden,  // wk
-        kv_dim * hidden,  // wv
-        hidden * q_dim,   // wo
-        inter * hidden,   // w_gate
-        inter * hidden,   // w_up
-        hidden * inter,   // w_down
-        hidden,           // attn_norm
-        hidden,           // ffn_norm
+        q_dim * hidden,  // wq
+        kv_dim * hidden, // wk
+        kv_dim * hidden, // wv
+        hidden * q_dim,  // wo
+        inter * hidden,  // w_gate
+        inter * hidden,  // w_up
+        hidden * inter,  // w_down
+        hidden,          // attn_norm
+        hidden,          // ffn_norm
     ];
 
     let mut offset = 0u64;
@@ -209,17 +210,34 @@ pub fn compute_layer_shape(config: &LargeModelConfig) -> LayerShape {
 
     let blob_size = offset;
     let subtensors = SubtensorOffsets {
-        wq: slices[0], wk: slices[1], wv: slices[2], wo: slices[3],
-        bq: None, bk: None, bv: None,
-        w_gate: slices[4], w_up: slices[5], w_down: slices[6],
-        attn_norm: slices[7], ffn_norm: slices[8],
+        wq: slices[0],
+        wk: slices[1],
+        wv: slices[2],
+        wo: slices[3],
+        bq: None,
+        bk: None,
+        bv: None,
+        w_gate: slices[4],
+        w_up: slices[5],
+        w_down: slices[6],
+        attn_norm: slices[7],
+        ffn_norm: slices[8],
         router_weight: None,
         experts: None,
-        shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-        attn_gate: None, attn_post_norm: None,
-        ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-        ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-        attn_q_norm: None, attn_k_norm: None,
+        shared_expert_gate: None,
+        shared_expert_up: None,
+        shared_expert_down: None,
+        attn_gate: None,
+        attn_post_norm: None,
+        ssm_a: None,
+        ssm_conv1d: None,
+        ssm_dt: None,
+        ssm_beta: None,
+        ssm_alpha: None,
+        ssm_norm: None,
+        ssm_out: None,
+        attn_q_norm: None,
+        attn_k_norm: None,
         ffn_gate_inp_shexp: None,
         layer_type: None,
     };
@@ -243,15 +261,15 @@ pub fn compute_layer_shape_f16(config: &LargeModelConfig) -> LayerShape {
 
     // (num_elements, bytes_per_element, quant_scheme)
     let tensors: [(usize, usize, QuantScheme); 9] = [
-        (q_dim * hidden, 2, QuantScheme::F16),    // wq
-        (kv_dim * hidden, 2, QuantScheme::F16),   // wk
-        (kv_dim * hidden, 2, QuantScheme::F16),   // wv
-        (hidden * q_dim, 2, QuantScheme::F16),    // wo
-        (inter * hidden, 2, QuantScheme::F16),    // w_gate
-        (inter * hidden, 2, QuantScheme::F16),    // w_up
-        (hidden * inter, 2, QuantScheme::F16),    // w_down
-        (hidden, 4, QuantScheme::F32),            // attn_norm
-        (hidden, 4, QuantScheme::F32),            // ffn_norm
+        (q_dim * hidden, 2, QuantScheme::F16),  // wq
+        (kv_dim * hidden, 2, QuantScheme::F16), // wk
+        (kv_dim * hidden, 2, QuantScheme::F16), // wv
+        (hidden * q_dim, 2, QuantScheme::F16),  // wo
+        (inter * hidden, 2, QuantScheme::F16),  // w_gate
+        (inter * hidden, 2, QuantScheme::F16),  // w_up
+        (hidden * inter, 2, QuantScheme::F16),  // w_down
+        (hidden, 4, QuantScheme::F32),          // attn_norm
+        (hidden, 4, QuantScheme::F32),          // ffn_norm
     ];
 
     let mut offset = 0u64;
@@ -268,17 +286,34 @@ pub fn compute_layer_shape_f16(config: &LargeModelConfig) -> LayerShape {
 
     let blob_size = offset;
     let subtensors = SubtensorOffsets {
-        wq: slices[0], wk: slices[1], wv: slices[2], wo: slices[3],
-        bq: None, bk: None, bv: None,
-        w_gate: slices[4], w_up: slices[5], w_down: slices[6],
-        attn_norm: slices[7], ffn_norm: slices[8],
+        wq: slices[0],
+        wk: slices[1],
+        wv: slices[2],
+        wo: slices[3],
+        bq: None,
+        bk: None,
+        bv: None,
+        w_gate: slices[4],
+        w_up: slices[5],
+        w_down: slices[6],
+        attn_norm: slices[7],
+        ffn_norm: slices[8],
         router_weight: None,
         experts: None,
-        shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-        attn_gate: None, attn_post_norm: None,
-        ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-        ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-        attn_q_norm: None, attn_k_norm: None,
+        shared_expert_gate: None,
+        shared_expert_up: None,
+        shared_expert_down: None,
+        attn_gate: None,
+        attn_post_norm: None,
+        ssm_a: None,
+        ssm_conv1d: None,
+        ssm_dt: None,
+        ssm_beta: None,
+        ssm_alpha: None,
+        ssm_norm: None,
+        ssm_out: None,
+        attn_q_norm: None,
+        attn_k_norm: None,
         ffn_gate_inp_shexp: None,
         layer_type: None,
     };

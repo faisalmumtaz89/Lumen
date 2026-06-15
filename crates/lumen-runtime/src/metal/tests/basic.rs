@@ -1,6 +1,6 @@
-use crate::metal::*;
-use crate::metal::shaders::METAL_SHADER_SOURCE;
 use crate::metal::ffi::{MTLSize, MetalBuffer};
+use crate::metal::shaders::METAL_SHADER_SOURCE;
+use crate::metal::*;
 
 #[test]
 fn test_metal_backend_creation() {
@@ -18,8 +18,10 @@ fn test_metal_matmul_correctness() {
     let backend = MetalF32Backend::new().unwrap();
 
     // Compile pipelines manually for this test
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("matmul_f32").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -41,24 +43,27 @@ fn test_metal_matmul_correctness() {
     enc.set_buffer(&x_buf, 0, 1);
     enc.set_buffer(&out_buf, 0, 2);
     enc.set_bytes(&in_dim.to_le_bytes(), 3);
-    enc.dispatch_threadgroups(
-        MTLSize::new(2, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(2, 1, 1), MTLSize::new(tg_size, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
     let mut result = vec![0.0f32; 2];
     out_buf.read_f32(&mut result);
-    assert_eq!(result, vec![4.0, 10.0], "GPU matmul should match CPU: [1,2,3]*[1,0,1]=4, [4,5,6]*[1,0,1]=10");
+    assert_eq!(
+        result,
+        vec![4.0, 10.0],
+        "GPU matmul should match CPU: [1,2,3]*[1,0,1]=4, [4,5,6]*[1,0,1]=10"
+    );
 }
 
 #[test]
 fn test_metal_rmsnorm_correctness() {
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("rmsnorm").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -79,10 +84,7 @@ fn test_metal_rmsnorm_correctness() {
     enc.set_buffer(&out_buf, 0, 2);
     enc.set_bytes(&dim.to_le_bytes(), 3);
     enc.set_bytes(&eps.to_le_bytes(), 4);
-    enc.dispatch_threadgroups(
-        MTLSize::new(1, 1, 1),
-        MTLSize::new(32, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(32, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -104,8 +106,10 @@ fn test_metal_rmsnorm_correctness() {
 fn test_metal_softmax_correctness() {
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("softmax").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -118,10 +122,7 @@ fn test_metal_softmax_correctness() {
     enc.set_pipeline_state(&pso);
     enc.set_buffer(&data_buf, 0, 0);
     enc.set_bytes(&len.to_le_bytes(), 1);
-    enc.dispatch_threadgroups(
-        MTLSize::new(1, 1, 1),
-        MTLSize::new(32, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(32, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -141,8 +142,10 @@ fn test_metal_softmax_correctness() {
 fn test_metal_swiglu_correctness() {
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("swiglu").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -159,10 +162,7 @@ fn test_metal_swiglu_correctness() {
     enc.set_buffer(&gate_buf, 0, 0);
     enc.set_buffer(&up_buf, 0, 1);
     enc.set_bytes(&dim.to_le_bytes(), 2);
-    enc.dispatch_threads(
-        MTLSize::new(3, 1, 1),
-        MTLSize::new(3, 1, 1),
-    );
+    enc.dispatch_threads(MTLSize::new(3, 1, 1), MTLSize::new(3, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -170,8 +170,16 @@ fn test_metal_swiglu_correctness() {
     gate_buf.read_f32(&mut result);
 
     assert!((result[0] - 0.0).abs() < 1e-6, "swiglu(0)*1 = 0");
-    assert!((result[1] - 0.7310586).abs() < 1e-4, "swiglu(1)*1 ~ 0.731, got {}", result[1]);
-    assert!((result[2] - (-0.2689414)).abs() < 1e-4, "swiglu(-1)*1 ~ -0.269, got {}", result[2]);
+    assert!(
+        (result[1] - 0.7310586).abs() < 1e-4,
+        "swiglu(1)*1 ~ 0.731, got {}",
+        result[1]
+    );
+    assert!(
+        (result[2] - (-0.2689414)).abs() < 1e-4,
+        "swiglu(-1)*1 ~ -0.269, got {}",
+        result[2]
+    );
 }
 
 /// Helper: convert f16 (IEEE 754 half-precision) bits (u16) to f32.
@@ -199,7 +207,11 @@ fn f16_to_f32_bits(bits: u16) -> f32 {
         if frac != 0 {
             return f32::NAN;
         }
-        return if sign != 0 { f32::NEG_INFINITY } else { f32::INFINITY };
+        return if sign != 0 {
+            f32::NEG_INFINITY
+        } else {
+            f32::INFINITY
+        };
     }
 
     let f32_exp = (exp as i32 + 127 - 15) as u32;
@@ -260,8 +272,10 @@ fn test_metal_dequant_matmul_q8_0_correctness() {
 
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("dequant_matmul_q8_0").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -327,7 +341,8 @@ fn test_metal_dequant_matmul_q8_0_correctness() {
     let expected_0 = 64.0f32;
     assert!(
         (result[0] - expected_0).abs() < 0.1,
-        "Q8_0 matmul row 0: GPU={}, expected={expected_0}", result[0]
+        "Q8_0 matmul row 0: GPU={}, expected={expected_0}",
+        result[0]
     );
 
     // Row 1: scale=1.0, values=[0..31, 0..31] -> elements = [0,1,...,31,0,1,...,31]
@@ -335,11 +350,14 @@ fn test_metal_dequant_matmul_q8_0_correctness() {
     let expected_1 = 992.0f32;
     assert!(
         (result[1] - expected_1).abs() < 0.1,
-        "Q8_0 matmul row 1: GPU={}, expected={expected_1}", result[1]
+        "Q8_0 matmul row 1: GPU={}, expected={expected_1}",
+        result[1]
     );
 
-    eprintln!("Q8_0 dequant matmul: out[0]={}, out[1]={} (expected {expected_0}, {expected_1})",
-        result[0], result[1]);
+    eprintln!(
+        "Q8_0 dequant matmul: out[0]={}, out[1]={} (expected {expected_0}, {expected_1})",
+        result[0], result[1]
+    );
 }
 
 #[test]
@@ -351,8 +369,10 @@ fn test_metal_dequant_matmul_q8_0_negative_values() {
 
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("dequant_matmul_q8_0").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -386,10 +406,7 @@ fn test_metal_dequant_matmul_q8_0_negative_values() {
     enc.set_buffer(&x_buf, 0, 1);
     enc.set_buffer(&out_buf, 0, 2);
     enc.set_bytes(&in_dim_u32.to_le_bytes(), 3);
-    enc.dispatch_threadgroups(
-        MTLSize::new(out_dim as u64, 1, 1),
-        MTLSize::new(32, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(out_dim as u64, 1, 1), MTLSize::new(32, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -401,10 +418,14 @@ fn test_metal_dequant_matmul_q8_0_negative_values() {
     let expected = -64.0f32;
     assert!(
         (result[0] - expected).abs() < 0.1,
-        "Q8_0 matmul neg: GPU={}, expected={expected}", result[0]
+        "Q8_0 matmul neg: GPU={}, expected={expected}",
+        result[0]
     );
 
-    eprintln!("Q8_0 dequant matmul (negative): out[0]={} (expected {expected})", result[0]);
+    eprintln!(
+        "Q8_0 dequant matmul (negative): out[0]={} (expected {expected})",
+        result[0]
+    );
 }
 
 #[test]
@@ -417,8 +438,10 @@ fn test_metal_write_kv_cache_correctness() {
     // V[d*4+2] should contain V[d] for each d (transposed, f16).
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("write_kv_cache").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -468,17 +491,32 @@ fn test_metal_write_kv_cache_correctness() {
 
     // K: row-major [max_seq_len, kv_dim]. Position 2 should have our data.
     let start = seq_pos as usize * kv_dim;
-    assert_eq!(&k_result[0..start], &vec![0.0f32; start][..], "K before write pos should be zero");
-    assert_eq!(&k_result[start..start + kv_dim], &k_new[..], "K at write pos should match input");
+    assert_eq!(
+        &k_result[0..start],
+        &vec![0.0f32; start][..],
+        "K before write pos should be zero"
+    );
+    assert_eq!(
+        &k_result[start..start + kv_dim],
+        &k_new[..],
+        "K at write pos should match input"
+    );
 
     // V: transposed [kv_dim, max_seq_len]. v_cache[d * max_seq_len + seq_pos] = v_new[d]
     for d in 0..kv_dim {
         let v_idx = d * max_seq_len + seq_pos as usize;
-        assert_eq!(v_result[v_idx], v_new[d],
-            "V transposed: v_cache[{d}*{max_seq_len}+{seq_pos}] = {} should be {}", v_result[v_idx], v_new[d]);
+        assert_eq!(
+            v_result[v_idx], v_new[d],
+            "V transposed: v_cache[{d}*{max_seq_len}+{seq_pos}] = {} should be {}",
+            v_result[v_idx], v_new[d]
+        );
     }
 
-    eprintln!("write_kv_cache: K[{start}..{}] = {:?}", start + kv_dim, &k_result[start..start + kv_dim]);
+    eprintln!(
+        "write_kv_cache: K[{start}..{}] = {:?}",
+        start + kv_dim,
+        &k_result[start..start + kv_dim]
+    );
 }
 
 /// Upload f32 data as f16 (half) to a Metal buffer.
@@ -491,7 +529,12 @@ fn upload_as_f16(backend: &MetalF32Backend, data: &[f32]) -> MetalBuffer {
 }
 
 /// Transpose V cache from [seq_len, kv_dim] to [kv_dim, max_seq_len] layout.
-fn transpose_v_cache(v_row_major: &[f32], seq_len: usize, kv_dim: usize, max_seq_len: usize) -> Vec<f32> {
+fn transpose_v_cache(
+    v_row_major: &[f32],
+    seq_len: usize,
+    kv_dim: usize,
+    max_seq_len: usize,
+) -> Vec<f32> {
     let mut v_transposed = vec![0.0f32; kv_dim * max_seq_len];
     for t in 0..seq_len {
         for d in 0..kv_dim {
@@ -515,8 +558,10 @@ fn test_metal_multi_head_attention_single_head() {
 
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("multi_head_attention").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -531,13 +576,21 @@ fn test_metal_multi_head_attention_single_head() {
     let q = vec![1.0f32, 0.0, 0.0, 0.0];
     let k_cache = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
     let v_cache_row = vec![10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
-    let v_cache = transpose_v_cache(&v_cache_row, seq_len as usize, kv_dim as usize, max_seq_len as usize);
+    let v_cache = transpose_v_cache(
+        &v_cache_row,
+        seq_len as usize,
+        kv_dim as usize,
+        max_seq_len as usize,
+    );
 
     let q_buf = backend.upload_f32(&q).unwrap();
     let k_buf = upload_as_f16(&backend, &k_cache);
     let v_buf = upload_as_f16(&backend, &v_cache);
     let out_buf = backend.device.new_buffer(head_dim as usize * 4).unwrap();
-    let scores_buf = backend.device.new_buffer((num_heads * seq_len) as usize * 4).unwrap();
+    let scores_buf = backend
+        .device
+        .new_buffer((num_heads * seq_len) as usize * 4)
+        .unwrap();
 
     let cmd = backend.queue.new_command_buffer().unwrap();
     let enc = cmd.new_compute_encoder().unwrap();
@@ -554,10 +607,7 @@ fn test_metal_multi_head_attention_single_head() {
     enc.set_bytes(&seq_len.to_le_bytes(), 9);
     enc.set_bytes(&scale.to_le_bytes(), 10);
     enc.set_bytes(&max_seq_len.to_le_bytes(), 11);
-    enc.dispatch_threadgroups(
-        MTLSize::new(num_heads as u64, 1, 1),
-        MTLSize::new(32, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(num_heads as u64, 1, 1), MTLSize::new(32, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -570,7 +620,8 @@ fn test_metal_multi_head_attention_single_head() {
         let expected = w0 * v_cache_row[d] + w1 * v_cache_row[4 + d];
         assert!(
             (result[d] - expected).abs() < 0.01,
-            "MHA out[{d}]: GPU={}, expected={expected}", result[d]
+            "MHA out[{d}]: GPU={}, expected={expected}",
+            result[d]
         );
     }
     eprintln!("multi_head_attention (1 head): {:?}", result);
@@ -585,8 +636,10 @@ fn test_metal_multi_head_attention_gqa() {
 
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("multi_head_attention").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -601,13 +654,24 @@ fn test_metal_multi_head_attention_gqa() {
     let q = vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.5];
     let k_cache = vec![1.0f32, 0.0, 0.0, 1.0];
     let v_cache_row = vec![10.0f32, 20.0, 30.0, 40.0];
-    let v_cache = transpose_v_cache(&v_cache_row, seq_len as usize, kv_dim as usize, max_seq_len as usize);
+    let v_cache = transpose_v_cache(
+        &v_cache_row,
+        seq_len as usize,
+        kv_dim as usize,
+        max_seq_len as usize,
+    );
 
     let q_buf = backend.upload_f32(&q).unwrap();
     let k_buf = upload_as_f16(&backend, &k_cache);
     let v_buf = upload_as_f16(&backend, &v_cache);
-    let out_buf = backend.device.new_buffer((num_heads * head_dim) as usize * 4).unwrap();
-    let scores_buf = backend.device.new_buffer((num_heads * seq_len) as usize * 4).unwrap();
+    let out_buf = backend
+        .device
+        .new_buffer((num_heads * head_dim) as usize * 4)
+        .unwrap();
+    let scores_buf = backend
+        .device
+        .new_buffer((num_heads * seq_len) as usize * 4)
+        .unwrap();
 
     let cmd = backend.queue.new_command_buffer().unwrap();
     let enc = cmd.new_compute_encoder().unwrap();
@@ -624,10 +688,7 @@ fn test_metal_multi_head_attention_gqa() {
     enc.set_bytes(&seq_len.to_le_bytes(), 9);
     enc.set_bytes(&scale.to_le_bytes(), 10);
     enc.set_bytes(&max_seq_len.to_le_bytes(), 11);
-    enc.dispatch_threadgroups(
-        MTLSize::new(num_heads as u64, 1, 1),
-        MTLSize::new(32, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(num_heads as u64, 1, 1), MTLSize::new(32, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -639,7 +700,9 @@ fn test_metal_multi_head_attention_gqa() {
     for i in 0..8 {
         assert!(
             (result[i] - expected[i]).abs() < 0.01,
-            "MHA GQA out[{i}]: GPU={}, expected={}", result[i], expected[i]
+            "MHA GQA out[{i}]: GPU={}, expected={}",
+            result[i],
+            expected[i]
         );
     }
     eprintln!("multi_head_attention (GQA 4q/2kv): {:?}", result);
@@ -651,8 +714,10 @@ fn test_metal_multi_head_attention_uniform_scores() {
 
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("multi_head_attention").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -667,13 +732,21 @@ fn test_metal_multi_head_attention_uniform_scores() {
     let q = vec![0.0f32, 0.0];
     let k_cache = vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0];
     let v_cache_row = vec![3.0f32, 6.0, 9.0, 12.0, 15.0, 18.0];
-    let v_cache = transpose_v_cache(&v_cache_row, seq_len as usize, kv_dim as usize, max_seq_len as usize);
+    let v_cache = transpose_v_cache(
+        &v_cache_row,
+        seq_len as usize,
+        kv_dim as usize,
+        max_seq_len as usize,
+    );
 
     let q_buf = backend.upload_f32(&q).unwrap();
     let k_buf = upload_as_f16(&backend, &k_cache);
     let v_buf = upload_as_f16(&backend, &v_cache);
     let out_buf = backend.device.new_buffer(head_dim as usize * 4).unwrap();
-    let scores_buf = backend.device.new_buffer((num_heads * seq_len) as usize * 4).unwrap();
+    let scores_buf = backend
+        .device
+        .new_buffer((num_heads * seq_len) as usize * 4)
+        .unwrap();
 
     let cmd = backend.queue.new_command_buffer().unwrap();
     let enc = cmd.new_compute_encoder().unwrap();
@@ -690,10 +763,7 @@ fn test_metal_multi_head_attention_uniform_scores() {
     enc.set_bytes(&seq_len.to_le_bytes(), 9);
     enc.set_bytes(&scale.to_le_bytes(), 10);
     enc.set_bytes(&max_seq_len.to_le_bytes(), 11);
-    enc.dispatch_threadgroups(
-        MTLSize::new(num_heads as u64, 1, 1),
-        MTLSize::new(32, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(num_heads as u64, 1, 1), MTLSize::new(32, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -705,11 +775,13 @@ fn test_metal_multi_head_attention_uniform_scores() {
     let expected_1 = (6.0 + 12.0 + 18.0) / 3.0;
     assert!(
         (result[0] - expected_0).abs() < 0.01,
-        "MHA uniform out[0]: GPU={}, expected={expected_0}", result[0]
+        "MHA uniform out[0]: GPU={}, expected={expected_0}",
+        result[0]
     );
     assert!(
         (result[1] - expected_1).abs() < 0.01,
-        "MHA uniform out[1]: GPU={}, expected={expected_1}", result[1]
+        "MHA uniform out[1]: GPU={}, expected={expected_1}",
+        result[1]
     );
     eprintln!("multi_head_attention (uniform): {:?}", result);
 }
@@ -726,10 +798,15 @@ fn test_flash_decode_matches_original_mha() {
 
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let mha_func = lib.get_function("multi_head_attention").unwrap();
-    let mha_pso = backend.device.new_compute_pipeline_state(&mha_func).unwrap();
+    let mha_pso = backend
+        .device
+        .new_compute_pipeline_state(&mha_func)
+        .unwrap();
     let fd_func = lib.get_function("flash_decode_attention").unwrap();
     let fd_pso = backend.device.new_compute_pipeline_state(&fd_func).unwrap();
     let fr_func = lib.get_function("flash_decode_reduce").unwrap();
@@ -744,29 +821,43 @@ fn test_flash_decode_matches_original_mha() {
     let scale: f32 = 1.0 / (head_dim as f32).sqrt();
 
     // Q: head 0 = [1,0,0,0], head 1 = [0,1,0,0]
-    let q_data: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0,  0.0, 1.0, 0.0, 0.0];
+    let q_data: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
     // K cache: 4 positions (row-major)
     let k_data: Vec<f32> = vec![
-        1.0, 0.0, 0.0, 0.0,  // pos 0: aligns with head 0
-        0.0, 1.0, 0.0, 0.0,  // pos 1: aligns with head 1
-        0.5, 0.5, 0.0, 0.0,  // pos 2: partial alignment
-        0.0, 0.0, 1.0, 0.0,  // pos 3: orthogonal to both
+        1.0, 0.0, 0.0, 0.0, // pos 0: aligns with head 0
+        0.0, 1.0, 0.0, 0.0, // pos 1: aligns with head 1
+        0.5, 0.5, 0.0, 0.0, // pos 2: partial alignment
+        0.0, 0.0, 1.0, 0.0, // pos 3: orthogonal to both
     ];
     // V cache: 4 positions (stored transposed)
     let v_data_row: Vec<f32> = vec![
-        10.0, 20.0, 30.0, 40.0,  // pos 0
-        50.0, 60.0, 70.0, 80.0,  // pos 1
-        1.0,  2.0,  3.0,  4.0,   // pos 2
-        5.0,  6.0,  7.0,  8.0,   // pos 3
+        10.0, 20.0, 30.0, 40.0, // pos 0
+        50.0, 60.0, 70.0, 80.0, // pos 1
+        1.0, 2.0, 3.0, 4.0, // pos 2
+        5.0, 6.0, 7.0, 8.0, // pos 3
     ];
-    let v_data = transpose_v_cache(&v_data_row, seq_len as usize, kv_dim as usize, max_seq_len as usize);
+    let v_data = transpose_v_cache(
+        &v_data_row,
+        seq_len as usize,
+        kv_dim as usize,
+        max_seq_len as usize,
+    );
 
     let q_buf = backend.upload_f32(&q_data).unwrap();
     let k_buf = upload_as_f16(&backend, &k_data);
     let v_buf = upload_as_f16(&backend, &v_data);
-    let out_buf_mha = backend.device.new_buffer((num_heads * head_dim) as usize * 4).unwrap();
-    let out_buf_fd  = backend.device.new_buffer((num_heads * head_dim) as usize * 4).unwrap();
-    let scores_buf = backend.device.new_buffer((num_heads * seq_len) as usize * 4).unwrap();
+    let out_buf_mha = backend
+        .device
+        .new_buffer((num_heads * head_dim) as usize * 4)
+        .unwrap();
+    let out_buf_fd = backend
+        .device
+        .new_buffer((num_heads * head_dim) as usize * 4)
+        .unwrap();
+    let scores_buf = backend
+        .device
+        .new_buffer((num_heads * seq_len) as usize * 4)
+        .unwrap();
 
     // Run original MHA
     let queue = backend.device.new_command_queue().unwrap();
@@ -786,10 +877,7 @@ fn test_flash_decode_matches_original_mha() {
         enc.set_bytes(&seq_len.to_le_bytes(), 9);
         enc.set_bytes(&scale.to_le_bytes(), 10);
         enc.set_bytes(&max_seq_len.to_le_bytes(), 11);
-        enc.dispatch_threadgroups(
-            MTLSize::new(num_heads as u64, 1, 1),
-            MTLSize::new(32, 1, 1),
-        );
+        enc.dispatch_threadgroups(MTLSize::new(num_heads as u64, 1, 1), MTLSize::new(32, 1, 1));
         enc.end_encoding();
         cmd.commit_and_wait();
     }
@@ -824,10 +912,7 @@ fn test_flash_decode_matches_original_mha() {
         enc.set_bytes(&num_tiles.to_le_bytes(), 11);
         enc.set_bytes(&max_seq_len.to_le_bytes(), 12);
         let total_tgs = (num_heads * num_tiles) as u64;
-        enc.dispatch_threadgroups(
-            MTLSize::new(total_tgs, 1, 1),
-            MTLSize::new(32, 1, 1),
-        );
+        enc.dispatch_threadgroups(MTLSize::new(total_tgs, 1, 1), MTLSize::new(32, 1, 1));
         enc.end_encoding();
 
         // Phase 2: flash_decode_reduce
@@ -838,10 +923,7 @@ fn test_flash_decode_matches_original_mha() {
         enc2.set_bytes(&num_heads.to_le_bytes(), 2);
         enc2.set_bytes(&head_dim.to_le_bytes(), 3);
         enc2.set_bytes(&num_tiles.to_le_bytes(), 4);
-        enc2.dispatch_threadgroups(
-            MTLSize::new(num_heads as u64, 1, 1),
-            MTLSize::new(32, 1, 1),
-        );
+        enc2.dispatch_threadgroups(MTLSize::new(num_heads as u64, 1, 1), MTLSize::new(32, 1, 1));
         enc2.end_encoding();
 
         cmd.commit_and_wait();
@@ -858,7 +940,9 @@ fn test_flash_decode_matches_original_mha() {
         assert!(
             (mha_result[i] - fd_result[i]).abs() < 0.01,
             "Flash decode mismatch at [{}]: MHA={}, Flash={}",
-            i, mha_result[i], fd_result[i]
+            i,
+            mha_result[i],
+            fd_result[i]
         );
     }
 }
@@ -874,8 +958,10 @@ fn test_flash_decode_matches_original_mha() {
 fn measure_matvec_bandwidth(in_dim: u32, out_dim: u32, iterations: u32) -> (f64, f64) {
     let backend = MetalF32Backend::new().expect("No Metal device");
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("dequant_matmul_q8_0_4row").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -968,11 +1054,17 @@ fn bench_matvec_bandwidth_qkv() {
 
     let weight_mb = (out_dim as usize * (in_dim / 32) as usize * 34) as f64 / 1e6;
     println!("\n=== Matvec Bandwidth: QKV Projection ===");
-    println!("Matrix: {}x{} Q8_0 ({:.1} MB weights)", out_dim, in_dim, weight_mb);
+    println!(
+        "Matrix: {}x{} Q8_0 ({:.1} MB weights)",
+        out_dim, in_dim, weight_mb
+    );
     println!("Iterations: {}", iterations);
     println!("Elapsed: {:.2} ms", elapsed_ms);
     println!("Effective bandwidth: {:.1} GB/s", bw);
-    println!("Note: {:.1} MB likely fits in L2 cache -- expect high BW", weight_mb);
+    println!(
+        "Note: {:.1} MB likely fits in L2 cache -- expect high BW",
+        weight_mb
+    );
     println!("========================================\n");
 
     assert!(bw > 50.0, "Bandwidth too low: {:.1} GB/s", bw);
@@ -992,11 +1084,17 @@ fn bench_matvec_bandwidth_ffn_gate_up() {
 
     let weight_mb = (out_dim as usize * (in_dim / 32) as usize * 34) as f64 / 1e6;
     println!("\n=== Matvec Bandwidth: FFN Gate/Up Projection ===");
-    println!("Matrix: {}x{} Q8_0 ({:.1} MB weights)", out_dim, in_dim, weight_mb);
+    println!(
+        "Matrix: {}x{} Q8_0 ({:.1} MB weights)",
+        out_dim, in_dim, weight_mb
+    );
     println!("Iterations: {}", iterations);
     println!("Elapsed: {:.2} ms", elapsed_ms);
     println!("Effective bandwidth: {:.1} GB/s", bw);
-    println!("Note: {:.1} MB likely fits in L2 cache -- expect high BW", weight_mb);
+    println!(
+        "Note: {:.1} MB likely fits in L2 cache -- expect high BW",
+        weight_mb
+    );
     println!("================================================\n");
 
     assert!(bw > 50.0, "Bandwidth too low: {:.1} GB/s", bw);
@@ -1016,11 +1114,17 @@ fn bench_matvec_bandwidth_ffn_down() {
 
     let weight_mb = (out_dim as usize * (in_dim / 32) as usize * 34) as f64 / 1e6;
     println!("\n=== Matvec Bandwidth: FFN Down Projection ===");
-    println!("Matrix: {}x{} Q8_0 ({:.1} MB weights)", out_dim, in_dim, weight_mb);
+    println!(
+        "Matrix: {}x{} Q8_0 ({:.1} MB weights)",
+        out_dim, in_dim, weight_mb
+    );
     println!("Iterations: {}", iterations);
     println!("Elapsed: {:.2} ms", elapsed_ms);
     println!("Effective bandwidth: {:.1} GB/s", bw);
-    println!("Note: {:.1} MB likely fits in L2 cache -- expect high BW", weight_mb);
+    println!(
+        "Note: {:.1} MB likely fits in L2 cache -- expect high BW",
+        weight_mb
+    );
     println!("=============================================\n");
 
     assert!(bw > 50.0, "Bandwidth too low: {:.1} GB/s", bw);
@@ -1042,11 +1146,17 @@ fn bench_matvec_bandwidth_output_proj() {
 
     let weight_mb = (out_dim as usize * (in_dim / 32) as usize * 34) as f64 / 1e6;
     println!("\n=== Matvec Bandwidth: Output Projection (DRAM) ===");
-    println!("Matrix: {}x{} Q8_0 ({:.1} MB weights)", out_dim, in_dim, weight_mb);
+    println!(
+        "Matrix: {}x{} Q8_0 ({:.1} MB weights)",
+        out_dim, in_dim, weight_mb
+    );
     println!("Iterations: {}", iterations);
     println!("Elapsed: {:.2} ms", elapsed_ms);
     println!("Effective bandwidth: {:.1} GB/s", bw);
-    println!("Note: {:.1} MB exceeds typical L2 cache -- measures true DRAM bandwidth", weight_mb);
+    println!(
+        "Note: {:.1} MB exceeds typical L2 cache -- measures true DRAM bandwidth",
+        weight_mb
+    );
     println!("===================================================\n");
 
     assert!(bw > 50.0, "Bandwidth too low: {:.1} GB/s", bw);
@@ -1070,8 +1180,7 @@ fn bench_matvec_bandwidth_summary() {
     println!("\n======================================================================");
     println!("  Matvec Bandwidth Summary (dequant_matmul_q8_0_4row)");
     println!("======================================================================");
-    println!("{:<35} {:>8} {:>10}",
-        "Shape", "MB", "GB/s");
+    println!("{:<35} {:>8} {:>10}", "Shape", "MB", "GB/s");
     println!("{:-<35} {:->8} {:->10}", "", "", "");
 
     for &(in_dim, out_dim, label) in configs {
@@ -1079,8 +1188,7 @@ fn bench_matvec_bandwidth_summary() {
         let (bw, _elapsed_ms) = measure_matvec_bandwidth(in_dim, out_dim, iterations);
         let weight_mb = (out_dim as usize * (in_dim / 32) as usize * 34) as f64 / 1e6;
 
-        println!("{:<35} {:>7.1} {:>9.1}",
-            label, weight_mb, bw);
+        println!("{:<35} {:>7.1} {:>9.1}", label, weight_mb, bw);
     }
 
     println!("======================================================================");
@@ -1134,4 +1242,3 @@ fn metal_validate_kv_precision_rejects_int_quantized() {
         );
     }
 }
-

@@ -486,7 +486,9 @@ fn bench_fused_vs_separate() {
     // Compile fused kernels.
     let fused_src = lumen_runtime::cuda::shaders::FUSED_RMSNORM_MATVEC_KERNEL_SOURCE;
     let fused_ptx = compile_ptx(fused_src).expect("NVRTC compile failed (fused)");
-    let fused_mod = ctx.load_module(fused_ptx).expect("Failed to load fused module");
+    let fused_mod = ctx
+        .load_module(fused_ptx)
+        .expect("Failed to load fused module");
     let rms_func = fused_mod
         .load_function("compute_rms_scale")
         .expect("Failed to load compute_rms_scale");
@@ -497,14 +499,18 @@ fn bench_fused_vs_separate() {
     // Compile separate kernels.
     let norm_src = lumen_runtime::cuda::shaders::NORM_KERNEL_SOURCE;
     let norm_ptx = compile_ptx(norm_src).expect("NVRTC compile failed (norm)");
-    let norm_mod = ctx.load_module(norm_ptx).expect("Failed to load norm module");
+    let norm_mod = ctx
+        .load_module(norm_ptx)
+        .expect("Failed to load norm module");
     let norm_func = norm_mod
         .load_function("rmsnorm")
         .expect("Failed to load rmsnorm");
 
     let mv_src = lumen_runtime::cuda::shaders::MATVEC_F32_KERNEL_SOURCE;
     let mv_ptx = compile_ptx(mv_src).expect("NVRTC compile failed (matvec)");
-    let mv_mod = ctx.load_module(mv_ptx).expect("Failed to load matvec module");
+    let mv_mod = ctx
+        .load_module(mv_ptx)
+        .expect("Failed to load matvec module");
     let mv_func = mv_mod
         .load_function("matvec_f32")
         .expect("Failed to load matvec_f32");

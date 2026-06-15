@@ -188,10 +188,7 @@ mod tests {
 
         assert_eq!(tok.model_type, "llama");
         assert_eq!(tok.pre_tokenizer, "llama-bpe");
-        assert_eq!(
-            tok.tokens,
-            vec!["<s>", "</s>", "<unk>", "hello", "world"]
-        );
+        assert_eq!(tok.tokens, vec!["<s>", "</s>", "<unk>", "hello", "world"]);
         assert_eq!(tok.token_types, vec![3, 3, 2, 1, 1]);
         assert_eq!(tok.scores, vec![0.0, 0.0, 0.0, -1.0, -2.0]);
         assert_eq!(tok.merges, vec!["h e", "l l", "o _"]);

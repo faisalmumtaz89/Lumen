@@ -122,13 +122,19 @@ pub(crate) fn repack_bf16_qkv_gate_concat(
     if src_qkv.len() != expected_qkv {
         return Err(RuntimeError::Compute(format!(
             "repack_bf16_qkv_gate_concat: src_qkv len {} != expected {} (qkv_n={}, k_elems={})",
-            src_qkv.len(), expected_qkv, qkv_n, k_elems
+            src_qkv.len(),
+            expected_qkv,
+            qkv_n,
+            k_elems
         )));
     }
     if src_gate.len() != expected_gate {
         return Err(RuntimeError::Compute(format!(
             "repack_bf16_qkv_gate_concat: src_gate len {} != expected {} (gate_n={}, k_elems={})",
-            src_gate.len(), expected_gate, gate_n, k_elems
+            src_gate.len(),
+            expected_gate,
+            gate_n,
+            k_elems
         )));
     }
 
@@ -232,7 +238,9 @@ mod tests {
             assert_eq!(
                 &repacked[dst_off..dst_off + row_tile_bytes],
                 &src_row[src_off..src_off + row_tile_bytes],
-                "row-tile mismatch at stripe row {} kb {}", stripe_row_index, kb
+                "row-tile mismatch at stripe row {} kb {}",
+                stripe_row_index,
+                kb
             );
         }
     }
@@ -249,7 +257,11 @@ mod tests {
         let repacked = repack_bf16_qkv_gate_concat(&src_q, &src_g, qkv_n, gate_n, k_elems)
             .expect("repack_bf16_qkv_gate_concat");
         let expected_len = (qkv_n + gate_n) * k_elems * BF16_ELEM_BYTES;
-        assert_eq!(repacked.len(), expected_len, "concat repack must preserve total bytes");
+        assert_eq!(
+            repacked.len(),
+            expected_len,
+            "concat repack must preserve total bytes"
+        );
 
         let row_bytes = k_elems * BF16_ELEM_BYTES;
         // First TILE_N rows come from qkv.

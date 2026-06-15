@@ -161,7 +161,11 @@ async fn post_sse(
         .body(Full::new(bytes::Bytes::from(body_bytes)))
         .unwrap();
     let resp = client.request(req).await.unwrap();
-    assert!(resp.status().is_success(), "POST SSE status: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "POST SSE status: {}",
+        resp.status()
+    );
     let content_type = resp
         .headers()
         .get("content-type")
@@ -190,7 +194,9 @@ async fn models_endpoint_lists_one_model() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_chat_completion_non_streaming() {
     let (addr, client, _tmp, _handle) = boot_server().await;
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     let body = serde_json::json!({
         "model": MODEL_ID,
         "messages": [
@@ -219,7 +225,9 @@ async fn openai_chat_completion_non_streaming() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_chat_completion_streaming_emits_done_sentinel() {
     let (addr, client, _tmp, _handle) = boot_server().await;
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     let body = serde_json::json!({
         "model": MODEL_ID,
         "messages": [{"role": "user", "content": "x"}],
@@ -234,7 +242,10 @@ async fn openai_chat_completion_streaming_emits_done_sentinel() {
     assert!(!frames.is_empty(), "SSE response was empty");
     // First frame must be a chat.completion.chunk with role announcement.
     let first = frames.first().unwrap();
-    assert!(first.starts_with("data: "), "first frame must start with data:");
+    assert!(
+        first.starts_with("data: "),
+        "first frame must start with data:"
+    );
     let first_json: Value = serde_json::from_str(&first[6..]).unwrap();
     assert_eq!(first_json["object"], "chat.completion.chunk");
     assert_eq!(first_json["choices"][0]["delta"]["role"], "assistant");
@@ -345,7 +356,9 @@ async fn legacy_completion_non_streaming() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bad_request_returns_400() {
     let (addr, client, _tmp, _handle) = boot_server().await;
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
 
     // Helper: POST a JSON body, return (status, parsed envelope JSON).
     async fn post_and_assert_envelope(
@@ -505,7 +518,10 @@ async fn bad_request_returns_400() {
     )
     .await;
     assert_eq!(v6["error"]["code"], "unknown_field", "C6 code");
-    assert_eq!(v6["error"]["param"], "garbage_field_not_in_spec", "C6 param");
+    assert_eq!(
+        v6["error"]["param"], "garbage_field_not_in_spec",
+        "C6 param"
+    );
 }
 
 /// G3: real-SDK round-trip — when the `LUMEN_TEST_OPENAI_SDK`
@@ -602,7 +618,9 @@ except Exception as e:
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bad_request_streaming_returns_400_envelope() {
     let (addr, client, _tmp, _handle) = boot_server().await;
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     // Same body as Case 1 but with `stream:true` — schema rejection still
     // wins because extractors run pre-handler.
     let body = serde_json::json!({
@@ -662,7 +680,9 @@ async fn bad_request_streaming_returns_400_envelope() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sequential_fifty_requests_terminate_cleanly() {
     let (addr, client, _tmp, handle) = boot_server().await;
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     // boot_server() spawns with inbox_size = 4 → pool cap = 5.
     let pool_cap = 5;
 
@@ -748,7 +768,9 @@ async fn sequential_fifty_requests_terminate_cleanly() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_eight_requests_serialize_via_inbox() {
     let (addr, client, _tmp, _handle) = boot_server().await;
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     // Use single-char varying content per request (see the sequential
     // soak findings above): keeps the ChatML envelope short enough to
     // fit under max_seq_len(64) AND varies per-call to avoid the
@@ -875,7 +897,9 @@ async fn concurrent_eight_requests_serialize_via_inbox() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identical_prompts_sequential_100_no_panic() {
     let (addr, client, _tmp, handle) = boot_server().await;
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     let pool_cap = 5;
 
     // Identical body for every iteration — this is the reproducer.
@@ -919,7 +943,10 @@ async fn identical_prompts_sequential_100_no_panic() {
         );
         ok += 1;
     }
-    assert_eq!(ok, 100, "identical-soak seq: not all 100 requests returned 200");
+    assert_eq!(
+        ok, 100,
+        "identical-soak seq: not all 100 requests returned 200"
+    );
 
     // Channel pool must stay bounded (no per-request leak).
     let pool_after = handle.channel_pool_len();
@@ -946,7 +973,9 @@ async fn identical_prompts_sequential_100_no_panic() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn temp0_seed_fixed_requests_are_deterministic() {
     let (addr, client, _tmp, _handle) = boot_server().await;
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     let body = serde_json::json!({
         "model": MODEL_ID,
         "messages": [{"role": "user", "content": "hi"}],
@@ -960,7 +989,10 @@ async fn temp0_seed_fixed_requests_are_deterministic() {
     let mut finishes: Vec<String> = Vec::with_capacity(3);
     for i in 0..3_usize {
         let v = post_json(&client, uri.clone(), body.clone()).await;
-        assert_eq!(v["object"], "chat.completion", "determinism det req {i}: object");
+        assert_eq!(
+            v["object"], "chat.completion",
+            "determinism det req {i}: object"
+        );
         contents.push(
             v["choices"][0]["message"]["content"]
                 .as_str()
@@ -985,8 +1017,14 @@ async fn temp0_seed_fixed_requests_are_deterministic() {
         "determinism: temp=0/seed=42 req#1 vs req#2 content diverged ({:?} vs {:?})",
         contents[1], contents[2]
     );
-    assert_eq!(finishes[0], finishes[1], "determinism: finish_reason diverged");
-    assert_eq!(finishes[1], finishes[2], "determinism: finish_reason diverged");
+    assert_eq!(
+        finishes[0], finishes[1],
+        "determinism: finish_reason diverged"
+    );
+    assert_eq!(
+        finishes[1], finishes[2],
+        "determinism: finish_reason diverged"
+    );
     eprintln!(
         "determinism: 3 identical temp=0/seed=42 requests byte-identical (content={:?}, finish={:?})",
         contents[0], finishes[0]
@@ -1001,7 +1039,9 @@ async fn temp0_seed_fixed_requests_are_deterministic() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn identical_prompts_concurrent_8_no_panic() {
     let (addr, client, _tmp, _handle) = boot_server().await;
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     let body = serde_json::json!({
         "model": MODEL_ID,
         "messages": [{"role": "user", "content": "hi"}],
@@ -1031,7 +1071,10 @@ async fn identical_prompts_concurrent_8_no_panic() {
     let mut ok = 0_usize;
     for h in handles {
         let v = h.await.expect("identical-soak concurrent: task panic");
-        assert_eq!(v["object"], "chat.completion", "identical-soak concurrent: response shape");
+        assert_eq!(
+            v["object"], "chat.completion",
+            "identical-soak concurrent: response shape"
+        );
         assert!(
             v["choices"][0]["message"]["content"].is_string(),
             "identical-soak concurrent: content must be a string"
@@ -1045,7 +1088,10 @@ async fn identical_prompts_concurrent_8_no_panic() {
         );
         ok += 1;
     }
-    assert_eq!(ok, n, "identical-soak concurrent: not all 8 requests returned 200");
+    assert_eq!(
+        ok, n,
+        "identical-soak concurrent: not all 8 requests returned 200"
+    );
     eprintln!("identical-soak concurrent stats: n={n}, all returned 200");
 }
 
@@ -1076,10 +1122,10 @@ async fn identical_prompts_concurrent_8_no_panic() {
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hyper::StatusCode;
+use lumen_format::{ModelHyperparams, QuantScheme};
 use lumen_runtime::compute::{ActivationBuffer, BackendCaps, Logits};
 use lumen_runtime::kv::KvCacheView;
 use lumen_runtime::weight::cache::LayerView;
-use lumen_format::{ModelHyperparams, QuantScheme};
 
 /// Test-only backend that wraps a real `NaiveF32Backend` and panics on
 /// the next `compute_layer` call when `armed` is true.  The panic mimics
@@ -1144,7 +1190,8 @@ impl ComputeBackend for PanicArmedBackend {
         final_norm: Vec<f32>,
         output_proj: Vec<f32>,
     ) {
-        self.inner.set_global_tensors(embedding, final_norm, output_proj)
+        self.inner
+            .set_global_tensors(embedding, final_norm, output_proj)
     }
     fn set_output_proj_raw(&mut self, raw: Vec<u8>, quant: QuantScheme) {
         self.inner.set_output_proj_raw(raw, quant)
@@ -1265,8 +1312,7 @@ async fn worker_recovers_from_single_panic() {
     std::env::remove_var("LUMEN_SERVER_PANIC_MAX");
     std::env::remove_var("LUMEN_SERVER_PANIC_WINDOW_SECS");
 
-    let (addr, client, _tmp, _handle, armed, panics) =
-        boot_server_with_panic_backend().await;
+    let (addr, client, _tmp, _handle, armed, panics) = boot_server_with_panic_backend().await;
 
     if let Some(v) = saved_max {
         std::env::set_var("LUMEN_SERVER_PANIC_MAX", v);
@@ -1274,7 +1320,9 @@ async fn worker_recovers_from_single_panic() {
     if let Some(v) = saved_window {
         std::env::set_var("LUMEN_SERVER_PANIC_WINDOW_SECS", v);
     }
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     let body = |c: char| {
         serde_json::json!({
             "model": MODEL_ID,
@@ -1355,8 +1403,7 @@ async fn worker_survives_100_panic_recovery_cycles() {
     std::env::set_var("LUMEN_SERVER_PANIC_MAX", "10000");
     std::env::set_var("LUMEN_SERVER_PANIC_WINDOW_SECS", "300");
 
-    let (addr, client, _tmp, _handle, armed, panics) =
-        boot_server_with_panic_backend().await;
+    let (addr, client, _tmp, _handle, armed, panics) = boot_server_with_panic_backend().await;
 
     // Restore env immediately after spawn — the worker has already
     // captured the values at start.  Subsequent tests in the same
@@ -1370,7 +1417,9 @@ async fn worker_survives_100_panic_recovery_cycles() {
         None => std::env::remove_var("LUMEN_SERVER_PANIC_WINDOW_SECS"),
     }
 
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     let body = |c: char| {
         serde_json::json!({
             "model": MODEL_ID,
@@ -1392,7 +1441,11 @@ async fn worker_survives_100_panic_recovery_cycles() {
         armed.store(true, Ordering::Release);
         let panic_post = tokio::time::timeout(
             cycle_deadline,
-            post_status(&client, uri.clone(), body(char::from(b'a' + (i % 26) as u8))),
+            post_status(
+                &client,
+                uri.clone(),
+                body(char::from(b'a' + (i % 26) as u8)),
+            ),
         )
         .await
         .unwrap_or_else(|_| panic!("cycle {i}: panicking POST hung past {cycle_deadline:?}"));
@@ -1401,7 +1454,11 @@ async fn worker_survives_100_panic_recovery_cycles() {
         // Healthy follow-up; if the worker died, this returns 503.
         let recover_post = tokio::time::timeout(
             cycle_deadline,
-            post_status(&client, uri.clone(), body(char::from(b'A' + (i % 26) as u8))),
+            post_status(
+                &client,
+                uri.clone(),
+                body(char::from(b'A' + (i % 26) as u8)),
+            ),
         )
         .await
         .unwrap_or_else(|_| panic!("cycle {i}: recovery POST hung past {cycle_deadline:?}"));
@@ -1451,8 +1508,7 @@ async fn worker_drains_inbox_when_panic_budget_exhausted() {
     std::env::remove_var("LUMEN_SERVER_PANIC_MAX");
     std::env::remove_var("LUMEN_SERVER_PANIC_WINDOW_SECS");
 
-    let (addr, client, _tmp, _handle, armed, panics) =
-        boot_server_with_panic_backend().await;
+    let (addr, client, _tmp, _handle, armed, panics) = boot_server_with_panic_backend().await;
 
     // Restore env after spawn.
     if let Some(v) = saved_max {
@@ -1461,7 +1517,9 @@ async fn worker_drains_inbox_when_panic_budget_exhausted() {
     if let Some(v) = saved_window {
         std::env::set_var("LUMEN_SERVER_PANIC_WINDOW_SECS", v);
     }
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     let body = serde_json::json!({
         "model": MODEL_ID,
         "messages": [{"role": "user", "content": "hi"}],
@@ -1624,10 +1682,7 @@ async fn d1_disconnect_mid_stream_does_not_wedge_engine() {
         .await
         .expect("submit long stream");
     // Consume one event — could be PrefillDone or the first Token.
-    let _first = rx_long
-        .recv()
-        .await
-        .expect("first event from long stream");
+    let _first = rx_long.recv().await.expect("first event from long stream");
     // Mid-stream disconnect: drop the receiver. The CancellationGuard
     // drops here, flipping the cancel flag.
     drop(rx_long);
@@ -1975,8 +2030,7 @@ async fn e2_http_non_streaming_kv_overflow_returns_length_finish_reason() {
     let v = post_json(&client, uri, body).await;
     assert_eq!(v["object"], "text_completion", "E-2: shape");
     assert_eq!(
-        v["choices"][0]["finish_reason"],
-        "length",
+        v["choices"][0]["finish_reason"], "length",
         "E-2: finish_reason must be 'length'"
     );
     let text = v["choices"][0]["text"]
@@ -1986,7 +2040,10 @@ async fn e2_http_non_streaming_kv_overflow_returns_length_finish_reason() {
     // UTF-8 char; partial UTF-8 sequences buffer until complete, so
     // the byte-length lower bound is "tokens minus a few partial".
     // The strict gate is `not empty` and `finish_reason="length"`.
-    assert!(!text.is_empty(), "E-2: partial completion text must be present");
+    assert!(
+        !text.is_empty(),
+        "E-2: partial completion text must be present"
+    );
     assert_eq!(
         v["usage"]["completion_tokens"]
             .as_u64()
@@ -2161,7 +2218,9 @@ async fn sampler_default_sampler_accepts_request_without_params() {
     // default. The probe asserts the server-side default does not
     // break the request path.
     let (addr, client, _tmp, _handle) = boot_server().await;
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     let body = serde_json::json!({
         "model": MODEL_ID,
         "messages": [{"role": "user", "content": "hi"}],
@@ -2191,7 +2250,9 @@ async fn sampler_default_sampler_temp0_is_deterministic() {
     // determinism at temperature=0 because argmax is invariant to
     // monotonic logit shifts.
     let (addr, client, _tmp, _handle) = boot_server().await;
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     let body = serde_json::json!({
         "model": MODEL_ID,
         "messages": [{"role": "user", "content": "hi"}],
@@ -2334,8 +2395,14 @@ impl ComputeBackend for ScriptedBackend {
     fn embed_token(&self, token_id: u32) -> Result<ActivationBuffer, lumen_runtime::RuntimeError> {
         self.inner.embed_token(token_id)
     }
-    fn set_global_tensors(&mut self, embedding: Vec<f32>, final_norm: Vec<f32>, output_proj: Vec<f32>) {
-        self.inner.set_global_tensors(embedding, final_norm, output_proj)
+    fn set_global_tensors(
+        &mut self,
+        embedding: Vec<f32>,
+        final_norm: Vec<f32>,
+        output_proj: Vec<f32>,
+    ) {
+        self.inner
+            .set_global_tensors(embedding, final_norm, output_proj)
     }
     fn set_output_proj_raw(&mut self, raw: Vec<u8>, quant: QuantScheme) {
         self.inner.set_output_proj_raw(raw, quant)
@@ -2452,7 +2519,11 @@ async fn drain_engine_text(
         match evt {
             TokenEvent::PrefillDone { .. } => {}
             TokenEvent::Token { delta_text, .. } => text.push_str(&delta_text),
-            TokenEvent::Done { finish_reason, completion_tokens, .. } => {
+            TokenEvent::Done {
+                finish_reason,
+                completion_tokens,
+                ..
+            } => {
                 reason = finish_reason;
                 completion = completion_tokens;
                 break;
@@ -2472,8 +2543,14 @@ async fn f4_worker_stop_truncates_decoded_text() {
     let (_addr, _client, _tmp, handle) = boot_server_scripted("Hello STOP World").await;
     let (text, reason, _completion) =
         drain_engine_text(&handle, make_stop_job_request(64, vec!["STOP".into()])).await;
-    assert_eq!(text, "Hello ", "worker must emit prefix up-to-but-excluding the stop");
-    assert!(!text.contains("STOP"), "matched stop bytes must never be emitted");
+    assert_eq!(
+        text, "Hello ",
+        "worker must emit prefix up-to-but-excluding the stop"
+    );
+    assert!(
+        !text.contains("STOP"),
+        "matched stop bytes must never be emitted"
+    );
     assert_eq!(
         reason,
         FinishReason::StopSequence,
@@ -2497,7 +2574,10 @@ async fn f4_worker_empty_stop_is_byte_identical_full_text() {
         text, script,
         "EMPTY stop must yield the FULL decoded text byte-for-byte (no truncation, no held bytes lost)"
     );
-    assert_eq!(completion, n, "completion_tokens unchanged by the inert stop path");
+    assert_eq!(
+        completion, n,
+        "completion_tokens unchanged by the inert stop path"
+    );
     assert_eq!(
         reason,
         FinishReason::Length,
@@ -2514,7 +2594,10 @@ async fn f4_worker_stop_straddling_tokens_is_caught() {
     let (_addr, _client, _tmp, handle) = boot_server_scripted("abcSTOPdef").await;
     let (text, reason, _c) =
         drain_engine_text(&handle, make_stop_job_request(64, vec!["STOP".into()])).await;
-    assert_eq!(text, "abc", "straddled stop across 1-byte tokens must truncate at 'abc'");
+    assert_eq!(
+        text, "abc",
+        "straddled stop across 1-byte tokens must truncate at 'abc'"
+    );
     assert_eq!(reason, FinishReason::StopSequence);
 }
 
@@ -2523,7 +2606,9 @@ async fn f4_worker_stop_straddling_tokens_is_caught() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn f4_openai_chat_nonstream_honors_stop() {
     let (addr, client, _tmp, _h) = boot_server_scripted("Answer END trailing").await;
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     let body = serde_json::json!({
         "model": MODEL_ID,
         "messages": [{"role": "user", "content": "hi"}],
@@ -2533,9 +2618,15 @@ async fn f4_openai_chat_nonstream_honors_stop() {
     });
     let v = post_json(&client, uri, body).await;
     let content = v["choices"][0]["message"]["content"].as_str().unwrap();
-    assert_eq!(content, "Answer ", "OpenAI non-stream content truncated at stop");
+    assert_eq!(
+        content, "Answer ",
+        "OpenAI non-stream content truncated at stop"
+    );
     assert!(!content.contains("END"));
-    assert_eq!(v["choices"][0]["finish_reason"], "stop", "finish_reason must be stop");
+    assert_eq!(
+        v["choices"][0]["finish_reason"], "stop",
+        "finish_reason must be stop"
+    );
 }
 
 /// F4-E (OpenAI stream): the streamed content chunks truncate at the stop and
@@ -2543,7 +2634,9 @@ async fn f4_openai_chat_nonstream_honors_stop() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn f4_openai_chat_stream_honors_stop() {
     let (addr, client, _tmp, _h) = boot_server_scripted("Answer END trailing").await;
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     let body = serde_json::json!({
         "model": MODEL_ID,
         "messages": [{"role": "user", "content": "hi"}],
@@ -2565,8 +2658,14 @@ async fn f4_openai_chat_stream_honors_stop() {
             }
         }
     }
-    assert_eq!(content, "Answer ", "OpenAI stream content truncated at stop");
-    assert!(!sse.contains("END"), "stop bytes must not appear anywhere in the stream");
+    assert_eq!(
+        content, "Answer ",
+        "OpenAI stream content truncated at stop"
+    );
+    assert!(
+        !sse.contains("END"),
+        "stop bytes must not appear anywhere in the stream"
+    );
     assert!(
         sse.contains("\"finish_reason\":\"stop\""),
         "stream must carry a finish_reason:stop chunk, got:\n{sse}"
@@ -2593,7 +2692,10 @@ async fn f4_anthropic_messages_nonstream_honors_stop() {
         .and_then(|blocks| blocks.iter().find(|b| b["type"] == "text"))
         .and_then(|b| b["text"].as_str())
         .unwrap_or("");
-    assert_eq!(text, "Reply ", "Anthropic non-stream text truncated at stop");
+    assert_eq!(
+        text, "Reply ",
+        "Anthropic non-stream text truncated at stop"
+    );
     assert!(!text.contains("HALT"));
     assert_eq!(
         v["stop_reason"], "stop_sequence",
@@ -2630,7 +2732,10 @@ async fn f4_anthropic_messages_stream_honors_stop() {
         }
     }
     assert_eq!(text, "Reply ", "Anthropic stream text truncated at stop");
-    assert!(!sse.contains("HALT"), "stop bytes must not appear anywhere in the stream");
+    assert!(
+        !sse.contains("HALT"),
+        "stop bytes must not appear anywhere in the stream"
+    );
     assert!(
         sse.contains("\"stop_reason\":\"stop_sequence\""),
         "stream must carry stop_reason:stop_sequence, got:\n{sse}"
@@ -2644,7 +2749,9 @@ async fn f4_anthropic_messages_stream_honors_stop() {
 async fn f4_openai_chat_empty_stop_streams_full_text() {
     let script = "Answer END trailing";
     let (addr, client, _tmp, _h) = boot_server_scripted(script).await;
-    let uri: Uri = format!("http://{addr}/v1/chat/completions").parse().unwrap();
+    let uri: Uri = format!("http://{addr}/v1/chat/completions")
+        .parse()
+        .unwrap();
     let body = serde_json::json!({
         "model": MODEL_ID,
         "messages": [{"role": "user", "content": "hi"}],

@@ -35,14 +35,14 @@ fn synthetic_model_path() -> (std::path::PathBuf, std::path::PathBuf) {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("test_model.lbc");
     let bytes = generate_test_model(&TestModelConfig::default());
-    std::fs::File::create(&path).unwrap().write_all(&bytes).unwrap();
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
     (dir, path)
 }
 
-fn make_cpu_session(
-    provider: &SyncWeightProvider,
-    seed: u64,
-) -> (Session, NaiveF32Backend) {
+fn make_cpu_session(provider: &SyncWeightProvider, seed: u64) -> (Session, NaiveF32Backend) {
     let hp = provider.lbc().header.hyperparams;
     let mut backend = NaiveF32Backend::new();
     backend.set_global_tensors(
@@ -135,7 +135,9 @@ fn s5_argmax_token_bit_identity_cpu_naive() {
     sess_a.extend(&prompt, &backend_a, &provider).unwrap();
     // Invariant: kv.seq_len() == tokens.len() after `extend`.
     assert_eq!(sess_a.kv().seq_len(), sess_a.tokens().len());
-    sess_a.save_to_disk(&save_path, &backend_a, &fingerprint).unwrap();
+    sess_a
+        .save_to_disk(&save_path, &backend_a, &fingerprint)
+        .unwrap();
 
     let (mut sess_cont, backend_cont) = make_cpu_session(&provider, 42);
     sess_cont.extend(&prompt, &backend_cont, &provider).unwrap();
@@ -167,7 +169,12 @@ fn s5_argmax_token_bit_identity_cpu_naive() {
         ..Default::default()
     };
     let mut sess_r = Session::load_from_disk(
-        &save_path, config_r, hp, sampling_r, &backend_r, &fingerprint,
+        &save_path,
+        config_r,
+        hp,
+        sampling_r,
+        &backend_r,
+        &fingerprint,
     )
     .unwrap();
     // After load, tokens MUST equal prompt and kv.seq_len() MUST equal prompt.len().
@@ -211,15 +218,12 @@ fn s5_metal_hardware_gate() {
         eprintln!("[skip] model file not found: {model_path}");
         return;
     }
-    use lumen_runtime::MetalF32Backend;
-    use lumen_runtime::weight::provider_mmap::MmapWeightProvider;
     use lumen_runtime::storage::MmapConfig;
+    use lumen_runtime::weight::provider_mmap::MmapWeightProvider;
+    use lumen_runtime::MetalF32Backend;
 
-    let provider = MmapWeightProvider::open(
-        std::path::Path::new(&model_path),
-        MmapConfig::default(),
-    )
-    .unwrap();
+    let provider =
+        MmapWeightProvider::open(std::path::Path::new(&model_path), MmapConfig::default()).unwrap();
     let hp = provider.lbc().header.hyperparams;
 
     let mut backend = MetalF32Backend::new().expect("Metal backend must construct");
@@ -271,9 +275,8 @@ fn s5_metal_hardware_gate() {
     sess_a.extend(&prompt, &backend, &provider).unwrap();
     sess_a.save_to_disk(&path, &backend, &fingerprint).unwrap();
 
-    let mut sess_r = Session::load_from_disk(
-        &path, config, hp, sampling, &backend, &fingerprint,
-    ).unwrap();
+    let mut sess_r =
+        Session::load_from_disk(&path, config, hp, sampling, &backend, &fingerprint).unwrap();
     let mut resumed: Vec<u32> = Vec::with_capacity(32);
     for _ in 0..32 {
         resumed.push(sess_r.next_token(&backend, &provider).unwrap());

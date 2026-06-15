@@ -93,9 +93,9 @@ where
     type Rejection = ServerError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let bytes = Bytes::from_request(req, state).await.map_err(|e| {
-            ServerError::bad_request(format!("failed to read request body: {e}"))
-        })?;
+        let bytes = Bytes::from_request(req, state)
+            .await
+            .map_err(|e| ServerError::bad_request(format!("failed to read request body: {e}")))?;
         let value: T = serde_json::from_slice(&bytes).map_err(map_serde_error)?;
         Ok(OpenAiJson(value))
     }
@@ -126,7 +126,11 @@ fn map_serde_error(e: serde_json::Error) -> ServerError {
     }
     if msg.starts_with("invalid type") {
         // Focus on the type mismatch; drop serde's parser-position suffix.
-        return ServerError::bad_request_field(strip_location(&msg).to_string(), "", "invalid_type");
+        return ServerError::bad_request_field(
+            strip_location(&msg).to_string(),
+            "",
+            "invalid_type",
+        );
     }
     // Classify the rest by serde_json category.
     let code = match e.classify() {
@@ -286,10 +290,7 @@ fn sse_response(body: Body) -> Response {
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-cache, no-store, no-transform"),
     );
-    headers.insert(
-        header::CONNECTION,
-        HeaderValue::from_static("keep-alive"),
-    );
+    headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
     (StatusCode::OK, headers, body).into_response()
 }
 
@@ -330,10 +331,6 @@ async fn memory_breakdown(State(state): State<AppState>) -> Response {
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     (StatusCode::OK, headers, body).into_response()
 }
-

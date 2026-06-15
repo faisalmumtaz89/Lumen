@@ -72,7 +72,8 @@ impl Harness {
             provider.output_proj.clone(),
         );
         if !provider.output_proj_raw.is_empty() {
-            backend.set_output_proj_raw(provider.output_proj_raw.clone(), provider.output_proj_quant);
+            backend
+                .set_output_proj_raw(provider.output_proj_raw.clone(), provider.output_proj_quant);
         }
         if !provider.embedding_raw.is_empty() {
             backend.set_embedding_raw(provider.embedding_raw.clone(), provider.embedding_quant);
@@ -81,7 +82,9 @@ impl Harness {
             backend.set_weight_tying(true);
         }
         backend.init(&hyper).expect("Metal init");
-        backend.preload_weights(&provider).expect("Metal preload_weights");
+        backend
+            .preload_weights(&provider)
+            .expect("Metal preload_weights");
         Harness {
             backend,
             provider,
@@ -112,13 +115,19 @@ impl Harness {
     fn gen_cached(&self, prompt: &[u32], max_new: usize) -> (Vec<u32>, Vec<f32>) {
         self.backend.reset_recurrent_state();
         let mut kv = self.fresh_kv();
-        let hidden = self.backend.prefill(prompt, &self.provider, &mut kv).expect("prefill");
+        let hidden = self
+            .backend
+            .prefill(prompt, &self.provider, &mut kv)
+            .expect("prefill");
         let lg = self.logits_of(&hidden);
         let mut tok = lg.argmax() as u32;
         let mut tokens = vec![tok];
         let mut final_logits = lg.data;
         for _ in 1..max_new {
-            let lg = self.backend.decode_token(tok, &self.provider, &mut kv).expect("decode_token");
+            let lg = self
+                .backend
+                .decode_token(tok, &self.provider, &mut kv)
+                .expect("decode_token");
             tok = lg.argmax() as u32;
             final_logits = lg.data;
             tokens.push(tok);
@@ -134,7 +143,10 @@ impl Harness {
         for _ in 0..max_new {
             self.backend.reset_recurrent_state(); // GDN recomputed from scratch
             let mut kv = self.fresh_kv(); // no reuse
-            let hidden = self.backend.prefill(&seq, &self.provider, &mut kv).expect("prefill");
+            let hidden = self
+                .backend
+                .prefill(&seq, &self.provider, &mut kv)
+                .expect("prefill");
             let lg = self.logits_of(&hidden);
             let tok = lg.argmax() as u32;
             final_logits = lg.data;
@@ -183,7 +195,9 @@ fn corr010_kv_cache_equals_no_cache() {
             eprintln!("  -> FAIL: token divergence at {first_div:?} (cache corruption)");
             failures += 1;
         } else if ldiff > 1e-1 {
-            eprintln!("  -> FAIL: logit delta {ldiff:.3e} >> ~1e-2 kernel-FP floor (gross regression)");
+            eprintln!(
+                "  -> FAIL: logit delta {ldiff:.3e} >> ~1e-2 kernel-FP floor (gross regression)"
+            );
             failures += 1;
         }
     }

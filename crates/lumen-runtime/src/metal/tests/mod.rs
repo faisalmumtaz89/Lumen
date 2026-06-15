@@ -1,5 +1,5 @@
 mod basic;
 mod gdn;
-mod moe;
 mod microbench;
+mod moe;
 mod paired_dispatch;

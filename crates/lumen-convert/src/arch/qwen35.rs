@@ -1,12 +1,12 @@
 //! Qwen3.5 (dense) converter: hybrid GDN + full-attention with dense FFN.
 
-use super::ArchConverter;
 use super::gdn_gates::{compute_ssm_slices, write_ssm_tensors};
+use super::ArchConverter;
 use crate::convert::{ConvertError, ConvertTarget};
 use crate::dequant::*;
 use crate::gguf::{GgmlType, GgufFile};
-use crate::tensor_names::*;
 use crate::tensor_io::*;
+use crate::tensor_names::*;
 use lumen_format::index::{LayerIndex, SubtensorOffsets, TensorSlice};
 use lumen_format::quantization::QuantScheme;
 use lumen_format::streaming_writer::LayerShape;
@@ -70,10 +70,13 @@ fn compute_layer_shape_qwen35(
     let is_full_attn = is_qwen35moe_full_attention_layer(layer);
 
     // Helper to compute a TensorSlice for a given tensor.
-    let compute_slice = |gguf: &GgufFile, name: &str, blob_offset: &mut u64, dequantize: bool|
-        -> Result<TensorSlice, ConvertError>
-    {
-        let tensor = gguf.find_tensor(name)
+    let compute_slice = |gguf: &GgufFile,
+                         name: &str,
+                         blob_offset: &mut u64,
+                         dequantize: bool|
+     -> Result<TensorSlice, ConvertError> {
+        let tensor = gguf
+            .find_tensor(name)
             .ok_or_else(|| ConvertError::MissingTensor(name.to_string()))?;
         let is_norm = name.contains("norm");
 
@@ -83,7 +86,11 @@ fn compute_layer_shape_qwen35(
                 // Norms stay F32
                 let n_elements = tensor.n_elements();
                 let size = n_elements * 4;
-                let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::F32 };
+                let slice = TensorSlice {
+                    offset: *blob_offset,
+                    length: size,
+                    quant: QuantScheme::F32,
+                };
                 *blob_offset += size;
                 return Ok(slice);
             }
@@ -91,14 +98,20 @@ fn compute_layer_shape_qwen35(
             if src_quant == Some(target_q) {
                 // Already in target format
                 let size = tensor.byte_size().unwrap_or(0);
-                let slice = TensorSlice { offset: *blob_offset, length: size, quant: target_q };
+                let slice = TensorSlice {
+                    offset: *blob_offset,
+                    length: size,
+                    quant: target_q,
+                };
                 *blob_offset += size;
                 return Ok(slice);
             }
             // Compute size for target quant
             let n_elements = tensor.n_elements() as usize;
-            assert!(n_elements % 32 == 0,
-                "quantization requires elements divisible by 32, got {n_elements} for {name}");
+            assert!(
+                n_elements % 32 == 0,
+                "quantization requires elements divisible by 32, got {n_elements} for {name}"
+            );
             let (size, quant) = match target_q {
                 QuantScheme::Q8_0 => {
                     // Q8_0: 34 bytes per 32 elements
@@ -115,7 +128,11 @@ fn compute_layer_shape_qwen35(
                     (n_elements as u64 * 4, QuantScheme::F32)
                 }
             };
-            let slice = TensorSlice { offset: *blob_offset, length: size, quant };
+            let slice = TensorSlice {
+                offset: *blob_offset,
+                length: size,
+                quant,
+            };
             *blob_offset += size;
             return Ok(slice);
         }
@@ -123,53 +140,88 @@ fn compute_layer_shape_qwen35(
         if dequantize {
             let n_elements = tensor.n_elements();
             let size = n_elements * 4;
-            let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::F32 };
+            let slice = TensorSlice {
+                offset: *blob_offset,
+                length: size,
+                quant: QuantScheme::F32,
+            };
             *blob_offset += size;
             Ok(slice)
         } else if target == ConvertTarget::Metal && !is_norm && is_k_quant(tensor.ggml_type) {
             // Metal K-quant upcast to Q8_0. Must match
             // `append_tensor_to_blob_requant_with_target` byte layout.
             let n_elements = tensor.n_elements() as usize;
-            assert!(n_elements % 32 == 0,
-                "Q8_0 requires elements divisible by 32, got {n_elements} for {name}");
+            assert!(
+                n_elements % 32 == 0,
+                "Q8_0 requires elements divisible by 32, got {n_elements} for {name}"
+            );
             let size = ((n_elements / 32) * 34) as u64;
-            let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::Q8_0 };
+            let slice = TensorSlice {
+                offset: *blob_offset,
+                length: size,
+                quant: QuantScheme::Q8_0,
+            };
             *blob_offset += size;
             Ok(slice)
         } else if tensor.ggml_type == GgmlType::Q4_1 {
             // Q4_1 has no dedicated GPU kernel -- requantize to Q4_0.
             let n_elements = tensor.n_elements();
-            assert!(n_elements % 32 == 0, "Q4_1->Q4_0 requires elements divisible by 32, got {n_elements} for {name}");
+            assert!(
+                n_elements % 32 == 0,
+                "Q4_1->Q4_0 requires elements divisible by 32, got {n_elements} for {name}"
+            );
             let size = ((n_elements as usize / 32) * 18) as u64;
-            let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::Q4_0 };
+            let slice = TensorSlice {
+                offset: *blob_offset,
+                length: size,
+                quant: QuantScheme::Q4_0,
+            };
             *blob_offset += size;
             Ok(slice)
         } else if tensor.ggml_type == GgmlType::Q8_1 {
             // Q8_1 has no LBC QuantScheme -- requantize to Q8_0.
             let n_elements = tensor.n_elements();
-            assert!(n_elements % 32 == 0, "Q8_1->Q8_0 requires elements divisible by 32, got {n_elements} for {name}");
+            assert!(
+                n_elements % 32 == 0,
+                "Q8_1->Q8_0 requires elements divisible by 32, got {n_elements} for {name}"
+            );
             let size = ((n_elements as usize / 32) * 34) as u64;
-            let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::Q8_0 };
+            let slice = TensorSlice {
+                offset: *blob_offset,
+                length: size,
+                quant: QuantScheme::Q8_0,
+            };
             *blob_offset += size;
             Ok(slice)
         } else if tensor.ggml_type == GgmlType::Q5_1 {
             // Q5_1 has no LBC QuantScheme -- dequantize to F32.
             let n_elements = tensor.n_elements();
             let size = n_elements * 4;
-            let slice = TensorSlice { offset: *blob_offset, length: size, quant: QuantScheme::F32 };
+            let slice = TensorSlice {
+                offset: *blob_offset,
+                length: size,
+                quant: QuantScheme::F32,
+            };
             *blob_offset += size;
             Ok(slice)
         } else {
-            let quant = tensor.ggml_type.to_lbc_quant()
-                .ok_or_else(|| ConvertError::UnsupportedTensorType {
+            let quant = tensor.ggml_type.to_lbc_quant().ok_or_else(|| {
+                ConvertError::UnsupportedTensorType {
                     tensor: name.to_string(),
                     ggml_type: format!("{:?}", tensor.ggml_type),
-                })?;
-            let size = tensor.byte_size().ok_or_else(|| ConvertError::UnsupportedTensorType {
-                tensor: name.to_string(),
-                ggml_type: format!("{:?} (unknown block geometry)", tensor.ggml_type),
+                }
             })?;
-            let slice = TensorSlice { offset: *blob_offset, length: size, quant };
+            let size = tensor
+                .byte_size()
+                .ok_or_else(|| ConvertError::UnsupportedTensorType {
+                    tensor: name.to_string(),
+                    ggml_type: format!("{:?} (unknown block geometry)", tensor.ggml_type),
+                })?;
+            let slice = TensorSlice {
+                offset: *blob_offset,
+                length: size,
+                quant,
+            };
             *blob_offset += size;
             Ok(slice)
         }
@@ -179,31 +231,46 @@ fn compute_layer_shape_qwen35(
     // user's global `requant_to`). Used for SSM_OUT, which always wants the
     // runtime's fast Q8_0 / Q4_0 path regardless of the user's flag.
     // Returns None if the tensor is absent.
-    let compute_slice_with_requant = |gguf: &GgufFile, layer: usize, suffix: &str, blob_offset: &mut u64, target: Option<QuantScheme>|
-        -> Result<Option<TensorSlice>, ConvertError>
-    {
+    let compute_slice_with_requant = |gguf: &GgufFile,
+                                      layer: usize,
+                                      suffix: &str,
+                                      blob_offset: &mut u64,
+                                      target: Option<QuantScheme>|
+     -> Result<Option<TensorSlice>, ConvertError> {
         let name = layer_tensor_name(layer, suffix);
-        let Some(tensor) = gguf.find_tensor(&name) else { return Ok(None); };
+        let Some(tensor) = gguf.find_tensor(&name) else {
+            return Ok(None);
+        };
         let n_elements = tensor.n_elements() as usize;
         let src_quant = tensor.ggml_type.to_lbc_quant();
         let (size, quant) = match target {
             Some(QuantScheme::Q8_0) if n_elements % 32 == 0 => {
                 if src_quant == Some(QuantScheme::Q8_0) {
-                    (tensor.byte_size().unwrap_or((n_elements / 32 * 34) as u64), QuantScheme::Q8_0)
+                    (
+                        tensor.byte_size().unwrap_or((n_elements / 32 * 34) as u64),
+                        QuantScheme::Q8_0,
+                    )
                 } else {
                     ((n_elements / 32 * 34) as u64, QuantScheme::Q8_0)
                 }
             }
             Some(QuantScheme::Q4_0) if n_elements % 32 == 0 => {
                 if src_quant == Some(QuantScheme::Q4_0) {
-                    (tensor.byte_size().unwrap_or((n_elements / 32 * 18) as u64), QuantScheme::Q4_0)
+                    (
+                        tensor.byte_size().unwrap_or((n_elements / 32 * 18) as u64),
+                        QuantScheme::Q4_0,
+                    )
                 } else {
                     ((n_elements / 32 * 18) as u64, QuantScheme::Q4_0)
                 }
             }
             _ => ((n_elements * 4) as u64, QuantScheme::F32),
         };
-        let slice = TensorSlice { offset: *blob_offset, length: size, quant };
+        let slice = TensorSlice {
+            offset: *blob_offset,
+            length: size,
+            quant,
+        };
         *blob_offset += size;
         Ok(Some(slice))
     };
@@ -212,18 +279,32 @@ fn compute_layer_shape_qwen35(
     // Returns None if the tensor is absent. For tensors with no direct LBC
     // mapping but a known dequant path (Q8_1, Q5_1, MXFP4, etc.), forces
     // dequantization to F32 instead of silently skipping.
-    let try_compute_opt_slice = |gguf: &GgufFile, layer: usize, suffix: &str, blob_offset: &mut u64, dequantize: bool|
-        -> Result<Option<TensorSlice>, ConvertError>
-    {
+    let try_compute_opt_slice = |gguf: &GgufFile,
+                                 layer: usize,
+                                 suffix: &str,
+                                 blob_offset: &mut u64,
+                                 dequantize: bool|
+     -> Result<Option<TensorSlice>, ConvertError> {
         let name = layer_tensor_name(layer, suffix);
         if let Some(tensor) = gguf.find_tensor(&name) {
             let force_dequant = !dequantize && tensor.ggml_type.to_lbc_quant().is_none();
             if force_dequant {
                 if tensor.ggml_type.has_dequant_path() {
-                    eprintln!("  Note: dequantizing {} ({:?} -> F32)", name, tensor.ggml_type);
-                    Ok(Some(compute_slice(gguf, &name, blob_offset, /*dequantize=*/ true)?))
+                    eprintln!(
+                        "  Note: dequantizing {} ({:?} -> F32)",
+                        name, tensor.ggml_type
+                    );
+                    Ok(Some(compute_slice(
+                        gguf,
+                        &name,
+                        blob_offset,
+                        /*dequantize=*/ true,
+                    )?))
                 } else {
-                    eprintln!("  Warning: skipping {} (unsupported GGML type {:?})", name, tensor.ggml_type);
+                    eprintln!(
+                        "  Warning: skipping {} (unsupported GGML type {:?})",
+                        name, tensor.ggml_type
+                    );
                     Ok(None)
                 }
             } else {
@@ -237,33 +318,75 @@ fn compute_layer_shape_qwen35(
     // Attention projections: different tensor layout per layer type.
     let (wq, wk, wv, wo);
     if is_full_attn {
-        wq = compute_slice(gguf, &layer_tensor_name(layer, ATTN_Q), &mut blob_size, dequantize)?;
-        wk = compute_slice(gguf, &layer_tensor_name(layer, ATTN_K), &mut blob_size, dequantize)?;
-        wv = compute_slice(gguf, &layer_tensor_name(layer, ATTN_V), &mut blob_size, dequantize)?;
-        wo = compute_slice(gguf, &layer_tensor_name(layer, ATTN_OUTPUT), &mut blob_size, dequantize)?;
+        wq = compute_slice(
+            gguf,
+            &layer_tensor_name(layer, ATTN_Q),
+            &mut blob_size,
+            dequantize,
+        )?;
+        wk = compute_slice(
+            gguf,
+            &layer_tensor_name(layer, ATTN_K),
+            &mut blob_size,
+            dequantize,
+        )?;
+        wv = compute_slice(
+            gguf,
+            &layer_tensor_name(layer, ATTN_V),
+            &mut blob_size,
+            dequantize,
+        )?;
+        wo = compute_slice(
+            gguf,
+            &layer_tensor_name(layer, ATTN_OUTPUT),
+            &mut blob_size,
+            dequantize,
+        )?;
     } else {
         // Linear attention: fused QKV stored in wq slot; wk/wv/wo left as zero sentinel
-        let z = TensorSlice { offset: 0, length: 0, quant: QuantScheme::F32 };
-        wq = compute_slice(gguf, &layer_tensor_name(layer, ATTN_QKV), &mut blob_size, dequantize)?;
-        wk = z; wv = z; wo = z;
+        let z = TensorSlice {
+            offset: 0,
+            length: 0,
+            quant: QuantScheme::F32,
+        };
+        wq = compute_slice(
+            gguf,
+            &layer_tensor_name(layer, ATTN_QKV),
+            &mut blob_size,
+            dequantize,
+        )?;
+        wk = z;
+        wv = z;
+        wo = z;
     }
 
     // Pre-attention norm (always present)
-    let attn_norm = compute_slice(gguf, &layer_tensor_name(layer, ATTN_NORM), &mut blob_size, dequantize)?;
+    let attn_norm = compute_slice(
+        gguf,
+        &layer_tensor_name(layer, ATTN_NORM),
+        &mut blob_size,
+        dequantize,
+    )?;
 
     // Post-attention norm (present in all Qwen3.5 layers)
-    let attn_post_norm = try_compute_opt_slice(gguf, layer, ATTN_POST_NORM, &mut blob_size, dequantize)?;
+    let attn_post_norm =
+        try_compute_opt_slice(gguf, layer, ATTN_POST_NORM, &mut blob_size, dequantize)?;
 
     // FFN norm (present in all layers)
     let ffn_norm_name = layer_tensor_name(layer, FFN_NORM);
     let ffn_norm = if gguf.find_tensor(&ffn_norm_name).is_some() {
         compute_slice(gguf, &ffn_norm_name, &mut blob_size, dequantize)?
     } else {
-        TensorSlice { offset: 0, length: 0, quant: QuantScheme::F32 }
+        TensorSlice {
+            offset: 0,
+            length: 0,
+            quant: QuantScheme::F32,
+        }
     };
 
     // Attention gate (full attention layers only)
-    let attn_gate = try_compute_opt_slice(gguf, layer, ATTN_GATE_WEIGHT, &mut blob_size, dequantize)?;
+    let attn_gate =
+        try_compute_opt_slice(gguf, layer, ATTN_GATE_WEIGHT, &mut blob_size, dequantize)?;
 
     // SSM tensors (linear attention layers only) — never requantized to user target.
     // ssm_alpha/beta MUST be Q8_0 — the GDN runtime hardcodes Q8_0 matvec kernels.
@@ -294,9 +417,24 @@ fn compute_layer_shape_qwen35(
     let ssm_out = compute_slice_with_requant(gguf, layer, SSM_OUT, &mut blob_size, ssm_out_target)?;
 
     // Dense FFN weights (present in all layers)
-    let w_gate = compute_slice(gguf, &layer_tensor_name(layer, FFN_GATE), &mut blob_size, dequantize)?;
-    let w_up = compute_slice(gguf, &layer_tensor_name(layer, FFN_UP), &mut blob_size, dequantize)?;
-    let w_down = compute_slice(gguf, &layer_tensor_name(layer, FFN_DOWN), &mut blob_size, dequantize)?;
+    let w_gate = compute_slice(
+        gguf,
+        &layer_tensor_name(layer, FFN_GATE),
+        &mut blob_size,
+        dequantize,
+    )?;
+    let w_up = compute_slice(
+        gguf,
+        &layer_tensor_name(layer, FFN_UP),
+        &mut blob_size,
+        dequantize,
+    )?;
+    let w_down = compute_slice(
+        gguf,
+        &layer_tensor_name(layer, FFN_DOWN),
+        &mut blob_size,
+        dequantize,
+    )?;
 
     // Optional bias tensors
     let bq = try_compute_bias_slice(gguf, layer, ATTN_Q_BIAS, &mut blob_size);
@@ -304,22 +442,53 @@ fn compute_layer_shape_qwen35(
     let bv = try_compute_bias_slice(gguf, layer, ATTN_V_BIAS, &mut blob_size);
 
     // Per-head Q/K RMSNorm weights (full attention layers only, always F32)
-    let attn_q_norm = try_compute_opt_slice(gguf, layer, ATTN_Q_NORM, &mut blob_size, /*dequantize=*/ true)?;
-    let attn_k_norm = try_compute_opt_slice(gguf, layer, ATTN_K_NORM, &mut blob_size, /*dequantize=*/ true)?;
+    let attn_q_norm = try_compute_opt_slice(
+        gguf,
+        layer,
+        ATTN_Q_NORM,
+        &mut blob_size,
+        /*dequantize=*/ true,
+    )?;
+    let attn_k_norm = try_compute_opt_slice(
+        gguf,
+        layer,
+        ATTN_K_NORM,
+        &mut blob_size,
+        /*dequantize=*/ true,
+    )?;
 
     let layer_type = if is_full_attn { Some(0u8) } else { Some(1u8) };
 
     let subtensors = SubtensorOffsets {
-        wq, wk, wv, wo,
-        bq, bk, bv,
-        w_gate, w_up, w_down,
-        attn_norm, ffn_norm,
+        wq,
+        wk,
+        wv,
+        wo,
+        bq,
+        bk,
+        bv,
+        w_gate,
+        w_up,
+        w_down,
+        attn_norm,
+        ffn_norm,
         router_weight: None,
         experts: None,
-        shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-        attn_gate, attn_post_norm,
-        ssm_a, ssm_conv1d, ssm_dt, ssm_beta, ssm_alpha, ssm_norm, ssm_out,
-        attn_q_norm, attn_k_norm, ffn_gate_inp_shexp: None,
+        shared_expert_gate: None,
+        shared_expert_up: None,
+        shared_expert_down: None,
+        attn_gate,
+        attn_post_norm,
+        ssm_a,
+        ssm_conv1d,
+        ssm_dt,
+        ssm_beta,
+        ssm_alpha,
+        ssm_norm,
+        ssm_out,
+        attn_q_norm,
+        attn_k_norm,
+        ffn_gate_inp_shexp: None,
         layer_type,
     };
 
@@ -357,32 +526,80 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
     if is_full_attn {
         // Full attention: separate Q/K/V/output tensors
         for suffix in &ATTN_TENSOR_SUFFIXES {
-            append_tensor_to_blob_requant_with_target(blob, reader, gguf, &layer_tensor_name(layer, suffix), dequantize, requant_to, target)?;
+            append_tensor_to_blob_requant_with_target(
+                blob,
+                reader,
+                gguf,
+                &layer_tensor_name(layer, suffix),
+                dequantize,
+                requant_to,
+                target,
+            )?;
         }
     } else {
         // Linear attention: fused QKV tensor only (stored in wq slot in index)
-        append_tensor_to_blob_requant_with_target(blob, reader, gguf, &layer_tensor_name(layer, ATTN_QKV), dequantize, requant_to, target)?;
+        append_tensor_to_blob_requant_with_target(
+            blob,
+            reader,
+            gguf,
+            &layer_tensor_name(layer, ATTN_QKV),
+            dequantize,
+            requant_to,
+            target,
+        )?;
     }
 
     // Pre-attention norm
-    append_tensor_to_blob_requant_with_target(blob, reader, gguf, &layer_tensor_name(layer, ATTN_NORM), dequantize, requant_to, target)?;
+    append_tensor_to_blob_requant_with_target(
+        blob,
+        reader,
+        gguf,
+        &layer_tensor_name(layer, ATTN_NORM),
+        dequantize,
+        requant_to,
+        target,
+    )?;
 
     // Post-attention norm (if present)
     let post_norm_name = layer_tensor_name(layer, ATTN_POST_NORM);
     if gguf.find_tensor(&post_norm_name).is_some() {
-        append_tensor_to_blob_requant_with_target(blob, reader, gguf, &post_norm_name, dequantize, requant_to, target)?;
+        append_tensor_to_blob_requant_with_target(
+            blob,
+            reader,
+            gguf,
+            &post_norm_name,
+            dequantize,
+            requant_to,
+            target,
+        )?;
     }
 
     // FFN norm (if present)
     let ffn_norm_name = layer_tensor_name(layer, FFN_NORM);
     if gguf.find_tensor(&ffn_norm_name).is_some() {
-        append_tensor_to_blob_requant_with_target(blob, reader, gguf, &ffn_norm_name, dequantize, requant_to, target)?;
+        append_tensor_to_blob_requant_with_target(
+            blob,
+            reader,
+            gguf,
+            &ffn_norm_name,
+            dequantize,
+            requant_to,
+            target,
+        )?;
     }
 
     // Attention gate (if present)
     let attn_gate_name = layer_tensor_name(layer, ATTN_GATE_WEIGHT);
     if gguf.find_tensor(&attn_gate_name).is_some() {
-        append_tensor_to_blob_requant_with_target(blob, reader, gguf, &attn_gate_name, dequantize, requant_to, target)?;
+        append_tensor_to_blob_requant_with_target(
+            blob,
+            reader,
+            gguf,
+            &attn_gate_name,
+            dequantize,
+            requant_to,
+            target,
+        )?;
     }
 
     // SSM tensors (if present) — shared GDN gate logic handles force-requant
@@ -401,23 +618,53 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
                 Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
                 other => other.or(Some(QuantScheme::Q8_0)),
             };
-            append_tensor_to_blob_requant(blob, reader, gguf, &name, /*dequantize=*/ false, ssm_out_target)?;
+            append_tensor_to_blob_requant(
+                blob,
+                reader,
+                gguf,
+                &name,
+                /*dequantize=*/ false,
+                ssm_out_target,
+            )?;
         }
     }
 
     // Dense FFN weights
-    append_tensor_to_blob_requant_with_target(blob, reader, gguf, &layer_tensor_name(layer, FFN_GATE), dequantize, requant_to, target)?;
-    append_tensor_to_blob_requant_with_target(blob, reader, gguf, &layer_tensor_name(layer, FFN_UP), dequantize, requant_to, target)?;
-    append_tensor_to_blob_requant_with_target(blob, reader, gguf, &layer_tensor_name(layer, FFN_DOWN), dequantize, requant_to, target)?;
+    append_tensor_to_blob_requant_with_target(
+        blob,
+        reader,
+        gguf,
+        &layer_tensor_name(layer, FFN_GATE),
+        dequantize,
+        requant_to,
+        target,
+    )?;
+    append_tensor_to_blob_requant_with_target(
+        blob,
+        reader,
+        gguf,
+        &layer_tensor_name(layer, FFN_UP),
+        dequantize,
+        requant_to,
+        target,
+    )?;
+    append_tensor_to_blob_requant_with_target(
+        blob,
+        reader,
+        gguf,
+        &layer_tensor_name(layer, FFN_DOWN),
+        dequantize,
+        requant_to,
+        target,
+    )?;
 
     // Optional bias tensors (always F32)
     for bias_suffix in &[ATTN_Q_BIAS, ATTN_K_BIAS, ATTN_V_BIAS] {
         let name = layer_tensor_name(layer, bias_suffix);
         if let Some(tensor) = gguf.find_tensor(&name) {
             let data = read_tensor_data(reader, gguf, tensor)?;
-            let f32_data = dequantize_to_f32_bytes(
-                &data, tensor.ggml_type, tensor.n_elements(), &name,
-            )?;
+            let f32_data =
+                dequantize_to_f32_bytes(&data, tensor.ggml_type, tensor.n_elements(), &name)?;
             blob.extend_from_slice(&f32_data);
         }
     }

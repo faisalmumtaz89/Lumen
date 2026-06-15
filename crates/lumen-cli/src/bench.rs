@@ -25,24 +25,33 @@ pub(crate) fn generate_test_model_cmd(args: &[String]) {
                 println!("OPTIONS:");
                 println!("    --output <path>, -o <path>");
                 println!("                       Output LBC path (default: test_model.lbc in cwd)");
-                println!("    --size <spec>      Generate a larger benchmark fixture instead of the");
+                println!(
+                    "    --size <spec>      Generate a larger benchmark fixture instead of the"
+                );
                 println!("                       tiny default. One of: 256mb | 1gb | 4gb | 7b");
                 println!("    -h, --help         Print this help");
                 return;
             }
             "--output" | "-o" => {
                 i += 1;
-                output_path = args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --output requires a path");
-                    std::process::exit(1);
-                }).clone();
+                output_path = args
+                    .get(i)
+                    .unwrap_or_else(|| {
+                        eprintln!("Error: --output requires a path");
+                        std::process::exit(1);
+                    })
+                    .clone();
             }
             "--size" => {
                 i += 1;
-                size = Some(args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --size requires a value (256mb, 1gb, 4gb, 7b)");
-                    std::process::exit(1);
-                }).clone());
+                size = Some(
+                    args.get(i)
+                        .unwrap_or_else(|| {
+                            eprintln!("Error: --size requires a value (256mb, 1gb, 4gb, 7b)");
+                            std::process::exit(1);
+                        })
+                        .clone(),
+                );
             }
             other if !other.starts_with('-') && i == 0 => {
                 output_path = other.to_string();
@@ -69,14 +78,23 @@ pub(crate) fn generate_test_model_cmd(args: &[String]) {
             };
 
             let est = config.estimated_file_size();
-            println!("Generating {sz} model (~{})...", large_model::format_size(est));
+            println!(
+                "Generating {sz} model (~{})...",
+                large_model::format_size(est)
+            );
             println!("  Layers: {}", config.num_layers);
             println!("  Hidden dim: {}", config.hidden_dim);
-            println!("  Heads: {} (KV: {})", config.num_heads, config.num_kv_heads);
+            println!(
+                "  Heads: {} (KV: {})",
+                config.num_heads, config.num_kv_heads
+            );
             println!("  Head dim: {}", config.head_dim);
             println!("  Intermediate dim: {}", config.intermediate_dim);
             println!("  Vocab size: {}", config.vocab_size);
-            println!("  Layer blob size: {}", large_model::format_size(config.layer_blob_size()));
+            println!(
+                "  Layer blob size: {}",
+                large_model::format_size(config.layer_blob_size())
+            );
 
             let file = std::fs::File::create(&output_path).unwrap_or_else(|e| {
                 eprintln!("Error creating {output_path}: {e}");
@@ -88,8 +106,14 @@ pub(crate) fn generate_test_model_cmd(args: &[String]) {
                 std::process::exit(1);
             });
 
-            let actual_size = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
-            println!("Written: {} ({})", output_path, large_model::format_size(actual_size));
+            let actual_size = std::fs::metadata(&output_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            println!(
+                "Written: {} ({})",
+                output_path,
+                large_model::format_size(actual_size)
+            );
         }
         None => {
             // Default: generate the tiny test model
@@ -107,7 +131,10 @@ pub(crate) fn generate_test_model_cmd(args: &[String]) {
 
             println!("Generated test model: {output_path}");
             println!("  Layers: {}", config.num_layers);
-            println!("  Heads: {} (KV: {})", config.num_heads, config.num_kv_heads);
+            println!(
+                "  Heads: {} (KV: {})",
+                config.num_heads, config.num_kv_heads
+            );
             println!("  Hidden dim: {}", config.hidden_dim);
             println!("  Intermediate dim: {}", config.intermediate_dim);
             println!("  Head dim: {}", config.head_dim);
@@ -128,10 +155,14 @@ pub(crate) fn purge_cmd(args: &[String]) {
         match args[i].as_str() {
             "--model" => {
                 i += 1;
-                model_path = Some(args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --model requires a path");
-                    std::process::exit(1);
-                }).clone());
+                model_path = Some(
+                    args.get(i)
+                        .unwrap_or_else(|| {
+                            eprintln!("Error: --model requires a path");
+                            std::process::exit(1);
+                        })
+                        .clone(),
+                );
             }
             "--help" | "-h" => {
                 println!("USAGE:");
@@ -207,19 +238,55 @@ pub(crate) fn bench_cmd(args: &[String]) {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--suite" => { i += 1; suite_name = parse_arg(args, i, "--suite"); }
-            "--size" => { i += 1; size = parse_arg(args, i, "--size"); }
-            "--backend" => { i += 1; backend = parse_arg(args, i, "--backend"); }
-            "--prefetch" => { i += 1; prefetch = parse_arg_num(args, i, "--prefetch"); }
-            "--mode" => { i += 1; mode = parse_arg(args, i, "--mode"); }
-            "--cold-start" => { cold_start = true; }
-            "--iters" => { i += 1; iters = parse_arg_num(args, i, "--iters"); }
-            "--prompt-len" => { i += 1; prompt_len = parse_arg_num(args, i, "--prompt-len"); }
-            "--gen-len" => { i += 1; gen_len = parse_arg_num(args, i, "--gen-len"); }
-            "--output-dir" => { i += 1; output_dir = PathBuf::from(parse_arg(args, i, "--output-dir")); }
-            "--json" => { json = true; }
-            "--simd" => { use_simd = true; }
-            "--help" | "-h" => { print_bench_usage(); return; }
+            "--suite" => {
+                i += 1;
+                suite_name = parse_arg(args, i, "--suite");
+            }
+            "--size" => {
+                i += 1;
+                size = parse_arg(args, i, "--size");
+            }
+            "--backend" => {
+                i += 1;
+                backend = parse_arg(args, i, "--backend");
+            }
+            "--prefetch" => {
+                i += 1;
+                prefetch = parse_arg_num(args, i, "--prefetch");
+            }
+            "--mode" => {
+                i += 1;
+                mode = parse_arg(args, i, "--mode");
+            }
+            "--cold-start" => {
+                cold_start = true;
+            }
+            "--iters" => {
+                i += 1;
+                iters = parse_arg_num(args, i, "--iters");
+            }
+            "--prompt-len" => {
+                i += 1;
+                prompt_len = parse_arg_num(args, i, "--prompt-len");
+            }
+            "--gen-len" => {
+                i += 1;
+                gen_len = parse_arg_num(args, i, "--gen-len");
+            }
+            "--output-dir" => {
+                i += 1;
+                output_dir = PathBuf::from(parse_arg(args, i, "--output-dir"));
+            }
+            "--json" => {
+                json = true;
+            }
+            "--simd" => {
+                use_simd = true;
+            }
+            "--help" | "-h" => {
+                print_bench_usage();
+                return;
+            }
             other => {
                 eprintln!("Unknown bench option: {other}");
                 print_bench_usage();
@@ -267,7 +334,11 @@ pub(crate) fn bench_cmd(args: &[String]) {
                 temperature: 0.0,
                 seed: 42,
                 use_simd,
-                label: format!("{size}-{backend}-{mode}-{}{}", if cold_start { "cold" } else { "warm" }, if use_simd { "-simd" } else { "" }),
+                label: format!(
+                    "{size}-{backend}-{mode}-{}{}",
+                    if cold_start { "cold" } else { "warm" },
+                    if use_simd { "-simd" } else { "" }
+                ),
             }]
         }
         _ => {

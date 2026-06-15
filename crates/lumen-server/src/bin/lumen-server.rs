@@ -20,21 +20,21 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lumen_runtime::compute::ComputeBackend;
+use lumen_format::reader::LbcFile;
+use lumen_format::QuantScheme;
 use lumen_runtime::compute::cpu_naive::NaiveF32Backend;
+use lumen_runtime::compute::ComputeBackend;
 use lumen_runtime::kv::KvPrecision;
 use lumen_runtime::pipeline::PipelineMode;
-use lumen_runtime::weight::provider_sync::SyncWeightProvider;
-use lumen_runtime::weight::provider_mmap::MmapWeightProvider;
-use lumen_runtime::weight::cache::WeightProvider;
 use lumen_runtime::storage::MmapConfig;
-use lumen_format::reader::LbcFile;
-use lumen_runtime::RuntimeConfig;
-#[cfg(target_os = "macos")]
-use lumen_runtime::MetalF32Backend;
+use lumen_runtime::weight::cache::WeightProvider;
+use lumen_runtime::weight::provider_mmap::MmapWeightProvider;
+use lumen_runtime::weight::provider_sync::SyncWeightProvider;
 #[cfg(feature = "cuda")]
 use lumen_runtime::CudaBackend;
-use lumen_format::QuantScheme;
+#[cfg(target_os = "macos")]
+use lumen_runtime::MetalF32Backend;
+use lumen_runtime::RuntimeConfig;
 
 use lumen_server::{build_router, EngineWorker, ModelInfo, Tokenize};
 
@@ -172,7 +172,9 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--port" => {
                 i += 1;
                 let v = raw.get(i).ok_or("--port requires a value")?;
-                args.port = v.parse().map_err(|_| format!("--port must be u16, got {v}"))?;
+                args.port = v
+                    .parse()
+                    .map_err(|_| format!("--port must be u16, got {v}"))?;
             }
             "--context-len" => {
                 i += 1;
@@ -189,7 +191,11 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                     "metal" => BackendChoice::Metal,
                     "cpu" => BackendChoice::Cpu,
                     "auto" => BackendChoice::Auto,
-                    other => return Err(format!("--backend must be cuda|metal|cpu|auto, got {other}")),
+                    other => {
+                        return Err(format!(
+                            "--backend must be cuda|metal|cpu|auto, got {other}"
+                        ))
+                    }
                 };
             }
             "--backend-device" => {
@@ -218,7 +224,10 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                println!("lumen-server {}", option_env!("LUMEN_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")));
+                println!(
+                    "lumen-server {}",
+                    option_env!("LUMEN_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+                );
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -253,7 +262,10 @@ fn cache_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         #[cfg(target_os = "macos")]
         {
-            let macos = PathBuf::from(&home).join("Library").join("Caches").join("lumen");
+            let macos = PathBuf::from(&home)
+                .join("Library")
+                .join("Caches")
+                .join("lumen");
             if macos.is_dir() {
                 return macos;
             }
@@ -375,7 +387,10 @@ impl Tokenize for BpeTokenizerAdapter {
     fn apply_chat_template(&self, system: Option<&str>, user: &str) -> Option<String> {
         // Soak/bench harness: reasoning off (closed think tail), byte-identical
         // to the pre-reasoning-control template.
-        Some(self.inner.apply_chat_template_with_system(user, system, false))
+        Some(
+            self.inner
+                .apply_chat_template_with_system(user, system, false),
+        )
     }
 
     fn eos_tokens(&self) -> Vec<u32> {
@@ -577,7 +592,10 @@ async fn run(args: Args) -> Result<(), String> {
     };
     let bpe = lumen_cli::tokenize::BpeTokenizer::from_tokenizer_data(&tok_data);
     let eos_ids = bpe.stop_token_ids.clone();
-    let tokenizer: Arc<dyn Tokenize> = Arc::new(BpeTokenizerAdapter { inner: bpe, eos_ids });
+    let tokenizer: Arc<dyn Tokenize> = Arc::new(BpeTokenizerAdapter {
+        inner: bpe,
+        eos_ids,
+    });
 
     // Resolve the backend first — the weight-provider choice depends on it.
     let backend_choice = select_backend(args.backend);
@@ -591,8 +609,7 @@ async fn run(args: Args) -> Result<(), String> {
     // (CUDA/CPU read F32-dequantized layers; the sync path is also the
     // guarded fallback). Mmap and sync are proven byte-identical on the
     // Metal path by `metal_sync_mmap_argmax_parity_test`.
-    let use_mmap_provider =
-        matches!(backend_choice, BackendChoice::Metal) && !args.sync_provider;
+    let use_mmap_provider = matches!(backend_choice, BackendChoice::Metal) && !args.sync_provider;
     let provider: ServerWeights = if use_mmap_provider {
         // Enable the no-copy residency path. We set the env BEFORE the backend
         // constructor / `preload_weights` reads it (gpu_resident.rs probe). An
@@ -600,7 +617,9 @@ async fn run(args: Args) -> Result<(), String> {
         // because we only set it when unset.
         if std::env::var_os("LUMEN_METAL_MMAP_ONLY").is_none() {
             // SAFETY: single-threaded boot, before any worker thread is spawned.
-            unsafe { std::env::set_var("LUMEN_METAL_MMAP_ONLY", "1"); }
+            unsafe {
+                std::env::set_var("LUMEN_METAL_MMAP_ONLY", "1");
+            }
         }
         let mmap_config = MmapConfig {
             prefetch_window: 2,
@@ -710,8 +729,12 @@ async fn run(args: Args) -> Result<(), String> {
         BackendChoice::Cuda => {
             #[cfg(feature = "cuda")]
             {
-                let mut cuda = CudaBackend::new(args.backend_device)
-                    .map_err(|e| format!("CUDA backend unavailable (device {}): {e}", args.backend_device))?;
+                let mut cuda = CudaBackend::new(args.backend_device).map_err(|e| {
+                    format!(
+                        "CUDA backend unavailable (device {}): {e}",
+                        args.backend_device
+                    )
+                })?;
                 // CUDA: keep the F32 dequant (skip=false) — byte-identical to
                 // the long-standing path until validated on real CUDA hardware
                 // (its embed_token CPU fallback still reads self.embedding).
@@ -726,9 +749,7 @@ async fn run(args: Args) -> Result<(), String> {
             #[cfg(not(feature = "cuda"))]
             {
                 let _ = args.backend_device;
-                return Err(
-                    "--backend cuda requires building with --features cuda".to_string(),
-                );
+                return Err("--backend cuda requires building with --features cuda".to_string());
             }
         }
         BackendChoice::Cpu => {
@@ -784,7 +805,9 @@ async fn run(args: Args) -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .map_err(|e| format!("bind {bind_addr}: {e}"))?;
-    let local = listener.local_addr().map_err(|e| format!("local_addr: {e}"))?;
+    let local = listener
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
     eprintln!("[lumen-server] listening on http://{local}");
     eprintln!("[lumen-server] try: curl http://{local}/v1/models");
     eprintln!("[lumen-server] (Ctrl-C to stop)");

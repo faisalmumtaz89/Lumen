@@ -20,9 +20,7 @@
 //! On pre-Metal 3 hardware or pre-macOS 13, `MetalIOQueue::new()` returns
 //! `None` and callers fall back to the existing pread + blit copy path.
 
-use crate::metal::ffi::{
-    MetalBuffer, MetalDevice, MetalIOCommandQueue, MetalIOStatus,
-};
+use crate::metal::ffi::{MetalBuffer, MetalDevice, MetalIOCommandQueue, MetalIOStatus};
 use std::path::Path;
 
 /// Safe wrapper around Metal's IO command queue for direct file-to-GPU DMA.
@@ -72,19 +70,26 @@ impl MetalIOQueue {
             return Ok(());
         }
 
-        let path_str = src_path.to_str().ok_or_else(|| {
-            format!("Path contains non-UTF8 characters: {}", src_path.display())
-        })?;
+        let path_str = src_path
+            .to_str()
+            .ok_or_else(|| format!("Path contains non-UTF8 characters: {}", src_path.display()))?;
 
         // Open the file handle (retained for this operation).
         let file_handle = MetalIOCommandQueue::open_file(device, path_str)?;
 
         // Create and submit the IO command buffer.
-        let cmd = self.queue.command_buffer().ok_or_else(|| {
-            "Failed to create Metal IO command buffer".to_string()
-        })?;
+        let cmd = self
+            .queue
+            .command_buffer()
+            .ok_or_else(|| "Failed to create Metal IO command buffer".to_string())?;
 
-        cmd.load_buffer(dest_buffer, dest_offset, byte_count, &file_handle, src_offset);
+        cmd.load_buffer(
+            dest_buffer,
+            dest_offset,
+            byte_count,
+            &file_handle,
+            src_offset,
+        );
         cmd.commit_and_wait();
 
         // Verify completion status.
@@ -118,19 +123,26 @@ impl MetalIOQueue {
             return Ok(());
         }
 
-        let path_str = src_path.to_str().ok_or_else(|| {
-            format!("Path contains non-UTF8 characters: {}", src_path.display())
-        })?;
+        let path_str = src_path
+            .to_str()
+            .ok_or_else(|| format!("Path contains non-UTF8 characters: {}", src_path.display()))?;
 
         let file_handle = MetalIOCommandQueue::open_file(device, path_str)?;
 
-        let cmd = self.queue.command_buffer().ok_or_else(|| {
-            "Failed to create Metal IO command buffer".to_string()
-        })?;
+        let cmd = self
+            .queue
+            .command_buffer()
+            .ok_or_else(|| "Failed to create Metal IO command buffer".to_string())?;
 
         for &(dest_offset, src_offset, byte_count) in ranges {
             if byte_count > 0 {
-                cmd.load_buffer(dest_buffer, dest_offset, byte_count, &file_handle, src_offset);
+                cmd.load_buffer(
+                    dest_buffer,
+                    dest_offset,
+                    byte_count,
+                    &file_handle,
+                    src_offset,
+                );
             }
         }
 
@@ -199,14 +211,7 @@ mod tests {
             .expect("create Metal buffer");
 
         // Load via Metal IO.
-        let result = io_queue.load_sync(
-            &device,
-            &buf,
-            0,
-            &path,
-            0,
-            test_data.len() as u64,
-        );
+        let result = io_queue.load_sync(&device, &buf, 0, &path, 0, test_data.len() as u64);
         assert!(result.is_ok(), "Metal IO load failed: {:?}", result.err());
 
         // Verify contents.
@@ -248,7 +253,7 @@ mod tests {
         // Test batch load (load_ranges_sync).
         let buf3 = device.new_buffer(2048).expect("create Metal buffer 3");
         let ranges = vec![
-            (0u64, 0u64, 1024u64),     // First 1KB from file start -> buffer start
+            (0u64, 0u64, 1024u64),       // First 1KB from file start -> buffer start
             (1024u64, 2048u64, 1024u64), // 1KB from file offset 2048 -> buffer offset 1024
         ];
         let result3 = io_queue.load_ranges_sync(&device, &buf3, &path, &ranges);
@@ -327,10 +332,7 @@ mod tests {
 
         let lbc_path = std::path::Path::new("/tmp/lumen-bench/qwen3-5-moe-35b-a3b-Q4_0.lbc");
         if !lbc_path.exists() {
-            eprintln!(
-                "SKIP: benchmark file not found at {}",
-                lbc_path.display()
-            );
+            eprintln!("SKIP: benchmark file not found at {}", lbc_path.display());
             return;
         }
 
@@ -371,7 +373,8 @@ mod tests {
 
         // Benchmark pread (4 threads).
         let start = Instant::now();
-        let _pread_data = crate::expert::reader::parallel_pread(lbc_path, offset, length, 4).unwrap();
+        let _pread_data =
+            crate::expert::reader::parallel_pread(lbc_path, offset, length, 4).unwrap();
         let elapsed_pread = start.elapsed();
         let bw_pread = length as f64 / 1e9 / elapsed_pread.as_secs_f64();
         eprintln!(

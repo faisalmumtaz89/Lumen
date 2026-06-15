@@ -20,7 +20,7 @@
 
 #![cfg(feature = "cuda")]
 
-use cudarc::cublas::{CudaBlas, Gemv, GemvConfig, sys};
+use cudarc::cublas::{sys, CudaBlas, Gemv, GemvConfig};
 use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::compile_ptx;
 use std::time::Instant;
@@ -114,7 +114,11 @@ fn bench_custom(
     let bytes = (out_dim * in_dim * 4 + in_dim * 4 + out_dim * 4) as f64;
     let gb_per_s = (bytes * iterations as f64) / elapsed.as_secs_f64() / 1e9;
 
-    BenchResult { us_per_op, gflops, gb_per_s }
+    BenchResult {
+        us_per_op,
+        gflops,
+        gb_per_s,
+    }
 }
 
 /// Run cuBLAS SGEMV for `iterations` and return timing stats.
@@ -160,7 +164,11 @@ fn bench_cublas(
     let bytes = (out_dim * in_dim * 4 + in_dim * 4 + out_dim * 4) as f64;
     let gb_per_s = (bytes * iterations as f64) / elapsed.as_secs_f64() / 1e9;
 
-    BenchResult { us_per_op, gflops, gb_per_s }
+    BenchResult {
+        us_per_op,
+        gflops,
+        gb_per_s,
+    }
 }
 
 /// Run the custom kernel once and return the output vector.
@@ -253,10 +261,26 @@ fn bench_cublas_ab_comparison() {
     let func = module.load_function("matvec_f32").unwrap();
 
     let configs = [
-        DimConfig { label: "8B hidden (4096x4096)", out_dim: 4096, in_dim: 4096 },
-        DimConfig { label: "8B FFN gate/up (14336x4096)", out_dim: 14336, in_dim: 4096 },
-        DimConfig { label: "1B hidden (2048x2048)", out_dim: 2048, in_dim: 2048 },
-        DimConfig { label: "1B FFN gate/up (8192x2048)", out_dim: 8192, in_dim: 2048 },
+        DimConfig {
+            label: "8B hidden (4096x4096)",
+            out_dim: 4096,
+            in_dim: 4096,
+        },
+        DimConfig {
+            label: "8B FFN gate/up (14336x4096)",
+            out_dim: 14336,
+            in_dim: 4096,
+        },
+        DimConfig {
+            label: "1B hidden (2048x2048)",
+            out_dim: 2048,
+            in_dim: 2048,
+        },
+        DimConfig {
+            label: "1B FFN gate/up (8192x2048)",
+            out_dim: 8192,
+            in_dim: 2048,
+        },
     ];
 
     eprintln!();
@@ -305,10 +329,12 @@ fn bench_cublas_ab_comparison() {
         }
 
         // --- Performance benchmark ---
-        let custom_result =
-            bench_custom(&stream, &func, &w_gpu, &x_gpu, out_dim, in_dim, warmup, iterations);
-        let cublas_result =
-            bench_cublas(&stream, &blas, &w_gpu, &x_gpu, out_dim, in_dim, warmup, iterations);
+        let custom_result = bench_custom(
+            &stream, &func, &w_gpu, &x_gpu, out_dim, in_dim, warmup, iterations,
+        );
+        let cublas_result = bench_cublas(
+            &stream, &blas, &w_gpu, &x_gpu, out_dim, in_dim, warmup, iterations,
+        );
 
         let speedup = custom_result.us_per_op / cublas_result.us_per_op;
 
@@ -326,7 +352,10 @@ fn bench_cublas_ab_comparison() {
             CORRECTNESS_TOL,
         );
         eprintln!();
-        eprintln!("  {:>12} {:>10} {:>10} {:>10}", "", "us/op", "GFLOPS", "GB/s");
+        eprintln!(
+            "  {:>12} {:>10} {:>10} {:>10}",
+            "", "us/op", "GFLOPS", "GB/s"
+        );
         eprintln!(
             "  {:>12} {:>10.1} {:>10.1} {:>10.1}",
             "Custom:", custom_result.us_per_op, custom_result.gflops, custom_result.gb_per_s,
@@ -348,9 +377,16 @@ fn bench_cublas_ab_comparison() {
     eprintln!("======================================================================");
     eprintln!(
         "  Overall correctness: {}",
-        if all_correct { "ALL PASS" } else { "SOME FAILED" },
+        if all_correct {
+            "ALL PASS"
+        } else {
+            "SOME FAILED"
+        },
     );
     eprintln!("======================================================================");
 
-    assert!(all_correct, "Correctness check failed for one or more dimension configs");
+    assert!(
+        all_correct,
+        "Correctness check failed for one or more dimension configs"
+    );
 }

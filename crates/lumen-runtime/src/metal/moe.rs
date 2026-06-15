@@ -2,21 +2,17 @@
 //!
 //! Extracted from mod.rs for modularity.
 
+use super::{
+    CachedLayerMeta, CachedMoeMeta, MetalF32Backend, MetalPipelines, MetalScratch, RouterLayerStats,
+};
 use crate::error::RuntimeError;
 use crate::expert::cache::ExpertLfuCache;
-use crate::metal::ffi::{
-    MetalBuffer, MetalCommandBuffer, MetalComputeEncoder, MTLSize,
-};
+use crate::metal::ffi::{MTLSize, MetalBuffer, MetalCommandBuffer, MetalComputeEncoder};
 use lumen_format::quantization::QuantScheme;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
-use super::{
-    MetalPipelines, MetalScratch, CachedLayerMeta, CachedMoeMeta,
-    MetalF32Backend, RouterLayerStats,
-};
+use std::sync::Mutex;
 
 impl MetalF32Backend {
-
     /// Configure MoE expert caching for streaming decode.
     ///
     /// Must be called BEFORE `init()`. Only effective for MoE models
@@ -24,11 +20,7 @@ impl MetalF32Backend {
     ///
     /// - `lbc_path`: Path to the LBC model file for per-expert byte-range reads.
     /// - `cache_capacity`: Maximum number of experts to cache (0 = profiling only).
-    pub fn configure_expert_cache(
-        &mut self,
-        lbc_path: &std::path::Path,
-        cache_capacity: usize,
-    ) {
+    pub fn configure_expert_cache(&mut self, lbc_path: &std::path::Path, cache_capacity: usize) {
         self.lbc_path = Some(lbc_path.to_path_buf());
         if cache_capacity > 0 {
             self.expert_cache = Some(Mutex::new(ExpertLfuCache::new(cache_capacity)));
@@ -46,12 +38,9 @@ impl MetalF32Backend {
     ///
     /// - `profiling_tokens`: Number of tokens to observe before triggering warmup.
     /// - `top_k_per_layer`: Number of experts per layer to cache (e.g., 4 for top-4).
-    pub fn configure_expert_warmup(
-        &mut self,
-        profiling_tokens: usize,
-        top_k_per_layer: usize,
-    ) {
-        self.profiling_tokens_remaining.store(profiling_tokens, Ordering::Relaxed);
+    pub fn configure_expert_warmup(&mut self, profiling_tokens: usize, top_k_per_layer: usize) {
+        self.profiling_tokens_remaining
+            .store(profiling_tokens, Ordering::Relaxed);
         self.profiling_top_k = top_k_per_layer;
         self.warmup_complete.store(false, Ordering::Relaxed);
     }
@@ -111,55 +100,64 @@ impl MetalF32Backend {
         out.push_str("--- Router Diagnostics ---\n");
 
         for layer in 0..num_layers {
-            let entries: Vec<&RouterLayerStats> = log.iter()
-                .filter(|s| s.layer == layer)
-                .collect();
+            let entries: Vec<&RouterLayerStats> = log.iter().filter(|s| s.layer == layer).collect();
             if entries.is_empty() {
                 continue;
             }
 
             // Collect all expert selections and weights.
-            let mut expert_counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
-            let mut weight_sums: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+            let mut expert_counts: std::collections::HashMap<u32, usize> =
+                std::collections::HashMap::new();
+            let mut weight_sums: std::collections::HashMap<u32, f32> =
+                std::collections::HashMap::new();
             let num_tokens = entries.len();
 
             for entry in &entries {
                 for (i, &eid) in entry.expert_ids.iter().enumerate() {
                     *expert_counts.entry(eid).or_insert(0) += 1;
-                    *weight_sums.entry(eid).or_insert(0.0) += entry.expert_weights.get(i).copied().unwrap_or(0.0);
+                    *weight_sums.entry(eid).or_insert(0.0) +=
+                        entry.expert_weights.get(i).copied().unwrap_or(0.0);
                 }
             }
 
             // Compute selection entropy (over expert_ids[0] -- the top-1 expert).
-            let top1_counts: std::collections::HashMap<u32, usize> = entries.iter()
+            let top1_counts: std::collections::HashMap<u32, usize> = entries
+                .iter()
                 .filter_map(|e| e.expert_ids.first().copied())
                 .fold(std::collections::HashMap::new(), |mut acc, eid| {
                     *acc.entry(eid).or_insert(0) += 1;
                     acc
                 });
             let total_top1 = num_tokens as f64;
-            let entropy: f64 = top1_counts.values()
+            let entropy: f64 = top1_counts
+                .values()
                 .map(|&c| {
                     let p = c as f64 / total_top1;
-                    if p > 0.0 { -p * p.log2() } else { 0.0 }
+                    if p > 0.0 {
+                        -p * p.log2()
+                    } else {
+                        0.0
+                    }
                 })
                 .sum();
 
             // Find most frequent top-1 expert.
-            let (most_freq_expert, most_freq_count) = top1_counts.iter()
+            let (most_freq_expert, most_freq_count) = top1_counts
+                .iter()
                 .max_by_key(|(_, &c)| c)
                 .map(|(&eid, &c)| (eid, c))
                 .unwrap_or((0, 0));
 
             // Average top-1 weight.
-            let avg_top1_weight: f32 = entries.iter()
+            let avg_top1_weight: f32 = entries
+                .iter()
                 .filter_map(|e| e.expert_weights.first().copied())
-                .sum::<f32>() / num_tokens.max(1) as f32;
+                .sum::<f32>()
+                / num_tokens.max(1) as f32;
 
             // Average weight spread (top1 - top2).
-            let avg_spread: f32 = entries.iter()
-                .map(|e| e.weight_spread)
-                .sum::<f32>() / num_tokens.max(1) as f32;
+            let avg_spread: f32 =
+                entries.iter().map(|e| e.weight_spread).sum::<f32>() / num_tokens.max(1) as f32;
 
             // Use abs() to avoid displaying "-0.000" when entropy is negative zero.
             out.push_str(&format!(
@@ -170,23 +168,36 @@ impl MetalF32Backend {
         }
 
         // Overall determination.
-        let all_entropies: Vec<f64> = (0..num_layers).map(|layer| {
-            let entries: Vec<&RouterLayerStats> = log.iter()
-                .filter(|s| s.layer == layer)
-                .collect();
-            if entries.is_empty() { return 0.0; }
-            let top1_counts: std::collections::HashMap<u32, usize> = entries.iter()
-                .filter_map(|e| e.expert_ids.first().copied())
-                .fold(std::collections::HashMap::new(), |mut acc, eid| {
-                    *acc.entry(eid).or_insert(0) += 1;
-                    acc
-                });
-            let total = entries.len() as f64;
-            top1_counts.values()
-                .map(|&c| { let p = c as f64 / total; if p > 0.0 { -p * p.log2() } else { 0.0 } })
-                .sum()
-        }).collect();
-        let mean_entropy: f64 = all_entropies.iter().sum::<f64>() / all_entropies.len().max(1) as f64;
+        let all_entropies: Vec<f64> = (0..num_layers)
+            .map(|layer| {
+                let entries: Vec<&RouterLayerStats> =
+                    log.iter().filter(|s| s.layer == layer).collect();
+                if entries.is_empty() {
+                    return 0.0;
+                }
+                let top1_counts: std::collections::HashMap<u32, usize> = entries
+                    .iter()
+                    .filter_map(|e| e.expert_ids.first().copied())
+                    .fold(std::collections::HashMap::new(), |mut acc, eid| {
+                        *acc.entry(eid).or_insert(0) += 1;
+                        acc
+                    });
+                let total = entries.len() as f64;
+                top1_counts
+                    .values()
+                    .map(|&c| {
+                        let p = c as f64 / total;
+                        if p > 0.0 {
+                            -p * p.log2()
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum()
+            })
+            .collect();
+        let mean_entropy: f64 =
+            all_entropies.iter().sum::<f64>() / all_entropies.len().max(1) as f64;
         let any_nonzero = all_entropies.iter().any(|&e| e > 0.001);
 
         // Compute average weight spread across all entries.
@@ -202,20 +213,26 @@ impl MetalF32Backend {
 
             // Weight spread diagnosis.
             out.push_str(&format!(
-                "\n  Weight spread analysis: mean_spread={:.6}\n", mean_spread
+                "\n  Weight spread analysis: mean_spread={:.6}\n",
+                mean_spread
             ));
             if mean_spread < 0.01 {
                 out.push_str("  DIAGNOSIS: Near-zero weight spread confirms softmax output is near-uniform.\n");
                 out.push_str("  The router cannot distinguish between experts. When all softmax\n");
-                out.push_str("  probabilities are ~1/num_experts, the strict `>` argmax tiebreaker\n");
+                out.push_str(
+                    "  probabilities are ~1/num_experts, the strict `>` argmax tiebreaker\n",
+                );
                 out.push_str("  always selects expert 0 (lowest index wins ties).\n");
                 out.push_str("  ROOT CAUSE: Router weight matrix has insufficient variance.\n");
-                out.push_str("  This is a model quality issue (Q4_0 quantization or undertrained router),\n");
+                out.push_str(
+                    "  This is a model quality issue (Q4_0 quantization or undertrained router),\n",
+                );
                 out.push_str("  not a Lumen code bug. The kernel is analytically correct.\n");
             }
         } else {
             out.push_str(&format!(
-                "\n  Mean entropy across layers: {:.3} (mean_spread={:.4})\n", mean_entropy, mean_spread
+                "\n  Mean entropy across layers: {:.3} (mean_spread={:.4})\n",
+                mean_entropy, mean_spread
             ));
             out.push_str("  Routing appears diverse (non-degenerate).\n");
         }
@@ -243,7 +260,10 @@ impl MetalF32Backend {
             return; // Not configured for warmup
         }
 
-        let new_remaining = self.profiling_tokens_remaining.fetch_sub(1, Ordering::Relaxed) - 1;
+        let new_remaining = self
+            .profiling_tokens_remaining
+            .fetch_sub(1, Ordering::Relaxed)
+            - 1;
         if new_remaining > 0 {
             return;
         }
@@ -403,17 +423,22 @@ impl MetalF32Backend {
             // Select biased or standard router pipeline.
             let use_biased = cache_bias_lambda > 0.0 && is_cached_buf.is_some();
             let router_softmax = if use_biased {
-                pipelines.moe_router_softmax_biased.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute(
-                        "MoE router_softmax_biased pipeline not compiled. \
-                         Ensure biased kernel is in METAL_SHADER_SOURCE.".into()
-                    )
-                })?
+                pipelines
+                    .moe_router_softmax_biased
+                    .as_ref()
+                    .ok_or_else(|| {
+                        RuntimeError::Compute(
+                            "MoE router_softmax_biased pipeline not compiled. \
+                         Ensure biased kernel is in METAL_SHADER_SOURCE."
+                                .into(),
+                        )
+                    })?
             } else {
                 pipelines.moe_router_softmax.as_ref().ok_or_else(|| {
                     RuntimeError::Compute(
                         "MoE router_softmax pipeline not compiled. \
-                         Ensure MoE shader kernels are in METAL_SHADER_SOURCE.".into()
+                         Ensure MoE shader kernels are in METAL_SHADER_SOURCE."
+                            .into(),
                     )
                 })?
             };
@@ -431,17 +456,17 @@ impl MetalF32Backend {
                 RuntimeError::Compute("Failed to create encoder for MoE router".into())
             })?;
             enc.set_pipeline_state(router_softmax);
-            enc.set_buffer(&s.normed_buf, 0, 0);                           // hidden state [hidden_dim] float
-            enc.set_buffer(layer_buf, moe_meta.router_weight_off, 1);       // router weight [num_experts * hidden_dim]
-            enc.set_buffer(expert_ids_buf, 0, 2);                           // output: expert_ids [top_k] u32
-            enc.set_buffer(expert_weights_buf, 0, 3);                       // output: expert_weights [top_k] f32
+            enc.set_buffer(&s.normed_buf, 0, 0); // hidden state [hidden_dim] float
+            enc.set_buffer(layer_buf, moe_meta.router_weight_off, 1); // router weight [num_experts * hidden_dim]
+            enc.set_buffer(expert_ids_buf, 0, 2); // output: expert_ids [top_k] u32
+            enc.set_buffer(expert_weights_buf, 0, 3); // output: expert_weights [top_k] f32
             enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
             enc.set_bytes(&(num_experts as u32).to_le_bytes(), 5);
             enc.set_bytes(&(top_k as u32).to_le_bytes(), 6);
             // Biased kernel: pass is_cached buffer and lambda at buffer(7) and buffer(8).
             if use_biased {
-                enc.set_buffer(is_cached_buf.unwrap(), 0, 7);               // is_cached [num_experts] u8
-                enc.set_bytes(&cache_bias_lambda.to_le_bytes(), 8);         // cache_bias_lambda f32
+                enc.set_buffer(is_cached_buf.unwrap(), 0, 7); // is_cached [num_experts] u8
+                enc.set_bytes(&cache_bias_lambda.to_le_bytes(), 8); // cache_bias_lambda f32
             }
             // Single threadgroup processes all experts for one token
             let tg = 256u64.min(hidden_dim as u64).max(1);
@@ -471,7 +496,10 @@ impl MetalF32Backend {
         let expert_loop: Vec<(usize, usize)> = if let Some(ids) = cpu_expert_ids {
             // Option A: only dispatch top-K selected experts.
             // ids[k] = expert index, output slot = k (dense).
-            ids.iter().enumerate().map(|(slot, &eid)| (eid as usize, slot)).collect()
+            ids.iter()
+                .enumerate()
+                .map(|(slot, &eid)| (eid as usize, slot))
+                .collect()
         } else {
             // Option B: dispatch all experts, output slot = expert_idx (sparse).
             (0..num_experts).map(|e| (e, e)).collect()
@@ -481,7 +509,11 @@ impl MetalF32Backend {
             // When offsets are dense (streaming Option A assembled buffer), index by
             // output_slot (0..top_k-1). When sparse (GPU-resident or Option B), index
             // by expert_idx (raw expert ID, 0..num_experts-1).
-            let off_idx = if dense_offsets { output_slot } else { expert_idx };
+            let off_idx = if dense_offsets {
+                output_slot
+            } else {
+                expert_idx
+            };
             let gate_off = moe_meta.expert_gate_offs[off_idx];
             let up_off = moe_meta.expert_up_offs[off_idx];
             let down_off = moe_meta.expert_down_offs[off_idx];
@@ -500,21 +532,25 @@ impl MetalF32Backend {
                             (64u64, ((inter_dim as u64) + 7) / 8)
                         }
                         QuantScheme::Q4_0 => {
-                            enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q4_0_deferred);
+                            enc.set_pipeline_state(
+                                &pipelines.ffn_fused_gate_up_swiglu_q4_0_deferred,
+                            );
                             (128u64, inter_dim as u64)
                         }
                         QuantScheme::Q4_1 => {
-                            enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q4_1_deferred);
+                            enc.set_pipeline_state(
+                                &pipelines.ffn_fused_gate_up_swiglu_q4_1_deferred,
+                            );
                             (128u64, inter_dim as u64)
                         }
                         _ => unreachable!(),
                     };
-                    enc.set_buffer(ewb, gate_off, 0);                // gate weights
-                    enc.set_buffer(&s.normed_buf, 0, 1);            // normed input x
-                    enc.set_buffer(&s.gate_buf, 0, 2);              // output (SwiGLU result -> gate_buf as temp)
+                    enc.set_buffer(ewb, gate_off, 0); // gate weights
+                    enc.set_buffer(&s.normed_buf, 0, 1); // normed input x
+                    enc.set_buffer(&s.gate_buf, 0, 2); // output (SwiGLU result -> gate_buf as temp)
                     enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
                     enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 4);
-                    enc.set_buffer(ewb, up_off, 5);                  // up weights
+                    enc.set_buffer(ewb, up_off, 5); // up weights
                     enc.dispatch_threadgroups(
                         MTLSize::new(ffn_n_tg, 1, 1),
                         MTLSize::new(ffn_tg, 1, 1),
@@ -526,14 +562,31 @@ impl MetalF32Backend {
                     // Gate: gate_buf = W_gate * normed_buf
                     // Up:   up_buf   = W_up   * normed_buf
                     let (fb_pso, fb_tg, fb_n_tg) = match moe_meta.expert_gate_quant {
-                        QuantScheme::F16 => (&pipelines.matmul_f16_deferred_nr2, 128u64, ((inter_dim as u64) + 1) / 2),
-                        QuantScheme::Bf16 => (&pipelines.matmul_bf16_deferred_nr2, 128u64, ((inter_dim as u64) + 1) / 2),
-                        _ => (&pipelines.matmul_bytes_f32, s.matmul_tg_size, inter_dim as u64),
+                        QuantScheme::F16 => (
+                            &pipelines.matmul_f16_deferred_nr2,
+                            128u64,
+                            ((inter_dim as u64) + 1) / 2,
+                        ),
+                        QuantScheme::Bf16 => (
+                            &pipelines.matmul_bf16_deferred_nr2,
+                            128u64,
+                            ((inter_dim as u64) + 1) / 2,
+                        ),
+                        _ => (
+                            &pipelines.matmul_bytes_f32,
+                            s.matmul_tg_size,
+                            inter_dim as u64,
+                        ),
                     };
-                    let need_inter_byte = matches!(moe_meta.expert_gate_quant, QuantScheme::F16 | QuantScheme::Bf16);
+                    let need_inter_byte = matches!(
+                        moe_meta.expert_gate_quant,
+                        QuantScheme::F16 | QuantScheme::Bf16
+                    );
                     {
                         let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                            RuntimeError::Compute("Failed to create encoder for MoE expert gate".into())
+                            RuntimeError::Compute(
+                                "Failed to create encoder for MoE expert gate".into(),
+                            )
                         })?;
                         enc.set_pipeline_state(fb_pso);
                         enc.set_buffer(ewb, gate_off, 0);
@@ -551,7 +604,9 @@ impl MetalF32Backend {
                     }
                     {
                         let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                            RuntimeError::Compute("Failed to create encoder for MoE expert up".into())
+                            RuntimeError::Compute(
+                                "Failed to create encoder for MoE expert up".into(),
+                            )
                         })?;
                         enc.set_pipeline_state(fb_pso);
                         enc.set_buffer(ewb, up_off, 0);
@@ -570,7 +625,9 @@ impl MetalF32Backend {
                     // SwiGLU: gate_buf = swiglu(gate_buf, up_buf)
                     {
                         let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                            RuntimeError::Compute("Failed to create encoder for MoE expert swiglu".into())
+                            RuntimeError::Compute(
+                                "Failed to create encoder for MoE expert swiglu".into(),
+                            )
                         })?;
                         enc.set_pipeline_state(&pipelines.swiglu);
                         enc.set_buffer(&s.gate_buf, 0, 0);
@@ -589,7 +646,9 @@ impl MetalF32Backend {
             // Down projection: expert_output[slot] = W_down * gate_buf
             {
                 let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder for MoE expert down proj".into())
+                    RuntimeError::Compute(
+                        "Failed to create encoder for MoE expert down proj".into(),
+                    )
                 })?;
                 match moe_meta.expert_down_quant {
                     QuantScheme::Q8_0 => {
@@ -610,7 +669,10 @@ impl MetalF32Backend {
                         enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 3);
                         enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
                         let n_tg = ((hidden_dim as u64) + 1) / 2;
-                        enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(n_tg, 1, 1),
+                            MTLSize::new(128, 1, 1),
+                        );
                     }
                     QuantScheme::Q4_1 => {
                         // Q4_1 expert down projection (decode matvec)
@@ -621,7 +683,10 @@ impl MetalF32Backend {
                         enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 3);
                         enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
                         let n_tg = ((hidden_dim as u64) + 3) / 4;
-                        enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(n_tg, 1, 1),
+                            MTLSize::new(128, 1, 1),
+                        );
                     }
                     QuantScheme::F16 => {
                         enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
@@ -631,7 +696,10 @@ impl MetalF32Backend {
                         enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 3);
                         enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
                         let n_tg = ((hidden_dim as u64) + 1) / 2;
-                        enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(n_tg, 1, 1),
+                            MTLSize::new(128, 1, 1),
+                        );
                     }
                     QuantScheme::Bf16 => {
                         enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
@@ -641,7 +709,10 @@ impl MetalF32Backend {
                         enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 3);
                         enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
                         let n_tg = ((hidden_dim as u64) + 1) / 2;
-                        enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(n_tg, 1, 1),
+                            MTLSize::new(128, 1, 1),
+                        );
                     }
                     _ => {
                         // F32 fallback: matmul_bytes_f32 (cast uchar* to float*)
@@ -671,17 +742,22 @@ impl MetalF32Backend {
 
             if cpu_expert_ids.is_some() {
                 // Option A: dense layout, no expert_ids needed in kernel.
-                let expert_accum_a = pipelines.moe_expert_accum_option_a.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute(
-                        "MoE expert_accum_option_a pipeline not compiled. \
-                         Ensure MoE shader kernels are in METAL_SHADER_SOURCE.".into()
-                    )
-                })?;
+                let expert_accum_a =
+                    pipelines
+                        .moe_expert_accum_option_a
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeError::Compute(
+                                "MoE expert_accum_option_a pipeline not compiled. \
+                         Ensure MoE shader kernels are in METAL_SHADER_SOURCE."
+                                    .into(),
+                            )
+                        })?;
                 enc.set_pipeline_state(expert_accum_a);
-                enc.set_buffer(expert_output_buf, 0, 0);         // expert_outputs [top_k * hidden_dim]
-                enc.set_buffer(expert_weights_buf, 0, 1);         // expert_weights [top_k]
-                enc.set_buffer(&s.x_buf, 0, 2);                   // output (hidden state)
-                enc.set_buffer(&s.attn_proj_buf, 0, 3);            // residual (pre-FFN)
+                enc.set_buffer(expert_output_buf, 0, 0); // expert_outputs [top_k * hidden_dim]
+                enc.set_buffer(expert_weights_buf, 0, 1); // expert_weights [top_k]
+                enc.set_buffer(&s.x_buf, 0, 2); // output (hidden state)
+                enc.set_buffer(&s.attn_proj_buf, 0, 3); // residual (pre-FFN)
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
                 enc.set_bytes(&(top_k as u32).to_le_bytes(), 5);
             } else {
@@ -689,24 +765,22 @@ impl MetalF32Backend {
                 let expert_accum = pipelines.moe_expert_accum.as_ref().ok_or_else(|| {
                     RuntimeError::Compute(
                         "MoE expert_accum pipeline not compiled. \
-                         Ensure MoE shader kernels are in METAL_SHADER_SOURCE.".into()
+                         Ensure MoE shader kernels are in METAL_SHADER_SOURCE."
+                            .into(),
                     )
                 })?;
                 enc.set_pipeline_state(expert_accum);
-                enc.set_buffer(expert_output_buf, 0, 0);         // expert_outputs [num_experts * hidden_dim]
-                enc.set_buffer(expert_weights_buf, 0, 1);         // expert_weights [top_k]
-                enc.set_buffer(expert_ids_buf, 0, 2);             // expert_ids [top_k] u32
-                enc.set_buffer(&s.x_buf, 0, 3);                   // output (hidden state)
-                enc.set_buffer(&s.attn_proj_buf, 0, 4);            // residual (pre-FFN)
+                enc.set_buffer(expert_output_buf, 0, 0); // expert_outputs [num_experts * hidden_dim]
+                enc.set_buffer(expert_weights_buf, 0, 1); // expert_weights [top_k]
+                enc.set_buffer(expert_ids_buf, 0, 2); // expert_ids [top_k] u32
+                enc.set_buffer(&s.x_buf, 0, 3); // output (hidden state)
+                enc.set_buffer(&s.attn_proj_buf, 0, 4); // residual (pre-FFN)
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 5);
                 enc.set_bytes(&(top_k as u32).to_le_bytes(), 6);
             }
 
             let tg_count = ((hidden_dim as u64) + 255) / 256;
-            enc.dispatch_threadgroups(
-                MTLSize::new(tg_count, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
+            enc.dispatch_threadgroups(MTLSize::new(tg_count, 1, 1), MTLSize::new(256, 1, 1));
             enc.end_encoding();
         }
 
@@ -726,20 +800,27 @@ impl MetalF32Backend {
         layer_buf: &MetalBuffer,
         meta: &CachedLayerMeta,
     ) -> Result<(), RuntimeError> {
-        let gate_off = meta.shared_expert_gate_off.ok_or_else(|| {
-            RuntimeError::Compute("shared_expert_gate_off missing".into())
-        })?;
-        let up_off = meta.shared_expert_up_off.ok_or_else(|| {
-            RuntimeError::Compute("shared_expert_up_off missing".into())
-        })?;
-        let down_off = meta.shared_expert_down_off.ok_or_else(|| {
-            RuntimeError::Compute("shared_expert_down_off missing".into())
-        })?;
+        let gate_off = meta
+            .shared_expert_gate_off
+            .ok_or_else(|| RuntimeError::Compute("shared_expert_gate_off missing".into()))?;
+        let up_off = meta
+            .shared_expert_up_off
+            .ok_or_else(|| RuntimeError::Compute("shared_expert_up_off missing".into()))?;
+        let down_off = meta
+            .shared_expert_down_off
+            .ok_or_else(|| RuntimeError::Compute("shared_expert_down_off missing".into()))?;
         let gate_quant = meta.shared_expert_gate_quant.unwrap_or(QuantScheme::F32);
         let down_quant = meta.shared_expert_down_quant.unwrap_or(QuantScheme::F32);
         Self::encode_shared_expert_ffn_decode_raw(
-            cmd, pipelines, s, layer_buf,
-            gate_off, up_off, down_off, gate_quant, down_quant,
+            cmd,
+            pipelines,
+            s,
+            layer_buf,
+            gate_off,
+            up_off,
+            down_off,
+            gate_quant,
+            down_quant,
             meta.ffn_gate_inp_shexp_off,
         )
     }
@@ -765,12 +846,14 @@ impl MetalF32Backend {
         let hidden_dim = s.hidden_dim;
         let se_inter = s.shared_expert_inter_dim;
 
-        let se_gate_buf = s.shared_expert_gate_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("shared_expert_gate_buf not allocated".into())
-        })?;
-        let se_down_buf = s.shared_expert_down_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("shared_expert_down_buf not allocated".into())
-        })?;
+        let se_gate_buf = s
+            .shared_expert_gate_buf
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("shared_expert_gate_buf not allocated".into()))?;
+        let se_down_buf = s
+            .shared_expert_down_buf
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("shared_expert_down_buf not allocated".into()))?;
 
         // Step 1: Fused Gate+Up+SwiGLU (input = normed_buf, output = se_gate_buf)
         {
@@ -793,11 +876,24 @@ impl MetalF32Backend {
                 _ => {
                     // F16/BF16/F32 fallback: separate gate, up, then swiglu
                     let (fb_pso, fb_tg, fb_n_tg) = match gate_quant {
-                        QuantScheme::F16 => (&pipelines.matmul_f16_deferred_nr2, 128u64, ((se_inter as u64) + 1) / 2),
-                        QuantScheme::Bf16 => (&pipelines.matmul_bf16_deferred_nr2, 128u64, ((se_inter as u64) + 1) / 2),
-                        _ => (&pipelines.matmul_bytes_f32, s.matmul_tg_size, se_inter as u64),
+                        QuantScheme::F16 => (
+                            &pipelines.matmul_f16_deferred_nr2,
+                            128u64,
+                            ((se_inter as u64) + 1) / 2,
+                        ),
+                        QuantScheme::Bf16 => (
+                            &pipelines.matmul_bf16_deferred_nr2,
+                            128u64,
+                            ((se_inter as u64) + 1) / 2,
+                        ),
+                        _ => (
+                            &pipelines.matmul_bytes_f32,
+                            s.matmul_tg_size,
+                            se_inter as u64,
+                        ),
                     };
-                    let gate_need_inter_byte = matches!(gate_quant, QuantScheme::F16 | QuantScheme::Bf16);
+                    let gate_need_inter_byte =
+                        matches!(gate_quant, QuantScheme::F16 | QuantScheme::Bf16);
                     enc.set_pipeline_state(fb_pso);
                     enc.set_buffer(layer_buf, gate_off, 0);
                     enc.set_buffer(&s.normed_buf, 0, 1);
@@ -820,7 +916,9 @@ impl MetalF32Backend {
                     enc.end_encoding();
                     // SwiGLU: se_gate_buf = silu(se_gate_buf) * se_down_buf
                     let enc2 = cmd.new_compute_encoder().ok_or_else(|| {
-                        RuntimeError::Compute("Failed to create encoder for shared expert swiglu".into())
+                        RuntimeError::Compute(
+                            "Failed to create encoder for shared expert swiglu".into(),
+                        )
                     })?;
                     enc2.set_pipeline_state(&pipelines.swiglu);
                     enc2.set_buffer(se_gate_buf, 0, 0);
@@ -837,14 +935,29 @@ impl MetalF32Backend {
                     // Step 2: Down projection: se_down_buf = W_down * se_gate_buf
                     {
                         let enc3 = cmd.new_compute_encoder().ok_or_else(|| {
-                            RuntimeError::Compute("Failed to create encoder for shared expert down".into())
+                            RuntimeError::Compute(
+                                "Failed to create encoder for shared expert down".into(),
+                            )
                         })?;
                         let (d_pso, d_tg, d_n_tg) = match down_quant {
-                            QuantScheme::F16 => (&pipelines.matmul_f16_deferred_nr2, 128u64, ((hidden_dim as u64) + 1) / 2),
-                            QuantScheme::Bf16 => (&pipelines.matmul_bf16_deferred_nr2, 128u64, ((hidden_dim as u64) + 1) / 2),
-                            _ => (&pipelines.matmul_bytes_f32, s.matmul_tg_size, hidden_dim as u64),
+                            QuantScheme::F16 => (
+                                &pipelines.matmul_f16_deferred_nr2,
+                                128u64,
+                                ((hidden_dim as u64) + 1) / 2,
+                            ),
+                            QuantScheme::Bf16 => (
+                                &pipelines.matmul_bf16_deferred_nr2,
+                                128u64,
+                                ((hidden_dim as u64) + 1) / 2,
+                            ),
+                            _ => (
+                                &pipelines.matmul_bytes_f32,
+                                s.matmul_tg_size,
+                                hidden_dim as u64,
+                            ),
                         };
-                        let down_need_hidden_byte = matches!(down_quant, QuantScheme::F16 | QuantScheme::Bf16);
+                        let down_need_hidden_byte =
+                            matches!(down_quant, QuantScheme::F16 | QuantScheme::Bf16);
                         enc3.set_pipeline_state(d_pso);
                         enc3.set_buffer(layer_buf, down_off, 0);
                         enc3.set_buffer(se_gate_buf, 0, 1);
@@ -864,20 +977,27 @@ impl MetalF32Backend {
                     if let Some(gis_off) = gate_inp_shexp_off {
                         // Dot product: [1 x hidden_dim] @ normed_buf -> se_gate_buf[0]
                         let enc_dot = cmd.new_compute_encoder().ok_or_else(|| {
-                            RuntimeError::Compute("Failed to create encoder for shared expert gate dot".into())
+                            RuntimeError::Compute(
+                                "Failed to create encoder for shared expert gate dot".into(),
+                            )
                         })?;
                         enc_dot.set_pipeline_state(&pipelines.matmul_bytes_f32);
                         enc_dot.set_buffer(layer_buf, gis_off, 0);
                         enc_dot.set_buffer(&s.normed_buf, 0, 1);
                         enc_dot.set_buffer(se_gate_buf, 0, 2);
                         enc_dot.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                        enc_dot.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(s.matmul_tg_size, 1, 1));
+                        enc_dot.dispatch_threadgroups(
+                            MTLSize::new(1, 1, 1),
+                            MTLSize::new(s.matmul_tg_size, 1, 1),
+                        );
                         enc_dot.end_encoding();
 
                         // Fused sigmoid-scale + residual add in one encoder:
                         //   x_buf[i] += sigmoid(se_gate_buf[0]) * se_down_buf[i]
                         let enc_fused = cmd.new_compute_encoder().ok_or_else(|| {
-                            RuntimeError::Compute("Failed to create encoder for shared expert sigmoid+add".into())
+                            RuntimeError::Compute(
+                                "Failed to create encoder for shared expert sigmoid+add".into(),
+                            )
                         })?;
                         if let Some(ref pso_fused) = pipelines.sigmoid_scale_add {
                             enc_fused.set_pipeline_state(pso_fused);
@@ -892,9 +1012,12 @@ impl MetalF32Backend {
                             );
                         } else {
                             // Fallback: sigmoid_scale_buffer (modifies se_down_buf in place)
-                            let pso_sig = pipelines.sigmoid_scale_buffer.as_ref().ok_or_else(|| {
-                                RuntimeError::Compute("sigmoid_scale_buffer pipeline not compiled".into())
-                            })?;
+                            let pso_sig =
+                                pipelines.sigmoid_scale_buffer.as_ref().ok_or_else(|| {
+                                    RuntimeError::Compute(
+                                        "sigmoid_scale_buffer pipeline not compiled".into(),
+                                    )
+                                })?;
                             enc_fused.set_pipeline_state(pso_sig);
                             enc_fused.set_buffer(se_gate_buf, 0, 0);
                             enc_fused.set_buffer(se_down_buf, 0, 1);
@@ -911,7 +1034,9 @@ impl MetalF32Backend {
                         // Residual add needed: either no gating, or fallback path
                         // that modified se_down_buf in-place.
                         let enc4 = cmd.new_compute_encoder().ok_or_else(|| {
-                            RuntimeError::Compute("Failed to create encoder for shared expert residual".into())
+                            RuntimeError::Compute(
+                                "Failed to create encoder for shared expert residual".into(),
+                            )
                         })?;
                         enc4.set_pipeline_state(&pipelines.add_residual);
                         enc4.set_buffer(&s.x_buf, 0, 0);
@@ -947,21 +1072,53 @@ impl MetalF32Backend {
                 RuntimeError::Compute("Failed to create encoder for shared expert down".into())
             })?;
             let tg_down = match down_quant {
-                QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_2sg); 64u64 },
-                QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); 128u64 },
-                QuantScheme::Q4_1 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_1_deferred); 128u64 },
-                QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2); 128u64 },
-                QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2); 128u64 },
-                _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32); s.matmul_tg_size },
+                QuantScheme::Q8_0 => {
+                    enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_2sg);
+                    64u64
+                }
+                QuantScheme::Q4_0 => {
+                    enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2);
+                    128u64
+                }
+                QuantScheme::Q4_1 => {
+                    enc.set_pipeline_state(&pipelines.dequant_matmul_q4_1_deferred);
+                    128u64
+                }
+                QuantScheme::F16 => {
+                    enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
+                    128u64
+                }
+                QuantScheme::Bf16 => {
+                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                    128u64
+                }
+                _ => {
+                    enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
+                    s.matmul_tg_size
+                }
             };
             enc.set_buffer(layer_buf, down_off, 0);
             enc.set_buffer(se_gate_buf, 0, 1);
             enc.set_buffer(se_down_buf, 0, 2);
             enc.set_bytes(&(se_inter as u32).to_le_bytes(), 3);
-            if matches!(down_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::Q4_1 | QuantScheme::F16 | QuantScheme::Bf16) {
+            if matches!(
+                down_quant,
+                QuantScheme::Q8_0
+                    | QuantScheme::Q4_0
+                    | QuantScheme::Q4_1
+                    | QuantScheme::F16
+                    | QuantScheme::Bf16
+            ) {
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
             }
-            let n_tg_down = match down_quant { QuantScheme::Q8_0 => ((hidden_dim as u64) + 7) / 8, QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Q4_1 => ((hidden_dim as u64) + 3) / 4, QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2, _ => hidden_dim as u64 };
+            let n_tg_down = match down_quant {
+                QuantScheme::Q8_0 => ((hidden_dim as u64) + 7) / 8,
+                QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2,
+                QuantScheme::Q4_1 => ((hidden_dim as u64) + 3) / 4,
+                QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2,
+                QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2,
+                _ => hidden_dim as u64,
+            };
             enc.dispatch_threadgroups(MTLSize::new(n_tg_down, 1, 1), MTLSize::new(tg_down, 1, 1));
             enc.end_encoding();
         }
@@ -977,13 +1134,16 @@ impl MetalF32Backend {
             enc_dot.set_buffer(&s.normed_buf, 0, 1);
             enc_dot.set_buffer(se_gate_buf, 0, 2);
             enc_dot.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-            enc_dot.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(s.matmul_tg_size, 1, 1));
+            enc_dot
+                .dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(s.matmul_tg_size, 1, 1));
             enc_dot.end_encoding();
 
             // Fused sigmoid-scale + residual add:
             //   x_buf[i] += sigmoid(se_gate_buf[0]) * se_down_buf[i]
             let enc_fused = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder for shared expert sigmoid+add".into())
+                RuntimeError::Compute(
+                    "Failed to create encoder for shared expert sigmoid+add".into(),
+                )
             })?;
             if let Some(ref pso_fused) = pipelines.sigmoid_scale_add {
                 enc_fused.set_pipeline_state(pso_fused);
@@ -1034,9 +1194,6 @@ impl MetalF32Backend {
         Ok(())
     }
 
-
-
-
     /// Fused single-encoder variant of encode_moe_ffn_decode_batched.
     pub(crate) fn encode_moe_ffn_decode_batched_fused(
         enc: &MetalComputeEncoder,
@@ -1053,19 +1210,30 @@ impl MetalF32Backend {
         let inter_dim = s.moe_expert_inter_dim;
         let top_k = s.moe_num_active_experts;
 
-        let swiglu_buf = s.moe_batched_swiglu_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("moe_batched_swiglu_buf not allocated".into())
-        })?;
+        let swiglu_buf = s
+            .moe_batched_swiglu_buf
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("moe_batched_swiglu_buf not allocated".into()))?;
 
         // Phase 1: Batched gate+up+swiglu (select kernel based on expert_gate_quant)
         {
             let pipeline = match moe_meta.expert_gate_quant {
-                QuantScheme::Q8_0 => pipelines.moe_batched_gate_up_swiglu_q8_0.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute("moe_batched_gate_up_swiglu_q8_0 pipeline not compiled".into())
-                })?,
-                _ => pipelines.moe_batched_gate_up_swiglu_q4_0.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute("moe_batched_gate_up_swiglu_q4_0 pipeline not compiled".into())
-                })?,
+                QuantScheme::Q8_0 => pipelines
+                    .moe_batched_gate_up_swiglu_q8_0
+                    .as_ref()
+                    .ok_or_else(|| {
+                        RuntimeError::Compute(
+                            "moe_batched_gate_up_swiglu_q8_0 pipeline not compiled".into(),
+                        )
+                    })?,
+                _ => pipelines
+                    .moe_batched_gate_up_swiglu_q4_0
+                    .as_ref()
+                    .ok_or_else(|| {
+                        RuntimeError::Compute(
+                            "moe_batched_gate_up_swiglu_q4_0 pipeline not compiled".into(),
+                        )
+                    })?,
             };
             enc.set_pipeline_state(pipeline);
             enc.set_buffer(layer_buf, 0, 0);
@@ -1077,10 +1245,7 @@ impl MetalF32Backend {
             enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 6);
             enc.set_bytes(&(top_k as u32).to_le_bytes(), 7);
             let n_tg = (top_k * inter_dim) as u64;
-            enc.dispatch_threadgroups(
-                MTLSize::new(n_tg, 1, 1),
-                MTLSize::new(128, 1, 1),
-            );
+            enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
         }
 
         // Barrier: Phase 1 writes swiglu_buf, Phase 2 reads it
@@ -1088,17 +1253,33 @@ impl MetalF32Backend {
 
         // Phase 2: Batched down+accum (select kernel based on expert_down_quant)
         {
-            let pipeline = match moe_meta.expert_down_quant {
-                QuantScheme::Q4_1 => pipelines.moe_batched_down_accum_q4_1.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute("moe_batched_down_accum_q4_1 pipeline not compiled".into())
-                })?,
-                QuantScheme::Q8_0 => pipelines.moe_batched_down_accum_q8_0.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute("moe_batched_down_accum_q8_0 pipeline not compiled".into())
-                })?,
-                _ => pipelines.moe_batched_down_accum_q4_0.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute("moe_batched_down_accum_q4_0 pipeline not compiled".into())
-                })?,
-            };
+            let pipeline =
+                match moe_meta.expert_down_quant {
+                    QuantScheme::Q4_1 => pipelines
+                        .moe_batched_down_accum_q4_1
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeError::Compute(
+                                "moe_batched_down_accum_q4_1 pipeline not compiled".into(),
+                            )
+                        })?,
+                    QuantScheme::Q8_0 => pipelines
+                        .moe_batched_down_accum_q8_0
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeError::Compute(
+                                "moe_batched_down_accum_q8_0 pipeline not compiled".into(),
+                            )
+                        })?,
+                    _ => pipelines
+                        .moe_batched_down_accum_q4_0
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeError::Compute(
+                                "moe_batched_down_accum_q4_0 pipeline not compiled".into(),
+                            )
+                        })?,
+                };
             enc.set_pipeline_state(pipeline);
             enc.set_buffer(layer_buf, 0, 0);
             enc.set_buffer(swiglu_buf, 0, 1);
@@ -1112,10 +1293,7 @@ impl MetalF32Backend {
             enc.set_bytes(&(top_k as u32).to_le_bytes(), 9);
             // Q8_0 down uses deferred pattern with 4 rows/TG just like Q4_0
             let n_tg = ((hidden_dim as u64) + 3) / 4;
-            enc.dispatch_threadgroups(
-                MTLSize::new(n_tg, 1, 1),
-                MTLSize::new(128, 1, 1),
-            );
+            enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
         }
 
         Ok(())
@@ -1152,13 +1330,22 @@ impl MetalF32Backend {
             let down_quant = moe_meta.expert_down_quant;
             let se_down_quant = meta.shared_expert_down_quant.unwrap_or(QuantScheme::F32);
             let fused_avail = match (down_quant, se_down_quant) {
-                (QuantScheme::Q8_0, QuantScheme::Q8_0) => pipelines.moe_batched_down_accum_shared_q8_0.is_some(),
-                (QuantScheme::Q8_0, QuantScheme::Q4_0) => pipelines.moe_batched_down_accum_shared_q8_0_se_q4_0.is_some(),
-                (QuantScheme::Q4_0, QuantScheme::Q4_0) => pipelines.moe_batched_down_accum_shared_q4_0.is_some(),
+                (QuantScheme::Q8_0, QuantScheme::Q8_0) => {
+                    pipelines.moe_batched_down_accum_shared_q8_0.is_some()
+                }
+                (QuantScheme::Q8_0, QuantScheme::Q4_0) => pipelines
+                    .moe_batched_down_accum_shared_q8_0_se_q4_0
+                    .is_some(),
+                (QuantScheme::Q4_0, QuantScheme::Q4_0) => {
+                    pipelines.moe_batched_down_accum_shared_q4_0.is_some()
+                }
                 _ => false,
             };
             fused_avail
-                && s.moe_shared_down_offsets.get(layer_idx).and_then(|o| o.as_ref()).is_some()
+                && s.moe_shared_down_offsets
+                    .get(layer_idx)
+                    .and_then(|o| o.as_ref())
+                    .is_some()
                 && s.moe_shared_gate_scalar_buf.is_some()
                 && s.shared_expert_gate_buf.is_some()
         };
@@ -1185,13 +1372,18 @@ impl MetalF32Backend {
                     && super::moe_gateup_sgrow_enabled();
                 let (pipeline, gu_threads, gu_n_tg) = if use_gateup_v2 {
                     (
-                        pipelines.moe_batched_gate_up_swiglu_q8_0_v2.as_ref().unwrap(),
+                        pipelines
+                            .moe_batched_gate_up_swiglu_q8_0_v2
+                            .as_ref()
+                            .unwrap(),
                         128u64,
                         (((top_k * inter_dim) as u64) + 3) / 4,
                     )
                 } else {
                     let p = match moe_meta.expert_gate_quant {
-                        QuantScheme::Q8_0 => pipelines.moe_batched_gate_up_swiglu_q8_0.as_ref().unwrap(),
+                        QuantScheme::Q8_0 => {
+                            pipelines.moe_batched_gate_up_swiglu_q8_0.as_ref().unwrap()
+                        }
                         _ => pipelines.moe_batched_gate_up_swiglu_q4_0.as_ref().unwrap(),
                     };
                     (p, 128u64, (top_k * inter_dim) as u64)
@@ -1217,19 +1409,19 @@ impl MetalF32Backend {
                     QuantScheme::Q8_0 => {
                         enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q8_0_2sg);
                         (64u64, ((se_inter as u64) + 7) / 8)
-                    },
+                    }
                     QuantScheme::Q4_0 => {
                         enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q4_0_deferred);
                         (128u64, se_inter as u64)
-                    },
+                    }
                     QuantScheme::Q4_1 => {
                         enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q4_1_deferred);
                         (128u64, se_inter as u64)
-                    },
+                    }
                     QuantScheme::F16 => {
                         enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
                         (128u64, ((se_inter as u64) + 1) / 2)
-                    },
+                    }
                     QuantScheme::Bf16 => {
                         enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
                         (128u64, ((se_inter as u64) + 1) / 2)
@@ -1237,7 +1429,7 @@ impl MetalF32Backend {
                     _ => {
                         enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
                         (s.matmul_tg_size, se_inter as u64)
-                    },
+                    }
                 };
                 enc.set_buffer(layer_buf, gate_off, 0);
                 enc.set_buffer(&s.normed_buf, 0, 1);
@@ -1253,13 +1445,18 @@ impl MetalF32Backend {
 
             // Dispatch 3: Gating dot product (if gate_inp_shexp exists) -- reads normed_buf (parallel)
             let has_gating = meta.ffn_gate_inp_shexp_off.is_some();
-            if let (Some(gis_off), true) = (meta.ffn_gate_inp_shexp_off, super::moe_diag_skip() != 4) {
+            if let (Some(gis_off), true) =
+                (meta.ffn_gate_inp_shexp_off, super::moe_diag_skip() != 4)
+            {
                 enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
                 enc.set_buffer(layer_buf, gis_off, 0);
                 enc.set_buffer(&s.normed_buf, 0, 1);
                 enc.set_buffer(se_gate_scalar_buf, 0, 2);
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(s.matmul_tg_size, 1, 1));
+                enc.dispatch_threadgroups(
+                    MTLSize::new(1, 1, 1),
+                    MTLSize::new(s.matmul_tg_size, 1, 1),
+                );
             }
 
             // Barrier: wait for all 3 parallel dispatches before fused phase 2
@@ -1276,52 +1473,70 @@ impl MetalF32Backend {
                 // mixed q8-routed / q4-shared production case, use the
                 // one-simdgroup-per-row redesign (2 rows/TG, 64 threads/TG,
                 // grid=ceil(hidden/2)). Default OFF -> original byte path.
-                let use_sgrow_v2 = matches!((down_quant, se_down_quant),
-                    (QuantScheme::Q8_0, QuantScheme::Q4_0))
-                    && pipelines.moe_batched_down_accum_shared_q8_0_se_q4_0_v2.is_some()
+                let use_sgrow_v2 = matches!(
+                    (down_quant, se_down_quant),
+                    (QuantScheme::Q8_0, QuantScheme::Q4_0)
+                ) && pipelines
+                    .moe_batched_down_accum_shared_q8_0_se_q4_0_v2
+                    .is_some()
                     && super::moe_down_sgrow_enabled();
                 let (pipeline, tg_threads, n_tg) = if use_sgrow_v2 {
                     (
-                        pipelines.moe_batched_down_accum_shared_q8_0_se_q4_0_v2.as_ref().unwrap(),
+                        pipelines
+                            .moe_batched_down_accum_shared_q8_0_se_q4_0_v2
+                            .as_ref()
+                            .unwrap(),
                         64u64,
                         ((hidden_dim as u64) + 1) / 2,
                     )
                 } else {
                     let p = match (down_quant, se_down_quant) {
-                        (QuantScheme::Q8_0, QuantScheme::Q8_0) => pipelines.moe_batched_down_accum_shared_q8_0.as_ref().unwrap(),
-                        (QuantScheme::Q8_0, QuantScheme::Q4_0) => pipelines.moe_batched_down_accum_shared_q8_0_se_q4_0.as_ref().unwrap(),
-                        _ => pipelines.moe_batched_down_accum_shared_q4_0.as_ref().unwrap(),
+                        (QuantScheme::Q8_0, QuantScheme::Q8_0) => pipelines
+                            .moe_batched_down_accum_shared_q8_0
+                            .as_ref()
+                            .unwrap(),
+                        (QuantScheme::Q8_0, QuantScheme::Q4_0) => pipelines
+                            .moe_batched_down_accum_shared_q8_0_se_q4_0
+                            .as_ref()
+                            .unwrap(),
+                        _ => pipelines
+                            .moe_batched_down_accum_shared_q4_0
+                            .as_ref()
+                            .unwrap(),
                     };
                     (p, 128u64, ((hidden_dim as u64) + 3) / 4)
                 };
                 enc.set_pipeline_state(pipeline);
-                enc.set_buffer(layer_buf, 0, 0);          // layer_buf
-                enc.set_buffer(swiglu_buf, 0, 1);         // swiglu_in
-                enc.set_buffer(&s.x_buf, 0, 2);           // output
-                enc.set_buffer(&s.attn_proj_buf, 0, 3);   // residual
-                enc.set_buffer(expert_ids_buf, 0, 4);     // expert_ids
+                enc.set_buffer(layer_buf, 0, 0); // layer_buf
+                enc.set_buffer(swiglu_buf, 0, 1); // swiglu_in
+                enc.set_buffer(&s.x_buf, 0, 2); // output
+                enc.set_buffer(&s.attn_proj_buf, 0, 3); // residual
+                enc.set_buffer(expert_ids_buf, 0, 4); // expert_ids
                 enc.set_buffer(expert_weights_buf, 0, 5); // expert_weights
-                enc.set_buffer(down_off_buf, 0, 6);       // down_offsets
+                enc.set_buffer(down_off_buf, 0, 6); // down_offsets
                 enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 7);
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 8);
                 enc.set_bytes(&(top_k as u32).to_le_bytes(), 9);
-                enc.set_buffer(se_gate_buf, 0, 10);       // se_swiglu
-                enc.set_buffer(se_down_off_buf, 0, 11);   // se_down_off
+                enc.set_buffer(se_gate_buf, 0, 10); // se_swiglu
+                enc.set_buffer(se_down_off_buf, 0, 11); // se_down_off
                 enc.set_buffer(se_gate_scalar_buf, 0, 12); // se_gate_scalar
                 enc.set_bytes(&(se_inter as u32).to_le_bytes(), 13);
                 let use_sigmoid: u32 = if has_gating { 1 } else { 0 };
                 enc.set_bytes(&use_sigmoid.to_le_bytes(), 14);
-                enc.dispatch_threadgroups(
-                    MTLSize::new(n_tg, 1, 1),
-                    MTLSize::new(tg_threads, 1, 1),
-                );
+                enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(tg_threads, 1, 1));
             }
         } else {
             // ==== NON-FUSED PATH: Original batched + separate shared expert ====
             Self::encode_moe_ffn_decode_batched_fused(
-                enc, pipelines, s, layer_buf, moe_meta,
-                expert_ids_buf, expert_weights_buf,
-                gate_up_off_buf, down_off_buf,
+                enc,
+                pipelines,
+                s,
+                layer_buf,
+                moe_meta,
+                expert_ids_buf,
+                expert_weights_buf,
+                gate_up_off_buf,
+                down_off_buf,
             )?;
 
             // Barrier between routed and shared expert dispatches
@@ -1335,8 +1550,15 @@ impl MetalF32Backend {
                 let gate_quant = meta.shared_expert_gate_quant.unwrap_or(QuantScheme::F32);
                 let down_quant = meta.shared_expert_down_quant.unwrap_or(QuantScheme::F32);
                 Self::encode_shared_expert_ffn_decode_fused(
-                    enc, pipelines, s, layer_buf,
-                    gate_off, up_off, down_off, gate_quant, down_quant,
+                    enc,
+                    pipelines,
+                    s,
+                    layer_buf,
+                    gate_off,
+                    up_off,
+                    down_off,
+                    gate_quant,
+                    down_quant,
                     meta.ffn_gate_inp_shexp_off,
                 )?;
             }
@@ -1361,20 +1583,31 @@ impl MetalF32Backend {
         let hidden_dim = s.hidden_dim;
         let se_inter = s.shared_expert_inter_dim;
 
-        let se_gate_buf = s.shared_expert_gate_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("shared_expert_gate_buf not allocated".into())
-        })?;
-        let se_down_buf = s.shared_expert_down_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("shared_expert_down_buf not allocated".into())
-        })?;
+        let se_gate_buf = s
+            .shared_expert_gate_buf
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("shared_expert_gate_buf not allocated".into()))?;
+        let se_down_buf = s
+            .shared_expert_down_buf
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("shared_expert_down_buf not allocated".into()))?;
 
         // Gate+Up+SwiGLU
         match gate_quant {
             QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::Q4_1 => {
                 let (se_ffn_tg, se_ffn_n_tg) = match gate_quant {
-                    QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q8_0_2sg); (64u64, ((se_inter as u64) + 7) / 8) },
-                    QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q4_0_deferred); (128u64, se_inter as u64) },
-                    QuantScheme::Q4_1 => { enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q4_1_deferred); (128u64, se_inter as u64) },
+                    QuantScheme::Q8_0 => {
+                        enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q8_0_2sg);
+                        (64u64, ((se_inter as u64) + 7) / 8)
+                    }
+                    QuantScheme::Q4_0 => {
+                        enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q4_0_deferred);
+                        (128u64, se_inter as u64)
+                    }
+                    QuantScheme::Q4_1 => {
+                        enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q4_1_deferred);
+                        (128u64, se_inter as u64)
+                    }
                     _ => unreachable!(),
                 };
                 enc.set_buffer(layer_buf, gate_off, 0);
@@ -1391,9 +1624,17 @@ impl MetalF32Backend {
             _ => {
                 // F16/F32 fallback: gate matmul
                 let (fb_pso, fb_tg, fb_n_tg) = if gate_quant == QuantScheme::F16 {
-                    (&pipelines.matmul_f16_deferred_nr2, 128u64, ((se_inter as u64) + 1) / 2)
+                    (
+                        &pipelines.matmul_f16_deferred_nr2,
+                        128u64,
+                        ((se_inter as u64) + 1) / 2,
+                    )
                 } else {
-                    (&pipelines.matmul_bytes_f32, s.matmul_tg_size, se_inter as u64)
+                    (
+                        &pipelines.matmul_bytes_f32,
+                        s.matmul_tg_size,
+                        se_inter as u64,
+                    )
                 };
                 enc.set_pipeline_state(fb_pso);
                 enc.set_buffer(layer_buf, gate_off, 0);
@@ -1403,17 +1644,11 @@ impl MetalF32Backend {
                 if gate_quant == QuantScheme::F16 {
                     enc.set_bytes(&(se_inter as u32).to_le_bytes(), 4);
                 }
-                enc.dispatch_threadgroups(
-                    MTLSize::new(fb_n_tg, 1, 1),
-                    MTLSize::new(fb_tg, 1, 1),
-                );
+                enc.dispatch_threadgroups(MTLSize::new(fb_n_tg, 1, 1), MTLSize::new(fb_tg, 1, 1));
                 // Up into down_buf as temp
                 enc.set_buffer(layer_buf, up_off, 0);
                 enc.set_buffer(se_down_buf, 0, 2);
-                enc.dispatch_threadgroups(
-                    MTLSize::new(fb_n_tg, 1, 1),
-                    MTLSize::new(fb_tg, 1, 1),
-                );
+                enc.dispatch_threadgroups(MTLSize::new(fb_n_tg, 1, 1), MTLSize::new(fb_tg, 1, 1));
                 // SwiGLU
                 enc.set_pipeline_state(&pipelines.swiglu);
                 enc.set_buffer(se_gate_buf, 0, 0);
@@ -1433,21 +1668,53 @@ impl MetalF32Backend {
         // Down projection
         {
             let tg_down = match down_quant {
-                QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_2sg); 64u64 },
-                QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); 128u64 },
-                QuantScheme::Q4_1 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_1_deferred); 128u64 },
-                QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2); 128u64 },
-                QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2); 128u64 },
-                _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32); s.matmul_tg_size },
+                QuantScheme::Q8_0 => {
+                    enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_2sg);
+                    64u64
+                }
+                QuantScheme::Q4_0 => {
+                    enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2);
+                    128u64
+                }
+                QuantScheme::Q4_1 => {
+                    enc.set_pipeline_state(&pipelines.dequant_matmul_q4_1_deferred);
+                    128u64
+                }
+                QuantScheme::F16 => {
+                    enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
+                    128u64
+                }
+                QuantScheme::Bf16 => {
+                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                    128u64
+                }
+                _ => {
+                    enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
+                    s.matmul_tg_size
+                }
             };
             enc.set_buffer(layer_buf, down_off, 0);
             enc.set_buffer(se_gate_buf, 0, 1);
             enc.set_buffer(se_down_buf, 0, 2);
             enc.set_bytes(&(se_inter as u32).to_le_bytes(), 3);
-            if matches!(down_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::Q4_1 | QuantScheme::F16 | QuantScheme::Bf16) {
+            if matches!(
+                down_quant,
+                QuantScheme::Q8_0
+                    | QuantScheme::Q4_0
+                    | QuantScheme::Q4_1
+                    | QuantScheme::F16
+                    | QuantScheme::Bf16
+            ) {
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
             }
-            let n_tg_down = match down_quant { QuantScheme::Q8_0 => ((hidden_dim as u64) + 7) / 8, QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Q4_1 => ((hidden_dim as u64) + 3) / 4, QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2, _ => hidden_dim as u64 };
+            let n_tg_down = match down_quant {
+                QuantScheme::Q8_0 => ((hidden_dim as u64) + 7) / 8,
+                QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2,
+                QuantScheme::Q4_1 => ((hidden_dim as u64) + 3) / 4,
+                QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2,
+                QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2,
+                _ => hidden_dim as u64,
+            };
             enc.dispatch_threadgroups(MTLSize::new(n_tg_down, 1, 1), MTLSize::new(tg_down, 1, 1));
         }
 
@@ -1472,9 +1739,9 @@ impl MetalF32Backend {
             // Replaces 2 dispatches (sigmoid_scale_buffer + add_residual) with 1.
             if let Some(ref pso_fused) = pipelines.sigmoid_scale_add {
                 enc.set_pipeline_state(pso_fused);
-                enc.set_buffer(se_gate_buf, 0, 0);     // scalar [1] float
-                enc.set_buffer(se_down_buf, 0, 1);      // src [dim] float (read-only)
-                enc.set_buffer(&s.x_buf, 0, 2);          // dst [dim] float (R/W)
+                enc.set_buffer(se_gate_buf, 0, 0); // scalar [1] float
+                enc.set_buffer(se_down_buf, 0, 1); // src [dim] float (read-only)
+                enc.set_buffer(&s.x_buf, 0, 2); // dst [dim] float (R/W)
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
                 let tg = 256u64.min(hidden_dim as u64).max(1);
                 enc.dispatch_threadgroups(
@@ -1550,41 +1817,54 @@ impl MetalF32Backend {
         let num_experts = scratch.moe_num_experts;
         let _top_k = scratch.moe_num_active_experts;
 
-        let router_softmax_batched = pipelines.moe_router_softmax_batched.as_ref().ok_or_else(|| {
-            RuntimeError::Compute(
-                "MoE router_softmax_batched pipeline not compiled. \
-                 Ensure MoE shader kernels are in METAL_SHADER_SOURCE.".into()
-            )
-        })?;
-        let expert_accum_batched = pipelines.moe_expert_accum_batched.as_ref().ok_or_else(|| {
-            RuntimeError::Compute(
-                "MoE expert_accum_batched pipeline not compiled. \
-                 Ensure MoE shader kernels are in METAL_SHADER_SOURCE.".into()
-            )
-        })?;
+        let router_softmax_batched =
+            pipelines
+                .moe_router_softmax_batched
+                .as_ref()
+                .ok_or_else(|| {
+                    RuntimeError::Compute(
+                        "MoE router_softmax_batched pipeline not compiled. \
+                 Ensure MoE shader kernels are in METAL_SHADER_SOURCE."
+                            .into(),
+                    )
+                })?;
+        let expert_accum_batched =
+            pipelines.moe_expert_accum_batched.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(
+                    "MoE expert_accum_batched pipeline not compiled. \
+                 Ensure MoE shader kernels are in METAL_SHADER_SOURCE."
+                        .into(),
+                )
+            })?;
 
         let batch_expert_ids_buf = scratch.moe_batch_expert_ids.as_ref().ok_or_else(|| {
             RuntimeError::Compute("MoE batch expert_ids buffer not allocated".into())
         })?;
-        let batch_expert_weights_buf = scratch.moe_batch_expert_weights.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("MoE batch expert_weights buffer not allocated".into())
-        })?;
-        let batch_expert_output_buf = scratch.moe_batch_expert_output.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("MoE batch expert_output buffer not allocated".into())
-        })?;
+        let batch_expert_weights_buf =
+            scratch.moe_batch_expert_weights.as_ref().ok_or_else(|| {
+                RuntimeError::Compute("MoE batch expert_weights buffer not allocated".into())
+            })?;
+        let batch_expert_output_buf =
+            scratch.moe_batch_expert_output.as_ref().ok_or_else(|| {
+                RuntimeError::Compute("MoE batch expert_output buffer not allocated".into())
+            })?;
 
-        let normed_buf = scratch.batch_normed_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("batch_normed_buf not allocated".into())
-        })?;
-        let gate_buf = scratch.batch_gate_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("batch_gate_buf not allocated".into())
-        })?;
-        let x_buf = scratch.batch_x_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("batch_x_buf not allocated".into())
-        })?;
-        let attn_proj_buf = scratch.batch_attn_proj_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("batch_attn_proj_buf not allocated".into())
-        })?;
+        let normed_buf = scratch
+            .batch_normed_buf
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("batch_normed_buf not allocated".into()))?;
+        let gate_buf = scratch
+            .batch_gate_buf
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("batch_gate_buf not allocated".into()))?;
+        let x_buf = scratch
+            .batch_x_buf
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("batch_x_buf not allocated".into()))?;
+        let attn_proj_buf = scratch
+            .batch_attn_proj_buf
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("batch_attn_proj_buf not allocated".into()))?;
 
         let _router_weight_quant = router_weight_quant;
 
@@ -1624,10 +1904,10 @@ impl MetalF32Backend {
         // (tile-map only) experts; other quants use Option B.
         // Byte-identical to Option B (validated md5-equal). Q4_0 requires the
         // tile-map path (no legacy dense-grid Q4 grouped GEMM).
-        let uniform_q8 = expert_gate_quant == QuantScheme::Q8_0
-            && expert_down_quant == QuantScheme::Q8_0;
-        let uniform_q4 = expert_gate_quant == QuantScheme::Q4_0
-            && expert_down_quant == QuantScheme::Q4_0;
+        let uniform_q8 =
+            expert_gate_quant == QuantScheme::Q8_0 && expert_down_quant == QuantScheme::Q8_0;
+        let uniform_q4 =
+            expert_gate_quant == QuantScheme::Q4_0 && expert_down_quant == QuantScheme::Q4_0;
         let grouped_enabled = super::moe_prefill_grouped_enabled()
             && (uniform_q8
                 || (uniform_q4
@@ -1635,186 +1915,208 @@ impl MetalF32Backend {
                     && pipelines.moe_grouped_gemm_q4_0_tilemap.is_some()));
         // DIAGNOSTIC (LUMEN_METAL_MOE_GRP_THEN_B=1): force the Option-B branch even
         // when grouped is enabled (used during bring-up to isolate grouped bugs).
-        let grouped_then_optionb = std::env::var("LUMEN_METAL_MOE_GRP_THEN_B")
-            .ok().as_deref() == Some("1");
+        let grouped_then_optionb =
+            std::env::var("LUMEN_METAL_MOE_GRP_THEN_B").ok().as_deref() == Some("1");
 
         if grouped_enabled && !grouped_then_optionb {
             // Populate moe_batch_expert_output at routed (expert, token) slots
             // only; Step 3 accum below reads it byte-identically.
             Self::encode_moe_prefill_grouped_q8_0(
-                cmd, pipelines, scratch, layer_buf, batch_size,
-                expert_gate_offs, expert_up_offs, expert_down_offs,
-                expert_gate_quant, device,
+                cmd,
+                pipelines,
+                scratch,
+                layer_buf,
+                batch_size,
+                expert_gate_offs,
+                expert_up_offs,
+                expert_down_offs,
+                expert_gate_quant,
+                device,
             )?;
         } else {
+            // DIAGNOSTIC (no-op when unset, profiling only — produces GARBAGE output):
+            // LUMEN_METAL_MOE_PREFILL_DIAG=N caps the expert FFN loop at N experts
+            // instead of all `num_experts`. Used to isolate the cost attributable to
+            // the redundant experts (Option B computes all 256, only top_k are used).
+            // Comparing N=num_experts (default) vs N=top_k quantifies the wasted
+            // (num_experts - top_k)/num_experts ≈ 96.9% expert compute.
+            let expert_loop_cap = std::env::var("LUMEN_METAL_MOE_PREFILL_DIAG")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|n| n.min(num_experts))
+                .unwrap_or(num_experts);
 
-        // DIAGNOSTIC (no-op when unset, profiling only — produces GARBAGE output):
-        // LUMEN_METAL_MOE_PREFILL_DIAG=N caps the expert FFN loop at N experts
-        // instead of all `num_experts`. Used to isolate the cost attributable to
-        // the redundant experts (Option B computes all 256, only top_k are used).
-        // Comparing N=num_experts (default) vs N=top_k quantifies the wasted
-        // (num_experts - top_k)/num_experts ≈ 96.9% expert compute.
-        let expert_loop_cap = std::env::var("LUMEN_METAL_MOE_PREFILL_DIAG")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|n| n.min(num_experts))
-            .unwrap_or(num_experts);
+            for expert_idx in 0..expert_loop_cap {
+                let gate_off = expert_gate_offs[expert_idx];
+                let up_off = expert_up_offs[expert_idx];
+                let down_off = expert_down_offs[expert_idx];
+                let expert_out_byte_off = (expert_idx * batch_size * hidden_dim * 4) as u64;
 
-        for expert_idx in 0..expert_loop_cap {
-            let gate_off = expert_gate_offs[expert_idx];
-            let up_off = expert_up_offs[expert_idx];
-            let down_off = expert_down_offs[expert_idx];
-            let expert_out_byte_off = (expert_idx * batch_size * hidden_dim * 4) as u64;
+                // Gate + Up + SwiGLU (batched tiled GEMM)
+                {
+                    let enc = cmd.new_concurrent_compute_encoder().ok_or_else(|| {
+                        RuntimeError::Compute(
+                            "Failed to create encoder for MoE batched expert FFN".into(),
+                        )
+                    })?;
 
-            // Gate + Up + SwiGLU (batched tiled GEMM)
-            {
-                let enc = cmd.new_concurrent_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder for MoE batched expert FFN".into())
-                })?;
+                    let m_u32 = batch_size as u32;
+                    let n_u32 = inter_dim as u32;
+                    let k_u32 = hidden_dim as u32;
 
-                let m_u32 = batch_size as u32;
-                let n_u32 = inter_dim as u32;
-                let k_u32 = hidden_dim as u32;
+                    match expert_gate_quant {
+                        QuantScheme::Q8_0 => {
+                            enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q8_0);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                        QuantScheme::Q4_0 => {
+                            enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q4_0);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                        QuantScheme::Q4_1 => {
+                            enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q4_1);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                        QuantScheme::F16 => {
+                            enc.set_pipeline_state(&pipelines.tiled_matmul_f16);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                        QuantScheme::Bf16 => {
+                            enc.set_pipeline_state(&pipelines.tiled_matmul_bf16);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                        _ => {
+                            enc.set_pipeline_state(&pipelines.tiled_matmul_bytes_f32);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                    }
+                    enc.set_buffer(layer_buf, gate_off, 0);
+                    enc.set_buffer(normed_buf, 0, 1);
+                    enc.set_buffer(gate_buf, 0, 2);
+                    enc.set_bytes(&m_u32.to_le_bytes(), 3);
+                    enc.set_bytes(&n_u32.to_le_bytes(), 4);
+                    enc.set_bytes(&k_u32.to_le_bytes(), 5);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(
+                            (inter_dim as u64).div_ceil(TILE_N),
+                            (batch_size as u64).div_ceil(TILE_M),
+                            1,
+                        ),
+                        MTLSize::new(128, 1, 1),
+                    );
 
-                match expert_gate_quant {
-                    QuantScheme::Q8_0 => {
-                        enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q8_0);
-                        enc.set_threadgroup_memory_length(4096, 0);
+                    let up_buf = scratch.batch_up_buf.as_ref().ok_or_else(|| {
+                        RuntimeError::Compute("batch_up_buf not allocated".into())
+                    })?;
+                    match expert_gate_quant {
+                        QuantScheme::Q8_0 => {
+                            enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q8_0);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                        QuantScheme::Q4_0 => {
+                            enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q4_0);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                        QuantScheme::Q4_1 => {
+                            enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q4_1);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                        QuantScheme::F16 => {
+                            enc.set_pipeline_state(&pipelines.tiled_matmul_f16);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                        QuantScheme::Bf16 => {
+                            enc.set_pipeline_state(&pipelines.tiled_matmul_bf16);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                        _ => {
+                            enc.set_pipeline_state(&pipelines.tiled_matmul_bytes_f32);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
                     }
-                    QuantScheme::Q4_0 => {
-                        enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q4_0);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
-                    QuantScheme::Q4_1 => {
-                        enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q4_1);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
-                    QuantScheme::F16 => {
-                        enc.set_pipeline_state(&pipelines.tiled_matmul_f16);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
-                    QuantScheme::Bf16 => {
-                        enc.set_pipeline_state(&pipelines.tiled_matmul_bf16);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
-                    _ => {
-                        enc.set_pipeline_state(&pipelines.tiled_matmul_bytes_f32);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
+                    enc.set_buffer(layer_buf, up_off, 0);
+                    enc.set_buffer(normed_buf, 0, 1);
+                    enc.set_buffer(up_buf, 0, 2);
+                    enc.set_bytes(&m_u32.to_le_bytes(), 3);
+                    enc.set_bytes(&n_u32.to_le_bytes(), 4);
+                    enc.set_bytes(&k_u32.to_le_bytes(), 5);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(
+                            (inter_dim as u64).div_ceil(TILE_N),
+                            (batch_size as u64).div_ceil(TILE_M),
+                            1,
+                        ),
+                        MTLSize::new(128, 1, 1),
+                    );
+
+                    enc.memory_barrier_with_scope(1);
+
+                    let total_elems = (batch_size * inter_dim) as u32;
+                    enc.set_pipeline_state(&pipelines.swiglu_batched);
+                    enc.set_buffer(gate_buf, 0, 0);
+                    enc.set_buffer(up_buf, 0, 1);
+                    enc.set_bytes(&total_elems.to_le_bytes(), 2);
+                    let tg_swiglu = 256u64.min(total_elems as u64).max(1);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new((total_elems as u64).div_ceil(tg_swiglu), 1, 1),
+                        MTLSize::new(tg_swiglu, 1, 1),
+                    );
+                    enc.end_encoding();
                 }
-                enc.set_buffer(layer_buf, gate_off, 0);
-                enc.set_buffer(normed_buf, 0, 1);
-                enc.set_buffer(gate_buf, 0, 2);
-                enc.set_bytes(&m_u32.to_le_bytes(), 3);
-                enc.set_bytes(&n_u32.to_le_bytes(), 4);
-                enc.set_bytes(&k_u32.to_le_bytes(), 5);
-                enc.dispatch_threadgroups(
-                    MTLSize::new((inter_dim as u64).div_ceil(TILE_N), (batch_size as u64).div_ceil(TILE_M), 1),
-                    MTLSize::new(128, 1, 1),
-                );
 
-                let up_buf = scratch.batch_up_buf.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute("batch_up_buf not allocated".into())
-                })?;
-                match expert_gate_quant {
-                    QuantScheme::Q8_0 => {
-                        enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q8_0);
-                        enc.set_threadgroup_memory_length(4096, 0);
+                // Down projection -> expert_output_buf at expert_idx offset
+                {
+                    let enc = cmd.new_compute_encoder().ok_or_else(|| {
+                        RuntimeError::Compute(
+                            "Failed to create encoder for MoE batched down proj".into(),
+                        )
+                    })?;
+                    let m_u32 = batch_size as u32;
+                    let n_u32 = hidden_dim as u32;
+                    let k_u32 = inter_dim as u32;
+                    match expert_down_quant {
+                        QuantScheme::Q8_0 => {
+                            enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q8_0);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                        QuantScheme::Q4_0 => {
+                            enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q4_0);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                        QuantScheme::Q4_1 => {
+                            enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q4_1);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                        QuantScheme::F16 => {
+                            enc.set_pipeline_state(&pipelines.tiled_matmul_f16);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                        QuantScheme::Bf16 => {
+                            enc.set_pipeline_state(&pipelines.tiled_matmul_bf16);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
+                        _ => {
+                            enc.set_pipeline_state(&pipelines.tiled_matmul_bytes_f32);
+                            enc.set_threadgroup_memory_length(4096, 0);
+                        }
                     }
-                    QuantScheme::Q4_0 => {
-                        enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q4_0);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
-                    QuantScheme::Q4_1 => {
-                        enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q4_1);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
-                    QuantScheme::F16 => {
-                        enc.set_pipeline_state(&pipelines.tiled_matmul_f16);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
-                    QuantScheme::Bf16 => {
-                        enc.set_pipeline_state(&pipelines.tiled_matmul_bf16);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
-                    _ => {
-                        enc.set_pipeline_state(&pipelines.tiled_matmul_bytes_f32);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
+                    enc.set_buffer(layer_buf, down_off, 0);
+                    enc.set_buffer(gate_buf, 0, 1);
+                    enc.set_buffer(batch_expert_output_buf, expert_out_byte_off, 2);
+                    enc.set_bytes(&m_u32.to_le_bytes(), 3);
+                    enc.set_bytes(&n_u32.to_le_bytes(), 4);
+                    enc.set_bytes(&k_u32.to_le_bytes(), 5);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(
+                            (hidden_dim as u64).div_ceil(TILE_N),
+                            (batch_size as u64).div_ceil(TILE_M),
+                            1,
+                        ),
+                        MTLSize::new(128, 1, 1),
+                    );
+                    enc.end_encoding();
                 }
-                enc.set_buffer(layer_buf, up_off, 0);
-                enc.set_buffer(normed_buf, 0, 1);
-                enc.set_buffer(up_buf, 0, 2);
-                enc.set_bytes(&m_u32.to_le_bytes(), 3);
-                enc.set_bytes(&n_u32.to_le_bytes(), 4);
-                enc.set_bytes(&k_u32.to_le_bytes(), 5);
-                enc.dispatch_threadgroups(
-                    MTLSize::new((inter_dim as u64).div_ceil(TILE_N), (batch_size as u64).div_ceil(TILE_M), 1),
-                    MTLSize::new(128, 1, 1),
-                );
-
-                enc.memory_barrier_with_scope(1);
-
-                let total_elems = (batch_size * inter_dim) as u32;
-                enc.set_pipeline_state(&pipelines.swiglu_batched);
-                enc.set_buffer(gate_buf, 0, 0);
-                enc.set_buffer(up_buf, 0, 1);
-                enc.set_bytes(&total_elems.to_le_bytes(), 2);
-                let tg_swiglu = 256u64.min(total_elems as u64).max(1);
-                enc.dispatch_threadgroups(
-                    MTLSize::new((total_elems as u64).div_ceil(tg_swiglu), 1, 1),
-                    MTLSize::new(tg_swiglu, 1, 1),
-                );
-                enc.end_encoding();
             }
-
-            // Down projection -> expert_output_buf at expert_idx offset
-            {
-                let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder for MoE batched down proj".into())
-                })?;
-                let m_u32 = batch_size as u32;
-                let n_u32 = hidden_dim as u32;
-                let k_u32 = inter_dim as u32;
-                match expert_down_quant {
-                    QuantScheme::Q8_0 => {
-                        enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q8_0);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
-                    QuantScheme::Q4_0 => {
-                        enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q4_0);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
-                    QuantScheme::Q4_1 => {
-                        enc.set_pipeline_state(&pipelines.dequant_tiled_matmul_q4_1);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
-                    QuantScheme::F16 => {
-                        enc.set_pipeline_state(&pipelines.tiled_matmul_f16);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
-                    QuantScheme::Bf16 => {
-                        enc.set_pipeline_state(&pipelines.tiled_matmul_bf16);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
-                    _ => {
-                        enc.set_pipeline_state(&pipelines.tiled_matmul_bytes_f32);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
-                }
-                enc.set_buffer(layer_buf, down_off, 0);
-                enc.set_buffer(gate_buf, 0, 1);
-                enc.set_buffer(batch_expert_output_buf, expert_out_byte_off, 2);
-                enc.set_bytes(&m_u32.to_le_bytes(), 3);
-                enc.set_bytes(&n_u32.to_le_bytes(), 4);
-                enc.set_bytes(&k_u32.to_le_bytes(), 5);
-                enc.dispatch_threadgroups(
-                    MTLSize::new((hidden_dim as u64).div_ceil(TILE_N), (batch_size as u64).div_ceil(TILE_M), 1),
-                    MTLSize::new(128, 1, 1),
-                );
-                enc.end_encoding();
-            }
-        }
         } // end else (Option B expert loop)
 
         // ---- Step 3: Batched weighted accumulation + residual ----
@@ -1833,10 +2135,7 @@ impl MetalF32Backend {
             enc.set_bytes(&(batch_size as u32).to_le_bytes(), 7);
             let total_elems = (batch_size * hidden_dim) as u64;
             let tg_count = total_elems.div_ceil(256);
-            enc.dispatch_threadgroups(
-                MTLSize::new(tg_count, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
+            enc.dispatch_threadgroups(MTLSize::new(tg_count, 1, 1), MTLSize::new(256, 1, 1));
             enc.end_encoding();
         }
 
@@ -1884,14 +2183,18 @@ impl MetalF32Backend {
         macro_rules! pso {
             ($field:ident, $name:expr) => {
                 pipelines.$field.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute(concat!("MoE grouped: ", $name, " pipeline not compiled").into())
+                    RuntimeError::Compute(
+                        concat!("MoE grouped: ", $name, " pipeline not compiled").into(),
+                    )
                 })?
             };
         }
         macro_rules! buf {
             ($field:ident, $name:expr) => {
                 scratch.$field.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute(concat!("MoE grouped: ", $name, " buffer not allocated").into())
+                    RuntimeError::Compute(
+                        concat!("MoE grouped: ", $name, " buffer not allocated").into(),
+                    )
                 })?
             };
         }
@@ -1953,14 +2256,16 @@ impl MetalF32Backend {
         // so each layer's GEMM reads its own offsets. (The other grouped scratch
         // buffers are safe to share because they are written by GPU kernels
         // during CB execution, hence ordered per-layer.)
-        let offs_to_bytes = |offs: &[u64]| -> Vec<u8> {
-            offs.iter().flat_map(|v| v.to_le_bytes()).collect()
-        };
-        let gate_woff = device.new_buffer_with_bytes(&offs_to_bytes(expert_gate_offs))
+        let offs_to_bytes =
+            |offs: &[u64]| -> Vec<u8> { offs.iter().flat_map(|v| v.to_le_bytes()).collect() };
+        let gate_woff = device
+            .new_buffer_with_bytes(&offs_to_bytes(expert_gate_offs))
             .ok_or_else(|| RuntimeError::Compute("MoE grouped: gate_woff alloc".into()))?;
-        let up_woff = device.new_buffer_with_bytes(&offs_to_bytes(expert_up_offs))
+        let up_woff = device
+            .new_buffer_with_bytes(&offs_to_bytes(expert_up_offs))
             .ok_or_else(|| RuntimeError::Compute("MoE grouped: up_woff alloc".into()))?;
-        let down_woff = device.new_buffer_with_bytes(&offs_to_bytes(expert_down_offs))
+        let down_woff = device
+            .new_buffer_with_bytes(&offs_to_bytes(expert_down_offs))
             .ok_or_else(|| RuntimeError::Compute("MoE grouped: down_woff alloc".into()))?;
         let gate_woff = &gate_woff;
         let up_woff = &up_woff;
@@ -1992,9 +2297,9 @@ impl MetalF32Backend {
         // profile flag; production keeps ONE encoder with explicit barriers.
         let census = super::profile::is_gdn_deep_enabled();
         let max_m_tiles = (batch_size as u64).div_ceil(32);
-        let mut enc = cmd.new_compute_encoder().ok_or_else(|| {
-            RuntimeError::Compute("MoE grouped: encoder".into())
-        })?;
+        let mut enc = cmd
+            .new_compute_encoder()
+            .ok_or_else(|| RuntimeError::Compute("MoE grouped: encoder".into()))?;
         let tg_ne = (256u64).min(num_experts as u64).max(1);
         // Number of work-tiles to dispatch when the tile-map path is
         // on. Bound = ceil(total_assign/TILE_M) + num_experts (each expert adds
@@ -2075,7 +2380,8 @@ impl MetalF32Backend {
         };
         enc.dispatch_threadgroups(
             MTLSize::new(gather_elems.div_ceil(256), 1, 1),
-            MTLSize::new(256, 1, 1));
+            MTLSize::new(256, 1, 1),
+        );
         enc.memory_barrier_with_scope(1);
         census_boundary!("moe/grp_4_gate_up_gemm");
 
@@ -2098,7 +2404,8 @@ impl MetalF32Backend {
                     enc.set_buffer(tile_map_buf.unwrap(), 0, 8);
                     enc.dispatch_threadgroups(
                         MTLSize::new(($n as u64).div_ceil(32), tile_bound, 1),
-                        MTLSize::new(128, 1, 1));
+                        MTLSize::new(128, 1, 1),
+                    );
                 } else {
                     enc.set_pipeline_state(grouped_gemm);
                     enc.set_buffer(layer_buf, 0, 0);
@@ -2111,7 +2418,8 @@ impl MetalF32Backend {
                     enc.set_bytes(&ne_u32.to_le_bytes(), 7);
                     enc.dispatch_threadgroups(
                         MTLSize::new(($n as u64).div_ceil(32), max_m_tiles, num_experts as u64),
-                        MTLSize::new(128, 1, 1));
+                        MTLSize::new(128, 1, 1),
+                    );
                 }
             };
         }
@@ -2131,7 +2439,8 @@ impl MetalF32Backend {
         let tg_sw = 256u64.min(total_elems as u64).max(1);
         enc.dispatch_threadgroups(
             MTLSize::new((total_elems as u64).div_ceil(tg_sw), 1, 1),
-            MTLSize::new(tg_sw, 1, 1));
+            MTLSize::new(tg_sw, 1, 1),
+        );
         enc.memory_barrier_with_scope(1);
         census_boundary!("moe/grp_6_down_gemm");
 
@@ -2157,7 +2466,8 @@ impl MetalF32Backend {
         };
         enc.dispatch_threadgroups(
             MTLSize::new(scatter_elems.div_ceil(256), 1, 1),
-            MTLSize::new(256, 1, 1));
+            MTLSize::new(256, 1, 1),
+        );
         enc.end_encoding();
 
         Ok(())
@@ -2201,24 +2511,27 @@ impl MetalF32Backend {
         let pipelines = self.pipelines.as_ref().ok_or_else(|| {
             RuntimeError::Compute("Metal pipelines not initialized: call init() first".into())
         })?;
-        let embedding_buf = self.embedding_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("Embedding buffer not initialized".into())
-        })?;
-        let final_norm_buf = self.final_norm_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("Final norm buffer not initialized".into())
-        })?;
-        let output_proj_buf = self.output_proj_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("Output proj buffer not initialized".into())
-        })?;
+        let embedding_buf = self
+            .embedding_buf
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("Embedding buffer not initialized".into()))?;
+        let final_norm_buf = self
+            .final_norm_buf
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("Final norm buffer not initialized".into()))?;
+        let output_proj_buf = self
+            .output_proj_buf
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("Output proj buffer not initialized".into()))?;
         let output_proj_quant = self.output_proj_quant;
 
         let seq_pos = kv.seq_len();
 
         // Single mutex acquisition for the entire token.
         let mut scratch_guard = self.scratch.lock().unwrap();
-        let s = scratch_guard.as_mut().ok_or_else(|| {
-            RuntimeError::Compute("Metal scratch not initialized".into())
-        })?;
+        let s = scratch_guard
+            .as_mut()
+            .ok_or_else(|| RuntimeError::Compute("Metal scratch not initialized".into()))?;
         if let Some(prev_cmd) = s.last_async_cmd.take() {
             prev_cmd.wait_until_completed();
         }
@@ -2249,7 +2562,9 @@ impl MetalF32Backend {
 
         // Start the first command buffer: embed + first layer's attention.
         let mut cmd = self.queue.new_command_buffer().ok_or_else(|| {
-            RuntimeError::Compute("Failed to create command buffer for Option A GPU-resident decode".into())
+            RuntimeError::Compute(
+                "Failed to create command buffer for Option A GPU-resident decode".into(),
+            )
         })?;
 
         // --- Embed token into x_buf ---
@@ -2260,9 +2575,9 @@ impl MetalF32Backend {
                 (embedding_buf, 0u64)
             };
         {
-            let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder".into())
-            })?;
+            let enc = cmd
+                .new_compute_encoder()
+                .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
             match self.embedding_quant {
                 QuantScheme::Q8_0 => enc.set_pipeline_state(&pipelines.embed_token_q8_0),
                 QuantScheme::Q4_0 => enc.set_pipeline_state(&pipelines.embed_token_q4_0),
@@ -2310,228 +2625,236 @@ impl MetalF32Backend {
             // and FFN block proceed as normal (shared path below).
             // ================================================================
             if meta.gdn_layer_idx.is_none() {
-
-            // Attention RMSNorm
-            {
-                let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder".into())
-                })?;
-                enc.set_pipeline_state(&pipelines.rmsnorm_bytes);
-                enc.set_buffer(&s.x_buf, 0, 0);
-                enc.set_buffer(layer_buf, attn_norm_off, 1);
-                enc.set_buffer(&s.normed_buf, 0, 2);
-                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                enc.set_bytes(&eps.to_le_bytes(), 4);
-                enc.dispatch_threadgroups(
-                    MTLSize::new(1, 1, 1),
-                    MTLSize::new(norm_tg_size, 1, 1),
-                );
-                enc.end_encoding();
-            }
-            // Fused QKV projection (+ fused bias for Qwen2-family models)
-            {
-                let has_bias = meta.bq_off.is_some() && meta.bk_off.is_some() && meta.bv_off.is_some();
-                let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder".into())
-                })?;
-                let tg = if has_bias && matches!(meta.wq_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
-                    match meta.wq_quant {
-                        QuantScheme::Q8_0 => enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_bias_nr2),
-                        QuantScheme::Q4_0 => enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_bias_nr2),
-                        QuantScheme::F16 => enc.set_pipeline_state(&pipelines.matmul_f16_deferred_bias_nr2),
-                        QuantScheme::Bf16 => enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_bias_nr2),
-                        _ => unreachable!(),
-                    };
-                    128u64
-                } else {
-                    match meta.wq_quant {
-                        QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2); 128u64 },
-                        QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); 128u64 },
-                        QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2); 128u64 },
-                        QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2); 128u64 },
-                        _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32); matmul_tg_size },
-                    }
-                };
-                enc.set_buffer(layer_buf, wq_off, 0);
-                enc.set_buffer(&s.normed_buf, 0, 1);
-                enc.set_buffer(&s.qkv_buf, 0, 2);
-                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                if matches!(meta.wq_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
-                    enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 4);
-                }
-                if has_bias && matches!(meta.wq_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
-                    enc.set_buffer(layer_buf, meta.bq_off.unwrap(), 5);
-                    enc.set_buffer(layer_buf, meta.bk_off.unwrap(), 6);
-                    enc.set_buffer(layer_buf, meta.bv_off.unwrap(), 7);
-                    enc.set_bytes(&(q_dim as u32).to_le_bytes(), 8);
-                    let qk_dim = (q_dim + kv_dim) as u32;
-                    enc.set_bytes(&qk_dim.to_le_bytes(), 9);
-                }
-                let n_tg = if tg == 64 {
-                    ((qkv_dim as u64) + 7) / 8  // (dead path: Q8_0 now uses deferred with tg=128)
-                } else {
-                    match meta.wq_quant { QuantScheme::Q8_0 => ((qkv_dim as u64) + 1) / 2, QuantScheme::Q4_0 => ((qkv_dim as u64) + 1) / 2, QuantScheme::F16 => ((qkv_dim as u64) + 1) / 2, QuantScheme::Bf16 => ((qkv_dim as u64) + 1) / 2, _ => qkv_dim as u64 }
-                };
-                enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(tg, 1, 1));
-                enc.end_encoding();
-            }
-            // QKV bias addition fallback (only for F32 weights with bias, rare)
-            if !matches!(meta.wq_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16)
-                && (meta.bq_off.is_some() || meta.bk_off.is_some() || meta.bv_off.is_some())
-            {
-                let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder for QKV bias".into())
-                })?;
-                enc.set_pipeline_state(&pipelines.bias_add);
-                if let Some(bq_off) = meta.bq_off {
-                    enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
-                    enc.set_buffer(layer_buf, bq_off, 1);
-                    enc.set_bytes(&(q_dim as u32).to_le_bytes(), 2);
-                    let n_tg_bq = (q_dim as u64 + 255) / 256;
-                    enc.dispatch_threadgroups(MTLSize::new(n_tg_bq, 1, 1), MTLSize::new(256, 1, 1));
-                }
-                if let Some(bk_off) = meta.bk_off {
-                    enc.set_buffer(&s.qkv_buf, k_byte_off, 0);
-                    enc.set_buffer(layer_buf, bk_off, 1);
-                    enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 2);
-                    let n_tg_bk = (kv_dim as u64 + 255) / 256;
-                    enc.dispatch_threadgroups(MTLSize::new(n_tg_bk, 1, 1), MTLSize::new(256, 1, 1));
-                }
-                if let Some(bv_off) = meta.bv_off {
-                    enc.set_buffer(&s.qkv_buf, v_byte_off, 0);
-                    enc.set_buffer(layer_buf, bv_off, 1);
-                    enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 2);
-                    let n_tg_bv = (kv_dim as u64 + 255) / 256;
-                    enc.dispatch_threadgroups(MTLSize::new(n_tg_bv, 1, 1), MTLSize::new(256, 1, 1));
-                }
-                enc.end_encoding();
-            }
-            // Fused RoPE Q + RoPE K + KV cache write (1 dispatch instead of 3)
-            let is_linear_attn = meta.layer_type == Some(1);
-            let rope_half_dim = s.rotary_dim / 2;
-            let use_fused_rope_kv = !is_linear_attn && s.rotary_dim == head_dim;
-            if use_fused_rope_kv {
-                let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder".into())
-                })?;
-                let pos_offset_u32 = (seq_pos * rope_half_dim) as u32;
-                let fused_pipe = if s.rope_neox {
-                    pipelines.fused_rope_neox_kv_write.as_ref().unwrap_or(&pipelines.fused_rope_kv_write)
-                } else {
-                    &pipelines.fused_rope_kv_write
-                };
-                enc.set_pipeline_state(fused_pipe);
-                enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
-                enc.set_buffer(&s.qkv_buf, k_byte_off, 1);
-                enc.set_buffer(&s.qkv_buf, v_byte_off, 2);
-                enc.set_buffer(&s.rope_cos_buf, 0, 3);
-                enc.set_buffer(&s.rope_sin_buf, 0, 4);
-                enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 5);
-                enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 6);
-                enc.set_bytes(&(num_heads as u32).to_le_bytes(), 7);
-                enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 8);
-                enc.set_bytes(&(head_dim as u32).to_le_bytes(), 9);
-                enc.set_bytes(&(rope_half_dim as u32).to_le_bytes(), 10);
-                enc.set_bytes(&pos_offset_u32.to_le_bytes(), 11);
-                enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 12);
-                enc.set_bytes(&(seq_pos as u32).to_le_bytes(), 13);
-                enc.set_bytes(&(s.max_seq_len as u32).to_le_bytes(), 14);
-                let total_threads = (num_heads * rope_half_dim + num_kv_heads * rope_half_dim + kv_dim) as u64;
-                let tg = 64u64.min(total_threads.max(1));
-                enc.dispatch_threadgroups(
-                    MTLSize::new(total_threads.div_ceil(tg), 1, 1),
-                    MTLSize::new(tg, 1, 1),
-                );
-                enc.end_encoding();
-            } else {
-                if !is_linear_attn {
-                    let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                        RuntimeError::Compute("Failed to create encoder".into())
-                    })?;
-                    let pos_offset_u32 = (seq_pos * rope_half_dim) as u32;
-                    let rope_pipe = if s.rope_neox {
-                        pipelines.rope_neox.as_ref().unwrap_or(&pipelines.rope)
-                    } else {
-                        &pipelines.rope
-                    };
-                    enc.set_pipeline_state(rope_pipe);
-                    enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
-                    enc.set_buffer(&s.rope_cos_buf, 0, 1);
-                    enc.set_buffer(&s.rope_sin_buf, 0, 2);
-                    enc.set_bytes(&(num_heads as u32).to_le_bytes(), 3);
-                    enc.set_bytes(&(head_dim as u32).to_le_bytes(), 4);
-                    enc.set_bytes(&(rope_half_dim as u32).to_le_bytes(), 5);
-                    enc.set_bytes(&pos_offset_u32.to_le_bytes(), 6);
-                    let q_total_half = (num_heads * rope_half_dim) as u64;
-                    let tg_q = 64u64.min(q_total_half.max(1));
+                // Attention RMSNorm
+                {
+                    let enc = cmd
+                        .new_compute_encoder()
+                        .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
+                    enc.set_pipeline_state(&pipelines.rmsnorm_bytes);
+                    enc.set_buffer(&s.x_buf, 0, 0);
+                    enc.set_buffer(layer_buf, attn_norm_off, 1);
+                    enc.set_buffer(&s.normed_buf, 0, 2);
+                    enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                    enc.set_bytes(&eps.to_le_bytes(), 4);
                     enc.dispatch_threadgroups(
-                        MTLSize::new(q_total_half.div_ceil(tg_q), 1, 1),
-                        MTLSize::new(tg_q, 1, 1),
-                    );
-                    enc.set_buffer(&s.qkv_buf, k_byte_off, 0);
-                    enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 3);
-                    let k_total_half = (num_kv_heads * rope_half_dim) as u64;
-                    let tg_k = 64u64.min(k_total_half.max(1));
-                    enc.dispatch_threadgroups(
-                        MTLSize::new(k_total_half.div_ceil(tg_k), 1, 1),
-                        MTLSize::new(tg_k, 1, 1),
+                        MTLSize::new(1, 1, 1),
+                        MTLSize::new(norm_tg_size, 1, 1),
                     );
                     enc.end_encoding();
                 }
+                // Fused QKV projection (+ fused bias for Qwen2-family models)
+                {
+                    let has_bias =
+                        meta.bq_off.is_some() && meta.bk_off.is_some() && meta.bv_off.is_some();
+                    let enc = cmd
+                        .new_compute_encoder()
+                        .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
+                    let tg = if has_bias
+                        && matches!(
+                            meta.wq_quant,
+                            QuantScheme::Q8_0
+                                | QuantScheme::Q4_0
+                                | QuantScheme::F16
+                                | QuantScheme::Bf16
+                        ) {
+                        match meta.wq_quant {
+                            QuantScheme::Q8_0 => enc.set_pipeline_state(
+                                &pipelines.dequant_matmul_q8_0_deferred_bias_nr2,
+                            ),
+                            QuantScheme::Q4_0 => enc.set_pipeline_state(
+                                &pipelines.dequant_matmul_q4_0_deferred_bias_nr2,
+                            ),
+                            QuantScheme::F16 => {
+                                enc.set_pipeline_state(&pipelines.matmul_f16_deferred_bias_nr2)
+                            }
+                            QuantScheme::Bf16 => {
+                                enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_bias_nr2)
+                            }
+                            _ => unreachable!(),
+                        };
+                        128u64
+                    } else {
+                        match meta.wq_quant {
+                            QuantScheme::Q8_0 => {
+                                enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2);
+                                128u64
+                            }
+                            QuantScheme::Q4_0 => {
+                                enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2);
+                                128u64
+                            }
+                            QuantScheme::F16 => {
+                                enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
+                                128u64
+                            }
+                            QuantScheme::Bf16 => {
+                                enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                                128u64
+                            }
+                            _ => {
+                                enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
+                                matmul_tg_size
+                            }
+                        }
+                    };
+                    enc.set_buffer(layer_buf, wq_off, 0);
+                    enc.set_buffer(&s.normed_buf, 0, 1);
+                    enc.set_buffer(&s.qkv_buf, 0, 2);
+                    enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                    if matches!(
+                        meta.wq_quant,
+                        QuantScheme::Q8_0
+                            | QuantScheme::Q4_0
+                            | QuantScheme::F16
+                            | QuantScheme::Bf16
+                    ) {
+                        enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 4);
+                    }
+                    if has_bias
+                        && matches!(
+                            meta.wq_quant,
+                            QuantScheme::Q8_0
+                                | QuantScheme::Q4_0
+                                | QuantScheme::F16
+                                | QuantScheme::Bf16
+                        )
+                    {
+                        enc.set_buffer(layer_buf, meta.bq_off.unwrap(), 5);
+                        enc.set_buffer(layer_buf, meta.bk_off.unwrap(), 6);
+                        enc.set_buffer(layer_buf, meta.bv_off.unwrap(), 7);
+                        enc.set_bytes(&(q_dim as u32).to_le_bytes(), 8);
+                        let qk_dim = (q_dim + kv_dim) as u32;
+                        enc.set_bytes(&qk_dim.to_le_bytes(), 9);
+                    }
+                    let n_tg = if tg == 64 {
+                        ((qkv_dim as u64) + 7) / 8 // (dead path: Q8_0 now uses deferred with tg=128)
+                    } else {
+                        match meta.wq_quant {
+                            QuantScheme::Q8_0 => ((qkv_dim as u64) + 1) / 2,
+                            QuantScheme::Q4_0 => ((qkv_dim as u64) + 1) / 2,
+                            QuantScheme::F16 => ((qkv_dim as u64) + 1) / 2,
+                            QuantScheme::Bf16 => ((qkv_dim as u64) + 1) / 2,
+                            _ => qkv_dim as u64,
+                        }
+                    };
+                    enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(tg, 1, 1));
+                    enc.end_encoding();
+                }
+                // QKV bias addition fallback (only for F32 weights with bias, rare)
+                if !matches!(
+                    meta.wq_quant,
+                    QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
+                ) && (meta.bq_off.is_some() || meta.bk_off.is_some() || meta.bv_off.is_some())
                 {
                     let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                        RuntimeError::Compute("Failed to create encoder".into())
+                        RuntimeError::Compute("Failed to create encoder for QKV bias".into())
                     })?;
-                    enc.set_pipeline_state(&pipelines.write_kv_cache);
-                    enc.set_buffer(&s.qkv_buf, k_byte_off, 0);
-                    enc.set_buffer(&s.qkv_buf, v_byte_off, 1);
-                    enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 2);
-                    enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 3);
-                    enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
-                    enc.set_bytes(&(seq_pos as u32).to_le_bytes(), 5);
-                    enc.set_bytes(&(s.max_seq_len as u32).to_le_bytes(), 6);
-                    let tg = 64u64.min(kv_dim as u64).max(1);
+                    enc.set_pipeline_state(&pipelines.bias_add);
+                    if let Some(bq_off) = meta.bq_off {
+                        enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
+                        enc.set_buffer(layer_buf, bq_off, 1);
+                        enc.set_bytes(&(q_dim as u32).to_le_bytes(), 2);
+                        let n_tg_bq = (q_dim as u64 + 255) / 256;
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(n_tg_bq, 1, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                    }
+                    if let Some(bk_off) = meta.bk_off {
+                        enc.set_buffer(&s.qkv_buf, k_byte_off, 0);
+                        enc.set_buffer(layer_buf, bk_off, 1);
+                        enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 2);
+                        let n_tg_bk = (kv_dim as u64 + 255) / 256;
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(n_tg_bk, 1, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                    }
+                    if let Some(bv_off) = meta.bv_off {
+                        enc.set_buffer(&s.qkv_buf, v_byte_off, 0);
+                        enc.set_buffer(layer_buf, bv_off, 1);
+                        enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 2);
+                        let n_tg_bv = (kv_dim as u64 + 255) / 256;
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(n_tg_bv, 1, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                    }
+                    enc.end_encoding();
+                }
+                // Fused RoPE Q + RoPE K + KV cache write (1 dispatch instead of 3)
+                let is_linear_attn = meta.layer_type == Some(1);
+                let rope_half_dim = s.rotary_dim / 2;
+                let use_fused_rope_kv = !is_linear_attn && s.rotary_dim == head_dim;
+                if use_fused_rope_kv {
+                    let enc = cmd
+                        .new_compute_encoder()
+                        .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
+                    let pos_offset_u32 = (seq_pos * rope_half_dim) as u32;
+                    let fused_pipe = if s.rope_neox {
+                        pipelines
+                            .fused_rope_neox_kv_write
+                            .as_ref()
+                            .unwrap_or(&pipelines.fused_rope_kv_write)
+                    } else {
+                        &pipelines.fused_rope_kv_write
+                    };
+                    enc.set_pipeline_state(fused_pipe);
+                    enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
+                    enc.set_buffer(&s.qkv_buf, k_byte_off, 1);
+                    enc.set_buffer(&s.qkv_buf, v_byte_off, 2);
+                    enc.set_buffer(&s.rope_cos_buf, 0, 3);
+                    enc.set_buffer(&s.rope_sin_buf, 0, 4);
+                    enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 5);
+                    enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 6);
+                    enc.set_bytes(&(num_heads as u32).to_le_bytes(), 7);
+                    enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 8);
+                    enc.set_bytes(&(head_dim as u32).to_le_bytes(), 9);
+                    enc.set_bytes(&(rope_half_dim as u32).to_le_bytes(), 10);
+                    enc.set_bytes(&pos_offset_u32.to_le_bytes(), 11);
+                    enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 12);
+                    enc.set_bytes(&(seq_pos as u32).to_le_bytes(), 13);
+                    enc.set_bytes(&(s.max_seq_len as u32).to_le_bytes(), 14);
+                    let total_threads =
+                        (num_heads * rope_half_dim + num_kv_heads * rope_half_dim + kv_dim) as u64;
+                    let tg = 64u64.min(total_threads.max(1));
                     enc.dispatch_threadgroups(
-                        MTLSize::new((kv_dim as u64).div_ceil(tg), 1, 1),
+                        MTLSize::new(total_threads.div_ceil(tg), 1, 1),
                         MTLSize::new(tg, 1, 1),
                     );
                     enc.end_encoding();
-                }
-            }
-            // Attention (flash decode or MHA)
-            {
-                let num_heads_u32 = num_heads as u32;
-                let num_kv_heads_u32 = num_kv_heads as u32;
-                let head_dim_u32 = head_dim as u32;
-                let kv_dim_u32 = kv_dim as u32;
-                let seq_len_u32 = new_seq_len as u32;
-                let max_seq_len_u32 = s.max_seq_len as u32;
-                const FLASH_DECODE_TILE_SIZE: u32 = 256;
-                const FLASH_DECODE_THRESHOLD: usize = FLASH_DECODE_TILE_SIZE as usize + 1; // 257: single-tile is a no-op reduce
-
-                if new_seq_len >= FLASH_DECODE_THRESHOLD {
-                    let num_tiles = ((new_seq_len as u32) + FLASH_DECODE_TILE_SIZE - 1) / FLASH_DECODE_TILE_SIZE;
-                    {
+                } else {
+                    if !is_linear_attn {
                         let enc = cmd.new_compute_encoder().ok_or_else(|| {
                             RuntimeError::Compute("Failed to create encoder".into())
                         })?;
-                        enc.set_pipeline_state(&pipelines.flash_decode_attention);
+                        let pos_offset_u32 = (seq_pos * rope_half_dim) as u32;
+                        let rope_pipe = if s.rope_neox {
+                            pipelines.rope_neox.as_ref().unwrap_or(&pipelines.rope)
+                        } else {
+                            &pipelines.rope
+                        };
+                        enc.set_pipeline_state(rope_pipe);
                         enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
-                        enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 1);
-                        enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 2);
-                        enc.set_buffer(&s.flash_decode_partial_buf, 0, 3);
-                        enc.set_bytes(&num_heads_u32.to_le_bytes(), 4);
-                        enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 5);
-                        enc.set_bytes(&head_dim_u32.to_le_bytes(), 6);
-                        enc.set_bytes(&kv_dim_u32.to_le_bytes(), 7);
-                        enc.set_bytes(&seq_len_u32.to_le_bytes(), 8);
-                        enc.set_bytes(&attn_scale.to_le_bytes(), 9);
-                        enc.set_bytes(&FLASH_DECODE_TILE_SIZE.to_le_bytes(), 10);
-                        enc.set_bytes(&num_tiles.to_le_bytes(), 11);
-                        enc.set_bytes(&max_seq_len_u32.to_le_bytes(), 12);
+                        enc.set_buffer(&s.rope_cos_buf, 0, 1);
+                        enc.set_buffer(&s.rope_sin_buf, 0, 2);
+                        enc.set_bytes(&(num_heads as u32).to_le_bytes(), 3);
+                        enc.set_bytes(&(head_dim as u32).to_le_bytes(), 4);
+                        enc.set_bytes(&(rope_half_dim as u32).to_le_bytes(), 5);
+                        enc.set_bytes(&pos_offset_u32.to_le_bytes(), 6);
+                        let q_total_half = (num_heads * rope_half_dim) as u64;
+                        let tg_q = 64u64.min(q_total_half.max(1));
                         enc.dispatch_threadgroups(
-                            MTLSize::new((num_heads as u64) * (num_tiles as u64), 1, 1),
-                            MTLSize::new(128, 1, 1),
+                            MTLSize::new(q_total_half.div_ceil(tg_q), 1, 1),
+                            MTLSize::new(tg_q, 1, 1),
+                        );
+                        enc.set_buffer(&s.qkv_buf, k_byte_off, 0);
+                        enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 3);
+                        let k_total_half = (num_kv_heads * rope_half_dim) as u64;
+                        let tg_k = 64u64.min(k_total_half.max(1));
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(k_total_half.div_ceil(tg_k), 1, 1),
+                            MTLSize::new(tg_k, 1, 1),
                         );
                         enc.end_encoding();
                     }
@@ -2539,94 +2862,181 @@ impl MetalF32Backend {
                         let enc = cmd.new_compute_encoder().ok_or_else(|| {
                             RuntimeError::Compute("Failed to create encoder".into())
                         })?;
-                        enc.set_pipeline_state(&pipelines.flash_decode_reduce);
-                        enc.set_buffer(&s.flash_decode_partial_buf, 0, 0);
-                        enc.set_buffer(&s.attn_out_buf, 0, 1);
-                        enc.set_bytes(&num_heads_u32.to_le_bytes(), 2);
-                        enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
-                        enc.set_bytes(&num_tiles.to_le_bytes(), 4);
-                        let tg_threads = (head_dim as u64).max(1).min(256);
+                        enc.set_pipeline_state(&pipelines.write_kv_cache);
+                        enc.set_buffer(&s.qkv_buf, k_byte_off, 0);
+                        enc.set_buffer(&s.qkv_buf, v_byte_off, 1);
+                        enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 2);
+                        enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 3);
+                        enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
+                        enc.set_bytes(&(seq_pos as u32).to_le_bytes(), 5);
+                        enc.set_bytes(&(s.max_seq_len as u32).to_le_bytes(), 6);
+                        let tg = 64u64.min(kv_dim as u64).max(1);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new((kv_dim as u64).div_ceil(tg), 1, 1),
+                            MTLSize::new(tg, 1, 1),
+                        );
+                        enc.end_encoding();
+                    }
+                }
+                // Attention (flash decode or MHA)
+                {
+                    let num_heads_u32 = num_heads as u32;
+                    let num_kv_heads_u32 = num_kv_heads as u32;
+                    let head_dim_u32 = head_dim as u32;
+                    let kv_dim_u32 = kv_dim as u32;
+                    let seq_len_u32 = new_seq_len as u32;
+                    let max_seq_len_u32 = s.max_seq_len as u32;
+                    const FLASH_DECODE_TILE_SIZE: u32 = 256;
+                    const FLASH_DECODE_THRESHOLD: usize = FLASH_DECODE_TILE_SIZE as usize + 1; // 257: single-tile is a no-op reduce
+
+                    if new_seq_len >= FLASH_DECODE_THRESHOLD {
+                        let num_tiles = ((new_seq_len as u32) + FLASH_DECODE_TILE_SIZE - 1)
+                            / FLASH_DECODE_TILE_SIZE;
+                        {
+                            let enc = cmd.new_compute_encoder().ok_or_else(|| {
+                                RuntimeError::Compute("Failed to create encoder".into())
+                            })?;
+                            enc.set_pipeline_state(&pipelines.flash_decode_attention);
+                            enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
+                            enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 1);
+                            enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 2);
+                            enc.set_buffer(&s.flash_decode_partial_buf, 0, 3);
+                            enc.set_bytes(&num_heads_u32.to_le_bytes(), 4);
+                            enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 5);
+                            enc.set_bytes(&head_dim_u32.to_le_bytes(), 6);
+                            enc.set_bytes(&kv_dim_u32.to_le_bytes(), 7);
+                            enc.set_bytes(&seq_len_u32.to_le_bytes(), 8);
+                            enc.set_bytes(&attn_scale.to_le_bytes(), 9);
+                            enc.set_bytes(&FLASH_DECODE_TILE_SIZE.to_le_bytes(), 10);
+                            enc.set_bytes(&num_tiles.to_le_bytes(), 11);
+                            enc.set_bytes(&max_seq_len_u32.to_le_bytes(), 12);
+                            enc.dispatch_threadgroups(
+                                MTLSize::new((num_heads as u64) * (num_tiles as u64), 1, 1),
+                                MTLSize::new(128, 1, 1),
+                            );
+                            enc.end_encoding();
+                        }
+                        {
+                            let enc = cmd.new_compute_encoder().ok_or_else(|| {
+                                RuntimeError::Compute("Failed to create encoder".into())
+                            })?;
+                            enc.set_pipeline_state(&pipelines.flash_decode_reduce);
+                            enc.set_buffer(&s.flash_decode_partial_buf, 0, 0);
+                            enc.set_buffer(&s.attn_out_buf, 0, 1);
+                            enc.set_bytes(&num_heads_u32.to_le_bytes(), 2);
+                            enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
+                            enc.set_bytes(&num_tiles.to_le_bytes(), 4);
+                            let tg_threads = (head_dim as u64).max(1).min(256);
+                            enc.dispatch_threadgroups(
+                                MTLSize::new(num_heads as u64, 1, 1),
+                                MTLSize::new(tg_threads, 1, 1),
+                            );
+                            enc.end_encoding();
+                        }
+                    } else {
+                        let mha_tg_size = s.mha_tg_size;
+                        let enc = cmd.new_compute_encoder().ok_or_else(|| {
+                            RuntimeError::Compute("Failed to create encoder".into())
+                        })?;
+                        enc.set_pipeline_state(&pipelines.multi_head_attention);
+                        enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
+                        enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 1);
+                        enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 2);
+                        enc.set_buffer(&s.attn_out_buf, 0, 3);
+                        enc.set_buffer(&s.mha_scores_buf, 0, 4);
+                        enc.set_bytes(&(num_heads as u32).to_le_bytes(), 5);
+                        enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 6);
+                        enc.set_bytes(&(head_dim as u32).to_le_bytes(), 7);
+                        enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 8);
+                        enc.set_bytes(&(new_seq_len as u32).to_le_bytes(), 9);
+                        enc.set_bytes(&attn_scale.to_le_bytes(), 10);
+                        enc.set_bytes(&(s.max_seq_len as u32).to_le_bytes(), 11);
+                        let tg_threads = mha_tg_size.min((head_dim.max(new_seq_len) as u64).max(1));
                         enc.dispatch_threadgroups(
                             MTLSize::new(num_heads as u64, 1, 1),
                             MTLSize::new(tg_threads, 1, 1),
                         );
                         enc.end_encoding();
                     }
-                } else {
-                    let mha_tg_size = s.mha_tg_size;
-                    let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                        RuntimeError::Compute("Failed to create encoder".into())
-                    })?;
-                    enc.set_pipeline_state(&pipelines.multi_head_attention);
-                    enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
-                    enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 1);
-                    enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 2);
-                    enc.set_buffer(&s.attn_out_buf, 0, 3);
-                    enc.set_buffer(&s.mha_scores_buf, 0, 4);
-                    enc.set_bytes(&(num_heads as u32).to_le_bytes(), 5);
-                    enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 6);
-                    enc.set_bytes(&(head_dim as u32).to_le_bytes(), 7);
-                    enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 8);
-                    enc.set_bytes(&(new_seq_len as u32).to_le_bytes(), 9);
-                    enc.set_bytes(&attn_scale.to_le_bytes(), 10);
-                    enc.set_bytes(&(s.max_seq_len as u32).to_le_bytes(), 11);
-                    let tg_threads = mha_tg_size.min((head_dim.max(new_seq_len) as u64).max(1));
+                }
+                // Wo projection + Residual 1 (fused)
+                {
+                    let enc = cmd
+                        .new_compute_encoder()
+                        .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
+                    let tg_wo = match meta.wo_quant {
+                        QuantScheme::Q8_0 => {
+                            enc.set_pipeline_state(
+                                &pipelines.dequant_matmul_q8_0_deferred_residual_nr2,
+                            );
+                            128u64
+                        }
+                        QuantScheme::Q4_0 => {
+                            enc.set_pipeline_state(
+                                &pipelines.dequant_matmul_q4_0_deferred_residual_nr2,
+                            );
+                            128u64
+                        }
+                        QuantScheme::F16 => {
+                            enc.set_pipeline_state(&pipelines.matmul_f16_deferred_residual_nr2);
+                            128u64
+                        }
+                        QuantScheme::Bf16 => {
+                            enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_residual_nr2);
+                            128u64
+                        }
+                        _ => {
+                            enc.set_pipeline_state(&pipelines.matmul_bytes_f32_residual);
+                            matmul_tg_size
+                        }
+                    };
+                    enc.set_buffer(layer_buf, wo_off, 0);
+                    enc.set_buffer(&s.attn_out_buf, 0, 1);
+                    enc.set_buffer(&s.attn_proj_buf, 0, 2);
+                    enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
+                    enc.set_buffer(&s.x_buf, 0, 4);
+                    if matches!(
+                        meta.wo_quant,
+                        QuantScheme::Q8_0
+                            | QuantScheme::Q4_0
+                            | QuantScheme::F16
+                            | QuantScheme::Bf16
+                    ) {
+                        enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 5);
+                    }
+                    let n_tg_wo = match meta.wo_quant {
+                        QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2,
+                        QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2,
+                        QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2,
+                        QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2,
+                        _ => hidden_dim as u64,
+                    };
                     enc.dispatch_threadgroups(
-                        MTLSize::new(num_heads as u64, 1, 1),
-                        MTLSize::new(tg_threads, 1, 1),
+                        MTLSize::new(n_tg_wo, 1, 1),
+                        MTLSize::new(tg_wo, 1, 1),
                     );
                     enc.end_encoding();
                 }
-            }
-            // Wo projection + Residual 1 (fused)
-            {
-                let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder".into())
-                })?;
-                let tg_wo = match meta.wo_quant {
-                    QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_residual_nr2); 128u64 },
-                    QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_residual_nr2); 128u64 },
-                    QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_residual_nr2); 128u64 },
-                    QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_residual_nr2); 128u64 },
-                    _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32_residual); matmul_tg_size },
-                };
-                enc.set_buffer(layer_buf, wo_off, 0);
-                enc.set_buffer(&s.attn_out_buf, 0, 1);
-                enc.set_buffer(&s.attn_proj_buf, 0, 2);
-                enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
-                enc.set_buffer(&s.x_buf, 0, 4);
-                if matches!(meta.wo_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
-                    enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 5);
-                }
-                let n_tg_wo = match meta.wo_quant { QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2, _ => hidden_dim as u64 };
-                enc.dispatch_threadgroups(MTLSize::new(n_tg_wo, 1, 1), MTLSize::new(tg_wo, 1, 1));
-                enc.end_encoding();
-            }
-
             } else {
                 // GatedDeltaNet layer: linear attention forward pass
                 let gdn_idx = meta.gdn_layer_idx.unwrap();
-                let new_conv_pos = Self::encode_gdn_layer_decode(
-                    &cmd, pipelines, s, layer_buf, meta, gdn_idx,
-                )?;
+                let new_conv_pos =
+                    Self::encode_gdn_layer_decode(&cmd, pipelines, s, layer_buf, meta, gdn_idx)?;
                 s.gdn_conv_positions[gdn_idx] = new_conv_pos;
             }
 
             // FFN RMSNorm
             {
-                let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create encoder".into())
-                })?;
+                let enc = cmd
+                    .new_compute_encoder()
+                    .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
                 enc.set_pipeline_state(&pipelines.rmsnorm_bytes);
                 enc.set_buffer(&s.attn_proj_buf, 0, 0);
                 enc.set_buffer(layer_buf, ffn_norm_off, 1);
                 enc.set_buffer(&s.normed_buf, 0, 2);
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
                 enc.set_bytes(&eps.to_le_bytes(), 4);
-                enc.dispatch_threadgroups(
-                    MTLSize::new(1, 1, 1),
-                    MTLSize::new(norm_tg_size, 1, 1),
-                );
+                enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(norm_tg_size, 1, 1));
                 enc.end_encoding();
             }
             // FFN block: branch on MoE vs dense
@@ -2640,16 +3050,19 @@ impl MetalF32Backend {
                 // CB2 uses async commit — Metal FIFO guarantees ordering.
 
                 // Encode router into the current CB (CB1) using per-layer buffer.
-                let per_layer_ids_buf = s.moe_per_layer_expert_ids
+                let per_layer_ids_buf = s
+                    .moe_per_layer_expert_ids
                     .get(layer_idx)
                     .and_then(|opt| opt.as_ref());
                 {
-                    let router_softmax = pipelines.moe_router_softmax.as_ref().ok_or_else(|| {
-                        RuntimeError::Compute("MoE router_softmax pipeline not compiled.".into())
-                    })?;
-                    let expert_ids_buf = per_layer_ids_buf.unwrap_or_else(|| {
-                        s.moe_expert_ids.as_ref().unwrap()
-                    });
+                    let router_softmax =
+                        pipelines.moe_router_softmax.as_ref().ok_or_else(|| {
+                            RuntimeError::Compute(
+                                "MoE router_softmax pipeline not compiled.".into(),
+                            )
+                        })?;
+                    let expert_ids_buf =
+                        per_layer_ids_buf.unwrap_or_else(|| s.moe_expert_ids.as_ref().unwrap());
                     let expert_weights_buf = s.moe_expert_weights.as_ref().ok_or_else(|| {
                         RuntimeError::Compute("MoE expert_weights buffer not allocated".into())
                     })?;
@@ -2673,9 +3086,8 @@ impl MetalF32Backend {
                 cmd.commit_and_wait();
 
                 // Read back expert_ids from per-layer buffer (top_k * 4 bytes).
-                let ids_buf = per_layer_ids_buf.unwrap_or_else(|| {
-                    s.moe_expert_ids.as_ref().unwrap()
-                });
+                let ids_buf =
+                    per_layer_ids_buf.unwrap_or_else(|| s.moe_expert_ids.as_ref().unwrap());
                 let mut cpu_ids = vec![0u32; top_k];
                 ids_buf.read_u32(&mut cpu_ids);
 
@@ -2686,24 +3098,29 @@ impl MetalF32Backend {
 
                 // CB2: dispatch only top-K expert FFNs.
                 cmd = self.queue.new_command_buffer().ok_or_else(|| {
-                    RuntimeError::Compute("Failed to create CB2 for Option A GPU-resident FFN".into())
+                    RuntimeError::Compute(
+                        "Failed to create CB2 for Option A GPU-resident FFN".into(),
+                    )
                 })?;
                 Self::encode_moe_ffn_decode(
-                    &cmd, pipelines, s, layer_buf, moe_meta,
+                    &cmd,
+                    pipelines,
+                    s,
+                    layer_buf,
+                    moe_meta,
                     per_layer_ids_buf,
-                    None,  // GPU-resident: all weights in layer_buf
-                    None, 0.0,  // No cache bias in GPU-resident mode
-                    Some(&cpu_ids),  // Option A: only top-K experts
-                    true,  // Skip router (already ran in CB1)
-                    None,  // No per-layer routing weights in Option A CB2
+                    None, // GPU-resident: all weights in layer_buf
+                    None,
+                    0.0,            // No cache bias in GPU-resident mode
+                    Some(&cpu_ids), // Option A: only top-K experts
+                    true,           // Skip router (already ran in CB1)
+                    None,           // No per-layer routing weights in Option A CB2
                 )?;
 
                 // Shared expert dispatch for GPU-resident Option A.
                 // After routed experts, add the always-active shared expert output.
                 if meta.shared_expert_gate_off.is_some() {
-                    Self::encode_shared_expert_ffn_decode(
-                        &cmd, pipelines, s, layer_buf, meta,
-                    )?;
+                    Self::encode_shared_expert_ffn_decode(&cmd, pipelines, s, layer_buf, meta)?;
                 }
 
                 // Async commit CB2: Metal FIFO ordering guarantees the next CB
@@ -2716,13 +3133,12 @@ impl MetalF32Backend {
                 cmd = self.queue.new_command_buffer().ok_or_else(|| {
                     RuntimeError::Compute("Failed to create command buffer for next layer".into())
                 })?;
-
             } else {
                 // Dense FFN path (unchanged from decode_token_greedy)
                 if meta.w_gate_quant == QuantScheme::Q8_0 && meta.w_up_quant == QuantScheme::Q8_0 {
-                    let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                        RuntimeError::Compute("Failed to create encoder".into())
-                    })?;
+                    let enc = cmd
+                        .new_compute_encoder()
+                        .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
                     enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q8_0_deferred);
                     enc.set_buffer(layer_buf, w_gate_off, 0);
                     enc.set_buffer(&s.normed_buf, 0, 1);
@@ -2736,9 +3152,9 @@ impl MetalF32Backend {
                     );
                     enc.end_encoding();
                 } else if matches!(meta.w_gate_quant, QuantScheme::Q4_0) {
-                    let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                        RuntimeError::Compute("Failed to create encoder".into())
-                    })?;
+                    let enc = cmd
+                        .new_compute_encoder()
+                        .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
                     enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q4_0_deferred);
                     enc.set_buffer(layer_buf, w_gate_off, 0);
                     enc.set_buffer(&s.normed_buf, 0, 1);
@@ -2753,9 +3169,21 @@ impl MetalF32Backend {
                     enc.end_encoding();
                 } else {
                     let (fb_pso, fb_tg, fb_n_tg) = match meta.w_gate_quant {
-                        QuantScheme::F16 => (&pipelines.matmul_f16_deferred_nr2, 128u64, ((inter_dim as u64) + 1) / 2),
-                        QuantScheme::Bf16 => (&pipelines.matmul_bf16_deferred_nr2, 128u64, ((inter_dim as u64) + 1) / 2),
-                        _ => (&pipelines.matmul_bytes_f32, matmul_tg_size, inter_dim as u64),
+                        QuantScheme::F16 => (
+                            &pipelines.matmul_f16_deferred_nr2,
+                            128u64,
+                            ((inter_dim as u64) + 1) / 2,
+                        ),
+                        QuantScheme::Bf16 => (
+                            &pipelines.matmul_bf16_deferred_nr2,
+                            128u64,
+                            ((inter_dim as u64) + 1) / 2,
+                        ),
+                        _ => (
+                            &pipelines.matmul_bytes_f32,
+                            matmul_tg_size,
+                            inter_dim as u64,
+                        ),
                     };
                     {
                         let enc = cmd.new_compute_encoder().ok_or_else(|| {
@@ -2799,26 +3227,60 @@ impl MetalF32Backend {
                 }
                 // Down projection + Residual 2 (fused)
                 {
-                    let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                        RuntimeError::Compute("Failed to create encoder".into())
-                    })?;
+                    let enc = cmd
+                        .new_compute_encoder()
+                        .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
                     let tg_down = match meta.w_down_quant {
-                        QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_residual_nr2); 128u64 },
-                        QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_residual_nr2); 128u64 },
-                        QuantScheme::F16 => { enc.set_pipeline_state(&pipelines.matmul_f16_deferred_residual_nr2); 128u64 },
-                        QuantScheme::Bf16 => { enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_residual_nr2); 128u64 },
-                        _ => { enc.set_pipeline_state(&pipelines.matmul_bytes_f32_residual); matmul_tg_size },
+                        QuantScheme::Q8_0 => {
+                            enc.set_pipeline_state(
+                                &pipelines.dequant_matmul_q8_0_deferred_residual_nr2,
+                            );
+                            128u64
+                        }
+                        QuantScheme::Q4_0 => {
+                            enc.set_pipeline_state(
+                                &pipelines.dequant_matmul_q4_0_deferred_residual_nr2,
+                            );
+                            128u64
+                        }
+                        QuantScheme::F16 => {
+                            enc.set_pipeline_state(&pipelines.matmul_f16_deferred_residual_nr2);
+                            128u64
+                        }
+                        QuantScheme::Bf16 => {
+                            enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_residual_nr2);
+                            128u64
+                        }
+                        _ => {
+                            enc.set_pipeline_state(&pipelines.matmul_bytes_f32_residual);
+                            matmul_tg_size
+                        }
                     };
                     enc.set_buffer(layer_buf, w_down_off, 0);
                     enc.set_buffer(&s.gate_buf, 0, 1);
                     enc.set_buffer(&s.x_buf, 0, 2);
                     enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 3);
                     enc.set_buffer(&s.attn_proj_buf, 0, 4);
-                    if matches!(meta.w_down_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) {
+                    if matches!(
+                        meta.w_down_quant,
+                        QuantScheme::Q8_0
+                            | QuantScheme::Q4_0
+                            | QuantScheme::F16
+                            | QuantScheme::Bf16
+                    ) {
                         enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 5);
                     }
-                    let n_tg_down = match meta.w_down_quant { QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2, QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2, QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2, _ => hidden_dim as u64 };
-                    enc.dispatch_threadgroups(MTLSize::new(n_tg_down, 1, 1), MTLSize::new(tg_down, 1, 1));
+                    let n_tg_down = match meta.w_down_quant {
+                        QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2,
+                        QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2,
+                        QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2,
+                        QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2,
+                        _ => hidden_dim as u64,
+                    };
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(n_tg_down, 1, 1),
+                        MTLSize::new(tg_down, 1, 1),
+                    );
                     enc.end_encoding();
                 }
             } // end MoE vs dense FFN branch
@@ -2840,31 +3302,37 @@ impl MetalF32Backend {
 
         // --- Final RMSNorm ---
         {
-            let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder".into())
-            })?;
+            let enc = cmd
+                .new_compute_encoder()
+                .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
             enc.set_pipeline_state(&pipelines.rmsnorm);
             enc.set_buffer(&s.x_buf, 0, 0);
             enc.set_buffer(sc_norm_buf, sc_norm_off, 1);
             enc.set_buffer(&s.normed_buf, 0, 2);
             enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
             enc.set_bytes(&eps.to_le_bytes(), 4);
-            enc.dispatch_threadgroups(
-                MTLSize::new(1, 1, 1),
-                MTLSize::new(norm_tg_size, 1, 1),
-            );
+            enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(norm_tg_size, 1, 1));
             enc.end_encoding();
         }
 
         // --- Logits projection (deferred NR0=2 for Q8_0, NR0=4 for others, 128 threads) ---
         {
-            let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder".into())
-            })?;
+            let enc = cmd
+                .new_compute_encoder()
+                .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
             let (proj_tg, proj_rows_per_tg) = match output_proj_quant {
-                QuantScheme::Q8_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2); (128u64, 2u64) },
-                QuantScheme::Q4_0 => { enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2); (128u64, 2u64) },
-                _ => { enc.set_pipeline_state(&pipelines.matmul_f32_deferred); (128u64, 4u64) },
+                QuantScheme::Q8_0 => {
+                    enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2);
+                    (128u64, 2u64)
+                }
+                QuantScheme::Q4_0 => {
+                    enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2);
+                    (128u64, 2u64)
+                }
+                _ => {
+                    enc.set_pipeline_state(&pipelines.matmul_f32_deferred);
+                    (128u64, 4u64)
+                }
             };
             enc.set_buffer(sc_proj_buf, sc_proj_off, 0);
             enc.set_buffer(&s.normed_buf, 0, 1);
@@ -2872,26 +3340,20 @@ impl MetalF32Backend {
             enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
             enc.set_bytes(&(vocab_size as u32).to_le_bytes(), 4);
             let n_tg = ((vocab_size as u64) + proj_rows_per_tg - 1) / proj_rows_per_tg;
-            enc.dispatch_threadgroups(
-                MTLSize::new(n_tg, 1, 1),
-                MTLSize::new(proj_tg, 1, 1),
-            );
+            enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(proj_tg, 1, 1));
             enc.end_encoding();
         }
 
         // --- GPU-side argmax (replaces 128 KB logits readback) ---
         {
-            let enc = cmd.new_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("Failed to create encoder".into())
-            })?;
+            let enc = cmd
+                .new_compute_encoder()
+                .ok_or_else(|| RuntimeError::Compute("Failed to create encoder".into()))?;
             enc.set_pipeline_state(&pipelines.argmax);
             enc.set_buffer(&s.logits_buf, 0, 0);
             enc.set_buffer(&s.argmax_result_buf, 0, 1);
             enc.set_bytes(&(vocab_size as u32).to_le_bytes(), 2);
-            enc.dispatch_threadgroups(
-                MTLSize::new(1, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
+            enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
             enc.end_encoding();
         }
 
@@ -2915,5 +3377,4 @@ impl MetalF32Backend {
 
         Ok(result[0])
     }
-
 }

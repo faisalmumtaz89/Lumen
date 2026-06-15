@@ -570,7 +570,10 @@ fn parse_call_body(body: &str) -> Option<ParsedToolCall> {
     }
     let name = extract_json_string_field(trimmed, "name")?;
     let arguments_json = extract_json_value_field(trimmed, "arguments")?;
-    Some(ParsedToolCall { name, arguments_json })
+    Some(ParsedToolCall {
+        name,
+        arguments_json,
+    })
 }
 
 /// Extract `"key": "string-value"` from a JSON object body. Returns the
@@ -712,7 +715,13 @@ fn json_value_len(s: &str) -> Option<usize> {
             while i < bytes.len() {
                 let b = bytes[i];
                 let cb = b as char;
-                if cb == '-' || cb == '+' || cb == '.' || cb.is_ascii_digit() || cb == 'e' || cb == 'E' {
+                if cb == '-'
+                    || cb == '+'
+                    || cb == '.'
+                    || cb.is_ascii_digit()
+                    || cb == 'e'
+                    || cb == 'E'
+                {
                     i += 1;
                 } else {
                     break;
@@ -745,14 +754,18 @@ pub fn qwen35_system_tool_block(tools: &[ToolSchema]) -> String {
     out.push_str("\n\n# Tools\n\n");
     out.push_str(
         "You may call one or more functions to assist with the user query.\n\n\
-         You are provided with function signatures within <tools></tools> XML tags:\n\n");
+         You are provided with function signatures within <tools></tools> XML tags:\n\n",
+    );
     out.push_str("<tools>\n");
     out.push_str(&body);
     out.push_str("</tools>\n\n");
     out.push_str(
         "For each function call, return a json object with function name and \
-         arguments within <tool_call></tool_call> XML tags:\n\n");
-    out.push_str("<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>");
+         arguments within <tool_call></tool_call> XML tags:\n\n",
+    );
+    out.push_str(
+        "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>",
+    );
     out
 }
 
@@ -874,7 +887,8 @@ mod tests {
             description: "Get current weather for a city.".into(),
             parameters_json_schema:
                 "{\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \
-                 \"required\": [\"city\"]}".into(),
+                 \"required\": [\"city\"]}"
+                    .into(),
         }
     }
 
@@ -894,7 +908,11 @@ mod tests {
         let block = Qwen35Renderer::render_tools_block(&[weather_tool(), calc_tool()]);
         assert!(block.contains("\"name\": \"get_weather\""));
         assert!(block.contains("\"name\": \"calc\""));
-        assert_eq!(block.matches('\n').count(), 2, "one trailing newline per tool");
+        assert_eq!(
+            block.matches('\n').count(),
+            2,
+            "one trailing newline per tool"
+        );
     }
 
     #[test]
@@ -949,7 +967,9 @@ mod tests {
         assert_eq!(d1.text, "Calling: ", "the <tool prefix must be held back");
         assert!(d1.tool_calls.is_empty());
 
-        let d2 = p.feed("_call>\n{\"name\": \"calc\", \"arguments\": {\"expr\": \"1+1\"}}\n</tool_call> done");
+        let d2 = p.feed(
+            "_call>\n{\"name\": \"calc\", \"arguments\": {\"expr\": \"1+1\"}}\n</tool_call> done",
+        );
         assert_eq!(d2.tool_calls.len(), 1);
         assert_eq!(d2.tool_calls[0].name, "calc");
         assert_eq!(d2.text, " done");
@@ -958,7 +978,9 @@ mod tests {
     #[test]
     fn streaming_close_marker_split_across_chunks() {
         let mut p = StreamingParser::new();
-        let _ = p.feed("<tool_call>\n{\"name\": \"calc\", \"arguments\": {\"expr\": \"2*3\"}}\n</tool_ca");
+        let _ = p.feed(
+            "<tool_call>\n{\"name\": \"calc\", \"arguments\": {\"expr\": \"2*3\"}}\n</tool_ca",
+        );
         let d = p.feed("ll> finished");
         assert_eq!(d.tool_calls.len(), 1);
         assert_eq!(d.tool_calls[0].name, "calc");
@@ -990,7 +1012,8 @@ mod tests {
     fn streaming_byte_for_byte_emission_recoverable() {
         // Emit a long sequence one character at a time and verify the
         // assembled output matches the result of a single-shot feed.
-        let full = "Hi! <tool_call>\n{\"name\": \"f\", \"arguments\": {\"a\": 1}}\n</tool_call> Tail.";
+        let full =
+            "Hi! <tool_call>\n{\"name\": \"f\", \"arguments\": {\"a\": 1}}\n</tool_call> Tail.";
         let mut p = StreamingParser::new();
         let mut text_acc = String::new();
         let mut calls_acc = Vec::new();
@@ -1067,8 +1090,14 @@ mod tests {
     #[test]
     fn tool_response_block_is_valid_xml_envelope() {
         let s = format_tool_responses(&[
-            ToolResult { tool_name: "calc", content: "{\"value\": 5}" },
-            ToolResult { tool_name: "calc", content: "{\"value\": 7}" },
+            ToolResult {
+                tool_name: "calc",
+                content: "{\"value\": 5}",
+            },
+            ToolResult {
+                tool_name: "calc",
+                content: "{\"value\": 7}",
+            },
         ]);
         let count = s.matches("<tool_response>").count();
         assert_eq!(count, 2);
@@ -1091,7 +1120,10 @@ mod tests {
         // Equivalence to the underlying primitive.
         assert_eq!(
             seg,
-            format!("\n{}", Qwen35Renderer::render_one_call("get_weather", "{\"city\": \"Paris\"}"))
+            format!(
+                "\n{}",
+                Qwen35Renderer::render_one_call("get_weather", "{\"city\": \"Paris\"}")
+            )
         );
     }
 

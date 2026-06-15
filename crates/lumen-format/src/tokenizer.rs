@@ -351,7 +351,9 @@ mod tests {
         let tokens: Vec<String> = (0..10000).map(|i| format!("token_{i}")).collect();
         let scores: Vec<f32> = (0..10000).map(|i| -(i as f32)).collect();
         let token_types: Vec<u32> = (0..10000).map(|i| if i < 3 { 3 } else { 1 }).collect();
-        let merges: Vec<String> = (0..5000).map(|i| format!("tok_{} en_{}", i, i + 1)).collect();
+        let merges: Vec<String> = (0..5000)
+            .map(|i| format!("tok_{} en_{}", i, i + 1))
+            .collect();
 
         let tok = TokenizerSection {
             model_type: "llama".to_string(),
@@ -397,9 +399,9 @@ mod tests {
             model_type: "llama".to_string(),
             pre_tokenizer: "".to_string(),
             tokens: vec![
-                "\u{00e9}".into(),   // e-acute
+                "\u{00e9}".into(),         // e-acute
                 "\u{4e16}\u{754c}".into(), // Chinese: "world"
-                "\u{1f600}".into(),  // emoji: grinning face
+                "\u{1f600}".into(),        // emoji: grinning face
             ],
             token_types: vec![],
             scores: vec![],

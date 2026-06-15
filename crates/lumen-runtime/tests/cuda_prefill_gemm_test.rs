@@ -37,9 +37,7 @@ fn assert_f32_close(label: &str, actual: &[f32], expected: &[f32], tolerance: f3
         let diff = (a - e).abs();
         if diff > tolerance {
             if mismatches < 5 {
-                eprintln!(
-                    "  {label}[{i}]: CUDA={a:.6}, CPU={e:.6}, diff={diff:.2e}"
-                );
+                eprintln!("  {label}[{i}]: CUDA={a:.6}, CPU={e:.6}, diff={diff:.2e}");
             }
             mismatches += 1;
         }

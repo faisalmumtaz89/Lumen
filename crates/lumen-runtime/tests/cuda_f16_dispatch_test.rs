@@ -9,8 +9,8 @@
 
 #[cfg(feature = "cuda")]
 mod cuda_f16_tests {
-    use lumen_runtime::cuda::CudaBackend;
     use lumen_runtime::compute::ComputeBackend;
+    use lumen_runtime::cuda::CudaBackend;
 
     /// Convert an f32 value to IEEE 754 half-precision (f16) bits.
     ///
@@ -200,7 +200,11 @@ mod cuda_f16_tests {
         let n_elements = 128;
         let weights: Vec<f32> = (0..n_elements).map(|i| i as f32 * 0.01).collect();
         let bytes = make_f16_weight_bytes(&weights);
-        assert_eq!(bytes.len(), n_elements * 2, "F16 should be 2 bytes per element");
+        assert_eq!(
+            bytes.len(),
+            n_elements * 2,
+            "F16 should be 2 bytes per element"
+        );
     }
 
     #[test]

@@ -4,9 +4,9 @@
 //! `StorageModePrivate` Metal buffer, eliminating TLB misses, reducing virtual
 //! address ranges, and enabling GPU memory controller optimizations.
 
-use super::ffi::{MetalBuffer, MTLSize};
-use super::repack_q8;
+use super::ffi::{MTLSize, MetalBuffer};
 use super::repack_q4;
+use super::repack_q8;
 use super::types::{CachedLayerMeta, CachedMoeMeta};
 use super::{MetalF32Backend, PAGE_SIZE};
 use crate::error::RuntimeError;
@@ -106,9 +106,7 @@ impl MetalF32Backend {
             // get_layer_raw keeps the native blob layout (see the main upload
             // loop below for why get_layer_blocking would corrupt sync weights).
             let lv0 = weights.get_layer_raw(0).map_err(|e| {
-                RuntimeError::Compute(format!(
-                    " MMAP_ONLY: probe layer 0 failed: {}", e
-                ))
+                RuntimeError::Compute(format!(" MMAP_ONLY: probe layer 0 failed: {}", e))
             })?;
             let probe_ptr = lv0.as_bytes().as_ptr() as usize;
             let probe_aligned = probe_ptr != 0 && (probe_ptr % PAGE_SIZE == 0);
@@ -117,16 +115,21 @@ impl MetalF32Backend {
                 for layer in 0..num_layers {
                     let lv = weights.get_layer_raw(layer).map_err(|e| {
                         RuntimeError::Compute(format!(
-                            " MMAP_ONLY: probe layer {} failed: {}", layer, e
+                            " MMAP_ONLY: probe layer {} failed: {}",
+                            layer, e
                         ))
                     })?;
                     let bytes = lv.as_bytes();
                     let p = bytes.as_ptr() as usize;
                     let l = bytes.len();
                     layer_ptrs.push((p, l));
-                    if p < mmap_min_ptr { mmap_min_ptr = p; }
+                    if p < mmap_min_ptr {
+                        mmap_min_ptr = p;
+                    }
                     let end = p.saturating_add(l);
-                    if end > mmap_max_end { mmap_max_end = end; }
+                    if end > mmap_max_end {
+                        mmap_max_end = end;
+                    }
                 }
                 true
             } else {
@@ -156,7 +159,8 @@ impl MetalF32Backend {
             // backend, which uses get_layer_raw for the same reason.
             let layer_view = weights.get_layer_raw(layer).map_err(|e| {
                 RuntimeError::Compute(format!(
-                    "Failed to get layer {} for GPU-resident loading: {}", layer, e
+                    "Failed to get layer {} for GPU-resident loading: {}",
+                    layer, e
                 ))
             })?;
             let blob = layer_view.as_bytes();
@@ -204,9 +208,15 @@ impl MetalF32Backend {
                         let first = &experts[0];
                         Some(CachedMoeMeta {
                             router_weight_off: base + router.offset,
-                            expert_gate_offs: experts.iter().map(|e| base + e.gate.offset).collect(),
+                            expert_gate_offs: experts
+                                .iter()
+                                .map(|e| base + e.gate.offset)
+                                .collect(),
                             expert_up_offs: experts.iter().map(|e| base + e.up.offset).collect(),
-                            expert_down_offs: experts.iter().map(|e| base + e.down.offset).collect(),
+                            expert_down_offs: experts
+                                .iter()
+                                .map(|e| base + e.down.offset)
+                                .collect(),
                             expert_gate_quant: first.gate.quant,
                             expert_down_quant: first.down.quant,
                         })
@@ -231,10 +241,26 @@ impl MetalF32Backend {
                 // When true, the decode path deinterleaves Q+gate, projects K/V
                 // separately from wk/wv, and applies SiLU-gated output.
                 has_qgate_fusion: st.attn_q_norm.is_some(),
-                wk_off: if st.wk.length > 0 { Some(base + st.wk.offset) } else { None },
-                wv_off: if st.wv.length > 0 { Some(base + st.wv.offset) } else { None },
-                wk_quant: if st.wk.length > 0 { Some(st.wk.quant) } else { None },
-                wv_quant: if st.wv.length > 0 { Some(st.wv.quant) } else { None },
+                wk_off: if st.wk.length > 0 {
+                    Some(base + st.wk.offset)
+                } else {
+                    None
+                },
+                wv_off: if st.wv.length > 0 {
+                    Some(base + st.wv.offset)
+                } else {
+                    None
+                },
+                wk_quant: if st.wk.length > 0 {
+                    Some(st.wk.quant)
+                } else {
+                    None
+                },
+                wv_quant: if st.wv.length > 0 {
+                    Some(st.wv.quant)
+                } else {
+                    None
+                },
                 // Per-head Q/K RMSNorm weights.
                 attn_q_norm_off: st.attn_q_norm.map(|s| base + s.offset),
                 attn_k_norm_off: st.attn_k_norm.map(|s| base + s.offset),
@@ -351,8 +377,10 @@ impl MetalF32Backend {
             // dereferences always see live mmap pages. The deallocator block is
             // nil (we do not own the memory — the kernel mmap does).
             let unified_buf = unsafe {
-                self.device.new_buffer_no_copy(mmap_min_ptr as *mut std::ffi::c_void, span)
-            }.ok_or_else(|| {
+                self.device
+                    .new_buffer_no_copy(mmap_min_ptr as *mut std::ffi::c_void, span)
+            }
+            .ok_or_else(|| {
                 RuntimeError::Compute(format!(
                     " MMAP_ONLY: newBufferWithBytesNoCopy failed (ptr={:#x}, len={})",
                     mmap_min_ptr, span
@@ -383,12 +411,16 @@ impl MetalF32Backend {
             let embed_len = embed_buf_ref.length() as usize;
 
             let norm_buf_ref = self.final_norm_buf.as_ref().ok_or_else(|| {
-                RuntimeError::Compute("Final norm buffer not initialized for unified preload".into())
+                RuntimeError::Compute(
+                    "Final norm buffer not initialized for unified preload".into(),
+                )
             })?;
             let norm_len = norm_buf_ref.length() as usize;
 
             let proj_buf_ref = self.output_proj_buf.as_ref().ok_or_else(|| {
-                RuntimeError::Compute("Output proj buffer not initialized for unified preload".into())
+                RuntimeError::Compute(
+                    "Output proj buffer not initialized for unified preload".into(),
+                )
             })?;
             let proj_len = proj_buf_ref.length() as usize;
 
@@ -424,7 +456,8 @@ impl MetalF32Backend {
             let staging_buf = self.device.new_buffer(total_size).ok_or_else(|| {
                 RuntimeError::Compute(format!(
                     "Failed to allocate staging buffer ({} bytes, {:.1} MB)",
-                    total_size, total_size as f64 / (1024.0 * 1024.0)
+                    total_size,
+                    total_size as f64 / (1024.0 * 1024.0)
                 ))
             })?;
 
@@ -443,14 +476,20 @@ impl MetalF32Backend {
                 // Copy global tensors from their existing Metal buffers
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        embed_buf_ref.contents() as *const u8, dst_base.add(embed_offset), embed_len,
+                        embed_buf_ref.contents() as *const u8,
+                        dst_base.add(embed_offset),
+                        embed_len,
                     );
                     std::ptr::copy_nonoverlapping(
-                        norm_buf_ref.contents() as *const u8, dst_base.add(norm_offset), norm_len,
+                        norm_buf_ref.contents() as *const u8,
+                        dst_base.add(norm_offset),
+                        norm_len,
                     );
                     if !self.weight_tying {
                         std::ptr::copy_nonoverlapping(
-                            proj_buf_ref.contents() as *const u8, dst_base.add(proj_offset), proj_len,
+                            proj_buf_ref.contents() as *const u8,
+                            dst_base.add(proj_offset),
+                            proj_len,
                         );
                     }
                 }
@@ -465,7 +504,8 @@ impl MetalF32Backend {
             let private_buf = self.device.new_buffer_private(total_size).ok_or_else(|| {
                 RuntimeError::Compute(format!(
                     "Failed to allocate private GPU buffer ({} bytes, {:.1} MB)",
-                    total_size, total_size as f64 / (1024.0 * 1024.0)
+                    total_size,
+                    total_size as f64 / (1024.0 * 1024.0)
                 ))
             })?;
 
@@ -483,7 +523,11 @@ impl MetalF32Backend {
             drop(staging_buf);
 
             let layer_mb = layer_bytes_total as f64 / (1024.0 * 1024.0);
-            let global_mb = if include_globals { global_bytes as f64 / (1024.0 * 1024.0) } else { 0.0 };
+            let global_mb = if include_globals {
+                global_bytes as f64 / (1024.0 * 1024.0)
+            } else {
+                0.0
+            };
             let total_mb = total_size as f64 / (1024.0 * 1024.0);
             // GPU-resident buffer info available via MetalF32Backend::gpu_resident_summary().
             let _ = (num_layers, layer_mb, global_mb, total_mb, include_globals);
@@ -493,7 +537,7 @@ impl MetalF32Backend {
             if include_globals {
                 s.gpu_global_offsets = Some((embed_offset, norm_offset, proj_offset));
             } else {
-                s.gpu_global_offsets = None;  // Forces fallback to separate shared buffers
+                s.gpu_global_offsets = None; // Forces fallback to separate shared buffers
             }
             s.cached_layer_meta = layer_metas;
         }
@@ -506,8 +550,15 @@ impl MetalF32Backend {
         // ====================================================================
         // Suppress unused-variable warnings when only the legacy path uses
         // the global offsets (mmap-only path zeros them as `_unused`).
-        let _ = (global_bytes, total_size, layer_bytes_total, include_globals,
-                 embed_offset, norm_offset, proj_offset);
+        let _ = (
+            global_bytes,
+            total_size,
+            layer_bytes_total,
+            include_globals,
+            embed_offset,
+            norm_offset,
+            proj_offset,
+        );
 
         // ====================================================================
         // Qwen3.5-MoE detection
@@ -532,28 +583,38 @@ impl MetalF32Backend {
                     s.shared_expert_inter_dim = s.inter_dim;
                     let se_inter = s.shared_expert_inter_dim;
                     let hidden = s.hidden_dim;
-                    s.shared_expert_gate_buf = Some(self.device.new_buffer(se_inter * 4).ok_or_else(|| {
-                        RuntimeError::Compute("Failed to allocate shared_expert_gate_buf".into())
-                    })?);
-                    s.shared_expert_down_buf = Some(self.device.new_buffer(hidden * 4).ok_or_else(|| {
-                        RuntimeError::Compute("Failed to allocate shared_expert_down_buf".into())
-                    })?);
+                    s.shared_expert_gate_buf =
+                        Some(self.device.new_buffer(se_inter * 4).ok_or_else(|| {
+                            RuntimeError::Compute(
+                                "Failed to allocate shared_expert_gate_buf".into(),
+                            )
+                        })?);
+                    s.shared_expert_down_buf =
+                        Some(self.device.new_buffer(hidden * 4).ok_or_else(|| {
+                            RuntimeError::Compute(
+                                "Failed to allocate shared_expert_down_buf".into(),
+                            )
+                        })?);
                 }
 
                 // Partial RoPE: Qwen3.5 uses partial_rotary_factor=0.25,
                 // meaning only the first head_dim/4 dimensions of each head are rotated.
                 let head_dim = s.head_dim;
                 if head_dim >= 128 {
-                    s.rotary_dim = head_dim / 4;  // 128/4 = 32 for Qwen3.5-9B, 256/4 = 64 for -35B
+                    s.rotary_dim = head_dim / 4; // 128/4 = 32 for Qwen3.5-9B, 256/4 = 64 for -35B
                 }
 
                 // Allocate attention gate scratch buffer (for full attention layers with attn_gate)
-                let has_attn_gate = s.cached_layer_meta.iter().any(|m| m.attn_gate_off.is_some());
+                let has_attn_gate = s
+                    .cached_layer_meta
+                    .iter()
+                    .any(|m| m.attn_gate_off.is_some());
                 if has_attn_gate {
                     let hidden = s.hidden_dim;
-                    s.attn_gate_buf = Some(self.device.new_buffer(hidden * 4).ok_or_else(|| {
-                        RuntimeError::Compute("Failed to allocate attn_gate_buf".into())
-                    })?);
+                    s.attn_gate_buf =
+                        Some(self.device.new_buffer(hidden * 4).ok_or_else(|| {
+                            RuntimeError::Compute("Failed to allocate attn_gate_buf".into())
+                        })?);
                 }
 
                 // Recompute RoPE cos/sin tables for partial rotation.
@@ -583,13 +644,28 @@ impl MetalF32Backend {
                 s.rope_sin_buf.write_f32(&sin_table);
 
                 // Count layer types for diagnostics
-                let n_linear = s.cached_layer_meta.iter().filter(|m| m.layer_type == Some(1)).count();
-                let n_full = s.cached_layer_meta.iter().filter(|m| m.layer_type == Some(0)).count();
-                let n_moe = s.cached_layer_meta.iter().filter(|m| m.moe_meta.is_some()).count();
-                let n_shared = s.cached_layer_meta.iter().filter(|m| m.shared_expert_gate_off.is_some()).count();
+                let n_linear = s
+                    .cached_layer_meta
+                    .iter()
+                    .filter(|m| m.layer_type == Some(1))
+                    .count();
+                let n_full = s
+                    .cached_layer_meta
+                    .iter()
+                    .filter(|m| m.layer_type == Some(0))
+                    .count();
+                let n_moe = s
+                    .cached_layer_meta
+                    .iter()
+                    .filter(|m| m.moe_meta.is_some())
+                    .count();
+                let n_shared = s
+                    .cached_layer_meta
+                    .iter()
+                    .filter(|m| m.shared_expert_gate_off.is_some())
+                    .count();
                 let se_inter_display = s.shared_expert_inter_dim;
                 let _ = (n_linear, n_full, n_moe, n_shared, se_inter_display);
-
             }
         }
 
@@ -599,16 +675,21 @@ impl MetalF32Backend {
         // Allocate persistent h_state and conv_state buffers for all GDN layers.
         // This runs for ANY model with layer_type=1 layers (both MoE and dense).
         {
-            let n_linear = s.cached_layer_meta.iter().filter(|m| m.layer_type == Some(1)).count();
+            let n_linear = s
+                .cached_layer_meta
+                .iter()
+                .filter(|m| m.layer_type == Some(1))
+                .count();
             if n_linear > 0 {
                 // GDN dims from the resolved SSM dims (9B {32,16,128,4} default,
                 // 27B {48,16,128,4}), populated in init() from hyperparams.gdn_dims().
-                let gdn_num_v_heads = s.gdn_num_v_heads;  // ssm.time_step_rank
-                let gdn_num_k_heads = s.gdn_num_k_heads;  // ssm.group_count
-                let gdn_head_dim = s.gdn_head_dim;        // ssm.state_size
+                let gdn_num_v_heads = s.gdn_num_v_heads; // ssm.time_step_rank
+                let gdn_num_k_heads = s.gdn_num_k_heads; // ssm.group_count
+                let gdn_head_dim = s.gdn_head_dim; // ssm.state_size
                 let conv_kernel_size = s.gdn_conv_kernel_size; // ssm.conv_kernel
-                // Fused QKV channels: 2*qk_dim + v_dim (9B=8192, 27B=10240).
-                let gdn_qkv_dim = 2 * gdn_num_k_heads * gdn_head_dim + gdn_num_v_heads * gdn_head_dim;
+                                                               // Fused QKV channels: 2*qk_dim + v_dim (9B=8192, 27B=10240).
+                let gdn_qkv_dim =
+                    2 * gdn_num_k_heads * gdn_head_dim + gdn_num_v_heads * gdn_head_dim;
                 // V / gate / output-projection width = num_v_heads*head_dim (9B=4096, 27B=6144).
                 let gdn_q_dim = gdn_num_v_heads * gdn_head_dim;
                 let hidden = s.hidden_dim;
@@ -643,39 +724,47 @@ impl MetalF32Backend {
 
                 // Allocate GDN scratch buffers using GDN-specific dimensions
                 // (gdn_q_dim = num_v_heads*head_dim, computed above).
-                s.gdn_alpha_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
-                    RuntimeError::Compute("Failed to allocate GDN alpha buffer".into())
-                })?);
-                s.gdn_beta_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
-                    RuntimeError::Compute("Failed to allocate GDN beta buffer".into())
-                })?);
+                s.gdn_alpha_buf =
+                    Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
+                        RuntimeError::Compute("Failed to allocate GDN alpha buffer".into())
+                    })?);
+                s.gdn_beta_buf =
+                    Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
+                        RuntimeError::Compute("Failed to allocate GDN beta buffer".into())
+                    })?);
                 // Output of state query: [num_v_heads * head_dim] (9B=4096, 27B=6144)
-                s.gdn_output_buf = Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
-                    RuntimeError::Compute("Failed to allocate GDN output buffer".into())
-                })?);
+                s.gdn_output_buf =
+                    Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
+                        RuntimeError::Compute("Failed to allocate GDN output buffer".into())
+                    })?);
                 // SSM output projection result: [hidden_dim]
                 s.gdn_ssm_proj_buf = Some(self.device.new_buffer(hidden * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN ssm_proj buffer".into())
                 })?);
                 // Attention gate sigmoid output: [v_dim] (gate applied BEFORE ssm_out_proj)
-                s.gdn_gate_sigmoid_buf = Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
-                    RuntimeError::Compute("Failed to allocate GDN gate_sigmoid buffer".into())
-                })?);
+                s.gdn_gate_sigmoid_buf =
+                    Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
+                        RuntimeError::Compute("Failed to allocate GDN gate_sigmoid buffer".into())
+                    })?);
                 // L2-norm scaled output: [num_v_heads * head_dim] (9B=4096, 27B=6144)
-                s.gdn_normed_out_buf = Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
-                    RuntimeError::Compute("Failed to allocate GDN normed_out buffer".into())
-                })?);
+                s.gdn_normed_out_buf =
+                    Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
+                        RuntimeError::Compute("Failed to allocate GDN normed_out buffer".into())
+                    })?);
                 // Q8_0 matvec outputs for alpha/beta gate projections [num_v_heads] f32
-                s.gdn_alpha_raw_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
-                    RuntimeError::Compute("Failed to allocate GDN alpha_raw buffer".into())
-                })?);
-                s.gdn_beta_raw_buf = Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
-                    RuntimeError::Compute("Failed to allocate GDN beta_raw buffer".into())
-                })?);
+                s.gdn_alpha_raw_buf =
+                    Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
+                        RuntimeError::Compute("Failed to allocate GDN alpha_raw buffer".into())
+                    })?);
+                s.gdn_beta_raw_buf =
+                    Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
+                        RuntimeError::Compute("Failed to allocate GDN beta_raw buffer".into())
+                    })?);
                 // Conv1d output for all QKV channels [qkv_dim] f32 (9B=8192, 27B=10240)
-                s.gdn_qkv_conv_buf = Some(self.device.new_buffer(gdn_qkv_dim * 4).ok_or_else(|| {
-                    RuntimeError::Compute("Failed to allocate GDN qkv_conv buffer".into())
-                })?);
+                s.gdn_qkv_conv_buf =
+                    Some(self.device.new_buffer(gdn_qkv_dim * 4).ok_or_else(|| {
+                        RuntimeError::Compute("Failed to allocate GDN qkv_conv buffer".into())
+                    })?);
 
                 let h_state_mb = (n_linear * h_state_size * 4) as f64 / (1024.0 * 1024.0);
                 let conv_mb = (n_linear * conv_state_size * 4) as f64 / (1024.0 * 1024.0);
@@ -701,13 +790,19 @@ impl MetalF32Backend {
                         // Build gate+up offset table: [n_experts * 2] u64
                         let mut gu_offsets = vec![0u64; n_experts * 2];
                         for e in 0..n_experts.min(moe_meta.expert_gate_offs.len()) {
-                            gu_offsets[e * 2]     = moe_meta.expert_gate_offs[e];
+                            gu_offsets[e * 2] = moe_meta.expert_gate_offs[e];
                             gu_offsets[e * 2 + 1] = moe_meta.expert_up_offs[e];
                         }
-                        let gu_bytes: Vec<u8> = gu_offsets.iter().flat_map(|v| v.to_le_bytes()).collect();
-                        let gu_buf = self.device.new_buffer_with_bytes(&gu_bytes).ok_or_else(|| {
-                            RuntimeError::Compute("Failed to allocate MoE gate_up offset table".into())
-                        })?;
+                        let gu_bytes: Vec<u8> =
+                            gu_offsets.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        let gu_buf =
+                            self.device
+                                .new_buffer_with_bytes(&gu_bytes)
+                                .ok_or_else(|| {
+                                    RuntimeError::Compute(
+                                        "Failed to allocate MoE gate_up offset table".into(),
+                                    )
+                                })?;
                         gate_up_vecs.push(Some(gu_buf));
 
                         // Build down offset table: [n_experts] u64
@@ -715,10 +810,14 @@ impl MetalF32Backend {
                         for e in 0..n_experts.min(moe_meta.expert_down_offs.len()) {
                             d_offsets[e] = moe_meta.expert_down_offs[e];
                         }
-                        let d_bytes: Vec<u8> = d_offsets.iter().flat_map(|v| v.to_le_bytes()).collect();
-                        let d_buf = self.device.new_buffer_with_bytes(&d_bytes).ok_or_else(|| {
-                            RuntimeError::Compute("Failed to allocate MoE down offset table".into())
-                        })?;
+                        let d_bytes: Vec<u8> =
+                            d_offsets.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        let d_buf =
+                            self.device.new_buffer_with_bytes(&d_bytes).ok_or_else(|| {
+                                RuntimeError::Compute(
+                                    "Failed to allocate MoE down offset table".into(),
+                                )
+                            })?;
                         down_vecs.push(Some(d_buf));
                     } else {
                         gate_up_vecs.push(None);
@@ -735,9 +834,14 @@ impl MetalF32Backend {
                 for meta in &s.cached_layer_meta {
                     if let Some(se_down_off) = meta.shared_expert_down_off {
                         let off_bytes: Vec<u8> = se_down_off.to_le_bytes().to_vec();
-                        let buf = self.device.new_buffer_with_bytes(&off_bytes).ok_or_else(|| {
-                            RuntimeError::Compute("Failed to allocate MoE shared expert down offset".into())
-                        })?;
+                        let buf =
+                            self.device
+                                .new_buffer_with_bytes(&off_bytes)
+                                .ok_or_else(|| {
+                                    RuntimeError::Compute(
+                                        "Failed to allocate MoE shared expert down offset".into(),
+                                    )
+                                })?;
                         se_down_vecs.push(Some(buf));
                     } else {
                         se_down_vecs.push(None);
@@ -782,7 +886,8 @@ impl MetalF32Backend {
                 for layer in 0..num_layers {
                     let lv = weights.get_layer_raw(layer).map_err(|e| {
                         RuntimeError::Compute(format!(
-                            " repack: failed to get layer {}: {}", layer, e
+                            " repack: failed to get layer {}: {}",
+                            layer, e
                         ))
                     })?;
                     let st = &lv.subtensors;
@@ -798,13 +903,20 @@ impl MetalF32Backend {
                     {
                         let src = lv.subtensor_bytes(&st.w_down).map_err(|e| {
                             RuntimeError::Compute(format!(
-                                " repack: failed to read w_down at layer {}: {}", layer, e
+                                " repack: failed to read w_down at layer {}: {}",
+                                layer, e
                             ))
                         })?;
                         match repack_q8::build_repacked_buffer_single(
-                            &self.device, src, hidden_dim_u, inter_dim_u,
+                            &self.device,
+                            src,
+                            hidden_dim_u,
+                            inter_dim_u,
                         ) {
-                            Ok(buf) => { down_ok_count += 1; Some(buf) }
+                            Ok(buf) => {
+                                down_ok_count += 1;
+                                Some(buf)
+                            }
                             Err(_) => None,
                         }
                     } else {
@@ -826,18 +938,27 @@ impl MetalF32Backend {
                     {
                         let src_g = lv.subtensor_bytes(&st.w_gate).map_err(|e| {
                             RuntimeError::Compute(format!(
-                                " repack: failed to read w_gate at layer {}: {}", layer, e
+                                " repack: failed to read w_gate at layer {}: {}",
+                                layer, e
                             ))
                         })?;
                         let src_u = lv.subtensor_bytes(&st.w_up).map_err(|e| {
                             RuntimeError::Compute(format!(
-                                " repack: failed to read w_up at layer {}: {}", layer, e
+                                " repack: failed to read w_up at layer {}: {}",
+                                layer, e
                             ))
                         })?;
                         match repack_q8::build_repacked_buffer_pair(
-                            &self.device, src_g, src_u, inter_dim_u, hidden_dim_u,
+                            &self.device,
+                            src_g,
+                            src_u,
+                            inter_dim_u,
+                            hidden_dim_u,
                         ) {
-                            Ok(buf) => { gate_up_ok_count += 1; Some(buf) }
+                            Ok(buf) => {
+                                gate_up_ok_count += 1;
+                                Some(buf)
+                            }
                             Err(_) => None,
                         }
                     } else {
@@ -887,7 +1008,8 @@ impl MetalF32Backend {
                 for layer in 0..num_layers {
                     let lv = weights.get_layer_raw(layer).map_err(|e| {
                         RuntimeError::Compute(format!(
-                            " Q4 repack: failed to get layer {}: {}", layer, e
+                            " Q4 repack: failed to get layer {}: {}",
+                            layer, e
                         ))
                     })?;
                     let st = &lv.subtensors;
@@ -903,13 +1025,20 @@ impl MetalF32Backend {
                     {
                         let src = lv.subtensor_bytes(&st.w_down).map_err(|e| {
                             RuntimeError::Compute(format!(
-                                " Q4 repack: failed to read w_down at layer {}: {}", layer, e
+                                " Q4 repack: failed to read w_down at layer {}: {}",
+                                layer, e
                             ))
                         })?;
                         match repack_q4::build_repacked_buffer_single(
-                            &self.device, src, hidden_dim_u, inter_dim_u,
+                            &self.device,
+                            src,
+                            hidden_dim_u,
+                            inter_dim_u,
                         ) {
-                            Ok(buf) => { down_ok_count += 1; Some(buf) }
+                            Ok(buf) => {
+                                down_ok_count += 1;
+                                Some(buf)
+                            }
                             Err(_) => None,
                         }
                     } else {
@@ -931,18 +1060,27 @@ impl MetalF32Backend {
                     {
                         let src_g = lv.subtensor_bytes(&st.w_gate).map_err(|e| {
                             RuntimeError::Compute(format!(
-                                " Q4 repack: failed to read w_gate at layer {}: {}", layer, e
+                                " Q4 repack: failed to read w_gate at layer {}: {}",
+                                layer, e
                             ))
                         })?;
                         let src_u = lv.subtensor_bytes(&st.w_up).map_err(|e| {
                             RuntimeError::Compute(format!(
-                                " Q4 repack: failed to read w_up at layer {}: {}", layer, e
+                                " Q4 repack: failed to read w_up at layer {}: {}",
+                                layer, e
                             ))
                         })?;
                         match repack_q4::build_repacked_buffer_pair(
-                            &self.device, src_g, src_u, inter_dim_u, hidden_dim_u,
+                            &self.device,
+                            src_g,
+                            src_u,
+                            inter_dim_u,
+                            hidden_dim_u,
                         ) {
-                            Ok(buf) => { gate_up_ok_count += 1; Some(buf) }
+                            Ok(buf) => {
+                                gate_up_ok_count += 1;
+                                Some(buf)
+                            }
                             Err(_) => None,
                         }
                     } else {
@@ -986,7 +1124,9 @@ impl MetalF32Backend {
                 // layer counter 0..n_gdn_layers-1), matching the convention used
                 // for `gdn_h_states` and `gdn_conv_states`. Non-GDN (full-attn)
                 // layers do not enter the Vec at all.
-                let n_gdn_layers = s.cached_layer_meta.iter()
+                let n_gdn_layers = s
+                    .cached_layer_meta
+                    .iter()
                     .filter(|m| m.layer_type == Some(1))
                     .count();
                 let mut qkv_gate_vecs: Vec<Option<MetalBuffer>> = Vec::with_capacity(n_gdn_layers);
@@ -1003,7 +1143,7 @@ impl MetalF32Backend {
                         continue;
                     }
                     let attn_gate_off = match meta.attn_gate_off {
-                        Some(_) => {},
+                        Some(_) => {}
                         None => {
                             qkv_gate_vecs.push(None);
                             qkv_gate_shapes.push(None);
@@ -1014,7 +1154,8 @@ impl MetalF32Backend {
 
                     let lv = weights.get_layer_raw(layer).map_err(|e| {
                         RuntimeError::Compute(format!(
-                            " BF16 GDN paired repack: failed to get layer {}: {}", layer, e
+                            " BF16 GDN paired repack: failed to get layer {}: {}",
+                            layer, e
                         ))
                     })?;
                     let st = &lv.subtensors;
@@ -1038,11 +1179,9 @@ impl MetalF32Backend {
 
                     // Derive the projection N dimensions from the BF16 tensor lengths
                     // (each tensor is `N * K * 2` bytes).
-                    let row_bytes = hidden_dim_u
-                        .checked_mul(2)
-                        .ok_or_else(|| RuntimeError::Compute(
-                            " BF16 repack: hidden_dim * 2 overflow".into()
-                        ))?;
+                    let row_bytes = hidden_dim_u.checked_mul(2).ok_or_else(|| {
+                        RuntimeError::Compute(" BF16 repack: hidden_dim * 2 overflow".into())
+                    })?;
                     if row_bytes == 0 {
                         qkv_gate_vecs.push(None);
                         qkv_gate_shapes.push(None);
@@ -1075,17 +1214,24 @@ impl MetalF32Backend {
 
                     let src_qkv = lv.subtensor_bytes(&st.wq).map_err(|e| {
                         RuntimeError::Compute(format!(
-                            " BF16 repack: failed to read wq at layer {}: {}", layer, e
+                            " BF16 repack: failed to read wq at layer {}: {}",
+                            layer, e
                         ))
                     })?;
                     let src_gate = lv.subtensor_bytes(attn_gate_st).map_err(|e| {
                         RuntimeError::Compute(format!(
-                            " BF16 repack: failed to read attn_gate at layer {}: {}", layer, e
+                            " BF16 repack: failed to read attn_gate at layer {}: {}",
+                            layer, e
                         ))
                     })?;
 
                     let buf = super::repack_bf16::build_repacked_buffer_qkv_gate(
-                        &self.device, src_qkv, src_gate, qkv_n, gate_n, hidden_dim_u,
+                        &self.device,
+                        src_qkv,
+                        src_gate,
+                        qkv_n,
+                        gate_n,
+                        hidden_dim_u,
                     );
                     match buf {
                         Ok(b) => {
@@ -1172,55 +1318,70 @@ impl MetalF32Backend {
                     .unwrap_or_else(|| "minimal".to_string());
                 if warmup_enabled {
                     if let Some(pipelines) = self.pipelines.as_ref() {
-                    let any_populated = s.repacked_gdn_qkv_gate_bf16.iter().any(|o| o.is_some());
-                    if any_populated {
-                        if let Some(cmd) = self.queue.new_command_buffer() {
-                            if let Some(enc) = cmd.new_compute_encoder() {
-                                if warmup_mode == "full" {
-                                    // Production-shape warmup using the actual
-                                    // paired GEMM kernel at M=32 (TILE_M).
-                                    // Commits page-table for every byte that
-                                    // the production dispatch will touch.
-                                    let k_u32 = hidden_dim_u as u32;
-                                    enc.set_pipeline_state(&pipelines.tiled_matmul_bf16_k64_qkv_gate_paired);
-                                    enc.set_threadgroup_memory_length(8192, 0);
-                                    for (slot, buf_opt) in s.repacked_gdn_qkv_gate_bf16.iter().enumerate() {
-                                        let Some(packed_buf) = buf_opt.as_ref() else { continue };
-                                        let Some(shape_opt) = qkv_gate_shapes.get(slot) else { continue };
-                                        let Some((qkv_n_u32, gate_n_u32)) = *shape_opt else { continue };
-                                        let n_total = qkv_n_u32 as u64 + gate_n_u32 as u64;
-                                        if n_total == 0 { continue; }
-                                        enc.set_buffer(packed_buf, 0, 0);
-                                        enc.set_buffer(&s.normed_buf, 0, 1);
-                                        enc.set_buffer(&s.qkv_buf, 0, 2);
-                                        enc.set_buffer(&s.gate_buf, 0, 3);
-                                        enc.set_bytes(&32u32.to_le_bytes(), 4);
-                                        enc.set_bytes(&qkv_n_u32.to_le_bytes(), 5);
-                                        enc.set_bytes(&gate_n_u32.to_le_bytes(), 6);
-                                        enc.set_bytes(&k_u32.to_le_bytes(), 7);
-                                        enc.dispatch_threadgroups(
-                                            MTLSize::new(n_total.div_ceil(32), 1, 1),
-                                            MTLSize::new(128, 1, 1),
+                        let any_populated =
+                            s.repacked_gdn_qkv_gate_bf16.iter().any(|o| o.is_some());
+                        if any_populated {
+                            if let Some(cmd) = self.queue.new_command_buffer() {
+                                if let Some(enc) = cmd.new_compute_encoder() {
+                                    if warmup_mode == "full" {
+                                        // Production-shape warmup using the actual
+                                        // paired GEMM kernel at M=32 (TILE_M).
+                                        // Commits page-table for every byte that
+                                        // the production dispatch will touch.
+                                        let k_u32 = hidden_dim_u as u32;
+                                        enc.set_pipeline_state(
+                                            &pipelines.tiled_matmul_bf16_k64_qkv_gate_paired,
                                         );
+                                        enc.set_threadgroup_memory_length(8192, 0);
+                                        for (slot, buf_opt) in
+                                            s.repacked_gdn_qkv_gate_bf16.iter().enumerate()
+                                        {
+                                            let Some(packed_buf) = buf_opt.as_ref() else {
+                                                continue;
+                                            };
+                                            let Some(shape_opt) = qkv_gate_shapes.get(slot) else {
+                                                continue;
+                                            };
+                                            let Some((qkv_n_u32, gate_n_u32)) = *shape_opt else {
+                                                continue;
+                                            };
+                                            let n_total = qkv_n_u32 as u64 + gate_n_u32 as u64;
+                                            if n_total == 0 {
+                                                continue;
+                                            }
+                                            enc.set_buffer(packed_buf, 0, 0);
+                                            enc.set_buffer(&s.normed_buf, 0, 1);
+                                            enc.set_buffer(&s.qkv_buf, 0, 2);
+                                            enc.set_buffer(&s.gate_buf, 0, 3);
+                                            enc.set_bytes(&32u32.to_le_bytes(), 4);
+                                            enc.set_bytes(&qkv_n_u32.to_le_bytes(), 5);
+                                            enc.set_bytes(&gate_n_u32.to_le_bytes(), 6);
+                                            enc.set_bytes(&k_u32.to_le_bytes(), 7);
+                                            enc.dispatch_threadgroups(
+                                                MTLSize::new(n_total.div_ceil(32), 1, 1),
+                                                MTLSize::new(128, 1, 1),
+                                            );
+                                        }
+                                    } else {
+                                        // Minimal warmup: 1-thread no-op per layer.
+                                        enc.set_pipeline_state(&pipelines.bf16_paired_warmup);
+                                        for buf_opt in s.repacked_gdn_qkv_gate_bf16.iter() {
+                                            let Some(packed_buf) = buf_opt.as_ref() else {
+                                                continue;
+                                            };
+                                            enc.set_buffer(packed_buf, 0, 0);
+                                            enc.set_buffer(&s.qkv_buf, 0, 1);
+                                            enc.dispatch_threadgroups(
+                                                MTLSize::new(1, 1, 1),
+                                                MTLSize::new(1, 1, 1),
+                                            );
+                                        }
                                     }
-                                } else {
-                                    // Minimal warmup: 1-thread no-op per layer.
-                                    enc.set_pipeline_state(&pipelines.bf16_paired_warmup);
-                                    for buf_opt in s.repacked_gdn_qkv_gate_bf16.iter() {
-                                        let Some(packed_buf) = buf_opt.as_ref() else { continue };
-                                        enc.set_buffer(packed_buf, 0, 0);
-                                        enc.set_buffer(&s.qkv_buf, 0, 1);
-                                        enc.dispatch_threadgroups(
-                                            MTLSize::new(1, 1, 1),
-                                            MTLSize::new(1, 1, 1),
-                                        );
-                                    }
+                                    enc.end_encoding();
                                 }
-                                enc.end_encoding();
+                                cmd.commit_and_wait();
                             }
-                            cmd.commit_and_wait();
                         }
-                    }
                     }
                 }
             }
@@ -1285,9 +1446,7 @@ impl MetalF32Backend {
                 // guard is the same `scratch_guard` opened at the top of
                 // this function (still held here).
                 let s_ref = scratch_guard.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute(
-                        "scratch unexpectedly None at warmup time".into(),
-                    )
+                    RuntimeError::Compute("scratch unexpectedly None at warmup time".into())
                 })?;
                 let any_populated = s_ref.repacked_gdn_qkv_gate_bf16.iter().any(|o| o.is_some());
                 let num_kv_heads_u = s_ref.num_kv_heads;

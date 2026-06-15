@@ -12,11 +12,11 @@
 pub(crate) mod ffi;
 
 use self::ffi::{cblas_sgemm, CblasOrder, CblasTranspose};
-use crate::weight::cache::{LayerView, WeightProvider};
+use crate::compute::simd_kernels;
 use crate::error::RuntimeError;
 use crate::kv::{KvCache, KvCacheView};
-use crate::compute::simd_kernels;
 use crate::thread_pool::ThreadPool;
+use crate::weight::cache::{LayerView, WeightProvider};
 use lumen_format::hyperparams::ModelHyperparams;
 use lumen_format::quantization::QuantScheme;
 
@@ -39,17 +39,17 @@ pub struct AccelerateBatchBackend {
     dequant_buf: Vec<f32>,
 
     // Batch scratch buffers — all sized for [max_batch * dim]
-    x_batch: Vec<f32>,      // [batch, hidden_dim] — input activations
-    normed_batch: Vec<f32>,  // [batch, hidden_dim] — after RMSNorm
-    q_batch: Vec<f32>,       // [batch, q_dim]
-    k_batch: Vec<f32>,       // [batch, kv_dim]
-    v_batch: Vec<f32>,       // [batch, kv_dim]
-    attn_out_batch: Vec<f32>,// [batch, q_dim] — attention output per token
-    attn_proj_batch: Vec<f32>,// [batch, hidden_dim] — after Wo projection
-    gate_batch: Vec<f32>,    // [batch, inter_dim]
-    up_batch: Vec<f32>,      // [batch, inter_dim]
-    down_batch: Vec<f32>,    // [batch, hidden_dim]
-    scores: Vec<f32>,        // [num_heads, max_seq_len] — for per-token attention
+    x_batch: Vec<f32>,         // [batch, hidden_dim] — input activations
+    normed_batch: Vec<f32>,    // [batch, hidden_dim] — after RMSNorm
+    q_batch: Vec<f32>,         // [batch, q_dim]
+    k_batch: Vec<f32>,         // [batch, kv_dim]
+    v_batch: Vec<f32>,         // [batch, kv_dim]
+    attn_out_batch: Vec<f32>,  // [batch, q_dim] — attention output per token
+    attn_proj_batch: Vec<f32>, // [batch, hidden_dim] — after Wo projection
+    gate_batch: Vec<f32>,      // [batch, inter_dim]
+    up_batch: Vec<f32>,        // [batch, inter_dim]
+    down_batch: Vec<f32>,      // [batch, hidden_dim]
+    scores: Vec<f32>,          // [num_heads, max_seq_len] — for per-token attention
 
     // RoPE tables
     rope_cos: Vec<f32>,
@@ -186,11 +186,7 @@ impl AccelerateBatchBackend {
             };
             let mut kv_view = kv.view_mut(layer)?;
 
-            self.compute_layer_batched(
-                batch_size,
-                &layer_view,
-                &mut kv_view,
-            )?;
+            self.compute_layer_batched(batch_size, &layer_view, &mut kv_view)?;
 
             kv.commit_view(kv_view)?;
         }
@@ -248,28 +244,48 @@ impl AccelerateBatchBackend {
             let x_slice = &self.x_batch[x_start..x_start + hidden_dim];
             let out_slice = &mut self.normed_batch[t * hidden_dim..(t + 1) * hidden_dim];
             match st.attn_norm.quant {
-                QuantScheme::Q8_0 => simd_kernels::rmsnorm_q8_0_simd(out_slice, x_slice, attn_norm_bytes, eps),
+                QuantScheme::Q8_0 => {
+                    simd_kernels::rmsnorm_q8_0_simd(out_slice, x_slice, attn_norm_bytes, eps)
+                }
                 _ => simd_kernels::rmsnorm_bytes_simd(out_slice, x_slice, attn_norm_bytes, eps),
             }
         }
 
         // ---- 2. Q projection: [batch, hidden_dim] x W_q^T -> [batch, q_dim] ----
         dequant_and_gemm(
-            &mut self.q_batch, &self.normed_batch, &mut self.dequant_buf,
-            wq_bytes, st.wq.quant,
-            batch_size, q_dim, hidden_dim, &self.pool,
+            &mut self.q_batch,
+            &self.normed_batch,
+            &mut self.dequant_buf,
+            wq_bytes,
+            st.wq.quant,
+            batch_size,
+            q_dim,
+            hidden_dim,
+            &self.pool,
         );
 
         // ---- 3. K, V projections ----
         dequant_and_gemm(
-            &mut self.k_batch, &self.normed_batch, &mut self.dequant_buf,
-            wk_bytes, st.wk.quant,
-            batch_size, kv_dim, hidden_dim, &self.pool,
+            &mut self.k_batch,
+            &self.normed_batch,
+            &mut self.dequant_buf,
+            wk_bytes,
+            st.wk.quant,
+            batch_size,
+            kv_dim,
+            hidden_dim,
+            &self.pool,
         );
         dequant_and_gemm(
-            &mut self.v_batch, &self.normed_batch, &mut self.dequant_buf,
-            wv_bytes, st.wv.quant,
-            batch_size, kv_dim, hidden_dim, &self.pool,
+            &mut self.v_batch,
+            &self.normed_batch,
+            &mut self.dequant_buf,
+            wv_bytes,
+            st.wv.quant,
+            batch_size,
+            kv_dim,
+            hidden_dim,
+            &self.pool,
         );
 
         // ---- 4. RoPE per-token + write KV cache ----
@@ -281,9 +297,15 @@ impl AccelerateBatchBackend {
             let k_slice = &mut self.k_batch[k_start..k_start + kv_dim];
 
             apply_rope_single(
-                q_slice, k_slice,
-                num_heads, num_kv_heads, head_dim, pos,
-                &self.rope_cos, &self.rope_sin, self.half_dim,
+                q_slice,
+                k_slice,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                pos,
+                &self.rope_cos,
+                &self.rope_sin,
+                self.half_dim,
             );
 
             // Pre-scale Q by attention scale
@@ -386,20 +408,23 @@ impl AccelerateBatchBackend {
                     let kv_h = h / gqa_ratio;
                     let kv_head_elem_base = kv_h * kv_max_seq_len * head_dim;
 
-                    let q_head = &self.q_batch[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
+                    let q_head =
+                        &self.q_batch[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
 
                     let scores_start = h * max_seq_len;
                     for p in 0..attend_len {
                         let k_elem_start = kv_head_elem_base + p * head_dim;
                         let k_slice = kv.keys_f32_slice(k_elem_start, head_dim);
-                        self.scores[scores_start + p] = simd_kernels::dot_product_simd(q_head, k_slice);
+                        self.scores[scores_start + p] =
+                            simd_kernels::dot_product_simd(q_head, k_slice);
                     }
 
                     simd_kernels::softmax_inplace_simd(
                         &mut self.scores[scores_start..scores_start + attend_len],
                     );
 
-                    let out_head = &mut self.attn_out_batch[attn_out_start + h * head_dim..attn_out_start + (h + 1) * head_dim];
+                    let out_head = &mut self.attn_out_batch
+                        [attn_out_start + h * head_dim..attn_out_start + (h + 1) * head_dim];
                     out_head.fill(0.0);
                     for p in 0..attend_len {
                         let score = self.scores[scores_start + p];
@@ -413,17 +438,20 @@ impl AccelerateBatchBackend {
 
         // ---- 6. Wo projection: [batch, q_dim] x W_o^T -> [batch, hidden_dim] ----
         dequant_and_gemm(
-            &mut self.attn_proj_batch, &self.attn_out_batch, &mut self.dequant_buf,
-            wo_bytes, st.wo.quant,
-            batch_size, hidden_dim, q_dim, &self.pool,
+            &mut self.attn_proj_batch,
+            &self.attn_out_batch,
+            &mut self.dequant_buf,
+            wo_bytes,
+            st.wo.quant,
+            batch_size,
+            hidden_dim,
+            q_dim,
+            &self.pool,
         );
 
         // ---- 7. Residual add: x_batch += attn_proj_batch ----
         let n = batch_size * hidden_dim;
-        simd_kernels::vadd_inplace_simd(
-            &mut self.x_batch[..n],
-            &self.attn_proj_batch[..n],
-        );
+        simd_kernels::vadd_inplace_simd(&mut self.x_batch[..n], &self.attn_proj_batch[..n]);
 
         // ---- 8. FFN RMSNorm ----
         for t in 0..batch_size {
@@ -431,21 +459,35 @@ impl AccelerateBatchBackend {
             let x_slice = &self.x_batch[x_start..x_start + hidden_dim];
             let out_slice = &mut self.normed_batch[t * hidden_dim..(t + 1) * hidden_dim];
             match st.ffn_norm.quant {
-                QuantScheme::Q8_0 => simd_kernels::rmsnorm_q8_0_simd(out_slice, x_slice, ffn_norm_bytes, eps),
+                QuantScheme::Q8_0 => {
+                    simd_kernels::rmsnorm_q8_0_simd(out_slice, x_slice, ffn_norm_bytes, eps)
+                }
                 _ => simd_kernels::rmsnorm_bytes_simd(out_slice, x_slice, ffn_norm_bytes, eps),
             }
         }
 
         // ---- 9. Gate + Up projections ----
         dequant_and_gemm(
-            &mut self.gate_batch, &self.normed_batch, &mut self.dequant_buf,
-            w_gate_bytes, st.w_gate.quant,
-            batch_size, inter_dim, hidden_dim, &self.pool,
+            &mut self.gate_batch,
+            &self.normed_batch,
+            &mut self.dequant_buf,
+            w_gate_bytes,
+            st.w_gate.quant,
+            batch_size,
+            inter_dim,
+            hidden_dim,
+            &self.pool,
         );
         dequant_and_gemm(
-            &mut self.up_batch, &self.normed_batch, &mut self.dequant_buf,
-            w_up_bytes, st.w_up.quant,
-            batch_size, inter_dim, hidden_dim, &self.pool,
+            &mut self.up_batch,
+            &self.normed_batch,
+            &mut self.dequant_buf,
+            w_up_bytes,
+            st.w_up.quant,
+            batch_size,
+            inter_dim,
+            hidden_dim,
+            &self.pool,
         );
 
         // ---- 10. SwiGLU: gate = silu(gate) * up ----
@@ -456,24 +498,26 @@ impl AccelerateBatchBackend {
 
         // ---- 11. Down projection: [batch, inter_dim] x W_down^T -> [batch, hidden_dim] ----
         dequant_and_gemm(
-            &mut self.down_batch, &self.gate_batch, &mut self.dequant_buf,
-            w_down_bytes, st.w_down.quant,
-            batch_size, hidden_dim, inter_dim, &self.pool,
+            &mut self.down_batch,
+            &self.gate_batch,
+            &mut self.dequant_buf,
+            w_down_bytes,
+            st.w_down.quant,
+            batch_size,
+            hidden_dim,
+            inter_dim,
+            &self.pool,
         );
 
         // ---- 12. Residual add: x_batch += down_batch ----
         let n = batch_size * hidden_dim;
-        simd_kernels::vadd_inplace_simd(
-            &mut self.x_batch[..n],
-            &self.down_batch[..n],
-        );
+        simd_kernels::vadd_inplace_simd(&mut self.x_batch[..n], &self.down_batch[..n]);
 
         // Update KV cache seq_len
         kv.seq_len = new_total_seq_len;
 
         Ok(())
     }
-
 }
 
 /// Dequantize a weight matrix (if Q8_0) and perform batched GEMM via Accelerate.
@@ -502,10 +546,7 @@ fn dequant_and_gemm(
         }
         _ => {
             let w_f32 = unsafe {
-                std::slice::from_raw_parts(
-                    w_bytes.as_ptr() as *const f32,
-                    out_dim * in_dim,
-                )
+                std::slice::from_raw_parts(w_bytes.as_ptr() as *const f32, out_dim * in_dim)
             };
             gemm_batch(out, input, w_f32, batch_size, out_dim, in_dim);
         }
@@ -562,12 +603,7 @@ fn dequantize_q8_0_to_f32_parallel(
 /// (2 iterations per Q8_0 block). The NEON path vectorizes i8→f32 widening
 /// and scale multiplication for ~4-8x throughput over the scalar fallback.
 #[cfg(target_arch = "aarch64")]
-fn dequantize_q8_0_to_f32(
-    dst: &mut [f32],
-    q8_bytes: &[u8],
-    out_dim: usize,
-    in_dim: usize,
-) {
+fn dequantize_q8_0_to_f32(dst: &mut [f32], q8_bytes: &[u8], out_dim: usize, in_dim: usize) {
     use std::arch::aarch64::*;
 
     let num_blocks_per_row = in_dim.div_ceil(Q8_0_GROUP_SIZE);
@@ -579,10 +615,7 @@ fn dequantize_q8_0_to_f32(
 
         for b in 0..num_blocks_per_row {
             let block_start = row_start + b * Q8_0_BLOCK_SIZE;
-            let scale_bits = u16::from_le_bytes([
-                q8_bytes[block_start],
-                q8_bytes[block_start + 1],
-            ]);
+            let scale_bits = u16::from_le_bytes([q8_bytes[block_start], q8_bytes[block_start + 1]]);
             let scale = f16_to_f32(scale_bits);
 
             let elem_base = dst_row_start + b * Q8_0_GROUP_SIZE;
@@ -628,12 +661,7 @@ fn dequantize_q8_0_to_f32(
 
 /// Scalar fallback for non-aarch64 platforms.
 #[cfg(not(target_arch = "aarch64"))]
-fn dequantize_q8_0_to_f32(
-    dst: &mut [f32],
-    q8_bytes: &[u8],
-    out_dim: usize,
-    in_dim: usize,
-) {
+fn dequantize_q8_0_to_f32(dst: &mut [f32], q8_bytes: &[u8], out_dim: usize, in_dim: usize) {
     let num_blocks_per_row = in_dim.div_ceil(Q8_0_GROUP_SIZE);
     let row_bytes = num_blocks_per_row * Q8_0_BLOCK_SIZE;
 
@@ -643,10 +671,7 @@ fn dequantize_q8_0_to_f32(
 
         for b in 0..num_blocks_per_row {
             let block_start = row_start + b * Q8_0_BLOCK_SIZE;
-            let scale_bits = u16::from_le_bytes([
-                q8_bytes[block_start],
-                q8_bytes[block_start + 1],
-            ]);
+            let scale_bits = u16::from_le_bytes([q8_bytes[block_start], q8_bytes[block_start + 1]]);
             let scale = f16_to_f32(scale_bits);
 
             let elem_base = dst_row_start + b * Q8_0_GROUP_SIZE;
@@ -670,32 +695,37 @@ fn dequantize_q8_0_to_f32(
 ///   - out = result [batch_size x out_dim], row-major
 fn gemm_batch(
     out: &mut [f32],
-    a: &[f32],       // [M x K]
-    b: &[f32],       // [N x K] (will be transposed)
-    m: usize,        // batch_size
-    n: usize,        // out_dim
-    k: usize,        // in_dim
+    a: &[f32], // [M x K]
+    b: &[f32], // [N x K] (will be transposed)
+    m: usize,  // batch_size
+    n: usize,  // out_dim
+    k: usize,  // in_dim
 ) {
     debug_assert!(a.len() >= m * k, "a too small: {} < {}", a.len(), m * k);
     debug_assert!(b.len() >= n * k, "b too small: {} < {}", b.len(), n * k);
-    debug_assert!(out.len() >= m * n, "out too small: {} < {}", out.len(), m * n);
+    debug_assert!(
+        out.len() >= m * n,
+        "out too small: {} < {}",
+        out.len(),
+        m * n
+    );
 
     unsafe {
         cblas_sgemm(
             CblasOrder::RowMajor,
-            CblasTranspose::NoTrans,  // A is already [M x K]
-            CblasTranspose::Trans,    // B stored as [N x K], transposed to [K x N]
-            m as i32,                 // M = batch_size
-            n as i32,                 // N = out_dim
-            k as i32,                 // K = in_dim
-            1.0,                      // alpha
+            CblasTranspose::NoTrans, // A is already [M x K]
+            CblasTranspose::Trans,   // B stored as [N x K], transposed to [K x N]
+            m as i32,                // M = batch_size
+            n as i32,                // N = out_dim
+            k as i32,                // K = in_dim
+            1.0,                     // alpha
             a.as_ptr(),
-            k as i32,                 // lda = K (row stride of A)
+            k as i32, // lda = K (row stride of A)
             b.as_ptr(),
-            k as i32,                 // ldb = K (row stride of B before transpose)
-            0.0,                      // beta
+            k as i32, // ldb = K (row stride of B before transpose)
+            0.0,      // beta
             out.as_mut_ptr(),
-            n as i32,                 // ldc = N (row stride of C)
+            n as i32, // ldc = N (row stride of C)
         );
     }
 }
@@ -735,13 +765,21 @@ fn f16_to_f32(bits: u16) -> f32 {
     }
     if exp == 31 {
         return if frac == 0 {
-            if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY }
+            if sign == 1 {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            }
         } else {
             f32::NAN
         };
     }
     let v = 2.0f32.powi(exp as i32 - 15) * (1.0 + frac as f32 / 1024.0);
-    if sign == 1 { -v } else { v }
+    if sign == 1 {
+        -v
+    } else {
+        v
+    }
 }
 
 /// Apply RoPE to Q and K for a single token at a given position.
@@ -779,8 +817,10 @@ fn apply_rope_single(
                     let cos_vec = vld1q_f32(rope_cos.as_ptr().add(cos_base + i));
                     let sin_vec = vld1q_f32(rope_sin.as_ptr().add(sin_base + i));
                     let neg_sin = vnegq_f32(sin_vec);
-                    let new_evens = vfmaq_f32(vmulq_f32(interleaved.0, cos_vec), interleaved.1, neg_sin);
-                    let new_odds = vfmaq_f32(vmulq_f32(interleaved.1, cos_vec), interleaved.0, sin_vec);
+                    let new_evens =
+                        vfmaq_f32(vmulq_f32(interleaved.0, cos_vec), interleaved.1, neg_sin);
+                    let new_odds =
+                        vfmaq_f32(vmulq_f32(interleaved.1, cos_vec), interleaved.0, sin_vec);
                     vst2q_f32(q.as_mut_ptr().add(idx), float32x4x2_t(new_evens, new_odds));
                 }
                 for i in tail_start..half_dim {
@@ -788,10 +828,10 @@ fn apply_rope_single(
                     let idx1 = idx0 + 1;
                     let v0 = *q.get_unchecked(idx0);
                     let v1 = *q.get_unchecked(idx1);
-                    *q.get_unchecked_mut(idx0) =
-                        v0 * *rope_cos.get_unchecked(cos_base + i) - v1 * *rope_sin.get_unchecked(sin_base + i);
-                    *q.get_unchecked_mut(idx1) =
-                        v0 * *rope_sin.get_unchecked(sin_base + i) + v1 * *rope_cos.get_unchecked(cos_base + i);
+                    *q.get_unchecked_mut(idx0) = v0 * *rope_cos.get_unchecked(cos_base + i)
+                        - v1 * *rope_sin.get_unchecked(sin_base + i);
+                    *q.get_unchecked_mut(idx1) = v0 * *rope_sin.get_unchecked(sin_base + i)
+                        + v1 * *rope_cos.get_unchecked(cos_base + i);
                 }
             }
             for h in 0..num_kv_heads {
@@ -803,8 +843,10 @@ fn apply_rope_single(
                     let cos_vec = vld1q_f32(rope_cos.as_ptr().add(cos_base + i));
                     let sin_vec = vld1q_f32(rope_sin.as_ptr().add(sin_base + i));
                     let neg_sin = vnegq_f32(sin_vec);
-                    let new_evens = vfmaq_f32(vmulq_f32(interleaved.0, cos_vec), interleaved.1, neg_sin);
-                    let new_odds = vfmaq_f32(vmulq_f32(interleaved.1, cos_vec), interleaved.0, sin_vec);
+                    let new_evens =
+                        vfmaq_f32(vmulq_f32(interleaved.0, cos_vec), interleaved.1, neg_sin);
+                    let new_odds =
+                        vfmaq_f32(vmulq_f32(interleaved.1, cos_vec), interleaved.0, sin_vec);
                     vst2q_f32(k.as_mut_ptr().add(idx), float32x4x2_t(new_evens, new_odds));
                 }
                 for i in tail_start..half_dim {
@@ -812,10 +854,10 @@ fn apply_rope_single(
                     let idx1 = idx0 + 1;
                     let v0 = *k.get_unchecked(idx0);
                     let v1 = *k.get_unchecked(idx1);
-                    *k.get_unchecked_mut(idx0) =
-                        v0 * *rope_cos.get_unchecked(cos_base + i) - v1 * *rope_sin.get_unchecked(sin_base + i);
-                    *k.get_unchecked_mut(idx1) =
-                        v0 * *rope_sin.get_unchecked(sin_base + i) + v1 * *rope_cos.get_unchecked(cos_base + i);
+                    *k.get_unchecked_mut(idx0) = v0 * *rope_cos.get_unchecked(cos_base + i)
+                        - v1 * *rope_sin.get_unchecked(sin_base + i);
+                    *k.get_unchecked_mut(idx1) = v0 * *rope_sin.get_unchecked(sin_base + i)
+                        + v1 * *rope_cos.get_unchecked(cos_base + i);
                 }
             }
         }
@@ -870,7 +912,8 @@ mod tests {
             let expected = j as f32; // scale=1.0 * q=j
             assert!(
                 (dst[j] - expected).abs() < 1e-3,
-                "dst[{j}] = {}, expected {expected}", dst[j]
+                "dst[{j}] = {}, expected {expected}",
+                dst[j]
             );
         }
     }
@@ -887,7 +930,9 @@ mod tests {
         for i in 0..6 {
             assert!(
                 (out[i] - a[i]).abs() < 1e-5,
-                "out[{i}] = {}, expected {}", out[i], a[i]
+                "out[{i}] = {}, expected {}",
+                out[i],
+                a[i]
             );
         }
     }
@@ -907,7 +952,9 @@ mod tests {
         for i in 0..4 {
             assert!(
                 (out[i] - expected[i]).abs() < 1e-4,
-                "out[{i}] = {}, expected {}", out[i], expected[i]
+                "out[{i}] = {}, expected {}",
+                out[i],
+                expected[i]
             );
         }
     }

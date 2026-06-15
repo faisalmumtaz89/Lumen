@@ -730,18 +730,24 @@ fn canonical_default_on() -> bool {
 
 /// Per-process default for `LUMEN_CUDA_MOE_BATCHED` when the env is unset.
 /// ON by default — fires only for MoE models, no effect on dense.
-pub fn moe_batched_default() -> bool { canonical_default_on() }
+pub fn moe_batched_default() -> bool {
+    canonical_default_on()
+}
 
 /// Per-process default for `LUMEN_CUDA_MOE_ROUTER_PARALLEL` when unset.
 /// ON by default — fires only for MoE, dispatches the two-launch parallel
 /// router instead of the sequential single-CTA router.
-pub fn moe_router_parallel_default() -> bool { canonical_default_on() }
+pub fn moe_router_parallel_default() -> bool {
+    canonical_default_on()
+}
 
 /// Per-process default for `LUMEN_CUDA_GDN_REGISTER_RESIDENT` when unset.
 /// ON by default — fires only for GDN models (Qwen3.5 family).
 /// Finding: the two-launch phase 4 update is byte-identical to the reference
 /// path.
-pub fn gdn_register_resident_default() -> bool { canonical_default_on() }
+pub fn gdn_register_resident_default() -> bool {
+    canonical_default_on()
+}
 
 /// Per-process default for `LUMEN_CUDA_GDN_F64_ACCUM` when the operator does
 /// not set it explicitly.
@@ -832,7 +838,9 @@ pub fn gdn_f64_accum_default() -> bool {
 /// recurrence also contributes). Kept as opt-in for the record; default OFF so
 /// MoE q8 stays at its rep2/391 baseline. The real fix must make decode GDN
 /// (projection AND recurrence) numerically equal prefill.
-pub fn gdn_decode_proj_mmq_default() -> bool { false }
+pub fn gdn_decode_proj_mmq_default() -> bool {
+    false
+}
 
 /// Per-process default for `LUMEN_CUDA_GDN_DECODE_AB_MMQ` (alpha/beta-only
 /// decode-vs-prefill projection alignment) when the operator does not set it.
@@ -903,7 +911,9 @@ pub fn gdn_decode_proj_mmq_default() -> bool { false }
 /// (`GDN_PHASE123_F64`) found regresses — i.e. it is the documented diffuse
 /// cross-engine numeric-fidelity problem, not closable by this projection
 /// lever alone.
-pub fn gdn_decode_ab_mmq_default() -> bool { false }
+pub fn gdn_decode_ab_mmq_default() -> bool {
+    false
+}
 
 /// Per-process default for `LUMEN_CUDA_GDN_AB_F16` — route the GDN
 /// `ssm_alpha` / `ssm_beta` projections through a pre-dequanted **F16**
@@ -935,7 +945,9 @@ pub fn gdn_decode_ab_mmq_default() -> bool { false }
 /// MoE-default-ON (2026-06-09 GQ validation: the parity stack makes MoE q8/q4
 /// PRISTINE and clears bf16 gross garble); dense byte-identical (gate requires
 /// `model_is_moe()`). Set `LUMEN_CUDA_GDN_AB_F16=0|1` to override the per-model default.
-pub fn gdn_ab_f16_default() -> bool { true }
+pub fn gdn_ab_f16_default() -> bool {
+    true
+}
 
 /// Per-process default for `LUMEN_CUDA_GDN_RECUR_PREFILL_ORDER` — route the GDN
 /// **decode** delta-rule state update through a variant whose arithmetic is
@@ -962,7 +974,9 @@ pub fn gdn_ab_f16_default() -> bool { true }
 /// Default-OFF until proven net-positive on the GQ suite; dense byte-identical
 /// (gate requires `model_is_moe()`). Set
 /// `LUMEN_CUDA_GDN_RECUR_PREFILL_ORDER=0|1` to override the per-model default.
-pub fn gdn_recur_prefill_order_default() -> bool { false }
+pub fn gdn_recur_prefill_order_default() -> bool {
+    false
+}
 
 /// Per-process default for `LUMEN_CUDA_GDN_PHASE123_ALIGN` — align the GDN
 /// **decode** phase123 (conv1d + SiLU + L2-norm) to the **prefill** phase123
@@ -987,7 +1001,9 @@ pub fn gdn_recur_prefill_order_default() -> bool { false }
 /// (gate requires `model_is_moe()`). Run together with `LUMEN_CUDA_GDN_AB_F16=1`
 /// (projection prerequisite). Set `LUMEN_CUDA_GDN_PHASE123_ALIGN=0|1` to
 /// override the per-model default.
-pub fn gdn_phase123_align_default() -> bool { false }
+pub fn gdn_phase123_align_default() -> bool {
+    false
+}
 
 /// Per-process default for `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL` — the combined
 /// GDN-decode==GDN-prefill structural-parity lever (ALL GDN models).
@@ -1062,7 +1078,10 @@ pub fn gdn_decode_via_prefill_default() -> bool {
     // removing the carve-out is a provable no-op on the Metal/CPU build.
     // `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL=0|1` overrides either way.
     let dense_bf16 = MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) == HINT_BF16;
-    let small = { let l = model_block_count(); l > 0 && l <= 32 };
+    let small = {
+        let l = model_block_count();
+        l > 0 && l <= 32
+    };
     // 27B-bf16 large carve-out removed: `|| (dense_bf16 && large)` folded in,
     // making the expression total. Kept factored for readability + future
     // re-split.
@@ -1100,7 +1119,9 @@ pub fn gdn_decode_via_prefill_default() -> bool {
 /// byte-identical (gate requires `model_is_moe()`). Requires
 /// `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL` to be effective (it only matters for the
 /// via-prefill conv consume). Set `LUMEN_CUDA_GDN_CONVSTATE_PARITY=0|1` to override.
-pub fn gdn_convstate_parity_default() -> bool { true }
+pub fn gdn_convstate_parity_default() -> bool {
+    true
+}
 
 /// Per-process default for the greedy anti-degeneration guard
 /// (`SamplingParams::anti_restate`).
@@ -1159,20 +1180,28 @@ pub fn anti_restate_default() -> bool {
 
 /// Per-process default for `LUMEN_CUDA_BF16_MOE_V3` when unset. ON by
 /// default — fires only for BF16 MoE expert dispatch.
-pub fn bf16_moe_v3_default() -> bool { canonical_default_on() }
+pub fn bf16_moe_v3_default() -> bool {
+    canonical_default_on()
+}
 
 /// Per-process default for `LUMEN_CUDA_MOE_Q4_V3` when unset. ON by
 /// default — fires only for Q4 MoE expert dispatch.
-pub fn moe_q4_v3_default() -> bool { canonical_default_on() }
+pub fn moe_q4_v3_default() -> bool {
+    canonical_default_on()
+}
 
 /// Per-process default for `LUMEN_CUDA_MOE_Q4_V3B` when unset. ON by
 /// default — fires only for Q4 MoE; gated by V3 also being ON.
-pub fn moe_q4_v3b_default() -> bool { canonical_default_on() }
+pub fn moe_q4_v3b_default() -> bool {
+    canonical_default_on()
+}
 
 /// Per-process default for `LUMEN_CUDA_MMV_Q_OUTPUT_PROJ` when unset. ON
 /// by default — affects dense Q8/Q4 output projection. finding:
 /// the fused matvec saves ~25% on the vocab projection.
-pub fn mmv_q_output_proj_default() -> bool { canonical_default_on() }
+pub fn mmv_q_output_proj_default() -> bool {
+    canonical_default_on()
+}
 
 /// Per-process default for `LUMEN_CUDA_FFN_FUSED_GLU` "skip" gate when
 /// unset. The env-var semantics are inverted (`=0` SKIPS the fused kernel,
@@ -1227,25 +1256,35 @@ pub fn q8_split_default() -> bool {
 /// Per-process default for `LUMEN_CUDA_OUTPUT_PROJ_SPLIT` when unset. ON
 /// for Q8 dense (output projection in particular). Same gating logic as
 /// `q8_split_default`.
-pub fn output_proj_split_default() -> bool { q8_split_default() }
+pub fn output_proj_split_default() -> bool {
+    q8_split_default()
+}
 
 /// Per-process default for `LUMEN_CUDA_Q8_SCALE_HW` when unset. ON for
 /// Q8 dense (prefer the `matvec_q8_aligned_q8_1_hw` kernel that uses
 /// hardware-scale dp4a; no-op when the kernel is absent or not Q8 dense).
-pub fn q8_scale_hw_default() -> bool { q8_split_default() }
+pub fn q8_scale_hw_default() -> bool {
+    q8_split_default()
+}
 
 /// Per-process default for `LUMEN_CUDA_OUTPUT_PROJ_NR` when unset. Returns
 /// `16` for Q8 dense (the measured optimum). `1` is the legacy
 /// default for any other configuration.
 pub fn output_proj_nr_default() -> u32 {
-    if q8_split_default() { 16 } else { 1 }
+    if q8_split_default() {
+        16
+    } else {
+        1
+    }
 }
 
 /// Per-process default for `LUMEN_CUDA_MOE_DECODE_GRAPH` when unset.
 /// MoE-only graph capture; measured 0.00% paired delta but the ON path is
 /// byte-identical, so we ship it ON for MoE to keep the canonical flag stack
 /// reproducible without env juggling. No-op for dense models.
-pub fn moe_decode_graph_default() -> bool { canonical_default_on() }
+pub fn moe_decode_graph_default() -> bool {
+    canonical_default_on()
+}
 
 // ---------------------------------------------------------------------------
 // Env-var typo validator
@@ -1515,7 +1554,11 @@ fn collect_unknown_lumen_env_vars() -> Vec<String> {
     let mut unknown_with_prefix: Vec<&String> = env_vars
         .iter()
         .filter(|k| k.starts_with("LUMEN_"))
-        .filter(|k| !KNOWN_LUMEN_ENV_VARS.iter().any(|known| *known == k.as_str()))
+        .filter(|k| {
+            !KNOWN_LUMEN_ENV_VARS
+                .iter()
+                .any(|known| *known == k.as_str())
+        })
         .collect();
     unknown_with_prefix.sort();
     for name in unknown_with_prefix {
@@ -1538,8 +1581,7 @@ fn collect_unknown_lumen_env_vars() -> Vec<String> {
     // prevents emitting the same warning twice if e.g. `PER_JOB_RESET`
     // matches both `LUMEN_SERVER_PER_JOB_RESET` and (hypothetically) other
     // roots.
-    let mut already_seen: std::collections::HashSet<&String> =
-        std::collections::HashSet::new();
+    let mut already_seen: std::collections::HashSet<&String> = std::collections::HashSet::new();
     let mut suffix_warnings: Vec<String> = Vec::new();
     for non_lumen in env_vars.iter().filter(|k| !k.starts_with("LUMEN_")) {
         if non_lumen.len() < 6 {
@@ -1698,12 +1740,24 @@ mod tests {
         // paths; LUMEN_METAL_DECODE_DELAY_US remains available for diagnostics.
         reset_for_tests();
         set_path_is_server(true);
-        assert_eq!(metal_decode_delay_us_default(), 0, "Metal server default must be 0 (DET-001 fixed)");
+        assert_eq!(
+            metal_decode_delay_us_default(),
+            0,
+            "Metal server default must be 0 (DET-001 fixed)"
+        );
         reset_for_tests();
         set_path_is_server(false);
-        assert_eq!(metal_decode_delay_us_default(), 0, "Metal CLI default must be 0 (DET-001 fixed)");
+        assert_eq!(
+            metal_decode_delay_us_default(),
+            0,
+            "Metal CLI default must be 0 (DET-001 fixed)"
+        );
         reset_for_tests();
-        assert_eq!(metal_decode_delay_us_default(), 0, "Metal default must be 0 even with no setter call");
+        assert_eq!(
+            metal_decode_delay_us_default(),
+            0,
+            "Metal default must be 0 even with no setter call"
+        );
     }
 
     #[test]
@@ -1732,7 +1786,11 @@ mod tests {
         // still get conservative WMMA (0). The per-quant `match` arm is kept so
         // a class can be re-split out on future evidence.
         reset_for_tests();
-        assert_eq!(attn_precise_default(), 0, "unset block count -> legacy WMMA");
+        assert_eq!(
+            attn_precise_default(),
+            0,
+            "unset block count -> legacy WMMA"
+        );
 
         // 9B (32-layer) dense: pvf32 regardless of quant.
         reset_for_tests();
@@ -1741,18 +1799,30 @@ mod tests {
         reset_for_tests();
         set_model_block_count(32);
         set_model_primary_quant(QuantScheme::Bf16);
-        assert_eq!(attn_precise_default(), 2, "dense 9B bf16 -> pvf32 (size wins)");
+        assert_eq!(
+            attn_precise_default(),
+            2,
+            "dense 9B bf16 -> pvf32 (size wins)"
+        );
 
         // 27B (64-layer) dense, per-quant discrimination — keyed on the PRIMARY
         // (bulk) scheme, NOT output_proj (which is Q8_0 for both q4 and q8).
         reset_for_tests();
         set_model_block_count(64);
         // No primary-quant set (legacy 27B caller) -> conservative legacy WMMA.
-        assert_eq!(attn_precise_default(), 0, "dense 27B, quant unset -> legacy WMMA");
+        assert_eq!(
+            attn_precise_default(),
+            0,
+            "dense 27B, quant unset -> legacy WMMA"
+        );
         reset_for_tests();
         set_model_block_count(64);
         set_model_primary_quant(QuantScheme::Q4_0);
-        assert_eq!(attn_precise_default(), 2, "dense 27B Q4_0 -> pvf32 (GQ-014 heal, no regression)");
+        assert_eq!(
+            attn_precise_default(),
+            2,
+            "dense 27B Q4_0 -> pvf32 (GQ-014 heal, no regression)"
+        );
         reset_for_tests();
         set_model_block_count(64);
         set_model_primary_quant(QuantScheme::Q8_0);
@@ -1760,7 +1830,11 @@ mod tests {
         reset_for_tests();
         set_model_block_count(64);
         set_model_primary_quant(QuantScheme::Bf16);
-        assert_eq!(attn_precise_default(), 2, "dense 27B bf16 -> pvf32 (paired with via-prefill ON)");
+        assert_eq!(
+            attn_precise_default(),
+            2,
+            "dense 27B bf16 -> pvf32 (paired with via-prefill ON)"
+        );
         // The crux of the 2026-06-12 root-cause: output_proj (Q8_0) must NOT be
         // what drives this — only the primary bulk scheme. Set the coarse
         // output_proj hint to Q8_0 (as a real q4 LBC does) WITHOUT a primary
@@ -1783,7 +1857,11 @@ mod tests {
         set_model_block_count(64);
         set_model_is_moe(true);
         set_model_primary_quant(QuantScheme::Bf16);
-        assert_eq!(attn_precise_default(), 2, "MoE bf16 -> pvf32 (MoE wins over bf16 carve-out)");
+        assert_eq!(
+            attn_precise_default(),
+            2,
+            "MoE bf16 -> pvf32 (MoE wins over bf16 carve-out)"
+        );
     }
 
     #[test]
@@ -1928,8 +2006,15 @@ mod tests {
             output_proj_split_default(),
             "Q8 dense should default OUTPUT_PROJ_SPLIT=ON"
         );
-        assert!(q8_scale_hw_default(), "Q8 dense should default Q8_SCALE_HW=ON");
-        assert_eq!(output_proj_nr_default(), 16, "Q8 dense should default NR=16");
+        assert!(
+            q8_scale_hw_default(),
+            "Q8 dense should default Q8_SCALE_HW=ON"
+        );
+        assert_eq!(
+            output_proj_nr_default(),
+            16,
+            "Q8 dense should default NR=16"
+        );
         assert!(
             ffn_fused_glu_skip_default(),
             "Q8 dense should default to SKIP fused GLU (use dp4a fall-through)"
@@ -1943,9 +2028,19 @@ mod tests {
         set_model_dense_quant(QuantScheme::Bf16);
         // BF16 dense is unaffected by Q8-only defaults; they stay legacy OFF.
         assert!(!q8_split_default(), "BF16 should NOT default Q8_SPLIT=ON");
-        assert!(!output_proj_split_default(), "BF16 should NOT default OUTPUT_PROJ_SPLIT=ON");
-        assert!(!q8_scale_hw_default(), "BF16 should NOT default Q8_SCALE_HW=ON");
-        assert_eq!(output_proj_nr_default(), 1, "BF16 should default NR=1 (legacy)");
+        assert!(
+            !output_proj_split_default(),
+            "BF16 should NOT default OUTPUT_PROJ_SPLIT=ON"
+        );
+        assert!(
+            !q8_scale_hw_default(),
+            "BF16 should NOT default Q8_SCALE_HW=ON"
+        );
+        assert_eq!(
+            output_proj_nr_default(),
+            1,
+            "BF16 should default NR=1 (legacy)"
+        );
         assert!(
             !ffn_fused_glu_skip_default(),
             "BF16 should NOT default to SKIP fused GLU (kernel is no-op anyway)"
@@ -1983,11 +2078,27 @@ mod tests {
         // Q8_SPLIT=1 corrupted the MoE Q8 decode path into PAD-token spam.
         set_model_dense_quant(QuantScheme::Q8_0);
         set_model_is_moe(true);
-        assert!(!q8_split_default(), "Q8 MoE should NOT default Q8_SPLIT=ON (PAD-spam regression)");
-        assert!(!output_proj_split_default(), "Q8 MoE should NOT default OUTPUT_PROJ_SPLIT=ON");
-        assert!(!q8_scale_hw_default(), "Q8 MoE should NOT default Q8_SCALE_HW=ON");
-        assert_eq!(output_proj_nr_default(), 1, "Q8 MoE should default NR=1 (legacy), not 16");
-        assert!(!ffn_fused_glu_skip_default(), "Q8 MoE should NOT default FFN_FUSED_GLU_SKIP=ON");
+        assert!(
+            !q8_split_default(),
+            "Q8 MoE should NOT default Q8_SPLIT=ON (PAD-spam regression)"
+        );
+        assert!(
+            !output_proj_split_default(),
+            "Q8 MoE should NOT default OUTPUT_PROJ_SPLIT=ON"
+        );
+        assert!(
+            !q8_scale_hw_default(),
+            "Q8 MoE should NOT default Q8_SCALE_HW=ON"
+        );
+        assert_eq!(
+            output_proj_nr_default(),
+            1,
+            "Q8 MoE should default NR=1 (legacy), not 16"
+        );
+        assert!(
+            !ffn_fused_glu_skip_default(),
+            "Q8 MoE should NOT default FFN_FUSED_GLU_SKIP=ON"
+        );
         // The shared MoE flags MUST stay ON (they fire only on MoE anyway).
         assert!(moe_batched_default());
         assert!(moe_router_parallel_default());
@@ -2004,7 +2115,10 @@ mod tests {
         // the entire Q8 split family ON so the dense Q8 configuration continues at 0.907× llama.cpp.
         set_model_dense_quant(QuantScheme::Q8_0);
         // set_model_is_moe NOT called → defaults to false (dense).
-        assert!(q8_split_default(), "Dense Q8 must keep Q8_SPLIT=ON for the dense Q8 0.907× llama.cpp");
+        assert!(
+            q8_split_default(),
+            "Dense Q8 must keep Q8_SPLIT=ON for the dense Q8 0.907× llama.cpp"
+        );
         assert!(output_proj_split_default());
         assert!(q8_scale_hw_default());
         assert_eq!(output_proj_nr_default(), 16);
@@ -2070,7 +2184,10 @@ mod tests {
         // gate is belt-and-suspenders and must stay OFF for byte-identity.
         reset_for_tests();
         set_model_dense_quant(QuantScheme::Q8_0);
-        assert!(!gdn_f64_accum_default(), "dense Q8 must default GDN_F64_ACCUM OFF");
+        assert!(
+            !gdn_f64_accum_default(),
+            "dense Q8 must default GDN_F64_ACCUM OFF"
+        );
 
         // Validated 2026-06-11: dense BF16 now defaults F64 ON —
         // the F32 GDN delta-rule decode recurrence accumulates ULP drift into
@@ -2078,7 +2195,10 @@ mod tests {
         // with decode-graph OFF).
         reset_for_tests();
         set_model_dense_quant(QuantScheme::Bf16);
-        assert!(gdn_f64_accum_default(), "dense BF16 must default GDN_F64_ACCUM ON (GAP-D)");
+        assert!(
+            gdn_f64_accum_default(),
+            "dense BF16 must default GDN_F64_ACCUM ON (GAP-D)"
+        );
 
         // MoE (set_model_is_moe(true)): ON for both q8 and bf16 — F64 on the
         // GDN single-token state update removes the decode-vs-prefill ULP
@@ -2086,16 +2206,25 @@ mod tests {
         reset_for_tests();
         set_model_dense_quant(QuantScheme::Q8_0);
         set_model_is_moe(true);
-        assert!(gdn_f64_accum_default(), "MoE Q8 must default GDN_F64_ACCUM ON");
+        assert!(
+            gdn_f64_accum_default(),
+            "MoE Q8 must default GDN_F64_ACCUM ON"
+        );
 
         reset_for_tests();
         set_model_dense_quant(QuantScheme::Bf16);
         set_model_is_moe(true);
-        assert!(gdn_f64_accum_default(), "MoE BF16 must default GDN_F64_ACCUM ON");
+        assert!(
+            gdn_f64_accum_default(),
+            "MoE BF16 must default GDN_F64_ACCUM ON"
+        );
 
         // Unset (no setters): OFF (dense default).
         reset_for_tests();
-        assert!(!gdn_f64_accum_default(), "unset hint defaults GDN_F64_ACCUM OFF");
+        assert!(
+            !gdn_f64_accum_default(),
+            "unset hint defaults GDN_F64_ACCUM OFF"
+        );
 
         reset_for_tests();
     }
@@ -2112,30 +2241,48 @@ mod tests {
         // (`LUMEN_CUDA_GDN_DECODE_AB_MMQ=1`). Must be OFF for dense AND MoE.
         reset_for_tests();
         set_model_dense_quant(QuantScheme::Q8_0);
-        assert!(!gdn_decode_ab_mmq_default(), "dense Q8 must default GDN_DECODE_AB_MMQ OFF");
+        assert!(
+            !gdn_decode_ab_mmq_default(),
+            "dense Q8 must default GDN_DECODE_AB_MMQ OFF"
+        );
 
         reset_for_tests();
         set_model_dense_quant(QuantScheme::Bf16);
-        assert!(!gdn_decode_ab_mmq_default(), "dense BF16 must default GDN_DECODE_AB_MMQ OFF");
+        assert!(
+            !gdn_decode_ab_mmq_default(),
+            "dense BF16 must default GDN_DECODE_AB_MMQ OFF"
+        );
 
         reset_for_tests();
         set_model_dense_quant(QuantScheme::Q8_0);
         set_model_is_moe(true);
-        assert!(!gdn_decode_ab_mmq_default(), "MoE Q8 must default GDN_DECODE_AB_MMQ OFF (regresses)");
+        assert!(
+            !gdn_decode_ab_mmq_default(),
+            "MoE Q8 must default GDN_DECODE_AB_MMQ OFF (regresses)"
+        );
 
         reset_for_tests();
         set_model_dense_quant(QuantScheme::Bf16);
         set_model_is_moe(true);
-        assert!(!gdn_decode_ab_mmq_default(), "MoE BF16 must default GDN_DECODE_AB_MMQ OFF (net-zero)");
+        assert!(
+            !gdn_decode_ab_mmq_default(),
+            "MoE BF16 must default GDN_DECODE_AB_MMQ OFF (net-zero)"
+        );
 
         reset_for_tests();
         set_model_dense_quant(QuantScheme::Q4_0);
         set_model_is_moe(true);
-        assert!(!gdn_decode_ab_mmq_default(), "MoE Q4 must default GDN_DECODE_AB_MMQ OFF (lever opt-in)");
+        assert!(
+            !gdn_decode_ab_mmq_default(),
+            "MoE Q4 must default GDN_DECODE_AB_MMQ OFF (lever opt-in)"
+        );
 
         // Unset (no setters): OFF.
         reset_for_tests();
-        assert!(!gdn_decode_ab_mmq_default(), "unset hint defaults GDN_DECODE_AB_MMQ OFF");
+        assert!(
+            !gdn_decode_ab_mmq_default(),
+            "unset hint defaults GDN_DECODE_AB_MMQ OFF"
+        );
 
         reset_for_tests();
     }
@@ -2157,9 +2304,7 @@ mod tests {
         );
         // And the suggestion list should include the correct name.
         assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains(canonical)),
+            warnings.iter().any(|w| w.contains(canonical)),
             "expected typo suggestion to surface canonical name; warnings = {warnings:?}"
         );
     }
@@ -2177,7 +2322,8 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|w| w.contains("'GDN_REGISTER_RESIDENT'") && w.contains("LUMEN_CUDA_GDN_REGISTER_RESIDENT")),
+                .any(|w| w.contains("'GDN_REGISTER_RESIDENT'")
+                    && w.contains("LUMEN_CUDA_GDN_REGISTER_RESIDENT")),
             "expected missing-prefix warning; warnings = {warnings:?}"
         );
     }
@@ -2269,9 +2415,15 @@ mod tests {
 
         // Per-request Some(_) is authoritative regardless of env.
         std::env::set_var("LUMEN_CHAT_ENABLE_THINKING", "1");
-        assert!(!resolve_enable_thinking(Some(false)), "per-request false beats env=1");
+        assert!(
+            !resolve_enable_thinking(Some(false)),
+            "per-request false beats env=1"
+        );
         std::env::set_var("LUMEN_CHAT_ENABLE_THINKING", "0");
-        assert!(resolve_enable_thinking(Some(true)), "per-request true beats env=0");
+        assert!(
+            resolve_enable_thinking(Some(true)),
+            "per-request true beats env=0"
+        );
 
         match saved {
             Some(v) => std::env::set_var("LUMEN_CHAT_ENABLE_THINKING", v),
@@ -2288,11 +2440,17 @@ mod tests {
         // canonical truthy/falsy spellings; bogus values fall to the default.
         for truthy in ["1", "true", "yes", "on", "ON", "True"] {
             std::env::set_var("LUMEN_CHAT_ENABLE_THINKING", truthy);
-            assert!(resolve_enable_thinking(None), "env '{truthy}' should enable");
+            assert!(
+                resolve_enable_thinking(None),
+                "env '{truthy}' should enable"
+            );
         }
         for falsy in ["0", "false", "no", "off", "OFF"] {
             std::env::set_var("LUMEN_CHAT_ENABLE_THINKING", falsy);
-            assert!(!resolve_enable_thinking(None), "env '{falsy}' should disable");
+            assert!(
+                !resolve_enable_thinking(None),
+                "env '{falsy}' should disable"
+            );
         }
         std::env::set_var("LUMEN_CHAT_ENABLE_THINKING", "garbage");
         assert_eq!(

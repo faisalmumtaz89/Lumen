@@ -1,26 +1,26 @@
 use crate::help::print_run_usage;
 
-use lumen_runtime::compute::ComputeBackend;
+use lumen_format::quantization::QuantScheme;
 use lumen_runtime::compute::cpu_naive::NaiveF32Backend;
 use lumen_runtime::compute::cpu_simd::SimdF32Backend;
-#[cfg(target_os = "macos")]
-use lumen_runtime::metal::MetalF32Backend;
-#[cfg(target_os = "macos")]
-use lumen_runtime::AccelerateBatchBackend;
-#[cfg(feature = "cuda")]
-use lumen_runtime::CudaBackend;
+use lumen_runtime::compute::ComputeBackend;
 use lumen_runtime::config::RuntimeConfig;
 use lumen_runtime::engine::{GenerationResult, InferenceEngine, SamplingParams, StopCondition};
-use lumen_runtime::kv::disk::{ModelFingerprint, serialize_hyperparams_le};
+use lumen_runtime::kv::disk::{serialize_hyperparams_le, ModelFingerprint};
 use lumen_runtime::kv::KvPrecision;
+#[cfg(target_os = "macos")]
+use lumen_runtime::metal::MetalF32Backend;
 use lumen_runtime::pipeline::PipelineMode;
 use lumen_runtime::session::Session;
 use lumen_runtime::storage::MmapConfig;
 use lumen_runtime::weight::provider_async::AsyncWeightProvider;
 use lumen_runtime::weight::provider_mmap::MmapWeightProvider;
 use lumen_runtime::weight::provider_sync::SyncWeightProvider;
+#[cfg(target_os = "macos")]
+use lumen_runtime::AccelerateBatchBackend;
+#[cfg(feature = "cuda")]
+use lumen_runtime::CudaBackend;
 use lumen_runtime::WeightProvider;
-use lumen_format::quantization::QuantScheme;
 
 use std::path::Path;
 
@@ -63,7 +63,10 @@ fn effective_sampling(base: &SamplingParams) -> SamplingParams {
     // gone.
     let anti_restate = lumen_runtime::runtime_defaults::anti_restate_default();
     if REPETITION_PENALTY_EXPLICIT.load(std::sync::atomic::Ordering::Relaxed) {
-        return SamplingParams { anti_restate, ..base.clone() };
+        return SamplingParams {
+            anti_restate,
+            ..base.clone()
+        };
     }
     SamplingParams {
         repetition_penalty: Some(lumen_runtime::runtime_defaults::repetition_penalty_default()),
@@ -103,10 +106,12 @@ fn cli_resolve_repeat_last_n(parsed: Option<usize>, explicit: bool) -> Option<us
 }
 
 pub(crate) fn parse_arg(args: &[String], i: usize, name: &str) -> String {
-    args.get(i).unwrap_or_else(|| {
-        eprintln!("Error: {name} requires a value");
-        std::process::exit(1);
-    }).clone()
+    args.get(i)
+        .unwrap_or_else(|| {
+            eprintln!("Error: {name} requires a value");
+            std::process::exit(1);
+        })
+        .clone()
 }
 
 pub(crate) fn parse_arg_num<T: std::str::FromStr>(args: &[String], i: usize, name: &str) -> T
@@ -124,8 +129,12 @@ where
 fn levenshtein(a: &str, b: &str) -> usize {
     let a_len = a.len();
     let b_len = b.len();
-    if a_len == 0 { return b_len; }
-    if b_len == 0 { return a_len; }
+    if a_len == 0 {
+        return b_len;
+    }
+    if b_len == 0 {
+        return a_len;
+    }
 
     let mut prev: Vec<usize> = (0..=b_len).collect();
     let mut curr = vec![0usize; b_len + 1];
@@ -134,9 +143,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         curr[0] = i + 1;
         for (j, cb) in b.chars().enumerate() {
             let cost = if ca == cb { 0 } else { 1 };
-            curr[j + 1] = (prev[j] + cost)
-                .min(prev[j + 1] + 1)
-                .min(curr[j] + 1);
+            curr[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(curr[j] + 1);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -155,7 +162,15 @@ fn suggest_models(input: &str, registry: &crate::registry::Registry) -> Vec<Stri
         let dist = levenshtein(&input_lower, &key_lower);
         if dist <= 3 || key_lower.starts_with(&input_lower) || input_lower.starts_with(&key_lower) {
             let quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
-            candidates.push((dist, format!("  {:<20} {} ({})", entry.key, entry.display_name, quants.join(", "))));
+            candidates.push((
+                dist,
+                format!(
+                    "  {:<20} {} ({})",
+                    entry.key,
+                    entry.display_name,
+                    quants.join(", ")
+                ),
+            ));
         }
     }
 
@@ -163,11 +178,19 @@ fn suggest_models(input: &str, registry: &crate::registry::Registry) -> Vec<Stri
     for alias in registry.alias_keys() {
         let alias_lower = alias.to_lowercase();
         let dist = levenshtein(&input_lower, &alias_lower);
-        if dist <= 3 || alias_lower.starts_with(&input_lower) || input_lower.starts_with(&alias_lower) {
+        if dist <= 3
+            || alias_lower.starts_with(&input_lower)
+            || input_lower.starts_with(&alias_lower)
+        {
             // Resolve to display the canonical entry info.
             if let Some(entry) = registry.resolve(alias) {
                 let quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
-                let line = format!("  {:<20} {} ({})", alias, entry.display_name, quants.join(", "));
+                let line = format!(
+                    "  {:<20} {} ({})",
+                    alias,
+                    entry.display_name,
+                    quants.join(", ")
+                );
                 // Avoid duplicates (alias might resolve to same model already added).
                 if !candidates.iter().any(|(_, l)| l == &line) {
                     candidates.push((dist, line));
@@ -192,9 +215,9 @@ pub(crate) fn run_inference(args: &[String]) {
     // parsing via `resolve_enable_thinking`, keeping CLI/server identical.
     let mut think_flag: Option<bool> = None;
     let mut max_tokens: usize = usize::MAX; // unlimited by default, stops at EOS
-    // F4: caller-supplied textual stop sequences (`--stop`), repeatable /
-    // comma-list. Empty by default → no textual stop (the EOS/max-tokens
-    // behaviour is byte-identical to pre-F4).
+                                            // F4: caller-supplied textual stop sequences (`--stop`), repeatable /
+                                            // comma-list. Empty by default → no textual stop (the EOS/max-tokens
+                                            // behaviour is byte-identical to pre-F4).
     let mut stop_text: Vec<String> = Vec::new();
     // No-temperature default sourced from the SINGLE canonical
     // `runtime_defaults::default_temperature()` (0.7) so the CLI matches both
@@ -250,7 +273,7 @@ pub(crate) fn run_inference(args: &[String]) {
     let mut use_cuda = false;
     let mut explicitly_chose_backend = false;
     let mut cuda_device: usize = 0;
-    let mut gpu_resident = true;  // Default: GPU-resident when --metal
+    let mut gpu_resident = true; // Default: GPU-resident when --metal
     let mut option_a = false;
     let mut threads: usize = 0;
     let mut profile = false;
@@ -280,31 +303,47 @@ pub(crate) fn run_inference(args: &[String]) {
         match args[i].as_str() {
             "--model" => {
                 i += 1;
-                model_path = Some(args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --model requires a path");
-                    std::process::exit(1);
-                }).clone());
+                model_path = Some(
+                    args.get(i)
+                        .unwrap_or_else(|| {
+                            eprintln!("Error: --model requires a path");
+                            std::process::exit(1);
+                        })
+                        .clone(),
+                );
             }
             "--tokens" => {
                 i += 1;
-                tokens_str = Some(args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --tokens requires token IDs");
-                    std::process::exit(1);
-                }).clone());
+                tokens_str = Some(
+                    args.get(i)
+                        .unwrap_or_else(|| {
+                            eprintln!("Error: --tokens requires token IDs");
+                            std::process::exit(1);
+                        })
+                        .clone(),
+                );
             }
             "--prompt" => {
                 i += 1;
-                prompt_str = Some(args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --prompt requires text");
-                    std::process::exit(1);
-                }).clone());
+                prompt_str = Some(
+                    args.get(i)
+                        .unwrap_or_else(|| {
+                            eprintln!("Error: --prompt requires text");
+                            std::process::exit(1);
+                        })
+                        .clone(),
+                );
             }
             "--system" => {
                 i += 1;
-                system_str = Some(args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --system requires text");
-                    std::process::exit(1);
-                }).clone());
+                system_str = Some(
+                    args.get(i)
+                        .unwrap_or_else(|| {
+                            eprintln!("Error: --system requires text");
+                            std::process::exit(1);
+                        })
+                        .clone(),
+                );
             }
             "--max-tokens" => {
                 i += 1;
@@ -365,7 +404,8 @@ pub(crate) fn run_inference(args: &[String]) {
             "--top-k" => {
                 i += 1;
                 let val = args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --top-k requires a number"); std::process::exit(1);
+                    eprintln!("Error: --top-k requires a number");
+                    std::process::exit(1);
                 });
                 let k: usize = val.parse().unwrap_or_else(|_| {
                     eprintln!("Error: --top-k must be a non-negative integer, got: {val}");
@@ -376,7 +416,8 @@ pub(crate) fn run_inference(args: &[String]) {
             "--top-p" => {
                 i += 1;
                 let val = args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --top-p requires a number"); std::process::exit(1);
+                    eprintln!("Error: --top-p requires a number");
+                    std::process::exit(1);
                 });
                 top_p = Some(val.parse().unwrap_or_else(|_| {
                     eprintln!("Error: --top-p must be a float, got: {val}");
@@ -386,7 +427,8 @@ pub(crate) fn run_inference(args: &[String]) {
             "--min-p" => {
                 i += 1;
                 let val = args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --min-p requires a number"); std::process::exit(1);
+                    eprintln!("Error: --min-p requires a number");
+                    std::process::exit(1);
                 });
                 min_p = Some(val.parse().unwrap_or_else(|_| {
                     eprintln!("Error: --min-p must be a float, got: {val}");
@@ -396,19 +438,25 @@ pub(crate) fn run_inference(args: &[String]) {
             "--repeat-penalty" | "--repetition-penalty" => {
                 i += 1;
                 let val = args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --repeat-penalty requires a number"); std::process::exit(1);
+                    eprintln!("Error: --repeat-penalty requires a number");
+                    std::process::exit(1);
                 });
                 let p: f32 = val.parse().unwrap_or_else(|_| {
                     eprintln!("Error: --repeat-penalty must be a float, got: {val}");
                     std::process::exit(1);
                 });
-                repetition_penalty = if (p - 1.0).abs() < f32::EPSILON { None } else { Some(p) };
+                repetition_penalty = if (p - 1.0).abs() < f32::EPSILON {
+                    None
+                } else {
+                    Some(p)
+                };
                 REPETITION_PENALTY_EXPLICIT.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             "--repeat-last-n" => {
                 i += 1;
                 let val = args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --repeat-last-n requires a number"); std::process::exit(1);
+                    eprintln!("Error: --repeat-last-n requires a number");
+                    std::process::exit(1);
                 });
                 let n: i64 = val.parse().unwrap_or_else(|_| {
                     eprintln!("Error: --repeat-last-n must be an integer, got: {val}");
@@ -421,7 +469,8 @@ pub(crate) fn run_inference(args: &[String]) {
             "--presence-penalty" => {
                 i += 1;
                 let val = args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --presence-penalty requires a number"); std::process::exit(1);
+                    eprintln!("Error: --presence-penalty requires a number");
+                    std::process::exit(1);
                 });
                 let p: f32 = val.parse().unwrap_or_else(|_| {
                     eprintln!("Error: --presence-penalty must be a float, got: {val}");
@@ -432,7 +481,8 @@ pub(crate) fn run_inference(args: &[String]) {
             "--frequency-penalty" => {
                 i += 1;
                 let val = args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --frequency-penalty requires a number"); std::process::exit(1);
+                    eprintln!("Error: --frequency-penalty requires a number");
+                    std::process::exit(1);
                 });
                 let p: f32 = val.parse().unwrap_or_else(|_| {
                     eprintln!("Error: --frequency-penalty must be a float, got: {val}");
@@ -565,9 +615,7 @@ pub(crate) fn run_inference(args: &[String]) {
                     std::process::exit(1);
                 });
                 kv_disk_space_mb = Some(val.parse().unwrap_or_else(|_| {
-                    eprintln!(
-                        "Error: --kv-disk-space-mb must be a positive integer, got: {val}"
-                    );
+                    eprintln!("Error: --kv-disk-space-mb must be a positive integer, got: {val}");
                     std::process::exit(1);
                 }));
             }
@@ -642,7 +690,11 @@ pub(crate) fn run_inference(args: &[String]) {
             let first = &positional_args[0];
             let reg = crate::registry::load_registry();
             if reg.resolve(first).is_some() {
-                eprintln!("Error: model specified twice — --model {} and '{}'", model_path.as_ref().unwrap(), first);
+                eprintln!(
+                    "Error: model specified twice — --model {} and '{}'",
+                    model_path.as_ref().unwrap(),
+                    first
+                );
                 eprintln!("Use one or the other, not both.");
                 std::process::exit(1);
             }
@@ -669,17 +721,23 @@ pub(crate) fn run_inference(args: &[String]) {
             if prompt_str.is_some() {
                 let registry = crate::registry::load_registry();
                 let default = registry.default_model();
-                eprintln!("No model specified. Using default: {} ({})",
-                    default.display_name, default.key);
+                eprintln!(
+                    "No model specified. Using default: {} ({})",
+                    default.display_name, default.key
+                );
                 default.key.clone()
             } else {
                 eprintln!("Model name is required.\n");
                 let registry = crate::registry::load_registry();
                 eprintln!("Available models:");
                 for entry in registry.list() {
-                    let mut quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+                    let mut quants: Vec<&str> =
+                        entry.gguf_files.keys().map(|s| s.as_str()).collect();
                     quants.sort();
-                    let tags: Vec<String> = quants.iter().map(|q| format!("{}:{}", entry.key, q.to_lowercase())).collect();
+                    let tags: Vec<String> = quants
+                        .iter()
+                        .map(|q| format!("{}:{}", entry.key, q.to_lowercase()))
+                        .collect();
                     eprintln!("  {}", tags.join(", "));
                 }
                 eprintln!("\nUsage: lumen run <model>:<quant> \"your prompt\"");
@@ -700,8 +758,7 @@ pub(crate) fn run_inference(args: &[String]) {
     // `LUMEN_CHAT_ENABLE_THINKING` (env) then the default — identically to the
     // server. Used both for the chat-template `<think>` tail and to drive the
     // shared ReasoningExtractor in `print_generated_text`.
-    let enable_thinking =
-        lumen_runtime::runtime_defaults::resolve_enable_thinking(think_flag);
+    let enable_thinking = lumen_runtime::runtime_defaults::resolve_enable_thinking(think_flag);
 
     // F4: record the parsed `--stop` list process-globally so the answer printer
     // can truncate at the first match. Set exactly once; ignored if already set.
@@ -888,11 +945,10 @@ pub(crate) fn run_inference(args: &[String]) {
             std::process::exit(1);
         }
         // Load tokenizer from LBC file header (targeted seek, not full-file read).
-        let lbc = lumen_format::reader::LbcFile::open(path)
-            .unwrap_or_else(|e| {
-                eprintln!("Error parsing model file: {e}");
-                std::process::exit(1);
-            });
+        let lbc = lumen_format::reader::LbcFile::open(path).unwrap_or_else(|e| {
+            eprintln!("Error parsing model file: {e}");
+            std::process::exit(1);
+        });
         let tok_section = lbc.tokenizer.unwrap_or_else(|| {
             eprintln!("Error: This model has no embedded tokenizer (LBC v2).");
             eprintln!("Re-convert with: lumen convert --input model.gguf --output model.lbc");
@@ -925,7 +981,9 @@ pub(crate) fn run_inference(args: &[String]) {
             eprintln!("Error: prompt produced no tokens after tokenization");
             std::process::exit(1);
         }
-        if verbose { eprintln!("Tokenized prompt: {} tokens", ids.len()); }
+        if verbose {
+            eprintln!("Tokenized prompt: {} tokens", ids.len());
+        }
         // [XCHK] Echo the exact chat-templated prompt token IDs (env LUMEN_XCHK=1,
         // default OFF). Lets the cross-backend forensic diff verify Metal and CUDA
         // ingest byte-identical inputs before comparing per-op sumsq trajectories.
@@ -936,7 +994,10 @@ pub(crate) fn run_inference(args: &[String]) {
     } else {
         eprintln!("No prompt provided.\n");
         eprintln!("Usage:");
-        eprintln!("  lumen run {} \"What is the capital of France?\"", model_str);
+        eprintln!(
+            "  lumen run {} \"What is the capital of France?\"",
+            model_str
+        );
         eprintln!("  lumen run --model {} --prompt \"Hello\"", model_str);
         std::process::exit(1);
     };
@@ -961,7 +1022,9 @@ pub(crate) fn run_inference(args: &[String]) {
         #[cfg(target_os = "macos")]
         {
             use_metal = true;
-            if verbose { eprintln!("Auto-detected backend: Metal (Apple Silicon GPU)"); }
+            if verbose {
+                eprintln!("Auto-detected backend: Metal (Apple Silicon GPU)");
+            }
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -971,7 +1034,9 @@ pub(crate) fn run_inference(args: &[String]) {
                 #[cfg(feature = "cuda")]
                 {
                     use_cuda = true;
-                    if verbose { eprintln!("Auto-detected backend: CUDA (NVIDIA GPU)"); }
+                    if verbose {
+                        eprintln!("Auto-detected backend: CUDA (NVIDIA GPU)");
+                    }
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
@@ -1023,7 +1088,10 @@ pub(crate) fn run_inference(args: &[String]) {
         if eos_ids.is_empty() {
             StopCondition::MaxTokens(max_tokens)
         } else {
-            StopCondition::MaxTokensOrEos { max_tokens, eos_tokens: eos_ids }
+            StopCondition::MaxTokensOrEos {
+                max_tokens,
+                eos_tokens: eos_ids,
+            }
         }
     } else {
         StopCondition::MaxTokens(max_tokens)
@@ -1067,11 +1135,75 @@ pub(crate) fn run_inference(args: &[String]) {
     };
 
     if use_async {
-        run_with_async(path, use_simd, use_metal, use_cuda, cuda_device, use_accelerate, threads, profile, verbose, &prompt_tokens, &stop, &sampling, context_len, tokenizer.as_ref(), &model_display, backend_name, kv_precision, &session_flags, enable_thinking);
+        run_with_async(
+            path,
+            use_simd,
+            use_metal,
+            use_cuda,
+            cuda_device,
+            use_accelerate,
+            threads,
+            profile,
+            verbose,
+            &prompt_tokens,
+            &stop,
+            &sampling,
+            context_len,
+            tokenizer.as_ref(),
+            &model_display,
+            backend_name,
+            kv_precision,
+            &session_flags,
+            enable_thinking,
+        );
     } else if use_sync {
-        run_with_sync(path, use_simd, use_metal, use_cuda, cuda_device, use_accelerate, threads, profile, verbose, &prompt_tokens, &stop, &sampling, context_len, tokenizer.as_ref(), &model_display, backend_name, kv_precision, &session_flags, enable_thinking);
+        run_with_sync(
+            path,
+            use_simd,
+            use_metal,
+            use_cuda,
+            cuda_device,
+            use_accelerate,
+            threads,
+            profile,
+            verbose,
+            &prompt_tokens,
+            &stop,
+            &sampling,
+            context_len,
+            tokenizer.as_ref(),
+            &model_display,
+            backend_name,
+            kv_precision,
+            &session_flags,
+            enable_thinking,
+        );
     } else {
-        run_with_mmap(path, use_simd, use_metal, use_cuda, cuda_device, use_accelerate, gpu_resident, option_a, threads, profile, verbose, verbose_routing, routing_bias, &prompt_tokens, &stop, &sampling, context_len, tokenizer.as_ref(), &model_display, backend_name, kv_precision, &session_flags, enable_thinking);
+        run_with_mmap(
+            path,
+            use_simd,
+            use_metal,
+            use_cuda,
+            cuda_device,
+            use_accelerate,
+            gpu_resident,
+            option_a,
+            threads,
+            profile,
+            verbose,
+            verbose_routing,
+            routing_bias,
+            &prompt_tokens,
+            &stop,
+            &sampling,
+            context_len,
+            tokenizer.as_ref(),
+            &model_display,
+            backend_name,
+            kv_precision,
+            &session_flags,
+            enable_thinking,
+        );
     }
 }
 
@@ -1156,10 +1288,7 @@ pub(crate) struct LiveModel {
 }
 
 impl LiveModel {
-    pub fn from_lbc(
-        lbc: &lumen_format::reader::LbcFile,
-        weight_quant: QuantScheme,
-    ) -> Self {
+    pub fn from_lbc(lbc: &lumen_format::reader::LbcFile, weight_quant: QuantScheme) -> Self {
         Self {
             hyperparams: lbc.header.hyperparams,
             vocab_blob: tokenizer_vocab_blob(lbc),
@@ -1257,7 +1386,13 @@ fn resolve_kv_precision(
 /// Default: min(model_max, max(prompt_len + max_gen + 256 headroom, 512)).
 /// This ensures KV cache is right-sized for actual usage while leaving headroom
 /// for multi-turn conversations. Use --context-len to override.
-fn effective_max_seq_len(model_max: usize, user_override: Option<usize>, prompt_len: usize, max_gen: usize, verbose: bool) -> usize {
+fn effective_max_seq_len(
+    model_max: usize,
+    user_override: Option<usize>,
+    prompt_len: usize,
+    max_gen: usize,
+    verbose: bool,
+) -> usize {
     let effective = match user_override {
         Some(n) => n.min(model_max),
         None => {
@@ -1268,8 +1403,10 @@ fn effective_max_seq_len(model_max: usize, user_override: Option<usize>, prompt_
         }
     };
     if verbose && effective < model_max {
-        eprintln!("  Context length: {} (model supports {}, use --context-len {} to increase)",
-            effective, model_max, model_max);
+        eprintln!(
+            "  Context length: {} (model supports {}, use --context-len {} to increase)",
+            effective, model_max, model_max
+        );
     }
     effective
 }
@@ -1324,7 +1461,12 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
                 eprintln!("Available models:");
                 for entry in reg.list() {
                     let quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
-                    eprintln!("  {:<20} {} ({})", entry.key, entry.display_name, quants.join(", "));
+                    eprintln!(
+                        "  {:<20} {} ({})",
+                        entry.key,
+                        entry.display_name,
+                        quants.join(", ")
+                    );
                 }
             }
             eprintln!("\nRun 'lumen models' to see all available models.");
@@ -1345,14 +1487,22 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
         let in_cache = crate::cache::cached_lbc(&entry.key, q.as_str()).is_some();
         if !in_registry && !in_cache {
             let available: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
-            eprintln!("Error: quantization '{}' not available for {}\n", q, entry.display_name);
+            eprintln!(
+                "Error: quantization '{}' not available for {}\n",
+                q, entry.display_name
+            );
             eprintln!("Available (downloadable):");
             for a in &available {
                 eprintln!("  {}:{}", model_name, a.to_lowercase());
             }
             eprintln!();
-            eprintln!("Tip: if you have a locally-converted LBC, pass --model <path.lbc> directly,");
-            eprintln!("     or place it at: {}", crate::cache::lbc_path(&entry.key, q.as_str()).display());
+            eprintln!(
+                "Tip: if you have a locally-converted LBC, pass --model <path.lbc> directly,"
+            );
+            eprintln!(
+                "     or place it at: {}",
+                crate::cache::lbc_path(&entry.key, q.as_str()).display()
+            );
             std::process::exit(1);
         }
         q.as_str().to_owned()
@@ -1361,20 +1511,28 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
         entry.gguf_files.keys().next().unwrap().clone()
     } else {
         // Multiple quants — require explicit choice.
-        eprintln!("Multiple quantizations available for {}:\n", entry.display_name);
+        eprintln!(
+            "Multiple quantizations available for {}:\n",
+            entry.display_name
+        );
         let mut quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
         quants.sort();
         for q in &quants {
             eprintln!("  {}:{}", model_name, q.to_lowercase());
         }
-        eprintln!("\nSpecify one: lumen run {}:<quant> \"your prompt\"", model_name);
+        eprintln!(
+            "\nSpecify one: lumen run {}:<quant> \"your prompt\"",
+            model_name
+        );
         std::process::exit(1);
     };
     let quant = quant.as_str();
 
     // Check cache first.
     if let Some(cached) = crate::cache::cached_lbc(&entry.key, quant) {
-        if verbose { eprintln!("Using cached model: {}", cached.display()); }
+        if verbose {
+            eprintln!("Using cached model: {}", cached.display());
+        }
         return cached.to_string_lossy().into_owned();
     }
 
@@ -1383,7 +1541,10 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
         Some(src) => src.clone(),
         None => {
             let available: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
-            eprintln!("Error: no {quant} GGUF available for {}", entry.display_name);
+            eprintln!(
+                "Error: no {quant} GGUF available for {}",
+                entry.display_name
+            );
             eprintln!("Available quantizations: {}", available.join(", "));
             std::process::exit(1);
         }
@@ -1391,11 +1552,18 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
 
     #[cfg(feature = "download")]
     {
-        if verbose { eprintln!("Model '{}' not cached. Downloading {}...", value, entry.display_name); }
+        if verbose {
+            eprintln!(
+                "Model '{}' not cached. Downloading {}...",
+                value, entry.display_name
+            );
+        }
         let gguf_path = resolve_download_gguf_shards(&gguf_source, verbose);
         let lbc_out = crate::cache::lbc_path(&entry.key, quant);
         resolve_convert_to_lbc(&gguf_path, &lbc_out, verbose);
-        if verbose { eprintln!("Ready: {}", lbc_out.display()); }
+        if verbose {
+            eprintln!("Ready: {}", lbc_out.display());
+        }
         return lbc_out.to_string_lossy().into_owned();
     }
 
@@ -1413,7 +1581,10 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
 /// (first) shard. The converter is pointed at the primary shard; multi-shard
 /// auto-discovery resolves the siblings.
 #[cfg(feature = "download")]
-fn resolve_download_gguf_shards(src: &crate::registry::GgufSource, verbose: bool) -> std::path::PathBuf {
+fn resolve_download_gguf_shards(
+    src: &crate::registry::GgufSource,
+    verbose: bool,
+) -> std::path::PathBuf {
     if src.is_multi_shard() && verbose {
         eprintln!(
             "Multi-shard model: {} shard(s) to fetch from {}",
@@ -1437,7 +1608,9 @@ fn resolve_download_gguf_shards(src: &crate::registry::GgufSource, verbose: bool
 #[cfg(feature = "download")]
 fn resolve_download_gguf(repo: &str, filename: &str, verbose: bool) -> std::path::PathBuf {
     if let Some(existing) = crate::cache::cached_gguf(filename) {
-        if verbose { eprintln!("GGUF already downloaded: {}", existing.display()); }
+        if verbose {
+            eprintln!("GGUF already downloaded: {}", existing.display());
+        }
         return existing;
     }
 
@@ -1448,11 +1621,12 @@ fn resolve_download_gguf(repo: &str, filename: &str, verbose: bool) -> std::path
 
     // Auto-download without confirmation in --model resolution (interactive
     // users who want a confirmation prompt should use `lumen pull` instead).
-    crate::download::download_gguf(repo, filename, &crate::cache::cache_dir(), true)
-        .unwrap_or_else(|e| {
+    crate::download::download_gguf(repo, filename, &crate::cache::cache_dir(), true).unwrap_or_else(
+        |e| {
             eprintln!("Download failed: {e}");
             std::process::exit(1);
-        })
+        },
+    )
 }
 
 #[cfg(feature = "download")]
@@ -1466,9 +1640,19 @@ fn resolve_convert_to_lbc(gguf_path: &std::path::Path, lbc_out: &std::path::Path
         target: crate::convert::default_target_for_host(),
     };
 
-    if verbose { eprintln!("Converting to LBC: {} -> {}", gguf_path.display(), lbc_out.display()); }
+    if verbose {
+        eprintln!(
+            "Converting to LBC: {} -> {}",
+            gguf_path.display(),
+            lbc_out.display()
+        );
+    }
     match convert_gguf_to_lbc(gguf_path, lbc_out, &opts) {
-        Ok(stats) => { if verbose { eprintln!("{stats}"); } }
+        Ok(stats) => {
+            if verbose {
+                eprintln!("{stats}");
+            }
+        }
         Err(e) => {
             eprintln!("Conversion failed: {e}");
             std::process::exit(1);
@@ -1492,7 +1676,11 @@ fn print_generated_text(
 ) {
     if let Some(tok) = tokenizer {
         let stop_ids = &tok.stop_token_ids;
-        let clean: Vec<u32> = tokens.iter().copied().filter(|t| !stop_ids.contains(t)).collect();
+        let clean: Vec<u32> = tokens
+            .iter()
+            .copied()
+            .filter(|t| !stop_ids.contains(t))
+            .collect();
         // Diagnostic (default OFF): dump raw generated token ids plus the
         // per-id decoded byte string, so a model-decode degenerate token
         // (e.g. an extra "lication" id) is distinguishable from any
@@ -1591,7 +1779,9 @@ fn print_banner(model_name: &str, backend: &str, metrics_summary: &str) {
     // there (eprintln), leaving stdout clean for token output.
     #[cfg(unix)]
     {
-        extern "C" { fn isatty(fd: std::ffi::c_int) -> std::ffi::c_int; }
+        extern "C" {
+            fn isatty(fd: std::ffi::c_int) -> std::ffi::c_int;
+        }
         // stderr = fd 2
         if unsafe { isatty(2) } == 0 {
             return;
@@ -1609,7 +1799,10 @@ fn print_banner(model_name: &str, backend: &str, metrics_summary: &str) {
     eprintln!();
     eprintln!("{sep}");
     eprintln!("  Source    github.com/faisalmumtaz89/Lumen");
-    eprintln!("  Engine    Lumen v{} (Rust + {backend})", env!("CARGO_PKG_VERSION"));
+    eprintln!(
+        "  Engine    Lumen v{} (Rust + {backend})",
+        env!("CARGO_PKG_VERSION")
+    );
     eprintln!("  Model     {model_name}");
     // Indent each line of the metrics summary for alignment within the banner.
     for line in metrics_summary.lines() {
@@ -1636,7 +1829,9 @@ fn create_cpu_or_metal_backend(
             eprintln!("Error: Metal backend unavailable: {e}");
             std::process::exit(1);
         });
-        if verbose { eprintln!("Metal GPU backend: {}", metal.device_name()); }
+        if verbose {
+            eprintln!("Metal GPU backend: {}", metal.device_name());
+        }
         return Box::new(metal);
     }
 
@@ -1663,12 +1858,9 @@ fn create_cpu_or_metal_backend(
 #[allow(clippy::too_many_arguments)]
 fn create_backend(
     use_simd: bool,
-    #[allow(unused_variables)]
-    use_metal: bool,
-    #[allow(unused_variables)]
-    use_cuda: bool,
-    #[allow(unused_variables)]
-    cuda_device: usize,
+    #[allow(unused_variables)] use_metal: bool,
+    #[allow(unused_variables)] use_cuda: bool,
+    #[allow(unused_variables)] cuda_device: usize,
     threads: usize,
     profile: bool,
     verbose: bool,
@@ -1676,16 +1868,11 @@ fn create_backend(
     final_norm: Vec<f32>,
     output_proj: Vec<f32>,
     hyperparams: &lumen_format::hyperparams::ModelHyperparams,
-    #[allow(unused_variables)]
-    output_proj_raw: Vec<u8>,
-    #[allow(unused_variables)]
-    output_proj_quant: QuantScheme,
-    #[allow(unused_variables)]
-    embedding_raw: Vec<u8>,
-    #[allow(unused_variables)]
-    embedding_quant: QuantScheme,
-    #[allow(unused_variables)]
-    weight_tying: bool,
+    #[allow(unused_variables)] output_proj_raw: Vec<u8>,
+    #[allow(unused_variables)] output_proj_quant: QuantScheme,
+    #[allow(unused_variables)] embedding_raw: Vec<u8>,
+    #[allow(unused_variables)] embedding_quant: QuantScheme,
+    #[allow(unused_variables)] weight_tying: bool,
 ) -> Box<dyn ComputeBackend> {
     // Construct the concrete backend and box it. All subsequent setup goes
     // through the ComputeBackend trait, keeping the logic backend-agnostic.
@@ -1719,22 +1906,40 @@ fn create_backend(
     // BF16 added to the raw-weight allow-list. Without this, BF16 LBC models silently route
     // through the F32 CPU-dequant fallback and the BF16 raw-weight path
     // is skipped. Load-bearing for the BF16 path's prefill kernel.
-    if matches!(output_proj_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16) && !output_proj_raw.is_empty() {
+    if matches!(
+        output_proj_quant,
+        QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
+    ) && !output_proj_raw.is_empty()
+    {
         if verbose {
-            eprintln!("  output_proj: {:?} ({} bytes, ~{:.1} MB)",
-                output_proj_quant, output_proj_raw.len(), output_proj_raw.len() as f64 / 1048576.0);
+            eprintln!(
+                "  output_proj: {:?} ({} bytes, ~{:.1} MB)",
+                output_proj_quant,
+                output_proj_raw.len(),
+                output_proj_raw.len() as f64 / 1048576.0
+            );
         }
         backend.set_output_proj_raw(output_proj_raw, output_proj_quant);
     }
-    if matches!(embedding_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) && !embedding_raw.is_empty() {
+    if matches!(
+        embedding_quant,
+        QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16
+    ) && !embedding_raw.is_empty()
+    {
         if verbose {
-            eprintln!("  embedding: {:?} ({} bytes, ~{:.1} MB)",
-                embedding_quant, embedding_raw.len(), embedding_raw.len() as f64 / 1048576.0);
+            eprintln!(
+                "  embedding: {:?} ({} bytes, ~{:.1} MB)",
+                embedding_quant,
+                embedding_raw.len(),
+                embedding_raw.len() as f64 / 1048576.0
+            );
         }
         backend.set_embedding_raw(embedding_raw, embedding_quant);
     }
     if weight_tying {
-        if verbose { eprintln!("  weight_tying: output_proj shares embedding storage"); }
+        if verbose {
+            eprintln!("  weight_tying: output_proj shares embedding storage");
+        }
         backend.set_weight_tying(true);
     }
 
@@ -1742,7 +1947,9 @@ fn create_backend(
         eprintln!("Error: backend initialization failed: {e}");
         std::process::exit(1);
     });
-    if profile { backend.set_profile(true); }
+    if profile {
+        backend.set_profile(true);
+    }
 
     backend
 }
@@ -1801,7 +2008,17 @@ fn run_with_async(
     );
 
     let model_max = provider.lbc().header.hyperparams.max_seq_len as usize;
-    let max_seq_len = effective_max_seq_len(model_max, context_len, prompt_tokens.len(), match stop { StopCondition::MaxTokens(n) => *n, StopCondition::MaxTokensOrEos { max_tokens, .. } => *max_tokens, StopCondition::EosTokens(_) => model_max }, verbose);
+    let max_seq_len = effective_max_seq_len(
+        model_max,
+        context_len,
+        prompt_tokens.len(),
+        match stop {
+            StopCondition::MaxTokens(n) => *n,
+            StopCondition::MaxTokensOrEos { max_tokens, .. } => *max_tokens,
+            StopCondition::EosTokens(_) => model_max,
+        },
+        verbose,
+    );
 
     // pass the right-sized max_seq_len through to the backend via
     // hyperparams so the CUDA KV cache is sized exactly for the requested
@@ -1845,12 +2062,23 @@ fn run_with_async(
     }
     let live = LiveModel::from_lbc(provider.lbc(), provider.output_proj_quant);
     run_engine(
-        &engine, &provider, backend.as_ref(), use_accelerate,
+        &engine,
+        &provider,
+        backend.as_ref(),
+        use_accelerate,
         &hyperparams_capped,
-        &provider.embedding, &provider.final_norm,
-        prompt_tokens, stop, sampling, tokenizer,
-        verbose, model_display, backend_name,
-        session_flags, &live, enable_thinking,
+        &provider.embedding,
+        &provider.final_norm,
+        prompt_tokens,
+        stop,
+        sampling,
+        tokenizer,
+        verbose,
+        model_display,
+        backend_name,
+        session_flags,
+        &live,
+        enable_thinking,
     );
 }
 
@@ -1900,7 +2128,17 @@ fn run_with_sync(
     );
 
     let model_max = provider.lbc().header.hyperparams.max_seq_len as usize;
-    let max_seq_len = effective_max_seq_len(model_max, context_len, prompt_tokens.len(), match stop { StopCondition::MaxTokens(n) => *n, StopCondition::MaxTokensOrEos { max_tokens, .. } => *max_tokens, StopCondition::EosTokens(_) => model_max }, verbose);
+    let max_seq_len = effective_max_seq_len(
+        model_max,
+        context_len,
+        prompt_tokens.len(),
+        match stop {
+            StopCondition::MaxTokens(n) => *n,
+            StopCondition::MaxTokensOrEos { max_tokens, .. } => *max_tokens,
+            StopCondition::EosTokens(_) => model_max,
+        },
+        verbose,
+    );
 
     // pass the right-sized max_seq_len through to the backend via
     // hyperparams so the CUDA KV cache is sized exactly for the requested
@@ -1969,12 +2207,23 @@ fn run_with_sync(
     }
     let live = LiveModel::from_lbc(provider.lbc(), provider.output_proj_quant);
     run_engine(
-        &engine, &provider, backend.as_ref(), use_accelerate,
+        &engine,
+        &provider,
+        backend.as_ref(),
+        use_accelerate,
         &hyperparams_capped,
-        &provider.embedding, &provider.final_norm,
-        prompt_tokens, stop, sampling, tokenizer,
-        verbose, model_display, backend_name,
-        session_flags, &live, enable_thinking,
+        &provider.embedding,
+        &provider.final_norm,
+        prompt_tokens,
+        stop,
+        sampling,
+        tokenizer,
+        verbose,
+        model_display,
+        backend_name,
+        session_flags,
+        &live,
+        enable_thinking,
     );
 }
 
@@ -2034,7 +2283,17 @@ fn run_with_mmap(
     );
 
     let model_max = provider.lbc().header.hyperparams.max_seq_len as usize;
-    let max_seq_len = effective_max_seq_len(model_max, context_len, prompt_tokens.len(), match stop { StopCondition::MaxTokens(n) => *n, StopCondition::MaxTokensOrEos { max_tokens, .. } => *max_tokens, StopCondition::EosTokens(_) => model_max }, verbose);
+    let max_seq_len = effective_max_seq_len(
+        model_max,
+        context_len,
+        prompt_tokens.len(),
+        match stop {
+            StopCondition::MaxTokens(n) => *n,
+            StopCondition::MaxTokensOrEos { max_tokens, .. } => *max_tokens,
+            StopCondition::EosTokens(_) => model_max,
+        },
+        verbose,
+    );
 
     // Create hyperparams with capped max_seq_len for Metal init.
     // This ensures KV cache, RoPE tables, and scratch buffers use the capped value.
@@ -2069,23 +2328,41 @@ fn run_with_mmap(
             eprintln!("Error: Metal backend unavailable: {e}");
             std::process::exit(1);
         });
-        if verbose { eprintln!("Metal GPU backend: {}", metal.device_name()); }
+        if verbose {
+            eprintln!("Metal GPU backend: {}", metal.device_name());
+        }
         metal.set_global_tensors(
             provider.embedding.clone(),
             provider.final_norm.clone(),
             provider.output_proj.clone(),
         );
-        if matches!(provider.output_proj_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) && !provider.output_proj_raw.is_empty() {
+        if matches!(
+            provider.output_proj_quant,
+            QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16
+        ) && !provider.output_proj_raw.is_empty()
+        {
             if verbose {
-                eprintln!("  output_proj: {:?} ({} bytes, ~{:.1} MB)",
-                    provider.output_proj_quant, provider.output_proj_raw.len(), provider.output_proj_raw.len() as f64 / 1048576.0);
+                eprintln!(
+                    "  output_proj: {:?} ({} bytes, ~{:.1} MB)",
+                    provider.output_proj_quant,
+                    provider.output_proj_raw.len(),
+                    provider.output_proj_raw.len() as f64 / 1048576.0
+                );
             }
             metal.set_output_proj_raw(provider.output_proj_raw.clone(), provider.output_proj_quant);
         }
-        if matches!(provider.embedding_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16) && !provider.embedding_raw.is_empty() {
+        if matches!(
+            provider.embedding_quant,
+            QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16
+        ) && !provider.embedding_raw.is_empty()
+        {
             if verbose {
-                eprintln!("  embedding: {:?} ({} bytes, ~{:.1} MB)",
-                    provider.embedding_quant, provider.embedding_raw.len(), provider.embedding_raw.len() as f64 / 1048576.0);
+                eprintln!(
+                    "  embedding: {:?} ({} bytes, ~{:.1} MB)",
+                    provider.embedding_quant,
+                    provider.embedding_raw.len(),
+                    provider.embedding_raw.len() as f64 / 1048576.0
+                );
             }
             metal.set_embedding_raw(provider.embedding_raw.clone(), provider.embedding_quant);
         }
@@ -2109,18 +2386,24 @@ fn run_with_mmap(
         // Enable router diagnostics before init so per-layer buffers are allocated.
         if verbose_routing {
             metal.configure_router_debug(true);
-            if verbose { eprintln!("Router diagnostics: enabled (--verbose-routing)"); }
+            if verbose {
+                eprintln!("Router diagnostics: enabled (--verbose-routing)");
+            }
         }
         // Configure cache-conditional routing bias.
         if let Some(lambda) = routing_bias {
             metal.configure_routing_bias(lambda);
-            if verbose { eprintln!("Routing bias \u{03bb}={lambda} (cache-conditional routing active)"); }
+            if verbose {
+                eprintln!("Routing bias \u{03bb}={lambda} (cache-conditional routing active)");
+            }
         }
         metal.init(&hyperparams_capped).unwrap_or_else(|e| {
             eprintln!("Error: Metal initialization failed: {e}");
             std::process::exit(1);
         });
-        if profile { metal.set_profile(true); }
+        if profile {
+            metal.set_profile(true);
+        }
 
         // Configure MoE Option A dispatch (streaming + GPU-resident).
         // When enabled, only top-K experts are dispatched per token instead of all 8.
@@ -2131,19 +2414,31 @@ fn run_with_mmap(
             if !gpu_resident {
                 // Streaming mode: warmup profiler to populate expert cache.
                 metal.configure_expert_warmup(8, top_k);
-                if verbose { eprintln!("Option A enabled: top-{} expert dispatch (streaming mode)", top_k); }
+                if verbose {
+                    eprintln!(
+                        "Option A enabled: top-{} expert dispatch (streaming mode)",
+                        top_k
+                    );
+                }
             } else {
-                if verbose { eprintln!("Option A enabled: top-{} expert dispatch (GPU-resident mode)", top_k); }
+                if verbose {
+                    eprintln!(
+                        "Option A enabled: top-{} expert dispatch (GPU-resident mode)",
+                        top_k
+                    );
+                }
             }
         }
 
         // Pre-load all layer weights into GPU-resident Metal buffers.
         // Eliminates TLB misses and page table walks from mmap access.
         if gpu_resident {
-            metal.preload_weights_gpu_resident(&provider).unwrap_or_else(|e| {
-                eprintln!("Error: GPU-resident preload failed: {e}");
-                std::process::exit(1);
-            });
+            metal
+                .preload_weights_gpu_resident(&provider)
+                .unwrap_or_else(|e| {
+                    eprintln!("Error: GPU-resident preload failed: {e}");
+                    std::process::exit(1);
+                });
         }
 
         // Route through the session-driven path when
@@ -2190,22 +2485,37 @@ fn run_with_mmap(
                     }
                     if let Some(stats) = metal.expert_cache_stats() {
                         eprintln!("\n--- MoE Expert Cache ---");
-                        eprintln!("  cached: {}/{} experts ({} bytes)",
-                            stats.cached_experts, stats.capacity, stats.cached_bytes);
-                        eprintln!("  hits: {}, misses: {}, hit_rate: {:.1}%",
-                            stats.total_hits, stats.total_misses, stats.hit_rate * 100.0);
+                        eprintln!(
+                            "  cached: {}/{} experts ({} bytes)",
+                            stats.cached_experts, stats.capacity, stats.cached_bytes
+                        );
+                        eprintln!(
+                            "  hits: {}, misses: {}, hit_rate: {:.1}%",
+                            stats.total_hits,
+                            stats.total_misses,
+                            stats.hit_rate * 100.0
+                        );
                     }
                     // MoE expert I/O statistics.
                     let (disk, cache, blob) = metal.expert_io_stats();
                     if disk + cache + blob > 0 {
                         let total = disk + cache + blob;
                         eprintln!("\n--- MoE Expert I/O ---");
-                        eprintln!("  from_cache: {} bytes ({:.1}%)",
-                            cache, cache as f64 / total as f64 * 100.0);
-                        eprintln!("  from_disk:  {} bytes ({:.1}%)",
-                            disk, disk as f64 / total as f64 * 100.0);
-                        eprintln!("  from_blob:  {} bytes ({:.1}%)",
-                            blob, blob as f64 / total as f64 * 100.0);
+                        eprintln!(
+                            "  from_cache: {} bytes ({:.1}%)",
+                            cache,
+                            cache as f64 / total as f64 * 100.0
+                        );
+                        eprintln!(
+                            "  from_disk:  {} bytes ({:.1}%)",
+                            disk,
+                            disk as f64 / total as f64 * 100.0
+                        );
+                        eprintln!(
+                            "  from_blob:  {} bytes ({:.1}%)",
+                            blob,
+                            blob as f64 / total as f64 * 100.0
+                        );
                         eprintln!("  total:      {} bytes", total);
                     }
                     // Router diagnostics summary.
@@ -2246,20 +2556,34 @@ fn run_with_mmap(
     // GPU-resident preload for CUDA: loads all layer weights to GPU memory.
     // Enables native quantized kernel paths (dp4a, HGEMV) and batched prefill.
     if gpu_resident && use_cuda {
-        backend.as_mut().preload_weights(&provider).unwrap_or_else(|e| {
-            eprintln!("Error: CUDA GPU-resident preload failed: {e}");
-            std::process::exit(1);
-        });
+        backend
+            .as_mut()
+            .preload_weights(&provider)
+            .unwrap_or_else(|e| {
+                eprintln!("Error: CUDA GPU-resident preload failed: {e}");
+                std::process::exit(1);
+            });
     }
 
     let live = LiveModel::from_lbc(provider.lbc(), provider.output_proj_quant);
     run_engine(
-        &engine, &provider, backend.as_ref(), use_accelerate,
+        &engine,
+        &provider,
+        backend.as_ref(),
+        use_accelerate,
         &hyperparams_capped,
-        &provider.embedding, &provider.final_norm,
-        prompt_tokens, stop, sampling, tokenizer,
-        verbose, model_display, backend_name,
-        session_flags, &live, enable_thinking,
+        &provider.embedding,
+        &provider.final_norm,
+        prompt_tokens,
+        stop,
+        sampling,
+        tokenizer,
+        verbose,
+        model_display,
+        backend_name,
+        session_flags,
+        &live,
+        enable_thinking,
     );
 }
 
@@ -2268,14 +2592,10 @@ fn run_engine(
     engine: &InferenceEngine,
     weights: &dyn WeightProvider,
     backend: &dyn ComputeBackend,
-    #[allow(unused_variables)]
-    use_accelerate: bool,
-    #[allow(unused_variables)]
-    hyperparams: &lumen_format::hyperparams::ModelHyperparams,
-    #[allow(unused_variables)]
-    embedding: &[f32],
-    #[allow(unused_variables)]
-    final_norm: &[f32],
+    #[allow(unused_variables)] use_accelerate: bool,
+    #[allow(unused_variables)] hyperparams: &lumen_format::hyperparams::ModelHyperparams,
+    #[allow(unused_variables)] embedding: &[f32],
+    #[allow(unused_variables)] final_norm: &[f32],
     prompt_tokens: &[u32],
     stop: &StopCondition,
     sampling: &SamplingParams,
@@ -2287,7 +2607,9 @@ fn run_engine(
     live: &LiveModel,
     enable_thinking: bool,
 ) {
-    if verbose { eprintln!("Prompt tokens: {prompt_tokens:?}"); }
+    if verbose {
+        eprintln!("Prompt tokens: {prompt_tokens:?}");
+    }
 
     // Resolve the model-aware `repetition_penalty` default now that the LBC is
     // open and `runtime_defaults::set_model_is_moe` has run (called by every
@@ -2303,7 +2625,9 @@ fn run_engine(
 
     #[cfg(target_os = "macos")]
     if use_accelerate {
-        if verbose { eprintln!("Running inference with Accelerate batched prefill...\n"); }
+        if verbose {
+            eprintln!("Running inference with Accelerate batched prefill...\n");
+        }
         if session_flags.is_active() {
             // The Accelerate path uses a separate prefill backend; the
             // session-driven path is not yet plumbed through it because
@@ -2325,7 +2649,14 @@ fn run_engine(
             embedding.to_vec(),
             final_norm.to_vec(),
         );
-        match engine.generate_with_prefill(prompt_tokens, weights, backend, &mut accel, stop, sampling) {
+        match engine.generate_with_prefill(
+            prompt_tokens,
+            weights,
+            backend,
+            &mut accel,
+            stop,
+            sampling,
+        ) {
             Ok(result) => {
                 print_generated_text(&result.tokens, tokenizer, enable_thinking);
                 if verbose {
@@ -2350,7 +2681,9 @@ fn run_engine(
         std::process::exit(1);
     }
 
-    if verbose { eprintln!("Running inference...\n"); }
+    if verbose {
+        eprintln!("Running inference...\n");
+    }
 
     let gen_result = run_generation(
         engine,
@@ -2439,9 +2772,7 @@ fn run_generation(
         .map_err(|e| {
             // Wrap with a session-resume hint so the operator immediately
             // sees what failed.
-            lumen_runtime::error::RuntimeError::Compute(format!(
-                "--session-resume {p}: {e}"
-            ))
+            lumen_runtime::error::RuntimeError::Compute(format!("--session-resume {p}: {e}"))
         })?
     } else {
         Session::new(
@@ -2632,7 +2963,10 @@ mod tests {
             "",
         ] {
             let parsed = lumen_runtime::tooling::parse_final(s);
-            assert_eq!(parsed.content, s, "parse_final must echo tool-free text verbatim: {s:?}");
+            assert_eq!(
+                parsed.content, s,
+                "parse_final must echo tool-free text verbatim: {s:?}"
+            );
             assert!(parsed.tool_calls.is_empty());
         }
     }
@@ -2643,8 +2977,14 @@ mod tests {
         // as a structured call (mirrors both server surfaces).
         let text = "Sure.<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call> Done.";
         let parsed = lumen_runtime::tooling::parse_final(text);
-        assert!(!parsed.content.contains("<tool_call>"), "marker must be stripped");
-        assert!(!parsed.content.contains("get_weather"), "tool JSON must not leak to stdout");
+        assert!(
+            !parsed.content.contains("<tool_call>"),
+            "marker must be stripped"
+        );
+        assert!(
+            !parsed.content.contains("get_weather"),
+            "tool JSON must not leak to stdout"
+        );
         assert!(parsed.content.contains("Sure."));
         assert!(parsed.content.contains("Done."));
         assert_eq!(parsed.tool_calls.len(), 1);
@@ -2660,14 +3000,25 @@ mod tests {
         // No --stop (empty list) → content returned verbatim, byte-identical.
         let full = "alpha STOP beta";
         assert_eq!(truncate_at_first_stop(full, &[]), full);
-        assert_eq!(truncate_at_first_stop(full, &["".to_string()]), full, "empty stop entries are ignored");
-        assert_eq!(truncate_at_first_stop(full, &["ZZZ".to_string()]), full, "no match → verbatim");
+        assert_eq!(
+            truncate_at_first_stop(full, &["".to_string()]),
+            full,
+            "empty stop entries are ignored"
+        );
+        assert_eq!(
+            truncate_at_first_stop(full, &["ZZZ".to_string()]),
+            full,
+            "no match → verbatim"
+        );
     }
 
     #[test]
     fn f4_cli_stop_truncates_at_first_match() {
         let full = "keep this STOP drop this";
-        assert_eq!(truncate_at_first_stop(full, &["STOP".to_string()]), "keep this ");
+        assert_eq!(
+            truncate_at_first_stop(full, &["STOP".to_string()]),
+            "keep this "
+        );
         // Earliest of multiple stops wins.
         let two = "aaa END bbb STOP ccc";
         assert_eq!(

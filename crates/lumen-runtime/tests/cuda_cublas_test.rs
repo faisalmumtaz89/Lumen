@@ -8,7 +8,7 @@
 
 #![cfg(feature = "cuda")]
 
-use cudarc::cublas::{CudaBlas, Gemv, GemvConfig, sys};
+use cudarc::cublas::{sys, CudaBlas, Gemv, GemvConfig};
 use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::compile_ptx;
 
@@ -129,7 +129,13 @@ fn run_cublas_gemv_residual(
 
 /// Assert two vectors match within tolerance, with descriptive error messages.
 fn assert_close(label: &str, a: &[f32], b: &[f32], tol: f32) {
-    assert_eq!(a.len(), b.len(), "{label}: length mismatch {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "{label}: length mismatch {} vs {}",
+        a.len(),
+        b.len()
+    );
     let mut max_diff = 0.0f32;
     let mut max_idx = 0;
     for i in 0..a.len() {
@@ -164,7 +170,9 @@ fn cublas_vs_custom_small() {
 
     let out_dim = 4;
     let in_dim = 8;
-    let weight: Vec<f32> = (0..out_dim * in_dim).map(|i| (i as f32) * 0.01 - 0.15).collect();
+    let weight: Vec<f32> = (0..out_dim * in_dim)
+        .map(|i| (i as f32) * 0.01 - 0.15)
+        .collect();
     let x: Vec<f32> = (0..in_dim).map(|i| (i as f32) * 0.1 + 0.5).collect();
     let expected = cpu_matvec(&weight, &x, out_dim, in_dim);
 
@@ -199,7 +207,9 @@ fn cublas_vs_custom_4096x4096() {
     // Pseudo-random weights via simple LCG.
     let mut seed = 42u64;
     let mut rng = || -> f32 {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((seed >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
     };
     let weight: Vec<f32> = (0..out_dim * in_dim).map(|_| rng()).collect();
@@ -233,7 +243,9 @@ fn cublas_vs_custom_11008x4096() {
     let in_dim = 4096;
     let mut seed = 123u64;
     let mut rng = || -> f32 {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((seed >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
     };
     let weight: Vec<f32> = (0..out_dim * in_dim).map(|_| rng()).collect();
@@ -262,7 +274,9 @@ fn cublas_residual_vs_cpu() {
     let in_dim = 4096;
     let mut seed = 77u64;
     let mut rng = || -> f32 {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((seed >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
     };
     let weight: Vec<f32> = (0..out_dim * in_dim).map(|_| rng()).collect();
@@ -324,7 +338,9 @@ fn cublas_vs_custom_non_aligned() {
 
     let out_dim = 17;
     let in_dim = 13; // Not a multiple of 4
-    let weight: Vec<f32> = (0..out_dim * in_dim).map(|i| (i as f32) * 0.003 - 0.3).collect();
+    let weight: Vec<f32> = (0..out_dim * in_dim)
+        .map(|i| (i as f32) * 0.003 - 0.3)
+        .collect();
     let x: Vec<f32> = (0..in_dim).map(|i| (i as f32) * 0.07 + 0.1).collect();
     let expected = cpu_matvec(&weight, &x, out_dim, in_dim);
 

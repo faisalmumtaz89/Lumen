@@ -270,6 +270,10 @@ mod tests {
         let mut m = StopMatcher::new(vec!["€END".into()]);
         let (t, _) = m.push("x€");
         assert_eq!(t, "x");
-        assert_eq!(m.finish(), "€", "held multi-byte tail flushed intact on finish()");
+        assert_eq!(
+            m.finish(),
+            "€",
+            "held multi-byte tail flushed intact on finish()"
+        );
     }
 }

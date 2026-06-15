@@ -29,7 +29,11 @@ pub struct GlobalTensorRange {
 
 impl Default for GlobalTensorRange {
     fn default() -> Self {
-        Self { offset: 0, length: 0, quant: QuantScheme::F32 }
+        Self {
+            offset: 0,
+            length: 0,
+            quant: QuantScheme::F32,
+        }
     }
 }
 
@@ -155,7 +159,8 @@ mod tests {
             num_experts: None,
             num_active_experts: None,
             norm_eps: 1e-5,
-            rotary_dim: None, rope_neox: false,
+            rotary_dim: None,
+            rope_neox: false,
             gdn: None,
         }
     }

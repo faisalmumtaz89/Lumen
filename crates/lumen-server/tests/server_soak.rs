@@ -75,9 +75,7 @@ use lumen_runtime::pipeline::PipelineMode;
 use lumen_runtime::weight::provider_sync::SyncWeightProvider;
 use lumen_runtime::{MetalF32Backend, RuntimeConfig};
 
-use lumen_server::{
-    build_router, DiskKvConfig, EngineWorker, ModelInfo, Tokenize,
-};
+use lumen_server::{build_router, DiskKvConfig, EngineWorker, ModelInfo, Tokenize};
 
 const MODEL_ID: &str = "qwen3.5-9b:q8_0";
 const SAMPLE_INTERVAL_SEC: u64 = 30;
@@ -157,7 +155,10 @@ impl Tokenize for BpeTokenizerAdapter {
 
     fn apply_chat_template(&self, system: Option<&str>, user: &str) -> Option<String> {
         // Soak harness: reasoning off (closed think tail), byte-identical.
-        Some(self.inner.apply_chat_template_with_system(user, system, false))
+        Some(
+            self.inner
+                .apply_chat_template_with_system(user, system, false),
+        )
     }
 
     fn eos_tokens(&self) -> Vec<u32> {
@@ -168,9 +169,7 @@ impl Tokenize for BpeTokenizerAdapter {
 /// Resolve LBC path from env vars. Returns `None` if no Q8 path is set;
 /// the test gracefully no-ops in that case (matches pattern).
 fn resolve_q8_lbc_path() -> Option<PathBuf> {
-    std::env::var("LUMEN_QWEN35_9B_Q8")
-        .ok()
-        .map(PathBuf::from)
+    std::env::var("LUMEN_QWEN35_9B_Q8").ok().map(PathBuf::from)
 }
 
 /// Resolve soak duration from env. Defaults to 300s (smoke).
@@ -324,8 +323,8 @@ async fn boot_soak_server(
     let hyperparams = provider.lbc().header.hyperparams;
     let context_length = std::cmp::min(CONTEXT_LEN, hyperparams.max_seq_len as usize);
 
-    let mut backend = MetalF32Backend::new()
-        .unwrap_or_else(|e| panic!("Metal backend unavailable: {e}"));
+    let mut backend =
+        MetalF32Backend::new().unwrap_or_else(|e| panic!("Metal backend unavailable: {e}"));
     backend.set_global_tensors(
         provider.embedding.clone(),
         provider.final_norm.clone(),
@@ -440,7 +439,10 @@ async fn one_chat_request(
         .header("content-type", "application/json")
         .body(Full::new(bytes::Bytes::from(body_bytes)))
         .map_err(|e| format!("build: {e}"))?;
-    let resp = client.request(req).await.map_err(|e| format!("send: {e}"))?;
+    let resp = client
+        .request(req)
+        .await
+        .map_err(|e| format!("send: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("status: {}", resp.status()));
     }
@@ -465,8 +467,8 @@ async fn run_in_process_workload(
 ) -> Result<(), String> {
     let started = Instant::now();
     let workload_path = out_dir.join("soak-workload.jsonl");
-    let mut workload_log = std::fs::File::create(&workload_path)
-        .map_err(|e| format!("create workload log: {e}"))?;
+    let mut workload_log =
+        std::fs::File::create(&workload_path).map_err(|e| format!("create workload log: {e}"))?;
     use std::io::Write;
 
     // Workload mix (round-robin in 10-request cycles: 6 short, 3 medium, 1 long).
@@ -774,7 +776,7 @@ async fn sample_loop(
             mtl_alloc_bytes: sample_mtl_alloc_bytes(),
             request_count: counter.load(std::sync::atomic::Ordering::Relaxed),
             decode_tokens_total: 0, // (per-token counter would require engine
-                                    // changes; deferred)
+            // changes; deferred)
             disk_kv_used_bytes: dir_size_bytes(&disk_kv_dir),
             disk_kv_tmp_orphan_count: count_tmp_orphans(&disk_kv_dir),
         };
@@ -785,9 +787,11 @@ async fn sample_loop(
 
         // breakdown sample — best-effort GET against the
         // server's /debug/memory_breakdown endpoint.
-        if let (Some(addr), Some(client), Some(f)) =
-            (breakdown_addr, breakdown_client.as_ref(), breakdown_file.as_mut())
-        {
+        if let (Some(addr), Some(client), Some(f)) = (
+            breakdown_addr,
+            breakdown_client.as_ref(),
+            breakdown_file.as_mut(),
+        ) {
             let line = match sample_breakdown(client, addr).await {
                 Ok(body) => format!(r#"{{"elapsed_sec":{},"breakdown":{}}}"#, elapsed_sec, body),
                 Err(e) => format!(
@@ -855,7 +859,10 @@ async fn sample_breakdown(
         .uri(uri)
         .body(Full::new(bytes::Bytes::new()))
         .map_err(|e| format!("build: {e}"))?;
-    let resp = client.request(req).await.map_err(|e| format!("send: {e}"))?;
+    let resp = client
+        .request(req)
+        .await
+        .map_err(|e| format!("send: {e}"))?;
     let status = resp.status();
     let body = resp
         .into_body()
@@ -867,7 +874,10 @@ async fn sample_breakdown(
         return Err(format!(
             "status={} body={}",
             status,
-            String::from_utf8_lossy(&body).chars().take(200).collect::<String>(),
+            String::from_utf8_lossy(&body)
+                .chars()
+                .take(200)
+                .collect::<String>(),
         ));
     }
     Ok(String::from_utf8_lossy(&body).to_string())
@@ -902,11 +912,13 @@ async fn sample_breakdown(
 /// the offline analyzer's `DEFAULT_WARMUP_SEC` constant lineage).
 fn write_soak_summary(out_dir: &Path, duration_sec: u64) -> Result<bool, String> {
     let stats_path = out_dir.join("soak-stats.jsonl");
-    let raw = std::fs::read_to_string(&stats_path)
-        .map_err(|e| format!("read stats: {e}"))?;
+    let raw = std::fs::read_to_string(&stats_path).map_err(|e| format!("read stats: {e}"))?;
     let lines: Vec<&str> = raw.lines().filter(|l| !l.is_empty()).collect();
     if lines.len() < 2 {
-        return Err(format!("soak-stats.jsonl has only {} lines; cannot compute slope", lines.len()));
+        return Err(format!(
+            "soak-stats.jsonl has only {} lines; cannot compute slope",
+            lines.len()
+        ));
     }
 
     // Parse first & last sample to compute slopes (simple two-point — for
@@ -996,8 +1008,7 @@ fn write_soak_summary(out_dir: &Path, duration_sec: u64) -> Result<bool, String>
     ) = if post_warmup.len() >= 2 {
         let n = post_warmup.len();
         let mean_x = post_warmup.iter().map(|&(e, _, _)| e as f64).sum::<f64>() / n as f64;
-        let mean_y =
-            post_warmup.iter().map(|&(_, r, _)| r as f64).sum::<f64>() / n as f64;
+        let mean_y = post_warmup.iter().map(|&(_, r, _)| r as f64).sum::<f64>() / n as f64;
         let num: f64 = post_warmup
             .iter()
             .map(|&(e, r, _)| (e as f64 - mean_x) * (r as f64 - mean_y))
@@ -1016,7 +1027,13 @@ fn write_soak_summary(out_dir: &Path, duration_sec: u64) -> Result<bool, String>
         } else {
             f64::NAN
         };
-        (n, mean_y, slope_kb_per_sec, slope_mb_per_hour, slope_pct_per_hour)
+        (
+            n,
+            mean_y,
+            slope_kb_per_sec,
+            slope_mb_per_hour,
+            slope_pct_per_hour,
+        )
     } else {
         (0, f64::NAN, f64::NAN, f64::NAN, f64::NAN)
     };
@@ -1030,9 +1047,7 @@ fn write_soak_summary(out_dir: &Path, duration_sec: u64) -> Result<bool, String>
     // FD trace is 36 → 36 (FLAT) while the whole-run delta is 34→36
     // (FAIL strict).
     let (fd_post_warmup_first, fd_post_warmup_last, fd_post_warmup_delta) =
-        if let (Some(&(_, _, ff)), Some(&(_, _, fl))) =
-            (post_warmup.first(), post_warmup.last())
-        {
+        if let (Some(&(_, _, ff)), Some(&(_, _, fl))) = (post_warmup.first(), post_warmup.last()) {
             (ff, fl, fl - ff)
         } else {
             (-1, -1, 0)
@@ -1068,8 +1083,7 @@ fn write_soak_summary(out_dir: &Path, duration_sec: u64) -> Result<bool, String>
     // to the smoke sanity checks (same behaviour as the prior
     // harness for short runs).
     let rss_post_warmup_pass = if rss_post_warmup_n >= 2 {
-        rss_post_warmup_slope_pct_per_hour.is_nan()
-            || rss_post_warmup_slope_pct_per_hour <= 0.5
+        rss_post_warmup_slope_pct_per_hour.is_nan() || rss_post_warmup_slope_pct_per_hour <= 0.5
     } else {
         pass_rss // fall back to smoke sanity check
     };
@@ -1078,11 +1092,8 @@ fn write_soak_summary(out_dir: &Path, duration_sec: u64) -> Result<bool, String>
     } else {
         pass_fd // fall back to whole-run delta in smoke window
     };
-    let overall_pass = rss_post_warmup_pass
-        && fd_post_warmup_pass
-        && pass_mtl
-        && pass_orphans
-        && pass_req;
+    let overall_pass =
+        rss_post_warmup_pass && fd_post_warmup_pass && pass_mtl && pass_orphans && pass_req;
 
     let gate_mode = if is_smoke { "smoke" } else { "full_soak" };
     // f64::NAN serialization: serde would emit `null`, but we hand-roll
@@ -1116,22 +1127,34 @@ fn write_soak_summary(out_dir: &Path, duration_sec: u64) -> Result<bool, String>
         gate_mode,
         lines.len(),
         req_last,
-        rss_first, rss_last, fmt_f(rss_slope_pct_per_hour), pass_rss,
-        fd_first, fd_last, fd_delta, pass_fd,
-        mtl_first, mtl_last, fmt_f(mtl_slope_pct_per_hour), pass_mtl,
-        kv_orphan_max, pass_orphans,
+        rss_first,
+        rss_last,
+        fmt_f(rss_slope_pct_per_hour),
+        pass_rss,
+        fd_first,
+        fd_last,
+        fd_delta,
+        pass_fd,
+        mtl_first,
+        mtl_last,
+        fmt_f(mtl_slope_pct_per_hour),
+        pass_mtl,
+        kv_orphan_max,
+        pass_orphans,
         warmup_sec,
         rss_post_warmup_n,
         fmt_f(rss_post_warmup_mean_kb),
         fmt_f(rss_post_warmup_slope_mb_per_hour),
         fmt_f(rss_post_warmup_slope_pct_per_hour),
         rss_post_warmup_pass,
-        fd_post_warmup_first, fd_post_warmup_last, fd_post_warmup_delta, fd_post_warmup_pass,
+        fd_post_warmup_first,
+        fd_post_warmup_last,
+        fd_post_warmup_delta,
+        fd_post_warmup_pass,
         overall_pass,
     );
     let summary_path = out_dir.join("soak-summary.json");
-    std::fs::write(&summary_path, summary.as_bytes())
-        .map_err(|e| format!("write summary: {e}"))?;
+    std::fs::write(&summary_path, summary.as_bytes()).map_err(|e| format!("write summary: {e}"))?;
     eprintln!("[soak/summary] wrote {}", summary_path.display());
     eprintln!(
         "[soak/summary] post-warmup (warmup={}s): rss_slope={} %/h fd_delta={} → rss_pass={} fd_pass={}",
@@ -1141,7 +1164,10 @@ fn write_soak_summary(out_dir: &Path, duration_sec: u64) -> Result<bool, String>
         rss_post_warmup_pass,
         fd_post_warmup_pass,
     );
-    eprintln!("[soak/summary] verdict: {}", if overall_pass { "PASS" } else { "FAIL" });
+    eprintln!(
+        "[soak/summary] verdict: {}",
+        if overall_pass { "PASS" } else { "FAIL" }
+    );
     Ok(overall_pass)
 }
 
@@ -1210,7 +1236,11 @@ async fn run_soak() {
     let breakdown_addr = if breakdown_enabled { Some(addr) } else { None };
     eprintln!(
         "[soak/init] breakdown sampling: {}",
-        if breakdown_enabled { "ENABLED" } else { "disabled" },
+        if breakdown_enabled {
+            "ENABLED"
+        } else {
+            "disabled"
+        },
     );
 
     // Spawn sampler loop alongside workload.
@@ -1219,11 +1249,14 @@ async fn run_soak() {
         let counter = Arc::clone(&counter);
         let stop = Arc::clone(&stop);
         let kv_dir = disk_kv_dir.clone();
-        tokio::spawn(async move { sample_loop(out_dir, counter, kv_dir, stop, breakdown_addr).await })
+        tokio::spawn(
+            async move { sample_loop(out_dir, counter, kv_dir, stop, breakdown_addr).await },
+        )
     };
 
     // Run the workload (this blocks until duration elapses).
-    let workload_result = run_in_process_workload(&client, addr, duration, Arc::clone(&counter), &out_dir).await;
+    let workload_result =
+        run_in_process_workload(&client, addr, duration, Arc::clone(&counter), &out_dir).await;
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     // Wait for the sampler to flush its final line.
     let _ = sampler_handle.await;
@@ -1234,7 +1267,10 @@ async fn run_soak() {
 
     // Write summary + assert acceptance.
     let pass = write_soak_summary(&out_dir, duration.as_secs()).expect("write summary");
-    assert!(pass, "soak failed acceptance criteria (see soak-summary.json)");
+    assert!(
+        pass,
+        "soak failed acceptance criteria (see soak-summary.json)"
+    );
 }
 
 /// 4-hour soak: same harness, longer duration. Caller MUST set
@@ -1276,10 +1312,14 @@ async fn soak_30min() {
     // across threads).  Only this test mutates the var in this binary;
     // the env-guard pattern lives in server_memory_breakdown.rs for the
     // unit tests that need finer control.
-    unsafe { std::env::set_var("LUMEN_SERVER_DEBUG_MEM", "1"); }
+    unsafe {
+        std::env::set_var("LUMEN_SERVER_DEBUG_MEM", "1");
+    }
     // If the operator did not explicitly set a duration, default to 30 min.
     if std::env::var("LUMEN_SOAK_DURATION_SEC").is_err() {
-        unsafe { std::env::set_var("LUMEN_SOAK_DURATION_SEC", "1800"); }
+        unsafe {
+            std::env::set_var("LUMEN_SOAK_DURATION_SEC", "1800");
+        }
     }
     run_soak().await
 }

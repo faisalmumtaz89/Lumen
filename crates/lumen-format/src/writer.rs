@@ -62,7 +62,10 @@ pub fn write_lbc<W: Write>(
     let alignment: usize = header.alignment.try_into().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("alignment {} exceeds platform pointer size", header.alignment),
+            format!(
+                "alignment {} exceeds platform pointer size",
+                header.alignment
+            ),
         )
     })?;
     let padding = align_up(raw_prefix, alignment) - raw_prefix;
@@ -204,7 +207,10 @@ pub(crate) fn write_zeros<W: Write>(w: &mut W, mut n: usize) -> io::Result<()> {
 }
 
 pub(crate) fn align_up(value: usize, alignment: usize) -> usize {
-    assert!(alignment > 0 && alignment.is_power_of_two(), "alignment must be a non-zero power of two");
+    assert!(
+        alignment > 0 && alignment.is_power_of_two(),
+        "alignment must be a non-zero power of two"
+    );
     (value + alignment - 1) & !(alignment - 1)
 }
 
@@ -214,11 +220,14 @@ pub(crate) fn align_up(value: usize, alignment: usize) -> usize {
 pub(crate) fn serialize_header(h: &LbcHeader) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
 
-    buf.extend_from_slice(&h.magic.to_le_bytes());                  // 0..4
-    buf.extend_from_slice(&h.version.to_le_bytes());                // 4..8
-    buf.push(match h.endianness { Endianness::Little => 0, Endianness::Big => 1 }); // 8
+    buf.extend_from_slice(&h.magic.to_le_bytes()); // 0..4
+    buf.extend_from_slice(&h.version.to_le_bytes()); // 4..8
+    buf.push(match h.endianness {
+        Endianness::Little => 0,
+        Endianness::Big => 1,
+    }); // 8
     buf.extend_from_slice(&[0u8; 3]); // padding to align                           // 9..12
-    buf.extend_from_slice(&h.header_checksum.to_le_bytes());        // 12..16
+    buf.extend_from_slice(&h.header_checksum.to_le_bytes()); // 12..16
 
     // Hyperparams
     serialize_hyperparams(&mut buf, &h.hyperparams);
@@ -367,22 +376,33 @@ pub(crate) fn serialize_layer_indices(indices: &[LayerIndex]) -> Vec<u8> {
         buf.extend_from_slice(&idx.layer_length_bytes.to_le_bytes());
         let st = &idx.subtensors;
         for slice in [
-            &st.wq, &st.wk, &st.wv, &st.wo,
-            &st.w_gate, &st.w_up, &st.w_down,
-            &st.attn_norm, &st.ffn_norm,
+            &st.wq,
+            &st.wk,
+            &st.wv,
+            &st.wo,
+            &st.w_gate,
+            &st.w_up,
+            &st.w_down,
+            &st.attn_norm,
+            &st.ffn_norm,
         ] {
             serialize_tensor_slice(&mut buf, slice);
         }
         // Bias flags byte: bit 0 = bq, bit 1 = bk, bit 2 = bv
-        let bias_flags: u8 =
-            (st.bq.is_some() as u8)
+        let bias_flags: u8 = (st.bq.is_some() as u8)
             | ((st.bk.is_some() as u8) << 1)
             | ((st.bv.is_some() as u8) << 2);
         buf.push(bias_flags);
         buf.extend_from_slice(&[0u8; 7]); // padding to 8 bytes
-        if let Some(ref s) = st.bq { serialize_tensor_slice(&mut buf, s); }
-        if let Some(ref s) = st.bk { serialize_tensor_slice(&mut buf, s); }
-        if let Some(ref s) = st.bv { serialize_tensor_slice(&mut buf, s); }
+        if let Some(ref s) = st.bq {
+            serialize_tensor_slice(&mut buf, s);
+        }
+        if let Some(ref s) = st.bk {
+            serialize_tensor_slice(&mut buf, s);
+        }
+        if let Some(ref s) = st.bv {
+            serialize_tensor_slice(&mut buf, s);
+        }
 
         // MoE fields: num_experts (u32) + has_router (u8) + padding (3 bytes) = 8 bytes
         // Followed by optional router slice and expert slices.
@@ -420,8 +440,7 @@ pub(crate) fn serialize_layer_indices(indices: &[LayerIndex]) -> Vec<u8> {
         //   bit 13: attn_q_norm
         //   bit 14: attn_k_norm
         //   bit 15: ffn_gate_inp_shexp
-        let ext_flags: u32 =
-            (st.shared_expert_gate.is_some() as u32)
+        let ext_flags: u32 = (st.shared_expert_gate.is_some() as u32)
             | ((st.shared_expert_up.is_some() as u32) << 1)
             | ((st.shared_expert_down.is_some() as u32) << 2)
             | ((st.attn_gate.is_some() as u32) << 3)
@@ -440,25 +459,55 @@ pub(crate) fn serialize_layer_indices(indices: &[LayerIndex]) -> Vec<u8> {
         buf.extend_from_slice(&ext_flags.to_le_bytes());
         buf.extend_from_slice(&[0u8; 4]); // padding to 8 bytes
 
-        if let Some(ref s) = st.shared_expert_gate { serialize_tensor_slice(&mut buf, s); }
-        if let Some(ref s) = st.shared_expert_up { serialize_tensor_slice(&mut buf, s); }
-        if let Some(ref s) = st.shared_expert_down { serialize_tensor_slice(&mut buf, s); }
-        if let Some(ref s) = st.attn_gate { serialize_tensor_slice(&mut buf, s); }
-        if let Some(ref s) = st.attn_post_norm { serialize_tensor_slice(&mut buf, s); }
-        if let Some(ref s) = st.ssm_a { serialize_tensor_slice(&mut buf, s); }
-        if let Some(ref s) = st.ssm_conv1d { serialize_tensor_slice(&mut buf, s); }
-        if let Some(ref s) = st.ssm_dt { serialize_tensor_slice(&mut buf, s); }
-        if let Some(ref s) = st.ssm_beta { serialize_tensor_slice(&mut buf, s); }
-        if let Some(ref s) = st.ssm_alpha { serialize_tensor_slice(&mut buf, s); }
-        if let Some(ref s) = st.ssm_norm { serialize_tensor_slice(&mut buf, s); }
-        if let Some(ref s) = st.ssm_out { serialize_tensor_slice(&mut buf, s); }
+        if let Some(ref s) = st.shared_expert_gate {
+            serialize_tensor_slice(&mut buf, s);
+        }
+        if let Some(ref s) = st.shared_expert_up {
+            serialize_tensor_slice(&mut buf, s);
+        }
+        if let Some(ref s) = st.shared_expert_down {
+            serialize_tensor_slice(&mut buf, s);
+        }
+        if let Some(ref s) = st.attn_gate {
+            serialize_tensor_slice(&mut buf, s);
+        }
+        if let Some(ref s) = st.attn_post_norm {
+            serialize_tensor_slice(&mut buf, s);
+        }
+        if let Some(ref s) = st.ssm_a {
+            serialize_tensor_slice(&mut buf, s);
+        }
+        if let Some(ref s) = st.ssm_conv1d {
+            serialize_tensor_slice(&mut buf, s);
+        }
+        if let Some(ref s) = st.ssm_dt {
+            serialize_tensor_slice(&mut buf, s);
+        }
+        if let Some(ref s) = st.ssm_beta {
+            serialize_tensor_slice(&mut buf, s);
+        }
+        if let Some(ref s) = st.ssm_alpha {
+            serialize_tensor_slice(&mut buf, s);
+        }
+        if let Some(ref s) = st.ssm_norm {
+            serialize_tensor_slice(&mut buf, s);
+        }
+        if let Some(ref s) = st.ssm_out {
+            serialize_tensor_slice(&mut buf, s);
+        }
         if let Some(lt) = st.layer_type {
             buf.push(lt);
             buf.extend_from_slice(&[0u8; 7]); // padding to 8 bytes
         }
-        if let Some(ref s) = st.attn_q_norm { serialize_tensor_slice(&mut buf, s); }
-        if let Some(ref s) = st.attn_k_norm { serialize_tensor_slice(&mut buf, s); }
-        if let Some(ref s) = st.ffn_gate_inp_shexp { serialize_tensor_slice(&mut buf, s); }
+        if let Some(ref s) = st.attn_q_norm {
+            serialize_tensor_slice(&mut buf, s);
+        }
+        if let Some(ref s) = st.attn_k_norm {
+            serialize_tensor_slice(&mut buf, s);
+        }
+        if let Some(ref s) = st.ffn_gate_inp_shexp {
+            serialize_tensor_slice(&mut buf, s);
+        }
     }
     buf
 }

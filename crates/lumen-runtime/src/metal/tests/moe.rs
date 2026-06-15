@@ -1,10 +1,10 @@
 // MoE (Mixture of Experts) kernel and routing tests.
 // Extracted from mod.rs for modularity.
 
-use crate::metal::*;
-use crate::metal::shaders::METAL_SHADER_SOURCE;
-use crate::metal::ffi::MTLSize;
 use crate::compute::ComputeBackend;
+use crate::metal::ffi::MTLSize;
+use crate::metal::shaders::METAL_SHADER_SOURCE;
+use crate::metal::*;
 use lumen_format::hyperparams::ModelHyperparams;
 
 /// Test moe_expert_accum kernel correctness (decode path).
@@ -16,8 +16,10 @@ use lumen_format::hyperparams::ModelHyperparams;
 fn test_moe_expert_accum_correctness() {
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("moe_expert_accum").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -45,7 +47,10 @@ fn test_moe_expert_accum_correctness() {
     let expert_ids_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(expert_ids.as_ptr() as *const u8, expert_ids.len() * 4)
     };
-    let expert_ids_buf = backend.device.new_buffer_with_bytes(expert_ids_bytes).unwrap();
+    let expert_ids_buf = backend
+        .device
+        .new_buffer_with_bytes(expert_ids_bytes)
+        .unwrap();
 
     // Residual = all 0.0 (isolates the accumulation logic)
     let residual = vec![0.0f32; hidden_dim];
@@ -60,18 +65,15 @@ fn test_moe_expert_accum_correctness() {
     let cmd = backend.queue.new_command_buffer().unwrap();
     let enc = cmd.new_compute_encoder().unwrap();
     enc.set_pipeline_state(&pso);
-    enc.set_buffer(&expert_outputs_buf, 0, 0);     // expert_outputs [num_experts * hidden_dim]
-    enc.set_buffer(&expert_weights_buf, 0, 1);      // expert_weights [top_k]
-    enc.set_buffer(&expert_ids_buf, 0, 2);           // expert_ids [top_k] u32
-    enc.set_buffer(&output_buf, 0, 3);               // output [hidden_dim]
-    enc.set_buffer(&residual_buf, 0, 4);             // residual [hidden_dim]
+    enc.set_buffer(&expert_outputs_buf, 0, 0); // expert_outputs [num_experts * hidden_dim]
+    enc.set_buffer(&expert_weights_buf, 0, 1); // expert_weights [top_k]
+    enc.set_buffer(&expert_ids_buf, 0, 2); // expert_ids [top_k] u32
+    enc.set_buffer(&output_buf, 0, 3); // output [hidden_dim]
+    enc.set_buffer(&residual_buf, 0, 4); // residual [hidden_dim]
     enc.set_bytes(&hidden_dim_u32.to_le_bytes(), 5);
     enc.set_bytes(&top_k_u32.to_le_bytes(), 6);
     let tg_count = ((hidden_dim as u64) + 255) / 256;
-    enc.dispatch_threadgroups(
-        MTLSize::new(tg_count, 1, 1),
-        MTLSize::new(256, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(tg_count, 1, 1), MTLSize::new(256, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -97,8 +99,10 @@ fn test_moe_expert_accum_correctness() {
 fn test_moe_expert_accum_with_residual() {
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("moe_expert_accum").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -124,7 +128,10 @@ fn test_moe_expert_accum_with_residual() {
     let expert_ids_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(expert_ids.as_ptr() as *const u8, expert_ids.len() * 4)
     };
-    let expert_ids_buf = backend.device.new_buffer_with_bytes(expert_ids_bytes).unwrap();
+    let expert_ids_buf = backend
+        .device
+        .new_buffer_with_bytes(expert_ids_bytes)
+        .unwrap();
 
     // Residual = all 10.0
     let residual = vec![10.0f32; hidden_dim];
@@ -143,10 +150,7 @@ fn test_moe_expert_accum_with_residual() {
     enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 5);
     enc.set_bytes(&(top_k as u32).to_le_bytes(), 6);
     let tg_count = ((hidden_dim as u64) + 255) / 256;
-    enc.dispatch_threadgroups(
-        MTLSize::new(tg_count, 1, 1),
-        MTLSize::new(256, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(tg_count, 1, 1), MTLSize::new(256, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -176,8 +180,10 @@ fn test_moe_expert_accum_with_residual() {
 fn test_moe_expert_accum_batched_correctness() {
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("moe_expert_accum_batched").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -204,18 +210,24 @@ fn test_moe_expert_accum_batched_correctness() {
     // batch 0: experts [1, 3], weights [0.6, 0.4]
     // batch 1: experts [0, 2], weights [0.5, 0.5]
     // batch 2: experts [2, 3], weights [0.8, 0.2]
-    let expert_ids: Vec<u32> = vec![1, 3,  0, 2,  2, 3];
-    let expert_weights: Vec<f32> = vec![0.6, 0.4,  0.5, 0.5,  0.8, 0.2];
+    let expert_ids: Vec<u32> = vec![1, 3, 0, 2, 2, 3];
+    let expert_weights: Vec<f32> = vec![0.6, 0.4, 0.5, 0.5, 0.8, 0.2];
 
     let expert_ids_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(expert_ids.as_ptr() as *const u8, expert_ids.len() * 4)
     };
-    let expert_ids_buf = backend.device.new_buffer_with_bytes(expert_ids_bytes).unwrap();
+    let expert_ids_buf = backend
+        .device
+        .new_buffer_with_bytes(expert_ids_bytes)
+        .unwrap();
     let expert_weights_buf = backend.upload_f32(&expert_weights).unwrap();
 
     let residual = vec![0.0f32; batch_size * hidden_dim];
     let residual_buf = backend.upload_f32(&residual).unwrap();
-    let output_buf = backend.device.new_buffer(batch_size * hidden_dim * 4).unwrap();
+    let output_buf = backend
+        .device
+        .new_buffer(batch_size * hidden_dim * 4)
+        .unwrap();
 
     let cmd = backend.queue.new_command_buffer().unwrap();
     let enc = cmd.new_compute_encoder().unwrap();
@@ -230,10 +242,7 @@ fn test_moe_expert_accum_batched_correctness() {
     enc.set_bytes(&(batch_size as u32).to_le_bytes(), 7);
     let total_elems = (batch_size * hidden_dim) as u64;
     let tg_count = total_elems.div_ceil(256);
-    enc.dispatch_threadgroups(
-        MTLSize::new(tg_count, 1, 1),
-        MTLSize::new(256, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(tg_count, 1, 1), MTLSize::new(256, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -248,14 +257,19 @@ fn test_moe_expert_accum_batched_correctness() {
 
     let mut max_err = 0.0f32;
     for b in 0..batch_size {
-        let ids = [expert_ids[b * top_k] as usize, expert_ids[b * top_k + 1] as usize];
+        let ids = [
+            expert_ids[b * top_k] as usize,
+            expert_ids[b * top_k + 1] as usize,
+        ];
         let weights = [expert_weights[b * top_k], expert_weights[b * top_k + 1]];
         for t in 0..hidden_dim {
-            let expected = weights[0] * expert_val(ids[0], b, t)
-                         + weights[1] * expert_val(ids[1], b, t);
+            let expected =
+                weights[0] * expert_val(ids[0], b, t) + weights[1] * expert_val(ids[1], b, t);
             let actual = result[b * hidden_dim + t];
             let err = (actual - expected).abs();
-            if err > max_err { max_err = err; }
+            if err > max_err {
+                max_err = err;
+            }
             assert!(
                 err < 1e-2,
                 "moe_expert_accum_batched[b={b}, t={t}]: GPU={actual}, expected={expected}, err={err}"
@@ -273,7 +287,10 @@ fn test_moe_expert_accum_batched_correctness() {
 #[test]
 fn test_moe_prefill_route_sort() {
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device.new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("moe_prefill_route_sort").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -281,15 +298,16 @@ fn test_moe_prefill_route_sort() {
     let batch_size: usize = 4;
     let top_k: usize = 2;
     // token 0 -> [3,1]; token 1 -> [1,5]; token 2 -> [3,0]; token 3 -> [1,3]
-    let expert_ids: Vec<u32> = vec![3,1, 1,5, 3,0, 1,3];
+    let expert_ids: Vec<u32> = vec![3, 1, 1, 5, 3, 0, 1, 3];
     let a = batch_size * top_k;
 
     let eid_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(expert_ids.as_ptr() as *const u8, expert_ids.len()*4) };
+        std::slice::from_raw_parts(expert_ids.as_ptr() as *const u8, expert_ids.len() * 4)
+    };
     let eid_buf = backend.device.new_buffer_with_bytes(eid_bytes).unwrap();
-    let seg_off_buf = backend.device.new_buffer((num_experts+1)*4).unwrap();
-    let tok_buf = backend.device.new_buffer(a*4).unwrap();
-    let slot_buf = backend.device.new_buffer(a*4).unwrap();
+    let seg_off_buf = backend.device.new_buffer((num_experts + 1) * 4).unwrap();
+    let tok_buf = backend.device.new_buffer(a * 4).unwrap();
+    let slot_buf = backend.device.new_buffer(a * 4).unwrap();
 
     let cmd = backend.queue.new_command_buffer().unwrap();
     let enc = cmd.new_compute_encoder().unwrap();
@@ -301,11 +319,14 @@ fn test_moe_prefill_route_sort() {
     enc.set_bytes(&(batch_size as u32).to_le_bytes(), 4);
     enc.set_bytes(&(top_k as u32).to_le_bytes(), 5);
     enc.set_bytes(&(num_experts as u32).to_le_bytes(), 6);
-    enc.dispatch_threadgroups(MTLSize::new(1,1,1), MTLSize::new(num_experts as u64,1,1));
+    enc.dispatch_threadgroups(
+        MTLSize::new(1, 1, 1),
+        MTLSize::new(num_experts as u64, 1, 1),
+    );
     enc.end_encoding();
     cmd.commit_and_wait();
 
-    let mut seg = vec![0u32; num_experts+1];
+    let mut seg = vec![0u32; num_experts + 1];
     seg_off_buf.read_u32(&mut seg);
     let mut tok = vec![0u32; a];
     tok_buf.read_u32(&mut tok);
@@ -314,19 +335,29 @@ fn test_moe_prefill_route_sort() {
 
     // CPU counting-sort reference.
     let mut counts = vec![0u32; num_experts];
-    for &e in &expert_ids { counts[e as usize] += 1; }
-    let mut exp_seg = vec![0u32; num_experts+1];
-    for e in 0..num_experts { exp_seg[e+1] = exp_seg[e] + counts[e]; }
-    assert_eq!(seg, exp_seg, "seg_off mismatch: got {seg:?} exp {exp_seg:?}");
+    for &e in &expert_ids {
+        counts[e as usize] += 1;
+    }
+    let mut exp_seg = vec![0u32; num_experts + 1];
+    for e in 0..num_experts {
+        exp_seg[e + 1] = exp_seg[e] + counts[e];
+    }
+    assert_eq!(
+        seg, exp_seg,
+        "seg_off mismatch: got {seg:?} exp {exp_seg:?}"
+    );
 
     // For each expert segment, the (tok,slot) entries must all route to e.
     for e in 0..num_experts {
-        for p in seg[e]..seg[e+1] {
+        for p in seg[e]..seg[e + 1] {
             let t = tok[p as usize] as usize;
             let k = slot[p as usize] as usize;
-            assert_eq!(expert_ids[t*top_k + k] as usize, e,
+            assert_eq!(
+                expert_ids[t * top_k + k] as usize,
+                e,
                 "expert {e} seg pos {p}: tok {t} slot {k} routes to {} not {e}",
-                expert_ids[t*top_k+k]);
+                expert_ids[t * top_k + k]
+            );
         }
     }
     eprintln!("moe_prefill_route_sort: seg={seg:?} -- PASS");
@@ -337,15 +368,18 @@ fn test_moe_prefill_route_sort() {
 #[test]
 fn test_moe_grouped_gemm_q8_0() {
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device.new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("moe_grouped_gemm_q8_0").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
     // 2 experts. seg_off = [0, 3, 5] => expert0 has rows 0..3 (3 rows),
     // expert1 has rows 3..5 (2 rows). total_assign=5.
     let num_experts: usize = 2;
-    let n: usize = 64;   // output dim (inter)
-    let k: usize = 64;   // input dim (hidden)
+    let n: usize = 64; // output dim (inter)
+    let k: usize = 64; // input dim (hidden)
     let total_assign: usize = 5;
     let seg_off: Vec<u32> = vec![0, 3, 5];
 
@@ -360,13 +394,15 @@ fn test_moe_grouped_gemm_q8_0() {
         woff[e] = (e * ebytes) as u64;
         let w = vec![evals[e]; n * k];
         let enc = encode_q8_0_matrix(&w, n, k);
-        layer[e*ebytes..(e+1)*ebytes].copy_from_slice(&enc);
+        layer[e * ebytes..(e + 1) * ebytes].copy_from_slice(&enc);
     }
 
     // Input: row r has constant value (r+1)*1.0
     let mut x = vec![0.0f32; total_assign * k];
     for r in 0..total_assign {
-        for c in 0..k { x[r*k+c] = (r+1) as f32; }
+        for c in 0..k {
+            x[r * k + c] = (r + 1) as f32;
+        }
     }
 
     let layer_buf = backend.device.new_buffer_with_bytes(&layer).unwrap();
@@ -390,8 +426,13 @@ fn test_moe_grouped_gemm_q8_0() {
     enc.set_bytes(&(num_experts as u32).to_le_bytes(), 7);
     let max_m_tiles = ((total_assign as u64) + 31) / 32;
     enc.dispatch_threadgroups(
-        MTLSize::new(((n as u64)+31)/32, max_m_tiles.max(1), num_experts as u64),
-        MTLSize::new(128, 1, 1));
+        MTLSize::new(
+            ((n as u64) + 31) / 32,
+            max_m_tiles.max(1),
+            num_experts as u64,
+        ),
+        MTLSize::new(128, 1, 1),
+    );
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -401,19 +442,25 @@ fn test_moe_grouped_gemm_q8_0() {
     // CPU ref: row r in expert e => Y[r,j] = sum_c x[r,c]*w_e = K * (r+1) * evals[e]
     let mut max_err = 0.0f32;
     for e in 0..num_experts {
-        for r in seg_off[e]..seg_off[e+1] {
+        for r in seg_off[e]..seg_off[e + 1] {
             let r = r as usize;
-            let expected = (k as f32) * (r+1) as f32 * evals[e];
+            let expected = (k as f32) * (r + 1) as f32 * evals[e];
             for j in 0..n {
-                let got = y[r*n+j];
-                let err = (got-expected).abs() / expected.max(1e-3);
-                if err > max_err { max_err = err; }
-                assert!(err < 0.02,
-                    "grouped_gemm e={e} r={r} j={j}: got {got} exp {expected} rel_err {err}");
+                let got = y[r * n + j];
+                let err = (got - expected).abs() / expected.max(1e-3);
+                if err > max_err {
+                    max_err = err;
+                }
+                assert!(
+                    err < 0.02,
+                    "grouped_gemm e={e} r={r} j={j}: got {got} exp {expected} rel_err {err}"
+                );
             }
         }
     }
-    eprintln!("moe_grouped_gemm_q8_0: total_assign={total_assign} max_rel_err={max_err:.5} -- PASS");
+    eprintln!(
+        "moe_grouped_gemm_q8_0: total_assign={total_assign} max_rel_err={max_err:.5} -- PASS"
+    );
 }
 
 /// Gather + scatter roundtrip + assign_expert.
@@ -422,15 +469,26 @@ fn test_moe_grouped_gemm_q8_0() {
 #[test]
 fn test_moe_prefill_gather_scatter() {
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device.new_library_with_source(METAL_SHADER_SOURCE).unwrap();
-    let sort = backend.device.new_compute_pipeline_state(
-        &lib.get_function("moe_prefill_route_sort").unwrap()).unwrap();
-    let assign = backend.device.new_compute_pipeline_state(
-        &lib.get_function("moe_prefill_assign_expert").unwrap()).unwrap();
-    let gather = backend.device.new_compute_pipeline_state(
-        &lib.get_function("moe_prefill_gather").unwrap()).unwrap();
-    let scatter = backend.device.new_compute_pipeline_state(
-        &lib.get_function("moe_prefill_scatter").unwrap()).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
+    let sort = backend
+        .device
+        .new_compute_pipeline_state(&lib.get_function("moe_prefill_route_sort").unwrap())
+        .unwrap();
+    let assign = backend
+        .device
+        .new_compute_pipeline_state(&lib.get_function("moe_prefill_assign_expert").unwrap())
+        .unwrap();
+    let gather = backend
+        .device
+        .new_compute_pipeline_state(&lib.get_function("moe_prefill_gather").unwrap())
+        .unwrap();
+    let scatter = backend
+        .device
+        .new_compute_pipeline_state(&lib.get_function("moe_prefill_scatter").unwrap())
+        .unwrap();
 
     let num_experts: usize = 4;
     let batch_size: usize = 3;
@@ -438,67 +496,95 @@ fn test_moe_prefill_gather_scatter() {
     let top_k: usize = 2;
     let a = batch_size * top_k;
     // tok0->[2,0], tok1->[1,2], tok2->[0,3]
-    let expert_ids: Vec<u32> = vec![2,0, 1,2, 0,3];
+    let expert_ids: Vec<u32> = vec![2, 0, 1, 2, 0, 3];
 
     // normed[tok][h] = tok*100 + h
-    let mut normed = vec![0.0f32; batch_size*hidden];
-    for t in 0..batch_size { for h in 0..hidden { normed[t*hidden+h] = (t*100+h) as f32; } }
+    let mut normed = vec![0.0f32; batch_size * hidden];
+    for t in 0..batch_size {
+        for h in 0..hidden {
+            normed[t * hidden + h] = (t * 100 + h) as f32;
+        }
+    }
 
-    let eid_bytes: &[u8] = unsafe { std::slice::from_raw_parts(expert_ids.as_ptr() as *const u8, a*4) };
+    let eid_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(expert_ids.as_ptr() as *const u8, a * 4) };
     let eid_buf = backend.device.new_buffer_with_bytes(eid_bytes).unwrap();
-    let seg_buf = backend.device.new_buffer((num_experts+1)*4).unwrap();
-    let tok_buf = backend.device.new_buffer(a*4).unwrap();
-    let slot_buf = backend.device.new_buffer(a*4).unwrap();
-    let ae_buf = backend.device.new_buffer(a*4).unwrap();
+    let seg_buf = backend.device.new_buffer((num_experts + 1) * 4).unwrap();
+    let tok_buf = backend.device.new_buffer(a * 4).unwrap();
+    let slot_buf = backend.device.new_buffer(a * 4).unwrap();
+    let ae_buf = backend.device.new_buffer(a * 4).unwrap();
     let normed_buf = backend.upload_f32(&normed).unwrap();
-    let grp_in_buf = backend.device.new_buffer(a*hidden*4).unwrap();
+    let grp_in_buf = backend.device.new_buffer(a * hidden * 4).unwrap();
     // grouped "down output" = the gathered input itself (identity), to test scatter roundtrip.
-    let eout_buf = backend.upload_f32(&vec![-1.0f32; num_experts*batch_size*hidden]).unwrap();
+    let eout_buf = backend
+        .upload_f32(&vec![-1.0f32; num_experts * batch_size * hidden])
+        .unwrap();
 
     let cmd = backend.queue.new_command_buffer().unwrap();
     let enc = cmd.new_compute_encoder().unwrap();
     enc.set_pipeline_state(&sort);
-    enc.set_buffer(&eid_buf,0,0); enc.set_buffer(&seg_buf,0,1);
-    enc.set_buffer(&tok_buf,0,2); enc.set_buffer(&slot_buf,0,3);
-    enc.set_bytes(&(batch_size as u32).to_le_bytes(),4);
-    enc.set_bytes(&(top_k as u32).to_le_bytes(),5);
-    enc.set_bytes(&(num_experts as u32).to_le_bytes(),6);
-    enc.dispatch_threadgroups(MTLSize::new(1,1,1), MTLSize::new(num_experts as u64,1,1));
+    enc.set_buffer(&eid_buf, 0, 0);
+    enc.set_buffer(&seg_buf, 0, 1);
+    enc.set_buffer(&tok_buf, 0, 2);
+    enc.set_buffer(&slot_buf, 0, 3);
+    enc.set_bytes(&(batch_size as u32).to_le_bytes(), 4);
+    enc.set_bytes(&(top_k as u32).to_le_bytes(), 5);
+    enc.set_bytes(&(num_experts as u32).to_le_bytes(), 6);
+    enc.dispatch_threadgroups(
+        MTLSize::new(1, 1, 1),
+        MTLSize::new(num_experts as u64, 1, 1),
+    );
     enc.memory_barrier_with_scope(1);
     enc.set_pipeline_state(&assign);
-    enc.set_buffer(&seg_buf,0,0); enc.set_buffer(&ae_buf,0,1);
-    enc.set_bytes(&(num_experts as u32).to_le_bytes(),2);
-    enc.dispatch_threadgroups(MTLSize::new(1,1,1), MTLSize::new(num_experts as u64,1,1));
+    enc.set_buffer(&seg_buf, 0, 0);
+    enc.set_buffer(&ae_buf, 0, 1);
+    enc.set_bytes(&(num_experts as u32).to_le_bytes(), 2);
+    enc.dispatch_threadgroups(
+        MTLSize::new(1, 1, 1),
+        MTLSize::new(num_experts as u64, 1, 1),
+    );
     enc.memory_barrier_with_scope(1);
     enc.set_pipeline_state(&gather);
-    enc.set_buffer(&normed_buf,0,0); enc.set_buffer(&tok_buf,0,1); enc.set_buffer(&grp_in_buf,0,2);
-    enc.set_bytes(&(hidden as u32).to_le_bytes(),3);
-    enc.set_bytes(&(a as u32).to_le_bytes(),4);
-    enc.dispatch_threadgroups(MTLSize::new(((a*hidden) as u64+255)/256,1,1), MTLSize::new(256,1,1));
+    enc.set_buffer(&normed_buf, 0, 0);
+    enc.set_buffer(&tok_buf, 0, 1);
+    enc.set_buffer(&grp_in_buf, 0, 2);
+    enc.set_bytes(&(hidden as u32).to_le_bytes(), 3);
+    enc.set_bytes(&(a as u32).to_le_bytes(), 4);
+    enc.dispatch_threadgroups(
+        MTLSize::new(((a * hidden) as u64 + 255) / 256, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
     enc.memory_barrier_with_scope(1);
     // scatter grp_in (identity "output") into eout
     enc.set_pipeline_state(&scatter);
-    enc.set_buffer(&grp_in_buf,0,0); enc.set_buffer(&tok_buf,0,1); enc.set_buffer(&ae_buf,0,2);
-    enc.set_buffer(&eout_buf,0,3);
-    enc.set_bytes(&(hidden as u32).to_le_bytes(),4);
-    enc.set_bytes(&(batch_size as u32).to_le_bytes(),5);
-    enc.set_bytes(&(a as u32).to_le_bytes(),6);
-    enc.dispatch_threadgroups(MTLSize::new(((a*hidden) as u64+255)/256,1,1), MTLSize::new(256,1,1));
+    enc.set_buffer(&grp_in_buf, 0, 0);
+    enc.set_buffer(&tok_buf, 0, 1);
+    enc.set_buffer(&ae_buf, 0, 2);
+    enc.set_buffer(&eout_buf, 0, 3);
+    enc.set_bytes(&(hidden as u32).to_le_bytes(), 4);
+    enc.set_bytes(&(batch_size as u32).to_le_bytes(), 5);
+    enc.set_bytes(&(a as u32).to_le_bytes(), 6);
+    enc.dispatch_threadgroups(
+        MTLSize::new(((a * hidden) as u64 + 255) / 256, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
     enc.end_encoding();
     cmd.commit_and_wait();
 
-    let mut eout = vec![0.0f32; num_experts*batch_size*hidden];
+    let mut eout = vec![0.0f32; num_experts * batch_size * hidden];
     eout_buf.read_f32(&mut eout);
 
     // For each routed (token, expert), eout[e*batch*hidden + tok*hidden + h] == normed[tok][h].
     for t in 0..batch_size {
         for k in 0..top_k {
-            let e = expert_ids[t*top_k+k] as usize;
+            let e = expert_ids[t * top_k + k] as usize;
             for h in 0..hidden {
-                let got = eout[e*batch_size*hidden + t*hidden + h];
-                let exp = normed[t*hidden+h];
-                assert!((got-exp).abs() < 1e-4,
-                    "scatter (t={t},e={e},h={h}): got {got} exp {exp}");
+                let got = eout[e * batch_size * hidden + t * hidden + h];
+                let exp = normed[t * hidden + h];
+                assert!(
+                    (got - exp).abs() < 1e-4,
+                    "scatter (t={t},e={e},h={h}): got {got} exp {exp}"
+                );
             }
         }
     }
@@ -512,8 +598,16 @@ fn test_moe_prefill_gather_scatter() {
 #[test]
 fn test_moe_prefill_grouped_end_to_end() {
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device.new_library_with_source(METAL_SHADER_SOURCE).unwrap();
-    let p = |n: &str| backend.device.new_compute_pipeline_state(&lib.get_function(n).unwrap()).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
+    let p = |n: &str| {
+        backend
+            .device
+            .new_compute_pipeline_state(&lib.get_function(n).unwrap())
+            .unwrap()
+    };
     let sort = p("moe_prefill_route_sort");
     let assign = p("moe_prefill_assign_expert");
     let gather = p("moe_prefill_gather");
@@ -539,127 +633,218 @@ fn test_moe_prefill_grouped_end_to_end() {
         let mut ws = 0.0f32;
         let mut chosen = Vec::new();
         for k in 0..top_k {
-            let mut e = ((t*13 + k*29 + 1) % ne) as u32;
-            while chosen.contains(&e) { e = (e + 1) % ne as u32; }
+            let mut e = ((t * 13 + k * 29 + 1) % ne) as u32;
+            while chosen.contains(&e) {
+                e = (e + 1) % ne as u32;
+            }
             chosen.push(e);
             let w = ((t + k + 1) % 7 + 1) as f32;
             ws += w;
             expert_ids.push(e);
             expert_weights.push(w);
         }
-        for k in 0..top_k { expert_weights[t*top_k+k] /= ws; }
+        for k in 0..top_k {
+            expert_weights[t * top_k + k] /= ws;
+        }
     }
 
     // normed[token][h] in [-1,1] deterministic.
-    let mut normed = vec![0.0f32; batch*hidden];
-    for t in 0..batch { for h in 0..hidden {
-        normed[t*hidden+h] = (((t*7 + h*3) % 13) as f32 / 13.0) - 0.5;
-    }}
+    let mut normed = vec![0.0f32; batch * hidden];
+    for t in 0..batch {
+        for h in 0..hidden {
+            normed[t * hidden + h] = (((t * 7 + h * 3) % 13) as f32 / 13.0) - 0.5;
+        }
+    }
     // Per-expert gate/up/down weights, [N,K] each, small deterministic values.
     let wval = |e: usize, kind: usize, r: usize, c: usize| -> f32 {
-        (((e*31 + kind*17 + r*5 + c*2) % 19) as f32 / 19.0) - 0.5
+        (((e * 31 + kind * 17 + r * 5 + c * 2) % 19) as f32 / 19.0) - 0.5
     };
-    let bpr = hidden/32; let q8b = 34usize;
-    let gate_bytes = inter*bpr*q8b;       // [inter, hidden]
-    let down_bytes = hidden*(inter/32)*q8b; // [hidden, inter]
-    // Pack layer buffer: for each expert: gate | up | down.
-    let estride = gate_bytes*2 + down_bytes;
-    let mut layer = vec![0u8; ne*estride];
+    let bpr = hidden / 32;
+    let q8b = 34usize;
+    let gate_bytes = inter * bpr * q8b; // [inter, hidden]
+    let down_bytes = hidden * (inter / 32) * q8b; // [hidden, inter]
+                                                  // Pack layer buffer: for each expert: gate | up | down.
+    let estride = gate_bytes * 2 + down_bytes;
+    let mut layer = vec![0u8; ne * estride];
     let mut gate_woff = vec![0u64; ne];
     let mut up_woff = vec![0u64; ne];
     let mut down_woff = vec![0u64; ne];
     for e in 0..ne {
-        let base = e*estride;
+        let base = e * estride;
         gate_woff[e] = base as u64;
-        up_woff[e] = (base+gate_bytes) as u64;
-        down_woff[e] = (base+gate_bytes*2) as u64;
-        let g: Vec<f32> = (0..inter*hidden).map(|i| wval(e,0,i/hidden,i%hidden)).collect();
-        let u: Vec<f32> = (0..inter*hidden).map(|i| wval(e,1,i/hidden,i%hidden)).collect();
-        let d: Vec<f32> = (0..hidden*inter).map(|i| wval(e,2,i/inter,i%inter)).collect();
-        layer[base..base+gate_bytes].copy_from_slice(&encode_q8_0_matrix(&g, inter, hidden));
-        layer[base+gate_bytes..base+gate_bytes*2].copy_from_slice(&encode_q8_0_matrix(&u, inter, hidden));
-        layer[base+gate_bytes*2..base+estride].copy_from_slice(&encode_q8_0_matrix(&d, hidden, inter));
+        up_woff[e] = (base + gate_bytes) as u64;
+        down_woff[e] = (base + gate_bytes * 2) as u64;
+        let g: Vec<f32> = (0..inter * hidden)
+            .map(|i| wval(e, 0, i / hidden, i % hidden))
+            .collect();
+        let u: Vec<f32> = (0..inter * hidden)
+            .map(|i| wval(e, 1, i / hidden, i % hidden))
+            .collect();
+        let d: Vec<f32> = (0..hidden * inter)
+            .map(|i| wval(e, 2, i / inter, i % inter))
+            .collect();
+        layer[base..base + gate_bytes].copy_from_slice(&encode_q8_0_matrix(&g, inter, hidden));
+        layer[base + gate_bytes..base + gate_bytes * 2]
+            .copy_from_slice(&encode_q8_0_matrix(&u, inter, hidden));
+        layer[base + gate_bytes * 2..base + estride]
+            .copy_from_slice(&encode_q8_0_matrix(&d, hidden, inter));
     }
 
     // ---- GPU buffers ----
-    let mkbuf = |n: usize| backend.device.new_buffer(n*4).unwrap();
-    let eid_bytes: &[u8] = unsafe { std::slice::from_raw_parts(expert_ids.as_ptr() as *const u8, a*4) };
+    let mkbuf = |n: usize| backend.device.new_buffer(n * 4).unwrap();
+    let eid_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(expert_ids.as_ptr() as *const u8, a * 4) };
     let eid_buf = backend.device.new_buffer_with_bytes(eid_bytes).unwrap();
     let ew_buf = backend.upload_f32(&expert_weights).unwrap();
     let normed_buf = backend.upload_f32(&normed).unwrap();
     let layer_buf = backend.device.new_buffer_with_bytes(&layer).unwrap();
-    let seg_buf = mkbuf(ne+1);
-    let tok_buf = mkbuf(a); let slot_buf = mkbuf(a); let ae_buf = mkbuf(a);
-    let grp_in = mkbuf(a*hidden); let grp_sw = mkbuf(a*inter); let grp_dn = mkbuf(a*hidden);
-    let gate_woff_buf = backend.device.new_buffer_with_bytes(
-        &gate_woff.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
-    let up_woff_buf = backend.device.new_buffer_with_bytes(
-        &up_woff.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
-    let down_woff_buf = backend.device.new_buffer_with_bytes(
-        &down_woff.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
-    let eout = backend.upload_f32(&vec![0.0f32; ne*batch*hidden]).unwrap();
-    let residual = backend.upload_f32(&vec![0.0f32; batch*hidden]).unwrap();
-    let final_out = mkbuf(batch*hidden);
+    let seg_buf = mkbuf(ne + 1);
+    let tok_buf = mkbuf(a);
+    let slot_buf = mkbuf(a);
+    let ae_buf = mkbuf(a);
+    let grp_in = mkbuf(a * hidden);
+    let grp_sw = mkbuf(a * inter);
+    let grp_dn = mkbuf(a * hidden);
+    let gate_woff_buf = backend
+        .device
+        .new_buffer_with_bytes(
+            &gate_woff
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+        .unwrap();
+    let up_woff_buf = backend
+        .device
+        .new_buffer_with_bytes(
+            &up_woff
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+        .unwrap();
+    let down_woff_buf = backend
+        .device
+        .new_buffer_with_bytes(
+            &down_woff
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+        .unwrap();
+    let eout = backend
+        .upload_f32(&vec![0.0f32; ne * batch * hidden])
+        .unwrap();
+    let residual = backend.upload_f32(&vec![0.0f32; batch * hidden]).unwrap();
+    let final_out = mkbuf(batch * hidden);
 
     let cmd = backend.queue.new_command_buffer().unwrap();
     let enc = cmd.new_compute_encoder().unwrap();
     let u32b = |v: usize| (v as u32).to_le_bytes();
-    let mm = |v: usize| ((v as u64)+31)/32;
+    let mm = |v: usize| ((v as u64) + 31) / 32;
     // sort + assign
     enc.set_pipeline_state(&sort);
-    enc.set_buffer(&eid_buf,0,0); enc.set_buffer(&seg_buf,0,1);
-    enc.set_buffer(&tok_buf,0,2); enc.set_buffer(&slot_buf,0,3);
-    enc.set_bytes(&u32b(batch),4); enc.set_bytes(&u32b(top_k),5); enc.set_bytes(&u32b(ne),6);
-    enc.dispatch_threadgroups(MTLSize::new(1,1,1), MTLSize::new(ne as u64,1,1));
+    enc.set_buffer(&eid_buf, 0, 0);
+    enc.set_buffer(&seg_buf, 0, 1);
+    enc.set_buffer(&tok_buf, 0, 2);
+    enc.set_buffer(&slot_buf, 0, 3);
+    enc.set_bytes(&u32b(batch), 4);
+    enc.set_bytes(&u32b(top_k), 5);
+    enc.set_bytes(&u32b(ne), 6);
+    enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(ne as u64, 1, 1));
     enc.memory_barrier_with_scope(1);
     enc.set_pipeline_state(&assign);
-    enc.set_buffer(&seg_buf,0,0); enc.set_buffer(&ae_buf,0,1); enc.set_bytes(&u32b(ne),2);
-    enc.dispatch_threadgroups(MTLSize::new(1,1,1), MTLSize::new(ne as u64,1,1));
+    enc.set_buffer(&seg_buf, 0, 0);
+    enc.set_buffer(&ae_buf, 0, 1);
+    enc.set_bytes(&u32b(ne), 2);
+    enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(ne as u64, 1, 1));
     enc.memory_barrier_with_scope(1);
     // gather
     enc.set_pipeline_state(&gather);
-    enc.set_buffer(&normed_buf,0,0); enc.set_buffer(&tok_buf,0,1); enc.set_buffer(&grp_in,0,2);
-    enc.set_bytes(&u32b(hidden),3); enc.set_bytes(&u32b(a),4);
-    enc.dispatch_threadgroups(MTLSize::new(((a*hidden) as u64+255)/256,1,1), MTLSize::new(256,1,1));
+    enc.set_buffer(&normed_buf, 0, 0);
+    enc.set_buffer(&tok_buf, 0, 1);
+    enc.set_buffer(&grp_in, 0, 2);
+    enc.set_bytes(&u32b(hidden), 3);
+    enc.set_bytes(&u32b(a), 4);
+    enc.dispatch_threadgroups(
+        MTLSize::new(((a * hidden) as u64 + 255) / 256, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
     enc.memory_barrier_with_scope(1);
     // gate -> grp_sw ; up -> grp_dn
-    for (woff, out) in [(&gate_woff_buf,&grp_sw),(&up_woff_buf,&grp_dn)] {
+    for (woff, out) in [(&gate_woff_buf, &grp_sw), (&up_woff_buf, &grp_dn)] {
         enc.set_pipeline_state(&ggemm);
-        enc.set_buffer(&layer_buf,0,0); enc.set_buffer(&grp_in,0,1); enc.set_buffer(out,0,2);
-        enc.set_bytes(&u32b(inter),3); enc.set_bytes(&u32b(hidden),4);
-        enc.set_buffer(&seg_buf,0,5); enc.set_buffer(woff,0,6); enc.set_bytes(&u32b(ne),7);
-        enc.dispatch_threadgroups(MTLSize::new(mm(inter),mm(batch),ne as u64), MTLSize::new(128,1,1));
+        enc.set_buffer(&layer_buf, 0, 0);
+        enc.set_buffer(&grp_in, 0, 1);
+        enc.set_buffer(out, 0, 2);
+        enc.set_bytes(&u32b(inter), 3);
+        enc.set_bytes(&u32b(hidden), 4);
+        enc.set_buffer(&seg_buf, 0, 5);
+        enc.set_buffer(woff, 0, 6);
+        enc.set_bytes(&u32b(ne), 7);
+        enc.dispatch_threadgroups(
+            MTLSize::new(mm(inter), mm(batch), ne as u64),
+            MTLSize::new(128, 1, 1),
+        );
     }
     enc.memory_barrier_with_scope(1);
     // swiglu grp_sw = silu(grp_sw)*grp_dn
     enc.set_pipeline_state(&swiglu);
-    enc.set_buffer(&grp_sw,0,0); enc.set_buffer(&grp_dn,0,1); enc.set_bytes(&u32b(a*inter),2);
-    enc.dispatch_threadgroups(MTLSize::new(((a*inter) as u64+255)/256,1,1), MTLSize::new(256,1,1));
+    enc.set_buffer(&grp_sw, 0, 0);
+    enc.set_buffer(&grp_dn, 0, 1);
+    enc.set_bytes(&u32b(a * inter), 2);
+    enc.dispatch_threadgroups(
+        MTLSize::new(((a * inter) as u64 + 255) / 256, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
     enc.memory_barrier_with_scope(1);
     // down grp_sw -> grp_dn
     enc.set_pipeline_state(&ggemm);
-    enc.set_buffer(&layer_buf,0,0); enc.set_buffer(&grp_sw,0,1); enc.set_buffer(&grp_dn,0,2);
-    enc.set_bytes(&u32b(hidden),3); enc.set_bytes(&u32b(inter),4);
-    enc.set_buffer(&seg_buf,0,5); enc.set_buffer(&down_woff_buf,0,6); enc.set_bytes(&u32b(ne),7);
-    enc.dispatch_threadgroups(MTLSize::new(mm(hidden),mm(batch),ne as u64), MTLSize::new(128,1,1));
+    enc.set_buffer(&layer_buf, 0, 0);
+    enc.set_buffer(&grp_sw, 0, 1);
+    enc.set_buffer(&grp_dn, 0, 2);
+    enc.set_bytes(&u32b(hidden), 3);
+    enc.set_bytes(&u32b(inter), 4);
+    enc.set_buffer(&seg_buf, 0, 5);
+    enc.set_buffer(&down_woff_buf, 0, 6);
+    enc.set_bytes(&u32b(ne), 7);
+    enc.dispatch_threadgroups(
+        MTLSize::new(mm(hidden), mm(batch), ne as u64),
+        MTLSize::new(128, 1, 1),
+    );
     enc.memory_barrier_with_scope(1);
     // scatter -> eout
     enc.set_pipeline_state(&scatter);
-    enc.set_buffer(&grp_dn,0,0); enc.set_buffer(&tok_buf,0,1); enc.set_buffer(&ae_buf,0,2);
-    enc.set_buffer(&eout,0,3); enc.set_bytes(&u32b(hidden),4); enc.set_bytes(&u32b(batch),5);
-    enc.set_bytes(&u32b(a),6);
-    enc.dispatch_threadgroups(MTLSize::new(((a*hidden) as u64+255)/256,1,1), MTLSize::new(256,1,1));
+    enc.set_buffer(&grp_dn, 0, 0);
+    enc.set_buffer(&tok_buf, 0, 1);
+    enc.set_buffer(&ae_buf, 0, 2);
+    enc.set_buffer(&eout, 0, 3);
+    enc.set_bytes(&u32b(hidden), 4);
+    enc.set_bytes(&u32b(batch), 5);
+    enc.set_bytes(&u32b(a), 6);
+    enc.dispatch_threadgroups(
+        MTLSize::new(((a * hidden) as u64 + 255) / 256, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
     enc.memory_barrier_with_scope(1);
     // accum -> final_out
     enc.set_pipeline_state(&accum);
-    enc.set_buffer(&eout,0,0); enc.set_buffer(&ew_buf,0,1); enc.set_buffer(&eid_buf,0,2);
-    enc.set_buffer(&final_out,0,3); enc.set_buffer(&residual,0,4);
-    enc.set_bytes(&u32b(hidden),5); enc.set_bytes(&u32b(top_k),6); enc.set_bytes(&u32b(batch),7);
-    enc.dispatch_threadgroups(MTLSize::new(((batch*hidden) as u64+255)/256,1,1), MTLSize::new(256,1,1));
+    enc.set_buffer(&eout, 0, 0);
+    enc.set_buffer(&ew_buf, 0, 1);
+    enc.set_buffer(&eid_buf, 0, 2);
+    enc.set_buffer(&final_out, 0, 3);
+    enc.set_buffer(&residual, 0, 4);
+    enc.set_bytes(&u32b(hidden), 5);
+    enc.set_bytes(&u32b(top_k), 6);
+    enc.set_bytes(&u32b(batch), 7);
+    enc.dispatch_threadgroups(
+        MTLSize::new(((batch * hidden) as u64 + 255) / 256, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
     enc.end_encoding();
     cmd.commit_and_wait();
 
-    let mut got = vec![0.0f32; batch*hidden];
+    let mut got = vec![0.0f32; batch * hidden];
     final_out.read_f32(&mut got);
 
     // CPU reference using the DEQUANTIZED Q8 weights (exact values the GPU
@@ -668,15 +853,18 @@ fn test_moe_prefill_grouped_end_to_end() {
     // correctness from quantization noise (which catastrophic cancellation in
     // this synthetic test would otherwise amplify).
     let deq = |bytes: &[u8], rows: usize, cols: usize| -> Vec<f32> {
-        let bpr = cols/32; let mut out = vec![0.0f32; rows*cols];
-        for r in 0..rows { for b in 0..bpr {
-            let bs = (r*bpr+b)*34;
-            let scale = f16_bits_to_f32_moe(u16::from_le_bytes([bytes[bs], bytes[bs+1]]));
-            for j in 0..32 {
-                let q = bytes[bs+2+j] as i8;
-                out[r*cols + b*32 + j] = scale * q as f32;
+        let bpr = cols / 32;
+        let mut out = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            for b in 0..bpr {
+                let bs = (r * bpr + b) * 34;
+                let scale = f16_bits_to_f32_moe(u16::from_le_bytes([bytes[bs], bytes[bs + 1]]));
+                for j in 0..32 {
+                    let q = bytes[bs + 2 + j] as i8;
+                    out[r * cols + b * 32 + j] = scale * q as f32;
+                }
             }
-        }}
+        }
         out
     };
     // Dequantize each expert's gate/up/down from the packed layer buffer.
@@ -684,10 +872,14 @@ fn test_moe_prefill_grouped_end_to_end() {
     let mut dq_up = vec![Vec::new(); ne];
     let mut dq_down = vec![Vec::new(); ne];
     for e in 0..ne {
-        let base = e*estride;
-        dq_gate[e] = deq(&layer[base..base+gate_bytes], inter, hidden);
-        dq_up[e]   = deq(&layer[base+gate_bytes..base+gate_bytes*2], inter, hidden);
-        dq_down[e] = deq(&layer[base+gate_bytes*2..base+estride], hidden, inter);
+        let base = e * estride;
+        dq_gate[e] = deq(&layer[base..base + gate_bytes], inter, hidden);
+        dq_up[e] = deq(
+            &layer[base + gate_bytes..base + gate_bytes * 2],
+            inter,
+            hidden,
+        );
+        dq_down[e] = deq(&layer[base + gate_bytes * 2..base + estride], hidden, inter);
     }
     let silu = |x: f32| x / (1.0 + (-x).exp());
     let mut max_rel = 0.0f32;
@@ -695,25 +887,28 @@ fn test_moe_prefill_grouped_end_to_end() {
     for t in 0..batch {
         let mut out = vec![0.0f32; hidden];
         for k in 0..top_k {
-            let e = expert_ids[t*top_k+k] as usize;
-            let w = expert_weights[t*top_k+k];
+            let e = expert_ids[t * top_k + k] as usize;
+            let w = expert_weights[t * top_k + k];
             let mut sw = vec![0.0f32; inter];
             for r in 0..inter {
-                let mut g = 0.0; let mut u = 0.0;
+                let mut g = 0.0;
+                let mut u = 0.0;
                 for c in 0..hidden {
-                    g += dq_gate[e][r*hidden+c] * normed[t*hidden+c];
-                    u += dq_up[e][r*hidden+c] * normed[t*hidden+c];
+                    g += dq_gate[e][r * hidden + c] * normed[t * hidden + c];
+                    u += dq_up[e][r * hidden + c] * normed[t * hidden + c];
                 }
                 sw[r] = silu(g) * u;
             }
             for r in 0..hidden {
                 let mut d = 0.0;
-                for c in 0..inter { d += dq_down[e][r*inter+c] * sw[c]; }
+                for c in 0..inter {
+                    d += dq_down[e][r * inter + c] * sw[c];
+                }
                 out[r] += w * d;
             }
         }
         for h in 0..hidden {
-            let g = got[t*hidden+h];
+            let g = got[t * hidden + h];
             // Mixed tolerance: kernel correctness is judged on max(rel, abs).
             // Down outputs are O(100) and the weighted sum cancels to O(0.01..3),
             // so fp-order differences between tiled-GPU and sequential-CPU give
@@ -722,15 +917,23 @@ fn test_moe_prefill_grouped_end_to_end() {
             let abs = (g - out[h]).abs();
             let rel = abs / out[h].abs().max(1e-6);
             let ok = abs < 0.05 || rel < 0.06;
-            if rel > max_rel && abs >= 0.05 { max_rel = rel; }
+            if rel > max_rel && abs >= 0.05 {
+                max_rel = rel;
+            }
             if !ok && nfail < 12 {
-                eprintln!("  FAIL t={t} h={h}: got {g:.5} exp {:.5} abs {abs:.5} rel {rel:.3}", out[h]);
+                eprintln!(
+                    "  FAIL t={t} h={h}: got {g:.5} exp {:.5} abs {abs:.5} rel {rel:.3}",
+                    out[h]
+                );
                 nfail += 1;
             }
         }
     }
     eprintln!("moe_prefill_grouped_end_to_end: batch={batch} max_rel={max_rel:.4} nfail={nfail}");
-    assert!(nfail == 0, "grouped e2e had {nfail}+ failures, max_rel={max_rel:.4}");
+    assert!(
+        nfail == 0,
+        "grouped e2e had {nfail}+ failures, max_rel={max_rel:.4}"
+    );
 }
 
 // ====================================================================
@@ -744,7 +947,9 @@ fn test_non_expert_byte_end_dense_layer() {
     use lumen_format::quantization::QuantScheme;
 
     let make = |off: u64, len: u64| TensorSlice {
-        offset: off, length: len, quant: QuantScheme::Q8_0,
+        offset: off,
+        length: len,
+        quant: QuantScheme::Q8_0,
     };
 
     let st = SubtensorOffsets {
@@ -752,7 +957,9 @@ fn test_non_expert_byte_end_dense_layer() {
         wk: make(1024, 512),
         wv: make(1536, 512),
         wo: make(2048, 1024),
-        bq: None, bk: None, bv: None,
+        bq: None,
+        bk: None,
+        bv: None,
         w_gate: make(3072, 2048),
         w_up: make(5120, 2048),
         w_down: make(7168, 2048),
@@ -760,27 +967,42 @@ fn test_non_expert_byte_end_dense_layer() {
         ffn_norm: make(9280, 64),
         router_weight: None,
         experts: None,
-        shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-        attn_gate: None, attn_post_norm: None,
-        ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-        ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-        attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+        shared_expert_gate: None,
+        shared_expert_up: None,
+        shared_expert_down: None,
+        attn_gate: None,
+        attn_post_norm: None,
+        ssm_a: None,
+        ssm_conv1d: None,
+        ssm_dt: None,
+        ssm_beta: None,
+        ssm_alpha: None,
+        ssm_norm: None,
+        ssm_out: None,
+        attn_q_norm: None,
+        attn_k_norm: None,
+        ffn_gate_inp_shexp: None,
         layer_type: None,
     };
 
     let end = MetalF32Backend::non_expert_byte_end(&st);
     // Last tensor ends at 9280 + 64 = 9344
-    assert_eq!(end, 9344, "non_expert_byte_end should cover all tensors for dense layer");
+    assert_eq!(
+        end, 9344,
+        "non_expert_byte_end should cover all tensors for dense layer"
+    );
 }
 
 #[test]
 fn test_non_expert_byte_end_moe_layer() {
     // MoE layer: non_expert_end should stop before expert data.
-    use lumen_format::index::{SubtensorOffsets, TensorSlice, ExpertSlice};
+    use lumen_format::index::{ExpertSlice, SubtensorOffsets, TensorSlice};
     use lumen_format::quantization::QuantScheme;
 
     let make = |off: u64, len: u64| TensorSlice {
-        offset: off, length: len, quant: QuantScheme::Q8_0,
+        offset: off,
+        length: len,
+        quant: QuantScheme::Q8_0,
     };
 
     // Layout: [wq=0..1024][wk=1024..1536][wv=1536..2048][wo=2048..3072]
@@ -793,8 +1015,10 @@ fn test_non_expert_byte_end_moe_layer() {
         wk: make(1024, 512),
         wv: make(1536, 512),
         wo: make(2048, 1024),
-        bq: None, bk: None, bv: None,
-        w_gate: make(0, 0),  // sentinel for MoE
+        bq: None,
+        bk: None,
+        bv: None,
+        w_gate: make(0, 0), // sentinel for MoE
         w_up: make(0, 0),
         w_down: make(0, 0),
         attn_norm: make(3072, 64),
@@ -812,27 +1036,42 @@ fn test_non_expert_byte_end_moe_layer() {
                 down: make(13696, 2048),
             },
         ]),
-        shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-        attn_gate: None, attn_post_norm: None,
-        ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-        ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-        attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+        shared_expert_gate: None,
+        shared_expert_up: None,
+        shared_expert_down: None,
+        attn_gate: None,
+        attn_post_norm: None,
+        ssm_a: None,
+        ssm_conv1d: None,
+        ssm_dt: None,
+        ssm_beta: None,
+        ssm_alpha: None,
+        ssm_norm: None,
+        ssm_out: None,
+        attn_q_norm: None,
+        attn_k_norm: None,
+        ffn_gate_inp_shexp: None,
         layer_type: None,
     };
 
     let end = MetalF32Backend::non_expert_byte_end(&st);
     // Router ends at 3200 + 256 = 3456, which is exactly where experts start.
-    assert_eq!(end, 3456, "non_expert_byte_end should stop at router end (before experts)");
+    assert_eq!(
+        end, 3456,
+        "non_expert_byte_end should stop at router end (before experts)"
+    );
 }
 
 #[test]
 fn test_non_expert_byte_end_with_biases() {
     // MoE layer with biases: non_expert_end should include bias data.
-    use lumen_format::index::{SubtensorOffsets, TensorSlice, ExpertSlice};
+    use lumen_format::index::{ExpertSlice, SubtensorOffsets, TensorSlice};
     use lumen_format::quantization::QuantScheme;
 
     let make = |off: u64, len: u64| TensorSlice {
-        offset: off, length: len, quant: QuantScheme::Q8_0,
+        offset: off,
+        length: len,
+        quant: QuantScheme::Q8_0,
     };
 
     let st = SubtensorOffsets {
@@ -849,34 +1088,47 @@ fn test_non_expert_byte_end_with_biases() {
         attn_norm: make(3328, 64),
         ffn_norm: make(3392, 64),
         router_weight: Some(make(3456, 256)),
-        experts: Some(vec![
-            ExpertSlice {
-                gate: make(3712, 2048),
-                up: make(5760, 2048),
-                down: make(7808, 2048),
-            },
-        ]),
-        shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-        attn_gate: None, attn_post_norm: None,
-        ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-        ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-        attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+        experts: Some(vec![ExpertSlice {
+            gate: make(3712, 2048),
+            up: make(5760, 2048),
+            down: make(7808, 2048),
+        }]),
+        shared_expert_gate: None,
+        shared_expert_up: None,
+        shared_expert_down: None,
+        attn_gate: None,
+        attn_post_norm: None,
+        ssm_a: None,
+        ssm_conv1d: None,
+        ssm_dt: None,
+        ssm_beta: None,
+        ssm_alpha: None,
+        ssm_norm: None,
+        ssm_out: None,
+        attn_q_norm: None,
+        attn_k_norm: None,
+        ffn_gate_inp_shexp: None,
         layer_type: None,
     };
 
     let end = MetalF32Backend::non_expert_byte_end(&st);
     // Router ends at 3456 + 256 = 3712, which is where experts start.
-    assert_eq!(end, 3712, "non_expert_byte_end should include biases and router");
+    assert_eq!(
+        end, 3712,
+        "non_expert_byte_end should include biases and router"
+    );
 }
 
 /// Verify non_expert_byte_end includes shared expert tensors.
 #[test]
 fn test_non_expert_byte_end_with_shared_expert() {
-    use lumen_format::index::{SubtensorOffsets, TensorSlice, ExpertSlice};
+    use lumen_format::index::{ExpertSlice, SubtensorOffsets, TensorSlice};
     use lumen_format::quantization::QuantScheme;
 
     let make = |off: u64, len: u64| TensorSlice {
-        offset: off, length: len, quant: QuantScheme::Q4_0,
+        offset: off,
+        length: len,
+        quant: QuantScheme::Q4_0,
     };
 
     // Layout simulating Qwen3.5-MoE:
@@ -888,34 +1140,45 @@ fn test_non_expert_byte_end_with_shared_expert() {
         wk: make(1024, 512),
         wv: make(1536, 512),
         wo: make(2048, 1024),
-        bq: None, bk: None, bv: None,
+        bq: None,
+        bk: None,
+        bv: None,
         w_gate: make(0, 0),
         w_up: make(0, 0),
         w_down: make(0, 0),
         attn_norm: make(3072, 64),
         ffn_norm: make(3136, 64),
         router_weight: Some(make(3200, 256)),
-        experts: Some(vec![
-            ExpertSlice {
-                gate: make(6528, 2048),
-                up: make(8576, 2048),
-                down: make(10624, 2048),
-            },
-        ]),
+        experts: Some(vec![ExpertSlice {
+            gate: make(6528, 2048),
+            up: make(8576, 2048),
+            down: make(10624, 2048),
+        }]),
         shared_expert_gate: Some(make(3456, 1024)),
         shared_expert_up: Some(make(4480, 1024)),
         shared_expert_down: Some(make(5504, 1024)),
-        attn_gate: None, attn_post_norm: None,
-        ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-        ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-        attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+        attn_gate: None,
+        attn_post_norm: None,
+        ssm_a: None,
+        ssm_conv1d: None,
+        ssm_dt: None,
+        ssm_beta: None,
+        ssm_alpha: None,
+        ssm_norm: None,
+        ssm_out: None,
+        attn_q_norm: None,
+        attn_k_norm: None,
+        ffn_gate_inp_shexp: None,
         layer_type: Some(0),
     };
 
     let end = MetalF32Backend::non_expert_byte_end(&st);
     // Shared expert down ends at 5504 + 1024 = 6528, which is where experts start.
-    assert_eq!(end, 6528,
-        "non_expert_byte_end should include shared expert tensors (got {})", end);
+    assert_eq!(
+        end, 6528,
+        "non_expert_byte_end should include shared expert tensors (got {})",
+        end
+    );
 }
 
 /// Verify non_expert_byte_end includes SSM tensors for GDN layers.
@@ -925,7 +1188,9 @@ fn test_non_expert_byte_end_with_ssm_tensors() {
     use lumen_format::quantization::QuantScheme;
 
     let make = |off: u64, len: u64| TensorSlice {
-        offset: off, length: len, quant: QuantScheme::Q8_0,
+        offset: off,
+        length: len,
+        quant: QuantScheme::Q8_0,
     };
 
     let st = SubtensorOffsets {
@@ -933,7 +1198,9 @@ fn test_non_expert_byte_end_with_ssm_tensors() {
         wk: make(1024, 512),
         wv: make(1536, 512),
         wo: make(2048, 1024),
-        bq: None, bk: None, bv: None,
+        bq: None,
+        bk: None,
+        bv: None,
         w_gate: make(0, 0),
         w_up: make(0, 0),
         w_down: make(0, 0),
@@ -941,7 +1208,9 @@ fn test_non_expert_byte_end_with_ssm_tensors() {
         ffn_norm: make(3136, 64),
         router_weight: None,
         experts: None,
-        shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
+        shared_expert_gate: None,
+        shared_expert_up: None,
+        shared_expert_down: None,
         attn_gate: Some(make(3200, 128)),
         attn_post_norm: Some(make(3328, 64)),
         ssm_a: Some(make(3392, 256)),
@@ -951,14 +1220,19 @@ fn test_non_expert_byte_end_with_ssm_tensors() {
         ssm_alpha: Some(make(4096, 64)),
         ssm_norm: Some(make(4160, 64)),
         ssm_out: Some(make(4224, 512)),
-        attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+        attn_q_norm: None,
+        attn_k_norm: None,
+        ffn_gate_inp_shexp: None,
         layer_type: Some(1),
     };
 
     let end = MetalF32Backend::non_expert_byte_end(&st);
     // ssm_out ends at 4224 + 512 = 4736 (the last tensor).
-    assert_eq!(end, 4736,
-        "non_expert_byte_end should include SSM tensors (got {})", end);
+    assert_eq!(
+        end, 4736,
+        "non_expert_byte_end should include SSM tensors (got {})",
+        end
+    );
 }
 
 #[test]
@@ -969,7 +1243,9 @@ fn test_streaming_moe_cache_assembly_simulation() {
     use lumen_format::quantization::QuantScheme;
 
     let make_slice = |off: u64, len: u64| TensorSlice {
-        offset: off, length: len, quant: QuantScheme::F32,
+        offset: off,
+        length: len,
+        quant: QuantScheme::F32,
     };
 
     let num_experts = 4;
@@ -1040,17 +1316,20 @@ fn test_streaming_moe_cache_assembly_simulation() {
 
         assert!(
             assembled[gate_start..gate_start + expert_tensor_size as usize]
-                .iter().all(|&b| b == (eid * 3) as u8),
+                .iter()
+                .all(|&b| b == (eid * 3) as u8),
             "expert {eid} gate data mismatch"
         );
         assert!(
             assembled[up_start..up_start + expert_tensor_size as usize]
-                .iter().all(|&b| b == (eid * 3 + 1) as u8),
+                .iter()
+                .all(|&b| b == (eid * 3 + 1) as u8),
             "expert {eid} up data mismatch"
         );
         assert!(
             assembled[down_start..down_start + expert_tensor_size as usize]
-                .iter().all(|&b| b == (eid * 3 + 2) as u8),
+                .iter()
+                .all(|&b| b == (eid * 3 + 2) as u8),
             "expert {eid} down data mismatch"
         );
     }
@@ -1058,7 +1337,10 @@ fn test_streaming_moe_cache_assembly_simulation() {
     eprintln!(
         "streaming_moe_cache_assembly: {} experts, {} cached / {} from reader, \
          assembled {} bytes -- PASS",
-        num_experts, cached_experts.len(), uncached_experts.len(), assembled.len()
+        num_experts,
+        cached_experts.len(),
+        uncached_experts.len(),
+        assembled.len()
     );
 }
 
@@ -1071,7 +1353,9 @@ fn test_streaming_moe_cache_hit_rate_simulation() {
     use lumen_format::quantization::QuantScheme;
 
     let make_slice = |off: u64, len: u64| TensorSlice {
-        offset: off, length: len, quant: QuantScheme::F32,
+        offset: off,
+        length: len,
+        quant: QuantScheme::F32,
     };
 
     let num_layers = 4;
@@ -1163,7 +1447,9 @@ fn test_streaming_moe_cache_hit_rate_simulation() {
     );
     eprintln!(
         "  Cache: capacity={}, final_entries={}, hit_rate={:.1}%",
-        cache_capacity, cache.len(), hit_rate * 100.0,
+        cache_capacity,
+        cache.len(),
+        hit_rate * 100.0,
     );
     eprintln!(
         "  Bytes: no_cache={:.1} MB, with_cache={:.1} MB, saved={:.1} MB ({:.1}%)",
@@ -1198,13 +1484,21 @@ fn test_moe_router_softmax_biased_zero_lambda_matches_unbiased() {
     // must produce identical output to the unbiased kernel.
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
 
     let unbiased_fn = lib.get_function("moe_router_softmax").unwrap();
     let biased_fn = lib.get_function("moe_router_softmax_biased").unwrap();
-    let unbiased_pso = backend.device.new_compute_pipeline_state(&unbiased_fn).unwrap();
-    let biased_pso = backend.device.new_compute_pipeline_state(&biased_fn).unwrap();
+    let unbiased_pso = backend
+        .device
+        .new_compute_pipeline_state(&unbiased_fn)
+        .unwrap();
+    let biased_pso = backend
+        .device
+        .new_compute_pipeline_state(&biased_fn)
+        .unwrap();
 
     let hidden_dim: usize = 64;
     let num_experts: usize = 8;
@@ -1280,7 +1574,8 @@ fn test_moe_router_softmax_biased_zero_lambda_matches_unbiased() {
         assert!(
             (wts_u[k] - wts_b[k]).abs() < 1e-5,
             "expert_weights[{k}] differ: unbiased={}, biased={}",
-            wts_u[k], wts_b[k],
+            wts_u[k],
+            wts_b[k],
         );
     }
     eprintln!(
@@ -1295,10 +1590,15 @@ fn test_moe_router_softmax_biased_nudges_cached_expert() {
     // should prefer a cached expert over a non-cached one.
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let biased_fn = lib.get_function("moe_router_softmax_biased").unwrap();
-    let biased_pso = backend.device.new_compute_pipeline_state(&biased_fn).unwrap();
+    let biased_pso = backend
+        .device
+        .new_compute_pipeline_state(&biased_fn)
+        .unwrap();
 
     let hidden_dim: usize = 4;
     let num_experts: usize = 4;
@@ -1370,7 +1670,8 @@ fn test_moe_router_softmax_biased_nudges_cached_expert() {
     let sum: f32 = wts.iter().sum();
     assert!(
         (sum - 1.0).abs() < 1e-5,
-        "weights should sum to 1.0, got {sum:.6} (weights={:?})", wts,
+        "weights should sum to 1.0, got {sum:.6} (weights={:?})",
+        wts,
     );
 
     eprintln!(
@@ -1400,8 +1701,10 @@ fn test_expert_io_stats_initial_zero() {
 fn test_moe_expert_accum_option_a_correctness() {
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("moe_expert_accum_option_a").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -1436,10 +1739,7 @@ fn test_moe_expert_accum_option_a_correctness() {
     enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
     enc.set_bytes(&(top_k as u32).to_le_bytes(), 5);
     let tg_count = ((hidden_dim as u64) + 255) / 256;
-    enc.dispatch_threadgroups(
-        MTLSize::new(tg_count, 1, 1),
-        MTLSize::new(256, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(tg_count, 1, 1), MTLSize::new(256, 1, 1));
     enc.end_encoding();
     cmd.commit();
     cmd.wait_until_completed();
@@ -1472,31 +1772,54 @@ fn test_option_a_default_disabled() {
 fn test_option_a_configure() {
     let mut backend = MetalF32Backend::new().unwrap();
     backend.configure_option_a(true);
-    assert!(backend.use_option_a, "Option A should be true after configure_option_a(true)");
+    assert!(
+        backend.use_option_a,
+        "Option A should be true after configure_option_a(true)"
+    );
     backend.configure_option_a(false);
-    assert!(!backend.use_option_a, "Option A should be false after configure_option_a(false)");
+    assert!(
+        !backend.use_option_a,
+        "Option A should be false after configure_option_a(false)"
+    );
 }
 
 // Minimal WeightProvider stub for tests that need a &dyn WeightProvider
 // but never actually load weights (GPU-resident path ignores it).
 struct StubWeightProvider;
 impl crate::weight::cache::WeightProvider for StubWeightProvider {
-    fn prefetch_layer(&self, _l: usize, _p: crate::weight::cache::PrefetchPriority) -> Result<crate::weight::cache::PrefetchHandle, RuntimeError> {
+    fn prefetch_layer(
+        &self,
+        _l: usize,
+        _p: crate::weight::cache::PrefetchPriority,
+    ) -> Result<crate::weight::cache::PrefetchHandle, RuntimeError> {
         Err(RuntimeError::Compute("stub".into()))
     }
-    fn get_layer_blocking(&self, _l: usize) -> Result<crate::weight::cache::LayerView, RuntimeError> {
+    fn get_layer_blocking(
+        &self,
+        _l: usize,
+    ) -> Result<crate::weight::cache::LayerView, RuntimeError> {
         Err(RuntimeError::Compute("stub".into()))
     }
-    fn try_get_layer(&self, _l: usize) -> Option<crate::weight::cache::LayerView> { None }
+    fn try_get_layer(&self, _l: usize) -> Option<crate::weight::cache::LayerView> {
+        None
+    }
     fn release_layer_hint(&self, _l: usize) {}
     fn stats(&self) -> crate::weight::cache::CacheStats {
         crate::weight::cache::CacheStats {
-            layers_cached: 0, bytes_cached: 0, capacity_bytes: 0,
-            hits: 0, misses: 0, evictions: 0,
-            prefetch_hits: 0, prefetch_misses: 0, inflight_prefetches: 0,
+            layers_cached: 0,
+            bytes_cached: 0,
+            capacity_bytes: 0,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+            prefetch_hits: 0,
+            prefetch_misses: 0,
+            inflight_prefetches: 0,
         }
     }
-    fn num_layers(&self) -> usize { 0 }
+    fn num_layers(&self) -> usize {
+        0
+    }
 }
 
 // Helper: create minimal ModelHyperparams for tests (dense, non-MoE).
@@ -1518,7 +1841,8 @@ fn test_hyperparams() -> ModelHyperparams {
         }),
         num_experts: None,
         num_active_experts: None,
-        rotary_dim: None, rope_neox: false,
+        rotary_dim: None,
+        rope_neox: false,
         gdn: None,
     }
 }
@@ -1539,12 +1863,16 @@ fn test_option_a_gpu_resident_requires_weights() {
         num_kv_heads: hp.num_kv_heads as usize,
         head_dim: hp.head_dim as usize,
         precision: crate::kv::KvPrecision::F32,
-    }).unwrap();
+    })
+    .unwrap();
     let weights = StubWeightProvider;
 
     // Without GPU-resident weights loaded, should get an error.
     let result = backend.decode_token_option_a_gpu_resident(1, &weights, &mut kv);
-    assert!(result.is_err(), "Option A GPU-resident should fail without GPU-resident weights");
+    assert!(
+        result.is_err(),
+        "Option A GPU-resident should fail without GPU-resident weights"
+    );
     let err_msg = format!("{}", result.unwrap_err());
     assert!(
         err_msg.contains("GPU-resident"),
@@ -1573,7 +1901,8 @@ fn test_option_a_greedy_dispatch_routing() {
         num_kv_heads: hp.num_kv_heads as usize,
         head_dim: hp.head_dim as usize,
         precision: crate::kv::KvPrecision::F32,
-    }).unwrap();
+    })
+    .unwrap();
     let weights = StubWeightProvider;
     let result = backend.decode_token_greedy(1, &weights, &mut kv);
     assert!(result.is_err());
@@ -1596,9 +1925,9 @@ fn test_option_a_greedy_dispatch_routing() {
 #[ignore = "requires external model file at runtime"]
 #[test]
 fn test_moe_hw_benchmark() {
-    use crate::expert::reader::ExpertReader;
     use crate::expert::cache::ExpertLfuCache;
     use crate::expert::profiler::ExpertActivationProfiler;
+    use crate::expert::reader::ExpertReader;
     use std::path::Path;
     use std::time::Instant;
 
@@ -1645,7 +1974,10 @@ fn test_moe_hw_benchmark() {
                     load_count += 1;
                     eprintln!(
                         "  Layer {} expert {}: {} bytes ({:.2} MB), gate+up+down",
-                        layer, expert_id, data.len(), data.len() as f64 / 1e6
+                        layer,
+                        expert_id,
+                        data.len(),
+                        data.len() as f64 / 1e6
                     );
                     let _ = slice; // used for offset info
                 }
@@ -1675,13 +2007,15 @@ fn test_moe_hw_benchmark() {
     let par_reader = ExpertReader::open(lbc_path).unwrap();
     let results = par_reader.load_experts_parallel(&requests);
     let elapsed_par = start_par.elapsed();
-    let par_bytes: u64 = results.iter()
+    let par_bytes: u64 = results
+        .iter()
         .filter_map(|r| r.as_ref().ok().map(|(d, _)| d.len() as u64))
         .sum();
     let par_ok = results.iter().filter(|r| r.is_ok()).count();
     eprintln!(
         "Parallel: {}/{} succeeded, {:.2} MB, {:.2?} ({:.2} MB/s)",
-        par_ok, requests.len(),
+        par_ok,
+        requests.len(),
         par_bytes as f64 / 1e6,
         elapsed_par,
         par_bytes as f64 / 1e6 / elapsed_par.as_secs_f64()
@@ -1701,9 +2035,15 @@ fn test_moe_hw_benchmark() {
     let mut cache_hits: u64 = 0;
     let mut cache_misses: u64 = 0;
     // Dummy ExpertSlice for cache insertion (we only measure cache behavior).
-    let dummy_ts = lumen_format::TensorSlice { offset: 0, length: 0, quant: lumen_format::QuantScheme::F32 };
+    let dummy_ts = lumen_format::TensorSlice {
+        offset: 0,
+        length: 0,
+        quant: lumen_format::QuantScheme::F32,
+    };
     let dummy_slice = lumen_format::ExpertSlice {
-        gate: dummy_ts, up: dummy_ts, down: dummy_ts,
+        gate: dummy_ts,
+        up: dummy_ts,
+        down: dummy_ts,
     };
     for _token in 0..50 {
         for layer in 0..num_layers {
@@ -1731,13 +2071,19 @@ fn test_moe_hw_benchmark() {
     let total_lookups = cache_hits + cache_misses;
     eprintln!(
         "Cache: {} hits, {} misses, {:.1}% hit rate",
-        cache_hits, cache_misses,
-        if total_lookups > 0 { cache_hits as f64 / total_lookups as f64 * 100.0 } else { 0.0 }
+        cache_hits,
+        cache_misses,
+        if total_lookups > 0 {
+            cache_hits as f64 / total_lookups as f64 * 100.0
+        } else {
+            0.0
+        }
     );
     let stats = cache.stats();
     eprintln!(
         "Cache state: {}/{} entries ({:.2} MB cached)",
-        stats.cached_experts, stats.capacity,
+        stats.cached_experts,
+        stats.capacity,
         stats.cached_bytes as f64 / 1e6,
     );
 
@@ -1776,10 +2122,15 @@ fn test_moe_router_correct_topk() {
     // Expected top-2: [1, 2] (expert 1 highest, expert 2 second).
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let router_fn = lib.get_function("moe_router_softmax").unwrap();
-    let router_pso = backend.device.new_compute_pipeline_state(&router_fn).unwrap();
+    let router_pso = backend
+        .device
+        .new_compute_pipeline_state(&router_fn)
+        .unwrap();
 
     let hidden_dim: usize = 4;
     let num_experts: usize = 4;
@@ -1821,8 +2172,16 @@ fn test_moe_router_correct_topk() {
     weights_buf.read_f32(&mut wts);
 
     // (a) Top-K experts are returned: expert 1 (logit 3.0) first, expert 2 (logit 2.0) second.
-    assert_eq!(ids[0], 1, "top-1 should be expert 1 (logit 3.0), got expert {}", ids[0]);
-    assert_eq!(ids[1], 2, "top-2 should be expert 2 (logit 2.0), got expert {}", ids[1]);
+    assert_eq!(
+        ids[0], 1,
+        "top-1 should be expert 1 (logit 3.0), got expert {}",
+        ids[0]
+    );
+    assert_eq!(
+        ids[1], 2,
+        "top-2 should be expert 2 (logit 2.0), got expert {}",
+        ids[1]
+    );
 
     // (b) Weights sum to 1.0 (renormalized).
     let sum: f32 = wts.iter().sum();
@@ -1836,7 +2195,8 @@ fn test_moe_router_correct_topk() {
     assert!(
         wts[0] > wts[1],
         "weight for expert 1 ({:.4}) should be > weight for expert 2 ({:.4})",
-        wts[0], wts[1]
+        wts[0],
+        wts[1]
     );
 
     // Verify the weights approximately match the analytical softmax.
@@ -1845,11 +2205,15 @@ fn test_moe_router_correct_topk() {
     let expected_w1 = 1.0 / (std::f32::consts::E + 1.0);
     assert!(
         (wts[0] - expected_w0).abs() < 1e-4,
-        "weight[0]={:.6}, expected {:.6}", wts[0], expected_w0
+        "weight[0]={:.6}, expected {:.6}",
+        wts[0],
+        expected_w0
     );
     assert!(
         (wts[1] - expected_w1).abs() < 1e-4,
-        "weight[1]={:.6}, expected {:.6}", wts[1], expected_w1
+        "weight[1]={:.6}, expected {:.6}",
+        wts[1],
+        expected_w1
     );
 
     eprintln!(
@@ -1865,13 +2229,22 @@ fn test_moe_router_parallel_matches_serial() {
     // the legacy single-threadgroup moe_router_softmax, for a 256-expert config
     // mirroring Qwen3.5-35B-A3B. This locks in the runtime byte-identity result.
     let backend = MetalF32Backend::new().unwrap();
-    let lib = backend.device.new_library_with_source(METAL_SHADER_SOURCE).unwrap();
-    let serial = backend.device
-        .new_compute_pipeline_state(&lib.get_function("moe_router_softmax").unwrap()).unwrap();
-    let logits_pso = backend.device
-        .new_compute_pipeline_state(&lib.get_function("moe_router_logits_f32").unwrap()).unwrap();
-    let topk_pso = backend.device
-        .new_compute_pipeline_state(&lib.get_function("moe_router_topk_softmax").unwrap()).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
+    let serial = backend
+        .device
+        .new_compute_pipeline_state(&lib.get_function("moe_router_softmax").unwrap())
+        .unwrap();
+    let logits_pso = backend
+        .device
+        .new_compute_pipeline_state(&lib.get_function("moe_router_logits_f32").unwrap())
+        .unwrap();
+    let topk_pso = backend
+        .device
+        .new_compute_pipeline_state(&lib.get_function("moe_router_topk_softmax").unwrap())
+        .unwrap();
 
     let hidden_dim: usize = 2048;
     let num_experts: usize = 256;
@@ -1879,7 +2252,10 @@ fn test_moe_router_parallel_matches_serial() {
 
     // Deterministic pseudo-random hidden + gate weights.
     let mut seed: u32 = 0x1234_5678;
-    let mut rng = || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); (seed >> 8) as f32 / 16_777_216.0 - 0.5 };
+    let mut rng = || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        (seed >> 8) as f32 / 16_777_216.0 - 0.5
+    };
     let hidden: Vec<f32> = (0..hidden_dim).map(|_| rng()).collect();
     let gate: Vec<f32> = (0..num_experts * hidden_dim).map(|_| rng()).collect();
 
@@ -1899,7 +2275,10 @@ fn test_moe_router_parallel_matches_serial() {
             enc.set_buffer(&logits_buf, 0, 2);
             enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
             enc.set_bytes(&(num_experts as u32).to_le_bytes(), 4);
-            enc.dispatch_threadgroups(MTLSize::new(num_experts as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.dispatch_threadgroups(
+                MTLSize::new(num_experts as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
             enc.memory_barrier_with_scope(1);
             enc.set_pipeline_state(&topk_pso);
             enc.set_buffer(&logits_buf, 0, 0);
@@ -1932,11 +2311,16 @@ fn test_moe_router_parallel_matches_serial() {
     let (ids_s, wts_s) = run(false);
     let (ids_p, wts_p) = run(true);
 
-    assert_eq!(ids_s, ids_p, "parallel router selected different experts: serial={ids_s:?} parallel={ids_p:?}");
+    assert_eq!(
+        ids_s, ids_p,
+        "parallel router selected different experts: serial={ids_s:?} parallel={ids_p:?}"
+    );
     for k in 0..top_k {
         assert!(
             (wts_s[k] - wts_p[k]).abs() < 1e-5,
-            "weight mismatch at k={k}: serial={} parallel={}", wts_s[k], wts_p[k]
+            "weight mismatch at k={k}: serial={} parallel={}",
+            wts_s[k],
+            wts_p[k]
         );
     }
     eprintln!("router_parallel_matches_serial: ids={ids_p:?} weights match within 1e-5 -- PASS");
@@ -1949,10 +2333,15 @@ fn test_moe_router_diversity_non_degenerate() {
     // a wiring bug where the router always selects the same expert.
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let router_fn = lib.get_function("moe_router_softmax").unwrap();
-    let router_pso = backend.device.new_compute_pipeline_state(&router_fn).unwrap();
+    let router_pso = backend
+        .device
+        .new_compute_pipeline_state(&router_fn)
+        .unwrap();
 
     let hidden_dim: usize = 8;
     let num_experts: usize = 8;
@@ -1969,13 +2358,41 @@ fn test_moe_router_diversity_non_degenerate() {
     // Run several hidden states that should route to different experts.
     let test_cases: Vec<(Vec<f32>, u32)> = vec![
         // hidden_state = [5, 0, 0, 0, 0, 0, 0, 0] -> logit[0]=5, expect top-1 = expert 0
-        ({let mut v = vec![0.0f32; hidden_dim]; v[0] = 5.0; v}, 0),
+        (
+            {
+                let mut v = vec![0.0f32; hidden_dim];
+                v[0] = 5.0;
+                v
+            },
+            0,
+        ),
         // hidden_state = [0, 0, 0, 5, 0, 0, 0, 0] -> logit[3]=5, expect top-1 = expert 3
-        ({let mut v = vec![0.0f32; hidden_dim]; v[3] = 5.0; v}, 3),
+        (
+            {
+                let mut v = vec![0.0f32; hidden_dim];
+                v[3] = 5.0;
+                v
+            },
+            3,
+        ),
         // hidden_state = [0, 0, 0, 0, 0, 0, 0, 5] -> logit[7]=5, expect top-1 = expert 7
-        ({let mut v = vec![0.0f32; hidden_dim]; v[7] = 5.0; v}, 7),
+        (
+            {
+                let mut v = vec![0.0f32; hidden_dim];
+                v[7] = 5.0;
+                v
+            },
+            7,
+        ),
         // hidden_state = [0, 0, 5, 0, 0, 0, 0, 0] -> logit[2]=5, expect top-1 = expert 2
-        ({let mut v = vec![0.0f32; hidden_dim]; v[2] = 5.0; v}, 2),
+        (
+            {
+                let mut v = vec![0.0f32; hidden_dim];
+                v[2] = 5.0;
+                v
+            },
+            2,
+        ),
     ];
 
     let mut selected_experts: Vec<u32> = Vec::new();
@@ -2024,7 +2441,9 @@ fn test_moe_router_diversity_non_degenerate() {
         selected_experts.push(ids[0]);
         eprintln!(
             "  hidden dim{} dominant -> top-1=expert {}, weight={:.4} -- OK",
-            hidden.iter().position(|&x| x > 1.0).unwrap_or(0), ids[0], wts[0],
+            hidden.iter().position(|&x| x > 1.0).unwrap_or(0),
+            ids[0],
+            wts[0],
         );
     }
 
@@ -2033,12 +2452,14 @@ fn test_moe_router_diversity_non_degenerate() {
     assert!(
         unique.len() >= 3,
         "Expected >= 3 unique expert selections, got {} ({:?})",
-        unique.len(), selected_experts,
+        unique.len(),
+        selected_experts,
     );
 
     eprintln!(
         "moe_router_diversity: {} unique experts across {} inputs -- PASS",
-        unique.len(), test_cases.len(),
+        unique.len(),
+        test_cases.len(),
     );
 }
 
@@ -2048,10 +2469,15 @@ fn test_moe_router_large_hidden_dim() {
     // the multi-thread cooperative reduction code path in the kernel.
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let router_fn = lib.get_function("moe_router_softmax").unwrap();
-    let router_pso = backend.device.new_compute_pipeline_state(&router_fn).unwrap();
+    let router_pso = backend
+        .device
+        .new_compute_pipeline_state(&router_fn)
+        .unwrap();
 
     let hidden_dim: usize = 256;
     let num_experts: usize = 8;
@@ -2107,7 +2533,12 @@ fn test_moe_router_large_hidden_dim() {
         (sum - 1.0).abs() < 1e-5,
         "weights should sum to 1.0, got {sum:.6}"
     );
-    assert!(wts[0] > wts[1], "w0={:.4} should be > w1={:.4}", wts[0], wts[1]);
+    assert!(
+        wts[0] > wts[1],
+        "w0={:.4} should be > w1={:.4}",
+        wts[0],
+        wts[1]
+    );
 
     eprintln!(
         "moe_router_large_hidden_dim: ids={:?}, weights={:?} -- PASS",
@@ -2121,10 +2552,15 @@ fn test_moe_router_large_hidden_dim() {
 fn test_moe_router_uniform_logits_selects_expert_zero() {
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let router_fn = lib.get_function("moe_router_softmax").unwrap();
-    let router_pso = backend.device.new_compute_pipeline_state(&router_fn).unwrap();
+    let router_pso = backend
+        .device
+        .new_compute_pipeline_state(&router_fn)
+        .unwrap();
 
     let hidden_dim: usize = 8;
     let num_experts: usize = 8;
@@ -2165,12 +2601,23 @@ fn test_moe_router_uniform_logits_selects_expert_zero() {
     weights_buf.read_f32(&mut wts);
 
     // With uniform logits, strict `>` tiebreaker picks expert 0 first, expert 1 second.
-    assert_eq!(ids[0], 0, "uniform logits: top-1 should be expert 0 (tiebreaker), got {}", ids[0]);
-    assert_eq!(ids[1], 1, "uniform logits: top-2 should be expert 1 (tiebreaker), got {}", ids[1]);
+    assert_eq!(
+        ids[0], 0,
+        "uniform logits: top-1 should be expert 0 (tiebreaker), got {}",
+        ids[0]
+    );
+    assert_eq!(
+        ids[1], 1,
+        "uniform logits: top-2 should be expert 1 (tiebreaker), got {}",
+        ids[1]
+    );
 
     // Weights should be equal (0.5 each after renormalization of 2 equal probs).
     let spread = (wts[0] - wts[1]).abs();
-    assert!(spread < 1e-5, "uniform logits: weight spread should be ~0, got {spread:.6}");
+    assert!(
+        spread < 1e-5,
+        "uniform logits: weight spread should be ~0, got {spread:.6}"
+    );
 
     eprintln!(
         "moe_router_uniform_logits: ids={:?}, weights={:?}, spread={:.6} -- PASS",
@@ -2184,10 +2631,15 @@ fn test_moe_router_uniform_logits_selects_expert_zero() {
 fn test_moe_router_tiny_logit_difference_routes_correctly() {
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let router_fn = lib.get_function("moe_router_softmax").unwrap();
-    let router_pso = backend.device.new_compute_pipeline_state(&router_fn).unwrap();
+    let router_pso = backend
+        .device
+        .new_compute_pipeline_state(&router_fn)
+        .unwrap();
 
     let hidden_dim: usize = 8;
     let num_experts: usize = 8;
@@ -2232,10 +2684,17 @@ fn test_moe_router_tiny_logit_difference_routes_correctly() {
     weights_buf.read_f32(&mut wts);
 
     // Expert 5 should be top-1 because it has the highest logit.
-    assert_eq!(ids[0], 5, "tiny diff: top-1 should be expert 5, got {}", ids[0]);
+    assert_eq!(
+        ids[0], 5,
+        "tiny diff: top-1 should be expert 5, got {}",
+        ids[0]
+    );
     // Weight spread should be tiny but nonzero.
     let spread = wts[0] - wts[1];
-    assert!(spread > 0.0, "tiny diff: weight spread should be > 0, got {spread:.6}");
+    assert!(
+        spread > 0.0,
+        "tiny diff: weight spread should be > 0, got {spread:.6}"
+    );
 
     eprintln!(
         "moe_router_tiny_logit_diff: ids={:?}, weights={:?}, spread={:.6} -- PASS",
@@ -2256,8 +2715,12 @@ fn test_router_layer_stats_weight_spread() {
 
     // Verify spread computation matches what readback would produce.
     let computed = stats.expert_weights[0] - stats.expert_weights[1];
-    assert!((computed - stats.weight_spread).abs() < 1e-7,
-        "weight_spread={} should match w0-w1={}", stats.weight_spread, computed);
+    assert!(
+        (computed - stats.weight_spread).abs() < 1e-7,
+        "weight_spread={} should match w0-w1={}",
+        stats.weight_spread,
+        computed
+    );
 }
 
 /// Verify router_debug_summary diagnoses near-zero spread as Q4_0 issue.
@@ -2314,11 +2777,20 @@ fn test_router_debug_summary_degenerate_near_zero_spread() {
 #[test]
 fn test_configure_router_debug() {
     let mut backend = MetalF32Backend::new().unwrap();
-    assert!(!backend.router_debug_enabled, "router debug should default to false");
+    assert!(
+        !backend.router_debug_enabled,
+        "router debug should default to false"
+    );
     backend.configure_router_debug(true);
-    assert!(backend.router_debug_enabled, "router debug should be true after configure");
+    assert!(
+        backend.router_debug_enabled,
+        "router debug should be true after configure"
+    );
     backend.configure_router_debug(false);
-    assert!(!backend.router_debug_enabled, "router debug should be false after disable");
+    assert!(
+        !backend.router_debug_enabled,
+        "router debug should be false after disable"
+    );
 }
 
 #[test]
@@ -2381,14 +2853,44 @@ fn test_router_debug_summary_diverse() {
     {
         let mut log = backend.router_debug_log.lock().unwrap();
         // Token 0: layer 0 selects expert 0, layer 1 selects expert 3
-        log.push(RouterLayerStats { layer: 0, expert_ids: vec![0, 1], expert_weights: vec![0.7, 0.3], weight_spread: 0.4 });
-        log.push(RouterLayerStats { layer: 1, expert_ids: vec![3, 2], expert_weights: vec![0.6, 0.4], weight_spread: 0.2 });
+        log.push(RouterLayerStats {
+            layer: 0,
+            expert_ids: vec![0, 1],
+            expert_weights: vec![0.7, 0.3],
+            weight_spread: 0.4,
+        });
+        log.push(RouterLayerStats {
+            layer: 1,
+            expert_ids: vec![3, 2],
+            expert_weights: vec![0.6, 0.4],
+            weight_spread: 0.2,
+        });
         // Token 1: layer 0 selects expert 2, layer 1 selects expert 1
-        log.push(RouterLayerStats { layer: 0, expert_ids: vec![2, 0], expert_weights: vec![0.5, 0.5], weight_spread: 0.0 });
-        log.push(RouterLayerStats { layer: 1, expert_ids: vec![1, 0], expert_weights: vec![0.6, 0.4], weight_spread: 0.2 });
+        log.push(RouterLayerStats {
+            layer: 0,
+            expert_ids: vec![2, 0],
+            expert_weights: vec![0.5, 0.5],
+            weight_spread: 0.0,
+        });
+        log.push(RouterLayerStats {
+            layer: 1,
+            expert_ids: vec![1, 0],
+            expert_weights: vec![0.6, 0.4],
+            weight_spread: 0.2,
+        });
         // Token 2: layer 0 selects expert 1, layer 1 selects expert 0
-        log.push(RouterLayerStats { layer: 0, expert_ids: vec![1, 3], expert_weights: vec![0.55, 0.45], weight_spread: 0.1 });
-        log.push(RouterLayerStats { layer: 1, expert_ids: vec![0, 2], expert_weights: vec![0.7, 0.3], weight_spread: 0.4 });
+        log.push(RouterLayerStats {
+            layer: 0,
+            expert_ids: vec![1, 3],
+            expert_weights: vec![0.55, 0.45],
+            weight_spread: 0.1,
+        });
+        log.push(RouterLayerStats {
+            layer: 1,
+            expert_ids: vec![0, 2],
+            expert_weights: vec![0.7, 0.3],
+            weight_spread: 0.4,
+        });
     }
 
     let summary = backend.router_debug_summary().unwrap();
@@ -2415,10 +2917,7 @@ fn test_moe_routing_entropy() {
 
     let lbc_path = Path::new("/tmp/lumen-bench/qwen3-5-moe-35b-a3b-Q4_0.lbc");
     if !lbc_path.exists() {
-        eprintln!(
-            "SKIP: MoE LBC file not found at {}",
-            lbc_path.display()
-        );
+        eprintln!("SKIP: MoE LBC file not found at {}", lbc_path.display());
         return;
     }
 
@@ -2430,7 +2929,8 @@ fn test_moe_routing_entropy() {
         advise_sequential: true,
         release_with_dontneed: true,
     };
-    let provider = crate::weight::provider_mmap::MmapWeightProvider::open(lbc_path, mmap_config).unwrap();
+    let provider =
+        crate::weight::provider_mmap::MmapWeightProvider::open(lbc_path, mmap_config).unwrap();
     let hp = &provider.lbc().header.hyperparams;
 
     let num_experts = hp.num_experts.unwrap_or(0) as usize;
@@ -2490,10 +2990,18 @@ fn test_moe_routing_entropy() {
     let stop = crate::engine::StopCondition::MaxTokens(20);
 
     match engine.generate(
-        &prompt_tokens, &provider, &metal as &dyn ComputeBackend, &stop, &sampling,
+        &prompt_tokens,
+        &provider,
+        &metal as &dyn ComputeBackend,
+        &stop,
+        &sampling,
     ) {
         Ok(result) => {
-            eprintln!("Generated {} tokens: {:?}", result.tokens.len(), result.tokens);
+            eprintln!(
+                "Generated {} tokens: {:?}",
+                result.tokens.len(),
+                result.tokens
+            );
         }
         Err(e) => {
             eprintln!("Inference failed: {e}");
@@ -2516,30 +3024,42 @@ fn test_moe_routing_entropy() {
     let mut any_diverse = false;
 
     for layer in 0..=max_layer {
-        let entries: Vec<&RouterLayerStats> = log.iter()
-            .filter(|s| s.layer == layer)
-            .collect();
-        if entries.is_empty() { continue; }
+        let entries: Vec<&RouterLayerStats> = log.iter().filter(|s| s.layer == layer).collect();
+        if entries.is_empty() {
+            continue;
+        }
 
-        let top1_experts: Vec<u32> = entries.iter()
+        let top1_experts: Vec<u32> = entries
+            .iter()
             .filter_map(|e| e.expert_ids.first().copied())
             .collect();
         let unique: std::collections::HashSet<u32> = top1_experts.iter().copied().collect();
-        let avg_w0: f32 = entries.iter()
+        let avg_w0: f32 = entries
+            .iter()
             .filter_map(|e| e.expert_weights.first().copied())
-            .sum::<f32>() / entries.len() as f32;
+            .sum::<f32>()
+            / entries.len() as f32;
 
-        if unique.len() > 1 { any_diverse = true; }
+        if unique.len() > 1 {
+            any_diverse = true;
+        }
 
         eprintln!(
             "  Layer {:2}: {} tokens, {} unique top-1 experts {:?}, avg_top1_weight={:.4}",
-            layer, entries.len(), unique.len(), unique, avg_w0,
+            layer,
+            entries.len(),
+            unique.len(),
+            unique,
+            avg_w0,
         );
     }
 
     if !any_diverse {
         eprintln!("\nFINDING: ALL layers always select the same top-1 expert.");
-        eprintln!("Routing entropy = 0 across all {} tokens.", log.len() / (max_layer + 1).max(1));
+        eprintln!(
+            "Routing entropy = 0 across all {} tokens.",
+            log.len() / (max_layer + 1).max(1)
+        );
         eprintln!("Possible causes:");
         eprintln!("  1. Router weights collapsed due to Q4_0 quantization");
         eprintln!("  2. Short prompt does not provide enough diversity");
@@ -2561,10 +3081,16 @@ fn f16_bits_to_f32_moe(bits: u16) -> f32 {
     let exp = ((bits >> 10) & 0x1F) as u32;
     let frac = (bits & 0x3FF) as u32;
     let out = if exp == 0 {
-        if frac == 0 { sign << 31 } else {
+        if frac == 0 {
+            sign << 31
+        } else {
             // subnormal
-            let mut e = -1i32; let mut f = frac;
-            while (f & 0x400) == 0 { f <<= 1; e -= 1; }
+            let mut e = -1i32;
+            let mut f = frac;
+            while (f & 0x400) == 0 {
+                f <<= 1;
+                e -= 1;
+            }
             f &= 0x3FF;
             let new_exp = (e + 127 + 1 - 15) as u32;
             (sign << 31) | (new_exp << 23) | (f << 13)
@@ -2656,8 +3182,10 @@ fn encode_q8_0_matrix(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
 fn test_moe_batched_gate_up_swiglu_q8_0_correctness() {
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("moe_batched_gate_up_swiglu_q8_0").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -2708,15 +3236,27 @@ fn test_moe_batched_gate_up_swiglu_q8_0_correctness() {
     let expert_ids: Vec<u32> = vec![1, 3];
 
     // Allocate GPU buffers
-    let layer_buf = backend.device.new_buffer_with_bytes(&layer_buf_data).unwrap();
+    let layer_buf = backend
+        .device
+        .new_buffer_with_bytes(&layer_buf_data)
+        .unwrap();
     let x_buf = backend.upload_f32(&x).unwrap();
     let swiglu_out_buf = backend.device.new_buffer(top_k * inter_dim * 4).unwrap();
     let expert_ids_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(expert_ids.as_ptr() as *const u8, expert_ids.len() * 4)
     };
-    let expert_ids_buf = backend.device.new_buffer_with_bytes(expert_ids_bytes).unwrap();
-    let offsets_bytes: Vec<u8> = expert_offsets.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let offsets_buf = backend.device.new_buffer_with_bytes(&offsets_bytes).unwrap();
+    let expert_ids_buf = backend
+        .device
+        .new_buffer_with_bytes(expert_ids_bytes)
+        .unwrap();
+    let offsets_bytes: Vec<u8> = expert_offsets
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let offsets_buf = backend
+        .device
+        .new_buffer_with_bytes(&offsets_bytes)
+        .unwrap();
 
     // Dispatch
     let cmd = backend.queue.new_command_buffer().unwrap();
@@ -2731,10 +3271,7 @@ fn test_moe_batched_gate_up_swiglu_q8_0_correctness() {
     enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 6);
     enc.set_bytes(&(top_k as u32).to_le_bytes(), 7);
     let n_tg = (top_k * inter_dim) as u64;
-    enc.dispatch_threadgroups(
-        MTLSize::new(n_tg, 1, 1),
-        MTLSize::new(128, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -2795,8 +3332,10 @@ fn test_moe_batched_gate_up_swiglu_q8_0_correctness() {
 fn test_moe_batched_down_accum_q8_0_correctness() {
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("moe_batched_down_accum_q8_0").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 
@@ -2809,8 +3348,12 @@ fn test_moe_batched_down_accum_q8_0_correctness() {
     // Slot 0 (expert 1): all 2.0
     // Slot 1 (expert 3): all 4.0
     let mut swiglu_in = vec![0.0f32; top_k * inter_dim];
-    for i in 0..inter_dim { swiglu_in[i] = 2.0; }          // slot 0
-    for i in 0..inter_dim { swiglu_in[inter_dim + i] = 4.0; } // slot 1
+    for i in 0..inter_dim {
+        swiglu_in[i] = 2.0;
+    } // slot 0
+    for i in 0..inter_dim {
+        swiglu_in[inter_dim + i] = 4.0;
+    } // slot 1
 
     // Down weight matrices: all 1.0 for each expert -> dot = sum(swiglu_k)
     let blocks_per_row = inter_dim / 32;
@@ -2835,17 +3378,26 @@ fn test_moe_batched_down_accum_q8_0_correctness() {
     let residual = vec![10.0f32; hidden_dim];
 
     // Allocate GPU buffers
-    let layer_buf = backend.device.new_buffer_with_bytes(&layer_buf_data).unwrap();
+    let layer_buf = backend
+        .device
+        .new_buffer_with_bytes(&layer_buf_data)
+        .unwrap();
     let swiglu_buf = backend.upload_f32(&swiglu_in).unwrap();
     let output_buf = backend.device.new_buffer(hidden_dim * 4).unwrap();
     let residual_buf = backend.upload_f32(&residual).unwrap();
     let expert_ids_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(expert_ids.as_ptr() as *const u8, expert_ids.len() * 4)
     };
-    let expert_ids_buf = backend.device.new_buffer_with_bytes(expert_ids_bytes).unwrap();
+    let expert_ids_buf = backend
+        .device
+        .new_buffer_with_bytes(expert_ids_bytes)
+        .unwrap();
     let expert_weights_buf = backend.upload_f32(&expert_weights).unwrap();
     let offsets_bytes: Vec<u8> = down_offsets.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let offsets_buf = backend.device.new_buffer_with_bytes(&offsets_bytes).unwrap();
+    let offsets_buf = backend
+        .device
+        .new_buffer_with_bytes(&offsets_bytes)
+        .unwrap();
 
     // Dispatch
     let cmd = backend.queue.new_command_buffer().unwrap();
@@ -2862,10 +3414,7 @@ fn test_moe_batched_down_accum_q8_0_correctness() {
     enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 8);
     enc.set_bytes(&(top_k as u32).to_le_bytes(), 9);
     let n_tg = ((hidden_dim as u64) + 3) / 4;
-    enc.dispatch_threadgroups(
-        MTLSize::new(n_tg, 1, 1),
-        MTLSize::new(128, 1, 1),
-    );
+    enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
     enc.end_encoding();
     cmd.commit_and_wait();
 
@@ -2904,8 +3453,10 @@ fn test_moe_batched_down_accum_q8_0_correctness() {
 fn test_sigmoid_scale_add_correctness() {
     let backend = MetalF32Backend::new().unwrap();
 
-    let lib = backend.device
-        .new_library_with_source(METAL_SHADER_SOURCE).unwrap();
+    let lib = backend
+        .device
+        .new_library_with_source(METAL_SHADER_SOURCE)
+        .unwrap();
     let func = lib.get_function("sigmoid_scale_add").unwrap();
     let pso = backend.device.new_compute_pipeline_state(&func).unwrap();
 

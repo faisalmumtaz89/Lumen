@@ -65,8 +65,8 @@
 // API stays stable across revisions.
 #![allow(dead_code)]
 
-use crate::error::RuntimeError;
 use super::ffi::{MetalBuffer, MetalComputeEncoder};
+use crate::error::RuntimeError;
 use std::sync::atomic::{AtomicU8, Ordering as AOrd};
 
 /// Identifies a logical mutable buffer for hazard tracking.
@@ -118,9 +118,14 @@ pub(crate) struct ByteRange {
 
 impl ByteRange {
     /// Whole-buffer marker (used when an op touches the entire logical span).
-    pub const WHOLE: Self = Self { off: 0, len: u64::MAX };
+    pub const WHOLE: Self = Self {
+        off: 0,
+        len: u64::MAX,
+    };
 
-    pub fn whole() -> Self { Self::WHOLE }
+    pub fn whole() -> Self {
+        Self::WHOLE
+    }
 
     pub fn overlaps(&self, other: &Self) -> bool {
         // Treat WHOLE as overlapping everything.
@@ -142,8 +147,14 @@ pub(crate) enum AccessKind {
 }
 
 impl AccessKind {
-    #[inline] pub fn is_write(self) -> bool { matches!(self, Self::Write | Self::ReadWrite) }
-    #[inline] pub fn is_read (self) -> bool { matches!(self, Self::Read  | Self::ReadWrite) }
+    #[inline]
+    pub fn is_write(self) -> bool {
+        matches!(self, Self::Write | Self::ReadWrite)
+    }
+    #[inline]
+    pub fn is_read(self) -> bool {
+        matches!(self, Self::Read | Self::ReadWrite)
+    }
 }
 
 /// One mutable-buffer access by an op.
@@ -157,15 +168,27 @@ pub(crate) struct Access {
 impl Access {
     #[inline]
     pub fn read(buf: BufferId) -> Self {
-        Self { buf, range: ByteRange::WHOLE, kind: AccessKind::Read }
+        Self {
+            buf,
+            range: ByteRange::WHOLE,
+            kind: AccessKind::Read,
+        }
     }
     #[inline]
     pub fn write(buf: BufferId) -> Self {
-        Self { buf, range: ByteRange::WHOLE, kind: AccessKind::Write }
+        Self {
+            buf,
+            range: ByteRange::WHOLE,
+            kind: AccessKind::Write,
+        }
     }
     #[inline]
     pub fn read_write(buf: BufferId) -> Self {
-        Self { buf, range: ByteRange::WHOLE, kind: AccessKind::ReadWrite }
+        Self {
+            buf,
+            range: ByteRange::WHOLE,
+            kind: AccessKind::ReadWrite,
+        }
     }
 }
 
@@ -204,13 +227,19 @@ impl AccessList {
 
     #[inline]
     pub(crate) fn new() -> Self {
-        Self { len: 0, data: [Self::SENTINEL; Self::MAX] }
+        Self {
+            len: 0,
+            data: [Self::SENTINEL; Self::MAX],
+        }
     }
 
     #[inline]
     pub(crate) fn push(&mut self, a: Access) {
-        debug_assert!((self.len as usize) < Self::MAX,
-            "AccessList capacity exceeded ({}); raise MAX", Self::MAX);
+        debug_assert!(
+            (self.len as usize) < Self::MAX,
+            "AccessList capacity exceeded ({}); raise MAX",
+            Self::MAX
+        );
         if (self.len as usize) < Self::MAX {
             self.data[self.len as usize] = a;
             self.len += 1;
@@ -220,7 +249,9 @@ impl AccessList {
     #[inline]
     pub(crate) fn from_iter_inline<I: IntoIterator<Item = Access>>(iter: I) -> Self {
         let mut v = Self::new();
-        for a in iter { v.push(a); }
+        for a in iter {
+            v.push(a);
+        }
         v
     }
 
@@ -260,8 +291,7 @@ pub(crate) enum OrderClass {
 /// Stored as a boxed `FnMut` so callers can capture per-op constants
 /// (pipeline state, buffer offsets, set_bytes payload) without bloating
 /// the op enum with every possible parameter combination.
-pub(crate) type EmitFn<'a> =
-    Box<dyn FnMut(&MetalComputeEncoder) -> Result<(), RuntimeError> + 'a>;
+pub(crate) type EmitFn<'a> = Box<dyn FnMut(&MetalComputeEncoder) -> Result<(), RuntimeError> + 'a>;
 
 /// A single scheduled operation in a per-layer plan.
 ///
@@ -287,7 +317,9 @@ impl<'a> LayerOp<'a> {
     fn conflicts_with(&self, other: &Self) -> bool {
         for a in self.accesses.iter() {
             for b in other.accesses.iter() {
-                if a.buf != b.buf { continue; }
+                if a.buf != b.buf {
+                    continue;
+                }
                 // Two accesses on the same buffer conflict iff at least one
                 // is a write and their ranges overlap.
                 if (a.kind.is_write() || b.kind.is_write()) && a.range.overlaps(&b.range) {
@@ -301,7 +333,8 @@ impl<'a> LayerOp<'a> {
     /// Returns the buffers written by this op. Used to compute the
     /// barrier resource set between wavefronts.
     fn writes(&self) -> impl Iterator<Item = BufferId> + '_ {
-        self.accesses.iter()
+        self.accesses
+            .iter()
             .filter(|a| a.kind.is_write())
             .map(|a| a.buf)
     }
@@ -336,7 +369,9 @@ const LOOKAHEAD_FULL: usize = 64;
 pub(crate) fn metal_defaults_active() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let off = std::env::var("LUMEN_METAL_DEFAULTS_OFF")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
@@ -355,12 +390,18 @@ pub(crate) fn metal_defaults_active() -> bool {
 fn active_lookahead() -> usize {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return if cur == 2 { LOOKAHEAD_FULL } else { LOOKAHEAD }; }
+    if cur != 0 {
+        return if cur == 2 { LOOKAHEAD_FULL } else { LOOKAHEAD };
+    }
     let v = std::env::var("LUMEN_METAL_CONCURRENT_ENCODER_FULL")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
     CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    if v { LOOKAHEAD_FULL } else { LOOKAHEAD }
+    if v {
+        LOOKAHEAD_FULL
+    } else {
+        LOOKAHEAD
+    }
 }
 
 /// Whether the concurrent-encoder path is enabled for this process.
@@ -378,7 +419,9 @@ fn active_lookahead() -> usize {
 pub(crate) fn concurrent_encoder_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let raw = std::env::var("LUMEN_METAL_CONCURRENT_ENCODER").ok();
     let v = match raw.as_deref() {
         Some("0") => false,
@@ -405,7 +448,9 @@ pub(crate) fn concurrent_encoder_enabled() -> bool {
 pub(crate) fn concurrent_encoder_full_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let v = std::env::var("LUMEN_METAL_CONCURRENT_ENCODER_FULL")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
@@ -429,7 +474,9 @@ pub(crate) fn concurrent_encoder_full_enabled() -> bool {
 pub(crate) fn gdn_concurrent_encoder_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let raw = std::env::var("LUMEN_METAL_GDN_CONCURRENT_ENCODER").ok();
     let v = match raw.as_deref() {
         Some("0") => false,
@@ -450,7 +497,9 @@ pub(crate) fn gdn_concurrent_encoder_enabled() -> bool {
 pub(crate) fn gdn_concurrent_encoder_validate_serial() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let v = std::env::var("LUMEN_METAL_GDN_CONCURRENT_ENCODER_VALIDATE")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
@@ -481,7 +530,9 @@ pub(crate) fn gdn_concurrent_encoder_validate_serial() -> bool {
 pub(crate) fn gdn_dual_queue_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let v = std::env::var("LUMEN_METAL_GDN_DUAL_QUEUE")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
@@ -508,7 +559,9 @@ pub(crate) fn gdn_dual_queue_enabled() -> bool {
 pub(crate) fn gdn_phase2a_nsg4_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let v = std::env::var("LUMEN_METAL_GDN_PHASE2A_NSG4")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
@@ -527,7 +580,9 @@ pub(crate) fn gdn_phase2a_nsg4_enabled() -> bool {
 pub(crate) fn gdn_prefill_chunked_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let v = std::env::var("LUMEN_METAL_GDN_PREFILL_CHUNKED")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
@@ -543,9 +598,13 @@ pub(crate) fn gdn_prefill_chunked_enabled() -> bool {
 pub(crate) fn gdn_prefill_chunk_c() -> u32 {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur as u32; }
+    if cur != 0 {
+        return cur as u32;
+    }
     let v: u32 = std::env::var("LUMEN_METAL_GDN_PREFILL_CHUNK_C")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
     let v = if v == 8 { 8 } else { 16 };
     CACHE.store(v as u8, AOrd::Relaxed);
     v
@@ -565,7 +624,9 @@ pub(crate) fn gdn_prefill_chunk_c() -> u32 {
 pub(crate) fn gdn_diag_skip() -> u8 {
     static CACHE: AtomicU8 = AtomicU8::new(255);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 255 { return cur; }
+    if cur != 255 {
+        return cur;
+    }
     let v = match std::env::var("LUMEN_METAL_GDN_DIAG_SKIP").ok().as_deref() {
         Some("phase2a") => 1,
         Some("phase3") => 2,
@@ -592,7 +653,9 @@ pub(crate) fn gdn_diag_skip() -> u8 {
 pub(crate) fn gdn_subskip() -> u32 {
     static CACHE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != u32::MAX { return cur; }
+    if cur != u32::MAX {
+        return cur;
+    }
     let v = std::env::var("LUMEN_METAL_GDN_SUBSKIP")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
@@ -609,7 +672,9 @@ pub(crate) fn gdn_subskip() -> u32 {
 pub(crate) fn gdn_l2_sg_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(255);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 255 { return cur != 0; }
+    if cur != 255 {
+        return cur != 0;
+    }
     let on = std::env::var("LUMEN_METAL_GDN_L2_SG").ok().as_deref() == Some("1");
     CACHE.store(on as u8, AOrd::Relaxed);
     on
@@ -626,8 +691,13 @@ pub(crate) fn gdn_l2_sg_enabled() -> bool {
 pub(crate) fn gdn_conv_l2_fused_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(255);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 255 { return cur != 0; }
-    let on = std::env::var("LUMEN_METAL_GDN_CONV_L2_FUSED").ok().as_deref() == Some("1");
+    if cur != 255 {
+        return cur != 0;
+    }
+    let on = std::env::var("LUMEN_METAL_GDN_CONV_L2_FUSED")
+        .ok()
+        .as_deref()
+        == Some("1");
     CACHE.store(on as u8, AOrd::Relaxed);
     on
 }
@@ -648,7 +718,9 @@ pub(crate) fn gdn_conv_l2_fused_enabled() -> bool {
 pub(crate) fn gdn_ssm_out_f32_batched_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     // Opt-OUT semantics: default ON when unset, OFF only when explicitly "0".
     let v = std::env::var("LUMEN_METAL_GDN_SSM_OUT_F32_BATCHED")
         .map(|s| s != "0")
@@ -672,7 +744,9 @@ pub(crate) fn gdn_ssm_out_f32_batched_enabled() -> bool {
 pub(crate) fn ffn_down_splitk_value() -> u32 {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return (cur - 1) as u32; }
+    if cur != 0 {
+        return (cur - 1) as u32;
+    }
     let raw = std::env::var("LUMEN_METAL_FFN_DOWN_SPLITK").ok();
     let v: u32 = match raw {
         Some(ref s) if !s.is_empty() => s.parse().unwrap_or(0),
@@ -685,7 +759,13 @@ pub(crate) fn ffn_down_splitk_value() -> u32 {
         // allocation in `ensure_batch_buffers` (line 168-184 of
         // prefill_encode.rs) which saves 8 * batch * hidden_dim floats of
         // wasted scratch. Explicit env-set still wins for diagnostics.
-        _ => if metal_defaults_active() && !crate::runtime_defaults::model_is_moe() { 8 } else { 0 },
+        _ => {
+            if metal_defaults_active() && !crate::runtime_defaults::model_is_moe() {
+                8
+            } else {
+                0
+            }
+        }
     };
     // Allowed values: 0 (off), 2, 4, 8. Any other value disables.
     let v = if matches!(v, 0 | 2 | 4 | 8) { v } else { 0 };
@@ -708,7 +788,9 @@ pub(crate) fn ffn_down_splitk_value() -> u32 {
 pub(crate) fn ffn_down_splitk_bf16_value() -> u32 {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return (cur - 1) as u32; }
+    if cur != 0 {
+        return (cur - 1) as u32;
+    }
     let raw = std::env::var("LUMEN_METAL_FFN_DOWN_SPLITK_BF16").ok();
     let v: u32 = match raw {
         Some(ref s) if !s.is_empty() => s.parse().unwrap_or(0),
@@ -737,7 +819,9 @@ pub(crate) fn ffn_down_splitk_bf16_value() -> u32 {
 pub(crate) fn bf16_gdn_tile_nok64_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let v = std::env::var("LUMEN_METAL_BF16_GDN_TILE_NOK64")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
@@ -769,7 +853,9 @@ pub(crate) fn bf16_gdn_tile_nok64_enabled() -> bool {
 pub(crate) fn bf16_mps_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let v = std::env::var("LUMEN_METAL_BF16_MPS")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
@@ -793,7 +879,9 @@ pub(crate) fn bf16_mps_enabled() -> bool {
 pub(crate) fn q8_repacked_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let raw = std::env::var("LUMEN_METAL_Q8_REPACKED").ok();
     let v = match raw.as_deref() {
         Some("0") => false,
@@ -815,10 +903,14 @@ pub(crate) fn q8_repacked_enabled() -> bool {
 /// `LUMEN_METAL_Q8_REPACKED_FFN_DOWN=0`.
 #[inline]
 pub(crate) fn q8_repacked_ffn_down_enabled() -> bool {
-    if !q8_repacked_enabled() { return false; }
+    if !q8_repacked_enabled() {
+        return false;
+    }
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     // Default ON inside the parent gate, opt-out via "0".
     let v = std::env::var("LUMEN_METAL_Q8_REPACKED_FFN_DOWN")
         .map(|s| s != "0")
@@ -830,10 +922,14 @@ pub(crate) fn q8_repacked_ffn_down_enabled() -> bool {
 /// Sub-gate for FFN gate+up pair-packed repack. Same semantics as FFN-down sub-gate.
 #[inline]
 pub(crate) fn q8_repacked_gate_up_enabled() -> bool {
-    if !q8_repacked_enabled() { return false; }
+    if !q8_repacked_enabled() {
+        return false;
+    }
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let v = std::env::var("LUMEN_METAL_Q8_REPACKED_GATE_UP")
         .map(|s| s != "0")
         .unwrap_or(true);
@@ -855,7 +951,9 @@ pub(crate) fn q8_repacked_gate_up_enabled() -> bool {
 pub(crate) fn q4_repacked_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     // default OFF (env-required-ON). MoE-safe by construction because
     // dense FFN slots are zero-slice sentinels on MoE LBCs — the repack pass
     // skips them via `length > 0` checks. Default stays OFF; explicit
@@ -873,10 +971,14 @@ pub(crate) fn q4_repacked_enabled() -> bool {
 /// `LUMEN_METAL_Q4_REPACKED_FFN_DOWN=0`.
 #[inline]
 pub(crate) fn q4_repacked_ffn_down_enabled() -> bool {
-    if !q4_repacked_enabled() { return false; }
+    if !q4_repacked_enabled() {
+        return false;
+    }
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let v = std::env::var("LUMEN_METAL_Q4_REPACKED_FFN_DOWN")
         .map(|s| s != "0")
         .unwrap_or(true);
@@ -887,10 +989,14 @@ pub(crate) fn q4_repacked_ffn_down_enabled() -> bool {
 /// Sub-gate for Q4 FFN gate+up pair-packed repack. Same semantics as FFN-down sub-gate.
 #[inline]
 pub(crate) fn q4_repacked_gate_up_enabled() -> bool {
-    if !q4_repacked_enabled() { return false; }
+    if !q4_repacked_enabled() {
+        return false;
+    }
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let v = std::env::var("LUMEN_METAL_Q4_REPACKED_GATE_UP")
         .map(|s| s != "0")
         .unwrap_or(true);
@@ -942,7 +1048,9 @@ pub(crate) fn q4_repacked_gate_up_enabled() -> bool {
 pub(crate) fn bf16_gdn_qkv_gate_paired_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let raw = std::env::var("LUMEN_METAL_BF16_GDN_QKV_GATE_PAIRED").ok();
     let v = match raw.as_deref() {
         Some("0") => false,
@@ -975,7 +1083,9 @@ pub(crate) fn bf16_gdn_qkv_gate_paired_enabled() -> bool {
 pub(crate) fn bf16_paired_full_prefill_warmup_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let raw = std::env::var("LUMEN_METAL_BF16_GDN_FULL_PREFILL_WARMUP").ok();
     let v = match raw.as_deref() {
         Some("0") => false,
@@ -1001,7 +1111,9 @@ pub(crate) fn bf16_paired_full_prefill_warmup_enabled() -> bool {
 pub(crate) fn ffn_gate_up_swiglu_fused_q8_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let raw = std::env::var("LUMEN_METAL_FFN_GATE_UP_SWIGLU_FUSED").ok();
     let v = match raw.as_deref() {
         Some("0") => false,
@@ -1024,7 +1136,9 @@ pub(crate) fn ffn_gate_up_swiglu_fused_q8_enabled() -> bool {
 pub(crate) fn ffn_gate_up_swiglu_fused_q4_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let raw = std::env::var("LUMEN_METAL_FFN_GATE_UP_SWIGLU_FUSED_Q4").ok();
     let v = match raw.as_deref() {
         Some("0") => false,
@@ -1048,7 +1162,9 @@ pub(crate) fn ffn_gate_up_swiglu_fused_q4_enabled() -> bool {
 pub(crate) fn ffn_gate_up_swiglu_fused_bf16_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let raw = std::env::var("LUMEN_METAL_FFN_GATE_UP_SWIGLU_FUSED_BF16").ok();
     let v = match raw.as_deref() {
         Some("0") => false,
@@ -1077,7 +1193,9 @@ pub(crate) fn ffn_gate_up_swiglu_fused_bf16_enabled() -> bool {
 pub(crate) fn bf16_gate_up_nr() -> u8 {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur - 1; }
+    if cur != 0 {
+        return cur - 1;
+    }
     let raw = std::env::var("LUMEN_METAL_BF16_GATE_UP_NR").ok();
     let v: u8 = match raw.as_deref() {
         Some("1") => 1,
@@ -1109,7 +1227,9 @@ pub(crate) fn bf16_gate_up_nr() -> u8 {
 pub(crate) fn unretained_cmdbufs_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let v = std::env::var("LUMEN_METAL_UNRETAINED_CMDBUFS")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
@@ -1146,7 +1266,9 @@ pub(crate) fn unretained_cmdbufs_enabled() -> bool {
 pub(crate) fn multi_cb_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let v = std::env::var("LUMEN_METAL_MULTI_CB")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
@@ -1189,7 +1311,9 @@ pub(crate) fn multi_cb_count() -> usize {
 pub(crate) fn concurrent_encoder_trace_enabled() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let v = std::env::var("LUMEN_METAL_CONCURRENT_ENCODER_TRACE")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
@@ -1209,7 +1333,9 @@ pub(crate) fn concurrent_encoder_trace_enabled() -> bool {
 pub(crate) fn concurrent_encoder_validate_serial() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let v = std::env::var("LUMEN_METAL_CONCURRENT_ENCODER_VALIDATE")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
@@ -1232,7 +1358,9 @@ pub(crate) fn concurrent_encoder_validate_serial() -> bool {
 pub(crate) fn concurrent_encoder_full_validate_serial() -> bool {
     static CACHE: AtomicU8 = AtomicU8::new(0);
     let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 { return cur == 2; }
+    if cur != 0 {
+        return cur == 2;
+    }
     let v = std::env::var("LUMEN_METAL_CONCURRENT_ENCODER_FULL_VALIDATE")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
@@ -1268,7 +1396,9 @@ pub(crate) fn emit_cross_layer_barrier(
     serial_validate: bool,
     buffer_lookup: Option<BufferLookup<'_>>,
 ) {
-    if serial_validate { return; }
+    if serial_validate {
+        return;
+    }
     if let Some(lookup) = buffer_lookup {
         if let Some(buf) = lookup(residual_id) {
             let mut bufs: smallvec_no_alloc::Small16<&MetalBuffer> =
@@ -1315,7 +1445,9 @@ pub(crate) fn emit_plan_into_encoder(
     buffer_lookup: Option<BufferLookup<'_>>,
 ) -> Result<(), RuntimeError> {
     let n = plan.len();
-    if n == 0 { return Ok(()); }
+    if n == 0 {
+        return Ok(());
+    }
 
     // Wavefront lookahead window: 32 by default, 64 when
     // `LUMEN_METAL_CONCURRENT_ENCODER_FULL=1` is set ( scheduler — 64-node lookahead
@@ -1360,26 +1492,41 @@ pub(crate) fn emit_plan_into_encoder(
         // past a Strict candidate is considered for this wave.
         let mut scanned = 0usize;
         for j in (seed + 1)..n {
-            if scanned >= lookahead { break; }
+            if scanned >= lookahead {
+                break;
+            }
             scanned += 1;
-            if done[j] { continue; }
-            if plan[j].order_class == OrderClass::Strict { break; }
+            if done[j] {
+                continue;
+            }
+            if plan[j].order_class == OrderClass::Strict {
+                break;
+            }
             // (a) Conflict with anything already in the wave?
             let mut conflict = false;
             for &w_idx in &wave_buf {
-                if plan[j].conflicts_with(&plan[w_idx]) { conflict = true; break; }
+                if plan[j].conflicts_with(&plan[w_idx]) {
+                    conflict = true;
+                    break;
+                }
             }
-            if conflict { continue; }
+            if conflict {
+                continue;
+            }
             // (b) Conflict with any pending earlier op?
             let mut earlier_blocked = false;
             for k in (seed + 1)..j {
-                if done[k] { continue; }
+                if done[k] {
+                    continue;
+                }
                 if plan[j].conflicts_with(&plan[k]) {
                     earlier_blocked = true;
                     break;
                 }
             }
-            if earlier_blocked { continue; }
+            if earlier_blocked {
+                continue;
+            }
             wave_buf.push(j);
             done[j] = true;
         }
@@ -1396,7 +1543,9 @@ pub(crate) fn emit_plan_into_encoder(
         wave_id += 1;
         for &idx in &wave_buf {
             for buf in plan[idx].writes() {
-                if !wave_writes.contains(&buf) { wave_writes.push(buf); }
+                if !wave_writes.contains(&buf) {
+                    wave_writes.push(buf);
+                }
             }
             (plan[idx].emit)(enc)?;
         }
@@ -1412,12 +1561,17 @@ pub(crate) fn emit_plan_into_encoder(
             for &b in &wave_writes {
                 let mut needed = false;
                 for j in 0..n {
-                    if done[j] { continue; }
+                    if done[j] {
+                        continue;
+                    }
                     if plan[j].accesses.iter().any(|a| a.buf == b) {
-                        needed = true; break;
+                        needed = true;
+                        break;
                     }
                 }
-                if needed { barrier_set.push(b); }
+                if needed {
+                    barrier_set.push(b);
+                }
             }
             if !barrier_set.is_empty() {
                 // Prefer the resource-scoped barrier when the caller has
@@ -1429,7 +1583,9 @@ pub(crate) fn emit_plan_into_encoder(
                     let mut bufs: smallvec_no_alloc::Small16<&MetalBuffer> =
                         smallvec_no_alloc::Small16::new();
                     for &b in &barrier_set {
-                        if let Some(buf) = lookup(b) { bufs.push(buf); }
+                        if let Some(buf) = lookup(b) {
+                            bufs.push(buf);
+                        }
                     }
                     if !bufs.is_empty() {
                         enc.memory_barrier_with_resources(bufs.as_slice());
@@ -1484,15 +1640,12 @@ pub(crate) mod smallvec_no_alloc {
             // plan has at most ~10 distinct mutable buffers, so this never
             // trips in production.
         }
-        pub(crate) fn is_empty(&self) -> bool { self.len == 0 }
+        pub(crate) fn is_empty(&self) -> bool {
+            self.len == 0
+        }
         pub(crate) fn as_slice(&self) -> &[T] {
             // SAFETY: 0..self.len are written and aligned correctly.
-            unsafe {
-                std::slice::from_raw_parts(
-                    self.data.as_ptr() as *const T,
-                    self.len,
-                )
-            }
+            unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const T, self.len) }
         }
     }
 
@@ -1501,7 +1654,9 @@ pub(crate) mod smallvec_no_alloc {
             // Run drop on all initialised entries.
             for i in 0..self.len {
                 // SAFETY: 0..self.len entries are initialised.
-                unsafe { self.data[i].assume_init_drop(); }
+                unsafe {
+                    self.data[i].assume_init_drop();
+                }
             }
         }
     }
@@ -1525,18 +1680,26 @@ mod tests {
             label,
             accesses: AccessList::from_iter_inline(accesses),
             order_class,
-            emit: Box::new(move |_enc| { sink.lock().unwrap().push(label); Ok(()) }),
+            emit: Box::new(move |_enc| {
+                sink.lock().unwrap().push(label);
+                Ok(())
+            }),
         }
     }
 
     #[test]
     fn writes_iter_filters_reads() {
         let sink: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
-        let o = op("x", OrderClass::Free, vec![
-            Access::read(BufferId::Normed),
-            Access::write(BufferId::Q),
-            Access::read_write(BufferId::K),
-        ], &sink);
+        let o = op(
+            "x",
+            OrderClass::Free,
+            vec![
+                Access::read(BufferId::Normed),
+                Access::write(BufferId::Q),
+                Access::read_write(BufferId::K),
+            ],
+            &sink,
+        );
         let writes: Vec<_> = o.writes().collect();
         assert!(writes.contains(&BufferId::Q));
         assert!(writes.contains(&BufferId::K));
@@ -1546,10 +1709,18 @@ mod tests {
     #[test]
     fn read_write_conflict() {
         let sink: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
-        let a = op("a", OrderClass::Free,
-            vec![Access::read(BufferId::Q)], &sink);
-        let b = op("b", OrderClass::Free,
-            vec![Access::write(BufferId::Q)], &sink);
+        let a = op(
+            "a",
+            OrderClass::Free,
+            vec![Access::read(BufferId::Q)],
+            &sink,
+        );
+        let b = op(
+            "b",
+            OrderClass::Free,
+            vec![Access::write(BufferId::Q)],
+            &sink,
+        );
         assert!(a.conflicts_with(&b));
         assert!(b.conflicts_with(&a));
     }
@@ -1557,16 +1728,36 @@ mod tests {
     #[test]
     fn read_read_no_conflict() {
         let sink: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
-        let a = op("a", OrderClass::Free, vec![Access::read(BufferId::Q)], &sink);
-        let b = op("b", OrderClass::Free, vec![Access::read(BufferId::Q)], &sink);
+        let a = op(
+            "a",
+            OrderClass::Free,
+            vec![Access::read(BufferId::Q)],
+            &sink,
+        );
+        let b = op(
+            "b",
+            OrderClass::Free,
+            vec![Access::read(BufferId::Q)],
+            &sink,
+        );
         assert!(!a.conflicts_with(&b));
     }
 
     #[test]
     fn different_buffers_no_conflict() {
         let sink: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
-        let a = op("a", OrderClass::Free, vec![Access::write(BufferId::Q)], &sink);
-        let b = op("b", OrderClass::Free, vec![Access::write(BufferId::K)], &sink);
+        let a = op(
+            "a",
+            OrderClass::Free,
+            vec![Access::write(BufferId::Q)],
+            &sink,
+        );
+        let b = op(
+            "b",
+            OrderClass::Free,
+            vec![Access::write(BufferId::K)],
+            &sink,
+        );
         assert!(!a.conflicts_with(&b));
     }
 
@@ -1574,15 +1765,26 @@ mod tests {
     fn byte_range_disjoint_no_conflict() {
         let sink: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
         let a = LayerOp {
-            label: "a", order_class: OrderClass::Free,
-            accesses: AccessList::from_iter_inline([Access { buf: BufferId::Qkv,
-                range: ByteRange { off: 0, len: 1024 }, kind: AccessKind::Write }]),
+            label: "a",
+            order_class: OrderClass::Free,
+            accesses: AccessList::from_iter_inline([Access {
+                buf: BufferId::Qkv,
+                range: ByteRange { off: 0, len: 1024 },
+                kind: AccessKind::Write,
+            }]),
             emit: Box::new(|_| Ok(())),
         };
         let b = LayerOp {
-            label: "b", order_class: OrderClass::Free,
-            accesses: AccessList::from_iter_inline([Access { buf: BufferId::Qkv,
-                range: ByteRange { off: 1024, len: 1024 }, kind: AccessKind::Write }]),
+            label: "b",
+            order_class: OrderClass::Free,
+            accesses: AccessList::from_iter_inline([Access {
+                buf: BufferId::Qkv,
+                range: ByteRange {
+                    off: 1024,
+                    len: 1024,
+                },
+                kind: AccessKind::Write,
+            }]),
             emit: Box::new(|_| Ok(())),
         };
         let _ = &sink;
@@ -1592,7 +1794,10 @@ mod tests {
     #[test]
     fn whole_range_overlaps_everything() {
         let whole = ByteRange::WHOLE;
-        let small = ByteRange { off: 1024, len: 512 };
+        let small = ByteRange {
+            off: 1024,
+            len: 512,
+        };
         assert!(whole.overlaps(&small));
         assert!(small.overlaps(&whole));
     }
@@ -1610,12 +1815,24 @@ mod tests {
     fn pending_earlier_blocks_reorder() {
         let sink: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
         let mut plan = vec![
-            op("A", OrderClass::Free,
-                vec![Access::write(BufferId::Normed)], &sink),
-            op("B", OrderClass::Free,
-                vec![Access::read(BufferId::Normed), Access::write(BufferId::Q)], &sink),
-            op("C", OrderClass::Free,
-                vec![Access::read(BufferId::Q)], &sink),
+            op(
+                "A",
+                OrderClass::Free,
+                vec![Access::write(BufferId::Normed)],
+                &sink,
+            ),
+            op(
+                "B",
+                OrderClass::Free,
+                vec![Access::read(BufferId::Normed), Access::write(BufferId::Q)],
+                &sink,
+            ),
+            op(
+                "C",
+                OrderClass::Free,
+                vec![Access::read(BufferId::Q)],
+                &sink,
+            ),
         ];
 
         // Compute wave structure without touching Metal: replicate the
@@ -1629,15 +1846,22 @@ mod tests {
             wave.push(seed);
             done[seed] = true;
             for j in (seed + 1)..n {
-                if done[j] { continue; }
-                if plan[j].order_class == OrderClass::Strict { break; }
-                let conflict_with_wave = wave.iter()
-                    .any(|&w| plan[j].conflicts_with(&plan[w]));
-                if conflict_with_wave { continue; }
+                if done[j] {
+                    continue;
+                }
+                if plan[j].order_class == OrderClass::Strict {
+                    break;
+                }
+                let conflict_with_wave = wave.iter().any(|&w| plan[j].conflicts_with(&plan[w]));
+                if conflict_with_wave {
+                    continue;
+                }
                 let blocked_by_earlier = (seed + 1..j)
                     .filter(|&k| !done[k])
                     .any(|k| plan[j].conflicts_with(&plan[k]));
-                if blocked_by_earlier { continue; }
+                if blocked_by_earlier {
+                    continue;
+                }
                 wave.push(j);
                 done[j] = true;
             }

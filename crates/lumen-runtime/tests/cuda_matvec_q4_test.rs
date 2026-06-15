@@ -76,10 +76,7 @@ fn quantize_q4_0(values: &[f32]) -> Vec<u8> {
         let group = &values[base..base + Q4_0_GROUP_SIZE];
 
         // Find the absmax to compute the scale.
-        let amax = group
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0f32, f32::max);
+        let amax = group.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
 
         // Scale: maps [-amax, amax] to [-8, 7] (approximately).
         // Q4_0 stores unsigned nibbles 0..15, centered at 8.
@@ -160,8 +157,8 @@ fn cpu_matvec_q4_0(weight_q4: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -
             let block_start = row_start + b * Q4_0_BLOCK_BYTES;
 
             // Read f16 scale.
-            let scale_bits = weight_q4[block_start] as u16
-                | ((weight_q4[block_start + 1] as u16) << 8);
+            let scale_bits =
+                weight_q4[block_start] as u16 | ((weight_q4[block_start + 1] as u16) << 8);
             let scale = f16_to_f32(scale_bits);
 
             let x_base = b * Q4_0_GROUP_SIZE;
@@ -191,8 +188,11 @@ fn cpu_matvec_q4_0(weight_q4: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -
 
 fn compile_q4_module(
     ctx: &Arc<CudaContext>,
-) -> (Arc<cudarc::driver::CudaModule>, cudarc::driver::CudaFunction, cudarc::driver::CudaFunction)
-{
+) -> (
+    Arc<cudarc::driver::CudaModule>,
+    cudarc::driver::CudaFunction,
+    cudarc::driver::CudaFunction,
+) {
     let src = lumen_runtime::cuda::shaders::MATVEC_Q4_0_KERNEL_SOURCE;
     let ptx = compile_ptx(src).expect("NVRTC compile failed for matvec_q4_0.cu");
     let module = ctx.load_module(ptx).expect("Failed to load Q4_0 module");
@@ -490,7 +490,11 @@ fn test_cuda_matvec_q4_0_zero_weights() {
     let result = stream.clone_dtoh(&out_gpu).unwrap();
 
     for i in 0..out_dim {
-        assert!(result[i].is_finite(), "output[{i}] should be finite, got {}", result[i]);
+        assert!(
+            result[i].is_finite(),
+            "output[{i}] should be finite, got {}",
+            result[i]
+        );
         assert!(
             result[i].abs() < 1e-6,
             "zero weights should produce near-zero output, got {}",

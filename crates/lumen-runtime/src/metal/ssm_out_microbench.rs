@@ -86,7 +86,10 @@ impl MetalF32Backend {
         // K = q_dim = value_dim = 4096. Overridable via env for sweeps:
         //   LUMEN_SSMBENCH_M / _N / _K.
         let env_usize = |k: &str, d: usize| {
-            std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d)
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(d)
         };
         // GEMM-convention upper-case dim names (M/N/K) kept for readability.
         #[allow(non_snake_case)]
@@ -104,16 +107,20 @@ impl MetalF32Backend {
             let pipelines = self.compile_pipelines()?;
             self.pipelines = Some(pipelines);
         }
-        let pipelines = self.pipelines.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("ssm_out_microbench: pipelines missing".into())
-        })?;
+        let pipelines = self
+            .pipelines
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("ssm_out_microbench: pipelines missing".into()))?;
 
         // -------- buffers --------
         let weight_bytes = build_q8_weight_bytes(N, K);
         let weight_mb = weight_bytes.len() as f64 / 1.0e6;
-        let w_buf = self.device.new_buffer_with_bytes(&weight_bytes).ok_or_else(|| {
-            RuntimeError::Compute("ssm_out_microbench: failed to allocate W buffer".into())
-        })?;
+        let w_buf = self
+            .device
+            .new_buffer_with_bytes(&weight_bytes)
+            .ok_or_else(|| {
+                RuntimeError::Compute("ssm_out_microbench: failed to allocate W buffer".into())
+            })?;
 
         let x_bytes = build_random_f32_bytes(M * K, 0xC0FFEEu64);
         let x_buf = self.device.new_buffer_with_bytes(&x_bytes).ok_or_else(|| {
@@ -127,12 +134,9 @@ impl MetalF32Backend {
         // Random residual: mimics the production case where R = x_buf is
         // dense, non-zero data left by the prior layer's FFN-down kernel.
         let r_bytes = build_random_f32_bytes(M * N, 0xBADBEEFu64);
-        let r_random_buf = self
-            .device
-            .new_buffer_with_bytes(&r_bytes)
-            .ok_or_else(|| {
-                RuntimeError::Compute("ssm_out_microbench: failed to allocate R (random) buffer".into())
-            })?;
+        let r_random_buf = self.device.new_buffer_with_bytes(&r_bytes).ok_or_else(|| {
+            RuntimeError::Compute("ssm_out_microbench: failed to allocate R (random) buffer".into())
+        })?;
 
         // Zero residual: cold-cache control — same shape but never touched
         // before this dispatch. If the slowness is residual-buffer cache
@@ -490,7 +494,9 @@ fn build_q8_weight_bytes(n: usize, k: usize) -> Vec<u8> {
             data[off] = (scale_bits & 0xFF) as u8;
             data[off + 1] = (scale_bits >> 8) as u8;
             for j in 0..Q8_GROUP {
-                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 // Map low byte to int8 range [-64, 63] to keep dequant outputs sane.
                 let signed = ((rng >> 56) as i8) >> 1;
                 data[off + 2 + j] = signed as u8;
@@ -506,7 +512,9 @@ fn build_random_f32_bytes(num_floats: usize, seed: u64) -> Vec<u8> {
     let mut out = vec![0u8; num_floats * 4];
     let mut rng = seed.max(1);
     for i in 0..num_floats {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bits24 = (rng >> 40) as u32 & 0x00FF_FFFF;
         // Scale to [-1.0, 1.0).
         let v = (bits24 as f32 / (1u32 << 23) as f32) - 1.0;

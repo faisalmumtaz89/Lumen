@@ -109,8 +109,7 @@ fn cpu_matvec_f16(weight_f16: &[u16], x: &[f32], out_dim: usize, in_dim: usize) 
 #[test]
 fn test_f16_roundtrip_basic_values() {
     let test_values: &[f32] = &[
-        0.0, -0.0, 1.0, -1.0, 0.5, -0.5,
-        0.333333, 2.0, 100.0, 0.001,
+        0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 0.333333, 2.0, 100.0, 0.001,
         65504.0,  // max f16 normal
         -65504.0, // min f16 normal
     ];
@@ -118,7 +117,11 @@ fn test_f16_roundtrip_basic_values() {
     for &v in test_values {
         let h = f32_to_f16_bits(v);
         let back = f16_bits_to_f32(h);
-        let tol = if v == 0.0 { 0.0 } else { (v.abs() * 1e-3).max(6e-8) };
+        let tol = if v == 0.0 {
+            0.0
+        } else {
+            (v.abs() * 1e-3).max(6e-8)
+        };
         assert!(
             (v - back).abs() <= tol,
             "f16 roundtrip failed: {v} -> 0x{h:04x} -> {back} (diff={})",
@@ -157,7 +160,10 @@ fn test_f16_subnormal() {
     // Smallest positive subnormal f16 = 2^-24 ~ 5.96e-8
     let smallest_sub = f16_bits_to_f32(0x0001);
     assert!(smallest_sub > 0.0, "smallest subnormal should be positive");
-    assert!(smallest_sub < 1e-6, "smallest subnormal should be tiny: {smallest_sub}");
+    assert!(
+        smallest_sub < 1e-6,
+        "smallest subnormal should be tiny: {smallest_sub}"
+    );
 
     // Largest subnormal f16 = (1023/1024) * 2^-14 ~ 6.098e-5
     let largest_sub = f16_bits_to_f32(0x03FF);
@@ -169,11 +175,18 @@ fn test_f16_subnormal() {
 fn test_f16_overflow() {
     // Values > 65504 should overflow to infinity
     let h = f32_to_f16_bits(100000.0);
-    assert!(f16_bits_to_f32(h).is_infinite(), "100000.0 should overflow to f16 inf");
+    assert!(
+        f16_bits_to_f32(h).is_infinite(),
+        "100000.0 should overflow to f16 inf"
+    );
 
     // Values very close to zero should flush
     let h = f32_to_f16_bits(1e-30);
-    assert_eq!(f16_bits_to_f32(h), 0.0, "1e-30 should underflow to f16 zero");
+    assert_eq!(
+        f16_bits_to_f32(h),
+        0.0,
+        "1e-30 should underflow to f16 zero"
+    );
 }
 
 #[test]
@@ -191,7 +204,8 @@ fn test_cpu_matvec_f16_identity() {
         assert!(
             (out[i] - x[i]).abs() < 1e-3,
             "identity matvec[{i}]: expected {}, got {}",
-            x[i], out[i]
+            x[i],
+            out[i]
         );
     }
 }
@@ -206,8 +220,16 @@ fn test_cpu_matvec_f16_known_output() {
     let x = vec![1.0f32, 0.0, 1.0];
 
     let out = cpu_matvec_f16(&weight_f16, &x, out_dim, in_dim);
-    assert!((out[0] - 4.0).abs() < 1e-3, "row 0: expected 4.0, got {}", out[0]);
-    assert!((out[1] - 10.0).abs() < 1e-3, "row 1: expected 10.0, got {}", out[1]);
+    assert!(
+        (out[0] - 4.0).abs() < 1e-3,
+        "row 0: expected 4.0, got {}",
+        out[0]
+    );
+    assert!(
+        (out[1] - 10.0).abs() < 1e-3,
+        "row 1: expected 10.0, got {}",
+        out[1]
+    );
 }
 
 #[test]
@@ -222,14 +244,19 @@ fn test_cpu_matvec_f16_residual() {
     let residual = vec![10.0f32, 20.0, 30.0, 40.0];
 
     let matvec_out = cpu_matvec_f16(&weight_f16, &x, dim, dim);
-    let with_residual: Vec<f32> = matvec_out.iter().zip(residual.iter()).map(|(m, r)| m + r).collect();
+    let with_residual: Vec<f32> = matvec_out
+        .iter()
+        .zip(residual.iter())
+        .map(|(m, r)| m + r)
+        .collect();
 
     let expected = [12.0f32, 24.0, 36.0, 48.0]; // 2*x + residual
     for i in 0..dim {
         assert!(
             (with_residual[i] - expected[i]).abs() < 1e-2,
             "residual[{i}]: expected {}, got {}",
-            expected[i], with_residual[i]
+            expected[i],
+            with_residual[i]
         );
     }
 }
@@ -393,7 +420,8 @@ mod gpu_tests {
             assert!(
                 (out[i] - x[i]).abs() < 1e-3,
                 "GPU identity matvec[{i}]: expected {}, got {}",
-                x[i], out[i]
+                x[i],
+                out[i]
             );
         }
     }
@@ -457,7 +485,8 @@ mod gpu_tests {
             assert!(
                 diff < tol,
                 "GPU vs CPU mismatch at [{i}]: gpu={}, cpu={}, diff={diff}",
-                gpu_result[i], cpu_out[i]
+                gpu_result[i],
+                cpu_out[i]
             );
         }
     }

@@ -71,16 +71,16 @@ fn f32_to_f16_bits(val: f32) -> u16 {
 // Encode a contiguous F32 slice into Q8Aligned (36-byte) blocks.
 // Layout: [f16 scale][2 byte pad][32 int8 quants].
 fn encode_q8_aligned(values: &[f32]) -> Vec<u8> {
-    assert!(values.len() % Q8_BLOCK_SIZE == 0, "in_dim must be multiple of 32");
+    assert!(
+        values.len() % Q8_BLOCK_SIZE == 0,
+        "in_dim must be multiple of 32"
+    );
     let block_count = values.len() / Q8_BLOCK_SIZE;
     let mut bytes = Vec::with_capacity(block_count * Q8_ALIGNED_BYTES);
     for block_idx in 0..block_count {
         let start = block_idx * Q8_BLOCK_SIZE;
         let block_values = &values[start..start + Q8_BLOCK_SIZE];
-        let amax = block_values
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0f32, f32::max);
+        let amax = block_values.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let scale = if amax == 0.0 { 0.0 } else { amax / 127.0 };
         let inv_scale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
         let scale_bits = f32_to_f16_bits(scale);
@@ -99,16 +99,16 @@ fn encode_q8_aligned(values: &[f32]) -> Vec<u8> {
 // Encode a contiguous F32 slice into Q8_1 (36-byte) blocks.
 // Layout: [f16 scale][f16 weighted sum][32 int8 quants].
 fn encode_q8_1(values: &[f32]) -> Vec<u8> {
-    assert!(values.len() % Q8_BLOCK_SIZE == 0, "in_dim must be multiple of 32");
+    assert!(
+        values.len() % Q8_BLOCK_SIZE == 0,
+        "in_dim must be multiple of 32"
+    );
     let block_count = values.len() / Q8_BLOCK_SIZE;
     let mut bytes = Vec::with_capacity(block_count * Q8_1_BYTES);
     for block_idx in 0..block_count {
         let start = block_idx * Q8_BLOCK_SIZE;
         let block_values = &values[start..start + Q8_BLOCK_SIZE];
-        let amax = block_values
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0f32, f32::max);
+        let amax = block_values.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let scale = if amax == 0.0 { 0.0 } else { amax / 127.0 };
         let inv_scale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
         let mut quants = [0i8; 32];
@@ -231,10 +231,8 @@ fn test_q8_aligned_q8_1_hw_matches_reference() {
     let weight_gpu = stream.clone_htod(&weight_i8).unwrap();
     let x_gpu = stream.clone_htod(&x_i8).unwrap();
 
-    let out_ref =
-        unsafe { run_kernel(&stream, &f_ref, &weight_gpu, &x_gpu, out_dim, in_dim) };
-    let out_hw =
-        unsafe { run_kernel(&stream, &f_hw, &weight_gpu, &x_gpu, out_dim, in_dim) };
+    let out_ref = unsafe { run_kernel(&stream, &f_ref, &weight_gpu, &x_gpu, out_dim, in_dim) };
+    let out_hw = unsafe { run_kernel(&stream, &f_hw, &weight_gpu, &x_gpu, out_dim, in_dim) };
 
     // Both kernels do the same math; their outputs must be bit-identical or
     // very close (NVCC scheduling can reorder FP additions in the reduction

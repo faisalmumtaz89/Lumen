@@ -17,12 +17,12 @@
 //!
 //! RoPE uses NEON vld2q/vst2q for paired rotation on aarch64.
 
-use crate::weight::cache::LayerView;
+use crate::compute::simd_kernels;
 use crate::compute::{ActivationBuffer, ComputeBackend, ComputeDtype, Logits};
 use crate::error::RuntimeError;
 use crate::kv::{KvCacheView, KvPrecision};
-use crate::compute::simd_kernels;
 use crate::thread_pool::ThreadPool;
+use crate::weight::cache::LayerView;
 use lumen_format::hyperparams::ModelHyperparams;
 use lumen_format::quantization::QuantScheme;
 use std::cell::UnsafeCell;
@@ -94,42 +94,64 @@ impl ComputeProfile {
         let num_layers = if num_layers > 0 { num_layers } else { 1 };
         let tokens = (self.calls as usize) / num_layers;
 
-        eprintln!("\n========== COMPUTE PROFILE ({} layer calls, {} tokens x {} layers) ==========",
-            self.calls, tokens, num_layers);
-        eprintln!("{:<30} {:>10} {:>10} {:>10} {:>7}",
-            "Operation", "Total(us)", "Per-call", "Per-tok", "Pct(%)");
+        eprintln!(
+            "\n========== COMPUTE PROFILE ({} layer calls, {} tokens x {} layers) ==========",
+            self.calls, tokens, num_layers
+        );
+        eprintln!(
+            "{:<30} {:>10} {:>10} {:>10} {:>7}",
+            "Operation", "Total(us)", "Per-call", "Per-tok", "Pct(%)"
+        );
         eprintln!("{:-<72}", "");
 
         let ops: &[(&str, Duration)] = &[
-            ("1. Attn RMSNorm",          self.attn_rmsnorm),
-            ("2. Quant normed(attn)",     self.quantize_normed_attn),
-            ("3. Q+K+V matmul",          self.qkv_matmul),
-            ("4. RoPE",                  self.rope),
-            ("5. KV cache write",        self.kv_cache_write),
-            ("6. Attention loop",        self.attention),
-            ("7. Wo matmul",             self.wo_matmul),
-            ("8. Residual add(attn)",    self.residual_attn),
-            ("9. FFN RMSNorm",           self.ffn_rmsnorm),
-            ("10. Quant normed(ffn)",    self.quantize_normed_ffn),
-            ("11. Gate+Up matmul",       self.gate_up_matmul),
-            ("12. SwiGLU",               self.swiglu),
-            ("13. Down matmul",          self.down_matmul),
-            ("14. Residual add(ffn)",    self.residual_ffn),
+            ("1. Attn RMSNorm", self.attn_rmsnorm),
+            ("2. Quant normed(attn)", self.quantize_normed_attn),
+            ("3. Q+K+V matmul", self.qkv_matmul),
+            ("4. RoPE", self.rope),
+            ("5. KV cache write", self.kv_cache_write),
+            ("6. Attention loop", self.attention),
+            ("7. Wo matmul", self.wo_matmul),
+            ("8. Residual add(attn)", self.residual_attn),
+            ("9. FFN RMSNorm", self.ffn_rmsnorm),
+            ("10. Quant normed(ffn)", self.quantize_normed_ffn),
+            ("11. Gate+Up matmul", self.gate_up_matmul),
+            ("12. SwiGLU", self.swiglu),
+            ("13. Down matmul", self.down_matmul),
+            ("14. Residual add(ffn)", self.residual_ffn),
         ];
 
         for (name, dur) in ops {
             let us = dur.as_secs_f64() * 1_000_000.0;
             let avg = us / calls;
             let per_tok = if tokens > 0 { us / tokens as f64 } else { 0.0 };
-            let pct = if total_us > 0.0 { us / total_us * 100.0 } else { 0.0 };
+            let pct = if total_us > 0.0 {
+                us / total_us * 100.0
+            } else {
+                0.0
+            };
             eprintln!("{name:<30} {us:>10.0} {avg:>10.1} {per_tok:>10.1} {pct:>6.1}%");
         }
 
         eprintln!("{:-<72}", "");
-        let per_tok_total = if tokens > 0 { total_us / tokens as f64 } else { 0.0 };
-        eprintln!("{:<30} {:>10.0} {:>10.1} {:>10.1} {:>6.1}%",
-            "TOTAL", total_us, total_us / calls, per_tok_total, 100.0);
-        eprintln!("\nPer-token compute: {:.1} us = {:.3} ms", per_tok_total, per_tok_total / 1000.0);
+        let per_tok_total = if tokens > 0 {
+            total_us / tokens as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "{:<30} {:>10.0} {:>10.1} {:>10.1} {:>6.1}%",
+            "TOTAL",
+            total_us,
+            total_us / calls,
+            per_tok_total,
+            100.0
+        );
+        eprintln!(
+            "\nPer-token compute: {:.1} us = {:.3} ms",
+            per_tok_total,
+            per_tok_total / 1000.0
+        );
         eprintln!("=======================================================================\n");
     }
 }
@@ -183,8 +205,8 @@ struct ComputeScratch {
     head_dim: usize,
     inter_dim: usize,
     eps: f32,
-    q_dim: usize,   // num_heads * head_dim
-    kv_dim: usize,   // num_kv_heads * head_dim
+    q_dim: usize,     // num_heads * head_dim
+    kv_dim: usize,    // num_kv_heads * head_dim
     gqa_ratio: usize, // num_heads / num_kv_heads
     vocab_size: usize,
     max_seq_len: usize,
@@ -247,10 +269,10 @@ fn apply_rope_precomputed(
                     let idx1 = idx0 + 1;
                     let v0 = *q.get_unchecked(idx0);
                     let v1 = *q.get_unchecked(idx1);
-                    *q.get_unchecked_mut(idx0) =
-                        v0 * *rope_cos.get_unchecked(cos_base + i) - v1 * *rope_sin.get_unchecked(sin_base + i);
-                    *q.get_unchecked_mut(idx1) =
-                        v0 * *rope_sin.get_unchecked(sin_base + i) + v1 * *rope_cos.get_unchecked(cos_base + i);
+                    *q.get_unchecked_mut(idx0) = v0 * *rope_cos.get_unchecked(cos_base + i)
+                        - v1 * *rope_sin.get_unchecked(sin_base + i);
+                    *q.get_unchecked_mut(idx1) = v0 * *rope_sin.get_unchecked(sin_base + i)
+                        + v1 * *rope_cos.get_unchecked(cos_base + i);
                 }
             }
             // K heads
@@ -279,10 +301,10 @@ fn apply_rope_precomputed(
                     let idx1 = idx0 + 1;
                     let v0 = *k.get_unchecked(idx0);
                     let v1 = *k.get_unchecked(idx1);
-                    *k.get_unchecked_mut(idx0) =
-                        v0 * *rope_cos.get_unchecked(cos_base + i) - v1 * *rope_sin.get_unchecked(sin_base + i);
-                    *k.get_unchecked_mut(idx1) =
-                        v0 * *rope_sin.get_unchecked(sin_base + i) + v1 * *rope_cos.get_unchecked(cos_base + i);
+                    *k.get_unchecked_mut(idx0) = v0 * *rope_cos.get_unchecked(cos_base + i)
+                        - v1 * *rope_sin.get_unchecked(sin_base + i);
+                    *k.get_unchecked_mut(idx1) = v0 * *rope_sin.get_unchecked(sin_base + i)
+                        + v1 * *rope_cos.get_unchecked(cos_base + i);
                 }
             }
         }
@@ -632,7 +654,11 @@ impl ComputeBackend for SimdF32Backend {
 
         // Pre-compute RoPE tables for all positions up to max_seq_len
         let half_dim = head_dim / 2;
-        let theta = hyperparams.rope_params.as_ref().map(|r| r.theta).unwrap_or(10000.0);
+        let theta = hyperparams
+            .rope_params
+            .as_ref()
+            .map(|r| r.theta)
+            .unwrap_or(10000.0);
         let mut rope_cos = vec![0.0f32; max_seq_len * half_dim];
         let mut rope_sin = vec![0.0f32; max_seq_len * half_dim];
         for pos in 0..max_seq_len {
@@ -724,19 +750,29 @@ impl ComputeBackend for SimdF32Backend {
     ) -> Result<(), RuntimeError> {
         // SAFETY: compute_layer is only called from the engine's single-threaded
         // generate() loop. No concurrent access to scratch or profile is possible.
-        let s = unsafe { &mut *self.scratch.get() }.as_mut().ok_or_else(|| {
-            RuntimeError::Compute("scratch not initialized: call init() first".into())
-        })?;
+        let s = unsafe { &mut *self.scratch.get() }
+            .as_mut()
+            .ok_or_else(|| {
+                RuntimeError::Compute("scratch not initialized: call init() first".into())
+            })?;
         let profile = self.profile_enabled;
         let prof = unsafe { &mut *self.profile.get() };
 
         // Profile helper macros: zero-cost when profile == false (no Instant::now() calls).
         macro_rules! tick {
-            () => { if profile { Some(Instant::now()) } else { None } };
+            () => {
+                if profile {
+                    Some(Instant::now())
+                } else {
+                    None
+                }
+            };
         }
         macro_rules! tock {
             ($start:expr, $field:ident) => {
-                if let Some(t) = $start { prof.$field += t.elapsed(); }
+                if let Some(t) = $start {
+                    prof.$field += t.elapsed();
+                }
             };
         }
 
@@ -797,8 +833,12 @@ impl ComputeBackend for SimdF32Backend {
                 // 1. Attention RMSNorm
                 let t0 = tick!();
                 match st.attn_norm.quant {
-                    QuantScheme::Q8_0 => simd_kernels::rmsnorm_q8_0_simd(&mut s.normed, x_f32, attn_norm_bytes, eps),
-                    _ => simd_kernels::rmsnorm_bytes_simd(&mut s.normed, x_f32, attn_norm_bytes, eps),
+                    QuantScheme::Q8_0 => {
+                        simd_kernels::rmsnorm_q8_0_simd(&mut s.normed, x_f32, attn_norm_bytes, eps)
+                    }
+                    _ => {
+                        simd_kernels::rmsnorm_bytes_simd(&mut s.normed, x_f32, attn_norm_bytes, eps)
+                    }
                 }
                 tock!(t0, attn_rmsnorm);
 
@@ -823,18 +863,25 @@ impl ComputeBackend for SimdF32Backend {
                 if self.pool.should_parallelize(q_dim) {
                     self.pool.parallel_for(q_dim, |start, end| {
                         let chunk_len = end - start;
-                        if chunk_len == 0 { return; }
+                        if chunk_len == 0 {
+                            return;
+                        }
 
                         // Q projection (always: start..end within q_dim)
                         let q_slice = unsafe {
                             std::slice::from_raw_parts_mut(
-                                (q_addr as *mut f32).add(start), chunk_len,
+                                (q_addr as *mut f32).add(start),
+                                chunk_len,
                             )
                         };
                         let wq_offset = start * row_bytes_hidden;
                         let wq_sub = &wq_bytes[wq_offset..wq_offset + chunk_len * row_bytes_hidden];
                         simd_kernels::matmul_q8_0_preq(
-                            q_slice, wq_sub, normed_q8_ref, chunk_len, hidden_dim,
+                            q_slice,
+                            wq_sub,
+                            normed_q8_ref,
+                            chunk_len,
+                            hidden_dim,
                         );
 
                         // K projection (only if this chunk overlaps kv_dim)
@@ -843,14 +890,19 @@ impl ComputeBackend for SimdF32Backend {
                             let k_chunk = k_end - start;
                             let k_slice = unsafe {
                                 std::slice::from_raw_parts_mut(
-                                    (k_addr as *mut f32).add(start), k_chunk,
+                                    (k_addr as *mut f32).add(start),
+                                    k_chunk,
                                 )
                             };
                             let wk_offset = start * row_bytes_hidden;
                             let wk_sub =
                                 &wk_bytes[wk_offset..wk_offset + k_chunk * row_bytes_hidden];
                             simd_kernels::matmul_q8_0_preq(
-                                k_slice, wk_sub, normed_q8_ref, k_chunk, hidden_dim,
+                                k_slice,
+                                wk_sub,
+                                normed_q8_ref,
+                                k_chunk,
+                                hidden_dim,
                             );
                         }
 
@@ -860,27 +912,44 @@ impl ComputeBackend for SimdF32Backend {
                             let v_chunk = v_end - start;
                             let v_slice = unsafe {
                                 std::slice::from_raw_parts_mut(
-                                    (v_addr as *mut f32).add(start), v_chunk,
+                                    (v_addr as *mut f32).add(start),
+                                    v_chunk,
                                 )
                             };
                             let wv_offset = start * row_bytes_hidden;
                             let wv_sub =
                                 &wv_bytes[wv_offset..wv_offset + v_chunk * row_bytes_hidden];
                             simd_kernels::matmul_q8_0_preq(
-                                v_slice, wv_sub, normed_q8_ref, v_chunk, hidden_dim,
+                                v_slice,
+                                wv_sub,
+                                normed_q8_ref,
+                                v_chunk,
+                                hidden_dim,
                             );
                         }
                     });
                 } else {
                     // Single-threaded fallback for small dims
                     simd_kernels::matmul_q8_0_preq(
-                        &mut s.q, wq_bytes, normed_q8_ref, q_dim, hidden_dim,
+                        &mut s.q,
+                        wq_bytes,
+                        normed_q8_ref,
+                        q_dim,
+                        hidden_dim,
                     );
                     simd_kernels::matmul_q8_0_preq(
-                        &mut s.k, wk_bytes, normed_q8_ref, kv_dim, hidden_dim,
+                        &mut s.k,
+                        wk_bytes,
+                        normed_q8_ref,
+                        kv_dim,
+                        hidden_dim,
                     );
                     simd_kernels::matmul_q8_0_preq(
-                        &mut s.v, wv_bytes, normed_q8_ref, kv_dim, hidden_dim,
+                        &mut s.v,
+                        wv_bytes,
+                        normed_q8_ref,
+                        kv_dim,
+                        hidden_dim,
                     );
                 }
                 tock!(t0, qkv_matmul);
@@ -889,8 +958,12 @@ impl ComputeBackend for SimdF32Backend {
                 // may not be needed)
                 let t0 = tick!();
                 match st.attn_norm.quant {
-                    QuantScheme::Q8_0 => simd_kernels::rmsnorm_q8_0_simd(&mut s.normed, x_f32, attn_norm_bytes, eps),
-                    _ => simd_kernels::rmsnorm_bytes_simd(&mut s.normed, x_f32, attn_norm_bytes, eps),
+                    QuantScheme::Q8_0 => {
+                        simd_kernels::rmsnorm_q8_0_simd(&mut s.normed, x_f32, attn_norm_bytes, eps)
+                    }
+                    _ => {
+                        simd_kernels::rmsnorm_bytes_simd(&mut s.normed, x_f32, attn_norm_bytes, eps)
+                    }
                 }
                 tock!(t0, attn_rmsnorm);
 
@@ -902,19 +975,46 @@ impl ComputeBackend for SimdF32Backend {
                 tock!(t0, quantize_normed_attn);
                 let t0 = tick!();
                 if st.wq.quant == QuantScheme::Q8_0 {
-                    simd_kernels::matmul_q8_0_preq_parallel(&mut s.q, wq_bytes, &s.normed_q8, q_dim, hidden_dim, &self.pool);
+                    simd_kernels::matmul_q8_0_preq_parallel(
+                        &mut s.q,
+                        wq_bytes,
+                        &s.normed_q8,
+                        q_dim,
+                        hidden_dim,
+                        &self.pool,
+                    );
                 } else {
-                    simd_kernels::matmul_bytes_simd_parallel(&mut s.q, wq_bytes, &s.normed, q_dim, hidden_dim, &self.pool);
+                    simd_kernels::matmul_bytes_simd_parallel(
+                        &mut s.q, wq_bytes, &s.normed, q_dim, hidden_dim, &self.pool,
+                    );
                 }
                 if st.wk.quant == QuantScheme::Q8_0 {
-                    simd_kernels::matmul_q8_0_preq_parallel(&mut s.k, wk_bytes, &s.normed_q8, kv_dim, hidden_dim, &self.pool);
+                    simd_kernels::matmul_q8_0_preq_parallel(
+                        &mut s.k,
+                        wk_bytes,
+                        &s.normed_q8,
+                        kv_dim,
+                        hidden_dim,
+                        &self.pool,
+                    );
                 } else {
-                    simd_kernels::matmul_bytes_simd_parallel(&mut s.k, wk_bytes, &s.normed, kv_dim, hidden_dim, &self.pool);
+                    simd_kernels::matmul_bytes_simd_parallel(
+                        &mut s.k, wk_bytes, &s.normed, kv_dim, hidden_dim, &self.pool,
+                    );
                 }
                 if st.wv.quant == QuantScheme::Q8_0 {
-                    simd_kernels::matmul_q8_0_preq_parallel(&mut s.v, wv_bytes, &s.normed_q8, kv_dim, hidden_dim, &self.pool);
+                    simd_kernels::matmul_q8_0_preq_parallel(
+                        &mut s.v,
+                        wv_bytes,
+                        &s.normed_q8,
+                        kv_dim,
+                        hidden_dim,
+                        &self.pool,
+                    );
                 } else {
-                    simd_kernels::matmul_bytes_simd_parallel(&mut s.v, wv_bytes, &s.normed, kv_dim, hidden_dim, &self.pool);
+                    simd_kernels::matmul_bytes_simd_parallel(
+                        &mut s.v, wv_bytes, &s.normed, kv_dim, hidden_dim, &self.pool,
+                    );
                 }
                 tock!(t0, qkv_matmul);
             }
@@ -924,23 +1024,37 @@ impl ComputeBackend for SimdF32Backend {
             // Non-aarch64: separate RMSNorm (no fused path available)
             let t0 = tick!();
             match st.attn_norm.quant {
-                QuantScheme::Q8_0 => simd_kernels::rmsnorm_q8_0_simd(&mut s.normed, x_f32, attn_norm_bytes, eps),
+                QuantScheme::Q8_0 => {
+                    simd_kernels::rmsnorm_q8_0_simd(&mut s.normed, x_f32, attn_norm_bytes, eps)
+                }
                 _ => simd_kernels::rmsnorm_bytes_simd(&mut s.normed, x_f32, attn_norm_bytes, eps),
             }
             tock!(t0, attn_rmsnorm);
 
             let t0 = tick!();
             match st.wq.quant {
-                QuantScheme::Q8_0 => simd_kernels::matmul_q8_0_simd_parallel(&mut s.q, wq_bytes, &s.normed, q_dim, hidden_dim, &self.pool),
-                _ => simd_kernels::matmul_bytes_simd_parallel(&mut s.q, wq_bytes, &s.normed, q_dim, hidden_dim, &self.pool),
+                QuantScheme::Q8_0 => simd_kernels::matmul_q8_0_simd_parallel(
+                    &mut s.q, wq_bytes, &s.normed, q_dim, hidden_dim, &self.pool,
+                ),
+                _ => simd_kernels::matmul_bytes_simd_parallel(
+                    &mut s.q, wq_bytes, &s.normed, q_dim, hidden_dim, &self.pool,
+                ),
             }
             match st.wk.quant {
-                QuantScheme::Q8_0 => simd_kernels::matmul_q8_0_simd_parallel(&mut s.k, wk_bytes, &s.normed, kv_dim, hidden_dim, &self.pool),
-                _ => simd_kernels::matmul_bytes_simd_parallel(&mut s.k, wk_bytes, &s.normed, kv_dim, hidden_dim, &self.pool),
+                QuantScheme::Q8_0 => simd_kernels::matmul_q8_0_simd_parallel(
+                    &mut s.k, wk_bytes, &s.normed, kv_dim, hidden_dim, &self.pool,
+                ),
+                _ => simd_kernels::matmul_bytes_simd_parallel(
+                    &mut s.k, wk_bytes, &s.normed, kv_dim, hidden_dim, &self.pool,
+                ),
             }
             match st.wv.quant {
-                QuantScheme::Q8_0 => simd_kernels::matmul_q8_0_simd_parallel(&mut s.v, wv_bytes, &s.normed, kv_dim, hidden_dim, &self.pool),
-                _ => simd_kernels::matmul_bytes_simd_parallel(&mut s.v, wv_bytes, &s.normed, kv_dim, hidden_dim, &self.pool),
+                QuantScheme::Q8_0 => simd_kernels::matmul_q8_0_simd_parallel(
+                    &mut s.v, wv_bytes, &s.normed, kv_dim, hidden_dim, &self.pool,
+                ),
+                _ => simd_kernels::matmul_bytes_simd_parallel(
+                    &mut s.v, wv_bytes, &s.normed, kv_dim, hidden_dim, &self.pool,
+                ),
             }
             tock!(t0, qkv_matmul);
         }
@@ -948,9 +1062,15 @@ impl ComputeBackend for SimdF32Backend {
         // 3. Apply RoPE (pre-computed tables, NEON vectorized on aarch64)
         let t0 = tick!();
         apply_rope_precomputed(
-            &mut s.q, &mut s.k,
-            num_heads, num_kv_heads, head_dim, seq_pos,
-            &s.rope_cos, &s.rope_sin, s.half_dim,
+            &mut s.q,
+            &mut s.k,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_pos,
+            &s.rope_cos,
+            &s.rope_sin,
+            s.half_dim,
         );
         // 3b. Pre-scale Q by attention scale factor (1/sqrt(head_dim), practice 4.3).
         vscale_inplace(&mut s.q, s.attn_scale);
@@ -958,9 +1078,8 @@ impl ComputeBackend for SimdF32Backend {
 
         // 4. Append k,v to KV cache
         let t0 = tick!();
-        let kv = kv.ok_or_else(|| {
-            RuntimeError::Compute("KV cache view required for attention".into())
-        })?;
+        let kv =
+            kv.ok_or_else(|| RuntimeError::Compute("KV cache view required for attention".into()))?;
         kv.append_keys(&s.k);
         kv.append_values(&s.v);
         let new_seq_len = (kv.seq_len + 1).min(kv.max_seq_len);
@@ -982,7 +1101,10 @@ impl ComputeBackend for SimdF32Backend {
         let head_dim_bytes = head_dim * bytes_per_elem;
         let kv_max_seq_len = kv.max_seq_len;
 
-        if num_heads >= self.pool.total_threads() && self.pool.total_threads() > 1 && new_seq_len >= 64 {
+        if num_heads >= self.pool.total_threads()
+            && self.pool.total_threads() > 1
+            && new_seq_len >= 64
+        {
             // Parallel path: each thread processes a range of heads.
             // Uses parallel_for_heads which skips the row-count threshold check
             // (num_heads=16 is below PARALLEL_THRESHOLD=256, but each head does
@@ -1001,89 +1123,95 @@ impl ComputeBackend for SimdF32Backend {
             let kv_values_ptr = kv.values.as_ptr() as usize;
             let kv_values_len = kv.values.len();
 
-            self.pool.parallel_for_heads(num_heads, |start_head, end_head| {
-                for h in start_head..end_head {
-                    let kv_h = h / gqa_ratio;
-                    // Head-first layout: per-head base byte offset
-                    let kv_head_byte_base = kv_h * kv_max_seq_len * head_dim_bytes;
+            self.pool
+                .parallel_for_heads(num_heads, |start_head, end_head| {
+                    for h in start_head..end_head {
+                        let kv_h = h / gqa_ratio;
+                        // Head-first layout: per-head base byte offset
+                        let kv_head_byte_base = kv_h * kv_max_seq_len * head_dim_bytes;
 
-                    // SAFETY: q_ptr + h*head_dim is within the q allocation (size = num_heads * head_dim).
-                    // Each head reads a disjoint slice.
-                    let q_head = unsafe {
-                        std::slice::from_raw_parts(
-                            (q_ptr as *const f32).add(h * head_dim),
-                            head_dim,
-                        )
-                    };
-
-                    // SAFETY: scores_ptr + h*max_seq_len is within the scores allocation
-                    // (size = num_heads * max_seq_len). Each head writes a disjoint region.
-                    let head_scores = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            (scores_ptr as *mut f32).add(h * max_seq_len),
-                            new_seq_len,
-                        )
-                    };
-
-                    // Compute attention scores using SIMD dot product.
-                    // Q is already scaled by 1/sqrt(head_dim), so scores = Q . K directly.
-                    // Head-first layout: K[kv_h] is contiguous at base + t*head_dim_bytes.
-                    for t in 0..new_seq_len {
-                        let k_byte_start = kv_head_byte_base + t * head_dim_bytes;
-                        let dot = if kv_is_f16 {
-                            debug_assert!(k_byte_start + head_dim * 2 <= kv_keys_len);
-                            unsafe {
-                                let src = (kv_keys_ptr as *const u8).add(k_byte_start);
-                                simd_kernels::dot_product_f16_f32_simd(q_head, src, head_dim)
-                            }
-                        } else {
-                            debug_assert!(k_byte_start + head_dim * 4 <= kv_keys_len);
-                            let k_slice = unsafe {
-                                std::slice::from_raw_parts(
-                                    (kv_keys_ptr as *const u8).add(k_byte_start) as *const f32,
-                                    head_dim,
-                                )
-                            };
-                            simd_kernels::dot_product_simd(q_head, k_slice)
+                        // SAFETY: q_ptr + h*head_dim is within the q allocation (size = num_heads * head_dim).
+                        // Each head reads a disjoint slice.
+                        let q_head = unsafe {
+                            std::slice::from_raw_parts(
+                                (q_ptr as *const f32).add(h * head_dim),
+                                head_dim,
+                            )
                         };
-                        unsafe { *head_scores.get_unchecked_mut(t) = dot; }
-                    }
 
-                    // Softmax over scores (SIMD, best practice 4.1)
-                    simd_kernels::softmax_inplace_simd(head_scores);
+                        // SAFETY: scores_ptr + h*max_seq_len is within the scores allocation
+                        // (size = num_heads * max_seq_len). Each head writes a disjoint region.
+                        let head_scores = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (scores_ptr as *mut f32).add(h * max_seq_len),
+                                new_seq_len,
+                            )
+                        };
 
-                    // Weighted sum of values (SIMD FMA: out += score * v_slice)
-                    // SAFETY: attn_out_ptr + h*head_dim is within the attn_out allocation.
-                    let out_slice = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            (attn_out_ptr as *mut f32).add(h * head_dim),
-                            head_dim,
-                        )
-                    };
-                    out_slice.fill(0.0);
-
-                    for t in 0..new_seq_len {
-                        let score = unsafe { *head_scores.get_unchecked(t) };
-                        let v_byte_start = kv_head_byte_base + t * head_dim_bytes;
-                        if kv_is_f16 {
-                            debug_assert!(v_byte_start + head_dim * 2 <= kv_values_len);
-                            unsafe {
-                                let src = (kv_values_ptr as *const u8).add(v_byte_start);
-                                simd_kernels::vscale_add_f16_f32_inplace(out_slice, src, score, head_dim);
-                            }
-                        } else {
-                            debug_assert!(v_byte_start + head_dim * 4 <= kv_values_len);
-                            let v_slice = unsafe {
-                                std::slice::from_raw_parts(
-                                    (kv_values_ptr as *const u8).add(v_byte_start) as *const f32,
-                                    head_dim,
-                                )
+                        // Compute attention scores using SIMD dot product.
+                        // Q is already scaled by 1/sqrt(head_dim), so scores = Q . K directly.
+                        // Head-first layout: K[kv_h] is contiguous at base + t*head_dim_bytes.
+                        for t in 0..new_seq_len {
+                            let k_byte_start = kv_head_byte_base + t * head_dim_bytes;
+                            let dot = if kv_is_f16 {
+                                debug_assert!(k_byte_start + head_dim * 2 <= kv_keys_len);
+                                unsafe {
+                                    let src = (kv_keys_ptr as *const u8).add(k_byte_start);
+                                    simd_kernels::dot_product_f16_f32_simd(q_head, src, head_dim)
+                                }
+                            } else {
+                                debug_assert!(k_byte_start + head_dim * 4 <= kv_keys_len);
+                                let k_slice = unsafe {
+                                    std::slice::from_raw_parts(
+                                        (kv_keys_ptr as *const u8).add(k_byte_start) as *const f32,
+                                        head_dim,
+                                    )
+                                };
+                                simd_kernels::dot_product_simd(q_head, k_slice)
                             };
-                            vscale_add_inplace(out_slice, v_slice, score);
+                            unsafe {
+                                *head_scores.get_unchecked_mut(t) = dot;
+                            }
+                        }
+
+                        // Softmax over scores (SIMD, best practice 4.1)
+                        simd_kernels::softmax_inplace_simd(head_scores);
+
+                        // Weighted sum of values (SIMD FMA: out += score * v_slice)
+                        // SAFETY: attn_out_ptr + h*head_dim is within the attn_out allocation.
+                        let out_slice = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (attn_out_ptr as *mut f32).add(h * head_dim),
+                                head_dim,
+                            )
+                        };
+                        out_slice.fill(0.0);
+
+                        for t in 0..new_seq_len {
+                            let score = unsafe { *head_scores.get_unchecked(t) };
+                            let v_byte_start = kv_head_byte_base + t * head_dim_bytes;
+                            if kv_is_f16 {
+                                debug_assert!(v_byte_start + head_dim * 2 <= kv_values_len);
+                                unsafe {
+                                    let src = (kv_values_ptr as *const u8).add(v_byte_start);
+                                    simd_kernels::vscale_add_f16_f32_inplace(
+                                        out_slice, src, score, head_dim,
+                                    );
+                                }
+                            } else {
+                                debug_assert!(v_byte_start + head_dim * 4 <= kv_values_len);
+                                let v_slice = unsafe {
+                                    std::slice::from_raw_parts(
+                                        (kv_values_ptr as *const u8).add(v_byte_start)
+                                            as *const f32,
+                                        head_dim,
+                                    )
+                                };
+                                vscale_add_inplace(out_slice, v_slice, score);
+                            }
                         }
                     }
-                }
-            });
+                });
         } else {
             // Serial fallback for small head counts or when parallelism isn't beneficial.
             for h in 0..num_heads {
@@ -1117,7 +1245,9 @@ impl ComputeBackend for SimdF32Backend {
                         };
                         simd_kernels::dot_product_simd(q_head, k_slice)
                     };
-                    unsafe { *s.scores.get_unchecked_mut(scores_start + t) = dot; }
+                    unsafe {
+                        *s.scores.get_unchecked_mut(scores_start + t) = dot;
+                    }
                 }
 
                 // Softmax over scores (SIMD, best practice 4.1)
@@ -1137,7 +1267,9 @@ impl ComputeBackend for SimdF32Backend {
                         let v_byte_start = v_start * 2;
                         unsafe {
                             let src = kv.values.as_ptr().add(v_byte_start);
-                            simd_kernels::vscale_add_f16_f32_inplace(out_slice, src, score, head_dim);
+                            simd_kernels::vscale_add_f16_f32_inplace(
+                                out_slice, src, score, head_dim,
+                            );
                         }
                     } else {
                         #[cfg(target_endian = "little")]
@@ -1184,21 +1316,23 @@ impl ComputeBackend for SimdF32Backend {
 
                     self.pool.parallel_for(hidden_dim, |start, end| {
                         let chunk_len = end - start;
-                        if chunk_len == 0 { return; }
+                        if chunk_len == 0 {
+                            return;
+                        }
 
                         // First thread claims the quantization work (CAS 0 -> 1).
-                        if quant_state.compare_exchange(
-                            0, 1, AtomicOrdering::AcqRel, AtomicOrdering::Acquire,
-                        ).is_ok() {
+                        if quant_state
+                            .compare_exchange(0, 1, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+                            .is_ok()
+                        {
                             // SAFETY: attn_out_q8 is not read until after the Release
                             // store below, and only one thread enters this block.
                             unsafe {
                                 let q8_buf = std::slice::from_raw_parts_mut(
-                                    attn_out_q8_ptr as *mut u8, attn_out_q8_size,
+                                    attn_out_q8_ptr as *mut u8,
+                                    attn_out_q8_size,
                                 );
-                                simd_kernels::quantize_f32_to_q8_0_pub(
-                                    attn_out_ref, q8_buf, q_dim,
-                                );
+                                simd_kernels::quantize_f32_to_q8_0_pub(attn_out_ref, q8_buf, q_dim);
                             }
                             // Signal done (1 -> 2). Release ensures all q8 writes
                             // are visible to threads that Acquire-load state == 2.
@@ -1213,7 +1347,8 @@ impl ComputeBackend for SimdF32Backend {
                         // Now attn_out_q8 is fully written. All threads proceed.
                         let attn_out_q8_ref = unsafe {
                             std::slice::from_raw_parts(
-                                attn_out_q8_ptr as *const u8, attn_out_q8_size,
+                                attn_out_q8_ptr as *const u8,
+                                attn_out_q8_size,
                             )
                         };
 
@@ -1221,13 +1356,18 @@ impl ComputeBackend for SimdF32Backend {
                         // wo_bytes, attn_out_q8_ref, x_f32 are read-only shared references.
                         let proj_slice = unsafe {
                             std::slice::from_raw_parts_mut(
-                                (attn_proj_addr as *mut f32).add(start), chunk_len,
+                                (attn_proj_addr as *mut f32).add(start),
+                                chunk_len,
                             )
                         };
                         let wo_offset = start * row_bytes_q;
                         let wo_sub = &wo_bytes[wo_offset..wo_offset + chunk_len * row_bytes_q];
                         simd_kernels::matmul_q8_0_preq(
-                            proj_slice, wo_sub, attn_out_q8_ref, chunk_len, q_dim,
+                            proj_slice,
+                            wo_sub,
+                            attn_out_q8_ref,
+                            chunk_len,
+                            q_dim,
                         );
                         // Fused residual: attn_proj[chunk] += x_f32[chunk]
                         let x_chunk = &x_f32[start..end];
@@ -1237,7 +1377,11 @@ impl ComputeBackend for SimdF32Backend {
                     // Single-threaded fallback: quantize then matmul sequentially.
                     simd_kernels::quantize_f32_to_q8_0_pub(&s.attn_out, &mut s.attn_out_q8, q_dim);
                     simd_kernels::matmul_q8_0_preq(
-                        &mut s.attn_proj, wo_bytes, &s.attn_out_q8, hidden_dim, q_dim,
+                        &mut s.attn_proj,
+                        wo_bytes,
+                        &s.attn_out_q8,
+                        hidden_dim,
+                        q_dim,
                     );
                     vadd_inplace(&mut s.attn_proj, x_f32);
                 }
@@ -1248,24 +1392,36 @@ impl ComputeBackend for SimdF32Backend {
                 if self.pool.should_parallelize(hidden_dim) {
                     self.pool.parallel_for(hidden_dim, |start, end| {
                         let chunk_len = end - start;
-                        if chunk_len == 0 { return; }
+                        if chunk_len == 0 {
+                            return;
+                        }
 
                         let proj_slice = unsafe {
                             std::slice::from_raw_parts_mut(
-                                (attn_proj_addr as *mut f32).add(start), chunk_len,
+                                (attn_proj_addr as *mut f32).add(start),
+                                chunk_len,
                             )
                         };
                         let w_byte_offset = start * q_dim * 4;
-                        let wo_sub = &wo_bytes[w_byte_offset..w_byte_offset + chunk_len * q_dim * 4];
+                        let wo_sub =
+                            &wo_bytes[w_byte_offset..w_byte_offset + chunk_len * q_dim * 4];
                         simd_kernels::matmul_bytes_simd_2row(
-                            proj_slice, wo_sub, attn_out_ref, chunk_len, q_dim,
+                            proj_slice,
+                            wo_sub,
+                            attn_out_ref,
+                            chunk_len,
+                            q_dim,
                         );
                         let x_chunk = &x_f32[start..end];
                         vadd_inplace(proj_slice, x_chunk);
                     });
                 } else {
                     simd_kernels::matmul_bytes_simd_2row(
-                        &mut s.attn_proj, wo_bytes, attn_out_ref, hidden_dim, q_dim,
+                        &mut s.attn_proj,
+                        wo_bytes,
+                        attn_out_ref,
+                        hidden_dim,
+                        q_dim,
                     );
                     vadd_inplace(&mut s.attn_proj, x_f32);
                 }
@@ -1274,8 +1430,22 @@ impl ComputeBackend for SimdF32Backend {
         #[cfg(not(target_arch = "aarch64"))]
         {
             match st.wo.quant {
-                QuantScheme::Q8_0 => simd_kernels::matmul_q8_0_simd_parallel(&mut s.attn_proj, wo_bytes, &s.attn_out, hidden_dim, q_dim, &self.pool),
-                _ => simd_kernels::matmul_bytes_simd_parallel(&mut s.attn_proj, wo_bytes, &s.attn_out, hidden_dim, q_dim, &self.pool),
+                QuantScheme::Q8_0 => simd_kernels::matmul_q8_0_simd_parallel(
+                    &mut s.attn_proj,
+                    wo_bytes,
+                    &s.attn_out,
+                    hidden_dim,
+                    q_dim,
+                    &self.pool,
+                ),
+                _ => simd_kernels::matmul_bytes_simd_parallel(
+                    &mut s.attn_proj,
+                    wo_bytes,
+                    &s.attn_out,
+                    hidden_dim,
+                    q_dim,
+                    &self.pool,
+                ),
             }
             vadd_inplace(&mut s.attn_proj, x_f32);
         }
@@ -1324,8 +1494,18 @@ impl ComputeBackend for SimdF32Backend {
             {
                 let t0 = tick!();
                 match st.ffn_norm.quant {
-                    QuantScheme::Q8_0 => simd_kernels::rmsnorm_q8_0_simd(&mut s.normed, &s.attn_proj, ffn_norm_bytes, eps),
-                    _ => simd_kernels::rmsnorm_bytes_simd(&mut s.normed, &s.attn_proj, ffn_norm_bytes, eps),
+                    QuantScheme::Q8_0 => simd_kernels::rmsnorm_q8_0_simd(
+                        &mut s.normed,
+                        &s.attn_proj,
+                        ffn_norm_bytes,
+                        eps,
+                    ),
+                    _ => simd_kernels::rmsnorm_bytes_simd(
+                        &mut s.normed,
+                        &s.attn_proj,
+                        ffn_norm_bytes,
+                        eps,
+                    ),
                 }
                 tock!(t0, ffn_rmsnorm);
                 if is_q8 {
@@ -1338,8 +1518,18 @@ impl ComputeBackend for SimdF32Backend {
             {
                 let t0 = tick!();
                 match st.ffn_norm.quant {
-                    QuantScheme::Q8_0 => simd_kernels::rmsnorm_q8_0_simd(&mut s.normed, &s.attn_proj, ffn_norm_bytes, eps),
-                    _ => simd_kernels::rmsnorm_bytes_simd(&mut s.normed, &s.attn_proj, ffn_norm_bytes, eps),
+                    QuantScheme::Q8_0 => simd_kernels::rmsnorm_q8_0_simd(
+                        &mut s.normed,
+                        &s.attn_proj,
+                        ffn_norm_bytes,
+                        eps,
+                    ),
+                    _ => simd_kernels::rmsnorm_bytes_simd(
+                        &mut s.normed,
+                        &s.attn_proj,
+                        ffn_norm_bytes,
+                        eps,
+                    ),
                 }
                 tock!(t0, ffn_rmsnorm);
             }
@@ -1365,7 +1555,10 @@ impl ComputeBackend for SimdF32Backend {
                     // SAFETY: Each thread writes to a disjoint range of gateand up[].
                     // normed, normed_q8, w_gate_bytes, w_up_bytes are read-only shared references.
                     let gate_slice = unsafe {
-                        std::slice::from_raw_parts_mut((gate_addr as *mut f32).add(start), chunk_len)
+                        std::slice::from_raw_parts_mut(
+                            (gate_addr as *mut f32).add(start),
+                            chunk_len,
+                        )
                     };
                     let up_slice = unsafe {
                         std::slice::from_raw_parts_mut((up_addr as *mut f32).add(start), chunk_len)
@@ -1375,25 +1568,49 @@ impl ComputeBackend for SimdF32Backend {
                         let num_blocks = hidden_dim.div_ceil(32); // Q8_0_GROUP_SIZE = 32
                         let row_bytes = num_blocks * 34; // Q8_0_BLOCK_SIZE = 34
                         let w_byte_offset = start * row_bytes;
-                        let w_gate_sub = &w_gate_bytes[w_byte_offset..w_byte_offset + chunk_len * row_bytes];
-                        let w_up_sub = &w_up_bytes[w_byte_offset..w_byte_offset + chunk_len * row_bytes];
+                        let w_gate_sub =
+                            &w_gate_bytes[w_byte_offset..w_byte_offset + chunk_len * row_bytes];
+                        let w_up_sub =
+                            &w_up_bytes[w_byte_offset..w_byte_offset + chunk_len * row_bytes];
                         // Use pre-quantized path: no allocation, no re-quantization per chunk.
                         #[cfg(target_arch = "aarch64")]
                         {
-                            simd_kernels::matmul_q8_0_preq(gate_slice, w_gate_sub, normed_q8_ref, chunk_len, hidden_dim);
-                            simd_kernels::matmul_q8_0_preq(up_slice, w_up_sub, normed_q8_ref, chunk_len, hidden_dim);
+                            simd_kernels::matmul_q8_0_preq(
+                                gate_slice,
+                                w_gate_sub,
+                                normed_q8_ref,
+                                chunk_len,
+                                hidden_dim,
+                            );
+                            simd_kernels::matmul_q8_0_preq(
+                                up_slice,
+                                w_up_sub,
+                                normed_q8_ref,
+                                chunk_len,
+                                hidden_dim,
+                            );
                         }
                         #[cfg(not(target_arch = "aarch64"))]
                         {
-                            simd_kernels::matmul_q8_0_simd_2row(gate_slice, w_gate_sub, normed_ref, chunk_len, hidden_dim);
-                            simd_kernels::matmul_q8_0_simd_2row(up_slice, w_up_sub, normed_ref, chunk_len, hidden_dim);
+                            simd_kernels::matmul_q8_0_simd_2row(
+                                gate_slice, w_gate_sub, normed_ref, chunk_len, hidden_dim,
+                            );
+                            simd_kernels::matmul_q8_0_simd_2row(
+                                up_slice, w_up_sub, normed_ref, chunk_len, hidden_dim,
+                            );
                         }
                     } else {
                         let w_byte_offset = start * hidden_dim * 4;
-                        let w_gate_sub = &w_gate_bytes[w_byte_offset..w_byte_offset + chunk_len * hidden_dim * 4];
-                        let w_up_sub = &w_up_bytes[w_byte_offset..w_byte_offset + chunk_len * hidden_dim * 4];
-                        simd_kernels::matmul_bytes_simd_2row(gate_slice, w_gate_sub, normed_ref, chunk_len, hidden_dim);
-                        simd_kernels::matmul_bytes_simd_2row(up_slice, w_up_sub, normed_ref, chunk_len, hidden_dim);
+                        let w_gate_sub = &w_gate_bytes
+                            [w_byte_offset..w_byte_offset + chunk_len * hidden_dim * 4];
+                        let w_up_sub =
+                            &w_up_bytes[w_byte_offset..w_byte_offset + chunk_len * hidden_dim * 4];
+                        simd_kernels::matmul_bytes_simd_2row(
+                            gate_slice, w_gate_sub, normed_ref, chunk_len, hidden_dim,
+                        );
+                        simd_kernels::matmul_bytes_simd_2row(
+                            up_slice, w_up_sub, normed_ref, chunk_len, hidden_dim,
+                        );
                     }
 
                     // Fused SwiGLU: apply silu(gate) * up per-chunk, eliminating
@@ -1421,17 +1638,45 @@ impl ComputeBackend for SimdF32Backend {
                 if is_q8 {
                     #[cfg(target_arch = "aarch64")]
                     {
-                        simd_kernels::matmul_q8_0_preq(&mut s.gate, w_gate_bytes, normed_q8_ref, inter_dim, hidden_dim);
-                        simd_kernels::matmul_q8_0_preq(&mut s.up, w_up_bytes, normed_q8_ref, inter_dim, hidden_dim);
+                        simd_kernels::matmul_q8_0_preq(
+                            &mut s.gate,
+                            w_gate_bytes,
+                            normed_q8_ref,
+                            inter_dim,
+                            hidden_dim,
+                        );
+                        simd_kernels::matmul_q8_0_preq(
+                            &mut s.up,
+                            w_up_bytes,
+                            normed_q8_ref,
+                            inter_dim,
+                            hidden_dim,
+                        );
                     }
                     #[cfg(not(target_arch = "aarch64"))]
                     {
-                        simd_kernels::matmul_q8_0_simd_2row(&mut s.gate, w_gate_bytes, normed_ref, inter_dim, hidden_dim);
-                        simd_kernels::matmul_q8_0_simd_2row(&mut s.up, w_up_bytes, normed_ref, inter_dim, hidden_dim);
+                        simd_kernels::matmul_q8_0_simd_2row(
+                            &mut s.gate,
+                            w_gate_bytes,
+                            normed_ref,
+                            inter_dim,
+                            hidden_dim,
+                        );
+                        simd_kernels::matmul_q8_0_simd_2row(
+                            &mut s.up, w_up_bytes, normed_ref, inter_dim, hidden_dim,
+                        );
                     }
                 } else {
-                    simd_kernels::matmul_bytes_simd_2row(&mut s.gate, w_gate_bytes, normed_ref, inter_dim, hidden_dim);
-                    simd_kernels::matmul_bytes_simd_2row(&mut s.up, w_up_bytes, normed_ref, inter_dim, hidden_dim);
+                    simd_kernels::matmul_bytes_simd_2row(
+                        &mut s.gate,
+                        w_gate_bytes,
+                        normed_ref,
+                        inter_dim,
+                        hidden_dim,
+                    );
+                    simd_kernels::matmul_bytes_simd_2row(
+                        &mut s.up, w_up_bytes, normed_ref, inter_dim, hidden_dim,
+                    );
                 }
                 // Single-threaded: SwiGLU applied after matmuls (cannot fuse into dispatch)
                 simd_kernels::swiglu_inplace_simd(&mut s.gate, &s.up);
@@ -1465,31 +1710,44 @@ impl ComputeBackend for SimdF32Backend {
                 if self.pool.should_parallelize(hidden_dim) {
                     self.pool.parallel_for(hidden_dim, |start, end| {
                         let chunk_len = end - start;
-                        if chunk_len == 0 { return; }
+                        if chunk_len == 0 {
+                            return;
+                        }
 
                         // SAFETY: Each thread writes to disjoint ranges of downand attn_proj[].
                         // w_down_bytes and gate_q8_ref are read-only shared references.
                         let down_slice = unsafe {
                             std::slice::from_raw_parts_mut(
-                                (down_addr as *mut f32).add(start), chunk_len,
+                                (down_addr as *mut f32).add(start),
+                                chunk_len,
                             )
                         };
                         let wd_offset = start * row_bytes_inter;
-                        let wd_sub = &w_down_bytes[wd_offset..wd_offset + chunk_len * row_bytes_inter];
+                        let wd_sub =
+                            &w_down_bytes[wd_offset..wd_offset + chunk_len * row_bytes_inter];
                         simd_kernels::matmul_q8_0_preq(
-                            down_slice, wd_sub, gate_q8_ref, chunk_len, inter_dim,
+                            down_slice,
+                            wd_sub,
+                            gate_q8_ref,
+                            chunk_len,
+                            inter_dim,
                         );
                         // Fused residual: attn_proj[chunk] += down[chunk]
                         let proj_slice = unsafe {
                             std::slice::from_raw_parts_mut(
-                                (attn_proj_addr as *mut f32).add(start), chunk_len,
+                                (attn_proj_addr as *mut f32).add(start),
+                                chunk_len,
                             )
                         };
                         vadd_inplace(proj_slice, down_slice);
                     });
                 } else {
                     simd_kernels::matmul_q8_0_preq(
-                        &mut s.down, w_down_bytes, gate_q8_ref, hidden_dim, inter_dim,
+                        &mut s.down,
+                        w_down_bytes,
+                        gate_q8_ref,
+                        hidden_dim,
+                        inter_dim,
                     );
                     vadd_inplace(&mut s.attn_proj, &s.down);
                 }
@@ -1501,28 +1759,37 @@ impl ComputeBackend for SimdF32Backend {
                 if self.pool.should_parallelize(hidden_dim) {
                     self.pool.parallel_for(hidden_dim, |start, end| {
                         let chunk_len = end - start;
-                        if chunk_len == 0 { return; }
+                        if chunk_len == 0 {
+                            return;
+                        }
 
                         let down_slice = unsafe {
                             std::slice::from_raw_parts_mut(
-                                (down_addr as *mut f32).add(start), chunk_len,
+                                (down_addr as *mut f32).add(start),
+                                chunk_len,
                             )
                         };
                         let w_byte_offset = start * inter_dim * 4;
-                        let wd_sub = &w_down_bytes[w_byte_offset..w_byte_offset + chunk_len * inter_dim * 4];
+                        let wd_sub =
+                            &w_down_bytes[w_byte_offset..w_byte_offset + chunk_len * inter_dim * 4];
                         simd_kernels::matmul_bytes_simd_2row(
                             down_slice, wd_sub, gate_ref, chunk_len, inter_dim,
                         );
                         let proj_slice = unsafe {
                             std::slice::from_raw_parts_mut(
-                                (attn_proj_addr as *mut f32).add(start), chunk_len,
+                                (attn_proj_addr as *mut f32).add(start),
+                                chunk_len,
                             )
                         };
                         vadd_inplace(proj_slice, down_slice);
                     });
                 } else {
                     simd_kernels::matmul_bytes_simd_2row(
-                        &mut s.down, w_down_bytes, gate_ref, hidden_dim, inter_dim,
+                        &mut s.down,
+                        w_down_bytes,
+                        gate_ref,
+                        hidden_dim,
+                        inter_dim,
                     );
                     vadd_inplace(&mut s.attn_proj, &s.down);
                 }
@@ -1531,8 +1798,22 @@ impl ComputeBackend for SimdF32Backend {
         #[cfg(not(target_arch = "aarch64"))]
         {
             match st.w_down.quant {
-                QuantScheme::Q8_0 => simd_kernels::matmul_q8_0_simd_parallel(&mut s.down, w_down_bytes, &s.gate, hidden_dim, inter_dim, &self.pool),
-                _ => simd_kernels::matmul_bytes_simd_parallel(&mut s.down, w_down_bytes, &s.gate, hidden_dim, inter_dim, &self.pool),
+                QuantScheme::Q8_0 => simd_kernels::matmul_q8_0_simd_parallel(
+                    &mut s.down,
+                    w_down_bytes,
+                    &s.gate,
+                    hidden_dim,
+                    inter_dim,
+                    &self.pool,
+                ),
+                _ => simd_kernels::matmul_bytes_simd_parallel(
+                    &mut s.down,
+                    w_down_bytes,
+                    &s.gate,
+                    hidden_dim,
+                    inter_dim,
+                    &self.pool,
+                ),
             }
             vadd_inplace(&mut s.attn_proj, &s.down);
         }
@@ -1544,7 +1825,9 @@ impl ComputeBackend for SimdF32Backend {
         kv.seq_len = new_seq_len;
 
         // Increment profiled call counter
-        if profile { prof.calls += 1; }
+        if profile {
+            prof.calls += 1;
+        }
 
         // Write result back to activation buffer (reuse existing allocation)
         x.write_f32_from(&s.attn_proj);
@@ -1554,9 +1837,11 @@ impl ComputeBackend for SimdF32Backend {
     fn compute_final(&self, x: &ActivationBuffer) -> Result<Logits, RuntimeError> {
         // SAFETY: compute_final is only called from the engine's single-threaded
         // generate() loop. No concurrent access to scratch is possible.
-        let s = unsafe { &mut *self.scratch.get() }.as_mut().ok_or_else(|| {
-            RuntimeError::Compute("scratch not initialized: call init() first".into())
-        })?;
+        let s = unsafe { &mut *self.scratch.get() }
+            .as_mut()
+            .ok_or_else(|| {
+                RuntimeError::Compute("scratch not initialized: call init() first".into())
+            })?;
 
         // Read cached dimensions from scratch (no hp() Option check)
         let hidden_dim = s.hidden_dim;
@@ -1601,15 +1886,19 @@ impl ComputeBackend for SimdF32Backend {
 
                     self.pool.parallel_for(vocab_size, |start, end| {
                         let chunk_len = end - start;
-                        if chunk_len == 0 { return; }
+                        if chunk_len == 0 {
+                            return;
+                        }
 
                         // First thread claims the quantization work (CAS 0 -> 1).
-                        if quant_state.compare_exchange(
-                            0, 1, AtomicOrdering::AcqRel, AtomicOrdering::Acquire,
-                        ).is_ok() {
+                        if quant_state
+                            .compare_exchange(0, 1, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+                            .is_ok()
+                        {
                             unsafe {
                                 let q8_buf = std::slice::from_raw_parts_mut(
-                                    final_normed_q8_ptr as *mut u8, final_normed_q8_size,
+                                    final_normed_q8_ptr as *mut u8,
+                                    final_normed_q8_size,
                                 );
                                 simd_kernels::quantize_f32_to_q8_0_pub(
                                     normed_ref, q8_buf, hidden_dim,
@@ -1627,12 +1916,14 @@ impl ComputeBackend for SimdF32Backend {
 
                         let q8_ref = unsafe {
                             std::slice::from_raw_parts(
-                                final_normed_q8_ptr as *const u8, final_normed_q8_size,
+                                final_normed_q8_ptr as *const u8,
+                                final_normed_q8_size,
                             )
                         };
                         let out_slice = unsafe {
                             std::slice::from_raw_parts_mut(
-                                (logits_addr as *mut f32).add(start), chunk_len,
+                                (logits_addr as *mut f32).add(start),
+                                chunk_len,
                             )
                         };
                         let w_offset = start * row_bytes;
@@ -1643,10 +1934,17 @@ impl ComputeBackend for SimdF32Backend {
                     });
                 } else {
                     // Single-threaded: quantize then matmul sequentially.
-                    simd_kernels::quantize_f32_to_q8_0_pub(normed_ref, &mut s.final_normed_q8, hidden_dim);
+                    simd_kernels::quantize_f32_to_q8_0_pub(
+                        normed_ref,
+                        &mut s.final_normed_q8,
+                        hidden_dim,
+                    );
                     simd_kernels::matmul_q8_0_preq(
-                        &mut s.logits, output_proj_q8_ref, &s.final_normed_q8,
-                        vocab_size, hidden_dim,
+                        &mut s.logits,
+                        output_proj_q8_ref,
+                        &s.final_normed_q8,
+                        vocab_size,
+                        hidden_dim,
                     );
                 }
             } else {
@@ -1745,7 +2043,10 @@ impl ComputeBackend for SimdF32Backend {
             return;
         }
         let prof = unsafe { &*self.profile.get() };
-        let num_layers = self.hyperparams.map(|hp| hp.num_layers as usize).unwrap_or(0);
+        let num_layers = self
+            .hyperparams
+            .map(|hp| hp.num_layers as usize)
+            .unwrap_or(0);
         prof.print_summary(num_layers);
     }
 

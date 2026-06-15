@@ -90,9 +90,7 @@ impl ExpertActivationProfiler {
         let total: u64 = counts.iter().sum();
         if total == 0 {
             // No activations recorded yet; return all zeros sorted by expert_id.
-            return (0..self.num_experts as u32)
-                .map(|eid| (eid, 0.0))
-                .collect();
+            return (0..self.num_experts as u32).map(|eid| (eid, 0.0)).collect();
         }
         let total_f64 = total as f64;
         let mut freqs: Vec<(u32, f64)> = counts
@@ -277,10 +275,7 @@ mod tests {
 
         let summary = profiler.summary();
         let entropy = summary.per_layer_entropy[0];
-        assert!(
-            entropy.abs() < 1e-6,
-            "Expected entropy ~0.0, got {entropy}"
-        );
+        assert!(entropy.abs() < 1e-6, "Expected entropy ~0.0, got {entropy}");
     }
 
     #[test]

@@ -54,7 +54,9 @@ fn device_name_is_nonempty_on_gpu() {
         Some(d) => d,
         None => return,
     };
-    let name = device.name().expect("name() should succeed on a valid device");
+    let name = device
+        .name()
+        .expect("name() should succeed on a valid device");
     assert!(!name.is_empty(), "device name must not be empty");
     eprintln!("[info] device name: {name}");
 }
@@ -65,7 +67,9 @@ fn total_memory_is_positive_on_gpu() {
         Some(d) => d,
         None => return,
     };
-    let total = device.total_memory().expect("total_memory() should succeed");
+    let total = device
+        .total_memory()
+        .expect("total_memory() should succeed");
     assert!(total > 0, "total VRAM must be > 0");
     eprintln!(
         "[info] VRAM: {:.1} GB",
@@ -79,9 +83,14 @@ fn free_memory_does_not_exceed_total() {
         Some(d) => d,
         None => return,
     };
-    let total = device.total_memory().expect("total_memory() should succeed");
+    let total = device
+        .total_memory()
+        .expect("total_memory() should succeed");
     let free = device.free_memory().expect("free_memory() should succeed");
-    assert!(free <= total, "free ({free}) must not exceed total ({total})");
+    assert!(
+        free <= total,
+        "free ({free}) must not exceed total ({total})"
+    );
     eprintln!("[info] free: {free} / total: {total}");
 }
 

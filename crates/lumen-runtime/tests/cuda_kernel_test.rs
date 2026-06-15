@@ -7,15 +7,18 @@
 
 #![cfg(feature = "cuda")]
 
+use cudarc::driver::{CudaContext, CudaSlice};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::compile_ptx;
-use cudarc::driver::{CudaContext, CudaSlice};
 
 /// Compile CUDA source, allocate device buffers, launch kernel, read back.
 /// All tests follow this pattern using cudarc directly (the integration test
 /// exercises kernel correctness, not the CudaDevice wrapper).
 
-fn create_context() -> (std::sync::Arc<CudaContext>, std::sync::Arc<cudarc::driver::CudaStream>) {
+fn create_context() -> (
+    std::sync::Arc<CudaContext>,
+    std::sync::Arc<cudarc::driver::CudaStream>,
+) {
     let ctx = CudaContext::new(0).expect("No CUDA GPU available");
     let stream = ctx.default_stream();
     (ctx, stream)
@@ -30,7 +33,10 @@ fn cpu_rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let n = x.len();
     let ms: f32 = x.iter().map(|&v| v * v).sum::<f32>() / n as f32;
     let scale = 1.0 / (ms + eps).sqrt();
-    x.iter().zip(weight.iter()).map(|(&xi, &wi)| xi * scale * wi).collect()
+    x.iter()
+        .zip(weight.iter())
+        .map(|(&xi, &wi)| xi * scale * wi)
+        .collect()
 }
 
 #[test]
@@ -40,7 +46,9 @@ fn test_cuda_rmsnorm_basic() {
     let src = lumen_runtime::cuda::shaders::NORM_KERNEL_SOURCE;
     let ptx = compile_ptx(src).expect("NVRTC compile failed for norm.cu");
     let module = ctx.load_module(ptx).expect("Failed to load norm module");
-    let func = module.load_function("rmsnorm").expect("Failed to load rmsnorm");
+    let func = module
+        .load_function("rmsnorm")
+        .expect("Failed to load rmsnorm");
 
     let x = vec![1.0f32, 2.0, 3.0, 4.0];
     let weight = vec![1.0f32, 1.0, 1.0, 1.0];
@@ -112,9 +120,13 @@ fn test_cuda_rmsnorm_with_weights() {
     };
 
     unsafe {
-        stream.launch_builder(&func)
-            .arg(&x_gpu).arg(&w_gpu).arg(&mut out_gpu)
-            .arg(&eps).arg(&dim)
+        stream
+            .launch_builder(&func)
+            .arg(&x_gpu)
+            .arg(&w_gpu)
+            .arg(&mut out_gpu)
+            .arg(&eps)
+            .arg(&dim)
             .launch(cfg)
     }
     .unwrap();
@@ -158,9 +170,13 @@ fn test_cuda_rmsnorm_zeros() {
     };
 
     unsafe {
-        stream.launch_builder(&func)
-            .arg(&x_gpu).arg(&w_gpu).arg(&mut out_gpu)
-            .arg(&eps).arg(&dim)
+        stream
+            .launch_builder(&func)
+            .arg(&x_gpu)
+            .arg(&w_gpu)
+            .arg(&mut out_gpu)
+            .arg(&eps)
+            .arg(&dim)
             .launch(cfg)
     }
     .unwrap();
@@ -203,9 +219,13 @@ fn test_cuda_rmsnorm_large_dim() {
     };
 
     unsafe {
-        stream.launch_builder(&func)
-            .arg(&x_gpu).arg(&w_gpu).arg(&mut out_gpu)
-            .arg(&eps).arg(&(dim as u32))
+        stream
+            .launch_builder(&func)
+            .arg(&x_gpu)
+            .arg(&w_gpu)
+            .arg(&mut out_gpu)
+            .arg(&eps)
+            .arg(&(dim as u32))
             .launch(cfg)
     }
     .unwrap();
@@ -264,7 +284,8 @@ fn test_cuda_swiglu() {
     };
 
     unsafe {
-        stream.launch_builder(&func)
+        stream
+            .launch_builder(&func)
             .arg(&mut gate_gpu)
             .arg(&up_gpu)
             .arg(&n)
@@ -309,8 +330,11 @@ fn test_cuda_swiglu_known_values() {
     };
 
     unsafe {
-        stream.launch_builder(&func)
-            .arg(&mut gate_gpu).arg(&up_gpu).arg(&n)
+        stream
+            .launch_builder(&func)
+            .arg(&mut gate_gpu)
+            .arg(&up_gpu)
+            .arg(&n)
             .launch(cfg)
     }
     .unwrap();
@@ -358,8 +382,11 @@ fn test_cuda_residual_add() {
     };
 
     unsafe {
-        stream.launch_builder(&func)
-            .arg(&mut x_gpu).arg(&res_gpu).arg(&n)
+        stream
+            .launch_builder(&func)
+            .arg(&mut x_gpu)
+            .arg(&res_gpu)
+            .arg(&n)
             .launch(cfg)
     }
     .unwrap();
@@ -404,8 +431,11 @@ fn test_cuda_residual_add_large() {
     };
 
     unsafe {
-        stream.launch_builder(&func)
-            .arg(&mut x_gpu).arg(&res_gpu).arg(&n)
+        stream
+            .launch_builder(&func)
+            .arg(&mut x_gpu)
+            .arg(&res_gpu)
+            .arg(&n)
             .launch(cfg)
     }
     .unwrap();
@@ -459,8 +489,10 @@ fn test_cuda_softmax() {
     };
 
     unsafe {
-        stream.launch_builder(&func)
-            .arg(&mut scores_gpu).arg(&n)
+        stream
+            .launch_builder(&func)
+            .arg(&mut scores_gpu)
+            .arg(&n)
             .launch(cfg)
     }
     .unwrap();
@@ -510,8 +542,10 @@ fn test_cuda_softmax_large_values() {
     };
 
     unsafe {
-        stream.launch_builder(&func)
-            .arg(&mut scores_gpu).arg(&n)
+        stream
+            .launch_builder(&func)
+            .arg(&mut scores_gpu)
+            .arg(&n)
             .launch(cfg)
     }
     .unwrap();
@@ -549,13 +583,7 @@ fn test_cuda_softmax_large_values() {
 ///   freq = 1 / theta^(2d / head_dim)
 ///   angle = pos * freq
 ///   (x0', x1') = (x0*cos - x1*sin, x0*sin + x1*cos)
-fn cpu_rope_apply(
-    vec: &mut [f32],
-    pos: usize,
-    num_heads: usize,
-    head_dim: usize,
-    theta: f32,
-) {
+fn cpu_rope_apply(vec: &mut [f32], pos: usize, num_heads: usize, head_dim: usize, theta: f32) {
     let half_dim = head_dim / 2;
     for h in 0..num_heads {
         let head_start = h * head_dim;
@@ -611,7 +639,8 @@ fn run_rope_kernel(
     };
 
     unsafe {
-        stream.launch_builder(&func)
+        stream
+            .launch_builder(&func)
             .arg(&mut q_gpu)
             .arg(&mut k_gpu)
             .arg(&pos)
@@ -643,8 +672,20 @@ fn test_cuda_rope_position_zero() {
     let k = vec![0.5f32, 0.5, 0.5, 0.5];
     let mut q_expected = q.clone();
     let mut k_expected = k.clone();
-    cpu_rope_apply(&mut q_expected, pos as usize, num_heads as usize, head_dim as usize, theta);
-    cpu_rope_apply(&mut k_expected, pos as usize, num_heads as usize, head_dim as usize, theta);
+    cpu_rope_apply(
+        &mut q_expected,
+        pos as usize,
+        num_heads as usize,
+        head_dim as usize,
+        theta,
+    );
+    cpu_rope_apply(
+        &mut k_expected,
+        pos as usize,
+        num_heads as usize,
+        head_dim as usize,
+        theta,
+    );
 
     let (q_result, k_result) = run_rope_kernel(
         &ctx, &stream, &q, &k, pos, num_heads, num_heads, head_dim, theta,
@@ -680,8 +721,20 @@ fn test_cuda_rope_nonzero_position() {
     let k = vec![1.0f32, 1.0, 1.0, 1.0];
     let mut q_expected = q.clone();
     let mut k_expected = k.clone();
-    cpu_rope_apply(&mut q_expected, pos as usize, num_heads as usize, head_dim as usize, theta);
-    cpu_rope_apply(&mut k_expected, pos as usize, num_heads as usize, head_dim as usize, theta);
+    cpu_rope_apply(
+        &mut q_expected,
+        pos as usize,
+        num_heads as usize,
+        head_dim as usize,
+        theta,
+    );
+    cpu_rope_apply(
+        &mut k_expected,
+        pos as usize,
+        num_heads as usize,
+        head_dim as usize,
+        theta,
+    );
 
     let (q_result, _k_result) = run_rope_kernel(
         &ctx, &stream, &q, &k, pos, num_heads, num_heads, head_dim, theta,
@@ -723,11 +776,31 @@ fn test_cuda_rope_multi_head() {
     let k: Vec<f32> = (0..16).map(|i| (i as f32) * 0.05 + 0.2).collect();
     let mut q_expected = q.clone();
     let mut k_expected = k.clone();
-    cpu_rope_apply(&mut q_expected, pos as usize, num_q_heads as usize, head_dim as usize, theta);
-    cpu_rope_apply(&mut k_expected, pos as usize, num_kv_heads as usize, head_dim as usize, theta);
+    cpu_rope_apply(
+        &mut q_expected,
+        pos as usize,
+        num_q_heads as usize,
+        head_dim as usize,
+        theta,
+    );
+    cpu_rope_apply(
+        &mut k_expected,
+        pos as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+        theta,
+    );
 
     let (q_result, k_result) = run_rope_kernel(
-        &ctx, &stream, &q, &k, pos, num_q_heads, num_kv_heads, head_dim, theta,
+        &ctx,
+        &stream,
+        &q,
+        &k,
+        pos,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        theta,
     );
 
     for i in 0..16 {

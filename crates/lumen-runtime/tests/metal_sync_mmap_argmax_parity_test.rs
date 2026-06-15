@@ -47,7 +47,10 @@ fn write_q8_model() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("lumen_metal_argmax_parity_{id}"));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("model_q8.lbc");
-    std::fs::File::create(&path).unwrap().write_all(&data).unwrap();
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(&data)
+        .unwrap();
     path
 }
 
@@ -59,8 +62,7 @@ fn write_q8_model() -> std::path::PathBuf {
 /// global tensors — isolating the layer-view OFFSET source as the only variable.
 macro_rules! wire_metal_backend {
     ($provider:expr, $hyper:expr) => {{
-        let mut backend = MetalF32Backend::new()
-            .expect("Metal backend must be available on macOS");
+        let mut backend = MetalF32Backend::new().expect("Metal backend must be available on macOS");
         backend.set_global_tensors(
             $provider.embedding.clone(),
             $provider.final_norm.clone(),
@@ -73,10 +75,7 @@ macro_rules! wire_metal_backend {
             );
         }
         if !$provider.embedding_raw.is_empty() {
-            backend.set_embedding_raw(
-                $provider.embedding_raw.clone(),
-                $provider.embedding_quant,
-            );
+            backend.set_embedding_raw($provider.embedding_raw.clone(), $provider.embedding_quant);
         }
         if $provider.weight_tying {
             backend.set_weight_tying(true);
@@ -123,7 +122,11 @@ fn metal_q8_first_token_argmax_identical_for_sync_and_mmap() {
     // whole prefill->decode chain agrees).
     let prompt_tokens = vec![0u32, 1, 2, 3];
     let stop = StopCondition::MaxTokens(6);
-    let sampling = SamplingParams { temperature: 0.0, seed: Some(42), ..Default::default() };
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        seed: Some(42),
+        ..Default::default()
+    };
 
     let mmap_engine = engine_for(mmap_hyper);
     let mmap_result = mmap_engine
@@ -138,7 +141,10 @@ fn metal_q8_first_token_argmax_identical_for_sync_and_mmap() {
     eprintln!("mmap tokens: {:?}", mmap_result.tokens);
     eprintln!("sync tokens: {:?}", sync_result.tokens);
 
-    assert!(!mmap_result.tokens.is_empty(), "mmap must generate at least one token");
+    assert!(
+        !mmap_result.tokens.is_empty(),
+        "mmap must generate at least one token"
+    );
 
     // The headline guard: first-token argmax identical between providers.
     assert_eq!(

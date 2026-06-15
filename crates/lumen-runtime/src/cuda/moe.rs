@@ -308,7 +308,9 @@ pub(crate) fn moe_down_fast_bn128_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
         matches!(
-            std::env::var("LUMEN_CUDA_MOE_DOWN_FAST_BN128").ok().as_deref(),
+            std::env::var("LUMEN_CUDA_MOE_DOWN_FAST_BN128")
+                .ok()
+                .as_deref(),
             Some("1") | Some("true") | Some("yes")
         )
     })
@@ -396,7 +398,8 @@ pub(crate) fn build_repacked_down(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(repack_fn)
                 .arg(layer_buf)
                 .arg(down_offsets)
@@ -424,7 +427,8 @@ pub(crate) fn build_repacked_down(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(gu_fn)
                 .arg(layer_buf)
                 .arg(gate_up_offsets)
@@ -440,7 +444,12 @@ pub(crate) fn build_repacked_down(
         (None, None)
     };
 
-    Ok(CudaMoeRepacked { down_q, down_s, gate_up_q, gate_up_s })
+    Ok(CudaMoeRepacked {
+        down_q,
+        down_s,
+        gate_up_q,
+        gate_up_s,
+    })
 }
 
 /// Read `LUMEN_CUDA_MOE_BATCHED` once via OnceLock (default OFF).
@@ -476,7 +485,9 @@ pub(crate) fn moe_prefill_batched_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
         matches!(
-            std::env::var("LUMEN_CUDA_MOE_PREFILL_BATCHED").ok().as_deref(),
+            std::env::var("LUMEN_CUDA_MOE_PREFILL_BATCHED")
+                .ok()
+                .as_deref(),
             Some("1") | Some("true") | Some("yes")
         )
     })
@@ -492,7 +503,9 @@ pub(crate) fn moe_grouped_mtiled_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
         matches!(
-            std::env::var("LUMEN_CUDA_MOE_GROUPED_MTILED").ok().as_deref(),
+            std::env::var("LUMEN_CUDA_MOE_GROUPED_MTILED")
+                .ok()
+                .as_deref(),
             Some("1") | Some("true") | Some("yes")
         )
     })
@@ -511,7 +524,9 @@ pub(crate) fn moe_grouped_tiled_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
         matches!(
-            std::env::var("LUMEN_CUDA_MOE_GROUPED_TILED").ok().as_deref(),
+            std::env::var("LUMEN_CUDA_MOE_GROUPED_TILED")
+                .ok()
+                .as_deref(),
             Some("1") | Some("true") | Some("yes")
         )
     })
@@ -580,7 +595,10 @@ pub(crate) fn moe_down_tiled_f32act_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
-        match std::env::var("LUMEN_CUDA_MOE_DOWN_TILED_F32ACT").ok().as_deref() {
+        match std::env::var("LUMEN_CUDA_MOE_DOWN_TILED_F32ACT")
+            .ok()
+            .as_deref()
+        {
             Some("0") | Some("false") | Some("no") => false,
             // Default-ON (unset) and any truthy value → ON.
             _ => true,
@@ -646,7 +664,10 @@ pub(crate) fn mmv_q_output_proj_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
-        match std::env::var("LUMEN_CUDA_MMV_Q_OUTPUT_PROJ").ok().as_deref() {
+        match std::env::var("LUMEN_CUDA_MMV_Q_OUTPUT_PROJ")
+            .ok()
+            .as_deref()
+        {
             Some(v) => matches!(v, "1" | "true" | "yes"),
             // default ON. measured +25% on the
             // vocab projection (dense Q8/Q4); no-op for BF16/F32 (different
@@ -787,7 +808,9 @@ pub(crate) fn moe_decode_f32_ffn_enabled() -> bool {
     *FLAG.get_or_init(|| {
         crate::runtime_defaults::model_is_moe()
             && matches!(
-                std::env::var("LUMEN_CUDA_MOE_DECODE_F32_FFN").ok().as_deref(),
+                std::env::var("LUMEN_CUDA_MOE_DECODE_F32_FFN")
+                    .ok()
+                    .as_deref(),
                 Some("1" | "true" | "yes")
             )
     })
@@ -912,7 +935,10 @@ pub(crate) fn moe_router_parallel_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
-        match std::env::var("LUMEN_CUDA_MOE_ROUTER_PARALLEL").ok().as_deref() {
+        match std::env::var("LUMEN_CUDA_MOE_ROUTER_PARALLEL")
+            .ok()
+            .as_deref()
+        {
             Some(v) => matches!(v, "1" | "true" | "yes"),
             // default ON (no-op on dense models).
             None => crate::runtime_defaults::moe_router_parallel_default(),
@@ -1071,11 +1097,9 @@ pub(crate) fn allocate_moe_scratch(
         shared_gate_scalar: Some(device.alloc_zeros::<f32>(1)?),
         // Phase-F batched SwiGLU scratch — sized `top_k * expert_inter_dim`.
         // For Qwen3.5-35B-A3B (top_k=8, inter_dim=1408): 45 KB.
-        batched_swiglu_buf: device
-            .alloc_zeros::<f32>(top_k.max(1) * expert_inter_dim)?,
+        batched_swiglu_buf: device.alloc_zeros::<f32>(top_k.max(1) * expert_inter_dim)?,
         // Q8_1 normed_x scratch (~2.3 KB).
-        mmv_q_moe_normed_q8_1: device
-            .alloc_zeros::<u8>(((hidden_dim + 31) / 32) * 36)?,
+        mmv_q_moe_normed_q8_1: device.alloc_zeros::<u8>(((hidden_dim + 31) / 32) * 36)?,
         // Q8_1 per-expert swiglu scratch (~13 KB).
         mmv_q_moe_swiglu_q8_1: device
             .alloc_zeros::<u8>(top_k.max(1) * ((expert_inter_dim + 31) / 32) * 36)?,
@@ -1131,15 +1155,21 @@ pub(crate) fn ensure_prefill_grouped(
         // allocate prequant + bucketed tile buffers only when the path is on.
         w10_xq_q: if moe_gate_up_w10_enabled() {
             Some(device.alloc_zeros::<i8>((hidden_dim / 32) * need_cols * 32)?)
-        } else { None },
+        } else {
+            None
+        },
         w10_xq_d: if moe_gate_up_w10_enabled() {
             Some(device.alloc_zeros::<f32>((hidden_dim / 32) * need_cols)?)
-        } else { None },
+        } else {
+            None
+        },
         w10_tiles: if moe_gate_up_w10_enabled() {
             // worst case col-tiles = need_cols + num_experts; times row128 count.
             let r128 = (inter_dim / 128).max(1);
             Some(device.alloc_zeros::<i32>((need_cols + num_experts) * r128 * 4)?)
-        } else { None },
+        } else {
+            None
+        },
         cap_tiles_w10: {
             let r128 = (inter_dim / 128).max(1);
             (need_cols + num_experts) * r128
@@ -1218,35 +1248,49 @@ pub(crate) fn encode_moe_ffn_decode(
     // BF16 fast path. When both gate and down quants are BF16,
     // delegate to the BF16 dispatch (separate kernel set; bandwidth-bound row-
     // major weights, ~2× larger than Q8 but no scale fetch).
-    if meta.expert_gate_quant == QuantScheme::Bf16
-        && meta.expert_down_quant == QuantScheme::Bf16
-    {
+    if meta.expert_gate_quant == QuantScheme::Bf16 && meta.expert_down_quant == QuantScheme::Bf16 {
         return encode_moe_ffn_decode_bf16(
-            device, kernels, scratch, meta, batched_offsets,
-            layer_buf, normed_x, residual, output_x,
-            hidden_dim, inter_dim, num_experts, top_k,
+            device,
+            kernels,
+            scratch,
+            meta,
+            batched_offsets,
+            layer_buf,
+            normed_x,
+            residual,
+            output_x,
+            hidden_dim,
+            inter_dim,
+            num_experts,
+            top_k,
         );
     }
 
     // Q4_0 fast path. When both gate and down quants are Q4_0,
     // delegate to the Q4_0 dispatch (separate kernel set; 18-byte GGML blocks
     // with nibble unpack, ~½ memory bandwidth of Q8).
-    if meta.expert_gate_quant == QuantScheme::Q4_0
-        && meta.expert_down_quant == QuantScheme::Q4_0
-    {
+    if meta.expert_gate_quant == QuantScheme::Q4_0 && meta.expert_down_quant == QuantScheme::Q4_0 {
         return encode_moe_ffn_decode_q4_0(
-            device, kernels, scratch, meta, batched_offsets,
-            layer_buf, normed_x, residual, output_x,
-            hidden_dim, inter_dim, num_experts, top_k,
+            device,
+            kernels,
+            scratch,
+            meta,
+            batched_offsets,
+            layer_buf,
+            normed_x,
+            residual,
+            output_x,
+            hidden_dim,
+            inter_dim,
+            num_experts,
+            top_k,
         );
     }
 
     // Remaining quant combinations (mixed quant, F16, etc.) are not yet
     // supported. Q8_0 (legacy path below), Q4_0 (above) and BF16 (above) are
     // the three quant schemes wired.
-    if meta.expert_gate_quant != QuantScheme::Q8_0
-        || meta.expert_down_quant != QuantScheme::Q8_0
-    {
+    if meta.expert_gate_quant != QuantScheme::Q8_0 || meta.expert_down_quant != QuantScheme::Q8_0 {
         return Err(RuntimeError::Unsupported(format!(
             "CUDA MoE FFN: gate_quant={:?} down_quant={:?} not yet supported \
 ",
@@ -1338,10 +1382,11 @@ pub(crate) fn encode_moe_ffn_decode(
         }
         let byte_view = layer_buf.slice(router_off..router_off + router_bytes_needed);
         let router_view: cudarc::driver::CudaView<'_, f32> = unsafe {
-            byte_view.transmute::<f32>(num_experts * hidden_dim)
-                .ok_or_else(|| RuntimeError::Compute(
-                    "moe v2 router transmute<f32> returned None".into(),
-                ))?
+            byte_view
+                .transmute::<f32>(num_experts * hidden_dim)
+                .ok_or_else(|| {
+                    RuntimeError::Compute("moe v2 router transmute<f32> returned None".into())
+                })?
         };
 
         // ---- Phase 1 fused-atomic: dot-product + softmax + top-K in ONE launch. ----
@@ -1397,7 +1442,8 @@ pub(crate) fn encode_moe_ffn_decode(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(logits_fn)
                     .arg(normed_x)
                     .arg(&router_view)
@@ -1405,9 +1451,7 @@ pub(crate) fn encode_moe_ffn_decode(
                     .arg(&hd_u32)
                     .arg(&ne_u32)
                     .launch(cfg_logits)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_router_logits_v2: {e}",
-                    )))?;
+                    .map_err(|e| RuntimeError::Compute(format!("moe_router_logits_v2: {e}",)))?;
             }
             // Launch 2: top-K finalize.
             //
@@ -1424,7 +1468,9 @@ pub(crate) fn encode_moe_ffn_decode(
             let use_topk_moe_fused = topk_moe_fused_enabled();
             let lc_fn = if use_topk_moe_fused {
                 topk_moe_fused_kernel_for(kernels, num_experts)
-            } else { None };
+            } else {
+                None
+            };
             if let Some(lc_fn) = lc_fn {
                 let n_rows: i32 = 1; // decode: single token
                 let n_expert_used: i32 = top_k as i32;
@@ -1439,7 +1485,8 @@ pub(crate) fn encode_moe_ffn_decode(
                     shared_mem_bytes: 0,
                 };
                 unsafe {
-                    device.stream
+                    device
+                        .stream
                         .launch_builder(lc_fn)
                         .arg(&scratch.router_logits)
                         .arg(&mut scratch.expert_weights)
@@ -1452,9 +1499,9 @@ pub(crate) fn encode_moe_ffn_decode(
                         .arg(&with_norm_u)
                         .arg(&delayed_softmax_u)
                         .launch(cfg)
-                        .map_err(|e| RuntimeError::Compute(format!(
-                            "topk_moe_fused finalize: {e}",
-                        )))?;
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("topk_moe_fused finalize: {e}",))
+                        })?;
                 }
             } else {
                 let finalize_fn = kernels.moe_router_softmax_finalize_v2.as_ref().unwrap();
@@ -1464,7 +1511,8 @@ pub(crate) fn encode_moe_ffn_decode(
                     shared_mem_bytes: 0,
                 };
                 unsafe {
-                    device.stream
+                    device
+                        .stream
                         .launch_builder(finalize_fn)
                         .arg(&mut scratch.router_logits)
                         .arg(&mut scratch.expert_ids)
@@ -1472,9 +1520,9 @@ pub(crate) fn encode_moe_ffn_decode(
                         .arg(&ne_u32)
                         .arg(&tk_u32)
                         .launch(cfg_final)
-                        .map_err(|e| RuntimeError::Compute(format!(
-                            "moe_router_softmax_finalize_v2: {e}",
-                        )))?;
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("moe_router_softmax_finalize_v2: {e}",))
+                        })?;
                 }
             }
         } else if use_router_single_cta {
@@ -1493,7 +1541,8 @@ pub(crate) fn encode_moe_ffn_decode(
                 shared_mem_bytes: smem_bytes,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(single_cta_fn)
                     .arg(normed_x)
                     .arg(&router_view)
@@ -1503,24 +1552,26 @@ pub(crate) fn encode_moe_ffn_decode(
                     .arg(&ne_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_router_fused_v2 (single-CTA): {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_router_fused_v2 (single-CTA): {e}",))
+                    })?;
             }
         } else {
             // Legacy atomicAdd last-CTA router. Known broken for
             // prefill ≥16 tokens — kept for opt-in evaluation only.
-            device.htod_copy_into(&[0u32], &mut scratch.router_done_counter)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe v2 done_counter reset (defensive): {e}",
-                )))?;
+            device
+                .htod_copy_into(&[0u32], &mut scratch.router_done_counter)
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("moe v2 done_counter reset (defensive): {e}",))
+                })?;
             let cfg = CudarcLaunchConfig {
                 grid_dim: (num_experts as u32, 1, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(router_atomic_fn)
                     .arg(normed_x)
                     .arg(&router_view)
@@ -1532,9 +1583,9 @@ pub(crate) fn encode_moe_ffn_decode(
                     .arg(&ne_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_router_fused_atomic_v2: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_router_fused_atomic_v2: {e}",))
+                    })?;
             }
         }
 
@@ -1544,7 +1595,9 @@ pub(crate) fn encode_moe_ffn_decode(
         if std::env::var("LUMEN_DUMP_EXPERTS").is_ok() {
             device.synchronize()?;
             let ids = device.dtoh_copy(&scratch.expert_ids).unwrap_or_default();
-            let ws = device.dtoh_copy(&scratch.expert_weights).unwrap_or_default();
+            let ws = device
+                .dtoh_copy(&scratch.expert_weights)
+                .unwrap_or_default();
             let n = MOE_DUMP_CALL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             eprintln!("MOE_EXPERT_DUMP call={n} ids={ids:?} weights={ws:?}");
         }
@@ -1577,8 +1630,7 @@ pub(crate) fn encode_moe_ffn_decode(
             // SM utilization (16 CTAs on 108 SMs = 14% util) against compute waste.
             const NR_V4_FUSED: u32 = 128;
             const BLOCK_DIM_V4_FUSED: u32 = 256;
-            let hidden_grid_fused =
-                ((hidden_dim as u32) + NR_V4_FUSED - 1) / NR_V4_FUSED;
+            let hidden_grid_fused = ((hidden_dim as u32) + NR_V4_FUSED - 1) / NR_V4_FUSED;
             // Dynamic shmem: nx_smem (hidden_dim * 4) + swiglu_smem (inter_dim * 4).
             let shmem_bytes = (hidden_dim + inter_dim) as u32 * 4;
             let cfg = CudarcLaunchConfig {
@@ -1632,7 +1684,8 @@ pub(crate) fn encode_moe_ffn_decode(
                 shared_mem_bytes: smem_gate_up,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(gate_up_fn)
                     .arg(normed_x)
                     .arg(layer_buf)
@@ -1643,9 +1696,11 @@ pub(crate) fn encode_moe_ffn_decode(
                     .arg(&id_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_batched_gate_up_swiglu_q8_0 v2/v3: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(
+                            format!("moe_batched_gate_up_swiglu_q8_0 v2/v3: {e}",),
+                        )
+                    })?;
             }
         }
 
@@ -1660,7 +1715,8 @@ pub(crate) fn encode_moe_ffn_decode(
                 shared_mem_bytes: smem_down,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(down_fn)
                     .arg(&scratch.batched_swiglu_buf)
                     .arg(layer_buf)
@@ -1671,9 +1727,7 @@ pub(crate) fn encode_moe_ffn_decode(
                     .arg(&id_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_batched_down v2/v3: {e}",
-                    )))?;
+                    .map_err(|e| RuntimeError::Compute(format!("moe_batched_down v2/v3: {e}",)))?;
             }
         }
 
@@ -1686,7 +1740,8 @@ pub(crate) fn encode_moe_ffn_decode(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(accum_fn)
                     .arg(output_x)
                     .arg(residual)
@@ -1695,9 +1750,9 @@ pub(crate) fn encode_moe_ffn_decode(
                     .arg(&hd_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_expert_accum_option_a (v2 path): {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_expert_accum_option_a (v2 path): {e}",))
+                    })?;
             }
         }
         let _ = num_experts;
@@ -1705,9 +1760,10 @@ pub(crate) fn encode_moe_ffn_decode(
     }
 
     // ---- Phase 1: Router ----
-    let router_fn = kernels.moe_router_softmax.as_ref().ok_or_else(|| {
-        RuntimeError::Compute("moe_router_softmax kernel not compiled".into())
-    })?;
+    let router_fn = kernels
+        .moe_router_softmax
+        .as_ref()
+        .ok_or_else(|| RuntimeError::Compute("moe_router_softmax kernel not compiled".into()))?;
 
     {
         let cfg = CudarcLaunchConfig {
@@ -1736,13 +1792,15 @@ pub(crate) fn encode_moe_ffn_decode(
         // qwen35_moe.rs:317). Offset is 4-byte aligned, length is exact.
         let byte_view = layer_buf.slice(router_off..router_off + router_bytes_needed);
         let router_view: cudarc::driver::CudaView<'_, f32> = unsafe {
-            byte_view.transmute::<f32>(num_experts * hidden_dim)
-                .ok_or_else(|| RuntimeError::Compute(
-                    "moe router transmute<f32> returned None".into(),
-                ))?
+            byte_view
+                .transmute::<f32>(num_experts * hidden_dim)
+                .ok_or_else(|| {
+                    RuntimeError::Compute("moe router transmute<f32> returned None".into())
+                })?
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(router_fn)
                 .arg(normed_x)
                 .arg(&router_view)
@@ -1799,7 +1857,8 @@ pub(crate) fn encode_moe_ffn_decode(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(gate_up_b_fn)
                     .arg(normed_x)
                     .arg(layer_buf)
@@ -1810,9 +1869,9 @@ pub(crate) fn encode_moe_ffn_decode(
                     .arg(&id_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_batched_gate_up_swiglu_q8_0: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_batched_gate_up_swiglu_q8_0: {e}",))
+                    })?;
             }
         }
 
@@ -1826,7 +1885,8 @@ pub(crate) fn encode_moe_ffn_decode(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(down_acc_b_fn)
                     .arg(&scratch.batched_swiglu_buf)
                     .arg(layer_buf)
@@ -1839,9 +1899,9 @@ pub(crate) fn encode_moe_ffn_decode(
                     .arg(&id_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_batched_down_accum_q8_0: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_batched_down_accum_q8_0: {e}",))
+                    })?;
             }
         }
         // num_experts is read implicitly via expert_ids range; suppress unused warning
@@ -1854,7 +1914,9 @@ pub(crate) fn encode_moe_ffn_decode(
         if std::env::var("LUMEN_DUMP_EXPERTS").is_ok() {
             device.synchronize()?;
             let ids = device.dtoh_copy(&scratch.expert_ids).unwrap_or_default();
-            let ws = device.dtoh_copy(&scratch.expert_weights).unwrap_or_default();
+            let ws = device
+                .dtoh_copy(&scratch.expert_weights)
+                .unwrap_or_default();
             let n = MOE_DUMP_CALL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             eprintln!("MOE_EXPERT_DUMP call={n} ids={ids:?} weights={ws:?}");
         }
@@ -1866,12 +1928,16 @@ pub(crate) fn encode_moe_ffn_decode(
     let expert_ids_host = device.dtoh_copy(&scratch.expert_ids)?;
 
     // ---- Phase 2: Per-expert FFN (K iterations) ----
-    let gate_up_fn = kernels.moe_expert_gate_up_swiglu_q8_0.as_ref().ok_or_else(|| {
-        RuntimeError::Compute("moe_expert_gate_up_swiglu_q8_0 kernel not compiled".into())
-    })?;
-    let down_fn = kernels.moe_expert_down_q8_0.as_ref().ok_or_else(|| {
-        RuntimeError::Compute("moe_expert_down_q8_0 kernel not compiled".into())
-    })?;
+    let gate_up_fn = kernels
+        .moe_expert_gate_up_swiglu_q8_0
+        .as_ref()
+        .ok_or_else(|| {
+            RuntimeError::Compute("moe_expert_gate_up_swiglu_q8_0 kernel not compiled".into())
+        })?;
+    let down_fn = kernels
+        .moe_expert_down_q8_0
+        .as_ref()
+        .ok_or_else(|| RuntimeError::Compute("moe_expert_down_q8_0 kernel not compiled".into()))?;
 
     let hd_u32 = hidden_dim as u32;
     let id_u32 = inter_dim as u32;
@@ -1897,7 +1963,8 @@ pub(crate) fn encode_moe_ffn_decode(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(gate_up_fn)
                     .arg(normed_x)
                     .arg(layer_buf)
@@ -1907,9 +1974,9 @@ pub(crate) fn encode_moe_ffn_decode(
                     .arg(&hd_u32)
                     .arg(&id_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_expert_gate_up_swiglu_q8_0 k={k}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_expert_gate_up_swiglu_q8_0 k={k}: {e}",))
+                    })?;
             }
         }
 
@@ -1931,7 +1998,8 @@ pub(crate) fn encode_moe_ffn_decode(
             // Mutable sub-view of expert_output_buf at slot k.
             let mut slot_view = scratch.expert_output_buf.slice_mut(slot_start..slot_end);
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(down_fn)
                     .arg(&scratch.gate_buf)
                     .arg(layer_buf)
@@ -1940,9 +2008,9 @@ pub(crate) fn encode_moe_ffn_decode(
                     .arg(&hd_u32)
                     .arg(&id_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_expert_down_q8_0 k={k}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_expert_down_q8_0 k={k}: {e}",))
+                    })?;
             }
         }
     }
@@ -1961,7 +2029,8 @@ pub(crate) fn encode_moe_ffn_decode(
         let hd_u32 = hidden_dim as u32;
         let tk_u32 = top_k as u32;
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(accum_fn)
                 .arg(output_x)
                 .arg(residual)
@@ -2009,8 +2078,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
     batched_offsets: Option<&CudaMoeBatchedOffsets>,
     repacked: Option<&CudaMoeRepacked>,
     layer_buf: &CudaSlice<u8>,
-    normed: &CudaSlice<f32>,    // [batch, hidden_dim]
-    residual: &CudaSlice<f32>,  // [batch, hidden_dim]
+    normed: &CudaSlice<f32>,     // [batch, hidden_dim]
+    residual: &CudaSlice<f32>,   // [batch, hidden_dim]
     output: &mut CudaSlice<f32>, // [batch, hidden_dim]
     batch: usize,
     hidden_dim: usize,
@@ -2054,9 +2123,16 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
     // the caller's gate must guarantee they are loaded + the shapes are compatible.
     let q8_path = !is_q4 && !is_bf16;
     let gate_up_fn = if q8_path {
-        Some(kernels.moe_grouped_gate_up_swiglu_q8_0.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("grouped MoE prefill: moe_grouped_gate_up_swiglu_q8_0 not loaded".into())
-        })?)
+        Some(
+            kernels
+                .moe_grouped_gate_up_swiglu_q8_0
+                .as_ref()
+                .ok_or_else(|| {
+                    RuntimeError::Compute(
+                        "grouped MoE prefill: moe_grouped_gate_up_swiglu_q8_0 not loaded".into(),
+                    )
+                })?,
+        )
     } else {
         None
     };
@@ -2068,7 +2144,9 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         None
     };
     if is_q4
-        && (kernels.moe_grouped_gate_up_swiglu_q4_0_tiled_f32act.is_none()
+        && (kernels
+            .moe_grouped_gate_up_swiglu_q4_0_tiled_f32act
+            .is_none()
             || kernels.moe_grouped_down_q4_0_tiled_f32act.is_none())
     {
         return Err(RuntimeError::Compute(
@@ -2076,19 +2154,34 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         ));
     }
     if is_bf16
-        && (kernels.moe_grouped_gate_up_swiglu_bf16_tiled_f32act.is_none()
+        && (kernels
+            .moe_grouped_gate_up_swiglu_bf16_tiled_f32act
+            .is_none()
             || kernels.moe_grouped_down_bf16_tiled_f32act.is_none())
     {
         return Err(RuntimeError::Compute(
             "grouped MoE prefill (BF16): bf16 f32act tiled kernels not loaded".into(),
         ));
     }
-    let scatter_fn = kernels.moe_grouped_scatter_accum_q8_0.as_ref().ok_or_else(|| {
-        RuntimeError::Compute("grouped MoE prefill: moe_grouped_scatter_accum_q8_0 not loaded".into())
-    })?;
+    let scatter_fn = kernels
+        .moe_grouped_scatter_accum_q8_0
+        .as_ref()
+        .ok_or_else(|| {
+            RuntimeError::Compute(
+                "grouped MoE prefill: moe_grouped_scatter_accum_q8_0 not loaded".into(),
+            )
+        })?;
 
     // Ensure grouped scratch is sized for this batch.
-    ensure_prefill_grouped(scratch, device, batch, top_k, num_experts, hidden_dim, inter_dim)?;
+    ensure_prefill_grouped(
+        scratch,
+        device,
+        batch,
+        top_k,
+        num_experts,
+        hidden_dim,
+        inter_dim,
+    )?;
 
     let hd_u32 = hidden_dim as u32;
     let id_u32 = inter_dim as u32;
@@ -2115,9 +2208,11 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
     let router_view: cudarc::driver::CudaView<'_, f32> = unsafe {
         router_byte_view
             .transmute::<f32>(num_experts * hidden_dim)
-            .ok_or_else(|| RuntimeError::Compute(
-                "grouped MoE prefill: router transmute<f32> returned None".into(),
-            ))?
+            .ok_or_else(|| {
+                RuntimeError::Compute(
+                    "grouped MoE prefill: router transmute<f32> returned None".into(),
+                )
+            })?
     };
 
     // ---- Stage 0: batched router logits [batch, num_experts]. ----
@@ -2129,7 +2224,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(logits_fn)
                 .arg(normed)
                 .arg(&router_view)
@@ -2159,7 +2255,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(topk_fn)
                 .arg(&g.router_logits_batched)
                 .arg(&mut g.expert_weights_batched)
@@ -2186,7 +2283,11 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         static T: OnceLock<bool> = OnceLock::new();
         *T.get_or_init(|| std::env::var("LUMEN_MOE_SORT_TIMING").as_deref() == Ok("1"))
     };
-    let sort_t0 = if sort_timing { Some(std::time::Instant::now()) } else { None };
+    let sort_t0 = if sort_timing {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let (col_expert_host, col_src_tok_host, dst_to_col_host, expert_bounds_host) = {
         let g = scratch.prefill_grouped.as_ref().unwrap();
         // dtoh_copy syncs the stream, so all upstream kernels have completed.
@@ -2195,8 +2296,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         // batch*4 live; the slice avoids transferring dead capacity.
         let ids_live = g.expert_ids_batched.slice(0..batch * num_experts);
         let ids_host = device.dtoh_copy_view(&ids_live)?; // [batch, num_experts]
-        // Counting-sort tokens by assigned expert into compact columns.
-        // Pass 1: per-expert counts. Pass 2: prefix-sum offsets. Pass 3: place.
+                                                          // Counting-sort tokens by assigned expert into compact columns.
+                                                          // Pass 1: per-expert counts. Pass 2: prefix-sum offsets. Pass 3: place.
         let mut counts = vec![0i32; num_experts];
         for t in 0..batch {
             let row = t * num_experts;
@@ -2231,7 +2332,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         }
         (col_expert, col_src_tok, dst_to_col, offsets)
     };
-    let max_cols_per_expert = expert_bounds_host.windows(2)
+    let max_cols_per_expert = expert_bounds_host
+        .windows(2)
         .map(|w| (w[1] - w[0]) as usize)
         .max()
         .unwrap_or(0)
@@ -2248,7 +2350,9 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         // down TBFD_BN=32 rows (hidden%32) + TBFD_BK=8 K-chunks over inter/32 (K-tail
         // masked). u16-staged weights to fit 48 KB shmem.
         moe_grouped_tiled_enabled()
-            && kernels.moe_grouped_gate_up_swiglu_bf16_tiled_f32act.is_some()
+            && kernels
+                .moe_grouped_gate_up_swiglu_bf16_tiled_f32act
+                .is_some()
             && kernels.moe_grouped_down_bf16_tiled_f32act.is_some()
             && hidden_dim % 256 == 0
             && hidden_dim % 32 == 0
@@ -2264,7 +2368,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
             && kernels.moe_grouped_down_q4_0_tiled_f32act.is_some()
             && hidden_dim % 256 == 0   // gate_up K-blocks (TQ4_BK=8)
             && hidden_dim % 64 == 0    // down rows (TQ4D_BN=64) — implied by %256
-            && inter_dim % 32 == 0     // gate_up rows (TQ4_BN=32) + whole down q-blocks
+            && inter_dim % 32 == 0 // gate_up rows (TQ4_BN=32) + whole down q-blocks
     } else {
         moe_grouped_tiled_enabled()
             && kernels.moe_grouped_gate_up_swiglu_q8_0_tiled.is_some()
@@ -2311,30 +2415,49 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         let mut bk: [Vec<i32>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         // push one tile entry per row128 into bucket `b` with cols_valid `cv`.
         fn push_tile(v: &mut Vec<i32>, col0: i32, e: i32, r128: i32, cv: i32) {
-            for r in 0..r128 { v.push(col0); v.push(e); v.push(r); v.push(cv); }
+            for r in 0..r128 {
+                v.push(col0);
+                v.push(e);
+                v.push(r);
+                v.push(cv);
+            }
         }
         for e in 0..num_experts {
             let begin = expert_bounds_host[e];
             let end = expert_bounds_host[e + 1];
             let cols = end - begin;
-            if cols <= 0 { continue; }
+            if cols <= 0 {
+                continue;
+            }
             let mut c = begin;
             // full M64 tiles (cols_valid = 64).
             let n_full = cols / 64;
-            for _ in 0..n_full { push_tile(&mut bk[3], c, e as i32, r128, 64); c += 64; }
+            for _ in 0..n_full {
+                push_tile(&mut bk[3], c, e as i32, r128, 64);
+                c += 64;
+            }
             // tail: bucket by remainder, cols_valid = the TRUE remainder (kernel masks).
             let rem = end - c;
             if rem > 0 {
-                let bucket = match rem { 1..=16 => 0, 17..=32 => 1, 33..=48 => 2, _ => 3 };
+                let bucket = match rem {
+                    1..=16 => 0,
+                    17..=32 => 1,
+                    33..=48 => 2,
+                    _ => 3,
+                };
                 push_tile(&mut bk[bucket], c, e as i32, r128, rem);
             }
         }
         let counts = [
-            (bk[0].len() / 4) as u32, (bk[1].len() / 4) as u32,
-            (bk[2].len() / 4) as u32, (bk[3].len() / 4) as u32,
+            (bk[0].len() / 4) as u32,
+            (bk[1].len() / 4) as u32,
+            (bk[2].len() / 4) as u32,
+            (bk[3].len() / 4) as u32,
         ];
         let mut combined = Vec::with_capacity(bk.iter().map(|v| v.len()).sum());
-        for v in &bk { combined.extend_from_slice(v); }
+        for v in &bk {
+            combined.extend_from_slice(v);
+        }
         (combined, counts)
     } else {
         (Vec::new(), [0; 4])
@@ -2393,7 +2516,9 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         && kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg2.is_some()
         && kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg3.is_some()
         && kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg4.is_some()
-        && scratch.prefill_grouped.as_ref()
+        && scratch
+            .prefill_grouped
+            .as_ref()
             .map(|g| g.w10_xq_q.is_some() && g.w10_xq_d.is_some() && g.w10_tiles.is_some())
             .unwrap_or(false);
     let gate_up_imma_ok = !gate_up_w10_ok
@@ -2410,10 +2535,22 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         let gu_s = rp.gate_up_s.as_ref().unwrap();
         let prequant_fn = kernels.moe_prequant_x_q8.as_ref().unwrap();
         let mg_fns = [
-            kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg1.as_ref().unwrap(),
-            kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg2.as_ref().unwrap(),
-            kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg3.as_ref().unwrap(),
-            kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg4.as_ref().unwrap(),
+            kernels
+                .moe_grouped_gate_up_swiglu_q8_0_w10_mg1
+                .as_ref()
+                .unwrap(),
+            kernels
+                .moe_grouped_gate_up_swiglu_q8_0_w10_mg2
+                .as_ref()
+                .unwrap(),
+            kernels
+                .moe_grouped_gate_up_swiglu_q8_0_w10_mg3
+                .as_ref()
+                .unwrap(),
+            kernels
+                .moe_grouped_gate_up_swiglu_q8_0_w10_mg4
+                .as_ref()
+                .unwrap(),
         ];
         let total_cols_i32 = total_cols as i32;
         {
@@ -2439,7 +2576,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
             };
             // borrow xq_d immutably via a raw split: alloc separate locals.
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(prequant_fn)
                     .arg(normed)
                     .arg(&g.col_src_tok)
@@ -2460,14 +2598,16 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         for mg in 0..4usize {
             let cnt = w10_counts[mg];
             if cnt > 0 {
-                let tile_slice = tiles.slice((base as usize * 4)..((base as usize + cnt as usize) * 4));
+                let tile_slice =
+                    tiles.slice((base as usize * 4)..((base as usize + cnt as usize) * 4));
                 let cfg = CudarcLaunchConfig {
                     grid_dim: (cnt, 1, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 };
                 unsafe {
-                    device.stream
+                    device
+                        .stream
                         .launch_builder(mg_fns[mg])
                         .arg(xq_q)
                         .arg(xq_d)
@@ -2480,23 +2620,33 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                         .arg(&hd_u32)
                         .arg(&id_u32)
                         .launch(cfg)
-                        .map_err(|e| RuntimeError::Compute(format!(
-                            "moe_grouped_gate_up_swiglu_q8_0_w10_mg{}: {e}", mg + 1
-                        )))?;
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                "moe_grouped_gate_up_swiglu_q8_0_w10_mg{}: {e}",
+                                mg + 1
+                            ))
+                        })?;
                 }
             }
             base += cnt as u64;
         }
     } else if gate_up_imma_ok {
-        let imma_fn = kernels.moe_grouped_gate_up_swiglu_q8_0_imma.as_ref().unwrap();
+        let imma_fn = kernels
+            .moe_grouped_gate_up_swiglu_q8_0_imma
+            .as_ref()
+            .unwrap();
         let rp = repacked.unwrap();
         let gu_q = rp.gate_up_q.as_ref().unwrap();
         let gu_s = rp.gate_up_s.as_ref().unwrap();
         let grid_y = (inter_dim as u32) / 64; // IMG_BN = 64
-        // dynamic shmem: s_xq 4096 + s_xs 512 + s_wq 32768 + s_ws 2048
-        //              + s_gepi 4096 + s_uepi 4096 = 47,616 B.
-        let shmem: u32 = (2*4*16*32) + (2*4*16*4) + (2*4*8*2*8*32) + (2*4*8*2*8*2)
-            + (16*64*4) + (16*64*4);
+                                              // dynamic shmem: s_xq 4096 + s_xs 512 + s_wq 32768 + s_ws 2048
+                                              //              + s_gepi 4096 + s_uepi 4096 = 47,616 B.
+        let shmem: u32 = (2 * 4 * 16 * 32)
+            + (2 * 4 * 16 * 4)
+            + (2 * 4 * 8 * 2 * 8 * 32)
+            + (2 * 4 * 8 * 2 * 8 * 2)
+            + (16 * 64 * 4)
+            + (16 * 64 * 4);
         {
             use std::sync::atomic::{AtomicBool, Ordering};
             static LOGGED: AtomicBool = AtomicBool::new(false);
@@ -2515,7 +2665,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
             shared_mem_bytes: shmem,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(imma_fn)
                 .arg(normed)
                 .arg(gu_q)
@@ -2527,14 +2678,17 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .arg(&hd_u32)
                 .arg(&id_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe_grouped_gate_up_swiglu_q8_0_imma: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("moe_grouped_gate_up_swiglu_q8_0_imma: {e}"))
+                })?;
         }
     } else if tiled_enabled && is_bf16 {
         // BF16 f32act tiled gate_up. Rows tiled by TBF_BN=16 (u16-staged weights
         // to fit 48 KB shmem).
-        let bf_fn = kernels.moe_grouped_gate_up_swiglu_bf16_tiled_f32act.as_ref().unwrap();
+        let bf_fn = kernels
+            .moe_grouped_gate_up_swiglu_bf16_tiled_f32act
+            .as_ref()
+            .unwrap();
         let grid_y = (inter_dim as u32) / 16; // TBF_BN = 16 (shape-guarded exact)
         {
             use std::sync::atomic::{AtomicBool, Ordering};
@@ -2553,7 +2707,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(bf_fn)
                 .arg(normed)
                 .arg(layer_buf)
@@ -2565,13 +2720,18 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .arg(&hd_u32)
                 .arg(&id_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe_grouped_gate_up_swiglu_bf16_tiled_f32act: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "moe_grouped_gate_up_swiglu_bf16_tiled_f32act: {e}"
+                    ))
+                })?;
         }
     } else if tiled_enabled && is_q4 {
         // Q4_0 f32act tiled gate_up. Rows tiled by TQ4_BN=32.
-        let q4_fn = kernels.moe_grouped_gate_up_swiglu_q4_0_tiled_f32act.as_ref().unwrap();
+        let q4_fn = kernels
+            .moe_grouped_gate_up_swiglu_q4_0_tiled_f32act
+            .as_ref()
+            .unwrap();
         let grid_y = (inter_dim as u32) / 32; // TQ4_BN = 32 (shape-guarded exact)
         {
             use std::sync::atomic::{AtomicBool, Ordering};
@@ -2590,7 +2750,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(q4_fn)
                 .arg(normed)
                 .arg(layer_buf)
@@ -2602,14 +2763,19 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .arg(&hd_u32)
                 .arg(&id_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe_grouped_gate_up_swiglu_q4_0_tiled_f32act: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "moe_grouped_gate_up_swiglu_q4_0_tiled_f32act: {e}"
+                    ))
+                })?;
         }
     } else if tiled_enabled {
-        let tiled_fn = kernels.moe_grouped_gate_up_swiglu_q8_0_tiled.as_ref().unwrap();
+        let tiled_fn = kernels
+            .moe_grouped_gate_up_swiglu_q8_0_tiled
+            .as_ref()
+            .unwrap();
         let grid_y = (inter_dim as u32) / 64; // TGU_BN = 64 (shape-guarded exact)
-        // First-call engagement log (no-op after once).
+                                              // First-call engagement log (no-op after once).
         {
             use std::sync::atomic::{AtomicBool, Ordering};
             static LOGGED: AtomicBool = AtomicBool::new(false);
@@ -2627,7 +2793,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(tiled_fn)
                 .arg(normed)
                 .arg(layer_buf)
@@ -2639,14 +2806,17 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .arg(&hd_u32)
                 .arg(&id_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe_grouped_gate_up_swiglu_q8_0_tiled: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("moe_grouped_gate_up_swiglu_q8_0_tiled: {e}"))
+                })?;
         }
     } else if moe_grouped_mtiled_enabled()
         && kernels.moe_grouped_gate_up_swiglu_q8_0_mtiled.is_some()
     {
-        let mtiled_fn = kernels.moe_grouped_gate_up_swiglu_q8_0_mtiled.as_ref().unwrap();
+        let mtiled_fn = kernels
+            .moe_grouped_gate_up_swiglu_q8_0_mtiled
+            .as_ref()
+            .unwrap();
         const MG_MT: usize = 4;
         let grid_x = ((inter_dim as u32) + 3) / 4; // NR_GU = 4
         let grid_y = (((max_cols_per_expert + MG_MT - 1) / MG_MT).max(1)) as u32;
@@ -2657,7 +2827,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(mtiled_fn)
                 .arg(normed)
                 .arg(layer_buf)
@@ -2668,9 +2839,9 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .arg(&hd_u32)
                 .arg(&id_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe_grouped_gate_up_swiglu_q8_0_mtiled: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("moe_grouped_gate_up_swiglu_q8_0_mtiled: {e}"))
+                })?;
         }
     } else {
         // Q8 per-column fallback. Unreachable for q4 (caller guarantees the q4
@@ -2686,7 +2857,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
             shared_mem_bytes: (hidden_dim * 4) as u32,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(gate_up_fn)
                 .arg(normed)
                 .arg(layer_buf)
@@ -2698,7 +2870,9 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .arg(&id_u32)
                 .arg(&total_cols_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!("moe_grouped_gate_up_swiglu_q8_0: {e}")))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("moe_grouped_gate_up_swiglu_q8_0: {e}"))
+                })?;
         }
     }
 
@@ -2764,7 +2938,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         };
         let swiglu_view = g.swiglu_compact.slice(0..total_cols * inter_dim);
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(bf_down_fn)
                 .arg(&swiglu_view)
                 .arg(layer_buf)
@@ -2775,7 +2950,9 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .arg(&hd_u32)
                 .arg(&id_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!("moe_grouped_down_bf16_tiled_f32act: {e}")))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("moe_grouped_down_bf16_tiled_f32act: {e}"))
+                })?;
         }
     } else if down_q4_tiled {
         let q4_down_fn = kernels.moe_grouped_down_q4_0_tiled_f32act.as_ref().unwrap();
@@ -2798,7 +2975,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         };
         let swiglu_view = g.swiglu_compact.slice(0..total_cols * inter_dim);
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(q4_down_fn)
                 .arg(&swiglu_view)
                 .arg(layer_buf)
@@ -2809,7 +2987,9 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .arg(&hd_u32)
                 .arg(&id_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!("moe_grouped_down_q4_0_tiled_f32act: {e}")))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("moe_grouped_down_q4_0_tiled_f32act: {e}"))
+                })?;
         }
     } else if down_fast_bn128_ok {
         // consult `down_f32_fast_bn128` — REPACKED-plane, double-buffered,
@@ -2817,7 +2997,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         let down_fn = kernels.moe_grouped_down_q8_0_fast_bn128.as_ref().unwrap();
         let rp = repacked.unwrap();
         let grid_y = (hidden_dim as u32) / 128; // TD4_BN = 128
-        const TD4_SHMEM_BYTES: u32 = 2*4*8*17*16 + 2*4*128*8*4 + 2*4*128*2; // 52_224
+        const TD4_SHMEM_BYTES: u32 = 2 * 4 * 8 * 17 * 16 + 2 * 4 * 128 * 8 * 4 + 2 * 4 * 128 * 2; // 52_224
         {
             use std::sync::atomic::{AtomicBool, Ordering};
             static LOGGED: AtomicBool = AtomicBool::new(false);
@@ -2836,7 +3016,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         };
         let swiglu_view = g.swiglu_compact.slice(0..total_cols * inter_dim);
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(down_fn)
                 .arg(&swiglu_view)
                 .arg(&rp.down_q)
@@ -2847,7 +3028,9 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .arg(&hd_u32)
                 .arg(&id_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!("moe_grouped_down_q8_0_fast_bn128: {e}")))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("moe_grouped_down_q8_0_fast_bn128: {e}"))
+                })?;
         }
     } else if down_tiled_f32act_ok {
         let down_f32act_fn = kernels.moe_grouped_down_q8_0_tiled_f32act.as_ref().unwrap();
@@ -2870,7 +3053,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         };
         let swiglu_view = g.swiglu_compact.slice(0..total_cols * inter_dim);
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(down_f32act_fn)
                 .arg(&swiglu_view)
                 .arg(layer_buf)
@@ -2881,7 +3065,9 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .arg(&hd_u32)
                 .arg(&id_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!("moe_grouped_down_q8_0_tiled_f32act: {e}")))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("moe_grouped_down_q8_0_tiled_f32act: {e}"))
+                })?;
         }
     } else if down_tiled_ok {
         let down_tiled_fn = kernels.moe_grouped_down_q8_0_tiled.as_ref().unwrap();
@@ -2904,7 +3090,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         };
         let swiglu_view = g.swiglu_compact.slice(0..total_cols * inter_dim);
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(down_tiled_fn)
                 .arg(&swiglu_view)
                 .arg(layer_buf)
@@ -2934,7 +3121,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         // Split borrows: read swiglu_compact, write down_compact.
         let swiglu_view = g.swiglu_compact.slice(0..total_cols * inter_dim);
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(down_fn)
                 .arg(&swiglu_view)
                 .arg(layer_buf)
@@ -2961,7 +3149,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         };
         let down_view = g.down_compact.slice(0..total_cols * hidden_dim);
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(scatter_fn)
                 .arg(&down_view)
                 .arg(residual)
@@ -2971,7 +3160,9 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .arg(&hd_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!("moe_grouped_scatter_accum_q8_0: {e}")))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("moe_grouped_scatter_accum_q8_0: {e}"))
+                })?;
         }
     }
 
@@ -3001,7 +3192,7 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
     scratch: &mut CudaMoeScratch,
     meta: &CudaMoeMeta,
     layer_buf: &CudaSlice<u8>,
-    normed: &CudaSlice<f32>,   // [batch, hidden_dim]
+    normed: &CudaSlice<f32>,     // [batch, hidden_dim]
     output: &mut CudaSlice<f32>, // [batch, hidden_dim] in/out (residual+routed already present)
     batch: usize,
     hidden_dim: usize,
@@ -3026,14 +3217,21 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
             gate_slice.quant, up_slice.quant, down_slice.quant,
         )));
     }
-    let gemv_fn = kernels.shared_glu_gemv_q4_0_batched.as_ref().ok_or_else(|| {
-        RuntimeError::Compute("batched shared expert: shared_glu_gemv_q4_0_batched not loaded".into())
-    })?;
+    let gemv_fn = kernels
+        .shared_glu_gemv_q4_0_batched
+        .as_ref()
+        .ok_or_else(|| {
+            RuntimeError::Compute(
+                "batched shared expert: shared_glu_gemv_q4_0_batched not loaded".into(),
+            )
+        })?;
 
     // Derive effective shared inter_dim from the down weight (Q4_0, 32 elems/18 B).
     let down_len = down_slice.length as usize;
     if hidden_dim == 0 || down_len == 0 {
-        return Err(RuntimeError::Compute("batched shared expert: invalid dims".into()));
+        return Err(RuntimeError::Compute(
+            "batched shared expert: invalid dims".into(),
+        ));
     }
     let inter_dim_eff = (down_len * 32) / (hidden_dim * 18);
     if inter_dim_eff == 0 || inter_dim_eff % 32 != 0 {
@@ -3091,7 +3289,9 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
     let shared_tiled = moe_grouped_tiled_enabled()
         && moe_shared_tiled_enabled()
         && kernels.shared_glu_gemv_q4_0_batched_tiled_f32act.is_some()
-        && kernels.shared_down_q4_0_accum_batched_tiled_f32act.is_some()
+        && kernels
+            .shared_down_q4_0_accum_batched_tiled_f32act
+            .is_some()
         && hidden_dim % 256 == 0
         && hidden_dim % 64 == 0
         && inter_dim_eff % 32 == 0;
@@ -3108,9 +3308,12 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
 
     // ---- Stage 1: batched gate+up+SwiGLU. ----
     if shared_tiled {
-        let gemv_tiled_fn = kernels.shared_glu_gemv_q4_0_batched_tiled_f32act.as_ref().unwrap();
-        let grid_x = ((batch as u32) + 15) / 16;       // SBT_BM = 16
-        let grid_y = (inter_dim_eff as u32) / 32;      // SBT_BN = 32 (shape-guarded)
+        let gemv_tiled_fn = kernels
+            .shared_glu_gemv_q4_0_batched_tiled_f32act
+            .as_ref()
+            .unwrap();
+        let grid_x = ((batch as u32) + 15) / 16; // SBT_BM = 16
+        let grid_y = (inter_dim_eff as u32) / 32; // SBT_BN = 32 (shape-guarded)
         let g = scratch.prefill_grouped.as_mut().unwrap();
         let cfg = CudarcLaunchConfig {
             grid_dim: (grid_x, grid_y, 1),
@@ -3118,7 +3321,8 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(gemv_tiled_fn)
                 .arg(&gate_view)
                 .arg(&up_view)
@@ -3128,9 +3332,9 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
                 .arg(&hd_u32)
                 .arg(&batch_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "shared_glu_gemv_q4_0_batched_tiled_f32act: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("shared_glu_gemv_q4_0_batched_tiled_f32act: {e}"))
+                })?;
         }
     } else {
         let g = scratch.prefill_grouped.as_mut().unwrap();
@@ -3141,7 +3345,8 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
             shared_mem_bytes: (hidden_dim * 4) as u32,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(gemv_fn)
                 .arg(&gate_view)
                 .arg(&up_view)
@@ -3178,7 +3383,8 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
             .as_ref()
             .ok_or_else(|| {
                 RuntimeError::Compute(
-                    "batched shared expert: shared_down_q4_0_sigmoid_accum_batched not loaded".into(),
+                    "batched shared expert: shared_down_q4_0_sigmoid_accum_batched not loaded"
+                        .into(),
                 )
             })?;
         // Stage 2: per-token logit.
@@ -3190,7 +3396,8 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(dot_fn)
                     .arg(&gis_view)
                     .arg(normed)
@@ -3203,10 +3410,13 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
         }
         // Stage 3: down + sigmoid-gated accum into output.
         if shared_tiled {
-            let down_tiled_fn = kernels.shared_down_q4_0_accum_batched_tiled_f32act.as_ref().unwrap();
-            let grid_x = ((batch as u32) + 15) / 16;   // SBTD_BM = 16
-            let grid_y = (hidden_dim as u32) / 64;     // SBTD_BN = 64 (shape-guarded)
-            let gate_mode: u32 = 1;                     // sigmoid-gated
+            let down_tiled_fn = kernels
+                .shared_down_q4_0_accum_batched_tiled_f32act
+                .as_ref()
+                .unwrap();
+            let grid_x = ((batch as u32) + 15) / 16; // SBTD_BM = 16
+            let grid_y = (hidden_dim as u32) / 64; // SBTD_BN = 64 (shape-guarded)
+            let gate_mode: u32 = 1; // sigmoid-gated
             let g = scratch.prefill_grouped.as_ref().unwrap();
             let swiglu_view = g.shared_swiglu_batched.slice(0..batch * inter_dim_eff);
             let cfg = CudarcLaunchConfig {
@@ -3215,7 +3425,8 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(down_tiled_fn)
                     .arg(&down_view)
                     .arg(&swiglu_view)
@@ -3226,9 +3437,11 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
                     .arg(&batch_u32)
                     .arg(&gate_mode)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "shared_down_q4_0_accum_batched_tiled_f32act (sigmoid): {e}"
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "shared_down_q4_0_accum_batched_tiled_f32act (sigmoid): {e}"
+                        ))
+                    })?;
             }
         } else {
             let g = scratch.prefill_grouped.as_ref().unwrap();
@@ -3239,7 +3452,8 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(down_fn)
                     .arg(&down_view)
                     .arg(&swiglu_view)
@@ -3249,17 +3463,22 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
                     .arg(&ie_u32)
                     .arg(&batch_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "shared_down_q4_0_sigmoid_accum_batched: {e}"
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "shared_down_q4_0_sigmoid_accum_batched: {e}"
+                        ))
+                    })?;
             }
         }
     } else if shared_tiled {
         // No gate_inp + tiled: plain residual accumulate (gate_mode=0).
-        let down_tiled_fn = kernels.shared_down_q4_0_accum_batched_tiled_f32act.as_ref().unwrap();
-        let grid_x = ((batch as u32) + 15) / 16;   // SBTD_BM = 16
-        let grid_y = (hidden_dim as u32) / 64;     // SBTD_BN = 64 (shape-guarded)
-        let gate_mode: u32 = 0;                     // plain residual
+        let down_tiled_fn = kernels
+            .shared_down_q4_0_accum_batched_tiled_f32act
+            .as_ref()
+            .unwrap();
+        let grid_x = ((batch as u32) + 15) / 16; // SBTD_BM = 16
+        let grid_y = (hidden_dim as u32) / 64; // SBTD_BN = 64 (shape-guarded)
+        let gate_mode: u32 = 0; // plain residual
         let g = scratch.prefill_grouped.as_ref().unwrap();
         let swiglu_view = g.shared_swiglu_batched.slice(0..batch * inter_dim_eff);
         let cfg = CudarcLaunchConfig {
@@ -3268,7 +3487,8 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(down_tiled_fn)
                 .arg(&down_view)
                 .arg(&swiglu_view)
@@ -3279,9 +3499,11 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
                 .arg(&batch_u32)
                 .arg(&gate_mode)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "shared_down_q4_0_accum_batched_tiled_f32act (residual): {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "shared_down_q4_0_accum_batched_tiled_f32act (residual): {e}"
+                    ))
+                })?;
         }
     } else {
         // No gate_inp: plain residual accumulate.
@@ -3290,7 +3512,8 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
             .as_ref()
             .ok_or_else(|| {
                 RuntimeError::Compute(
-                    "batched shared expert: shared_down_q4_0_residual_accum_batched not loaded".into(),
+                    "batched shared expert: shared_down_q4_0_residual_accum_batched not loaded"
+                        .into(),
                 )
             })?;
         let g = scratch.prefill_grouped.as_ref().unwrap();
@@ -3301,7 +3524,8 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(down_fn)
                 .arg(&down_view)
                 .arg(&swiglu_view)
@@ -3310,9 +3534,9 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
                 .arg(&ie_u32)
                 .arg(&batch_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "shared_down_q4_0_residual_accum_batched: {e}"
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("shared_down_q4_0_residual_accum_batched: {e}"))
+                })?;
         }
     }
 
@@ -3388,9 +3612,7 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
     // The fused-norm-router kernel (`moe_router_rmsnorm_atomic_v3`) is Q8_0-
     // specific; for non-Q8 paths we synthesize the RMSNorm here and then
     // delegate. This is the same pattern T3's single-CTA fallback already uses.
-    if meta.expert_gate_quant == QuantScheme::Bf16
-        && meta.expert_down_quant == QuantScheme::Bf16
-    {
+    if meta.expert_gate_quant == QuantScheme::Bf16 && meta.expert_down_quant == QuantScheme::Bf16 {
         // Run the standalone RMSNorm into normed_x, then delegate.
         let bs = super::decode::rmsnorm_block_size(hidden_dim);
         let cfg = CudarcLaunchConfig {
@@ -3400,7 +3622,8 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
         };
         let dim = hidden_dim as u32;
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(&kernels.rmsnorm)
                 .arg(attn_proj)
                 .arg(ffn_norm)
@@ -3408,19 +3631,27 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
                 .arg(&eps)
                 .arg(&dim)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "MoE BF16 fallback ffn_norm rmsnorm: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("MoE BF16 fallback ffn_norm rmsnorm: {e}",))
+                })?;
         }
         return encode_moe_ffn_decode(
-            device, kernels, scratch, meta, batched_offsets, layer_buf,
-            &normed_x.as_view(), residual, output_x,
-            hidden_dim, inter_dim, num_experts, top_k,
+            device,
+            kernels,
+            scratch,
+            meta,
+            batched_offsets,
+            layer_buf,
+            &normed_x.as_view(),
+            residual,
+            output_x,
+            hidden_dim,
+            inter_dim,
+            num_experts,
+            top_k,
         );
     }
-    if meta.expert_gate_quant == QuantScheme::Q4_0
-        && meta.expert_down_quant == QuantScheme::Q4_0
-    {
+    if meta.expert_gate_quant == QuantScheme::Q4_0 && meta.expert_down_quant == QuantScheme::Q4_0 {
         // Run the standalone RMSNorm into normed_x, then delegate.
         let bs = super::decode::rmsnorm_block_size(hidden_dim);
         let cfg = CudarcLaunchConfig {
@@ -3430,7 +3661,8 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
         };
         let dim = hidden_dim as u32;
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(&kernels.rmsnorm)
                 .arg(attn_proj)
                 .arg(ffn_norm)
@@ -3438,21 +3670,29 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
                 .arg(&eps)
                 .arg(&dim)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "MoE Q4_0 fallback ffn_norm rmsnorm: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("MoE Q4_0 fallback ffn_norm rmsnorm: {e}",))
+                })?;
         }
         return encode_moe_ffn_decode(
-            device, kernels, scratch, meta, batched_offsets, layer_buf,
-            &normed_x.as_view(), residual, output_x,
-            hidden_dim, inter_dim, num_experts, top_k,
+            device,
+            kernels,
+            scratch,
+            meta,
+            batched_offsets,
+            layer_buf,
+            &normed_x.as_view(),
+            residual,
+            output_x,
+            hidden_dim,
+            inter_dim,
+            num_experts,
+            top_k,
         );
     }
 
     // Remaining quant combinations are unsupported (mixed quant, F16, etc.).
-    if meta.expert_gate_quant != QuantScheme::Q8_0
-        || meta.expert_down_quant != QuantScheme::Q8_0
-    {
+    if meta.expert_gate_quant != QuantScheme::Q8_0 || meta.expert_down_quant != QuantScheme::Q8_0 {
         return Err(RuntimeError::Unsupported(format!(
             "CUDA MoE FFN: gate_quant={:?} down_quant={:?} not yet supported \
 ",
@@ -3498,7 +3738,8 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
             };
             let dim = hidden_dim as u32;
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(&kernels.rmsnorm)
                     .arg(attn_proj)
                     .arg(ffn_norm)
@@ -3506,9 +3747,9 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
                     .arg(&eps)
                     .arg(&dim)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "MoE fallback ffn_norm rmsnorm: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("MoE fallback ffn_norm rmsnorm: {e}",))
+                    })?;
             }
         }
         // Now `normed_x` is filled by the standalone kernel — delegate.
@@ -3574,10 +3815,11 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
     }
     let byte_view = layer_buf.slice(router_off..router_off + router_bytes_needed);
     let router_view: cudarc::driver::CudaView<'_, f32> = unsafe {
-        byte_view.transmute::<f32>(num_experts * hidden_dim)
-            .ok_or_else(|| RuntimeError::Compute(
-                "moe v3 router transmute<f32> returned None".into(),
-            ))?
+        byte_view
+            .transmute::<f32>(num_experts * hidden_dim)
+            .ok_or_else(|| {
+                RuntimeError::Compute("moe v3 router transmute<f32> returned None".into())
+            })?
     };
 
     // ---- Phase 1 (FUSED): RMSNorm + atomic-counter parallel logits + softmax + top-K. ----
@@ -3603,10 +3845,11 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
     // reads garbage expert_ids and computes out-of-bounds offsets into
     // layer_buf via gate_up_offsets[expert_id * 2], faulting with
     // CUDA_ERROR_ILLEGAL_ADDRESS — appearing in gate_up_v3, but rooted here.
-    device.htod_copy_into(&[0u32], &mut scratch.router_done_counter)
-        .map_err(|e| RuntimeError::Compute(format!(
-            "moe v3 done_counter reset (defensive): {e}",
-        )))?;
+    device
+        .htod_copy_into(&[0u32], &mut scratch.router_done_counter)
+        .map_err(|e| {
+            RuntimeError::Compute(format!("moe v3 done_counter reset (defensive): {e}",))
+        })?;
     {
         let smem_bytes = (hidden_dim * 4) as u32;
         let cfg = CudarcLaunchConfig {
@@ -3615,7 +3858,8 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
             shared_mem_bytes: smem_bytes,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(fused_norm_router_fn)
                 .arg(attn_proj)
                 .arg(ffn_norm)
@@ -3630,9 +3874,9 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
                 .arg(&ne_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe_router_rmsnorm_atomic_v3: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("moe_router_rmsnorm_atomic_v3: {e}",))
+                })?;
         }
     }
 
@@ -3640,7 +3884,9 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
     if std::env::var("LUMEN_DUMP_EXPERTS").is_ok() {
         device.synchronize()?;
         let ids = device.dtoh_copy(&scratch.expert_ids).unwrap_or_default();
-        let ws = device.dtoh_copy(&scratch.expert_weights).unwrap_or_default();
+        let ws = device
+            .dtoh_copy(&scratch.expert_weights)
+            .unwrap_or_default();
         let n = MOE_DUMP_CALL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         eprintln!("MOE_EXPERT_DUMP call={n} ids={ids:?} weights={ws:?}");
     }
@@ -3655,9 +3901,8 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
         && kernels.mmv_q_moe_down_q8_0.is_some();
     if use_mmv_q_moe_dp4a {
         return encode_moe_ffn_dp4a_dispatch_q8(
-            device, kernels, scratch, bo, layer_buf,
-            normed_x, residual, output_x,
-            hidden_dim, inter_dim, top_k,
+            device, kernels, scratch, bo, layer_buf, normed_x, residual, output_x, hidden_dim,
+            inter_dim, top_k,
         );
     }
 
@@ -3679,7 +3924,8 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
             shared_mem_bytes: smem_gate_up,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(gate_up_fn)
                 .arg(layer_buf)
                 .arg(&bo.gate_up_offsets)
@@ -3690,10 +3936,12 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
                 .arg(&id_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe_batched_gate_up_swiglu_q8_0_v{}: {e}",
-                    if use_v3_gateup_down { "3" } else { "2" },
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "moe_batched_gate_up_swiglu_q8_0_v{}: {e}",
+                        if use_v3_gateup_down { "3" } else { "2" },
+                    ))
+                })?;
         }
     }
 
@@ -3705,7 +3953,8 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
             shared_mem_bytes: smem_down,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(down_fn)
                 .arg(layer_buf)
                 .arg(&bo.down_offsets)
@@ -3716,10 +3965,12 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
                 .arg(&id_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe_batched_down_v{}: {e}",
-                    if use_v3_gateup_down { "3" } else { "2" },
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "moe_batched_down_v{}: {e}",
+                        if use_v3_gateup_down { "3" } else { "2" },
+                    ))
+                })?;
         }
     }
 
@@ -3731,7 +3982,8 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(accum_fn)
                 .arg(output_x)
                 .arg(residual)
@@ -3740,9 +3992,11 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
                 .arg(&hd_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe_expert_accum_option_a (fused v3 path): {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(
+                        format!("moe_expert_accum_option_a (fused v3 path): {e}",),
+                    )
+                })?;
         }
     }
 
@@ -3789,7 +4043,9 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q8(
     let quantize_swiglu_fn = kernels.quantize_q8_1_moe_swiglu.as_ref().unwrap();
     let down_fn = kernels.mmv_q_moe_down_q8_0.as_ref().unwrap();
     let accum_fn = kernels.moe_expert_accum_option_a.as_ref().ok_or_else(|| {
-        RuntimeError::Compute("moe_expert_accum_option_a kernel not loaded (mmv_q_moe_dp4a path)".into())
+        RuntimeError::Compute(
+            "moe_expert_accum_option_a kernel not loaded (mmv_q_moe_dp4a path)".into(),
+        )
     })?;
 
     let hd_u32 = hidden_dim as u32;
@@ -3807,7 +4063,8 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q8(
     if normed_blocks * 36 > scratch.mmv_q_moe_normed_q8_1.len() {
         return Err(RuntimeError::Compute(format!(
             "mmv_q_moe_normed_q8_1 scratch too small: have {} need {} (hidden_dim={hidden_dim})",
-            scratch.mmv_q_moe_normed_q8_1.len(), normed_blocks * 36,
+            scratch.mmv_q_moe_normed_q8_1.len(),
+            normed_blocks * 36,
         )));
     }
     let swiglu_blocks = (inter_dim + 31) / 32;
@@ -3827,15 +4084,14 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q8(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(quantize_normed_fn)
                 .arg(normed_x)
                 .arg(&mut scratch.mmv_q_moe_normed_q8_1)
                 .arg(&hd_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "quantize_q8_1_moe: {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("quantize_q8_1_moe: {e}",)))?;
         }
     }
 
@@ -3849,7 +4105,8 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q8(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(gate_up_fn)
                 .arg(&scratch.mmv_q_moe_normed_q8_1)
                 .arg(layer_buf)
@@ -3860,9 +4117,9 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q8(
                 .arg(&id_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "mmv_q_moe_gate_up_swiglu_q8_0: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("mmv_q_moe_gate_up_swiglu_q8_0: {e}",))
+                })?;
         }
     }
 
@@ -3875,16 +4132,15 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q8(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(quantize_swiglu_fn)
                 .arg(&scratch.batched_swiglu_buf)
                 .arg(&mut scratch.mmv_q_moe_swiglu_q8_1)
                 .arg(&id_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "quantize_q8_1_moe_swiglu: {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("quantize_q8_1_moe_swiglu: {e}",)))?;
         }
     }
 
@@ -3898,7 +4154,8 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q8(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(down_fn)
                 .arg(&scratch.mmv_q_moe_swiglu_q8_1)
                 .arg(layer_buf)
@@ -3909,9 +4166,7 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q8(
                 .arg(&id_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "mmv_q_moe_down_q8_0: {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("mmv_q_moe_down_q8_0: {e}",)))?;
         }
     }
 
@@ -3923,7 +4178,8 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q8(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(accum_fn)
                 .arg(output_x)
                 .arg(residual)
@@ -3932,9 +4188,11 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q8(
                 .arg(&hd_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe_expert_accum_option_a (mmv_q_moe_dp4a path): {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "moe_expert_accum_option_a (mmv_q_moe_dp4a path): {e}",
+                    ))
+                })?;
         }
     }
 
@@ -3963,7 +4221,9 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q4(
     let quantize_swiglu_fn = kernels.quantize_q8_1_moe_swiglu.as_ref().unwrap();
     let down_fn = kernels.mmv_q_moe_down_q4_0.as_ref().unwrap();
     let accum_fn = kernels.moe_expert_accum_option_a.as_ref().ok_or_else(|| {
-        RuntimeError::Compute("moe_expert_accum_option_a kernel not loaded (mmv_q_moe_dp4a Q4 path)".into())
+        RuntimeError::Compute(
+            "moe_expert_accum_option_a kernel not loaded (mmv_q_moe_dp4a Q4 path)".into(),
+        )
     })?;
 
     let hd_u32 = hidden_dim as u32;
@@ -3973,7 +4233,8 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q4(
     if top_k * inter_dim > scratch.batched_swiglu_buf.len() {
         return Err(RuntimeError::Compute(format!(
             "mmv_q_moe_dp4a Q4 batched_swiglu_buf too small: have {} need {}",
-            scratch.batched_swiglu_buf.len(), top_k * inter_dim,
+            scratch.batched_swiglu_buf.len(),
+            top_k * inter_dim,
         )));
     }
     let normed_blocks = (hidden_dim + 31) / 32;
@@ -3987,15 +4248,14 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q4(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(quantize_normed_fn)
                 .arg(normed_x)
                 .arg(&mut scratch.mmv_q_moe_normed_q8_1)
                 .arg(&hd_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "quantize_q8_1_moe (Q4 path): {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("quantize_q8_1_moe (Q4 path): {e}",)))?;
         }
     }
 
@@ -4008,7 +4268,8 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q4(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(gate_up_fn)
                 .arg(&scratch.mmv_q_moe_normed_q8_1)
                 .arg(layer_buf)
@@ -4019,9 +4280,9 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q4(
                 .arg(&id_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "mmv_q_moe_gate_up_swiglu_q4_0: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("mmv_q_moe_gate_up_swiglu_q4_0: {e}",))
+                })?;
         }
     }
 
@@ -4033,16 +4294,17 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q4(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(quantize_swiglu_fn)
                 .arg(&scratch.batched_swiglu_buf)
                 .arg(&mut scratch.mmv_q_moe_swiglu_q8_1)
                 .arg(&id_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "quantize_q8_1_moe_swiglu (Q4 path): {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("quantize_q8_1_moe_swiglu (Q4 path): {e}",))
+                })?;
         }
     }
 
@@ -4055,7 +4317,8 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q4(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(down_fn)
                 .arg(&scratch.mmv_q_moe_swiglu_q8_1)
                 .arg(layer_buf)
@@ -4066,9 +4329,7 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q4(
                 .arg(&id_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "mmv_q_moe_down_q4_0: {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("mmv_q_moe_down_q4_0: {e}",)))?;
         }
     }
 
@@ -4081,7 +4342,8 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q4(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(accum_fn)
                 .arg(output_x)
                 .arg(residual)
@@ -4090,9 +4352,11 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q4(
                 .arg(&hd_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe_expert_accum_option_a (mmv_q_moe_dp4a Q4 path): {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "moe_expert_accum_option_a (mmv_q_moe_dp4a Q4 path): {e}",
+                    ))
+                })?;
         }
     }
 
@@ -4177,10 +4441,11 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
     // qwen35_moe.rs:317 forces dequant=true). Offset 4-byte aligned,
     // length exact.
     let router_view: cudarc::driver::CudaView<'_, f32> = unsafe {
-        byte_view.transmute::<f32>(num_experts * hidden_dim)
-            .ok_or_else(|| RuntimeError::Compute(
-                "moe bf16 router transmute<f32> returned None".into(),
-            ))?
+        byte_view
+            .transmute::<f32>(num_experts * hidden_dim)
+            .ok_or_else(|| {
+                RuntimeError::Compute("moe bf16 router transmute<f32> returned None".into())
+            })?
     };
 
     let use_router_parallel = moe_router_parallel_enabled()
@@ -4209,7 +4474,8 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(logits_fn)
                 .arg(normed_x)
                 .arg(&router_view)
@@ -4217,14 +4483,14 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                 .arg(&hd_u32)
                 .arg(&ne_u32)
                 .launch(cfg_logits)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe bf16 router_logits_v2: {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("moe bf16 router_logits_v2: {e}",)))?;
         }
         let use_topk_moe_fused = topk_moe_fused_enabled();
         let lc_fn = if use_topk_moe_fused {
             topk_moe_fused_kernel_for(kernels, num_experts)
-        } else { None };
+        } else {
+            None
+        };
         if let Some(lc_fn) = lc_fn {
             let n_rows: i32 = 1;
             let n_expert_used: i32 = top_k as i32;
@@ -4239,7 +4505,8 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(lc_fn)
                     .arg(&scratch.router_logits)
                     .arg(&mut scratch.expert_weights)
@@ -4252,9 +4519,9 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                     .arg(&with_norm_u)
                     .arg(&delayed_softmax_u)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe bf16 topk_moe_fused finalize: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe bf16 topk_moe_fused finalize: {e}",))
+                    })?;
             }
         } else {
             let finalize_fn = kernels.moe_router_softmax_finalize_v2.as_ref().unwrap();
@@ -4264,7 +4531,8 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(finalize_fn)
                     .arg(&mut scratch.router_logits)
                     .arg(&mut scratch.expert_ids)
@@ -4272,9 +4540,9 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                     .arg(&ne_u32)
                     .arg(&tk_u32)
                     .launch(cfg_final)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe bf16 router_softmax_finalize_v2: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe bf16 router_softmax_finalize_v2: {e}",))
+                    })?;
             }
         }
     } else {
@@ -4288,7 +4556,8 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(router_fn)
                 .arg(normed_x)
                 .arg(&router_view)
@@ -4298,9 +4567,7 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                 .arg(&ne_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe bf16 router softmax: {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("moe bf16 router softmax: {e}",)))?;
         }
     }
 
@@ -4339,7 +4606,7 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
         let inter_grid_v3 = ((inter_dim as u32) + NR_BF16_V3 - 1) / NR_BF16_V3;
         let hidden_grid_v3 = ((hidden_dim as u32) + NR_BF16_V3 - 1) / NR_BF16_V3;
         let smem_gate_up = (hidden_dim * 4) as u32; // F32 normed_x cache
-        let smem_down = (inter_dim * 4) as u32;     // F32 swiglu cache
+        let smem_down = (inter_dim * 4) as u32; // F32 swiglu cache
 
         if top_k * inter_dim > scratch.batched_swiglu_buf.len() {
             return Err(RuntimeError::Compute(format!(
@@ -4361,7 +4628,8 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                 shared_mem_bytes: smem_gate_up,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(gate_up_fn)
                     .arg(normed_x)
                     .arg(layer_buf)
@@ -4372,9 +4640,9 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                     .arg(&id_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_batched_gate_up_swiglu_bf16_v3: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_batched_gate_up_swiglu_bf16_v3: {e}",))
+                    })?;
             }
         }
         // Phase 3a: cooperative down -> per-expert outputs in expert_output_buf.
@@ -4385,7 +4653,8 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                 shared_mem_bytes: smem_down,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(down_fn)
                     .arg(&scratch.batched_swiglu_buf)
                     .arg(layer_buf)
@@ -4396,9 +4665,9 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                     .arg(&id_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_batched_down_bf16_v3: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_batched_down_bf16_v3: {e}",))
+                    })?;
             }
         }
         // Phase 3b: weighted accumulate (existing F32 kernel, reused).
@@ -4410,7 +4679,8 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(accum_fn)
                     .arg(output_x)
                     .arg(residual)
@@ -4419,9 +4689,11 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                     .arg(&hd_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_expert_accum_option_a (bf16 v3 path): {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "moe_expert_accum_option_a (bf16 v3 path): {e}",
+                        ))
+                    })?;
             }
         }
         let _ = num_experts;
@@ -4461,7 +4733,8 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(gate_up_fn)
                     .arg(normed_x)
                     .arg(layer_buf)
@@ -4472,9 +4745,9 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                     .arg(&id_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_batched_gate_up_swiglu_bf16: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_batched_gate_up_swiglu_bf16: {e}",))
+                    })?;
             }
         }
         // Phase 3: batched down + weighted accum (fuses post-accum into one launch).
@@ -4485,7 +4758,8 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(down_acc_fn)
                     .arg(&scratch.batched_swiglu_buf)
                     .arg(layer_buf)
@@ -4498,9 +4772,9 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                     .arg(&id_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_batched_down_accum_bf16: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_batched_down_accum_bf16: {e}",))
+                    })?;
             }
         }
         let _ = num_experts;
@@ -4508,12 +4782,16 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
     }
 
     // ---- Per-expert path (default; reference implementation) ----
-    let gate_up_fn = kernels.moe_expert_gate_up_swiglu_bf16.as_ref().ok_or_else(|| {
-        RuntimeError::Compute("moe_expert_gate_up_swiglu_bf16 kernel not compiled".into())
-    })?;
-    let down_fn = kernels.moe_expert_down_bf16.as_ref().ok_or_else(|| {
-        RuntimeError::Compute("moe_expert_down_bf16 kernel not compiled".into())
-    })?;
+    let gate_up_fn = kernels
+        .moe_expert_gate_up_swiglu_bf16
+        .as_ref()
+        .ok_or_else(|| {
+            RuntimeError::Compute("moe_expert_gate_up_swiglu_bf16 kernel not compiled".into())
+        })?;
+    let down_fn = kernels
+        .moe_expert_down_bf16
+        .as_ref()
+        .ok_or_else(|| RuntimeError::Compute("moe_expert_down_bf16 kernel not compiled".into()))?;
     let accum_fn = kernels.moe_expert_accum_option_a.as_ref().ok_or_else(|| {
         RuntimeError::Compute("moe_expert_accum_option_a kernel not compiled".into())
     })?;
@@ -4546,7 +4824,8 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(gate_up_fn)
                     .arg(normed_x)
                     .arg(layer_buf)
@@ -4556,9 +4835,9 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                     .arg(&hd_u32)
                     .arg(&id_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_expert_gate_up_swiglu_bf16 k={k}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_expert_gate_up_swiglu_bf16 k={k}: {e}",))
+                    })?;
             }
         }
         // down -> expert_output_buf[k * hidden_dim ..].
@@ -4578,7 +4857,8 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
             }
             let mut slot_view = scratch.expert_output_buf.slice_mut(slot_start..slot_end);
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(down_fn)
                     .arg(&scratch.gate_buf)
                     .arg(layer_buf)
@@ -4587,9 +4867,9 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                     .arg(&hd_u32)
                     .arg(&id_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_expert_down_bf16 k={k}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_expert_down_bf16 k={k}: {e}",))
+                    })?;
             }
         }
     }
@@ -4603,7 +4883,8 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
         };
         let tk_u32 = top_k as u32;
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(accum_fn)
                 .arg(output_x)
                 .arg(residual)
@@ -4612,9 +4893,9 @@ pub(crate) fn encode_moe_ffn_decode_bf16(
                 .arg(&hd_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe_expert_accum_option_a (bf16 path): {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("moe_expert_accum_option_a (bf16 path): {e}",))
+                })?;
         }
     }
 
@@ -4657,9 +4938,7 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
     use cudarc::driver::{LaunchConfig as CudarcLaunchConfig, PushKernelArg};
 
     // Defensive: caller already verified quant is Q4_0.
-    if meta.expert_gate_quant != QuantScheme::Q4_0
-        || meta.expert_down_quant != QuantScheme::Q4_0
-    {
+    if meta.expert_gate_quant != QuantScheme::Q4_0 || meta.expert_down_quant != QuantScheme::Q4_0 {
         return Err(RuntimeError::Compute(format!(
             "encode_moe_ffn_decode_q4_0 called with non-Q4_0 quant: gate={:?} down={:?}",
             meta.expert_gate_quant, meta.expert_down_quant,
@@ -4682,11 +4961,11 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
     }
     let byte_view = layer_buf.slice(router_off..router_off + router_bytes_needed);
     let router_view: cudarc::driver::CudaView<'_, f32> = unsafe {
-        byte_view.transmute::<f32>(num_experts * hidden_dim).ok_or_else(|| {
-            RuntimeError::Compute(
-                "moe q4_0 router transmute<f32> returned None".into(),
-            )
-        })?
+        byte_view
+            .transmute::<f32>(num_experts * hidden_dim)
+            .ok_or_else(|| {
+                RuntimeError::Compute("moe q4_0 router transmute<f32> returned None".into())
+            })?
     };
 
     let hd_u32 = hidden_dim as u32;
@@ -4754,7 +5033,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(logits_fn)
                 .arg(normed_x)
                 .arg(&router_view)
@@ -4762,14 +5042,14 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                 .arg(&hd_u32)
                 .arg(&ne_u32)
                 .launch(cfg_logits)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe q4_0 router_logits_v2: {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("moe q4_0 router_logits_v2: {e}",)))?;
         }
         let use_topk_moe_fused = topk_moe_fused_enabled();
         let lc_fn = if use_topk_moe_fused {
             topk_moe_fused_kernel_for(kernels, num_experts)
-        } else { None };
+        } else {
+            None
+        };
         if let Some(lc_fn) = lc_fn {
             let n_rows: i32 = 1;
             let n_expert_used: i32 = top_k as i32;
@@ -4784,7 +5064,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(lc_fn)
                     .arg(&scratch.router_logits)
                     .arg(&mut scratch.expert_weights)
@@ -4797,9 +5078,9 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                     .arg(&with_norm_u)
                     .arg(&delayed_softmax_u)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe q4_0 topk_moe_fused finalize: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe q4_0 topk_moe_fused finalize: {e}",))
+                    })?;
             }
         } else {
             let finalize_fn = kernels.moe_router_softmax_finalize_v2.as_ref().unwrap();
@@ -4809,7 +5090,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(finalize_fn)
                     .arg(&mut scratch.router_logits)
                     .arg(&mut scratch.expert_ids)
@@ -4817,9 +5099,9 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                     .arg(&ne_u32)
                     .arg(&tk_u32)
                     .launch(cfg_final)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe q4_0 router_softmax_finalize_v2: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe q4_0 router_softmax_finalize_v2: {e}",))
+                    })?;
             }
         }
     } else if use_router_v2 {
@@ -4831,7 +5113,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
             shared_mem_bytes: smem_bytes,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(router_fn)
                 .arg(normed_x)
                 .arg(&router_view)
@@ -4841,9 +5124,7 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                 .arg(&ne_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe q4_0 router_fused_v2: {e}",
-                )))?;
+                .map_err(|e| RuntimeError::Compute(format!("moe q4_0 router_fused_v2: {e}",)))?;
         }
     } else {
         let router_fn = kernels.moe_router_softmax.as_ref().ok_or_else(|| {
@@ -4855,7 +5136,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(router_fn)
                 .arg(normed_x)
                 .arg(&router_view)
@@ -4865,9 +5147,9 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                 .arg(&ne_u32)
                 .arg(&tk_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "moe q4_0 router_softmax (V1 fallback): {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("moe q4_0 router_softmax (V1 fallback): {e}",))
+                })?;
         }
     }
 
@@ -4900,13 +5182,20 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
             {
                 eprintln!(
                     "Q4 V3 cooperative-CTA path ENGAGED ({})",
-                    if use_v3b { "V3b high-MLP, 1 row/CTA" } else { "V3 NR=4" }
+                    if use_v3b {
+                        "V3b high-MLP, 1 row/CTA"
+                    } else {
+                        "V3 NR=4"
+                    }
                 );
             }
         }
         let bo = batched_offsets.unwrap();
         let gate_up_fn = if use_v3b {
-            kernels.moe_batched_gate_up_swiglu_q4_0_v3b.as_ref().unwrap()
+            kernels
+                .moe_batched_gate_up_swiglu_q4_0_v3b
+                .as_ref()
+                .unwrap()
         } else {
             kernels.moe_batched_gate_up_swiglu_q4_0_v3.as_ref().unwrap()
         };
@@ -4930,7 +5219,7 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
             ((hidden_dim as u32) + NR_Q4_V3 - 1) / NR_Q4_V3
         };
         let smem_gate_up = (hidden_dim * 4) as u32; // F32 normed_x cache
-        let smem_down = (inter_dim * 4) as u32;     // F32 swiglu cache
+        let smem_down = (inter_dim * 4) as u32; // F32 swiglu cache
 
         // ---- Q4_0 batched MoE FFN matvec path. ----
         let use_mmv_q_moe_dp4a_q4 = mmv_q_moe_dp4a_enabled()
@@ -4940,9 +5229,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
             && kernels.mmv_q_moe_down_q4_0.is_some();
         if use_mmv_q_moe_dp4a_q4 {
             return encode_moe_ffn_dp4a_dispatch_q4(
-                device, kernels, scratch, bo, layer_buf,
-                normed_x, residual, output_x,
-                hidden_dim, inter_dim, top_k,
+                device, kernels, scratch, bo, layer_buf, normed_x, residual, output_x, hidden_dim,
+                inter_dim, top_k,
             );
         }
 
@@ -4967,7 +5255,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                 shared_mem_bytes: smem_gate_up,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(gate_up_fn)
                     .arg(normed_x)
                     .arg(layer_buf)
@@ -4978,9 +5267,9 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                     .arg(&id_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_batched_gate_up_swiglu_q4_0_v3: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_batched_gate_up_swiglu_q4_0_v3: {e}",))
+                    })?;
             }
         }
 
@@ -4992,7 +5281,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                 shared_mem_bytes: smem_down,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(down_fn)
                     .arg(&scratch.batched_swiglu_buf)
                     .arg(layer_buf)
@@ -5003,9 +5293,9 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                     .arg(&id_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_batched_down_q4_0_v3: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_batched_down_q4_0_v3: {e}",))
+                    })?;
             }
         }
 
@@ -5018,7 +5308,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(accum_fn)
                     .arg(output_x)
                     .arg(residual)
@@ -5027,9 +5318,11 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                     .arg(&hd_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe q4_0 expert_accum_option_a (V3 path): {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "moe q4_0 expert_accum_option_a (V3 path): {e}",
+                        ))
+                    })?;
             }
         }
         let _ = num_experts;
@@ -5072,7 +5365,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                 shared_mem_bytes: smem_gate_up,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(gate_up_fn)
                     .arg(normed_x)
                     .arg(layer_buf)
@@ -5083,9 +5377,11 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                     .arg(&id_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe q4_0 batched_gate_up_swiglu_q4_0_v2: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "moe q4_0 batched_gate_up_swiglu_q4_0_v2: {e}",
+                        ))
+                    })?;
             }
         }
 
@@ -5097,7 +5393,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                 shared_mem_bytes: smem_down,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(down_fn)
                     .arg(&scratch.batched_swiglu_buf)
                     .arg(layer_buf)
@@ -5108,9 +5405,9 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                     .arg(&id_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe q4_0 batched_down_v2_q4_0: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe q4_0 batched_down_v2_q4_0: {e}",))
+                    })?;
             }
         }
 
@@ -5123,7 +5420,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(accum_fn)
                     .arg(output_x)
                     .arg(residual)
@@ -5132,9 +5430,11 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                     .arg(&hd_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe q4_0 expert_accum_option_a (V2 path): {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "moe q4_0 expert_accum_option_a (V2 path): {e}",
+                        ))
+                    })?;
             }
         }
         let _ = num_experts;
@@ -5169,7 +5469,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(gate_up_fn)
                     .arg(normed_x)
                     .arg(layer_buf)
@@ -5180,9 +5481,9 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                     .arg(&id_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe q4_0 batched_gate_up_swiglu: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe q4_0 batched_gate_up_swiglu: {e}",))
+                    })?;
             }
         }
 
@@ -5194,7 +5495,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(down_acc_fn)
                     .arg(&scratch.batched_swiglu_buf)
                     .arg(layer_buf)
@@ -5207,9 +5509,9 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                     .arg(&id_u32)
                     .arg(&tk_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe q4_0 batched_down_accum: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe q4_0 batched_down_accum: {e}",))
+                    })?;
             }
         }
         let _ = num_experts;
@@ -5220,12 +5522,16 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
     device.synchronize()?;
     let expert_ids_host = device.dtoh_copy(&scratch.expert_ids)?;
 
-    let gate_up_fn = kernels.moe_expert_gate_up_swiglu_q4_0.as_ref().ok_or_else(|| {
-        RuntimeError::Compute("moe_expert_gate_up_swiglu_q4_0 kernel not compiled".into())
-    })?;
-    let down_fn = kernels.moe_expert_down_q4_0.as_ref().ok_or_else(|| {
-        RuntimeError::Compute("moe_expert_down_q4_0 kernel not compiled".into())
-    })?;
+    let gate_up_fn = kernels
+        .moe_expert_gate_up_swiglu_q4_0
+        .as_ref()
+        .ok_or_else(|| {
+            RuntimeError::Compute("moe_expert_gate_up_swiglu_q4_0 kernel not compiled".into())
+        })?;
+    let down_fn = kernels
+        .moe_expert_down_q4_0
+        .as_ref()
+        .ok_or_else(|| RuntimeError::Compute("moe_expert_down_q4_0 kernel not compiled".into()))?;
 
     let inter_grid = ((inter_dim + 127) / 128) as u32;
     let hidden_grid = ((hidden_dim + 127) / 128) as u32;
@@ -5249,7 +5555,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(gate_up_fn)
                     .arg(normed_x)
                     .arg(layer_buf)
@@ -5259,9 +5566,9 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                     .arg(&hd_u32)
                     .arg(&id_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_expert_gate_up_swiglu_q4_0 k={k}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_expert_gate_up_swiglu_q4_0 k={k}: {e}",))
+                    })?;
             }
         }
 
@@ -5282,7 +5589,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
             }
             let mut slot_view = scratch.expert_output_buf.slice_mut(slot_start..slot_end);
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(down_fn)
                     .arg(&scratch.gate_buf)
                     .arg(layer_buf)
@@ -5291,9 +5599,9 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
                     .arg(&hd_u32)
                     .arg(&id_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "moe_expert_down_q4_0 k={k}: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("moe_expert_down_q4_0 k={k}: {e}",))
+                    })?;
             }
         }
     }
@@ -5308,7 +5616,8 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
         shared_mem_bytes: 0,
     };
     unsafe {
-        device.stream
+        device
+            .stream
             .launch_builder(accum_fn)
             .arg(output_x)
             .arg(residual)
@@ -5317,9 +5626,7 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
             .arg(&hd_u32)
             .arg(&tk_u32)
             .launch(cfg)
-            .map_err(|e| RuntimeError::Compute(format!(
-                "moe q4_0 expert_accum_option_a: {e}",
-            )))?;
+            .map_err(|e| RuntimeError::Compute(format!("moe q4_0 expert_accum_option_a: {e}",)))?;
     }
 
     Ok(())
@@ -5387,19 +5694,13 @@ pub(crate) fn encode_shared_expert_ffn_decode(
     // Resolve the three weight slices. All three MUST be present together;
     // the converter writes them as a unit (qwen35_moe.rs:351-353 / 470-483).
     let gate_slice = meta.shared_gate.ok_or_else(|| {
-        RuntimeError::Compute(
-            "encode_shared_expert_ffn_decode: meta.shared_gate is None".into(),
-        )
+        RuntimeError::Compute("encode_shared_expert_ffn_decode: meta.shared_gate is None".into())
     })?;
     let up_slice = meta.shared_up.ok_or_else(|| {
-        RuntimeError::Compute(
-            "encode_shared_expert_ffn_decode: meta.shared_up is None".into(),
-        )
+        RuntimeError::Compute("encode_shared_expert_ffn_decode: meta.shared_up is None".into())
     })?;
     let down_slice = meta.shared_down.ok_or_else(|| {
-        RuntimeError::Compute(
-            "encode_shared_expert_ffn_decode: meta.shared_down is None".into(),
-        )
+        RuntimeError::Compute("encode_shared_expert_ffn_decode: meta.shared_down is None".into())
     })?;
     // Sanity-check the quant scheme (only Q4_0 produced by qwen35_moe.rs).
     if gate_slice.quant != QuantScheme::Q4_0
@@ -5452,7 +5753,8 @@ pub(crate) fn encode_shared_expert_ffn_decode(
     if shared_gate_buf.len() < inter_dim_eff {
         return Err(RuntimeError::Compute(format!(
             "shared_gate_buf too small: have {} need {} (inter_dim_eff)",
-            shared_gate_buf.len(), inter_dim_eff,
+            shared_gate_buf.len(),
+            inter_dim_eff,
         )));
     }
     let up_capacity = scratch.up_buf.len();
@@ -5486,7 +5788,8 @@ pub(crate) fn encode_shared_expert_ffn_decode(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(&kernels.matvec_q4_0)
                 .arg(&gate_byte_view)
                 .arg(normed_x)
@@ -5494,9 +5797,9 @@ pub(crate) fn encode_shared_expert_ffn_decode(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "shared expert gate matvec_q4_0: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("shared expert gate matvec_q4_0: {e}",))
+                })?;
         }
     }
 
@@ -5519,7 +5822,8 @@ pub(crate) fn encode_shared_expert_ffn_decode(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(&kernels.matvec_q4_0)
                 .arg(&up_byte_view)
                 .arg(normed_x)
@@ -5527,9 +5831,9 @@ pub(crate) fn encode_shared_expert_ffn_decode(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "shared expert up matvec_q4_0: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("shared expert up matvec_q4_0: {e}",))
+                })?;
         }
     }
 
@@ -5546,15 +5850,16 @@ pub(crate) fn encode_shared_expert_ffn_decode(
             shared_mem_bytes: 0,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(&kernels.swiglu_inplace)
                 .arg(shared_gate_buf)
                 .arg(&scratch.up_buf)
                 .arg(&n_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "shared expert swiglu_inplace: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("shared expert swiglu_inplace: {e}",))
+                })?;
         }
     }
 
@@ -5576,7 +5881,8 @@ pub(crate) fn encode_shared_expert_ffn_decode(
     if shared_down_buf.len() < hidden_dim {
         return Err(RuntimeError::Compute(format!(
             "shared_down_buf too small: have {} need {} (hidden_dim)",
-            shared_down_buf.len(), hidden_dim,
+            shared_down_buf.len(),
+            hidden_dim,
         )));
     }
     {
@@ -5590,7 +5896,8 @@ pub(crate) fn encode_shared_expert_ffn_decode(
         // shared_gate_buf is the SwiGLU output, reused as input here.
         let gate_view = scratch.shared_gate_buf.as_ref().unwrap();
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(&kernels.matvec_q4_0)
                 .arg(&down_byte_view)
                 .arg(gate_view)
@@ -5598,9 +5905,9 @@ pub(crate) fn encode_shared_expert_ffn_decode(
                 .arg(&out_dim_u32)
                 .arg(&in_dim_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "shared expert down matvec_q4_0: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("shared expert down matvec_q4_0: {e}",))
+                })?;
         }
     }
 
@@ -5613,7 +5920,11 @@ pub(crate) fn encode_shared_expert_ffn_decode(
         .as_deref()
         .map(|v| matches!(v, "1" | "true" | "yes"))
         .unwrap_or(false);
-    let gate_inp_opt = if skip_gate { None } else { meta.ffn_gate_inp_shexp };
+    let gate_inp_opt = if skip_gate {
+        None
+    } else {
+        meta.ffn_gate_inp_shexp
+    };
     if let Some(gate_inp_slice) = gate_inp_opt {
         // Step 5a: dot product → shared_gate_scalar[0].
         let gis_off = gate_inp_slice.offset as usize;
@@ -5659,25 +5970,27 @@ pub(crate) fn encode_shared_expert_ffn_decode(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(dot_fn)
                     .arg(&gis_view)
                     .arg(normed_x)
                     .arg(scalar_buf)
                     .arg(&hd_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "shared expert moe_shared_dot_f32: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("shared expert moe_shared_dot_f32: {e}",))
+                    })?;
             }
         }
 
         // Step 5b: x_out[i] += sigmoid(scalar) * shared_down_buf[i].
-        let accum_fn = kernels.moe_shared_sigmoid_gated_accum.as_ref().ok_or_else(|| {
-            RuntimeError::Compute(
-                "moe_shared_sigmoid_gated_accum kernel not compiled".into(),
-            )
-        })?;
+        let accum_fn = kernels
+            .moe_shared_sigmoid_gated_accum
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Compute("moe_shared_sigmoid_gated_accum kernel not compiled".into())
+            })?;
         let hd_u32 = hidden_dim as u32;
         const TPB: u32 = 256;
         let grid = ((hidden_dim as u32) + TPB - 1) / TPB;
@@ -5690,23 +6003,24 @@ pub(crate) fn encode_shared_expert_ffn_decode(
         let shared_down_buf = scratch.shared_down_buf.as_ref().unwrap();
         let scalar_buf = scratch.shared_gate_scalar.as_ref().unwrap();
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(accum_fn)
                 .arg(output_x)
                 .arg(shared_down_buf)
                 .arg(scalar_buf)
                 .arg(&hd_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "shared expert moe_shared_sigmoid_gated_accum: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "shared expert moe_shared_sigmoid_gated_accum: {e}",
+                    ))
+                })?;
         }
     } else {
         // No sigmoid gate: plain accumulate x_out[i] += shared_down_buf[i].
         let accum_fn = kernels.moe_shared_residual_accum.as_ref().ok_or_else(|| {
-            RuntimeError::Compute(
-                "moe_shared_residual_accum kernel not compiled".into(),
-            )
+            RuntimeError::Compute("moe_shared_residual_accum kernel not compiled".into())
         })?;
         let hd_u32 = hidden_dim as u32;
         const TPB: u32 = 256;
@@ -5718,15 +6032,16 @@ pub(crate) fn encode_shared_expert_ffn_decode(
         };
         let shared_down_buf = scratch.shared_down_buf.as_ref().unwrap();
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(accum_fn)
                 .arg(output_x)
                 .arg(shared_down_buf)
                 .arg(&hd_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "shared expert moe_shared_residual_accum: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("shared expert moe_shared_residual_accum: {e}",))
+                })?;
         }
     }
 
@@ -5823,24 +6138,27 @@ pub(crate) fn encode_shared_expert_ffn_decode_fused(
 
     // Scratch buffer presence + size checks.
     let shared_gate_buf = scratch.shared_gate_buf.as_mut().ok_or_else(|| {
-        RuntimeError::Compute(
-            "fused shared expert: scratch.shared_gate_buf not allocated".into(),
-        )
+        RuntimeError::Compute("fused shared expert: scratch.shared_gate_buf not allocated".into())
     })?;
     if shared_gate_buf.len() < inter_dim_eff {
         return Err(RuntimeError::Compute(format!(
             "fused shared expert: shared_gate_buf too small: have {} need {}",
-            shared_gate_buf.len(), inter_dim_eff,
+            shared_gate_buf.len(),
+            inter_dim_eff,
         )));
     }
 
     // Sub-step A: fused gate+up+SwiGLU (one launch). Replaces unfused steps 1+2+3.
     // Shmem: hidden_dim * 4 bytes (cached normed_x).
-    let fused_gu_fn = kernels.fused_glu_gemv_q4_0_prenormed_no_norm.as_ref().ok_or_else(|| {
-        RuntimeError::Compute(
-            "fused_glu_gemv_q4_0_prenormed_no_norm kernel not compiled (NVRTC may have failed)".into(),
-        )
-    })?;
+    let fused_gu_fn = kernels
+        .fused_glu_gemv_q4_0_prenormed_no_norm
+        .as_ref()
+        .ok_or_else(|| {
+            RuntimeError::Compute(
+                "fused_glu_gemv_q4_0_prenormed_no_norm kernel not compiled (NVRTC may have failed)"
+                    .into(),
+            )
+        })?;
     let gate_off = gate_slice.offset as usize;
     let gate_bytes = gate_slice.length as usize;
     let up_off = up_slice.offset as usize;
@@ -5867,7 +6185,8 @@ pub(crate) fn encode_shared_expert_ffn_decode_fused(
             shared_mem_bytes: shmem_bytes,
         };
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(fused_gu_fn)
                 .arg(&gate_byte_view)
                 .arg(&up_byte_view)
@@ -5876,9 +6195,9 @@ pub(crate) fn encode_shared_expert_ffn_decode_fused(
                 .arg(&inter_u32)
                 .arg(&hd_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "fused_glu_gemv_q4_0_prenormed_no_norm: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("fused_glu_gemv_q4_0_prenormed_no_norm: {e}",))
+                })?;
         }
     }
 
@@ -5888,7 +6207,11 @@ pub(crate) fn encode_shared_expert_ffn_decode_fused(
         .as_deref()
         .map(|v| matches!(v, "1" | "true" | "yes"))
         .unwrap_or(false);
-    let gate_inp_opt = if skip_gate { None } else { meta.ffn_gate_inp_shexp };
+    let gate_inp_opt = if skip_gate {
+        None
+    } else {
+        meta.ffn_gate_inp_shexp
+    };
 
     let down_off = down_slice.offset as usize;
     let down_bytes = down_slice.length as usize;
@@ -5929,9 +6252,7 @@ pub(crate) fn encode_shared_expert_ffn_decode_fused(
             )
         })?;
         let dot_fn = kernels.moe_shared_dot_f32.as_ref().ok_or_else(|| {
-            RuntimeError::Compute(
-                "moe_shared_dot_f32 kernel not compiled".into(),
-            )
+            RuntimeError::Compute("moe_shared_dot_f32 kernel not compiled".into())
         })?;
         {
             let hd_u32 = hidden_dim as u32;
@@ -5941,24 +6262,30 @@ pub(crate) fn encode_shared_expert_ffn_decode_fused(
                 shared_mem_bytes: 0,
             };
             unsafe {
-                device.stream
+                device
+                    .stream
                     .launch_builder(dot_fn)
                     .arg(&gis_view)
                     .arg(normed_x)
                     .arg(scalar_buf)
                     .arg(&hd_u32)
                     .launch(cfg)
-                    .map_err(|e| RuntimeError::Compute(format!(
-                        "fused shared expert moe_shared_dot_f32: {e}",
-                    )))?;
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "fused shared expert moe_shared_dot_f32: {e}",
+                        ))
+                    })?;
             }
         }
 
-        let down_accum_fn = kernels.moe_shared_down_q4_0_sigmoid_accum.as_ref().ok_or_else(|| {
-            RuntimeError::Compute(
-                "moe_shared_down_q4_0_sigmoid_accum kernel not compiled".into(),
-            )
-        })?;
+        let down_accum_fn = kernels
+            .moe_shared_down_q4_0_sigmoid_accum
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Compute(
+                    "moe_shared_down_q4_0_sigmoid_accum kernel not compiled".into(),
+                )
+            })?;
         let inter_u32 = inter_dim_eff as u32;
         let hd_u32 = hidden_dim as u32;
         let cfg = CudarcLaunchConfig {
@@ -5969,7 +6296,8 @@ pub(crate) fn encode_shared_expert_ffn_decode_fused(
         let gate_view = scratch.shared_gate_buf.as_ref().unwrap();
         let scalar_buf = scratch.shared_gate_scalar.as_ref().unwrap();
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(down_accum_fn)
                 .arg(&down_byte_view)
                 .arg(gate_view)
@@ -5978,16 +6306,21 @@ pub(crate) fn encode_shared_expert_ffn_decode_fused(
                 .arg(&hd_u32)
                 .arg(&inter_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "fused shared expert moe_shared_down_q4_0_sigmoid_accum: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "fused shared expert moe_shared_down_q4_0_sigmoid_accum: {e}",
+                    ))
+                })?;
         }
     } else {
-        let down_accum_fn = kernels.moe_shared_down_q4_0_residual_accum.as_ref().ok_or_else(|| {
-            RuntimeError::Compute(
-                "moe_shared_down_q4_0_residual_accum kernel not compiled".into(),
-            )
-        })?;
+        let down_accum_fn = kernels
+            .moe_shared_down_q4_0_residual_accum
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Compute(
+                    "moe_shared_down_q4_0_residual_accum kernel not compiled".into(),
+                )
+            })?;
         let inter_u32 = inter_dim_eff as u32;
         let hd_u32 = hidden_dim as u32;
         let cfg = CudarcLaunchConfig {
@@ -5997,7 +6330,8 @@ pub(crate) fn encode_shared_expert_ffn_decode_fused(
         };
         let gate_view = scratch.shared_gate_buf.as_ref().unwrap();
         unsafe {
-            device.stream
+            device
+                .stream
                 .launch_builder(down_accum_fn)
                 .arg(&down_byte_view)
                 .arg(gate_view)
@@ -6005,9 +6339,11 @@ pub(crate) fn encode_shared_expert_ffn_decode_fused(
                 .arg(&hd_u32)
                 .arg(&inter_u32)
                 .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!(
-                    "fused shared expert moe_shared_down_q4_0_residual_accum: {e}",
-                )))?;
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "fused shared expert moe_shared_down_q4_0_residual_accum: {e}",
+                    ))
+                })?;
         }
     }
 
@@ -6020,7 +6356,11 @@ mod tests {
     use lumen_format::index::{ExpertSlice, SubtensorOffsets};
 
     fn dummy_slice(offset: u64, length: u64, quant: QuantScheme) -> TensorSlice {
-        TensorSlice { offset, length, quant }
+        TensorSlice {
+            offset,
+            length,
+            quant,
+        }
     }
 
     /// Verify `build_moe_meta` returns `None` for a dense (non-MoE) layer.
@@ -6028,17 +6368,35 @@ mod tests {
     fn build_moe_meta_dense_layer_returns_none() {
         let zero = dummy_slice(0, 0, QuantScheme::F32);
         let subtensors = SubtensorOffsets {
-            wq: zero, wk: zero, wv: zero, wo: zero,
-            bq: None, bk: None, bv: None,
-            w_gate: zero, w_up: zero, w_down: zero,
-            attn_norm: zero, ffn_norm: zero,
-            router_weight: None,    // dense: no router
-            experts: None,          // dense: no experts
-            shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-            attn_gate: None, attn_post_norm: None,
-            ssm_a: None, ssm_conv1d: None, ssm_dt: None, ssm_beta: None,
-            ssm_alpha: None, ssm_norm: None, ssm_out: None,
-            attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+            wq: zero,
+            wk: zero,
+            wv: zero,
+            wo: zero,
+            bq: None,
+            bk: None,
+            bv: None,
+            w_gate: zero,
+            w_up: zero,
+            w_down: zero,
+            attn_norm: zero,
+            ffn_norm: zero,
+            router_weight: None, // dense: no router
+            experts: None,       // dense: no experts
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            ffn_gate_inp_shexp: None,
             layer_type: Some(0),
         };
         assert!(build_moe_meta(&subtensors).is_none());
@@ -6052,27 +6410,45 @@ mod tests {
         let experts = vec![
             ExpertSlice {
                 gate: dummy_slice(2000, 512, QuantScheme::Q8_0),
-                up:   dummy_slice(2512, 512, QuantScheme::Q8_0),
+                up: dummy_slice(2512, 512, QuantScheme::Q8_0),
                 down: dummy_slice(3024, 512, QuantScheme::Q8_0),
             },
             ExpertSlice {
                 gate: dummy_slice(4000, 512, QuantScheme::Q8_0),
-                up:   dummy_slice(4512, 512, QuantScheme::Q8_0),
+                up: dummy_slice(4512, 512, QuantScheme::Q8_0),
                 down: dummy_slice(5024, 512, QuantScheme::Q8_0),
             },
         ];
         let subtensors = SubtensorOffsets {
-            wq: zero, wk: zero, wv: zero, wo: zero,
-            bq: None, bk: None, bv: None,
-            w_gate: zero, w_up: zero, w_down: zero,
-            attn_norm: zero, ffn_norm: zero,
+            wq: zero,
+            wk: zero,
+            wv: zero,
+            wo: zero,
+            bq: None,
+            bk: None,
+            bv: None,
+            w_gate: zero,
+            w_up: zero,
+            w_down: zero,
+            attn_norm: zero,
+            ffn_norm: zero,
             router_weight: Some(router),
             experts: Some(experts.clone()),
-            shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-            attn_gate: None, attn_post_norm: None,
-            ssm_a: None, ssm_conv1d: None, ssm_dt: None, ssm_beta: None,
-            ssm_alpha: None, ssm_norm: None, ssm_out: None,
-            attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            ffn_gate_inp_shexp: None,
             layer_type: Some(0),
         };
         let meta = build_moe_meta(&subtensors).expect("MoE meta must build");
@@ -6142,9 +6518,7 @@ mod tests {
         // (the rest of moe.rs legitimately references both kernels).
         let q4_fn_start = this_file
             .find("fn encode_moe_ffn_decode_q4_0(")
-            .expect(
-                "encode_moe_ffn_decode_q4_0 function must exist",
-            );
+            .expect("encode_moe_ffn_decode_q4_0 function must exist");
         // Q4 fn body extends to the next top-level fn declaration (best-effort
         // bound via "\npub(crate) fn " or end-of-file).
         let after = &this_file[q4_fn_start..];
@@ -6334,17 +6708,30 @@ mod tests {
         let mut expert_weights = vec![0.0f32; top_k];
         let mut renorm = 0.0f32;
         for k in 0..top_k {
-            let (best_e, best) = logits.iter().cloned().enumerate()
-                .fold((0usize, -1.0f32), |(bi, bv), (i, v)| {
-                    if v > bv { (i, v) } else { (bi, bv) }
-                });
+            let (best_e, best) =
+                logits
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .fold(
+                        (0usize, -1.0f32),
+                        |(bi, bv), (i, v)| {
+                            if v > bv {
+                                (i, v)
+                            } else {
+                                (bi, bv)
+                            }
+                        },
+                    );
             expert_ids[k] = best_e as u32;
             expert_weights[k] = best;
             renorm += best;
             logits[best_e] = -1.0;
         }
         if renorm > 0.0 {
-            for k in 0..top_k { expert_weights[k] /= renorm; }
+            for k in 0..top_k {
+                expert_weights[k] /= renorm;
+            }
         }
         (expert_ids, expert_weights)
     }
@@ -6352,8 +6739,8 @@ mod tests {
     /// CPU reference for the moe_expert_accum_option_a kernel (dense layout).
     fn cpu_expert_accum_option_a(
         residual: &[f32],
-        expert_outputs: &[f32],  // [top_k * hidden_dim]
-        expert_weights: &[f32],  // [top_k]
+        expert_outputs: &[f32], // [top_k * hidden_dim]
+        expert_weights: &[f32], // [top_k]
         hidden_dim: usize,
         top_k: usize,
     ) -> Vec<f32> {
@@ -6371,9 +6758,9 @@ mod tests {
     /// CPU reference for the moe_expert_accum_batched_b kernel (sparse layout).
     fn cpu_expert_accum_batched_b(
         residual: &[f32],
-        expert_outputs: &[f32],  // [num_experts * hidden_dim]
-        expert_weights: &[f32],  // [top_k]
-        expert_ids: &[u32],      // [top_k]
+        expert_outputs: &[f32], // [num_experts * hidden_dim]
+        expert_weights: &[f32], // [top_k]
+        expert_ids: &[u32],     // [top_k]
         hidden_dim: usize,
         top_k: usize,
     ) -> Vec<f32> {
@@ -6400,7 +6787,9 @@ mod tests {
         let top_k = 4;
         let mut seed: u64 = 0xDEADBEEF;
         let mut next = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 32) as u32) as f32 / (u32::MAX as f32) - 0.5
         };
         for _ in 0..100 {
@@ -6438,20 +6827,19 @@ mod tests {
         let top_k = 4;
         let mut seed: u64 = 0xCAFEBABE;
         let mut next = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 32) as u32) as f32 / (u32::MAX as f32) - 0.5
         };
         for _ in 0..50 {
             let residual: Vec<f32> = (0..hidden_dim).map(|_| next()).collect();
-            let expert_outputs: Vec<f32> =
-                (0..top_k * hidden_dim).map(|_| next()).collect();
-            let raw_weights: Vec<f32> =
-                (0..top_k).map(|_| next().abs() + 1e-3).collect();
+            let expert_outputs: Vec<f32> = (0..top_k * hidden_dim).map(|_| next()).collect();
+            let raw_weights: Vec<f32> = (0..top_k).map(|_| next().abs() + 1e-3).collect();
             let s: f32 = raw_weights.iter().sum();
             let weights: Vec<f32> = raw_weights.iter().map(|w| w / s).collect();
-            let out = cpu_expert_accum_option_a(
-                &residual, &expert_outputs, &weights, hidden_dim, top_k,
-            );
+            let out =
+                cpu_expert_accum_option_a(&residual, &expert_outputs, &weights, hidden_dim, top_k);
             // Spot-check element 0:
             let mut expected = residual[0];
             for k in 0..top_k {
@@ -6459,7 +6847,9 @@ mod tests {
             }
             assert!(
                 (out[0] - expected).abs() < 1e-5,
-                "accum element 0 mismatch: got {} expected {}", out[0], expected,
+                "accum element 0 mismatch: got {} expected {}",
+                out[0],
+                expected,
             );
         }
     }
@@ -6476,7 +6866,9 @@ mod tests {
         let top_k = 3;
         let mut seed: u64 = 0xFACEFEED;
         let mut next = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 32) as u32) as f32 / (u32::MAX as f32) - 0.5
         };
         // Random selection of top-K out of num_experts.
@@ -6487,8 +6879,7 @@ mod tests {
         let residual: Vec<f32> = (0..hidden_dim).map(|_| next()).collect();
 
         // Per-expert dense layout: outputs at slot k for k in 0..top_k.
-        let dense_outputs: Vec<f32> =
-            (0..top_k * hidden_dim).map(|_| next()).collect();
+        let dense_outputs: Vec<f32> = (0..top_k * hidden_dim).map(|_| next()).collect();
 
         // Sparse (num_experts) layout: place dense_outputs[k] at slot expert_ids[k].
         let mut sparse_outputs = vec![0.0f32; num_experts * hidden_dim];
@@ -6499,11 +6890,15 @@ mod tests {
             }
         }
 
-        let dense_result = cpu_expert_accum_option_a(
-            &residual, &dense_outputs, &weights, hidden_dim, top_k,
-        );
+        let dense_result =
+            cpu_expert_accum_option_a(&residual, &dense_outputs, &weights, hidden_dim, top_k);
         let sparse_result = cpu_expert_accum_batched_b(
-            &residual, &sparse_outputs, &weights, &expert_ids, hidden_dim, top_k,
+            &residual,
+            &sparse_outputs,
+            &weights,
+            &expert_ids,
+            hidden_dim,
+            top_k,
         );
 
         // Must be element-wise identical.
@@ -6511,7 +6906,8 @@ mod tests {
             assert!(
                 (dense_result[i] - sparse_result[i]).abs() < 1e-6,
                 "dense vs sparse accum mismatch at element {i}: {} vs {}",
-                dense_result[i], sparse_result[i],
+                dense_result[i],
+                sparse_result[i],
             );
         }
     }
@@ -6582,7 +6978,9 @@ mod tests {
         let eps = 1e-6f32;
         let mut seed: u64 = 0xFEED_BEEF;
         let mut next = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 32) as u32) as f32 / (u32::MAX as f32) - 0.5
         };
 
@@ -6590,20 +6988,22 @@ mod tests {
             // Inputs.
             let attn_proj: Vec<f32> = (0..hidden_dim).map(|_| next()).collect();
             let ffn_norm: Vec<f32> = (0..hidden_dim).map(|_| next() + 1.0).collect();
-            let router_weight: Vec<f32> =
-                (0..num_experts * hidden_dim).map(|_| next()).collect();
+            let router_weight: Vec<f32> = (0..num_experts * hidden_dim).map(|_| next()).collect();
 
             // ---- Legacy two-step ----
             // Step 1: standalone RMSNorm of attn_proj into `normed_legacy`.
-            let mean_sq: f32 =
-                attn_proj.iter().map(|x| x * x).sum::<f32>() / (hidden_dim as f32);
+            let mean_sq: f32 = attn_proj.iter().map(|x| x * x).sum::<f32>() / (hidden_dim as f32);
             let rms_scale = 1.0 / (mean_sq + eps).sqrt();
             let normed_legacy: Vec<f32> = (0..hidden_dim)
                 .map(|i| attn_proj[i] * rms_scale * ffn_norm[i])
                 .collect();
             // Step 2: V2 atomic router on `normed_legacy`.
             let (ids_legacy, w_legacy) = cpu_router_softmax(
-                &normed_legacy, &router_weight, hidden_dim, num_experts, top_k,
+                &normed_legacy,
+                &router_weight,
+                hidden_dim,
+                num_experts,
+                top_k,
             );
 
             // ---- Fused (single kernel) ----
@@ -6619,16 +7019,16 @@ mod tests {
             let normed_v3: Vec<f32> = (0..hidden_dim)
                 .map(|i| attn_proj[i] * rms_scale_v3 * ffn_norm[i])
                 .collect();
-            let (ids_v3, w_v3) = cpu_router_softmax(
-                &normed_v3, &router_weight, hidden_dim, num_experts, top_k,
-            );
+            let (ids_v3, w_v3) =
+                cpu_router_softmax(&normed_v3, &router_weight, hidden_dim, num_experts, top_k);
 
             // The normed output must match within per-op tolerance.
             for i in 0..hidden_dim {
                 assert!(
                     (normed_legacy[i] - normed_v3[i]).abs() < 1e-6,
                     "trial {trial} normed mismatch at i={i}: legacy={} fused={}",
-                    normed_legacy[i], normed_v3[i],
+                    normed_legacy[i],
+                    normed_v3[i],
                 );
             }
             // Expert IDs must match exactly (top-K argmax is deterministic
@@ -6643,7 +7043,8 @@ mod tests {
                 assert!(
                     (w_legacy[k] - w_v3[k]).abs() < 1e-5,
                     "trial {trial} expert_weight[{k}] mismatch: legacy={} fused={}",
-                    w_legacy[k], w_v3[k],
+                    w_legacy[k],
+                    w_v3[k],
                 );
             }
         }

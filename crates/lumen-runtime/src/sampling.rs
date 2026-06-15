@@ -63,7 +63,11 @@ impl Xorshift64 {
     /// from the same seed remain bit-identical from `next_u64()` onward.
     pub fn new(seed: u64) -> Self {
         // Ensure non-zero state, then mix.
-        let base = if seed == 0 { 0xDEAD_BEEF_CAFE_BABEu64 } else { seed };
+        let base = if seed == 0 {
+            0xDEAD_BEEF_CAFE_BABEu64
+        } else {
+            seed
+        };
         // SplitMix64 finalizer (Stafford Mix13) — well-tested public-domain
         // avalanche, used by Java SplitableRandom and Rust's smallrng init.
         let mut x = base.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -164,9 +168,18 @@ pub fn softmax_inplace(logits: &mut [f32]) {
         i = 0;
         for _ in 0..chunks16 {
             vst1q_f32(ptr.add(i), vmulq_f32(vld1q_f32(ptr.add(i)), inv_sum_v));
-            vst1q_f32(ptr.add(i + 4), vmulq_f32(vld1q_f32(ptr.add(i + 4)), inv_sum_v));
-            vst1q_f32(ptr.add(i + 8), vmulq_f32(vld1q_f32(ptr.add(i + 8)), inv_sum_v));
-            vst1q_f32(ptr.add(i + 12), vmulq_f32(vld1q_f32(ptr.add(i + 12)), inv_sum_v));
+            vst1q_f32(
+                ptr.add(i + 4),
+                vmulq_f32(vld1q_f32(ptr.add(i + 4)), inv_sum_v),
+            );
+            vst1q_f32(
+                ptr.add(i + 8),
+                vmulq_f32(vld1q_f32(ptr.add(i + 8)), inv_sum_v),
+            );
+            vst1q_f32(
+                ptr.add(i + 12),
+                vmulq_f32(vld1q_f32(ptr.add(i + 12)), inv_sum_v),
+            );
             i += 16;
         }
         // 4-wide remainder
@@ -392,7 +405,11 @@ impl Sampler {
 
     /// Construct with a caller-provided RNG (used by the legacy shim).
     pub fn with_rng(params: SamplingParams, rng: Xorshift64) -> Self {
-        Self { params, state: SamplerState::new(), rng }
+        Self {
+            params,
+            state: SamplerState::new(),
+            rng,
+        }
     }
 
     /// Sample one token, updating `state` so subsequent calls see this
@@ -608,7 +625,11 @@ fn anti_restate_rules() -> AntiRestateRules {
         ngram: rule_enabled("LUMEN_ANTI_RESTATE_NGRAM"),
         loop_: rule_enabled("LUMEN_ANTI_RESTATE_LOOP"),
     });
-    AntiRestateRules { subword: r.subword, ngram: r.ngram, loop_: r.loop_ }
+    AntiRestateRules {
+        subword: r.subword,
+        ngram: r.ngram,
+        loop_: r.loop_,
+    }
 }
 
 /// True iff selecting `cand` next would produce a degenerate sub-word
@@ -840,21 +861,18 @@ fn apply_penalties(logits: &mut [f32], params: &SamplingParams, state: &SamplerS
 }
 
 #[inline]
-fn apply_penalty_one(
-    logits: &mut [f32],
-    tok: u32,
-    count: u32,
-    rep: f32,
-    presence: f32,
-    freq: f32,
-) {
+fn apply_penalty_one(logits: &mut [f32], tok: u32, count: u32, rep: f32, presence: f32, freq: f32) {
     let idx = tok as usize;
     if idx >= logits.len() {
         return;
     }
     let v = logits[idx];
     let mut new_v = if (rep - 1.0).abs() >= f32::EPSILON {
-        if v > 0.0 { v / rep } else { v * rep }
+        if v > 0.0 {
+            v / rep
+        } else {
+            v * rep
+        }
     } else {
         v
     };
@@ -1395,7 +1413,10 @@ mod tests {
             let mut want = (logits_ref.len() - 1) as u32;
             for (i, &p) in logits_ref.iter().enumerate() {
                 cum += p;
-                if r <= cum { want = i as u32; break; }
+                if r <= cum {
+                    want = i as u32;
+                    break;
+                }
             }
             assert_eq!(sampler.sample(&mut logits_base.clone()), want);
         }
@@ -1418,8 +1439,10 @@ mod tests {
         // non-zero value in `(0, 1)`.
         let mut rng = Xorshift64::new(42);
         let r0 = rng.next_f32();
-        assert!(r0 > 0.0 && r0 < 1.0,
-            " Xorshift64::new(42).next_f32() must be in (0, 1); got {r0}");
+        assert!(
+            r0 > 0.0 && r0 < 1.0,
+            " Xorshift64::new(42).next_f32() must be in (0, 1); got {r0}"
+        );
     }
 
     #[test]
@@ -1442,8 +1465,10 @@ mod tests {
         };
         let mut s = Sampler::new(params);
         let t = s.sample(&mut logits.clone());
-        assert_ne!(t, 0,
-            " default seed must not deterministically corrupt the first sampled token to index 0");
+        assert_ne!(
+            t, 0,
+            " default seed must not deterministically corrupt the first sampled token to index 0"
+        );
     }
 
     // ---- standard sampler ordering ----
@@ -1486,8 +1511,14 @@ mod tests {
                 saw_two_or_three = true;
             }
         }
-        assert!(saw_one, "standard ordering must let token 1 enter nucleus (kept at temp=1)");
-        assert!(!saw_two_or_three, "tokens 2-3 must stay outside top_p=0.85 nucleus");
+        assert!(
+            saw_one,
+            "standard ordering must let token 1 enter nucleus (kept at temp=1)"
+        );
+        assert!(
+            !saw_two_or_three,
+            "tokens 2-3 must stay outside top_p=0.85 nucleus"
+        );
     }
 
     #[test]
@@ -1506,8 +1537,11 @@ mod tests {
         };
         let mut s = Sampler::new(params);
         for _ in 0..100 {
-            assert_eq!(s.sample(&mut logits.clone()), 0,
-                "min_p=0.1 should leave only token 0 (logit 5.0 above the log-shift bound)");
+            assert_eq!(
+                s.sample(&mut logits.clone()),
+                0,
+                "min_p=0.1 should leave only token 0 (logit 5.0 above the log-shift bound)"
+            );
         }
     }
 
@@ -1519,13 +1553,13 @@ mod tests {
         Arc::new(|id: u32| -> Vec<u8> {
             match id {
                 10 => b" multiplication".to_vec(), // the complete word, one token
-                11 => b"lication".to_vec(),          // degenerate suffix doubling
-                12 => b" into".to_vec(),             // the llama-correct continuation
-                13 => b"ing".to_vec(),               // legit continuation (not a suffix of prev word)
+                11 => b"lication".to_vec(),        // degenerate suffix doubling
+                12 => b" into".to_vec(),           // the llama-correct continuation
+                13 => b"ing".to_vec(),             // legit continuation (not a suffix of prev word)
                 14 => b" running".to_vec(),
-                15 => b"lications".to_vec(),         // doubling + trailing 's' (real 2nd near-tie)
-                16 => b" distrib".to_vec(),          // legit prefix piece of "distributive"
-                17 => b"utive".to_vec(),             // legit continuation -> "distributive"
+                15 => b"lications".to_vec(), // doubling + trailing 's' (real 2nd near-tie)
+                16 => b" distrib".to_vec(),  // legit prefix piece of "distributive"
+                17 => b"utive".to_vec(),     // legit continuation -> "distributive"
                 20 => b"17".to_vec(),
                 21 => b" times".to_vec(),
                 22 => b" 23".to_vec(),
@@ -1538,7 +1572,10 @@ mod tests {
     fn anti_restate_is_noop_without_flag() {
         // With anti_restate=false the greedy path is the plain argmax even
         // when the top candidate would double a suffix.
-        let params = SamplingParams { temperature: 0.0, ..SamplingParams::default() };
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
         let mut state = SamplerState::new();
         state.set_decoder(test_decoder());
         state.record(10); // just emitted " multiplication"
@@ -1568,7 +1605,10 @@ mod tests {
         logits[11] = 5.0; // "lication" (degenerate, would be argmax)
         logits[12] = 4.9; // " into"   (llama-correct)
         let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
-        assert_eq!(t, 12, "guard must skip the suffix-doubling token and pick ' into'");
+        assert_eq!(
+            t, 12,
+            "guard must skip the suffix-doubling token and pick ' into'"
+        );
     }
 
     #[test]
@@ -1590,7 +1630,10 @@ mod tests {
         logits[15] = 4.9; // "lications" (degenerate, top-2 — escaped the old rule)
         logits[12] = 4.8; // " into"     (clean)
         let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
-        assert_eq!(t, 12, "both 'lication' and 'lications' doublings must be vetoed");
+        assert_eq!(
+            t, 12,
+            "both 'lication' and 'lications' doublings must be vetoed"
+        );
     }
 
     #[test]
@@ -1610,7 +1653,10 @@ mod tests {
         let mut logits = vec![0.0; 32];
         logits[17] = 5.0; // "utive"
         let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
-        assert_eq!(t, 17, "legit continuation 'utive' after 'distrib' must be allowed");
+        assert_eq!(
+            t, 17,
+            "legit continuation 'utive' after 'distrib' must be allowed"
+        );
     }
 
     #[test]
@@ -1625,9 +1671,9 @@ mod tests {
         let mut state = SamplerState::new();
         state.set_decoder(test_decoder());
         state.record(14); // " running" (already a full word; ends in "ing")
-        // Here picking "ing" (13) WOULD double — verify that case is vetoed —
-        // but first confirm a non-doubling continuation is allowed: emit a
-        // word that does not end in the candidate.
+                          // Here picking "ing" (13) WOULD double — verify that case is vetoed —
+                          // but first confirm a non-doubling continuation is allowed: emit a
+                          // word that does not end in the candidate.
         state.clear();
         state.set_decoder(test_decoder());
         state.record(20); // "17" — does not end in "ing"
@@ -1658,7 +1704,10 @@ mod tests {
         logits[12] = 4.0; // " into" — a non-restating alternative
         let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
         assert_ne!(t, 22, "n-gram restate of [17,times,23] must be vetoed");
-        assert_eq!(t, 12, "guard falls through to the non-restating alternative");
+        assert_eq!(
+            t, 12,
+            "guard falls through to the non-restating alternative"
+        );
     }
 
     #[test]
@@ -1704,7 +1753,10 @@ mod tests {
         let mut logits = vec![0.0; 32];
         logits[21] = 5.0; // closes [20,21][20,21] — a 2-token repeat, allowed
         let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
-        assert_eq!(t, 21, "2-token back-to-back repeat is below MIN_SPAN -> allowed");
+        assert_eq!(
+            t, 21,
+            "2-token back-to-back repeat is below MIN_SPAN -> allowed"
+        );
     }
 
     #[test]
@@ -1777,7 +1829,10 @@ mod tests {
         let mut logits = vec![0.0; 128];
         logits[50] = 5.0; // a fresh non-repeating continuation -> allowed
         let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
-        assert_eq!(t, 50, "varied context with sparse id-16 reuse must be allowed");
+        assert_eq!(
+            t, 50,
+            "varied context with sparse id-16 reuse must be allowed"
+        );
     }
 
     #[test]
@@ -1798,7 +1853,10 @@ mod tests {
         let mut logits = vec![f32::NEG_INFINITY; 32];
         logits[11] = 5.0;
         let t = sample_logits(&mut logits, &params, &mut state, &mut rng);
-        assert_eq!(t, 11, "no alternative -> fall back to raw argmax (never hang)");
+        assert_eq!(
+            t, 11,
+            "no alternative -> fall back to raw argmax (never hang)"
+        );
     }
 
     #[test]
@@ -1823,7 +1881,13 @@ mod tests {
         state.set_decoder(test_decoder());
         state.record(10);
         state.clear();
-        assert!(state.decoder.is_some(), "clear() must retain the per-session decoder");
-        assert!(state.history.is_empty(), "clear() must drop per-sequence history");
+        assert!(
+            state.decoder.is_some(),
+            "clear() must retain the per-session decoder"
+        );
+        assert!(
+            state.history.is_empty(),
+            "clear() must drop per-sequence history"
+        );
     }
 }

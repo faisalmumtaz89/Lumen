@@ -172,9 +172,7 @@ fn decode_token_greedy_matches_decode_token_argmax() {
         next_token_b = token_b;
     }
 
-    eprintln!(
-        "decode_token_greedy_matches_decode_token_argmax: {num_steps} tokens matched"
-    );
+    eprintln!("decode_token_greedy_matches_decode_token_argmax: {num_steps} tokens matched");
 }
 
 /// Smoke test: when weights are NOT preloaded, the trait method must error

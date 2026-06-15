@@ -22,7 +22,10 @@ pub fn split_repo_path(path: &str) -> Result<(String, String), String> {
     }
     let segments: Vec<&str> = path.split('/').collect();
     if segments.len() > 4 {
-        return Err(format!("path nests too deep ({} segments): {path:?}", segments.len()));
+        return Err(format!(
+            "path nests too deep ({} segments): {path:?}",
+            segments.len()
+        ));
     }
     for seg in &segments {
         if seg.is_empty() {
@@ -46,7 +49,9 @@ pub fn sanitize_filename(filename: &str) -> Result<(), String> {
         return Err(format!("filename contains path traversal: {filename:?}"));
     }
     if filename.contains('/') || filename.contains('\\') {
-        return Err(format!("filename contains directory separator: {filename:?}"));
+        return Err(format!(
+            "filename contains directory separator: {filename:?}"
+        ));
     }
     if filename.contains('\0') {
         return Err(format!("filename contains null byte: {filename:?}"));
@@ -111,7 +116,11 @@ mod inner {
     /// Prompt the user for [Y/n] confirmation.
     ///
     /// Returns `true` if the user accepts (Enter or Y/y), `false` otherwise.
-    fn confirm_download(repo: &str, filename: &str, size: Option<u64>) -> Result<bool, DownloadError> {
+    fn confirm_download(
+        repo: &str,
+        filename: &str,
+        size: Option<u64>,
+    ) -> Result<bool, DownloadError> {
         let size_str = match size {
             Some(s) => crate::cache::format_size(s),
             None => "unknown size".to_owned(),
@@ -125,7 +134,9 @@ mod inner {
             .map_err(|e| DownloadError::Io(format!("failed to read confirmation: {e}")))?;
 
         let trimmed = input.trim();
-        Ok(trimmed.is_empty() || trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes"))
+        Ok(trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("y")
+            || trimmed.eq_ignore_ascii_case("yes"))
     }
 
     /// Download a GGUF file from HuggingFace.
@@ -185,8 +196,9 @@ mod inner {
         }
 
         // Ensure dest dir exists.
-        std::fs::create_dir_all(dest_dir)
-            .map_err(|e| DownloadError::Io(format!("failed to create {}: {e}", dest_dir.display())))?;
+        std::fs::create_dir_all(dest_dir).map_err(|e| {
+            DownloadError::Io(format!("failed to create {}: {e}", dest_dir.display()))
+        })?;
 
         // Start the download.
         eprintln!("Downloading: {url}");
@@ -195,7 +207,8 @@ mod inner {
             .map_err(|e| DownloadError::Io(format!("GET request failed: {e}")))?;
 
         // Get content length from the actual response (might differ from HEAD due to CDN).
-        let content_length = resp.header("content-length")
+        let content_length = resp
+            .header("content-length")
             .and_then(|cl| cl.parse::<u64>().ok())
             .or(size);
 
@@ -221,14 +234,16 @@ mod inner {
 
         // Download to .part file.
         let mut reader = resp.into_reader();
-        let mut file = std::fs::File::create(&part_path)
-            .map_err(|e| DownloadError::Io(format!("failed to create {}: {e}", part_path.display())))?;
+        let mut file = std::fs::File::create(&part_path).map_err(|e| {
+            DownloadError::Io(format!("failed to create {}: {e}", part_path.display()))
+        })?;
 
         let mut buf = vec![0u8; 64 * 1024]; // 64 KB buffer
         let mut total_written: u64 = 0;
 
         loop {
-            let n = reader.read(&mut buf)
+            let n = reader
+                .read(&mut buf)
                 .map_err(|e| DownloadError::Io(format!("read error during download: {e}")))?;
             if n == 0 {
                 break;
@@ -260,16 +275,18 @@ mod inner {
         let hash = compute_sha256(&part_path)?;
 
         // Write SHA-256 sidecar.
-        std::fs::write(&sha_path, format!("{hash}  {filename}\n"))
-            .map_err(|e| DownloadError::Io(format!("failed to write {}: {e}", sha_path.display())))?;
+        std::fs::write(&sha_path, format!("{hash}  {filename}\n")).map_err(|e| {
+            DownloadError::Io(format!("failed to write {}: {e}", sha_path.display()))
+        })?;
 
         // Atomic rename: .part -> final.
-        std::fs::rename(&part_path, &final_path)
-            .map_err(|e| DownloadError::Io(format!(
+        std::fs::rename(&part_path, &final_path).map_err(|e| {
+            DownloadError::Io(format!(
                 "failed to rename {} -> {}: {e}",
                 part_path.display(),
                 final_path.display()
-            )))?;
+            ))
+        })?;
 
         eprintln!("Saved: {} (SHA-256: {hash})", final_path.display());
         Ok(final_path)
@@ -277,14 +294,19 @@ mod inner {
 
     /// Compute SHA-256 hash of a file. Returns the hex-encoded digest.
     pub fn compute_sha256(path: &Path) -> Result<String, DownloadError> {
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| DownloadError::Io(format!("failed to open {} for hashing: {e}", path.display())))?;
+        let mut file = std::fs::File::open(path).map_err(|e| {
+            DownloadError::Io(format!(
+                "failed to open {} for hashing: {e}",
+                path.display()
+            ))
+        })?;
 
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; 64 * 1024];
 
         loop {
-            let n = file.read(&mut buf)
+            let n = file
+                .read(&mut buf)
                 .map_err(|e| DownloadError::Io(format!("read error during hashing: {e}")))?;
             if n == 0 {
                 break;
@@ -301,15 +323,14 @@ mod inner {
     /// Returns `Ok(true)` if the hash matches, `Ok(false)` if it doesn't,
     /// or `Err` if the sidecar is missing or unreadable.
     pub fn verify_sha256(file_path: &Path) -> Result<bool, DownloadError> {
-        let sha_path = file_path.with_extension(
-            format!(
-                "{}.sha256",
-                file_path.extension().and_then(|e| e.to_str()).unwrap_or("")
-            ),
-        );
+        let sha_path = file_path.with_extension(format!(
+            "{}.sha256",
+            file_path.extension().and_then(|e| e.to_str()).unwrap_or("")
+        ));
 
-        let expected = std::fs::read_to_string(&sha_path)
-            .map_err(|e| DownloadError::Io(format!("failed to read {}: {e}", sha_path.display())))?;
+        let expected = std::fs::read_to_string(&sha_path).map_err(|e| {
+            DownloadError::Io(format!("failed to read {}: {e}", sha_path.display()))
+        })?;
 
         // Format is "<hash>  <filename>\n" (GNU coreutils style).
         let expected_hash = expected.split_whitespace().next().unwrap_or("");
@@ -399,11 +420,13 @@ mod tests {
 
     #[test]
     fn split_accepts_nested_shard() {
-        let (url, local) = split_repo_path(
-            "Qwen_Qwen3.6-27B-bf16/Qwen_Qwen3.6-27B-bf16-00001-of-00002.gguf",
-        )
-        .unwrap();
-        assert_eq!(url, "Qwen_Qwen3.6-27B-bf16/Qwen_Qwen3.6-27B-bf16-00001-of-00002.gguf");
+        let (url, local) =
+            split_repo_path("Qwen_Qwen3.6-27B-bf16/Qwen_Qwen3.6-27B-bf16-00001-of-00002.gguf")
+                .unwrap();
+        assert_eq!(
+            url,
+            "Qwen_Qwen3.6-27B-bf16/Qwen_Qwen3.6-27B-bf16-00001-of-00002.gguf"
+        );
         assert_eq!(local, "Qwen_Qwen3.6-27B-bf16-00001-of-00002.gguf");
     }
 
@@ -411,11 +434,11 @@ mod tests {
     fn split_rejects_traversal_and_malformed() {
         assert!(split_repo_path("../etc/passwd").is_err());
         assert!(split_repo_path("subdir/../escape.gguf").is_err());
-        assert!(split_repo_path("/abs/path.gguf").is_err());      // leading slash -> empty segment
-        assert!(split_repo_path("trailing/").is_err());           // trailing slash -> empty segment
-        assert!(split_repo_path("double//slash.gguf").is_err());  // empty middle segment
+        assert!(split_repo_path("/abs/path.gguf").is_err()); // leading slash -> empty segment
+        assert!(split_repo_path("trailing/").is_err()); // trailing slash -> empty segment
+        assert!(split_repo_path("double//slash.gguf").is_err()); // empty middle segment
         assert!(split_repo_path("back\\slash.gguf").is_err());
-        assert!(split_repo_path("a/b/c/d/e.gguf").is_err());      // too deep
+        assert!(split_repo_path("a/b/c/d/e.gguf").is_err()); // too deep
         assert!(split_repo_path("").is_err());
     }
 
@@ -453,7 +476,8 @@ mod tests {
             let sha_path = dir.join("test-verify.gguf.sha256");
 
             let mut f = std::fs::File::create(&path).unwrap();
-            f.write_all(b"test content for sha256 verification").unwrap();
+            f.write_all(b"test content for sha256 verification")
+                .unwrap();
             drop(f);
 
             // Compute hash and write sidecar.
@@ -481,7 +505,10 @@ mod tests {
             let result = download_gguf("some/repo", "../etc/passwd", &dir, true);
             assert!(result.is_err());
             if let Err(DownloadError::InvalidFilename(msg)) = result {
-                assert!(msg.contains("path traversal"), "expected traversal error, got: {msg}");
+                assert!(
+                    msg.contains("path traversal"),
+                    "expected traversal error, got: {msg}"
+                );
             } else {
                 panic!("expected InvalidFilename error");
             }

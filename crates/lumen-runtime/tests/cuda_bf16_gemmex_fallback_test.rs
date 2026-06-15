@@ -35,9 +35,7 @@ use lumen_runtime::cuda::CudaBackend;
 /// `Err` when `libcuda.{dylib,so}` cannot be loaded; wrap in
 /// `catch_unwind` so these tests skip cleanly on dev hosts.
 fn try_cuda_backend() -> Option<CudaBackend> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        CudaBackend::new(0)
-    })) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| CudaBackend::new(0))) {
         Ok(Ok(b)) => Some(b),
         Ok(Err(_)) | Err(_) => None,
     }
@@ -59,8 +57,8 @@ fn bf16_probe_runs_without_panic_on_hardware() {
     // `BF16_GEMMEX_PROBED.get().is_some()` and runs at most once per
     // process. If the gate is missing or broken, the second probe will
     // either panic (double-init) or emit a duplicate warning.
-    let _backend2 = try_cuda_backend()
-        .expect("second backend construction must succeed once the first did");
+    let _backend2 =
+        try_cuda_backend().expect("second backend construction must succeed once the first did");
     drop(backend1);
     // No assertions beyond "did not panic": the probe outcome is
     // recorded in process-static atomics that subsequent matvec tests

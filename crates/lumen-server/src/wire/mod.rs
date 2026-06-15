@@ -231,7 +231,9 @@ mod tests {
         use std::thread;
         let (threads, per) = (8usize, 20_000usize);
         let handles: Vec<_> = (0..threads)
-            .map(|_| thread::spawn(move || (0..per).map(|_| next_random_seed()).collect::<Vec<u64>>()))
+            .map(|_| {
+                thread::spawn(move || (0..per).map(|_| next_random_seed()).collect::<Vec<u64>>())
+            })
             .collect();
         let mut seen = HashSet::with_capacity(threads * per);
         for h in handles {
@@ -258,11 +260,31 @@ mod tests {
     #[test]
     fn normalize_zero_penalty_matches_cli() {
         assert_eq!(normalize_zero_penalty(None), None, "omitted -> None");
-        assert_eq!(normalize_zero_penalty(Some(0.0)), None, "explicit 0 -> None (CLI parity)");
-        assert_eq!(normalize_zero_penalty(Some(-0.0)), None, "negative-zero -> None");
-        assert_eq!(normalize_zero_penalty(Some(0.7)), Some(0.7), "non-zero passes through");
-        assert_eq!(normalize_zero_penalty(Some(f32::NAN)), None, "NaN -> None (junk guard)");
-        assert_eq!(normalize_zero_penalty(Some(f32::INFINITY)), None, "inf -> None");
+        assert_eq!(
+            normalize_zero_penalty(Some(0.0)),
+            None,
+            "explicit 0 -> None (CLI parity)"
+        );
+        assert_eq!(
+            normalize_zero_penalty(Some(-0.0)),
+            None,
+            "negative-zero -> None"
+        );
+        assert_eq!(
+            normalize_zero_penalty(Some(0.7)),
+            Some(0.7),
+            "non-zero passes through"
+        );
+        assert_eq!(
+            normalize_zero_penalty(Some(f32::NAN)),
+            None,
+            "NaN -> None (junk guard)"
+        );
+        assert_eq!(
+            normalize_zero_penalty(Some(f32::INFINITY)),
+            None,
+            "inf -> None"
+        );
     }
 
     // ---- F16(a): runtime-error classifier ----
@@ -304,15 +326,24 @@ mod tests {
     fn classify_runtime_compute_error_stays_500() {
         // A genuine compute/IO failure must NOT be downgraded to 400.
         let e = ServerError::classify_runtime("compute: matmul kernel returned NaN");
-        assert!(matches!(e, ServerError::Runtime(_)), "compute error stays Runtime (500)");
+        assert!(
+            matches!(e, ServerError::Runtime(_)),
+            "compute error stays Runtime (500)"
+        );
     }
 
     #[test]
     fn check_prompt_length_guard() {
         assert!(check_prompt_length(100, 4096).is_ok(), "under window OK");
-        assert!(check_prompt_length(4096, 4096).is_ok(), "exactly at window OK");
+        assert!(
+            check_prompt_length(4096, 4096).is_ok(),
+            "exactly at window OK"
+        );
         assert!(check_prompt_length(4097, 4096).is_err(), "over window 400");
-        assert!(check_prompt_length(99999, 0).is_ok(), "context 0 = unknown, skip");
+        assert!(
+            check_prompt_length(99999, 0).is_ok(),
+            "context 0 = unknown, skip"
+        );
     }
 
     // ---- F7: ONE shared content-parts flattener, single recognized key set ----
@@ -327,12 +358,18 @@ mod tests {
             "world",
             {"type": "text", "content": "DROPPED"}
         ]);
-        assert_eq!(flatten_content(&v, "messages.content").unwrap(), "hello world");
+        assert_eq!(
+            flatten_content(&v, "messages.content").unwrap(),
+            "hello world"
+        );
     }
 
     #[test]
     fn flatten_content_string_and_null() {
-        assert_eq!(flatten_content(&serde_json::json!("hi"), "p").unwrap(), "hi");
+        assert_eq!(
+            flatten_content(&serde_json::json!("hi"), "p").unwrap(),
+            "hi"
+        );
         assert_eq!(flatten_content(&Value::Null, "p").unwrap(), "");
     }
 
@@ -346,7 +383,10 @@ mod tests {
             }
             other => panic!("expected 400, got {other:?}"),
         }
-        assert!(flatten_content(&serde_json::json!(true), "p").is_err(), "bool also 400");
+        assert!(
+            flatten_content(&serde_json::json!(true), "p").is_err(),
+            "bool also 400"
+        );
     }
 
     #[test]
@@ -437,7 +477,13 @@ mod tests {
         );
         // Sanity: the transcript actually contains the round-trip markers.
         assert!(openai_prompt.contains("<tool_call>"), "tool_call present");
-        assert!(openai_prompt.contains("<tool_response>"), "tool_response present");
-        assert!(openai_prompt.contains("{\"city\":\"Paris\"}"), "arguments reconciled (compact)");
+        assert!(
+            openai_prompt.contains("<tool_response>"),
+            "tool_response present"
+        );
+        assert!(
+            openai_prompt.contains("{\"city\":\"Paris\"}"),
+            "arguments reconciled (compact)"
+        );
     }
 }

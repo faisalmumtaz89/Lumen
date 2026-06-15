@@ -137,8 +137,7 @@ fn cpu_gdn_state_update(
             let v_delta = b * (v_val - retrieval);
             let mut my_out = 0.0f32;
             for ki in 0..key_dim {
-                let h_updated =
-                    h_state[h_base + ki] + k_norm[kv_head * key_dim + ki] * v_delta;
+                let h_updated = h_state[h_base + ki] + k_norm[kv_head * key_dim + ki] * v_delta;
                 h_state[h_base + ki] = h_updated;
                 my_out += h_updated * q_norm[kv_head * key_dim + ki] * q_scale;
             }
@@ -739,8 +738,9 @@ fn test_cuda_gdn_state_update_basic() {
     let alpha_gpu = stream.clone_htod(&alpha).unwrap();
     let beta_gpu = stream.clone_htod(&beta).unwrap();
     let q_norm_gpu = stream.clone_htod(&q_norm).unwrap();
-    let mut output_gpu: CudaSlice<f32> =
-        stream.alloc_zeros(num_heads as usize * val_dim as usize).unwrap();
+    let mut output_gpu: CudaSlice<f32> = stream
+        .alloc_zeros(num_heads as usize * val_dim as usize)
+        .unwrap();
 
     // One block per head, val_dim threads per block
     let cfg = LaunchConfig {
@@ -841,8 +841,9 @@ fn test_cuda_gdn_state_update_realistic() {
     let alpha_gpu = stream.clone_htod(&alpha).unwrap();
     let beta_gpu = stream.clone_htod(&beta).unwrap();
     let q_norm_gpu = stream.clone_htod(&q_norm).unwrap();
-    let mut output_gpu: CudaSlice<f32> =
-        stream.alloc_zeros(num_heads as usize * val_dim as usize).unwrap();
+    let mut output_gpu: CudaSlice<f32> = stream
+        .alloc_zeros(num_heads as usize * val_dim as usize)
+        .unwrap();
 
     let cfg = LaunchConfig {
         grid_dim: (num_heads, 1, 1),

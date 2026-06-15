@@ -36,7 +36,9 @@ pub enum FormatError {
     #[error("invalid RoPE scaling type: {0}")]
     InvalidRopeScalingType(u8),
 
-    #[error("layer count mismatch: header says {header_count}, hyperparams say {hyperparams_count}")]
+    #[error(
+        "layer count mismatch: header says {header_count}, hyperparams say {hyperparams_count}"
+    )]
     LayerCountMismatch {
         header_count: u32,
         hyperparams_count: u32,
@@ -71,9 +73,14 @@ mod tests {
             max_supported: 4,
         }
         .to_string();
-        assert!(msg.contains("v5") && msg.contains("v4"), "states the versions: {msg}");
         assert!(
-            msg.contains("lumen pull") || msg.contains("lumen convert") || msg.contains("update Lumen"),
+            msg.contains("v5") && msg.contains("v4"),
+            "states the versions: {msg}"
+        );
+        assert!(
+            msg.contains("lumen pull")
+                || msg.contains("lumen convert")
+                || msg.contains("update Lumen"),
             "tells the user what to do: {msg}"
         );
     }
@@ -85,6 +92,9 @@ mod tests {
             found: 0xDEAD_BEEF,
         }
         .to_string();
-        assert!(msg.contains("lumen convert"), "hints GGUF conversion: {msg}");
+        assert!(
+            msg.contains("lumen convert"),
+            "hints GGUF conversion: {msg}"
+        );
     }
 }

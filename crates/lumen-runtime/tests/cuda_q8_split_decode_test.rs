@@ -70,7 +70,10 @@ fn f32_to_f16_bits(val: f32) -> u16 {
 /// the bytes loaded from GGUF / produced by the CUDA dequant inverse: scale at
 /// offset +0..1 (f16 little-endian), quants at offset +2..33 (int8).
 fn encode_q8_raw(values: &[f32]) -> Vec<u8> {
-    assert!(values.len() % Q8_BLOCK == 0, "encoder requires whole blocks");
+    assert!(
+        values.len() % Q8_BLOCK == 0,
+        "encoder requires whole blocks"
+    );
     let n_blocks = values.len() / Q8_BLOCK;
     let mut out = vec![0u8; n_blocks * Q8_RAW_BYTES];
     for b in 0..n_blocks {
@@ -137,7 +140,8 @@ fn run_split_vs_raw(out_dim: usize, in_dim: usize, seed: u64, tol: f32) {
 
     // --- Build random weights as Q8Raw bytes on the host. ---
     let mut rng = seed;
-    let mut weight_bytes: Vec<u8> = Vec::with_capacity(out_dim * (in_dim / Q8_BLOCK) * Q8_RAW_BYTES);
+    let mut weight_bytes: Vec<u8> =
+        Vec::with_capacity(out_dim * (in_dim / Q8_BLOCK) * Q8_RAW_BYTES);
     for _ in 0..out_dim {
         let row: Vec<f32> = (0..in_dim).map(|_| lcg_next_f32(&mut rng)).collect();
         weight_bytes.extend_from_slice(&encode_q8_raw(&row));

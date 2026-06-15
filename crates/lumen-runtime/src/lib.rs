@@ -11,19 +11,19 @@
 //! + Cache     Backend
 //! ```
 
-pub mod compute;
-#[cfg(target_os = "macos")]
-pub mod metal;
 #[cfg(target_os = "macos")]
 pub mod accelerate;
+pub mod compute;
+pub mod config;
 #[cfg(feature = "cuda")]
 pub mod cuda;
-pub mod config;
 pub mod engine;
 pub mod error;
 pub mod eval;
 pub mod expert;
 pub mod kv;
+#[cfg(target_os = "macos")]
+pub mod metal;
 pub mod pipeline;
 pub mod runtime_defaults;
 pub mod sampling;
@@ -34,34 +34,36 @@ pub mod thread_pool;
 pub mod tooling;
 pub mod weight;
 
-pub use weight::cache::{CacheStats, LayerView, PrefetchHandle, PrefetchPriority, WeightProvider};
-pub use compute::ComputeBackend;
+#[cfg(target_os = "macos")]
+pub use accelerate::AccelerateBatchBackend;
 pub use compute::cpu_naive::NaiveF32Backend;
 pub use compute::cpu_simd::SimdF32Backend;
+pub use compute::ComputeBackend;
+pub use config::RuntimeConfig;
+pub use engine::{InferenceEngine, SamplingParams, StopCondition};
+pub use error::RuntimeError;
+pub use eval::{coherence_score, CoherenceVerdict};
+pub use kv::{KvCache, KvCacheConfig, KvPrecision};
 #[cfg(target_os = "macos")]
 pub use metal::MetalF32Backend;
 #[cfg(target_os = "macos")]
 pub use metal::RouterLayerStats;
-#[cfg(target_os = "macos")]
-pub use accelerate::AccelerateBatchBackend;
-pub use config::RuntimeConfig;
-pub use engine::{InferenceEngine, SamplingParams, StopCondition};
-pub use error::RuntimeError;
-pub use kv::{KvCache, KvCacheConfig, KvPrecision};
-pub use session::{PrefillResult, Session, SuffixPrefillResult, TokenStream};
-pub use tooling::{
-    parse_final, ParsedAssistant, ParsedToolCall, Qwen35Renderer, ReasoningDelta,
-    ReasoningExtractor, StreamingDelta, StreamingFinish, StreamingParser, ToolResult,
-    ToolSchema, THINK_CLOSE, TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
-};
 pub use pipeline::PipelineMode;
-pub use storage::{IoSnapshot, IoTracker, MmapPageCacheBackend, StorageBackend};
+pub use session::{PrefillResult, Session, SuffixPrefillResult, TokenStream};
+pub use storage::mmap::MmapStorageBackend;
 #[cfg(unix)]
 pub use storage::purge_file_cache;
-pub use storage::mmap::MmapStorageBackend;
 pub use storage::sync::SyncFileBackend;
-pub use telemetry::{InferenceMetrics, IoMetrics, KvCacheStats, PerLayerTiming, ServerMemoryBreakdown};
-pub use eval::{coherence_score, CoherenceVerdict};
+pub use storage::{IoSnapshot, IoTracker, MmapPageCacheBackend, StorageBackend};
+pub use telemetry::{
+    InferenceMetrics, IoMetrics, KvCacheStats, PerLayerTiming, ServerMemoryBreakdown,
+};
+pub use tooling::{
+    parse_final, ParsedAssistant, ParsedToolCall, Qwen35Renderer, ReasoningDelta,
+    ReasoningExtractor, StreamingDelta, StreamingFinish, StreamingParser, ToolResult, ToolSchema,
+    THINK_CLOSE, TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
+};
+pub use weight::cache::{CacheStats, LayerView, PrefetchHandle, PrefetchPriority, WeightProvider};
 pub use weight::provider_async::AsyncWeightProvider;
 pub use weight::provider_mmap::MmapWeightProvider;
 pub use weight::provider_sync::SyncWeightProvider;

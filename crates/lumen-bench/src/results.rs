@@ -52,24 +52,36 @@ pub struct BenchSummary {
 impl BenchSummary {
     pub fn new(label: String, results: Vec<BenchResult>) -> Self {
         let iterations = results.len();
-        Self { label, iterations, results }
+        Self {
+            label,
+            iterations,
+            results,
+        }
     }
 
     /// Mean TPOT across iterations.
     pub fn mean_tpot_ms(&self) -> f64 {
-        if self.results.is_empty() { return 0.0; }
+        if self.results.is_empty() {
+            return 0.0;
+        }
         let sum: f64 = self.results.iter().map(|r| r.tpot_ms).sum();
         sum / self.results.len() as f64
     }
 
     /// Median TPOT across iterations.
     pub fn median_tpot_ms(&self) -> f64 {
-        percentile(&self.results.iter().map(|r| r.tpot_ms).collect::<Vec<_>>(), 0.5)
+        percentile(
+            &self.results.iter().map(|r| r.tpot_ms).collect::<Vec<_>>(),
+            0.5,
+        )
     }
 
     /// P95 TPOT across iterations.
     pub fn p95_tpot_ms(&self) -> f64 {
-        percentile(&self.results.iter().map(|r| r.tpot_ms).collect::<Vec<_>>(), 0.95)
+        percentile(
+            &self.results.iter().map(|r| r.tpot_ms).collect::<Vec<_>>(),
+            0.95,
+        )
     }
 
     /// Standard deviation of TPOT across iterations.
@@ -89,21 +101,27 @@ impl BenchSummary {
 
     /// Mean I/O bandwidth in GiB/s.
     pub fn mean_bandwidth_gibs(&self) -> f64 {
-        if self.results.is_empty() { return 0.0; }
+        if self.results.is_empty() {
+            return 0.0;
+        }
         let sum: f64 = self.results.iter().map(|r| r.bandwidth_gibs).sum();
         sum / self.results.len() as f64
     }
 
     /// Mean stall fraction.
     pub fn mean_stall_fraction(&self) -> f64 {
-        if self.results.is_empty() { return 0.0; }
+        if self.results.is_empty() {
+            return 0.0;
+        }
         let sum: f64 = self.results.iter().map(|r| r.stall_fraction).sum();
         sum / self.results.len() as f64
     }
 
     /// Mean total time.
     pub fn mean_total_time(&self) -> Duration {
-        if self.results.is_empty() { return Duration::ZERO; }
+        if self.results.is_empty() {
+            return Duration::ZERO;
+        }
         let sum: Duration = self.results.iter().map(|r| r.total_time).sum();
         sum / self.results.len() as u32
     }
@@ -320,7 +338,10 @@ mod tests {
         // [2, 4, 4, 4, 5, 5, 7, 9] -> mean=5, sample variance = 4.571..., std_dev ~ 2.138
         let data = vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
         let sd = std_dev(&data);
-        assert!((sd - 2.1380899352993952).abs() < 1e-10, "expected ~2.138, got {sd}");
+        assert!(
+            (sd - 2.1380899352993952).abs() < 1e-10,
+            "expected ~2.138, got {sd}"
+        );
     }
 
     /// Local fixture builder so the new fields are
@@ -457,8 +478,7 @@ mod tests {
         // and the caller is responsible for interpreting "every stream
         // was empty" as "capture was disabled, not determinism was
         // proved".
-        let results: Vec<BenchResult> =
-            (0..5).map(|_| mk_result(10.0, 1.0, vec![], 0)).collect();
+        let results: Vec<BenchResult> = (0..5).map(|_| mk_result(10.0, 1.0, vec![], 0)).collect();
         let summary = BenchSummary::new("nocap".to_string(), results);
         let v = summary.determinism_verdict();
         assert!(v.pass);

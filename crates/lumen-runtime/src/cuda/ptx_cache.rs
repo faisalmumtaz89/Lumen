@@ -201,14 +201,12 @@ pub(crate) fn store(key: &CacheKey, ptx: &[u8]) {
     // Unique temp name per (pid, key) so two concurrent first-launches writing
     // the *same* kernel don't clobber each other's temp file mid-write; the
     // final rename is atomic so whichever lands last wins with a complete file.
-    let tmp = dir.join(format!(
-        ".{}.{}.tmp",
-        key.digest_hex(),
-        std::process::id()
-    ));
+    let tmp = dir.join(format!(".{}.{}.tmp", key.digest_hex(), std::process::id()));
     let entry = serialize_entry(ptx);
     {
-        let Ok(mut f) = std::fs::File::create(&tmp) else { return };
+        let Ok(mut f) = std::fs::File::create(&tmp) else {
+            return;
+        };
         if f.write_all(&entry).is_err() {
             let _ = std::fs::remove_file(&tmp);
             return;
@@ -246,7 +244,9 @@ pub(crate) fn mark_driver_reject(key: &CacheKey) {
     if !cache_enabled() {
         return;
     }
-    let Some(path) = key.reject_path() else { return };
+    let Some(path) = key.reject_path() else {
+        return;
+    };
     let Some(dir) = path.parent() else { return };
     if std::fs::create_dir_all(dir).is_err() {
         return;
@@ -258,7 +258,9 @@ pub(crate) fn mark_driver_reject(key: &CacheKey) {
     }
     let tmp = dir.join(format!(".{}.{}.rtmp", key.digest_hex(), std::process::id()));
     {
-        let Ok(mut f) = std::fs::File::create(&tmp) else { return };
+        let Ok(mut f) = std::fs::File::create(&tmp) else {
+            return;
+        };
         // Content is irrelevant -- existence is the signal -- but a magic byte
         // makes the file self-describing if a human inspects the cache dir.
         if f.write_all(CACHE_MAGIC).is_err() || f.flush().is_err() {
@@ -278,9 +280,7 @@ pub(crate) fn is_driver_rejected(key: &CacheKey) -> bool {
     if !cache_enabled() {
         return false;
     }
-    key.reject_path()
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    key.reject_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 /// Serialize a cache entry: MAGIC || u32 len(payload) || payload || u32 crc(payload).
@@ -344,14 +344,11 @@ pub(crate) fn entry_count() -> usize {
 
 #[allow(dead_code)]
 fn count_ptxc(dir: &Path) -> usize {
-    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
     rd.filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|x| x == "ptxc")
-                .unwrap_or(false)
-        })
+        .filter(|e| e.path().extension().map(|x| x == "ptxc").unwrap_or(false))
         .count()
 }
 
@@ -664,12 +661,30 @@ mod tests {
         let d0 = base.digest_hex();
 
         let variants = [
-            CacheKey { source: "kernel B", ..clone_key(&base) },
-            CacheKey { arch: "compute_61", ..clone_key(&base) },
-            CacheKey { fast_math: true, ..clone_key(&base) },
-            CacheKey { cc: (8, 6), ..clone_key(&base) },
-            CacheKey { nvrtc_version: (12, 3), ..clone_key(&base) },
-            CacheKey { driver_version: 12030, ..clone_key(&base) },
+            CacheKey {
+                source: "kernel B",
+                ..clone_key(&base)
+            },
+            CacheKey {
+                arch: "compute_61",
+                ..clone_key(&base)
+            },
+            CacheKey {
+                fast_math: true,
+                ..clone_key(&base)
+            },
+            CacheKey {
+                cc: (8, 6),
+                ..clone_key(&base)
+            },
+            CacheKey {
+                nvrtc_version: (12, 3),
+                ..clone_key(&base)
+            },
+            CacheKey {
+                driver_version: 12030,
+                ..clone_key(&base)
+            },
         ];
         for v in &variants {
             assert_ne!(d0, v.digest_hex(), "key component must change digest");
@@ -721,7 +736,10 @@ mod tests {
             ..clone_key(&rejected)
         };
 
-        assert!(!is_driver_rejected(&rejected), "fresh key must not be rejected");
+        assert!(
+            !is_driver_rejected(&rejected),
+            "fresh key must not be rejected"
+        );
         assert!(!is_driver_rejected(&fallback));
 
         mark_driver_reject(&rejected);

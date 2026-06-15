@@ -18,15 +18,15 @@
 //!
 //! Zero mutex operations on the hot path. Stats use atomic counters.
 
+use crate::error::RuntimeError;
+use crate::storage::sync::SyncFileBackend;
+use crate::storage::{IoSnapshot, IoTracker, StorageBackend};
 use crate::weight::cache::{
     CacheStats, LayerView, PrefetchHandle, PrefetchPriority, WeightProvider,
 };
-use crate::error::RuntimeError;
-use crate::storage::{IoSnapshot, IoTracker, StorageBackend};
-use crate::storage::sync::SyncFileBackend;
 use crate::weight::provider_sync::{bytes_to_f32, read_embedding_global, read_output_proj_global};
-use lumen_format::quantization::QuantScheme;
 use lumen_format::index::LayerIndex;
+use lumen_format::quantization::QuantScheme;
 use lumen_format::reader::LbcFile;
 use std::cell::UnsafeCell;
 use std::path::Path;
@@ -155,10 +155,8 @@ impl AsyncWeightProvider {
 
         let embed_header_quant = lbc.header.embedding.quant;
         let outproj_header_quant = lbc.header.output_proj.quant;
-        let embedding_bytes = fallback_backend.read_range(
-            lbc.header.embedding.offset,
-            lbc.header.embedding.length,
-        )?;
+        let embedding_bytes = fallback_backend
+            .read_range(lbc.header.embedding.offset, lbc.header.embedding.length)?;
         let (embedding, embedding_raw, embedding_quant) =
             read_embedding_global(embedding_bytes, vocab_size, hidden_dim, embed_header_quant);
         let final_norm = read_f32_tensor(
@@ -166,12 +164,14 @@ impl AsyncWeightProvider {
             lbc.header.final_norm.offset,
             lbc.header.final_norm.length,
         )?;
-        let output_proj_bytes = fallback_backend.read_range(
-            lbc.header.output_proj.offset,
-            lbc.header.output_proj.length,
-        )?;
-        let (output_proj, output_proj_raw, output_proj_quant) =
-            read_output_proj_global(output_proj_bytes, vocab_size, hidden_dim, outproj_header_quant);
+        let output_proj_bytes = fallback_backend
+            .read_range(lbc.header.output_proj.offset, lbc.header.output_proj.length)?;
+        let (output_proj, output_proj_raw, output_proj_quant) = read_output_proj_global(
+            output_proj_bytes,
+            vocab_size,
+            hidden_dim,
+            outproj_header_quant,
+        );
 
         let num_layers = lbc.header.num_layers as usize;
         let layer_indices = lbc.layer_indices.clone();
@@ -273,7 +273,12 @@ fn io_thread_loop(shared: &SharedSlots, layer_indices: &[LayerIndex], path: &Pat
             // Only transition EMPTY -> FILLING (compare_exchange is lock-free).
             if slot
                 .state
-                .compare_exchange(SLOT_EMPTY, SLOT_FILLING, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange(
+                    SLOT_EMPTY,
+                    SLOT_FILLING,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
             {
                 // We own this slot exclusively. Read the layer data.
@@ -375,7 +380,12 @@ impl WeightProvider for AsyncWeightProvider {
         // we just return our view without storing.
         if slot
             .state
-            .compare_exchange(SLOT_EMPTY, SLOT_FILLING, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(
+                SLOT_EMPTY,
+                SLOT_FILLING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_ok()
         {
             // SAFETY: exclusive access while FILLING.
@@ -480,8 +490,8 @@ impl Drop for AsyncWeightProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compute::ComputeBackend;
     use crate::compute::cpu_naive::NaiveF32Backend;
+    use crate::compute::ComputeBackend;
     use crate::config::RuntimeConfig;
     use crate::engine::{InferenceEngine, SamplingParams, StopCondition};
     use crate::kv::KvPrecision;
@@ -526,9 +536,7 @@ mod tests {
         let path = create_test_lbc();
         let provider = AsyncWeightProvider::open(&path).unwrap();
 
-        provider
-            .prefetch_layer(1, PrefetchPriority::High)
-            .unwrap();
+        provider.prefetch_layer(1, PrefetchPriority::High).unwrap();
 
         // Give the I/O thread time to complete.
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -606,8 +614,7 @@ mod tests {
             .init(&async_provider.lbc().header.hyperparams)
             .unwrap();
 
-        let engine =
-            InferenceEngine::new(rt_config, async_provider.lbc().header.hyperparams);
+        let engine = InferenceEngine::new(rt_config, async_provider.lbc().header.hyperparams);
         let async_result = engine
             .generate(&prompt, &async_provider, &async_backend, &stop, &sampling)
             .unwrap();

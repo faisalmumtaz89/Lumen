@@ -19,11 +19,11 @@
 //!
 //! Output is bit-identical to the original allocating implementation.
 
-use crate::weight::cache::LayerView;
 use crate::compute::{ActivationBuffer, ComputeBackend, ComputeDtype, Logits};
 use crate::engine::softmax_inplace;
 use crate::error::RuntimeError;
 use crate::kv::KvCacheView;
+use crate::weight::cache::LayerView;
 use lumen_format::hyperparams::ModelHyperparams;
 use lumen_format::quantization::QuantScheme;
 use std::sync::Mutex;
@@ -188,14 +188,22 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
     }
     if exp == 31 {
         return if frac == 0 {
-            if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY }
+            if sign == 1 {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            }
         } else {
             f32::NAN
         };
     }
     let exp_f32 = ((exp as u32 - 15 + 127) << 23) | ((frac as u32) << 13);
     let v = f32::from_bits(exp_f32);
-    if sign == 1 { -v } else { v }
+    if sign == 1 {
+        -v
+    } else {
+        v
+    }
 }
 
 /// Matrix-vector multiply reading F16 weights from bytes.
@@ -289,7 +297,10 @@ fn matmul_dispatch(
         QuantScheme::F16 => matmul_bytes_f16(out, w_bytes, x, out_dim, in_dim),
         QuantScheme::Q8_0 => matmul_bytes_q8_0(out, w_bytes, x, out_dim, in_dim),
         QuantScheme::Q4_0 => matmul_bytes_q4_0(out, w_bytes, x, out_dim, in_dim),
-        _ => panic!("NaiveF32Backend: unsupported weight quant scheme {:?}", quant),
+        _ => panic!(
+            "NaiveF32Backend: unsupported weight quant scheme {:?}",
+            quant
+        ),
     }
 }
 
@@ -403,7 +414,11 @@ impl ComputeBackend for NaiveF32Backend {
 
         // Pre-compute RoPE tables for all positions up to max_seq_len
         let half_dim = head_dim / 2;
-        let theta = hyperparams.rope_params.as_ref().map(|r| r.theta).unwrap_or(10000.0);
+        let theta = hyperparams
+            .rope_params
+            .as_ref()
+            .map(|r| r.theta)
+            .unwrap_or(10000.0);
         let mut rope_cos = vec![0.0f32; max_seq_len * half_dim];
         let mut rope_sin = vec![0.0f32; max_seq_len * half_dim];
         for pos in 0..max_seq_len {
@@ -491,21 +506,47 @@ impl ComputeBackend for NaiveF32Backend {
         // Dispatch based on per-tensor quant scheme for quantized models
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
-        matmul_dispatch(&mut s.q, wq_bytes, &s.normed, q_dim, hidden_dim, st.wq.quant);
-        matmul_dispatch(&mut s.k, wk_bytes, &s.normed, kv_dim, hidden_dim, st.wk.quant);
-        matmul_dispatch(&mut s.v, wv_bytes, &s.normed, kv_dim, hidden_dim, st.wv.quant);
+        matmul_dispatch(
+            &mut s.q,
+            wq_bytes,
+            &s.normed,
+            q_dim,
+            hidden_dim,
+            st.wq.quant,
+        );
+        matmul_dispatch(
+            &mut s.k,
+            wk_bytes,
+            &s.normed,
+            kv_dim,
+            hidden_dim,
+            st.wk.quant,
+        );
+        matmul_dispatch(
+            &mut s.v,
+            wv_bytes,
+            &s.normed,
+            kv_dim,
+            hidden_dim,
+            st.wv.quant,
+        );
 
         // 3. Apply RoPE (pre-computed tables)
         apply_rope_precomputed(
-            &mut s.q, &mut s.k,
-            num_heads, num_kv_heads, head_dim, seq_pos,
-            &s.rope_cos, &s.rope_sin, s.half_dim,
+            &mut s.q,
+            &mut s.k,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_pos,
+            &s.rope_cos,
+            &s.rope_sin,
+            s.half_dim,
         );
 
         // 4. Append k,v to KV cache
-        let kv = kv.ok_or_else(|| {
-            RuntimeError::Compute("KV cache view required for attention".into())
-        })?;
+        let kv =
+            kv.ok_or_else(|| RuntimeError::Compute("KV cache view required for attention".into()))?;
 
         // Append new k,v to cache via KvCacheView helpers (proper abstraction layer)
         kv.append_keys(&s.k);
@@ -519,7 +560,7 @@ impl ComputeBackend for NaiveF32Backend {
 
         for h in 0..num_heads {
             let kv_h = h / gqa_ratio; // GQA: multiple Q heads share one KV head
-            // Head-first layout: per-head element base
+                                      // Head-first layout: per-head element base
             let kv_head_elem_base = kv_h * kv_max_seq_len * head_dim;
 
             // Compute attention scores for this head
@@ -553,7 +594,14 @@ impl ComputeBackend for NaiveF32Backend {
         }
 
         // 6. Output projection
-        matmul_dispatch(&mut s.attn_proj, wo_bytes, &s.attn_out, hidden_dim, q_dim, st.wo.quant);
+        matmul_dispatch(
+            &mut s.attn_proj,
+            wo_bytes,
+            &s.attn_out,
+            hidden_dim,
+            q_dim,
+            st.wo.quant,
+        );
 
         // 7. Residual connection (in-place into attn_proj to reuse buffer)
         // x_f32 is the zero-copy view of the original input activation
@@ -565,10 +613,31 @@ impl ComputeBackend for NaiveF32Backend {
         rmsnorm_bytes(&mut s.normed, &s.attn_proj, ffn_norm_bytes, eps);
 
         // 9. SwiGLU MLP (fused silu+multiply, reuse buffers)
-        matmul_dispatch(&mut s.gate, w_gate_bytes, &s.normed, inter_dim, hidden_dim, st.w_gate.quant);
-        matmul_dispatch(&mut s.up, w_up_bytes, &s.normed, inter_dim, hidden_dim, st.w_up.quant);
+        matmul_dispatch(
+            &mut s.gate,
+            w_gate_bytes,
+            &s.normed,
+            inter_dim,
+            hidden_dim,
+            st.w_gate.quant,
+        );
+        matmul_dispatch(
+            &mut s.up,
+            w_up_bytes,
+            &s.normed,
+            inter_dim,
+            hidden_dim,
+            st.w_up.quant,
+        );
         swiglu_inplace(&mut s.gate, &s.up); // gate now holds silu(gate)*up
-        matmul_dispatch(&mut s.down, w_down_bytes, &s.gate, hidden_dim, inter_dim, st.w_down.quant);
+        matmul_dispatch(
+            &mut s.down,
+            w_down_bytes,
+            &s.gate,
+            hidden_dim,
+            inter_dim,
+            st.w_down.quant,
+        );
 
         // 10. Residual connection
         for i in 0..hidden_dim {
@@ -600,7 +669,13 @@ impl ComputeBackend for NaiveF32Backend {
         rmsnorm(&mut s.normed, x_f32, &self.final_norm, hp.norm_eps);
 
         // Project to vocab logits
-        matmul(&mut s.logits, &self.output_proj, &s.normed, vocab_size, hidden_dim);
+        matmul(
+            &mut s.logits,
+            &self.output_proj,
+            &s.normed,
+            vocab_size,
+            hidden_dim,
+        );
 
         // Move-and-restore: take the computed logits out (O(1) pointer move),
         // then restore scratch.logits for the next call without zeroing.
@@ -645,7 +720,10 @@ mod tests {
         let expected_scale = 1.0 / (7.5f32 + 1e-5).sqrt();
         for (i, &v) in result.iter().enumerate() {
             let expected = x[i] * expected_scale;
-            assert!((v - expected).abs() < 1e-5, "rmsnorm[{i}]: {v} != {expected}");
+            assert!(
+                (v - expected).abs() < 1e-5,
+                "rmsnorm[{i}]: {v} != {expected}"
+            );
         }
     }
 
@@ -666,7 +744,10 @@ mod tests {
         let mut logits = vec![1000.0, 1001.0, 1002.0];
         softmax_inplace(&mut logits);
         let sum: f32 = logits.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5, "softmax sum with large values: {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "softmax sum with large values: {sum}"
+        );
         assert!(logits.iter().all(|v| v.is_finite()));
     }
 
@@ -716,13 +797,24 @@ mod tests {
 
         let cos1 = 1.0f32.cos();
         let sin1 = 1.0f32.sin();
-        assert!((q[0] - cos1).abs() < 1e-6, "q[0]: expected {cos1}, got {}", q[0]);
-        assert!((q[1] - sin1).abs() < 1e-6, "q[1]: expected {sin1}, got {}", q[1]);
+        assert!(
+            (q[0] - cos1).abs() < 1e-6,
+            "q[0]: expected {cos1}, got {}",
+            q[0]
+        );
+        assert!(
+            (q[1] - sin1).abs() < 1e-6,
+            "q[1]: expected {sin1}, got {}",
+            q[1]
+        );
 
         // Verify rotation preserved vector magnitude
         let mag_before = (1.0f32 * 1.0 + 0.0 * 0.0).sqrt();
         let mag_after = (q[0] * q[0] + q[1] * q[1]).sqrt();
-        assert!((mag_before - mag_after).abs() < 1e-6, "RoPE must preserve magnitude");
+        assert!(
+            (mag_before - mag_after).abs() < 1e-6,
+            "RoPE must preserve magnitude"
+        );
     }
 
     #[test]

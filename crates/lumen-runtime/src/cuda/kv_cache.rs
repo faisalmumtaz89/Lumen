@@ -8,7 +8,9 @@
 //! `KvCacheGpu` per layer, allocated at session start and reused across tokens.
 
 use crate::error::RuntimeError;
-use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, LaunchConfig as CudarcLaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaFunction, CudaModule, CudaSlice, LaunchConfig as CudarcLaunchConfig, PushKernelArg,
+};
 use std::sync::Arc;
 
 use super::ffi::CudaDevice;
@@ -54,9 +56,9 @@ impl KvCacheGpu {
         let v_cache = device.alloc_zeros::<f32>(total_elements)?;
 
         let module = device.compile_and_load(KV_CACHE_KERNEL_SOURCE)?;
-        let write_func = module.load_function("kv_cache_write").map_err(|e| {
-            RuntimeError::Compute(format!("Failed to load kv_cache_write: {e}"))
-        })?;
+        let write_func = module
+            .load_function("kv_cache_write")
+            .map_err(|e| RuntimeError::Compute(format!("Failed to load kv_cache_write: {e}")))?;
 
         Ok(Self {
             k_cache,
@@ -85,9 +87,9 @@ impl KvCacheGpu {
         let k_cache = device.alloc_zeros::<f32>(total_elements)?;
         let v_cache = device.alloc_zeros::<f32>(total_elements)?;
 
-        let write_func = module.load_function("kv_cache_write").map_err(|e| {
-            RuntimeError::Compute(format!("Failed to load kv_cache_write: {e}"))
-        })?;
+        let write_func = module
+            .load_function("kv_cache_write")
+            .map_err(|e| RuntimeError::Compute(format!("Failed to load kv_cache_write: {e}")))?;
 
         Ok(Self {
             k_cache,

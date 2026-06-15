@@ -135,27 +135,28 @@ impl LayerIndex {
     pub fn validate(&self, layer_idx: usize) -> Result<(), crate::FormatError> {
         let len = self.layer_length_bytes;
 
-        let validate_slice = |name: &'static str, slice: &TensorSlice| -> Result<(), crate::FormatError> {
-            let end = slice.offset.checked_add(slice.length).ok_or(
-                crate::FormatError::LayerOutOfBounds {
-                    layer: layer_idx,
-                    tensor_name: name,
-                    offset: slice.offset,
-                    length: slice.length,
-                    file_size: len,
-                },
-            )?;
-            if end > len {
-                return Err(crate::FormatError::LayerOutOfBounds {
-                    layer: layer_idx,
-                    tensor_name: name,
-                    offset: slice.offset,
-                    length: slice.length,
-                    file_size: len,
-                });
-            }
-            Ok(())
-        };
+        let validate_slice =
+            |name: &'static str, slice: &TensorSlice| -> Result<(), crate::FormatError> {
+                let end = slice.offset.checked_add(slice.length).ok_or(
+                    crate::FormatError::LayerOutOfBounds {
+                        layer: layer_idx,
+                        tensor_name: name,
+                        offset: slice.offset,
+                        length: slice.length,
+                        file_size: len,
+                    },
+                )?;
+                if end > len {
+                    return Err(crate::FormatError::LayerOutOfBounds {
+                        layer: layer_idx,
+                        tensor_name: name,
+                        offset: slice.offset,
+                        length: slice.length,
+                        file_size: len,
+                    });
+                }
+                Ok(())
+            };
 
         let slices = [
             ("wq", &self.subtensors.wq),
@@ -234,24 +235,36 @@ impl LayerIndex {
                 // lifetime requirement. We can only validate a fixed number of experts
                 // with static names; for the rest, reuse a generic name.
                 let gate_name: &'static str = match e {
-                    0 => "expert_0_gate", 1 => "expert_1_gate",
-                    2 => "expert_2_gate", 3 => "expert_3_gate",
-                    4 => "expert_4_gate", 5 => "expert_5_gate",
-                    6 => "expert_6_gate", 7 => "expert_7_gate",
+                    0 => "expert_0_gate",
+                    1 => "expert_1_gate",
+                    2 => "expert_2_gate",
+                    3 => "expert_3_gate",
+                    4 => "expert_4_gate",
+                    5 => "expert_5_gate",
+                    6 => "expert_6_gate",
+                    7 => "expert_7_gate",
                     _ => "expert_N_gate",
                 };
                 let up_name: &'static str = match e {
-                    0 => "expert_0_up", 1 => "expert_1_up",
-                    2 => "expert_2_up", 3 => "expert_3_up",
-                    4 => "expert_4_up", 5 => "expert_5_up",
-                    6 => "expert_6_up", 7 => "expert_7_up",
+                    0 => "expert_0_up",
+                    1 => "expert_1_up",
+                    2 => "expert_2_up",
+                    3 => "expert_3_up",
+                    4 => "expert_4_up",
+                    5 => "expert_5_up",
+                    6 => "expert_6_up",
+                    7 => "expert_7_up",
                     _ => "expert_N_up",
                 };
                 let down_name: &'static str = match e {
-                    0 => "expert_0_down", 1 => "expert_1_down",
-                    2 => "expert_2_down", 3 => "expert_3_down",
-                    4 => "expert_4_down", 5 => "expert_5_down",
-                    6 => "expert_6_down", 7 => "expert_7_down",
+                    0 => "expert_0_down",
+                    1 => "expert_1_down",
+                    2 => "expert_2_down",
+                    3 => "expert_3_down",
+                    4 => "expert_4_down",
+                    5 => "expert_5_down",
+                    6 => "expert_6_down",
+                    7 => "expert_7_down",
                     _ => "expert_N_down",
                 };
                 validate_slice(gate_name, &expert.gate)?;
@@ -270,7 +283,11 @@ mod tests {
     use crate::quantization::QuantScheme;
 
     fn make_slice(offset: u64, length: u64) -> TensorSlice {
-        TensorSlice { offset, length, quant: QuantScheme::F32 }
+        TensorSlice {
+            offset,
+            length,
+            quant: QuantScheme::F32,
+        }
     }
 
     fn valid_index(blob_size: u64) -> LayerIndex {
@@ -279,17 +296,35 @@ mod tests {
             layer_offset_bytes: 0,
             layer_length_bytes: blob_size,
             subtensors: SubtensorOffsets {
-                wq: s, wk: s, wv: s, wo: s,
-                bq: None, bk: None, bv: None,
-                w_gate: s, w_up: s, w_down: s,
-                attn_norm: s, ffn_norm: s,
+                wq: s,
+                wk: s,
+                wv: s,
+                wo: s,
+                bq: None,
+                bk: None,
+                bv: None,
+                w_gate: s,
+                w_up: s,
+                w_down: s,
+                attn_norm: s,
+                ffn_norm: s,
                 router_weight: None,
                 experts: None,
-                shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-                attn_gate: None, attn_post_norm: None,
-                ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-                ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-                attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+                shared_expert_gate: None,
+                shared_expert_up: None,
+                shared_expert_down: None,
+                attn_gate: None,
+                attn_post_norm: None,
+                ssm_a: None,
+                ssm_conv1d: None,
+                ssm_dt: None,
+                ssm_beta: None,
+                ssm_alpha: None,
+                ssm_norm: None,
+                ssm_out: None,
+                attn_q_norm: None,
+                attn_k_norm: None,
+                ffn_gate_inp_shexp: None,
                 layer_type: None,
             },
         }
@@ -345,17 +380,35 @@ mod tests {
             layer_offset_bytes: 0,
             layer_length_bytes: 200,
             subtensors: SubtensorOffsets {
-                wq: s, wk: s, wv: s, wo: s,
-                bq: None, bk: None, bv: None,
-                w_gate: make_slice(0, 0), w_up: make_slice(0, 0), w_down: make_slice(0, 0),
-                attn_norm: s, ffn_norm: s,
+                wq: s,
+                wk: s,
+                wv: s,
+                wo: s,
+                bq: None,
+                bk: None,
+                bv: None,
+                w_gate: make_slice(0, 0),
+                w_up: make_slice(0, 0),
+                w_down: make_slice(0, 0),
+                attn_norm: s,
+                ffn_norm: s,
                 router_weight: Some(make_slice(60, 10)),
                 experts: Some(vec![expert.clone(), expert]),
-                shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-                attn_gate: None, attn_post_norm: None,
-                ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-                ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-                attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+                shared_expert_gate: None,
+                shared_expert_up: None,
+                shared_expert_down: None,
+                attn_gate: None,
+                attn_post_norm: None,
+                ssm_a: None,
+                ssm_conv1d: None,
+                ssm_dt: None,
+                ssm_beta: None,
+                ssm_alpha: None,
+                ssm_norm: None,
+                ssm_out: None,
+                attn_q_norm: None,
+                attn_k_norm: None,
+                ffn_gate_inp_shexp: None,
                 layer_type: None,
             },
         };
@@ -374,24 +427,45 @@ mod tests {
             layer_offset_bytes: 0,
             layer_length_bytes: 100,
             subtensors: SubtensorOffsets {
-                wq: s, wk: s, wv: s, wo: s,
-                bq: None, bk: None, bv: None,
-                w_gate: make_slice(0, 0), w_up: make_slice(0, 0), w_down: make_slice(0, 0),
-                attn_norm: s, ffn_norm: s,
+                wq: s,
+                wk: s,
+                wv: s,
+                wo: s,
+                bq: None,
+                bk: None,
+                bv: None,
+                w_gate: make_slice(0, 0),
+                w_up: make_slice(0, 0),
+                w_down: make_slice(0, 0),
+                attn_norm: s,
+                ffn_norm: s,
                 router_weight: Some(make_slice(0, 5)),
                 experts: Some(vec![bad_expert]),
-                shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-                attn_gate: None, attn_post_norm: None,
-                ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-                ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-                attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+                shared_expert_gate: None,
+                shared_expert_up: None,
+                shared_expert_down: None,
+                attn_gate: None,
+                attn_post_norm: None,
+                ssm_a: None,
+                ssm_conv1d: None,
+                ssm_dt: None,
+                ssm_beta: None,
+                ssm_alpha: None,
+                ssm_norm: None,
+                ssm_out: None,
+                attn_q_norm: None,
+                attn_k_norm: None,
+                ffn_gate_inp_shexp: None,
                 layer_type: None,
             },
         };
         let err = idx.validate(0).unwrap_err();
         match err {
             crate::FormatError::LayerOutOfBounds { tensor_name, .. } => {
-                assert!(tensor_name.contains("down"), "expected expert down tensor, got: {tensor_name}");
+                assert!(
+                    tensor_name.contains("down"),
+                    "expected expert down tensor, got: {tensor_name}"
+                );
             }
             _ => panic!("expected LayerOutOfBounds"),
         }
@@ -404,17 +478,35 @@ mod tests {
             layer_offset_bytes: 0,
             layer_length_bytes: 100,
             subtensors: SubtensorOffsets {
-                wq: s, wk: s, wv: s, wo: s,
-                bq: None, bk: None, bv: None,
-                w_gate: make_slice(0, 0), w_up: make_slice(0, 0), w_down: make_slice(0, 0),
-                attn_norm: s, ffn_norm: s,
+                wq: s,
+                wk: s,
+                wv: s,
+                wo: s,
+                bq: None,
+                bk: None,
+                bv: None,
+                w_gate: make_slice(0, 0),
+                w_up: make_slice(0, 0),
+                w_down: make_slice(0, 0),
+                attn_norm: s,
+                ffn_norm: s,
                 router_weight: Some(make_slice(90, 20)), // 90+20=110 > 100
                 experts: None,
-                shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-                attn_gate: None, attn_post_norm: None,
-                ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-                ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-                attn_q_norm: None, attn_k_norm: None, ffn_gate_inp_shexp: None,
+                shared_expert_gate: None,
+                shared_expert_up: None,
+                shared_expert_down: None,
+                attn_gate: None,
+                attn_post_norm: None,
+                ssm_a: None,
+                ssm_conv1d: None,
+                ssm_dt: None,
+                ssm_beta: None,
+                ssm_alpha: None,
+                ssm_norm: None,
+                ssm_out: None,
+                attn_q_norm: None,
+                attn_k_norm: None,
+                ffn_gate_inp_shexp: None,
                 layer_type: None,
             },
         };

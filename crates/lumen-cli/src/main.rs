@@ -50,7 +50,10 @@ fn main() {
         "convert" => convert::convert_cmd(&args[2..]),
         "--help" | "-h" | "help" => help::print_usage(),
         "--version" | "-V" => {
-            println!("lumen {}", option_env!("LUMEN_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")));
+            println!(
+                "lumen {}",
+                option_env!("LUMEN_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+            );
         }
         other => {
             eprintln!("Unknown command: {other}");
@@ -76,10 +79,14 @@ fn pull_cmd(args: &[String]) {
         match args[i].as_str() {
             "--quant" => {
                 i += 1;
-                quant_override = Some(args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --quant requires a value (e.g. Q8_0, Q4_0, F16)");
-                    std::process::exit(1);
-                }).clone());
+                quant_override = Some(
+                    args.get(i)
+                        .unwrap_or_else(|| {
+                            eprintln!("Error: --quant requires a value (e.g. Q8_0, Q4_0, F16)");
+                            std::process::exit(1);
+                        })
+                        .clone(),
+                );
             }
             "--yes" | "-y" => {
                 skip_confirm = true;
@@ -111,7 +118,10 @@ fn pull_cmd(args: &[String]) {
         for entry in reg.list() {
             let mut quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
             quants.sort();
-            let tags: Vec<String> = quants.iter().map(|q| format!("{}:{}", entry.key, q.to_lowercase())).collect();
+            let tags: Vec<String> = quants
+                .iter()
+                .map(|q| format!("{}:{}", entry.key, q.to_lowercase()))
+                .collect();
             eprintln!("  {}", tags.join(", "));
         }
         std::process::exit(1);
@@ -121,7 +131,11 @@ fn pull_cmd(args: &[String]) {
     let (resolved_name, tag_quant) = if let Some(pos) = model_name.rfind(':') {
         let name = &model_name[..pos];
         let tag = &model_name[pos + 1..];
-        if tag.is_empty() { (model_name, None) } else { (name, Some(tag.to_uppercase())) }
+        if tag.is_empty() {
+            (model_name, None)
+        } else {
+            (name, Some(tag.to_uppercase()))
+        }
     } else {
         (model_name, None)
     };
@@ -148,7 +162,10 @@ fn pull_cmd(args: &[String]) {
         &quant_owned
     } else {
         // Multiple quants — require explicit choice.
-        eprintln!("Multiple quantizations available for {}:\n", entry.display_name);
+        eprintln!(
+            "Multiple quantizations available for {}:\n",
+            entry.display_name
+        );
         let mut quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
         quants.sort();
         for q in &quants {
@@ -183,7 +200,11 @@ fn pull_cmd(args: &[String]) {
     pull_convert_to_lbc(&gguf_path, &lbc_out);
 
     println!("\nReady: {}", lbc_out.display());
-    println!("Run with: lumen run {}:{} \"Hello\"", resolved_name, quant.to_lowercase());
+    println!(
+        "Run with: lumen run {}:{} \"Hello\"",
+        resolved_name,
+        quant.to_lowercase()
+    );
 }
 
 /// Download every shard listed in a [`registry::GgufSource`], returning the
@@ -219,7 +240,10 @@ fn pull_download_gguf_shards(src: &registry::GgufSource, skip_confirm: bool) -> 
 }
 
 #[cfg(not(feature = "download"))]
-fn pull_download_gguf_shards(_src: &registry::GgufSource, _skip_confirm: bool) -> std::path::PathBuf {
+fn pull_download_gguf_shards(
+    _src: &registry::GgufSource,
+    _skip_confirm: bool,
+) -> std::path::PathBuf {
     eprintln!("Error: download support is not compiled in.");
     eprintln!("Rebuild with: cargo build --release --features download");
     std::process::exit(1);
@@ -239,11 +263,10 @@ fn pull_download_gguf(repo: &str, filename: &str, skip_confirm: bool) -> std::pa
         std::process::exit(1);
     });
 
-    download::download_gguf(repo, filename, &cache::cache_dir(), skip_confirm)
-        .unwrap_or_else(|e| {
-            eprintln!("Download failed: {e}");
-            std::process::exit(1);
-        })
+    download::download_gguf(repo, filename, &cache::cache_dir(), skip_confirm).unwrap_or_else(|e| {
+        eprintln!("Download failed: {e}");
+        std::process::exit(1);
+    })
 }
 
 #[cfg(not(feature = "download"))]
@@ -264,7 +287,11 @@ fn pull_convert_to_lbc(gguf_path: &std::path::Path, lbc_out: &std::path::Path) {
         target: crate::convert::default_target_for_host(),
     };
 
-    eprintln!("Converting to LBC: {} -> {}", gguf_path.display(), lbc_out.display());
+    eprintln!(
+        "Converting to LBC: {} -> {}",
+        gguf_path.display(),
+        lbc_out.display()
+    );
 
     match convert_gguf_to_lbc(gguf_path, lbc_out, &opts) {
         Ok(stats) => {
@@ -289,7 +316,12 @@ fn models_cmd() {
         println!("Available models:");
         for entry in reg.list() {
             let quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
-            println!("  {:<20} {} ({})", entry.key, entry.display_name, quants.join(", "));
+            println!(
+                "  {:<20} {} ({})",
+                entry.key,
+                entry.display_name,
+                quants.join(", ")
+            );
         }
         return;
     }

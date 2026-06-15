@@ -16,7 +16,7 @@
 
 use lumen_format::index::TensorSlice;
 use lumen_format::quantization::QuantScheme;
-use lumen_format::test_model::{TestModelQ8Config, generate_test_model_q8_0};
+use lumen_format::test_model::{generate_test_model_q8_0, TestModelQ8Config};
 use lumen_runtime::compute::cpu_naive::NaiveF32Backend;
 use lumen_runtime::compute::ComputeBackend;
 use lumen_runtime::cuda::CudaBackend;
@@ -83,8 +83,7 @@ fn dequant_q8_0_to_f32(q8_bytes: &[u8], out_dim: usize, in_dim: usize) -> Vec<f3
             let block_ptr = &q8_bytes[block_offset..];
 
             // Read f16 scale
-            let scale_bits =
-                block_ptr[0] as u16 | ((block_ptr[1] as u16) << 8);
+            let scale_bits = block_ptr[0] as u16 | ((block_ptr[1] as u16) << 8);
             let scale = f16_bits_to_f32(scale_bits);
 
             // Dequantize 32 int8 values
@@ -130,7 +129,11 @@ fn dequant_layer_to_f32(
         let f32_vals = dequant_q8_0_to_f32(raw, out_d, in_d);
         let f32_bytes: Vec<u8> = f32_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
         let len = f32_bytes.len() as u64;
-        let ts = TensorSlice { offset: *offset, length: len, quant: QuantScheme::F32 };
+        let ts = TensorSlice {
+            offset: *offset,
+            length: len,
+            quant: QuantScheme::F32,
+        };
         blob.extend_from_slice(&f32_bytes);
         *offset += len;
         Ok(ts)
@@ -145,7 +148,11 @@ fn dequant_layer_to_f32(
     ) -> Result<TensorSlice, RuntimeError> {
         let raw = view.subtensor_bytes(slice)?;
         let len = raw.len() as u64;
-        let ts = TensorSlice { offset: *offset, length: len, quant: QuantScheme::F32 };
+        let ts = TensorSlice {
+            offset: *offset,
+            length: len,
+            quant: QuantScheme::F32,
+        };
         blob.extend_from_slice(raw);
         *offset += len;
         Ok(ts)
@@ -155,24 +162,62 @@ fn dequant_layer_to_f32(
     let wk = dequant_append(&view, &mut blob, &mut offset, &st.wk, kv_dim, hidden_dim)?;
     let wv = dequant_append(&view, &mut blob, &mut offset, &st.wv, kv_dim, hidden_dim)?;
     let wo = dequant_append(&view, &mut blob, &mut offset, &st.wo, hidden_dim, q_dim)?;
-    let w_gate = dequant_append(&view, &mut blob, &mut offset, &st.w_gate, inter_dim, hidden_dim)?;
-    let w_up = dequant_append(&view, &mut blob, &mut offset, &st.w_up, inter_dim, hidden_dim)?;
-    let w_down = dequant_append(&view, &mut blob, &mut offset, &st.w_down, hidden_dim, inter_dim)?;
+    let w_gate = dequant_append(
+        &view,
+        &mut blob,
+        &mut offset,
+        &st.w_gate,
+        inter_dim,
+        hidden_dim,
+    )?;
+    let w_up = dequant_append(
+        &view,
+        &mut blob,
+        &mut offset,
+        &st.w_up,
+        inter_dim,
+        hidden_dim,
+    )?;
+    let w_down = dequant_append(
+        &view,
+        &mut blob,
+        &mut offset,
+        &st.w_down,
+        hidden_dim,
+        inter_dim,
+    )?;
     let attn_norm = copy_f32_tensor(&view, &mut blob, &mut offset, &st.attn_norm)?;
     let ffn_norm = copy_f32_tensor(&view, &mut blob, &mut offset, &st.ffn_norm)?;
 
     let subs = lumen_format::index::SubtensorOffsets {
-        wq, wk, wv, wo,
-        bq: None, bk: None, bv: None,
-        w_gate, w_up, w_down,
-        attn_norm, ffn_norm,
+        wq,
+        wk,
+        wv,
+        wo,
+        bq: None,
+        bk: None,
+        bv: None,
+        w_gate,
+        w_up,
+        w_down,
+        attn_norm,
+        ffn_norm,
         router_weight: None,
         experts: None,
-        shared_expert_gate: None, shared_expert_up: None, shared_expert_down: None,
-        attn_gate: None, attn_post_norm: None,
-        ssm_a: None, ssm_conv1d: None, ssm_dt: None,
-        ssm_beta: None, ssm_alpha: None, ssm_norm: None, ssm_out: None,
-        attn_q_norm: None, attn_k_norm: None,
+        shared_expert_gate: None,
+        shared_expert_up: None,
+        shared_expert_down: None,
+        attn_gate: None,
+        attn_post_norm: None,
+        ssm_a: None,
+        ssm_conv1d: None,
+        ssm_dt: None,
+        ssm_beta: None,
+        ssm_alpha: None,
+        ssm_norm: None,
+        ssm_out: None,
+        attn_q_norm: None,
+        attn_k_norm: None,
         ffn_gate_inp_shexp: None,
         layer_type: None,
     };
@@ -183,9 +228,11 @@ fn dequant_layer_to_f32(
 /// Compare two f32 slices element-wise with a tolerance.
 fn assert_f32_close(label: &str, actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(
-        actual.len(), expected.len(),
+        actual.len(),
+        expected.len(),
         "{label}: length mismatch: actual={}, expected={}",
-        actual.len(), expected.len()
+        actual.len(),
+        expected.len()
     );
     let mut max_diff = 0.0f32;
     let mut mismatches = 0;
@@ -208,10 +255,7 @@ fn assert_f32_close(label: &str, actual: &[f32], expected: &[f32], tolerance: f3
 }
 
 /// Set up Q8_0 test model and return (provider, CPU backend with dequantized weights, CUDA backend).
-fn setup_q8_backends() -> Result<
-    (SyncWeightProvider, NaiveF32Backend, CudaBackend),
-    RuntimeError,
-> {
+fn setup_q8_backends() -> Result<(SyncWeightProvider, NaiveF32Backend, CudaBackend), RuntimeError> {
     let config = TestModelQ8Config::default();
     let lbc_data = generate_test_model_q8_0(&config);
 
@@ -291,30 +335,39 @@ fn test_cuda_q8_0_compute_layer_matches_cpu_dequant() {
 
         // CPU backend needs dequantized F32 weights. Build a synthetic LayerView
         // with F32 data from the dequantized Q8_0 bytes.
-        let (f32_blob, f32_subs) = dequant_layer_to_f32(
-            &provider, layer_idx, hidden_dim, q_dim, kv_dim, inter_dim,
-        ).unwrap();
-        let cpu_layer_view = lumen_runtime::weight::cache::LayerView::from_owned(
-            layer_idx,
-            f32_blob,
-            f32_subs,
-        );
+        let (f32_blob, f32_subs) =
+            dequant_layer_to_f32(&provider, layer_idx, hidden_dim, q_dim, kv_dim, inter_dim)
+                .unwrap();
+        let cpu_layer_view =
+            lumen_runtime::weight::cache::LayerView::from_owned(layer_idx, f32_blob, f32_subs);
 
         let seq_pos = cpu_kv.seq_len();
 
         // CPU compute_layer with dequantized F32 weights
         {
             let mut kv_view = cpu_kv.view_mut(layer_idx).unwrap();
-            cpu.compute_layer(layer_idx, &mut cpu_x, &cpu_layer_view, Some(&mut kv_view), seq_pos)
-                .unwrap();
+            cpu.compute_layer(
+                layer_idx,
+                &mut cpu_x,
+                &cpu_layer_view,
+                Some(&mut kv_view),
+                seq_pos,
+            )
+            .unwrap();
             cpu_kv.commit_view(kv_view).unwrap();
         }
 
         // CUDA compute_layer with native Q8_0 weights
         {
             let mut kv_view = cuda_kv.view_mut(layer_idx).unwrap();
-            cuda.compute_layer(layer_idx, &mut cuda_x, &q8_layer_view, Some(&mut kv_view), seq_pos)
-                .unwrap();
+            cuda.compute_layer(
+                layer_idx,
+                &mut cuda_x,
+                &q8_layer_view,
+                Some(&mut kv_view),
+                seq_pos,
+            )
+            .unwrap();
             cuda_kv.commit_view(kv_view).unwrap();
         }
 
@@ -529,14 +582,20 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     let frac = bits & 0x7FFFFF;
 
     if exp == 0xFF {
-        if frac != 0 { return sign | 0x7E00; }
+        if frac != 0 {
+            return sign | 0x7E00;
+        }
         return sign | 0x7C00;
     }
 
     let new_exp = exp - 127 + 15;
-    if new_exp >= 31 { return sign | 0x7C00; }
+    if new_exp >= 31 {
+        return sign | 0x7C00;
+    }
     if new_exp <= 0 {
-        if new_exp < -10 { return sign; }
+        if new_exp < -10 {
+            return sign;
+        }
         let full_frac = frac | 0x800000;
         let shift = (1 - new_exp) as u32;
         let f16_frac = (full_frac >> (13 + shift)) as u16;

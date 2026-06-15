@@ -19,9 +19,9 @@
 
 #![cfg(feature = "cuda")]
 
-use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
 use cudarc::driver::result::event;
 use cudarc::driver::sys as cuda_sys;
+use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
 fn compile_sm80(source: &str) -> cudarc::nvrtc::Ptx {
@@ -123,12 +123,8 @@ fn build_setup(out_dim: usize, in_dim: usize, seed: u64) -> Setup {
     let split_module = ctx
         .load_module(compile_sm80(split_src))
         .expect("split load");
-    let lc_module = ctx
-        .load_module(compile_sm80(lc_src))
-        .expect("lc load");
-    let raw_module = ctx
-        .load_module(compile_sm80(raw_src))
-        .expect("raw load");
+    let lc_module = ctx.load_module(compile_sm80(lc_src)).expect("lc load");
+    let raw_module = ctx.load_module(compile_sm80(raw_src)).expect("raw load");
     let repack_module = ctx
         .load_module(compile_sm80(repack_src))
         .expect("repack load");
@@ -267,10 +263,10 @@ where
 {
     let mut events = Vec::with_capacity(NUM_TRIALS);
     for _ in 0..NUM_TRIALS {
-        let e0 = event::create(cuda_sys::CUevent_flags::CU_EVENT_DEFAULT)
-            .expect("event create start");
-        let e1 = event::create(cuda_sys::CUevent_flags::CU_EVENT_DEFAULT)
-            .expect("event create end");
+        let e0 =
+            event::create(cuda_sys::CUevent_flags::CU_EVENT_DEFAULT).expect("event create start");
+        let e1 =
+            event::create(cuda_sys::CUevent_flags::CU_EVENT_DEFAULT).expect("event create end");
         events.push((e0, e1));
     }
 
@@ -312,7 +308,7 @@ fn bench_shape(name: &str, out_dim: usize, in_dim: usize) {
     let mut s = build_setup(out_dim, in_dim, 0xC0FFEE);
     let mut times_split = time_kernel(&mut s, |s| unsafe { launch_split(s) });
     let mut times_4thread = time_kernel(&mut s, |s| unsafe { launch_4thread(s) });
-    let med_split = median(&mut times_split) * 1000.0;  // ms -> us
+    let med_split = median(&mut times_split) * 1000.0; // ms -> us
     let med_4thread = median(&mut times_4thread) * 1000.0;
     let speedup = med_split / med_4thread;
     println!(
@@ -326,10 +322,10 @@ fn bench_shape(name: &str, out_dim: usize, in_dim: usize) {
 fn microbench_4thread_vs_split_all_shapes() {
     // Qwen3.5-9B production shapes hit during decode.
     // hidden_dim = 4096, kv_dim = 1024, inter_dim = 12288, qkv fused = 8192
-    bench_shape("4096x4096",    4096,  4096);   // FFN gate, up; QKV separated
-    bench_shape("4096x12288",   4096, 12288);   // FFN down
-    bench_shape("12288x4096",  12288,  4096);   // FFN gate+up (separate)
-    bench_shape("8192x4096",    8192,  4096);   // Qwen3.5 attn_q (Q+gate fused)
-    bench_shape("1024x4096",    1024,  4096);   // K, V proj
-    bench_shape("248320x4096", 248320, 4096);   // output_proj (full vocab)
+    bench_shape("4096x4096", 4096, 4096); // FFN gate, up; QKV separated
+    bench_shape("4096x12288", 4096, 12288); // FFN down
+    bench_shape("12288x4096", 12288, 4096); // FFN gate+up (separate)
+    bench_shape("8192x4096", 8192, 4096); // Qwen3.5 attn_q (Q+gate fused)
+    bench_shape("1024x4096", 1024, 4096); // K, V proj
+    bench_shape("248320x4096", 248320, 4096); // output_proj (full vocab)
 }

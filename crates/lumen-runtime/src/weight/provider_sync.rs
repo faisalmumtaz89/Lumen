@@ -3,15 +3,15 @@
 //! No prefetching — `prefetch_layer` is a no-op. `get_layer_blocking` reads
 //! from disk and caches in memory. Simple and correct — the baseline for testing.
 
+use crate::error::RuntimeError;
+use crate::storage::sync::SyncFileBackend;
+use crate::storage::{IoSnapshot, StorageBackend};
 use crate::weight::cache::{
     CacheStats, LayerView, PrefetchHandle, PrefetchPriority, WeightProvider,
 };
-use crate::error::RuntimeError;
-use crate::storage::{IoSnapshot, StorageBackend};
-use crate::storage::sync::SyncFileBackend;
-use lumen_format::reader::LbcFile;
 use lumen_format::index::{SubtensorOffsets, TensorSlice};
 use lumen_format::quantization::QuantScheme;
+use lumen_format::reader::LbcFile;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -53,13 +53,23 @@ impl SyncWeightProvider {
         // Read global tensors
         let embed_header_quant = lbc.header.embedding.quant;
         let outproj_header_quant = lbc.header.output_proj.quant;
-        let embedding_bytes = backend.read_range(lbc.header.embedding.offset, lbc.header.embedding.length)?;
+        let embedding_bytes =
+            backend.read_range(lbc.header.embedding.offset, lbc.header.embedding.length)?;
         let (embedding, embedding_raw, embedding_quant) =
             read_embedding_global(embedding_bytes, vocab_size, hidden_dim, embed_header_quant);
-        let final_norm = read_f32_tensor(&backend, lbc.header.final_norm.offset, lbc.header.final_norm.length)?;
-        let output_proj_bytes = backend.read_range(lbc.header.output_proj.offset, lbc.header.output_proj.length)?;
-        let (output_proj, output_proj_raw, output_proj_quant) =
-            read_output_proj_global(output_proj_bytes, vocab_size, hidden_dim, outproj_header_quant);
+        let final_norm = read_f32_tensor(
+            &backend,
+            lbc.header.final_norm.offset,
+            lbc.header.final_norm.length,
+        )?;
+        let output_proj_bytes =
+            backend.read_range(lbc.header.output_proj.offset, lbc.header.output_proj.length)?;
+        let (output_proj, output_proj_raw, output_proj_quant) = read_output_proj_global(
+            output_proj_bytes,
+            vocab_size,
+            hidden_dim,
+            outproj_header_quant,
+        );
 
         let weight_tying = lbc.header.weight_tying;
         Ok(Self {
@@ -90,13 +100,23 @@ impl SyncWeightProvider {
 
         let embed_header_quant = lbc.header.embedding.quant;
         let outproj_header_quant = lbc.header.output_proj.quant;
-        let embedding_bytes = backend.read_range(lbc.header.embedding.offset, lbc.header.embedding.length)?;
+        let embedding_bytes =
+            backend.read_range(lbc.header.embedding.offset, lbc.header.embedding.length)?;
         let (embedding, embedding_raw, embedding_quant) =
             read_embedding_global(embedding_bytes, vocab_size, hidden_dim, embed_header_quant);
-        let final_norm = read_f32_tensor(&backend, lbc.header.final_norm.offset, lbc.header.final_norm.length)?;
-        let output_proj_bytes = backend.read_range(lbc.header.output_proj.offset, lbc.header.output_proj.length)?;
-        let (output_proj, output_proj_raw, output_proj_quant) =
-            read_output_proj_global(output_proj_bytes, vocab_size, hidden_dim, outproj_header_quant);
+        let final_norm = read_f32_tensor(
+            &backend,
+            lbc.header.final_norm.offset,
+            lbc.header.final_norm.length,
+        )?;
+        let output_proj_bytes =
+            backend.read_range(lbc.header.output_proj.offset, lbc.header.output_proj.length)?;
+        let (output_proj, output_proj_raw, output_proj_quant) = read_output_proj_global(
+            output_proj_bytes,
+            vocab_size,
+            hidden_dim,
+            outproj_header_quant,
+        );
 
         let weight_tying = lbc.header.weight_tying;
         Ok(Self {
@@ -160,7 +180,11 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
     }
     if exp == 31 {
         return if frac == 0 {
-            if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY }
+            if sign == 1 {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            }
         } else {
             f32::NAN
         };
@@ -172,7 +196,11 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
     // result `exp + 112` is always in 113..=142, a valid f32 exponent.
     let exp_f32 = ((exp as i32 - 15 + 127) as u32) << 23 | ((frac as u32) << 13);
     let v = f32::from_bits(exp_f32);
-    if sign == 1 { -v } else { v }
+    if sign == 1 {
+        -v
+    } else {
+        v
+    }
 }
 
 /// Dequantize Q8_0 bytes to Vec<f32>.
@@ -197,7 +225,6 @@ pub fn dequantize_q8_0_to_f32(src: &[u8], n_elements: usize) -> Vec<f32> {
     }
     out
 }
-
 
 /// Dequantize Q4_0 bytes to Vec<f32>.
 /// Q4_0 block layout: [2 bytes f16 scale] [16 bytes packed nibbles], total 18 bytes per 32 elements.
@@ -351,10 +378,7 @@ pub fn read_output_proj_global(
 
 /// Dequantize a single subtensor from the raw layer blob, returning F32 bytes.
 /// Returns the dequantized bytes and the number of F32 elements.
-fn dequant_subtensor_to_f32_bytes(
-    raw_blob: &[u8],
-    slice: &TensorSlice,
-) -> Option<Vec<u8>> {
+fn dequant_subtensor_to_f32_bytes(raw_blob: &[u8], slice: &TensorSlice) -> Option<Vec<u8>> {
     match slice.quant {
         QuantScheme::F32 => None, // Already F32, no conversion needed
         QuantScheme::Q8_0 => {
@@ -407,10 +431,18 @@ fn dequantize_layer_to_f32(
 ) -> (Vec<u8>, SubtensorOffsets) {
     // Check if any subtensor needs dequantization
     let needs_dequant = [
-        &subtensors.wq, &subtensors.wk, &subtensors.wv, &subtensors.wo,
-        &subtensors.w_gate, &subtensors.w_up, &subtensors.w_down,
-        &subtensors.attn_norm, &subtensors.ffn_norm,
-    ].iter().any(|s| s.quant != QuantScheme::F32);
+        &subtensors.wq,
+        &subtensors.wk,
+        &subtensors.wv,
+        &subtensors.wo,
+        &subtensors.w_gate,
+        &subtensors.w_up,
+        &subtensors.w_down,
+        &subtensors.attn_norm,
+        &subtensors.ffn_norm,
+    ]
+    .iter()
+    .any(|s| s.quant != QuantScheme::F32);
 
     if !needs_dequant {
         // Fast path: all F32, return as-is
@@ -424,16 +456,46 @@ fn dequantize_layer_to_f32(
     // NOTE: Only mandatory subtensors are processed. Optional fields (bq, bk, bv,
     // ssm_*, attn_gate, etc.) retain their original-blob offsets. This is safe
     // because the cpu_naive backend only reads mandatory fields.
-    let slices_and_fields: Vec<(&TensorSlice, Box<dyn FnOnce(&mut SubtensorOffsets, TensorSlice)>)> = vec![
-        (&subtensors.wq, Box::new(|st: &mut SubtensorOffsets, s| st.wq = s)),
-        (&subtensors.wk, Box::new(|st: &mut SubtensorOffsets, s| st.wk = s)),
-        (&subtensors.wv, Box::new(|st: &mut SubtensorOffsets, s| st.wv = s)),
-        (&subtensors.wo, Box::new(|st: &mut SubtensorOffsets, s| st.wo = s)),
-        (&subtensors.w_gate, Box::new(|st: &mut SubtensorOffsets, s| st.w_gate = s)),
-        (&subtensors.w_up, Box::new(|st: &mut SubtensorOffsets, s| st.w_up = s)),
-        (&subtensors.w_down, Box::new(|st: &mut SubtensorOffsets, s| st.w_down = s)),
-        (&subtensors.attn_norm, Box::new(|st: &mut SubtensorOffsets, s| st.attn_norm = s)),
-        (&subtensors.ffn_norm, Box::new(|st: &mut SubtensorOffsets, s| st.ffn_norm = s)),
+    let slices_and_fields: Vec<(
+        &TensorSlice,
+        Box<dyn FnOnce(&mut SubtensorOffsets, TensorSlice)>,
+    )> = vec![
+        (
+            &subtensors.wq,
+            Box::new(|st: &mut SubtensorOffsets, s| st.wq = s),
+        ),
+        (
+            &subtensors.wk,
+            Box::new(|st: &mut SubtensorOffsets, s| st.wk = s),
+        ),
+        (
+            &subtensors.wv,
+            Box::new(|st: &mut SubtensorOffsets, s| st.wv = s),
+        ),
+        (
+            &subtensors.wo,
+            Box::new(|st: &mut SubtensorOffsets, s| st.wo = s),
+        ),
+        (
+            &subtensors.w_gate,
+            Box::new(|st: &mut SubtensorOffsets, s| st.w_gate = s),
+        ),
+        (
+            &subtensors.w_up,
+            Box::new(|st: &mut SubtensorOffsets, s| st.w_up = s),
+        ),
+        (
+            &subtensors.w_down,
+            Box::new(|st: &mut SubtensorOffsets, s| st.w_down = s),
+        ),
+        (
+            &subtensors.attn_norm,
+            Box::new(|st: &mut SubtensorOffsets, s| st.attn_norm = s),
+        ),
+        (
+            &subtensors.ffn_norm,
+            Box::new(|st: &mut SubtensorOffsets, s| st.ffn_norm = s),
+        ),
     ];
 
     for (slice, setter) in slices_and_fields {
@@ -493,7 +555,9 @@ impl WeightProvider for SyncWeightProvider {
         stats.misses += 1;
 
         let idx = &self.lbc.layer_indices[layer];
-        let raw_data = self.backend.read_range(idx.layer_offset_bytes, idx.layer_length_bytes)?;
+        let raw_data = self
+            .backend
+            .read_range(idx.layer_offset_bytes, idx.layer_length_bytes)?;
 
         // Dequantize quantized subtensors to F32 for CPU backends.
         // The CPU naive backend reads raw bytes as F32 via matmul_bytes/rmsnorm_bytes.
@@ -518,13 +582,22 @@ impl WeightProvider for SyncWeightProvider {
         if layer >= self.lbc.layer_indices.len() {
             return Err(RuntimeError::LayerUnavailable {
                 layer,
-                reason: format!("layer index out of range (num_layers={})", self.lbc.layer_indices.len()),
+                reason: format!(
+                    "layer index out of range (num_layers={})",
+                    self.lbc.layer_indices.len()
+                ),
             });
         }
         let idx = &self.lbc.layer_indices[layer];
-        let raw_data = self.backend.read_range(idx.layer_offset_bytes, idx.layer_length_bytes)?;
+        let raw_data = self
+            .backend
+            .read_range(idx.layer_offset_bytes, idx.layer_length_bytes)?;
         // Return raw bytes with original quant schemes — NO dequantization.
-        Ok(LayerView::from_owned(layer, raw_data, idx.subtensors.clone()))
+        Ok(LayerView::from_owned(
+            layer,
+            raw_data,
+            idx.subtensors.clone(),
+        ))
     }
 
     fn try_get_layer(&self, layer: usize) -> Option<LayerView> {
@@ -580,7 +653,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lumen_sync_raw_invariant_{tag}_{id}"));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.lbc");
-        std::fs::File::create(&path).unwrap().write_all(data).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(data)
+            .unwrap();
         path
     }
 
@@ -657,7 +733,10 @@ mod tests {
             check("w_down", &s.w_down, &m.w_down);
             check("attn_norm", &s.attn_norm, &m.attn_norm);
             check("ffn_norm", &s.ffn_norm, &m.ffn_norm);
-            assert_eq!(s.layer_type, m.layer_type, "layer {layer}: layer_type differs");
+            assert_eq!(
+                s.layer_type, m.layer_type,
+                "layer {layer}: layer_type differs"
+            );
 
             // 3. The weight subtensors must stay in their NATIVE quant scheme on
             //    the raw path (Q8_0 here). If a future change makes
@@ -744,7 +823,10 @@ mod tests {
 
         // (1) get_layer_raw is provider-independent for the ssm_* subtensors AND
         //     preserves native quant + raw offsets (what prefill feeds the GPU).
-        let m_ssm_out = m_raw.subtensors.ssm_out.expect("mmap GDN layer must have ssm_out");
+        let m_ssm_out = m_raw
+            .subtensors
+            .ssm_out
+            .expect("mmap GDN layer must have ssm_out");
         assert_eq!(
             (ssm_out_raw.offset, ssm_out_raw.length, ssm_out_raw.quant),
             (m_ssm_out.offset, m_ssm_out.length, m_ssm_out.quant),
@@ -765,7 +847,9 @@ mod tests {
         assert!(
             ssm_out_raw.offset + ssm_out_raw.length <= raw_blob_len,
             "raw ssm_out [{}, {}) must lie within the raw blob (len {})",
-            ssm_out_raw.offset, ssm_out_raw.offset + ssm_out_raw.length, raw_blob_len,
+            ssm_out_raw.offset,
+            ssm_out_raw.offset + ssm_out_raw.length,
+            raw_blob_len,
         );
 
         // (2) get_layer_blocking REBUILDS the blob to F32 but CLONES the ssm_*
@@ -887,8 +971,7 @@ mod tests {
                  (Q8_0), not the F32 produced by get_layer_blocking",
             );
             assert_eq!(
-                resolved.subtensors.wq.quant,
-                reference.subtensors.wq.quant,
+                resolved.subtensors.wq.quant, reference.subtensors.wq.quant,
                 "layer {layer}: resolved quant must equal get_layer_raw's",
             );
         }
@@ -903,7 +986,8 @@ mod tests {
             .expect("GDN layer ssm_out present on resolved (raw) view");
         assert_eq!(ssm_out.quant, QuantScheme::Q8_0);
         assert_eq!(
-            ssm_out.offset, raw_reference.subtensors.ssm_out.unwrap().offset,
+            ssm_out.offset,
+            raw_reference.subtensors.ssm_out.unwrap().offset,
             "resolved ssm_out offset must equal the raw offset (not the stale \
              get_layer_blocking one)",
         );

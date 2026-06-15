@@ -68,7 +68,10 @@ fn f32_to_f16_bits(val: f32) -> u16 {
 }
 
 fn encode_q8_raw(values: &[f32]) -> Vec<u8> {
-    assert!(values.len() % Q8_BLOCK == 0, "encoder requires whole blocks");
+    assert!(
+        values.len() % Q8_BLOCK == 0,
+        "encoder requires whole blocks"
+    );
     let n_blocks = values.len() / Q8_BLOCK;
     let mut out = vec![0u8; n_blocks * Q8_RAW_BYTES];
     for b in 0..n_blocks {
@@ -110,9 +113,7 @@ fn run_nr8_vs_split(out_dim: usize, in_dim: usize, seed: u64, tol: f32) {
     let split_module = ctx
         .load_module(compile_sm80(split_src))
         .expect("split load");
-    let lc_module = ctx
-        .load_module(compile_sm80(lc_src))
-        .expect("nr8 load");
+    let lc_module = ctx.load_module(compile_sm80(lc_src)).expect("nr8 load");
     let repack_module = ctx
         .load_module(compile_sm80(repack_src))
         .expect("repack load");

@@ -27,9 +27,9 @@
 //! reference bench (131 = "hello "*120 token count). K=4096,
 //! N=12288 match Qwen3.5-9B FFN gate+up dimensions.
 
-use crate::metal::MetalF32Backend;
 use crate::metal::ffi::{MTLSize, MetalFunctionConstantValues};
 use crate::metal::shaders::METAL_SHADER_SOURCE;
+use crate::metal::MetalF32Backend;
 
 const TILE_N: u64 = 32; // unchanged across all NR variants
 
@@ -50,7 +50,9 @@ fn make_synthetic_bf16(n_rows: usize, k_cols: usize, seed: u32) -> Vec<u16> {
     let mut s: u64 = seed as u64;
     let mut out = Vec::with_capacity(n_rows * k_cols);
     for _ in 0..(n_rows * k_cols) {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (s >> 32) as u32;
         // Map to [-0.1, 0.1]: keeps |gate|, |up| products small at large K.
         let f = ((u as f32) / (u32::MAX as f32) * 0.2 - 0.1) as f32;
@@ -63,7 +65,9 @@ fn make_random_f32_small(n: usize, seed: u32) -> Vec<f32> {
     let mut s: u64 = seed as u64;
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (s >> 32) as u32;
         // [-0.5, 0.5]
         let f = (u as f32) / (u32::MAX as f32) - 0.5;
@@ -76,13 +80,14 @@ fn make_random_f32_small(n: usize, seed: u32) -> Vec<f32> {
 #[test]
 fn microbench_bf16_gate_up_nr_sweep() {
     const M: usize = 131;
-    const K: usize = 4096;   // hidden_dim
-    const N: usize = 12288;  // inter_dim
+    const K: usize = 4096; // hidden_dim
+    const N: usize = 12288; // inter_dim
     const WARMUP: usize = 8;
     const ITERS: usize = 64;
 
     let backend = MetalF32Backend::new().expect("Metal backend create");
-    let lib = backend.device
+    let lib = backend
+        .device
         .new_library_with_source(METAL_SHADER_SOURCE)
         .expect("Metal lib compile");
 
@@ -93,38 +98,53 @@ fn microbench_bf16_gate_up_nr_sweep() {
     fcv.set_bool(true, 11);
     fcv.set_bool(true, 12);
 
-    let f_nr1 = lib.get_function_with_constants(
-        "bf16_matmul_gate_up_swiglu_fused_nr1", &fcv
-    ).expect("NR=1 kernel function");
-    let pso_nr1 = backend.device.new_compute_pipeline_state(&f_nr1)
+    let f_nr1 = lib
+        .get_function_with_constants("bf16_matmul_gate_up_swiglu_fused_nr1", &fcv)
+        .expect("NR=1 kernel function");
+    let pso_nr1 = backend
+        .device
+        .new_compute_pipeline_state(&f_nr1)
         .expect("NR=1 PSO");
 
-    let f_nr2 = lib.get_function_with_constants(
-        "bf16_matmul_gate_up_swiglu_fused", &fcv
-    ).expect("NR=2 baseline kernel function");
-    let pso_nr2 = backend.device.new_compute_pipeline_state(&f_nr2)
+    let f_nr2 = lib
+        .get_function_with_constants("bf16_matmul_gate_up_swiglu_fused", &fcv)
+        .expect("NR=2 baseline kernel function");
+    let pso_nr2 = backend
+        .device
+        .new_compute_pipeline_state(&f_nr2)
         .expect("NR=2 baseline PSO");
 
-    let f_nr4 = lib.get_function_with_constants(
-        "bf16_matmul_gate_up_swiglu_fused_nr4", &fcv
-    ).expect("NR=4 kernel function");
-    let pso_nr4 = backend.device.new_compute_pipeline_state(&f_nr4)
+    let f_nr4 = lib
+        .get_function_with_constants("bf16_matmul_gate_up_swiglu_fused_nr4", &fcv)
+        .expect("NR=4 kernel function");
+    let pso_nr4 = backend
+        .device
+        .new_compute_pipeline_state(&f_nr4)
         .expect("NR=4 PSO");
 
     // Synthetic weights and activations. Seeds chosen so gate and up differ.
     let w_gate = make_synthetic_bf16(N, K, 1);
-    let w_up   = make_synthetic_bf16(N, K, 2);
-    let x      = make_random_f32_small(M * K, 3);
+    let w_up = make_synthetic_bf16(N, K, 2);
+    let x = make_random_f32_small(M * K, 3);
 
-    let w_gate_buf = backend.device.new_buffer_with_bytes(unsafe {
-        std::slice::from_raw_parts(w_gate.as_ptr() as *const u8, w_gate.len() * 2)
-    }).expect("w_gate buf");
-    let w_up_buf = backend.device.new_buffer_with_bytes(unsafe {
-        std::slice::from_raw_parts(w_up.as_ptr() as *const u8, w_up.len() * 2)
-    }).expect("w_up buf");
-    let x_buf = backend.device.new_buffer_with_bytes(unsafe {
-        std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4)
-    }).expect("x buf");
+    let w_gate_buf = backend
+        .device
+        .new_buffer_with_bytes(unsafe {
+            std::slice::from_raw_parts(w_gate.as_ptr() as *const u8, w_gate.len() * 2)
+        })
+        .expect("w_gate buf");
+    let w_up_buf = backend
+        .device
+        .new_buffer_with_bytes(unsafe {
+            std::slice::from_raw_parts(w_up.as_ptr() as *const u8, w_up.len() * 2)
+        })
+        .expect("w_up buf");
+    let x_buf = backend
+        .device
+        .new_buffer_with_bytes(unsafe {
+            std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4)
+        })
+        .expect("x buf");
 
     let y_nr1_buf = backend.device.new_buffer(M * N * 4).expect("y nr1 buf");
     let y_nr2_buf = backend.device.new_buffer(M * N * 4).expect("y nr2 buf");
@@ -138,7 +158,8 @@ fn microbench_bf16_gate_up_nr_sweep() {
     let dispatch = |pso: &crate::metal::ffi::MetalPipelineState,
                     y_buf: &crate::metal::ffi::MetalBuffer,
                     tile_m: u64,
-                    shmem_bytes: u64| -> u128 {
+                    shmem_bytes: u64|
+     -> u128 {
         let cmd = backend.queue.new_command_buffer().expect("cmd buf");
         let enc = cmd.new_compute_encoder().expect("enc");
         enc.set_pipeline_state(pso);
@@ -192,12 +213,16 @@ fn microbench_bf16_gate_up_nr_sweep() {
         let mut sum_sq = 0f64;
         for (x, y) in a.iter().zip(b.iter()) {
             let d = (x - y).abs();
-            if d > max_abs_diff { max_abs_diff = d; }
+            if d > max_abs_diff {
+                max_abs_diff = d;
+            }
             sum_sq += (d as f64) * (d as f64);
         }
         let rmse = (sum_sq / (a.len() as f64)).sqrt();
-        eprintln!("[microbench] correctness {label}: max_abs_diff={:.6e}, rmse={:.6e}",
-            max_abs_diff, rmse);
+        eprintln!(
+            "[microbench] correctness {label}: max_abs_diff={:.6e}, rmse={:.6e}",
+            max_abs_diff, rmse
+        );
         (max_abs_diff, rmse)
     };
 
@@ -209,12 +234,16 @@ fn microbench_bf16_gate_up_nr_sweep() {
     // and 4096 such products with random small values gives an RMSE of ~1e-3.
     // Anything beyond 1e-2 indicates a genuine algorithmic divergence, not
     // float-pipeline-ordering noise.
-    assert!(max_diff_1 < 1e-2,
+    assert!(
+        max_diff_1 < 1e-2,
         "NR=1 diverges from NR=2 beyond BF16 tolerance: max_abs_diff={:.6e}",
-        max_diff_1);
-    assert!(max_diff_4 < 1e-2,
+        max_diff_1
+    );
+    assert!(
+        max_diff_4 < 1e-2,
         "NR=4 diverges from NR=2 beyond BF16 tolerance: max_abs_diff={:.6e}",
-        max_diff_4);
+        max_diff_4
+    );
 
     // Bench. Use interleaved ordering (1-2-4, 1-2-4, ...) so thermal drift
     // affects all three variants symmetrically across the run.
@@ -240,9 +269,8 @@ fn microbench_bf16_gate_up_nr_sweep() {
     let min_2 = *t_nr2.first().unwrap();
     let min_4 = *t_nr4.first().unwrap();
 
-    let speedup = |baseline: u128, treatment: u128| -> f64 {
-        (baseline as f64) / (treatment as f64)
-    };
+    let speedup =
+        |baseline: u128, treatment: u128| -> f64 { (baseline as f64) / (treatment as f64) };
     let su_med_1 = speedup(med_2, med_1);
     let su_med_4 = speedup(med_2, med_4);
     let su_mean_1 = speedup(mean_2, mean_1);
@@ -250,21 +278,34 @@ fn microbench_bf16_gate_up_nr_sweep() {
     let su_min_1 = speedup(min_2, min_1);
     let su_min_4 = speedup(min_2, min_4);
 
-    eprintln!("[microbench] Qwen3.5-9B FFN gate+up shape M={} K={} N={}:", M, K, N);
-    eprintln!("[microbench] NR=1: median={} ns, mean={} ns, min={} ns",
-        med_1, mean_1, min_1);
-    eprintln!("[microbench] NR=2: median={} ns, mean={} ns, min={} ns (BASELINE)",
-        med_2, mean_2, min_2);
-    eprintln!("[microbench] NR=4: median={} ns, mean={} ns, min={} ns",
-        med_4, mean_4, min_4);
-    eprintln!("[microbench] NR=1 / NR=2: median={:+.3}%, mean={:+.3}%, min={:+.3}%",
+    eprintln!(
+        "[microbench] Qwen3.5-9B FFN gate+up shape M={} K={} N={}:",
+        M, K, N
+    );
+    eprintln!(
+        "[microbench] NR=1: median={} ns, mean={} ns, min={} ns",
+        med_1, mean_1, min_1
+    );
+    eprintln!(
+        "[microbench] NR=2: median={} ns, mean={} ns, min={} ns (BASELINE)",
+        med_2, mean_2, min_2
+    );
+    eprintln!(
+        "[microbench] NR=4: median={} ns, mean={} ns, min={} ns",
+        med_4, mean_4, min_4
+    );
+    eprintln!(
+        "[microbench] NR=1 / NR=2: median={:+.3}%, mean={:+.3}%, min={:+.3}%",
         (su_med_1 - 1.0) * 100.0,
         (su_mean_1 - 1.0) * 100.0,
-        (su_min_1 - 1.0) * 100.0);
-    eprintln!("[microbench] NR=4 / NR=2: median={:+.3}%, mean={:+.3}%, min={:+.3}%",
+        (su_min_1 - 1.0) * 100.0
+    );
+    eprintln!(
+        "[microbench] NR=4 / NR=2: median={:+.3}%, mean={:+.3}%, min={:+.3}%",
         (su_med_4 - 1.0) * 100.0,
         (su_mean_4 - 1.0) * 100.0,
-        (su_min_4 - 1.0) * 100.0);
+        (su_min_4 - 1.0) * 100.0
+    );
 
     // Gate evaluation: >= +5% per-kernel improvement required
     // for integration.
@@ -274,11 +315,17 @@ fn microbench_bf16_gate_up_nr_sweep() {
     if pct_med_1 >= 5.0 {
         eprintln!("[microbench] NR=1 PASS: +{:.2}% median vs NR=2", pct_med_1);
     } else {
-        eprintln!("[microbench] NR=1 FAIL gate: +{:.2}% median vs NR=2 (< +5%)", pct_med_1);
+        eprintln!(
+            "[microbench] NR=1 FAIL gate: +{:.2}% median vs NR=2 (< +5%)",
+            pct_med_1
+        );
     }
     if pct_med_4 >= 5.0 {
         eprintln!("[microbench] NR=4 PASS: +{:.2}% median vs NR=2", pct_med_4);
     } else {
-        eprintln!("[microbench] NR=4 FAIL gate: +{:.2}% median vs NR=2 (< +5%)", pct_med_4);
+        eprintln!(
+            "[microbench] NR=4 FAIL gate: +{:.2}% median vs NR=2 (< +5%)",
+            pct_med_4
+        );
     }
 }

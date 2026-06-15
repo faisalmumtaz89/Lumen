@@ -113,9 +113,9 @@ impl QuantScheme {
             9 => Ok(Self::Q6_K),
             10 => Ok(Self::Q2_K),
             11 => Ok(Self::Q3_K),
-            _ => Err(crate::FormatError::UnsupportedQuantization(
-                format!("unknown quant scheme tag: {tag}"),
-            )),
+            _ => Err(crate::FormatError::UnsupportedQuantization(format!(
+                "unknown quant scheme tag: {tag}"
+            ))),
         }
     }
 }
@@ -125,10 +125,18 @@ mod tests {
     use super::*;
 
     const ALL_SCHEMES: [QuantScheme; 12] = [
-        QuantScheme::F32, QuantScheme::F16, QuantScheme::Bf16,
-        QuantScheme::Q8_0, QuantScheme::Q4_0, QuantScheme::Q4_1,
-        QuantScheme::Q4_K, QuantScheme::Q5_0, QuantScheme::Q5_K,
-        QuantScheme::Q6_K, QuantScheme::Q2_K, QuantScheme::Q3_K,
+        QuantScheme::F32,
+        QuantScheme::F16,
+        QuantScheme::Bf16,
+        QuantScheme::Q8_0,
+        QuantScheme::Q4_0,
+        QuantScheme::Q4_1,
+        QuantScheme::Q4_K,
+        QuantScheme::Q5_0,
+        QuantScheme::Q5_K,
+        QuantScheme::Q6_K,
+        QuantScheme::Q2_K,
+        QuantScheme::Q3_K,
     ];
 
     #[test]
@@ -149,13 +157,26 @@ mod tests {
     #[test]
     fn bits_per_weight_correctness() {
         let expected: [(QuantScheme, f32); 12] = [
-            (QuantScheme::F32, 32.0), (QuantScheme::F16, 16.0), (QuantScheme::Bf16, 16.0),
-            (QuantScheme::Q8_0, 8.0), (QuantScheme::Q4_0, 4.0), (QuantScheme::Q4_1, 4.0),
-            (QuantScheme::Q4_K, 4.0), (QuantScheme::Q5_0, 5.0), (QuantScheme::Q5_K, 5.0),
-            (QuantScheme::Q6_K, 6.0), (QuantScheme::Q2_K, 2.0), (QuantScheme::Q3_K, 3.0),
+            (QuantScheme::F32, 32.0),
+            (QuantScheme::F16, 16.0),
+            (QuantScheme::Bf16, 16.0),
+            (QuantScheme::Q8_0, 8.0),
+            (QuantScheme::Q4_0, 4.0),
+            (QuantScheme::Q4_1, 4.0),
+            (QuantScheme::Q4_K, 4.0),
+            (QuantScheme::Q5_0, 5.0),
+            (QuantScheme::Q5_K, 5.0),
+            (QuantScheme::Q6_K, 6.0),
+            (QuantScheme::Q2_K, 2.0),
+            (QuantScheme::Q3_K, 3.0),
         ];
         for (scheme, bits) in expected {
-            assert_eq!(scheme.bits_per_weight(), bits, "wrong bits for {:?}", scheme);
+            assert_eq!(
+                scheme.bits_per_weight(),
+                bits,
+                "wrong bits for {:?}",
+                scheme
+            );
         }
     }
 
@@ -177,4 +198,3 @@ mod tests {
         assert!(QuantScheme::Q3_K.is_quantized());
     }
 }
-

@@ -42,10 +42,7 @@ impl GgufSource {
     /// is the file itself; for multi-shard GGUFs it's the shard the converter
     /// should be pointed at (auto-discovery will locate siblings).
     pub fn file(&self) -> &str {
-        self.files
-            .first()
-            .map(|s| s.as_str())
-            .unwrap_or("")
+        self.files.first().map(|s| s.as_str()).unwrap_or("")
     }
 
     /// `true` iff this source contains more than one shard file.
@@ -82,7 +79,9 @@ impl Registry {
 
     /// Get the default model entry.
     pub fn default_model(&self) -> &ModelEntry {
-        self.models.get("qwen3-5-9b").expect("default model qwen3-5-9b must exist in registry")
+        self.models
+            .get("qwen3-5-9b")
+            .expect("default model qwen3-5-9b must exist in registry")
     }
 
     /// List all model entries (sorted by key).
@@ -100,10 +99,16 @@ impl Registry {
 
 /// Load and parse the embedded model registry.
 pub fn load_registry() -> Registry {
-    let table: toml::Table = REGISTRY_TOML.parse().expect("embedded model_registry.toml must be valid TOML");
+    let table: toml::Table = REGISTRY_TOML
+        .parse()
+        .expect("embedded model_registry.toml must be valid TOML");
 
-    let meta = table.get("meta").and_then(|v| v.as_table()).expect("registry must have [meta]");
-    let default_quant = meta.get("default_quant")
+    let meta = table
+        .get("meta")
+        .and_then(|v| v.as_table())
+        .expect("registry must have [meta]");
+    let default_quant = meta
+        .get("default_quant")
         .and_then(|v| v.as_str())
         .unwrap_or("Q8_0")
         .to_owned();
@@ -116,31 +121,48 @@ pub fn load_registry() -> Registry {
                 Some(t) => t,
                 None => continue,
             };
-            let display_name = model_table.get("display_name")
-                .and_then(|v| v.as_str()).unwrap_or(key).to_owned();
-            let architecture = model_table.get("architecture")
-                .and_then(|v| v.as_str()).unwrap_or("").to_owned();
-            let parameters = model_table.get("parameters")
-                .and_then(|v| v.as_str()).unwrap_or("").to_owned();
-            let tokenizer = model_table.get("tokenizer")
-                .and_then(|v| v.as_str()).unwrap_or("").to_owned();
+            let display_name = model_table
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(key)
+                .to_owned();
+            let architecture = model_table
+                .get("architecture")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let parameters = model_table
+                .get("parameters")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let tokenizer = model_table
+                .get("tokenizer")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
 
             let mut gguf_files = HashMap::new();
             if let Some(gguf_table) = model_table.get("gguf_files").and_then(|v| v.as_table()) {
                 for (quant, source_val) in gguf_table {
                     if let Some(source_table) = source_val.as_table() {
-                        let repo = source_table.get("repo")
-                            .and_then(|v| v.as_str()).unwrap_or("").to_owned();
+                        let repo = source_table
+                            .get("repo")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_owned();
                         // Accept both single-file (`file = "name.gguf"`) and
                         // multi-shard (`files = ["shard1.gguf", "shard2.gguf"]`)
                         // forms. Multi-shard wins if both are present.
-                        let files = if let Some(arr) = source_table.get("files")
-                            .and_then(|v| v.as_array())
+                        let files = if let Some(arr) =
+                            source_table.get("files").and_then(|v| v.as_array())
                         {
                             arr.iter()
                                 .filter_map(|v| v.as_str().map(|s| s.to_owned()))
                                 .collect::<Vec<String>>()
-                        } else if let Some(single) = source_table.get("file").and_then(|v| v.as_str()) {
+                        } else if let Some(single) =
+                            source_table.get("file").and_then(|v| v.as_str())
+                        {
                             vec![single.to_owned()]
                         } else {
                             Vec::new()
@@ -155,14 +177,17 @@ pub fn load_registry() -> Registry {
                 }
             }
 
-            models.insert(key.clone(), ModelEntry {
-                key: key.clone(),
-                display_name,
-                architecture,
-                parameters,
-                tokenizer,
-                gguf_files,
-            });
+            models.insert(
+                key.clone(),
+                ModelEntry {
+                    key: key.clone(),
+                    display_name,
+                    architecture,
+                    parameters,
+                    tokenizer,
+                    gguf_files,
+                },
+            );
         }
     }
 
@@ -176,7 +201,11 @@ pub fn load_registry() -> Registry {
         }
     }
 
-    Registry { models, aliases, default_quant }
+    Registry {
+        models,
+        aliases,
+        default_quant,
+    }
 }
 
 // ===========================================================================
@@ -190,7 +219,10 @@ mod tests {
     #[test]
     fn load_registry_succeeds() {
         let reg = load_registry();
-        assert!(!reg.models.is_empty(), "registry must have at least one model");
+        assert!(
+            !reg.models.is_empty(),
+            "registry must have at least one model"
+        );
         assert_eq!(reg.default_quant(), "Q8_0");
     }
 
@@ -207,7 +239,9 @@ mod tests {
     #[test]
     fn resolve_qwen35_dot_alias() {
         let reg = load_registry();
-        let entry = reg.resolve("qwen3.5-9b").expect("alias qwen3.5-9b must resolve");
+        let entry = reg
+            .resolve("qwen3.5-9b")
+            .expect("alias qwen3.5-9b must resolve");
         assert_eq!(entry.key, "qwen3-5-9b");
         assert_eq!(entry.architecture, "qwen35");
     }
@@ -225,7 +259,14 @@ mod tests {
         // must no longer resolve. Callers should receive `None` (and the
         // CLI will surface a clear "unsupported model" error).
         let reg = load_registry();
-        for legacy in &["llama-8b", "tinyllama", "qwen2.5-3b", "qwen2.5-7b", "qwen2.5-14b", "mistral-7b"] {
+        for legacy in &[
+            "llama-8b",
+            "tinyllama",
+            "qwen2.5-3b",
+            "qwen2.5-7b",
+            "qwen2.5-14b",
+            "mistral-7b",
+        ] {
             assert!(reg.resolve(legacy).is_none(), "{legacy} must not resolve");
         }
     }
@@ -252,10 +293,15 @@ mod tests {
             list.len(),
         );
         let keys: Vec<&str> = list.iter().map(|e| e.key.as_str()).collect();
-        assert!(keys.contains(&"qwen3-5-9b"), "dense baseline missing: {:?}", keys);
+        assert!(
+            keys.contains(&"qwen3-5-9b"),
+            "dense baseline missing: {:?}",
+            keys
+        );
         // qwen35moe entry is asserted by `resolve_qwen35moe_canonical_key` below
         // so this list test simply enforces the family lock.
-        let archs: std::collections::HashSet<&str> = list.iter().map(|e| e.architecture.as_str()).collect();
+        let archs: std::collections::HashSet<&str> =
+            list.iter().map(|e| e.architecture.as_str()).collect();
         for arch in &archs {
             assert!(
                 matches!(*arch, "qwen35" | "qwen35moe"),
@@ -293,7 +339,11 @@ mod tests {
         let entry = reg.resolve("qwen3-5-9b").expect("qwen3-5-9b must exist");
         assert!(entry.gguf_files.contains_key("Q8_0"));
         let q8 = &entry.gguf_files["Q8_0"];
-        assert!(q8.repo.contains("Qwen3.5"), "Q8_0 repo should reference Qwen3.5: {}", q8.repo);
+        assert!(
+            q8.repo.contains("Qwen3.5"),
+            "Q8_0 repo should reference Qwen3.5: {}",
+            q8.repo
+        );
         assert!(q8.file().contains("Q8_0"));
         assert!(!q8.is_multi_shard(), "Q8_0 dense should be single-shard");
     }
@@ -312,8 +362,14 @@ mod tests {
             .gguf_files
             .get("BF16")
             .expect("BF16 quant must be declared for qwen3-5-moe-35b-a3b");
-        assert!(bf16.is_multi_shard(), "BF16 entry must list multiple shard files");
-        assert!(bf16.files.len() >= 2, "BF16 must have at least 2 shard files");
+        assert!(
+            bf16.is_multi_shard(),
+            "BF16 entry must list multiple shard files"
+        );
+        assert!(
+            bf16.files.len() >= 2,
+            "BF16 must have at least 2 shard files"
+        );
         for f in &bf16.files {
             // bartowski's repo uses lowercase `bf16` in the filename; other
             // providers may use uppercase. Accept either casing.
@@ -358,7 +414,11 @@ mod tests {
     fn all_models_have_tokenizer() {
         let reg = load_registry();
         for entry in reg.list() {
-            assert!(!entry.tokenizer.is_empty(), "model {} has no tokenizer", entry.key);
+            assert!(
+                !entry.tokenizer.is_empty(),
+                "model {} has no tokenizer",
+                entry.key
+            );
         }
     }
 }

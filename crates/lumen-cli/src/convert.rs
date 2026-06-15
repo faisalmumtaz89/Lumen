@@ -22,17 +22,25 @@ pub(crate) fn convert_cmd(args: &[String]) {
         match args[i].as_str() {
             "--input" | "-i" => {
                 i += 1;
-                input_path = Some(args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --input requires a path");
-                    std::process::exit(1);
-                }).clone());
+                input_path = Some(
+                    args.get(i)
+                        .unwrap_or_else(|| {
+                            eprintln!("Error: --input requires a path");
+                            std::process::exit(1);
+                        })
+                        .clone(),
+                );
             }
             "--output" | "-o" => {
                 i += 1;
-                output_path = Some(args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --output requires a path");
-                    std::process::exit(1);
-                }).clone());
+                output_path = Some(
+                    args.get(i)
+                        .unwrap_or_else(|| {
+                            eprintln!("Error: --output requires a path");
+                            std::process::exit(1);
+                        })
+                        .clone(),
+                );
             }
             "--dequantize" => {
                 dequantize = true;
@@ -47,7 +55,9 @@ pub(crate) fn convert_cmd(args: &[String]) {
                     "q4_0" | "q4" => Some(QuantScheme::Q4_0),
                     "q8_0" | "q8" => Some(QuantScheme::Q8_0),
                     other => {
-                        eprintln!("Error: unsupported requant target: {other} (supported: q4_0, q8_0)");
+                        eprintln!(
+                            "Error: unsupported requant target: {other} (supported: q4_0, q8_0)"
+                        );
                         std::process::exit(1);
                     }
                 };
@@ -89,9 +99,7 @@ pub(crate) fn convert_cmd(args: &[String]) {
     let output_path = output_path.unwrap_or_else(|| {
         // Default: same name with .lbc extension
         let p = Path::new(&input_path);
-        p.with_extension("lbc")
-            .to_string_lossy()
-            .into_owned()
+        p.with_extension("lbc").to_string_lossy().into_owned()
     });
 
     let input = Path::new(&input_path);
@@ -132,7 +140,11 @@ pub(crate) fn convert_cmd(args: &[String]) {
 /// the legacy `Generic` behaviour (K-quant layer tensors pass through).
 pub(crate) fn default_target_for_host() -> ConvertTarget {
     #[cfg(target_os = "macos")]
-    { ConvertTarget::Metal }
+    {
+        ConvertTarget::Metal
+    }
     #[cfg(not(target_os = "macos"))]
-    { ConvertTarget::Generic }
+    {
+        ConvertTarget::Generic
+    }
 }

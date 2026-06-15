@@ -76,8 +76,10 @@ pub(crate) const MAX_SHARDS: usize = 256;
 /// Compose a virtual address from a shard id and an absolute byte offset
 /// within that shard's on-disk file.
 pub(crate) fn make_virtual_address(shard_id: u8, abs_offset: u64) -> u64 {
-    debug_assert!(abs_offset <= WITHIN_SHARD_MASK,
-        "abs_offset {abs_offset} exceeds 2^56 -- shard too large for virtual address scheme");
+    debug_assert!(
+        abs_offset <= WITHIN_SHARD_MASK,
+        "abs_offset {abs_offset} exceeds 2^56 -- shard too large for virtual address scheme"
+    );
     ((shard_id as u64) << SHARD_ID_SHIFT) | abs_offset
 }
 
@@ -115,17 +117,40 @@ pub enum ShardError {
     /// The shard filename did not match the `*-NNNNN-of-MMMMM.gguf` pattern.
     InvalidShardName(String),
     /// `split.count` differs between shards (e.g. shard 1 says 2 but shard 2 says 3).
-    SplitCountMismatch { shard: PathBuf, expected: u16, got: u16 },
+    SplitCountMismatch {
+        shard: PathBuf,
+        expected: u16,
+        got: u16,
+    },
     /// The set of `split.no` values is not contiguous 0..N or has duplicates.
-    NonContiguousShards { found: Vec<u16>, expected_count: u16 },
+    NonContiguousShards {
+        found: Vec<u16>,
+        expected_count: u16,
+    },
     /// Fewer shards were located on disk than `split.count` requires.
-    MissingShards { expected: u16, present: u16, looked_for: Vec<PathBuf> },
+    MissingShards {
+        expected: u16,
+        present: u16,
+        looked_for: Vec<PathBuf>,
+    },
     /// Two shards declare the same tensor name.
-    TensorNameCollision { name: String, first_shard: usize, second_shard: usize },
+    TensorNameCollision {
+        name: String,
+        first_shard: usize,
+        second_shard: usize,
+    },
     /// Two shards declare different GGUF format versions.
-    VersionMismatch { shard: PathBuf, expected: u32, got: u32 },
+    VersionMismatch {
+        shard: PathBuf,
+        expected: u32,
+        got: u32,
+    },
     /// Two shards declare different data-section alignments.
-    AlignmentMismatch { shard: PathBuf, expected: u32, got: u32 },
+    AlignmentMismatch {
+        shard: PathBuf,
+        expected: u32,
+        got: u32,
+    },
 }
 
 impl std::fmt::Display for ShardError {
@@ -191,7 +216,10 @@ impl From<GgufError> for ShardError {
 
 impl From<ShardError> for ConvertError {
     fn from(e: ShardError) -> Self {
-        ConvertError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        ConvertError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ))
     }
 }
 
@@ -265,7 +293,11 @@ impl ShardedGguf {
             let f = GgufFile::open(p)?;
             // Single-shard files have no `split.no`; default to 0.
             let shard_no = read_u16_metadata(&f, SPLIT_NO_KEY).unwrap_or(0);
-            specs.push(ShardSpec { path: p.clone(), shard_no, file: f });
+            specs.push(ShardSpec {
+                path: p.clone(),
+                shard_no,
+                file: f,
+            });
         }
 
         // Sort by shard_no so we iterate in deterministic order.
@@ -355,7 +387,10 @@ impl ShardedGguf {
 
     /// Returns the absolute file offset of a tensor's data within its owning
     /// shard. Decoded from the virtual offset baked into the merged tensor info.
-    pub fn tensor_data_absolute_offset(&self, tensor: &GgufTensorInfo) -> Result<u64, ConvertError> {
+    pub fn tensor_data_absolute_offset(
+        &self,
+        tensor: &GgufTensorInfo,
+    ) -> Result<u64, ConvertError> {
         let (shard_id, abs_offset) = split_virtual_address(tensor.offset);
         if (shard_id as usize) >= self.shards.len() {
             return Err(ConvertError::MissingTensor(tensor.name.clone()));
@@ -522,7 +557,10 @@ fn validate_shards(specs: &[ShardSpec]) -> Result<(), ShardError> {
                 got: spec.file.alignment,
             });
         }
-        if let (Some(expected), Some(got)) = (declared_count, read_u16_metadata(&spec.file, SPLIT_COUNT_KEY)) {
+        if let (Some(expected), Some(got)) = (
+            declared_count,
+            read_u16_metadata(&spec.file, SPLIT_COUNT_KEY),
+        ) {
             if expected != got {
                 return Err(ShardError::SplitCountMismatch {
                     shard: spec.path.clone(),
@@ -671,7 +709,10 @@ impl MultiShardReader {
             let f = File::open(&spec.path)?;
             shards.push(BufReader::new(f));
         }
-        Ok(Self { shards, current_shard: 0 })
+        Ok(Self {
+            shards,
+            current_shard: 0,
+        })
     }
 }
 
@@ -752,8 +793,7 @@ mod tests {
 
     #[test]
     fn parse_shard_filename_second_of_two() {
-        let (stem, no, total) =
-            parse_shard_filename("model-00002-of-00002.gguf").unwrap();
+        let (stem, no, total) = parse_shard_filename("model-00002-of-00002.gguf").unwrap();
         assert_eq!(stem, "model");
         assert_eq!(no, 2);
         assert_eq!(total, 2);
@@ -797,10 +837,7 @@ mod tests {
             make_shard_filename("Qwen_Qwen3.5-MoE-35B-A3B-BF16", 1, 2),
             "Qwen_Qwen3.5-MoE-35B-A3B-BF16-00001-of-00002.gguf"
         );
-        assert_eq!(
-            make_shard_filename("foo", 7, 12),
-            "foo-00007-of-00012.gguf"
-        );
+        assert_eq!(make_shard_filename("foo", 7, 12), "foo-00007-of-00012.gguf");
     }
 
     #[test]
@@ -883,8 +920,18 @@ mod tests {
         let (p1, p2) = write_2shard_set(
             &dir,
             "modelX",
-            &[("token_embd.weight", GgmlType::F32, vec![4, 4], vec![0u8; 64])],
-            &[("blk.0.attn_q.weight", GgmlType::F32, vec![4, 4], vec![0u8; 64])],
+            &[(
+                "token_embd.weight",
+                GgmlType::F32,
+                vec![4, 4],
+                vec![0u8; 64],
+            )],
+            &[(
+                "blk.0.attn_q.weight",
+                GgmlType::F32,
+                vec![4, 4],
+                vec![0u8; 64],
+            )],
         );
         // Discover from either shard.
         let from_p1 = discover_sibling_shards(&p1).unwrap();
@@ -909,7 +956,9 @@ mod tests {
 
         let err = discover_sibling_shards(&p1).unwrap_err();
         match err {
-            ShardError::MissingShards { expected, present, .. } => {
+            ShardError::MissingShards {
+                expected, present, ..
+            } => {
                 assert_eq!(expected, 2);
                 assert_eq!(present, 1);
             }
@@ -954,19 +1003,40 @@ mod tests {
         // Shard 2: blk.1.attn_q + output.weight
         // u16 indices because tile_d's values exceed u8 range.
         let tile_a: Vec<u8> = (0u16..64).flat_map(|i| (i as f32).to_le_bytes()).collect();
-        let tile_b: Vec<u8> = (0u16..64).flat_map(|i| ((100 + i) as f32).to_le_bytes()).collect();
-        let tile_c: Vec<u8> = (0u16..16).flat_map(|i| ((200 + i) as f32).to_le_bytes()).collect();
-        let tile_d: Vec<u8> = (0u16..16).flat_map(|i| ((300 + i) as f32).to_le_bytes()).collect();
+        let tile_b: Vec<u8> = (0u16..64)
+            .flat_map(|i| ((100 + i) as f32).to_le_bytes())
+            .collect();
+        let tile_c: Vec<u8> = (0u16..16)
+            .flat_map(|i| ((200 + i) as f32).to_le_bytes())
+            .collect();
+        let tile_d: Vec<u8> = (0u16..16)
+            .flat_map(|i| ((300 + i) as f32).to_le_bytes())
+            .collect();
 
         let (p1, _p2) = write_2shard_set(
             &dir,
             "two-shard",
             &[
-                ("token_embd.weight", GgmlType::F32, vec![16, 4], tile_a.clone()),
-                ("blk.0.attn_q.weight", GgmlType::F32, vec![8, 8], tile_b.clone()),
+                (
+                    "token_embd.weight",
+                    GgmlType::F32,
+                    vec![16, 4],
+                    tile_a.clone(),
+                ),
+                (
+                    "blk.0.attn_q.weight",
+                    GgmlType::F32,
+                    vec![8, 8],
+                    tile_b.clone(),
+                ),
             ],
             &[
-                ("blk.1.attn_q.weight", GgmlType::F32, vec![4, 4], tile_c.clone()),
+                (
+                    "blk.1.attn_q.weight",
+                    GgmlType::F32,
+                    vec![4, 4],
+                    tile_c.clone(),
+                ),
                 ("output.weight", GgmlType::F32, vec![4, 4], tile_d.clone()),
             ],
         );
@@ -993,9 +1063,13 @@ mod tests {
         // Shard attribution: first two go to shard 0, last two to shard 1.
         let (_t, s0a) = sharded.find_tensor_with_shard("token_embd.weight").unwrap();
         assert_eq!(s0a, 0);
-        let (_t, s0b) = sharded.find_tensor_with_shard("blk.0.attn_q.weight").unwrap();
+        let (_t, s0b) = sharded
+            .find_tensor_with_shard("blk.0.attn_q.weight")
+            .unwrap();
         assert_eq!(s0b, 0);
-        let (_t, s1a) = sharded.find_tensor_with_shard("blk.1.attn_q.weight").unwrap();
+        let (_t, s1a) = sharded
+            .find_tensor_with_shard("blk.1.attn_q.weight")
+            .unwrap();
         assert_eq!(s1a, 1);
         let (_t, s1b) = sharded.find_tensor_with_shard("output.weight").unwrap();
         assert_eq!(s1b, 1);
@@ -1013,14 +1087,23 @@ mod tests {
             "dup-set",
             &[("conflict.weight", GgmlType::F32, vec![4], vec![0u8; 16])],
             &[
-                ("blk.0.attn_q.weight", GgmlType::F32, vec![4, 4], vec![0u8; 64]),
+                (
+                    "blk.0.attn_q.weight",
+                    GgmlType::F32,
+                    vec![4, 4],
+                    vec![0u8; 64],
+                ),
                 ("conflict.weight", GgmlType::F32, vec![4], vec![0u8; 16]),
             ],
         );
 
         let err = ShardedGguf::open(&p1).unwrap_err();
         match err {
-            ShardError::TensorNameCollision { name, first_shard, second_shard } => {
+            ShardError::TensorNameCollision {
+                name,
+                first_shard,
+                second_shard,
+            } => {
                 assert_eq!(name, "conflict.weight");
                 assert_eq!(first_shard, 0);
                 assert_eq!(second_shard, 1);
@@ -1118,7 +1201,10 @@ mod tests {
 
         let err = ShardedGguf::open(&p1).unwrap_err();
         match err {
-            ShardError::NonContiguousShards { found, expected_count } => {
+            ShardError::NonContiguousShards {
+                found,
+                expected_count,
+            } => {
                 assert_eq!(expected_count, 2);
                 assert_eq!(found, vec![0, 0]);
             }
@@ -1135,8 +1221,18 @@ mod tests {
         let (p1, p2) = write_2shard_set(
             &dir,
             "sizecheck",
-            &[("token_embd.weight", GgmlType::F32, vec![4, 4], vec![0u8; 64])],
-            &[("blk.0.attn_q.weight", GgmlType::F32, vec![4, 4], vec![0u8; 64])],
+            &[(
+                "token_embd.weight",
+                GgmlType::F32,
+                vec![4, 4],
+                vec![0u8; 64],
+            )],
+            &[(
+                "blk.0.attn_q.weight",
+                GgmlType::F32,
+                vec![4, 4],
+                vec![0u8; 64],
+            )],
         );
 
         let sharded = ShardedGguf::open(&p1).unwrap();
@@ -1160,8 +1256,18 @@ mod tests {
         let (p1, p2) = write_2shard_set(
             &dir,
             "offset-check",
-            &[("token_embd.weight", GgmlType::F32, vec![4, 4], vec![0xAA; 64])],
-            &[("blk.0.attn_q.weight", GgmlType::F32, vec![4, 4], vec![0xBB; 64])],
+            &[(
+                "token_embd.weight",
+                GgmlType::F32,
+                vec![4, 4],
+                vec![0xAA; 64],
+            )],
+            &[(
+                "blk.0.attn_q.weight",
+                GgmlType::F32,
+                vec![4, 4],
+                vec![0xBB; 64],
+            )],
         );
 
         let sharded = ShardedGguf::open(&p1).unwrap();
@@ -1175,8 +1281,14 @@ mod tests {
         // picked the right shard file.
         let d0 = sharded.read_tensor_data(&t0).unwrap();
         let d1 = sharded.read_tensor_data(&t1).unwrap();
-        assert!(d0.iter().all(|&b| b == 0xAA), "shard 0 tensor should be 0xAA pattern");
-        assert!(d1.iter().all(|&b| b == 0xBB), "shard 1 tensor should be 0xBB pattern");
+        assert!(
+            d0.iter().all(|&b| b == 0xAA),
+            "shard 0 tensor should be 0xAA pattern"
+        );
+        assert!(
+            d1.iter().all(|&b| b == 0xBB),
+            "shard 1 tensor should be 0xBB pattern"
+        );
 
         // Spot-check the path-for-tensor accessor.
         assert_eq!(sharded.path_for_tensor(&t0).unwrap(), p1.as_path());
@@ -1257,10 +1369,14 @@ mod tests {
         let beta = m.find_tensor("beta.weight").unwrap().clone();
         let a = view.read_tensor_data(&alpha).unwrap();
         let b = view.read_tensor_data(&beta).unwrap();
-        assert!(a.iter().all(|&v| v == 0xAA),
-                "alpha (shard 0, split.no=0) must read 0xAA bytes regardless of input order");
-        assert!(b.iter().all(|&v| v == 0xBB),
-                "beta (shard 1, split.no=1) must read 0xBB bytes regardless of input order");
+        assert!(
+            a.iter().all(|&v| v == 0xAA),
+            "alpha (shard 0, split.no=0) must read 0xAA bytes regardless of input order"
+        );
+        assert!(
+            b.iter().all(|&v| v == 0xBB),
+            "beta (shard 1, split.no=1) must read 0xBB bytes regardless of input order"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1319,7 +1435,10 @@ mod tests {
             let size = t.byte_size().unwrap() as usize;
             let mut buf = vec![0u8; size];
             reader.read_exact(&mut buf).unwrap();
-            assert_eq!(&buf, expected, "{name} bytes mismatch through MultiShardReader");
+            assert_eq!(
+                &buf, expected,
+                "{name} bytes mismatch through MultiShardReader"
+            );
         }
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1350,7 +1469,10 @@ mod tests {
         let size = t.byte_size().unwrap() as usize;
         let mut buf = vec![0u8; size];
         reader.read_exact(&mut buf).unwrap();
-        assert_eq!(buf, payload, "single-shard MultiShardReader must be byte-identical");
+        assert_eq!(
+            buf, payload,
+            "single-shard MultiShardReader must be byte-identical"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1400,7 +1522,12 @@ mod tests {
 
     #[test]
     fn virtual_address_roundtrip() {
-        for (sid, off) in [(0u8, 0u64), (1, 0x1234), (5, (1u64 << 40)), (255, WITHIN_SHARD_MASK)] {
+        for (sid, off) in [
+            (0u8, 0u64),
+            (1, 0x1234),
+            (5, (1u64 << 40)),
+            (255, WITHIN_SHARD_MASK),
+        ] {
             let v = make_virtual_address(sid, off);
             let (sid2, off2) = split_virtual_address(v);
             assert_eq!((sid, off), (sid2, off2),

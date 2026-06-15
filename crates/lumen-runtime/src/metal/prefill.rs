@@ -3,10 +3,10 @@
 //! Extracted from mod.rs for modularity.
 //! These are methods on MetalF32Backend that orchestrate the batched prefill pipeline.
 
+use super::graph_reorder;
+use super::{MTLSize, MetalBuffer, MetalF32Backend, MetalPipelines, MetalScratch};
 use crate::error::RuntimeError;
 use crate::metal::ffi::MetalCommandBuffer;
-use super::{MetalPipelines, MetalScratch, MetalF32Backend, MetalBuffer, MTLSize};
-use super::graph_reorder;
 use lumen_format::quantization::QuantScheme;
 
 impl MetalF32Backend {
@@ -28,22 +28,25 @@ impl MetalF32Backend {
         let batch_size = token_ids.len();
         let hidden_dim = scratch.hidden_dim;
 
-        let x_buf = scratch.batch_x_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("batch_x_buf not allocated for embed".into())
-        })?;
+        let x_buf = scratch
+            .batch_x_buf
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("batch_x_buf not allocated for embed".into()))?;
 
         // Upload token ids
-        let ids_bytes: Vec<u8> = token_ids.iter()
-            .flat_map(|id| id.to_le_bytes())
-            .collect();
-        let ids_buf = self.device.new_buffer_with_bytes(&ids_bytes).ok_or_else(|| {
-            RuntimeError::Compute("Failed to create token ids buffer".into())
-        })?;
+        let ids_bytes: Vec<u8> = token_ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let ids_buf = self
+            .device
+            .new_buffer_with_bytes(&ids_bytes)
+            .ok_or_else(|| RuntimeError::Compute("Failed to create token ids buffer".into()))?;
 
         // Resolve embedding buffer: prefer unified private buffer, fall back to separate
         let (embed_buf_ref, embed_off): (&MetalBuffer, u64) =
             if let Some((emb_o, _, _)) = scratch.gpu_global_offsets {
-                (scratch.gpu_unified_weight_buf.as_ref().unwrap(), emb_o as u64)
+                (
+                    scratch.gpu_unified_weight_buf.as_ref().unwrap(),
+                    emb_o as u64,
+                )
             } else {
                 let eb = self.embedding_buf.as_ref().ok_or_else(|| {
                     RuntimeError::Compute("Embedding buffer not initialized".into())
@@ -74,10 +77,7 @@ impl MetalF32Backend {
         let total_elems = (batch_size * hidden_dim) as u64;
         let tg = 256u64.min(total_elems).max(1);
         let tg_count = total_elems.div_ceil(tg);
-        enc.dispatch_threadgroups(
-            MTLSize::new(tg_count, 1, 1),
-            MTLSize::new(tg, 1, 1),
-        );
+        enc.dispatch_threadgroups(MTLSize::new(tg_count, 1, 1), MTLSize::new(tg, 1, 1));
         enc.end_encoding();
 
         Ok(())
@@ -93,9 +93,10 @@ impl MetalF32Backend {
         scratch: &MetalScratch,
     ) -> Result<Vec<f32>, RuntimeError> {
         let hidden_dim = scratch.hidden_dim;
-        let x_buf = scratch.batch_x_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("batch_x_buf not allocated for read".into())
-        })?;
+        let x_buf = scratch
+            .batch_x_buf
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("batch_x_buf not allocated for read".into()))?;
 
         // Read entire batch, extract last token
         let total = batch_size * hidden_dim;
@@ -151,9 +152,9 @@ impl MetalF32Backend {
         // buffer pointers in registers across the entire encoding loop.
         // ================================================================
         let mut scratch_guard = self.scratch.lock().unwrap();
-        let s = scratch_guard.as_mut().ok_or_else(|| {
-            RuntimeError::Compute("Metal scratch not initialized".into())
-        })?;
+        let s = scratch_guard
+            .as_mut()
+            .ok_or_else(|| RuntimeError::Compute("Metal scratch not initialized".into()))?;
 
         // Ensure batch buffers are large enough
         self.ensure_batch_buffers(s, batch_size)?;
@@ -193,17 +194,18 @@ impl MetalF32Backend {
         // own granularity), and with batch_size < num_layers (no point
         // splitting). Each of these falls back to K=1.
         let cb_count_request = super::graph_reorder::multi_cb_count();
-        let helper_new_cb = |unretained: bool, profilable: bool| -> Result<MetalCommandBuffer, RuntimeError> {
-            let res = match (profilable, unretained) {
-                (true, true)  => self.queue.new_command_buffer_profilable_unretained(),
-                (true, false) => self.queue.new_command_buffer_profilable(),
-                (false, true) => self.queue.new_command_buffer_unretained(),
-                (false, false) => self.queue.new_command_buffer(),
+        let helper_new_cb =
+            |unretained: bool, profilable: bool| -> Result<MetalCommandBuffer, RuntimeError> {
+                let res = match (profilable, unretained) {
+                    (true, true) => self.queue.new_command_buffer_profilable_unretained(),
+                    (true, false) => self.queue.new_command_buffer_profilable(),
+                    (false, true) => self.queue.new_command_buffer_unretained(),
+                    (false, false) => self.queue.new_command_buffer(),
+                };
+                res.ok_or_else(|| {
+                    RuntimeError::Compute("Failed to create command buffer for prefill".into())
+                })
             };
-            res.ok_or_else(|| {
-                RuntimeError::Compute("Failed to create command buffer for prefill".into())
-            })
-        };
         let cmd = helper_new_cb(unretained, super::profile::is_enabled())?;
 
         // Initialise per-section profile state for this prefill (cheap no-op
@@ -286,13 +288,12 @@ impl MetalF32Backend {
         // layer is ineligible (MoE, legacy per-layer GDN, deep-profile, etc.),
         // the outer-encoder path is silently skipped and the legacy
         // per-layer encoder loop runs.
-        let concurrent_encoder_full = graph_reorder::concurrent_encoder_full_enabled() && graph_reorder::concurrent_encoder_enabled();
+        let concurrent_encoder_full = graph_reorder::concurrent_encoder_full_enabled()
+            && graph_reorder::concurrent_encoder_enabled();
         let serial_validate_full = graph_reorder::concurrent_encoder_full_validate_serial();
 
         let all_layers_outer_eligible = concurrent_encoder_full
-            && (0..num_layers).all(|l| {
-                self.layer_outer_eligible(s, &layer_views[l], batch_size)
-            });
+            && (0..num_layers).all(|l| self.layer_outer_eligible(s, &layer_views[l], batch_size));
 
         if all_layers_outer_eligible {
             // fast path: one outer encoder spans all layers.
@@ -305,15 +306,11 @@ impl MetalF32Backend {
             // `serial_validate` is true).
             let outer_enc = if serial_validate_full {
                 cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute(
-                        ": failed to create outer serial validate encoder".into(),
-                    )
+                    RuntimeError::Compute(": failed to create outer serial validate encoder".into())
                 })?
             } else {
                 cmd.new_concurrent_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute(
-                        ": failed to create outer concurrent encoder".into(),
-                    )
+                    RuntimeError::Compute(": failed to create outer concurrent encoder".into())
                 })?
             };
 
@@ -330,27 +327,49 @@ impl MetalF32Backend {
             // only use the references to emit cross-layer barriers (Metal
             // API calls that do not retain). Constructing `&MetalBuffer`
             // from known-live raw pointers is safe.
-            let x_buf_ptr: *const MetalBuffer = s.batch_x_buf.as_ref()
+            let x_buf_ptr: *const MetalBuffer = s
+                .batch_x_buf
+                .as_ref()
                 .ok_or_else(|| RuntimeError::Compute(": batch_x_buf missing".into()))?;
-            let normed_buf_ptr: *const MetalBuffer = s.batch_normed_buf.as_ref()
+            let normed_buf_ptr: *const MetalBuffer = s
+                .batch_normed_buf
+                .as_ref()
                 .ok_or_else(|| RuntimeError::Compute(": batch_normed_buf missing".into()))?;
-            let qkv_buf_ptr: *const MetalBuffer = s.batch_qkv_buf.as_ref()
+            let qkv_buf_ptr: *const MetalBuffer = s
+                .batch_qkv_buf
+                .as_ref()
                 .ok_or_else(|| RuntimeError::Compute(": batch_qkv_buf missing".into()))?;
-            let q_buf_ptr: *const MetalBuffer = s.batch_q_buf.as_ref()
+            let q_buf_ptr: *const MetalBuffer = s
+                .batch_q_buf
+                .as_ref()
                 .ok_or_else(|| RuntimeError::Compute(": batch_q_buf missing".into()))?;
-            let k_buf_ptr: *const MetalBuffer = s.batch_k_buf.as_ref()
+            let k_buf_ptr: *const MetalBuffer = s
+                .batch_k_buf
+                .as_ref()
                 .ok_or_else(|| RuntimeError::Compute(": batch_k_buf missing".into()))?;
-            let v_buf_ptr: *const MetalBuffer = s.batch_v_buf.as_ref()
+            let v_buf_ptr: *const MetalBuffer = s
+                .batch_v_buf
+                .as_ref()
                 .ok_or_else(|| RuntimeError::Compute(": batch_v_buf missing".into()))?;
-            let attn_out_buf_ptr: *const MetalBuffer = s.batch_attn_out_buf.as_ref()
+            let attn_out_buf_ptr: *const MetalBuffer = s
+                .batch_attn_out_buf
+                .as_ref()
                 .ok_or_else(|| RuntimeError::Compute(": batch_attn_out_buf missing".into()))?;
-            let attn_proj_buf_ptr: *const MetalBuffer = s.batch_attn_proj_buf.as_ref()
+            let attn_proj_buf_ptr: *const MetalBuffer = s
+                .batch_attn_proj_buf
+                .as_ref()
                 .ok_or_else(|| RuntimeError::Compute(": batch_attn_proj_buf missing".into()))?;
-            let gate_buf_ptr: *const MetalBuffer = s.batch_gate_buf.as_ref()
+            let gate_buf_ptr: *const MetalBuffer = s
+                .batch_gate_buf
+                .as_ref()
                 .ok_or_else(|| RuntimeError::Compute(": batch_gate_buf missing".into()))?;
-            let up_buf_ptr: *const MetalBuffer = s.batch_up_buf.as_ref()
+            let up_buf_ptr: *const MetalBuffer = s
+                .batch_up_buf
+                .as_ref()
                 .ok_or_else(|| RuntimeError::Compute(": batch_up_buf missing".into()))?;
-            let scores_buf_ptr: *const MetalBuffer = s.batch_scores_buf.as_ref()
+            let scores_buf_ptr: *const MetalBuffer = s
+                .batch_scores_buf
+                .as_ref()
                 .ok_or_else(|| RuntimeError::Compute(": batch_scores_buf missing".into()))?;
 
             for layer in 0..num_layers {
@@ -387,18 +406,33 @@ impl MetalF32Backend {
                     // owned by `s` (MetalScratch), which is borrowed
                     // mutably for the entire `for` loop. The buffers are
                     // not moved or dropped during the loop.
-                    let bufs: [&MetalBuffer; 11] = unsafe {[
-                        &*x_buf_ptr, &*normed_buf_ptr, &*qkv_buf_ptr,
-                        &*q_buf_ptr, &*k_buf_ptr, &*v_buf_ptr,
-                        &*attn_out_buf_ptr, &*attn_proj_buf_ptr,
-                        &*gate_buf_ptr, &*up_buf_ptr, &*scores_buf_ptr,
-                    ]};
+                    let bufs: [&MetalBuffer; 11] = unsafe {
+                        [
+                            &*x_buf_ptr,
+                            &*normed_buf_ptr,
+                            &*qkv_buf_ptr,
+                            &*q_buf_ptr,
+                            &*k_buf_ptr,
+                            &*v_buf_ptr,
+                            &*attn_out_buf_ptr,
+                            &*attn_proj_buf_ptr,
+                            &*gate_buf_ptr,
+                            &*up_buf_ptr,
+                            &*scores_buf_ptr,
+                        ]
+                    };
                     outer_enc.memory_barrier_with_resources(&bufs);
                 }
 
                 self.encode_layer_batched_into(
-                    &cmd, &outer_enc, layer, batch_size, &layer_views[layer],
-                    &mut kv_view, pipelines, s,
+                    &cmd,
+                    &outer_enc,
+                    layer,
+                    batch_size,
+                    &layer_views[layer],
+                    &mut kv_view,
+                    pipelines,
+                    s,
                 )?;
 
                 kv.commit_view(kv_view)?;
@@ -443,7 +477,11 @@ impl MetalF32Backend {
                 // Layer ranges by CB: cb 0 -> [0, base); cb 1 -> [base, 2*base); ...; cb K-1 -> [(K-1)*base, num_layers).
                 // The remainder goes to the LAST CB.
                 let cb_end = |k_idx: usize| -> usize {
-                    if k_idx + 1 == k { num_layers } else { (k_idx + 1) * base + 0 }
+                    if k_idx + 1 == k {
+                        num_layers
+                    } else {
+                        (k_idx + 1) * base + 0
+                    }
                 };
                 // Track the queue of in-flight CBs we still hold a handle to.
                 // We only need to wait on the LAST one (FIFO ordering on
@@ -459,8 +497,13 @@ impl MetalF32Backend {
                 for layer in 0..num_layers {
                     let mut kv_view = kv.view_mut(layer)?;
                     self.encode_layer_batched(
-                        &current_cb, layer, batch_size, &layer_views[layer],
-                        &mut kv_view, pipelines, s,
+                        &current_cb,
+                        layer,
+                        batch_size,
+                        &layer_views[layer],
+                        &mut kv_view,
+                        pipelines,
+                        s,
                     )?;
                     kv.commit_view(kv_view)?;
 
@@ -496,10 +539,7 @@ impl MetalF32Backend {
                 // after each layer. Used to pinpoint the first layer that
                 // produces NaN. Default off; production path is the loop
                 // immediately below.
-                let nan_dump = std::env::var("LUMEN_METAL_NAN_DUMP")
-                    .ok()
-                    .as_deref()
-                    == Some("1");
+                let nan_dump = std::env::var("LUMEN_METAL_NAN_DUMP").ok().as_deref() == Some("1");
                 if nan_dump {
                     let hidden_dim = s.hidden_dim;
                     let total = batch_size * hidden_dim;
@@ -510,14 +550,21 @@ impl MetalF32Backend {
                         xb.read_f32(&mut buf);
                         let nans = buf.iter().filter(|v| v.is_nan()).count();
                         let infs = buf.iter().filter(|v| v.is_infinite()).count();
-                        eprintln!("post-embed batch_size={batch_size} NaN={nans}/{total} Inf={infs}");
+                        eprintln!(
+                            "post-embed batch_size={batch_size} NaN={nans}/{total} Inf={infs}"
+                        );
                     }
                     for layer in 0..num_layers {
                         let layer_cmd = helper_new_cb(unretained, false)?;
                         let mut kv_view = kv.view_mut(layer)?;
                         self.encode_layer_batched(
-                            &layer_cmd, layer, batch_size, &layer_views[layer],
-                            &mut kv_view, pipelines, s,
+                            &layer_cmd,
+                            layer,
+                            batch_size,
+                            &layer_views[layer],
+                            &mut kv_view,
+                            pipelines,
+                            s,
                         )?;
                         kv.commit_view(kv_view)?;
                         layer_cmd.commit_and_wait();
@@ -539,8 +586,8 @@ impl MetalF32Backend {
                     // can read true GPU busy time (GPUEndTime-GPUStartTime) and the
                     // CPU encode wall separately. The production path is bit-exact
                     // when the env is absent (single CB, single commit_and_wait).
-                    let gputime = std::env::var("LUMEN_METAL_PREFILL_GPUTIME")
-                        .ok().as_deref() == Some("1");
+                    let gputime =
+                        std::env::var("LUMEN_METAL_PREFILL_GPUTIME").ok().as_deref() == Some("1");
 
                     // Dual-queue GDN branch-overlap setup
                     // (`LUMEN_METAL_GDN_DUAL_QUEUE=1`). When enabled, allocate a
@@ -555,19 +602,29 @@ impl MetalF32Backend {
                         && !super::profile::is_enabled();
                     let dq_installed = if dual_queue {
                         let aux_queue = self.device.new_command_queue().ok_or_else(|| {
-                            RuntimeError::Compute("dual-queue: failed to create aux command queue".into())
+                            RuntimeError::Compute(
+                                "dual-queue: failed to create aux command queue".into(),
+                            )
                         })?;
                         let aux_cmd = aux_queue.new_command_buffer().ok_or_else(|| {
-                            RuntimeError::Compute("dual-queue: failed to create aux command buffer".into())
+                            RuntimeError::Compute(
+                                "dual-queue: failed to create aux command buffer".into(),
+                            )
                         })?;
                         let ev_norm = self.device.new_shared_event().ok_or_else(|| {
-                            RuntimeError::Compute("dual-queue: failed to create norm-ready event".into())
+                            RuntimeError::Compute(
+                                "dual-queue: failed to create norm-ready event".into(),
+                            )
                         })?;
                         let ev_ab = self.device.new_shared_event().ok_or_else(|| {
-                            RuntimeError::Compute("dual-queue: failed to create ab-ready event".into())
+                            RuntimeError::Compute(
+                                "dual-queue: failed to create ab-ready event".into(),
+                            )
                         })?;
                         let ev_gate = self.device.new_shared_event().ok_or_else(|| {
-                            RuntimeError::Compute("dual-queue: failed to create gate-ready event".into())
+                            RuntimeError::Compute(
+                                "dual-queue: failed to create gate-ready event".into(),
+                            )
                         })?;
                         // The aux queue must outlive its command buffer; leak its
                         // Rust handle into the ctx via a Box kept alive by the
@@ -586,12 +643,21 @@ impl MetalF32Backend {
                         None
                     };
 
-                    let enc_start = if gputime { Some(std::time::Instant::now()) } else { None };
+                    let enc_start = if gputime {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     for layer in 0..num_layers {
                         let mut kv_view = kv.view_mut(layer)?;
                         self.encode_layer_batched(
-                            &cmd, layer, batch_size, &layer_views[layer],
-                            &mut kv_view, pipelines, s,
+                            &cmd,
+                            layer,
+                            batch_size,
+                            &layer_views[layer],
+                            &mut kv_view,
+                            pipelines,
+                            s,
                         )?;
                         kv.commit_view(kv_view)?;
                     }
@@ -704,5 +770,4 @@ impl MetalF32Backend {
             .map(|s| s.gdn_num_layers)
             .unwrap_or(0)
     }
-
 }

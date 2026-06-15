@@ -124,7 +124,8 @@ pub fn list_cached() -> Vec<(String, PathBuf, u64)> {
     for entry in read_dir.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("lbc") {
-            let stem = path.file_stem()
+            let stem = path
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_owned();
@@ -229,7 +230,10 @@ mod tests {
             Some(val) => std::env::set_var("LUMEN_CACHE_DIR", val),
             None => std::env::remove_var("LUMEN_CACHE_DIR"),
         }
-        assert_eq!(path, PathBuf::from("/tmp/lumen-test-cache/qwen3-5-9b-Q8_0.lbc"));
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/lumen-test-cache/qwen3-5-9b-Q8_0.lbc")
+        );
     }
 
     #[test]

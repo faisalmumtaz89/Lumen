@@ -63,7 +63,10 @@ fn f32_to_f16_bits(val: f32) -> u16 {
 /// de-interleaved layout: lo nibble of byte i = element i, hi nibble = element
 /// i+16. Scale at offset +0..1 (f16 little-endian), nibbles at +2..17.
 fn encode_q4_raw(values: &[f32]) -> Vec<u8> {
-    assert!(values.len() % Q4_BLOCK == 0, "encoder requires whole blocks");
+    assert!(
+        values.len() % Q4_BLOCK == 0,
+        "encoder requires whole blocks"
+    );
     let n_blocks = values.len() / Q4_BLOCK;
     let mut out = vec![0u8; n_blocks * Q4_RAW_BYTES];
     for b in 0..n_blocks {
@@ -143,7 +146,8 @@ fn run_split_vs_raw(out_dim: usize, in_dim: usize, seed: u64, tol: f32) {
 
     // --- Build random weights as Q4Raw bytes on the host. ---
     let mut rng = seed;
-    let mut weight_bytes: Vec<u8> = Vec::with_capacity(out_dim * (in_dim / Q4_BLOCK) * Q4_RAW_BYTES);
+    let mut weight_bytes: Vec<u8> =
+        Vec::with_capacity(out_dim * (in_dim / Q4_BLOCK) * Q4_RAW_BYTES);
     for _ in 0..out_dim {
         let row: Vec<f32> = (0..in_dim).map(|_| lcg_next_f32(&mut rng)).collect();
         weight_bytes.extend_from_slice(&encode_q4_raw(&row));

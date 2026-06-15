@@ -82,10 +82,7 @@ fn encode_q8_0(values: &[f32]) -> Vec<u8> {
         let end = (start + 32).min(values.len());
         let block_values = &values[start..end];
 
-        let amax = block_values
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0f32, f32::max);
+        let amax = block_values.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
 
         let scale = if amax == 0.0 { 0.0 } else { amax / 127.0 };
         let inv_scale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
@@ -150,8 +147,8 @@ fn cpu_matvec_q8_0(weight_bytes: &[u8], x: &[f32], out_dim: usize, in_dim: usize
 
         for b in 0..blocks_per_row {
             let block_start = row_start + b * 34;
-            let scale_bits = (weight_bytes[block_start] as u16)
-                | ((weight_bytes[block_start + 1] as u16) << 8);
+            let scale_bits =
+                (weight_bytes[block_start] as u16) | ((weight_bytes[block_start + 1] as u16) << 8);
             let scale = f16_bits_to_f32_cpu(scale_bits);
 
             let base_idx = b * 32;
@@ -186,7 +183,9 @@ fn test_cuda_matvec_q8_0_v3_small() {
 
     let src = lumen_runtime::cuda::shaders::MATVEC_Q8_0_V3_KERNEL_SOURCE;
     let ptx = compile_ptx(src).expect("NVRTC compile failed for matvec_q8_0_v3.cu");
-    let module = ctx.load_module(ptx).expect("Failed to load matvec_q8_0_v3 module");
+    let module = ctx
+        .load_module(ptx)
+        .expect("Failed to load matvec_q8_0_v3 module");
     let func = module
         .load_function("matvec_q8_0_v3")
         .expect("Failed to load matvec_q8_0_v3");
@@ -196,7 +195,9 @@ fn test_cuda_matvec_q8_0_v3_small() {
 
     let weight_f32: Vec<Vec<f32>> = vec![
         (0..32).map(|i| (i as f32 + 1.0) * 0.25).collect(),
-        (0..32).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect(),
+        (0..32)
+            .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
+            .collect(),
         {
             let mut v = vec![0.0f32; 32];
             v[0] = 1.0;
@@ -613,10 +614,10 @@ fn bench_kernel_matvec_q8_0_v1_vs_v3() {
 
     // Test multiple matrix sizes to understand scaling behavior.
     let sizes: Vec<(usize, usize)> = vec![
-        (4096, 4096),   // typical hidden_dim for 7B models
-        (11008, 4096),  // FFN gate/up for Llama 7B
-        (4096, 11008),  // FFN down for Llama 7B
-        (32000, 4096),  // output projection (vocab_size x hidden_dim)
+        (4096, 4096),  // typical hidden_dim for 7B models
+        (11008, 4096), // FFN gate/up for Llama 7B
+        (4096, 11008), // FFN down for Llama 7B
+        (32000, 4096), // output projection (vocab_size x hidden_dim)
     ];
 
     let (ctx, stream) = create_context();
@@ -672,40 +673,34 @@ fn bench_kernel_matvec_q8_0_v1_vs_v3() {
         let cfg = q8_launch_config(out_dim as u32);
 
         // Benchmark v1
-        let (v1_us, v1_elapsed) = bench_kernel_loop(
-            &stream, 100, iterations,
-            || {
-                unsafe {
-                    stream
-                        .launch_builder(&func_v1)
-                        .arg(&w_gpu)
-                        .arg(&x_gpu)
-                        .arg(&mut out_v1)
-                        .arg(&(out_dim as u32))
-                        .arg(&(in_dim as u32))
-                        .launch(cfg)
-                }
-                .unwrap();
-            },
-        );
+        let (v1_us, v1_elapsed) = bench_kernel_loop(&stream, 100, iterations, || {
+            unsafe {
+                stream
+                    .launch_builder(&func_v1)
+                    .arg(&w_gpu)
+                    .arg(&x_gpu)
+                    .arg(&mut out_v1)
+                    .arg(&(out_dim as u32))
+                    .arg(&(in_dim as u32))
+                    .launch(cfg)
+            }
+            .unwrap();
+        });
 
         // Benchmark v3
-        let (v3_us, v3_elapsed) = bench_kernel_loop(
-            &stream, 100, iterations,
-            || {
-                unsafe {
-                    stream
-                        .launch_builder(&func_v3)
-                        .arg(&w_gpu)
-                        .arg(&x_gpu)
-                        .arg(&mut out_v3)
-                        .arg(&(out_dim as u32))
-                        .arg(&(in_dim as u32))
-                        .launch(cfg)
-                }
-                .unwrap();
-            },
-        );
+        let (v3_us, v3_elapsed) = bench_kernel_loop(&stream, 100, iterations, || {
+            unsafe {
+                stream
+                    .launch_builder(&func_v3)
+                    .arg(&w_gpu)
+                    .arg(&x_gpu)
+                    .arg(&mut out_v3)
+                    .arg(&(out_dim as u32))
+                    .arg(&(in_dim as u32))
+                    .launch(cfg)
+            }
+            .unwrap();
+        });
 
         // Memory traffic: read Q8_0 weight + read x (f32) + write out (f32)
         let bytes_per_op = total_bytes + in_dim * 4 + out_dim * 4;
@@ -731,7 +726,9 @@ fn bench_kernel_matvec_q8_0_v1_vs_v3() {
         assert!(
             max_diff < 1e-3,
             "v1 vs v3 mismatch for {}x{}: max_diff={}",
-            out_dim, in_dim, max_diff
+            out_dim,
+            in_dim,
+            max_diff
         );
     }
 
@@ -761,11 +758,7 @@ fn bench_kernel_matvec_q8_0_v1_vs_v3() {
 fn bench_kernel_q8_0_roofline() {
     let iterations = env_usize("LUMEN_BENCH_ITERATIONS", 10000);
 
-    let sizes: Vec<(usize, usize)> = vec![
-        (4096, 4096),
-        (11008, 4096),
-        (4096, 11008),
-    ];
+    let sizes: Vec<(usize, usize)> = vec![(4096, 4096), (11008, 4096), (4096, 11008)];
 
     let (ctx, stream) = create_context();
 
@@ -788,8 +781,8 @@ fn bench_kernel_q8_0_roofline() {
     eprintln!("  {}", "-".repeat(72));
 
     // A10G theoretical limits (adjust for your GPU).
-    let peak_bw_gb_s = 600.0;    // GB/s HBM bandwidth
-    let peak_flops = 31.2e12;     // FP32 peak FLOPS
+    let peak_bw_gb_s = 600.0; // GB/s HBM bandwidth
+    let peak_flops = 31.2e12; // FP32 peak FLOPS
 
     for &(out_dim, in_dim) in &sizes {
         let blocks_per_row = (in_dim + 31) / 32;
@@ -819,22 +812,19 @@ fn bench_kernel_q8_0_roofline() {
 
         let cfg = q8_launch_config(out_dim as u32);
 
-        let (measured_us, _) = bench_kernel_loop(
-            &stream, 100, iterations,
-            || {
-                unsafe {
-                    stream
-                        .launch_builder(&func)
-                        .arg(&w_gpu)
-                        .arg(&x_gpu)
-                        .arg(&mut out_gpu)
-                        .arg(&(out_dim as u32))
-                        .arg(&(in_dim as u32))
-                        .launch(cfg)
-                }
-                .unwrap();
-            },
-        );
+        let (measured_us, _) = bench_kernel_loop(&stream, 100, iterations, || {
+            unsafe {
+                stream
+                    .launch_builder(&func)
+                    .arg(&w_gpu)
+                    .arg(&x_gpu)
+                    .arg(&mut out_gpu)
+                    .arg(&(out_dim as u32))
+                    .arg(&(in_dim as u32))
+                    .launch(cfg)
+            }
+            .unwrap();
+        });
 
         // Bandwidth limit: time to transfer all data at peak bandwidth.
         let total_bytes = total_weight_bytes + in_dim * 4 + out_dim * 4;
@@ -853,8 +843,7 @@ fn bench_kernel_q8_0_roofline() {
 
         eprintln!(
             "  {:>5}x{:<5}  {:>10.3}  {:>10.3}  {:>10.3}  {:>9.1}%  {:>12}",
-            out_dim, in_dim, measured_us, bw_limit_us, compute_limit_us,
-            bw_utilization, bottleneck
+            out_dim, in_dim, measured_us, bw_limit_us, compute_limit_us, bw_utilization, bottleneck
         );
     }
 

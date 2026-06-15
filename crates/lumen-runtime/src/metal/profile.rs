@@ -84,7 +84,11 @@ pub(crate) fn init_from_env() {
     }
     // Commit-all-wait-once deferred census: removes the
     // per-CB wait that injects bogus GPU idle into the split census.
-    if std::env::var("LUMEN_METAL_PROFILE_GDN_DEFER").ok().as_deref() == Some("1") {
+    if std::env::var("LUMEN_METAL_PROFILE_GDN_DEFER")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         set_enabled(true);
         PROFILE_GDN_ENABLED.store(true, Ordering::Relaxed);
         DEFER_ENABLED.store(true, Ordering::Relaxed);
@@ -242,7 +246,10 @@ pub(crate) fn record_section_end() {
         return;
     }
     let elapsed = LAST_MARK.with(|m| {
-        m.borrow_mut().take().map(|t| t.elapsed()).unwrap_or_default()
+        m.borrow_mut()
+            .take()
+            .map(|t| t.elapsed())
+            .unwrap_or_default()
     });
     let label = IN_FLIGHT_SECTION.with(|s| *s.borrow());
     ACCUM.with(|a| {
@@ -274,11 +281,8 @@ pub(crate) fn reset_accum() {
 /// `(label, total_gpu_seconds, call_count)`.
 pub(crate) fn gpu_snapshot() -> Vec<(&'static str, f64, u64)> {
     GPU_ACCUM.with(|a| {
-        let mut v: Vec<(&'static str, f64, u64)> = a
-            .borrow()
-            .iter()
-            .map(|(k, (d, n))| (*k, *d, *n))
-            .collect();
+        let mut v: Vec<(&'static str, f64, u64)> =
+            a.borrow().iter().map(|(k, (d, n))| (*k, *d, *n)).collect();
         v.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
         v
     })
@@ -288,11 +292,8 @@ pub(crate) fn gpu_snapshot() -> Vec<(&'static str, f64, u64)> {
 /// `(label, total_duration, call_count)`.
 pub(crate) fn snapshot() -> Vec<(&'static str, Duration, u64)> {
     ACCUM.with(|a| {
-        let mut v: Vec<(&'static str, Duration, u64)> = a
-            .borrow()
-            .iter()
-            .map(|(k, (d, n))| (*k, *d, *n))
-            .collect();
+        let mut v: Vec<(&'static str, Duration, u64)> =
+            a.borrow().iter().map(|(k, (d, n))| (*k, *d, *n)).collect();
         v.sort_by(|x, y| y.1.cmp(&x.1));
         v
     })
@@ -347,7 +348,9 @@ pub(crate) fn print_report() {
     let gsnap = gpu_snapshot();
     if !gsnap.is_empty() {
         let gtotal: f64 = gsnap.iter().map(|(_, d, _)| *d).sum();
-        eprintln!("===== Metal prefill per-section GPU-TIME census (GPUEndTime-GPUStartTime) =====");
+        eprintln!(
+            "===== Metal prefill per-section GPU-TIME census (GPUEndTime-GPUStartTime) ====="
+        );
         eprintln!(
             "{:<40} {:>12} {:>10} {:>9} {:>12}",
             "section", "gpu_total_ms", "calls", "% gpu", "gpu_ms/call"
@@ -355,7 +358,11 @@ pub(crate) fn print_report() {
         eprintln!("{}", "-".repeat(86));
         for (label, gsec, n) in &gsnap {
             let ms = gsec * 1000.0;
-            let pct = if gtotal > 0.0 { (gsec / gtotal) * 100.0 } else { 0.0 };
+            let pct = if gtotal > 0.0 {
+                (gsec / gtotal) * 100.0
+            } else {
+                0.0
+            };
             let per_call = if *n > 0 { ms / *n as f64 } else { 0.0 };
             eprintln!(
                 "{:<40} {:>12.3} {:>10} {:>8.2}% {:>12.4}",
