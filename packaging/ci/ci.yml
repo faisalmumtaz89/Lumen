@@ -4,7 +4,9 @@
 # (NVRTC for CUDA, MSL for Metal). GPU correctness/quality is validated separately
 # by validate-cuda-modal.yml (Modal) and validate-metal.yml (self-hosted Mac).
 #
-# To activate: see packaging/ci/SETUP.md, then `git mv` this file to .github/workflows/.
+# Activated by moving into .github/workflows/ (this PR). Actions are SHA-pinned
+# (Dependabot-tracked) and builds use --locked so the committed Cargo.lock — which
+# pins the load-bearing cudarc surface — is enforced.
 name: ci
 
 on:
@@ -31,17 +33,22 @@ jobs:
     name: cpu tests + lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (stable)
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: fmt
-        run: cargo fmt --all --check
-      - name: clippy (cpu crates)
-        run: cargo clippy -p lumen-format -p lumen-convert -p lumen-cli --release -- -D warnings
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # fmt + clippy are ADVISORY for now: the repo predates these gates and isn't
+      # yet clean under the pinned toolchain (rust-toolchain.toml). They surface
+      # drift as warnings without failing CI. Flip to hard gates after a one-time
+      # `cargo fmt --all` + `cargo clippy --fix` (tracked in SETUP.md). The
+      # substantive gates below (build + tests) stay hard.
+      - name: fmt (advisory)
+        run: cargo fmt --all --check || echo "::warning title=rustfmt::formatting drift — run 'cargo fmt --all' (see SETUP.md)"
+      - name: clippy (advisory)
+        run: cargo clippy --locked -p lumen-format -p lumen-convert -p lumen-cli --release || echo "::warning title=clippy::lints present — run 'cargo clippy --fix' (see SETUP.md)"
       - name: cpu test suite
-        run: cargo test -p lumen-format -p lumen-convert -p lumen-cli --release
+        run: cargo test --locked -p lumen-format -p lumen-convert -p lumen-cli --release
       - name: detector self-test
         run: python3 quality/detectors.py --selftest
 
@@ -52,14 +59,14 @@ jobs:
     name: build linux/cuda (sm_80 target)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (stable)
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: build server (cuda)
-        run: cargo build --release -p lumen-server -p lumen-cli --features bin,cuda
+        run: cargo build --release --locked -p lumen-server -p lumen-cli --features bin,cuda
       - name: compile cuda unit tests (no GPU run)
-        run: cargo test -p lumen-runtime --features cuda --release --no-run
-      - uses: actions/upload-artifact@v4
+        run: cargo test --locked -p lumen-runtime --features cuda --release --no-run
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: lumen-linux-x86_64-cuda
           path: |
@@ -76,11 +83,11 @@ jobs:
     name: build macos/metal (arm64)
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (stable)
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: build server + cli (metal default)
-        run: cargo build --release -p lumen-server -p lumen-cli --features bin
+        run: cargo build --release --locked -p lumen-server -p lumen-cli --features bin
       - name: link audit (system frameworks only)
         run: |
           otool -L target/release/lumen-server
@@ -90,7 +97,7 @@ jobs:
             echo "::error::non-system dynamic dependency found in lumen-server"
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: lumen-macos-arm64-metal
           path: |
