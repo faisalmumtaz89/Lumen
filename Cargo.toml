@@ -9,6 +9,54 @@ members = [
     "crates/lumen-server",
 ]
 
+# Clippy policy (deliberate, reviewed 2026-06-15): deny everything by default, then
+# ALLOW a curated set of pre-existing style/complexity/perf lints that are pervasive
+# in the GPU/tensor engine and not worth churning hot numeric paths for. NOTE:
+# `manual_div_ceil` is allowed because clippy itself refuses to auto-fix it — the
+# overflow semantics of `(a+b-1)/b` differ from `div_ceil`, so converting 200+ grid-
+# size computations would be a behaviour risk, not a cleanup. Correctness + suspicious
+# lints are NOT allowed, so the gate still catches real bugs (e.g. self_assignment +
+# identity_op were found and fixed in this PR). Crates opt in via `[lints] workspace = true`.
+[workspace.lints.rust]
+# `stacks_dump` is an opt-in diagnostic cfg (lumen-server tests/server_soak.rs),
+# enabled via RUSTFLAGS='--cfg stacks_dump'; declare it so default builds are clean.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(stacks_dump)'] }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+# complexity / style in numeric + GPU-dispatch code
+manual_div_ceil = "allow"
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+unnecessary_unwrap = "allow"
+manual_clamp = "allow"
+blocks_in_conditions = "allow"
+manual_flatten = "allow"
+unnecessary_cast = "allow"
+needless_update = "allow"
+nonminimal_bool = "allow"
+overly_complex_bool_expr = "allow"
+needless_lifetimes = "allow"
+let_unit_value = "allow"
+if_same_then_else = "allow"
+collapsible_if = "allow"
+collapsible_else_if = "allow"
+op_ref = "allow"
+needless_borrow = "allow"
+match_like_matches_macro = "allow"
+map_entry = "allow"
+manual_memcpy = "allow"
+manual_contains = "allow"
+iter_cloned_collect = "allow"
+explicit_counter_loop = "allow"
+derivable_impls = "allow"
+clone_on_copy = "allow"
+# doc-formatting nits introduced by clippy 1.93
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+empty_line_after_doc_comments = "allow"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

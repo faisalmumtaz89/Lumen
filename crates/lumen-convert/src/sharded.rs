@@ -216,10 +216,7 @@ impl From<GgufError> for ShardError {
 
 impl From<ShardError> for ConvertError {
     fn from(e: ShardError) -> Self {
-        ConvertError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
+        ConvertError::Io(std::io::Error::other(e.to_string()))
     }
 }
 

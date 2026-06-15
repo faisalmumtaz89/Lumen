@@ -189,10 +189,8 @@ mod inner {
         let size = get_remote_size(&url)?;
 
         // Confirm with user unless --yes was passed.
-        if !skip_confirm {
-            if !confirm_download(repo, filename, size)? {
-                return Err(DownloadError::UserDeclined);
-            }
+        if !skip_confirm && !confirm_download(repo, filename, size)? {
+            return Err(DownloadError::UserDeclined);
         }
 
         // Ensure dest dir exists.

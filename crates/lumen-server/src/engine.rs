@@ -2007,10 +2007,7 @@ impl Tokenize for IdentityByteTokenizer {
         state.push((token_id & 0xff) as u8);
         // Try to take the longest UTF-8 prefix.
         match std::str::from_utf8(state) {
-            Ok(_) => {
-                let s = String::from_utf8(std::mem::take(state)).unwrap_or_default();
-                s
-            }
+            Ok(_) => String::from_utf8(std::mem::take(state)).unwrap_or_default(),
             Err(e) => {
                 let valid = e.valid_up_to();
                 if valid == 0 {

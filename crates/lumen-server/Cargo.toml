@@ -7,11 +7,6 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[lints.rust]
-# `stacks_dump` is an opt-in diagnostic cfg (see tests/server_soak.rs), enabled via
-# `RUSTFLAGS='--cfg stacks_dump'`; declare it so the default build is warning-clean.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(stacks_dump)'] }
-
 [features]
 default = []
 cuda = ["lumen-runtime/cuda"]
@@ -66,3 +61,6 @@ lumen-convert.workspace = true
 # tests/server_memory_breakdown.rs). The lumen-server library itself does
 # NOT depend on mimalloc so external consumers stay allocator-agnostic.
 mimalloc = { workspace = true }
+
+[lints]
+workspace = true

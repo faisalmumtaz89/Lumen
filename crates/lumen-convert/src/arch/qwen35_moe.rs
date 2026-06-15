@@ -552,7 +552,7 @@ fn compute_layer_shape_qwen35moe(
                 n_elements % 32 == 0,
                 "Q4_0 requires elements divisible by 32, got {n_elements} for {name}"
             );
-            let q4_size = (n_elements as u64 / 32) * 18;
+            let q4_size = (n_elements / 32) * 18;
             let slice = TensorSlice {
                 offset: *blob_offset,
                 length: q4_size,

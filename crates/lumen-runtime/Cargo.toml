@@ -39,3 +39,6 @@ libc = "0.2"
 # reintroduce the startup crash. CI builds with `cargo build --locked`. Dependabot
 # tracks this so a bump is a reviewed PR (and re-validated on the Modal matrix).
 cudarc = { version = "=0.19.3", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "f16", "fallback-dynamic-loading", "cuda-12020"], optional = true }
+
+[lints]
+workspace = true

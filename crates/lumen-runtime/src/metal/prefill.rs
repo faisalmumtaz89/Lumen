@@ -480,7 +480,7 @@ impl MetalF32Backend {
                     if k_idx + 1 == k {
                         num_layers
                     } else {
-                        (k_idx + 1) * base + 0
+                        (k_idx + 1) * base
                     }
                 };
                 // Track the queue of in-flight CBs we still hold a handle to.
