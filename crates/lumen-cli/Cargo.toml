@@ -24,7 +24,7 @@ lumen-bench.workspace = true
 regex = "1"
 fancy-regex = "0.14"
 unicode-normalization = "0.1"
-toml = "0.8"
+toml = "1.1"
 ureq = { version = "2", features = ["json"], optional = true }
 indicatif = { version = "0.17", optional = true }
 dirs = { version = "6", optional = true }
