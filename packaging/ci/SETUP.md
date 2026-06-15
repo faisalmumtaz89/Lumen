@@ -104,3 +104,10 @@ Metal is intentionally *not* a required PR check (self-hosted; runs post-merge o
   *correctness* is the manual gold-standard quality suite, not CI.
 - **Supply-chain provenance.** Actions are SHA-pinned + Dependabot-tracked; image
   signing / SLSA attestation is a later add.
+- **Lint/format gates are advisory.** `rust-toolchain.toml` pins rustc/rustfmt/
+  clippy to 1.93.1 (deterministic — was a floating `@stable`), but the repo predates
+  the fmt/clippy CI gates and isn't yet clean under it (172 fmt diffs, ~306 clippy
+  lints). `ci.yml`'s `fmt`/`clippy` steps therefore **warn** instead of failing; the
+  build + test steps are hard gates. To make style a hard gate: on the pinned
+  toolchain run `cargo fmt --all` and `cargo clippy --fix --allow-dirty -- -D warnings`,
+  commit the (mechanical) result, then drop the `|| echo …` from those two steps.

@@ -1,0 +1,7 @@
+# Pin the toolchain so rustc / rustfmt / clippy are DETERMINISTIC across the build
+# hosts and CI (was floating `dtolnay/rust-toolchain@stable`, which drifts the
+# compiler + lint set between commits — flagged by the CI audit as a reproducibility
+# gap). Bump deliberately (and re-validate on the Modal matrix), not implicitly.
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy"]
