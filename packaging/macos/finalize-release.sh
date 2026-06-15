@@ -45,6 +45,11 @@ EOF
 tar -C "$(dirname "$stage")" -czf "dist/lumen-${TAG}-linux-x86_64-cuda.tar.gz" "$(basename "$stage")"
 ( cd dist && shasum -a 256 "lumen-${TAG}-linux-x86_64-cuda.tar.gz" > "lumen-${TAG}-linux-x86_64-cuda.tar.gz.sha256" )
 
+# Tag-less Linux alias so `releases/latest/download/lumen-linux-x86_64-cuda.tar.gz`
+# resolves (mirrors the macOS alias in build-tarball.sh) — the installer's stable URL.
+cp "dist/lumen-${TAG}-linux-x86_64-cuda.tar.gz" "dist/lumen-linux-x86_64-cuda.tar.gz"
+( cd dist && shasum -a 256 "lumen-linux-x86_64-cuda.tar.gz" > "lumen-linux-x86_64-cuda.tar.gz.sha256" )
+
 # ── Filled Homebrew formula (from the macOS tarball that will ship) ───────────
 mac_tb="lumen-${TAG}-macos-arm64-metal.tar.gz"
 [ -f "dist/$mac_tb" ] || { echo "error: dist/$mac_tb missing (build-macos artifact not downloaded?)" >&2; exit 1; }

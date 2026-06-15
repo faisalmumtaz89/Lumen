@@ -1,24 +1,30 @@
 # Getting Started with Lumen
 
-Lumen runs **LLM inference in Rust, for Apple Silicon and NVIDIA CUDA**. Built from scratch with zero ML dependencies — no PyTorch, no ONNX, no Python runtime. v1 (current) ships verified-against-llama.cpp support for **Qwen3.5-9B** and **Qwen3.5-MoE 35B-A3B**; additional model families are planned.
+Lumen runs **LLM inference in Rust, for Apple Silicon and NVIDIA CUDA**. Built from scratch with zero ML dependencies — no PyTorch, no ONNX, no Python runtime. v1 (current) ships verified support for **Qwen3.5-9B**, **Qwen3.6-27B**, and **Qwen3.5-MoE 35B-A3B**; additional model families are planned.
 
 This page is the 5-minute path: install, pull a model, run inference. The Qwen3.5 examples below reflect what is currently shipped end-to-end — more model families coming.
 
 ## 1. Install
 
-Pick the line for your machine.
+**Fastest — pre-built binary (no toolchain).** Detects your platform (macOS → Metal, Linux x86_64 + NVIDIA → CUDA), installs `lumen` + `lumen-server`, and helps you set up a model:
 
 ```bash
-# NVIDIA Linux (CUDA backend)
-cargo install --path crates/lumen-cli --features cuda
-
-# Apple Silicon macOS (Metal backend — auto-detected)
-cargo install --path crates/lumen-cli
+curl -fsSL https://raw.githubusercontent.com/faisalmumtaz89/Lumen/main/packaging/macos/install.sh | bash
 ```
 
-Requirements:
+**Or build from source** (needs the Rust toolchain):
 
-- Rust 1.75+
+```bash
+# Apple Silicon macOS (Metal backend — auto-detected)
+cargo install --path crates/lumen-cli
+
+# NVIDIA Linux (CUDA backend)
+cargo install --path crates/lumen-cli --features cuda
+```
+
+Requirements (source build):
+
+- Rust (pinned via `rust-toolchain.toml`; `rustup` installs it automatically)
 - CUDA path: an NVIDIA GPU + driver. No build-time CUDA SDK needed — kernels compile at runtime via NVRTC.
 - Metal path: macOS on Apple Silicon. No extra deps.
 
@@ -39,12 +45,12 @@ lumen pull qwen3.5-moe-35b-a3b:q4_0
 
 `lumen models` lists everything cached and everything available. The model registry source-of-truth is `model_registry.toml`. Unsupported `(model, quant)` combinations are rejected with a clear error listing available alternatives.
 
-Need Qwen3.5-9B at Q4_0 (not in the registry today)? Derive it from the Q8_0 source: `lumen convert --input <gguf> --output <lbc> --requant q4_0`. See [`docs/cli.md`](cli.md) for convert options.
+All three `qwen3.5-9b` quants (Q8_0, Q4_0, BF16) are in the registry and auto-download. To re-quantize a custom GGUF/LBC for a different target, use `lumen convert --input <gguf> --output <lbc> --requant q4_0`. See [`docs/cli.md`](cli.md) for convert options.
 
 ## 3. Run inference
 
 ```bash
-# Default sampling: temperature 0.8 with a random seed — output varies each run.
+# Default sampling: temperature 0.7 with a random seed — output varies each run.
 # For reproducible output add `--seed <n>`; for greedy/argmax use `--temperature 0`.
 lumen run qwen3.5-9b:q8_0 "Write a haiku about Rust"
 

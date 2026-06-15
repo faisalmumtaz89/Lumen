@@ -18,7 +18,7 @@ The canonical, always-up-to-date reference is `lumen run --help` (printed by [`c
 |------|-------------|
 | `--system <text>` | System prompt |
 | `--max-tokens <n>` | Tokens to generate (default: unlimited, stops at EOS) |
-| `--temperature <f>` | Sampling temperature (0 = greedy, default 0.8) |
+| `--temperature <f>` | Sampling temperature (0 = greedy, default 0.7) |
 | `--top-p` / `--top-k` / `--min-p` | Nucleus / top-K / min-prob cutoffs |
 | `--repetition-penalty` / `--presence-penalty` / `--frequency-penalty` | Sampling penalties |
 | `--seed <n>` | Sampling seed (default: random each run; set a fixed value for reproducible output) |
