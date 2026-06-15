@@ -5,7 +5,7 @@
 # formula. Run by release.yml's publish-release job (after validation is green).
 #
 # Inputs (set up by the workflow):
-#   $TAG          git tag, e.g. v1.0.0 or b1234
+#   $TAG          git tag, e.g. v1.0.0 or v1.2.0-rc.1
 #   dist/         macOS arm64 tarball + .sha256 (downloaded build-macos artifact)
 #   linux-bins/   lumen, lumen-server (downloaded, validated Linux/CUDA binaries)
 #

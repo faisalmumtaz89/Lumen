@@ -5,7 +5,9 @@ All notable changes to Lumen are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 `0.1.0` is published.
 
-## [Unreleased] — pre-`0.1.0`
+## [Unreleased]
+
+## [0.1.0] — 2026-06-15
 
 ### Production-ready (2026-06-02)
 
@@ -60,4 +62,5 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[Unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/main...HEAD
+[Unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/faisalmumtaz89/Lumen/releases/tag/v0.1.0
