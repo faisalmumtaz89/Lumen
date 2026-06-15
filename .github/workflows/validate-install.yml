@@ -1,0 +1,51 @@
+# On-demand: run Lumen's REAL one-command installer (curl … | bash) in a clean
+# Linux + NVIDIA Modal container and validate it end-to-end — detect CUDA →
+# download the released binary → verify SHA-256 → install → pull a model → run on
+# the GPU (DET-001 + coherence) — plus a no-GPU refusal check. Driven from a
+# hosted runner that holds the Modal token (same model as validate-cuda-modal.yml;
+# the token never lives on a self-hosted box).
+#
+#   gh workflow run validate-install.yml --ref <branch> -f ref=<branch>
+name: validate-install
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch/ref whose packaging/macos/install.sh to test'
+        required: true
+        default: install-onboarder
+
+permissions:
+  contents: read
+
+jobs:
+  install-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: guard — secrets present
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "::error::MODAL_TOKEN_ID / MODAL_TOKEN_SECRET not set"; exit 1
+          fi
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: install modal
+        run: pip install 'modal~=1.4'
+      - name: run install-test on Modal
+        env:
+          REF: ${{ github.event.inputs.ref }}
+        run: |
+          set -o pipefail
+          modal run packaging/modal/install_test.py --ref "$REF" | tee install-validation.log
+      - name: stop modal app
+        if: always()
+        run: modal app stop lumen-install-test 2>/dev/null || true
+      - name: gate
+        run: grep -q "INSTALL VALIDATION PASSED" install-validation.log || { echo "::error::install validation FAILED"; exit 1; }
