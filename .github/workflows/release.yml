@@ -1,4 +1,4 @@
-# Release: on a `b<N>` or `v<X.Y.Z>` tag, build the shippable binaries ONCE, then
+# Release: on a SemVer `v<X.Y.Z>` tag (or a `v<X.Y.Z>-rc.N` pre-release), build the shippable binaries ONCE, then
 # validate those EXACT bytes on real hardware, then publish ONLY if validation is
 # green. Artifacts are promoted (downloaded + reused), never independently rebuilt —
 # so "what ships" is provably "what was validated".
@@ -17,7 +17,7 @@ name: release
 
 on:
   push:
-    tags: ['b*', 'v*']
+    tags: ['v*']   # SemVer only: v<X.Y.Z> ships; v<X.Y.Z>-rc.N is a pre-release dry-run (see RELEASING.md)
 
 # Least-privilege at the top; only the publish jobs widen their own scope.
 permissions:
@@ -158,6 +158,10 @@ jobs:
         run: bash packaging/macos/finalize-release.sh
       - uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
+          # A tag with a hyphen (v0.1.0-rc.1) is a SemVer pre-release: mark it as a
+          # GitHub prerelease so it does NOT become "Latest release" — which keeps the
+          # install.sh / Homebrew `latest` channel pinned to the last final release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
@@ -195,8 +199,9 @@ jobs:
           # Context = packaging/modal so the Dockerfile's `COPY bin/...` resolves.
           docker build -t "${img}:${GITHUB_REF_NAME}" packaging/modal
           docker push "${img}:${GITHUB_REF_NAME}"
-          # Move :latest only on SemVer (v*) tags, not dev b<N> tags.
-          if [[ "${GITHUB_REF_NAME}" == v* ]]; then
+          # Move :latest only on a FINAL release — a pre-release tag (v0.1.0-rc.1,
+          # contains a hyphen) publishes its versioned image but must not steal :latest.
+          if [[ "${GITHUB_REF_NAME}" != *-* ]]; then
             docker tag "${img}:${GITHUB_REF_NAME}" "${img}:latest"
             docker push "${img}:latest"
           fi

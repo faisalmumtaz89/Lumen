@@ -12,9 +12,11 @@
 # the binary (sub-second). There is NO separate .metallib or shader directory to
 # ship — the binaries are self-contained.
 #
-# Usage:
-#   packaging/macos/build-tarball.sh            # tag = b<git-rev-count>
+# Usage (local dev build):
+#   packaging/macos/build-tarball.sh            # tag = b<git-rev-count> (local only)
 #   LUMEN_TAG=v1.0.0 packaging/macos/build-tarball.sh
+# Releases are cut by pushing a v<X.Y.Z> tag; release.yml sets LUMEN_TAG to the tag.
+# See RELEASING.md.
 #
 set -euo pipefail
 
