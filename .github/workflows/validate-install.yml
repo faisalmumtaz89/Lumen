@@ -9,6 +9,15 @@
 name: validate-install
 
 on:
+  # Branch push (scoped) so this can run before it ever reaches the default branch
+  # — workflow_dispatch only works from the default branch. Tighten/remove the push
+  # trigger when finalizing (workflow_dispatch + release are the long-term triggers).
+  push:
+    branches: [install-onboarder]
+    paths:
+      - 'packaging/macos/install.sh'
+      - 'packaging/modal/install_test.py'
+      - '.github/workflows/validate-install.yml'
   workflow_dispatch:
     inputs:
       ref:
@@ -40,7 +49,7 @@ jobs:
         run: pip install 'modal~=1.4'
       - name: run install-test on Modal
         env:
-          REF: ${{ github.event.inputs.ref }}
+          REF: ${{ github.event.inputs.ref || github.ref_name }}
         run: |
           set -o pipefail
           modal run packaging/modal/install_test.py --ref "$REF" | tee install-validation.log
