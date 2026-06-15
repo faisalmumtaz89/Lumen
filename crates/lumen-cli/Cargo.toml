@@ -28,7 +28,7 @@ toml = "0.8"
 ureq = { version = "2", features = ["json"], optional = true }
 indicatif = { version = "0.17", optional = true }
 dirs = { version = "6", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 # global allocator (declared in src/main.rs). Targets macOS
 # libmalloc fragmentation that surfaced under sustained server-style
 # load. Compatible with all other crate deps.
