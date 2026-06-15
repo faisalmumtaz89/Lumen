@@ -236,7 +236,7 @@ def _run_validation(gpu_name: str) -> dict:
         result["errors"].append(f"timeout waiting for listening ({timeout_s}s)")
         return None, None
 
-    def http_complete(prompt: str, max_tokens: int = 24, temperature: float = 0.0):
+    def http_complete(prompt: str, max_tokens: int = 24, temperature: float = 0.0, retries: int = 2):
         body = json.dumps({
             "model": "lumen",
             "messages": [{"role": "user", "content": prompt}],
@@ -250,9 +250,19 @@ def _run_validation(gpu_name: str) -> dict:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=120) as r:
-            data = json.loads(r.read().decode())
-        return data["choices"][0]["message"]["content"]
+        # Retry transient transport errors (a dropped read, a blip during warmup)
+        # so infra noise isn't scored as a regression. Determinism is unaffected:
+        # a temp-0 request returns identical content on retry.
+        last = None
+        for attempt in range(retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    return json.loads(r.read().decode())["choices"][0]["message"]["content"]
+            except Exception as e:  # noqa: BLE001
+                last = e
+                if attempt < retries:
+                    time.sleep(1.5 * (attempt + 1))
+        raise last
 
     # --- COLD launch (wipe this arch's cache first) --------------------------
     log("COLD launch (wiping PTX cache for this arch) ...")
@@ -274,10 +284,13 @@ def _run_validation(gpu_name: str) -> dict:
     result["starts"] = True
 
     # --- DET-001 + coherence + decode tok/s (on the cold server) -------------
-    log("DET-001: 20x temp-0 greedy on fixed prompt ...")
+    # N=50 to match the historically observed ~1/50 non-determinism rate (a 20-run
+    # window had ~1/3 chance of missing a 1-in-50 flake).
+    DET_N = 50
+    log(f"DET-001: {DET_N}x temp-0 greedy on fixed prompt ...")
     try:
         det_outputs = []
-        for i in range(20):
+        for i in range(DET_N):
             det_outputs.append(http_complete(DET_PROMPT, max_tokens=16, temperature=0.0).strip())
         result["det001_n"] = len(det_outputs)
         result["det001_distinct"] = len(set(det_outputs))
@@ -365,7 +378,10 @@ def _run_validation(gpu_name: str) -> dict:
 COMMON = dict(
     image=image,
     volumes={"/models": models_vol, "/ptxcache": ptx_vol},
-    timeout=2700,
+    # Tightened from 2700: caps the worst-case bill if a cancelled GitHub job
+    # leaves a detached .spawn() container running. A normal arch finishes in
+    # ~5-10 min (cold compile ~80s + DET-001 N=50 + coherence + warm relaunch).
+    timeout=1500,
 )
 
 
@@ -420,13 +436,18 @@ def main(arches: str = "T4,A10G,L4,A100,H100"):
     want = [a.strip() for a in arches.split(",") if a.strip()]
     print(f"[driver] validating arches: {want}", file=sys.stderr)
 
+    # Fail fast on an empty or unknown arch set. Without this, an all-unknown list
+    # (e.g. a dispatch typo "FOO") would yield an EMPTY results dict that the
+    # verdict loop below would vacuously report as VALIDATION PASSED — a green run
+    # that validated zero GPUs. (Audit BLOCKER: empty-results false-pass.)
+    unknown = [a for a in want if a not in _FN]
+    if not want or unknown:
+        why = "no arches requested" if not want else f"unknown arch(es) {unknown}"
+        print(f"\nVALIDATION FAILED: {why}; known = {sorted(_FN)}")
+        sys.exit(1)
+
     # Launch all requested arches in parallel via .spawn(), then gather.
-    handles = {}
-    for a in want:
-        if a not in _FN:
-            print(f"[driver] unknown arch {a}, skipping", file=sys.stderr)
-            continue
-        handles[a] = _FN[a].spawn()
+    handles = {a: _FN[a].spawn() for a in want}
 
     results = {}
     for a, h in handles.items():
@@ -453,6 +474,19 @@ def main(arches: str = "T4,A10G,L4,A100,H100"):
             and not r.get("fatal")
         )
 
+    # Distinguish a Modal/infrastructure failure (container threw, model copy/
+    # startup timed out — retryable, NOT a code defect) from a genuine binary
+    # REGRESSION (server ran but produced wrong/non-deterministic output). Both
+    # look like a red X otherwise, so a Modal outage gets mistaken for a kernel bug.
+    def fail_kind(r):
+        if r.get("fatal"):
+            return "INFRA"
+        if r.get("starts") is not True and not r.get("kernel_compile_failures"):
+            errs = " ".join(r.get("errors") or []).lower()
+            if any(k in errs for k in ("timeout", "no such", "connection", "modal", "volume", "urlopen")):
+                return "INFRA"
+        return "REGRESSION"
+
     print("\n===== PER-ARCH VERDICT =====")
     all_pass = True
     for a, r in results.items():
@@ -464,12 +498,13 @@ def main(arches: str = "T4,A10G,L4,A100,H100"):
                   f"decode={r.get('decode_tok_s')} tok/s)")
         else:
             why = (r.get("errors") or ([r["fatal"]] if r.get("fatal") else ["unknown"]))[0]
-            print(f"  {a}: FAIL  (starts={r.get('starts')} "
+            print(f"  {a}: FAIL[{fail_kind(r)}]  (starts={r.get('starts')} "
                   f"kernel_compile_failures={len(r.get('kernel_compile_failures') or [])} "
                   f"det001_distinct={r.get('det001_distinct')} coherence_ok={r.get('coherence_ok')})")
             print(f"        reason: {str(why)[:400]}")
 
     if not all_pass:
-        print("\nVALIDATION FAILED")
+        infra_only = all(fail_kind(r) == "INFRA" for r in results.values() if not arch_ok(r))
+        print("\nVALIDATION FAILED" + ("  [INFRA-ONLY — transient, safe to re-run]" if infra_only else ""))
         sys.exit(1)
     print("\nVALIDATION PASSED")
