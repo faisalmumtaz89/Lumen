@@ -50,7 +50,7 @@ fn main() {
         "convert" => convert::convert_cmd(&args[2..]),
         "--help" | "-h" | "help" => help::print_usage(),
         "--version" | "-V" => {
-            println!("lumen {}", env!("CARGO_PKG_VERSION"));
+            println!("lumen {}", option_env!("LUMEN_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")));
         }
         other => {
             eprintln!("Unknown command: {other}");
