@@ -1,5 +1,9 @@
-# Dependabot — keep the SHA-pinned GitHub Actions and Cargo deps fresh via reviewed
-# PRs (each Cargo PR re-runs the CUDA validation, so a risky bump can't merge blind).
+# Dependabot — keep Actions + Cargo deps fresh via reviewed PRs, with low noise.
+# Low-risk minor/patch bumps are grouped into a single PR; known-problematic deps
+# are not auto-proposed (see ignore lists). NOTE: Dependabot PRs run WITHOUT repo
+# secrets, so the Modal GPU validation is skipped on them (see validate-cuda-modal.yml);
+# they still get the full ci.yml build + CPU tests, and the GPU path is re-validated
+# on push-to-main after merge.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -18,7 +22,21 @@ updates:
       interval: weekly
     commit-message:
       prefix: deps
-    # NOTE: cudarc is pinned EXACT (=0.19.3) on purpose — its feature surface is the
-    # fix for the no-SDK startup crash. Dependabot will still open a PR for a newer
-    # cudarc; treat it as load-bearing and re-validate on the full Modal matrix
-    # before merging (do not auto-merge cudarc).
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for all low-risk minor/patch bumps; majors stay individual.
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      # cudarc's feature surface is LOAD-BEARING (the no-SDK startup-crash fix is the
+      # exact cuda-12020 pin). Bump it MANUALLY and re-validate on the full A100
+      # matrix — never auto-PR (even a patch can re-gate symbols).
+      - dependency-name: "cudarc"
+      # These majors need a deliberate API migration (axum 0.8 removed
+      # axum::async_trait; ureq 3 redesigned its API), so don't auto-propose the
+      # breaking bump — do it as a focused, separately-validated PR when ready.
+      - dependency-name: "axum"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "ureq"
+        update-types: ["version-update:semver-major"]
