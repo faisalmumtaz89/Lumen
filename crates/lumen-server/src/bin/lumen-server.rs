@@ -218,7 +218,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                println!("lumen-server {}", env!("CARGO_PKG_VERSION"));
+                println!("lumen-server {}", option_env!("LUMEN_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")));
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}")),

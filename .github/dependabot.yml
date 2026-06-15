@@ -1,0 +1,24 @@
+# Dependabot — keep the SHA-pinned GitHub Actions and Cargo deps fresh via reviewed
+# PRs (each Cargo PR re-runs the CUDA validation, so a risky bump can't merge blind).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
+    # NOTE: cudarc is pinned EXACT (=0.19.3) on purpose — its feature surface is the
+    # fix for the no-SDK startup crash. Dependabot will still open a PR for a newer
+    # cudarc; treat it as load-bearing and re-validate on the full Modal matrix
+    # before merging (do not auto-merge cudarc).
