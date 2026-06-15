@@ -24,4 +24,13 @@ test-fault-injection = []
 lumen-format.workspace = true
 thiserror.workspace = true
 libc = "0.2"
-cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "f16", "fallback-dynamic-loading", "cuda-version-from-build-system", "fallback-latest"], optional = true }
+# CUDA API surface is pinned EXPLICITLY to 12020, not detected from the build
+# system. The shippable binary builds with NO CUDA toolkit (kernels JIT at
+# runtime via NVRTC), so `cuda-version-from-build-system` finds nothing and
+# `fallback-latest` would select the newest surface (cuda-13010) — which eagerly
+# dlsyms symbols like `cuDevSmResourceSplit` that no shipping driver exports (they
+# have `cuDevSmResourceSplitByCount`), aborting the server on startup. 12020
+# matches the CUDA 12.2 runtime (libnvrtc/libcublas) we ship/validate against and
+# is forward-compatible with newer drivers. Bump deliberately if a newer API is
+# ever needed — never go back to build-system detection + fallback-latest.
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "f16", "fallback-dynamic-loading", "cuda-12020"], optional = true }

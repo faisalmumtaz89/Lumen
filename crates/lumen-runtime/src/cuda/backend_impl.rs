@@ -14466,8 +14466,29 @@ impl ComputeBackend for CudaBackend {
         self.embed_q4_0_func = Some(embed_q4_0);
         self.embed_bf16_func = Some(embed_bf16);
 
-        // Compile all decode-path kernels.
+        // Compile all decode-path kernels. With the persistent PTX disk cache
+        // (default ON; `LUMEN_CUDA_PTX_CACHE=0` disables), a warm cache turns
+        // this ~252-module NVRTC compile from a multi-minute cold start into a
+        // sub-second `cuModuleLoadData` sweep. Time it and report cache hits.
+        let kernel_compile_start = std::time::Instant::now();
         let mut kernels = decode::compile_all_kernels(&self.device)?;
+        {
+            let (hits, misses) = super::ptx_cache::stats();
+            let elapsed = kernel_compile_start.elapsed();
+            let state = if !super::ptx_cache::cache_enabled() {
+                "disabled"
+            } else if misses == 0 && hits > 0 {
+                "warm (all cached)"
+            } else if hits == 0 {
+                "cold (all compiled)"
+            } else {
+                "partial"
+            };
+            eprintln!(
+                "[CUDA] kernel compile/load done in {:.3}s -- PTX cache {state}: {hits} hits, {misses} misses",
+                elapsed.as_secs_f64()
+            );
+        }
 
         // Allocate GPU scratch buffers.
         let scratch = GpuScratch {

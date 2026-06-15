@@ -1,0 +1,135 @@
+# CUDA cross-arch validation via Modal (no self-hosted GPU runner needed).
+#
+# A free GitHub-hosted runner holds the Modal token and drives Modal, which spins
+# the real GPUs on demand and runs the validation there (packaging/modal/
+# validate_arches.py). This validates the shippable Linux/CUDA binary on real
+# NVIDIA silicon — run + byte-determinism (DET-001) + coherence + PTX-cache —
+# across compute capabilities, without an always-on exposed GPU box.
+#
+# Cost control: PRs, push-to-main, and manual runs validate ONE arch (A100) as a
+# smoke test; the full sm_75..sm_90 matrix runs only on release tags.
+#
+# PR gating: runs on pull_request too, but ONLY for same-repo branches — the job's
+# `if` skips fork PRs (head repo != this repo), and GitHub withholds secrets from
+# forks anyway, so a fork PR can never spend Modal or see the token. The `paths`
+# filter keeps docs-/tooling-only PRs from spending GPU minutes. (Metal can't do
+# this safely on a self-hosted runner — see validate-metal.yml.)
+#
+# Secrets required (repo Settings -> Secrets -> Actions): MODAL_TOKEN_ID, MODAL_TOKEN_SECRET.
+# To activate: see packaging/ci/SETUP.md, then `git mv` this file to .github/workflows/.
+name: validate-cuda-modal
+
+on:
+  push:
+    branches: [main]
+    tags: ['b*', 'v*']
+  pull_request:
+    branches: [main]
+    # Only spend GPU minutes when the engine or its deps change. Shared runtime
+    # code affects CUDA too, so this is broad on purpose (not just cuda/**).
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'packaging/modal/**'
+      - '.github/workflows/validate-cuda-modal.yml'
+  workflow_dispatch:
+    inputs:
+      arches:
+        description: 'Comma-separated Modal GPUs (default A100). e.g. "T4,A10G,L4,A100,H100"'
+        required: false
+        default: 'A100'
+
+concurrency:
+  group: cuda-modal-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  modal-validate:
+    name: modal cuda validation
+    runs-on: ubuntu-latest
+    # Same-repo events only. Fork PRs (head repo != this repo) are skipped so the
+    # Modal token is never exposed and untrusted code never spends GPU. Non-PR
+    # events (push / tag / manual dispatch) always run.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 90
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: guard — secrets present
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "::error::MODAL_TOKEN_ID / MODAL_TOKEN_SECRET secrets not set — see packaging/ci/SETUP.md"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: install modal
+        run: pip install --upgrade modal
+
+      # Build the binary in CI (no GPU/SDK needed) and hand it to the Modal harness,
+      # so we validate the exact artifact this commit produces.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build linux/cuda binary
+        run: cargo build --release -p lumen-server -p lumen-cli --features bin,cuda
+
+      # The harness bakes binaries from packaging/modal/bin/ into the Modal image
+      # (see validate_arches.py BIN_DIR). Stage the freshly-built artifacts there so
+      # we validate exactly what this commit produces.
+      - name: stage binaries for the modal image
+        run: |
+          mkdir -p packaging/modal/bin
+          cp target/release/lumen-server target/release/lumen packaging/modal/bin/
+
+      # Arch selection: explicit input wins; release tags get the full matrix;
+      # everything else gets the cheap A100 smoke.
+      - name: choose arches
+        id: arches
+        run: |
+          if [ -n "${{ github.event.inputs.arches }}" ]; then
+            echo "list=${{ github.event.inputs.arches }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "list=T4,A10G,L4,A100,H100" >> "$GITHUB_OUTPUT"
+          else
+            echo "list=A100" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: run modal cross-arch validation
+        run: |
+          set -o pipefail
+          modal run packaging/modal/validate_arches.py \
+            --arches "${{ steps.arches.outputs.list }}" | tee modal-validation.log
+
+      # Gate: validate_arches.py exits non-zero on ANY hard failure (server didn't
+      # start, a kernel failed to compile, DET-001 != 1 distinct, or coherence
+      # miss) and `set -o pipefail` above propagates it — so the modal step itself
+      # is the authoritative gate. This is a belt-and-suspenders check on the
+      # emitted verdict line.
+      - name: gate on validation matrix
+        run: |
+          if ! grep -q "VALIDATION PASSED" modal-validation.log; then
+            echo "::error::CUDA cross-arch validation failed — see the PER-ARCH VERDICT in modal-validation.log"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cuda-arch-validation-${{ github.run_id }}
+          path: |
+            modal-validation.log
+            /tmp/modal-val/
+          if-no-files-found: warn
+          retention-days: 14

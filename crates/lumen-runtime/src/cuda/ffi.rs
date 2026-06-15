@@ -114,12 +114,16 @@ impl CudaDevice {
     }
 
     /// Compile CUDA source to PTX via NVRTC and load as a module.
+    ///
+    /// Routes through the persistent PTX disk cache: on a cache hit the NVRTC
+    /// compile is skipped and the cached PTX is handed straight to
+    /// `cuModuleLoadData` (the driver JIT still runs and is itself cached by
+    /// the driver's compute cache). See [`super::ptx_cache`].
     pub fn compile_and_load(
         &self,
         cuda_source: &str,
     ) -> Result<Arc<CudaModule>, RuntimeError> {
-        let ptx = cudarc::nvrtc::compile_ptx(cuda_source).map_err(cuda_nvrtc_err)?;
-        self.ctx.load_module(ptx).map_err(cuda_driver_err)
+        self.compile_and_load_cached(cuda_source, None, false)
     }
 
     /// Compile CUDA source targeting a specific SM architecture.
@@ -133,13 +137,7 @@ impl CudaDevice {
         cuda_source: &str,
         arch: &'static str,
     ) -> Result<Arc<CudaModule>, RuntimeError> {
-        let opts = cudarc::nvrtc::CompileOptions {
-            arch: Some(arch),
-            ..Default::default()
-        };
-        let ptx = cudarc::nvrtc::compile_ptx_with_opts(cuda_source, opts)
-            .map_err(cuda_nvrtc_err)?;
-        self.ctx.load_module(ptx).map_err(cuda_driver_err)
+        self.compile_and_load_cached(cuda_source, Some(arch), false)
     }
 
     /// Compile CUDA source targeting a specific SM architecture with --use_fast_math.
@@ -152,17 +150,143 @@ impl CudaDevice {
         cuda_source: &str,
         arch: &'static str,
     ) -> Result<Arc<CudaModule>, RuntimeError> {
+        self.compile_and_load_cached(cuda_source, Some(arch), true)
+    }
+
+    /// Shared compile-or-load-from-cache primitive behind the three public
+    /// `compile_and_load*` entry points.
+    ///
+    /// Flow:
+    ///  1. Build the cache key (source hash + arch + fast_math + compute
+    ///     capability + NVRTC version + driver version).
+    ///  2. On a cache hit, load the cached PTX bytes via `cuModuleLoadData`
+    ///     (the exact same driver path a fresh compile uses -> byte-identical
+    ///     SASS).
+    ///  3. On a miss (or any cache read error), NVRTC-compile, atomically
+    ///     write the PTX to the cache, then load it.
+    ///
+    /// Caching is default-ON and a pure optimization: disabling it
+    /// (`LUMEN_CUDA_PTX_CACHE=0`) only changes startup latency, never output.
+    fn compile_and_load_cached(
+        &self,
+        cuda_source: &str,
+        arch: Option<&'static str>,
+        fast_math: bool,
+    ) -> Result<Arc<CudaModule>, RuntimeError> {
+        // Compute-capability + toolchain components of the cache key. If any
+        // query fails we fall back to a non-cached compile (cache disabled for
+        // this call) rather than failing the load.
+        let key_env = self.ptx_cache_key_env();
+
+        if let Some(env) = key_env.as_ref() {
+            let key = super::ptx_cache::CacheKey {
+                source: cuda_source,
+                arch: arch.unwrap_or("default"),
+                fast_math,
+                cc: env.cc,
+                nvrtc_version: env.nvrtc_version,
+                driver_version: env.driver_version,
+            };
+
+            // Known driver-reject: this exact key (same source + arch + cc +
+            // driver) compiled fine under NVRTC on a prior launch but the host
+            // driver refused its PTX at cuModuleLoadData (e.g. an sm_75 host
+            // loading compute_80 PTX). Re-compiling + re-loading would burn the
+            // full NVRTC cost only to fail the JIT again, so short-circuit to
+            // the same error the caller already handles as a fallback. Counted
+            // as a miss for the cold/warm log so the headline reflects reality.
+            if super::ptx_cache::is_driver_rejected(&key) {
+                super::ptx_cache::record_miss();
+                return Err(RuntimeError::Compute(format!(
+                    "CUDA driver rejected cached PTX for arch '{}' on cc {}.{} \
+                     (driver-reject marker present; skipping doomed recompile)",
+                    key.arch, key.cc.0, key.cc.1
+                )));
+            }
+
+            // Cache hit: load the cached PTX bytes directly.
+            if let Some(cached) = super::ptx_cache::load(&key) {
+                let ptx = cudarc::nvrtc::Ptx::from_binary(cached);
+                if let Ok(module) = self.ctx.load_module(ptx) {
+                    super::ptx_cache::record_hit();
+                    return Ok(module);
+                }
+                // A cached blob that the driver rejects (e.g. produced by an
+                // incompatible build that somehow shares the key) must never be
+                // fatal: record a driver-reject marker so subsequent launches
+                // skip the doomed reload + recompile, then fall through to a
+                // fresh compile for this launch.
+                super::ptx_cache::mark_driver_reject(&key);
+            }
+
+            // Miss (or rejected cache entry): NVRTC-compile, then load. Only
+            // persist the PTX once the driver has *accepted* it -- caching PTX
+            // the local driver rejects is worthless (it can never warm-hit) and
+            // bloats the cache, so on rejection we write a driver-reject marker
+            // instead and return the error for the caller to fall back on.
+            super::ptx_cache::record_miss();
+            let ptx = Self::nvrtc_compile(cuda_source, arch, fast_math)?;
+            // Capture the PTX bytes *before* the load_module move so we can
+            // persist them only on driver acceptance.
+            let ptx_bytes = ptx.as_bytes().map(|b| b.to_vec());
+            match self.ctx.load_module(ptx) {
+                Ok(module) => {
+                    if let Some(bytes) = ptx_bytes {
+                        super::ptx_cache::store(&key, &bytes);
+                    }
+                    return Ok(module);
+                }
+                Err(e) => {
+                    super::ptx_cache::mark_driver_reject(&key);
+                    return Err(cuda_driver_err(e));
+                }
+            }
+        }
+
+        // Cache key unavailable (version query failed) -> plain compile+load.
+        let ptx = Self::nvrtc_compile(cuda_source, arch, fast_math)?;
+        self.ctx.load_module(ptx).map_err(cuda_driver_err)
+    }
+
+    /// Run NVRTC source->PTX compilation with the given arch / fast_math flags.
+    fn nvrtc_compile(
+        cuda_source: &str,
+        arch: Option<&'static str>,
+        fast_math: bool,
+    ) -> Result<cudarc::nvrtc::Ptx, RuntimeError> {
+        if arch.is_none() && !fast_math {
+            return cudarc::nvrtc::compile_ptx(cuda_source).map_err(cuda_nvrtc_err);
+        }
         let opts = cudarc::nvrtc::CompileOptions {
-            arch: Some(arch),
-            // Use raw --use_fast_math flag via options vec for full effect:
+            arch,
+            // Raw --use_fast_math flag for full effect:
             // --fmad=true --ftz=true --prec-div=false --prec-sqrt=false
-            // (cudarc's use_fast_math field only adds --fmad=true)
-            options: vec!["--use_fast_math".to_string()],
+            // (cudarc's use_fast_math field only adds --fmad=true).
+            options: if fast_math {
+                vec!["--use_fast_math".to_string()]
+            } else {
+                Vec::new()
+            },
             ..Default::default()
         };
-        let ptx = cudarc::nvrtc::compile_ptx_with_opts(cuda_source, opts)
-            .map_err(cuda_nvrtc_err)?;
-        self.ctx.load_module(ptx).map_err(cuda_driver_err)
+        cudarc::nvrtc::compile_ptx_with_opts(cuda_source, opts).map_err(cuda_nvrtc_err)
+    }
+
+    /// Query the environment components of the PTX cache key (compute
+    /// capability + NVRTC version + driver version). Returns `None` if any
+    /// query fails, which disables caching for that load (graceful fallback).
+    fn ptx_cache_key_env(&self) -> Option<PtxCacheKeyEnv> {
+        if !super::ptx_cache::cache_enabled() {
+            return None;
+        }
+        let cc = self.compute_capability().ok()?;
+        let nvrtc_version = nvrtc_version().ok()?;
+        let driver_version = driver_version().ok()?;
+        Some(PtxCacheKeyEnv {
+            cc,
+            nvrtc_version,
+            driver_version,
+        })
     }
 
     /// Copy host data to a new device buffer.
@@ -341,6 +465,50 @@ impl CudaDevice {
         }
         Ok(())
     }
+}
+
+/// Environment components of a PTX cache key (everything except the per-kernel
+/// source / arch / fast_math). Queried once per load; cheap FFI calls.
+struct PtxCacheKeyEnv {
+    cc: (i32, i32),
+    nvrtc_version: (i32, i32),
+    driver_version: i32,
+}
+
+/// Query the NVRTC library version as (major, minor) via `nvrtcVersion`.
+///
+/// Part of the PTX cache key: a toolkit upgrade that changes the NVRTC version
+/// must invalidate cached PTX (the new NVRTC may emit different PTX for the
+/// same source). Returns an error if the call fails.
+fn nvrtc_version() -> Result<(i32, i32), RuntimeError> {
+    let mut major: std::ffi::c_int = 0;
+    let mut minor: std::ffi::c_int = 0;
+    // SAFETY: out-pointers are valid for the duration of the call; cudarc's
+    // dynamic loader resolves `nvrtcVersion` from libnvrtc.
+    let res = unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) };
+    if res != cudarc::nvrtc::sys::nvrtcResult::NVRTC_SUCCESS {
+        return Err(RuntimeError::Compute(format!(
+            "nvrtcVersion query failed: {res:?}"
+        )));
+    }
+    Ok((major as i32, minor as i32))
+}
+
+/// Query the CUDA driver version (e.g. 12020 for 12.2) via `cuDriverGetVersion`.
+///
+/// Part of the PTX cache key: a driver upgrade changes how PTX JITs to SASS,
+/// mirroring the driver compute cache's own invalidation. Returns an error if
+/// the call fails.
+fn driver_version() -> Result<i32, RuntimeError> {
+    let mut version: std::ffi::c_int = 0;
+    // SAFETY: out-pointer is valid for the duration of the call.
+    let res = unsafe { cudarc::driver::sys::cuDriverGetVersion(&mut version) };
+    if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        return Err(RuntimeError::Compute(format!(
+            "cuDriverGetVersion query failed: {res:?}"
+        )));
+    }
+    Ok(version as i32)
 }
 
 /// Convert a cudarc driver error to RuntimeError.

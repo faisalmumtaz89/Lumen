@@ -1,0 +1,70 @@
+# Metal (Apple Silicon) functional validation on a SELF-HOSTED Mac runner.
+#
+# GitHub-hosted macOS runners are virtualized with no reliable Metal GPU, so real
+# Metal validation (byte-determinism + coherence on a real M-series GPU) must run
+# on a self-hosted Apple-Silicon runner = your Mac. See packaging/ci/SETUP.md for
+# registration.
+#
+# ────────────────────────── SECURITY (read before activating) ──────────────────
+# A self-hosted runner executes whatever a workflow gives it. On a PUBLIC repo a
+# malicious fork PR could therefore run arbitrary code on your Mac. This workflow
+# is deliberately gated to events the repo OWNER controls — release tags, manual
+# dispatch, and push-to-main — and is NEVER triggered by `pull_request`. Also set
+# repo Settings → Actions → "Require approval for all outside collaborators".
+# ────────────────────────────────────────────────────────────────────────────────
+#
+# To activate: see packaging/ci/SETUP.md, then `git mv` this file to .github/workflows/.
+name: validate-metal
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['b*', 'v*']
+  # NOTE: intentionally NO `pull_request:` trigger — a fork PR must never run on
+  # your Mac (see SECURITY note above). Unlike CUDA (which validates on Modal, so
+  # fork PRs are safely skippable), Metal runs on the physical self-hosted Mac, so
+  # it stays off PRs entirely. To validate a branch's Metal path BEFORE merging,
+  # use the "Run workflow" button (workflow_dispatch) and select the branch;
+  # otherwise Metal validates automatically when the PR merges to main.
+
+concurrency:
+  group: metal-selfhosted   # one at a time on the single physical Mac
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  metal-validate:
+    name: metal validation (self-hosted M-series)
+    runs-on: [self-hosted, macos, arm64, metal]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build server + cli (metal default)
+        run: cargo build --release -p lumen-server -p lumen-cli --features bin
+
+      - name: link audit (system frameworks only)
+        run: |
+          if otool -L target/release/lumen-server | tail -n +2 \
+             | grep -vE '/usr/lib/|/System/Library/'; then
+            echo "::error::non-system dynamic dependency in lumen-server"; exit 1
+          fi
+
+      # Functional validation on the real GPU. A small model that fits any Apple
+      # Silicon Mac. DET-001 byte-determinism + a coherence smoke; the full quality
+      # matrix is the manual gold-standard gate documented in SETUP.md.
+      - name: metal DET-001 + coherence
+        env:
+          LUMEN_CACHE_DIR: ${{ runner.temp }}/lumen-cache
+        run: bash packaging/ci/metal_validate.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: metal-validation-${{ github.run_id }}
+          path: ${{ runner.temp }}/metal-val/
+          if-no-files-found: warn
+          retention-days: 14

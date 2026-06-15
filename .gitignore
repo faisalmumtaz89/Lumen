@@ -34,3 +34,6 @@ __pycache__/
 /.codecompass/
 /modal/
 codecompass.config.json
+
+# macOS packaging tarball output (packaging/macos/build-tarball.sh)
+/dist/

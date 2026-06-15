@@ -1341,6 +1341,8 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_PREFILL_F32",
     "LUMEN_CUDA_PREFILL_STAGE_TIMING",
     "LUMEN_CUDA_PROFILE",
+    "LUMEN_CUDA_PTX_CACHE",
+    "LUMEN_CUDA_PTX_CACHE_DIR",
     "LUMEN_CUDA_Q4_SPLIT",
     "LUMEN_CUDA_Q4_TILE",
     "LUMEN_CUDA_Q4_V3_TRACE",
@@ -1387,6 +1389,9 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_METAL_CONCURRENT_ENCODER_FULL_VALIDATE",
     "LUMEN_METAL_CONCURRENT_ENCODER_TRACE",
     "LUMEN_METAL_CONCURRENT_ENCODER_VALIDATE",
+    // Diagnostic-only: prints the newLibraryWithSource vs pipeline-state-creation
+    // wall-clock split at backend init. No-op when unset (see metal/pipelines.rs).
+    "LUMEN_METAL_COMPILE_PROFILE",
     "LUMEN_METAL_DECODE_DELAY_US",
     "LUMEN_METAL_FFN_DOWN_SPLITK",
     "LUMEN_METAL_FFN_DOWN_SPLITK_BF16",
