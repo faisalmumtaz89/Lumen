@@ -34,7 +34,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (stable)
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: rustup show
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: build
         run: cargo build --release --locked -p lumen-server -p lumen-cli --features bin,cuda
@@ -52,7 +53,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (stable)
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: rustup show
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # LUMEN_TAG = the actual git tag, so the asset name matches the Release tag
       # (was defaulting to b<rev-count>, which 404'd the installer).
