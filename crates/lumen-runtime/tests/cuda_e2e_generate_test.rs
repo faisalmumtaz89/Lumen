@@ -91,6 +91,7 @@ fn run_generate(
     let sampling = SamplingParams {
         temperature: 0.0,
         seed: Some(42),
+        ..Default::default()
     };
 
     engine
@@ -273,6 +274,7 @@ fn cuda_e2e_metrics_populated() {
     let sampling = SamplingParams {
         temperature: 0.0,
         seed: Some(42),
+        ..Default::default()
     };
 
     let result = engine

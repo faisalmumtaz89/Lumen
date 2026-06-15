@@ -22,6 +22,8 @@ pub mod ffi;
 /// Embedded CUDA kernel source strings, compiled to PTX at runtime via NVRTC.
 pub mod shaders;
 pub(crate) mod types;
+/// Persistent on-disk cache for NVRTC-compiled kernel PTX (cold-start fix).
+pub(crate) mod ptx_cache;
 pub(crate) mod gpu_buffers;
 pub(crate) mod kv_cache;
 pub(crate) mod decode;

@@ -1,0 +1,61 @@
+# Release: on a `b<N>` or `v<X.Y.Z>` tag, build + package the artifacts and attach
+# them to a GitHub Release. GPU validation runs in its own workflows (validate-
+# cuda-modal / validate-metal) which the same tag also triggers; treat a green run
+# of those as the gate before announcing a release.
+#
+# Channels (per the binary strategy): macOS tarball + Homebrew formula; Linux/CUDA
+# Docker image to ghcr.io. All built on hosted runners (no GPU/SDK needed to build).
+#
+# To activate: see packaging/ci/SETUP.md, then `git mv` this file to .github/workflows/.
+name: release
+
+on:
+  push:
+    tags: ['b*', 'v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create the GitHub Release + upload assets
+  packages: write   # push the Docker image to ghcr.io
+
+jobs:
+  macos-tarball:
+    name: macOS arm64 tarball + sha256
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build tarball
+        run: bash packaging/macos/build-tarball.sh
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  linux-cuda-docker:
+    name: Linux/CUDA Docker image -> ghcr.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build linux binaries
+        run: |
+          cargo build --release -p lumen-server -p lumen-cli --features bin,cuda
+          mkdir -p packaging/modal/bin
+          cp target/release/lumen-server target/release/lumen packaging/modal/bin/
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The same Dockerfile validated on Modal (-devel base: libnvrtc + libcublas).
+      - name: build + push image
+        run: |
+          IMG="ghcr.io/${{ github.repository }}:${GITHUB_REF_NAME}"
+          docker build -f packaging/modal/Dockerfile -t "$IMG" .
+          docker push "$IMG"

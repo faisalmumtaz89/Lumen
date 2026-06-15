@@ -1,0 +1,100 @@
+# Lumen CI — build + CPU tests + lint on every push/PR.
+# Runs entirely on GitHub-hosted runners (free): no GPU and no CUDA/Metal SDK are
+# needed to BUILD, because all GPU kernel compilation is deferred to runtime
+# (NVRTC for CUDA, MSL for Metal). GPU correctness/quality is validated separately
+# by validate-cuda-modal.yml (Modal) and validate-metal.yml (self-hosted Mac).
+#
+# To activate: see packaging/ci/SETUP.md, then `git mv` this file to .github/workflows/.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One in-flight run per ref; new pushes cancel the old to save runner minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-cpu:
+    # The CPU reference suite (lumen-format, lumen-convert, lumen-cli) runs without
+    # a GPU — see README "Requirements". The lumen-runtime GPU paths are validated
+    # in the dedicated GPU workflows, not here.
+    name: cpu tests + lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy (cpu crates)
+        run: cargo clippy -p lumen-format -p lumen-convert -p lumen-cli --release -- -D warnings
+      - name: cpu test suite
+        run: cargo test -p lumen-format -p lumen-convert -p lumen-cli --release
+      - name: detector self-test
+        run: python3 quality/detectors.py --selftest
+
+  build-linux-cuda:
+    # Compile-check the CUDA build. cudarc uses fallback-dynamic-loading, so this
+    # links against NOTHING at build time (libcuda/libnvrtc/libcublas are dlopen'd
+    # at runtime) — a GitHub-hosted runner with no CUDA SDK builds it fine.
+    name: build linux/cuda (sm_80 target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build server (cuda)
+        run: cargo build --release -p lumen-server -p lumen-cli --features bin,cuda
+      - name: compile cuda unit tests (no GPU run)
+        run: cargo test -p lumen-runtime --features cuda --release --no-run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lumen-linux-x86_64-cuda
+          path: |
+            target/release/lumen-server
+            target/release/lumen
+          if-no-files-found: error
+          retention-days: 7
+
+  build-macos-metal:
+    # Build-smoke for Apple Silicon on a hosted runner: confirms it compiles + links
+    # only system frameworks. The hosted macOS runner is virtualized with no reliable
+    # Metal GPU, so functional Metal validation happens on the self-hosted Mac
+    # (validate-metal.yml), not here.
+    name: build macos/metal (arm64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build server + cli (metal default)
+        run: cargo build --release -p lumen-server -p lumen-cli --features bin
+      - name: link audit (system frameworks only)
+        run: |
+          otool -L target/release/lumen-server
+          # Fail if anything outside system framework / dyld paths is linked.
+          if otool -L target/release/lumen-server | tail -n +2 \
+             | grep -vE '/usr/lib/|/System/Library/'; then
+            echo "::error::non-system dynamic dependency found in lumen-server"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lumen-macos-arm64-metal
+          path: |
+            target/release/lumen-server
+            target/release/lumen
+          if-no-files-found: error
+          retention-days: 7

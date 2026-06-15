@@ -9,10 +9,23 @@ use crate::error::RuntimeError;
 impl MetalF32Backend {
     /// Compile all Metal shader pipelines.
     pub(super) fn compile_pipelines(&self) -> Result<MetalPipelines, RuntimeError> {
+        // Diagnostic-only: when `LUMEN_METAL_COMPILE_PROFILE=1` is set, print the
+        // wall-clock split between MSL library compilation
+        // (`newLibraryWithSource:`) and compute-pipeline-state creation (the
+        // lazy SASS codegen across all kernels). No-op when the env var is unset,
+        // so this does not alter any runtime behavior or output.
+        let compile_profile = std::env::var("LUMEN_METAL_COMPILE_PROFILE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let t_lib_start = std::time::Instant::now();
+
         let lib = self
             .device
             .new_library_with_source(METAL_SHADER_SOURCE)
             .map_err(RuntimeError::Compute)?;
+
+        let lib_elapsed = t_lib_start.elapsed();
+        let t_pso_start = std::time::Instant::now();
 
         macro_rules! make_pipeline {
             ($name:expr) => {{
@@ -59,7 +72,7 @@ impl MetalF32Backend {
             }};
         }
 
-        Ok(MetalPipelines {
+        let pipelines = MetalPipelines {
             matmul_f32: make_pipeline!("matmul_f32"),
             matmul_f32_deferred: make_pipeline!("matmul_f32_deferred"),
             matmul_bytes_f32: make_pipeline!("matmul_bytes_f32"),
@@ -463,6 +476,18 @@ impl MetalF32Backend {
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             dequant_batched_matvec_q8_0_dual: lib.get_function("dequant_batched_matvec_q8_0_dual")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-        })
+        };
+
+        if compile_profile {
+            let pso_elapsed = t_pso_start.elapsed();
+            eprintln!(
+                "[LUMEN_METAL_COMPILE_PROFILE] newLibraryWithSource={:.3}s pipeline_state_creation={:.3}s total_shader_compile={:.3}s",
+                lib_elapsed.as_secs_f64(),
+                pso_elapsed.as_secs_f64(),
+                (lib_elapsed + pso_elapsed).as_secs_f64(),
+            );
+        }
+
+        Ok(pipelines)
     }
 }

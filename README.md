@@ -249,7 +249,7 @@ See [`docs/production.md`](docs/production.md) for serving-mode selection, GPU-r
 
 **Requirements:**
 - Rust 1.75+
-- For CUDA: an NVIDIA GPU + driver (no build-time CUDA SDK needed; kernels compile at runtime via NVRTC)
+- For CUDA: an NVIDIA GPU + driver, plus the CUDA runtime libraries `libnvrtc` and `libcublas` present at run time (loaded dynamically; no build-time CUDA SDK needed — kernels compile at runtime via NVRTC). Driver ≥ 525 recommended.
 - For Metal: macOS on Apple Silicon (no extra deps; ships with the OS)
 
 ```bash
