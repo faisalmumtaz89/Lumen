@@ -1676,6 +1676,15 @@ fn print_generated_text(
     tokenizer: Option<&crate::tokenize::BpeTokenizer>,
     enable_thinking: bool,
 ) {
+    // Diagnostic (default OFF, GATE-2 spec-decode acceptance measurement): dump
+    // the RAW generated token ids BEFORE any tokenizer/stop filtering. This fires
+    // in BOTH `--prompt` (text) and `--tokens` (raw-id) modes, so a prefix can be
+    // fed via raw ids (no re-tokenization drift) and the model's next-token argmax
+    // read back exactly. `LUMEN_SPEC_DUMP_IDS=1`. No-op when unset → byte-identical
+    // default output. Goes to stderr; stdout answer path is untouched.
+    if std::env::var("LUMEN_SPEC_DUMP_IDS").as_deref() == Ok("1") {
+        eprintln!("[SPEC_DUMP_IDS] raw_count={} ids={tokens:?}", tokens.len());
+    }
     if let Some(tok) = tokenizer {
         let stop_ids = &tok.stop_token_ids;
         let clean: Vec<u32> = tokens

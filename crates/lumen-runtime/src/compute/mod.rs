@@ -199,6 +199,33 @@ impl Logits {
     }
 }
 
+/// Run-level configuration for the GPU temperature sampler (Option A, Metal
+/// `LUMEN_METAL_GPU_SAMPLER=1`). The engine resolves this ONCE per generation
+/// from `SamplingParams` + the prompt and passes it to every
+/// `decode_token_sampled` call; the backend reads the prompt-history fields only
+/// on the fresh-run initialisation (when no pipelined CB is in flight) to seed
+/// the GPU RNG-state ring and history frequency array, exactly mirroring the CPU
+/// `Xorshift64::new(seed)` + `SamplerState` prompt seeding.
+#[derive(Clone)]
+pub struct GpuSamplerRunCfg {
+    /// 1.0 / temperature (temperature > 0 guaranteed by the engine route gate).
+    pub inv_temp: f32,
+    /// True iff any penalty (rep != 1, presence != 0, freq != 0) is active.
+    pub pen_active: bool,
+    /// repetition / presence / frequency penalty values (SamplingParams).
+    pub rep: f32,
+    pub presence: f32,
+    pub freq: f32,
+    /// The post-finalizer `Xorshift64::new(seed).state()` u64 — the EXACT RNG
+    /// state the CPU sampler would start from, used to seed the GPU RNG ring[0].
+    pub rng_seed_state: u64,
+    /// The full prompt-history token ids (what the engine recorded into
+    /// SamplerState before decode). Used once at fresh-run to seed the GPU
+    /// history frequency array so the first sampled token's penalties match the
+    /// CPU. Cheap to clone (Arc).
+    pub prompt_history: std::sync::Arc<Vec<u32>>,
+}
+
 /// The pluggable compute backend interface.
 ///
 /// # Contract
@@ -377,6 +404,36 @@ pub trait ComputeBackend: Send + Sync {
         ))
     }
 
+    /// [Option B] Deferred-async-commit decode (Metal only; default OFF flag).
+    /// Commits this token's CB async and returns the PREVIOUS token's logits
+    /// (1-deep pipeline). Returns empty logits on the priming call. Backends that
+    /// don't implement it report `false` from `supports_async_decode` so the
+    /// engine never calls it. Advances `kv.seq_len()` internally.
+    fn decode_token_async(
+        &self,
+        _token_id: u32,
+        _weights: &dyn WeightProvider,
+        _kv: &mut KvCache,
+    ) -> Result<Logits, RuntimeError> {
+        Err(RuntimeError::Compute(
+            "async-commit decode not supported".into(),
+        ))
+    }
+
+    /// [Option B] Flush the final in-flight async-commit CB and return its
+    /// logits. Paired with `decode_token_async`; no-op (empty) by default.
+    fn decode_flush_async(&self) -> Result<Logits, RuntimeError> {
+        Ok(Logits { data: Vec::new() })
+    }
+
+    /// Whether this backend's `decode_token_async` path is active (the
+    /// `LUMEN_METAL_DECODE_ASYNC_COMMIT=1` flag is set AND the backend supports
+    /// it). Default false. The engine consults this to opt into the 1-deep async
+    /// sampled-decode driver.
+    fn supports_async_decode(&self) -> bool {
+        false
+    }
+
     /// GPU-side greedy decode returning token ID directly.
     ///
     /// # KV seq_len contract
@@ -392,6 +449,36 @@ pub trait ComputeBackend: Send + Sync {
         Err(RuntimeError::Compute(
             "GPU-side argmax not supported".into(),
         ))
+    }
+
+    /// [Option A] GPU temperature-sampled decode returning the token id directly
+    /// (Metal only; `LUMEN_METAL_GPU_SAMPLER=1`). The token is SAMPLED on the GPU
+    /// (parity-matched to the CPU `sample_logits`) and chained through the lean
+    /// pipeline exactly like `decode_token_greedy`, so temp>0 decode pipelines
+    /// without the serial CPU sampler + logit readback. Advances `kv.seq_len()`
+    /// internally (once per call); the caller must NOT call `advance_seq_len`.
+    /// Backends that do not support it return an error and `supports_gpu_sampler`
+    /// reports false so the engine never calls it.
+    fn decode_token_sampled(
+        &self,
+        _prev_token: u32,
+        _weights: &dyn WeightProvider,
+        _kv: &mut KvCache,
+        _cfg: &GpuSamplerRunCfg,
+    ) -> Result<u32, RuntimeError> {
+        Err(RuntimeError::Compute(
+            "GPU temperature sampler not supported".into(),
+        ))
+    }
+
+    /// Whether this backend's `decode_token_sampled` (Option A GPU sampler) path
+    /// is active for the given sampling config. The engine consults this to opt
+    /// into the GPU-sampled lean driver; default false. Implementations check the
+    /// `LUMEN_METAL_GPU_SAMPLER` flag, kernel availability, and that the config is
+    /// the subset the kernel reproduces (no top_k/top_p/min_p, full-history
+    /// window). `params` is the resolved `SamplingParams`.
+    fn supports_gpu_sampler(&self, _params: &crate::sampling::SamplingParams) -> bool {
+        false
     }
 
     /// Reset recurrent state (GDN h_state, conv_state).

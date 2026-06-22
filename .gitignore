@@ -37,3 +37,4 @@ codecompass.config.json
 
 # macOS packaging tarball output (packaging/macos/build-tarball.sh)
 /dist/
+/.ttsvenv

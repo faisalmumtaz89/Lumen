@@ -262,10 +262,31 @@ impl ComputeBackend for MetalF32Backend {
             gate_buf: make_buf(inter_dim.max(q_dim))?, // max of FFN inter_dim and attn q_dim (Q+gate deinterleave)
             up_buf: make_buf(inter_dim)?,
             down_buf: make_buf(hidden_dim)?,
+            // SPLIT-K down partials: [hidden_dim * MAX_K_SPLITS(8)] f32 (env-gated kernel).
+            splitk_partials_buf: make_buf(hidden_dim * 8)?,
+            // SPLIT-K gate/up partials: gate [inter*8] + up [inter*8] f32 (env-gated).
+            splitk_gateup_partials_buf: make_buf(inter_dim * 8 * 2)?,
+            splitk_normed_buf: make_buf(hidden_dim)?,
             logits_buf: make_buf(vocab_size)?,
+            // Option-B async-commit double-buffer: allocated lazily only when the
+            // flag is on (the default synchronous path leaves it None).
+            logits_buf_b: None,
+            async_inflight_logits_b: false,
             argmax_result_buf: self.device.new_buffer(4).ok_or_else(|| {
                 RuntimeError::Compute("Failed to allocate argmax result buffer (4 bytes)".into())
             })?,
+            // Pipelined greedy decode state (lazily set up on first pipelined
+            // call; empty/unused in the default sequential path).
+            pipe_token_ring: Vec::new(),
+            pipe_inflight: std::collections::VecDeque::new(),
+            pipe_step: 0,
+            pipe_seq_pos: 0,
+            pipe_event: None,
+            pipe_event_base: 0,
+            // GPU temperature sampler (Option A) state; lazily allocated on the
+            // first LUMEN_METAL_GPU_SAMPLER call, empty/None in every other path.
+            gpu_sampler_rng_ring: Vec::new(),
+            gpu_sampler_freq_arr: None,
             rope_cos_buf,
             rope_sin_buf,
             gpu_k_cache,
@@ -436,6 +457,7 @@ impl ComputeBackend for MetalF32Backend {
             // GDN state: defaults for non-hybrid models. Overridden in
             // preload_weights_gpu_resident when Qwen3.5-MoE is detected.
             gdn_h_states: Vec::new(),
+            gdn_h_states_f16: Vec::new(),
             gdn_conv_states: Vec::new(),
             gdn_conv_positions: Vec::new(),
             gdn_alpha_buf: None,
@@ -463,6 +485,43 @@ impl ComputeBackend for MetalF32Backend {
             // `preload_weights_gpu_resident` builds them when env-gated ON.
             repacked_ffn_down_q4: Vec::new(),
             repacked_ffn_gate_up_q4: Vec::new(),
+            qmv_down_qw: Vec::new(),
+            qmv_down_scales: Vec::new(),
+            qmv_gdn_qkv_qw: Vec::new(),
+            qmv_gdn_qkv_scales: Vec::new(),
+            qmv_gdn_attn_gate_qw: Vec::new(),
+            qmv_gdn_attn_gate_scales: Vec::new(),
+            qmv_attn_wq_qw: Vec::new(),
+            qmv_attn_wq_scales: Vec::new(),
+            qmv_attn_wo_qw: Vec::new(),
+            qmv_attn_wo_scales: Vec::new(),
+            // Full-attn K/V decode-qmv buffers (LUMEN_METAL_Q4_QMV_KV). Empty
+            // until `preload_weights_gpu_resident` builds them when env-gated ON.
+            qmv_attn_wk_qw: Vec::new(),
+            qmv_attn_wk_scales: Vec::new(),
+            qmv_attn_wv_qw: Vec::new(),
+            qmv_attn_wv_scales: Vec::new(),
+            // GDN ssm_out decode-qmv buffers (LUMEN_METAL_Q4_QMV_SSMOUT). Empty
+            // until `preload_weights_gpu_resident` builds them when env-gated ON.
+            qmv_gdn_ssm_out_qw: Vec::new(),
+            qmv_gdn_ssm_out_scales: Vec::new(),
+            // GDN ssm_out Q8->Q4 native-NR2 requant buffers
+            // (LUMEN_METAL_Q4_SSMOUT_NR2). Empty until built when env-gated ON.
+            q4nr2_ssm_out: Vec::new(),
+            // Dense FFN gate/up dual-matrix decode-qmv buffers
+            // (LUMEN_METAL_Q4_QMV_GATEUP). Empty until built when env-gated ON.
+            qmv_ffn_gate_qw: Vec::new(),
+            qmv_ffn_gate_scales: Vec::new(),
+            qmv_ffn_up_qw: Vec::new(),
+            qmv_ffn_up_scales: Vec::new(),
+            qmv_ffn_gate_up_il_qw: Vec::new(),
+            qmv_ffn_gate_up_il_scales: Vec::new(),
+            qmv_zero_residual_buf: None,
+            // GLOBAL Q4 lm_head decode-qmv buffers. None until
+            // `preload_weights_gpu_resident` builds them when
+            // `LUMEN_METAL_Q4_QMV_LMHEAD=1` is set at load time.
+            qmv_lmhead_qw: None,
+            qmv_lmhead_scales: None,
 
             // GDN qkv+attn_gate paired BF16 repacked storage. Empty
             // until `preload_weights_gpu_resident` builds it when
@@ -709,10 +768,22 @@ impl ComputeBackend for MetalF32Backend {
                 let h_state_size = gdn_num_v_heads * gdn_head_dim * gdn_head_dim;
                 let conv_state_size = (conv_kernel_size - 1) * gdn_qkv_dim;
 
-                let h_buf = self.device.new_buffer(h_state_size * 4).ok_or_else(|| {
+                // Persistent h_state precision: F32 (4 B/elem) or a reduced-precision
+                // bfloat/half variant (2 B/elem). Must match gpu_resident allocation.
+                let h_state_precision = crate::metal::gdn_state_precision();
+                let h_bytes = if h_state_precision == crate::metal::GdnStatePrecision::F32 {
+                    h_state_size * 4
+                } else {
+                    h_state_size * 2
+                };
+                let h_buf = self.device.new_buffer(h_bytes).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN h_state".into())
                 })?;
-                h_buf.write_f32(&vec![0.0f32; h_state_size]);
+                if h_state_precision == crate::metal::GdnStatePrecision::F32 {
+                    h_buf.write_f32(&vec![0.0f32; h_state_size]);
+                } else {
+                    h_buf.write_u16(&vec![0u16; h_state_size]);
+                }
 
                 let c_buf = self.device.new_buffer(conv_state_size * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN conv_state".into())
@@ -720,6 +791,9 @@ impl ComputeBackend for MetalF32Backend {
                 c_buf.write_f32(&vec![0.0f32; conv_state_size]);
 
                 s.gdn_h_states.push(h_buf);
+                // Length-sync the lazy F16 h_state mirror (filled on first decode
+                // touch when LUMEN_METAL_GDN_F16_STATE_DECODE=1).
+                s.gdn_h_states_f16.push(std::cell::RefCell::new(None));
                 s.gdn_conv_states.push(c_buf);
                 s.gdn_conv_positions.push(0);
                 s.gdn_conv_kernel_size = conv_kernel_size;
@@ -3130,19 +3204,129 @@ impl ComputeBackend for MetalF32Backend {
         autoreleasepool(|| self.decode_token_single_cb(token_id, weights, kv))
     }
 
+    fn supports_async_decode(&self) -> bool {
+        // Option B (deferred-async-commit) sampled-decode path, default OFF.
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("LUMEN_METAL_DECODE_ASYNC_COMMIT").as_deref() == Ok("1"))
+    }
+
+    fn decode_token_async(
+        &self,
+        token_id: u32,
+        weights: &dyn WeightProvider,
+        kv: &mut KvCache,
+    ) -> Result<Logits, RuntimeError> {
+        autoreleasepool(|| self.decode_token_single_cb_async(token_id, weights, kv))
+    }
+
+    fn decode_flush_async(&self) -> Result<Logits, RuntimeError> {
+        autoreleasepool(|| MetalF32Backend::decode_flush_async(self))
+    }
+
     fn decode_token_greedy(
         &self,
         token_id: u32,
         weights: &dyn WeightProvider,
         kv: &mut KvCache,
     ) -> Result<u32, RuntimeError> {
-        // Drain autoreleased Metal objects at every token
-        // boundary (greedy path delegates to decode_token_greedy or the
-        // option-a-gpu-resident fallback; both create CBs + encoders).
-        autoreleasepool(|| MetalF32Backend::decode_token_greedy(self, token_id, weights, kv))
+        // Drain autoreleased Metal objects at the token boundary (the driver
+        // creates CBs + encoders). Greedy decode runs the lean single-queue
+        // pipeline (the one decode path).
+        autoreleasepool(|| MetalF32Backend::decode_token_greedy_lean(self, token_id, weights, kv))
+    }
+
+    fn decode_token_sampled(
+        &self,
+        prev_token: u32,
+        weights: &dyn WeightProvider,
+        kv: &mut KvCache,
+        cfg: &crate::compute::GpuSamplerRunCfg,
+    ) -> Result<u32, RuntimeError> {
+        // Option A GPU temperature sampler -> lean GPU-sampled pipeline. Drains
+        // autoreleased Metal objects at the token boundary (the driver creates
+        // CBs + encoders), mirroring decode_token_greedy.
+        autoreleasepool(|| {
+            MetalF32Backend::decode_token_sampled_lean(self, prev_token, weights, kv, cfg)
+        })
+    }
+
+    fn supports_gpu_sampler(&self, params: &crate::sampling::SamplingParams) -> bool {
+        // Gate: flag on, kernel compiled, and the sampling config is the EXACT
+        // subset the gpu_sampler kernel reproduces. Anything outside this set
+        // (top_k/top_p/min_p, windowed penalty, greedy) falls back to the CPU
+        // sampler so behaviour stays correct.
+        if !crate::metal::metal_gpu_sampler_enabled() {
+            return false;
+        }
+        // The kernel that will actually be dispatched must have compiled on this
+        // device (fast by default; exact under LUMEN_METAL_GPU_SAMPLER_EXACT=1).
+        let want_exact = crate::metal::metal_gpu_sampler_exact_enabled();
+        let kernel_ok = self
+            .pipelines
+            .as_ref()
+            .map(|p| {
+                if want_exact {
+                    p.gpu_sampler.is_some()
+                } else {
+                    p.gpu_sampler_fast.is_some()
+                }
+            })
+            .unwrap_or(false);
+        if !kernel_ok {
+            return false;
+        }
+        // temperature > 0 (greedy stays on its own byte-identical path).
+        if params.temperature <= 0.0 {
+            return false;
+        }
+        // v1 kernel does NOT implement top_k / top_p / min_p; require them unset
+        // (or no-ops: top_k=0, top_p>=1 / <=0, min_p<=0). Conservative: only the
+        // None / explicit no-op forms pass; any active shaping -> CPU sampler.
+        let top_k_noop = matches!(params.top_k, None | Some(0));
+        let top_p_noop = match params.top_p {
+            None => true,
+            Some(p) => !(p > 0.0 && p < 1.0),
+        };
+        let min_p_noop = match params.min_p {
+            None => true,
+            Some(m) => m <= 0.0, // min_p disabled (<=0); a positive min_p needs the CPU sampler
+        };
+        if !(top_k_noop && top_p_noop && min_p_noop) {
+            return false;
+        }
+        // Full-history window only: the GPU freq array tracks FULL history, so a
+        // windowed (repeat_last_n = Some(n>0)) penalty would diverge. None or
+        // Some(0) (== full history in apply_penalties) pass.
+        let full_history_window = matches!(params.repeat_last_n, None | Some(0));
+        if !full_history_window {
+            return false;
+        }
+        // BYTE-GUARD gate (checklist item 6): the anti-restate byte-guard is only
+        // ever consulted in the greedy (temperature<=0) branch of sample_logits,
+        // so for temperature>0 it is structurally inactive and the GPU sampler
+        // (which omits it) is faithful. Assert the invariant defensively: if it
+        // were somehow requested alongside temp>0 we still match, but make the
+        // reasoning explicit so a future change that wires the guard into the
+        // sampled path cannot silently skip it.
+        debug_assert!(
+            params.temperature > 0.0,
+            "gpu sampler gate reached with greedy temperature"
+        );
+        true
     }
 
     fn reset_recurrent_state(&self) {
+        // Drain any pipelined-decode CBs left in flight by a previous
+        // generation before resetting GDN state, so a fresh run never inherits
+        // stale in-flight command buffers or token-ring contents.
+        if let Ok(mut guard) = self.scratch.lock() {
+            if let Some(s) = guard.as_mut() {
+                if !s.pipe_inflight.is_empty() {
+                    Self::pipe_drain_locked(s);
+                }
+            }
+        }
         self.reset_gdn_state();
     }
 

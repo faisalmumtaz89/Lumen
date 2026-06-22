@@ -95,6 +95,14 @@ impl Xorshift64 {
         const SCALE: f32 = 1.0 / (1u64 << 24) as f32;
         (self.next_u64() >> 40) as f32 * SCALE
     }
+
+    /// Current internal state. Used by the Metal GPU sampler (Option A) to seed
+    /// its GPU-side RNG-state ring with the EXACT state the CPU sampler holds, so
+    /// the GPU `next_u64` (same 13/7/17 transition) yields a bit-identical draw
+    /// sequence (draw-count + value parity with `sample_categorical`).
+    pub fn state(&self) -> u64 {
+        self.state
+    }
 }
 
 /// Softmax with max-subtraction for numerical stability (best practice 4.1).
