@@ -37,6 +37,13 @@ pub(crate) fn is_enabled() -> bool {
 
 static GPUTIME_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// True when LUMEN_METAL_DECODE_GPUTIME=1. Used to gate the clean single-CB
+/// GPU-busy-vs-wall measurement in the greedy decode path (no CB splitting).
+#[inline]
+pub(crate) fn gputime_enabled() -> bool {
+    GPUTIME_ENABLED.load(Ordering::Relaxed)
+}
+
 pub(crate) fn init_from_env() {
     if std::env::var("LUMEN_METAL_DECODE_PROFILE").ok().as_deref() == Some("1") {
         ENABLED.store(true, Ordering::Relaxed);
@@ -44,6 +51,41 @@ pub(crate) fn init_from_env() {
     if std::env::var("LUMEN_METAL_DECODE_GPUTIME").ok().as_deref() == Some("1") {
         GPUTIME_ENABLED.store(true, Ordering::Relaxed);
     }
+}
+
+/// Diagnostic sub-stage skip bitmask for the full-attention decode block, parsed
+/// once from `LUMEN_METAL_FULLATTN_SUBSKIP` (decimal or 0x-hex u32). When a bit is
+/// set, the matching sub-stage's GPU dispatch is skipped so its cost can be read
+/// off the `full_attn` per-section GPU time. Skipping corrupts the output (this is
+/// a timing-attribution tool only). 0 / unset => no-op (every sub-stage runs).
+///
+/// Bit layout (see `FULLATTN_SKIP_*` constants in `decode_greedy.rs`):
+///   bit0 K proj, bit1 V proj, bit2 RoPE+KV-write, bit3 attention (MHA/flash),
+///   bit4 Q+gate proj, bit5 Wo proj, bit6 deinterleave/norm/assemble + misc.
+#[inline]
+pub(crate) fn fullattn_subskip() -> u32 {
+    use std::sync::atomic::AtomicU32;
+    // Sentinel bit31 marks "already resolved" so a genuine mask of 0 is cached.
+    const RESOLVED: u32 = 0x8000_0000;
+    static CACHE: AtomicU32 = AtomicU32::new(0);
+    let cur = CACHE.load(Ordering::Relaxed);
+    if cur & RESOLVED != 0 {
+        return cur & !RESOLVED;
+    }
+    let v = std::env::var("LUMEN_METAL_FULLATTN_SUBSKIP")
+        .ok()
+        .and_then(|s| {
+            let t = s.trim();
+            if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                u32::from_str_radix(hex, 16).ok()
+            } else {
+                t.parse::<u32>().ok()
+            }
+        })
+        .unwrap_or(0)
+        & !RESOLVED; // never let the sentinel be a user-supplied bit
+    CACHE.store(v | RESOLVED, Ordering::Relaxed);
+    v
 }
 
 thread_local! {
@@ -107,6 +149,116 @@ pub(crate) fn record_gpu_time(gpu_secs: f64) {
 }
 
 thread_local! {
+    /// Lean-pipeline wall accumulator: (sum_gpu_secs, sum_wall_secs, count,
+    /// last completion Instant). Wall = time between successive front-CB
+    /// completions (the steady-state per-token wall of the async path).
+    static LEAN_ACC: RefCell<(f64, f64, u64)> = const { RefCell::new((0.0, 0.0, 0)) };
+    static LEAN_LAST: RefCell<Option<Instant>> = const { RefCell::new(None) };
+}
+
+/// Record one lean-pipeline token: accumulate the front CB's true GPU-busy time
+/// and the wall between successive completions, and every 64 tokens print
+/// lean's effective wall/tok + GPU_util. Comparable head-to-head with the
+/// sequential `record_gpu_time` output. No-op unless DECODE_GPUTIME=1.
+pub(crate) fn record_lean_wall(gpu_secs: f64) {
+    if !GPUTIME_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = Instant::now();
+    let wall = LEAN_LAST.with(|l| {
+        let prev = l.borrow_mut().replace(now);
+        prev.map(|p| now.duration_since(p).as_secs_f64())
+    });
+    let fire = LEAN_ACC.with(|a| {
+        let mut a = a.borrow_mut();
+        a.0 += gpu_secs;
+        if let Some(w) = wall {
+            a.1 += w;
+        }
+        a.2 += 1;
+        a.2 >= 64
+    });
+    if fire {
+        let (gpu_sum, wall_sum, n) = LEAN_ACC.with(|a| *a.borrow());
+        let gpu_ms = gpu_sum / n as f64 * 1000.0;
+        // wall accumulates (n-1) intervals (first token has no predecessor).
+        let wall_ms = if n > 1 {
+            wall_sum / (n as f64 - 1.0) * 1000.0
+        } else {
+            0.0
+        };
+        let util = if wall_ms > 0.0 {
+            gpu_ms / wall_ms * 100.0
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[decode-lean] over {n} tokens: wall={wall_ms:.3} ms/tok  \
+             GPU_busy={gpu_ms:.3} ms/tok  GPU_util={util:.1}%  \
+             (recovered_vs_serial_gap = wall-GPU = {:.3} ms/tok)",
+            (wall_ms - gpu_ms).max(0.0)
+        );
+        LEAN_ACC.with(|a| *a.borrow_mut() = (0.0, 0.0, 0));
+    }
+}
+
+thread_local! {
+    /// Encode/exec split accumulator (sum_encode_secs, sum_wait_secs,
+    /// sum_gpu_secs, count). Encode = CPU time from new_command_buffer to
+    /// commit; wait = wall time the commit_and_wait blocks; gpu = true GPU
+    /// busy (GPUEndTime-GPUStartTime). Reported with the same 64-tok window
+    /// as record_gpu_time. No-op unless LUMEN_METAL_DECODE_GPUTIME=1.
+    static SPLIT_ACC: RefCell<(f64, f64, f64, u64)> = const { RefCell::new((0.0, 0.0, 0.0, 0)) };
+}
+
+/// Accumulate the CPU-encode-vs-GPU-exec split for one decode token and, every
+/// 64 tokens, print the decomposition: how much of the per-token wall is spent
+/// (a) CPU-encoding the command buffer, (b) blocked in commit_and_wait, and how
+/// that wait compares to the true GPU-busy time. This is the decisive STEP-1
+/// measurement for whether an encode-once-replay / CPU-GPU-overlap paradigm can
+/// recover wall time: if CPU-encode is a large fraction of wall AND it is fully
+/// serial before the GPU runs, overlap can hide it. No-op unless
+/// LUMEN_METAL_DECODE_GPUTIME=1.
+pub(crate) fn record_encode_split(encode_secs: f64, wait_secs: f64, gpu_secs: f64) {
+    if !GPUTIME_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let fire = SPLIT_ACC.with(|a| {
+        let mut a = a.borrow_mut();
+        a.0 += encode_secs;
+        a.1 += wait_secs;
+        a.2 += gpu_secs;
+        a.3 += 1;
+        a.3 >= 64
+    });
+    if fire {
+        let (enc_sum, wait_sum, gpu_sum, n) = SPLIT_ACC.with(|a| *a.borrow());
+        let nf = n as f64;
+        let enc_ms = enc_sum / nf * 1000.0;
+        let wait_ms = wait_sum / nf * 1000.0;
+        let gpu_ms = gpu_sum / nf * 1000.0;
+        // Within-token wall = encode + wait (the loop body is serial:
+        // encode the CB, then block on commit_and_wait). The wait should be
+        // ~= gpu_busy + launch/scheduling tail; encode is the pure CPU cost
+        // an overlap paradigm targets.
+        let body_ms = enc_ms + wait_ms;
+        let tail_ms = (wait_ms - gpu_ms).max(0.0);
+        eprintln!(
+            "[decode-split] over {n} tokens: CPU_encode={enc_ms:.3} ms/tok  \
+             commit_wait={wait_ms:.3} ms/tok  GPU_busy={gpu_ms:.3} ms/tok  \
+             (within-tok body={body_ms:.3}  wait_tail_over_gpu={tail_ms:.3})  \
+             encode_frac_of_body={:.1}%",
+            if body_ms > 0.0 {
+                enc_ms / body_ms * 100.0
+            } else {
+                0.0
+            }
+        );
+        SPLIT_ACC.with(|a| *a.borrow_mut() = (0.0, 0.0, 0.0, 0));
+    }
+}
+
+thread_local! {
     /// Label of the in-flight (not-yet-committed) section.
     static IN_FLIGHT: RefCell<&'static str> = const { RefCell::new("(start)") };
     /// Accumulator: label -> (total_duration, call_count).
@@ -125,6 +277,15 @@ pub(crate) fn maybe_report_and_reset(every: u64) {
     if !is_enabled() {
         return;
     }
+    // Diagnostic override: report after this many decode tokens instead of the
+    // built-in cadence. Lets a short run (e.g. one whose output hits EOS before
+    // the default 64-token mark) still emit a valid per-call average; the us/call
+    // is a per-call mean and is independent of the token count. Unset => default.
+    let every = std::env::var("LUMEN_METAL_DECODE_PROFILE_EVERY")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(every);
     let fire = TOK_COUNT.with(|c| {
         let mut c = c.borrow_mut();
         *c += 1;

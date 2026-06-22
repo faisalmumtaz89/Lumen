@@ -1833,6 +1833,46 @@ impl MetalBuffer {
         }
     }
 
+    /// Write u32 data into the buffer (e.g. seeding the pipelined-decode token
+    /// ring with the first token id, which the GPU embed then reads).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the data exceeds the buffer length.
+    pub fn write_u32(&self, data: &[u32]) {
+        let byte_len = data.len() * 4;
+        assert!(
+            byte_len as u64 <= self.length(),
+            "MetalBuffer::write_u32: data size ({byte_len}) exceeds buffer length ({})",
+            self.length()
+        );
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr() as *const u8,
+                self.contents() as *mut u8,
+                byte_len,
+            );
+        }
+    }
+
+    /// Write a single u64 into the buffer (e.g. seeding the GPU-sampler RNG-state
+    /// ring slot with the xorshift64 state the CPU sampler holds).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer is smaller than 8 bytes.
+    pub fn write_u64_one(&self, value: u64) {
+        assert!(
+            self.length() >= 8,
+            "MetalBuffer::write_u64_one: buffer length ({}) < 8",
+            self.length()
+        );
+        let bytes = value.to_le_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.contents() as *mut u8, 8);
+        }
+    }
+
     /// Read u16 data from the buffer into a slice (for f16 KV cache).
     ///
     /// # Panics

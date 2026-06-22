@@ -674,6 +674,414 @@ kernel void argmax(
 }
 
 // ============================================================================
+// gpu_sampler: GPU-side temperature sampling with PARITY to the CPU sampler.
+//
+// Reproduces, BIT-FOR-BIT where the platform allows, the CPU reference
+// `sample_logits` (crates/lumen-runtime/src/sampling.rs) for the temperature>0
+// path with: repetition/presence/frequency penalties over a history window,
+// temperature, softmax (max-subtract), and an inverse-CDF categorical draw.
+// top_k / top_p / min_p are NOT implemented in this v1 kernel; the Rust caller
+// gates the GPU-sampler path to require them unset (and routes to the CPU
+// sampler otherwise), so this kernel is only ever invoked for the exact subset
+// it reproduces.
+//
+// PARITY CONTRACT (matches sampling.rs precisely):
+//   1. Penalties on RAW logits, BEFORE temperature, driven by a GPU-RESIDENT
+//      FREQUENCY ARRAY `freq_arr[vocab]` (u32 occurrence count per token id over
+//      the FULL history). For each token id `t` with freq_arr[t] = c > 0:
+//         new = (logit[t] > 0 ? logit[t]/rep : logit[t]*rep)
+//               - presence - freq*c
+//      This is EXACTLY the CPU `apply_penalties`/`apply_penalty_one` over the
+//      full-history `state.freq` map: one application per UNIQUE token id (the
+//      array has one slot per id, so a token seen N times is penalised once for
+//      `rep` and by `freq*N` for the count term — identical to the freq map).
+//      The parallel per-index application is order-independent and bit-exact.
+//      The array is GPU-resident so a pipelined CB(k+1) sees CB(k)'s freshly
+//      appended token WITHOUT any CPU round-trip (the FIFO queue orders the
+//      append-before-read), which is what lets the SAMPLED path pipeline at the
+//      same depth-2 as the greedy argmax chain. The Rust caller gates this path
+//      to `repeat_last_n == None` (full-history window) so the array semantics
+//      match; a windowed penalty falls back to the CPU sampler.
+//      After selecting the token `sel`, the kernel does `freq_arr[sel] += 1`
+//      (single thread) so the NEXT CB's penalty phase sees it -- the GPU-side
+//      analogue of SamplerState::record / the history ring (checklist 5 + 7).
+//   2. Temperature: logit[i] *= (1.0/temperature) for ALL i (after penalties).
+//   3. Softmax max: max over ALL temperature-scaled logits. Max is associative
+//      and commutative for finite f32, so the parallel reduction is EXACT
+//      (bit-identical to the CPU's sequential/NEON max).
+//   4. exp: exp_i = precise::exp(scaled_i - max), elementwise in parallel. exp
+//      is order-independent; the only residual non-determinism vs the CPU is
+//      the transcendental implementation itself (Metal precise::exp vs Rust
+//      std f32 exp), which can differ by <=1 ULP per element. This is the ONE
+//      place true bit-exactness is not guaranteed; it only matters at a genuine
+//      near-tie where r ~ cumsum boundary (characterized by the parity test).
+//   5. sum: SUM of exp_i computed by a SINGLE THREAD, SEQUENTIALLY i=0..n, in
+//      f32 — reproducing the CPU softmax Phase-2 accumulation order exactly
+//      (the CPU does a naive sequential f32 add, NOT Kahan; a GPU tree-reduce
+//      would round differently and shift cumsum, so we MUST do this serially).
+//   6. inv_sum = 1.0/sum (computed once, as the CPU does).
+//   7. draw: ONE rng.next_f32() (xorshift64 13/7/17; r = (next_u64()>>40) *
+//      (1/2^24)); then a SINGLE THREAD walks cumsum += exp_i*inv_sum (the CPU
+//      normalizes p_i = exp_i*inv_sum THEN accumulates p_i, so we multiply
+//      per-term BEFORE adding — NOT (sum exp)*inv_sum) and returns the first i
+//      with `r < cumsum` (STRICT <). Sequential to match sample_categorical's
+//      accumulation order exactly. Fall through to (n-1) on FP slack.
+//   8. Degenerate guards: if max is non-finite OR sum <= f32::EPSILON, the CPU
+//      fills a uniform distribution (p=1/n). We reproduce: a uniform draw picks
+//      floor(r*n) clamped (equivalently the first i with r < (i+1)/n). The CPU
+//      STILL consumes exactly one rng draw in these branches (softmax fills
+//      uniform, then sample_categorical draws once), so draw-count parity holds.
+//
+// RNG STATE RING: rng_state_in[0] holds this step's u64 xorshift state. The
+// kernel performs exactly ONE next_u64() (advancing the state once) and writes
+// the ADVANCED state to rng_state_out[0]. The Rust driver wires these to a
+// state ring (step%R -> (step+1)%R) exactly like the token ring, so the
+// post-token RNG state advances by precisely one draw per token (draw-count
+// parity, checklist item 2).
+//
+// f32::EPSILON in Rust = 1.19209290e-07. Matched as a literal below.
+//
+// Launch: 1 threadgroup, 256 threads (single-TG finalizer, like argmax).
+// ============================================================================
+
+constant float LUMEN_F32_EPSILON = 1.1920929e-07f;
+
+kernel void gpu_sampler(
+    device float*        logits        [[buffer(0)]],  // [n] in/out scratch
+    device uint*         token_out     [[buffer(1)]],  // [1] selected token id
+    constant uint&       n             [[buffer(2)]],  // vocab size
+    constant float&      inv_temp      [[buffer(3)]],  // 1.0 / temperature
+    device atomic_uint*  freq_arr      [[buffer(4)]],  // [n] per-id history count
+    constant uint&       pen_active    [[buffer(5)]],  // 1 if any penalty active
+    constant float&      rep           [[buffer(6)]],  // repetition_penalty
+    constant float&      presence      [[buffer(7)]],  // presence_penalty
+    constant float&      freq          [[buffer(8)]],  // frequency_penalty
+    device const ulong*  rng_state_in  [[buffer(9)]],  // [1] xorshift64 state
+    device ulong*        rng_state_out [[buffer(10)]], // [1] advanced state
+    uint tid        [[thread_index_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    const uint TG = 256u;
+
+    // ----- Phase A: penalties on RAW logits, driven by the GPU freq array. ----
+    // One application per UNIQUE token id (the array has one slot per id), so it
+    // is bit-identical to the CPU loop over the full-history freq map. Parallel
+    // over vocab; each index is touched by exactly one thread (order-independent).
+    // freq_arr is atomic_uint only so the post-select append (atomic_fetch_add)
+    // is well-defined; here we read it relaxed (the FIFO queue guarantees the
+    // prior CB's append is visible, and within this CB no append has happened
+    // yet, so a plain relaxed load is correct and race-free).
+    if (pen_active != 0u) {
+        const bool rep_active = fabs(rep - 1.0f) >= LUMEN_F32_EPSILON;
+        for (uint i = tid; i < n; i += TG) {
+            uint c = atomic_load_explicit(&freq_arr[i], memory_order_relaxed);
+            if (c == 0u) { continue; }
+            float v = logits[i];
+            float nv = v;
+            if (rep_active) {
+                nv = (v > 0.0f) ? (v / rep) : (v * rep);
+            }
+            nv = nv - presence;
+            nv = nv - freq * (float)c;
+            logits[i] = nv;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+
+    // ----- Phase B1: temperature scale + max over ALL logits (parallel). -----
+    // We fold the temperature multiply into the max scan; the per-element
+    // scaled value is recomputed in B2 (cheap mul) so we never need a second
+    // device buffer. Max is exact regardless of reduction order.
+    float local_max = -INFINITY;
+    for (uint i = tid; i < n; i += TG) {
+        float s = logits[i] * inv_temp;
+        if (s > local_max) { local_max = s; }
+    }
+    local_max = simd_max(local_max);
+    threadgroup float tg_max[8];
+    if (simd_lane == 0) { tg_max[simd_group] = local_max; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float max_val_sh;
+    if (tid == 0) {
+        float m = tg_max[0];
+        for (uint i = 1; i < 8; i++) { if (tg_max[i] > m) { m = tg_max[i]; } }
+        max_val_sh = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_val = max_val_sh;
+
+    // Degenerate guard #1: non-finite max -> CPU fills uniform (1/n) then draws
+    // once. Reproduce a single-draw uniform pick. (isfinite covers +/-inf+nan.)
+    bool max_finite = isfinite(max_val);
+
+    // ----- Phase B2: exp_i = precise::exp(scaled_i - max) into logits[i]. -----
+    // Only when max is finite (else logits content is irrelevant; uniform path).
+    if (max_finite) {
+        for (uint i = tid; i < n; i += TG) {
+            float s = logits[i] * inv_temp;
+            logits[i] = precise::exp(s - max_val);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // ----- Phase C: SINGLE-THREAD sequential sum + inverse-CDF walk. -----
+    // This is the parity-critical core: the CPU sums exp sequentially (i=0..n)
+    // and walks the normalized cumsum sequentially. We reproduce BOTH on one
+    // thread so the f32 rounding order is identical.
+    if (tid == 0) {
+        // RNG: exactly one next_u64 -> next_f32 (== CPU sample_categorical).
+        ulong x = rng_state_in[0];
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        rng_state_out[0] = x;                 // advanced state (draw-count parity)
+        // next_f32: (next_u64() >> 40) as f32 * (1/2^24).
+        float r = (float)(x >> 40) * (1.0f / (float)(1u << 24));
+
+        uint sel;
+        if (!max_finite) {
+            // Uniform fallback: probs all 1/n; cumsum walk gives first i with
+            // r < (i+1)/n  <=>  i = floor(r*n) (r in [0,1)). Clamp to n-1.
+            float fn = (float)n;
+            uint i = (uint)(r * fn);
+            sel = (i >= n) ? (n - 1u) : i;
+        } else {
+            // Sequential sum of exp, matching softmax Phase-2 order.
+            float sum = 0.0f;
+            for (uint i = 0; i < n; i++) { sum += logits[i]; }
+            if (sum <= LUMEN_F32_EPSILON) {
+                // Degenerate guard #2: CPU fills uniform then draws (already
+                // drew above). Same uniform pick as the non-finite branch.
+                float fn = (float)n;
+                uint i = (uint)(r * fn);
+                sel = (i >= n) ? (n - 1u) : i;
+            } else {
+                float inv_sum = 1.0f / sum;
+                // Inverse-CDF walk: p_i = exp_i*inv_sum (per-term rounded),
+                // cumsum += p_i, first i with r < cumsum. STRICT <.
+                float cumsum = 0.0f;
+                sel = n - 1u;                  // FP-slack fall-through
+                for (uint i = 0; i < n; i++) {
+                    cumsum += logits[i] * inv_sum;
+                    if (r < cumsum) { sel = i; break; }
+                }
+            }
+        }
+        token_out[0] = sel;
+        // GPU-side SamplerState::record: append the chosen token to the history
+        // freq array so the NEXT pipelined CB's penalty phase sees it. Ordered
+        // before the next CB by the single FIFO queue (no event needed, same
+        // invariant the greedy token-ring chain relies on).
+        if (pen_active != 0u) {
+            atomic_fetch_add_explicit(&freq_arr[sel], 1u, memory_order_relaxed);
+        }
+    }
+}
+
+// ============================================================================
+// gpu_sampler_fast: latency-hiding variant of gpu_sampler.
+//
+// Identical pipeline + identical RNG/penalty semantics, but the two O(vocab)
+// reductions (the softmax sum and the inverse-CDF walk) are made FAST by
+// hiding device-memory latency with all 256 threads instead of running a single
+// thread serially over ~248k device loads (which is latency-bound: ~14 ms).
+//
+// HOW IT STAYS PARITY-FAITHFUL:
+//   * Penalties, max, and exp are computed EXACTLY as in gpu_sampler (max is
+//     order-independent => bit-exact; exp is the same precise::exp).
+//   * The SUM is computed as a HIERARCHICAL block sum: thread t sums its
+//     contiguous block [t*B, (t+1)*B) SEQUENTIALLY (in-order, matching the CPU
+//     accumulation order WITHIN the block), producing block_sum[t]; then one
+//     thread sums the 256 block sums SEQUENTIALLY in block order. This is NOT
+//     bit-identical to the CPU's single continuous running sum (a block boundary
+//     restarts the local accumulator at 0 instead of carrying the running
+//     total), but the difference is the SAME O(1e-6) magnitude as the exp
+//     transcendental difference that gpu_sampler already incurs, so it does not
+//     change the selected token except at a genuine sub-ULP near-tie. (The
+//     parity test asserts this empirically against the CPU reference.)
+//   * The WALK reuses the per-block sums: a single thread scans the 256 block
+//     sums to find the block B that contains the target (running block-prefix
+//     first exceeds r), carrying the exact block-prefix; then it walks WITHIN
+//     block B (<= ~970 elements) sequentially, exactly as the CPU walk would,
+//     starting from that prefix. Bounded single-thread work (~256 + ~970 loads)
+//     instead of up to ~248k. Uses the SAME normalized per-term accumulation
+//     (cumsum += exp_i * inv_sum) and the SAME strict `r < cumsum` test.
+//
+// The block boundaries are deterministic (B = ceil(n/256)), so the reduction
+// order is fixed run-to-run (determinism preserved). Launch: 1 TG, 256 threads.
+// ============================================================================
+
+kernel void gpu_sampler_fast(
+    device float*        logits        [[buffer(0)]],
+    device uint*         token_out     [[buffer(1)]],
+    constant uint&       n             [[buffer(2)]],
+    constant float&      inv_temp      [[buffer(3)]],
+    device atomic_uint*  freq_arr      [[buffer(4)]],
+    constant uint&       pen_active    [[buffer(5)]],
+    constant float&      rep           [[buffer(6)]],
+    constant float&      presence      [[buffer(7)]],
+    constant float&      freq          [[buffer(8)]],
+    device const ulong*  rng_state_in  [[buffer(9)]],
+    device ulong*        rng_state_out [[buffer(10)]],
+    uint tid        [[thread_index_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    const uint TG = 256u;
+    // Contiguous block size per thread (covers all n; last block may be short).
+    const uint B = (n + TG - 1u) / TG;
+
+    // ----- Phase A: penalties (parallel; identical to gpu_sampler). -----
+    if (pen_active != 0u) {
+        const bool rep_active = fabs(rep - 1.0f) >= LUMEN_F32_EPSILON;
+        for (uint i = tid; i < n; i += TG) {
+            uint c = atomic_load_explicit(&freq_arr[i], memory_order_relaxed);
+            if (c == 0u) { continue; }
+            float v = logits[i];
+            float nv = v;
+            if (rep_active) { nv = (v > 0.0f) ? (v / rep) : (v * rep); }
+            nv = nv - presence;
+            nv = nv - freq * (float)c;
+            logits[i] = nv;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+
+    // ----- Phase B1: temperature + max (parallel reduction; exact). -----
+    float local_max = -INFINITY;
+    for (uint i = tid; i < n; i += TG) {
+        float s = logits[i] * inv_temp;
+        if (s > local_max) { local_max = s; }
+    }
+    local_max = simd_max(local_max);
+    threadgroup float tg_max[8];
+    if (simd_lane == 0) { tg_max[simd_group] = local_max; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float max_val_sh;
+    if (tid == 0) {
+        float m = tg_max[0];
+        for (uint i = 1; i < 8; i++) { if (tg_max[i] > m) { m = tg_max[i]; } }
+        max_val_sh = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_val = max_val_sh;
+    bool max_finite = isfinite(max_val);
+
+    // ----- Phase B2: exp into logits[i] (parallel; identical). -----
+    if (max_finite) {
+        for (uint i = tid; i < n; i += TG) {
+            float s = logits[i] * inv_temp;
+            logits[i] = precise::exp(s - max_val);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // ----- Phase C-sum: hierarchical block sum (parallel block, serial merge). -
+    // Each thread sums its contiguous block in order (matching the CPU
+    // accumulation order WITHIN the block). Latency across the 256 blocks is
+    // hidden because the threads issue their loads concurrently.
+    threadgroup float block_sum[256];
+    if (max_finite) {
+        uint start = tid * B;
+        uint end = min(start + B, n);
+        float bs = 0.0f;
+        for (uint i = start; i < end; i++) { bs += logits[i]; }
+        block_sum[tid] = bs;
+    } else {
+        block_sum[tid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // tid 0 merges the block sums (sequential, block order) into the total, does
+    // the RNG draw, and computes inv_sum + the degenerate flags. Shared out.
+    threadgroup float inv_sum_sh;
+    threadgroup float r_sh;
+    threadgroup uint  sel_sh;       // final token (set here for degenerate paths)
+    threadgroup uint  done_sh;      // 1 if a degenerate/uniform path already set sel
+    if (tid == 0) {
+        ulong x = rng_state_in[0];
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        rng_state_out[0] = x;
+        float r = (float)(x >> 40) * (1.0f / (float)(1u << 24));
+        r_sh = r;
+        done_sh = 0u;
+        inv_sum_sh = 0.0f;
+        if (!max_finite) {
+            float fn = (float)n;
+            uint i = (uint)(r * fn);
+            sel_sh = (i >= n) ? (n - 1u) : i;
+            done_sh = 1u;
+        } else {
+            float sum = 0.0f;
+            for (uint t = 0; t < TG; t++) { sum += block_sum[t]; }
+            if (sum <= LUMEN_F32_EPSILON) {
+                float fn = (float)n;
+                uint i = (uint)(r * fn);
+                sel_sh = (i >= n) ? (n - 1u) : i;
+                done_sh = 1u;
+            } else {
+                inv_sum_sh = 1.0f / sum;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // If not already resolved, do the inverse-CDF walk in NORMALIZED space.
+    // To keep the per-element normalized accumulation the CPU uses (p_i =
+    // exp_i*inv_sum accumulated term-by-term) we recompute each block's
+    // NORMALIZED partial now that inv_sum is known, then a single thread finds
+    // the target block via the normalized block-prefix and walks WITHIN that
+    // block per-element from the carried prefix. Both the block-partials and the
+    // within-block walk use the same `+= logits[i]*inv_sum` term form, so the
+    // accumulation style matches the CPU (modulo block-boundary re-association,
+    // the same O(1e-6) class as the exp difference).
+    if (done_sh == 0u) {
+        float inv_sum = inv_sum_sh;
+        // Parallel: per-block normalized partial.
+        threadgroup float block_norm[256];
+        uint start = tid * B;
+        uint end = min(start + B, n);
+        float bn = 0.0f;
+        for (uint i = start; i < end; i++) { bn += logits[i] * inv_sum; }
+        block_norm[tid] = bn;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            float r = r_sh;
+            // Find target block via normalized block-prefix (sequential).
+            float cumsum = 0.0f;
+            uint b = 0u;
+            for (; b < TG; b++) {
+                float next = cumsum + block_norm[b];
+                if (r < next) { break; }
+                cumsum = next;
+            }
+            uint sel = n - 1u;     // FP-slack fall-through (r past last block)
+            if (b < TG) {
+                uint s2 = b * B;
+                uint e2 = min(s2 + B, n);
+                for (uint i = s2; i < e2; i++) {
+                    cumsum += logits[i] * inv_sum;
+                    if (r < cumsum) { sel = i; break; }
+                }
+            }
+            sel_sh = sel;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // tid 0 writes the result + appends to the history freq array.
+    if (tid == 0) {
+        uint sel = sel_sh;
+        token_out[0] = sel;
+        if (pen_active != 0u) {
+            atomic_fetch_add_explicit(&freq_arr[sel], 1u, memory_order_relaxed);
+        }
+    }
+}
+
+// ============================================================================
 // bias_add: Element-wise bias addition for single-token decode
 //
 // Adds a bias vector to the output of a matmul projection:
