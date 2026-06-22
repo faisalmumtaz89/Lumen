@@ -281,14 +281,15 @@ kernel void rmsnorm_dequant_matmul_q4_0_deferred_nr2(
             device const uchar* qdata = (device const uchar*)(bp + 2) + il * 4;
 
             float sumq = 0.f;
+            float syl = 0.f;
             #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uchar byte_val = qdata[i];
-                float lo = float(byte_val & 0x0F) - 8.0f;
-                float hi = float(byte_val >> 4) - 8.0f;
-                sumq += lo * yl_lo[i] + hi * yl_hi[i];
+                sumq += float(byte_val & 0x0F) * yl_lo[i] + float(byte_val >> 4) * yl_hi[i];
+                syl += yl_lo[i] + yl_hi[i];
             }
-            sumf[row] += sumq * scale;
+            // Fold Q4_0 -8 zero-point: dot((q-8),yl) = dot(q,yl) - 8*sum(yl).
+            sumf[row] += (sumq - 8.0f * syl) * scale;
         }
 
         yb_lo += NSG * NQ * 32;
@@ -417,14 +418,15 @@ kernel void rmsnorm_dequant_matmul_q4_0_deferred_residual_nr2(
             device const uchar* qdata = (device const uchar*)(bp + 2) + il * 4;
 
             float sumq = 0.f;
+            float syl = 0.f;
             #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uchar byte_val = qdata[i];
-                float lo = float(byte_val & 0x0F) - 8.0f;
-                float hi = float(byte_val >> 4) - 8.0f;
-                sumq += lo * yl_lo[i] + hi * yl_hi[i];
+                sumq += float(byte_val & 0x0F) * yl_lo[i] + float(byte_val >> 4) * yl_hi[i];
+                syl += yl_lo[i] + yl_hi[i];
             }
-            sumf[row] += sumq * scale;
+            // Fold Q4_0 -8 zero-point: dot((q-8),yl) = dot(q,yl) - 8*sum(yl).
+            sumf[row] += (sumq - 8.0f * syl) * scale;
         }
 
         yb_lo += NSG * NQ * 32;
@@ -538,6 +540,12 @@ kernel void rmsnorm_ffn_fused_gate_up_swiglu_q4_0_deferred(
             yl_hi[i] = xi_hi * norm_weight[block_base + il * 4 + 16 + i];
         }
 
+        // Fold the Q4_0 -8 zero-point out of the per-nibble loop: dot((q-8),yl)
+        // = dot(q,yl) - 8*sum(yl). sum_yl is shared by gate and up, so the 16
+        // per-nibble subtracts/block collapse to one correction term each.
+        float sum_yl = (yl_lo[0] + yl_lo[1] + yl_lo[2] + yl_lo[3])
+                     + (yl_hi[0] + yl_hi[1] + yl_hi[2] + yl_hi[3]);
+
         // Gate weights
         device const uchar* gate_bp = gate_row_ptr + ib * Q4_BS;
         float gate_scale = float(as_type<half>(*(device const ushort*)gate_bp));
@@ -546,11 +554,9 @@ kernel void rmsnorm_ffn_fused_gate_up_swiglu_q4_0_deferred(
         #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; i++) {
             uchar byte_val = gate_qdata[i];
-            float lo = float(byte_val & 0x0F) - 8.0f;
-            float hi = float(byte_val >> 4) - 8.0f;
-            gate_dot += lo * yl_lo[i] + hi * yl_hi[i];
+            gate_dot += float(byte_val & 0x0F) * yl_lo[i] + float(byte_val >> 4) * yl_hi[i];
         }
-        gate_sum += gate_dot * gate_scale;
+        gate_sum += (gate_dot - 8.0f * sum_yl) * gate_scale;
 
         // Up weights
         device const uchar* up_bp = up_row_ptr + ib * Q4_BS;
@@ -560,11 +566,9 @@ kernel void rmsnorm_ffn_fused_gate_up_swiglu_q4_0_deferred(
         #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; i++) {
             uchar byte_val = up_qdata[i];
-            float lo = float(byte_val & 0x0F) - 8.0f;
-            float hi = float(byte_val >> 4) - 8.0f;
-            up_dot += lo * yl_lo[i] + hi * yl_hi[i];
+            up_dot += float(byte_val & 0x0F) * yl_lo[i] + float(byte_val >> 4) * yl_hi[i];
         }
-        up_sum += up_dot * up_scale;
+        up_sum += (up_dot - 8.0f * sum_yl) * up_scale;
     }
 
     // Reduce all three quantities
@@ -661,6 +665,12 @@ kernel void rmsnorm_ffn_fused_gate_up_swiglu_q4_0_8row(
             yl_hi[i] = xi_hi * norm_weight[block_base + il * 4 + 16 + i];
         }
 
+        // Fold the Q4_0 -8 zero-point out of the per-nibble loop: dot((q-8),yl)
+        // = dot(q,yl) - 8*sum(yl). sum_yl is shared by gate and up, so the 16
+        // per-nibble subtracts/block collapse to one correction term each.
+        float sum_yl = (yl_lo[0] + yl_lo[1] + yl_lo[2] + yl_lo[3])
+                     + (yl_hi[0] + yl_hi[1] + yl_hi[2] + yl_hi[3]);
+
         // Gate weights
         device const uchar* gate_bp = gate_row_ptr + ib * Q4_BS;
         float gate_scale = float(as_type<half>(*(device const ushort*)gate_bp));
@@ -669,11 +679,9 @@ kernel void rmsnorm_ffn_fused_gate_up_swiglu_q4_0_8row(
         #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; i++) {
             uchar byte_val = gate_qdata[i];
-            float lo = float(byte_val & 0x0F) - 8.0f;
-            float hi = float(byte_val >> 4) - 8.0f;
-            gate_dot += lo * yl_lo[i] + hi * yl_hi[i];
+            gate_dot += float(byte_val & 0x0F) * yl_lo[i] + float(byte_val >> 4) * yl_hi[i];
         }
-        gate_sum += gate_dot * gate_scale;
+        gate_sum += (gate_dot - 8.0f * sum_yl) * gate_scale;
 
         // Up weights
         device const uchar* up_bp = up_row_ptr + ib * Q4_BS;
@@ -683,11 +691,9 @@ kernel void rmsnorm_ffn_fused_gate_up_swiglu_q4_0_8row(
         #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; i++) {
             uchar byte_val = up_qdata[i];
-            float lo = float(byte_val & 0x0F) - 8.0f;
-            float hi = float(byte_val >> 4) - 8.0f;
-            up_dot += lo * yl_lo[i] + hi * yl_hi[i];
+            up_dot += float(byte_val & 0x0F) * yl_lo[i] + float(byte_val >> 4) * yl_hi[i];
         }
-        up_sum += up_dot * up_scale;
+        up_sum += (up_dot - 8.0f * sum_yl) * up_scale;
     }
 
     // Final reduction: ONE simd_sum each (deferred pattern payoff)

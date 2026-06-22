@@ -627,17 +627,104 @@ impl MetalF32Backend {
 
     /// Fused single-encoder variant of encode_gdn_layer_decode.
     ///
-    /// All dispatches go through the caller-provided encoder (no encoder
-    /// create/end cycles). The blit copy is replaced with a compute
-    /// copy_buffer dispatch to avoid forcing an encoder boundary.
-    pub(crate) fn encode_gdn_layer_decode_fused(
+    /// Takes OWNERSHIP of the layer encoder and RETURNS the encoder that is
+    /// active when the layer finishes (the caller must adopt it). In the normal
+    /// path the same encoder is returned unchanged. When `concurrent` is set
+    /// (LUMEN_METAL_CONCURRENT_PROJ on a GDN-capable Q4_0 layer), the
+    /// independent PARALLEL-GROUP-1 projection cluster (QKV-in-proj + alpha/beta
+    /// + attn_gate — all read the SAME normed x and write DISJOINT buffers) is
+    /// dispatched on a CONCURRENT encoder so Metal may spread their threadgroups
+    /// across both M3 Ultra dies; a resource-scoped barrier then closes the
+    /// cluster and a fresh SERIAL encoder runs GROUP 2 (conv1d + the recurrence)
+    /// so the h_state update keeps its deterministic serial-encoder ordering.
+    /// Byte-identical to the serial path (disjoint cluster outputs, shared
+    /// read-only input; the recurrence is never made concurrent).
+    /// One-time, lazy F32 -> F16 conversion of GDN layer `gdn_idx`'s persistent
+    /// h_state, for the `LUMEN_METAL_GDN_F16_STATE_DECODE` decode lever.
+    ///
+    /// On the FIRST decode touch of a GDN layer (mirror is `None`), allocates a
+    /// half-size F16 buffer and encodes a `gdn_state_f32_to_f16` dispatch on the
+    /// CURRENT serial `enc` that copies+rounds the prefill F32 state into it. The
+    /// convert is appended to `enc` BEFORE the recurrence dispatch that consumes
+    /// it, so serial-encoder ordering guarantees convert-then-read. Subsequent
+    /// tokens find the mirror already populated and skip the convert (the F16
+    /// recurrence reads/writes the mirror in place). A no-op when the flag is OFF,
+    /// the converter pipeline is unavailable, or the mirror already exists.
+    pub(crate) fn ensure_gdn_f16_state_decode(
+        device: &super::ffi::MetalDevice,
+        pipelines: &MetalPipelines,
         enc: &MetalComputeEncoder,
+        s: &MetalScratch,
+        gdn_idx: usize,
+    ) -> Result<(), RuntimeError> {
+        // The F16 mirror is built when ANY of the plain F16-state flag, the
+        // F16-state+h1 (dead-store-elided) flag, or the vi-amortized v2 flag is on.
+        // All consume the same half-size mirror; only the recurrence kernel differs.
+        let want_v4 = crate::metal::gdn_f16_state_h1_v4_enabled();
+        let want_v2 = crate::metal::gdn_f16_state_h1_v2_enabled();
+        let want_h1 = crate::metal::gdn_f16_state_h1_enabled() || want_v2 || want_v4;
+        if !crate::metal::gdn_f16_state_decode_enabled() && !want_h1 {
+            return Ok(());
+        }
+        // Converter must be present. The vi-amortized v2 needs its own kernel; the
+        // f16_h1 variant needs the elided kernel; otherwise the plain f16 kernel. If
+        // the required recurrence kernel did not compile, fall back (no mirror -> f32).
+        if pipelines.gdn_state_f32_to_f16.is_none() {
+            return Ok(());
+        }
+        if want_v4 {
+            if pipelines.gdn_state_output_l2_sg_f16_h1_v4.is_none() {
+                return Ok(());
+            }
+        } else if want_v2 {
+            if pipelines.gdn_state_output_l2_sg_f16_h1_v2.is_none() {
+                return Ok(());
+            }
+        } else if want_h1 {
+            if pipelines.gdn_state_output_l2_sg_f16_h1.is_none() {
+                return Ok(());
+            }
+        } else if pipelines.gdn_state_output_l2_sg_f16.is_none() {
+            return Ok(());
+        }
+        let cell = match s.gdn_h_states_f16.get(gdn_idx) {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        if cell.borrow().is_some() {
+            return Ok(()); // already converted on a previous token
+        }
+        let h_state_size = s.gdn_num_v_heads * s.gdn_head_dim * s.gdn_head_dim;
+        let f16_buf = device.new_buffer(h_state_size * 2).ok_or_else(|| {
+            RuntimeError::Compute("Failed to allocate F16 GDN h_state mirror".into())
+        })?;
+
+        // Encode the one-time convert on the live serial encoder (reads F32 src,
+        // writes the new F16 dst; distinct buffers -> no aliasing).
+        let pso = pipelines.gdn_state_f32_to_f16.as_ref().unwrap();
+        enc.set_pipeline_state(pso);
+        enc.set_buffer(&s.gdn_h_states[gdn_idx], 0, 0); // src f32
+        enc.set_buffer(&f16_buf, 0, 1); // dst f16
+        enc.set_bytes(&(h_state_size as u32).to_le_bytes(), 2);
+        let tg = 256u64;
+        enc.dispatch_threadgroups(
+            MTLSize::new((h_state_size as u64).div_ceil(tg), 1, 1),
+            MTLSize::new(tg, 1, 1),
+        );
+        *cell.borrow_mut() = Some(f16_buf);
+        Ok(())
+    }
+
+    pub(crate) fn encode_gdn_layer_decode_fused(
+        mut enc: MetalComputeEncoder,
+        cmd: &MetalCommandBuffer,
+        concurrent: bool,
         pipelines: &MetalPipelines,
         s: &MetalScratch,
         layer_buf: &MetalBuffer,
         meta: &CachedLayerMeta,
         gdn_idx: usize,
-    ) -> Result<u32, RuntimeError> {
+    ) -> Result<(u32, MetalComputeEncoder), RuntimeError> {
         let hidden_dim = s.hidden_dim;
         // Resolved SSM dims (9B {32,16,128,4} default, 27B {48,16,128,4}).
         // Q and K each have num_k_heads pre-repeat heads; V has num_v_heads heads.
@@ -789,7 +876,26 @@ impl MetalF32Backend {
         // Q4_0: fused RMSNorm+matvec kernels read x_buf + norm weights inline.
         // Alpha/beta+gates: always fused (only 16 TGs, overhead negligible).
 
-        // Step 1+2: QKV matvec
+        // DIE-SATURATION LEVER (LUMEN_METAL_CONCURRENT_PROJ): the PARALLEL-GROUP-1
+        // projections (QKV-in-proj -> qkv_buf, alpha/beta dual-gates -> alpha/beta
+        // bufs, attn_gate -> gate_sigmoid_buf) all read the SAME x_buf with the
+        // SAME attn_norm RMSNorm and write DISJOINT buffers -> independent. On the
+        // serial encoder they run one-at-a-time; a single matvec tops out ~50-60%
+        // of the two-die aggregate bandwidth. Dispatch the cluster on a CONCURRENT
+        // encoder so Metal may spread their threadgroups across both dies. GROUP 2
+        // (conv1d + recurrence) reopens a SERIAL encoder below to keep the h_state
+        // update deterministic.
+        let gdn_concurrent_cluster = concurrent;
+        if gdn_concurrent_cluster {
+            enc.end_encoding();
+            enc = cmd.new_concurrent_compute_encoder().ok_or_else(|| {
+                RuntimeError::Compute(
+                    "CONCURRENT_PROJ(GDN): failed to create concurrent encoder".into(),
+                )
+            })?;
+        }
+
+        // Step 1+2 (+1+9 when fused): QKV matvec (+ attn_gate when fused)
         {
             let wq_off = meta.wq_off;
             if q8_unfused {
@@ -806,28 +912,92 @@ impl MetalF32Backend {
                 meta.wq_quant,
                 QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
             ) {
-                // Q4_0/F16/BF16 fused: RMSNorm + matvec in one kernel
-                match meta.wq_quant {
-                    QuantScheme::Q4_0 => {
-                        enc.set_pipeline_state(&pipelines.rmsnorm_dequant_matmul_q4_0_deferred_nr2)
+                // MLX-style fused RMSNorm+qmv fast path when decode-qmv buffers exist
+                // for this Q4_0 GDN layer (env LUMEN_METAL_Q4_QMV_PROJ=1); else the
+                // existing per-quant fused NR2 path. Vec is indexed by gdn_idx.
+                let qmv_qkv = if meta.wq_quant == QuantScheme::Q4_0 {
+                    match (
+                        s.qmv_gdn_qkv_qw.get(gdn_idx),
+                        s.qmv_gdn_qkv_scales.get(gdn_idx),
+                    ) {
+                        (Some(Some(qw)), Some(Some(sc))) => Some((qw, sc)),
+                        _ => None,
                     }
-                    QuantScheme::F16 => {
-                        enc.set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2)
+                } else {
+                    None
+                };
+                if let Some((qw, sc)) = qmv_qkv {
+                    // qmv_q4_0_rmsnorm: w@0, x@1, out@2, in_dim@3, scales@4, norm_w@5, eps@6.
+                    // out_dim = qkv_dim (implicit, %8==0); in_dim = hidden_dim (%512==0).
+                    // F16-scales fast path (env LUMEN_METAL_Q4_PROJ_F16SC=1): when the
+                    // scale buffer was built as f16 (2 B/block) and the f16sc kernel
+                    // compiled, dispatch qmv_q4_0_rmsnorm_f16sc (reads `half*` scales).
+                    // Byte-identical to the f32-scale kernel (f16 is the on-disk Q4_0
+                    // native scale precision). Mirrors the lm_head f16sc dispatch.
+                    // A/B EXPERIMENT: else swap to the llama.cpp lane->block mapping
+                    // variant when LUMEN_METAL_Q4_QMV_PROJ_LCMAP=1 (same buffers/geometry).
+                    let proj_f16sc_pipe = if crate::metal::q4_proj_f16sc_enabled() {
+                        pipelines.qmv_q4_0_rmsnorm_f16sc.as_ref()
+                    } else {
+                        None
+                    };
+                    // HALF2-MATH GDN-QKV (env LUMEN_METAL_Q4_PROJ_H2MATH): when the
+                    // f16-scale path is engaged (proj_f16sc_pipe is Some — this flag
+                    // self-engages it) AND the h2math kernel compiled, prefer the
+                    // half2-vectorized dequant-MAC variant qmv_q4_0_rmsnorm_f16sc_h2math.
+                    // SAME bindings + geometry (2 SG/TG, 4 rows/SG, qkv_dim/8 TGs, 64
+                    // threads) — only the per-32-block dequant MAC runs as half2 (2 half
+                    // FMAs/ALU slot). Takes precedence over the plain f16sc proj variant.
+                    let proj_h2math_pipe =
+                        if proj_f16sc_pipe.is_some() && crate::metal::q4_proj_h2math_enabled() {
+                            pipelines.qmv_q4_0_rmsnorm_f16sc_h2math.as_ref()
+                        } else {
+                            None
+                        };
+                    if let Some(p) = proj_h2math_pipe {
+                        enc.set_pipeline_state(p);
+                    } else if let Some(p) = proj_f16sc_pipe {
+                        enc.set_pipeline_state(p);
+                    } else if crate::metal::q4_qmv_proj_lcmap_enabled() {
+                        enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm_llamacpp);
+                    } else {
+                        enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm);
                     }
-                    QuantScheme::Bf16 => {
-                        enc.set_pipeline_state(&pipelines.rmsnorm_matmul_bf16_deferred_nr2)
+                    enc.set_buffer(qw, 0, 0);
+                    enc.set_buffer(&s.x_buf, 0, 1);
+                    enc.set_buffer(&s.qkv_buf, 0, 2);
+                    enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                    enc.set_buffer(sc, 0, 4);
+                    enc.set_buffer(layer_buf, attn_norm_off, 5);
+                    enc.set_bytes(&eps.to_le_bytes(), 6);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new((qkv_dim as u64) / 8, 1, 1),
+                        MTLSize::new(64, 1, 1),
+                    );
+                } else {
+                    // Q4_0/F16/BF16 fused: RMSNorm + matvec in one kernel
+                    match meta.wq_quant {
+                        QuantScheme::Q4_0 => enc.set_pipeline_state(
+                            &pipelines.rmsnorm_dequant_matmul_q4_0_deferred_nr2,
+                        ),
+                        QuantScheme::F16 => {
+                            enc.set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2)
+                        }
+                        QuantScheme::Bf16 => {
+                            enc.set_pipeline_state(&pipelines.rmsnorm_matmul_bf16_deferred_nr2)
+                        }
+                        _ => unreachable!(),
                     }
-                    _ => unreachable!(),
+                    enc.set_buffer(layer_buf, wq_off, 0);
+                    enc.set_buffer(&s.x_buf, 0, 1);
+                    enc.set_buffer(&s.qkv_buf, 0, 2);
+                    enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                    enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 4);
+                    enc.set_buffer(layer_buf, attn_norm_off, 5);
+                    enc.set_bytes(&eps.to_le_bytes(), 6);
+                    let n_tg = ((qkv_dim as u64) + 1) / 2;
+                    enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
                 }
-                enc.set_buffer(layer_buf, wq_off, 0);
-                enc.set_buffer(&s.x_buf, 0, 1);
-                enc.set_buffer(&s.qkv_buf, 0, 2);
-                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 4);
-                enc.set_buffer(layer_buf, attn_norm_off, 5);
-                enc.set_bytes(&eps.to_le_bytes(), 6);
-                let n_tg = ((qkv_dim as u64) + 1) / 2;
-                enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
             } else {
                 // Fallback: separate RMSNorm + matvec (non-quantized)
                 enc.set_pipeline_state(&pipelines.rmsnorm_bytes);
@@ -911,7 +1081,7 @@ impl MetalF32Backend {
             }
         }
 
-        // Step 1+9: Attn gate matvec
+        // Step 1+9: Attn gate matvec.
         {
             if q8_unfused {
                 // Q8_0 unfused: read normed_buf, use dequant_matmul_q8_0_2sg (64 threads, 8 rows/TG)
@@ -927,28 +1097,85 @@ impl MetalF32Backend {
                 attn_gate_quant,
                 QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
             ) {
-                // Q4_0/F16/BF16 fused: RMSNorm + matvec in one kernel
-                match attn_gate_quant {
-                    QuantScheme::Q4_0 => {
-                        enc.set_pipeline_state(&pipelines.rmsnorm_dequant_matmul_q4_0_deferred_nr2)
+                // MLX-style fused RMSNorm+qmv fast path for the Q4_0 GDN attn_gate
+                // projection when decode-qmv buffers exist (env LUMEN_METAL_Q4_QMV_PROJ=1);
+                // else the existing per-quant fused NR2 path. Vec indexed by gdn_idx
+                // (same convention as the qkv qmv above). Mirrors the qkv wiring exactly.
+                let qmv_gate = if attn_gate_quant == QuantScheme::Q4_0 {
+                    match (
+                        s.qmv_gdn_attn_gate_qw.get(gdn_idx),
+                        s.qmv_gdn_attn_gate_scales.get(gdn_idx),
+                    ) {
+                        (Some(Some(qw)), Some(Some(sc))) => Some((qw, sc)),
+                        _ => None,
                     }
-                    QuantScheme::F16 => {
-                        enc.set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2)
+                } else {
+                    None
+                };
+                if let Some((qw, sc)) = qmv_gate {
+                    // qmv_q4_0_rmsnorm: w@0, x@1, out@2, in_dim@3, scales@4, norm_w@5, eps@6.
+                    // out_dim = q_dim (implicit, %8==0); in_dim = hidden_dim (%512==0).
+                    // F16-scales fast path (env LUMEN_METAL_Q4_PROJ_F16SC=1): same as the
+                    // QKV-in-proj above — the attn_gate scale buffer is built as f16 when
+                    // the flag is on, so dispatch qmv_q4_0_rmsnorm_f16sc (byte-identical).
+                    let gate_f16sc_pipe = if crate::metal::q4_proj_f16sc_enabled() {
+                        pipelines.qmv_q4_0_rmsnorm_f16sc.as_ref()
+                    } else {
+                        None
+                    };
+                    // HALF2-MATH attn_gate (env LUMEN_METAL_Q4_PROJ_H2MATH): mirrors
+                    // the QKV-in-proj wiring above (binding-identical drop-in). Highest
+                    // priority when the f16-scale path is engaged AND the h2math kernel
+                    // compiled. Half2 compute lever on the 24-GDN-layer second-largest
+                    // matvec pool.
+                    let gate_h2math_pipe =
+                        if gate_f16sc_pipe.is_some() && crate::metal::q4_proj_h2math_enabled() {
+                            pipelines.qmv_q4_0_rmsnorm_f16sc_h2math.as_ref()
+                        } else {
+                            None
+                        };
+                    if let Some(p) = gate_h2math_pipe {
+                        enc.set_pipeline_state(p);
+                    } else if let Some(p) = gate_f16sc_pipe {
+                        enc.set_pipeline_state(p);
+                    } else {
+                        enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm);
                     }
-                    QuantScheme::Bf16 => {
-                        enc.set_pipeline_state(&pipelines.rmsnorm_matmul_bf16_deferred_nr2)
+                    enc.set_buffer(qw, 0, 0);
+                    enc.set_buffer(&s.x_buf, 0, 1);
+                    enc.set_buffer(gate_sigmoid_buf, 0, 2);
+                    enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                    enc.set_buffer(sc, 0, 4);
+                    enc.set_buffer(layer_buf, attn_norm_off, 5);
+                    enc.set_bytes(&eps.to_le_bytes(), 6);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new((q_dim as u64) / 8, 1, 1),
+                        MTLSize::new(64, 1, 1),
+                    );
+                } else {
+                    // Q4_0/F16/BF16 fused: RMSNorm + matvec in one kernel
+                    match attn_gate_quant {
+                        QuantScheme::Q4_0 => enc.set_pipeline_state(
+                            &pipelines.rmsnorm_dequant_matmul_q4_0_deferred_nr2,
+                        ),
+                        QuantScheme::F16 => {
+                            enc.set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2)
+                        }
+                        QuantScheme::Bf16 => {
+                            enc.set_pipeline_state(&pipelines.rmsnorm_matmul_bf16_deferred_nr2)
+                        }
+                        _ => unreachable!(),
                     }
-                    _ => unreachable!(),
+                    enc.set_buffer(layer_buf, attn_gate_off, 0);
+                    enc.set_buffer(&s.x_buf, 0, 1);
+                    enc.set_buffer(gate_sigmoid_buf, 0, 2);
+                    enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                    enc.set_bytes(&(q_dim as u32).to_le_bytes(), 4);
+                    enc.set_buffer(layer_buf, attn_norm_off, 5);
+                    enc.set_bytes(&eps.to_le_bytes(), 6);
+                    let n_tg = ((q_dim as u64) + 1) / 2;
+                    enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
                 }
-                enc.set_buffer(layer_buf, attn_gate_off, 0);
-                enc.set_buffer(&s.x_buf, 0, 1);
-                enc.set_buffer(gate_sigmoid_buf, 0, 2);
-                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                enc.set_bytes(&(q_dim as u32).to_le_bytes(), 4);
-                enc.set_buffer(layer_buf, attn_norm_off, 5);
-                enc.set_bytes(&eps.to_le_bytes(), 6);
-                let n_tg = ((q_dim as u64) + 1) / 2;
-                enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
             } else {
                 // Non-quantized fallback: gate reads normed_buf (needs separate RMSNorm)
                 // Only reached if the non-fused QKV path above already wrote normed_buf.
@@ -979,6 +1206,26 @@ impl MetalF32Backend {
 
         // Barrier: QKV -> qkv_buf, alpha/beta -> alpha/beta_buf (fused) or alpha_raw/beta_raw (fallback),
         // gate -> gate_sigmoid all ready
+        if gdn_concurrent_cluster {
+            // Close the concurrent projection cluster: resource-scoped barrier on
+            // every buffer the cluster wrote (no-op for any without an outstanding
+            // write), then reopen a SERIAL encoder so GROUP 2's conv1d + recurrence
+            // (h_state) keep deterministic serial-encoder completion ordering.
+            enc.memory_barrier_with_resources(&[
+                &s.qkv_buf,
+                alpha_buf,
+                beta_buf,
+                gate_sigmoid_buf,
+                alpha_raw_buf,
+                beta_raw_buf,
+            ]);
+            enc.end_encoding();
+            enc = cmd.new_compute_encoder().ok_or_else(|| {
+                RuntimeError::Compute(
+                    "CONCURRENT_PROJ(GDN): failed to reopen serial encoder".into(),
+                )
+            })?;
+        }
 
         // === GROUP 2: Conv1D + L2 + StateUpdate + Output + Norm ===
         //
@@ -1053,9 +1300,82 @@ impl MetalF32Backend {
 
             // Simdgroup-parallel state update with high GPU occupancy.
             // Each simdgroup (32 threads) handles one (head, val_col) pair via simd_sum.
-            let pso_sg = pso_state_l2_sg.unwrap();
-            enc.set_pipeline_state(pso_sg);
-            enc.set_buffer(h_state_buf, 0, 0); // h_state [n_heads * val_dim * key_dim]
+            // GDN_STATE_H1 (env LUMEN_METAL_GDN_STATE_H1=1, default OFF): dispatch the
+            // `gdn_state_output_l2_sg_h1` variant, which is MATHEMATICALLY IDENTICAL
+            // (same L2-norm, same decay/retrieval/delta arithmetic + reduction order,
+            // same output) but elides the reference kernel's redundant first h_state
+            // write (a dead store: the decayed-state store is immediately overwritten
+            // by the updated-state store and never read back from device memory). This
+            // halves the per-token h_state WRITE traffic on the 24 GDN layers with a
+            // BYTE-IDENTICAL final state + output. Bindings/grid/threadgroup are the
+            // SAME as gdn_state_output_l2_sg, so only the pipeline-state selection
+            // changes here. Falls back to the f32 reference kernel when the flag is OFF
+            // or the h1 pipeline did not compile (preserves the byte-identical default).
+            // GDN_F16_STATE_DECODE (env, default OFF): when this layer's F16 mirror
+            // has been converted (ensure_gdn_f16_state_decode ran on the caller's
+            // encoder before this fn), run the F16 recurrence reading/writing the
+            // half-size F16 h_state -> halves the per-token h_state device traffic.
+            // The recurrence math stays F32-in-registers (load+upcast, store+downcast),
+            // so the only change is state rounding (near-tie). Takes precedence over
+            // the H1 variant (the dead-store elision is f32-only). Falls back to the
+            // f32 path when the mirror is absent (flag OFF / pipeline missing).
+            // Borrow the F16 mirror cell (if present + converted) and hold the guard
+            // across set_pipeline_state + set_buffer so the bound buffer ref stays live.
+            // GDN_F16_STATE_H1 (env, default OFF): same F16 mirror as GDN_F16_STATE_DECODE
+            // but dispatch the dead-store-elided f16 kernel (gdn_state_output_l2_sg_f16_h1).
+            // Takes precedence over the plain F16 kernel when both flags are set.
+            // VI-amortized v2 (LUMEN_METAL_GDN_F16_STATE_H1_V2): each TG handles 2 vi
+            // columns, computing the (vi-invariant) Q/K norm + load once -> halves the
+            // redundant per-vi norm ALU + Q/K reads on the recurrence critical path.
+            // Takes precedence over the single-vi f16_h1 / plain-f16 kernels; requires
+            // val_dim even (key_dim==val_dim==head_dim, always even here). The grid's
+            // y-dimension halves; everything else (bindings, the F16 mirror) is identical.
+            // V4 (LUMEN_METAL_GDN_F16_STATE_H1_V4): 4 vi columns/TG, Q/K norm+load
+            // shared 4-way; takes precedence over v2 (out-of-range vi guarded, so no
+            // divisibility requirement). Grid y quarters.
+            let want_f16_v4 = crate::metal::gdn_f16_state_h1_v4_enabled()
+                && pipelines.gdn_state_output_l2_sg_f16_h1_v4.is_some();
+            let want_f16_v2 = !want_f16_v4
+                && crate::metal::gdn_f16_state_h1_v2_enabled()
+                && pipelines.gdn_state_output_l2_sg_f16_h1_v2.is_some()
+                && (head_dim % 2 == 0);
+            let want_f16_h1 = !want_f16_v4
+                && !want_f16_v2
+                && crate::metal::gdn_f16_state_h1_enabled()
+                && pipelines.gdn_state_output_l2_sg_f16_h1.is_some();
+            // The mirror is selected if ANY f16 kernel is available (it is built by
+            // ensure_gdn_f16_state_decode under any of the f16-state flags).
+            let f16_pso = if want_f16_v4 {
+                pipelines.gdn_state_output_l2_sg_f16_h1_v4.as_ref()
+            } else if want_f16_v2 {
+                pipelines.gdn_state_output_l2_sg_f16_h1_v2.as_ref()
+            } else if want_f16_h1 {
+                pipelines.gdn_state_output_l2_sg_f16_h1.as_ref()
+            } else {
+                pipelines.gdn_state_output_l2_sg_f16.as_ref()
+            };
+            let f16_cell_ref = f16_pso
+                .and(s.gdn_h_states_f16.get(gdn_idx))
+                .map(|c| c.borrow());
+            let f16_active = f16_cell_ref.as_ref().map(|r| r.is_some()).unwrap_or(false);
+
+            if f16_active {
+                // F16 recurrence on the converted half-size mirror (plain / h1 / v2).
+                enc.set_pipeline_state(f16_pso.unwrap());
+                enc.set_buffer(f16_cell_ref.as_ref().unwrap().as_ref().unwrap(), 0, 0);
+            // f16 h_state
+            } else {
+                let pso_sg = if crate::metal::metal_gdn_state_h1_enabled() {
+                    pipelines
+                        .gdn_state_output_l2_sg_h1
+                        .as_ref()
+                        .unwrap_or_else(|| pso_state_l2_sg.unwrap())
+                } else {
+                    pso_state_l2_sg.unwrap()
+                };
+                enc.set_pipeline_state(pso_sg);
+                enc.set_buffer(h_state_buf, 0, 0); // f32 h_state
+            }
             enc.set_buffer(qkv_conv_buf, k_byte_off, 1); // k_raw [n_kv_heads * key_dim] (UN-normalized)
             enc.set_buffer(qkv_conv_buf, v_byte_off, 2); // v_tokens [n_heads * val_dim]
             enc.set_buffer(alpha_buf, 0, 3); // alpha [n_heads]
@@ -1069,9 +1389,18 @@ impl MetalF32Backend {
             {
                 let l2_eps: f32 = 1e-12;
                 enc.set_bytes(&l2_eps.to_le_bytes(), 11);
-                // grid: (1, val_dim=128, n_heads=32) = 4096 TGs, threadgroup: (32, 1, 1)
+                // grid: (1, val_dim, n_heads), threadgroup: (32, 1, 1).
+                // v2 amortizes 2 vi columns/TG -> y-dim halves (4096 -> 2048 TGs);
+                // v4 amortizes 4 vi columns/TG -> y-dim quarters (4096 -> 1024 TGs).
+                let y_dim = if want_f16_v4 {
+                    (head_dim as u64).div_ceil(4)
+                } else if want_f16_v2 {
+                    (head_dim as u64).div_ceil(2)
+                } else {
+                    head_dim as u64
+                };
                 enc.dispatch_threadgroups(
-                    MTLSize::new(1, head_dim as u64, num_heads as u64),
+                    MTLSize::new(1, y_dim, num_heads as u64),
                     MTLSize::new(32, 1, 1),
                 );
             }
@@ -1338,7 +1667,136 @@ impl MetalF32Backend {
         // Steps 10+11+12+13: SiLU-gated output + SSMOut matvec + residual + copy
         // Prefer fused SiLU+matvec (eliminates silu_elementwise_mul dispatch + barrier).
         // gate_sigmoid_buf holds raw gate values; normed_out_buf holds GDN normed output.
-        {
+        //
+        // MLX-style Q4 decode-qmv fast path for the ssm_out projection (env
+        // LUMEN_METAL_Q4_QMV_SSMOUT=1): the SiLU gate fusion in the NR2 kernel
+        // blocks a clean qmv reuse, so apply SiLU in a tiny `silu_elementwise_mul`
+        // predecessor (silu(gate)*normed_out -> gate_sigmoid_buf, the exact fallback
+        // step), then run `qmv_q4_0_residual` (zero residual) -> ssm_proj_buf, then
+        // `residual_add_copy` (x_buf += proj; attn_proj = x_buf). Mirrors the F16/Bf16
+        // non-fused ssm_out structure but with the qmv matvec. Vec indexed by gdn_idx.
+        let qmv_ssm_out = if ssm_out_quant == QuantScheme::Q4_0 {
+            match (
+                s.qmv_gdn_ssm_out_qw.get(gdn_idx),
+                s.qmv_gdn_ssm_out_scales.get(gdn_idx),
+                s.qmv_zero_residual_buf.as_ref(),
+            ) {
+                (Some(Some(qw)), Some(Some(sc)), Some(zero_res)) => Some((qw, sc, zero_res)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // GDN ssm_out Q8->Q4 NATIVE-NR2 fast path (env LUMEN_METAL_Q4_SSMOUT_NR2):
+        // when a per-layer Q4_0-NR2 requant buffer exists for this GDN layer AND the
+        // qmv path above is NOT engaged AND the Q4 fused kernel is compiled, bind the
+        // Q4 weight + run the SAME single-dispatch fused silu+matvec+residual+copy
+        // kernel the Q8 path uses (`pso_silu_matvec_q4`). Halves the ssm_out weight
+        // stream with no extra dispatch. (`s.q4nr2_ssm_out` indexed by gdn_idx.)
+        let nr2_ssm_out_q4: Option<&MetalBuffer> = if qmv_ssm_out.is_none() {
+            match s.q4nr2_ssm_out.get(gdn_idx) {
+                Some(Some(buf)) if pso_silu_matvec_q4.is_some() => Some(buf),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(nr2_q4) = nr2_ssm_out_q4 {
+            // Fused: silu(gate) * normed_out computed inline during Q4_0 matvec
+            // x-load; matvec + residual (x_buf += proj) + copy (attn_proj = x_buf),
+            // ALL in ONE dispatch. Identical bindings to the Q8 fused branch below,
+            // only the weight buffer (Q4 NR2 instead of the Q8 layer-blob slice) and
+            // the pipeline (Q4 instead of Q8) change.
+            let pso = pso_silu_matvec_q4.unwrap();
+            enc.set_pipeline_state(pso);
+            enc.set_buffer(nr2_q4, 0, 0); // Q4_0 NR2 ssm_out weights
+            enc.set_buffer(normed_out_buf, 0, 1); // x = normed GDN output
+            enc.set_buffer(&s.x_buf, 0, 2); // accum (R/W)
+            enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3); // in_dim
+            enc.set_buffer(&s.attn_proj_buf, 0, 4); // copy_dst
+            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 5); // out_dim
+            enc.set_buffer(gate_sigmoid_buf, 0, 6); // gate values
+            let n_tg = ((hidden_dim as u64) + 1) / 2;
+            enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
+        } else if let Some((qw, sc, zero_res)) = qmv_ssm_out {
+            // Predecessor: silu(gate)*normed_out -> gate_sigmoid_buf (in_dim = q_dim).
+            let pso_silu_mul = pipelines.silu_elementwise_mul.as_ref().ok_or_else(|| {
+                RuntimeError::Compute("silu_elementwise_mul pipeline not compiled".into())
+            })?;
+            enc.set_pipeline_state(pso_silu_mul);
+            enc.set_buffer(gate_sigmoid_buf, 0, 0); // gate (raw)
+            enc.set_buffer(normed_out_buf, 0, 1); // normed GDN output
+            enc.set_buffer(gate_sigmoid_buf, 0, 2); // output overwrites gate_sigmoid_buf
+            enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
+            let fused_tg = 256u64.min(q_dim as u64).max(1);
+            enc.dispatch_threadgroups(
+                MTLSize::new((q_dim as u64).div_ceil(fused_tg), 1, 1),
+                MTLSize::new(fused_tg, 1, 1),
+            );
+
+            // Two-pass deterministic SPLIT-K (env LUMEN_METAL_Q4_SSMOUT_SPLITK=N,
+            // default 0=off) when in_dim=q_dim splits evenly into N 512-block slices;
+            // else the one-pass qmv_q4_0_residual. Splits the K=q_dim contraction
+            // across N× more threadgroups to lift the row-starved (out=hidden=2048,
+            // ~8.5 SG/core) ssm_out matvec occupancy. Zero residual (added next).
+            let ssm_k_splits = crate::metal::q4_ssmout_splitk();
+            if ssm_k_splits >= 2 && (q_dim as u32) % (512 * ssm_k_splits) == 0 {
+                // Pass 1: per-(row-group, k-slice) partial dot -> partials scratch.
+                enc.set_pipeline_state(&pipelines.qmv_q4_0_splitk_partial);
+                enc.set_buffer(qw, 0, 0);
+                enc.set_buffer(gate_sigmoid_buf, 0, 1); // gated input
+                enc.set_buffer(&s.splitk_partials_buf, 0, 2);
+                enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
+                enc.set_buffer(sc, 0, 4);
+                enc.set_bytes(&ssm_k_splits.to_le_bytes(), 5);
+                enc.dispatch_threadgroups(
+                    MTLSize::new((hidden_dim as u64) / 8, ssm_k_splits as u64, 1),
+                    MTLSize::new(64, 1, 1),
+                );
+                enc.memory_barrier_with_scope(1);
+                // Pass 2: deterministic reduce (fixed ks-ascending) + zero residual.
+                enc.set_pipeline_state(&pipelines.qmv_q4_0_splitk_reduce);
+                enc.set_buffer(&s.splitk_partials_buf, 0, 0);
+                enc.set_buffer(ssm_proj_buf, 0, 1);
+                enc.set_buffer(zero_res, 0, 2);
+                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                enc.set_bytes(&ssm_k_splits.to_le_bytes(), 4);
+                enc.dispatch_threadgroups(
+                    MTLSize::new((hidden_dim as u64).div_ceil(256), 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            } else {
+                // qmv_q4_0_residual: w@0, x@1, out@2, in_dim@3, scales@4, residual@5.
+                // out_dim = hidden_dim (implicit, %8==0); in_dim = q_dim (%512==0).
+                // Zero residual so out == W*input exactly; residual added next.
+                enc.set_pipeline_state(&pipelines.qmv_q4_0_residual);
+                enc.set_buffer(qw, 0, 0);
+                enc.set_buffer(gate_sigmoid_buf, 0, 1); // gated input
+                enc.set_buffer(ssm_proj_buf, 0, 2);
+                enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
+                enc.set_buffer(sc, 0, 4);
+                enc.set_buffer(zero_res, 0, 5);
+                enc.dispatch_threadgroups(
+                    MTLSize::new((hidden_dim as u64) / 8, 1, 1),
+                    MTLSize::new(64, 1, 1),
+                );
+            }
+
+            // residual_add_copy: x_buf += ssm_proj_buf; attn_proj_buf = x_buf.
+            let pso_residual_copy = pipelines.residual_add_copy.as_ref().ok_or_else(|| {
+                RuntimeError::Compute("residual_add_copy pipeline not compiled".into())
+            })?;
+            enc.set_pipeline_state(pso_residual_copy);
+            enc.set_buffer(&s.x_buf, 0, 0);
+            enc.set_buffer(ssm_proj_buf, 0, 1);
+            enc.set_buffer(&s.attn_proj_buf, 0, 2);
+            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+            let rc_tg = 256u64.min(hidden_dim as u64).max(1);
+            enc.dispatch_threadgroups(
+                MTLSize::new((hidden_dim as u64).div_ceil(rc_tg), 1, 1),
+                MTLSize::new(rc_tg, 1, 1),
+            );
+        } else {
             match ssm_out_quant {
                 QuantScheme::Q8_0 if pso_silu_matvec.is_some() => {
                     // Fused: silu(gate) * normed_out computed inline during matvec x-load
@@ -1569,7 +2027,7 @@ impl MetalF32Backend {
             }
         }
 
-        Ok(new_conv_pos)
+        Ok((new_conv_pos, enc))
     }
 
     /// Encode batched GDN prefill for T tokens.
@@ -1922,7 +2380,7 @@ impl MetalF32Backend {
                 enc.set_bytes(&(batch_size as u32).to_le_bytes(), 3); // M
                 enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 4); // N
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 5); // K
-                                                                      // K2 DIAG (no-op unless LUMEN_METAL_GDN_SUBSKIP bit 1): skip QKV-proj GEMM.
+                                                                      // DIAG (no-op unless LUMEN_METAL_GDN_SUBSKIP bit 1): skip QKV-proj GEMM.
                 if super::graph_reorder::gdn_subskip() & 1 == 0 {
                     enc.dispatch_threadgroups(
                         MTLSize::new(
@@ -2099,7 +2557,7 @@ impl MetalF32Backend {
                 enc.set_bytes(&(batch_size as u32).to_le_bytes(), 3); // M
                 enc.set_bytes(&(q_dim as u32).to_le_bytes(), 4); // N
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 5); // K
-                                                                      // K2 DIAG (no-op unless LUMEN_METAL_GDN_SUBSKIP bit 64): skip attn-gate GEMM.
+                                                                      // DIAG (no-op unless LUMEN_METAL_GDN_SUBSKIP bit 64): skip attn-gate GEMM.
                 if super::graph_reorder::gdn_subskip() & 64 == 0 {
                     enc.dispatch_threadgroups(
                         MTLSize::new(
@@ -2200,7 +2658,7 @@ impl MetalF32Backend {
             // hazard cost. In legacy mode the role buffers point into the
             // shared `scratch_buf` at offsets `alpha_role_off` / `beta_role_off`.
             {
-                // K2 DIAG (no-op unless LUMEN_METAL_GDN_SUBSKIP bit 2): skip alpha/beta GEMMs.
+                // DIAG (no-op unless LUMEN_METAL_GDN_SUBSKIP bit 2): skip alpha/beta GEMMs.
                 let skip_ab = super::graph_reorder::gdn_subskip() & 2 != 0;
                 // Alpha GEMM: [batch_size, hidden_dim] @ [hidden_dim, num_heads] -> [batch_size, num_heads]
                 let gemm_aligned =
@@ -2394,7 +2852,7 @@ impl MetalF32Backend {
                 enc.set_bytes(&conv_pos.to_le_bytes(), 6);
                 enc.set_bytes(&(batch_size as u32).to_le_bytes(), 7);
                 let used_parallel_conv1d = pso_conv1d_silu_par.is_some();
-                // K2 DIAG (no-op unless LUMEN_METAL_GDN_SUBSKIP bit 4): skip conv1d.
+                // DIAG (no-op unless LUMEN_METAL_GDN_SUBSKIP bit 4): skip conv1d.
                 let skip_conv1d = super::graph_reorder::gdn_subskip() & 4 != 0;
                 if skip_conv1d {
                     // attribution only: do not dispatch conv1d (garbage output).
@@ -2458,7 +2916,7 @@ impl MetalF32Backend {
                 // conv1d → L2 barrier: L2 reads conv_out.
                 emit_phase_barrier(&enc, &[conv_out_role_buf]);
                 {
-                    // K2 Wave-1: simdgroup-per-head L2 (no threadgroup barriers),
+                    // simdgroup-per-head L2 (no threadgroup barriers),
                     // gated by LUMEN_METAL_GDN_L2_SG=1, requires head_dim%32==0.
                     let use_l2_sg = super::graph_reorder::gdn_l2_sg_enabled()
                         && head_dim % 32 == 0
@@ -2480,7 +2938,7 @@ impl MetalF32Backend {
                     enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 4); // stride
                     enc.set_bytes(&(0u32).to_le_bytes(), 5); // q_offset = 0
                     enc.set_bytes(&(qk_dim as u32).to_le_bytes(), 6); // k_offset = qk_dim
-                                                                      // K2 DIAG (no-op unless LUMEN_METAL_GDN_SUBSKIP bit 8): skip L2.
+                                                                      // DIAG (no-op unless LUMEN_METAL_GDN_SUBSKIP bit 8): skip L2.
                     if super::graph_reorder::gdn_subskip() & 8 == 0 {
                         if use_l2_sg {
                             // SG_PER_TG=4 simdgroups/TG (128 threads); one SG per (token,head).
@@ -2651,7 +3109,7 @@ impl MetalF32Backend {
             enc.set_bytes(&eps.to_le_bytes(), 6);
             enc.set_bytes(&(1u32).to_le_bytes(), 7); // scale_n_heads
             enc.set_bytes(&(batch_size as u32).to_le_bytes(), 8); // T
-                                                                  // K2 DIAG (no-op unless LUMEN_METAL_GDN_SUBSKIP bit 16): skip norm_gate.
+                                                                  // DIAG (no-op unless LUMEN_METAL_GDN_SUBSKIP bit 16): skip norm_gate.
             if super::graph_reorder::gdn_subskip() & 16 == 0 {
                 enc.dispatch_threadgroups(
                     MTLSize::new(num_heads as u64, batch_size as u64, 1),
@@ -2723,7 +3181,7 @@ impl MetalF32Backend {
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4); // N
                 enc.set_bytes(&(q_dim as u32).to_le_bytes(), 5); // K
                 enc.set_buffer(x_buf, 0, 6); // R residual [batch_size, hidden_dim]
-                                             // K2 DIAG (no-op unless LUMEN_METAL_GDN_SUBSKIP bit 32): skip ssm_out GEMM.
+                                             // DIAG (no-op unless LUMEN_METAL_GDN_SUBSKIP bit 32): skip ssm_out GEMM.
                 if super::graph_reorder::gdn_subskip() & 32 == 0 {
                     enc.dispatch_threadgroups(
                         MTLSize::new(
@@ -2884,8 +3342,8 @@ impl MetalF32Backend {
                 // (attn_proj = ssm_out·X^T + x_buf) fused at writeback — same
                 // contract as the Q8/Q4/Bf16 tiled-residual paths. FP-order +
                 // half-input precision diverge from the per-token F32 matvec, so
-                // the quality suite is the validator (validated PRISTINE×3,
-                // permits non-byte-identical output). Env
+                // the quality suite is the validator (permits non-byte-identical
+                // output). Env
                 // `LUMEN_METAL_GDN_SSM_OUT_F32_BATCHED=0` reverts
                 // to the legacy per-token loop.
                 //
@@ -3472,6 +3930,12 @@ impl MetalF32Backend {
 
                 for h_buf in &s.gdn_h_states {
                     h_buf.write_f32(&vec![0.0f32; h_state_size]);
+                }
+                // Drop any F16 h_state mirrors (LUMEN_METAL_GDN_F16_STATE_DECODE):
+                // a new sequence restarts from the freshly-zeroed F32 state, so the
+                // next decode re-converts F32->F16 on first touch.
+                for hf in &s.gdn_h_states_f16 {
+                    *hf.borrow_mut() = None;
                 }
                 for c_buf in &s.gdn_conv_states {
                     c_buf.write_f32(&vec![0.0f32; conv_state_size]);

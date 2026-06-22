@@ -124,6 +124,102 @@ kernel void embed_token_q4_0(
 }
 
 // ============================================================================
+// embed_token_*_bufid: token-id-from-GPU-buffer embedding variants (decode).
+//
+// IDENTICAL math to the matching embed_token_* kernel above, EXCEPT the token
+// id is read from a GPU buffer (`token_buf[0]`) instead of an inline
+// `constant uint& token_id` push-constant. This lets the pipelined greedy
+// decode chain tokens entirely on the GPU: the prior step's argmax writes the
+// next token id into this buffer, and this embed reads it -- so the CPU never
+// needs the token value to build the next command buffer (it overlaps the
+// CPU-encode of token N+1 with the GPU-execute of token N).
+//
+// The math is byte-for-byte the same as the set_bytes path (same scale,
+// same nibble/dequant arithmetic, same output layout), so the decoded token
+// sequence is byte-identical to the sequential decode_token_greedy path.
+// Used by the lean GPU-pipelined greedy decode path (the default).
+// ============================================================================
+
+kernel void embed_token_bufid(
+    device const float* embedding  [[buffer(0)]],
+    device float*       out        [[buffer(1)]],
+    device const uint*  token_buf  [[buffer(2)]],
+    constant uint&      hidden_dim [[buffer(3)]],
+    uint gid                       [[thread_position_in_grid]])
+{
+    if (gid >= hidden_dim) return;
+    uint token_id = token_buf[0];
+    out[gid] = embedding[token_id * hidden_dim + gid];
+}
+
+kernel void embed_token_f16_bufid(
+    device const half* embedding_f16 [[buffer(0)]],
+    device float*      out           [[buffer(1)]],
+    device const uint* token_buf     [[buffer(2)]],
+    constant uint&     hidden_dim    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= hidden_dim) return;
+    uint token_id = token_buf[0];
+    out[gid] = float(embedding_f16[token_id * hidden_dim + gid]);
+}
+
+kernel void embed_token_bf16_bufid(
+    device const ushort* embedding_bf16 [[buffer(0)]],
+    device float*        out            [[buffer(1)]],
+    device const uint*   token_buf      [[buffer(2)]],
+    constant uint&       hidden_dim     [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= hidden_dim) return;
+    uint token_id = token_buf[0];
+    ushort bits = embedding_bf16[token_id * hidden_dim + gid];
+    out[gid] = as_type<float>((uint(bits)) << 16);
+}
+
+kernel void embed_token_q8_0_bufid(
+    device const char* embedding_q8  [[buffer(0)]],
+    device float*      out           [[buffer(1)]],
+    device const uint* token_buf     [[buffer(2)]],
+    constant uint&     hidden_dim    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= hidden_dim) return;
+    uint token_id = token_buf[0];
+    uint global_elem = token_id * hidden_dim + gid;
+    uint block_idx = global_elem >> 5;       // / 32
+    uint elem_in_block = global_elem & 31;   // % 32
+
+    device const char* block_ptr = embedding_q8 + block_idx * 34;
+    float scale = float(*(device const half*)block_ptr);
+    float val = float(block_ptr[2 + elem_in_block]);
+    out[gid] = val * scale;
+}
+
+kernel void embed_token_q4_0_bufid(
+    device const char* embedding_q4  [[buffer(0)]],
+    device float*      out           [[buffer(1)]],
+    device const uint* token_buf     [[buffer(2)]],
+    constant uint&     hidden_dim    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= hidden_dim) return;
+    uint token_id = token_buf[0];
+    uint global_elem = token_id * hidden_dim + gid;
+    uint block_idx = global_elem >> 5;
+    uint elem_in_block = global_elem & 31;
+
+    device const uchar* block_ptr = (device const uchar*)(embedding_q4 + block_idx * 18);
+    float scale = float(*(device const half*)block_ptr);
+
+    // De-interleaved: elem 0-15 use lo nibble, elem 16-31 use hi nibble
+    uint byte_idx = (elem_in_block < 16) ? elem_in_block : (elem_in_block - 16);
+    uchar packed = block_ptr[2 + byte_idx];
+    int nibble = (elem_in_block < 16) ? (int)(packed & 0xF) - 8 : (int)(packed >> 4) - 8;
+    out[gid] = float(nibble) * scale;
+}
+
+// ============================================================================
 // BATCHED PREFILL KERNELS
 //
 // These kernels process multiple tokens at once (mat-mat GEMM) for prompt

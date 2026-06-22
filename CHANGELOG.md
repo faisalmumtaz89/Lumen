@@ -7,6 +7,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-22
+
+### Changed
+
+- Metal Q4_0 decode is unified onto a single, sampling-correct path with the optimized matvec stack as the default (qmv projections, Q4_0 lm_head, projection fusion, concurrent dispatch, and a lean single-queue async pipeline). Greedy decode is byte-deterministic; temperature > 0 runs a GPU temperature sampler, falling back to the CPU sampler for sampling options it does not implement.
+
+### Fixed
+
+- Sampled (temperature > 0) Metal Q4_0 decode could produce degraded output under the previous experimental fast path. The matvec kernels now accumulate in f32 per block and the sampled path uses correct scale-type wiring, so sampled output is fluent and matches the CPU sampler.
+
+### Removed
+
+- The experimental `LUMEN_METAL_Q4_FAST_DECODE` flag (its optimized stack is now the default) and the superseded decode pipeline variants, plus unused feature getters and unreachable shaders.
+
 ## [0.1.0] — 2026-06-15
 
 ### Production-ready (2026-06-02)
@@ -62,5 +76,6 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[Unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/faisalmumtaz89/Lumen/releases/tag/v0.1.0

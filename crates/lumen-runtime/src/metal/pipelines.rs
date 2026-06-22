@@ -100,6 +100,7 @@ impl MetalF32Backend {
             write_kv_cache: make_pipeline!("write_kv_cache"),
             fused_rope_kv_write: make_pipeline!("fused_rope_kv_write"),
             fused_rope_kv_mha: make_pipeline!("fused_rope_kv_mha"),
+            fused_rope_kv_mha_tgscores: make_pipeline!("fused_rope_kv_mha_tgscores"),
             fused_rope_neox_kv_write: lib
                 .get_function("fused_rope_neox_kv_write")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
@@ -112,6 +113,11 @@ impl MetalF32Backend {
             embed_token_q4_0: make_pipeline!("embed_token_q4_0"),
             embed_token_f16: make_pipeline!("embed_token_f16"),
             embed_token_bf16: make_pipeline!("embed_token_bf16"),
+            embed_token_bufid: make_pipeline!("embed_token_bufid"),
+            embed_token_q8_0_bufid: make_pipeline!("embed_token_q8_0_bufid"),
+            embed_token_q4_0_bufid: make_pipeline!("embed_token_q4_0_bufid"),
+            embed_token_f16_bufid: make_pipeline!("embed_token_f16_bufid"),
+            embed_token_bf16_bufid: make_pipeline!("embed_token_bf16_bufid"),
             dequant_matmul_q8_0_residual: make_pipeline!("dequant_matmul_q8_0_residual"),
             dequant_matmul_q8_0_multirow: make_pipeline!("dequant_matmul_q8_0_multirow"),
             dequant_matmul_q8_0_residual_multirow: make_pipeline!(
@@ -153,6 +159,74 @@ impl MetalF32Backend {
             ),
             dequant_matmul_q4_0_deferred_bias_nr2: make_pipeline!(
                 "dequant_matmul_q4_0_deferred_bias_nr2"
+            ),
+            qmv_q4_0_residual: make_pipeline!("qmv_q4_0_residual"),
+            // OPTIONAL (non-fatal): f16-scales FFN-down variant. None falls back to
+            // the f32-scale qmv_q4_0_residual.
+            qmv_q4_0_residual_f16sc: lib
+                .get_function("qmv_q4_0_residual_f16sc")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // OPTIONAL (non-fatal): HALF2-VECTORIZED FFN-down variant (half2 dequant
+            // MAC). None falls back to the f16math/f16sc/f32-scale down kernels.
+            // env LUMEN_METAL_Q4_DOWN_H2MATH.
+            qmv_q4_0_residual_f16sc_h2math: lib
+                .get_function("qmv_q4_0_residual_f16sc_h2math")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            qmv_q4_0_splitk_partial: make_pipeline!("qmv_q4_0_splitk_partial"),
+            qmv_q4_0_splitk_reduce: make_pipeline!("qmv_q4_0_splitk_reduce"),
+            gateup_splitk_reduce_swiglu: make_pipeline!("gateup_splitk_reduce_swiglu"),
+            qmv_q4_0: make_pipeline!("qmv_q4_0"),
+            qmv_q4_0_8sg: make_pipeline!("qmv_q4_0_8sg"),
+            qmv_q4_0_rmsnorm: make_pipeline!("qmv_q4_0_rmsnorm"),
+            // OPTIONAL (non-fatal): f16-scales lm_head + GDN QKV/attn_gate variant.
+            // None falls back to the f32-scale qmv_q4_0_rmsnorm.
+            qmv_q4_0_rmsnorm_f16sc: lib
+                .get_function("qmv_q4_0_rmsnorm_f16sc")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // OPTIONAL (non-fatal): HALF2-VECTORIZED f16-scales single-matrix rmsnorm
+            // variant (half2 dequant MAC). None falls back to the f16math/f16sc/f32
+            // path. env LUMEN_METAL_Q4_LMHEAD_H2MATH (lm_head dispatch site).
+            qmv_q4_0_rmsnorm_f16sc_h2math: lib
+                .get_function("qmv_q4_0_rmsnorm_f16sc_h2math")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            qmv_q4_0_rmsnorm_llamacpp: make_pipeline!("qmv_q4_0_rmsnorm_llamacpp"),
+            qmv_q4_0_rmsnorm_kv: make_pipeline!("qmv_q4_0_rmsnorm_kv"),
+            qmv_q4_0_rmsnorm_qgatekv: make_pipeline!("qmv_q4_0_rmsnorm_qgatekv"),
+            qmv_q4_0_gate_up_swiglu: make_pipeline!("qmv_q4_0_gate_up_swiglu"),
+            // OPTIONAL (non-fatal): f16-scales dense FFN gate/up variant. None falls
+            // back to the f32-scale qmv_q4_0_gate_up_swiglu.
+            qmv_q4_0_gate_up_swiglu_f16sc: lib
+                .get_function("qmv_q4_0_gate_up_swiglu_f16sc")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // OPTIONAL (non-fatal): 1-SG-per-TG f16-scales gate/up variant. None
+            // falls back to the 2-SG f16sc/f32 path. env LUMEN_METAL_Q4_GATEUP_1SG.
+            qmv_q4_0_gate_up_swiglu_f16sc_1sg: lib
+                .get_function("qmv_q4_0_gate_up_swiglu_f16sc_1sg")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // OPTIONAL (non-fatal): 8-rows-per-SG f16-scales gate/up variant. None
+            // falls back to the 4-row f16sc path. env LUMEN_METAL_Q4_GATEUP_8ROW.
+            qmv_q4_0_gate_up_swiglu_f16sc_8row: lib
+                .get_function("qmv_q4_0_gate_up_swiglu_f16sc_8row")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // OPTIONAL (non-fatal): F16-MATH f16-scales gate/up variant (half dequant
+            // MAC). None falls back to the f16sc/8row/1sg path. env
+            // LUMEN_METAL_Q4_GATEUP_F16MATH.
+            qmv_q4_0_gate_up_swiglu_f16sc_f16math: lib
+                .get_function("qmv_q4_0_gate_up_swiglu_f16sc_f16math")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // OPTIONAL (non-fatal): HALF2-VECTORIZED f16-scales gate/up variant
+            // (half2 dequant MAC). None falls back to the f16math/f16sc/8row/1sg
+            // path. env LUMEN_METAL_Q4_GATEUP_H2MATH.
+            qmv_q4_0_gate_up_swiglu_f16sc_h2math: lib
+                .get_function("qmv_q4_0_gate_up_swiglu_f16sc_h2math")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // OPTIONAL (non-fatal): INTERLEAVED gate+up variant. None falls back to
+            // the f16sc/8row/default path. env LUMEN_METAL_Q4_GATEUP_IL.
+            qmv_q4_0_gate_up_swiglu_il: lib
+                .get_function("qmv_q4_0_gate_up_swiglu_il")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            rmsnorm_ffn_gate_up_swiglu_q4_0_wide: make_pipeline!(
+                "rmsnorm_ffn_gate_up_swiglu_q4_0_wide"
             ),
             dequant_tiled_matmul_q8_0_residual_batched: make_bc_pipeline!(
                 "dequant_tiled_matmul_q8_0_residual_batched"
@@ -381,6 +455,15 @@ impl MetalF32Backend {
                 "ffn_fused_gate_up_swiglu_f16_deferred"
             ),
             argmax: make_pipeline!("argmax"),
+            // GPU temperature sampler (Option A). Optional: if the kernel fails
+            // to compile on this device we fall back to the CPU sampler rather
+            // than fail backend init (mirrors the MoE optional-pipeline style).
+            gpu_sampler: lib
+                .get_function("gpu_sampler")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            gpu_sampler_fast: lib
+                .get_function("gpu_sampler_fast")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             bias_add: make_pipeline!("bias_add"),
             bias_add_batched: make_pipeline!("bias_add_batched"),
             deinterleave_qkv: make_pipeline!("deinterleave_qkv"),
@@ -588,6 +671,43 @@ impl MetalF32Backend {
             // Simdgroup-parallel state update (4096 TGs)
             gdn_state_output_l2_sg: lib
                 .get_function("gdn_state_output_l2_sg")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // Read-once/write-once variant (dead store removed)
+            gdn_state_output_l2_sg_h1: lib
+                .get_function("gdn_state_output_l2_sg_h1")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // Diagnostic (timing only): L2-norm-skipped variant (output garbage)
+            gdn_state_output_l2_sg_normskip: lib
+                .get_function("gdn_state_output_l2_sg_NORMSKIP")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            gdn_state_output_l2_sg_recurskip: lib
+                .get_function("gdn_state_output_l2_sg_RECURSKIP")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // Reduced-precision persistent-state variants (bfloat / half h_state)
+            gdn_state_output_l2_sg_bf16: lib
+                .get_function("gdn_state_output_l2_sg_bf16")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            gdn_state_output_l2_sg_f16: lib
+                .get_function("gdn_state_output_l2_sg_f16")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // F16 state recurrence WITHOUT the dead decayed write-back
+            // (LUMEN_METAL_GDN_F16_STATE_H1: union of f16-state + h1 dead-store elision)
+            gdn_state_output_l2_sg_f16_h1: lib
+                .get_function("gdn_state_output_l2_sg_f16_h1")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // VI-amortized f16+h1 recurrence (LUMEN_METAL_GDN_F16_STATE_H1_V2):
+            // 2 val_dim columns/TG, Q/K norm + load computed once and reused.
+            gdn_state_output_l2_sg_f16_h1_v2: lib
+                .get_function("gdn_state_output_l2_sg_f16_h1_v2")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // 4-way VI-amortized f16+h1 recurrence (LUMEN_METAL_GDN_F16_STATE_H1_V4):
+            // 4 val_dim columns/TG, Q/K norm + load computed once and reused.
+            gdn_state_output_l2_sg_f16_h1_v4: lib
+                .get_function("gdn_state_output_l2_sg_f16_h1_v4")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // One-time F32->F16 h_state converter (LUMEN_METAL_GDN_F16_STATE_DECODE)
+            gdn_state_f32_to_f16: lib
+                .get_function("gdn_state_f32_to_f16")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             // RMSNorm + scale for decode (pairs with gdn_state_output_l2_sg)
             gdn_decode_norm_scale: lib

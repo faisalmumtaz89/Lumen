@@ -389,13 +389,94 @@ impl InferenceEngine {
                 sampler_state.record(next_token);
                 generated_tokens.push(next_token);
             }
+        } else if caps.gpu_resident && backend.supports_gpu_sampler(sampling) {
+            // [Option A] GPU temperature sampler -> lean GPU-sampled pipeline
+            // (LUMEN_METAL_GPU_SAMPLER=1). The token is SAMPLED on the GPU,
+            // parity-matched to the CPU `sample_logits`, and chained through the
+            // lean pipeline exactly like the greedy argmax win -- so temp>0 decode
+            // pipelines WITHOUT the serial CPU sampler + logit readback.
+            //
+            // Continuation parity with the first (CPU-sampled) token: the first
+            // generated token was already drawn on the CPU above
+            // (sample_token_with_state, which advanced `rng` once and recorded the
+            // token into `sampler_state`). We hand the GPU the EXACT current RNG
+            // state (`rng.state()`, post-first-draw) and the EXACT recorded
+            // history (prompt + first token) so the GPU draw sequence and penalty
+            // freq array continue bit-identically from where the CPU left off.
+            // `decode_token_sampled` advances kv.seq_len() internally.
+            let cfg = crate::compute::GpuSamplerRunCfg {
+                inv_temp: 1.0 / sampling.temperature,
+                pen_active: sampling.penalties_active(),
+                rep: sampling.repetition_penalty.unwrap_or(1.0),
+                presence: sampling.presence_penalty.unwrap_or(0.0),
+                freq: sampling.frequency_penalty.unwrap_or(0.0),
+                rng_seed_state: rng.state(),
+                prompt_history: std::sync::Arc::new(sampler_state.history.clone()),
+            };
+            while !stop.should_stop(next_token, generated_tokens.len()) {
+                next_token = backend.decode_token_sampled(next_token, weights, &mut kv, &cfg)?;
+                // Keep the CPU `sampler_state` in lock-step for any post-loop
+                // consumer (and so a fallback would see correct history); the GPU
+                // owns the authoritative freq array during the loop.
+                sampler_state.record(next_token);
+                generated_tokens.push(next_token);
+            }
+        } else if caps.gpu_resident && backend.supports_async_decode() {
+            // [Option B] Deferred-async-commit sampled-decode driver
+            // (LUMEN_METAL_DECODE_ASYNC_COMMIT=1). Same token threading + contract
+            // as the synchronous gpu_resident path below (decode_token_async
+            // returns THIS token's logits and advances kv.seq_len() internally),
+            // but the backend commits each CB asynchronously and waits it via the
+            // split commit()/wait_until_completed() pair. A trailing flush drains
+            // any CB still in flight (no-op in the current always-wait form; kept
+            // for safety if the wait is later moved off the critical path).
+            while !stop.should_stop(next_token, generated_tokens.len()) {
+                logits = backend.decode_token_async(next_token, weights, &mut kv)?;
+                next_token =
+                    sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
+                generated_tokens.push(next_token);
+            }
+            let _ = backend.decode_flush_async();
         } else if caps.gpu_resident {
             // GPU-RESIDENT fast path: single command buffer per token.
             // decode_token() advances kv.seq_len() internally.
+            // DIAGNOSTIC (env LUMEN_METAL_SAMPLE_PROBE=1, default OFF): time the
+            // pure CPU sampler (`sample_token_with_state`, which consumes the
+            // already-read-back logits vec) separately from `decode_token`, and
+            // print the mean every 64 tokens. This isolates the SERIAL CPU-sampler
+            // cost — the ceiling-limiter for any deferred-async-commit overlap of
+            // the sampled decode path. No effect on sampled output (read-only).
+            let sample_probe = std::env::var("LUMEN_METAL_SAMPLE_PROBE").as_deref() == Ok("1");
+            let mut sp_sum = 0.0f64;
+            let mut sp_n: u64 = 0;
             while !stop.should_stop(next_token, generated_tokens.len()) {
                 logits = backend.decode_token(next_token, weights, &mut kv)?;
-                next_token =
-                    sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
+                if sample_probe {
+                    let t = Instant::now();
+                    next_token = sample_token_with_state(
+                        &mut logits,
+                        sampling,
+                        &mut sampler_state,
+                        &mut rng,
+                    );
+                    sp_sum += t.elapsed().as_secs_f64();
+                    sp_n += 1;
+                    if sp_n >= 64 {
+                        eprintln!(
+                            "[sample-probe] over {sp_n} tokens: CPU_sampler={:.3} ms/tok",
+                            sp_sum / sp_n as f64 * 1000.0
+                        );
+                        sp_sum = 0.0;
+                        sp_n = 0;
+                    }
+                } else {
+                    next_token = sample_token_with_state(
+                        &mut logits,
+                        sampling,
+                        &mut sampler_state,
+                        &mut rng,
+                    );
+                }
                 generated_tokens.push(next_token);
             }
         } else {
