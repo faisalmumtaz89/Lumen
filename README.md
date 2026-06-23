@@ -27,7 +27,7 @@ Get Lumen one of two ways, then run.
 **Option A — pre-built binary** (no Rust toolchain). One command detects your platform (macOS → Metal, Linux x86_64 + NVIDIA → CUDA), installs the matching validated binary, and helps you set up a model:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/faisalmumtaz89/Lumen/main/packaging/macos/install.sh | bash
+curl -fsSL https://servelumen.com/install.sh | bash
 ```
 
 **Option B — build from source** (Rust toolchain):

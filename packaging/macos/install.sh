@@ -2,7 +2,7 @@
 #
 # install.sh — one-command, cross-platform binary onboarder for Lumen.
 #
-#   curl -fsSL https://raw.githubusercontent.com/faisalmumtaz89/Lumen/main/packaging/macos/install.sh | bash
+#   curl -fsSL https://servelumen.com/install.sh | bash
 #
 # Detects your machine (macOS Apple Silicon -> Metal · Linux x86_64 + NVIDIA ->
 # CUDA), downloads the matching prebuilt binaries from the latest GitHub release,
@@ -72,7 +72,7 @@ usage() {
   cat <<'EOF'
 Lumen installer — detects your platform, installs the prebuilt binaries, sets up a model.
 
-  curl -fsSL https://raw.githubusercontent.com/faisalmumtaz89/Lumen/main/packaging/macos/install.sh | bash
+  curl -fsSL https://servelumen.com/install.sh | bash
 
 Options (after `bash -s --`) / env:
   --model <alias>   LUMEN_MODEL   qwen3.5-9b | qwen3.5-moe | qwen3.6-27b  (accepts name:quant)
