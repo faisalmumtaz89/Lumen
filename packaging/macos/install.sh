@@ -18,10 +18,18 @@
 #   --model <alias>   LUMEN_MODEL   (qwen3.5-9b | qwen3.5-moe | qwen3.6-27b; accepts name:quant)
 #   --quant <tag>     LUMEN_QUANT   (q8_0 | q4_0 | bf16; default q8_0)
 #   --yes, -y                        non-interactive (accept defaults, no prompts)
-#   --prefix <dir>    LUMEN_PREFIX  (install dir; default /usr/local/bin)
+#   --prefix <dir>    LUMEN_PREFIX  (install dir; default = auto-selected, see below)
 #   LUMEN_TAG         pin a release tag (e.g. v0.1.0, or a v..-rc.N prerelease); default = latest
 #   LUMEN_CACHE_DIR   model cache location (passed through to lumen)
 #   LUMEN_RELEASE_BASE / LUMEN_ALLOW_INSECURE_BASE / LUMEN_INSECURE_SKIP_CHECKSUM  (advanced/testing)
+#   NO_COLOR          set to disable colored output (color is also off when stdout isn't a TTY)
+#
+# Install location (no --prefix/LUMEN_PREFIX): the first directory that is both
+# already on $PATH AND writable without sudo is chosen — typically
+# ~/.local/bin (Linux), /opt/homebrew/bin (Apple-Silicon Homebrew), or
+# /usr/local/bin. No sudo, no profile edits in that case. Failing that, it uses
+# /usr/local/bin via sudo (with a clear heads-up), or finally ~/.local/bin with
+# a one-line, idempotent PATH addition to your shell profile.
 #
 # (Path note: this script lives under packaging/macos/ for URL stability but is
 #  cross-platform — it serves both the macOS Metal and Linux CUDA binaries.)
@@ -31,7 +39,9 @@ REPO="faisalmumtaz89/Lumen"
 RELEASE_BASE="${LUMEN_RELEASE_BASE:-https://github.com/$REPO/releases}"
 API_LATEST="https://api.github.com/repos/$REPO/releases/latest"
 TAG="${LUMEN_TAG:-latest}"
-PREFIX="${LUMEN_PREFIX:-/usr/local/bin}"
+# Empty unless the user passed --prefix/LUMEN_PREFIX. Auto-selection (below)
+# only runs when this is empty, so an explicit prefix always wins.
+PREFIX="${LUMEN_PREFIX:-}"
 DEFAULT_MODEL="qwen3.5-9b"
 DEFAULT_QUANT="q8_0"
 MOE_CANONICAL="qwen3.5-moe-35b-a3b"   # the alias that round-trips through pull, run AND lumen-server
@@ -40,9 +50,21 @@ MODEL="${LUMEN_MODEL:-}"
 QUANT="${LUMEN_QUANT:-}"
 ASSUME_YES=0
 
+# ── Presentation ──────────────────────────────────────────────────────────────
+# Color ONLY when stdout is a real TTY and NO_COLOR is unset (CI/pipe-safe).
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+else
+  C_RESET=''; C_BOLD=''; C_DIM=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''
+fi
+OK_MARK="${C_GREEN}✓${C_RESET}"
+
 say()  { printf '%s\n' "$*"; }
-info() { printf '[install] %s\n' "$*"; }
-err()  { printf 'error: %s\n' "$*" >&2; }
+# Aligned "Label   value" line for the main flow (replaces the [install] prefix).
+field() { printf '  %s%-10s%s %s\n' "$C_BOLD" "$1" "$C_RESET" "$2"; }
+info() { printf '  %sinfo%s  %s\n' "$C_DIM" "$C_RESET" "$*"; }
+err()  { printf '  %serror%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -56,7 +78,7 @@ Options (after `bash -s --`) / env:
   --model <alias>   LUMEN_MODEL   qwen3.5-9b | qwen3.5-moe | qwen3.6-27b  (accepts name:quant)
   --quant <tag>     LUMEN_QUANT   q8_0 | q4_0 | bf16        (default q8_0)
   --yes, -y                       non-interactive (defaults, no prompts)
-  --prefix <dir>    LUMEN_PREFIX  install dir               (default /usr/local/bin)
+  --prefix <dir>    LUMEN_PREFIX  install dir   (default: auto — first writable $PATH dir)
   LUMEN_TAG=<tag>   install a specific release (e.g. v0.1.0, or a v..-rc.N prerelease)
 EOF
 }
@@ -90,6 +112,11 @@ case "$RELEASE_BASE" in
        || die "LUMEN_RELEASE_BASE must be an https://github.com URL (got '$RELEASE_BASE'); set LUMEN_ALLOW_INSECURE_BASE=1 to override (testing only)." ;;
 esac
 
+# ── Banner ────────────────────────────────────────────────────────────────────
+say ""
+say "  ${C_BOLD}Lumen${C_RESET} ${C_DIM}·${C_RESET} installer"
+say ""
+
 # ── Step 0 · detect platform ──────────────────────────────────────────────────
 has_nvidia() {
   [ -e /dev/nvidia0 ] && return 0
@@ -104,11 +131,13 @@ case "$OS" in
     OSVER="$(sw_vers -productVersion)"; OSMAJ="${OSVER%%.*}"
     [ "${OSMAJ:-0}" -ge 14 ] || die "macOS 14 (Sonoma) or newer required; found $OSVER."
     PLAT="macos-arm64-metal"; BACKEND="metal"
+    PLAT_LABEL="macOS · Apple Silicon → Metal"
     ;;
   Linux)
     [ "$ARCH" = "x86_64" ] || die "no prebuilt Linux binary for $ARCH (x86_64 only). Build from source: cargo install --path crates/lumen-cli --features cuda"
     if has_nvidia; then
       PLAT="linux-x86_64-cuda"; BACKEND="cuda"
+      PLAT_LABEL="Linux · x86_64 + NVIDIA → CUDA"
     else
       err "no NVIDIA GPU detected — the prebuilt Linux binary is CUDA-only."
       err "For a CPU build, build from source: cargo install --path crates/lumen-cli   (or ./scripts/quickstart.sh)"
@@ -117,7 +146,7 @@ case "$OS" in
     ;;
   *) die "no prebuilt binary for $OS/$ARCH; build from source: https://github.com/$REPO" ;;
 esac
-info "platform: $OS/$ARCH -> $BACKEND ($PLAT)"
+field "Platform" "$PLAT_LABEL"
 
 for tool in curl tar; do have "$tool" || die "'$tool' is required but not found"; done
 sha256_of() { if have shasum; then shasum -a 256 "$1" | awk '{print $1}'; else sha256sum "$1" | awk '{print $1}'; fi; }
@@ -129,65 +158,198 @@ api_get() {  # honor GITHUB_TOKEN to dodge the 60-req/hr unauthenticated limit
   if [ -n "${GITHUB_TOKEN:-}" ]; then curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$1" 2>/dev/null
   else curl -fsSL "$1" 2>/dev/null; fi
 }
+# Sets RESOLVED_URL and RESOLVED_TAG (the human-readable release, e.g. v0.2.0 or
+# "latest"). Kept as globals so Step 2 can show a short asset name + version
+# instead of the long URL.
+RESOLVED_TAG="$TAG"
 resolve_asset_url() {
   local plat="$1"
   if [ "$TAG" != "latest" ]; then
-    printf '%s\n' "$RELEASE_BASE/download/$TAG/lumen-$TAG-$plat.tar.gz"; return 0
+    RESOLVED_URL="$RELEASE_BASE/download/$TAG/lumen-$TAG-$plat.tar.gz"; RESOLVED_TAG="$TAG"; return 0
   fi
   local alias_url="$RELEASE_BASE/latest/download/lumen-$plat.tar.gz"
-  if url_ok "$alias_url"; then printf '%s\n' "$alias_url"; return 0; fi
+  if url_ok "$alias_url"; then RESOLVED_URL="$alias_url"; RESOLVED_TAG="latest"; return 0; fi
   # Fallback: latest *stable* (non-prerelease) tag from the API, then the tag-named asset.
   local tag
   tag="$(api_get "$API_LATEST" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/' || true)"
   if [ -z "$tag" ]; then
     die "could not resolve a stable release (none published yet, only a pre-release, or the GitHub API is rate-limited). Pin one with LUMEN_TAG=<tag> (e.g. a v..-rc.N pre-release), or set GITHUB_TOKEN to raise the API limit."
   fi
-  printf '%s\n' "$RELEASE_BASE/download/$tag/lumen-$tag-$plat.tar.gz"
+  RESOLVED_URL="$RELEASE_BASE/download/$tag/lumen-$tag-$plat.tar.gz"; RESOLVED_TAG="$tag"
 }
-URL="$(resolve_asset_url "$PLAT")"
+resolve_asset_url "$PLAT"
+URL="$RESOLVED_URL"
+ASSET="lumen-$PLAT"
+if [ "$RESOLVED_TAG" = "latest" ]; then
+  field "Release" "latest"
+else
+  field "Release" "$RESOLVED_TAG"
+fi
 
 # ── Step 2 · download + verify checksum (abort installs nothing on mismatch) ──
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-info "downloading $URL"
-curl -fSL "$URL" -o "$TMP/pkg.tar.gz" || die "download failed: $URL"
+curl -fsSL "$URL" -o "$TMP/pkg.tar.gz" || die "download failed: $URL"
+# Human-readable size of the downloaded asset (best-effort; blank if stat differs).
+DL_SIZE=""
+if bytes="$(wc -c < "$TMP/pkg.tar.gz" 2>/dev/null)" && [ -n "$bytes" ]; then
+  DL_SIZE="$(awk -v b="$bytes" 'BEGIN{ if (b>=1048576) printf "%.1f MB", b/1048576; else printf "%.0f KB", b/1024 }')"
+fi
+VERIFIED=""
 if curl -fsSL "$URL.sha256" -o "$TMP/pkg.sha256" 2>/dev/null; then
   want="$(awk '{print $1}' "$TMP/pkg.sha256")"; got="$(sha256_of "$TMP/pkg.tar.gz")"
   [ "$want" = "$got" ] || die "checksum mismatch (want $want, got $got) — installing nothing."
-  info "checksum OK"
+  VERIFIED="$OK_MARK verified"
 elif [ "${LUMEN_INSECURE_SKIP_CHECKSUM:-0}" = "1" ]; then
-  info "WARNING: no .sha256 published; skipping verification (LUMEN_INSECURE_SKIP_CHECKSUM=1)."
+  VERIFIED="${C_YELLOW}unverified${C_RESET} (LUMEN_INSECURE_SKIP_CHECKSUM=1)"
+  info "WARNING: no .sha256 published; skipping verification."
 else
   die "no checksum (.sha256) for $URL; refusing. Set LUMEN_INSECURE_SKIP_CHECKSUM=1 to override."
 fi
+# Download   lumen-macos-arm64-metal · 6.6 MB · ✓ verified
+if [ -n "$DL_SIZE" ]; then
+  field "Download" "$ASSET ${C_DIM}·${C_RESET} $DL_SIZE ${C_DIM}·${C_RESET} $VERIFIED"
+else
+  field "Download" "$ASSET ${C_DIM}·${C_RESET} $VERIFIED"
+fi
 
-# ── Step 3 · install both binaries (version-agnostic glob; mkdir + sudo + ~/.local fb) ─
+# ── Step 3 · install both binaries ────────────────────────────────────────────
+# Robust, cross-platform location logic (macOS Metal + Linux CUDA). The goal:
+# pick a directory that is already on $PATH and writable WITHOUT sudo so the
+# common Linux + Homebrew-Mac case needs no password and no profile edit. Only
+# when none qualifies do we fall back to sudo /usr/local/bin or to ~/.local/bin
+# with a one-line PATH addition.
 tar -C "$TMP" -xzf "$TMP/pkg.tar.gz"
 SRC="$(find "$TMP" -maxdepth 1 -type d -name "lumen-*-$PLAT" | head -1)"
 [ -n "$SRC" ] && [ -d "$SRC/bin" ] || die "unexpected tarball layout under $TMP"
 
-install_to() {  # $1=dir  $2=""|"sudo"  — creates the dir first (fixes missing-PREFIX)
+# True if $1 is a literal entry on $PATH.
+on_path() { case ":$PATH:" in *":$1:"*) return 0 ;; *) return 1 ;; esac; }
+# True if $1 can be written WITHOUT sudo: it exists and is writable, OR it does
+# not exist but the nearest existing ancestor is writable (so `mkdir -p` would
+# succeed without sudo). Walks up the same way `mkdir -p` does.
+writable_nosudo() {
+  local d="$1"
+  if [ -d "$d" ]; then [ -w "$d" ] && return 0; return 1; fi
+  # Climb to the first existing ancestor; if it's writable, mkdir -p succeeds.
+  local p="$d" parent
+  while :; do
+    parent="$(dirname -- "$p")"
+    [ "$parent" = "$p" ] && return 1   # reached / without finding one
+    if [ -e "$parent" ]; then
+      [ -d "$parent" ] && [ -w "$parent" ] && return 0
+      return 1
+    fi
+    p="$parent"
+  done
+}
+# Copy both binaries into $1 using the command prefix $2 ("" or "sudo").
+# stderr is suppressed so a no-sudo probe failure is SILENT — the caller decides
+# whether the failure is fatal and prints a clean message if so.
+install_to() {
   local d="$1" S="$2" b
   $S mkdir -p "$d" 2>/dev/null || return 1
   for b in lumen lumen-server; do
-    $S install -m 0755 "$SRC/bin/$b" "$d/$b" || return 1
+    $S install -m 0755 "$SRC/bin/$b" "$d/$b" 2>/dev/null || return 1
   done
   return 0
 }
-DEST=""
-if install_to "$PREFIX" ""; then DEST="$PREFIX"
-elif have sudo && { info "installing to $PREFIX (sudo may prompt for your password)"; install_to "$PREFIX" "sudo"; }; then DEST="$PREFIX"
-elif install_to "$HOME/.local/bin" ""; then DEST="$HOME/.local/bin"; info "$PREFIX not writable; installed to $DEST"
-else die "could not install to $PREFIX (and the $HOME/.local/bin fallback also failed)"; fi
 
+DEST=""
+PROFILE_EDITED=""   # set to the profile path if we appended a PATH line (branch 4)
+
+if [ -n "$PREFIX" ]; then
+  # (1) Explicit --prefix / LUMEN_PREFIX → honor it. No auto-selection.
+  if writable_nosudo "$PREFIX" && install_to "$PREFIX" ""; then
+    DEST="$PREFIX"
+  elif have sudo; then
+    info "Admin access is needed to write $PREFIX — you'll be asked for your password."
+    install_to "$PREFIX" "sudo" && DEST="$PREFIX"
+    [ -n "$DEST" ] || die "could not install to $PREFIX (even with sudo). Pick a writable --prefix, e.g. --prefix \"\$HOME/.local/bin\"."
+  else
+    die "cannot write $PREFIX and 'sudo' is unavailable. Pick a writable --prefix, e.g. --prefix \"\$HOME/.local/bin\"."
+  fi
+else
+  # (2) Auto-select: FIRST dir that is BOTH on $PATH AND writable without sudo.
+  # Preference order: ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, then any
+  # other writable $PATH entry. (No sudo, no profile edit in this branch.)
+  CANDIDATES="$HOME/.local/bin /opt/homebrew/bin /usr/local/bin"
+  # Append remaining $PATH entries (split on ':') not already named above.
+  _oldifs="$IFS"; IFS=':'
+  for p in $PATH; do
+    [ -n "$p" ] || continue
+    case " $CANDIDATES " in *" $p "*) ;; *) CANDIDATES="$CANDIDATES $p" ;; esac
+  done
+  IFS="$_oldifs"
+  for d in $CANDIDATES; do
+    if on_path "$d" && writable_nosudo "$d" && install_to "$d" ""; then
+      DEST="$d"; break
+    fi
+  done
+
+  if [ -z "$DEST" ]; then
+    # (3) Nothing on-PATH-and-writable. If /usr/local/bin is on $PATH and sudo is
+    # available, install there with sudo (after a clear heads-up).
+    if on_path "/usr/local/bin" && have sudo; then
+      info "Admin access is needed to write /usr/local/bin — you'll be asked for your password."
+      install_to "/usr/local/bin" "sudo" && DEST="/usr/local/bin"
+    fi
+  fi
+
+  if [ -z "$DEST" ]; then
+    # (4) Last resort: install to ~/.local/bin (create it) and put it on PATH by
+    # appending a single idempotent line to the user's shell profile.
+    DEST="$HOME/.local/bin"
+    install_to "$DEST" "" || die "could not install to $DEST."
+    if ! on_path "$DEST"; then
+      # Pick the profile by login shell; cover bash's two files.
+      shell_name="$(basename -- "${SHELL:-}")"
+      profiles=""
+      case "$shell_name" in
+        zsh)  profiles="$HOME/.zshrc" ;;
+        bash) profiles="$HOME/.bashrc $HOME/.bash_profile" ;;
+        *)    profiles="$HOME/.profile" ;;
+      esac
+      export_line="export PATH=\"\$HOME/.local/bin:\$PATH\""
+      for prof in $profiles; do
+        # Idempotent: skip if a line already puts ~/.local/bin on PATH — match
+        # BOTH the unexpanded `$HOME/.local/bin` literal we write (so a second
+        # run is a no-op) AND an already-expanded absolute path a user may have.
+        # shellcheck disable=SC2016  # the '$HOME' literal is intentional: that
+        # is the exact text we append, so the single-quoted pattern matches it.
+        if [ -f "$prof" ] \
+           && { grep -Fq '$HOME/.local/bin' "$prof" 2>/dev/null \
+                || grep -Fq "$HOME/.local/bin" "$prof" 2>/dev/null; }; then
+          continue
+        fi
+        printf '\n# Added by Lumen installer\n%s\n' "$export_line" >> "$prof" \
+          && PROFILE_EDITED="${PROFILE_EDITED:+$PROFILE_EDITED }$prof"
+      done
+    fi
+  fi
+fi
+
+# Strip macOS quarantine so Gatekeeper doesn't block the unsigned binaries.
 if [ "$BACKEND" = "metal" ]; then
   xattr -dr com.apple.quarantine "$DEST/lumen" "$DEST/lumen-server" 2>/dev/null || true
 fi
+
 LUMEN="$DEST/lumen"
-info "installed: $DEST/lumen, $DEST/lumen-server ($("$LUMEN" --version 2>/dev/null || echo '?'))"
-case ":$PATH:" in *":$DEST:"*) ;; *) info "NOTE: add to PATH:  export PATH=\"$DEST:\$PATH\"" ;; esac
-resolved="$(command -v lumen 2>/dev/null || true)"
-if [ -n "$resolved" ] && [ "$resolved" != "$DEST/lumen" ]; then
-  info "NOTE: 'lumen' on PATH currently resolves to $resolved (not $DEST/lumen)"
+VER="$("$LUMEN" --version 2>/dev/null | awk '{print $NF}' || echo '?')"
+field "Installed" "lumen + lumen-server → $DEST ${C_DIM}·${C_RESET} $VER"
+
+if [ -n "$PROFILE_EDITED" ]; then
+  info "added $DEST to PATH in: $PROFILE_EDITED"
+  info "for this shell, run:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+fi
+
+# Shadow check: if a DIFFERENT `lumen` is found earlier on PATH, the new one is
+# masked. Make this an actionable warning, not a passive note.
+r="$(command -v lumen 2>/dev/null || true)"
+if on_path "$DEST" && [ -n "$r" ] && [ "$r" != "$DEST/lumen" ]; then
+  err "another 'lumen' shadows the one just installed:"
+  err "    on PATH:   $r"
+  err "    installed: $DEST/lumen"
+  err "  fix it:  rm \"$r\"   (or put $DEST earlier on PATH)"
 fi
 
 # ── Step 4 · pick a model + quant (interactive via /dev/tty; safe under pipe) ──
@@ -195,20 +357,20 @@ INTERACTIVE=0
 if [ -z "$MODEL" ] && [ "$ASSUME_YES" != "1" ] && [ -r /dev/tty ]; then INTERACTIVE=1; fi
 if [ "$INTERACTIVE" = "1" ]; then
   say ""
-  say "  Which model?"
-  say "    1) Qwen3.5 9B     (dense, ~10 GB at Q8 — fast, recommended)"
-  say "    2) Qwen3.5 MoE    (30B-A3B mixture-of-experts, larger)"
-  say "    3) Qwen3.6 27B    (dense, largest)"
-  printf '  > '
+  say "  ${C_BOLD}Choose a model${C_RESET}"
+  say "    1  Qwen3.5 9B    ${C_DIM}dense · ~10 GB @ Q8${C_RESET}        ${C_GREEN}(recommended)${C_RESET}"
+  say "    2  Qwen3.5 MoE   ${C_DIM}30B-A3B · mixture-of-experts${C_RESET}"
+  say "    3  Qwen3.6 27B   ${C_DIM}dense · largest${C_RESET}"
+  printf '  %s›%s ' "$C_CYAN" "$C_RESET"
   read -r pick < /dev/tty || pick=""
   case "$pick" in 2) MODEL="$MOE_CANONICAL" ;; 3) MODEL="qwen3.6-27b" ;; *) MODEL="$DEFAULT_MODEL" ;; esac
   if [ -z "$QUANT" ]; then   # honor an explicit --quant; only prompt if unset
     say ""
-    say "  Which version (quant)?"
-    say "    1) Q8    (recommended — best quality/size balance)   [default]"
-    say "    2) Q4    (smaller, faster, slightly lower quality)"
-    say "    3) BF16  (full precision — ~18 GB for 9B, ~55-70 GB for MoE/27B; large, not resumable)"
-    printf '  > '
+    say "  ${C_BOLD}Choose a quant${C_RESET}"
+    say "    1  Q8    ${C_DIM}best quality/size${C_RESET}                  ${C_GREEN}(recommended)${C_RESET}"
+    say "    2  Q4    ${C_DIM}smaller · faster${C_RESET}"
+    say "    3  BF16  ${C_DIM}full precision · large${C_RESET}"
+    printf '  %s›%s ' "$C_CYAN" "$C_RESET"
     read -r qpick < /dev/tty || qpick=""
     case "$qpick" in 2) QUANT="q4_0" ;; 3) QUANT="bf16" ;; *) QUANT="$DEFAULT_QUANT" ;; esac
   fi
@@ -220,7 +382,6 @@ fi
 case "$MODEL" in
   qwen3.5-moe|qwen3-5-moe|qwen3.5-moe-35b-a3b|qwen3-5-moe-35b-a3b) MODEL="$MOE_CANONICAL" ;;
 esac
-info "selected: $MODEL:$QUANT"
 
 # ── Step 5 · prepare the model (installer owns consent -> pull --yes) ─────────
 cache="${LUMEN_CACHE_DIR:-}"
@@ -244,18 +405,26 @@ if [ -n "${free_gb:-}" ] && [ "$free_gb" -lt "$need" ]; then
     case "$go" in y|Y|yes) ;; *) die "aborted (low disk)." ;; esac
   fi
 fi
+say ""
 info "preparing $MODEL:$QUANT (download + convert; one-time)"
-LUMEN_CACHE_DIR="$cache" "$LUMEN" pull "$MODEL:$QUANT" --yes \
+# Strip the installer's own LUMEN_* input vars (model/quant/prefix/tag/release-base/
+# insecure flags) from the child env — they configure the installer, not lumen, so
+# lumen's env-var typo validator would otherwise warn about each one. LUMEN_CACHE_DIR
+# IS a real lumen var and is passed through explicitly.
+env -u LUMEN_MODEL -u LUMEN_QUANT -u LUMEN_PREFIX -u LUMEN_TAG -u LUMEN_RELEASE_BASE \
+    -u LUMEN_ALLOW_INSECURE_BASE -u LUMEN_INSECURE_SKIP_CHECKSUM \
+    LUMEN_CACHE_DIR="$cache" "$LUMEN" pull "$MODEL:$QUANT" --yes \
   || die "model prepare failed for $MODEL:$QUANT. The binaries are installed at $DEST — re-run this installer (it restarts cleanly), or run: $DEST/lumen pull $MODEL:$QUANT --yes"
 
-# ── Step 6 · print the exact next steps (correct positional / server forms) ───
+# ── Step 6 · print the exact next steps (positional model:quant forms) ────────
 say ""
-say "  Lumen is ready. The model is cached, so the server starts instantly."
+say "  $OK_MARK  ${C_BOLD}$MODEL:$QUANT${C_RESET} ready (cached)"
 say ""
-say "  Chat:"
-say "    lumen run $MODEL:$QUANT \"Write a haiku about Rust\""
+say "  ${C_BOLD}Chat${C_RESET}     lumen run $MODEL:$QUANT \"Write a haiku about Rust\""
+say "  ${C_BOLD}Serve${C_RESET}    lumen-server $MODEL:$QUANT          ${C_DIM}(OpenAI/Anthropic API · :8000)${C_RESET}"
 say ""
-say "  OpenAI/Anthropic-compatible server:"
-say "    lumen-server --model $MODEL --quant $QUANT --backend $BACKEND --port 8000"
-say ""
-case ":$PATH:" in *":$DEST:"*) ;; *) say "  (first: export PATH=\"$DEST:\$PATH\")" ;; esac
+# PATH reminder only if $DEST isn't already on PATH (e.g. fresh ~/.local/bin).
+if ! on_path "$DEST"; then
+  say "  ${C_DIM}First, put it on PATH:${C_RESET}  export PATH=\"$DEST:\$PATH\""
+  say ""
+fi

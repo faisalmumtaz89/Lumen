@@ -12,17 +12,22 @@ For concurrent-client deployments use `lumen-server` (not repeated `lumen run`) 
 # Pre-download a model (one-time, ~10 GB for Qwen3.5-9B Q8_0)
 lumen pull qwen3.5-9b:q8_0
 
-# Boot the server (Metal on macOS, CUDA on Linux with --features cuda)
-cargo run --release --bin lumen-server --features bin -- \
-  --model qwen3.5-9b --quant q8_0 --port 8000
+# Boot the server. The model is positional (model:quant); port defaults to 8000
+# and the backend auto-detects (Metal on macOS, CUDA on Linux).
+lumen-server qwen3.5-9b:q8_0
 
-# Or against an explicit LBC path
-cargo run --release --bin lumen-server --features bin -- \
-  --model /path/to/qwen3-5-9b-Q8_0.lbc
+# Equivalent explicit-flag form (and how to override port / backend)
+lumen-server --model qwen3.5-9b --quant q8_0 --port 8000
 
 # Try it
 curl http://localhost:8000/v1/models
 ```
+
+Building from source instead of the prebuilt binary? Prefix with
+`cargo run --release --bin lumen-server --features bin --`, e.g.
+`cargo run --release --bin lumen-server --features bin -- qwen3.5-9b:q8_0`
+(append `,cuda` to `--features` on NVIDIA). An explicit `.lbc` path also works in
+place of `model:quant`: `lumen-server /path/to/qwen3-5-9b-Q8_0.lbc`.
 
 The bin is gated behind the `bin` Cargo feature so library embedders that wire their own tokenizer / backend keep the `lumen-server` dep graph minimal. `lumen-server --help` lists all flags.
 

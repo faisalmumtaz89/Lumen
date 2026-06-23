@@ -82,7 +82,8 @@ For concurrent clients, run the long-lived server (not repeated `lumen run`):
 
 ```bash
 lumen pull qwen3.5-9b:q8_0
-lumen-server --model qwen3.5-9b --quant q8_0 --port 8000
+lumen-server qwen3.5-9b:q8_0                          # defaults: port 8000, auto backend
+# (explicit form: lumen-server --model qwen3.5-9b --quant q8_0 --port 8000)
 curl http://localhost:8000/v1/models
 ```
 
