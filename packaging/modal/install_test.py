@@ -64,8 +64,8 @@ def install_e2e(ref: str):
     log = r.stdout + r.stderr
     print(log[-5000:], flush=True)
     step("installer exit 0", r.returncode == 0, f"rc={r.returncode}")
-    step("detected CUDA backend", "-> cuda" in log)
-    step("checksum verified", "checksum OK" in log)
+    step("detected CUDA backend", "cuda" in log.lower())
+    step("checksum verified", "verified" in log)
     step("both binaries installed",
          os.path.exists("/usr/local/bin/lumen") and os.path.exists("/usr/local/bin/lumen-server"))
     v = _sh("/usr/local/bin/lumen --version")

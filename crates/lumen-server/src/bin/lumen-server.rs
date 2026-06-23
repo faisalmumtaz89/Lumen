@@ -93,9 +93,14 @@ fn print_help() {
 lumen-server - OpenAI / Anthropic-compatible HTTP server for Lumen
 
 USAGE:
-    lumen-server [OPTIONS] --model <MODEL>
+    lumen-server [OPTIONS] [MODEL:QUANT]
+    lumen-server [OPTIONS] --model <MODEL> [--quant <Q>]
 
-REQUIRED:
+MODEL (positional or --model):
+    MODEL:QUANT            Registry name with an optional quant tag, e.g.
+                           `lumen-server qwen3.5-9b:q4_0`. Equivalent to
+                           `--model qwen3.5-9b --quant q4_0`. A bare
+                           `lumen-server qwen3.5-9b` uses the default quant.
     --model <ID|PATH>      Registry name (e.g. qwen3.5-9b, qwen3.5-moe-35b-a3b)
                            OR direct path to a .lbc file. Registry-name
                            resolution requires the LBC to be cached under
@@ -134,11 +139,14 @@ ENVIRONMENT VARIABLES (CUDA backend):
                            `0`. Set `=0` to disable on the server. Cost <=1% TPOT.
 
 EXAMPLES:
-    # Auto-detect backend, default port 8000
+    # Positional model:quant, auto-detect backend, default port 8000
+    lumen-server qwen3.5-9b:q4_0
+
+    # Explicit flags (equivalent to the above for q8_0)
     lumen-server --model qwen3.5-9b --quant q8_0
 
     # CUDA, custom port
-    lumen-server --model qwen3.5-9b --quant q8_0 --backend cuda --port 9000
+    lumen-server qwen3.5-9b:q8_0 --backend cuda --port 9000
 
     # Direct file path
     lumen-server --model /path/to/qwen3-5-9b-Q8_0.lbc --port 8080
@@ -154,6 +162,10 @@ ENDPOINTS:
 
 fn parse_args(raw: &[String]) -> Result<Args, String> {
     let mut args = Args::default();
+    // Tracks whether `--quant` was passed explicitly. A positional `model:quant`
+    // tag only sets the quant when `--quant` was NOT given, so an explicit
+    // `--quant` always wins regardless of argument order.
+    let mut quant_explicit = false;
     let mut i = 0;
     while i < raw.len() {
         match raw[i].as_str() {
@@ -164,6 +176,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--quant" => {
                 i += 1;
                 args.quant = Some(raw.get(i).ok_or("--quant requires a value")?.clone());
+                quant_explicit = true;
             }
             "--host" => {
                 i += 1;
@@ -230,12 +243,47 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 );
                 std::process::exit(0);
             }
+            // Positional `model:quant`. Only a token that does NOT start with
+            // `-` and only when `--model` has not yet been set is treated as the
+            // model spec. This mirrors `lumen run <model>:<quant>`
+            // (`lumen-cli/src/run.rs`): split on the LAST `:` — name before, tag
+            // after — and a trailing `:` (empty tag) means "no quant". A second
+            // bare positional, or a bare token after `--model`, leaves
+            // `args.model` already set and so falls through to the error below.
+            other if !other.starts_with('-') && args.model.is_empty() => {
+                // A direct file path (contains `/`/`\`, or ends with `.lbc`/`.gguf`)
+                // is taken verbatim and never split on an internal `:` — matching
+                // `lumen run` and `resolve_model_path`'s path-first rule. Only a
+                // registry-style `name:quant` token is split on the last `:`.
+                let looks_like_path = other.contains('/')
+                    || other.contains('\\')
+                    || other.ends_with(".lbc")
+                    || other.ends_with(".gguf");
+                if looks_like_path {
+                    args.model = other.to_string();
+                } else {
+                    match other.rfind(':') {
+                        // `name:tag` with a non-empty tag → set both (tag only when
+                        // `--quant` wasn't given, so an explicit `--quant` wins).
+                        Some(p) if !other[p + 1..].is_empty() => {
+                            args.model = other[..p].to_string();
+                            if !quant_explicit {
+                                args.quant = Some(other[p + 1..].to_string());
+                            }
+                        }
+                        // Trailing `:` with an empty tag → name only (strip the `:`).
+                        Some(p) => args.model = other[..p].to_string(),
+                        // No `:` at all → the whole token is the name.
+                        None => args.model = other.to_string(),
+                    }
+                }
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
         i += 1;
     }
     if args.model.is_empty() {
-        return Err("--model is required (try --help)".to_string());
+        return Err("a model is required: pass `MODEL:QUANT` or --model (try --help)".to_string());
     }
     Ok(args)
 }
@@ -872,5 +920,125 @@ fn main() -> ExitCode {
             eprintln!("lumen-server: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+
+    /// Build the `&[String]` `parse_args` expects from string literals.
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn positional_model_quant_sets_both() {
+        // `lumen-server qwen3.5-9b:q4_0` ⇒ model=qwen3.5-9b, quant=Some("q4_0").
+        let a = parse_args(&argv(&["qwen3.5-9b:q4_0"])).expect("parse");
+        assert_eq!(a.model, "qwen3.5-9b");
+        assert_eq!(a.quant.as_deref(), Some("q4_0"));
+    }
+
+    #[test]
+    fn positional_path_with_colon_is_not_split() {
+        // A direct file path containing a `:` must be taken verbatim, NOT split
+        // into a bogus model/quant — matching `lumen run`'s path-first rule.
+        let a = parse_args(&argv(&["./ckpt:final/model.lbc"])).expect("parse");
+        assert_eq!(a.model, "./ckpt:final/model.lbc");
+        assert_eq!(a.quant, None);
+        // The `.lbc` extension alone (no slash) also marks it a path.
+        let b = parse_args(&argv(&["weird:name.lbc"])).expect("parse");
+        assert_eq!(b.model, "weird:name.lbc");
+        assert_eq!(b.quant, None);
+    }
+
+    #[test]
+    fn bare_positional_sets_model_no_quant() {
+        // `lumen-server qwen3.5-9b` ⇒ model set, quant defaults (None here;
+        // resolve_model_path fills q8_0 downstream).
+        let a = parse_args(&argv(&["qwen3.5-9b"])).expect("parse");
+        assert_eq!(a.model, "qwen3.5-9b");
+        assert_eq!(a.quant, None);
+    }
+
+    #[test]
+    fn trailing_colon_means_no_quant() {
+        // Split on the LAST `:`; a trailing `:` (empty tag) ⇒ just the name.
+        let a = parse_args(&argv(&["qwen3.5-9b:"])).expect("parse");
+        assert_eq!(a.model, "qwen3.5-9b");
+        assert_eq!(a.quant, None);
+    }
+
+    #[test]
+    fn explicit_quant_overrides_positional_tag_either_order() {
+        // --quant after the positional wins.
+        let a = parse_args(&argv(&["qwen3.5-9b:q4_0", "--quant", "q8_0"])).expect("parse");
+        assert_eq!(a.model, "qwen3.5-9b");
+        assert_eq!(a.quant.as_deref(), Some("q8_0"));
+        // --quant before the positional also wins (no clobber).
+        let b = parse_args(&argv(&["--quant", "q8_0", "qwen3.5-9b:q4_0"])).expect("parse");
+        assert_eq!(b.model, "qwen3.5-9b");
+        assert_eq!(b.quant.as_deref(), Some("q8_0"));
+    }
+
+    #[test]
+    fn positional_then_flags_still_parse() {
+        // Positional spec composes with other flags.
+        let a = parse_args(&argv(&[
+            "qwen3.5-9b:q8_0",
+            "--backend",
+            "cuda",
+            "--port",
+            "9000",
+        ]))
+        .expect("parse");
+        assert_eq!(a.model, "qwen3.5-9b");
+        assert_eq!(a.quant.as_deref(), Some("q8_0"));
+        assert_eq!(a.port, 9000);
+    }
+
+    #[test]
+    fn explicit_flags_still_work() {
+        // Backward compatibility: --model/--quant unchanged.
+        let a = parse_args(&argv(&["--model", "qwen3.5-9b", "--quant", "q8_0"])).expect("parse");
+        assert_eq!(a.model, "qwen3.5-9b");
+        assert_eq!(a.quant.as_deref(), Some("q8_0"));
+    }
+
+    #[test]
+    fn last_colon_split_keeps_namespaced_names() {
+        // rfind(':') splits on the LAST colon, so a name containing a colon
+        // keeps everything before the final `:` as the model.
+        let a = parse_args(&argv(&["org:model:q4_0"])).expect("parse");
+        assert_eq!(a.model, "org:model");
+        assert_eq!(a.quant.as_deref(), Some("q4_0"));
+    }
+
+    #[test]
+    fn second_bare_positional_is_error() {
+        // A second bare token (model already set) is rejected.
+        let e = parse_args(&argv(&["qwen3.5-9b:q4_0", "qwen3.6-27b"]));
+        assert!(e.is_err(), "expected error, got {e:?}");
+    }
+
+    #[test]
+    fn bare_token_after_model_flag_is_error() {
+        // `--model X` then a bare positional is rejected (model already set).
+        let e = parse_args(&argv(&["--model", "qwen3.5-9b", "qwen3.6-27b"]));
+        assert!(e.is_err(), "expected error, got {e:?}");
+    }
+
+    #[test]
+    fn unknown_flag_is_still_error() {
+        // A leading-dash unknown flag is NOT treated as a positional.
+        let e = parse_args(&argv(&["--bogus"]));
+        assert!(e.is_err(), "expected error, got {e:?}");
+    }
+
+    #[test]
+    fn no_model_is_error() {
+        let e = parse_args(&argv(&[]));
+        assert!(e.is_err(), "expected error, got {e:?}");
     }
 }
