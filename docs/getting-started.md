@@ -9,7 +9,7 @@ This page is the 5-minute path: install, pull a model, run inference. The Qwen3.
 **Fastest — pre-built binary (no toolchain).** Detects your platform (macOS → Metal, Linux x86_64 + NVIDIA → CUDA), installs `lumen` + `lumen-server`, and helps you set up a model:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/faisalmumtaz89/Lumen/main/packaging/macos/install.sh | bash
+curl -fsSL https://servelumen.com/install.sh | bash
 ```
 
 **Or build from source** (needs the Rust toolchain):
