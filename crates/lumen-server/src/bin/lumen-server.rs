@@ -251,19 +251,31 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             // bare positional, or a bare token after `--model`, leaves
             // `args.model` already set and so falls through to the error below.
             other if !other.starts_with('-') && args.model.is_empty() => {
-                match other.rfind(':') {
-                    // `name:tag` with a non-empty tag → set both (tag only when
-                    // `--quant` wasn't given, so an explicit `--quant` wins).
-                    Some(p) if !other[p + 1..].is_empty() => {
-                        args.model = other[..p].to_string();
-                        if !quant_explicit {
-                            args.quant = Some(other[p + 1..].to_string());
+                // A direct file path (contains `/`/`\`, or ends with `.lbc`/`.gguf`)
+                // is taken verbatim and never split on an internal `:` — matching
+                // `lumen run` and `resolve_model_path`'s path-first rule. Only a
+                // registry-style `name:quant` token is split on the last `:`.
+                let looks_like_path = other.contains('/')
+                    || other.contains('\\')
+                    || other.ends_with(".lbc")
+                    || other.ends_with(".gguf");
+                if looks_like_path {
+                    args.model = other.to_string();
+                } else {
+                    match other.rfind(':') {
+                        // `name:tag` with a non-empty tag → set both (tag only when
+                        // `--quant` wasn't given, so an explicit `--quant` wins).
+                        Some(p) if !other[p + 1..].is_empty() => {
+                            args.model = other[..p].to_string();
+                            if !quant_explicit {
+                                args.quant = Some(other[p + 1..].to_string());
+                            }
                         }
+                        // Trailing `:` with an empty tag → name only (strip the `:`).
+                        Some(p) => args.model = other[..p].to_string(),
+                        // No `:` at all → the whole token is the name.
+                        None => args.model = other.to_string(),
                     }
-                    // Trailing `:` with an empty tag → name only (strip the `:`).
-                    Some(p) => args.model = other[..p].to_string(),
-                    // No `:` at all → the whole token is the name.
-                    None => args.model = other.to_string(),
                 }
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -926,6 +938,19 @@ mod tests {
         let a = parse_args(&argv(&["qwen3.5-9b:q4_0"])).expect("parse");
         assert_eq!(a.model, "qwen3.5-9b");
         assert_eq!(a.quant.as_deref(), Some("q4_0"));
+    }
+
+    #[test]
+    fn positional_path_with_colon_is_not_split() {
+        // A direct file path containing a `:` must be taken verbatim, NOT split
+        // into a bogus model/quant — matching `lumen run`'s path-first rule.
+        let a = parse_args(&argv(&["./ckpt:final/model.lbc"])).expect("parse");
+        assert_eq!(a.model, "./ckpt:final/model.lbc");
+        assert_eq!(a.quant, None);
+        // The `.lbc` extension alone (no slash) also marks it a path.
+        let b = parse_args(&argv(&["weird:name.lbc"])).expect("parse");
+        assert_eq!(b.model, "weird:name.lbc");
+        assert_eq!(b.quant, None);
     }
 
     #[test]

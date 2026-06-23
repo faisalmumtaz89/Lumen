@@ -328,6 +328,11 @@ else
   fi
 fi
 
+# Normalize a trailing slash on the chosen dir (e.g. a $PATH entry like
+# /opt/homebrew/bin/) so the shadow check below compares the same text the shell
+# returns and does not falsely flag the binary it just installed.
+DEST="${DEST%/}"
+
 # Strip macOS quarantine so Gatekeeper doesn't block the unsigned binaries.
 if [ "$BACKEND" = "metal" ]; then
   xattr -dr com.apple.quarantine "$DEST/lumen" "$DEST/lumen-server" 2>/dev/null || true
@@ -396,7 +401,7 @@ case "$QUANT" in
   q8_0) case "$MODEL" in *moe*) need=85 ;; *27b*) need=70 ;; *) need=24 ;; esac ;;
   *)    case "$MODEL" in *moe*) need=48 ;; *27b*) need=40 ;; *) need=14 ;; esac ;;
 esac
-free_gb="$(df -Pk "$cache" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024}')"
+free_gb="$(df -Pk "$cache" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024}' || true)"
 if [ -n "${free_gb:-}" ] && [ "$free_gb" -lt "$need" ]; then
   info "WARNING: ~${free_gb} GB free at $cache; $MODEL:$QUANT needs roughly ${need} GB peak (source GGUF + converted LBC coexist; downloads are NOT resumable)."
   if [ "$INTERACTIVE" = "1" ]; then
