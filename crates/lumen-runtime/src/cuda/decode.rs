@@ -546,6 +546,13 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q4_split_q8_1: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_residual: Option<CudaFunction>,
 
+    // Codegen-LOCKED Q4 split matvec (same SoA layout + integer dot as
+    // matvec_q4_split_q8_1, but FP epilogue + reduction pinned with `.rn` PTX
+    // for layout-independent bitwise-identical F32 output). Selected over the
+    // unlocked split kernel when `use_soa_locked` is set.
+    pub(crate) matvec_q4_split_q8_1_locked: Option<CudaFunction>,
+    pub(crate) matvec_q4_split_q8_1_locked_residual: Option<CudaFunction>,
+
     // Q8 split matvec dedicated to the final output projection (configurable NR).
     // The shader exports nr8/nr16/nr32/nr64/nr128 instantiations; we load each
     // as its own optional handle so the host can pick at dispatch time via
@@ -606,6 +613,12 @@ pub(crate) struct KernelSet {
     pub(crate) use_q8_aos_nr8_dispatch: bool,
     /// `LUMEN_CUDA_Q4_SPLIT=1` AND matvec_q4_split_q8_1 loaded.
     pub(crate) use_q4_split_dispatch: bool,
+    /// `LUMEN_CUDA_SOA_LOCKED=1` AND matvec_q4_split_q8_1_locked loaded.
+    /// When true, the Q4 split dispatch selects the codegen-LOCKED kernel
+    /// instead of matvec_q4_split_q8_1. Implies the Q4 split repack (the
+    /// flag forces `use_q4_split` on so the SoA sibling buffers exist).
+    /// Has no effect unless `use_q4_split_dispatch` is also true. Default OFF.
+    pub(crate) use_soa_locked: bool,
     /// `LUMEN_CUDA_Q8_TILE=1` AND matvec_q8_tile_q8_1 loaded.
     /// When true AND the layer's `q8_tile_*` sibling is `Some`, dispatch
     /// routes to `matvec_q8_tile_q8_1` instead of the SPLIT / Aligned / Raw
@@ -667,6 +680,12 @@ pub(crate) struct KernelSet {
     // rmsnorm_to_q8_1: RMSNorm + Q8_1 quantize in one kernel.
     // Replaces rmsnorm + quantize_f32_to_q8_1 at 2 sites/layer (attn_norm, ffn_norm).
     pub(crate) rmsnorm_to_q8_1: Option<CudaFunction>,
+    // rmsnorm_to_q8_1_rawsum: RMSNorm + Q8_1 quantize in one kernel, RAW-SUM
+    // convention (s = raw F32 sum of normed values), matching quantize_q8_1_rawsum.
+    // Wired into the Q4 lm_head "Path -1" (rawsum quantize + mul_mat_vec_q_q4_0)
+    // under LUMEN_CUDA_LMHEAD_FUSED to fuse the final rmsnorm + rawsum-quantize
+    // into one launch (bit-identical). Default-OFF.
+    pub(crate) rmsnorm_to_q8_1_rawsum: Option<CudaFunction>,
     // fused_residual_rmsnorm_q8_1: Residual add + RMSNorm + Q8_1 quantize.
     // For Q8_0 inter-layer boundaries: fuses residual_add_copy + rmsnorm + quantize_f32_to_q8_1.
     pub(crate) fused_residual_rmsnorm_q8_1: Option<CudaFunction>,
@@ -2002,6 +2021,35 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        // Codegen-LOCKED Q4 split kernels. Loaded via the same fast-math
+        // pipeline -- the kernel's inline `.rn` PTX ops are immune to
+        // --use_fast_math, so the lock holds regardless of the loader flags.
+        matvec_q4_split_q8_1_locked: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE,
+            "matvec_q4_split_q8_1_locked",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_locked: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_locked: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_split_q8_1_locked_residual: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE,
+            "matvec_q4_split_q8_1_locked_residual",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_locked_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_locked_residual: FAILED: {e}");
+                None
+            }
+        },
         matvec_q8_split_output_proj: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_SPLIT_OUTPUT_PROJ_KERNEL_SOURCE,
             "matvec_q8_split_output_proj_nr32",
@@ -2387,6 +2435,20 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] rmsnorm_to_q8_1: FAILED: {e}");
+                None
+            }
+        },
+        // Fused RMSNorm + Q8_1 quantize, RAW-SUM convention (Q4 lm_head Path -1).
+        rmsnorm_to_q8_1_rawsum: match load_fn(
+            shaders::RMSNORM_Q8_1_KERNEL_SOURCE,
+            "rmsnorm_to_q8_1_rawsum",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] rmsnorm_to_q8_1_rawsum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] rmsnorm_to_q8_1_rawsum: FAILED: {e}");
                 None
             }
         },
@@ -3506,6 +3568,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         use_q8_split_nr8_dispatch: false,
         use_q8_aos_nr8_dispatch: false,
         use_q4_split_dispatch: false,
+        use_soa_locked: false,
         // TILE feature flags. Same handling as SPLIT.
         use_q8_tile_dispatch: false,
         use_q4_tile_dispatch: false,

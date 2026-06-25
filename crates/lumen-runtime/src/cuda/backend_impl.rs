@@ -1137,6 +1137,24 @@ fn cuda_decode_graph_enabled() -> bool {
     })
 }
 
+/// Resolves `LUMEN_CUDA_GPU_SAMPLE` (default ON). When ON, the CUDA backend
+/// advertises `gpu_argmax = true` (once weights are preloaded) and serves the
+/// greedy decode loop through `decode_token_greedy`: the existing on-GPU
+/// `argmax_f32` kernel selects the token and only a 4-byte token id is copied
+/// back, removing the per-token full-vocab logits D2H copy that the
+/// logits-returning `decode_token` path pays. Greedy output is byte-identical
+/// to the prior full-readback path (GPU `argmax_f32` selects the same index the
+/// CPU argmax did over the same logits buffer) -- proven by the differential
+/// test `cuda_decode_token_greedy_matches_decode_token_argmax` and by the
+/// determinism + baseline-anchored corpus gate. Set `LUMEN_CUDA_GPU_SAMPLE=0`
+/// to fall back to the full-vocab-readback + CPU-argmax path. Temperature>0
+/// sampling is unaffected (CUDA has no GPU sampler; it stays on the CPU
+/// full-logits path), so the fixed-seed sampler remains deterministic.
+fn cuda_gpu_sample_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| parse_env_truthy("LUMEN_CUDA_GPU_SAMPLE").unwrap_or(true))
+}
+
 /// Resolves `LUMEN_CUDA_DECODE_GRAPH_QGATE`. Unset → BF16-aware default.
 fn cuda_decode_graph_qgate_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
@@ -11036,6 +11054,92 @@ impl CudaBackend {
             }
         }
 
+        // Fused fast path: fused final-RMSNorm + rawsum-Q8_1-quantize for the Q4
+        // lm_head "Path -1" (rawsum quantize + mul_mat_vec_q_q4_0). Replaces the
+        // standalone `rmsnorm` + `quantize_q8_1_rawsum` with ONE launch of
+        // `rmsnorm_to_q8_1_rawsum` (x_gpu -> q8_1_buf, never materializing the
+        // F32 `normed`), then the same `mul_mat_vec_q_q4_0` matvec, and returns.
+        // BIT-IDENTICAL by construction (same rms reduction tree + same rawsum
+        // quantize math). Gated behind LUMEN_CUDA_LMHEAD_FUSED (default OFF);
+        // only fires when the exact Path -1 prerequisites hold, so when OFF or
+        // inapplicable the dispatch below is byte-unchanged.
+        if super::moe::lmhead_fused_enabled()
+            && super::moe::mmv_q_output_proj_enabled()
+            && st.kernels.rmsnorm_to_q8_1_rawsum.is_some()
+            && st.kernels.mul_mat_vec_q_q4_0.is_some()
+            && st.scratch.input_q8_1.is_some()
+        {
+            // Pick the active Q4 output_proj buffer with the SAME priority as the
+            // unfused branches: Q4Aligned first, then raw Q4.
+            let proj_q4: Option<&CudaSlice<u8>> = st
+                .globals
+                .output_proj_q4_aligned
+                .as_ref()
+                .or(st.globals.output_proj_q4.as_ref());
+            if let Some(proj_q4) = proj_q4 {
+                use std::sync::Once;
+                static TRACE_ONCE_LMHEAD_FUSED: Once = Once::new();
+                TRACE_ONCE_LMHEAD_FUSED.call_once(|| {
+                    super::decode::cuda_log_force(format!(
+                        "[CUDA] LUMEN_CUDA_LMHEAD_FUSED: rmsnorm_to_q8_1_rawsum + mul_mat_vec_q_q4_0 (grid={}, in_dim={})",
+                        vocab_size, hidden_dim
+                    ));
+                });
+                let out_dim = vocab_size as u32;
+                let in_dim = hidden_dim as u32;
+                let fused_fn = st.kernels.rmsnorm_to_q8_1_rawsum.as_ref().unwrap();
+                let mv_fn = st.kernels.mul_mat_vec_q_q4_0.as_ref().unwrap();
+                let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
+
+                // Fused RMSNorm + rawsum-Q8_1 quantize. Use the SAME block_size /
+                // shared-mem as the standalone `rmsnorm` so the reduction tree
+                // (num_warps) — and thus `rms` — is bit-identical.
+                let block_size = rmsnorm_block_size(hidden_dim);
+                let shared_bytes = rmsnorm_shared_bytes(block_size);
+                let fused_cfg = CudarcLaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: shared_bytes,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(fused_fn)
+                        .arg(&st.scratch.x_gpu)
+                        .arg(&st.globals.final_norm)
+                        .arg(&mut *q8_1_buf)
+                        .arg(&eps)
+                        .arg(&in_dim)
+                        .launch(fused_cfg)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("rmsnorm_to_q8_1_rawsum lm_head: {e}"))
+                })?;
+
+                // mul_mat_vec_q_q4_0 matvec — identical config to Path -1.
+                let mv_cfg = CudarcLaunchConfig {
+                    grid_dim: (out_dim, 1, 1),
+                    block_dim: (32, 4, 1),
+                    shared_mem_bytes: 128,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(mv_fn)
+                        .arg(proj_q4)
+                        .arg(&*q8_1_buf)
+                        .arg(&mut st.logits_gpu)
+                        .arg(&in_dim)
+                        .arg(&out_dim)
+                        .launch(mv_cfg)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("mul_mat_vec_q_q4_0 lm_head fused: {e}"))
+                })?;
+                return Ok(());
+            }
+        }
+
         // RMSNorm with final_norm weights (for non-F16 output projection paths).
         {
             let block_size = rmsnorm_block_size(hidden_dim);
@@ -11914,6 +12018,76 @@ impl CudaBackend {
         kv.advance_seq_len()?;
         st.decode_token_count += 1;
         Ok(Logits { data: logits_host })
+    }
+
+    /// GPU-side greedy decode (normal / non-graph path) returning the token id
+    /// directly. Runs the IDENTICAL compute pipeline as `decode_token_normal`
+    /// (embed -> per-layer -> final projection -> on-GPU `argmax_f32`), in the
+    /// same kernel order with the same per-layer dtod propagation, so the
+    /// selected token is bit-identical to `argmax(decode_token(..).data)`. The
+    /// only difference is the readback: instead of copying the full vocab logits
+    /// to the host (~vocab*4 bytes) and running CPU argmax, it copies back ONLY
+    /// the 4-byte argmax index the kernel already wrote into `st.argmax_result`.
+    /// That removes the per-token full-vocab D2H copy + the host-side argmax scan
+    /// from the greedy decode loop. Advances `kv.seq_len()` and the decode
+    /// counter internally (matching the `decode_token_greedy` trait contract).
+    fn decode_token_greedy_normal(
+        &self,
+        token_id: u32,
+        seq_pos: usize,
+        num_layers: usize,
+        hp: &ModelHyperparams,
+        st: &mut MutableState,
+        kv: &mut crate::kv::KvCache,
+    ) -> Result<u32, RuntimeError> {
+        self.embed_token_gpu(token_id, st)?;
+        for layer in 0..num_layers {
+            self.compute_layer_gpu(layer, seq_pos, st)?;
+            // Mirror decode_token_normal's FIX-DTOD: propagate the post-FFN
+            // residual for dense layers; skip for MoE layers (encode_moe_ffn_decode
+            // already wrote the post-FFN state in-place to st.scratch.x_gpu).
+            let is_moe_layer = st
+                .moe_meta_cache
+                .get(layer)
+                .and_then(|m| m.as_ref())
+                .is_some();
+            if !is_moe_layer {
+                self.device
+                    .stream
+                    .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
+                    .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
+            }
+        }
+        self.compute_final_gpu(st)?;
+        {
+            let vocab = hp.vocab_size;
+            let launch_cfg = CudarcLaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (1024, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.device
+                    .stream
+                    .launch_builder(&st.kernels.argmax_f32)
+                    .arg(&st.logits_gpu)
+                    .arg(&mut st.argmax_result)
+                    .arg(&vocab)
+                    .launch(launch_cfg)
+            }
+            .map_err(|e| RuntimeError::Compute(format!("argmax launch: {e}")))?;
+        }
+        // Sync is still required to make the argmax index host-visible, but we
+        // copy back only the single u32 the kernel wrote -- NOT the full vocab.
+        self.device.synchronize()?;
+        // Keep the optional per-step CPU sleep for parity with the logits path
+        // (default OFF -> no-op).
+        maybe_apply_cuda_decode_delay();
+        let token_host = self.device.dtoh_copy(&st.argmax_result)?;
+        let token = token_host.first().copied().unwrap_or(0);
+        kv.advance_seq_len()?;
+        st.decode_token_count += 1;
+        Ok(token)
     }
 }
 
@@ -13787,10 +13961,17 @@ unsafe fn launch_matvec_preq8_1_split(
             }
         }
     }
-    // Q4 split path.
+    // Q4 split path. When SOA_LOCKED is active, dispatch the codegen-locked
+    // kernel (same SoA sibling buffer, same grid/block/args) instead of the
+    // unlocked split kernel.
     if kernels.use_q4_split_dispatch {
         if let Some(split_buf) = q4_split_sibling {
-            if let Some(mv_fn) = kernels.matvec_q4_split_q8_1.as_ref() {
+            let mv_fn_opt = if kernels.use_soa_locked {
+                kernels.matvec_q4_split_q8_1_locked.as_ref()
+            } else {
+                kernels.matvec_q4_split_q8_1.as_ref()
+            };
+            if let Some(mv_fn) = mv_fn_opt {
                 let out_dim_u32 = out_dim as u32;
                 let in_dim_u32 = in_dim as u32;
                 let mv_grid = dp4a_q4_grid(out_dim_u32);
@@ -13901,7 +14082,12 @@ unsafe fn launch_matvec_preq8_1_residual_split(
     }
     if kernels.use_q4_split_dispatch {
         if let Some(split_buf) = q4_split_sibling {
-            if let Some(mv_fn) = kernels.matvec_q4_split_q8_1_residual.as_ref() {
+            let mv_fn_opt = if kernels.use_soa_locked {
+                kernels.matvec_q4_split_q8_1_locked_residual.as_ref()
+            } else {
+                kernels.matvec_q4_split_q8_1_residual.as_ref()
+            };
+            if let Some(mv_fn) = mv_fn_opt {
                 let out_dim_u32 = out_dim as u32;
                 let in_dim_u32 = in_dim as u32;
                 let mv_grid = dp4a_q4_grid(out_dim_u32);
@@ -17380,8 +17566,19 @@ impl ComputeBackend for CudaBackend {
         if use_q8_split {
             eprintln!("[CUDA] LUMEN_CUDA_Q8_SPLIT: Q8_0 weights will be cloned to split layout for decode");
         }
-        let use_q4_split = env_truthy("LUMEN_CUDA_Q4_SPLIT");
-        if use_q4_split {
+        // LUMEN_CUDA_SOA_LOCKED selects the codegen-LOCKED Q4 split kernel.
+        // It reuses the Q4 split (SoA) repack + sibling buffers, so it implies
+        // `use_q4_split` (the SoA buffers must exist for the locked kernel to
+        // read). Default resolved by `soa_locked_default` (ON for quantised
+        // dense, OFF for MoE/BF16); `LUMEN_CUDA_SOA_LOCKED=0` forces OFF.
+        let use_soa_locked = env_truthy_or_default(
+            "LUMEN_CUDA_SOA_LOCKED",
+            crate::runtime_defaults::soa_locked_default,
+        );
+        let use_q4_split = env_truthy("LUMEN_CUDA_Q4_SPLIT") || use_soa_locked;
+        if use_soa_locked {
+            eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED=1: Q4_0 weights cloned to split layout; decode uses the codegen-locked split kernel");
+        } else if use_q4_split {
             eprintln!("[CUDA] LUMEN_CUDA_Q4_SPLIT=1: Q4_0 weights will be cloned to split layout for decode");
         }
         let use_gdn_split = env_truthy("LUMEN_CUDA_GDN_SPLIT");
@@ -17451,6 +17648,18 @@ impl ComputeBackend for CudaBackend {
         kernels.use_q8_scale_hw = use_q8_scale_hw;
         kernels.use_q8_split_dispatch = use_q8_split && kernels.matvec_q8_split_q8_1.is_some();
         kernels.use_q4_split_dispatch = use_q4_split && kernels.matvec_q4_split_q8_1.is_some();
+        // Locked Q4 split kernel selection. Effective only when the Q4 split
+        // dispatch is active AND both locked kernels loaded. When the locked
+        // kernels failed to compile, fall back to the unlocked split kernel.
+        kernels.use_soa_locked = use_soa_locked
+            && kernels.use_q4_split_dispatch
+            && kernels.matvec_q4_split_q8_1_locked.is_some()
+            && kernels.matvec_q4_split_q8_1_locked_residual.is_some();
+        if kernels.use_soa_locked {
+            eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED=1: Q4 split dispatch uses the codegen-locked kernel (layout-independent bitwise-identical F32)");
+        } else if use_soa_locked {
+            eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED=1 set but prerequisites missing (need Q4 split dispatch active + locked kernels loaded); using unlocked split / base path");
+        }
 
         // 4-threads-per-block mmvq kernel selection.
         // Effective only when LUMEN_CUDA_Q8_SPLIT=1 is also set, since the
@@ -18811,7 +19020,14 @@ impl ComputeBackend for CudaBackend {
             gpu_resident: is_preloaded,
             gdn: true,
             moe: has_moe,
-            gpu_argmax: false,
+            // GPU-side greedy argmax fast path. Gated behind LUMEN_CUDA_GPU_SAMPLE
+            // (default ON). When enabled and weights are preloaded, the engine's
+            // `use_gpu_greedy_predicate` routes greedy (temperature<=0, no
+            // penalties) through `decode_token_greedy`: on-GPU argmax + a 4-byte
+            // token readback, eliminating the per-token full-vocab logits D2H
+            // copy. `LUMEN_CUDA_GPU_SAMPLE=0` reverts to the full-logits-readback
+            // `decode_token` path (byte-identical output, just slower readback).
+            gpu_argmax: is_preloaded && cuda_gpu_sample_enabled(),
         }
     }
 
@@ -21018,6 +21234,43 @@ impl ComputeBackend for CudaBackend {
         }
 
         Ok(())
+    }
+
+    /// GPU-side greedy decode returning the token id directly (4-byte readback).
+    ///
+    /// Active only when the engine selects the greedy fast path, which requires
+    /// `caps().gpu_argmax == true` -- i.e. weights preloaded AND
+    /// `LUMEN_CUDA_GPU_SAMPLE=1`. Runs the same non-graph compute pipeline as the
+    /// first-token / GDN `decode_token` path and reads back only the on-GPU
+    /// argmax index, eliminating the per-token full-vocab logits D2H copy and the
+    /// host-side argmax. Advances `kv.seq_len()` internally (the caller must NOT
+    /// call `advance_seq_len`). Falls back with an explicit error if weights are
+    /// not GPU-resident, matching the cap's `is_preloaded` gate.
+    fn decode_token_greedy(
+        &self,
+        token_id: u32,
+        _weights: &dyn WeightProvider,
+        kv: &mut crate::kv::KvCache,
+    ) -> Result<u32, RuntimeError> {
+        let hp = self.hp()?;
+        let num_layers = hp.num_layers as usize;
+        let seq_pos = kv.seq_len();
+
+        let mut state_guard = self.state.lock().unwrap();
+        let st = state_guard
+            .as_mut()
+            .ok_or_else(|| RuntimeError::Compute("CUDA backend not initialized".into()))?;
+
+        // Greedy GPU argmax requires GPU-resident weights (same contract as the
+        // gpu_argmax cap, which is gated on layer_weights_cache being populated).
+        if st.layer_weights_cache.len() < num_layers {
+            return Err(RuntimeError::Compute(
+                "decode_token_greedy requires GPU-resident weights (call preload_weights first)"
+                    .into(),
+            ));
+        }
+
+        self.decode_token_greedy_normal(token_id, seq_pos, num_layers, hp, st, kv)
     }
 
     fn decode_token(
