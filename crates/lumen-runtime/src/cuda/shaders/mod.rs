@@ -503,6 +503,20 @@ pub const MATVEC_Q8_ALIGNED_NR8_KERNEL_SOURCE: &str = include_str!("matvec_q8_al
 /// Requires SM 6.1+ (dp4a).
 pub const MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q4_split_q8_1.cu");
 
+/// Codegen-LOCKED variant of `MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE`. Same SoA
+/// split layout and integer dp4a dot, but every floating-point op in the
+/// per-block epilogue and the cross-warp reduction is pinned with inline-PTX
+/// `.rn` (round-to-nearest, no contraction). This makes the F32 output bitwise
+/// identical regardless of weight load order (AoS vs SoA), so the SoA layout's
+/// decode-bandwidth win can pass the byte-identical-greedy correctness gate.
+/// The `.rn` ops are immune to `--use_fast_math`, so this loads through the
+/// same fast-math NVRTC pipeline as the unlocked kernel.
+///
+/// Kernels: `matvec_q4_split_q8_1_locked`, `matvec_q4_split_q8_1_locked_residual`.
+/// Requires SM 6.1+ (dp4a).
+pub const MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE: &str =
+    include_str!("matvec_q4_split_q8_1_locked.cu");
+
 /// Q8_0 split matvec dedicated to the final `output_proj` shape.
 ///
 /// Same split layout as `MATVEC_Q8_SPLIT_Q8_1_KERNEL_SOURCE` but tuned for the
