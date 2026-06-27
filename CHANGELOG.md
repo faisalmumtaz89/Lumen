@@ -7,6 +7,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-06-27
+
+### Added
+
+- `lumen-server` accepts the model as a positional `model:quant` argument (e.g. `lumen-server qwen3.5-9b:q4_0`).
+
+### Changed
+
+- CUDA Q4_0 single-stream decode is ~45% faster — Qwen3.5-9B Q4_0 reaches ~148 tok/s on A100 (**0.97× llama.cpp**, up from 0.64×). The Q4_0 split matvec uses a codegen-locked structure-of-arrays layout (word-load nibble streaming + load-hoist) that stays byte-identical to the reference path, and greedy decode computes the argmax on the GPU. Both are default-on; validated across all supported models × quants on greedy and sampling.
+- The one-command installer UX was overhauled for smoother cross-platform setup.
+
 ## [0.2.0] — 2026-06-22
 
 ### Changed
@@ -76,6 +87,7 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[Unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/faisalmumtaz89/Lumen/releases/tag/v0.1.0

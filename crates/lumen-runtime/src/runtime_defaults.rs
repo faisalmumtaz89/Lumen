@@ -1253,6 +1253,29 @@ pub fn q8_split_default() -> bool {
     }
 }
 
+/// Per-process default for `LUMEN_CUDA_SOA_LOCKED` when the env is unset.
+/// ON for quantised dense (the codegen-locked Q4_0 split matvec: word-load
+/// nibble stream + load-hoist + `.rn`-pinned epilogue, bit-deterministic and
+/// faster than the unlocked split kernel). The effect is gated downstream by
+/// Q4 split-dispatch + locked-kernel presence (`matvec_q4_split_q8_1_locked`),
+/// so on a Q8/BF16 model the locked kernel is absent and this is a no-op.
+///
+/// **MoE: explicit OFF.** `SOA_LOCKED` implies the Q4 split clone pass
+/// (`repack_all_layers_q4_clone_to_split`), which populates the dense
+/// `wq/wk/wv/wo/w_gate/w_up/w_down` siblings only. On an MoE LBC the dense MLP
+/// is replaced by per-expert weights, so arming the clone there would partially
+/// populate siblings exactly as the Q8 SPLIT pass did before its MoE gate
+/// (PAD-token spam). Gating OFF for MoE mirrors `q8_split_default` and keeps the
+/// Q4-dense decode win without touching the MoE path.
+pub fn soa_locked_default() -> bool {
+    match MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) {
+        // Q4 dense benefits (Q8/BF16/F32 lack the locked kernel → no-op).
+        // MoE: explicit OFF (clone-pass hazard, mirrors q8_split_default).
+        HINT_QUANTISED if !model_is_moe() => canonical_default_on(),
+        _ => false,
+    }
+}
+
 /// Per-process default for `LUMEN_CUDA_OUTPUT_PROJ_SPLIT` when unset. ON
 /// for Q8 dense (output projection in particular). Same gating logic as
 /// `q8_split_default`.
@@ -1339,6 +1362,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_GDN_PROJ_HGEMM",
     "LUMEN_CUDA_GDN_SPLIT",
     "LUMEN_CUDA_GDN_SUBSTAGE_TIMING",
+    "LUMEN_CUDA_GPU_SAMPLE",
     "LUMEN_CUDA_L2NORM_RSQRTF",
     "LUMEN_CUDA_LEGACY_DEFAULTS",
     "LUMEN_CUDA_LEVER_TRACE",
@@ -1397,6 +1421,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_SKIP_BF16_PROBE",
     "LUMEN_CUDA_SKIP_SHARED_EXPERT",
     "LUMEN_CUDA_SKIP_SHARED_GATE",
+    "LUMEN_CUDA_SOA_LOCKED",
     "LUMEN_CUDA_TOPK_MOE_FUSED",
     "LUMEN_CUDA_VERBOSE",
     "LUMEN_DEBUG_DUMP_SSM_BETA_W",
@@ -2151,6 +2176,34 @@ mod tests {
         assert!(moe_router_parallel_default());
         assert!(moe_decode_graph_default());
         assert!(gdn_register_resident_default());
+    }
+
+    #[test]
+    fn quantised_dense_enables_soa_locked_default() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset_for_tests();
+        // Q4 dense (lm_head often Q8_0 → HINT_QUANTISED) defaults SOA_LOCKED ON.
+        set_model_dense_quant(QuantScheme::Q8_0);
+        assert!(
+            soa_locked_default(),
+            "quantised dense should default SOA_LOCKED=ON"
+        );
+    }
+
+    #[test]
+    fn moe_disables_soa_locked_default() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset_for_tests();
+        // regression guard: SOA_LOCKED MUST default OFF on MoE even though the
+        // dense-quant hint is QUANTISED — the Q4 split clone pass populates only
+        // dense siblings and would PAD-spam an MoE decode (same class as the
+        // Q8_SPLIT MoE regression).
+        set_model_dense_quant(QuantScheme::Q8_0);
+        set_model_is_moe(true);
+        assert!(
+            !soa_locked_default(),
+            "MoE should NOT default SOA_LOCKED=ON (clone-pass / PAD-spam regression)"
+        );
     }
 
     #[test]

@@ -677,6 +677,29 @@ pub(crate) fn mmv_q_output_proj_enabled() -> bool {
     })
 }
 
+/// lm_head epilogue fusion: fuse the final RMSNorm + rawsum Q8_1
+/// quantize into ONE launch for the Q4 lm_head "Path -1"
+/// (quantize_q8_1_rawsum + mul_mat_vec_q_q4_0). When ON, `compute_final_gpu`
+/// dispatches `rmsnorm_to_q8_1_rawsum` (x_gpu -> q8_1_buf) instead of the
+/// standalone `rmsnorm` + `quantize_q8_1_rawsum`, dropping 1 dispatch + the
+/// F32 `normed` HBM round-trip. BIT-IDENTICAL by construction (same reduction
+/// tree + same rawsum quantize math).
+///
+/// **default OFF** (byte-identity preserved at default config). Opt in with
+/// `LUMEN_CUDA_LMHEAD_FUSED=1`. No-op unless the Q4 Path -1 is active
+/// (output_proj_q4[_aligned] present, mmv_q_output_proj ON, rawsum +
+/// mul_mat_vec_q_q4_0 kernels loaded).
+pub(crate) fn lmhead_fused_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(
+        || match std::env::var("LUMEN_CUDA_LMHEAD_FUSED").ok().as_deref() {
+            Some(v) => matches!(v, "1" | "true" | "yes" | "on"),
+            None => false,
+        },
+    )
+}
+
 /// Q8_1-activation x {Q8_0,Q4_0}-weight matvec with dp4a INT8
 /// dot-product. When enabled, routes Q8/Q4 dense and shared-expert matvecs
 /// through the dispatch: quantize_q8_1 + mul_mat_vec_q_q8_0 /
