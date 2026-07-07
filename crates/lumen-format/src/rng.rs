@@ -175,7 +175,7 @@ mod tests {
         let mut rng = WeightRng::new(42);
         for _ in 0..1000 {
             let v = rng.next_f32();
-            assert!(v >= -0.1 && v < 0.1, "got {v}");
+            assert!((-0.1..0.1).contains(&v), "got {v}");
         }
     }
 }

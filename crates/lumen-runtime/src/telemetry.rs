@@ -367,21 +367,25 @@ mod tests {
         // The soak harness sampler parses this JSON shape into JSONL, so the
         // key set is load-bearing.  Pin every key here so a future field
         // rename forces a test update + soak-harness update in lock-step.
-        let mut b = ServerMemoryBreakdown::default();
-        b.kv_used_bytes = 1_000;
-        b.kv_allocated_bytes = 2_000;
-        b.kv_seq_len = 3;
-        b.kv_max_seq_len = 4;
-        b.session_tokens_len = 5;
-        b.session_pending_logits_bytes = 6;
-        b.session_timings_bytes = 7;
-        b.metal_current_allocated_bytes = 8;
-        b.tokio_active_tasks = 9;
-        b.engine_inbox_capacity = 10;
-        b.engine_inbox_len = 11;
-        b.disk_kv_used_bytes = 12;
-        b.update_count = 13;
-        b.last_update_unix = 14;
+        // Exhaustive struct literal (no `..Default::default()`): adding a
+        // field to ServerMemoryBreakdown fails compilation here, forcing the
+        // lock-step update this test exists to enforce.
+        let b = ServerMemoryBreakdown {
+            kv_used_bytes: 1_000,
+            kv_allocated_bytes: 2_000,
+            kv_seq_len: 3,
+            kv_max_seq_len: 4,
+            session_tokens_len: 5,
+            session_pending_logits_bytes: 6,
+            session_timings_bytes: 7,
+            metal_current_allocated_bytes: 8,
+            tokio_active_tasks: 9,
+            engine_inbox_capacity: 10,
+            engine_inbox_len: 11,
+            disk_kv_used_bytes: 12,
+            update_count: 13,
+            last_update_unix: 14,
+        };
         let s = b.to_jsonl();
         for k in [
             "kv_used_bytes",

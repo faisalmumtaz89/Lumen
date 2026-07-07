@@ -339,7 +339,7 @@ mod tests {
         let data = vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
         let sd = std_dev(&data);
         assert!(
-            (sd - 2.1380899352993952).abs() < 1e-10,
+            (sd - 2.138_089_935_299_395).abs() < 1e-10,
             "expected ~2.138, got {sd}"
         );
     }
