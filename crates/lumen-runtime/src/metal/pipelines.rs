@@ -86,6 +86,10 @@ impl MetalF32Backend {
             matmul_bf16_deferred_nr2: make_pipeline!("matmul_bf16_deferred_nr2"),
             matmul_bf16_deferred_residual_nr2: make_pipeline!("matmul_bf16_deferred_residual_nr2"),
             matmul_bf16_deferred_bias_nr2: make_pipeline!("matmul_bf16_deferred_bias_nr2"),
+            // BF16 QMV vectorized-load decode matvecs (ushort4 coalesced loads).
+            matmul_bf16_qmv_nr2: make_pipeline!("matmul_bf16_qmv_nr2"),
+            matmul_bf16_qmv_residual_nr2: make_pipeline!("matmul_bf16_qmv_residual_nr2"),
+            matmul_bf16_qmv_bias_nr2: make_pipeline!("matmul_bf16_qmv_bias_nr2"),
             dequant_matmul_q8_0: make_pipeline!("dequant_matmul_q8_0"),
             rmsnorm: make_pipeline!("rmsnorm"),
             rmsnorm_bytes: make_pipeline!("rmsnorm_bytes"),
@@ -425,6 +429,7 @@ impl MetalF32Backend {
             rmsnorm_matmul_bf16_deferred_residual_nr2: make_pipeline!(
                 "rmsnorm_matmul_bf16_deferred_residual_nr2"
             ),
+            rmsnorm_matmul_bf16_qmv_nr2: make_pipeline!("rmsnorm_matmul_bf16_qmv_nr2"),
             rmsnorm_ffn_fused_gate_up_swiglu_q8_0_deferred: make_pipeline!(
                 "rmsnorm_ffn_fused_gate_up_swiglu_q8_0_deferred"
             ),

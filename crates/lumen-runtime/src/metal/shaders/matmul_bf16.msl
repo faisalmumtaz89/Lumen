@@ -394,4 +394,301 @@ kernel void rmsnorm_matmul_bf16_deferred_residual_nr2(
     }
 }
 
+// ============================================================================
+// BF16 QMV (vectorized-load) decode matvec kernels.
+//
+// Byte-for-byte the same NR0=2 / 4-SG / 128-thread deferred-reduction dispatch
+// as the matmul_bf16_deferred_* family above (identical buffer layout, identical
+// threadgroup/grid geometry) so the dispatch site only swaps the pipeline. The
+// only change is the inner dot loop: weights are read as `ushort4` (8-byte
+// coalesced loads) and x as `float4`, cutting the per-weight scalar 2-byte load
+// count 4x. Accumulation stays in float. Differs from the scalar kernel only by
+// FP reassociation (dot() groups 4 products), a benign near-tie.
+//
+// A scalar remainder loop handles in_dim not divisible by 4 (all Qwen3.5 decode
+// shapes are multiples of 4, so the remainder is a no-op in practice).
+// ============================================================================
+
+// bf16_dot4: dot(ushort4-as-bf16, float4) with float accumulation.
+inline float bf16_dot4(ushort4 w, float4 xv) {
+    float4 wf = float4(as_type<float>((uint(w.x)) << 16),
+                       as_type<float>((uint(w.y)) << 16),
+                       as_type<float>((uint(w.z)) << 16),
+                       as_type<float>((uint(w.w)) << 16));
+    return dot(wf, xv);
+}
+
+// matmul_bf16_qmv_nr2: vectorized-load BF16 matvec. Layout == matmul_bf16_deferred_nr2.
+kernel void matmul_bf16_qmv_nr2(
+    device const ushort* weights [[buffer(0)]],
+    device const float*  x       [[buffer(1)]],
+    device float*        out     [[buffer(2)]],
+    constant uint&       in_dim  [[buffer(3)]],
+    constant uint&       out_dim [[buffer(4)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NW = 32;
+
+    const uint r0 = tgpig * NR0;
+    const uint tid = sgitg * NW + tiisg;
+    const uint total_threads = NSG * NW;  // 128
+
+    const uint in4 = in_dim >> 2;
+    device const ushort4* w0 = (device const ushort4*)(weights + (r0 + 0) * in_dim);
+    device const ushort4* w1 = (device const ushort4*)(weights + (r0 + 1) * in_dim);
+    device const float4*  x4 = (device const float4*)x;
+    const bool has1 = (r0 + 1 < out_dim);
+
+    float sumf[NR0] = { 0.f, 0.f };
+
+    for (uint j = tid; j < in4; j += total_threads) {
+        float4 xv = x4[j];
+        sumf[0] += bf16_dot4(w0[j], xv);
+        if (has1) sumf[1] += bf16_dot4(w1[j], xv);
+    }
+    for (uint j = (in4 << 2) + tid; j < in_dim; j += total_threads) {
+        float xv = x[j];
+        sumf[0] += bf16_load(weights, (r0 + 0) * in_dim + j) * xv;
+        if (has1) sumf[1] += bf16_load(weights, (r0 + 1) * in_dim + j) * xv;
+    }
+
+    threadgroup float shmem[NR0 * NW];
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) shmem[row * NW + tiisg] = 0.0f;
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) shmem[row * NW + sgitg] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) out[r0 + row] = tot;
+    }
+}
+
+// matmul_bf16_qmv_residual_nr2: layout == matmul_bf16_deferred_residual_nr2.
+kernel void matmul_bf16_qmv_residual_nr2(
+    device const ushort* weights   [[buffer(0)]],
+    device const float*  x         [[buffer(1)]],
+    device float*        out       [[buffer(2)]],
+    constant uint&       in_dim    [[buffer(3)]],
+    device const float*  residual  [[buffer(4)]],
+    constant uint&       out_dim   [[buffer(5)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NW = 32;
+
+    const uint r0 = tgpig * NR0;
+    const uint tid = sgitg * NW + tiisg;
+    const uint total_threads = NSG * NW;
+
+    const uint in4 = in_dim >> 2;
+    device const ushort4* w0 = (device const ushort4*)(weights + (r0 + 0) * in_dim);
+    device const ushort4* w1 = (device const ushort4*)(weights + (r0 + 1) * in_dim);
+    device const float4*  x4 = (device const float4*)x;
+    const bool has1 = (r0 + 1 < out_dim);
+
+    float sumf[NR0] = { 0.f, 0.f };
+
+    for (uint j = tid; j < in4; j += total_threads) {
+        float4 xv = x4[j];
+        sumf[0] += bf16_dot4(w0[j], xv);
+        if (has1) sumf[1] += bf16_dot4(w1[j], xv);
+    }
+    for (uint j = (in4 << 2) + tid; j < in_dim; j += total_threads) {
+        float xv = x[j];
+        sumf[0] += bf16_load(weights, (r0 + 0) * in_dim + j) * xv;
+        if (has1) sumf[1] += bf16_load(weights, (r0 + 1) * in_dim + j) * xv;
+    }
+
+    threadgroup float shmem[NR0 * NW];
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) shmem[row * NW + tiisg] = 0.0f;
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) shmem[row * NW + sgitg] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) out[r0 + row] = tot + residual[r0 + row];
+    }
+}
+
+// matmul_bf16_qmv_bias_nr2: layout == matmul_bf16_deferred_bias_nr2.
+kernel void matmul_bf16_qmv_bias_nr2(
+    device const ushort* weights [[buffer(0)]],
+    device const float*  x       [[buffer(1)]],
+    device float*        out     [[buffer(2)]],
+    constant uint&       in_dim  [[buffer(3)]],
+    constant uint&       out_dim [[buffer(4)]],
+    device const float*  bias_q  [[buffer(5)]],
+    device const float*  bias_k  [[buffer(6)]],
+    device const float*  bias_v  [[buffer(7)]],
+    constant uint&       q_dim   [[buffer(8)]],
+    constant uint&       qk_dim  [[buffer(9)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NW = 32;
+
+    const uint r0 = tgpig * NR0;
+    const uint tid = sgitg * NW + tiisg;
+    const uint total_threads = NSG * NW;
+
+    const uint in4 = in_dim >> 2;
+    device const ushort4* w0 = (device const ushort4*)(weights + (r0 + 0) * in_dim);
+    device const ushort4* w1 = (device const ushort4*)(weights + (r0 + 1) * in_dim);
+    device const float4*  x4 = (device const float4*)x;
+    const bool has1 = (r0 + 1 < out_dim);
+
+    float sumf[NR0] = { 0.f, 0.f };
+
+    for (uint j = tid; j < in4; j += total_threads) {
+        float4 xv = x4[j];
+        sumf[0] += bf16_dot4(w0[j], xv);
+        if (has1) sumf[1] += bf16_dot4(w1[j], xv);
+    }
+    for (uint j = (in4 << 2) + tid; j < in_dim; j += total_threads) {
+        float xv = x[j];
+        sumf[0] += bf16_load(weights, (r0 + 0) * in_dim + j) * xv;
+        if (has1) sumf[1] += bf16_load(weights, (r0 + 1) * in_dim + j) * xv;
+    }
+
+    threadgroup float shmem[NR0 * NW];
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) shmem[row * NW + tiisg] = 0.0f;
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) shmem[row * NW + sgitg] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            uint r = r0 + row;
+            float b;
+            if (r < q_dim) b = bias_q[r];
+            else if (r < qk_dim) b = bias_k[r - q_dim];
+            else b = bias_v[r - qk_dim];
+            out[r] = tot + b;
+        }
+    }
+}
+
+// rmsnorm_matmul_bf16_qmv_nr2: vectorized-load fused RMSNorm + BF16 matvec.
+// Layout == rmsnorm_matmul_bf16_deferred_nr2. Reads x/norm_w as float4 and
+// weights as ushort4; float accumulation of both sum(x^2) and the dot.
+kernel void rmsnorm_matmul_bf16_qmv_nr2(
+    device const ushort* weights   [[buffer(0)]],
+    device const float*  x         [[buffer(1)]],
+    device float*        out       [[buffer(2)]],
+    constant uint&       in_dim    [[buffer(3)]],
+    constant uint&       out_dim   [[buffer(4)]],
+    device const uchar*  norm_w    [[buffer(5)]],
+    constant float&      eps       [[buffer(6)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR0 = 2;
+    const uint NSG = 4;
+    const uint NW = 32;
+
+    device const float* norm_weight = (device const float*)norm_w;
+
+    const uint r0 = tgpig * NR0;
+    const uint tid = sgitg * NW + tiisg;
+    const uint total_threads = NSG * NW;
+
+    const uint in4 = in_dim >> 2;
+    device const ushort4* w0 = (device const ushort4*)(weights + (r0 + 0) * in_dim);
+    device const ushort4* w1 = (device const ushort4*)(weights + (r0 + 1) * in_dim);
+    device const float4*  x4 = (device const float4*)x;
+    device const float4*  nw4 = (device const float4*)norm_weight;
+    const bool has1 = (r0 + 1 < out_dim);
+
+    float sumf[NR0] = { 0.f, 0.f };
+    float ss = 0.0f;
+
+    for (uint j = tid; j < in4; j += total_threads) {
+        float4 xv = x4[j];
+        ss += dot(xv, xv);
+        float4 normed = xv * nw4[j];
+        sumf[0] += bf16_dot4(w0[j], normed);
+        if (has1) sumf[1] += bf16_dot4(w1[j], normed);
+    }
+    for (uint j = (in4 << 2) + tid; j < in_dim; j += total_threads) {
+        float xi = x[j];
+        ss += xi * xi;
+        float normed_xj = xi * norm_weight[j];
+        sumf[0] += bf16_load(weights, (r0 + 0) * in_dim + j) * normed_xj;
+        if (has1) sumf[1] += bf16_load(weights, (r0 + 1) * in_dim + j) * normed_xj;
+    }
+
+    ss = simd_sum(ss);
+
+    threadgroup float shmem[NR0 * NW];
+
+    if (tiisg == 0) {
+        shmem[sgitg] = ss;
+    }
+
+    for (uint row = 0; row < NR0; ++row) {
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float rms_scale_shared;
+    if (sgitg == 0) {
+        float total_ss = (tiisg < NSG) ? shmem[tiisg] : 0.0f;
+        total_ss = simd_sum(total_ss);
+        if (tiisg == 0) {
+            rms_scale_shared = rsqrt(total_ss / float(in_dim) + eps);
+        }
+    }
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (sgitg == 0) shmem[row * NW + tiisg] = 0.0f;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0; row < NR0; ++row) {
+        if (tiisg == 0) shmem[row * NW + sgitg] = sumf[row];
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms_scale = rms_scale_shared;
+
+    for (uint row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        float tot = simd_sum(shmem[row * NW + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            out[r0 + row] = tot * rms_scale;
+        }
+    }
+}
+
 // embed_token_bf16 lives in embed.msl. Defined here in a comment for cross-ref.

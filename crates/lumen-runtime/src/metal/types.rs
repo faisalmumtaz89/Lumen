@@ -49,6 +49,12 @@ pub(crate) struct MetalPipelines {
     pub(crate) matmul_bf16_deferred_nr2: MetalPipelineState,
     pub(crate) matmul_bf16_deferred_residual_nr2: MetalPipelineState,
     pub(crate) matmul_bf16_deferred_bias_nr2: MetalPipelineState,
+    // BF16 QMV (vectorized ushort4-load) decode matvec kernels. Same dispatch
+    // geometry as the deferred family, but read weights as ushort4 (8-byte
+    // coalesced loads); these are the decode-path matvec kernels for BF16.
+    pub(crate) matmul_bf16_qmv_nr2: MetalPipelineState,
+    pub(crate) matmul_bf16_qmv_residual_nr2: MetalPipelineState,
+    pub(crate) matmul_bf16_qmv_bias_nr2: MetalPipelineState,
     pub(crate) dequant_matmul_q8_0: MetalPipelineState,
     pub(crate) rmsnorm: MetalPipelineState,
     pub(crate) rmsnorm_bytes: MetalPipelineState,
@@ -395,6 +401,8 @@ pub(crate) struct MetalPipelines {
     // F16 fused variant; weights read as bfloat instead of half.
     pub(crate) rmsnorm_matmul_bf16_deferred_nr2: MetalPipelineState,
     pub(crate) rmsnorm_matmul_bf16_deferred_residual_nr2: MetalPipelineState,
+    // Vectorized-load (ushort4) fused RMSNorm + BF16 matvec (decode path).
+    pub(crate) rmsnorm_matmul_bf16_qmv_nr2: MetalPipelineState,
     // Fused RMSNorm + FFN Gate+Up+SwiGLU Q8_0 deferred
     pub(crate) rmsnorm_ffn_fused_gate_up_swiglu_q8_0_deferred: MetalPipelineState,
     // Fused RMSNorm + FFN Gate+Up+SwiGLU Q8_0 8-row (8 SGs, zero barriers)
@@ -607,6 +615,35 @@ pub(crate) struct MetalPipelines {
     pub(crate) gdn_compute_gates_batched: Option<MetalPipelineState>,
     pub(crate) dequant_batched_matvec_q8_0: Option<MetalPipelineState>,
     pub(crate) dequant_batched_matvec_q8_0_dual: Option<MetalPipelineState>,
+}
+
+impl MetalPipelines {
+    /// BF16 decode matvec (plain / bias-less). Returns the vectorized ushort4-load
+    /// (QMV) kernel: reading weights 4-at-a-time coalesces the loads and better
+    /// saturates Apple GPU bandwidth than the scalar 2-byte-per-weight path, with
+    /// identical NR0=2 / 128-thread dispatch geometry.
+    #[inline]
+    pub(crate) fn bf16_matvec_nr2(&self) -> &MetalPipelineState {
+        &self.matmul_bf16_qmv_nr2
+    }
+
+    /// BF16 decode matvec + residual add.
+    #[inline]
+    pub(crate) fn bf16_matvec_residual_nr2(&self) -> &MetalPipelineState {
+        &self.matmul_bf16_qmv_residual_nr2
+    }
+
+    /// BF16 decode matvec + fused QKV bias.
+    #[inline]
+    pub(crate) fn bf16_matvec_bias_nr2(&self) -> &MetalPipelineState {
+        &self.matmul_bf16_qmv_bias_nr2
+    }
+
+    /// Fused RMSNorm + BF16 decode matvec.
+    #[inline]
+    pub(crate) fn bf16_rmsnorm_matvec_nr2(&self) -> &MetalPipelineState {
+        &self.rmsnorm_matmul_bf16_qmv_nr2
+    }
 }
 
 // ============================================================================
