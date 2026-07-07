@@ -460,6 +460,10 @@ impl MetalF32Backend {
                 "ffn_fused_gate_up_swiglu_f16_deferred"
             ),
             argmax: make_pipeline!("argmax"),
+            // Two-pass tiled argmax (greedy-decode token selection). Bit-identical
+            // token to `argmax`; fills the machine to escape the single-TG stall.
+            argmax_tiled_partial: make_pipeline!("argmax_tiled_partial"),
+            argmax_tiled_reduce: make_pipeline!("argmax_tiled_reduce"),
             // GPU temperature sampler (Option A). Optional: if the kernel fails
             // to compile on this device we fall back to the CPU sampler rather
             // than fail backend init (mirrors the MoE optional-pipeline style).

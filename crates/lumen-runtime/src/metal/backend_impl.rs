@@ -275,6 +275,9 @@ impl ComputeBackend for MetalF32Backend {
             argmax_result_buf: self.device.new_buffer(4).ok_or_else(|| {
                 RuntimeError::Compute("Failed to allocate argmax result buffer (4 bytes)".into())
             })?,
+            // Two-pass tiled-argmax partials scratch:
+            // [ARGMAX_MAX_TILES] f32 vals + [ARGMAX_MAX_TILES] u32 idxs = 2*MAX*4 B.
+            argmax_partials_buf: make_buf(2 * super::ARGMAX_MAX_TILES)?,
             // Pipelined greedy decode state (lazily set up on first pipelined
             // call; empty/unused in the default sequential path).
             pipe_token_ring: Vec::new(),

@@ -425,6 +425,14 @@ pub(crate) struct MetalPipelines {
     // GPU-side argmax for greedy decode (eliminates 128KB logits readback)
     pub(crate) argmax: MetalPipelineState,
 
+    // Two-pass tiled GPU argmax (the greedy-decode token-selection path). Fills
+    // the machine with N threadgroups instead of the single-TG `argmax` (which is
+    // bandwidth-starved at ~2.9 GB/s over the vocab logits). Bit-identical token
+    // selection to `argmax` for every input (see ffn_elementwise.msl). Pass-1
+    // writes per-tile (max_val, arg_idx) partials; pass-2 reduces them to the token.
+    pub(crate) argmax_tiled_partial: MetalPipelineState,
+    pub(crate) argmax_tiled_reduce: MetalPipelineState,
+
     // GPU-side temperature sampler (Option A: lean-sampled decode path,
     // LUMEN_METAL_GPU_SAMPLER=1, default OFF). Parity-matched to the CPU
     // `sample_logits`; finalizes a sampled token on-GPU so temp>0 decode can
@@ -800,6 +808,12 @@ pub(crate) struct MetalScratch {
     // GPU-side argmax result: 1 x u32 (4 bytes). Eliminates 128KB logits readback
     // for greedy sampling (temperature <= 0).
     pub(crate) argmax_result_buf: MetalBuffer,
+
+    // Two-pass tiled-argmax pass-1 partials scratch.
+    // Layout: [ARGMAX_MAX_TILES] f32 max-vals at byte 0, then [ARGMAX_MAX_TILES]
+    // u32 arg-idxs at byte ARGMAX_MAX_TILES*4. Sized once for the max tile count;
+    // pass-1 writes the first `num_tiles` entries, pass-2 reduces them.
+    pub(crate) argmax_partials_buf: MetalBuffer,
 
     // ---- Lean GPU-pipelined greedy decode (the default greedy path) ----
     // A small ring of CPU-visible u32 token buffers used to chain tokens on the

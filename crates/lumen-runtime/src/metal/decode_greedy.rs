@@ -3002,14 +3002,42 @@ impl MetalF32Backend {
             enc.set_buffer(&s.gpu_sampler_rng_ring[sw.rng_write_slot], 0, 10);
             enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         } else {
-            enc.set_pipeline_state(&pipelines.argmax);
+            // Two-pass tiled argmax for greedy decode. Pass-1: N threadgroups each
+            // reduce a contiguous logits slice to a (max_val, arg_idx) partial (fills
+            // the machine — a single-threadgroup argmax is bandwidth-starved at
+            // ~2.9 GB/s over the vocab logits). Pass-2: one 256-thread TG reduces the
+            // <=256 partials to the token id. Bit-identical selection to the
+            // single-threadgroup argmax for every input (composite (value, i%256, i)
+            // tie-break; see ffn_elementwise.msl). Writes the SAME output buffer + u32
+            // format, so the device-side next-token embed is unchanged.
+            let num_tiles = super::TILED_ARGMAX_TILES as u64;
+            let tile_size = ((vocab_size as u64) + num_tiles - 1) / num_tiles;
+            let actual_tiles = ((vocab_size as u64) + tile_size - 1) / tile_size;
+            let idx_off = (super::ARGMAX_MAX_TILES * 4) as u64;
+            // Pass-1: per-tile partials into argmax_partials_buf (vals@0, idxs@idx_off).
+            enc.set_pipeline_state(&pipelines.argmax_tiled_partial);
             enc.set_buffer(&s.logits_buf, 0, 0);
-            if let Some(ref w) = pipe {
-                enc.set_buffer(&s.pipe_token_ring[w.argmax_write_slot], 0, 1);
-            } else {
-                enc.set_buffer(&s.argmax_result_buf, 0, 1);
+            enc.set_buffer(&s.argmax_partials_buf, 0, 1);
+            enc.set_buffer(&s.argmax_partials_buf, idx_off, 2);
+            enc.set_bytes(&(vocab_size as u32).to_le_bytes(), 3);
+            enc.set_bytes(&(tile_size as u32).to_le_bytes(), 4);
+            enc.dispatch_threadgroups(MTLSize::new(actual_tiles, 1, 1), MTLSize::new(256, 1, 1));
+            // Barrier: pass-1 writes the partials, pass-2 reads them. The serial
+            // encoder (has_gdn/all_dense) already orders dispatches; the concurrent
+            // encoder needs the explicit barrier (mirrors the projection->argmax edge).
+            if needs_barriers {
+                enc.memory_barrier_with_scope(1);
             }
-            enc.set_bytes(&(vocab_size as u32).to_le_bytes(), 2);
+            // Pass-2: reduce partials to the token id in the argmax output buffer.
+            enc.set_pipeline_state(&pipelines.argmax_tiled_reduce);
+            enc.set_buffer(&s.argmax_partials_buf, 0, 0);
+            enc.set_buffer(&s.argmax_partials_buf, idx_off, 1);
+            if let Some(ref w) = pipe {
+                enc.set_buffer(&s.pipe_token_ring[w.argmax_write_slot], 0, 2);
+            } else {
+                enc.set_buffer(&s.argmax_result_buf, 0, 2);
+            }
+            enc.set_bytes(&(actual_tiles as u32).to_le_bytes(), 3);
             enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         }
 
