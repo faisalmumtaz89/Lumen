@@ -2079,6 +2079,69 @@ impl MetalF32Backend {
             s.qmv_ffn_gate_up_il_scales = il_sc_vecs;
         }
 
+        // LM-head-structure (LS) dense FFN gate/up: build ONE ROW-INTERLEAVED
+        // packed nibble buffer + ONE row-interleaved packed f16-scale buffer per
+        // layer (physical row 2d = whole gate row d, 2d+1 = whole up row d) for the
+        // single-stream kernel `qmv_q4_0_gate_up_swiglu_ls_h2math` (2*inter_dim/8
+        // TGs). Same correctness gate as the f16sc/IL builds above; requires
+        // in_dim(hidden) % 512 == 0 and inter_dim % 4 == 0. Only when the LS
+        // pipeline compiled; any miss -> None pair so the dispatch falls back to
+        // the h2math/default path. Byte-identical.
+        if self
+            .pipelines
+            .as_ref()
+            .map(|p| p.qmv_q4_0_gate_up_swiglu_ls_h2math.is_some())
+            .unwrap_or(false)
+        {
+            let hidden_dim_u = s.hidden_dim;
+            let inter_dim_u = s.inter_dim;
+            let q4_row_bytes = (hidden_dim_u / 32) * 18;
+            let expected_len = inter_dim_u * q4_row_bytes;
+            let mut ls_qw_vecs: Vec<Option<MetalBuffer>> = Vec::with_capacity(num_layers);
+            let mut ls_sc_vecs: Vec<Option<MetalBuffer>> = Vec::with_capacity(num_layers);
+            for layer in 0..num_layers {
+                let built = if hidden_dim_u % 512 == 0 && inter_dim_u % 4 == 0 && q4_row_bytes > 0 {
+                    let lv = weights.get_layer_raw(layer).map_err(|e| {
+                        RuntimeError::Compute(format!("qmv-gateup-ls: layer {}: {}", layer, e))
+                    })?;
+                    let st = &lv.subtensors;
+                    if st.w_gate.quant == QuantScheme::Q4_0
+                        && st.w_up.quant == QuantScheme::Q4_0
+                        && st.w_gate.length as usize == expected_len
+                        && st.w_up.length as usize == expected_len
+                    {
+                        match (lv.subtensor_bytes(&st.w_gate), lv.subtensor_bytes(&st.w_up)) {
+                            (Ok(gsrc), Ok(usrc)) => repack_q4::build_qmv_gate_up_ls_buffers(
+                                &self.device,
+                                gsrc,
+                                usrc,
+                                inter_dim_u,
+                                hidden_dim_u,
+                            )
+                            .ok(),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                match built {
+                    Some((qw, sc)) => {
+                        ls_qw_vecs.push(Some(qw));
+                        ls_sc_vecs.push(Some(sc));
+                    }
+                    None => {
+                        ls_qw_vecs.push(None);
+                        ls_sc_vecs.push(None);
+                    }
+                }
+            }
+            s.qmv_ffn_gate_up_ls_qw = ls_qw_vecs;
+            s.qmv_ffn_gate_up_ls_scales = ls_sc_vecs;
+        }
+
         // Q4_0 hot-weight repack pass.
         //
         // Same pattern as the Q8 block above. Allocates `MTLBuffer`s

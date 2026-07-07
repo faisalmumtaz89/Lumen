@@ -131,6 +131,11 @@ pub(crate) struct MetalPipelines {
     pub(crate) dequant_matmul_q4_0_deferred_bias_nr2: MetalPipelineState,
     // MLX-style decode GEMV (separated sequential-nibble + f32 scales layout).
     pub(crate) qmv_q4_0_residual: MetalPipelineState,
+    // OPTIONAL (non-fatal): glue-side elision Wo kernel. Folds sigmoid_mul_fused +
+    // qmv_q4_0_residual + residual_add_copy into one dispatch, byte-identically, on
+    // the Qwen3.5 full-attn Wo path. None => the fold does not engage and the three
+    // separate dispatches run.
+    pub(crate) qmv_q4_0_wo_glue: Option<MetalPipelineState>,
     // OPTIONAL (non-fatal): f16-scales variant of qmv_q4_0_residual (FFN-down). A
     // missing/uncompilable kernel yields None and the FFN-down dispatch falls back
     // to the f32-scale qmv_q4_0_residual. env LUMEN_METAL_Q4_QMV_DOWN_F16SC.
@@ -222,6 +227,12 @@ pub(crate) struct MetalPipelines {
     // four separate streams (gate/up nibbles + gate/up scales). None falls back to
     // the f16sc/8row/default path. env LUMEN_METAL_Q4_GATEUP_IL.
     pub(crate) qmv_q4_0_gate_up_swiglu_il: Option<MetalPipelineState>,
+    // OPTIONAL (non-fatal): LM-head-structure (LS) single-stream gate+up variant.
+    // Byte-identical math to the h2math dual kernel; reads a ROW-INTERLEAVED
+    // gate|up buffer single-stream at 2*inter_dim/8 TGs (lm_head structure)
+    // instead of the DUAL gate+up stream at inter_dim/8 TGs. None falls back to
+    // the h2math/default path.
+    pub(crate) qmv_q4_0_gate_up_swiglu_ls_h2math: Option<MetalPipelineState>,
     // WIDE-load (uint4/256-thread) variant of the dense FFN gate/up GEMV; reads
     // the same separated sequential-nibble layout (env LUMEN_METAL_Q4_GATEUP_WIDE).
     pub(crate) rmsnorm_ffn_gate_up_swiglu_q4_0_wide: MetalPipelineState,
@@ -544,6 +555,9 @@ pub(crate) struct MetalPipelines {
 
     // Fused deinterleave+norm+assemble for full-attention Q+gate layers
     pub(crate) deinterleave_norm_assemble: Option<MetalPipelineState>,
+    // Full-attention bookend elision: deinterleave+norm+rope+kv-write folded into
+    // one dispatch. None => the six-dispatch incumbent bookend runs.
+    pub(crate) deinterleave_norm_rope_kvwrite: Option<MetalPipelineState>,
     // Fused L2-normalize + state-update + output + RMSNorm (eliminates l2_normalize_qk dispatch)
     pub(crate) gdn_state_output_norm_l2: Option<MetalPipelineState>,
     // Simdgroup-parallel state update (4096 TGs of 32 threads, writes raw output)
@@ -1289,6 +1303,14 @@ pub(crate) struct MetalScratch {
     /// path for that layer. Byte-identical to the separated f16sc kernel.
     pub(crate) qmv_ffn_gate_up_il_qw: Vec<Option<MetalBuffer>>,
     pub(crate) qmv_ffn_gate_up_il_scales: Vec<Option<MetalBuffer>>,
+    /// LM-head-structure (LS) gate+up decode-qmv buffers: per layer, ONE
+    /// ROW-INTERLEAVED packed nibble buffer + ONE row-interleaved packed f16-scale
+    /// buffer (physical row 2d = whole gate row d, 2d+1 = whole up row d) consumed by
+    /// `qmv_q4_0_gate_up_swiglu_ls_h2math`. Built when the LS pipeline compiled; any
+    /// None => fall back to the h2math/default path for that layer. Byte-identical to
+    /// the h2math dual kernel.
+    pub(crate) qmv_ffn_gate_up_ls_qw: Vec<Option<MetalBuffer>>,
+    pub(crate) qmv_ffn_gate_up_ls_scales: Vec<Option<MetalBuffer>>,
     /// Persistent all-zero f32 buffer (length >= hidden_dim) used as the `residual`
     /// argument when `qmv_q4_0_residual` services the Q+gate-fusion Wo path, which is
     /// mathematically NON-residual (the residual is added downstream by `residual_add_copy`).

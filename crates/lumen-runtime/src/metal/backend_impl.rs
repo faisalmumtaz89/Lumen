@@ -519,6 +519,8 @@ impl ComputeBackend for MetalF32Backend {
             qmv_ffn_up_scales: Vec::new(),
             qmv_ffn_gate_up_il_qw: Vec::new(),
             qmv_ffn_gate_up_il_scales: Vec::new(),
+            qmv_ffn_gate_up_ls_qw: Vec::new(),
+            qmv_ffn_gate_up_ls_scales: Vec::new(),
             qmv_zero_residual_buf: None,
             // GLOBAL Q4 lm_head decode-qmv buffers. None until
             // `preload_weights_gpu_resident` builds them when
