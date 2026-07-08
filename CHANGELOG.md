@@ -7,6 +7,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-07-08
+
+### Performance
+- Metal decode fast-paths, now unconditional (no flags): two-pass tiled GPU argmax,
+  fused attention bookend (deinterleave + norm + RoPE + KV-write in one dispatch),
+  fused attention-output glue (gate + output projection + residual), row-interleaved
+  dense-FFN gate/up kernel, and a vectorized BF16 decode matvec.
+  Measured on M3 Ultra (Qwen3.5-9B): **+7% Q4_0 decode, +13% BF16 decode**,
+  +8% long-context decode via a corrected flash-decode threshold (K ≤ 512 now uses
+  the exact-MHA kernel, which is faster in that band).
+
+### Fixed
+- ThreadPool teardown lost-wakeup race that could hang process exit (and a latent
+  use-after-free path when a worker raced a dying pool); test suite now runs with
+  zero skips.
+- Flash-decode threshold mistune that routed K ∈ [257, 512] contexts to the slower
+  kernel.
+
 ## [0.3.0] — 2026-06-27
 
 ### Added
@@ -87,7 +105,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[Unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.3.0...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/faisalmumtaz89/Lumen/releases/tag/v0.1.0
