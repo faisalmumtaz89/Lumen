@@ -22,7 +22,7 @@ lumen-runtime.workspace = true
 lumen-convert.workspace = true
 lumen-bench.workspace = true
 regex = "1"
-fancy-regex = "0.14"
+fancy-regex = "0.18"
 unicode-normalization = "0.1"
 toml = "1.1"
 ureq = { version = "2", features = ["json"], optional = true }
