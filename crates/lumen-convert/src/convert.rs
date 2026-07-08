@@ -831,7 +831,7 @@ mod tests {
         builder.add_u32("qwen35.feed_forward_length", 16);
 
         // Global tensors -- minimal, just so the metadata reader doesn't trip.
-        builder.add_f32_tensor(EMBEDDING_NAME, &[8, 4], &vec![0.0f32; 32]);
+        builder.add_f32_tensor(EMBEDDING_NAME, &[8, 4], &[0.0f32; 32]);
 
         // 32 real layers: each carries `blk.N.attn_q.weight`.
         for layer in 0..32 {
@@ -877,7 +877,7 @@ mod tests {
         builder.add_u32("qwen35.attention.head_count_kv", 2);
         builder.add_u32("qwen35.embedding_length", 8);
         builder.add_u32("qwen35.feed_forward_length", 16);
-        builder.add_f32_tensor(EMBEDDING_NAME, &[8, 4], &vec![0.0f32; 32]);
+        builder.add_f32_tensor(EMBEDDING_NAME, &[8, 4], &[0.0f32; 32]);
 
         // Real layers 0 and 1 each have attn_q.weight.
         for layer in 0..2 {
@@ -888,7 +888,7 @@ mod tests {
         // happens when a producer stopped emitting layers part-way through.
         // We emulate it with just a norm tensor so the index exists but
         // doesn't carry a required attention weight.
-        builder.add_f32_tensor("blk.2.attn_norm.weight", &[8], &vec![1.0f32; 8]);
+        builder.add_f32_tensor("blk.2.attn_norm.weight", &[8], &[1.0f32; 8]);
 
         let gguf_data = builder.build();
         let mut cur = std::io::Cursor::new(&gguf_data);
@@ -1521,7 +1521,7 @@ mod tests {
             scale_bytes[10],
             scale_bytes[11],
         ]);
-        let out0 = (a0 & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+        let out0 = (a0 & KMASK2) | ((tmp & KMASK1) << 4);
         let out1 = (a1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
         let out2 = ((a0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
         let out3 = ((a1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);

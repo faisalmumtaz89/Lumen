@@ -1208,7 +1208,7 @@ mod tests {
 
         write_test_string(&mut buf, "test.f32");
         buf.extend_from_slice(&6u32.to_le_bytes());
-        buf.extend_from_slice(&3.14f32.to_le_bytes());
+        buf.extend_from_slice(&std::f32::consts::PI.to_le_bytes());
 
         write_test_string(&mut buf, "test.bool");
         buf.extend_from_slice(&7u32.to_le_bytes());
@@ -1224,7 +1224,7 @@ mod tests {
 
         write_test_string(&mut buf, "test.f64");
         buf.extend_from_slice(&12u32.to_le_bytes());
-        buf.extend_from_slice(&2.718f64.to_le_bytes());
+        buf.extend_from_slice(&std::f64::consts::E.to_le_bytes());
 
         pad_to_alignment(&mut buf, 32);
 
@@ -1239,7 +1239,7 @@ mod tests {
             GgufValue::I32(v) => assert_eq!(*v, -100),
             other => panic!("expected I32, got {other:?}"),
         }
-        assert_eq!(file.get_f32("test.f32"), Some(3.14));
+        assert_eq!(file.get_f32("test.f32"), Some(std::f32::consts::PI));
         match file.get_metadata("test.bool").unwrap() {
             GgufValue::Bool(v) => assert!(*v),
             other => panic!("expected Bool, got {other:?}"),
@@ -1247,7 +1247,7 @@ mod tests {
         assert_eq!(file.get_string("test.string"), Some("hello"));
         assert_eq!(file.get_u64("test.u64"), Some(999));
         match file.get_metadata("test.f64").unwrap() {
-            GgufValue::F64(v) => assert!((v - 2.718).abs() < 1e-10),
+            GgufValue::F64(v) => assert!((v - std::f64::consts::E).abs() < 1e-10),
             other => panic!("expected F64, got {other:?}"),
         }
     }
@@ -1391,7 +1391,7 @@ mod tests {
         buf.extend_from_slice(&64u64.to_le_bytes());
 
         pad_to_alignment(&mut buf, 32);
-        buf.extend_from_slice(&vec![0u8; 128]);
+        buf.extend_from_slice(&[0u8; 128]);
 
         let file = GgufFile::parse(&mut buf.as_slice()).unwrap();
         assert_eq!(file.tensors.len(), 2);
@@ -1710,7 +1710,7 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("invalid GGUF magic"));
 
-        let io_err = GgufError::Io(std::io::Error::new(std::io::ErrorKind::Other, "test"));
+        let io_err = GgufError::Io(std::io::Error::other("test"));
         assert!(std::error::Error::source(&io_err).is_some());
         assert!(std::error::Error::source(&GgufError::TruncatedFile).is_none());
     }

@@ -1,3 +1,4 @@
+mod argmax_tiled;
 mod basic;
 mod gdn;
 mod microbench;

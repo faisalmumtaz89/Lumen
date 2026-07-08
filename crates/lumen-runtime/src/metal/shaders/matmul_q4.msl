@@ -1237,6 +1237,124 @@ kernel void qmv_q4_0_residual_f16sc(
 }
 
 // ============================================================================
+// qmv_q4_0_wo_glue: glue-side elision for the Qwen3.5 full-attn Wo projection.
+// Folds THREE decode dispatches into ONE, BYTE-IDENTICALLY:
+//   (1) sigmoid_mul_fused: attn_out[j] = sigmoid(gate[j]) * attn_out[j]
+//   (2) qmv_q4_0_residual: attn_proj  = Wo * attn_out            (+ ZERO residual)
+//   (3) residual_add_copy: x_buf += attn_proj; attn_proj = x_buf
+//
+// This reuses the qmv_q4_0_residual matvec verbatim with TWO changes: (a) the input
+// gate is SIGMOID (`sig*x`) — matching sigmoid_mul_fused exactly;
+// (b) f32 scales (Wo is f32-scale qmv_q4_0_residual), not f16. The Q4_0 dequant,
+// the nibble staging (v*1/16, 1/256, 1/4096), the -8*sumx zero-point fold, the
+// per-row accumulation order, and the simd_sum reduce are COPIED VERBATIM from the
+// proven kernels, so the matvec is bit-identical to qmv_q4_0_residual on the
+// sigmoid-gated input. FOLD-A (gate) is byte-exact because sigmoid_mul_fused stores
+// sig*attn_out as f32 and qmv reloads it — identical to computing sig*attn_out in
+// an f32 register here (store+reload of an f32 == the register f32; `*` commutes).
+// FOLD-B (residual) is byte-exact because residual_add_copy computes
+// x_buf_old + Wo_out and this computes tot(=Wo_out) + accum(=x_buf_old), f32 add
+// commutes, dual-written to accum(=x_buf) AND copy_dst(=attn_proj).
+//
+// Bindings: w@0, x=attn_out@1, accum=x_buf (residual src + write)@2, in_dim=q_dim@3,
+//   scales=Wo f32 scales@4, copy_dst=attn_proj@5, gate=gate_buf@6.
+// Grid/threads identical to qmv_q4_0_residual: (hidden_dim/8) TGs x 64 threads.
+// ============================================================================
+kernel void qmv_q4_0_wo_glue(
+    device const uint32_t* w        [[buffer(0)]],
+    device const float*    x        [[buffer(1)]],
+    device float*          accum    [[buffer(2)]],
+    constant uint&         in_dim   [[buffer(3)]],
+    device const float*    scales   [[buffer(4)]],
+    device float*          copy_dst [[buffer(5)]],
+    device const float*    gate     [[buffer(6)]],
+    uint  tgpig    [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+    const uint SIMD_SIZE = 32u;
+    const uint group_size = 32u;
+    const uint packs_per_thread = 2u;
+    const uint results_per_simdgroup = 4u;
+    const uint pack_factor = 8u;          // 8 nibbles / uint32
+    const uint bytes_per_pack = 4u;       // one uint32
+    const uint values_per_thread = pack_factor * packs_per_thread; // 16
+    const uint block_size = values_per_thread * SIMD_SIZE;         // 512
+    const uint scale_step_per_thread = group_size / values_per_thread; // 2
+
+    const uint out_row = tgpig * (2u * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+
+    const uint in_vec_size_w = in_dim * bytes_per_pack / pack_factor; // in_dim/2 bytes per row
+    const uint in_vec_size_g = in_dim / group_size;                   // scales per row
+
+    device const uchar* ws = (device const uchar*)w;
+    ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+    device const float* sc = scales + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+    device const float* xr = x + simd_lid * values_per_thread;
+    device const float* gr = gate + simd_lid * values_per_thread;
+
+    float x_thread[16];
+    float result[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+    for (uint k = 0; k < in_dim; k += block_size) {
+        float sumx = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < values_per_thread; i += 4) {
+            // FOLD-A: sigmoid(gate)*x staged once per thread (matches
+            // sigmoid_mul_fused `sig*x` bit-for-bit; NOT SiLU's `g*sig*x`).
+            float g0 = gr[i];
+            float g1 = gr[i + 1];
+            float g2 = gr[i + 2];
+            float g3 = gr[i + 3];
+            float v0 = (1.0f / (1.0f + exp(-g0))) * xr[i];
+            float v1 = (1.0f / (1.0f + exp(-g1))) * xr[i + 1];
+            float v2 = (1.0f / (1.0f + exp(-g2))) * xr[i + 2];
+            float v3 = (1.0f / (1.0f + exp(-g3))) * xr[i + 3];
+            sumx += v0 + v1 + v2 + v3;
+            x_thread[i]     = v0;
+            x_thread[i + 1] = v1 * (1.0f / 16.0f);
+            x_thread[i + 2] = v2 * (1.0f / 256.0f);
+            x_thread[i + 3] = v3 * (1.0f / 4096.0f);
+        }
+
+        #pragma clang loop unroll(full)
+        for (uint row = 0; row < results_per_simdgroup; row++) {
+            device const uint16_t* wsl = (device const uint16_t*)(ws + row * in_vec_size_w);
+            float s = sc[row * in_vec_size_g];
+            float accf = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < (values_per_thread / 4); i++) {
+                uint16_t wv = wsl[i];
+                accf += x_thread[4 * i]     * float(wv & 0x000f)
+                      + x_thread[4 * i + 1] * float(wv & 0x00f0)
+                      + x_thread[4 * i + 2] * float(wv & 0x0f00)
+                      + x_thread[4 * i + 3] * float(wv & 0xf000);
+            }
+            result[row] += s * (accf - 8.0f * sumx);
+        }
+
+        ws += block_size * bytes_per_pack / pack_factor; // += 256 bytes
+        sc += block_size / group_size;                   // += 16 scales
+        xr += block_size;
+        gr += block_size;
+    }
+
+    // FOLD-B: residual add + dual-write. accum holds x_buf (pre-attention
+    // residual); tot is the Wo matvec (== the old attn_proj with zero residual).
+    // val = tot + x_buf_old == residual_add_copy's x_buf_new; write to BOTH
+    // x_buf (accum) and attn_proj (copy_dst).
+    #pragma clang loop unroll(full)
+    for (uint row = 0; row < results_per_simdgroup; row++) {
+        float tot = simd_sum(result[row]);
+        if (simd_lid == 0) {
+            float val = tot + accum[out_row + row];
+            accum[out_row + row] = val;
+            copy_dst[out_row + row] = val;
+        }
+    }
+}
+
+// ============================================================================
 // qmv_q4_0_residual_f16sc_h2math: HALF2-VECTORIZED dequant-MAC FFN-down matvec
 // (env LUMEN_METAL_Q4_DOWN_H2MATH=1, default OFF; stacks ONLY on the f16-scale
 // FFN-down path, so it reads `device const half*` scales). The FFN-down twin of
@@ -3199,6 +3317,138 @@ kernel void qmv_q4_0_gate_up_swiglu_il(
             float sigmoid = 1.0f / (1.0f + exp(-g));
             out[out_row + row] = g * sigmoid * u;  // SwiGLU
         }
+    }
+}
+
+// ============================================================================
+// qmv_q4_0_gate_up_swiglu_ls_h2math: "LM-head-structure" (LS) SINGLE-STREAM
+// variant of qmv_q4_0_gate_up_swiglu_f16sc_h2math.
+//
+// STRUCTURE: the production DUAL-matrix h2math kernel reads w_gate AND w_up per
+// inner iteration for the SAME output row (1536 TGs on 9B). This LS kernel reads
+// ONE weight stream per simdgroup row from a ROW-INTERLEAVED gate|up buffer
+// (`w_ls`: physical row 2d = the whole gate row d, row 2d+1 = the whole up row d;
+// scales likewise) exactly like the single-matrix lm_head qmv, and applies SwiGLU
+// LOCALLY. Each simdgroup owns 4 CONSECUTIVE physical rows {gate[d0], up[d0],
+// gate[d0+1], up[d0+1]} (d0 = out_row/2) and writes out[d0], out[d0+1]. Grid =
+// (2*inter_dim)/8 = 3072 TGs (2x the dual kernel), SAME 56.6MB weight stream, 64
+// threads/TG. Standalone the LS single-stream layout measured ~655 GB/s vs the
+// dual kernel's ~633 (+3.4%), bit-matching at maxrel 6.9e-12.
+//
+// BYTE-IDENTICAL to qmv_q4_0_gate_up_swiglu_f16sc_h2math per output element: each
+// physical LS row is a VERBATIM copy of the production per-row f16sc nibble+scale
+// bytes, and the per-row reduction (x-staging, half2 dequant-MAC, f32 accumulate,
+// -8*sumx zero-point fold, per-simdgroup ss reduce + rms_scale, SwiGLU
+// g*sigmoid(g)*u) is the SAME arithmetic in the SAME order as the dual kernel. Both
+// gate[d] and up[d] land in the SAME simdgroup, ss is reduced over the FULL x per
+// simdgroup (every TG sees all of x) -> the RMSNorm denominator, gate[d], up[d] and
+// the SwiGLU are bit-for-bit identical. The ONLY change is which simdgroup computes
+// a given row (single vs dual stream) -- a pure memory-access-structure change.
+//
+// Layout consumed (built by build_qmv_gate_up_ls_buffers):
+//   w_ls    [2*inter_dim, in_dim/2] bytes: physical row r = f16sc per-row nibbles
+//   scales  [2*inter_dim, in_dim/32] f16:  physical row r = f16sc per-row scales
+// Bindings: w_ls@0, x@1, out@2, in_dim@3, ls_scales@4, norm_w@5(f32 bytes), eps@6.
+// Requires in_dim % 512 == 0 and inter_dim % 4 == 0 (9B: in=4096, inter=12288 OK).
+// ============================================================================
+kernel void qmv_q4_0_gate_up_swiglu_ls_h2math(
+    device const uint32_t* w_ls      [[buffer(0)]],
+    device const float*    x         [[buffer(1)]],
+    device float*          out       [[buffer(2)]],
+    constant uint&         in_dim    [[buffer(3)]],
+    device const half*     ls_scales [[buffer(4)]],
+    device const uchar*    norm_w    [[buffer(5)]],   // RMSNorm weight [in_dim] as f32 bytes
+    constant float&        eps       [[buffer(6)]],
+    uint  tgpig    [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+    const uint SIMD_SIZE = 32u;
+    const uint group_size = 32u;
+    const uint packs_per_thread = 2u;
+    const uint results_per_simdgroup = 4u;
+    const uint pack_factor = 8u;
+    const uint bytes_per_pack = 4u;
+    const uint values_per_thread = pack_factor * packs_per_thread; // 16
+    const uint block_size = values_per_thread * SIMD_SIZE;         // 512
+    const uint scale_step_per_thread = group_size / values_per_thread; // 2
+
+    // Physical row in the 2*inter_dim interleaved space (row 2d=gate[d], 2d+1=up[d]).
+    const uint out_row = tgpig * (2u * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+
+    const uint in_vec_size_w = in_dim * bytes_per_pack / pack_factor; // in_dim/2 bytes per row
+    const uint in_vec_size_g = in_dim / group_size;                   // scales per row
+
+    device const uchar* ws = (device const uchar*)w_ls;
+    ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+    device const half* sc = ls_scales + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+    device const float* xr = x + simd_lid * values_per_thread;
+    device const float* nw = ((device const float*)norm_w) + simd_lid * values_per_thread;
+
+    // x staged as half2 pairs (two adjacent prescaled positions per half2 lane) --
+    // VERBATIM from qmv_q4_0_gate_up_swiglu_f16sc_h2math.
+    half2 x2[8];
+    float result[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float ss = 0.0f;  // sum of RAW x^2 for RMSNorm (f32)
+
+    for (uint k = 0; k < in_dim; k += block_size) {
+        float sumx = 0.0f;  // f32 shared -8 zero-point fold magnitude
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < values_per_thread; i += 4) {
+            float rx0 = xr[i];
+            float rx1 = xr[i + 1];
+            float rx2 = xr[i + 2];
+            float rx3 = xr[i + 3];
+            ss += rx0 * rx0 + rx1 * rx1 + rx2 * rx2 + rx3 * rx3;  // RAW x^2 (f32)
+            float v0 = rx0 * nw[i];        // NORMED x = x * norm_w
+            float v1 = rx1 * nw[i + 1];
+            float v2 = rx2 * nw[i + 2];
+            float v3 = rx3 * nw[i + 3];
+            sumx += v0 + v1 + v2 + v3;
+            x2[i / 2]       = half2(half(v0),                 half(v1 * (1.0f / 16.0f)));
+            x2[i / 2 + 1]   = half2(half(v2 * (1.0f / 256.0f)), half(v3 * (1.0f / 4096.0f)));
+        }
+
+        #pragma clang loop unroll(full)
+        for (uint row = 0; row < results_per_simdgroup; row++) {
+            device const uint16_t* wsl = (device const uint16_t*)(ws + row * in_vec_size_w);
+            float s = float(sc[row * in_vec_size_g]);
+            // f32 per-block dot accumulator; half2 MULTIPLY preserved (VERBATIM from
+            // the h2math dual kernel's per-row inner).
+            float accf = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < (values_per_thread / 4); i++) {
+                uint16_t wv = wsl[i];
+                half2 n_a = half2(half(wv & 0x000f), half(wv & 0x00f0));
+                half2 n_b = half2(half(wv & 0x0f00), half(wv & 0xf000));
+                half2 p = x2[2 * i] * n_a + x2[2 * i + 1] * n_b;  // half2 multiply preserved
+                accf += float(p.x) + float(p.y);                 // f32 accumulate
+            }
+            result[row] += s * (accf - 8.0f * sumx);
+        }
+
+        ws += block_size * bytes_per_pack / pack_factor; // += 256 bytes
+        sc += block_size / group_size;                   // += 16 scales
+        xr += block_size;
+        nw += block_size;
+    }
+
+    // Full sum-of-squares over ONE simdgroup's 32 lanes == sum over all of x.
+    float ss_total = simd_sum(ss);
+    float rms_scale = rsqrt(ss_total / float(in_dim) + eps);
+
+    // 4 physical rows = {gate[d0], up[d0], gate[d0+1], up[d0+1]}; write 2 SwiGLU out.
+    // r0*s0*r1 == (g*sigmoid(g))*u : SAME left-assoc order as the dual kernel.
+    float r0 = simd_sum(result[0]) * rms_scale; // gate[d0]
+    float r1 = simd_sum(result[1]) * rms_scale; // up[d0]
+    float r2 = simd_sum(result[2]) * rms_scale; // gate[d0+1]
+    float r3 = simd_sum(result[3]) * rms_scale; // up[d0+1]
+    if (simd_lid == 0) {
+        uint d0 = out_row >> 1;
+        float s0 = 1.0f / (1.0f + exp(-r0));
+        float s2 = 1.0f / (1.0f + exp(-r2));
+        out[d0]     = r0 * s0 * r1;  // SwiGLU
+        out[d0 + 1] = r2 * s2 * r3;
     }
 }
 

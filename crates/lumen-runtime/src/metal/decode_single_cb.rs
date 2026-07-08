@@ -350,7 +350,7 @@ impl MetalF32Backend {
                             enc.set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2)
                         }
                         QuantScheme::Bf16 => {
-                            enc.set_pipeline_state(&pipelines.rmsnorm_matmul_bf16_deferred_nr2)
+                            enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
                         }
                         _ => unreachable!(),
                     }
@@ -539,9 +539,9 @@ impl MetalF32Backend {
                                     QuantScheme::F16 => enc.set_pipeline_state(
                                         &pipelines.rmsnorm_matmul_f16_deferred_nr2,
                                     ),
-                                    QuantScheme::Bf16 => enc.set_pipeline_state(
-                                        &pipelines.rmsnorm_matmul_bf16_deferred_nr2,
-                                    ),
+                                    QuantScheme::Bf16 => {
+                                        enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
+                                    }
                                     _ => enc.set_pipeline_state(
                                         &pipelines.rmsnorm_dequant_matmul_q8_0_deferred_nr2,
                                     ),
@@ -572,7 +572,7 @@ impl MetalF32Backend {
                                         128u64
                                     }
                                     QuantScheme::Bf16 => {
-                                        enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                                        enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                                         128u64
                                     }
                                     _ => {
@@ -703,9 +703,9 @@ impl MetalF32Backend {
                                 ),
                                 QuantScheme::F16 => enc
                                     .set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2),
-                                QuantScheme::Bf16 => enc.set_pipeline_state(
-                                    &pipelines.rmsnorm_matmul_bf16_deferred_nr2,
-                                ),
+                                QuantScheme::Bf16 => {
+                                    enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
+                                }
                                 _ => enc.set_pipeline_state(
                                     &pipelines.rmsnorm_dequant_matmul_q8_0_deferred_nr2,
                                 ),
@@ -740,7 +740,7 @@ impl MetalF32Backend {
                                     128u64
                                 }
                                 QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                                     128u64
                                 }
                                 _ => {
@@ -824,9 +824,9 @@ impl MetalF32Backend {
                                 ),
                                 QuantScheme::F16 => enc
                                     .set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2),
-                                QuantScheme::Bf16 => enc.set_pipeline_state(
-                                    &pipelines.rmsnorm_matmul_bf16_deferred_nr2,
-                                ),
+                                QuantScheme::Bf16 => {
+                                    enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
+                                }
                                 _ => enc.set_pipeline_state(
                                     &pipelines.rmsnorm_dequant_matmul_q8_0_deferred_nr2,
                                 ),
@@ -861,7 +861,7 @@ impl MetalF32Backend {
                                     128u64
                                 }
                                 QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                                     128u64
                                 }
                                 _ => {
@@ -1102,7 +1102,7 @@ impl MetalF32Backend {
                                     enc.set_pipeline_state(&pipelines.matmul_f16_deferred_bias_nr2)
                                 }
                                 QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_bias_nr2)
+                                    enc.set_pipeline_state(pipelines.bf16_matvec_bias_nr2())
                                 }
                                 _ => unreachable!(),
                             };
@@ -1126,7 +1126,7 @@ impl MetalF32Backend {
                                     128u64
                                 }
                                 QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                                     128u64
                                 }
                                 _ => {
@@ -1552,7 +1552,7 @@ impl MetalF32Backend {
                                     128u64
                                 }
                                 QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                                     128u64
                                 }
                                 _ => {
@@ -1647,7 +1647,7 @@ impl MetalF32Backend {
                                     128u64
                                 }
                                 QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                                     128u64
                                 }
                                 _ => {
@@ -1844,9 +1844,7 @@ impl MetalF32Backend {
                                 128u64
                             }
                             QuantScheme::Bf16 => {
-                                enc.set_pipeline_state(
-                                    &pipelines.matmul_bf16_deferred_residual_nr2,
-                                );
+                                enc.set_pipeline_state(pipelines.bf16_matvec_residual_nr2());
                                 128u64
                             }
                             _ => {
@@ -2546,7 +2544,7 @@ impl MetalF32Backend {
                     // BF16 unfused: gate matvec + up matvec + SwiGLU (no fused BF16 kernel)
                     // Mirrors the F32 fallback path but uses matmul_bf16_deferred_nr2.
                     // Gate: gate_buf = W_gate * normed_buf
-                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                     enc.set_buffer(layer_buf, w_gate_off, 0);
                     enc.set_buffer(&s.normed_buf, 0, 1);
                     enc.set_buffer(&s.gate_buf, 0, 2);
@@ -2714,9 +2712,7 @@ impl MetalF32Backend {
                                 128u64
                             }
                             QuantScheme::Bf16 => {
-                                enc.set_pipeline_state(
-                                    &pipelines.matmul_bf16_deferred_residual_nr2,
-                                );
+                                enc.set_pipeline_state(pipelines.bf16_matvec_residual_nr2());
                                 128u64
                             }
                             _ => {
@@ -2869,7 +2865,7 @@ impl MetalF32Backend {
                         enc.set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2)
                     }
                     QuantScheme::Bf16 => {
-                        enc.set_pipeline_state(&pipelines.rmsnorm_matmul_bf16_deferred_nr2)
+                        enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
                     }
                     _ => {
                         enc.set_pipeline_state(&pipelines.rmsnorm_dequant_matmul_q8_0_deferred_nr2)
@@ -2910,7 +2906,7 @@ impl MetalF32Backend {
                     (128u64, 2u64)
                 }
                 QuantScheme::Bf16 => {
-                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                     (128u64, 2u64)
                 }
                 _ => {

@@ -152,20 +152,6 @@ fn strip_location(msg: &str) -> &str {
     msg.find(" at line ").map(|i| &msg[..i]).unwrap_or(msg)
 }
 
-#[cfg(test)]
-mod serde_error_tests {
-    use super::strip_location;
-
-    #[test]
-    fn strip_location_removes_parser_position() {
-        assert_eq!(
-            strip_location("invalid value: integer `-1`, expected u64 at line 1 column 75"),
-            "invalid value: integer `-1`, expected u64"
-        );
-        assert_eq!(strip_location("no position here"), "no position here");
-    }
-}
-
 /// Extract the first backtick-quoted token after the given prefix.
 /// Returns `None` if the prefix is not present or no backticked token follows.
 fn extract_quoted_after(msg: &str, prefix: &str) -> Option<String> {
@@ -333,4 +319,18 @@ async fn memory_breakdown(State(state): State<AppState>) -> Response {
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     (StatusCode::OK, headers, body).into_response()
+}
+
+#[cfg(test)]
+mod serde_error_tests {
+    use super::strip_location;
+
+    #[test]
+    fn strip_location_removes_parser_position() {
+        assert_eq!(
+            strip_location("invalid value: integer `-1`, expected u64 at line 1 column 75"),
+            "invalid value: integer `-1`, expected u64"
+        );
+        assert_eq!(strip_location("no position here"), "no position here");
+    }
 }

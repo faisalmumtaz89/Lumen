@@ -542,7 +542,7 @@ async fn bad_request_returns_400() {
 /// proof that the SDK round-trip is wire-compatible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_sdk_bad_request_raises_cleanly() {
-    if std::env::var("LUMEN_TEST_OPENAI_SDK").ok().as_deref() == None {
+    if std::env::var("LUMEN_TEST_OPENAI_SDK").is_err() {
         eprintln!("openai_sdk_bad_request_raises_cleanly: skipped (set LUMEN_TEST_OPENAI_SDK=1 to enable)");
         return;
     }
@@ -1173,7 +1173,10 @@ impl ComputeBackend for PanicArmedBackend {
             let err: Result<(), String> = Err(
                 "cudarc-0.19.3 unwrap() on Err DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")".into(),
             );
-            #[allow(clippy::unnecessary_wraps)]
+            // The "unnecessary" unwrap-on-Err IS the fault being injected:
+            // it must produce the exact `Result::unwrap` panic payload shape
+            // that cudarc-0.19.x throws on a DriverError.
+            #[allow(clippy::unnecessary_wraps, clippy::unnecessary_literal_unwrap)]
             err.unwrap();
         }
         self.inner.compute_layer(layer_idx, x, weights, kv, seq_pos)

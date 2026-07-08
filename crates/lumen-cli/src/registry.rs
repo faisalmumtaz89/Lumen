@@ -288,7 +288,7 @@ mod tests {
         let reg = load_registry();
         let list = reg.list();
         assert!(
-            list.len() >= 1,
+            !list.is_empty(),
             "expected at least 1 model, got {}",
             list.len(),
         );
