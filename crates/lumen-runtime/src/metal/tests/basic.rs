@@ -291,7 +291,7 @@ fn test_metal_dequant_matmul_q8_0_correctness() {
     // Row 0: 2 blocks, each with scale=0.5, all int8 values = 2
     let scale_half_bits = f32_to_f16_bits(0.5);
     for b in 0..num_blocks_per_row {
-        let block_start = 0 * row_bytes + b * q8_block_size;
+        let block_start = b * q8_block_size; // row 0 starts at offset 0
         w_q8[block_start] = (scale_half_bits & 0xFF) as u8;
         w_q8[block_start + 1] = (scale_half_bits >> 8) as u8;
         for j in 0..q8_group_size {
@@ -302,7 +302,7 @@ fn test_metal_dequant_matmul_q8_0_correctness() {
     // Row 1: 2 blocks, each with scale=1.0, values=[0,1,2,...,31]
     let scale_one_bits: u16 = 0x3C00;
     for b in 0..num_blocks_per_row {
-        let block_start = 1 * row_bytes + b * q8_block_size;
+        let block_start = row_bytes + b * q8_block_size; // row 1 starts at row_bytes
         w_q8[block_start] = (scale_one_bits & 0xFF) as u8;
         w_q8[block_start + 1] = (scale_one_bits >> 8) as u8;
         for j in 0..q8_group_size {

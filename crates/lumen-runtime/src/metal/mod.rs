@@ -197,6 +197,18 @@ pub(crate) fn metal_gpu_sampler_exact_enabled() -> bool {
     v
 }
 
+/// Maximum pass-1 tile count for the two-pass tiled argmax. Sizes the partials
+/// scratch buffer ([ARGMAX_MAX_TILES] f32 + [ARGMAX_MAX_TILES] u32). 256 partials
+/// reduce in a single 256-thread pass-2 TG.
+pub(crate) const ARGMAX_MAX_TILES: usize = 256;
+
+/// Pass-1 tile count for the two-pass tiled greedy argmax. 128 spreads the
+/// 248320-wide vocab reduction across the GPU while keeping the <=256 partials
+/// within a single 256-thread pass-2 threadgroup; token selection is
+/// tile-count-invariant, so this only sets pass-1 parallelism. Must be
+/// <= ARGMAX_MAX_TILES.
+pub(crate) const TILED_ARGMAX_TILES: usize = 128;
+
 /// The full Q4_0 fast-decode kernel stack — now the DEFAULT decode path (no flag).
 /// Engages the complete validated Metal Q4_0 batch-1 decode acceleration on the
 /// Qwen3.5 family: the decode-qmv weight layout (GDN QKV/gate, FFN gate/up + down,

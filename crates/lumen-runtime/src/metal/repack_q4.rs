@@ -1078,3 +1078,81 @@ pub(crate) fn build_qmv_gate_up_interleaved_buffers(
     })?;
     Ok((qbuf, sbuf))
 }
+
+/// LM-head-structure (LS) gate+up decode-qmv repack.
+///
+/// Places the gate and up weights of the dense FFN gate/up matvec into ONE
+/// ROW-INTERLEAVED nibble buffer + ONE row-interleaved f16-scale buffer, so the
+/// `qmv_q4_0_gate_up_swiglu_ls_h2math` kernel reads ONE contiguous weight stream
+/// per simdgroup row (lm_head structure) instead of the DUAL gate+up stream. Unlike
+/// [`repack_q4_gate_up_interleaved`] (which weaves gate|up WITHIN each output row at
+/// 256-byte super-iter granularity for the 1536-TG dual kernel), this interleaves
+/// at WHOLE-ROW granularity: physical row `2d` is the ENTIRE gate row `d`, physical
+/// row `2d+1` is the ENTIRE up row `d`. Each physical row is a byte-for-byte copy of
+/// the f16sc per-row layout ([`repack_q4_qmv_decode_f16sc`]), so the kernel's per-row
+/// reduction is bit-identical to the h2math dual kernel's per-row reduction.
+///
+/// Layout (`g`, `u` are `[n_rows, k]` Q4_0; `row_qw = k/2` nibble bytes/row,
+/// `row_sc = (k/32)*2` f16 scale bytes/row; requires `k % 512 == 0`):
+///   - qweights `[2*n_rows, row_qw]` bytes: row `2d` = gate row `d`, `2d+1` = up row `d`
+///   - scales   `[2*n_rows, row_sc]` bytes: row `2d` = gate scales `d`, `2d+1` = up `d`
+/// Consumed by `qmv_q4_0_gate_up_swiglu_ls_h2math` (out_row indexes the 2*n_rows
+/// space; d0 = out_row/2 selects the output element). BYTE-IDENTICAL math.
+#[allow(clippy::type_complexity)]
+pub(crate) fn repack_q4_gate_up_ls(
+    gate_src: &[u8],
+    up_src: &[u8],
+    n_rows: usize,
+    k: usize,
+) -> Result<(Vec<u8>, Vec<u8>), RuntimeError> {
+    if k % 512 != 0 {
+        return Err(RuntimeError::Compute(format!(
+            "qmv gate/up LS repack: k={} not a multiple of 512",
+            k
+        )));
+    }
+    // Re-order each tensor's nibbles/scales exactly as the f16sc path does, then
+    // interleave whole rows (gate row d, up row d, ...).
+    let (gate_qw, gate_sc) = repack_q4_qmv_decode_f16sc(gate_src, n_rows, k)?;
+    let (up_qw, up_sc) = repack_q4_qmv_decode_f16sc(up_src, n_rows, k)?;
+    let row_qw = k / 2; // nibble bytes per row in the single-tensor f16sc layout
+    let row_sc = (k / 32) * 2; // f16 scale bytes per row (k/32 blocks x 2 B)
+
+    let mut qweights = vec![0u8; 2 * n_rows * row_qw];
+    let mut scales = vec![0u8; 2 * n_rows * row_sc];
+    for d in 0..n_rows {
+        let g_qw = d * row_qw;
+        let u_qw = d * row_qw;
+        qweights[(2 * d) * row_qw..(2 * d + 1) * row_qw]
+            .copy_from_slice(&gate_qw[g_qw..g_qw + row_qw]);
+        qweights[(2 * d + 1) * row_qw..(2 * d + 2) * row_qw]
+            .copy_from_slice(&up_qw[u_qw..u_qw + row_qw]);
+        let g_sc = d * row_sc;
+        let u_sc = d * row_sc;
+        scales[(2 * d) * row_sc..(2 * d + 1) * row_sc]
+            .copy_from_slice(&gate_sc[g_sc..g_sc + row_sc]);
+        scales[(2 * d + 1) * row_sc..(2 * d + 2) * row_sc]
+            .copy_from_slice(&up_sc[u_sc..u_sc + row_sc]);
+    }
+    Ok((qweights, scales))
+}
+
+/// Build the two LM-head-structure (LS) gate+up decode-qmv Metal buffers (one
+/// row-interleaved packed nibble buffer, one row-interleaved packed f16-scale
+/// buffer). See [`repack_q4_gate_up_ls`].
+pub(crate) fn build_qmv_gate_up_ls_buffers(
+    device: &MetalDevice,
+    gate_src: &[u8],
+    up_src: &[u8],
+    n_rows: usize,
+    k: usize,
+) -> Result<(MetalBuffer, MetalBuffer), RuntimeError> {
+    let (qw, sc) = repack_q4_gate_up_ls(gate_src, up_src, n_rows, k)?;
+    let qbuf = device.new_buffer_with_bytes(&qw).ok_or_else(|| {
+        RuntimeError::Compute("qmv gate/up LS: alloc qweights buffer failed".into())
+    })?;
+    let sbuf = device.new_buffer_with_bytes(&sc).ok_or_else(|| {
+        RuntimeError::Compute("qmv gate/up LS: alloc scales buffer failed".into())
+    })?;
+    Ok((qbuf, sbuf))
+}

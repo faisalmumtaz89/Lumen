@@ -928,6 +928,202 @@ kernel void deinterleave_norm_assemble(
 }
 
 // ============================================================================
+// deinterleave_norm_rope_kvwrite: full-attention bookend elision.
+//
+// Folds SEVEN full-attention decode dispatches into ONE, eliminating six:
+//   deinterleave_norm_assemble          (kept: this kernel's compute core)
+//   + copy_buffer q_buf -> qkv_buf[Q]   (ELIDED: SDPA reads q_out directly)
+//   + copy_buffer k_buf -> qkv_buf[K]   (ELIDED: K roped straight to cache)
+//   + copy_buffer v_buf -> qkv_buf[V]   (ELIDED: V straight to cache)
+//   + rope_neox Q                       (ELIDED: folded into Q epilogue)
+//   + rope_neox K                       (ELIDED: folded into K epilogue)
+//   + write_kv_cache                     (ELIDED: K/V written direct to cache)
+//
+// BYTE-IDENTITY CONTRACT: every intermediate in the incumbent pipeline is f32
+// and every copy is a lossless f32->f32 move, so an f32 register value equals
+// the value the separate rope_neox/write_kv_cache dispatches would read back.
+// This kernel reproduces the SAME arithmetic in the SAME order:
+//   1. per-head RMSNorm sum-of-squares reduction (simd_sum + partial_sums[32],
+//      rsqrt(ss/head_dim + eps)) -- identical to deinterleave_norm_assemble.
+//   2. normed = val * scale * norm_w[i]  -- identical.
+//   3. NeoX partial rope on [0, 2*half_dim): (v0,v1)=(idx0,idx1=idx0+half_dim),
+//      out0=v0*c-v1*s, out1=v0*s+v1*c  -- identical to rope_neox.
+//   4. cache store casts the f32 roped/pass-through value to half exactly as
+//      write_kv_cache does: half(new0).
+// The normed values are round-tripped through device memory (q_out / k_data)
+// with a device-scoped threadgroup barrier so the rope read sees exactly the
+// f32 bits the incumbent copy would have produced -- no register short-cut that
+// could change rounding.
+//
+// Partial RoPE: only [0, 2*half_dim) is rotated; [2*half_dim, head_dim) passes
+// through as the normed value (matches rope_neox touching only num_heads*half_dim
+// / num_kv_heads*half_dim elements, write_kv_cache then copying the whole head).
+//
+// Dispatch: (num_heads + num_kv_heads) threadgroups, min(head_dim,256).max(32)
+//   threads. TGs [0, num_heads): Q head. TGs [num_heads, total): K/V head.
+//
+// buffer(0):  qgate_interleaved [num_heads * 2 * head_dim] float (Q|gate interleaved)
+// buffer(1):  k_data   [num_kv_heads * head_dim] float (K proj; normed in-place)
+// buffer(2):  v_data   [num_kv_heads * head_dim] float (V proj; untouched)
+// buffer(3):  q_norm_w [head_dim] float
+// buffer(4):  k_norm_w [head_dim] float
+// buffer(5):  cos_table float
+// buffer(6):  sin_table float
+// buffer(7):  gate_out [num_heads * head_dim] float
+// buffer(8):  q_out    [num_heads * head_dim] float (normed+roped Q; SDPA reads this)
+// buffer(9):  k_cache  half [max_seq_len, kv_dim] row-major
+// buffer(10): v_cache  half [kv_dim, max_seq_len] transposed
+// buffer(11): num_heads (uint)
+// buffer(12): num_kv_heads (uint)
+// buffer(13): head_dim (uint)
+// buffer(14): half_dim (uint)  -- rotary_dim/2
+// buffer(15): pos_offset (uint) -- seq_pos * half_dim
+// buffer(16): kv_dim (uint)
+// buffer(17): seq_pos (uint)
+// buffer(18): max_seq_len (uint)
+// buffer(19): eps (float)
+// ============================================================================
+kernel void deinterleave_norm_rope_kvwrite(
+    device const float* qgate_interleaved [[buffer(0)]],
+    device       float* k_data            [[buffer(1)]],
+    device const float* v_data            [[buffer(2)]],
+    device const float* q_norm_w          [[buffer(3)]],
+    device const float* k_norm_w          [[buffer(4)]],
+    device const float* cos_table         [[buffer(5)]],
+    device const float* sin_table         [[buffer(6)]],
+    device       float* gate_out          [[buffer(7)]],
+    device       float* q_out             [[buffer(8)]],
+    device       half*  k_cache           [[buffer(9)]],
+    device       half*  v_cache           [[buffer(10)]],
+    constant     uint&  num_heads         [[buffer(11)]],
+    constant     uint&  num_kv_heads      [[buffer(12)]],
+    constant     uint&  head_dim          [[buffer(13)]],
+    constant     uint&  half_dim          [[buffer(14)]],
+    constant     uint&  pos_offset        [[buffer(15)]],
+    constant     uint&  kv_dim            [[buffer(16)]],
+    constant     uint&  seq_pos           [[buffer(17)]],
+    constant     uint&  max_seq_len       [[buffer(18)]],
+    constant     float& eps               [[buffer(19)]],
+    uint tg_idx                           [[threadgroup_position_in_grid]],
+    uint tid                              [[thread_index_in_threadgroup]],
+    uint tg_size                          [[threads_per_threadgroup]],
+    uint simd_lane                        [[thread_index_in_simdgroup]],
+    uint simd_group                       [[simdgroup_index_in_threadgroup]])
+{
+    uint total_tgs = num_heads + num_kv_heads;
+    if (tg_idx >= total_tgs) return;
+
+    threadgroup float partial_sums[32];
+    threadgroup float total_ss;
+
+    if (tg_idx < num_heads) {
+        // --- Q head: deinterleave + RMSNorm + NeoX rope -> q_out; write gate ---
+        uint h = tg_idx;
+        uint interleaved_base = h * 2 * head_dim;
+        uint qbase = h * head_dim;
+
+        // Step 1: sum-of-squares (identical reduction to deinterleave_norm_assemble)
+        float ss = 0.0f;
+        for (uint i = tid; i < head_dim; i += tg_size) {
+            float q_val = qgate_interleaved[interleaved_base + i];
+            ss += q_val * q_val;
+            gate_out[qbase + i] = qgate_interleaved[interleaved_base + head_dim + i];
+        }
+        ss = simd_sum(ss);
+        if (simd_lane == 0) {
+            partial_sums[simd_group] = ss;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint num_sg = (tg_size + 31) / 32;
+        if (simd_group == 0) {
+            float val = (simd_lane < num_sg) ? partial_sums[simd_lane] : 0.0f;
+            val = simd_sum(val);
+            if (simd_lane == 0) {
+                total_ss = val;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float scale = rsqrt(total_ss / float(head_dim) + eps);
+
+        // Step 2: normed Q -> q_out (identical to deinterleave_norm_assemble)
+        for (uint i = tid; i < head_dim; i += tg_size) {
+            float qv = qgate_interleaved[interleaved_base + i];
+            q_out[qbase + i] = qv * scale * q_norm_w[i];
+        }
+        // Make the normed Q writes visible to the rope readers in this threadgroup
+        // (each head is one threadgroup; rope for head h reads only q_out[head h]).
+        threadgroup_barrier(mem_flags::mem_device);
+
+        // Step 3: NeoX partial rope on [0, 2*half_dim) (identical to rope_neox)
+        for (uint i = tid; i < half_dim; i += tg_size) {
+            float v0 = q_out[qbase + i];
+            float v1 = q_out[qbase + i + half_dim];
+            uint cos_idx = pos_offset + i;
+            float c = cos_table[cos_idx];
+            float s = sin_table[cos_idx];
+            q_out[qbase + i]            = v0 * c - v1 * s;
+            q_out[qbase + i + half_dim] = v0 * s + v1 * c;
+        }
+    } else {
+        // --- K/V head: RMSNorm+rope K -> k_cache; V -> v_cache (all half()) ---
+        uint kh = tg_idx - num_heads;
+        uint kbase = kh * head_dim;
+
+        // Step 1: sum-of-squares over K (identical reduction)
+        float ss = 0.0f;
+        for (uint i = tid; i < head_dim; i += tg_size) {
+            float kv = k_data[kbase + i];
+            ss += kv * kv;
+        }
+        ss = simd_sum(ss);
+        if (simd_lane == 0) {
+            partial_sums[simd_group] = ss;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint num_sg = (tg_size + 31) / 32;
+        if (simd_group == 0) {
+            float val = (simd_lane < num_sg) ? partial_sums[simd_lane] : 0.0f;
+            val = simd_sum(val);
+            if (simd_lane == 0) {
+                total_ss = val;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float scale = rsqrt(total_ss / float(head_dim) + eps);
+
+        // Step 2: normed K in-place to k_data (identical to deinterleave_norm_assemble)
+        for (uint i = tid; i < head_dim; i += tg_size) {
+            float kv = k_data[kbase + i];
+            k_data[kbase + i] = kv * scale * k_norm_w[i];
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
+        // Step 3a: NeoX partial rope on [0, 2*half_dim); write half() straight to K cache.
+        // K cache row-major [max_seq_len, kv_dim]; global col within row = kbase + idx.
+        for (uint i = tid; i < half_dim; i += tg_size) {
+            float v0 = k_data[kbase + i];
+            float v1 = k_data[kbase + i + half_dim];
+            uint cos_idx = pos_offset + i;
+            float c = cos_table[cos_idx];
+            float s = sin_table[cos_idx];
+            float new0 = v0 * c - v1 * s;
+            float new1 = v0 * s + v1 * c;
+            k_cache[seq_pos * kv_dim + kbase + i]            = half(new0);
+            k_cache[seq_pos * kv_dim + kbase + i + half_dim] = half(new1);
+        }
+        // Step 3b: pass-through K region [2*half_dim, head_dim) -> half() to K cache.
+        for (uint i = 2 * half_dim + tid; i < head_dim; i += tg_size) {
+            k_cache[seq_pos * kv_dim + kbase + i] = half(k_data[kbase + i]);
+        }
+        // Step 4: V (no transform) -> transposed V cache [kv_dim, max_seq_len].
+        for (uint i = tid; i < head_dim; i += tg_size) {
+            uint col = kbase + i;
+            v_cache[col * max_seq_len + seq_pos] = half(v_data[col]);
+        }
+    }
+}
+
+// ============================================================================
 // deinterleave_qgate: Split interleaved [Q_h0, gate_h0, Q_h1, gate_h1, ...] into
 // separate Q and gate buffers.
 //

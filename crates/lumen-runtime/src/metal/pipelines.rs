@@ -86,6 +86,10 @@ impl MetalF32Backend {
             matmul_bf16_deferred_nr2: make_pipeline!("matmul_bf16_deferred_nr2"),
             matmul_bf16_deferred_residual_nr2: make_pipeline!("matmul_bf16_deferred_residual_nr2"),
             matmul_bf16_deferred_bias_nr2: make_pipeline!("matmul_bf16_deferred_bias_nr2"),
+            // BF16 QMV vectorized-load decode matvecs (ushort4 coalesced loads).
+            matmul_bf16_qmv_nr2: make_pipeline!("matmul_bf16_qmv_nr2"),
+            matmul_bf16_qmv_residual_nr2: make_pipeline!("matmul_bf16_qmv_residual_nr2"),
+            matmul_bf16_qmv_bias_nr2: make_pipeline!("matmul_bf16_qmv_bias_nr2"),
             dequant_matmul_q8_0: make_pipeline!("dequant_matmul_q8_0"),
             rmsnorm: make_pipeline!("rmsnorm"),
             rmsnorm_bytes: make_pipeline!("rmsnorm_bytes"),
@@ -161,6 +165,11 @@ impl MetalF32Backend {
                 "dequant_matmul_q4_0_deferred_bias_nr2"
             ),
             qmv_q4_0_residual: make_pipeline!("qmv_q4_0_residual"),
+            // OPTIONAL (non-fatal): glue-side elision Wo kernel. None falls
+            // back to the separate sigmoid_mul + qmv_q4_0_residual + residual_add_copy.
+            qmv_q4_0_wo_glue: lib
+                .get_function("qmv_q4_0_wo_glue")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             // OPTIONAL (non-fatal): f16-scales FFN-down variant. None falls back to
             // the f32-scale qmv_q4_0_residual.
             qmv_q4_0_residual_f16sc: lib
@@ -224,6 +233,11 @@ impl MetalF32Backend {
             // the f16sc/8row/default path. env LUMEN_METAL_Q4_GATEUP_IL.
             qmv_q4_0_gate_up_swiglu_il: lib
                 .get_function("qmv_q4_0_gate_up_swiglu_il")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // OPTIONAL (non-fatal): LM-head-structure (LS) single-stream gate+up.
+            // None falls back to the h2math/default path.
+            qmv_q4_0_gate_up_swiglu_ls_h2math: lib
+                .get_function("qmv_q4_0_gate_up_swiglu_ls_h2math")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             rmsnorm_ffn_gate_up_swiglu_q4_0_wide: make_pipeline!(
                 "rmsnorm_ffn_gate_up_swiglu_q4_0_wide"
@@ -425,6 +439,7 @@ impl MetalF32Backend {
             rmsnorm_matmul_bf16_deferred_residual_nr2: make_pipeline!(
                 "rmsnorm_matmul_bf16_deferred_residual_nr2"
             ),
+            rmsnorm_matmul_bf16_qmv_nr2: make_pipeline!("rmsnorm_matmul_bf16_qmv_nr2"),
             rmsnorm_ffn_fused_gate_up_swiglu_q8_0_deferred: make_pipeline!(
                 "rmsnorm_ffn_fused_gate_up_swiglu_q8_0_deferred"
             ),
@@ -455,6 +470,10 @@ impl MetalF32Backend {
                 "ffn_fused_gate_up_swiglu_f16_deferred"
             ),
             argmax: make_pipeline!("argmax"),
+            // Two-pass tiled argmax (greedy-decode token selection). Bit-identical
+            // token to `argmax`; fills the machine to escape the single-TG stall.
+            argmax_tiled_partial: make_pipeline!("argmax_tiled_partial"),
+            argmax_tiled_reduce: make_pipeline!("argmax_tiled_reduce"),
             // GPU temperature sampler (Option A). Optional: if the kernel fails
             // to compile on this device we fall back to the CPU sampler rather
             // than fail backend init (mirrors the MoE optional-pipeline style).
@@ -663,6 +682,10 @@ impl MetalF32Backend {
             // Fused deinterleave+norm+assemble for full-attention Q+gate layers
             deinterleave_norm_assemble: lib
                 .get_function("deinterleave_norm_assemble")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // Full-attention bookend elision: deinterleave+norm+rope+kv-write fused.
+            deinterleave_norm_rope_kvwrite: lib
+                .get_function("deinterleave_norm_rope_kvwrite")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             // Fused L2-normalize + state-update + output + RMSNorm
             gdn_state_output_norm_l2: lib

@@ -49,6 +49,12 @@ pub(crate) struct MetalPipelines {
     pub(crate) matmul_bf16_deferred_nr2: MetalPipelineState,
     pub(crate) matmul_bf16_deferred_residual_nr2: MetalPipelineState,
     pub(crate) matmul_bf16_deferred_bias_nr2: MetalPipelineState,
+    // BF16 QMV (vectorized ushort4-load) decode matvec kernels. Same dispatch
+    // geometry as the deferred family, but read weights as ushort4 (8-byte
+    // coalesced loads); these are the decode-path matvec kernels for BF16.
+    pub(crate) matmul_bf16_qmv_nr2: MetalPipelineState,
+    pub(crate) matmul_bf16_qmv_residual_nr2: MetalPipelineState,
+    pub(crate) matmul_bf16_qmv_bias_nr2: MetalPipelineState,
     pub(crate) dequant_matmul_q8_0: MetalPipelineState,
     pub(crate) rmsnorm: MetalPipelineState,
     pub(crate) rmsnorm_bytes: MetalPipelineState,
@@ -125,6 +131,11 @@ pub(crate) struct MetalPipelines {
     pub(crate) dequant_matmul_q4_0_deferred_bias_nr2: MetalPipelineState,
     // MLX-style decode GEMV (separated sequential-nibble + f32 scales layout).
     pub(crate) qmv_q4_0_residual: MetalPipelineState,
+    // OPTIONAL (non-fatal): glue-side elision Wo kernel. Folds sigmoid_mul_fused +
+    // qmv_q4_0_residual + residual_add_copy into one dispatch, byte-identically, on
+    // the Qwen3.5 full-attn Wo path. None => the fold does not engage and the three
+    // separate dispatches run.
+    pub(crate) qmv_q4_0_wo_glue: Option<MetalPipelineState>,
     // OPTIONAL (non-fatal): f16-scales variant of qmv_q4_0_residual (FFN-down). A
     // missing/uncompilable kernel yields None and the FFN-down dispatch falls back
     // to the f32-scale qmv_q4_0_residual. env LUMEN_METAL_Q4_QMV_DOWN_F16SC.
@@ -216,6 +227,12 @@ pub(crate) struct MetalPipelines {
     // four separate streams (gate/up nibbles + gate/up scales). None falls back to
     // the f16sc/8row/default path. env LUMEN_METAL_Q4_GATEUP_IL.
     pub(crate) qmv_q4_0_gate_up_swiglu_il: Option<MetalPipelineState>,
+    // OPTIONAL (non-fatal): LM-head-structure (LS) single-stream gate+up variant.
+    // Byte-identical math to the h2math dual kernel; reads a ROW-INTERLEAVED
+    // gate|up buffer single-stream at 2*inter_dim/8 TGs (lm_head structure)
+    // instead of the DUAL gate+up stream at inter_dim/8 TGs. None falls back to
+    // the h2math/default path.
+    pub(crate) qmv_q4_0_gate_up_swiglu_ls_h2math: Option<MetalPipelineState>,
     // WIDE-load (uint4/256-thread) variant of the dense FFN gate/up GEMV; reads
     // the same separated sequential-nibble layout (env LUMEN_METAL_Q4_GATEUP_WIDE).
     pub(crate) rmsnorm_ffn_gate_up_swiglu_q4_0_wide: MetalPipelineState,
@@ -395,6 +412,8 @@ pub(crate) struct MetalPipelines {
     // F16 fused variant; weights read as bfloat instead of half.
     pub(crate) rmsnorm_matmul_bf16_deferred_nr2: MetalPipelineState,
     pub(crate) rmsnorm_matmul_bf16_deferred_residual_nr2: MetalPipelineState,
+    // Vectorized-load (ushort4) fused RMSNorm + BF16 matvec (decode path).
+    pub(crate) rmsnorm_matmul_bf16_qmv_nr2: MetalPipelineState,
     // Fused RMSNorm + FFN Gate+Up+SwiGLU Q8_0 deferred
     pub(crate) rmsnorm_ffn_fused_gate_up_swiglu_q8_0_deferred: MetalPipelineState,
     // Fused RMSNorm + FFN Gate+Up+SwiGLU Q8_0 8-row (8 SGs, zero barriers)
@@ -416,6 +435,14 @@ pub(crate) struct MetalPipelines {
 
     // GPU-side argmax for greedy decode (eliminates 128KB logits readback)
     pub(crate) argmax: MetalPipelineState,
+
+    // Two-pass tiled GPU argmax (the greedy-decode token-selection path). Fills
+    // the machine with N threadgroups instead of the single-TG `argmax` (which is
+    // bandwidth-starved at ~2.9 GB/s over the vocab logits). Bit-identical token
+    // selection to `argmax` for every input (see ffn_elementwise.msl). Pass-1
+    // writes per-tile (max_val, arg_idx) partials; pass-2 reduces them to the token.
+    pub(crate) argmax_tiled_partial: MetalPipelineState,
+    pub(crate) argmax_tiled_reduce: MetalPipelineState,
 
     // GPU-side temperature sampler (Option A: lean-sampled decode path,
     // LUMEN_METAL_GPU_SAMPLER=1, default OFF). Parity-matched to the CPU
@@ -528,6 +555,9 @@ pub(crate) struct MetalPipelines {
 
     // Fused deinterleave+norm+assemble for full-attention Q+gate layers
     pub(crate) deinterleave_norm_assemble: Option<MetalPipelineState>,
+    // Full-attention bookend elision: deinterleave+norm+rope+kv-write folded into
+    // one dispatch. None => the six-dispatch incumbent bookend runs.
+    pub(crate) deinterleave_norm_rope_kvwrite: Option<MetalPipelineState>,
     // Fused L2-normalize + state-update + output + RMSNorm (eliminates l2_normalize_qk dispatch)
     pub(crate) gdn_state_output_norm_l2: Option<MetalPipelineState>,
     // Simdgroup-parallel state update (4096 TGs of 32 threads, writes raw output)
@@ -607,6 +637,35 @@ pub(crate) struct MetalPipelines {
     pub(crate) gdn_compute_gates_batched: Option<MetalPipelineState>,
     pub(crate) dequant_batched_matvec_q8_0: Option<MetalPipelineState>,
     pub(crate) dequant_batched_matvec_q8_0_dual: Option<MetalPipelineState>,
+}
+
+impl MetalPipelines {
+    /// BF16 decode matvec (plain / bias-less). Returns the vectorized ushort4-load
+    /// (QMV) kernel: reading weights 4-at-a-time coalesces the loads and better
+    /// saturates Apple GPU bandwidth than the scalar 2-byte-per-weight path, with
+    /// identical NR0=2 / 128-thread dispatch geometry.
+    #[inline]
+    pub(crate) fn bf16_matvec_nr2(&self) -> &MetalPipelineState {
+        &self.matmul_bf16_qmv_nr2
+    }
+
+    /// BF16 decode matvec + residual add.
+    #[inline]
+    pub(crate) fn bf16_matvec_residual_nr2(&self) -> &MetalPipelineState {
+        &self.matmul_bf16_qmv_residual_nr2
+    }
+
+    /// BF16 decode matvec + fused QKV bias.
+    #[inline]
+    pub(crate) fn bf16_matvec_bias_nr2(&self) -> &MetalPipelineState {
+        &self.matmul_bf16_qmv_bias_nr2
+    }
+
+    /// Fused RMSNorm + BF16 decode matvec.
+    #[inline]
+    pub(crate) fn bf16_rmsnorm_matvec_nr2(&self) -> &MetalPipelineState {
+        &self.rmsnorm_matmul_bf16_qmv_nr2
+    }
 }
 
 // ============================================================================
@@ -763,6 +822,12 @@ pub(crate) struct MetalScratch {
     // GPU-side argmax result: 1 x u32 (4 bytes). Eliminates 128KB logits readback
     // for greedy sampling (temperature <= 0).
     pub(crate) argmax_result_buf: MetalBuffer,
+
+    // Two-pass tiled-argmax pass-1 partials scratch.
+    // Layout: [ARGMAX_MAX_TILES] f32 max-vals at byte 0, then [ARGMAX_MAX_TILES]
+    // u32 arg-idxs at byte ARGMAX_MAX_TILES*4. Sized once for the max tile count;
+    // pass-1 writes the first `num_tiles` entries, pass-2 reduces them.
+    pub(crate) argmax_partials_buf: MetalBuffer,
 
     // ---- Lean GPU-pipelined greedy decode (the default greedy path) ----
     // A small ring of CPU-visible u32 token buffers used to chain tokens on the
@@ -1238,6 +1303,14 @@ pub(crate) struct MetalScratch {
     /// path for that layer. Byte-identical to the separated f16sc kernel.
     pub(crate) qmv_ffn_gate_up_il_qw: Vec<Option<MetalBuffer>>,
     pub(crate) qmv_ffn_gate_up_il_scales: Vec<Option<MetalBuffer>>,
+    /// LM-head-structure (LS) gate+up decode-qmv buffers: per layer, ONE
+    /// ROW-INTERLEAVED packed nibble buffer + ONE row-interleaved packed f16-scale
+    /// buffer (physical row 2d = whole gate row d, 2d+1 = whole up row d) consumed by
+    /// `qmv_q4_0_gate_up_swiglu_ls_h2math`. Built when the LS pipeline compiled; any
+    /// None => fall back to the h2math/default path for that layer. Byte-identical to
+    /// the h2math dual kernel.
+    pub(crate) qmv_ffn_gate_up_ls_qw: Vec<Option<MetalBuffer>>,
+    pub(crate) qmv_ffn_gate_up_ls_scales: Vec<Option<MetalBuffer>>,
     /// Persistent all-zero f32 buffer (length >= hidden_dim) used as the `residual`
     /// argument when `qmv_q4_0_residual` services the Q+gate-fusion Wo path, which is
     /// mathematically NON-residual (the residual is added downstream by `residual_add_copy`).

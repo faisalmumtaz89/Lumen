@@ -1716,8 +1716,8 @@ fn test_moe_expert_accum_option_a_correctness() {
     // Slot 1 (selected expert): all 6.0
     let mut expert_outputs = vec![0.0f32; top_k * hidden_dim];
     for t in 0..hidden_dim {
-        expert_outputs[0 * hidden_dim + t] = 3.0;
-        expert_outputs[1 * hidden_dim + t] = 6.0;
+        expert_outputs[t] = 3.0; // slot 0
+        expert_outputs[hidden_dim + t] = 6.0; // slot 1
     }
     let expert_weights = vec![0.7f32, 0.3];
     let residual = vec![1.0f32; hidden_dim];

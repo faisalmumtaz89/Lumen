@@ -354,11 +354,13 @@ impl MetalF32Backend {
             if decode_profile::is_enabled() {
                 enc.end_encoding();
                 cmd.commit_and_wait();
+                let g = cmd.gpu_elapsed_secs();
                 let lbl = if meta.gdn_layer_idx.is_some() {
                     "gdn_attn"
                 } else {
                     "full_attn"
                 };
+                decode_profile::record_gpu(g, lbl);
                 decode_profile::record_and_advance(lbl);
                 cmd = self.queue.new_command_buffer().ok_or_else(|| {
                     RuntimeError::Compute("decode-profile: failed to create CB".into())
@@ -430,7 +432,7 @@ impl MetalF32Backend {
                             enc.set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2)
                         }
                         QuantScheme::Bf16 => {
-                            enc.set_pipeline_state(&pipelines.rmsnorm_matmul_bf16_deferred_nr2)
+                            enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
                         }
                         _ => unreachable!(),
                     }
@@ -462,6 +464,24 @@ impl MetalF32Backend {
                         enc.memory_barrier_with_scope(1);
                     }
                 }
+
+                // Full-attention bookend elision. When engaged, the
+                // deinterleave/norm/assemble + rope + kv-write bookend collapses to
+                // a single `deinterleave_norm_rope_kvwrite` dispatch (six dispatches
+                // eliminated per full-attn layer). Only the Qwen3.5 Q+gate-fusion
+                // NeoX partial-RoPE shape is byte-identical under the fold; anything
+                // else (full RoPE fused path, linear-attn, non-NeoX, missing norms,
+                // or any diagnostic fa_skip bit set) keeps the incumbent path.
+                let is_linear_attn_be = meta.layer_type == Some(1);
+                let use_fused_rope_kv_be = !is_linear_attn_be && s.rotary_dim == head_dim;
+                let bookend_elided = fa_skip == 0
+                    && meta.has_qgate_fusion
+                    && !is_linear_attn_be
+                    && s.rope_neox
+                    && !use_fused_rope_kv_be
+                    && meta.attn_q_norm_off.is_some()
+                    && meta.attn_k_norm_off.is_some()
+                    && pipelines.deinterleave_norm_rope_kvwrite.is_some();
 
                 // QKV projection: two paths depending on Q+gate fusion.
                 if meta.has_qgate_fusion {
@@ -557,9 +577,9 @@ impl MetalF32Backend {
                                     QuantScheme::F16 => enc.set_pipeline_state(
                                         &pipelines.rmsnorm_matmul_f16_deferred_nr2,
                                     ),
-                                    QuantScheme::Bf16 => enc.set_pipeline_state(
-                                        &pipelines.rmsnorm_matmul_bf16_deferred_nr2,
-                                    ),
+                                    QuantScheme::Bf16 => {
+                                        enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
+                                    }
                                     _ => enc.set_pipeline_state(
                                         &pipelines.rmsnorm_dequant_matmul_q8_0_deferred_nr2,
                                     ),
@@ -590,7 +610,7 @@ impl MetalF32Backend {
                                         128u64
                                     }
                                     QuantScheme::Bf16 => {
-                                        enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                                        enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                                         128u64
                                     }
                                     _ => {
@@ -673,9 +693,9 @@ impl MetalF32Backend {
                                 ),
                                 QuantScheme::F16 => enc
                                     .set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2),
-                                QuantScheme::Bf16 => enc.set_pipeline_state(
-                                    &pipelines.rmsnorm_matmul_bf16_deferred_nr2,
-                                ),
+                                QuantScheme::Bf16 => {
+                                    enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
+                                }
                                 _ => enc.set_pipeline_state(
                                     &pipelines.rmsnorm_dequant_matmul_q8_0_deferred_nr2,
                                 ),
@@ -710,7 +730,7 @@ impl MetalF32Backend {
                                     128u64
                                 }
                                 QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                                     128u64
                                 }
                                 _ => {
@@ -792,9 +812,9 @@ impl MetalF32Backend {
                                 ),
                                 QuantScheme::F16 => enc
                                     .set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2),
-                                QuantScheme::Bf16 => enc.set_pipeline_state(
-                                    &pipelines.rmsnorm_matmul_bf16_deferred_nr2,
-                                ),
+                                QuantScheme::Bf16 => {
+                                    enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
+                                }
                                 _ => enc.set_pipeline_state(
                                     &pipelines.rmsnorm_dequant_matmul_q8_0_deferred_nr2,
                                 ),
@@ -829,7 +849,7 @@ impl MetalF32Backend {
                                     128u64
                                 }
                                 QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                                     128u64
                                 }
                                 _ => {
@@ -888,6 +908,45 @@ impl MetalF32Backend {
 
                     if fa_skip & FULLATTN_SKIP_DNA != 0 {
                         // diagnostic: skip deinterleave/norm/assemble (corrupts output)
+                    } else if bookend_elided {
+                        // Bookend elision: one dispatch does deinterleave +
+                        // per-head Q/K RMSNorm + NeoX partial rope + direct K/V cache
+                        // write. Eliminates copy_buffer x3 + rope_neox x2 +
+                        // write_kv_cache (folded below). Q lands in q_buf; SDPA reads
+                        // it directly. Byte-identical: all-f32 intermediates, same
+                        // arithmetic order, same half() cache cast.
+                        let pso = pipelines.deinterleave_norm_rope_kvwrite.as_ref().unwrap();
+                        let q_norm_off = meta.attn_q_norm_off.unwrap();
+                        let k_norm_off = meta.attn_k_norm_off.unwrap();
+                        let rope_half_dim = s.rotary_dim / 2;
+                        let pos_offset_u32 = (seq_pos * rope_half_dim) as u32;
+                        enc.set_pipeline_state(pso);
+                        enc.set_buffer(&s.qkv_buf, 0, 0); // qgate_interleaved (Q|gate)
+                        enc.set_buffer(&s.k_buf, 0, 1); // k_data (normed in-place)
+                        enc.set_buffer(&s.v_buf, 0, 2); // v_data
+                        enc.set_buffer(layer_buf, q_norm_off, 3); // q_norm_w
+                        enc.set_buffer(layer_buf, k_norm_off, 4); // k_norm_w
+                        enc.set_buffer(&s.rope_cos_buf, 0, 5);
+                        enc.set_buffer(&s.rope_sin_buf, 0, 6);
+                        enc.set_buffer(&s.gate_buf, 0, 7); // gate_out
+                        enc.set_buffer(&s.q_buf, 0, 8); // q_out (normed+roped Q)
+                        enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 9);
+                        enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 10);
+                        enc.set_bytes(&(num_heads as u32).to_le_bytes(), 11);
+                        enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 12);
+                        enc.set_bytes(&(head_dim as u32).to_le_bytes(), 13);
+                        enc.set_bytes(&(rope_half_dim as u32).to_le_bytes(), 14);
+                        enc.set_bytes(&pos_offset_u32.to_le_bytes(), 15);
+                        enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 16);
+                        enc.set_bytes(&(seq_pos as u32).to_le_bytes(), 17);
+                        enc.set_bytes(&(s.max_seq_len as u32).to_le_bytes(), 18);
+                        enc.set_bytes(&eps.to_le_bytes(), 19);
+                        let total_tgs = (num_heads + num_kv_heads) as u64;
+                        let tg_threads = 256u64.min(head_dim as u64).max(32);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(total_tgs, 1, 1),
+                            MTLSize::new(tg_threads, 1, 1),
+                        );
                     } else if use_fused_dna {
                         let pso = pipelines.deinterleave_norm_assemble.as_ref().unwrap();
                         let q_norm_off = meta.attn_q_norm_off.unwrap();
@@ -1070,7 +1129,7 @@ impl MetalF32Backend {
                                     enc.set_pipeline_state(&pipelines.matmul_f16_deferred_bias_nr2)
                                 }
                                 QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_bias_nr2)
+                                    enc.set_pipeline_state(pipelines.bf16_matvec_bias_nr2())
                                 }
                                 _ => unreachable!(),
                             };
@@ -1094,7 +1153,7 @@ impl MetalF32Backend {
                                     128u64
                                 }
                                 QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                                     128u64
                                 }
                                 _ => {
@@ -1256,7 +1315,11 @@ impl MetalF32Backend {
                     let is_linear_attn = meta.layer_type == Some(1);
                     let rope_half_dim = s.rotary_dim / 2;
                     let use_fused_rope_kv = !is_linear_attn && s.rotary_dim == head_dim;
-                    if fa_skip & FULLATTN_SKIP_ROPE_KV != 0 {
+                    if bookend_elided {
+                        // Bookend elision: RoPE Q/K + KV-cache write already
+                        // performed inside the fused deinterleave_norm_rope_kvwrite
+                        // dispatch above; nothing to do here.
+                    } else if fa_skip & FULLATTN_SKIP_ROPE_KV != 0 {
                         // diagnostic: skip RoPE + KV-cache write (corrupts output)
                     } else if use_fused_rope_kv {
                         let pos_offset_u32 = (seq_pos * rope_half_dim) as u32;
@@ -1346,6 +1409,14 @@ impl MetalF32Backend {
                     }
                     // Attention (flash decode or MHA)
                     if fa_skip & FULLATTN_SKIP_ATTN == 0 {
+                        // Bookend elision: the fused kernel wrote normed+roped
+                        // Q to q_buf (byte-identical to the incumbent roped qkv_buf[Q]),
+                        // so attention reads Q from q_buf. Otherwise read qkv_buf[Q].
+                        let (q_attn_buf, q_attn_off) = if bookend_elided {
+                            (&s.q_buf, 0u64)
+                        } else {
+                            (&s.qkv_buf, q_byte_off)
+                        };
                         let num_heads_u32 = num_heads as u32;
                         let num_kv_heads_u32 = num_kv_heads as u32;
                         let head_dim_u32 = head_dim as u32;
@@ -1353,13 +1424,19 @@ impl MetalF32Backend {
                         let seq_len_u32 = new_seq_len as u32;
                         let max_seq_len_u32 = s.max_seq_len as u32;
                         const FLASH_DECODE_TILE_SIZE: u32 = 256;
-                        const FLASH_DECODE_THRESHOLD: usize = FLASH_DECODE_TILE_SIZE as usize + 1; // 257: single-tile is a no-op reduce
+                        // Flash decode engages only at K >= 513 (two full tiles). For K in
+                        // [257, 512] the 2-tile flash path spills the 1..256 keys of the
+                        // second tile into a near-empty tile plus a separate reduce dispatch,
+                        // which is slower than -- and byte-identical to -- the exact
+                        // single-dispatch multi_head_attention over the same keys. So
+                        // single-tile MHA serves K <= 512 and flash takes over at K >= 513.
+                        let flash_decode_threshold: usize = FLASH_DECODE_TILE_SIZE as usize * 2 + 1; // 513
 
-                        if new_seq_len >= FLASH_DECODE_THRESHOLD {
+                        if new_seq_len >= flash_decode_threshold {
                             let num_tiles = ((new_seq_len as u32) + FLASH_DECODE_TILE_SIZE - 1)
                                 / FLASH_DECODE_TILE_SIZE;
                             enc.set_pipeline_state(&pipelines.flash_decode_attention);
-                            enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
+                            enc.set_buffer(q_attn_buf, q_attn_off, 0);
                             enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 1);
                             enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 2);
                             enc.set_buffer(&s.flash_decode_partial_buf, 0, 3);
@@ -1394,7 +1471,7 @@ impl MetalF32Backend {
                         } else {
                             let mha_tg_size = s.mha_tg_size;
                             enc.set_pipeline_state(&pipelines.multi_head_attention);
-                            enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
+                            enc.set_buffer(q_attn_buf, q_attn_off, 0);
                             enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 1);
                             enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 2);
                             enc.set_buffer(&s.attn_out_buf, 0, 3);
@@ -1425,8 +1502,23 @@ impl MetalF32Backend {
                     || meta.attn_gate_off.is_some()
                     || meta.has_qgate_fusion;
                 if has_attn_extras {
+                    // Glue-side elision: fold sigmoid_mul + Wo qmv + residual_add_copy
+                    // into `qmv_q4_0_wo_glue`. Engages ONLY on the Qwen3.5 full-attn
+                    // f32-scale Q4_0 qmv-Wo path with Q+gate fusion and NO separate
+                    // attn_gate (so the residual sits immediately after Wo); the
+                    // f32-scale path is required (the f16sc Wo path keeps the three
+                    // separate dispatches). All other paths keep them too.
+                    let glue_fold = meta.has_qgate_fusion
+                        && meta.attn_gate_off.is_none()
+                        && meta.wo_quant == QuantScheme::Q4_0
+                        && !super::q4_fullattn_f16sc_enabled()
+                        && pipelines.qmv_q4_0_wo_glue.is_some()
+                        && matches!(s.qmv_attn_wo_qw.get(layer_idx), Some(Some(_)))
+                        && matches!(s.qmv_attn_wo_scales.get(layer_idx), Some(Some(_)))
+                        && (fa_skip & FULLATTN_SKIP_WO == 0);
                     // Apply sigmoid(gate) * attn_out BEFORE Wo (Q+gate fusion).
-                    if meta.has_qgate_fusion {
+                    // SKIPPED when glue_fold: the folded Wo kernel applies the gate.
+                    if meta.has_qgate_fusion && !glue_fold {
                         let pso = pipelines.sigmoid_mul_fused.as_ref().ok_or_else(|| {
                             RuntimeError::Compute("sigmoid_mul_fused pipeline not compiled".into())
                         })?;
@@ -1467,7 +1559,31 @@ impl MetalF32Backend {
                         } else {
                             None
                         };
-                        if let Some((qw, sc, zero)) = qmv_wo {
+                        if glue_fold {
+                            // Glue-side elision: one dispatch folds the
+                            // sigmoid gate (on attn_out), the Wo matvec, the residual
+                            // add (x_buf), and the dual-write (x_buf + attn_proj).
+                            // Bindings: w@0, x=attn_out@1, accum=x_buf@2, in_dim@3,
+                            // scales@4, copy_dst=attn_proj@5, gate=gate_buf@6.
+                            // gate_fold guaranteed qmv_wo Some + glue pipeline Some.
+                            let (qw, sc, _zero) = qmv_wo.expect("glue_fold implies qmv_wo");
+                            let glue_pso = pipelines
+                                .qmv_q4_0_wo_glue
+                                .as_ref()
+                                .expect("glue_fold implies qmv_q4_0_wo_glue compiled");
+                            enc.set_pipeline_state(glue_pso);
+                            enc.set_buffer(qw, 0, 0);
+                            enc.set_buffer(&s.attn_out_buf, 0, 1);
+                            enc.set_buffer(&s.x_buf, 0, 2); // accum = residual src + write
+                            enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
+                            enc.set_buffer(sc, 0, 4);
+                            enc.set_buffer(&s.attn_proj_buf, 0, 5); // copy_dst
+                            enc.set_buffer(&s.gate_buf, 0, 6);
+                            enc.dispatch_threadgroups(
+                                MTLSize::new((hidden_dim as u64) / 8, 1, 1),
+                                MTLSize::new(64, 1, 1),
+                            );
+                        } else if let Some((qw, sc, zero)) = qmv_wo {
                             // qmv_q4_0_residual: w@0, x@1, out@2, in_dim@3, scales@4,
                             // residual@5. in = q_dim (%512); out = hidden_dim (%8).
                             // F16-scales full-attn Wo (LUMEN_METAL_Q4_FULLATTN_F16SC=1): when its
@@ -1510,7 +1626,7 @@ impl MetalF32Backend {
                                     128u64
                                 }
                                 QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                                     128u64
                                 }
                                 _ => {
@@ -1605,7 +1721,7 @@ impl MetalF32Backend {
                                     128u64
                                 }
                                 QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                                     128u64
                                 }
                                 _ => {
@@ -1703,7 +1819,10 @@ impl MetalF32Backend {
                     } else {
                         // No attn_gate: fused residual + copy
                         // x_buf += attn_proj_buf; attn_proj_buf = x_buf
-                        {
+                        // Glue-side elision: SKIPPED when glue_fold — the
+                        // folded qmv_q4_0_wo_glue already did x_buf += Wo_out and
+                        // attn_proj = x_buf (dual-write) in the Wo dispatch.
+                        if !glue_fold {
                             let pso = pipelines
                                 .residual_add_copy
                                 .as_ref()
@@ -1803,9 +1922,7 @@ impl MetalF32Backend {
                                 128u64
                             }
                             QuantScheme::Bf16 => {
-                                enc.set_pipeline_state(
-                                    &pipelines.matmul_bf16_deferred_residual_nr2,
-                                );
+                                enc.set_pipeline_state(pipelines.bf16_matvec_residual_nr2());
                                 128u64
                             }
                             _ => {
@@ -1875,11 +1992,13 @@ impl MetalF32Backend {
             if decode_profile::is_enabled() {
                 enc.end_encoding();
                 cmd.commit_and_wait();
+                let g = cmd.gpu_elapsed_secs();
                 let ffn_lbl = if meta.moe_meta.is_some() {
                     "moe_ffn"
                 } else {
                     "dense_ffn"
                 };
+                decode_profile::record_gpu(g, ffn_lbl);
                 decode_profile::record_and_advance(ffn_lbl);
                 cmd = self.queue.new_command_buffer().ok_or_else(|| {
                     RuntimeError::Compute("decode-profile: failed to create CB".into())
@@ -2144,6 +2263,22 @@ impl MetalF32Backend {
                             // buffer (gate|up woven per 512-value super-iter) and writes
                             // gate_buf = SwiGLU(gate,up) directly, exactly like the
                             // f16sc path. Byte-identical math. Indexed by layer_idx.
+                            // LM-head-structure (LS) single-stream gate+up: takes
+                            // priority when the LS pipeline compiled AND the LS
+                            // row-interleaved buffers were built for this layer.
+                            // Reads ONE weight stream per simdgroup row from a
+                            // row-interleaved gate|up buffer (row 2d=gate[d],
+                            // 2d+1=up[d]) at 2*inter_dim/8 TGs and writes
+                            // gate_buf = SwiGLU(gate,up). Byte-identical to the
+                            // h2math dual kernel. Indexed by layer_idx.
+                            let ls_bufs = match (
+                                pipelines.qmv_q4_0_gate_up_swiglu_ls_h2math.as_ref(),
+                                s.qmv_ffn_gate_up_ls_qw.get(layer_idx),
+                                s.qmv_ffn_gate_up_ls_scales.get(layer_idx),
+                            ) {
+                                (Some(pso), Some(Some(qw)), Some(Some(sc))) => Some((pso, qw, sc)),
+                                _ => None,
+                            };
                             let il_bufs = if super::q4_gateup_il_enabled() {
                                 match (
                                     pipelines.qmv_q4_0_gate_up_swiglu_il.as_ref(),
@@ -2158,7 +2293,23 @@ impl MetalF32Backend {
                             } else {
                                 None
                             };
-                            if let Some((pso_il, il_qw, il_sc)) = il_bufs {
+                            if let Some((pso_ls, ls_qw, ls_sc)) = ls_bufs {
+                                // qmv_q4_0_gate_up_swiglu_ls_h2math: w_ls@0, x@1,
+                                // out@2, in_dim@3, ls_scales@4, norm_w@5, eps@6.
+                                // Grid = 2*inter_dim/8 TGs, 64 threads.
+                                enc.set_pipeline_state(pso_ls);
+                                enc.set_buffer(ls_qw, 0, 0);
+                                enc.set_buffer(&s.attn_proj_buf, 0, 1);
+                                enc.set_buffer(&s.gate_buf, 0, 2);
+                                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                                enc.set_buffer(ls_sc, 0, 4);
+                                enc.set_buffer(layer_buf, ffn_norm_off, 5);
+                                enc.set_bytes(&eps.to_le_bytes(), 6);
+                                enc.dispatch_threadgroups(
+                                    MTLSize::new((inter_dim as u64) * 2 / 8, 1, 1),
+                                    MTLSize::new(64, 1, 1),
+                                );
+                            } else if let Some((pso_il, il_qw, il_sc)) = il_bufs {
                                 // qmv_q4_0_gate_up_swiglu_il: w_il@0, x@1, out@2,
                                 // in_dim@3, scales_il@4, norm_w@5, eps@6.
                                 // out_dim = inter_dim (%8==0); in_dim = hidden (%512==0).
@@ -2585,7 +2736,7 @@ impl MetalF32Backend {
                     // BF16 unfused: gate matvec + up matvec + SwiGLU (no fused BF16 kernel)
                     // Mirrors the F32 fallback path but uses matmul_bf16_deferred_nr2.
                     // Gate: gate_buf = W_gate * normed_buf
-                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                     enc.set_buffer(layer_buf, w_gate_off, 0);
                     enc.set_buffer(&s.normed_buf, 0, 1);
                     enc.set_buffer(&s.gate_buf, 0, 2);
@@ -2760,9 +2911,7 @@ impl MetalF32Backend {
                                 128u64
                             }
                             QuantScheme::Bf16 => {
-                                enc.set_pipeline_state(
-                                    &pipelines.matmul_bf16_deferred_residual_nr2,
-                                );
+                                enc.set_pipeline_state(pipelines.bf16_matvec_residual_nr2());
                                 128u64
                             }
                             _ => {
@@ -2810,6 +2959,8 @@ impl MetalF32Backend {
         if decode_profile::is_enabled() {
             enc.end_encoding();
             cmd.commit_and_wait();
+            let g = cmd.gpu_elapsed_secs();
+            decode_profile::record_gpu(g, "lm_head");
             decode_profile::record_and_advance("lm_head");
             cmd = self.queue.new_command_buffer().ok_or_else(|| {
                 RuntimeError::Compute("decode-profile: failed to create CB".into())
@@ -2900,7 +3051,7 @@ impl MetalF32Backend {
                         enc.set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2)
                     }
                     QuantScheme::Bf16 => {
-                        enc.set_pipeline_state(&pipelines.rmsnorm_matmul_bf16_deferred_nr2)
+                        enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
                     }
                     _ => {
                         enc.set_pipeline_state(&pipelines.rmsnorm_dequant_matmul_q8_0_deferred_nr2)
@@ -2941,7 +3092,7 @@ impl MetalF32Backend {
                     (128u64, 2u64)
                 }
                 QuantScheme::Bf16 => {
-                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                     (128u64, 2u64)
                 }
                 _ => {
@@ -3006,14 +3157,42 @@ impl MetalF32Backend {
             enc.set_buffer(&s.gpu_sampler_rng_ring[sw.rng_write_slot], 0, 10);
             enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         } else {
-            enc.set_pipeline_state(&pipelines.argmax);
+            // Two-pass tiled argmax for greedy decode. Pass-1: N threadgroups each
+            // reduce a contiguous logits slice to a (max_val, arg_idx) partial (fills
+            // the machine — a single-threadgroup argmax is bandwidth-starved at
+            // ~2.9 GB/s over the vocab logits). Pass-2: one 256-thread TG reduces the
+            // <=256 partials to the token id. Bit-identical selection to the
+            // single-threadgroup argmax for every input (composite (value, i%256, i)
+            // tie-break; see ffn_elementwise.msl). Writes the SAME output buffer + u32
+            // format, so the device-side next-token embed is unchanged.
+            let num_tiles = super::TILED_ARGMAX_TILES as u64;
+            let tile_size = ((vocab_size as u64) + num_tiles - 1) / num_tiles;
+            let actual_tiles = ((vocab_size as u64) + tile_size - 1) / tile_size;
+            let idx_off = (super::ARGMAX_MAX_TILES * 4) as u64;
+            // Pass-1: per-tile partials into argmax_partials_buf (vals@0, idxs@idx_off).
+            enc.set_pipeline_state(&pipelines.argmax_tiled_partial);
             enc.set_buffer(&s.logits_buf, 0, 0);
-            if let Some(ref w) = pipe {
-                enc.set_buffer(&s.pipe_token_ring[w.argmax_write_slot], 0, 1);
-            } else {
-                enc.set_buffer(&s.argmax_result_buf, 0, 1);
+            enc.set_buffer(&s.argmax_partials_buf, 0, 1);
+            enc.set_buffer(&s.argmax_partials_buf, idx_off, 2);
+            enc.set_bytes(&(vocab_size as u32).to_le_bytes(), 3);
+            enc.set_bytes(&(tile_size as u32).to_le_bytes(), 4);
+            enc.dispatch_threadgroups(MTLSize::new(actual_tiles, 1, 1), MTLSize::new(256, 1, 1));
+            // Barrier: pass-1 writes the partials, pass-2 reads them. The serial
+            // encoder (has_gdn/all_dense) already orders dispatches; the concurrent
+            // encoder needs the explicit barrier (mirrors the projection->argmax edge).
+            if needs_barriers {
+                enc.memory_barrier_with_scope(1);
             }
-            enc.set_bytes(&(vocab_size as u32).to_le_bytes(), 2);
+            // Pass-2: reduce partials to the token id in the argmax output buffer.
+            enc.set_pipeline_state(&pipelines.argmax_tiled_reduce);
+            enc.set_buffer(&s.argmax_partials_buf, 0, 0);
+            enc.set_buffer(&s.argmax_partials_buf, idx_off, 1);
+            if let Some(ref w) = pipe {
+                enc.set_buffer(&s.pipe_token_ring[w.argmax_write_slot], 0, 2);
+            } else {
+                enc.set_buffer(&s.argmax_result_buf, 0, 2);
+            }
+            enc.set_bytes(&(actual_tiles as u32).to_le_bytes(), 3);
             enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         }
 
@@ -3050,6 +3229,7 @@ impl MetalF32Backend {
         // [decode-profile] Record the final lm_head section and print a report
         // every 64 tokens (cheap; only when LUMEN_METAL_DECODE_PROFILE=1).
         if decode_profile::is_enabled() {
+            decode_profile::record_gpu_final(cmd.gpu_elapsed_secs());
             decode_profile::record_final();
             decode_profile::maybe_report_and_reset(64);
         }

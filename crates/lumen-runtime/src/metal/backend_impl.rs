@@ -275,6 +275,9 @@ impl ComputeBackend for MetalF32Backend {
             argmax_result_buf: self.device.new_buffer(4).ok_or_else(|| {
                 RuntimeError::Compute("Failed to allocate argmax result buffer (4 bytes)".into())
             })?,
+            // Two-pass tiled-argmax partials scratch:
+            // [ARGMAX_MAX_TILES] f32 vals + [ARGMAX_MAX_TILES] u32 idxs = 2*MAX*4 B.
+            argmax_partials_buf: make_buf(2 * super::ARGMAX_MAX_TILES)?,
             // Pipelined greedy decode state (lazily set up on first pipelined
             // call; empty/unused in the default sequential path).
             pipe_token_ring: Vec::new(),
@@ -516,6 +519,8 @@ impl ComputeBackend for MetalF32Backend {
             qmv_ffn_up_scales: Vec::new(),
             qmv_ffn_gate_up_il_qw: Vec::new(),
             qmv_ffn_gate_up_il_scales: Vec::new(),
+            qmv_ffn_gate_up_ls_qw: Vec::new(),
+            qmv_ffn_gate_up_ls_scales: Vec::new(),
             qmv_zero_residual_buf: None,
             // GLOBAL Q4 lm_head decode-qmv buffers. None until
             // `preload_weights_gpu_resident` builds them when
@@ -964,7 +969,7 @@ impl ComputeBackend for MetalF32Backend {
                             128u64
                         }
                         QuantScheme::Bf16 => {
-                            enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                            enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                             128u64
                         }
                         _ => {
@@ -1037,7 +1042,7 @@ impl ComputeBackend for MetalF32Backend {
                             128u64
                         }
                         QuantScheme::Bf16 => {
-                            enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                            enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                             128u64
                         }
                         _ => {
@@ -1089,7 +1094,7 @@ impl ComputeBackend for MetalF32Backend {
                             128u64
                         }
                         QuantScheme::Bf16 => {
-                            enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                            enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                             128u64
                         }
                         _ => {
@@ -1224,7 +1229,7 @@ impl ComputeBackend for MetalF32Backend {
                                 enc.set_pipeline_state(&pipelines.matmul_f16_deferred_bias_nr2)
                             }
                             QuantScheme::Bf16 => {
-                                enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_bias_nr2)
+                                enc.set_pipeline_state(pipelines.bf16_matvec_bias_nr2())
                             }
                             _ => unreachable!(),
                         };
@@ -1244,7 +1249,7 @@ impl ComputeBackend for MetalF32Backend {
                                 128u64
                             }
                             QuantScheme::Bf16 => {
-                                enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                                enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                                 128u64
                             }
                             _ => {
@@ -1591,7 +1596,7 @@ impl ComputeBackend for MetalF32Backend {
                         128u64
                     }
                     QuantScheme::Bf16 => {
-                        enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_residual_nr2);
+                        enc.set_pipeline_state(pipelines.bf16_matvec_residual_nr2());
                         128u64
                     }
                     _ => {
@@ -2722,7 +2727,7 @@ impl ComputeBackend for MetalF32Backend {
                         128u64
                     }
                     QuantScheme::Bf16 => {
-                        enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_residual_nr2);
+                        enc.set_pipeline_state(pipelines.bf16_matvec_residual_nr2());
                         128u64
                     }
                     _ => {
@@ -2974,7 +2979,7 @@ impl ComputeBackend for MetalF32Backend {
                     (128u64, 2u64)
                 }
                 QuantScheme::Bf16 => {
-                    enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
+                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
                     (128u64, 2u64)
                 }
                 _ => {

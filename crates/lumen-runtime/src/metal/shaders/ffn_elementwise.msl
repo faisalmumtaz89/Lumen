@@ -674,6 +674,130 @@ kernel void argmax(
 }
 
 // ============================================================================
+// argmax_tiled_partial / argmax_tiled_reduce: two-pass GPU argmax that FILLS
+// THE MACHINE (N threadgroups over contiguous slices), replacing the single-TG
+// `argmax` above which streams all `n` logits through one of 80 cores (~2.9 GB/s,
+// bandwidth-STARVED). Selected by the Rust greedy-decode dispatch.
+//
+// EXACTNESS (hard requirement): the selected token is BIT-IDENTICAL to the
+// single-TG `argmax` for EVERY input, including exact ties, +/-Inf, NaN, and the
+// all-(-Inf) case. The single-TG kernel's effective selection — derived from its
+// 256-wide stride + strict `>` in the per-thread scan, the simd_shuffle_down
+// reduction (lower lane wins on tie) and the serial cross-simdgroup scan (lower
+// group wins on tie) — is exactly:
+//     winner = argmin, over { i : logits[i] == globalmax }, of the key (i % 256, i)
+// i.e. among all indices holding the maximum value, the one whose (index mod 256)
+// is smallest, breaking further ties by smallest index. Both passes below compare
+// with that SAME strict total order via `argmax_tiled_beats` (value DESC, then
+// (i & 255) ASC, then i ASC). Because that order is a pure function of the index,
+// the global winner is INDEPENDENT of how the logits are tiled/strided, so the
+// two-pass result equals the single-TG result on every input. NaN never wins
+// (both `>` and `==` are false for NaN, exactly as the single-TG `>` does); when
+// nothing beats the -INFINITY sentinel (all -Inf / all NaN) the result is 0,
+// matching the single-TG kernel's untouched `max_idx = 0`.
+//
+// tile_size = ceil(n / num_tiles); TG g owns [g*tile_size, min((g+1)*tile_size, n)).
+// ============================================================================
+
+// Strict composite tie-break: does candidate (vb, ib) beat the current (va, ia)?
+inline bool argmax_tiled_beats(float vb, uint ib, float va, uint ia) {
+    if (vb > va) return true;
+    if (vb == va) {
+        uint rb = ib & 255u;
+        uint ra = ia & 255u;
+        if (rb < ra) return true;
+        if (rb == ra && ib < ia) return true;
+    }
+    return false;
+}
+
+kernel void argmax_tiled_partial(
+    device const float* logits    [[buffer(0)]],
+    device float*       part_val  [[buffer(1)]],
+    device uint*        part_idx  [[buffer(2)]],
+    constant uint&      n         [[buffer(3)]],
+    constant uint&      tile_size [[buffer(4)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint tid        [[thread_index_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    uint start = tgid * tile_size;
+    uint end   = min(start + tile_size, n);
+
+    // Per-thread strided scan over this tile's contiguous slice.
+    float max_val = -INFINITY;
+    uint  max_idx = 0;
+    for (uint i = start + tid; i < end; i += 256) {
+        float v = logits[i];
+        if (argmax_tiled_beats(v, i, max_val, max_idx)) { max_val = v; max_idx = i; }
+    }
+
+    // SIMD reduction (32-wide) with the composite comparator.
+    for (uint offset = 16; offset > 0; offset >>= 1) {
+        float ov = simd_shuffle_down(max_val, offset);
+        uint  oi = simd_shuffle_down(max_idx, offset);
+        if (argmax_tiled_beats(ov, oi, max_val, max_idx)) { max_val = ov; max_idx = oi; }
+    }
+
+    // Cross-simdgroup reduction via threadgroup memory.
+    threadgroup float tg_vals[8];
+    threadgroup uint  tg_idxs[8];
+    if (simd_lane == 0) { tg_vals[simd_group] = max_val; tg_idxs[simd_group] = max_idx; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float bv = tg_vals[0];
+        uint  bi = tg_idxs[0];
+        for (uint i = 1; i < 8; i++) {
+            if (argmax_tiled_beats(tg_vals[i], tg_idxs[i], bv, bi)) { bv = tg_vals[i]; bi = tg_idxs[i]; }
+        }
+        part_val[tgid] = bv;
+        part_idx[tgid] = bi;
+    }
+}
+
+kernel void argmax_tiled_reduce(
+    device const float* part_val  [[buffer(0)]],
+    device const uint*  part_idx  [[buffer(1)]],
+    device uint*        result    [[buffer(2)]],
+    constant uint&      num_tiles [[buffer(3)]],
+    uint tid        [[thread_index_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    // Reduce the <=256 pass-1 partials (part_idx holds GLOBAL indices, so the
+    // (i & 255) residue key is the true logit residue — same total order as pass-1).
+    float max_val = -INFINITY;
+    uint  max_idx = 0;
+    for (uint i = tid; i < num_tiles; i += 256) {
+        float v   = part_val[i];
+        uint  idx = part_idx[i];
+        if (argmax_tiled_beats(v, idx, max_val, max_idx)) { max_val = v; max_idx = idx; }
+    }
+
+    for (uint offset = 16; offset > 0; offset >>= 1) {
+        float ov = simd_shuffle_down(max_val, offset);
+        uint  oi = simd_shuffle_down(max_idx, offset);
+        if (argmax_tiled_beats(ov, oi, max_val, max_idx)) { max_val = ov; max_idx = oi; }
+    }
+
+    threadgroup float tg_vals[8];
+    threadgroup uint  tg_idxs[8];
+    if (simd_lane == 0) { tg_vals[simd_group] = max_val; tg_idxs[simd_group] = max_idx; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float bv = tg_vals[0];
+        uint  bi = tg_idxs[0];
+        for (uint i = 1; i < 8; i++) {
+            if (argmax_tiled_beats(tg_vals[i], tg_idxs[i], bv, bi)) { bv = tg_vals[i]; bi = tg_idxs[i]; }
+        }
+        result[0] = bi;
+    }
+}
+
+// ============================================================================
 // gpu_sampler: GPU-side temperature sampling with PARITY to the CPU sampler.
 //
 // Reproduces, BIT-FOR-BIT where the platform allows, the CPU reference

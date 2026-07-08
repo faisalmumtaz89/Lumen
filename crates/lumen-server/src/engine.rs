@@ -2366,6 +2366,9 @@ mod panic_supervisor_tests {
         // Simulate the cudarc panic shape: `Result::unwrap` on `Err`
         // formats via `Debug`, so the payload is a `String`.
         let err: Result<(), String> = Err("DriverError(CUDA_ERROR_OUT_OF_MEMORY)".into());
+        // The "unnecessary" unwrap-on-Err IS the test subject: it must produce
+        // the exact `Result::unwrap` panic payload shape that cudarc throws.
+        #[allow(clippy::unnecessary_literal_unwrap)]
         let res = panic::catch_unwind(|| err.unwrap());
         let payload = res.unwrap_err();
         let msg = panic_payload_message(payload.as_ref());
@@ -2378,12 +2381,13 @@ mod panic_supervisor_tests {
     #[test]
     fn panic_window_constants_are_sane() {
         // Guard against accidental zeroing during a refactor — these
-        // values determine production recovery semantics.
-        assert!(
+        // values determine production recovery semantics. Checked as
+        // compile-time const assertions (the values are constants).
+        const _: () = assert!(
             DEFAULT_PANIC_WINDOW_SECS >= 1,
             "DEFAULT_PANIC_WINDOW_SECS must be > 0"
         );
-        assert!(
+        const _: () = assert!(
             DEFAULT_MAX_PANICS_IN_WINDOW >= 1,
             "DEFAULT_MAX_PANICS_IN_WINDOW must be >= 1"
         );

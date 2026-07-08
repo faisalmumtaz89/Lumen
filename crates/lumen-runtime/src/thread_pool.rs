@@ -461,11 +461,39 @@ impl ThreadPool {
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        // Signal shutdown and wake all workers.
-        self.shared.shutdown.store(true, Ordering::Release);
-        // Bump the atomic generation so spinning workers break out of spin loop.
-        self.shared.generation.fetch_add(1, Ordering::Release);
-        // Wake workers that fell through to condvar sleep.
+        // Signal shutdown. This store MUST happen while holding the `work` mutex.
+        //
+        // A parked worker sits in a check-then-wait critical section that holds
+        // this same mutex:
+        //     let mut work = work.lock();
+        //     loop {
+        //         if shutdown { return; }
+        //         if work.generation > last_generation { break; }
+        //         work = work_ready.wait(work);   // releases the lock while parked
+        //     }
+        // If `shutdown` were set (and `notify_all` fired) WITHOUT the mutex, the
+        // store could land in the tiny window after a worker evaluated the predicate
+        // (saw `shutdown == false`) but before it called `wait()`. The worker would
+        // then park *after* the notification was already delivered and sleep
+        // forever, hanging the `join()` below. Because `shutdown` is the ONLY
+        // predicate that releases a parked worker on teardown (`work.generation` is
+        // never advanced here), that lost wakeup is unrecoverable. Taking the mutex
+        // around the store makes the flag change mutually exclusive with the
+        // worker's check-then-wait, closing the window.
+        {
+            let _work = self.shared.work.lock().unwrap();
+            self.shared.shutdown.store(true, Ordering::Release);
+        }
+        // Wake workers parked on the condvar; each re-checks `shutdown` under the
+        // lock immediately after waking and returns.
+        //
+        // We deliberately do NOT bump `generation` here. A spinning (not-yet-parked)
+        // worker already observes `shutdown` via its per-iteration check and exits
+        // on its own. Advancing `generation` would instead make such a worker break
+        // out of the spin loop through the *generation* branch and fall into the
+        // dispatch path, where it would read the stale `work` descriptor from the
+        // last `parallel_for` call and execute a dangling closure pointer
+        // (use-after-free of the caller's returned stack frame).
         self.shared.work_ready.notify_all();
 
         // Join all worker threads.

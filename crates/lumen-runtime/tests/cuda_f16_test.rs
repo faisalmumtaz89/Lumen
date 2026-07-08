@@ -241,7 +241,7 @@ fn test_cpu_matvec_f16_residual() {
         weight_f16[i * dim + i] = f32_to_f16_bits(2.0); // 2x identity
     }
     let x = vec![1.0f32, 2.0, 3.0, 4.0];
-    let residual = vec![10.0f32, 20.0, 30.0, 40.0];
+    let residual = [10.0f32, 20.0, 30.0, 40.0];
 
     let matvec_out = cpu_matvec_f16(&weight_f16, &x, dim, dim);
     let with_residual: Vec<f32> = matvec_out

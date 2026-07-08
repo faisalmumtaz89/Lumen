@@ -1018,7 +1018,7 @@ mod tests {
                 data[e]
             );
         }
-        let head1_base = 1 * 16 * 4; // 64
+        let head1_base = 16 * 4; // head 1 base: head stride = 16 * 4 = 64
         for e in 0..4 {
             let got = view.read_key_f32(head1_base + e);
             assert_eq!(
@@ -1047,7 +1047,7 @@ mod tests {
                 data[e]
             );
         }
-        let head1_base = 1 * 16 * 4;
+        let head1_base = 16 * 4; // head 1 base: head stride = 16 * 4 = 64
         for e in 0..4 {
             let got = view.read_value_f32(head1_base + e);
             assert_eq!(

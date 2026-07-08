@@ -668,7 +668,8 @@ mod tests {
         let mut gpu_src = vec![0u16; total];
         // Mark element (pos=1, head=1, d=2) so it has a unique value.
         let marker: u16 = 0xBEEF;
-        gpu_src[1 * (num_kv_heads * head_dim) + 1 * head_dim + 2] = marker;
+        let (pos, head, d) = (1, 1, 2);
+        gpu_src[pos * (num_kv_heads * head_dim) + head * head_dim + d] = marker;
         let mut cpu_bytes = vec![0u8; total * 2];
         MetalF32Backend::transpose_gpu_k_to_cpu_f16(
             &gpu_src,
@@ -680,7 +681,7 @@ mod tests {
         );
         // CPU expects `[head=1, pos=1, d=2]` at byte offset
         // `(1*max_seq_len*head_dim + 1*head_dim + 2) * 2`.
-        let off = (1 * max_seq_len * head_dim + 1 * head_dim + 2) * 2;
+        let off = (head * max_seq_len * head_dim + pos * head_dim + d) * 2;
         let got = u16::from_le_bytes([cpu_bytes[off], cpu_bytes[off + 1]]);
         assert_eq!(got, marker, "K transpose dest byte mismatch");
     }
