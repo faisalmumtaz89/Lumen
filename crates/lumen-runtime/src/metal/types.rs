@@ -844,6 +844,15 @@ pub(crate) struct MetalScratch {
     // step_index, seq_pos) for a CB that has been committed (async) but whose
     // output token has not yet been read back on the CPU. Drained in order.
     pub(crate) pipe_inflight: std::collections::VecDeque<(MetalCommandBuffer, usize, usize)>,
+    // [metal-R9 pos79 probe] Split-CB staging (LUMEN_METAL_SPLIT_CB_AT_ORD). When
+    // the probe flag is set, decode_token_greedy_core commits CB1 (first half,
+    // encoders ord 0..N) mid-token and stashes it in `pipe_split_stage`; the lean
+    // driver moves it into `pipe_split_inflight` in lockstep with `pipe_inflight`
+    // (one Option per in-flight token) so BOTH halves' GPUStart/End timestamps can
+    // be read after the token's terminal CB2 completes. Empty/None unless the
+    // probe flag is set (byte-identical single-CB behavior otherwise).
+    pub(crate) pipe_split_stage: Option<MetalCommandBuffer>,
+    pub(crate) pipe_split_inflight: std::collections::VecDeque<Option<MetalCommandBuffer>>,
     // Monotonic decode-step counter for the current pipeline run; reset when the
     // pipeline is (re)started (i.e. when pipe_inflight is empty at entry).
     pub(crate) pipe_step: usize,

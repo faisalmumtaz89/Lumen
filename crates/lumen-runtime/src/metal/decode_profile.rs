@@ -44,6 +44,31 @@ pub(crate) fn gputime_enabled() -> bool {
     GPUTIME_ENABLED.load(Ordering::Relaxed)
 }
 
+/// [metal-R9 pos79 probe] Ordinal at which to split the single per-token CB into
+/// two (`LUMEN_METAL_SPLIT_CB_AT_ORD=<N>`, default unset). `None` => no split;
+/// behavior is byte-identical to the single-CB path. When `Some(N)` and the lean
+/// pipelined path is active, `decode_token_greedy_core` commits CB1 (encoders
+/// ord 0..N) at the ord N->N+1 boundary and continues ord N+1..end in CB2 (the
+/// token's terminal CB). Only full-attn concurrent-proj CLOSE ordinals
+/// (odd N = 2*layer+1 for a full-attn layer, e.g. 79 = layer 39) are supported;
+/// any other N never matches the split site and leaves behavior unchanged.
+/// Cached once; diagnostic only.
+#[inline]
+pub(crate) fn split_cb_at_ord() -> Option<u32> {
+    use std::sync::atomic::AtomicI64;
+    // -2 = unresolved, -1 = unset/off, >=0 = the ordinal to split at.
+    static CACHE: AtomicI64 = AtomicI64::new(-2);
+    let cur = CACHE.load(Ordering::Relaxed);
+    if cur != -2 {
+        return if cur < 0 { None } else { Some(cur as u32) };
+    }
+    let v = std::env::var("LUMEN_METAL_SPLIT_CB_AT_ORD")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    CACHE.store(v.map(|x| x as i64).unwrap_or(-1), Ordering::Relaxed);
+    v
+}
+
 pub(crate) fn init_from_env() {
     if std::env::var("LUMEN_METAL_DECODE_PROFILE").ok().as_deref() == Some("1") {
         ENABLED.store(true, Ordering::Relaxed);

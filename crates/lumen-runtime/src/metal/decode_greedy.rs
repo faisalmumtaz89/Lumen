@@ -322,6 +322,18 @@ impl MetalF32Backend {
             }
         }
 
+        // [metal-R9 pos79 probe] Encoder-ordinal counter matching Phase-0's
+        // numbering: ord 0 = this initial embed serial encoder (opened above);
+        // each per-layer concurrent-proj island OPEN (+1) and CLOSE/serial-reopen
+        // (+1) increments it, so layer k's concurrent-proj encoder = ord 2k+1 and
+        // its serial-bulk = ord 2k+2 (closed form = seam-map.md §4: 1 + 2L). When
+        // `LUMEN_METAL_SPLIT_CB_AT_ORD=<N>` is set and the lean pipelined path is
+        // active, the single per-token CB is split at the ord N->N+1 boundary
+        // (see the full-attn island CLOSE below). `None` => never splits =>
+        // byte-identical single-CB behavior.
+        let split_at_ord = decode_profile::split_cb_at_ord();
+        let mut enc_ord: u32 = 0;
+
         // --- ALL layers ---
 
         for layer_idx in 0..num_layers {
@@ -522,6 +534,8 @@ impl MetalF32Backend {
                                 "CONCURRENT_PROJ: failed to create concurrent encoder".into(),
                             )
                         })?;
+                        // [metal-R9 pos79 probe] concurrent-proj island OPEN => ord 2k+1.
+                        enc_ord += 1;
                     }
 
                     // Project Q+gate into qkv_buf
@@ -891,11 +905,53 @@ impl MetalF32Backend {
                         // completion ordering exactly as before.
                         enc.memory_barrier_with_resources(&[&s.qkv_buf, &s.k_buf, &s.v_buf]);
                         enc.end_encoding();
+                        // [metal-R9 pos79 probe] Flag-gated CB split at this
+                        // concurrent-proj CLOSE (ord enc_ord -> enc_ord+1). The
+                        // encoder just ended is the concurrent-proj island, ord
+                        // enc_ord == 2*layer_idx+1 (asserted below). When the probe
+                        // targets this ordinal on the lean pipelined path, commit
+                        // CB1 (ord 0..enc_ord) and continue ord enc_ord+1..end in a
+                        // fresh CB2 on the SAME queue. CB1->CB2 ordering + memory
+                        // visibility come for free from (a) the single command
+                        // queue being FIFO (CB1 retires before CB2 executes -- the
+                        // exact invariant the event-free lean pipeline already
+                        // relies on for inter-token CBs) and (b) qkv/k/v being
+                        // hazard-TRACKED device buffers (StorageModeShared, non-heap
+                        // => automatic cross-CB boundary hazard tracking). No
+                        // MTLSharedEvent is needed and none is added (the lean path
+                        // uses event:None). The barrier above is retained; it is a
+                        // no-op-for-output scheduling hint and CB1's retirement is
+                        // itself a full barrier. Byte-identical output.
+                        if pipe.is_some() && split_at_ord == Some(enc_ord) {
+                            debug_assert_eq!(enc_ord, 2 * layer_idx as u32 + 1);
+                            cmd.commit(); // commit CB1 async; queue is FIFO
+                            {
+                                use std::sync::OnceLock;
+                                static ANNOUNCED: OnceLock<()> = OnceLock::new();
+                                ANNOUNCED.get_or_init(|| {
+                                    eprintln!(
+                                        "[SPLITCB-INIT] split at ord {enc_ord} -> {} \
+                                         (full-attn layer_idx={layer_idx} island CLOSE); \
+                                         CB1=ord0..{enc_ord}, CB2=ord{}..end",
+                                        enc_ord + 1,
+                                        enc_ord + 1
+                                    );
+                                });
+                            }
+                            s.pipe_split_stage = Some(cmd);
+                            cmd = self.queue.new_command_buffer().ok_or_else(|| {
+                                RuntimeError::Compute(
+                                    "SPLIT_CB: failed to create CB2 for the split probe".into(),
+                                )
+                            })?;
+                        }
                         enc = cmd.new_compute_encoder().ok_or_else(|| {
                             RuntimeError::Compute(
                                 "CONCURRENT_PROJ: failed to reopen serial encoder".into(),
                             )
                         })?;
+                        // [metal-R9 pos79 probe] serial-bulk reopen => ord 2k+2.
+                        enc_ord += 1;
                     } else if needs_barriers {
                         enc.memory_barrier_with_scope(1);
                     }
@@ -1984,6 +2040,13 @@ impl MetalF32Backend {
                 )?; // s passed immutably; F16 mirror lives behind RefCell
                 enc = ret_enc;
                 s.gdn_conv_positions[gdn_idx] = new_conv_pos;
+                // [metal-R9 pos79 probe] Each GDN layer opens one concurrent-proj
+                // island + reopens one serial encoder inside the fused fn (2 encoder
+                // opens), matching the full-attn per-layer pattern, so advance the
+                // ordinal counter by 2 to keep ord = 2k+1 / 2k+2 across GDN layers.
+                if gdn_concurrent {
+                    enc_ord += 2;
+                }
             }
 
             // [decode-profile] Section boundary between attention and FFN.
@@ -3417,6 +3480,11 @@ impl MetalF32Backend {
         while let Some((cmd, _, _)) = s.pipe_inflight.pop_front() {
             cmd.wait_until_completed();
         }
+        // [metal-R9 pos79 probe] Drop any staged/in-flight CB1 halves. They were
+        // committed on the same FIFO queue BEFORE their terminal CB2 (which the
+        // loop above just waited), so they are already retired; just clear.
+        s.pipe_split_inflight.clear();
+        s.pipe_split_stage = None;
         s.pipe_step = 0;
     }
 
@@ -3457,6 +3525,13 @@ impl MetalF32Backend {
         if decode_profile::is_enabled() {
             return self.decode_token_greedy(prev_token, weights, kv);
         }
+
+        // [metal-R9 pos79 probe] When LUMEN_METAL_SPLIT_CB_AT_ORD is set, the core
+        // commits CB1 mid-token and stashes it; carry each token's CB1 in
+        // `pipe_split_inflight` in lockstep with `pipe_inflight` so both halves'
+        // GPU timestamps can be read after the terminal CB2 completes. `false`
+        // (flag unset) => zero extra work, byte-identical single-CB behavior.
+        let split_flag_on = decode_profile::split_cb_at_ord().is_some();
 
         // Effective in-flight depth: `PIPE_DEPTH` (2). The ring must hold > depth
         // slots so a slot is never re-written before its GPU consumer (the next CB's
@@ -3538,21 +3613,53 @@ impl MetalF32Backend {
             let mut guard = self.scratch.lock().unwrap();
             let s = guard.as_mut().unwrap();
             s.pipe_inflight.push_back((cmd, step, seq_pos));
+            // [metal-R9 pos79 probe] Move this token's staged CB1 (the first half
+            // the core just committed) into the split deque, in lockstep with the
+            // terminal CB2 pushed above. One entry per token (Option is None only
+            // if the split site never fired, keeping the deques length-matched).
+            if split_flag_on {
+                s.pipe_split_inflight.push_back(s.pipe_split_stage.take());
+            }
             s.pipe_step = step + 1;
             s.pipe_seq_pos = seq_pos + 1;
         }
 
         // -- Wait the FRONT in-flight CB, read its produced token, advance the
         //    CPU KV counter by one, return. --
-        let (front_cmd, front_step) = {
+        let (front_cmd, front_step, front_cb1) = {
             let mut guard = self.scratch.lock().unwrap();
             let s = guard.as_mut().unwrap();
             let (cmd, step, _seq) = s.pipe_inflight.pop_front().ok_or_else(|| {
                 RuntimeError::Compute("lean pipelined decode: no in-flight CB to drain".into())
             })?;
-            (cmd, step)
+            // [metal-R9 pos79 probe] Pop this token's CB1 (first half) in lockstep.
+            let cb1 = if split_flag_on {
+                s.pipe_split_inflight.pop_front().flatten()
+            } else {
+                None
+            };
+            (cmd, step, cb1)
         };
         front_cmd.wait_until_completed();
+        // [metal-R9 pos79 probe] CLEAN (no-xctrace) split measurement: with CB2
+        // (front_cmd) now complete and CB1 already retired before it (FIFO), read
+        // both halves' absolute GPU timestamps and log the inter-CB idle gap.
+        //   span1 = GPUEnd(CB1)-GPUStart(CB1); span2 = GPUEnd(CB2)-GPUStart(CB2);
+        //   gap12 = GPUStart(CB2)-GPUEnd(CB1)  (the pos79 idle, if it is real).
+        // REAL hypothesis => gap12 ~ 0.6 ms; ARTIFACT => gap12 ~ commit/event
+        // overhead only and span1+span2+gap12 ~ the flag-off single-CB span.
+        if let Some(cb1) = front_cb1 {
+            let (s1, e1) = cb1.gpu_start_end_secs();
+            let (s2, e2) = front_cmd.gpu_start_end_secs();
+            let span1_ms = (e1 - s1).max(0.0) * 1e3;
+            let span2_ms = (e2 - s2).max(0.0) * 1e3;
+            let gap12_us = (s2 - e1) * 1e6;
+            let sum_ms = span1_ms + span2_ms + gap12_us / 1e3;
+            eprintln!(
+                "[SPLITCB] tok={front_step} span1_ms={span1_ms:.4} span2_ms={span2_ms:.4} \
+                 gap12_us={gap12_us:.3} sum_ms={sum_ms:.4}"
+            );
+        }
         // [decode-gputime] STEP-2 lean-path measurement (no-op unless
         // LUMEN_METAL_DECODE_GPUTIME=1): record token-completion-to-completion
         // wall AND the front CB's true GPU-busy time. This is the async

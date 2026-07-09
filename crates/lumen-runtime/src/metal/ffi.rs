@@ -1101,6 +1101,20 @@ impl MetalCommandBuffer {
         }
     }
 
+    /// Absolute `(GPUStartTime, GPUEndTime)` in host-clock seconds for this CB.
+    /// Valid only AFTER completion (`wait_until_completed`). Unlike
+    /// `gpu_elapsed_secs` (which returns end-start), this exposes the raw
+    /// timestamps so an inter-CB GPU-idle gap can be computed as
+    /// `GPUStart(next) - GPUEnd(prev)`. Used only by the metal-R9 pos79
+    /// split-CB probe (`LUMEN_METAL_SPLIT_CB_AT_ORD`); no production caller.
+    pub fn gpu_start_end_secs(&self) -> (f64, f64) {
+        unsafe {
+            let start = msg_send_0_f64(self.raw(), cached_sel::gpu_start_time());
+            let end = msg_send_0_f64(self.raw(), cached_sel::gpu_end_time());
+            (start, end)
+        }
+    }
+
     /// Wait until completed.
     pub fn wait_until_completed(&self) {
         unsafe {
