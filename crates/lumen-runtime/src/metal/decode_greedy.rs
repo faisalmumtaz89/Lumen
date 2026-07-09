@@ -322,19 +322,40 @@ impl MetalF32Backend {
             }
         }
 
-        // [metal-R9 pos79 probe] Encoder-ordinal counter matching Phase-0's
-        // numbering: ord 0 = this initial embed serial encoder (opened above);
-        // each per-layer concurrent-proj island OPEN (+1) and CLOSE/serial-reopen
-        // (+1) increments it, so layer k's concurrent-proj encoder = ord 2k+1 and
-        // its serial-bulk = ord 2k+2 (closed form = seam-map.md §4: 1 + 2L). When
-        // `LUMEN_METAL_SPLIT_CB_AT_ORD=<N>` is set and the lean pipelined path is
-        // active, the single per-token CB is split at the ord N->N+1 boundary
-        // (see the full-attn island CLOSE below). `None` => never splits =>
-        // byte-identical single-CB behavior.
-        let split_ords = decode_profile::split_cb_ords();
-        let mut enc_ord: u32 = 0;
-
         // --- ALL layers ---
+
+        // [metal-R9] Command-buffer split lever. Encoder-ordinal counter matching
+        // the metal-R9 seam map: ord 0 = the embed serial encoder opened above;
+        // each per-layer concurrent-proj island OPEN (+1) and its serial-bulk
+        // reopen/CLOSE (+1) increment it, so layer k's concurrent-proj encoder =
+        // ord 2k+1 and its serial-bulk = ord 2k+2. GDN layers advance by 2 as well
+        // (their fused fn opens one concurrent + reopens one serial encoder), so
+        // EVERY layer contributes exactly 2 and the invariant holds uniformly. On
+        // the pipelined path, when the lever is active the single per-token CB is
+        // committed at a full-attn island CLOSE -- at an explicit `SPLIT_CB_AT_ORD`
+        // ordinal, or under the AUTO policy once the current CB has accumulated
+        // `AUTO_SPLIT_ENCODER_STRIDE` (~40) encoders. This shrinks the large CB
+        // whose completion triggers the ~0.5 ms/tok GPU dispatch stall. Byte-
+        // identical (see decode_profile). Lever off or non-pipelined => the counter
+        // is maintained but never fires a split => single-CB behavior.
+        // Split ONLY on the lean event-free pipelined path (`pipe` present with
+        // `event: None`) -- the shipped default driver. A split commits the CB1
+        // half while any inter-CB ordering event lives on CB1's wait and the
+        // terminal CB's signal; that split-vs-event interaction is unverified, so
+        // an event-ordered path (none exists today; defensive) is NOT split. The
+        // non-pipelined (sequential) path is not split either.
+        let split_lever_on = pipe.as_ref().map_or(false, |w| w.event.is_none())
+            && decode_profile::cb_split_enabled();
+        let split_explicit_ords = decode_profile::split_cb_ords();
+        let split_auto = split_explicit_ords.is_empty() && decode_profile::cb_split_auto();
+        let mut enc_ord: u32 = 0;
+        // First encoder ordinal of the current (uncommitted) CB; advanced past each
+        // split boundary. The AUTO policy commits when this CB has reached ~40
+        // encoders (`enc_ord + 1 - cb_start_ord`, inclusive count).
+        let mut cb_start_ord: u32 = 0;
+        // Boundaries actually committed this token (for the one-time announce
+        // below). Never allocates unless the lever fires a split.
+        let mut split_ords_hit: Vec<u32> = Vec::new();
 
         for layer_idx in 0..num_layers {
             // Resolve layer buffer: prefer unified private buffer, then per-layer
@@ -534,7 +555,7 @@ impl MetalF32Backend {
                                 "CONCURRENT_PROJ: failed to create concurrent encoder".into(),
                             )
                         })?;
-                        // [metal-R9 pos79 probe] concurrent-proj island OPEN => ord 2k+1.
+                        // [metal-R9] concurrent-proj island OPEN => ord 2k+1.
                         enc_ord += 1;
                     }
 
@@ -905,63 +926,43 @@ impl MetalF32Backend {
                         // completion ordering exactly as before.
                         enc.memory_barrier_with_resources(&[&s.qkv_buf, &s.k_buf, &s.v_buf]);
                         enc.end_encoding();
-                        // [metal-R9 pos79 probe] Flag-gated CB split at this
-                        // concurrent-proj CLOSE (ord enc_ord -> enc_ord+1). The
-                        // encoder just ended is the concurrent-proj island, ord
-                        // enc_ord == 2*layer_idx+1 (asserted below). When the probe
-                        // targets this ordinal on the lean pipelined path, commit
-                        // CB1 (ord 0..enc_ord) and continue ord enc_ord+1..end in a
-                        // fresh CB2 on the SAME queue. CB1->CB2 ordering + memory
-                        // visibility come for free from (a) the single command
-                        // queue being FIFO (CB1 retires before CB2 executes -- the
-                        // exact invariant the event-free lean pipeline already
-                        // relies on for inter-token CBs) and (b) qkv/k/v being
-                        // hazard-TRACKED device buffers (StorageModeShared, non-heap
-                        // => automatic cross-CB boundary hazard tracking). No
-                        // MTLSharedEvent is needed and none is added (the lean path
-                        // uses event:None). The barrier above is retained; it is a
-                        // no-op-for-output scheduling hint and CB1's retirement is
-                        // itself a full barrier. Byte-identical output.
-                        if pipe.is_some() && split_ords.contains(&enc_ord) {
+                        // [metal-R9] CB-split lever: at this full-attn island CLOSE
+                        // (enc_ord == 2*layer_idx+1) optionally commit the accumulated
+                        // per-token CB and continue in a fresh CB on the SAME FIFO
+                        // queue. The committed CB is fire-and-forget: the command queue
+                        // retains it to completion, and the token's result comes from
+                        // the terminal CB the driver waits on -- which is FIFO-after
+                        // this one, so this half is guaranteed complete before the
+                        // token is read back. Byte-identical: FIFO ordering + the
+                        // hazard-tracked qkv/k/v StorageModeShared buffers carry the
+                        // cross-CB dependency; no MTLSharedEvent (the lean path uses
+                        // event:None). Off / non-pipelined => no split (single CB).
+                        if split_lever_on {
                             debug_assert_eq!(enc_ord, 2 * layer_idx as u32 + 1);
-                            // [Phase-2] Mark the sub-CB commit (CPU event timeline).
-                            decode_profile::tl_mark(
-                                decode_profile::EV_SUBCB_COMMIT_PRE,
-                                seq_pos as u32,
-                                enc_ord,
-                            );
-                            cmd.commit(); // commit this sub-CB async; queue is FIFO
-                            decode_profile::tl_mark(
-                                decode_profile::EV_SUBCB_COMMIT_POST,
-                                seq_pos as u32,
-                                enc_ord,
-                            );
-                            {
-                                use std::sync::OnceLock;
-                                static ANNOUNCED: OnceLock<()> = OnceLock::new();
-                                ANNOUNCED.get_or_init(|| {
-                                    eprintln!(
-                                        "[SPLITCB-INIT] split ords={split_ords:?}; first hit at ord \
-                                         {enc_ord} (full-attn layer_idx={layer_idx} island CLOSE); \
-                                         sub-CB ends at ord {enc_ord}, next starts at ord {}",
-                                        enc_ord + 1
-                                    );
-                                });
+                            let do_split = if split_auto {
+                                enc_ord + 1 - cb_start_ord
+                                    >= decode_profile::AUTO_SPLIT_ENCODER_STRIDE
+                            } else {
+                                split_explicit_ords.binary_search(&enc_ord).is_ok()
+                            };
+                            if do_split {
+                                cmd.commit();
+                                cmd = self.queue.new_command_buffer().ok_or_else(|| {
+                                    RuntimeError::Compute(
+                                        "CB-split: failed to open the continuation command buffer"
+                                            .into(),
+                                    )
+                                })?;
+                                cb_start_ord = enc_ord + 1;
+                                split_ords_hit.push(enc_ord);
                             }
-                            s.pipe_split_stage.push(cmd);
-                            cmd = self.queue.new_command_buffer().ok_or_else(|| {
-                                RuntimeError::Compute(
-                                    "SPLIT_CB: failed to create the next sub-CB for the split probe"
-                                        .into(),
-                                )
-                            })?;
                         }
                         enc = cmd.new_compute_encoder().ok_or_else(|| {
                             RuntimeError::Compute(
                                 "CONCURRENT_PROJ: failed to reopen serial encoder".into(),
                             )
                         })?;
-                        // [metal-R9 pos79 probe] serial-bulk reopen => ord 2k+2.
+                        // [metal-R9] serial-bulk reopen => ord 2k+2.
                         enc_ord += 1;
                     } else if needs_barriers {
                         enc.memory_barrier_with_scope(1);
@@ -2051,10 +2052,10 @@ impl MetalF32Backend {
                 )?; // s passed immutably; F16 mirror lives behind RefCell
                 enc = ret_enc;
                 s.gdn_conv_positions[gdn_idx] = new_conv_pos;
-                // [metal-R9 pos79 probe] Each GDN layer opens one concurrent-proj
-                // island + reopens one serial encoder inside the fused fn (2 encoder
-                // opens), matching the full-attn per-layer pattern, so advance the
-                // ordinal counter by 2 to keep ord = 2k+1 / 2k+2 across GDN layers.
+                // [metal-R9] Each GDN layer opens one concurrent-proj island +
+                // reopens one serial encoder inside the fused fn (2 encoder opens),
+                // matching the full-attn per-layer pattern, so advance the ordinal
+                // counter by 2 to keep ord = 2k+1 / 2k+2 uniform across GDN layers.
                 if gdn_concurrent {
                     enc_ord += 2;
                 }
@@ -3272,6 +3273,22 @@ impl MetalF32Backend {
 
         enc.end_encoding();
 
+        // [metal-R9] One-time announce of the CB-split boundaries actually taken
+        // (stderr only; stdout stays byte-identical). Fires once per process on
+        // the first token that split, so an operator/gate can confirm the policy
+        // resolved to the expected ordinals (27B auto: 39/79/119; 9B auto: 39).
+        if split_lever_on && !split_ords_hit.is_empty() {
+            static ANNOUNCE: std::sync::Once = std::sync::Once::new();
+            ANNOUNCE.call_once(|| {
+                let mode = if split_auto { "auto" } else { "explicit" };
+                eprintln!(
+                    "[metal] CB-split lever ({mode}): {} boundary/token at encoder ords {:?}",
+                    split_ords_hit.len(),
+                    split_ords_hit
+                );
+            });
+        }
+
         // ============================ PIPELINED ============================
         // Signal the ordering event at end-of-CB, commit ASYNC (do NOT wait),
         // and hand the in-flight CB back to the driver. The driver reads the
@@ -3284,11 +3301,7 @@ impl MetalF32Backend {
             if let Some(event) = w.event {
                 cmd.encode_signal_event(event, w.signal_value);
             }
-            // [Phase-2] Mark the terminal CB commit (CPU event timeline). aux =
-            // the final encoder ordinal (~128 on 27B), i.e. the whole-token end.
-            decode_profile::tl_mark(decode_profile::EV_TERM_COMMIT_PRE, seq_pos as u32, enc_ord);
             cmd.commit();
-            decode_profile::tl_mark(decode_profile::EV_TERM_COMMIT_POST, seq_pos as u32, enc_ord);
             s.gpu_x_valid = false;
             return Ok(CoreResult::InFlight(cmd));
         }
@@ -3495,11 +3508,6 @@ impl MetalF32Backend {
         while let Some((cmd, _, _)) = s.pipe_inflight.pop_front() {
             cmd.wait_until_completed();
         }
-        // [metal-R9 pos79 probe] Drop any staged/in-flight CB1 halves. They were
-        // committed on the same FIFO queue BEFORE their terminal CB2 (which the
-        // loop above just waited), so they are already retired; just clear.
-        s.pipe_split_inflight.clear();
-        s.pipe_split_stage.clear();
         s.pipe_step = 0;
     }
 
@@ -3540,34 +3548,6 @@ impl MetalF32Backend {
         if decode_profile::is_enabled() {
             return self.decode_token_greedy(prev_token, weights, kv);
         }
-
-        // [Phase-2] Mark the lean driver entry (CPU event timeline; no-op unless
-        // LUMEN_METAL_CPU_TIMELINE=1). Also emit a one-time [CLOCK-INIT] line and a
-        // periodic [CLOCK] sample so the analyzer can validate the mach<->GPU clock
-        // alignment and its drift.
-        decode_profile::tl_mark(decode_profile::EV_ENTRY, 0, 0);
-        if decode_profile::cpu_timeline_enabled() {
-            self.emit_clock_sample();
-        }
-
-        // [Phase-2 Q2(a)] Optional CPU-phase perturbation: usleep at the top of the
-        // driver call, shifting the whole CPU loop phase WITHOUT touching GPU work.
-        // No-op unless LUMEN_METAL_DELAY_US>0.
-        {
-            let dus = decode_profile::delay_us();
-            if dus > 0 {
-                decode_profile::tl_mark(decode_profile::EV_DELAY_PRE, 0, dus);
-                decode_profile::usleep_us(dus);
-                decode_profile::tl_mark(decode_profile::EV_DELAY_POST, 0, dus);
-            }
-        }
-
-        // [metal-R9 pos79 probe / Phase-2] When LUMEN_METAL_SPLIT_CB_AT_ORD is set,
-        // the core commits each sub-CB mid-token and stashes it; carry each token's
-        // sub-CB Vec in `pipe_split_inflight` in lockstep with `pipe_inflight` so all
-        // sub-CBs' GPU timestamps can be read after the terminal CB completes.
-        // `false` (flag unset) => zero extra work, byte-identical single-CB behavior.
-        let split_flag_on = !decode_profile::split_cb_ords().is_empty();
 
         // Effective in-flight depth: `PIPE_DEPTH` (2). The ring must hold > depth
         // slots so a slot is never re-written before its GPU consumer (the next CB's
@@ -3637,8 +3617,6 @@ impl MetalF32Backend {
                 signal_value: 0,
                 wait_value: 0,
             };
-            // [Phase-2] Mark the CPU-side encode of CB(step) (start .. end).
-            decode_profile::tl_mark(decode_profile::EV_ENCODE_START, step as u32, 0);
             let cmd = match self.decode_token_greedy_core(prev_token, weights, kv, Some(wiring))? {
                 CoreResult::InFlight(cmd) => cmd,
                 CoreResult::Token(_) => {
@@ -3647,86 +3625,25 @@ impl MetalF32Backend {
                     ));
                 }
             };
-            decode_profile::tl_mark(decode_profile::EV_ENCODE_END, step as u32, 0);
             // Record the in-flight CB and advance the encode counters.
             let mut guard = self.scratch.lock().unwrap();
             let s = guard.as_mut().unwrap();
             s.pipe_inflight.push_back((cmd, step, seq_pos));
-            // [metal-R9 pos79 probe / Phase-2] Move this token's staged sub-CB Vec
-            // into the split deque, in lockstep with the terminal CB pushed above.
-            // One Vec per token (empty only if the split site never fired, keeping
-            // the deques length-matched).
-            if split_flag_on {
-                let staged = std::mem::take(&mut s.pipe_split_stage);
-                s.pipe_split_inflight.push_back(staged);
-            }
             s.pipe_step = step + 1;
             s.pipe_seq_pos = seq_pos + 1;
         }
 
         // -- Wait the FRONT in-flight CB, read its produced token, advance the
         //    CPU KV counter by one, return. --
-        let (front_cmd, front_step, front_cb1s) = {
+        let (front_cmd, front_step) = {
             let mut guard = self.scratch.lock().unwrap();
             let s = guard.as_mut().unwrap();
             let (cmd, step, _seq) = s.pipe_inflight.pop_front().ok_or_else(|| {
                 RuntimeError::Compute("lean pipelined decode: no in-flight CB to drain".into())
             })?;
-            // [metal-R9 pos79 probe / Phase-2] Pop this token's sub-CB Vec in lockstep.
-            let cb1s = if split_flag_on {
-                s.pipe_split_inflight.pop_front().unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            (cmd, step, cb1s)
+            (cmd, step)
         };
-        // [Phase-2] Mark the front-wait (CPU blocks on the terminal CB) start..end.
-        decode_profile::tl_mark(decode_profile::EV_WAIT_PRE, front_step as u32, 0);
         front_cmd.wait_until_completed();
-        decode_profile::tl_mark(decode_profile::EV_WAIT_POST, front_step as u32, 0);
-        // [metal-R9 pos79 probe / Phase-2] CLEAN (no-xctrace) split measurement.
-        // The terminal CB (front_cmd) is complete and every sub-CB retired before
-        // it (FIFO). Read ALL sub-CBs' absolute GPU timestamps and emit the
-        // per-boundary GPU-idle map: for the ordered sequence [sub0..subN-1, term],
-        // gap at split ordinal ords[i] = GPUStart(next) - GPUEnd(sub_i). A single
-        // split ordinal reproduces the Phase-1 pos79 gap; a comma list maps the
-        // whole token. eprev_s / snext_s are absolute host seconds (== the mach
-        // domain of the CPU timeline) so a post-run join places each CPU event
-        // against each stall window.
-        if !front_cb1s.is_empty() {
-            let ords = decode_profile::split_cb_ords();
-            let mut spans: Vec<(f64, f64)> = Vec::with_capacity(front_cb1s.len() + 1);
-            for c in &front_cb1s {
-                spans.push(c.gpu_start_end_secs());
-            }
-            spans.push(front_cmd.gpu_start_end_secs());
-            let mut sumspan_ms = 0.0f64;
-            let mut sumgap_ms = 0.0f64;
-            for i in 0..spans.len() {
-                let (s_i, e_i) = spans[i];
-                sumspan_ms += (e_i - s_i).max(0.0) * 1e3;
-                if i + 1 < spans.len() {
-                    let (ns, _ne) = spans[i + 1];
-                    let gap_us = (ns - e_i) * 1e6;
-                    sumgap_ms += gap_us / 1e3;
-                    let ord = ords.get(i).copied().unwrap_or(0);
-                    eprintln!(
-                        "[IDLEMAP] tok={front_step} b={i} ord={ord} gap_us={gap_us:.3} \
-                         eprev_s={e_i:.9} snext_s={ns:.9} spanprev_ms={:.4}",
-                        (e_i - s_i).max(0.0) * 1e3
-                    );
-                }
-            }
-            let total_ms = sumspan_ms + sumgap_ms;
-            let first_start_s = spans.first().map(|x| x.0).unwrap_or(0.0);
-            let term_end_s = spans.last().map(|x| x.1).unwrap_or(0.0);
-            eprintln!(
-                "[SPLITSUM] tok={front_step} nsub={} sumspan_ms={sumspan_ms:.4} \
-                 sumgap_ms={sumgap_ms:.4} total_ms={total_ms:.4} \
-                 first_start_s={first_start_s:.9} term_end_s={term_end_s:.9}",
-                spans.len()
-            );
-        }
         // [decode-gputime] STEP-2 lean-path measurement (no-op unless
         // LUMEN_METAL_DECODE_GPUTIME=1): record token-completion-to-completion
         // wall AND the front CB's true GPU-busy time. This is the async
@@ -3744,46 +3661,8 @@ impl MetalF32Backend {
             s.pipe_token_ring[slot].read_u32(&mut out);
             out[0]
         };
-        // [Phase-2] Mark the token readback + driver exit (CPU event timeline).
-        decode_profile::tl_mark(decode_profile::EV_READBACK, front_step as u32, 0);
         kv.advance_seq_len()?;
-        decode_profile::tl_mark(decode_profile::EV_EXIT, front_step as u32, 0);
         Ok(token)
-    }
-
-    /// [metal-R9 Phase-2] CPU<->GPU clock-correlation sampler. Emits a one-time
-    /// `[CLOCK-INIT]` line (mach timebase + a `sampleTimestamps` pair, so the
-    /// analyzer can confirm the `sampleTimestamps` CPU value == `mach_absolute_time`
-    /// and read the GPU-counter rate) and a periodic `[CLOCK]` sample every 64
-    /// calls so drift over the run is visible. Only called when the CPU timeline is
-    /// enabled. Cheap; the periodic tokens are excluded from steady-state stats.
-    fn emit_clock_sample(&self) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CALLS: AtomicU64 = AtomicU64::new(0);
-        let n = CALLS.fetch_add(1, Ordering::Relaxed);
-        if n == 0 {
-            let mach = decode_profile::mach_now();
-            let (cpu_ts, gpu_ts) = self.device.sample_timestamps();
-            // sampleTimestamps' CPU value is in nanoseconds; mach_now() is in mach
-            // ticks (converted to host seconds by mach_to_secs). Both name the SAME
-            // instant, and MTLCommandBuffer.GPUStartTime is in that SAME host-second
-            // domain (validated by the analyzer's ordering invariants).
-            eprintln!(
-                "[CLOCK-INIT] mach_now_s={:.9} sample_cpu_ns={cpu_ts} \
-                 sample_cpu_s={:.9} sample_gpu_ts={gpu_ts} gpu_s={:.9}",
-                decode_profile::mach_to_secs(mach),
-                (cpu_ts as f64) / 1e9,
-                (gpu_ts as f64) / 1e9
-            );
-        } else if n % 64 == 0 {
-            let mach = decode_profile::mach_now();
-            let (cpu_ts, gpu_ts) = self.device.sample_timestamps();
-            eprintln!(
-                "[CLOCK] call={n} mach_now_s={:.9} sample_cpu_s={:.9} sample_gpu_ts={gpu_ts}",
-                decode_profile::mach_to_secs(mach),
-                (cpu_ts as f64) / 1e9
-            );
-        }
     }
 
     /// LEAN GPU-SAMPLED decode driver (Option A, `LUMEN_METAL_GPU_SAMPLER=1`).

@@ -283,15 +283,6 @@ mod cached_sel {
     // process's allocations. Used by the server-side
     // `/debug/memory_breakdown` endpoint.
     cached_sel!(current_allocated_size, "currentAllocatedSize");
-
-    // -- [metal-R9 Phase-2] CPU<->GPU clock correlation --
-    //
-    // `-[MTLDevice sampleTimestamps:gpuTimestamp:]` writes a correlated pair of
-    // (CPU, GPU) timestamps: the CPU value is in `mach_absolute_time()` units,
-    // the GPU value in the device's timestamp-counter units. Used ONLY by the
-    // Phase-2 CPU-timeline probe to verify the mach<->GPU clock alignment and
-    // measure drift across a decode run. No production caller.
-    cached_sel!(sample_timestamps, "sampleTimestamps:gpuTimestamp:");
 }
 
 /// Send an Objective-C message with no arguments, returning an object pointer.
@@ -431,28 +422,6 @@ impl MetalDevice {
             type GetSizeFn = unsafe extern "C" fn(ObjcId, ObjcSel) -> u64;
             let f: GetSizeFn = std::mem::transmute(objc_msgSend as *const c_void);
             f(self.raw, cached_sel::current_allocated_size())
-        }
-    }
-
-    /// [metal-R9 Phase-2] Sample a correlated `(cpu, gpu)` timestamp pair.
-    ///
-    /// Returns `(cpu_mach, gpu_ts)` where `cpu_mach` is in `mach_absolute_time()`
-    /// units and `gpu_ts` is in the device timestamp-counter units. Two samples
-    /// taken at the start and end of a decode run bound the CPU<->GPU clock drift.
-    /// Diagnostic only (Phase-2 CPU-timeline probe); no production caller.
-    pub fn sample_timestamps(&self) -> (u64, u64) {
-        unsafe {
-            let mut cpu_ts: u64 = 0;
-            let mut gpu_ts: u64 = 0;
-            type SampleFn = unsafe extern "C" fn(ObjcId, ObjcSel, *mut u64, *mut u64);
-            let f: SampleFn = std::mem::transmute(objc_msgSend as *const c_void);
-            f(
-                self.raw,
-                cached_sel::sample_timestamps(),
-                &mut cpu_ts as *mut u64,
-                &mut gpu_ts as *mut u64,
-            );
-            (cpu_ts, gpu_ts)
         }
     }
 
@@ -1129,20 +1098,6 @@ impl MetalCommandBuffer {
             let start = msg_send_0_f64(self.raw(), cached_sel::gpu_start_time());
             let end = msg_send_0_f64(self.raw(), cached_sel::gpu_end_time());
             (end - start).max(0.0)
-        }
-    }
-
-    /// Absolute `(GPUStartTime, GPUEndTime)` in host-clock seconds for this CB.
-    /// Valid only AFTER completion (`wait_until_completed`). Unlike
-    /// `gpu_elapsed_secs` (which returns end-start), this exposes the raw
-    /// timestamps so an inter-CB GPU-idle gap can be computed as
-    /// `GPUStart(next) - GPUEnd(prev)`. Used only by the metal-R9 pos79
-    /// split-CB probe (`LUMEN_METAL_SPLIT_CB_AT_ORD`); no production caller.
-    pub fn gpu_start_end_secs(&self) -> (f64, f64) {
-        unsafe {
-            let start = msg_send_0_f64(self.raw(), cached_sel::gpu_start_time());
-            let end = msg_send_0_f64(self.raw(), cached_sel::gpu_end_time());
-            (start, end)
         }
     }
 

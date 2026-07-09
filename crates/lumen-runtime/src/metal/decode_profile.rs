@@ -26,7 +26,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -45,19 +45,30 @@ pub(crate) fn gputime_enabled() -> bool {
     GPUTIME_ENABLED.load(Ordering::Relaxed)
 }
 
-/// [metal-R9 pos79 probe / Phase-2] Encoder ordinal(s) at which to split the
-/// single per-token CB. `LUMEN_METAL_SPLIT_CB_AT_ORD=<N>` OR a comma list
-/// `=a,b,c` (default unset => empty slice => byte-identical single-CB behavior).
-///
-/// A single value reproduces the Phase-1 pos79 probe EXACTLY (one split -> two
-/// CBs). A comma list splits at each listed ordinal, yielding a multi-boundary
-/// GPU-idle map (per-boundary `GPUStart(next)-GPUEnd(prev)` gaps) in ONE clean,
-/// UNTRACED run -- P1 proved splits are throughput-free.
-///
-/// Only full-attn concurrent-proj CLOSE ordinals (odd N = 2*layer+1 for a
-/// full-attn layer) ever match the split site (`decode_token_greedy_core`);
-/// GDN-only ordinals are silently ignored (they never fire). Parsed, sorted, and
-/// de-duplicated once; diagnostic only.
+// ============================================================================
+// [metal-R9] Command-buffer split lever (production).
+// ============================================================================
+//
+// The Metal lean decode path submits embed + all layers + lm_head + argmax as
+// ONE per-token command buffer. When that CB is large (~15 ms on 27B-Q4), the
+// GPU incurs a ~0.5 ms/tok dispatch stall launching the next already-committed
+// CB after the big one retires (metal-R9 P1/P2 mechanism: the stall scales with
+// the completing CB's size, not phase or content). Committing the per-token CB
+// in a few pieces at full-attn island boundaries keeps each CB small enough to
+// avoid the stall. The split points are full-attn concurrent-proj island CLOSE
+// sites, where cross-CB correctness is FREE: the single command queue is FIFO
+// (the committed CB retires before the continuation executes -- the same
+// invariant the event-free lean pipeline already relies on inter-token) and the
+// qkv/k/v buffers are hazard-tracked StorageModeShared (automatic cross-CB
+// hazard barrier). No MTLSharedEvent is used. Byte-identical to the single-CB
+// path (metal-R9 P1, DET-001 + corpus). See `decode_token_greedy_core`.
+
+/// Explicit split-boundary override: `LUMEN_METAL_SPLIT_CB_AT_ORD=<N>` or a
+/// comma list `=a,b,c`. Each value is an encoder ordinal (a full-attn island
+/// CLOSE ordinal `2*layer+1`) at which to commit the accumulated per-token CB.
+/// When non-empty this list is used verbatim and the AUTO policy is ignored.
+/// Default unset => empty slice => (with AUTO off) byte-identical single-CB
+/// behavior. Parsed / sorted / de-duplicated once.
 pub(crate) fn split_cb_ords() -> &'static [u32] {
     static CACHE: OnceLock<Vec<u32>> = OnceLock::new();
     CACHE
@@ -78,172 +89,43 @@ pub(crate) fn split_cb_ords() -> &'static [u32] {
         .as_slice()
 }
 
-/// [metal-R9 Phase-2 Q2(a)] Microseconds to `usleep` at the driver's front-wait
-/// point, gated by `LUMEN_METAL_DELAY_US=<us>` (default 0 => no-op). Perturbs the
-/// CPU loop phase WITHOUT touching GPU work: if the ~62%-phase stall FOLLOWS the
-/// delayed CPU event it moves; if it stays put it is GPU/OS-side. Cached once.
-pub(crate) fn delay_us() -> u32 {
-    use std::sync::atomic::AtomicI64;
-    static CACHE: AtomicI64 = AtomicI64::new(-1);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur >= 0 {
-        return cur as u32;
-    }
-    let v = std::env::var("LUMEN_METAL_DELAY_US")
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(0);
-    CACHE.store(v as i64, Ordering::Relaxed);
-    v
-}
-
-/// `usleep(3)` — libSystem. Q2(a) CPU-phase perturbation only.
-pub(crate) fn usleep_us(us: u32) {
-    extern "C" {
-        fn usleep(useconds: u32) -> i32;
-    }
-    if us > 0 {
-        unsafe {
-            usleep(us);
-        }
-    }
-}
-
-// ============================================================================
-// [metal-R9 Phase-2] CPU per-token event timeline (LUMEN_METAL_CPU_TIMELINE=1)
-// ============================================================================
-//
-// Records `mach_absolute_time()` at every per-token CPU driver event in the lean
-// decode loop into a global buffer, flushed to stderr ONCE at process exit
-// (`atexit`). Zero cost when the flag is off (one relaxed atomic load + early
-// return). Correlation: each event's mach time -> host seconds via the mach
-// timebase, the SAME domain as `MTLCommandBuffer.GPUStartTime/GPUEndTime` on
-// Apple Silicon (both == `CACurrentMediaTime`). Post-analysis compares each CPU
-// event's time against the per-token GPU stall window
-// `[GPUEnd(CB1), GPUStart(CB2)]` (emitted by the split-CB `[IDLEMAP]` log) to
-// answer: which CPU event, if any, coincides with the ~62%-phase GPU stall?
-// Domain agreement is validated empirically by the ordering invariants
-// (commit <= GPUStart, GPUEnd <= wait-return) reported by the analyzer; a
-// `sampleTimestamps` pair at run start/end reports the CPU<->GPU drift.
-
-static CPU_TL_ENABLED: AtomicBool = AtomicBool::new(false);
-
-#[inline]
-pub(crate) fn cpu_timeline_enabled() -> bool {
-    CPU_TL_ENABLED.load(Ordering::Relaxed)
-}
-
-// Event ids (labels mirrored in the analyzer).
-pub(crate) const EV_ENTRY: u8 = 1; // lean driver call entry
-pub(crate) const EV_ENCODE_START: u8 = 2; // before decode_token_greedy_core (encode CB(step))
-pub(crate) const EV_ENCODE_END: u8 = 3; // after core returns the in-flight CB
-pub(crate) const EV_SUBCB_COMMIT_PRE: u8 = 4; // before a split sub-CB commit (aux = enc_ord)
-pub(crate) const EV_SUBCB_COMMIT_POST: u8 = 5; // after
-pub(crate) const EV_TERM_COMMIT_PRE: u8 = 6; // before the terminal CB commit (core tail)
-pub(crate) const EV_TERM_COMMIT_POST: u8 = 7; // after
-pub(crate) const EV_WAIT_PRE: u8 = 8; // before front_cmd.wait_until_completed()
-pub(crate) const EV_WAIT_POST: u8 = 9; // after the wait returns (CPU observes GPU done)
-pub(crate) const EV_READBACK: u8 = 10; // after the token is read back from the ring
-pub(crate) const EV_EXIT: u8 = 11; // lean driver call exit (return token)
-pub(crate) const EV_DELAY_PRE: u8 = 12; // before a Q2(a) injected usleep (aux = us)
-pub(crate) const EV_DELAY_POST: u8 = 13; // after
-
-#[repr(C)]
-struct MachTimebaseInfo {
-    numer: u32,
-    denom: u32,
-}
-extern "C" {
-    fn mach_absolute_time() -> u64;
-    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
-    fn atexit(cb: extern "C" fn()) -> i32;
-    fn pthread_threadid_np(thread: *mut core::ffi::c_void, thread_id: *mut u64) -> i32;
-}
-
-fn timebase() -> (u32, u32) {
-    static TB: OnceLock<(u32, u32)> = OnceLock::new();
-    *TB.get_or_init(|| {
-        let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
-        unsafe {
-            mach_timebase_info(&mut info as *mut _);
-        }
-        (info.numer.max(1), info.denom.max(1))
+/// AUTO split-policy toggle: `LUMEN_METAL_CB_SPLIT` set to `auto` (or the plain
+/// truthy `1`, which the LKA gate harness uses to enable a candidate's flag)
+/// turns it on; `off` / `0` / unset / any other value is off. When on AND no
+/// explicit `SPLIT_CB_AT_ORD` list is set, the decode core inserts a commit
+/// boundary at a full-attn island CLOSE once the current CB has accumulated
+/// `AUTO_SPLIT_ENCODER_STRIDE` encoders (see `decode_token_greedy_core`).
+/// Reproduces the measured split3 boundaries (27B: ord 39/79/119; 9B: ord 39)
+/// and no-ops on architectures without full-attn islands (MoE / all-dense: no
+/// island CLOSE site fires => unchanged behavior). Cached once.
+pub(crate) fn cb_split_auto() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("LUMEN_METAL_CB_SPLIT")
+            .ok()
+            .map(|s| {
+                let t = s.trim();
+                t.eq_ignore_ascii_case("auto") || t == "1"
+            })
+            .unwrap_or(false)
     })
 }
 
-/// mach ticks -> host seconds (the `CACurrentMediaTime` / `GPUStartTime` domain).
-pub(crate) fn mach_to_secs(t: u64) -> f64 {
-    let (n, d) = timebase();
-    (t as f64) * (n as f64) / (d as f64) / 1e9
-}
+/// Encoders-per-CB target for the AUTO split policy. At `40`, the per-token CB
+/// is committed each time it has accumulated ~40 compute encoders at a full-attn
+/// island CLOSE. On Qwen3.6-27B (129 encoders, full-attn every 4th of 64 layers)
+/// this yields boundaries at ord 39/79/119 (== the measured split3); on
+/// Qwen3.5-9B (65 encoders) a single boundary at ord 39. The win saturates at 3
+/// commits/token on 27B (metal-R9 P2), so a coarse stride is deliberate: it
+/// removes every large-CB stall while adding the fewest commits.
+pub(crate) const AUTO_SPLIT_ENCODER_STRIDE: u32 = 40;
 
+/// `true` when the CB-split lever is active (an explicit `SPLIT_CB_AT_ORD` list
+/// OR the AUTO policy). When `false`, the decode core does zero extra work and
+/// the per-token CB is a single commit (byte-identical to the pre-lever path).
 #[inline]
-pub(crate) fn mach_now() -> u64 {
-    unsafe { mach_absolute_time() }
-}
-
-fn cur_tid() -> u64 {
-    thread_local! {
-        static TID: u64 = {
-            let mut id = 0u64;
-            unsafe { pthread_threadid_np(core::ptr::null_mut(), &mut id as *mut u64); }
-            id
-        };
-    }
-    TID.with(|t| *t)
-}
-
-// (mach_time, event, tok_tag, aux, tid)
-type TlEvent = (u64, u8, u32, u32, u64);
-static CPU_TL: Mutex<Vec<TlEvent>> = Mutex::new(Vec::new());
-
-/// Record one CPU event. `tok` is the best-effort token tag (seq_pos or step);
-/// `aux` carries an event-specific value (enc_ord for sub-CB commits, us for a
-/// delay). No-op unless `LUMEN_METAL_CPU_TIMELINE=1`.
-#[inline]
-pub(crate) fn tl_mark(event: u8, tok: u32, aux: u32) {
-    if !cpu_timeline_enabled() {
-        return;
-    }
-    let t = mach_now();
-    let tid = cur_tid();
-    if let Ok(mut buf) = CPU_TL.lock() {
-        buf.push((t, event, tok, aux, tid));
-    }
-}
-
-extern "C" fn cpu_tl_flush_atexit() {
-    flush_cpu_timeline();
-}
-
-/// Drain the CPU timeline buffer to stderr (one line per event). Called once at
-/// process exit via `atexit`; clears the buffer so a manual call cannot double.
-pub(crate) fn flush_cpu_timeline() {
-    let mut buf = match CPU_TL.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    if buf.is_empty() {
-        return;
-    }
-    use std::io::Write;
-    let stderr = std::io::stderr();
-    let mut h = stderr.lock();
-    let _ = writeln!(h, "[CPUTL-BEGIN] count={}", buf.len());
-    for (t, ev, tok, aux, tid) in buf.iter() {
-        let _ = writeln!(
-            h,
-            "[CPUTL] t_s={:.9} ev={} tok={} aux={} tid={}",
-            mach_to_secs(*t),
-            ev,
-            tok,
-            aux,
-            tid
-        );
-    }
-    let _ = writeln!(h, "[CPUTL-END]");
-    let _ = h.flush();
-    buf.clear();
+pub(crate) fn cb_split_enabled() -> bool {
+    cb_split_auto() || !split_cb_ords().is_empty()
 }
 
 pub(crate) fn init_from_env() {
@@ -252,16 +134,6 @@ pub(crate) fn init_from_env() {
     }
     if std::env::var("LUMEN_METAL_DECODE_GPUTIME").ok().as_deref() == Some("1") {
         GPUTIME_ENABLED.store(true, Ordering::Relaxed);
-    }
-    if std::env::var("LUMEN_METAL_CPU_TIMELINE").ok().as_deref() == Some("1") {
-        CPU_TL_ENABLED.store(true, Ordering::Relaxed);
-        if let Ok(mut b) = CPU_TL.lock() {
-            b.reserve(1 << 16);
-        }
-        // Flush the in-memory timeline to stderr once at normal process exit.
-        unsafe {
-            atexit(cpu_tl_flush_atexit);
-        }
     }
 }
 
