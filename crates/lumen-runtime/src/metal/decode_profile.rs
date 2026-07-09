@@ -26,6 +26,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -44,29 +45,205 @@ pub(crate) fn gputime_enabled() -> bool {
     GPUTIME_ENABLED.load(Ordering::Relaxed)
 }
 
-/// [metal-R9 pos79 probe] Ordinal at which to split the single per-token CB into
-/// two (`LUMEN_METAL_SPLIT_CB_AT_ORD=<N>`, default unset). `None` => no split;
-/// behavior is byte-identical to the single-CB path. When `Some(N)` and the lean
-/// pipelined path is active, `decode_token_greedy_core` commits CB1 (encoders
-/// ord 0..N) at the ord N->N+1 boundary and continues ord N+1..end in CB2 (the
-/// token's terminal CB). Only full-attn concurrent-proj CLOSE ordinals
-/// (odd N = 2*layer+1 for a full-attn layer, e.g. 79 = layer 39) are supported;
-/// any other N never matches the split site and leaves behavior unchanged.
-/// Cached once; diagnostic only.
-#[inline]
-pub(crate) fn split_cb_at_ord() -> Option<u32> {
+/// [metal-R9 pos79 probe / Phase-2] Encoder ordinal(s) at which to split the
+/// single per-token CB. `LUMEN_METAL_SPLIT_CB_AT_ORD=<N>` OR a comma list
+/// `=a,b,c` (default unset => empty slice => byte-identical single-CB behavior).
+///
+/// A single value reproduces the Phase-1 pos79 probe EXACTLY (one split -> two
+/// CBs). A comma list splits at each listed ordinal, yielding a multi-boundary
+/// GPU-idle map (per-boundary `GPUStart(next)-GPUEnd(prev)` gaps) in ONE clean,
+/// UNTRACED run -- P1 proved splits are throughput-free.
+///
+/// Only full-attn concurrent-proj CLOSE ordinals (odd N = 2*layer+1 for a
+/// full-attn layer) ever match the split site (`decode_token_greedy_core`);
+/// GDN-only ordinals are silently ignored (they never fire). Parsed, sorted, and
+/// de-duplicated once; diagnostic only.
+pub(crate) fn split_cb_ords() -> &'static [u32] {
+    static CACHE: OnceLock<Vec<u32>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            std::env::var("LUMEN_METAL_SPLIT_CB_AT_ORD")
+                .ok()
+                .map(|s| {
+                    let mut v: Vec<u32> = s
+                        .split(',')
+                        .filter_map(|x| x.trim().parse::<u32>().ok())
+                        .collect();
+                    v.sort_unstable();
+                    v.dedup();
+                    v
+                })
+                .unwrap_or_default()
+        })
+        .as_slice()
+}
+
+/// [metal-R9 Phase-2 Q2(a)] Microseconds to `usleep` at the driver's front-wait
+/// point, gated by `LUMEN_METAL_DELAY_US=<us>` (default 0 => no-op). Perturbs the
+/// CPU loop phase WITHOUT touching GPU work: if the ~62%-phase stall FOLLOWS the
+/// delayed CPU event it moves; if it stays put it is GPU/OS-side. Cached once.
+pub(crate) fn delay_us() -> u32 {
     use std::sync::atomic::AtomicI64;
-    // -2 = unresolved, -1 = unset/off, >=0 = the ordinal to split at.
-    static CACHE: AtomicI64 = AtomicI64::new(-2);
+    static CACHE: AtomicI64 = AtomicI64::new(-1);
     let cur = CACHE.load(Ordering::Relaxed);
-    if cur != -2 {
-        return if cur < 0 { None } else { Some(cur as u32) };
+    if cur >= 0 {
+        return cur as u32;
     }
-    let v = std::env::var("LUMEN_METAL_SPLIT_CB_AT_ORD")
+    let v = std::env::var("LUMEN_METAL_DELAY_US")
         .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok());
-    CACHE.store(v.map(|x| x as i64).unwrap_or(-1), Ordering::Relaxed);
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    CACHE.store(v as i64, Ordering::Relaxed);
     v
+}
+
+/// `usleep(3)` — libSystem. Q2(a) CPU-phase perturbation only.
+pub(crate) fn usleep_us(us: u32) {
+    extern "C" {
+        fn usleep(useconds: u32) -> i32;
+    }
+    if us > 0 {
+        unsafe {
+            usleep(us);
+        }
+    }
+}
+
+// ============================================================================
+// [metal-R9 Phase-2] CPU per-token event timeline (LUMEN_METAL_CPU_TIMELINE=1)
+// ============================================================================
+//
+// Records `mach_absolute_time()` at every per-token CPU driver event in the lean
+// decode loop into a global buffer, flushed to stderr ONCE at process exit
+// (`atexit`). Zero cost when the flag is off (one relaxed atomic load + early
+// return). Correlation: each event's mach time -> host seconds via the mach
+// timebase, the SAME domain as `MTLCommandBuffer.GPUStartTime/GPUEndTime` on
+// Apple Silicon (both == `CACurrentMediaTime`). Post-analysis compares each CPU
+// event's time against the per-token GPU stall window
+// `[GPUEnd(CB1), GPUStart(CB2)]` (emitted by the split-CB `[IDLEMAP]` log) to
+// answer: which CPU event, if any, coincides with the ~62%-phase GPU stall?
+// Domain agreement is validated empirically by the ordering invariants
+// (commit <= GPUStart, GPUEnd <= wait-return) reported by the analyzer; a
+// `sampleTimestamps` pair at run start/end reports the CPU<->GPU drift.
+
+static CPU_TL_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+pub(crate) fn cpu_timeline_enabled() -> bool {
+    CPU_TL_ENABLED.load(Ordering::Relaxed)
+}
+
+// Event ids (labels mirrored in the analyzer).
+pub(crate) const EV_ENTRY: u8 = 1; // lean driver call entry
+pub(crate) const EV_ENCODE_START: u8 = 2; // before decode_token_greedy_core (encode CB(step))
+pub(crate) const EV_ENCODE_END: u8 = 3; // after core returns the in-flight CB
+pub(crate) const EV_SUBCB_COMMIT_PRE: u8 = 4; // before a split sub-CB commit (aux = enc_ord)
+pub(crate) const EV_SUBCB_COMMIT_POST: u8 = 5; // after
+pub(crate) const EV_TERM_COMMIT_PRE: u8 = 6; // before the terminal CB commit (core tail)
+pub(crate) const EV_TERM_COMMIT_POST: u8 = 7; // after
+pub(crate) const EV_WAIT_PRE: u8 = 8; // before front_cmd.wait_until_completed()
+pub(crate) const EV_WAIT_POST: u8 = 9; // after the wait returns (CPU observes GPU done)
+pub(crate) const EV_READBACK: u8 = 10; // after the token is read back from the ring
+pub(crate) const EV_EXIT: u8 = 11; // lean driver call exit (return token)
+pub(crate) const EV_DELAY_PRE: u8 = 12; // before a Q2(a) injected usleep (aux = us)
+pub(crate) const EV_DELAY_POST: u8 = 13; // after
+
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+    fn atexit(cb: extern "C" fn()) -> i32;
+    fn pthread_threadid_np(thread: *mut core::ffi::c_void, thread_id: *mut u64) -> i32;
+}
+
+fn timebase() -> (u32, u32) {
+    static TB: OnceLock<(u32, u32)> = OnceLock::new();
+    *TB.get_or_init(|| {
+        let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+        unsafe {
+            mach_timebase_info(&mut info as *mut _);
+        }
+        (info.numer.max(1), info.denom.max(1))
+    })
+}
+
+/// mach ticks -> host seconds (the `CACurrentMediaTime` / `GPUStartTime` domain).
+pub(crate) fn mach_to_secs(t: u64) -> f64 {
+    let (n, d) = timebase();
+    (t as f64) * (n as f64) / (d as f64) / 1e9
+}
+
+#[inline]
+pub(crate) fn mach_now() -> u64 {
+    unsafe { mach_absolute_time() }
+}
+
+fn cur_tid() -> u64 {
+    thread_local! {
+        static TID: u64 = {
+            let mut id = 0u64;
+            unsafe { pthread_threadid_np(core::ptr::null_mut(), &mut id as *mut u64); }
+            id
+        };
+    }
+    TID.with(|t| *t)
+}
+
+// (mach_time, event, tok_tag, aux, tid)
+type TlEvent = (u64, u8, u32, u32, u64);
+static CPU_TL: Mutex<Vec<TlEvent>> = Mutex::new(Vec::new());
+
+/// Record one CPU event. `tok` is the best-effort token tag (seq_pos or step);
+/// `aux` carries an event-specific value (enc_ord for sub-CB commits, us for a
+/// delay). No-op unless `LUMEN_METAL_CPU_TIMELINE=1`.
+#[inline]
+pub(crate) fn tl_mark(event: u8, tok: u32, aux: u32) {
+    if !cpu_timeline_enabled() {
+        return;
+    }
+    let t = mach_now();
+    let tid = cur_tid();
+    if let Ok(mut buf) = CPU_TL.lock() {
+        buf.push((t, event, tok, aux, tid));
+    }
+}
+
+extern "C" fn cpu_tl_flush_atexit() {
+    flush_cpu_timeline();
+}
+
+/// Drain the CPU timeline buffer to stderr (one line per event). Called once at
+/// process exit via `atexit`; clears the buffer so a manual call cannot double.
+pub(crate) fn flush_cpu_timeline() {
+    let mut buf = match CPU_TL.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if buf.is_empty() {
+        return;
+    }
+    use std::io::Write;
+    let stderr = std::io::stderr();
+    let mut h = stderr.lock();
+    let _ = writeln!(h, "[CPUTL-BEGIN] count={}", buf.len());
+    for (t, ev, tok, aux, tid) in buf.iter() {
+        let _ = writeln!(
+            h,
+            "[CPUTL] t_s={:.9} ev={} tok={} aux={} tid={}",
+            mach_to_secs(*t),
+            ev,
+            tok,
+            aux,
+            tid
+        );
+    }
+    let _ = writeln!(h, "[CPUTL-END]");
+    let _ = h.flush();
+    buf.clear();
 }
 
 pub(crate) fn init_from_env() {
@@ -75,6 +252,16 @@ pub(crate) fn init_from_env() {
     }
     if std::env::var("LUMEN_METAL_DECODE_GPUTIME").ok().as_deref() == Some("1") {
         GPUTIME_ENABLED.store(true, Ordering::Relaxed);
+    }
+    if std::env::var("LUMEN_METAL_CPU_TIMELINE").ok().as_deref() == Some("1") {
+        CPU_TL_ENABLED.store(true, Ordering::Relaxed);
+        if let Ok(mut b) = CPU_TL.lock() {
+            b.reserve(1 << 16);
+        }
+        // Flush the in-memory timeline to stderr once at normal process exit.
+        unsafe {
+            atexit(cpu_tl_flush_atexit);
+        }
     }
 }
 

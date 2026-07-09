@@ -282,8 +282,8 @@ impl ComputeBackend for MetalF32Backend {
             // call; empty/unused in the default sequential path).
             pipe_token_ring: Vec::new(),
             pipe_inflight: std::collections::VecDeque::new(),
-            // [metal-R9 pos79 probe] split-CB staging (empty unless the flag is set)
-            pipe_split_stage: None,
+            // [metal-R9 pos79 probe / Phase-2] split-CB staging (empty unless the flag is set)
+            pipe_split_stage: Vec::new(),
             pipe_split_inflight: std::collections::VecDeque::new(),
             pipe_step: 0,
             pipe_seq_pos: 0,
