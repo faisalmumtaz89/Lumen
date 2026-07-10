@@ -2347,9 +2347,16 @@ fn run_with_mmap(
             provider.final_norm.clone(),
             provider.output_proj.clone(),
         );
+        // The BF16 lm_head weight is stored bf16 (2 bytes/elem) on disk, and the
+        // bf16 output_proj GPU buffer + fused-RMSNorm bf16 matvec are fully wired
+        // (init + decode). Bf16 was missing from this raw fast-path allow-list, so
+        // it silently fell back to the F32-upcast lm_head (4 GB streamed/token via
+        // matmul_f32_deferred, plus an ~86 GB copy-load peak). Admitting Bf16 routes
+        // it to the native bf16 path — numerically identical (same weight values),
+        // half the lm_head byte traffic, and a ~22 GB copy-load peak.
         if matches!(
             provider.output_proj_quant,
-            QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16
+            QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
         ) && !provider.output_proj_raw.is_empty()
         {
             if verbose {
