@@ -89,15 +89,16 @@ pub(crate) fn split_cb_ords() -> &'static [u32] {
         .as_slice()
 }
 
-/// AUTO split-policy toggle: `LUMEN_METAL_CB_SPLIT` set to `auto` (or the plain
-/// truthy `1`, which the LKA gate harness uses to enable a candidate's flag)
-/// turns it on; `off` / `0` / unset / any other value is off. When on AND no
-/// explicit `SPLIT_CB_AT_ORD` list is set, the decode core inserts a commit
-/// boundary at a full-attn island CLOSE once the current CB has accumulated
-/// `AUTO_SPLIT_ENCODER_STRIDE` encoders (see `decode_token_greedy_core`).
-/// Reproduces the measured split3 boundaries (27B: ord 39/79/119; 9B: ord 39)
-/// and no-ops on architectures without full-attn islands (MoE / all-dense: no
-/// island CLOSE site fires => unchanged behavior). Cached once.
+/// AUTO split-policy toggle: `LUMEN_METAL_CB_SPLIT`. Default-ON (metal-R10):
+/// unset, `auto`, or `1` (the plain truthy the LKA gate harness uses) turns it
+/// on; `0` / `off` disables. When on AND no explicit `SPLIT_CB_AT_ORD` list is
+/// set, the decode core inserts a commit boundary at a full-attn island CLOSE
+/// once the current CB has accumulated `AUTO_SPLIT_ENCODER_STRIDE` encoders
+/// (see `decode_token_greedy_core`), provided the model has at least
+/// `AUTO_SPLIT_MIN_ENCODERS` per-token encoders. Reproduces the measured
+/// split boundaries (27B: ord 39/79/119, +2.4% decode; MoE 35B-A3B: ord
+/// 39/79, +5.6% decode) and no-ops on architectures without full-attn
+/// islands (no island CLOSE site fires => unchanged behavior). Cached once.
 pub(crate) fn cb_split_auto() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -105,28 +106,28 @@ pub(crate) fn cb_split_auto() -> bool {
             .ok()
             .map(|s| {
                 let t = s.trim();
-                t.eq_ignore_ascii_case("auto") || t == "1"
+                !(t.eq_ignore_ascii_case("off") || t == "0")
             })
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
 /// Encoders-per-CB target for the AUTO split policy. At `40`, the per-token CB
 /// is committed each time it has accumulated ~40 compute encoders at a full-attn
 /// island CLOSE. On Qwen3.6-27B (129 encoders, full-attn every 4th of 64 layers)
-/// this yields boundaries at ord 39/79/119 (== the measured split3); on
-/// Qwen3.5-9B (65 encoders) a single boundary at ord 39. The win saturates at 3
-/// commits/token on 27B (metal-R9 P2), so a coarse stride is deliberate: it
-/// removes every large-CB stall while adding the fewest commits.
+/// this yields boundaries at ord 39/79/119 (== the measured split3). The win
+/// saturates at 3 commits/token on 27B (metal-R9 P2), so a coarse stride is
+/// deliberate: it removes every large-CB stall while adding the fewest commits.
 pub(crate) const AUTO_SPLIT_ENCODER_STRIDE: u32 = 40;
 
-/// `true` when the CB-split lever is active (an explicit `SPLIT_CB_AT_ORD` list
-/// OR the AUTO policy). When `false`, the decode core does zero extra work and
-/// the per-token CB is a single commit (byte-identical to the pre-lever path).
-#[inline]
-pub(crate) fn cb_split_enabled() -> bool {
-    cb_split_auto() || !split_cb_ords().is_empty()
-}
+/// Minimum per-token encoder count (`2*layers+1`) for the AUTO policy to
+/// engage. Below this, stride-40 fires a single split near the token tail,
+/// measured FLAT on Qwen3.5-9B (65 encoders; metal-R9/R10) -- harmless but
+/// pointless, so the AUTO policy skips it and the token stays single-CB.
+/// At 73+ encoders (>= 36 layers) the first split leaves a >= 33-encoder
+/// continuation and the stall removal is real (27B/MoE). An explicit
+/// `SPLIT_CB_AT_ORD` list bypasses this gate.
+pub(crate) const AUTO_SPLIT_MIN_ENCODERS: u32 = 73;
 
 pub(crate) fn init_from_env() {
     if std::env::var("LUMEN_METAL_DECODE_PROFILE").ok().as_deref() == Some("1") {

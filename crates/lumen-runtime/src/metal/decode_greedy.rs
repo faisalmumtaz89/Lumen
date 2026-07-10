@@ -344,10 +344,18 @@ impl MetalF32Backend {
         // terminal CB's signal; that split-vs-event interaction is unverified, so
         // an event-ordered path (none exists today; defensive) is NOT split. The
         // non-pipelined (sequential) path is not split either.
-        let split_lever_on = pipe.as_ref().map_or(false, |w| w.event.is_none())
-            && decode_profile::cb_split_enabled();
         let split_explicit_ords = decode_profile::split_cb_ords();
-        let split_auto = split_explicit_ords.is_empty() && decode_profile::cb_split_auto();
+        // AUTO policy (default-ON since metal-R10): engages only when the
+        // per-token encoder count (2*layers+1) reaches AUTO_SPLIT_MIN_ENCODERS.
+        // Below that (e.g. Qwen3.5-9B, 65 encoders) the single stride-40 split
+        // lands in the token tail and measured FLAT, so it is skipped and the
+        // token stays single-CB. An explicit SPLIT_CB_AT_ORD list is used
+        // verbatim and bypasses the size gate.
+        let split_auto = split_explicit_ords.is_empty()
+            && decode_profile::cb_split_auto()
+            && 2 * (num_layers as u32) + 1 >= decode_profile::AUTO_SPLIT_MIN_ENCODERS;
+        let split_lever_on = pipe.as_ref().is_some_and(|w| w.event.is_none())
+            && (split_auto || !split_explicit_ords.is_empty());
         let mut enc_ord: u32 = 0;
         // First encoder ordinal of the current (uncommitted) CB; advanced past each
         // split boundary. The AUTO policy commits when this CB has reached ~40
@@ -3276,7 +3284,8 @@ impl MetalF32Backend {
         // [metal-R9] One-time announce of the CB-split boundaries actually taken
         // (stderr only; stdout stays byte-identical). Fires once per process on
         // the first token that split, so an operator/gate can confirm the policy
-        // resolved to the expected ordinals (27B auto: 39/79/119; 9B auto: 39).
+        // resolved to the expected ordinals (27B auto: 39/79/119; MoE 35B-A3B
+        // auto: 39/79; 9B auto: none -- below AUTO_SPLIT_MIN_ENCODERS).
         if split_lever_on && !split_ords_hit.is_empty() {
             static ANNOUNCE: std::sync::Once = std::sync::Once::new();
             ANNOUNCE.call_once(|| {
