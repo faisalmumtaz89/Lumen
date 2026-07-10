@@ -2267,6 +2267,23 @@ fn run_with_mmap(
     session_flags: &SessionFlags,
     enable_thinking: bool,
 ) {
+    // Metal + mmap provider: default the no-copy unified-buffer residency path
+    // ON (`LUMEN_METAL_MMAP_ONLY=1`), aligning the CLI with `lumen-server`
+    // (see its provider-selection block). This skips the redundant CPU staging
+    // copy + GPU private blit at load (MoE-Q8 load peak: ~75 GB -> ~12.6 GB,
+    // which OOM-killed the legacy path on 96 GB hosts) and is proven
+    // byte-identical to the copy path (`metal_sync_mmap_argmax_parity_test`;
+    // R6/R10 A/B). An explicit operator value (e.g. `LUMEN_METAL_MMAP_ONLY=0`)
+    // still wins because we only set the env when unset; `--sync` keeps the
+    // legacy full-copy provider path (`run_with_sync`). Set BEFORE the
+    // provider/backend so the `gpu_resident.rs` preload probe sees it.
+    if use_metal && std::env::var_os("LUMEN_METAL_MMAP_ONLY").is_none() {
+        // SAFETY: single-threaded at this point in CLI boot (no worker threads
+        // spawned yet), mirroring the identical set in `lumen-server`.
+        unsafe {
+            std::env::set_var("LUMEN_METAL_MMAP_ONLY", "1");
+        }
+    }
     let mmap_config = MmapConfig {
         prefetch_window: 2,
         advise_sequential: true,
