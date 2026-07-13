@@ -22,13 +22,6 @@ impl ComputeBackend for MetalF32Backend {
         self.cached_hidden_dim = hyperparams.hidden_dim as usize;
         self.cached_vocab_size = hyperparams.vocab_size as usize;
 
-        // Initialise the MPSGraph context up-front so dispatch
-        // sites can look it up via `mps_graph_ffi::get()` without
-        // threading `&MetalDevice` through every encode function. The
-        // returned context is process-wide; subsequent prefill calls
-        // reuse the same compiled-graph cache.
-        let _ = super::mps_graph_ffi::get_or_init(&self.device);
-
         // Compile shader pipelines
         let pipelines = self.compile_pipelines()?;
 
@@ -262,11 +255,6 @@ impl ComputeBackend for MetalF32Backend {
             gate_buf: make_buf(inter_dim.max(q_dim))?, // max of FFN inter_dim and attn q_dim (Q+gate deinterleave)
             up_buf: make_buf(inter_dim)?,
             down_buf: make_buf(hidden_dim)?,
-            // SPLIT-K down partials: [hidden_dim * MAX_K_SPLITS(8)] f32 (env-gated kernel).
-            splitk_partials_buf: make_buf(hidden_dim * 8)?,
-            // SPLIT-K gate/up partials: gate [inter*8] + up [inter*8] f32 (env-gated).
-            splitk_gateup_partials_buf: make_buf(inter_dim * 8 * 2)?,
-            splitk_normed_buf: make_buf(hidden_dim)?,
             logits_buf: make_buf(vocab_size)?,
             // Option-B async-commit double-buffer: allocated lazily only when the
             // flag is on (the default synchronous path leaves it None).
@@ -359,14 +347,6 @@ impl ComputeBackend for MetalF32Backend {
             moe_num_active_experts,
             moe_expert_inter_dim,
             moe_router_logits,
-            // 1-element atomic counter for the fused router.
-            moe_router_counter: if moe_num_experts > 0 {
-                Some(self.device.new_buffer(4).ok_or_else(|| {
-                    RuntimeError::Compute("Failed to allocate MoE router_counter buffer".into())
-                })?)
-            } else {
-                None
-            },
             moe_expert_ids,
             moe_expert_weights,
             moe_expert_output,
@@ -504,10 +484,6 @@ impl ComputeBackend for MetalF32Backend {
             qmv_attn_wk_scales: Vec::new(),
             qmv_attn_wv_qw: Vec::new(),
             qmv_attn_wv_scales: Vec::new(),
-            // GDN ssm_out decode-qmv buffers (LUMEN_METAL_Q4_QMV_SSMOUT). Empty
-            // until `preload_weights_gpu_resident` builds them when env-gated ON.
-            qmv_gdn_ssm_out_qw: Vec::new(),
-            qmv_gdn_ssm_out_scales: Vec::new(),
             // GDN ssm_out Q8->Q4 native-NR2 requant buffers
             // (LUMEN_METAL_Q4_SSMOUT_NR2). Empty until built when env-gated ON.
             q4nr2_ssm_out: Vec::new(),
@@ -517,8 +493,6 @@ impl ComputeBackend for MetalF32Backend {
             qmv_ffn_gate_scales: Vec::new(),
             qmv_ffn_up_qw: Vec::new(),
             qmv_ffn_up_scales: Vec::new(),
-            qmv_ffn_gate_up_il_qw: Vec::new(),
-            qmv_ffn_gate_up_il_scales: Vec::new(),
             qmv_ffn_gate_up_ls_qw: Vec::new(),
             qmv_ffn_gate_up_ls_scales: Vec::new(),
             qmv_zero_residual_buf: None,

@@ -188,12 +188,6 @@ impl MetalF32Backend {
         // order, so the implicit cross-CB ordering on `batch_x_buf` is
         // preserved without an explicit fence.
         //
-        // Multi-CB is INCOMPATIBLE with the concurrent_encoder_full outer-encoder
-        // path (single encoder spans all layers and cannot cross a CB
-        // boundary), with profile mode (the profiler splits CBs at its
-        // own granularity), and with batch_size < num_layers (no point
-        // splitting). Each of these falls back to K=1.
-        let cb_count_request = super::graph_reorder::multi_cb_count();
         let helper_new_cb =
             |unretained: bool, profilable: bool| -> Result<MetalCommandBuffer, RuntimeError> {
                 let res = match (profilable, unretained) {
@@ -449,91 +443,7 @@ impl MetalF32Backend {
             // between encoders within the same command buffer (implicit
             // barriers). The scratch guard is held throughout, eliminating
             // 22 lock/unlock cycles in the inner loop.
-            //
-            // when LUMEN_METAL_MULTI_CB=1, split the prefill
-            // across `cb_count_request` CBs (default 2). Each CB carries
-            // a contiguous range of layers. CB[k] is commit()'d (no wait)
-            // once its last layer is encoded, then encoding of CB[k+1]
-            // proceeds while CB[k] runs on the GPU. The final CB is the
-            // one that calls commit_and_wait() at the end of prefill().
-            //
-            // Multi-CB is disabled when profile mode is active (profiler
-            // already splits CBs at section boundaries, double-splitting
-            // would scramble attribution). When K=1, the multi-CB branch is
-            // bypassed and the code path is bit-exact to the K=1 loop above.
-            let multi_cb = cb_count_request > 1 && !super::profile::is_enabled();
-            if multi_cb {
-                let k = cb_count_request.min(num_layers);
-                // Per-CB layer count, with the remainder loaded onto the
-                // FINAL CB so the early CBs are smaller and finish first.
-                // Example for num_layers=32, K=2: CB[0] has 16, CB[1] has
-                // 16. For num_layers=32, K=3: CB[0]=10, CB[1]=10, CB[2]=12.
-                let base = num_layers / k;
-                // The first CB is `cmd` (already constructed above and
-                // already contains the embed encoder). Subsequent CBs are
-                // constructed lazily within the loop.
-                let mut current_cb = cmd;
-                let mut cur_idx: usize = 0;
-                // Layer ranges by CB: cb 0 -> [0, base); cb 1 -> [base, 2*base); ...; cb K-1 -> [(K-1)*base, num_layers).
-                // The remainder goes to the LAST CB.
-                let cb_end = |k_idx: usize| -> usize {
-                    if k_idx + 1 == k {
-                        num_layers
-                    } else {
-                        (k_idx + 1) * base
-                    }
-                };
-                // Track the queue of in-flight CBs we still hold a handle to.
-                // We only need to wait on the LAST one (FIFO ordering on
-                // same queue means later CBs imply earlier are done), but
-                // we MUST keep early CBs alive until they have been
-                // committed — `commit()` is non-blocking; the CB handle's
-                // Drop releases the underlying MTLCommandBuffer pointer.
-                // After commit() the GPU still references the CB so it is
-                // safe for the handle to be dropped, but to keep semantics
-                // crystal-clear we hold them in a Vec
-                // until the final wait completes.
-                let mut held_cbs: Vec<MetalCommandBuffer> = Vec::with_capacity(k);
-                for layer in 0..num_layers {
-                    let mut kv_view = kv.view_mut(layer)?;
-                    self.encode_layer_batched(
-                        &current_cb,
-                        layer,
-                        batch_size,
-                        &layer_views[layer],
-                        &mut kv_view,
-                        pipelines,
-                        s,
-                    )?;
-                    kv.commit_view(kv_view)?;
-
-                    // If this layer is the LAST in its CB, commit and (unless
-                    // it's the final CB) start the next CB. The final CB is
-                    // committed via the unified `commit_and_wait()` below.
-                    let is_last_in_cb = (layer + 1) == cb_end(cur_idx);
-                    let is_final_cb = cur_idx + 1 == k;
-                    if is_last_in_cb && !is_final_cb {
-                        // Replace current_cb with a freshly constructed CB
-                        // for the next slice. We keep the old `current_cb`
-                        // alive in `held_cbs` so its underlying MTLCommandBuffer
-                        // is not released until the final wait completes.
-                        let next_cb = helper_new_cb(unretained, false)?;
-                        let prev_cb = std::mem::replace(&mut current_cb, next_cb);
-                        // commit() is the asynchronous variant; CPU returns
-                        // immediately and GPU enqueues this CB behind any
-                        // prior CBs on the same queue.
-                        prev_cb.commit();
-                        held_cbs.push(prev_cb);
-                        cur_idx += 1;
-                    }
-                }
-                // The final CB is `current_cb`. Single sync point closes
-                // the entire prefill — earlier CBs are guaranteed done
-                // before this returns (FIFO ordering on same queue).
-                current_cb.commit_and_wait();
-                // Now safe to drop held CBs; their GPU work is complete.
-                drop(held_cbs);
-            } else {
+            {
                 // NaN dump (opt-in via `LUMEN_METAL_NAN_DUMP=1`):
                 // commit each layer's CB separately and scan x_buf for NaN
                 // after each layer. Used to pinpoint the first layer that
@@ -589,60 +499,6 @@ impl MetalF32Backend {
                     let gputime =
                         std::env::var("LUMEN_METAL_PREFILL_GPUTIME").ok().as_deref() == Some("1");
 
-                    // Dual-queue GDN branch-overlap setup
-                    // (`LUMEN_METAL_GDN_DUAL_QUEUE=1`). When enabled, allocate a
-                    // second command queue + a whole-prefill aux command buffer +
-                    // 3 per-prefill shared events, and install them as the
-                    // thread-local dual-queue context. GDN layers route their
-                    // independent branches (B: alpha/beta/gates, C: attn-gate) onto
-                    // the aux CB; the main CB carries E0/A/recurrence/join. AGX runs
-                    // the two queues concurrently; the events enforce the exact DAG.
-                    // Skipped under profile mode (the profiler owns CB splitting).
-                    let dual_queue = super::graph_reorder::gdn_dual_queue_enabled()
-                        && !super::profile::is_enabled();
-                    let dq_installed = if dual_queue {
-                        let aux_queue = self.device.new_command_queue().ok_or_else(|| {
-                            RuntimeError::Compute(
-                                "dual-queue: failed to create aux command queue".into(),
-                            )
-                        })?;
-                        let aux_cmd = aux_queue.new_command_buffer().ok_or_else(|| {
-                            RuntimeError::Compute(
-                                "dual-queue: failed to create aux command buffer".into(),
-                            )
-                        })?;
-                        let ev_norm = self.device.new_shared_event().ok_or_else(|| {
-                            RuntimeError::Compute(
-                                "dual-queue: failed to create norm-ready event".into(),
-                            )
-                        })?;
-                        let ev_ab = self.device.new_shared_event().ok_or_else(|| {
-                            RuntimeError::Compute(
-                                "dual-queue: failed to create ab-ready event".into(),
-                            )
-                        })?;
-                        let ev_gate = self.device.new_shared_event().ok_or_else(|| {
-                            RuntimeError::Compute(
-                                "dual-queue: failed to create gate-ready event".into(),
-                            )
-                        })?;
-                        // The aux queue must outlive its command buffer; leak its
-                        // Rust handle into the ctx via a Box kept alive by the
-                        // closure scope below. Simpler: hold the queue in a local
-                        // that lives to the end of this block (after the final
-                        // wait), so its Drop (release) runs only post-completion.
-                        super::gdn::dual_queue_ctx_set(super::gdn::DualQueueCtx {
-                            aux_cmd,
-                            ev_norm_ready: ev_norm,
-                            ev_ab_ready: ev_ab,
-                            ev_gate_ready: ev_gate,
-                            ord: 0,
-                        });
-                        Some(aux_queue)
-                    } else {
-                        None
-                    };
-
                     let enc_start = if gputime {
                         Some(std::time::Instant::now())
                     } else {
@@ -662,31 +518,7 @@ impl MetalF32Backend {
                         kv.commit_view(kv_view)?;
                     }
 
-                    if let Some(ctx) = super::gdn::dual_queue_ctx_take() {
-                        // Dual-queue commit ordering: commit the aux CB (no wait),
-                        // then commit+wait the main CB. The main CB contains waits
-                        // on every aux-signaled event, so main completion implies
-                        // aux completion. Keep ctx (aux CB + events) and the aux
-                        // queue handle alive through GPU execution, then drop.
-                        ctx.aux_cmd.commit();
-                        if let Some(t0) = enc_start {
-                            let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                            let commit_t0 = std::time::Instant::now();
-                            cmd.commit_and_wait();
-                            let commit_ms = commit_t0.elapsed().as_secs_f64() * 1000.0;
-                            let gpu_ms = cmd.gpu_elapsed_secs() * 1000.0;
-                            eprintln!(
-                                "[prefill-gputime] (dual-queue) batch={batch_size} \
-                                 cpu_encode={encode_ms:.2}ms commit_wait={commit_ms:.2}ms \
-                                 gpu_busy={gpu_ms:.2}ms gpu_util={:.1}%",
-                                100.0 * gpu_ms / (encode_ms + commit_ms)
-                            );
-                        } else {
-                            cmd.commit_and_wait();
-                        }
-                        drop(ctx);
-                        drop(dq_installed);
-                    } else if let Some(t0) = enc_start {
+                    if let Some(t0) = enc_start {
                         let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
                         let commit_t0 = std::time::Instant::now();
                         cmd.commit_and_wait();

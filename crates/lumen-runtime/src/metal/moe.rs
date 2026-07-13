@@ -1365,21 +1365,7 @@ impl MetalF32Backend {
 
             // Dispatch 1: Batched gate+up+SwiGLU (routed experts) -- reads normed_buf
             if super::moe_diag_skip() != 2 {
-                // One-simdgroup-per-row redesign for the q8 routed
-                // gate+up+swiglu (LUMEN_METAL_MOE_GATEUP_SGROW=1). Default OFF.
-                let use_gateup_v2 = matches!(moe_meta.expert_gate_quant, QuantScheme::Q8_0)
-                    && pipelines.moe_batched_gate_up_swiglu_q8_0_v2.is_some()
-                    && super::moe_gateup_sgrow_enabled();
-                let (pipeline, gu_threads, gu_n_tg) = if use_gateup_v2 {
-                    (
-                        pipelines
-                            .moe_batched_gate_up_swiglu_q8_0_v2
-                            .as_ref()
-                            .unwrap(),
-                        128u64,
-                        (((top_k * inter_dim) as u64) + 3) / 4,
-                    )
-                } else {
+                let (pipeline, gu_threads, gu_n_tg) = {
                     let p = match moe_meta.expert_gate_quant {
                         QuantScheme::Q8_0 => {
                             pipelines.moe_batched_gate_up_swiglu_q8_0.as_ref().unwrap()
@@ -1469,27 +1455,7 @@ impl MetalF32Backend {
             if !diag_skip_down {
                 let down_quant = moe_meta.expert_down_quant;
                 let se_down_quant = meta.shared_expert_down_quant.unwrap_or(QuantScheme::F32);
-                // When LUMEN_METAL_MOE_DOWN_SGROW=1 AND this is the
-                // mixed q8-routed / q4-shared production case, use the
-                // one-simdgroup-per-row redesign (2 rows/TG, 64 threads/TG,
-                // grid=ceil(hidden/2)). Default OFF -> original byte path.
-                let use_sgrow_v2 = matches!(
-                    (down_quant, se_down_quant),
-                    (QuantScheme::Q8_0, QuantScheme::Q4_0)
-                ) && pipelines
-                    .moe_batched_down_accum_shared_q8_0_se_q4_0_v2
-                    .is_some()
-                    && super::moe_down_sgrow_enabled();
-                let (pipeline, tg_threads, n_tg) = if use_sgrow_v2 {
-                    (
-                        pipelines
-                            .moe_batched_down_accum_shared_q8_0_se_q4_0_v2
-                            .as_ref()
-                            .unwrap(),
-                        64u64,
-                        ((hidden_dim as u64) + 1) / 2,
-                    )
-                } else {
+                let (pipeline, tg_threads, n_tg) = {
                     let p = match (down_quant, se_down_quant) {
                         (QuantScheme::Q8_0, QuantScheme::Q8_0) => pipelines
                             .moe_batched_down_accum_shared_q8_0

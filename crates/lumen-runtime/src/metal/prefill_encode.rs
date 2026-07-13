@@ -6,9 +6,7 @@
 use super::graph_reorder::{
     self, gdn_concurrent_encoder_enabled, Access, AccessList, BufferId, LayerOp, OrderClass,
 };
-use super::{
-    use_ggml_ported_q8_0_gemm, CachedLayerMeta, MetalF32Backend, MetalPipelines, MetalScratch,
-};
+use super::{CachedLayerMeta, MetalF32Backend, MetalPipelines, MetalScratch};
 use crate::error::RuntimeError;
 use crate::kv::KvCacheView;
 use crate::metal::ffi::{MTLSize, MetalBuffer, MetalCommandBuffer, MetalComputeEncoder};
@@ -76,36 +74,17 @@ fn metal_attn_precise_engage(
     );
 }
 
-/// Dispatch a Q8_0 × F32 → F32 batched-prefill GEMM.
-///
-/// When `LUMEN_METAL_GEMM_GGML_PORT=1` AND the underlying weight is Q8_0,
-/// reroutes the dispatch through the ggml-ported `kernel_mul_mm_q8_0_f32_ported`
-/// kernel (tile NR0=64 × NR1=32, threadgroup memory 8192 B). Otherwise
-/// performs the original dispatch with the supplied grid.
-///
-/// `m` is the batch size, `n` is the output dim. Both are needed because the
-/// ported kernel uses a different tile shape than the in-tree tiled GEMM.
+/// Dispatch a Q8_0 × F32 → F32 batched-prefill GEMM with the supplied grid.
 #[inline]
 fn dispatch_q8_0_or_orig(
     enc: &MetalComputeEncoder,
-    pipelines: &MetalPipelines,
-    is_q8_0: bool,
-    m: u32,
-    n: u32,
+    _pipelines: &MetalPipelines,
+    _is_q8_0: bool,
+    _m: u32,
+    _n: u32,
     orig_grid: MTLSize,
 ) {
-    if is_q8_0 && use_ggml_ported_q8_0_gemm() {
-        enc.set_pipeline_state(&pipelines.kernel_mul_mm_q8_0_f32_ported);
-        enc.set_threadgroup_memory_length(8192, 0);
-        // Ported kernel tile = NR0=64 (N_out) × NR1=32 (M_batch)
-        // tg_pos.y indexes ceil(N/64); tg_pos.x indexes ceil(M/32)
-        enc.dispatch_threadgroups(
-            MTLSize::new((m as u64).div_ceil(32), (n as u64).div_ceil(64), 1),
-            MTLSize::new(128, 1, 1),
-        );
-    } else {
-        enc.dispatch_threadgroups(orig_grid, MTLSize::new(128, 1, 1));
-    }
+    enc.dispatch_threadgroups(orig_grid, MTLSize::new(128, 1, 1));
 }
 
 impl MetalF32Backend {
@@ -1965,70 +1944,23 @@ impl MetalF32Backend {
                         // diag wholeattn: intentionally skip the GDN attention
                         // megakernel (no-op; garbage output, profiling only).
                     } else {
-                        // Dual-queue GDN branch-overlap path
-                        // (`LUMEN_METAL_GDN_DUAL_QUEUE=1`): route to the dual-queue
-                        // variant ONLY when a per-prefill dual-queue context is
-                        // installed AND this layer's wq/attn_gate/ssm_out are all Q8
-                        // AND the de-aliased role buffers + parallel conv1d exist.
-                        // Otherwise fall through to the bit-exact production path.
-                        let dq_eligible = super::gdn::dual_queue_ctx_active()
-                            && matches!(gdn_meta.wq_quant, QuantScheme::Q8_0)
-                            && matches!(gdn_meta.attn_gate_quant, Some(QuantScheme::Q8_0))
-                            && matches!(gdn_meta.ssm_out_quant, Some(QuantScheme::Q8_0))
-                            && scratch.batch_gdn_alpha_buf.is_some()
-                            && scratch.batch_gdn_beta_buf.is_some()
-                            && scratch.batch_gdn_conv_out_buf.is_some()
-                            && scratch.batch_gdn_raw_out_buf.is_some()
-                            && scratch.batch_gdn_ssm_in_buf.is_some()
-                            && pipelines.ssm_conv1d_silu_prefill_parallel.is_some()
-                            && pipelines.ssm_conv1d_state_update.is_some();
-                        if dq_eligible {
-                            // Take the ctx out of the thread-local for the duration
-                            // of the call (so we can borrow its fields immutably
-                            // alongside `scratch`), bump ord, then re-install it.
-                            let mut ctx = super::gdn::dual_queue_ctx_take().unwrap();
-                            ctx.ord += 1;
-                            let ord = ctx.ord;
-                            let new_conv_pos = Self::encode_batched_gdn_prefill_dual_queue(
-                                cmd,
-                                &ctx.aux_cmd,
-                                &ctx.ev_norm_ready,
-                                &ctx.ev_ab_ready,
-                                &ctx.ev_gate_ready,
-                                ord,
-                                pipelines,
-                                scratch,
-                                layer_buf,
-                                &gdn_meta,
-                                gdn_idx,
-                                x_buf,
-                                normed_buf,
-                                qkv_buf,
-                                attn_out_buf,
-                                attn_proj_buf,
-                                batch_size,
-                            )?;
-                            scratch.gdn_conv_positions[gdn_idx] = new_conv_pos;
-                            super::gdn::dual_queue_ctx_set(ctx);
-                        } else {
-                            let new_conv_pos = Self::encode_batched_gdn_prefill(
-                                cmd,
-                                None,
-                                pipelines,
-                                scratch,
-                                layer_buf,
-                                &gdn_meta,
-                                gdn_idx,
-                                x_buf,
-                                normed_buf,
-                                qkv_buf,
-                                attn_out_buf,
-                                gate_buf,
-                                attn_proj_buf,
-                                batch_size,
-                            )?;
-                            scratch.gdn_conv_positions[gdn_idx] = new_conv_pos;
-                        }
+                        let new_conv_pos = Self::encode_batched_gdn_prefill(
+                            cmd,
+                            None,
+                            pipelines,
+                            scratch,
+                            layer_buf,
+                            &gdn_meta,
+                            gdn_idx,
+                            x_buf,
+                            normed_buf,
+                            qkv_buf,
+                            attn_out_buf,
+                            gate_buf,
+                            attn_proj_buf,
+                            batch_size,
+                        )?;
+                        scratch.gdn_conv_positions[gdn_idx] = new_conv_pos;
                     }
                 } else {
                     // Fallback: token-by-token processing using single-token decode path.
@@ -4808,9 +4740,7 @@ impl MetalF32Backend {
 
     /// Construct a `LayerOp` for a plain quant GEMM `output = weight @ input`.
     ///
-    /// Pipeline selection mirrors `encode_layer_batched`'s match arms. The
-    /// `ggml-port` fast path (`use_ggml_ported_q8_0_gemm()`) is preserved
-    /// through `dispatch_q8_0_or_orig`.
+    /// Pipeline selection mirrors `encode_layer_batched`'s match arms.
     #[allow(clippy::too_many_arguments)]
     fn concurrent_encoder_emit_gemm<'a>(
         label: &'static str,

@@ -3,49 +3,11 @@
 //! Extracted from mod.rs for modularity.
 //! These are methods on MetalF32Backend that encode GDN-specific GPU dispatch sequences.
 
-use super::ffi::MetalSharedEvent;
 use super::graph_reorder;
 use super::{CachedLayerMeta, MetalF32Backend, MetalPipelines, MetalScratch};
 use crate::error::RuntimeError;
 use crate::metal::ffi::{MTLSize, MetalBuffer, MetalCommandBuffer, MetalComputeEncoder};
 use lumen_format::quantization::QuantScheme;
-use std::cell::RefCell;
-
-/// Per-prefill dual-queue context for the GDN branch-overlap path
-/// (`LUMEN_METAL_GDN_DUAL_QUEUE=1`). Set by the prefill driver before the layer
-/// loop and cleared after; read by `encode_batched_gdn_prefill` to route GDN
-/// layers through the dual-queue variant. Thread-local because prefill runs
-/// single-threaded per request and this avoids threading the context through
-/// the many-arg `encode_layer_batched` call chain (matching the codebase's
-/// existing thread-local profile-state pattern). Holds owned aux CB + 3 events
-/// for the lifetime of one prefill; `ord` is the running 1-based GDN ordinal.
-pub(crate) struct DualQueueCtx {
-    pub aux_cmd: MetalCommandBuffer,
-    pub ev_norm_ready: MetalSharedEvent,
-    pub ev_ab_ready: MetalSharedEvent,
-    pub ev_gate_ready: MetalSharedEvent,
-    pub ord: u64,
-}
-
-thread_local! {
-    static DUAL_QUEUE_CTX: RefCell<Option<DualQueueCtx>> = const { RefCell::new(None) };
-}
-
-/// Install the dual-queue context for the current prefill (thread-local).
-pub(crate) fn dual_queue_ctx_set(ctx: DualQueueCtx) {
-    DUAL_QUEUE_CTX.with(|c| *c.borrow_mut() = Some(ctx));
-}
-
-/// Take (remove) the dual-queue context, returning it so the driver can commit
-/// the aux CB and keep the events alive until the main CB completes.
-pub(crate) fn dual_queue_ctx_take() -> Option<DualQueueCtx> {
-    DUAL_QUEUE_CTX.with(|c| c.borrow_mut().take())
-}
-
-/// True if a dual-queue context is currently installed.
-pub(crate) fn dual_queue_ctx_active() -> bool {
-    DUAL_QUEUE_CTX.with(|c| c.borrow().is_some())
-}
 
 impl MetalF32Backend {
     /// Encode full GatedDeltaNet (linear attention) layer for single-token decode.
@@ -934,8 +896,6 @@ impl MetalF32Backend {
                     // compiled, dispatch qmv_q4_0_rmsnorm_f16sc (reads `half*` scales).
                     // Byte-identical to the f32-scale kernel (f16 is the on-disk Q4_0
                     // native scale precision). Mirrors the lm_head f16sc dispatch.
-                    // A/B EXPERIMENT: else swap to the llama.cpp lane->block mapping
-                    // variant when LUMEN_METAL_Q4_QMV_PROJ_LCMAP=1 (same buffers/geometry).
                     let proj_f16sc_pipe = if crate::metal::q4_proj_f16sc_enabled() {
                         pipelines.qmv_q4_0_rmsnorm_f16sc.as_ref()
                     } else {
@@ -958,8 +918,6 @@ impl MetalF32Backend {
                         enc.set_pipeline_state(p);
                     } else if let Some(p) = proj_f16sc_pipe {
                         enc.set_pipeline_state(p);
-                    } else if crate::metal::q4_qmv_proj_lcmap_enabled() {
-                        enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm_llamacpp);
                     } else {
                         enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm);
                     }
@@ -1621,38 +1579,15 @@ impl MetalF32Backend {
         // Prefer fused SiLU+matvec (eliminates silu_elementwise_mul dispatch + barrier).
         // gate_sigmoid_buf holds raw gate values; normed_out_buf holds GDN normed output.
         //
-        // MLX-style Q4 decode-qmv fast path for the ssm_out projection (env
-        // LUMEN_METAL_Q4_QMV_SSMOUT=1): the SiLU gate fusion in the NR2 kernel
-        // blocks a clean qmv reuse, so apply SiLU in a tiny `silu_elementwise_mul`
-        // predecessor (silu(gate)*normed_out -> gate_sigmoid_buf, the exact fallback
-        // step), then run `qmv_q4_0_residual` (zero residual) -> ssm_proj_buf, then
-        // `residual_add_copy` (x_buf += proj; attn_proj = x_buf). Mirrors the F16/Bf16
-        // non-fused ssm_out structure but with the qmv matvec. Vec indexed by gdn_idx.
-        let qmv_ssm_out = if ssm_out_quant == QuantScheme::Q4_0 {
-            match (
-                s.qmv_gdn_ssm_out_qw.get(gdn_idx),
-                s.qmv_gdn_ssm_out_scales.get(gdn_idx),
-                s.qmv_zero_residual_buf.as_ref(),
-            ) {
-                (Some(Some(qw)), Some(Some(sc)), Some(zero_res)) => Some((qw, sc, zero_res)),
-                _ => None,
-            }
-        } else {
-            None
-        };
         // GDN ssm_out Q8->Q4 NATIVE-NR2 fast path (env LUMEN_METAL_Q4_SSMOUT_NR2):
         // when a per-layer Q4_0-NR2 requant buffer exists for this GDN layer AND the
-        // qmv path above is NOT engaged AND the Q4 fused kernel is compiled, bind the
-        // Q4 weight + run the SAME single-dispatch fused silu+matvec+residual+copy
-        // kernel the Q8 path uses (`pso_silu_matvec_q4`). Halves the ssm_out weight
-        // stream with no extra dispatch. (`s.q4nr2_ssm_out` indexed by gdn_idx.)
-        let nr2_ssm_out_q4: Option<&MetalBuffer> = if qmv_ssm_out.is_none() {
-            match s.q4nr2_ssm_out.get(gdn_idx) {
-                Some(Some(buf)) if pso_silu_matvec_q4.is_some() => Some(buf),
-                _ => None,
-            }
-        } else {
-            None
+        // Q4 fused kernel is compiled, bind the Q4 weight + run the SAME
+        // single-dispatch fused silu+matvec+residual+copy kernel the Q8 path uses
+        // (`pso_silu_matvec_q4`). Halves the ssm_out weight stream with no extra
+        // dispatch. (`s.q4nr2_ssm_out` indexed by gdn_idx.)
+        let nr2_ssm_out_q4: Option<&MetalBuffer> = match s.q4nr2_ssm_out.get(gdn_idx) {
+            Some(Some(buf)) if pso_silu_matvec_q4.is_some() => Some(buf),
+            _ => None,
         };
         if let Some(nr2_q4) = nr2_ssm_out_q4 {
             // Fused: silu(gate) * normed_out computed inline during Q4_0 matvec
@@ -1671,84 +1606,6 @@ impl MetalF32Backend {
             enc.set_buffer(gate_sigmoid_buf, 0, 6); // gate values
             let n_tg = ((hidden_dim as u64) + 1) / 2;
             enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(128, 1, 1));
-        } else if let Some((qw, sc, zero_res)) = qmv_ssm_out {
-            // Predecessor: silu(gate)*normed_out -> gate_sigmoid_buf (in_dim = q_dim).
-            let pso_silu_mul = pipelines.silu_elementwise_mul.as_ref().ok_or_else(|| {
-                RuntimeError::Compute("silu_elementwise_mul pipeline not compiled".into())
-            })?;
-            enc.set_pipeline_state(pso_silu_mul);
-            enc.set_buffer(gate_sigmoid_buf, 0, 0); // gate (raw)
-            enc.set_buffer(normed_out_buf, 0, 1); // normed GDN output
-            enc.set_buffer(gate_sigmoid_buf, 0, 2); // output overwrites gate_sigmoid_buf
-            enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
-            let fused_tg = 256u64.min(q_dim as u64).max(1);
-            enc.dispatch_threadgroups(
-                MTLSize::new((q_dim as u64).div_ceil(fused_tg), 1, 1),
-                MTLSize::new(fused_tg, 1, 1),
-            );
-
-            // Two-pass deterministic SPLIT-K (env LUMEN_METAL_Q4_SSMOUT_SPLITK=N,
-            // default 0=off) when in_dim=q_dim splits evenly into N 512-block slices;
-            // else the one-pass qmv_q4_0_residual. Splits the K=q_dim contraction
-            // across N× more threadgroups to lift the row-starved (out=hidden=2048,
-            // ~8.5 SG/core) ssm_out matvec occupancy. Zero residual (added next).
-            let ssm_k_splits = crate::metal::q4_ssmout_splitk();
-            if ssm_k_splits >= 2 && (q_dim as u32) % (512 * ssm_k_splits) == 0 {
-                // Pass 1: per-(row-group, k-slice) partial dot -> partials scratch.
-                enc.set_pipeline_state(&pipelines.qmv_q4_0_splitk_partial);
-                enc.set_buffer(qw, 0, 0);
-                enc.set_buffer(gate_sigmoid_buf, 0, 1); // gated input
-                enc.set_buffer(&s.splitk_partials_buf, 0, 2);
-                enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
-                enc.set_buffer(sc, 0, 4);
-                enc.set_bytes(&ssm_k_splits.to_le_bytes(), 5);
-                enc.dispatch_threadgroups(
-                    MTLSize::new((hidden_dim as u64) / 8, ssm_k_splits as u64, 1),
-                    MTLSize::new(64, 1, 1),
-                );
-                enc.memory_barrier_with_scope(1);
-                // Pass 2: deterministic reduce (fixed ks-ascending) + zero residual.
-                enc.set_pipeline_state(&pipelines.qmv_q4_0_splitk_reduce);
-                enc.set_buffer(&s.splitk_partials_buf, 0, 0);
-                enc.set_buffer(ssm_proj_buf, 0, 1);
-                enc.set_buffer(zero_res, 0, 2);
-                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                enc.set_bytes(&ssm_k_splits.to_le_bytes(), 4);
-                enc.dispatch_threadgroups(
-                    MTLSize::new((hidden_dim as u64).div_ceil(256), 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-            } else {
-                // qmv_q4_0_residual: w@0, x@1, out@2, in_dim@3, scales@4, residual@5.
-                // out_dim = hidden_dim (implicit, %8==0); in_dim = q_dim (%512==0).
-                // Zero residual so out == W*input exactly; residual added next.
-                enc.set_pipeline_state(&pipelines.qmv_q4_0_residual);
-                enc.set_buffer(qw, 0, 0);
-                enc.set_buffer(gate_sigmoid_buf, 0, 1); // gated input
-                enc.set_buffer(ssm_proj_buf, 0, 2);
-                enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
-                enc.set_buffer(sc, 0, 4);
-                enc.set_buffer(zero_res, 0, 5);
-                enc.dispatch_threadgroups(
-                    MTLSize::new((hidden_dim as u64) / 8, 1, 1),
-                    MTLSize::new(64, 1, 1),
-                );
-            }
-
-            // residual_add_copy: x_buf += ssm_proj_buf; attn_proj_buf = x_buf.
-            let pso_residual_copy = pipelines.residual_add_copy.as_ref().ok_or_else(|| {
-                RuntimeError::Compute("residual_add_copy pipeline not compiled".into())
-            })?;
-            enc.set_pipeline_state(pso_residual_copy);
-            enc.set_buffer(&s.x_buf, 0, 0);
-            enc.set_buffer(ssm_proj_buf, 0, 1);
-            enc.set_buffer(&s.attn_proj_buf, 0, 2);
-            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-            let rc_tg = 256u64.min(hidden_dim as u64).max(1);
-            enc.dispatch_threadgroups(
-                MTLSize::new((hidden_dim as u64).div_ceil(rc_tg), 1, 1),
-                MTLSize::new(rc_tg, 1, 1),
-            );
         } else {
             match ssm_out_quant {
                 QuantScheme::Q8_0 if pso_silu_matvec.is_some() => {
@@ -2345,64 +2202,7 @@ impl MetalF32Backend {
                     );
                 }
             } else if matches!(meta.wq_quant, QuantScheme::Bf16) {
-                // Optional MPSGraph BF16 GEMM path for the QKV
-                // projection (qkv_dim=8192, hidden_dim=4096 — the largest
-                // per-layer BF16 matmul). Gated by
-                // `LUMEN_METAL_BF16_MPS=1` AND M >= 32 AND N >= 4096.
-                // When taken: end current encoder, encode MPSGraph into
-                // the command buffer, reopen a fresh encoder so the
-                // remaining Phase 1 sub-ops (Gate / Alpha / Beta / Conv1d /
-                // L2) continue in a new context. Byte-equivalent to the
-                // legacy path when the env var is unset.
-                let mps_eligible = super::graph_reorder::bf16_mps_enabled()
-                    && batch_size >= 32
-                    && qkv_dim >= 4096
-                    && hidden_dim >= 4096;
-                let mps_taken = if mps_eligible {
-                    if let Some(ctx) = super::mps_graph_ffi::get() {
-                        // End current encoder, encode MPSGraph into
-                        // the same CB. MPSGraph encoder is independent
-                        // of compute encoders so this is safe. If
-                        // MPSGraph internally commits (large graphs),
-                        // the FFI rebinds `cmd` to the new root CB.
-                        enc.end_encoding();
-                        super::mps_graph_ffi::encode_bf16_matmul_into_cb(
-                            ctx, cmd,
-                            normed_buf,  // X [M=batch_size, K=hidden_dim]
-                            layer_buf,
-                            meta.wq_off, // W offset into the layer blob
-                            qkv_buf,     // Y [M, N=qkv_dim]
-                            batch_size as u32,
-                            hidden_dim as u32,
-                            qkv_dim as u32,
-                        ).map_err(|reason| {
-                            RuntimeError::Compute(format!(
-                                "MPSGraph BF16 QKV failed ({reason}); fall back via LUMEN_METAL_BF16_MPS=0"
-                            ))
-                        })?;
-                        // Reopen an encoder of the same flavour (concurrent
-                        // vs serial) used for Phase 1.
-                        enc = if concurrent_encoder_active && !concurrent_encoder_validate {
-                            cmd.new_concurrent_compute_encoder().ok_or_else(|| {
-                                RuntimeError::Compute(
-                                    "GDN prefill: phase 1 concurrent encoder reopen after MPSGraph QKV".into()
-                                )
-                            })?
-                        } else {
-                            cmd.new_compute_encoder().ok_or_else(|| {
-                                RuntimeError::Compute(
-                                    "GDN prefill: phase 1 encoder reopen after MPSGraph QKV".into(),
-                                )
-                            })?
-                        };
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if !mps_taken {
+                {
                     // BF16 tiled prefill GEMM (mirror Q8 structure with BF16 kernels)
                     // optional env opt-in to force non-K64 tile (4 KB shmem,
                     // 4× barriers per K-loop iteration vs K64). Default OFF preserves
@@ -2869,20 +2669,11 @@ impl MetalF32Backend {
                 // conv1d → L2 barrier: L2 reads conv_out.
                 emit_phase_barrier(&enc, &[conv_out_role_buf]);
                 {
-                    // simdgroup-per-head L2 (no threadgroup barriers),
-                    // gated by LUMEN_METAL_GDN_L2_SG=1, requires head_dim%32==0.
-                    let use_l2_sg = super::graph_reorder::gdn_l2_sg_enabled()
-                        && head_dim % 32 == 0
-                        && pipelines.l2_normalize_qk_strided_sg.is_some();
-                    let pso_l2 = if use_l2_sg {
-                        pipelines.l2_normalize_qk_strided_sg.as_ref().unwrap()
-                    } else {
-                        pipelines.l2_normalize_qk_strided.as_ref().ok_or_else(|| {
-                            RuntimeError::Compute(
-                                "l2_normalize_qk_strided pipeline not compiled".into(),
-                            )
-                        })?
-                    };
+                    let pso_l2 = pipelines.l2_normalize_qk_strided.as_ref().ok_or_else(|| {
+                        RuntimeError::Compute(
+                            "l2_normalize_qk_strided pipeline not compiled".into(),
+                        )
+                    })?;
                     enc.set_pipeline_state(pso_l2);
                     enc.set_buffer(conv_out_role_buf, conv_out_role_off, 0); // conv_out [T, qkv_dim]
                     enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 1);
@@ -2893,20 +2684,10 @@ impl MetalF32Backend {
                     enc.set_bytes(&(qk_dim as u32).to_le_bytes(), 6); // k_offset = qk_dim
                                                                       // DIAG (no-op unless LUMEN_METAL_GDN_SUBSKIP bit 8): skip L2.
                     if super::graph_reorder::gdn_subskip() & 8 == 0 {
-                        if use_l2_sg {
-                            // SG_PER_TG=4 simdgroups/TG (128 threads); one SG per (token,head).
-                            const SG_PER_TG: u64 = 4;
-                            let total_heads = (num_kv_heads * batch_size) as u64;
-                            enc.dispatch_threadgroups(
-                                MTLSize::new(total_heads.div_ceil(SG_PER_TG), 1, 1),
-                                MTLSize::new(32 * SG_PER_TG, 1, 1),
-                            );
-                        } else {
-                            enc.dispatch_threadgroups(
-                                MTLSize::new((num_kv_heads * batch_size) as u64, 1, 1),
-                                MTLSize::new(head_dim as u64, 1, 1),
-                            );
-                        }
+                        enc.dispatch_threadgroups(
+                            MTLSize::new((num_kv_heads * batch_size) as u64, 1, 1),
+                            MTLSize::new(head_dim as u64, 1, 1),
+                        );
                     }
                 }
             } // end else (legacy conv+state+L2 path)
@@ -2947,35 +2728,7 @@ impl MetalF32Backend {
             // writes raw_out to `raw_out_role_buf` (dedicated when concurrent encoder is
             // active; legacy `qkv_buf` at `raw_out_off_legacy`).
             //
-            // NSG4 geometry opt-in (`LUMEN_METAL_GDN_PHASE2A_NSG4=1`): swaps the
-            // (1, val_dim, n_heads) grid of 32-thread TGs for a (val_dim/4,
-            // n_heads, 1) grid of 128-thread TGs (4 simdgroups/TG sharing Q/K
-            // fetches via L1). Bit-identical kernel body; the reference-token
-            // gate is the validator. Wired here for the MoE GDN path (the dense
-            // 9B used different layer counts/FFN share — the MoE
-            // GDN is 72% of prefill so a small per-layer win compounds 30x).
-            // Chunk-parallel delta-rule: replaces the O(T)-serial
-            // recurrence with O(T/C) serial chunks. Requires head_dim==128 (the
-            // GDN_CS geometry: 32 lanes x 4 key-elems; MT=32 value-tile).
-            let use_chunkscan = graph_reorder::gdn_prefill_chunked_enabled()
-                && pipelines.gdn_prefill_chunkscan.is_some()
-                && head_dim == 128;
-            let use_nsg4 = !use_chunkscan
-                && graph_reorder::gdn_phase2a_nsg4_enabled()
-                && pipelines.gdn_prefill_fused_v3_chunked_nsg4.is_some()
-                && head_dim % 4 == 0;
-            if use_chunkscan {
-                enc.set_pipeline_state(pipelines.gdn_prefill_chunkscan.as_ref().unwrap());
-            } else if use_nsg4 {
-                enc.set_pipeline_state(
-                    pipelines
-                        .gdn_prefill_fused_v3_chunked_nsg4
-                        .as_ref()
-                        .unwrap(),
-                );
-            } else {
-                enc.set_pipeline_state(pso_v3);
-            }
+            enc.set_pipeline_state(pso_v3);
             enc.set_buffer(h_state_buf, 0, 0); // h_state [n_heads * val_dim * key_dim] (transposed layout)
             enc.set_buffer(conv_out_role_buf, conv_out_role_off, 1); // conv_out_all [T, qkv_dim]
             enc.set_buffer(alpha_role_buf, alpha_role_off, 2); // alpha_all [T, n_heads]
@@ -2991,29 +2744,10 @@ impl MetalF32Backend {
             // DIAG: skip the Phase 2a state-update dispatch to attribute its GPU
             // cost (no-op when LUMEN_METAL_GDN_DIAG_SKIP is unset; garbage output).
             if graph_reorder::gdn_diag_skip() != 1 {
-                if use_chunkscan {
-                    let chunk_c = graph_reorder::gdn_prefill_chunk_c();
-                    enc.set_bytes(&chunk_c.to_le_bytes(), 12); // chunk_C
-                                                               // K_tg threadgroup memory: C * key_dim floats.
-                    let k_tg_bytes = (chunk_c as u64) * (head_dim as u64) * 4;
-                    enc.set_threadgroup_memory_length(k_tg_bytes, 0);
-                    // grid (n_heads, val_dim_per_head/MT=32, 1); TG (32, 4, 1).
-                    enc.dispatch_threadgroups(
-                        MTLSize::new(num_heads as u64, (head_dim as u64) / 32, 1),
-                        MTLSize::new(32, 4, 1),
-                    );
-                } else if use_nsg4 {
-                    // (val_dim/NSG, n_heads, 1) grid of (32, NSG=4, 1) threads.
-                    enc.dispatch_threadgroups(
-                        MTLSize::new((head_dim as u64) / 4, num_heads as u64, 1),
-                        MTLSize::new(32, 4, 1),
-                    );
-                } else {
-                    enc.dispatch_threadgroups(
-                        MTLSize::new(1, head_dim as u64, num_heads as u64),
-                        MTLSize::new(32, 1, 1),
-                    );
-                }
+                enc.dispatch_threadgroups(
+                    MTLSize::new(1, head_dim as u64, num_heads as u64),
+                    MTLSize::new(32, 1, 1),
+                );
             }
             // Phase 2a → Phase 2b barrier: Phase 2b reads `raw_out_role` and
             // `gate_all_buf` (= attn_out_buf, written by Phase 1 attn-gate
@@ -3181,107 +2915,39 @@ impl MetalF32Backend {
                     MTLSize::new(128, 1, 1),
                 );
             } else if matches!(ssm_out_quant, QuantScheme::Bf16) {
-                // Optional MPSGraph BF16 GEMM path for the ssm_out
-                // projection (hidden_dim=4096, q_dim=4096 — second-largest
-                // per-layer BF16 matmul). Gated by `LUMEN_METAL_BF16_MPS=1`
-                // AND M >= 32 AND N >= 4096. The fused-residual contract
-                // is recovered by dispatching `add_residual_batched` after
-                // the matmul (`attn_proj_buf += x_buf`).
-                let mps_eligible_ssm = super::graph_reorder::bf16_mps_enabled()
-                    && batch_size >= 32
-                    && hidden_dim >= 4096
-                    && q_dim >= 4096;
-                let mps_taken_ssm = if mps_eligible_ssm {
-                    if let Some(ctx) = super::mps_graph_ffi::get() {
-                        // End current encoder, encode MPSGraph matmul,
-                        // open a fresh encoder for the residual add + the
-                        // remainder of Phase 3 + FFN-norm.
-                        enc.end_encoding();
-                        super::mps_graph_ffi::encode_bf16_matmul_into_cb(
-                            ctx, cmd,
-                            ssm_in_role_buf,  // X [M, K=q_dim] at offset 0
-                            layer_buf,
-                            meta.ssm_out_off.unwrap(),
-                            attn_proj_buf,    // Y [M, N=hidden_dim]
-                            batch_size as u32,
-                            q_dim as u32,
-                            hidden_dim as u32,
-                        ).map_err(|reason| {
-                            RuntimeError::Compute(format!(
-                                "MPSGraph BF16 ssm_out failed ({reason}); fall back via LUMEN_METAL_BF16_MPS=0"
-                            ))
-                        })?;
-                        // Reopen encoder of the same flavour and dispatch
-                        // the F32 residual add to recover fused-residual
-                        // semantics (`attn_proj_buf += x_buf`).
-                        enc = if concurrent_encoder_active && !concurrent_encoder_validate {
-                            cmd.new_concurrent_compute_encoder().ok_or_else(|| {
-                                RuntimeError::Compute(
-                                    "GDN prefill: phase 3 concurrent encoder reopen after MPSGraph ssm_out".into()
-                                )
-                            })?
-                        } else {
-                            cmd.new_compute_encoder().ok_or_else(|| {
-                                RuntimeError::Compute(
-                                    "GDN prefill: phase 3 encoder reopen after MPSGraph ssm_out"
-                                        .into(),
-                                )
-                            })?
-                        };
-                        enc.set_pipeline_state(&pipelines.add_residual_batched);
-                        enc.set_buffer(attn_proj_buf, 0, 0); // dst: F32 [batch_size, hidden_dim]
-                        enc.set_buffer(x_buf, 0, 1); // src: F32 residual
-                        let total_elems = (batch_size * hidden_dim) as u32;
-                        enc.set_bytes(&total_elems.to_le_bytes(), 2);
-                        let tg = 256u64;
-                        enc.dispatch_threadgroups(
-                            MTLSize::new((total_elems as u64).div_ceil(tg), 1, 1),
-                            MTLSize::new(tg, 1, 1),
-                        );
-                        true
+                // BF16 tiled GEMM + residual: attn_proj_buf = GEMM(ssm_in) + x_buf
+                // optional env opt-in to force non-K64 tile (4 KB shmem,
+                // 4× barriers per K-loop iteration vs K64). Default OFF preserves
+                // reference byte-identical behaviour.
+                let force_nok64 = super::graph_reorder::bf16_gdn_tile_nok64_enabled();
+                if !force_nok64 && q_dim % 64 == 0 && batch_size <= 4096 {
+                    let gemm_aligned =
+                        batch_size % 32 == 0 && hidden_dim % 32 == 0 && q_dim % 32 == 0;
+                    if gemm_aligned {
+                        enc.set_pipeline_state(&pipelines.tiled_matmul_bf16_k64_residual_aligned);
                     } else {
-                        false
+                        enc.set_pipeline_state(&pipelines.tiled_matmul_bf16_k64_residual);
                     }
+                    enc.set_threadgroup_memory_length(8192, 0);
                 } else {
-                    false
-                };
-                if !mps_taken_ssm {
-                    // BF16 tiled GEMM + residual: attn_proj_buf = GEMM(ssm_in) + x_buf
-                    // optional env opt-in to force non-K64 tile (4 KB shmem,
-                    // 4× barriers per K-loop iteration vs K64). Default OFF preserves
-                    // reference byte-identical behaviour.
-                    let force_nok64 = super::graph_reorder::bf16_gdn_tile_nok64_enabled();
-                    if !force_nok64 && q_dim % 64 == 0 && batch_size <= 4096 {
-                        let gemm_aligned =
-                            batch_size % 32 == 0 && hidden_dim % 32 == 0 && q_dim % 32 == 0;
-                        if gemm_aligned {
-                            enc.set_pipeline_state(
-                                &pipelines.tiled_matmul_bf16_k64_residual_aligned,
-                            );
-                        } else {
-                            enc.set_pipeline_state(&pipelines.tiled_matmul_bf16_k64_residual);
-                        }
-                        enc.set_threadgroup_memory_length(8192, 0);
-                    } else {
-                        enc.set_pipeline_state(&pipelines.tiled_matmul_bf16_residual);
-                        enc.set_threadgroup_memory_length(4096, 0);
-                    }
-                    enc.set_buffer(layer_buf, ssm_out_off, 0); // W_bf16 weights [hidden_dim, q_dim]
-                    enc.set_buffer(ssm_in_role_buf, ssm_in_role_off, 1); // X input [batch_size, q_dim]
-                    enc.set_buffer(attn_proj_buf, 0, 2); // Y output [batch_size, hidden_dim]
-                    enc.set_bytes(&(batch_size as u32).to_le_bytes(), 3); // M
-                    enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4); // N
-                    enc.set_bytes(&(q_dim as u32).to_le_bytes(), 5); // K
-                    enc.set_buffer(x_buf, 0, 6); // R residual [batch_size, hidden_dim]
-                    enc.dispatch_threadgroups(
-                        MTLSize::new(
-                            (hidden_dim as u64).div_ceil(32),
-                            (batch_size as u64).div_ceil(32),
-                            1,
-                        ),
-                        MTLSize::new(128, 1, 1),
-                    );
+                    enc.set_pipeline_state(&pipelines.tiled_matmul_bf16_residual);
+                    enc.set_threadgroup_memory_length(4096, 0);
                 }
+                enc.set_buffer(layer_buf, ssm_out_off, 0); // W_bf16 weights [hidden_dim, q_dim]
+                enc.set_buffer(ssm_in_role_buf, ssm_in_role_off, 1); // X input [batch_size, q_dim]
+                enc.set_buffer(attn_proj_buf, 0, 2); // Y output [batch_size, hidden_dim]
+                enc.set_bytes(&(batch_size as u32).to_le_bytes(), 3); // M
+                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4); // N
+                enc.set_bytes(&(q_dim as u32).to_le_bytes(), 5); // K
+                enc.set_buffer(x_buf, 0, 6); // R residual [batch_size, hidden_dim]
+                enc.dispatch_threadgroups(
+                    MTLSize::new(
+                        (hidden_dim as u64).div_ceil(32),
+                        (batch_size as u64).div_ceil(32),
+                        1,
+                    ),
+                    MTLSize::new(128, 1, 1),
+                );
             } else if graph_reorder::gdn_ssm_out_f32_batched_enabled() {
                 // F32 ssm_out BATCHED tiled GEMM + fused residual.
                 //
@@ -3403,459 +3069,6 @@ impl MetalF32Backend {
         // After T tokens: new_pos = (old_pos + T) % buf_slots.
         let new_conv_pos = (conv_pos + batch_size as u32) % buf_slots;
 
-        Ok(new_conv_pos)
-    }
-
-    /// Dual-queue GDN prefill: bit-identical to `encode_batched_gdn_prefill`'s
-    /// Q8 path, but splits the per-layer branchy DAG across two command queues
-    /// coordinated by `MetalSharedEvent` so the independent branches overlap.
-    ///
-    /// Main CB (`cmd`, main queue):
-    ///   E0 RMSNorm(x->normed) ; signal(norm_ready,ord)
-    ///   branch A: QKV-GEMM -> conv1d+SiLU -> conv_state_update -> L2
-    ///   wait(ab_ready,ord)
-    ///   recurrence (Phase 2a state update)
-    ///   wait(gate_ready,ord)
-    ///   join tail: gated-RMSNorm(Phase 2b) -> ssm_out-GEMM+residual(Phase 3) -> FFN-RMSNorm
-    ///
-    /// Aux CB (`aux_cmd`, aux queue):
-    ///   wait(norm_ready,ord)
-    ///   branch B: alpha-GEMM, beta-GEMM -> compute_gates
-    ///   signal(ab_ready,ord)
-    ///   branch C: attn-gate-GEMM
-    ///   signal(gate_ready,ord)
-    ///
-    /// Each kernel dispatch (pipeline, set_buffer/set_bytes order, grid/TG, FP
-    /// accumulation order) is byte-identical to the single-encoder Q8 path; only
-    /// the encoder/CB/queue placement changes. signal/wait are CB-granularity:
-    /// the caller must NOT have an encoder open across them — this function ends
-    /// each encoder before the signal/wait.
-    ///
-    /// `ord` is the GDN ordinal (1-based) used as the monotonic event value on
-    /// all three per-prefill events. Preconditions (caller-checked): Q8 wq,
-    /// attn_gate, ssm_out; de-aliased role buffers present; parallel conv1d
-    /// pipeline present. Returns the new conv position.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn encode_batched_gdn_prefill_dual_queue(
-        cmd: &MetalCommandBuffer,
-        aux_cmd: &MetalCommandBuffer,
-        ev_norm_ready: &super::ffi::MetalSharedEvent,
-        ev_ab_ready: &super::ffi::MetalSharedEvent,
-        ev_gate_ready: &super::ffi::MetalSharedEvent,
-        ord: u64,
-        pipelines: &MetalPipelines,
-        s: &MetalScratch,
-        layer_buf: &MetalBuffer,
-        meta: &CachedLayerMeta,
-        gdn_idx: usize,
-        x_buf: &MetalBuffer,
-        normed_buf: &MetalBuffer,
-        qkv_buf: &MetalBuffer,
-        attn_out_buf: &MetalBuffer,
-        attn_proj_buf: &MetalBuffer,
-        batch_size: usize,
-    ) -> Result<u32, RuntimeError> {
-        let hidden_dim = s.hidden_dim;
-        let num_heads = s.gdn_num_v_heads;
-        let num_kv_heads = s.gdn_num_k_heads;
-        let head_dim = s.gdn_head_dim;
-        let qk_dim = num_kv_heads * head_dim;
-        let value_dim = num_heads * head_dim;
-        let q_dim = value_dim;
-        let qkv_dim = 2 * qk_dim + value_dim;
-        let eps = s.eps;
-        let norm_tg_size = s.norm_tg_size;
-        let conv_kernel_size = s.gdn_conv_kernel_size;
-
-        let ssm_conv1d_off = meta.ssm_conv1d_off.ok_or_else(|| {
-            RuntimeError::Compute("GDN dual-queue: missing ssm_conv1d_off".into())
-        })?;
-        let ssm_dt_off = meta
-            .ssm_dt_off
-            .ok_or_else(|| RuntimeError::Compute("GDN dual-queue: missing ssm_dt_off".into()))?;
-        let ssm_a_off = meta
-            .ssm_a_off
-            .ok_or_else(|| RuntimeError::Compute("GDN dual-queue: missing ssm_a_off".into()))?;
-        let ssm_beta_off = meta
-            .ssm_beta_off
-            .ok_or_else(|| RuntimeError::Compute("GDN dual-queue: missing ssm_beta_off".into()))?;
-        let ssm_alpha_off = meta
-            .ssm_alpha_off
-            .ok_or_else(|| RuntimeError::Compute("GDN dual-queue: missing ssm_alpha_off".into()))?;
-        let ssm_norm_off = meta
-            .ssm_norm_off
-            .ok_or_else(|| RuntimeError::Compute("GDN dual-queue: missing ssm_norm_off".into()))?;
-        let ssm_out_off = meta
-            .ssm_out_off
-            .ok_or_else(|| RuntimeError::Compute("GDN dual-queue: missing ssm_out_off".into()))?;
-        let attn_gate_off = meta
-            .attn_gate_off
-            .ok_or_else(|| RuntimeError::Compute("GDN dual-queue: missing attn_gate_off".into()))?;
-        let attn_norm_off = meta.attn_norm_off;
-        let ffn_norm_off = meta.ffn_norm_off;
-
-        let conv_state_buf = &s.gdn_conv_states[gdn_idx];
-        let conv_pos = s.gdn_conv_positions[gdn_idx];
-        let h_state_buf = &s.gdn_h_states[gdn_idx];
-
-        let buf_slots = (conv_kernel_size - 1) as u32;
-        let gate_all_buf = attn_out_buf;
-
-        // De-aliased role buffers (dedicated MTLBuffers; required precondition).
-        let alpha_role_buf = s.batch_gdn_alpha_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("GDN dual-queue: missing batch_gdn_alpha_buf".into())
-        })?;
-        let beta_role_buf = s.batch_gdn_beta_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("GDN dual-queue: missing batch_gdn_beta_buf".into())
-        })?;
-        let conv_out_role_buf = s.batch_gdn_conv_out_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("GDN dual-queue: missing batch_gdn_conv_out_buf".into())
-        })?;
-        let raw_out_role_buf = s.batch_gdn_raw_out_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("GDN dual-queue: missing batch_gdn_raw_out_buf".into())
-        })?;
-        let ssm_in_role_buf = s.batch_gdn_ssm_in_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("GDN dual-queue: missing batch_gdn_ssm_in_buf".into())
-        })?;
-
-        // Resource-scoped barrier helper (concurrent encoders, same as the
-        // production concurrent path: resource-scoped barriers within an
-        // encoder; cross-encoder/CB hazards are handled by the events + Metal's
-        // automatic boundary hazard tracking).
-        let barrier = |enc: &MetalComputeEncoder, bufs: &[&MetalBuffer]| {
-            enc.memory_barrier_with_resources(bufs);
-        };
-
-        // ===============================================================
-        // MAIN CB — E0: RMSNorm(x -> normed)
-        // ===============================================================
-        {
-            let enc = cmd
-                .new_concurrent_compute_encoder()
-                .ok_or_else(|| RuntimeError::Compute("GDN dual-queue: E0 encoder".into()))?;
-            enc.set_pipeline_state(&pipelines.rmsnorm_batched_bytes);
-            enc.set_buffer(x_buf, 0, 0);
-            enc.set_buffer(layer_buf, attn_norm_off, 1);
-            enc.set_buffer(normed_buf, 0, 2);
-            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-            enc.set_bytes(&eps.to_le_bytes(), 4);
-            enc.dispatch_threadgroups(
-                MTLSize::new(batch_size as u64, 1, 1),
-                MTLSize::new(norm_tg_size, 1, 1),
-            );
-            enc.end_encoding();
-        }
-        // normed_buf is now produced on the main queue; signal aux to start B/C.
-        cmd.encode_signal_event(ev_norm_ready, ord);
-
-        // ===============================================================
-        // AUX CB — wait(norm) ; branch B (alpha,beta,gates) ; signal(ab) ;
-        //          branch C (attn-gate GEMM) ; signal(gate)
-        // ===============================================================
-        aux_cmd.encode_wait_for_event(ev_norm_ready, ord);
-        {
-            let enc = aux_cmd.new_concurrent_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("GDN dual-queue: aux branch-B encoder".into())
-            })?;
-            // Alpha GEMM (Q8 k64): [T,hidden] @ [hidden,num_heads] -> alpha_role
-            let ab_aligned = batch_size % 32 == 0 && num_heads % 32 == 0 && hidden_dim % 32 == 0;
-            let pso_ab = if ab_aligned && hidden_dim % 64 == 0 {
-                &pipelines.dequant_tiled_matmul_q8_0_k64_aligned
-            } else {
-                &pipelines.dequant_tiled_matmul_q8_0_k64
-            };
-            enc.set_pipeline_state(pso_ab);
-            enc.set_threadgroup_memory_length(8192, 0);
-            enc.set_buffer(layer_buf, ssm_alpha_off, 0);
-            enc.set_buffer(normed_buf, 0, 1);
-            enc.set_buffer(alpha_role_buf, 0, 2);
-            enc.set_bytes(&(batch_size as u32).to_le_bytes(), 3);
-            enc.set_bytes(&(num_heads as u32).to_le_bytes(), 4);
-            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 5);
-            enc.dispatch_threadgroups(
-                MTLSize::new(
-                    (num_heads as u64).div_ceil(32),
-                    (batch_size as u64).div_ceil(32),
-                    1,
-                ),
-                MTLSize::new(128, 1, 1),
-            );
-            // Beta GEMM (Q8 k64): -> beta_role
-            enc.set_pipeline_state(pso_ab);
-            enc.set_threadgroup_memory_length(8192, 0);
-            enc.set_buffer(layer_buf, ssm_beta_off, 0);
-            enc.set_buffer(normed_buf, 0, 1);
-            enc.set_buffer(beta_role_buf, 0, 2);
-            enc.set_bytes(&(batch_size as u32).to_le_bytes(), 3);
-            enc.set_bytes(&(num_heads as u32).to_le_bytes(), 4);
-            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 5);
-            enc.dispatch_threadgroups(
-                MTLSize::new(
-                    (num_heads as u64).div_ceil(32),
-                    (batch_size as u64).div_ceil(32),
-                    1,
-                ),
-                MTLSize::new(128, 1, 1),
-            );
-            // compute-gates: alpha/beta -> gated (in-place). Barrier: reads alpha/beta.
-            barrier(&enc, &[alpha_role_buf, beta_role_buf]);
-            let pso_gates = pipelines
-                .gdn_compute_gates_batched
-                .as_ref()
-                .ok_or_else(|| {
-                    RuntimeError::Compute("gdn_compute_gates_batched pipeline not compiled".into())
-                })?;
-            enc.set_pipeline_state(pso_gates);
-            enc.set_buffer(layer_buf, ssm_dt_off, 0);
-            enc.set_buffer(layer_buf, ssm_a_off, 1);
-            enc.set_buffer(beta_role_buf, 0, 2);
-            enc.set_buffer(alpha_role_buf, 0, 3);
-            enc.set_buffer(alpha_role_buf, 0, 4);
-            enc.set_buffer(beta_role_buf, 0, 5);
-            enc.set_bytes(&(num_heads as u32).to_le_bytes(), 6);
-            enc.set_bytes(&(batch_size as u32).to_le_bytes(), 7);
-            let total_gates = (num_heads * batch_size) as u64;
-            enc.dispatch_threadgroups(
-                MTLSize::new(total_gates.div_ceil(256), 1, 1),
-                MTLSize::new(256u64.min(total_gates), 1, 1),
-            );
-            enc.end_encoding();
-        }
-        // Branch B (alpha,beta,gates) ready -> unblock main's recurrence.
-        aux_cmd.encode_signal_event(ev_ab_ready, ord);
-        {
-            // Branch C: attn-gate GEMM (Q8 k64) -> gate_all_buf
-            let enc = aux_cmd.new_concurrent_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("GDN dual-queue: aux branch-C encoder".into())
-            })?;
-            let c_aligned = batch_size % 32 == 0 && q_dim % 32 == 0 && hidden_dim % 32 == 0;
-            let pso_c = if c_aligned && hidden_dim % 64 == 0 {
-                &pipelines.dequant_tiled_matmul_q8_0_k64_aligned
-            } else {
-                &pipelines.dequant_tiled_matmul_q8_0_k64
-            };
-            enc.set_pipeline_state(pso_c);
-            enc.set_threadgroup_memory_length(8192, 0);
-            enc.set_buffer(layer_buf, attn_gate_off, 0);
-            enc.set_buffer(normed_buf, 0, 1);
-            enc.set_buffer(gate_all_buf, 0, 2);
-            enc.set_bytes(&(batch_size as u32).to_le_bytes(), 3);
-            enc.set_bytes(&(q_dim as u32).to_le_bytes(), 4);
-            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 5);
-            enc.dispatch_threadgroups(
-                MTLSize::new(
-                    (q_dim as u64).div_ceil(32),
-                    (batch_size as u64).div_ceil(32),
-                    1,
-                ),
-                MTLSize::new(128, 1, 1),
-            );
-            enc.end_encoding();
-        }
-        // Branch C (attn-gate) ready -> unblock main's gated-RMSNorm.
-        aux_cmd.encode_signal_event(ev_gate_ready, ord);
-
-        // ===============================================================
-        // MAIN CB — branch A: QKV-GEMM -> conv1d+SiLU -> conv_state_update -> L2
-        // ===============================================================
-        {
-            let enc = cmd
-                .new_concurrent_compute_encoder()
-                .ok_or_else(|| RuntimeError::Compute("GDN dual-queue: branch-A encoder".into()))?;
-            // QKV GEMM (Q8 k64): normed -> qkv_buf
-            let qkv_aligned = batch_size % 32 == 0 && qkv_dim % 32 == 0 && hidden_dim % 32 == 0;
-            let pso_qkv = if qkv_aligned && hidden_dim % 64 == 0 {
-                &pipelines.dequant_tiled_matmul_q8_0_k64_aligned
-            } else {
-                &pipelines.dequant_tiled_matmul_q8_0_k64
-            };
-            enc.set_pipeline_state(pso_qkv);
-            enc.set_threadgroup_memory_length(8192, 0);
-            enc.set_buffer(layer_buf, meta.wq_off, 0);
-            enc.set_buffer(normed_buf, 0, 1);
-            enc.set_buffer(qkv_buf, 0, 2);
-            enc.set_bytes(&(batch_size as u32).to_le_bytes(), 3);
-            enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 4);
-            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 5);
-            enc.dispatch_threadgroups(
-                MTLSize::new(
-                    (qkv_dim as u64).div_ceil(32),
-                    (batch_size as u64).div_ceil(32),
-                    1,
-                ),
-                MTLSize::new(128, 1, 1),
-            );
-            // conv1d+SiLU: qkv_buf -> conv_out_role. Barrier: reads qkv_buf.
-            barrier(&enc, &[qkv_buf]);
-            let pso_conv1d_par = pipelines
-                .ssm_conv1d_silu_prefill_parallel
-                .as_ref()
-                .ok_or_else(|| {
-                    RuntimeError::Compute(
-                        "GDN dual-queue requires ssm_conv1d_silu_prefill_parallel pipeline".into(),
-                    )
-                })?;
-            let conv_tg = 256u64.min(qkv_dim as u64).max(1);
-            enc.set_pipeline_state(pso_conv1d_par);
-            enc.set_buffer(qkv_buf, 0, 0);
-            enc.set_buffer(conv_state_buf, 0, 1);
-            enc.set_buffer(layer_buf, ssm_conv1d_off, 2);
-            enc.set_buffer(conv_out_role_buf, 0, 3);
-            enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 4);
-            enc.set_bytes(&(conv_kernel_size as u32).to_le_bytes(), 5);
-            enc.set_bytes(&conv_pos.to_le_bytes(), 6);
-            enc.set_bytes(&(batch_size as u32).to_le_bytes(), 7);
-            enc.dispatch_threadgroups(
-                MTLSize::new((qkv_dim as u64).div_ceil(conv_tg), batch_size as u64, 1),
-                MTLSize::new(conv_tg, 1, 1),
-            );
-            // conv_state circular-buffer update (race-free; reads qkv_buf, writes conv_state).
-            let pso_su = pipelines.ssm_conv1d_state_update.as_ref().ok_or_else(|| {
-                RuntimeError::Compute("ssm_conv1d_state_update pipeline not compiled".into())
-            })?;
-            barrier(&enc, &[conv_state_buf]);
-            let su_tg = 256u64.min(qkv_dim as u64).max(1);
-            enc.set_pipeline_state(pso_su);
-            enc.set_buffer(qkv_buf, 0, 0);
-            enc.set_buffer(conv_state_buf, 0, 1);
-            enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 2);
-            enc.set_bytes(&(conv_kernel_size as u32).to_le_bytes(), 3);
-            enc.set_bytes(&conv_pos.to_le_bytes(), 4);
-            enc.set_bytes(&(batch_size as u32).to_le_bytes(), 5);
-            enc.dispatch_threadgroups(
-                MTLSize::new((qkv_dim as u64).div_ceil(su_tg), 1, 1),
-                MTLSize::new(su_tg, 1, 1),
-            );
-            // L2 normalize q/k in conv_out (in-place). Barrier: reads conv_out.
-            barrier(&enc, &[conv_out_role_buf]);
-            let pso_l2 = pipelines.l2_normalize_qk_strided.as_ref().ok_or_else(|| {
-                RuntimeError::Compute("l2_normalize_qk_strided pipeline not compiled".into())
-            })?;
-            enc.set_pipeline_state(pso_l2);
-            enc.set_buffer(conv_out_role_buf, 0, 0);
-            enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 1);
-            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 2);
-            enc.set_bytes(&(batch_size as u32).to_le_bytes(), 3);
-            enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 4);
-            enc.set_bytes(&(0u32).to_le_bytes(), 5);
-            enc.set_bytes(&(qk_dim as u32).to_le_bytes(), 6);
-            enc.dispatch_threadgroups(
-                MTLSize::new((num_kv_heads * batch_size) as u64, 1, 1),
-                MTLSize::new(head_dim as u64, 1, 1),
-            );
-            enc.end_encoding();
-        }
-
-        // Main must not run recurrence until branch B (alpha/beta/gates) retires.
-        cmd.encode_wait_for_event(ev_ab_ready, ord);
-
-        // ===============================================================
-        // MAIN CB — recurrence (Phase 2a state update)
-        // ===============================================================
-        {
-            let enc = cmd.new_concurrent_compute_encoder().ok_or_else(|| {
-                RuntimeError::Compute("GDN dual-queue: recurrence encoder".into())
-            })?;
-            let pso_v3 = pipelines
-                .gdn_prefill_fused_v3_chunked
-                .as_ref()
-                .ok_or_else(|| {
-                    RuntimeError::Compute(
-                        "gdn_prefill_fused_v3_chunked pipeline not compiled".into(),
-                    )
-                })?;
-            enc.set_pipeline_state(pso_v3);
-            enc.set_buffer(h_state_buf, 0, 0);
-            enc.set_buffer(conv_out_role_buf, 0, 1);
-            enc.set_buffer(alpha_role_buf, 0, 2);
-            enc.set_buffer(beta_role_buf, 0, 3);
-            enc.set_buffer(raw_out_role_buf, 0, 4);
-            enc.set_bytes(&(num_heads as u32).to_le_bytes(), 5);
-            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 6);
-            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 7);
-            enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 8);
-            enc.set_bytes(&(batch_size as u32).to_le_bytes(), 9);
-            enc.set_bytes(&(qk_dim as u32).to_le_bytes(), 10);
-            enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 11);
-            enc.dispatch_threadgroups(
-                MTLSize::new(1, head_dim as u64, num_heads as u64),
-                MTLSize::new(32, 1, 1),
-            );
-            enc.end_encoding();
-        }
-
-        // Main must not run gated-RMSNorm until branch C (attn-gate) retires.
-        cmd.encode_wait_for_event(ev_gate_ready, ord);
-
-        // ===============================================================
-        // MAIN CB — join tail: Phase 2b (gated-RMSNorm) -> Phase 3
-        //           (ssm_out GEMM + residual) -> FFN-RMSNorm
-        // ===============================================================
-        {
-            let enc = cmd
-                .new_concurrent_compute_encoder()
-                .ok_or_else(|| RuntimeError::Compute("GDN dual-queue: join-tail encoder".into()))?;
-            // Phase 2b: gated-RMSNorm(raw_out, gate_all -> ssm_in)
-            let pso_norm_gate = pipelines.gdn_prefill_norm_gate.as_ref().ok_or_else(|| {
-                RuntimeError::Compute("gdn_prefill_norm_gate pipeline not compiled".into())
-            })?;
-            enc.set_pipeline_state(pso_norm_gate);
-            enc.set_buffer(raw_out_role_buf, 0, 0);
-            enc.set_buffer(gate_all_buf, 0, 1);
-            enc.set_buffer(layer_buf, ssm_norm_off, 2);
-            enc.set_buffer(ssm_in_role_buf, 0, 3);
-            enc.set_bytes(&(num_heads as u32).to_le_bytes(), 4);
-            enc.set_bytes(&(head_dim as u32).to_le_bytes(), 5);
-            enc.set_bytes(&eps.to_le_bytes(), 6);
-            enc.set_bytes(&(1u32).to_le_bytes(), 7);
-            enc.set_bytes(&(batch_size as u32).to_le_bytes(), 8);
-            enc.dispatch_threadgroups(
-                MTLSize::new(num_heads as u64, batch_size as u64, 1),
-                MTLSize::new(head_dim as u64, 1, 1),
-            );
-            // Phase 2b -> Phase 3 barrier: ssm_out GEMM reads ssm_in.
-            barrier(&enc, &[ssm_in_role_buf]);
-            // Phase 3: ssm_out GEMM (Q8 k64 residual) + residual add -> attn_proj_buf
-            let p3_aligned = batch_size % 32 == 0 && hidden_dim % 32 == 0 && q_dim % 32 == 0;
-            let pso_ssm = if p3_aligned && q_dim % 64 == 0 {
-                &pipelines.dequant_tiled_matmul_q8_0_k64_residual_batched_aligned
-            } else {
-                &pipelines.dequant_tiled_matmul_q8_0_k64_residual_batched
-            };
-            enc.set_pipeline_state(pso_ssm);
-            enc.set_threadgroup_memory_length(8192, 0);
-            enc.set_buffer(layer_buf, ssm_out_off, 0);
-            enc.set_buffer(ssm_in_role_buf, 0, 1);
-            enc.set_buffer(attn_proj_buf, 0, 2);
-            enc.set_bytes(&(batch_size as u32).to_le_bytes(), 3);
-            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
-            enc.set_bytes(&(q_dim as u32).to_le_bytes(), 5);
-            enc.set_buffer(x_buf, 0, 6);
-            enc.dispatch_threadgroups(
-                MTLSize::new(
-                    (hidden_dim as u64).div_ceil(32),
-                    (batch_size as u64).div_ceil(32),
-                    1,
-                ),
-                MTLSize::new(128, 1, 1),
-            );
-            // Phase 3 -> FFN-norm barrier: FFN-norm reads attn_proj_buf.
-            barrier(&enc, &[attn_proj_buf]);
-            // FFN RMSNorm: attn_proj_buf -> normed_buf
-            enc.set_pipeline_state(&pipelines.rmsnorm_batched_bytes);
-            enc.set_buffer(attn_proj_buf, 0, 0);
-            enc.set_buffer(layer_buf, ffn_norm_off, 1);
-            enc.set_buffer(normed_buf, 0, 2);
-            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-            enc.set_bytes(&eps.to_le_bytes(), 4);
-            enc.dispatch_threadgroups(
-                MTLSize::new(batch_size as u64, 1, 1),
-                MTLSize::new(norm_tg_size, 1, 1),
-            );
-            enc.end_encoding();
-        }
-
-        let new_conv_pos = (conv_pos + batch_size as u32) % buf_slots;
         Ok(new_conv_pos)
     }
 

@@ -235,8 +235,7 @@ mod cached_sel {
 
     // -- MTLSharedEvent (cross-queue GPU↔GPU synchronization) --
     //
-    // Used by the dual-queue GDN branch-overlap path
-    // (`LUMEN_METAL_GDN_DUAL_QUEUE=1`). `newSharedEvent` allocates a
+    // `newSharedEvent` allocates a
     // device-shared event whose 64-bit `signaledValue` is monotonically
     // advanced by `encodeSignalEvent:value:` on a producer command buffer
     // and waited on by `encodeWaitForEvent:value:` on a consumer command
@@ -804,15 +803,6 @@ impl MetalCommandQueue {
             })
         }
     }
-
-    /// Raw Objective-C id for this queue. Exposed for the MPSGraph
-    /// path (`mps_graph_ffi.rs`) which needs the underlying
-    /// `id<MTLCommandQueue>` to pass into MPSGraph's
-    /// `runWithMTLCommandQueue:` API.
-    #[inline]
-    pub(crate) fn raw(&self) -> ObjcId {
-        self.raw
-    }
 }
 
 impl Drop for MetalCommandQueue {
@@ -1105,92 +1095,6 @@ impl MetalCommandBuffer {
     pub fn wait_until_completed(&self) {
         unsafe {
             msg_send_0_raw(self.raw(), cached_sel::wait_until_completed());
-        }
-    }
-
-    /// Returns the raw `MTLCommandBuffer` Objective-C handle.
-    ///
-    /// Exposed only for the optional MPSGraph BF16 GEMM path
-    /// (`mps_graph_ffi.rs`). The returned pointer is **not** retained
-    /// by the caller; it remains owned by this `MetalCommandBuffer`.
-    #[inline]
-    pub(crate) fn raw_command_buffer(&self) -> *mut c_void {
-        self.raw.load(AOrdering::Relaxed)
-    }
-
-    /// Atomically replace the underlying `MTLCommandBuffer` pointer with
-    /// a new one, releasing the previous handle and retaining the new
-    /// one. Exposed only for the MPSGraph in-CB path — Apple's
-    /// `MPSCommandBuffer.encodeToCommandBuffer:` may internally call
-    /// `commitAndContinue`, committing the original CB and replacing it
-    /// with a fresh one read via `rootCommandBuffer`. The caller must
-    /// re-bind this wrapper to the new CB so subsequent compute
-    /// encoders land on an open (uncommitted) CB.
-    ///
-    /// `new_raw` is treated as a `+0` (autoreleased) source and is
-    /// retained inside; the previously held CB is released — its GPU
-    /// work is already committed by MPSGraph by the time we get here,
-    /// so dropping our Rust handle does not abort in-flight work.
-    #[inline]
-    pub(crate) fn replace_raw_command_buffer(&self, new_raw: *mut c_void) {
-        unsafe {
-            if new_raw.is_null() {
-                return;
-            }
-            retain(new_raw);
-            let prev = self.raw.swap(new_raw, AOrdering::Relaxed);
-            if !prev.is_null() {
-                release(prev);
-            }
-        }
-    }
-
-    /// Commit the in-flight CB, wait for GPU completion, then atomically
-    /// swap in a fresh CB allocated from `queue`. Provided for the
-    /// alternative MPSGraph BF16 GEMM path (`mps_graph_ffi.rs`) that
-    /// drains Lumen's encoded work before MPSGraph reads from the same
-    /// buffers on its own queue. The default in-CB path
-    /// (`encode_bf16_matmul_into_cb`) does not need this drain;
-    /// kept here as `#[allow(dead_code)]` because the alternative path
-    /// is wired up env-OFF and may be revisited in a future revision.
-    ///
-    /// `unretained` should match how the original CB was created: if
-    /// the caller wants the new CB to skip resource retain/release
-    /// (matching `LUMEN_METAL_UNRETAINED_CMDBUFS=1`), pass `true`.
-    #[allow(dead_code)]
-    pub(crate) fn commit_and_swap_to_fresh(
-        &self,
-        queue: &MetalCommandQueue,
-        unretained: bool,
-    ) -> Result<(), String> {
-        unsafe {
-            let prev = self.raw.load(AOrdering::Relaxed);
-            if prev.is_null() {
-                return Err(
-                    "MetalCommandBuffer::commit_and_swap_to_fresh: prior CB is null".into(),
-                );
-            }
-            msg_send_0_raw(prev, cached_sel::commit());
-            msg_send_0_raw(prev, cached_sel::wait_until_completed());
-
-            let sel = if unretained {
-                cached_sel::command_buffer_with_unretained_references()
-            } else {
-                cached_sel::command_buffer()
-            };
-            let fresh = msg_send_0_raw(queue.raw, sel);
-            if fresh.is_null() {
-                return Err(
-                    "MetalCommandBuffer::commit_and_swap_to_fresh: fresh CB alloc returned null"
-                        .into(),
-                );
-            }
-            // `commandBuffer` / unretained variants return autoreleased
-            // — retain for our wrapper's ownership.
-            retain(fresh);
-            self.raw.store(fresh, AOrdering::Relaxed);
-            release(prev);
-            Ok(())
         }
     }
 }

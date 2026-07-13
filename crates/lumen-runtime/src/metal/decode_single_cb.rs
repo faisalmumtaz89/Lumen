@@ -229,18 +229,6 @@ impl MetalF32Backend {
         // [decode-profile] Start timing with the embed section in-flight.
         decode_profile::begin("embed");
 
-        // Zero the fused-router finish counter once per token.
-        // The kernel self-resets to 0 after each layer, but we zero defensively
-        // at token start (Shared buffer, not guaranteed zero-initialized; the CPU
-        // write is visible to the GPU when this command buffer commits below).
-        if super::moe_router_fused_enabled() {
-            if let Some(counter) = s.moe_router_counter.as_ref() {
-                unsafe {
-                    *(counter.contents() as *mut u32) = 0u32;
-                }
-            }
-        }
-
         // --- ALL layers ---
 
         for layer_idx in 0..num_layers {
@@ -394,35 +382,6 @@ impl MetalF32Backend {
                     // run in parallel, then a single barrier before deinterleave.
                     // Saves 1 dispatch (RMSNorm) + 2 barriers per layer vs non-fused path.
 
-                    // FULLY FUSED Q+gate+K+V projection (env LUMEN_METAL_Q4_QGATEKV_FUSE=1):
-                    // ONE dispatch over the concatenated [qgate_dim + 2*kv_dim] row space
-                    // (1280 TGs = ~42.7 SG/core for Qwen3.5-9B, past the occupancy knee that
-                    // the separate dispatches under-occupy at). wq rows write qkv_buf, wk rows
-                    // write k_buf, wv rows write v_buf -- the SAME three buffers the separate
-                    // qmv_q4_0_rmsnorm dispatches write, and the SAME three the downstream
-                    // deinterleave_norm_assemble reads. Byte-identical to the three separate
-                    // dispatches (same per-row RMSNorm + -8 fold + accumulation order). Engages
-                    // only when none of Q+gate/K/V is SUBSKIP-skipped, the fused-norm path is
-                    // active, all three (wq/wk/wv) are Q4_0, and all three qmv buffers exist
-                    // (wq under PROJ-or-this-flag, wk/wv under KV-or-this-flag at load time).
-                    let qgatekv_fused = crate::metal::q4_qgatekv_fuse_enabled()
-                        // FULLATTN_F16SC forces the SEPARATE-projection path: the fused
-                        // qgatekv kernel reads f32 scales, but this flag builds wq/wk/wv
-                        // scales as f16 -> mixing them would read f16-as-f32 (garbage).
-                        && !crate::metal::q4_fullattn_f16sc_enabled()
-                        && (fa_skip & (FULLATTN_SKIP_QGATE | FULLATTN_SKIP_K | FULLATTN_SKIP_V))
-                            == 0
-                        && use_fused_attn_norm
-                        && meta.wq_quant == QuantScheme::Q4_0
-                        && meta.wk_quant == Some(QuantScheme::Q4_0)
-                        && meta.wv_quant == Some(QuantScheme::Q4_0)
-                        && matches!(s.qmv_attn_wq_qw.get(layer_idx), Some(Some(_)))
-                        && matches!(s.qmv_attn_wq_scales.get(layer_idx), Some(Some(_)))
-                        && matches!(s.qmv_attn_wk_qw.get(layer_idx), Some(Some(_)))
-                        && matches!(s.qmv_attn_wk_scales.get(layer_idx), Some(Some(_)))
-                        && matches!(s.qmv_attn_wv_qw.get(layer_idx), Some(Some(_)))
-                        && matches!(s.qmv_attn_wv_scales.get(layer_idx), Some(Some(_)));
-
                     // DIE-SATURATION LEVER (LUMEN_METAL_CONCURRENT_PROJ=1, default OFF):
                     // the three SEPARATE Q+gate/K/V projection matvecs all read the SAME
                     // x_buf and write DISJOINT buffers (qkv_buf/k_buf/v_buf) with no shared
@@ -437,8 +396,6 @@ impl MetalF32Backend {
                     // cluster before the DNA consumer reads. The GDN recurrence is untouched.
                     let concurrent_proj_cluster = crate::metal::metal_concurrent_proj_enabled()
                         && use_fused_attn_norm
-                        && !qgatekv_fused
-                        && !crate::metal::q4_kv_fuse_enabled()
                         && (fa_skip & (FULLATTN_SKIP_QGATE | FULLATTN_SKIP_K | FULLATTN_SKIP_V))
                             == 0;
                     if concurrent_proj_cluster {
@@ -454,41 +411,8 @@ impl MetalF32Backend {
                         })?;
                     }
 
-                    if qgatekv_fused {
-                        let qw_q = s.qmv_attn_wq_qw[layer_idx].as_ref().unwrap();
-                        let sc_q = s.qmv_attn_wq_scales[layer_idx].as_ref().unwrap();
-                        let qw_k = s.qmv_attn_wk_qw[layer_idx].as_ref().unwrap();
-                        let sc_k = s.qmv_attn_wk_scales[layer_idx].as_ref().unwrap();
-                        let qw_v = s.qmv_attn_wv_qw[layer_idx].as_ref().unwrap();
-                        let sc_v = s.qmv_attn_wv_scales[layer_idx].as_ref().unwrap();
-                        // qmv_q4_0_rmsnorm_qgatekv: wq@0, x@1, q_out@2, in_dim@3, scales_q@4,
-                        // norm_w@5, eps@6, wk@7, k_out@8, scales_k@9, wv@10, v_out@11,
-                        // scales_v@12, qgate_dim@13, kv_dim@14.
-                        enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm_qgatekv);
-                        enc.set_buffer(qw_q, 0, 0);
-                        enc.set_buffer(&s.x_buf, 0, 1);
-                        enc.set_buffer(&s.qkv_buf, 0, 2);
-                        enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                        enc.set_buffer(sc_q, 0, 4);
-                        enc.set_buffer(layer_buf, attn_norm_off, 5);
-                        enc.set_bytes(&eps.to_le_bytes(), 6);
-                        enc.set_buffer(qw_k, 0, 7);
-                        enc.set_buffer(&s.k_buf, 0, 8);
-                        enc.set_buffer(sc_k, 0, 9);
-                        enc.set_buffer(qw_v, 0, 10);
-                        enc.set_buffer(&s.v_buf, 0, 11);
-                        enc.set_buffer(sc_v, 0, 12);
-                        enc.set_bytes(&(qgate_dim as u32).to_le_bytes(), 13);
-                        enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 14);
-                        // Grid covers (qgate_dim + 2*kv_dim) rows / 8 rows-per-TG.
-                        enc.dispatch_threadgroups(
-                            MTLSize::new((qgate_dim as u64 + 2 * kv_dim as u64) / 8, 1, 1),
-                            MTLSize::new(64, 1, 1),
-                        );
-                    }
-
                     // Project Q+gate into qkv_buf
-                    if !qgatekv_fused && fa_skip & FULLATTN_SKIP_QGATE == 0 {
+                    if fa_skip & FULLATTN_SKIP_QGATE == 0 {
                         // MLX-style fused RMSNorm+qmv fast path for the Q4_0 full-attn
                         // Q+gate projection when decode-qmv buffers exist (env
                         // LUMEN_METAL_Q4_QMV_PROJ=1) AND the fused-norm path would run
@@ -509,16 +433,7 @@ impl MetalF32Backend {
                         if let Some((qw, sc)) = qmv_wq {
                             // qmv_q4_0_rmsnorm: w@0, x@1, out@2, in_dim@3, scales@4,
                             // norm_w@5, eps@6. out = qgate_dim (%8); in = hidden (%512).
-                            // F16-scales full-attn (LUMEN_METAL_Q4_FULLATTN_F16SC=1): f16sc
-                            // kernel when its scale buffer was built f16 + kernel compiled.
-                            if let Some(p) = crate::metal::q4_fullattn_f16sc_enabled()
-                                .then_some(pipelines.qmv_q4_0_rmsnorm_f16sc.as_ref())
-                                .flatten()
-                            {
-                                enc.set_pipeline_state(p);
-                            } else {
-                                enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm);
-                            }
+                            enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm);
                             enc.set_buffer(qw, 0, 0);
                             enc.set_buffer(&s.x_buf, 0, 1);
                             enc.set_buffer(&s.qkv_buf, 0, 2);
@@ -607,54 +522,8 @@ impl MetalF32Backend {
                             );
                         }
                     }
-                    // FUSED K+V projection (env LUMEN_METAL_Q4_KV_FUSE=1): ONE dispatch
-                    // over [2*kv_dim] rows (K rows write k_buf, V rows write v_buf) to
-                    // double the threadgroup occupancy of the row-starved K/V matvecs
-                    // (kv_dim=1024 = ~4.3 SG/core each -> ~8.5 SG/core fused). Byte-identical
-                    // to the two separate qmv_q4_0_rmsnorm dispatches (same per-row math).
-                    // Only when neither K nor V is SUBSKIP-skipped, the fused-norm path is
-                    // active, both are Q4_0, and both wk/wv qmv buffers exist.
-                    let kv_fused = !qgatekv_fused
-                        && crate::metal::q4_kv_fuse_enabled()
-                        // FULLATTN_F16SC builds wk/wv scales as f16; the fused kv kernel
-                        // reads f32 scales -> force the separate f16sc-aware K/V dispatches.
-                        && !crate::metal::q4_fullattn_f16sc_enabled()
-                        && (fa_skip & (FULLATTN_SKIP_K | FULLATTN_SKIP_V)) == 0
-                        && use_fused_attn_norm
-                        && meta.wk_quant == Some(QuantScheme::Q4_0)
-                        && meta.wv_quant == Some(QuantScheme::Q4_0)
-                        && matches!(s.qmv_attn_wk_qw.get(layer_idx), Some(Some(_)))
-                        && matches!(s.qmv_attn_wk_scales.get(layer_idx), Some(Some(_)))
-                        && matches!(s.qmv_attn_wv_qw.get(layer_idx), Some(Some(_)))
-                        && matches!(s.qmv_attn_wv_scales.get(layer_idx), Some(Some(_)));
-                    if kv_fused {
-                        let qw_k = s.qmv_attn_wk_qw[layer_idx].as_ref().unwrap();
-                        let sc_k = s.qmv_attn_wk_scales[layer_idx].as_ref().unwrap();
-                        let qw_v = s.qmv_attn_wv_qw[layer_idx].as_ref().unwrap();
-                        let sc_v = s.qmv_attn_wv_scales[layer_idx].as_ref().unwrap();
-                        // qmv_q4_0_rmsnorm_kv: wk@0, x@1, k_out@2, in_dim@3, scales_k@4,
-                        // norm_w@5, eps@6, wv@7, v_out@8, scales_v@9, out_dim_kv@10.
-                        enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm_kv);
-                        enc.set_buffer(qw_k, 0, 0);
-                        enc.set_buffer(&s.x_buf, 0, 1);
-                        enc.set_buffer(&s.k_buf, 0, 2);
-                        enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                        enc.set_buffer(sc_k, 0, 4);
-                        enc.set_buffer(layer_buf, attn_norm_off, 5);
-                        enc.set_bytes(&eps.to_le_bytes(), 6);
-                        enc.set_buffer(qw_v, 0, 7);
-                        enc.set_buffer(&s.v_buf, 0, 8);
-                        enc.set_buffer(sc_v, 0, 9);
-                        enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 10);
-                        // Grid covers 2*kv_dim rows / 8 rows-per-TG.
-                        enc.dispatch_threadgroups(
-                            MTLSize::new((2 * kv_dim as u64) / 8, 1, 1),
-                            MTLSize::new(64, 1, 1),
-                        );
-                    }
-                    // Project K from wk (parallel with Q+gate when fused).
-                    // Skipped when the full Q+gate+K+V fused kernel already produced k_buf.
-                    if !qgatekv_fused && !kv_fused && fa_skip & FULLATTN_SKIP_K == 0 {
+                    // Project K from wk.
+                    if fa_skip & FULLATTN_SKIP_K == 0 {
                         let wk_off_val = meta.wk_off.unwrap();
                         let wk_quant = meta.wk_quant.unwrap();
                         // MLX-style fused RMSNorm+qmv fast path for the Q4_0 K projection
@@ -676,15 +545,7 @@ impl MetalF32Backend {
                         if let Some((qw, sc)) = qmv_wk {
                             // qmv_q4_0_rmsnorm: w@0, x@1, out@2, in_dim@3, scales@4,
                             // norm_w@5, eps@6. out = kv_dim (%8); in = hidden (%512).
-                            // F16-scales full-attn K (LUMEN_METAL_Q4_FULLATTN_F16SC=1).
-                            if let Some(p) = crate::metal::q4_fullattn_f16sc_enabled()
-                                .then_some(pipelines.qmv_q4_0_rmsnorm_f16sc.as_ref())
-                                .flatten()
-                            {
-                                enc.set_pipeline_state(p);
-                            } else {
-                                enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm);
-                            }
+                            enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm);
                             enc.set_buffer(qw, 0, 0);
                             enc.set_buffer(&s.x_buf, 0, 1);
                             enc.set_buffer(&s.k_buf, 0, 2);
@@ -774,9 +635,8 @@ impl MetalF32Backend {
                             );
                         }
                     }
-                    // Project V from wv (parallel with Q+gate and K when fused).
-                    // Skipped when the fused K+V (or full Q+gate+K+V) kernel produced v_buf.
-                    if !qgatekv_fused && !kv_fused && fa_skip & FULLATTN_SKIP_V == 0 {
+                    // Project V from wv.
+                    if fa_skip & FULLATTN_SKIP_V == 0 {
                         let wv_off_val = meta.wv_off.unwrap();
                         let wv_quant = meta.wv_quant.unwrap();
                         // MLX-style fused RMSNorm+qmv fast path for the Q4_0 V projection
@@ -797,15 +657,7 @@ impl MetalF32Backend {
                         if let Some((qw, sc)) = qmv_wv {
                             // qmv_q4_0_rmsnorm: w@0, x@1, out@2, in_dim@3, scales@4,
                             // norm_w@5, eps@6. out = kv_dim (%8); in = hidden (%512).
-                            // F16-scales full-attn V (LUMEN_METAL_Q4_FULLATTN_F16SC=1).
-                            if let Some(p) = crate::metal::q4_fullattn_f16sc_enabled()
-                                .then_some(pipelines.qmv_q4_0_rmsnorm_f16sc.as_ref())
-                                .flatten()
-                            {
-                                enc.set_pipeline_state(p);
-                            } else {
-                                enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm);
-                            }
+                            enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm);
                             enc.set_buffer(qw, 0, 0);
                             enc.set_buffer(&s.x_buf, 0, 1);
                             enc.set_buffer(&s.v_buf, 0, 2);
@@ -1395,9 +1247,7 @@ impl MetalF32Backend {
                                                                          // adds the reduce dispatch + partial round-trip; MHA's single dispatch
                                                                          // is optimal for KV<257). Kept gated-off as an A/B substrate. Tile is
                                                                          // fixed at the default 256 (partial buffer is sized for 256).
-                        let flash_always = super::flash_decode_always_enabled();
-
-                        if new_seq_len >= FLASH_DECODE_THRESHOLD || flash_always {
+                        if new_seq_len >= FLASH_DECODE_THRESHOLD {
                             let flash_tile_size = FLASH_DECODE_TILE_SIZE_DEFAULT;
                             let num_tiles =
                                 ((new_seq_len as u32) + flash_tile_size - 1) / flash_tile_size;
@@ -1514,15 +1364,7 @@ impl MetalF32Backend {
                         if let Some((qw, sc, zero)) = qmv_wo {
                             // qmv_q4_0_residual: w@0, x@1, out@2, in_dim@3, scales@4,
                             // residual@5. in = q_dim (%512); out = hidden_dim (%8).
-                            // F16-scales full-attn Wo (LUMEN_METAL_Q4_FULLATTN_F16SC=1).
-                            if let Some(p) = crate::metal::q4_fullattn_f16sc_enabled()
-                                .then_some(pipelines.qmv_q4_0_residual_f16sc.as_ref())
-                                .flatten()
-                            {
-                                enc.set_pipeline_state(p);
-                            } else {
-                                enc.set_pipeline_state(&pipelines.qmv_q4_0_residual);
-                            }
+                            enc.set_pipeline_state(&pipelines.qmv_q4_0_residual);
                             enc.set_buffer(qw, 0, 0);
                             enc.set_buffer(&s.attn_out_buf, 0, 1);
                             enc.set_buffer(&s.attn_proj_buf, 0, 2);
@@ -1806,15 +1648,7 @@ impl MetalF32Backend {
                     if let Some((qw, sc)) = qmv_wo {
                         // qmv_q4_0_residual: w@0, x@1, out@2, in_dim@3, scales@4,
                         // residual@5. in = q_dim (%512); out = hidden_dim (%8).
-                        // F16-scales full-attn Wo (LUMEN_METAL_Q4_FULLATTN_F16SC=1), residual=x_buf.
-                        if let Some(p) = crate::metal::q4_fullattn_f16sc_enabled()
-                            .then_some(pipelines.qmv_q4_0_residual_f16sc.as_ref())
-                            .flatten()
-                        {
-                            enc.set_pipeline_state(p);
-                        } else {
-                            enc.set_pipeline_state(&pipelines.qmv_q4_0_residual);
-                        }
+                        enc.set_pipeline_state(&pipelines.qmv_q4_0_residual);
                         enc.set_buffer(qw, 0, 0);
                         enc.set_buffer(&s.attn_out_buf, 0, 1);
                         enc.set_buffer(&s.attn_proj_buf, 0, 2);
@@ -2012,36 +1846,12 @@ impl MetalF32Backend {
                     // Fused single-dispatch router (grid=experts,
                     // last-TG reduction) eliminates the separate 1-TG top-k drain
                     // bubble (~6 ms/token = 39% of decode). Env-gated, default OFF.
-                    let use_router_fused = super::moe_router_fused_enabled()
-                        && pipelines.moe_router_fused_topk.is_some()
-                        && s.moe_router_logits.is_some()
-                        && s.moe_router_counter.is_some();
-                    let use_router_parallel = !use_router_fused
-                        && super::moe_router_parallel_enabled()
+                    let use_router_parallel = super::moe_router_parallel_enabled()
                         && pipelines.moe_router_logits_f32.is_some()
                         && pipelines.moe_router_topk_softmax.is_some()
                         && s.moe_router_logits.is_some();
                     if super::moe_diag_skip() == 5 {
                         // diagnostic: skip router entirely
-                    } else if use_router_fused {
-                        let logits_buf = s.moe_router_logits.as_ref().unwrap();
-                        let counter_buf = s.moe_router_counter.as_ref().unwrap();
-                        let pso = pipelines.moe_router_fused_topk.as_ref().unwrap();
-                        enc.set_pipeline_state(pso);
-                        enc.set_buffer(&s.normed_buf, 0, 0);
-                        enc.set_buffer(layer_buf, moe_meta.router_weight_off, 1);
-                        enc.set_buffer(logits_buf, 0, 2);
-                        enc.set_buffer(expert_ids_buf, 0, 3);
-                        enc.set_buffer(expert_weights_buf, 0, 4);
-                        enc.set_buffer(counter_buf, 0, 5);
-                        enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 6);
-                        enc.set_bytes(&(s.moe_num_experts as u32).to_le_bytes(), 7);
-                        enc.set_bytes(&(s.moe_num_active_experts as u32).to_le_bytes(), 8);
-                        let tg = 256u64.min(hidden_dim as u64).max(1);
-                        enc.dispatch_threadgroups(
-                            MTLSize::new(s.moe_num_experts as u64, 1, 1),
-                            MTLSize::new(tg, 1, 1),
-                        );
                     } else if use_router_parallel {
                         let logits_buf = s.moe_router_logits.as_ref().unwrap();
                         let diag = super::moe_diag_skip();
@@ -2217,246 +2027,52 @@ impl MetalF32Backend {
                         } else {
                             None
                         };
-                        let gateup_splitk = crate::metal::q4_gateup_splitk();
-                        let splitk_ok = gateup_splitk >= 2
-                            && qmv_gate_up.is_some()
-                            && hidden_dim % (512 * gateup_splitk as usize) == 0
-                            && inter_dim % 8 == 0;
-                        if splitk_ok {
-                            // Two-pass deterministic SPLIT-K for gate/up (env
-                            // LUMEN_METAL_Q4_GATEUP_SPLITK=N). Reuses the gate/up
-                            // qmv decode buffers. (1) RMSNorm x -> splitk_normed_buf;
-                            // (2) qmv_q4_0_splitk_partial x2 (gate, up) over N K-slices
-                            // -> gate/up partials; (3) gateup_splitk_reduce_swiglu
-                            // (fixed-order reduce + SwiGLU) -> gate_buf. Raises TG
-                            // concurrency Nx for the K=4096 gate/up matvec.
-                            let (gqw, gsc, uqw, usc) = qmv_gate_up.unwrap();
-                            let ks = gateup_splitk;
-                            let up_part_off: u64 = (inter_dim as u64) * 8 * 4; // bytes
-                                                                               // (1) RMSNorm pre-pass: normed = x * rsqrt(mean(x^2)+eps) * norm_w
-                            enc.set_pipeline_state(&pipelines.rmsnorm_bytes);
-                            enc.set_buffer(&s.attn_proj_buf, 0, 0);
-                            enc.set_buffer(layer_buf, ffn_norm_off, 1);
-                            enc.set_buffer(&s.splitk_normed_buf, 0, 2);
-                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                            enc.set_bytes(&eps.to_le_bytes(), 4);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new(1, 1, 1),
-                                MTLSize::new(s.matmul_tg_size, 1, 1),
-                            );
-                            // (2) gate partials over N K-slices
-                            enc.set_pipeline_state(&pipelines.qmv_q4_0_splitk_partial);
-                            enc.set_buffer(gqw, 0, 0);
-                            enc.set_buffer(&s.splitk_normed_buf, 0, 1);
-                            enc.set_buffer(&s.splitk_gateup_partials_buf, 0, 2);
-                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                            enc.set_buffer(gsc, 0, 4);
-                            enc.set_bytes(&ks.to_le_bytes(), 5);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new((inter_dim as u64) / 8, ks as u64, 1),
-                                MTLSize::new(64, 1, 1),
-                            );
-                            // (2b) up partials over N K-slices (offset into the buffer)
-                            enc.set_pipeline_state(&pipelines.qmv_q4_0_splitk_partial);
-                            enc.set_buffer(uqw, 0, 0);
-                            enc.set_buffer(&s.splitk_normed_buf, 0, 1);
-                            enc.set_buffer(&s.splitk_gateup_partials_buf, up_part_off, 2);
-                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                            enc.set_buffer(usc, 0, 4);
-                            enc.set_bytes(&ks.to_le_bytes(), 5);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new((inter_dim as u64) / 8, ks as u64, 1),
-                                MTLSize::new(64, 1, 1),
-                            );
-                            // (3) reduce gate+up partials + SwiGLU -> gate_buf
-                            enc.set_pipeline_state(&pipelines.gateup_splitk_reduce_swiglu);
-                            enc.set_buffer(&s.splitk_gateup_partials_buf, 0, 0);
-                            enc.set_buffer(&s.splitk_gateup_partials_buf, up_part_off, 1);
-                            enc.set_buffer(&s.gate_buf, 0, 2);
-                            enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 3);
-                            enc.set_bytes(&ks.to_le_bytes(), 4);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new(((inter_dim as u64) + 255) / 256, 1, 1),
-                                MTLSize::new(256, 1, 1),
-                            );
-                        } else if crate::metal::metal_concurrent_gateup_enabled()
-                            && qmv_gate_up.is_some()
-                        {
-                            // DIE-SATURATION LEVER for the dense FFN gate/up
-                            // (LUMEN_METAL_CONCURRENT_GATEUP=1, default OFF): the
-                            // fused 8row kernel computes gate+up in ONE dispatch, so
-                            // Metal cannot spread it across the M3 Ultra's two
-                            // UltraFusion dies. Un-fuse into RMSNorm-once + two BARE
-                            // single-matrix qmv matvecs (gate -> gate_buf, up ->
-                            // up_buf) dispatched on a CONCURRENT encoder + a
-                            // standalone SwiGLU. gate and up read the SAME read-only
-                            // normed x and write DISJOINT buffers -> independent ->
-                            // concurrent dispatch is BYTE-IDENTICAL to serial (each
-                            // matvec's internal accumulation order is unchanged; only
-                            // the inter-matvec ordering relaxes). Mirrors the proven
-                            // CONCURRENT_PROJ mechanism, extended to the largest decode
-                            // GPU pool. HONEST: gate/up is ~51 SG/core (past the
-                            // occupancy knee), so the die-spread may be marginal vs the
-                            // die-starved projection clusters where it won — measured.
-                            let (gqw, gsc, uqw, usc) = qmv_gate_up.unwrap();
-                            let use256 = crate::metal::metal_concurrent_gateup_256_enabled();
-                            let (gu_pso, gu_threads): (&_, u64) = if use256 {
-                                (&pipelines.qmv_q4_0_8sg, 256)
-                            } else {
-                                (&pipelines.qmv_q4_0, 64)
-                            };
-                            // (a) RMSNorm x ONCE on the SERIAL encoder: attn_proj_buf
-                            // -> normed_buf (rmsnorm_bytes reads the FFN norm weight as
-                            // raw bytes off layer_buf at ffn_norm_off; 1 TG).
-                            enc.set_pipeline_state(&pipelines.rmsnorm_bytes);
-                            enc.set_buffer(&s.attn_proj_buf, 0, 0);
-                            enc.set_buffer(layer_buf, ffn_norm_off, 1);
-                            enc.set_buffer(&s.normed_buf, 0, 2);
-                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                            enc.set_bytes(&eps.to_le_bytes(), 4);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new(1, 1, 1),
-                                MTLSize::new(norm_tg_size, 1, 1),
-                            );
-                            // Close the serial encoder and open a CONCURRENT one for
-                            // the gate/up cluster. Encoders within ONE command buffer
-                            // execute in submission order, so the RMSNorm above is
-                            // ordered-before this cluster -> normed_buf is fully
-                            // written when gate/up read it.
-                            enc.end_encoding();
-                            enc = cmd.new_concurrent_compute_encoder().ok_or_else(|| {
-                                RuntimeError::Compute(
-                                    "CONCURRENT_GATEUP: failed to create concurrent encoder".into(),
-                                )
-                            })?;
-                            // (b) bare qmv GATE: normed_buf -> gate_buf. NO barrier
-                            // between gate and up (disjoint outputs) so Metal can run
-                            // them concurrently across both dies.
-                            enc.set_pipeline_state(gu_pso);
-                            enc.set_buffer(gqw, 0, 0);
-                            enc.set_buffer(&s.normed_buf, 0, 1);
-                            enc.set_buffer(&s.gate_buf, 0, 2);
-                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                            enc.set_buffer(gsc, 0, 4);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new((inter_dim as u64) / 8, 1, 1),
-                                MTLSize::new(gu_threads, 1, 1),
-                            );
-                            // (c) bare qmv UP: normed_buf -> up_buf.
-                            enc.set_pipeline_state(gu_pso);
-                            enc.set_buffer(uqw, 0, 0);
-                            enc.set_buffer(&s.normed_buf, 0, 1);
-                            enc.set_buffer(&s.up_buf, 0, 2);
-                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                            enc.set_buffer(usc, 0, 4);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new((inter_dim as u64) / 8, 1, 1),
-                                MTLSize::new(gu_threads, 1, 1),
-                            );
-                            // Resource-scoped barrier on the two disjoint outputs, then
-                            // close the concurrent encoder and reopen a serial one so
-                            // the SwiGLU (and the rest of the layer) runs with serial
-                            // completion ordering exactly as before.
-                            enc.memory_barrier_with_resources(&[&s.gate_buf, &s.up_buf]);
-                            enc.end_encoding();
-                            enc = cmd.new_compute_encoder().ok_or_else(|| {
-                                RuntimeError::Compute(
-                                    "CONCURRENT_GATEUP: failed to reopen serial encoder".into(),
-                                )
-                            })?;
-                            // (d) standalone SwiGLU: gate_buf = silu(gate_buf) * up_buf
-                            enc.set_pipeline_state(&pipelines.swiglu);
-                            enc.set_buffer(&s.gate_buf, 0, 0);
-                            enc.set_buffer(&s.up_buf, 0, 1);
-                            enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 2);
-                            let swg_tg = 256u64.min(inter_dim as u64).max(1);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new((inter_dim as u64).div_ceil(swg_tg), 1, 1),
-                                MTLSize::new(swg_tg, 1, 1),
-                            );
-                        } else if let Some((gqw, gsc, uqw, usc)) = qmv_gate_up {
-                            // INTERLEAVED gate+up (env LUMEN_METAL_Q4_GATEUP_IL):
-                            // highest priority when the IL pipeline compiled AND the
-                            // interleaved buffers exist for this layer. Byte-identical
-                            // SwiGLU written to gate_buf, exactly like the dual-matrix
-                            // path below, but reading ONE co-resident packed nibble +
-                            // ONE packed f16-scale buffer. Indexed by layer_idx.
-                            let il_bufs = if super::q4_gateup_il_enabled() {
-                                match (
-                                    pipelines.qmv_q4_0_gate_up_swiglu_il.as_ref(),
-                                    s.qmv_ffn_gate_up_il_qw.get(layer_idx),
-                                    s.qmv_ffn_gate_up_il_scales.get(layer_idx),
-                                ) {
-                                    (Some(pso), Some(Some(qw)), Some(Some(sc))) => {
-                                        Some((pso, qw, sc))
-                                    }
-                                    _ => None,
-                                }
+                        if let Some((gqw, gsc, uqw, usc)) = qmv_gate_up {
+                            // qmv_q4_0_gate_up_swiglu: w_gate@0, x@1, out@2, in_dim@3,
+                            // gate_scales@4, w_up@5, up_scales@6, norm_w@7, eps@8.
+                            // out_dim = inter_dim (%8==0); in_dim = hidden (%512==0).
+                            //
+                            // SCALE-TYPE-MATCHING dispatch (mirrors the greedy path in
+                            // decode_greedy.rs): when the gate/up decode-qmv scale
+                            // buffers were built as f16 (which LUMEN_METAL_Q4_GATEUP_H2MATH=1
+                            // self-engages), the f32-scale qmv_q4_0_gate_up_swiglu reads
+                            // those f16 bytes as f32 and garbles. Dispatch the f16sc (or
+                            // h2math) variant that reads `device const half*` scales.
+                            // Bindings + geometry are identical across all three (only the
+                            // scale element type and the inner accumulator differ), so the
+                            // dispatched kernel MUST match the buffer-build layout.
+                            // (sampling-correctness fix.)
+                            let gateup_f16sc_on = super::q4_gateup_f16sc_enabled();
+                            let gu_pipe = if gateup_f16sc_on
+                                && super::q4_gateup_h2math_enabled()
+                                && pipelines.qmv_q4_0_gate_up_swiglu_f16sc_h2math.is_some()
+                            {
+                                pipelines.qmv_q4_0_gate_up_swiglu_f16sc_h2math.as_ref()
+                            } else if gateup_f16sc_on
+                                && pipelines.qmv_q4_0_gate_up_swiglu_f16sc.is_some()
+                            {
+                                pipelines.qmv_q4_0_gate_up_swiglu_f16sc.as_ref()
                             } else {
                                 None
                             };
-                            if let Some((pso_il, il_qw, il_sc)) = il_bufs {
-                                // qmv_q4_0_gate_up_swiglu_il: w_il@0, x@1, out@2,
-                                // in_dim@3, scales_il@4, norm_w@5, eps@6.
-                                enc.set_pipeline_state(pso_il);
-                                enc.set_buffer(il_qw, 0, 0);
-                                enc.set_buffer(&s.attn_proj_buf, 0, 1);
-                                enc.set_buffer(&s.gate_buf, 0, 2);
-                                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                                enc.set_buffer(il_sc, 0, 4);
-                                enc.set_buffer(layer_buf, ffn_norm_off, 5);
-                                enc.set_bytes(&eps.to_le_bytes(), 6);
-                                enc.dispatch_threadgroups(
-                                    MTLSize::new((inter_dim as u64) / 8, 1, 1),
-                                    MTLSize::new(64, 1, 1),
-                                );
+                            if let Some(p) = gu_pipe {
+                                enc.set_pipeline_state(p);
                             } else {
-                                // qmv_q4_0_gate_up_swiglu: w_gate@0, x@1, out@2, in_dim@3,
-                                // gate_scales@4, w_up@5, up_scales@6, norm_w@7, eps@8.
-                                // out_dim = inter_dim (%8==0); in_dim = hidden (%512==0).
-                                //
-                                // SCALE-TYPE-MATCHING dispatch (mirrors the greedy path in
-                                // decode_greedy.rs): when the gate/up decode-qmv scale
-                                // buffers were built as f16 (which LUMEN_METAL_Q4_GATEUP_H2MATH=1
-                                // self-engages), the f32-scale qmv_q4_0_gate_up_swiglu reads
-                                // those f16 bytes as f32 and garbles. Dispatch the f16sc (or
-                                // h2math) variant that reads `device const half*` scales.
-                                // Bindings + geometry are identical across all three (only the
-                                // scale element type and the inner accumulator differ), so the
-                                // dispatched kernel MUST match the buffer-build layout.
-                                // (sampling-correctness fix.)
-                                let gateup_f16sc_on = super::q4_gateup_f16sc_enabled();
-                                let gu_pipe = if gateup_f16sc_on
-                                    && super::q4_gateup_h2math_enabled()
-                                    && pipelines.qmv_q4_0_gate_up_swiglu_f16sc_h2math.is_some()
-                                {
-                                    pipelines.qmv_q4_0_gate_up_swiglu_f16sc_h2math.as_ref()
-                                } else if gateup_f16sc_on
-                                    && pipelines.qmv_q4_0_gate_up_swiglu_f16sc.is_some()
-                                {
-                                    pipelines.qmv_q4_0_gate_up_swiglu_f16sc.as_ref()
-                                } else {
-                                    None
-                                };
-                                if let Some(p) = gu_pipe {
-                                    enc.set_pipeline_state(p);
-                                } else {
-                                    enc.set_pipeline_state(&pipelines.qmv_q4_0_gate_up_swiglu);
-                                }
-                                enc.set_buffer(gqw, 0, 0);
-                                enc.set_buffer(&s.attn_proj_buf, 0, 1);
-                                enc.set_buffer(&s.gate_buf, 0, 2);
-                                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                                enc.set_buffer(gsc, 0, 4);
-                                enc.set_buffer(uqw, 0, 5);
-                                enc.set_buffer(usc, 0, 6);
-                                enc.set_buffer(layer_buf, ffn_norm_off, 7);
-                                enc.set_bytes(&eps.to_le_bytes(), 8);
-                                enc.dispatch_threadgroups(
-                                    MTLSize::new((inter_dim as u64) / 8, 1, 1),
-                                    MTLSize::new(64, 1, 1),
-                                );
+                                enc.set_pipeline_state(&pipelines.qmv_q4_0_gate_up_swiglu);
                             }
+                            enc.set_buffer(gqw, 0, 0);
+                            enc.set_buffer(&s.attn_proj_buf, 0, 1);
+                            enc.set_buffer(&s.gate_buf, 0, 2);
+                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                            enc.set_buffer(gsc, 0, 4);
+                            enc.set_buffer(uqw, 0, 5);
+                            enc.set_buffer(usc, 0, 6);
+                            enc.set_buffer(layer_buf, ffn_norm_off, 7);
+                            enc.set_bytes(&eps.to_le_bytes(), 8);
+                            enc.dispatch_threadgroups(
+                                MTLSize::new((inter_dim as u64) / 8, 1, 1),
+                                MTLSize::new(64, 1, 1),
+                            );
                         } else {
                             match meta.w_gate_quant {
                                 QuantScheme::Q4_0 => enc.set_pipeline_state(
@@ -2626,73 +2242,42 @@ impl MetalF32Backend {
                         None
                     };
                     if let Some((qw, sc)) = qmv_down {
-                        // Two-pass deterministic SPLIT-K (env LUMEN_METAL_Q4_QMV_DOWN_SPLITK=N,
-                        // default 0=off) when in_dim splits evenly into N 512-block slices;
-                        // else the one-pass qmv_q4_0_residual.
-                        let k_splits = crate::metal::q4_qmv_down_splitk();
-                        if k_splits >= 2 && (inter_dim as u32) % (512 * k_splits) == 0 {
-                            // Pass 1: per-(row-group, k-slice) partial dot -> partials scratch.
-                            enc.set_pipeline_state(&pipelines.qmv_q4_0_splitk_partial);
-                            enc.set_buffer(qw, 0, 0);
-                            enc.set_buffer(&s.gate_buf, 0, 1);
-                            enc.set_buffer(&s.splitk_partials_buf, 0, 2);
-                            enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 3);
-                            enc.set_buffer(sc, 0, 4);
-                            enc.set_bytes(&k_splits.to_le_bytes(), 5);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new((hidden_dim as u64) / 8, k_splits as u64, 1),
-                                MTLSize::new(64, 1, 1),
-                            );
-                            enc.memory_barrier_with_scope(1);
-                            // Pass 2: deterministic reduce (fixed ks-ascending) + residual.
-                            enc.set_pipeline_state(&pipelines.qmv_q4_0_splitk_reduce);
-                            enc.set_buffer(&s.splitk_partials_buf, 0, 0);
-                            enc.set_buffer(&s.x_buf, 0, 1);
-                            enc.set_buffer(&s.attn_proj_buf, 0, 2);
-                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                            enc.set_bytes(&k_splits.to_le_bytes(), 4);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new((hidden_dim as u64).div_ceil(256), 1, 1),
-                                MTLSize::new(256, 1, 1),
-                            );
+                        // SCALE-TYPE-MATCHING dispatch (mirrors the greedy path in
+                        // decode_greedy.rs): when the FFN-down decode-qmv scale
+                        // buffer was built as f16 (env LUMEN_METAL_Q4_QMV_DOWN_F16SC=1,
+                        // which LUMEN_METAL_Q4_DOWN_H2MATH=1 self-engages), the f32-
+                        // scale qmv_q4_0_residual reads those f16 bytes as f32 and
+                        // garbles. Dispatch the f16sc (or h2math) kernel that reads
+                        // `device const half*` scales instead. Bindings + geometry are
+                        // identical across all three (only the scale element type and
+                        // the inner accumulator differ), so the buffer-build layout and
+                        // the dispatched kernel MUST match. (sampling-correctness fix.)
+                        let down_f16sc_on = crate::metal::q4_qmv_down_f16sc_enabled();
+                        let down_pipe = if down_f16sc_on
+                            && crate::metal::q4_down_h2math_enabled()
+                            && pipelines.qmv_q4_0_residual_f16sc_h2math.is_some()
+                        {
+                            pipelines.qmv_q4_0_residual_f16sc_h2math.as_ref()
+                        } else if down_f16sc_on && pipelines.qmv_q4_0_residual_f16sc.is_some() {
+                            pipelines.qmv_q4_0_residual_f16sc.as_ref()
                         } else {
-                            // SCALE-TYPE-MATCHING dispatch (mirrors the greedy path in
-                            // decode_greedy.rs): when the FFN-down decode-qmv scale
-                            // buffer was built as f16 (env LUMEN_METAL_Q4_QMV_DOWN_F16SC=1,
-                            // which LUMEN_METAL_Q4_DOWN_H2MATH=1 self-engages), the f32-
-                            // scale qmv_q4_0_residual reads those f16 bytes as f32 and
-                            // garbles. Dispatch the f16sc (or h2math) kernel that reads
-                            // `device const half*` scales instead. Bindings + geometry are
-                            // identical across all three (only the scale element type and
-                            // the inner accumulator differ), so the buffer-build layout and
-                            // the dispatched kernel MUST match. (sampling-correctness fix.)
-                            let down_f16sc_on = crate::metal::q4_qmv_down_f16sc_enabled();
-                            let down_pipe = if down_f16sc_on
-                                && crate::metal::q4_down_h2math_enabled()
-                                && pipelines.qmv_q4_0_residual_f16sc_h2math.is_some()
-                            {
-                                pipelines.qmv_q4_0_residual_f16sc_h2math.as_ref()
-                            } else if down_f16sc_on && pipelines.qmv_q4_0_residual_f16sc.is_some() {
-                                pipelines.qmv_q4_0_residual_f16sc.as_ref()
-                            } else {
-                                None
-                            };
-                            if let Some(p) = down_pipe {
-                                enc.set_pipeline_state(p);
-                            } else {
-                                enc.set_pipeline_state(&pipelines.qmv_q4_0_residual);
-                            }
-                            enc.set_buffer(qw, 0, 0);
-                            enc.set_buffer(&s.gate_buf, 0, 1);
-                            enc.set_buffer(&s.x_buf, 0, 2);
-                            enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 3);
-                            enc.set_buffer(sc, 0, 4);
-                            enc.set_buffer(&s.attn_proj_buf, 0, 5);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new((hidden_dim as u64) / 8, 1, 1),
-                                MTLSize::new(64, 1, 1),
-                            );
+                            None
+                        };
+                        if let Some(p) = down_pipe {
+                            enc.set_pipeline_state(p);
+                        } else {
+                            enc.set_pipeline_state(&pipelines.qmv_q4_0_residual);
                         }
+                        enc.set_buffer(qw, 0, 0);
+                        enc.set_buffer(&s.gate_buf, 0, 1);
+                        enc.set_buffer(&s.x_buf, 0, 2);
+                        enc.set_bytes(&(inter_dim as u32).to_le_bytes(), 3);
+                        enc.set_buffer(sc, 0, 4);
+                        enc.set_buffer(&s.attn_proj_buf, 0, 5);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new((hidden_dim as u64) / 8, 1, 1),
+                            MTLSize::new(64, 1, 1),
+                        );
                     } else {
                         let tg_down = match meta.w_down_quant {
                             QuantScheme::Q8_0 => {

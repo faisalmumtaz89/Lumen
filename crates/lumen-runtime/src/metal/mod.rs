@@ -26,16 +26,11 @@
 //! - Attention: Scores computed in parallel, softmax on GPU, value accumulation parallel
 //! - Activation buffers: Metal shared-mode buffers (CPU/GPU zero-copy)
 
-pub(crate) mod ffi;
-// Apple MPSGraph BF16 GEMM bindings (env-gated opt-in path).
-// Provides `MpsGraphContext` + `encode_bf16_matmul_to_command_buffer`
-// for the GDN qkv-proj and ssm-out matmuls when
-// `LUMEN_METAL_BF16_MPS=1`. Default OFF.
 mod decode_greedy;
 pub(crate) mod decode_profile;
 mod decode_single_cb;
+pub(crate) mod ffi;
 pub(crate) mod io;
-pub(crate) mod mps_graph_ffi;
 pub(crate) mod shaders;
 // disk-KV sync helpers (GPU<->CPU KV mirror + GDN state).
 mod disk_sync;
@@ -110,49 +105,6 @@ fn maybe_apply_metal_decode_delay() {
     if delay_us > 0 {
         std::thread::sleep(std::time::Duration::from_micros(delay_us));
     }
-}
-
-/// Env-var gated opt-in: use the ggml-metal-ported Q8_0 × F32 GEMM kernel.
-///
-/// When `LUMEN_METAL_GEMM_GGML_PORT=1` (or any non-empty value), Lumen swaps
-/// the Q8_0 prefill GEMM dispatch from the in-tree `dequant_tiled_matmul_q8_0_k64`
-/// to the upstream-derived `kernel_mul_mm_q8_0_f32_ported` (see
-/// `shaders/gemm_q8_0_ported.msl`). Default OFF.
-///
-/// Resolved once at startup (atomic) so dispatch sites don't pay an env lookup.
-#[inline]
-pub(crate) fn use_ggml_ported_q8_0_gemm() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    // 0 = unknown, 1 = false, 2 = true
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_GEMM_GGML_PORT")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
-}
-
-/// When `LUMEN_METAL_Q4_GATEUP_WIDE=1` (and the decode-qmv gate/up buffers
-/// exist, i.e. `LUMEN_METAL_Q4_QMV_GATEUP=1`), the dense FFN gate/up GEMV uses
-/// the WIDE-load kernel `rmsnorm_ffn_gate_up_swiglu_q4_0_wide` (256-thread,
-/// uint4/128-bit aligned loads off the separated sequential-nibble layout)
-/// instead of the 64-thread `qmv_q4_0_gate_up_swiglu`. Default OFF. Cached.
-pub(crate) fn q4_gateup_wide_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_Q4_GATEUP_WIDE")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
 }
 
 /// Opt-in switch for the GPU temperature sampler (Option A,
@@ -237,101 +189,6 @@ pub(crate) fn q4_gateup_f16sc_enabled() -> bool {
     q4_gateup_h2math_enabled()
 }
 
-/// When `LUMEN_METAL_Q4_GATEUP_1SG=1` (and the dense FFN gate/up decode-qmv
-/// buffers exist via `LUMEN_METAL_Q4_QMV_GATEUP=1`, AND the f16-scales gate/up
-/// path is engaged so the f16 scale buffers are built — `LUMEN_METAL_Q4_GATEUP_F16SC`
-/// or the master `LUMEN_METAL_Q4_F16_SCALES_ALL`), the dense FFN gate/up GEMV uses
-/// the 1-SIMDGROUP-PER-THREADGROUP kernel `qmv_q4_0_gate_up_swiglu_f16sc_1sg`
-/// (32 threads/TG, 4 rows/TG, dispatched over inter_dim/4 threadgroups) instead
-/// of the 2-SG kernel (64 threads/TG, 8 rows/TG, inter_dim/8 TGs). This DOUBLES
-/// the resident threadgroup count to deepen the wavefront queue and hide HBM
-/// latency on the under-occupied gate/up matvec (~55-67% of bandwidth peak vs
-/// lm_head's ~84%), while keeping the per-simdgroup 4-rows x-register-reuse intact.
-/// Byte-identical to the f16sc kernel (same per-row math + same
-/// per-simdgroup RMSNorm reduction; only the TG/SG partition changes). Perf lever,
-/// default OFF. Cached.
-pub(crate) fn q4_gateup_1sg_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_Q4_GATEUP_1SG")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
-}
-
-/// When `LUMEN_METAL_Q4_GATEUP_8ROW=1` (and the dense FFN gate/up decode-qmv
-/// buffers exist via `LUMEN_METAL_Q4_QMV_GATEUP=1`, AND the f16-scales gate/up
-/// path is engaged so the f16 scale buffers are built — `LUMEN_METAL_Q4_GATEUP_F16SC`
-/// or the master `LUMEN_METAL_Q4_F16_SCALES_ALL`), the dense FFN gate/up GEMV uses
-/// the 8-ROWS-PER-SIMDGROUP kernel `qmv_q4_0_gate_up_swiglu_f16sc_8row` (2 SG/TG,
-/// 8 rows/SG = 16 rows/TG, dispatched over inter_dim/16 threadgroups) instead of
-/// the 4-row f16sc kernel (8 rows/TG, inter_dim/8 TGs). This HALVES the threadgroup
-/// count (9B: 1536 -> 768, still ~12.8/core on the 60-core M3 Ultra = richly
-/// occupied) while DOUBLING x-register reuse: each register-staged normed-x value
-/// (and the shared sumx + the RMSNorm ss accumulation) is reused across 8 rows x
-/// 2 matrices = 16 MACs vs 8, lifting arithmetic intensity per fetched activation
-/// byte. The gate/up matvec is over-subscribed (occupancy is NOT its limiter — the
-/// 1SG MORE-TGs variant was flat) yet runs only ~55-67% of bandwidth peak vs
-/// lm_head's ~84%; this attacks the per-byte-work side. Byte-identical per output
-/// element to the f16sc kernel (each row's FP add order + simd_sum reduction are
-/// unchanged; only the row<->simdgroup assignment differs). Requires
-/// inter_dim % 16 == 0 (9B inter=12288 OK). Perf lever, default OFF. Cached.
-pub(crate) fn q4_gateup_8row_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_Q4_GATEUP_8ROW")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
-}
-
-/// When `LUMEN_METAL_Q4_GATEUP_IL=1` (and the dense FFN gate/up decode-qmv buffers
-/// exist via `LUMEN_METAL_Q4_QMV_GATEUP=1`), the dense FFN gate/up GEMV uses the
-/// INTERLEAVED kernel `qmv_q4_0_gate_up_swiglu_il` reading ONE co-resident packed
-/// buffer instead of four separate streams (w_gate, w_up, gate_scales, up_scales).
-///
-/// MECHANISM (roofline "coalescing — find the real limiter"): the f16sc gate/up
-/// kernel issues, per 32-value block, FOUR distinct device-memory accesses from
-/// FOUR buffers at four base addresses — gate nibbles, up nibbles, gate f16 scale,
-/// up f16 scale. The dense FFN gate/up matvec is the DOMINANT per-token weight
-/// stream (~1.81 GB/tok across 32 layers x 2 matrices) yet runs only ~55-67% of
-/// bandwidth peak (vs lm_head's ~84%). Four interleaved streams under-utilise the
-/// memory subsystem (more in-flight cache-line/TLB demand streams, weaker
-/// prefetch) vs ONE contiguous stream. This packs, per output row, blocks
-/// sequentially as `[half g_scale, half u_scale, 16B gate_nibbles, 16B up_nibbles]`
-/// = 36 contiguous bytes/block, so each thread's per-block fetch is ONE coalesced
-/// region. Same bytes moved, same nibble math, same -8 fold, same per-simdgroup
-/// RMSNorm ss reduce + SwiGLU -> BYTE-IDENTICAL to qmv_q4_0_gate_up_swiglu_f16sc.
-///
-/// Engages only when the IL pipeline compiled AND the interleaved buffers were
-/// built (preload_weights_gpu_resident, gated on this flag); otherwise the
-/// dispatch falls back cleanly to the existing f16sc / 8row / default paths.
-/// Requires in_dim % 512 == 0 and inter_dim % 8 == 0 (9B: in=4096, out=12288 OK).
-/// Perf lever, default OFF. Cached.
-pub(crate) fn q4_gateup_il_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_Q4_GATEUP_IL")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
-}
-
 /// When `LUMEN_METAL_Q4_QMV_DOWN_F16SC=1` (and the FFN-down decode-qmv buffers
 /// exist, i.e. `LUMEN_METAL_Q4_QMV_DOWN=1`), the dense FFN-down GEMV uses the
 /// F16-SCALES kernel `qmv_q4_0_residual_f16sc` with the per-block scale buffer
@@ -361,36 +218,6 @@ pub(crate) fn q4_qmv_down_f16sc_enabled() -> bool {
 /// fold + f32 scale bound the long-K drift.
 pub(crate) fn q4_down_h2math_enabled() -> bool {
     true
-}
-
-/// When `LUMEN_METAL_Q4_GATEUP_F16MATH=1` (and the dense FFN gate/up f16-scale path
-/// is engaged — `q4_gateup_f16sc_enabled`, which the master `LUMEN_METAL_Q4_F16_SCALES_ALL`
-/// turns on — AND the f16math kernel compiled), the dense FFN gate/up GEMV uses
-/// `qmv_q4_0_gate_up_swiglu_f16sc_f16math`: x is staged as `half` and each per-32-block
-/// dequant MAC (the 16-term nibble*x dot, for BOTH gate and up) is accumulated in
-/// `half`, with the cross-block reduction + sum-of-x + scale + RMSNorm + SwiGLU kept
-/// in f32.
-///
-/// RATIONALE: the same compute-bound-unpack argument as the FFN-down h2math path,
-/// applied to the DOMINANT FFN matvec. The dense FFN gate/up is the largest single
-/// matvec pool in decode (gate+up = 100M weights/layer x 32 dense layers, ~2x the
-/// GDN qkv) and sits at the single-kernel bandwidth/compute ceiling, so halving the
-/// per-nibble dequant ALU on the matvec that matters most is the remaining compute
-/// lever. NEAR-TIE, not guaranteed byte-identical (per-block product+sum rounds to
-/// f16 mantissa); the f32 cross-block accumulation + f32 SwiGLU bound the drift.
-/// Default OFF. Cached.
-pub(crate) fn q4_gateup_f16math_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_Q4_GATEUP_F16MATH")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
 }
 
 /// Part of the default Q4_0 fast-decode stack (unconditional — the dense FFN
@@ -463,32 +290,6 @@ pub(crate) fn q4_proj_h2math_enabled() -> bool {
     true
 }
 
-/// When `LUMEN_METAL_Q4_SSMOUT_REQUANT=1` (and `LUMEN_METAL_Q4_QMV_SSMOUT=1`), the
-/// GDN `ssm_out` output projection — which ships as Q8_0 on Qwen3.5-9B (so the
-/// native-Q4 ssm_out qmv path is otherwise INERT, building 0 buffers) — is
-/// RE-QUANTIZED Q8_0 -> Q4_0 at load time and the decode-qmv buffers are built
-/// from the Q4 result, so the existing `qmv_q4_0_residual` ssm_out dispatch
-/// engages on all 24 GDN layers. ssm_out (in=value_dim, out=hidden) is the last
-/// major per-token Q8_0 weight stream on the GDN decode path (~Q8 8.5 bits/weight
-/// over 24 layers); halving it to Q4 (~4.5 bits) is a ~2% bytes-moved cut on the
-/// bandwidth-bound decode. Like the lm_head Q8->Q4 requant
-/// (`LUMEN_METAL_Q4_QMV_LMHEAD`), this is a deliberate precision tradeoff (NOT
-/// byte-identical to the Q8 ssm_out NR2 path) — accepted only if the correctness
-/// gate keeps the answer (byte-identical OR near-tie). Default OFF. Cached.
-pub(crate) fn q4_ssmout_requant_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_Q4_SSMOUT_REQUANT")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
-}
-
 /// Part of the default Q4_0 fast-decode stack (unconditional). The GDN `ssm_out`
 /// output projection — which ships as Q8_0 on Qwen3.5-9B (so its per-token weight
 /// stream is the LAST major Q8_0 stream on the GDN decode path: in=value_dim=4096,
@@ -501,7 +302,7 @@ pub(crate) fn q4_ssmout_requant_enabled() -> bool {
 /// matvec + residual + copy, ALL in ONE dispatch) in place of the Q8 fused
 /// `..._q8_0_..._nr2` kernel.
 ///
-/// This is the CORRECTED form of the SUPERSEDED `LUMEN_METAL_Q4_SSMOUT_REQUANT`
+/// This is the CORRECTED form of the earlier qmv-layout ssm_out requant approach
 /// (which requanted to the *qmv* sequential-nibble layout and routed through the
 /// 3-dispatch `silu_elementwise_mul + qmv_q4_0_residual + residual_add_copy` path
 /// — the byte saving was real but eaten by the two extra dispatches+barriers,
@@ -545,212 +346,6 @@ pub(crate) fn q4_proj_f16sc_enabled() -> bool {
     q4_proj_h2math_enabled()
 }
 
-/// When `LUMEN_METAL_Q4_FULLATTN_F16SC=1` (and the full-attn decode-qmv buffers
-/// exist, i.e. `LUMEN_METAL_Q4_QMV_PROJ=1` for Q+gate/Wo and
-/// `LUMEN_METAL_Q4_QMV_KV=1` for K/V), the FULL-ATTENTION-layer projections —
-/// Q+gate (`wq`, 2*q_dim rows), K (`wk`), V (`wv`) all via
-/// `qmv_q4_0_rmsnorm_f16sc`, and the output projection Wo (`wo`) via
-/// `qmv_q4_0_residual_f16sc` — read their per-block scale buffers built as f16
-/// (2 B/block instead of f32's 4 B). This is the LAST remaining f32-scale matvec
-/// stream: `LUMEN_METAL_Q4_PROJ_F16SC` already covers the 24 GDN layers, while
-/// these run on the 8 full-attention layers of the Qwen3.5-9B GatedDeltaNet
-/// hybrid. The f16 scale is the on-disk Q4_0 scale's native precision (the f32
-/// decode-qmv layout widened it; the f16sc repack copies the on-disk f16 bytes
-/// verbatim), so the result is BYTE-IDENTICAL to the f32-scale kernels — only the
-/// streamed weight bytes drop from 20 to 18 per 32-value block (~10% fewer bytes
-/// on these bandwidth-bound matvecs). Reuses the existing `qmv_q4_0_rmsnorm_f16sc`
-/// and `qmv_q4_0_residual_f16sc` kernels (no new MSL). Default OFF. Cached.
-pub(crate) fn q4_fullattn_f16sc_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_Q4_FULLATTN_F16SC")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
-}
-
-/// When `LUMEN_METAL_Q4_GATEUP_UNFUSED=1` (and the decode-qmv gate/up buffers
-/// exist), the dense FFN gate/up runs as TWO separate single-matrix
-/// `qmv_q4_0_rmsnorm` GEMVs (gate -> gate_buf, up -> up_buf) + a standalone
-/// `swiglu`, instead of the fused dual-matrix kernel. The single-matrix qmv has
-/// HALF the register pressure of the dual-matrix one (proven 84% peak on
-/// lm_head), so it may beat the 8row on the dense FFN. Default OFF. Cached.
-pub(crate) fn q4_gateup_unfused_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_Q4_GATEUP_UNFUSED")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
-}
-
-/// When `LUMEN_METAL_Q4_GATEUP_BAREQMV=1` (and the decode-qmv gate/up buffers
-/// exist), the dense FFN gate/up runs as: RMSNorm the FFN input ONCE
-/// (`rmsnorm_bytes`, attn_proj_buf -> normed_buf) -> a BARE single-matrix
-/// `qmv_q4_0` GEMV on the pre-normed x for gate (-> gate_buf) -> a bare
-/// `qmv_q4_0` for up (-> up_buf) -> a standalone `swiglu`. This removes the
-/// redundant per-matrix RMSNorm that the fused `qmv_q4_0_rmsnorm` gate/up path
-/// recomputes inside BOTH gate and up. Default OFF. Cached.
-pub(crate) fn q4_gateup_bareqmv_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_Q4_GATEUP_BAREQMV")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
-}
-
-/// When `LUMEN_METAL_Q4_GATEUP_BAREQMV_256=1`, the bare-qmv gate/up path (see
-/// `q4_gateup_bareqmv_enabled`) selects the 256-thread `qmv_q4_0_8sg` kernel
-/// (8 simdgroups/threadgroup, K split across the 32 lanes) instead of the
-/// 64-thread `qmv_q4_0`. Only consulted when BAREQMV is on. Default OFF. Cached.
-pub(crate) fn q4_gateup_bareqmv_256_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_Q4_GATEUP_BAREQMV_256")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
-}
-
-/// When `LUMEN_METAL_Q4_QMV_DOWN_SPLITK=N` (N in {2,4,8}, default OFF/0), the Q4
-/// FFN-down decode matvec uses the two-pass deterministic SPLIT-K kernels
-/// (`qmv_q4_0_splitk_partial` + `qmv_q4_0_splitk_reduce`) with N K-slices instead
-/// of the one-pass `qmv_q4_0_residual`. Splits the K=12288 contraction across N×
-/// more threadgroups to raise memory-level parallelism for the row-starved down
-/// projection. Requires the down qmv buffers (LUMEN_METAL_Q4_QMV_DOWN=1) AND
-/// in_dim % (512*N) == 0. Returns the K-split count (0 = disabled). Perf lever,
-/// default-OFF. NOT byte-identical (different FP reduction tree); quality-clean.
-pub(crate) fn q4_qmv_down_splitk() -> u32 {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return (cur - 1) as u32;
-    }
-    let n = std::env::var("LUMEN_METAL_Q4_QMV_DOWN_SPLITK")
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .filter(|&n| n == 2 || n == 4 || n == 8)
-        .unwrap_or(0);
-    CACHE.store((n as u8) + 1, Ordering::Relaxed);
-    n
-}
-
-/// When `LUMEN_METAL_Q4_GATEUP_SPLITK=N` (N in {2,4}, default OFF/0), the Q4 dense
-/// FFN gate/up projection uses a two-pass deterministic SPLIT-K: a pre-pass RMSNorm
-/// of x, then `qmv_q4_0_splitk_partial` run TWICE (gate, up) over N K-slices each,
-/// then `gateup_splitk_reduce_swiglu` (fixed-order reduce + SwiGLU). Splits the
-/// K=4096 contraction across N× more threadgroups to raise memory-level parallelism
-/// for the biggest decode pool. Requires the gate/up qmv buffers
-/// (LUMEN_METAL_Q4_QMV_GATEUP=1) AND hidden % (512*N) == 0. Returns the K-split
-/// count (0 = disabled). Perf lever, default-OFF. NOT byte-identical (different FP
-/// reduction tree); quality-clean.
-pub(crate) fn q4_gateup_splitk() -> u32 {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return (cur - 1) as u32;
-    }
-    let n = std::env::var("LUMEN_METAL_Q4_GATEUP_SPLITK")
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .filter(|&n| n == 2 || n == 4)
-        .unwrap_or(0);
-    CACHE.store((n as u8) + 1, Ordering::Relaxed);
-    n
-}
-
-/// When `LUMEN_METAL_Q4_SSMOUT_SPLITK=N` (N in {2,4,8}, default OFF/0), the Q4 GDN
-/// ssm_out projection uses the two-pass deterministic SPLIT-K kernels
-/// (`qmv_q4_0_splitk_partial` + `qmv_q4_0_splitk_reduce`, zero residual) with N
-/// K-slices instead of the one-pass `qmv_q4_0_residual`. Splits the K=4096(q_dim)
-/// contraction across N× more threadgroups to raise memory-level parallelism for
-/// the row-starved ssm_out projection (out=2048, ~8.5 SG/core at N=1). Requires the
-/// ssm_out qmv buffers (LUMEN_METAL_Q4_QMV_SSMOUT=1) AND in_dim % (512*N) == 0.
-/// Returns the K-split count (0 = disabled). Perf lever, default-OFF. NOT
-/// byte-identical (different FP reduction tree); quality-clean.
-pub(crate) fn q4_ssmout_splitk() -> u32 {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return (cur - 1) as u32;
-    }
-    let n = std::env::var("LUMEN_METAL_Q4_SSMOUT_SPLITK")
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .filter(|&n| n == 2 || n == 4 || n == 8)
-        .unwrap_or(0);
-    CACHE.store((n as u8) + 1, Ordering::Relaxed);
-    n
-}
-
-/// When `LUMEN_METAL_Q4_KV_FUSE=1` (default OFF), the full-attn K and V projections
-/// (each [kv_dim=1024, hidden=4096] Q4_0, ~4.3 SG/core separately) are computed by a
-/// SINGLE fused qmv dispatch over the concatenated [2*kv_dim, hidden] weight (256 TGs
-/// = ~8.5 SG/core), raising effective occupancy for the worst-occupancy matvecs in
-/// the model. Requires the fused K|V qmv buffer (built at load under the same flag).
-/// Byte-identical (same per-row accumulation, merged grid). Perf lever, default-OFF.
-pub(crate) fn q4_kv_fuse_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let on = std::env::var("LUMEN_METAL_Q4_KV_FUSE")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-    on
-}
-
-/// When `LUMEN_METAL_Q4_QGATEKV_FUSE=1` (default OFF), the full-attn Q+gate, K AND
-/// V projections (wq [qgate_dim=8192, hidden=4096], wk/wv [kv_dim=1024, hidden=4096],
-/// all Q4_0) are computed by a SINGLE fused qmv dispatch over the concatenated
-/// [qgate_dim + 2*kv_dim] row space (1280 TGs = ~42.7 SG/core for Qwen3.5-9B, well
-/// past the ~24-32 occupancy knee that the separate dispatches and the K/V-only
-/// fusion (~8.5 SG/core) cannot reach). Byte-identical to the three separate
-/// qmv_q4_0_rmsnorm dispatches (same per-row RMSNorm + -8 fold + accumulation order,
-/// merged grid). Setting this flag ALSO triggers the load-time build of the wq, wk
-/// AND wv decode-qmv buffers (so the user need only set this ONE flag, not also
-/// LUMEN_METAL_Q4_QMV_PROJ + LUMEN_METAL_Q4_QMV_KV). Perf lever, default-OFF.
-pub(crate) fn q4_qgatekv_fuse_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let on = std::env::var("LUMEN_METAL_Q4_QGATEKV_FUSE")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-    on
-}
-
 /// Part of the default Q4_0 fast-decode stack (unconditional). The full-attn
 /// Q+gate/K/V projection cluster in the single-CB decode path is dispatched on a
 /// CONCURRENT compute encoder (`MTLDispatchTypeConcurrent`) instead of the layer's
@@ -785,34 +380,6 @@ pub(crate) fn metal_q8_gdn_qkvgate_2stream_enabled() -> bool {
     on
 }
 
-/// When `LUMEN_METAL_FLASH_DECODE_ALWAYS=1` (default OFF), the full-attention decode
-/// path uses the online-softmax `flash_decode_attention` + `flash_decode_reduce`
-/// kernels at ALL KV lengths, instead of falling back to `multi_head_attention`
-/// (MHA) below the 257 threshold. RATIONALE (diagnostic/perf lever): the MHA kernel
-/// materializes the per-head score vector to DEVICE memory and re-reads it twice
-/// (DRAM round-trip), and runs only `num_heads` (32) threadgroups = ~0.5 TG/core =
-/// occupancy-starved. Flash keeps scores in registers (online softmax, no device
-/// scratch) and splits over `num_tiles` TGs. NOTE: flash and MHA differ in FP
-/// reduction order, so this is NOT byte-identical below 257 (the >=257 path already
-/// uses flash in the byte-id baseline). A perf POC: measure first, then assess
-/// quality. VALIDATED NEGATIVE: measured +6-7% slower on full_attn at the decode KV
-/// lengths (<257), because single-tile flash adds a reduce dispatch + a partial-buffer
-/// device round-trip that MHA's single dispatch avoids. Kept gated-off as an A/B
-/// substrate; MHA is the optimal kernel for short-KV decode attention.
-pub(crate) fn flash_decode_always_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let on = std::env::var("LUMEN_METAL_FLASH_DECODE_ALWAYS")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-    on
-}
-
 /// When `LUMEN_METAL_FUSED_SDPA_DECODE=1` (default OFF), the short-KV
 /// (new_seq_len < 257) full-attention decode path uses
 /// `fused_rope_kv_mha_tgscores` instead of `fused_rope_kv_mha`: the only
@@ -841,57 +408,6 @@ pub(crate) fn fused_sdpa_decode_enabled() -> bool {
     on
 }
 
-/// When `LUMEN_METAL_CONCURRENT_GATEUP=1` (default OFF, requires the decode-qmv
-/// gate/up buffers), the dense FFN gate/up runs as: RMSNorm the FFN input ONCE
-/// (`rmsnorm_bytes`, attn_proj_buf -> normed_buf) on the serial encoder, then a
-/// pair of BARE single-matrix `qmv_q4_0` GEMVs (gate -> gate_buf, up -> up_buf)
-/// dispatched on a CONCURRENT encoder, then a resource-scoped barrier on
-/// (gate_buf, up_buf) before a standalone `swiglu`. The gate and up matvecs read
-/// the SAME read-only normed x and write DISJOINT buffers, so concurrent dispatch
-/// is byte-identical to running them serially (each matvec's internal
-/// accumulation order is unchanged; only the inter-matvec ordering relaxes). This
-/// is the die-saturation lever (`metal_concurrent_proj_enabled`) extended to the
-/// dense FFN — the biggest decode GPU pool. The fused 8row gate/up kernel cannot
-/// be split across dies; this un-fuses it into two independent matvecs whose
-/// threadgroups Metal can spread across both UltraFusion dies. HONEST: gate/up
-/// runs at ~51 simdgroups/core (past the occupancy knee), so the die-spread may
-/// be marginal/flat where the projection clusters (4-17 SG/core, die-starved)
-/// won big — measured empirically. Diagnostic/perf lever; default OFF.
-pub(crate) fn metal_concurrent_gateup_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let on = std::env::var("LUMEN_METAL_CONCURRENT_GATEUP")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-    on
-}
-
-/// When `LUMEN_METAL_CONCURRENT_GATEUP_256=1` (only consulted when
-/// `metal_concurrent_gateup_enabled`), the concurrent gate/up matvecs use the
-/// 256-thread `qmv_q4_0_8sg` kernel (8 simdgroups/TG, K split across lanes)
-/// instead of the 64-thread `qmv_q4_0`. The 256-thread variant has higher
-/// per-matvec occupancy but fewer threadgroups to spread across dies; the 64-thread
-/// variant has 4x more threadgroups (better die-fill) but lower per-matvec
-/// occupancy. Measured empirically. Default OFF (64-thread). Cached.
-pub(crate) fn metal_concurrent_gateup_256_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let on = std::env::var("LUMEN_METAL_CONCURRENT_GATEUP_256")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-    on
-}
-
 /// Part of the default Q4_0 fast-decode stack (unconditional). The Tier-0 fused GDN decode
 /// recurrence dispatches the 4-WAY VI-AMORTIZED `gdn_state_output_l2_sg_f16_h1_v4` kernel:
 /// each threadgroup handles FOUR adjacent val_dim columns and computes the (vi-invariant)
@@ -908,61 +424,6 @@ pub(crate) fn metal_concurrent_gateup_256_enabled() -> bool {
 /// absent. Cached.
 pub(crate) fn gdn_f16_state_h1_v4_enabled() -> bool {
     true
-}
-
-/// A/B EXPERIMENT (default OFF): when set, the GDN qkv (+ attn_gate) Q4_0 decode
-/// matvec uses the llama.cpp lane->block mapping variant `qmv_q4_0_rmsnorm_llamacpp`
-/// instead of the reference `qmv_q4_0_rmsnorm`. Pure dispatch swap on the SAME
-/// repacked buffers (requires LUMEN_METAL_Q4_QMV_PROJ=1 to build/select them); only
-/// the memory coalescing pattern differs. Isolates the matvec mapping variable.
-pub(crate) fn q4_qmv_proj_lcmap_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let on = std::env::var("LUMEN_METAL_Q4_QMV_PROJ_LCMAP")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-    on
-}
-
-/// When `LUMEN_METAL_MOE_DOWN_SGROW=1`, the mixed q8/q4 MoE
-/// down+accum dispatch uses the one-simdgroup-per-row redesigned kernel
-/// (`moe_batched_down_accum_shared_q8_0_se_q4_0_v2`). Default OFF → the
-/// original kernel runs (byte-identical path). Cached after first read.
-pub(crate) fn moe_down_sgrow_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_MOE_DOWN_SGROW")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
-}
-
-/// When `LUMEN_METAL_MOE_GATEUP_SGROW=1`, the routed
-/// gate+up+swiglu dispatch uses the one-simdgroup-per-row redesigned kernel
-/// (`moe_batched_gate_up_swiglu_q8_0_v2`). Default OFF → original kernel
-/// (byte-identical path). Cached after first read.
-pub(crate) fn moe_gateup_sgrow_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_MOE_GATEUP_SGROW")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
 }
 
 /// Parallel two-kernel MoE router (per-expert logits across the
@@ -983,27 +444,6 @@ pub(crate) fn moe_router_parallel_enabled() -> bool {
         Ok(s) => !(s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off")),
         Err(_) => true,
     };
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
-}
-
-/// Fused single-dispatch MoE router (logits + top-k in ONE
-/// grid=num_experts dispatch via last-threadgroup reduction). Eliminates the
-/// separate grid=1 top-k dispatch whose drain bubble was measured at ~6 ms/token
-/// (39% of decode) on the serial GDN decode encoder. Default OFF until validated;
-/// set `LUMEN_METAL_MOE_ROUTER_FUSED=1` to enable. Falls back to the two-kernel
-/// parallel router when off or when the pipeline/counter is unavailable.
-/// Cached after first read.
-pub(crate) fn moe_router_fused_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_MOE_ROUTER_FUSED")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
     CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
     v
 }

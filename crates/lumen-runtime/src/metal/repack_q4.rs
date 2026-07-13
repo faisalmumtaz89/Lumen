@@ -769,21 +769,6 @@ pub(crate) fn build_qmv_lmhead_buffers_from_q8(
     build_qmv_decode_buffers(device, &q4, n_rows, k)
 }
 
-/// Build the decode-qmv (qweights, scales) buffers for a per-layer projection
-/// (e.g. the GDN `ssm_out`) by RE-QUANTIZING its Q8_0 weights to Q4_0 first.
-/// `q8_src` is the raw Q8_0 tensor bytes `[n_rows, k]` (row-major), `n_rows`/`k`
-/// the matvec out/in dims. Identical to [`build_qmv_lmhead_buffers_from_q8`] but
-/// named for the per-layer projection use; the Q4 scales are emitted as f32.
-pub(crate) fn build_qmv_decode_buffers_from_q8(
-    device: &MetalDevice,
-    q8_src: &[u8],
-    n_rows: usize,
-    k: usize,
-) -> Result<(MetalBuffer, MetalBuffer), RuntimeError> {
-    let q4 = requant_q8_0_to_q4_0(q8_src, n_rows * k)?;
-    build_qmv_decode_buffers(device, &q4, n_rows, k)
-}
-
 /// F16-scale variant of [`build_qmv_decode_buffers_from_q8`]: re-quantizes the
 /// Q8_0 tensor to Q4_0, then builds the decode-qmv buffers with the per-block
 /// scales emitted as **f16** (2 B/block) instead of f32 (4 B). The Q4_0 scale
@@ -995,86 +980,6 @@ pub(crate) fn build_qmv_decode_buffers_f16sc(
     })?;
     let sbuf = device.new_buffer_with_bytes(&sc).ok_or_else(|| {
         RuntimeError::Compute("qmv decode f16sc: alloc scales buffer failed".into())
-    })?;
-    Ok((qbuf, sbuf))
-}
-
-/// INTERLEAVED gate+up decode-qmv repack (env LUMEN_METAL_Q4_GATEUP_IL).
-///
-/// Co-resides the gate and up weights of the dense FFN gate/up matvec into ONE
-/// nibble buffer + ONE f16-scale buffer, so the matvec reads TWO contiguous
-/// streams instead of FOUR (gate-nibbles, up-nibbles, gate-scale, up-scale). The
-/// nibble re-ordering of EACH tensor is byte-for-byte the SAME as
-/// [`repack_q4_qmv_decode_f16sc`]; only the placement interleaves gate and up at
-/// the 256-byte super-iteration-stripe granularity (one full simdgroup's
-/// 512-value block = 256 nibble bytes).
-///
-/// Layout (both gate `g` and up `u` are `[out_rows, k]` Q4_0; `SI = k / 512`
-/// super-iterations per row, `k % 512 == 0` required so the qmv block_size=512
-/// tiling is exact):
-///   - qweights `[out_rows, k]` bytes (gate k/2 + up k/2 = k bytes/row):
-///       per row, per super-iter j: `[256 B gate stripe j][256 B up stripe j]`
-///   - scales `[out_rows, SI, 64]` bytes (16 gate f16 + 16 up f16 per super-iter):
-///       per row, per super-iter j: `[16 gate f16 (32 B)][16 up f16 (32 B)]`
-/// Consumed by `qmv_q4_0_gate_up_swiglu_il`, which strides gate at `j*512`, up at
-/// `j*512+256`, gate-scale at `j*64`, up-scale at `j*64+32`. BYTE-IDENTICAL math.
-#[allow(clippy::type_complexity)]
-pub(crate) fn repack_q4_gate_up_interleaved(
-    gate_src: &[u8],
-    up_src: &[u8],
-    n_rows: usize,
-    k: usize,
-) -> Result<(Vec<u8>, Vec<u8>), RuntimeError> {
-    if k % 512 != 0 {
-        return Err(RuntimeError::Compute(format!(
-            "qmv gate/up interleaved repack: k={} not a multiple of 512",
-            k
-        )));
-    }
-    // Re-order each tensor's nibbles exactly as the f16sc path does, then weave.
-    let (gate_qw, gate_sc) = repack_q4_qmv_decode_f16sc(gate_src, n_rows, k)?;
-    let (up_qw, up_sc) = repack_q4_qmv_decode_f16sc(up_src, n_rows, k)?;
-    let si = k / 512; // super-iterations per row (each = 512 values = 256 nibble bytes)
-    let row_qw = k / 2; // bytes per row in the single-tensor f16sc qweight layout
-    let row_sc = (k / 32) * 2; // f16 scale bytes per row (k/32 blocks x 2 B)
-
-    let mut qweights = vec![0u8; n_rows * k]; // gate k/2 + up k/2 per row
-    let mut scales = vec![0u8; n_rows * si * 64]; // 32 gate + 32 up f16 bytes per super-iter
-    for row in 0..n_rows {
-        for j in 0..si {
-            // --- nibbles: 256 B gate stripe j, then 256 B up stripe j ---
-            let dst = (row * si + j) * 512;
-            let g0 = row * row_qw + j * 256;
-            let u0 = row * row_qw + j * 256;
-            qweights[dst..dst + 256].copy_from_slice(&gate_qw[g0..g0 + 256]);
-            qweights[dst + 256..dst + 512].copy_from_slice(&up_qw[u0..u0 + 256]);
-            // --- scales: 16 gate f16 (32 B), then 16 up f16 (32 B) ---
-            // 512 values = 16 blocks of 32 -> 16 scales each, 2 B/scale.
-            let sdst = (row * si + j) * 64;
-            let gs0 = row * row_sc + j * 32; // 16 blocks x 2 B
-            let us0 = row * row_sc + j * 32;
-            scales[sdst..sdst + 32].copy_from_slice(&gate_sc[gs0..gs0 + 32]);
-            scales[sdst + 32..sdst + 64].copy_from_slice(&up_sc[us0..us0 + 32]);
-        }
-    }
-    Ok((qweights, scales))
-}
-
-/// Build the two INTERLEAVED gate+up decode-qmv Metal buffers (one packed nibble
-/// buffer, one packed f16-scale buffer). See [`repack_q4_gate_up_interleaved`].
-pub(crate) fn build_qmv_gate_up_interleaved_buffers(
-    device: &MetalDevice,
-    gate_src: &[u8],
-    up_src: &[u8],
-    n_rows: usize,
-    k: usize,
-) -> Result<(MetalBuffer, MetalBuffer), RuntimeError> {
-    let (qw, sc) = repack_q4_gate_up_interleaved(gate_src, up_src, n_rows, k)?;
-    let qbuf = device.new_buffer_with_bytes(&qw).ok_or_else(|| {
-        RuntimeError::Compute("qmv gate/up IL: alloc qweights buffer failed".into())
-    })?;
-    let sbuf = device.new_buffer_with_bytes(&sc).ok_or_else(|| {
-        RuntimeError::Compute("qmv gate/up IL: alloc scales buffer failed".into())
     })?;
     Ok((qbuf, sbuf))
 }

@@ -507,109 +507,6 @@ pub(crate) fn gdn_concurrent_encoder_validate_serial() -> bool {
     v
 }
 
-/// Whether the dual-queue GDN branch-overlap prefill path is enabled.
-///
-/// Resolved once via `LUMEN_METAL_GDN_DUAL_QUEUE=1`. **Default OFF** until
-/// PRISTINE×3 + bit-identity validation. When ON, the per-GDN-layer block is
-/// split across two command queues coordinated by `MetalSharedEvent`: the main
-/// queue carries RMSNorm(E0), branch A (qkv→conv1d→state-update→L2), the
-/// recurrence, and the join+FFN-norm tail; a second `gdn_aux_queue` carries the
-/// independent branches B (alpha/beta GEMM + compute-gates) and C (attn-gate
-/// GEMM). Three per-prefill events (norm-ready / ab-ready / gate-ready, value =
-/// gdn_ord) enforce the exact DAG dependencies, so the schedule changes but the
-/// kernels, dispatch arguments, and FP accumulation order are byte-identical to
-/// the single-encoder path. The win is hiding max(B, C) under branch A's
-/// shadow (intra-layer ceiling ~50-150ms; no cross-layer
-/// overlap is available because the residual stream serializes layers).
-///
-/// Requires the de-aliased role buffers (same precondition as the concurrent
-/// encoder) AND deep-profile OFF AND the multi-CB split OFF (the dual-queue path
-/// owns CB management). Falls back to the single-CB concurrent-encoder path when
-/// any precondition is unmet.
-#[inline]
-pub(crate) fn gdn_dual_queue_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_GDN_DUAL_QUEUE")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
-/// Whether the GDN Phase 2a (32, NSG=4, 1) threadgroup geometry
-/// is enabled.
-///
-/// Resolved once via `LUMEN_METAL_GDN_PHASE2A_NSG4=1`. Default OFF.
-/// Cached atomically.
-///
-/// When ON, `encode_batched_gdn_prefill` dispatches the new kernel
-/// `gdn_prefill_fused_v3_chunked_nsg4` with a (val_dim/4, n_heads, 1)
-/// grid and (32, 4, 1) threadgroup shape. Each TG owns 4 consecutive rows
-/// of state across 4 simdgroups that share Q/K HBM fetches via L1 (only V
-/// differs per simdgroup). The algorithm is bit-identical to the legacy
-/// `gdn_prefill_fused_v3_chunked` kernel; the reference-token gate is the
-/// validator.
-///
-/// Research:concurrent-encoder section.
-#[inline]
-pub(crate) fn gdn_phase2a_nsg4_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_GDN_PHASE2A_NSG4")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
-/// Whether the chunk-parallel gated-delta-rule Phase 2a kernel is enabled.
-///
-/// Resolved once via `LUMEN_METAL_GDN_PREFILL_CHUNKED=1`. **Default OFF** until
-/// the reference-token gate validates it on the MoE model. When ON,
-/// `encode_batched_gdn_prefill` dispatches `gdn_prefill_chunkscan` (one TG per
-/// (head, 32-value-tile), C-token chunks) in place of the O(T)-serial
-/// `gdn_prefill_fused_v3_chunked`. Bit-exact path when OFF.
-#[inline]
-pub(crate) fn gdn_prefill_chunked_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_GDN_PREFILL_CHUNKED")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
-/// Chunk size C for the chunk-parallel Phase 2a kernel.
-///
-/// Resolved once via `LUMEN_METAL_GDN_PREFILL_CHUNK_C=<8|16>` (default 16,
-/// clamped to {8,16} which the kernel's `GDN_CS_MAXC=16` supports).
-#[inline]
-pub(crate) fn gdn_prefill_chunk_c() -> u32 {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur as u32;
-    }
-    let v: u32 = std::env::var("LUMEN_METAL_GDN_PREFILL_CHUNK_C")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16);
-    let v = if v == 8 { 8 } else { 16 };
-    CACHE.store(v as u8, AOrd::Relaxed);
-    v
-}
-
 /// Diagnostic: which GDN prefill phase to SKIP (no-op when unset).
 ///
 /// Resolved once via `LUMEN_METAL_GDN_DIAG_SKIP=<phase>`. Profiling only —
@@ -662,22 +559,6 @@ pub(crate) fn gdn_subskip() -> u32 {
         .unwrap_or(0);
     CACHE.store(v, AOrd::Relaxed);
     v
-}
-
-/// K2 Wave-1: use the simdgroup-per-head L2-normalize kernel
-/// (`l2_normalize_qk_strided_sg`, no threadgroup barriers) instead of the
-/// 128-thread/2-barrier `l2_normalize_qk_strided`. Bit-identical math.
-/// `LUMEN_METAL_GDN_L2_SG=1` → ON, `=0` → OFF. Default OFF until A/B-validated.
-#[inline]
-pub(crate) fn gdn_l2_sg_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(255);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 255 {
-        return cur != 0;
-    }
-    let on = std::env::var("LUMEN_METAL_GDN_L2_SG").ok().as_deref() == Some("1");
-    CACHE.store(on as u8, AOrd::Relaxed);
-    on
 }
 
 /// Whether to use the fused conv1d+SiLU+L2(Q/K) kernel that
@@ -823,40 +704,6 @@ pub(crate) fn bf16_gdn_tile_nok64_enabled() -> bool {
         return cur == 2;
     }
     let v = std::env::var("LUMEN_METAL_BF16_GDN_TILE_NOK64")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
-/// Apple MPSGraph BF16 GEMM opt-in.
-///
-/// When ON, the BF16 GDN `qkv_proj` (K=4096, N=8192) and `ssm_out`
-/// (K=4096, N=4096) matmuls are routed through Apple's MPSGraph in place
-/// of Lumen's `tiled_matmul_bf16_k64` / `tiled_matmul_bf16_k64_residual`
-/// custom kernels. MPSGraph achieves ~7.5 TFLOPs at the qkv-proj shape
-/// per microbench (1.166 ms median); the smaller projections
-/// (gate, gk, gk_a_log) keep the custom kernel because MPSGraph
-/// framework overhead dominates at N <= 128.
-///
-/// Activation conditions checked at the dispatch site:
-///   1. `bf16_mps_enabled()` returns true (env `LUMEN_METAL_BF16_MPS=1`).
-///   2. BF16 weight quantization (other quants stay on existing path).
-///   3. Batch size > 32 (small-M overhead dominates the MPSGraph win).
-///   4. K, N >= 4096 (excludes the small attention projections).
-///
-/// Default OFF — every BF16 path remains byte-identical until the user
-/// explicitly opts in. The ssm_out residual addition (`+ x_buf`) is
-/// performed by a follow-on F32 add kernel when this path is taken,
-/// since MPSGraph does not subsume the residual in the same graph.
-#[inline]
-pub(crate) fn bf16_mps_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_BF16_MPS")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
     CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
@@ -1231,61 +1078,6 @@ pub(crate) fn unretained_cmdbufs_enabled() -> bool {
         .unwrap_or(false);
     CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
     v
-}
-
-/// Multi command-buffer in-flight on prefill.
-///
-/// When `LUMEN_METAL_MULTI_CB=1`, the prefill is split into K command
-/// buffers (default K=2, override via `LUMEN_METAL_MULTI_CB_N`) that
-/// are committed sequentially on the same MTLCommandQueue. CB[0] is
-/// `commit()`'d (no wait) immediately after its layers are encoded,
-/// then CB[k+1] is encoded while CB[k] executes on the GPU. Only the
-/// FINAL CB is `commit_and_wait()`'d.
-///
-/// Same-queue submission order = strict GPU execution order, so the
-/// CB[k]→CB[k+1] boundary on `batch_x_buf` (residual carrier) requires
-/// no explicit fence — Metal's MTLCommandQueue guarantees CBs run in
-/// submission FIFO. The win comes from CPU encoding of CB[k+1]
-/// overlapping with GPU execution of CB[k].
-///
-/// Default: OFF. CPU encoding time per layer must be measured to be a
-/// non-negligible fraction of prefill wall before this can deliver.
-/// analytical evidence shows CPU encoding is microseconds at
-/// pp131,
-/// so the predicted upside is small (≤0.5%); kept env-gated until
-/// empirical validation lands measurable.
-///
-/// 64-CB submission baseline benchmark (a comparison runtime
-/// submits ~3 large CBs per prefill iteration with 130-170 ms each of
-/// asynchronous GPU compute; Lumen submits 1 CB then waits).
-#[inline]
-pub(crate) fn multi_cb_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_MULTI_CB")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
-/// Number of command buffers to split prefill into when
-/// `LUMEN_METAL_MULTI_CB=1`. Default 2. Allowed range: [2, 8]. Values
-/// outside the range are clamped. Returns 1 when MULTI_CB is OFF (the
-/// caller can branch on `> 1`).
-#[inline]
-pub(crate) fn multi_cb_count() -> usize {
-    if !multi_cb_enabled() {
-        return 1;
-    }
-    let n: usize = std::env::var("LUMEN_METAL_MULTI_CB_N")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
-    n.clamp(2, 8)
 }
 
 /// Whether wavefront trace prints are enabled.
