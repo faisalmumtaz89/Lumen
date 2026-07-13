@@ -1805,31 +1805,3 @@ kernel void tiled_matmul_bf16_k64_qkv_gate_paired(
     }
 }
 
-// ============================================================================
-// bf16_paired_warmup
-//
-// Minimal warmup kernel for the BF16 GDN paired repack buffer. Dispatched
-// once per `lumen` process at the tail of `preload_weights_gpu_resident` to
-// force Apple's Metal driver to commit the GPU page-table mapping for the
-// 96 MB packed buffer per GDN layer. Without this warmup, the FIRST production
-// paired dispatch in each fresh process must pay a one-time ~280 ms cost
-//
-// Algorithm: a SINGLE thread reads the first BF16 element of the buffer and
-// accumulates into a sink that is forced live by writing to `out_sink[0]`.
-// The read is necessary so the compiler cannot eliminate the load; the write
-// to the sink is necessary so the compiler cannot eliminate the kernel.
-// Cost: O(1) per layer, ~1µs per dispatch.
-//
-// Dispatch: one threadgroup of (1, 1, 1) per layer. Grid = (1, 1, 1).
-// ============================================================================
-
-kernel void bf16_paired_warmup(
-    device const ushort* W      [[buffer(0)]],
-    device float*        sink   [[buffer(1)]],
-    uint tid                     [[thread_position_in_grid]])
-{
-    if (tid == 0) {
-        bfloat first = bf16_bits_to_bfloat(W[0]);
-        sink[0] = (float)first;
-    }
-}

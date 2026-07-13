@@ -371,8 +371,6 @@ impl MetalF32Backend {
             tiled_matmul_bf16_k64_qkv_gate_paired_aligned: make_aligned_pipeline!(
                 "tiled_matmul_bf16_k64_qkv_gate_paired"
             ),
-            // minimal warmup kernel for the paired repack buffer.
-            bf16_paired_warmup: make_pipeline!("bf16_paired_warmup"),
             // BF16 fused gate+up+SwiGLU (FC_BC_*=true and FC_BC_*=false variants).
             bf16_matmul_gate_up_swiglu_fused: make_bc_pipeline!("bf16_matmul_gate_up_swiglu_fused"),
             bf16_matmul_gate_up_swiglu_fused_aligned: make_aligned_pipeline!(
@@ -698,10 +696,6 @@ impl MetalF32Backend {
             gdn_state_output_l2_sg: lib
                 .get_function("gdn_state_output_l2_sg")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // Read-once/write-once variant (dead store removed)
-            gdn_state_output_l2_sg_h1: lib
-                .get_function("gdn_state_output_l2_sg_h1")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             // Diagnostic (timing only): L2-norm-skipped variant (output garbage)
             gdn_state_output_l2_sg_normskip: lib
                 .get_function("gdn_state_output_l2_sg_NORMSKIP")
@@ -716,22 +710,12 @@ impl MetalF32Backend {
             gdn_state_output_l2_sg_f16: lib
                 .get_function("gdn_state_output_l2_sg_f16")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // F16 state recurrence WITHOUT the dead decayed write-back
-            // (LUMEN_METAL_GDN_F16_STATE_H1: union of f16-state + h1 dead-store elision)
-            gdn_state_output_l2_sg_f16_h1: lib
-                .get_function("gdn_state_output_l2_sg_f16_h1")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // VI-amortized f16+h1 recurrence (LUMEN_METAL_GDN_F16_STATE_H1_V2):
-            // 2 val_dim columns/TG, Q/K norm + load computed once and reused.
-            gdn_state_output_l2_sg_f16_h1_v2: lib
-                .get_function("gdn_state_output_l2_sg_f16_h1_v2")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // 4-way VI-amortized f16+h1 recurrence (LUMEN_METAL_GDN_F16_STATE_H1_V4):
+            // 4-way VI-amortized f16+h1 recurrence (default fast-decode stack):
             // 4 val_dim columns/TG, Q/K norm + load computed once and reused.
             gdn_state_output_l2_sg_f16_h1_v4: lib
                 .get_function("gdn_state_output_l2_sg_f16_h1_v4")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // One-time F32->F16 h_state converter (LUMEN_METAL_GDN_F16_STATE_DECODE)
+            // One-time F32->F16 h_state converter for the decode mirror
             gdn_state_f32_to_f16: lib
                 .get_function("gdn_state_f32_to_f16")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),

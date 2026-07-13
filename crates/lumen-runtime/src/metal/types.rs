@@ -271,13 +271,6 @@ pub(crate) struct MetalPipelines {
     /// GDN: M=131 may misalign but N=8192/4096 and K=4096 are aligned —
     /// the BC variant is used in practice when M is misaligned).
     pub(crate) tiled_matmul_bf16_k64_qkv_gate_paired_aligned: MetalPipelineState,
-    /// Minimal warmup kernel for the BF16 GDN paired repack
-    /// buffer. Touches one BF16 element per layer at load time so that the
-    /// Apple Metal driver commits the GPU page-table mapping for the 96 MB
-    /// packed buffer upfront, not at first-prefill time. Cost: ~1µs per
-    /// layer; the alternative is ~280 ms on the cold first prefill per the
-    /// diagnostic.
-    pub(crate) bf16_paired_warmup: MetalPipelineState,
     pub(crate) matmul_bytes_f32_residual: MetalPipelineState,
 
     // Buffer ops (GPU-side activation transfer)
@@ -563,8 +556,6 @@ pub(crate) struct MetalPipelines {
     pub(crate) gdn_state_output_norm_l2: Option<MetalPipelineState>,
     // Simdgroup-parallel state update (4096 TGs of 32 threads, writes raw output)
     pub(crate) gdn_state_output_l2_sg: Option<MetalPipelineState>,
-    // Same as gdn_state_output_l2_sg but read-once/write-once (dead store removed)
-    pub(crate) gdn_state_output_l2_sg_h1: Option<MetalPipelineState>,
     // Diagnostic (timing only): same as gdn_state_output_l2_sg but the per-TG
     // Q/K L2-norm is skipped (output garbage) to isolate its compute cost
     pub(crate) gdn_state_output_l2_sg_normskip: Option<MetalPipelineState>,
@@ -576,20 +567,11 @@ pub(crate) struct MetalPipelines {
     pub(crate) gdn_state_output_l2_sg_bf16: Option<MetalPipelineState>,
     // Same as gdn_state_output_l2_sg but persistent h_state stored in half (half traffic)
     pub(crate) gdn_state_output_l2_sg_f16: Option<MetalPipelineState>,
-    // F16 state recurrence WITHOUT the dead decayed write-back (LUMEN_METAL_GDN_F16_STATE_H1):
-    // union of the f16-state (half R+W) + h1 dead-store-elision (drop the redundant decayed store).
-    pub(crate) gdn_state_output_l2_sg_f16_h1: Option<MetalPipelineState>,
-    // VI-amortized f16+h1 recurrence (LUMEN_METAL_GDN_F16_STATE_H1_V2): each TG handles
-    // 2 adjacent val_dim columns, computing the (vi-invariant) Q/K L2-norm + load ONCE and
-    // reusing across both -> halves the redundant per-vi norm ALU + Q/K device reads on the
-    // recurrence critical path. Byte-identical to gdn_state_output_l2_sg_f16_h1 (same reduction).
-    pub(crate) gdn_state_output_l2_sg_f16_h1_v2: Option<MetalPipelineState>,
-    // 4-way VI-amortized f16+h1 recurrence (LUMEN_METAL_GDN_F16_STATE_H1_V4): each TG handles
-    // 4 adjacent val_dim columns, computing the (vi-invariant) Q/K L2-norm + load ONCE and
-    // reusing across all four -> cuts the redundant per-vi norm ALU + Q/K device reads 4x vs
-    // reference (2x vs v2). Byte-identical to gdn_state_output_l2_sg_f16_h1 (same reduction).
+    // 4-way VI-amortized f16 recurrence (the default GDN decode state kernel): each TG
+    // handles 4 adjacent val_dim columns, computing the (vi-invariant) Q/K L2-norm + load
+    // ONCE and reusing across all four to cut the redundant per-vi norm ALU + Q/K reads.
     pub(crate) gdn_state_output_l2_sg_f16_h1_v4: Option<MetalPipelineState>,
-    // One-time F32->F16 converter for the GDN h_state buffer (LUMEN_METAL_GDN_F16_STATE_DECODE)
+    // One-time F32->F16 converter for the GDN h_state decode mirror
     pub(crate) gdn_state_f32_to_f16: Option<MetalPipelineState>,
     // RMSNorm + scale on raw GDN decode output (pairs with gdn_state_output_l2_sg)
     pub(crate) gdn_decode_norm_scale: Option<MetalPipelineState>,
@@ -1137,7 +1119,7 @@ pub(crate) struct MetalScratch {
     /// These MUST persist across tokens and be reset between sequences.
     pub(crate) gdn_h_states: Vec<MetalBuffer>,
     /// Lazily-allocated half-size F16 mirror of each `gdn_h_states` entry, used
-    /// ONLY when `LUMEN_METAL_GDN_F16_STATE_DECODE=1`. `None` until the first
+    /// by the default F16 decode recurrence. `None` until the first
     /// decode touch of that GDN layer converts its prefill F32 state into F16
     /// (via `gdn_state_f32_to_f16`); thereafter the F16 decode recurrence
     /// reads/writes this buffer and the F32 `gdn_h_states` entry is dormant.

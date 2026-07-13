@@ -4,7 +4,7 @@
 //! `StorageModePrivate` Metal buffer, eliminating TLB misses, reducing virtual
 //! address ranges, and enabling GPU memory controller optimizations.
 
-use super::ffi::{MTLSize, MetalBuffer};
+use super::ffi::MetalBuffer;
 use super::repack_q4;
 use super::repack_q8;
 use super::types::{CachedLayerMeta, CachedMoeMeta};
@@ -699,32 +699,15 @@ impl MetalF32Backend {
                 // conv_state: [(kernel_size - 1) * qkv_dim] per GDN layer
                 let conv_state_size = (conv_kernel_size - 1) * gdn_qkv_dim;
 
-                // Persistent h_state precision: F32 (default, 4 B/elem) or a
-                // reduced-precision variant (bfloat/half, 2 B/elem) that halves the
-                // dominant decode state traffic. Zero-initialized either way (BF16/
-                // F16 zero == 0x0000, so a u16 zero-fill is correct for both).
-                let h_state_precision = crate::metal::gdn_state_precision();
-                let h_state_bytes_per_elem =
-                    if h_state_precision == crate::metal::GdnStatePrecision::F32 {
-                        4
-                    } else {
-                        2
-                    };
+                // Persistent h_state: F32 (4 B/elem). Zero-initialized (new
+                // sequence starts with zero state).
                 let mut h_states = Vec::with_capacity(n_linear);
                 let mut conv_states = Vec::with_capacity(n_linear);
                 for _ in 0..n_linear {
-                    let h_buf = self
-                        .device
-                        .new_buffer(h_state_size * h_state_bytes_per_elem)
-                        .ok_or_else(|| {
-                            RuntimeError::Compute("Failed to allocate GDN h_state buffer".into())
-                        })?;
-                    // Zero-initialize h_state (new sequence starts with zero state).
-                    if h_state_precision == crate::metal::GdnStatePrecision::F32 {
-                        h_buf.write_f32(&vec![0.0f32; h_state_size]);
-                    } else {
-                        h_buf.write_u16(&vec![0u16; h_state_size]);
-                    }
+                    let h_buf = self.device.new_buffer(h_state_size * 4).ok_or_else(|| {
+                        RuntimeError::Compute("Failed to allocate GDN h_state buffer".into())
+                    })?;
+                    h_buf.write_f32(&vec![0.0f32; h_state_size]);
                     h_states.push(h_buf);
 
                     let c_buf = self.device.new_buffer(conv_state_size * 4).ok_or_else(|| {
@@ -735,8 +718,8 @@ impl MetalF32Backend {
                 }
 
                 s.gdn_h_states = h_states;
-                // F16 h_state mirrors: allocated lazily on first decode touch when
-                // LUMEN_METAL_GDN_F16_STATE_DECODE=1 (kept length-synced with gdn_h_states).
+                // F16 h_state mirrors: allocated lazily on the first decode touch (the
+                // default F16 decode recurrence; kept length-synced with gdn_h_states).
                 s.gdn_h_states_f16 = (0..n_linear)
                     .map(|_| std::cell::RefCell::new(None))
                     .collect();
@@ -1002,11 +985,7 @@ impl MetalF32Backend {
         // default OFF). Builds per-layer sequential-nibble qweights + f32 scales for
         // the qmv_q4_0_residual decode kernel; absent => NR2 fallback. Requires
         // inter_dim % 512 == 0 and hidden_dim % 8 == 0 (Qwen3.5-9B: 12288, 4096 OK).
-        if crate::metal::q4_fast_decode_enabled()
-            || std::env::var("LUMEN_METAL_Q4_QMV_DOWN")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-        {
+        if crate::metal::q4_fast_decode_enabled() {
             let hidden_dim_u = s.hidden_dim;
             let inter_dim_u = s.inter_dim;
             let mut qw_vecs: Vec<Option<MetalBuffer>> = Vec::with_capacity(num_layers);
@@ -1087,12 +1066,7 @@ impl MetalF32Backend {
         // entry (same convention as the BF16 paired GDN repack below).
         // Also triggered by LUMEN_METAL_Q4_QGATEKV_FUSE (fused Q+gate/K/V dispatch),
         // which consumes the full-attn wq buffers built in this block.
-        if crate::metal::q4_fast_decode_enabled()
-            || std::env::var("LUMEN_METAL_Q4_QMV_PROJ")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-            || crate::metal::q4_qgatekv_fuse_enabled()
-        {
+        if crate::metal::q4_fast_decode_enabled() || crate::metal::q4_qgatekv_fuse_enabled() {
             let hidden_dim_u = s.hidden_dim;
             let n_gdn_layers = s
                 .cached_layer_meta
@@ -1424,12 +1398,7 @@ impl MetalF32Backend {
         // Independent of LUMEN_METAL_Q4_QMV_PROJ so it can be A/B'd alone.
         // Also triggered by LUMEN_METAL_Q4_QGATEKV_FUSE (fused Q+gate/K/V dispatch),
         // which consumes the full-attn wk/wv buffers built in this block.
-        if crate::metal::q4_fast_decode_enabled()
-            || std::env::var("LUMEN_METAL_Q4_QMV_KV")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-            || crate::metal::q4_qgatekv_fuse_enabled()
-        {
+        if crate::metal::q4_fast_decode_enabled() || crate::metal::q4_qgatekv_fuse_enabled() {
             let hidden_dim_u = s.hidden_dim;
             let num_layers = s.cached_layer_meta.len();
             let q4_row_bytes = (hidden_dim_u / 32) * 18; // Q4_0 row for in_dim = hidden
@@ -1577,11 +1546,7 @@ impl MetalF32Backend {
         // engages for a genuine, separate (non-weight-tied) Q8_0 output_proj whose
         // buffer length is consistent with [vocab, hidden] (in=hidden % 512 == 0,
         // out=vocab % 8 == 0). Any mismatch -> skip (existing Q8 lm_head path).
-        if crate::metal::q4_fast_decode_enabled()
-            || std::env::var("LUMEN_METAL_Q4_QMV_LMHEAD")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-        {
+        if crate::metal::q4_fast_decode_enabled() {
             let hidden_dim_u = s.hidden_dim;
             let vocab = self.cached_vocab_size;
             // Q8_0 row bytes for in_dim = hidden (2B f16 scale + 32 i8 per 32-block).
@@ -1889,11 +1854,7 @@ impl MetalF32Backend {
         // Build the separate gate/up qmv buffers for ANY path that consumes them:
         // the dual-matrix kernel (LUMEN_METAL_Q4_QMV_GATEUP), the bare-qmv variants,
         // OR the concurrent gate/up die-saturation lever (LUMEN_METAL_CONCURRENT_GATEUP).
-        if crate::metal::q4_fast_decode_enabled()
-            || std::env::var("LUMEN_METAL_Q4_QMV_GATEUP")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-            || crate::metal::metal_concurrent_gateup_enabled()
+        if crate::metal::q4_fast_decode_enabled() || crate::metal::metal_concurrent_gateup_enabled()
         {
             let hidden_dim_u = s.hidden_dim;
             let inter_dim_u = s.inter_dim;
@@ -2417,140 +2378,6 @@ impl MetalF32Backend {
 
                 // Diagnostic counter silenced. Re-enable if needed by inserting
                 // an `eprintln!` here using `_ok_count` and `n_gdn_layers`.
-
-                // ================================================================
-                // Load-time warmup dispatch for the BF16 GDN repack buffer.
-                // ================================================================
-                //
-                // The 2.30 GB BF16 GDN repack buffer (24 layers × 96 MB) is
-                // allocated as a `StorageModeShared` Metal buffer via
-                // `device.new_buffer_with_bytes(..)`. The buffer pages are not
-                // committed to the GPU's translation table until the kernel
-                // first dispatches against it. On a fresh process, that first
-                // dispatch occurs DURING the first prefill and incurs roughly
-                // 280 ms of one-shot overhead versus subsequent dispatches.
-                //
-                // The fix: issue a tiny `M=1` dispatch against every populated
-                // packed buffer right here, at the tail of preload. The grid
-                // walks every (row_group, k_block) of every layer's repack
-                // buffer, forcing Apple's driver to commit the page-table
-                // mapping at preload time (where it's a one-time UX cost equal
-                // for all users), rather than at first-inference time (where
-                // it pessimizes single-shot CLI users specifically).
-                //
-                // Cost target <10 ms (ideally <5 ms): 24 layers ×
-                // (12288/32) = 9216 TGs × 128 threads × ~64 MMA iterations.
-                // Apple M3 Ultra dispatches this in roughly 3-5 ms total; the
-                // observed first-prefill saving is ~280 ms.
-                //
-                // Correctness: the warmup dispatch writes garbage into
-                // `s.qkv_buf` and `s.gate_buf`. Both are persistent scratch
-                // buffers that are rewritten at the start of every layer's
-                // GEMM dispatch in production; clobbering them at preload
-                // time has zero observable effect on inference output.
-                //
-                // The warmup is naturally scoped to `bf16_gdn_qkv_gate_paired_enabled()`
-                // — this entire block runs only when the resolver returns
-                // true, so non-BF16-paired runs pay zero warmup cost.
-                // The dispatch is also gated behind
-                // `LUMEN_METAL_BF16_GDN_WARMUP` (default OFF). When explicitly
-                // enabled, it attempts to commit the GPU page-table mapping
-                // for the 2.30 GB packed buffer at preload time.
-                //
-                // The minimal warmup mitigates but does not reliably eliminate
-                // the cold-start pessimization on the first one or two
-                // inferences of a freshly started process; the steady-state
-                // throughput improvement is real and reproducible, but the
-                // cold-start cost appears to depend on macOS / Apple AGX
-                // driver state that the warmup cannot address. The warmup is
-                // retained env-OFF for downstream investigation. The
-                // `LUMEN_METAL_BF16_GDN_QKV_GATE_PAIRED` parent gate remains
-                // OFF by default per `graph_reorder::bf16_gdn_qkv_gate_paired_enabled`.
-                //
-                // Implementation strategy is selected by `LUMEN_METAL_BF16_GDN_WARMUP_MODE`:
-                //   - `minimal`: a tiny single-thread kernel reads
-                //     the first BF16 element of each layer's packed buffer.
-                //     Cost: <1µs per dispatch × 24 layers = <50µs total.
-                //   - `full`: dispatches the actual production paired GEMM
-                //     kernel at M=32 (TILE_M, fully aligned) against every
-                //     packed buffer. Cost: <5 ms total. Discards Y outputs
-                //     into scratch buffers production will overwrite.
-                let warmup_enabled = std::env::var("LUMEN_METAL_BF16_GDN_WARMUP")
-                    .ok()
-                    .as_deref()
-                    .map(|s| s != "0" && !s.is_empty())
-                    .unwrap_or(false);
-                let warmup_mode = std::env::var("LUMEN_METAL_BF16_GDN_WARMUP_MODE")
-                    .ok()
-                    .unwrap_or_else(|| "minimal".to_string());
-                if warmup_enabled {
-                    if let Some(pipelines) = self.pipelines.as_ref() {
-                        let any_populated =
-                            s.repacked_gdn_qkv_gate_bf16.iter().any(|o| o.is_some());
-                        if any_populated {
-                            if let Some(cmd) = self.queue.new_command_buffer() {
-                                if let Some(enc) = cmd.new_compute_encoder() {
-                                    if warmup_mode == "full" {
-                                        // Production-shape warmup using the actual
-                                        // paired GEMM kernel at M=32 (TILE_M).
-                                        // Commits page-table for every byte that
-                                        // the production dispatch will touch.
-                                        let k_u32 = hidden_dim_u as u32;
-                                        enc.set_pipeline_state(
-                                            &pipelines.tiled_matmul_bf16_k64_qkv_gate_paired,
-                                        );
-                                        enc.set_threadgroup_memory_length(8192, 0);
-                                        for (slot, buf_opt) in
-                                            s.repacked_gdn_qkv_gate_bf16.iter().enumerate()
-                                        {
-                                            let Some(packed_buf) = buf_opt.as_ref() else {
-                                                continue;
-                                            };
-                                            let Some(shape_opt) = qkv_gate_shapes.get(slot) else {
-                                                continue;
-                                            };
-                                            let Some((qkv_n_u32, gate_n_u32)) = *shape_opt else {
-                                                continue;
-                                            };
-                                            let n_total = qkv_n_u32 as u64 + gate_n_u32 as u64;
-                                            if n_total == 0 {
-                                                continue;
-                                            }
-                                            enc.set_buffer(packed_buf, 0, 0);
-                                            enc.set_buffer(&s.normed_buf, 0, 1);
-                                            enc.set_buffer(&s.qkv_buf, 0, 2);
-                                            enc.set_buffer(&s.gate_buf, 0, 3);
-                                            enc.set_bytes(&32u32.to_le_bytes(), 4);
-                                            enc.set_bytes(&qkv_n_u32.to_le_bytes(), 5);
-                                            enc.set_bytes(&gate_n_u32.to_le_bytes(), 6);
-                                            enc.set_bytes(&k_u32.to_le_bytes(), 7);
-                                            enc.dispatch_threadgroups(
-                                                MTLSize::new(n_total.div_ceil(32), 1, 1),
-                                                MTLSize::new(128, 1, 1),
-                                            );
-                                        }
-                                    } else {
-                                        // Minimal warmup: 1-thread no-op per layer.
-                                        enc.set_pipeline_state(&pipelines.bf16_paired_warmup);
-                                        for buf_opt in s.repacked_gdn_qkv_gate_bf16.iter() {
-                                            let Some(packed_buf) = buf_opt.as_ref() else {
-                                                continue;
-                                            };
-                                            enc.set_buffer(packed_buf, 0, 0);
-                                            enc.set_buffer(&s.qkv_buf, 0, 1);
-                                            enc.dispatch_threadgroups(
-                                                MTLSize::new(1, 1, 1),
-                                                MTLSize::new(1, 1, 1),
-                                            );
-                                        }
-                                    }
-                                    enc.end_encoding();
-                                }
-                                cmd.commit_and_wait();
-                            }
-                        }
-                    }
-                }
             }
         }
 

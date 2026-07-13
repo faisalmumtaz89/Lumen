@@ -1444,8 +1444,6 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_METAL_BF16_GDN_FULL_PREFILL_WARMUP",
     "LUMEN_METAL_BF16_GDN_QKV_GATE_PAIRED",
     "LUMEN_METAL_BF16_GDN_TILE_NOK64",
-    "LUMEN_METAL_BF16_GDN_WARMUP",
-    "LUMEN_METAL_BF16_GDN_WARMUP_MODE",
     "LUMEN_METAL_BF16_MMAP_ONLY",
     "LUMEN_METAL_BF16_MPS",
     "LUMEN_METAL_CONCURRENT_ENCODER",
@@ -1503,16 +1501,8 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_METAL_Q4_REPACKED",
     "LUMEN_METAL_Q4_REPACKED_FFN_DOWN",
     "LUMEN_METAL_Q4_REPACKED_GATE_UP",
-    "LUMEN_METAL_Q4_F16_SCALES_ALL",
-    "LUMEN_METAL_Q4_QMV_DOWN",
-    "LUMEN_METAL_Q4_QMV_DOWN_F16SC",
-    "LUMEN_METAL_Q4_QMV_PROJ",
-    "LUMEN_METAL_Q4_PROJ_F16SC",
     "LUMEN_METAL_Q4_FULLATTN_F16SC",
     "LUMEN_METAL_Q4_QMV_PROJ_LCMAP",
-    "LUMEN_METAL_Q4_QMV_KV",
-    "LUMEN_METAL_Q4_QMV_LMHEAD",
-    "LUMEN_METAL_Q4_LMHEAD_F16SC",
     "LUMEN_METAL_Q4_QMV_DOWN_SPLITK",
     "LUMEN_METAL_Q4_GATEUP_SPLITK",
     "LUMEN_METAL_Q4_SSMOUT_SPLITK",
@@ -1520,14 +1510,8 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_METAL_Q4_QGATEKV_FUSE",
     "LUMEN_METAL_CONCURRENT_GATEUP",
     "LUMEN_METAL_CONCURRENT_GATEUP_256",
-    "LUMEN_METAL_GDN_STATE_H1",
-    "LUMEN_METAL_GDN_F16_STATE_DECODE",
-    "LUMEN_METAL_GDN_F16_STATE_H1",
-    "LUMEN_METAL_GDN_F16_STATE_H1_V2",
     "LUMEN_METAL_Q4_QMV_SSMOUT",
     "LUMEN_METAL_Q4_SSMOUT_REQUANT",
-    "LUMEN_METAL_Q4_QMV_GATEUP",
-    "LUMEN_METAL_Q4_GATEUP_F16SC",
     "LUMEN_METAL_Q4_GATEUP_1SG",
     "LUMEN_METAL_Q4_GATEUP_8ROW",
     "LUMEN_METAL_Q4_GATEUP_F16MATH",
@@ -1545,7 +1529,6 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_METAL_Q8_REPACKED_GATE_UP",
     "LUMEN_METAL_Q8_GDN_QKVGATE_2STREAM",
     "LUMEN_METAL_UNRETAINED_CMDBUFS",
-    "LUMEN_MOE_FFN_FINGERPRINT",
     "LUMEN_MOE_PROBE",
     "LUMEN_MOE_SORT_TIMING",
     "LUMEN_PREFILL_TIMING",
@@ -1558,7 +1541,6 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_SERVER_DEBUG_MEM",
     "LUMEN_SERVER_PANIC_MAX",
     "LUMEN_SERVER_PANIC_WINDOW_SECS",
-    "LUMEN_SERVER_PER_JOB_RESET",
     "LUMEN_SOAK_DURATION_SEC",
     "LUMEN_SOAK_OUT_DIR",
     "LUMEN_SOAK_STACK_DUMP",
@@ -1653,9 +1635,8 @@ fn collect_unknown_lumen_env_vars() -> Vec<String> {
     // catches the literal typo: `GDN_REGISTER_RESIDENT=1` instead
     // of `LUMEN_CUDA_GDN_REGISTER_RESIDENT=1`. The 6-char minimum on the
     // matching suffix keeps the false-positive rate low. Tracking `seen`
-    // prevents emitting the same warning twice if e.g. `PER_JOB_RESET`
-    // matches both `LUMEN_SERVER_PER_JOB_RESET` and (hypothetically) other
-    // roots.
+    // prevents emitting the same warning twice if a single suffix
+    // matches more than one canonical root.
     let mut already_seen: std::collections::HashSet<&String> = std::collections::HashSet::new();
     let mut suffix_warnings: Vec<String> = Vec::new();
     for non_lumen in env_vars.iter().filter(|k| !k.starts_with("LUMEN_")) {

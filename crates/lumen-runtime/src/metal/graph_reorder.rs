@@ -1029,10 +1029,6 @@ pub(crate) fn q4_repacked_gate_up_enabled() -> bool {
 /// `LUMEN_METAL_BF16_GDN_QKV_GATE_PAIRED=1` and amortise the
 /// page-table commit over many inferences.
 ///
-/// A load-time warmup dispatch in `gpu_resident.rs` is retained as an opt-in
-/// (`LUMEN_METAL_BF16_GDN_WARMUP=1` with `MODE=minimal|full`) for
-/// downstream investigation.
-///
 /// A stronger warmup mechanism (`bf16_paired_full_prefill_warmup_enabled`)
 /// runs a complete throwaway prefill at `M=131` at the tail of
 /// `preload_weights_gpu_resident`. Unlike the minimal-touch dispatch, which

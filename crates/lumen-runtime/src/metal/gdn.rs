@@ -640,7 +640,7 @@ impl MetalF32Backend {
     /// Byte-identical to the serial path (disjoint cluster outputs, shared
     /// read-only input; the recurrence is never made concurrent).
     /// One-time, lazy F32 -> F16 conversion of GDN layer `gdn_idx`'s persistent
-    /// h_state, for the `LUMEN_METAL_GDN_F16_STATE_DECODE` decode lever.
+    /// h_state, for the default F16 decode recurrence.
     ///
     /// On the FIRST decode touch of a GDN layer (mirror is `None`), allocates a
     /// half-size F16 buffer and encodes a `gdn_state_f32_to_f16` dispatch on the
@@ -657,31 +657,15 @@ impl MetalF32Backend {
         s: &MetalScratch,
         gdn_idx: usize,
     ) -> Result<(), RuntimeError> {
-        // The F16 mirror is built when ANY of the plain F16-state flag, the
-        // F16-state+h1 (dead-store-elided) flag, or the vi-amortized v2 flag is on.
-        // All consume the same half-size mirror; only the recurrence kernel differs.
+        // The GDN decode recurrence stores the persistent h_state in a half-size
+        // F16 mirror (the default v4 kernel; plain-F16 fallback). Build the mirror
+        // lazily; fall back to the f32 path when the converter / f16 kernels are absent.
         let want_v4 = crate::metal::gdn_f16_state_h1_v4_enabled();
-        let want_v2 = crate::metal::gdn_f16_state_h1_v2_enabled();
-        let want_h1 = crate::metal::gdn_f16_state_h1_enabled() || want_v2 || want_v4;
-        if !crate::metal::gdn_f16_state_decode_enabled() && !want_h1 {
-            return Ok(());
-        }
-        // Converter must be present. The vi-amortized v2 needs its own kernel; the
-        // f16_h1 variant needs the elided kernel; otherwise the plain f16 kernel. If
-        // the required recurrence kernel did not compile, fall back (no mirror -> f32).
         if pipelines.gdn_state_f32_to_f16.is_none() {
             return Ok(());
         }
         if want_v4 {
             if pipelines.gdn_state_output_l2_sg_f16_h1_v4.is_none() {
-                return Ok(());
-            }
-        } else if want_v2 {
-            if pipelines.gdn_state_output_l2_sg_f16_h1_v2.is_none() {
-                return Ok(());
-            }
-        } else if want_h1 {
-            if pipelines.gdn_state_output_l2_sg_f16_h1.is_none() {
                 return Ok(());
             }
         } else if pipelines.gdn_state_output_l2_sg_f16.is_none() {
@@ -1318,57 +1302,18 @@ impl MetalF32Backend {
 
             // Simdgroup-parallel state update with high GPU occupancy.
             // Each simdgroup (32 threads) handles one (head, val_col) pair via simd_sum.
-            // GDN_STATE_H1 (env LUMEN_METAL_GDN_STATE_H1=1, default OFF): dispatch the
-            // `gdn_state_output_l2_sg_h1` variant, which is MATHEMATICALLY IDENTICAL
-            // (same L2-norm, same decay/retrieval/delta arithmetic + reduction order,
-            // same output) but elides the reference kernel's redundant first h_state
-            // write (a dead store: the decayed-state store is immediately overwritten
-            // by the updated-state store and never read back from device memory). This
-            // halves the per-token h_state WRITE traffic on the 24 GDN layers with a
-            // BYTE-IDENTICAL final state + output. Bindings/grid/threadgroup are the
-            // SAME as gdn_state_output_l2_sg, so only the pipeline-state selection
-            // changes here. Falls back to the f32 reference kernel when the flag is OFF
-            // or the h1 pipeline did not compile (preserves the byte-identical default).
-            // GDN_F16_STATE_DECODE (env, default OFF): when this layer's F16 mirror
-            // has been converted (ensure_gdn_f16_state_decode ran on the caller's
-            // encoder before this fn), run the F16 recurrence reading/writing the
-            // half-size F16 h_state -> halves the per-token h_state device traffic.
-            // The recurrence math stays F32-in-registers (load+upcast, store+downcast),
-            // so the only change is state rounding (near-tie). Takes precedence over
-            // the H1 variant (the dead-store elision is f32-only). Falls back to the
-            // f32 path when the mirror is absent (flag OFF / pipeline missing).
-            // Borrow the F16 mirror cell (if present + converted) and hold the guard
-            // across set_pipeline_state + set_buffer so the bound buffer ref stays live.
-            // GDN_F16_STATE_H1 (env, default OFF): same F16 mirror as GDN_F16_STATE_DECODE
-            // but dispatch the dead-store-elided f16 kernel (gdn_state_output_l2_sg_f16_h1).
-            // Takes precedence over the plain F16 kernel when both flags are set.
-            // VI-amortized v2 (LUMEN_METAL_GDN_F16_STATE_H1_V2): each TG handles 2 vi
-            // columns, computing the (vi-invariant) Q/K norm + load once -> halves the
-            // redundant per-vi norm ALU + Q/K reads on the recurrence critical path.
-            // Takes precedence over the single-vi f16_h1 / plain-f16 kernels; requires
-            // val_dim even (key_dim==val_dim==head_dim, always even here). The grid's
-            // y-dimension halves; everything else (bindings, the F16 mirror) is identical.
-            // V4 (LUMEN_METAL_GDN_F16_STATE_H1_V4): 4 vi columns/TG, Q/K norm+load
-            // shared 4-way; takes precedence over v2 (out-of-range vi guarded, so no
-            // divisibility requirement). Grid y quarters.
+            // The default GDN decode recurrence stores the persistent h_state in a
+            // half-size F16 mirror (built lazily by ensure_gdn_f16_state_decode) and
+            // dispatches the 4-way VI-amortized `gdn_state_output_l2_sg_f16_h1_v4`
+            // kernel. When the mirror / v4 kernel is absent it falls back to the plain
+            // F16 kernel, and finally to the byte-identical f32 reference
+            // `gdn_state_output_l2_sg`.
             let want_f16_v4 = crate::metal::gdn_f16_state_h1_v4_enabled()
                 && pipelines.gdn_state_output_l2_sg_f16_h1_v4.is_some();
-            let want_f16_v2 = !want_f16_v4
-                && crate::metal::gdn_f16_state_h1_v2_enabled()
-                && pipelines.gdn_state_output_l2_sg_f16_h1_v2.is_some()
-                && (head_dim % 2 == 0);
-            let want_f16_h1 = !want_f16_v4
-                && !want_f16_v2
-                && crate::metal::gdn_f16_state_h1_enabled()
-                && pipelines.gdn_state_output_l2_sg_f16_h1.is_some();
-            // The mirror is selected if ANY f16 kernel is available (it is built by
-            // ensure_gdn_f16_state_decode under any of the f16-state flags).
+            // The mirror is selected if an f16 kernel is available (it is built by
+            // ensure_gdn_f16_state_decode).
             let f16_pso = if want_f16_v4 {
                 pipelines.gdn_state_output_l2_sg_f16_h1_v4.as_ref()
-            } else if want_f16_v2 {
-                pipelines.gdn_state_output_l2_sg_f16_h1_v2.as_ref()
-            } else if want_f16_h1 {
-                pipelines.gdn_state_output_l2_sg_f16_h1.as_ref()
             } else {
                 pipelines.gdn_state_output_l2_sg_f16.as_ref()
             };
@@ -1378,20 +1323,12 @@ impl MetalF32Backend {
             let f16_active = f16_cell_ref.as_ref().map(|r| r.is_some()).unwrap_or(false);
 
             if f16_active {
-                // F16 recurrence on the converted half-size mirror (plain / h1 / v2).
+                // F16 recurrence on the converted half-size mirror.
                 enc.set_pipeline_state(f16_pso.unwrap());
                 enc.set_buffer(f16_cell_ref.as_ref().unwrap().as_ref().unwrap(), 0, 0);
             // f16 h_state
             } else {
-                let pso_sg = if crate::metal::metal_gdn_state_h1_enabled() {
-                    pipelines
-                        .gdn_state_output_l2_sg_h1
-                        .as_ref()
-                        .unwrap_or_else(|| pso_state_l2_sg.unwrap())
-                } else {
-                    pso_state_l2_sg.unwrap()
-                };
-                enc.set_pipeline_state(pso_sg);
+                enc.set_pipeline_state(pso_state_l2_sg.unwrap());
                 enc.set_buffer(h_state_buf, 0, 0); // f32 h_state
             }
             enc.set_buffer(qkv_conv_buf, k_byte_off, 1); // k_raw [n_kv_heads * key_dim] (UN-normalized)
@@ -1412,8 +1349,6 @@ impl MetalF32Backend {
                 // v4 amortizes 4 vi columns/TG -> y-dim quarters (4096 -> 1024 TGs).
                 let y_dim = if want_f16_v4 {
                     (head_dim as u64).div_ceil(4)
-                } else if want_f16_v2 {
-                    (head_dim as u64).div_ceil(2)
                 } else {
                     head_dim as u64
                 };
@@ -3949,7 +3884,7 @@ impl MetalF32Backend {
                 for h_buf in &s.gdn_h_states {
                     h_buf.write_f32(&vec![0.0f32; h_state_size]);
                 }
-                // Drop any F16 h_state mirrors (LUMEN_METAL_GDN_F16_STATE_DECODE):
+                // Drop any F16 h_state mirrors:
                 // a new sequence restarts from the freshly-zeroed F32 state, so the
                 // next decode re-converts F32->F16 on first touch.
                 for hf in &s.gdn_h_states_f16 {

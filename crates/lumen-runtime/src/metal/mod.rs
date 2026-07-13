@@ -224,29 +224,6 @@ pub(crate) fn q4_fast_decode_enabled() -> bool {
     true
 }
 
-/// Master switch for the four byte-identical F16-SCALES matvec paths
-/// (`LUMEN_METAL_Q4_F16_SCALES_ALL=1`, default OFF). The gate/up, FFN-down,
-/// lm_head, and GDN-QKV/gate f16-scale kernels each cut ~10% of their matvec's
-/// per-block scale bytes and are byte-identical because the f16 scale is the
-/// on-disk Q4_0 native precision the f32 decode-qmv layout widened (see the four
-/// per-path getters below). This master ORs into all four per-path getters at
-/// once so a single flag engages the full f16-scale weight-byte reduction across
-/// every Q4 decode matvec stream. It does NOT touch the full-attn path
-/// (`LUMEN_METAL_Q4_FULLATTN_F16SC`). Default OFF. Cached.
-pub(crate) fn q4_f16_scales_all_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_Q4_F16_SCALES_ALL")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
-}
-
 /// When `LUMEN_METAL_Q4_GATEUP_F16SC=1` (and the decode-qmv gate/up buffers
 /// exist, i.e. `LUMEN_METAL_Q4_QMV_GATEUP=1`), the dense FFN gate/up GEMV uses
 /// the F16-SCALES kernel `qmv_q4_0_gate_up_swiglu_f16sc` with gate/up scale
@@ -257,19 +234,7 @@ pub(crate) fn q4_f16_scales_all_enabled() -> bool {
 /// f32-scale kernel. Also engaged by the master `LUMEN_METAL_Q4_F16_SCALES_ALL`.
 /// Default OFF. Cached.
 pub(crate) fn q4_gateup_f16sc_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = q4_f16_scales_all_enabled()
-        || q4_gateup_h2math_enabled()
-        || std::env::var("LUMEN_METAL_Q4_GATEUP_F16SC")
-            .map(|s| !s.is_empty() && s != "0")
-            .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
+    q4_gateup_h2math_enabled()
 }
 
 /// When `LUMEN_METAL_Q4_GATEUP_1SG=1` (and the dense FFN gate/up decode-qmv
@@ -377,19 +342,7 @@ pub(crate) fn q4_gateup_il_enabled() -> bool {
 /// on-disk Q4_0 scale's native precision (the f32 decode-qmv layout widened it),
 /// so the result is byte-identical to the f32-scale kernel. Default OFF. Cached.
 pub(crate) fn q4_qmv_down_f16sc_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = q4_f16_scales_all_enabled()
-        || q4_down_h2math_enabled()
-        || std::env::var("LUMEN_METAL_Q4_QMV_DOWN_F16SC")
-            .map(|s| !s.is_empty() && s != "0")
-            .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
+    q4_down_h2math_enabled()
 }
 
 /// Part of the default Q4_0 fast-decode stack (unconditional — the dense FFN-down
@@ -573,19 +526,7 @@ pub(crate) fn q4_ssmout_nr2_enabled() -> bool {
 /// scale's native precision (the f32 decode-qmv layout widened it), so the result
 /// is byte-identical to the f32-scale kernel. Default OFF. Cached.
 pub(crate) fn q4_lmhead_f16sc_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = q4_f16_scales_all_enabled()
-        || q4_lmhead_h2math_enabled()
-        || std::env::var("LUMEN_METAL_Q4_LMHEAD_F16SC")
-            .map(|s| !s.is_empty() && s != "0")
-            .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
+    q4_lmhead_h2math_enabled()
 }
 
 /// When `LUMEN_METAL_Q4_PROJ_F16SC=1` (and the GDN decode-qmv QKV-in-proj +
@@ -601,19 +542,7 @@ pub(crate) fn q4_lmhead_f16sc_enabled() -> bool {
 /// decode-qmv layout widened it), so the result is byte-identical to the
 /// f32-scale kernel. Default OFF. Cached.
 pub(crate) fn q4_proj_f16sc_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = q4_f16_scales_all_enabled()
-        || q4_proj_h2math_enabled()
-        || std::env::var("LUMEN_METAL_Q4_PROJ_F16SC")
-            .map(|s| !s.is_empty() && s != "0")
-            .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
+    q4_proj_h2math_enabled()
 }
 
 /// When `LUMEN_METAL_Q4_FULLATTN_F16SC=1` (and the full-attn decode-qmv buffers
@@ -963,126 +892,6 @@ pub(crate) fn metal_concurrent_gateup_256_enabled() -> bool {
     on
 }
 
-/// When `LUMEN_METAL_GDN_STATE_H1=1` (default OFF), the Tier-0 GDN decode state
-/// update dispatches the `gdn_state_output_l2_sg_h1` ("h1" = one global write)
-/// kernel instead of the reference `gdn_state_output_l2_sg`. The h1 variant is
-/// MATHEMATICALLY IDENTICAL — same L2-norm, same decay/retrieval/delta-update
-/// arithmetic order, same simd_sum reductions, same output — but it keeps the
-/// decayed state in registers and elides the reference kernel's redundant first
-/// `h_state` write (the decayed-state store at the top of the recurrence is a
-/// DEAD STORE: it is immediately overwritten by the updated-state store and is
-/// never read back from device memory, since `retrieval` reads the decayed
-/// values from registers). Removing it halves the per-token `h_state` WRITE
-/// traffic on the 24 GDN layers (~50 MB/token of pure redundant device writes,
-/// ~1% of the Q4 token stream) with a BYTE-IDENTICAL final state and output.
-/// f32 state only (it reads/writes `device float* h_state`, so it is independent
-/// of the reduced-precision state flags and safe with the f32 prefill path).
-/// Cached after first read.
-pub(crate) fn metal_gdn_state_h1_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let on = std::env::var("LUMEN_METAL_GDN_STATE_H1")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-    on
-}
-
-/// When `LUMEN_METAL_GDN_F16_STATE_DECODE=1` (default OFF), the Tier-0 GDN decode
-/// recurrence (`gdn_state_output_l2_sg`) is replaced by the `gdn_state_output_l2_sg_f16`
-/// variant, which stores the persistent recurrent `h_state` in F16 instead of F32.
-/// h_state is `[n_v_heads * head_dim * head_dim]` (9B: 32*128*128 = 512Ki f32 = 2 MB)
-/// PER GDN layer, READ and WRITTEN every token x 24 GDN layers -> ~96 MB/token of
-/// device h_state traffic (~1.9% of the ~5.2 GB/token Q4 stream). Halving the persisted
-/// state to F16 cuts that to ~48 MB/token. The recurrence math stays F32-in-registers
-/// (load+upcast, compute, downcast-on-store), so the ONLY numerical change is the
-/// rounding of the persisted state -> a near-tie, NOT byte-identical (acceptable if the
-/// answer is preserved + self-deterministic, exactly like the other reduced-precision
-/// decode levers).
-///
-/// CRUCIAL SAFETY: the prefill GDN kernels (`gdn_prefill_fused_v3*`) write `h_state` as
-/// `device float*`, so the persistent F32 buffer (`s.gdn_h_states`) is LEFT F32-allocated
-/// and prefill is UNCHANGED (no corruption). When this flag is ON, the FIRST decode touch
-/// of each GDN layer converts that layer's F32 state into a SEPARATE half-size F16 buffer
-/// (`s.gdn_h_states_f16[idx]`, allocated + filled lazily by `gdn_state_f32_to_f16` — a
-/// distinct dst buffer, so NO in-place read/write aliasing) and the F16 recurrence
-/// reads/writes the F16 buffer thereafter. The one-time per-layer convert (24 tiny copies)
-/// amortizes over the whole decode. Default OFF (the byte-identical F32 path). Cached.
-pub(crate) fn gdn_f16_state_decode_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let on = std::env::var("LUMEN_METAL_GDN_F16_STATE_DECODE")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-    on
-}
-
-/// When `LUMEN_METAL_GDN_F16_STATE_H1=1` (default OFF), the GDN decode recurrence uses
-/// the F16 persistent h_state (exactly like `LUMEN_METAL_GDN_F16_STATE_DECODE` — same
-/// lazy F32->F16 mirror, half the device state R+W) BUT dispatches the
-/// `gdn_state_output_l2_sg_f16_h1` kernel, which additionally ELIDES the redundant
-/// decayed-state write-back (a dead store overwritten by the phase-2 updated store;
-/// retrieval reads the decayed values from registers). Net vs the F32 2-write reference:
-/// ONE F16 read + ONE F16 write per state row = 4x less h_state device traffic
-/// (2x F16 width x 2x dropping the dead write). This flag IMPLIES the F16 mirror
-/// (so it engages even when `GDN_F16_STATE_DECODE` is not set) and, when ON,
-/// takes precedence over the plain F16 kernel. Falls back to the f32 path when the
-/// mirror is absent / the f16_h1 pipeline did not compile. Output is byte-identical to
-/// the plain F16 kernel (only the dead store is removed) and a near-tie vs F32 (F16
-/// state rounding — answer-preserving + self-deterministic, like the other reduced-
-/// precision decode levers). Cached.
-pub(crate) fn gdn_f16_state_h1_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let on = std::env::var("LUMEN_METAL_GDN_F16_STATE_H1")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-    on
-}
-
-/// When `LUMEN_METAL_GDN_F16_STATE_H1_V2=1` (default OFF), the Tier-0 fused GDN decode
-/// recurrence dispatches the VI-AMORTIZED `gdn_state_output_l2_sg_f16_h1_v2` kernel:
-/// each threadgroup handles TWO adjacent val_dim columns and computes the (vi-invariant)
-/// Q/K L2-norm + Q/K device load ONCE, reusing it across both columns. This halves the
-/// per-token redundant Q/K L2-norm ALU (the two simd_sum reductions + two sqrt + two
-/// reciprocal-selects that the reference grid recomputes val_dim=128x per head) AND the
-/// redundant Q/K device reads on the GDN recurrence critical dependency path that the
-/// lean async pipeline cannot hide. Grid halves 4096 -> 2048 TGs (still richly occupied
-/// on the 80-core M3 Ultra). Requires the F16 h_state mirror (implies the same lazy
-/// F32->F16 conversion as GDN_F16_STATE_H1, with which it shares the half-size mirror)
-/// and takes precedence over the single-vi f16_h1 / plain-f16 kernels when set. Falls
-/// back to the f32 path when the mirror / v2 pipeline is absent. Output is BYTE-IDENTICAL
-/// to the single-vi `gdn_state_output_l2_sg_f16_h1` kernel (the Q/K norm uses the same
-/// 32-lane simd_sum reduction tree and each column runs the identical recurrence
-/// arithmetic) and a near-tie vs F32 (F16 state rounding). Cached.
-pub(crate) fn gdn_f16_state_h1_v2_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let on = std::env::var("LUMEN_METAL_GDN_F16_STATE_H1_V2")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-    on
-}
-
 /// Part of the default Q4_0 fast-decode stack (unconditional). The Tier-0 fused GDN decode
 /// recurrence dispatches the 4-WAY VI-AMORTIZED `gdn_state_output_l2_sg_f16_h1_v4` kernel:
 /// each threadgroup handles FOUR adjacent val_dim columns and computes the (vi-invariant)
@@ -1118,59 +927,6 @@ pub(crate) fn q4_qmv_proj_lcmap_enabled() -> bool {
         .unwrap_or(false);
     CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
     on
-}
-
-/// Precision of the persistent GDN recurrent h_state buffer.
-///
-/// The default `gdn_state_output_l2_sg` recurrence stores h_state in F32 (2
-/// MB/layer, read+written every token×layer). The reduced-precision variants
-/// store it in bfloat or half (1 MB/layer), halving the dominant decode state
-/// traffic. The recurrence math stays F32-in-registers in all cases; only the
-/// persisted state is rounded. Selected at allocation AND dispatch time so the
-/// buffer byte-size and the kernel pointer type stay consistent.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GdnStatePrecision {
-    F32,
-    Bf16,
-    F16,
-}
-
-/// When `LUMEN_METAL_GDN_BF16_STATE=1` -> Bf16; `LUMEN_METAL_GDN_F16_STATE=1`
-/// -> F16; otherwise F32. BF16 takes precedence if both are set. Default F32
-/// (the existing byte-identical path). Cached after first read.
-pub(crate) fn gdn_state_precision() -> GdnStatePrecision {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    // 0 = uninit, 1 = F32, 2 = Bf16, 3 = F16
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return match cur {
-            2 => GdnStatePrecision::Bf16,
-            3 => GdnStatePrecision::F16,
-            _ => GdnStatePrecision::F32,
-        };
-    }
-    let env_on = |name: &str| {
-        std::env::var(name)
-            .map(|s| !s.is_empty() && s != "0")
-            .unwrap_or(false)
-    };
-    let p = if env_on("LUMEN_METAL_GDN_BF16_STATE") {
-        GdnStatePrecision::Bf16
-    } else if env_on("LUMEN_METAL_GDN_F16_STATE") {
-        GdnStatePrecision::F16
-    } else {
-        GdnStatePrecision::F32
-    };
-    CACHE.store(
-        match p {
-            GdnStatePrecision::Bf16 => 2,
-            GdnStatePrecision::F16 => 3,
-            GdnStatePrecision::F32 => 1,
-        },
-        Ordering::Relaxed,
-    );
-    p
 }
 
 /// When `LUMEN_METAL_MOE_DOWN_SGROW=1`, the mixed q8/q4 MoE

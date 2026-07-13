@@ -773,22 +773,11 @@ impl ComputeBackend for MetalF32Backend {
                 let h_state_size = gdn_num_v_heads * gdn_head_dim * gdn_head_dim;
                 let conv_state_size = (conv_kernel_size - 1) * gdn_qkv_dim;
 
-                // Persistent h_state precision: F32 (4 B/elem) or a reduced-precision
-                // bfloat/half variant (2 B/elem). Must match gpu_resident allocation.
-                let h_state_precision = crate::metal::gdn_state_precision();
-                let h_bytes = if h_state_precision == crate::metal::GdnStatePrecision::F32 {
-                    h_state_size * 4
-                } else {
-                    h_state_size * 2
-                };
-                let h_buf = self.device.new_buffer(h_bytes).ok_or_else(|| {
+                // Persistent h_state: F32 (4 B/elem).
+                let h_buf = self.device.new_buffer(h_state_size * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN h_state".into())
                 })?;
-                if h_state_precision == crate::metal::GdnStatePrecision::F32 {
-                    h_buf.write_f32(&vec![0.0f32; h_state_size]);
-                } else {
-                    h_buf.write_u16(&vec![0u16; h_state_size]);
-                }
+                h_buf.write_f32(&vec![0.0f32; h_state_size]);
 
                 let c_buf = self.device.new_buffer(conv_state_size * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN conv_state".into())
@@ -796,8 +785,8 @@ impl ComputeBackend for MetalF32Backend {
                 c_buf.write_f32(&vec![0.0f32; conv_state_size]);
 
                 s.gdn_h_states.push(h_buf);
-                // Length-sync the lazy F16 h_state mirror (filled on first decode
-                // touch when LUMEN_METAL_GDN_F16_STATE_DECODE=1).
+                // Length-sync the lazy F16 h_state mirror (filled on the first decode
+                // touch by the default F16 decode recurrence).
                 s.gdn_h_states_f16.push(std::cell::RefCell::new(None));
                 s.gdn_conv_states.push(c_buf);
                 s.gdn_conv_positions.push(0);
