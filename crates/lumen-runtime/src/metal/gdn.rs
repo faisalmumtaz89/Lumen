@@ -898,7 +898,23 @@ impl MetalF32Backend {
         // Step 1+2 (+1+9 when fused): QKV matvec (+ attn_gate when fused)
         {
             let wq_off = meta.wq_off;
-            if q8_unfused {
+            if q8_unfused && crate::metal::metal_q8_gdn_qkvgate_2stream_enabled() {
+                // v0.5: FUSE qkv in-proj + attn_gate into ONE per-thread 2-stream dispatch
+                // (each thread computes BOTH dots from the shared normed x -> 2x loads/thread
+                // MLP). Writes qkv_buf AND gate_sigmoid_buf; the separate attn_gate dispatch
+                // below is skipped. BYTE-IDENTICAL to the two separate 2sg dispatches.
+                enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_qkv_gate_2stream);
+                enc.set_buffer(layer_buf, wq_off, 0);
+                enc.set_buffer(&s.normed_buf, 0, 1);
+                enc.set_buffer(&s.qkv_buf, 0, 2);
+                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                enc.set_bytes(&(qkv_dim as u32).to_le_bytes(), 4);
+                enc.set_buffer(layer_buf, attn_gate_off, 5);
+                enc.set_buffer(gate_sigmoid_buf, 0, 6);
+                enc.set_bytes(&(q_dim as u32).to_le_bytes(), 7);
+                let n_tg = ((qkv_dim as u64) + 7) / 8;
+                enc.dispatch_threadgroups(MTLSize::new(n_tg, 1, 1), MTLSize::new(64, 1, 1));
+            } else if q8_unfused {
                 // Q8_0 unfused: read normed_buf, use dequant_matmul_q8_0_2sg (64 threads, 8 rows/TG)
                 enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_2sg);
                 enc.set_buffer(layer_buf, wq_off, 0);
@@ -1083,7 +1099,9 @@ impl MetalF32Backend {
 
         // Step 1+9: Attn gate matvec.
         {
-            if q8_unfused {
+            if q8_unfused && crate::metal::metal_q8_gdn_qkvgate_2stream_enabled() {
+                // v0.5: attn_gate already computed by the fused qkv+gate 2-stream dispatch above.
+            } else if q8_unfused {
                 // Q8_0 unfused: read normed_buf, use dequant_matmul_q8_0_2sg (64 threads, 8 rows/TG)
                 enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_2sg);
                 enc.set_buffer(layer_buf, attn_gate_off, 0);

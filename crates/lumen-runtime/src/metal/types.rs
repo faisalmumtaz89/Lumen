@@ -114,6 +114,7 @@ pub(crate) struct MetalPipelines {
     pub(crate) dequant_matmul_q8_0_deferred_bias_nr2: MetalPipelineState,
     // 2-SG independent row ownership (zero barriers, zero shmem)
     pub(crate) dequant_matmul_q8_0_2sg: MetalPipelineState,
+    pub(crate) dequant_matmul_q8_0_qkv_gate_2stream: MetalPipelineState,
     pub(crate) dequant_matmul_q8_0_2sg_residual: MetalPipelineState,
     pub(crate) ffn_fused_gate_up_swiglu_q8_0_2sg: MetalPipelineState,
     // Q4_0 decode kernels

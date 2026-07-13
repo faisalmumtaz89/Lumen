@@ -837,6 +837,25 @@ pub(crate) fn metal_concurrent_proj_enabled() -> bool {
     true
 }
 
+/// When `LUMEN_METAL_Q8_GDN_QKVGATE_2STREAM` is unset or != "0" (DEFAULT-ON, v0.5), the GDN
+/// qkv in-proj + attn_gate Q8 matvecs are FUSED into `dequant_matmul_q8_0_qkv_gate_2stream`:
+/// each thread accumulates BOTH dot products from the shared normed x (2 in-flight weight
+/// streams/thread = more memory-level parallelism, +0.83% 27B-Q8 decode). BYTE-IDENTICAL to
+/// the two separate 2sg dispatches. Set the env to "0" to disable.
+pub(crate) fn metal_q8_gdn_qkvgate_2stream_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(0);
+    let cur = CACHE.load(Ordering::Relaxed);
+    if cur != 0 {
+        return cur == 2;
+    }
+    let on = std::env::var("LUMEN_METAL_Q8_GDN_QKVGATE_2STREAM")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    on
+}
+
 /// When `LUMEN_METAL_FLASH_DECODE_ALWAYS=1` (default OFF), the full-attention decode
 /// path uses the online-softmax `flash_decode_attention` + `flash_decode_reduce`
 /// kernels at ALL KV lengths, instead of falling back to `multi_head_attention`

@@ -145,6 +145,9 @@ impl MetalF32Backend {
             ),
             // 2-simdgroup matmul kernels (two SIMD groups cooperate on one output tile).
             dequant_matmul_q8_0_2sg: make_pipeline!("dequant_matmul_q8_0_2sg"),
+            dequant_matmul_q8_0_qkv_gate_2stream: make_pipeline!(
+                "dequant_matmul_q8_0_qkv_gate_2stream"
+            ),
             dequant_matmul_q8_0_2sg_residual: make_pipeline!("dequant_matmul_q8_0_2sg_residual"),
             ffn_fused_gate_up_swiglu_q8_0_2sg: make_pipeline!("ffn_fused_gate_up_swiglu_q8_0_2sg"),
             // Q4_0 decode kernels
