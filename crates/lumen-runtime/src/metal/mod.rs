@@ -51,10 +51,6 @@ pub(crate) mod repack_q4;
 mod backend_impl;
 pub(crate) mod repack_bf16;
 pub(crate) mod types;
-// ssm_out_gemm microbench: standalone perf harness for the GDN hot-spot.
-// Exposes a single `#[doc(hidden)] pub fn run_ssm_out_microbench` entry
-// point; no production code path touches this module.
-pub mod ssm_out_microbench;
 pub use types::*;
 
 use self::ffi::{MTLSize, MetalBuffer, MetalCommandQueue, MetalDevice};
@@ -176,28 +172,27 @@ pub(crate) fn q4_fast_decode_enabled() -> bool {
     true
 }
 
-/// When `LUMEN_METAL_Q4_GATEUP_F16SC=1` (and the decode-qmv gate/up buffers
-/// exist, i.e. `LUMEN_METAL_Q4_QMV_GATEUP=1`), the dense FFN gate/up GEMV uses
+/// Part of the default Q4_0 fast-decode stack (unconditional): the dense FFN
+/// gate/up GEMV uses
 /// the F16-SCALES kernel `qmv_q4_0_gate_up_swiglu_f16sc` with gate/up scale
 /// buffers built as f16 (2 B/block instead of f32's 4 B). This streams 18 (not
 /// 20) weight bytes per 32-value block = ~10% fewer bytes on the bandwidth-bound
 /// dense FFN gate/up matvec. The f16 scale is the on-disk Q4_0 scale's native
 /// precision (the f32 path widened it), so the result is byte-identical to the
-/// f32-scale kernel. Also engaged by the master `LUMEN_METAL_Q4_F16_SCALES_ALL`.
-/// Default OFF. Cached.
+/// f32-scale kernel. Cached.
 pub(crate) fn q4_gateup_f16sc_enabled() -> bool {
     q4_gateup_h2math_enabled()
 }
 
-/// When `LUMEN_METAL_Q4_QMV_DOWN_F16SC=1` (and the FFN-down decode-qmv buffers
-/// exist, i.e. `LUMEN_METAL_Q4_QMV_DOWN=1`), the dense FFN-down GEMV uses the
+/// Part of the default Q4_0 fast-decode stack (unconditional): the dense FFN-down
+/// GEMV uses the
 /// F16-SCALES kernel `qmv_q4_0_residual_f16sc` with the per-block scale buffer
 /// built as f16 (2 B/block instead of f32's 4 B). FFN-down is the longest-K
 /// matvec (in=12288 -> 384 blocks/row), so this is the single largest per-token
 /// scale stream: streaming 18 (not 20) weight bytes per 32-value block = ~10%
 /// fewer bytes on the bandwidth-bound FFN-down matvec. The f16 scale is the
 /// on-disk Q4_0 scale's native precision (the f32 decode-qmv layout widened it),
-/// so the result is byte-identical to the f32-scale kernel. Default OFF. Cached.
+/// so the result is byte-identical to the f32-scale kernel. Cached.
 pub(crate) fn q4_qmv_down_f16sc_enabled() -> bool {
     q4_down_h2math_enabled()
 }
@@ -252,7 +247,7 @@ pub(crate) fn q4_gateup_h2math_enabled() -> bool {
 /// sum-of-squares kept in f32.
 ///
 /// RATIONALE: the lm_head (out=vocab, in=hidden=4096) is the single largest weight
-/// tensor (the Q8 output_proj re-quantized to Q4 under `LUMEN_METAL_Q4_QMV_LMHEAD`,
+/// tensor (the Q8 output_proj re-quantized to Q4 by default,
 /// ~0.54 GB streamed/token). Packing its dequant-MAC into the native 16-bit-
 /// vectorized ALU lane (which a scalar `half` path leaves half-idle) halves the
 /// inner-loop arithmetic on the largest matvec. NEAR-TIE, not guaranteed
@@ -316,8 +311,8 @@ pub(crate) fn q4_ssmout_nr2_enabled() -> bool {
     true
 }
 
-/// When `LUMEN_METAL_Q4_LMHEAD_F16SC=1` (and the Q4 lm_head decode-qmv buffers
-/// exist, i.e. `LUMEN_METAL_Q4_QMV_LMHEAD=1` re-quantized the Q8 output_proj),
+/// Part of the default Q4_0 fast-decode stack (unconditional; the Q4 lm_head
+/// decode-qmv buffers re-quantized the Q8 output_proj):
 /// the lm_head / output-projection GEMV uses the F16-SCALES kernel
 /// `qmv_q4_0_rmsnorm_f16sc` with the per-block scale buffer built as f16 (2 B/block
 /// instead of f32's 4 B). The lm_head is the single LARGEST weight tensor
@@ -325,13 +320,12 @@ pub(crate) fn q4_ssmout_nr2_enabled() -> bool {
 /// the model: streaming 18 (not 20) weight bytes per 32-value block = ~10% fewer
 /// bytes on the bandwidth-bound lm_head matvec. The f16 scale is the on-disk Q4_0
 /// scale's native precision (the f32 decode-qmv layout widened it), so the result
-/// is byte-identical to the f32-scale kernel. Default OFF. Cached.
+/// is byte-identical to the f32-scale kernel. Cached.
 pub(crate) fn q4_lmhead_f16sc_enabled() -> bool {
     q4_lmhead_h2math_enabled()
 }
 
-/// When `LUMEN_METAL_Q4_PROJ_F16SC=1` (and the GDN decode-qmv QKV-in-proj +
-/// attn_gate buffers exist, i.e. `LUMEN_METAL_Q4_QMV_PROJ=1`), the GDN-layer
+/// Part of the default Q4_0 fast-decode stack (unconditional): the GDN-layer
 /// QKV-in-projection (`wq`, qkv_dim rows) AND attn_gate (q_dim rows) GEMVs use
 /// the F16-SCALES kernel `qmv_q4_0_rmsnorm_f16sc` with their per-block scale
 /// buffers built as f16 (2 B/block instead of f32's 4 B). These two matvecs run
@@ -341,7 +335,7 @@ pub(crate) fn q4_lmhead_f16sc_enabled() -> bool {
 /// weight bytes per 32-value block = ~10% fewer bytes on these bandwidth-bound
 /// matvecs. The f16 scale is the on-disk Q4_0 scale's native precision (the f32
 /// decode-qmv layout widened it), so the result is byte-identical to the
-/// f32-scale kernel. Default OFF. Cached.
+/// f32-scale kernel. Cached.
 pub(crate) fn q4_proj_f16sc_enabled() -> bool {
     q4_proj_h2math_enabled()
 }
@@ -376,34 +370,6 @@ pub(crate) fn metal_q8_gdn_qkvgate_2stream_enabled() -> bool {
     let on = std::env::var("LUMEN_METAL_Q8_GDN_QKVGATE_2STREAM")
         .map(|v| v != "0")
         .unwrap_or(true);
-    CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-    on
-}
-
-/// When `LUMEN_METAL_FUSED_SDPA_DECODE=1` (default OFF), the short-KV
-/// (new_seq_len < 257) full-attention decode path uses
-/// `fused_rope_kv_mha_tgscores` instead of `fused_rope_kv_mha`: the only
-/// difference is that the per-head attention score vector lives in THREADGROUP
-/// memory rather than the device `mha_scores_buf` scratch. The baseline kernel
-/// touches that device score vector five times per head (write raw dot, read for
-/// softmax-max, write exp, read for sum, write normalized, read for V-weighted
-/// sum); for decode the vector is tiny (<=256 f32) and fits on-chip, so this
-/// eliminates the transient score buffer's DRAM round-trips -- matching MLX's
-/// vendor SDPA, which never round-trips a score buffer to device. The arithmetic,
-/// thread ownership, softmax reduction, and V accumulation order are unchanged =>
-/// byte-identical to the baseline; only the score storage location moves
-/// device->threadgroup. Engages only on the `use_fused_rope_kv_mha` path
-/// (standard RoPE, not NeoX, new_seq_len < 257).
-pub(crate) fn fused_sdpa_decode_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let on = std::env::var("LUMEN_METAL_FUSED_SDPA_DECODE")
-        .map(|v| v == "1")
-        .unwrap_or(false);
     CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
     on
 }
@@ -561,30 +527,6 @@ pub(crate) fn moe_gather_vec4_enabled() -> bool {
         Err(_) => true,
     };
     CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-    v
-}
-
-/// [diag] Returns which MoE sub-dispatch to SKIP for GPU-time attribution
-/// (LUMEN_METAL_MOE_DIAG_SKIP=down→1, =gateup→2, else 0). Produces garbage
-/// output when set; use only with the decode profiler to read GPU timings.
-pub(crate) fn moe_diag_skip() -> u8 {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(255);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur != 255 {
-        return cur;
-    }
-    let v = match std::env::var("LUMEN_METAL_MOE_DIAG_SKIP").ok().as_deref() {
-        Some("down") => 1u8,
-        Some("gateup") => 2u8,
-        Some("shared") => 3u8,
-        Some("gating") => 4u8,
-        Some("router") => 5u8,
-        Some("rtopk") => 6u8,   // skip only the top-k softmax kernel
-        Some("rlogits") => 7u8, // skip only the per-expert logits kernel
-        _ => 0u8,
-    };
-    CACHE.store(v, Ordering::Relaxed);
     v
 }
 

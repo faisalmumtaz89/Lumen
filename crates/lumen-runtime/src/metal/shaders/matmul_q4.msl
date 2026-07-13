@@ -1155,7 +1155,7 @@ kernel void qmv_q4_0_residual(
 // Consumes the f16-scale decode-qmv buffers (repack_q4.rs
 // repack_q4_qmv_decode_f16sc): same sequential-nibble qweights, scales as f16.
 // Bindings/layout/dispatch identical to qmv_q4_0_residual (only scale @4 element
-// type changes). Env LUMEN_METAL_Q4_QMV_DOWN_F16SC=1, default OFF.
+// type changes). Default path.
 // ============================================================================
 kernel void qmv_q4_0_residual_f16sc(
     device const uint32_t* w        [[buffer(0)]],
@@ -1624,7 +1624,7 @@ kernel void qmv_q4_0_rmsnorm(
 // Consumes the f16-scale decode-qmv buffers (repack_q4.rs build_qmv_decode_buffers_f16sc
 // / build_qmv_lmhead_buffers_from_q8_f16sc): same sequential-nibble qweights, scales
 // as f16. Bindings/layout/dispatch identical to qmv_q4_0_rmsnorm (only scale @4
-// element type changes). Env LUMEN_METAL_Q4_LMHEAD_F16SC / LUMEN_METAL_Q4_PROJ_F16SC.
+// element type changes). Default path.
 // ============================================================================
 kernel void qmv_q4_0_rmsnorm_f16sc(
     device const uint32_t* w        [[buffer(0)]],
@@ -1729,7 +1729,7 @@ kernel void qmv_q4_0_rmsnorm_f16sc(
 // (accum.x/.y), issuing TWO half multiply-adds per ALU slot -> ~2x fewer
 // dequant-MAC instructions on the LARGEST matvec pool in decode: the lm_head /
 // output-proj (out=vocab, in=hidden=4096, the single largest weight tensor,
-// ~0.54 GB streamed/token under LUMEN_METAL_Q4_QMV_LMHEAD), dispatched ONCE per
+// ~0.54 GB streamed/token), dispatched ONCE per
 // token.
 //
 // PACKING (exactly equivalent magnitudes to the scalar-half form): x is
@@ -1855,7 +1855,7 @@ kernel void qmv_q4_0_rmsnorm_f16sc_h2math(
 // ============================================================================
 // qmv_q4_0_gate_up_swiglu: MLX-style DUAL-matrix decode GEMV for the fused FFN
 // gate/up + RMSNorm + SwiGLU (replaces rmsnorm_ffn_fused_gate_up_swiglu_q4_0_8row
-// when the decode-qmv buffers are present, env LUMEN_METAL_Q4_QMV_GATEUP=1).
+// when the decode-qmv buffers are present).
 //
 // Computes, per output row r (0..inter_dim):
 //   normed[i] = x[i] * norm_w[i]                       (RMSNorm scale deferred)
@@ -2027,7 +2027,7 @@ kernel void qmv_q4_0_gate_up_swiglu(
 // bandwidth-bound dense FFN gate/up matvec.
 //
 // Bindings/layout/dispatch identical to qmv_q4_0_gate_up_swiglu (only scale @4/@6
-// element type changes). Env LUMEN_METAL_Q4_GATEUP_F16SC=1, default OFF.
+// element type changes). Default path.
 // ============================================================================
 kernel void qmv_q4_0_gate_up_swiglu_f16sc(
     device const uint32_t* w_gate      [[buffer(0)]],

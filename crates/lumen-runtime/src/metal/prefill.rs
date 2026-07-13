@@ -3,7 +3,6 @@
 //! Extracted from mod.rs for modularity.
 //! These are methods on MetalF32Backend that orchestrate the batched prefill pipeline.
 
-use super::graph_reorder;
 use super::{MTLSize, MetalBuffer, MetalF32Backend, MetalPipelines, MetalScratch};
 use crate::error::RuntimeError;
 use crate::metal::ffi::MetalCommandBuffer;
@@ -255,314 +254,110 @@ impl MetalF32Backend {
             layer_views.push(layer_view);
         }
 
-        // ================================================================
-        // whole-prefill outer concurrent encoder
-        // ================================================================
-        //
-        // When `LUMEN_METAL_CONCURRENT_ENCODER_FULL=1` is set AND every layer in this prefill
-        // is outer-encoder eligible, open ONE concurrent compute encoder
-        // right here and thread it through all `num_layers` layers. This
-        // consolidates 32 per-layer concurrent encoders into
-        // 1 outer encoder, eliminating 31 encoder-boundary transitions per
-        // prefill. Cross-layer hazards are expressed via an explicit
-        // resource-scoped `memoryBarrierWithResources:` listing all 11
-        // shared layer-local activation buffers (x_buf, normed_buf, qkv_buf,
-        // q_buf, k_buf, v_buf, attn_out_buf, attn_proj_buf, gate_buf,
-        // up_buf, scores_buf) between consecutive layers. Per-layer KV
-        // cache slots are not in the barrier because they are layer-local
-        // and serialised within the wavefront scheduler's emit-plan.
-        //
-        // Validate mode (`LUMEN_METAL_CONCURRENT_ENCODER_FULL_VALIDATE=1`) forces the outer
-        // encoder to be a SERIAL `new_compute_encoder()` instead of a
-        // concurrent one, so dispatch ordering matches the legacy per-layer
-        // path modulo encoder boundaries. Used to isolate cross-layer
-        // barrier bugs from concurrent-scheduling bugs.
-        //
-        // Eligibility (per-layer): `layer_outer_eligible`. If any
-        // layer is ineligible (MoE, legacy per-layer GDN, deep-profile, etc.),
-        // the outer-encoder path is silently skipped and the legacy
-        // per-layer encoder loop runs.
-        let concurrent_encoder_full = graph_reorder::concurrent_encoder_full_enabled()
-            && graph_reorder::concurrent_encoder_enabled();
-        let serial_validate_full = graph_reorder::concurrent_encoder_full_validate_serial();
-
-        let all_layers_outer_eligible = concurrent_encoder_full
-            && (0..num_layers).all(|l| self.layer_outer_eligible(s, &layer_views[l], batch_size));
-
-        if all_layers_outer_eligible {
-            // fast path: one outer encoder spans all layers.
-            //
-            // Edit 4 — Validate gate: when LUMEN_METAL_CONCURRENT_ENCODER_FULL_VALIDATE=1,
-            // open the outer encoder as a serial `new_compute_encoder()`
-            // so dispatches run in program order (matches legacy serial
-            // semantics). Cross-layer barriers are no-ops in serial mode
-            // (the `emit_cross_layer_barrier` helper short-circuits when
-            // `serial_validate` is true).
-            let outer_enc = if serial_validate_full {
-                cmd.new_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute(": failed to create outer serial validate encoder".into())
-                })?
+        // Existing default path: 32 iterations, per-layer encoders.
+        // Each layer adds ~13 compute encoders. Metal guarantees ordering
+        // between encoders within the same command buffer (implicit
+        // barriers). The scratch guard is held throughout, eliminating
+        // 22 lock/unlock cycles in the inner loop.
+        {
+            // NaN dump (opt-in via `LUMEN_METAL_NAN_DUMP=1`):
+            // commit each layer's CB separately and scan x_buf for NaN
+            // after each layer. Used to pinpoint the first layer that
+            // produces NaN. Default off; production path is the loop
+            // immediately below.
+            let nan_dump = std::env::var("LUMEN_METAL_NAN_DUMP").ok().as_deref() == Some("1");
+            if nan_dump {
+                let hidden_dim = s.hidden_dim;
+                let total = batch_size * hidden_dim;
+                cmd.commit_and_wait();
+                {
+                    let xb = s.batch_x_buf.as_ref().unwrap();
+                    let mut buf = vec![0.0f32; total];
+                    xb.read_f32(&mut buf);
+                    let nans = buf.iter().filter(|v| v.is_nan()).count();
+                    let infs = buf.iter().filter(|v| v.is_infinite()).count();
+                    eprintln!("post-embed batch_size={batch_size} NaN={nans}/{total} Inf={infs}");
+                }
+                for layer in 0..num_layers {
+                    let layer_cmd = helper_new_cb(unretained, false)?;
+                    let mut kv_view = kv.view_mut(layer)?;
+                    self.encode_layer_batched(
+                        &layer_cmd,
+                        layer,
+                        batch_size,
+                        &layer_views[layer],
+                        &mut kv_view,
+                        pipelines,
+                        s,
+                    )?;
+                    kv.commit_view(kv_view)?;
+                    layer_cmd.commit_and_wait();
+                    let xb = s.batch_x_buf.as_ref().unwrap();
+                    let mut buf = vec![0.0f32; total];
+                    xb.read_f32(&mut buf);
+                    let nans = buf.iter().filter(|v| v.is_nan()).count();
+                    let infs = buf.iter().filter(|v| v.is_infinite()).count();
+                    let any_nan = nans > 0;
+                    let first_f = buf.iter().copied().take(4).collect::<Vec<_>>();
+                    eprintln!(
+                        "post-layer {layer:02} NaN={nans}/{total} Inf={infs} first4={first_f:?}{}",
+                        if any_nan { "  <-- NaN ENTERED" } else { "" }
+                    );
+                }
             } else {
-                cmd.new_concurrent_compute_encoder().ok_or_else(|| {
-                    RuntimeError::Compute(": failed to create outer concurrent encoder".into())
-                })?
-            };
+                // DIAG (no-op when LUMEN_METAL_PREFILL_GPUTIME unset): split
+                // the CPU-side encode loop from the GPU commit_and_wait so we
+                // can read true GPU busy time (GPUEndTime-GPUStartTime) and the
+                // CPU encode wall separately. The production path is bit-exact
+                // when the env is absent (single CB, single commit_and_wait).
+                let gputime =
+                    std::env::var("LUMEN_METAL_PREFILL_GPUTIME").ok().as_deref() == Some("1");
 
-            // Resolve the layer-shared activation buffers ONCE so the
-            // per-iteration cross-layer barrier can reference them by
-            // resource scope (cheaper than whole-buffer scope on Apple's
-            // hazard tracker). All these buffers are allocated by
-            // `ensure_batch_buffers` and live for the entire prefill.
-            //
-            // Storing raw pointers to bypass the `s: &mut MetalScratch`
-            // borrow that the per-layer dispatcher needs. The buffers are
-            // alive for the entire prefill (scratch holds them in fields
-            // that are not dropped until the function returns), and we
-            // only use the references to emit cross-layer barriers (Metal
-            // API calls that do not retain). Constructing `&MetalBuffer`
-            // from known-live raw pointers is safe.
-            let x_buf_ptr: *const MetalBuffer = s
-                .batch_x_buf
-                .as_ref()
-                .ok_or_else(|| RuntimeError::Compute(": batch_x_buf missing".into()))?;
-            let normed_buf_ptr: *const MetalBuffer = s
-                .batch_normed_buf
-                .as_ref()
-                .ok_or_else(|| RuntimeError::Compute(": batch_normed_buf missing".into()))?;
-            let qkv_buf_ptr: *const MetalBuffer = s
-                .batch_qkv_buf
-                .as_ref()
-                .ok_or_else(|| RuntimeError::Compute(": batch_qkv_buf missing".into()))?;
-            let q_buf_ptr: *const MetalBuffer = s
-                .batch_q_buf
-                .as_ref()
-                .ok_or_else(|| RuntimeError::Compute(": batch_q_buf missing".into()))?;
-            let k_buf_ptr: *const MetalBuffer = s
-                .batch_k_buf
-                .as_ref()
-                .ok_or_else(|| RuntimeError::Compute(": batch_k_buf missing".into()))?;
-            let v_buf_ptr: *const MetalBuffer = s
-                .batch_v_buf
-                .as_ref()
-                .ok_or_else(|| RuntimeError::Compute(": batch_v_buf missing".into()))?;
-            let attn_out_buf_ptr: *const MetalBuffer = s
-                .batch_attn_out_buf
-                .as_ref()
-                .ok_or_else(|| RuntimeError::Compute(": batch_attn_out_buf missing".into()))?;
-            let attn_proj_buf_ptr: *const MetalBuffer = s
-                .batch_attn_proj_buf
-                .as_ref()
-                .ok_or_else(|| RuntimeError::Compute(": batch_attn_proj_buf missing".into()))?;
-            let gate_buf_ptr: *const MetalBuffer = s
-                .batch_gate_buf
-                .as_ref()
-                .ok_or_else(|| RuntimeError::Compute(": batch_gate_buf missing".into()))?;
-            let up_buf_ptr: *const MetalBuffer = s
-                .batch_up_buf
-                .as_ref()
-                .ok_or_else(|| RuntimeError::Compute(": batch_up_buf missing".into()))?;
-            let scores_buf_ptr: *const MetalBuffer = s
-                .batch_scores_buf
-                .as_ref()
-                .ok_or_else(|| RuntimeError::Compute(": batch_scores_buf missing".into()))?;
-
-            for layer in 0..num_layers {
-                let mut kv_view = kv.view_mut(layer)?;
-
-                // Cross-layer barrier on ALL shared layer-local buffers.
-                // The per-layer wavefront scheduler emits within-layer
-                // barriers, but the cross-layer state is the union of all
-                // hazards on buffers carried across layer boundaries:
-                //   x_buf (residual carrier, WAR)
-                //   normed_buf, qkv_buf, q_buf, k_buf, v_buf, attn_out_buf,
-                //     attn_proj_buf, gate_buf, up_buf, scores_buf (WAW + WAR)
-                //
-                // Use resource-scoped barriers on each carried buffer
-                // (cheaper than whole-buffer scope: Apple's hazard tracker
-                // only serialises against the listed resources, leaving
-                // unrelated in-flight work free to retire). In legacy
-                // each layer opened its own encoder and
-                // the encoder-end / encoder-begin transition served as
-                // this implicit serialisation point; expresses it
-                // explicitly here.
-                //
-                // Skip layer 0: embed wrote x_buf via its own encoder
-                // (`encode_embed_batched` opens + closes its own encoder),
-                // and Metal's between-encoder boundary already serialised
-                // that write.
-                //
-                // In serial validate mode (`LUMEN_METAL_CONCURRENT_ENCODER_FULL_VALIDATE=1`),
-                // dispatches execute in program order even within a single
-                // encoder, so the barrier is a no-op for correctness but
-                // is emitted anyway for cache-coherence robustness.
-                if layer > 0 {
-                    // SAFETY: all the *_ptr values point to MetalBuffers
-                    // owned by `s` (MetalScratch), which is borrowed
-                    // mutably for the entire `for` loop. The buffers are
-                    // not moved or dropped during the loop.
-                    let bufs: [&MetalBuffer; 11] = unsafe {
-                        [
-                            &*x_buf_ptr,
-                            &*normed_buf_ptr,
-                            &*qkv_buf_ptr,
-                            &*q_buf_ptr,
-                            &*k_buf_ptr,
-                            &*v_buf_ptr,
-                            &*attn_out_buf_ptr,
-                            &*attn_proj_buf_ptr,
-                            &*gate_buf_ptr,
-                            &*up_buf_ptr,
-                            &*scores_buf_ptr,
-                        ]
-                    };
-                    outer_enc.memory_barrier_with_resources(&bufs);
+                let enc_start = if gputime {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                for layer in 0..num_layers {
+                    let mut kv_view = kv.view_mut(layer)?;
+                    self.encode_layer_batched(
+                        &cmd,
+                        layer,
+                        batch_size,
+                        &layer_views[layer],
+                        &mut kv_view,
+                        pipelines,
+                        s,
+                    )?;
+                    kv.commit_view(kv_view)?;
                 }
 
-                self.encode_layer_batched_into(
-                    &cmd,
-                    &outer_enc,
-                    layer,
-                    batch_size,
-                    &layer_views[layer],
-                    &mut kv_view,
-                    pipelines,
-                    s,
-                )?;
-
-                kv.commit_view(kv_view)?;
-            }
-
-            outer_enc.end_encoding();
-            // concurrent_encoder_full path uses the single `cmd` from the outset (no multi-CB
-            // because the outer encoder spans all layers). Commit and wait
-            // here so the fall-through below skips the path.
-            cmd.commit_and_wait();
-        } else {
-            // Existing default path: 32 iterations, per-layer encoders.
-            // Each layer adds ~13 compute encoders. Metal guarantees ordering
-            // between encoders within the same command buffer (implicit
-            // barriers). The scratch guard is held throughout, eliminating
-            // 22 lock/unlock cycles in the inner loop.
-            {
-                // NaN dump (opt-in via `LUMEN_METAL_NAN_DUMP=1`):
-                // commit each layer's CB separately and scan x_buf for NaN
-                // after each layer. Used to pinpoint the first layer that
-                // produces NaN. Default off; production path is the loop
-                // immediately below.
-                let nan_dump = std::env::var("LUMEN_METAL_NAN_DUMP").ok().as_deref() == Some("1");
-                if nan_dump {
-                    let hidden_dim = s.hidden_dim;
-                    let total = batch_size * hidden_dim;
+                if let Some(t0) = enc_start {
+                    let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    let commit_t0 = std::time::Instant::now();
                     cmd.commit_and_wait();
-                    {
-                        let xb = s.batch_x_buf.as_ref().unwrap();
-                        let mut buf = vec![0.0f32; total];
-                        xb.read_f32(&mut buf);
-                        let nans = buf.iter().filter(|v| v.is_nan()).count();
-                        let infs = buf.iter().filter(|v| v.is_infinite()).count();
-                        eprintln!(
-                            "post-embed batch_size={batch_size} NaN={nans}/{total} Inf={infs}"
-                        );
-                    }
-                    for layer in 0..num_layers {
-                        let layer_cmd = helper_new_cb(unretained, false)?;
-                        let mut kv_view = kv.view_mut(layer)?;
-                        self.encode_layer_batched(
-                            &layer_cmd,
-                            layer,
-                            batch_size,
-                            &layer_views[layer],
-                            &mut kv_view,
-                            pipelines,
-                            s,
-                        )?;
-                        kv.commit_view(kv_view)?;
-                        layer_cmd.commit_and_wait();
-                        let xb = s.batch_x_buf.as_ref().unwrap();
-                        let mut buf = vec![0.0f32; total];
-                        xb.read_f32(&mut buf);
-                        let nans = buf.iter().filter(|v| v.is_nan()).count();
-                        let infs = buf.iter().filter(|v| v.is_infinite()).count();
-                        let any_nan = nans > 0;
-                        let first_f = buf.iter().copied().take(4).collect::<Vec<_>>();
-                        eprintln!(
-                            "post-layer {layer:02} NaN={nans}/{total} Inf={infs} first4={first_f:?}{}",
-                            if any_nan { "  <-- NaN ENTERED" } else { "" }
-                        );
-                    }
+                    let commit_ms = commit_t0.elapsed().as_secs_f64() * 1000.0;
+                    let gpu_ms = cmd.gpu_elapsed_secs() * 1000.0;
+                    eprintln!(
+                        "[prefill-gputime] batch={batch_size} cpu_encode={encode_ms:.2}ms \
+                         commit_wait={commit_ms:.2}ms gpu_busy={gpu_ms:.2}ms \
+                         gpu_util={:.1}%",
+                        100.0 * gpu_ms / (encode_ms + commit_ms)
+                    );
                 } else {
-                    // DIAG (no-op when LUMEN_METAL_PREFILL_GPUTIME unset): split
-                    // the CPU-side encode loop from the GPU commit_and_wait so we
-                    // can read true GPU busy time (GPUEndTime-GPUStartTime) and the
-                    // CPU encode wall separately. The production path is bit-exact
-                    // when the env is absent (single CB, single commit_and_wait).
-                    let gputime =
-                        std::env::var("LUMEN_METAL_PREFILL_GPUTIME").ok().as_deref() == Some("1");
-
-                    let enc_start = if gputime {
-                        Some(std::time::Instant::now())
-                    } else {
-                        None
-                    };
-                    for layer in 0..num_layers {
-                        let mut kv_view = kv.view_mut(layer)?;
-                        self.encode_layer_batched(
-                            &cmd,
-                            layer,
-                            batch_size,
-                            &layer_views[layer],
-                            &mut kv_view,
-                            pipelines,
-                            s,
-                        )?;
-                        kv.commit_view(kv_view)?;
-                    }
-
-                    if let Some(t0) = enc_start {
-                        let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                        let commit_t0 = std::time::Instant::now();
-                        cmd.commit_and_wait();
-                        let commit_ms = commit_t0.elapsed().as_secs_f64() * 1000.0;
-                        let gpu_ms = cmd.gpu_elapsed_secs() * 1000.0;
-                        eprintln!(
-                            "[prefill-gputime] batch={batch_size} cpu_encode={encode_ms:.2}ms \
-                             commit_wait={commit_ms:.2}ms gpu_busy={gpu_ms:.2}ms \
-                             gpu_util={:.1}%",
-                            100.0 * gpu_ms / (encode_ms + commit_ms)
-                        );
-                    } else {
-                        cmd.commit_and_wait();
-                    }
+                    cmd.commit_and_wait();
                 }
             }
         }
 
-        // both prefill paths (the `concurrent_encoder_full` branch above, and
-        // the default-with-optional-multi-CB below) now commit + wait
-        // before returning. `cmd` and any auxiliary CBs in `held_cbs` are
-        // dropped when their scope exits — either inside the concurrent_encoder_full
-        // branch (where `cmd` is moved into `commit_and_wait`) or inside
-        // the multi-CB / single-CB sub-branch of the else (where
+        // The prefill path commits + waits before returning. `cmd` and any
+        // auxiliary CBs in `held_cbs` are dropped when their scope exits (where
         // `current_cb` is consumed by `commit_and_wait`).
         //
         // Profile mode: record GPU time for the final in-flight section
         // (the one that did not get a follow-up `new_compute_encoder` call
         // to split it). No-op when profiling is OFF.
         super::profile::record_section_end();
-
-        // DIAG (K2, no-op when LUMEN_METAL_PROFILE_GDN unset): print the
-        // accumulated per-sub-dispatch GDN deep-profile from the SERVER path
-        // (the CLI prints it via print_profile(); the server never calls that).
-        // Produces evidence only; zero behaviour change when the env is absent.
-        if super::profile::is_gdn_deep_enabled() {
-            // Commit-all-wait-once census: drain the deferred split
-            // CBs — wait once on the last and read every CB's GPU wall — BEFORE
-            // printing, so the GPU-time table reflects back-to-back serial
-            // service time without the per-CB-wait idle confound. No-op in
-            // legacy (non-defer) mode where each CB was already waited inline.
-            super::ffi::drain_deferred_cbs();
-            super::profile::print_report();
-        }
 
         // LayerViews are dropped here, after GPU has finished.
         // This is the key safety guarantee: backing memory was alive

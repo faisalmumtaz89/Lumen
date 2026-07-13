@@ -256,10 +256,6 @@ impl ComputeBackend for MetalF32Backend {
             up_buf: make_buf(inter_dim)?,
             down_buf: make_buf(hidden_dim)?,
             logits_buf: make_buf(vocab_size)?,
-            // Option-B async-commit double-buffer: allocated lazily only when the
-            // flag is on (the default synchronous path leaves it None).
-            logits_buf_b: None,
-            async_inflight_logits_b: false,
             argmax_result_buf: self.device.new_buffer(4).ok_or_else(|| {
                 RuntimeError::Compute("Failed to allocate argmax result buffer (4 bytes)".into())
             })?,
@@ -463,11 +459,6 @@ impl ComputeBackend for MetalF32Backend {
             // `preload_weights_gpu_resident` builds them when env-gated ON.
             repacked_ffn_down: Vec::new(),
             repacked_ffn_gate_up: Vec::new(),
-
-            // repacked Q4_0 hot-weight storage. Empty until
-            // `preload_weights_gpu_resident` builds them when env-gated ON.
-            repacked_ffn_down_q4: Vec::new(),
-            repacked_ffn_gate_up_q4: Vec::new(),
             qmv_down_qw: Vec::new(),
             qmv_down_scales: Vec::new(),
             qmv_gdn_qkv_qw: Vec::new(),
@@ -478,8 +469,8 @@ impl ComputeBackend for MetalF32Backend {
             qmv_attn_wq_scales: Vec::new(),
             qmv_attn_wo_qw: Vec::new(),
             qmv_attn_wo_scales: Vec::new(),
-            // Full-attn K/V decode-qmv buffers (LUMEN_METAL_Q4_QMV_KV). Empty
-            // until `preload_weights_gpu_resident` builds them when env-gated ON.
+            // Full-attn K/V decode-qmv buffers. Empty until
+            // `preload_weights_gpu_resident` builds them (default).
             qmv_attn_wk_qw: Vec::new(),
             qmv_attn_wk_scales: Vec::new(),
             qmv_attn_wv_qw: Vec::new(),
@@ -487,8 +478,8 @@ impl ComputeBackend for MetalF32Backend {
             // GDN ssm_out Q8->Q4 native-NR2 requant buffers
             // (LUMEN_METAL_Q4_SSMOUT_NR2). Empty until built when env-gated ON.
             q4nr2_ssm_out: Vec::new(),
-            // Dense FFN gate/up dual-matrix decode-qmv buffers
-            // (LUMEN_METAL_Q4_QMV_GATEUP). Empty until built when env-gated ON.
+            // Dense FFN gate/up dual-matrix decode-qmv buffers.
+            // Empty until built (default).
             qmv_ffn_gate_qw: Vec::new(),
             qmv_ffn_gate_scales: Vec::new(),
             qmv_ffn_up_qw: Vec::new(),
@@ -497,8 +488,8 @@ impl ComputeBackend for MetalF32Backend {
             qmv_ffn_gate_up_ls_scales: Vec::new(),
             qmv_zero_residual_buf: None,
             // GLOBAL Q4 lm_head decode-qmv buffers. None until
-            // `preload_weights_gpu_resident` builds them when
-            // `LUMEN_METAL_Q4_QMV_LMHEAD=1` is set at load time.
+            // `preload_weights_gpu_resident` builds them at load time (default,
+            // for a non-tied Q8_0 output_proj).
             qmv_lmhead_qw: None,
             qmv_lmhead_scales: None,
 
@@ -3170,26 +3161,6 @@ impl ComputeBackend for MetalF32Backend {
         // Drain autoreleased Metal objects at every token
         // boundary. This is the dominant leak site (~120 MB/h per a prior leak attribution).
         autoreleasepool(|| self.decode_token_single_cb(token_id, weights, kv))
-    }
-
-    fn supports_async_decode(&self) -> bool {
-        // Option B (deferred-async-commit) sampled-decode path, default OFF.
-        use std::sync::OnceLock;
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var("LUMEN_METAL_DECODE_ASYNC_COMMIT").as_deref() == Ok("1"))
-    }
-
-    fn decode_token_async(
-        &self,
-        token_id: u32,
-        weights: &dyn WeightProvider,
-        kv: &mut KvCache,
-    ) -> Result<Logits, RuntimeError> {
-        autoreleasepool(|| self.decode_token_single_cb_async(token_id, weights, kv))
-    }
-
-    fn decode_flush_async(&self) -> Result<Logits, RuntimeError> {
-        autoreleasepool(|| MetalF32Backend::decode_flush_async(self))
     }
 
     fn decode_token_greedy(

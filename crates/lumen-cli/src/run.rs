@@ -1692,19 +1692,6 @@ fn print_generated_text(
             .copied()
             .filter(|t| !stop_ids.contains(t))
             .collect();
-        // Diagnostic (default OFF): dump raw generated token ids plus the
-        // per-id decoded byte string, so a model-decode degenerate token
-        // (e.g. an extra "lication" id) is distinguishable from any
-        // detokenizer effect. The streaming detok is a pure per-id byte
-        // concat, so a doubled sub-word here means the model emitted it.
-        if std::env::var("LUMEN_DUMP_TOKEN_IDS").is_ok() {
-            eprintln!("[DUMP_TOKEN_IDS] count={}", clean.len());
-            eprintln!("[DUMP_TOKEN_IDS] ids={clean:?}");
-            for &id in &clean {
-                let frag = String::from_utf8_lossy(&tok.decode_bytes(&[id])).to_string();
-                eprintln!("[DUMP_TOKEN_IDS] id={id} frag={frag:?}");
-            }
-        }
         let text = tok.decode(&clean);
         if !enable_thinking {
             // F8: strip `<tool_call>...</tool_call>` blocks from stdout via the

@@ -404,36 +404,6 @@ pub trait ComputeBackend: Send + Sync {
         ))
     }
 
-    /// [Option B] Deferred-async-commit decode (Metal only; default OFF flag).
-    /// Commits this token's CB async and returns the PREVIOUS token's logits
-    /// (1-deep pipeline). Returns empty logits on the priming call. Backends that
-    /// don't implement it report `false` from `supports_async_decode` so the
-    /// engine never calls it. Advances `kv.seq_len()` internally.
-    fn decode_token_async(
-        &self,
-        _token_id: u32,
-        _weights: &dyn WeightProvider,
-        _kv: &mut KvCache,
-    ) -> Result<Logits, RuntimeError> {
-        Err(RuntimeError::Compute(
-            "async-commit decode not supported".into(),
-        ))
-    }
-
-    /// [Option B] Flush the final in-flight async-commit CB and return its
-    /// logits. Paired with `decode_token_async`; no-op (empty) by default.
-    fn decode_flush_async(&self) -> Result<Logits, RuntimeError> {
-        Ok(Logits { data: Vec::new() })
-    }
-
-    /// Whether this backend's `decode_token_async` path is active (the
-    /// `LUMEN_METAL_DECODE_ASYNC_COMMIT=1` flag is set AND the backend supports
-    /// it). Default false. The engine consults this to opt into the 1-deep async
-    /// sampled-decode driver.
-    fn supports_async_decode(&self) -> bool {
-        false
-    }
-
     /// GPU-side greedy decode returning token ID directly.
     ///
     /// # KV seq_len contract

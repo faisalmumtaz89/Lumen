@@ -2298,19 +2298,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
 
     // ---- Stage 2: host gather-sort by expert. ONE DtoH sync. ----
     // Read expert_ids [batch, num_experts] (first top_k valid per row).
-    // Diagnostic (no-op unless LUMEN_MOE_SORT_TIMING=1): wall-clock cost of the
-    // DtoH sync + host counting-sort + HtoD, accumulated across all MoE layers,
-    // to quantify whether the host round-trip is a Wave-3 bottleneck.
-    let sort_timing = {
-        use std::sync::OnceLock;
-        static T: OnceLock<bool> = OnceLock::new();
-        *T.get_or_init(|| std::env::var("LUMEN_MOE_SORT_TIMING").as_deref() == Ok("1"))
-    };
-    let sort_t0 = if sort_timing {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
     let (col_expert_host, col_src_tok_host, dst_to_col_host, expert_bounds_host) = {
         let g = scratch.prefill_grouped.as_ref().unwrap();
         // dtoh_copy syncs the stream, so all upstream kernels have completed.
@@ -2505,23 +2492,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
             }
         }
     }
-    if let Some(t0) = sort_t0 {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static ACC_US: AtomicU64 = AtomicU64::new(0);
-        static CALLS: AtomicU64 = AtomicU64::new(0);
-        let us = t0.elapsed().as_micros() as u64;
-        let total = ACC_US.fetch_add(us, Ordering::Relaxed) + us;
-        let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
-        // Print a running total every 40 calls (≈ one prefill's worth of MoE layers).
-        if n % 40 == 0 {
-            eprintln!(
-                "[MOE-SORT-TIMING] calls={n} cumulative_ms={:.3} (DtoH sync + host counting-sort \
-                 + HtoD across MoE layers)",
-                total as f64 / 1000.0
-            );
-        }
-    }
-
     // ---- Stage 3: grouped gate+up+SwiGLU. ----
     // M-tiled variant (one CTA per expert × column-tile × row-tile,
     // weight read once and reused across MG_MT=4 columns) when enabled AND the

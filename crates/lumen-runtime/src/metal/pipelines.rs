@@ -9,23 +9,10 @@ use crate::error::RuntimeError;
 impl MetalF32Backend {
     /// Compile all Metal shader pipelines.
     pub(super) fn compile_pipelines(&self) -> Result<MetalPipelines, RuntimeError> {
-        // Diagnostic-only: when `LUMEN_METAL_COMPILE_PROFILE=1` is set, print the
-        // wall-clock split between MSL library compilation
-        // (`newLibraryWithSource:`) and compute-pipeline-state creation (the
-        // lazy SASS codegen across all kernels). No-op when the env var is unset,
-        // so this does not alter any runtime behavior or output.
-        let compile_profile = std::env::var("LUMEN_METAL_COMPILE_PROFILE")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        let t_lib_start = std::time::Instant::now();
-
         let lib = self
             .device
             .new_library_with_source(METAL_SHADER_SOURCE)
             .map_err(RuntimeError::Compute)?;
-
-        let lib_elapsed = t_lib_start.elapsed();
-        let t_pso_start = std::time::Instant::now();
 
         macro_rules! make_pipeline {
             ($name:expr) => {{
@@ -104,7 +91,6 @@ impl MetalF32Backend {
             write_kv_cache: make_pipeline!("write_kv_cache"),
             fused_rope_kv_write: make_pipeline!("fused_rope_kv_write"),
             fused_rope_kv_mha: make_pipeline!("fused_rope_kv_mha"),
-            fused_rope_kv_mha_tgscores: make_pipeline!("fused_rope_kv_mha_tgscores"),
             fused_rope_neox_kv_write: lib
                 .get_function("fused_rope_neox_kv_write")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
@@ -290,20 +276,6 @@ impl MetalF32Backend {
                 "dequant_tiled_matmul_q4_0_gate_up_swiglu_fused"
             ),
 
-            // packed-layout Q4_0 kernels (consume runtime-repacked SoA buffers).
-            dequant_tiled_matmul_q4_0_k64_residual_batched_packed: make_bc_pipeline!(
-                "dequant_tiled_matmul_q4_0_k64_residual_batched_packed"
-            ),
-            dequant_tiled_matmul_q4_0_k64_residual_batched_packed_aligned: make_aligned_pipeline!(
-                "dequant_tiled_matmul_q4_0_k64_residual_batched_packed"
-            ),
-            dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed: make_bc_pipeline!(
-                "dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed"
-            ),
-            dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed_aligned: make_aligned_pipeline!(
-                "dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed"
-            ),
-
             // ggml-metal ported Q8_0 GEMM (env-var gated)
 
             // Function-constant-specialized aligned GEMM variants (no boundary checks)
@@ -356,9 +328,6 @@ impl MetalF32Backend {
             bf16_matmul_gate_up_swiglu_fused_nr4_aligned: make_aligned_pipeline!(
                 "bf16_matmul_gate_up_swiglu_fused_nr4"
             ),
-            // BF16 K64 Split-K (FC_BC_*=true and FC_BC_*=false variants).
-            bf16_matmul_k64_splitk: make_bc_pipeline!("bf16_matmul_k64_splitk"),
-            bf16_matmul_k64_splitk_aligned: make_aligned_pipeline!("bf16_matmul_k64_splitk"),
 
             // Batched prefill kernels
             tiled_matmul_f32: make_pipeline!("tiled_matmul_f32"),
@@ -736,12 +705,6 @@ impl MetalF32Backend {
             l2_normalize_qk_strided: lib
                 .get_function("l2_normalize_qk_strided")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            conv1d_silu_l2_qk_fused: lib
-                .get_function("conv1d_silu_l2_qk_fused")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            conv1d_silu_vrange: lib
-                .get_function("conv1d_silu_vrange")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             gdn_compute_gates_batched: lib
                 .get_function("gdn_compute_gates_batched")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
@@ -752,16 +715,6 @@ impl MetalF32Backend {
                 .get_function("dequant_batched_matvec_q8_0_dual")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
         };
-
-        if compile_profile {
-            let pso_elapsed = t_pso_start.elapsed();
-            eprintln!(
-                "[LUMEN_METAL_COMPILE_PROFILE] newLibraryWithSource={:.3}s pipeline_state_creation={:.3}s total_shader_compile={:.3}s",
-                lib_elapsed.as_secs_f64(),
-                pso_elapsed.as_secs_f64(),
-                (lib_elapsed + pso_elapsed).as_secs_f64(),
-            );
-        }
 
         Ok(pipelines)
     }

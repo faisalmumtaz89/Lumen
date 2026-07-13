@@ -981,8 +981,8 @@ impl MetalF32Backend {
             }
         }
 
-        // MLX-style Q4_0 FFN-down decode-qmv repack (env LUMEN_METAL_Q4_QMV_DOWN=1,
-        // default OFF). Builds per-layer sequential-nibble qweights + f32 scales for
+        // MLX-style Q4_0 FFN-down decode-qmv repack (default). Builds per-layer
+        // sequential-nibble qweights + f32 scales for
         // the qmv_q4_0_residual decode kernel; absent => NR2 fallback. Requires
         // inter_dim % 512 == 0 and hidden_dim % 8 == 0 (Qwen3.5-9B: 12288, 4096 OK).
         if crate::metal::q4_fast_decode_enabled() {
@@ -990,7 +990,7 @@ impl MetalF32Backend {
             let inter_dim_u = s.inter_dim;
             let mut qw_vecs: Vec<Option<MetalBuffer>> = Vec::with_capacity(num_layers);
             let mut sc_vecs: Vec<Option<MetalBuffer>> = Vec::with_capacity(num_layers);
-            // F16-scales FFN-down (env LUMEN_METAL_Q4_QMV_DOWN_F16SC=1): build the
+            // F16-scales FFN-down (default): build the
             // scale buffer as f16 (2 B/block) instead of f32 (4 B) for the f16sc
             // kernel. Same sequential-nibble qweights either way. Only valid when
             // the f16sc pipeline compiled; otherwise stay on the f32 builder so the
@@ -1051,8 +1051,8 @@ impl MetalF32Backend {
             s.qmv_down_scales = sc_vecs;
         }
 
-        // MLX-style Q4_0 GDN qkv-projection decode-qmv repack (env
-        // LUMEN_METAL_Q4_QMV_PROJ=1, default OFF). Builds per-GDN-layer
+        // MLX-style Q4_0 GDN qkv-projection decode-qmv repack (default).
+        // Builds per-GDN-layer
         // sequential-nibble qweights + f32 scales for the `qmv_q4_0_rmsnorm`
         // kernel (fused RMSNorm + matvec); absent => the existing NR2 fused path.
         //
@@ -1080,7 +1080,7 @@ impl MetalF32Backend {
             // Q4_0 bytes per output row for in_dim = hidden_dim (2B scale + 16B nibbles
             // per 32-element block). hidden % 32 is implied by hidden % 512 == 0.
             let q4_row_bytes = (hidden_dim_u / 32) * 18;
-            // F16-scales GDN QKV-in-proj + attn_gate (env LUMEN_METAL_Q4_PROJ_F16SC=1):
+            // F16-scales GDN QKV-in-proj + attn_gate (default):
             // build both decode-qmv scale buffers as f16 (2 B/block) instead of f32
             // (4 B). Only when the f16sc kernel compiled; otherwise stay on the f32
             // builder so the GDN dispatch falls back cleanly to the f32-scale
@@ -1344,13 +1344,12 @@ impl MetalF32Backend {
             }
         }
 
-        // MLX-style Q4 full-attn K/V decode-qmv repack (env LUMEN_METAL_Q4_QMV_KV=1,
-        // default OFF). K (`st.wk`) and V (`st.wv`) are Q4_0 [kv_dim, hidden_dim].
+        // MLX-style Q4 full-attn K/V decode-qmv repack (default). K (`st.wk`) and V
+        // (`st.wv`) are Q4_0 [kv_dim, hidden_dim].
         // Both read the SAME pre-norm hidden as Q (rmsnorm-fused) -> the
         // `qmv_q4_0_rmsnorm` kernel (same as the Q+gate fast path). in_dim = hidden
         // (%512), out = kv_dim from byte length (%8). Indexed by `layer_idx`
         // (0..num_layers; None for GDN layers, matching the wq/wo convention).
-        // Independent of LUMEN_METAL_Q4_QMV_PROJ so it can be A/B'd alone.
         if crate::metal::q4_fast_decode_enabled() {
             let hidden_dim_u = s.hidden_dim;
             let num_layers = s.cached_layer_meta.len();
@@ -1449,8 +1448,8 @@ impl MetalF32Backend {
             s.qmv_attn_wv_scales = wv_sc_vecs;
         }
 
-        // MLX-style Q4 lm_head (output projection) decode-qmv repack (env
-        // LUMEN_METAL_Q4_QMV_LMHEAD=1, default OFF). MLX's 4-bit model quantizes
+        // MLX-style Q4 lm_head (output projection) decode-qmv repack (default).
+        // MLX's 4-bit model quantizes
         // the lm_head to 4-bit; Lumen ships it as Q8_0 (~1080 MB, ~13% of decode).
         // This re-quantizes the Q8_0 output_proj -> Q4_0 at load time and builds
         // the GLOBAL (single, non-per-layer) sequential-nibble qweights + f32
@@ -1472,7 +1471,7 @@ impl MetalF32Backend {
                 0
             };
             let mut built = false;
-            // F16-scales lm_head (env LUMEN_METAL_Q4_LMHEAD_F16SC=1): re-quant the Q8
+            // F16-scales lm_head (default): re-quant the Q8
             // output_proj to Q4 but emit the per-block scale as f16 (2 B/block) for the
             // f16sc kernel. Only when the f16sc pipeline compiled; otherwise the f32
             // builder so the lm_head dispatch falls back cleanly to qmv_q4_0_rmsnorm.
@@ -1623,8 +1622,8 @@ impl MetalF32Backend {
             s.q4nr2_ssm_out = nr2_vecs;
         }
 
-        // MLX-style Q4_0 DENSE FFN gate/up dual-matrix decode-qmv repack (env
-        // LUMEN_METAL_Q4_QMV_GATEUP=1, default OFF). Builds per-layer SEPARATE
+        // MLX-style Q4_0 DENSE FFN gate/up dual-matrix decode-qmv repack (default).
+        // Builds per-layer SEPARATE
         // sequential-nibble qweights + f32 scales for BOTH gate (`st.w_gate`)
         // and up (`st.w_up`), consumed together by the `qmv_q4_0_gate_up_swiglu`
         // dual-matrix kernel (fused RMSNorm + SwiGLU). Absent / partial => the
@@ -1648,7 +1647,7 @@ impl MetalF32Backend {
             // Q4_0 bytes per output row for in_dim = hidden_dim.
             let q4_row_bytes = (hidden_dim_u / 32) * 18;
             let expected_len = inter_dim_u * q4_row_bytes;
-            // F16-scales dense FFN gate/up (env LUMEN_METAL_Q4_GATEUP_F16SC=1): build
+            // F16-scales dense FFN gate/up (default): build
             // BOTH gate and up scale buffers as f16 (2 B/block) instead of f32 (4 B)
             // for the f16sc kernel. Only when the f16sc pipeline compiled; otherwise
             // stay on the f32 builder so the dispatch falls back cleanly to the
@@ -1813,128 +1812,6 @@ impl MetalF32Backend {
             }
             s.qmv_ffn_gate_up_ls_qw = ls_qw_vecs;
             s.qmv_ffn_gate_up_ls_scales = ls_sc_vecs;
-        }
-
-        // Q4_0 hot-weight repack pass.
-        //
-        // Same pattern as the Q8 block above. Allocates `MTLBuffer`s
-        // holding hot Q4_0 FFN tensors in a Metal-friendly stripe SoA layout
-        // (see `metal/repack_q4.rs`). The packed kernels in
-        // `shaders/gemm_q4.msl` (`*_packed`) consume these. The original
-        // buffers + AoS kernels are preserved unchanged as a fallback path.
-        //
-        // VRAM cost (per layer, Qwen3.5-9B Q4):
-        //   FFN-down:   ~25 MB (same as raw Q4, byte count preserved)
-        //   Gate+Up:    ~50 MB (2 × 25 MB, paired interleaved)
-        //
-        // Across 32 layers: ~0.8 GB FFN-down + ~1.6 GB gate+up = ~2.4 GB
-        // additional VRAM. M3 Ultra 96 GB headroom comfortably accomodates
-        // this; for smaller machines, the env gate keeps it off by default.
-        {
-            use super::graph_reorder as gr;
-            let want_repack = gr::q4_repacked_enabled();
-            let want_ffn_down = gr::q4_repacked_ffn_down_enabled();
-            let want_gate_up = gr::q4_repacked_gate_up_enabled();
-            if want_repack && (want_ffn_down || want_gate_up) {
-                let hidden_dim_u = s.hidden_dim;
-                let inter_dim_u = s.inter_dim;
-
-                let mut ffn_down_vecs: Vec<Option<MetalBuffer>> = Vec::with_capacity(num_layers);
-                let mut gate_up_vecs: Vec<Option<MetalBuffer>> = Vec::with_capacity(num_layers);
-
-                let mut down_ok_count: usize = 0;
-                let mut gate_up_ok_count: usize = 0;
-
-                for layer in 0..num_layers {
-                    let lv = weights.get_layer_raw(layer).map_err(|e| {
-                        RuntimeError::Compute(format!(
-                            " Q4 repack: failed to get layer {}: {}",
-                            layer, e
-                        ))
-                    })?;
-                    let st = &lv.subtensors;
-
-                    // FFN-down: target shape [hidden_dim, inter_dim] Q4_0
-                    //   N = hidden_dim (output rows), K = inter_dim
-                    //   Qwen3.5-9B: N=4096, K=12288 — both multiples of 32.
-                    let ffn_down_buf: Option<MetalBuffer> = if want_ffn_down
-                        && st.w_down.quant == QuantScheme::Q4_0
-                        && hidden_dim_u % 32 == 0
-                        && inter_dim_u % 32 == 0
-                        && st.w_down.length > 0
-                    {
-                        let src = lv.subtensor_bytes(&st.w_down).map_err(|e| {
-                            RuntimeError::Compute(format!(
-                                " Q4 repack: failed to read w_down at layer {}: {}",
-                                layer, e
-                            ))
-                        })?;
-                        match repack_q4::build_repacked_buffer_single(
-                            &self.device,
-                            src,
-                            hidden_dim_u,
-                            inter_dim_u,
-                        ) {
-                            Ok(buf) => {
-                                down_ok_count += 1;
-                                Some(buf)
-                            }
-                            Err(_) => None,
-                        }
-                    } else {
-                        None
-                    };
-                    ffn_down_vecs.push(ffn_down_buf);
-
-                    // Gate+Up pair: target shape [inter_dim, hidden_dim] Q4_0 each.
-                    //   N = inter_dim, K = hidden_dim. Both gate AND up must be Q4.
-                    //   Qwen3.5-9B: N=12288, K=4096 — both multiples of 32.
-                    let gate_up_buf: Option<MetalBuffer> = if want_gate_up
-                        && st.w_gate.quant == QuantScheme::Q4_0
-                        && st.w_up.quant == QuantScheme::Q4_0
-                        && inter_dim_u % 32 == 0
-                        && hidden_dim_u % 32 == 0
-                        && st.w_gate.length > 0
-                        && st.w_up.length > 0
-                        && st.w_gate.length == st.w_up.length
-                    {
-                        let src_g = lv.subtensor_bytes(&st.w_gate).map_err(|e| {
-                            RuntimeError::Compute(format!(
-                                " Q4 repack: failed to read w_gate at layer {}: {}",
-                                layer, e
-                            ))
-                        })?;
-                        let src_u = lv.subtensor_bytes(&st.w_up).map_err(|e| {
-                            RuntimeError::Compute(format!(
-                                " Q4 repack: failed to read w_up at layer {}: {}",
-                                layer, e
-                            ))
-                        })?;
-                        match repack_q4::build_repacked_buffer_pair(
-                            &self.device,
-                            src_g,
-                            src_u,
-                            inter_dim_u,
-                            hidden_dim_u,
-                        ) {
-                            Ok(buf) => {
-                                gate_up_ok_count += 1;
-                                Some(buf)
-                            }
-                            Err(_) => None,
-                        }
-                    } else {
-                        None
-                    };
-                    gate_up_vecs.push(gate_up_buf);
-                }
-
-                s.repacked_ffn_down_q4 = ffn_down_vecs;
-                s.repacked_ffn_gate_up_q4 = gate_up_vecs;
-
-                // Diagnostic counters (silenced by default; use env LUMEN_METAL_LOG to enable).
-                let _ = (down_ok_count, gate_up_ok_count);
-            }
         }
 
         // ====================================================================

@@ -924,38 +924,17 @@ impl MetalCommandBuffer {
         // Close the in-flight CB. The encoder has already had end_encoding()
         // called by the prior call site.
         //
-        // DEFER MODE (LUMEN_METAL_PROFILE_GDN_DEFER=1): commit
-        // WITHOUT waiting. Metal executes CBs on one queue in FIFO commit
-        // order, so the next CB's reads see this CB's writes (ordering/RAW
-        // correctness preserved) — but no per-CB GPU-idle is injected. Retain
-        // the CB and register its ptr for a single deferred GPU-time read at
-        // prefill end. This removes the bogus drain/refill bubble that the
-        // legacy per-CB wait charged to dependency-tail kernels (the ssm_out
-        // 40ms artifact). `drain_deferred_cbs` (called at prefill end) waits
-        // once and reads every CB's GPUEndTime-GPUStartTime.
-        //
-        // LEGACY MODE (LUMEN_METAL_PROFILE_GDN=1 without DEFER): commit + wait
-        // each CB, read its GPU wall immediately. Kept for A/B of the method.
-        if super::profile::is_defer_enabled() {
-            // Commit (no wait). Transfer the wrapper's existing +1 reference to
-            // the deferred registry (do NOT release here); `drain_deferred_cbs`
-            // reads its GPU time and releases it after the single final wait.
-            unsafe {
-                msg_send_0_raw(cur, cached_sel::commit());
-            }
-            super::profile::register_deferred_cb(cur as usize);
-            super::profile::record_section_end();
-        } else {
-            unsafe {
-                msg_send_0_raw(cur, cached_sel::commit());
-                msg_send_0_raw(cur, cached_sel::wait_until_completed());
-                let start = msg_send_0_f64(cur, cached_sel::gpu_start_time());
-                let end = msg_send_0_f64(cur, cached_sel::gpu_end_time());
-                super::profile::record_section_gpu_time((end - start).max(0.0));
-                release(cur);
-            }
-            super::profile::record_section_end();
+        // Commit + wait each CB, read its GPU wall (GPUEndTime-GPUStartTime)
+        // immediately for the per-section GPU-time census.
+        unsafe {
+            msg_send_0_raw(cur, cached_sel::commit());
+            msg_send_0_raw(cur, cached_sel::wait_until_completed());
+            let start = msg_send_0_f64(cur, cached_sel::gpu_start_time());
+            let end = msg_send_0_f64(cur, cached_sel::gpu_end_time());
+            super::profile::record_section_gpu_time((end - start).max(0.0));
+            release(cur);
         }
+        super::profile::record_section_end();
 
         // Allocate a fresh CB from the parent queue.
         let fresh = unsafe { msg_send_0_raw(q, cached_sel::command_buffer()) };
@@ -1120,39 +1099,6 @@ impl Drop for MetalCommandBuffer {
 // &self; ordering is the caller's responsibility) is preserved.
 unsafe impl Send for MetalCommandBuffer {}
 unsafe impl Sync for MetalCommandBuffer {}
-
-/// Drain the deferred per-CB GPU-time registry (commit-all-wait-once
-/// census). Called once at prefill end in defer mode. Waits on the LAST
-/// committed split CB (which, on a single FIFO queue, implies all prior CBs
-/// completed), then reads each CB's `GPUEndTime - GPUStartTime`, attributes it
-/// to its recorded section label, and releases the CB (the registry owns the
-/// wrapper's original +1). No-op when the registry is empty / profiling off.
-///
-/// This is the contamination-free per-kernel census WITHOUT the per-CB-wait
-/// idle confound: kernels run back-to-back on the GPU (no forced drain between
-/// dispatches), so each CB's GPU wall is its true serial service time. The
-/// sum is additive to a serial schedule; compare to production single-CB
-/// gpu_busy for the overlap credit (two-metric model).
-pub(crate) fn drain_deferred_cbs() {
-    let cbs = super::profile::take_deferred_cbs();
-    if cbs.is_empty() {
-        return;
-    }
-    unsafe {
-        // Wait on the last committed CB; FIFO single-queue ⇒ all prior done.
-        let (last_ptr, _) = cbs[cbs.len() - 1];
-        let last = last_ptr as ObjcId;
-        msg_send_0_raw(last, cached_sel::wait_until_completed());
-        // Read each CB's GPU wall, attribute to its label, release it.
-        for (ptr, label) in cbs {
-            let cb = ptr as ObjcId;
-            let start = msg_send_0_f64(cb, cached_sel::gpu_start_time());
-            let end = msg_send_0_f64(cb, cached_sel::gpu_end_time());
-            super::profile::record_section_gpu_time_for(label, (end - start).max(0.0));
-            release(cb);
-        }
-    }
-}
 
 // ============================================================================
 // MetalBlitEncoder -- wraps MTLBlitCommandEncoder

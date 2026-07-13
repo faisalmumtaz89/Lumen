@@ -417,21 +417,6 @@ impl MetalF32Backend {
             if meta.gdn_layer_idx.is_none() {
                 // Standard softmax attention path
 
-                // Diagnostic sub-stage skip bitmask (LUMEN_METAL_FULLATTN_SUBSKIP).
-                // When a bit is set the matching dispatch is skipped so its cost is
-                // visible in the `full_attn` per-section GPU time. No-op when 0/unset.
-                // Skipping corrupts output -- this is a timing-attribution tool only.
-                // bit0 K proj, bit1 V proj, bit2 RoPE+KV-write, bit3 attention,
-                // bit4 Q+gate proj, bit5 Wo proj, bit6 deinterleave/norm/assemble.
-                const FULLATTN_SKIP_K: u32 = 1 << 0;
-                const FULLATTN_SKIP_V: u32 = 1 << 1;
-                const FULLATTN_SKIP_ROPE_KV: u32 = 1 << 2;
-                const FULLATTN_SKIP_ATTN: u32 = 1 << 3;
-                const FULLATTN_SKIP_QGATE: u32 = 1 << 4;
-                const FULLATTN_SKIP_WO: u32 = 1 << 5;
-                const FULLATTN_SKIP_DNA: u32 = 1 << 6;
-                let fa_skip = decode_profile::fullattn_subskip();
-
                 // Fused RMSNorm + QKV Q8_0 matvec.
                 // Eliminates 1 dispatch + 1 barrier + normed_buf write/read per layer.
                 // Also works for Q+gate fusion: all 3 matmuls (Q+gate, K, V) fuse
@@ -511,12 +496,11 @@ impl MetalF32Backend {
                 // a single `deinterleave_norm_rope_kvwrite` dispatch (six dispatches
                 // eliminated per full-attn layer). Only the Qwen3.5 Q+gate-fusion
                 // NeoX partial-RoPE shape is byte-identical under the fold; anything
-                // else (full RoPE fused path, linear-attn, non-NeoX, missing norms,
-                // or any diagnostic fa_skip bit set) keeps the incumbent path.
+                // else (full RoPE fused path, linear-attn, non-NeoX, missing norms)
+                // keeps the incumbent path.
                 let is_linear_attn_be = meta.layer_type == Some(1);
                 let use_fused_rope_kv_be = !is_linear_attn_be && s.rotary_dim == head_dim;
-                let bookend_elided = fa_skip == 0
-                    && meta.has_qgate_fusion
+                let bookend_elided = meta.has_qgate_fusion
                     && !is_linear_attn_be
                     && s.rope_neox
                     && !use_fused_rope_kv_be
@@ -548,10 +532,8 @@ impl MetalF32Backend {
                     // reads. The GDN recurrence is untouched. (Greedy has no qgatekv/kv-fuse
                     // single-dispatch paths, so the only guard is the separate-projection +
                     // fused-norm condition.) Mirrors decode_single_cb's validated wiring.
-                    let concurrent_proj_cluster = crate::metal::metal_concurrent_proj_enabled()
-                        && use_fused_attn_norm
-                        && (fa_skip & (FULLATTN_SKIP_QGATE | FULLATTN_SKIP_K | FULLATTN_SKIP_V))
-                            == 0;
+                    let concurrent_proj_cluster =
+                        crate::metal::metal_concurrent_proj_enabled() && use_fused_attn_norm;
                     if concurrent_proj_cluster {
                         // Close the layer's current (serial) encoder and open a concurrent
                         // one for the projection cluster. Encoders within ONE command buffer
@@ -568,335 +550,322 @@ impl MetalF32Backend {
                     }
 
                     // Project Q+gate into qkv_buf
-                    if fa_skip & FULLATTN_SKIP_QGATE == 0 {
-                        // MLX-style fused RMSNorm+qmv fast path for the Q4_0 full-attn
-                        // Q+gate projection when decode-qmv buffers exist (env
-                        // LUMEN_METAL_Q4_QMV_PROJ=1) AND the fused-norm path would run
-                        // (the qmv kernel fuses RMSNorm, so it is ONLY valid when
-                        // use_fused_attn_norm is true -- never when reading normed_buf).
-                        // Vec indexed by layer_idx (None for GDN layers).
-                        let qmv_wq = if use_fused_attn_norm && meta.wq_quant == QuantScheme::Q4_0 {
-                            match (
-                                s.qmv_attn_wq_qw.get(layer_idx),
-                                s.qmv_attn_wq_scales.get(layer_idx),
-                            ) {
-                                (Some(Some(qw)), Some(Some(sc))) => Some((qw, sc)),
-                                _ => None,
+                    // MLX-style fused RMSNorm+qmv fast path for the Q4_0 full-attn
+                    // Q+gate projection when decode-qmv buffers exist (default)
+                    // AND the fused-norm path would run
+                    // (the qmv kernel fuses RMSNorm, so it is ONLY valid when
+                    // use_fused_attn_norm is true -- never when reading normed_buf).
+                    // Vec indexed by layer_idx (None for GDN layers).
+                    let qmv_wq = if use_fused_attn_norm && meta.wq_quant == QuantScheme::Q4_0 {
+                        match (
+                            s.qmv_attn_wq_qw.get(layer_idx),
+                            s.qmv_attn_wq_scales.get(layer_idx),
+                        ) {
+                            (Some(Some(qw)), Some(Some(sc))) => Some((qw, sc)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some((qw, sc)) = qmv_wq {
+                        // qmv_q4_0_rmsnorm: w@0, x@1, out@2, in_dim@3, scales@4,
+                        // norm_w@5, eps@6. out_dim = qgate_dim (%8==0); in = hidden (%512==0).
+                        enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm);
+                        enc.set_buffer(qw, 0, 0);
+                        enc.set_buffer(&s.x_buf, 0, 1);
+                        enc.set_buffer(&s.qkv_buf, 0, 2);
+                        enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                        enc.set_buffer(sc, 0, 4);
+                        enc.set_buffer(layer_buf, attn_norm_off, 5);
+                        enc.set_bytes(&eps.to_le_bytes(), 6);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new((qgate_dim as u64) / 8, 1, 1),
+                            MTLSize::new(64, 1, 1),
+                        );
+                    } else {
+                        if use_fused_attn_norm {
+                            match meta.wq_quant {
+                                QuantScheme::Q4_0 => enc.set_pipeline_state(
+                                    &pipelines.rmsnorm_dequant_matmul_q4_0_deferred_nr2,
+                                ),
+                                QuantScheme::F16 => enc
+                                    .set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2),
+                                QuantScheme::Bf16 => {
+                                    enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
+                                }
+                                _ => enc.set_pipeline_state(
+                                    &pipelines.rmsnorm_dequant_matmul_q8_0_deferred_nr2,
+                                ),
                             }
-                        } else {
-                            None
-                        };
-                        if let Some((qw, sc)) = qmv_wq {
-                            // qmv_q4_0_rmsnorm: w@0, x@1, out@2, in_dim@3, scales@4,
-                            // norm_w@5, eps@6. out_dim = qgate_dim (%8==0); in = hidden (%512==0).
-                            enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm);
-                            enc.set_buffer(qw, 0, 0);
+                            enc.set_buffer(layer_buf, wq_off, 0);
                             enc.set_buffer(&s.x_buf, 0, 1);
                             enc.set_buffer(&s.qkv_buf, 0, 2);
                             enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                            enc.set_buffer(sc, 0, 4);
+                            enc.set_bytes(&(qgate_dim as u32).to_le_bytes(), 4);
                             enc.set_buffer(layer_buf, attn_norm_off, 5);
                             enc.set_bytes(&eps.to_le_bytes(), 6);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new((qgate_dim as u64) / 8, 1, 1),
-                                MTLSize::new(64, 1, 1),
-                            );
                         } else {
-                            if use_fused_attn_norm {
-                                match meta.wq_quant {
-                                    QuantScheme::Q4_0 => enc.set_pipeline_state(
-                                        &pipelines.rmsnorm_dequant_matmul_q4_0_deferred_nr2,
-                                    ),
-                                    QuantScheme::F16 => enc.set_pipeline_state(
-                                        &pipelines.rmsnorm_matmul_f16_deferred_nr2,
-                                    ),
-                                    QuantScheme::Bf16 => {
-                                        enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
-                                    }
-                                    _ => enc.set_pipeline_state(
-                                        &pipelines.rmsnorm_dequant_matmul_q8_0_deferred_nr2,
-                                    ),
+                            let _tg = match meta.wq_quant {
+                                QuantScheme::Q8_0 => {
+                                    enc.set_pipeline_state(
+                                        &pipelines.dequant_matmul_q8_0_deferred_nr2,
+                                    );
+                                    128u64
                                 }
-                                enc.set_buffer(layer_buf, wq_off, 0);
-                                enc.set_buffer(&s.x_buf, 0, 1);
-                                enc.set_buffer(&s.qkv_buf, 0, 2);
-                                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                                enc.set_bytes(&(qgate_dim as u32).to_le_bytes(), 4);
-                                enc.set_buffer(layer_buf, attn_norm_off, 5);
-                                enc.set_bytes(&eps.to_le_bytes(), 6);
-                            } else {
-                                let _tg = match meta.wq_quant {
-                                    QuantScheme::Q8_0 => {
-                                        enc.set_pipeline_state(
-                                            &pipelines.dequant_matmul_q8_0_deferred_nr2,
-                                        );
-                                        128u64
-                                    }
-                                    QuantScheme::Q4_0 => {
-                                        enc.set_pipeline_state(
-                                            &pipelines.dequant_matmul_q4_0_deferred_nr2,
-                                        );
-                                        128u64
-                                    }
-                                    QuantScheme::F16 => {
-                                        enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
-                                        128u64
-                                    }
-                                    QuantScheme::Bf16 => {
-                                        enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
-                                        128u64
-                                    }
-                                    _ => {
-                                        enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
-                                        matmul_tg_size
-                                    }
-                                };
-                                enc.set_buffer(layer_buf, wq_off, 0);
-                                enc.set_buffer(&s.normed_buf, 0, 1);
-                                enc.set_buffer(&s.qkv_buf, 0, 2);
-                                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                                if matches!(
-                                    meta.wq_quant,
-                                    QuantScheme::Q8_0
-                                        | QuantScheme::Q4_0
-                                        | QuantScheme::F16
-                                        | QuantScheme::Bf16
-                                ) {
-                                    enc.set_bytes(&(qgate_dim as u32).to_le_bytes(), 4);
+                                QuantScheme::Q4_0 => {
+                                    enc.set_pipeline_state(
+                                        &pipelines.dequant_matmul_q4_0_deferred_nr2,
+                                    );
+                                    128u64
                                 }
-                            }
-                            let n_tg = match meta.wq_quant {
-                                QuantScheme::Q8_0 => ((qgate_dim as u64) + 1) / 2,
-                                QuantScheme::Q4_0 => ((qgate_dim as u64) + 1) / 2,
-                                QuantScheme::F16 => ((qgate_dim as u64) + 1) / 2,
-                                QuantScheme::Bf16 => ((qgate_dim as u64) + 1) / 2,
-                                _ => qgate_dim as u64,
+                                QuantScheme::F16 => {
+                                    enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
+                                    128u64
+                                }
+                                QuantScheme::Bf16 => {
+                                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
+                                    128u64
+                                }
+                                _ => {
+                                    enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
+                                    matmul_tg_size
+                                }
                             };
-                            enc.dispatch_threadgroups(
-                                MTLSize::new(n_tg, 1, 1),
-                                MTLSize::new(128, 1, 1),
-                            );
+                            enc.set_buffer(layer_buf, wq_off, 0);
+                            enc.set_buffer(&s.normed_buf, 0, 1);
+                            enc.set_buffer(&s.qkv_buf, 0, 2);
+                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                            if matches!(
+                                meta.wq_quant,
+                                QuantScheme::Q8_0
+                                    | QuantScheme::Q4_0
+                                    | QuantScheme::F16
+                                    | QuantScheme::Bf16
+                            ) {
+                                enc.set_bytes(&(qgate_dim as u32).to_le_bytes(), 4);
+                            }
                         }
+                        let n_tg = match meta.wq_quant {
+                            QuantScheme::Q8_0 => ((qgate_dim as u64) + 1) / 2,
+                            QuantScheme::Q4_0 => ((qgate_dim as u64) + 1) / 2,
+                            QuantScheme::F16 => ((qgate_dim as u64) + 1) / 2,
+                            QuantScheme::Bf16 => ((qgate_dim as u64) + 1) / 2,
+                            _ => qgate_dim as u64,
+                        };
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(n_tg, 1, 1),
+                            MTLSize::new(128, 1, 1),
+                        );
                     }
                     // Project K from wk (parallel with Q+gate when fused)
-                    if fa_skip & FULLATTN_SKIP_K == 0 {
-                        let wk_off_val = meta.wk_off.unwrap();
-                        let wk_quant = meta.wk_quant.unwrap();
-                        // MLX-style fused RMSNorm+qmv fast path for the Q4_0 K projection
-                        // when decode-qmv buffers exist (env LUMEN_METAL_Q4_QMV_KV=1).
-                        // Reads x_buf (pre-norm hidden) like Q does; writes k_buf at
-                        // offset 0 exactly as the NR2 path. Indexed by layer_idx.
-                        let qmv_wk = if use_fused_attn_norm && wk_quant == QuantScheme::Q4_0 {
-                            match (
-                                s.qmv_attn_wk_qw.get(layer_idx),
-                                s.qmv_attn_wk_scales.get(layer_idx),
-                            ) {
-                                (Some(Some(qw)), Some(Some(sc))) => Some((qw, sc)),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
-                        if let Some((qw, sc)) = qmv_wk {
-                            enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm);
-                            enc.set_buffer(qw, 0, 0);
-                            enc.set_buffer(&s.x_buf, 0, 1);
-                            enc.set_buffer(&s.k_buf, 0, 2);
-                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                            enc.set_buffer(sc, 0, 4);
-                            enc.set_buffer(layer_buf, attn_norm_off, 5);
-                            enc.set_bytes(&eps.to_le_bytes(), 6);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new((kv_dim as u64) / 8, 1, 1),
-                                MTLSize::new(64, 1, 1),
-                            );
-                        } else if use_fused_attn_norm {
-                            match wk_quant {
-                                QuantScheme::Q4_0 => enc.set_pipeline_state(
-                                    &pipelines.rmsnorm_dequant_matmul_q4_0_deferred_nr2,
-                                ),
-                                QuantScheme::F16 => enc
-                                    .set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2),
-                                QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
-                                }
-                                _ => enc.set_pipeline_state(
-                                    &pipelines.rmsnorm_dequant_matmul_q8_0_deferred_nr2,
-                                ),
-                            }
-                            enc.set_buffer(layer_buf, wk_off_val, 0);
-                            enc.set_buffer(&s.x_buf, 0, 1);
-                            enc.set_buffer(&s.k_buf, 0, 2);
-                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                            enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
-                            enc.set_buffer(layer_buf, attn_norm_off, 5);
-                            enc.set_bytes(&eps.to_le_bytes(), 6);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new(((kv_dim as u64) + 1) / 2, 1, 1),
-                                MTLSize::new(128, 1, 1),
-                            );
-                        } else {
-                            let _tg = match wk_quant {
-                                QuantScheme::Q8_0 => {
-                                    enc.set_pipeline_state(
-                                        &pipelines.dequant_matmul_q8_0_deferred_nr2,
-                                    );
-                                    128u64
-                                }
-                                QuantScheme::Q4_0 => {
-                                    enc.set_pipeline_state(
-                                        &pipelines.dequant_matmul_q4_0_deferred_nr2,
-                                    );
-                                    128u64
-                                }
-                                QuantScheme::F16 => {
-                                    enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
-                                    128u64
-                                }
-                                QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
-                                    128u64
-                                }
-                                _ => {
-                                    enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
-                                    matmul_tg_size
-                                }
-                            };
-                            enc.set_buffer(layer_buf, wk_off_val, 0);
-                            enc.set_buffer(&s.normed_buf, 0, 1);
-                            enc.set_buffer(&s.k_buf, 0, 2);
-                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                            if matches!(
-                                wk_quant,
-                                QuantScheme::Q8_0
-                                    | QuantScheme::Q4_0
-                                    | QuantScheme::F16
-                                    | QuantScheme::Bf16
-                            ) {
-                                enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
-                            }
-                            let n_tg = match wk_quant {
-                                QuantScheme::Q8_0 => ((kv_dim as u64) + 1) / 2,
-                                QuantScheme::Q4_0 => ((kv_dim as u64) + 1) / 2,
-                                QuantScheme::F16 => ((kv_dim as u64) + 1) / 2,
-                                QuantScheme::Bf16 => ((kv_dim as u64) + 1) / 2,
-                                _ => kv_dim as u64,
-                            };
-                            enc.dispatch_threadgroups(
-                                MTLSize::new(n_tg, 1, 1),
-                                MTLSize::new(128, 1, 1),
-                            );
+                    let wk_off_val = meta.wk_off.unwrap();
+                    let wk_quant = meta.wk_quant.unwrap();
+                    // MLX-style fused RMSNorm+qmv fast path for the Q4_0 K projection
+                    // when decode-qmv buffers exist (default).
+                    // Reads x_buf (pre-norm hidden) like Q does; writes k_buf at
+                    // offset 0 exactly as the NR2 path. Indexed by layer_idx.
+                    let qmv_wk = if use_fused_attn_norm && wk_quant == QuantScheme::Q4_0 {
+                        match (
+                            s.qmv_attn_wk_qw.get(layer_idx),
+                            s.qmv_attn_wk_scales.get(layer_idx),
+                        ) {
+                            (Some(Some(qw)), Some(Some(sc))) => Some((qw, sc)),
+                            _ => None,
                         }
+                    } else {
+                        None
+                    };
+                    if let Some((qw, sc)) = qmv_wk {
+                        enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm);
+                        enc.set_buffer(qw, 0, 0);
+                        enc.set_buffer(&s.x_buf, 0, 1);
+                        enc.set_buffer(&s.k_buf, 0, 2);
+                        enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                        enc.set_buffer(sc, 0, 4);
+                        enc.set_buffer(layer_buf, attn_norm_off, 5);
+                        enc.set_bytes(&eps.to_le_bytes(), 6);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new((kv_dim as u64) / 8, 1, 1),
+                            MTLSize::new(64, 1, 1),
+                        );
+                    } else if use_fused_attn_norm {
+                        match wk_quant {
+                            QuantScheme::Q4_0 => enc.set_pipeline_state(
+                                &pipelines.rmsnorm_dequant_matmul_q4_0_deferred_nr2,
+                            ),
+                            QuantScheme::F16 => {
+                                enc.set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2)
+                            }
+                            QuantScheme::Bf16 => {
+                                enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
+                            }
+                            _ => enc.set_pipeline_state(
+                                &pipelines.rmsnorm_dequant_matmul_q8_0_deferred_nr2,
+                            ),
+                        }
+                        enc.set_buffer(layer_buf, wk_off_val, 0);
+                        enc.set_buffer(&s.x_buf, 0, 1);
+                        enc.set_buffer(&s.k_buf, 0, 2);
+                        enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                        enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
+                        enc.set_buffer(layer_buf, attn_norm_off, 5);
+                        enc.set_bytes(&eps.to_le_bytes(), 6);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(((kv_dim as u64) + 1) / 2, 1, 1),
+                            MTLSize::new(128, 1, 1),
+                        );
+                    } else {
+                        let _tg = match wk_quant {
+                            QuantScheme::Q8_0 => {
+                                enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2);
+                                128u64
+                            }
+                            QuantScheme::Q4_0 => {
+                                enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2);
+                                128u64
+                            }
+                            QuantScheme::F16 => {
+                                enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
+                                128u64
+                            }
+                            QuantScheme::Bf16 => {
+                                enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
+                                128u64
+                            }
+                            _ => {
+                                enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
+                                matmul_tg_size
+                            }
+                        };
+                        enc.set_buffer(layer_buf, wk_off_val, 0);
+                        enc.set_buffer(&s.normed_buf, 0, 1);
+                        enc.set_buffer(&s.k_buf, 0, 2);
+                        enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                        if matches!(
+                            wk_quant,
+                            QuantScheme::Q8_0
+                                | QuantScheme::Q4_0
+                                | QuantScheme::F16
+                                | QuantScheme::Bf16
+                        ) {
+                            enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
+                        }
+                        let n_tg = match wk_quant {
+                            QuantScheme::Q8_0 => ((kv_dim as u64) + 1) / 2,
+                            QuantScheme::Q4_0 => ((kv_dim as u64) + 1) / 2,
+                            QuantScheme::F16 => ((kv_dim as u64) + 1) / 2,
+                            QuantScheme::Bf16 => ((kv_dim as u64) + 1) / 2,
+                            _ => kv_dim as u64,
+                        };
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(n_tg, 1, 1),
+                            MTLSize::new(128, 1, 1),
+                        );
                     }
                     // Project V from wv (parallel with Q+gate and K when fused)
-                    if fa_skip & FULLATTN_SKIP_V == 0 {
-                        let wv_off_val = meta.wv_off.unwrap();
-                        let wv_quant = meta.wv_quant.unwrap();
-                        // MLX-style fused RMSNorm+qmv fast path for the Q4_0 V projection
-                        // when decode-qmv buffers exist (env LUMEN_METAL_Q4_QMV_KV=1).
-                        // Reads x_buf (pre-norm hidden) like Q does; writes v_buf at
-                        // offset 0 exactly as the NR2 path. Indexed by layer_idx.
-                        let qmv_wv = if use_fused_attn_norm && wv_quant == QuantScheme::Q4_0 {
-                            match (
-                                s.qmv_attn_wv_qw.get(layer_idx),
-                                s.qmv_attn_wv_scales.get(layer_idx),
-                            ) {
-                                (Some(Some(qw)), Some(Some(sc))) => Some((qw, sc)),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
-                        if let Some((qw, sc)) = qmv_wv {
-                            enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm);
-                            enc.set_buffer(qw, 0, 0);
-                            enc.set_buffer(&s.x_buf, 0, 1);
-                            enc.set_buffer(&s.v_buf, 0, 2);
-                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                            enc.set_buffer(sc, 0, 4);
-                            enc.set_buffer(layer_buf, attn_norm_off, 5);
-                            enc.set_bytes(&eps.to_le_bytes(), 6);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new((kv_dim as u64) / 8, 1, 1),
-                                MTLSize::new(64, 1, 1),
-                            );
-                        } else if use_fused_attn_norm {
-                            match wv_quant {
-                                QuantScheme::Q4_0 => enc.set_pipeline_state(
-                                    &pipelines.rmsnorm_dequant_matmul_q4_0_deferred_nr2,
-                                ),
-                                QuantScheme::F16 => enc
-                                    .set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2),
-                                QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
-                                }
-                                _ => enc.set_pipeline_state(
-                                    &pipelines.rmsnorm_dequant_matmul_q8_0_deferred_nr2,
-                                ),
-                            }
-                            enc.set_buffer(layer_buf, wv_off_val, 0);
-                            enc.set_buffer(&s.x_buf, 0, 1);
-                            enc.set_buffer(&s.v_buf, 0, 2);
-                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                            enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
-                            enc.set_buffer(layer_buf, attn_norm_off, 5);
-                            enc.set_bytes(&eps.to_le_bytes(), 6);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new(((kv_dim as u64) + 1) / 2, 1, 1),
-                                MTLSize::new(128, 1, 1),
-                            );
-                        } else {
-                            let _tg = match wv_quant {
-                                QuantScheme::Q8_0 => {
-                                    enc.set_pipeline_state(
-                                        &pipelines.dequant_matmul_q8_0_deferred_nr2,
-                                    );
-                                    128u64
-                                }
-                                QuantScheme::Q4_0 => {
-                                    enc.set_pipeline_state(
-                                        &pipelines.dequant_matmul_q4_0_deferred_nr2,
-                                    );
-                                    128u64
-                                }
-                                QuantScheme::F16 => {
-                                    enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
-                                    128u64
-                                }
-                                QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
-                                    128u64
-                                }
-                                _ => {
-                                    enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
-                                    matmul_tg_size
-                                }
-                            };
-                            enc.set_buffer(layer_buf, wv_off_val, 0);
-                            enc.set_buffer(&s.normed_buf, 0, 1);
-                            enc.set_buffer(&s.v_buf, 0, 2);
-                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                            if matches!(
-                                wv_quant,
-                                QuantScheme::Q8_0
-                                    | QuantScheme::Q4_0
-                                    | QuantScheme::F16
-                                    | QuantScheme::Bf16
-                            ) {
-                                enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
-                            }
-                            let n_tg = match wv_quant {
-                                QuantScheme::Q8_0 => ((kv_dim as u64) + 1) / 2,
-                                QuantScheme::Q4_0 => ((kv_dim as u64) + 1) / 2,
-                                QuantScheme::F16 => ((kv_dim as u64) + 1) / 2,
-                                QuantScheme::Bf16 => ((kv_dim as u64) + 1) / 2,
-                                _ => kv_dim as u64,
-                            };
-                            enc.dispatch_threadgroups(
-                                MTLSize::new(n_tg, 1, 1),
-                                MTLSize::new(128, 1, 1),
-                            );
+                    let wv_off_val = meta.wv_off.unwrap();
+                    let wv_quant = meta.wv_quant.unwrap();
+                    // MLX-style fused RMSNorm+qmv fast path for the Q4_0 V projection
+                    // when decode-qmv buffers exist (default).
+                    // Reads x_buf (pre-norm hidden) like Q does; writes v_buf at
+                    // offset 0 exactly as the NR2 path. Indexed by layer_idx.
+                    let qmv_wv = if use_fused_attn_norm && wv_quant == QuantScheme::Q4_0 {
+                        match (
+                            s.qmv_attn_wv_qw.get(layer_idx),
+                            s.qmv_attn_wv_scales.get(layer_idx),
+                        ) {
+                            (Some(Some(qw)), Some(Some(sc))) => Some((qw, sc)),
+                            _ => None,
                         }
+                    } else {
+                        None
+                    };
+                    if let Some((qw, sc)) = qmv_wv {
+                        enc.set_pipeline_state(&pipelines.qmv_q4_0_rmsnorm);
+                        enc.set_buffer(qw, 0, 0);
+                        enc.set_buffer(&s.x_buf, 0, 1);
+                        enc.set_buffer(&s.v_buf, 0, 2);
+                        enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                        enc.set_buffer(sc, 0, 4);
+                        enc.set_buffer(layer_buf, attn_norm_off, 5);
+                        enc.set_bytes(&eps.to_le_bytes(), 6);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new((kv_dim as u64) / 8, 1, 1),
+                            MTLSize::new(64, 1, 1),
+                        );
+                    } else if use_fused_attn_norm {
+                        match wv_quant {
+                            QuantScheme::Q4_0 => enc.set_pipeline_state(
+                                &pipelines.rmsnorm_dequant_matmul_q4_0_deferred_nr2,
+                            ),
+                            QuantScheme::F16 => {
+                                enc.set_pipeline_state(&pipelines.rmsnorm_matmul_f16_deferred_nr2)
+                            }
+                            QuantScheme::Bf16 => {
+                                enc.set_pipeline_state(pipelines.bf16_rmsnorm_matvec_nr2())
+                            }
+                            _ => enc.set_pipeline_state(
+                                &pipelines.rmsnorm_dequant_matmul_q8_0_deferred_nr2,
+                            ),
+                        }
+                        enc.set_buffer(layer_buf, wv_off_val, 0);
+                        enc.set_buffer(&s.x_buf, 0, 1);
+                        enc.set_buffer(&s.v_buf, 0, 2);
+                        enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                        enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
+                        enc.set_buffer(layer_buf, attn_norm_off, 5);
+                        enc.set_bytes(&eps.to_le_bytes(), 6);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(((kv_dim as u64) + 1) / 2, 1, 1),
+                            MTLSize::new(128, 1, 1),
+                        );
+                    } else {
+                        let _tg = match wv_quant {
+                            QuantScheme::Q8_0 => {
+                                enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2);
+                                128u64
+                            }
+                            QuantScheme::Q4_0 => {
+                                enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2);
+                                128u64
+                            }
+                            QuantScheme::F16 => {
+                                enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
+                                128u64
+                            }
+                            QuantScheme::Bf16 => {
+                                enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
+                                128u64
+                            }
+                            _ => {
+                                enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
+                                matmul_tg_size
+                            }
+                        };
+                        enc.set_buffer(layer_buf, wv_off_val, 0);
+                        enc.set_buffer(&s.normed_buf, 0, 1);
+                        enc.set_buffer(&s.v_buf, 0, 2);
+                        enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
+                        if matches!(
+                            wv_quant,
+                            QuantScheme::Q8_0
+                                | QuantScheme::Q4_0
+                                | QuantScheme::F16
+                                | QuantScheme::Bf16
+                        ) {
+                            enc.set_bytes(&(kv_dim as u32).to_le_bytes(), 4);
+                        }
+                        let n_tg = match wv_quant {
+                            QuantScheme::Q8_0 => ((kv_dim as u64) + 1) / 2,
+                            QuantScheme::Q4_0 => ((kv_dim as u64) + 1) / 2,
+                            QuantScheme::F16 => ((kv_dim as u64) + 1) / 2,
+                            QuantScheme::Bf16 => ((kv_dim as u64) + 1) / 2,
+                            _ => kv_dim as u64,
+                        };
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(n_tg, 1, 1),
+                            MTLSize::new(128, 1, 1),
+                        );
                     }
                     // Barrier: Q+gate/K/V projections all complete
                     if concurrent_proj_cluster {
@@ -954,9 +923,7 @@ impl MetalF32Backend {
                         && meta.attn_q_norm_off.is_some()
                         && meta.attn_k_norm_off.is_some();
 
-                    if fa_skip & FULLATTN_SKIP_DNA != 0 {
-                        // diagnostic: skip deinterleave/norm/assemble (corrupts output)
-                    } else if bookend_elided {
+                    if bookend_elided {
                         // Bookend elision: one dispatch does deinterleave +
                         // per-head Q/K RMSNorm + NeoX partial rope + direct K/V cache
                         // write. Eliminates copy_buffer x3 + rope_neox x2 +
@@ -1318,14 +1285,8 @@ impl MetalF32Backend {
 
                 if use_fused_rope_kv_mha {
                     // Single dispatch: RoPE Q/K + KV cache write + MHA.
-                    // LUMEN_METAL_FUSED_SDPA_DECODE swaps in the threadgroup-scores
-                    // variant (scores on-chip, no device round-trip) -- byte-identical.
                     let pos_offset_u32 = (seq_pos * rope_half_dim) as u32;
-                    if crate::metal::fused_sdpa_decode_enabled() {
-                        enc.set_pipeline_state(&pipelines.fused_rope_kv_mha_tgscores);
-                    } else {
-                        enc.set_pipeline_state(&pipelines.fused_rope_kv_mha);
-                    }
+                    enc.set_pipeline_state(&pipelines.fused_rope_kv_mha);
                     enc.set_buffer(&s.qkv_buf, q_byte_off, 0);
                     enc.set_buffer(&s.qkv_buf, k_byte_off, 1);
                     enc.set_buffer(&s.qkv_buf, v_byte_off, 2);
@@ -1344,12 +1305,7 @@ impl MetalF32Backend {
                     enc.set_bytes(&(seq_pos as u32).to_le_bytes(), 15);
                     enc.set_bytes(&attn_scale.to_le_bytes(), 16);
                     enc.set_bytes(&(s.max_seq_len as u32).to_le_bytes(), 17);
-                    // Diagnostic: skip attention compute (FULLATTN_SKIP_ATTN bit3). 0 = full run.
-                    let skip_attn_u32: u32 = if fa_skip & FULLATTN_SKIP_ATTN != 0 {
-                        1
-                    } else {
-                        0
-                    };
+                    let skip_attn_u32: u32 = 0;
                     enc.set_bytes(&skip_attn_u32.to_le_bytes(), 18);
                     let tg_threads = 256u64.min((head_dim.max(new_seq_len) as u64).max(32));
                     enc.dispatch_threadgroups(
@@ -1367,8 +1323,6 @@ impl MetalF32Backend {
                         // Bookend elision: RoPE Q/K + KV-cache write already
                         // performed inside the fused deinterleave_norm_rope_kvwrite
                         // dispatch above; nothing to do here.
-                    } else if fa_skip & FULLATTN_SKIP_ROPE_KV != 0 {
-                        // diagnostic: skip RoPE + KV-cache write (corrupts output)
                     } else if use_fused_rope_kv {
                         let pos_offset_u32 = (seq_pos * rope_half_dim) as u32;
                         let fused_pipe = if s.rope_neox {
@@ -1456,88 +1410,85 @@ impl MetalF32Backend {
                         enc.memory_barrier_with_scope(1);
                     }
                     // Attention (flash decode or MHA)
-                    if fa_skip & FULLATTN_SKIP_ATTN == 0 {
-                        // Bookend elision: the fused kernel wrote normed+roped
-                        // Q to q_buf (byte-identical to the incumbent roped qkv_buf[Q]),
-                        // so attention reads Q from q_buf. Otherwise read qkv_buf[Q].
-                        let (q_attn_buf, q_attn_off) = if bookend_elided {
-                            (&s.q_buf, 0u64)
-                        } else {
-                            (&s.qkv_buf, q_byte_off)
-                        };
-                        let num_heads_u32 = num_heads as u32;
-                        let num_kv_heads_u32 = num_kv_heads as u32;
-                        let head_dim_u32 = head_dim as u32;
-                        let kv_dim_u32 = kv_dim as u32;
-                        let seq_len_u32 = new_seq_len as u32;
-                        let max_seq_len_u32 = s.max_seq_len as u32;
-                        const FLASH_DECODE_TILE_SIZE: u32 = 256;
-                        // Flash decode engages only at K >= 513 (two full tiles). For K in
-                        // [257, 512] the 2-tile flash path spills the 1..256 keys of the
-                        // second tile into a near-empty tile plus a separate reduce dispatch,
-                        // which is slower than -- and byte-identical to -- the exact
-                        // single-dispatch multi_head_attention over the same keys. So
-                        // single-tile MHA serves K <= 512 and flash takes over at K >= 513.
-                        let flash_decode_threshold: usize = FLASH_DECODE_TILE_SIZE as usize * 2 + 1; // 513
+                    // Bookend elision: the fused kernel wrote normed+roped
+                    // Q to q_buf (byte-identical to the incumbent roped qkv_buf[Q]),
+                    // so attention reads Q from q_buf. Otherwise read qkv_buf[Q].
+                    let (q_attn_buf, q_attn_off) = if bookend_elided {
+                        (&s.q_buf, 0u64)
+                    } else {
+                        (&s.qkv_buf, q_byte_off)
+                    };
+                    let num_heads_u32 = num_heads as u32;
+                    let num_kv_heads_u32 = num_kv_heads as u32;
+                    let head_dim_u32 = head_dim as u32;
+                    let kv_dim_u32 = kv_dim as u32;
+                    let seq_len_u32 = new_seq_len as u32;
+                    let max_seq_len_u32 = s.max_seq_len as u32;
+                    const FLASH_DECODE_TILE_SIZE: u32 = 256;
+                    // Flash decode engages only at K >= 513 (two full tiles). For K in
+                    // [257, 512] the 2-tile flash path spills the 1..256 keys of the
+                    // second tile into a near-empty tile plus a separate reduce dispatch,
+                    // which is slower than -- and byte-identical to -- the exact
+                    // single-dispatch multi_head_attention over the same keys. So
+                    // single-tile MHA serves K <= 512 and flash takes over at K >= 513.
+                    let flash_decode_threshold: usize = FLASH_DECODE_TILE_SIZE as usize * 2 + 1; // 513
 
-                        if new_seq_len >= flash_decode_threshold {
-                            let num_tiles = ((new_seq_len as u32) + FLASH_DECODE_TILE_SIZE - 1)
-                                / FLASH_DECODE_TILE_SIZE;
-                            enc.set_pipeline_state(&pipelines.flash_decode_attention);
-                            enc.set_buffer(q_attn_buf, q_attn_off, 0);
-                            enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 1);
-                            enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 2);
-                            enc.set_buffer(&s.flash_decode_partial_buf, 0, 3);
-                            enc.set_bytes(&num_heads_u32.to_le_bytes(), 4);
-                            enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 5);
-                            enc.set_bytes(&head_dim_u32.to_le_bytes(), 6);
-                            enc.set_bytes(&kv_dim_u32.to_le_bytes(), 7);
-                            enc.set_bytes(&seq_len_u32.to_le_bytes(), 8);
-                            enc.set_bytes(&attn_scale.to_le_bytes(), 9);
-                            enc.set_bytes(&FLASH_DECODE_TILE_SIZE.to_le_bytes(), 10);
-                            enc.set_bytes(&num_tiles.to_le_bytes(), 11);
-                            enc.set_bytes(&max_seq_len_u32.to_le_bytes(), 12);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new((num_heads as u64) * (num_tiles as u64), 1, 1),
-                                MTLSize::new(128, 1, 1),
-                            );
-                            // Barrier: flash_decode writes partial_buf, reduce reads partial_buf
-                            if needs_barriers {
-                                enc.memory_barrier_with_scope(1);
-                            }
-                            enc.set_pipeline_state(&pipelines.flash_decode_reduce);
-                            enc.set_buffer(&s.flash_decode_partial_buf, 0, 0);
-                            enc.set_buffer(&s.attn_out_buf, 0, 1);
-                            enc.set_bytes(&num_heads_u32.to_le_bytes(), 2);
-                            enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
-                            enc.set_bytes(&num_tiles.to_le_bytes(), 4);
-                            let tg_threads = (head_dim as u64).max(1).min(256);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new(num_heads as u64, 1, 1),
-                                MTLSize::new(tg_threads, 1, 1),
-                            );
-                        } else {
-                            let mha_tg_size = s.mha_tg_size;
-                            enc.set_pipeline_state(&pipelines.multi_head_attention);
-                            enc.set_buffer(q_attn_buf, q_attn_off, 0);
-                            enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 1);
-                            enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 2);
-                            enc.set_buffer(&s.attn_out_buf, 0, 3);
-                            enc.set_buffer(&s.mha_scores_buf, 0, 4);
-                            enc.set_bytes(&num_heads_u32.to_le_bytes(), 5);
-                            enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 6);
-                            enc.set_bytes(&head_dim_u32.to_le_bytes(), 7);
-                            enc.set_bytes(&kv_dim_u32.to_le_bytes(), 8);
-                            enc.set_bytes(&seq_len_u32.to_le_bytes(), 9);
-                            enc.set_bytes(&attn_scale.to_le_bytes(), 10);
-                            enc.set_bytes(&max_seq_len_u32.to_le_bytes(), 11);
-                            let tg_threads =
-                                mha_tg_size.min((head_dim.max(new_seq_len) as u64).max(1));
-                            enc.dispatch_threadgroups(
-                                MTLSize::new(num_heads as u64, 1, 1),
-                                MTLSize::new(tg_threads, 1, 1),
-                            );
+                    if new_seq_len >= flash_decode_threshold {
+                        let num_tiles = ((new_seq_len as u32) + FLASH_DECODE_TILE_SIZE - 1)
+                            / FLASH_DECODE_TILE_SIZE;
+                        enc.set_pipeline_state(&pipelines.flash_decode_attention);
+                        enc.set_buffer(q_attn_buf, q_attn_off, 0);
+                        enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 1);
+                        enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 2);
+                        enc.set_buffer(&s.flash_decode_partial_buf, 0, 3);
+                        enc.set_bytes(&num_heads_u32.to_le_bytes(), 4);
+                        enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 5);
+                        enc.set_bytes(&head_dim_u32.to_le_bytes(), 6);
+                        enc.set_bytes(&kv_dim_u32.to_le_bytes(), 7);
+                        enc.set_bytes(&seq_len_u32.to_le_bytes(), 8);
+                        enc.set_bytes(&attn_scale.to_le_bytes(), 9);
+                        enc.set_bytes(&FLASH_DECODE_TILE_SIZE.to_le_bytes(), 10);
+                        enc.set_bytes(&num_tiles.to_le_bytes(), 11);
+                        enc.set_bytes(&max_seq_len_u32.to_le_bytes(), 12);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new((num_heads as u64) * (num_tiles as u64), 1, 1),
+                            MTLSize::new(128, 1, 1),
+                        );
+                        // Barrier: flash_decode writes partial_buf, reduce reads partial_buf
+                        if needs_barriers {
+                            enc.memory_barrier_with_scope(1);
                         }
+                        enc.set_pipeline_state(&pipelines.flash_decode_reduce);
+                        enc.set_buffer(&s.flash_decode_partial_buf, 0, 0);
+                        enc.set_buffer(&s.attn_out_buf, 0, 1);
+                        enc.set_bytes(&num_heads_u32.to_le_bytes(), 2);
+                        enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
+                        enc.set_bytes(&num_tiles.to_le_bytes(), 4);
+                        let tg_threads = (head_dim as u64).max(1).min(256);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(num_heads as u64, 1, 1),
+                            MTLSize::new(tg_threads, 1, 1),
+                        );
+                    } else {
+                        let mha_tg_size = s.mha_tg_size;
+                        enc.set_pipeline_state(&pipelines.multi_head_attention);
+                        enc.set_buffer(q_attn_buf, q_attn_off, 0);
+                        enc.set_buffer(&s.gpu_k_cache[layer_idx], 0, 1);
+                        enc.set_buffer(&s.gpu_v_cache[layer_idx], 0, 2);
+                        enc.set_buffer(&s.attn_out_buf, 0, 3);
+                        enc.set_buffer(&s.mha_scores_buf, 0, 4);
+                        enc.set_bytes(&num_heads_u32.to_le_bytes(), 5);
+                        enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 6);
+                        enc.set_bytes(&head_dim_u32.to_le_bytes(), 7);
+                        enc.set_bytes(&kv_dim_u32.to_le_bytes(), 8);
+                        enc.set_bytes(&seq_len_u32.to_le_bytes(), 9);
+                        enc.set_bytes(&attn_scale.to_le_bytes(), 10);
+                        enc.set_bytes(&max_seq_len_u32.to_le_bytes(), 11);
+                        let tg_threads = mha_tg_size.min((head_dim.max(new_seq_len) as u64).max(1));
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(num_heads as u64, 1, 1),
+                            MTLSize::new(tg_threads, 1, 1),
+                        );
                     }
                 } // end fallback (non-fused RoPE+KV+MHA)
 
@@ -1559,8 +1510,7 @@ impl MetalF32Backend {
                         && meta.wo_quant == QuantScheme::Q4_0
                         && pipelines.qmv_q4_0_wo_glue.is_some()
                         && matches!(s.qmv_attn_wo_qw.get(layer_idx), Some(Some(_)))
-                        && matches!(s.qmv_attn_wo_scales.get(layer_idx), Some(Some(_)))
-                        && (fa_skip & FULLATTN_SKIP_WO == 0);
+                        && matches!(s.qmv_attn_wo_scales.get(layer_idx), Some(Some(_)));
                     // Apply sigmoid(gate) * attn_out BEFORE Wo (Q+gate fusion).
                     // SKIPPED when glue_fold: the folded Wo kernel applies the gate.
                     if meta.has_qgate_fusion && !glue_fold {
@@ -1584,116 +1534,108 @@ impl MetalF32Backend {
                         enc.memory_barrier_with_scope(1);
                     }
                     // Non-fused Wo: attn_proj_buf = Wo * attn_out (NO residual)
-                    if fa_skip & FULLATTN_SKIP_WO == 0 {
-                        // MLX-style qmv fast path for the Q4_0 Wo projection when
-                        // decode-qmv buffers exist (env LUMEN_METAL_Q4_QMV_PROJ=1).
-                        // This branch is mathematically NON-residual (the residual is
-                        // added downstream by residual_add_copy), so feed qmv a ZERO
-                        // residual buffer: Wo*x + 0 == Wo*x exactly. Indexed by layer_idx.
-                        let qmv_wo = if meta.wo_quant == QuantScheme::Q4_0 {
-                            match (
-                                s.qmv_attn_wo_qw.get(layer_idx),
-                                s.qmv_attn_wo_scales.get(layer_idx),
-                                s.qmv_zero_residual_buf.as_ref(),
-                            ) {
-                                (Some(Some(qw)), Some(Some(sc)), Some(zero)) => {
-                                    Some((qw, sc, zero))
-                                }
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
-                        if glue_fold {
-                            // Glue-side elision: one dispatch folds the
-                            // sigmoid gate (on attn_out), the Wo matvec, the residual
-                            // add (x_buf), and the dual-write (x_buf + attn_proj).
-                            // Bindings: w@0, x=attn_out@1, accum=x_buf@2, in_dim@3,
-                            // scales@4, copy_dst=attn_proj@5, gate=gate_buf@6.
-                            // gate_fold guaranteed qmv_wo Some + glue pipeline Some.
-                            let (qw, sc, _zero) = qmv_wo.expect("glue_fold implies qmv_wo");
-                            let glue_pso = pipelines
-                                .qmv_q4_0_wo_glue
-                                .as_ref()
-                                .expect("glue_fold implies qmv_q4_0_wo_glue compiled");
-                            enc.set_pipeline_state(glue_pso);
-                            enc.set_buffer(qw, 0, 0);
-                            enc.set_buffer(&s.attn_out_buf, 0, 1);
-                            enc.set_buffer(&s.x_buf, 0, 2); // accum = residual src + write
-                            enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
-                            enc.set_buffer(sc, 0, 4);
-                            enc.set_buffer(&s.attn_proj_buf, 0, 5); // copy_dst
-                            enc.set_buffer(&s.gate_buf, 0, 6);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new((hidden_dim as u64) / 8, 1, 1),
-                                MTLSize::new(64, 1, 1),
-                            );
-                        } else if let Some((qw, sc, zero)) = qmv_wo {
-                            // qmv_q4_0_residual: w@0, x@1, out@2, in_dim@3, scales@4,
-                            // residual@5. in = q_dim (%512); out = hidden_dim (%8).
-                            enc.set_pipeline_state(&pipelines.qmv_q4_0_residual);
-                            enc.set_buffer(qw, 0, 0);
-                            enc.set_buffer(&s.attn_out_buf, 0, 1);
-                            enc.set_buffer(&s.attn_proj_buf, 0, 2);
-                            enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
-                            enc.set_buffer(sc, 0, 4);
-                            enc.set_buffer(zero, 0, 5);
-                            enc.dispatch_threadgroups(
-                                MTLSize::new((hidden_dim as u64) / 8, 1, 1),
-                                MTLSize::new(64, 1, 1),
-                            );
-                        } else {
-                            let tg_wo = match meta.wo_quant {
-                                QuantScheme::Q8_0 => {
-                                    enc.set_pipeline_state(
-                                        &pipelines.dequant_matmul_q8_0_deferred_nr2,
-                                    );
-                                    128u64
-                                }
-                                QuantScheme::Q4_0 => {
-                                    enc.set_pipeline_state(
-                                        &pipelines.dequant_matmul_q4_0_deferred_nr2,
-                                    );
-                                    128u64
-                                }
-                                QuantScheme::F16 => {
-                                    enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
-                                    128u64
-                                }
-                                QuantScheme::Bf16 => {
-                                    enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
-                                    128u64
-                                }
-                                _ => {
-                                    enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
-                                    matmul_tg_size
-                                }
-                            };
-                            enc.set_buffer(layer_buf, wo_off, 0);
-                            enc.set_buffer(&s.attn_out_buf, 0, 1);
-                            enc.set_buffer(&s.attn_proj_buf, 0, 2);
-                            enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
-                            if matches!(
-                                meta.wo_quant,
-                                QuantScheme::Q8_0
-                                    | QuantScheme::Q4_0
-                                    | QuantScheme::F16
-                                    | QuantScheme::Bf16
-                            ) {
-                                enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
-                            }
-                            let n_tg_wo = match meta.wo_quant {
-                                QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2,
-                                QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2,
-                                QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2,
-                                QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2,
-                                _ => hidden_dim as u64,
-                            };
-                            enc.dispatch_threadgroups(
-                                MTLSize::new(n_tg_wo, 1, 1),
-                                MTLSize::new(tg_wo, 1, 1),
-                            );
+                    // MLX-style qmv fast path for the Q4_0 Wo projection when
+                    // decode-qmv buffers exist (default).
+                    // This branch is mathematically NON-residual (the residual is
+                    // added downstream by residual_add_copy), so feed qmv a ZERO
+                    // residual buffer: Wo*x + 0 == Wo*x exactly. Indexed by layer_idx.
+                    let qmv_wo = if meta.wo_quant == QuantScheme::Q4_0 {
+                        match (
+                            s.qmv_attn_wo_qw.get(layer_idx),
+                            s.qmv_attn_wo_scales.get(layer_idx),
+                            s.qmv_zero_residual_buf.as_ref(),
+                        ) {
+                            (Some(Some(qw)), Some(Some(sc)), Some(zero)) => Some((qw, sc, zero)),
+                            _ => None,
                         }
+                    } else {
+                        None
+                    };
+                    if glue_fold {
+                        // Glue-side elision: one dispatch folds the
+                        // sigmoid gate (on attn_out), the Wo matvec, the residual
+                        // add (x_buf), and the dual-write (x_buf + attn_proj).
+                        // Bindings: w@0, x=attn_out@1, accum=x_buf@2, in_dim@3,
+                        // scales@4, copy_dst=attn_proj@5, gate=gate_buf@6.
+                        // gate_fold guaranteed qmv_wo Some + glue pipeline Some.
+                        let (qw, sc, _zero) = qmv_wo.expect("glue_fold implies qmv_wo");
+                        let glue_pso = pipelines
+                            .qmv_q4_0_wo_glue
+                            .as_ref()
+                            .expect("glue_fold implies qmv_q4_0_wo_glue compiled");
+                        enc.set_pipeline_state(glue_pso);
+                        enc.set_buffer(qw, 0, 0);
+                        enc.set_buffer(&s.attn_out_buf, 0, 1);
+                        enc.set_buffer(&s.x_buf, 0, 2); // accum = residual src + write
+                        enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
+                        enc.set_buffer(sc, 0, 4);
+                        enc.set_buffer(&s.attn_proj_buf, 0, 5); // copy_dst
+                        enc.set_buffer(&s.gate_buf, 0, 6);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new((hidden_dim as u64) / 8, 1, 1),
+                            MTLSize::new(64, 1, 1),
+                        );
+                    } else if let Some((qw, sc, zero)) = qmv_wo {
+                        // qmv_q4_0_residual: w@0, x@1, out@2, in_dim@3, scales@4,
+                        // residual@5. in = q_dim (%512); out = hidden_dim (%8).
+                        enc.set_pipeline_state(&pipelines.qmv_q4_0_residual);
+                        enc.set_buffer(qw, 0, 0);
+                        enc.set_buffer(&s.attn_out_buf, 0, 1);
+                        enc.set_buffer(&s.attn_proj_buf, 0, 2);
+                        enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
+                        enc.set_buffer(sc, 0, 4);
+                        enc.set_buffer(zero, 0, 5);
+                        enc.dispatch_threadgroups(
+                            MTLSize::new((hidden_dim as u64) / 8, 1, 1),
+                            MTLSize::new(64, 1, 1),
+                        );
+                    } else {
+                        let tg_wo = match meta.wo_quant {
+                            QuantScheme::Q8_0 => {
+                                enc.set_pipeline_state(&pipelines.dequant_matmul_q8_0_deferred_nr2);
+                                128u64
+                            }
+                            QuantScheme::Q4_0 => {
+                                enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2);
+                                128u64
+                            }
+                            QuantScheme::F16 => {
+                                enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
+                                128u64
+                            }
+                            QuantScheme::Bf16 => {
+                                enc.set_pipeline_state(pipelines.bf16_matvec_nr2());
+                                128u64
+                            }
+                            _ => {
+                                enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
+                                matmul_tg_size
+                            }
+                        };
+                        enc.set_buffer(layer_buf, wo_off, 0);
+                        enc.set_buffer(&s.attn_out_buf, 0, 1);
+                        enc.set_buffer(&s.attn_proj_buf, 0, 2);
+                        enc.set_bytes(&(q_dim as u32).to_le_bytes(), 3);
+                        if matches!(
+                            meta.wo_quant,
+                            QuantScheme::Q8_0
+                                | QuantScheme::Q4_0
+                                | QuantScheme::F16
+                                | QuantScheme::Bf16
+                        ) {
+                            enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 4);
+                        }
+                        let n_tg_wo = match meta.wo_quant {
+                            QuantScheme::Q8_0 => ((hidden_dim as u64) + 1) / 2,
+                            QuantScheme::Q4_0 => ((hidden_dim as u64) + 1) / 2,
+                            QuantScheme::F16 => ((hidden_dim as u64) + 1) / 2,
+                            QuantScheme::Bf16 => ((hidden_dim as u64) + 1) / 2,
+                            _ => hidden_dim as u64,
+                        };
+                        enc.dispatch_threadgroups(
+                            MTLSize::new(n_tg_wo, 1, 1),
+                            MTLSize::new(tg_wo, 1, 1),
+                        );
                     }
                     // Barrier: Wo writes attn_proj_buf
                     if needs_barriers {
@@ -1901,7 +1843,7 @@ impl MetalF32Backend {
                 } else {
                     // Standard fused Wo + Residual path
                     // MLX-style qmv fast path for the Q4_0 Wo projection when decode-qmv
-                    // buffers exist (env LUMEN_METAL_Q4_QMV_PROJ=1). This branch IS
+                    // buffers exist (default). This branch IS
                     // residual-fused, so feed qmv the real residual buffer (x_buf):
                     // Wo*x + x_buf, matching the NR2 residual kernel. Indexed by layer_idx.
                     let qmv_wo = if meta.wo_quant == QuantScheme::Q4_0 {
@@ -2266,7 +2208,7 @@ impl MetalF32Backend {
                     } else if hidden_dim <= 4096 {
                         // MLX-style DUAL-matrix qmv fast path for the Q4_0 dense
                         // FFN gate/up when decode-qmv buffers exist for this layer
-                        // (env LUMEN_METAL_Q4_QMV_GATEUP=1); else the 8row fused
+                        // (default); else the 8row fused
                         // path. Vec indexed by layer_idx. WILDCARD: 8row is already
                         // 256-thread/78% peak, so qmv (64-thread) MAY regress; the
                         // orchestrator A/Bs it empirically.
@@ -2535,7 +2477,7 @@ impl MetalF32Backend {
                 // Down projection + Residual 2 (fused)
                 {
                     // MLX-style qmv fast path when decode-qmv buffers exist for this
-                    // Q4_0 layer (env LUMEN_METAL_Q4_QMV_DOWN=1); else NR2.
+                    // Q4_0 layer (default); else NR2.
                     let qmv_down = if meta.w_down_quant == QuantScheme::Q4_0 {
                         match (
                             s.qmv_down_qw.get(layer_idx),
@@ -2549,7 +2491,7 @@ impl MetalF32Backend {
                     };
                     if let Some((qw, sc)) = qmv_down {
                         // F16-scales FFN-down: when the scale buffer was built
-                        // as f16 (env LUMEN_METAL_Q4_QMV_DOWN_F16SC=1 + kernel
+                        // as f16 (by default, when the f16sc kernel
                         // compiled) dispatch the f16sc kernel that reads
                         // `device const half*` scales; else the f32 kernel.
                         // BYTE-IDENTICAL math (only the scale element type and
@@ -2693,7 +2635,7 @@ impl MetalF32Backend {
             output_proj_quant,
             QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
         ) {
-            // MLX-style Q4 lm_head fast path (env LUMEN_METAL_Q4_QMV_LMHEAD=1):
+            // MLX-style Q4 lm_head fast path (default):
             // when the re-quantized Q4 output_proj decode-qmv buffers exist, run the
             // fused-RMSNorm `qmv_q4_0_rmsnorm` instead of the Q8 lm_head. Writes the
             // SAME logits buffer + layout ([vocab] f32) that the Q8 path writes, so
@@ -2702,7 +2644,7 @@ impl MetalF32Backend {
             if let (Some(qw), Some(sc)) = (s.qmv_lmhead_qw.as_ref(), s.qmv_lmhead_scales.as_ref()) {
                 // qmv_q4_0_rmsnorm: w@0, x@1, out@2, in_dim@3, scales@4, norm_w@5, eps@6.
                 // out_dim = vocab (%8==0), in_dim = hidden (%512==0). norm_w = final_norm.
-                // F16-scales fast path (env LUMEN_METAL_Q4_LMHEAD_F16SC=1): if the
+                // F16-scales fast path (default): if the
                 // scales buffer was built as f16 (2 B/block) and the f16sc kernel
                 // compiled, dispatch qmv_q4_0_rmsnorm_f16sc (reads `half*` scales).
                 // Byte-identical to the f32-scale kernel (f16 is the on-disk Q4_0

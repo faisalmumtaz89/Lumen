@@ -7277,94 +7277,6 @@ impl CudaBackend {
                 RuntimeError::Compute(format!("GDN prefill L{layer_idx}: ssm_beta weight missing",))
             })?;
 
-            // diagnostic: when LUMEN_DEBUG_DUMP_SSM_BETA_W=1 is set, dump the
-            // first 64 Q8 blocks (= row 16) of the ssm_beta weight buffer for
-            // off-line verification against the GGUF F32 weight.  One-shot per
-            // process invocation; head 16 specifically because per-head-drift
-            // bisection shows head 16 produces 22% drift while all
-            // others are < 1%.
-            if layer_idx == 0 && std::env::var("LUMEN_DEBUG_DUMP_SSM_BETA_W").is_ok() {
-                use super::gpu_buffers::GpuWeightBuf;
-                static W_DUMPED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !W_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    if let GpuWeightBuf::Q8Raw(ref q8buf) = ssm_beta {
-                        self.device.synchronize()?;
-                        let host = self.device.dtoh_copy(q8buf)?;
-                        let total = host.len();
-                        let path = "/tmp/ssm-beta-q8.bin".to_string();
-                        std::fs::write(&path, &host)
-                            .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
-                        eprintln!(
-                            "[scale-debug] L0 ssm_beta Q8 buf {} bytes -> {} \
-                             (expected: 32 rows × 64 blocks × 34 bytes = 69632)",
-                            total, path
-                        );
-                    } else {
-                        eprintln!(
-                            "[scale-debug] L0 ssm_beta is NOT Q8Raw (variant={:?})",
-                            std::mem::discriminant(ssm_beta)
-                        );
-                    }
-                }
-            }
-
-            // comprehensive runtime Q8 scale audit. When
-            // LUMEN_DUMP_RUNTIME_Q8_SCALES=1 is set, count zero scales across
-            // ALL F16 Q8 scales of ssm_alpha + ssm_beta L0. The audit succeeds
-            // (no zero scales) once the converter F16-subnormal fix is in
-            // effect on the LBC file. One-shot per process.
-            if layer_idx == 0 && std::env::var("LUMEN_DUMP_RUNTIME_Q8_SCALES").is_ok() {
-                use super::gpu_buffers::GpuWeightBuf;
-                static AUDITED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !AUDITED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    self.device.synchronize()?;
-                    for (name, buf_opt) in [
-                        ("ssm_beta", Some(ssm_beta)),
-                        ("ssm_alpha", lw.ssm_alpha.as_ref()),
-                    ] {
-                        if let Some(GpuWeightBuf::Q8Raw(ref q8buf)) = buf_opt {
-                            let host = self.device.dtoh_copy(q8buf)?;
-                            let n_blocks = host.len() / 34;
-                            let mut zero_scales = 0usize;
-                            let mut per_head_zero = [0usize; 32];
-                            let blocks_per_row = 64usize; // 2048 hidden / 32
-                            for blk in 0..n_blocks {
-                                let off = blk * 34;
-                                let scale = u16::from_le_bytes([host[off], host[off + 1]]);
-                                if scale == 0 {
-                                    zero_scales += 1;
-                                    let head = blk / blocks_per_row;
-                                    if head < 32 {
-                                        per_head_zero[head] += 1;
-                                    }
-                                }
-                            }
-                            eprintln!(
-                                "[scale-audit] L0 {} Q8: blocks={} zero_scales={} ({:.2}%)",
-                                name,
-                                n_blocks,
-                                zero_scales,
-                                100.0 * zero_scales as f64 / n_blocks as f64
-                            );
-                            for h in 0..32 {
-                                if per_head_zero[h] > 0 {
-                                    eprintln!(
-                                        "[scale-audit]   {} head {:2}: {} zero scales",
-                                        name, h, per_head_zero[h]
-                                    );
-                                }
-                            }
-                            // Write the buffer to a stable path for off-line verification.
-                            let path = format!("/tmp/debug-{}-q8.bin", name);
-                            std::fs::write(&path, &host)
-                                .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
-                        }
-                    }
-                }
-            }
-
             unsafe {
                 super::prefill::launch_gemm_projection(
                     &self.device,
@@ -7801,9 +7713,9 @@ impl CudaBackend {
                 // LUMEN_MOE_PROBE=1, default OFF -> byte-identical). Dumps the
                 // FINAL h_state (after scanning all `batch` tokens, i.e. the
                 // state through the last token of this prefill) and the
-                // conv_state circular buffer. Under LUMEN_FORCE_PREFILL_DECODE
-                // each decode step re-prefills the whole growing prefix from a
-                // fresh-zeroed state, so this final h_state == "state through
+                // conv_state circular buffer. When a decode step re-prefills the
+                // whole growing prefix from a fresh-zeroed state, this final
+                // h_state == "state through
                 // pos N" via the pure scan. Comparing it to the decode
                 // [GDNSTATE] mode=D phase=after (state through pos N via the
                 // incremental recurrence) is the H1/H2 discriminator. Mirrors
@@ -11980,40 +11892,6 @@ impl CudaBackend {
             let step = st.decode_token_count;
             eprintln!("[XCHK] step={step} residual_x sumsq={xsq:.6} absmax={xmx:.6}");
             eprintln!("[XCHK] step={step} logits sumsq={lsq:.6} absmax={lmx:.6} top8={top8:?}");
-        }
-        // [LOGITDUMP] DECODE-path near-tie dump (env LUMEN_LOGIT_DUMP=1, default
-        // OFF -> byte-identical). Same format as the compute_final hook; fires
-        // once per CPU-readback decode step so the near-tie step (after id
-        // 44896) is captured under the REAL incremental-decode KV state. Tagged
-        // mode=D and includes the decode_token_count step index.
-        if {
-            use std::sync::OnceLock;
-            static LD2: OnceLock<bool> = OnceLock::new();
-            *LD2.get_or_init(|| std::env::var("LUMEN_LOGIT_DUMP").as_deref() == Ok("1"))
-        } {
-            let sumsq = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
-            let logits_sumsq = sumsq(&logits_host);
-            let id_a = std::env::var("LUMEN_LOGIT_DUMP_A")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(1633);
-            let id_b = std::env::var("LUMEN_LOGIT_DUMP_B")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(1083);
-            let la = logits_host.get(id_a).copied().unwrap_or(f32::NAN);
-            let lb = logits_host.get(id_b).copied().unwrap_or(f32::NAN);
-            let mut idx: Vec<usize> = (0..logits_host.len()).collect();
-            idx.sort_unstable_by(|&i, &j| logits_host[j].total_cmp(&logits_host[i]));
-            let topk: Vec<(usize, f32)> =
-                idx.iter().take(8).map(|&i| (i, logits_host[i])).collect();
-            eprintln!(
-                "[LOGITDUMP] mode=D step={} logits_sumsq={logits_sumsq:.6} \
-                 id_a={id_a} logit_a={la:.6} id_b={id_b} logit_b={lb:.6} \
-                 margin_a_minus_b={:.6} top8={topk:?}",
-                st.decode_token_count,
-                (la as f64) - (lb as f64)
-            );
         }
         kv.advance_seq_len()?;
         st.decode_token_count += 1;
@@ -18905,55 +18783,6 @@ impl ComputeBackend for CudaBackend {
         self.device.synchronize()?;
         let logits_host = self.device.dtoh_copy(&st.logits_gpu)?;
 
-        // [LOGITDUMP] Cross-engine near-tie localization (env LUMEN_LOGIT_DUMP=1,
-        // default OFF -> byte-identical). Dumps the final-position next-token
-        // top-K logits plus the two specific near-tie ids and their margin, AND
-        // layout-independent whole-buffer sumsq of the lm_head INPUT (final hidden
-        // `x` and its post-final-RMSNorm `normed`) and the OUTPUT logits. This is
-        // the single hook that decides (a) the margin sign and (b) whether the
-        // divergence is at the lm_head/output_proj GEMM (input matches llama
-        // `result_norm` but output `result_output` diverges) or upstream (input
-        // already diverges -> walk back via [CHK] mode=P per-layer dumps).
-        if {
-            use std::sync::OnceLock;
-            static LD: OnceLock<bool> = OnceLock::new();
-            *LD.get_or_init(|| std::env::var("LUMEN_LOGIT_DUMP").as_deref() == Ok("1"))
-        } {
-            // Whole-buffer sumsq (layout-independent) of lm_head input/output.
-            let sumsq = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
-            let x_slice = x.as_f32_slice();
-            let x_sumsq = sumsq(x_slice);
-            let normed_host = self
-                .device
-                .dtoh_copy(&st.scratch.normed)
-                .unwrap_or_default();
-            let normed_sumsq = sumsq(&normed_host);
-            let logits_sumsq = sumsq(&logits_host);
-            // Specific near-tie ids and margin.
-            let id_a = std::env::var("LUMEN_LOGIT_DUMP_A")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(1633);
-            let id_b = std::env::var("LUMEN_LOGIT_DUMP_B")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(1083);
-            let la = logits_host.get(id_a).copied().unwrap_or(f32::NAN);
-            let lb = logits_host.get(id_b).copied().unwrap_or(f32::NAN);
-            // Top-K by value (full vocab argsort, K small).
-            let mut idx: Vec<usize> = (0..logits_host.len()).collect();
-            idx.sort_unstable_by(|&i, &j| logits_host[j].total_cmp(&logits_host[i]));
-            let topk: Vec<(usize, f32)> =
-                idx.iter().take(8).map(|&i| (i, logits_host[i])).collect();
-            eprintln!(
-                "[LOGITDUMP] x_sumsq={x_sumsq:.6} normed_sumsq={normed_sumsq:.6} \
-                 logits_sumsq={logits_sumsq:.6} id_a={id_a} logit_a={la:.6} \
-                 id_b={id_b} logit_b={lb:.6} margin_a_minus_b={:.6}",
-                (la as f64) - (lb as f64)
-            );
-            eprintln!("[LOGITDUMP] top8={topk:?}");
-        }
-
         Ok(Logits { data: logits_host })
     }
 
@@ -21923,43 +21752,6 @@ impl ComputeBackend for CudaBackend {
         // Set `LUMEN_CUDA_DECODE_DELAY_US=50` to opt in (Metal precedent).
         maybe_apply_cuda_decode_delay();
         let logits_host = self.device.dtoh_copy(&st.logits_gpu)?;
-
-        // [LOGITDUMP] DECODE-path near-tie dump (env LUMEN_LOGIT_DUMP=1, default
-        // OFF -> byte-identical). This is the ACTUAL incremental-decode logit
-        // production for GDN/MoE models (can_use_graph=false -> the non-graph
-        // else branch above). Fires once per decode step so the near-tie step
-        // (predicting the token after id 44896) is captured under the REAL
-        // incremental-decode KV state, which is where the 1633-vs-1083 flip
-        // lives (a fresh PREFILL of the same prefix does NOT flip).
-        if {
-            use std::sync::OnceLock;
-            static LD3: OnceLock<bool> = OnceLock::new();
-            *LD3.get_or_init(|| std::env::var("LUMEN_LOGIT_DUMP").as_deref() == Ok("1"))
-        } {
-            let sumsq = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
-            let logits_sumsq = sumsq(&logits_host);
-            let id_a = std::env::var("LUMEN_LOGIT_DUMP_A")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(1633);
-            let id_b = std::env::var("LUMEN_LOGIT_DUMP_B")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(1083);
-            let la = logits_host.get(id_a).copied().unwrap_or(f32::NAN);
-            let lb = logits_host.get(id_b).copied().unwrap_or(f32::NAN);
-            let mut idx: Vec<usize> = (0..logits_host.len()).collect();
-            idx.sort_unstable_by(|&i, &j| logits_host[j].total_cmp(&logits_host[i]));
-            let topk: Vec<(usize, f32)> =
-                idx.iter().take(8).map(|&i| (i, logits_host[i])).collect();
-            eprintln!(
-                "[LOGITDUMP] mode=D step={} logits_sumsq={logits_sumsq:.6} \
-                 id_a={id_a} logit_a={la:.6} id_b={id_b} logit_b={lb:.6} \
-                 margin_a_minus_b={:.6} top8={topk:?}",
-                st.decode_token_count,
-                (la as f64) - (lb as f64)
-            );
-        }
 
         // Advance host-side KV cache seq_len and decode counter.
         kv.advance_seq_len()?;

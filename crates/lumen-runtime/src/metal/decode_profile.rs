@@ -63,30 +63,11 @@ pub(crate) fn gputime_enabled() -> bool {
 // hazard barrier). No MTLSharedEvent is used. Byte-identical to the single-CB
 // path (metal-R9 P1, DET-001 + corpus). See `decode_token_greedy_core`.
 
-/// Explicit split-boundary override: `LUMEN_METAL_SPLIT_CB_AT_ORD=<N>` or a
-/// comma list `=a,b,c`. Each value is an encoder ordinal (a full-attn island
-/// CLOSE ordinal `2*layer+1`) at which to commit the accumulated per-token CB.
-/// When non-empty this list is used verbatim and the AUTO policy is ignored.
-/// Default unset => empty slice => (with AUTO off) byte-identical single-CB
-/// behavior. Parsed / sorted / de-duplicated once.
+/// Explicit per-token CB split boundaries. Always empty: the diagnostic
+/// `LUMEN_METAL_SPLIT_CB_AT_ORD` override was removed, so callers fall through
+/// to the AUTO split policy (byte-identical single-CB behavior when AUTO off).
 pub(crate) fn split_cb_ords() -> &'static [u32] {
-    static CACHE: OnceLock<Vec<u32>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            std::env::var("LUMEN_METAL_SPLIT_CB_AT_ORD")
-                .ok()
-                .map(|s| {
-                    let mut v: Vec<u32> = s
-                        .split(',')
-                        .filter_map(|x| x.trim().parse::<u32>().ok())
-                        .collect();
-                    v.sort_unstable();
-                    v.dedup();
-                    v
-                })
-                .unwrap_or_default()
-        })
-        .as_slice()
+    &[]
 }
 
 /// AUTO split-policy toggle: `LUMEN_METAL_CB_SPLIT`. Default-ON (metal-R10):
@@ -136,41 +117,6 @@ pub(crate) fn init_from_env() {
     if std::env::var("LUMEN_METAL_DECODE_GPUTIME").ok().as_deref() == Some("1") {
         GPUTIME_ENABLED.store(true, Ordering::Relaxed);
     }
-}
-
-/// Diagnostic sub-stage skip bitmask for the full-attention decode block, parsed
-/// once from `LUMEN_METAL_FULLATTN_SUBSKIP` (decimal or 0x-hex u32). When a bit is
-/// set, the matching sub-stage's GPU dispatch is skipped so its cost can be read
-/// off the `full_attn` per-section GPU time. Skipping corrupts the output (this is
-/// a timing-attribution tool only). 0 / unset => no-op (every sub-stage runs).
-///
-/// Bit layout (see `FULLATTN_SKIP_*` constants in `decode_greedy.rs`):
-///   bit0 K proj, bit1 V proj, bit2 RoPE+KV-write, bit3 attention (MHA/flash),
-///   bit4 Q+gate proj, bit5 Wo proj, bit6 deinterleave/norm/assemble + misc.
-#[inline]
-pub(crate) fn fullattn_subskip() -> u32 {
-    use std::sync::atomic::AtomicU32;
-    // Sentinel bit31 marks "already resolved" so a genuine mask of 0 is cached.
-    const RESOLVED: u32 = 0x8000_0000;
-    static CACHE: AtomicU32 = AtomicU32::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur & RESOLVED != 0 {
-        return cur & !RESOLVED;
-    }
-    let v = std::env::var("LUMEN_METAL_FULLATTN_SUBSKIP")
-        .ok()
-        .and_then(|s| {
-            let t = s.trim();
-            if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-                u32::from_str_radix(hex, 16).ok()
-            } else {
-                t.parse::<u32>().ok()
-            }
-        })
-        .unwrap_or(0)
-        & !RESOLVED; // never let the sentinel be a user-supplied bit
-    CACHE.store(v | RESOLVED, Ordering::Relaxed);
-    v
 }
 
 thread_local! {
@@ -362,15 +308,6 @@ pub(crate) fn maybe_report_and_reset(every: u64) {
     if !is_enabled() {
         return;
     }
-    // Diagnostic override: report after this many decode tokens instead of the
-    // built-in cadence. Lets a short run (e.g. one whose output hits EOS before
-    // the default 64-token mark) still emit a valid per-call average; the us/call
-    // is a per-call mean and is independent of the token count. Unset => default.
-    let every = std::env::var("LUMEN_METAL_DECODE_PROFILE_EVERY")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(every);
     let fire = TOK_COUNT.with(|c| {
         let mut c = c.borrow_mut();
         *c += 1;
