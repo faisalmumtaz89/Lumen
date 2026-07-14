@@ -198,21 +198,6 @@ pub(crate) struct KernelSet {
     // differs (load residual, add MMQ result, store sum).
     pub(crate) mmq_q8_0_batched_residual: Option<CudaFunction>,
 
-    // Tiled shared-memory-staged MMQ Q8_0 GEMM. Drop-in fast
-    // replacement for `mmq_q8_0_batched`: same Q8_0/Q8_1 INT8 dp4a numerics,
-    // but stages activation + weight tiles in shared memory (BM=32 x BN=128 x
-    // BK=8, 512 threads) with no cross-thread reduction, eliminating the
-    // matvec's redundant per-row-tile activation re-quant. Env-gated
-    // `LUMEN_CUDA_MMQ_TILED=1`.
-    pub(crate) mmq_q8_0_tiled: Option<CudaFunction>,
-    // Residual-add variant of `mmq_q8_0_tiled` (out = residual + W @ x).
-    pub(crate) mmq_q8_0_tiled_residual: Option<CudaFunction>,
-    // LEVER C: int8 tensor-core (mma.sync m16n8k32) dense Q8_0 GEMM. Numerics-
-    // identical drop-in for `mmq_q8_0_tiled` on the dense GDN/full-attn
-    // projections (validated BYTE-IDENTICAL to the dp4a kernel on 10 shapes).
-    // Env-gated `LUMEN_CUDA_MMQ_IMMA=1` (default OFF).
-    pub(crate) mmq_q8_0_imma: Option<CudaFunction>,
-
     // MMQ-style Q4_0 batched matmul (dp4a INT4 path). q4-specific twin of
     // `mmq_q8_0_batched`: Q4_0 weights x per-token-INT8-quantized activation,
     // INT32-exact dp4a with de-interleaved nibbles + -8 zero-point + once-only
@@ -280,13 +265,6 @@ pub(crate) struct KernelSet {
     pub(crate) gdn_decode_megakernel: Option<CudaFunction>,
     pub(crate) gdn_rmsnorm_silu_gate: Option<CudaFunction>,
 
-    // graph-compatible variant of gdn_decode_megakernel.
-    // Identical math but state_pos is read from a device pointer instead of a
-    // scalar arg, enabling CUDA graph capture for the GDN decode path. Paired
-    // with `advance_conv_position` (compiled in graph::GraphKernelSet) which
-    // increments the GPU-resident counter inside the captured graph.
-    pub(crate) gdn_decode_megakernel_graph: Option<CudaFunction>,
-
     // F64-internal-accumulator twins of the decode megakernels (MoE decode/prefill
     // precision parity). Same structure/geometry/shmem as the F32 megakernels but
     // the L2-norm reduction and the delta-rule recurrence accumulate in F64,
@@ -294,7 +272,6 @@ pub(crate) struct KernelSet {
     // Engaged only when `gdn_decode_megakernel_f64_enabled()` (MoE default, env
     // `LUMEN_CUDA_GDN_DECODE_MEGAKERNEL_F64` override). OFF is byte-identical.
     pub(crate) gdn_decode_megakernel_f64accum: Option<CudaFunction>,
-    pub(crate) gdn_decode_megakernel_graph_f64accum: Option<CudaFunction>,
 
     // GDN two-launch decode kernel pair (env-gated alternative to gdn_decode_megakernel).
     // gdn_phase123_register_resident: conv1d+silu+gates+L2-norm; writes Q/K/V/alpha/beta
@@ -309,22 +286,6 @@ pub(crate) struct KernelSet {
     pub(crate) gdn_phase123_register_resident: Option<CudaFunction>,
     pub(crate) gdn_phase4_register_resident: Option<CudaFunction>,
 
-    /// CUDA graph-capturable variant of `gdn_phase123_register_resident`.
-    /// Identical math; reads `state_pos` from a device pointer instead of a
-    /// host-scalar arg, so the dispatch's kernel-launch parameters are
-    /// identical across replays. Enables graph capture under
-    /// `LUMEN_CUDA_GDN_REGISTER_RESIDENT=1` (previously silently disabled). Pairs with
-    /// the existing `advance_conv_position` kernel for per-replay GPU-side
-    /// state position advancement.
-    pub(crate) gdn_phase123_register_resident_graph: Option<CudaFunction>,
-
-    // GDN Phase-4 coalesced-access variant (env-gated default OFF).
-    // Identical math to `gdn_phase4_register_resident`; lane-ownership change from
-    // `ki = lane*4 + r` to `ki = lane + r*32` produces a single 128B
-    // coalesced LDG.E.32 per warp per `r` instead of 4 strided sectors.
-    // Gated by `LUMEN_CUDA_GDN_PHASE4_COAL=1` (requires `LUMEN_CUDA_GDN_REGISTER_RESIDENT=1`).
-    pub(crate) gdn_phase4_register_resident_coal: Option<CudaFunction>,
-
     // GDN fused prefill kernels (eliminate per-token loop over decode kernels).
     // ssm_conv1d_silu_prefill: batched conv1d+SiLU across T tokens.
     // gdn_compute_gates_batched: batched gate computation for T * num_heads.
@@ -334,20 +295,8 @@ pub(crate) struct KernelSet {
     pub(crate) ssm_conv1d_silu_prefill: Option<CudaFunction>,
     pub(crate) gdn_compute_gates_batched: Option<CudaFunction>,
     pub(crate) l2_normalize_qk_strided: Option<CudaFunction>,
-    /// two-step rsqrtf L2-norm variant (eps=1e-6, rsqrtf(fmaxf(ss,eps^2))).
-    /// Env-gated by LUMEN_CUDA_L2NORM_RSQRTF=1. Default OFF preserves current behavior.
-    pub(crate) l2_normalize_qk_strided_rsqrtf: Option<CudaFunction>,
     pub(crate) gdn_prefill_fused_v3: Option<CudaFunction>,
     pub(crate) gdn_prefill_norm_gate: Option<CudaFunction>,
-
-    /// RMSNorm + SiLU-gate variant. Differences vs the
-    /// original above:
-    ///   1. Variance step uses `rsqrtf(mean + eps)` (one hardware op) instead
-    ///      of `1.0f / sqrtf(mean + eps)` (two IEEE ops).
-    ///   2. Cross-warp reduction uses a block-wide warp-shuffle SUM pattern.
-    /// Env-gated by `LUMEN_CUDA_RMSNORM_RSQRTF=1`; default OFF is byte-identical
-    /// to the original kernel above on Lumen's actual inputs.
-    pub(crate) gdn_prefill_norm_gate_rsqrtf: Option<CudaFunction>,
 
     // GDN F64-internal-accumulator variants (env-gated default OFF via
     // `LUMEN_CUDA_GDN_F64_ACCUM=1`). Address cumulative F32-ULP
@@ -356,37 +305,7 @@ pub(crate) struct KernelSet {
     pub(crate) gdn_prefill_fused_v3_f64accum: Option<CudaFunction>,
     pub(crate) gdn_prefill_norm_gate_f64accum: Option<CudaFunction>,
     pub(crate) gdn_phase4_register_resident_f64accum: Option<CudaFunction>,
-    /// Prefill-order twin of `gdn_phase4_register_resident_f64accum`: the
-    /// delta-rule arithmetic is reordered to match the prefill batched-scan
-    /// single-token step (`gdn_prefill_fused_v3_f64accum`) bit-for-bit (decay
-    /// state FIRST -> retrieval = SUM(d.k), then v_delta = b*(v-retrieval)),
-    /// eliminating the residual decode-vs-prefill GDN recurrence divergence.
-    /// Engaged on the decode phase4 site when `gdn_recur_prefill_order_enabled()`
-    /// (MoE-gated, env `LUMEN_CUDA_GDN_RECUR_PREFILL_ORDER`, default OFF).
-    pub(crate) gdn_phase4_register_resident_f64accum_prefillorder: Option<CudaFunction>,
     pub(crate) gdn_rmsnorm_silu_gate_f64accum: Option<CudaFunction>,
-    /// F64-internal-accumulator twin of `gdn_phase123_register_resident`
-    /// (conv1d + SiLU + L2-norm + gates in double, F32 write-back). Engaged on
-    /// the decode phase123 site when `gdn_f64_accum_enabled()` is true. Added so
-    /// the post-conv1d/SiLU/L2 Q/K consumed by the F64 phase4 are no longer
-    /// re-rounded through F32 reductions.
-    pub(crate) gdn_phase123_register_resident_f64accum: Option<CudaFunction>,
-    /// CUDA-graph-capturable twin (`state_pos` from device pointer).
-    pub(crate) gdn_phase123_register_resident_graph_f64accum: Option<CudaFunction>,
-
-    /// PHASE123 decode->prefill L2-norm ALIGNMENT twin of
-    /// `gdn_phase123_register_resident` (`LUMEN_CUDA_GDN_PHASE123_ALIGN`).
-    /// conv1d + SiLU stay F32 (bit-identical to the prefill
-    /// `ssm_conv1d_silu_prefill` single-token step) but the per-head L2-norm of
-    /// Q/K is computed with the EXACT F64 reduction of the prefill
-    /// `l2_normalize_qk_strided_f64accum` (which the MoE prefill already runs by
-    /// default). Engaged on the decode phase123 site when
-    /// `gdn_phase123_align_enabled()` is true; makes the decode q_norm/k_norm
-    /// bit-identical to a prefill of the same token. Distinct from the regressed
-    /// PHASE123_F64 (which raised conv1d to F64 too). Loaded best-effort.
-    pub(crate) gdn_phase123_register_resident_alignl2: Option<CudaFunction>,
-    /// CUDA-graph-capturable twin (`state_pos` from device pointer).
-    pub(crate) gdn_phase123_register_resident_graph_alignl2: Option<CudaFunction>,
 
     // Tensor-core Flash Attention (WMMA via inline PTX, SM 80+).
     // 16x16 query tiles via mma.sync.aligned.m16n8k16 for QK^T and PV.
@@ -403,21 +322,6 @@ pub(crate) struct KernelSet {
     // Performant fix: split-F16 (hi+lo) operands on BOTH QK^T and P@V,
     // recovering ~20-bit mantissa while staying on tensor cores.
     pub(crate) flash_attention_wmma_split: Option<CudaFunction>,
-
-    // Flash Attention 2 with mask block-skip (P1-3, long-context prefill).
-    // Br=4 rows per block, Bc=64 KV positions per tile. The kernel iterates
-    // only the lower-triangular tiles of (Q-tile, KV-tile); upper-triangular
-    // tiles past the causal boundary are never visited, saving O(seq_len^2/2)
-    // FLOPs at long contexts. Companion Split-K kernels emit per-slice
-    // (O, m, l) tuples for sequences large enough that a single CTA per
-    // (Q, head) underutilises the SM (seq_len > ~4096).
-    //
-    // Env gate: `LUMEN_CUDA_FA2_BLOCKSKIP=1` selects the new FA2 path at
-    // prefill dispatch in place of `flash_attention_wmma`/`flash_attention_br4`.
-    // Default OFF -- enabled per-session via the CLI/server `--fa2-blockskip` flag.
-    pub(crate) flash_attention_fa2_causal: Option<CudaFunction>,
-    pub(crate) flash_attention_fa2_splitk_partial: Option<CudaFunction>,
-    pub(crate) flash_attention_fa2_splitk_reduce: Option<CudaFunction>,
 
     // GPU-side argmax: finds index of max value in logits buffer.
     // Single block of 1024 threads, reads back 4 bytes instead of vocab_size*4.
@@ -516,32 +420,6 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q8_split_q8_1: Option<CudaFunction>,
     pub(crate) matvec_q8_split_q8_1_residual: Option<CudaFunction>,
 
-    // 4-threads-per-block split-Q8 matvec on the SAME byte layout.
-    // K-loop trip 4+ (vs Lumen's 1) addresses the warp scheduler
-    // starvation root cause observed at Q8 decode shapes.
-    // Selected when `LUMEN_CUDA_Q8_SPLIT_4THREAD=1` is set AND the kernel loaded.
-    pub(crate) matvec_q8_split_q8_1_4thread: Option<CudaFunction>,
-    pub(crate) matvec_q8_split_q8_1_4thread_residual: Option<CudaFunction>,
-
-    // NR=8 split-Q8 matvec: 4-threads-per-block thread mapping with NR=8
-    // (rows/CTA). The single parameter-combination not tested in any prior
-    // Lumen revision: 4-threads-per-block + K-trip=4+ + vdr=2 STACKED with NR=8
-    // (vs the 4thread variant which kept NR=2).
-    // Selected when `LUMEN_CUDA_Q8_SPLIT_NR8=1` is set AND the kernel loaded.
-    // Mutually exclusive with `use_q8_split_4thread_dispatch` -- NR8 takes
-    // priority if both env vars are set.
-    pub(crate) matvec_q8_split_q8_1_nr8: Option<CudaFunction>,
-    pub(crate) matvec_q8_split_q8_1_nr8_residual: Option<CudaFunction>,
-
-    // AoS NR=8 matvec: 4-threads-per-block thread mapping (vdr=2,
-    // blocks_per_iter=32, NR=8) applied to Lumen's AoS 36-byte block layout
-    // (the same parameters on the SPLIT/SoA layout regressed -4.85% e2e).
-    // Selected when `LUMEN_CUDA_Q8_AOS_NR8=1` is set AND the kernel
-    // loaded. Operates on the AoS dispatch path (`launch_matvec_preq8_1`),
-    // NOT the SPLIT path. Default OFF (default-off contract).
-    pub(crate) matvec_q8_aligned_nr8: Option<CudaFunction>,
-    pub(crate) matvec_q8_aligned_nr8_residual: Option<CudaFunction>,
-
     // Q4 split (SoA) matvec against pre-quantized Q8_1 input (dp4a, NR=4).
     pub(crate) matvec_q4_split_q8_1: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_residual: Option<CudaFunction>,
@@ -569,20 +447,6 @@ pub(crate) struct KernelSet {
     pub(crate) repack_q8_raw_to_split: Option<CudaFunction>,
     pub(crate) repack_q4_raw_to_split: Option<CudaFunction>,
 
-    // TILE: tile-grouped matvec kernels + one-time
-    // tile-layout repack kernels. Same byte density as the SPLIT layout but
-    // colocates 8 scales and 8 quant/nibble blocks within a single 144 B
-    // (Q4) / 272 B (Q8) tile to improve L1-sector locality. Opt-in via
-    // `LUMEN_CUDA_Q8_TILE=1` / `LUMEN_CUDA_Q4_TILE=1`; default OFF (Hard
-    // Rule 12). `Option<CudaFunction>` so a failed NVRTC compile falls back
-    // to the SPLIT / Aligned / Raw dispatch in `launch_matvec_preq8_1_tile`.
-    pub(crate) matvec_q8_tile_q8_1: Option<CudaFunction>,
-    pub(crate) matvec_q8_tile_q8_1_residual: Option<CudaFunction>,
-    pub(crate) matvec_q4_tile_q8_1: Option<CudaFunction>,
-    pub(crate) matvec_q4_tile_q8_1_residual: Option<CudaFunction>,
-    pub(crate) repack_q8_raw_to_tile: Option<CudaFunction>,
-    pub(crate) repack_q4_raw_to_tile: Option<CudaFunction>,
-
     // split-layout integration: runtime feature flags (computed in CudaBackend::init
     // from LUMEN_CUDA_* env vars and kernel availability). Stored on `KernelSet`
     // so the `launch_matvec_*` free functions can consult them without taking
@@ -593,24 +457,6 @@ pub(crate) struct KernelSet {
     /// When true AND the layer's `q8_split_*` sibling is `Some`, dispatch
     /// routes to `matvec_q8_split_q8_1` instead of the Q8Aligned/Q8Raw path.
     pub(crate) use_q8_split_dispatch: bool,
-    /// `LUMEN_CUDA_Q8_SPLIT_4THREAD=1` AND matvec_q8_split_q8_1_4thread loaded.
-    /// When true, the SPLIT dispatch uses the dp4a-mmvq kernel variant
-    /// (K-trip=4 thread mapping) instead of the Lumen-native split kernel.
-    /// Has no effect when `use_q8_split_dispatch` is false.
-    pub(crate) use_q8_split_4thread_dispatch: bool,
-    /// `LUMEN_CUDA_Q8_SPLIT_NR8=1` AND matvec_q8_split_q8_1_nr8 loaded.
-    /// When true, the SPLIT dispatch uses the dp4a-mmvq kernel variant
-    /// with NR=8 rows/CTA and the 4-thread mapping. Takes priority over
-    /// `use_q8_split_4thread_dispatch` when both env vars are set.
-    /// Default OFF (default-off contract).
-    pub(crate) use_q8_split_nr8_dispatch: bool,
-    /// `LUMEN_CUDA_Q8_AOS_NR8=1` AND matvec_q8_aligned_nr8 loaded.
-    /// When true, the AoS dispatch (`launch_matvec_preq8_1`) uses the
-    /// dp4a-mmvq kernel (NR=8 + 4-thread mapping) on the 36-byte block layout. Default OFF
-    /// (default-off contract). Independent of `use_q8_split_dispatch` —
-    /// the AoS NR8 operates whenever the dispatch path lands on
-    /// `launch_matvec_preq8_1` (i.e., when split is OFF, or fallback).
-    pub(crate) use_q8_aos_nr8_dispatch: bool,
     /// `LUMEN_CUDA_Q4_SPLIT=1` AND matvec_q4_split_q8_1 loaded.
     pub(crate) use_q4_split_dispatch: bool,
     /// `LUMEN_CUDA_SOA_LOCKED=1` AND matvec_q4_split_q8_1_locked loaded.
@@ -619,20 +465,6 @@ pub(crate) struct KernelSet {
     /// flag forces `use_q4_split` on so the SoA sibling buffers exist).
     /// Has no effect unless `use_q4_split_dispatch` is also true. Default OFF.
     pub(crate) use_soa_locked: bool,
-    /// `LUMEN_CUDA_Q8_TILE=1` AND matvec_q8_tile_q8_1 loaded.
-    /// When true AND the layer's `q8_tile_*` sibling is `Some`, dispatch
-    /// routes to `matvec_q8_tile_q8_1` instead of the SPLIT / Aligned / Raw
-    /// paths. Checked BEFORE `use_q8_split_dispatch` in
-    /// `launch_matvec_preq8_1_tile`.
-    pub(crate) use_q8_tile_dispatch: bool,
-    /// `LUMEN_CUDA_Q4_TILE=1` AND matvec_q4_tile_q8_1 loaded.
-    pub(crate) use_q4_tile_dispatch: bool,
-
-    /// `LUMEN_CUDA_FA2_BLOCKSKIP=1` AND flash_attention_fa2_causal loaded.
-    /// Routes prefill attention to the FA2 block-skip kernel in place of the
-    /// existing wmma/br4 dispatch when the env var is set at session start.
-    /// Has / P1-3 lineage; default OFF (default-off contract).
-    pub(crate) use_fa2_blockskip_dispatch: bool,
 
     // Fused gate+up+SwiGLU GEMV with inline RMSNorm for single-token decode.
     // Reads the input vector ONCE, computes gate and up projections simultaneously,
@@ -680,12 +512,6 @@ pub(crate) struct KernelSet {
     // rmsnorm_to_q8_1: RMSNorm + Q8_1 quantize in one kernel.
     // Replaces rmsnorm + quantize_f32_to_q8_1 at 2 sites/layer (attn_norm, ffn_norm).
     pub(crate) rmsnorm_to_q8_1: Option<CudaFunction>,
-    // rmsnorm_to_q8_1_rawsum: RMSNorm + Q8_1 quantize in one kernel, RAW-SUM
-    // convention (s = raw F32 sum of normed values), matching quantize_q8_1_rawsum.
-    // Wired into the Q4 lm_head "Path -1" (rawsum quantize + mul_mat_vec_q_q4_0)
-    // under LUMEN_CUDA_LMHEAD_FUSED to fuse the final rmsnorm + rawsum-quantize
-    // into one launch (bit-identical). Default-OFF.
-    pub(crate) rmsnorm_to_q8_1_rawsum: Option<CudaFunction>,
     // fused_residual_rmsnorm_q8_1: Residual add + RMSNorm + Q8_1 quantize.
     // For Q8_0 inter-layer boundaries: fuses residual_add_copy + rmsnorm + quantize_f32_to_q8_1.
     pub(crate) fused_residual_rmsnorm_q8_1: Option<CudaFunction>,
@@ -732,15 +558,10 @@ pub(crate) struct KernelSet {
     // expert-grouped dispatch. Gated behind `LUMEN_CUDA_MOE_PREFILL_BATCHED=1`.
     pub(crate) moe_router_logits_batched: Option<CudaFunction>,
     pub(crate) moe_grouped_gate_up_swiglu_q8_0: Option<CudaFunction>,
-    pub(crate) moe_grouped_gate_up_swiglu_q8_0_mtiled: Option<CudaFunction>,
     /// Tiled shmem-staged grouped gate+up+SwiGLU (BM16/BN64/BK8, dp4a,
     /// no cross-thread reduction). Engaged by `LUMEN_CUDA_MOE_GROUPED_TILED=1`.
     pub(crate) moe_grouped_gate_up_swiglu_q8_0_tiled: Option<CudaFunction>,
     pub(crate) moe_grouped_down_q8_0: Option<CudaFunction>,
-    /// Tiled shmem-staged grouped DOWN projection (BM16/BN128/BK8, dp4a,
-    /// no cross-thread reduction). Engaged by `LUMEN_CUDA_MOE_GROUPED_TILED=1`
-    /// (shares the gate+up tile gate + the same host `tiles16` column-tile list).
-    pub(crate) moe_grouped_down_q8_0_tiled: Option<CudaFunction>,
     /// Tiled grouped DOWN with EXACT F32 activation (the
     /// down-tiled quality rescue — same tile structure, BM16/BN64/BK8, but raw
     /// F32 activation dot instead of int8-quantized, matching the per-column
@@ -758,28 +579,16 @@ pub(crate) struct KernelSet {
     pub(crate) moe_grouped_gate_up_swiglu_bf16_tiled_f32act: Option<CudaFunction>,
     pub(crate) moe_grouped_down_bf16_tiled_f32act: Option<CudaFunction>,
     /// Offline aligned-plane weight REPACK for the routed-FFN down
-    /// projection. Runs once per MoE layer at preload, reading raw Q8_0 down
-    /// weights from the layer blob into aligned `d_q`/`d_s` planes consumed by
-    /// `moe_grouped_down_q8_0_fast_bn128` and the IMMA down kernel.
+    /// projection. Runs once per MoE layer at preload. The aligned `d_q`/`d_s`
+    /// planes are allocated for the repack struct but not consumed by the
+    /// current W10 gate+up path (retained as the repack-block gate handle).
     pub(crate) moe_repack_down_q8_0: Option<CudaFunction>,
-    /// Numerics-preserving fast down (`down_f32_fast_bn128`).
-    /// BM16/BN128/BK4, double-buffered, reads REPACKED aligned planes,
-    /// `char4`/`float4` vectorized staging. Recovers the +10.8% down headroom at
-    /// PRISTINE numerics (raw-F32 act, no int8 quant). Requires dynamic shmem
-    /// (52,224 B). Opt-in via `LUMEN_CUDA_MOE_DOWN_FAST_BN128=1`.
-    pub(crate) moe_grouped_down_q8_0_fast_bn128: Option<CudaFunction>,
     /// Offline aligned-plane REPACK for the routed-FFN gate+up (fused).
-    /// Builds the `gu_q`/`gu_s` planes consumed by the IMMA gate+up kernel.
+    /// Builds the `gu_q`/`gu_s` planes consumed by the W10 wide-M gate+up kernel.
     pub(crate) moe_repack_gate_up_q8_0: Option<CudaFunction>,
-    /// int8 TENSOR-CORE (IMMA) grouped gate+up+SwiGLU GEMM.
-    /// `mma.sync.m16n8k32.s8.s8.s32`, validated int8 tile maps (load_generic),
-    /// BM16/BN64/BK4, on-the-fly int8 x quant, per-block int32->f32 scale
-    /// (BIT-IDENTICAL to dp4a). Reads REPACKED gu_q/gu_s. Requires dynamic shmem
-    /// (47,616 B). Opt-in via `LUMEN_CUDA_MOE_GATE_UP_IMMA=1`.
-    pub(crate) moe_grouped_gate_up_swiglu_q8_0_imma: Option<CudaFunction>,
     /// One-time compact K-major activation prequant (`xq_q`/`xq_d`) so
     /// the register-C gate+up GEMM never re-quantizes x across row-tiles. Bit-
-    /// identical activation quant rule to the IMMA on-the-fly path.
+    /// identical activation quant rule used by the W10 wide-M gate+up path.
     pub(crate) moe_prequant_x_q8: Option<CudaFunction>,
     /// Register-resident-C + wide-M (bucketed {16,32,48,64} cols × N=128
     /// rows) IMMA gate+up (no stream-K). Tile-validated
@@ -799,12 +608,6 @@ pub(crate) struct KernelSet {
     // replaces the per-(row,token) matvec shared kernels. Helps every quant.
     pub(crate) shared_glu_gemv_q4_0_batched_tiled_f32act: Option<CudaFunction>,
     pub(crate) shared_down_q4_0_accum_batched_tiled_f32act: Option<CudaFunction>,
-    // fused persistent gate+up+SwiGLU+down+accum kernel (Q8_0).
-    // Eliminates the HBM round-trip on swiglu_buf by keeping the K-expert
-    // SwiGLU intermediate in shmem. One launch replaces the
-    // (gate_up_v3 + down_v3 + accum_option_a) trio. Gated behind
-    // `LUMEN_CUDA_MOE_FUSED_PERSISTENT=1` (default OFF; opt-in).
-    pub(crate) moe_batched_persistent_gate_up_swiglu_down_accum_q8_0: Option<CudaFunction>,
     // fused FFN-norm + router single-launch kernel.
     // Replaces (standalone `rmsnorm` writing `normed_out` + `moe_router_fused_atomic_v2`)
     // pair with one launch. Saves ~1 µs/layer launch overhead + the global write/read
@@ -897,10 +700,6 @@ pub(crate) struct KernelSet {
     pub(crate) moe_shared_dot_f32: Option<CudaFunction>,
     pub(crate) moe_shared_sigmoid_gated_accum: Option<CudaFunction>,
     pub(crate) moe_shared_residual_accum: Option<CudaFunction>,
-    // fused shared-expert FFN kernels (collapses 5-6 launches to 3).
-    pub(crate) fused_glu_gemv_q4_0_prenormed_no_norm: Option<CudaFunction>,
-    pub(crate) moe_shared_down_q4_0_sigmoid_accum: Option<CudaFunction>,
-    pub(crate) moe_shared_down_q4_0_residual_accum: Option<CudaFunction>,
 }
 
 /// Compile all CUDA kernels via NVRTC and return the kernel function handles.
@@ -1119,42 +918,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        // Tiled shared-memory-staged MMQ Q8_0 GEMM + residual variant.
-        mmq_q8_0_tiled: match load_fn_sm80(shaders::MMQ_Q8_0_TILED_KERNEL_SOURCE, "mmq_q8_0_tiled")
-        {
-            Ok(f) => {
-                cuda_log!("[CUDA] mmq_q8_0_tiled: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] mmq_q8_0_tiled: FAILED: {e}");
-                None
-            }
-        },
-        mmq_q8_0_tiled_residual: match load_fn_sm80(
-            shaders::MMQ_Q8_0_TILED_KERNEL_SOURCE,
-            "mmq_q8_0_tiled_residual",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] mmq_q8_0_tiled_residual: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] mmq_q8_0_tiled_residual: FAILED: {e}");
-                None
-            }
-        },
-        // LEVER C int8-TC dense Q8_0 GEMM (mma.sync) — same source file.
-        mmq_q8_0_imma: match load_fn_sm80(shaders::MMQ_Q8_0_TILED_KERNEL_SOURCE, "mmq_q8_0_imma") {
-            Ok(f) => {
-                cuda_log!("[CUDA] mmq_q8_0_imma: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] mmq_q8_0_imma: FAILED: {e}");
-                None
-            }
-        },
         // q4-specific MMQ INT4 batched matmul (mul_mat_q-grade numerics).
         mmq_q4_0_batched: match load_fn_sm80(shaders::MMQ_Q4_0_KERNEL_SOURCE, "mmq_q4_0_batched") {
             Ok(f) => {
@@ -1241,36 +1004,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             "flash_attention_wmma_split",
         )
         .ok(),
-        flash_attention_fa2_causal: match load_fn(
-            shaders::FLASH_ATTENTION_FA2_KERNEL_SOURCE,
-            "flash_attention_fa2_causal",
-        ) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                cuda_log!("[CUDA] FA2 block-skip: FAILED: {e}");
-                None
-            }
-        },
-        flash_attention_fa2_splitk_partial: match load_fn(
-            shaders::FLASH_ATTENTION_FA2_KERNEL_SOURCE,
-            "flash_attention_fa2_splitk_partial",
-        ) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                cuda_log!("[CUDA] FA2 Split-K partial: FAILED: {e}");
-                None
-            }
-        },
-        flash_attention_fa2_splitk_reduce: match load_fn(
-            shaders::FLASH_ATTENTION_FA2_KERNEL_SOURCE,
-            "flash_attention_fa2_splitk_reduce",
-        ) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                cuda_log!("[CUDA] FA2 Split-K reduce: FAILED: {e}");
-                None
-            }
-        },
         argmax_f32: load_fn(shaders::ARGMAX_KERNEL_SOURCE, "argmax_f32")?,
         // Q8_0 shared-memory matvec (PRIMARY Q8_0 decode path)
         matvec_q8_0_smem: match load_fn(shaders::MATVEC_Q8_0_SMEM_KERNEL_SOURCE, "matvec_q8_0_smem")
@@ -1351,20 +1084,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        // graph-compatible megakernel (state_pos via device pointer).
-        gdn_decode_megakernel_graph: match load_fn(
-            shaders::GDN_MEGAKERNEL_SOURCE,
-            "gdn_decode_megakernel_graph",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] gdn_decode_megakernel_graph: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] gdn_decode_megakernel_graph: FAILED: {e}");
-                None
-            }
-        },
         // F64-accum decode megakernel twins (MoE decode/prefill precision parity)
         gdn_decode_megakernel_f64accum: match load_fn(
             shaders::GDN_MEGAKERNEL_SOURCE,
@@ -1376,19 +1095,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] gdn_decode_megakernel_f64accum: FAILED: {e}");
-                None
-            }
-        },
-        gdn_decode_megakernel_graph_f64accum: match load_fn(
-            shaders::GDN_MEGAKERNEL_SOURCE,
-            "gdn_decode_megakernel_graph_f64accum",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] gdn_decode_megakernel_graph_f64accum: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] gdn_decode_megakernel_graph_f64accum: FAILED: {e}");
                 None
             }
         },
@@ -1419,34 +1125,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        // CUDA graph-capturable variant (device-pointer state_pos)
-        gdn_phase123_register_resident_graph: match load_fn(
-            shaders::GDN_REGISTER_RESIDENT_KERNEL_SOURCE,
-            "gdn_phase123_register_resident_graph",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] gdn_phase123_register_resident_graph: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] gdn_phase123_register_resident_graph: FAILED: {e}");
-                None
-            }
-        },
-        // GDN Phase 4 coalesced variant (env-gated default OFF)
-        gdn_phase4_register_resident_coal: match load_fn(
-            shaders::GDN_REGISTER_RESIDENT_KERNEL_SOURCE,
-            "gdn_phase4_register_resident_coal",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] gdn_phase4_register_resident_coal: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] gdn_phase4_register_resident_coal: FAILED: {e}");
-                None
-            }
-        },
         // GDN fused prefill kernels
         ssm_conv1d_silu_prefill: load_fn(shaders::GDN_KERNEL_SOURCE, "ssm_conv1d_silu_prefill")
             .ok(),
@@ -1454,20 +1132,8 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             .ok(),
         l2_normalize_qk_strided: load_fn(shaders::GDN_KERNEL_SOURCE, "l2_normalize_qk_strided")
             .ok(),
-        l2_normalize_qk_strided_rsqrtf: load_fn(
-            shaders::GDN_KERNEL_SOURCE,
-            "l2_normalize_qk_strided_rsqrtf",
-        )
-        .ok(),
         gdn_prefill_fused_v3: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_fused_v3").ok(),
         gdn_prefill_norm_gate: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_norm_gate").ok(),
-        // RMSNorm + SiLU-gate variant. Loaded best-effort;
-        // engaged only when LUMEN_CUDA_RMSNORM_RSQRTF=1 is set.
-        gdn_prefill_norm_gate_rsqrtf: load_fn(
-            shaders::GDN_KERNEL_SOURCE,
-            "gdn_prefill_norm_gate_rsqrtf",
-        )
-        .ok(),
         // accumulator variants. Default-OFF; loaded best-effort.
         l2_normalize_qk_strided_f64accum: match load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,
@@ -1521,19 +1187,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        gdn_phase4_register_resident_f64accum_prefillorder: match load_fn(
-            shaders::GDN_F64ACCUM_KERNEL_SOURCE,
-            "gdn_phase4_register_resident_f64accum_prefillorder",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] gdn_phase4_register_resident_f64accum_prefillorder: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] gdn_phase4_register_resident_f64accum_prefillorder: FAILED: {e}");
-                None
-            }
-        },
         gdn_rmsnorm_silu_gate_f64accum: match load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,
             "gdn_rmsnorm_silu_gate_f64accum",
@@ -1544,58 +1197,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] gdn_rmsnorm_silu_gate_f64accum: FAILED: {e}");
-                None
-            }
-        },
-        gdn_phase123_register_resident_f64accum: match load_fn(
-            shaders::GDN_F64ACCUM_KERNEL_SOURCE,
-            "gdn_phase123_register_resident_f64accum",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] gdn_phase123_register_resident_f64accum: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] gdn_phase123_register_resident_f64accum: FAILED: {e}");
-                None
-            }
-        },
-        gdn_phase123_register_resident_graph_f64accum: match load_fn(
-            shaders::GDN_F64ACCUM_KERNEL_SOURCE,
-            "gdn_phase123_register_resident_graph_f64accum",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] gdn_phase123_register_resident_graph_f64accum: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] gdn_phase123_register_resident_graph_f64accum: FAILED: {e}");
-                None
-            }
-        },
-        gdn_phase123_register_resident_alignl2: match load_fn(
-            shaders::GDN_F64ACCUM_KERNEL_SOURCE,
-            "gdn_phase123_register_resident_alignl2",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] gdn_phase123_register_resident_alignl2: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] gdn_phase123_register_resident_alignl2: FAILED: {e}");
-                None
-            }
-        },
-        gdn_phase123_register_resident_graph_alignl2: match load_fn(
-            shaders::GDN_F64ACCUM_KERNEL_SOURCE,
-            "gdn_phase123_register_resident_graph_alignl2",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] gdn_phase123_register_resident_graph_alignl2: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] gdn_phase123_register_resident_graph_alignl2: FAILED: {e}");
                 None
             }
         },
@@ -1914,87 +1515,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        matvec_q8_split_q8_1_4thread: match load_fn_sm80_fast_math(
-            shaders::MATVEC_Q8_SPLIT_Q8_1_4THREAD_KERNEL_SOURCE,
-            "matvec_q8_split_q8_1_4thread",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_q8_split_q8_1_4thread: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_q8_split_q8_1_4thread: FAILED: {e}");
-                None
-            }
-        },
-        matvec_q8_split_q8_1_4thread_residual: match load_fn_sm80_fast_math(
-            shaders::MATVEC_Q8_SPLIT_Q8_1_4THREAD_KERNEL_SOURCE,
-            "matvec_q8_split_q8_1_4thread_residual",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_q8_split_q8_1_4thread_residual: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_q8_split_q8_1_4thread_residual: FAILED: {e}");
-                None
-            }
-        },
-        // NR=8 split-Q8 matvec (4-threads-per-block, NR=8 rows/CTA).
-        matvec_q8_split_q8_1_nr8: match load_fn_sm80_fast_math(
-            shaders::MATVEC_Q8_SPLIT_Q8_1_NR8_KERNEL_SOURCE,
-            "matvec_q8_split_q8_1_nr8",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_q8_split_q8_1_nr8: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_q8_split_q8_1_nr8: FAILED: {e}");
-                None
-            }
-        },
-        matvec_q8_split_q8_1_nr8_residual: match load_fn_sm80_fast_math(
-            shaders::MATVEC_Q8_SPLIT_Q8_1_NR8_KERNEL_SOURCE,
-            "matvec_q8_split_q8_1_nr8_residual",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_q8_split_q8_1_nr8_residual: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_q8_split_q8_1_nr8_residual: FAILED: {e}");
-                None
-            }
-        },
-        // AoS NR=8 matvec (4-threads-per-block thread mapping on Lumen's
-        // 36-byte aligned block layout).
-        matvec_q8_aligned_nr8: match load_fn_sm80_fast_math(
-            shaders::MATVEC_Q8_ALIGNED_NR8_KERNEL_SOURCE,
-            "matvec_q8_aligned_nr8",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_q8_aligned_nr8: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_q8_aligned_nr8: FAILED: {e}");
-                None
-            }
-        },
-        matvec_q8_aligned_nr8_residual: match load_fn_sm80_fast_math(
-            shaders::MATVEC_Q8_ALIGNED_NR8_KERNEL_SOURCE,
-            "matvec_q8_aligned_nr8_residual",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_q8_aligned_nr8_residual: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_q8_aligned_nr8_residual: FAILED: {e}");
-                None
-            }
-        },
         matvec_q4_split_q8_1: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE,
             "matvec_q4_split_q8_1",
@@ -2142,87 +1662,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] repack_q4_raw_to_split: FAILED: {e}");
-                None
-            }
-        },
-        // TILE: tile-grouped Q8 / Q4 matvec kernels + one-time repack
-        // kernels. Failures are non-fatal -- caller falls back to SPLIT /
-        // Aligned / Raw via `launch_matvec_preq8_1_tile`.
-        matvec_q8_tile_q8_1: match load_fn_sm80_fast_math(
-            shaders::MATVEC_Q8_TILE_Q8_1_KERNEL_SOURCE,
-            "matvec_q8_tile_q8_1",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_q8_tile_q8_1: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_q8_tile_q8_1: FAILED: {e}");
-                None
-            }
-        },
-        matvec_q8_tile_q8_1_residual: match load_fn_sm80_fast_math(
-            shaders::MATVEC_Q8_TILE_Q8_1_KERNEL_SOURCE,
-            "matvec_q8_tile_q8_1_residual",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_q8_tile_q8_1_residual: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_q8_tile_q8_1_residual: FAILED: {e}");
-                None
-            }
-        },
-        matvec_q4_tile_q8_1: match load_fn_sm80_fast_math(
-            shaders::MATVEC_Q4_TILE_Q8_1_KERNEL_SOURCE,
-            "matvec_q4_tile_q8_1",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_q4_tile_q8_1: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_q4_tile_q8_1: FAILED: {e}");
-                None
-            }
-        },
-        matvec_q4_tile_q8_1_residual: match load_fn_sm80_fast_math(
-            shaders::MATVEC_Q4_TILE_Q8_1_KERNEL_SOURCE,
-            "matvec_q4_tile_q8_1_residual",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_q4_tile_q8_1_residual: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_q4_tile_q8_1_residual: FAILED: {e}");
-                None
-            }
-        },
-        repack_q8_raw_to_tile: match load_fn(
-            shaders::REPACK_Q8_TILE_KERNEL_SOURCE,
-            "repack_q8_raw_to_tile",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] repack_q8_raw_to_tile: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] repack_q8_raw_to_tile: FAILED: {e}");
-                None
-            }
-        },
-        repack_q4_raw_to_tile: match load_fn(
-            shaders::REPACK_Q4_TILE_KERNEL_SOURCE,
-            "repack_q4_raw_to_tile",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] repack_q4_raw_to_tile: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] repack_q4_raw_to_tile: FAILED: {e}");
                 None
             }
         },
@@ -2435,20 +1874,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] rmsnorm_to_q8_1: FAILED: {e}");
-                None
-            }
-        },
-        // Fused RMSNorm + Q8_1 quantize, RAW-SUM convention (Q4 lm_head Path -1).
-        rmsnorm_to_q8_1_rawsum: match load_fn(
-            shaders::RMSNORM_Q8_1_KERNEL_SOURCE,
-            "rmsnorm_to_q8_1_rawsum",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] rmsnorm_to_q8_1_rawsum: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] rmsnorm_to_q8_1_rawsum: FAILED: {e}");
                 None
             }
         },
@@ -2685,19 +2110,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        moe_grouped_gate_up_swiglu_q8_0_mtiled: match load_fn_sm80(
-            shaders::MOE_GROUPED_KERNEL_SOURCE,
-            "moe_grouped_gate_up_swiglu_q8_0_mtiled",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_mtiled: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_mtiled: FAILED: {e}");
-                None
-            }
-        },
         moe_grouped_gate_up_swiglu_q8_0_tiled: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_grouped_gate_up_swiglu_q8_0_tiled",
@@ -2721,19 +2133,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] moe_grouped_down_q8_0: FAILED: {e}");
-                None
-            }
-        },
-        moe_grouped_down_q8_0_tiled: match load_fn_sm80(
-            shaders::MOE_GROUPED_KERNEL_SOURCE,
-            "moe_grouped_down_q8_0_tiled",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] moe_grouped_down_q8_0_tiled: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] moe_grouped_down_q8_0_tiled: FAILED: {e}");
                 None
             }
         },
@@ -2817,19 +2216,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        moe_grouped_down_q8_0_fast_bn128: match load_fn_sm80(
-            shaders::MOE_GROUPED_KERNEL_SOURCE,
-            "moe_grouped_down_q8_0_fast_bn128",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] moe_grouped_down_q8_0_fast_bn128: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] moe_grouped_down_q8_0_fast_bn128: FAILED: {e}");
-                None
-            }
-        },
         moe_repack_gate_up_q8_0: match load_fn_sm80(
             shaders::MOE_GROUPED_KERNEL_SOURCE,
             "moe_repack_gate_up_q8_0",
@@ -2840,19 +2226,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] moe_repack_gate_up_q8_0: FAILED: {e}");
-                None
-            }
-        },
-        moe_grouped_gate_up_swiglu_q8_0_imma: match load_fn_sm80(
-            shaders::MOE_GROUPED_KERNEL_SOURCE,
-            "moe_grouped_gate_up_swiglu_q8_0_imma",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_imma: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] moe_grouped_gate_up_swiglu_q8_0_imma: FAILED: {e}");
                 None
             }
         },
@@ -3017,21 +2390,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
         },
         // fused persistent gate+up+SwiGLU+down+accum.
-        moe_batched_persistent_gate_up_swiglu_down_accum_q8_0: match load_fn(
-            shaders::MOE_BATCHED_KERNEL_SOURCE,
-            "moe_batched_persistent_gate_up_swiglu_down_accum_q8_0",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] moe_batched_persistent_gate_up_swiglu_down_accum_q8_0: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!(
-                    "[CUDA] moe_batched_persistent_gate_up_swiglu_down_accum_q8_0: FAILED: {e}"
-                );
-                None
-            }
-        },
         // fused FFN-norm + router single-launch kernel.
         // Replaces 2 launches (standalone `rmsnorm` + `moe_router_fused_atomic_v2`)
         // with 1. Gated behind `LUMEN_CUDA_MOE_FUSED_NORM_ROUTER=1` (default-on
@@ -3519,61 +2877,14 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        // fused shared-expert FFN kernels (NVRTC; silent-disable on fail).
-        fused_glu_gemv_q4_0_prenormed_no_norm: match load_fn(
-            shaders::MOE_SHARED_ACCUM_KERNEL_SOURCE,
-            "fused_glu_gemv_q4_0_prenormed_no_norm",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] fused_glu_gemv_q4_0_prenormed_no_norm: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] fused_glu_gemv_q4_0_prenormed_no_norm: FAILED: {e}");
-                None
-            }
-        },
-        moe_shared_down_q4_0_sigmoid_accum: match load_fn(
-            shaders::MOE_SHARED_ACCUM_KERNEL_SOURCE,
-            "moe_shared_down_q4_0_sigmoid_accum",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] moe_shared_down_q4_0_sigmoid_accum: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] moe_shared_down_q4_0_sigmoid_accum: FAILED: {e}");
-                None
-            }
-        },
-        moe_shared_down_q4_0_residual_accum: match load_fn(
-            shaders::MOE_SHARED_ACCUM_KERNEL_SOURCE,
-            "moe_shared_down_q4_0_residual_accum",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] moe_shared_down_q4_0_residual_accum: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] moe_shared_down_q4_0_residual_accum: FAILED: {e}");
-                None
-            }
-        },
         // split-layout integration: feature flags. Start OFF; flipped on in
         // `CudaBackend::init()` after reading LUMEN_CUDA_* env vars and
         // verifying the corresponding kernel(s) loaded successfully.
         use_q8_scale_hw: false,
         use_q8_split_dispatch: false,
-        use_q8_split_4thread_dispatch: false,
-        use_q8_split_nr8_dispatch: false,
-        use_q8_aos_nr8_dispatch: false,
         use_q4_split_dispatch: false,
         use_soa_locked: false,
-        // TILE feature flags. Same handling as SPLIT.
-        use_q8_tile_dispatch: false,
-        use_q4_tile_dispatch: false,
         // FA2 block-skip dispatch flag (default-off contract: default OFF, env-gated).
-        use_fa2_blockskip_dispatch: false,
     };
 
     // Raise the attention_decode kernel's per-block dynamic shared-memory cap
@@ -3582,47 +2893,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
     // cannot service the request keep the default cap and only long-context
     // decode is affected.
     opt_in_attention_decode_dyn_shmem(&[&kernels.attention_decode])?;
-
-    // The `down_f32_fast_bn128` kernel needs 52,224 B of dynamic
-    // shared memory (> the 48 KB static cap) and PreferredSharedMemoryCarveout=100
-    // to fit 3 CTAs/SM. Best-effort (non-fatal): if declined the kernel won't
-    // launch and dispatch falls back to the f32act / per-column path.
-    if let Some(f) = kernels.moe_grouped_down_q8_0_fast_bn128.as_ref() {
-        use cudarc::driver::sys::CUfunction_attribute_enum::{
-            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
-        };
-        if let Err(e) = f.set_attribute(
-            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            56 * 1024_i32,
-        ) {
-            eprintln!(
-                "[lumen-cuda] moe_grouped_down_q8_0_fast_bn128 dyn-shmem opt-in \
-                 declined ({e}); fast BN=128 down disabled"
-            );
-        } else {
-            // Carveout=100 -> prefer max shared (occupancy: 3*52224 < 163840).
-            let _ = f.set_attribute(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100_i32);
-        }
-    }
-
-    // The IMMA gate+up kernel uses 47,616 B dynamic shmem. Raise the
-    // limit + carveout=100 for 3 CTAs/SM. Best-effort (non-fatal).
-    if let Some(f) = kernels.moe_grouped_gate_up_swiglu_q8_0_imma.as_ref() {
-        use cudarc::driver::sys::CUfunction_attribute_enum::{
-            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
-        };
-        if let Err(e) = f.set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 49_152_i32)
-        {
-            eprintln!(
-                "[lumen-cuda] moe_grouped_gate_up_swiglu_q8_0_imma dyn-shmem opt-in \
-                 declined ({e}); IMMA gate+up disabled"
-            );
-        } else {
-            let _ = f.set_attribute(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100_i32);
-        }
-    }
 
     Ok(kernels)
 }
@@ -4363,60 +3633,6 @@ pub(crate) fn flash_attention_wmma_split_shared_bytes(head_dim: u32) -> u32 {
         + (br * 4)
         + (br * 4)
 }
-
-// ------------------------------------------------------------------
-// FA2 block-skip constants and helpers (must match flash_attention_fa2.cu)
-// ------------------------------------------------------------------
-
-/// KV tile size for FA2 block-skip kernel (must match `FA2_BC`).
-pub(crate) const FA2_BC: u32 = 64;
-
-/// Query rows per block in `flash_attention_fa2_causal` (must match `FA2_BR`).
-pub(crate) const FA2_BR: u32 = 4;
-
-/// Block size for `flash_attention_fa2_causal` (128 threads = 4 warps).
-pub(crate) fn flash_attention_fa2_block_size() -> u32 {
-    128
-}
-
-/// Shared memory bytes for `flash_attention_fa2_causal`.
-///
-/// Layout: q_rows[FA2_BR][head_dim] + s_tiles[FA2_BR][FA2_BC] floats.
-pub(crate) fn flash_attention_fa2_shared_bytes(head_dim: u32) -> u32 {
-    FA2_BR * (head_dim + FA2_BC) * 4
-}
-
-/// Block size for `flash_attention_fa2_splitk_partial` (one warp).
-pub(crate) fn flash_attention_fa2_splitk_partial_block_size() -> u32 {
-    32
-}
-
-/// Shared memory bytes for `flash_attention_fa2_splitk_partial`.
-///
-/// Layout: q_shmem[head_dim] + s_tile[FA2_BC] floats.
-pub(crate) fn flash_attention_fa2_splitk_partial_shared_bytes(head_dim: u32) -> u32 {
-    (head_dim + FA2_BC) * 4
-}
-
-/// Block size for `flash_attention_fa2_splitk_reduce`.
-pub(crate) fn flash_attention_fa2_splitk_reduce_block_size() -> u32 {
-    256
-}
-
-/// Shared memory bytes for `flash_attention_fa2_splitk_reduce`.
-///
-/// Layout: m_arr[N] + l_arr[N] + rescale[N] + scratch[1] floats.
-pub(crate) fn flash_attention_fa2_splitk_reduce_shared_bytes(num_splits: u32) -> u32 {
-    (3 * num_splits + 1) * 4
-}
-
-/// Recommended Split-K KV slice size. The single-kernel block-skip path is
-/// preferred for short contexts; Split-K kicks in when seq_len is large
-/// enough that a single (q_idx, head) block underutilises the SM.
-pub(crate) const FA2_SPLITK_SLICE: u32 = 1024;
-
-/// Minimum seq_len that triggers Split-K dispatch.
-pub(crate) const FA2_SPLITK_MIN_SEQ: u32 = 4096;
 
 // ------------------------------------------------------------------
 // HGEMV (dequant-in-register) constants and helpers

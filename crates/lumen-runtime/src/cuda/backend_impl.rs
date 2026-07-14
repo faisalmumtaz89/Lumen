@@ -700,16 +700,6 @@ struct GpuGlobals {
     /// variant when present. The original `output_proj_q8` is preserved so
     /// the F16-cache prefill path keeps its source.
     output_proj_q8_split: Option<CudaSlice<u8>>,
-    /// output_proj fast-path: pre-dequanted F16 cache of `output_proj_q8`
-    /// for cuBLAS HGEMV-N=1 decode. Populated when
-    /// `LUMEN_CUDA_OUTPUT_PROJ_F16_CACHE=1` is set AND the source projection is
-    /// Q8_0 AND the dequant allocation succeeds (~1.94 GB on Qwen3.5-9B).
-    /// Decode dispatch prefers this over the Q8 SPLIT / Q8 Aligned / Q8 Raw
-    /// paths when present, mirroring the BF16 cuBLAS HGEMV path which already
-    /// wins on the same shape. The original `output_proj_q8` is retained for
-    /// the prefill F16-cache path (which uses cuBLAS HGEMM with M=N tokens,
-    /// not GEMV).
-    output_proj_q8_to_f16_cache: Option<CudaSlice<u8>>,
     /// Output projection as raw Q4_0 bytes (None if not Q4_0).
     output_proj_q4: Option<CudaSlice<u8>>,
     /// Output projection as 20-byte aligned Q4_0 (None if not Q4_0 or repack failed).
@@ -758,10 +748,8 @@ struct GdnScratchGpu {
     /// Stored on host; uploaded as kernel arg each dispatch.
     conv_positions: Vec<u32>,
 
-    /// GPU-resident conv positions for CUDA graph capture.
-    /// Each entry is a single u32 on GPU, read by `ssm_conv1d_decode_graph`
-    /// and updated by `advance_conv_position`. Synced from host `conv_positions`
-    /// before graph capture begins.
+    /// GPU-resident conv positions for the GDN decode conv ring.
+    /// Each entry is a single u32 on GPU, synced from host `conv_positions`.
     conv_positions_gpu: Option<Vec<CudaSlice<u32>>>,
 
     /// Layer index mapping: layer_idx -> gdn_scratch_index.
@@ -827,24 +815,11 @@ struct MutableState {
     logits_gpu: CudaSlice<f32>,
     /// GPU-side argmax result: [1] u32. Avoids reading back full vocab logits.
     argmax_result: CudaSlice<u32>,
-    /// Captured CUDA graph for the decode pipeline. `None` until first
-    /// graph capture completes. Replayed on subsequent decode tokens.
-    captured_graph: Option<super::graph::CapturedGraph>,
-    /// Graph-compatible kernel variants (read scalars from device pointers).
-    /// Compiled once in `init()`, used during graph capture.
-    graph_kernels: Option<super::graph::GraphKernelSet>,
-    /// GPU-resident scalar parameter buffers for graph kernel variants.
-    /// Updated via small htod memcpys before each graph replay.
-    graph_params: Option<super::graph::GraphParamsBuf>,
-    /// Whether the model has any GDN layers (disables graph capture).
+    /// Whether the model has any GDN layers.
     has_gdn_layers: bool,
     /// Whether the model has Q+gate fusion layers (disables graph capture).
     has_qgate_layers: bool,
-    /// Whether the model has any MoE layers.: when true, the graph
-    /// path requires `LUMEN_CUDA_MOE_DECODE_GRAPH=1` so MoE FFN dispatch is
-    /// routed via the new MoE-aware branch in `compute_layer_gpu_graph`.
-    /// Default OFF (disables graph capture for MoE), byte-identical to the
-    /// prior production default when unset. Populated in `preload_weights`
+    /// Whether the model has any MoE layers. Populated in `preload_weights`
     /// from `moe_meta_cache`.
     has_moe_layers: bool,
     /// Number of decode tokens processed since last graph invalidation.
@@ -889,11 +864,11 @@ struct MutableState {
     /// (used in `prefill_moe_ffn_layer`) and `cudarc::CudaSlice<u64>` is not
     /// `Clone`.
     moe_batched_offsets: Vec<Option<super::moe::CudaMoeBatchedOffsets>>,
-    /// Per-layer REPACKED aligned down-weight planes for the fast-down
-    /// (and IMMA) kernels. `Some(_)` iff the layer is MoE AND
-    /// `moe_down_fast_bn128_enabled()` (the gate that justifies the ~738 MB/layer
-    /// cost). Built at preload after the layer blob upload. `None` otherwise (the
-    /// default f32act/per-column down path needs no repack). Empty for dense.
+    /// Per-layer REPACKED aligned gate+up planes for the W10 wide-M gate+up
+    /// kernel. `Some(_)` iff the layer is MoE AND `moe_repack_needed()` (the
+    /// W10 gate that justifies the repack cost). Built at preload after the layer
+    /// blob upload. `None` otherwise (the default f32act/per-column down path
+    /// needs no repack). Empty for dense.
     moe_repacked: Vec<Option<super::moe::CudaMoeRepacked>>,
 
     // split-layout integration::
@@ -916,26 +891,11 @@ struct MutableState {
     /// `LUMEN_CUDA_Q4_SPLIT=1`: mirror of `use_q8_split` for Q4Raw projection
     /// weights. Clones into `q4_split_*` sibling buffers.
     use_q4_split: bool,
-    /// `LUMEN_CUDA_GDN_SPLIT=1`: clone GDN-specific Q4Raw weights (ssm_out,
-    /// attn_gate, ssm_alpha, ssm_beta) into split siblings. Q8 + GDN_SPLIT
-    /// OOMs on A100-80GB per ; Q4 only.
-    use_gdn_split: bool,
     /// `LUMEN_CUDA_OUTPUT_PROJ_SPLIT=1`: clone the Q8Raw output projection
     /// (~1 GB on Qwen3.5-9B) into a split sibling for decode. Independent of
     /// `use_q8_split` so the contribution of the final projection can be
     /// measured / stacked separately.
     use_output_proj_split: bool,
-    /// `LUMEN_CUDA_OUTPUT_PROJ_F16_CACHE=1`: at preload, dequant the
-    /// Q8_0 output projection into an F16 cache (~1.94 GB on Qwen3.5-9B). Decode
-    /// dispatches via `cublasGemmEx` with N=1 (the same path used by the BF16
-    /// output projection, which already wins on BF16 storage). Higher priority
-    /// than `use_output_proj_split` in the dispatch chain when both are
-    /// enabled. EMPIRICALLY: LOSES -2.83% on A100 Q8_0 (Modal 5-trial median)
-    /// because the F16 cache reads 1.94 GB vs Q8 SPLIT 1.06 GB (~83% more
-    /// bytes), and the HBM bandwidth penalty exceeds the cuBLAS scheduling
-    /// win. Kept env-gated for future hardware (e.g. H100 tensor-core
-    /// rebalance) or A/B reuse.
-    use_output_proj_f16_cache: bool,
     /// `LUMEN_CUDA_OUTPUT_PROJ_NR={2,16,32,64,128}`: when set AND
     /// `use_output_proj_split` is also set AND the requested NR kernel loaded,
     /// route the SPLIT dispatch via the matching `matvec_q8_split_output_proj_nr*`
@@ -950,16 +910,6 @@ struct MutableState {
     /// NR=64 -> 80.0 tok/s (-1.60%) [register pressure]
     /// NR=128-> 78.3 tok/s (-3.69%) [register-spill regime]
     output_proj_nr: u32,
-    /// `LUMEN_CUDA_Q8_TILE=1`: at preload, clone Q8Raw projection weights into
-    /// per-row tile-grouped (8 blocks colocated) siblings (`q8_tile_*` on
-    /// `LayerWeightsGpu`). Decode dispatches to `matvec_q8_tile_q8_1` when
-    /// the sibling is present. Falls back to SPLIT / Aligned / Raw paths
-    /// when absent. Stacks on `use_q8_split` (tile wins when both are set
-    /// and both siblings populated, per `launch_matvec_preq8_1_tile`).
-    use_q8_tile: bool,
-    /// `LUMEN_CUDA_Q4_TILE=1`: mirror of `use_q8_tile` for Q4Raw projection
-    /// weights. Clones into `q4_tile_*` sibling buffers.
-    use_q4_tile: bool,
 }
 
 /// Process-wide state for the cuBLAS BF16 GemmEx fast path.
@@ -1099,41 +1049,15 @@ fn cuda_decode_delay_us() -> u64 {
     })
 }
 
-// ---------------------------------------------------------------------------
-// model-aware default resolvers for the four `LUMEN_CUDA_
-// DECODE_GRAPH*` envs.
-//
-// Each helper preserves the original truthy-set parsing (1 / true / TRUE /
-// yes / YES / on / ON) for backward-compatibility. When the env is unset,
-// the helper falls through to `runtime_defaults::decode_graph*_default()`,
-// which returns `true` for BF16 dense models (: graph capture is
-// a measured +13% TPOT win on BF16 dense) and `false` for Q8/Q4 dense (a
-// regression in those cells). The OnceLock cache mirrors
-// the `cuda_decode_delay_us` pattern: at most one syscall + one atomic
-// read per process for each gate.
-//
-// Note: legacy callers that read the env directly inline still work — we
-// keep these helpers separate from the inline reads so a misread won't
-// silently change the answer at a different call site. All inline reads
-// have been migrated to the helper at the commit.
-// ---------------------------------------------------------------------------
-
+/// Parse a `LUMEN_CUDA_*` env var as a truthy flag (`1` / `true` / `TRUE` /
+/// `yes` / `YES` / `on` / `ON`). Returns `None` when the env is unset so the
+/// caller can apply its own default.
 fn parse_env_truthy(name: &str) -> Option<bool> {
     std::env::var(name).ok().map(|v| {
         matches!(
             v.as_str(),
             "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
         )
-    })
-}
-
-/// Resolves `LUMEN_CUDA_DECODE_GRAPH` (master). Unset → BF16-aware
-/// default per `runtime_defaults`.
-fn cuda_decode_graph_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        parse_env_truthy("LUMEN_CUDA_DECODE_GRAPH")
-            .unwrap_or_else(crate::runtime_defaults::decode_graph_default)
     })
 }
 
@@ -1153,24 +1077,6 @@ fn cuda_decode_graph_enabled() -> bool {
 fn cuda_gpu_sample_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| parse_env_truthy("LUMEN_CUDA_GPU_SAMPLE").unwrap_or(true))
-}
-
-/// Resolves `LUMEN_CUDA_DECODE_GRAPH_QGATE`. Unset → BF16-aware default.
-fn cuda_decode_graph_qgate_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        parse_env_truthy("LUMEN_CUDA_DECODE_GRAPH_QGATE")
-            .unwrap_or_else(crate::runtime_defaults::decode_graph_qgate_default)
-    })
-}
-
-/// Resolves `LUMEN_CUDA_DECODE_GRAPH_TILED`. Unset → BF16-aware default.
-fn cuda_decode_graph_tiled_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        parse_env_truthy("LUMEN_CUDA_DECODE_GRAPH_TILED")
-            .unwrap_or_else(crate::runtime_defaults::decode_graph_tiled_default)
-    })
 }
 
 /// Resolves `LUMEN_CUDA_GDN_F64_ACCUM`. Unset → model-aware default
@@ -1266,50 +1172,6 @@ fn gdn_decode_megakernel_f64_enabled() -> bool {
     })
 }
 
-/// Resolves `LUMEN_CUDA_GDN_DECODE_PROJ_MMQ`. Unset → model-aware default
-/// (`runtime_defaults::gdn_decode_proj_mmq_default`, ON for MoE GDN-hybrid).
-///
-/// When ON, the single-token DECODE GDN q/k/v/gate/alpha/beta projections are
-/// routed through `mmq_q8_0_batched` (batch = 1) — the SAME MMQ INT8-dp4a
-/// kernel the batched PREFILL uses for MoE Q8 GDN projections — instead of the
-/// per-token pre-quantized-Q8_1 tile matvec. This aligns the decode GDN
-/// projection numerics with prefill (which match llama.cpp), so the 256-expert
-/// MoE router selects the prefill expert set and the final logits match the
-/// clean prefill. Only the Q8Raw GDN projection weights take this path; any
-/// non-Q8Raw weight (Q4, Q8Aligned, F16, …) falls through to the existing
-/// dispatch. Cached because the gate is consulted per-GDN-layer per-token and
-/// `set_model_is_moe` is established before the first decode call.
-fn gdn_decode_proj_mmq_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        parse_env_truthy("LUMEN_CUDA_GDN_DECODE_PROJ_MMQ")
-            .unwrap_or_else(crate::runtime_defaults::gdn_decode_proj_mmq_default)
-    })
-}
-
-/// Resolves `LUMEN_CUDA_GDN_DECODE_AB_MMQ`. Unset → model-aware default
-/// (`runtime_defaults::gdn_decode_ab_mmq_default`, ON for MoE GDN-hybrid).
-///
-/// When ON, ONLY the single-token DECODE GDN `ssm_alpha` / `ssm_beta`
-/// projections (which are `Q8Raw` in every LBC quant) are routed through
-/// `mmq_q8_0_batched` (batch = 1) — the SAME MMQ INT8-dp4a kernel the batched
-/// PREFILL uses — instead of the per-token Q8_1/dp4a `matvec_q8_0_q8_1` tile
-/// matvec. The MMQ kernel is per-token-independent so batch=1 is bit-identical
-/// to row 0 of the batch=N prefill, eliminating the ~20% alpha/beta
-/// decode-vs-prefill divergence at GDN layer 0 that the 256-expert router
-/// amplifies into expert-selection flips. qkv/gate are left untouched (they
-/// were measured bit-identical decode-vs-prefill). Distinct from the refuted
-/// `gdn_decode_proj_mmq` (which MMQ'd all four projections and required
-/// all-four-Q8Raw). Cached because the gate is consulted per-GDN-layer
-/// per-token and `set_model_is_moe` is established before the first decode.
-fn gdn_decode_ab_mmq_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        parse_env_truthy("LUMEN_CUDA_GDN_DECODE_AB_MMQ")
-            .unwrap_or_else(crate::runtime_defaults::gdn_decode_ab_mmq_default)
-    })
-}
-
 /// Resolves `LUMEN_CUDA_GDN_AB_F16`. Unset → model-aware default
 /// (`runtime_defaults::gdn_ab_f16_default`, currently ON for MoE; dense
 /// byte-identical via the `model_is_moe()` AND-gate) so DENSE models stay
@@ -1331,54 +1193,6 @@ fn gdn_ab_f16_enabled() -> bool {
         crate::runtime_defaults::model_is_moe()
             && parse_env_truthy("LUMEN_CUDA_GDN_AB_F16")
                 .unwrap_or_else(crate::runtime_defaults::gdn_ab_f16_default)
-    })
-}
-
-/// Resolves `LUMEN_CUDA_GDN_RECUR_PREFILL_ORDER`. Unset → model-aware default
-/// (`runtime_defaults::gdn_recur_prefill_order_default`, currently OFF)
-/// AND-gated on `model_is_moe()` so DENSE models stay byte-identical.
-///
-/// When ON, the GDN decode delta-rule state update routes through
-/// `gdn_phase4_register_resident_f64accum_prefillorder` whose arithmetic order
-/// matches the prefill batched-scan single-token step bit-for-bit (decay state
-/// FIRST → `retrieval = SUM (alpha*s_r)*k_r`, then `v_delta = b*(v-retrieval)`),
-/// instead of the base decode order (`delta = (v - alpha*SUM s_r*k_r)*beta`).
-/// This aligns the residual decode-vs-prefill GDN RECURRENCE divergence that
-/// survives the `GDN_AB_F16` projection fix. OFF keeps the existing F64 phase4
-/// kernel and is byte-identical to history. Cached because the gate is read
-/// per-GDN-layer per-token; `set_model_is_moe` is established before first read.
-fn gdn_recur_prefill_order_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        crate::runtime_defaults::model_is_moe()
-            && parse_env_truthy("LUMEN_CUDA_GDN_RECUR_PREFILL_ORDER")
-                .unwrap_or_else(crate::runtime_defaults::gdn_recur_prefill_order_default)
-    })
-}
-
-/// Resolves `LUMEN_CUDA_GDN_PHASE123_ALIGN`. Unset → model-aware default
-/// (`runtime_defaults::gdn_phase123_align_default`, currently OFF) AND-gated on
-/// `model_is_moe()` so DENSE models stay byte-identical regardless of the env.
-///
-/// When ON, the GDN decode phase123 (conv1d + SiLU + L2-norm) routes through
-/// `gdn_phase123_register_resident_alignl2` (and its graph twin): conv1d + SiLU
-/// stay F32 (bit-identical to the prefill `ssm_conv1d_silu_prefill` single-token
-/// step) while the per-head L2-norm of Q/K is computed with the EXACT F64
-/// reduction of the prefill `l2_normalize_qk_strided_f64accum` (which the MoE
-/// prefill already runs by default via `gdn_f64_accum_enabled()`). This makes
-/// the decode q_norm/k_norm bit-identical to a prefill of the same token,
-/// collapsing the residual GDN L0-output divergence (a_sumsq/x_sumsq relD
-/// ~27-28%) that survives the `GDN_AB_F16` projection fix and the phase4
-/// reorder. Distinct from `GDN_PHASE123_F64` (which raised conv1d to F64 too and
-/// REGRESSED) — this aligns ONLY the L2-norm reduction order/precision to
-/// prefill, NOT the conv1d. Cached because the gate is read per-GDN-layer
-/// per-token; `set_model_is_moe` is established before the first decode call.
-fn gdn_phase123_align_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        crate::runtime_defaults::model_is_moe()
-            && parse_env_truthy("LUMEN_CUDA_GDN_PHASE123_ALIGN")
-                .unwrap_or_else(crate::runtime_defaults::gdn_phase123_align_default)
     })
 }
 
@@ -2473,12 +2287,10 @@ impl CudaBackend {
                         // split-layout: prefer Q8Split/Q4Split sibling buffers on QKV when set.
                         // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
                         if has_qgate_fusion {
-                            launch_matvec_preq8_1_tile(
+                            launch_matvec_preq8_1_split(
                                 &self.device,
                                 &st.kernels,
                                 &lw.wq,
-                                lw.q8_tile_wq.as_ref(),
-                                lw.q4_tile_wq.as_ref(),
                                 lw.q8_split_wq.as_ref(),
                                 lw.q4_split_wq.as_ref(),
                                 q8_1_buf,
@@ -2488,12 +2300,10 @@ impl CudaBackend {
                                 "wq",
                             )?;
                         } else {
-                            launch_matvec_preq8_1_tile(
+                            launch_matvec_preq8_1_split(
                                 &self.device,
                                 &st.kernels,
                                 &lw.wq,
-                                lw.q8_tile_wq.as_ref(),
-                                lw.q4_tile_wq.as_ref(),
                                 lw.q8_split_wq.as_ref(),
                                 lw.q4_split_wq.as_ref(),
                                 q8_1_buf,
@@ -2503,12 +2313,10 @@ impl CudaBackend {
                                 "wq",
                             )?;
                         }
-                        launch_matvec_preq8_1_tile(
+                        launch_matvec_preq8_1_split(
                             &self.device,
                             &st.kernels,
                             &lw.wk,
-                            lw.q8_tile_wk.as_ref(),
-                            lw.q4_tile_wk.as_ref(),
                             lw.q8_split_wk.as_ref(),
                             lw.q4_split_wk.as_ref(),
                             q8_1_buf,
@@ -2517,12 +2325,10 @@ impl CudaBackend {
                             hidden_dim,
                             "wk",
                         )?;
-                        launch_matvec_preq8_1_tile(
+                        launch_matvec_preq8_1_split(
                             &self.device,
                             &st.kernels,
                             &lw.wv,
-                            lw.q8_tile_wv.as_ref(),
-                            lw.q4_tile_wv.as_ref(),
                             lw.q8_split_wv.as_ref(),
                             lw.q4_split_wv.as_ref(),
                             q8_1_buf,
@@ -2570,12 +2376,10 @@ impl CudaBackend {
                         // split-layout: prefer Q8Split/Q4Split sibling buffers on QKV when set.
                         // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
                         if has_qgate_fusion {
-                            launch_matvec_preq8_1_tile(
+                            launch_matvec_preq8_1_split(
                                 &self.device,
                                 &st.kernels,
                                 &lw.wq,
-                                lw.q8_tile_wq.as_ref(),
-                                lw.q4_tile_wq.as_ref(),
                                 lw.q8_split_wq.as_ref(),
                                 lw.q4_split_wq.as_ref(),
                                 q8_1_buf,
@@ -2585,12 +2389,10 @@ impl CudaBackend {
                                 "wq",
                             )?;
                         } else {
-                            launch_matvec_preq8_1_tile(
+                            launch_matvec_preq8_1_split(
                                 &self.device,
                                 &st.kernels,
                                 &lw.wq,
-                                lw.q8_tile_wq.as_ref(),
-                                lw.q4_tile_wq.as_ref(),
                                 lw.q8_split_wq.as_ref(),
                                 lw.q4_split_wq.as_ref(),
                                 q8_1_buf,
@@ -2600,12 +2402,10 @@ impl CudaBackend {
                                 "wq",
                             )?;
                         }
-                        launch_matvec_preq8_1_tile(
+                        launch_matvec_preq8_1_split(
                             &self.device,
                             &st.kernels,
                             &lw.wk,
-                            lw.q8_tile_wk.as_ref(),
-                            lw.q4_tile_wk.as_ref(),
                             lw.q8_split_wk.as_ref(),
                             lw.q4_split_wk.as_ref(),
                             q8_1_buf,
@@ -2614,12 +2414,10 @@ impl CudaBackend {
                             hidden_dim,
                             "wk",
                         )?;
-                        launch_matvec_preq8_1_tile(
+                        launch_matvec_preq8_1_split(
                             &self.device,
                             &st.kernels,
                             &lw.wv,
-                            lw.q8_tile_wv.as_ref(),
-                            lw.q4_tile_wv.as_ref(),
                             lw.q8_split_wv.as_ref(),
                             lw.q4_split_wv.as_ref(),
                             q8_1_buf,
@@ -3078,12 +2876,10 @@ impl CudaBackend {
                                 q_dim,
                                 "wo split",
                             )?;
-                            launch_matvec_preq8_1_residual_tile(
+                            launch_matvec_preq8_1_residual_split(
                                 &self.device,
                                 &st.kernels,
                                 &lw.wo,
-                                lw.q8_tile_wo.as_ref(),
-                                lw.q4_tile_wo.as_ref(),
                                 lw.q8_split_wo.as_ref(),
                                 lw.q4_split_wo.as_ref(),
                                 q8_1_buf,
@@ -3274,33 +3070,16 @@ impl CudaBackend {
                 // opt-in fused shared-expert path (3 launches vs 5-6).
                 // Falls back to legacy unfused path if any of the 3 fused
                 // kernels failed to compile (NVRTC failure on this device).
-                let use_fused = super::moe::moe_shared_fused_enabled()
-                    && st.kernels.fused_glu_gemv_q4_0_prenormed_no_norm.is_some()
-                    && st.kernels.moe_shared_down_q4_0_sigmoid_accum.is_some()
-                    && st.kernels.moe_shared_down_q4_0_residual_accum.is_some();
-                if use_fused {
-                    super::moe::encode_shared_expert_ffn_decode_fused(
-                        &self.device,
-                        &st.kernels,
-                        moe_scratch,
-                        moe_meta,
-                        moe_layer_blob,
-                        &st.scratch.normed.slice(..),
-                        &mut st.scratch.x_gpu.slice_mut(..),
-                        hidden_dim,
-                    )?;
-                } else {
-                    super::moe::encode_shared_expert_ffn_decode(
-                        &self.device,
-                        &st.kernels,
-                        moe_scratch,
-                        moe_meta,
-                        moe_layer_blob,
-                        &st.scratch.normed.slice(..),
-                        &mut st.scratch.x_gpu.slice_mut(..),
-                        hidden_dim,
-                    )?;
-                }
+                super::moe::encode_shared_expert_ffn_decode(
+                    &self.device,
+                    &st.kernels,
+                    moe_scratch,
+                    moe_meta,
+                    moe_layer_blob,
+                    &st.scratch.normed.slice(..),
+                    &mut st.scratch.x_gpu.slice_mut(..),
+                    hidden_dim,
+                )?;
             }
 
             // FIX-3 DEBUG: dump x_gpu and attn_proj magnitude per layer to bisect.
@@ -3469,7 +3248,7 @@ impl CudaBackend {
             // Profile evidence shows `fused_glu_gemv_q8_0`
             // is 30.8% of Lumen Q8 dense decode kernel time at 158 us/call,
             // dominated by SCALAR `(float)gq[j] * xv[j]` inner loops (no dp4a,
-            // no tensor cores). The fall-through `launch_matvec_preq8_1_tile`
+            // no tensor cores). The fall-through `launch_matvec_preq8_1_split`
             // path uses `mul_mat_vec_q_q8_0` (via `LUMEN_CUDA_MMV_Q_DP4A=1`
             // default-ON) which is dp4a-based at ~25.5 us/call = ~6x faster
             // per call. Two extra dispatches (gate + up separately + SwiGLU)
@@ -4022,12 +3801,10 @@ impl CudaBackend {
                     .map_err(|e| RuntimeError::Compute(format!("rmsnorm_to_q8_1 ffn: {e}")))?;
                     unsafe {
                         // split-layout: prefer Q8Split/Q4Split sibling buffers on FFN gate/up when set.
-                        launch_matvec_preq8_1_tile(
+                        launch_matvec_preq8_1_split(
                             &self.device,
                             &st.kernels,
                             &lw.w_gate,
-                            lw.q8_tile_w_gate.as_ref(),
-                            lw.q4_tile_w_gate.as_ref(),
                             lw.q8_split_w_gate.as_ref(),
                             lw.q4_split_w_gate.as_ref(),
                             q8_1_buf,
@@ -4036,12 +3813,10 @@ impl CudaBackend {
                             hidden_dim,
                             "gate",
                         )?;
-                        launch_matvec_preq8_1_tile(
+                        launch_matvec_preq8_1_split(
                             &self.device,
                             &st.kernels,
                             &lw.w_up,
-                            lw.q8_tile_w_up.as_ref(),
-                            lw.q4_tile_w_up.as_ref(),
                             lw.q8_split_w_up.as_ref(),
                             lw.q4_split_w_up.as_ref(),
                             q8_1_buf,
@@ -4087,12 +3862,10 @@ impl CudaBackend {
                             "ffn gate_up",
                         )?;
                         // split-layout: prefer Q8Split/Q4Split sibling buffers on FFN gate/up when set.
-                        launch_matvec_preq8_1_tile(
+                        launch_matvec_preq8_1_split(
                             &self.device,
                             &st.kernels,
                             &lw.w_gate,
-                            lw.q8_tile_w_gate.as_ref(),
-                            lw.q4_tile_w_gate.as_ref(),
                             lw.q8_split_w_gate.as_ref(),
                             lw.q4_split_w_gate.as_ref(),
                             q8_1_buf,
@@ -4101,12 +3874,10 @@ impl CudaBackend {
                             hidden_dim,
                             "gate",
                         )?;
-                        launch_matvec_preq8_1_tile(
+                        launch_matvec_preq8_1_split(
                             &self.device,
                             &st.kernels,
                             &lw.w_up,
-                            lw.q8_tile_w_up.as_ref(),
-                            lw.q4_tile_w_up.as_ref(),
                             lw.q8_split_w_up.as_ref(),
                             lw.q4_split_w_up.as_ref(),
                             q8_1_buf,
@@ -4370,12 +4141,10 @@ impl CudaBackend {
                                 inter_dim,
                                 "down split",
                             )?;
-                            launch_matvec_preq8_1_tile(
+                            launch_matvec_preq8_1_split(
                                 &self.device,
                                 &st.kernels,
                                 &lw.w_down,
-                                lw.q8_tile_w_down.as_ref(),
-                                lw.q4_tile_w_down.as_ref(),
                                 lw.q8_split_w_down.as_ref(),
                                 lw.q4_split_w_down.as_ref(),
                                 q8_1_buf,
@@ -4647,12 +4416,10 @@ impl CudaBackend {
                             inter_dim,
                             "down split (sep swiglu)",
                         )?;
-                        launch_matvec_preq8_1_tile(
+                        launch_matvec_preq8_1_split(
                             &self.device,
                             &st.kernels,
                             &lw.w_down,
-                            lw.q8_tile_w_down.as_ref(),
-                            lw.q4_tile_w_down.as_ref(),
                             lw.q8_split_w_down.as_ref(),
                             lw.q4_split_w_down.as_ref(),
                             q8_1_buf,
@@ -4876,33 +4643,13 @@ impl CudaBackend {
         layer_idx: usize,
         st: &mut MutableState,
     ) -> Result<(), RuntimeError> {
-        self.compute_gdn_attention_gpu_impl(layer_idx, st, false)
-    }
-
-    /// Graph-capture-path entry point. When called inside an active stream
-    /// capture region, the megakernel branch dispatches the graph-compatible
-    /// `gdn_decode_megakernel_graph` (reads state_pos from a device pointer,
-    /// not a host-scalar arg) and a follow-up `advance_conv_position` kernel.
-    /// Falls back to the eager path's host-scalar dispatch if the graph
-    /// kernel or `conv_positions_gpu` are unavailable.
-    ///
-    /// Host counter
-    /// `gdn.conv_positions[gdn_idx]` is advanced in lockstep with the GPU
-    /// counter (via the calling pipeline) so any subsequent eager-fallback
-    /// path reads a correct host counter.
-    fn compute_gdn_attention_gpu_graph(
-        &self,
-        layer_idx: usize,
-        st: &mut MutableState,
-    ) -> Result<(), RuntimeError> {
-        self.compute_gdn_attention_gpu_impl(layer_idx, st, true)
+        self.compute_gdn_attention_gpu_impl(layer_idx, st)
     }
 
     fn compute_gdn_attention_gpu_impl(
         &self,
         layer_idx: usize,
         st: &mut MutableState,
-        graph_mode: bool,
     ) -> Result<(), RuntimeError> {
         let hp = self.hp()?;
         let hidden_dim = hp.hidden_dim as usize;
@@ -4957,13 +4704,6 @@ impl CudaBackend {
         // projection weights to be Q8Raw (the MoE Q8 GDN case — repack is
         // skipped for GDN models so they stay Q8Raw) and the MMQ kernel to be
         // loaded. Dense models keep the existing path byte-identical.
-        let gdn_decode_proj_mmq = gdn_decode_proj_mmq_enabled()
-            && st.kernels.mmq_q8_0_batched.is_some()
-            && matches!(lw.wq, GpuWeightBuf::Q8Raw(_))
-            && matches!(ssm_alpha_w, GpuWeightBuf::Q8Raw(_))
-            && matches!(ssm_beta_w, GpuWeightBuf::Q8Raw(_))
-            && matches!(attn_gate_w, GpuWeightBuf::Q8Raw(_))
-            && hidden_dim % 32 == 0;
 
         // === DECODE GDN alpha/beta-ONLY MMQ alignment (MoE-gated) ===
         // The TARGETED, empirically-isolated lever (2026-06-08): only the
@@ -4997,14 +4737,6 @@ impl CudaBackend {
         let gdn_ab_f16 =
             gdn_ab_f16_enabled() && lw.ssm_alpha_f16.is_some() && lw.ssm_beta_f16.is_some();
 
-        let gdn_decode_ab_mmq = gdn_decode_ab_mmq_enabled()
-            && !gdn_decode_proj_mmq
-            && !gdn_ab_f16
-            && st.kernels.mmq_q8_0_batched.is_some()
-            && matches!(ssm_alpha_w, GpuWeightBuf::Q8Raw(_))
-            && matches!(ssm_beta_w, GpuWeightBuf::Q8Raw(_))
-            && hidden_dim % 32 == 0;
-
         // === DECODE GDN conv_state PARITY (MoE-gated; LUMEN_CUDA_GDN_CONVSTATE_PARITY) ===
         // Re-project the GDN qkv (the buffer that feeds the conv ring consumed by
         // `ssm_conv1d_silu_prefill` at T=1 in the via-prefill arm) through the
@@ -5032,112 +4764,7 @@ impl CudaBackend {
                 _ => false,
             };
 
-        if gdn_decode_proj_mmq {
-            // === PREFILL-MATCHING: RMSNorm (F32) + MMQ INT8 projections ===
-            // Step 1: RMSNorm into the F32 `normed` scratch (NOT Q8_1) so the
-            // MMQ kernel performs its OWN per-token Q8_1 activation quant —
-            // byte-identical to the prefill MMQ activation path.
-            {
-                let block_size = rmsnorm_block_size(hidden_dim);
-                let shared_bytes = rmsnorm_shared_bytes(block_size);
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: shared_bytes,
-                };
-                let dim = hidden_dim as u32;
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(&st.kernels.rmsnorm)
-                        .arg(&st.scratch.x_gpu)
-                        .arg(&lw.attn_norm)
-                        .arg(&mut st.scratch.normed)
-                        .arg(&eps)
-                        .arg(&dim)
-                        .launch(launch_cfg)
-                }
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("GDN rmsnorm (mmq decode) L{layer_idx}: {e}",))
-                })?;
-            }
-
-            // The Q8Raw byte slices for each projection weight. The outer
-            // `matches!` guards guarantee these patterns hold.
-            let wq_q8 = match &lw.wq {
-                GpuWeightBuf::Q8Raw(b) => b,
-                _ => unreachable!("gdn_decode_proj_mmq guards wq is Q8Raw"),
-            };
-            let alpha_q8 = match ssm_alpha_w {
-                GpuWeightBuf::Q8Raw(b) => b,
-                _ => unreachable!("gdn_decode_proj_mmq guards ssm_alpha is Q8Raw"),
-            };
-            let beta_q8 = match ssm_beta_w {
-                GpuWeightBuf::Q8Raw(b) => b,
-                _ => unreachable!("gdn_decode_proj_mmq guards ssm_beta is Q8Raw"),
-            };
-            let gate_q8 = match attn_gate_w {
-                GpuWeightBuf::Q8Raw(b) => b,
-                _ => unreachable!("gdn_decode_proj_mmq guards attn_gate is Q8Raw"),
-            };
-
-            // Step 2: fused QKV projection (out = qkv_dim) via MMQ, batch = 1.
-            unsafe {
-                super::prefill::launch_mmq_q8_0_batched(
-                    &self.device,
-                    &st.kernels,
-                    wq_q8,
-                    &st.scratch.normed,
-                    &mut gdn.qkv_buf,
-                    p.qkv_dim,
-                    hidden_dim,
-                    1,
-                    "gdn_qkv_decode_mmq",
-                )?;
-            }
-            // Step 3: alpha projection (out = num_heads).
-            unsafe {
-                super::prefill::launch_mmq_q8_0_batched(
-                    &self.device,
-                    &st.kernels,
-                    alpha_q8,
-                    &st.scratch.normed,
-                    &mut gdn.alpha_raw_buf,
-                    p.num_heads,
-                    hidden_dim,
-                    1,
-                    "gdn_alpha_decode_mmq",
-                )?;
-            }
-            // Step 4: beta projection (out = num_heads).
-            unsafe {
-                super::prefill::launch_mmq_q8_0_batched(
-                    &self.device,
-                    &st.kernels,
-                    beta_q8,
-                    &st.scratch.normed,
-                    &mut gdn.beta_raw_buf,
-                    p.num_heads,
-                    hidden_dim,
-                    1,
-                    "gdn_beta_decode_mmq",
-                )?;
-            }
-            // Step 5: gate projection (out = value_dim).
-            unsafe {
-                super::prefill::launch_mmq_q8_0_batched(
-                    &self.device,
-                    &st.kernels,
-                    gate_q8,
-                    &st.scratch.normed,
-                    &mut gdn.gate_buf,
-                    p.value_dim,
-                    hidden_dim,
-                    1,
-                    "gdn_gate_decode_mmq",
-                )?;
-            }
-        } else if gdn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
+        if gdn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
             // === FUSED: RMSNorm + Q8_1 quantize in 1 dispatch ===
             // Then all 3 matvecs (QKV, alpha, beta) use launch_matvec_preq8_1
             // sharing the single quantized input. Saves 4 separate quantize dispatches.
@@ -5151,7 +4778,7 @@ impl CudaBackend {
             // used by qkv/gate). One extra 2048-wide RMSNorm per GDN decode step
             // — negligible cost. Done BEFORE the `q8_1_buf` mutable borrow so
             // the two scratch fields are accessed sequentially.
-            if gdn_decode_ab_mmq || gdn_ab_f16 {
+            if gdn_ab_f16 {
                 let block_size = rmsnorm_block_size(hidden_dim);
                 let shared_bytes = rmsnorm_shared_bytes(block_size);
                 let launch_cfg = CudarcLaunchConfig {
@@ -5201,12 +4828,10 @@ impl CudaBackend {
             // QKV matvec with pre-quantized input.
             // split-layout: prefer Q8/Q4 split siblings for the fused QKV weight.
             unsafe {
-                launch_matvec_preq8_1_tile(
+                launch_matvec_preq8_1_split(
                     &self.device,
                     &st.kernels,
                     &lw.wq,
-                    lw.q8_tile_wq.as_ref(),
-                    lw.q4_tile_wq.as_ref(),
                     lw.q8_split_wq.as_ref(),
                     lw.q4_split_wq.as_ref(),
                     q8_1_buf,
@@ -5258,49 +4883,12 @@ impl CudaBackend {
                         cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
                     )?;
                 }
-            } else if gdn_decode_ab_mmq {
-                let alpha_q8 = match ssm_alpha_w {
-                    GpuWeightBuf::Q8Raw(b) => b,
-                    _ => unreachable!("gdn_decode_ab_mmq guards ssm_alpha is Q8Raw"),
-                };
-                let beta_q8 = match ssm_beta_w {
-                    GpuWeightBuf::Q8Raw(b) => b,
-                    _ => unreachable!("gdn_decode_ab_mmq guards ssm_beta is Q8Raw"),
-                };
-                unsafe {
-                    super::prefill::launch_mmq_q8_0_batched(
-                        &self.device,
-                        &st.kernels,
-                        alpha_q8,
-                        &st.scratch.normed,
-                        &mut gdn.alpha_raw_buf,
-                        p.num_heads,
-                        hidden_dim,
-                        1,
-                        "gdn_alpha_decode_ab_mmq",
-                    )?;
-                }
-                unsafe {
-                    super::prefill::launch_mmq_q8_0_batched(
-                        &self.device,
-                        &st.kernels,
-                        beta_q8,
-                        &st.scratch.normed,
-                        &mut gdn.beta_raw_buf,
-                        p.num_heads,
-                        hidden_dim,
-                        1,
-                        "gdn_beta_decode_ab_mmq",
-                    )?;
-                }
             } else {
                 unsafe {
-                    launch_matvec_preq8_1_tile(
+                    launch_matvec_preq8_1_split(
                         &self.device,
                         &st.kernels,
                         ssm_alpha_w,
-                        None,
-                        None,
                         None,
                         lw.q4_split_ssm_alpha.as_ref(),
                         q8_1_buf,
@@ -5313,12 +4901,10 @@ impl CudaBackend {
 
                 // Beta matvec with shared pre-quantized input.
                 unsafe {
-                    launch_matvec_preq8_1_tile(
+                    launch_matvec_preq8_1_split(
                         &self.device,
                         &st.kernels,
                         ssm_beta_w,
-                        None,
-                        None,
                         None,
                         lw.q4_split_ssm_beta.as_ref(),
                         q8_1_buf,
@@ -5332,12 +4918,10 @@ impl CudaBackend {
 
             // Gate matvec with shared pre-quantized input.
             unsafe {
-                launch_matvec_preq8_1_tile(
+                launch_matvec_preq8_1_split(
                     &self.device,
                     &st.kernels,
                     attn_gate_w,
-                    None,
-                    None,
                     None,
                     lw.q4_split_attn_gate.as_ref(),
                     q8_1_buf,
@@ -5437,48 +5021,6 @@ impl CudaBackend {
                         hidden_dim,
                         "gdn_beta_f16",
                         cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
-                    )?;
-                }
-            } else if gdn_decode_ab_mmq {
-                // alpha/beta MMQ alignment (MoE-gated; the bf16 path lands here
-                // because qkv/gate are Bf16Raw so `gdn_use_preq` is false): route
-                // alpha/beta through `mmq_q8_0_batched` (batch=1, from the F32
-                // `normed` already computed above) to match the prefill MMQ INT8
-                // reduction order instead of the per-token Q8_1/dp4a matvec. This
-                // is the empirically-isolated first-flipping-stage fix; qkv/gate
-                // (bit-identical decode-vs-prefill) keep their existing path.
-                let alpha_q8 = match ssm_alpha_w {
-                    GpuWeightBuf::Q8Raw(b) => b,
-                    _ => unreachable!("gdn_decode_ab_mmq guards ssm_alpha is Q8Raw"),
-                };
-                let beta_q8 = match ssm_beta_w {
-                    GpuWeightBuf::Q8Raw(b) => b,
-                    _ => unreachable!("gdn_decode_ab_mmq guards ssm_beta is Q8Raw"),
-                };
-                unsafe {
-                    super::prefill::launch_mmq_q8_0_batched(
-                        &self.device,
-                        &st.kernels,
-                        alpha_q8,
-                        &st.scratch.normed,
-                        &mut gdn.alpha_raw_buf,
-                        p.num_heads,
-                        hidden_dim,
-                        1,
-                        "gdn_alpha_decode_ab_mmq",
-                    )?;
-                }
-                unsafe {
-                    super::prefill::launch_mmq_q8_0_batched(
-                        &self.device,
-                        &st.kernels,
-                        beta_q8,
-                        &st.scratch.normed,
-                        &mut gdn.beta_raw_buf,
-                        p.num_heads,
-                        hidden_dim,
-                        1,
-                        "gdn_beta_decode_ab_mmq",
                     )?;
                 }
             } else {
@@ -5756,8 +5298,9 @@ impl CudaBackend {
                     std::sync::atomic::AtomicBool::new(false);
                 if probe && !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     eprintln!(
-                        "[GDNSTATE] PATH=decode-via-prefill use_prefill_f64={} f64_enabled={} graph_mode={}",
-                        use_prefill_f64, gdn_f64_accum_enabled(), graph_mode,
+                        "[GDNSTATE] PATH=decode-via-prefill use_prefill_f64={} f64_enabled={}",
+                        use_prefill_f64,
+                        gdn_f64_accum_enabled(),
                     );
                 }
             }
@@ -6004,21 +5547,6 @@ impl CudaBackend {
             }
         } else if use_register_resident_phase4 {
             // === TWO-LAUNCH PATH: Phase 1-3 + Phase 4 (2 launches; replaces megakernel) ===
-            // Optional Phase-4 variant: coalesced lane mapping (env-gated default OFF).
-            // Selected when LUMEN_CUDA_GDN_PHASE4_COAL=1 AND the coal kernel is loaded.
-            // Math is identical (warp-reduce is commutative); only the per-lane ki
-            // ownership changes from `lane*4..lane*4+3` to `lane,lane+32,lane+64,lane+96`,
-            // which converts strided LDG.E.32 (4 sectors/r) into a single coalesced
-            // 128B transaction per r. ADD-only: falls back to gdn_phase4_register_resident.
-            let use_phase4_coal = std::env::var("LUMEN_CUDA_GDN_PHASE4_COAL")
-                .map(|v| {
-                    matches!(
-                        v.as_str(),
-                        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-                    )
-                })
-                .unwrap_or(false)
-                && st.kernels.gdn_phase4_register_resident_coal.is_some();
             // F64-internal-accumulator variant for Phase 4 (decode path).
             // When `LUMEN_CUDA_GDN_F64_ACCUM=1`, replace the F32 lane-strided
             // kernel with the F64-state F64-reduce variant; the coal/strided
@@ -6026,87 +5554,14 @@ impl CudaBackend {
             // F64 variant uses the strided lane pattern like F32 base).
             let use_phase4_f64 = gdn_f64_accum_enabled()
                 && st.kernels.gdn_phase4_register_resident_f64accum.is_some();
-            // Prefill-order F64 phase4: reorders the delta-rule arithmetic to
-            // match the prefill batched-scan single-token step bit-for-bit,
-            // aligning the residual decode-vs-prefill GDN RECURRENCE divergence
-            // that survives the GDN_AB_F16 projection fix. Requires the F64
-            // phase4 path (same precision as prefill's F64 scan); when ON it
-            // SUBSTITUTES the base F64 phase4 kernel (identical args/grid).
-            // Default OFF (`LUMEN_CUDA_GDN_RECUR_PREFILL_ORDER`, MoE-gated).
-            let use_phase4_prefillorder = use_phase4_f64
-                && gdn_recur_prefill_order_enabled()
-                && st
-                    .kernels
-                    .gdn_phase4_register_resident_f64accum_prefillorder
-                    .is_some();
-            // F64-internal-accumulator variant for Phase 1-3 (conv1d+SiLU+L2-norm).
-            // DEFAULT OFF on its OWN gate `LUMEN_CUDA_GDN_PHASE123_F64=1`,
-            // deliberately DECOUPLED from `gdn_f64_accum_enabled()` (which keeps
-            // the 5 proven F64 kernels -- phase4, prefill v3, norm_gate, l2norm,
-            // rmsnorm_silu_gate -- ON for MoE).
-            //
-            // EMPIRICAL (Jun 8, A100, MoE-35B, both runs byte-deterministic):
-            // routing decode phase123 through F64 REGRESSED both quants vs F32:
-            //   q4 math: rep 4->26, LOST 391 (hard "17x20=17x20" loop)
-            //   q8 math: rep 2->12, LOST 391, "multiplicationlication" doubling
-            //            UNCHANGED (so phase123 F32 drift is NOT the cause).
-            // The extra precision shifts the near-tie token landscape into worse
-            // repetition basins -- same failure class as "generic PREFILL_F32 made
-            // q4 rep30". Hence default OFF; kept opt-in for further investigation.
-            // Falls back to the F32 phase123 when the kernel did not compile.
-            let use_phase123_f64 = parse_env_truthy("LUMEN_CUDA_GDN_PHASE123_F64").unwrap_or(false)
-                && st.kernels.gdn_phase123_register_resident_f64accum.is_some();
-            // PHASE123 decode->prefill L2-norm ALIGNMENT (MoE-gated;
-            // LUMEN_CUDA_GDN_PHASE123_ALIGN). Routes the decode phase123 through
-            // `gdn_phase123_register_resident_alignl2`: conv1d+SiLU stay F32
-            // (bit-identical to ssm_conv1d_silu_prefill single token) and the
-            // per-head L2-norm matches the prefill `l2_normalize_qk_strided_f64accum`
-            // F64 reduction bit-for-bit. Mutually exclusive with the F32-conv
-            // PHASE123_F64 (that raises conv1d precision and regressed): when both
-            // are requested, ALIGN takes precedence below. OFF is byte-identical
-            // (falls back to the F32 base phase123). The MoE prefill's L2-norm is
-            // already F64 by default (gdn_f64_accum_enabled()), so this is the
-            // matching half on the decode side.
-            let use_phase123_align = gdn_phase123_align_enabled()
-                && st.kernels.gdn_phase123_register_resident_alignl2.is_some();
-            // when running inside an active CUDA graph capture
-            // region (graph_mode == true) AND the graph-capturable variant of
-            // phase123 is available AND `conv_positions_gpu` is allocated,
-            // dispatch `gdn_phase123_register_resident_graph` (reads state_pos from a
-            // device pointer) followed by a single-thread `advance_conv_position`
-            // kernel. Phase 4 has no state_pos dependence, so its existing
-            // dispatch is already graph-safe.
-            let use_phase123_graph = graph_mode
-                && st.kernels.gdn_phase123_register_resident_graph.is_some()
-                && gdn.conv_positions_gpu.is_some();
-
-            let p4_fn = if use_phase4_prefillorder {
-                st.kernels
-                    .gdn_phase4_register_resident_f64accum_prefillorder
-                    .as_ref()
-                    .unwrap()
-            } else if use_phase4_f64 {
+            let p4_fn = if use_phase4_f64 {
                 st.kernels
                     .gdn_phase4_register_resident_f64accum
-                    .as_ref()
-                    .unwrap()
-            } else if use_phase4_coal {
-                st.kernels
-                    .gdn_phase4_register_resident_coal
                     .as_ref()
                     .unwrap()
             } else {
                 st.kernels.gdn_phase4_register_resident.as_ref().unwrap()
             };
-            if use_phase4_prefillorder {
-                static RECUR_PO_LOGGED: AtomicBool = AtomicBool::new(false);
-                if !RECUR_PO_LOGGED.swap(true, Ordering::Relaxed) {
-                    eprintln!(
-                        "[CUDA] GDN_RECUR_PREFILL_ORDER: ACTIVE — decode phase4 \
-                         delta-rule reordered to match prefill batched-scan (F64)"
-                    );
-                }
-            }
 
             let num_heads_u32 = p.num_heads as u32;
             let num_kv_heads_u32 = p.num_kv_heads as u32;
@@ -6121,50 +5576,7 @@ impl CudaBackend {
             // Same grid/block as existing megakernel; writes Q_norm, K_norm,
             // V, alpha, beta to device buffers.
             let block_dim = (p.head_dim as u32).max(128).min(1024);
-            // The graph path can only run F64 if the graph-capturable F64 twin
-            // compiled; otherwise the graph branch falls back to the F32 graph
-            // kernel (so resolve F64-for-graph separately).
-            let use_phase123_graph_f64 = use_phase123_graph
-                && use_phase123_f64
-                && st
-                    .kernels
-                    .gdn_phase123_register_resident_graph_f64accum
-                    .is_some();
-            // ALIGN graph twin (only when the graph-capturable align kernel
-            // compiled; otherwise the graph branch falls back to F32 base).
-            // ALIGN takes precedence over PHASE123_F64 if both requested.
-            let use_phase123_graph_align = use_phase123_graph
-                && use_phase123_align
-                && st
-                    .kernels
-                    .gdn_phase123_register_resident_graph_alignl2
-                    .is_some();
-            // F64 shmem doubles q_shmem/k_shmem/warp_scratch element size.
-            // Non-graph dispatch uses F64 whenever `use_phase123_f64`; graph
-            // dispatch uses F64 only when the graph F64 twin is present.
-            let phase123_is_f64 = if use_phase123_graph {
-                use_phase123_graph_f64
-            } else {
-                use_phase123_f64
-            };
-            // Whether THIS dispatch will run the align kernel (non-graph: any
-            // time use_phase123_align; graph: only when the align graph twin
-            // exists). The align kernel uses the SAME all-double shmem layout as
-            // the F64-base variant: (32 + 2*head_dim) doubles (it differs from
-            // the F64-base ONLY in computing conv1d in F32 before promoting).
-            let phase123_is_align = if use_phase123_graph {
-                use_phase123_graph_align
-            } else {
-                use_phase123_align
-            };
-            // F64 shmem (8 bytes/elem) whenever the dispatch runs the F64-base
-            // OR the align kernel (both use all-double shmem); F32 otherwise.
-            let elem_bytes = if phase123_is_f64 || phase123_is_align {
-                8u32
-            } else {
-                4u32
-            };
-            let shared_bytes = (32 + 2 * p.head_dim as u32) * elem_bytes;
+            let shared_bytes = (32 + 2 * p.head_dim as u32) * 4;
             let p123_cfg = CudarcLaunchConfig {
                 grid_dim: (num_heads_u32, 1, 1),
                 block_dim: (block_dim, 1, 1),
@@ -6177,117 +5589,36 @@ impl CudaBackend {
             // `output_buf` that would otherwise reject under the borrow
             // checker (cudarc's launch_builder cannot hold both `&` and
             // `&mut` to the same CudaSlice at once).
-            if use_phase123_graph {
-                // device-pointer state_pos. `conv_positions_gpu[gdn_idx]`
-                // was pre-populated via htod_copy by `decode_token` before
-                // begin_capture(), so its current value matches the host
-                // state_pos at capture time. The advance_conv_position kernel
-                // (dispatched after phase4 below) increments it per-replay.
-                let p123_graph_fn = if use_phase123_graph_align {
-                    st.kernels
-                        .gdn_phase123_register_resident_graph_alignl2
-                        .as_ref()
-                        .unwrap()
-                } else if use_phase123_graph_f64 {
-                    st.kernels
-                        .gdn_phase123_register_resident_graph_f64accum
-                        .as_ref()
-                        .unwrap()
-                } else {
-                    st.kernels
-                        .gdn_phase123_register_resident_graph
-                        .as_ref()
-                        .unwrap()
-                };
-                let gpu_pos_slice = &mut gdn.conv_positions_gpu.as_mut().unwrap()[gdn_idx];
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(p123_graph_fn)
-                        .arg(&mut gdn.conv_states[gdn_idx])
-                        .arg(&gdn.qkv_buf)
-                        .arg(&gdn.alpha_raw_buf)
-                        .arg(&gdn.beta_raw_buf)
-                        .arg(conv1d_weight)
-                        .arg(dt_bias)
-                        .arg(ssm_a)
-                        .arg(gdn.q_norm_buf_rr.as_mut().unwrap())
-                        .arg(gdn.k_norm_buf_rr.as_mut().unwrap())
-                        .arg(&mut gdn.normed_out_buf) // V buf
-                        .arg(&mut gdn.alpha_buf)
-                        .arg(&mut gdn.beta_buf)
-                        .arg(&num_heads_u32)
-                        .arg(&num_kv_heads_u32)
-                        .arg(&head_dim_u32)
-                        .arg(&qkv_dim_u32)
-                        .arg(&qk_dim_u32)
-                        .arg(&value_dim_u32)
-                        .arg(&kernel_size_u32)
-                        .arg(&*gpu_pos_slice)
-                        .launch(p123_cfg)
-                }
-                .map_err(|e| {
-                    RuntimeError::Compute(format!(
-                        "GDN phase123 register_resident graph L{layer_idx}: {e}"
-                    ))
-                })?;
-            } else {
-                let p123_fn = if use_phase123_align {
-                    st.kernels
-                        .gdn_phase123_register_resident_alignl2
-                        .as_ref()
-                        .unwrap()
-                } else if use_phase123_f64 {
-                    st.kernels
-                        .gdn_phase123_register_resident_f64accum
-                        .as_ref()
-                        .unwrap()
-                } else {
-                    st.kernels.gdn_phase123_register_resident.as_ref().unwrap()
-                };
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(p123_fn)
-                        .arg(&mut gdn.conv_states[gdn_idx])
-                        .arg(&gdn.qkv_buf)
-                        .arg(&gdn.alpha_raw_buf)
-                        .arg(&gdn.beta_raw_buf)
-                        .arg(conv1d_weight)
-                        .arg(dt_bias)
-                        .arg(ssm_a)
-                        .arg(gdn.q_norm_buf_rr.as_mut().unwrap())
-                        .arg(gdn.k_norm_buf_rr.as_mut().unwrap())
-                        .arg(&mut gdn.normed_out_buf) // V buf
-                        .arg(&mut gdn.alpha_buf)
-                        .arg(&mut gdn.beta_buf)
-                        .arg(&num_heads_u32)
-                        .arg(&num_kv_heads_u32)
-                        .arg(&head_dim_u32)
-                        .arg(&qkv_dim_u32)
-                        .arg(&qk_dim_u32)
-                        .arg(&value_dim_u32)
-                        .arg(&kernel_size_u32)
-                        .arg(&state_pos)
-                        .launch(p123_cfg)
-                }
-                .map_err(|e| {
-                    RuntimeError::Compute(format!(
-                        "GDN phase123 register_resident L{layer_idx}: {e}"
-                    ))
-                })?;
+            let p123_fn = st.kernels.gdn_phase123_register_resident.as_ref().unwrap();
+            unsafe {
+                self.device
+                    .stream
+                    .launch_builder(p123_fn)
+                    .arg(&mut gdn.conv_states[gdn_idx])
+                    .arg(&gdn.qkv_buf)
+                    .arg(&gdn.alpha_raw_buf)
+                    .arg(&gdn.beta_raw_buf)
+                    .arg(conv1d_weight)
+                    .arg(dt_bias)
+                    .arg(ssm_a)
+                    .arg(gdn.q_norm_buf_rr.as_mut().unwrap())
+                    .arg(gdn.k_norm_buf_rr.as_mut().unwrap())
+                    .arg(&mut gdn.normed_out_buf) // V buf
+                    .arg(&mut gdn.alpha_buf)
+                    .arg(&mut gdn.beta_buf)
+                    .arg(&num_heads_u32)
+                    .arg(&num_kv_heads_u32)
+                    .arg(&head_dim_u32)
+                    .arg(&qkv_dim_u32)
+                    .arg(&qk_dim_u32)
+                    .arg(&value_dim_u32)
+                    .arg(&kernel_size_u32)
+                    .arg(&state_pos)
+                    .launch(p123_cfg)
             }
-
-            if phase123_is_align {
-                static PHASE123_ALIGN_LOGGED: AtomicBool = AtomicBool::new(false);
-                if !PHASE123_ALIGN_LOGGED.swap(true, Ordering::Relaxed) {
-                    eprintln!(
-                        "[CUDA] GDN_PHASE123_ALIGN: ACTIVE — decode phase123 L2-norm \
-                         reduction aligned to prefill l2_normalize_qk_strided_f64accum \
-                         (conv1d kept F32; q_norm/k_norm bit-identical decode-vs-prefill)"
-                    );
-                }
-            }
+            .map_err(|e| {
+                RuntimeError::Compute(format!("GDN phase123 register_resident L{layer_idx}: {e}"))
+            })?;
 
             // --- Phase 4: register-resident delta-rule ---
             // Grid: (num_heads, 1, ceil(head_dim / num_warps)); Block: (32, 4, 1)
@@ -6394,36 +5725,6 @@ impl CudaBackend {
             // Advance circular buffer position.
             let buf_slots = (p.conv_kernel_size - 1) as u32;
 
-            // when graph_mode is on, dispatch the
-            // `advance_conv_position` kernel (single-thread, single-block) to
-            // increment `conv_positions_gpu[gdn_idx]` on-device. The host
-            // counter advance below remains in lockstep so any subsequent
-            // eager-fallback path reads a consistent host counter.
-            if use_phase123_graph {
-                let gk = st.graph_kernels.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute(
-                        "graph mode requires graph_kernels (advance_conv_position)".into(),
-                    )
-                })?;
-                let advance_cfg = CudarcLaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (1, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let gpu_pos_slice2 = &mut gdn.conv_positions_gpu.as_mut().unwrap()[gdn_idx];
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(&gk.advance_conv_position)
-                        .arg(&mut *gpu_pos_slice2)
-                        .arg(&buf_slots)
-                        .launch(advance_cfg)
-                }
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("GDN advance_conv_position L{layer_idx}: {e}",))
-                })?;
-            }
-
             gdn.conv_positions[gdn_idx] = (state_pos + 1) % buf_slots;
         } else if let Some(ref mega_fn_f32) = st.kernels.gdn_decode_megakernel {
             // === FUSED PATH: 8 launches -> 2 ===
@@ -6456,22 +5757,13 @@ impl CudaBackend {
                     std::sync::atomic::AtomicBool::new(false);
                 if probe && !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     eprintln!(
-                        "[GDNSTATE] PATH=megakernel-eager use_mega_f64={} f64_enabled={} f64_twin_compiled={} graph_mode={}",
+                        "[GDNSTATE] PATH=megakernel-eager use_mega_f64={} f64_enabled={} f64_twin_compiled={}",
                         use_mega_f64,
                         gdn_decode_megakernel_f64_enabled(),
                         st.kernels.gdn_decode_megakernel_f64accum.is_some(),
-                        graph_mode,
                     );
                 }
             }
-            //
-            // when running inside an active
-            // CUDA graph capture region (graph_mode == true) AND the graph
-            // variant kernel + conv_positions_gpu are both available, dispatch
-            // `gdn_decode_megakernel_graph` (reads state_pos from a device
-            // pointer) followed by a single-thread `advance_conv_position`
-            // kernel. This keeps the entire GDN inner loop graph-capturable
-            // (state_pos changes between tokens without re-capturing the graph).
             let num_heads_u32 = p.num_heads as u32;
             let num_kv_heads_u32 = p.num_kv_heads as u32;
             let head_dim_u32 = p.head_dim as u32;
@@ -6491,202 +5783,107 @@ impl CudaBackend {
                 shared_mem_bytes: shared_bytes,
             };
 
-            // When the F64 twin is engaged, the graph path requires the F64
-            // graph twin (the F32 graph kernel would re-introduce the F32 decode
-            // recurrence). If F64 is off, use the F32 graph kernel as before.
-            let graph_twin_available = if use_mega_f64 {
-                st.kernels.gdn_decode_megakernel_graph_f64accum.is_some()
-            } else {
-                st.kernels.gdn_decode_megakernel_graph.is_some()
+            // Eager path (graph_mode == false OR graph kernel unavailable).
+            // bit-exact when disabled: host-scalar state_pos.
+            // [GDNSTATE] DECODE recurrent-state probe (env LUMEN_MOE_PROBE=1,
+            // default OFF -> byte-identical). h_state CARRIED INTO the
+            // megakernel (= state built by prompt prefill scan thru pos N-1)
+            // + conv_state, then UPDATED h_state after the single-token
+            // megakernel step. The H1/H2 discriminator vs the prefill
+            // [GDNSTATE] mode=P dump. (This is the ACTIVE default decode
+            // path: gdn_decode_megakernel, eager.)
+            let gdnstate_probe_mega = {
+                use std::sync::OnceLock;
+                static GSM: OnceLock<bool> = OnceLock::new();
+                *GSM.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
             };
-            let use_graph_mega =
-                graph_mode && graph_twin_available && gdn.conv_positions_gpu.is_some();
-
-            if use_graph_mega {
-                // dispatch the graph-capturable variant with
-                // device-pointer state_pos. The CudaSlice<u32> at
-                // conv_positions_gpu[gdn_idx] was pre-populated via htod_copy
-                // before begin_capture(), so its current value matches the
-                // host state_pos at capture time.
-                let mega_graph_fn = if use_mega_f64 {
-                    st.kernels
-                        .gdn_decode_megakernel_graph_f64accum
-                        .as_ref()
-                        .unwrap()
-                } else {
-                    st.kernels.gdn_decode_megakernel_graph.as_ref().unwrap()
-                };
-                // Borrow conv_positions_gpu separately for the megakernel arg
-                // — the borrow checker requires we split mutable borrows on
-                // the GdnScratchGpu fields. The `.as_mut().unwrap()` pattern
-                // matches the gdn.h_states / gdn.conv_states style nearby.
-                let gpu_pos_slice = &mut gdn.conv_positions_gpu.as_mut().unwrap()[gdn_idx];
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(mega_graph_fn)
-                        .arg(&mut gdn.conv_states[gdn_idx])
-                        .arg(&mut gdn.h_states[gdn_idx])
-                        .arg(&gdn.qkv_buf)
-                        .arg(&gdn.alpha_raw_buf)
-                        .arg(&gdn.beta_raw_buf)
-                        .arg(conv1d_weight)
-                        .arg(dt_bias)
-                        .arg(ssm_a)
-                        .arg(&mut gdn.output_buf)
-                        .arg(&num_heads_u32)
-                        .arg(&num_kv_heads_u32)
-                        .arg(&head_dim_u32)
-                        .arg(&qkv_dim_u32)
-                        .arg(&qk_dim_u32)
-                        .arg(&value_dim_u32)
-                        .arg(&kernel_size_u32)
-                        .arg(&*gpu_pos_slice)
-                        .launch(launch_cfg)
-                }
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("GDN megakernel_graph L{layer_idx}: {e}",))
-                })?;
-
-                // Follow-up: advance_conv_position kernel inside the captured
-                // graph. Single thread, single block — trivially cheap.
-                let buf_slots = (p.conv_kernel_size - 1) as u32;
-                let gk = st.graph_kernels.as_ref().ok_or_else(|| {
-                    RuntimeError::Compute(
-                        "graph mode requires graph_kernels (advance_conv_position)".into(),
-                    )
-                })?;
-                let advance_cfg = CudarcLaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (1, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let gpu_pos_slice2 = &mut gdn.conv_positions_gpu.as_mut().unwrap()[gdn_idx];
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(&gk.advance_conv_position)
-                        .arg(&mut *gpu_pos_slice2)
-                        .arg(&buf_slots)
-                        .launch(advance_cfg)
-                }
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("GDN advance_conv_position L{layer_idx}: {e}",))
-                })?;
-
-                // Host counter is advanced by the CALLER post-replay (see
-                // `decode_token` graph-replay path), NOT here, because this
-                // dispatch is captured (the host code runs once at capture
-                // time but the kernel runs once per replay).
-                // For the very first call (capture token itself), the host
-                // counter MUST also be advanced so the next eager-fallback
-                // sees consistent state. Done by the caller (run_graph_pipeline
-                // post-loop or decode_token replay-path) — kept here for
-                // safety mirroring of the original logic:
-                gdn.conv_positions[gdn_idx] = (state_pos + 1) % buf_slots;
-            } else {
-                // Eager path (graph_mode == false OR graph kernel unavailable).
-                // bit-exact when disabled: host-scalar state_pos.
-                // [GDNSTATE] DECODE recurrent-state probe (env LUMEN_MOE_PROBE=1,
-                // default OFF -> byte-identical). h_state CARRIED INTO the
-                // megakernel (= state built by prompt prefill scan thru pos N-1)
-                // + conv_state, then UPDATED h_state after the single-token
-                // megakernel step. The H1/H2 discriminator vs the prefill
-                // [GDNSTATE] mode=P dump. (This is the ACTIVE default decode
-                // path: gdn_decode_megakernel, eager.)
-                let gdnstate_probe_mega = {
-                    use std::sync::OnceLock;
-                    static GSM: OnceLock<bool> = OnceLock::new();
-                    *GSM.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
-                };
-                if gdnstate_probe_mega {
-                    let ss =
-                        |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
-                    let h_before = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
-                    let conv_h = self.device.dtoh_copy(&gdn.conv_states[gdn_idx])?;
-                    eprintln!(
-                        "[GDNSTATE] mode=D phase=before step={} layer={layer_idx} \
+            if gdnstate_probe_mega {
+                let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                let h_before = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
+                let conv_h = self.device.dtoh_copy(&gdn.conv_states[gdn_idx])?;
+                eprintln!(
+                    "[GDNSTATE] mode=D phase=before step={} layer={layer_idx} \
                          state_pos={state_pos} h_sumsq={:.6} h_len={} conv_sumsq={:.6} conv_len={}",
-                        st.decode_token_count,
-                        ss(&h_before),
-                        h_before.len(),
-                        ss(&conv_h),
-                        conv_h.len(),
-                    );
-                }
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(mega_fn)
-                        .arg(&mut gdn.conv_states[gdn_idx])
-                        .arg(&mut gdn.h_states[gdn_idx])
-                        .arg(&gdn.qkv_buf)
-                        .arg(&gdn.alpha_raw_buf)
-                        .arg(&gdn.beta_raw_buf)
-                        .arg(conv1d_weight)
-                        .arg(dt_bias)
-                        .arg(ssm_a)
-                        .arg(&mut gdn.output_buf)
-                        .arg(&num_heads_u32)
-                        .arg(&num_kv_heads_u32)
-                        .arg(&head_dim_u32)
-                        .arg(&qkv_dim_u32)
-                        .arg(&qk_dim_u32)
-                        .arg(&value_dim_u32)
-                        .arg(&kernel_size_u32)
-                        .arg(&state_pos)
-                        .launch(launch_cfg)
-                }
-                .map_err(|e| RuntimeError::Compute(format!("GDN megakernel L{layer_idx}: {e}")))?;
-                if gdnstate_probe_mega {
-                    let ss =
-                        |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
-                    let h_after = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
-                    let out_h = self.device.dtoh_copy(&gdn.output_buf)?;
-                    eprintln!(
-                        "[GDNSTATE] mode=D phase=after step={} layer={layer_idx} \
-                         h_sumsq={:.6} out_sumsq={:.6}",
-                        st.decode_token_count,
-                        ss(&h_after),
-                        ss(&out_h[..p.value_dim.min(out_h.len())]),
-                    );
-                }
-                // [XCHK] Cross-backend forensic probe (env LUMEN_XCHK=1, default
-                // OFF -> byte-identical). GDN post-update h_state + conv_state in
-                // the SAME layout-independent sumsq/absmax schema as the Metal
-                // [XCHK] dump, keyed by the 0-based decode ordinal
-                // (decode_token_count) so the two backends align op-for-op. This
-                // is the LIVE megakernel decode path (gdn_decode_megakernel).
-                if {
-                    use std::sync::OnceLock;
-                    static XK: OnceLock<bool> = OnceLock::new();
-                    *XK.get_or_init(|| std::env::var("LUMEN_XCHK").as_deref() == Ok("1"))
-                } {
-                    let sa = |v: &[f32]| -> (f64, f32) {
-                        let mut sq = 0f64;
-                        let mut mx = 0f32;
-                        for &e in v {
-                            sq += (e as f64) * (e as f64);
-                            let a = e.abs();
-                            if a > mx {
-                                mx = a;
-                            }
-                        }
-                        (sq, mx)
-                    };
-                    let h_after = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
-                    let conv_h = self.device.dtoh_copy(&gdn.conv_states[gdn_idx])?;
-                    let (hsq, hmx) = sa(&h_after);
-                    let (csq, cmx) = sa(&conv_h);
-                    let step = st.decode_token_count;
-                    eprintln!("[XCHK] step={step} L={layer_idx} gdn_h_state sumsq={hsq:.6} absmax={hmx:.6}");
-                    eprintln!("[XCHK] step={step} L={layer_idx} gdn_conv_state sumsq={csq:.6} absmax={cmx:.6}");
-                }
-
-                // Advance circular buffer position (host-scalar path).
-                let buf_slots = (p.conv_kernel_size - 1) as u32;
-                gdn.conv_positions[gdn_idx] = (state_pos + 1) % buf_slots;
+                    st.decode_token_count,
+                    ss(&h_before),
+                    h_before.len(),
+                    ss(&conv_h),
+                    conv_h.len(),
+                );
             }
+            unsafe {
+                self.device
+                    .stream
+                    .launch_builder(mega_fn)
+                    .arg(&mut gdn.conv_states[gdn_idx])
+                    .arg(&mut gdn.h_states[gdn_idx])
+                    .arg(&gdn.qkv_buf)
+                    .arg(&gdn.alpha_raw_buf)
+                    .arg(&gdn.beta_raw_buf)
+                    .arg(conv1d_weight)
+                    .arg(dt_bias)
+                    .arg(ssm_a)
+                    .arg(&mut gdn.output_buf)
+                    .arg(&num_heads_u32)
+                    .arg(&num_kv_heads_u32)
+                    .arg(&head_dim_u32)
+                    .arg(&qkv_dim_u32)
+                    .arg(&qk_dim_u32)
+                    .arg(&value_dim_u32)
+                    .arg(&kernel_size_u32)
+                    .arg(&state_pos)
+                    .launch(launch_cfg)
+            }
+            .map_err(|e| RuntimeError::Compute(format!("GDN megakernel L{layer_idx}: {e}")))?;
+            if gdnstate_probe_mega {
+                let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                let h_after = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
+                let out_h = self.device.dtoh_copy(&gdn.output_buf)?;
+                eprintln!(
+                    "[GDNSTATE] mode=D phase=after step={} layer={layer_idx} \
+                         h_sumsq={:.6} out_sumsq={:.6}",
+                    st.decode_token_count,
+                    ss(&h_after),
+                    ss(&out_h[..p.value_dim.min(out_h.len())]),
+                );
+            }
+            // [XCHK] Cross-backend forensic probe (env LUMEN_XCHK=1, default
+            // OFF -> byte-identical). GDN post-update h_state + conv_state in
+            // the SAME layout-independent sumsq/absmax schema as the Metal
+            // [XCHK] dump, keyed by the 0-based decode ordinal
+            // (decode_token_count) so the two backends align op-for-op. This
+            // is the LIVE megakernel decode path (gdn_decode_megakernel).
+            if {
+                use std::sync::OnceLock;
+                static XK: OnceLock<bool> = OnceLock::new();
+                *XK.get_or_init(|| std::env::var("LUMEN_XCHK").as_deref() == Ok("1"))
+            } {
+                let sa = |v: &[f32]| -> (f64, f32) {
+                    let mut sq = 0f64;
+                    let mut mx = 0f32;
+                    for &e in v {
+                        sq += (e as f64) * (e as f64);
+                        let a = e.abs();
+                        if a > mx {
+                            mx = a;
+                        }
+                    }
+                    (sq, mx)
+                };
+                let h_after = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
+                let conv_h = self.device.dtoh_copy(&gdn.conv_states[gdn_idx])?;
+                let (hsq, hmx) = sa(&h_after);
+                let (csq, cmx) = sa(&conv_h);
+                let step = st.decode_token_count;
+                eprintln!(
+                    "[XCHK] step={step} L={layer_idx} gdn_h_state sumsq={hsq:.6} absmax={hmx:.6}"
+                );
+                eprintln!("[XCHK] step={step} L={layer_idx} gdn_conv_state sumsq={csq:.6} absmax={cmx:.6}");
+            }
+
+            // Advance circular buffer position (host-scalar path).
+            let buf_slots = (p.conv_kernel_size - 1) as u32;
+            gdn.conv_positions[gdn_idx] = (state_pos + 1) % buf_slots;
         } else {
             // === UNFUSED FALLBACK PATH ===
             // Step 3a: Conv1D decode
@@ -6991,9 +6188,6 @@ impl CudaBackend {
 
         // --- Step 11: Output projection -> ssm_proj ---
         // Fused path: reads from normed_out_buf. Unfused path: reads from output_buf.
-        // GDN_SPLIT: when q4_split_ssm_out is set, route through
-        // launch_matvec_preq8_1_split via inline Q8_1 quantization. Otherwise
-        // fall through to launch_matvec as before.
         {
             let ssm_out = lw.ssm_out.as_ref().ok_or_else(|| {
                 RuntimeError::Compute(format!("GDN L{layer_idx}: ssm_out weight missing",))
@@ -7003,69 +6197,20 @@ impl CudaBackend {
             } else {
                 &gdn.output_buf
             };
-            let use_split_ssm_out =
-                st.kernels.use_q4_split_dispatch && lw.q4_split_ssm_out.is_some();
-            if use_split_ssm_out {
-                let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref();
-                let q8_1_scratch = st.scratch.input_q8_1.as_mut();
-                if let (Some(quant_fn), Some(q8_1_buf)) = (quant_fn, q8_1_scratch) {
-                    unsafe {
-                        launch_quantize_input_q8_1(
-                            &self.device,
-                            quant_fn,
-                            ssm_input,
-                            q8_1_buf,
-                            p.value_dim,
-                            "gdn_ssm_out split",
-                        )?;
-                        launch_matvec_preq8_1_tile(
-                            &self.device,
-                            &st.kernels,
-                            ssm_out,
-                            None,
-                            None,
-                            None,
-                            lw.q4_split_ssm_out.as_ref(),
-                            q8_1_buf,
-                            &mut gdn.ssm_proj_buf,
-                            hidden_dim,
-                            p.value_dim,
-                            "gdn_ssm_out",
-                        )?;
-                    }
-                } else {
-                    unsafe {
-                        launch_matvec(
-                            &self.device,
-                            &st.kernels,
-                            ssm_out,
-                            ssm_input,
-                            &mut gdn.ssm_proj_buf,
-                            hidden_dim,
-                            p.value_dim,
-                            "gdn_ssm_out",
-                            lw.ssm_out_f16.as_ref(),
-                            Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut(),
-                        )?;
-                    }
-                }
-            } else {
-                unsafe {
-                    launch_matvec(
-                        &self.device,
-                        &st.kernels,
-                        ssm_out,
-                        ssm_input,
-                        &mut gdn.ssm_proj_buf,
-                        hidden_dim,
-                        p.value_dim,
-                        "gdn_ssm_out",
-                        lw.ssm_out_f16.as_ref(),
-                        Some(&mut st.scratch.input_f16),
-                        st.scratch.input_q8_1.as_mut(),
-                    )?;
-                }
+            unsafe {
+                launch_matvec(
+                    &self.device,
+                    &st.kernels,
+                    ssm_out,
+                    ssm_input,
+                    &mut gdn.ssm_proj_buf,
+                    hidden_dim,
+                    p.value_dim,
+                    "gdn_ssm_out",
+                    lw.ssm_out_f16.as_ref(),
+                    Some(&mut st.scratch.input_f16),
+                    st.scratch.input_q8_1.as_mut(),
+                )?;
             }
         }
 
@@ -7578,32 +6723,12 @@ impl CudaBackend {
 
             // 3. l2_normalize_qk_strided: batched L2 norm for Q and K
             //
-            // env-gated swap to two-step rsqrtf L2-norm variant
-            // when LUMEN_CUDA_L2NORM_RSQRTF=1.: also engages on
-            // LUMEN_CUDA_NORM_RSQRTF_BUNDLE (the combined convenience gate
-            // that also enables the alternate RMSNorm variant below).
-            // Switches to eps=1e-6 + rsqrtf(fmaxf(ss, eps^2)) (one HW op)
-            // instead of Lumen's historical eps=1e-12 +
-            // (sqrt>eps ? 1/sqrt : 1/eps) two-op form.
-            let l2norm_rsqrtf_on = std::env::var("LUMEN_CUDA_L2NORM_RSQRTF")
-                .map(|v| {
-                    matches!(
-                        v.as_str(),
-                        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-                    )
-                })
-                .unwrap_or(false)
-                || std::env::var("LUMEN_CUDA_NORM_RSQRTF_BUNDLE").is_ok();
-            let use_l2norm_rsqrtf =
-                l2norm_rsqrtf_on && st.kernels.l2_normalize_qk_strided_rsqrtf.is_some();
             {
                 let l2_fn = if use_prefill_f64 {
                     st.kernels
                         .l2_normalize_qk_strided_f64accum
                         .as_ref()
                         .unwrap()
-                } else if use_l2norm_rsqrtf {
-                    st.kernels.l2_normalize_qk_strided_rsqrtf.as_ref().unwrap()
                 } else {
                     st.kernels.l2_normalize_qk_strided.as_ref().unwrap()
                 };
@@ -7766,33 +6891,8 @@ impl CudaBackend {
             // is byte-identical to the prior path. The chunking only
             // engages at batch >= 65_536.
             {
-                // when LUMEN_CUDA_RMSNORM_RSQRTF=1 (or the combined gate
-                // LUMEN_CUDA_NORM_RSQRTF_BUNDLE=1) is set AND the alternate
-                // variant kernel loaded successfully, dispatch through the
-                // alternate RMSNorm + SiLU-gate kernel. Default OFF preserves
-                // byte-identical behaviour. The alternate variant changes:
-                //   1) `1/sqrtf(mean+eps)` → `rsqrtf(mean+eps)` (one HW op).
-                //   2) Cross-warp reduction uses a block-wide warp-shuffle
-                //      SUM pattern.
-                let rmsnorm_rsqrtf_on = std::env::var("LUMEN_CUDA_RMSNORM_RSQRTF").is_ok()
-                    || std::env::var("LUMEN_CUDA_NORM_RSQRTF_BUNDLE").is_ok();
-                let use_rsqrtf_norm_gate = rmsnorm_rsqrtf_on
-                    && !use_prefill_f64
-                    && st.kernels.gdn_prefill_norm_gate_rsqrtf.is_some();
-                if use_rsqrtf_norm_gate {
-                    static RSQRTF_NG_LOGGED: std::sync::atomic::AtomicBool =
-                        std::sync::atomic::AtomicBool::new(false);
-                    if !RSQRTF_NG_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        eprintln!(
-                            "[CUDA]: gdn_prefill_norm_gate_rsqrtf ACTIVE \
-                             (rsqrtf + block-wide warp-shuffle reduce)"
-                        );
-                    }
-                }
                 let norm_fn = if use_prefill_f64 {
                     st.kernels.gdn_prefill_norm_gate_f64accum.as_ref().unwrap()
-                } else if use_rsqrtf_norm_gate {
-                    st.kernels.gdn_prefill_norm_gate_rsqrtf.as_ref().unwrap()
                 } else {
                     st.kernels.gdn_prefill_norm_gate.as_ref().unwrap()
                 };
@@ -8532,33 +7632,16 @@ impl CudaBackend {
                 if moe_meta.shared_gate.is_some() && !skip_shared_pf {
                     let normed_view2 = pf.normed.slice(off..end);
                     let mut output_view2 = pf.x.slice_mut(off..end);
-                    let use_fused = super::moe::moe_shared_fused_enabled()
-                        && st.kernels.fused_glu_gemv_q4_0_prenormed_no_norm.is_some()
-                        && st.kernels.moe_shared_down_q4_0_sigmoid_accum.is_some()
-                        && st.kernels.moe_shared_down_q4_0_residual_accum.is_some();
-                    if use_fused {
-                        super::moe::encode_shared_expert_ffn_decode_fused(
-                            &self.device,
-                            &st.kernels,
-                            moe_scratch,
-                            &moe_meta,
-                            &moe_layer_blob,
-                            &normed_view2,
-                            &mut output_view2,
-                            hidden_dim,
-                        )?;
-                    } else {
-                        super::moe::encode_shared_expert_ffn_decode(
-                            &self.device,
-                            &st.kernels,
-                            moe_scratch,
-                            &moe_meta,
-                            &moe_layer_blob,
-                            &normed_view2,
-                            &mut output_view2,
-                            hidden_dim,
-                        )?;
-                    }
+                    super::moe::encode_shared_expert_ffn_decode(
+                        &self.device,
+                        &st.kernels,
+                        moe_scratch,
+                        &moe_meta,
+                        &moe_layer_blob,
+                        &normed_view2,
+                        &mut output_view2,
+                        hidden_dim,
+                    )?;
                 }
                 continue;
             }
@@ -8656,33 +7739,16 @@ impl CudaBackend {
                 let normed_view2 = pf.normed.slice(off..end);
                 let mut output_view2 = pf.x.slice_mut(off..end);
                 // opt-in fused path (same gating as decode).
-                let use_fused = super::moe::moe_shared_fused_enabled()
-                    && st.kernels.fused_glu_gemv_q4_0_prenormed_no_norm.is_some()
-                    && st.kernels.moe_shared_down_q4_0_sigmoid_accum.is_some()
-                    && st.kernels.moe_shared_down_q4_0_residual_accum.is_some();
-                if use_fused {
-                    super::moe::encode_shared_expert_ffn_decode_fused(
-                        &self.device,
-                        &st.kernels,
-                        moe_scratch,
-                        &moe_meta,
-                        &moe_layer_blob,
-                        &normed_view2,
-                        &mut output_view2,
-                        hidden_dim,
-                    )?;
-                } else {
-                    super::moe::encode_shared_expert_ffn_decode(
-                        &self.device,
-                        &st.kernels,
-                        moe_scratch,
-                        &moe_meta,
-                        &moe_layer_blob,
-                        &normed_view2,
-                        &mut output_view2,
-                        hidden_dim,
-                    )?;
-                }
+                super::moe::encode_shared_expert_ffn_decode(
+                    &self.device,
+                    &st.kernels,
+                    moe_scratch,
+                    &moe_meta,
+                    &moe_layer_blob,
+                    &normed_view2,
+                    &mut output_view2,
+                    hidden_dim,
+                )?;
             }
         }
 
@@ -8751,2180 +7817,6 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// Graph-compatible embed: reads token_id from device pointer.
-    fn embed_token_gpu_graph(&self, st: &mut MutableState) -> Result<(), RuntimeError> {
-        let hidden_dim = self.cached_hidden_dim;
-        let gk = st.graph_kernels.as_ref().unwrap();
-        let gp = st.graph_params.as_ref().unwrap();
-        let config = LaunchConfig::for_elements(hidden_dim);
-        let launch_cfg = CudarcLaunchConfig {
-            grid_dim: (config.grid_dim, 1, 1),
-            block_dim: (config.block_dim, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let hd = hidden_dim as u32;
-        let tid_ptr = gp.token_id_ptr();
-        if let Some(ref emb_f16) = st.globals.embedding_f16 {
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(&gk.embed_f16)
-                    .arg(emb_f16)
-                    .arg(&mut st.scratch.x_gpu)
-                    .arg(&tid_ptr)
-                    .arg(&hd)
-                    .launch(launch_cfg)
-            }
-            .map_err(|e| RuntimeError::Compute(format!("graph embed_f16: {e}")))?;
-        } else if let Some(ref emb_q4) = st.globals.embedding_q4 {
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(&gk.embed_q4_0)
-                    .arg(emb_q4)
-                    .arg(&mut st.scratch.x_gpu)
-                    .arg(&tid_ptr)
-                    .arg(&hd)
-                    .launch(launch_cfg)
-            }
-            .map_err(|e| RuntimeError::Compute(format!("graph embed_q4_0: {e}")))?;
-        } else if let Some(ref emb_q8) = st.globals.embedding_q8 {
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(&gk.embed_q8_0)
-                    .arg(emb_q8)
-                    .arg(&mut st.scratch.x_gpu)
-                    .arg(&tid_ptr)
-                    .arg(&hd)
-                    .launch(launch_cfg)
-            }
-            .map_err(|e| RuntimeError::Compute(format!("graph embed_q8_0: {e}")))?;
-        } else {
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(&gk.embed_f32)
-                    .arg(&st.globals.embedding)
-                    .arg(&mut st.scratch.x_gpu)
-                    .arg(&tid_ptr)
-                    .arg(&hd)
-                    .launch(launch_cfg)
-            }
-            .map_err(|e| RuntimeError::Compute(format!("graph embed_f32: {e}")))?;
-        }
-        Ok(())
-    }
-
-    /// Graph-compatible transformer layer: reads pos/seq_len from device pointers.
-    ///
-    /// CRITICAL: This function must NOT perform any host-to-device memcpy on the
-    /// capturing stream. All cuBLAS batched calls MUST use pre-computed device
-    /// pointer arrays (uploaded once in `preload_weights()`). The caller must
-    /// verify `precomputed_ptrs.is_some()` before entering graph capture.
-    ///
-    /// # Inter-layer fusion parameters
-    ///
-    /// - `skip_head_norm`: If true, skip the initial `fused_rmsnorm_f16` because
-    /// `input_f16` already contains the normalized activation from the previous
-    /// layer's fused tail. Only effective for F16/HGEMV paths.
-    /// - `fuse_tail_next_layer`: If Some(next_layer_idx), replace the final
-    /// `residual_add_copy` with `fused_residual_rmsnorm_f16` using the next
-    /// layer's attn_norm weights (from `layer_weights_cache[next_layer_idx]`).
-    /// Saves 1 dispatch per inter-layer boundary (35 fewer for 36-layer models).
-    fn compute_layer_gpu_graph(
-        &self,
-        layer_idx: usize,
-        st: &mut MutableState,
-        skip_head_norm: bool,
-        fuse_tail_next_layer: Option<usize>,
-    ) -> Result<(), RuntimeError> {
-        let hp = self.hp()?;
-        let hidden_dim = hp.hidden_dim as usize;
-        let num_heads = hp.num_heads as usize;
-        let num_kv_heads = hp.num_kv_heads as usize;
-        let head_dim = hp.head_dim as usize;
-        let inter_dim = hp.intermediate_dim as usize;
-        let eps = hp.norm_eps;
-        let theta = hp.rope_params.as_ref().map(|r| r.theta).unwrap_or(10000.0);
-        let q_dim = num_heads * head_dim;
-        let kv_dim = num_kv_heads * head_dim;
-
-        // Step 1: RMSNorm + QKV projections.
-        // For F16/HGEMV paths: use fused RMSNorm+F16 kernel (1 dispatch instead of 2)
-        // followed by pre-computed batched cuBLAS calls (zero htod memcpy).
-        let lw = &st.layer_weights_cache[layer_idx];
-
-        // Q+gate fusion (Qwen3.5 dense layers). Mirrors the production
-        // `compute_layer_gpu` path at line 1727: `attn_q_norm` present means wq
-        // projects to [q_dim * 2] = q_gate scratch, which is then deinterleaved
-        // into st.scratch.q + st.scratch.gate_buf, per-head-RMSNorm'd, then a
-        // post-attention sigmoid gating applies to attn_out before output proj.
-        // When this is OFF the graph variant is bit-exact when disabled.
-        let has_qgate_fusion = lw.attn_q_norm.is_some();
-        let wq_out_dim = if has_qgate_fusion { q_dim * 2 } else { q_dim };
-
-        // Diagnostic: on first layer, report which weight path is used (cuBLAS vs custom).
-        if layer_idx == 0 {
-            let diag = std::env::var("LUMEN_GRAPH_DIAGNOSTIC")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-            if diag {
-                let has_f16_cache = lw.wq_f16.is_some();
-                let wq_type = match &lw.wq {
-                    GpuWeightBuf::F16Raw(_) => "F16Raw (cuBLAS HGEMV path)",
-                    GpuWeightBuf::Bf16Raw(_) => "Bf16Raw (custom matvec_bf16 path)",
-                    GpuWeightBuf::Q8Raw(_) => "Q8Raw (native dp4a path)",
-                    GpuWeightBuf::Q4Raw(_) => "Q4Raw (native dp4a path)",
-                    GpuWeightBuf::Q4Aligned(_) => "Q4Aligned (native dp4a path)",
-                    GpuWeightBuf::Q8Aligned(_) => "Q8Aligned (native dp4a path)",
-                    GpuWeightBuf::F32(_) if has_f16_cache => "F32 (cuBLAS HGEMV via F16 cache)",
-                    GpuWeightBuf::F32(_) => "F32 (cuBLAS SGEMV path)",
-                    // Q8Split/Q4Split/Q8Tile/Q4Tile are sibling buffers,
-                    // not stored in `lw.wq`. Provided here only to make the match
-                    // exhaustive; should never trip in practice.
-                    GpuWeightBuf::Q8Split(_) => "Q8Split (sibling -- unexpected in lw.wq)",
-                    GpuWeightBuf::Q4Split(_) => "Q4Split (sibling -- unexpected in lw.wq)",
-                    GpuWeightBuf::Q8Tile(_) => "Q8Tile (sibling -- unexpected in lw.wq)",
-                    GpuWeightBuf::Q4Tile(_) => "Q4Tile (sibling -- unexpected in lw.wq)",
-                };
-                eprintln!("[GRAPH-DIAG]     L0 weight format: {wq_type}");
-                eprintln!(
-                    "[GRAPH-DIAG]     L0 has_precomputed_ptrs: {}",
-                    st.precomputed_ptrs.is_some()
-                );
-            }
-        }
-
-        if matches!(&lw.wq, GpuWeightBuf::F16Raw(_)) {
-            // F16 native: fused RMSNorm + F32->F16 in one kernel.
-            // Skip if the previous layer already fused this into its residual tail.
-            let pcp = st.precomputed_ptrs.as_ref().unwrap(); // guaranteed by can_use_graph check
-            if !skip_head_norm {
-                unsafe {
-                    launch_fused_rmsnorm_f16(
-                        &self.device,
-                        &st.kernels,
-                        &st.scratch.x_gpu,
-                        &lw.attn_norm,
-                        &mut st.scratch.input_f16,
-                        eps,
-                        hidden_dim,
-                        "graph attn F16",
-                    )?;
-                }
-            }
-            // QKV projections: Q separate + KV batched (2 cuBLAS calls).
-            // Pre-computed batched: Q separate + KV batched (no htod).
-            // qgate routes wq -> q_gate (q_dim*2). KV unchanged.
-            if let GpuWeightBuf::F16Raw(ref wq_f16) = lw.wq {
-                let (wq_out_buf, wq_od) = if has_qgate_fusion {
-                    (
-                        st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>,
-                        wq_out_dim,
-                    )
-                } else {
-                    (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
-                };
-                unsafe {
-                    launch_hgemv_f16_preconverted(
-                        &self.device,
-                        wq_f16,
-                        &st.scratch.input_f16,
-                        wq_out_buf,
-                        wq_od,
-                        hidden_dim,
-                        "graph wq",
-                        st.algo_cache.get(wq_od, hidden_dim),
-                    )?;
-                }
-            }
-            unsafe {
-                launch_hgemv_f16_batched_precomputed(
-                    &self.device,
-                    &pcp.kv_a_ptrs[layer_idx],
-                    &pcp.kv_b_ptrs[layer_idx],
-                    &pcp.kv_c_ptrs[layer_idx],
-                    2,
-                    kv_dim,
-                    hidden_dim,
-                    "graph kv",
-                    st.algo_cache.get(kv_dim, hidden_dim),
-                )?;
-            }
-        } else if matches!(&lw.wq, GpuWeightBuf::F32(_))
-            && lw.wq_f16.is_some()
-            && lw.wk_f16.is_some()
-            && lw.wv_f16.is_some()
-        {
-            // cuBLAS HGEMV fast path for F32 weights with pre-dequanted F16 caches.
-            // Q8/Q4 weights fall through to launch_matvec() for native dp4a (1.06 B/elem).
-            let pcp = st.precomputed_ptrs.as_ref().unwrap();
-            if !skip_head_norm {
-                unsafe {
-                    launch_fused_rmsnorm_f16(
-                        &self.device,
-                        &st.kernels,
-                        &st.scratch.x_gpu,
-                        &lw.attn_norm,
-                        &mut st.scratch.input_f16,
-                        eps,
-                        hidden_dim,
-                        "graph attn HGEMV",
-                    )?;
-                }
-            }
-            // qgate routes wq -> q_gate (q_dim*2). KV unchanged.
-            if let Some(ref wq_f16) = lw.wq_f16 {
-                let (wq_out_buf, wq_od) = if has_qgate_fusion {
-                    (
-                        st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>,
-                        wq_out_dim,
-                    )
-                } else {
-                    (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
-                };
-                unsafe {
-                    launch_hgemv_f16_preconverted(
-                        &self.device,
-                        wq_f16,
-                        &st.scratch.input_f16,
-                        wq_out_buf,
-                        wq_od,
-                        hidden_dim,
-                        "graph wq",
-                        st.algo_cache.get(wq_od, hidden_dim),
-                    )?;
-                }
-            }
-            unsafe {
-                launch_hgemv_f16_batched_precomputed(
-                    &self.device,
-                    &pcp.kv_a_ptrs[layer_idx],
-                    &pcp.kv_b_ptrs[layer_idx],
-                    &pcp.kv_c_ptrs[layer_idx],
-                    2,
-                    kv_dim,
-                    hidden_dim,
-                    "graph kv",
-                    st.algo_cache.get(kv_dim, hidden_dim),
-                )?;
-            }
-        } else {
-            // Q8/Q4/Q8Aligned/Q4Aligned/F32: native-quant graph decode via launch_matvec().
-            let qkv_use_preq = weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
-                && weight_uses_dp4a_q8_1(&lw.wk, &st.kernels)
-                && weight_uses_dp4a_q8_1(&lw.wv, &st.kernels)
-                && st.scratch.input_q8_1.is_some()
-                && st.kernels.quantize_f32_to_q8_1.is_some();
-
-            if skip_head_norm && qkv_use_preq {
-                // input_q8_1 already populated by fused_residual_rmsnorm_q8_1 from
-                // the previous layer's tail. Skip norm+quantize, go straight to QKV matvecs.
-                // split-layout: prefer Q8Split/Q4Split sibling buffers on QKV when set.
-                // qgate routes wq -> q_gate (q_dim*2); K/V unchanged.
-                unsafe {
-                    if has_qgate_fusion {
-                        let q8_1_in = st.scratch.input_q8_1.as_ref().unwrap();
-                        let q8_1_ptr: *const _ = q8_1_in;
-                        let q_gate = st.scratch.q_gate.as_mut().unwrap();
-                        launch_matvec_preq8_1_tile(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wq,
-                            lw.q8_tile_wq.as_ref(),
-                            lw.q4_tile_wq.as_ref(),
-                            lw.q8_split_wq.as_ref(),
-                            lw.q4_split_wq.as_ref(),
-                            &*q8_1_ptr,
-                            q_gate,
-                            wq_out_dim,
-                            hidden_dim,
-                            "graph wq qgate",
-                        )?;
-                    } else {
-                        let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                        launch_matvec_preq8_1_tile(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wq,
-                            lw.q8_tile_wq.as_ref(),
-                            lw.q4_tile_wq.as_ref(),
-                            lw.q8_split_wq.as_ref(),
-                            lw.q4_split_wq.as_ref(),
-                            q8_1_buf,
-                            &mut st.scratch.q,
-                            q_dim,
-                            hidden_dim,
-                            "graph wq",
-                        )?;
-                    }
-                    let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                    launch_matvec_preq8_1_tile(
-                        &self.device,
-                        &st.kernels,
-                        &lw.wk,
-                        lw.q8_tile_wk.as_ref(),
-                        lw.q4_tile_wk.as_ref(),
-                        lw.q8_split_wk.as_ref(),
-                        lw.q4_split_wk.as_ref(),
-                        q8_1_buf,
-                        &mut st.scratch.k,
-                        kv_dim,
-                        hidden_dim,
-                        "graph wk",
-                    )?;
-                    launch_matvec_preq8_1_tile(
-                        &self.device,
-                        &st.kernels,
-                        &lw.wv,
-                        lw.q8_tile_wv.as_ref(),
-                        lw.q4_tile_wv.as_ref(),
-                        lw.q8_split_wv.as_ref(),
-                        lw.q4_split_wv.as_ref(),
-                        q8_1_buf,
-                        &mut st.scratch.v,
-                        kv_dim,
-                        hidden_dim,
-                        "graph wv",
-                    )?;
-                }
-            } else if !skip_head_norm && qkv_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
-                // Fused RMSNorm + Q8_1 for graph decode: saves 1 dispatch per norm site.
-                let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
-                let q8_1_buf_init = st.scratch.input_q8_1.as_mut().unwrap();
-                let bs = rmsnorm_block_size(hidden_dim);
-                let lc = CudarcLaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (bs, 1, 1),
-                    shared_mem_bytes: rmsnorm_shared_bytes(bs),
-                };
-                let dim = hidden_dim as u32;
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(fused_fn)
-                        .arg(&st.scratch.x_gpu)
-                        .arg(&lw.attn_norm)
-                        .arg(&mut *q8_1_buf_init)
-                        .arg(&eps)
-                        .arg(&dim)
-                        .launch(lc)
-                }
-                .map_err(|e| RuntimeError::Compute(format!("graph rmsnorm_to_q8_1 attn: {e}")))?;
-                // Drop the &mut borrow before re-borrowing for wq dispatch.
-                let _ = q8_1_buf_init;
-                unsafe {
-                    // split-layout: prefer Q8Split/Q4Split sibling buffers on QKV when set.
-                    // qgate routes wq -> q_gate (q_dim*2); K/V unchanged.
-                    if has_qgate_fusion {
-                        let q8_1_in = st.scratch.input_q8_1.as_ref().unwrap();
-                        // Aliasing: q8_1 buffer is read-only here (KV reads also read-only).
-                        // Use raw pointer to break the borrow chain for the &mut q_gate write.
-                        let q8_1_ptr: *const _ = q8_1_in;
-                        let q_gate = st.scratch.q_gate.as_mut().unwrap();
-                        launch_matvec_preq8_1_tile(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wq,
-                            lw.q8_tile_wq.as_ref(),
-                            lw.q4_tile_wq.as_ref(),
-                            lw.q8_split_wq.as_ref(),
-                            lw.q4_split_wq.as_ref(),
-                            &*q8_1_ptr,
-                            q_gate,
-                            wq_out_dim,
-                            hidden_dim,
-                            "graph wq qgate",
-                        )?;
-                    } else {
-                        let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                        launch_matvec_preq8_1_tile(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wq,
-                            lw.q8_tile_wq.as_ref(),
-                            lw.q4_tile_wq.as_ref(),
-                            lw.q8_split_wq.as_ref(),
-                            lw.q4_split_wq.as_ref(),
-                            q8_1_buf,
-                            &mut st.scratch.q,
-                            q_dim,
-                            hidden_dim,
-                            "graph wq",
-                        )?;
-                    }
-                    let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                    launch_matvec_preq8_1_tile(
-                        &self.device,
-                        &st.kernels,
-                        &lw.wk,
-                        lw.q8_tile_wk.as_ref(),
-                        lw.q4_tile_wk.as_ref(),
-                        lw.q8_split_wk.as_ref(),
-                        lw.q4_split_wk.as_ref(),
-                        q8_1_buf,
-                        &mut st.scratch.k,
-                        kv_dim,
-                        hidden_dim,
-                        "graph wk",
-                    )?;
-                    launch_matvec_preq8_1_tile(
-                        &self.device,
-                        &st.kernels,
-                        &lw.wv,
-                        lw.q8_tile_wv.as_ref(),
-                        lw.q4_tile_wv.as_ref(),
-                        lw.q8_split_wv.as_ref(),
-                        lw.q4_split_wv.as_ref(),
-                        q8_1_buf,
-                        &mut st.scratch.v,
-                        kv_dim,
-                        hidden_dim,
-                        "graph wv",
-                    )?;
-                }
-            } else {
-                if !skip_head_norm {
-                    let bs = rmsnorm_block_size(hidden_dim);
-                    let lc = CudarcLaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (bs, 1, 1),
-                        shared_mem_bytes: rmsnorm_shared_bytes(bs),
-                    };
-                    let dim = hidden_dim as u32;
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(&st.kernels.rmsnorm)
-                            .arg(&st.scratch.x_gpu)
-                            .arg(&lw.attn_norm)
-                            .arg(&mut st.scratch.normed)
-                            .arg(&eps)
-                            .arg(&dim)
-                            .launch(lc)
-                    }
-                    .map_err(|e| RuntimeError::Compute(format!("graph rmsnorm attn: {e}")))?;
-                }
-                if qkv_use_preq {
-                    let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref().unwrap();
-                    unsafe {
-                        {
-                            let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                            launch_quantize_input_q8_1(
-                                &self.device,
-                                quant_fn,
-                                &st.scratch.normed,
-                                q8_1_buf,
-                                hidden_dim,
-                                "graph qkv",
-                            )?;
-                        }
-                        // split-layout: prefer Q8Split/Q4Split sibling buffers on QKV when set.
-                        // qgate routes wq -> q_gate (q_dim*2); K/V unchanged.
-                        if has_qgate_fusion {
-                            let q8_1_in = st.scratch.input_q8_1.as_ref().unwrap();
-                            let q8_1_ptr: *const _ = q8_1_in;
-                            let q_gate = st.scratch.q_gate.as_mut().unwrap();
-                            launch_matvec_preq8_1_tile(
-                                &self.device,
-                                &st.kernels,
-                                &lw.wq,
-                                lw.q8_tile_wq.as_ref(),
-                                lw.q4_tile_wq.as_ref(),
-                                lw.q8_split_wq.as_ref(),
-                                lw.q4_split_wq.as_ref(),
-                                &*q8_1_ptr,
-                                q_gate,
-                                wq_out_dim,
-                                hidden_dim,
-                                "graph wq qgate",
-                            )?;
-                        } else {
-                            let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                            launch_matvec_preq8_1_tile(
-                                &self.device,
-                                &st.kernels,
-                                &lw.wq,
-                                lw.q8_tile_wq.as_ref(),
-                                lw.q4_tile_wq.as_ref(),
-                                lw.q8_split_wq.as_ref(),
-                                lw.q4_split_wq.as_ref(),
-                                q8_1_buf,
-                                &mut st.scratch.q,
-                                q_dim,
-                                hidden_dim,
-                                "graph wq",
-                            )?;
-                        }
-                        let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                        launch_matvec_preq8_1_tile(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wk,
-                            lw.q8_tile_wk.as_ref(),
-                            lw.q4_tile_wk.as_ref(),
-                            lw.q8_split_wk.as_ref(),
-                            lw.q4_split_wk.as_ref(),
-                            q8_1_buf,
-                            &mut st.scratch.k,
-                            kv_dim,
-                            hidden_dim,
-                            "graph wk",
-                        )?;
-                        launch_matvec_preq8_1_tile(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wv,
-                            lw.q8_tile_wv.as_ref(),
-                            lw.q4_tile_wv.as_ref(),
-                            lw.q8_split_wv.as_ref(),
-                            lw.q4_split_wv.as_ref(),
-                            q8_1_buf,
-                            &mut st.scratch.v,
-                            kv_dim,
-                            hidden_dim,
-                            "graph wv",
-                        )?;
-                    }
-                } else {
-                    // qgate routes wq -> q_gate (q_dim*2); K/V unchanged.
-                    unsafe {
-                        if has_qgate_fusion {
-                            let q_gate = st.scratch.q_gate.as_mut().unwrap();
-                            launch_matvec(
-                                &self.device,
-                                &st.kernels,
-                                &lw.wq,
-                                &st.scratch.normed,
-                                q_gate,
-                                wq_out_dim,
-                                hidden_dim,
-                                "graph wq qgate",
-                                lw.wq_f16.as_ref(),
-                                Some(&mut st.scratch.input_f16),
-                                st.scratch.input_q8_1.as_mut(),
-                            )?;
-                        } else {
-                            launch_matvec(
-                                &self.device,
-                                &st.kernels,
-                                &lw.wq,
-                                &st.scratch.normed,
-                                &mut st.scratch.q,
-                                q_dim,
-                                hidden_dim,
-                                "graph wq",
-                                lw.wq_f16.as_ref(),
-                                Some(&mut st.scratch.input_f16),
-                                st.scratch.input_q8_1.as_mut(),
-                            )?;
-                        }
-                        launch_matvec(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wk,
-                            &st.scratch.normed,
-                            &mut st.scratch.k,
-                            kv_dim,
-                            hidden_dim,
-                            "graph wk",
-                            lw.wk_f16.as_ref(),
-                            Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut(),
-                        )?;
-                        launch_matvec(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wv,
-                            &st.scratch.normed,
-                            &mut st.scratch.v,
-                            kv_dim,
-                            hidden_dim,
-                            "graph wv",
-                            lw.wv_f16.as_ref(),
-                            Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut(),
-                        )?;
-                    }
-                }
-            }
-        }
-
-        // Q+gate fusion post-processing: deinterleave q_gate -> q + gate_buf,
-        // then per-head RMSNorm on Q (attn_q_norm) and K (attn_k_norm). Mirrors
-        // `compute_layer_gpu` line 2138-2231. Must run AFTER all QKV projection
-        // branches and BEFORE bias/RoPE. All three sub-dispatches are graph-
-        // capture-safe: deinterleave_qgate, rmsnorm_per_head_inplace take only
-        // device pointers + immutable u32 dims as args (no host scalars vary
-        // per-token across the graph; eps is hp.norm_eps, fixed per session).
-        if has_qgate_fusion {
-            let lw = &st.layer_weights_cache[layer_idx];
-            // 1a. Deinterleave: q_gate [q_dim*2] -> q [q_dim] + gate_buf [q_dim]
-            if let Some(ref deinterleave_fn) = st.kernels.deinterleave_qgate {
-                let q_gate_buf_ptr: *const _ = st.scratch.q_gate.as_ref().unwrap();
-                let block = 256u32;
-                let grid = ((q_dim as u32) + block - 1) / block;
-                let hd = head_dim as u32;
-                let nh = num_heads as u32;
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                unsafe {
-                    let q_gate_buf = &*q_gate_buf_ptr;
-                    let gate_buf = st.scratch.gate_buf.as_mut().unwrap();
-                    let q_out_ptr: *mut _ = &mut st.scratch.q;
-                    self.device
-                        .stream
-                        .launch_builder(deinterleave_fn)
-                        .arg(q_gate_buf)
-                        .arg(&mut *q_out_ptr)
-                        .arg(gate_buf)
-                        .arg(&hd)
-                        .arg(&nh)
-                        .launch(launch_cfg)
-                }
-                .map_err(|e| RuntimeError::Compute(format!("graph deinterleave_qgate: {e}")))?;
-            } else {
-                return Err(RuntimeError::Compute(
-                    "Q+gate fusion (graph) requires deinterleave_qgate kernel".into(),
-                ));
-            }
-
-            // 1b. Per-head RMSNorm on Q using attn_q_norm [head_dim].
-            if let Some(ref q_norm_w) = lw.attn_q_norm {
-                let norm_fn = st
-                    .kernels
-                    .rmsnorm_per_head_inplace
-                    .as_ref()
-                    .ok_or_else(|| {
-                        RuntimeError::Compute(
-                            "Q+gate fusion (graph) requires rmsnorm_per_head_inplace".into(),
-                        )
-                    })?;
-                let hd = head_dim as u32;
-                let nh = num_heads as u32;
-                let block = (head_dim as u32).min(1024).max(32);
-                let block = (block / 32) * 32; // round down to warp multiple
-                let shared_bytes = (block / 32) * 4; // one float per warp
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (nh, 1, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: shared_bytes,
-                };
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(norm_fn)
-                        .arg(&mut st.scratch.q)
-                        .arg(q_norm_w)
-                        .arg(&nh)
-                        .arg(&hd)
-                        .arg(&eps)
-                        .launch(launch_cfg)
-                }
-                .map_err(|e| RuntimeError::Compute(format!("graph rmsnorm_per_head Q: {e}")))?;
-            }
-
-            // 1c. Per-head RMSNorm on K using attn_k_norm [head_dim].
-            if let Some(ref k_norm_w) = lw.attn_k_norm {
-                let norm_fn = st
-                    .kernels
-                    .rmsnorm_per_head_inplace
-                    .as_ref()
-                    .ok_or_else(|| {
-                        RuntimeError::Compute(
-                            "Q+gate fusion (graph) requires rmsnorm_per_head_inplace".into(),
-                        )
-                    })?;
-                let hd = head_dim as u32;
-                let nkvh = num_kv_heads as u32;
-                let block = (head_dim as u32).min(1024).max(32);
-                let block = (block / 32) * 32;
-                let shared_bytes = (block / 32) * 4;
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (nkvh, 1, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: shared_bytes,
-                };
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(norm_fn)
-                        .arg(&mut st.scratch.k)
-                        .arg(k_norm_w)
-                        .arg(&nkvh)
-                        .arg(&hd)
-                        .arg(&eps)
-                        .launch(launch_cfg)
-                }
-                .map_err(|e| RuntimeError::Compute(format!("graph rmsnorm_per_head K: {e}")))?;
-            }
-        }
-
-        // QKV bias (Qwen2-family, graph decode).
-        let lw = &st.layer_weights_cache[layer_idx];
-        if lw.bq.is_some() || lw.bk.is_some() || lw.bv.is_some() {
-            let block = 256u32;
-            unsafe {
-                if let Some(ref bq) = lw.bq {
-                    let d = q_dim as u32;
-                    let g = (d + block - 1) / block;
-                    self.device
-                        .stream
-                        .launch_builder(&st.kernels.bias_add)
-                        .arg(&mut st.scratch.q)
-                        .arg(bq)
-                        .arg(&d)
-                        .launch(CudarcLaunchConfig {
-                            grid_dim: (g, 1, 1),
-                            block_dim: (block, 1, 1),
-                            shared_mem_bytes: 0,
-                        })
-                        .map_err(|e| RuntimeError::Compute(format!("bias_add bq graph: {e}")))?;
-                }
-                if let Some(ref bk) = lw.bk {
-                    let d = kv_dim as u32;
-                    let g = (d + block - 1) / block;
-                    self.device
-                        .stream
-                        .launch_builder(&st.kernels.bias_add)
-                        .arg(&mut st.scratch.k)
-                        .arg(bk)
-                        .arg(&d)
-                        .launch(CudarcLaunchConfig {
-                            grid_dim: (g, 1, 1),
-                            block_dim: (block, 1, 1),
-                            shared_mem_bytes: 0,
-                        })
-                        .map_err(|e| RuntimeError::Compute(format!("bias_add bk graph: {e}")))?;
-                }
-                if let Some(ref bv) = lw.bv {
-                    let d = kv_dim as u32;
-                    let g = (d + block - 1) / block;
-                    self.device
-                        .stream
-                        .launch_builder(&st.kernels.bias_add)
-                        .arg(&mut st.scratch.v)
-                        .arg(bv)
-                        .arg(&d)
-                        .launch(CudarcLaunchConfig {
-                            grid_dim: (g, 1, 1),
-                            block_dim: (block, 1, 1),
-                            shared_mem_bytes: 0,
-                        })
-                        .map_err(|e| RuntimeError::Compute(format!("bias_add bv graph: {e}")))?;
-                }
-            }
-        }
-
-        // Steps 2+3: Fused RoPE + KV cache write -- GRAPH VARIANT.
-        // Single kernel applies RoPE to Q and K, then writes K and V to cache.
-        // Saves 2 dispatches/layer vs separate rope_apply + 2x kv_cache_write.
-        // Thread mapping: 1 thread per RoPE pair. Grid = max(q_pairs, k_pairs).
-        {
-            let gk = st.graph_kernels.as_ref().unwrap();
-            let gp = st.graph_params.as_ref().unwrap();
-            let pos_ptr = gp.seq_pos_ptr();
-            let kvc = &mut st.kv_caches[layer_idx];
-            let nkv = kvc.num_kv_heads as u32;
-            let msl = kvc.max_seq_len as u32;
-            let hd = kvc.head_dim as u32;
-            let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
-            let actual_rot = if rotary_dim > 0 && rotary_dim < head_dim as u32 {
-                rotary_dim as usize
-            } else {
-                head_dim
-            };
-            let half_rot = actual_rot / 2;
-            let total_q_pairs = num_heads * half_rot;
-            let total_k_pairs = num_kv_heads * half_rot;
-            let max_pairs = total_q_pairs.max(total_k_pairs);
-            let config = LaunchConfig::for_elements(max_pairs);
-            let lc = CudarcLaunchConfig {
-                grid_dim: (config.grid_dim, 1, 1),
-                block_dim: (config.block_dim, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            // NeoX RoPE: models with partial rotary_dim use half-offset dimension pairing.
-            let rope_neox = hp.rope_neox;
-            let rope_kv_fn = if rope_neox {
-                &gk.rope_kv_write_neox
-            } else {
-                &gk.rope_kv_write
-            };
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(rope_kv_fn)
-                    .arg(&mut st.scratch.q)
-                    .arg(&mut st.scratch.k)
-                    .arg(&st.scratch.v)
-                    .arg(&mut kvc.k_cache)
-                    .arg(&mut kvc.v_cache)
-                    .arg(&pos_ptr)
-                    .arg(&(num_heads as u32))
-                    .arg(&nkv)
-                    .arg(&hd)
-                    .arg(&msl)
-                    .arg(&theta)
-                    .arg(&rotary_dim)
-                    .launch(lc)
-            }
-            .map_err(|e| RuntimeError::Compute(format!("graph rope_kv_write L{layer_idx}: {e}")))?;
-        }
-
-        // Step 4: Attention -- GRAPH VARIANT (reads seq_len from device pointer).
-        //
-        // when `LUMEN_CUDA_DECODE_GRAPH_TILED=1` is set AND the
-        // `attention_decode_tiled_graph` kernel is loaded, route through the
-        // tiled streaming-softmax kernel. Tiled-graph shmem is O(T_C + head_dim),
-        // constant in seq_len -- ~1.6 KB at head_dim=256, T_C=128. No extended-
-        // shmem opt-in needed. Algorithm is the same Dao-2022 online softmax as
-        // `attention_decode_tiled.cu`; the host-side gate at `decode_token`
-        // (`graph_eager_fallback_for_tiled`) is now bypassed when this lever
-        // is active.
-        //
-        // When the flag is OFF, this site uses the single-block
-        // `attention_decode_graph` kernel, preserving the prior behaviour.
-        {
-            let gk = st.graph_kernels.as_ref().unwrap();
-            let gp = st.graph_params.as_ref().unwrap();
-            let seq_len_ptr = gp.attn_seq_len_ptr();
-            let kvc = &st.kv_caches[layer_idx];
-            let msl = kvc.max_seq_len as u32;
-            let scale = 1.0f32 / (head_dim as f32).sqrt();
-            // Tiled-graph routing: only when the env opted in AND the kernel
-            // loaded AND head_dim satisfies the tile invariant (head_dim %
-            // ATTN_DECODE_TILED_BLOCK_DIM == 0). Production Qwen3.5-9B uses
-            // head_dim=256 which satisfies the latter.
-            // env-or-model-default helper. Returns true when
-            // explicitly set OR when the model is BF16 dense (graph capture
-            // is a measured +13% TPOT win there). Defaults to false on Q8/Q4
-            // dense.
-            let use_tiled_graph = cuda_decode_graph_tiled_enabled()
-                && gk.attention_decode_tiled.is_some()
-                && super::decode::attention_decode_tiled_supports_head_dim(head_dim as u32);
-            if use_tiled_graph {
-                // tiled-graph shmem: (8 + head_dim + T_C) * 4 bytes. T_C is the
-                // compile-time constant in the kernel (graph_kernels.cu); we
-                // mirror it here. Constant in seq_len.
-                const TILED_T_C: u32 = 128;
-                const TILED_BLOCK_DIM: u32 = 128;
-                let shared = (8 + (head_dim as u32) + TILED_T_C) * 4;
-                let lc = CudarcLaunchConfig {
-                    grid_dim: (num_heads as u32, 1, 1),
-                    block_dim: (TILED_BLOCK_DIM, 1, 1),
-                    shared_mem_bytes: shared,
-                };
-                let tiled_fn = gk.attention_decode_tiled.as_ref().unwrap();
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(tiled_fn)
-                        .arg(&st.scratch.q)
-                        .arg(&kvc.k_cache)
-                        .arg(&kvc.v_cache)
-                        .arg(&mut st.scratch.attn_out)
-                        .arg(&(num_heads as u32))
-                        .arg(&(num_kv_heads as u32))
-                        .arg(&(head_dim as u32))
-                        .arg(&seq_len_ptr)
-                        .arg(&msl)
-                        .arg(&scale)
-                        .launch(lc)
-                }
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("graph attn tiled L{layer_idx}: {e}"))
-                })?;
-            } else {
-                let shared = super::graph::graph_attention_shared_bytes(msl);
-                let lc = CudarcLaunchConfig {
-                    grid_dim: (num_heads as u32, 1, 1),
-                    block_dim: (super::graph::GRAPH_ATTN_BLOCK_SIZE, 1, 1),
-                    shared_mem_bytes: shared,
-                };
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(&gk.attention_decode)
-                        .arg(&st.scratch.q)
-                        .arg(&kvc.k_cache)
-                        .arg(&kvc.v_cache)
-                        .arg(&mut st.scratch.attn_out)
-                        .arg(&(num_heads as u32))
-                        .arg(&(num_kv_heads as u32))
-                        .arg(&(head_dim as u32))
-                        .arg(&seq_len_ptr)
-                        .arg(&msl)
-                        .arg(&scale)
-                        .launch(lc)
-                }
-                .map_err(|e| RuntimeError::Compute(format!("graph attn L{layer_idx}: {e}")))?;
-            }
-        }
-
-        // Q+gate sigmoid gating (graph variant): mirror of
-        // `compute_layer_gpu` line 2349. Applies after attention, before output
-        // projection. `attn_out = sigmoid(gate_buf) * attn_out`.
-        //
-        // Implementation note: the kernel computes `out[i] = sigmoid(gate[i]) *
-        // x[i]`. Each thread reads x[i] before writing out[i], so passing
-        // `attn_out` as BOTH x and out is safe and matches the math (in-place
-        // form). This avoids the memcpy_dtod step the non-graph production
-        // path uses; that step had to write through `q` and then dtod-copy back
-        // because the production-path comment notes a sizing concern -- but
-        // here we know q_dim = q_dim (the attn_out is unconditionally [q_dim]).
-        // Single sigmoid_mul kernel dispatch, fully graph-capture-safe.
-        if has_qgate_fusion {
-            if let Some(ref sigmoid_fn) = st.kernels.sigmoid_mul {
-                let n = q_dim as u32;
-                let block = 256u32;
-                let grid = (n + block - 1) / block;
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                unsafe {
-                    let gate_buf_ptr: *const _ = st.scratch.gate_buf.as_ref().unwrap();
-                    // x and out are both `attn_out`. Pass via raw pointer to
-                    // satisfy borrow checker (one shared ref + one mutable).
-                    let attn_out_ptr: *mut _ = &mut st.scratch.attn_out;
-                    self.device
-                        .stream
-                        .launch_builder(sigmoid_fn)
-                        .arg(&*gate_buf_ptr)
-                        .arg(&*attn_out_ptr)
-                        .arg(&mut *attn_out_ptr)
-                        .arg(&n)
-                        .launch(launch_cfg)
-                }
-                .map_err(|e| RuntimeError::Compute(format!("graph sigmoid_mul: {e}")))?;
-            } else {
-                return Err(RuntimeError::Compute(
-                    "Q+gate fusion (graph) requires sigmoid_mul kernel".into(),
-                ));
-            }
-        }
-
-        // Step 5: Output proj + residual (no per-token scalars, safe for capture).
-        // F16 path: fused F32->F16 conversion + residual copy (1 dispatch instead of 2),
-        // then cuBLAS HGEMV with beta=1.0.
-        let lw = &st.layer_weights_cache[layer_idx];
-        if let GpuWeightBuf::F16Raw(ref wo_f16) = lw.wo {
-            let gk = st.graph_kernels.as_ref().unwrap();
-            // Fused kernel: convert attn_out to F16 AND copy residual to attn_proj.
-            // Saves 1 dispatch (was: dtod copy + f32_to_f16_vec = 2 dispatches).
-            let max_dim = q_dim.max(hidden_dim);
-            let block = 256u32;
-            let grid = ((max_dim as u32) + block - 1) / block;
-            let lc = CudarcLaunchConfig {
-                grid_dim: (grid, 1, 1),
-                block_dim: (block, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(&gk.convert_f16_residual_copy)
-                    .arg(&st.scratch.attn_out)
-                    .arg(&mut st.scratch.input_f16)
-                    .arg(&st.scratch.x_gpu)
-                    .arg(&mut st.scratch.attn_proj)
-                    .arg(&(q_dim as u32))
-                    .arg(&(hidden_dim as u32))
-                    .launch(lc)
-            }
-            .map_err(|e| {
-                RuntimeError::Compute(format!("graph convert_f16_residual L{layer_idx}: {e}"))
-            })?;
-            // HGEMV with beta=1.0 (residual already in attn_proj).
-            unsafe {
-                launch_hgemv_f16_preconverted_beta1(
-                    &self.device,
-                    wo_f16,
-                    &st.scratch.input_f16,
-                    &mut st.scratch.attn_proj,
-                    hidden_dim,
-                    q_dim,
-                    "graph wo",
-                    st.algo_cache.get(hidden_dim, q_dim),
-                )?;
-            }
-        } else if matches!(&lw.wo, GpuWeightBuf::F32(_)) && lw.wo_f16.is_some() {
-            // cuBLAS HGEMV fast path for F32 weights with pre-dequanted F16 caches.
-            // Q8/Q4 weights fall through to launch_matvec_residual() for native dp4a.
-            let wo_f16 = lw.wo_f16.as_ref().unwrap();
-            unsafe {
-                launch_hgemv_f16_residual(
-                    &self.device,
-                    &st.kernels,
-                    wo_f16,
-                    &st.scratch.attn_out,
-                    &st.scratch.x_gpu,
-                    &mut st.scratch.attn_proj,
-                    &mut st.scratch.input_f16,
-                    hidden_dim,
-                    q_dim,
-                    "graph wo",
-                    st.algo_cache.get(hidden_dim, q_dim),
-                )?;
-            }
-        } else {
-            // split-layout: try Q8/Q4 split sibling for wo (mirrors the non-graph wo path).
-            let use_split_wo = (st.kernels.use_q8_split_dispatch && lw.q8_split_wo.is_some())
-                || (st.kernels.use_q4_split_dispatch && lw.q4_split_wo.is_some());
-            if use_split_wo {
-                let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref();
-                let q8_1_scratch = st.scratch.input_q8_1.as_mut();
-                if let (Some(quant_fn), Some(q8_1_buf)) = (quant_fn, q8_1_scratch) {
-                    unsafe {
-                        launch_quantize_input_q8_1(
-                            &self.device,
-                            quant_fn,
-                            &st.scratch.attn_out,
-                            q8_1_buf,
-                            q_dim,
-                            "graph wo split",
-                        )?;
-                        launch_matvec_preq8_1_residual_tile(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wo,
-                            lw.q8_tile_wo.as_ref(),
-                            lw.q4_tile_wo.as_ref(),
-                            lw.q8_split_wo.as_ref(),
-                            lw.q4_split_wo.as_ref(),
-                            q8_1_buf,
-                            &st.scratch.x_gpu,
-                            &mut st.scratch.attn_proj,
-                            hidden_dim,
-                            q_dim,
-                            "graph wo",
-                        )?;
-                    }
-                } else {
-                    unsafe {
-                        launch_matvec_residual(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wo,
-                            &st.scratch.attn_out,
-                            &st.scratch.x_gpu,
-                            &mut st.scratch.attn_proj,
-                            hidden_dim,
-                            q_dim,
-                            "graph wo",
-                            lw.wo_f16.as_ref(),
-                            Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut(),
-                        )?;
-                    }
-                }
-            } else {
-                unsafe {
-                    launch_matvec_residual(
-                        &self.device,
-                        &st.kernels,
-                        &lw.wo,
-                        &st.scratch.attn_out,
-                        &st.scratch.x_gpu,
-                        &mut st.scratch.attn_proj,
-                        hidden_dim,
-                        q_dim,
-                        "graph wo",
-                        lw.wo_f16.as_ref(),
-                        Some(&mut st.scratch.input_f16),
-                        st.scratch.input_q8_1.as_mut(),
-                    )?;
-                }
-            }
-        }
-
-        // MoE FFN branch.
-        //
-        // When this layer has `moe_layer_blob`, dispatch the existing graph-safe
-        // MoE FFN family (`encode_moe_ffn_decode_fused_norm` for Q8, falls back
-        // to `encode_moe_ffn_decode_q4_0` for Q4, plus shared-expert dispatch).
-        // The MoE dispatch is structurally identical across decode tokens
-        // because all per-token state (expert_ids, expert_weights) lives on
-        // the GPU; CPU passes only fixed u32 dims as kernel args.
-        //
-        // Output: `st.scratch.x_gpu` receives `attn_proj + Σ_k w[k] * expert[k](normed)`,
-        // with residual=attn_proj. The shared expert (Qwen3.5-MoE always-active)
-        // is added on top: `x_gpu += sigmoid(shared_gate · normed) * shared_expert(normed)`.
-        //
-        // After MoE FFN, the residual is already incorporated into x_gpu and
-        // no further residual_add is needed — we return early. The caller
-        // (run_graph_pipeline) forces fuse_tail_next=None for MoE layers, so
-        // the next layer's head-norm runs unconditionally.
-        if st.layer_weights_cache[layer_idx].moe_layer_blob.is_some() {
-            let lw_moe: &LayerWeightsGpu = &st.layer_weights_cache[layer_idx];
-            let moe_meta_ref = st
-                .moe_meta_cache
-                .get(layer_idx)
-                .and_then(|m| m.as_ref())
-                .ok_or_else(|| {
-                    RuntimeError::Compute(format!(
-                        "MoE graph layer {layer_idx} missing moe_meta_cache entry",
-                    ))
-                })?;
-            let moe_layer_blob = lw_moe
-                .moe_layer_blob
-                .as_ref()
-                .expect("moe_layer_blob.is_some() verified above");
-            let num_experts = moe_meta_ref.expert_gate_offs.len();
-            let top_k = self
-                .hp()?
-                .num_active_experts
-                .map(|v| v as usize)
-                .unwrap_or(0);
-            if top_k == 0 {
-                return Err(RuntimeError::Compute(
-                    "MoE graph layer present but hyperparams.num_active_experts not set".into(),
-                ));
-            }
-
-            let batched_offsets = st
-                .moe_batched_offsets
-                .get(layer_idx)
-                .and_then(|b| b.as_ref());
-            let has_shared = moe_meta_ref.shared_gate.is_some();
-
-            // Borrow the mutable scratch — `st.moe_scratch` is disjoint from
-            // `st.layer_weights_cache`, `st.scratch.*`, `st.kernels`.
-            let moe_scratch = st.moe_scratch.as_mut().ok_or_else(|| {
-                RuntimeError::Compute(
-                    "MoE graph layer dispatch requires moe_scratch (allocated in init for MoE models)".into(),
-                )
-            })?;
-
-            super::moe::encode_moe_ffn_decode_fused_norm(
-                &self.device,
-                &st.kernels,
-                moe_scratch,
-                moe_meta_ref,
-                batched_offsets,
-                moe_layer_blob,
-                &st.scratch.attn_proj.slice(..),
-                &lw_moe.ffn_norm,
-                &mut st.scratch.normed.slice_mut(..),
-                &st.scratch.attn_proj.slice(..),
-                &mut st.scratch.x_gpu.slice_mut(..),
-                eps,
-                hidden_dim,
-                inter_dim,
-                num_experts,
-                top_k,
-            )?;
-
-            // FIX shared expert (Qwen3.5-MoE always-active expert).
-            // Cached env var via OnceLock to match production path.
-            let skip_shared = {
-                use std::sync::OnceLock;
-                static FLAG: OnceLock<bool> = OnceLock::new();
-                *FLAG.get_or_init(|| {
-                    std::env::var("LUMEN_CUDA_SKIP_SHARED_EXPERT")
-                        .ok()
-                        .as_deref()
-                        .map(|v| matches!(v, "1" | "true" | "yes"))
-                        .unwrap_or(false)
-                })
-            };
-            if has_shared && !skip_shared {
-                let use_fused = super::moe::moe_shared_fused_enabled()
-                    && st.kernels.fused_glu_gemv_q4_0_prenormed_no_norm.is_some()
-                    && st.kernels.moe_shared_down_q4_0_sigmoid_accum.is_some()
-                    && st.kernels.moe_shared_down_q4_0_residual_accum.is_some();
-                if use_fused {
-                    super::moe::encode_shared_expert_ffn_decode_fused(
-                        &self.device,
-                        &st.kernels,
-                        moe_scratch,
-                        moe_meta_ref,
-                        moe_layer_blob,
-                        &st.scratch.normed.slice(..),
-                        &mut st.scratch.x_gpu.slice_mut(..),
-                        hidden_dim,
-                    )?;
-                } else {
-                    super::moe::encode_shared_expert_ffn_decode(
-                        &self.device,
-                        &st.kernels,
-                        moe_scratch,
-                        moe_meta_ref,
-                        moe_layer_blob,
-                        &st.scratch.normed.slice(..),
-                        &mut st.scratch.x_gpu.slice_mut(..),
-                        hidden_dim,
-                    )?;
-                }
-            }
-
-            // MoE FFN done — x_gpu = attn_proj + Σ expert_k + shared_expert.
-            // No further residual add (fused_norm wrapper already accumulated).
-            // Caller (run_graph_pipeline) forces fuse_tail_next=None for MoE,
-            // so next layer's head_norm runs unconditionally.
-            let _ = fuse_tail_next_layer; // explicitly unused for MoE
-            return Ok(());
-        }
-
-        // Step 6: FFN -- RMSNorm+F16 -> batched cuBLAS HGEMV gate/up -> SwiGLU -> HGEMV down.
-        let lw = &st.layer_weights_cache[layer_idx];
-        let pcp = st.precomputed_ptrs.as_ref().unwrap();
-        if matches!(
-            (&lw.w_gate, &lw.w_up),
-            (GpuWeightBuf::F16Raw(_), GpuWeightBuf::F16Raw(_))
-        ) {
-            unsafe {
-                launch_fused_rmsnorm_f16(
-                    &self.device,
-                    &st.kernels,
-                    &st.scratch.attn_proj,
-                    &lw.ffn_norm,
-                    &mut st.scratch.input_f16,
-                    eps,
-                    hidden_dim,
-                    "graph ffn F16",
-                )?;
-            }
-            unsafe {
-                launch_hgemv_f16_batched_precomputed(
-                    &self.device,
-                    &pcp.ffn_a_ptrs[layer_idx],
-                    &pcp.ffn_b_ptrs[layer_idx],
-                    &pcp.ffn_c_ptrs[layer_idx],
-                    2,
-                    inter_dim,
-                    hidden_dim,
-                    "graph gate_up",
-                    st.algo_cache.get(inter_dim, hidden_dim),
-                )?;
-            }
-        } else if matches!(&lw.w_gate, GpuWeightBuf::F32(_))
-            && lw.w_gate_f16.is_some()
-            && lw.w_up_f16.is_some()
-        {
-            // cuBLAS HGEMV fast path for F32 weights with pre-dequanted F16 caches.
-            // Q8/Q4 weights fall through to launch_matvec() for native dp4a.
-            unsafe {
-                launch_fused_rmsnorm_f16(
-                    &self.device,
-                    &st.kernels,
-                    &st.scratch.attn_proj,
-                    &lw.ffn_norm,
-                    &mut st.scratch.input_f16,
-                    eps,
-                    hidden_dim,
-                    "graph ffn HGEMV",
-                )?;
-            }
-            unsafe {
-                launch_hgemv_f16_batched_precomputed(
-                    &self.device,
-                    &pcp.ffn_a_ptrs[layer_idx],
-                    &pcp.ffn_b_ptrs[layer_idx],
-                    &pcp.ffn_c_ptrs[layer_idx],
-                    2,
-                    inter_dim,
-                    hidden_dim,
-                    "graph gate_up",
-                    st.algo_cache.get(inter_dim, hidden_dim),
-                )?;
-            }
-        } else {
-            // Q8/Q4/Q8Aligned/Q4Aligned/F32: native-quant graph FFN.
-            // Separate path: rmsnorm + gate + up dispatches.
-            let ffn_use_preq = weight_uses_dp4a_q8_1(&lw.w_gate, &st.kernels)
-                && weight_uses_dp4a_q8_1(&lw.w_up, &st.kernels)
-                && st.scratch.input_q8_1.is_some()
-                && st.kernels.quantize_f32_to_q8_1.is_some();
-
-            // Fused RMSNorm + Q8_1 for graph FFN: saves 1 dispatch per layer.
-            if ffn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
-                let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
-                let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                let bs = rmsnorm_block_size(hidden_dim);
-                let lc = CudarcLaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (bs, 1, 1),
-                    shared_mem_bytes: rmsnorm_shared_bytes(bs),
-                };
-                let dim = hidden_dim as u32;
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(fused_fn)
-                        .arg(&st.scratch.attn_proj)
-                        .arg(&lw.ffn_norm)
-                        .arg(&mut *q8_1_buf)
-                        .arg(&eps)
-                        .arg(&dim)
-                        .launch(lc)
-                }
-                .map_err(|e| RuntimeError::Compute(format!("graph rmsnorm_to_q8_1 ffn: {e}")))?;
-                unsafe {
-                    // split-layout: prefer Q8Split/Q4Split sibling buffers on FFN gate/up when set.
-                    launch_matvec_preq8_1_tile(
-                        &self.device,
-                        &st.kernels,
-                        &lw.w_gate,
-                        lw.q8_tile_w_gate.as_ref(),
-                        lw.q4_tile_w_gate.as_ref(),
-                        lw.q8_split_w_gate.as_ref(),
-                        lw.q4_split_w_gate.as_ref(),
-                        q8_1_buf,
-                        &mut st.scratch.gate,
-                        inter_dim,
-                        hidden_dim,
-                        "graph gate",
-                    )?;
-                    launch_matvec_preq8_1_tile(
-                        &self.device,
-                        &st.kernels,
-                        &lw.w_up,
-                        lw.q8_tile_w_up.as_ref(),
-                        lw.q4_tile_w_up.as_ref(),
-                        lw.q8_split_w_up.as_ref(),
-                        lw.q4_split_w_up.as_ref(),
-                        q8_1_buf,
-                        &mut st.scratch.up,
-                        inter_dim,
-                        hidden_dim,
-                        "graph up",
-                    )?;
-                }
-            } else {
-                let bs = rmsnorm_block_size(hidden_dim);
-                let lc = CudarcLaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (bs, 1, 1),
-                    shared_mem_bytes: rmsnorm_shared_bytes(bs),
-                };
-                let dim = hidden_dim as u32;
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(&st.kernels.rmsnorm)
-                        .arg(&st.scratch.attn_proj)
-                        .arg(&lw.ffn_norm)
-                        .arg(&mut st.scratch.normed)
-                        .arg(&eps)
-                        .arg(&dim)
-                        .launch(lc)
-                }
-                .map_err(|e| RuntimeError::Compute(format!("graph rmsnorm ffn: {e}")))?;
-
-                if ffn_use_preq {
-                    let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref().unwrap();
-                    let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                    unsafe {
-                        launch_quantize_input_q8_1(
-                            &self.device,
-                            quant_fn,
-                            &st.scratch.normed,
-                            q8_1_buf,
-                            hidden_dim,
-                            "graph ffn gate_up",
-                        )?;
-                        // split-layout: prefer Q8Split/Q4Split sibling buffers on FFN gate/up when set.
-                        launch_matvec_preq8_1_tile(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_gate,
-                            lw.q8_tile_w_gate.as_ref(),
-                            lw.q4_tile_w_gate.as_ref(),
-                            lw.q8_split_w_gate.as_ref(),
-                            lw.q4_split_w_gate.as_ref(),
-                            q8_1_buf,
-                            &mut st.scratch.gate,
-                            inter_dim,
-                            hidden_dim,
-                            "graph gate",
-                        )?;
-                        launch_matvec_preq8_1_tile(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_up,
-                            lw.q8_tile_w_up.as_ref(),
-                            lw.q4_tile_w_up.as_ref(),
-                            lw.q8_split_w_up.as_ref(),
-                            lw.q4_split_w_up.as_ref(),
-                            q8_1_buf,
-                            &mut st.scratch.up,
-                            inter_dim,
-                            hidden_dim,
-                            "graph up",
-                        )?;
-                    }
-                } else {
-                    unsafe {
-                        launch_matvec(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_gate,
-                            &st.scratch.normed,
-                            &mut st.scratch.gate,
-                            inter_dim,
-                            hidden_dim,
-                            "graph gate",
-                            lw.w_gate_f16.as_ref(),
-                            Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut(),
-                        )?;
-                        launch_matvec(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_up,
-                            &st.scratch.normed,
-                            &mut st.scratch.up,
-                            inter_dim,
-                            hidden_dim,
-                            "graph up",
-                            lw.w_up_f16.as_ref(),
-                            Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut(),
-                        )?;
-                    }
-                }
-            }
-        }
-
-        // SwiGLU + Down projection.
-        // gate and up are separate buffers. Apply SwiGLU (fused with F32->F16) then
-        // down projection.
-        let lw = &st.layer_weights_cache[layer_idx];
-
-        if let GpuWeightBuf::F16Raw(ref wd_f16) = lw.w_down {
-            unsafe {
-                launch_swiglu_f32_to_f16(
-                    &self.device,
-                    &st.kernels,
-                    &mut st.scratch.gate,
-                    &st.scratch.up,
-                    &mut st.scratch.input_f16,
-                    inter_dim,
-                )?;
-            }
-            unsafe {
-                launch_hgemv_f16_preconverted(
-                    &self.device,
-                    wd_f16,
-                    &st.scratch.input_f16,
-                    &mut st.scratch.down,
-                    hidden_dim,
-                    inter_dim,
-                    "graph down",
-                    st.algo_cache.get(hidden_dim, inter_dim),
-                )?;
-            }
-        } else if matches!(&lw.w_down, GpuWeightBuf::F32(_)) && lw.w_down_f16.is_some() {
-            unsafe {
-                launch_swiglu_f32_to_f16(
-                    &self.device,
-                    &st.kernels,
-                    &mut st.scratch.gate,
-                    &st.scratch.up,
-                    &mut st.scratch.input_f16,
-                    inter_dim,
-                )?;
-            }
-            if let Some(ref wd_f16) = lw.w_down_f16 {
-                unsafe {
-                    launch_hgemv_f16_preconverted(
-                        &self.device,
-                        wd_f16,
-                        &st.scratch.input_f16,
-                        &mut st.scratch.down,
-                        hidden_dim,
-                        inter_dim,
-                        "graph down",
-                        st.algo_cache.get(hidden_dim, inter_dim),
-                    )?;
-                }
-            }
-        } else {
-            // Non-F16: separate SwiGLU + launch_matvec down.
-            let config = LaunchConfig::for_elements(inter_dim);
-            let lc = CudarcLaunchConfig {
-                grid_dim: (config.grid_dim, 1, 1),
-                block_dim: (config.block_dim, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let n = inter_dim as u32;
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(&st.kernels.swiglu_inplace)
-                    .arg(&mut st.scratch.gate)
-                    .arg(&st.scratch.up)
-                    .arg(&n)
-                    .launch(lc)
-            }
-            .map_err(|e| RuntimeError::Compute(format!("graph swiglu L{layer_idx}: {e}")))?;
-            // split-layout: prefer Q8/Q4 split sibling for w_down in graph path too.
-            let use_split_down = (st.kernels.use_q8_split_dispatch && lw.q8_split_w_down.is_some())
-                || (st.kernels.use_q4_split_dispatch && lw.q4_split_w_down.is_some());
-            if use_split_down {
-                let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref();
-                let q8_1_scratch = st.scratch.input_q8_1.as_mut();
-                if let (Some(quant_fn), Some(q8_1_buf)) = (quant_fn, q8_1_scratch) {
-                    unsafe {
-                        launch_quantize_input_q8_1(
-                            &self.device,
-                            quant_fn,
-                            &st.scratch.gate,
-                            q8_1_buf,
-                            inter_dim,
-                            "graph down split",
-                        )?;
-                        launch_matvec_preq8_1_tile(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_down,
-                            lw.q8_tile_w_down.as_ref(),
-                            lw.q4_tile_w_down.as_ref(),
-                            lw.q8_split_w_down.as_ref(),
-                            lw.q4_split_w_down.as_ref(),
-                            q8_1_buf,
-                            &mut st.scratch.down,
-                            hidden_dim,
-                            inter_dim,
-                            "graph down",
-                        )?;
-                    }
-                } else {
-                    unsafe {
-                        launch_matvec(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_down,
-                            &st.scratch.gate,
-                            &mut st.scratch.down,
-                            hidden_dim,
-                            inter_dim,
-                            "graph down",
-                            lw.w_down_f16.as_ref(),
-                            Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut(),
-                        )?;
-                    }
-                }
-            } else {
-                unsafe {
-                    launch_matvec(
-                        &self.device,
-                        &st.kernels,
-                        &lw.w_down,
-                        &st.scratch.gate,
-                        &mut st.scratch.down,
-                        hidden_dim,
-                        inter_dim,
-                        "graph down",
-                        lw.w_down_f16.as_ref(),
-                        Some(&mut st.scratch.input_f16),
-                        st.scratch.input_q8_1.as_mut(),
-                    )?;
-                }
-            }
-        }
-        // Final step: residual add, with optional inter-layer fusion.
-        //
-        // Two fusion paths based on next layer's weight type:
-        // - F16: fused_residual_rmsnorm_f16 -> residual + RMSNorm + F16 output (for HGEMV paths)
-        // - Q8_0/dp4a: fused_residual_rmsnorm_q8_1 -> residual + RMSNorm + Q8_1 output (for dp4a paths)
-        // - residual_add_copy: plain residual (last layer, no fusion kernel, or no match)
-        if let Some(next_layer) = fuse_tail_next_layer {
-            let next_lw = &st.layer_weights_cache[next_layer];
-            // Check if next layer is F16 (HGEMV path).
-            let next_is_f16 = matches!(&next_lw.wq, GpuWeightBuf::F16Raw(_))
-                || (matches!(&next_lw.wq, GpuWeightBuf::F32(_))
-                    && next_lw.wq_f16.is_some()
-                    && next_lw.wk_f16.is_some()
-                    && next_lw.wv_f16.is_some());
-            // Check if next layer uses dp4a Q8_1 pre-quantized input.
-            let next_uses_q8_preq = weight_uses_dp4a_q8_1(&next_lw.wq, &st.kernels)
-                && weight_uses_dp4a_q8_1(&next_lw.wk, &st.kernels)
-                && weight_uses_dp4a_q8_1(&next_lw.wv, &st.kernels)
-                && st.scratch.input_q8_1.is_some()
-                && st.kernels.quantize_f32_to_q8_1.is_some();
-
-            if next_is_f16 {
-                if let Some(ref func) = st.kernels.fused_residual_rmsnorm_f16 {
-                    let next_norm = &next_lw.attn_norm;
-                    let bs = rmsnorm_block_size(hidden_dim);
-                    let shared = rmsnorm_shared_bytes(bs);
-                    let lc = CudarcLaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (bs, 1, 1),
-                        shared_mem_bytes: shared,
-                    };
-                    let dim = hidden_dim as u32;
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(func)
-                            .arg(&st.scratch.attn_proj)
-                            .arg(&st.scratch.down)
-                            .arg(&mut st.scratch.x_gpu)
-                            .arg(next_norm)
-                            .arg(&mut st.scratch.input_f16)
-                            .arg(&eps)
-                            .arg(&dim)
-                            .launch(lc)
-                    }
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!(
-                            "graph fused_residual_rmsnorm_f16 L{layer_idx}: {e}"
-                        ))
-                    })?;
-                } else {
-                    let config = LaunchConfig::for_elements(hidden_dim);
-                    let lc = CudarcLaunchConfig {
-                        grid_dim: (config.grid_dim, 1, 1),
-                        block_dim: (config.block_dim, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    let n = hidden_dim as u32;
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(&st.kernels.residual_add_copy)
-                            .arg(&st.scratch.attn_proj)
-                            .arg(&st.scratch.down)
-                            .arg(&mut st.scratch.x_gpu)
-                            .arg(&n)
-                            .launch(lc)
-                    }
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("graph residual_add_copy L{layer_idx}: {e}"))
-                    })?;
-                }
-            } else if next_uses_q8_preq {
-                if let Some(ref func) = st.kernels.fused_residual_rmsnorm_q8_1 {
-                    let next_norm = &next_lw.attn_norm;
-                    let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                    let bs = rmsnorm_block_size(hidden_dim);
-                    let shared = rmsnorm_shared_bytes(bs);
-                    let lc = CudarcLaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (bs, 1, 1),
-                        shared_mem_bytes: shared,
-                    };
-                    let dim = hidden_dim as u32;
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(func)
-                            .arg(&st.scratch.attn_proj)
-                            .arg(&st.scratch.down)
-                            .arg(&mut st.scratch.x_gpu)
-                            .arg(next_norm)
-                            .arg(&mut *q8_1_buf)
-                            .arg(&eps)
-                            .arg(&dim)
-                            .launch(lc)
-                    }
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!(
-                            "graph fused_residual_rmsnorm_q8_1 L{layer_idx}: {e}"
-                        ))
-                    })?;
-                } else {
-                    let config = LaunchConfig::for_elements(hidden_dim);
-                    let lc = CudarcLaunchConfig {
-                        grid_dim: (config.grid_dim, 1, 1),
-                        block_dim: (config.block_dim, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    let n = hidden_dim as u32;
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(&st.kernels.residual_add_copy)
-                            .arg(&st.scratch.attn_proj)
-                            .arg(&st.scratch.down)
-                            .arg(&mut st.scratch.x_gpu)
-                            .arg(&n)
-                            .launch(lc)
-                    }
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("graph residual_add_copy L{layer_idx}: {e}"))
-                    })?;
-                }
-            } else {
-                let config = LaunchConfig::for_elements(hidden_dim);
-                let lc = CudarcLaunchConfig {
-                    grid_dim: (config.grid_dim, 1, 1),
-                    block_dim: (config.block_dim, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let n = hidden_dim as u32;
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(&st.kernels.residual_add_copy)
-                        .arg(&st.scratch.attn_proj)
-                        .arg(&st.scratch.down)
-                        .arg(&mut st.scratch.x_gpu)
-                        .arg(&n)
-                        .launch(lc)
-                }
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("graph residual_add_copy L{layer_idx}: {e}"))
-                })?;
-            }
-        } else {
-            // Last layer: plain residual_add_copy (no fusion needed).
-            let config = LaunchConfig::for_elements(hidden_dim);
-            let lc = CudarcLaunchConfig {
-                grid_dim: (config.grid_dim, 1, 1),
-                block_dim: (config.block_dim, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let n = hidden_dim as u32;
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(&st.kernels.residual_add_copy)
-                    .arg(&st.scratch.attn_proj)
-                    .arg(&st.scratch.down)
-                    .arg(&mut st.scratch.x_gpu)
-                    .arg(&n)
-                    .launch(lc)
-            }
-            .map_err(|e| {
-                RuntimeError::Compute(format!("graph residual_add_copy L{layer_idx}: {e}"))
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Run the full graph-captured decode pipeline: embed + all layers + final + argmax.
-    ///
-    /// This is called during graph CAPTURE (kernels execute AND are recorded into
-    /// the graph) and on the first decode token to establish the graph.
-    ///
-    /// Uses graph kernel variants for embed, RoPE, KV cache write, and attention.
-    /// Everything else uses standard kernels (captured directly since they have
-    /// no per-token-varying scalars).
-    fn run_graph_pipeline(&self, st: &mut MutableState) -> Result<(), RuntimeError> {
-        let hp = self.hp()?;
-        let num_layers = hp.num_layers as usize;
-        let diag = std::env::var("LUMEN_GRAPH_DIAGNOSTIC")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-
-        // Step 1: Embed using graph variant
-        if diag {
-            eprintln!("[GRAPH-DIAG]   pipeline step 1: embed_token_gpu_graph");
-        }
-        self.embed_token_gpu_graph(st)?;
-        if diag {
-            let status = super::graph::query_capture_status(&self.device.stream);
-            eprintln!("[GRAPH-DIAG]     after embed: capture status = {status}");
-        }
-
-        // Step 2: All layers using graph variants, with inter-layer fusion.
-        //
-        // Inter-layer fusion: fuse the tail of layer L (residual_add_copy) with the
-        // head of layer L+1 (RMSNorm) into a single kernel.
-        // Two fusion paths:
-        // - F16: fused_residual_rmsnorm_f16 -> residual + RMSNorm + F16 output (for HGEMV paths)
-        // - Q8_0: fused_residual_rmsnorm_q8_1 -> residual + RMSNorm + Q8_1 output (for dp4a paths)
-        let uses_f16: Vec<bool> = (0..num_layers)
-            .map(|l| {
-                let lw = &st.layer_weights_cache[l];
-                matches!(&lw.wq, GpuWeightBuf::F16Raw(_))
-                    || (matches!(&lw.wq, GpuWeightBuf::F32(_))
-                        && lw.wq_f16.is_some()
-                        && lw.wk_f16.is_some()
-                        && lw.wv_f16.is_some())
-            })
-            .collect();
-
-        // Detect layers that use dp4a Q8_1 pre-quantized input for QKV (Q8_0/Q4_0/Q8Aligned/Q4Aligned).
-        let uses_q8_preq: Vec<bool> = (0..num_layers)
-            .map(|l| {
-                let lw = &st.layer_weights_cache[l];
-                weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
-                    && weight_uses_dp4a_q8_1(&lw.wk, &st.kernels)
-                    && weight_uses_dp4a_q8_1(&lw.wv, &st.kernels)
-                    && st.scratch.input_q8_1.is_some()
-                    && st.kernels.quantize_f32_to_q8_1.is_some()
-            })
-            .collect();
-
-        let has_fused_f16 = st.kernels.fused_residual_rmsnorm_f16.is_some();
-        let has_fused_q8_1 = st.kernels.fused_residual_rmsnorm_q8_1.is_some()
-            && st.kernels.rmsnorm_to_q8_1.is_some(); // also need unfused for FFN norm
-
-        // Detect GDN layers for graph-compatible routing.
-        let layer_types: Vec<u8> = (0..num_layers)
-            .map(|l| st.layer_weights_cache[l].layer_type)
-            .collect();
-
-        // conv_positions->GPU sync is now performed by the caller
-        // (`decode_token`) BEFORE `begin_capture()`. Doing it here would
-        // record the htod_copy into the captured graph, which is incorrect
-        // — the captured graph is supposed to be replayable without changing
-        // its dispatch list. The advance_conv_position kernel (captured)
-        // handles all per-replay updates to conv_positions_gpu.
-
-        let mut skip_head_norm = false;
-        for layer in 0..num_layers {
-            if diag && (layer < 2 || layer == num_layers - 1) {
-                eprintln!(
-                    "[GRAPH-DIAG]   pipeline step 2: L{layer} type={} (skip_head={skip_head_norm})",
-                    layer_types[layer]
-                );
-            }
-
-            // GDN layer routing: use the regular decode GDN path (non-graph-specific).
-            // GDN layers have inherently sequential state updates and go through the
-            // regular compute_gdn_attention_gpu which handles conv1d, gates, state update.
-            // The FFN block is handled by calling compute_layer_gpu which detects
-            // layer_type=1 and routes appropriately.
-            if layer_types[layer] == 1 {
-                // GDN attention block: sets attn_proj = x_gpu post-residual.
-                // route through graph-aware wrapper. When the
-                // graph megakernel and conv_positions_gpu are available, this
-                // emits a graph-capturable dispatch (device-pointer state_pos
-                // + advance_conv_position kernel) instead of the host-scalar
-                // path that previously baked the position into the graph and
-                // prevented replay.
-                self.compute_gdn_attention_gpu_graph(layer, st)?;
-                // GDN layers still need the shared FFN block. The code after
-                // compute_gdn_attention_gpu in the non-graph path does FFN via
-                // the normal flow in compute_layer_gpu. For the graph path,
-                // we skip the attention part and run only FFN.
-                // The FFN code in compute_layer_gpu_graph expects attn_proj to
-                // contain the post-attention hidden state, which is already set.
-                // We call compute_layer_gpu_graph with skip_head_norm=false
-                // and fuse_tail=None for simplicity -- GDN FFN doesn't benefit
-                // much from inter-layer fusion since GDN/standard layers alternate.
-                // BUT: we can't call compute_layer_gpu_graph for a GDN layer because
-                // it would try to run the standard attention path. Instead, we inline
-                // just the FFN portion.
-                //
-                // handle MoE-FFN-on-GDN-layer case (Qwen3.5-MoE-30B-A3B
-                // is GDN-attn + MoE-FFN). Without this branch, lw.w_gate/w_up/w_down
-                // would not exist for MoE layers and `launch_matvec(&lw.w_gate, ...)`
-                // would hit `CUBLAS_STATUS_INVALID_VALUE`. Detect MoE layer first
-                // and dispatch the same MoE FFN family used in compute_layer_gpu_graph.
-                let is_moe_on_gdn = st.layer_weights_cache[layer].moe_layer_blob.is_some();
-                if is_moe_on_gdn {
-                    let hp = self.hp()?;
-                    let hidden_dim = hp.hidden_dim as usize;
-                    let inter_dim = hp.intermediate_dim as usize;
-                    let eps = hp.norm_eps;
-                    let lw_moe: &LayerWeightsGpu = &st.layer_weights_cache[layer];
-                    let moe_meta_ref = st
-                        .moe_meta_cache
-                        .get(layer)
-                        .and_then(|m| m.as_ref())
-                        .ok_or_else(|| {
-                            RuntimeError::Compute(format!(
-                                "MoE-on-GDN graph layer {layer} missing moe_meta_cache entry",
-                            ))
-                        })?;
-                    let moe_layer_blob = lw_moe
-                        .moe_layer_blob
-                        .as_ref()
-                        .expect("moe_layer_blob.is_some() verified above");
-                    let num_experts = moe_meta_ref.expert_gate_offs.len();
-                    let top_k = hp.num_active_experts.map(|v| v as usize).unwrap_or(0);
-                    if top_k == 0 {
-                        return Err(RuntimeError::Compute(
-                            "MoE-on-GDN graph layer present but hyperparams.num_active_experts not set".into(),
-                        ));
-                    }
-                    let batched_offsets =
-                        st.moe_batched_offsets.get(layer).and_then(|b| b.as_ref());
-                    let has_shared = moe_meta_ref.shared_gate.is_some();
-                    let moe_scratch = st.moe_scratch.as_mut().ok_or_else(|| {
-                        RuntimeError::Compute(
-                            "MoE-on-GDN graph layer dispatch requires moe_scratch".into(),
-                        )
-                    })?;
-                    super::moe::encode_moe_ffn_decode_fused_norm(
-                        &self.device,
-                        &st.kernels,
-                        moe_scratch,
-                        moe_meta_ref,
-                        batched_offsets,
-                        moe_layer_blob,
-                        &st.scratch.attn_proj.slice(..),
-                        &lw_moe.ffn_norm,
-                        &mut st.scratch.normed.slice_mut(..),
-                        &st.scratch.attn_proj.slice(..),
-                        &mut st.scratch.x_gpu.slice_mut(..),
-                        eps,
-                        hidden_dim,
-                        inter_dim,
-                        num_experts,
-                        top_k,
-                    )?;
-                    let skip_shared = {
-                        use std::sync::OnceLock;
-                        static FLAG: OnceLock<bool> = OnceLock::new();
-                        *FLAG.get_or_init(|| {
-                            std::env::var("LUMEN_CUDA_SKIP_SHARED_EXPERT")
-                                .ok()
-                                .as_deref()
-                                .map(|v| matches!(v, "1" | "true" | "yes"))
-                                .unwrap_or(false)
-                        })
-                    };
-                    if has_shared && !skip_shared {
-                        let use_fused = super::moe::moe_shared_fused_enabled()
-                            && st.kernels.fused_glu_gemv_q4_0_prenormed_no_norm.is_some()
-                            && st.kernels.moe_shared_down_q4_0_sigmoid_accum.is_some()
-                            && st.kernels.moe_shared_down_q4_0_residual_accum.is_some();
-                        if use_fused {
-                            super::moe::encode_shared_expert_ffn_decode_fused(
-                                &self.device,
-                                &st.kernels,
-                                moe_scratch,
-                                moe_meta_ref,
-                                moe_layer_blob,
-                                &st.scratch.normed.slice(..),
-                                &mut st.scratch.x_gpu.slice_mut(..),
-                                hidden_dim,
-                            )?;
-                        } else {
-                            super::moe::encode_shared_expert_ffn_decode(
-                                &self.device,
-                                &st.kernels,
-                                moe_scratch,
-                                moe_meta_ref,
-                                moe_layer_blob,
-                                &st.scratch.normed.slice(..),
-                                &mut st.scratch.x_gpu.slice_mut(..),
-                                hidden_dim,
-                            )?;
-                        }
-                    }
-                    // MoE-on-GDN done: x_gpu = attn_proj + Σ expert + shared.
-                    // Skip the residual_add below (already incorporated).
-                    skip_head_norm = false;
-                    continue;
-                }
-                {
-                    let hp = self.hp()?;
-                    let hidden_dim = hp.hidden_dim as usize;
-                    let inter_dim = hp.intermediate_dim as usize;
-                    let eps = hp.norm_eps;
-                    let lw = &st.layer_weights_cache[layer];
-
-                    // FFN RMSNorm
-                    let block_size = rmsnorm_block_size(hidden_dim);
-                    let shared_bytes = rmsnorm_shared_bytes(block_size);
-                    let launch_cfg = CudarcLaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (block_size, 1, 1),
-                        shared_mem_bytes: shared_bytes,
-                    };
-                    let dim = hidden_dim as u32;
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(&st.kernels.rmsnorm)
-                            .arg(&st.scratch.attn_proj)
-                            .arg(&lw.ffn_norm)
-                            .arg(&mut st.scratch.normed)
-                            .arg(&eps)
-                            .arg(&dim)
-                            .launch(launch_cfg)
-                    }
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("GDN graph FFN rmsnorm L{layer}: {e}"))
-                    })?;
-
-                    // Gate + Up + SwiGLU + Down projections
-                    unsafe {
-                        launch_matvec(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_gate,
-                            &st.scratch.normed,
-                            &mut st.scratch.gate,
-                            inter_dim,
-                            hidden_dim,
-                            "graph gdn gate",
-                            lw.w_gate_f16.as_ref(),
-                            Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut(),
-                        )?;
-                        launch_matvec(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_up,
-                            &st.scratch.normed,
-                            &mut st.scratch.up,
-                            inter_dim,
-                            hidden_dim,
-                            "graph gdn up",
-                            lw.w_up_f16.as_ref(),
-                            Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut(),
-                        )?;
-                    }
-                    // SwiGLU
-                    {
-                        let config = LaunchConfig::for_elements(inter_dim);
-                        let lc = CudarcLaunchConfig {
-                            grid_dim: (config.grid_dim, 1, 1),
-                            block_dim: (config.block_dim, 1, 1),
-                            shared_mem_bytes: 0,
-                        };
-                        let n = inter_dim as u32;
-                        unsafe {
-                            self.device
-                                .stream
-                                .launch_builder(&st.kernels.swiglu_inplace)
-                                .arg(&mut st.scratch.gate)
-                                .arg(&st.scratch.up)
-                                .arg(&n)
-                                .launch(lc)
-                        }
-                        .map_err(|e| {
-                            RuntimeError::Compute(format!("GDN graph swiglu L{layer}: {e}"))
-                        })?;
-                    }
-                    // Down projection
-                    unsafe {
-                        launch_matvec(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_down,
-                            &st.scratch.gate,
-                            &mut st.scratch.down,
-                            hidden_dim,
-                            inter_dim,
-                            "graph gdn down",
-                            lw.w_down_f16.as_ref(),
-                            Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut(),
-                        )?;
-                    }
-                    // Residual add: x_gpu = attn_proj + down (attn_proj already has GDN attention output)
-                    {
-                        let config = LaunchConfig::for_elements(hidden_dim);
-                        let lc = CudarcLaunchConfig {
-                            grid_dim: (config.grid_dim, 1, 1),
-                            block_dim: (config.block_dim, 1, 1),
-                            shared_mem_bytes: 0,
-                        };
-                        let n = hidden_dim as u32;
-                        unsafe {
-                            self.device
-                                .stream
-                                .launch_builder(&st.kernels.residual_add_copy)
-                                .arg(&st.scratch.attn_proj)
-                                .arg(&st.scratch.down)
-                                .arg(&mut st.scratch.x_gpu)
-                                .arg(&n)
-                                .launch(lc)
-                        }
-                        .map_err(|e| {
-                            RuntimeError::Compute(format!("GDN graph residual L{layer}: {e}"))
-                        })?;
-                    }
-                }
-                // GDN layers break inter-layer fusion -- reset skip_head_norm.
-                skip_head_norm = false;
-                continue;
-            }
-
-            // detect MoE layer. MoE FFN dispatch handles its own
-            // residual accumulation inside `encode_moe_ffn_decode_fused_norm`,
-            // so the dense graph path's residual_add + fuse-tail logic does
-            // not apply. Skip fusion when this layer OR the next layer is MoE.
-            let is_moe_layer = st.layer_weights_cache[layer].moe_layer_blob.is_some();
-            let next_is_moe = layer + 1 < num_layers
-                && st.layer_weights_cache[layer + 1].moe_layer_blob.is_some();
-
-            // Determine if we should fuse the tail of this layer with the head of the next.
-            // Fuse when the next layer uses F16 (fused_residual_rmsnorm_f16) or
-            // Q8_0/dp4a (fused_residual_rmsnorm_q8_1) and the corresponding kernel exists.
-            // Skip fusion if next layer is GDN (GDN has its own attention path).
-            // also skip fusion if THIS layer is MoE (MoE writes x_gpu
-            // directly with residual accumulated) or NEXT layer is MoE (MoE FFN
-            // does its own RMSNorm internally).
-            let fuse_tail_next = if layer + 1 < num_layers
-                && layer_types[layer + 1] != 1
-                && !is_moe_layer
-                && !next_is_moe
-            {
-                let next_f16 = uses_f16[layer + 1];
-                let next_q8 = uses_q8_preq[layer + 1];
-                if next_f16 && has_fused_f16 {
-                    Some(layer + 1)
-                } else if next_q8 && has_fused_q8_1 {
-                    Some(layer + 1)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            self.compute_layer_gpu_graph(layer, st, skip_head_norm, fuse_tail_next)?;
-
-            // If we fused the tail, the next layer should skip its head norm.
-            skip_head_norm = fuse_tail_next.is_some();
-
-            if diag && (layer < 2 || layer == num_layers - 1) {
-                let status = super::graph::query_capture_status(&self.device.stream);
-                eprintln!("[GRAPH-DIAG]     after L{layer}: capture status = {status}");
-            }
-        }
-
-        // Step 3: Final RMSNorm + output projection (no per-token scalars)
-        if diag {
-            eprintln!("[GRAPH-DIAG]   pipeline step 3: compute_final_gpu");
-        }
-        self.compute_final_gpu(st)?;
-        if diag {
-            let status = super::graph::query_capture_status(&self.device.stream);
-            eprintln!("[GRAPH-DIAG]     after compute_final: capture status = {status}");
-        }
-
-        // Step 4: GPU argmax
-        if diag {
-            eprintln!("[GRAPH-DIAG]   pipeline step 4: argmax");
-        }
-        {
-            let vocab = hp.vocab_size;
-            let launch_cfg = CudarcLaunchConfig {
-                grid_dim: (1, 1, 1),
-                block_dim: (1024, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(&st.kernels.argmax_f32)
-                    .arg(&st.logits_gpu)
-                    .arg(&mut st.argmax_result)
-                    .arg(&vocab)
-                    .launch(launch_cfg)
-            }
-            .map_err(|e| RuntimeError::Compute(format!("graph argmax: {e}")))?;
-        }
-        if diag {
-            let status = super::graph::query_capture_status(&self.device.stream);
-            eprintln!("[GRAPH-DIAG]     after argmax: capture status = {status}");
-            eprintln!("[GRAPH-DIAG]   pipeline complete");
-        }
-
-        Ok(())
-    }
-
     /// Compute final RMSNorm + output projection entirely on GPU, with no host sync.
     ///
     /// Input: `st.scratch.x_gpu` (final hidden state, [hidden_dim]).
@@ -10962,92 +7854,6 @@ impl CudaBackend {
                         st.algo_cache.get(vocab_size, hidden_dim),
                     )?;
                 }
-                return Ok(());
-            }
-        }
-
-        // Fused fast path: fused final-RMSNorm + rawsum-Q8_1-quantize for the Q4
-        // lm_head "Path -1" (rawsum quantize + mul_mat_vec_q_q4_0). Replaces the
-        // standalone `rmsnorm` + `quantize_q8_1_rawsum` with ONE launch of
-        // `rmsnorm_to_q8_1_rawsum` (x_gpu -> q8_1_buf, never materializing the
-        // F32 `normed`), then the same `mul_mat_vec_q_q4_0` matvec, and returns.
-        // BIT-IDENTICAL by construction (same rms reduction tree + same rawsum
-        // quantize math). Gated behind LUMEN_CUDA_LMHEAD_FUSED (default OFF);
-        // only fires when the exact Path -1 prerequisites hold, so when OFF or
-        // inapplicable the dispatch below is byte-unchanged.
-        if super::moe::lmhead_fused_enabled()
-            && super::moe::mmv_q_output_proj_enabled()
-            && st.kernels.rmsnorm_to_q8_1_rawsum.is_some()
-            && st.kernels.mul_mat_vec_q_q4_0.is_some()
-            && st.scratch.input_q8_1.is_some()
-        {
-            // Pick the active Q4 output_proj buffer with the SAME priority as the
-            // unfused branches: Q4Aligned first, then raw Q4.
-            let proj_q4: Option<&CudaSlice<u8>> = st
-                .globals
-                .output_proj_q4_aligned
-                .as_ref()
-                .or(st.globals.output_proj_q4.as_ref());
-            if let Some(proj_q4) = proj_q4 {
-                use std::sync::Once;
-                static TRACE_ONCE_LMHEAD_FUSED: Once = Once::new();
-                TRACE_ONCE_LMHEAD_FUSED.call_once(|| {
-                    super::decode::cuda_log_force(format!(
-                        "[CUDA] LUMEN_CUDA_LMHEAD_FUSED: rmsnorm_to_q8_1_rawsum + mul_mat_vec_q_q4_0 (grid={}, in_dim={})",
-                        vocab_size, hidden_dim
-                    ));
-                });
-                let out_dim = vocab_size as u32;
-                let in_dim = hidden_dim as u32;
-                let fused_fn = st.kernels.rmsnorm_to_q8_1_rawsum.as_ref().unwrap();
-                let mv_fn = st.kernels.mul_mat_vec_q_q4_0.as_ref().unwrap();
-                let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-
-                // Fused RMSNorm + rawsum-Q8_1 quantize. Use the SAME block_size /
-                // shared-mem as the standalone `rmsnorm` so the reduction tree
-                // (num_warps) — and thus `rms` — is bit-identical.
-                let block_size = rmsnorm_block_size(hidden_dim);
-                let shared_bytes = rmsnorm_shared_bytes(block_size);
-                let fused_cfg = CudarcLaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: shared_bytes,
-                };
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(fused_fn)
-                        .arg(&st.scratch.x_gpu)
-                        .arg(&st.globals.final_norm)
-                        .arg(&mut *q8_1_buf)
-                        .arg(&eps)
-                        .arg(&in_dim)
-                        .launch(fused_cfg)
-                }
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("rmsnorm_to_q8_1_rawsum lm_head: {e}"))
-                })?;
-
-                // mul_mat_vec_q_q4_0 matvec — identical config to Path -1.
-                let mv_cfg = CudarcLaunchConfig {
-                    grid_dim: (out_dim, 1, 1),
-                    block_dim: (32, 4, 1),
-                    shared_mem_bytes: 128,
-                };
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(mv_fn)
-                        .arg(proj_q4)
-                        .arg(&*q8_1_buf)
-                        .arg(&mut st.logits_gpu)
-                        .arg(&in_dim)
-                        .arg(&out_dim)
-                        .launch(mv_cfg)
-                }
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("mul_mat_vec_q_q4_0 lm_head fused: {e}"))
-                })?;
                 return Ok(());
             }
         }
@@ -11337,26 +8143,6 @@ impl CudaBackend {
                     vocab_size,
                     hidden_dim,
                     "output_proj",
-                    st.algo_cache.get(vocab_size, hidden_dim),
-                )?;
-            }
-        } else if let Some(ref proj_f16_cache) = st.globals.output_proj_q8_to_f16_cache {
-            // cuBLAS HGEMV-N=1 against a pre-dequanted F16 cache of the
-            // Q8_0 output projection. Same compute path as BF16 / native F16
-            // output_proj (proven faster on this shape). Takes priority over
-            // the SPLIT / Q8Aligned / Q8Raw fallbacks below; default OFF (env
-            // `LUMEN_CUDA_OUTPUT_PROJ_F16_CACHE=1`).
-            unsafe {
-                launch_hgemv_f16(
-                    &self.device,
-                    &st.kernels,
-                    proj_f16_cache,
-                    &st.scratch.normed,
-                    &mut st.logits_gpu,
-                    &mut st.scratch.input_f16,
-                    vocab_size,
-                    hidden_dim,
-                    "output_proj_q8_to_f16",
                     st.algo_cache.get(vocab_size, hidden_dim),
                 )?;
             }
@@ -13426,38 +10212,6 @@ unsafe fn launch_matvec_preq8_1(
             }
         }
         GpuWeightBuf::Q8Aligned(w_q8a) => {
-            // AoS NR=8 dispatch.
-            // When LUMEN_CUDA_Q8_AOS_NR8=1 is set AND the kernel loaded,
-            // route AoS Q8 dispatch to the NR=8 dp4a mmvq kernel (NR=8 +
-            // 4-thread cooperation + vdr=2 + blocks_per_iter=32). NR=8 grid
-            // math. Takes priority over Q8_SCALE_HW since it is a more
-            // aggressive structural variant operating on the same byte layout.
-            if kernels.use_q8_aos_nr8_dispatch {
-                if let Some(mv_fn) = kernels.matvec_q8_aligned_nr8.as_ref() {
-                    let nr: u32 = 8;
-                    let mv_grid = (out_dim_u32 + nr - 1) / nr;
-                    let mv_cfg = CudarcLaunchConfig {
-                        grid_dim: (mv_grid, 1, 1),
-                        block_dim: (DP4A_Q8_1_BLOCK_DIM, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    device
-                        .stream
-                        .launch_builder(mv_fn)
-                        .arg(w_q8a)
-                        .arg(q8_1_buf)
-                        .arg(output)
-                        .arg(&out_dim_u32)
-                        .arg(&in_dim_u32)
-                        .launch(mv_cfg)
-                        .map_err(|e| {
-                            RuntimeError::Compute(format!(
-                                "matvec_q8_aligned_nr8 preq {label}: {e}",
-                            ))
-                        })?;
-                    return Ok(());
-                }
-            }
             // Q8_SCALE_HW: prefer the halfword-scale variant when
             // LUMEN_CUDA_Q8_SCALE_HW=1 was set at init AND the kernel loaded.
             // Numerically equivalent to matvec_q8_aligned_q8_1 (replaces a
@@ -13597,34 +10351,6 @@ unsafe fn launch_matvec_preq8_1_residual(
             }
         }
         GpuWeightBuf::Q8Aligned(w_q8a) => {
-            // AoS NR=8 residual dispatch.
-            if kernels.use_q8_aos_nr8_dispatch {
-                if let Some(mv_fn) = kernels.matvec_q8_aligned_nr8_residual.as_ref() {
-                    let nr: u32 = 8;
-                    let mv_grid = (out_dim_u32 + nr - 1) / nr;
-                    let mv_cfg = CudarcLaunchConfig {
-                        grid_dim: (mv_grid, 1, 1),
-                        block_dim: (DP4A_Q8_1_BLOCK_DIM, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    device
-                        .stream
-                        .launch_builder(mv_fn)
-                        .arg(w_q8a)
-                        .arg(q8_1_buf)
-                        .arg(residual)
-                        .arg(output)
-                        .arg(&out_dim_u32)
-                        .arg(&in_dim_u32)
-                        .launch(mv_cfg)
-                        .map_err(|e| {
-                            RuntimeError::Compute(format!(
-                                "matvec_q8_aligned_nr8_residual preq {label}: {e}",
-                            ))
-                        })?;
-                    return Ok(());
-                }
-            }
             // Q8_SCALE_HW: prefer the halfword-scale residual variant.
             let mv_fn_opt = if kernels.use_q8_scale_hw {
                 kernels
@@ -13763,57 +10489,11 @@ unsafe fn launch_matvec_preq8_1_split(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
-    // AoS NR=8 path PRIORITY OVERRIDE.
-    // When LUMEN_CUDA_Q8_AOS_NR8=1 is set AND the kernel loaded AND the
-    // underlying weight is a Q8Aligned (AoS) buffer, bypass the SPLIT
-    // dispatch entirely and route to the AoS NR=8 kernel. This is the
-    // brief's "replace SPLIT dispatch with AOS_NR8 for FFN shapes":
-    // since FFN gate/up/down all flow through `launch_matvec_preq8_1_split`,
-    // we re-route them to the AoS path when AOS_NR8 is enabled.
-    if kernels.use_q8_aos_nr8_dispatch {
-        if let GpuWeightBuf::Q8Aligned(_) = weight {
-            return launch_matvec_preq8_1(
-                device, kernels, weight, q8_1_buf, output, out_dim, in_dim, label,
-            );
-        }
-    }
     // Q8 split path.
     if kernels.use_q8_split_dispatch {
         if let Some(split_buf) = q8_split_sibling {
-            // NR8 takes priority over 4thread when both
-            // are env-enabled. NR8 is the strict structural superset
-            // (4-threads-per-block + NR=8). When NR8 is the chosen kernel,
-            // the grid uses NR=8 instead of NR=2; otherwise NR=2 grid math is
-            // used.
-            //
-            // when LUMEN_CUDA_Q8_SPLIT_4THREAD=1 is set, prefer
-            // the 4-threads-per-block variant on the same byte layout for
-            // shapes where the microbench (A100-80GB) showed a per-shape win:
-            //
-            // out_dim <= 4096: 4thread faster (1.09-1.25x)
-            // out_dim > 4096: production split faster (4thread 0.90-0.97x)
-            //
-            // The crossover happens because production's K-trip = 1 at
-            // in_dim=4096 with 128 threads benefits from 4 K-iters in the
-            // 4-threads-per-block pattern only when CTAs/SM stays low (small
-            // grids). At large out_dim the grid is so big that the dual-CTA-
-            // per-SM hint on the production kernel beats the K-iter unroll.
-            //
-            // We restrict to in_dim <= 4096 too: at larger in_dim production
-            // already gets K-trip >= 3 and the 4-thread advantage shrinks.
-            let use_split_nr8 = kernels.use_q8_split_nr8_dispatch;
-            let use_split_4thread = !use_split_nr8
-                && kernels.use_q8_split_4thread_dispatch
-                && out_dim <= 4096
-                && in_dim <= 4096;
-            let (mv_fn_opt, nr_grid): (Option<&CudaFunction>, u32) = if use_split_nr8 {
-                // NR=8 grid math: ceil(out_dim / 8)
-                (kernels.matvec_q8_split_q8_1_nr8.as_ref(), 8)
-            } else if use_split_4thread {
-                (kernels.matvec_q8_split_q8_1_4thread.as_ref(), 2)
-            } else {
-                (kernels.matvec_q8_split_q8_1.as_ref(), 2)
-            };
+            let (mv_fn_opt, nr_grid): (Option<&CudaFunction>, u32) =
+                (kernels.matvec_q8_split_q8_1.as_ref(), 2);
             if let Some(mv_fn) = mv_fn_opt {
                 let out_dim_u32 = out_dim as u32;
                 let in_dim_u32 = in_dim as u32;
@@ -13898,38 +10578,10 @@ unsafe fn launch_matvec_preq8_1_residual_split(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
-    // AoS NR=8 residual PRIORITY OVERRIDE.
-    // Mirrors `launch_matvec_preq8_1_split`: when AOS_NR8 is enabled and
-    // the underlying weight is Q8Aligned, bypass SPLIT dispatch and route
-    // to the AoS path with residual fusion.
-    if kernels.use_q8_aos_nr8_dispatch {
-        if let GpuWeightBuf::Q8Aligned(_) = weight {
-            return launch_matvec_preq8_1_residual(
-                device, kernels, weight, q8_1_buf, residual, output, out_dim, in_dim, label,
-            );
-        }
-    }
     if kernels.use_q8_split_dispatch {
         if let Some(split_buf) = q8_split_sibling {
-            // NR8 takes priority over 4thread.
-            // Same shape gate as launch_matvec_preq8_1_split: 4thread wins
-            // only for out_dim<=4096 && in_dim<=4096 shapes (wo, KV proj,
-            // GDN ssm_out). NR8 is applied unconditionally when its env
-            // var is set (the NR8 premise is that NR=8 unlocks the FFN
-            // shapes where 4thread LOST). Larger shapes (without either env
-            // var) fall back to the prod split kernel.
-            let use_split_nr8 = kernels.use_q8_split_nr8_dispatch;
-            let use_split_4thread = !use_split_nr8
-                && kernels.use_q8_split_4thread_dispatch
-                && out_dim <= 4096
-                && in_dim <= 4096;
-            let (mv_fn_opt, nr_grid): (Option<&CudaFunction>, u32) = if use_split_nr8 {
-                (kernels.matvec_q8_split_q8_1_nr8_residual.as_ref(), 8)
-            } else if use_split_4thread {
-                (kernels.matvec_q8_split_q8_1_4thread_residual.as_ref(), 2)
-            } else {
-                (kernels.matvec_q8_split_q8_1_residual.as_ref(), 2)
-            };
+            let (mv_fn_opt, nr_grid): (Option<&CudaFunction>, u32) =
+                (kernels.matvec_q8_split_q8_1_residual.as_ref(), 2);
             if let Some(mv_fn) = mv_fn_opt {
                 let out_dim_u32 = out_dim as u32;
                 let in_dim_u32 = in_dim as u32;
@@ -14644,972 +11296,8 @@ unsafe fn repack_all_layers_q4_clone_to_split(
     (layers_with_split.len(), oom_layer, oom_count, jobs.len())
 }
 
-/// Clone GDN-specific Q4Raw projection weights (`ssm_out`, `attn_gate`,
-/// `ssm_alpha`, `ssm_beta`) into per-row split (SoA) siblings.
-///
-/// GDN-specific because these weights live in `Option<GpuWeightBuf>` fields on
-/// `LayerWeightsGpu` (separate from the standard wq/wk/wv/wo/FFN weights).
-/// profile shows the 4096x4096 ssm_out matvec is ~10% of decode time on
-/// Qwen3.5-9B; the SPLIT layout closes ~20% of that.
-///
-/// Q4 only. Q8 + GDN_SPLIT OOMs on A100-80GB per . Returns a tuple of
-/// `(layers_with_any_split, total_jobs)`.
-unsafe fn repack_all_layers_gdn_q4_clone_to_split(
-    device: &CudaDevice,
-    repack_kernel: &cudarc::driver::CudaFunction,
-    layers: &mut [LayerWeightsGpu],
-    hp: &ModelHyperparams,
-) -> (usize, usize) {
-    let hidden = hp.hidden_dim as usize;
-    let heads = hp.num_heads as usize;
-    let kv_heads = hp.num_kv_heads as usize;
-    let head_dim = hp.head_dim as usize;
-    let q_dim = heads * head_dim;
-    let kv_dim = kv_heads * head_dim;
-    // GDN value_dim heuristic from gpu_buffers::upload_layer_weights:
-    // num_heads = group_count * GQA_ratio_2 = 16 * 2 = 32 (NOT hp.num_heads).
-    // Use ssm_norm_tiled length if available; else fall back to value_dim from hp.
-    let mut n_layers_with_split: usize = 0;
-    let mut total_jobs: usize = 0;
-
-    for layer in layers.iter_mut() {
-        if layer.layer_type != 1 {
-            continue;
-        }
-
-        // Determine value_dim per layer from ssm_norm_tiled length (set in upload).
-        let value_dim = layer
-            .ssm_norm_tiled
-            .as_ref()
-            .map(|s| s.len())
-            .unwrap_or(q_dim);
-
-        let mut layer_had_any = false;
-
-        // ssm_out: [hidden, value_dim] Q4Raw
-        if let Some(GpuWeightBuf::Q4Raw(ref raw)) = layer.ssm_out {
-            total_jobs += 1;
-            if let Ok(split) = repack_q4_raw_to_split(device, repack_kernel, raw, hidden, value_dim)
-            {
-                layer.q4_split_ssm_out = Some(split);
-                layer_had_any = true;
-            }
-        }
-        // attn_gate: [value_dim, hidden] Q4Raw
-        if let Some(GpuWeightBuf::Q4Raw(ref raw)) = layer.attn_gate {
-            total_jobs += 1;
-            if let Ok(split) = repack_q4_raw_to_split(device, repack_kernel, raw, value_dim, hidden)
-            {
-                layer.q4_split_attn_gate = Some(split);
-                layer_had_any = true;
-            }
-        }
-        // ssm_alpha: [num_heads, hidden] Q4Raw. num_heads inferred from hp.num_heads
-        // (GDN uses num_heads from hyperparams for the per-head projection).
-        if let Some(GpuWeightBuf::Q4Raw(ref raw)) = layer.ssm_alpha {
-            total_jobs += 1;
-            // alpha output dim = qkv_dim's num_heads scalar (per-head scalar),
-            // matches the kv_dim path; concretely raw.len() / (hidden / 32 * 18)
-            // gives the actual out_dim.
-            let nb = hidden / 32;
-            if nb > 0 && hidden % 32 == 0 {
-                let row_bytes = nb * 18;
-                if row_bytes > 0 && raw.len() % row_bytes == 0 {
-                    let out_dim = raw.len() / row_bytes;
-                    if let Ok(split) =
-                        repack_q4_raw_to_split(device, repack_kernel, raw, out_dim, hidden)
-                    {
-                        layer.q4_split_ssm_alpha = Some(split);
-                        layer_had_any = true;
-                    }
-                }
-            }
-            let _ = kv_dim; // suppress unused warning
-        }
-        if let Some(GpuWeightBuf::Q4Raw(ref raw)) = layer.ssm_beta {
-            total_jobs += 1;
-            let nb = hidden / 32;
-            if nb > 0 && hidden % 32 == 0 {
-                let row_bytes = nb * 18;
-                if row_bytes > 0 && raw.len() % row_bytes == 0 {
-                    let out_dim = raw.len() / row_bytes;
-                    if let Ok(split) =
-                        repack_q4_raw_to_split(device, repack_kernel, raw, out_dim, hidden)
-                    {
-                        layer.q4_split_ssm_beta = Some(split);
-                        layer_had_any = true;
-                    }
-                }
-            }
-            let _ = head_dim;
-        }
-
-        if layer_had_any {
-            n_layers_with_split += 1;
-        }
-    }
-    (n_layers_with_split, total_jobs)
-}
-
 // =============================================================================
 // End split-layout integration: dispatch helpers.
-// =============================================================================
-
-// =============================================================================
-// tile-layout integration:: tile-grouped layout dispatch.
-//
-// The TILE layout colocates 8 scales and 8 quant / nibble blocks within a
-// single tile (272 B for Q8, 144 B for Q4). Density is identical to Q8Raw /
-// Q4Raw; the win is L1-sector locality vs the SPLIT layout where the scales
-// stream lives `2*nb` bytes away from the quants stream.
-//
-// Wiring:
-// 1. Env vars `LUMEN_CUDA_Q8_TILE=1` / `LUMEN_CUDA_Q4_TILE=1` flip the
-// `KernelSet::use_q*_tile_dispatch` flags at session start.
-// 2. `repack_all_layers_q*_clone_to_tile` runs once during `preload_weights`
-// to clone Q8Raw / Q4Raw projection weights into TILE siblings on
-// `LayerWeightsGpu`. Skipped when the env var is unset OR the repack
-// kernel failed to compile.
-// 3. `launch_matvec_preq8_1_tile` / `launch_matvec_preq8_1_residual_tile`
-// prefer the TILE sibling, then fall back to the SPLIT dispatch helper
-// (which itself falls back to Aligned / Raw).
-//
-// default-off contract (clean revert): with env vars unset the dispatch path is
-// byte-for-byte identical to the SPLIT integration (which itself reduces to
-// the pre-SPLIT base path when its env vars are unset).
-// =============================================================================
-
-/// Dispatch a dp4a matvec with pre-quantized Q8_1 input, preferring the
-/// Q8Tile / Q4Tile sibling buffer when present.
-///
-/// When `q8_tile_sibling` is `Some` AND `kernels.use_q8_tile_dispatch` is true,
-/// routes to `matvec_q8_tile_q8_1`. Likewise for Q4. Falls through to
-/// `launch_matvec_preq8_1_split` (which itself falls back to the base
-/// dispatch) when no tile sibling is set or the TILE dispatch is disabled.
-///
-/// Tile and split siblings can coexist; tile wins because the layout is
-/// strictly more L1-locality-friendly within the same byte budget.
-///
-/// # Safety
-///
-/// Same constraints as `launch_matvec_preq8_1_split`. The tile sibling is
-/// produced by `repack_all_layers_q*_clone_to_tile` and has identical element
-/// count to the base weight.
-#[allow(clippy::too_many_arguments)]
-#[inline]
-unsafe fn launch_matvec_preq8_1_tile(
-    device: &CudaDevice,
-    kernels: &KernelSet,
-    weight: &GpuWeightBuf,
-    q8_tile_sibling: Option<&CudaSlice<u8>>,
-    q4_tile_sibling: Option<&CudaSlice<u8>>,
-    q8_split_sibling: Option<&CudaSlice<u8>>,
-    q4_split_sibling: Option<&CudaSlice<u8>>,
-    q8_1_buf: &CudaSlice<u8>,
-    output: &mut CudaSlice<f32>,
-    out_dim: usize,
-    in_dim: usize,
-    label: &str,
-) -> Result<(), RuntimeError> {
-    // Q8 tile path.
-    if kernels.use_q8_tile_dispatch {
-        if let Some(tile_buf) = q8_tile_sibling {
-            if let Some(mv_fn) = kernels.matvec_q8_tile_q8_1.as_ref() {
-                let out_dim_u32 = out_dim as u32;
-                let in_dim_u32 = in_dim as u32;
-                let mv_grid = dp4a_q8_1_grid(out_dim_u32);
-                let mv_cfg = CudarcLaunchConfig {
-                    grid_dim: (mv_grid, 1, 1),
-                    block_dim: (DP4A_Q8_1_BLOCK_DIM, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                device
-                    .stream
-                    .launch_builder(mv_fn)
-                    .arg(tile_buf)
-                    .arg(q8_1_buf)
-                    .arg(output)
-                    .arg(&out_dim_u32)
-                    .arg(&in_dim_u32)
-                    .launch(mv_cfg)
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("matvec_q8_tile_q8_1 preq {label}: {e}",))
-                    })?;
-                return Ok(());
-            }
-        }
-    }
-    // Q4 tile path.
-    if kernels.use_q4_tile_dispatch {
-        if let Some(tile_buf) = q4_tile_sibling {
-            if let Some(mv_fn) = kernels.matvec_q4_tile_q8_1.as_ref() {
-                let out_dim_u32 = out_dim as u32;
-                let in_dim_u32 = in_dim as u32;
-                let mv_grid = dp4a_q4_grid(out_dim_u32);
-                let mv_cfg = CudarcLaunchConfig {
-                    grid_dim: (mv_grid, 1, 1),
-                    block_dim: (DP4A_Q4_BLOCK_DIM, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                device
-                    .stream
-                    .launch_builder(mv_fn)
-                    .arg(tile_buf)
-                    .arg(q8_1_buf)
-                    .arg(output)
-                    .arg(&out_dim_u32)
-                    .arg(&in_dim_u32)
-                    .launch(mv_cfg)
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("matvec_q4_tile_q8_1 preq {label}: {e}",))
-                    })?;
-                return Ok(());
-            }
-        }
-    }
-    // Fall-through: SPLIT-aware dispatch (which itself falls back to the
-    // base Q8Raw/Q8Aligned/Q4Raw/Q4Aligned path when neither SPLIT sibling
-    // is present).
-    launch_matvec_preq8_1_split(
-        device,
-        kernels,
-        weight,
-        q8_split_sibling,
-        q4_split_sibling,
-        q8_1_buf,
-        output,
-        out_dim,
-        in_dim,
-        label,
-    )
-}
-
-/// Dispatch a dp4a matvec + fused residual, preferring the Q8Tile / Q4Tile
-/// sibling when present. Falls through to `launch_matvec_preq8_1_residual_split`.
-#[allow(clippy::too_many_arguments)]
-#[inline]
-unsafe fn launch_matvec_preq8_1_residual_tile(
-    device: &CudaDevice,
-    kernels: &KernelSet,
-    weight: &GpuWeightBuf,
-    q8_tile_sibling: Option<&CudaSlice<u8>>,
-    q4_tile_sibling: Option<&CudaSlice<u8>>,
-    q8_split_sibling: Option<&CudaSlice<u8>>,
-    q4_split_sibling: Option<&CudaSlice<u8>>,
-    q8_1_buf: &CudaSlice<u8>,
-    residual: &CudaSlice<f32>,
-    output: &mut CudaSlice<f32>,
-    out_dim: usize,
-    in_dim: usize,
-    label: &str,
-) -> Result<(), RuntimeError> {
-    if kernels.use_q8_tile_dispatch {
-        if let Some(tile_buf) = q8_tile_sibling {
-            if let Some(mv_fn) = kernels.matvec_q8_tile_q8_1_residual.as_ref() {
-                let out_dim_u32 = out_dim as u32;
-                let in_dim_u32 = in_dim as u32;
-                let mv_grid = dp4a_q8_1_grid(out_dim_u32);
-                let mv_cfg = CudarcLaunchConfig {
-                    grid_dim: (mv_grid, 1, 1),
-                    block_dim: (DP4A_Q8_1_BLOCK_DIM, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                device
-                    .stream
-                    .launch_builder(mv_fn)
-                    .arg(tile_buf)
-                    .arg(q8_1_buf)
-                    .arg(residual)
-                    .arg(output)
-                    .arg(&out_dim_u32)
-                    .arg(&in_dim_u32)
-                    .launch(mv_cfg)
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!(
-                            "matvec_q8_tile_q8_1_residual preq {label}: {e}",
-                        ))
-                    })?;
-                return Ok(());
-            }
-        }
-    }
-    if kernels.use_q4_tile_dispatch {
-        if let Some(tile_buf) = q4_tile_sibling {
-            if let Some(mv_fn) = kernels.matvec_q4_tile_q8_1_residual.as_ref() {
-                let out_dim_u32 = out_dim as u32;
-                let in_dim_u32 = in_dim as u32;
-                let mv_grid = dp4a_q4_grid(out_dim_u32);
-                let mv_cfg = CudarcLaunchConfig {
-                    grid_dim: (mv_grid, 1, 1),
-                    block_dim: (DP4A_Q4_BLOCK_DIM, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                device
-                    .stream
-                    .launch_builder(mv_fn)
-                    .arg(tile_buf)
-                    .arg(q8_1_buf)
-                    .arg(residual)
-                    .arg(output)
-                    .arg(&out_dim_u32)
-                    .arg(&in_dim_u32)
-                    .launch(mv_cfg)
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!(
-                            "matvec_q4_tile_q8_1_residual preq {label}: {e}",
-                        ))
-                    })?;
-                return Ok(());
-            }
-        }
-    }
-    launch_matvec_preq8_1_residual_split(
-        device,
-        kernels,
-        weight,
-        q8_split_sibling,
-        q4_split_sibling,
-        q8_1_buf,
-        residual,
-        output,
-        out_dim,
-        in_dim,
-        label,
-    )
-}
-
-/// Repack a single Q8Raw buffer into the per-row tile-grouped layout.
-///
-/// Produces a buffer of `out_dim * (nb/8) * 272` bytes = `out_dim * 34 * nb`
-/// bytes (same density as Q8Raw, regrouped into 272 B tiles of 8 blocks each).
-/// `nb` must be a multiple of 8 (one tile = 8 blocks). The original Q8Raw is
-/// preserved by the caller (prefill path needs the AoS layout).
-///
-/// # Safety
-///
-/// - `raw_buf` must contain at least `out_dim * nb * 34` bytes of valid Q8_0 data.
-/// - `in_dim` must be a multiple of 32, and `nb = in_dim / 32` must be a
-/// multiple of 8.
-unsafe fn repack_q8_raw_to_tile(
-    device: &CudaDevice,
-    repack_kernel: &cudarc::driver::CudaFunction,
-    raw_buf: &CudaSlice<u8>,
-    out_dim: usize,
-    in_dim: usize,
-) -> Result<CudaSlice<u8>, RuntimeError> {
-    if in_dim % 32 != 0 {
-        return Err(RuntimeError::Compute(format!(
-            "Q8 tile repack: in_dim={in_dim} is not a multiple of 32",
-        )));
-    }
-    let nb = in_dim / 32;
-    if nb % 8 != 0 {
-        return Err(RuntimeError::Compute(format!(
-            "Q8 tile repack: in_dim={in_dim} yields nb={nb} (not a multiple of 8); tile layout requires nb%%8==0",
-        )));
-    }
-    let row_bytes = (nb / 8) * 272;
-    let total_bytes = out_dim * row_bytes;
-    let mut tile_buf: CudaSlice<u8> = device.alloc_zeros(total_bytes)?;
-
-    let expected_src_bytes = out_dim * nb * 34;
-    if raw_buf.len() < expected_src_bytes {
-        return Err(RuntimeError::Compute(format!(
-            "Q8 tile repack: source buffer has {} bytes, expected {} (out_dim={out_dim}, nb={nb})",
-            raw_buf.len(),
-            expected_src_bytes,
-        )));
-    }
-
-    let total_blocks = (out_dim * nb) as u32;
-    let block_size = 256u32;
-    let grid_size = (total_blocks + block_size - 1) / block_size;
-    let nb_u32 = nb as u32;
-    let out_dim_u32 = out_dim as u32;
-
-    let launch_cfg = CudarcLaunchConfig {
-        grid_dim: (grid_size, 1, 1),
-        block_dim: (block_size, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    device
-        .stream
-        .launch_builder(repack_kernel)
-        .arg(raw_buf)
-        .arg(&mut tile_buf)
-        .arg(&nb_u32)
-        .arg(&out_dim_u32)
-        .launch(launch_cfg)
-        .map_err(|e| RuntimeError::Compute(format!("repack_q8_raw_to_tile launch: {e}")))?;
-
-    device.synchronize()?;
-    Ok(tile_buf)
-}
-
-/// Repack a single Q4Raw buffer into the per-row tile-grouped layout.
-///
-/// Produces a buffer of `out_dim * (nb/8) * 144` bytes = `out_dim * 18 * nb`
-/// bytes. `nb` must be a multiple of 8.
-unsafe fn repack_q4_raw_to_tile(
-    device: &CudaDevice,
-    repack_kernel: &cudarc::driver::CudaFunction,
-    raw_buf: &CudaSlice<u8>,
-    out_dim: usize,
-    in_dim: usize,
-) -> Result<CudaSlice<u8>, RuntimeError> {
-    if in_dim % 32 != 0 {
-        return Err(RuntimeError::Compute(format!(
-            "Q4 tile repack: in_dim={in_dim} is not a multiple of 32",
-        )));
-    }
-    let nb = in_dim / 32;
-    if nb % 8 != 0 {
-        return Err(RuntimeError::Compute(format!(
-            "Q4 tile repack: in_dim={in_dim} yields nb={nb} (not a multiple of 8); tile layout requires nb%%8==0",
-        )));
-    }
-    let row_bytes = (nb / 8) * 144;
-    let total_bytes = out_dim * row_bytes;
-    let mut tile_buf: CudaSlice<u8> = device.alloc_zeros(total_bytes)?;
-
-    let expected_src_bytes = out_dim * nb * 18;
-    if raw_buf.len() < expected_src_bytes {
-        return Err(RuntimeError::Compute(format!(
-            "Q4 tile repack: source buffer has {} bytes, expected {} (out_dim={out_dim}, nb={nb})",
-            raw_buf.len(),
-            expected_src_bytes,
-        )));
-    }
-
-    let total_blocks = (out_dim * nb) as u32;
-    let block_size = 256u32;
-    let grid_size = (total_blocks + block_size - 1) / block_size;
-    let nb_u32 = nb as u32;
-    let out_dim_u32 = out_dim as u32;
-
-    let launch_cfg = CudarcLaunchConfig {
-        grid_dim: (grid_size, 1, 1),
-        block_dim: (block_size, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    device
-        .stream
-        .launch_builder(repack_kernel)
-        .arg(raw_buf)
-        .arg(&mut tile_buf)
-        .arg(&nb_u32)
-        .arg(&out_dim_u32)
-        .launch(launch_cfg)
-        .map_err(|e| RuntimeError::Compute(format!("repack_q4_raw_to_tile launch: {e}")))?;
-
-    device.synchronize()?;
-    Ok(tile_buf)
-}
-
-/// Largest-first allocator for cloning every Q8Raw projection weight in a
-/// model into the per-row tile-grouped sibling layout. Mirror of
-/// `repack_all_layers_q8_clone_to_split` but populates the `q8_tile_*`
-/// fields and rejects any in_dim whose `nb` is not a multiple of 8.
-///
-/// Returns `(num_layers_with_any_tile, first_oom_layer_idx, total_oom_count,
-/// total_jobs_attempted)`. On OOM the loop aborts (no more attempts).
-///
-/// # Safety
-///
-/// Caller must ensure the `repack_kernel` is the compiled `repack_q8_raw_to_tile`.
-unsafe fn repack_all_layers_q8_clone_to_tile(
-    device: &CudaDevice,
-    repack_kernel: &cudarc::driver::CudaFunction,
-    layers: &mut [LayerWeightsGpu],
-    hp: &ModelHyperparams,
-) -> (usize, Option<usize>, usize, usize) {
-    let hidden = hp.hidden_dim as usize;
-    let heads = hp.num_heads as usize;
-    let kv_heads = hp.num_kv_heads as usize;
-    let head_dim = hp.head_dim as usize;
-    let inter = hp.intermediate_dim as usize;
-
-    let q_dim = heads * head_dim;
-    let kv_dim = kv_heads * head_dim;
-
-    #[derive(Copy, Clone, Debug)]
-    enum TileWeightKind {
-        Wq,
-        Wk,
-        Wv,
-        Wo,
-        Gate,
-        Up,
-        Down,
-    }
-
-    struct Job {
-        layer_idx: usize,
-        kind: TileWeightKind,
-        out_dim: usize,
-        in_dim: usize,
-        size_bytes: usize,
-    }
-
-    let mut jobs: Vec<Job> = Vec::with_capacity(layers.len() * 7);
-
-    fn push_if_q8raw(
-        jobs: &mut Vec<Job>,
-        layer_idx: usize,
-        kind: TileWeightKind,
-        w: &GpuWeightBuf,
-        out_dim: usize,
-        in_dim: usize,
-    ) {
-        if let GpuWeightBuf::Q8Raw(_) = w {
-            if in_dim % 32 != 0 {
-                return;
-            }
-            let nb = in_dim / 32;
-            // Tile layout requires nb to be a multiple of 8 (8 blocks per tile).
-            if nb % 8 != 0 {
-                return;
-            }
-            let size_bytes = out_dim * nb * 34;
-            jobs.push(Job {
-                layer_idx,
-                kind,
-                out_dim,
-                in_dim,
-                size_bytes,
-            });
-        }
-    }
-
-    for (layer_idx, layer) in layers.iter().enumerate() {
-        let wq_out_dim = if layer.layer_type == 1 {
-            kv_dim + kv_dim + q_dim
-        } else if layer.attn_q_norm.is_some() {
-            q_dim * 2
-        } else {
-            q_dim
-        };
-        push_if_q8raw(
-            &mut jobs,
-            layer_idx,
-            TileWeightKind::Wq,
-            &layer.wq,
-            wq_out_dim,
-            hidden,
-        );
-        push_if_q8raw(
-            &mut jobs,
-            layer_idx,
-            TileWeightKind::Wk,
-            &layer.wk,
-            kv_dim,
-            hidden,
-        );
-        push_if_q8raw(
-            &mut jobs,
-            layer_idx,
-            TileWeightKind::Wv,
-            &layer.wv,
-            kv_dim,
-            hidden,
-        );
-        push_if_q8raw(
-            &mut jobs,
-            layer_idx,
-            TileWeightKind::Wo,
-            &layer.wo,
-            hidden,
-            q_dim,
-        );
-        push_if_q8raw(
-            &mut jobs,
-            layer_idx,
-            TileWeightKind::Gate,
-            &layer.w_gate,
-            inter,
-            hidden,
-        );
-        push_if_q8raw(
-            &mut jobs,
-            layer_idx,
-            TileWeightKind::Up,
-            &layer.w_up,
-            inter,
-            hidden,
-        );
-        push_if_q8raw(
-            &mut jobs,
-            layer_idx,
-            TileWeightKind::Down,
-            &layer.w_down,
-            hidden,
-            inter,
-        );
-    }
-
-    jobs.sort_by(|a, b| {
-        b.size_bytes
-            .cmp(&a.size_bytes)
-            .then_with(|| {
-                let pa = if layers[a.layer_idx].layer_type == 0 {
-                    0u8
-                } else {
-                    1u8
-                };
-                let pb = if layers[b.layer_idx].layer_type == 0 {
-                    0u8
-                } else {
-                    1u8
-                };
-                pa.cmp(&pb)
-            })
-            .then_with(|| a.layer_idx.cmp(&b.layer_idx))
-    });
-
-    // Same 5.1 GB budget as SPLIT. Tile siblings COEXIST with split siblings
-    // when both env vars are set, so the effective VRAM usage may approach
-    // 2x the model size. Q8 + TILE on Qwen3.5-9B (~10 GB model) fits in 80
-    // GB even with SPLIT + aligned-repack also enabled, but the budget
-    // caps clone attempts to keep KV cache + scratch headroom intact.
-    const CLONE_BUDGET_BYTES: usize = 5_100_000_000;
-    let mut layers_with_tile = std::collections::HashSet::new();
-    let mut oom_layer: Option<usize> = None;
-    let mut oom_count: usize = 0;
-    let mut bytes_cloned: usize = 0;
-
-    for job in &jobs {
-        if oom_layer.is_some() {
-            break;
-        }
-        if bytes_cloned + job.size_bytes > CLONE_BUDGET_BYTES {
-            break;
-        }
-
-        let layer = &mut layers[job.layer_idx];
-        let src_ref: Option<&CudaSlice<u8>> = match job.kind {
-            TileWeightKind::Wq => {
-                if let GpuWeightBuf::Q8Raw(b) = &layer.wq {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            TileWeightKind::Wk => {
-                if let GpuWeightBuf::Q8Raw(b) = &layer.wk {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            TileWeightKind::Wv => {
-                if let GpuWeightBuf::Q8Raw(b) = &layer.wv {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            TileWeightKind::Wo => {
-                if let GpuWeightBuf::Q8Raw(b) = &layer.wo {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            TileWeightKind::Gate => {
-                if let GpuWeightBuf::Q8Raw(b) = &layer.w_gate {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            TileWeightKind::Up => {
-                if let GpuWeightBuf::Q8Raw(b) = &layer.w_up {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            TileWeightKind::Down => {
-                if let GpuWeightBuf::Q8Raw(b) = &layer.w_down {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-        };
-        let Some(raw_buf) = src_ref else { continue };
-        match repack_q8_raw_to_tile(device, repack_kernel, raw_buf, job.out_dim, job.in_dim) {
-            Ok(tile_buf) => {
-                match job.kind {
-                    TileWeightKind::Wq => layer.q8_tile_wq = Some(tile_buf),
-                    TileWeightKind::Wk => layer.q8_tile_wk = Some(tile_buf),
-                    TileWeightKind::Wv => layer.q8_tile_wv = Some(tile_buf),
-                    TileWeightKind::Wo => layer.q8_tile_wo = Some(tile_buf),
-                    TileWeightKind::Gate => layer.q8_tile_w_gate = Some(tile_buf),
-                    TileWeightKind::Up => layer.q8_tile_w_up = Some(tile_buf),
-                    TileWeightKind::Down => layer.q8_tile_w_down = Some(tile_buf),
-                }
-                layers_with_tile.insert(job.layer_idx);
-                bytes_cloned += job.size_bytes;
-            }
-            Err(_) => {
-                oom_layer = Some(job.layer_idx);
-                oom_count += 1;
-                break;
-            }
-        }
-    }
-
-    (layers_with_tile.len(), oom_layer, oom_count, jobs.len())
-}
-
-/// Largest-first allocator for cloning every Q4Raw projection weight into
-/// per-row tile-grouped siblings. Mirror of
-/// `repack_all_layers_q8_clone_to_tile`.
-unsafe fn repack_all_layers_q4_clone_to_tile(
-    device: &CudaDevice,
-    repack_kernel: &cudarc::driver::CudaFunction,
-    layers: &mut [LayerWeightsGpu],
-    hp: &ModelHyperparams,
-) -> (usize, Option<usize>, usize, usize) {
-    let hidden = hp.hidden_dim as usize;
-    let heads = hp.num_heads as usize;
-    let kv_heads = hp.num_kv_heads as usize;
-    let head_dim = hp.head_dim as usize;
-    let inter = hp.intermediate_dim as usize;
-
-    let q_dim = heads * head_dim;
-    let kv_dim = kv_heads * head_dim;
-
-    #[derive(Copy, Clone, Debug)]
-    enum TileWeightKind {
-        Wq,
-        Wk,
-        Wv,
-        Wo,
-        Gate,
-        Up,
-        Down,
-    }
-
-    struct Job {
-        layer_idx: usize,
-        kind: TileWeightKind,
-        out_dim: usize,
-        in_dim: usize,
-        size_bytes: usize,
-    }
-
-    let mut jobs: Vec<Job> = Vec::with_capacity(layers.len() * 7);
-
-    fn push_if_q4raw(
-        jobs: &mut Vec<Job>,
-        layer_idx: usize,
-        kind: TileWeightKind,
-        w: &GpuWeightBuf,
-        out_dim: usize,
-        in_dim: usize,
-    ) {
-        if let GpuWeightBuf::Q4Raw(_) = w {
-            if in_dim % 32 != 0 {
-                return;
-            }
-            let nb = in_dim / 32;
-            if nb % 8 != 0 {
-                return;
-            }
-            let size_bytes = out_dim * nb * 18;
-            jobs.push(Job {
-                layer_idx,
-                kind,
-                out_dim,
-                in_dim,
-                size_bytes,
-            });
-        }
-    }
-
-    for (layer_idx, layer) in layers.iter().enumerate() {
-        let wq_out_dim = if layer.layer_type == 1 {
-            kv_dim + kv_dim + q_dim
-        } else if layer.attn_q_norm.is_some() {
-            q_dim * 2
-        } else {
-            q_dim
-        };
-        push_if_q4raw(
-            &mut jobs,
-            layer_idx,
-            TileWeightKind::Wq,
-            &layer.wq,
-            wq_out_dim,
-            hidden,
-        );
-        push_if_q4raw(
-            &mut jobs,
-            layer_idx,
-            TileWeightKind::Wk,
-            &layer.wk,
-            kv_dim,
-            hidden,
-        );
-        push_if_q4raw(
-            &mut jobs,
-            layer_idx,
-            TileWeightKind::Wv,
-            &layer.wv,
-            kv_dim,
-            hidden,
-        );
-        push_if_q4raw(
-            &mut jobs,
-            layer_idx,
-            TileWeightKind::Wo,
-            &layer.wo,
-            hidden,
-            q_dim,
-        );
-        push_if_q4raw(
-            &mut jobs,
-            layer_idx,
-            TileWeightKind::Gate,
-            &layer.w_gate,
-            inter,
-            hidden,
-        );
-        push_if_q4raw(
-            &mut jobs,
-            layer_idx,
-            TileWeightKind::Up,
-            &layer.w_up,
-            inter,
-            hidden,
-        );
-        push_if_q4raw(
-            &mut jobs,
-            layer_idx,
-            TileWeightKind::Down,
-            &layer.w_down,
-            hidden,
-            inter,
-        );
-    }
-
-    jobs.sort_by(|a, b| {
-        b.size_bytes
-            .cmp(&a.size_bytes)
-            .then_with(|| {
-                let pa = if layers[a.layer_idx].layer_type == 0 {
-                    0u8
-                } else {
-                    1u8
-                };
-                let pb = if layers[b.layer_idx].layer_type == 0 {
-                    0u8
-                } else {
-                    1u8
-                };
-                pa.cmp(&pb)
-            })
-            .then_with(|| a.layer_idx.cmp(&b.layer_idx))
-    });
-
-    const CLONE_BUDGET_BYTES: usize = 5_100_000_000;
-    let mut layers_with_tile = std::collections::HashSet::new();
-    let mut oom_layer: Option<usize> = None;
-    let mut oom_count: usize = 0;
-    let mut bytes_cloned: usize = 0;
-
-    for job in &jobs {
-        if oom_layer.is_some() {
-            break;
-        }
-        if bytes_cloned + job.size_bytes > CLONE_BUDGET_BYTES {
-            break;
-        }
-
-        let layer = &mut layers[job.layer_idx];
-        let src_ref: Option<&CudaSlice<u8>> = match job.kind {
-            TileWeightKind::Wq => {
-                if let GpuWeightBuf::Q4Raw(b) = &layer.wq {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            TileWeightKind::Wk => {
-                if let GpuWeightBuf::Q4Raw(b) = &layer.wk {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            TileWeightKind::Wv => {
-                if let GpuWeightBuf::Q4Raw(b) = &layer.wv {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            TileWeightKind::Wo => {
-                if let GpuWeightBuf::Q4Raw(b) = &layer.wo {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            TileWeightKind::Gate => {
-                if let GpuWeightBuf::Q4Raw(b) = &layer.w_gate {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            TileWeightKind::Up => {
-                if let GpuWeightBuf::Q4Raw(b) = &layer.w_up {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            TileWeightKind::Down => {
-                if let GpuWeightBuf::Q4Raw(b) = &layer.w_down {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-        };
-        let Some(raw_buf) = src_ref else { continue };
-        match repack_q4_raw_to_tile(device, repack_kernel, raw_buf, job.out_dim, job.in_dim) {
-            Ok(tile_buf) => {
-                match job.kind {
-                    TileWeightKind::Wq => layer.q4_tile_wq = Some(tile_buf),
-                    TileWeightKind::Wk => layer.q4_tile_wk = Some(tile_buf),
-                    TileWeightKind::Wv => layer.q4_tile_wv = Some(tile_buf),
-                    TileWeightKind::Wo => layer.q4_tile_wo = Some(tile_buf),
-                    TileWeightKind::Gate => layer.q4_tile_w_gate = Some(tile_buf),
-                    TileWeightKind::Up => layer.q4_tile_w_up = Some(tile_buf),
-                    TileWeightKind::Down => layer.q4_tile_w_down = Some(tile_buf),
-                }
-                layers_with_tile.insert(job.layer_idx);
-                bytes_cloned += job.size_bytes;
-            }
-            Err(_) => {
-                oom_layer = Some(job.layer_idx);
-                oom_count += 1;
-                break;
-            }
-        }
-    }
-
-    (layers_with_tile.len(), oom_layer, oom_count, jobs.len())
-}
-
-// =============================================================================
-// End tile-layout integration: dispatch helpers.
 // =============================================================================
 
 /// Check if a weight buffer uses the dp4a Q8_1 path (Q8Raw, Q8Aligned, Q4Aligned, Q4Raw).
@@ -17313,7 +13001,6 @@ impl ComputeBackend for CudaBackend {
             output_proj_q8,
             output_proj_q8_aligned: None, // Populated during preload_weights
             output_proj_q8_split: None,   // populated when LUMEN_CUDA_OUTPUT_PROJ_SPLIT=1
-            output_proj_q8_to_f16_cache: None, // populated when LUMEN_CUDA_OUTPUT_PROJ_F16_CACHE=1
             output_proj_q4,
             output_proj_q4_aligned: None, // Populated during preload_weights
             output_proj_bf16: output_proj_bf16_raw,
@@ -17350,24 +13037,6 @@ impl ComputeBackend for CudaBackend {
         // Pre-allocate logits buffer for the zero-sync decode path.
         let vocab_size = hyperparams.vocab_size as usize;
         let logits_gpu = self.device.alloc_zeros::<f32>(vocab_size)?;
-
-        // Compile graph-compatible kernel variants for CUDA graph capture.
-        let graph_kernels = match super::graph::compile_graph_kernels(&self.device) {
-            Ok(gk) => Some(gk),
-            Err(e) => {
-                eprintln!("[CUDA] Graph kernel compilation failed (graph capture disabled): {e}");
-                None
-            }
-        };
-
-        // Allocate graph parameter buffers (small device scalars for token_id, pos, seq_len).
-        let graph_params = match super::graph::GraphParamsBuf::new(&self.device) {
-            Ok(gp) => Some(gp),
-            Err(e) => {
-                eprintln!("[CUDA] Graph params allocation failed (graph capture disabled): {e}");
-                None
-            }
-        };
 
         // Allocate cuBLAS workspace for CUDA graph capture compatibility.
         // cuBLAS must not call cudaMalloc during graph capture; providing a
@@ -17414,8 +13083,7 @@ impl ComputeBackend for CudaBackend {
         // helper that respects per-flag default-ON resolvers.
         // `Some(v)` parses the env value; `None` calls the runtime_defaults
         // helper. Explicit `=0` / "false" / "no" / "off" always wins (returns
-        // false). This matches the resolver pattern used for
-        // BF16_GEMMEX and DECODE_GRAPH.
+        // false). This matches the resolver pattern used for BF16_GEMMEX.
         let env_truthy_or_default = |key: &str, default_fn: fn() -> bool| -> bool {
             match std::env::var(key).ok() {
                 Some(v) => {
@@ -17459,10 +13127,6 @@ impl ComputeBackend for CudaBackend {
         } else if use_q4_split {
             eprintln!("[CUDA] LUMEN_CUDA_Q4_SPLIT=1: Q4_0 weights will be cloned to split layout for decode");
         }
-        let use_gdn_split = env_truthy("LUMEN_CUDA_GDN_SPLIT");
-        if use_gdn_split {
-            eprintln!("[CUDA] LUMEN_CUDA_GDN_SPLIT=1: GDN Q4 weights (ssm_out/attn_gate/ssm_alpha/ssm_beta) will be cloned to split layout for decode");
-        }
         // OUTPUT_PROJ_SPLIT defaults ON for Q8 dense (no-op
         // otherwise; clones the Q8_0 vocab output projection to the split
         // sibling layout for the NR-tiled matvec kernel).
@@ -17475,10 +13139,6 @@ impl ComputeBackend for CudaBackend {
         }
         // output_proj fast-path: F16 dequant cache + cuBLAS HGEMV-N=1.
         // Activates only when output_proj is Q8_0 (no other quants supported).
-        let use_output_proj_f16_cache = env_truthy("LUMEN_CUDA_OUTPUT_PROJ_F16_CACHE");
-        if use_output_proj_f16_cache {
-            eprintln!("[CUDA] LUMEN_CUDA_OUTPUT_PROJ_F16_CACHE=1: output_proj Q8_0 will be pre-dequanted to F16 for cuBLAS HGEMV decode");
-        }
         // output_proj NR override: pick from 2/16/32/64/128. Default = 16
         // when the model is Q8 dense (: matches the canonical
         // production config), else 32 (legacy default that matches the
@@ -17512,14 +13172,6 @@ impl ComputeBackend for CudaBackend {
                 "[CUDA] LUMEN_CUDA_OUTPUT_PROJ_NR={output_proj_nr}: output_proj SPLIT dispatch will use NR={output_proj_nr} kernel"
             );
         }
-        let use_q8_tile = env_truthy("LUMEN_CUDA_Q8_TILE");
-        if use_q8_tile {
-            eprintln!("[CUDA] LUMEN_CUDA_Q8_TILE=1: Q8_0 weights will be cloned to tile-grouped layout for decode");
-        }
-        let use_q4_tile = env_truthy("LUMEN_CUDA_Q4_TILE");
-        if use_q4_tile {
-            eprintln!("[CUDA] LUMEN_CUDA_Q4_TILE=1: Q4_0 weights will be cloned to tile-grouped layout for decode");
-        }
         // Propagate runtime feature flags onto KernelSet so the
         // `launch_matvec_preq8_1*` free functions can consult them without
         // taking an extra parameter at every call site.
@@ -17537,63 +13189,6 @@ impl ComputeBackend for CudaBackend {
             eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED=1: Q4 split dispatch uses the codegen-locked kernel (layout-independent bitwise-identical F32)");
         } else if use_soa_locked {
             eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED=1 set but prerequisites missing (need Q4 split dispatch active + locked kernels loaded); using unlocked split / base path");
-        }
-
-        // 4-threads-per-block mmvq kernel selection.
-        // Effective only when LUMEN_CUDA_Q8_SPLIT=1 is also set, since the
-        // 4-thread variant consumes the SPLIT byte layout. Default OFF.
-        let use_q8_split_4thread = env_truthy("LUMEN_CUDA_Q8_SPLIT_4THREAD");
-        kernels.use_q8_split_4thread_dispatch = use_q8_split_4thread
-            && kernels.use_q8_split_dispatch
-            && kernels.matvec_q8_split_q8_1_4thread.is_some()
-            && kernels.matvec_q8_split_q8_1_4thread_residual.is_some();
-        if kernels.use_q8_split_4thread_dispatch {
-            eprintln!("[CUDA] LUMEN_CUDA_Q8_SPLIT_4THREAD=1: SPLIT dispatch uses dp4a-mmvq kernel (K-trip=4)");
-        } else if use_q8_split_4thread {
-            eprintln!("[CUDA] LUMEN_CUDA_Q8_SPLIT_4THREAD=1 set but prerequisites missing (need Q8_SPLIT=1 + kernel load OK); using existing split kernel");
-        }
-        // NR=8 mmvq kernel selection (4-threads-per-block + NR=8 rows/CTA).
-        // Selected if env var is set AND prerequisites are met. Takes priority
-        // over 4thread when both are set (FULL is the strict superset).
-        // Default OFF (default-off contract).
-        let use_q8_split_nr8 = env_truthy("LUMEN_CUDA_Q8_SPLIT_NR8");
-        kernels.use_q8_split_nr8_dispatch = use_q8_split_nr8
-            && kernels.use_q8_split_dispatch
-            && kernels.matvec_q8_split_q8_1_nr8.is_some()
-            && kernels.matvec_q8_split_q8_1_nr8_residual.is_some();
-        if kernels.use_q8_split_nr8_dispatch {
-            eprintln!("[CUDA] LUMEN_CUDA_Q8_SPLIT_NR8=1: SPLIT dispatch uses dp4a-mmvq kernel (NR=8 + 4-thread mapping)");
-            if kernels.use_q8_split_4thread_dispatch {
-                eprintln!(
-                    "[CUDA] NR8 takes priority over 4thread (FULL is the structural superset)"
-                );
-            }
-        } else if use_q8_split_nr8 {
-            eprintln!("[CUDA] LUMEN_CUDA_Q8_SPLIT_NR8=1 set but prerequisites missing (need Q8_SPLIT=1 + kernel load OK); using existing split kernel");
-        }
-        // AoS NR=8 mmvq kernel selection.
-        // Operates on the AoS dispatch (`launch_matvec_preq8_1`); does NOT
-        // require Q8_SPLIT. Independent of `use_q8_split_nr8_dispatch`. Default OFF.
-        let use_q8_aos_nr8 = env_truthy("LUMEN_CUDA_Q8_AOS_NR8");
-        kernels.use_q8_aos_nr8_dispatch = use_q8_aos_nr8
-            && kernels.matvec_q8_aligned_nr8.is_some()
-            && kernels.matvec_q8_aligned_nr8_residual.is_some();
-        if kernels.use_q8_aos_nr8_dispatch {
-            eprintln!("[CUDA] LUMEN_CUDA_Q8_AOS_NR8=1: AoS dispatch uses dp4a-mmvq kernel (NR=8 + 4-thread mapping on 36-byte blocks)");
-        } else if use_q8_aos_nr8 {
-            eprintln!("[CUDA] LUMEN_CUDA_Q8_AOS_NR8=1 set but prerequisites missing (need matvec_q8_aligned_nr8 kernel load OK); using existing AoS kernel");
-        }
-        kernels.use_q8_tile_dispatch = use_q8_tile && kernels.matvec_q8_tile_q8_1.is_some();
-        kernels.use_q4_tile_dispatch = use_q4_tile && kernels.matvec_q4_tile_q8_1.is_some();
-        // P1-3 FA2 block-skip prefill kernel selection. Default OFF; the
-        // env var routes prefill attention dispatch through the new kernel.
-        let use_fa2_blockskip = env_truthy("LUMEN_CUDA_FA2_BLOCKSKIP");
-        kernels.use_fa2_blockskip_dispatch =
-            use_fa2_blockskip && kernels.flash_attention_fa2_causal.is_some();
-        if kernels.use_fa2_blockskip_dispatch {
-            eprintln!("[CUDA] LUMEN_CUDA_FA2_BLOCKSKIP=1: prefill attention dispatch uses FA2 mask block-skip kernel");
-        } else if use_fa2_blockskip {
-            eprintln!("[CUDA] LUMEN_CUDA_FA2_BLOCKSKIP=1 set but flash_attention_fa2_causal kernel unavailable; using existing wmma/br4 dispatch");
         }
 
         // pre-allocate MoE scratch when the model declares experts.
@@ -17648,9 +13243,6 @@ impl ComputeBackend for CudaBackend {
             layer_weights_cache: Vec::new(),
             logits_gpu,
             argmax_result: self.device.alloc_zeros::<u32>(1)?,
-            captured_graph: None,
-            graph_kernels,
-            graph_params,
             has_gdn_layers: false,
             has_qgate_layers: false,
             has_moe_layers: false,
@@ -17666,12 +13258,8 @@ impl ComputeBackend for CudaBackend {
             use_q8_scale_hw,
             use_q8_split,
             use_q4_split,
-            use_gdn_split,
             use_output_proj_split,
-            use_output_proj_f16_cache,
             output_proj_nr,
-            use_q8_tile,
-            use_q4_tile,
         });
 
         Ok(())
@@ -18550,27 +14138,6 @@ impl ComputeBackend for CudaBackend {
                         st.algo_cache.get(vocab_size, hidden_dim),
                     )?;
                 }
-            } else if let Some(ref proj_f16_cache) = st.globals.output_proj_q8_to_f16_cache {
-                // cuBLAS HGEMV-N=1 against pre-dequanted F16 cache.
-                // Mirrors the non-graph dispatch above. Same byte budget for
-                // the matvec (1.94 GB F16 vs 1.06 GB Q8) but cuBLAS GemmEx
-                // ships through the tensor-core path with persistent-CTA
-                // scheduling -- proven faster than custom dp4a kernels on
-                // this shape (cf. BF16 output_proj at 0.66-0.77× llama.cpp).
-                unsafe {
-                    launch_hgemv_f16(
-                        &self.device,
-                        &st.kernels,
-                        proj_f16_cache,
-                        &st.scratch.normed,
-                        &mut st.logits_gpu,
-                        &mut st.scratch.input_f16,
-                        vocab_size,
-                        hidden_dim,
-                        "output_proj_q8_to_f16",
-                        st.algo_cache.get(vocab_size, hidden_dim),
-                    )?;
-                }
             } else if let Some(ref proj_q8_split) = st.globals.output_proj_q8_split {
                 // OUTPUT_PROJ_SPLIT: prefer split layout for graph variant too.
                 // NR=32 grid for the dedicated output_proj kernel; NR=2 fallback.
@@ -18880,15 +14447,13 @@ impl ComputeBackend for CudaBackend {
     }
 
     fn reset_recurrent_state(&self) {
-        // Reset GPU KV caches, GDN recurrent state, and CUDA graph to prevent
+        // Reset GPU KV caches and GDN recurrent state to prevent
         // stale data from leaking across generate() calls.
         if let Ok(mut guard) = self.state.lock() {
             if let Some(ref mut st) = *guard {
                 for kv_cache in &mut st.kv_caches {
                     kv_cache.reset();
                 }
-                // Invalidate the captured CUDA graph (seq_len starts from 0 again).
-                st.captured_graph = None;
                 st.decode_token_count = 0;
 
                 // Reset GDN h_states and conv_states (zeroing GPU buffers).
@@ -19446,40 +15011,7 @@ impl ComputeBackend for CudaBackend {
                     )
                 };
                 unsafe {
-                    if !force_scalar_attn && st.kernels.use_fa2_blockskip_dispatch {
-                        let causal_max = (pos_start + batch) as u32;
-                        if causal_max >= super::decode::FA2_SPLITK_MIN_SEQ
-                            && st.kernels.flash_attention_fa2_splitk_partial.is_some()
-                            && st.kernels.flash_attention_fa2_splitk_reduce.is_some()
-                        {
-                            super::prefill::launch_flash_attention_fa2_splitk(
-                                &self.device,
-                                &st.kernels,
-                                &pf.q,
-                                kv_cache,
-                                &mut pf.attn_out,
-                                batch,
-                                num_heads,
-                                num_kv_heads,
-                                head_dim,
-                                pos_start,
-                                super::decode::FA2_SPLITK_SLICE,
-                            )?;
-                        } else {
-                            super::prefill::launch_flash_attention_fa2(
-                                &self.device,
-                                &st.kernels,
-                                &pf.q,
-                                kv_cache,
-                                &mut pf.attn_out,
-                                batch,
-                                num_heads,
-                                num_kv_heads,
-                                head_dim,
-                                pos_start,
-                            )?;
-                        }
-                    } else if !force_scalar_attn
+                    if !force_scalar_attn
                         && batch >= 16
                         && st.kernels.flash_attention_wmma.is_some()
                     {
@@ -19923,40 +15455,7 @@ impl ComputeBackend for CudaBackend {
             // 3. Scalar Br=4 fallback: 4 queries/block, warp-level parallelism.
             // Used when batch < 16 (not enough queries for a full WMMA tile).
             unsafe {
-                if st.kernels.use_fa2_blockskip_dispatch {
-                    let causal_max = (pos_start + batch) as u32;
-                    if causal_max >= super::decode::FA2_SPLITK_MIN_SEQ
-                        && st.kernels.flash_attention_fa2_splitk_partial.is_some()
-                        && st.kernels.flash_attention_fa2_splitk_reduce.is_some()
-                    {
-                        super::prefill::launch_flash_attention_fa2_splitk(
-                            &self.device,
-                            &st.kernels,
-                            &pf.q,
-                            kv_cache,
-                            &mut pf.attn_out,
-                            batch,
-                            num_heads,
-                            num_kv_heads,
-                            head_dim,
-                            pos_start,
-                            super::decode::FA2_SPLITK_SLICE,
-                        )?;
-                    } else {
-                        super::prefill::launch_flash_attention_fa2(
-                            &self.device,
-                            &st.kernels,
-                            &pf.q,
-                            kv_cache,
-                            &mut pf.attn_out,
-                            batch,
-                            num_heads,
-                            num_kv_heads,
-                            head_dim,
-                            pos_start,
-                        )?;
-                    }
-                } else if batch >= 16 && st.kernels.flash_attention_wmma.is_some() {
+                if batch >= 16 && st.kernels.flash_attention_wmma.is_some() {
                     // WMMA-PRECISION-FIX-RCA: honor LUMEN_CUDA_ATTN_PRECISE on
                     // this secondary prefill-attention dispatch as well, so the
                     // eventual default change is complete across both sites.
@@ -20301,21 +15800,19 @@ impl ComputeBackend for CudaBackend {
             }
             let gpu_weights = upload_layer_weights(&self.device, &layer_view, &hp_copy)?;
 
-            // Build the REPACKED aligned down-weight planes for the
-            // fast-down kernel. Gated by `LUMEN_CUDA_MOE_DOWN_FAST_BN128` (the
-            // planes cost ~738 MB/layer, so only allocate when the path is on).
-            // Runs AFTER upload so the GPU blob exists; reads the raw Q8_0 down
-            // blocks via the `moe_repack_down_q8_0` kernel into aligned d_q/d_s.
+            // Build the REPACKED aligned gate+up planes for the W10 wide-M
+            // gate+up path. Runs AFTER upload so the GPU blob exists; reads raw
+            // Q8_0 weights via the repack kernels into aligned planes. The down
+            // planes are allocated but not launched (W10 does not consume them).
             // Leaves the original blob byte-untouched.
             if super::moe::moe_repack_needed() && layer_idx < st.moe_meta_cache.len() {
                 if let Some(meta_ref) = st.moe_meta_cache[layer_idx].as_ref() {
                     let num_experts = meta_ref.expert_down_offs.len();
                     let hidden_dim = hp_copy.hidden_dim as usize;
                     let inter_dim = hp_copy.intermediate_dim as usize;
-                    let build_down = super::moe::moe_down_fast_bn128_enabled();
-                    // The wide-M gate+up path shares the IMMA gu_q/gu_s repacked planes.
-                    let build_gate_up = super::moe::moe_gate_up_imma_enabled()
-                        || super::moe::moe_gate_up_w10_enabled();
+                    // No fast-down path remains; only the W10 gate+up repack.
+                    let build_down = false;
+                    let build_gate_up = super::moe::moe_gate_up_w10_enabled();
                     let repack_fn = st.kernels.moe_repack_down_q8_0.as_ref();
                     let repack_gu_fn = st.kernels.moe_repack_gate_up_q8_0.as_ref();
                     let offs = st.moe_batched_offsets[layer_idx].as_ref();
@@ -20560,57 +16057,6 @@ impl ComputeBackend for CudaBackend {
             }
         }
 
-        // output_proj fast-path: F16 dequant cache.
-        //
-        // Pre-dequantize the Q8_0 output projection (~1 GB on Qwen3.5-9B Q8)
-        // to F16 (~1.94 GB) once at preload, then dispatch via the existing
-        // `launch_hgemv_f16_preconverted` path (cublasGemmEx with N=1). This
-        // mirrors the BF16 output_proj path (which already wins on the same
-        // 248320x4096 shape via `launch_hgemv_bf16` at 0.66-0.77× llama.cpp) while
-        // letting Q8-storage models use the same compute path at decode time.
-        //
-        // VRAM cost: replaces the 1 GB Q8 (or 1 GB Q8 SPLIT clone) with a
-        // 1.94 GB F16 cache. Net delta vs Q8Raw alone: +0.94 GB. Net delta
-        // vs Q8 SPLIT integration: +0.94 GB (the SPLIT clone is preserved as
-        // fallback; both coexist when env vars stack). A100-80GB has ~25-30 GB
-        // headroom after the SPLIT stack at this point, so the alloc should
-        // succeed cleanly on Qwen3.5-9B.
-        if st.use_output_proj_f16_cache {
-            if let (Some(ref dequant_fn), Some(ref proj_q8)) = (
-                Some(&st.kernels.dequant_q8_0_to_f16),
-                st.globals.output_proj_q8.as_ref(),
-            ) {
-                let vocab_size = hp_copy.vocab_size as usize;
-                let hidden = hp_copy.hidden_dim as usize;
-                let n_elem = vocab_size * hidden;
-                let mem_before = self.device.free_memory().unwrap_or(0);
-                match super::gpu_buffers::dequant_q8_to_f16_gpu(
-                    &self.device,
-                    dequant_fn,
-                    proj_q8,
-                    n_elem,
-                ) {
-                    Ok(f16_buf) => {
-                        let mem_after = self.device.free_memory().unwrap_or(0);
-                        st.globals.output_proj_q8_to_f16_cache = Some(f16_buf);
-                        eprintln!(
-                            "[CUDA] LUMEN_CUDA_OUTPUT_PROJ_F16_CACHE=1: output_proj dequanted to F16 ({vocab_size}x{hidden}, {:.2} GB consumed)",
-                            (mem_before.saturating_sub(mem_after) as f64) / 1.0e9
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[CUDA] LUMEN_CUDA_OUTPUT_PROJ_F16_CACHE=1 set but dequant alloc failed (falling back to Q8 split/aligned): {e}"
-                        );
-                    }
-                }
-            } else if st.use_output_proj_f16_cache {
-                eprintln!(
-                    "[CUDA] LUMEN_CUDA_OUTPUT_PROJ_F16_CACHE=1 set but output_proj is not Q8_0; ignoring"
-                );
-            }
-        }
-
         // Repack Q8_0 weights to 36-byte aligned blocks for dp4a int* loads.
         // Aligned weight repack: enabled for ALL models including GDN.
         // +16% decode from dp4a int* loads (proven C8-C11).
@@ -20712,79 +16158,6 @@ impl ComputeBackend for CudaBackend {
             }
         }
 
-        // split-layout integration: GDN Q4 weight split pass.
-        // Targets ssm_out / attn_gate / ssm_alpha / ssm_beta (the GDN-specific
-        // Q4Raw weights). Q8 variant intentionally NOT wired -- showed
-        // Q8 + GDN_SPLIT OOMs on A100-80GB due to physical VRAM exhaustion.
-        if st.use_gdn_split && has_gdn {
-            if let (Some(ref split_repack_fn), true) = (
-                st.kernels.repack_q4_raw_to_split.as_ref(),
-                st.kernels.matvec_q4_split_q8_1.is_some(),
-            ) {
-                let mem_before_gdn_split = self.device.free_memory().unwrap_or(0);
-                let (n_layers_split, total_jobs) = unsafe {
-                    repack_all_layers_gdn_q4_clone_to_split(
-                        &self.device,
-                        split_repack_fn,
-                        &mut cache,
-                        &hp_copy,
-                    )
-                };
-                let mem_after_gdn_split = self.device.free_memory().unwrap_or(0);
-                let consumed_gb =
-                    (mem_before_gdn_split.saturating_sub(mem_after_gdn_split) as f64) / 1.0e9;
-                eprintln!(
-                    "[CUDA] LUMEN_CUDA_GDN_SPLIT=1: cloned GDN Q4 split siblings on \
-                     {n_layers_split} layers, {total_jobs} jobs attempted, \
-                     {consumed_gb:.2} GB consumed"
-                );
-            } else {
-                eprintln!(
-                    "[CUDA] LUMEN_CUDA_GDN_SPLIT=1 set but Q4 split kernels unavailable; \
-                     GDN weights will use existing Q4Raw path"
-                );
-            }
-        } else if st.use_gdn_split && !has_gdn {
-            eprintln!("[CUDA] LUMEN_CUDA_GDN_SPLIT=1 set but model has no GDN layers; ignored");
-        }
-
-        // tile-layout integration: Q8 tile-grouped clone pass.
-        // Runs AFTER the SPLIT pass so SPLIT siblings are populated first
-        // (tile wins when both are set; SPLIT is still consumed by other
-        // code paths). Uses the same Q8Raw source as SPLIT -- tile clone
-        // does NOT mutate the source. Skipped silently when the env var is
-        // unset OR the tile kernels failed to compile.
-        if st.use_q8_tile {
-            if let (Some(ref tile_repack_fn), true) = (
-                st.kernels.repack_q8_raw_to_tile.as_ref(),
-                st.kernels.matvec_q8_tile_q8_1.is_some(),
-            ) {
-                let mem_before_q8_tile = self.device.free_memory().unwrap_or(0);
-                let (n_layers_tile, oom_layer, oom_count, total_jobs) = unsafe {
-                    repack_all_layers_q8_clone_to_tile(
-                        &self.device,
-                        tile_repack_fn,
-                        &mut cache,
-                        &hp_copy,
-                    )
-                };
-                let mem_after_q8_tile = self.device.free_memory().unwrap_or(0);
-                let consumed_gb =
-                    (mem_before_q8_tile.saturating_sub(mem_after_q8_tile) as f64) / 1.0e9;
-                eprintln!(
-                    "[CUDA] LUMEN_CUDA_Q8_TILE=1: cloned Q8 tile siblings on \
-                     {n_layers_tile} layers, {total_jobs} jobs attempted, \
-                     {oom_count} OOMs (first at layer {:?}), {consumed_gb:.2} GB consumed",
-                    oom_layer,
-                );
-            } else if st.use_q8_tile {
-                eprintln!(
-                    "[CUDA] LUMEN_CUDA_Q8_TILE=1 set but tile kernels unavailable; \
-                     decode will use SPLIT / Q8Aligned / Q8Raw base path"
-                );
-            }
-        }
-
         // Repack Q4_0 weights to 20-byte aligned blocks for dp4a int* nibble loads.
         // aligned repack runs ALONGSIDE Q4 split clones so the
         // fused-swiglu-down path (line 2390) -- which requires Q4Aligned and is
@@ -20832,42 +16205,6 @@ impl ComputeBackend for CudaBackend {
             }
         }
 
-        // tile-layout integration: Q4 tile-grouped clone pass.
-        // Runs AFTER the Q4 SPLIT + GDN_SPLIT + Q4 aligned passes (same
-        // Q4Raw source is consumed by all four; tile clone does NOT mutate
-        // the source). Skipped when the env var is unset or kernels are
-        // unavailable.
-        if st.use_q4_tile {
-            if let (Some(ref tile_repack_fn), true) = (
-                st.kernels.repack_q4_raw_to_tile.as_ref(),
-                st.kernels.matvec_q4_tile_q8_1.is_some(),
-            ) {
-                let mem_before_q4_tile = self.device.free_memory().unwrap_or(0);
-                let (n_layers_tile, oom_layer, oom_count, total_jobs) = unsafe {
-                    repack_all_layers_q4_clone_to_tile(
-                        &self.device,
-                        tile_repack_fn,
-                        &mut cache,
-                        &hp_copy,
-                    )
-                };
-                let mem_after_q4_tile = self.device.free_memory().unwrap_or(0);
-                let consumed_gb =
-                    (mem_before_q4_tile.saturating_sub(mem_after_q4_tile) as f64) / 1.0e9;
-                eprintln!(
-                    "[CUDA] LUMEN_CUDA_Q4_TILE=1: cloned Q4 tile siblings on \
-                     {n_layers_tile} layers, {total_jobs} jobs attempted, \
-                     {oom_count} OOMs (first at layer {:?}), {consumed_gb:.2} GB consumed",
-                    oom_layer,
-                );
-            } else if st.use_q4_tile {
-                eprintln!(
-                    "[CUDA] LUMEN_CUDA_Q4_TILE=1 set but tile kernels unavailable; \
-                     decode will use SPLIT / Q4Aligned / Q4Raw base path"
-                );
-            }
-        }
-
         // Allocate Q+gate fusion scratch buffers if any layer has attn_q_norm.
         let has_qgate = cache.iter().any(|lw| lw.attn_q_norm.is_some());
         if has_qgate {
@@ -20880,48 +16217,12 @@ impl ComputeBackend for CudaBackend {
             );
         }
 
-        // GDN layers are now graph-capturable
-        // when the device-resident conv_position infrastructure is wired up.
-        // The `can_use_graph` gate above checks all required preconditions
-        // (graph megakernel compiled, conv_positions_gpu allocated, two-launch
-        // env not set) and gracefully falls back to the eager path otherwise.
         st.has_gdn_layers = has_gdn;
         st.has_qgate_layers = has_qgate;
-        // detect MoE layers from `moe_meta_cache`. Populated by
-        // `preload_weights` immediately before this site (line ~14705). The
-        // `can_use_graph` gate enables MoE-aware graph capture only when
-        // `LUMEN_CUDA_MOE_DECODE_GRAPH=1` is set, byte-identical at default.
+        // Detect MoE layers from `moe_meta_cache` (populated earlier in
+        // preload_weights).
         let has_moe = st.moe_meta_cache.iter().any(|m| m.is_some());
         st.has_moe_layers = has_moe;
-        if has_gdn {
-            // default ON.
-            let lc_active = match std::env::var("LUMEN_CUDA_GDN_REGISTER_RESIDENT")
-                .ok()
-                .as_deref()
-            {
-                Some(v) => matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"),
-                None => crate::runtime_defaults::gdn_register_resident_default(),
-            };
-            // C3: opt-in env gate with model-aware
-            // default. When `LUMEN_CUDA_DECODE_GRAPH=1` OR the model is BF16
-            // dense (default-ON per `runtime_defaults::decode_graph_default`),
-            // graph capture is re-enabled under 4thread provided the
-            // `gdn_phase123_register_resident_graph` kernel is compiled.
-            let decode_graph_opt_in = cuda_decode_graph_enabled();
-            let graph_kernel_ok = st.kernels.gdn_decode_megakernel_graph.is_some();
-            let lc_graph_kernel_ok = st.kernels.gdn_phase123_register_resident_graph.is_some();
-            if lc_active && !decode_graph_opt_in {
-                eprintln!("[CUDA] GDN layers detected -- CUDA graph capture disabled (dp4a-mmvq env set; set LUMEN_CUDA_DECODE_GRAPH=1 to enable graph path)");
-            } else if lc_active && decode_graph_opt_in && lc_graph_kernel_ok {
-                eprintln!("[CUDA] GDN layers detected -- CUDA graph capture enabled (dp4a-mmvq; gdn_phase123_register_resident_graph)");
-            } else if lc_active && decode_graph_opt_in && !lc_graph_kernel_ok {
-                eprintln!("[CUDA] GDN layers detected -- CUDA graph capture disabled (LUMEN_CUDA_DECODE_GRAPH=1 but gdn_phase123_register_resident_graph PTX compile failed)");
-            } else if !graph_kernel_ok {
-                eprintln!("[CUDA] GDN layers detected -- CUDA graph capture disabled (gdn_decode_megakernel_graph PTX compile failed)");
-            } else {
-                eprintln!("[CUDA] GDN layers detected -- CUDA graph capture enabled (device-resident conv_position;)");
-            }
-        }
 
         st.layer_weights_cache = cache;
 
@@ -21110,7 +16411,6 @@ impl ComputeBackend for CudaBackend {
     ) -> Result<Logits, RuntimeError> {
         let hp = self.hp()?;
         let num_layers = hp.num_layers as usize;
-        let max_seq_len = hp.max_seq_len as usize;
         let seq_pos = kv.seq_len();
 
         let mut state_guard = self.state.lock().unwrap();
@@ -21125,639 +16425,10 @@ impl ComputeBackend for CudaBackend {
             ));
         }
 
-        // --- CUDA Graph Decode Path ---
-        //
-        // Three modes based on decode_token_count:
-        // 0 (first token): Run normal path (non-graph). This token establishes
-        // the first KV entry. We don't capture here because the attention
-        // shared memory must accommodate seq_len=1+ which is always true.
-        // 1 (second token): Run the graph pipeline while capturing into a CUDA
-        // graph. All subsequent tokens replay the captured graph.
-        // 2+ (subsequent tokens): Update graph params (token_id, pos, seq_len)
-        // via 3 small htod memcpys, then replay the captured graph.
-        //
-        // Graph capture is disabled for:
-        // - Models with GDN layers (host-side conv state management)
-        // - When graph kernels failed to compile
-        // - When graph params failed to allocate
-
-        // CUDA graph capture: disabled by default, enabled only in diagnostic mode.
-        //
-        // Graph capture has crashed on A100 in 3 attempts (C26, C30, C32).
-        // Set LUMEN_GRAPH_DIAGNOSTIC=1 to enable with comprehensive error logging.
-        // This diagnostic mode prints every CUDA API return code to stderr so the
-        // exact failure point can be identified from Modal logs.
-        let graph_diagnostic = std::env::var("LUMEN_GRAPH_DIAGNOSTIC")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-
-        // CUDA graph capture: enabled when all prerequisites are met.
-        //
-        // Root cause of previous STREAM_CAPTURE_ISOLATION failures was cudarc's
-        // event tracking: every CudaSlice carried read/write CudaEvent objects,
-        // and PushKernelArg inserted cuStreamWaitEvent calls during kernel
-        // launch. During graph capture, these cross-stream event waits violated
-        // capture isolation. The fix: disable event tracking in CudaDevice::new()
-        // (ffi.rs) before ANY allocations, so all CudaSlice objects have
-        // read=None/write=None. cudarc 0.19.3 already uses cuMemAllocAsync on
-        // A100 (has_async_alloc=true), so allocations are stream-ordered on our
-        // capture stream -- no legacy-stream associations.
-        //
-        // Prerequisites: graph kernels compiled, parameter buffers allocated,
-        // cuBLAS workspace set, and no GDN layers (GDN conv1d uses a host-side
-        // conv_position scalar that gets baked during graph capture -- not yet
-        // graph-compatible until advance_conv_position dispatch is wired up).
-        // Tiled-attention eager-fallback gate:
-        // When the decode-attention gate would select the tiled streaming-
-        // softmax kernel (seq_len > LUMEN_CUDA_DECODE_TILED_THRESHOLD,
-        // default 0 = "tiled-always", OR force=true), the CUDA graph
-        // fast path is BYPASSED for that token. The graph-captured
-        // `attention_decode_graph` kernel in
-        // `graph_kernels.cu` uses the single-block layout and cannot serve
-        // seq_len past the shmem ceiling; rather than build a
-        // `attention_decode_tiled_graph` variant in this revision, the design
-        // chose eager-fallback to keep the scope bounded.
-        //
-        // The graph fast path remains BYTE-IDENTICAL for short decode
-        // (seq_len <= threshold), which is the common case. Long-context
-        // decode at seq_len > threshold pays a small per-token overhead for
-        // the eager path (no graph replay) in exchange for opening the
-        // structural ceiling.
-        let attn_seq_len_pre = (seq_pos + 1) as u32; // seq_len AFTER KV write
-        let decode_variant = super::decode::attention_decode_variant(
-            attn_seq_len_pre,
-            super::decode::decode_tiled_force_enabled(),
-            super::decode::decode_tiled_threshold(),
-        );
-        let graph_eager_fallback_for_tiled =
-            matches!(decode_variant, super::decode::AttentionDecodeVariant::Tiled);
-
-        // GDN layers are now graph-capturable
-        // when the device-resident conv_position infrastructure is wired up:
-        //   - `gdn_decode_megakernel_graph` kernel compiled (reads state_pos
-        //     from a device pointer instead of a host-scalar arg)
-        //   - `conv_positions_gpu: Some(Vec<CudaSlice<u32>>)` allocated in
-        //     `ensure_gdn_scratch`
-        //   - `advance_conv_position` kernel in `graph_kernels.cu` (always
-        //     compiled when graph_kernels.is_some())
-        //   - `LUMEN_CUDA_GDN_REGISTER_RESIDENT` NOT set (dp4a-mmvq path is non-graph
-        //     in this revision; falls back to host-scalar dispatch)
-        // When all four conditions hold, the GDN inner loop is fully
-        // capturable; otherwise we keep `!st.has_gdn_layers` to disable.
-        //
-        // Pre-check: `ensure_gdn_scratch` allocates `conv_positions_gpu` only
-        // when GDN layers exist. We cannot call ensure_gdn_scratch here
-        // because it requires &mut st but `can_use_graph` is evaluated as
-        // an expression. Instead we check `gdn_scratch_gpu.is_some()` AND
-        // the conv_positions_gpu within. The graph path's
-        // `run_graph_pipeline` calls ensure_gdn_scratch itself.
-        // default ON (matches init-site resolver).
-        let register_resident_active = match std::env::var("LUMEN_CUDA_GDN_REGISTER_RESIDENT")
-            .ok()
-            .as_deref()
-        {
-            Some(v) => matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"),
-            None => crate::runtime_defaults::gdn_register_resident_default(),
-        };
-        // C3: when `LUMEN_CUDA_DECODE_GRAPH=1` (or
-        // BF16 dense default-ON) AND two-launch is active AND the two-launch
-        // graph variant is compiled, route through the graph path. The
-        // graph variant (`gdn_phase123_register_resident_graph`) reads `state_pos`
-        // from a device pointer, paired with the existing
-        // `advance_conv_position` kernel, so the full two-launch GDN inner
-        // loop becomes graph-capturable while preserving byte-identical
-        // math vs the eager two-launch host-scalar kernel.
-        let decode_graph_opt_in = cuda_decode_graph_enabled();
-        let conv_positions_gpu_ready = st
-            .gdn_scratch_gpu
-            .as_ref()
-            .map(|g| g.conv_positions_gpu.is_some())
-            .unwrap_or(false);
-        let lc_graph_ready = register_resident_active
-            && decode_graph_opt_in
-            && st.kernels.gdn_phase123_register_resident_graph.is_some()
-            && conv_positions_gpu_ready;
-        let megakernel_graph_ready = !register_resident_active
-            && st.kernels.gdn_decode_megakernel_graph.is_some()
-            && conv_positions_gpu_ready;
-        let gdn_graph_ready = megakernel_graph_ready || lc_graph_ready;
-
-        // `LUMEN_CUDA_DECODE_GRAPH_QGATE=1` makes the gate accept layers with
-        // per-head q_norm/k_norm. Earlier this path was a correctness-broken
-        // diagnostic (compute_layer_gpu_graph dispatched QKV into q_dim, not
-        // q_dim*2, then ran RoPE on un-deinterleaved Q). This block now ports
-        // the full qgate fusion dispatch into the graph variant
-        // (deinterleave_qgate, per-head RMSNorm Q+K, post-attention sigmoid_mul),
-        // so this gate now produces bit-correct output on Qwen3.5 dense paths.
-        // The env is kept as the activation switch (default OFF, byte-identical
-        // to the previous default when unset).
-        // env-or-BF16-default helper. BF16 dense models pull
-        // the qgate graph path on by default; Q8/Q4 keep the legacy OFF.
-        let allow_qgate_graph = cuda_decode_graph_qgate_enabled();
-        // `LUMEN_CUDA_DECODE_GRAPH_TILED=1` flips the eager-fallback
-        // gate when the tiled-graph kernel is compiled. The graph variant
-        // (`attention_decode_tiled_graph`) reads seq_len from a device pointer
-        // so the capture is structurally identical across decode tokens. Shmem
-        // footprint is constant in seq_len (8 + head_dim + T_C = ~1.6 KB at
-        // head_dim=256, T_C=128), no extended-shmem opt-in needed. Default OFF
-        // (bit-exact when disabled, i.e. when the env var is unset).
-        // env-or-BF16-default helper. Tiled-graph kernel
-        // ships with BF16 dense path default-ON; Q8/Q4 keep
-        // the legacy OFF.
-        let allow_tiled_graph = cuda_decode_graph_tiled_enabled();
-        let tiled_graph_ready = allow_tiled_graph
-            && st
-                .graph_kernels
-                .as_ref()
-                .map(|gk| gk.attention_decode_tiled.is_some())
-                .unwrap_or(false);
-        // MoE decode graph gate. When the model has MoE layers AND
-        // `LUMEN_CUDA_MOE_DECODE_GRAPH=1` is set, route MoE FFN dispatch through
-        // `compute_layer_gpu_graph`'s new MoE branch (Strategy C: full MoE FFN
-        // capture using existing graph-safe `encode_moe_ffn_decode_*` family).
-        // The MoE dispatch is naturally graph-compatible because all per-token
-        // decisions (expert_ids, expert_weights) live entirely on the GPU —
-        // CPU passes only fixed dims as kernel args. Default OFF (byte-identical
-        // to the previous default when unset).
-        // default ON (confirmed
-        // byte-identical at the routed-MoE path; no-op for non-MoE models).
-        let allow_moe_graph = match std::env::var("LUMEN_CUDA_MOE_DECODE_GRAPH").ok().as_deref() {
-            Some(v) => matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"),
-            None => crate::runtime_defaults::moe_decode_graph_default(),
-        };
-        let can_use_graph = st.graph_kernels.is_some()
-            && st.graph_params.is_some()
-            && st.cublas_workspace.is_some()
-            && st.precomputed_ptrs.is_some()
-            && (!st.has_gdn_layers || gdn_graph_ready)
-            && (!st.has_qgate_layers || allow_qgate_graph)
-            && (!st.has_moe_layers || allow_moe_graph)
-            && (!graph_eager_fallback_for_tiled || tiled_graph_ready);
-
-        if graph_diagnostic && st.decode_token_count == 0 {
-            eprintln!("[GRAPH-DIAG] === CUDA Graph Diagnostic Mode Enabled ===");
-            eprintln!("[GRAPH-DIAG] Prerequisites:");
-            eprintln!(
-                "[GRAPH-DIAG]   graph_kernels:    {}",
-                st.graph_kernels.is_some()
-            );
-            eprintln!(
-                "[GRAPH-DIAG]   graph_params:     {}",
-                st.graph_params.is_some()
-            );
-            eprintln!(
-                "[GRAPH-DIAG]   cublas_workspace: {}",
-                st.cublas_workspace.is_some()
-            );
-            eprintln!(
-                "[GRAPH-DIAG]   precomputed_ptrs: {}",
-                st.precomputed_ptrs.is_some()
-            );
-            eprintln!("[GRAPH-DIAG]   has_gdn_layers:   {}", st.has_gdn_layers);
-            eprintln!(
-                "[GRAPH-DIAG]   has_qgate_layers: {}  (was blocker; ports qgate fusion into graph)",
-                st.has_qgate_layers
-            );
-            eprintln!(
-                "[GRAPH-DIAG]   has_moe_layers:   {}  (MoE-aware graph dispatch)",
-                st.has_moe_layers
-            );
-            eprintln!(
-                "[GRAPH-DIAG]   allow_moe_graph:  {allow_moe_graph}  (LUMEN_CUDA_MOE_DECODE_GRAPH)"
-            );
-            eprintln!("[GRAPH-DIAG]   allow_qgate_graph: {allow_qgate_graph}  (LUMEN_CUDA_DECODE_GRAPH_QGATE)");
-            eprintln!("[GRAPH-DIAG]   allow_tiled_graph: {allow_tiled_graph}  (LUMEN_CUDA_DECODE_GRAPH_TILED)");
-            eprintln!("[GRAPH-DIAG]   tiled_graph_ready: {tiled_graph_ready}  (attention_decode_tiled_graph)");
-            eprintln!("[GRAPH-DIAG]   register_resident_active:  {register_resident_active}");
-            eprintln!("[GRAPH-DIAG]   decode_graph_opt_in: {decode_graph_opt_in}");
-            eprintln!("[GRAPH-DIAG]   conv_positions_gpu_ready: {conv_positions_gpu_ready}");
-            eprintln!("[GRAPH-DIAG]   lc_graph_ready:   {lc_graph_ready}  (gdn_phase123_register_resident_graph)");
-            eprintln!("[GRAPH-DIAG]   megakernel_graph_ready: {megakernel_graph_ready}");
-            eprintln!("[GRAPH-DIAG]   gdn_graph_ready:  {gdn_graph_ready}");
-            eprintln!("[GRAPH-DIAG]   graph_eager_fallback_for_tiled: {graph_eager_fallback_for_tiled}  (set LUMEN_CUDA_DECODE_GRAPH_TILED=1 for graph path)");
-            eprintln!("[GRAPH-DIAG]   can_use_graph:    {can_use_graph}");
-            eprintln!("[GRAPH-DIAG]   num_layers:       {num_layers}");
-            eprintln!("[GRAPH-DIAG]   max_seq_len:      {max_seq_len}");
-            eprintln!("[GRAPH-DIAG]   token_id:         {token_id}");
-            eprintln!("[GRAPH-DIAG]   seq_pos:          {seq_pos}");
-            // Check CUDA_LAUNCH_BLOCKING
-            let clb = std::env::var("CUDA_LAUNCH_BLOCKING").unwrap_or_else(|_| "unset".into());
-            eprintln!("[GRAPH-DIAG]   CUDA_LAUNCH_BLOCKING: {clb}");
-
-            // Query stream capture status before anything
-            let capture_status = super::graph::query_capture_status(&self.device.stream);
-            eprintln!("[GRAPH-DIAG]   stream capture status (pre-capture): {capture_status}");
-
-            // Synchronize and check for pre-existing errors
-            match self.device.synchronize() {
-                Ok(()) => eprintln!("[GRAPH-DIAG]   pre-capture sync: OK"),
-                Err(e) => eprintln!("[GRAPH-DIAG]   pre-capture sync: FAILED: {e}"),
-            }
-        }
-
-        // Alias the pre-computed value ( used it for the eager-fallback
-        // gate check above; the existing downstream code expects the name
-        // `attn_seq_len`).
-        let attn_seq_len = attn_seq_len_pre; // seq_len AFTER KV write
-
-        if can_use_graph && st.decode_token_count >= 1 {
-            let diag = graph_diagnostic;
-
-            // Check if we have a valid captured graph.
-            let have_valid_graph = st
-                .captured_graph
-                .as_ref()
-                .map(|g| g.is_valid_for(num_layers, max_seq_len))
-                .unwrap_or(false);
-
-            if have_valid_graph {
-                // --- GRAPH REPLAY PATH ---
-                if diag {
-                    eprintln!(
-                        "[GRAPH-DIAG] === Graph REPLAY (token #{}, seq_pos={seq_pos}) ===",
-                        st.decode_token_count
-                    );
-                }
-
-                // Update per-token scalars in device memory (3 x 4-byte htod).
-                match st.graph_params.as_mut().unwrap().update(
-                    &self.device,
-                    token_id,
-                    seq_pos as u32,
-                    attn_seq_len,
-                ) {
-                    Ok(()) => {
-                        if diag {
-                            eprintln!("[GRAPH-DIAG]   params update: OK");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[GRAPH-DIAG]   params update: FAILED: {e}");
-                        return Err(e);
-                    }
-                }
-
-                // sync host conv_positions
-                // to GPU BEFORE every replay. This guards against drift
-                // introduced by prior eager-fallback tokens (e.g. tiled-decode
-                // crossover) which advance only the host counter without
-                // touching conv_positions_gpu. Cost: ~24 GDN layers × 4 bytes
-                // htod_copy = <5 µs/token (well below the +1 ms win target).
-                // The memcpy is OUTSIDE the captured graph (graph is already
-                // instantiated; this dispatch goes to the stream which is
-                // not in capture mode here).
-                if st.has_gdn_layers {
-                    if let Some(ref mut gdn) = st.gdn_scratch_gpu {
-                        if let Some(ref mut gpu_pos) = gdn.conv_positions_gpu {
-                            for (i, pos) in gdn.conv_positions.iter().enumerate() {
-                                self.device.htod_copy_into(&[*pos], &mut gpu_pos[i])?;
-                            }
-                        }
-                    }
-                }
-
-                // Replay the captured graph (single API call, all kernels execute).
-                match st.captured_graph.as_ref().unwrap().launch() {
-                    Ok(()) => {
-                        if diag {
-                            eprintln!("[GRAPH-DIAG]   graph launch: OK");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[GRAPH-DIAG]   graph launch: FAILED: {e}");
-                        eprintln!("[CUDA] Graph replay failed: {e} -- disabling graph capture for this session");
-                        st.captured_graph = None;
-                        st.decode_token_count = 0;
-                        return self.decode_token_normal(token_id, seq_pos, num_layers, hp, st, kv);
-                    }
-                }
-
-                if diag {
-                    // Synchronize to surface any async errors from the graph replay.
-                    match self.device.synchronize() {
-                        Ok(()) => eprintln!("[GRAPH-DIAG]   post-replay sync: OK"),
-                        Err(e) => {
-                            eprintln!("[GRAPH-DIAG]   post-replay sync: FAILED: {e}");
-                            eprintln!("[GRAPH-DIAG]   This is the actual error -- graph kernels ran but produced an async fault.");
-                            st.captured_graph = None;
-                            st.decode_token_count = 0;
-                            return self
-                                .decode_token_normal(token_id, seq_pos, num_layers, hp, st, kv);
-                        }
-                    }
-                }
-
-                // Advance GPU-side KV cache seq_len for all layers (host bookkeeping).
-                for kv_cache in &mut st.kv_caches {
-                    kv_cache.advance_seq_len_by(1);
-                }
-
-                // mirror the GPU-side
-                // advance_conv_position kernel by advancing the host counter.
-                // The GPU kernel ran inside the captured graph and updated
-                // conv_positions_gpu[i]; we mirror that here so any
-                // subsequent eager-fallback dispatch (e.g. tiled-decode
-                // threshold crossover) reads a consistent host counter.
-                // Also keeps disk-KV session checkpoint accurate.
-                if let Some(ref mut gdn) = st.gdn_scratch_gpu {
-                    let buf_slots = (gdn.params.conv_kernel_size - 1) as u32;
-                    if buf_slots > 0 {
-                        for pos in gdn.conv_positions.iter_mut() {
-                            *pos = (*pos + 1) % buf_slots;
-                        }
-                    }
-                }
-            } else {
-                // --- GRAPH CAPTURE PATH ---
-                if diag {
-                    eprintln!(
-                        "[GRAPH-DIAG] === Graph CAPTURE (token #{}, seq_pos={seq_pos}) ===",
-                        st.decode_token_count
-                    );
-                }
-
-                // Update per-token scalars before capture (the graph will read
-                // from these fixed device pointers).
-                match st.graph_params.as_mut().unwrap().update(
-                    &self.device,
-                    token_id,
-                    seq_pos as u32,
-                    attn_seq_len,
-                ) {
-                    Ok(()) => {
-                        if diag {
-                            eprintln!("[GRAPH-DIAG]   params update: OK (token_id={token_id}, pos={seq_pos}, attn_seq_len={attn_seq_len})");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[GRAPH-DIAG]   params update: FAILED: {e}");
-                        return Err(e);
-                    }
-                }
-
-                // Device-level sync before capture to ensure all prior GPU work
-                // (weight uploads, scratch init, cuBLAS workspace setup) is
-                // complete. With event tracking disabled and stream-ordered
-                // allocation, our single stream is self-consistent, but a device
-                // sync provides a clean capture boundary.
-                match cudarc::driver::result::ctx::synchronize() {
-                    Ok(()) => {
-                        if diag {
-                            eprintln!("[GRAPH-DIAG]   pre-capture device sync: OK");
-                        }
-                    }
-                    Err(e) => {
-                        let err = RuntimeError::Compute(format!("device sync failed: {e:?}"));
-                        eprintln!("[GRAPH-DIAG]   pre-capture device sync: FAILED: {err}");
-                        return Err(err);
-                    }
-                }
-
-                // sync host conv_positions
-                // to GPU BEFORE begin_capture(). This memcpy is NOT recorded
-                // into the captured graph, so it can run once before each
-                // capture-token to establish the initial state. From there,
-                // the captured `advance_conv_position` kernel advances the
-                // GPU counter on every replay.
-                if st.has_gdn_layers {
-                    self.ensure_gdn_scratch(st)?;
-                    if let Some(ref mut gdn) = st.gdn_scratch_gpu {
-                        if let Some(ref mut gpu_pos) = gdn.conv_positions_gpu {
-                            for (i, pos) in gdn.conv_positions.iter().enumerate() {
-                                self.device.htod_copy_into(&[*pos], &mut gpu_pos[i])?;
-                            }
-                        }
-                    }
-                }
-
-                // Check stream capture status before begin_capture
-                if diag {
-                    let status = super::graph::query_capture_status(&self.device.stream);
-                    eprintln!("[GRAPH-DIAG]   stream status before begin_capture: {status}");
-                }
-
-                // Begin stream capture -- all subsequent kernel launches on this
-                // stream are recorded (not executed) into the graph.
-                match super::graph::begin_capture(&self.device.stream) {
-                    Ok(()) => {
-                        if diag {
-                            eprintln!("[GRAPH-DIAG]   begin_capture: OK");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[GRAPH-DIAG]   begin_capture: FAILED: {e}");
-                        st.decode_token_count = 0;
-                        return self.decode_token_normal(token_id, seq_pos, num_layers, hp, st, kv);
-                    }
-                }
-
-                // Check stream capture status after begin_capture
-                if diag {
-                    let status = super::graph::query_capture_status(&self.device.stream);
-                    eprintln!("[GRAPH-DIAG]   stream status after begin_capture: {status}");
-                }
-
-                // Run the full decode pipeline using graph-compatible kernels.
-                if diag {
-                    eprintln!("[GRAPH-DIAG]   running graph pipeline ({num_layers} layers)...");
-                }
-                match self.run_graph_pipeline(st) {
-                    Ok(()) => {
-                        if diag {
-                            eprintln!("[GRAPH-DIAG]   graph pipeline: OK");
-                        }
-                    }
-                    Err(e) => {
-                        // Capture failed -- end capture to restore the stream
-                        // to non-capturing state, then fall through to normal path.
-                        eprintln!("[GRAPH-DIAG]   graph pipeline: FAILED: {e}");
-
-                        // Check stream capture status after failure
-                        if diag {
-                            let status = super::graph::query_capture_status(&self.device.stream);
-                            eprintln!(
-                                "[GRAPH-DIAG]   stream status after pipeline failure: {status}"
-                            );
-                        }
-
-                        // Try to end capture to clean up.
-                        match super::graph::end_capture(
-                            &self.device.stream,
-                            num_layers,
-                            max_seq_len,
-                        ) {
-                            Ok(_) => {
-                                if diag {
-                                    eprintln!("[GRAPH-DIAG]   cleanup end_capture: OK");
-                                }
-                            }
-                            Err(e2) => {
-                                eprintln!("[GRAPH-DIAG]   cleanup end_capture: FAILED: {e2}");
-                            }
-                        }
-
-                        st.decode_token_count = 0;
-                        return self.decode_token_normal(token_id, seq_pos, num_layers, hp, st, kv);
-                    }
-                }
-
-                // Check stream capture status before end_capture
-                if diag {
-                    let status = super::graph::query_capture_status(&self.device.stream);
-                    eprintln!("[GRAPH-DIAG]   stream status before end_capture: {status}");
-                }
-
-                // End capture -- instantiate the graph for future replay.
-                match super::graph::end_capture(&self.device.stream, num_layers, max_seq_len) {
-                    Ok(Some(graph)) => {
-                        if diag {
-                            eprintln!("[GRAPH-DIAG]   end_capture: OK (graph instantiated, {num_layers} layers)");
-                        }
-                        eprintln!("[CUDA] Graph capture successful ({num_layers} layers)");
-                        st.captured_graph = Some(graph);
-
-                        // Replay the freshly captured graph.
-                        if diag {
-                            eprintln!("[GRAPH-DIAG]   launching freshly captured graph...");
-                        }
-                        match st.captured_graph.as_ref().unwrap().launch() {
-                            Ok(()) => {
-                                if diag {
-                                    eprintln!("[GRAPH-DIAG]   first graph launch: OK");
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("[GRAPH-DIAG]   first graph launch: FAILED: {e}");
-                                st.captured_graph = None;
-                                st.decode_token_count = 0;
-                                return self.decode_token_normal(
-                                    token_id, seq_pos, num_layers, hp, st, kv,
-                                );
-                            }
-                        }
-
-                        // Synchronize to catch async errors from graph execution.
-                        if diag {
-                            match self.device.synchronize() {
-                                Ok(()) => eprintln!("[GRAPH-DIAG]   post-launch sync: OK"),
-                                Err(e) => {
-                                    eprintln!("[GRAPH-DIAG]   post-launch sync: FAILED: {e}");
-                                    eprintln!("[GRAPH-DIAG]   ASYNC ERROR: Graph launched OK but kernels faulted during execution.");
-                                    st.captured_graph = None;
-                                    st.decode_token_count = 0;
-                                    return self.decode_token_normal(
-                                        token_id, seq_pos, num_layers, hp, st, kv,
-                                    );
-                                }
-                            }
-                        }
-
-                        // Advance GPU-side KV cache seq_len for all layers.
-                        for kv_cache in &mut st.kv_caches {
-                            kv_cache.advance_seq_len_by(1);
-                        }
-                        // no additional
-                        // host conv_positions advance here. During the capture
-                        // pass, `compute_gdn_attention_gpu_impl(graph_mode=true)`
-                        // already advanced `gdn.conv_positions` once (the host
-                        // code ran once during capture). On this first launch
-                        // after end_capture, the GPU advance_conv_position
-                        // kernel runs once, incrementing conv_positions_gpu[i]
-                        // to match. Both counters are at (pre-token + 1). Good.
-                        // For subsequent pure-replay tokens, the replay branch
-                        // (above) mirrors the GPU advance to the host counter.
-                    }
-                    Ok(None) => {
-                        eprintln!("[GRAPH-DIAG]   end_capture: OK but graph is EMPTY (no kernels captured)");
-                        eprintln!("[CUDA] Graph capture produced empty graph -- falling back to normal path");
-                        st.decode_token_count = 0;
-                        return self.decode_token_normal(token_id, seq_pos, num_layers, hp, st, kv);
-                    }
-                    Err(e) => {
-                        eprintln!("[GRAPH-DIAG]   end_capture: FAILED: {e}");
-                        eprintln!("[CUDA] Graph capture end_capture failed: {e} -- falling back to normal path");
-                        st.decode_token_count = 0;
-                        return self.decode_token_normal(token_id, seq_pos, num_layers, hp, st, kv);
-                    }
-                }
-            }
-        } else {
-            // --- NORMAL (NON-GRAPH) PATH ---
-            // Used for:
-            // - First decode token (decode_token_count == 0)
-            // - Models with GDN layers
-            // - When graph infrastructure is unavailable
-
-            self.embed_token_gpu(token_id, st)?;
-
-            for layer in 0..num_layers {
-                self.compute_layer_gpu(layer, seq_pos, st)?;
-
-                // FIX-DTOD: see decode_token_normal for full rationale.
-                // Skip the attn_proj -> x_gpu propagation for MoE layers because
-                // encode_moe_ffn_decode already wrote the post-FFN state directly
-                // into st.scratch.x_gpu; the dtod would overwrite it with the
-                // stale pre-FFN attn+residual.
-                let is_moe_layer = st
-                    .moe_meta_cache
-                    .get(layer)
-                    .and_then(|m| m.as_ref())
-                    .is_some();
-                if !is_moe_layer {
-                    self.device
-                        .stream
-                        .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
-                        .map_err(|e| {
-                            RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}"))
-                        })?;
-                }
-            }
-
-            self.compute_final_gpu(st)?;
-
-            {
-                let vocab = hp.vocab_size;
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (1024, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(&st.kernels.argmax_f32)
-                        .arg(&st.logits_gpu)
-                        .arg(&mut st.argmax_result)
-                        .arg(&vocab)
-                        .launch(launch_cfg)
-                }
-                .map_err(|e| RuntimeError::Compute(format!("argmax launch: {e}")))?;
-            }
-        }
-
-        // Full real-logits readback on the sampling decode
-        // path. The previous code synthesized a ONE-HOT vector {argmax->1.0,
-        // rest->0.0} from a 4-byte argmax readback, which destroyed the real
-        // distribution that `compute_final_gpu` had already written into
-        // `st.logits_gpu`. Any sampler (temperature>0) then drew from a
-        // near-uniform softmax over the one-hot -> gibberish. Greedy is
-        // unaffected because it uses the separate `decode_token_greedy` GPU
-        // argmax path and never calls this function. Cost: one ~1 MB dtoh per
-        // decode token on the sampling path only (negligible vs the closed
-        // decode perf; greedy untouched).
-        self.device.synchronize()?;
-        // optional per-step CPU sleep to close the GPU-scheduler
-        // timing race documented in
-        // Default OFF (delay=0 → no-op, bit-exact when disabled).
-        // Set `LUMEN_CUDA_DECODE_DELAY_US=50` to opt in (Metal precedent).
-        maybe_apply_cuda_decode_delay();
-        let logits_host = self.device.dtoh_copy(&st.logits_gpu)?;
-
-        // Advance host-side KV cache seq_len and decode counter.
-        kv.advance_seq_len()?;
-        st.decode_token_count += 1;
-
-        Ok(Logits { data: logits_host })
+        // CUDA graph capture removed (condor/tern/harrier/osprey all NO-GO):
+        // the sampling decode path runs the eager pipeline, identical to the
+        // greedy path, via `decode_token_normal`.
+        self.decode_token_normal(token_id, seq_pos, num_layers, hp, st, kv)
     }
 }
 

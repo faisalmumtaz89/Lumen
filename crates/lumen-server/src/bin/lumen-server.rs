@@ -691,8 +691,7 @@ async fn run(args: Args) -> Result<(), String> {
     // any backend constructor or kernel dispatch fires its first env-var
     // read. The two setters are idempotent and cheap (one atomic store
     // each); they let the operator run a BF16 dense LBC against
-    // `lumen-server` with NO `LUMEN_CUDA_BF16_GEMMEX=1` and NO
-    // `LUMEN_CUDA_DECODE_GRAPH=1` / `_QGATE` / `_TILED` and the runtime
+    // `lumen-server` with NO `LUMEN_CUDA_BF16_GEMMEX=1` and the runtime
     // still picks the right path for that cell. Operator explicit env vars
     // remain authoritative — model-aware defaults only apply when the env
     // is unset. F3 typo validator already ran in `main()` BEFORE this; the

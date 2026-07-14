@@ -81,27 +81,17 @@ pub enum GpuWeightBuf {
     /// Repacked Q8_0 in per-row tile-grouped layout: each row holds
     /// `num_tiles = nb / 8` tiles of 272 bytes (`[16 B scales][256 B quants]`),
     /// for total `(nb/8) * 272 = 34 * nb` bytes (same density as `Q8Raw`).
-    /// Scales and quants for 8 consecutive blocks are colocated within 272
-    /// contiguous bytes, reducing L1-sector traffic vs `Q8Split` where the
-    /// two streams are `2*nb` bytes apart.
     ///
-    /// Used only for the decode path; produced by `repack_q8_raw_to_tile()`
-    /// when `LUMEN_CUDA_Q8_TILE=1` is set at session start. Consumed by
-    /// `matvec_q8_tile_q8_1` / `matvec_q8_tile_q8_1_residual`.
-    ///
-    /// Stored as a sibling `Option<CudaSlice<u8>>` on `LayerWeightsGpu`, not
-    /// constructed directly via this enum; the variant exists so all match
-    /// sites on `GpuWeightBuf` are exhaustive.
+    /// Vestigial placeholder: never constructed (the tile decode path was
+    /// removed). Retained so all match sites on `GpuWeightBuf` stay exhaustive.
     #[allow(dead_code)]
     Q8Tile(CudaSlice<u8>),
     /// Repacked Q4_0 in per-row tile-grouped layout: each row holds
     /// `num_tiles = nb / 8` tiles of 144 bytes (`[16 B scales][128 B nibbles]`),
     /// for total `(nb/8) * 144 = 18 * nb` bytes (same density as `Q4Raw`).
-    /// Adapts the Q8 tile pattern to Q4_0.
     ///
-    /// Used only for the decode path; produced by `repack_q4_raw_to_tile()`
-    /// when `LUMEN_CUDA_Q4_TILE=1` is set at session start. Consumed by
-    /// `matvec_q4_tile_q8_1` / `matvec_q4_tile_q8_1_residual`.
+    /// Vestigial placeholder: never constructed (the tile decode path was
+    /// removed). Retained so all match sites on `GpuWeightBuf` stay exhaustive.
     #[allow(dead_code)]
     Q4Tile(CudaSlice<u8>),
 }
@@ -173,28 +163,6 @@ pub struct LayerWeightsGpu {
     pub q4_split_w_up: Option<CudaSlice<u8>>,
     pub q4_split_w_down: Option<CudaSlice<u8>>,
 
-    // --- tile-layout integration: decode-only tile-grouped siblings
-    // (Q8 and Q4). Mirror of the q8_split_* / q4_split_* fields above
-    // but in the colocated-per-tile layout consumed by
-    // `matvec_q8_tile_q8_1` / `matvec_q4_tile_q8_1`.
-    // Populated by `repack_all_layers_q8_clone_to_tile` /
-    // `repack_all_layers_q4_clone_to_tile` when `LUMEN_CUDA_Q8_TILE=1`
-    // / `LUMEN_CUDA_Q4_TILE=1` is set at session start.
-    pub q8_tile_wq: Option<CudaSlice<u8>>,
-    pub q8_tile_wk: Option<CudaSlice<u8>>,
-    pub q8_tile_wv: Option<CudaSlice<u8>>,
-    pub q8_tile_wo: Option<CudaSlice<u8>>,
-    pub q8_tile_w_gate: Option<CudaSlice<u8>>,
-    pub q8_tile_w_up: Option<CudaSlice<u8>>,
-    pub q8_tile_w_down: Option<CudaSlice<u8>>,
-    pub q4_tile_wq: Option<CudaSlice<u8>>,
-    pub q4_tile_wk: Option<CudaSlice<u8>>,
-    pub q4_tile_wv: Option<CudaSlice<u8>>,
-    pub q4_tile_wo: Option<CudaSlice<u8>>,
-    pub q4_tile_w_gate: Option<CudaSlice<u8>>,
-    pub q4_tile_w_up: Option<CudaSlice<u8>>,
-    pub q4_tile_w_down: Option<CudaSlice<u8>>,
-
     // --- GDN-specific weights (None for standard attention layers) ---
     /// Layer type: 0 = softmax attention, 1 = GDN.
     pub layer_type: u8,
@@ -238,11 +206,9 @@ pub struct LayerWeightsGpu {
     pub q8_split_ssm_alpha: Option<CudaSlice<u8>>,
     #[allow(dead_code)]
     pub q8_split_ssm_beta: Option<CudaSlice<u8>>,
-    /// Per-row split siblings for Q4Raw GDN weights. Populated by
-    /// `repack_all_layers_gdn_q4_clone_to_split` at preload when
-    /// `LUMEN_CUDA_GDN_SPLIT=1`. The 4096x4096 ssm_out matvec is ~10% of decode
-    /// time (profile).
-    pub q4_split_ssm_out: Option<CudaSlice<u8>>,
+    /// Per-row split siblings for Q4Raw GDN weights (decode-only). Currently
+    /// always `None` (no populator); the decode projection reads them as
+    /// optional split siblings and falls back to the base Q4Raw matvec.
     pub q4_split_attn_gate: Option<CudaSlice<u8>>,
     pub q4_split_ssm_alpha: Option<CudaSlice<u8>>,
     pub q4_split_ssm_beta: Option<CudaSlice<u8>>,
@@ -946,23 +912,6 @@ pub fn upload_layer_weights(
         q4_split_w_gate: None,
         q4_split_w_up: None,
         q4_split_w_down: None,
-        // tile siblings start as None; populated by
-        // repack_all_layers_q8_clone_to_tile() / repack_all_layers_q4_clone_to_tile()
-        // when LUMEN_CUDA_Q8_TILE=1 / LUMEN_CUDA_Q4_TILE=1.
-        q8_tile_wq: None,
-        q8_tile_wk: None,
-        q8_tile_wv: None,
-        q8_tile_wo: None,
-        q8_tile_w_gate: None,
-        q8_tile_w_up: None,
-        q8_tile_w_down: None,
-        q4_tile_wq: None,
-        q4_tile_wk: None,
-        q4_tile_wv: None,
-        q4_tile_wo: None,
-        q4_tile_w_gate: None,
-        q4_tile_w_up: None,
-        q4_tile_w_down: None,
         // GDN fields: populated only for GDN layers (layer_type == 1).
         layer_type: subs.layer_type.unwrap_or(0),
         ssm_conv1d: match &subs.ssm_conv1d {
@@ -1027,13 +976,11 @@ pub fn upload_layer_weights(
         attn_gate_f16: None,
         ssm_alpha_f16: None,
         ssm_beta_f16: None,
-        // GDN split siblings start as None; populated by
-        // repack_layer_gdn_clone_to_split() when LUMEN_CUDA_GDN_SPLIT=1.
+        // GDN split siblings start as None (decode-only optional siblings).
         q8_split_ssm_out: None,
         q8_split_attn_gate: None,
         q8_split_ssm_alpha: None,
         q8_split_ssm_beta: None,
-        q4_split_ssm_out: None,
         q4_split_attn_gate: None,
         q4_split_ssm_alpha: None,
         q4_split_ssm_beta: None,

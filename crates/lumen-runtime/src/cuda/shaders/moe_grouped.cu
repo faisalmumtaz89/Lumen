@@ -520,10 +520,10 @@ extern "C" __global__ void moe_grouped_scatter_accum_q8_0(
 // TILED shmem-staged grouped gate+up+SwiGLU.
 //
 // Replaces the per-column matvec (`moe_grouped_gate_up_swiglu_q8_0`) — the
-// dominant prefill cost (routed FFN = 73% of prefill, runtime-measured). Mirrors
-// the Wave-4 dense `mmq_q8_0_tiled` design (shmem-staged, per-thread accumulators,
-// NO cross-thread reduction) adapted for the expert-grouped case via a host-built
-// flattened column-tile list.
+// dominant prefill cost (routed FFN = 73% of prefill, runtime-measured). Uses a
+// shmem-staged tiled design (per-thread accumulators, NO cross-thread reduction)
+// adapted for the expert-grouped case via a host-built flattened
+// column-tile list.
 //
 // CTA tile = TGU_BM=16 compact columns (same expert) x TGU_BN=64 rows x TGU_BK=8
 // q-blocks. 256 threads (8 warps). Each thread owns 1 column x 4 rows -> 8 F32

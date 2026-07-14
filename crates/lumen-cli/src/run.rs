@@ -1981,8 +1981,8 @@ fn run_with_async(
 
     // feed the LBC-resolved dense quant into the runtime
     // defaults registry BEFORE the backend is constructed so the cached
-    // `LUMEN_CUDA_BF16_GEMMEX` / `LUMEN_CUDA_DECODE_GRAPH*` resolvers
-    // observe the model-aware default on their first read. CLI path stays
+    // `LUMEN_CUDA_BF16_GEMMEX` resolver observes the model-aware default on
+    // its first read. CLI path stays
     // on `set_path_is_server(false)` (set in `main`) so the decode-delay
     // default remains 0 µs — CLI is fork-deterministic.
     lumen_runtime::runtime_defaults::set_model_dense_quant(provider.output_proj_quant);

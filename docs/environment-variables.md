@@ -46,40 +46,22 @@ The 12-flag CUDA production stack is **default-ON** (set any to `=0` to opt out)
 | Variable | Description |
 |---|---|
 | `LUMEN_CUDA_BF16_AUTOTUNE` | BF16 autotune sweep (off in production) |
-| `LUMEN_CUDA_DECODE_GRAPH` | CUDA graph capture for decode (experimental) |
-| `LUMEN_CUDA_DECODE_GRAPH_QGATE` | CUDA graph + Q-gate fusion variant |
-| `LUMEN_CUDA_DECODE_GRAPH_TILED` | CUDA graph for tiled decode kernel |
 | `LUMEN_CUDA_DECODE_TILED` | Force tiled streaming-softmax decode kernel |
 | `LUMEN_CUDA_DECODE_TILED_THRESHOLD` | Token threshold above which tiled kernel engages (default 0 = always-on); set to `4294967295` to force single-block path |
-| `LUMEN_CUDA_FA2_ATTN` | Flash Attention 2 decode (per-call HBM alloc dominates at batch=1) |
-| `LUMEN_CUDA_FA2_BLOCKSKIP` | FA2 prefill with block-skip causal kernel |
 | `LUMEN_CUDA_FFN_FUSED_GLU` | Fused gate+up+SwiGLU FFN variant |
 | `LUMEN_CUDA_GDN_AB_F32` | F32 A-tile / B-tile accumulators in GDN |
 | `LUMEN_CUDA_GDN_F64_ACCUM` | F64 GDN delta-rule accumulator; **default-ON for MoE** — the decode-vs-prefill parity fix that lands MoE arithmetic at greedy; no-op/OFF for dense (see [MoE correctness defaults](#cuda--moe-correctness-defaults-auto-on-for-moe-no-op-for-dense)) |
-| `LUMEN_CUDA_GDN_PHASE4_COAL` | GDN phase-4 coalesced dispatch |
-| `LUMEN_CUDA_GDN_SPLIT` | Split layout for GDN tensors (Q4; +2.6% Q4 decode) |
-| `LUMEN_CUDA_L2NORM_RSQRTF` | Two-step rsqrtf L2 norm variant (`rsqrtf(fmaxf(ss,eps^2))`, one HW op) |
 | `LUMEN_CUDA_MMV_Q_OUTPUT_PROJ` | Q8/Q4 output_proj llama.cpp-parity port (within noise floor) |
 | `LUMEN_CUDA_MOE_BATCHED_V2` / `_V3` | MoE batched FFN variants V2 / V3 |
-| `LUMEN_CUDA_MOE_DECODE_GRAPH` | CUDA graph capture for MoE decode |
 | `LUMEN_CUDA_MOE_FUSED_NORM_ROUTER` | Fused norm + router kernel |
-| `LUMEN_CUDA_MOE_FUSED_PERSISTENT` | Persistent fused MoE kernel |
-| `LUMEN_CUDA_MOE_SHARED_FUSED` | Fused shared-expert path |
-| `LUMEN_CUDA_NORM_RSQRTF_BUNDLE` | Umbrella gate: enables L2NORM_RSQRTF + RMSNORM_RSQRTF + GDN_AB_F32 together (rsqrtf-norm bundle) |
-| `LUMEN_CUDA_OUTPUT_PROJ_F16_CACHE` | F16 cache for output_proj |
 | `LUMEN_CUDA_OUTPUT_PROJ_NR` | Override NR for output projection (16 / 32) |
 | `LUMEN_CUDA_OUTPUT_PROJ_SPLIT` | Split-K layout for 1 GB output projection |
 | `LUMEN_CUDA_PREFILL_F32` | Force F32 prefill path |
 | `LUMEN_CUDA_Q4_SPLIT` | Raw + split layout for Q4_0 weights (+9.0% Q4 decode) |
-| `LUMEN_CUDA_Q4_TILE` | Q4 matmul tile size override |
-| `LUMEN_CUDA_Q8_AOS_NR8` / `LUMEN_CUDA_Q8_SPLIT_NR8` | Q8 NR=8 dp4a-mmvq variants (AoS / SPLIT layouts) |
-| `LUMEN_CUDA_Q8_SPLIT_4THREAD` | Q8 SPLIT 4-threads-per-block dp4a-mmvq variant |
 | `LUMEN_CUDA_Q8_PROJ_MMQ` | Q8 projection via MMQ |
 | `LUMEN_CUDA_Q8_SCALE_HW` | Native `LDG.E.U16` scale fetch for Q8 matvec (+0.4% Q8 decode) |
 | `LUMEN_CUDA_Q8_SPLIT` | Raw + split layout for Q8_0 weights (+4.5% Q8 decode) |
 | `LUMEN_CUDA_Q8_SSM_OUT_MMQ_OFF` | Disable MMQ for Q8 SSM-out |
-| `LUMEN_CUDA_Q8_TILE` | Q8 matmul tile size override |
-| `LUMEN_CUDA_RMSNORM_RSQRTF` | rsqrtf + block-wide warp-shuffle RMSNorm kernel |
 | `LUMEN_CUDA_SKIP_BF16_PROBE` | Skip BF16 GemmEx capability probe at startup |
 | `LUMEN_CUDA_SKIP_SHARED_EXPERT` / `_GATE` | Skip shared-expert path / gate (debug) |
 
@@ -108,7 +90,6 @@ Set any to `=0` to opt out on MoE, `=1` to force on.
 |---|---|
 | `LUMEN_CUDA_DECODE_DELAY_US` | CPU sleep (µs) after `device.synchronize()` per decode step; serializes inter-step submission to close a GPU-scheduler timing race for MoE Q4 server determinism. Default is `50` on `lumen-server` (applied automatically) and `0` on the `lumen run` CLI, which is deterministic without it. |
 | `LUMEN_CUDA_LEGACY_DEFAULTS` | Roll back to legacy default values |
-| `LUMEN_CUDA_LEVER_TRACE` | Trace which perf levers fire at runtime |
 | `LUMEN_CUDA_MAX_SEQ_LEN` | Cap KV-cache max sequence length |
 | `LUMEN_CUDA_MOE_DEBUG_DUMP` | Dump MoE intermediate tensors |
 | `LUMEN_CUDA_PROFILE` | Enable CUDA-side profiling |
