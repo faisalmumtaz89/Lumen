@@ -1095,6 +1095,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_BENCH_WARMUP",
     "LUMEN_CACHE_DIR",
     "LUMEN_CHAT_ENABLE_THINKING",
+    "LUMEN_CORR010_MODEL",
     "LUMEN_CUDA_BF16_AUTOTUNE",
     "LUMEN_CUDA_BF16_GEMMEX",
     "LUMEN_CUDA_BF16_MOE_V3",
@@ -1102,6 +1103,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_DECODE_TILED",
     "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
     "LUMEN_CUDA_FFN_FUSED_GLU",
+    "LUMEN_CUDA_FORCE_SCALAR_ATTN",
     "LUMEN_CUDA_GDN_AB_F16",
     "LUMEN_CUDA_GDN_AB_F32",
     "LUMEN_CUDA_GDN_CONVSTATE_PARITY",
@@ -1127,6 +1129,8 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_MOE_DECODE_F32_FFN",
     "LUMEN_CUDA_MOE_FUSED_NORM_ROUTER",
     "LUMEN_CUDA_MOE_GATE_UP_W10",
+    "LUMEN_CUDA_MOE_GROUPED_TILED",
+    "LUMEN_CUDA_MOE_PREFILL_BATCHED",
     "LUMEN_CUDA_MOE_Q4_V3",
     "LUMEN_CUDA_MOE_Q4_V3B",
     "LUMEN_CUDA_MOE_ROUTER_PARALLEL",
@@ -1173,6 +1177,10 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_METAL_MOE_ROUTER_PARALLEL",
     "LUMEN_METAL_MOE_ROUTER_TOPK_TGS",
     "LUMEN_METAL_MOE_PREFILL_GROUPED",
+    "LUMEN_METAL_MOE_GATHER_VEC4",
+    "LUMEN_METAL_MOE_GEMM_TILEMAP",
+    "LUMEN_METAL_MOE_ROUTE_SORT",
+    "LUMEN_METAL_MOE_ROUTE_SORT_PAR",
     "LUMEN_METAL_NAN_DUMP",
     "LUMEN_METAL_DEFAULTS_OFF",
     "LUMEN_METAL_PROFILE",
@@ -2248,6 +2256,176 @@ mod tests {
             assert!(
                 !warnings.iter().any(|w| w.contains(name)),
                 "allowlist member '{name}' must not warn; warnings = {warnings:?}"
+            );
+        }
+    }
+
+    // ---- Reverse coverage: every READ env var is in the allowlist ----
+
+    /// Every `LUMEN_*` env var **read** at runtime in `crates/` (via
+    /// `std::env::var` / the `env_*` helpers). The two tests above prove the
+    /// forward direction (`allowlist ⇒ no-warn`); this static proves the
+    /// *reverse* — `reads ⊆ allowlist` — which is the direction that actually
+    /// prevents the startup false-warn defect: a flag that is read but NOT
+    /// allowlisted makes `validate_lumen_env_vars()` emit a spurious
+    /// "unknown LUMEN var — typo?" warning the moment an operator sets it.
+    ///
+    /// REGENERATE (from repo root) with the campaign one-liner:
+    ///   grep -rhoE '"LUMEN_[A-Z0-9_]+"' crates --include='*.rs' | tr -d '"' | sort -u
+    /// then drop `LUMEN_BUILD_VERSION` — it is a compile-time `option_env!`
+    /// baked in at build time, never present in the runtime process env, so it
+    /// is intentionally NOT a runtime allowlist member.
+    static READ_SITE_LUMEN_ENV_VARS: &[&str] = &[
+        "LUMEN_AB_ITERATIONS",
+        "LUMEN_AB_WARMUP",
+        "LUMEN_ANTI_RESTATE",
+        "LUMEN_ANTI_RESTATE_LOOP",
+        "LUMEN_ANTI_RESTATE_NGRAM",
+        "LUMEN_ANTI_RESTATE_SUBWORD",
+        "LUMEN_BASE_URL",
+        "LUMEN_BENCH_ITERATIONS",
+        "LUMEN_BENCH_SCALE",
+        "LUMEN_BENCH_TOKENS",
+        "LUMEN_BENCH_WARMUP",
+        "LUMEN_CACHE_DIR",
+        "LUMEN_CHAT_ENABLE_THINKING",
+        "LUMEN_CORR010_MODEL",
+        "LUMEN_CUDA_ATTN_PRECISE",
+        "LUMEN_CUDA_ATTN_PRECISE_DBG",
+        "LUMEN_CUDA_BF16_AUTOTUNE",
+        "LUMEN_CUDA_BF16_GEMMEX",
+        "LUMEN_CUDA_BF16_MOE_V3",
+        "LUMEN_CUDA_DECODE_DELAY_US",
+        "LUMEN_CUDA_DECODE_TILED",
+        "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
+        "LUMEN_CUDA_FFN_FUSED_GLU",
+        "LUMEN_CUDA_FORCE_SCALAR_ATTN",
+        "LUMEN_CUDA_GDN_AB_F16",
+        "LUMEN_CUDA_GDN_AB_F32",
+        "LUMEN_CUDA_GDN_CONVSTATE_PARITY",
+        "LUMEN_CUDA_GDN_DECODE_MEGAKERNEL_F64",
+        "LUMEN_CUDA_GDN_DECODE_VIA_PREFILL",
+        "LUMEN_CUDA_GDN_F64_ACCUM",
+        "LUMEN_CUDA_GDN_PREFILL_F64",
+        "LUMEN_CUDA_GDN_REGISTER_RESIDENT",
+        "LUMEN_CUDA_GDN_SUBSTAGE_TIMING",
+        "LUMEN_CUDA_GPU_SAMPLE",
+        "LUMEN_CUDA_LEGACY_DEFAULTS",
+        "LUMEN_CUDA_MAX_SEQ_LEN",
+        "LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ",
+        "LUMEN_CUDA_MMV_Q_DP4A",
+        "LUMEN_CUDA_MMV_Q_MOE_DP4A",
+        "LUMEN_CUDA_MMV_Q_OUTPUT_PROJ",
+        "LUMEN_CUDA_MOE_BATCHED",
+        "LUMEN_CUDA_MOE_BATCHED_V2",
+        "LUMEN_CUDA_MOE_BATCHED_V3",
+        "LUMEN_CUDA_MOE_BF16_NATIVE",
+        "LUMEN_CUDA_MOE_DECODE_F32",
+        "LUMEN_CUDA_MOE_DECODE_F32_FFN",
+        "LUMEN_CUDA_MOE_DOWN_TILED_F32ACT",
+        "LUMEN_CUDA_MOE_FUSED_NORM_ROUTER",
+        "LUMEN_CUDA_MOE_GATE_UP_W10",
+        "LUMEN_CUDA_MOE_GROUPED_TILED",
+        "LUMEN_CUDA_MOE_PREFILL_BATCHED",
+        "LUMEN_CUDA_MOE_Q4_V3",
+        "LUMEN_CUDA_MOE_Q4_V3B",
+        "LUMEN_CUDA_MOE_ROUTER_PARALLEL",
+        "LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA",
+        "LUMEN_CUDA_OUTPUT_PROJ_NR",
+        "LUMEN_CUDA_OUTPUT_PROJ_SPLIT",
+        "LUMEN_CUDA_PREFILL_F32",
+        "LUMEN_CUDA_PROFILE",
+        "LUMEN_CUDA_PTX_CACHE",
+        "LUMEN_CUDA_PTX_CACHE_DIR",
+        "LUMEN_CUDA_Q4_SPLIT",
+        "LUMEN_CUDA_Q8_PROJ_MMQ",
+        "LUMEN_CUDA_Q8_SCALE_HW",
+        "LUMEN_CUDA_Q8_SPLIT",
+        "LUMEN_CUDA_SHARED_TILED",
+        "LUMEN_CUDA_SKIP_BF16_PROBE",
+        "LUMEN_CUDA_SOA_LOCKED",
+        "LUMEN_CUDA_TOPK_MOE_FUSED",
+        "LUMEN_CUDA_VERBOSE",
+        "LUMEN_DUMP_EXPERTS",
+        "LUMEN_DUMP_GDN_L0_BIN",
+        "LUMEN_DUMP_NORMED",
+        "LUMEN_FREQUENCY_PENALTY",
+        "LUMEN_GRAPH_DIAGNOSTIC",
+        "LUMEN_KV_PRECISION",
+        "LUMEN_METAL_ATTN_PRECISE",
+        "LUMEN_METAL_BF16_GATE_UP_NR",
+        "LUMEN_METAL_BF16_GDN_FULL_PREFILL_WARMUP",
+        "LUMEN_METAL_BF16_GDN_QKV_GATE_PAIRED",
+        "LUMEN_METAL_BF16_MMAP_ONLY",
+        "LUMEN_METAL_CB_SPLIT",
+        "LUMEN_METAL_CONCURRENT_ENCODER",
+        "LUMEN_METAL_CONCURRENT_ENCODER_VALIDATE",
+        "LUMEN_METAL_DECODE_DELAY_US",
+        "LUMEN_METAL_DECODE_GPUTIME",
+        "LUMEN_METAL_DECODE_PROFILE",
+        "LUMEN_METAL_DEFAULTS_OFF",
+        "LUMEN_METAL_FFN_DOWN_SPLITK",
+        "LUMEN_METAL_FFN_GATE_UP_SWIGLU_FUSED",
+        "LUMEN_METAL_FFN_GATE_UP_SWIGLU_FUSED_BF16",
+        "LUMEN_METAL_FFN_GATE_UP_SWIGLU_FUSED_Q4",
+        "LUMEN_METAL_GDN_CONCURRENT_ENCODER",
+        "LUMEN_METAL_GDN_CONCURRENT_ENCODER_VALIDATE",
+        "LUMEN_METAL_GDN_SSM_OUT_F32_BATCHED",
+        "LUMEN_METAL_GPU_SAMPLER",
+        "LUMEN_METAL_GPU_SAMPLER_EXACT",
+        "LUMEN_METAL_GPU_SAMPLER_QUIET",
+        "LUMEN_METAL_MMAP_ONLY",
+        "LUMEN_METAL_MOE_GATHER_VEC4",
+        "LUMEN_METAL_MOE_GEMM_TILEMAP",
+        "LUMEN_METAL_MOE_PREFILL_GROUPED",
+        "LUMEN_METAL_MOE_ROUTER_PARALLEL",
+        "LUMEN_METAL_MOE_ROUTER_TOPK_TGS",
+        "LUMEN_METAL_MOE_ROUTE_SORT",
+        "LUMEN_METAL_MOE_ROUTE_SORT_PAR",
+        "LUMEN_METAL_NAN_DUMP",
+        "LUMEN_METAL_PREFILL_GPUTIME",
+        "LUMEN_METAL_PROFILE",
+        "LUMEN_METAL_Q8_GDN_QKVGATE_2STREAM",
+        "LUMEN_METAL_Q8_REPACKED",
+        "LUMEN_METAL_Q8_REPACKED_FFN_DOWN",
+        "LUMEN_METAL_Q8_REPACKED_GATE_UP",
+        "LUMEN_METAL_UNRETAINED_CMDBUFS",
+        "LUMEN_MOE_PROBE",
+        "LUMEN_PREFILL_TIMING",
+        "LUMEN_QWEN35_9B_BF16",
+        "LUMEN_QWEN35_9B_PATH",
+        "LUMEN_QWEN35_9B_Q4",
+        "LUMEN_QWEN35_9B_Q8",
+        "LUMEN_REPEAT_LAST_N",
+        "LUMEN_REPETITION_PENALTY",
+        "LUMEN_SERVER_DEBUG_MEM",
+        "LUMEN_SERVER_PANIC_MAX",
+        "LUMEN_SERVER_PANIC_WINDOW_SECS",
+        "LUMEN_SOAK_DURATION_SEC",
+        "LUMEN_SOAK_OUT_DIR",
+        "LUMEN_SOAK_STACK_DUMP",
+        "LUMEN_SOAK_STACK_LEAKS",
+        "LUMEN_SOAK_STACK_TICKS",
+        "LUMEN_SOAK_WARMUP_SEC",
+        "LUMEN_SPEC_DUMP_IDS",
+        "LUMEN_SUFFIX_THRESHOLD",
+        "LUMEN_TEST_OPENAI_SDK",
+        "LUMEN_XCHK",
+        "LUMEN_XCHK2",
+    ];
+
+    #[test]
+    fn all_read_env_vars_are_registered() {
+        // Reverse-registry invariant: `reads ⊆ KNOWN_LUMEN_ENV_VARS`. If this
+        // fails, a newly-added env read is missing from the allowlist — add it
+        // to KNOWN_LUMEN_ENV_VARS (or remove the read). Regenerate the array
+        // above with the one-liner in its doc comment.
+        for name in READ_SITE_LUMEN_ENV_VARS {
+            assert!(
+                KNOWN_LUMEN_ENV_VARS.contains(name),
+                "read-but-unregistered LUMEN env var '{name}': it is read in \
+                 crates/ but absent from KNOWN_LUMEN_ENV_VARS, so it would \
+                 false-warn at startup. Add it to the allowlist."
             );
         }
     }

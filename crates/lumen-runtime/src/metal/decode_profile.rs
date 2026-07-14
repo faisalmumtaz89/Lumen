@@ -63,17 +63,18 @@ pub(crate) fn gputime_enabled() -> bool {
 // hazard barrier). No MTLSharedEvent is used. Byte-identical to the single-CB
 // path (metal-R9 P1, DET-001 + corpus). See `decode_token_greedy_core`.
 
-/// Explicit per-token CB split boundaries. Always empty: the diagnostic
-/// `LUMEN_METAL_SPLIT_CB_AT_ORD` override was removed, so callers fall through
-/// to the AUTO split policy (byte-identical single-CB behavior when AUTO off).
+/// Explicit per-token CB split boundaries. Always empty: the manual override
+/// was removed, so callers fall through to the AUTO split policy
+/// (byte-identical single-CB behavior when AUTO off).
 pub(crate) fn split_cb_ords() -> &'static [u32] {
     &[]
 }
 
 /// AUTO split-policy toggle: `LUMEN_METAL_CB_SPLIT`. Default-ON (metal-R10):
 /// unset, `auto`, or `1` (the plain truthy the LKA gate harness uses) turns it
-/// on; `0` / `off` disables. When on AND no explicit `SPLIT_CB_AT_ORD` list is
-/// set, the decode core inserts a commit boundary at a full-attn island CLOSE
+/// on; `0` / `off` disables. When on (the explicit `split_cb_ords()` list is
+/// always empty), the decode core inserts a commit boundary at a full-attn
+/// island CLOSE
 /// once the current CB has accumulated `AUTO_SPLIT_ENCODER_STRIDE` encoders
 /// (see `decode_token_greedy_core`), provided the model has at least
 /// `AUTO_SPLIT_MIN_ENCODERS` per-token encoders. Reproduces the measured
@@ -106,8 +107,8 @@ pub(crate) const AUTO_SPLIT_ENCODER_STRIDE: u32 = 40;
 /// measured FLAT on Qwen3.5-9B (65 encoders; metal-R9/R10) -- harmless but
 /// pointless, so the AUTO policy skips it and the token stays single-CB.
 /// At 73+ encoders (>= 36 layers) the first split leaves a >= 33-encoder
-/// continuation and the stall removal is real (27B/MoE). An explicit
-/// `SPLIT_CB_AT_ORD` list bypasses this gate.
+/// continuation and the stall removal is real (27B/MoE). A non-empty explicit
+/// `split_cb_ords()` list would bypass this gate (currently always empty).
 pub(crate) const AUTO_SPLIT_MIN_ENCODERS: u32 = 73;
 
 pub(crate) fn init_from_env() {

@@ -332,8 +332,9 @@ impl MetalF32Backend {
         // (their fused fn opens one concurrent + reopens one serial encoder), so
         // EVERY layer contributes exactly 2 and the invariant holds uniformly. On
         // the pipelined path, when the lever is active the single per-token CB is
-        // committed at a full-attn island CLOSE -- at an explicit `SPLIT_CB_AT_ORD`
-        // ordinal, or under the AUTO policy once the current CB has accumulated
+        // committed at a full-attn island CLOSE -- at an explicit split ordinal
+        // (the `split_cb_ords()` list, currently always empty), or under the AUTO
+        // policy once the current CB has accumulated
         // `AUTO_SPLIT_ENCODER_STRIDE` (~40) encoders. This shrinks the large CB
         // whose completion triggers the ~0.5 ms/tok GPU dispatch stall. Byte-
         // identical (see decode_profile). Lever off or non-pipelined => the counter
@@ -349,8 +350,8 @@ impl MetalF32Backend {
         // per-token encoder count (2*layers+1) reaches AUTO_SPLIT_MIN_ENCODERS.
         // Below that (e.g. Qwen3.5-9B, 65 encoders) the single stride-40 split
         // lands in the token tail and measured FLAT, so it is skipped and the
-        // token stays single-CB. An explicit SPLIT_CB_AT_ORD list is used
-        // verbatim and bypasses the size gate.
+        // token stays single-CB. A non-empty explicit `split_cb_ords()` list is
+        // used verbatim and bypasses the size gate.
         let split_auto = split_explicit_ords.is_empty()
             && decode_profile::cb_split_auto()
             && 2 * (num_layers as u32) + 1 >= decode_profile::AUTO_SPLIT_MIN_ENCODERS;

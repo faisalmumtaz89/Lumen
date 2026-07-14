@@ -914,7 +914,7 @@ kernel void gdn_state_output_l2_sg_f16(
 // @8, val_dim @9, n_kv_heads @10, l2_eps @11).
 //   grid: (1, ceil(val_dim/4) = 32, n_heads = 32) = 1024 TGs, threadgroup:
 //   (32, 1, 1). REQUIRES nothing extra (out-of-range vi columns are guarded).
-// Env LUMEN_METAL_GDN_F16_STATE_H1_V4=1, default OFF.
+// (F16 single-simdgroup H=1 GDN state-output variant.)
 // ============================================================================
 kernel void gdn_state_output_l2_sg_f16_h1_v4(
     device       half*  h_state        [[buffer(0)]],
@@ -1004,9 +1004,9 @@ kernel void gdn_state_output_l2_sg_f16_h1_v4(
 //
 // Reads the prefill-populated F32 h_state (src) element-by-element and writes the
 // half-precision rounding into a SEPARATE F16 dst buffer (no in-place aliasing).
-// Used once per GDN layer at the prefill->decode boundary when
-// LUMEN_METAL_GDN_F16_STATE_DECODE=1, so the decode recurrence
-// (gdn_state_output_l2_sg_f16) can run on F16 state.
+// Used once per GDN layer at the prefill->decode boundary for the F16 decode
+// state path, so the decode recurrence (gdn_state_output_l2_sg_f16) can run on
+// F16 state.
 //
 // buffer(0): src  [n] float  -- prefill F32 h_state (read-only)
 // buffer(1): dst  [n] half   -- F16 h_state (write)
