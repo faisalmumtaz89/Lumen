@@ -2954,58 +2954,6 @@ impl CudaBackend {
                 ));
             }
 
-            // FIX-3 DEBUG: pre-FFN-norm dump + ffn_norm value samples
-            if {
-                use std::sync::OnceLock;
-                static FLAG: OnceLock<bool> = OnceLock::new();
-                *FLAG.get_or_init(|| {
-                    std::env::var("LUMEN_CUDA_MOE_DEBUG_DUMP").as_deref() == Ok("1")
-                })
-            } {
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                static PRE_COUNT: AtomicUsize = AtomicUsize::new(0);
-                let n = PRE_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 80 {
-                    let xg_host = self.device.dtoh_copy(&st.scratch.x_gpu)?;
-                    let ap_host = self.device.dtoh_copy(&st.scratch.attn_proj)?;
-                    let ffn_host = self.device.dtoh_copy(&lw.ffn_norm)?;
-                    let attn_norm_host = self.device.dtoh_copy(&lw.attn_norm)?;
-                    let mut xg_max = 0.0f32;
-                    let mut xg_sum = 0.0f64;
-                    for v in &xg_host {
-                        xg_max = xg_max.max(v.abs());
-                        xg_sum += v.abs() as f64;
-                    }
-                    let mut ap_max = 0.0f32;
-                    let mut ap_sum = 0.0f64;
-                    for v in &ap_host {
-                        ap_max = ap_max.max(v.abs());
-                        ap_sum += v.abs() as f64;
-                    }
-                    let mut fn_max = 0.0f32;
-                    let mut fn_sum = 0.0f64;
-                    for v in &ffn_host {
-                        fn_max = fn_max.max(v.abs());
-                        fn_sum += v.abs() as f64;
-                    }
-                    let mut an_max = 0.0f32;
-                    let mut an_sum = 0.0f64;
-                    for v in &attn_norm_host {
-                        an_max = an_max.max(v.abs());
-                        an_sum += v.abs() as f64;
-                    }
-                    eprintln!(
-                        "[MoE-PRE] call={n} layer={layer_idx} | x_gpu_pre: max={xg_max:.3} mean={:.4} first5={:?} | attn_proj_pre: max={ap_max:.3} mean={:.3} | attn_norm: max={an_max:.3} mean={:.3} | ffn_norm: max={fn_max:.3} mean={:.3} first5={:?}",
-                        xg_sum / hidden_dim as f64,
-                        &xg_host[..5.min(xg_host.len())],
-                        ap_sum / hidden_dim as f64,
-                        an_sum / attn_norm_host.len().max(1) as f64,
-                        fn_sum / ffn_host.len().max(1) as f64,
-                        &ffn_host[..5.min(ffn_host.len())],
-                    );
-                }
-            }
-
             // Fused FFN-norm + router. When the V3 fused kernel is
             // loaded and LUMEN_CUDA_MOE_FUSED_NORM_ROUTER=1, the standalone
             // RMSNorm dispatch is collapsed into the router kernel (saves 1
@@ -3049,24 +2997,7 @@ impl CudaBackend {
             // accumulation. Ported from `metal::moe::encode_shared_expert_ffn_decode_raw`.
             // Without this dispatch, the FFN is missing a typically-dominant
             // residual term and the model output is gibberish (prior reproduction).
-            //
-            // Env-var bisection knob: `LUMEN_CUDA_SKIP_SHARED_EXPERT=1` skips
-            // the dispatch (reverts to routed-only behavior). Used to
-            // confirm that the dispatch is what changes output behavior.
-            // cache via OnceLock to avoid per-layer env::var overhead
-            // (~40 calls/token × 5 µs = 0.2 ms saved).
-            let skip_shared = {
-                use std::sync::OnceLock;
-                static FLAG: OnceLock<bool> = OnceLock::new();
-                *FLAG.get_or_init(|| {
-                    std::env::var("LUMEN_CUDA_SKIP_SHARED_EXPERT")
-                        .ok()
-                        .as_deref()
-                        .map(|v| matches!(v, "1" | "true" | "yes"))
-                        .unwrap_or(false)
-                })
-            };
-            if moe_meta.shared_gate.is_some() && !skip_shared {
+            if moe_meta.shared_gate.is_some() {
                 // opt-in fused shared-expert path (3 launches vs 5-6).
                 // Falls back to legacy unfused path if any of the 3 fused
                 // kernels failed to compile (NVRTC failure on this device).
@@ -3080,53 +3011,6 @@ impl CudaBackend {
                     &mut st.scratch.x_gpu.slice_mut(..),
                     hidden_dim,
                 )?;
-            }
-
-            // FIX-3 DEBUG: dump x_gpu and attn_proj magnitude per layer to bisect.
-            // Print on first decode call for first few layers to identify which layer's
-            // dataflow goes haywire. Gated by `LUMEN_CUDA_MOE_DEBUG_DUMP=1`.
-            if {
-                use std::sync::OnceLock;
-                static FLAG: OnceLock<bool> = OnceLock::new();
-                *FLAG.get_or_init(|| {
-                    std::env::var("LUMEN_CUDA_MOE_DEBUG_DUMP").as_deref() == Ok("1")
-                })
-            } {
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                static COUNT: AtomicUsize = AtomicUsize::new(0);
-                let n = COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 80 {
-                    let x_host = self.device.dtoh_copy(&st.scratch.x_gpu)?;
-                    let ap_host = self.device.dtoh_copy(&st.scratch.attn_proj)?;
-                    let normed_host = self.device.dtoh_copy(&st.scratch.normed)?;
-                    let mut x_max = 0.0f32;
-                    let mut x_sum = 0.0f64;
-                    let mut x_nan = 0;
-                    for v in &x_host {
-                        x_max = x_max.max(v.abs());
-                        x_sum += v.abs() as f64;
-                        if !v.is_finite() {
-                            x_nan += 1;
-                        }
-                    }
-                    let mut ap_max = 0.0f32;
-                    let mut ap_sum = 0.0f64;
-                    for v in &ap_host {
-                        ap_max = ap_max.max(v.abs());
-                        ap_sum += v.abs() as f64;
-                    }
-                    let mut n_max = 0.0f32;
-                    let mut n_sum = 0.0f64;
-                    for v in &normed_host {
-                        n_max = n_max.max(v.abs());
-                        n_sum += v.abs() as f64;
-                    }
-                    eprintln!(
-                        "[MoE-DEBUG] call={n} layer={layer_idx} hidden={hidden_dim} | normed: max={n_max:.3} mean={:.3} | attn_proj: max={ap_max:.3} mean={:.3} | x_gpu: max={x_max:.3} mean={:.3} nans={x_nan} | first_5={:?}",
-                        n_sum / hidden_dim as f64, ap_sum / hidden_dim as f64, x_sum / hidden_dim as f64,
-                        &x_host[..5.min(x_host.len())],
-                    );
-                }
             }
 
             // [PROBE] Decode-vs-prefill localization (env LUMEN_MOE_PROBE=1).
@@ -7534,17 +7418,7 @@ impl CudaBackend {
             && st.kernels.moe_grouped_scatter_accum_q8_0.is_some()
             && super::moe::topk_moe_fused_kernel_for(&st.kernels, num_experts).is_some();
 
-        // Diagnostic (no-op unless set; PRODUCES GARBAGE OUTPUT — profiling only):
-        // skip the grouped routed FFN to measure the non-routed-FFN prefill floor
-        // (attention + GDN + router + norm + shared). Quantifies whether the
-        // remaining gap to 0.9× LC is the routed grouped GEMM
-        // or attention/GDN.
-        let skip_routed_diag = {
-            use std::sync::OnceLock;
-            static SR: OnceLock<bool> = OnceLock::new();
-            *SR.get_or_init(|| std::env::var("LUMEN_CUDA_MOE_SKIP_ROUTED").as_deref() == Ok("1"))
-        };
-        if use_batched_routed && !skip_routed_diag {
+        if use_batched_routed {
             // Engagement probe (no-op unless LUMEN_MOE_PROBE=1): definitively
             // proves the batched/grouped routed-FFN path ran for this layer.
             if {
@@ -7579,12 +7453,7 @@ impl CudaBackend {
         // Batched SHARED-expert FFN (replaces the per-token shared loop).
         // Engages only on the batched-routed path AND when the batched shared
         // kernels are loaded AND the shared expert is present. Bit-identical to
-        // the per-token unfused shared path. Skipped by LUMEN_CUDA_SKIP_SHARED_EXPERT.
-        let skip_shared_pf = std::env::var("LUMEN_CUDA_SKIP_SHARED_EXPERT")
-            .ok()
-            .as_deref()
-            .map(|v| matches!(v, "1" | "true" | "yes"))
-            .unwrap_or(false);
+        // the per-token unfused shared path.
         // The batched shared-expert kernels are Q4_0-only (the shared expert is Q4_0
         // in q8/q4 models). Guard on the shared gate's quant so a model whose shared
         // expert is NOT Q4_0 (e.g. a hypothetical bf16 shared) falls back to the
@@ -7595,7 +7464,6 @@ impl CudaBackend {
             .map(|s| s.quant == QuantScheme::Q4_0)
             .unwrap_or(false);
         let use_batched_shared = use_batched_routed
-            && !skip_shared_pf
             && shared_is_q4
             && st.kernels.shared_glu_gemv_q4_0_batched.is_some()
             && st.kernels.shared_dot_f32_batched.is_some()
@@ -7629,7 +7497,7 @@ impl CudaBackend {
                 }
                 // Skip the per-token routed dispatch + its probes; jump to the
                 // shared-expert block below using the same (off,end) slices.
-                if moe_meta.shared_gate.is_some() && !skip_shared_pf {
+                if moe_meta.shared_gate.is_some() {
                     let normed_view2 = pf.normed.slice(off..end);
                     let mut output_view2 = pf.x.slice_mut(off..end);
                     super::moe::encode_shared_expert_ffn_decode(
@@ -7728,14 +7596,7 @@ impl CudaBackend {
             // expert). Mirrors the decode-path dispatch at compute_layer_gpu.
             // Each prefill token runs the shared expert sigmoid-gated and
             // accumulates into pf.x[t..t+H] (the per-token output slice).
-            //
-            // Env-var bisection: `LUMEN_CUDA_SKIP_SHARED_EXPERT=1` to skip.
-            let skip_shared_pf = std::env::var("LUMEN_CUDA_SKIP_SHARED_EXPERT")
-                .ok()
-                .as_deref()
-                .map(|v| matches!(v, "1" | "true" | "yes"))
-                .unwrap_or(false);
-            if moe_meta.shared_gate.is_some() && !skip_shared_pf {
+            if moe_meta.shared_gate.is_some() {
                 let normed_view2 = pf.normed.slice(off..end);
                 let mut output_view2 = pf.x.slice_mut(off..end);
                 // opt-in fused path (same gating as decode).
@@ -14641,40 +14502,12 @@ impl ComputeBackend for CudaBackend {
             )?;
         }
 
-        // PREFILL STAGE TIMING (diagnostic, no-op when unset). When
-        // LUMEN_CUDA_PREFILL_STAGE_TIMING=1, the layer loop synchronizes the
-        // device around each stage class (GDN layer, full-attn block, FFN) and
-        // accumulates wall-clock ms per class, printed once on prefill exit.
-        // Purely produces evidence (added syncs perturb timing but localize the
-        // floor cost between GDN vs full-attn vs FFN). Byte-identical output.
-        let stage_timing = {
-            use std::sync::OnceLock;
-            static ST: OnceLock<bool> = OnceLock::new();
-            *ST.get_or_init(|| {
-                std::env::var("LUMEN_CUDA_PREFILL_STAGE_TIMING").as_deref() == Ok("1")
-            })
-        };
-        let mut stage_ms: std::collections::BTreeMap<&'static str, f64> =
-            std::collections::BTreeMap::new();
-        // Helper: when timing, sync + return elapsed ms since `t0`; else 0.0.
-        macro_rules! stage_sync_ms {
-            ($t0:expr) => {{
-                if stage_timing {
-                    self.device.synchronize()?;
-                    $t0.elapsed().as_secs_f64() * 1000.0
-                } else {
-                    0.0
-                }
-            }};
-        }
-
         // Step 2: Process all layers with batched GEMM for projections.
         for layer_idx in 0..num_layers {
             let lw = &st.layer_weights_cache[layer_idx];
 
             // ---- GDN LAYER: batched projections + sequential state update ----
             if lw.layer_type == 1 {
-                let _t0 = std::time::Instant::now();
                 self.prefill_gdn_layer(
                     layer_idx,
                     batch,
@@ -14683,16 +14516,10 @@ impl ComputeBackend for CudaBackend {
                     gdn_pf.as_mut().unwrap(),
                     eps,
                 )?;
-                if stage_timing {
-                    *stage_ms.entry("gdn_layer").or_default() += stage_sync_ms!(_t0);
-                }
                 continue;
             }
 
             // ---- STANDARD ATTENTION LAYER ----
-
-            // Stage-timing: mark start of attention portion (qkv proj + attn + wo).
-            let _t_attn = std::time::Instant::now();
 
             // 2a. Batched RMSNorm for QKV projections (always F32 path for precision).
             unsafe {
@@ -15178,12 +15005,6 @@ impl ComputeBackend for CudaBackend {
                     )?;
                 }
 
-                // Stage-timing: attention portion done; FFN begins.
-                if stage_timing {
-                    *stage_ms.entry("full_attn").or_default() += stage_sync_ms!(_t_attn);
-                }
-                let _t_ffn = std::time::Instant::now();
-
                 // 2g-2j. FFN (same as standard path) — MoE branch OR
                 // dense. See `prefill_moe_ffn_layer` doc-comment for context.
                 let is_moe_layer = lw.moe_layer_blob.is_some();
@@ -15275,9 +15096,6 @@ impl ComputeBackend for CudaBackend {
                         .map_err(|e| {
                             RuntimeError::Compute(format!("dtod x<-attn_proj qgate prefill: {e}"))
                         })?;
-                }
-                if stage_timing {
-                    *stage_ms.entry("ffn").or_default() += stage_sync_ms!(_t_ffn);
                 }
                 continue; // Skip the standard path below
             }
@@ -15585,12 +15403,6 @@ impl ComputeBackend for CudaBackend {
                 )?;
             }
 
-            // Stage-timing: attention portion done; FFN begins (standard path).
-            if stage_timing {
-                *stage_ms.entry("full_attn").or_default() += stage_sync_ms!(_t_attn);
-            }
-            let _t_ffn = std::time::Instant::now();
-
             // 2g-2j. FFN — MoE branch OR dense.
             //
             // See `prefill_moe_ffn_layer` doc-comment for the design-gap
@@ -15695,29 +15507,6 @@ impl ComputeBackend for CudaBackend {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("dtod x<-attn_proj prefill: {e}"))
                     })?;
-            }
-            if stage_timing {
-                *stage_ms.entry("ffn").or_default() += stage_sync_ms!(_t_ffn);
-            }
-        }
-
-        // Stage-timing summary (diagnostic). Printed once per prefill when
-        // LUMEN_CUDA_PREFILL_STAGE_TIMING=1. ms totals are over all layers;
-        // per-token = total / batch. Localizes the prefill floor across the
-        // GDN / full-attn / FFN stage classes.
-        if stage_timing {
-            let total: f64 = stage_ms.values().sum();
-            eprintln!(
-                "[PREFILL-STAGE-TIMING] batch={batch} num_layers={num_layers} \
-                 total_ms={total:.2}"
-            );
-            for (name, ms) in &stage_ms {
-                eprintln!(
-                    "[PREFILL-STAGE-TIMING]   {name:<12} {ms:>9.2} ms  \
-                     {:>5.1}%  {:>7.4} ms/tok",
-                    100.0 * ms / total.max(1e-9),
-                    ms / batch as f64,
-                );
             }
         }
 

@@ -4761,23 +4761,6 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
         let use_v3b = moe_q4_v3b_enabled()
             && kernels.moe_batched_gate_up_swiglu_q4_0_v3b.is_some()
             && kernels.moe_batched_down_q4_0_v3b.is_some();
-        // diagnostic: confirm V3-Q4 path engaged (prints once).
-        {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static ANNOUNCED: AtomicBool = AtomicBool::new(false);
-            if !ANNOUNCED.swap(true, Ordering::Relaxed)
-                && std::env::var("LUMEN_CUDA_Q4_V3_TRACE").is_ok()
-            {
-                eprintln!(
-                    "Q4 V3 cooperative-CTA path ENGAGED ({})",
-                    if use_v3b {
-                        "V3b high-MLP, 1 row/CTA"
-                    } else {
-                        "V3 NR=4"
-                    }
-                );
-            }
-        }
         let bo = batched_offsets.unwrap();
         let gate_up_fn = if use_v3b {
             kernels
@@ -5500,20 +5483,7 @@ pub(crate) fn encode_shared_expert_ffn_decode(
     }
 
     // -- Step 5: sigmoid gate (if present) + accumulate into x_out. --
-    // FIX debug: LUMEN_CUDA_SKIP_SHARED_GATE=1 forces the non-gated
-    // residual_add path (ignores ffn_gate_inp_shexp). Used to bisect whether
-    // the sigmoid gate logit is the source of post-fix gibberish.
-    let skip_gate = std::env::var("LUMEN_CUDA_SKIP_SHARED_GATE")
-        .ok()
-        .as_deref()
-        .map(|v| matches!(v, "1" | "true" | "yes"))
-        .unwrap_or(false);
-    let gate_inp_opt = if skip_gate {
-        None
-    } else {
-        meta.ffn_gate_inp_shexp
-    };
-    if let Some(gate_inp_slice) = gate_inp_opt {
+    if let Some(gate_inp_slice) = meta.ffn_gate_inp_shexp {
         // Step 5a: dot product → shared_gate_scalar[0].
         let gis_off = gate_inp_slice.offset as usize;
         let gis_bytes = (hidden_dim * 4) as usize;

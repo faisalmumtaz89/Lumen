@@ -551,22 +551,10 @@ pub(crate) unsafe fn launch_gemm_projection(
             // restores llama-matching INT8 numerics so the products are correct.
             // Dense q8 keeps the faster HGEMM path (no router to amplify drift).
             // Env `LUMEN_CUDA_Q8_PROJ_MMQ=0|1` overrides the per-model default.
-            let mut mmq_enabled = match std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").ok().as_deref() {
+            let mmq_enabled = match std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").ok().as_deref() {
                 Some(v) => !matches!(v, "0" | "false" | "no"),
                 None => crate::runtime_defaults::model_is_moe(),
             };
-            // DIAGNOSTIC (LUMEN_CUDA_GDN_PROJ_HGEMM=1, no-op when unset): route
-            // ONLY the GDN-block projections (labels starting "gdn_") through the
-            // fast dequant->F16->HGEMM path, while FFN/expert/router projections
-            // keep MMQ INT8. Tests whether the GDN-projection INT8 fidelity is
-            // load-bearing for the 256-expert router (the documented reason MoE
-            // defaults ALL Q8 projections to MMQ). If the oracle stays
-            // byte-identical, GDN-only HGEMM is a safe ~+38% prefill win.
-            if label.starts_with("gdn_")
-                && std::env::var("LUMEN_CUDA_GDN_PROJ_HGEMM").as_deref() == Ok("1")
-            {
-                mmq_enabled = false;
-            }
             let use_mmq = mmq_enabled
                 && !force_alpha_beta_f32
                 && kernels.mmq_q8_0_batched.is_some()
@@ -987,13 +975,8 @@ pub(crate) unsafe fn launch_gemm_residual(
     // closed `qkv_pre_conv` drift 7700x; closes the residual
     // `linear_attn_out` drift (~0.226 max-abs persists with alone) by
     // extending the same MMQ math to this second Q8 projection site.
-    //
-    // Diagnostic sub-gate: LUMEN_CUDA_Q8_SSM_OUT_MMQ_OFF=1 disables ONLY the
-    // residual MMQ arm (used to A/B isolate the prior vs
-    //  Default-on when parent env is set.
     let q8_proj_mmq = std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").is_ok();
-    let ssm_out_mmq_off = std::env::var("LUMEN_CUDA_Q8_SSM_OUT_MMQ_OFF").is_ok();
-    let q8_residual_mmq = q8_proj_mmq && !ssm_out_mmq_off;
+    let q8_residual_mmq = q8_proj_mmq;
     let weight_is_q8raw = matches!(weight, GpuWeightBuf::Q8Raw(_));
     let prefer_mmq_over_f16cache = q8_residual_mmq
         && weight_is_q8raw

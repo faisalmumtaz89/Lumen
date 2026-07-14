@@ -61,9 +61,7 @@ The 12-flag CUDA production stack is **default-ON** (set any to `=0` to opt out)
 | `LUMEN_CUDA_Q8_PROJ_MMQ` | Q8 projection via MMQ |
 | `LUMEN_CUDA_Q8_SCALE_HW` | Native `LDG.E.U16` scale fetch for Q8 matvec (+0.4% Q8 decode) |
 | `LUMEN_CUDA_Q8_SPLIT` | Raw + split layout for Q8_0 weights (+4.5% Q8 decode) |
-| `LUMEN_CUDA_Q8_SSM_OUT_MMQ_OFF` | Disable MMQ for Q8 SSM-out |
 | `LUMEN_CUDA_SKIP_BF16_PROBE` | Skip BF16 GemmEx capability probe at startup |
-| `LUMEN_CUDA_SKIP_SHARED_EXPERT` / `_GATE` | Skip shared-expert path / gate (debug) |
 
 ### CUDA — MoE correctness defaults (auto-ON for MoE, no-op for dense)
 
@@ -91,9 +89,7 @@ Set any to `=0` to opt out on MoE, `=1` to force on.
 | `LUMEN_CUDA_DECODE_DELAY_US` | CPU sleep (µs) after `device.synchronize()` per decode step; serializes inter-step submission to close a GPU-scheduler timing race for MoE Q4 server determinism. Default is `50` on `lumen-server` (applied automatically) and `0` on the `lumen run` CLI, which is deterministic without it. |
 | `LUMEN_CUDA_LEGACY_DEFAULTS` | Roll back to legacy default values |
 | `LUMEN_CUDA_MAX_SEQ_LEN` | Cap KV-cache max sequence length |
-| `LUMEN_CUDA_MOE_DEBUG_DUMP` | Dump MoE intermediate tensors |
 | `LUMEN_CUDA_PROFILE` | Enable CUDA-side profiling |
-| `LUMEN_CUDA_Q4_V3_TRACE` | Trace Q4 V3 kernel dispatch |
 | `LUMEN_CUDA_VERBOSE` | Verbose CUDA backend logging |
 
 ### Metal — perf levers (default-ON, opt-out via `LUMEN_METAL_DEFAULTS_OFF=1`)
