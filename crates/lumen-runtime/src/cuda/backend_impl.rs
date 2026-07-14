@@ -996,6 +996,16 @@ fn bf16_gemmex_env_force_off() -> bool {
     })
 }
 
+/// Cached `LUMEN_MOE_PROBE=1` gate for the CUDA MoE/GDN decode-vs-prefill
+/// diagnostics ([PROBE] / [GDNSTATE] / [XCHK] / rope probes). Default OFF ->
+/// byte-identical output; when set, every probe site prints. The env is read
+/// once for the whole process (previously each probe site had its own
+/// `OnceLock`; the cached result is identical since the env is constant).
+fn moe_probe_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
+}
+
 /// CUDA port of the Metal decode-delay fix.
 ///
 /// Returns the configured per-decode-step delay in microseconds. `0` (the
@@ -3017,11 +3027,7 @@ impl CudaBackend {
             // compute_layer_gpu is the DECODE path (1 token). Dumps this token's
             // post-layer residual (x_gpu) and attention output (attn_proj) so it
             // can be compared against the batched prefill of the same position.
-            if {
-                use std::sync::OnceLock;
-                static PF: OnceLock<bool> = OnceLock::new();
-                *PF.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
-            } {
+            if moe_probe_enabled() {
                 let xh = self.device.dtoh_copy(&st.scratch.x_gpu)?;
                 let ah = self.device.dtoh_copy(&st.scratch.attn_proj)?;
                 let k = 16usize;
@@ -5034,11 +5040,7 @@ impl CudaBackend {
         // (decode bf16 cuBLAS GEMV N=1 vs prefill bf16 cuBLAS GEMM N=batch),
         // separated from the GDN recurrence (incremental vs batched scan).
         // Mirrors the prefill [GDNPROJSS] dump in prefill_gdn_layer.
-        if {
-            use std::sync::OnceLock;
-            static GP: OnceLock<bool> = OnceLock::new();
-            *GP.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
-        } {
+        if moe_probe_enabled() {
             let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
             let qkv_h = self.device.dtoh_copy(&gdn.qkv_buf)?;
             let alpha_h = self.device.dtoh_copy(&gdn.alpha_raw_buf)?;
@@ -5174,10 +5176,7 @@ impl CudaBackend {
 
             // [GDNSTATE] one-time path diagnostic (env LUMEN_MOE_PROBE=1).
             {
-                use std::sync::OnceLock;
-                static PD: OnceLock<bool> = OnceLock::new();
-                let probe =
-                    *PD.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"));
+                let probe = moe_probe_enabled();
                 static SHOWN: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if probe && !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -5291,11 +5290,7 @@ impl CudaBackend {
             }
 
             // [GDNSTATE] mode=D phase=before (env LUMEN_MOE_PROBE=1).
-            let gdnstate_probe_vp = {
-                use std::sync::OnceLock;
-                static GSV: OnceLock<bool> = OnceLock::new();
-                *GSV.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
-            };
+            let gdnstate_probe_vp = moe_probe_enabled();
             if gdnstate_probe_vp {
                 let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
                 let h_before = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
@@ -5524,11 +5519,7 @@ impl CudaBackend {
             // token state discriminates H1 (carried-state-build differs) from
             // H2 (per-step update differs given equal prior state). Mirrors the
             // prefill [GDNSTATE] dump in prefill_gdn_layer.
-            let gdnstate_probe = {
-                use std::sync::OnceLock;
-                static GS: OnceLock<bool> = OnceLock::new();
-                *GS.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
-            };
+            let gdnstate_probe = moe_probe_enabled();
             if gdnstate_probe {
                 let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
                 let h_before = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
@@ -5633,10 +5624,7 @@ impl CudaBackend {
             // OFF -> byte-identical). Confirms the megakernel eager branch is the
             // ACTIVE decode path AND whether the F64 twin is selected/compiled.
             {
-                use std::sync::OnceLock;
-                static PD: OnceLock<bool> = OnceLock::new();
-                let probe =
-                    *PD.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"));
+                let probe = moe_probe_enabled();
                 static SHOWN: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if probe && !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -5676,11 +5664,7 @@ impl CudaBackend {
             // megakernel step. The H1/H2 discriminator vs the prefill
             // [GDNSTATE] mode=P dump. (This is the ACTIVE default decode
             // path: gdn_decode_megakernel, eager.)
-            let gdnstate_probe_mega = {
-                use std::sync::OnceLock;
-                static GSM: OnceLock<bool> = OnceLock::new();
-                *GSM.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
-            };
+            let gdnstate_probe_mega = moe_probe_enabled();
             if gdnstate_probe_mega {
                 let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
                 let h_before = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
@@ -6336,11 +6320,7 @@ impl CudaBackend {
         // the projection KERNEL divergence (GEMV N=1 vs GEMM N=batch) from the
         // recurrence. Only layer 0 (where the projection input is just the
         // token embedding) gives a clean kernel-only comparison.
-        if {
-            use std::sync::OnceLock;
-            static GPP: OnceLock<bool> = OnceLock::new();
-            *GPP.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
-        } {
+        if moe_probe_enabled() {
             let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
             let qkv_h = self.device.dtoh_copy(&gdn_pf.qkv)?;
             let alpha_h = self.device.dtoh_copy(&gdn_pf.alpha_raw)?;
@@ -6730,10 +6710,7 @@ impl CudaBackend {
                 // incremental recurrence) is the H1/H2 discriminator. Mirrors
                 // the decode [GDNSTATE] dump in compute_gdn_attention_gpu_impl.
                 {
-                    use std::sync::OnceLock;
-                    static GSP: OnceLock<bool> = OnceLock::new();
-                    let on =
-                        *GSP.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"));
+                    let on = moe_probe_enabled();
                     if on {
                         let ss =
                             |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
@@ -7421,11 +7398,7 @@ impl CudaBackend {
         if use_batched_routed {
             // Engagement probe (no-op unless LUMEN_MOE_PROBE=1): definitively
             // proves the batched/grouped routed-FFN path ran for this layer.
-            if {
-                use std::sync::OnceLock;
-                static BP: OnceLock<bool> = OnceLock::new();
-                *BP.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
-            } {
+            if moe_probe_enabled() {
                 eprintln!(
                     "[BATCHED-ROUTED] layer={layer_idx} batch={batch} top_k={top_k} \
                      num_experts={num_experts} engaged=1"
@@ -7543,11 +7516,7 @@ impl CudaBackend {
             // default prefill V2 path: `router_logits` is populated by the
             // parallel `moe_router_logits_v2` launch, `expert_weights` by the
             // top-K finalize, and `expert_output_buf` by the batched-down launch.
-            if t + 1 == batch && {
-                use std::sync::OnceLock;
-                static MS: OnceLock<bool> = OnceLock::new();
-                *MS.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
-            } {
+            if t + 1 == batch && moe_probe_enabled() {
                 // Ensure all router/FFN kernels for this token have completed
                 // before reading their output buffers back to the host.
                 self.device.synchronize()?;
@@ -7582,11 +7551,7 @@ impl CudaBackend {
 
             // [PROBE-RT] prefill routing: selected expert IDs + gate weights per
             // token, to compare against the decode router (env LUMEN_MOE_PROBE=1).
-            if {
-                use std::sync::OnceLock;
-                static RT: OnceLock<bool> = OnceLock::new();
-                *RT.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
-            } {
+            if moe_probe_enabled() {
                 let ids = self.device.dtoh_copy(&moe_scratch.expert_ids)?;
                 let ws = self.device.dtoh_copy(&moe_scratch.expert_weights)?;
                 eprintln!("[PROBE-RT] mode=P pos={t} layer={layer_idx} ids={ids:?} w={ws:?}");
@@ -7617,11 +7582,7 @@ impl CudaBackend {
         // per-token layer-output residual; pf.attn_proj = attention output
         // (still intact before Step 3). Dump EVERY position so a single prefill
         // run gives the no-cache reference for every decode position.
-        if {
-            use std::sync::OnceLock;
-            static PF2: OnceLock<bool> = OnceLock::new();
-            *PF2.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
-        } {
+        if moe_probe_enabled() {
             let xh = self.device.dtoh_copy(&pf.x)?;
             let ah = self.device.dtoh_copy(&pf.attn_proj)?;
             let k = 16usize;
@@ -14703,11 +14664,7 @@ impl ComputeBackend for CudaBackend {
                 let rotary_dim_pf = hp.rotary_dim.unwrap_or(0) as u32;
                 // [ROPEPROBE] dump pre/post-rope Q for full-attn layers (last token,
                 // head 0, first 16 dims) to compare vs llama.cpp Qcur_normed/Qcur.
-                let ropeprobe = {
-                    use std::sync::OnceLock;
-                    static RP: OnceLock<bool> = OnceLock::new();
-                    *RP.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
-                };
+                let ropeprobe = moe_probe_enabled();
                 let qd = num_heads * head_dim;
                 if ropeprobe && batch > 1 {
                     let qh = self.device.dtoh_copy(&pf.q)?;

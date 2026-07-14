@@ -2404,6 +2404,21 @@ impl MetalF32Backend {
     ///
     /// Extends Option A from streaming-only to GPU-resident mode.
     /// Expected 2.5-3x decode speedup for Mixtral 8x7B (2/8 experts = 75% skip).
+    ///
+    /// LIVENESS (Track-C flag-cleanup reachability trace, 2026-07-14): DEAD on
+    /// every production path — reachable only from unit tests. The live decode
+    /// trait routes `decode_token` -> `decode_token_single_cb` and
+    /// `decode_token_greedy` -> `decode_token_greedy_lean`; that lean path only
+    /// reaches `decode_token_greedy_core(None)` (this fn's sole non-test caller,
+    /// via the inherent `decode_token_greedy`) under `LUMEN_METAL_DECODE_PROFILE=1`
+    /// (decode_greedy.rs:3119). Even then the `use_option_a && !has_batched` guard
+    /// (decode_greedy.rs:142) never fires: `has_batched` =
+    /// `moe_batched_gate_up_swiglu_q4_0.is_some()`, and that kernel is
+    /// unconditionally compiled into the metallib (pipelines.rs:491), so
+    /// `!has_batched` is always false on a functioning Metal backend. `--option-a`
+    /// is required too. NOT deleted (out of scope for this wave; recorded for a
+    /// dedicated strand wave + battery). Deleting it would NOT free
+    /// `encode_gdn_layer_decode` — prefill + compute_layer keep that live.
     pub fn decode_token_option_a_gpu_resident(
         &self,
         token_id: u32,
