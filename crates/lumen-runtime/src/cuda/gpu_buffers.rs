@@ -738,12 +738,36 @@ fn upload_tensor(
             Ok(GpuWeightBuf::F32(gpu_buf))
         }
         QuantScheme::Bf16 => {
-            // Upload raw BF16 bytes (2 bytes per element). The custom matvec_bf16
-            // kernel dequantizes bf16→f32 on the fly. Bandwidth: 2 B/elem
-            // (same as F16) -- 2x lower than F32 dispatch, with full F32 dynamic
-            // range. Industry-standard precision for modern LLM inference.
-            let gpu_buf = device.htod_copy(raw)?;
-            Ok(GpuWeightBuf::Bf16Raw(gpu_buf))
+            // BF16 layer weights are dequantized to F32 at load and consumed via the
+            // F32 SGEMM path (the same proven path q8/q4 GDN models already use for
+            // prefill projections).
+            //
+            // ROOT CAUSE (bf16 CUDA decode garble, [209489,248046] "administrasi"+EOS):
+            // the native cuBLAS bf16 GemmEx path (`launch_cublas_gemm_bf16` /
+            // `launch_hgemv_bf16`: CUDA_R_16BF operands + CUBLAS_COMPUTE_32F) that
+            // consumed `Bf16Raw` layer weights produced numerically wrong results on
+            // A100 — corrupting every prefill projection, so the very first sampled
+            // token (`compute_final(prefill(prompt))`) was already garbage. It went
+            // unnoticed because bf16 CUDA was only ever throughput-benched, never
+            // coherence-checked. Routing bf16 layer weights through F32 (this dequant)
+            // yields coherent output; verified on A100 (LUMEN_CUDA_BF16_FORCE_F32
+            // localization: byte-garble -> coherent 89-token generation).
+            //
+            // The dequant is LOSSLESS (bf16 is the top 16 bits of an IEEE-754 f32:
+            // `bits << 16`), so the F32 compute is at least as accurate as native bf16
+            // would be. Cost: layer weights occupy 4 B/elem instead of 2 B/elem in
+            // VRAM (fits on 80 GB with LUMEN_CUDA_MAX_SEQ_LEN capped, which bf16
+            // already requires). A VRAM-neutral successor (per-projection bf16->f32
+            // dequant into `dequant_scratch` + SGEMM, mirroring the Q8Raw arm) is a
+            // follow-up once a `dequant_bf16_to_f32` GPU kernel is added.
+            let n = raw.len() / 2;
+            let mut f32_data = vec![0.0f32; n];
+            for i in 0..n {
+                let bits = (raw[2 * i] as u16) | ((raw[2 * i + 1] as u16) << 8);
+                f32_data[i] = f32::from_bits((bits as u32) << 16);
+            }
+            let gpu_buf = device.htod_copy(&f32_data)?;
+            Ok(GpuWeightBuf::F32(gpu_buf))
         }
         other => {
             // Catch-all for K-quant and other unsupported quant schemes:
