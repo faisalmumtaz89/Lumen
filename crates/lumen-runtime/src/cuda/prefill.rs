@@ -882,17 +882,14 @@ pub(crate) unsafe fn launch_gemm_projection(
                 label,
             )?;
         }
-        // split-layout: / TILE: prefill never dispatches against
-        // Q8Split/Q4Split/Q8Tile/Q4Tile siblings. These are decode-only
-        // reorganizations; the prefill path operates on the original AoS
-        // Q8Raw/Q4Raw via dequant->F16->cuBLAS HGEMM. If we somehow get
-        // here the caller has confused decode/prefill dispatch.
-        GpuWeightBuf::Q8Split(_)
-        | GpuWeightBuf::Q4Split(_)
-        | GpuWeightBuf::Q8Tile(_)
-        | GpuWeightBuf::Q4Tile(_) => {
+        // split-layout: prefill never dispatches against Q8Split/Q4Split
+        // siblings. These are decode-only reorganizations; the prefill path
+        // operates on the original AoS Q8Raw/Q4Raw via dequant->F16->cuBLAS
+        // HGEMM. If we somehow get here the caller has confused decode/prefill
+        // dispatch.
+        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
-                "prefill GEMM {label}: Q8Split/Q4Split/Q8Tile/Q4Tile sibling \
+                "prefill GEMM {label}: Q8Split/Q4Split sibling \
                  routed to prefill; prefill must use the original Q8Raw/Q4Raw \
                  buffer (dequant->HGEMM path)",
             )));
@@ -1380,14 +1377,11 @@ pub(crate) unsafe fn launch_gemm_residual(
                 label,
             )?;
         }
-        // split-layout: / TILE: prefill never dispatches against
-        // Q8Split/Q4Split/Q8Tile/Q4Tile siblings.
-        GpuWeightBuf::Q8Split(_)
-        | GpuWeightBuf::Q4Split(_)
-        | GpuWeightBuf::Q8Tile(_)
-        | GpuWeightBuf::Q4Tile(_) => {
+        // split-layout: prefill never dispatches against Q8Split/Q4Split
+        // siblings.
+        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
-                "prefill residual GEMM {label}: Q8Split/Q4Split/Q8Tile/Q4Tile \
+                "prefill residual GEMM {label}: Q8Split/Q4Split \
                  sibling routed to prefill; prefill must use the original \
                  Q8Raw/Q4Raw buffer",
             )));
@@ -2427,14 +2421,11 @@ unsafe fn launch_matvec_slice(
                 .launch(launch_cfg)
                 .map_err(|e| RuntimeError::Compute(format!("matvec BF16 {label} prefill: {e}")))?;
         }
-        // split-layout: / TILE: prefill never dispatches against
-        // Q8Split/Q4Split/Q8Tile/Q4Tile siblings.
-        GpuWeightBuf::Q8Split(_)
-        | GpuWeightBuf::Q4Split(_)
-        | GpuWeightBuf::Q8Tile(_)
-        | GpuWeightBuf::Q4Tile(_) => {
+        // split-layout: prefill never dispatches against Q8Split/Q4Split
+        // siblings.
+        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
-                "matvec prefill fallback {label}: Q8Split/Q4Split/Q8Tile/Q4Tile \
+                "matvec prefill fallback {label}: Q8Split/Q4Split \
                  sibling routed to prefill",
             )));
         }
@@ -3058,14 +3049,11 @@ unsafe fn launch_matvec_residual_slice(
                     RuntimeError::Compute(format!("matvec+res BF16 {label} prefill: {e}"))
                 })?;
         }
-        // split-layout: / TILE: prefill never dispatches against
-        // Q8Split/Q4Split/Q8Tile/Q4Tile siblings.
-        GpuWeightBuf::Q8Split(_)
-        | GpuWeightBuf::Q4Split(_)
-        | GpuWeightBuf::Q8Tile(_)
-        | GpuWeightBuf::Q4Tile(_) => {
+        // split-layout: prefill never dispatches against Q8Split/Q4Split
+        // siblings.
+        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
-                "matvec+residual prefill fallback {label}: Q8Split/Q4Split/Q8Tile/Q4Tile \
+                "matvec+residual prefill fallback {label}: Q8Split/Q4Split \
                  sibling routed to prefill",
             )));
         }

@@ -9339,16 +9339,12 @@ unsafe fn launch_matvec(
                 "Q4Aligned weight reached fallback match in matvec {label} — dp4a kernels unavailable"
             )));
         }
-        // split-layout: / TILE: Q8Split/Q4Split/Q8Tile/Q4Tile are sibling
-        // buffers consumed only by `launch_matvec_preq8_1_split` (or its
-        // tile-aware wrapper). Reaching the base `launch_matvec` means the
-        // caller passed a sibling as the base weight, which is a bug.
-        GpuWeightBuf::Q8Split(_)
-        | GpuWeightBuf::Q4Split(_)
-        | GpuWeightBuf::Q8Tile(_)
-        | GpuWeightBuf::Q4Tile(_) => {
+        // split-layout: Q8Split/Q4Split are sibling buffers consumed only by
+        // `launch_matvec_preq8_1_split`. Reaching the base `launch_matvec`
+        // means the caller passed a sibling as the base weight, which is a bug.
+        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
-                "Q8Split/Q4Split/Q8Tile/Q4Tile sibling reached fallback match in matvec {label} — \
+                "Q8Split/Q4Split sibling reached fallback match in matvec {label} — \
                  caller must dispatch via launch_matvec_preq8_1_split"
             )));
         }
@@ -9965,16 +9961,13 @@ unsafe fn launch_matvec_residual(
                 "Q4Aligned weight reached fallback match in matvec+residual {label} — dp4a kernels unavailable"
             )));
         }
-        // split-layout: / TILE: Q8Split/Q4Split/Q8Tile/Q4Tile are sibling
-        // buffers consumed only by `launch_matvec_residual_split` (or its
-        // tile-aware wrapper). Reaching the base `launch_matvec_residual`
-        // means the caller passed a sibling as the base weight, which is a bug.
-        GpuWeightBuf::Q8Split(_)
-        | GpuWeightBuf::Q4Split(_)
-        | GpuWeightBuf::Q8Tile(_)
-        | GpuWeightBuf::Q4Tile(_) => {
+        // split-layout: Q8Split/Q4Split are sibling buffers consumed only by
+        // `launch_matvec_residual_split`. Reaching the base
+        // `launch_matvec_residual` means the caller passed a sibling as the
+        // base weight, which is a bug.
+        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
-                "Q8Split/Q4Split/Q8Tile/Q4Tile sibling reached fallback match in matvec+residual {label} — \
+                "Q8Split/Q4Split sibling reached fallback match in matvec+residual {label} — \
                  caller must dispatch via launch_matvec_residual_split"
             )));
         }
@@ -15591,16 +15584,23 @@ impl ComputeBackend for CudaBackend {
 
             // Build the REPACKED aligned gate+up planes for the W10 wide-M
             // gate+up path. Runs AFTER upload so the GPU blob exists; reads raw
-            // Q8_0 weights via the repack kernels into aligned planes. The down
-            // planes are allocated but not launched (W10 does not consume them).
-            // Leaves the original blob byte-untouched.
+            // Q8_0 weights via the repack kernel into aligned planes. Leaves the
+            // original blob byte-untouched.
+            //
+            // Q8-ONLY GUARD: the repack (`moe_repack_gate_up_q8_0`, 34-byte Q8_0
+            // blocks) is consumed only by the Q8 W10 dispatch (`w10_enabled`
+            // requires `q8_path`). For Q4/BF16 MoE it would build ~1.5 GB/layer of
+            // Q8-layout planes over 18-byte Q4 blocks (OOB strides) that are never
+            // read — so gate the whole repack on Q8_0 experts.
             if super::moe::moe_repack_needed() && layer_idx < st.moe_meta_cache.len() {
-                if let Some(meta_ref) = st.moe_meta_cache[layer_idx].as_ref() {
+                if let Some(meta_ref) = st.moe_meta_cache[layer_idx]
+                    .as_ref()
+                    .filter(|m| m.expert_gate_quant == QuantScheme::Q8_0)
+                {
                     let num_experts = meta_ref.expert_down_offs.len();
                     let hidden_dim = hp_copy.hidden_dim as usize;
                     let inter_dim = hp_copy.intermediate_dim as usize;
                     // No fast-down path remains; only the W10 gate+up repack.
-                    let build_down = false;
                     let build_gate_up = super::moe::moe_gate_up_w10_enabled();
                     let repack_fn = st.kernels.moe_repack_down_q8_0.as_ref();
                     let repack_gu_fn = st.kernels.moe_repack_gate_up_q8_0.as_ref();
@@ -15618,7 +15618,6 @@ impl ComputeBackend for CudaBackend {
                             num_experts,
                             hidden_dim,
                             inter_dim,
-                            build_down,
                             build_gate_up,
                         )?;
                         st.moe_repacked[layer_idx] = Some(rp);
@@ -15626,7 +15625,7 @@ impl ComputeBackend for CudaBackend {
                             eprintln!(
                                 "[CUDA] W-infra: repacked planes built (layer 0: \
                                  E={num_experts} H={hidden_dim} I={inter_dim} \
-                                 down={build_down} gate_up={build_gate_up})"
+                                 gate_up={build_gate_up})"
                             );
                         }
                     }

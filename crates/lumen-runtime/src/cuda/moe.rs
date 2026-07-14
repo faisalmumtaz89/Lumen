@@ -75,33 +75,19 @@ pub(crate) struct CudaMoeBatchedOffsets {
     pub(crate) down_offsets: CudaSlice<u64>,
 }
 
-/// per-layer REPACKED aligned weight planes for the routed-FFN
-/// down projection. Built once at preload (after the layer blob is uploaded) by
-/// the `moe_repack_down_q8_0` kernel, which splits each raw Q8_0 down block
-/// (`{f16 scale}{32 int8}`, +2-byte-misaligned q) into two contiguous aligned
-/// planes:
-///   `d_q[e][kb][rt8]` = 8 rows x 32 int8 = 256 B  (char4-aligned, ldmatrix-ready)
-///   `d_s[e][kb][rt8]` = 8 half scales    =  16 B
-/// where `Kb = inter_dim/32`, `Rt = hidden_dim/8`. The `d_q`/`d_s` down planes
-/// are currently allocated for struct completeness but NOT consumed (the
-/// fast-down / IMMA down consumers were removed); only the gate+up planes feed
-/// the W10 wide-M path. The ORIGINAL layer blob is left byte-untouched.
+/// per-layer REPACKED aligned gate+up weight planes for the routed-FFN, built
+/// once at preload (after the layer blob is uploaded) by the
+/// `moe_repack_gate_up_q8_0` kernel, which splits each raw Q8_0 gate/up block
+/// into contiguous aligned (char4, ldmatrix-ready) q + half-scale planes that
+/// feed the W10 wide-M IMMA gate+up path. The ORIGINAL layer blob is left
+/// byte-untouched.
 ///
-/// Cost: one Q8_0-size copy of the down weights per MoE layer (~half the routed
-/// FFN weight bytes), built once. At E=256, I=1408, H=2048: Kb=44, Rt=256 ->
-/// d_q = 256*44*256*256 = 738 MB/layer; d_s = 256*44*256*8 = 23 MB/layer.
-/// Allocated whenever the repack runs (the W10 gate+up path).
+/// (The fast-down / IMMA down planes and their `d_q`/`d_s` fields were removed
+/// with their consumers — the W10 path consumes only the gate+up planes.)
 pub(crate) struct CudaMoeRepacked {
-    /// Repacked down q plane: `[num_experts * Kb * Rt * 256]` int8. Allocated
-    /// but currently unread (down consumers removed); retained for the struct.
-    #[allow(dead_code)]
-    pub(crate) down_q: CudaSlice<i8>,
-    /// Repacked down scale plane: `[num_experts * Kb * Rt * 8]` f16-bits (u16).
-    #[allow(dead_code)]
-    pub(crate) down_s: CudaSlice<u16>,
     /// repacked gate+up FUSED q plane `[E * Kb * Rt * 512]` int8 (gate then
     /// up), Kb=hidden_dim/32, Rt=inter_dim/8. `None` unless the IMMA gate+up
-    /// path is enabled (these planes cost ~2× the down planes).
+    /// path is enabled.
     pub(crate) gate_up_q: Option<CudaSlice<i8>>,
     /// repacked gate+up FUSED scale plane `[E * Kb * Rt * 16]` half (gate
     /// [0..7], up [8..15]).
@@ -188,14 +174,11 @@ pub(crate) struct CudaMoePrefillGrouped {
     /// Prefix-sum expert column bounds (M-tiled GEMM): expert e owns
     /// compact columns [expert_bounds[e], expert_bounds[e+1]). [num_experts+1] i32.
     pub(crate) expert_bounds: CudaSlice<i32>,
-    /// Capacity (num_experts) for which expert_bounds was sized.
-    pub(crate) cap_experts: usize,
-    /// flattened column-tile list for the tiled grouped gate+up kernel.
-    /// `[cap_tiles * 4]` i32, each entry {expert, col_start, col_count, pad}.
-    /// Built host-side from expert_bounds (one entry per ceil(cols_e/16) block).
+    /// flattened column-tile list for the tiled grouped gate+up kernel, sized
+    /// `(need_cols + num_experts) * 4` i32, each entry {expert, col_start,
+    /// col_count, pad}. Built host-side from expert_bounds (one entry per
+    /// ceil(cols_e/16) block).
     pub(crate) gate_up_tiles16: CudaSlice<i32>,
-    /// Capacity in tile entries for which gate_up_tiles16 was sized.
-    pub(crate) cap_tiles: usize,
     /// Batched router logits, [cap_tok * num_experts] F32 (topk input layout).
     pub(crate) router_logits_batched: CudaSlice<f32>,
     /// Batched expert ids, [cap_tok * num_experts] u32 (topk output: first top_k valid/row).
@@ -211,11 +194,10 @@ pub(crate) struct CudaMoePrefillGrouped {
     /// int8, `xq_d` = [Kb * cap_cols] f32. Allocated only when the W10 path is on.
     pub(crate) w10_xq_q: Option<CudaSlice<i8>>,
     pub(crate) w10_xq_d: Option<CudaSlice<f32>>,
-    /// W10 bucketed tile list, [cap_tiles_w10 * 4] i32, entries {col0,expert,row128,
-    /// cols_valid}, 4 buckets (MG=1..4) concatenated. Allocated only when W10 is on.
+    /// W10 bucketed tile list, `(need_cols + num_experts) * (inter_dim/128) * 4`
+    /// i32, entries {col0,expert,row128,cols_valid}, 4 buckets (MG=1..4)
+    /// concatenated. Allocated only when W10 is on.
     pub(crate) w10_tiles: Option<CudaSlice<i32>>,
-    /// Capacity (in tile entries) of `w10_tiles`.
-    pub(crate) cap_tiles_w10: usize,
 }
 
 /// Build per-layer MoE metadata from a layer's subtensor offsets.
@@ -300,28 +282,32 @@ pub(crate) fn build_batched_offsets(
     })
 }
 
-/// read `LUMEN_CUDA_MOE_GATE_UP_W10` once (default OFF). Gates BOTH the
-/// preload-time gate+up repack (shares the gu_q/gu_s planes) AND the dispatch of
-/// the register-C wide-M gate+up kernel + the one-time activation prequant.
+/// read `LUMEN_CUDA_MOE_GATE_UP_W10` once (**default-ON** kill-switch, v0.5 combo
+/// promotion; only `0`/`false`/`no` disables). Gates BOTH the preload-time
+/// gate+up repack (shares the gu_q/gu_s planes) AND the dispatch of the
+/// register-C wide-M gate+up kernel + the one-time activation prequant.
 ///
 /// Validated 2026-06-14: the register-C wide-M IMMA gate+up is +9.30% q8 MoE
 /// prefill (paired N=6 drop-warm, 1230.5 -> 1344.9 tok/s, stdev <1,
 /// xLC 0.3723 -> 0.4069) AND PRISTINE x3 (GQ-001 15/15 incl. 17x23=391 router
 /// canary, GQ-002 7/8, GQ-004 3/3 byte-reproducible x3, matching the gold
-/// moe-q8 CUDA baseline). NOT yet default-flipped because (a) it only has effect
-/// when the parent prefill-batched + grouped-tiled stack is active (those gates
-/// are quant-shared and a default-flip would change q4/bf16 prefill, requiring
-/// their own GQ validation first), and (b) defaulting this lever alone would
-/// force the preload gate+up repack (~0.5 GB) on every q8 MoE model even when the
-/// parent fast-prefill path is off (`moe_repack_needed`). The coordinated stack
-/// flip + q4/bf16 validation remains future work.
+/// moe-q8 CUDA baseline). Promoted default-ON as the 3.78x MoE-35B prefill combo
+/// (with `MOE_GROUPED_TILED` + `MOE_PREFILL_BATCHED`).
+///
+/// CAVEAT (Q8-only consumer): the W10 dispatch is gated on `q8_path` (see the
+/// `w10_enabled` guard), so it only ENGAGES for Q8_0 experts. The preload gate+up
+/// repack (`moe_repack_needed`) is NOT quant-gated, so for Q4/BF16 MoE it still
+/// builds ~1.5 GB/layer of gu planes that are never consumed — Q8-guard the
+/// preload repack before relying on default-ON for Q4/BF16 MoE.
 pub(crate) fn moe_gate_up_w10_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
-        matches!(
+        // Default-ON kill-switch (v0.5 combo promotion): only an explicit
+        // 0/false/no disables it; unset or any truthy value engages W10.
+        !matches!(
             std::env::var("LUMEN_CUDA_MOE_GATE_UP_W10").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes")
+            Some("0") | Some("false") | Some("no")
         )
     })
 }
@@ -341,47 +327,24 @@ pub(crate) fn moe_repack_needed() -> bool {
 /// is true (the W10 wide-M gate+up path).
 pub(crate) fn build_repacked_down(
     device: &super::ffi::CudaDevice,
-    repack_fn: &cudarc::driver::CudaFunction,
+    // `_repack_fn` (the `moe_repack_down_q8_0` handle) and `_down_offsets` are
+    // threaded from the caller only to keep the down-repack kernel handle live;
+    // the aligned down planes are no longer built (their consumers were removed
+    // in W4). Full removal of the down-repack kernel + its `.cu` is deferred to
+    // the CUDA strand-cleanup wave.
+    _repack_fn: &cudarc::driver::CudaFunction,
     repack_gu_fn: Option<&cudarc::driver::CudaFunction>,
     layer_buf: &CudaSlice<u8>,
-    down_offsets: &CudaSlice<u64>,
+    _down_offsets: &CudaSlice<u64>,
     gate_up_offsets: &CudaSlice<u64>,
     num_experts: usize,
     hidden_dim: usize,
     inter_dim: usize,
-    build_down: bool,
     build_gate_up: bool,
 ) -> Result<CudaMoeRepacked, RuntimeError> {
     use cudarc::driver::{LaunchConfig as CudarcLaunchConfig, PushKernelArg};
     let hd_u32 = hidden_dim as u32;
     let id_u32 = inter_dim as u32;
-
-    // --- Down planes: Kb=I/32, Rt=H/8, frag=256B q / 16B(8 half) scale. ---
-    // Always allocate (the struct requires them); only LAUNCH when build_down.
-    let kb_d = inter_dim / 32;
-    let rt_d = hidden_dim / 8;
-    let mut down_q = device.alloc_zeros::<i8>(num_experts * kb_d * rt_d * 256)?;
-    let mut down_s = device.alloc_zeros::<u16>(num_experts * kb_d * rt_d * 8)?;
-    if build_down {
-        let cfg = CudarcLaunchConfig {
-            grid_dim: (rt_d as u32, kb_d as u32, num_experts as u32),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            device
-                .stream
-                .launch_builder(repack_fn)
-                .arg(layer_buf)
-                .arg(down_offsets)
-                .arg(&mut down_q)
-                .arg(&mut down_s)
-                .arg(&hd_u32)
-                .arg(&id_u32)
-                .launch(cfg)
-                .map_err(|e| RuntimeError::Compute(format!("moe_repack_down_q8_0: {e}")))?;
-        }
-    }
 
     // --- Gate+up FUSED planes: Kb=H/32 (K dim), Rt=I/8, frag=512B q / 32B scale. ---
     let (gate_up_q, gate_up_s) = if build_gate_up {
@@ -416,8 +379,6 @@ pub(crate) fn build_repacked_down(
     };
 
     Ok(CudaMoeRepacked {
-        down_q,
-        down_s,
         gate_up_q,
         gate_up_s,
     })
@@ -447,19 +408,23 @@ pub(crate) fn moe_batched_enabled() -> bool {
 /// Gates the batched/grouped MoE PREFILL FFN path that replaces
 /// the per-token decode loop in `backend_impl.rs::prefill_moe_ffn_layer` with a
 /// single grouped-expert GEMM over all batch tokens (weights read once per
-/// expert, amortized across all its routed tokens). DEFAULT OFF until the path
-/// is bit-validated against the per-token loop and the quality suite stays
-/// PRISTINE; will flip ON after validation. Dense models never enter the MoE
-/// prefill path, so this flag is a no-op for them.
+/// expert, amortized across all its routed tokens). **Default-ON** kill-switch
+/// (v0.5 combo promotion; only `0`/`false`/`no` disables) — validated as part
+/// of the 3.78x MoE-35B prefill combo. NOT byte-identical to the per-token loop
+/// (grouped reduction reorders F32 accumulation); accepted at the GQ-PRISTINE /
+/// x_sumsq-oracle quality bar. Dense models never enter the MoE prefill path,
+/// so this flag is a no-op for them.
 pub(crate) fn moe_prefill_batched_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
-        matches!(
+        // Default-ON kill-switch (v0.5 combo promotion): only an explicit
+        // 0/false/no disables it; unset or any truthy value engages.
+        !matches!(
             std::env::var("LUMEN_CUDA_MOE_PREFILL_BATCHED")
                 .ok()
                 .as_deref(),
-            Some("1") | Some("true") | Some("yes")
+            Some("0") | Some("false") | Some("no")
         )
     })
 }
@@ -471,16 +436,19 @@ pub(crate) fn moe_prefill_batched_enabled() -> bool {
 /// (73% of prefill). NOT byte-identical to the per-column kernel (per-thread
 /// sequential F32 accumulation vs warp-tree regrouping; same per-32-block
 /// int32-dot->f32-scale terms) — gated by the x_sumsq oracle + router/token
-/// equivalence, same acceptance class as the tiled path. Default OFF.
+/// equivalence, same acceptance class as the tiled path. **Default-ON**
+/// kill-switch (v0.5 combo promotion; only `0`/`false`/`no` disables).
 pub(crate) fn moe_grouped_tiled_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
-        matches!(
+        // Default-ON kill-switch (v0.5 combo promotion): only an explicit
+        // 0/false/no disables it; unset or any truthy value engages.
+        !matches!(
             std::env::var("LUMEN_CUDA_MOE_GROUPED_TILED")
                 .ok()
                 .as_deref(),
-            Some("1") | Some("true") | Some("yes")
+            Some("0") | Some("false") | Some("no")
         )
     })
 }
@@ -1021,11 +989,9 @@ pub(crate) fn ensure_prefill_grouped(
         col_src_tok: device.alloc_zeros::<i32>(need_cols)?,
         dst_to_col: device.alloc_zeros::<i32>(need_cols)?,
         expert_bounds: device.alloc_zeros::<i32>(num_experts + 1)?,
-        cap_experts: num_experts,
         // worst-case tile count = sum_e ceil(cols_e/16) <= need_cols (each
         // expert with 1 col -> 1 tile) + num_experts slack. *4 i32 per tile entry.
         gate_up_tiles16: device.alloc_zeros::<i32>((need_cols + num_experts) * 4)?,
-        cap_tiles: need_cols + num_experts,
         router_logits_batched: device.alloc_zeros::<f32>(need_tok * num_experts)?,
         expert_ids_batched: device.alloc_zeros::<u32>(need_tok * num_experts)?,
         expert_weights_batched: device.alloc_zeros::<f32>(need_tok * top_k)?,
@@ -1048,10 +1014,6 @@ pub(crate) fn ensure_prefill_grouped(
             Some(device.alloc_zeros::<i32>((need_cols + num_experts) * r128 * 4)?)
         } else {
             None
-        },
-        cap_tiles_w10: {
-            let r128 = (inter_dim / 128).max(1);
-            (need_cols + num_experts) * r128
         },
     });
     Ok(())
@@ -2271,7 +2233,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         device.htod_copy_into(&expert_bounds_host, &mut g.expert_bounds)?;
         if !tiles16_host.is_empty() {
             // memcpy copies host_data.len() elems into the START of the buffer;
-            // kernel reads [0..num_tiles*4]. host len <= cap_tiles*4 by construction.
+            // kernel reads [0..num_tiles*4]. host len <= gate_up_tiles16 capacity
+            // ((need_cols + num_experts) * 4) by construction.
             device.htod_copy_into(&tiles16_host, &mut g.gate_up_tiles16)?;
         }
         if !w10_tiles_host.is_empty() {

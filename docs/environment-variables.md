@@ -96,6 +96,9 @@ Set any to `=0` to opt out. Model-aware defaults are noted per row.
 | `LUMEN_CUDA_Q4_SPLIT` | armed by `SOA_LOCKED` for Q4-dense (env A/B only) | kill-switch | Raw+split layout for Q4_0 weights (+9.0% Q4 decode); load-bearing under SoA-lock. | Leave as-is; the env read is A/B-only. |
 | `LUMEN_CUDA_Q8_PROJ_MMQ` | ON for MoE, OFF for dense (model-aware) | kill-switch | Q8 projection via MMQ. | `=0`/`=1` to A/B MMQ vs. matvec projection. |
 | `LUMEN_CUDA_SHARED_TILED` | ON (only `0/false/no` disables) | kill-switch | Shared-memory tiled path for the MoE shared expert. | `=0` to A/B the untiled shared expert. |
+| `LUMEN_CUDA_MOE_GATE_UP_W10` | ON, Q8 MoE (only `0/false/no` disables) | kill-switch | Wide-M IMMA gate+up MoE prefill kernel (+9.30% Q8 MoE prefill, PRISTINE ×3); member of the 3.78× MoE-35B prefill combo. Engages only for Q8 experts. Quality-equivalent to the per-token path (int8 activation prequant — **not** byte-identical). No-op on dense. | `=0` to disable the W10 gate+up path. |
+| `LUMEN_CUDA_MOE_GROUPED_TILED` | ON, MoE (only `0/false/no` disables) | kill-switch | Grouped-tiled MoE prefill GEMM; parent of the tiled-prefill stack (`MOE_DOWN_TILED_F32ACT`, `SHARED_TILED`). Quality-equivalent to the per-column path (grouped F32 reduction reorder — **not** byte-identical; x_sumsq-oracle + GQ-PRISTINE gated). No-op on dense. | `=0` to A/B the per-column MoE prefill. |
+| `LUMEN_CUDA_MOE_PREFILL_BATCHED` | ON, MoE (only `0/false/no` disables) | kill-switch | Batched/grouped MoE prefill dispatch (single grouped GEMM vs the per-token loop); combo member. Quality-equivalent, **not** byte-identical. No-op on dense. | `=0` to A/B the per-token MoE prefill loop. |
 
 ## CUDA — MoE correctness defaults (auto-ON for MoE, no-op for dense)
 
@@ -127,9 +130,6 @@ stays byte-identical to history. Set any to `=0` to opt out on MoE.
 | `LUMEN_CUDA_SKIP_BF16_PROBE` | OFF | config | Skip the BF16 GemmEx capability probe at startup. | `=1` under sanitizers / to skip the probe. |
 | `LUMEN_CUDA_PTX_CACHE_DIR` | `$LUMEN_CACHE_DIR/ptx` / XDG fallback | config | Override the compiled-PTX cache directory (empty-string guarded). | Point PTX cache at a writable path. |
 | `LUMEN_CUDA_LEGACY_DEFAULTS` | OFF (canonical defaults ON) | config | Roll every CUDA default back to its legacy value. | `=1` to reproduce a pre-optimization baseline. |
-| `LUMEN_CUDA_MOE_GATE_UP_W10` | OFF | config | Wide-10 gate/up MoE prefill kernel (validated +9.30% PRISTINE; part of the 3.78× MoE-35B prefill combo with `MOE_GROUPED_TILED` + `MOE_PREFILL_BATCHED`). | `=1` with the two combo flags to accelerate MoE prefill. |
-| `LUMEN_CUDA_MOE_GROUPED_TILED` | OFF | config | Grouped-tiled MoE prefill GEMM (combo member; owns the tiled-prefill stack). | `=1` as part of the MoE-prefill combo. |
-| `LUMEN_CUDA_MOE_PREFILL_BATCHED` | OFF | config | Batched MoE prefill dispatch (combo member). | `=1` as part of the MoE-prefill combo. |
 | `LUMEN_CUDA_MOE_DECODE_F32` | OFF | config | F32 MoE decode path. Retained pending the open BF16-MoE decode RCA. | `=1` only for the BF16-MoE decode investigation. |
 | `LUMEN_CUDA_MOE_DECODE_F32_FFN` | OFF | config | F32 MoE decode FFN path (pairs with `MOE_DECODE_F32`). Retained pending the open BF16-MoE decode RCA. | `=1` only for the BF16-MoE decode investigation. |
 

@@ -78,22 +78,6 @@ pub enum GpuWeightBuf {
     /// is preserved alongside for prefill. Consumed by `matvec_q4_split_q8_1`.
     #[allow(dead_code)]
     Q4Split(CudaSlice<u8>),
-    /// Repacked Q8_0 in per-row tile-grouped layout: each row holds
-    /// `num_tiles = nb / 8` tiles of 272 bytes (`[16 B scales][256 B quants]`),
-    /// for total `(nb/8) * 272 = 34 * nb` bytes (same density as `Q8Raw`).
-    ///
-    /// Vestigial placeholder: never constructed (the tile decode path was
-    /// removed). Retained so all match sites on `GpuWeightBuf` stay exhaustive.
-    #[allow(dead_code)]
-    Q8Tile(CudaSlice<u8>),
-    /// Repacked Q4_0 in per-row tile-grouped layout: each row holds
-    /// `num_tiles = nb / 8` tiles of 144 bytes (`[16 B scales][128 B nibbles]`),
-    /// for total `(nb/8) * 144 = 18 * nb` bytes (same density as `Q4Raw`).
-    ///
-    /// Vestigial placeholder: never constructed (the tile decode path was
-    /// removed). Retained so all match sites on `GpuWeightBuf` stay exhaustive.
-    #[allow(dead_code)]
-    Q4Tile(CudaSlice<u8>),
 }
 
 /// Per-layer weight buffers resident on GPU.
@@ -1172,11 +1156,6 @@ pub fn dequant_layer_q8_to_f16(
             // value in the base weight slot (currently sibling-only).
             GpuWeightBuf::Q8Split(q8) => (q8.len() / 34) * 32,
             GpuWeightBuf::Q4Split(q4) => (q4.len() / 18) * 32,
-            // Q8Tile / Q4Tile: same density as Q8Raw / Q4Raw (272 B / 8 blocks
-            // = 34 B/block; 144 B / 8 blocks = 18 B/block). Sibling-only;
-            // arithmetic mirrors the Split arms.
-            GpuWeightBuf::Q8Tile(q8) => (q8.len() / 34) * 32,
-            GpuWeightBuf::Q4Tile(q4) => (q4.len() / 18) * 32,
         }
     };
 
