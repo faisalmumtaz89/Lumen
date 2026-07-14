@@ -736,57 +736,22 @@ pub(crate) fn moe_fused_norm_router_enabled() -> bool {
     })
 }
 
-/// read `LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA` once via OnceLock.
-///
-/// When enabled (**default ON** for V2 path), the single-CTA
-/// `moe_router_fused_v2` kernel replaces `moe_router_fused_atomic_v2`.
-///
-/// **Why this exists** — introduced `moe_router_fused_atomic_v2`, an
-/// atomicAdd "last-CTA" router that runs all per-expert dot products in
-/// parallel across `num_experts` CTAs and lets the last-completing CTA do
-/// softmax+top-K. found it caused `CUDA_ERROR_ILLEGAL_ADDRESS` at
-/// prefill ≥16 tokens; added a defensive host-side `done_counter`
-/// reset but the crash persisted (defensive-zero hypothesis falsified).
-/// V3's identical `moe_router_rmsnorm_atomic_v3` (same atomicAdd pattern)
-/// did not crash — but the diagnostic test / ran only V3 in
-/// isolation; V2 specifically failed.
-///
-/// root-cause finding: the atomicAdd "last-CTA" pattern with a
-/// **persistent across-launch `done_counter` buffer** is a CUDA anti-pattern.
-/// Even with a host-side defensive zero, the counter is shared by N kernel
-/// launches on the same stream; subtle cross-launch reordering or
-/// reuse-of-stale-shmem (`s_is_last`) can leave `expert_ids[]` uninitialized
-/// when no CTA hits `prev+1 == num_experts`. Downstream
-/// `moe_batched_gate_up_swiglu_q8_0_v2` then reads garbage `expert_id`,
-/// indexes `gate_up_offsets[expert_id * 2]` out of bounds, and faults.
-///
-/// **Fix**: dispatch the alternative single-CTA `moe_router_fused_v2`
-/// kernel (loaded but never wired). Single
-/// CTA = no atomicAdd race. The kernel caches `normed_x` in shmem
-/// (`hidden_dim*4` bytes), then warp-parallelizes per-expert dot products
-/// (8 warps × 16 experts = 128 experts in ~16 sequential warp rounds).
-/// Empirically benchmarks at +1-3 μs/launch over the atomicAdd path, well
-/// within the 50% margin the perf budget allows.
-///
-/// **Default ON when V2 path is selected.** Opt-out with `=0` to dispatch
-/// the (currently broken) atomicAdd router.
-pub(crate) fn moe_router_single_cta_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA")
-            .ok()
-            .as_deref()
-            .map(|v| !matches!(v, "0" | "false" | "no"))
-            .unwrap_or(true)
-    })
-}
+// NOTE: `LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA` was deleted 2026-07-14 (flag-cleanup
+// retention audit). The single-CTA `moe_router_fused_v2` router is now the
+// hardcoded default — see the dispatch sites below. Its former `=0` off-arm
+// dispatched the atomicAdd "last-CTA" router (`moe_router_fused_atomic_v2`),
+// which faults with `CUDA_ERROR_ILLEGAL_ADDRESS` at prefill ≥16 tokens: a
+// persistent cross-launch `done_counter` can leave `expert_ids[]` uninitialized,
+// after which `moe_batched_gate_up_swiglu_q8_0_v2` indexes out of bounds. The
+// crash-on-set arm is removed (CONCURRENT_ENCODER_FULL precedent). The single-CTA
+// kernel caches `normed_x` in shmem and warp-parallelizes per-expert dot products
+// (+1-3 μs/launch over the atomicAdd path).
 
 /// read `LUMEN_CUDA_MOE_ROUTER_PARALLEL` once via OnceLock (default OFF).
 ///
 /// **Why this exists** — nsys profiling of Lumen MoE Q8 decode on A100
-/// found `moe_router_fused_v2` (the single-CTA router selected by
-/// `LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA=1`) consumes **49% of all GPU kernel time**
+/// found `moe_router_fused_v2` (the hardcoded single-CTA router)
+/// consumes **49% of all GPU kernel time**
 /// at 290.8 µs/instance — 6.5× llama.cpp's parallel `topk_moe_cuda<256>` router
 /// (44.5 µs/instance). Root cause: the single-CTA kernel launches grid=(1,1,1)
 /// (256 threads, 1 CTA), serializing all `num_experts` (256 for Qwen3.5-MoE)
@@ -1162,22 +1127,19 @@ pub(crate) fn encode_moe_ffn_decode(
 
     if use_v2 {
         let bo = batched_offsets.unwrap();
-        // prefer the single-CTA router when the kernel is loaded
-        // AND `LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA=1` (default ON). The atomicAdd
-        // last-CTA router (`moe_router_fused_atomic_v2`) crashes with
-        // `CUDA_ERROR_ILLEGAL_ADDRESS` at prefill ≥16 tokens (127);
-        // the single-CTA router eliminates the cross-launch atomicAdd
-        // race entirely. Opt out with `LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA=0`
-        // to use the atomicAdd path (currently broken).
-        // the parallel 2-launch router (logits-per-CTA + finalize)
-        // takes precedence over the single-CTA router when opted in. Both
-        // produce numerically identical expert_ids/expert_weights.
+        // The single-CTA router (`moe_router_fused_v2`) is the hardcoded default
+        // when its kernel is loaded (`LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA` deleted
+        // 2026-07-14). The atomicAdd last-CTA router (`moe_router_fused_atomic_v2`)
+        // crashes with `CUDA_ERROR_ILLEGAL_ADDRESS` at prefill ≥16 tokens; the
+        // single-CTA router eliminates the cross-launch atomicAdd race entirely.
+        // The parallel 2-launch router (logits-per-CTA + finalize) takes
+        // precedence over the single-CTA router when opted in
+        // (`LUMEN_CUDA_MOE_ROUTER_PARALLEL=1`). All produce numerically
+        // identical expert_ids/expert_weights.
         let use_router_parallel = moe_router_parallel_enabled()
             && kernels.moe_router_logits_v2.is_some()
             && kernels.moe_router_softmax_finalize_v2.is_some();
-        let use_router_single_cta = !use_router_parallel
-            && moe_router_single_cta_enabled()
-            && kernels.moe_router_fused_v2.is_some();
+        let use_router_single_cta = !use_router_parallel && kernels.moe_router_fused_v2.is_some();
         let router_atomic_fn = kernels.moe_router_fused_atomic_v2.as_ref().unwrap();
         let router_single_cta_fn = kernels.moe_router_fused_v2.as_ref();
         // V3: NR=4 tiling for gate_up + down. Falls back to V2 (NR=2) if V3 disabled
@@ -3253,16 +3215,16 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
 
     // ---- Fused-norm-router path availability ----
     //
-    // when `LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA=1` (default ON when
-    // the kernel is loaded), suppress the V3 fused-norm path entirely. The V3
-    // path uses `moe_router_rmsnorm_atomic_v3` which shares the V2 atomicAdd
-    // "last-CTA" race; downstream `moe_batched_gate_up_swiglu_q8_0_v2/v3`
-    // then reads uninitialized `expert_ids[]` and faults with
-    // `CUDA_ERROR_ILLEGAL_ADDRESS` at prefill ≥16 tokens or decode step ≥2.
-    // The single-CTA fallback path (standalone RMSNorm + `encode_moe_ffn_decode`
-    // with single-CTA router) is bit-equivalent and race-free.
-    let suppress_fused_v3_for_single_cta =
-        moe_router_single_cta_enabled() && kernels.moe_router_fused_v2.is_some();
+    // The single-CTA router is the hardcoded default when its kernel is loaded
+    // (`LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA` deleted 2026-07-14), so suppress the V3
+    // fused-norm path entirely. The V3 path uses `moe_router_rmsnorm_atomic_v3`
+    // which shares the V2 atomicAdd "last-CTA" race; downstream
+    // `moe_batched_gate_up_swiglu_q8_0_v2/v3` then reads uninitialized
+    // `expert_ids[]` and faults with `CUDA_ERROR_ILLEGAL_ADDRESS` at prefill ≥16
+    // tokens or decode step ≥2. The single-CTA path (standalone RMSNorm +
+    // `encode_moe_ffn_decode` with single-CTA router) is bit-equivalent and
+    // race-free.
+    let suppress_fused_v3_for_single_cta = kernels.moe_router_fused_v2.is_some();
     let use_fused_v3 = !suppress_fused_v3_for_single_cta
         && moe_batched_enabled()
         && moe_batched_v2_enabled()

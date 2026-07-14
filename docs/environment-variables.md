@@ -40,7 +40,7 @@ is `LUMEN_CUDA_BF16_GEMMEX=0` (required for BF16 P3 correctness on MoE).
 
 | Variable | Default | Category | Effect | When to touch |
 |---|---|---|---|---|
-| `LUMEN_KV_PRECISION` | backend: Metal `f16`, CUDA/CPU `f32` | config | KV-cache precision (`f16`/`f32`); invalid value warns + falls back. CLI `--kv-precision` wins. | Force `f32` on Metal for a numerical-parity check, or `f16` on CUDA to halve KV memory. |
+| `LUMEN_KV_PRECISION` | backend: Metal `f16`, CUDA/CPU `f32` | config | KV-cache precision (`f16`/`f32`); invalid value warns + falls back. CLI `--kv-precision` wins. **Metal is F16-only for the KV cache** — `f32` is rejected with a clear error (GPU-resident KV buffers are allocated F16); use `f32` only on CUDA/CPU. | `f16` on CUDA to halve KV memory; `f32` for a numerical-parity check on CUDA/CPU. |
 | `LUMEN_SUFFIX_THRESHOLD` | built-in `DEFAULT_SUFFIX_THRESHOLD` | config | Minimum shared-prefix length before suffix-prefill reuse engages (positive-int; warns + falls back on invalid). | Raise to suppress suffix reuse; lower to reuse shorter shared prefixes. |
 | `LUMEN_REPEAT_LAST_N` | unset = full-history window | config | Finite recent-token window for the repetition penalty (e.g. `64`). Byte-identical to history-wide at default. | Set a finite window to bound repetition-penalty scope. |
 | `LUMEN_REPETITION_PENALTY` | `1.05` dense / `1.03` MoE | config | Repetition penalty (server wire); bounds-checked (finite, `>0`). `=1.0` disables. | Tune output repetition; `=1.0` for pure greedy. |
@@ -81,7 +81,6 @@ Set any to `=0` to opt out. Model-aware defaults are noted per row.
 | `LUMEN_CUDA_MOE_Q4_V3` | ON (canonical) | kill-switch | MoE Q4 V3 FFN path. | `=0` to A/B the legacy MoE Q4 path. |
 | `LUMEN_CUDA_MOE_Q4_V3B` | ON (effective under V3) | kill-switch | MoE Q4 V3B refinement. | `=0` to drop the V3B refinement. |
 | `LUMEN_CUDA_MOE_ROUTER_PARALLEL` | ON | kill-switch | Parallel top-K MoE router. | `=0` to A/B the serial router. |
-| `LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA` | ON (`=0` broken; redundant when PARALLEL on) | kill-switch | Single-CTA top-K MoE router. | Leave ON — the `=0` arm dispatches a known-crashing atomicAdd router. |
 | `LUMEN_CUDA_TOPK_MOE_FUSED` | ON | kill-switch | Fused sigmoid+top-K+renorm router (+6–8% all MoE quants). | `=0` to A/B the unfused router. |
 | `LUMEN_CUDA_MOE_FUSED_NORM_ROUTER` | ON | kill-switch | Fused norm + router kernel. | `=0` to A/B the split norm/router. |
 | `LUMEN_CUDA_MOE_BF16_NATIVE` | ON (MoE-bf16 raw path) | kill-switch | Native BF16 MoE (no F32 upcast). | `=0` to force the F32-upcast MoE path. |
@@ -122,7 +121,7 @@ stays byte-identical to history. Set any to `=0` to opt out on MoE.
 | Variable | Default | Category | Effect | When to touch |
 |---|---|---|---|---|
 | `LUMEN_CUDA_DECODE_DELAY_US` | `0` (CLI) / `50` (server) | config | CPU sleep (µs) after `device.synchronize()` per decode step; serialises inter-step submission to close a GPU-scheduler timing race for MoE-Q4 server determinism. Unparseable → default; no upper clamp. | Raise on a server if MoE-Q4 determinism drifts; `0` on the deterministic CLI. |
-| `LUMEN_CUDA_MAX_SEQ_LEN` | unset = model max | config | Cap KV-cache max sequence length. No lower guard (`=0` caps at 0); non-numeric ignored. | Set to bound KV memory for long-context models. |
+| `LUMEN_CUDA_MAX_SEQ_LEN` | unset = model max | config | Cap KV-cache max sequence length. `=0` is treated as **no cap** (a 0-length KV cache previously faulted the GPU with an illegal address; guarded 2026-07-14); non-numeric ignored. | Set to bound KV memory for long-context models. |
 | `LUMEN_CUDA_ATTN_PRECISE` | numeric, model-aware: `2` (P@V-F32) for MoE + dense ≤32-layer, `0` (legacy F16 WMMA) for 27B-other | config | Attention accumulation precision. | Force `2` when debugging attention numerics. |
 | `LUMEN_CUDA_DECODE_TILED` | OFF (force-mode opt-in) | config | Force the tiled streaming-softmax decode kernel. | `=1` to exercise the tiled decode kernel. |
 | `LUMEN_CUDA_DECODE_TILED_THRESHOLD` | `0` (tiled-always) | config | Token threshold above which the tiled kernel engages; `4294967295` forces the single-block path. | Tune the tiled/single-block crossover. |
@@ -170,7 +169,7 @@ individual switches also accept `=0`.
 | `LUMEN_METAL_MMAP_ONLY` | ON (wrapper auto-enables) | kill-switch | No-copy `newBufferWithBytesNoCopy` model load — **required** for BF16 dense / Q8 MoE / Q4 MoE on M3 Ultra 96 GB to avoid OOM at load. | `=0` only on high-memory boxes to force the copy loader. |
 | `LUMEN_METAL_GDN_SSM_OUT_F32_BATCHED` | ON (opt-out) | kill-switch | F32 batched GDN ssm-out path. | `=0` to revert to the non-batched ssm-out. |
 | `LUMEN_METAL_MOE_PREFILL_GROUPED` | ON | kill-switch | Grouped MoE prefill dispatch (`=0` selects Option B). | `=0` to A/B the alternate MoE prefill. |
-| `LUMEN_METAL_MOE_ROUTER_PARALLEL` | ON | kill-switch | Parallel MoE router (`=0` → serial). | `=0` to A/B the serial router. |
+| `LUMEN_METAL_MOE_ROUTER_PARALLEL` | ON | kill-switch | Parallel MoE router (`=0` → serial). The parallel and serial routers diverge at greedy near-ties: the `=0` token stream is coherent but **not byte-identical** to the default. | `=0` to A/B the serial router. |
 | `LUMEN_METAL_MOE_GEMM_TILEMAP` | ON | kill-switch | Work-tile-map dispatch for the grouped MoE GEMM (byte-identical; only changes which TG computes which tile). | `=0` to A/B the legacy over-subscribed grid. |
 | `LUMEN_METAL_MOE_GATHER_VEC4` | ON | kill-switch | Float4-vectorized grouped gather/scatter (byte-exact; needs `hidden_dim % 4 == 0`). | `=0` to A/B the scalar gather. |
 | `LUMEN_METAL_MOE_ROUTE_SORT` | `atomic` | kill-switch | MoE route-sort strategy: `serial`/`0`, `par`/`1`, else atomic. | Set `serial`/`par` to A/B route-sort strategies. |
@@ -222,7 +221,7 @@ individual switches also accept `=0`.
 | `LUMEN_SPEC_DUMP_IDS` | OFF (stderr only) | diagnostic | Dumps raw generated token ids pre-filter (spec-decode acceptance / prefix feed). | Set for raw-id correctness forensics. |
 | `LUMEN_PREFILL_TIMING` | OFF | diagnostic | Prints prefill tok/s (server; MoE-prefill vs llama-bench pp). | Measure MoE prefill throughput. |
 | `LUMEN_DUMP_EXPERTS` | unset (no-op) | diagnostic | Dump per-expert routing decisions (adds a DtoH sync when set). | Set for MoE routing triage. |
-| `LUMEN_DUMP_GDN_L0_BIN` | unset (no writes) | diagnostic | Dump GDN layer-0 full-precision binaries. | Set for GDN correctness triage. |
+| `LUMEN_DUMP_GDN_L0_BIN` | unset (no writes) | diagnostic | Dump GDN layer-0 full-precision binaries. **Value is a directory path** (or `=all` for every GDN layer), *not* a boolean — set it to an existing writable directory, e.g. `/tmp/gdndump`. | Set to a dir for GDN correctness triage. |
 | `LUMEN_DUMP_NORMED` | unset (no-op) | diagnostic | Dump post-RMSNorm activations. | Set to inspect normed activations. |
 
 ---

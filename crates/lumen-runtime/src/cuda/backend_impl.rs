@@ -12561,7 +12561,11 @@ impl ComputeBackend for CudaBackend {
         let model_max_seq_len = hyperparams.max_seq_len as usize;
         let env_cap = std::env::var("LUMEN_CUDA_MAX_SEQ_LEN")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+            .and_then(|v| v.parse::<usize>().ok())
+            // `=0` would size the KV cache to 0 tokens and fault the KV-write
+            // kernel (CUDA_ERROR_ILLEGAL_ADDRESS / MMU fault). A zero cap is
+            // meaningless, so treat it as "no cap" (identical to unset).
+            .filter(|&cap| cap > 0);
         let max_seq_len = match env_cap {
             Some(cap) => model_max_seq_len.min(cap),
             None => model_max_seq_len,
