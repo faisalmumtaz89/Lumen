@@ -13,7 +13,22 @@
 #![cfg(feature = "cuda")]
 
 use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+
+// The aligned/hw dp4a kernels need an explicit SM target. Production loads them
+// via compile_and_load_with_arch("compute_80"); a plain NVRTC-default compile
+// emits PTX the driver rejects (CUDA_ERROR_INVALID_PTX) for __dp4a. Shadow bare
+// `compile_ptx` with an arch-targeted compile so call sites are unchanged.
+fn compile_ptx(src: &str) -> Result<cudarc::nvrtc::Ptx, String> {
+    compile_ptx_with_opts(
+        src,
+        CompileOptions {
+            arch: Some("compute_80"),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("{e:?}"))
+}
 
 // Kernel constants must match the .cu defines.
 const NR: u32 = 2;

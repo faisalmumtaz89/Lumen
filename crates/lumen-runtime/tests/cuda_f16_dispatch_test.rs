@@ -214,10 +214,15 @@ mod cuda_f16_tests {
         let result = std::panic::catch_unwind(|| CudaBackend::new(0));
         match result {
             Ok(Ok(backend)) => {
-                // CUDA available -- verify capabilities.
+                // CUDA available -- verify the fresh-backend caps contract.
+                // Caps are dynamic: batched_prefill and gpu_resident are
+                // advertised only after preload_weights (and batched_prefill
+                // additionally requires a GDN model). A freshly-constructed
+                // backend with no model loaded must report both false.
                 let caps = backend.caps();
-                assert!(caps.batched_prefill);
+                assert!(!caps.batched_prefill);
                 assert!(!caps.gpu_resident);
+                assert!(caps.gdn);
             }
             Ok(Err(_)) | Err(_) => {
                 // CUDA not available (error or panic) -- expected on macOS.
