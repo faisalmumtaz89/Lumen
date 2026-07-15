@@ -175,6 +175,34 @@ impl MetalF32Backend {
                 cursor as u64
             };
             let st = &layer_view.subtensors;
+            // Reject quant schemes the Metal backend has no dispatch kernels
+            // for BEFORE upload. Without this, a `--target generic` LBC (K-quant
+            // tensors intact, fine on CUDA) loads "successfully" and generates
+            // pad-token garbage — the dispatch catch-alls feed K-quant bytes to
+            // a non-K pipeline. Fail loudly with the remedy instead.
+            for (name, slice) in st.named_slices() {
+                if slice.length == 0 {
+                    continue;
+                }
+                match slice.quant {
+                    QuantScheme::F32
+                    | QuantScheme::F16
+                    | QuantScheme::Bf16
+                    | QuantScheme::Q8_0
+                    | QuantScheme::Q4_0
+                    | QuantScheme::Q4_1 => {}
+                    other => {
+                        return Err(RuntimeError::Compute(format!(
+                            "layer {layer} tensor '{name}' is {other:?}: the Metal \
+                             backend has no dispatch kernels for this quant scheme. \
+                             This LBC was converted for a different backend \
+                             (`--target generic`); re-convert with \
+                             `lumen convert --target metal` (K-quant layer tensors \
+                             are upcast to Q8_0)."
+                        )));
+                    }
+                }
+            }
             layer_metas.push(CachedLayerMeta {
                 attn_norm_off: base + st.attn_norm.offset,
                 wq_off: base + st.wq.offset,
