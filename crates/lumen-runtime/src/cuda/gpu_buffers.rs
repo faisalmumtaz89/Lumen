@@ -738,6 +738,24 @@ fn upload_tensor(
             Ok(GpuWeightBuf::F32(gpu_buf))
         }
         QuantScheme::Bf16 => {
+            // Architecture-gated bf16 upload. On sm_90+ (Hopper/H100) the native
+            // cuBLAS bf16 GemmEx path is numerically correct, so upload raw bf16
+            // (2 B/elem, VRAM-efficient) as `Bf16Raw` and consume it via the
+            // fully-wired native decode (matvec_bf16) + prefill GemmEx path. On
+            // sm_80 and below that same GemmEx bf16 path garbles every prefill
+            // projection (root cause below), so losslessly upcast to F32 (4 B/elem).
+            //
+            // VERIFIED 2026-07-15 on an H100 (cc 9.0): native bf16 is coherent
+            // (GQ-001/002/004 PASS for 9B/27B/MoE) and 2.14x faster than the
+            // F32-upcast (9B decode 113.4 vs 52.9 tok/s); the discriminator
+            // (native-vs-upcast, greedy) returned NATIVE-CORRECT-ON-H100. On sm_90+
+            // native is also VRAM-frugal enough to run 27B-bf16 (54 GB), which the
+            // F32-upcast (~108 GB) cannot fit on an 80 GB card at all.
+            let (cc_major, _cc_minor) = device.compute_capability().unwrap_or((0, 0));
+            if cc_major >= 9 {
+                let gpu_buf = device.htod_copy(raw)?;
+                return Ok(GpuWeightBuf::Bf16Raw(gpu_buf));
+            }
             // BF16 layer weights are dequantized to F32 at load and consumed via the
             // F32 SGEMM path (the same proven path q8/q4 GDN models already use for
             // prefill projections).
