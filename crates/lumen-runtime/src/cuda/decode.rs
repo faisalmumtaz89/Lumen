@@ -700,6 +700,14 @@ pub(crate) struct KernelSet {
     pub(crate) moe_shared_dot_f32: Option<CudaFunction>,
     pub(crate) moe_shared_sigmoid_gated_accum: Option<CudaFunction>,
     pub(crate) moe_shared_residual_accum: Option<CudaFunction>,
+    // Lever L2 "shared-expert fused decode" (default-OFF LUMEN_CUDA_SHARED_FUSED_DECODE).
+    // Batch=1-native fusion of the shared expert: gate+up+SwiGLU into one 2-stream
+    // GEMV, and down-matvec+sigmoid/residual-accum into one kernel. Same Q4_0/F32
+    // numerics as the naive matvec_q4_0 + swiglu_inplace path (byte-identical up to
+    // warp-reduction FP add ordering). All three live in moe_shared_accum.cu.
+    pub(crate) fused_glu_gemv_q4_0_prenormed_no_norm: Option<CudaFunction>,
+    pub(crate) moe_shared_down_q4_0_sigmoid_accum: Option<CudaFunction>,
+    pub(crate) moe_shared_down_q4_0_residual_accum: Option<CudaFunction>,
 }
 
 /// Compile all CUDA kernels via NVRTC and return the kernel function handles.
@@ -2874,6 +2882,49 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] moe_shared_residual_accum: FAILED: {e}");
+                None
+            }
+        },
+        // Lever L2 "shared-expert fused decode" kernels (default-OFF opt-in via
+        // LUMEN_CUDA_SHARED_FUSED_DECODE). Same MOE_SHARED_ACCUM module. If any
+        // fail to compile, the L2 dispatch delegates to the byte-identical naive
+        // `encode_shared_expert_ffn_decode`, so a load failure is not fatal.
+        fused_glu_gemv_q4_0_prenormed_no_norm: match load_fn(
+            shaders::MOE_SHARED_ACCUM_KERNEL_SOURCE,
+            "fused_glu_gemv_q4_0_prenormed_no_norm",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q4_0_prenormed_no_norm: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q4_0_prenormed_no_norm: FAILED: {e}");
+                None
+            }
+        },
+        moe_shared_down_q4_0_sigmoid_accum: match load_fn(
+            shaders::MOE_SHARED_ACCUM_KERNEL_SOURCE,
+            "moe_shared_down_q4_0_sigmoid_accum",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_shared_down_q4_0_sigmoid_accum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_shared_down_q4_0_sigmoid_accum: FAILED: {e}");
+                None
+            }
+        },
+        moe_shared_down_q4_0_residual_accum: match load_fn(
+            shaders::MOE_SHARED_ACCUM_KERNEL_SOURCE,
+            "moe_shared_down_q4_0_residual_accum",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] moe_shared_down_q4_0_residual_accum: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] moe_shared_down_q4_0_residual_accum: FAILED: {e}");
                 None
             }
         },

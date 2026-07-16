@@ -469,6 +469,41 @@ pub(crate) fn moe_shared_tiled_enabled() -> bool {
     })
 }
 
+/// DEFAULT-OFF gate for the FUSED shared-expert FFN on the **DECODE** path
+/// (`LUMEN_CUDA_SHARED_FUSED_DECODE`) — lever L2 "shared-expert fused decode".
+///
+/// When ON, decode's always-on shared expert runs the SAME Q4_0 matvec math as
+/// the naive `encode_shared_expert_ffn_decode` but through BATCH=1-NATIVE fused
+/// kernels: a 2-stream gate+up+SwiGLU GEMV (`fused_glu_gemv_q4_0_prenormed_no_norm`
+/// reads the pre-normed activation ONCE and streams both weight matrices) and a
+/// fused down-matvec+gated-accum (`moe_shared_down_q4_0_sigmoid_accum`), collapsing
+/// the naive path's 5-6 undersized `matvec_q4_0`/swiglu/accum launches to 2-3.
+///
+/// NOT the batch-TILED L1 path: those kernels tile 16 tokens/tile (BM16) and waste
+/// 15/16 of the tile at batch=1 (lever L1 measured -29.4% for exactly this reason).
+/// L2 uses one CTA per output row with the identical per-row reduction as
+/// `matvec_q4_0`, so it stays batch=1-efficient AND numerically byte-identical
+/// (F32 accumulate, Q4_0 weights — same quant/accumulate precision, only warp
+/// FP-add ordering differs vs the naive path; validated 10/10 byte-identical).
+///
+/// DEFAULT ON (kill-switch): the fused path is the validated production default
+/// (+8.4% MoE-Q4 decode, byte-identical, gate-banked). Set
+/// `LUMEN_CUDA_SHARED_FUSED_DECODE=0` to revert to the naive
+/// `encode_shared_expert_ffn_decode` path (byte-identical output, more launches).
+pub(crate) fn moe_shared_fused_decode_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        // Default-ON: only an explicit falsy token disables the fused decode path.
+        !matches!(
+            std::env::var("LUMEN_CUDA_SHARED_FUSED_DECODE")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("false") | Some("no")
+        )
+    })
+}
+
 /// Read `LUMEN_CUDA_MOE_DOWN_TILED_F32ACT` once. The down-tiled
 /// QUALITY RESCUE — **DEFAULT-ON under the parent `LUMEN_CUDA_MOE_GROUPED_TILED`**.
 /// Same shmem-staged tiled DOWN structure as the gate+up tiled kernel (BM16/BN64/BK8, per-thread
@@ -5524,6 +5559,277 @@ pub(crate) fn encode_shared_expert_ffn_decode(
                 .launch(cfg)
                 .map_err(|e| {
                     RuntimeError::Compute(format!("shared expert moe_shared_residual_accum: {e}",))
+                })?;
+        }
+    }
+
+    Ok(())
+}
+
+/// DECODE FUSED SHARED-expert FFN — lever L2 ("shared-expert fused decode").
+///
+/// A BATCH=1-NATIVE fusion of the always-on shared expert. Produces the SAME
+/// output as the naive `encode_shared_expert_ffn_decode` (byte-identical up to
+/// warp-reduction FP add ordering — same Q4_0 dequant, same F32 accumulate,
+/// SAME per-row reduction as `matvec_q4_0`), but collapses the naive path's
+/// 5-6 undersized `matvec_q4_0`/swiglu/dot/accum launches to 2-3:
+///
+///   1. `fused_glu_gemv_q4_0_prenormed_no_norm` — reads the pre-normed `normed_x`
+///      ONCE into shmem and streams BOTH W_gate and W_up (2 output streams),
+///      applying SwiGLU in-register → `shared_gate_buf` [inter_dim] (replaces the
+///      naive gate matvec + up matvec + swiglu_inplace = 3 launches).
+///   2. `moe_shared_dot_f32` (UNCHANGED — same kernel the naive path uses) →
+///      the sigmoid gate logit (only when `ffn_gate_inp_shexp` is present).
+///   3. `moe_shared_down_q4_0_sigmoid_accum` — down matvec fused with the
+///      sigmoid-gated accumulate into `output_x` (replaces the naive down matvec
+///      + sigmoid_gated_accum = 2 launches; eliminates the `shared_down_buf` HBM
+///      round-trip). The no-gate variant uses `moe_shared_down_q4_0_residual_accum`.
+///
+/// Explicitly NOT the L1 batch-TILED path (BM16 wastes 15/16 of the tile at
+/// batch=1; L1 measured -29.4%): each fused kernel is one CTA per output row,
+/// batch=1-native.
+///
+/// Engaged ONLY when the caller has checked `moe_shared_fused_decode_enabled()`
+/// (default-OFF `LUMEN_CUDA_SHARED_FUSED_DECODE`). For robustness, if the fused
+/// kernels are not loaded (NVRTC failure), the quant is not Q4_0, the shapes are
+/// unsupported, a scratch buffer is too small, or the shmem exceeds the fused-GLU
+/// limit, this DELEGATES to the naive `encode_shared_expert_ffn_decode` so
+/// correctness (and the exact naive error surface) is never at risk.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "cuda")]
+pub(crate) fn encode_shared_expert_ffn_decode_fused(
+    device: &super::ffi::CudaDevice,
+    kernels: &super::decode::KernelSet,
+    scratch: &mut CudaMoeScratch,
+    meta: &CudaMoeMeta,
+    layer_buf: &CudaSlice<u8>,
+    normed_x: &CudaView<'_, f32>,
+    output_x: &mut CudaViewMut<'_, f32>,
+    hidden_dim: usize,
+) -> Result<(), RuntimeError> {
+    use cudarc::driver::{LaunchConfig as CudarcLaunchConfig, PushKernelArg};
+
+    // Resolve the three Q4_0 weight slices (same unit-written contract as naive).
+    // Any missing → delegate to naive (which emits the canonical error).
+    let (gate_slice, up_slice, down_slice) =
+        match (meta.shared_gate, meta.shared_up, meta.shared_down) {
+            (Some(g), Some(u), Some(d)) => (g, u, d),
+            _ => {
+                return encode_shared_expert_ffn_decode(
+                    device, kernels, scratch, meta, layer_buf, normed_x, output_x, hidden_dim,
+                );
+            }
+        };
+
+    // Derive effective shared inter_dim from the down weight (Q4_0: 32 elems/18 B).
+    let down_len = down_slice.length as usize;
+    let inter_dim_eff = if hidden_dim != 0 && down_len != 0 {
+        (down_len * 32) / (hidden_dim * 18)
+    } else {
+        0
+    };
+
+    // Resolve the fused kernels; the gated path needs the down-sigmoid kernel and
+    // the shared-dot kernel, the ungated path needs the down-residual kernel.
+    let gated = meta.ffn_gate_inp_shexp.is_some();
+    let glu_fn = kernels.fused_glu_gemv_q4_0_prenormed_no_norm.as_ref();
+    let down_gated_fn = kernels.moe_shared_down_q4_0_sigmoid_accum.as_ref();
+    let down_resid_fn = kernels.moe_shared_down_q4_0_residual_accum.as_ref();
+    let dot_fn = kernels.moe_shared_dot_f32.as_ref();
+
+    // Shared-memory footprint for the fused gate+up GEMV (F32 normed-x cache).
+    let shmem = super::decode::fused_glu_shared_bytes_f32(hidden_dim as u32);
+
+    // Fused viability: kernels present, Q4_0, shapes valid, scratch sized, shmem
+    // within limit. Anything else → naive (correctness-preserving fallback).
+    let fused_ok = glu_fn.is_some()
+        && (if gated {
+            down_gated_fn.is_some() && dot_fn.is_some()
+        } else {
+            down_resid_fn.is_some()
+        })
+        && gate_slice.quant == QuantScheme::Q4_0
+        && up_slice.quant == QuantScheme::Q4_0
+        && down_slice.quant == QuantScheme::Q4_0
+        && inter_dim_eff != 0
+        && inter_dim_eff % 32 == 0
+        && hidden_dim != 0
+        && hidden_dim % 32 == 0
+        && shmem <= super::decode::FUSED_GLU_SHMEM_LIMIT
+        && scratch
+            .shared_gate_buf
+            .as_ref()
+            .is_some_and(|b| b.len() >= inter_dim_eff);
+    if !fused_ok {
+        return encode_shared_expert_ffn_decode(
+            device, kernels, scratch, meta, layer_buf, normed_x, output_x, hidden_dim,
+        );
+    }
+
+    // Cross-check gate/up lengths against the derived inter_dim (mirror naive);
+    // any mismatch or OOB slice → naive.
+    let gate_off = gate_slice.offset as usize;
+    let gate_bytes = gate_slice.length as usize;
+    let up_off = up_slice.offset as usize;
+    let up_bytes = up_slice.length as usize;
+    let down_off = down_slice.offset as usize;
+    let down_bytes = down_slice.length as usize;
+    let expected_len = inter_dim_eff * (hidden_dim / 32) * 18;
+    if gate_bytes != expected_len || up_bytes != expected_len {
+        return encode_shared_expert_ffn_decode(
+            device, kernels, scratch, meta, layer_buf, normed_x, output_x, hidden_dim,
+        );
+    }
+    for (o, b) in [
+        (gate_off, gate_bytes),
+        (up_off, up_bytes),
+        (down_off, down_bytes),
+    ] {
+        if o + b > layer_buf.len() {
+            return encode_shared_expert_ffn_decode(
+                device, kernels, scratch, meta, layer_buf, normed_x, output_x, hidden_dim,
+            );
+        }
+    }
+
+    let glu_fn = glu_fn.unwrap();
+    let inter_u32 = inter_dim_eff as u32;
+    let hd_u32 = hidden_dim as u32;
+
+    // -- Launch 1: fused gate+up+SwiGLU → shared_gate_buf [inter_dim]. --
+    // 2-stream GEMV: reads normed_x once, streams W_gate and W_up, SwiGLU in-reg.
+    // Bit-identical to (matvec_q4_0(gate) + matvec_q4_0(up) + swiglu_inplace).
+    {
+        let gate_view = layer_buf.slice(gate_off..gate_off + gate_bytes);
+        let up_view = layer_buf.slice(up_off..up_off + up_bytes);
+        let shared_gate_buf = scratch.shared_gate_buf.as_mut().unwrap();
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (super::decode::fused_glu_grid(inter_u32), 1, 1),
+            block_dim: (super::decode::FUSED_GLU_BLOCK_DIM, 1, 1),
+            shared_mem_bytes: shmem,
+        };
+        unsafe {
+            device
+                .stream
+                .launch_builder(glu_fn)
+                .arg(&gate_view)
+                .arg(&up_view)
+                .arg(normed_x)
+                .arg(shared_gate_buf)
+                .arg(&inter_u32)
+                .arg(&hd_u32)
+                .launch(cfg)
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "shared expert fused_glu_gemv_q4_0_prenormed_no_norm: {e}",
+                    ))
+                })?;
+        }
+    }
+
+    let down_view = layer_buf.slice(down_off..down_off + down_bytes);
+
+    if gated {
+        // -- Launch 2: sigmoid gate logit → shared_gate_scalar[0] (UNCHANGED). --
+        let gate_inp_slice = meta.ffn_gate_inp_shexp.unwrap();
+        let gis_off = gate_inp_slice.offset as usize;
+        let gis_bytes = hidden_dim * 4;
+        if gis_off + gis_bytes > layer_buf.len() || gis_off % 4 != 0 {
+            return encode_shared_expert_ffn_decode(
+                device, kernels, scratch, meta, layer_buf, normed_x, output_x, hidden_dim,
+            );
+        }
+        let scalar_present = scratch.shared_gate_scalar.is_some();
+        if !scalar_present {
+            return encode_shared_expert_ffn_decode(
+                device, kernels, scratch, meta, layer_buf, normed_x, output_x, hidden_dim,
+            );
+        }
+        let dot_fn = dot_fn.unwrap();
+        {
+            let gis_byte_view = layer_buf.slice(gis_off..gis_off + gis_bytes);
+            // SAFETY: ffn_gate_inp_shexp is F32, 4-byte aligned, exact length.
+            let gis_view: cudarc::driver::CudaView<'_, f32> = unsafe {
+                match gis_byte_view.transmute::<f32>(hidden_dim) {
+                    Some(v) => v,
+                    None => {
+                        return encode_shared_expert_ffn_decode(
+                            device, kernels, scratch, meta, layer_buf, normed_x, output_x,
+                            hidden_dim,
+                        );
+                    }
+                }
+            };
+            let scalar_buf = scratch.shared_gate_scalar.as_mut().unwrap();
+            let cfg = CudarcLaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                device
+                    .stream
+                    .launch_builder(dot_fn)
+                    .arg(&gis_view)
+                    .arg(normed_x)
+                    .arg(scalar_buf)
+                    .arg(&hd_u32)
+                    .launch(cfg)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("shared expert moe_shared_dot_f32: {e}",))
+                    })?;
+            }
+        }
+
+        // -- Launch 3: fused down matvec + sigmoid-gated accum into output_x. --
+        let down_gated_fn = down_gated_fn.unwrap();
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (hd_u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let swiglu_buf = scratch.shared_gate_buf.as_ref().unwrap();
+        let scalar_buf = scratch.shared_gate_scalar.as_ref().unwrap();
+        unsafe {
+            device
+                .stream
+                .launch_builder(down_gated_fn)
+                .arg(&down_view)
+                .arg(swiglu_buf)
+                .arg(scalar_buf)
+                .arg(output_x)
+                .arg(&hd_u32)
+                .arg(&inter_u32)
+                .launch(cfg)
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "shared expert moe_shared_down_q4_0_sigmoid_accum: {e}",
+                    ))
+                })?;
+        }
+    } else {
+        // -- Launch 2 (ungated): fused down matvec + residual accum into output_x. --
+        let down_resid_fn = down_resid_fn.unwrap();
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (hd_u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let swiglu_buf = scratch.shared_gate_buf.as_ref().unwrap();
+        unsafe {
+            device
+                .stream
+                .launch_builder(down_resid_fn)
+                .arg(&down_view)
+                .arg(swiglu_buf)
+                .arg(output_x)
+                .arg(&hd_u32)
+                .arg(&inter_u32)
+                .launch(cfg)
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "shared expert moe_shared_down_q4_0_residual_accum: {e}",
+                    ))
                 })?;
         }
     }

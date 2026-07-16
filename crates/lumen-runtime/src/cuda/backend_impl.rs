@@ -3011,16 +3011,37 @@ impl CudaBackend {
                 // opt-in fused shared-expert path (3 launches vs 5-6).
                 // Falls back to legacy unfused path if any of the 3 fused
                 // kernels failed to compile (NVRTC failure on this device).
-                super::moe::encode_shared_expert_ffn_decode(
-                    &self.device,
-                    &st.kernels,
-                    moe_scratch,
-                    moe_meta,
-                    moe_layer_blob,
-                    &st.scratch.normed.slice(..),
-                    &mut st.scratch.x_gpu.slice_mut(..),
-                    hidden_dim,
-                )?;
+                if super::moe::moe_shared_fused_decode_enabled() {
+                    // Lever L2 "shared-expert fused decode" (default-OFF flag
+                    // LUMEN_CUDA_SHARED_FUSED_DECODE), independent of the L1 tiled
+                    // flag. When ON, route the decode shared expert through the
+                    // batch=1-native fused kernels (2-3 launches vs the naive
+                    // 5-6): a 2-stream gate+up+SwiGLU GEMV and a fused
+                    // down+gated-accum. Same Q4_0/F32 numerics as naive
+                    // (byte-identical up to warp FP-add order). Delegates
+                    // internally to the naive path on any unsupported model/device.
+                    super::moe::encode_shared_expert_ffn_decode_fused(
+                        &self.device,
+                        &st.kernels,
+                        moe_scratch,
+                        moe_meta,
+                        moe_layer_blob,
+                        &st.scratch.normed.slice(..),
+                        &mut st.scratch.x_gpu.slice_mut(..),
+                        hidden_dim,
+                    )?;
+                } else {
+                    super::moe::encode_shared_expert_ffn_decode(
+                        &self.device,
+                        &st.kernels,
+                        moe_scratch,
+                        moe_meta,
+                        moe_layer_blob,
+                        &st.scratch.normed.slice(..),
+                        &mut st.scratch.x_gpu.slice_mut(..),
+                        hidden_dim,
+                    )?;
+                }
             }
 
             // [PROBE] Decode-vs-prefill localization (env LUMEN_MOE_PROBE=1).
