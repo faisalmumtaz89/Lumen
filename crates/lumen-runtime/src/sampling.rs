@@ -527,13 +527,23 @@ pub fn sample_logits(
 }
 
 /// Argmax with deterministic NaN handling. Returns 0 on empty input.
+///
+/// On exact ties this returns the LOWEST index, matching the spec (CORR-011),
+/// llama.cpp, and the sibling `argmax_excluding` (first-max) below. We fold
+/// keeping the running best unless a later logit is STRICTLY greater by
+/// `total_cmp` (so equal values never displace the earlier index); `total_cmp`
+/// preserves the deterministic total order over NaN/±inf. Note that
+/// `Iterator::max_by` would instead return the LAST maximal element (highest
+/// index), which is why it is not used here.
 fn argmax(logits: &[f32]) -> usize {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &v) in logits.iter().enumerate() {
+        match best {
+            Some((_, bv)) if !v.total_cmp(&bv).is_gt() => {}
+            _ => best = Some((i, v)),
+        }
+    }
+    best.map(|(i, _)| i).unwrap_or(0)
 }
 
 /// Maximum candidate tokens to skip per step before falling back to the raw
@@ -1004,6 +1014,30 @@ mod tests {
             ..SamplingParams::default()
         });
         assert_eq!(s.sample(&mut logits), 1);
+    }
+
+    #[test]
+    fn argmax_breaks_ties_to_lowest_index() {
+        // CORR-011: on exact-equal maxima, `argmax` returns the LOWEST index
+        // (matching the spec, llama.cpp, and the sibling `argmax_excluding`),
+        // NOT the highest index that `Iterator::max_by` would yield.
+        // Unique max -> that index.
+        assert_eq!(argmax(&[1.0, 5.0, 3.0, 2.0]), 1);
+        // Tie at indices {3,4,5} -> lowest (3).
+        assert_eq!(argmax(&[0.0, 0.0, 0.0, 9.0, 9.0, 9.0]), 3);
+        // All equal -> 0.
+        assert_eq!(argmax(&[7.0, 7.0, 7.0, 7.0]), 0);
+        // Tie that includes index 0 -> 0.
+        assert_eq!(argmax(&[4.0, 4.0, 1.0]), 0);
+        // Empty input -> 0.
+        assert_eq!(argmax(&[]), 0);
+        // Single element -> 0.
+        assert_eq!(argmax(&[42.0]), 0);
+        // Negative values with a tie -> lowest tied index.
+        assert_eq!(argmax(&[-3.0, -1.0, -1.0, -5.0]), 1);
+        // `guarded_argmax` (empty history) must also return the lowest-index max.
+        let s = SamplerState::new();
+        assert_eq!(guarded_argmax(&[2.0, 9.0, 9.0, 1.0], &s), 1);
     }
 
     #[test]

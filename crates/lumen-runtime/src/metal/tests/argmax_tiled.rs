@@ -5,8 +5,8 @@
 //!
 //! Ground truth is the incumbent `argmax` kernel itself (dispatched on the GPU),
 //! so this is true differential testing, not a re-derivation of the expected
-//! value. Cases stress the tie topology (the single-TG kernel's effective rule is
-//! argmin over the max-set of (i mod 256, i) — see ffn_elementwise.msl), plus
+//! value. Cases stress the tie topology (both kernels now select the LOWEST
+//! GLOBAL index on a value tie — CORR-011, see ffn_elementwise.msl), plus
 //! +/-Inf, NaN, all-(-Inf) -> 0, and boundary indices, across several tile counts
 //! (the selection must be tile-count-invariant).
 //!
@@ -273,14 +273,14 @@ fn tiled_argmax_matches_incumbent() {
         }
     }
 
-    // 2. Tie topology: duplicated max at indices 1 and 512. residue(512)=0 <
-    //    residue(1)=1, so the single-TG kernel selects 512 (its 256-stride quirk),
-    //    NOT the lowest index 1. The tiled kernel must reproduce 512.
+    // 2. Tie topology: duplicated max at indices 1 and 512. Both kernels now
+    //    select the LOWEST GLOBAL index (CORR-011), i.e. 1. assert_match verifies
+    //    the tiled kernel reproduces whatever the single-TG incumbent selects.
     {
         let mut v = vec![-1.0f32; 1024];
         v[1] = 9.0;
         v[512] = 9.0;
-        h.assert_match("tie {1,512} residue-quirk", &v);
+        h.assert_match("tie {1,512} lowest-index", &v);
     }
 
     // 3. Many duplicated maxima across residue classes and blocks.
