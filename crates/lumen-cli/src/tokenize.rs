@@ -91,9 +91,22 @@ pub struct BpeTokenizer {
     special_tokens: Vec<(String, u32)>,
 }
 
-/// Pre-tokenizer regex shared by llama-bpe, qwen2, and qwen35.
+/// Pre-tokenizer regex for llama-bpe and qwen2 (GPT-4 / Llama-3 `Split`
+/// pattern: digits grouped `\p{N}{1,3}`, letter runs `\p{L}+`).
 /// Uses negative lookahead `(?!\S)` which requires fancy-regex.
 const PRETOKENIZER_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// Pre-tokenizer regex for qwen35. This is the EXACT `Split` `pattern.Regex`
+/// from the Qwen3.5 `tokenizer.json` pre_tokenizer (Sequence -> Split
+/// "Isolated" -> ByteLevel use_regex=false). It differs from the llama/qwen2
+/// pattern in three ways that its reference mandates:
+///   * letter runs include combining marks — `[\p{L}\p{M}]+` (not `\p{L}+`) —
+///     so scripts like Thai keep a base character and its following marks in
+///     one pre-token (fixes CORR-007: Thai over-segmentation).
+///   * digits are isolated one at a time — `\p{N}` (not `\p{N}{1,3}`).
+///   * the punctuation run also excludes marks — `[^\s\p{L}\p{M}\p{N}]+` — so a
+///     combining mark is never swallowed into an adjacent punctuation span.
+const PRETOKENIZER_REGEX_QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 impl BpeTokenizer {
     /// Build a tokenizer from extracted GGUF tokenizer data.
@@ -118,10 +131,17 @@ impl BpeTokenizer {
 
         let scores = data.scores.clone();
 
-        // Compile pre-tokenizer regex for tiktoken-style models.
+        // Compile pre-tokenizer regex for tiktoken-style models. qwen35 uses its
+        // own reference `Split` pattern (combining marks + isolated digits);
+        // llama-bpe and qwen2 use the GPT-4/Llama-3 pattern.
         let pre_regex = if data.model_type == "gpt2" {
+            let pattern = if data.pre_tokenizer == "qwen35" {
+                PRETOKENIZER_REGEX_QWEN35
+            } else {
+                PRETOKENIZER_REGEX
+            };
             Some(
-                fancy_regex::Regex::new(PRETOKENIZER_REGEX)
+                fancy_regex::Regex::new(pattern)
                     .expect("failed to compile pre-tokenizer regex"),
             )
         } else {
