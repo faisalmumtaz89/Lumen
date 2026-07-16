@@ -140,10 +140,7 @@ impl BpeTokenizer {
             } else {
                 PRETOKENIZER_REGEX
             };
-            Some(
-                fancy_regex::Regex::new(pattern)
-                    .expect("failed to compile pre-tokenizer regex"),
-            )
+            Some(fancy_regex::Regex::new(pattern).expect("failed to compile pre-tokenizer regex"))
         } else {
             None
         };
