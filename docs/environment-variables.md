@@ -99,6 +99,7 @@ Set any to `=0` to opt out. Model-aware defaults are noted per row.
 | `LUMEN_CUDA_MOE_GROUPED_TILED` | ON, MoE (only `0/false/no` disables) | kill-switch | Grouped-tiled MoE prefill GEMM; parent of the tiled-prefill stack (`MOE_DOWN_TILED_F32ACT`, `SHARED_TILED`). Quality-equivalent to the per-column path (grouped F32 reduction reorder — **not** byte-identical; x_sumsq-oracle + GQ-PRISTINE gated). No-op on dense. | `=0` to A/B the per-column MoE prefill. |
 | `LUMEN_CUDA_MOE_PREFILL_BATCHED` | ON, MoE (only `0/false/no` disables) | kill-switch | Batched/grouped MoE prefill dispatch (single grouped GEMM vs the per-token loop); combo member. Quality-equivalent, **not** byte-identical. No-op on dense. | `=0` to A/B the per-token MoE prefill loop. |
 | `LUMEN_CUDA_SHARED_FUSED_DECODE` | ON, MoE (only `0/false/no` disables) | kill-switch | Fused shared-expert FFN decode (batch=1-native fused GLU/down kernels, 6→3 launches/layer; +8.4% MoE-Q4 decode, byte-identical). No-op on dense. | `=0` to A/B the naive shared-expert decode path. |
+| `LUMEN_CUDA_MOE_RESIDUAL_Q8` | ON, MoE (only `0/false/no` disables) | kill-switch | Two-term int8 (Q8_1) activation path for the routed-expert residual matvecs (+9.6% MoE-Q4 decode). Quality-equivalent, **not** byte-identical (self-deterministic; DET+GQ gate-banked). No-op on dense. | `=0` to A/B the FP32-activation routed path. |
 
 ## CUDA — MoE correctness defaults (auto-ON for MoE, no-op for dense)
 

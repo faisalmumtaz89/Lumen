@@ -643,6 +643,15 @@ pub(crate) struct KernelSet {
     pub(crate) mmv_q_moe_down_q8_0: Option<CudaFunction>,
     pub(crate) mmv_q_moe_gate_up_swiglu_q4_0: Option<CudaFunction>,
     pub(crate) mmv_q_moe_down_q4_0: Option<CudaFunction>,
+    // Two-term residual-Q8 activation Q4_0 MoE FFN (lever L7,
+    // LUMEN_CUDA_MOE_RESIDUAL_Q8=1, default OFF). Same 5-launch dp4a flow but the
+    // activation carries a coarse+residual int8 pair (~14-16 effective bits) to
+    // pass the quality gate the single-term dp4a path fails. NVRTC failure leaves
+    // the FP32-activation V3 path as the (unchanged) fallback.
+    pub(crate) quantize_q8_1_residual_moe: Option<CudaFunction>,
+    pub(crate) quantize_q8_1_residual_moe_swiglu: Option<CudaFunction>,
+    pub(crate) mmv_q_moe_gate_up_swiglu_q4_0_residual: Option<CudaFunction>,
+    pub(crate) mmv_q_moe_down_q4_0_residual: Option<CudaFunction>,
 
     // BF16 output_proj matvec (replaces cuBLAS HGEMV at the
     // largest BF16 decode call, 16.7% TPOT measured).
@@ -2577,6 +2586,59 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] mmv_q_moe_down_q4_0: FAILED: {e}");
+                None
+            }
+        },
+        // Two-term residual-Q8 activation Q4_0 MoE FFN kernels (LUMEN_CUDA_MOE_RESIDUAL_Q8).
+        quantize_q8_1_residual_moe: match load_fn_sm61(
+            shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
+            "quantize_q8_1_residual_moe",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] quantize_q8_1_residual_moe: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] quantize_q8_1_residual_moe: FAILED: {e}");
+                None
+            }
+        },
+        quantize_q8_1_residual_moe_swiglu: match load_fn_sm61(
+            shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
+            "quantize_q8_1_residual_moe_swiglu",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] quantize_q8_1_residual_moe_swiglu: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] quantize_q8_1_residual_moe_swiglu: FAILED: {e}");
+                None
+            }
+        },
+        mmv_q_moe_gate_up_swiglu_q4_0_residual: match load_fn_sm61(
+            shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
+            "mmv_q_moe_gate_up_swiglu_q4_0_residual",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] mmv_q_moe_gate_up_swiglu_q4_0_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] mmv_q_moe_gate_up_swiglu_q4_0_residual: FAILED: {e}");
+                None
+            }
+        },
+        mmv_q_moe_down_q4_0_residual: match load_fn_sm61(
+            shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
+            "mmv_q_moe_down_q4_0_residual",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] mmv_q_moe_down_q4_0_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] mmv_q_moe_down_q4_0_residual: FAILED: {e}");
                 None
             }
         },

@@ -147,6 +147,15 @@ pub(crate) struct CudaMoeScratch {
     /// Size: top_k * ceil(inter_dim / 32) * 36 bytes. ~13 KB at top_k=8, inter_dim=1408.
     pub(crate) mmv_q_moe_swiglu_q8_1: CudaSlice<u8>,
 
+    /// Two-term residual-Q8 quantized normed_x (lever L7,
+    /// `LUMEN_CUDA_MOE_RESIDUAL_Q8`). Same as `mmv_q_moe_normed_q8_1` but with
+    /// 72-byte residual blocks (coarse+fine int8 pair + 2 scales + raw sum).
+    /// Size: ceil(hidden_dim / 32) * 72 bytes. ~4.6 KB at hidden_dim=2048.
+    pub(crate) mmv_q_moe_normed_res: CudaSlice<u8>,
+    /// Two-term residual-Q8 quantized per-expert swiglu_buf.
+    /// Size: top_k * ceil(inter_dim / 32) * 72 bytes. ~26 KB at top_k=8, inter_dim=1408.
+    pub(crate) mmv_q_moe_swiglu_res: CudaSlice<u8>,
+
     /// Grouped MoE PREFILL scratch. Lazily allocated on first
     /// use of the batched/grouped prefill path, sized to `prefill_grouped_cap`
     /// (max compact columns = batch * top_k seen so far). `None` until the
@@ -669,6 +678,43 @@ pub(crate) fn mmv_q_moe_dp4a_enabled() -> bool {
     })
 }
 
+/// === lever L7 "two-term residual-Q8 expert matvec" (MoE Q4, default OFF) ===
+/// Resolves `LUMEN_CUDA_MOE_RESIDUAL_Q8`. Unset / `0`/`false`/`no` → OFF;
+/// `1`/`true`/`yes` → ON.
+///
+/// **Why this exists.** The single-term dp4a MoE path (`LUMEN_CUDA_MMV_Q_MOE_DP4A`)
+/// quantizes each 32-elem activation block to ONE int8 vector (~7-8 effective
+/// activation bits). On Qwen3.5-35B-A3B Q4 that error, amplified across the
+/// top-K experts × 40 MoE layers, flips downstream router picks and garbles
+/// arithmetic (see `mmv_q_moe_dp4a_enabled`). The routed Q4 expert matvecs
+/// therefore run an FP32-activation path (correct but ~89 µs/layer).
+///
+/// When ON, the routed Q4 expert gate_up_swiglu + down matvecs take the
+/// two-term residual-Q8 dp4a kernels: each activation block is quantized to a
+/// COARSE int8 vector `a0` (scale s0) plus a RESIDUAL int8 vector `a1`
+/// (scale s1) of `r = x - s0*a0`, giving x ≈ s0*a0 + s1*a1 (~14-16 effective
+/// bits). The Q4 weight nibbles are unpacked ONCE and reused across two dp4a
+/// passes (~2x dp4a, ~1x weight memory). Combine per weight block:
+///   `d_w * ( s0*dp4a(n,a0) + s1*dp4a(n,a1) - 4*sum_x )`  (per lane; 2 lanes/
+///   block → the -8*(n offset) bias). Router + top-K stay fully FP32 (untouched).
+///
+/// This is a QUALITY-EQUIVALENT (NOT byte-identical) lever: self-deterministic
+/// (fixed warp reduction order, round-to-nearest-even, no atomics), gated by the
+/// sacred DET-001 + GQ suite. OFF leaves the FP32-activation routed path
+/// byte-identical to the Q4 baseline. Read once via OnceLock.
+pub(crate) fn moe_residual_q8_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        // Default-ON (kill-switch): +9.6% MoE-Q4 decode, quality-equivalent,
+        // harness gate-banked. `=0` reverts to the FP32-activation routed path.
+        !matches!(
+            std::env::var("LUMEN_CUDA_MOE_RESIDUAL_Q8").ok().as_deref(),
+            Some("0" | "false" | "no")
+        )
+    })
+}
+
 /// NR=4 row-tiling for gate_up and down kernels. Default-on under
 /// V2; opt-out with `LUMEN_CUDA_MOE_BATCHED_V3=0`.
 pub(crate) fn moe_batched_v3_enabled() -> bool {
@@ -950,6 +996,11 @@ pub(crate) fn allocate_moe_scratch(
         // Q8_1 per-expert swiglu scratch (~13 KB).
         mmv_q_moe_swiglu_q8_1: device
             .alloc_zeros::<u8>(top_k.max(1) * ((expert_inter_dim + 31) / 32) * 36)?,
+        // Two-term residual-Q8 scratch (72-byte blocks). Allocated unconditionally;
+        // cost is negligible (~4.6 KB + ~26 KB at Qwen3.5-35B-A3B).
+        mmv_q_moe_normed_res: device.alloc_zeros::<u8>(((hidden_dim + 31) / 32) * 72)?,
+        mmv_q_moe_swiglu_res: device
+            .alloc_zeros::<u8>(top_k.max(1) * ((expert_inter_dim + 31) / 32) * 72)?,
         // Grouped prefill scratch is lazily allocated on first use.
         prefill_grouped: None,
     })
@@ -3912,6 +3963,215 @@ pub(crate) fn encode_moe_ffn_dp4a_dispatch_q4(
 }
 
 // ============================================================================
+// TWO-TERM RESIDUAL-Q8 Q4_0 batched MoE FFN dispatch (lever L7).
+//
+// Same 5-launch structure as `encode_moe_ffn_dp4a_dispatch_q4`, but the two
+// activation-quantization launches produce 72-byte residual blocks (coarse int8
+// `a0` + residual int8 `a1` + scales s0/s1 + raw block sum) and the gate_up +
+// down matvecs run the two-term residual dp4a (~14-16 effective activation
+// bits). Router + top-K are computed by the caller in FP32 and untouched here.
+//
+// Flow (per layer):
+//   1. quantize normed_x [hidden_dim] -> residual [num_blocks*72]
+//   2. gate_up_swiglu residual: silu(gate)*up -> batched_swiglu_buf (F32)
+//   3. quantize batched_swiglu_buf [top_k*inter_dim] -> residual [.. *72]
+//   4. down residual: per-expert outputs -> expert_output_buf (F32)
+//   5. existing accum kernel (weighted sum + residual) -> output_x
+//
+// Self-deterministic (fixed reduction order, round-to-nearest-even, no atomics).
+// ============================================================================
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "cuda")]
+pub(crate) fn encode_moe_ffn_residual_dispatch_q4(
+    device: &super::ffi::CudaDevice,
+    kernels: &super::decode::KernelSet,
+    scratch: &mut CudaMoeScratch,
+    bo: &CudaMoeBatchedOffsets,
+    layer_buf: &CudaSlice<u8>,
+    normed_x: &cudarc::driver::CudaView<'_, f32>,
+    residual: &cudarc::driver::CudaView<'_, f32>,
+    output_x: &mut cudarc::driver::CudaViewMut<'_, f32>,
+    hidden_dim: usize,
+    inter_dim: usize,
+    top_k: usize,
+) -> Result<(), RuntimeError> {
+    use cudarc::driver::{LaunchConfig as CudarcLaunchConfig, PushKernelArg};
+
+    let quantize_normed_fn = kernels.quantize_q8_1_residual_moe.as_ref().unwrap();
+    let gate_up_fn = kernels
+        .mmv_q_moe_gate_up_swiglu_q4_0_residual
+        .as_ref()
+        .unwrap();
+    let quantize_swiglu_fn = kernels.quantize_q8_1_residual_moe_swiglu.as_ref().unwrap();
+    let down_fn = kernels.mmv_q_moe_down_q4_0_residual.as_ref().unwrap();
+    let accum_fn = kernels.moe_expert_accum_option_a.as_ref().ok_or_else(|| {
+        RuntimeError::Compute(
+            "moe_expert_accum_option_a kernel not loaded (residual-Q8 Q4 path)".into(),
+        )
+    })?;
+
+    let hd_u32 = hidden_dim as u32;
+    let id_u32 = inter_dim as u32;
+    let tk_u32 = top_k as u32;
+
+    // Pre-checks (mirror the dp4a path; residual blocks are 72 bytes).
+    if top_k * inter_dim > scratch.batched_swiglu_buf.len() {
+        return Err(RuntimeError::Compute(format!(
+            "residual-Q8 Q4 batched_swiglu_buf too small: have {} need {}",
+            scratch.batched_swiglu_buf.len(),
+            top_k * inter_dim,
+        )));
+    }
+    if top_k * hidden_dim > scratch.expert_output_buf.len() {
+        return Err(RuntimeError::Compute(format!(
+            "residual-Q8 Q4 expert_output_buf too small: have {} need {}",
+            scratch.expert_output_buf.len(),
+            top_k * hidden_dim,
+        )));
+    }
+    let normed_blocks = (hidden_dim + 31) / 32;
+    if normed_blocks * 72 > scratch.mmv_q_moe_normed_res.len() {
+        return Err(RuntimeError::Compute(format!(
+            "residual-Q8 mmv_q_moe_normed_res scratch too small: have {} need {}",
+            scratch.mmv_q_moe_normed_res.len(),
+            normed_blocks * 72,
+        )));
+    }
+    let swiglu_blocks = (inter_dim + 31) / 32;
+    if top_k * swiglu_blocks * 72 > scratch.mmv_q_moe_swiglu_res.len() {
+        return Err(RuntimeError::Compute(format!(
+            "residual-Q8 mmv_q_moe_swiglu_res scratch too small: have {} need {}",
+            scratch.mmv_q_moe_swiglu_res.len(),
+            top_k * swiglu_blocks * 72,
+        )));
+    }
+
+    // ---- Phase Q0: quantize normed_x -> two-term residual. ----
+    {
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (normed_blocks as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device
+                .stream
+                .launch_builder(quantize_normed_fn)
+                .arg(normed_x)
+                .arg(&mut scratch.mmv_q_moe_normed_res)
+                .arg(&hd_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!("quantize_q8_1_residual_moe: {e}",)))?;
+        }
+    }
+
+    // ---- Phase 2: gate+up+SwiGLU (two-term residual). ----
+    {
+        let inter_grid = ((inter_dim as u32) + 1) / 2;
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (inter_grid, 1, 1),
+            block_dim: (32, top_k as u32, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device
+                .stream
+                .launch_builder(gate_up_fn)
+                .arg(&scratch.mmv_q_moe_normed_res)
+                .arg(layer_buf)
+                .arg(&scratch.expert_ids)
+                .arg(&bo.gate_up_offsets)
+                .arg(&mut scratch.batched_swiglu_buf)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .arg(&tk_u32)
+                .launch(cfg)
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("mmv_q_moe_gate_up_swiglu_q4_0_residual: {e}",))
+                })?;
+        }
+    }
+
+    // ---- Phase Q-swiglu: quantize per-expert swiglu_buf -> two-term residual. ----
+    {
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (swiglu_blocks as u32, top_k as u32, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device
+                .stream
+                .launch_builder(quantize_swiglu_fn)
+                .arg(&scratch.batched_swiglu_buf)
+                .arg(&mut scratch.mmv_q_moe_swiglu_res)
+                .arg(&id_u32)
+                .arg(&tk_u32)
+                .launch(cfg)
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("quantize_q8_1_residual_moe_swiglu: {e}",))
+                })?;
+        }
+    }
+
+    // ---- Phase 3: down matvec (two-term residual). ----
+    {
+        let hidden_grid = ((hidden_dim as u32) + 1) / 2;
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (hidden_grid, 1, 1),
+            block_dim: (32, top_k as u32, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device
+                .stream
+                .launch_builder(down_fn)
+                .arg(&scratch.mmv_q_moe_swiglu_res)
+                .arg(layer_buf)
+                .arg(&scratch.expert_ids)
+                .arg(&bo.down_offsets)
+                .arg(&mut scratch.expert_output_buf)
+                .arg(&hd_u32)
+                .arg(&id_u32)
+                .arg(&tk_u32)
+                .launch(cfg)
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("mmv_q_moe_down_q4_0_residual: {e}",))
+                })?;
+        }
+    }
+
+    // ---- Phase 4: weighted accumulate (existing kernel, FP32). ----
+    {
+        let hidden_grid_accum = ((hidden_dim + 127) / 128) as u32;
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (hidden_grid_accum, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            device
+                .stream
+                .launch_builder(accum_fn)
+                .arg(output_x)
+                .arg(residual)
+                .arg(&scratch.expert_output_buf)
+                .arg(&scratch.expert_weights)
+                .arg(&hd_u32)
+                .arg(&tk_u32)
+                .launch(cfg)
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "moe_expert_accum_option_a (residual-Q8 Q4 path): {e}",
+                    ))
+                })?;
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // BF16 MoE FFN forward path
 // ============================================================================
 //
@@ -4751,6 +5011,27 @@ pub(crate) fn encode_moe_ffn_decode_q4_0(
         };
         let smem_gate_up = (hidden_dim * 4) as u32; // F32 normed_x cache
         let smem_down = (inter_dim * 4) as u32; // F32 swiglu cache
+
+        // ---- Lever L7: two-term residual-Q8 activation path (default OFF). ----
+        // Takes precedence over BOTH the single-term dp4a path and the FP32-act
+        // V3 path when `LUMEN_CUDA_MOE_RESIDUAL_Q8=1` and its kernels are loaded
+        // and the shapes are block-aligned. On any unsupported shape / missing
+        // kernel this predicate is false and control falls through to the
+        // (unchanged) single-term dp4a check and then the FP32-activation V3
+        // path below — so OFF is byte-identical to the Q4 baseline.
+        let use_residual_q8_q4 = moe_residual_q8_enabled()
+            && kernels.quantize_q8_1_residual_moe.is_some()
+            && kernels.quantize_q8_1_residual_moe_swiglu.is_some()
+            && kernels.mmv_q_moe_gate_up_swiglu_q4_0_residual.is_some()
+            && kernels.mmv_q_moe_down_q4_0_residual.is_some()
+            && hidden_dim % 32 == 0
+            && inter_dim % 32 == 0;
+        if use_residual_q8_q4 {
+            return encode_moe_ffn_residual_dispatch_q4(
+                device, kernels, scratch, bo, layer_buf, normed_x, residual, output_x, hidden_dim,
+                inter_dim, top_k,
+            );
+        }
 
         // ---- Q4_0 batched MoE FFN matvec path. ----
         let use_mmv_q_moe_dp4a_q4 = mmv_q_moe_dp4a_enabled()
