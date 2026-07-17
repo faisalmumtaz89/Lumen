@@ -1059,6 +1059,127 @@ fn cuda_decode_delay_us() -> u64 {
     })
 }
 
+/// Historical floor for a split-clone VRAM budget: 5.1 GB. The free-memory-aware
+/// default never resolves below this so that a small / heavily-loaded GPU keeps
+/// the exact pre-lever clone set (Q4_0 Qwen3.5-9B is ~5 GB total, fully cloned
+/// under this floor), preserving byte-identical decode there.
+const SPLIT_CLONE_MIN_BUDGET_BYTES: usize = 5_100_000_000;
+
+/// Bytes held back from the free-memory-aware split-clone budget for per-token
+/// activations and transient scratch that live *beyond* weights + KV cache.
+///
+/// This covers the cuBLAS graph-capture workspace, the pre-allocated full-vocab
+/// logits buffer (`vocab_size * 4 B` ≈ 1 MB at 248K vocab), per-token activation
+/// buffers (hidden/intermediate-sized, KB-scale each), and the Q4/Q8 *aligned*
+/// repack passes that run immediately after the split clone and stage additional
+/// aligned weight buffers. 2 GB is a deliberately conservative envelope: the true
+/// transient footprint is well under this, and the per-clone `cudaMalloc`
+/// fail-safe in the clone loop (records the first OOM layer and stops) is the
+/// ultimate backstop, so an optimistic budget can never crash preload — it only
+/// permits more clones to be attempted.
+const SPLIT_CLONE_ACTIVATION_SLACK_BYTES: usize = 2_000_000_000; // 2 GB
+
+/// Outcome of [`resolve_split_clone_budget`]: the resolved upper cap plus the
+/// inputs that produced it, so the caller can log the "ship what you gated" proof.
+struct ResolvedSplitBudget {
+    /// Upper cap (bytes) the largest-first clone loop fills up to.
+    budget_bytes: usize,
+    /// Device free VRAM queried at the clone call site (preload, before KV alloc).
+    free_mem_bytes: usize,
+    /// VRAM reserved for the F32 KV cache that `init()` allocates after preload.
+    kv_reserve_bytes: usize,
+    /// Activation / scratch slack held back ([`SPLIT_CLONE_ACTIVATION_SLACK_BYTES`]).
+    slack_bytes: usize,
+    /// True when the value came from the explicit `env_var` override.
+    from_env: bool,
+}
+
+/// Resolves a split-clone VRAM budget, SHARED by the Q4 and Q8 clone passes.
+///
+/// * `env_var` — the explicit override key (`LUMEN_CUDA_Q4_SPLIT_BUDGET_GB` for the
+///   Q4 site, `LUMEN_CUDA_Q8_SPLIT_BUDGET_GB` for the Q8 site).
+/// * `device` — used to query FREE VRAM at the clone call site. The clone runs at
+///   preload, BEFORE `init()` allocates the KV cache, so this free figure still
+///   contains the KV headroom we then subtract.
+/// * `hp` — model config; supplies the KV-cache dims (layers / kv-heads / head-dim /
+///   max_seq_len) so the KV reserve is derived from the ACTUAL model, never hardcoded.
+///
+/// Resolution:
+/// * **`env_var` SET** (finite, > 0) → `gb * 1_000_000_000` bytes. Byte-for-byte the
+///   pre-lever behavior: the same explicit override maps to the same cap, so the
+///   env-override path is unchanged.
+/// * **`env_var` UNSET** → `max(5.1 GB, free_mem − KV_reserve − ACTIVATION_SLACK)`.
+///   On an 80 GB target with the 27B Q4 FFN (~9.6 GB), the resolved cap exceeds the
+///   FFN size so ALL 64 FFN layers clone (reproducing the gated +17%), while the
+///   subtracted `KV_reserve` provably preserves KV headroom.
+///
+/// `KV_reserve` mirrors `init()`'s allocation exactly: `init()` allocates a full
+/// F32 K and V cache for EVERY layer (`for _ in 0..num_layers`), even GDN layers,
+/// so counting all `num_layers` is both the ACTUAL usage and the conservative upper
+/// bound — the config does not expose a full-attn-only layer count here. The
+/// effective `max_seq_len` replicates `init()`'s `LUMEN_CUDA_MAX_SEQ_LEN` cap so the
+/// reserve tracks the cache that will actually be allocated.
+fn resolve_split_clone_budget(
+    env_var: &str,
+    device: &CudaDevice,
+    hp: &ModelHyperparams,
+) -> ResolvedSplitBudget {
+    // Free VRAM at the clone call site (preload, before KV alloc).
+    let free_mem_bytes = device.free_memory().unwrap_or(0);
+
+    // Effective max_seq_len: mirror init()'s LUMEN_CUDA_MAX_SEQ_LEN cap logic so the
+    // KV reserve tracks the cache init() will actually allocate. `=0` is treated as
+    // "no cap" (identical to unset) — a zero cap would size the KV cache to 0 tokens.
+    let model_max_seq_len = hp.max_seq_len as usize;
+    let effective_max_seq_len = std::env::var("LUMEN_CUDA_MAX_SEQ_LEN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&cap| cap > 0)
+        .map(|cap| model_max_seq_len.min(cap))
+        .unwrap_or(model_max_seq_len);
+
+    // KV reserve == init()'s per-layer F32 K+V alloc, summed over ALL layers.
+    // KvCacheGpu allocs `num_kv_heads * max_seq_len * head_dim` f32 elems for K and
+    // the same for V, per layer. F32 => 4 bytes/elem.
+    const KV_DTYPE_BYTES: usize = 4; // KvCacheGpu k/v_cache: alloc_zeros::<f32>
+    let kv_reserve_bytes = (hp.num_layers as usize)
+        .saturating_mul(effective_max_seq_len)
+        .saturating_mul(hp.num_kv_heads as usize)
+        .saturating_mul(hp.head_dim as usize)
+        .saturating_mul(2) // K and V
+        .saturating_mul(KV_DTYPE_BYTES);
+
+    // Explicit override: byte-for-byte the pre-lever behavior.
+    if let Some(gb) = std::env::var(env_var)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|gb| gb.is_finite() && *gb > 0.0)
+    {
+        return ResolvedSplitBudget {
+            budget_bytes: (gb * 1_000_000_000.0) as usize,
+            free_mem_bytes,
+            kv_reserve_bytes,
+            slack_bytes: SPLIT_CLONE_ACTIVATION_SLACK_BYTES,
+            from_env: true,
+        };
+    }
+
+    // Free-memory-aware default: reserve KV + activation slack from free VRAM, never
+    // dropping below the 5.1 GB historical floor.
+    let budget_bytes = free_mem_bytes
+        .saturating_sub(kv_reserve_bytes)
+        .saturating_sub(SPLIT_CLONE_ACTIVATION_SLACK_BYTES)
+        .max(SPLIT_CLONE_MIN_BUDGET_BYTES);
+
+    ResolvedSplitBudget {
+        budget_bytes,
+        free_mem_bytes,
+        kv_reserve_bytes,
+        slack_bytes: SPLIT_CLONE_ACTIVATION_SLACK_BYTES,
+        from_env: false,
+    }
+}
+
 /// Parse a `LUMEN_CUDA_*` env var as a truthy flag (`1` / `true` / `TRUE` /
 /// `yes` / `YES` / `on` / `ON`). Returns `None` when the env is unset so the
 /// caller can apply its own default.
@@ -10893,22 +11014,26 @@ unsafe fn repack_all_layers_q4_clone_to_split(
     repack_kernel: &cudarc::driver::CudaFunction,
     layers: &mut [LayerWeightsGpu],
     hp: &ModelHyperparams,
+    clone_budget_bytes: usize,
 ) -> (usize, Option<usize>, usize, usize) {
     let hidden = hp.hidden_dim as usize;
-    let heads = hp.num_heads as usize;
-    let kv_heads = hp.num_kv_heads as usize;
-    let head_dim = hp.head_dim as usize;
     let inter = hp.intermediate_dim as usize;
 
-    let q_dim = heads * head_dim;
-    let kv_dim = kv_heads * head_dim;
-
+    // Only the dense FFN weights (Gate/Up/Down) are cloned to Q4 split siblings.
+    // The full-attention projections (Wq/Wk/Wv/Wo) are deliberately EXCLUDED:
+    // the residual-split `wo` decode kernel
+    // (`matvec_q4_split_q8_1_locked_residual`) is not yet correct and produces
+    // NaN logits, so cloning attention weights -- which only happens once the
+    // clone budget is raised past the (larger, sort-first) FFN set -- garbles
+    // decode (token 0 repeated). FFN split is bitwise-identical to the AoS
+    // `matvec_q4_0_dp4a` path via the `.rn` codegen lock, so restricting the
+    // clone to FFN keeps decode byte-identical at ANY budget while still
+    // delivering the FFN SoA speedup on 27B (all 64 FFN layers when the budget
+    // is raised). With the default 5.1 GB cap attention was never reached
+    // anyway (FFN weights are larger and sort first), so the unset-env path is
+    // unchanged.
     #[derive(Copy, Clone, Debug)]
     enum SplitWeightKind {
-        Wq,
-        Wk,
-        Wv,
-        Wo,
         Gate,
         Up,
         Down,
@@ -10922,7 +11047,7 @@ unsafe fn repack_all_layers_q4_clone_to_split(
         size_bytes: usize,
     }
 
-    let mut jobs: Vec<Job> = Vec::with_capacity(layers.len() * 7);
+    let mut jobs: Vec<Job> = Vec::with_capacity(layers.len() * 3);
 
     fn push_if_q4raw(
         jobs: &mut Vec<Job>,
@@ -10952,45 +11077,9 @@ unsafe fn repack_all_layers_q4_clone_to_split(
     }
 
     for (layer_idx, layer) in layers.iter().enumerate() {
-        let wq_out_dim = if layer.layer_type == 1 {
-            kv_dim + kv_dim + q_dim
-        } else if layer.attn_q_norm.is_some() {
-            q_dim * 2
-        } else {
-            q_dim
-        };
-        push_if_q4raw(
-            &mut jobs,
-            layer_idx,
-            SplitWeightKind::Wq,
-            &layer.wq,
-            wq_out_dim,
-            hidden,
-        );
-        push_if_q4raw(
-            &mut jobs,
-            layer_idx,
-            SplitWeightKind::Wk,
-            &layer.wk,
-            kv_dim,
-            hidden,
-        );
-        push_if_q4raw(
-            &mut jobs,
-            layer_idx,
-            SplitWeightKind::Wv,
-            &layer.wv,
-            kv_dim,
-            hidden,
-        );
-        push_if_q4raw(
-            &mut jobs,
-            layer_idx,
-            SplitWeightKind::Wo,
-            &layer.wo,
-            hidden,
-            q_dim,
-        );
+        // FFN-only: attention (Wq/Wk/Wv/Wo) is intentionally not cloned (see the
+        // SplitWeightKind comment) so attention decode stays on the base dp4a
+        // path and output remains byte-identical to the AoS path.
         push_if_q4raw(
             &mut jobs,
             layer_idx,
@@ -11037,10 +11126,14 @@ unsafe fn repack_all_layers_q4_clone_to_split(
     });
 
     // Q4 has 1.9x the per-element density of Q8 (18 vs 34 bytes per 32-elem
-    // block), so for the same model the Q4 clone budget can be smaller.
-    // Reuse the 5.1 GB budget for safety -- Q4_0 Qwen3.5-9B is ~5 GB total
-    // so the entire model can be cloned with room to spare.
-    const CLONE_BUDGET_BYTES: usize = 5_100_000_000;
+    // block), so for the same model the Q4 clone budget can be smaller. The
+    // `clone_budget_bytes` UPPER cap is resolved by the caller via
+    // `resolve_split_clone_budget("LUMEN_CUDA_Q4_SPLIT_BUDGET_GB", ..)`: the env
+    // override (when set) maps to the exact pre-lever cap, while the default is
+    // free-memory-aware (`free − KV_reserve − activation_slack`, floored at
+    // 5.1 GB). On an 80 GB target the default exceeds the ~9.6 GB 27B dense FFN so
+    // all 64 FFN layers clone; on a small GPU it holds at the 5.1 GB floor. The cap
+    // does NOT force allocation — per-clone `cudaMalloc` failures still fail-safe.
     let mut layers_with_split = std::collections::HashSet::new();
     let mut oom_layer: Option<usize> = None;
     let mut oom_count: usize = 0;
@@ -11050,40 +11143,12 @@ unsafe fn repack_all_layers_q4_clone_to_split(
         if oom_layer.is_some() {
             break;
         }
-        if bytes_cloned + job.size_bytes > CLONE_BUDGET_BYTES {
+        if bytes_cloned + job.size_bytes > clone_budget_bytes {
             break;
         }
 
         let layer = &mut layers[job.layer_idx];
         let src_ref: Option<&CudaSlice<u8>> = match job.kind {
-            SplitWeightKind::Wq => {
-                if let GpuWeightBuf::Q4Raw(b) = &layer.wq {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            SplitWeightKind::Wk => {
-                if let GpuWeightBuf::Q4Raw(b) = &layer.wk {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            SplitWeightKind::Wv => {
-                if let GpuWeightBuf::Q4Raw(b) = &layer.wv {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            SplitWeightKind::Wo => {
-                if let GpuWeightBuf::Q4Raw(b) = &layer.wo {
-                    Some(b)
-                } else {
-                    None
-                }
-            }
             SplitWeightKind::Gate => {
                 if let GpuWeightBuf::Q4Raw(b) = &layer.w_gate {
                     Some(b)
@@ -11110,10 +11175,6 @@ unsafe fn repack_all_layers_q4_clone_to_split(
         match repack_q4_raw_to_split(device, repack_kernel, raw_buf, job.out_dim, job.in_dim) {
             Ok(split_buf) => {
                 match job.kind {
-                    SplitWeightKind::Wq => layer.q4_split_wq = Some(split_buf),
-                    SplitWeightKind::Wk => layer.q4_split_wk = Some(split_buf),
-                    SplitWeightKind::Wv => layer.q4_split_wv = Some(split_buf),
-                    SplitWeightKind::Wo => layer.q4_split_wo = Some(split_buf),
                     SplitWeightKind::Gate => layer.q4_split_w_gate = Some(split_buf),
                     SplitWeightKind::Up => layer.q4_split_w_up = Some(split_buf),
                     SplitWeightKind::Down => layer.q4_split_w_down = Some(split_buf),
@@ -15890,15 +15951,38 @@ impl ComputeBackend for CudaBackend {
                 st.kernels.repack_q4_raw_to_split.as_ref(),
                 st.kernels.matvec_q4_split_q8_1.is_some(),
             ) {
-                let mem_before_q4_split = self.device.free_memory().unwrap_or(0);
+                // Resolve the split-clone VRAM budget (env override, else
+                // free-mem-aware default) at the clone site — preload, BEFORE the KV
+                // cache is allocated, so `free` still holds the KV headroom.
+                let budget = resolve_split_clone_budget(
+                    "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
+                    &self.device,
+                    &hp_copy,
+                );
+                let mem_before_q4_split = budget.free_mem_bytes;
                 let (n_layers_split, oom_layer, oom_count, total_jobs) = unsafe {
                     repack_all_layers_q4_clone_to_split(
                         &self.device,
                         split_repack_fn,
                         &mut cache,
                         &hp_copy,
+                        budget.budget_bytes,
                     )
                 };
+                // Ship-what-you-gated proof: the resolved cap plus its inputs.
+                // `n_layers_split` distinct layers received a split sibling out of the
+                // model's `num_layers` FFN-bearing layers (64 for 27B); `total_jobs`
+                // gate/up/down weight-jobs were attempted.
+                eprintln!(
+                    "[CUDA] Q4 split-clone budget: resolved={:.2} GB (free={:.2} GB, \
+                     kv_reserve={:.2} GB, slack={:.2} GB, source={}); cloned \
+                     {n_layers_split}/{num_layers} FFN layers ({total_jobs} weight-jobs)",
+                    (budget.budget_bytes as f64) / 1.0e9,
+                    (budget.free_mem_bytes as f64) / 1.0e9,
+                    (budget.kv_reserve_bytes as f64) / 1.0e9,
+                    (budget.slack_bytes as f64) / 1.0e9,
+                    if budget.from_env { "env" } else { "free-mem" },
+                );
                 let mem_after_q4_split = self.device.free_memory().unwrap_or(0);
                 let consumed_gb =
                     (mem_before_q4_split.saturating_sub(mem_after_q4_split) as f64) / 1.0e9;
