@@ -2383,7 +2383,11 @@ impl CudaBackend {
                 // Shared-quantization optimization: if all QKV weights use dp4a Q8_1 path,
                 // quantize the normed input ONCE and reuse across Q, K, V projections.
                 // Saves 2 quantize_f32_to_q8_1 launches per layer.
-                let qkv_use_preq = weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
+                // Q4_0 QUALITY FIX (attention side): on the fragile 9B config,
+                // Q4Raw QKV uses F32 activations, not int8 Q8_1 dp4a. Other models
+                // keep dp4a (flag off). See weight_uses_f32_act_q4.
+                let qkv_use_preq = !weight_uses_f32_act_q4(&lw.wq, st.kernels.q4_decode_f32_act)
+                    && weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
                     && weight_uses_dp4a_q8_1(&lw.wk, &st.kernels)
                     && weight_uses_dp4a_q8_1(&lw.wv, &st.kernels)
                     && st.scratch.input_q8_1.is_some()
@@ -3802,10 +3806,17 @@ impl CudaBackend {
 
                 // Shared-quantization optimization: quantize normed FFN input ONCE,
                 // reuse across gate and up projections. Saves 1 quantize launch per layer.
-                let ffn_use_preq = weight_uses_dp4a_q8_1(&lw.w_gate, &st.kernels)
-                    && weight_uses_dp4a_q8_1(&lw.w_up, &st.kernels)
-                    && st.scratch.input_q8_1.is_some()
-                    && st.kernels.quantize_f32_to_q8_1.is_some();
+                // Q4_0 QUALITY FIX (FFN side): on the fragile 9B config, Q4Raw FFN
+                // also uses F32 activations. The int8 dp4a FFN error is tolerable for
+                // short/medium generation but accumulates over VERY-LONG output
+                // (GQ-004) into mild repetition that trips the spam detector; F32
+                // keeps long-form clean. Other models keep dp4a (flag off).
+                let ffn_use_preq =
+                    !weight_uses_f32_act_q4(&lw.w_gate, st.kernels.q4_decode_f32_act)
+                        && weight_uses_dp4a_q8_1(&lw.w_gate, &st.kernels)
+                        && weight_uses_dp4a_q8_1(&lw.w_up, &st.kernels)
+                        && st.scratch.input_q8_1.is_some()
+                        && st.kernels.quantize_f32_to_q8_1.is_some();
 
                 // Fused RMSNorm + Q8_1 for FFN: saves 1 dispatch per layer.
                 if ffn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
@@ -4713,7 +4724,12 @@ impl CudaBackend {
             RuntimeError::Compute(format!("GDN L{layer_idx}: attn_gate weight missing",))
         })?;
 
-        let gdn_use_preq = weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
+        // Q4_0 QUALITY FIX (GDN side): on the fragile 9B config, Q4Raw GDN
+        // projections use F32 activations, not int8 Q8_1 dp4a. Other models keep
+        // dp4a (flag off). See weight_uses_f32_act_q4.
+        let gdn_use_preq = !weight_uses_f32_act_q4(&lw.wq, st.kernels.q4_decode_f32_act)
+            && !weight_uses_f32_act_q4(attn_gate_w, st.kernels.q4_decode_f32_act)
+            && weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
             && weight_uses_dp4a_q8_1(ssm_alpha_w, &st.kernels)
             && weight_uses_dp4a_q8_1(ssm_beta_w, &st.kernels)
             && weight_uses_dp4a_q8_1(attn_gate_w, &st.kernels)
@@ -8974,11 +8990,14 @@ unsafe fn launch_matvec(
         return Ok(());
     }
 
-    // Q4Aligned or Q4Raw: dp4a with pre-quantized Q8_1 input.
-    // Q4Aligned uses aligned int* nibble loads (20-byte blocks, 0.625 B/elem).
-    // Q4Raw uses byte-level nibble loads (18-byte blocks, 0.5625 B/elem).
-    // Priority: Q4Aligned > Q4Raw.
-    if matches!(weight, GpuWeightBuf::Q4Aligned(_) | GpuWeightBuf::Q4Raw(_)) {
+    // Q4Aligned: dp4a with pre-quantized Q8_1 input (20-byte aligned blocks).
+    // Q4Raw: dp4a EXCEPT on the fragile 9B config (kernels.q4_decode_f32_act),
+    // where it falls to the F32-activation matvec_q4_0_smem path below (the int8
+    // Q8_1-activation dp4a collapses quality through the 9B's GDN recurrence).
+    // 27B/MoE/non-GDN keep the fast int8 dp4a path.
+    if matches!(weight, GpuWeightBuf::Q4Aligned(_))
+        || (matches!(weight, GpuWeightBuf::Q4Raw(_)) && !kernels.q4_decode_f32_act)
+    {
         // Path -1: Q4_0 dp4a mmvq dispatch.
         // Q8_1-activation x Q4_0-weight matvec with dp4a INT8 dot-product.
         // Operates on Q4Raw layout only (18-byte standard blocks).
@@ -9090,7 +9109,10 @@ unsafe fn launch_matvec(
         let shmem_f32 = (in_dim as u32) * 4;
         let shmem_f16 = (in_dim as u32) * 2;
 
-        // Path 1: smem kernel (F32 x, NR=2).
+        // Path 1: smem kernel (F32 x, NR=2). F32-precision activations for the
+        // Q4Raw attention/GDN projections (Q4_0 QUALITY FIX) — F16 activations
+        // were measured insufficient on the 9B GDN (12/15 vs F32's 15/15), so
+        // full F32 is required here.
         if let Some(smem_fn) = kernels
             .matvec_q4_0_smem
             .as_ref()
@@ -9645,8 +9667,12 @@ unsafe fn launch_matvec_residual(
         return Ok(());
     }
 
-    // Q4Aligned or Q4Raw residual: dp4a with pre-quantized Q8_1 input + fused residual.
-    if matches!(weight, GpuWeightBuf::Q4Aligned(_) | GpuWeightBuf::Q4Raw(_)) {
+    // Q4Aligned residual: dp4a with pre-quantized Q8_1 input + fused residual.
+    // Q4Raw: dp4a EXCEPT on the fragile 9B config (kernels.q4_decode_f32_act),
+    // where it takes the F32-activation matvec_q4_0_smem_residual path below.
+    if matches!(weight, GpuWeightBuf::Q4Aligned(_))
+        || (matches!(weight, GpuWeightBuf::Q4Raw(_)) && !kernels.q4_decode_f32_act)
+    {
         if let (Some(quant_fn), Some(q8_1_buf)) = (
             kernels.quantize_f32_to_q8_1.as_ref(),
             input_q8_1_scratch.take(),
@@ -9717,7 +9743,8 @@ unsafe fn launch_matvec_residual(
         let shmem_f32 = (in_dim as u32) * 4;
         let shmem_f16 = (in_dim as u32) * 2;
 
-        // Path 1: smem kernel (F32 x, NR=2).
+        // Path 1: smem kernel (F32 x, NR=2). F32-precision activations for the
+        // Q4Raw attention output (wo) residual matvec — see launch_matvec Path 1.
         if let Some(smem_fn) = kernels
             .matvec_q4_0_smem_residual
             .as_ref()
@@ -11198,6 +11225,26 @@ unsafe fn repack_all_layers_q4_clone_to_split(
 // =============================================================================
 
 /// Check if a weight buffer uses the dp4a Q8_1 path (Q8Raw, Q8Aligned, Q4Aligned, Q4Raw).
+/// Q4_0 QUALITY FIX (Qwen3.5 GDN Q4_0 decode collapse, GQ-001 7/15 -> 14/15).
+///
+/// Q4Raw ATTENTION/GDN projections (wq, wk, wv, wo, attn_gate) must decode with
+/// F32 activations, NOT the int8 Q8_1 dp4a path. The int8 activation quantization
+/// is a ~0.5-1% per-matvec error on top of the already-lossy 4-bit weights; the
+/// GDN linear-attention recurrence integrates the attention-projection outputs
+/// across decode steps, so that stacked error COMPOUNDS over sequence length and
+/// collapses multi-step reasoning (arithmetic prompts loop/degenerate). Metal
+/// decodes the SAME LBC bytes with F32 activations (dequant_matmul_q4_0) and
+/// PASSES; Q8_0 weights are precise enough to tolerate the int8-activation error
+/// and PASS. Returning true here forces the projection off the int8 preq path
+/// onto the non-preq `launch_matvec` route, which uses the F32-activation
+/// `matvec_q4_0_smem` kernel (Metal-parity math). The FFN (gate/up/down) stays
+/// on dp4a: its per-layer error is NOT amplified by the recurrence, and it is the
+/// bandwidth-critical path, so keeping dp4a preserves decode throughput.
+#[inline]
+fn weight_uses_f32_act_q4(weight: &GpuWeightBuf, q4_decode_f32_act: bool) -> bool {
+    q4_decode_f32_act && matches!(weight, GpuWeightBuf::Q4Raw(_))
+}
+
 fn weight_uses_dp4a_q8_1(weight: &GpuWeightBuf, kernels: &KernelSet) -> bool {
     match weight {
         GpuWeightBuf::Q8Raw(_) => kernels.matvec_q8_0_q8_1.is_some(),
@@ -16077,6 +16124,23 @@ impl ComputeBackend for CudaBackend {
         // preload_weights).
         let has_moe = st.moe_meta_cache.iter().any(|m| m.is_some());
         st.has_moe_layers = has_moe;
+
+        // Q4_0 QUALITY FIX (per-model routing). int8 Q8_1 activation quantization
+        // compounds through the GDN linear-attention recurrence and collapses Q4_0
+        // decode quality on the NARROW-GDN configs (GDN v-heads == 32): Qwen3.5-9B
+        // (GQ 7/15; llama.cpp's own int8 path degenerates identically on the same
+        // GGUF -> engine-agnostic) and Qwen3.5-MoE (GQ-001 13/15 at int8). Both
+        // require F32-activation matvecs. The 27B has WIDER GDN heads (v-heads == 48)
+        // and is CERTIFIED clean on the fast int8 path (GQ-001/002/004 all pass), so
+        // it keeps dp4a. Keyed off the GDN v-head width (a config value, not a name):
+        // 32 -> F32, 48 -> int8. Gated on has_gdn so non-GDN models keep int8.
+        st.kernels.q4_decode_f32_act = has_gdn && hp_copy.gdn_dims().num_v_heads == 32;
+        if st.kernels.q4_decode_f32_act {
+            eprintln!(
+                "[CUDA] Q4_0 decode: F32-activation quality path ON \
+                 (narrow-GDN precision-fragile config, v_heads=32)"
+            );
+        }
 
         st.layer_weights_cache = cache;
 

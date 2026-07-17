@@ -465,6 +465,11 @@ pub(crate) struct KernelSet {
     /// flag forces `use_q4_split` on so the SoA sibling buffers exist).
     /// Has no effect unless `use_q4_split_dispatch` is also true. Default OFF.
     pub(crate) use_soa_locked: bool,
+    /// Q4_0 QUALITY FIX (per-model): route Q4Raw decode projections through
+    /// F32-activation matvecs instead of the int8 Q8_1 dp4a path. Enabled ONLY
+    /// for the GDN-precision-fragile Qwen3.5-9B configuration (see the assignment
+    /// in `preload_weights`); 27B/MoE/non-GDN models keep the fast int8 dp4a path.
+    pub(crate) q4_decode_f32_act: bool,
 
     // Fused gate+up+SwiGLU GEMV with inline RMSNorm for single-token decode.
     // Reads the input vector ONCE, computes gate and up projections simultaneously,
@@ -2997,6 +3002,8 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         use_q8_split_dispatch: false,
         use_q4_split_dispatch: false,
         use_soa_locked: false,
+        // Set per-model in preload_weights (default OFF = int8 dp4a path).
+        q4_decode_f32_act: false,
         // FA2 block-skip dispatch flag (default-off contract: default OFF, env-gated).
     };
 
