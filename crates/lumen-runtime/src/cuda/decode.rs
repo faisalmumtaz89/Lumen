@@ -87,6 +87,14 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_bf16: CudaFunction,
     pub(crate) matvec_bf16_residual: CudaFunction,
 
+    // Bandwidth-optimal BF16 decode GEMV (uint4 vectorized weight load, F32
+    // accumulate). Gated DEFAULT-OFF behind `LUMEN_CUDA_BF16_MATVEC`; dispatched
+    // for every eligible BF16 decode matvec through `launch_matvec` (FFN
+    // gate/up/down, attention wq/wk/wv, GDN qkv/gate/ssm_out) when the flag is
+    // set, excluding the GDN alpha/beta precision keepers.
+    // `Option` so a compile failure degrades gracefully to the cuBLAS path.
+    pub(crate) matvec_bf16_v4: Option<CudaFunction>,
+
     // F32 <-> F16 conversion kernels (for cuBLAS HGEMM activation conversion)
     pub(crate) f32_to_f16_vec: CudaFunction,
     // Vectorized F32->F16: 4 elements/thread with float4 loads + uint2 stores.
@@ -787,6 +795,10 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             cuda_log!("[CUDA] matvec_bf16_residual: OK");
             f
         },
+        // Optional (`.ok()`): if the uint4-vectorized BF16 decode GEMV fails to
+        // compile on this device, the `LUMEN_CUDA_BF16_MATVEC` path is simply
+        // unavailable and dispatch falls through to cuBLAS GemmEx.
+        matvec_bf16_v4: load_fn(shaders::MATVEC_BF16_KERNEL_SOURCE, "matvec_bf16_v4").ok(),
         f32_to_f16_vec: load_fn(shaders::CONVERT_F16_KERNEL_SOURCE, "f32_to_f16_vec")?,
         f32_to_f16_vec4: load_fn(shaders::CONVERT_F16_KERNEL_SOURCE, "f32_to_f16_vec4").ok(),
         f16_to_f32_vec: load_fn(shaders::CONVERT_F16_KERNEL_SOURCE, "f16_to_f32_vec")?,

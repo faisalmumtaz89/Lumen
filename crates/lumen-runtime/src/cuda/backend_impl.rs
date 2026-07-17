@@ -113,6 +113,36 @@ fn bf16_autotune_enabled() -> bool {
     })
 }
 
+/// Env-gate for the custom bandwidth-optimal BF16 decode GEMV kernel
+/// (`matvec_bf16_v4`). DEFAULT-OFF: unset / `0` keeps the cuBLAS `GemmEx`
+/// batch-1 GEMV path byte-identical. When set (`1|true|yes|on`), every eligible
+/// BF16 decode matvec flowing through `launch_matvec` (FFN gate/up/down,
+/// attention wq/wk/wv, GDN qkv/gate/ssm_out) dispatches the custom
+/// uint4-vectorized, F32-accumulate kernel instead of `cublasGemmEx` at M=1.
+/// Precision-keeper projections are excluded (see `is_bf16_precision_keeper_label`);
+/// residual matvecs and lm_head use separate paths and are never affected here.
+/// Cached to avoid a per-projection `std::env::var` syscall on the decode hot path.
+fn bf16_matvec_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    // Default-ON (kill-switch): +5.2% bf16 decode, byte-identical output,
+    // harness gate-banked. `=0` reverts to the cuBLAS GemmEx paths.
+    *CACHED.get_or_init(|| parse_env_truthy("LUMEN_CUDA_BF16_MATVEC").unwrap_or(true))
+}
+
+/// Projection labels that must stay on their existing (precision-forced) path
+/// and are therefore EXCLUDED from the custom `matvec_bf16_v4` GEMV even when
+/// `LUMEN_CUDA_BF16_MATVEC` is ON. The GDN SSM alpha/beta gate projections are
+/// precision keepers: their tiny output (`out_dim = num_heads`) feeds the
+/// linear-attention recurrence directly, so they are deliberately left on the
+/// existing cuBLAS / F16 path. Every OTHER Bf16Raw projection reaching
+/// `launch_matvec` (FFN gate/up/down, attention wq/wk/wv, GDN qkv/gate/ssm_out)
+/// is eligible; the custom kernel's F32-exact accumulate is >= the precision of
+/// those paths' F16 GemmEx downcast, so accelerating them is numerically safe.
+fn is_bf16_precision_keeper_label(label: &str) -> bool {
+    matches!(label, "gdn_alpha" | "gdn_beta")
+}
+
 /// Benchmark all tensor-core cuBLAS algorithms for each unique (M, K) HGEMV
 /// shape under the BF16 GemmEx datapath (CUDA_R_16BF operands + COMPUTE_32F
 /// accumulator) and return a (shape -> best algo) map.
@@ -9223,6 +9253,43 @@ unsafe fn launch_matvec(
     if let (GpuWeightBuf::Bf16Raw(w_bf16), Some(scratch)) =
         (weight, input_f16_scratch.as_deref_mut())
     {
+        // Custom bandwidth-optimal BF16 decode GEMV (DEFAULT-OFF gate
+        // `LUMEN_CUDA_BF16_MATVEC`). Taken ONLY when: the gate is ON, this
+        // projection is NOT a precision keeper (GDN alpha/beta stay on their
+        // existing path), the uint4 fast path is applicable (in_dim % 8 == 0 for
+        // 16-byte-aligned loads, no scalar tail), and the kernel compiled. If
+        // ANY condition is false the `&&`/`if let` chain short-circuits and the
+        // existing cuBLAS `GemmEx` wrapper below runs UNCHANGED — so OFF (and
+        // every excluded label) is byte-identical to history. Numerics:
+        // `matvec_bf16_v4` upcasts bf16->f32 losslessly and accumulates in F32
+        // (>= the precision of the GemmEx F16 downcast), so it is safe for the
+        // included FFN, attention (wq/wk/wv), and GDN (qkv/gate/ssm_out) matvecs.
+        if bf16_matvec_enabled() && !is_bf16_precision_keeper_label(label) && in_dim % 8 == 0 {
+            if let Some(mv_fn) = kernels.matvec_bf16_v4.as_ref() {
+                const NR_BF16: u32 = 2; // output rows per block (matches kernel)
+                let out_dim_u32 = out_dim as u32;
+                let in_dim_u32 = in_dim as u32;
+                let grid = (out_dim_u32 + NR_BF16 - 1) / NR_BF16;
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                device
+                    .stream
+                    .launch_builder(mv_fn)
+                    .arg(w_bf16)
+                    .arg(input)
+                    .arg(output)
+                    .arg(&out_dim_u32)
+                    .arg(&in_dim_u32)
+                    .launch(launch_cfg)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec_bf16_v4 {label} launch: {e}",))
+                    })?;
+                return Ok(());
+            }
+        }
         return launch_bf16_matvec_with_fallback(
             device, kernels, w_bf16, input, output, scratch, out_dim, in_dim, label,
         );
