@@ -3310,6 +3310,97 @@ impl CudaBackend {
         // The fused kernel writes silu(gate)*up directly to scratch.gate,
         // so the SwiGLU step is skipped entirely.
         let fused_glu_fired = 'fused_glu: {
+            // LUMEN_CUDA_Q8_MMVQ: mmvq-dp4a fused gate+up+SwiGLU on the Q8 split
+            // layout (consult §2.7). Preferred over BOTH the separate mmvq
+            // gate/up + swiglu_inplace path AND the scalar fused_glu_gemv when
+            // the flag is on and both gate+up have Q8 split siblings. Runs
+            // rmsnorm_to_q8_1 (attn_proj -> shared q8_1 buffer, same kernel the
+            // separate path uses) then ONE fused kernel that reads that q8_1
+            // activation once, computes gate_dot + up_dot with the
+            // matvec_q8_split_q8_1_mmvq striping/reduction, and writes
+            // silu(gate)*up straight to scratch.gate -- removing 1 matvec + 1
+            // SwiGLU launch and the scratch.up round-trip per FFN/layer.
+            // BYTE-IDENTICAL to the separate mmvq gate+up+swiglu path; carries
+            // exactly the mmvq near-tie vs OFF (GQ + router gated). Setting
+            // fused_glu_fired = true reuses the downstream skip-SwiGLU +
+            // down-reads-scratch.gate logic unchanged.
+            //
+            // A/B isolation: fires by default under Q8_MMVQ=1, but an explicit
+            // `LUMEN_CUDA_FFN_FUSED_GLU=0` (which already means "use the separate
+            // dp4a gate/up path") opts OUT, so the reviewer can measure the
+            // combined mmvq config WITH vs WITHOUT gate-fusion.
+            let mmvq_glu_opt_out = matches!(
+                std::env::var("LUMEN_CUDA_FFN_FUSED_GLU").ok().as_deref(),
+                Some("0") | Some("false") | Some("no") | Some("off") | Some("OFF")
+            );
+            if st.kernels.use_mmvq
+                && !mmvq_glu_opt_out
+                && st.kernels.fused_glu_gemv_q8_split_mmvq.is_some()
+                && st.kernels.rmsnorm_to_q8_1.is_some()
+                && st.scratch.input_q8_1.is_some()
+                && lw.q8_split_w_gate.is_some()
+                && lw.q8_split_w_up.is_some()
+            {
+                // 1. Fused RMSNorm + Q8_1 quantize: attn_proj -> shared q8_1 buffer.
+                {
+                    let rms_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
+                    let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
+                    let block_size = rmsnorm_block_size(hidden_dim);
+                    let shared_bytes = rmsnorm_shared_bytes(block_size);
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (block_size, 1, 1),
+                        shared_mem_bytes: shared_bytes,
+                    };
+                    let dim = hidden_dim as u32;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(rms_fn)
+                            .arg(&st.scratch.attn_proj)
+                            .arg(&lw.ffn_norm)
+                            .arg(&mut *q8_1_buf)
+                            .arg(&eps)
+                            .arg(&dim)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("rmsnorm_to_q8_1 ffn mmvq-glu: {e}"))
+                    })?;
+                }
+                // 2. Fused gate+up+SwiGLU mmvq: q8_1 -> scratch.gate = silu(gate)*up.
+                {
+                    let fused_fn = st.kernels.fused_glu_gemv_q8_split_mmvq.as_ref().unwrap();
+                    let wg = lw.q8_split_w_gate.as_ref().unwrap();
+                    let wu = lw.q8_split_w_up.as_ref().unwrap();
+                    let q8_1_ref = st.scratch.input_q8_1.as_ref().unwrap();
+                    let inter_u32 = inter_dim as u32;
+                    let hd_u32 = hidden_dim as u32;
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (inter_u32, 1, 1),            // ONE output row per CTA
+                        block_dim: (DP4A_Q8_1_BLOCK_DIM, 1, 1), // 128 = 4 warps
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(fused_fn)
+                            .arg(wg)
+                            .arg(wu)
+                            .arg(q8_1_ref)
+                            .arg(&mut st.scratch.gate)
+                            .arg(&inter_u32)
+                            .arg(&hd_u32)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "fused_glu_gemv_q8_split_mmvq L{layer_idx}: {e}",
+                        ))
+                    })?;
+                }
+                break 'fused_glu true;
+            }
             // env-gated opt-out of the fused gate+up+SwiGLU kernel.
             // Profile evidence shows `fused_glu_gemv_q8_0`
             // is 30.8% of Lumen Q8 dense decode kernel time at 158 us/call,
@@ -10263,6 +10354,36 @@ unsafe fn launch_matvec_preq8_1(
             }
         }
         GpuWeightBuf::Q8Aligned(w_q8a) => {
+            // LUMEN_CUDA_Q8_MMVQ: llama mmvq port on the 36-byte aligned layout
+            // takes precedence when active. grid = out_dim (ONE row/CTA), block
+            // = 128 (4 warps). Near-tie; no repack (reads the same Q8Aligned
+            // weight). The 1-row/CTA mmvq is used for ALL nb (the small-K
+            // warp-per-row variant measured slower on the GDN shapes and was
+            // reverted). Falls through to the scalar/hw kernel if not loaded.
+            if kernels.use_mmvq {
+                if let Some(mv_fn) = kernels.matvec_q8_aligned_q8_1_mmvq.as_ref() {
+                    let mv_cfg = CudarcLaunchConfig {
+                        grid_dim: (out_dim_u32, 1, 1),
+                        block_dim: (DP4A_Q8_1_BLOCK_DIM, 1, 1), // 128 = 4 warps
+                        shared_mem_bytes: 0,
+                    };
+                    device
+                        .stream
+                        .launch_builder(mv_fn)
+                        .arg(w_q8a)
+                        .arg(q8_1_buf)
+                        .arg(output)
+                        .arg(&out_dim_u32)
+                        .arg(&in_dim_u32)
+                        .launch(mv_cfg)
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                "matvec_q8_aligned_q8_1_mmvq preq {label}: {e}",
+                            ))
+                        })?;
+                    return Ok(());
+                }
+            }
             // Q8_SCALE_HW: prefer the halfword-scale variant when
             // LUMEN_CUDA_Q8_SCALE_HW=1 was set at init AND the kernel loaded.
             // Numerically equivalent to matvec_q8_aligned_q8_1 (replaces a
@@ -10402,6 +10523,36 @@ unsafe fn launch_matvec_preq8_1_residual(
             }
         }
         GpuWeightBuf::Q8Aligned(w_q8a) => {
+            // LUMEN_CUDA_Q8_MMVQ: llama mmvq residual port on the 36-byte aligned
+            // layout takes precedence when active. grid = out_dim (ONE row/CTA),
+            // block = 128. Near-tie; no repack. The 1-row/CTA mmvq is used for
+            // ALL nb (the small-K variant was reverted as measured-slower).
+            // Scalar/hw residual fallback if the mmvq kernel is unavailable.
+            if kernels.use_mmvq {
+                if let Some(mv_fn) = kernels.matvec_q8_aligned_q8_1_mmvq_residual.as_ref() {
+                    let mv_cfg = CudarcLaunchConfig {
+                        grid_dim: (out_dim_u32, 1, 1),
+                        block_dim: (DP4A_Q8_1_BLOCK_DIM, 1, 1), // 128 = 4 warps
+                        shared_mem_bytes: 0,
+                    };
+                    device
+                        .stream
+                        .launch_builder(mv_fn)
+                        .arg(w_q8a)
+                        .arg(q8_1_buf)
+                        .arg(residual)
+                        .arg(output)
+                        .arg(&out_dim_u32)
+                        .arg(&in_dim_u32)
+                        .launch(mv_cfg)
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                "matvec_q8_aligned_q8_1_mmvq_residual preq {label}: {e}",
+                            ))
+                        })?;
+                    return Ok(());
+                }
+            }
             // Q8_SCALE_HW: prefer the halfword-scale residual variant.
             let mv_fn_opt = if kernels.use_q8_scale_hw {
                 kernels
@@ -10543,8 +10694,45 @@ unsafe fn launch_matvec_preq8_1_split(
     // Q8 split path.
     if kernels.use_q8_split_dispatch {
         if let Some(split_buf) = q8_split_sibling {
-            let (mv_fn_opt, nr_grid): (Option<&CudaFunction>, u32) =
-                (kernels.matvec_q8_split_q8_1.as_ref(), 2);
+            // LUMEN_CUDA_Q8_MMVQ: llama mmvq port takes precedence when active.
+            // grid = out_dim (ONE row/CTA), block = 128 (4 warps). Near-tie.
+            if kernels.use_mmvq {
+                if let Some(mv_fn) = kernels.matvec_q8_split_q8_1_mmvq.as_ref() {
+                    let out_dim_u32 = out_dim as u32;
+                    let in_dim_u32 = in_dim as u32;
+                    let mv_cfg = CudarcLaunchConfig {
+                        grid_dim: (out_dim_u32, 1, 1),
+                        block_dim: (DP4A_Q8_1_BLOCK_DIM, 1, 1), // 128 = 4 warps
+                        shared_mem_bytes: 0,
+                    };
+                    device
+                        .stream
+                        .launch_builder(mv_fn)
+                        .arg(split_buf)
+                        .arg(q8_1_buf)
+                        .arg(output)
+                        .arg(&out_dim_u32)
+                        .arg(&in_dim_u32)
+                        .launch(mv_cfg)
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                "matvec_q8_split_q8_1_mmvq preq {label}: {e}",
+                            ))
+                        })?;
+                    return Ok(());
+                }
+            }
+            // LUMEN_CUDA_Q8_MATVEC_FAST: prefer the 128-bit-load kernel on
+            // 16-byte-aligned dims (in_dim % 256 == 0 => nb % 8 == 0 => the
+            // quant-stream base is 16-aligned). Byte-identical to the scalar
+            // kernel; same NR=2 grid/block. Falls back to scalar otherwise.
+            let use_fast = kernels.use_q8_matvec_fast && (in_dim % 256 == 0);
+            let mv_fn_opt: Option<&CudaFunction> = if use_fast {
+                kernels.matvec_q8_split_q8_1_v4.as_ref()
+            } else {
+                kernels.matvec_q8_split_q8_1.as_ref()
+            };
+            let nr_grid: u32 = 2;
             if let Some(mv_fn) = mv_fn_opt {
                 let out_dim_u32 = out_dim as u32;
                 let in_dim_u32 = in_dim as u32;
@@ -10575,6 +10763,35 @@ unsafe fn launch_matvec_preq8_1_split(
     // unlocked split kernel.
     if kernels.use_q4_split_dispatch {
         if let Some(split_buf) = q4_split_sibling {
+            // LUMEN_CUDA_Q8_MMVQ: llama mmvq port takes precedence when active.
+            // grid = out_dim (ONE row/CTA), block = 128 (4 warps, NOT the NR=4
+            // 256-thread DP4A_Q4_BLOCK_DIM). Near-tie; per-fragment -4*x_sum.
+            if kernels.use_mmvq {
+                if let Some(mv_fn) = kernels.matvec_q4_split_q8_1_mmvq.as_ref() {
+                    let out_dim_u32 = out_dim as u32;
+                    let in_dim_u32 = in_dim as u32;
+                    let mv_cfg = CudarcLaunchConfig {
+                        grid_dim: (out_dim_u32, 1, 1),
+                        block_dim: (DP4A_Q8_1_BLOCK_DIM, 1, 1), // 128 = 4 warps
+                        shared_mem_bytes: 0,
+                    };
+                    device
+                        .stream
+                        .launch_builder(mv_fn)
+                        .arg(split_buf)
+                        .arg(q8_1_buf)
+                        .arg(output)
+                        .arg(&out_dim_u32)
+                        .arg(&in_dim_u32)
+                        .launch(mv_cfg)
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                "matvec_q4_split_q8_1_mmvq preq {label}: {e}",
+                            ))
+                        })?;
+                    return Ok(());
+                }
+            }
             let mv_fn_opt = if kernels.use_soa_locked {
                 kernels.matvec_q4_split_q8_1_locked.as_ref()
             } else {
@@ -10631,8 +10848,44 @@ unsafe fn launch_matvec_preq8_1_residual_split(
 ) -> Result<(), RuntimeError> {
     if kernels.use_q8_split_dispatch {
         if let Some(split_buf) = q8_split_sibling {
-            let (mv_fn_opt, nr_grid): (Option<&CudaFunction>, u32) =
-                (kernels.matvec_q8_split_q8_1_residual.as_ref(), 2);
+            // LUMEN_CUDA_Q8_MMVQ: llama mmvq residual kernel takes precedence.
+            // grid = out_dim (ONE row/CTA), block = 128 (4 warps). Near-tie.
+            if kernels.use_mmvq {
+                if let Some(mv_fn) = kernels.matvec_q8_split_q8_1_mmvq_residual.as_ref() {
+                    let out_dim_u32 = out_dim as u32;
+                    let in_dim_u32 = in_dim as u32;
+                    let mv_cfg = CudarcLaunchConfig {
+                        grid_dim: (out_dim_u32, 1, 1),
+                        block_dim: (DP4A_Q8_1_BLOCK_DIM, 1, 1), // 128 = 4 warps
+                        shared_mem_bytes: 0,
+                    };
+                    device
+                        .stream
+                        .launch_builder(mv_fn)
+                        .arg(split_buf)
+                        .arg(q8_1_buf)
+                        .arg(residual)
+                        .arg(output)
+                        .arg(&out_dim_u32)
+                        .arg(&in_dim_u32)
+                        .launch(mv_cfg)
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                "matvec_q8_split_q8_1_mmvq_residual preq {label}: {e}",
+                            ))
+                        })?;
+                    return Ok(());
+                }
+            }
+            // LUMEN_CUDA_Q8_MATVEC_FAST: 128-bit-load residual kernel on aligned
+            // dims (byte-identical; same NR=2 grid/block). Scalar fallback else.
+            let use_fast = kernels.use_q8_matvec_fast && (in_dim % 256 == 0);
+            let mv_fn_opt: Option<&CudaFunction> = if use_fast {
+                kernels.matvec_q8_split_q8_1_v4_residual.as_ref()
+            } else {
+                kernels.matvec_q8_split_q8_1_residual.as_ref()
+            };
+            let nr_grid: u32 = 2;
             if let Some(mv_fn) = mv_fn_opt {
                 let out_dim_u32 = out_dim as u32;
                 let in_dim_u32 = in_dim as u32;
@@ -10663,6 +10916,36 @@ unsafe fn launch_matvec_preq8_1_residual_split(
     }
     if kernels.use_q4_split_dispatch {
         if let Some(split_buf) = q4_split_sibling {
+            // LUMEN_CUDA_Q8_MMVQ: llama mmvq residual kernel takes precedence.
+            // grid = out_dim (ONE row/CTA), block = 128 (4 warps). Near-tie;
+            // per-fragment -4*x_sum half-correction.
+            if kernels.use_mmvq {
+                if let Some(mv_fn) = kernels.matvec_q4_split_q8_1_mmvq_residual.as_ref() {
+                    let out_dim_u32 = out_dim as u32;
+                    let in_dim_u32 = in_dim as u32;
+                    let mv_cfg = CudarcLaunchConfig {
+                        grid_dim: (out_dim_u32, 1, 1),
+                        block_dim: (DP4A_Q8_1_BLOCK_DIM, 1, 1), // 128 = 4 warps
+                        shared_mem_bytes: 0,
+                    };
+                    device
+                        .stream
+                        .launch_builder(mv_fn)
+                        .arg(split_buf)
+                        .arg(q8_1_buf)
+                        .arg(residual)
+                        .arg(output)
+                        .arg(&out_dim_u32)
+                        .arg(&in_dim_u32)
+                        .launch(mv_cfg)
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                "matvec_q4_split_q8_1_mmvq_residual preq {label}: {e}",
+                            ))
+                        })?;
+                    return Ok(());
+                }
+            }
             let mv_fn_opt = if kernels.use_soa_locked {
                 kernels.matvec_q4_split_q8_1_locked_residual.as_ref()
             } else {
@@ -13073,6 +13356,31 @@ impl ComputeBackend for CudaBackend {
         if use_q8_split {
             eprintln!("[CUDA] LUMEN_CUDA_Q8_SPLIT: Q8_0 weights will be cloned to split layout for decode");
         }
+        // LUMEN_CUDA_Q8_MATVEC_FAST (default-OFF): route the Q8 split decode
+        // matvec through the 128-bit-weight-load kernel (matvec_q8_split_q8_1_v4).
+        // Byte-identical to the scalar split kernel; only the weight load width
+        // changes. Effective only when Q8 split dispatch is already active AND
+        // the v4 kernels loaded; the per-call `in_dim % 256 == 0` alignment guard
+        // is applied at dispatch. OFF -> the scalar kernel runs unchanged.
+        let use_q8_matvec_fast = env_truthy("LUMEN_CUDA_Q8_MATVEC_FAST");
+        if use_q8_matvec_fast {
+            eprintln!("[CUDA] LUMEN_CUDA_Q8_MATVEC_FAST: Q8 split decode matvec uses 128-bit weight loads (aligned dims only)");
+        }
+        // LUMEN_CUDA_Q8_MMVQ (default-OFF): route BOTH the Q8 and Q4 split decode
+        // matvecs through the llama `mul_mat_vec_q` port (matvec_q{8,4}_split_q8_1_mmvq):
+        // one output row per CTA, VDR lane striping (4 lanes/Q8 block, 2 lanes/Q4
+        // block), and a single lane-preserving cross-warp reduction. Effective
+        // only when the corresponding split dispatch is active AND all four mmvq
+        // kernels loaded. NOT byte-identical -- a quality-equivalent near-tie that
+        // gates on the FULL GQ + MoE-router-stability check, NOT DET byte identity.
+        // OFF -> the existing scalar/v4/locked split kernels run unchanged.
+        // Default-ON (kill-switch): +3.9% 9B-q8 decode with the fused-GLU
+        // epilogue, harness gate-banked (receipts §23). `=0` reverts to the
+        // scalar/locked split kernels (byte-identical to the pre-mmvq default).
+        let use_q8_mmvq = parse_env_truthy("LUMEN_CUDA_Q8_MMVQ").unwrap_or(true);
+        if use_q8_mmvq {
+            eprintln!("[CUDA] LUMEN_CUDA_Q8_MMVQ: Q8/Q4 split decode matvec uses the llama mmvq port (near-tie; GQ+router gated)");
+        }
         // LUMEN_CUDA_SOA_LOCKED selects the codegen-LOCKED Q4 split kernel.
         // It reuses the Q4 split (SoA) repack + sibling buffers, so it implies
         // `use_q4_split` (the SoA buffers must exist for the locked kernel to
@@ -13138,6 +13446,15 @@ impl ComputeBackend for CudaBackend {
         // taking an extra parameter at every call site.
         kernels.use_q8_scale_hw = use_q8_scale_hw;
         kernels.use_q8_split_dispatch = use_q8_split && kernels.matvec_q8_split_q8_1.is_some();
+        // Q8 128-bit-load fast path: requires the Q8 split dispatch active AND
+        // both v4 kernels loaded. Default OFF (env-gated only, no canonical default).
+        kernels.use_q8_matvec_fast = use_q8_matvec_fast
+            && kernels.use_q8_split_dispatch
+            && kernels.matvec_q8_split_q8_1_v4.is_some()
+            && kernels.matvec_q8_split_q8_1_v4_residual.is_some();
+        if use_q8_matvec_fast && !kernels.use_q8_matvec_fast {
+            eprintln!("[CUDA] LUMEN_CUDA_Q8_MATVEC_FAST=1 set but prerequisites missing (need Q8 split dispatch active + v4 kernels loaded); using scalar split kernel");
+        }
         kernels.use_q4_split_dispatch = use_q4_split && kernels.matvec_q4_split_q8_1.is_some();
         // Locked Q4 split kernel selection. Effective only when the Q4 split
         // dispatch is active AND both locked kernels loaded. When the locked
@@ -13150,6 +13467,23 @@ impl ComputeBackend for CudaBackend {
             eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED=1: Q4 split dispatch uses the codegen-locked kernel (layout-independent bitwise-identical F32)");
         } else if use_soa_locked {
             eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED=1 set but prerequisites missing (need Q4 split dispatch active + locked kernels loaded); using unlocked split / base path");
+        }
+        // llama mmvq path -- single master gate for ALL three mmvq kernel
+        // families: the Q8 split, Q4 split, and Q8Aligned (36-byte attn/GDN)
+        // paths. Set true when the operator asked for it AND at least one mmvq
+        // kernel loaded; each dispatch branch then independently checks its own
+        // specific kernel `.is_some()` (so split-only and aligned-only models
+        // each work, and a family whose kernel failed to compile cleanly falls
+        // through to the existing scalar/v4/locked path). When a branch fires it
+        // takes precedence over the scalar/v4 (Q8 split), locked/unlocked (Q4
+        // split), and scalar/hw (Q8Aligned) kernels. Near-tie: GQ+router gated,
+        // NOT DET byte-identical.
+        let any_mmvq_loaded = kernels.matvec_q8_split_q8_1_mmvq.is_some()
+            || kernels.matvec_q4_split_q8_1_mmvq.is_some()
+            || kernels.matvec_q8_aligned_q8_1_mmvq.is_some();
+        kernels.use_mmvq = use_q8_mmvq && any_mmvq_loaded;
+        if use_q8_mmvq && !kernels.use_mmvq {
+            eprintln!("[CUDA] LUMEN_CUDA_Q8_MMVQ=1 set but prerequisites missing (no mmvq kernels loaded); using existing scalar/v4/locked/aligned kernels");
         }
 
         // pre-allocate MoE scratch when the model declares experts.

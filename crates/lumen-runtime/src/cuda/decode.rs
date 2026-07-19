@@ -421,12 +421,33 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q8_aligned_q8_1_hw: Option<CudaFunction>,
     pub(crate) matvec_q8_aligned_q8_1_hw_residual: Option<CudaFunction>,
 
+    // llama mmvq port on the Q8Aligned (36-byte AoS) attn/GDN path
+    // (`LUMEN_CUDA_Q8_MMVQ`, default-OFF; shares the split mmvq flag). Same
+    // 4-lane VDR striping + one-row/CTA + lane-preserving cross-warp reduction
+    // as the Q8 split mmvq; only the 36-byte weight offset differs (no repack).
+    // NOT byte-identical (near-tie, GQ+router gated); `.rn`-pinned F32.
+    pub(crate) matvec_q8_aligned_q8_1_mmvq: Option<CudaFunction>,
+    pub(crate) matvec_q8_aligned_q8_1_mmvq_residual: Option<CudaFunction>,
+
     // Q8 split (SoA) matvec against pre-quantized Q8_1 input (dp4a, NR=2).
     // Consumes the per-row split layout produced by repack_q8_raw_to_split.
     // Selected when `LUMEN_CUDA_Q8_SPLIT=1` is set AND a sibling buffer is
     // populated on the relevant `LayerWeightsGpu.q8_split_*` field.
     pub(crate) matvec_q8_split_q8_1: Option<CudaFunction>,
     pub(crate) matvec_q8_split_q8_1_residual: Option<CudaFunction>,
+
+    // 128-bit weight-load variant of matvec_q8_split_q8_1 (`LUMEN_CUDA_Q8_MATVEC_FAST`,
+    // default-OFF). Byte-identical dp4a math; two int4 loads replace eight int
+    // loads per block. Selected over the scalar split kernel when
+    // `use_q8_matvec_fast` is set AND `in_dim % 256 == 0` (16-byte alignment).
+    pub(crate) matvec_q8_split_q8_1_v4: Option<CudaFunction>,
+    pub(crate) matvec_q8_split_q8_1_v4_residual: Option<CudaFunction>,
+
+    // llama mmvq port on the Q8 split layout (`LUMEN_CUDA_Q8_MMVQ`, default-OFF).
+    // 4-lane VDR striping + one-row/CTA + lane-preserving cross-warp reduction.
+    // NOT byte-identical (near-tie, GQ+router gated); `.rn`-pinned F32.
+    pub(crate) matvec_q8_split_q8_1_mmvq: Option<CudaFunction>,
+    pub(crate) matvec_q8_split_q8_1_mmvq_residual: Option<CudaFunction>,
 
     // Q4 split (SoA) matvec against pre-quantized Q8_1 input (dp4a, NR=4).
     pub(crate) matvec_q4_split_q8_1: Option<CudaFunction>,
@@ -438,6 +459,13 @@ pub(crate) struct KernelSet {
     // unlocked split kernel when `use_soa_locked` is set.
     pub(crate) matvec_q4_split_q8_1_locked: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_locked_residual: Option<CudaFunction>,
+
+    // llama mmvq port on the Q4 split layout (`LUMEN_CUDA_Q8_MMVQ`, default-OFF;
+    // shares the Q8 mmvq flag). 2-lane VDR striping + one-row/CTA + lane-
+    // preserving cross-warp reduction; per-fragment -4*x_sum half-correction.
+    // NOT byte-identical (near-tie, GQ+router gated); `.rn`-pinned F32.
+    pub(crate) matvec_q4_split_q8_1_mmvq: Option<CudaFunction>,
+    pub(crate) matvec_q4_split_q8_1_mmvq_residual: Option<CudaFunction>,
 
     // Q8 split matvec dedicated to the final output projection (configurable NR).
     // The shader exports nr8/nr16/nr32/nr64/nr128 instantiations; we load each
@@ -465,6 +493,13 @@ pub(crate) struct KernelSet {
     /// When true AND the layer's `q8_split_*` sibling is `Some`, dispatch
     /// routes to `matvec_q8_split_q8_1` instead of the Q8Aligned/Q8Raw path.
     pub(crate) use_q8_split_dispatch: bool,
+    /// `LUMEN_CUDA_Q8_MATVEC_FAST=1` AND matvec_q8_split_q8_1_v4 loaded.
+    /// When true, the Q8 split dispatch selects the 128-bit-load kernel
+    /// (`matvec_q8_split_q8_1_v4[_residual]`) instead of the scalar
+    /// `matvec_q8_split_q8_1[_residual]`, but ONLY for dims with
+    /// `in_dim % 256 == 0` (the int4 alignment contract). Byte-identical output.
+    /// Default OFF pending on-A100 A/B measurement.
+    pub(crate) use_q8_matvec_fast: bool,
     /// `LUMEN_CUDA_Q4_SPLIT=1` AND matvec_q4_split_q8_1 loaded.
     pub(crate) use_q4_split_dispatch: bool,
     /// `LUMEN_CUDA_SOA_LOCKED=1` AND matvec_q4_split_q8_1_locked loaded.
@@ -473,6 +508,15 @@ pub(crate) struct KernelSet {
     /// flag forces `use_q4_split` on so the SoA sibling buffers exist).
     /// Has no effect unless `use_q4_split_dispatch` is also true. Default OFF.
     pub(crate) use_soa_locked: bool,
+    /// `LUMEN_CUDA_Q8_MMVQ=1` AND all four mmvq kernels loaded. Single gate for
+    /// BOTH the Q8 and Q4 split mmvq kernels (llama `mul_mat_vec_q` port:
+    /// one-row/CTA, VDR lane striping, single cross-warp reduction). When true,
+    /// the Q8 split path selects `matvec_q8_split_q8_1_mmvq[_residual]` and the
+    /// Q4 split path selects `matvec_q4_split_q8_1_mmvq[_residual]`, in both
+    /// cases taking precedence over the scalar/v4/locked split kernels. NOT
+    /// byte-identical (quality-equivalent near-tie; gates on the FULL GQ +
+    /// MoE-router-stability check, NOT DET byte identity). Default OFF.
+    pub(crate) use_mmvq: bool,
     /// Q4_0 QUALITY FIX (per-model): route Q4Raw decode projections through
     /// F32-activation matvecs instead of the int8 Q8_1 dp4a path. Enabled ONLY
     /// for the GDN-precision-fragile Qwen3.5-9B configuration (see the assignment
@@ -485,6 +529,11 @@ pub(crate) struct KernelSet {
     //
     // Q8_0 variant (F32 x in shmem): hidden_dim * 4 <= 48KB -> hidden_dim <= 12288.
     pub(crate) fused_glu_gemv_q8_0: Option<CudaFunction>,
+    // mmvq-dp4a fused gate+up+SwiGLU on the Q8 split layout (`LUMEN_CUDA_Q8_MMVQ`).
+    // Reads the pre-quantized Q8_1 activation once, computes gate_dot + up_dot
+    // with the matvec_q8_split_q8_1_mmvq striping/reduction (two weight streams),
+    // then silu(gate)*up. Byte-identical to the separate mmvq gate+up+swiglu path.
+    pub(crate) fused_glu_gemv_q8_split_mmvq: Option<CudaFunction>,
     // Q4_0 variant (F32 x in shmem): hidden_dim * 4 <= 48KB -> hidden_dim <= 12288.
     pub(crate) fused_glu_gemv_q4_0: Option<CudaFunction>,
     // F16 variant (F32 x in shmem): hidden_dim * 4 <= 48KB -> hidden_dim <= 12288.
@@ -1523,6 +1572,35 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        // llama mmvq port on the Q8Aligned (36-byte AoS) attn/GDN path
+        // (LUMEN_CUDA_Q8_MMVQ, default-OFF). Same fast-math pipeline; the `.rn`
+        // PTX ops are immune to --use_fast_math, so contraction cannot drift.
+        matvec_q8_aligned_q8_1_mmvq: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q8_ALIGNED_Q8_1_MMVQ_KERNEL_SOURCE,
+            "matvec_q8_aligned_q8_1_mmvq",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_q8_1_mmvq: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_q8_1_mmvq: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q8_aligned_q8_1_mmvq_residual: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q8_ALIGNED_Q8_1_MMVQ_KERNEL_SOURCE,
+            "matvec_q8_aligned_q8_1_mmvq_residual",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_q8_1_mmvq_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_aligned_q8_1_mmvq_residual: FAILED: {e}");
+                None
+            }
+        },
         matvec_q8_split_q8_1: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_SPLIT_Q8_1_KERNEL_SOURCE,
             "matvec_q8_split_q8_1",
@@ -1549,6 +1627,62 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        // 128-bit weight-load variant (LUMEN_CUDA_Q8_MATVEC_FAST, default-OFF).
+        matvec_q8_split_q8_1_v4: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q8_SPLIT_Q8_1_V4_KERNEL_SOURCE,
+            "matvec_q8_split_q8_1_v4",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_v4: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_v4: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q8_split_q8_1_v4_residual: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q8_SPLIT_Q8_1_V4_KERNEL_SOURCE,
+            "matvec_q8_split_q8_1_v4_residual",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_v4_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_v4_residual: FAILED: {e}");
+                None
+            }
+        },
+        // llama mmvq port on the Q8 split layout (LUMEN_CUDA_Q8_MMVQ, default-OFF).
+        // Loaded through the same fast-math pipeline -- the `.rn` PTX ops are
+        // immune to --use_fast_math, so contraction cannot drift the F32 tree.
+        matvec_q8_split_q8_1_mmvq: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q8_SPLIT_Q8_1_MMVQ_KERNEL_SOURCE,
+            "matvec_q8_split_q8_1_mmvq",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_mmvq: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_mmvq: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q8_split_q8_1_mmvq_residual: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q8_SPLIT_Q8_1_MMVQ_KERNEL_SOURCE,
+            "matvec_q8_split_q8_1_mmvq_residual",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_mmvq_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q8_split_q8_1_mmvq_residual: FAILED: {e}");
+                None
+            }
+        },
         matvec_q4_split_q8_1: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE,
             "matvec_q4_split_q8_1",
@@ -1572,6 +1706,34 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] matvec_q4_split_q8_1_residual: FAILED: {e}");
+                None
+            }
+        },
+        // llama mmvq port on the Q4 split layout (LUMEN_CUDA_Q8_MMVQ, default-OFF;
+        // shares the Q8 mmvq flag). Same fast-math pipeline; `.rn`-pinned F32.
+        matvec_q4_split_q8_1_mmvq: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_SPLIT_Q8_1_MMVQ_KERNEL_SOURCE,
+            "matvec_q4_split_q8_1_mmvq",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_mmvq: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_mmvq: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_split_q8_1_mmvq_residual: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_SPLIT_Q8_1_MMVQ_KERNEL_SOURCE,
+            "matvec_q4_split_q8_1_mmvq_residual",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_mmvq_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_mmvq_residual: FAILED: {e}");
                 None
             }
         },
@@ -1710,6 +1872,21 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] fused_glu_gemv_q8_0: FAILED: {e}");
+                None
+            }
+        },
+        // mmvq-dp4a fused gate+up+SwiGLU on the Q8 split layout. dp4a + `.rn`
+        // locks -> same fast-math sm80 pipeline as the mmvq split matvecs.
+        fused_glu_gemv_q8_split_mmvq: match load_fn_sm80_fast_math(
+            shaders::FUSED_GLU_GEMV_Q8_SPLIT_MMVQ_KERNEL_SOURCE,
+            "fused_glu_gemv_q8_split_mmvq",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q8_split_mmvq: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] fused_glu_gemv_q8_split_mmvq: FAILED: {e}");
                 None
             }
         },
@@ -3012,8 +3189,10 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         // verifying the corresponding kernel(s) loaded successfully.
         use_q8_scale_hw: false,
         use_q8_split_dispatch: false,
+        use_q8_matvec_fast: false,
         use_q4_split_dispatch: false,
         use_soa_locked: false,
+        use_mmvq: false,
         // Set per-model in preload_weights (default OFF = int8 dp4a path).
         q4_decode_f32_act: false,
         // FA2 block-skip dispatch flag (default-off contract: default OFF, env-gated).

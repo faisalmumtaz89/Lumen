@@ -307,6 +307,22 @@ pub const MATVEC_DP4A_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_dp4a_q8_1.
 /// Falls back to existing separate dispatch if compilation fails.
 pub const FUSED_GLU_GEMV_KERNEL_SOURCE: &str = include_str!("fused_glu_gemv.cu");
 
+/// mmvq-dp4a fused gate+up+SwiGLU decode GEMV on the Q8 split layout
+/// (`LUMEN_CUDA_Q8_MMVQ`, default-OFF). Unlike FUSED_GLU_GEMV_KERNEL_SOURCE
+/// (scalar `(float)gq*xv`, ~6x slower per call, disabled on quantised dense),
+/// this reads the pre-quantized Q8_1 activation ONCE and computes gate_dot and
+/// up_dot with the SAME 4-lane mmvq striping + lane-preserving reduction as
+/// `matvec_q8_split_q8_1_mmvq` (two weight streams), then applies
+/// `silu(gate)*up` in-register. Replaces the separate mmvq gate matvec + up
+/// matvec + swiglu_inplace with one kernel, removing 1 matvec + 1 SwiGLU launch
+/// and the scratch.up round-trip per FFN/layer. BYTE-IDENTICAL to that separate
+/// mmvq path (same `.rn`-pinned dot + same silu as swiglu_inplace); carries
+/// exactly the mmvq near-tie vs OFF. GQ + MoE-router gated.
+///
+/// Kernel: `fused_glu_gemv_q8_split_mmvq`. Requires SM 6.1+ (dp4a).
+pub const FUSED_GLU_GEMV_Q8_SPLIT_MMVQ_KERNEL_SOURCE: &str =
+    include_str!("fused_glu_gemv_q8_split_mmvq.cu");
+
 /// Q4_0 dp4a decode: native Q4_0 weights + pre-quantized Q8_1 input + dp4a + NR=2.
 ///
 /// Unpacks Q4_0 nibbles into sequential int8 words for dp4a dot product against
@@ -328,6 +344,22 @@ pub const MATVEC_Q4_0_DP4A_KERNEL_SOURCE: &str = include_str!("matvec_q4_0_dp4a.
 /// Reuses `quantize_f32_to_q8_1` from MATVEC_DP4A_Q8_1_KERNEL_SOURCE.
 /// Requires SM 6.1+ (dp4a).
 pub const MATVEC_Q8_ALIGNED_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q8_aligned_q8_1.cu");
+
+/// llama `mul_mat_vec_q` port on the Q8Aligned (36-byte AoS) layout
+/// (`LUMEN_CUDA_Q8_MMVQ`, default-OFF; shares the flag with the split mmvq
+/// kernels). Covers the attention / GDN projection path that has no split
+/// sibling and falls through to `matvec_q8_aligned_q8_1`. 128 threads / 4 warps,
+/// ONE output row per CTA (grid=out_dim), 4-lane-per-block VDR striping and
+/// llama's lane-preserving cross-warp reduction (ONE shuffle tree/output vs four
+/// in the scalar NR=2 kernel). Same 4-lane math as the Q8 split mmvq; the only
+/// delta is the 36-byte AoS weight offset (scale @ ib*36, quants @ ib*36+4,
+/// stride 36*nb) -- NO repack. NOT byte-identical (quality-equivalent near-tie;
+/// GQ + MoE-router gated); the F32 ops are `.rn`-pinned for JIT stability.
+///
+/// Kernels: `matvec_q8_aligned_q8_1_mmvq`, `matvec_q8_aligned_q8_1_mmvq_residual`.
+/// Requires SM 6.1+ (dp4a).
+pub const MATVEC_Q8_ALIGNED_Q8_1_MMVQ_KERNEL_SOURCE: &str =
+    include_str!("matvec_q8_aligned_q8_1_mmvq.cu");
 
 /// Repack Q4_0 blocks from 18 bytes to 20 bytes (insert 2-byte padding for alignment).
 /// One-time kernel run during preload_weights, not on the decode hot path.
@@ -404,6 +436,32 @@ pub const QGATE_FUSION_KERNEL_SOURCE: &str = include_str!("qgate_fusion.cu");
 /// Requires SM 6.1+ (dp4a).
 pub const MATVEC_Q8_SPLIT_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q8_split_q8_1.cu");
 
+/// 128-bit weight-load variant of `MATVEC_Q8_SPLIT_Q8_1_KERNEL_SOURCE`
+/// (`LUMEN_CUDA_Q8_MATVEC_FAST`, default-OFF). Identical NR=2 dp4a math and
+/// F32 epilogue; the ONLY delta is the weight-quant stream load width -- two
+/// `int4` (128-bit) loads per block replace eight `int` loads, cutting the
+/// weight load-instruction / L1-sector-request rate ~4x. Output is
+/// byte-identical to the scalar kernel by construction (same 8 int32 words fed
+/// to dp4a in the same order). Host only routes here when `in_dim % 256 == 0`
+/// (the 16-byte alignment contract for the int4 loads).
+///
+/// Kernels: `matvec_q8_split_q8_1_v4`, `matvec_q8_split_q8_1_v4_residual`.
+/// Requires SM 6.1+ (dp4a).
+pub const MATVEC_Q8_SPLIT_Q8_1_V4_KERNEL_SOURCE: &str = include_str!("matvec_q8_split_q8_1_v4.cu");
+
+/// llama `mul_mat_vec_q` port on the Q8 split layout (`LUMEN_CUDA_Q8_MMVQ`,
+/// default-OFF). 128 threads / 4 warps, ONE output row per CTA (grid=out_dim),
+/// with 4-lane-per-Q8-block VDR striping (2 dp4a/lane, dependency chain cut 4x)
+/// and llama's lane-preserving cross-warp reduction (ONE shuffle tree/output vs
+/// four in the scalar kernel). NOT byte-identical -- the per-fragment F32
+/// scaling and changed reduction order make it a quality-equivalent near-tie
+/// (GQ + MoE-router gated); the F32 ops are `.rn`-pinned for JIT stability.
+///
+/// Kernels: `matvec_q8_split_q8_1_mmvq`, `matvec_q8_split_q8_1_mmvq_residual`.
+/// Requires SM 6.1+ (dp4a).
+pub const MATVEC_Q8_SPLIT_Q8_1_MMVQ_KERNEL_SOURCE: &str =
+    include_str!("matvec_q8_split_q8_1_mmvq.cu");
+
 /// Q4_0 split (SoA) matvec against pre-quantized Q8_1 input (dp4a, NR=4).
 ///
 /// Consumes the per-row split layout `[scales * nb][nibbles[16] * nb]` produced
@@ -428,6 +486,20 @@ pub const MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q4_spl
 /// Requires SM 6.1+ (dp4a).
 pub const MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE: &str =
     include_str!("matvec_q4_split_q8_1_locked.cu");
+
+/// llama `mul_mat_vec_q` port on the Q4 split layout (`LUMEN_CUDA_Q8_MMVQ`,
+/// default-OFF; shares the flag with the Q8 mmvq kernel). 128 threads / 4 warps,
+/// ONE output row per CTA (grid=out_dim), with 2-lane-per-Q4-block VDR striping
+/// (4 dp4a/lane) and llama's lane-preserving cross-warp reduction (ONE shuffle
+/// tree/output vs eight in the scalar NR=4 kernel). Each fragment owns HALF the
+/// block and applies the HALF zero-point correction `-4*x_sum` (two fragments
+/// sum to the full `-8*x_sum`). NOT byte-identical -- quality-equivalent near-tie
+/// (GQ + MoE-router gated); the F32 ops are `.rn`-pinned for JIT stability.
+///
+/// Kernels: `matvec_q4_split_q8_1_mmvq`, `matvec_q4_split_q8_1_mmvq_residual`.
+/// Requires SM 6.1+ (dp4a).
+pub const MATVEC_Q4_SPLIT_Q8_1_MMVQ_KERNEL_SOURCE: &str =
+    include_str!("matvec_q4_split_q8_1_mmvq.cu");
 
 /// Q8_0 split matvec dedicated to the final `output_proj` shape.
 ///
