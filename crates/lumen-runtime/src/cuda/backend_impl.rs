@@ -24,10 +24,11 @@ use std::sync::Mutex;
 use super::decode::{
     self, dp4a_q4_grid, dp4a_q8_1_grid, fused_glu_grid, fused_glu_shared_bytes_f16,
     fused_glu_shared_bytes_f32, fused_norm_matvec_block_size, hgemv_grid, hgemv_shared_bytes,
-    matvec_block_size, matvec_q8_0_grid, matvec_smem_grid, matvec_smem_shared_bytes,
-    q8_1_quant_grid, rmsnorm_block_size, rmsnorm_shared_bytes, KernelSet, DP4A_Q4_BLOCK_DIM,
-    DP4A_Q8_1_BLOCK_DIM, FUSED_GLU_BLOCK_DIM, FUSED_GLU_SHMEM_LIMIT, HGEMV_BLOCK_DIM,
-    HGEMV_SHMEM_LIMIT, Q8_0_BLOCK_DIM, Q8_1_QUANT_BLOCK_DIM, SMEM_BLOCK_DIM,
+    matvec_block_size, matvec_q8_0_grid, matvec_smem_grid, matvec_smem_grid_nr,
+    matvec_smem_shared_bytes, q8_1_quant_grid, rmsnorm_block_size, rmsnorm_shared_bytes, KernelSet,
+    Q4F32ActKernel, DP4A_Q4_BLOCK_DIM, DP4A_Q8_1_BLOCK_DIM, FUSED_GLU_BLOCK_DIM,
+    FUSED_GLU_SHMEM_LIMIT, HGEMV_BLOCK_DIM, HGEMV_SHMEM_LIMIT, Q8_0_BLOCK_DIM,
+    Q8_1_QUANT_BLOCK_DIM, SMEM_BLOCK_DIM,
 };
 use super::ffi::CudaDevice;
 use super::gpu_buffers::{upload_layer_weights, GpuWeightBuf, LayerWeightsGpu};
@@ -8164,6 +8165,74 @@ impl CudaBackend {
             }
 
             let shmem_needed = in_dim * 4;
+
+            // LUMEN_CUDA_Q4_F32ACT_KERNEL variant selection.
+            // Default `Smem` does NOTHING here and falls through to the unchanged
+            // primary NR=2 smem path below (byte-identical). Row/Nr4/Nr8 are pure
+            // occupancy variants — all keep FULL F32 activations. Nr4/Nr8 fall
+            // through to the NR=2 smem path if their kernel failed to compile or the
+            // shmem request exceeds the 48 KB static cap.
+            match st.kernels.q4_f32act_kernel {
+                Q4F32ActKernel::Smem => {}
+                Q4F32ActKernel::Row => {
+                    let mv_block = matvec_block_size();
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (out_dim, 1, 1),
+                        block_dim: (mv_block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.matvec_q4_0)
+                            .arg(proj_q4)
+                            .arg(&st.scratch.normed)
+                            .arg(&mut st.logits_gpu)
+                            .arg(&out_dim)
+                            .arg(&in_dim)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec output_proj Q4_0 row launch: {e}"))
+                    })?;
+                    return Ok(());
+                }
+                Q4F32ActKernel::Nr4 | Q4F32ActKernel::Nr8 => {
+                    let (nr_fn, nr) = if matches!(st.kernels.q4_f32act_kernel, Q4F32ActKernel::Nr8)
+                    {
+                        (st.kernels.matvec_q4_0_smem_nr8.as_ref(), 8u32)
+                    } else {
+                        (st.kernels.matvec_q4_0_smem_nr4.as_ref(), 4u32)
+                    };
+                    if let Some(nr_fn) = nr_fn.filter(|_| shmem_needed <= 49152) {
+                        let grid = matvec_smem_grid_nr(out_dim, nr);
+                        let shmem = matvec_smem_shared_bytes(in_dim);
+                        let launch_cfg = CudarcLaunchConfig {
+                            grid_dim: (grid, 1, 1),
+                            block_dim: (SMEM_BLOCK_DIM, 1, 1),
+                            shared_mem_bytes: shmem,
+                        };
+                        unsafe {
+                            self.device
+                                .stream
+                                .launch_builder(nr_fn)
+                                .arg(proj_q4)
+                                .arg(&st.scratch.normed)
+                                .arg(&mut st.logits_gpu)
+                                .arg(&out_dim)
+                                .arg(&in_dim)
+                                .launch(launch_cfg)
+                        }
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                "matvec output_proj Q4_0 smem-wide launch: {e}"
+                            ))
+                        })?;
+                        return Ok(());
+                    }
+                }
+            }
+
             if let Some(ref smem_fn) = st.kernels.matvec_q4_0_smem {
                 if shmem_needed <= 49152 {
                     let grid = matvec_smem_grid(out_dim);
@@ -9229,6 +9298,72 @@ unsafe fn launch_matvec(
     if let GpuWeightBuf::Q4Raw(w_q4) = weight {
         let shmem_f32 = (in_dim as u32) * 4;
         let shmem_f16 = (in_dim as u32) * 2;
+
+        // LUMEN_CUDA_Q4_F32ACT_KERNEL variant selection.
+        // Default `Smem` does NOTHING here and falls through to the unchanged
+        // primary NR=2 smem path below (byte-identical). Row/Nr4/Nr8 are pure
+        // occupancy variants — all keep FULL F32 activations. Nr4/Nr8 fall
+        // through to the NR=2 smem path if their kernel failed to compile or the
+        // shmem request exceeds the 48 KB static cap.
+        match kernels.q4_f32act_kernel {
+            Q4F32ActKernel::Smem => {}
+            Q4F32ActKernel::Row => {
+                let out_dim_u32 = out_dim as u32;
+                let in_dim_u32 = in_dim as u32;
+                let mv_block = matvec_block_size();
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (out_dim_u32, 1, 1),
+                    block_dim: (mv_block, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                device
+                    .stream
+                    .launch_builder(&kernels.matvec_q4_0)
+                    .arg(w_q4)
+                    .arg(input)
+                    .arg(output)
+                    .arg(&out_dim_u32)
+                    .arg(&in_dim_u32)
+                    .launch(launch_cfg)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec Q4_0 row {label} launch: {e}",))
+                    })?;
+                return Ok(());
+            }
+            Q4F32ActKernel::Nr4 | Q4F32ActKernel::Nr8 => {
+                let (nr_fn, nr) = if matches!(kernels.q4_f32act_kernel, Q4F32ActKernel::Nr8) {
+                    (kernels.matvec_q4_0_smem_nr8.as_ref(), 8u32)
+                } else {
+                    (kernels.matvec_q4_0_smem_nr4.as_ref(), 4u32)
+                };
+                if let Some(nr_fn) = nr_fn.filter(|_| shmem_f32 <= 49152) {
+                    let out_dim_u32 = out_dim as u32;
+                    let in_dim_u32 = in_dim as u32;
+                    let grid = matvec_smem_grid_nr(out_dim_u32, nr);
+                    let shmem = matvec_smem_shared_bytes(in_dim_u32);
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (SMEM_BLOCK_DIM, 1, 1),
+                        shared_mem_bytes: shmem,
+                    };
+                    device
+                        .stream
+                        .launch_builder(nr_fn)
+                        .arg(w_q4)
+                        .arg(input)
+                        .arg(output)
+                        .arg(&out_dim_u32)
+                        .arg(&in_dim_u32)
+                        .launch(launch_cfg)
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                "matvec Q4_0 smem-wide {label} launch: {e}",
+                            ))
+                        })?;
+                    return Ok(());
+                }
+            }
+        }
 
         // Path 1: smem kernel (F32 x, NR=2). F32-precision activations for the
         // Q4Raw attention/GDN projections (Q4_0 QUALITY FIX) — F16 activations
@@ -16526,6 +16661,33 @@ impl ComputeBackend for CudaBackend {
             eprintln!(
                 "[CUDA] Q4_0 decode: F32-activation quality path ON \
                  (narrow-GDN precision-fragile config, v_heads=32)"
+            );
+        }
+
+        // LUMEN_CUDA_Q4_F32ACT_KERNEL: select among F32-EXACT Q4_0 decode matvec
+        // variants at the two smem launch sites. ALL variants keep FULL F32
+        // activations — pure kernel/occupancy, no precision change. Read ONCE.
+        //   "row"  -> matvec_q4_0 (one-block-per-row, no shmem)
+        //   "nr4"  -> matvec_q4_0_smem_nr4 (NR=4 wide smem)
+        //   "nr8"  -> matvec_q4_0_smem_nr8 (NR=8 wide smem)
+        //   "smem" -> explicit opt-out to the NR=2 path
+        // DEFAULT-ON: on the narrow-GDN F32-act path (q4_decode_f32_act = 9B-Q4 /
+        // MoE-Q4 dense), NR=4 is the default — occupancy win at BYTE-EXACT F32,
+        // GQ-confirmed IDENTICAL to NR=2. All other (non-F32-act) paths keep NR=2.
+        st.kernels.q4_f32act_kernel =
+            match std::env::var("LUMEN_CUDA_Q4_F32ACT_KERNEL").ok().as_deref() {
+                Some("row") => Q4F32ActKernel::Row,
+                Some("nr4") => Q4F32ActKernel::Nr4,
+                Some("nr8") => Q4F32ActKernel::Nr8,
+                Some("smem") => Q4F32ActKernel::Smem,
+                _ if st.kernels.q4_decode_f32_act => Q4F32ActKernel::Nr4,
+                _ => Q4F32ActKernel::Smem,
+            };
+        if !matches!(st.kernels.q4_f32act_kernel, Q4F32ActKernel::Smem) {
+            eprintln!(
+                "[CUDA] Q4_0 F32-act decode matvec variant: {:?} \
+                 (LUMEN_CUDA_Q4_F32ACT_KERNEL; FULL F32 activations, occupancy-only)",
+                st.kernels.q4_f32act_kernel
             );
         }
 

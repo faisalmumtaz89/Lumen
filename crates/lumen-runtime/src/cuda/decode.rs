@@ -60,6 +60,25 @@ pub(crate) fn cuda_log_force(msg: String) {
     }
 }
 
+/// F32-EXACT Q4_0 decode matvec kernel variant selector
+/// (`LUMEN_CUDA_Q4_F32ACT_KERNEL`). ALL variants keep FULL F32 activations —
+/// pure kernel/occupancy selection with identical per-row numerics; only the
+/// launch geometry differs. Resolved ONCE at preload (see `preload_weights`),
+/// then read at the two Q4_0 smem launch sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Q4F32ActKernel {
+    /// NR=2 shared-memory matvec (`matvec_q4_0_smem`). DEFAULT — byte-identical
+    /// to pre-flag behavior.
+    #[default]
+    Smem,
+    /// One-block-per-row scalar matvec (`matvec_q4_0`), no shared memory.
+    Row,
+    /// NR=4 wide shared-memory matvec (`matvec_q4_0_smem_nr4`).
+    Nr4,
+    /// NR=8 wide shared-memory matvec (`matvec_q4_0_smem_nr8`).
+    Nr8,
+}
+
 /// All compiled CUDA kernel functions needed for single-token decode.
 ///
 /// Compiled once during `init()` via NVRTC and reused across all layers.
@@ -258,6 +277,14 @@ pub(crate) struct KernelSet {
     // (0.5625 B/elem) instead of HGEMV's pre-dequanted F16 (2 B/elem).
     pub(crate) matvec_q4_0_smem: Option<CudaFunction>,
     pub(crate) matvec_q4_0_smem_residual: Option<CudaFunction>,
+
+    // Q4_0 shared-memory matvec WIDE variants (NR=4 / NR=8 rows per block).
+    // Byte-identical per-row numerics to matvec_q4_0_smem (NR=2); only the
+    // rows-per-block occupancy differs. Selected by `LUMEN_CUDA_Q4_F32ACT_KERNEL`
+    // (default Smem = NR=2, unchanged). Optional: NVRTC compile may fail; the
+    // launch sites fall back to the NR=2 smem path when None.
+    pub(crate) matvec_q4_0_smem_nr4: Option<CudaFunction>,
+    pub(crate) matvec_q4_0_smem_nr8: Option<CudaFunction>,
 
     // GDN (GatedDeltaNet) kernels for Qwen3.5 hybrid layers.
     pub(crate) ssm_conv1d_decode: Option<CudaFunction>,
@@ -530,6 +557,13 @@ pub(crate) struct KernelSet {
     /// for the GDN-precision-fragile Qwen3.5-9B configuration (see the assignment
     /// in `preload_weights`); 27B/MoE/non-GDN models keep the fast int8 dp4a path.
     pub(crate) q4_decode_f32_act: bool,
+
+    /// F32-EXACT Q4_0 decode matvec variant selector (`LUMEN_CUDA_Q4_F32ACT_KERNEL`).
+    /// Resolved ONCE in `preload_weights`; read at the two Q4_0 smem launch sites
+    /// (`launch_matvec` Q4Raw + lm_head `compute_final_gpu`). Default `Smem` is
+    /// byte-identical to pre-flag behavior; on the narrow-GDN F32-act path it
+    /// defaults to `Nr4`. FULL F32 activations in every variant — no precision change.
+    pub(crate) q4_f32act_kernel: Q4F32ActKernel,
 
     // Fused gate+up+SwiGLU GEMV with inline RMSNorm for single-token decode.
     // Reads the input vector ONCE, computes gate and up projections simultaneously,
@@ -1137,6 +1171,27 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             Ok(f) => Some(f),
             Err(e) => {
                 cuda_log!("[CUDA] Q4_0 smem matvec residual: FAILED: {e}");
+                None
+            }
+        },
+        // Q4_0 smem WIDE variants (NR=4 / NR=8) — LUMEN_CUDA_Q4_F32ACT_KERNEL.
+        matvec_q4_0_smem_nr4: match load_fn(
+            shaders::MATVEC_Q4_0_SMEM_WIDE_KERNEL_SOURCE,
+            "matvec_q4_0_smem_nr4",
+        ) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                cuda_log!("[CUDA] Q4_0 smem matvec nr4: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_0_smem_nr8: match load_fn(
+            shaders::MATVEC_Q4_0_SMEM_WIDE_KERNEL_SOURCE,
+            "matvec_q4_0_smem_nr8",
+        ) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                cuda_log!("[CUDA] Q4_0 smem matvec nr8: FAILED: {e}");
                 None
             }
         },
@@ -3204,6 +3259,9 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         use_mmvq_q4: false,
         // Set per-model in preload_weights (default OFF = int8 dp4a path).
         q4_decode_f32_act: false,
+        // Resolved ONCE in preload_weights from LUMEN_CUDA_Q4_F32ACT_KERNEL.
+        // Default Smem (NR=2) = byte-identical to pre-flag behavior.
+        q4_f32act_kernel: Q4F32ActKernel::Smem,
         // FA2 block-skip dispatch flag (default-off contract: default OFF, env-gated).
     };
 
@@ -3796,6 +3854,12 @@ pub(crate) const SMEM_BLOCK_DIM: u32 = 256;
 /// Grid size for smem matvec: ceil(out_dim / NR) blocks.
 pub(crate) fn matvec_smem_grid(out_dim: u32) -> u32 {
     (out_dim + SMEM_NR - 1) / SMEM_NR
+}
+
+/// Grid size for the WIDE smem matvec variants (`matvec_q4_0_smem_nr4/nr8`):
+/// ceil(out_dim / nr) blocks, where `nr` is the kernel's rows-per-block (4 or 8).
+pub(crate) fn matvec_smem_grid_nr(out_dim: u32, nr: u32) -> u32 {
+    (out_dim + nr - 1) / nr
 }
 
 /// Shared memory bytes for smem matvec: in_dim floats for x-vector cache.

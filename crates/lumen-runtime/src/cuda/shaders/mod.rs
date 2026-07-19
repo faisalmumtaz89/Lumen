@@ -258,6 +258,12 @@ pub const MATVEC_Q8_0_SMEM_KERNEL_SOURCE: &str = include_str!("matvec_q8_0_smem.
 /// PRIMARY Q4_0 decode path.
 pub const MATVEC_Q4_0_SMEM_KERNEL_SOURCE: &str = include_str!("matvec_q4_0_smem.cu");
 
+/// Q4_0 shared-memory matvec WIDE variants (NR=4, NR=8): matvec_q4_0_smem_nr4,
+/// matvec_q4_0_smem_nr8. Byte-identical per-row numerics to matvec_q4_0_smem
+/// (NR=2, MATVEC_Q4_0_SMEM_KERNEL_SOURCE); only the rows-per-block occupancy
+/// differs. Selected by `LUMEN_CUDA_Q4_F32ACT_KERNEL`; default path stays NR=2.
+pub const MATVEC_Q4_0_SMEM_WIDE_KERNEL_SOURCE: &str = include_str!("matvec_q4_0_smem_wide.cu");
+
 /// Fused F16 decode kernels: fused_rmsnorm_f16, swiglu_f32_to_f16.
 ///
 /// Eliminates intermediate dispatches in the F16 HGEMV decode path:
