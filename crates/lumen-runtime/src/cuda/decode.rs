@@ -508,15 +508,23 @@ pub(crate) struct KernelSet {
     /// flag forces `use_q4_split` on so the SoA sibling buffers exist).
     /// Has no effect unless `use_q4_split_dispatch` is also true. Default OFF.
     pub(crate) use_soa_locked: bool,
-    /// `LUMEN_CUDA_Q8_MMVQ=1` AND all four mmvq kernels loaded. Single gate for
-    /// BOTH the Q8 and Q4 split mmvq kernels (llama `mul_mat_vec_q` port:
-    /// one-row/CTA, VDR lane striping, single cross-warp reduction). When true,
-    /// the Q8 split path selects `matvec_q8_split_q8_1_mmvq[_residual]` and the
-    /// Q4 split path selects `matvec_q4_split_q8_1_mmvq[_residual]`, in both
-    /// cases taking precedence over the scalar/v4/locked split kernels. NOT
-    /// byte-identical (quality-equivalent near-tie; gates on the FULL GQ +
-    /// MoE-router-stability check, NOT DET byte identity). Default OFF.
+    /// `LUMEN_CUDA_Q8_MMVQ=1`. Master gate for the Q8 split + Q8Aligned mmvq
+    /// families (llama `mul_mat_vec_q` port: one-row/CTA, VDR lane striping,
+    /// single cross-warp reduction). When true, the Q8 split path selects
+    /// `matvec_q8_split_q8_1_mmvq[_residual]` and the Q8Aligned attn/GDN path
+    /// selects `matvec_q8_aligned_q8_1_mmvq[_residual]`, taking precedence over
+    /// the scalar/v4/hw kernels. NOT byte-identical (quality-equivalent near-tie;
+    /// gates on the FULL GQ + MoE-router-stability check, NOT DET byte identity).
+    /// Q8 mmvq is a decode WIN on both sizes (+3.9% 9B-q8, +5.3% 27B-q8; receipts
+    /// §23/§26) -> default ON via `LUMEN_CUDA_Q8_MMVQ`. Default OFF at struct init.
     pub(crate) use_mmvq: bool,
+    /// `LUMEN_CUDA_Q4_MMVQ=1`. Gate for the Q4 split mmvq kernel
+    /// (`matvec_q4_split_q8_1_mmvq[_residual]`), SEPARATE from `use_mmvq` because
+    /// the Q4 split mmvq path is measured-NEGATIVE (27B-q4 -3.0%, 9B-q4 flat
+    /// +0.15% CI-straddles-zero; receipts §24/§26) while the Q8 path wins. The Q4
+    /// mmvq kernels stay loaded but default OFF, opt-in for a future re-gate.
+    /// Default OFF.
+    pub(crate) use_mmvq_q4: bool,
     /// Q4_0 QUALITY FIX (per-model): route Q4Raw decode projections through
     /// F32-activation matvecs instead of the int8 Q8_1 dp4a path. Enabled ONLY
     /// for the GDN-precision-fragile Qwen3.5-9B configuration (see the assignment
@@ -3193,6 +3201,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         use_q4_split_dispatch: false,
         use_soa_locked: false,
         use_mmvq: false,
+        use_mmvq_q4: false,
         // Set per-model in preload_weights (default OFF = int8 dp4a path).
         q4_decode_f32_act: false,
         // FA2 block-skip dispatch flag (default-off contract: default OFF, env-gated).

@@ -10763,10 +10763,11 @@ unsafe fn launch_matvec_preq8_1_split(
     // unlocked split kernel.
     if kernels.use_q4_split_dispatch {
         if let Some(split_buf) = q4_split_sibling {
-            // LUMEN_CUDA_Q8_MMVQ: llama mmvq port takes precedence when active.
-            // grid = out_dim (ONE row/CTA), block = 128 (4 warps, NOT the NR=4
-            // 256-thread DP4A_Q4_BLOCK_DIM). Near-tie; per-fragment -4*x_sum.
-            if kernels.use_mmvq {
+            // LUMEN_CUDA_Q4_MMVQ (default-OFF; measured-negative): llama mmvq
+            // port for the Q4 split path. grid = out_dim (ONE row/CTA), block =
+            // 128 (4 warps, NOT the NR=4 256-thread DP4A_Q4_BLOCK_DIM). Near-tie;
+            // per-fragment -4*x_sum.
+            if kernels.use_mmvq_q4 {
                 if let Some(mv_fn) = kernels.matvec_q4_split_q8_1_mmvq.as_ref() {
                     let out_dim_u32 = out_dim as u32;
                     let in_dim_u32 = in_dim as u32;
@@ -10916,10 +10917,10 @@ unsafe fn launch_matvec_preq8_1_residual_split(
     }
     if kernels.use_q4_split_dispatch {
         if let Some(split_buf) = q4_split_sibling {
-            // LUMEN_CUDA_Q8_MMVQ: llama mmvq residual kernel takes precedence.
-            // grid = out_dim (ONE row/CTA), block = 128 (4 warps). Near-tie;
-            // per-fragment -4*x_sum half-correction.
-            if kernels.use_mmvq {
+            // LUMEN_CUDA_Q4_MMVQ (default-OFF; measured-negative): llama mmvq
+            // residual kernel for the Q4 split path. grid = out_dim (ONE row/CTA),
+            // block = 128 (4 warps). Near-tie; per-fragment -4*x_sum half-correction.
+            if kernels.use_mmvq_q4 {
                 if let Some(mv_fn) = kernels.matvec_q4_split_q8_1_mmvq_residual.as_ref() {
                     let out_dim_u32 = out_dim as u32;
                     let in_dim_u32 = in_dim as u32;
@@ -13478,12 +13479,27 @@ impl ComputeBackend for CudaBackend {
         // takes precedence over the scalar/v4 (Q8 split), locked/unlocked (Q4
         // split), and scalar/hw (Q8Aligned) kernels. Near-tie: GQ+router gated,
         // NOT DET byte-identical.
-        let any_mmvq_loaded = kernels.matvec_q8_split_q8_1_mmvq.is_some()
-            || kernels.matvec_q4_split_q8_1_mmvq.is_some()
+        // The master `LUMEN_CUDA_Q8_MMVQ` gate drives ONLY the Q8 split +
+        // Q8Aligned mmvq families (both a decode WIN: +3.9% 9B-q8, +5.3% 27B-q8;
+        // receipts §23/§26). The Q4 split mmvq path is measured-NEGATIVE
+        // (27B-q4 -3.0%, 9B-q4 flat +0.15%; §24/§26), so it is gated separately
+        // below and defaults OFF.
+        let any_q8_mmvq_loaded = kernels.matvec_q8_split_q8_1_mmvq.is_some()
             || kernels.matvec_q8_aligned_q8_1_mmvq.is_some();
-        kernels.use_mmvq = use_q8_mmvq && any_mmvq_loaded;
+        kernels.use_mmvq = use_q8_mmvq && any_q8_mmvq_loaded;
         if use_q8_mmvq && !kernels.use_mmvq {
-            eprintln!("[CUDA] LUMEN_CUDA_Q8_MMVQ=1 set but prerequisites missing (no mmvq kernels loaded); using existing scalar/v4/locked/aligned kernels");
+            eprintln!("[CUDA] LUMEN_CUDA_Q8_MMVQ=1 set but prerequisites missing (no Q8 mmvq kernels loaded); using existing scalar/v4/aligned kernels");
+        }
+        // LUMEN_CUDA_Q4_MMVQ (default-OFF): the Q4 split mmvq path is
+        // measured-negative; its kernels stay loaded but are opt-in only, for a
+        // future re-gate if new evidence emerges. `=1` routes Q4 split decode
+        // through `matvec_q4_split_q8_1_mmvq[_residual]` (near-tie; GQ+router gated).
+        let use_q4_mmvq = parse_env_truthy("LUMEN_CUDA_Q4_MMVQ").unwrap_or(false);
+        kernels.use_mmvq_q4 = use_q4_mmvq && kernels.matvec_q4_split_q8_1_mmvq.is_some();
+        if use_q4_mmvq && !kernels.use_mmvq_q4 {
+            eprintln!("[CUDA] LUMEN_CUDA_Q4_MMVQ=1 set but the Q4 split mmvq kernel is not loaded; using the scalar/locked Q4 split kernel");
+        } else if kernels.use_mmvq_q4 {
+            eprintln!("[CUDA] LUMEN_CUDA_Q4_MMVQ=1: Q4 split decode matvec uses the llama mmvq port (measured-negative default-OFF; opt-in)");
         }
 
         // pre-allocate MoE scratch when the model declares experts.
