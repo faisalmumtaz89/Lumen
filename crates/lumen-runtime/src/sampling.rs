@@ -902,6 +902,23 @@ fn apply_penalty_one(logits: &mut [f32], tok: u32, count: u32, rep: f32, presenc
 /// Mask all logits outside the top-K to `-inf`. Caller clamps to
 /// `0 < k < len`.
 fn apply_top_k(logits: &mut [f32], k: usize) {
+    // k == 1 is deterministic greedy: keep EXACTLY the lowest-index maximum
+    // and mask every other token to -inf. A plain "strictly below cutoff"
+    // mask keeps ALL tokens tied at the max, which lets the downstream
+    // categorical draw pick a higher-index tie — contradicting the
+    // `top_k_one_acts_as_greedy` contract (top_k=1 == deterministic argmax).
+    // Reusing `argmax` gives the same lowest-index tie-break as the greedy
+    // path. For a unique max this keeps the same single token as the cutoff
+    // mask, so only exact-tie k==1 behaviour changes.
+    if k == 1 {
+        let keep = argmax(logits);
+        for (i, v) in logits.iter_mut().enumerate() {
+            if i != keep {
+                *v = f32::NEG_INFINITY;
+            }
+        }
+        return;
+    }
     // Find the k-th largest value via a sort on a copy. O(n log n) -- the
     // spec is correctness-first; a quickselect refactor is a later
     // optimization.
@@ -1154,6 +1171,153 @@ mod tests {
             ..SamplingParams::default()
         });
         for _ in 0..50 {
+            assert_eq!(s.sample(&mut logits.clone()), 1);
+        }
+    }
+
+    #[test]
+    fn top_k_one_exact_tie_breaks_to_lowest_index() {
+        // Companion to `top_k_one_acts_as_greedy` (above): top_k=1 must behave
+        // as a DETERMINISTIC lowest-index argmax even when the maximum logit is
+        // tied across several tokens. Here index 1 and index 2 both hold the
+        // max (2.0). Before the fix, `apply_top_k` masked only strictly-below
+        // tokens, keeping BOTH tied maxima, so the categorical draw could land
+        // on index 2. The contract requires index 1 (lowest-index max), every
+        // draw, every seed.
+        let logits = vec![1.0, 2.0, 2.0, 0.5];
+        for seed in [1u64, 2, 7, 42, 0xC0FFEE, 0xDEAD_BEEF] {
+            let mut s = Sampler::new(SamplingParams {
+                temperature: 1.0,
+                top_k: Some(1),
+                seed: Some(seed),
+                ..SamplingParams::default()
+            });
+            for _ in 0..50 {
+                assert_eq!(
+                    s.sample(&mut logits.clone()),
+                    1,
+                    "top_k=1 must select the lowest-index tied max (seed {seed})"
+                );
+            }
+        }
+
+        // Direct `apply_top_k` assertion: only the lowest-index max survives;
+        // every other token — including the index-2 tie — is masked to -inf.
+        let mut l = logits.clone();
+        apply_top_k(&mut l, 1);
+        assert_eq!(l[1], 2.0, "lowest-index max kept");
+        assert_eq!(l[0], f32::NEG_INFINITY);
+        assert_eq!(l[2], f32::NEG_INFINITY, "index-2 tie masked");
+        assert_eq!(l[3], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn apply_top_k_differential_only_k1_ties_change() {
+        // Reference = the ORIGINAL pre-fix implementation (strictly-below-cutoff
+        // mask, no k==1 special case). This proves the fix changes the output
+        // of `apply_top_k` ONLY for the exact-tie k==1 case and is otherwise
+        // byte-identical (bit-for-bit, including -inf and -0.0) for every other
+        // input/k combination.
+        fn apply_top_k_reference(logits: &mut [f32], k: usize) {
+            let mut sorted: Vec<f32> = logits.iter().copied().collect();
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            let cutoff = sorted[k - 1];
+            for v in logits.iter_mut() {
+                if v.total_cmp(&cutoff).is_lt() {
+                    *v = f32::NEG_INFINITY;
+                }
+            }
+        }
+        fn bits_eq(a: &[f32], b: &[f32]) -> bool {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+        }
+
+        // NON-TIE inputs: unique maxima at every rank. New == reference for
+        // ALL k, including k==1 (unique max => same single survivor).
+        let non_tie: Vec<Vec<f32>> = vec![
+            vec![1.0, 5.0, 3.0, 2.0, 4.0],
+            vec![-3.0, -1.0, -2.0, -5.0, -0.5],
+            vec![0.0, 10.0, 20.0, 5.0, 15.0, 7.5],
+            vec![9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0],
+        ];
+        for base in &non_tie {
+            for k in 1..base.len() {
+                let mut got = base.clone();
+                let mut want = base.clone();
+                apply_top_k(&mut got, k);
+                apply_top_k_reference(&mut want, k);
+                assert!(
+                    bits_eq(&got, &want),
+                    "non-tie input must be byte-identical to reference (k={k}, input={base:?})"
+                );
+            }
+        }
+
+        // TIED inputs: k > 1 path is untouched by the fix => byte-identical.
+        let tied: Vec<Vec<f32>> = vec![
+            vec![1.0, 2.0, 2.0, 0.5],
+            vec![7.0, 7.0, 7.0, 7.0],
+            vec![0.0, 9.0, 9.0, 9.0, 1.0],
+            vec![4.0, 4.0, 1.0, 4.0, 2.0],
+        ];
+        for base in &tied {
+            for k in 2..base.len() {
+                let mut got = base.clone();
+                let mut want = base.clone();
+                apply_top_k(&mut got, k);
+                apply_top_k_reference(&mut want, k);
+                assert!(
+                    bits_eq(&got, &want),
+                    "tied input with k>1 must be byte-identical to reference (k={k}, input={base:?})"
+                );
+            }
+        }
+
+        // TIED inputs, k == 1: this is the ONLY case that changes. The fix keeps
+        // exactly the lowest-index max; the reference keeps every tied max.
+        for base in &tied {
+            let mut got = base.clone();
+            let mut want = base.clone();
+            apply_top_k(&mut got, 1);
+            apply_top_k_reference(&mut want, 1);
+            let keep = argmax(base);
+            // New: exactly one finite survivor at the lowest-index max.
+            let finite: Vec<usize> = got
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.is_finite())
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                finite,
+                vec![keep],
+                "k==1 keeps only lowest-index max (input={base:?})"
+            );
+            // And it genuinely differs from the reference whenever the max is
+            // actually tied (more than one token at the max value).
+            let max_count = base.iter().filter(|&&v| v == base[keep]).count();
+            if max_count > 1 {
+                assert!(
+                    !bits_eq(&got, &want),
+                    "k==1 on a real tie must differ from the pre-fix reference (input={base:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn greedy_path_tie_unaffected_by_fix() {
+        // The greedy path (temperature <= 0) never calls `apply_top_k`; it goes
+        // straight through `argmax`. Confirm a tied-max input still resolves to
+        // the lowest-index max there, independent of the top_k fix.
+        let logits = vec![1.0, 2.0, 2.0, 0.5];
+        let mut s = Sampler::new(SamplingParams {
+            temperature: 0.0,
+            top_k: Some(1),
+            seed: Some(1),
+            ..SamplingParams::default()
+        });
+        for _ in 0..20 {
             assert_eq!(s.sample(&mut logits.clone()), 1);
         }
     }
