@@ -8,10 +8,21 @@
 //!
 //! # Supported model family
 //!
-//! Qwen3 / Qwen3.5 ChatML with native `<tool_call>...</tool_call>` markers.
-//! The chat template renders the tool schema list into the system message
-//! between `<tools>` and `</tools>`; the assistant emits tool calls as
-//! `<tool_call>\n{"name": "fn", "arguments": {...}}\n</tool_call>` blocks.
+//! Qwen3.5 ChatML with `<tool_call>...</tool_call>` markers. Inside the markers
+//! the model emits its NATIVE protocol — a `<function=NAME>` block whose
+//! `<parameter=NAME>value</parameter>` children carry each argument as raw text
+//! (a scalar `str()`-ified, an object/array `tojson`-ed). The parser
+//! reconstructs correctly-typed JSON arguments from the advertised
+//! [`ToolSchemas`]. The OLDER `<tool_call>\n{"name","arguments"}\n</tool_call>`
+//! JSON body is still accepted (retained backward-compat) so historical callers
+//! and the legacy JSON emissions keep parsing; the body parser dispatches on
+//! whether the block opens with `{` (JSON) or `<function=` (native).
+//!
+//! The tool schema list and the native-protocol instructions live in the
+//! system message; the engine renders them from the model's EMBEDDED chat
+//! template (see `lumen_runtime::chat_template`), NOT from a hand-rolled string
+//! here — the render helpers below are retained only for the legacy JSON path
+//! and its tests.
 //!
 //! Other architectures (Llama-3, Mistral, Phi-3, ...) ship different
 //! formats. New `Renderer` / `Parser` pairs would live next to this one.
@@ -31,6 +42,9 @@
 //!   plain-text portion and the list of structured calls.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use serde_json::Value as JsonValue;
 
 // ---------------------------------------------------------------------------
 // Schema types
@@ -62,6 +76,52 @@ pub struct ParsedToolCall {
     /// Argument object as raw JSON text. Callers parse / validate this
     /// against the schema in whatever way their wire format requires.
     pub arguments_json: String,
+}
+
+/// Per-tool parameter type table used to reconstruct native-protocol tool
+/// calls. In the Qwen3.5 native protocol every `<parameter=NAME>` value is
+/// emitted as raw text (a scalar is `str()`-ified, an object/array is
+/// `tojson`-ed), so recovering correctly-typed JSON arguments requires the
+/// declared JSON-Schema `type` of each parameter — a string `"35"` and a number
+/// `35` are indistinguishable in the token stream without it.
+#[derive(Debug, Clone, Default)]
+pub struct ToolSchemas {
+    /// function name -> (parameter name -> JSON Schema `type`).
+    params: HashMap<String, HashMap<String, String>>,
+}
+
+impl ToolSchemas {
+    /// Build the type table from the advertised tools. A tool whose
+    /// `parameters_json_schema` does not parse contributes an empty entry;
+    /// parameters missing a `type` are simply absent (parsed heuristically).
+    pub fn from_tools(tools: &[ToolSchema]) -> Self {
+        let mut params = HashMap::with_capacity(tools.len());
+        for t in tools {
+            let mut pmap = HashMap::new();
+            if let Ok(schema) = serde_json::from_str::<JsonValue>(&t.parameters_json_schema) {
+                if let Some(props) = schema.get("properties").and_then(JsonValue::as_object) {
+                    for (name, spec) in props {
+                        if let Some(ty) = spec.get("type").and_then(JsonValue::as_str) {
+                            pmap.insert(name.clone(), ty.to_string());
+                        }
+                    }
+                }
+            }
+            params.insert(t.name.clone(), pmap);
+        }
+        ToolSchemas { params }
+    }
+
+    /// The declared JSON-Schema `type` of `param` on `func`, if known.
+    fn param_type(&self, func: &str, param: &str) -> Option<&str> {
+        self.params.get(func).and_then(|m| m.get(param)).map(String::as_str)
+    }
+
+    /// True when no tool schema is known (the parser falls back to the JSON
+    /// value heuristic for every parameter).
+    pub fn is_empty(&self) -> bool {
+        self.params.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +267,11 @@ pub struct StreamingParser {
     held_back: String,
     /// Body of the call we're currently parsing (only in `InsideCall`).
     current_body: String,
+    /// Tool schemas used to type the native protocol's `<parameter>` values.
+    /// `None` (the default / schemaless constructor) parses native scalars
+    /// heuristically and legacy JSON bodies exactly. Shared (`Arc`) because the
+    /// same schema set is handed to every request's parser.
+    schemas: Option<Arc<ToolSchemas>>,
 }
 
 /// What [`StreamingParser::finish`] returns.
@@ -232,6 +297,20 @@ impl StreamingParser {
             mode: ParserMode::Outside,
             held_back: String::new(),
             current_body: String::new(),
+            schemas: None,
+        }
+    }
+
+    /// Construct a parser that types native `<parameter>` values by `schemas`.
+    /// The server builds one `ToolSchemas` per request (from the advertised
+    /// tools) and hands it here so the streaming reconstruction is schema-aware
+    /// and byte-identical to the non-streaming [`parse_final_with_schemas`].
+    pub fn with_schemas(schemas: Arc<ToolSchemas>) -> Self {
+        Self {
+            mode: ParserMode::Outside,
+            held_back: String::new(),
+            current_body: String::new(),
+            schemas: Some(schemas),
         }
     }
 
@@ -304,8 +383,9 @@ impl StreamingParser {
         if let Some(pos) = find_subslice(bytes, close) {
             // body grows by input[..pos]
             self.current_body.push_str(&input[..pos]);
-            // Finalize.
-            if let Some(call) = parse_call_body(&self.current_body) {
+            // Finalize. Native `<function=>` bodies are typed by the request's
+            // schemas; legacy JSON bodies ignore them.
+            if let Some(call) = parse_call_body(&self.current_body, self.schemas.as_deref()) {
                 delta.tool_calls.push(call);
             }
             self.current_body.clear();
@@ -507,9 +587,24 @@ pub struct ParsedAssistant {
 /// Parse a full assistant message, stripping `<tool_call>...</tool_call>`
 /// blocks into the `tool_calls` list. Bytes between blocks are concatenated
 /// into `content` verbatim.
+///
+/// Schemaless: native `<parameter>` scalars are typed heuristically (fine for
+/// the CLI, which advertises no tools, and for legacy JSON bodies which arrive
+/// already typed). Use [`parse_final_with_schemas`] on the server tool path so
+/// scalar values are typed by the advertised schema.
 pub fn parse_final(assistant_text: &str) -> ParsedAssistant {
+    run_final(assistant_text, StreamingParser::new())
+}
+
+/// Schema-aware [`parse_final`]: types native `<parameter>` values by the
+/// advertised tool schemas so the batch (non-streaming) reconstruction is
+/// byte-identical to the streaming one built with the same `schemas`.
+pub fn parse_final_with_schemas(assistant_text: &str, schemas: Arc<ToolSchemas>) -> ParsedAssistant {
+    run_final(assistant_text, StreamingParser::with_schemas(schemas))
+}
+
+fn run_final(assistant_text: &str, mut p: StreamingParser) -> ParsedAssistant {
     let mut out = ParsedAssistant::default();
-    let mut p = StreamingParser::new();
     let delta = p.feed(assistant_text);
     out.content.push_str(&delta.text);
     out.tool_calls.extend(delta.tool_calls);
@@ -557,14 +652,33 @@ fn longest_marker_prefix(tail: &[u8], marker: &[u8]) -> usize {
     0
 }
 
-/// Parse a tool-call body: expects JSON of the shape
-/// `{"name": "...", "arguments": ...}`. Returns None on malformed input.
-///
-/// We hand-roll this minimal parser instead of pulling in serde. The Qwen3.5
-/// chat template fixes the exact shape; anything else is a model emission
-/// bug that we surface to the caller via "no parsed call".
-fn parse_call_body(body: &str) -> Option<ParsedToolCall> {
+/// Native-protocol markers. The assistant emits, inside `<tool_call>`:
+/// `<function=NAME>` then one `<parameter=NAME>\nVALUE\n</parameter>` per
+/// argument, then `</function>`.
+const FUNCTION_OPEN: &str = "<function=";
+const PARAM_OPEN: &str = "<parameter=";
+const PARAM_CLOSE: &str = "</parameter>";
+
+/// Parse the body between `<tool_call>` and `</tool_call>`. Dispatches on the
+/// first non-whitespace byte: `{` is the LEGACY JSON protocol (retained
+/// backward-compat), `<function=` is the Qwen3.5 NATIVE protocol. `schemas`
+/// types the native path's scalar values; it is unused by the JSON path (whose
+/// arguments arrive already typed). Returns None on a body that is neither.
+fn parse_call_body(body: &str, schemas: Option<&ToolSchemas>) -> Option<ParsedToolCall> {
     let trimmed = body.trim();
+    if trimmed.starts_with('{') {
+        return parse_json_call_body(trimmed);
+    }
+    if trimmed.contains(FUNCTION_OPEN) {
+        return parse_native_call_body(trimmed, schemas);
+    }
+    None
+}
+
+/// Parse the LEGACY JSON tool-call body `{"name": "...", "arguments": ...}`.
+/// Retained so existing callers, the server's own round-trip re-render, and any
+/// model that still emits JSON keep working. Returns None on malformed input.
+fn parse_json_call_body(trimmed: &str) -> Option<ParsedToolCall> {
     if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
         return None;
     }
@@ -574,6 +688,97 @@ fn parse_call_body(body: &str) -> Option<ParsedToolCall> {
         name,
         arguments_json,
     })
+}
+
+/// Parse the Qwen3.5 NATIVE tool-call body:
+///
+/// ```text
+/// <function=get_weather>
+/// <parameter=city>
+/// Riyadh
+/// </parameter>
+/// <parameter=unit>
+/// celsius
+/// </parameter>
+/// </function>
+/// ```
+///
+/// Reconstructs a JSON arguments object, coercing each `<parameter>` value by
+/// its declared schema type (objects/arrays JSON-parsed, numbers/booleans
+/// typed, strings kept verbatim); parameters with no known type fall back to a
+/// JSON-value heuristic. The arguments object preserves the emitted parameter
+/// order. Returns None when no `<function=NAME>` opener is present.
+fn parse_native_call_body(body: &str, schemas: Option<&ToolSchemas>) -> Option<ParsedToolCall> {
+    let fstart = body.find(FUNCTION_OPEN)? + FUNCTION_OPEN.len();
+    let after_name = &body[fstart..];
+    let name_end = after_name.find('>')?;
+    let name = after_name[..name_end].trim().to_string();
+
+    // `serde_json::Map` preserves insertion order under the `preserve_order`
+    // feature (enabled crate-wide), so the reconstructed arguments keep the
+    // model's emitted parameter order.
+    let mut map = serde_json::Map::new();
+    let mut rest = &after_name[name_end + 1..];
+    while let Some(p) = rest.find(PARAM_OPEN) {
+        let after_open = &rest[p + PARAM_OPEN.len()..];
+        let Some(pname_end) = after_open.find('>') else { break };
+        let pname = after_open[..pname_end].trim().to_string();
+        let value_region = &after_open[pname_end + 1..];
+        let Some(close) = value_region.find(PARAM_CLOSE) else { break };
+        // The template wraps the value as `>\nVALUE\n</parameter>`; strip the one
+        // leading and one trailing newline it adds, preserving VALUE's interior.
+        let raw = &value_region[..close];
+        let value = strip_one_surrounding_newline(raw);
+        let coerced = coerce_param_value(value, schemas.and_then(|s| s.param_type(&name, &pname)));
+        map.insert(pname, coerced);
+        rest = &value_region[close + PARAM_CLOSE.len()..];
+    }
+
+    Some(ParsedToolCall {
+        name,
+        arguments_json: JsonValue::Object(map).to_string(),
+    })
+}
+
+/// Strip exactly one leading and one trailing `\n` (the template's per-value
+/// framing), leaving any interior newlines of a multi-line value intact.
+fn strip_one_surrounding_newline(s: &str) -> &str {
+    let s = s.strip_prefix('\n').unwrap_or(s);
+    s.strip_suffix('\n').unwrap_or(s)
+}
+
+/// Coerce a native `<parameter>` string value into a typed JSON value using the
+/// declared schema `param_type`. Objects/arrays are JSON-parsed (they were
+/// `tojson`-ed on the way out); numbers/booleans are typed; strings are kept
+/// verbatim. When the schema is unknown the value is accepted as JSON only if it
+/// parses to a non-string composite/scalar, else treated as a string — so a
+/// bare `celsius` stays a string while `{...}`/`42`/`true` are typed.
+fn coerce_param_value(value: &str, param_type: Option<&str>) -> JsonValue {
+    let as_json = || serde_json::from_str::<JsonValue>(value.trim());
+    match param_type {
+        Some("string") => JsonValue::String(value.to_string()),
+        Some("integer") | Some("number") => as_json()
+            .ok()
+            .filter(JsonValue::is_number)
+            .unwrap_or_else(|| JsonValue::String(value.to_string())),
+        // The Qwen3.5 template renders a historical boolean argument with Python
+        // `str()` — `True` / `False` (capitalized) — so the model is trained to
+        // EMIT that form, not JSON `true`/`false`. Accept both casings; anything
+        // else stays a string. (This is the parse-side mirror of the renderer's
+        // Python-`str()`-faithful `string` filter — see chat_template.rs.)
+        Some("boolean") => match value.trim() {
+            "true" | "True" => JsonValue::Bool(true),
+            "false" | "False" => JsonValue::Bool(false),
+            _ => JsonValue::String(value.to_string()),
+        },
+        Some("object") | Some("array") => {
+            as_json().unwrap_or_else(|_| JsonValue::String(value.to_string()))
+        }
+        _ => match as_json() {
+            Ok(v) if v.is_object() || v.is_array() || v.is_number() || v.is_boolean() => v,
+            _ => JsonValue::String(value.to_string()),
+        },
+    }
 }
 
 /// Extract `"key": "string-value"` from a JSON object body. Returns the
@@ -1280,5 +1485,234 @@ mod tests {
         let d = r.feed("</think>direct answer");
         assert_eq!(d.reasoning, "");
         assert_eq!(d.content, "direct answer");
+    }
+
+    // ---- Native `<function=..><parameter=..>` protocol (Qwen3.5) ----
+
+    fn schedule_tool() -> ToolSchema {
+        ToolSchema {
+            name: "schedule_event".into(),
+            description: "Create a calendar event.".into(),
+            parameters_json_schema: r#"{"type":"object","properties":{
+                "title":{"type":"string"},
+                "date":{"type":"string"},
+                "time":{"type":"object"},
+                "attendees":{"type":"array"},
+                "count":{"type":"integer"},
+                "all_day":{"type":"boolean"}
+            }}"#
+                .into(),
+        }
+    }
+
+    /// Build a native-protocol emission for `name` with ordered `(param, value)`
+    /// pairs, exactly as the Qwen3.5 template teaches the model to emit it.
+    fn native_call(name: &str, params: &[(&str, &str)]) -> String {
+        let mut s = String::from("<tool_call>\n<function=");
+        s.push_str(name);
+        s.push_str(">\n");
+        for (p, v) in params {
+            s.push_str("<parameter=");
+            s.push_str(p);
+            s.push_str(">\n");
+            s.push_str(v);
+            s.push_str("\n</parameter>\n");
+        }
+        s.push_str("</function>\n</tool_call>");
+        s
+    }
+
+    #[test]
+    fn native_scalar_values_typed_by_schema() {
+        // string stays string (even numeric-looking date), number/boolean typed.
+        let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
+        let emission = native_call(
+            "schedule_event",
+            &[("title", "Team Sync"), ("date", "2026-08-01"), ("count", "3"), ("all_day", "true")],
+        );
+        let parsed = parse_final_with_schemas(&emission, schemas);
+        assert_eq!(parsed.content, "");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "schedule_event");
+        assert_eq!(
+            parsed.tool_calls[0].arguments_json,
+            r#"{"title":"Team Sync","date":"2026-08-01","count":3,"all_day":true}"#
+        );
+    }
+
+    #[test]
+    fn native_string_type_keeps_numeric_looking_value_a_string() {
+        // A `string`-typed parameter whose value looks like a number must stay a
+        // JSON string — the whole reason the parser is schema-aware.
+        let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
+        let emission = native_call("schedule_event", &[("date", "2026")]);
+        let parsed = parse_final_with_schemas(&emission, schemas);
+        assert_eq!(parsed.tool_calls[0].arguments_json, r#"{"date":"2026"}"#);
+    }
+
+    #[test]
+    fn native_nested_object_and_array_json_parsed() {
+        let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
+        let emission = native_call(
+            "schedule_event",
+            &[
+                ("time", r#"{"start": "14:00", "end": "15:00"}"#),
+                ("attendees", r#"["Omar", "Layla"]"#),
+            ],
+        );
+        let parsed = parse_final_with_schemas(&emission, schemas);
+        // Nested composites are reparsed to real JSON (compact re-serialization).
+        assert_eq!(
+            parsed.tool_calls[0].arguments_json,
+            r#"{"time":{"start":"14:00","end":"15:00"},"attendees":["Omar","Layla"]}"#
+        );
+    }
+
+    #[test]
+    fn native_multiline_value_interior_newlines_preserved() {
+        let schemas = Arc::new(ToolSchemas::from_tools(&[ToolSchema {
+            name: "send_message".into(),
+            description: "send".into(),
+            parameters_json_schema: r#"{"type":"object","properties":{"body":{"type":"string"}}}"#
+                .into(),
+        }]));
+        let emission = native_call("send_message", &[("body", "line one\nline two")]);
+        let parsed = parse_final_with_schemas(&emission, schemas);
+        assert_eq!(
+            parsed.tool_calls[0].arguments_json,
+            "{\"body\":\"line one\\nline two\"}"
+        );
+    }
+
+    #[test]
+    fn native_schemaless_heuristic_types_composites_and_scalars() {
+        // With no schema: `{...}`/`42`/`true` become typed, a bare word stays a
+        // string. (The CLI path is schemaless; the server path is schema-aware.)
+        let emission = native_call("f", &[("obj", "{\"a\": 1}"), ("n", "42"), ("b", "true"), ("s", "hello")]);
+        let parsed = parse_final(&emission);
+        assert_eq!(
+            parsed.tool_calls[0].arguments_json,
+            r#"{"obj":{"a":1},"n":42,"b":true,"s":"hello"}"#
+        );
+    }
+
+    #[test]
+    fn native_two_consecutive_calls() {
+        let schemas = Arc::new(ToolSchemas::from_tools(&[ToolSchema {
+            name: "get_weather".into(),
+            description: "w".into(),
+            parameters_json_schema: r#"{"type":"object","properties":{"city":{"type":"string"}}}"#
+                .into(),
+        }]));
+        let a = native_call("get_weather", &[("city", "Riyadh")]);
+        let b = native_call("get_weather", &[("city", "Jeddah")]);
+        let emission = format!("{a}\n{b}");
+        let parsed = parse_final_with_schemas(&emission, schemas);
+        assert_eq!(parsed.tool_calls.len(), 2);
+        assert_eq!(parsed.tool_calls[0].arguments_json, r#"{"city":"Riyadh"}"#);
+        assert_eq!(parsed.tool_calls[1].arguments_json, r#"{"city":"Jeddah"}"#);
+    }
+
+    #[test]
+    fn native_streaming_equals_batch_char_by_char() {
+        // The §2D stream_eq_nonstream guarantee: feeding the native emission one
+        // char at a time reconstructs the SAME call as a single-shot batch parse.
+        let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
+        let emission = format!(
+            "Sure, scheduling now. {} Done.",
+            native_call(
+                "schedule_event",
+                &[("title", "Sync"), ("count", "2"), ("time", r#"{"start": "09:00"}"#)],
+            )
+        );
+
+        let batch = parse_final_with_schemas(&emission, schemas.clone());
+
+        let mut p = StreamingParser::with_schemas(schemas);
+        let mut text = String::new();
+        let mut calls = Vec::new();
+        for ch in emission.chars() {
+            let d = p.feed(&ch.to_string());
+            text.push_str(&d.text);
+            calls.extend(d.tool_calls);
+        }
+        let fin = p.finish();
+        text.push_str(&fin.flushed_text);
+
+        assert_eq!(calls, batch.tool_calls, "streaming calls must equal batch");
+        assert_eq!(text, batch.content, "streaming text must equal batch");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments_json,
+            r#"{"title":"Sync","count":2,"time":{"start":"09:00"}}"#
+        );
+    }
+
+    #[test]
+    fn native_negative_plain_answer_is_not_a_tool_call() {
+        // The negative case (§2D case 10): a plain answer with no `<tool_call>`
+        // marker yields zero calls and verbatim content.
+        let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
+        let parsed = parse_final_with_schemas("hello", schemas);
+        assert_eq!(parsed.content, "hello");
+        assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn native_boolean_python_capitalized_coerces_to_bool() {
+        // ADVERSARIAL: the embedded template renders a boolean argument with
+        // Python `str()` (`True`/`False`), so a model trained on it emits the
+        // CAPITALIZED form. A schema-typed `boolean` MUST coerce both `True`
+        // and `False` to real JSON booleans, else `args_schema_valid` (§2D)
+        // rejects a correct call. Lowercase `true`/`false` must also still work.
+        let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
+        let cap = native_call("schedule_event", &[("title", "Sync"), ("all_day", "True")]);
+        let p = parse_final_with_schemas(&cap, schemas.clone());
+        assert_eq!(p.tool_calls[0].arguments_json, r#"{"title":"Sync","all_day":true}"#);
+
+        let capf = native_call("schedule_event", &[("all_day", "False")]);
+        let pf = parse_final_with_schemas(&capf, schemas.clone());
+        assert_eq!(pf.tool_calls[0].arguments_json, r#"{"all_day":false}"#);
+
+        let low = native_call("schedule_event", &[("all_day", "false")]);
+        let pl = parse_final_with_schemas(&low, schemas);
+        assert_eq!(pl.tool_calls[0].arguments_json, r#"{"all_day":false}"#);
+    }
+
+    #[test]
+    fn legacy_json_body_still_parses_backward_compat() {
+        // §1 step 5: the OLD Qwen2.5-era `<tool_call>{"name","arguments"}` JSON
+        // body MUST keep parsing so existing callers / the server round-trip
+        // re-render / §2G legacy paths are not broken.
+        let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
+        let legacy = "<tool_call>\n{\"name\": \"schedule_event\", \"arguments\": {\"title\": \"Sync\", \"count\": 3}}\n</tool_call>";
+        let p = parse_final_with_schemas(legacy, schemas);
+        assert_eq!(p.tool_calls.len(), 1);
+        assert_eq!(p.tool_calls[0].name, "schedule_event");
+        assert_eq!(p.tool_calls[0].arguments_json, "{\"title\": \"Sync\", \"count\": 3}");
+    }
+
+    #[test]
+    fn native_marker_split_across_stream_chunks_reconstructs() {
+        // ADVERSARIAL streaming: the `<tool_call>` open and `</tool_call>` close
+        // markers straddle chunk boundaries mid-`<function>` block; the parser
+        // must still reconstruct exactly one schema-typed call.
+        let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
+        let mut p = StreamingParser::with_schemas(schemas);
+        let mut calls = Vec::new();
+        for chunk in [
+            "Working on it <too",
+            "l_call>\n<function=schedule_e",
+            "vent>\n<parameter=title>\nSt",
+            "andup\n</parameter>\n<parameter=count>\n5\n</para",
+            "meter>\n</function>\n</tool_",
+            "call> done",
+        ] {
+            calls.extend(p.feed(chunk).tool_calls);
+        }
+        let _ = p.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "schedule_event");
+        assert_eq!(calls[0].arguments_json, r#"{"title":"Standup","count":5}"#);
     }
 }

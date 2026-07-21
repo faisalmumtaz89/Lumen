@@ -441,6 +441,10 @@ impl Tokenize for BpeTokenizerAdapter {
         )
     }
 
+    fn chat_template(&self) -> Option<&str> {
+        self.inner.chat_template()
+    }
+
     fn eos_tokens(&self) -> Vec<u32> {
         self.eos_ids.clone()
     }

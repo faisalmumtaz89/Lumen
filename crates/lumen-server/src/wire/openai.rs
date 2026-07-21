@@ -12,9 +12,11 @@
 //! Inner DTOs (messages, tool defs, tool calls) keep the original
 //! permissive behavior so forward-compatible client extras still pass.
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use lumen_runtime::engine::SamplingParams;
-use lumen_runtime::tooling::{compose_system_with_tools, ToolSchema};
+use lumen_runtime::tooling::{compose_system_with_tools, ToolSchema, ToolSchemas};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -164,7 +166,8 @@ impl ChatCompletionRequest {
             ));
         }
         let enable_thinking = self.resolve_thinking();
-        let prompt = render_chat_prompt(&self.messages, &self.tools, enable_thinking)?;
+        let prompt =
+            render_chat_prompt(&self.messages, &self.tools, enable_thinking, engine.chat_template())?;
         let prompt_tokens = engine.tokenize_for_request(&prompt);
         // Synchronous oversize guard: 400 BEFORE the 200/SSE stream opens.
         super::check_prompt_length(prompt_tokens.len(), engine.context_length())?;
@@ -359,6 +362,24 @@ fn parse_stop_field(v: Option<Value>) -> Vec<String> {
     }
 }
 
+/// Build the runtime [`ToolSchemas`] (function -> parameter -> JSON-Schema type)
+/// the native tool-call parser needs, from the OpenAI tool definitions on a
+/// request. The router hands this to the streaming / non-streaming collectors so
+/// native `<parameter>` values are typed by the advertised schema. Mirrors the
+/// `ToolSchema` conversion the manual render uses.
+pub fn tool_schemas(tools: &[ToolDef]) -> ToolSchemas {
+    let schemas: Vec<ToolSchema> = tools
+        .iter()
+        .map(|t| ToolSchema {
+            name: t.function.name.clone(),
+            description: t.function.description.clone(),
+            parameters_json_schema: serde_json::to_string(&t.function.parameters)
+                .unwrap_or_else(|_| "{}".into()),
+        })
+        .collect();
+    ToolSchemas::from_tools(&schemas)
+}
+
 /// Render a chat-completion request as a single prompt string.
 ///
 /// We do NOT apply the model's chat template here; that is the tokenizer's
@@ -383,6 +404,92 @@ fn parse_stop_field(v: Option<Value>) -> Vec<String> {
 /// are stripped by the wire layer's StopMatcher / SseSafeEmitter only on
 /// Qwen3.5 (because only Qwen3.5's special-token map contains them).
 fn render_chat_prompt(
+    messages: &[ChatMessage],
+    tools: &[ToolDef],
+    enable_thinking: bool,
+    chat_template: Option<&str>,
+) -> Result<String, ServerError> {
+    // Prefer the model's EMBEDDED chat template (Qwen3.5's native tool-calling
+    // protocol) rendered via the shared Jinja engine — the SAME renderer the CLI
+    // uses, so the two cannot drift. Falls back to the hard-coded ChatML
+    // transcript below when no template is embedded (older LBCs / synthetic test
+    // tokenizers), keeping those paths byte-identical to today.
+    if let Some(template) = chat_template {
+        return render_chat_prompt_templated(messages, tools, enable_thinking, template);
+    }
+    render_chat_prompt_manual(messages, tools, enable_thinking)
+}
+
+/// Render `messages` + `tools` through the model's embedded Jinja template.
+///
+/// Builds the render context in the shape the template consumes: message
+/// `content` is flattened to a string via the shared [`super::flatten_content`]
+/// (preserving the ROBUST-007 numeric-content 400), assistant `tool_calls` are
+/// mapped to `{function: {name, arguments}}` with the OpenAI on-wire arguments
+/// JSON STRING parsed back into an object (the template iterates it with
+/// `|items`), and each tool is the OpenAI function-tool object. A template
+/// `raise_exception` (e.g. "No user query found", "System message must be at the
+/// beginning") surfaces as a 400.
+fn render_chat_prompt_templated(
+    messages: &[ChatMessage],
+    tools: &[ToolDef],
+    enable_thinking: bool,
+    template: &str,
+) -> Result<String, ServerError> {
+    let mut msgs: Vec<Value> = Vec::with_capacity(messages.len());
+    for m in messages {
+        let content = super::flatten_content(&m.content, "messages.content")?;
+        let mut obj = serde_json::Map::new();
+        obj.insert("role".into(), Value::String(m.role.clone()));
+        obj.insert("content".into(), Value::String(content));
+        if !m.tool_calls.is_empty() {
+            let calls: Vec<Value> = m
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    // OpenAI carries arguments as a JSON string; the template
+                    // needs a mapping (`arguments | items`), so parse it back.
+                    let args = serde_json::from_str::<Value>(&tc.function.arguments)
+                        .ok()
+                        .filter(Value::is_object)
+                        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                    json!({
+                        "id": tc.id,
+                        "type": tc.call_type,
+                        "function": {"name": tc.function.name, "arguments": args},
+                    })
+                })
+                .collect();
+            obj.insert("tool_calls".into(), Value::Array(calls));
+        }
+        msgs.push(Value::Object(obj));
+    }
+    let tools_json: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": t.def_type,
+                "function": {
+                    "name": t.function.name,
+                    "description": t.function.description,
+                    "parameters": t.function.parameters,
+                },
+            })
+        })
+        .collect();
+    lumen_runtime::chat_template::render_chat_prompt(
+        template,
+        &Value::Array(msgs),
+        &Value::Array(tools_json),
+        true,
+        enable_thinking,
+    )
+    .map_err(|e| ServerError::bad_request(format!("chat template render failed: {e}")))
+}
+
+/// Hard-coded ChatML transcript, retained as the fallback for tokenizers with no
+/// embedded template. Byte-identical to the pre-embedded-template behaviour.
+fn render_chat_prompt_manual(
     messages: &[ChatMessage],
     tools: &[ToolDef],
     enable_thinking: bool,
@@ -498,10 +605,11 @@ pub fn stream_chat(
     created: u64,
     thinking: bool,
     stop: Vec<String>,
+    tool_schemas: Arc<ToolSchemas>,
 ) -> Body {
     let (tx, body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     tokio::spawn(drive_chat_stream(
-        rx, tx, model, created, true, thinking, stop,
+        rx, tx, model, created, true, thinking, stop, tool_schemas,
     ));
     body_from_byte_stream(body_rx)
 }
@@ -514,9 +622,17 @@ pub fn stream_completion(
 ) -> Body {
     let (tx, body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     // Legacy completions have no chat template / `<think>` block: thinking is
-    // always off, so the emitter's reasoning stage is a passthrough.
+    // always off, so the emitter's reasoning stage is a passthrough. No tools
+    // are advertised on the legacy surface, so the parser is schemaless.
     tokio::spawn(drive_chat_stream(
-        rx, tx, model, created, false, false, stop,
+        rx,
+        tx,
+        model,
+        created,
+        false,
+        false,
+        stop,
+        Arc::new(ToolSchemas::default()),
     ));
     body_from_byte_stream(body_rx)
 }
@@ -529,12 +645,13 @@ async fn drive_chat_stream(
     chat: bool,
     thinking: bool,
     stop: Vec<String>,
+    tool_schemas: Arc<ToolSchemas>,
 ) {
     let id = format!(
         "chatcmpl-lumen-{created:x}-{:x}",
         super::next_response_seq()
     );
-    let mut emitter = SseSafeEmitter::new(thinking);
+    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
     // F4: seed the streaming stop matcher from the request stop list. The
     // worker already truncates generation at the stop string (and reports
     // `FinishReason::StopSequence`, which it forwards via `TokenEvent::Done`);
@@ -784,8 +901,9 @@ pub async fn collect_chat(
     created: u64,
     thinking: bool,
     stop: Vec<String>,
+    tool_schemas: Arc<ToolSchemas>,
 ) -> Result<Value, ServerError> {
-    let mut emitter = SseSafeEmitter::new(thinking);
+    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
     // F4: seed from the request stop list (see `drive_chat_stream`). Empty =>
     // verbatim passthrough, byte-identical to the pre-F4 response.
     let mut stop_matcher = StopMatcher::new(stop);
@@ -930,7 +1048,10 @@ pub async fn collect_chat_from_events_with_stop(
     // test helper; no cancellation guard needed (no live
     // worker, no client-disconnect path).
     let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
-    collect_chat(pooled, model, created, thinking, stop).await
+    // Test helper exercises the legacy JSON tool-call path, which parses without
+    // schemas; the schema-aware native path is covered by the runtime tooling
+    // tests and the Modal §2D gate.
+    collect_chat(pooled, model, created, thinking, stop, Arc::new(ToolSchemas::default())).await
 }
 
 pub async fn collect_completion(
@@ -1238,12 +1359,89 @@ mod tests {
         }
     }
 
+    fn assistant_tool_call_msg(name: &str, arguments: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: Value::String(String::new()),
+            tool_call_id: None,
+            tool_calls: vec![AssistantToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                function: AssistantToolCallFn {
+                    name: name.into(),
+                    arguments: arguments.into(),
+                },
+            }],
+        }
+    }
+
+    fn tool_msg(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "tool".into(),
+            content: Value::String(content.into()),
+            tool_call_id: Some("call_1".into()),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    fn weather_tool_def() -> ToolDef {
+        ToolDef {
+            def_type: "function".into(),
+            function: ToolDefFunction {
+                name: "get_weather".into(),
+                description: "Get weather.".into(),
+                parameters: json!({"type":"object","properties":{"city":{"type":"string"}}}),
+            },
+        }
+    }
+
+    #[test]
+    fn templated_render_parses_tool_call_arguments_into_object_for_items() {
+        // The template iterates `tool_calls[].function.arguments | items`, so the
+        // server MUST parse the OpenAI on-wire arguments JSON STRING into an
+        // object; if it passed the raw string this render would error on `|items`.
+        let tmpl = "{%- for m in messages %}{%- if m.tool_calls %}{%- for tc in m.tool_calls %}{%- set f = tc.function %}fn={{ f.name }}{%- for k, v in f.arguments | items %} {{ k }}={{ v }}{%- endfor %}{%- endfor %}{%- endif %}{%- endfor %}";
+        let messages = vec![assistant_tool_call_msg(
+            "get_weather",
+            r#"{"city": "Riyadh", "unit": "celsius"}"#,
+        )];
+        let out = render_chat_prompt(&messages, &[], false, Some(tmpl)).unwrap();
+        assert_eq!(out, "fn=get_weather city=Riyadh unit=celsius");
+    }
+
+    #[test]
+    fn templated_render_groups_consecutive_tool_results_via_adjacent_loop_items() {
+        // Two consecutive `tool` messages must collapse into ONE user turn
+        // (opened before the first, closed after the last) — the template does
+        // this with loop.previtem / loop.nextitem, which requires the
+        // adjacent_loop_items feature the shared renderer enables.
+        let tmpl = "{%- for m in messages %}{%- if m.role == 'tool' %}{%- if loop.previtem and loop.previtem.role != 'tool' %}<user>{%- endif %}[{{ m.content }}]{%- if loop.last or loop.nextitem.role != 'tool' %}</user>{%- endif %}{%- else %}<{{ m.role }}>{{ m.content }}{%- endif %}{%- endfor %}";
+        let messages = vec![
+            user_msg("hi"),
+            tool_msg("A"),
+            tool_msg("B"),
+            assistant_msg("done"),
+        ];
+        let out = render_chat_prompt(&messages, &[], false, Some(tmpl)).unwrap();
+        assert_eq!(out, "<user>hi<user>[A][B]</user><assistant>done");
+    }
+
+    #[test]
+    fn templated_render_dispatches_and_builds_tool_context() {
+        // A tool is advertised: the templated path must expose `tools` (non-empty)
+        // and the flattened user content to the template.
+        let tmpl = "{%- if tools %}TOOLS={{ tools[0].function.name }}{%- endif %} U={{ messages[-1].content }}";
+        let messages = vec![user_msg("weather?")];
+        let out = render_chat_prompt(&messages, &[weather_tool_def()], false, Some(tmpl)).unwrap();
+        assert_eq!(out, "TOOLS=get_weather U=weather?");
+    }
+
     #[test]
     fn render_chat_prompt_user_only_emits_closed_think_when_disabled() {
         // enable_thinking=false (the default) MUST emit the closed empty-think
         // tail, byte-identical to the pre-reasoning-control behaviour.
         let messages = vec![user_msg("Hello")];
-        let out = render_chat_prompt(&messages, &[], false).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, None).unwrap();
         // CLI's `apply_chat_template_with_system("Hello", None)` for qwen35
         // post- produces exactly this string (see crates/lumen-cli
         // /src/tokenize.rs:273-292).
@@ -1257,7 +1455,7 @@ mod tests {
         // enable_thinking=true MUST emit the OPEN `<think>\n` tail so the
         // model produces a reasoning trace.
         let messages = vec![user_msg("Hello")];
-        let out = render_chat_prompt(&messages, &[], true).unwrap();
+        let out = render_chat_prompt(&messages, &[], true, None).unwrap();
         let expected = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n";
         assert_eq!(
             out, expected,
@@ -1268,7 +1466,7 @@ mod tests {
     #[test]
     fn render_chat_prompt_system_plus_user_emits_closed_think_when_disabled() {
         let messages = vec![system_msg("You are helpful."), user_msg("Hi")];
-        let out = render_chat_prompt(&messages, &[], false).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, None).unwrap();
         let expected = "<|im_start|>system\nYou are helpful.<|im_end|>\n\
                         <|im_start|>user\nHi<|im_end|>\n\
                         <|im_start|>assistant\n<think>\n\n</think>\n\n";
@@ -1281,7 +1479,7 @@ mod tests {
     #[test]
     fn render_chat_prompt_system_plus_user_emits_open_think_when_enabled() {
         let messages = vec![system_msg("You are helpful."), user_msg("Hi")];
-        let out = render_chat_prompt(&messages, &[], true).unwrap();
+        let out = render_chat_prompt(&messages, &[], true, None).unwrap();
         let expected = "<|im_start|>system\nYou are helpful.<|im_end|>\n\
                         <|im_start|>user\nHi<|im_end|>\n\
                         <|im_start|>assistant\n<think>\n";
@@ -1297,7 +1495,7 @@ mod tests {
         // appear ONLY at the final assistant prefix, NOT at the previous
         // assistant turn (which carries real content).
         let messages = vec![user_msg("Q1"), assistant_msg("A1"), user_msg("Q2")];
-        let out = render_chat_prompt(&messages, &[], false).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, None).unwrap();
         let expected = "<|im_start|>user\nQ1<|im_end|>\n\
                         <|im_start|>assistant\nA1<|im_end|>\n\
                         <|im_start|>user\nQ2<|im_end|>\n\
@@ -1316,7 +1514,7 @@ mod tests {
         // (The unit test in tokenize.rs guards the CLI side; this guards
         // the server side; they must produce byte-identical strings.)
         let messages = vec![user_msg("Hello")];
-        let server_out = render_chat_prompt(&messages, &[], false).unwrap();
+        let server_out = render_chat_prompt(&messages, &[], false, None).unwrap();
         let cli_out = format!(
             "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
             prompt = "Hello"

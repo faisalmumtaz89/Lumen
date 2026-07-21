@@ -24,9 +24,11 @@
 //! data: {...}
 //! ```
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use lumen_runtime::engine::SamplingParams;
-use lumen_runtime::tooling::{compose_system_with_tools, ToolSchema};
+use lumen_runtime::tooling::{compose_system_with_tools, ToolSchema, ToolSchemas};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -131,8 +133,24 @@ impl MessagesRequest {
                     .unwrap_or_else(|_| "{}".into()),
             })
             .collect();
-        let final_system = compose_system_with_tools(system_text.as_deref(), &tool_schemas);
-        let prompt = render_prompt(&final_system, &self.messages, enable_thinking)?;
+        // Prefer the model's embedded template (native tool-calling protocol),
+        // shared with the CLI and OpenAI surfaces so the three cannot drift.
+        // Fall back to the hard-coded ChatML transcript (compose the tools into
+        // the system message) when no template is embedded.
+        let prompt = match engine.chat_template() {
+            Some(tmpl) => render_prompt_templated(
+                system_text.as_deref(),
+                &self.messages,
+                &self.tools,
+                enable_thinking,
+                tmpl,
+            )?,
+            None => {
+                let final_system =
+                    compose_system_with_tools(system_text.as_deref(), &tool_schemas);
+                render_prompt(&final_system, &self.messages, enable_thinking)?
+            }
+        };
         let prompt_tokens = engine.tokenize_for_request(&prompt);
         // Synchronous oversize guard: 400 BEFORE the 200/SSE stream opens.
         super::check_prompt_length(prompt_tokens.len(), engine.context_length())?;
@@ -167,6 +185,106 @@ impl MessagesRequest {
             reasoning_budget,
         })
     }
+}
+
+/// Build the runtime [`ToolSchemas`] from Anthropic tool defs (used by the
+/// router to type native `<parameter>` values in the collectors, mirroring the
+/// OpenAI surface).
+pub fn tool_schemas(tools: &[AnthropicTool]) -> ToolSchemas {
+    let schemas: Vec<ToolSchema> = tools
+        .iter()
+        .map(|t| ToolSchema {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            parameters_json_schema: serde_json::to_string(&t.input_schema)
+                .unwrap_or_else(|_| "{}".into()),
+        })
+        .collect();
+    ToolSchemas::from_tools(&schemas)
+}
+
+/// Render the Anthropic request through the model's embedded Jinja template.
+/// Converts Anthropic's block-structured messages into the template's message
+/// shape — `tool_result` blocks become `role:"tool"` messages (the template
+/// groups consecutive ones into a single user turn), `tool_use` blocks become
+/// assistant `tool_calls` with the `input` object as `arguments` — then defers
+/// to the shared renderer so the transcript is byte-identical to the OpenAI
+/// surface's for an equivalent round-trip.
+fn render_prompt_templated(
+    system: Option<&str>,
+    messages: &[AnthropicMessage],
+    tools: &[AnthropicTool],
+    enable_thinking: bool,
+    template: &str,
+) -> Result<String, ServerError> {
+    let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
+    if let Some(s) = system {
+        if !s.is_empty() {
+            msgs.push(json!({"role": "system", "content": s}));
+        }
+    }
+    for m in messages {
+        match m.role.as_str() {
+            "user" => {
+                let (text, tool_results) =
+                    partition_tool_result_blocks(&m.content, "messages.content")?;
+                for tr in &tool_results {
+                    msgs.push(json!({"role": "tool", "content": tr}));
+                }
+                if !text.is_empty() || tool_results.is_empty() {
+                    msgs.push(json!({"role": "user", "content": text}));
+                }
+            }
+            "assistant" => {
+                let (text, tool_uses) = partition_tool_use_blocks(&m.content, "messages.content")?;
+                let mut obj = serde_json::Map::new();
+                obj.insert("role".into(), json!("assistant"));
+                obj.insert("content".into(), json!(text));
+                if !tool_uses.is_empty() {
+                    let calls: Vec<Value> = tool_uses
+                        .iter()
+                        .map(|(name, arguments_json)| {
+                            let args = serde_json::from_str::<Value>(arguments_json)
+                                .ok()
+                                .filter(Value::is_object)
+                                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                            json!({"type": "function", "function": {"name": name, "arguments": args}})
+                        })
+                        .collect();
+                    obj.insert("tool_calls".into(), Value::Array(calls));
+                }
+                msgs.push(Value::Object(obj));
+            }
+            other => {
+                return Err(ServerError::bad_request_field(
+                    format!("unknown anthropic role: {other}"),
+                    "messages[].role",
+                    "invalid_value",
+                ));
+            }
+        }
+    }
+    let tools_json: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                },
+            })
+        })
+        .collect();
+    lumen_runtime::chat_template::render_chat_prompt(
+        template,
+        &Value::Array(msgs),
+        &Value::Array(tools_json),
+        true,
+        enable_thinking,
+    )
+    .map_err(|e| ServerError::bad_request(format!("chat template render failed: {e}")))
 }
 
 fn render_prompt(
@@ -390,9 +508,10 @@ pub fn stream_messages(
     model: String,
     thinking: bool,
     stop: Vec<String>,
+    tool_schemas: Arc<ToolSchemas>,
 ) -> Body {
     let (tx, body_rx) = mpsc::channel::<Vec<u8>>(64);
-    tokio::spawn(drive_messages_stream(rx, tx, model, thinking, stop));
+    tokio::spawn(drive_messages_stream(rx, tx, model, thinking, stop, tool_schemas));
     body_from_byte_stream(body_rx)
 }
 
@@ -402,6 +521,7 @@ async fn drive_messages_stream(
     model: String,
     thinking: bool,
     stop: Vec<String>,
+    tool_schemas: Arc<ToolSchemas>,
 ) {
     let msg_id = format!(
         "msg_lumen_{:x}-{:x}",
@@ -411,7 +531,7 @@ async fn drive_messages_stream(
             .unwrap_or(0),
         super::next_response_seq()
     );
-    let mut emitter = SseSafeEmitter::new(thinking);
+    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
     // F4: seed the streaming stop matcher from `stop_sequences`. Empty =>
     // verbatim passthrough (byte-identical); see the OpenAI `drive_chat_stream`
     // note for the worker/wire division of labour.
@@ -726,8 +846,9 @@ pub async fn collect_messages(
     model: String,
     thinking: bool,
     stop: Vec<String>,
+    tool_schemas: Arc<ToolSchemas>,
 ) -> Result<Value, ServerError> {
-    let mut emitter = SseSafeEmitter::new(thinking);
+    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
     // F4: seed from `stop_sequences`. Empty => verbatim, byte-identical.
     let mut stop_matcher = StopMatcher::new(stop);
     let mut text = String::new();
@@ -854,7 +975,9 @@ mod tests {
         }
         drop(tx);
         let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
-        collect_messages(pooled, "test".into(), thinking, stop)
+        // Test helper exercises the legacy JSON tool-call path (schemaless); the
+        // schema-aware native path is covered by the runtime tests + Modal §2D.
+        collect_messages(pooled, "test".into(), thinking, stop, Arc::new(ToolSchemas::default()))
             .await
             .unwrap()
     }

@@ -89,6 +89,12 @@ pub struct BpeTokenizer {
     unicode_to_byte: HashMap<char, u8>,
     /// Special tokens: exact string -> token_id. Sorted longest-first.
     special_tokens: Vec<(String, u32)>,
+    /// The model's embedded Jinja chat template (LBC v3 `tokenizer.chat_template`).
+    /// Preserved here so [`apply_chat_template_with_system`] can render the
+    /// model's NATIVE protocol via the shared Jinja renderer instead of the
+    /// hard-coded ChatML; `None` for older LBCs / synthetic tokenizers, which
+    /// fall back to the hard-coded per-family render.
+    chat_template: Option<String>,
 }
 
 /// Pre-tokenizer regex for llama-bpe and qwen2 (GPT-4 / Llama-3 `Split`
@@ -225,7 +231,13 @@ impl BpeTokenizer {
             byte_to_unicode,
             unicode_to_byte,
             special_tokens,
+            chat_template: data.chat_template.clone(),
         }
+    }
+
+    /// The model's embedded chat template, if the LBC carried one.
+    pub fn chat_template(&self) -> Option<&str> {
+        self.chat_template.as_deref()
     }
 
     /// Encode text into token IDs (without BOS/EOS -- raw BPE output).
@@ -346,6 +358,23 @@ impl BpeTokenizer {
         system: Option<&str>,
         enable_thinking: bool,
     ) -> String {
+        // Prefer the model's EMBEDDED chat template, rendered through the shared
+        // Jinja engine, for Qwen3.5: this makes the CLI advertise the model's
+        // NATIVE tool-calling protocol and byte-matches the pinned template
+        // (resolves §2H's trailing-whitespace mismatches via the template's
+        // `| trim`). Fall back to the hard-coded ChatML when there is no embedded
+        // template (older LBCs / synthetic test tokenizers) or if rendering ever
+        // fails, so behaviour degrades gracefully rather than panicking. Only
+        // Qwen3.5 opts in here; other families keep their existing render.
+        if self.pre_tokenizer == "qwen35" {
+            if let Some(tmpl) = self.chat_template.as_deref() {
+                if let Ok(rendered) = lumen_runtime::chat_template::render_single_turn(
+                    tmpl, system, prompt, enable_thinking,
+                ) {
+                    return rendered;
+                }
+            }
+        }
         if self.token_to_id.contains_key("<|begin_of_text|>") {
             // Llama-3 style
             let sys = system.unwrap_or(
@@ -828,6 +857,55 @@ mod tests {
         assert_eq!(
             out,
             "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+    }
+
+    /// Build a qwen35 tokenizer carrying an embedded chat template, so
+    /// `apply_chat_template_with_system` routes through the shared Jinja renderer
+    /// instead of the hard-coded ChatML fallback.
+    fn qwen35_tokenizer_with_template(tmpl: &str) -> BpeTokenizer {
+        let data = lumen_convert::tokenizer_data::TokenizerData {
+            model_type: "gpt2".into(),
+            pre_tokenizer: "qwen35".into(),
+            tokens: vec!["a".into(), "b".into()],
+            token_types: vec![1, 1],
+            scores: vec![0.0, 0.0],
+            merges: Vec::new(),
+            bos_token_id: 0,
+            eos_token_id: 1,
+            pad_token_id: None,
+            add_bos_token: false,
+            add_eos_token: false,
+            add_space_prefix: false,
+            chat_template: Some(tmpl.to_string()),
+        };
+        BpeTokenizer::from_tokenizer_data(&data)
+    }
+
+    #[test]
+    fn qwen35_embedded_template_is_rendered_via_jinja_and_trims() {
+        // With an embedded template present, the CLI renders THROUGH it (not the
+        // hard-coded ChatML): the `| trim` strips the user whitespace the
+        // hard-coded path would keep (the §2H u_whitespace resolution), and the
+        // enable_thinking tail is honoured.
+        let tmpl = "{%- for m in messages %}{{- '<|im_start|>' + m.role + '\\n' + (m.content | trim) + '<|im_end|>\\n' }}{%- endfor %}{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- if enable_thinking is defined and enable_thinking is false %}{{- '<think>\\n\\n</think>\\n\\n' }}{%- else %}{{- '<think>\\n' }}{%- endif %}{%- endif %}";
+        let tok = qwen35_tokenizer_with_template(tmpl);
+        let out = tok.apply_chat_template_with_system("   hi   ", None, false);
+        assert_eq!(
+            out,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn qwen35_falls_back_to_hardcoded_when_no_template() {
+        // No embedded template -> hard-coded ChatML (preserves whitespace),
+        // proving the graceful fallback the synthetic tokenizers rely on.
+        let tok = minimal_qwen35_tokenizer();
+        let out = tok.apply_chat_template_with_system("Hello", None, false);
+        assert_eq!(
+            out,
+            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
     }
 

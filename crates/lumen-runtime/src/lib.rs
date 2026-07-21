@@ -13,6 +13,7 @@
 
 #[cfg(target_os = "macos")]
 pub mod accelerate;
+pub mod chat_template;
 pub mod compute;
 pub mod config;
 #[cfg(feature = "cuda")]
@@ -59,10 +60,11 @@ pub use telemetry::{
     InferenceMetrics, IoMetrics, KvCacheStats, PerLayerTiming, ServerMemoryBreakdown,
 };
 pub use tooling::{
-    parse_final, ParsedAssistant, ParsedToolCall, Qwen35Renderer, ReasoningDelta,
-    ReasoningExtractor, StreamingDelta, StreamingFinish, StreamingParser, ToolResult, ToolSchema,
-    THINK_CLOSE, TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
+    parse_final, parse_final_with_schemas, ParsedAssistant, ParsedToolCall, Qwen35Renderer,
+    ReasoningDelta, ReasoningExtractor, StreamingDelta, StreamingFinish, StreamingParser,
+    ToolResult, ToolSchema, ToolSchemas, THINK_CLOSE, TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
 };
+pub use chat_template::{render_chat_prompt, ChatTemplateError};
 pub use weight::cache::{CacheStats, LayerView, PrefetchHandle, PrefetchPriority, WeightProvider};
 pub use weight::provider_async::AsyncWeightProvider;
 pub use weight::provider_mmap::MmapWeightProvider;
