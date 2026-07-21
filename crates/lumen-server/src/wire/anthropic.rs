@@ -543,6 +543,11 @@ async fn drive_messages_stream(
     let mut thinking_block_open = false;
     let mut text_block_open = false;
     let mut block_count = 0usize;
+    // Set once a `tool_use` block is streamed. Mirrors the OpenAI streaming
+    // path (`emitted_any_tool_call`): the worker reports `Stop` at end-of-turn
+    // even for a tool-call turn, so the wire layer upgrades the terminal
+    // stop_reason to `tool_use` (matches the non-streaming Anthropic path).
+    let mut emitted_any_tool_call = false;
     let mut input_tokens = 0usize;
     let mut output_tokens = 0usize;
 
@@ -650,6 +655,7 @@ async fn drive_messages_stream(
                     }
                 }
                 for tc in delta.tool_calls {
+                    emitted_any_tool_call = true;
                     // Close the reasoning block before the first tool block too
                     // (reasoning precedes all answer content).
                     if thinking_block_open {
@@ -822,7 +828,14 @@ async fn drive_messages_stream(
             .send(sse_event("content_block_stop", &s.to_string()))
             .await;
     }
-    let reason = finish_reason.unwrap_or(FinishReason::Stop);
+    // A tool-call turn ends with the worker's natural `Stop`; upgrade it to
+    // `ToolCalls` so the terminal message_delta reports stop_reason "tool_use"
+    // (byte-identical to the OpenAI streaming + non-streaming Anthropic paths).
+    let reason = match finish_reason {
+        Some(FinishReason::Stop) if emitted_any_tool_call => FinishReason::ToolCalls,
+        Some(r) => r,
+        None => FinishReason::Stop,
+    };
     let delta_msg = json!({
         "type": "message_delta",
         "delta": {
@@ -1147,6 +1160,128 @@ mod tests {
         let blocks = resp["content"].as_array().unwrap();
         assert_eq!(blocks[0]["text"], "alpha ");
         assert_eq!(resp["stop_reason"], "stop_sequence");
+    }
+
+    // ---- Streaming terminal stop_reason (tool_use vs end_turn) ----
+
+    /// Drive `drive_messages_stream` over a fixed event list and return the raw
+    /// SSE byte stream as a UTF-8 string (mirrors the non-streaming helper).
+    async fn stream_messages_to_string(
+        events: Vec<TokenEvent>,
+        thinking: bool,
+        stop: Vec<String>,
+    ) -> String {
+        let (tx, rx) = mpsc::channel(events.len().max(1));
+        let return_sender = tx.clone();
+        for e in events {
+            tx.send(e).await.unwrap();
+        }
+        drop(tx);
+        let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
+        let (body_tx, mut body_rx) = mpsc::channel::<Vec<u8>>(256);
+        tokio::spawn(drive_messages_stream(
+            pooled,
+            body_tx,
+            "test".into(),
+            thinking,
+            stop,
+            Arc::new(ToolSchemas::default()),
+        ));
+        let mut out = String::new();
+        while let Some(chunk) = body_rx.recv().await {
+            out.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        out
+    }
+
+    /// Pull `delta.stop_reason` from the terminal `message_delta` SSE event.
+    fn stream_stop_reason(sse: &str) -> String {
+        for block in sse.split("\n\n") {
+            if block.contains("event: message_delta") {
+                let data = block
+                    .lines()
+                    .find_map(|l| l.strip_prefix("data: "))
+                    .expect("message_delta must carry a data line");
+                let v: Value = serde_json::from_str(data).unwrap();
+                return v["delta"]["stop_reason"].as_str().unwrap().to_string();
+            }
+        }
+        panic!("no message_delta event in stream: {sse}");
+    }
+
+    /// A streamed tool-call turn must report the terminal stop_reason
+    /// `tool_use` (the worker reports a natural `Stop`; the wire layer upgrades
+    /// it — matching the OpenAI streaming + non-streaming Anthropic paths).
+    /// Regression guard: before the fix this reported "end_turn".
+    #[tokio::test]
+    async fn stream_messages_tool_call_reports_tool_use_stop_reason() {
+        use lumen_runtime::tooling::Qwen35Renderer;
+        let call = Qwen35Renderer::render_one_call("get_weather", "{\"city\": \"Paris\"}");
+        let events = vec![
+            tok("Let me check. "),
+            tok(&call),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 3,
+                completion_tokens: 8,
+            },
+        ];
+        let sse = stream_messages_to_string(events, false, Vec::new()).await;
+        assert!(
+            sse.contains("\"type\":\"tool_use\""),
+            "stream must carry a tool_use content block: {sse}"
+        );
+        assert_eq!(
+            stream_stop_reason(&sse),
+            "tool_use",
+            "a streamed tool-call turn must report stop_reason:tool_use"
+        );
+    }
+
+    /// A plain (no-tool) streamed turn is unchanged: stop_reason `end_turn`.
+    #[tokio::test]
+    async fn stream_messages_normal_turn_reports_end_turn_stop_reason() {
+        let events = vec![
+            tok("Just a plain answer."),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 3,
+                completion_tokens: 4,
+            },
+        ];
+        let sse = stream_messages_to_string(events, false, Vec::new()).await;
+        assert!(
+            !sse.contains("\"type\":\"tool_use\""),
+            "a normal turn must not emit a tool_use block: {sse}"
+        );
+        assert_eq!(
+            stream_stop_reason(&sse),
+            "end_turn",
+            "a normal turn must keep stop_reason:end_turn"
+        );
+    }
+
+    /// The upgrade is conservative (mirrors OpenAI): a non-`Stop` worker reason
+    /// is never rewritten, even with a tool block present. `Length` stays
+    /// `max_tokens`.
+    #[tokio::test]
+    async fn stream_messages_tool_call_under_length_keeps_max_tokens() {
+        use lumen_runtime::tooling::Qwen35Renderer;
+        let call = Qwen35Renderer::render_one_call("get_weather", "{\"city\": \"Paris\"}");
+        let events = vec![
+            tok(&call),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: 3,
+                completion_tokens: 8,
+            },
+        ];
+        let sse = stream_messages_to_string(events, false, Vec::new()).await;
+        assert_eq!(
+            stream_stop_reason(&sse),
+            "max_tokens",
+            "a Length finish must not be upgraded to tool_use"
+        );
     }
 
     // ---- F5: Anthropic-valid sampler subset (top_p, top_k) ----
