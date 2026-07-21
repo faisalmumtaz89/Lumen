@@ -1436,6 +1436,25 @@ fn gdn_convstate_parity_enabled() -> bool {
     })
 }
 
+/// Resolves `LUMEN_CUDA_GDN_SKIP_DUP_QKV`. When ON *and* the decode GDN
+/// conv_state parity reprojection is active (`gdn_convstate_parity_qkv`), the
+/// redundant **normal** GDN qkv projection is SKIPPED: the parity block fully
+/// overwrites `gdn.qkv_buf` (beta=0 BF16 GemmEx / batch=1 Q8 MMQ) and nothing
+/// consumes the normal projection's result between the two dispatches (only
+/// alpha/beta/gate — none read `qkv_buf` — run in between, and each re-derives
+/// its own quantized/F16 activation from `normed`, so the normal qkv matvec
+/// leaves no consumed scratch). Removing it is therefore arithmetic-identical
+/// (BYTE-identical) — a pure dead-work elimination, validated byte-identical on
+/// MoE-bf16 (+5.99%) and MoE-Q8 (+4.87%) whole-token decode. Default ON; the
+/// skip only ever engages when the parity predicate that overwrites the buffer
+/// is itself true (MoE bf16/Q8), so dense / Q4 / non-parity paths are
+/// unaffected. Set `LUMEN_CUDA_GDN_SKIP_DUP_QKV=0` to force the legacy
+/// double-projection (A/B baseline). Cached: read per-GDN-layer per-token.
+fn gdn_skip_dup_qkv_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| parse_env_truthy("LUMEN_CUDA_GDN_SKIP_DUP_QKV").unwrap_or(true))
+}
+
 /// Resolves `LUMEN_CUDA_MOE_DECODE_F32`. Unset → OFF; AND-gated on
 /// `model_is_moe()` so DENSE models stay byte-identical regardless of the env.
 ///
@@ -4934,6 +4953,15 @@ impl CudaBackend {
                 _ => false,
             };
 
+        // LEVER (HIGHEST-EV): when the conv_state parity reprojection is active
+        // it OVERWRITES `gdn.qkv_buf` below, and nothing consumes the *normal*
+        // qkv projection between here and that overwrite (only alpha/beta/gate,
+        // none of which read `qkv_buf`; each re-derives its own activation from
+        // `normed`). So the normal qkv dispatch is pure dead work. When ON, skip
+        // it: dispatch ONLY the parity projection. Arithmetic-identical
+        // (BYTE-identical); env-gated default-OFF for the A/B gate.
+        let gdn_skip_dup_qkv = gdn_convstate_parity_qkv && gdn_skip_dup_qkv_enabled();
+
         if gdn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
             // === FUSED: RMSNorm + Q8_1 quantize in 1 dispatch ===
             // Then all 3 matvecs (QKV, alpha, beta) use launch_matvec_preq8_1
@@ -4997,19 +5025,23 @@ impl CudaBackend {
 
             // QKV matvec with pre-quantized input.
             // split-layout: prefer Q8/Q4 split siblings for the fused QKV weight.
-            unsafe {
-                launch_matvec_preq8_1_split(
-                    &self.device,
-                    &st.kernels,
-                    &lw.wq,
-                    lw.q8_split_wq.as_ref(),
-                    lw.q4_split_wq.as_ref(),
-                    q8_1_buf,
-                    &mut gdn.qkv_buf,
-                    p.qkv_dim,
-                    hidden_dim,
-                    "gdn_qkv",
-                )?;
+            // Skipped when the parity reprojection below overwrites qkv_buf
+            // (dead work: nothing consumes this result before the overwrite).
+            if !gdn_skip_dup_qkv {
+                unsafe {
+                    launch_matvec_preq8_1_split(
+                        &self.device,
+                        &st.kernels,
+                        &lw.wq,
+                        lw.q8_split_wq.as_ref(),
+                        lw.q4_split_wq.as_ref(),
+                        q8_1_buf,
+                        &mut gdn.qkv_buf,
+                        p.qkv_dim,
+                        hidden_dim,
+                        "gdn_qkv",
+                    )?;
+                }
             }
 
             // Alpha matvec with shared pre-quantized input.
@@ -5129,20 +5161,24 @@ impl CudaBackend {
             }
 
             // QKV matvec
-            unsafe {
-                launch_matvec(
-                    &self.device,
-                    &st.kernels,
-                    &lw.wq,
-                    &st.scratch.normed,
-                    &mut gdn.qkv_buf,
-                    p.qkv_dim,
-                    hidden_dim,
-                    "gdn_qkv",
-                    lw.wq_f16.as_ref(),
-                    Some(&mut st.scratch.input_f16),
-                    st.scratch.input_q8_1.as_mut(),
-                )?;
+            // Skipped when the parity reprojection below overwrites qkv_buf
+            // (dead work: nothing consumes this result before the overwrite).
+            if !gdn_skip_dup_qkv {
+                unsafe {
+                    launch_matvec(
+                        &self.device,
+                        &st.kernels,
+                        &lw.wq,
+                        &st.scratch.normed,
+                        &mut gdn.qkv_buf,
+                        p.qkv_dim,
+                        hidden_dim,
+                        "gdn_qkv",
+                        lw.wq_f16.as_ref(),
+                        Some(&mut st.scratch.input_f16),
+                        st.scratch.input_q8_1.as_mut(),
+                    )?;
+                }
             }
 
             // Alpha + Beta matvec.
