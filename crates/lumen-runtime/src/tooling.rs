@@ -101,8 +101,8 @@ impl ToolSchemas {
             if let Ok(schema) = serde_json::from_str::<JsonValue>(&t.parameters_json_schema) {
                 if let Some(props) = schema.get("properties").and_then(JsonValue::as_object) {
                     for (name, spec) in props {
-                        if let Some(ty) = spec.get("type").and_then(JsonValue::as_str) {
-                            pmap.insert(name.clone(), ty.to_string());
+                        if let Some(ty) = schema_scalar_type(spec) {
+                            pmap.insert(name.clone(), ty);
                         }
                     }
                 }
@@ -121,6 +121,26 @@ impl ToolSchemas {
     /// value heuristic for every parameter).
     pub fn is_empty(&self) -> bool {
         self.params.is_empty()
+    }
+}
+
+/// Extract a scalar JSON-Schema `type` for coercion. Accepts either a plain
+/// string type (`"type": "string"`) or JSON-Schema's array-of-types union
+/// (`"type": ["string", "null"]` — a *nullable* parameter, common in real
+/// tool / MCP schemas), returning the first non-`"null"` member. `anyOf` /
+/// `oneOf` / `$ref` and a missing `type` return `None`, so those parameters
+/// fall to the value heuristic (unchanged behaviour). Resolving the union to
+/// its non-null member is what lets a nullable-`string` param coerce a bare
+/// `35` to the string `"35"` instead of the JSON number `35`.
+fn schema_scalar_type(spec: &JsonValue) -> Option<String> {
+    match spec.get("type") {
+        Some(JsonValue::String(s)) => Some(s.clone()),
+        Some(JsonValue::Array(members)) => members
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .find(|s| *s != "null")
+            .map(str::to_string),
+        _ => None,
     }
 }
 
@@ -719,6 +739,13 @@ fn parse_native_call_body(body: &str, schemas: Option<&ToolSchemas>) -> Option<P
     // model's emitted parameter order.
     let mut map = serde_json::Map::new();
     let mut rest = &after_name[name_end + 1..];
+    // Known limitation (RISK-2): a `<parameter>` value that itself contains the
+    // literal `</parameter>` (or `</tool_call>` at the outer streaming marker
+    // scan) truncates the block early. The trained Qwen3.5 format never emits
+    // those markers inside a value, and because the batch and streaming paths
+    // scan for the SAME markers, any such truncation is byte-identical on both —
+    // so the streaming==batch guarantee is preserved. Not rewritten to a full
+    // nested parser: that carries regression risk for no observed benefit.
     while let Some(p) = rest.find(PARAM_OPEN) {
         let after_open = &rest[p + PARAM_OPEN.len()..];
         let Some(pname_end) = after_open.find('>') else { break };
@@ -1714,5 +1741,45 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "schedule_event");
         assert_eq!(calls[0].arguments_json, r#"{"title":"Standup","count":5}"#);
+    }
+
+    #[test]
+    fn nullable_string_param_coerces_numericlike_to_string() {
+        // JSON-Schema union `["string","null"]` (a nullable string — common in
+        // real tool/MCP schemas) must be treated as `string`, so a bare `35`
+        // stays the string "35", not the JSON number 35 (the schema-aware
+        // guarantee; before the union-type fix this fell to the heuristic).
+        let tool = ToolSchema {
+            name: "f".into(),
+            description: String::new(),
+            parameters_json_schema:
+                r#"{"type":"object","properties":{"code":{"type":["string","null"]}}}"#.into(),
+        };
+        let schemas = ToolSchemas::from_tools(&[tool]);
+        let call = parse_native_call_body(
+            "<function=f>\n<parameter=code>\n35\n</parameter>\n</function>",
+            Some(&schemas),
+        )
+        .unwrap();
+        assert_eq!(call.name, "f");
+        assert_eq!(call.arguments_json, r#"{"code":"35"}"#);
+    }
+
+    #[test]
+    fn nullable_integer_param_coerces_to_number() {
+        // `["null","integer"]` resolves to `integer`, so the value is a number.
+        let tool = ToolSchema {
+            name: "f".into(),
+            description: String::new(),
+            parameters_json_schema:
+                r#"{"type":"object","properties":{"n":{"type":["null","integer"]}}}"#.into(),
+        };
+        let schemas = ToolSchemas::from_tools(&[tool]);
+        let call = parse_native_call_body(
+            "<function=f>\n<parameter=n>\n35\n</parameter>\n</function>",
+            Some(&schemas),
+        )
+        .unwrap();
+        assert_eq!(call.arguments_json, r#"{"n":35}"#);
     }
 }

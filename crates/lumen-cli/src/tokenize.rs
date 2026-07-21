@@ -362,16 +362,25 @@ impl BpeTokenizer {
         // Jinja engine, for Qwen3.5: this makes the CLI advertise the model's
         // NATIVE tool-calling protocol and byte-matches the pinned template
         // (resolves §2H's trailing-whitespace mismatches via the template's
-        // `| trim`). Fall back to the hard-coded ChatML when there is no embedded
-        // template (older LBCs / synthetic test tokenizers) or if rendering ever
-        // fails, so behaviour degrades gracefully rather than panicking. Only
-        // Qwen3.5 opts in here; other families keep their existing render.
+        // `| trim`). Only Qwen3.5 opts in here; other families keep their
+        // existing render. The hard-coded ChatML below is the fallback ONLY when
+        // there is no embedded template (older LBCs / synthetic test tokenizers);
+        // a present-but-unrenderable template is surfaced LOUDLY (never silently
+        // reverted), because a silent revert would re-advertise the OLD
+        // `<tool_call>{json}` protocol and drop the template's `| trim` — i.e.
+        // reintroduce the exact prompt-divergence this renderer exists to remove.
         if self.pre_tokenizer == "qwen35" {
             if let Some(tmpl) = self.chat_template.as_deref() {
-                if let Ok(rendered) = lumen_runtime::chat_template::render_single_turn(
+                match lumen_runtime::chat_template::render_single_turn(
                     tmpl, system, prompt, enable_thinking,
                 ) {
-                    return rendered;
+                    Ok(rendered) => return rendered,
+                    Err(e) => {
+                        eprintln!(
+                            "Error: failed to render the model's embedded chat template: {e}"
+                        );
+                        std::process::exit(1);
+                    }
                 }
             }
         }
