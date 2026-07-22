@@ -731,7 +731,22 @@ async fn drive_chat_stream(
         match evt {
             TokenEvent::PrefillDone { .. } => {}
             TokenEvent::Token { delta_text, .. } => {
-                let delta = emitter.push(&delta_text);
+                // RAW passthrough for /v1/completions (`chat == false`): the
+                // legacy surface returns the decoded model text VERBATIM — no
+                // reasoning split and no tool-call parsing/stripping — so tool
+                // markers (`<tool_call>` / `<function=`) reach the client and
+                // the endpoint remains a faithful raw-emission oracle for the
+                // pre-parser model output. Stop matching still applies.
+                // `/v1/chat/completions` (`chat == true`) is unchanged.
+                let delta = if chat {
+                    emitter.push(&delta_text)
+                } else {
+                    crate::sse::EmitDelta {
+                        reasoning: String::new(),
+                        text: delta_text,
+                        tool_calls: Vec::new(),
+                    }
+                };
                 // Reasoning trace (chat only): emit `delta.reasoning_content`
                 // chunks BEFORE answer content. The trace bypasses the stop
                 // matcher (stop sequences apply to the answer, not the trace).
@@ -1132,8 +1147,10 @@ pub async fn collect_completion(
     created: u64,
     stop: Vec<String>,
 ) -> Result<Value, ServerError> {
-    // Legacy completions have no `<think>` block: thinking off (passthrough).
-    let mut emitter = SseSafeEmitter::new(false);
+    // RAW passthrough: the legacy completions surface returns the decoded
+    // model text VERBATIM — no SseSafeEmitter reasoning/tool stage (which
+    // would strip `<tool_call>` / `<function=` blocks) — so the endpoint is a
+    // faithful raw-emission oracle for the pre-parser model output.
     // F4: seed from the request stop list. Empty => verbatim, byte-identical.
     let mut stop_matcher = StopMatcher::new(stop);
     let mut text = String::new();
@@ -1145,8 +1162,7 @@ pub async fn collect_completion(
         match evt {
             TokenEvent::PrefillDone { .. } => {}
             TokenEvent::Token { delta_text, .. } => {
-                let delta = emitter.push(&delta_text);
-                let (safe_text, hit_stop) = stop_matcher.push(&delta.text);
+                let (safe_text, hit_stop) = stop_matcher.push(&delta_text);
                 text.push_str(&safe_text);
                 if hit_stop {
                     // Wire-side stop match -> StopSequence (renders OpenAI "stop").
@@ -1169,14 +1185,9 @@ pub async fn collect_completion(
             TokenEvent::Error(msg) => return Err(ServerError::classify_runtime(msg)),
         }
     }
-    let (residual, _) = emitter.finish();
     if finish != FinishReason::StopSequence {
-        let (residual_safe, _) = if stop_matcher.is_active() {
-            stop_matcher.push(&residual.text)
-        } else {
-            (residual.text.clone(), false)
-        };
-        text.push_str(&residual_safe);
+        // Only the stop matcher can be holding bytes (a partial stop-sequence
+        // prefix); with no stop list this is empty — byte-identical verbatim.
         text.push_str(&stop_matcher.finish());
     }
 
@@ -1274,6 +1285,70 @@ mod tests {
         assert_eq!(v["usage"]["total_tokens"], 10);
         let n = frames.iter().filter(|f| f.contains("\"usage\"")).count();
         assert_eq!(n, 1, "exactly one usage chunk: {sse}");
+    }
+
+    /// /v1/completions is a RAW surface: tool markers pass through VERBATIM
+    /// (non-streaming). Before the fix the SseSafeEmitter stripped the
+    /// `<tool_call>` block out of `choices[0].text`.
+    #[tokio::test]
+    async fn collect_completion_passes_tool_markers_verbatim() {
+        let raw = "prefix <tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call> suffix";
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let return_sender = tx.clone();
+        // Split mid-marker to prove nothing is held back or stripped across
+        // chunk boundaries on the raw path.
+        for part in [
+            "prefix <tool_",
+            "call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_",
+            "call> suffix",
+        ] {
+            tx.send(tok(part)).await.unwrap();
+        }
+        tx.send(TokenEvent::Done {
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 4,
+            completion_tokens: 9,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
+        let resp = collect_completion(pooled, "test-model".into(), 1234, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(resp["choices"][0]["text"].as_str().unwrap(), raw);
+        assert_eq!(resp["usage"]["total_tokens"], 13);
+    }
+
+    /// Streaming /v1/completions: the concatenated `choices[0].text` deltas
+    /// equal the verbatim model text, tool markers included (no stripping, no
+    /// held-back marker prefixes).
+    #[tokio::test]
+    async fn stream_completion_passes_tool_markers_verbatim() {
+        let raw = "prefix <tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call> suffix";
+        let events = vec![
+            tok("prefix <tool_"),
+            tok("call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_"),
+            tok("call> suffix"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 4,
+                completion_tokens: 9,
+            },
+        ];
+        let sse = stream_openai_to_string(events, false, false).await;
+        let mut text = String::new();
+        for frame in sse.split("\n\n").filter_map(|b| b.trim().strip_prefix("data: ")) {
+            if frame == "[DONE]" {
+                continue;
+            }
+            let v: Value = serde_json::from_str(frame).unwrap();
+            if let Some(t) = v["choices"][0]["text"].as_str() {
+                text.push_str(t);
+            }
+        }
+        assert_eq!(text, raw);
+        assert!(!sse.contains("\"usage\""), "legacy surface has no usage chunk");
     }
 
     /// Absent `stream_options.include_usage`, NO usage chunk is emitted — the
