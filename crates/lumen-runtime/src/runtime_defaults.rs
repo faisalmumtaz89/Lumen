@@ -198,9 +198,48 @@ pub(crate) fn model_block_count() -> u32 {
 }
 
 /// Per-class default for `LUMEN_CUDA_ATTN_PRECISE` (prefill WMMA attention
-/// precision). `2` = pvf32 (exact-F32 P@V, F16 QK^T — heals the WMMA F16
-/// P@V-mantissa token-flips at 94.6% of WMMA prefill perf); `0` = legacy
-/// F16 WMMA.
+/// precision). Mode map for the batch-≥16 WMMA full-attention prefill kernel:
+/// `0` = legacy F16 WMMA (both QK^T and P@V rounded to F16 operands);
+/// `1` = qkf32 (exact-F32 QK^T, F16 P@V); `2` = pvf32 (F16 QK^T, exact-F32
+/// P@V); `3` = scalar (exact-F32 QK^T **and** exact-F32 P@V — the F32 Br=4
+/// scalar kernel, both dispatch sites route mode 3 there); `4` = split
+/// (hi/lo tensor-core approximation, unqualified).
+///
+/// **Ratified default (2026-07-22): `3` (scalar) for every supported
+/// production class.** codex-sol RCA (F32-golden L3 trace) proved the
+/// batch-≥16 WMMA prefill has TWO independent precision carriers, and the
+/// prior pvf32 default only closed one of them:
+///
+///   * **P@V F16 carrier** — closed by AP=2 (pvf32). This is the GQ-014
+///     multi-turn heal documented below; exact-F32 P@V is *required* and must
+///     be preserved.
+///   * **QK^T F16 carrier** — closed only by exact-F32 QK^T. The F16 QK^T
+///     score matmul rounds Q/K operands to half BEFORE the (already-F32)
+///     accumulator, discarding mantissa bits that flip score ordering. On the
+///     cuda/9B/Q8_0 golden this flips **case-08** (Lumen emits `35`; the
+///     HF-F32 golden and llama.cpp `-fa 0` both emit the correct `28`). The
+///     L3 attention distribution — not global hidden-state L2 — is the
+///     decisive signal: under the F16-QK default the L3 top-token/mass
+///     diverges from the golden (~0.193 trace delta); AP=3 collapses it.
+///
+/// Why `3` and not `1` (qkf32): AP=1 closes the QK^T carrier but REOPENS the
+/// F16 P@V hole that AP=2 was introduced to fix, so it regresses GQ-014 (the
+/// RCA lever bisect below already recorded "AP=1 QK^T-only does NOT heal"
+/// GQ-014). AP=3 makes BOTH matmuls exact-F32, so it is the only existing
+/// mode structurally guaranteed to satisfy both carriers simultaneously. The
+/// cost is prefill-only (decode uses a separate F32 tiled kernel); the ≥0.95
+/// perf board is re-measured against this corrected default, not the retired
+/// F16-QK numbers.
+///
+/// Scope: the QK^T defect is weight-quant-independent — it is intrinsic to the
+/// F16 operand rounding in the WMMA score matmul — so the default broadens to
+/// EVERY class routed through this kernel (9B, 27B, MoE × Q4/Q8/BF16), not
+/// just 9B-Q8. Legacy callers that never set the block count still get
+/// conservative WMMA (`0`).
+///
+/// ---
+/// **Historical RCA (retained — this is WHY exact-F32 P@V must be preserved,
+/// i.e. why the default is AP=3 and not AP=1):**
 ///
 /// Validated 2026-06-11 (N=3 byte-deterministic quality runs per cell):
 /// pvf32 for MoE (all quants) + dense ≤32-layer (9B class) — strict wins
@@ -214,15 +253,15 @@ pub(crate) fn model_block_count() -> u32 {
 /// onto legacy all-F16 WMMA, but that path FAILS the multi-turn gate (GQ-014)
 /// on the quantised 27B cells: an F16-WMMA near-tie flip early in a longer
 /// (multi-turn) prefill derails the conversation (27b-q4 4/8, 27b-q8 6/8).
-/// The correct discriminator is **per (class × quant)** — and the lever's
-/// net effect is quant-specific, so it was decided empirically per quant
-/// (reference GPU, N≥3, runtime evidence; full validation matrix):
+/// The exact-F32 P@V (AP=2) was decided empirically per quant (reference GPU,
+/// N≥3, runtime evidence; full validation matrix). AP=3 inherits this exact
+/// P@V unchanged and adds exact QK^T on top:
 ///
-///   * 27B (64-layer) dense **Q4_0** → `2` (pvf32). pvf32 heals GQ-014
+///   * 27B (64-layer) dense **Q4_0**: pvf32 heals GQ-014
 ///     4/8→8/8 with ZERO single-prompt regression (15/15·7/8·3/3 →
 ///     15/15·8/8·3/3, GQ-002 even improves +1), N=3 cross-process
 ///     byte-identical. Re-confirmed here. **THE FIX.**
-///   * 27B (64-layer) dense **Q8_0** → `2` (pvf32). **2026-06-12
+///   * 27B (64-layer) dense **Q8_0**. **2026-06-12
 ///     re-classification**: the prior
 ///     branch excluded q8 because pvf32 appeared to regress GQ-001
 ///     (short-arith-05) + GQ-004 (vlong-explain-01) DD-REP. Further analysis
@@ -237,7 +276,7 @@ pub(crate) fn model_block_count() -> u32 {
 ///     prefill-attention P@V F16 mantissa (AP=1 QK^T-only does NOT heal, AP=2
 ///     P@V-exact DOES). With the harness-only detector calibration that lands
 ///     alongside this change, q8 → 15/15·8/8·3/3 + GQ-014 8/8. **THE FIX (q8).**
-///   * 27B (64-layer) dense **BF16** → `2` (pvf32) **paired with via-prefill
+///   * 27B (64-layer) dense **BF16**, **paired with via-prefill
 ///     ON** (see `gdn_decode_via_prefill_default`, whose 27B-bf16 carve-out is
 ///     removed alongside this). bf16 has TWO coupled carriers: prefill
 ///     attention P@V F16 (healed by AP=2) + GDN decode-recurrence per-step
@@ -251,8 +290,7 @@ pub(crate) fn model_block_count() -> u32 {
 ///     8/8→7/8 (med-reason-02, a verbosity truncation near-tie — 391 still
 ///     computed; validated against the LC reference-hardness check).
 ///     **THE FIX (bf16).**
-///   * MoE (any quant) + dense ≤32-layer (9B) → `2` (pvf32), unchanged.
-///   * dense 27B with any OTHER quant, or unset/legacy → `0` (conservative WMMA).
+///   * MoE (any quant) + dense ≤32-layer (9B): exact-F32 P@V, unchanged.
 ///
 /// Unset block count (0, legacy callers) → conservative legacy WMMA.
 /// CUDA-only: the sole consumers are the two `flash_attention_wmma_*` dispatch
@@ -262,38 +300,44 @@ pub(crate) fn model_block_count() -> u32 {
 /// build. `LUMEN_CUDA_ATTN_PRECISE=<0|1|2|3|4>` overrides either way.
 pub fn attn_precise_default() -> u8 {
     let layers = model_block_count();
-    // MoE (any quant) + dense 9B class (≤32 layers): ratified pvf32.
+    // MoE (any quant) + dense 9B class (≤32 layers): ratified AP=3 (scalar).
+    // AP=3 = exact-F32 QK^T AND exact-F32 P@V. It keeps the exact P@V that
+    // heals GQ-014 (see below) and ADDS exact QK^T to close the F16-QK score
+    // carrier that flipped case-08 (cuda/9B/Q8_0: F16-QK emits 35, golden 28).
     if model_is_moe() || (layers > 0 && layers <= 32) {
-        return 2;
+        return 3;
     }
-    // 27B (64-layer) dense class: pvf32 heals the GQ-014 multi-turn F16-WMMA
-    // near-tie flip. The per-QUANT structure is retained so future evidence can
-    // re-split, but the 2026-06-12 follow-up analysis
-    // proved AP=2 is the correct default
-    // for ALL three 27B quants:
-    //   * Q4_0 → 2 (pvf32). Re-confirmed N=3: GQ-014 4/8→8/8 with
-    //     ZERO single-prompt regression. (unchanged from the prior branch.)
-    //   * Q8_0 → 2 (pvf32). The carrier is prefill-attention P@V F16 mantissa
-    //     (lever bisect: AP=1 QK^T-only does NOT heal, AP=2 P@V-exact DOES;
-    //     GQ-014 6/8→8/8 N=3). The two prior "regressions" that excluded q8
+    // 27B (64-layer) dense class: AP=3 (scalar). Exact P@V heals the GQ-014
+    // multi-turn F16-WMMA near-tie flip (the per-QUANT bisect below), and the
+    // added exact QK^T closes the quant-independent F16-QK score carrier. The
+    // 2026-06-12 follow-up already proved exact P@V is correct for ALL three
+    // 27B quants; AP=3 preserves it and layers exact QK^T on top:
+    //   * Q4_0 → 3 (scalar). Exact P@V re-confirmed N=3: GQ-014 4/8→8/8 with
+    //     ZERO single-prompt regression. AP=3 adds exact QK^T (no P@V change).
+    //   * Q8_0 → 3 (scalar). The P@V carrier is prefill-attention P@V F16
+    //     mantissa (lever bisect: AP=1 QK^T-only does NOT heal GQ-014, AP=2
+    //     P@V-exact DOES; GQ-014 6/8→8/8 N=3) — AP=3 keeps that exact P@V and
+    //     ALSO makes QK^T exact. The two prior "regressions" that excluded q8
     //     (GQ-001 short-arith-05 + GQ-004 vlong-explain-01 DD-REP) were proven
     //     DETECTOR FALSE-POSITIVES on gold-standard outputs (full-text: 963
     //     correct, finish=stop; coherent DNS explanation) — fixed by the
     //     harness-only detector calibration that lands with this change.
-    //   * Bf16 → 2 (pvf32) AND `gdn_decode_via_prefill_default` carved back IN
+    //   * Bf16 → 3 (scalar) AND `gdn_decode_via_prefill_default` carved back IN
     //     for the 27B class (see that fn). bf16 has TWO coupled carriers:
-    //     prefill-attention P@V F16 (healed by AP=2) + GDN decode-recurrence
+    //     prefill-attention P@V F16 (healed by exact P@V) + GDN decode-recurrence
     //     per-step drift over long gens (healed by via-prefill ON). ONLY the
     //     combination heals every symptom — exactly the validated 9b-bf16 stack
-    //     (AP=2 + via-prefill, both ON). GQ-014 4/8→8/8 N=3, GQ-004 Moka
+    //     (exact P@V + via-prefill, both ON). GQ-014 4/8→8/8 N=3, GQ-004 Moka
     //     stutter eliminated. The earlier "AP=2 wrecks bf16 verylong 3/3→1/3"
     //     was part detector-FP, part a genuine stutter that via-prefill ON
     //     removes; with the FULL stack GQ-004 is 3/3.
+    // NOTE: AP=3 is NOT AP=1 (qkf32). AP=1 would close QK^T but REOPEN the F16
+    // P@V hole above and regress GQ-014; only AP=3 satisfies both carriers.
     // Other quants / unset → conservative WMMA.
     if layers > 32 {
         match model_dense_quant() {
             Some(QuantScheme::Q4_0) | Some(QuantScheme::Q8_0) | Some(QuantScheme::Bf16) => {
-                return 2;
+                return 3;
             }
             _ => {}
         }
@@ -1501,14 +1545,16 @@ mod tests {
     #[test]
     fn attn_precise_default_per_class() {
         let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-        // Validated 2026-06-11: pvf32 (2) for MoE + dense
-        // <=32-layer (9B). 2026-06-12 follow-up: the 27B (64-layer) class is
-        // now pvf32 (2) for ALL THREE quants — Q4_0 (proven, zero
-        // regression), Q8_0 (carrier = prefill P@V F16; prior "regressions"
-        // were detector false-positives, fixed by harness calibration), and BF16 (paired
-        // with via-prefill ON). Legacy callers that never set the block count
-        // still get conservative WMMA (0). The per-quant `match` arm is kept so
-        // a class can be re-split out on future evidence.
+        // Ratified 2026-07-22: AP=3 (scalar — exact-F32 QK^T AND exact-F32 P@V)
+        // for EVERY supported production class (MoE + dense 9B + dense 27B ×
+        // Q4/Q8/BF16). AP=3 keeps the exact P@V that heals GQ-014 (2026-06-11 /
+        // 2026-06-12 evidence below) and ADDS exact QK^T to close the
+        // quant-independent F16-QK score carrier that flipped case-08 (cuda/9B/
+        // Q8_0: F16-QK emits 35, HF-F32 golden 28). It is NOT AP=1 (qkf32),
+        // which would reopen the F16 P@V hole and regress GQ-014. Legacy callers
+        // that never set the block count still get conservative WMMA (0). The
+        // per-quant `match` arm is kept so a class can be re-split on future
+        // evidence.
         reset_for_tests();
         assert_eq!(
             attn_precise_default(),
@@ -1516,17 +1562,17 @@ mod tests {
             "unset block count -> legacy WMMA"
         );
 
-        // 9B (32-layer) dense: pvf32 regardless of quant.
+        // 9B (32-layer) dense: AP=3 scalar regardless of quant.
         reset_for_tests();
         set_model_block_count(32);
-        assert_eq!(attn_precise_default(), 2, "dense 9B (32 layers) -> pvf32");
+        assert_eq!(attn_precise_default(), 3, "dense 9B (32 layers) -> scalar (AP=3)");
         reset_for_tests();
         set_model_block_count(32);
         set_model_primary_quant(QuantScheme::Bf16);
         assert_eq!(
             attn_precise_default(),
-            2,
-            "dense 9B bf16 -> pvf32 (size wins)"
+            3,
+            "dense 9B bf16 -> scalar AP=3 (size wins)"
         );
 
         // 27B (64-layer) dense, per-quant discrimination — keyed on the PRIMARY
@@ -1544,20 +1590,20 @@ mod tests {
         set_model_primary_quant(QuantScheme::Q4_0);
         assert_eq!(
             attn_precise_default(),
-            2,
-            "dense 27B Q4_0 -> pvf32 (GQ-014 heal, no regression)"
+            3,
+            "dense 27B Q4_0 -> scalar AP=3 (exact P@V GQ-014 heal + exact QK^T)"
         );
         reset_for_tests();
         set_model_block_count(64);
         set_model_primary_quant(QuantScheme::Q8_0);
-        assert_eq!(attn_precise_default(), 2, "dense 27B Q8_0 -> pvf32 (GQ-014 heal, prior regressions were detector false-positives)");
+        assert_eq!(attn_precise_default(), 3, "dense 27B Q8_0 -> scalar AP=3 (exact P@V GQ-014 heal + exact QK^T; prior regressions were detector false-positives)");
         reset_for_tests();
         set_model_block_count(64);
         set_model_primary_quant(QuantScheme::Bf16);
         assert_eq!(
             attn_precise_default(),
-            2,
-            "dense 27B bf16 -> pvf32 (paired with via-prefill ON)"
+            3,
+            "dense 27B bf16 -> scalar AP=3 (exact P@V + exact QK^T, paired with via-prefill ON)"
         );
         // The crux of the 2026-06-12 root-cause: output_proj (Q8_0) must NOT be
         // what drives this — only the primary bulk scheme. Set the coarse
@@ -1572,19 +1618,19 @@ mod tests {
             "dense 27B with only output_proj=Q8_0 hint (no primary) -> legacy WMMA"
         );
 
-        // MoE: pvf32 regardless of size or quant.
+        // MoE: AP=3 scalar regardless of size or quant.
         reset_for_tests();
         set_model_block_count(64);
         set_model_is_moe(true);
-        assert_eq!(attn_precise_default(), 2, "MoE -> pvf32 regardless of size");
+        assert_eq!(attn_precise_default(), 3, "MoE -> scalar AP=3 regardless of size");
         reset_for_tests();
         set_model_block_count(64);
         set_model_is_moe(true);
         set_model_primary_quant(QuantScheme::Bf16);
         assert_eq!(
             attn_precise_default(),
-            2,
-            "MoE bf16 -> pvf32 (MoE wins over bf16 carve-out)"
+            3,
+            "MoE bf16 -> scalar AP=3 (MoE wins over bf16 carve-out)"
         );
     }
 
