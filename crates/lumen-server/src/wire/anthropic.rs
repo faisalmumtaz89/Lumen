@@ -1209,6 +1209,43 @@ mod tests {
         panic!("no message_delta event in stream: {sse}");
     }
 
+    /// The Anthropic protocol carries usage on the terminal `message_delta`.
+    /// Verify the streaming path actually populates it from the worker's Done
+    /// counts (input_tokens / output_tokens) rather than zeros — the streamed
+    /// analogue of the non-streaming `usage` object.
+    #[tokio::test]
+    async fn stream_messages_delta_reports_usage_counts() {
+        let sse = stream_messages_to_string(
+            vec![
+                TokenEvent::Token {
+                    token_id: 0,
+                    delta_text: "hello".into(),
+                },
+                TokenEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                    prompt_tokens: 7,
+                    completion_tokens: 3,
+                },
+            ],
+            false,
+            Vec::new(),
+        )
+        .await;
+        for block in sse.split("\n\n") {
+            if block.contains("event: message_delta") {
+                let data = block
+                    .lines()
+                    .find_map(|l| l.strip_prefix("data: "))
+                    .expect("message_delta must carry a data line");
+                let v: Value = serde_json::from_str(data).unwrap();
+                assert_eq!(v["usage"]["input_tokens"], 7, "input_tokens: {data}");
+                assert_eq!(v["usage"]["output_tokens"], 3, "output_tokens: {data}");
+                return;
+            }
+        }
+        panic!("no message_delta event in stream: {sse}");
+    }
+
     /// A streamed tool-call turn must report the terminal stop_reason
     /// `tool_use` (the worker reports a natural `Stop`; the wire layer upgrades
     /// it — matching the OpenAI streaming + non-streaming Anthropic paths).

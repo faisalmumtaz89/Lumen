@@ -204,6 +204,9 @@ async fn chat_completions(
     // Build the tool schemas BEFORE `into_job` consumes the request; the
     // collectors type native `<parameter>` values by them.
     let tool_schemas = std::sync::Arc::new(wire::openai::tool_schemas(&req.tools));
+    // OpenAI `stream_options.include_usage` — resolved before `into_job`
+    // consumes the request; only the streaming path consults it.
+    let include_usage = req.include_usage();
     let job = req.into_job(&state.engine)?;
     // Clone the stop list before `job` is moved into `submit`; the wire layer
     // seeds its redundant stop matcher from it (the worker enforces the actual
@@ -219,6 +222,7 @@ async fn chat_completions(
             thinking,
             stop,
             tool_schemas,
+            include_usage,
         );
         Ok(sse_response(body))
     } else {

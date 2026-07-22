@@ -115,6 +115,13 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub stream: Option<bool>,
+    /// OpenAI `stream_options` (consulted on the streaming path only). The one
+    /// field Lumen reads is `include_usage`: when true, the stream emits ONE
+    /// final chunk with empty `choices` and the `usage` totals BEFORE
+    /// `data: [DONE]` (the OpenAI contract); absent or false, no usage chunk
+    /// is emitted — byte-identical to the historical stream shape.
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
     #[serde(default)]
     pub stop: Option<Value>,
     #[serde(default)]
@@ -138,7 +145,28 @@ pub struct ChatCompletionRequest {
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
+/// OpenAI `stream_options` object (streaming requests only). Strict like the
+/// parent request struct: unknown fields 400.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamOptions {
+    /// When true, emit the final usage chunk (empty `choices` + `usage`)
+    /// before `data: [DONE]`.
+    #[serde(default)]
+    pub include_usage: Option<bool>,
+}
+
 impl ChatCompletionRequest {
+    /// True when the streaming client asked for the final usage chunk
+    /// (`stream_options: {"include_usage": true}`). Consulted only on the
+    /// streaming path; the non-streaming response always carries `usage`.
+    pub fn include_usage(&self) -> bool {
+        self.stream_options
+            .as_ref()
+            .and_then(|o| o.include_usage)
+            .unwrap_or(false)
+    }
+
     /// Resolve the per-request reasoning toggle using the single shared
     /// resolver. Precedence: top-level `enable_thinking` → vLLM
     /// `chat_template_kwargs.enable_thinking` → env override → default. The
@@ -606,10 +634,19 @@ pub fn stream_chat(
     thinking: bool,
     stop: Vec<String>,
     tool_schemas: Arc<ToolSchemas>,
+    include_usage: bool,
 ) -> Body {
     let (tx, body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     tokio::spawn(drive_chat_stream(
-        rx, tx, model, created, true, thinking, stop, tool_schemas,
+        rx,
+        tx,
+        model,
+        created,
+        true,
+        thinking,
+        stop,
+        tool_schemas,
+        include_usage,
     ));
     body_from_byte_stream(body_rx)
 }
@@ -633,6 +670,8 @@ pub fn stream_completion(
         false,
         stop,
         Arc::new(ToolSchemas::default()),
+        // The legacy surface has no `stream_options`; never emit a usage chunk.
+        false,
     ));
     body_from_byte_stream(body_rx)
 }
@@ -646,6 +685,7 @@ async fn drive_chat_stream(
     thinking: bool,
     stop: Vec<String>,
     tool_schemas: Arc<ToolSchemas>,
+    include_usage: bool,
 ) {
     let id = format!(
         "chatcmpl-lumen-{created:x}-{:x}",
@@ -663,6 +703,12 @@ async fn drive_chat_stream(
     let mut finish_reason: Option<FinishReason> = None;
     let mut tool_call_index = 0usize;
     let mut emitted_any_tool_call = false;
+    // Usage totals from the worker's `Done` event, reported in the final usage
+    // chunk when `stream_options.include_usage` was requested. On the rare
+    // wire-side stop path (the redundant net fires before the worker's Done)
+    // they remain 0 — the worker normally enforces stops first.
+    let mut prompt_tokens = 0usize;
+    let mut completion_tokens = 0usize;
 
     if chat {
         let head = json!({
@@ -777,9 +823,13 @@ async fn drive_chat_stream(
                 }
             }
             TokenEvent::Done {
-                finish_reason: fr, ..
+                finish_reason: fr,
+                prompt_tokens: p,
+                completion_tokens: c,
             } => {
                 finish_reason = Some(fr);
+                prompt_tokens = p;
+                completion_tokens = c;
                 break;
             }
             TokenEvent::Error(msg) => {
@@ -890,6 +940,28 @@ async fn drive_chat_stream(
         })
     };
     let _ = tx.send(sse_frame(&tail.to_string())).await;
+    // OpenAI `stream_options.include_usage` contract (chat only): when the
+    // client requested it, ONE extra chunk with empty `choices` and the usage
+    // totals goes out AFTER the finish chunk and BEFORE `data: [DONE]`. When
+    // not requested, nothing is emitted here — the stream stays byte-identical
+    // to the historical shape.
+    if chat && include_usage {
+        let usage = json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        });
+        if tx.send(sse_frame(&usage.to_string())).await.is_err() {
+            return;
+        }
+    }
     let _ = tx.send(sse_done()).await;
 }
 
@@ -1136,6 +1208,91 @@ mod tests {
             token_id: 0,
             delta_text: text.to_string(),
         }
+    }
+
+    /// Drive `drive_chat_stream` over a fixed event list and return the raw
+    /// SSE byte stream as a UTF-8 string (mirrors the Anthropic helper).
+    async fn stream_openai_to_string(
+        events: Vec<TokenEvent>,
+        chat: bool,
+        include_usage: bool,
+    ) -> String {
+        let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
+        let return_sender = tx.clone();
+        for e in events {
+            tx.send(e).await.unwrap();
+        }
+        drop(tx);
+        let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
+        let (body_tx, mut body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        tokio::spawn(drive_chat_stream(
+            pooled,
+            body_tx,
+            "test-model".into(),
+            1234,
+            chat,
+            false,
+            Vec::new(),
+            Arc::new(ToolSchemas::default()),
+            include_usage,
+        ));
+        let mut out = String::new();
+        while let Some(chunk) = body_rx.recv().await {
+            out.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        out
+    }
+
+    /// `stream_options.include_usage: true` -> exactly ONE extra chunk with
+    /// empty `choices` + the usage totals, positioned as the LAST data frame
+    /// before `data: [DONE]` (the OpenAI streaming contract).
+    #[tokio::test]
+    async fn stream_chat_usage_chunk_present_when_requested() {
+        let events = vec![
+            tok("hi"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 7,
+                completion_tokens: 3,
+            },
+        ];
+        let sse = stream_openai_to_string(events, true, true).await;
+        let frames: Vec<&str> = sse
+            .split("\n\n")
+            .filter_map(|b| b.trim().strip_prefix("data: "))
+            .collect();
+        assert_eq!(*frames.last().unwrap(), "[DONE]");
+        let usage_frame = frames[frames.len() - 2];
+        let v: Value = serde_json::from_str(usage_frame).unwrap();
+        assert_eq!(
+            v["choices"].as_array().unwrap().len(),
+            0,
+            "usage chunk must carry empty choices: {usage_frame}"
+        );
+        assert_eq!(v["usage"]["prompt_tokens"], 7);
+        assert_eq!(v["usage"]["completion_tokens"], 3);
+        assert_eq!(v["usage"]["total_tokens"], 10);
+        let n = frames.iter().filter(|f| f.contains("\"usage\"")).count();
+        assert_eq!(n, 1, "exactly one usage chunk: {sse}");
+    }
+
+    /// Absent `stream_options.include_usage`, NO usage chunk is emitted — the
+    /// stream stays byte-identical to the historical shape (matching OpenAI).
+    #[tokio::test]
+    async fn stream_chat_no_usage_chunk_by_default() {
+        let events = vec![
+            tok("hi"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 7,
+                completion_tokens: 3,
+            },
+        ];
+        let sse = stream_openai_to_string(events, true, false).await;
+        assert!(
+            !sse.contains("\"usage\""),
+            "no usage chunk absent the flag: {sse}"
+        );
     }
 
     #[tokio::test]
