@@ -44,26 +44,10 @@ use std::time::{Duration, Instant};
 /// construction from `LUMEN_METAL_PROFILE=1` and from `set_profile()`.
 static PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Global enable flag for GDN deep-profile mode. Read once at backend
-/// construction from `LUMEN_METAL_PROFILE_GDN=1`. When set, the GDN
-/// batched-prefill megakernel encoder is split into one CB per
-/// sub-dispatch (RMSNorm, QKV GEMM, attn-gate GEMM, alpha GEMM, beta
-/// GEMM, compute-gates, conv1d+silu, l2-norm, phase2a state, phase2b
-/// norm+gate, ssm-out GEMM, ffn-norm). Adds CPU-GPU sync overhead per
-/// split so absolute timing is inflated; the relative distribution
-/// across sub-dispatches is the informative output.
-static PROFILE_GDN_ENABLED: AtomicBool = AtomicBool::new(false);
-
 /// Returns whether Metal profiling is currently enabled.
 #[inline]
 pub(crate) fn is_enabled() -> bool {
     PROFILE_ENABLED.load(Ordering::Relaxed)
-}
-
-/// Returns whether GDN deep-profile mode is enabled. Implies `is_enabled()`.
-#[inline]
-pub(crate) fn is_gdn_deep_enabled() -> bool {
-    PROFILE_GDN_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Enable or disable Metal profiling globally.
@@ -76,22 +60,6 @@ pub(crate) fn set_enabled(on: bool) {
 pub(crate) fn init_from_env() {
     if std::env::var("LUMEN_METAL_PROFILE").ok().as_deref() == Some("1") {
         set_enabled(true);
-    }
-    // GDN deep-profile implies overall profiling.
-    if std::env::var("LUMEN_METAL_PROFILE_GDN").ok().as_deref() == Some("1") {
-        set_enabled(true);
-        PROFILE_GDN_ENABLED.store(true, Ordering::Relaxed);
-    }
-    // Commit-all-wait-once deferred census: removes the
-    // per-CB wait that injects bogus GPU idle into the split census.
-    if std::env::var("LUMEN_METAL_PROFILE_GDN_DEFER")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
-        set_enabled(true);
-        PROFILE_GDN_ENABLED.store(true, Ordering::Relaxed);
-        DEFER_ENABLED.store(true, Ordering::Relaxed);
     }
 }
 
@@ -138,65 +106,6 @@ pub(crate) fn record_section_gpu_time(gpu_secs: f64) {
         return;
     }
     let label = IN_FLIGHT_SECTION.with(|s| *s.borrow());
-    GPU_ACCUM.with(|a| {
-        let mut a = a.borrow_mut();
-        let entry = a.entry(label).or_insert((0.0, 0));
-        entry.0 += gpu_secs;
-        entry.1 += 1;
-    });
-}
-
-thread_local! {
-    /// Deferred per-CB GPU-time registry for the COMMIT-ALL-WAIT-ONCE census
-    /// The FFI split hook commits each split CB WITHOUT
-    /// waiting (Metal executes CBs on one queue in FIFO order, so ordering/RAW
-    /// correctness is preserved), records the raw CB pointer + its section label
-    /// here, and continues. At prefill end `drain_deferred_cbs()` waits on the
-    /// LAST committed CB and reads GPUStartTime/GPUEndTime of every CB, attributing
-    /// each to its label. This removes the per-CB `wait_until_completed` that
-    /// injected ~per-dispatch GPU-idle (the ssm_out 40ms artifact — a
-    /// dependency-tail kernel absorbed the drain/refill bubble of the forced sync).
-    /// Each entry: (raw MTLCommandBuffer ptr [retained], section label).
-    static DEFERRED_CBS: RefCell<Vec<(usize, &'static str)>> =
-        const { RefCell::new(Vec::new()) };
-}
-
-/// Returns whether the commit-all-wait-once deferred census is enabled.
-/// Gated by `LUMEN_METAL_PROFILE_GDN_DEFER=1` (implies deep profiling). When
-/// OFF the legacy per-CB commit+wait path is used (kept for A/B of the method
-/// itself). When ON the FFI split hook defers the wait.
-#[inline]
-pub(crate) fn is_defer_enabled() -> bool {
-    DEFER_ENABLED.load(Ordering::Relaxed)
-}
-
-static DEFER_ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// Register a committed-but-not-waited split CB (raw retained ptr) under the
-/// current in-flight label, for deferred GPU-time read. Called by the FFI
-/// split hook in defer mode. The caller MUST have retained the ptr and MUST
-/// NOT release it; `drain_deferred_cbs` releases it after reading its time.
-pub(crate) fn register_deferred_cb(raw_ptr: usize) {
-    if !is_enabled() {
-        return;
-    }
-    let label = IN_FLIGHT_SECTION.with(|s| *s.borrow());
-    DEFERRED_CBS.with(|v| v.borrow_mut().push((raw_ptr, label)));
-}
-
-/// Take the deferred-CB list (raw ptr, label), clearing the registry. The
-/// FFI layer waits on the last CB, reads each CB's GPU time, records it under
-/// its label via `record_section_gpu_time_for`, and releases each CB.
-pub(crate) fn take_deferred_cbs() -> Vec<(usize, &'static str)> {
-    DEFERRED_CBS.with(|v| std::mem::take(&mut *v.borrow_mut()))
-}
-
-/// Record GPU time under an EXPLICIT label (used by the deferred drain, where
-/// the in-flight label has already moved on).
-pub(crate) fn record_section_gpu_time_for(label: &'static str, gpu_secs: f64) {
-    if !is_enabled() {
-        return;
-    }
     GPU_ACCUM.with(|a| {
         let mut a = a.borrow_mut();
         let entry = a.entry(label).or_insert((0.0, 0));
@@ -273,8 +182,6 @@ pub(crate) fn reset_accum() {
     LAST_MARK.with(|m| *m.borrow_mut() = None);
     NEXT_SECTION.with(|n| *n.borrow_mut() = None);
     IN_FLIGHT_SECTION.with(|s| *s.borrow_mut() = "(unlabelled)");
-    // Deferred CBs are drained by the FFI layer each prefill; clear any stragglers.
-    DEFERRED_CBS.with(|v| v.borrow_mut().clear());
 }
 
 /// Snapshot of the GPU-time accumulator, sorted by total GPU time descending.

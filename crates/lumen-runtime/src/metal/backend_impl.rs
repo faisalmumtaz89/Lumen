@@ -22,13 +22,6 @@ impl ComputeBackend for MetalF32Backend {
         self.cached_hidden_dim = hyperparams.hidden_dim as usize;
         self.cached_vocab_size = hyperparams.vocab_size as usize;
 
-        // Initialise the MPSGraph context up-front so dispatch
-        // sites can look it up via `mps_graph_ffi::get()` without
-        // threading `&MetalDevice` through every encode function. The
-        // returned context is process-wide; subsequent prefill calls
-        // reuse the same compiled-graph cache.
-        let _ = super::mps_graph_ffi::get_or_init(&self.device);
-
         // Compile shader pipelines
         let pipelines = self.compile_pipelines()?;
 
@@ -262,16 +255,7 @@ impl ComputeBackend for MetalF32Backend {
             gate_buf: make_buf(inter_dim.max(q_dim))?, // max of FFN inter_dim and attn q_dim (Q+gate deinterleave)
             up_buf: make_buf(inter_dim)?,
             down_buf: make_buf(hidden_dim)?,
-            // SPLIT-K down partials: [hidden_dim * MAX_K_SPLITS(8)] f32 (env-gated kernel).
-            splitk_partials_buf: make_buf(hidden_dim * 8)?,
-            // SPLIT-K gate/up partials: gate [inter*8] + up [inter*8] f32 (env-gated).
-            splitk_gateup_partials_buf: make_buf(inter_dim * 8 * 2)?,
-            splitk_normed_buf: make_buf(hidden_dim)?,
             logits_buf: make_buf(vocab_size)?,
-            // Option-B async-commit double-buffer: allocated lazily only when the
-            // flag is on (the default synchronous path leaves it None).
-            logits_buf_b: None,
-            async_inflight_logits_b: false,
             argmax_result_buf: self.device.new_buffer(4).ok_or_else(|| {
                 RuntimeError::Compute("Failed to allocate argmax result buffer (4 bytes)".into())
             })?,
@@ -359,14 +343,6 @@ impl ComputeBackend for MetalF32Backend {
             moe_num_active_experts,
             moe_expert_inter_dim,
             moe_router_logits,
-            // 1-element atomic counter for the fused router.
-            moe_router_counter: if moe_num_experts > 0 {
-                Some(self.device.new_buffer(4).ok_or_else(|| {
-                    RuntimeError::Compute("Failed to allocate MoE router_counter buffer".into())
-                })?)
-            } else {
-                None
-            },
             moe_expert_ids,
             moe_expert_weights,
             moe_expert_output,
@@ -483,11 +459,6 @@ impl ComputeBackend for MetalF32Backend {
             // `preload_weights_gpu_resident` builds them when env-gated ON.
             repacked_ffn_down: Vec::new(),
             repacked_ffn_gate_up: Vec::new(),
-
-            // repacked Q4_0 hot-weight storage. Empty until
-            // `preload_weights_gpu_resident` builds them when env-gated ON.
-            repacked_ffn_down_q4: Vec::new(),
-            repacked_ffn_gate_up_q4: Vec::new(),
             qmv_down_qw: Vec::new(),
             qmv_down_scales: Vec::new(),
             qmv_gdn_qkv_qw: Vec::new(),
@@ -498,33 +469,27 @@ impl ComputeBackend for MetalF32Backend {
             qmv_attn_wq_scales: Vec::new(),
             qmv_attn_wo_qw: Vec::new(),
             qmv_attn_wo_scales: Vec::new(),
-            // Full-attn K/V decode-qmv buffers (LUMEN_METAL_Q4_QMV_KV). Empty
-            // until `preload_weights_gpu_resident` builds them when env-gated ON.
+            // Full-attn K/V decode-qmv buffers. Empty until
+            // `preload_weights_gpu_resident` builds them (default).
             qmv_attn_wk_qw: Vec::new(),
             qmv_attn_wk_scales: Vec::new(),
             qmv_attn_wv_qw: Vec::new(),
             qmv_attn_wv_scales: Vec::new(),
-            // GDN ssm_out decode-qmv buffers (LUMEN_METAL_Q4_QMV_SSMOUT). Empty
-            // until `preload_weights_gpu_resident` builds them when env-gated ON.
-            qmv_gdn_ssm_out_qw: Vec::new(),
-            qmv_gdn_ssm_out_scales: Vec::new(),
             // GDN ssm_out Q8->Q4 native-NR2 requant buffers
             // (LUMEN_METAL_Q4_SSMOUT_NR2). Empty until built when env-gated ON.
             q4nr2_ssm_out: Vec::new(),
-            // Dense FFN gate/up dual-matrix decode-qmv buffers
-            // (LUMEN_METAL_Q4_QMV_GATEUP). Empty until built when env-gated ON.
+            // Dense FFN gate/up dual-matrix decode-qmv buffers.
+            // Empty until built (default).
             qmv_ffn_gate_qw: Vec::new(),
             qmv_ffn_gate_scales: Vec::new(),
             qmv_ffn_up_qw: Vec::new(),
             qmv_ffn_up_scales: Vec::new(),
-            qmv_ffn_gate_up_il_qw: Vec::new(),
-            qmv_ffn_gate_up_il_scales: Vec::new(),
             qmv_ffn_gate_up_ls_qw: Vec::new(),
             qmv_ffn_gate_up_ls_scales: Vec::new(),
             qmv_zero_residual_buf: None,
             // GLOBAL Q4 lm_head decode-qmv buffers. None until
-            // `preload_weights_gpu_resident` builds them when
-            // `LUMEN_METAL_Q4_QMV_LMHEAD=1` is set at load time.
+            // `preload_weights_gpu_resident` builds them at load time (default,
+            // for a non-tied Q8_0 output_proj).
             qmv_lmhead_qw: None,
             qmv_lmhead_scales: None,
 
@@ -773,22 +738,11 @@ impl ComputeBackend for MetalF32Backend {
                 let h_state_size = gdn_num_v_heads * gdn_head_dim * gdn_head_dim;
                 let conv_state_size = (conv_kernel_size - 1) * gdn_qkv_dim;
 
-                // Persistent h_state precision: F32 (4 B/elem) or a reduced-precision
-                // bfloat/half variant (2 B/elem). Must match gpu_resident allocation.
-                let h_state_precision = crate::metal::gdn_state_precision();
-                let h_bytes = if h_state_precision == crate::metal::GdnStatePrecision::F32 {
-                    h_state_size * 4
-                } else {
-                    h_state_size * 2
-                };
-                let h_buf = self.device.new_buffer(h_bytes).ok_or_else(|| {
+                // Persistent h_state: F32 (4 B/elem).
+                let h_buf = self.device.new_buffer(h_state_size * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN h_state".into())
                 })?;
-                if h_state_precision == crate::metal::GdnStatePrecision::F32 {
-                    h_buf.write_f32(&vec![0.0f32; h_state_size]);
-                } else {
-                    h_buf.write_u16(&vec![0u16; h_state_size]);
-                }
+                h_buf.write_f32(&vec![0.0f32; h_state_size]);
 
                 let c_buf = self.device.new_buffer(conv_state_size * 4).ok_or_else(|| {
                     RuntimeError::Compute("Failed to allocate GDN conv_state".into())
@@ -796,8 +750,8 @@ impl ComputeBackend for MetalF32Backend {
                 c_buf.write_f32(&vec![0.0f32; conv_state_size]);
 
                 s.gdn_h_states.push(h_buf);
-                // Length-sync the lazy F16 h_state mirror (filled on first decode
-                // touch when LUMEN_METAL_GDN_F16_STATE_DECODE=1).
+                // Length-sync the lazy F16 h_state mirror (filled on the first decode
+                // touch by the default F16 decode recurrence).
                 s.gdn_h_states_f16.push(std::cell::RefCell::new(None));
                 s.gdn_conv_states.push(c_buf);
                 s.gdn_conv_positions.push(0);
@@ -3207,26 +3161,6 @@ impl ComputeBackend for MetalF32Backend {
         // Drain autoreleased Metal objects at every token
         // boundary. This is the dominant leak site (~120 MB/h per a prior leak attribution).
         autoreleasepool(|| self.decode_token_single_cb(token_id, weights, kv))
-    }
-
-    fn supports_async_decode(&self) -> bool {
-        // Option B (deferred-async-commit) sampled-decode path, default OFF.
-        use std::sync::OnceLock;
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var("LUMEN_METAL_DECODE_ASYNC_COMMIT").as_deref() == Ok("1"))
-    }
-
-    fn decode_token_async(
-        &self,
-        token_id: u32,
-        weights: &dyn WeightProvider,
-        kv: &mut KvCache,
-    ) -> Result<Logits, RuntimeError> {
-        autoreleasepool(|| self.decode_token_single_cb_async(token_id, weights, kv))
-    }
-
-    fn decode_flush_async(&self) -> Result<Logits, RuntimeError> {
-        autoreleasepool(|| MetalF32Backend::decode_flush_async(self))
     }
 
     fn decode_token_greedy(

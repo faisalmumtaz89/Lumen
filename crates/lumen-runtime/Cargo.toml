@@ -40,5 +40,28 @@ libc = "0.2"
 # tracks this so a bump is a reviewed PR (and re-validated on the Modal matrix).
 cudarc = { version = "=0.19.3", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "f16", "fallback-dynamic-loading", "cuda-12020"], optional = true }
 
+# Chat-template rendering. The model's chat_template is embedded in the LBC
+# (Qwen3.5 ships the NATIVE `<function=..><parameter=..>` tool-calling protocol
+# in Jinja2). Rendering it through a real Jinja engine here — instead of the
+# old hard-coded ChatML string — is the SINGLE source of truth the CLI and the
+# server both call, so their rendered prompts cannot drift from the pinned
+# template. `adjacent_loop_items` enables `loop.previtem`/`loop.nextitem` (the
+# template groups consecutive tool-result turns into one user turn with them).
+# `minijinja-contrib`'s pycompat callback supplies the Python str methods
+# (`.split`/`.startswith`/`.endswith`/`.rstrip`/`.lstrip`) the HF-authored
+# template uses, so minijinja reproduces the reference jinja2 byte-for-byte.
+# `preserve_order`: minijinja's own maps default to BTreeMap (sorted keys); this
+# makes them insertion-ordered so `tool | tojson` matches the reference jinja2.
+minijinja = { version = "2", features = ["adjacent_loop_items", "loop_controls", "preserve_order"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+# JSON is intrinsic to tool calling: building the message/tool render context,
+# schema-aware argument reconstruction, and coercing `<parameter>` values by the
+# tool schema. (Runtime avoided serde historically; tool calling requires it.)
+# `preserve_order` keeps object keys in INSERTION order so `tool | tojson` in the
+# chat template serializes keys in the order the client sent them — byte-matching
+# the reference jinja2 (`json.dumps(sort_keys=False)`), not BTreeMap-sorted.
+serde_json = { version = "1", features = ["preserve_order"] }
+serde = "1"
+
 [lints]
 workspace = true

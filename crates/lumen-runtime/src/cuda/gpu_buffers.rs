@@ -78,32 +78,6 @@ pub enum GpuWeightBuf {
     /// is preserved alongside for prefill. Consumed by `matvec_q4_split_q8_1`.
     #[allow(dead_code)]
     Q4Split(CudaSlice<u8>),
-    /// Repacked Q8_0 in per-row tile-grouped layout: each row holds
-    /// `num_tiles = nb / 8` tiles of 272 bytes (`[16 B scales][256 B quants]`),
-    /// for total `(nb/8) * 272 = 34 * nb` bytes (same density as `Q8Raw`).
-    /// Scales and quants for 8 consecutive blocks are colocated within 272
-    /// contiguous bytes, reducing L1-sector traffic vs `Q8Split` where the
-    /// two streams are `2*nb` bytes apart.
-    ///
-    /// Used only for the decode path; produced by `repack_q8_raw_to_tile()`
-    /// when `LUMEN_CUDA_Q8_TILE=1` is set at session start. Consumed by
-    /// `matvec_q8_tile_q8_1` / `matvec_q8_tile_q8_1_residual`.
-    ///
-    /// Stored as a sibling `Option<CudaSlice<u8>>` on `LayerWeightsGpu`, not
-    /// constructed directly via this enum; the variant exists so all match
-    /// sites on `GpuWeightBuf` are exhaustive.
-    #[allow(dead_code)]
-    Q8Tile(CudaSlice<u8>),
-    /// Repacked Q4_0 in per-row tile-grouped layout: each row holds
-    /// `num_tiles = nb / 8` tiles of 144 bytes (`[16 B scales][128 B nibbles]`),
-    /// for total `(nb/8) * 144 = 18 * nb` bytes (same density as `Q4Raw`).
-    /// Adapts the Q8 tile pattern to Q4_0.
-    ///
-    /// Used only for the decode path; produced by `repack_q4_raw_to_tile()`
-    /// when `LUMEN_CUDA_Q4_TILE=1` is set at session start. Consumed by
-    /// `matvec_q4_tile_q8_1` / `matvec_q4_tile_q8_1_residual`.
-    #[allow(dead_code)]
-    Q4Tile(CudaSlice<u8>),
 }
 
 /// Per-layer weight buffers resident on GPU.
@@ -173,28 +147,6 @@ pub struct LayerWeightsGpu {
     pub q4_split_w_up: Option<CudaSlice<u8>>,
     pub q4_split_w_down: Option<CudaSlice<u8>>,
 
-    // --- tile-layout integration: decode-only tile-grouped siblings
-    // (Q8 and Q4). Mirror of the q8_split_* / q4_split_* fields above
-    // but in the colocated-per-tile layout consumed by
-    // `matvec_q8_tile_q8_1` / `matvec_q4_tile_q8_1`.
-    // Populated by `repack_all_layers_q8_clone_to_tile` /
-    // `repack_all_layers_q4_clone_to_tile` when `LUMEN_CUDA_Q8_TILE=1`
-    // / `LUMEN_CUDA_Q4_TILE=1` is set at session start.
-    pub q8_tile_wq: Option<CudaSlice<u8>>,
-    pub q8_tile_wk: Option<CudaSlice<u8>>,
-    pub q8_tile_wv: Option<CudaSlice<u8>>,
-    pub q8_tile_wo: Option<CudaSlice<u8>>,
-    pub q8_tile_w_gate: Option<CudaSlice<u8>>,
-    pub q8_tile_w_up: Option<CudaSlice<u8>>,
-    pub q8_tile_w_down: Option<CudaSlice<u8>>,
-    pub q4_tile_wq: Option<CudaSlice<u8>>,
-    pub q4_tile_wk: Option<CudaSlice<u8>>,
-    pub q4_tile_wv: Option<CudaSlice<u8>>,
-    pub q4_tile_wo: Option<CudaSlice<u8>>,
-    pub q4_tile_w_gate: Option<CudaSlice<u8>>,
-    pub q4_tile_w_up: Option<CudaSlice<u8>>,
-    pub q4_tile_w_down: Option<CudaSlice<u8>>,
-
     // --- GDN-specific weights (None for standard attention layers) ---
     /// Layer type: 0 = softmax attention, 1 = GDN.
     pub layer_type: u8,
@@ -238,11 +190,9 @@ pub struct LayerWeightsGpu {
     pub q8_split_ssm_alpha: Option<CudaSlice<u8>>,
     #[allow(dead_code)]
     pub q8_split_ssm_beta: Option<CudaSlice<u8>>,
-    /// Per-row split siblings for Q4Raw GDN weights. Populated by
-    /// `repack_all_layers_gdn_q4_clone_to_split` at preload when
-    /// `LUMEN_CUDA_GDN_SPLIT=1`. The 4096x4096 ssm_out matvec is ~10% of decode
-    /// time (profile).
-    pub q4_split_ssm_out: Option<CudaSlice<u8>>,
+    /// Per-row split siblings for Q4Raw GDN weights (decode-only). Currently
+    /// always `None` (no populator); the decode projection reads them as
+    /// optional split siblings and falls back to the base Q4Raw matvec.
     pub q4_split_attn_gate: Option<CudaSlice<u8>>,
     pub q4_split_ssm_alpha: Option<CudaSlice<u8>>,
     pub q4_split_ssm_beta: Option<CudaSlice<u8>>,
@@ -788,12 +738,54 @@ fn upload_tensor(
             Ok(GpuWeightBuf::F32(gpu_buf))
         }
         QuantScheme::Bf16 => {
-            // Upload raw BF16 bytes (2 bytes per element). The custom matvec_bf16
-            // kernel dequantizes bf16→f32 on the fly. Bandwidth: 2 B/elem
-            // (same as F16) -- 2x lower than F32 dispatch, with full F32 dynamic
-            // range. Industry-standard precision for modern LLM inference.
-            let gpu_buf = device.htod_copy(raw)?;
-            Ok(GpuWeightBuf::Bf16Raw(gpu_buf))
+            // Architecture-gated bf16 upload. On sm_90+ (Hopper/H100) the native
+            // cuBLAS bf16 GemmEx path is numerically correct, so upload raw bf16
+            // (2 B/elem, VRAM-efficient) as `Bf16Raw` and consume it via the
+            // fully-wired native decode (matvec_bf16) + prefill GemmEx path. On
+            // sm_80 and below that same GemmEx bf16 path garbles every prefill
+            // projection (root cause below), so losslessly upcast to F32 (4 B/elem).
+            //
+            // VERIFIED 2026-07-15 on an H100 (cc 9.0): native bf16 is coherent
+            // (GQ-001/002/004 PASS for 9B/27B/MoE) and 2.14x faster than the
+            // F32-upcast (9B decode 113.4 vs 52.9 tok/s); the discriminator
+            // (native-vs-upcast, greedy) returned NATIVE-CORRECT-ON-H100. On sm_90+
+            // native is also VRAM-frugal enough to run 27B-bf16 (54 GB), which the
+            // F32-upcast (~108 GB) cannot fit on an 80 GB card at all.
+            let (cc_major, _cc_minor) = device.compute_capability().unwrap_or((0, 0));
+            if cc_major >= 9 {
+                let gpu_buf = device.htod_copy(raw)?;
+                return Ok(GpuWeightBuf::Bf16Raw(gpu_buf));
+            }
+            // BF16 layer weights are dequantized to F32 at load and consumed via the
+            // F32 SGEMM path (the same proven path q8/q4 GDN models already use for
+            // prefill projections).
+            //
+            // ROOT CAUSE (bf16 CUDA decode garble, [209489,248046] "administrasi"+EOS):
+            // the native cuBLAS bf16 GemmEx path (`launch_cublas_gemm_bf16` /
+            // `launch_hgemv_bf16`: CUDA_R_16BF operands + CUBLAS_COMPUTE_32F) that
+            // consumed `Bf16Raw` layer weights produced numerically wrong results on
+            // A100 — corrupting every prefill projection, so the very first sampled
+            // token (`compute_final(prefill(prompt))`) was already garbage. It went
+            // unnoticed because bf16 CUDA was only ever throughput-benched, never
+            // coherence-checked. Routing bf16 layer weights through F32 (this dequant)
+            // yields coherent output; verified on A100 (LUMEN_CUDA_BF16_FORCE_F32
+            // localization: byte-garble -> coherent 89-token generation).
+            //
+            // The dequant is LOSSLESS (bf16 is the top 16 bits of an IEEE-754 f32:
+            // `bits << 16`), so the F32 compute is at least as accurate as native bf16
+            // would be. Cost: layer weights occupy 4 B/elem instead of 2 B/elem in
+            // VRAM (fits on 80 GB with LUMEN_CUDA_MAX_SEQ_LEN capped, which bf16
+            // already requires). A VRAM-neutral successor (per-projection bf16->f32
+            // dequant into `dequant_scratch` + SGEMM, mirroring the Q8Raw arm) is a
+            // follow-up once a `dequant_bf16_to_f32` GPU kernel is added.
+            let n = raw.len() / 2;
+            let mut f32_data = vec![0.0f32; n];
+            for i in 0..n {
+                let bits = (raw[2 * i] as u16) | ((raw[2 * i + 1] as u16) << 8);
+                f32_data[i] = f32::from_bits((bits as u32) << 16);
+            }
+            let gpu_buf = device.htod_copy(&f32_data)?;
+            Ok(GpuWeightBuf::F32(gpu_buf))
         }
         other => {
             // Catch-all for K-quant and other unsupported quant schemes:
@@ -946,23 +938,6 @@ pub fn upload_layer_weights(
         q4_split_w_gate: None,
         q4_split_w_up: None,
         q4_split_w_down: None,
-        // tile siblings start as None; populated by
-        // repack_all_layers_q8_clone_to_tile() / repack_all_layers_q4_clone_to_tile()
-        // when LUMEN_CUDA_Q8_TILE=1 / LUMEN_CUDA_Q4_TILE=1.
-        q8_tile_wq: None,
-        q8_tile_wk: None,
-        q8_tile_wv: None,
-        q8_tile_wo: None,
-        q8_tile_w_gate: None,
-        q8_tile_w_up: None,
-        q8_tile_w_down: None,
-        q4_tile_wq: None,
-        q4_tile_wk: None,
-        q4_tile_wv: None,
-        q4_tile_wo: None,
-        q4_tile_w_gate: None,
-        q4_tile_w_up: None,
-        q4_tile_w_down: None,
         // GDN fields: populated only for GDN layers (layer_type == 1).
         layer_type: subs.layer_type.unwrap_or(0),
         ssm_conv1d: match &subs.ssm_conv1d {
@@ -1027,13 +1002,11 @@ pub fn upload_layer_weights(
         attn_gate_f16: None,
         ssm_alpha_f16: None,
         ssm_beta_f16: None,
-        // GDN split siblings start as None; populated by
-        // repack_layer_gdn_clone_to_split() when LUMEN_CUDA_GDN_SPLIT=1.
+        // GDN split siblings start as None (decode-only optional siblings).
         q8_split_ssm_out: None,
         q8_split_attn_gate: None,
         q8_split_ssm_alpha: None,
         q8_split_ssm_beta: None,
-        q4_split_ssm_out: None,
         q4_split_attn_gate: None,
         q4_split_ssm_alpha: None,
         q4_split_ssm_beta: None,
@@ -1225,11 +1198,6 @@ pub fn dequant_layer_q8_to_f16(
             // value in the base weight slot (currently sibling-only).
             GpuWeightBuf::Q8Split(q8) => (q8.len() / 34) * 32,
             GpuWeightBuf::Q4Split(q4) => (q4.len() / 18) * 32,
-            // Q8Tile / Q4Tile: same density as Q8Raw / Q4Raw (272 B / 8 blocks
-            // = 34 B/block; 144 B / 8 blocks = 18 B/block). Sibling-only;
-            // arithmetic mirrors the Split arms.
-            GpuWeightBuf::Q8Tile(q8) => (q8.len() / 34) * 32,
-            GpuWeightBuf::Q4Tile(q4) => (q4.len() / 18) * 32,
         }
     };
 

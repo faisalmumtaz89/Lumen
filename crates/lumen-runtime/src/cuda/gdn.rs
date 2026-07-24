@@ -229,9 +229,11 @@ impl GdnScratch {
 /// Apply 1D convolution on QKV channels using circular buffer state.
 ///
 /// For each channel i in [0..dim):
-///   1. Write current input into conv_state at current position
-///   2. Compute dot product of conv_state (circularly) with conv_weight
-///   3. Write result to output
+///   1. Convolve the ring history (oldest→newest) plus the current input,
+///      using dim-major weights `conv_weight[i * kernel_size + tap]` —
+///      the same convention as the production `ssm_conv1d_silu_prefill` /
+///      decode kernels in `shaders/gdn.cu`.
+///   2. Write the current input into the ring AFTER the read (no double-count).
 ///
 /// Returns the next conv position (circular, wraps at kernel_size - 1).
 #[allow(dead_code)]
@@ -245,22 +247,22 @@ pub fn conv1d_decode(
     conv_pos: u32,
 ) -> u32 {
     let buf_slots = (kernel_size - 1) as u32;
-
-    // Write current input into conv state at current position
     let pos = conv_pos as usize;
+
+    // Read conv history FIRST (dim-major weights), matching gdn.cu.
     for i in 0..dim {
-        conv_state[pos * dim + i] = input[i];
+        let mut sum = 0.0f32;
+        for tap in 0..buf_slots as usize {
+            let slot = (pos + tap) % buf_slots as usize;
+            sum += conv_weight[i * kernel_size + tap] * conv_state[slot * dim + i];
+        }
+        sum += conv_weight[i * kernel_size + buf_slots as usize] * input[i];
+        output[i] = sum;
     }
 
-    // Convolve: for each channel, dot product of state history with weight
-    // Weight layout: [kernel_size, dim] where kernel_size includes current input
+    // Write current input into the ring AFTER the read (no double-count).
     for i in 0..dim {
-        let mut sum = input[i] * conv_weight[(kernel_size - 1) * dim + i];
-        for k in 0..buf_slots as usize {
-            let state_pos = ((pos + buf_slots as usize - k) % buf_slots as usize) * dim + i;
-            sum += conv_state[state_pos] * conv_weight[(kernel_size - 2 - k) * dim + i];
-        }
-        output[i] = sum;
+        conv_state[pos * dim + i] = input[i];
     }
 
     (conv_pos + 1) % buf_slots

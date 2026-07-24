@@ -795,6 +795,10 @@ fn bench_kernel_rope() {
     };
 
     let pos = 42u32;
+    // Production `rope_apply` takes a trailing `rotary_dim` param (Qwen3.5 partial RoPE).
+    // This bench exercises full rotation, so pass `rotary_dim = head_dim`. Omitting it
+    // makes cuLaunchKernel fail with CUDA_ERROR_INVALID_VALUE (8 params, 7 args pushed).
+    let rotary_dim = head_dim;
 
     let (mean_us, _min_us, _max_us, elapsed) = bench_kernel_loop(&stream, 100, iterations, || {
         unsafe {
@@ -807,6 +811,7 @@ fn bench_kernel_rope() {
                 .arg(&num_kv_heads)
                 .arg(&head_dim)
                 .arg(&theta)
+                .arg(&rotary_dim)
                 .launch(cfg)
         }
         .unwrap();

@@ -620,3 +620,368 @@ extern "C" __global__ void mmv_q_moe_down_q4_0(
         }
     }
 }
+
+// ============================================================================
+// TWO-TERM RESIDUAL-Q8 activation path (lever L7, `LUMEN_CUDA_MOE_RESIDUAL_Q8`).
+//
+// The single-term Q4_0×Q8_1 dp4a path above quantizes each 32-elem activation
+// block to ONE int8 vector (~7-8 effective activation bits). Amplified across
+// top_k experts × N MoE layers, that error flips downstream router picks and
+// garbles arithmetic. The two-term residual scheme lifts the activation to
+// ~14-16 effective bits WITHOUT re-reading the Q4 weights:
+//
+//   Per 32-elem block of activation x (F32):
+//     s0 = amax(x)/127;  a0 = round(x/s0);            (coarse int8 term)
+//     r  = x - s0*a0;                                  (per-element residual)
+//     s1 = amax(r)/127;  a1 = round(r/s1);            (fine int8 term)
+//     x ~= s0*a0 + s1*a1.
+//
+//   For a Q4_0 weight block (nibbles n in [0,15], scale d_w, value = d_w*(n-8)):
+//     w . x ~= d_w * ( s0 * dp4a(n, a0) + s1 * dp4a(n, a1) - 8 * sum_recon )
+//   where sum_recon (the reconstructed-activation sum used for the (n-8) bias)
+//   ~= sum(x), because s0*sum(a0) + s1*sum(a1) telescopes to sum(x) (the
+//   coarse+fine terms reconstruct x, so their summed reconstruction equals the
+//   original block sum to second order). We therefore carry the SINGLE raw block
+//   sum `sum_x` (same convention as the single-term kernel above) and apply the
+//   SAME `-4*sum_x` per-lane bias (2 covering lanes/block => -8*sum_x/block).
+//
+//   The Q4 weight nibbles are UNPACKED ONCE per block (vi0/vi1 held in
+//   registers) and reused across BOTH dp4a passes: ~2x dp4a instructions but
+//   ~1x weight memory traffic. The two int32 partial sums (sumi0,sumi1) are
+//   kept separate and combined in F32 at the end.
+//
+// Determinism: fixed warp butterfly reduction order, round-to-nearest-even
+// quantization, NO atomics. Self-deterministic (not byte-identical to the FP32
+// reference — it is an approximation gated by the sacred quality suite).
+//
+// Residual activation block layout (72 bytes, replaces the 36-byte Q8_1 block):
+//   [0..2)   f16 s0 (coarse scale)
+//   [2..4)   f16 sum_x (raw F32 block sum, downcast)
+//   [4..6)   f16 s1 (residual scale)
+//   [6..8)   pad
+//   [8..40)  int8 a0[32]  (coarse quantized activation)
+//   [40..72) int8 a1[32]  (residual quantized activation)
+// ============================================================================
+
+#define QK_RES_BLOCK_BYTES 72
+
+// Two-term residual quantizer for a plain F32 activation vector.
+// Grid: (ceil(in_dim/32), 1, 1). Block: (32,1,1) = 1 warp per block.
+extern "C" __global__ void quantize_q8_1_residual_moe(
+    const float* __restrict__ x,
+    unsigned char* __restrict__ vy,
+    unsigned int in_dim)
+{
+    const unsigned int i0  = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int ib  = i0 / QK8_1;
+    const unsigned int iqs = i0 % QK8_1;
+
+    const float xi = (i0 < in_dim) ? x[i0] : 0.0f;
+
+    // Term 0 (coarse): warp-uniform amax + raw sum.
+    const float amax0 = warp_reduce_max_moe(fabsf(xi));
+    const float sumx  = warp_reduce_sum_moe(xi);
+    const float s0 = amax0 / 127.0f;
+    const int   a0 = (amax0 == 0.0f) ? 0 : __float2int_rn(xi / s0);
+
+    // Per-element residual (uses warp-uniform s0 and this lane's a0).
+    const float r = xi - s0 * (float)a0;
+
+    // Term 1 (residual/fine).
+    const float amax1 = warp_reduce_max_moe(fabsf(r));
+    const float s1 = amax1 / 127.0f;
+    const int   a1 = (amax1 == 0.0f) ? 0 : __float2int_rn(r / s1);
+
+    unsigned char* yb = vy + (uint64_t)ib * QK_RES_BLOCK_BYTES;
+    yb[8  + iqs] = (unsigned char)(int8_t)a0;
+    yb[40 + iqs] = (unsigned char)(int8_t)a1;
+
+    if (iqs == 0) {
+        const unsigned short d0_bits = f32_to_f16_bits(s0);
+        const unsigned short sx_bits = f32_to_f16_bits(sumx);
+        const unsigned short d1_bits = f32_to_f16_bits(s1);
+        yb[0] = (unsigned char)(d0_bits & 0xFF);
+        yb[1] = (unsigned char)((d0_bits >> 8) & 0xFF);
+        yb[2] = (unsigned char)(sx_bits & 0xFF);
+        yb[3] = (unsigned char)((sx_bits >> 8) & 0xFF);
+        yb[4] = (unsigned char)(d1_bits & 0xFF);
+        yb[5] = (unsigned char)((d1_bits >> 8) & 0xFF);
+        yb[6] = 0;
+        yb[7] = 0;
+    }
+}
+
+// Two-term residual quantizer for the per-expert swiglu buffer.
+// Grid: (ceil(inter_dim/32), top_k, 1). Block: (32,1,1) = 1 warp per block.
+extern "C" __global__ void quantize_q8_1_residual_moe_swiglu(
+    const float* __restrict__ swiglu_buf,
+    unsigned char* __restrict__ vy,
+    unsigned int inter_dim,
+    unsigned int top_k)
+{
+    const unsigned int k = blockIdx.y;
+    if (k >= top_k) return;
+
+    const unsigned int i0  = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int ib_layer = i0 / QK8_1;
+    const unsigned int iqs = i0 % QK8_1;
+    const unsigned int blocks_per_layer = (inter_dim + QK8_1 - 1) / QK8_1;
+
+    const float xi = (i0 < inter_dim)
+        ? swiglu_buf[(size_t)k * (size_t)inter_dim + i0] : 0.0f;
+
+    const float amax0 = warp_reduce_max_moe(fabsf(xi));
+    const float sumx  = warp_reduce_sum_moe(xi);
+    const float s0 = amax0 / 127.0f;
+    const int   a0 = (amax0 == 0.0f) ? 0 : __float2int_rn(xi / s0);
+
+    const float r = xi - s0 * (float)a0;
+
+    const float amax1 = warp_reduce_max_moe(fabsf(r));
+    const float s1 = amax1 / 127.0f;
+    const int   a1 = (amax1 == 0.0f) ? 0 : __float2int_rn(r / s1);
+
+    unsigned char* yb = vy
+        + (size_t)k * (size_t)blocks_per_layer * QK_RES_BLOCK_BYTES
+        + (size_t)ib_layer * QK_RES_BLOCK_BYTES;
+    yb[8  + iqs] = (unsigned char)(int8_t)a0;
+    yb[40 + iqs] = (unsigned char)(int8_t)a1;
+
+    if (iqs == 0) {
+        const unsigned short d0_bits = f32_to_f16_bits(s0);
+        const unsigned short sx_bits = f32_to_f16_bits(sumx);
+        const unsigned short d1_bits = f32_to_f16_bits(s1);
+        yb[0] = (unsigned char)(d0_bits & 0xFF);
+        yb[1] = (unsigned char)((d0_bits >> 8) & 0xFF);
+        yb[2] = (unsigned char)(sx_bits & 0xFF);
+        yb[3] = (unsigned char)((sx_bits >> 8) & 0xFF);
+        yb[4] = (unsigned char)(d1_bits & 0xFF);
+        yb[5] = (unsigned char)((d1_bits >> 8) & 0xFF);
+        yb[6] = 0;
+        yb[7] = 0;
+    }
+}
+
+// Two-term residual vec_dot: Q4_0 weights x {a0,a1} int8 activation terms.
+// Weight nibbles unpacked ONCE (vi0/vi1) and reused for both dp4a passes.
+// Combine: d4 * ( s0*sumi0 + s1*sumi1 - 4*sum_x ).  The `-4*sum_x` per-lane
+// bias, summed over the 2 lanes covering each block, yields -8*sum_x/block —
+// identical bias convention to `vec_dot_q4_0_q8_1_impl_moe` above.
+__device__ __forceinline__ float vec_dot_q4_0_q8_1_residual_impl_moe(
+    const uint8_t* __restrict__ bq4_0_qs,
+    const int8_t* __restrict__ a0_qs,
+    const int8_t* __restrict__ a1_qs,
+    int iqs,
+    float d4, float s0, float s1, float sum_x)
+{
+    int sumi0 = 0;
+    int sumi1 = 0;
+    #pragma unroll
+    for (int i = 0; i < VDR_Q4_0_Q8_1_MMVQ; ++i) {
+        const uint8_t* vp = bq4_0_qs + (iqs + i) * 4;
+        int v = ((int)vp[0])
+              | ((int)vp[1] << 8)
+              | ((int)vp[2] << 16)
+              | ((int)vp[3] << 24);
+        const int vi0 = (v >> 0) & 0x0F0F0F0F;
+        const int vi1 = (v >> 4) & 0x0F0F0F0F;
+
+        // --- Term 0 (coarse a0). ---
+        const int8_t* a0_lo = a0_qs + (iqs + i) * 4;
+        const int8_t* a0_hi = a0_qs + (iqs + i + QI4_0) * 4;
+        int u0_0 = ((int)(unsigned char)a0_lo[0])
+                 | ((int)(unsigned char)a0_lo[1] << 8)
+                 | ((int)(unsigned char)a0_lo[2] << 16)
+                 | ((int)(unsigned char)a0_lo[3] << 24);
+        int u0_1 = ((int)(unsigned char)a0_hi[0])
+                 | ((int)(unsigned char)a0_hi[1] << 8)
+                 | ((int)(unsigned char)a0_hi[2] << 16)
+                 | ((int)(unsigned char)a0_hi[3] << 24);
+        sumi0 = dp4a_s(vi0, u0_0, sumi0);
+        sumi0 = dp4a_s(vi1, u0_1, sumi0);
+
+        // --- Term 1 (residual a1) — REUSE vi0/vi1 (weight read once). ---
+        const int8_t* a1_lo = a1_qs + (iqs + i) * 4;
+        const int8_t* a1_hi = a1_qs + (iqs + i + QI4_0) * 4;
+        int u1_0 = ((int)(unsigned char)a1_lo[0])
+                 | ((int)(unsigned char)a1_lo[1] << 8)
+                 | ((int)(unsigned char)a1_lo[2] << 16)
+                 | ((int)(unsigned char)a1_lo[3] << 24);
+        int u1_1 = ((int)(unsigned char)a1_hi[0])
+                 | ((int)(unsigned char)a1_hi[1] << 8)
+                 | ((int)(unsigned char)a1_hi[2] << 16)
+                 | ((int)(unsigned char)a1_hi[3] << 24);
+        sumi1 = dp4a_s(vi0, u1_0, sumi1);
+        sumi1 = dp4a_s(vi1, u1_1, sumi1);
+    }
+    return d4 * ((float)sumi0 * s0 + (float)sumi1 * s1 - 4.0f * sum_x);
+}
+
+// ============================================================================
+// mmv_q_moe_gate_up_swiglu_q4_0_residual — Q4_0 gate+up+SwiGLU, two-term act.
+// Mirrors mmv_q_moe_gate_up_swiglu_q4_0 but reads 72-byte residual activation
+// blocks and issues the two-term residual dot.
+// ============================================================================
+extern "C" __global__ void mmv_q_moe_gate_up_swiglu_q4_0_residual(
+    const unsigned char* __restrict__ vy,           // [num_blocks*72] residual normed_x
+    const unsigned char* __restrict__ layer_buf,
+    const unsigned int* __restrict__ expert_ids,
+    const unsigned long long* __restrict__ gate_up_offsets,
+    float* __restrict__ swiglu_buf,
+    unsigned int hidden_dim,
+    unsigned int inter_dim,
+    unsigned int top_k)
+{
+    const unsigned int k = threadIdx.y;
+    if (k >= top_k) return;
+
+    const unsigned int row0 = C_ROWS_PER_BLOCK * blockIdx.x;
+    if (row0 >= inter_dim) return;
+
+    const unsigned int lane = threadIdx.x;
+    const unsigned int expert_id = expert_ids[k];
+    const uint64_t gate_off = gate_up_offsets[(size_t)expert_id * 2 + 0];
+    const uint64_t up_off   = gate_up_offsets[(size_t)expert_id * 2 + 1];
+
+    const int blocks_per_row_x = hidden_dim / QK4_0;
+    constexpr int blocks_per_iter = VDR_Q4_0_Q8_1_MMVQ * WARP_SIZE / QI4_0;  // 16
+
+    const int kbx0 = lane / (QI4_0 / VDR_Q4_0_Q8_1_MMVQ);
+    const int kqs  = VDR_Q4_0_Q8_1_MMVQ * (lane % (QI4_0 / VDR_Q4_0_Q8_1_MMVQ));
+
+    const uint64_t row_bytes = (uint64_t)blocks_per_row_x * 18;
+
+    float gate_sum[C_ROWS_PER_BLOCK] = {0.0f};
+    float up_sum[C_ROWS_PER_BLOCK]   = {0.0f};
+
+    for (int kbx = kbx0; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const unsigned char* br = vy + (uint64_t)kbx * QK_RES_BLOCK_BYTES;
+        const unsigned short d0_bits = (unsigned short)br[0] | ((unsigned short)br[1] << 8);
+        const unsigned short sx_bits = (unsigned short)br[2] | ((unsigned short)br[3] << 8);
+        const unsigned short d1_bits = (unsigned short)br[4] | ((unsigned short)br[5] << 8);
+        const float s0    = f16_bits_to_f32(d0_bits);
+        const float sum_x = f16_bits_to_f32(sx_bits);
+        const float s1    = f16_bits_to_f32(d1_bits);
+        const int8_t* a0_qs = (const int8_t*)(br + 8);
+        const int8_t* a1_qs = (const int8_t*)(br + 40);
+
+        #pragma unroll
+        for (int r = 0; r < C_ROWS_PER_BLOCK; ++r) {
+            if (row0 + r >= inter_dim) continue;
+
+            const unsigned char* bq4_0_gate = layer_buf + gate_off
+                + (uint64_t)(row0 + r) * row_bytes + (uint64_t)kbx * 18;
+            const unsigned short d_gate_bits =
+                (unsigned short)bq4_0_gate[0] | ((unsigned short)bq4_0_gate[1] << 8);
+            const float d_gate = f16_bits_to_f32(d_gate_bits);
+            const uint8_t* qs_gate = bq4_0_gate + 2;
+
+            gate_sum[r] += vec_dot_q4_0_q8_1_residual_impl_moe(
+                qs_gate, a0_qs, a1_qs, kqs, d_gate, s0, s1, sum_x);
+
+            const unsigned char* bq4_0_up = layer_buf + up_off
+                + (uint64_t)(row0 + r) * row_bytes + (uint64_t)kbx * 18;
+            const unsigned short d_up_bits =
+                (unsigned short)bq4_0_up[0] | ((unsigned short)bq4_0_up[1] << 8);
+            const float d_up = f16_bits_to_f32(d_up_bits);
+            const uint8_t* qs_up = bq4_0_up + 2;
+
+            up_sum[r] += vec_dot_q4_0_q8_1_residual_impl_moe(
+                qs_up, a0_qs, a1_qs, kqs, d_up, s0, s1, sum_x);
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < C_ROWS_PER_BLOCK; ++r) {
+        gate_sum[r] = warp_reduce_sum_moe(gate_sum[r]);
+        up_sum[r]   = warp_reduce_sum_moe(up_sum[r]);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int r = 0; r < C_ROWS_PER_BLOCK; ++r) {
+            if (row0 + r < inter_dim) {
+                const float g = gate_sum[r];
+                const float u = up_sum[r];
+                swiglu_buf[(size_t)k * (size_t)inter_dim + (row0 + r)] = silu(g) * u;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// mmv_q_moe_down_q4_0_residual — Q4_0 down matvec, two-term activation.
+// ============================================================================
+extern "C" __global__ void mmv_q_moe_down_q4_0_residual(
+    const unsigned char* __restrict__ vy,
+    const unsigned char* __restrict__ layer_buf,
+    const unsigned int* __restrict__ expert_ids,
+    const unsigned long long* __restrict__ down_offsets,
+    float* __restrict__ down_out,
+    unsigned int hidden_dim,
+    unsigned int inter_dim,
+    unsigned int top_k)
+{
+    const unsigned int k = threadIdx.y;
+    if (k >= top_k) return;
+
+    const unsigned int row0 = C_ROWS_PER_BLOCK * blockIdx.x;
+    if (row0 >= hidden_dim) return;
+
+    const unsigned int lane = threadIdx.x;
+    const unsigned int expert_id = expert_ids[k];
+    const uint64_t down_off = down_offsets[expert_id];
+
+    const int blocks_per_row_x = inter_dim / QK4_0;
+    constexpr int blocks_per_iter = VDR_Q4_0_Q8_1_MMVQ * WARP_SIZE / QI4_0;
+
+    const int kbx0 = lane / (QI4_0 / VDR_Q4_0_Q8_1_MMVQ);
+    const int kqs  = VDR_Q4_0_Q8_1_MMVQ * (lane % (QI4_0 / VDR_Q4_0_Q8_1_MMVQ));
+
+    const uint64_t row_bytes = (uint64_t)blocks_per_row_x * 18;
+    const unsigned char* vy_k =
+        vy + (uint64_t)k * (uint64_t)blocks_per_row_x * QK_RES_BLOCK_BYTES;
+
+    float tmp[C_ROWS_PER_BLOCK] = {0.0f};
+
+    for (int kbx = kbx0; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const unsigned char* br = vy_k + (uint64_t)kbx * QK_RES_BLOCK_BYTES;
+        const unsigned short d0_bits = (unsigned short)br[0] | ((unsigned short)br[1] << 8);
+        const unsigned short sx_bits = (unsigned short)br[2] | ((unsigned short)br[3] << 8);
+        const unsigned short d1_bits = (unsigned short)br[4] | ((unsigned short)br[5] << 8);
+        const float s0    = f16_bits_to_f32(d0_bits);
+        const float sum_x = f16_bits_to_f32(sx_bits);
+        const float s1    = f16_bits_to_f32(d1_bits);
+        const int8_t* a0_qs = (const int8_t*)(br + 8);
+        const int8_t* a1_qs = (const int8_t*)(br + 40);
+
+        #pragma unroll
+        for (int r = 0; r < C_ROWS_PER_BLOCK; ++r) {
+            if (row0 + r >= hidden_dim) continue;
+
+            const unsigned char* bq4_0 = layer_buf + down_off
+                + (uint64_t)(row0 + r) * row_bytes + (uint64_t)kbx * 18;
+            const unsigned short d_bits =
+                (unsigned short)bq4_0[0] | ((unsigned short)bq4_0[1] << 8);
+            const float d4 = f16_bits_to_f32(d_bits);
+            const uint8_t* qs = bq4_0 + 2;
+
+            tmp[r] += vec_dot_q4_0_q8_1_residual_impl_moe(
+                qs, a0_qs, a1_qs, kqs, d4, s0, s1, sum_x);
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < C_ROWS_PER_BLOCK; ++r) {
+        tmp[r] = warp_reduce_sum_moe(tmp[r]);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int r = 0; r < C_ROWS_PER_BLOCK; ++r) {
+            if (row0 + r < hidden_dim) {
+                down_out[(size_t)k * (size_t)hidden_dim + (row0 + r)] = tmp[r];
+            }
+        }
+    }
+}

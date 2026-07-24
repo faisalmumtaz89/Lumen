@@ -23,7 +23,6 @@ pub(crate) mod decode;
 pub mod ffi;
 pub(crate) mod gdn;
 pub(crate) mod gpu_buffers;
-pub(crate) mod graph;
 pub(crate) mod kv_cache;
 /// CUDA MoE forward-path types.
 pub(crate) mod moe;

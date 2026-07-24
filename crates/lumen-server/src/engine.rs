@@ -740,6 +740,14 @@ impl EngineHandle {
         self.tokenizer.apply_chat_template(system, user)
     }
 
+    /// The model's embedded Jinja chat template, if the tokenizer carries one.
+    /// The wire layer renders it (via `lumen_runtime::chat_template`) so the
+    /// server advertises the model's NATIVE tool-calling protocol and matches
+    /// the pinned template; `None` falls back to the hard-coded ChatML transcript.
+    pub fn chat_template(&self) -> Option<&str> {
+        self.tokenizer.chat_template()
+    }
+
     /// Read the latest per-component memory breakdown captured
     /// after the most recent completed job.
     ///
@@ -821,6 +829,14 @@ pub trait Tokenize: Send + Sync + 'static {
     /// returns `None` so callers that just want raw completion don't have
     /// to override.
     fn apply_chat_template(&self, _system: Option<&str>, _user: &str) -> Option<String> {
+        None
+    }
+
+    /// The model's embedded Jinja chat template, if any. Default `None` (the
+    /// wire layer then uses its hard-coded ChatML transcript). Real BPE
+    /// tokenizers return the LBC-embedded template so the server renders the
+    /// model's native tool-calling protocol.
+    fn chat_template(&self) -> Option<&str> {
         None
     }
 

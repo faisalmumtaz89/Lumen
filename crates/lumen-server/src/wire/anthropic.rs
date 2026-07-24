@@ -24,9 +24,11 @@
 //! data: {...}
 //! ```
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use lumen_runtime::engine::SamplingParams;
-use lumen_runtime::tooling::{compose_system_with_tools, ToolSchema};
+use lumen_runtime::tooling::{compose_system_with_tools, ToolSchema, ToolSchemas};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -131,8 +133,23 @@ impl MessagesRequest {
                     .unwrap_or_else(|_| "{}".into()),
             })
             .collect();
-        let final_system = compose_system_with_tools(system_text.as_deref(), &tool_schemas);
-        let prompt = render_prompt(&final_system, &self.messages, enable_thinking)?;
+        // Prefer the model's embedded template (native tool-calling protocol),
+        // shared with the CLI and OpenAI surfaces so the three cannot drift.
+        // Fall back to the hard-coded ChatML transcript (compose the tools into
+        // the system message) when no template is embedded.
+        let prompt = match engine.chat_template() {
+            Some(tmpl) => render_prompt_templated(
+                system_text.as_deref(),
+                &self.messages,
+                &self.tools,
+                enable_thinking,
+                tmpl,
+            )?,
+            None => {
+                let final_system = compose_system_with_tools(system_text.as_deref(), &tool_schemas);
+                render_prompt(&final_system, &self.messages, enable_thinking)?
+            }
+        };
         let prompt_tokens = engine.tokenize_for_request(&prompt);
         // Synchronous oversize guard: 400 BEFORE the 200/SSE stream opens.
         super::check_prompt_length(prompt_tokens.len(), engine.context_length())?;
@@ -167,6 +184,106 @@ impl MessagesRequest {
             reasoning_budget,
         })
     }
+}
+
+/// Build the runtime [`ToolSchemas`] from Anthropic tool defs (used by the
+/// router to type native `<parameter>` values in the collectors, mirroring the
+/// OpenAI surface).
+pub fn tool_schemas(tools: &[AnthropicTool]) -> ToolSchemas {
+    let schemas: Vec<ToolSchema> = tools
+        .iter()
+        .map(|t| ToolSchema {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            parameters_json_schema: serde_json::to_string(&t.input_schema)
+                .unwrap_or_else(|_| "{}".into()),
+        })
+        .collect();
+    ToolSchemas::from_tools(&schemas)
+}
+
+/// Render the Anthropic request through the model's embedded Jinja template.
+/// Converts Anthropic's block-structured messages into the template's message
+/// shape — `tool_result` blocks become `role:"tool"` messages (the template
+/// groups consecutive ones into a single user turn), `tool_use` blocks become
+/// assistant `tool_calls` with the `input` object as `arguments` — then defers
+/// to the shared renderer so the transcript is byte-identical to the OpenAI
+/// surface's for an equivalent round-trip.
+fn render_prompt_templated(
+    system: Option<&str>,
+    messages: &[AnthropicMessage],
+    tools: &[AnthropicTool],
+    enable_thinking: bool,
+    template: &str,
+) -> Result<String, ServerError> {
+    let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
+    if let Some(s) = system {
+        if !s.is_empty() {
+            msgs.push(json!({"role": "system", "content": s}));
+        }
+    }
+    for m in messages {
+        match m.role.as_str() {
+            "user" => {
+                let (text, tool_results) =
+                    partition_tool_result_blocks(&m.content, "messages.content")?;
+                for tr in &tool_results {
+                    msgs.push(json!({"role": "tool", "content": tr}));
+                }
+                if !text.is_empty() || tool_results.is_empty() {
+                    msgs.push(json!({"role": "user", "content": text}));
+                }
+            }
+            "assistant" => {
+                let (text, tool_uses) = partition_tool_use_blocks(&m.content, "messages.content")?;
+                let mut obj = serde_json::Map::new();
+                obj.insert("role".into(), json!("assistant"));
+                obj.insert("content".into(), json!(text));
+                if !tool_uses.is_empty() {
+                    let calls: Vec<Value> = tool_uses
+                        .iter()
+                        .map(|(name, arguments_json)| {
+                            let args = serde_json::from_str::<Value>(arguments_json)
+                                .ok()
+                                .filter(Value::is_object)
+                                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                            json!({"type": "function", "function": {"name": name, "arguments": args}})
+                        })
+                        .collect();
+                    obj.insert("tool_calls".into(), Value::Array(calls));
+                }
+                msgs.push(Value::Object(obj));
+            }
+            other => {
+                return Err(ServerError::bad_request_field(
+                    format!("unknown anthropic role: {other}"),
+                    "messages[].role",
+                    "invalid_value",
+                ));
+            }
+        }
+    }
+    let tools_json: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                },
+            })
+        })
+        .collect();
+    lumen_runtime::chat_template::render_chat_prompt(
+        template,
+        &Value::Array(msgs),
+        &Value::Array(tools_json),
+        true,
+        enable_thinking,
+    )
+    .map_err(|e| ServerError::bad_request(format!("chat template render failed: {e}")))
 }
 
 fn render_prompt(
@@ -390,9 +507,17 @@ pub fn stream_messages(
     model: String,
     thinking: bool,
     stop: Vec<String>,
+    tool_schemas: Arc<ToolSchemas>,
 ) -> Body {
     let (tx, body_rx) = mpsc::channel::<Vec<u8>>(64);
-    tokio::spawn(drive_messages_stream(rx, tx, model, thinking, stop));
+    tokio::spawn(drive_messages_stream(
+        rx,
+        tx,
+        model,
+        thinking,
+        stop,
+        tool_schemas,
+    ));
     body_from_byte_stream(body_rx)
 }
 
@@ -402,6 +527,7 @@ async fn drive_messages_stream(
     model: String,
     thinking: bool,
     stop: Vec<String>,
+    tool_schemas: Arc<ToolSchemas>,
 ) {
     let msg_id = format!(
         "msg_lumen_{:x}-{:x}",
@@ -411,7 +537,7 @@ async fn drive_messages_stream(
             .unwrap_or(0),
         super::next_response_seq()
     );
-    let mut emitter = SseSafeEmitter::new(thinking);
+    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
     // F4: seed the streaming stop matcher from `stop_sequences`. Empty =>
     // verbatim passthrough (byte-identical); see the OpenAI `drive_chat_stream`
     // note for the worker/wire division of labour.
@@ -423,6 +549,11 @@ async fn drive_messages_stream(
     let mut thinking_block_open = false;
     let mut text_block_open = false;
     let mut block_count = 0usize;
+    // Set once a `tool_use` block is streamed. Mirrors the OpenAI streaming
+    // path (`emitted_any_tool_call`): the worker reports `Stop` at end-of-turn
+    // even for a tool-call turn, so the wire layer upgrades the terminal
+    // stop_reason to `tool_use` (matches the non-streaming Anthropic path).
+    let mut emitted_any_tool_call = false;
     let mut input_tokens = 0usize;
     let mut output_tokens = 0usize;
 
@@ -530,6 +661,7 @@ async fn drive_messages_stream(
                     }
                 }
                 for tc in delta.tool_calls {
+                    emitted_any_tool_call = true;
                     // Close the reasoning block before the first tool block too
                     // (reasoning precedes all answer content).
                     if thinking_block_open {
@@ -702,7 +834,14 @@ async fn drive_messages_stream(
             .send(sse_event("content_block_stop", &s.to_string()))
             .await;
     }
-    let reason = finish_reason.unwrap_or(FinishReason::Stop);
+    // A tool-call turn ends with the worker's natural `Stop`; upgrade it to
+    // `ToolCalls` so the terminal message_delta reports stop_reason "tool_use"
+    // (byte-identical to the OpenAI streaming + non-streaming Anthropic paths).
+    let reason = match finish_reason {
+        Some(FinishReason::Stop) if emitted_any_tool_call => FinishReason::ToolCalls,
+        Some(r) => r,
+        None => FinishReason::Stop,
+    };
     let delta_msg = json!({
         "type": "message_delta",
         "delta": {
@@ -726,8 +865,9 @@ pub async fn collect_messages(
     model: String,
     thinking: bool,
     stop: Vec<String>,
+    tool_schemas: Arc<ToolSchemas>,
 ) -> Result<Value, ServerError> {
-    let mut emitter = SseSafeEmitter::new(thinking);
+    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
     // F4: seed from `stop_sequences`. Empty => verbatim, byte-identical.
     let mut stop_matcher = StopMatcher::new(stop);
     let mut text = String::new();
@@ -854,9 +994,17 @@ mod tests {
         }
         drop(tx);
         let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
-        collect_messages(pooled, "test".into(), thinking, stop)
-            .await
-            .unwrap()
+        // Test helper exercises the legacy JSON tool-call path (schemaless); the
+        // schema-aware native path is covered by the runtime tests + Modal §2D.
+        collect_messages(
+            pooled,
+            "test".into(),
+            thinking,
+            stop,
+            Arc::new(ToolSchemas::default()),
+        )
+        .await
+        .unwrap()
     }
 
     fn user(text: &str) -> AnthropicMessage {
@@ -1024,6 +1172,165 @@ mod tests {
         let blocks = resp["content"].as_array().unwrap();
         assert_eq!(blocks[0]["text"], "alpha ");
         assert_eq!(resp["stop_reason"], "stop_sequence");
+    }
+
+    // ---- Streaming terminal stop_reason (tool_use vs end_turn) ----
+
+    /// Drive `drive_messages_stream` over a fixed event list and return the raw
+    /// SSE byte stream as a UTF-8 string (mirrors the non-streaming helper).
+    async fn stream_messages_to_string(
+        events: Vec<TokenEvent>,
+        thinking: bool,
+        stop: Vec<String>,
+    ) -> String {
+        let (tx, rx) = mpsc::channel(events.len().max(1));
+        let return_sender = tx.clone();
+        for e in events {
+            tx.send(e).await.unwrap();
+        }
+        drop(tx);
+        let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
+        let (body_tx, mut body_rx) = mpsc::channel::<Vec<u8>>(256);
+        tokio::spawn(drive_messages_stream(
+            pooled,
+            body_tx,
+            "test".into(),
+            thinking,
+            stop,
+            Arc::new(ToolSchemas::default()),
+        ));
+        let mut out = String::new();
+        while let Some(chunk) = body_rx.recv().await {
+            out.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        out
+    }
+
+    /// Pull `delta.stop_reason` from the terminal `message_delta` SSE event.
+    fn stream_stop_reason(sse: &str) -> String {
+        for block in sse.split("\n\n") {
+            if block.contains("event: message_delta") {
+                let data = block
+                    .lines()
+                    .find_map(|l| l.strip_prefix("data: "))
+                    .expect("message_delta must carry a data line");
+                let v: Value = serde_json::from_str(data).unwrap();
+                return v["delta"]["stop_reason"].as_str().unwrap().to_string();
+            }
+        }
+        panic!("no message_delta event in stream: {sse}");
+    }
+
+    /// The Anthropic protocol carries usage on the terminal `message_delta`.
+    /// Verify the streaming path actually populates it from the worker's Done
+    /// counts (input_tokens / output_tokens) rather than zeros — the streamed
+    /// analogue of the non-streaming `usage` object.
+    #[tokio::test]
+    async fn stream_messages_delta_reports_usage_counts() {
+        let sse = stream_messages_to_string(
+            vec![
+                TokenEvent::Token {
+                    token_id: 0,
+                    delta_text: "hello".into(),
+                },
+                TokenEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                    prompt_tokens: 7,
+                    completion_tokens: 3,
+                },
+            ],
+            false,
+            Vec::new(),
+        )
+        .await;
+        for block in sse.split("\n\n") {
+            if block.contains("event: message_delta") {
+                let data = block
+                    .lines()
+                    .find_map(|l| l.strip_prefix("data: "))
+                    .expect("message_delta must carry a data line");
+                let v: Value = serde_json::from_str(data).unwrap();
+                assert_eq!(v["usage"]["input_tokens"], 7, "input_tokens: {data}");
+                assert_eq!(v["usage"]["output_tokens"], 3, "output_tokens: {data}");
+                return;
+            }
+        }
+        panic!("no message_delta event in stream: {sse}");
+    }
+
+    /// A streamed tool-call turn must report the terminal stop_reason
+    /// `tool_use` (the worker reports a natural `Stop`; the wire layer upgrades
+    /// it — matching the OpenAI streaming + non-streaming Anthropic paths).
+    /// Regression guard: before the fix this reported "end_turn".
+    #[tokio::test]
+    async fn stream_messages_tool_call_reports_tool_use_stop_reason() {
+        use lumen_runtime::tooling::Qwen35Renderer;
+        let call = Qwen35Renderer::render_one_call("get_weather", "{\"city\": \"Paris\"}");
+        let events = vec![
+            tok("Let me check. "),
+            tok(&call),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 3,
+                completion_tokens: 8,
+            },
+        ];
+        let sse = stream_messages_to_string(events, false, Vec::new()).await;
+        assert!(
+            sse.contains("\"type\":\"tool_use\""),
+            "stream must carry a tool_use content block: {sse}"
+        );
+        assert_eq!(
+            stream_stop_reason(&sse),
+            "tool_use",
+            "a streamed tool-call turn must report stop_reason:tool_use"
+        );
+    }
+
+    /// A plain (no-tool) streamed turn is unchanged: stop_reason `end_turn`.
+    #[tokio::test]
+    async fn stream_messages_normal_turn_reports_end_turn_stop_reason() {
+        let events = vec![
+            tok("Just a plain answer."),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 3,
+                completion_tokens: 4,
+            },
+        ];
+        let sse = stream_messages_to_string(events, false, Vec::new()).await;
+        assert!(
+            !sse.contains("\"type\":\"tool_use\""),
+            "a normal turn must not emit a tool_use block: {sse}"
+        );
+        assert_eq!(
+            stream_stop_reason(&sse),
+            "end_turn",
+            "a normal turn must keep stop_reason:end_turn"
+        );
+    }
+
+    /// The upgrade is conservative (mirrors OpenAI): a non-`Stop` worker reason
+    /// is never rewritten, even with a tool block present. `Length` stays
+    /// `max_tokens`.
+    #[tokio::test]
+    async fn stream_messages_tool_call_under_length_keeps_max_tokens() {
+        use lumen_runtime::tooling::Qwen35Renderer;
+        let call = Qwen35Renderer::render_one_call("get_weather", "{\"city\": \"Paris\"}");
+        let events = vec![
+            tok(&call),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: 3,
+                completion_tokens: 8,
+            },
+        ];
+        let sse = stream_messages_to_string(events, false, Vec::new()).await;
+        assert_eq!(
+            stream_stop_reason(&sse),
+            "max_tokens",
+            "a Length finish must not be upgraded to tool_use"
+        );
     }
 
     // ---- F5: Anthropic-valid sampler subset (top_p, top_k) ----

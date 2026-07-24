@@ -207,16 +207,6 @@ impl Session {
         }
     }
 
-    /// DIAGNOSTIC gate (default OFF): when `LUMEN_FORCE_PREFILL_DECODE=1`,
-    /// `next_token` generates every token via full re-prefill instead of the
-    /// single-token decode path. Used to isolate decode-vs-prefill defects
-    /// (CUDA MoE-35B router-flip root cause). Remove before commit.
-    fn force_prefill_decode() -> bool {
-        use std::sync::OnceLock;
-        static G: OnceLock<bool> = OnceLock::new();
-        *G.get_or_init(|| std::env::var("LUMEN_FORCE_PREFILL_DECODE").as_deref() == Ok("1"))
-    }
-
     /// Total length of the token history (prompt + generated).
     pub fn token_count(&self) -> usize {
         self.tokens.len()
@@ -356,38 +346,9 @@ impl Session {
         let logits = if caps.batched_prefill {
             // Backend handles KV advance internally.
             let last_hidden = backend.prefill(prompt, weights, &mut self.kv)?;
-            if std::env::var("LUMEN_PROVIDER_DEBUG").is_ok() {
-                let n = prompt.len();
-                let head: Vec<u32> = prompt.iter().take(12).copied().collect();
-                let tail: Vec<u32> = prompt.iter().rev().take(6).rev().copied().collect();
-                let hsum: f64 = last_hidden.iter().map(|&v| v as f64).sum();
-                let hmin = last_hidden.iter().cloned().fold(f32::INFINITY, f32::min);
-                let hmax = last_hidden
-                    .iter()
-                    .cloned()
-                    .fold(f32::NEG_INFINITY, f32::max);
-                eprintln!(
-                    "[provider-debug] extend prompt_len={n} head={head:?} tail={tail:?} hidden_len={} hidden_sum={hsum:.4} hidden_min={hmin:.4} hidden_max={hmax:.4}",
-                    last_hidden.len()
-                );
-            }
             let mut x = ActivationBuffer::zeros(last_hidden.len(), ComputeDtype::F32);
             x.write_f32_from(&last_hidden);
-            let lg = backend.compute_final(&x)?;
-            if std::env::var("LUMEN_PROVIDER_DEBUG").is_ok() {
-                let argmax = lg
-                    .data
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                eprintln!(
-                    "[provider-debug] extend first_logits_argmax={argmax} logit_val={:.4}",
-                    lg.data.get(argmax).copied().unwrap_or(0.0)
-                );
-            }
-            lg
+            backend.compute_final(&x)?
         } else {
             // Token-at-a-time path: forward_pass does NOT advance kv.seq_len,
             // so we step it after each token.
@@ -1162,35 +1123,6 @@ impl Session {
         // the rolling repeat-last-n window see prompt + previously generated
         // tokens regardless of which extend path was taken.
         Self::sync_sampler_state(&self.tokens, &mut self.sampler_state);
-
-        // DIAGNOSTIC (env LUMEN_FORCE_PREFILL_DECODE=1, default OFF): generate
-        // EVERY token by re-prefilling the full sequence from scratch (fresh KV,
-        // reset recurrent state) using ONLY the batched prefill path -- the
-        // single-token `decode_token` path is never called. This isolates
-        // whether the prefill path is a coherent generator vs. the decode path.
-        // Empirical CUDA MoE-35B root-cause probe; remove before commit.
-        if Self::force_prefill_decode() {
-            let start = Instant::now();
-            let full = self.tokens.clone();
-            self.truncate_to(0); // kv.seq_len -> 0, clears pending_logits & tokens
-            backend.reset_recurrent_state(); // GDN h_state/conv_state reset
-            let last_hidden = backend.prefill(&full, weights, &mut self.kv)?;
-            let mut cx = ActivationBuffer::zeros(last_hidden.len(), ComputeDtype::F32);
-            cx.write_f32_from(&last_hidden);
-            let mut logits = backend.compute_final(&cx)?;
-            let token = sample_token_with_state(
-                &mut logits,
-                &self.sampling,
-                &mut self.sampler_state,
-                &mut self.rng,
-            );
-            // Restore the full token history + the freshly sampled token so the
-            // next call re-prefills prompt+generated-so-far.
-            self.tokens = full;
-            self.tokens.push(token);
-            self.decode_time += start.elapsed();
-            return Ok(token);
-        }
 
         let last = match self.pending_logits.take() {
             Some(mut logits) => {

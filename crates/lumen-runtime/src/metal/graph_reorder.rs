@@ -56,8 +56,6 @@
 //! - Residual reads (Wo residual: `x_buf`, FFN-down residual:
 //!   `attn_proj_buf`) MUST appear in the access list; otherwise the
 //!   scheduler may pull the consumer too early.
-//! - `LUMEN_METAL_PROFILE_DEEP=1` intentionally splits encoders for
-//!   per-section profiling; the concurrent-encoder path must fall back to legacy.
 
 // The first integration wires the scheduler against full-attention + dense
 // FFN only. The `Down` buffer-id, byte-range arithmetic, and `is_read` helper
@@ -204,8 +202,8 @@ impl Access {
 /// `Copy` so it never deallocates and lifts the LayerOp construction onto
 /// the encoder thread's stack.
 ///
-/// Capacity 8 was chosen by inspection of `encode_layer_batched_concurrent` and
-/// `concurrent_encoder_extend_plan_with_ffn_block`: max distinct accesses per op = 5
+/// Capacity 8 was chosen by inspection of `encode_layer_batched_concurrent`:
+/// max distinct accesses per op = 5
 /// (FFN-down: read Gate, read Up, write X, plus the residual fold). The
 /// 8-slot ceiling leaves headroom; over-capacity pushes are debug-asserted
 /// and silently dropped in release. The `as_slice()` view is the only API
@@ -342,18 +340,10 @@ impl<'a> LayerOp<'a> {
 
 /// Greedy lookahead window.
 ///
-/// The default `LOOKAHEAD = 32` matches the per-layer op count on the
-/// plans (full-attn + dense FFN tops out at ~14 ops per
-/// layer; GDN tops out at ~12 after the split).
-///
-/// the scheduler bumps this to **64** when `LUMEN_METAL_CONCURRENT_ENCODER_FULL=1` is
-/// set. The wider window is only useful when the plan length exceeds the
-/// legacy ~14 op cap, which happens once cross-section emit collapses the
-/// FFN-norm + FFN gate+up+down chain into the same plan (currently still
-/// split into two per-layer plans on main; bumping the window is a no-op
-/// cost when the plan length is small, so this is safe to enable globally).
+/// `LOOKAHEAD = 32` matches the per-layer op count on the plans (full-attn +
+/// dense FFN tops out at ~14 ops per layer; GDN tops out at ~12 after the
+/// split).
 const LOOKAHEAD: usize = 32;
-const LOOKAHEAD_FULL: usize = 64;
 
 /// Master kill-switch for the runtime-architecture defaults.
 ///
@@ -380,30 +370,6 @@ pub(crate) fn metal_defaults_active() -> bool {
     active
 }
 
-/// Active lookahead window for the current process.
-///
-/// Resolves to `LOOKAHEAD_FULL = 64` when `LUMEN_METAL_CONCURRENT_ENCODER_FULL=1` is set
-/// otherwise `LOOKAHEAD = 32`.
-/// Cached once per process via an atomic so the per-op scan hot path
-/// stays branch-free after the first call.
-#[inline]
-fn active_lookahead() -> usize {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return if cur == 2 { LOOKAHEAD_FULL } else { LOOKAHEAD };
-    }
-    let v = std::env::var("LUMEN_METAL_CONCURRENT_ENCODER_FULL")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    if v {
-        LOOKAHEAD_FULL
-    } else {
-        LOOKAHEAD
-    }
-}
-
 /// Whether the concurrent-encoder path is enabled for this process.
 ///
 /// Resolved once via `LUMEN_METAL_CONCURRENT_ENCODER`. **Default: ON** when
@@ -428,32 +394,6 @@ pub(crate) fn concurrent_encoder_enabled() -> bool {
         Some(s) if !s.is_empty() => true,
         _ => metal_defaults_active(),
     };
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
-/// Whether the scheduler extensions are enabled.
-///
-/// Resolved once via `LUMEN_METAL_CONCURRENT_ENCODER_FULL=1`. Default OFF. Cached
-/// atomically. When ON, `emit_plan_into_encoder` uses a 64-op lookahead
-/// window (a wider lookahead than the legacy ~14-op cap) instead of the
-/// 32-op default. This is a no-op for current per-layer plans (~14 ops
-/// each) but becomes load-bearing when future revisions collapse multi-section
-/// plans into the same scheduler call.
-///
-/// Independent of `LUMEN_METAL_CONCURRENT_ENCODER` and `LUMEN_METAL_GDN_CONCURRENT_ENCODER` so it can
-/// be enabled or disabled standalone without affecting which sections
-/// route through the concurrent-encoder path.
-#[inline]
-pub(crate) fn concurrent_encoder_full_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_CONCURRENT_ENCODER_FULL")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
     CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
     v
 }
@@ -505,201 +445,6 @@ pub(crate) fn gdn_concurrent_encoder_validate_serial() -> bool {
         .unwrap_or(false);
     CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
     v
-}
-
-/// Whether the dual-queue GDN branch-overlap prefill path is enabled.
-///
-/// Resolved once via `LUMEN_METAL_GDN_DUAL_QUEUE=1`. **Default OFF** until
-/// PRISTINE×3 + bit-identity validation. When ON, the per-GDN-layer block is
-/// split across two command queues coordinated by `MetalSharedEvent`: the main
-/// queue carries RMSNorm(E0), branch A (qkv→conv1d→state-update→L2), the
-/// recurrence, and the join+FFN-norm tail; a second `gdn_aux_queue` carries the
-/// independent branches B (alpha/beta GEMM + compute-gates) and C (attn-gate
-/// GEMM). Three per-prefill events (norm-ready / ab-ready / gate-ready, value =
-/// gdn_ord) enforce the exact DAG dependencies, so the schedule changes but the
-/// kernels, dispatch arguments, and FP accumulation order are byte-identical to
-/// the single-encoder path. The win is hiding max(B, C) under branch A's
-/// shadow (intra-layer ceiling ~50-150ms; no cross-layer
-/// overlap is available because the residual stream serializes layers).
-///
-/// Requires the de-aliased role buffers (same precondition as the concurrent
-/// encoder) AND deep-profile OFF AND the multi-CB split OFF (the dual-queue path
-/// owns CB management). Falls back to the single-CB concurrent-encoder path when
-/// any precondition is unmet.
-#[inline]
-pub(crate) fn gdn_dual_queue_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_GDN_DUAL_QUEUE")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
-/// Whether the GDN Phase 2a (32, NSG=4, 1) threadgroup geometry
-/// is enabled.
-///
-/// Resolved once via `LUMEN_METAL_GDN_PHASE2A_NSG4=1`. Default OFF.
-/// Cached atomically.
-///
-/// When ON, `encode_batched_gdn_prefill` dispatches the new kernel
-/// `gdn_prefill_fused_v3_chunked_nsg4` with a (val_dim/4, n_heads, 1)
-/// grid and (32, 4, 1) threadgroup shape. Each TG owns 4 consecutive rows
-/// of state across 4 simdgroups that share Q/K HBM fetches via L1 (only V
-/// differs per simdgroup). The algorithm is bit-identical to the legacy
-/// `gdn_prefill_fused_v3_chunked` kernel; the reference-token gate is the
-/// validator.
-///
-/// Research:concurrent-encoder section.
-#[inline]
-pub(crate) fn gdn_phase2a_nsg4_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_GDN_PHASE2A_NSG4")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
-/// Whether the chunk-parallel gated-delta-rule Phase 2a kernel is enabled.
-///
-/// Resolved once via `LUMEN_METAL_GDN_PREFILL_CHUNKED=1`. **Default OFF** until
-/// the reference-token gate validates it on the MoE model. When ON,
-/// `encode_batched_gdn_prefill` dispatches `gdn_prefill_chunkscan` (one TG per
-/// (head, 32-value-tile), C-token chunks) in place of the O(T)-serial
-/// `gdn_prefill_fused_v3_chunked`. Bit-exact path when OFF.
-#[inline]
-pub(crate) fn gdn_prefill_chunked_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_GDN_PREFILL_CHUNKED")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
-/// Chunk size C for the chunk-parallel Phase 2a kernel.
-///
-/// Resolved once via `LUMEN_METAL_GDN_PREFILL_CHUNK_C=<8|16>` (default 16,
-/// clamped to {8,16} which the kernel's `GDN_CS_MAXC=16` supports).
-#[inline]
-pub(crate) fn gdn_prefill_chunk_c() -> u32 {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur as u32;
-    }
-    let v: u32 = std::env::var("LUMEN_METAL_GDN_PREFILL_CHUNK_C")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16);
-    let v = if v == 8 { 8 } else { 16 };
-    CACHE.store(v as u8, AOrd::Relaxed);
-    v
-}
-
-/// Diagnostic: which GDN prefill phase to SKIP (no-op when unset).
-///
-/// Resolved once via `LUMEN_METAL_GDN_DIAG_SKIP=<phase>`. Profiling only —
-/// skipping a phase produces garbage output but lets the per-phase GPU cost be
-/// attributed by the delta in the measured non-expert prefill floor. Returns a
-/// small integer code; 0 = no skip (default). Recognised values:
-///   `phase2a` → 1 (the v3-chunked state-update recurrence kernel)
-///   `phase3`  → 2 (the ssm_out GEMM + residual)
-///   `phase1qkv` → 3 (the QKV GEMM)
-/// Any unrecognised / empty value is treated as no-skip.
-#[inline]
-pub(crate) fn gdn_diag_skip() -> u8 {
-    static CACHE: AtomicU8 = AtomicU8::new(255);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 255 {
-        return cur;
-    }
-    let v = match std::env::var("LUMEN_METAL_GDN_DIAG_SKIP").ok().as_deref() {
-        Some("phase2a") => 1,
-        Some("phase3") => 2,
-        Some("phase1qkv") => 3,
-        Some("wholeattn") => 4,
-        Some("ffnblock") => 5,
-        _ => 0,
-    };
-    CACHE.store(v, AOrd::Relaxed);
-    v
-}
-
-/// K2 diagnostic bitmask `LUMEN_METAL_GDN_SUBSKIP=<n>` to attribute the
-/// NON-recurrence GDN-block GPU cost across its sub-dispatch groups. Profiling
-/// ONLY (garbage output when any bit set); read once and cached. Bits:
-///   1 = QKV-proj GEMM (Phase 1, qkv_buf)
-///   2 = alpha/beta GEMMs + compute-gates
-///   4 = conv1d + SiLU (+ conv_state update)
-///   8 = L2-norm (q/k)
-///  16 = norm_gate (Phase 2b)
-///  32 = ssm_out GEMM + residual (Phase 3)
-/// 0 = no skip (default, production path unchanged).
-#[inline]
-pub(crate) fn gdn_subskip() -> u32 {
-    static CACHE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != u32::MAX {
-        return cur;
-    }
-    let v = std::env::var("LUMEN_METAL_GDN_SUBSKIP")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
-    CACHE.store(v, AOrd::Relaxed);
-    v
-}
-
-/// K2 Wave-1: use the simdgroup-per-head L2-normalize kernel
-/// (`l2_normalize_qk_strided_sg`, no threadgroup barriers) instead of the
-/// 128-thread/2-barrier `l2_normalize_qk_strided`. Bit-identical math.
-/// `LUMEN_METAL_GDN_L2_SG=1` → ON, `=0` → OFF. Default OFF until A/B-validated.
-#[inline]
-pub(crate) fn gdn_l2_sg_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(255);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 255 {
-        return cur != 0;
-    }
-    let on = std::env::var("LUMEN_METAL_GDN_L2_SG").ok().as_deref() == Some("1");
-    CACHE.store(on as u8, AOrd::Relaxed);
-    on
-}
-
-/// Whether to use the fused conv1d+SiLU+L2(Q/K) kernel that
-/// collapses the conv1d -> L2 dispatch boundary (the dominant GDN-block stall
-/// per the per-substage attribution + L2-SG null). When ON, the GDN prefill
-/// path replaces the {full conv+silu, conv_state_update, standalone L2} trio
-/// with {fused conv+silu+L2 for Q/K, conv+silu for V, conv_state_update}.
-/// Bit-identical math (same conv tap order, SiLU, F32 storage, L2 reduction
-/// tree). Resolved once via `LUMEN_METAL_GDN_CONV_L2_FUSED=1`. **Default OFF**
-/// until paired-perf + PRISTINE x3 validation promotes it.
-pub(crate) fn gdn_conv_l2_fused_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(255);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 255 {
-        return cur != 0;
-    }
-    let on = std::env::var("LUMEN_METAL_GDN_CONV_L2_FUSED")
-        .ok()
-        .as_deref()
-        == Some("1");
-    CACHE.store(on as u8, AOrd::Relaxed);
-    on
 }
 
 /// Whether the GDN `ssm_out` projection uses the F32-batched residual kernel.
@@ -770,96 +515,6 @@ pub(crate) fn ffn_down_splitk_value() -> u32 {
     // Allowed values: 0 (off), 2, 4, 8. Any other value disables.
     let v = if matches!(v, 0 | 2 | 4 | 8) { v } else { 0 };
     CACHE.store((v + 1) as u8, AOrd::Relaxed);
-    v
-}
-
-/// Whether to enable the BF16 FFN-down Split-K K64 path.
-///
-/// Resolved once via `LUMEN_METAL_FFN_DOWN_SPLITK_BF16=<N>` (N in {2,4,8};
-/// explicit `0` disables). **Default OFF** until empirical validation;
-/// intentionally NOT gated under `metal_defaults_active()` (the Q8 variant
-/// has multi-revision evidence; BF16 awaits its own).
-///
-/// Eligibility (checked at the dispatch site):
-///   - BF16 weights, M <= 192, K >= 8192, K % 64 == 0.
-/// When non-zero, the FFN-down dispatch uses `bf16_matmul_k64_splitk`
-/// followed by the shared `reduce_splitk_add_residual` reduce kernel.
-#[inline]
-pub(crate) fn ffn_down_splitk_bf16_value() -> u32 {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return (cur - 1) as u32;
-    }
-    let raw = std::env::var("LUMEN_METAL_FFN_DOWN_SPLITK_BF16").ok();
-    let v: u32 = match raw {
-        Some(ref s) if !s.is_empty() => s.parse().unwrap_or(0),
-        _ => 0,
-    };
-    // Allowed values: 0 (off), 2, 4, 8. Any other value disables.
-    let v = if matches!(v, 0 | 2 | 4 | 8) { v } else { 0 };
-    CACHE.store((v + 1) as u8, AOrd::Relaxed);
-    v
-}
-
-/// BF16 GDN tile geometry override.
-///
-/// The default BF16 GDN dispatch picks `tiled_matmul_bf16_k64` when
-/// hidden_dim % 64 == 0 && batch_size <= 4096. The K64 variant has fewer
-/// barriers but doubles threadgroup-memory pressure (8 KB vs 4 KB shmem),
-/// which can reduce occupancy on M3 Ultra at skinny-M (M=131) shapes.
-///
-/// When `LUMEN_METAL_BF16_GDN_TILE_NOK64=1`, the GDN dispatch forces
-/// `tiled_matmul_bf16` (no K64) for ALL three BF16 GDN sites (QKV-proj,
-/// attn_gate-proj, ssm_out residual). Default OFF — preserves
-/// reference behaviour byte-identically when unset.
-///
-/// Microbench harness expectation:
-#[inline]
-pub(crate) fn bf16_gdn_tile_nok64_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_BF16_GDN_TILE_NOK64")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
-/// Apple MPSGraph BF16 GEMM opt-in.
-///
-/// When ON, the BF16 GDN `qkv_proj` (K=4096, N=8192) and `ssm_out`
-/// (K=4096, N=4096) matmuls are routed through Apple's MPSGraph in place
-/// of Lumen's `tiled_matmul_bf16_k64` / `tiled_matmul_bf16_k64_residual`
-/// custom kernels. MPSGraph achieves ~7.5 TFLOPs at the qkv-proj shape
-/// per microbench (1.166 ms median); the smaller projections
-/// (gate, gk, gk_a_log) keep the custom kernel because MPSGraph
-/// framework overhead dominates at N <= 128.
-///
-/// Activation conditions checked at the dispatch site:
-///   1. `bf16_mps_enabled()` returns true (env `LUMEN_METAL_BF16_MPS=1`).
-///   2. BF16 weight quantization (other quants stay on existing path).
-///   3. Batch size > 32 (small-M overhead dominates the MPSGraph win).
-///   4. K, N >= 4096 (excludes the small attention projections).
-///
-/// Default OFF — every BF16 path remains byte-identical until the user
-/// explicitly opts in. The ssm_out residual addition (`+ x_buf`) is
-/// performed by a follow-on F32 add kernel when this path is taken,
-/// since MPSGraph does not subsume the residual in the same graph.
-#[inline]
-pub(crate) fn bf16_mps_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_BF16_MPS")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
     v
 }
 
@@ -937,73 +592,6 @@ pub(crate) fn q8_repacked_gate_up_enabled() -> bool {
     v
 }
 
-/// Top-level enable for Q4_0 hot-weight runtime repack.
-///
-/// Port of `q8_repacked_enabled()` to Q4_0. When `LUMEN_METAL_Q4_REPACKED=1`,
-/// the load-time pass allocates extra `MTLBuffer`s holding hot FFN tensors
-/// in a Metal-friendly stripe SoA layout (see `metal/repack_q4.rs`). The
-/// packed kernels in `shaders/gemm_q4.msl` consume these buffers; the
-/// original AoS path remains as a fallback when this is OFF or when a tensor
-/// doesn't qualify (wrong quant, dimensions misaligned, etc).
-///
-/// Default: OFF (bit-exact behavior when disabled).
-#[inline]
-pub(crate) fn q4_repacked_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    // default OFF (env-required-ON). MoE-safe by construction because
-    // dense FFN slots are zero-slice sentinels on MoE LBCs — the repack pass
-    // skips them via `length > 0` checks. Default stays OFF; explicit
-    // `LUMEN_METAL_Q4_REPACKED=1` still wins (operator override honoured even
-    // on MoE, matching's "explicit > default" precedence).
-    let v = std::env::var("LUMEN_METAL_Q4_REPACKED")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
-/// Sub-gate for Q4 FFN-down repack only. Allows independent rollout from gate+up.
-/// Default: ON when `LUMEN_METAL_Q4_REPACKED=1`, can be force-disabled via
-/// `LUMEN_METAL_Q4_REPACKED_FFN_DOWN=0`.
-#[inline]
-pub(crate) fn q4_repacked_ffn_down_enabled() -> bool {
-    if !q4_repacked_enabled() {
-        return false;
-    }
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_Q4_REPACKED_FFN_DOWN")
-        .map(|s| s != "0")
-        .unwrap_or(true);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
-/// Sub-gate for Q4 FFN gate+up pair-packed repack. Same semantics as FFN-down sub-gate.
-#[inline]
-pub(crate) fn q4_repacked_gate_up_enabled() -> bool {
-    if !q4_repacked_enabled() {
-        return false;
-    }
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_Q4_REPACKED_GATE_UP")
-        .map(|s| s != "0")
-        .unwrap_or(true);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
 /// BF16 GDN qkv-proj + attn-gate-proj paired-dispatch enable.
 ///
 /// When ON, the two BF16 GEMM dispatches in Phase 1 of each GDN layer
@@ -1028,10 +616,6 @@ pub(crate) fn q4_repacked_gate_up_enabled() -> bool {
 /// processes (e.g. `lumen-server`) can opt in with
 /// `LUMEN_METAL_BF16_GDN_QKV_GATE_PAIRED=1` and amortise the
 /// page-table commit over many inferences.
-///
-/// A load-time warmup dispatch in `gpu_resident.rs` is retained as an opt-in
-/// (`LUMEN_METAL_BF16_GDN_WARMUP=1` with `MODE=minimal|full`) for
-/// downstream investigation.
 ///
 /// A stronger warmup mechanism (`bf16_paired_full_prefill_warmup_enabled`)
 /// runs a complete throwaway prefill at `M=131` at the tail of
@@ -1237,90 +821,6 @@ pub(crate) fn unretained_cmdbufs_enabled() -> bool {
     v
 }
 
-/// Multi command-buffer in-flight on prefill.
-///
-/// When `LUMEN_METAL_MULTI_CB=1`, the prefill is split into K command
-/// buffers (default K=2, override via `LUMEN_METAL_MULTI_CB_N`) that
-/// are committed sequentially on the same MTLCommandQueue. CB[0] is
-/// `commit()`'d (no wait) immediately after its layers are encoded,
-/// then CB[k+1] is encoded while CB[k] executes on the GPU. Only the
-/// FINAL CB is `commit_and_wait()`'d.
-///
-/// Same-queue submission order = strict GPU execution order, so the
-/// CB[k]→CB[k+1] boundary on `batch_x_buf` (residual carrier) requires
-/// no explicit fence — Metal's MTLCommandQueue guarantees CBs run in
-/// submission FIFO. The win comes from CPU encoding of CB[k+1]
-/// overlapping with GPU execution of CB[k].
-///
-/// Default: OFF. CPU encoding time per layer must be measured to be a
-/// non-negligible fraction of prefill wall before this can deliver.
-/// analytical evidence shows CPU encoding is microseconds at
-/// pp131,
-/// so the predicted upside is small (≤0.5%); kept env-gated until
-/// empirical validation lands measurable.
-///
-/// 64-CB submission baseline benchmark (a comparison runtime
-/// submits ~3 large CBs per prefill iteration with 130-170 ms each of
-/// asynchronous GPU compute; Lumen submits 1 CB then waits).
-#[inline]
-pub(crate) fn multi_cb_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_MULTI_CB")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
-/// Number of command buffers to split prefill into when
-/// `LUMEN_METAL_MULTI_CB=1`. Default 2. Allowed range: [2, 8]. Values
-/// outside the range are clamped. Returns 1 when MULTI_CB is OFF (the
-/// caller can branch on `> 1`).
-#[inline]
-pub(crate) fn multi_cb_count() -> usize {
-    if !multi_cb_enabled() {
-        return 1;
-    }
-    let n: usize = std::env::var("LUMEN_METAL_MULTI_CB_N")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
-    n.clamp(2, 8)
-}
-
-/// Whether wavefront trace prints are enabled.
-///
-/// When `LUMEN_METAL_CONCURRENT_ENCODER_TRACE=1`, `emit_plan_into_encoder` prints the
-/// wavefront structure (one `[graph-trace]` line per wave) to stderr. Useful
-/// for diagnosing wavefront grouping, but noisy enough to gate behind
-/// an env var.
-///
-/// Cached atomically following the same pattern as `concurrent_encoder_enabled()` /
-/// `unretained_cmdbufs_enabled()`. Previously this resolved
-/// `std::env::var` on every call to `emit_plan_into_encoder`, which fires
-/// 32 times per prefill on Qwen3.5-9B (8 full-attn layers + 24 GDN FFN
-/// blocks). The uncached lookup serialises on libc's environ mutex
-/// (`getenv` on macOS); caching eliminates that round-trip on every call
-/// after the first.
-///
-#[inline]
-pub(crate) fn concurrent_encoder_trace_enabled() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_CONCURRENT_ENCODER_TRACE")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
 /// Whether to validate the concurrent-encoder plan by emitting it serially.
 ///
 /// When `LUMEN_METAL_CONCURRENT_ENCODER_VALIDATE=1`, the plan is emitted into a *serial*
@@ -1337,31 +837,6 @@ pub(crate) fn concurrent_encoder_validate_serial() -> bool {
         return cur == 2;
     }
     let v = std::env::var("LUMEN_METAL_CONCURRENT_ENCODER_VALIDATE")
-        .map(|s| !s.is_empty() && s != "0")
-        .unwrap_or(false);
-    CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
-    v
-}
-
-/// Whether to validate the whole-prefill encoder by emitting
-/// into a serial encoder for byte-identity comparison against legacy.
-///
-/// Resolved once via `LUMEN_METAL_CONCURRENT_ENCODER_FULL_VALIDATE=1`. Default OFF. Cached
-/// atomically. Mirrors `concurrent_encoder_validate_serial()`'s pattern. When ON, callers
-/// that respect `concurrent_encoder_full_enabled()` should create their outer encoder as a
-/// serial `new_compute_encoder()` instead of a concurrent one. The whole-
-/// prefill dispatch order must then be identical to legacy modulo within-
-/// encoder ordering (which is in-program-order for serial encoders); any
-/// divergence in the reference-token gate isolates cross-layer barrier
-/// bugs from concurrent-scheduling bugs.
-#[inline]
-pub(crate) fn concurrent_encoder_full_validate_serial() -> bool {
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    let cur = CACHE.load(AOrd::Relaxed);
-    if cur != 0 {
-        return cur == 2;
-    }
-    let v = std::env::var("LUMEN_METAL_CONCURRENT_ENCODER_FULL_VALIDATE")
         .map(|s| !s.is_empty() && s != "0")
         .unwrap_or(false);
     CACHE.store(if v { 2 } else { 1 }, AOrd::Relaxed);
@@ -1449,10 +924,8 @@ pub(crate) fn emit_plan_into_encoder(
         return Ok(());
     }
 
-    // Wavefront lookahead window: 32 by default, 64 when
-    // `LUMEN_METAL_CONCURRENT_ENCODER_FULL=1` is set ( scheduler — 64-node lookahead
-    // for plans larger than the legacy ~14-op cap).
-    let lookahead = active_lookahead();
+    // Wavefront lookahead window (32 ops).
+    let lookahead = LOOKAHEAD;
 
     // `done[i] = true` once op i has been emitted.
     let mut done = vec![false; n];
@@ -1460,16 +933,7 @@ pub(crate) fn emit_plan_into_encoder(
     let mut wave_buf: Vec<usize> = Vec::with_capacity(lookahead);
     let mut written_so_far: Vec<BufferId> = Vec::with_capacity(8);
 
-    // LUMEN_METAL_CONCURRENT_ENCODER_TRACE=1 prints the wavefront structure to stderr per
-    // layer; useful for diagnosing wavefront grouping but noisy enough that
-    // it's gated behind an env var (no default-on prints). Atomic-cached
-    // resolver eliminates ~32 `getenv` syscalls per prefill on Qwen3.5-9B
-    // (one per call site; this function is invoked once per full-attn layer
-    // and once per GDN FFN block).
-    let trace_enabled = concurrent_encoder_trace_enabled();
-
     let mut emitted = 0usize;
-    let mut wave_id = 0u32;
     while emitted < n {
         wave_buf.clear();
 
@@ -1536,11 +1000,6 @@ pub(crate) fn emit_plan_into_encoder(
         // Track the writes performed by this wavefront so the next barrier
         // can be scoped to just those buffers.
         let mut wave_writes: Vec<BufferId> = Vec::with_capacity(8);
-        if trace_enabled {
-            let labels: Vec<&'static str> = wave_buf.iter().map(|&i| plan[i].label).collect();
-            eprintln!("[graph-trace] wave {wave_id}: {:?}", labels);
-        }
-        wave_id += 1;
         for &idx in &wave_buf {
             for buf in plan[idx].writes() {
                 if !wave_writes.contains(&buf) {
@@ -1877,63 +1336,5 @@ mod tests {
         assert_eq!(waves[2], vec![2]);
         // Avoid unused-variable warning when plan emits aren't invoked.
         let _ = &mut plan;
-    }
-
-    /// confirm `LOOKAHEAD_FULL` doubles the legacy window.
-    ///
-    /// The constant is `pub(crate)`-internal; this test pins the
-    /// invariant `LOOKAHEAD_FULL == 2 * LOOKAHEAD` so a future refactor
-    /// that bumps one without the other is caught at unit-test time
-    /// (the wider-window scheduler design assumes the lookahead is at
-    /// least 2× the legacy one).
-    #[test]
-    fn lookahead_full_doubles_legacy() {
-        assert_eq!(super::LOOKAHEAD_FULL, 2 * super::LOOKAHEAD);
-        assert_eq!(super::LOOKAHEAD_FULL, 64);
-    }
-
-    /// confirm `active_lookahead` returns the cached window.
-    ///
-    /// This is a smoke test only — `active_lookahead` reads the
-    /// `LUMEN_METAL_CONCURRENT_ENCODER_FULL` env var once and caches it in an atomic,
-    /// so the value here depends on test process env. We assert only
-    /// that the return value is one of the two valid windows.
-    #[test]
-    fn active_lookahead_returns_valid_window() {
-        let lookahead = super::active_lookahead();
-        assert!(
-            lookahead == super::LOOKAHEAD || lookahead == super::LOOKAHEAD_FULL,
-            "active_lookahead must return LOOKAHEAD or LOOKAHEAD_FULL, got {}",
-            lookahead
-        );
-    }
-
-    /// `concurrent_encoder_full_validate_serial()` is a process-cached bool resolver.
-    ///
-    /// The env var `LUMEN_METAL_CONCURRENT_ENCODER_FULL_VALIDATE` is process-scoped and
-    /// cached on first call. The test asserts that the resolver is
-    /// idempotent: two consecutive calls return the same value.
-    #[test]
-    fn concurrent_encoder_full_validate_is_idempotent() {
-        let a = super::concurrent_encoder_full_validate_serial();
-        let b = super::concurrent_encoder_full_validate_serial();
-        assert_eq!(a, b);
-    }
-
-    /// `concurrent_encoder_full_validate_serial()` and `concurrent_encoder_full_enabled()` resolve
-    /// independently.
-    ///
-    /// The whole-prefill encoder gate (`LUMEN_METAL_CONCURRENT_ENCODER_FULL`) and
-    /// its byte-identity validator (`LUMEN_METAL_CONCURRENT_ENCODER_FULL_VALIDATE`) MUST
-    /// be independent env-var resolvers so that engineers can enable the
-    /// new path with the validator OFF (production) or with the validator
-    /// ON (regression debug) without coupling. This test confirms the two
-    /// fns are distinct functions that read distinct env vars.
-    #[test]
-    fn concurrent_encoder_full_validate_and_enabled_are_independent_fns() {
-        // Each returns a bool; nothing else to check at unit-test scope
-        // without spawning subprocesses (which is overkill for the harness).
-        let _ = super::concurrent_encoder_full_validate_serial();
-        let _ = super::concurrent_encoder_full_enabled();
     }
 }

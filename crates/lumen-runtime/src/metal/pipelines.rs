@@ -9,23 +9,10 @@ use crate::error::RuntimeError;
 impl MetalF32Backend {
     /// Compile all Metal shader pipelines.
     pub(super) fn compile_pipelines(&self) -> Result<MetalPipelines, RuntimeError> {
-        // Diagnostic-only: when `LUMEN_METAL_COMPILE_PROFILE=1` is set, print the
-        // wall-clock split between MSL library compilation
-        // (`newLibraryWithSource:`) and compute-pipeline-state creation (the
-        // lazy SASS codegen across all kernels). No-op when the env var is unset,
-        // so this does not alter any runtime behavior or output.
-        let compile_profile = std::env::var("LUMEN_METAL_COMPILE_PROFILE")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        let t_lib_start = std::time::Instant::now();
-
         let lib = self
             .device
             .new_library_with_source(METAL_SHADER_SOURCE)
             .map_err(RuntimeError::Compute)?;
-
-        let lib_elapsed = t_lib_start.elapsed();
-        let t_pso_start = std::time::Instant::now();
 
         macro_rules! make_pipeline {
             ($name:expr) => {{
@@ -104,7 +91,6 @@ impl MetalF32Backend {
             write_kv_cache: make_pipeline!("write_kv_cache"),
             fused_rope_kv_write: make_pipeline!("fused_rope_kv_write"),
             fused_rope_kv_mha: make_pipeline!("fused_rope_kv_mha"),
-            fused_rope_kv_mha_tgscores: make_pipeline!("fused_rope_kv_mha_tgscores"),
             fused_rope_neox_kv_write: lib
                 .get_function("fused_rope_neox_kv_write")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
@@ -145,6 +131,9 @@ impl MetalF32Backend {
             ),
             // 2-simdgroup matmul kernels (two SIMD groups cooperate on one output tile).
             dequant_matmul_q8_0_2sg: make_pipeline!("dequant_matmul_q8_0_2sg"),
+            dequant_matmul_q8_0_qkv_gate_2stream: make_pipeline!(
+                "dequant_matmul_q8_0_qkv_gate_2stream"
+            ),
             dequant_matmul_q8_0_2sg_residual: make_pipeline!("dequant_matmul_q8_0_2sg_residual"),
             ffn_fused_gate_up_swiglu_q8_0_2sg: make_pipeline!("ffn_fused_gate_up_swiglu_q8_0_2sg"),
             // Q4_0 decode kernels
@@ -181,11 +170,6 @@ impl MetalF32Backend {
             qmv_q4_0_residual_f16sc_h2math: lib
                 .get_function("qmv_q4_0_residual_f16sc_h2math")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            qmv_q4_0_splitk_partial: make_pipeline!("qmv_q4_0_splitk_partial"),
-            qmv_q4_0_splitk_reduce: make_pipeline!("qmv_q4_0_splitk_reduce"),
-            gateup_splitk_reduce_swiglu: make_pipeline!("gateup_splitk_reduce_swiglu"),
-            qmv_q4_0: make_pipeline!("qmv_q4_0"),
-            qmv_q4_0_8sg: make_pipeline!("qmv_q4_0_8sg"),
             qmv_q4_0_rmsnorm: make_pipeline!("qmv_q4_0_rmsnorm"),
             // OPTIONAL (non-fatal): f16-scales lm_head + GDN QKV/attn_gate variant.
             // None falls back to the f32-scale qmv_q4_0_rmsnorm.
@@ -198,30 +182,11 @@ impl MetalF32Backend {
             qmv_q4_0_rmsnorm_f16sc_h2math: lib
                 .get_function("qmv_q4_0_rmsnorm_f16sc_h2math")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            qmv_q4_0_rmsnorm_llamacpp: make_pipeline!("qmv_q4_0_rmsnorm_llamacpp"),
-            qmv_q4_0_rmsnorm_kv: make_pipeline!("qmv_q4_0_rmsnorm_kv"),
-            qmv_q4_0_rmsnorm_qgatekv: make_pipeline!("qmv_q4_0_rmsnorm_qgatekv"),
             qmv_q4_0_gate_up_swiglu: make_pipeline!("qmv_q4_0_gate_up_swiglu"),
             // OPTIONAL (non-fatal): f16-scales dense FFN gate/up variant. None falls
             // back to the f32-scale qmv_q4_0_gate_up_swiglu.
             qmv_q4_0_gate_up_swiglu_f16sc: lib
                 .get_function("qmv_q4_0_gate_up_swiglu_f16sc")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // OPTIONAL (non-fatal): 1-SG-per-TG f16-scales gate/up variant. None
-            // falls back to the 2-SG f16sc/f32 path. env LUMEN_METAL_Q4_GATEUP_1SG.
-            qmv_q4_0_gate_up_swiglu_f16sc_1sg: lib
-                .get_function("qmv_q4_0_gate_up_swiglu_f16sc_1sg")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // OPTIONAL (non-fatal): 8-rows-per-SG f16-scales gate/up variant. None
-            // falls back to the 4-row f16sc path. env LUMEN_METAL_Q4_GATEUP_8ROW.
-            qmv_q4_0_gate_up_swiglu_f16sc_8row: lib
-                .get_function("qmv_q4_0_gate_up_swiglu_f16sc_8row")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // OPTIONAL (non-fatal): F16-MATH f16-scales gate/up variant (half dequant
-            // MAC). None falls back to the f16sc/8row/1sg path. env
-            // LUMEN_METAL_Q4_GATEUP_F16MATH.
-            qmv_q4_0_gate_up_swiglu_f16sc_f16math: lib
-                .get_function("qmv_q4_0_gate_up_swiglu_f16sc_f16math")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             // OPTIONAL (non-fatal): HALF2-VECTORIZED f16-scales gate/up variant
             // (half2 dequant MAC). None falls back to the f16math/f16sc/8row/1sg
@@ -229,19 +194,11 @@ impl MetalF32Backend {
             qmv_q4_0_gate_up_swiglu_f16sc_h2math: lib
                 .get_function("qmv_q4_0_gate_up_swiglu_f16sc_h2math")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // OPTIONAL (non-fatal): INTERLEAVED gate+up variant. None falls back to
-            // the f16sc/8row/default path. env LUMEN_METAL_Q4_GATEUP_IL.
-            qmv_q4_0_gate_up_swiglu_il: lib
-                .get_function("qmv_q4_0_gate_up_swiglu_il")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             // OPTIONAL (non-fatal): LM-head-structure (LS) single-stream gate+up.
             // None falls back to the h2math/default path.
             qmv_q4_0_gate_up_swiglu_ls_h2math: lib
                 .get_function("qmv_q4_0_gate_up_swiglu_ls_h2math")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            rmsnorm_ffn_gate_up_swiglu_q4_0_wide: make_pipeline!(
-                "rmsnorm_ffn_gate_up_swiglu_q4_0_wide"
-            ),
             dequant_tiled_matmul_q8_0_residual_batched: make_bc_pipeline!(
                 "dequant_tiled_matmul_q8_0_residual_batched"
             ),
@@ -319,22 +276,7 @@ impl MetalF32Backend {
                 "dequant_tiled_matmul_q4_0_gate_up_swiglu_fused"
             ),
 
-            // packed-layout Q4_0 kernels (consume runtime-repacked SoA buffers).
-            dequant_tiled_matmul_q4_0_k64_residual_batched_packed: make_bc_pipeline!(
-                "dequant_tiled_matmul_q4_0_k64_residual_batched_packed"
-            ),
-            dequant_tiled_matmul_q4_0_k64_residual_batched_packed_aligned: make_aligned_pipeline!(
-                "dequant_tiled_matmul_q4_0_k64_residual_batched_packed"
-            ),
-            dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed: make_bc_pipeline!(
-                "dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed"
-            ),
-            dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed_aligned: make_aligned_pipeline!(
-                "dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed"
-            ),
-
             // ggml-metal ported Q8_0 GEMM (env-var gated)
-            kernel_mul_mm_q8_0_f32_ported: make_pipeline!("kernel_mul_mm_q8_0_f32_ported"),
 
             // Function-constant-specialized aligned GEMM variants (no boundary checks)
             dequant_tiled_matmul_q8_0_aligned: make_aligned_pipeline!("dequant_tiled_matmul_q8_0"),
@@ -368,8 +310,6 @@ impl MetalF32Backend {
             tiled_matmul_bf16_k64_qkv_gate_paired_aligned: make_aligned_pipeline!(
                 "tiled_matmul_bf16_k64_qkv_gate_paired"
             ),
-            // minimal warmup kernel for the paired repack buffer.
-            bf16_paired_warmup: make_pipeline!("bf16_paired_warmup"),
             // BF16 fused gate+up+SwiGLU (FC_BC_*=true and FC_BC_*=false variants).
             bf16_matmul_gate_up_swiglu_fused: make_bc_pipeline!("bf16_matmul_gate_up_swiglu_fused"),
             bf16_matmul_gate_up_swiglu_fused_aligned: make_aligned_pipeline!(
@@ -388,9 +328,6 @@ impl MetalF32Backend {
             bf16_matmul_gate_up_swiglu_fused_nr4_aligned: make_aligned_pipeline!(
                 "bf16_matmul_gate_up_swiglu_fused_nr4"
             ),
-            // BF16 K64 Split-K (FC_BC_*=true and FC_BC_*=false variants).
-            bf16_matmul_k64_splitk: make_bc_pipeline!("bf16_matmul_k64_splitk"),
-            bf16_matmul_k64_splitk_aligned: make_aligned_pipeline!("bf16_matmul_k64_splitk"),
 
             // Batched prefill kernels
             tiled_matmul_f32: make_pipeline!("tiled_matmul_f32"),
@@ -498,9 +435,6 @@ impl MetalF32Backend {
             moe_router_topk_softmax: lib
                 .get_function("moe_router_topk_softmax")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            moe_router_fused_topk: lib
-                .get_function("moe_router_fused_topk")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             moe_router_softmax_batched: lib
                 .get_function("moe_router_softmax_batched")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
@@ -563,9 +497,6 @@ impl MetalF32Backend {
             moe_batched_gate_up_swiglu_q8_0: lib
                 .get_function("moe_batched_gate_up_swiglu_q8_0")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            moe_batched_gate_up_swiglu_q8_0_v2: lib
-                .get_function("moe_batched_gate_up_swiglu_q8_0_v2")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             moe_batched_down_accum_q4_0: lib
                 .get_function("moe_batched_down_accum_q4_0")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
@@ -580,9 +511,6 @@ impl MetalF32Backend {
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             moe_batched_down_accum_shared_q8_0_se_q4_0: lib
                 .get_function("moe_batched_down_accum_shared_q8_0_se_q4_0")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            moe_batched_down_accum_shared_q8_0_se_q4_0_v2: lib
-                .get_function("moe_batched_down_accum_shared_q8_0_se_q4_0_v2")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             moe_batched_down_accum_shared_q4_0: lib
                 .get_function("moe_batched_down_accum_shared_q4_0")
@@ -695,10 +623,6 @@ impl MetalF32Backend {
             gdn_state_output_l2_sg: lib
                 .get_function("gdn_state_output_l2_sg")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // Read-once/write-once variant (dead store removed)
-            gdn_state_output_l2_sg_h1: lib
-                .get_function("gdn_state_output_l2_sg_h1")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             // Diagnostic (timing only): L2-norm-skipped variant (output garbage)
             gdn_state_output_l2_sg_normskip: lib
                 .get_function("gdn_state_output_l2_sg_NORMSKIP")
@@ -713,22 +637,12 @@ impl MetalF32Backend {
             gdn_state_output_l2_sg_f16: lib
                 .get_function("gdn_state_output_l2_sg_f16")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // F16 state recurrence WITHOUT the dead decayed write-back
-            // (LUMEN_METAL_GDN_F16_STATE_H1: union of f16-state + h1 dead-store elision)
-            gdn_state_output_l2_sg_f16_h1: lib
-                .get_function("gdn_state_output_l2_sg_f16_h1")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // VI-amortized f16+h1 recurrence (LUMEN_METAL_GDN_F16_STATE_H1_V2):
-            // 2 val_dim columns/TG, Q/K norm + load computed once and reused.
-            gdn_state_output_l2_sg_f16_h1_v2: lib
-                .get_function("gdn_state_output_l2_sg_f16_h1_v2")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // 4-way VI-amortized f16+h1 recurrence (LUMEN_METAL_GDN_F16_STATE_H1_V4):
+            // 4-way VI-amortized f16+h1 recurrence (default fast-decode stack):
             // 4 val_dim columns/TG, Q/K norm + load computed once and reused.
             gdn_state_output_l2_sg_f16_h1_v4: lib
                 .get_function("gdn_state_output_l2_sg_f16_h1_v4")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // One-time F32->F16 h_state converter (LUMEN_METAL_GDN_F16_STATE_DECODE)
+            // One-time F32->F16 h_state converter for the decode mirror
             gdn_state_f32_to_f16: lib
                 .get_function("gdn_state_f32_to_f16")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
@@ -770,14 +684,6 @@ impl MetalF32Backend {
             gdn_prefill_fused_v3_chunked: lib
                 .get_function("gdn_prefill_fused_v3_chunked")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // (32, NSG=4, 1) threadgroup geometry for Phase 2a.
-            gdn_prefill_fused_v3_chunked_nsg4: lib
-                .get_function("gdn_prefill_fused_v3_chunked_nsg4")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            // Chunk-parallel delta-rule Phase 2a.
-            gdn_prefill_chunkscan: lib
-                .get_function("gdn_prefill_chunkscan")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             gdn_prefill_norm_gate: lib
                 .get_function("gdn_prefill_norm_gate")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
@@ -799,15 +705,6 @@ impl MetalF32Backend {
             l2_normalize_qk_strided: lib
                 .get_function("l2_normalize_qk_strided")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            l2_normalize_qk_strided_sg: lib
-                .get_function("l2_normalize_qk_strided_sg")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            conv1d_silu_l2_qk_fused: lib
-                .get_function("conv1d_silu_l2_qk_fused")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
-            conv1d_silu_vrange: lib
-                .get_function("conv1d_silu_vrange")
-                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             gdn_compute_gates_batched: lib
                 .get_function("gdn_compute_gates_batched")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
@@ -818,16 +715,6 @@ impl MetalF32Backend {
                 .get_function("dequant_batched_matvec_q8_0_dual")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
         };
-
-        if compile_profile {
-            let pso_elapsed = t_pso_start.elapsed();
-            eprintln!(
-                "[LUMEN_METAL_COMPILE_PROFILE] newLibraryWithSource={:.3}s pipeline_state_creation={:.3}s total_shader_compile={:.3}s",
-                lib_elapsed.as_secs_f64(),
-                pso_elapsed.as_secs_f64(),
-                (lib_elapsed + pso_elapsed).as_secs_f64(),
-            );
-        }
 
         Ok(pipelines)
     }

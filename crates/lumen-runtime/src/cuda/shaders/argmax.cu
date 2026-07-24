@@ -1,5 +1,14 @@
 // GPU-side argmax: finds the index of the maximum value in a float array.
 //
+// Tie semantics (CORR-011): on exact-equal values this returns the LOWEST
+// index, matching the CPU `argmax` in sampling.rs, `argmax_excluding`, and
+// llama.cpp. The per-thread strided scan keeps the lowest index within a
+// thread (strict `>` over increasing `i`); the warp/block reductions break
+// ties by `other_idx < best_idx`. Because "max value, then min index" is an
+// associative+commutative reduction operator, every lane converges to the
+// global (max-value, min-index) pair regardless of lane assignment. NaN is
+// never selected (`>` and `<` on NaN are false), preserving prior behaviour.
+//
 // Two-phase reduction:
 // Phase 1: Each block reduces BLOCK_SIZE elements, writes (max_val, max_idx) to shared mem,
 //          then reduces within the block to produce one (val, idx) pair per block.
@@ -32,11 +41,11 @@ extern "C" __global__ void argmax_f32(
         }
     }
 
-    // Warp-level reduction
+    // Warp-level reduction (lowest-index tie-break: keep smaller idx on equal val)
     for (int offset = 16; offset > 0; offset >>= 1) {
         float other_val = __shfl_xor_sync(0xffffffff, best_val, offset);
         unsigned int other_idx = __shfl_xor_sync(0xffffffff, best_idx, offset);
-        if (other_val > best_val) {
+        if (other_val > best_val || (other_val == best_val && other_idx < best_idx)) {
             best_val = other_val;
             best_idx = other_idx;
         }
@@ -60,7 +69,7 @@ extern "C" __global__ void argmax_f32(
         for (int offset = 16; offset > 0; offset >>= 1) {
             float other_val = __shfl_xor_sync(0xffffffff, best_val, offset);
             unsigned int other_idx = __shfl_xor_sync(0xffffffff, best_idx, offset);
-            if (other_val > best_val) {
+            if (other_val > best_val || (other_val == best_val && other_idx < best_idx)) {
                 best_val = other_val;
                 best_idx = other_idx;
             }

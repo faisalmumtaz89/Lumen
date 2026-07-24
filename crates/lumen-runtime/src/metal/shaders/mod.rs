@@ -30,7 +30,6 @@ pub const METAL_SHADER_SOURCE: &str = concat!(
     include_str!("embed.msl"),
     include_str!("gemm_f32.msl"),
     include_str!("gemm_q8_0.msl"),
-    include_str!("gemm_q8_0_ported.msl"),
     include_str!("batched_ops.msl"),
     include_str!("gemm_residual_f16.msl"),
     include_str!("gemm_residual_bf16.msl"),

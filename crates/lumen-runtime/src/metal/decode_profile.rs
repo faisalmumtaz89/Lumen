@@ -26,6 +26,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -44,6 +45,72 @@ pub(crate) fn gputime_enabled() -> bool {
     GPUTIME_ENABLED.load(Ordering::Relaxed)
 }
 
+// ============================================================================
+// [metal-R9] Command-buffer split lever (production).
+// ============================================================================
+//
+// The Metal lean decode path submits embed + all layers + lm_head + argmax as
+// ONE per-token command buffer. When that CB is large (~15 ms on 27B-Q4), the
+// GPU incurs a ~0.5 ms/tok dispatch stall launching the next already-committed
+// CB after the big one retires (metal-R9 P1/P2 mechanism: the stall scales with
+// the completing CB's size, not phase or content). Committing the per-token CB
+// in a few pieces at full-attn island boundaries keeps each CB small enough to
+// avoid the stall. The split points are full-attn concurrent-proj island CLOSE
+// sites, where cross-CB correctness is FREE: the single command queue is FIFO
+// (the committed CB retires before the continuation executes -- the same
+// invariant the event-free lean pipeline already relies on inter-token) and the
+// qkv/k/v buffers are hazard-tracked StorageModeShared (automatic cross-CB
+// hazard barrier). No MTLSharedEvent is used. Byte-identical to the single-CB
+// path (metal-R9 P1, DET-001 + corpus). See `decode_token_greedy_core`.
+
+/// Explicit per-token CB split boundaries. Always empty: the manual override
+/// was removed, so callers fall through to the AUTO split policy
+/// (byte-identical single-CB behavior when AUTO off).
+pub(crate) fn split_cb_ords() -> &'static [u32] {
+    &[]
+}
+
+/// AUTO split-policy toggle: `LUMEN_METAL_CB_SPLIT`. Default-ON (metal-R10):
+/// unset, `auto`, or `1` (the plain truthy the LKA gate harness uses) turns it
+/// on; `0` / `off` disables. When on (the explicit `split_cb_ords()` list is
+/// always empty), the decode core inserts a commit boundary at a full-attn
+/// island CLOSE
+/// once the current CB has accumulated `AUTO_SPLIT_ENCODER_STRIDE` encoders
+/// (see `decode_token_greedy_core`), provided the model has at least
+/// `AUTO_SPLIT_MIN_ENCODERS` per-token encoders. Reproduces the measured
+/// split boundaries (27B: ord 39/79/119, +2.4% decode; MoE 35B-A3B: ord
+/// 39/79, +5.6% decode) and no-ops on architectures without full-attn
+/// islands (no island CLOSE site fires => unchanged behavior). Cached once.
+pub(crate) fn cb_split_auto() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("LUMEN_METAL_CB_SPLIT")
+            .ok()
+            .map(|s| {
+                let t = s.trim();
+                !(t.eq_ignore_ascii_case("off") || t == "0")
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// Encoders-per-CB target for the AUTO split policy. At `40`, the per-token CB
+/// is committed each time it has accumulated ~40 compute encoders at a full-attn
+/// island CLOSE. On Qwen3.6-27B (129 encoders, full-attn every 4th of 64 layers)
+/// this yields boundaries at ord 39/79/119 (== the measured split3). The win
+/// saturates at 3 commits/token on 27B (metal-R9 P2), so a coarse stride is
+/// deliberate: it removes every large-CB stall while adding the fewest commits.
+pub(crate) const AUTO_SPLIT_ENCODER_STRIDE: u32 = 40;
+
+/// Minimum per-token encoder count (`2*layers+1`) for the AUTO policy to
+/// engage. Below this, stride-40 fires a single split near the token tail,
+/// measured FLAT on Qwen3.5-9B (65 encoders; metal-R9/R10) -- harmless but
+/// pointless, so the AUTO policy skips it and the token stays single-CB.
+/// At 73+ encoders (>= 36 layers) the first split leaves a >= 33-encoder
+/// continuation and the stall removal is real (27B/MoE). A non-empty explicit
+/// `split_cb_ords()` list would bypass this gate (currently always empty).
+pub(crate) const AUTO_SPLIT_MIN_ENCODERS: u32 = 73;
+
 pub(crate) fn init_from_env() {
     if std::env::var("LUMEN_METAL_DECODE_PROFILE").ok().as_deref() == Some("1") {
         ENABLED.store(true, Ordering::Relaxed);
@@ -51,41 +118,6 @@ pub(crate) fn init_from_env() {
     if std::env::var("LUMEN_METAL_DECODE_GPUTIME").ok().as_deref() == Some("1") {
         GPUTIME_ENABLED.store(true, Ordering::Relaxed);
     }
-}
-
-/// Diagnostic sub-stage skip bitmask for the full-attention decode block, parsed
-/// once from `LUMEN_METAL_FULLATTN_SUBSKIP` (decimal or 0x-hex u32). When a bit is
-/// set, the matching sub-stage's GPU dispatch is skipped so its cost can be read
-/// off the `full_attn` per-section GPU time. Skipping corrupts the output (this is
-/// a timing-attribution tool only). 0 / unset => no-op (every sub-stage runs).
-///
-/// Bit layout (see `FULLATTN_SKIP_*` constants in `decode_greedy.rs`):
-///   bit0 K proj, bit1 V proj, bit2 RoPE+KV-write, bit3 attention (MHA/flash),
-///   bit4 Q+gate proj, bit5 Wo proj, bit6 deinterleave/norm/assemble + misc.
-#[inline]
-pub(crate) fn fullattn_subskip() -> u32 {
-    use std::sync::atomic::AtomicU32;
-    // Sentinel bit31 marks "already resolved" so a genuine mask of 0 is cached.
-    const RESOLVED: u32 = 0x8000_0000;
-    static CACHE: AtomicU32 = AtomicU32::new(0);
-    let cur = CACHE.load(Ordering::Relaxed);
-    if cur & RESOLVED != 0 {
-        return cur & !RESOLVED;
-    }
-    let v = std::env::var("LUMEN_METAL_FULLATTN_SUBSKIP")
-        .ok()
-        .and_then(|s| {
-            let t = s.trim();
-            if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-                u32::from_str_radix(hex, 16).ok()
-            } else {
-                t.parse::<u32>().ok()
-            }
-        })
-        .unwrap_or(0)
-        & !RESOLVED; // never let the sentinel be a user-supplied bit
-    CACHE.store(v | RESOLVED, Ordering::Relaxed);
-    v
 }
 
 thread_local! {
@@ -277,15 +309,6 @@ pub(crate) fn maybe_report_and_reset(every: u64) {
     if !is_enabled() {
         return;
     }
-    // Diagnostic override: report after this many decode tokens instead of the
-    // built-in cadence. Lets a short run (e.g. one whose output hits EOS before
-    // the default 64-token mark) still emit a valid per-call average; the us/call
-    // is a per-call mean and is independent of the token count. Unset => default.
-    let every = std::env::var("LUMEN_METAL_DECODE_PROFILE_EVERY")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(every);
     let fire = TOK_COUNT.with(|c| {
         let mut c = c.borrow_mut();
         *c += 1;

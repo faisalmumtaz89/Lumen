@@ -16,8 +16,10 @@
 //!
 //! In return, it surfaces structured tool-call deltas as they finalize.
 
+use std::sync::Arc;
+
 use lumen_runtime::tooling::{
-    ParsedToolCall, ReasoningExtractor, StreamingFinish, StreamingParser,
+    ParsedToolCall, ReasoningExtractor, StreamingFinish, StreamingParser, ToolSchemas,
 };
 
 /// The output of a single [`SseSafeEmitter::push`] call.
@@ -73,6 +75,20 @@ impl SseSafeEmitter {
             pending_bytes: Vec::new(),
             reasoning: ReasoningExtractor::new(thinking),
             parser: StreamingParser::new(),
+        }
+    }
+
+    /// Construct an emitter whose tool-call parser types native-protocol
+    /// `<parameter>` values by the request's advertised tool `schemas`. The chat
+    /// and Anthropic surfaces use this so the streaming reconstruction is
+    /// schema-aware (and byte-identical to the aggregated non-streaming result,
+    /// which flows through the same emitter). Legacy `/v1/completions` and the
+    /// unit tests keep the schemaless [`new`](Self::new).
+    pub fn with_schemas(thinking: bool, schemas: Arc<ToolSchemas>) -> Self {
+        Self {
+            pending_bytes: Vec::new(),
+            reasoning: ReasoningExtractor::new(thinking),
+            parser: StreamingParser::with_schemas(schemas),
         }
     }
 
