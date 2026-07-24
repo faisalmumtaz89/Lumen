@@ -68,10 +68,6 @@ pub(crate) struct MetalPipelines {
     // Fused RoPE Q + RoPE K + KV cache write (saves 2 dispatches/layer)
     pub(crate) fused_rope_kv_write: MetalPipelineState,
     pub(crate) fused_rope_kv_mha: MetalPipelineState,
-    // Variant of fused_rope_kv_mha that holds the per-head attention scores in
-    // threadgroup memory instead of a device scratch buffer (eliminates the
-    // transient score vector's DRAM round-trips). Byte-identical math.
-    pub(crate) fused_rope_kv_mha_tgscores: MetalPipelineState,
     // MMA (simdgroup_matrix) variant of the decode attention: Q.K^T + softmax +
     pub(crate) fused_rope_neox_kv_write: Option<MetalPipelineState>,
     pub(crate) multi_head_attention: MetalPipelineState,
@@ -114,6 +110,7 @@ pub(crate) struct MetalPipelines {
     pub(crate) dequant_matmul_q8_0_deferred_bias_nr2: MetalPipelineState,
     // 2-SG independent row ownership (zero barriers, zero shmem)
     pub(crate) dequant_matmul_q8_0_2sg: MetalPipelineState,
+    pub(crate) dequant_matmul_q8_0_qkv_gate_2stream: MetalPipelineState,
     pub(crate) dequant_matmul_q8_0_2sg_residual: MetalPipelineState,
     pub(crate) ffn_fused_gate_up_swiglu_q8_0_2sg: MetalPipelineState,
     // Q4_0 decode kernels
@@ -138,7 +135,7 @@ pub(crate) struct MetalPipelines {
     pub(crate) qmv_q4_0_wo_glue: Option<MetalPipelineState>,
     // OPTIONAL (non-fatal): f16-scales variant of qmv_q4_0_residual (FFN-down). A
     // missing/uncompilable kernel yields None and the FFN-down dispatch falls back
-    // to the f32-scale qmv_q4_0_residual. env LUMEN_METAL_Q4_QMV_DOWN_F16SC.
+    // to the f32-scale qmv_q4_0_residual.
     pub(crate) qmv_q4_0_residual_f16sc: Option<MetalPipelineState>,
     // OPTIONAL (non-fatal): F16-MATH variant of qmv_q4_0_residual_f16sc (FFN-down).
     // Stages x as half + accumulates the per-32-block dequant MAC in half (~2x Apple
@@ -151,68 +148,21 @@ pub(crate) struct MetalPipelines {
     // f16sc dispatch falls back to f16sc/f32. env
     // LUMEN_METAL_Q4_DOWN_H2MATH.
     pub(crate) qmv_q4_0_residual_f16sc_h2math: Option<MetalPipelineState>,
-    // Two-pass deterministic SPLIT-K of qmv_q4_0_residual: pass-1 partial (K-slice
-    // per grid.y) + pass-2 reduce+residual. env LUMEN_METAL_Q4_QMV_DOWN_SPLITK,
-    // default OFF. Raises threadgroup concurrency for the row-starved FFN-down.
-    pub(crate) qmv_q4_0_splitk_partial: MetalPipelineState,
-    pub(crate) qmv_q4_0_splitk_reduce: MetalPipelineState,
-    // Pass-2 reduce+SwiGLU for the dense-FFN gate/up SPLIT-K (reuses
-    // qmv_q4_0_splitk_partial twice on pre-normed x). env LUMEN_METAL_Q4_GATEUP_SPLITK.
-    pub(crate) gateup_splitk_reduce_swiglu: MetalPipelineState,
-    // Fused K+V full-attn projection: one dispatch over [2*kv_dim] rows (doubles
-    // threadgroup occupancy for the row-starved K/V matvecs). Byte-identical to the
-    // two separate qmv_q4_0_rmsnorm dispatches. env LUMEN_METAL_Q4_KV_FUSE.
-    pub(crate) qmv_q4_0_rmsnorm_kv: MetalPipelineState,
-    // Fused Q+gate, K AND V full-attn projection: ONE dispatch over the concatenated
-    // [qgate_dim + 2*kv_dim] rows (~42.7 SG/core for Qwen3.5-9B, past the occupancy
-    // knee). Byte-identical to the three separate qmv_q4_0_rmsnorm dispatches.
-    // env LUMEN_METAL_Q4_QGATEKV_FUSE.
-    pub(crate) qmv_q4_0_rmsnorm_qgatekv: MetalPipelineState,
-    // Bare single-matrix decode GEMV on PRE-normed x (64-thread; no residual, no
-    // fused RMSNorm) — for the rmsnorm-once -> bare qmv gate/up -> swiglu path.
-    pub(crate) qmv_q4_0: MetalPipelineState,
-    // 256-thread (8 SG/TG, lane-parallel K) variant of qmv_q4_0.
-    pub(crate) qmv_q4_0_8sg: MetalPipelineState,
     // MLX-style decode GEMV with fused RMSNorm (GDN qkv projection; no residual).
     pub(crate) qmv_q4_0_rmsnorm: MetalPipelineState,
     // OPTIONAL (non-fatal): f16-scales variant of qmv_q4_0_rmsnorm (lm_head + GDN
-    // QKV/attn_gate). None falls back to the f32-scale qmv_q4_0_rmsnorm. env
-    // LUMEN_METAL_Q4_LMHEAD_F16SC / LUMEN_METAL_Q4_PROJ_F16SC.
+    // QKV/attn_gate). None falls back to the f32-scale qmv_q4_0_rmsnorm.
     pub(crate) qmv_q4_0_rmsnorm_f16sc: Option<MetalPipelineState>,
     // HALF2-VECTORIZED single-matrix rmsnorm variant (half2 dequant MAC); used by
     // the lm_head dispatch. None falls back to the f16math/f16sc/f32 path.
     // env LUMEN_METAL_Q4_LMHEAD_H2MATH (default OFF).
     pub(crate) qmv_q4_0_rmsnorm_f16sc_h2math: Option<MetalPipelineState>,
-    // A/B EXPERIMENT: llama.cpp lane->block mapping variant of qmv_q4_0_rmsnorm
-    // (same buffers/geometry/RMSNorm, only the coalescing pattern differs).
-    // env LUMEN_METAL_Q4_QMV_PROJ_LCMAP (default OFF).
-    pub(crate) qmv_q4_0_rmsnorm_llamacpp: MetalPipelineState,
     // MLX-style DUAL-matrix decode GEMV: fused RMSNorm + gate/up + SwiGLU
-    // (dense FFN gate/up; env LUMEN_METAL_Q4_QMV_GATEUP).
+    // (dense FFN gate/up).
     pub(crate) qmv_q4_0_gate_up_swiglu: MetalPipelineState,
     // OPTIONAL (non-fatal): f16-scales variant of qmv_q4_0_gate_up_swiglu. None
-    // falls back to the f32-scale dual-matrix kernel. env LUMEN_METAL_Q4_GATEUP_F16SC.
+    // falls back to the f32-scale dual-matrix kernel.
     pub(crate) qmv_q4_0_gate_up_swiglu_f16sc: Option<MetalPipelineState>,
-    // OPTIONAL (non-fatal): 1-simdgroup-per-TG variant of the f16-scales gate/up
-    // kernel. Byte-identical math; ONLY the geometry differs (1 SG/TG, 4 rows/TG,
-    // inter_dim/4 TGs = 2x more threadgroups for deeper wavefront latency hiding).
-    // None falls back to the 2-SG f16sc/f32 path. env LUMEN_METAL_Q4_GATEUP_1SG.
-    pub(crate) qmv_q4_0_gate_up_swiglu_f16sc_1sg: Option<MetalPipelineState>,
-    // OPTIONAL (non-fatal): 8-rows-per-SG variant of the f16-scales gate/up kernel.
-    // Byte-identical math (per output row the FP add order + simd_sum are unchanged);
-    // ONLY the geometry differs (2 SG/TG, 8 rows/SG, inter_dim/16 TGs = HALF the
-    // threadgroups, 2x x-register reuse to lift arithmetic intensity per fetched
-    // activation byte). None falls back to the 4-row f16sc path. env
-    // LUMEN_METAL_Q4_GATEUP_8ROW.
-    pub(crate) qmv_q4_0_gate_up_swiglu_f16sc_8row: Option<MetalPipelineState>,
-    // OPTIONAL (non-fatal): F16-MATH variant of the f16-scales gate/up kernel.
-    // Same 2 SG/TG, 4 rows/SG, inter_dim/8 TGs geometry + same bindings; the per-
-    // 32-block dequant MAC runs in `half` (~2x Apple GPU half ALU) while the cross-
-    // block reduction / sum-of-x / scale / RMSNorm / SwiGLU stay f32. Near-tie (not
-    // guaranteed byte-identical); attacks the COMPUTE half of the dominant FFN
-    // matvec. None falls back to the f16sc/8row/1sg path. env
-    // LUMEN_METAL_Q4_GATEUP_F16MATH.
-    pub(crate) qmv_q4_0_gate_up_swiglu_f16sc_f16math: Option<MetalPipelineState>,
     // OPTIONAL (non-fatal): HALF2-VECTORIZED variant of the f16-scales gate/up
     // kernel. Same 2 SG/TG, 4 rows/SG, inter_dim/8 TGs geometry + same bindings as
     // the f16math kernel; the per-32-block dequant MAC accumulates in `half2` (two
@@ -222,20 +172,12 @@ pub(crate) struct MetalPipelines {
     // cross-block reduction / sumx / scale / RMSNorm / SwiGLU stay f32). None falls
     // back to the f16math/f16sc/8row/1sg path. env LUMEN_METAL_Q4_GATEUP_H2MATH.
     pub(crate) qmv_q4_0_gate_up_swiglu_f16sc_h2math: Option<MetalPipelineState>,
-    // OPTIONAL (non-fatal): INTERLEAVED gate+up variant. Byte-identical math; reads
-    // ONE co-resident packed nibble buffer + ONE packed f16-scale buffer instead of
-    // four separate streams (gate/up nibbles + gate/up scales). None falls back to
-    // the f16sc/8row/default path. env LUMEN_METAL_Q4_GATEUP_IL.
-    pub(crate) qmv_q4_0_gate_up_swiglu_il: Option<MetalPipelineState>,
     // OPTIONAL (non-fatal): LM-head-structure (LS) single-stream gate+up variant.
     // Byte-identical math to the h2math dual kernel; reads a ROW-INTERLEAVED
     // gate|up buffer single-stream at 2*inter_dim/8 TGs (lm_head structure)
     // instead of the DUAL gate+up stream at inter_dim/8 TGs. None falls back to
     // the h2math/default path.
     pub(crate) qmv_q4_0_gate_up_swiglu_ls_h2math: Option<MetalPipelineState>,
-    // WIDE-load (uint4/256-thread) variant of the dense FFN gate/up GEMV; reads
-    // the same separated sequential-nibble layout (env LUMEN_METAL_Q4_GATEUP_WIDE).
-    pub(crate) rmsnorm_ffn_gate_up_swiglu_q4_0_wide: MetalPipelineState,
     pub(crate) dequant_tiled_matmul_q8_0_residual_batched: MetalPipelineState,
     // Q4_0 batched prefill kernels
     pub(crate) dequant_tiled_matmul_q4_0: MetalPipelineState,
@@ -270,13 +212,6 @@ pub(crate) struct MetalPipelines {
     /// GDN: M=131 may misalign but N=8192/4096 and K=4096 are aligned —
     /// the BC variant is used in practice when M is misaligned).
     pub(crate) tiled_matmul_bf16_k64_qkv_gate_paired_aligned: MetalPipelineState,
-    /// Minimal warmup kernel for the BF16 GDN paired repack
-    /// buffer. Touches one BF16 element per layer at load time so that the
-    /// Apple Metal driver commits the GPU page-table mapping for the 96 MB
-    /// packed buffer upfront, not at first-prefill time. Cost: ~1µs per
-    /// layer; the alternative is ~280 ms on the cold first prefill per the
-    /// diagnostic.
-    pub(crate) bf16_paired_warmup: MetalPipelineState,
     pub(crate) matmul_bytes_f32_residual: MetalPipelineState,
 
     // Buffer ops (GPU-side activation transfer)
@@ -313,20 +248,6 @@ pub(crate) struct MetalPipelines {
     // Same kernel structure; Q4_0 de-interleaved nibble dequant path.
     pub(crate) dequant_tiled_matmul_q4_0_gate_up_swiglu_fused: MetalPipelineState,
     pub(crate) dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_aligned: MetalPipelineState,
-
-    // packed-layout Q4_0 kernels. Consume runtime-repacked stripe SoA
-    // weight buffers (see `metal/repack_q4.rs`). Both BC and aligned variants
-    // are registered so the dispatch site can pick the fast path when M/N/K
-    // are aligned to the tile dimensions. Q4 port of.
-    pub(crate) dequant_tiled_matmul_q4_0_k64_residual_batched_packed: MetalPipelineState,
-    pub(crate) dequant_tiled_matmul_q4_0_k64_residual_batched_packed_aligned: MetalPipelineState,
-    pub(crate) dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed: MetalPipelineState,
-    pub(crate) dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed_aligned: MetalPipelineState,
-
-    // ggml-metal ported Q8_0 GEMM (gated by LUMEN_METAL_GEMM_GGML_PORT=1).
-    // Adapted from ggml-org/ggml `kernel_mul_mm_q8_0_f32` — MIT.
-    // See `shaders/gemm_q8_0_ported.msl`.
-    pub(crate) kernel_mul_mm_q8_0_f32_ported: MetalPipelineState,
 
     // Function-constant-specialized GEMM variants (BC_M=false, BC_N=false, BC_K=false).
     // Used when M, N, K are all aligned to tile dimensions, eliminating all
@@ -366,13 +287,6 @@ pub(crate) struct MetalPipelines {
     pub(crate) bf16_matmul_gate_up_swiglu_fused_nr1_aligned: MetalPipelineState,
     pub(crate) bf16_matmul_gate_up_swiglu_fused_nr4: MetalPipelineState,
     pub(crate) bf16_matmul_gate_up_swiglu_fused_nr4_aligned: MetalPipelineState,
-
-    // BF16 K64 Split-K GEMM. Pairs with the existing
-    // reduce_splitk_add_residual (which is quant-agnostic and operates on F32
-    // partials) to deliver a Split-K FFN-down path for BF16. Same dispatch
-    // pattern as the Q8 variant; only the B-tile load differs (u16->bfloat).
-    pub(crate) bf16_matmul_k64_splitk: MetalPipelineState,
-    pub(crate) bf16_matmul_k64_splitk_aligned: MetalPipelineState,
 
     // Batched prefill kernels
     pub(crate) tiled_matmul_f32: MetalPipelineState,
@@ -474,9 +388,6 @@ pub(crate) struct MetalPipelines {
     // Parallel router — per-expert logits + small top-k softmax.
     pub(crate) moe_router_logits_f32: Option<MetalPipelineState>,
     pub(crate) moe_router_topk_softmax: Option<MetalPipelineState>,
-    // Fused single-dispatch router (logits + top-k, grid=experts,
-    // last-TG reduction) — eliminates the 1-TG top-k drain bubble on decode.
-    pub(crate) moe_router_fused_topk: Option<MetalPipelineState>,
     pub(crate) moe_router_softmax_batched: Option<MetalPipelineState>,
     pub(crate) moe_router_softmax_biased: Option<MetalPipelineState>,
     pub(crate) moe_expert_accum: Option<MetalPipelineState>,
@@ -502,13 +413,9 @@ pub(crate) struct MetalPipelines {
     pub(crate) moe_batched_down_accum_q4_0: Option<MetalPipelineState>,
     pub(crate) moe_batched_down_accum_q4_1: Option<MetalPipelineState>,
     pub(crate) moe_batched_down_accum_q8_0: Option<MetalPipelineState>,
-    // One-simdgroup-per-row redesign of routed gate+up+swiglu (q8).
-    pub(crate) moe_batched_gate_up_swiglu_q8_0_v2: Option<MetalPipelineState>,
     // Fused down+accum+shared_expert kernels (eliminates 3 dispatches per MoE layer)
     pub(crate) moe_batched_down_accum_shared_q8_0: Option<MetalPipelineState>,
     pub(crate) moe_batched_down_accum_shared_q8_0_se_q4_0: Option<MetalPipelineState>,
-    // One-simdgroup-per-row redesign of the mixed q8/q4 down kernel.
-    pub(crate) moe_batched_down_accum_shared_q8_0_se_q4_0_v2: Option<MetalPipelineState>,
     pub(crate) moe_batched_down_accum_shared_q4_0: Option<MetalPipelineState>,
     pub(crate) sigmoid_scale_add: Option<MetalPipelineState>,
 
@@ -562,8 +469,6 @@ pub(crate) struct MetalPipelines {
     pub(crate) gdn_state_output_norm_l2: Option<MetalPipelineState>,
     // Simdgroup-parallel state update (4096 TGs of 32 threads, writes raw output)
     pub(crate) gdn_state_output_l2_sg: Option<MetalPipelineState>,
-    // Same as gdn_state_output_l2_sg but read-once/write-once (dead store removed)
-    pub(crate) gdn_state_output_l2_sg_h1: Option<MetalPipelineState>,
     // Diagnostic (timing only): same as gdn_state_output_l2_sg but the per-TG
     // Q/K L2-norm is skipped (output garbage) to isolate its compute cost
     pub(crate) gdn_state_output_l2_sg_normskip: Option<MetalPipelineState>,
@@ -575,20 +480,11 @@ pub(crate) struct MetalPipelines {
     pub(crate) gdn_state_output_l2_sg_bf16: Option<MetalPipelineState>,
     // Same as gdn_state_output_l2_sg but persistent h_state stored in half (half traffic)
     pub(crate) gdn_state_output_l2_sg_f16: Option<MetalPipelineState>,
-    // F16 state recurrence WITHOUT the dead decayed write-back (LUMEN_METAL_GDN_F16_STATE_H1):
-    // union of the f16-state (half R+W) + h1 dead-store-elision (drop the redundant decayed store).
-    pub(crate) gdn_state_output_l2_sg_f16_h1: Option<MetalPipelineState>,
-    // VI-amortized f16+h1 recurrence (LUMEN_METAL_GDN_F16_STATE_H1_V2): each TG handles
-    // 2 adjacent val_dim columns, computing the (vi-invariant) Q/K L2-norm + load ONCE and
-    // reusing across both -> halves the redundant per-vi norm ALU + Q/K device reads on the
-    // recurrence critical path. Byte-identical to gdn_state_output_l2_sg_f16_h1 (same reduction).
-    pub(crate) gdn_state_output_l2_sg_f16_h1_v2: Option<MetalPipelineState>,
-    // 4-way VI-amortized f16+h1 recurrence (LUMEN_METAL_GDN_F16_STATE_H1_V4): each TG handles
-    // 4 adjacent val_dim columns, computing the (vi-invariant) Q/K L2-norm + load ONCE and
-    // reusing across all four -> cuts the redundant per-vi norm ALU + Q/K device reads 4x vs
-    // reference (2x vs v2). Byte-identical to gdn_state_output_l2_sg_f16_h1 (same reduction).
+    // 4-way VI-amortized f16 recurrence (the default GDN decode state kernel): each TG
+    // handles 4 adjacent val_dim columns, computing the (vi-invariant) Q/K L2-norm + load
+    // ONCE and reusing across all four to cut the redundant per-vi norm ALU + Q/K reads.
     pub(crate) gdn_state_output_l2_sg_f16_h1_v4: Option<MetalPipelineState>,
-    // One-time F32->F16 converter for the GDN h_state buffer (LUMEN_METAL_GDN_F16_STATE_DECODE)
+    // One-time F32->F16 converter for the GDN h_state decode mirror
     pub(crate) gdn_state_f32_to_f16: Option<MetalPipelineState>,
     // RMSNorm + scale on raw GDN decode output (pairs with gdn_state_output_l2_sg)
     pub(crate) gdn_decode_norm_scale: Option<MetalPipelineState>,
@@ -608,18 +504,6 @@ pub(crate) struct MetalPipelines {
     pub(crate) gdn_prefill_fused: Option<MetalPipelineState>,
     pub(crate) gdn_prefill_fused_v2: Option<MetalPipelineState>,
     pub(crate) gdn_prefill_fused_v3_chunked: Option<MetalPipelineState>,
-    /// (32, NSG=4, 1) threadgroup geometry for Phase 2a — 1024 TGs
-    /// of 128 threads (4 simdgroups per TG) instead of 4096 TGs of 32
-    /// threads. Algorithmically bit-identical to `gdn_prefill_fused_v3_
-    /// chunked`. Each TG owns 4 consecutive rows of state and the 4
-    /// simdgroups share Q/K HBM fetches via L1. Opt-in via
-    /// `LUMEN_METAL_GDN_PHASE2A_NSG4=1`.
-    pub(crate) gdn_prefill_fused_v3_chunked_nsg4: Option<MetalPipelineState>,
-    /// Chunk-parallel gated-delta-rule Phase 2a. One TG per
-    /// (head, 32-value-tile); builds the per-chunk T/H matrices once and
-    /// forward-solves over C tokens, cutting the O(T)-serial recurrence to
-    /// O(T/C) serial chunks. Opt-in via `LUMEN_METAL_GDN_PREFILL_CHUNKED=1`.
-    pub(crate) gdn_prefill_chunkscan: Option<MetalPipelineState>,
     pub(crate) gdn_prefill_norm_gate: Option<MetalPipelineState>,
     pub(crate) ssm_conv1d_prefill: Option<MetalPipelineState>,
     pub(crate) ssm_conv1d_silu_prefill: Option<MetalPipelineState>,
@@ -629,11 +513,6 @@ pub(crate) struct MetalPipelines {
     pub(crate) ssm_conv1d_state_update: Option<MetalPipelineState>,
     pub(crate) l2_normalize_heads_batched: Option<MetalPipelineState>,
     pub(crate) l2_normalize_qk_strided: Option<MetalPipelineState>,
-    pub(crate) l2_normalize_qk_strided_sg: Option<MetalPipelineState>,
-    /// Fused conv1d+SiLU+L2 for Q/K (collapses the conv->L2 spine).
-    pub(crate) conv1d_silu_l2_qk_fused: Option<MetalPipelineState>,
-    /// Conv1d+SiLU for the V channel sub-range (no L2).
-    pub(crate) conv1d_silu_vrange: Option<MetalPipelineState>,
     pub(crate) gdn_compute_gates_batched: Option<MetalPipelineState>,
     pub(crate) dequant_batched_matvec_q8_0: Option<MetalPipelineState>,
     pub(crate) dequant_batched_matvec_q8_0_dual: Option<MetalPipelineState>,
@@ -800,24 +679,7 @@ pub(crate) struct MetalScratch {
     pub(crate) gate_buf: MetalBuffer,
     pub(crate) up_buf: MetalBuffer,
     pub(crate) down_buf: MetalBuffer,
-    /// SPLIT-K pass-1 partials scratch [hidden_dim * MAX_K_SPLITS(8)] f32, reused
-    /// by the FFN-down two-pass SPLIT-K kernel (env LUMEN_METAL_Q4_QMV_DOWN_SPLITK).
-    pub(crate) splitk_partials_buf: MetalBuffer,
-    /// gate/up SPLIT-K partials scratch: gate [inter*MAX_K_SPLITS(8)] then up
-    /// [inter*8] f32 (one buffer, up offset = inter*8*4 bytes). env
-    /// LUMEN_METAL_Q4_GATEUP_SPLITK. + normed-x scratch [hidden] (the pre-pass RMSNorm output).
-    pub(crate) splitk_gateup_partials_buf: MetalBuffer,
-    pub(crate) splitk_normed_buf: MetalBuffer,
     pub(crate) logits_buf: MetalBuffer,
-    /// Second logits buffer for the deferred-async-commit ("Option B") decode
-    /// prototype (env `LUMEN_METAL_DECODE_ASYNC_COMMIT=1`, default OFF). When the
-    /// async-commit path defers token N's wait+readback to the start of token
-    /// N+1's call, N+1's lm_head must write to a DIFFERENT logits buffer than the
-    /// one still holding N's un-read logits — otherwise N+1 clobbers N before the
-    /// CPU sampler consumes it. The two buffers are ping-ponged by token parity.
-    /// `None` until the async-commit path first allocates it (lazy; the default
-    /// synchronous path never touches it). Lazily sized to `logits_buf`.
-    pub(crate) logits_buf_b: Option<MetalBuffer>,
 
     // GPU-side argmax result: 1 x u32 (4 bytes). Eliminates 128KB logits readback
     // for greedy sampling (temperature <= 0).
@@ -933,13 +795,6 @@ pub(crate) struct MetalScratch {
     /// to ensure previous pass's GPU work completes before CPU writes to buffers.
     pub(crate) last_async_cmd: Option<MetalCommandBuffer>,
 
-    /// Option-B async-commit decode bookkeeping. `async_inflight_logits_b` is
-    /// true when the in-flight (not-yet-waited) decode CB wrote its logits to
-    /// `logits_buf_b` (false => `logits_buf`); the next call reads from that
-    /// buffer after waiting `last_async_cmd`, then writes THIS token's logits to
-    /// the OTHER buffer. Default sync path never reads these.
-    pub(crate) async_inflight_logits_b: bool,
-
     /// Cached per-layer zero-copy Metal buffers (avoid re-creating on every call).
     /// Indexed by layer_idx. Populated lazily on first access per layer.
     pub(crate) layer_buf_cache: Vec<Option<(usize, MetalBuffer)>>, // (ptr, buffer)
@@ -1036,10 +891,6 @@ pub(crate) struct MetalScratch {
     // Decode scratch buffers (single token)
     /// Router logits: [num_experts] f32 -- output of router matmul
     pub(crate) moe_router_logits: Option<MetalBuffer>,
-    /// Grid-wide finish counter (atomic_uint, 1 elem) for the
-    /// fused single-dispatch router's last-threadgroup reduction. Zeroed each
-    /// layer before the dispatch.
-    pub(crate) moe_router_counter: Option<MetalBuffer>,
     /// Selected expert IDs after top-K: [top_k] u32
     pub(crate) moe_expert_ids: Option<MetalBuffer>,
     /// Routing weights for selected experts: [top_k] f32
@@ -1136,7 +987,7 @@ pub(crate) struct MetalScratch {
     /// These MUST persist across tokens and be reset between sequences.
     pub(crate) gdn_h_states: Vec<MetalBuffer>,
     /// Lazily-allocated half-size F16 mirror of each `gdn_h_states` entry, used
-    /// ONLY when `LUMEN_METAL_GDN_F16_STATE_DECODE=1`. `None` until the first
+    /// by the default F16 decode recurrence. `None` until the first
     /// decode touch of that GDN layer converts its prefill F32 state into F16
     /// (via `gdn_state_f32_to_f16`); thereafter the F16 decode recurrence
     /// reads/writes this buffer and the F32 `gdn_h_states` entry is dormant.
@@ -1209,72 +1060,48 @@ pub(crate) struct MetalScratch {
     /// Set when `LUMEN_METAL_Q8_REPACKED_GATE_UP=1`.
     pub(crate) repacked_ffn_gate_up: Vec<Option<MetalBuffer>>,
 
-    // Q4_0 port of — runtime hot-weight repack for FFN tensors.
-    // Identical semantics to `repacked_ffn_down` / `repacked_ffn_gate_up` above,
-    // but for Q4_0 quant. The Q4 stripe layout uses 18-byte source blocks (vs
-    // Q8's 34 bytes), so the packed stride differs (576 vs 1088 bytes per
-    // single-tensor (row_group, k_block); 1152 vs 2176 for pair-packed).
-    //
-    // Allocated when `LUMEN_METAL_Q4_REPACKED=1` is set at load time.
-    /// Per-layer FFN-down (`w_down`) repacked Q4_0 buffer.
-    /// Set when `LUMEN_METAL_Q4_REPACKED_FFN_DOWN=1`.
-    pub(crate) repacked_ffn_down_q4: Vec<Option<MetalBuffer>>,
-    /// Per-layer FFN gate+up pair-packed Q4_0 buffer.
-    /// Set when `LUMEN_METAL_Q4_REPACKED_GATE_UP=1`.
-    pub(crate) repacked_ffn_gate_up_q4: Vec<Option<MetalBuffer>>,
     /// Per-layer FFN-down MLX-style decode-qmv buffers (sequential-nibble qweights
-    /// + f32 scales). Set when `LUMEN_METAL_Q4_QMV_DOWN=1`. Consumed by the
+    /// + f32 scales). Populated by default. Consumed by the
     /// `qmv_q4_0_residual` kernel. Empty => fall back to the NR2 decode kernel.
     pub(crate) qmv_down_qw: Vec<Option<MetalBuffer>>,
     pub(crate) qmv_down_scales: Vec<Option<MetalBuffer>>,
     /// Per-GDN-layer MLX-style decode-qmv buffers for the GDN qkv projection
     /// (sequential-nibble qweights + f32 scales). Indexed by `gdn_idx` (sequential
-    /// GDN layer counter, matching `gdn_h_states`). Set when `LUMEN_METAL_Q4_QMV_PROJ=1`.
+    /// GDN layer counter, matching `gdn_h_states`). Populated by default.
     /// Consumed by the `qmv_q4_0_rmsnorm` kernel. Empty / None => NR2 fused fallback.
     pub(crate) qmv_gdn_qkv_qw: Vec<Option<MetalBuffer>>,
     pub(crate) qmv_gdn_qkv_scales: Vec<Option<MetalBuffer>>,
     /// Per-GDN-layer MLX-style decode-qmv buffers for the GDN attn_gate projection
     /// (`st.attn_gate`, [q_dim, hidden_dim]). Indexed by `gdn_idx` (same convention as
-    /// `qmv_gdn_qkv_*`). Set when `LUMEN_METAL_Q4_QMV_PROJ=1`. Consumed by the
+    /// `qmv_gdn_qkv_*`). Populated by default. Consumed by the
     /// `qmv_q4_0_rmsnorm` kernel (RMSNorm with attn_norm). Empty / None => NR2 fallback.
     pub(crate) qmv_gdn_attn_gate_qw: Vec<Option<MetalBuffer>>,
     pub(crate) qmv_gdn_attn_gate_scales: Vec<Option<MetalBuffer>>,
     /// Per-layer MLX-style decode-qmv buffers for the FULL-ATTENTION Q+gate projection
     /// (`st.wq`, [qgate_dim, hidden_dim], qgate_dim = 2*q_dim under Q+gate fusion).
     /// Indexed by `layer_idx` (0..num_layers; None for GDN layers, same convention as
-    /// `qmv_down_*`). Set when `LUMEN_METAL_Q4_QMV_PROJ=1`. Consumed by the
+    /// `qmv_down_*`). Populated by default. Consumed by the
     /// `qmv_q4_0_rmsnorm` kernel (RMSNorm with attn_norm). Empty / None => NR2 fallback.
     pub(crate) qmv_attn_wq_qw: Vec<Option<MetalBuffer>>,
     pub(crate) qmv_attn_wq_scales: Vec<Option<MetalBuffer>>,
     /// Per-layer MLX-style decode-qmv buffers for the FULL-ATTENTION output projection
     /// (`st.wo`, [hidden_dim, q_dim]). Indexed by `layer_idx` (0..num_layers; None for
-    /// GDN layers). Set when `LUMEN_METAL_Q4_QMV_PROJ=1`. Consumed by the
+    /// GDN layers). Populated by default. Consumed by the
     /// `qmv_q4_0_residual` kernel (matvec + residual). Empty / None => NR2 fallback.
     pub(crate) qmv_attn_wo_qw: Vec<Option<MetalBuffer>>,
     pub(crate) qmv_attn_wo_scales: Vec<Option<MetalBuffer>>,
     /// Per-layer MLX-style decode-qmv buffers for the FULL-ATTENTION K and V
     /// projections (`st.wk` / `st.wv`, each [kv_dim, hidden_dim]; in_dim = hidden,
     /// out = kv_dim). Indexed by `layer_idx` (0..num_layers; None for GDN layers).
-    /// Set when `LUMEN_METAL_Q4_QMV_KV=1`. Both read the SAME pre-norm hidden as
+    /// Populated by default. Both read the SAME pre-norm hidden as
     /// Q (rmsnorm-fused) -> consumed by the `qmv_q4_0_rmsnorm` kernel writing
-    /// `k_buf` / `v_buf` at offset 0, exactly as the NR2 path does. Independent of
-    /// `LUMEN_METAL_Q4_QMV_PROJ` (Q+gate/Wo) so it can be A/B'd in isolation.
+    /// `k_buf` / `v_buf` at offset 0, exactly as the NR2 path does.
     /// Empty / None => the existing NR2 (`rmsnorm_dequant_matmul_q4_0_deferred_nr2`)
     /// fused-norm fallback.
     pub(crate) qmv_attn_wk_qw: Vec<Option<MetalBuffer>>,
     pub(crate) qmv_attn_wk_scales: Vec<Option<MetalBuffer>>,
     pub(crate) qmv_attn_wv_qw: Vec<Option<MetalBuffer>>,
     pub(crate) qmv_attn_wv_scales: Vec<Option<MetalBuffer>>,
-    /// Per-GDN-layer MLX-style decode-qmv buffers for the GDN ssm_out / output
-    /// projection (`st.ssm_out`, [hidden_dim, q_dim]; in_dim = q_dim(value_dim),
-    /// out = hidden_dim). Indexed by `gdn_idx` (same convention as `qmv_gdn_qkv_*`).
-    /// Set when `LUMEN_METAL_Q4_QMV_SSMOUT=1`. The SiLU gate is applied to the
-    /// matvec input by a tiny predecessor `silu_elementwise_mul` dispatch, then
-    /// `qmv_q4_0_residual` runs the matvec (with the zero-residual buffer so the
-    /// downstream `residual_add_copy` keeps the existing accum+copy semantics).
-    /// Empty / None => the existing fused silu+matvec+residual+copy NR2 path.
-    pub(crate) qmv_gdn_ssm_out_qw: Vec<Option<MetalBuffer>>,
-    pub(crate) qmv_gdn_ssm_out_scales: Vec<Option<MetalBuffer>>,
     /// Per-GDN-layer standalone Q4_0 (native GGUF block layout) weight buffer for
     /// the GDN ssm_out projection, RE-QUANTIZED from the Q8_0 ssm_out at load when
     /// `LUMEN_METAL_Q4_SSMOUT_NR2=1`. Indexed by `gdn_idx` (same convention as
@@ -1288,7 +1115,7 @@ pub(crate) struct MetalScratch {
     /// Per-layer MLX-style decode-qmv buffers for the DENSE FFN gate/up pair
     /// (`st.w_gate` and `st.w_up`, each [inter_dim, hidden_dim]; in_dim = hidden,
     /// out = inter_dim). Indexed by `layer_idx` (0..num_layers; every dense-FFN
-    /// layer participates). Set when `LUMEN_METAL_Q4_QMV_GATEUP=1`. Both matrices
+    /// layer participates). Populated by default. Both matrices
     /// repacked into SEPARATE decode-qmv buffers; consumed together by the
     /// `qmv_q4_0_gate_up_swiglu` dual-matrix kernel (fused RMSNorm + SwiGLU).
     /// Any None => the existing `rmsnorm_ffn_fused_gate_up_swiglu_q4_0_8row` path.
@@ -1296,13 +1123,6 @@ pub(crate) struct MetalScratch {
     pub(crate) qmv_ffn_gate_scales: Vec<Option<MetalBuffer>>,
     pub(crate) qmv_ffn_up_qw: Vec<Option<MetalBuffer>>,
     pub(crate) qmv_ffn_up_scales: Vec<Option<MetalBuffer>>,
-    /// INTERLEAVED gate+up decode-qmv buffers (env LUMEN_METAL_Q4_GATEUP_IL): per
-    /// layer, ONE co-resident packed nibble buffer + ONE packed f16-scale buffer
-    /// consumed by `qmv_q4_0_gate_up_swiglu_il`. Built only when the flag is on +
-    /// the IL pipeline compiled; any None => fall back to the f16sc/8row/default
-    /// path for that layer. Byte-identical to the separated f16sc kernel.
-    pub(crate) qmv_ffn_gate_up_il_qw: Vec<Option<MetalBuffer>>,
-    pub(crate) qmv_ffn_gate_up_il_scales: Vec<Option<MetalBuffer>>,
     /// LM-head-structure (LS) gate+up decode-qmv buffers: per layer, ONE
     /// ROW-INTERLEAVED packed nibble buffer + ONE row-interleaved packed f16-scale
     /// buffer (physical row 2d = whole gate row d, 2d+1 = whole up row d) consumed by
@@ -1319,7 +1139,7 @@ pub(crate) struct MetalScratch {
     pub(crate) qmv_zero_residual_buf: Option<MetalBuffer>,
     /// GLOBAL (single, non-per-layer) MLX-style decode-qmv buffers for the lm_head /
     /// output projection, built by RE-QUANTIZING the Q8_0 output_proj weights to Q4_0
-    /// at load time (`LUMEN_METAL_Q4_QMV_LMHEAD=1`, default OFF). `qmv_lmhead_qw`
+    /// at load time (by default, for a non-tied Q8_0 output_proj). `qmv_lmhead_qw`
     /// holds sequential-nibble Q4_0 qweights [vocab, hidden/2]; `qmv_lmhead_scales`
     /// holds the per-block f32 scales [vocab, hidden/32]. Both Some => the final
     /// RMSNorm+logits dispatch uses `qmv_q4_0_rmsnorm` (in_dim=hidden, out=vocab,

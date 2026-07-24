@@ -6,9 +6,7 @@
 use super::graph_reorder::{
     self, gdn_concurrent_encoder_enabled, Access, AccessList, BufferId, LayerOp, OrderClass,
 };
-use super::{
-    use_ggml_ported_q8_0_gemm, CachedLayerMeta, MetalF32Backend, MetalPipelines, MetalScratch,
-};
+use super::{CachedLayerMeta, MetalF32Backend, MetalPipelines, MetalScratch};
 use crate::error::RuntimeError;
 use crate::kv::KvCacheView;
 use crate::metal::ffi::{MTLSize, MetalBuffer, MetalCommandBuffer, MetalComputeEncoder};
@@ -41,71 +39,17 @@ fn metal_attn_precise_pvf32() -> bool {
     })
 }
 
-/// Diagnostic-only engagement counter (no-op unless `LUMEN_METAL_ATTN_PRECISE_DBG=1`).
-/// Proves at runtime that the exact-F32 P@V kernel actually dispatches on the
-/// full-attention prefill layers of the loaded model (and how many times), as
-/// opposed to the env-read print which only confirms the lever was enabled.
-/// Emits a `[ATTN_PRECISE_DBG]` line on each engagement with the running count.
-/// PRODUCES evidence only; changes no computation.
-fn metal_attn_precise_dbg() -> bool {
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::var("LUMEN_METAL_ATTN_PRECISE_DBG")
-            .ok()
-            .as_deref()
-            == Some("1")
-    })
-}
-
-fn metal_attn_precise_engage(
-    path: &str,
-    layer_idx: usize,
-    batch_size: usize,
-    num_heads: usize,
-    head_dim: usize,
-) {
-    if !metal_attn_precise_dbg() {
-        return;
-    }
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    eprintln!(
-        "[ATTN_PRECISE_DBG] F32 P@V engaged #{n} path={path} layer={layer_idx} batch={batch_size} num_heads={num_heads} head_dim={head_dim}"
-    );
-}
-
-/// Dispatch a Q8_0 × F32 → F32 batched-prefill GEMM.
-///
-/// When `LUMEN_METAL_GEMM_GGML_PORT=1` AND the underlying weight is Q8_0,
-/// reroutes the dispatch through the ggml-ported `kernel_mul_mm_q8_0_f32_ported`
-/// kernel (tile NR0=64 × NR1=32, threadgroup memory 8192 B). Otherwise
-/// performs the original dispatch with the supplied grid.
-///
-/// `m` is the batch size, `n` is the output dim. Both are needed because the
-/// ported kernel uses a different tile shape than the in-tree tiled GEMM.
+/// Dispatch a Q8_0 × F32 → F32 batched-prefill GEMM with the supplied grid.
 #[inline]
 fn dispatch_q8_0_or_orig(
     enc: &MetalComputeEncoder,
-    pipelines: &MetalPipelines,
-    is_q8_0: bool,
-    m: u32,
-    n: u32,
+    _pipelines: &MetalPipelines,
+    _is_q8_0: bool,
+    _m: u32,
+    _n: u32,
     orig_grid: MTLSize,
 ) {
-    if is_q8_0 && use_ggml_ported_q8_0_gemm() {
-        enc.set_pipeline_state(&pipelines.kernel_mul_mm_q8_0_f32_ported);
-        enc.set_threadgroup_memory_length(8192, 0);
-        // Ported kernel tile = NR0=64 (N_out) × NR1=32 (M_batch)
-        // tg_pos.y indexes ceil(N/64); tg_pos.x indexes ceil(M/32)
-        enc.dispatch_threadgroups(
-            MTLSize::new((m as u64).div_ceil(32), (n as u64).div_ceil(64), 1),
-            MTLSize::new(128, 1, 1),
-        );
-    } else {
-        enc.dispatch_threadgroups(orig_grid, MTLSize::new(128, 1, 1));
-    }
+    enc.dispatch_threadgroups(orig_grid, MTLSize::new(128, 1, 1));
 }
 
 impl MetalF32Backend {
@@ -309,16 +253,6 @@ impl MetalF32Backend {
             }
         }
 
-        // BF16 FFN-down Split-K path. Same sizing as Q8 (the partial
-        // buffer holds F32 partials regardless of weight quantisation).
-        let ffn_splitk_k_bf16 = super::graph_reorder::ffn_down_splitk_bf16_value() as usize;
-        if ffn_splitk_k_bf16 > 0 {
-            let want = 8usize * batch_size * hidden_dim;
-            if want > required_splitk_size {
-                required_splitk_size = want;
-            }
-        }
-
         if required_splitk_size > scratch.splitk_alloc_elems {
             let len = required_splitk_size.max(1) * 4;
             scratch.splitk_partial_buf = Some(self.device.new_buffer(len).ok_or_else(|| {
@@ -489,71 +423,6 @@ impl MetalF32Backend {
         enc.memory_barrier_with_scope(1);
 
         // Phase 2: Reduce partials + residual into final output in a single pass.
-        enc.set_pipeline_state(&pipelines.reduce_splitk_add_residual);
-        enc.set_buffer(partial_buf, 0, 0);
-        enc.set_buffer(r_buf, 0, 1);
-        enc.set_buffer(y_buf, 0, 2);
-        enc.set_bytes(&m.to_le_bytes(), 3);
-        enc.set_bytes(&n.to_le_bytes(), 4);
-        enc.set_bytes(&k_splits.to_le_bytes(), 5);
-        let total = (m as u64) * (n as u64);
-        enc.dispatch_threadgroups(
-            MTLSize::new(total.div_ceil(256), 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
-    }
-
-    /// Dispatch a Split-K K64 BF16 GEMM with fused residual writeback.
-    ///
-    /// BF16 analogue of `encode_splitk_q8_gemm_k64_residual`. The Phase 2
-    /// reduce kernel (`reduce_splitk_add_residual`) is identical between
-    /// quantisations because it operates on F32 partials; only Phase 1 differs.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn encode_splitk_bf16_gemm_k64_residual(
-        enc: &super::ffi::MetalComputeEncoder,
-        pipelines: &MetalPipelines,
-        w_buf: &MetalBuffer,
-        w_off: u64,
-        x_buf: &MetalBuffer,
-        r_buf: &MetalBuffer,
-        y_buf: &MetalBuffer,
-        partial_buf: &MetalBuffer,
-        m: u32,
-        n: u32,
-        k: u32,
-        k_splits: u32,
-    ) {
-        const TILE_M: u64 = 32;
-        const TILE_N: u64 = 32;
-
-        // Phase 1: Split-K K64 BF16 GEMM into partial buffer.
-        let aligned = m % 32 == 0 && n % 32 == 0 && k % 64 == 0;
-        if aligned {
-            enc.set_pipeline_state(&pipelines.bf16_matmul_k64_splitk_aligned);
-        } else {
-            enc.set_pipeline_state(&pipelines.bf16_matmul_k64_splitk);
-        }
-        enc.set_threadgroup_memory_length(8192, 0);
-        enc.set_buffer(w_buf, w_off, 0);
-        enc.set_buffer(x_buf, 0, 1);
-        enc.set_buffer(partial_buf, 0, 2);
-        enc.set_bytes(&m.to_le_bytes(), 3);
-        enc.set_bytes(&n.to_le_bytes(), 4);
-        enc.set_bytes(&k.to_le_bytes(), 5);
-        enc.set_bytes(&k_splits.to_le_bytes(), 6);
-        enc.dispatch_threadgroups(
-            MTLSize::new(
-                (n as u64).div_ceil(TILE_N),
-                (m as u64).div_ceil(TILE_M),
-                k_splits as u64,
-            ),
-            MTLSize::new(128, 1, 1),
-        );
-
-        // Memory barrier: ensure all Split-K writes complete before reduce reads.
-        enc.memory_barrier_with_scope(1);
-
-        // Phase 2: Reduce partials + residual (shared with Q8 path).
         enc.set_pipeline_state(&pipelines.reduce_splitk_add_residual);
         enc.set_buffer(partial_buf, 0, 0);
         enc.set_buffer(r_buf, 0, 1);
@@ -1602,13 +1471,6 @@ impl MetalF32Backend {
                     if metal_attn_precise_pvf32() {
                         // attention_output_batched: one thread per output element,
                         // accumulates (float)P * (float)V in F32. Same 11 buffers.
-                        metal_attn_precise_engage(
-                            "legacy",
-                            layer_idx,
-                            batch_size,
-                            num_heads as usize,
-                            head_dim,
-                        );
                         let total_elems = (batch_size * num_heads as usize * head_dim) as u64;
                         let pv_tg = 256u64.min(total_elems).max(1);
                         enc.set_pipeline_state(&pipelines.attention_output_batched);
@@ -1958,77 +1820,24 @@ impl MetalF32Backend {
                     // instead of 128*(15+2) per-token dispatches.
                     // FFN RMSNorm is fused into the same encoder (saves 1 encoder boundary).
                     super::profile::set_section("gdn/batched_prefill");
-                    // DIAG wholeattn (no-op unless LUMEN_METAL_GDN_DIAG_SKIP=wholeattn):
-                    // skip the entire GDN attention megakernel to attribute its
-                    // total GPU share (garbage output; profiling only).
-                    if super::graph_reorder::gdn_diag_skip() == 4 {
-                        // diag wholeattn: intentionally skip the GDN attention
-                        // megakernel (no-op; garbage output, profiling only).
-                    } else {
-                        // Dual-queue GDN branch-overlap path
-                        // (`LUMEN_METAL_GDN_DUAL_QUEUE=1`): route to the dual-queue
-                        // variant ONLY when a per-prefill dual-queue context is
-                        // installed AND this layer's wq/attn_gate/ssm_out are all Q8
-                        // AND the de-aliased role buffers + parallel conv1d exist.
-                        // Otherwise fall through to the bit-exact production path.
-                        let dq_eligible = super::gdn::dual_queue_ctx_active()
-                            && matches!(gdn_meta.wq_quant, QuantScheme::Q8_0)
-                            && matches!(gdn_meta.attn_gate_quant, Some(QuantScheme::Q8_0))
-                            && matches!(gdn_meta.ssm_out_quant, Some(QuantScheme::Q8_0))
-                            && scratch.batch_gdn_alpha_buf.is_some()
-                            && scratch.batch_gdn_beta_buf.is_some()
-                            && scratch.batch_gdn_conv_out_buf.is_some()
-                            && scratch.batch_gdn_raw_out_buf.is_some()
-                            && scratch.batch_gdn_ssm_in_buf.is_some()
-                            && pipelines.ssm_conv1d_silu_prefill_parallel.is_some()
-                            && pipelines.ssm_conv1d_state_update.is_some();
-                        if dq_eligible {
-                            // Take the ctx out of the thread-local for the duration
-                            // of the call (so we can borrow its fields immutably
-                            // alongside `scratch`), bump ord, then re-install it.
-                            let mut ctx = super::gdn::dual_queue_ctx_take().unwrap();
-                            ctx.ord += 1;
-                            let ord = ctx.ord;
-                            let new_conv_pos = Self::encode_batched_gdn_prefill_dual_queue(
-                                cmd,
-                                &ctx.aux_cmd,
-                                &ctx.ev_norm_ready,
-                                &ctx.ev_ab_ready,
-                                &ctx.ev_gate_ready,
-                                ord,
-                                pipelines,
-                                scratch,
-                                layer_buf,
-                                &gdn_meta,
-                                gdn_idx,
-                                x_buf,
-                                normed_buf,
-                                qkv_buf,
-                                attn_out_buf,
-                                attn_proj_buf,
-                                batch_size,
-                            )?;
-                            scratch.gdn_conv_positions[gdn_idx] = new_conv_pos;
-                            super::gdn::dual_queue_ctx_set(ctx);
-                        } else {
-                            let new_conv_pos = Self::encode_batched_gdn_prefill(
-                                cmd,
-                                None,
-                                pipelines,
-                                scratch,
-                                layer_buf,
-                                &gdn_meta,
-                                gdn_idx,
-                                x_buf,
-                                normed_buf,
-                                qkv_buf,
-                                attn_out_buf,
-                                gate_buf,
-                                attn_proj_buf,
-                                batch_size,
-                            )?;
-                            scratch.gdn_conv_positions[gdn_idx] = new_conv_pos;
-                        }
+                    {
+                        let new_conv_pos = Self::encode_batched_gdn_prefill(
+                            cmd,
+                            None,
+                            pipelines,
+                            scratch,
+                            layer_buf,
+                            &gdn_meta,
+                            gdn_idx,
+                            x_buf,
+                            normed_buf,
+                            qkv_buf,
+                            attn_out_buf,
+                            gate_buf,
+                            attn_proj_buf,
+                            batch_size,
+                        )?;
+                        scratch.gdn_conv_positions[gdn_idx] = new_conv_pos;
                     }
                 } else {
                     // Fallback: token-by-token processing using single-token decode path.
@@ -2105,13 +1914,6 @@ impl MetalF32Backend {
                 let down_offs: Vec<u64> =
                     experts.iter().map(|e| base_off + e.down.offset).collect();
                 let first = &experts[0];
-                // GPU-time census (no-op unless LUMEN_METAL_PROFILE_GDN=1): label the
-                // MoE grouped-expert FFN so its GPU wall is split out of the
-                // preceding GDN Phase-3 CB. The first new_compute_encoder inside
-                // encode_moe_ffn_batched triggers the split.
-                if super::profile::is_gdn_deep_enabled() {
-                    super::profile::set_section("moe/ffn_grouped_experts");
-                }
                 Self::encode_moe_ffn_batched(
                     &cmd,
                     pipelines,
@@ -2146,12 +1948,6 @@ impl MetalF32Backend {
 
                     const TILE_M_SE: u64 = 32;
                     const TILE_N_SE: u64 = 32;
-
-                    // GPU-time census: label the shared-expert FFN so its GPU wall is
-                    // split out of the grouped-expert CB. No-op when off.
-                    if super::profile::is_gdn_deep_enabled() {
-                        super::profile::set_section("moe/shared_expert");
-                    }
 
                     // Step SE-1: Gate+Up+SwiGLU (batched tiled GEMM)
                     // gate_buf = gate_shexp @ normed_buf  [batch, se_inter]
@@ -2798,40 +2594,7 @@ impl MetalF32Backend {
                     let ffn_aligned =
                         batch_size % 32 == 0 && inter_dim % 32 == 0 && hidden_dim % 32 == 0;
 
-                    // prefer the packed-layout Q4 kernel when a repacked buffer
-                    // is available for this layer. The packed kernel consumes a single
-                    // paired gate+up buffer instead of two separate weight regions.
-                    let packed_buf_q4: Option<&MetalBuffer> = scratch
-                        .repacked_ffn_gate_up_q4
-                        .get(layer_idx)
-                        .and_then(|opt| opt.as_ref());
-                    if let Some(buf_gu) = packed_buf_q4 {
-                        if ffn_aligned && hidden_dim % 64 == 0 {
-                            enc.set_pipeline_state(
-                                &pipelines
-                                    .dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed_aligned,
-                            );
-                        } else {
-                            enc.set_pipeline_state(
-                                &pipelines.dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed,
-                            );
-                        }
-                        enc.set_threadgroup_memory_length(12288, 0);
-                        enc.set_buffer(buf_gu, 0, 0); // paired packed buffer
-                        enc.set_buffer(normed_buf, 0, 1);
-                        enc.set_buffer(gate_buf, 0, 2);
-                        enc.set_bytes(&m_u32.to_le_bytes(), 3);
-                        enc.set_bytes(&n_u32.to_le_bytes(), 4);
-                        enc.set_bytes(&k_u32.to_le_bytes(), 5);
-                        enc.dispatch_threadgroups(
-                            MTLSize::new(
-                                (inter_dim as u64).div_ceil(TILE_N),
-                                (batch_size as u64).div_ceil(TILE_M),
-                                1,
-                            ),
-                            MTLSize::new(128, 1, 1),
-                        );
-                    } else {
+                    {
                         if ffn_aligned && hidden_dim % 64 == 0 {
                             enc.set_pipeline_state(
                                 &pipelines.dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_aligned,
@@ -2921,28 +2684,10 @@ impl MetalF32Backend {
                     // output buffers (gate_buf, up_buf). They can run concurrently.
                     // SwiGLU reads both gate_buf and up_buf, so it must wait for both via barrier.
                     //
-                    // DEEP-PROFILE override: when `LUMEN_METAL_PROFILE_DEEP=1` we split
-                    // the concurrent encoder into THREE separate compute encoders so
-                    // the per-section profiler can attribute time to gate / up / swiglu
-                    // individually. Adds barrier-style serialisation (no longer truly
-                    // concurrent) so absolute prefill is slower under deep mode, but
-                    // the relative ms/section is now observable.
-                    let deep_profile = super::profile::is_enabled()
-                        && std::env::var("LUMEN_METAL_PROFILE_DEEP").ok().as_deref() == Some("1");
-                    if deep_profile {
-                        super::profile::set_section("ffn/gate_gemm");
-                    } else {
-                        super::profile::set_section("ffn/gate+up+swiglu_concurrent");
-                    }
-                    let enc = if deep_profile {
-                        cmd.new_compute_encoder().ok_or_else(|| {
-                            RuntimeError::Compute("Failed to create encoder (deep-profile)".into())
-                        })?
-                    } else {
-                        cmd.new_concurrent_compute_encoder().ok_or_else(|| {
-                            RuntimeError::Compute("Failed to create concurrent encoder".into())
-                        })?
-                    };
+                    super::profile::set_section("ffn/gate+up+swiglu_concurrent");
+                    let enc = cmd.new_concurrent_compute_encoder().ok_or_else(|| {
+                        RuntimeError::Compute("Failed to create concurrent encoder".into())
+                    })?;
 
                     // Gate dispatch
                     let ffn_aligned =
@@ -3034,22 +2779,6 @@ impl MetalF32Backend {
                         ),
                     );
 
-                    // Deep-profile: split gate from up so each is its own profiler
-                    // section. Concurrent encoder semantics are lost (serialised),
-                    // making absolute timing slower but per-kernel observability
-                    // possible. Production path is unchanged when deep_profile=false.
-                    let enc = if deep_profile {
-                        enc.end_encoding();
-                        super::profile::set_section("ffn/up_gemm");
-                        cmd.new_compute_encoder().ok_or_else(|| {
-                            RuntimeError::Compute(
-                                "Failed to create encoder (deep-profile up)".into(),
-                            )
-                        })?
-                    } else {
-                        enc
-                    };
-
                     // Up dispatch (concurrent with Gate -- different output buffers)
                     match st.w_up.quant {
                         QuantScheme::Q8_0 if hidden_dim % 64 == 0 && batch_size <= 4096 => {
@@ -3120,15 +2849,7 @@ impl MetalF32Backend {
                         }
                     }
                     enc.set_buffer(layer_buf, w_up_off, 0);
-                    // Deep-profile: when split, we must re-bind buffer args at idx 1
-                    // because each fresh encoder loses its arg table.
-                    if deep_profile {
-                        enc.set_buffer(normed_buf, 0, 1);
-                        enc.set_bytes(&m_u32.to_le_bytes(), 3);
-                        enc.set_bytes(&n_u32.to_le_bytes(), 4);
-                        enc.set_bytes(&k_u32.to_le_bytes(), 5);
-                    }
-                    // normed_buf already set at index 1 (when not deep_profile)
+                    // normed_buf already set at index 1
                     enc.set_buffer(up_buf, 0, 2);
                     // M, N, K already set at indices 3, 4, 5
                     dispatch_q8_0_or_orig(
@@ -3144,20 +2865,8 @@ impl MetalF32Backend {
                         ),
                     );
 
-                    // Deep-profile: split up from swiglu.
-                    let enc = if deep_profile {
-                        enc.end_encoding();
-                        super::profile::set_section("ffn/swiglu_concurrent");
-                        cmd.new_compute_encoder().ok_or_else(|| {
-                            RuntimeError::Compute(
-                                "Failed to create encoder (deep-profile swiglu)".into(),
-                            )
-                        })?
-                    } else {
-                        // Barrier: Gate and Up must complete before SwiGLU reads gate_buf + up_buf
-                        enc.memory_barrier_with_scope(1); // MTLBarrierScope.buffers
-                        enc
-                    };
+                    // Barrier: Gate and Up must complete before SwiGLU reads gate_buf + up_buf
+                    enc.memory_barrier_with_scope(1); // MTLBarrierScope.buffers
 
                     // SwiGLU dispatch: gate = silu(gate) * up
                     let total_elems = (batch_size * inter_dim) as u32;
@@ -3232,15 +2941,6 @@ impl MetalF32Backend {
                     && inter_dim >= 8192
                     && inter_dim % 64 == 0;
 
-                // opt-in Split-K K64 path for FFN-down on BF16 weights.
-                // Same eligibility shape as the Q8 path. Default OFF.
-                let ffn_splitk_bf16_env = super::graph_reorder::ffn_down_splitk_bf16_value();
-                let use_ffn_down_splitk_bf16 = ffn_splitk_bf16_env > 0
-                    && matches!(st.w_down.quant, QuantScheme::Bf16)
-                    && batch_size <= 192
-                    && inter_dim >= 8192
-                    && inter_dim % 64 == 0;
-
                 let splitk = match st.w_down.quant {
                     QuantScheme::Q8_0 => {
                         Self::splitk_splits(batch_size, hidden_dim, inter_dim, batch_size)
@@ -3269,23 +2969,6 @@ impl MetalF32Backend {
                         n_u32,
                         k_u32,
                         ffn_splitk_k_env,
-                    );
-                    enc.end_encoding();
-                } else if use_ffn_down_splitk_bf16 {
-                    // path: BF16 K64-Split-K with shared reduce kernel.
-                    Self::encode_splitk_bf16_gemm_k64_residual(
-                        &enc,
-                        pipelines,
-                        layer_buf,
-                        w_down_off,
-                        gate_buf,
-                        attn_proj_buf,
-                        x_buf,
-                        splitk_partial_buf,
-                        m_u32,
-                        n_u32,
-                        k_u32,
-                        ffn_splitk_bf16_env,
                     );
                     enc.end_encoding();
                 } else if splitk > 0 {
@@ -3339,20 +3022,6 @@ impl MetalF32Backend {
                             None
                         };
 
-                    // prefer packed-layout Q4_0 FFN-down kernel when available.
-                    let packed_down_buf_q4: Option<&MetalBuffer> = if packed_down_buf.is_none()
-                        && matches!(st.w_down.quant, QuantScheme::Q4_0)
-                        && inter_dim % 64 == 0
-                        && batch_size <= 4096
-                    {
-                        scratch
-                            .repacked_ffn_down_q4
-                            .get(layer_idx)
-                            .and_then(|opt| opt.as_ref())
-                    } else {
-                        None
-                    };
-
                     if let Some(buf_d) = packed_down_buf {
                         if down_aligned && inter_dim % 64 == 0 {
                             enc.set_pipeline_state(
@@ -3362,33 +3031,6 @@ impl MetalF32Backend {
                         } else {
                             enc.set_pipeline_state(
                                 &pipelines.dequant_tiled_matmul_q8_0_k64_residual_batched_packed,
-                            );
-                        }
-                        enc.set_threadgroup_memory_length(8192, 0);
-                        enc.set_buffer(buf_d, 0, 0);
-                        enc.set_buffer(gate_buf, 0, 1);
-                        enc.set_buffer(x_buf, 0, 2);
-                        enc.set_bytes(&m_u32.to_le_bytes(), 3);
-                        enc.set_bytes(&n_u32.to_le_bytes(), 4);
-                        enc.set_bytes(&k_u32.to_le_bytes(), 5);
-                        enc.set_buffer(attn_proj_buf, 0, 6);
-                        enc.dispatch_threadgroups(
-                            MTLSize::new(
-                                (hidden_dim as u64).div_ceil(TILE_N),
-                                (batch_size as u64).div_ceil(TILE_M),
-                                1,
-                            ),
-                            MTLSize::new(128, 1, 1),
-                        );
-                    } else if let Some(buf_d) = packed_down_buf_q4 {
-                        if down_aligned && inter_dim % 64 == 0 {
-                            enc.set_pipeline_state(
-                                &pipelines
-                                    .dequant_tiled_matmul_q4_0_k64_residual_batched_packed_aligned,
-                            );
-                        } else {
-                            enc.set_pipeline_state(
-                                &pipelines.dequant_tiled_matmul_q4_0_k64_residual_batched_packed,
                             );
                         }
                         enc.set_threadgroup_memory_length(8192, 0);
@@ -3539,7 +3181,6 @@ impl MetalF32Backend {
     /// - MoE layers (`moe_num_experts > 0`).
     /// - Non-Qwen3.5 layers (no Q+gate fusion).
     /// - Any layer where Split-K would fire (none today; future-proof).
-    /// - `LUMEN_METAL_PROFILE_DEEP=1` (intentional encoder splitting).
     fn concurrent_encoder_layer_eligible(
         &self,
         scratch: &MetalScratch,
@@ -3580,63 +3221,7 @@ impl MetalF32Backend {
         if Self::splitk_splits(batch_size, hidden_dim, inter_dim, batch_size) > 0 {
             return false;
         }
-        // Deep-profile splits encoders intentionally; preserve that.
-        if super::profile::is_enabled()
-            && std::env::var("LUMEN_METAL_PROFILE_DEEP").ok().as_deref() == Some("1")
-        {
-            return false;
-        }
         true
-    }
-
-    /// returns true when this layer can be emitted into the
-    /// whole-prefill outer concurrent encoder.
-    ///
-    /// Two layer kinds qualify:
-    ///   * **Concurrent-encoder eligible full-attn / dense FFN** (`concurrent_encoder_layer_eligible`):
-    ///     dispatches go through `encode_layer_batched_concurrent`, which already
-    ///     accepts an outer-encoder argument (Edit 1).
-    ///   * **GDN linear-attn with concurrent-encoder active** (`gdn_concurrent_encoder_enabled()`
-    ///     plus all five de-aliased buffers present, and not deep-profile):
-    ///     dispatches go through `encode_batched_gdn_prefill`, which
-    ///     accepts an outer-encoder argument (Edit 2). The legacy GDN
-    ///     legacy per-layer path opens its own blit + compute encoders interleaved,
-    ///     incompatible with an outer encoder.
-    ///
-    /// Returns false for MoE, sequential GDN (legacy per-layer path), non-Qwen3.5
-    /// layers, deep-profile, and any other path that interleaves encoder
-    /// open/close mid-layer.
-    pub(crate) fn layer_outer_eligible(
-        &self,
-        scratch: &MetalScratch,
-        weights: &LayerView,
-        batch_size: usize,
-    ) -> bool {
-        let st = &weights.subtensors;
-        let is_linear_attn = st.layer_type == Some(1);
-        if is_linear_attn {
-            // GDN: require gdn_concurrent_encoder_enabled + all 5 buffers + no deep-profile.
-            if !graph_reorder::gdn_concurrent_encoder_enabled() {
-                return false;
-            }
-            if super::profile::is_gdn_deep_enabled() {
-                return false;
-            }
-            if scratch.batch_gdn_raw_out_buf.is_none()
-                || scratch.batch_gdn_ssm_in_buf.is_none()
-                || scratch.batch_gdn_alpha_buf.is_none()
-                || scratch.batch_gdn_beta_buf.is_none()
-                || scratch.batch_gdn_conv_out_buf.is_none()
-            {
-                return false;
-            }
-            true
-        } else {
-            // Full-attn: defer to `concurrent_encoder_layer_eligible`. That gates on
-            // deep-profile already.
-            graph_reorder::concurrent_encoder_enabled()
-                && self.concurrent_encoder_layer_eligible(scratch, weights, batch_size)
-        }
     }
 
     /// Concurrent-encoder fast path: emit the layer's full op plan into a single per-layer
@@ -3770,12 +3355,6 @@ impl MetalF32Backend {
         let scores_buf = scratch.batch_scores_buf.as_ref().ok_or_else(|| {
             RuntimeError::Compute("concurrent-encoder path:batch_scores_buf not allocated".into())
         })?;
-        // BF16 FFN-down Split-K K64 needs the Split-K partial buffer in the concurrent-encoder
-        // path. Allocation is unconditional (see ensure_batch_scratch around
-        // line 188); buffer is reused across FFN-down sites that opt in.
-        let splitk_partial_buf = scratch.splitk_partial_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("concurrent-encoder path:splitk_partial_buf not allocated".into())
-        })?;
         let k_cache = &scratch.gpu_k_cache[layer_idx];
         let v_cache = &scratch.gpu_v_cache[layer_idx];
         let rope_cos = &scratch.rope_cos_buf;
@@ -3792,17 +3371,6 @@ impl MetalF32Backend {
             .repacked_ffn_down
             .get(layer_idx)
             .and_then(|opt| opt.as_ref());
-        // optional Q4 packed buffers for this layer (None when
-        // repack is disabled or the layer is not Q4_0).
-        let repacked_gate_up_q4: Option<&MetalBuffer> = scratch
-            .repacked_ffn_gate_up_q4
-            .get(layer_idx)
-            .and_then(|opt| opt.as_ref());
-        let repacked_down_q4: Option<&MetalBuffer> = scratch
-            .repacked_ffn_down_q4
-            .get(layer_idx)
-            .and_then(|opt| opt.as_ref());
-
         let qgate_dim = q_dim * 2; // Qwen3.5 attn_q.weight outputs [2*q_dim] interleaved Q+gate
         let max_attend_len = seq_pos_start + batch_size;
         let scores_stride = (max_attend_len + 7) & !7;
@@ -4175,7 +3743,6 @@ impl MetalF32Backend {
         // to the exact-F32 scalar attention_output_batched (no F16 P@V truncation).
         let pv_precise = metal_attn_precise_pvf32();
         let p_attn_out = if pv_precise {
-            metal_attn_precise_engage("concurrent", layer_idx, batch_size, num_heads, head_dim);
             &pipelines.attention_output_batched
         } else {
             &pipelines.attention_output_tiled
@@ -4403,41 +3970,7 @@ impl MetalF32Backend {
                 });
             }
         } else if fused_q4 {
-            // packed-layout Q4 variant when repacked buffer is present.
-            if let Some(buf_gu) = repacked_gate_up_q4 {
-                let pso = if ffn_aligned && hidden_dim % 64 == 0 {
-                    &pipelines.dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed_aligned
-                } else {
-                    &pipelines.dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed
-                };
-                plan.push(LayerOp {
-                    label: "ffn_gate_up_swiglu_fused_q4_packed",
-                    accesses: AccessList::from_iter_inline([
-                        Access::read(BufferId::Normed),
-                        Access::write(BufferId::Gate),
-                    ]),
-                    order_class: OrderClass::Free,
-                    emit: Box::new(move |enc| {
-                        enc.set_pipeline_state(pso);
-                        enc.set_threadgroup_memory_length(12288, 0);
-                        enc.set_buffer(buf_gu, 0, 0); // paired packed buffer
-                        enc.set_buffer(normed_buf, 0, 1);
-                        enc.set_buffer(gate_buf, 0, 2);
-                        enc.set_bytes(&m_u32.to_le_bytes(), 3);
-                        enc.set_bytes(&ffn_n_u32.to_le_bytes(), 4);
-                        enc.set_bytes(&ffn_k_u32.to_le_bytes(), 5);
-                        enc.dispatch_threadgroups(
-                            MTLSize::new(
-                                (inter_dim as u64).div_ceil(TILE_N),
-                                (batch_size as u64).div_ceil(TILE_M),
-                                1,
-                            ),
-                            MTLSize::new(128, 1, 1),
-                        );
-                        Ok(())
-                    }),
-                });
-            } else {
+            {
                 let pso = if ffn_aligned && hidden_dim % 64 == 0 {
                     &pipelines.dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_aligned
                 } else {
@@ -4599,51 +4132,7 @@ impl MetalF32Backend {
         let dn_k64_eligible_q8 = matches!(st.w_down.quant, QuantScheme::Q8_0)
             && inter_dim % 64 == 0
             && batch_size <= 4096;
-        // same for Q4_0 packed FFN-down.
-        let dn_k64_eligible_q4 = matches!(st.w_down.quant, QuantScheme::Q4_0)
-            && inter_dim % 64 == 0
-            && batch_size <= 4096;
-        // BF16 FFN-down Split-K K64 in the concurrent-encoder path. Mirrors the legacy
-        // per-layer dispatch at site `prefill_encode.rs:~2675`. Eligibility matches
-        // `ffn_down_splitk_bf16_value()` doc: BF16 weights, M <= 192, K >= 8192,
-        // K % 64 == 0. Honors `LUMEN_METAL_FFN_DOWN_SPLITK_BF16=<2|4|8>`;
-        // default OFF until empirical validation (per the env resolver, which
-        // is intentionally NOT gated under metal_defaults_active).
-        let ffn_splitk_bf16_env = super::graph_reorder::ffn_down_splitk_bf16_value();
-        let dn_k64_eligible_bf16_splitk = ffn_splitk_bf16_env > 0
-            && matches!(st.w_down.quant, QuantScheme::Bf16)
-            && batch_size <= 192
-            && inter_dim >= 8192
-            && inter_dim % 64 == 0;
-        if dn_k64_eligible_bf16_splitk {
-            let k_splits = ffn_splitk_bf16_env;
-            plan.push(LayerOp {
-                label: "ffn_down_residual_splitk_bf16",
-                accesses: AccessList::from_iter_inline([
-                    Access::read(BufferId::Gate),
-                    Access::write(BufferId::X),
-                    Access::read(BufferId::AttnProj),
-                ]),
-                order_class: OrderClass::Strict,
-                emit: Box::new(move |enc| {
-                    Self::encode_splitk_bf16_gemm_k64_residual(
-                        enc,
-                        pipelines,
-                        layer_buf,
-                        w_down_off,
-                        gate_buf,
-                        attn_proj_buf,
-                        x_buf,
-                        splitk_partial_buf,
-                        dn_m_u32,
-                        dn_n_u32,
-                        dn_k_u32,
-                        k_splits,
-                    );
-                    Ok(())
-                }),
-            });
-        } else if dn_k64_eligible_q8 && repacked_down.is_some() {
+        if dn_k64_eligible_q8 && repacked_down.is_some() {
             let buf_d = repacked_down.unwrap();
             let dn_aligned = batch_size % 32 == 0 && hidden_dim % 32 == 0 && inter_dim % 32 == 0;
             let pso = if dn_aligned {
@@ -4653,43 +4142,6 @@ impl MetalF32Backend {
             };
             plan.push(LayerOp {
                 label: "ffn_down_residual_packed",
-                accesses: AccessList::from_iter_inline([
-                    Access::read(BufferId::Gate),
-                    Access::write(BufferId::X),
-                    Access::read(BufferId::AttnProj),
-                ]),
-                order_class: OrderClass::Strict,
-                emit: Box::new(move |enc| {
-                    enc.set_pipeline_state(pso);
-                    enc.set_threadgroup_memory_length(8192, 0);
-                    enc.set_buffer(buf_d, 0, 0);
-                    enc.set_buffer(gate_buf, 0, 1);
-                    enc.set_buffer(x_buf, 0, 2);
-                    enc.set_bytes(&dn_m_u32.to_le_bytes(), 3);
-                    enc.set_bytes(&dn_n_u32.to_le_bytes(), 4);
-                    enc.set_bytes(&dn_k_u32.to_le_bytes(), 5);
-                    enc.set_buffer(attn_proj_buf, 0, 6);
-                    enc.dispatch_threadgroups(
-                        MTLSize::new(
-                            (hidden_dim as u64).div_ceil(TILE_N),
-                            (batch_size as u64).div_ceil(TILE_M),
-                            1,
-                        ),
-                        MTLSize::new(128, 1, 1),
-                    );
-                    Ok(())
-                }),
-            });
-        } else if dn_k64_eligible_q4 && repacked_down_q4.is_some() {
-            let buf_d = repacked_down_q4.unwrap();
-            let dn_aligned = batch_size % 32 == 0 && hidden_dim % 32 == 0 && inter_dim % 32 == 0;
-            let pso = if dn_aligned {
-                &pipelines.dequant_tiled_matmul_q4_0_k64_residual_batched_packed_aligned
-            } else {
-                &pipelines.dequant_tiled_matmul_q4_0_k64_residual_batched_packed
-            };
-            plan.push(LayerOp {
-                label: "ffn_down_residual_packed_q4",
                 accesses: AccessList::from_iter_inline([
                     Access::read(BufferId::Gate),
                     Access::write(BufferId::X),
@@ -4808,9 +4260,7 @@ impl MetalF32Backend {
 
     /// Construct a `LayerOp` for a plain quant GEMM `output = weight @ input`.
     ///
-    /// Pipeline selection mirrors `encode_layer_batched`'s match arms. The
-    /// `ggml-port` fast path (`use_ggml_ported_q8_0_gemm()`) is preserved
-    /// through `dispatch_q8_0_or_orig`.
+    /// Pipeline selection mirrors `encode_layer_batched`'s match arms.
     #[allow(clippy::too_many_arguments)]
     fn concurrent_encoder_emit_gemm<'a>(
         label: &'static str,
@@ -5041,855 +4491,5 @@ impl MetalF32Backend {
             QuantScheme::Bf16 => (&pipelines.tiled_matmul_bf16_residual, 4096),
             _ => (&pipelines.tiled_matmul_bytes_f32_residual, 4096),
         }
-    }
-
-    // ========================================================================
-    // Shared FFN block plan builder.
-    //
-    // Both `encode_layer_batched_concurrent` (full-attn layers) and
-    // `encode_layer_batched_into` (GDN layers outer-encoder mode)
-    // need to emit the same FFN block dispatch chain:
-    //   * FFN RMSNorm  (attn_proj_buf -> normed_buf)
-    //   * FFN gate+up [+ SwiGLU] (normed_buf -> gate_buf)
-    //   * FFN down + residual (gate_buf @ wdown + attn_proj_buf -> x_buf)
-    //
-    // The concurrent-encoder path includes FFN-norm in the plan (it follows the Wo+residual
-    // op that wrote attn_proj_buf). The GDN path's `encode_batched_gdn_prefill`
-    // ALREADY emits the FFN-norm dispatch at the end of its phase chain, so
-    // the GDN caller passes `skip_ffn_norm=true` to avoid emitting it
-    // a second time.
-    //
-    // Returning a `Vec<LayerOp>` rather than a closure-emitting iterator
-    // lets the caller append the FFN ops to its existing plan (full-attn
-    // case) or schedule them on their own (GDN case).
-    // ========================================================================
-
-    /// Build the FFN-block ops (RMSNorm, gate+up [+SwiGLU], down+residual)
-    /// for a single layer and append to `plan`.
-    ///
-    /// `skip_ffn_norm` — when true (GDN case), the FFN RMSNorm op is
-    /// omitted (the caller's earlier dispatch chain already produced
-    /// `normed_buf` from `attn_proj_buf`).
-    #[allow(clippy::too_many_arguments)]
-    fn concurrent_encoder_extend_plan_with_ffn_block<'a>(
-        plan: &mut Vec<LayerOp<'a>>,
-        skip_ffn_norm: bool,
-        pipelines: &'a MetalPipelines,
-        st: &lumen_format::SubtensorOffsets,
-        layer_buf: &'a MetalBuffer,
-        normed_buf: &'a MetalBuffer,
-        attn_proj_buf: &'a MetalBuffer,
-        gate_buf: &'a MetalBuffer,
-        up_buf: &'a MetalBuffer,
-        x_buf: &'a MetalBuffer,
-        // BF16 FFN-down Split-K K64 in the concurrent-encoder path needs the Split-K partial
-        // buffer. Allocated unconditionally by ensure_batch_scratch (size set
-        // to the worst case when LUMEN_METAL_FFN_DOWN_SPLITK_BF16 > 0).
-        splitk_partial_buf: &'a MetalBuffer,
-        ffn_norm_off: u64,
-        w_gate_off: u64,
-        w_up_off: u64,
-        w_down_off: u64,
-        repacked_gate_up: Option<&'a MetalBuffer>,
-        repacked_down: Option<&'a MetalBuffer>,
-        repacked_gate_up_q4: Option<&'a MetalBuffer>,
-        repacked_down_q4: Option<&'a MetalBuffer>,
-        dim_u32: u32,
-        eps: f32,
-        norm_tg_size: u64,
-        m_u32: u32,
-        batch_size: usize,
-        hidden_dim: usize,
-        inter_dim: usize,
-    ) {
-        const TILE_M: u64 = 32;
-        const TILE_N: u64 = 32;
-
-        // Op 17: FFN RMSNorm: attn_proj_buf -> normed_buf
-        if !skip_ffn_norm {
-            let p_rmsnorm_ffn = &pipelines.rmsnorm_batched_bytes;
-            plan.push(LayerOp {
-                label: "ffn_norm",
-                accesses: AccessList::from_iter_inline([
-                    Access::read(BufferId::AttnProj),
-                    Access::write(BufferId::Normed),
-                ]),
-                order_class: OrderClass::Strict,
-                emit: Box::new(move |enc| {
-                    enc.set_pipeline_state(p_rmsnorm_ffn);
-                    enc.set_buffer(attn_proj_buf, 0, 0);
-                    enc.set_buffer(layer_buf, ffn_norm_off, 1);
-                    enc.set_buffer(normed_buf, 0, 2);
-                    enc.set_bytes(&dim_u32.to_le_bytes(), 3);
-                    enc.set_bytes(&eps.to_le_bytes(), 4);
-                    enc.dispatch_threadgroups(
-                        MTLSize::new(batch_size as u64, 1, 1),
-                        MTLSize::new(norm_tg_size, 1, 1),
-                    );
-                    Ok(())
-                }),
-            });
-        }
-
-        // Op 18+: FFN gate+up [+swiglu]
-        let ffn_n_u32 = inter_dim as u32;
-        let ffn_k_u32 = hidden_dim as u32;
-        // see the matching block above for rationale; same helpers.
-        // BF16 fused-kernel arm mirrors site A in
-        // `encode_layer_batched_concurrent` so the GDN-layer-shared FFN block also
-        // honours `LUMEN_METAL_FFN_GATE_UP_SWIGLU_FUSED_BF16=1` under the
-        // default. Required because Qwen3.5-9B has 24 GDN layers
-        // that walk this helper plus 8 full-attn layers that walk site A;
-        // both must dispatch the fused kernel for end-to-end BF16 coverage.
-        let fused_q8 = st.w_gate.quant == QuantScheme::Q8_0
-            && st.w_up.quant == QuantScheme::Q8_0
-            && hidden_dim % 64 == 0
-            && batch_size <= 4096
-            && super::graph_reorder::ffn_gate_up_swiglu_fused_q8_enabled();
-        let fused_q4 = st.w_gate.quant == QuantScheme::Q4_0
-            && st.w_up.quant == QuantScheme::Q4_0
-            && hidden_dim % 64 == 0
-            && batch_size <= 4096
-            && super::graph_reorder::ffn_gate_up_swiglu_fused_q4_enabled();
-        let fused_bf16 = st.w_gate.quant == QuantScheme::Bf16
-            && st.w_up.quant == QuantScheme::Bf16
-            && hidden_dim % 64 == 0
-            && batch_size <= 4096
-            && super::graph_reorder::ffn_gate_up_swiglu_fused_bf16_enabled();
-        let ffn_aligned = batch_size % 32 == 0 && inter_dim % 32 == 0 && hidden_dim % 32 == 0;
-        if fused_q8 {
-            if let Some(buf_gu) = repacked_gate_up {
-                let pso = if ffn_aligned && hidden_dim % 64 == 0 {
-                    &pipelines.dequant_tiled_matmul_q8_0_gate_up_swiglu_fused_packed_aligned
-                } else {
-                    &pipelines.dequant_tiled_matmul_q8_0_gate_up_swiglu_fused_packed
-                };
-                plan.push(LayerOp {
-                    label: "ffn_gate_up_swiglu_fused_q8_packed",
-                    accesses: AccessList::from_iter_inline([
-                        Access::read(BufferId::Normed),
-                        Access::write(BufferId::Gate),
-                    ]),
-                    order_class: OrderClass::Free,
-                    emit: Box::new(move |enc| {
-                        enc.set_pipeline_state(pso);
-                        enc.set_threadgroup_memory_length(12288, 0);
-                        enc.set_buffer(buf_gu, 0, 0);
-                        enc.set_buffer(normed_buf, 0, 1);
-                        enc.set_buffer(gate_buf, 0, 2);
-                        enc.set_bytes(&m_u32.to_le_bytes(), 3);
-                        enc.set_bytes(&ffn_n_u32.to_le_bytes(), 4);
-                        enc.set_bytes(&ffn_k_u32.to_le_bytes(), 5);
-                        enc.dispatch_threadgroups(
-                            MTLSize::new(
-                                (inter_dim as u64).div_ceil(TILE_N),
-                                (batch_size as u64).div_ceil(TILE_M),
-                                1,
-                            ),
-                            MTLSize::new(128, 1, 1),
-                        );
-                        Ok(())
-                    }),
-                });
-            } else {
-                let pso = if ffn_aligned && hidden_dim % 64 == 0 {
-                    &pipelines.dequant_tiled_matmul_q8_0_gate_up_swiglu_fused_aligned
-                } else {
-                    &pipelines.dequant_tiled_matmul_q8_0_gate_up_swiglu_fused
-                };
-                plan.push(LayerOp {
-                    label: "ffn_gate_up_swiglu_fused_q8",
-                    accesses: AccessList::from_iter_inline([
-                        Access::read(BufferId::Normed),
-                        Access::write(BufferId::Gate),
-                    ]),
-                    order_class: OrderClass::Free,
-                    emit: Box::new(move |enc| {
-                        enc.set_pipeline_state(pso);
-                        enc.set_threadgroup_memory_length(12288, 0);
-                        enc.set_buffer(layer_buf, w_gate_off, 0);
-                        enc.set_buffer(normed_buf, 0, 1);
-                        enc.set_buffer(gate_buf, 0, 2);
-                        enc.set_bytes(&m_u32.to_le_bytes(), 3);
-                        enc.set_bytes(&ffn_n_u32.to_le_bytes(), 4);
-                        enc.set_bytes(&ffn_k_u32.to_le_bytes(), 5);
-                        enc.set_buffer(layer_buf, w_up_off, 6);
-                        enc.dispatch_threadgroups(
-                            MTLSize::new(
-                                (inter_dim as u64).div_ceil(TILE_N),
-                                (batch_size as u64).div_ceil(TILE_M),
-                                1,
-                            ),
-                            MTLSize::new(128, 1, 1),
-                        );
-                        Ok(())
-                    }),
-                });
-            }
-        } else if fused_q4 {
-            if let Some(buf_gu) = repacked_gate_up_q4 {
-                let pso = if ffn_aligned && hidden_dim % 64 == 0 {
-                    &pipelines.dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed_aligned
-                } else {
-                    &pipelines.dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_packed
-                };
-                plan.push(LayerOp {
-                    label: "ffn_gate_up_swiglu_fused_q4_packed",
-                    accesses: AccessList::from_iter_inline([
-                        Access::read(BufferId::Normed),
-                        Access::write(BufferId::Gate),
-                    ]),
-                    order_class: OrderClass::Free,
-                    emit: Box::new(move |enc| {
-                        enc.set_pipeline_state(pso);
-                        enc.set_threadgroup_memory_length(12288, 0);
-                        enc.set_buffer(buf_gu, 0, 0);
-                        enc.set_buffer(normed_buf, 0, 1);
-                        enc.set_buffer(gate_buf, 0, 2);
-                        enc.set_bytes(&m_u32.to_le_bytes(), 3);
-                        enc.set_bytes(&ffn_n_u32.to_le_bytes(), 4);
-                        enc.set_bytes(&ffn_k_u32.to_le_bytes(), 5);
-                        enc.dispatch_threadgroups(
-                            MTLSize::new(
-                                (inter_dim as u64).div_ceil(TILE_N),
-                                (batch_size as u64).div_ceil(TILE_M),
-                                1,
-                            ),
-                            MTLSize::new(128, 1, 1),
-                        );
-                        Ok(())
-                    }),
-                });
-            } else {
-                let pso = if ffn_aligned && hidden_dim % 64 == 0 {
-                    &pipelines.dequant_tiled_matmul_q4_0_gate_up_swiglu_fused_aligned
-                } else {
-                    &pipelines.dequant_tiled_matmul_q4_0_gate_up_swiglu_fused
-                };
-                plan.push(LayerOp {
-                    label: "ffn_gate_up_swiglu_fused_q4",
-                    accesses: AccessList::from_iter_inline([
-                        Access::read(BufferId::Normed),
-                        Access::write(BufferId::Gate),
-                    ]),
-                    order_class: OrderClass::Free,
-                    emit: Box::new(move |enc| {
-                        enc.set_pipeline_state(pso);
-                        enc.set_threadgroup_memory_length(12288, 0);
-                        enc.set_buffer(layer_buf, w_gate_off, 0);
-                        enc.set_buffer(normed_buf, 0, 1);
-                        enc.set_buffer(gate_buf, 0, 2);
-                        enc.set_bytes(&m_u32.to_le_bytes(), 3);
-                        enc.set_bytes(&ffn_n_u32.to_le_bytes(), 4);
-                        enc.set_bytes(&ffn_k_u32.to_le_bytes(), 5);
-                        enc.set_buffer(layer_buf, w_up_off, 6);
-                        enc.dispatch_threadgroups(
-                            MTLSize::new(
-                                (inter_dim as u64).div_ceil(TILE_N),
-                                (batch_size as u64).div_ceil(TILE_M),
-                                1,
-                            ),
-                            MTLSize::new(128, 1, 1),
-                        );
-                        Ok(())
-                    }),
-                });
-            }
-        } else if fused_bf16 {
-            // BF16 fused gate+up+SwiGLU dispatch on the concurrent-encoder GDN-shared
-            // FFN block. Same kernel selection / threadgroup geometry as site
-            // A above; layer-buffer-resident weights with 12 KB shmem.
-            let pso = if ffn_aligned && hidden_dim % 64 == 0 {
-                &pipelines.bf16_matmul_gate_up_swiglu_fused_aligned
-            } else {
-                &pipelines.bf16_matmul_gate_up_swiglu_fused
-            };
-            plan.push(LayerOp {
-                label: "ffn_gate_up_swiglu_fused_bf16",
-                accesses: AccessList::from_iter_inline([
-                    Access::read(BufferId::Normed),
-                    Access::write(BufferId::Gate),
-                ]),
-                order_class: OrderClass::Free,
-                emit: Box::new(move |enc| {
-                    enc.set_pipeline_state(pso);
-                    enc.set_threadgroup_memory_length(12288, 0);
-                    enc.set_buffer(layer_buf, w_gate_off, 0);
-                    enc.set_buffer(normed_buf, 0, 1);
-                    enc.set_buffer(gate_buf, 0, 2);
-                    enc.set_bytes(&m_u32.to_le_bytes(), 3);
-                    enc.set_bytes(&ffn_n_u32.to_le_bytes(), 4);
-                    enc.set_bytes(&ffn_k_u32.to_le_bytes(), 5);
-                    enc.set_buffer(layer_buf, w_up_off, 6);
-                    enc.dispatch_threadgroups(
-                        MTLSize::new(
-                            (inter_dim as u64).div_ceil(TILE_N),
-                            (batch_size as u64).div_ceil(TILE_M),
-                            1,
-                        ),
-                        MTLSize::new(128, 1, 1),
-                    );
-                    Ok(())
-                }),
-            });
-        } else {
-            // Unfused path: gate + up + SwiGLU separately.
-            plan.push(Self::concurrent_encoder_emit_gemm(
-                "ffn_gate_gemm",
-                BufferId::Normed,
-                BufferId::Gate,
-                layer_buf,
-                w_gate_off,
-                normed_buf,
-                gate_buf,
-                pipelines,
-                st.w_gate.quant,
-                m_u32,
-                ffn_n_u32,
-                ffn_k_u32,
-                batch_size,
-                inter_dim,
-                hidden_dim,
-                TILE_M,
-                TILE_N,
-            ));
-            plan.push(Self::concurrent_encoder_emit_gemm(
-                "ffn_up_gemm",
-                BufferId::Normed,
-                BufferId::Up,
-                layer_buf,
-                w_up_off,
-                normed_buf,
-                up_buf,
-                pipelines,
-                st.w_up.quant,
-                m_u32,
-                ffn_n_u32,
-                ffn_k_u32,
-                batch_size,
-                inter_dim,
-                hidden_dim,
-                TILE_M,
-                TILE_N,
-            ));
-            let p_swiglu = &pipelines.swiglu_batched;
-            let total_elems = (batch_size * inter_dim) as u32;
-            let tg_swiglu = 256u64.min(total_elems as u64).max(1);
-            plan.push(LayerOp {
-                label: "ffn_swiglu",
-                accesses: AccessList::from_iter_inline([
-                    Access::read(BufferId::Up),
-                    Access::read_write(BufferId::Gate),
-                ]),
-                order_class: OrderClass::Strict,
-                emit: Box::new(move |enc| {
-                    enc.set_pipeline_state(p_swiglu);
-                    enc.set_buffer(gate_buf, 0, 0);
-                    enc.set_buffer(up_buf, 0, 1);
-                    enc.set_bytes(&total_elems.to_le_bytes(), 2);
-                    enc.dispatch_threadgroups(
-                        MTLSize::new((total_elems as u64).div_ceil(tg_swiglu), 1, 1),
-                        MTLSize::new(tg_swiglu, 1, 1),
-                    );
-                    Ok(())
-                }),
-            });
-        }
-
-        // Op final: FFN down + residual: gate @ wdown + attn_proj -> x_buf
-        let dn_m_u32 = batch_size as u32;
-        let dn_n_u32 = hidden_dim as u32;
-        let dn_k_u32 = inter_dim as u32;
-        let dn_k64_eligible_q8 = matches!(st.w_down.quant, QuantScheme::Q8_0)
-            && inter_dim % 64 == 0
-            && batch_size <= 4096;
-        let dn_k64_eligible_q4 = matches!(st.w_down.quant, QuantScheme::Q4_0)
-            && inter_dim % 64 == 0
-            && batch_size <= 4096;
-        // BF16 FFN-down Split-K K64 in the concurrent-encoder path. Mirrors the legacy
-        // per-layer dispatch at site `prefill_encode.rs:~2675`. Eligibility matches
-        // `ffn_down_splitk_bf16_value()` doc: BF16 weights, M <= 192, K >= 8192,
-        // K % 64 == 0. Honors `LUMEN_METAL_FFN_DOWN_SPLITK_BF16=<2|4|8>`;
-        // default OFF until empirical validation (per the env resolver, which
-        // is intentionally NOT gated under metal_defaults_active).
-        let ffn_splitk_bf16_env = super::graph_reorder::ffn_down_splitk_bf16_value();
-        let dn_k64_eligible_bf16_splitk = ffn_splitk_bf16_env > 0
-            && matches!(st.w_down.quant, QuantScheme::Bf16)
-            && batch_size <= 192
-            && inter_dim >= 8192
-            && inter_dim % 64 == 0;
-        if dn_k64_eligible_bf16_splitk {
-            let k_splits = ffn_splitk_bf16_env;
-            plan.push(LayerOp {
-                label: "ffn_down_residual_splitk_bf16",
-                accesses: AccessList::from_iter_inline([
-                    Access::read(BufferId::Gate),
-                    Access::write(BufferId::X),
-                    Access::read(BufferId::AttnProj),
-                ]),
-                order_class: OrderClass::Strict,
-                emit: Box::new(move |enc| {
-                    Self::encode_splitk_bf16_gemm_k64_residual(
-                        enc,
-                        pipelines,
-                        layer_buf,
-                        w_down_off,
-                        gate_buf,
-                        attn_proj_buf,
-                        x_buf,
-                        splitk_partial_buf,
-                        dn_m_u32,
-                        dn_n_u32,
-                        dn_k_u32,
-                        k_splits,
-                    );
-                    Ok(())
-                }),
-            });
-        } else if dn_k64_eligible_q8 && repacked_down.is_some() {
-            let buf_d = repacked_down.unwrap();
-            let dn_aligned = batch_size % 32 == 0 && hidden_dim % 32 == 0 && inter_dim % 32 == 0;
-            let pso = if dn_aligned {
-                &pipelines.dequant_tiled_matmul_q8_0_k64_residual_batched_packed_aligned
-            } else {
-                &pipelines.dequant_tiled_matmul_q8_0_k64_residual_batched_packed
-            };
-            plan.push(LayerOp {
-                label: "ffn_down_residual_packed",
-                accesses: AccessList::from_iter_inline([
-                    Access::read(BufferId::Gate),
-                    Access::write(BufferId::X),
-                    Access::read(BufferId::AttnProj),
-                ]),
-                order_class: OrderClass::Strict,
-                emit: Box::new(move |enc| {
-                    enc.set_pipeline_state(pso);
-                    enc.set_threadgroup_memory_length(8192, 0);
-                    enc.set_buffer(buf_d, 0, 0);
-                    enc.set_buffer(gate_buf, 0, 1);
-                    enc.set_buffer(x_buf, 0, 2);
-                    enc.set_bytes(&dn_m_u32.to_le_bytes(), 3);
-                    enc.set_bytes(&dn_n_u32.to_le_bytes(), 4);
-                    enc.set_bytes(&dn_k_u32.to_le_bytes(), 5);
-                    enc.set_buffer(attn_proj_buf, 0, 6);
-                    enc.dispatch_threadgroups(
-                        MTLSize::new(
-                            (hidden_dim as u64).div_ceil(TILE_N),
-                            (batch_size as u64).div_ceil(TILE_M),
-                            1,
-                        ),
-                        MTLSize::new(128, 1, 1),
-                    );
-                    Ok(())
-                }),
-            });
-        } else if dn_k64_eligible_q4 && repacked_down_q4.is_some() {
-            let buf_d = repacked_down_q4.unwrap();
-            let dn_aligned = batch_size % 32 == 0 && hidden_dim % 32 == 0 && inter_dim % 32 == 0;
-            let pso = if dn_aligned {
-                &pipelines.dequant_tiled_matmul_q4_0_k64_residual_batched_packed_aligned
-            } else {
-                &pipelines.dequant_tiled_matmul_q4_0_k64_residual_batched_packed
-            };
-            plan.push(LayerOp {
-                label: "ffn_down_residual_packed_q4",
-                accesses: AccessList::from_iter_inline([
-                    Access::read(BufferId::Gate),
-                    Access::write(BufferId::X),
-                    Access::read(BufferId::AttnProj),
-                ]),
-                order_class: OrderClass::Strict,
-                emit: Box::new(move |enc| {
-                    enc.set_pipeline_state(pso);
-                    enc.set_threadgroup_memory_length(8192, 0);
-                    enc.set_buffer(buf_d, 0, 0);
-                    enc.set_buffer(gate_buf, 0, 1);
-                    enc.set_buffer(x_buf, 0, 2);
-                    enc.set_bytes(&dn_m_u32.to_le_bytes(), 3);
-                    enc.set_bytes(&dn_n_u32.to_le_bytes(), 4);
-                    enc.set_bytes(&dn_k_u32.to_le_bytes(), 5);
-                    enc.set_buffer(attn_proj_buf, 0, 6);
-                    enc.dispatch_threadgroups(
-                        MTLSize::new(
-                            (hidden_dim as u64).div_ceil(TILE_N),
-                            (batch_size as u64).div_ceil(TILE_M),
-                            1,
-                        ),
-                        MTLSize::new(128, 1, 1),
-                    );
-                    Ok(())
-                }),
-            });
-        } else {
-            plan.push(Self::concurrent_encoder_emit_gemm_residual(
-                "ffn_down_residual",
-                BufferId::Gate,
-                BufferId::X,
-                BufferId::AttnProj,
-                layer_buf,
-                w_down_off,
-                gate_buf,
-                x_buf,
-                attn_proj_buf,
-                pipelines,
-                st.w_down.quant,
-                dn_m_u32,
-                dn_n_u32,
-                dn_k_u32,
-                batch_size,
-                hidden_dim,
-                inter_dim,
-                TILE_M,
-                TILE_N,
-            ));
-        }
-    }
-
-    // ========================================================================
-    // whole-prefill outer encoder dispatcher.
-    //
-    // The whole-prefill caller in `prefill.rs::prefill()` opens ONE outer
-    // concurrent compute encoder right after embed and threads it through
-    // every layer. `encode_layer_batched_into` is the per-layer
-    // dispatcher: it routes concurrent-encoder-eligible layers to `encode_layer_batched_concurrent`
-    // and GDN linear-attn layers to `encode_batched_gdn_prefill`, in both
-    // cases threading the outer encoder through. Cross-layer hazards are
-    // emitted by the caller via `graph_reorder::emit_cross_layer_barrier`
-    // on `BufferId::X` before each layer (except layer 0).
-    //
-    // The caller MUST pre-check eligibility via `layer_outer_eligible`
-    // for every layer. If ANY layer is ineligible, the caller MUST fall back
-    // to the legacy per-layer encoder path (because the outer encoder
-    // cannot coexist with the legacy multi-encoder dispatch sites).
-    // ========================================================================
-
-    /// dispatch one layer's full op chain into the caller's outer
-    /// concurrent encoder.
-    ///
-    /// Precondition: `layer_outer_eligible(scratch, weights, batch_size) == true`.
-    /// (The caller has already validated this.)
-    ///
-    /// Two dispatch branches:
-    /// 1. Full-attn / dense FFN (`!is_linear_attn`): defers to
-    ///    `encode_layer_batched_concurrent(cmd, Some(outer_enc), ...)`. The concurrent-encoder
-    ///    plan is constructed identically to the per-layer path but
-    ///    emitted into `outer_enc` instead of a fresh per-layer encoder.
-    /// 2. GDN linear-attn (`is_linear_attn`): resolves layer-buffer +
-    ///    base offset, builds a `CachedLayerMeta` from the layer's
-    ///    `SubtensorOffsets`, then calls
-    ///    `encode_batched_gdn_prefill(cmd, Some(outer_enc), ...)`. The
-    ///    construction code mirrors the legacy `encode_layer_batched`'s
-    ///    `else` (linear-attn) branch.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn encode_layer_batched_into(
-        &self,
-        cmd: &MetalCommandBuffer,
-        outer_enc: &MetalComputeEncoder,
-        layer_idx: usize,
-        batch_size: usize,
-        weights: &LayerView,
-        kv: &mut KvCacheView,
-        pipelines: &MetalPipelines,
-        scratch: &mut MetalScratch,
-    ) -> Result<(), RuntimeError> {
-        let st = &weights.subtensors;
-        let is_linear_attn = st.layer_type == Some(1);
-
-        if !is_linear_attn {
-            // Full-attn / dense FFN: route through concurrent-encoder fast path with outer
-            // encoder. `concurrent_encoder_layer_eligible` is guaranteed by the caller's
-            // `layer_outer_eligible` precheck.
-            return self.encode_layer_batched_concurrent(
-                cmd,
-                Some(outer_enc),
-                layer_idx,
-                batch_size,
-                weights,
-                kv,
-                pipelines,
-                scratch,
-            );
-        }
-
-        // ---- GDN linear-attn path ----
-        // Mirror the legacy `encode_layer_batched`'s linear-attn branch
-        // construction of layer_buf / base_off / gdn_meta, then call
-        // `encode_batched_gdn_prefill(cmd, Some(outer_enc), ...)`.
-        let layer_buf: &MetalBuffer;
-        let base_off: u64;
-        if let Some(ref ubuf) = scratch.gpu_unified_weight_buf {
-            layer_buf = ubuf;
-            base_off = scratch.gpu_layer_offsets[layer_idx] as u64;
-        } else if let Some(ref layers) = scratch.gpu_resident_layers {
-            if let Some(buf) = layers.get(layer_idx) {
-                layer_buf = buf;
-                base_off = 0;
-            } else {
-                return Err(RuntimeError::Compute(format!(
-                    ": gpu_resident_layers missing layer {}",
-                    layer_idx
-                )));
-            }
-        } else {
-            let blob = weights.as_bytes();
-            let blob_ptr = blob.as_ptr() as usize;
-            let cached = scratch
-                .layer_buf_cache
-                .get(layer_idx)
-                .and_then(|c| c.as_ref());
-            let need_create = match cached {
-                Some((ptr, _)) => *ptr != blob_ptr,
-                None => true,
-            };
-            if need_create {
-                let buf = self.create_layer_buffer(weights)?;
-                scratch.layer_buf_cache[layer_idx] = Some((blob_ptr, buf));
-            }
-            layer_buf = &scratch.layer_buf_cache[layer_idx].as_ref().unwrap().1;
-            base_off = 0;
-        }
-
-        let ffn_norm_off = if st.ffn_norm.length == 0 {
-            st.attn_post_norm.map_or(0, |s| base_off + s.offset)
-        } else {
-            base_off + st.ffn_norm.offset
-        };
-
-        let gdn_meta = CachedLayerMeta {
-            attn_norm_off: base_off + st.attn_norm.offset,
-            wq_off: base_off + st.wq.offset,
-            wo_off: base_off + st.wo.offset,
-            ffn_norm_off,
-            w_gate_off: base_off + st.w_gate.offset,
-            w_up_off: base_off + st.w_up.offset,
-            w_down_off: base_off + st.w_down.offset,
-            wq_quant: st.wq.quant,
-            wo_quant: st.wo.quant,
-            w_gate_quant: st.w_gate.quant,
-            w_up_quant: st.w_up.quant,
-            w_down_quant: st.w_down.quant,
-            bq_off: st.bq.map(|b| base_off + b.offset),
-            bk_off: st.bk.map(|b| base_off + b.offset),
-            bv_off: st.bv.map(|b| base_off + b.offset),
-            moe_meta: None,
-            shared_expert_gate_off: st.shared_expert_gate.map(|s| base_off + s.offset),
-            shared_expert_up_off: st.shared_expert_up.map(|s| base_off + s.offset),
-            shared_expert_down_off: st.shared_expert_down.map(|s| base_off + s.offset),
-            shared_expert_gate_quant: st.shared_expert_gate.map(|s| s.quant),
-            shared_expert_down_quant: st.shared_expert_down.map(|s| s.quant),
-            attn_gate_off: st.attn_gate.map(|s| base_off + s.offset),
-            attn_gate_quant: st.attn_gate.map(|s| s.quant),
-            attn_post_norm_off: st.attn_post_norm.map(|s| base_off + s.offset),
-            has_qgate_fusion: false,
-            wk_off: None,
-            wv_off: None,
-            wk_quant: None,
-            wv_quant: None,
-            attn_q_norm_off: None,
-            attn_k_norm_off: None,
-            ffn_gate_inp_shexp_off: st.ffn_gate_inp_shexp.map(|s| base_off + s.offset),
-            layer_type: st.layer_type,
-            ssm_a_off: st.ssm_a.map(|s| base_off + s.offset),
-            ssm_conv1d_off: st.ssm_conv1d.map(|s| base_off + s.offset),
-            ssm_dt_off: st.ssm_dt.map(|s| base_off + s.offset),
-            ssm_beta_off: st.ssm_beta.map(|s| base_off + s.offset),
-            ssm_alpha_off: st.ssm_alpha.map(|s| base_off + s.offset),
-            ssm_norm_off: st.ssm_norm.map(|s| base_off + s.offset),
-            ssm_out_off: st.ssm_out.map(|s| base_off + s.offset),
-            ssm_out_quant: st.ssm_out.map(|s| s.quant),
-            gdn_layer_idx: if st.layer_type == Some(1) {
-                if let Some(Some(idx)) = scratch.gdn_layer_idx_map.get(layer_idx) {
-                    Some(*idx)
-                } else {
-                    let mut gdn_count = 0usize;
-                    for l in 0..layer_idx {
-                        if (l + 1) % 4 != 0 {
-                            gdn_count += 1;
-                        }
-                    }
-                    Some(gdn_count)
-                }
-            } else {
-                None
-            },
-        };
-
-        let gdn_idx = gdn_meta.gdn_layer_idx.ok_or_else(|| {
-            RuntimeError::Compute(format!(
-                " GDN prefill: layer {} has layer_type=1 but no gdn_layer_idx",
-                layer_idx
-            ))
-        })?;
-
-        // Resolve batch buffers for the GDN call.
-        let x_buf = scratch
-            .batch_x_buf
-            .as_ref()
-            .ok_or_else(|| RuntimeError::Compute(" GDN: batch_x_buf not allocated".into()))?;
-        let normed_buf = scratch
-            .batch_normed_buf
-            .as_ref()
-            .ok_or_else(|| RuntimeError::Compute(" GDN: batch_normed_buf not allocated".into()))?;
-        let qkv_buf = scratch
-            .batch_qkv_buf
-            .as_ref()
-            .ok_or_else(|| RuntimeError::Compute(" GDN: batch_qkv_buf not allocated".into()))?;
-        let attn_out_buf = scratch.batch_attn_out_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute(" GDN: batch_attn_out_buf not allocated".into())
-        })?;
-        let gate_buf = scratch
-            .batch_gate_buf
-            .as_ref()
-            .ok_or_else(|| RuntimeError::Compute(" GDN: batch_gate_buf not allocated".into()))?;
-        let attn_proj_buf = scratch.batch_attn_proj_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute(" GDN: batch_attn_proj_buf not allocated".into())
-        })?;
-
-        let seq_pos_start = kv.seq_len;
-
-        super::profile::set_section("gdn/batched_prefill");
-        let new_conv_pos = Self::encode_batched_gdn_prefill(
-            cmd,
-            Some(outer_enc),
-            pipelines,
-            scratch,
-            layer_buf,
-            &gdn_meta,
-            gdn_idx,
-            x_buf,
-            normed_buf,
-            qkv_buf,
-            attn_out_buf,
-            gate_buf,
-            attn_proj_buf,
-            batch_size,
-        )?;
-        scratch.gdn_conv_positions[gdn_idx] = new_conv_pos;
-
-        // ---- FFN block ----
-        //
-        // GDN's `encode_batched_gdn_prefill` writes the residual into `x_buf`
-        // (Phase 3 SSM_OUT + residual) and ALREADY runs the FFN-input RMSNorm
-        // at its tail (writes `normed_buf` from `attn_proj_buf`). The legacy
-        // `encode_layer_batched` for GDN layers continues into the dense FFN
-        // block (gate+up + SwiGLU + down+residual) after the GDN return, and
-        // must do the same — otherwise `x_buf` carries only the GDN/SSM
-        // residual without the FFN contribution and downstream layers read
-        // the wrong hidden state.
-        //
-        // We schedule the FFN ops into the outer encoder via the concurrent-encoder wavefront
-        // scheduler so they interact correctly with the GDN function's
-        // earlier dispatches (which the scheduler does NOT see; the
-        // GDN function emitted them inline). Because the GDN function
-        // already serialised everything in its tail (FFN-norm wrote
-        // normed_buf last), and our outer-encoder cross-layer barrier in
-        // `prefill.rs` will serialise before the next layer reads x_buf,
-        // the only within-layer hazards are between the FFN ops themselves —
-        // exactly what the scheduler handles.
-        //
-        // `skip_ffn_norm=true` because GDN already emitted it.
-        super::profile::set_section("gdn/ffn_block");
-        let ffn_norm_off = gdn_meta.ffn_norm_off;
-        let w_gate_off = gdn_meta.w_gate_off;
-        let w_up_off = gdn_meta.w_up_off;
-        let w_down_off = gdn_meta.w_down_off;
-        let up_buf = scratch
-            .batch_up_buf
-            .as_ref()
-            .ok_or_else(|| RuntimeError::Compute(" GDN FFN: batch_up_buf not allocated".into()))?;
-        let repacked_gate_up: Option<&MetalBuffer> = scratch
-            .repacked_ffn_gate_up
-            .get(layer_idx)
-            .and_then(|opt| opt.as_ref());
-        let repacked_down: Option<&MetalBuffer> = scratch
-            .repacked_ffn_down
-            .get(layer_idx)
-            .and_then(|opt| opt.as_ref());
-        let repacked_gate_up_q4: Option<&MetalBuffer> = scratch
-            .repacked_ffn_gate_up_q4
-            .get(layer_idx)
-            .and_then(|opt| opt.as_ref());
-        let repacked_down_q4: Option<&MetalBuffer> = scratch
-            .repacked_ffn_down_q4
-            .get(layer_idx)
-            .and_then(|opt| opt.as_ref());
-        // Split-K partial buffer for the BF16 FFN-down Split-K
-        // dispatch inside the shared FFN helper.
-        let splitk_partial_buf = scratch.splitk_partial_buf.as_ref().ok_or_else(|| {
-            RuntimeError::Compute(" GDN FFN: splitk_partial_buf not allocated".into())
-        })?;
-        let mut ffn_plan: Vec<LayerOp<'_>> = Vec::with_capacity(4);
-        Self::concurrent_encoder_extend_plan_with_ffn_block(
-            &mut ffn_plan,
-            true, // skip_ffn_norm — GDN already did it
-            pipelines,
-            st,
-            layer_buf,
-            normed_buf,
-            attn_proj_buf,
-            gate_buf,
-            up_buf,
-            x_buf,
-            splitk_partial_buf,
-            ffn_norm_off,
-            w_gate_off,
-            w_up_off,
-            w_down_off,
-            repacked_gate_up,
-            repacked_down,
-            repacked_gate_up_q4,
-            repacked_down_q4,
-            scratch.hidden_dim as u32,
-            scratch.eps,
-            scratch.norm_tg_size,
-            batch_size as u32,
-            batch_size,
-            scratch.hidden_dim,
-            scratch.inter_dim,
-        );
-
-        // Cross-section barrier: the GDN function ended with a dispatch
-        // that wrote `normed_buf` (FFN-input RMSNorm). The concurrent-encoder scheduler
-        // is invoked fresh for the FFN plan and doesn't know about that
-        // prior dispatch, so it cannot emit an implicit `normed_buf`
-        // barrier before the first FFN op (ffn_gate_up). On a concurrent
-        // outer encoder, ffn_gate_up could read stale `normed_buf` before
-        // GDN's FFN-norm write retires. Emit an explicit barrier here on
-        // both buffers carried from the GDN function into the FFN plan:
-        //   * `normed_buf`: written by GDN's FFN-norm, read by ffn_gate_up
-        //   * `attn_proj_buf`: written by GDN's Phase 3 SSM_OUT+residual,
-        //      read by ffn_down (residual addend)
-        outer_enc.memory_barrier_with_resources(&[normed_buf, attn_proj_buf]);
-
-        // Emit the FFN plan into the outer encoder. The concurrent-encoder wavefront
-        // scheduler handles within-plan hazards (gate+up may run in
-        // parallel; SwiGLU is Strict because it reads both; down+residual
-        // is Strict). `serial_validate=false` is consistent with how
-        // encode_layer_batched_concurrent calls the scheduler.
-        let lookup = |id: BufferId| -> Option<&MetalBuffer> {
-            Some(match id {
-                BufferId::X => x_buf,
-                BufferId::Normed => normed_buf,
-                BufferId::AttnProj => attn_proj_buf,
-                BufferId::Gate => gate_buf,
-                BufferId::Up => up_buf,
-                // The GDN FFN block doesn't touch Qkv / Q / K / V / AttnOut /
-                // Scores / KCache / VCache. Returning None falls back to
-                // whole-buffer scope on those (no-op since they're not in the
-                // plan's access list).
-                _ => return None,
-            })
-        };
-        graph_reorder::emit_plan_into_encoder(outer_enc, &mut ffn_plan, false, Some(&lookup))?;
-
-        // Update kv view position so the next layer (full-attn) sees the
-        // correct seq_pos_start. The legacy `encode_layer_batched` does
-        // this unconditionally for both branches; mirror that here. The
-        // `kv` here is a per-layer `KvCacheView`, so this update is local
-        // to the view (does not propagate to the parent KvCache — that
-        // is done in `prefill.rs` via `kv.advance_seq_len()` after commit).
-        kv.seq_len = seq_pos_start + batch_size;
-
-        Ok(())
     }
 }

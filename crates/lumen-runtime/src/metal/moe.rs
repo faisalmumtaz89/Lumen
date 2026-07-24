@@ -1364,22 +1364,8 @@ impl MetalF32Backend {
             let top_k = s.moe_num_active_experts;
 
             // Dispatch 1: Batched gate+up+SwiGLU (routed experts) -- reads normed_buf
-            if super::moe_diag_skip() != 2 {
-                // One-simdgroup-per-row redesign for the q8 routed
-                // gate+up+swiglu (LUMEN_METAL_MOE_GATEUP_SGROW=1). Default OFF.
-                let use_gateup_v2 = matches!(moe_meta.expert_gate_quant, QuantScheme::Q8_0)
-                    && pipelines.moe_batched_gate_up_swiglu_q8_0_v2.is_some()
-                    && super::moe_gateup_sgrow_enabled();
-                let (pipeline, gu_threads, gu_n_tg) = if use_gateup_v2 {
-                    (
-                        pipelines
-                            .moe_batched_gate_up_swiglu_q8_0_v2
-                            .as_ref()
-                            .unwrap(),
-                        128u64,
-                        (((top_k * inter_dim) as u64) + 3) / 4,
-                    )
-                } else {
+            {
+                let (pipeline, gu_threads, gu_n_tg) = {
                     let p = match moe_meta.expert_gate_quant {
                         QuantScheme::Q8_0 => {
                             pipelines.moe_batched_gate_up_swiglu_q8_0.as_ref().unwrap()
@@ -1404,7 +1390,7 @@ impl MetalF32Backend {
             }
 
             // Dispatch 2: Shared expert gate+up+SwiGLU -- reads normed_buf (parallel with dispatch 1)
-            if super::moe_diag_skip() != 3 {
+            {
                 let (se_ffn_tg, se_ffn_n_tg) = match gate_quant {
                     QuantScheme::Q8_0 => {
                         enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q8_0_2sg);
@@ -1445,9 +1431,7 @@ impl MetalF32Backend {
 
             // Dispatch 3: Gating dot product (if gate_inp_shexp exists) -- reads normed_buf (parallel)
             let has_gating = meta.ffn_gate_inp_shexp_off.is_some();
-            if let (Some(gis_off), true) =
-                (meta.ffn_gate_inp_shexp_off, super::moe_diag_skip() != 4)
-            {
+            if let Some(gis_off) = meta.ffn_gate_inp_shexp_off {
                 enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
                 enc.set_buffer(layer_buf, gis_off, 0);
                 enc.set_buffer(&s.normed_buf, 0, 1);
@@ -1462,34 +1446,11 @@ impl MetalF32Backend {
             // Barrier: wait for all 3 parallel dispatches before fused phase 2
             enc.memory_barrier_with_scope(1);
 
-            // [diag] LUMEN_METAL_MOE_DIAG_SKIP={down|gateup}: skip a dispatch to
-            // attribute its GPU-time share (produces garbage output; profiling only).
-            let diag_skip_down = super::moe_diag_skip() == 1;
             // Dispatch 4: Fused down+accum+shared
-            if !diag_skip_down {
+            {
                 let down_quant = moe_meta.expert_down_quant;
                 let se_down_quant = meta.shared_expert_down_quant.unwrap_or(QuantScheme::F32);
-                // When LUMEN_METAL_MOE_DOWN_SGROW=1 AND this is the
-                // mixed q8-routed / q4-shared production case, use the
-                // one-simdgroup-per-row redesign (2 rows/TG, 64 threads/TG,
-                // grid=ceil(hidden/2)). Default OFF -> original byte path.
-                let use_sgrow_v2 = matches!(
-                    (down_quant, se_down_quant),
-                    (QuantScheme::Q8_0, QuantScheme::Q4_0)
-                ) && pipelines
-                    .moe_batched_down_accum_shared_q8_0_se_q4_0_v2
-                    .is_some()
-                    && super::moe_down_sgrow_enabled();
-                let (pipeline, tg_threads, n_tg) = if use_sgrow_v2 {
-                    (
-                        pipelines
-                            .moe_batched_down_accum_shared_q8_0_se_q4_0_v2
-                            .as_ref()
-                            .unwrap(),
-                        64u64,
-                        ((hidden_dim as u64) + 1) / 2,
-                    )
-                } else {
+                let (pipeline, tg_threads, n_tg) = {
                     let p = match (down_quant, se_down_quant) {
                         (QuantScheme::Q8_0, QuantScheme::Q8_0) => pipelines
                             .moe_batched_down_accum_shared_q8_0
@@ -1913,12 +1874,7 @@ impl MetalF32Backend {
                 || (uniform_q4
                     && super::moe_gemm_tilemap_enabled()
                     && pipelines.moe_grouped_gemm_q4_0_tilemap.is_some()));
-        // DIAGNOSTIC (LUMEN_METAL_MOE_GRP_THEN_B=1): force the Option-B branch even
-        // when grouped is enabled (used during bring-up to isolate grouped bugs).
-        let grouped_then_optionb =
-            std::env::var("LUMEN_METAL_MOE_GRP_THEN_B").ok().as_deref() == Some("1");
-
-        if grouped_enabled && !grouped_then_optionb {
+        if grouped_enabled {
             // Populate moe_batch_expert_output at routed (expert, token) slots
             // only; Step 3 accum below reads it byte-identically.
             Self::encode_moe_prefill_grouped_q8_0(
@@ -1934,19 +1890,7 @@ impl MetalF32Backend {
                 device,
             )?;
         } else {
-            // DIAGNOSTIC (no-op when unset, profiling only — produces GARBAGE output):
-            // LUMEN_METAL_MOE_PREFILL_DIAG=N caps the expert FFN loop at N experts
-            // instead of all `num_experts`. Used to isolate the cost attributable to
-            // the redundant experts (Option B computes all 256, only top_k are used).
-            // Comparing N=num_experts (default) vs N=top_k quantifies the wasted
-            // (num_experts - top_k)/num_experts ≈ 96.9% expert compute.
-            let expert_loop_cap = std::env::var("LUMEN_METAL_MOE_PREFILL_DIAG")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .map(|n| n.min(num_experts))
-                .unwrap_or(num_experts);
-
-            for expert_idx in 0..expert_loop_cap {
+            for expert_idx in 0..num_experts {
                 let gate_off = expert_gate_offs[expert_idx];
                 let up_off = expert_up_offs[expert_idx];
                 let down_off = expert_down_offs[expert_idx];
@@ -2284,20 +2228,8 @@ impl MetalF32Backend {
         // exactly; using one encoder rather than several makes every cross-stage
         // buffer hazard explicit via the barriers below rather than relying on
         // cross-encoder hazard tracking.
-        //
-        // CENSUS (no-op in production): when the GDN deep-profile is enabled
-        // (LUMEN_METAL_PROFILE_GDN[_DEFER]=1), the seven grouped sub-stages are
-        // split into separate per-section CBs so the per-section GPU-TIME census
-        // attributes the 483ms grouped block. The split path ends the current
-        // encoder, announces the next section label, and opens a fresh encoder
-        // (which triggers ffi::profile_split_if_needed -> a new CB). Cross-encoder
-        // RAW hazards are then handled by Metal's between-encoder hazard tracker
-        // on the single FIFO queue, so the math is identical to the production
-        // single-encoder + explicit-barrier path. Gated entirely on the deep
-        // profile flag; production keeps ONE encoder with explicit barriers.
-        let census = super::profile::is_gdn_deep_enabled();
         let max_m_tiles = (batch_size as u64).div_ceil(32);
-        let mut enc = cmd
+        let enc = cmd
             .new_compute_encoder()
             .ok_or_else(|| RuntimeError::Compute("MoE grouped: encoder".into()))?;
         let tg_ne = (256u64).min(num_experts as u64).max(1);
@@ -2308,24 +2240,6 @@ impl MetalF32Backend {
         // grouped_gemm_tm selected above (quant-specific).
         let build_tile_map = pipelines.moe_prefill_build_tile_map.as_ref();
         let tile_map_buf = scratch.moe_grp_tile_map.as_ref();
-
-        // Helper: in census mode, end the current encoder, announce the next
-        // section label, and open a fresh encoder (auto-splitting the CB). In
-        // production this is a no-op (keeps the single encoder).
-        macro_rules! census_boundary {
-            ($label:expr) => {
-                if census {
-                    enc.end_encoding();
-                    super::profile::set_section($label);
-                    enc = cmd.new_compute_encoder().ok_or_else(|| {
-                        RuntimeError::Compute("MoE grouped: census encoder".into())
-                    })?;
-                }
-            };
-        }
-        if census {
-            super::profile::set_section("moe/grp_1_route_sort");
-        }
 
         // ---- 1. route_sort ----
         enc.set_pipeline_state(route_sort);
@@ -2338,8 +2252,6 @@ impl MetalF32Backend {
         enc.set_bytes(&ne_u32.to_le_bytes(), 6);
         enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(tg_ne, 1, 1));
         enc.memory_barrier_with_scope(1);
-        census_boundary!("moe/grp_2_assign_expert");
-
         // ---- 2. assign_expert ----
         enc.set_pipeline_state(assign_expert_pso);
         enc.set_buffer(seg_off, 0, 0);
@@ -2364,8 +2276,6 @@ impl MetalF32Backend {
             enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(tg_ne, 1, 1));
         }
         enc.memory_barrier_with_scope(1);
-        census_boundary!("moe/grp_3_gather");
-
         // ---- 3. gather normed rows -> grp_in[A, hidden] ----
         enc.set_pipeline_state(gather);
         enc.set_buffer(normed, 0, 0);
@@ -2383,8 +2293,6 @@ impl MetalF32Backend {
             MTLSize::new(256, 1, 1),
         );
         enc.memory_barrier_with_scope(1);
-        census_boundary!("moe/grp_4_gate_up_gemm");
-
         // ---- 4. grouped gate -> grp_swiglu;  up -> grp_down (as up tmp) ----
         // grouped_gemm_dispatch!(out_buf, woff_buf, N, K): dispatches one grouped
         // GEMM, picking the tile-map kernel (exact non-empty tiles) or the legacy
@@ -2428,8 +2336,6 @@ impl MetalF32Backend {
         // up:   N = inter, K = hidden, src = grp_in, dst = grp_down (up tmp)
         grouped_gemm_dispatch!(grp_in, grp_down, up_woff, inter_u32, hidden_u32);
         enc.memory_barrier_with_scope(1);
-        census_boundary!("moe/grp_5_swiglu");
-
         // ---- 5. swiglu: grp_swiglu = silu(grp_swiglu) * grp_down ----
         let total_elems = (total_assign * inter_dim) as u32;
         enc.set_pipeline_state(swiglu);
@@ -2442,14 +2348,10 @@ impl MetalF32Backend {
             MTLSize::new(tg_sw, 1, 1),
         );
         enc.memory_barrier_with_scope(1);
-        census_boundary!("moe/grp_6_down_gemm");
-
         // ---- 6. grouped down(grp_swiglu) -> grp_down[A, hidden] ----
         // N = hidden, K = inter, src = grp_swiglu, dst = grp_down
         grouped_gemm_dispatch!(grp_swiglu, grp_down, down_woff, hidden_u32, inter_u32);
         enc.memory_barrier_with_scope(1);
-        census_boundary!("moe/grp_7_scatter");
-
         // ---- 7. scatter grp_down -> moe_batch_expert_output[e, tok, :] ----
         enc.set_pipeline_state(scatter);
         enc.set_buffer(grp_down, 0, 0);
@@ -2502,6 +2404,21 @@ impl MetalF32Backend {
     ///
     /// Extends Option A from streaming-only to GPU-resident mode.
     /// Expected 2.5-3x decode speedup for Mixtral 8x7B (2/8 experts = 75% skip).
+    ///
+    /// LIVENESS (Track-C flag-cleanup reachability trace, 2026-07-14): DEAD on
+    /// every production path — reachable only from unit tests. The live decode
+    /// trait routes `decode_token` -> `decode_token_single_cb` and
+    /// `decode_token_greedy` -> `decode_token_greedy_lean`; that lean path only
+    /// reaches `decode_token_greedy_core(None)` (this fn's sole non-test caller,
+    /// via the inherent `decode_token_greedy`) under `LUMEN_METAL_DECODE_PROFILE=1`
+    /// (decode_greedy.rs:3119). Even then the `use_option_a && !has_batched` guard
+    /// (decode_greedy.rs:142) never fires: `has_batched` =
+    /// `moe_batched_gate_up_swiglu_q4_0.is_some()`, and that kernel is
+    /// unconditionally compiled into the metallib (pipelines.rs:491), so
+    /// `!has_batched` is always false on a functioning Metal backend. `--option-a`
+    /// is required too. NOT deleted (out of scope for this wave; recorded for a
+    /// dedicated strand wave + battery). Deleting it would NOT free
+    /// `encode_gdn_layer_decode` — prefill + compute_layer keep that live.
     pub fn decode_token_option_a_gpu_resident(
         &self,
         token_id: u32,

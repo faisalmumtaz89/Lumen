@@ -120,6 +120,59 @@ pub struct TensorSlice {
     pub quant: QuantScheme,
 }
 
+impl SubtensorOffsets {
+    /// Every present sub-tensor slice with a stable diagnostic name,
+    /// including optional fields and per-expert slices. Backends use this to
+    /// validate that a layer's quant schemes are dispatchable before upload.
+    pub fn named_slices(&self) -> Vec<(String, &TensorSlice)> {
+        let mut out: Vec<(String, &TensorSlice)> = vec![
+            ("wq".into(), &self.wq),
+            ("wk".into(), &self.wk),
+            ("wv".into(), &self.wv),
+            ("wo".into(), &self.wo),
+            ("w_gate".into(), &self.w_gate),
+            ("w_up".into(), &self.w_up),
+            ("w_down".into(), &self.w_down),
+            ("attn_norm".into(), &self.attn_norm),
+            ("ffn_norm".into(), &self.ffn_norm),
+        ];
+        let opts: [(&str, &Option<TensorSlice>); 19] = [
+            ("bq", &self.bq),
+            ("bk", &self.bk),
+            ("bv", &self.bv),
+            ("router_weight", &self.router_weight),
+            ("shared_expert_gate", &self.shared_expert_gate),
+            ("shared_expert_up", &self.shared_expert_up),
+            ("shared_expert_down", &self.shared_expert_down),
+            ("attn_gate", &self.attn_gate),
+            ("attn_post_norm", &self.attn_post_norm),
+            ("ssm_a", &self.ssm_a),
+            ("ssm_conv1d", &self.ssm_conv1d),
+            ("ssm_dt", &self.ssm_dt),
+            ("ssm_beta", &self.ssm_beta),
+            ("ssm_alpha", &self.ssm_alpha),
+            ("ssm_norm", &self.ssm_norm),
+            ("ssm_out", &self.ssm_out),
+            ("attn_q_norm", &self.attn_q_norm),
+            ("attn_k_norm", &self.attn_k_norm),
+            ("ffn_gate_inp_shexp", &self.ffn_gate_inp_shexp),
+        ];
+        for (name, slice) in opts {
+            if let Some(s) = slice {
+                out.push((name.to_string(), s));
+            }
+        }
+        if let Some(experts) = &self.experts {
+            for (i, e) in experts.iter().enumerate() {
+                out.push((format!("expert[{i}].gate"), &e.gate));
+                out.push((format!("expert[{i}].up"), &e.up));
+                out.push((format!("expert[{i}].down"), &e.down));
+            }
+        }
+        out
+    }
+}
+
 /// Index entry for a single transformer layer.
 ///
 /// File-level byte range for the layer blob plus sub-tensor offsets.

@@ -80,6 +80,14 @@ fn run_sequential_rope(
     let mut q_out = q_flat.to_vec();
     let mut k_out = k_flat.to_vec();
 
+    // The production `rope_apply` kernel takes a trailing `rotary_dim` parameter
+    // (partial-RoPE support for Qwen3.5: rotary_dim=64 of head_dim=256). These tests
+    // exercise full rotation, so pass `rotary_dim = head_dim` (the kernel treats
+    // rotary_dim==head_dim identically to the pre-parameter "full head_dim" behavior
+    // and to the CPU reference `cpu_rope_apply`). Omitting this arg makes cuLaunchKernel
+    // fail with CUDA_ERROR_INVALID_VALUE (kernel expects 8 params, launch pushed 7).
+    let rotary_dim: u32 = head_dim;
+
     for t in 0..batch {
         let q_row = &q_out[t * q_dim..(t + 1) * q_dim];
         let k_row = &k_out[t * kv_dim..(t + 1) * kv_dim];
@@ -97,6 +105,7 @@ fn run_sequential_rope(
                 .arg(&num_kv_heads)
                 .arg(&head_dim)
                 .arg(&theta)
+                .arg(&rotary_dim)
                 .launch(cfg)
         }
         .expect("rope_apply launch failed");
@@ -145,6 +154,12 @@ fn run_batched_rope(
     let mut q_gpu = stream.clone_htod(q_flat).unwrap();
     let mut k_gpu = stream.clone_htod(k_flat).unwrap();
 
+    // Production `rope_apply_batched` takes a trailing `rotary_dim` parameter (0 or
+    // head_dim => full rotation). Pass `head_dim` for full rotation; omitting it makes
+    // cuLaunchKernel fail with CUDA_ERROR_INVALID_VALUE (kernel expects 9 params, launch
+    // pushed 8). See the note in `run_sequential_rope`.
+    let rotary_dim: u32 = head_dim;
+
     unsafe {
         stream
             .launch_builder(&func)
@@ -156,6 +171,7 @@ fn run_batched_rope(
             .arg(&num_kv_heads)
             .arg(&head_dim)
             .arg(&theta)
+            .arg(&rotary_dim)
             .launch(cfg)
     }
     .expect("rope_apply_batched launch failed");

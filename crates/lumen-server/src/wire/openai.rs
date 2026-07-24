@@ -12,9 +12,11 @@
 //! Inner DTOs (messages, tool defs, tool calls) keep the original
 //! permissive behavior so forward-compatible client extras still pass.
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use lumen_runtime::engine::SamplingParams;
-use lumen_runtime::tooling::{compose_system_with_tools, ToolSchema};
+use lumen_runtime::tooling::{compose_system_with_tools, ToolSchema, ToolSchemas};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -113,6 +115,13 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub stream: Option<bool>,
+    /// OpenAI `stream_options` (consulted on the streaming path only). The one
+    /// field Lumen reads is `include_usage`: when true, the stream emits ONE
+    /// final chunk with empty `choices` and the `usage` totals BEFORE
+    /// `data: [DONE]` (the OpenAI contract); absent or false, no usage chunk
+    /// is emitted — byte-identical to the historical stream shape.
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
     #[serde(default)]
     pub stop: Option<Value>,
     #[serde(default)]
@@ -136,7 +145,28 @@ pub struct ChatCompletionRequest {
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
+/// OpenAI `stream_options` object (streaming requests only). Strict like the
+/// parent request struct: unknown fields 400.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamOptions {
+    /// When true, emit the final usage chunk (empty `choices` + `usage`)
+    /// before `data: [DONE]`.
+    #[serde(default)]
+    pub include_usage: Option<bool>,
+}
+
 impl ChatCompletionRequest {
+    /// True when the streaming client asked for the final usage chunk
+    /// (`stream_options: {"include_usage": true}`). Consulted only on the
+    /// streaming path; the non-streaming response always carries `usage`.
+    pub fn include_usage(&self) -> bool {
+        self.stream_options
+            .as_ref()
+            .and_then(|o| o.include_usage)
+            .unwrap_or(false)
+    }
+
     /// Resolve the per-request reasoning toggle using the single shared
     /// resolver. Precedence: top-level `enable_thinking` → vLLM
     /// `chat_template_kwargs.enable_thinking` → env override → default. The
@@ -164,7 +194,12 @@ impl ChatCompletionRequest {
             ));
         }
         let enable_thinking = self.resolve_thinking();
-        let prompt = render_chat_prompt(&self.messages, &self.tools, enable_thinking)?;
+        let prompt = render_chat_prompt(
+            &self.messages,
+            &self.tools,
+            enable_thinking,
+            engine.chat_template(),
+        )?;
         let prompt_tokens = engine.tokenize_for_request(&prompt);
         // Synchronous oversize guard: 400 BEFORE the 200/SSE stream opens.
         super::check_prompt_length(prompt_tokens.len(), engine.context_length())?;
@@ -359,6 +394,24 @@ fn parse_stop_field(v: Option<Value>) -> Vec<String> {
     }
 }
 
+/// Build the runtime [`ToolSchemas`] (function -> parameter -> JSON-Schema type)
+/// the native tool-call parser needs, from the OpenAI tool definitions on a
+/// request. The router hands this to the streaming / non-streaming collectors so
+/// native `<parameter>` values are typed by the advertised schema. Mirrors the
+/// `ToolSchema` conversion the manual render uses.
+pub fn tool_schemas(tools: &[ToolDef]) -> ToolSchemas {
+    let schemas: Vec<ToolSchema> = tools
+        .iter()
+        .map(|t| ToolSchema {
+            name: t.function.name.clone(),
+            description: t.function.description.clone(),
+            parameters_json_schema: serde_json::to_string(&t.function.parameters)
+                .unwrap_or_else(|_| "{}".into()),
+        })
+        .collect();
+    ToolSchemas::from_tools(&schemas)
+}
+
 /// Render a chat-completion request as a single prompt string.
 ///
 /// We do NOT apply the model's chat template here; that is the tokenizer's
@@ -383,6 +436,92 @@ fn parse_stop_field(v: Option<Value>) -> Vec<String> {
 /// are stripped by the wire layer's StopMatcher / SseSafeEmitter only on
 /// Qwen3.5 (because only Qwen3.5's special-token map contains them).
 fn render_chat_prompt(
+    messages: &[ChatMessage],
+    tools: &[ToolDef],
+    enable_thinking: bool,
+    chat_template: Option<&str>,
+) -> Result<String, ServerError> {
+    // Prefer the model's EMBEDDED chat template (Qwen3.5's native tool-calling
+    // protocol) rendered via the shared Jinja engine — the SAME renderer the CLI
+    // uses, so the two cannot drift. Falls back to the hard-coded ChatML
+    // transcript below when no template is embedded (older LBCs / synthetic test
+    // tokenizers), keeping those paths byte-identical to today.
+    if let Some(template) = chat_template {
+        return render_chat_prompt_templated(messages, tools, enable_thinking, template);
+    }
+    render_chat_prompt_manual(messages, tools, enable_thinking)
+}
+
+/// Render `messages` + `tools` through the model's embedded Jinja template.
+///
+/// Builds the render context in the shape the template consumes: message
+/// `content` is flattened to a string via the shared [`super::flatten_content`]
+/// (preserving the ROBUST-007 numeric-content 400), assistant `tool_calls` are
+/// mapped to `{function: {name, arguments}}` with the OpenAI on-wire arguments
+/// JSON STRING parsed back into an object (the template iterates it with
+/// `|items`), and each tool is the OpenAI function-tool object. A template
+/// `raise_exception` (e.g. "No user query found", "System message must be at the
+/// beginning") surfaces as a 400.
+fn render_chat_prompt_templated(
+    messages: &[ChatMessage],
+    tools: &[ToolDef],
+    enable_thinking: bool,
+    template: &str,
+) -> Result<String, ServerError> {
+    let mut msgs: Vec<Value> = Vec::with_capacity(messages.len());
+    for m in messages {
+        let content = super::flatten_content(&m.content, "messages.content")?;
+        let mut obj = serde_json::Map::new();
+        obj.insert("role".into(), Value::String(m.role.clone()));
+        obj.insert("content".into(), Value::String(content));
+        if !m.tool_calls.is_empty() {
+            let calls: Vec<Value> = m
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    // OpenAI carries arguments as a JSON string; the template
+                    // needs a mapping (`arguments | items`), so parse it back.
+                    let args = serde_json::from_str::<Value>(&tc.function.arguments)
+                        .ok()
+                        .filter(Value::is_object)
+                        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                    json!({
+                        "id": tc.id,
+                        "type": tc.call_type,
+                        "function": {"name": tc.function.name, "arguments": args},
+                    })
+                })
+                .collect();
+            obj.insert("tool_calls".into(), Value::Array(calls));
+        }
+        msgs.push(Value::Object(obj));
+    }
+    let tools_json: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": t.def_type,
+                "function": {
+                    "name": t.function.name,
+                    "description": t.function.description,
+                    "parameters": t.function.parameters,
+                },
+            })
+        })
+        .collect();
+    lumen_runtime::chat_template::render_chat_prompt(
+        template,
+        &Value::Array(msgs),
+        &Value::Array(tools_json),
+        true,
+        enable_thinking,
+    )
+    .map_err(|e| ServerError::bad_request(format!("chat template render failed: {e}")))
+}
+
+/// Hard-coded ChatML transcript, retained as the fallback for tokenizers with no
+/// embedded template. Byte-identical to the pre-embedded-template behaviour.
+fn render_chat_prompt_manual(
     messages: &[ChatMessage],
     tools: &[ToolDef],
     enable_thinking: bool,
@@ -498,10 +637,20 @@ pub fn stream_chat(
     created: u64,
     thinking: bool,
     stop: Vec<String>,
+    tool_schemas: Arc<ToolSchemas>,
+    include_usage: bool,
 ) -> Body {
     let (tx, body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     tokio::spawn(drive_chat_stream(
-        rx, tx, model, created, true, thinking, stop,
+        rx,
+        tx,
+        model,
+        created,
+        true,
+        thinking,
+        stop,
+        tool_schemas,
+        include_usage,
     ));
     body_from_byte_stream(body_rx)
 }
@@ -514,9 +663,19 @@ pub fn stream_completion(
 ) -> Body {
     let (tx, body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     // Legacy completions have no chat template / `<think>` block: thinking is
-    // always off, so the emitter's reasoning stage is a passthrough.
+    // always off, so the emitter's reasoning stage is a passthrough. No tools
+    // are advertised on the legacy surface, so the parser is schemaless.
     tokio::spawn(drive_chat_stream(
-        rx, tx, model, created, false, false, stop,
+        rx,
+        tx,
+        model,
+        created,
+        false,
+        false,
+        stop,
+        Arc::new(ToolSchemas::default()),
+        // The legacy surface has no `stream_options`; never emit a usage chunk.
+        false,
     ));
     body_from_byte_stream(body_rx)
 }
@@ -529,12 +688,14 @@ async fn drive_chat_stream(
     chat: bool,
     thinking: bool,
     stop: Vec<String>,
+    tool_schemas: Arc<ToolSchemas>,
+    include_usage: bool,
 ) {
     let id = format!(
         "chatcmpl-lumen-{created:x}-{:x}",
         super::next_response_seq()
     );
-    let mut emitter = SseSafeEmitter::new(thinking);
+    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
     // F4: seed the streaming stop matcher from the request stop list. The
     // worker already truncates generation at the stop string (and reports
     // `FinishReason::StopSequence`, which it forwards via `TokenEvent::Done`);
@@ -546,6 +707,12 @@ async fn drive_chat_stream(
     let mut finish_reason: Option<FinishReason> = None;
     let mut tool_call_index = 0usize;
     let mut emitted_any_tool_call = false;
+    // Usage totals from the worker's `Done` event, reported in the final usage
+    // chunk when `stream_options.include_usage` was requested. On the rare
+    // wire-side stop path (the redundant net fires before the worker's Done)
+    // they remain 0 — the worker normally enforces stops first.
+    let mut prompt_tokens = 0usize;
+    let mut completion_tokens = 0usize;
 
     if chat {
         let head = json!({
@@ -568,7 +735,22 @@ async fn drive_chat_stream(
         match evt {
             TokenEvent::PrefillDone { .. } => {}
             TokenEvent::Token { delta_text, .. } => {
-                let delta = emitter.push(&delta_text);
+                // RAW passthrough for /v1/completions (`chat == false`): the
+                // legacy surface returns the decoded model text VERBATIM — no
+                // reasoning split and no tool-call parsing/stripping — so tool
+                // markers (`<tool_call>` / `<function=`) reach the client and
+                // the endpoint remains a faithful raw-emission oracle for the
+                // pre-parser model output. Stop matching still applies.
+                // `/v1/chat/completions` (`chat == true`) is unchanged.
+                let delta = if chat {
+                    emitter.push(&delta_text)
+                } else {
+                    crate::sse::EmitDelta {
+                        reasoning: String::new(),
+                        text: delta_text,
+                        tool_calls: Vec::new(),
+                    }
+                };
                 // Reasoning trace (chat only): emit `delta.reasoning_content`
                 // chunks BEFORE answer content. The trace bypasses the stop
                 // matcher (stop sequences apply to the answer, not the trace).
@@ -660,9 +842,13 @@ async fn drive_chat_stream(
                 }
             }
             TokenEvent::Done {
-                finish_reason: fr, ..
+                finish_reason: fr,
+                prompt_tokens: p,
+                completion_tokens: c,
             } => {
                 finish_reason = Some(fr);
+                prompt_tokens = p;
+                completion_tokens = c;
                 break;
             }
             TokenEvent::Error(msg) => {
@@ -773,6 +959,28 @@ async fn drive_chat_stream(
         })
     };
     let _ = tx.send(sse_frame(&tail.to_string())).await;
+    // OpenAI `stream_options.include_usage` contract (chat only): when the
+    // client requested it, ONE extra chunk with empty `choices` and the usage
+    // totals goes out AFTER the finish chunk and BEFORE `data: [DONE]`. When
+    // not requested, nothing is emitted here — the stream stays byte-identical
+    // to the historical shape.
+    if chat && include_usage {
+        let usage = json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        });
+        if tx.send(sse_frame(&usage.to_string())).await.is_err() {
+            return;
+        }
+    }
     let _ = tx.send(sse_done()).await;
 }
 
@@ -784,8 +992,9 @@ pub async fn collect_chat(
     created: u64,
     thinking: bool,
     stop: Vec<String>,
+    tool_schemas: Arc<ToolSchemas>,
 ) -> Result<Value, ServerError> {
-    let mut emitter = SseSafeEmitter::new(thinking);
+    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
     // F4: seed from the request stop list (see `drive_chat_stream`). Empty =>
     // verbatim passthrough, byte-identical to the pre-F4 response.
     let mut stop_matcher = StopMatcher::new(stop);
@@ -930,7 +1139,18 @@ pub async fn collect_chat_from_events_with_stop(
     // test helper; no cancellation guard needed (no live
     // worker, no client-disconnect path).
     let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
-    collect_chat(pooled, model, created, thinking, stop).await
+    // Test helper exercises the legacy JSON tool-call path, which parses without
+    // schemas; the schema-aware native path is covered by the runtime tooling
+    // tests and the Modal §2D gate.
+    collect_chat(
+        pooled,
+        model,
+        created,
+        thinking,
+        stop,
+        Arc::new(ToolSchemas::default()),
+    )
+    .await
 }
 
 pub async fn collect_completion(
@@ -939,8 +1159,10 @@ pub async fn collect_completion(
     created: u64,
     stop: Vec<String>,
 ) -> Result<Value, ServerError> {
-    // Legacy completions have no `<think>` block: thinking off (passthrough).
-    let mut emitter = SseSafeEmitter::new(false);
+    // RAW passthrough: the legacy completions surface returns the decoded
+    // model text VERBATIM — no SseSafeEmitter reasoning/tool stage (which
+    // would strip `<tool_call>` / `<function=` blocks) — so the endpoint is a
+    // faithful raw-emission oracle for the pre-parser model output.
     // F4: seed from the request stop list. Empty => verbatim, byte-identical.
     let mut stop_matcher = StopMatcher::new(stop);
     let mut text = String::new();
@@ -952,8 +1174,7 @@ pub async fn collect_completion(
         match evt {
             TokenEvent::PrefillDone { .. } => {}
             TokenEvent::Token { delta_text, .. } => {
-                let delta = emitter.push(&delta_text);
-                let (safe_text, hit_stop) = stop_matcher.push(&delta.text);
+                let (safe_text, hit_stop) = stop_matcher.push(&delta_text);
                 text.push_str(&safe_text);
                 if hit_stop {
                     // Wire-side stop match -> StopSequence (renders OpenAI "stop").
@@ -976,14 +1197,9 @@ pub async fn collect_completion(
             TokenEvent::Error(msg) => return Err(ServerError::classify_runtime(msg)),
         }
     }
-    let (residual, _) = emitter.finish();
     if finish != FinishReason::StopSequence {
-        let (residual_safe, _) = if stop_matcher.is_active() {
-            stop_matcher.push(&residual.text)
-        } else {
-            (residual.text.clone(), false)
-        };
-        text.push_str(&residual_safe);
+        // Only the stop matcher can be holding bytes (a partial stop-sequence
+        // prefix); with no stop list this is empty — byte-identical verbatim.
         text.push_str(&stop_matcher.finish());
     }
 
@@ -1015,6 +1231,161 @@ mod tests {
             token_id: 0,
             delta_text: text.to_string(),
         }
+    }
+
+    /// Drive `drive_chat_stream` over a fixed event list and return the raw
+    /// SSE byte stream as a UTF-8 string (mirrors the Anthropic helper).
+    async fn stream_openai_to_string(
+        events: Vec<TokenEvent>,
+        chat: bool,
+        include_usage: bool,
+    ) -> String {
+        let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
+        let return_sender = tx.clone();
+        for e in events {
+            tx.send(e).await.unwrap();
+        }
+        drop(tx);
+        let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
+        let (body_tx, mut body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        tokio::spawn(drive_chat_stream(
+            pooled,
+            body_tx,
+            "test-model".into(),
+            1234,
+            chat,
+            false,
+            Vec::new(),
+            Arc::new(ToolSchemas::default()),
+            include_usage,
+        ));
+        let mut out = String::new();
+        while let Some(chunk) = body_rx.recv().await {
+            out.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        out
+    }
+
+    /// `stream_options.include_usage: true` -> exactly ONE extra chunk with
+    /// empty `choices` + the usage totals, positioned as the LAST data frame
+    /// before `data: [DONE]` (the OpenAI streaming contract).
+    #[tokio::test]
+    async fn stream_chat_usage_chunk_present_when_requested() {
+        let events = vec![
+            tok("hi"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 7,
+                completion_tokens: 3,
+            },
+        ];
+        let sse = stream_openai_to_string(events, true, true).await;
+        let frames: Vec<&str> = sse
+            .split("\n\n")
+            .filter_map(|b| b.trim().strip_prefix("data: "))
+            .collect();
+        assert_eq!(*frames.last().unwrap(), "[DONE]");
+        let usage_frame = frames[frames.len() - 2];
+        let v: Value = serde_json::from_str(usage_frame).unwrap();
+        assert_eq!(
+            v["choices"].as_array().unwrap().len(),
+            0,
+            "usage chunk must carry empty choices: {usage_frame}"
+        );
+        assert_eq!(v["usage"]["prompt_tokens"], 7);
+        assert_eq!(v["usage"]["completion_tokens"], 3);
+        assert_eq!(v["usage"]["total_tokens"], 10);
+        let n = frames.iter().filter(|f| f.contains("\"usage\"")).count();
+        assert_eq!(n, 1, "exactly one usage chunk: {sse}");
+    }
+
+    /// /v1/completions is a RAW surface: tool markers pass through VERBATIM
+    /// (non-streaming). Before the fix the SseSafeEmitter stripped the
+    /// `<tool_call>` block out of `choices[0].text`.
+    #[tokio::test]
+    async fn collect_completion_passes_tool_markers_verbatim() {
+        let raw = "prefix <tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call> suffix";
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let return_sender = tx.clone();
+        // Split mid-marker to prove nothing is held back or stripped across
+        // chunk boundaries on the raw path.
+        for part in [
+            "prefix <tool_",
+            "call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_",
+            "call> suffix",
+        ] {
+            tx.send(tok(part)).await.unwrap();
+        }
+        tx.send(TokenEvent::Done {
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 4,
+            completion_tokens: 9,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
+        let resp = collect_completion(pooled, "test-model".into(), 1234, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(resp["choices"][0]["text"].as_str().unwrap(), raw);
+        assert_eq!(resp["usage"]["total_tokens"], 13);
+    }
+
+    /// Streaming /v1/completions: the concatenated `choices[0].text` deltas
+    /// equal the verbatim model text, tool markers included (no stripping, no
+    /// held-back marker prefixes).
+    #[tokio::test]
+    async fn stream_completion_passes_tool_markers_verbatim() {
+        let raw = "prefix <tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call> suffix";
+        let events = vec![
+            tok("prefix <tool_"),
+            tok("call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_"),
+            tok("call> suffix"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 4,
+                completion_tokens: 9,
+            },
+        ];
+        let sse = stream_openai_to_string(events, false, false).await;
+        let mut text = String::new();
+        for frame in sse
+            .split("\n\n")
+            .filter_map(|b| b.trim().strip_prefix("data: "))
+        {
+            if frame == "[DONE]" {
+                continue;
+            }
+            let v: Value = serde_json::from_str(frame).unwrap();
+            if let Some(t) = v["choices"][0]["text"].as_str() {
+                text.push_str(t);
+            }
+        }
+        assert_eq!(text, raw);
+        assert!(
+            !sse.contains("\"usage\""),
+            "legacy surface has no usage chunk"
+        );
+    }
+
+    /// Absent `stream_options.include_usage`, NO usage chunk is emitted — the
+    /// stream stays byte-identical to the historical shape (matching OpenAI).
+    #[tokio::test]
+    async fn stream_chat_no_usage_chunk_by_default() {
+        let events = vec![
+            tok("hi"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 7,
+                completion_tokens: 3,
+            },
+        ];
+        let sse = stream_openai_to_string(events, true, false).await;
+        assert!(
+            !sse.contains("\"usage\""),
+            "no usage chunk absent the flag: {sse}"
+        );
     }
 
     #[tokio::test]
@@ -1238,12 +1609,89 @@ mod tests {
         }
     }
 
+    fn assistant_tool_call_msg(name: &str, arguments: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: Value::String(String::new()),
+            tool_call_id: None,
+            tool_calls: vec![AssistantToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                function: AssistantToolCallFn {
+                    name: name.into(),
+                    arguments: arguments.into(),
+                },
+            }],
+        }
+    }
+
+    fn tool_msg(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "tool".into(),
+            content: Value::String(content.into()),
+            tool_call_id: Some("call_1".into()),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    fn weather_tool_def() -> ToolDef {
+        ToolDef {
+            def_type: "function".into(),
+            function: ToolDefFunction {
+                name: "get_weather".into(),
+                description: "Get weather.".into(),
+                parameters: json!({"type":"object","properties":{"city":{"type":"string"}}}),
+            },
+        }
+    }
+
+    #[test]
+    fn templated_render_parses_tool_call_arguments_into_object_for_items() {
+        // The template iterates `tool_calls[].function.arguments | items`, so the
+        // server MUST parse the OpenAI on-wire arguments JSON STRING into an
+        // object; if it passed the raw string this render would error on `|items`.
+        let tmpl = "{%- for m in messages %}{%- if m.tool_calls %}{%- for tc in m.tool_calls %}{%- set f = tc.function %}fn={{ f.name }}{%- for k, v in f.arguments | items %} {{ k }}={{ v }}{%- endfor %}{%- endfor %}{%- endif %}{%- endfor %}";
+        let messages = vec![assistant_tool_call_msg(
+            "get_weather",
+            r#"{"city": "Riyadh", "unit": "celsius"}"#,
+        )];
+        let out = render_chat_prompt(&messages, &[], false, Some(tmpl)).unwrap();
+        assert_eq!(out, "fn=get_weather city=Riyadh unit=celsius");
+    }
+
+    #[test]
+    fn templated_render_groups_consecutive_tool_results_via_adjacent_loop_items() {
+        // Two consecutive `tool` messages must collapse into ONE user turn
+        // (opened before the first, closed after the last) — the template does
+        // this with loop.previtem / loop.nextitem, which requires the
+        // adjacent_loop_items feature the shared renderer enables.
+        let tmpl = "{%- for m in messages %}{%- if m.role == 'tool' %}{%- if loop.previtem and loop.previtem.role != 'tool' %}<user>{%- endif %}[{{ m.content }}]{%- if loop.last or loop.nextitem.role != 'tool' %}</user>{%- endif %}{%- else %}<{{ m.role }}>{{ m.content }}{%- endif %}{%- endfor %}";
+        let messages = vec![
+            user_msg("hi"),
+            tool_msg("A"),
+            tool_msg("B"),
+            assistant_msg("done"),
+        ];
+        let out = render_chat_prompt(&messages, &[], false, Some(tmpl)).unwrap();
+        assert_eq!(out, "<user>hi<user>[A][B]</user><assistant>done");
+    }
+
+    #[test]
+    fn templated_render_dispatches_and_builds_tool_context() {
+        // A tool is advertised: the templated path must expose `tools` (non-empty)
+        // and the flattened user content to the template.
+        let tmpl = "{%- if tools %}TOOLS={{ tools[0].function.name }}{%- endif %} U={{ messages[-1].content }}";
+        let messages = vec![user_msg("weather?")];
+        let out = render_chat_prompt(&messages, &[weather_tool_def()], false, Some(tmpl)).unwrap();
+        assert_eq!(out, "TOOLS=get_weather U=weather?");
+    }
+
     #[test]
     fn render_chat_prompt_user_only_emits_closed_think_when_disabled() {
         // enable_thinking=false (the default) MUST emit the closed empty-think
         // tail, byte-identical to the pre-reasoning-control behaviour.
         let messages = vec![user_msg("Hello")];
-        let out = render_chat_prompt(&messages, &[], false).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, None).unwrap();
         // CLI's `apply_chat_template_with_system("Hello", None)` for qwen35
         // post- produces exactly this string (see crates/lumen-cli
         // /src/tokenize.rs:273-292).
@@ -1257,7 +1705,7 @@ mod tests {
         // enable_thinking=true MUST emit the OPEN `<think>\n` tail so the
         // model produces a reasoning trace.
         let messages = vec![user_msg("Hello")];
-        let out = render_chat_prompt(&messages, &[], true).unwrap();
+        let out = render_chat_prompt(&messages, &[], true, None).unwrap();
         let expected = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n";
         assert_eq!(
             out, expected,
@@ -1268,7 +1716,7 @@ mod tests {
     #[test]
     fn render_chat_prompt_system_plus_user_emits_closed_think_when_disabled() {
         let messages = vec![system_msg("You are helpful."), user_msg("Hi")];
-        let out = render_chat_prompt(&messages, &[], false).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, None).unwrap();
         let expected = "<|im_start|>system\nYou are helpful.<|im_end|>\n\
                         <|im_start|>user\nHi<|im_end|>\n\
                         <|im_start|>assistant\n<think>\n\n</think>\n\n";
@@ -1281,7 +1729,7 @@ mod tests {
     #[test]
     fn render_chat_prompt_system_plus_user_emits_open_think_when_enabled() {
         let messages = vec![system_msg("You are helpful."), user_msg("Hi")];
-        let out = render_chat_prompt(&messages, &[], true).unwrap();
+        let out = render_chat_prompt(&messages, &[], true, None).unwrap();
         let expected = "<|im_start|>system\nYou are helpful.<|im_end|>\n\
                         <|im_start|>user\nHi<|im_end|>\n\
                         <|im_start|>assistant\n<think>\n";
@@ -1297,7 +1745,7 @@ mod tests {
         // appear ONLY at the final assistant prefix, NOT at the previous
         // assistant turn (which carries real content).
         let messages = vec![user_msg("Q1"), assistant_msg("A1"), user_msg("Q2")];
-        let out = render_chat_prompt(&messages, &[], false).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, None).unwrap();
         let expected = "<|im_start|>user\nQ1<|im_end|>\n\
                         <|im_start|>assistant\nA1<|im_end|>\n\
                         <|im_start|>user\nQ2<|im_end|>\n\
@@ -1316,7 +1764,7 @@ mod tests {
         // (The unit test in tokenize.rs guards the CLI side; this guards
         // the server side; they must produce byte-identical strings.)
         let messages = vec![user_msg("Hello")];
-        let server_out = render_chat_prompt(&messages, &[], false).unwrap();
+        let server_out = render_chat_prompt(&messages, &[], false, None).unwrap();
         let cli_out = format!(
             "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
             prompt = "Hello"

@@ -1692,19 +1692,6 @@ fn print_generated_text(
             .copied()
             .filter(|t| !stop_ids.contains(t))
             .collect();
-        // Diagnostic (default OFF): dump raw generated token ids plus the
-        // per-id decoded byte string, so a model-decode degenerate token
-        // (e.g. an extra "lication" id) is distinguishable from any
-        // detokenizer effect. The streaming detok is a pure per-id byte
-        // concat, so a doubled sub-word here means the model emitted it.
-        if std::env::var("LUMEN_DUMP_TOKEN_IDS").is_ok() {
-            eprintln!("[DUMP_TOKEN_IDS] count={}", clean.len());
-            eprintln!("[DUMP_TOKEN_IDS] ids={clean:?}");
-            for &id in &clean {
-                let frag = String::from_utf8_lossy(&tok.decode_bytes(&[id])).to_string();
-                eprintln!("[DUMP_TOKEN_IDS] id={id} frag={frag:?}");
-            }
-        }
         let text = tok.decode(&clean);
         if !enable_thinking {
             // F8: strip `<tool_call>...</tool_call>` blocks from stdout via the
@@ -1994,8 +1981,8 @@ fn run_with_async(
 
     // feed the LBC-resolved dense quant into the runtime
     // defaults registry BEFORE the backend is constructed so the cached
-    // `LUMEN_CUDA_BF16_GEMMEX` / `LUMEN_CUDA_DECODE_GRAPH*` resolvers
-    // observe the model-aware default on their first read. CLI path stays
+    // `LUMEN_CUDA_BF16_GEMMEX` resolver observes the model-aware default on
+    // its first read. CLI path stays
     // on `set_path_is_server(false)` (set in `main`) so the decode-delay
     // default remains 0 µs — CLI is fork-deterministic.
     lumen_runtime::runtime_defaults::set_model_dense_quant(provider.output_proj_quant);
@@ -2267,6 +2254,23 @@ fn run_with_mmap(
     session_flags: &SessionFlags,
     enable_thinking: bool,
 ) {
+    // Metal + mmap provider: default the no-copy unified-buffer residency path
+    // ON (`LUMEN_METAL_MMAP_ONLY=1`), aligning the CLI with `lumen-server`
+    // (see its provider-selection block). This skips the redundant CPU staging
+    // copy + GPU private blit at load (MoE-Q8 load peak: ~75 GB -> ~12.6 GB,
+    // which OOM-killed the legacy path on 96 GB hosts) and is proven
+    // byte-identical to the copy path (`metal_sync_mmap_argmax_parity_test`;
+    // R6/R10 A/B). An explicit operator value (e.g. `LUMEN_METAL_MMAP_ONLY=0`)
+    // still wins because we only set the env when unset; `--sync` keeps the
+    // legacy full-copy provider path (`run_with_sync`). Set BEFORE the
+    // provider/backend so the `gpu_resident.rs` preload probe sees it.
+    if use_metal && std::env::var_os("LUMEN_METAL_MMAP_ONLY").is_none() {
+        // SAFETY: single-threaded at this point in CLI boot (no worker threads
+        // spawned yet), mirroring the identical set in `lumen-server`.
+        unsafe {
+            std::env::set_var("LUMEN_METAL_MMAP_ONLY", "1");
+        }
+    }
     let mmap_config = MmapConfig {
         prefetch_window: 2,
         advise_sequential: true,
@@ -2347,9 +2351,16 @@ fn run_with_mmap(
             provider.final_norm.clone(),
             provider.output_proj.clone(),
         );
+        // The BF16 lm_head weight is stored bf16 (2 bytes/elem) on disk, and the
+        // bf16 output_proj GPU buffer + fused-RMSNorm bf16 matvec are fully wired
+        // (init + decode). Bf16 was missing from this raw fast-path allow-list, so
+        // it silently fell back to the F32-upcast lm_head (4 GB streamed/token via
+        // matmul_f32_deferred, plus an ~86 GB copy-load peak). Admitting Bf16 routes
+        // it to the native bf16 path — numerically identical (same weight values),
+        // half the lm_head byte traffic, and a ~22 GB copy-load peak.
         if matches!(
             provider.output_proj_quant,
-            QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16
+            QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
         ) && !provider.output_proj_raw.is_empty()
         {
             if verbose {

@@ -627,6 +627,18 @@ kernel void ffn_fused_gate_up_swiglu_f16_deferred(
 // Eliminates 128 KB logits readback -- only 4 bytes (u32 token ID) returned.
 //
 // Launch: 1 threadgroup, 256 threads.
+//
+// TIE SEMANTICS (CORR-011): on exact-equal values this kernel selects the LOWEST
+// GLOBAL index -- aligned with the CPU `argmax` (sampling.rs) and the CUDA
+// `argmax_f32` kernel (argmax.cu). The per-thread strided scan keeps the smaller
+// index (strict `>` over increasing `i`); the simd + cross-simdgroup reductions
+// break value-ties by min index. "max value, then min index" is an associative +
+// commutative reduction operator, so the result is the global (max-value,
+// min-index) pair regardless of stride/lane assignment. The two-pass tiled kernel
+// below reproduces this via the same total order (`argmax_tiled_beats`). NaN is
+// never selected (`>` and `==` are false for NaN). This divergence from the prior
+// (i mod 256, i) order is unobservable in real decode (exact f32 logit ties
+// essentially never occur).
 // ============================================================================
 
 kernel void argmax(
@@ -646,11 +658,15 @@ kernel void argmax(
         if (v > max_val) { max_val = v; max_idx = i; }
     }
 
-    // SIMD reduction (32-wide on Apple Silicon)
+    // SIMD reduction (32-wide on Apple Silicon). Lowest-index tie-break: on an
+    // equal max value keep the SMALLER index (CORR-011). "max value, then min
+    // index" is associative+commutative, so lane 0 converges to the global pair.
     for (uint offset = 16; offset > 0; offset >>= 1) {
         float other_val = simd_shuffle_down(max_val, offset);
         uint other_idx = simd_shuffle_down(max_idx, offset);
-        if (other_val > max_val) { max_val = other_val; max_idx = other_idx; }
+        if (other_val > max_val || (other_val == max_val && other_idx < max_idx)) {
+            max_val = other_val; max_idx = other_idx;
+        }
     }
 
     // Cross-simdgroup reduction via threadgroup memory
@@ -662,12 +678,15 @@ kernel void argmax(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Thread 0 does final serial reduction across 8 simdgroups
+    // Thread 0 does final serial reduction across 8 simdgroups (same lowest-index
+    // tie-break: keep the smaller index on an equal max value).
     if (tid == 0) {
         float best = tg_vals[0];
         uint best_idx = tg_idxs[0];
         for (uint i = 1; i < 8; i++) {
-            if (tg_vals[i] > best) { best = tg_vals[i]; best_idx = tg_idxs[i]; }
+            if (tg_vals[i] > best || (tg_vals[i] == best && tg_idxs[i] < best_idx)) {
+                best = tg_vals[i]; best_idx = tg_idxs[i];
+            }
         }
         result[0] = best_idx;
     }
@@ -681,33 +700,31 @@ kernel void argmax(
 //
 // EXACTNESS (hard requirement): the selected token is BIT-IDENTICAL to the
 // single-TG `argmax` for EVERY input, including exact ties, +/-Inf, NaN, and the
-// all-(-Inf) case. The single-TG kernel's effective selection — derived from its
-// 256-wide stride + strict `>` in the per-thread scan, the simd_shuffle_down
-// reduction (lower lane wins on tie) and the serial cross-simdgroup scan (lower
-// group wins on tie) — is exactly:
-//     winner = argmin, over { i : logits[i] == globalmax }, of the key (i % 256, i)
-// i.e. among all indices holding the maximum value, the one whose (index mod 256)
-// is smallest, breaking further ties by smallest index. Both passes below compare
-// with that SAME strict total order via `argmax_tiled_beats` (value DESC, then
-// (i & 255) ASC, then i ASC). Because that order is a pure function of the index,
-// the global winner is INDEPENDENT of how the logits are tiled/strided, so the
-// two-pass result equals the single-TG result on every input. NaN never wins
-// (both `>` and `==` are false for NaN, exactly as the single-TG `>` does); when
-// nothing beats the -INFINITY sentinel (all -Inf / all NaN) the result is 0,
+// all-(-Inf) case. Both kernels now select the LOWEST GLOBAL index on a value
+// tie (CORR-011): the single-TG kernel's per-thread scan keeps the smaller index
+// (strict `>` over increasing `i`) and its simd/cross-simdgroup reductions break
+// value-ties by min index, giving:
+//     winner = argmin, over { i : logits[i] == globalmax }, of i
+// i.e. among all indices holding the maximum value, the smallest index. Both
+// passes below compare with that SAME strict total order via `argmax_tiled_beats`
+// (value DESC, then GLOBAL index ASC). Because that order is a pure function of
+// the index, the global winner is INDEPENDENT of how the logits are tiled/strided,
+// so the two-pass result equals the single-TG result on every input. NaN never
+// wins (both `>` and `==` are false for NaN, exactly as the single-TG `>` does);
+// when nothing beats the -INFINITY sentinel (all -Inf / all NaN) the result is 0,
 // matching the single-TG kernel's untouched `max_idx = 0`.
 //
 // tile_size = ceil(n / num_tiles); TG g owns [g*tile_size, min((g+1)*tile_size, n)).
 // ============================================================================
 
 // Strict composite tie-break: does candidate (vb, ib) beat the current (va, ia)?
+// Total order = value DESC, then GLOBAL index ASC (lowest index wins ties,
+// CORR-011). This is a pure function of the index, so the winner is independent
+// of how the logits are tiled/strided -- the two-pass result equals the
+// single-TG result on every input (both select the global (max, min-index)).
 inline bool argmax_tiled_beats(float vb, uint ib, float va, uint ia) {
     if (vb > va) return true;
-    if (vb == va) {
-        uint rb = ib & 255u;
-        uint ra = ia & 255u;
-        if (rb < ra) return true;
-        if (rb == ra && ib < ia) return true;
-    }
+    if (vb == va && ib < ia) return true;
     return false;
 }
 

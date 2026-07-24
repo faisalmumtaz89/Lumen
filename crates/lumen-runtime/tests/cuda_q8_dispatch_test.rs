@@ -126,8 +126,18 @@ fn dequant_layer_to_f32(
         in_d: usize,
     ) -> Result<TensorSlice, RuntimeError> {
         let raw = view.subtensor_bytes(slice)?;
-        let f32_vals = dequant_q8_0_to_f32(raw, out_d, in_d);
-        let f32_bytes: Vec<u8> = f32_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // The generator may emit some projections as F32 rather than Q8_0 (e.g. a
+        // small [64,64] weight → 16384 F32 bytes, not 4352 Q8_0 bytes). Dequant only
+        // genuine Q8_0 bytes; pass F32 through verbatim so the CPU reference weight
+        // matches whatever quant the model actually stored.
+        let f32_bytes: Vec<u8> = match slice.quant {
+            QuantScheme::Q8_0 => dequant_q8_0_to_f32(raw, out_d, in_d)
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            QuantScheme::F32 => raw.to_vec(),
+            other => panic!("dequant_layer_to_f32: unexpected quant {other:?}"),
+        };
         let len = f32_bytes.len() as u64;
         let ts = TensorSlice {
             offset: *offset,

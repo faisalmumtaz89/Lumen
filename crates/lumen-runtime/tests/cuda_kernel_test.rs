@@ -605,7 +605,7 @@ fn cpu_rope_apply(vec: &mut [f32], pos: usize, num_heads: usize, head_dim: usize
 /// Launch the rope_apply kernel on both Q and K vectors.
 ///
 /// The CUDA kernel signature is:
-///   rope_apply(q, k, pos, num_q_heads, num_kv_heads, head_dim, theta_base)
+///   rope_apply(q, k, pos, num_q_heads, num_kv_heads, head_dim, theta_base, rotary_dim)
 /// It processes both Q and K in a single launch, computing cos/sin internally.
 fn run_rope_kernel(
     ctx: &std::sync::Arc<CudaContext>,
@@ -625,6 +625,15 @@ fn run_rope_kernel(
 
     let mut q_gpu = stream.clone_htod(q).unwrap();
     let mut k_gpu = stream.clone_htod(k).unwrap();
+
+    // The production `rope_apply` kernel takes a trailing `rotary_dim` parameter
+    // (partial-RoPE support for Qwen3.5: rotary_dim=64 of head_dim=256). These tests
+    // exercise full rotation, so pass `rotary_dim = head_dim` (the kernel treats
+    // rotary_dim==head_dim identically to the pre-parameter "full head_dim" behavior
+    // and to the CPU reference `cpu_rope_apply`). Omitting this arg makes cuLaunchKernel
+    // fail with CUDA_ERROR_INVALID_VALUE (kernel expects 8 params, launch pushed 7),
+    // which poisons the CUDA context and SIGSEGVs the next test in the binary.
+    let rotary_dim: u32 = head_dim;
 
     let half_dim = head_dim / 2;
     let total_q_pairs = num_q_heads * half_dim;
@@ -648,6 +657,7 @@ fn run_rope_kernel(
             .arg(&num_kv_heads)
             .arg(&head_dim)
             .arg(&theta)
+            .arg(&rotary_dim)
             .launch(cfg)
     }
     .unwrap();

@@ -128,6 +128,12 @@ fn run_cublas_gemv_residual(
 }
 
 /// Assert two vectors match within tolerance, with descriptive error messages.
+///
+/// `tol` is applied per element scaled by magnitude: |a-b| <= tol * max(1, |a|, |b|).
+/// A raw absolute bound is wrong here: these are dot products over 4096-11008
+/// elements with accumulations of magnitude ~1e3, and the two implementations
+/// (custom kernel vs cuBLAS) sum in different orders, so agreement beyond
+/// ~1e-7 relative (f32 epsilon) cannot be asserted.
 fn assert_close(label: &str, a: &[f32], b: &[f32], tol: f32) {
     assert_eq!(
         a.len(),
@@ -136,18 +142,19 @@ fn assert_close(label: &str, a: &[f32], b: &[f32], tol: f32) {
         a.len(),
         b.len()
     );
-    let mut max_diff = 0.0f32;
+    let mut max_rel = 0.0f32;
     let mut max_idx = 0;
     for i in 0..a.len() {
-        let diff = (a[i] - b[i]).abs();
-        if diff > max_diff {
-            max_diff = diff;
+        let scale = 1.0f32.max(a[i].abs()).max(b[i].abs());
+        let rel = (a[i] - b[i]).abs() / scale;
+        if rel > max_rel {
+            max_rel = rel;
             max_idx = i;
         }
     }
     assert!(
-        max_diff <= tol,
-        "{label}: max_diff={max_diff} at [{max_idx}] (custom={}, cublas={}, tol={tol})",
+        max_rel <= tol,
+        "{label}: max_rel_diff={max_rel} at [{max_idx}] (custom={}, cublas={}, tol={tol})",
         a[max_idx],
         b[max_idx],
     );

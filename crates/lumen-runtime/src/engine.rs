@@ -288,38 +288,9 @@ impl InferenceEngine {
             // Batched prefill: single GPU dispatch for all prompt tokens.
             // prefill() advances kv.seq_len() internally -- do NOT advance here.
             let last_hidden = backend.prefill(prompt_tokens, weights, &mut kv)?;
-            if std::env::var("LUMEN_PREFILL_DEBUG").is_ok() {
-                let n = prompt_tokens.len();
-                let head: Vec<u32> = prompt_tokens.iter().take(12).copied().collect();
-                let tail: Vec<u32> = prompt_tokens.iter().rev().take(6).rev().copied().collect();
-                let hsum: f64 = last_hidden.iter().map(|&v| v as f64).sum();
-                let hmin = last_hidden.iter().cloned().fold(f32::INFINITY, f32::min);
-                let hmax = last_hidden
-                    .iter()
-                    .cloned()
-                    .fold(f32::NEG_INFINITY, f32::max);
-                eprintln!(
-                    "[prefill-debug] generate prompt_len={n} head={head:?} tail={tail:?} hidden_len={} hidden_sum={hsum:.4} hidden_min={hmin:.4} hidden_max={hmax:.4}",
-                    last_hidden.len()
-                );
-            }
             let mut current_x = ActivationBuffer::zeros(last_hidden.len(), ComputeDtype::F32);
             current_x.write_f32_from(&last_hidden);
-            let lg = backend.compute_final(&current_x)?;
-            if std::env::var("LUMEN_PREFILL_DEBUG").is_ok() {
-                let argmax = lg
-                    .data
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                eprintln!(
-                    "[prefill-debug] generate first_logits_argmax={argmax} logit_val={:.4}",
-                    lg.data.get(argmax).copied().unwrap_or(0.0)
-                );
-            }
-            lg
+            backend.compute_final(&current_x)?
         } else {
             // Token-at-a-time prefill: forward_pass() does NOT advance kv.seq_len(),
             // so we advance after each token.
@@ -358,30 +329,7 @@ impl InferenceEngine {
         // logits readback) so the penalty can be applied on CPU.
         let use_gpu_greedy = use_gpu_greedy_predicate(sampling, caps.gpu_resident, caps.gpu_argmax);
 
-        // DIAGNOSTIC (env LUMEN_FORCE_PREFILL_DECODE=1, default OFF): generate
-        // every subsequent token by re-prefilling the full sequence from scratch
-        // (fresh KV + reset recurrent state) via the batched prefill path only --
-        // `decode_token` is never called. Isolates whether the prefill path is a
-        // coherent generator vs. the single-token decode path (CUDA MoE-35B
-        // router-flip root cause). Remove before commit.
-        let force_prefill_decode =
-            std::env::var("LUMEN_FORCE_PREFILL_DECODE").as_deref() == Ok("1");
-
-        if force_prefill_decode {
-            while !stop.should_stop(next_token, generated_tokens.len()) {
-                let mut full: Vec<u32> = prompt_tokens.to_vec();
-                full.extend_from_slice(&generated_tokens);
-                kv.truncate_to(0);
-                backend.reset_recurrent_state();
-                let last_hidden = backend.prefill(&full, weights, &mut kv)?;
-                let mut cx = ActivationBuffer::zeros(last_hidden.len(), ComputeDtype::F32);
-                cx.write_f32_from(&last_hidden);
-                logits = backend.compute_final(&cx)?;
-                next_token =
-                    sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
-                generated_tokens.push(next_token);
-            }
-        } else if use_gpu_greedy {
+        if use_gpu_greedy {
             // GPU-RESIDENT GREEDY fast path: argmax on GPU, 4-byte readback.
             // decode_token_greedy() advances kv.seq_len() internally.
             while !stop.should_stop(next_token, generated_tokens.len()) {
@@ -421,62 +369,13 @@ impl InferenceEngine {
                 sampler_state.record(next_token);
                 generated_tokens.push(next_token);
             }
-        } else if caps.gpu_resident && backend.supports_async_decode() {
-            // [Option B] Deferred-async-commit sampled-decode driver
-            // (LUMEN_METAL_DECODE_ASYNC_COMMIT=1). Same token threading + contract
-            // as the synchronous gpu_resident path below (decode_token_async
-            // returns THIS token's logits and advances kv.seq_len() internally),
-            // but the backend commits each CB asynchronously and waits it via the
-            // split commit()/wait_until_completed() pair. A trailing flush drains
-            // any CB still in flight (no-op in the current always-wait form; kept
-            // for safety if the wait is later moved off the critical path).
-            while !stop.should_stop(next_token, generated_tokens.len()) {
-                logits = backend.decode_token_async(next_token, weights, &mut kv)?;
-                next_token =
-                    sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
-                generated_tokens.push(next_token);
-            }
-            let _ = backend.decode_flush_async();
         } else if caps.gpu_resident {
             // GPU-RESIDENT fast path: single command buffer per token.
             // decode_token() advances kv.seq_len() internally.
-            // DIAGNOSTIC (env LUMEN_METAL_SAMPLE_PROBE=1, default OFF): time the
-            // pure CPU sampler (`sample_token_with_state`, which consumes the
-            // already-read-back logits vec) separately from `decode_token`, and
-            // print the mean every 64 tokens. This isolates the SERIAL CPU-sampler
-            // cost — the ceiling-limiter for any deferred-async-commit overlap of
-            // the sampled decode path. No effect on sampled output (read-only).
-            let sample_probe = std::env::var("LUMEN_METAL_SAMPLE_PROBE").as_deref() == Ok("1");
-            let mut sp_sum = 0.0f64;
-            let mut sp_n: u64 = 0;
             while !stop.should_stop(next_token, generated_tokens.len()) {
                 logits = backend.decode_token(next_token, weights, &mut kv)?;
-                if sample_probe {
-                    let t = Instant::now();
-                    next_token = sample_token_with_state(
-                        &mut logits,
-                        sampling,
-                        &mut sampler_state,
-                        &mut rng,
-                    );
-                    sp_sum += t.elapsed().as_secs_f64();
-                    sp_n += 1;
-                    if sp_n >= 64 {
-                        eprintln!(
-                            "[sample-probe] over {sp_n} tokens: CPU_sampler={:.3} ms/tok",
-                            sp_sum / sp_n as f64 * 1000.0
-                        );
-                        sp_sum = 0.0;
-                        sp_n = 0;
-                    }
-                } else {
-                    next_token = sample_token_with_state(
-                        &mut logits,
-                        sampling,
-                        &mut sampler_state,
-                        &mut rng,
-                    );
-                }
+                next_token =
+                    sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
                 generated_tokens.push(next_token);
             }
         } else {

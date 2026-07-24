@@ -235,8 +235,7 @@ mod cached_sel {
 
     // -- MTLSharedEvent (cross-queue GPU↔GPU synchronization) --
     //
-    // Used by the dual-queue GDN branch-overlap path
-    // (`LUMEN_METAL_GDN_DUAL_QUEUE=1`). `newSharedEvent` allocates a
+    // `newSharedEvent` allocates a
     // device-shared event whose 64-bit `signaledValue` is monotonically
     // advanced by `encodeSignalEvent:value:` on a producer command buffer
     // and waited on by `encodeWaitForEvent:value:` on a consumer command
@@ -804,15 +803,6 @@ impl MetalCommandQueue {
             })
         }
     }
-
-    /// Raw Objective-C id for this queue. Exposed for the MPSGraph
-    /// path (`mps_graph_ffi.rs`) which needs the underlying
-    /// `id<MTLCommandQueue>` to pass into MPSGraph's
-    /// `runWithMTLCommandQueue:` API.
-    #[inline]
-    pub(crate) fn raw(&self) -> ObjcId {
-        self.raw
-    }
 }
 
 impl Drop for MetalCommandQueue {
@@ -934,38 +924,17 @@ impl MetalCommandBuffer {
         // Close the in-flight CB. The encoder has already had end_encoding()
         // called by the prior call site.
         //
-        // DEFER MODE (LUMEN_METAL_PROFILE_GDN_DEFER=1): commit
-        // WITHOUT waiting. Metal executes CBs on one queue in FIFO commit
-        // order, so the next CB's reads see this CB's writes (ordering/RAW
-        // correctness preserved) — but no per-CB GPU-idle is injected. Retain
-        // the CB and register its ptr for a single deferred GPU-time read at
-        // prefill end. This removes the bogus drain/refill bubble that the
-        // legacy per-CB wait charged to dependency-tail kernels (the ssm_out
-        // 40ms artifact). `drain_deferred_cbs` (called at prefill end) waits
-        // once and reads every CB's GPUEndTime-GPUStartTime.
-        //
-        // LEGACY MODE (LUMEN_METAL_PROFILE_GDN=1 without DEFER): commit + wait
-        // each CB, read its GPU wall immediately. Kept for A/B of the method.
-        if super::profile::is_defer_enabled() {
-            // Commit (no wait). Transfer the wrapper's existing +1 reference to
-            // the deferred registry (do NOT release here); `drain_deferred_cbs`
-            // reads its GPU time and releases it after the single final wait.
-            unsafe {
-                msg_send_0_raw(cur, cached_sel::commit());
-            }
-            super::profile::register_deferred_cb(cur as usize);
-            super::profile::record_section_end();
-        } else {
-            unsafe {
-                msg_send_0_raw(cur, cached_sel::commit());
-                msg_send_0_raw(cur, cached_sel::wait_until_completed());
-                let start = msg_send_0_f64(cur, cached_sel::gpu_start_time());
-                let end = msg_send_0_f64(cur, cached_sel::gpu_end_time());
-                super::profile::record_section_gpu_time((end - start).max(0.0));
-                release(cur);
-            }
-            super::profile::record_section_end();
+        // Commit + wait each CB, read its GPU wall (GPUEndTime-GPUStartTime)
+        // immediately for the per-section GPU-time census.
+        unsafe {
+            msg_send_0_raw(cur, cached_sel::commit());
+            msg_send_0_raw(cur, cached_sel::wait_until_completed());
+            let start = msg_send_0_f64(cur, cached_sel::gpu_start_time());
+            let end = msg_send_0_f64(cur, cached_sel::gpu_end_time());
+            super::profile::record_section_gpu_time((end - start).max(0.0));
+            release(cur);
         }
+        super::profile::record_section_end();
 
         // Allocate a fresh CB from the parent queue.
         let fresh = unsafe { msg_send_0_raw(q, cached_sel::command_buffer()) };
@@ -1107,92 +1076,6 @@ impl MetalCommandBuffer {
             msg_send_0_raw(self.raw(), cached_sel::wait_until_completed());
         }
     }
-
-    /// Returns the raw `MTLCommandBuffer` Objective-C handle.
-    ///
-    /// Exposed only for the optional MPSGraph BF16 GEMM path
-    /// (`mps_graph_ffi.rs`). The returned pointer is **not** retained
-    /// by the caller; it remains owned by this `MetalCommandBuffer`.
-    #[inline]
-    pub(crate) fn raw_command_buffer(&self) -> *mut c_void {
-        self.raw.load(AOrdering::Relaxed)
-    }
-
-    /// Atomically replace the underlying `MTLCommandBuffer` pointer with
-    /// a new one, releasing the previous handle and retaining the new
-    /// one. Exposed only for the MPSGraph in-CB path — Apple's
-    /// `MPSCommandBuffer.encodeToCommandBuffer:` may internally call
-    /// `commitAndContinue`, committing the original CB and replacing it
-    /// with a fresh one read via `rootCommandBuffer`. The caller must
-    /// re-bind this wrapper to the new CB so subsequent compute
-    /// encoders land on an open (uncommitted) CB.
-    ///
-    /// `new_raw` is treated as a `+0` (autoreleased) source and is
-    /// retained inside; the previously held CB is released — its GPU
-    /// work is already committed by MPSGraph by the time we get here,
-    /// so dropping our Rust handle does not abort in-flight work.
-    #[inline]
-    pub(crate) fn replace_raw_command_buffer(&self, new_raw: *mut c_void) {
-        unsafe {
-            if new_raw.is_null() {
-                return;
-            }
-            retain(new_raw);
-            let prev = self.raw.swap(new_raw, AOrdering::Relaxed);
-            if !prev.is_null() {
-                release(prev);
-            }
-        }
-    }
-
-    /// Commit the in-flight CB, wait for GPU completion, then atomically
-    /// swap in a fresh CB allocated from `queue`. Provided for the
-    /// alternative MPSGraph BF16 GEMM path (`mps_graph_ffi.rs`) that
-    /// drains Lumen's encoded work before MPSGraph reads from the same
-    /// buffers on its own queue. The default in-CB path
-    /// (`encode_bf16_matmul_into_cb`) does not need this drain;
-    /// kept here as `#[allow(dead_code)]` because the alternative path
-    /// is wired up env-OFF and may be revisited in a future revision.
-    ///
-    /// `unretained` should match how the original CB was created: if
-    /// the caller wants the new CB to skip resource retain/release
-    /// (matching `LUMEN_METAL_UNRETAINED_CMDBUFS=1`), pass `true`.
-    #[allow(dead_code)]
-    pub(crate) fn commit_and_swap_to_fresh(
-        &self,
-        queue: &MetalCommandQueue,
-        unretained: bool,
-    ) -> Result<(), String> {
-        unsafe {
-            let prev = self.raw.load(AOrdering::Relaxed);
-            if prev.is_null() {
-                return Err(
-                    "MetalCommandBuffer::commit_and_swap_to_fresh: prior CB is null".into(),
-                );
-            }
-            msg_send_0_raw(prev, cached_sel::commit());
-            msg_send_0_raw(prev, cached_sel::wait_until_completed());
-
-            let sel = if unretained {
-                cached_sel::command_buffer_with_unretained_references()
-            } else {
-                cached_sel::command_buffer()
-            };
-            let fresh = msg_send_0_raw(queue.raw, sel);
-            if fresh.is_null() {
-                return Err(
-                    "MetalCommandBuffer::commit_and_swap_to_fresh: fresh CB alloc returned null"
-                        .into(),
-                );
-            }
-            // `commandBuffer` / unretained variants return autoreleased
-            // — retain for our wrapper's ownership.
-            retain(fresh);
-            self.raw.store(fresh, AOrdering::Relaxed);
-            release(prev);
-            Ok(())
-        }
-    }
 }
 
 impl Drop for MetalCommandBuffer {
@@ -1216,39 +1099,6 @@ impl Drop for MetalCommandBuffer {
 // &self; ordering is the caller's responsibility) is preserved.
 unsafe impl Send for MetalCommandBuffer {}
 unsafe impl Sync for MetalCommandBuffer {}
-
-/// Drain the deferred per-CB GPU-time registry (commit-all-wait-once
-/// census). Called once at prefill end in defer mode. Waits on the LAST
-/// committed split CB (which, on a single FIFO queue, implies all prior CBs
-/// completed), then reads each CB's `GPUEndTime - GPUStartTime`, attributes it
-/// to its recorded section label, and releases the CB (the registry owns the
-/// wrapper's original +1). No-op when the registry is empty / profiling off.
-///
-/// This is the contamination-free per-kernel census WITHOUT the per-CB-wait
-/// idle confound: kernels run back-to-back on the GPU (no forced drain between
-/// dispatches), so each CB's GPU wall is its true serial service time. The
-/// sum is additive to a serial schedule; compare to production single-CB
-/// gpu_busy for the overlap credit (two-metric model).
-pub(crate) fn drain_deferred_cbs() {
-    let cbs = super::profile::take_deferred_cbs();
-    if cbs.is_empty() {
-        return;
-    }
-    unsafe {
-        // Wait on the last committed CB; FIFO single-queue ⇒ all prior done.
-        let (last_ptr, _) = cbs[cbs.len() - 1];
-        let last = last_ptr as ObjcId;
-        msg_send_0_raw(last, cached_sel::wait_until_completed());
-        // Read each CB's GPU wall, attribute to its label, release it.
-        for (ptr, label) in cbs {
-            let cb = ptr as ObjcId;
-            let start = msg_send_0_f64(cb, cached_sel::gpu_start_time());
-            let end = msg_send_0_f64(cb, cached_sel::gpu_end_time());
-            super::profile::record_section_gpu_time_for(label, (end - start).max(0.0));
-            release(cb);
-        }
-    }
-}
 
 // ============================================================================
 // MetalBlitEncoder -- wraps MTLBlitCommandEncoder
