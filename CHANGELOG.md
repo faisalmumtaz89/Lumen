@@ -7,6 +7,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-25
+
+### Added
+
+- **Native Qwen3.5 tool-calling.** The server renders the model's embedded chat
+  template and parses its native `<function=…><parameter=…>` tool-call protocol
+  (the legacy JSON-in-`<tool_call>` form is still accepted), on both the OpenAI
+  (`/v1/chat/completions`) and Anthropic (`/v1/messages`) wire APIs, in default
+  and thinking modes.
+- OpenAI `stream_options.include_usage`: streaming chat completions emit a final
+  usage chunk (prompt/completion token counts) before `[DONE]` when requested.
+
+### Fixed
+
+- Corrected a wrong long-prompt answer caused by low-precision attention scores:
+  prefill attention now defaults to exact-F32 (QK^T and P@V). The change is
+  decode-neutral — its cost is confined to prefill.
+- Anthropic streaming now reports `stop_reason: "tool_use"` on tool-call turns.
+- `/v1/completions` returns the decoded model text verbatim (it no longer strips
+  tool-call blocks from the raw stream).
+- `top_k=1` sampling breaks exact ties to the lowest-index token, matching greedy
+  argmax.
+
+### Performance
+
+- CUDA and Metal decode-throughput optimizations across the dense, quantized, and
+  MoE paths, plus a byte-identical duplicate-QKV-projection elimination.
+
+### Removed
+
+- Retired dead/no-op diagnostic environment flags and their unused kernels
+  (env-flag surface cleanup).
+
 ## [0.4.0] — 2026-07-08
 
 ### Performance
@@ -105,7 +138,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.4.0...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.1.0...v0.2.0
