@@ -80,10 +80,16 @@ fn tojson_filter(value: Value) -> Result<Value, minijinja::Error> {
     let mut buf = Vec::new();
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, PyJsonFormatter);
     value.serialize(&mut ser).map_err(|e| {
-        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, format!("tojson: {e}"))
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!("tojson: {e}"),
+        )
     })?;
     let s = String::from_utf8(buf).map_err(|e| {
-        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, format!("tojson utf8: {e}"))
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!("tojson utf8: {e}"),
+        )
     })?;
     Ok(Value::from_safe_string(s))
 }
@@ -264,7 +270,10 @@ mod tests {
         // `| trim` strips leading/trailing whitespace — the exact behaviour the
         // hard-coded renderer lacked (§2H u_code / u_whitespace).
         let out = render_single_turn(MINI_TMPL, None, "   spaced   ", false).unwrap();
-        assert!(out.starts_with("<|im_start|>user\nspaced<|im_end|>\n"), "got: {out:?}");
+        assert!(
+            out.starts_with("<|im_start|>user\nspaced<|im_end|>\n"),
+            "got: {out:?}"
+        );
     }
 
     #[test]
@@ -296,7 +305,8 @@ mod tests {
         // `.startswith` / `.split` come from minijinja-contrib pycompat; the real
         // Qwen3.5 template uses them (tool-response detection, </think> split).
         let tmpl = "{{- 'yes' if messages[0].content.startswith('<tool_response>') else 'no' }}";
-        let msgs = serde_json::json!([{"role": "user", "content": "<tool_response>x</tool_response>"}]);
+        let msgs =
+            serde_json::json!([{"role": "user", "content": "<tool_response>x</tool_response>"}]);
         let out = render_chat_prompt(tmpl, &msgs, &serde_json::Value::Array(vec![]), false, false)
             .unwrap();
         assert_eq!(out, "yes");

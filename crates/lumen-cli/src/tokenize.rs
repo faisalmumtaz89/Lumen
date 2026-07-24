@@ -372,7 +372,10 @@ impl BpeTokenizer {
         if self.pre_tokenizer == "qwen35" {
             if let Some(tmpl) = self.chat_template.as_deref() {
                 match lumen_runtime::chat_template::render_single_turn(
-                    tmpl, system, prompt, enable_thinking,
+                    tmpl,
+                    system,
+                    prompt,
+                    enable_thinking,
                 ) {
                     Ok(rendered) => return rendered,
                     Err(e) => {

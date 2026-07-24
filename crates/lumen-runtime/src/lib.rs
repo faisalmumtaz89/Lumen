@@ -37,6 +37,7 @@ pub mod weight;
 
 #[cfg(target_os = "macos")]
 pub use accelerate::AccelerateBatchBackend;
+pub use chat_template::{render_chat_prompt, ChatTemplateError};
 pub use compute::cpu_naive::NaiveF32Backend;
 pub use compute::cpu_simd::SimdF32Backend;
 pub use compute::ComputeBackend;
@@ -64,7 +65,6 @@ pub use tooling::{
     ReasoningDelta, ReasoningExtractor, StreamingDelta, StreamingFinish, StreamingParser,
     ToolResult, ToolSchema, ToolSchemas, THINK_CLOSE, TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
 };
-pub use chat_template::{render_chat_prompt, ChatTemplateError};
 pub use weight::cache::{CacheStats, LayerView, PrefetchHandle, PrefetchPriority, WeightProvider};
 pub use weight::provider_async::AsyncWeightProvider;
 pub use weight::provider_mmap::MmapWeightProvider;

@@ -1565,7 +1565,11 @@ mod tests {
         // 9B (32-layer) dense: AP=3 scalar regardless of quant.
         reset_for_tests();
         set_model_block_count(32);
-        assert_eq!(attn_precise_default(), 3, "dense 9B (32 layers) -> scalar (AP=3)");
+        assert_eq!(
+            attn_precise_default(),
+            3,
+            "dense 9B (32 layers) -> scalar (AP=3)"
+        );
         reset_for_tests();
         set_model_block_count(32);
         set_model_primary_quant(QuantScheme::Bf16);
@@ -1622,7 +1626,11 @@ mod tests {
         reset_for_tests();
         set_model_block_count(64);
         set_model_is_moe(true);
-        assert_eq!(attn_precise_default(), 3, "MoE -> scalar AP=3 regardless of size");
+        assert_eq!(
+            attn_precise_default(),
+            3,
+            "MoE -> scalar AP=3 regardless of size"
+        );
         reset_for_tests();
         set_model_block_count(64);
         set_model_is_moe(true);

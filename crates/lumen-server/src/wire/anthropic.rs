@@ -146,8 +146,7 @@ impl MessagesRequest {
                 tmpl,
             )?,
             None => {
-                let final_system =
-                    compose_system_with_tools(system_text.as_deref(), &tool_schemas);
+                let final_system = compose_system_with_tools(system_text.as_deref(), &tool_schemas);
                 render_prompt(&final_system, &self.messages, enable_thinking)?
             }
         };
@@ -511,7 +510,14 @@ pub fn stream_messages(
     tool_schemas: Arc<ToolSchemas>,
 ) -> Body {
     let (tx, body_rx) = mpsc::channel::<Vec<u8>>(64);
-    tokio::spawn(drive_messages_stream(rx, tx, model, thinking, stop, tool_schemas));
+    tokio::spawn(drive_messages_stream(
+        rx,
+        tx,
+        model,
+        thinking,
+        stop,
+        tool_schemas,
+    ));
     body_from_byte_stream(body_rx)
 }
 
@@ -990,9 +996,15 @@ mod tests {
         let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
         // Test helper exercises the legacy JSON tool-call path (schemaless); the
         // schema-aware native path is covered by the runtime tests + Modal §2D.
-        collect_messages(pooled, "test".into(), thinking, stop, Arc::new(ToolSchemas::default()))
-            .await
-            .unwrap()
+        collect_messages(
+            pooled,
+            "test".into(),
+            thinking,
+            stop,
+            Arc::new(ToolSchemas::default()),
+        )
+        .await
+        .unwrap()
     }
 
     fn user(text: &str) -> AnthropicMessage {

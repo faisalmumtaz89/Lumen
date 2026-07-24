@@ -194,8 +194,12 @@ impl ChatCompletionRequest {
             ));
         }
         let enable_thinking = self.resolve_thinking();
-        let prompt =
-            render_chat_prompt(&self.messages, &self.tools, enable_thinking, engine.chat_template())?;
+        let prompt = render_chat_prompt(
+            &self.messages,
+            &self.tools,
+            enable_thinking,
+            engine.chat_template(),
+        )?;
         let prompt_tokens = engine.tokenize_for_request(&prompt);
         // Synchronous oversize guard: 400 BEFORE the 200/SSE stream opens.
         super::check_prompt_length(prompt_tokens.len(), engine.context_length())?;
@@ -1138,7 +1142,15 @@ pub async fn collect_chat_from_events_with_stop(
     // Test helper exercises the legacy JSON tool-call path, which parses without
     // schemas; the schema-aware native path is covered by the runtime tooling
     // tests and the Modal §2D gate.
-    collect_chat(pooled, model, created, thinking, stop, Arc::new(ToolSchemas::default())).await
+    collect_chat(
+        pooled,
+        model,
+        created,
+        thinking,
+        stop,
+        Arc::new(ToolSchemas::default()),
+    )
+    .await
 }
 
 pub async fn collect_completion(
@@ -1338,7 +1350,10 @@ mod tests {
         ];
         let sse = stream_openai_to_string(events, false, false).await;
         let mut text = String::new();
-        for frame in sse.split("\n\n").filter_map(|b| b.trim().strip_prefix("data: ")) {
+        for frame in sse
+            .split("\n\n")
+            .filter_map(|b| b.trim().strip_prefix("data: "))
+        {
             if frame == "[DONE]" {
                 continue;
             }
@@ -1348,7 +1363,10 @@ mod tests {
             }
         }
         assert_eq!(text, raw);
-        assert!(!sse.contains("\"usage\""), "legacy surface has no usage chunk");
+        assert!(
+            !sse.contains("\"usage\""),
+            "legacy surface has no usage chunk"
+        );
     }
 
     /// Absent `stream_options.include_usage`, NO usage chunk is emitted — the

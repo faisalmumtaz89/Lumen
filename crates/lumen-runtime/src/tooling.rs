@@ -114,7 +114,10 @@ impl ToolSchemas {
 
     /// The declared JSON-Schema `type` of `param` on `func`, if known.
     fn param_type(&self, func: &str, param: &str) -> Option<&str> {
-        self.params.get(func).and_then(|m| m.get(param)).map(String::as_str)
+        self.params
+            .get(func)
+            .and_then(|m| m.get(param))
+            .map(String::as_str)
     }
 
     /// True when no tool schema is known (the parser falls back to the JSON
@@ -619,7 +622,10 @@ pub fn parse_final(assistant_text: &str) -> ParsedAssistant {
 /// Schema-aware [`parse_final`]: types native `<parameter>` values by the
 /// advertised tool schemas so the batch (non-streaming) reconstruction is
 /// byte-identical to the streaming one built with the same `schemas`.
-pub fn parse_final_with_schemas(assistant_text: &str, schemas: Arc<ToolSchemas>) -> ParsedAssistant {
+pub fn parse_final_with_schemas(
+    assistant_text: &str,
+    schemas: Arc<ToolSchemas>,
+) -> ParsedAssistant {
     run_final(assistant_text, StreamingParser::with_schemas(schemas))
 }
 
@@ -748,10 +754,14 @@ fn parse_native_call_body(body: &str, schemas: Option<&ToolSchemas>) -> Option<P
     // nested parser: that carries regression risk for no observed benefit.
     while let Some(p) = rest.find(PARAM_OPEN) {
         let after_open = &rest[p + PARAM_OPEN.len()..];
-        let Some(pname_end) = after_open.find('>') else { break };
+        let Some(pname_end) = after_open.find('>') else {
+            break;
+        };
         let pname = after_open[..pname_end].trim().to_string();
         let value_region = &after_open[pname_end + 1..];
-        let Some(close) = value_region.find(PARAM_CLOSE) else { break };
+        let Some(close) = value_region.find(PARAM_CLOSE) else {
+            break;
+        };
         // The template wraps the value as `>\nVALUE\n</parameter>`; strip the one
         // leading and one trailing newline it adds, preserving VALUE's interior.
         let raw = &value_region[..close];
@@ -1528,7 +1538,7 @@ mod tests {
                 "count":{"type":"integer"},
                 "all_day":{"type":"boolean"}
             }}"#
-                .into(),
+            .into(),
         }
     }
 
@@ -1555,7 +1565,12 @@ mod tests {
         let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
         let emission = native_call(
             "schedule_event",
-            &[("title", "Team Sync"), ("date", "2026-08-01"), ("count", "3"), ("all_day", "true")],
+            &[
+                ("title", "Team Sync"),
+                ("date", "2026-08-01"),
+                ("count", "3"),
+                ("all_day", "true"),
+            ],
         );
         let parsed = parse_final_with_schemas(&emission, schemas);
         assert_eq!(parsed.content, "");
@@ -1615,7 +1630,15 @@ mod tests {
     fn native_schemaless_heuristic_types_composites_and_scalars() {
         // With no schema: `{...}`/`42`/`true` become typed, a bare word stays a
         // string. (The CLI path is schemaless; the server path is schema-aware.)
-        let emission = native_call("f", &[("obj", "{\"a\": 1}"), ("n", "42"), ("b", "true"), ("s", "hello")]);
+        let emission = native_call(
+            "f",
+            &[
+                ("obj", "{\"a\": 1}"),
+                ("n", "42"),
+                ("b", "true"),
+                ("s", "hello"),
+            ],
+        );
         let parsed = parse_final(&emission);
         assert_eq!(
             parsed.tool_calls[0].arguments_json,
@@ -1649,7 +1672,11 @@ mod tests {
             "Sure, scheduling now. {} Done.",
             native_call(
                 "schedule_event",
-                &[("title", "Sync"), ("count", "2"), ("time", r#"{"start": "09:00"}"#)],
+                &[
+                    ("title", "Sync"),
+                    ("count", "2"),
+                    ("time", r#"{"start": "09:00"}"#)
+                ],
             )
         );
 
@@ -1695,7 +1722,10 @@ mod tests {
         let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
         let cap = native_call("schedule_event", &[("title", "Sync"), ("all_day", "True")]);
         let p = parse_final_with_schemas(&cap, schemas.clone());
-        assert_eq!(p.tool_calls[0].arguments_json, r#"{"title":"Sync","all_day":true}"#);
+        assert_eq!(
+            p.tool_calls[0].arguments_json,
+            r#"{"title":"Sync","all_day":true}"#
+        );
 
         let capf = native_call("schedule_event", &[("all_day", "False")]);
         let pf = parse_final_with_schemas(&capf, schemas.clone());
@@ -1716,7 +1746,10 @@ mod tests {
         let p = parse_final_with_schemas(legacy, schemas);
         assert_eq!(p.tool_calls.len(), 1);
         assert_eq!(p.tool_calls[0].name, "schedule_event");
-        assert_eq!(p.tool_calls[0].arguments_json, "{\"title\": \"Sync\", \"count\": 3}");
+        assert_eq!(
+            p.tool_calls[0].arguments_json,
+            "{\"title\": \"Sync\", \"count\": 3}"
+        );
     }
 
     #[test]
