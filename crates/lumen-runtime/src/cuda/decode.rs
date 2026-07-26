@@ -331,6 +331,9 @@ pub(crate) struct KernelSet {
     pub(crate) gdn_compute_gates_batched: Option<CudaFunction>,
     pub(crate) l2_normalize_qk_strided: Option<CudaFunction>,
     pub(crate) gdn_prefill_fused_v3: Option<CudaFunction>,
+    /// T=1 four-warp CTA grouping of the above. Bit-identical arithmetic;
+    /// 1024 CTAs/layer instead of 4096 single-warp CTAs.
+    pub(crate) gdn_prefill_fused_v3_t1_w4: Option<CudaFunction>,
     pub(crate) gdn_prefill_norm_gate: Option<CudaFunction>,
 
     // GDN F64-internal-accumulator variants (env-gated default OFF via
@@ -1285,6 +1288,11 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         l2_normalize_qk_strided: load_fn(shaders::GDN_KERNEL_SOURCE, "l2_normalize_qk_strided")
             .ok(),
         gdn_prefill_fused_v3: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_fused_v3").ok(),
+        gdn_prefill_fused_v3_t1_w4: load_fn(
+            shaders::GDN_KERNEL_SOURCE,
+            "gdn_prefill_fused_v3_t1_w4",
+        )
+        .ok(),
         gdn_prefill_norm_gate: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_norm_gate").ok(),
         // accumulator variants. Default-OFF; loaded best-effort.
         l2_normalize_qk_strided_f64accum: match load_fn(

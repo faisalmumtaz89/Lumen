@@ -5694,15 +5694,41 @@ impl CudaBackend {
             //    Reads conv_out + alpha_out + beta_out, writes raw_out
             //    (output_buf), updates h_states[gdn_idx] in place.
             {
+                // LUMEN_CUDA_GDN_T1_W4=1: at T=1, group four state columns
+                // into one four-warp CTA (1024 CTAs/layer instead of 4096
+                // single-warp CTAs). Arithmetic is BIT-IDENTICAL — warp w runs
+                // exactly the T=1 tail loop of gdn_prefill_fused_v3 for its own
+                // column — so the parity path's numerics, which have a known
+                // divergence history, are preserved. The recurrence costs
+                // 56.3 us/layer today for ~zero weight bytes: that is launch
+                // and occupancy cost, not bandwidth.
+                let use_t1_w4 = !use_prefill_f64
+                    && batch_u32 == 1
+                    && head_dim_u32 % 4 == 0
+                    && st.kernels.gdn_prefill_fused_v3_t1_w4.is_some()
+                    && matches!(
+                        std::env::var("LUMEN_CUDA_GDN_T1_W4").ok().as_deref(),
+                        Some("1") | Some("true") | Some("yes") | Some("on")
+                    );
                 let state_fn = if use_prefill_f64 {
                     st.kernels.gdn_prefill_fused_v3_f64accum.as_ref().unwrap()
+                } else if use_t1_w4 {
+                    st.kernels.gdn_prefill_fused_v3_t1_w4.as_ref().unwrap()
                 } else {
                     st.kernels.gdn_prefill_fused_v3.as_ref().unwrap()
                 };
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (head_dim_u32, num_heads_u32, 1),
-                    block_dim: (32, 1, 1),
-                    shared_mem_bytes: 0,
+                let launch_cfg = if use_t1_w4 {
+                    CudarcLaunchConfig {
+                        grid_dim: (head_dim_u32 / 4, num_heads_u32, 1),
+                        block_dim: (32, 4, 1),
+                        shared_mem_bytes: 0,
+                    }
+                } else {
+                    CudarcLaunchConfig {
+                        grid_dim: (head_dim_u32, num_heads_u32, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    }
                 };
                 unsafe {
                     self.device
@@ -7032,15 +7058,41 @@ impl CudaBackend {
             // 4. gdn_prefill_fused_v3: warp-parallel fused state update
             // Grid: (val_dim, num_heads), Block: (32, 1, 1)
             {
+                // LUMEN_CUDA_GDN_T1_W4=1: at T=1, group four state columns
+                // into one four-warp CTA (1024 CTAs/layer instead of 4096
+                // single-warp CTAs). Arithmetic is BIT-IDENTICAL — warp w runs
+                // exactly the T=1 tail loop of gdn_prefill_fused_v3 for its own
+                // column — so the parity path's numerics, which have a known
+                // divergence history, are preserved. The recurrence costs
+                // 56.3 us/layer today for ~zero weight bytes: that is launch
+                // and occupancy cost, not bandwidth.
+                let use_t1_w4 = !use_prefill_f64
+                    && batch_u32 == 1
+                    && head_dim_u32 % 4 == 0
+                    && st.kernels.gdn_prefill_fused_v3_t1_w4.is_some()
+                    && matches!(
+                        std::env::var("LUMEN_CUDA_GDN_T1_W4").ok().as_deref(),
+                        Some("1") | Some("true") | Some("yes") | Some("on")
+                    );
                 let state_fn = if use_prefill_f64 {
                     st.kernels.gdn_prefill_fused_v3_f64accum.as_ref().unwrap()
+                } else if use_t1_w4 {
+                    st.kernels.gdn_prefill_fused_v3_t1_w4.as_ref().unwrap()
                 } else {
                     st.kernels.gdn_prefill_fused_v3.as_ref().unwrap()
                 };
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (head_dim_u32, num_heads_u32, 1),
-                    block_dim: (32, 1, 1),
-                    shared_mem_bytes: 0,
+                let launch_cfg = if use_t1_w4 {
+                    CudarcLaunchConfig {
+                        grid_dim: (head_dim_u32 / 4, num_heads_u32, 1),
+                        block_dim: (32, 4, 1),
+                        shared_mem_bytes: 0,
+                    }
+                } else {
+                    CudarcLaunchConfig {
+                        grid_dim: (head_dim_u32, num_heads_u32, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    }
                 };
                 let qk_dim_u32 = p.qk_dim as u32;
                 let qkv_dim_u32 = p.qkv_dim as u32;

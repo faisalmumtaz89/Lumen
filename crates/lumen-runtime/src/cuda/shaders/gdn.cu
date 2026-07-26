@@ -720,3 +720,102 @@ extern "C" __global__ void gdn_prefill_norm_gate(
     ssm_out[gate_idx] = silu_g * normed;
 }
 
+
+
+// ============================================================================
+// gdn_prefill_fused_v3_t1_w4: T=1 specialization, FOUR WARPS PER CTA.
+//
+// WHY
+//
+// The GDN recurrence measured 1.351 ms/token = 56.3 us per GDN layer, which is
+// 12.9% of the whole token for essentially ZERO weight bytes (the per-layer
+// state is 32*128*128*4 = 2 MiB, so all 24 layers read+write only ~96 MiB).
+// That is not bandwidth, it is launch and occupancy cost. A good A100
+// implementation of this step should land at 12-23 us/layer.
+//
+// The structural cause: `gdn_prefill_fused_v3` launches grid (val_dim,
+// n_heads) = (128, 32) = 4096 CTAs of ONE WARP each. Single-warp CTAs waste
+// most of the scheduler's per-CTA overhead and cap occupancy by CTA slots
+// rather than by warps. llama.cpp's gated-delta-net kernel instead groups four
+// state columns into a four-warp CTA -> 1024 CTAs/layer. Lumen already has
+// that geometry in `gdn_phase4_register_resident`, but the shipping T=1 path
+// is the via-prefill kernel, which does not use it.
+//
+// WHAT THIS CHANGES: ONLY the CTA grouping.
+//
+// Warp w of the CTA handles column blockIdx.x * WARPS_V + w, running the exact
+// arithmetic of the T=1 tail loop above — same loads, same warp_reduce_sum,
+// same update order, same q_scale. So results are BIT-IDENTICAL to
+// `gdn_prefill_fused_v3` at T=1, and the parity path's numerics (which have a
+// known divergence history — this is why the register-resident kernel is not
+// simply substituted) are preserved exactly.
+//
+// Grid:  (val_dim / WARPS_V, n_heads, 1) = (32, 32) = 1024 CTAs
+// Block: (32, WARPS_V, 1) = 128 threads
+// ============================================================================
+#define GDN_T1_WARPS_V 4
+
+extern "C" __global__ void gdn_prefill_fused_v3_t1_w4(
+    float* __restrict__ h_state,            // [num_heads, val_dim, key_dim] R/W
+    const float* __restrict__ conv_out_all, // [1, qkv_dim]
+    const float* __restrict__ alpha_all,    // [1, num_heads]
+    const float* __restrict__ beta_all,     // [1, num_heads]
+    float* __restrict__ raw_out,            // [1, num_heads, val_dim]
+    unsigned int n_heads,
+    unsigned int key_dim,
+    unsigned int val_dim,
+    unsigned int n_kv_heads,
+    unsigned int T,
+    unsigned int qk_dim,
+    unsigned int qkv_dim)
+{
+    const unsigned int warp = threadIdx.y;                       // 0..WARPS_V-1
+    const unsigned int vj   = blockIdx.x * GDN_T1_WARPS_V + warp;
+    const unsigned int h    = blockIdx.y;
+    if (h >= n_heads || vj >= val_dim) return;
+
+    const unsigned int lane = threadIdx.x;  // 0..31
+    const unsigned int kv_head = h % n_kv_heads;
+    const float q_scale = rsqrtf((float)key_dim);
+
+    // Each lane owns 4 key_dim elements: lane*4 .. lane*4+3 (32 lanes = 128).
+    const unsigned int k_base = lane * 4;
+
+    float* h_row = h_state + h * val_dim * key_dim + vj * key_dim;
+    float s0 = h_row[k_base + 0];
+    float s1 = h_row[k_base + 1];
+    float s2 = h_row[k_base + 2];
+    float s3 = h_row[k_base + 3];
+
+    const unsigned int q_head_off = kv_head * key_dim + k_base;
+    const unsigned int k_head_off = qk_dim + kv_head * key_dim + k_base;
+    const unsigned int v_head_off = qk_dim + qk_dim + h * val_dim + vj;
+    const unsigned int out_base = h * val_dim + vj;
+
+    // T == 1 by construction; the caller only dispatches this kernel for decode.
+    {
+        const float a = alpha_all[h];
+        const float b = beta_all[h];
+        const float* conv_t = conv_out_all;
+
+        const float qn0 = conv_t[q_head_off];     const float qn1 = conv_t[q_head_off+1];
+        const float qn2 = conv_t[q_head_off+2];   const float qn3 = conv_t[q_head_off+3];
+        const float kn0 = conv_t[k_head_off];     const float kn1 = conv_t[k_head_off+1];
+        const float kn2 = conv_t[k_head_off+2];   const float kn3 = conv_t[k_head_off+3];
+        const float v_val = conv_t[v_head_off];
+
+        float d0 = a * s0;  float d1 = a * s1;
+        float d2 = a * s2;  float d3 = a * s3;
+        float retrieval = warp_reduce_sum(d0*kn0 + d1*kn1 + d2*kn2 + d3*kn3);
+        float v_delta = b * (v_val - retrieval);
+        s0 = d0 + kn0 * v_delta;  s1 = d1 + kn1 * v_delta;
+        s2 = d2 + kn2 * v_delta;  s3 = d3 + kn3 * v_delta;
+        float my_out = warp_reduce_sum(s0*qn0 + s1*qn1 + s2*qn2 + s3*qn3) * q_scale;
+        if (lane == 0) raw_out[out_base] = my_out;
+    }
+
+    h_row[k_base + 0] = s0;
+    h_row[k_base + 1] = s1;
+    h_row[k_base + 2] = s2;
+    h_row[k_base + 3] = s3;
+}
