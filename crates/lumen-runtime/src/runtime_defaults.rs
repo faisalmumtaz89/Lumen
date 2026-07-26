@@ -1223,6 +1223,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_Q4_ROUTE_ASSERT",
     "LUMEN_CUDA_Q4_SPLIT",
     "LUMEN_CUDA_Q4_SPLIT_F32",
+    "LUMEN_DECODE_ABLATE",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
     "LUMEN_CUDA_Q4_MMVQ",
@@ -2442,6 +2443,7 @@ mod tests {
     "LUMEN_CUDA_Q4_ROUTE_ASSERT",
     "LUMEN_CUDA_Q4_SPLIT",
     "LUMEN_CUDA_Q4_SPLIT_F32",
+    "LUMEN_DECODE_ABLATE",
         "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q4_MMVQ",
         "LUMEN_CUDA_Q8_MMVQ",
@@ -2987,4 +2989,38 @@ pub fn q4_split_f32_variant() -> u8 {
 /// `launch_matvec_ext` is reached.
 pub fn q4_split_f32_enabled() -> bool {
     q4_split_f32_variant() != 0
+}
+
+/// `LUMEN_DECODE_ABLATE` — VALIDATION-ONLY phase attribution.
+///
+/// Skips a whole phase of the decode layer so the wall-time delta measures
+/// that phase's share of the token. The output is NUMERICALLY GARBAGE by
+/// construction; the audited battery still performs exactly N decode calls, so
+/// the TIMING is exact. Never enable outside attribution runs.
+///
+/// This exists because the campaign's founding premise — that the Q4
+/// projection matvecs dominate the token, justified by the identity
+/// 5.181 GB/token / 11.34 ms = 456 GB/s — was never measured across eight
+/// rounds of kernel work. Ablation answers the sharper question directly: if a
+/// phase were FREE, what would the cell run at? That is an UPPER bound on any
+/// kernel work targeting it, so a target above the ablation ceiling is
+/// unreachable by definition rather than by argument.
+///
+/// Values: `ffn`, `gdn`, `attn`, or a comma-separated combination.
+pub fn decode_ablate(phase: &str) -> bool {
+    use std::sync::OnceLock;
+    static SET: OnceLock<Vec<String>> = OnceLock::new();
+    SET.get_or_init(|| {
+        std::env::var("LUMEN_DECODE_ABLATE")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+    .iter()
+    .any(|p| p == phase)
 }

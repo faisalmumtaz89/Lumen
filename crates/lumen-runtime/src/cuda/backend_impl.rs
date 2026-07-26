@@ -2115,6 +2115,12 @@ impl CudaBackend {
         // NOTE: GDN layers still have dense FFN (gate/up/SwiGLU/down) which runs
         // AFTER the GDN attention block, same as standard layers.
         if layer_type == 1 {
+            // Attribution ablation: skip the GDN recurrence block entirely.
+            // Output is garbage; the decode-call count and every other kernel
+            // are unchanged, so the wall delta is this phase's share.
+            if crate::runtime_defaults::decode_ablate("gdn") {
+                return Ok(());
+            }
             // Run the GDN attention block, which replaces the standard
             // QKV -> RoPE -> KV cache -> Attention -> Output proj path.
             // After this, attn_proj = x_old + ssm_proj (the post-GDN-attention
@@ -3118,6 +3124,13 @@ impl CudaBackend {
                 }
             }
         } // end else (standard attention path — skipped for GDN layers)
+
+        // Attribution ablation: skip the whole FFN block (gate/up/SwiGLU/down).
+        // On 9B this is 3 of every ~4 projection bytes, so it is the dominant
+        // matvec phase and its delta bounds all FFN kernel work.
+        if crate::runtime_defaults::decode_ablate("ffn") {
+            return Ok(());
+        }
 
         // Re-borrow layer weights for the FFN block (shared between standard and GDN layers).
         let lw: &LayerWeightsGpu = &st.layer_weights_cache[layer_idx];
