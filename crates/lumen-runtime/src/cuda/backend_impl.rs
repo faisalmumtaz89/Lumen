@@ -2128,7 +2128,10 @@ impl CudaBackend {
             // The FFN block reads from attn_proj, and the caller copies attn_proj
             // to x_gpu after the full layer (GDN attention + FFN) completes.
             self.compute_gdn_attention_gpu(layer_idx, st)?;
-        } else {
+        // Attribution ablation: skip the standard attention block on the 8
+        // full-attention layers, keeping their FFN. Part of splitting the 21%
+        // "everything else" that llama.cpp evidently does not pay.
+        } else if !crate::runtime_defaults::decode_ablate("attn") {
             let lw: &LayerWeightsGpu = st.layer_weights_cache.get(layer_idx).ok_or_else(|| {
                 RuntimeError::Compute(format!(
                     "compute_layer_gpu: layer {layer_idx} not in GPU-resident cache",
@@ -14777,7 +14780,11 @@ impl ComputeBackend for CudaBackend {
 
         // 3. MatVec: logits = output_proj * normed
         // Reuse the pre-allocated logits_gpu buffer from MutableState.
-        {
+        //
+        // Attribution ablation: lm_head is vocab 248320 x hidden 4096 =
+        // 1.017 G params = 0.572 GB/token in Q4_0, i.e. ~11% of ALL weight
+        // bytes in the model, and it sits in the never-measured residual.
+        if !crate::runtime_defaults::decode_ablate("head") {
             if let Some(ref proj_q4a) = st.globals.output_proj_q4_aligned {
                 // Q4Aligned dp4a output projection (highest priority for Q4_0).
                 if let (Some(ref quant_fn), Some(ref mv_fn)) = (
