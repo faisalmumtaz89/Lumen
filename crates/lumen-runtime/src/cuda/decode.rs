@@ -478,6 +478,8 @@ pub(crate) struct KernelSet {
 
     // Q4 split (SoA) matvec against pre-quantized Q8_1 input (dp4a, NR=4).
     pub(crate) matvec_q4_split_q8_1: Option<CudaFunction>,
+    /// F32-activation SoA matvec (`LUMEN_CUDA_Q4_SPLIT_F32=1`).
+    pub(crate) matvec_q4_split_f32: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_residual: Option<CudaFunction>,
 
     // Codegen-LOCKED Q4 split matvec (same SoA layout + integer dot as
@@ -1743,6 +1745,19 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] matvec_q8_split_q8_1_mmvq_residual: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_split_f32: match load_fn(
+            shaders::MATVEC_Q4_SPLIT_F32_KERNEL_SOURCE,
+            "matvec_q4_split_f32",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_split_f32: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_split_f32: FAILED: {e}");
                 None
             }
         },

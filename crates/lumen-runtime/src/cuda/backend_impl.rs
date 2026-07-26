@@ -2639,7 +2639,7 @@ impl CudaBackend {
                     unsafe {
                         // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
                         if has_qgate_fusion {
-                            launch_matvec(
+                            launch_matvec_ext(
                                 &self.device,
                                 &st.kernels,
                                 &lw.wq,
@@ -2651,9 +2651,10 @@ impl CudaBackend {
                                 lw.wq_f16.as_ref(),
                                 Some(&mut st.scratch.input_f16),
                                 st.scratch.input_q8_1.as_mut(),
+                                lw.q4_split_wq.as_ref(),
                             )?;
                         } else {
-                            launch_matvec(
+                            launch_matvec_ext(
                                 &self.device,
                                 &st.kernels,
                                 &lw.wq,
@@ -2665,9 +2666,10 @@ impl CudaBackend {
                                 lw.wq_f16.as_ref(),
                                 Some(&mut st.scratch.input_f16),
                                 st.scratch.input_q8_1.as_mut(),
+                                lw.q4_split_wq.as_ref(),
                             )?;
                         }
-                        launch_matvec(
+                        launch_matvec_ext(
                             &self.device,
                             &st.kernels,
                             &lw.wk,
@@ -2679,8 +2681,9 @@ impl CudaBackend {
                             lw.wk_f16.as_ref(),
                             Some(&mut st.scratch.input_f16),
                             st.scratch.input_q8_1.as_mut(),
+                            lw.q4_split_wk.as_ref(),
                         )?;
-                        launch_matvec(
+                        launch_matvec_ext(
                             &self.device,
                             &st.kernels,
                             &lw.wv,
@@ -2692,6 +2695,7 @@ impl CudaBackend {
                             lw.wv_f16.as_ref(),
                             Some(&mut st.scratch.input_f16),
                             st.scratch.input_q8_1.as_mut(),
+                            lw.q4_split_wv.as_ref(),
                         )?;
                     }
                 }
@@ -3045,8 +3049,9 @@ impl CudaBackend {
                 // through `launch_matvec_residual_split` -- requires quantizing the
                 // attention output to Q8_1 inline. Otherwise fall through to the
                 // existing `launch_matvec_residual` path.
-                let use_split_wo = (st.kernels.use_q8_split_dispatch && lw.q8_split_wo.is_some())
-                    || (st.kernels.use_q4_split_dispatch && lw.q4_split_wo.is_some());
+                let use_split_wo = ((st.kernels.use_q8_split_dispatch && lw.q8_split_wo.is_some())
+                    || (st.kernels.use_q4_split_dispatch && lw.q4_split_wo.is_some()))
+                    && !crate::runtime_defaults::q4_split_f32_enabled();
                 if use_split_wo {
                     // Quantize attention output to Q8_1 in scratch, then split residual matvec.
                     let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref();
@@ -4096,7 +4101,7 @@ impl CudaBackend {
                         .map_err(|e| RuntimeError::Compute(format!("rmsnorm ffn launch: {e}")))?;
                     }
                     unsafe {
-                        launch_matvec(
+                        launch_matvec_ext(
                             &self.device,
                             &st.kernels,
                             &lw.w_gate,
@@ -4108,8 +4113,9 @@ impl CudaBackend {
                             lw.w_gate_f16.as_ref(),
                             Some(&mut st.scratch.input_f16),
                             st.scratch.input_q8_1.as_mut(),
+                            lw.q4_split_w_gate.as_ref(),
                         )?;
-                        launch_matvec(
+                        launch_matvec_ext(
                             &self.device,
                             &st.kernels,
                             &lw.w_up,
@@ -4121,6 +4127,7 @@ impl CudaBackend {
                             lw.w_up_f16.as_ref(),
                             Some(&mut st.scratch.input_f16),
                             st.scratch.input_q8_1.as_mut(),
+                            lw.q4_split_w_up.as_ref(),
                         )?;
                     }
                 }
@@ -4242,7 +4249,7 @@ impl CudaBackend {
                 } else {
                     // Fallback: quantize + dp4a (2 dispatches).
                     unsafe {
-                        launch_matvec(
+                        launch_matvec_ext(
                             &self.device,
                             &st.kernels,
                             &lw.w_down,
@@ -4254,6 +4261,7 @@ impl CudaBackend {
                             lw.w_down_f16.as_ref(),
                             Some(&mut st.scratch.input_f16),
                             st.scratch.input_q8_1.as_mut(),
+                            lw.q4_split_w_down.as_ref(),
                         )?;
                     }
                 }
@@ -4288,7 +4296,7 @@ impl CudaBackend {
                 } else {
                     // Fallback: quantize + dp4a (2 dispatches).
                     unsafe {
-                        launch_matvec(
+                        launch_matvec_ext(
                             &self.device,
                             &st.kernels,
                             &lw.w_down,
@@ -4300,6 +4308,7 @@ impl CudaBackend {
                             lw.w_down_f16.as_ref(),
                             Some(&mut st.scratch.input_f16),
                             st.scratch.input_q8_1.as_mut(),
+                            lw.q4_split_w_down.as_ref(),
                         )?;
                     }
                 }
@@ -4315,8 +4324,8 @@ impl CudaBackend {
                 // ffn_down reported 0 F16 calls under the route census.
                 let down_mode = crate::runtime_defaults::q4_act_plan()
                     .mode_for(crate::runtime_defaults::Q4ProjectionFamily::FfnDown);
-                let down_explicit_non_q8 =
-                    down_mode == crate::runtime_defaults::Q4ActMode::F16;
+                let down_explicit_non_q8 = down_mode == crate::runtime_defaults::Q4ActMode::F16
+                    || crate::runtime_defaults::q4_split_f32_enabled();
                 let use_split_down = !down_explicit_non_q8
                     && ((st.kernels.use_q8_split_dispatch && lw.q8_split_w_down.is_some())
                         || (st.kernels.use_q4_split_dispatch && lw.q4_split_w_down.is_some()));
@@ -4348,7 +4357,7 @@ impl CudaBackend {
                         }
                     } else {
                         unsafe {
-                            launch_matvec(
+                            launch_matvec_ext(
                                 &self.device,
                                 &st.kernels,
                                 &lw.w_down,
@@ -4360,12 +4369,13 @@ impl CudaBackend {
                                 lw.w_down_f16.as_ref(),
                                 Some(&mut st.scratch.input_f16),
                                 st.scratch.input_q8_1.as_mut(),
+                                lw.q4_split_w_down.as_ref(),
                             )?;
                         }
                     }
                 } else {
                     unsafe {
-                        launch_matvec(
+                        launch_matvec_ext(
                             &self.device,
                             &st.kernels,
                             &lw.w_down,
@@ -4377,6 +4387,7 @@ impl CudaBackend {
                             lw.w_down_f16.as_ref(),
                             Some(&mut st.scratch.input_f16),
                             st.scratch.input_q8_1.as_mut(),
+                            lw.q4_split_w_down.as_ref(),
                         )?;
                     }
                 }
@@ -4486,7 +4497,7 @@ impl CudaBackend {
                     .map_err(|e| RuntimeError::Compute(format!("swiglu launch: {e}")))?;
                 }
                 unsafe {
-                    launch_matvec(
+                    launch_matvec_ext(
                         &self.device,
                         &st.kernels,
                         &lw.w_down,
@@ -4498,6 +4509,7 @@ impl CudaBackend {
                         lw.w_down_f16.as_ref(),
                         Some(&mut st.scratch.input_f16),
                         st.scratch.input_q8_1.as_mut(),
+                        lw.q4_split_w_down.as_ref(),
                     )?;
                 }
             }
@@ -4554,7 +4566,7 @@ impl CudaBackend {
                     .map_err(|e| RuntimeError::Compute(format!("swiglu launch: {e}")))?;
                 }
                 unsafe {
-                    launch_matvec(
+                    launch_matvec_ext(
                         &self.device,
                         &st.kernels,
                         &lw.w_down,
@@ -4566,6 +4578,7 @@ impl CudaBackend {
                         lw.w_down_f16.as_ref(),
                         Some(&mut st.scratch.input_f16),
                         st.scratch.input_q8_1.as_mut(),
+                        lw.q4_split_w_down.as_ref(),
                     )?;
                 }
             }
@@ -4598,6 +4611,7 @@ impl CudaBackend {
             let down_mode2 = crate::runtime_defaults::q4_act_plan()
                 .mode_for(crate::runtime_defaults::Q4ProjectionFamily::FfnDown);
             let use_split_down = down_mode2 != crate::runtime_defaults::Q4ActMode::F16
+                && !crate::runtime_defaults::q4_split_f32_enabled()
                 && ((st.kernels.use_q8_split_dispatch && lw.q8_split_w_down.is_some())
                     || (st.kernels.use_q4_split_dispatch && lw.q4_split_w_down.is_some()));
             if use_split_down {
@@ -4628,7 +4642,7 @@ impl CudaBackend {
                     }
                 } else {
                     unsafe {
-                        launch_matvec(
+                        launch_matvec_ext(
                             &self.device,
                             &st.kernels,
                             &lw.w_down,
@@ -4640,12 +4654,13 @@ impl CudaBackend {
                             lw.w_down_f16.as_ref(),
                             Some(&mut st.scratch.input_f16),
                             st.scratch.input_q8_1.as_mut(),
+                            lw.q4_split_w_down.as_ref(),
                         )?;
                     }
                 }
             } else {
                 unsafe {
-                    launch_matvec(
+                    launch_matvec_ext(
                         &self.device,
                         &st.kernels,
                         &lw.w_down,
@@ -4657,6 +4672,7 @@ impl CudaBackend {
                         lw.w_down_f16.as_ref(),
                         Some(&mut st.scratch.input_f16),
                         st.scratch.input_q8_1.as_mut(),
+                        lw.q4_split_w_down.as_ref(),
                     )?;
                 }
             }
@@ -8998,7 +9014,31 @@ impl CudaBackend {
 /// - `output` has `out_dim` elements
 /// - If `weight_f16_cache` is Some, it must have `out_dim * in_dim * 2` bytes
 /// - If `input_f16_scratch` is Some, it must have at least `in_dim * 2` bytes
+/// Compatibility shim: the 35 existing `launch_matvec` call sites have no
+/// SoA sibling in scope, so they forward `None` and behave exactly as before.
+/// Sites that DO hold `lw.q4_split_*` call `launch_matvec_ext` directly.
+#[allow(clippy::too_many_arguments)]
 unsafe fn launch_matvec(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    weight: &GpuWeightBuf,
+    input: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    out_dim: usize,
+    in_dim: usize,
+    label: &str,
+    weight_f16_cache: Option<&CudaSlice<u8>>,
+    input_f16_scratch: Option<&mut CudaSlice<u8>>,
+    input_q8_1_scratch: Option<&mut CudaSlice<u8>>,
+) -> Result<(), RuntimeError> {
+    launch_matvec_ext(
+        device, kernels, weight, input, output, out_dim, in_dim, label,
+        weight_f16_cache, input_f16_scratch, input_q8_1_scratch, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_matvec_ext(
     device: &CudaDevice,
     kernels: &KernelSet,
     weight: &GpuWeightBuf,
@@ -9010,7 +9050,29 @@ unsafe fn launch_matvec(
     weight_f16_cache: Option<&CudaSlice<u8>>,
     mut input_f16_scratch: Option<&mut CudaSlice<u8>>,
     mut input_q8_1_scratch: Option<&mut CudaSlice<u8>>,
+    q4_split_sibling: Option<&CudaSlice<u8>>,
 ) -> Result<(), RuntimeError> {
+    // SoA F32 fast path (LUMEN_CUDA_Q4_SPLIT_F32=1). Correctness-neutral: same
+    // F32 activations, same F32 accumulation — only the weight ACCESS PATTERN
+    // changes, from misaligned 18-byte AoS blocks read bytewise to a 4-byte
+    // aligned nibble stream read as ints. Returns false (fall through) when
+    // the flag is off, the kernel failed to compile, or the layer has no
+    // sibling, so the default path is untouched.
+    if matches!(weight, GpuWeightBuf::Q4Raw(_) | GpuWeightBuf::Q4Split(_))
+        && launch_matvec_split_f32(
+            device,
+            kernels,
+            q4_split_sibling,
+            input,
+            output,
+            out_dim,
+            in_dim,
+            label,
+        )?
+    {
+        return Ok(());
+    }
+
     // --- Native quantized kernels: read Q8_0/Q4_0 directly (1.06/0.56 B/elem) ---
     // These bypass the HGEMV path which reads 2 B/elem from pre-dequanted F16 cache.
     //
@@ -10973,6 +11035,64 @@ unsafe fn launch_matvec_preq8_1_residual(
 /// count to the base weight.
 #[allow(clippy::too_many_arguments)]
 #[inline]
+/// F32-ACTIVATION sibling of `launch_matvec_preq8_1_split`.
+///
+/// Attacks the measured 9B-Q4 gap directly: Lumen achieves 456 GB/s where
+/// llama.cpp reaches 793 GB/s streaming the SAME weight bytes. The default
+/// `matvec_q4_0_smem` gives each thread one native 18-byte Q4_0 block, which
+/// puts the nibble payload at byte offset 2 — permanently 4-byte MISALIGNED,
+/// which is why that kernel unpacks with sixteen single-BYTE loads per block.
+/// The split/SoA layout stores scales and nibbles as separate contiguous
+/// streams, so the nibble run is 4-byte aligned and readable as ints.
+///
+/// Unlike the activation-format levers (which move only 0.04% of memory
+/// traffic and measured 1.00x/1.12x), this changes nothing about the
+/// activation numerics — F32 in, F32 accumulate — so it is a correctness-
+/// neutral swap and the output should match the baseline modulo intra-block
+/// FP reassociation.
+///
+/// Returns Ok(false) when the split sibling or kernel is unavailable, so the
+/// caller falls back to the normal path.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_matvec_split_f32(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    q4_split_sibling: Option<&CudaSlice<u8>>,
+    input: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    out_dim: usize,
+    in_dim: usize,
+    label: &str,
+) -> Result<bool, RuntimeError> {
+    if !crate::runtime_defaults::q4_split_f32_enabled() {
+        return Ok(false);
+    }
+    let (Some(split_fn), Some(split_w)) =
+        (kernels.matvec_q4_split_f32.as_ref(), q4_split_sibling)
+    else {
+        return Ok(false);
+    };
+    let out_dim_u32 = out_dim as u32;
+    let in_dim_u32 = in_dim as u32;
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (out_dim_u32.div_ceil(4), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: in_dim_u32 * 4,
+    };
+    device
+        .stream
+        .launch_builder(split_fn)
+        .arg(split_w)
+        .arg(input)
+        .arg(output)
+        .arg(&out_dim_u32)
+        .arg(&in_dim_u32)
+        .launch(launch_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("matvec_q4_split_f32 {label}: {e}")))?;
+    crate::runtime_defaults::route_census_record(label, "F32_SPLIT_SOA");
+    Ok(true)
+}
+
 unsafe fn launch_matvec_preq8_1_split(
     device: &CudaDevice,
     kernels: &KernelSet,

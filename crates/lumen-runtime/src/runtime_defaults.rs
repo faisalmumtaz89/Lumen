@@ -1222,6 +1222,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_Q4_F16_ZONE",
     "LUMEN_CUDA_Q4_ROUTE_ASSERT",
     "LUMEN_CUDA_Q4_SPLIT",
+    "LUMEN_CUDA_Q4_SPLIT_F32",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
     "LUMEN_CUDA_Q4_MMVQ",
@@ -2440,6 +2441,7 @@ mod tests {
     "LUMEN_CUDA_Q4_F16_ZONE",
     "LUMEN_CUDA_Q4_ROUTE_ASSERT",
     "LUMEN_CUDA_Q4_SPLIT",
+    "LUMEN_CUDA_Q4_SPLIT_F32",
         "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q4_MMVQ",
         "LUMEN_CUDA_Q8_MMVQ",
@@ -2948,4 +2950,19 @@ pub fn route_census_verify(plan: &Q4ActPlan) -> Result<String, String> {
     } else {
         Err(format!("{manifest}\n  ERRORS: {}", errors.join("; ")))
     }
+}
+
+/// `LUMEN_CUDA_Q4_SPLIT_F32=1` — route Q4 decode matvecs through the
+/// F32-activation SoA kernel instead of the native-18-byte smem kernel.
+/// Correctness-neutral by design (identical activation numerics); only the
+/// weight access pattern changes. Default OFF.
+pub fn q4_split_f32_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_Q4_SPLIT_F32").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
 }

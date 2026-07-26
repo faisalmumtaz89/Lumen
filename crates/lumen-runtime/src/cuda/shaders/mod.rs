@@ -479,6 +479,15 @@ pub const MATVEC_Q8_SPLIT_Q8_1_MMVQ_KERNEL_SOURCE: &str =
 /// Requires SM 6.1+ (dp4a).
 pub const MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q4_split_q8_1.cu");
 
+/// F32-ACTIVATION sibling of the split/SoA Q4 matvec. Attacks the real 9B-Q4
+/// gap: Lumen achieves 456 GB/s where llama.cpp reaches 793 GB/s on the SAME
+/// weight bytes, because the default `matvec_q4_0_smem` gives each thread one
+/// 18-byte block (never 32B-aligned, so lanes never coalesce) and unpacks
+/// nibbles with sixteen single-BYTE loads. This reads the contiguous, 4-byte
+/// aligned split nibble stream as aligned ints and masks both halves in
+/// registers, while keeping EXACT F32 activation numerics.
+pub const MATVEC_Q4_SPLIT_F32_KERNEL_SOURCE: &str = include_str!("matvec_q4_split_f32.cu");
+
 /// Codegen-LOCKED variant of `MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE`. Same SoA
 /// split layout and integer dp4a dot, but every floating-point op in the
 /// per-block epilogue and the cross-warp reduction is pinned with inline-PTX
