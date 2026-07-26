@@ -9227,7 +9227,8 @@ unsafe fn launch_matvec(
     // admitted via LUMEN_CUDA_PRECISION_ZONE takes the fast dp4a path even on
     // that config. Unset flag => admits nothing => byte-identical to before.
     // `wo` is never admissible (see runtime_defaults::precision_zone_admits).
-    let zone_admits = crate::runtime_defaults::precision_zone_admits(label);
+    let act_mode = crate::runtime_defaults::q4_act_plan().mode_for_label(label);
+    let zone_admits = act_mode == crate::runtime_defaults::Q4ActMode::Q8_1;
     if matches!(weight, GpuWeightBuf::Q4Aligned(_))
         || (matches!(weight, GpuWeightBuf::Q4Raw(_))
             && (!kernels.q4_decode_f32_act || zone_admits))
@@ -9424,7 +9425,9 @@ unsafe fn launch_matvec(
         // the outlier mechanism that disqualifies `wo` under Q8 does not apply.
         //
         // Unset flag => this whole block is skipped => byte-identical default.
-        if crate::runtime_defaults::q4_f16_zone_admits(label) {
+        if crate::runtime_defaults::q4_act_plan().mode_for_label(label)
+            == crate::runtime_defaults::Q4ActMode::F16
+        {
             if let Some(hgemv_fn) = kernels
                 .hgemv_q4_0
                 .as_ref()
@@ -10059,7 +10062,8 @@ unsafe fn launch_matvec_residual(
     // admitted via LUMEN_CUDA_PRECISION_ZONE takes the fast dp4a path even on
     // that config. Unset flag => admits nothing => byte-identical to before.
     // `wo` is never admissible (see runtime_defaults::precision_zone_admits).
-    let zone_admits = crate::runtime_defaults::precision_zone_admits(label);
+    let act_mode = crate::runtime_defaults::q4_act_plan().mode_for_label(label);
+    let zone_admits = act_mode == crate::runtime_defaults::Q4ActMode::Q8_1;
     if matches!(weight, GpuWeightBuf::Q4Aligned(_))
         || (matches!(weight, GpuWeightBuf::Q4Raw(_))
             && (!kernels.q4_decode_f32_act || zone_admits))
@@ -10140,7 +10144,9 @@ unsafe fn launch_matvec_residual(
         // block scale, so `wo` IS a legitimate F16 candidate and the measured
         // F16 loss is localised to the GDN recurrence instead. Unset flag =>
         // skipped => byte-identical default.
-        if crate::runtime_defaults::q4_f16_zone_admits(label) {
+        if crate::runtime_defaults::q4_act_plan().mode_for_label(label)
+            == crate::runtime_defaults::Q4ActMode::F16
+        {
             if let Some(hgemv_fn) = kernels
                 .hgemv_q4_0_residual
                 .as_ref()

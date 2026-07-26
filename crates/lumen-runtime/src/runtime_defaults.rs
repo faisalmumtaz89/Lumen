@@ -2532,199 +2532,301 @@ mod tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// PRECISION ZONING for the Q4 decode path (`LUMEN_CUDA_PRECISION_ZONE`)
-// ---------------------------------------------------------------------------
-//
-// Background. On the 9B GDN config the whole model is pinned to F32
-// activations for Q4 weights (`KernelSet::q4_decode_f32_act`), because the
-// int8 Q8_1-activation dp4a path collapses output quality. That is a
-// WHOLE-MODEL switch, and it is expensive: 9B-Q4 decodes at 88 tok/s while
-// llama.cpp reaches 153 tok/s on the identical GGUF — Lumen realises only
-// ~31% of achievable HBM bandwidth because F32 activations foreclose dp4a.
-//
-// But the measured quality cliff is NOT uniform. The authoritative Pareto
-// (LKA-receipts §894) is:
-//
-//     F32 everywhere      88 tok/s   accepted reference
-//     Q8 except `wo`     110 tok/s   46/60 vs 52/60  (degraded)
-//     Q8 everywhere      138 tok/s   catastrophic
-//
-// and the collapse is concentrated in `wo`, the full-attention output
-// projection: its input is sigmoid-gated and outlier-heavy, so per-32 amax
-// scaling crushes the small channels. Other projections lose a diffuse 4-6/60.
-//
-// So the lever is ZONING, not a global flip: admit reduced precision one
-// projection family at a time, under the correctness gate, and never for `wo`.
-// This function is the admission oracle. Each admitted family is one candidate
-// for the LKA harness (`evaluate_candidate`), whose correctness gate runs
-// BEFORE any timing.
-//
-// Usage:  LUMEN_CUDA_PRECISION_ZONE=ffn_gate_up,ffn_down
-//         LUMEN_CUDA_PRECISION_ZONE=all      (every family EXCEPT `wo`)
-// Unset/empty => no family admitted => byte-identical to today's default.
 
-/// Projection families that may be independently admitted to reduced-precision
-/// (Q8_1-activation dp4a) decode. `wo` is deliberately absent: it is the
-/// measured quality cliff and is never admissible through this flag.
-fn precision_zone_family(label: &str) -> Option<&'static str> {
-    match label {
-        "gate" | "up" | "gate_up" => Some("ffn_gate_up"),
-        "down" => Some("ffn_down"),
-        "qkv" => Some("gdn_qkv"),
-        "attn_gate" => Some("gdn_attn_gate"),
-        "wq" | "wk" | "wv" => Some("attn_qkv"),
-        // "wo" => intentionally unmapped: see the module comment above.
-        _ => None,
+// ===========================================================================
+// Q4 ACTIVATION PLAN — the typed replacement for `q4_decode_f32_act`
+// ===========================================================================
+//
+// `q4_decode_f32_act` is a single whole-model boolean that pins EVERY Q4
+// projection on the 9B GDN config to F32 activations, because int8 was once
+// found to break quality *somewhere*. One bad projection condemned the whole
+// model, and the cost is large: 9B-Q4 decodes at 88 tok/s while llama.cpp
+// reaches 153 on the identical GGUF, because F32 activations foreclose both
+// the dp4a and HGEMV paths.
+//
+// This replaces that boolean with a per-family PLAN resolved once at startup.
+// Three hard lessons are encoded here:
+//
+//  1. STRINGS ARE NOT AN ORACLE. A first attempt matched dispatch labels by
+//     string and silently missed families whose call sites use different
+//     spellings — the GDN sites pass "gdn_qkv"/"gdn_gate" while the map was
+//     written for "qkv"/"attn_gate", so those families never zoned at all and
+//     the experiment reported a false ceiling. Labels are now logging only;
+//     dispatch decisions take a typed `Q4ActMode`.
+//
+//  2. THE TWO REPRESENTATIONS FAIL DIFFERENTLY. Q8_1 uses per-32 amax block
+//     scaling, so `wo`'s sigmoid-gated outliers crush its small channels —
+//     Q8 therefore structurally rejects `AttnWo`. F16 carries no block scale
+//     and supplies uniform relative precision, so `wo` IS F16-admissible.
+//
+//  3. THE BASELINE IS NOT PURE F32. With no environment set, quantized dense
+//     defaults SOA_LOCKED on, and the FFN-down split shortcut already
+//     quantizes to Q8_1 without consulting any oracle. The unset plan must
+//     reproduce that exactly, or the "repair" would itself move the reference
+//     token stream.
+
+/// The six Q4 projection families. Typed so a dispatch site cannot silently
+/// fail to match by misspelling a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Q4ProjectionFamily {
+    AttnQkv,
+    AttnWo,
+    FfnGateUp,
+    FfnDown,
+    GdnQkv,
+    GdnAttnGate,
+}
+
+/// Activation representation for one family's decode matvec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Q4ActMode {
+    /// Full F32 activations — the exact reference path.
+    #[default]
+    F32,
+    /// F16 activations (HGEMV). Global-F16 measures 181 tok/s but 12/15 vs
+    /// F32's 15/15, with the loss localised to the GDN recurrence.
+    F16,
+    /// Q8_1 int8 activations (dp4a). Never valid for `AttnWo`.
+    Q8_1,
+}
+
+impl Q4ProjectionFamily {
+    /// Map a dispatch label to its family. EVERY spelling used at a call site
+    /// must appear here; an unknown label yields `None` and is treated as
+    /// unzoned (F32), never as a silent match.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Some(match label {
+            "wq" | "wk" | "wv" => Self::AttnQkv,
+            "wo" => Self::AttnWo,
+            "gate" | "up" | "gate_up" => Self::FfnGateUp,
+            "down" => Self::FfnDown,
+            // both spellings in use at GDN dispatch sites
+            "qkv" | "gdn_qkv" => Self::GdnQkv,
+            "attn_gate" | "gdn_gate" | "gdn_attn_gate" => Self::GdnAttnGate,
+            _ => return None,
+        })
+    }
+
+    fn zone_name(self) -> &'static str {
+        match self {
+            Self::AttnQkv => "attn_qkv",
+            Self::AttnWo => "wo",
+            Self::FfnGateUp => "ffn_gate_up",
+            Self::FfnDown => "ffn_down",
+            Self::GdnQkv => "gdn_qkv",
+            Self::GdnAttnGate => "gdn_attn_gate",
+        }
+    }
+
+    const ALL: [Self; 6] = [
+        Self::AttnQkv,
+        Self::AttnWo,
+        Self::FfnGateUp,
+        Self::FfnDown,
+        Self::GdnQkv,
+        Self::GdnAttnGate,
+    ];
+}
+
+/// The resolved per-family activation plan, plus the requested/effective
+/// manifest that must travel with any benchmark number.
+#[derive(Debug, Clone)]
+pub struct Q4ActPlan {
+    modes: [(Q4ProjectionFamily, Q4ActMode); 6],
+    /// Human-readable manifest for the benchmark artifact and coherence gate.
+    pub manifest: String,
+    /// True when neither zone flag was set — the plan is then the historical
+    /// default and dispatch must be byte-identical to it.
+    pub is_default: bool,
+}
+
+impl Q4ActPlan {
+    pub fn mode_for(&self, family: Q4ProjectionFamily) -> Q4ActMode {
+        self.modes
+            .iter()
+            .find(|(f, _)| *f == family)
+            .map(|(_, m)| *m)
+            .unwrap_or(Q4ActMode::F32)
+    }
+
+    /// Convenience for dispatch sites that still carry a label.
+    pub fn mode_for_label(&self, label: &str) -> Q4ActMode {
+        Q4ProjectionFamily::from_label(label)
+            .map(|f| self.mode_for(f))
+            .unwrap_or(Q4ActMode::F32)
     }
 }
 
-/// True iff this projection is admitted to the reduced-precision zone.
-///
-/// FAIL-CLOSED by construction: an unknown label, an unset flag, or `wo` all
-/// return `false`, i.e. keep full F32 activations. Widening this set is a
-/// correctness decision that must be earned through the harness gate, not a
-/// convenience.
-pub fn precision_zone_admits(label: &str) -> bool {
-    use std::sync::OnceLock;
-    static ZONE: OnceLock<Vec<String>> = OnceLock::new();
-    let zone = ZONE.get_or_init(|| {
-        std::env::var("LUMEN_CUDA_PRECISION_ZONE")
-            .ok()
-            .map(|v| {
-                v.split(',')
-                    .map(|s| s.trim().to_ascii_lowercase())
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    });
-    if zone.is_empty() {
-        return false;
-    }
-    // `wo` is never admitted, not even under "all". The cliff is measured.
-    let Some(family) = precision_zone_family(label) else {
-        return false;
+fn parse_zone(var: &str) -> Result<Vec<String>, String> {
+    let raw = match std::env::var(var) {
+        Ok(v) => v,
+        Err(_) => return Ok(Vec::new()),
     };
-    zone.iter().any(|z| z == "all" || z == family)
+    let names: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let valid: Vec<&str> = Q4ProjectionFamily::ALL.iter().map(|f| f.zone_name()).collect();
+    for n in &names {
+        if n != "all" && !valid.contains(&n.as_str()) {
+            // FAIL STARTUP, never ignore: a typo silently zoning nothing is
+            // exactly how the first attempt produced a false ceiling.
+            return Err(format!(
+                "{var}: unknown family {n:?}; valid names are {valid:?} or \"all\""
+            ));
+        }
+    }
+    Ok(names)
+}
+
+fn zone_contains(zone: &[String], f: Q4ProjectionFamily) -> bool {
+    zone.iter().any(|z| z == "all" || z == f.zone_name())
+}
+
+/// Resolve `LUMEN_CUDA_PRECISION_ZONE` (Q8_1) and `LUMEN_CUDA_Q4_F16_ZONE`
+/// (F16) into one plan. Returns `Err` on a configuration that must not be
+/// benchmarked: an unknown family name, or one family claimed by both zones.
+pub fn resolve_q4_act_plan() -> Result<Q4ActPlan, String> {
+    let q8 = parse_zone("LUMEN_CUDA_PRECISION_ZONE")?;
+    let f16 = parse_zone("LUMEN_CUDA_Q4_F16_ZONE")?;
+    let is_default = q8.is_empty() && f16.is_empty();
+
+    let mut modes = [(Q4ProjectionFamily::AttnQkv, Q4ActMode::F32); 6];
+    let mut requested = Vec::new();
+    for (i, f) in Q4ProjectionFamily::ALL.iter().enumerate() {
+        let want_q8 = zone_contains(&q8, *f);
+        let want_f16 = zone_contains(&f16, *f);
+
+        // `wo` under Q8 is structurally rejected, including under "all": its
+        // sigmoid-gated outliers defeat per-32 block scaling. This is not a
+        // tunable.
+        let want_q8 = want_q8 && *f != Q4ProjectionFamily::AttnWo;
+
+        if want_q8 && want_f16 {
+            // Never silently prefer one because its branch is checked first.
+            return Err(format!(
+                "family {:?} is claimed by BOTH LUMEN_CUDA_PRECISION_ZONE (Q8_1) \
+                 and LUMEN_CUDA_Q4_F16_ZONE (F16); pick one",
+                f.zone_name()
+            ));
+        }
+        let mode = if want_f16 {
+            Q4ActMode::F16
+        } else if want_q8 {
+            Q4ActMode::Q8_1
+        } else {
+            Q4ActMode::F32
+        };
+        modes[i] = (*f, mode);
+        requested.push(format!("{}={:?}", f.zone_name(), mode));
+    }
+
+    let manifest = format!(
+        "q4_act_plan requested: {} | default={}",
+        requested.join(" "),
+        is_default
+    );
+    Ok(Q4ActPlan {
+        modes,
+        manifest,
+        is_default,
+    })
+}
+
+/// Process-wide plan, resolved once. A configuration error is fatal here
+/// rather than a fallback: benchmarking a silently-degraded plan is the
+/// failure mode this whole module exists to prevent.
+pub fn q4_act_plan() -> &'static Q4ActPlan {
+    use std::sync::OnceLock;
+    static PLAN: OnceLock<Q4ActPlan> = OnceLock::new();
+    PLAN.get_or_init(|| match resolve_q4_act_plan() {
+        Ok(p) => {
+            if !p.is_default {
+                eprintln!("[CUDA] {}", p.manifest);
+            }
+            p
+        }
+        Err(e) => {
+            eprintln!("[CUDA] FATAL: invalid Q4 activation zoning: {e}");
+            std::process::exit(30);
+        }
+    })
 }
 
 #[cfg(test)]
-mod precision_zone_tests {
+mod q4_act_plan_tests {
     use super::*;
+    use std::sync::Mutex;
 
-    #[test]
-    fn wo_is_never_admitted_even_under_all() {
-        // `wo` is the measured quality cliff (Q8 everywhere = catastrophic).
-        // No flag value may admit it; that is the whole point of zoning.
-        std::env::set_var("LUMEN_CUDA_PRECISION_ZONE", "all");
-        // Fresh process semantics are approximated here: the OnceLock may
-        // already be primed by a sibling test, so assert the pure mapping,
-        // which is what encodes the invariant.
-        assert!(precision_zone_family("wo").is_none());
+    // These tests mutate PROCESS-GLOBAL env vars, so they must not interleave;
+    // without this they race each other's `clear()` and fail spuriously.
+    static ZONE_SERIAL: Mutex<()> = Mutex::new(());
+
+    fn clear() {
         std::env::remove_var("LUMEN_CUDA_PRECISION_ZONE");
+        std::env::remove_var("LUMEN_CUDA_Q4_F16_ZONE");
     }
 
     #[test]
-    fn families_map_to_the_documented_names() {
-        assert_eq!(precision_zone_family("gate"), Some("ffn_gate_up"));
-        assert_eq!(precision_zone_family("up"), Some("ffn_gate_up"));
-        assert_eq!(precision_zone_family("down"), Some("ffn_down"));
-        assert_eq!(precision_zone_family("qkv"), Some("gdn_qkv"));
-        assert_eq!(precision_zone_family("wq"), Some("attn_qkv"));
-        assert_eq!(precision_zone_family("unknown_proj"), None);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// F16-ACTIVATION ZONING for the Q4 decode path (`LUMEN_CUDA_Q4_F16_ZONE`)
-// ---------------------------------------------------------------------------
-//
-// This is a SEPARATE oracle from `precision_zone_admits` and deliberately does
-// NOT share its family map. Reusing the Q8 map here would be a correctness
-// error, because the two representations fail for different reasons:
-//
-//   * Q8_1 uses per-32 amax BLOCK scaling. On `wo` — whose input is
-//     sigmoid-gated and outlier-heavy — a single large channel sets the block
-//     scale and crushes the small channels. Hence `wo` is never Q8-admissible.
-//   * F16 has no block scale at all. It supplies roughly uniform RELATIVE
-//     precision across the vector, so the `wo` outlier mechanism does not
-//     apply. `wo` is therefore F16-admissible and is included below.
-//
-// The measured F16 failure is elsewhere: global-F16 decode runs at 181 tok/s
-// but scores 12/15 vs F32's 15/15, and the repository localises that to the
-// narrow GDN recurrence's precision threshold (see the Path-1 comment in
-// `backend_impl::launch_matvec`). So the GDN carrier projections are the
-// F32 keepers and everything else is a candidate for F16.
-//
-// Latency budget (why the keeper set must stay small): global F16 is
-// 5.525 ms/token and the 1.1x-of-llama.cpp target is 5.931 ms/token, so the
-// F32 keepers may cost at most ~0.406 ms/token in aggregate before the target
-// is out of reach on this lever alone.
-//
-// Usage:  LUMEN_CUDA_Q4_F16_ZONE=ffn_gate_up,ffn_down,attn_qkv,wo
-// Unset/empty => nothing admitted => byte-identical to today's default.
-
-/// Projection families admissible to F16-activation decode. Note this map
-/// INCLUDES `wo`, unlike the Q8 map — see the module comment for why that is
-/// correct rather than an oversight.
-fn q4_f16_zone_family(label: &str) -> Option<&'static str> {
-    match label {
-        "gate" | "up" | "gate_up" => Some("ffn_gate_up"),
-        "down" => Some("ffn_down"),
-        "wq" | "wk" | "wv" => Some("attn_qkv"),
-        "wo" => Some("wo"),
-        // GDN carrier projections: the measured F16 precision threshold lives
-        // here, so they are only admissible if named explicitly.
-        "qkv" => Some("gdn_qkv"),
-        "attn_gate" => Some("gdn_attn_gate"),
-        _ => None,
-    }
-}
-
-/// True iff this projection is admitted to F16-activation decode.
-/// Fail-closed: unset flag, empty value, or unknown label all keep F32.
-pub fn q4_f16_zone_admits(label: &str) -> bool {
-    use std::sync::OnceLock;
-    static ZONE: OnceLock<Vec<String>> = OnceLock::new();
-    let zone = ZONE.get_or_init(|| {
-        std::env::var("LUMEN_CUDA_Q4_F16_ZONE")
-            .ok()
-            .map(|v| {
-                v.split(',')
-                    .map(|s| s.trim().to_ascii_lowercase())
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    });
-    if zone.is_empty() {
-        return false;
-    }
-    let Some(family) = q4_f16_zone_family(label) else {
-        return false;
-    };
-    zone.iter().any(|z| z == "all" || z == family)
-}
-
-#[cfg(test)]
-mod q4_f16_zone_tests {
-    use super::*;
-
-    #[test]
-    fn f16_map_includes_wo_unlike_the_q8_map() {
-        // The two oracles MUST differ here. Q8 crushes `wo` via per-32 block
-        // scaling; F16 has no block scale and does not share that failure.
-        assert_eq!(q4_f16_zone_family("wo"), Some("wo"));
-        assert_eq!(precision_zone_family("wo"), None);
+    fn every_dispatch_label_in_the_tree_maps_to_a_family() {
+        // The first implementation missed these two spellings entirely, so the
+        // GDN families never zoned and the run reported a false ceiling.
+        for l in ["wq", "wk", "wv", "wo", "gate", "up", "gate_up", "down",
+                  "qkv", "gdn_qkv", "attn_gate", "gdn_gate", "gdn_attn_gate"] {
+            assert!(Q4ProjectionFamily::from_label(l).is_some(), "unmapped label {l}");
+        }
+        assert!(Q4ProjectionFamily::from_label("nonsense").is_none());
     }
 
     #[test]
-    fn gdn_carrier_families_are_named_not_implicit() {
-        // The measured F16 threshold is in the GDN recurrence, so those
-        // projections must be opted in by name, never swept in by accident.
-        assert_eq!(q4_f16_zone_family("qkv"), Some("gdn_qkv"));
-        assert_eq!(q4_f16_zone_family("attn_gate"), Some("gdn_attn_gate"));
-        assert_eq!(q4_f16_zone_family("nonsense"), None);
+    fn q8_never_admits_wo_even_under_all() {
+        let _serial = ZONE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        std::env::set_var("LUMEN_CUDA_PRECISION_ZONE", "all");
+        let p = resolve_q4_act_plan().expect("plan");
+        assert_eq!(p.mode_for(Q4ProjectionFamily::AttnWo), Q4ActMode::F32);
+        assert_eq!(p.mode_for(Q4ProjectionFamily::FfnGateUp), Q4ActMode::Q8_1);
+        clear();
+    }
+
+    #[test]
+    fn f16_does_admit_wo() {
+        let _serial = ZONE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        std::env::set_var("LUMEN_CUDA_Q4_F16_ZONE", "wo");
+        let p = resolve_q4_act_plan().expect("plan");
+        assert_eq!(p.mode_for(Q4ProjectionFamily::AttnWo), Q4ActMode::F16);
+        clear();
+    }
+
+    #[test]
+    fn conflicting_claims_fail_rather_than_silently_pick_one() {
+        let _serial = ZONE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        std::env::set_var("LUMEN_CUDA_PRECISION_ZONE", "ffn_gate_up");
+        std::env::set_var("LUMEN_CUDA_Q4_F16_ZONE", "ffn_gate_up");
+        assert!(resolve_q4_act_plan().is_err());
+        clear();
+    }
+
+    #[test]
+    fn unknown_family_name_fails_rather_than_zoning_nothing() {
+        let _serial = ZONE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        std::env::set_var("LUMEN_CUDA_Q4_F16_ZONE", "ffn_gate_upp");
+        assert!(resolve_q4_act_plan().is_err());
+        clear();
+    }
+
+    #[test]
+    fn unset_is_all_f32_and_flagged_default() {
+        let _serial = ZONE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        let p = resolve_q4_act_plan().expect("plan");
+        assert!(p.is_default);
+        for f in Q4ProjectionFamily::ALL {
+            assert_eq!(p.mode_for(f), Q4ActMode::F32);
+        }
     }
 }
