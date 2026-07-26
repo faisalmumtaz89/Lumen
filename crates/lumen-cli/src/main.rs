@@ -12,6 +12,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod bench;
 pub mod cache;
 mod convert;
+mod decode_bench;
 #[allow(unused)]
 mod download;
 mod help;

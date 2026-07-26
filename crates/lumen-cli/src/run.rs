@@ -1388,7 +1388,9 @@ fn resolve_kv_precision(
 /// Default: min(model_max, max(prompt_len + max_gen + 256 headroom, 512)).
 /// This ensures KV cache is right-sized for actual usage while leaving headroom
 /// for multi-turn conversations. Use --context-len to override.
-fn effective_max_seq_len(
+// `pub(crate)`: visibility only, so `lbench` sizes its KV cache with the exact
+// same right-sizing rule as the CLI (KV footprint changes decode throughput).
+pub(crate) fn effective_max_seq_len(
     model_max: usize,
     user_override: Option<usize>,
     prompt_len: usize,
@@ -1853,8 +1855,12 @@ fn create_cpu_or_metal_backend(
 ///
 /// `threads` controls the SIMD backend thread pool size:
 ///   0 = auto-detect (all available cores), N = use exactly N threads.
+// `pub(crate)` (visibility only — no behaviour change) so the `lbench`
+// benchmark binary in this crate constructs its backend through THIS function
+// rather than a forked copy. Measurement fidelity depends on the benchmark and
+// the shipping CLI sharing one construction path.
 #[allow(clippy::too_many_arguments)]
-fn create_backend(
+pub(crate) fn create_backend(
     use_simd: bool,
     #[allow(unused_variables)] use_metal: bool,
     #[allow(unused_variables)] use_cuda: bool,
@@ -2469,6 +2475,27 @@ fn run_with_mmap(
         // the model-aware `repetition_penalty` default here too (MoE → 1.03
         // when the operator did not pass `--repeat-penalty`).
         let resolved_sampling = effective_sampling(sampling);
+
+        // BENCHMARK ARTIFACT (default-OFF, `LUMEN_DECODE_BENCH=1`): the audited
+        // fixed-decode battery. This Metal batched-prefill path bypasses
+        // `run_engine`, so the hook is repeated here — on the fully-configured
+        // Metal backend, after preload/global-tensor/expert-cache setup, so the
+        // benchmark measures the shipping decode path by construction.
+        if let Some(cfg) = crate::decode_bench::from_env() {
+            crate::decode_bench::run(
+                &cfg,
+                &engine,
+                &provider,
+                &metal as &dyn ComputeBackend,
+                prompt_tokens,
+                &resolved_sampling,
+                tokenizer,
+                backend_name,
+                model_display,
+            );
+            return;
+        }
+
         let live = LiveModel::from_lbc(provider.lbc(), provider.output_proj_quant);
         let gen_result = run_generation(
             &engine,
@@ -2639,6 +2666,27 @@ fn run_engine(
     // paths are unchanged.
     let resolved_sampling = effective_sampling(sampling);
     let sampling = &resolved_sampling;
+
+    // BENCHMARK ARTIFACT (default-OFF, `LUMEN_DECODE_BENCH=1`): the audited
+    // fixed-decode battery. It hooks in HERE, after every `run_with_*` has
+    // opened the provider, installed the four model-aware setters and fully
+    // configured the backend — so the benchmark measures the shipping setup by
+    // construction and cannot re-introduce the missing-setter class of
+    // measurement artifact. Unset, this is a single boolean test.
+    if let Some(cfg) = crate::decode_bench::from_env() {
+        crate::decode_bench::run(
+            &cfg,
+            engine,
+            weights,
+            backend,
+            prompt_tokens,
+            sampling,
+            tokenizer,
+            backend_name,
+            model_display,
+        );
+        return;
+    }
 
     // Metal batched prefill is handled in the run_with_* functions directly,
     // not here, to avoid creating a second Metal backend.

@@ -182,6 +182,36 @@ pub fn model_dense_quant_pub() -> Option<QuantScheme> {
     model_dense_quant()
 }
 
+/// Read-only snapshot of the four model-aware setters, as RESOLVED by the
+/// registry the backend actually consults:
+/// `(dense_quant, primary_quant, block_count, is_moe)`.
+///
+/// Exists for the audited decode-benchmark artifact. Recording the resolved
+/// values — rather than trusting that the caller invoked the setters — is what
+/// makes the missing-setter measurement artifact (which once understated a
+/// whole 9-cell board by up to 55% by silently routing to legacy kernels)
+/// impossible to reproduce without it showing up in the evidence. Not on any
+/// hot path; four relaxed atomic loads.
+///
+/// Note the two quant signals are genuinely different things: `dense_hint` is
+/// the coarse lm_head-derived tag fed by `set_model_dense_quant`
+/// (bf16 / quantised / unset), while `primary_quant` is the EXACT bulk
+/// attention+FFN scheme fed by `set_model_primary_quant`. `0` block count or a
+/// `None` primary quant both mean "setter never ran" → legacy dispatch.
+pub fn model_setter_snapshot() -> (&'static str, Option<QuantScheme>, u32, bool) {
+    let dense_hint = match MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) {
+        HINT_BF16 => "bf16",
+        HINT_QUANTISED => "quantised",
+        _ => "unset",
+    };
+    (
+        dense_hint,
+        model_dense_quant(), // reads MODEL_PRIMARY_QUANT_SCHEME (exact bulk scheme)
+        model_block_count(),
+        model_is_moe(),
+    )
+}
+
 /// Records the loaded model's transformer block count (9B = 32 layers,
 /// 27B = 64). Called from the CLI / server alongside `set_model_dense_quant`.
 /// This is the model-SIZE discriminator the per-class attention-precision
@@ -1188,6 +1218,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_PROFILE",
     "LUMEN_CUDA_PTX_CACHE",
     "LUMEN_CUDA_PTX_CACHE_DIR",
+    "LUMEN_CUDA_PRECISION_ZONE",
     "LUMEN_CUDA_Q4_SPLIT",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
@@ -2400,7 +2431,8 @@ mod tests {
         "LUMEN_CUDA_PROFILE",
         "LUMEN_CUDA_PTX_CACHE",
         "LUMEN_CUDA_PTX_CACHE_DIR",
-        "LUMEN_CUDA_Q4_SPLIT",
+        "LUMEN_CUDA_PRECISION_ZONE",
+    "LUMEN_CUDA_Q4_SPLIT",
         "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q4_MMVQ",
         "LUMEN_CUDA_Q8_MMVQ",
@@ -2494,5 +2526,109 @@ mod tests {
                  false-warn at startup. Add it to the allowlist."
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PRECISION ZONING for the Q4 decode path (`LUMEN_CUDA_PRECISION_ZONE`)
+// ---------------------------------------------------------------------------
+//
+// Background. On the 9B GDN config the whole model is pinned to F32
+// activations for Q4 weights (`KernelSet::q4_decode_f32_act`), because the
+// int8 Q8_1-activation dp4a path collapses output quality. That is a
+// WHOLE-MODEL switch, and it is expensive: 9B-Q4 decodes at 88 tok/s while
+// llama.cpp reaches 153 tok/s on the identical GGUF — Lumen realises only
+// ~31% of achievable HBM bandwidth because F32 activations foreclose dp4a.
+//
+// But the measured quality cliff is NOT uniform. The authoritative Pareto
+// (LKA-receipts §894) is:
+//
+//     F32 everywhere      88 tok/s   accepted reference
+//     Q8 except `wo`     110 tok/s   46/60 vs 52/60  (degraded)
+//     Q8 everywhere      138 tok/s   catastrophic
+//
+// and the collapse is concentrated in `wo`, the full-attention output
+// projection: its input is sigmoid-gated and outlier-heavy, so per-32 amax
+// scaling crushes the small channels. Other projections lose a diffuse 4-6/60.
+//
+// So the lever is ZONING, not a global flip: admit reduced precision one
+// projection family at a time, under the correctness gate, and never for `wo`.
+// This function is the admission oracle. Each admitted family is one candidate
+// for the LKA harness (`evaluate_candidate`), whose correctness gate runs
+// BEFORE any timing.
+//
+// Usage:  LUMEN_CUDA_PRECISION_ZONE=ffn_gate_up,ffn_down
+//         LUMEN_CUDA_PRECISION_ZONE=all      (every family EXCEPT `wo`)
+// Unset/empty => no family admitted => byte-identical to today's default.
+
+/// Projection families that may be independently admitted to reduced-precision
+/// (Q8_1-activation dp4a) decode. `wo` is deliberately absent: it is the
+/// measured quality cliff and is never admissible through this flag.
+fn precision_zone_family(label: &str) -> Option<&'static str> {
+    match label {
+        "gate" | "up" | "gate_up" => Some("ffn_gate_up"),
+        "down" => Some("ffn_down"),
+        "qkv" => Some("gdn_qkv"),
+        "attn_gate" => Some("gdn_attn_gate"),
+        "wq" | "wk" | "wv" => Some("attn_qkv"),
+        // "wo" => intentionally unmapped: see the module comment above.
+        _ => None,
+    }
+}
+
+/// True iff this projection is admitted to the reduced-precision zone.
+///
+/// FAIL-CLOSED by construction: an unknown label, an unset flag, or `wo` all
+/// return `false`, i.e. keep full F32 activations. Widening this set is a
+/// correctness decision that must be earned through the harness gate, not a
+/// convenience.
+pub fn precision_zone_admits(label: &str) -> bool {
+    use std::sync::OnceLock;
+    static ZONE: OnceLock<Vec<String>> = OnceLock::new();
+    let zone = ZONE.get_or_init(|| {
+        std::env::var("LUMEN_CUDA_PRECISION_ZONE")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    if zone.is_empty() {
+        return false;
+    }
+    // `wo` is never admitted, not even under "all". The cliff is measured.
+    let Some(family) = precision_zone_family(label) else {
+        return false;
+    };
+    zone.iter().any(|z| z == "all" || z == family)
+}
+
+#[cfg(test)]
+mod precision_zone_tests {
+    use super::*;
+
+    #[test]
+    fn wo_is_never_admitted_even_under_all() {
+        // `wo` is the measured quality cliff (Q8 everywhere = catastrophic).
+        // No flag value may admit it; that is the whole point of zoning.
+        std::env::set_var("LUMEN_CUDA_PRECISION_ZONE", "all");
+        // Fresh process semantics are approximated here: the OnceLock may
+        // already be primed by a sibling test, so assert the pure mapping,
+        // which is what encodes the invariant.
+        assert!(precision_zone_family("wo").is_none());
+        std::env::remove_var("LUMEN_CUDA_PRECISION_ZONE");
+    }
+
+    #[test]
+    fn families_map_to_the_documented_names() {
+        assert_eq!(precision_zone_family("gate"), Some("ffn_gate_up"));
+        assert_eq!(precision_zone_family("up"), Some("ffn_gate_up"));
+        assert_eq!(precision_zone_family("down"), Some("ffn_down"));
+        assert_eq!(precision_zone_family("qkv"), Some("gdn_qkv"));
+        assert_eq!(precision_zone_family("wq"), Some("attn_qkv"));
+        assert_eq!(precision_zone_family("unknown_proj"), None);
     }
 }

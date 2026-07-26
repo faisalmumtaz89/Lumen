@@ -329,6 +329,15 @@ impl InferenceEngine {
         // logits readback) so the penalty can be applied on CPU.
         let use_gpu_greedy = use_gpu_greedy_predicate(sampling, caps.gpu_resident, caps.gpu_argmax);
 
+        // BENCHMARK-ONLY clock (`decode_loop_time`): starts AFTER the first token
+        // has been sampled from the already-computed prefill logits and ends after
+        // the final backend decode call. `decode_time` above deliberately keeps its
+        // historical meaning (it also covers that first CPU-side full-vocabulary
+        // sample), but a benchmark that compares against llama-bench's tgN must time
+        // exactly N decode calls and nothing else — including no full-vocab scan
+        // that the shipping GPU-argmax path never performs per token.
+        let decode_loop_start = Instant::now();
+
         if use_gpu_greedy {
             // GPU-RESIDENT GREEDY fast path: argmax on GPU, 4-byte readback.
             // decode_token_greedy() advances kv.seq_len() internally.
@@ -400,6 +409,7 @@ impl InferenceEngine {
         }
 
         let decode_time = decode_start.elapsed();
+        let decode_loop_time = decode_loop_start.elapsed();
         let total_time = total_start.elapsed();
 
         let io = match weights.io_snapshot() {
@@ -436,6 +446,7 @@ impl InferenceEngine {
             total_time,
             prefill_time,
             decode_time,
+            decode_loop_time,
             io,
             weight_cache_hit_rate: weights.stats().hit_rate(),
             per_layer_timings,
@@ -599,6 +610,9 @@ impl InferenceEngine {
             total_time,
             prefill_time,
             decode_time,
+            // benchmark-only clock; only `generate()` (the path the audited
+            // decode battery drives) instruments the loop separately.
+            decode_loop_time: std::time::Duration::ZERO,
             io,
             weight_cache_hit_rate: weights.stats().hit_rate(),
             per_layer_timings,
@@ -862,6 +876,9 @@ impl InferenceEngine {
             total_time,
             prefill_time,
             decode_time,
+            // benchmark-only clock; only `generate()` (the path the audited
+            // decode battery drives) instruments the loop separately.
+            decode_loop_time: std::time::Duration::ZERO,
             io,
             weight_cache_hit_rate: weights.stats().hit_rate(),
             per_layer_timings: session.take_timings(),

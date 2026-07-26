@@ -9221,8 +9221,16 @@ unsafe fn launch_matvec(
     // where it falls to the F32-activation matvec_q4_0_smem path below (the int8
     // Q8_1-activation dp4a collapses quality through the 9B's GDN recurrence).
     // 27B/MoE/non-GDN keep the fast int8 dp4a path.
+    // PRECISION ZONING: `q4_decode_f32_act` is a WHOLE-MODEL pin to F32
+    // activations for the fragile 9B GDN config. The measured quality cliff is
+    // concentrated in `wo`, not uniform, so a projection family explicitly
+    // admitted via LUMEN_CUDA_PRECISION_ZONE takes the fast dp4a path even on
+    // that config. Unset flag => admits nothing => byte-identical to before.
+    // `wo` is never admissible (see runtime_defaults::precision_zone_admits).
+    let zone_admits = crate::runtime_defaults::precision_zone_admits(label);
     if matches!(weight, GpuWeightBuf::Q4Aligned(_))
-        || (matches!(weight, GpuWeightBuf::Q4Raw(_)) && !kernels.q4_decode_f32_act)
+        || (matches!(weight, GpuWeightBuf::Q4Raw(_))
+            && (!kernels.q4_decode_f32_act || zone_admits))
     {
         // Path -1: Q4_0 dp4a mmvq dispatch.
         // Q8_1-activation x Q4_0-weight matvec with dp4a INT8 dot-product.
@@ -9999,8 +10007,16 @@ unsafe fn launch_matvec_residual(
     // Q4Aligned residual: dp4a with pre-quantized Q8_1 input + fused residual.
     // Q4Raw: dp4a EXCEPT on the fragile 9B config (kernels.q4_decode_f32_act),
     // where it takes the F32-activation matvec_q4_0_smem_residual path below.
+    // PRECISION ZONING: `q4_decode_f32_act` is a WHOLE-MODEL pin to F32
+    // activations for the fragile 9B GDN config. The measured quality cliff is
+    // concentrated in `wo`, not uniform, so a projection family explicitly
+    // admitted via LUMEN_CUDA_PRECISION_ZONE takes the fast dp4a path even on
+    // that config. Unset flag => admits nothing => byte-identical to before.
+    // `wo` is never admissible (see runtime_defaults::precision_zone_admits).
+    let zone_admits = crate::runtime_defaults::precision_zone_admits(label);
     if matches!(weight, GpuWeightBuf::Q4Aligned(_))
-        || (matches!(weight, GpuWeightBuf::Q4Raw(_)) && !kernels.q4_decode_f32_act)
+        || (matches!(weight, GpuWeightBuf::Q4Raw(_))
+            && (!kernels.q4_decode_f32_act || zone_admits))
     {
         if let (Some(quant_fn), Some(q8_1_buf)) = (
             kernels.quantize_f32_to_q8_1.as_ref(),

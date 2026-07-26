@@ -119,6 +119,15 @@ pub struct InferenceMetrics {
     /// Time spent in decode phase.
     pub decode_time: Duration,
 
+    /// BENCHMARK-ONLY: time spent in the decode LOOP alone — from immediately
+    /// after the first token is sampled off the prefill logits to immediately
+    /// after the last backend decode call. `decode_time` additionally covers
+    /// that first CPU-side full-vocabulary sample, which makes it unsuitable as
+    /// the numerator/denominator of an engine-vs-engine comparison against
+    /// `llama-bench tgN` (N decode calls, no full-vocab sampling). Zero when the
+    /// generation produced no decode calls.
+    pub decode_loop_time: Duration,
+
     /// Aggregated I/O metrics for the session.
     pub io: IoMetrics,
 
