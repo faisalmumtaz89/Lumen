@@ -5706,10 +5706,26 @@ impl CudaBackend {
                     && batch_u32 == 1
                     && head_dim_u32 % 4 == 0
                     && st.kernels.gdn_prefill_fused_v3_t1_w4.is_some()
-                    && matches!(
-                        std::env::var("LUMEN_CUDA_GDN_T1_W4").ok().as_deref(),
-                        Some("1") | Some("true") | Some("yes") | Some("on")
-                    );
+                    && crate::runtime_defaults::gdn_t1_w4_requested();
+                // POSITIVE DISPATCH PROOF. A kernel that is requested but never
+                // reached is indistinguishable from one that is reached and
+                // does nothing — this campaign has already been burned twice by
+                // exactly that (a dead F16 branch behind a returning selector,
+                // and split siblings that were never allocated). Report the
+                // decision and, when the flag was set but the guard rejected
+                // it, say which clause failed.
+                if crate::runtime_defaults::gdn_t1_w4_requested() {
+                    use std::sync::atomic::{AtomicBool, Ordering as O};
+                    static SHOWN: AtomicBool = AtomicBool::new(false);
+                    if !SHOWN.swap(true, O::Relaxed) {
+                        eprintln!(
+                            "[GDN_T1_W4] dispatched={use_t1_w4} \
+                             (f64={use_prefill_f64} batch={batch_u32} \
+                             head_dim={head_dim_u32} kernel_loaded={})",
+                            st.kernels.gdn_prefill_fused_v3_t1_w4.is_some(),
+                        );
+                    }
+                }
                 let state_fn = if use_prefill_f64 {
                     st.kernels.gdn_prefill_fused_v3_f64accum.as_ref().unwrap()
                 } else if use_t1_w4 {
@@ -7070,10 +7086,26 @@ impl CudaBackend {
                     && batch_u32 == 1
                     && head_dim_u32 % 4 == 0
                     && st.kernels.gdn_prefill_fused_v3_t1_w4.is_some()
-                    && matches!(
-                        std::env::var("LUMEN_CUDA_GDN_T1_W4").ok().as_deref(),
-                        Some("1") | Some("true") | Some("yes") | Some("on")
-                    );
+                    && crate::runtime_defaults::gdn_t1_w4_requested();
+                // POSITIVE DISPATCH PROOF. A kernel that is requested but never
+                // reached is indistinguishable from one that is reached and
+                // does nothing — this campaign has already been burned twice by
+                // exactly that (a dead F16 branch behind a returning selector,
+                // and split siblings that were never allocated). Report the
+                // decision and, when the flag was set but the guard rejected
+                // it, say which clause failed.
+                if crate::runtime_defaults::gdn_t1_w4_requested() {
+                    use std::sync::atomic::{AtomicBool, Ordering as O};
+                    static SHOWN: AtomicBool = AtomicBool::new(false);
+                    if !SHOWN.swap(true, O::Relaxed) {
+                        eprintln!(
+                            "[GDN_T1_W4] dispatched={use_t1_w4} \
+                             (f64={use_prefill_f64} batch={batch_u32} \
+                             head_dim={head_dim_u32} kernel_loaded={})",
+                            st.kernels.gdn_prefill_fused_v3_t1_w4.is_some(),
+                        );
+                    }
+                }
                 let state_fn = if use_prefill_f64 {
                     st.kernels.gdn_prefill_fused_v3_f64accum.as_ref().unwrap()
                 } else if use_t1_w4 {

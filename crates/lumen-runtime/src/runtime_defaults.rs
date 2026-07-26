@@ -3030,3 +3030,17 @@ pub fn decode_ablate(phase: &str) -> bool {
     .iter()
     .any(|p| p == phase)
 }
+
+/// `LUMEN_CUDA_GDN_T1_W4=1` — four-warp CTA grouping for the T=1 GDN
+/// recurrence. Read once; the dispatch site logs whether the guard actually
+/// admitted it, so "requested" and "reached" are never conflated.
+pub fn gdn_t1_w4_requested() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_GDN_T1_W4").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
