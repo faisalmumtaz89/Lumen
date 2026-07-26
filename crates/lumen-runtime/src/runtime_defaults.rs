@@ -1220,6 +1220,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_PTX_CACHE_DIR",
     "LUMEN_CUDA_PRECISION_ZONE",
     "LUMEN_CUDA_Q4_F16_ZONE",
+    "LUMEN_CUDA_Q4_ROUTE_ASSERT",
     "LUMEN_CUDA_Q4_SPLIT",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
@@ -2434,7 +2435,10 @@ mod tests {
         "LUMEN_CUDA_PTX_CACHE_DIR",
         "LUMEN_CUDA_PRECISION_ZONE",
         "LUMEN_CUDA_Q4_F16_ZONE",
+        "LUMEN_CUDA_Q4_ROUTE_ASSERT",
+    "LUMEN_CUDA_Q4_ROUTE_ASSERT",
     "LUMEN_CUDA_Q4_F16_ZONE",
+    "LUMEN_CUDA_Q4_ROUTE_ASSERT",
     "LUMEN_CUDA_Q4_SPLIT",
         "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q4_MMVQ",
@@ -2602,6 +2606,10 @@ impl Q4ProjectionFamily {
             "down" => Self::FfnDown,
             // both spellings in use at GDN dispatch sites
             "qkv" | "gdn_qkv" => Self::GdnQkv,
+            // `ssm_out` is floored to Q8_0 by the converter, so it is not a Q4
+            // zoning candidate — but it MUST map, or a future Q4 variant would
+            // silently fall through to F32 exactly as the GDN labels once did.
+            "ssm_out" | "gdn_ssm_out" => Self::GdnAttnGate,
             "attn_gate" | "gdn_gate" | "gdn_attn_gate" => Self::GdnAttnGate,
             _ => return None,
         })
@@ -2769,11 +2777,16 @@ mod q4_act_plan_tests {
     }
 
     #[test]
-    fn every_dispatch_label_in_the_tree_maps_to_a_family() {
-        // The first implementation missed these two spellings entirely, so the
-        // GDN families never zoned and the run reported a false ceiling.
+    fn known_dispatch_labels_map_to_a_family() {
+        // NOTE the honest scope: this is a hand-maintained list, so it proves
+        // these spellings map — NOT that the tree contains no others. The
+        // real guarantee is the runtime route census, which fails the run when
+        // a zoned family is never dispatched. An earlier version of this test
+        // claimed the stronger invariant and was wrong: it omitted the live
+        // `gdn_ssm_out` spelling.
         for l in ["wq", "wk", "wv", "wo", "gate", "up", "gate_up", "down",
-                  "qkv", "gdn_qkv", "attn_gate", "gdn_gate", "gdn_attn_gate"] {
+                  "qkv", "gdn_qkv", "attn_gate", "gdn_gate", "gdn_attn_gate",
+                  "ssm_out", "gdn_ssm_out"] {
             assert!(Q4ProjectionFamily::from_label(l).is_some(), "unmapped label {l}");
         }
         assert!(Q4ProjectionFamily::from_label("nonsense").is_none());
@@ -2828,5 +2841,111 @@ mod q4_act_plan_tests {
         for f in Q4ProjectionFamily::ALL {
             assert_eq!(p.mode_for(f), Q4ActMode::F32);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ROUTE CENSUS — positive proof that a zoned family took the path it asked for
+// ---------------------------------------------------------------------------
+//
+// Two sweeps were wasted measuring branches that never executed: the string
+// oracle missed the GDN label spellings, and the F16 branch sat *after* an
+// early `return` so it was unreachable for every family except `wo`. Both
+// produced plausible-looking numbers. Token-ID equality is NOT route evidence
+// either — changed numerics can preserve every argmax.
+//
+// So dispatchers record the path actually taken, AFTER the launch call
+// returns, and the benchmark refuses to report timings unless every explicitly
+// zoned family shows a non-zero count on its requested path.
+//
+// Enabled by `LUMEN_CUDA_Q4_ROUTE_ASSERT=1`; zero overhead when unset.
+
+use std::sync::Mutex;
+
+static ROUTE_CENSUS: Mutex<Vec<(String, &'static str)>> = Mutex::new(Vec::new());
+
+pub fn route_census_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_Q4_ROUTE_ASSERT").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// Record that `label` was dispatched via `path`. Call only after the launch
+/// has actually been issued, never from the branch predicate.
+pub fn route_census_record(label: &str, path: &'static str) {
+    if !route_census_enabled() {
+        return;
+    }
+    if let Ok(mut v) = ROUTE_CENSUS.lock() {
+        v.push((label.to_string(), path));
+    }
+}
+
+/// Per-(family, path) counts observed so far.
+pub fn route_census_summary() -> Vec<(String, &'static str, usize)> {
+    let mut out: Vec<(String, &'static str, usize)> = Vec::new();
+    if let Ok(v) = ROUTE_CENSUS.lock() {
+        for (label, path) in v.iter() {
+            let fam = Q4ProjectionFamily::from_label(label)
+                .map(|f| f.zone_name().to_string())
+                .unwrap_or_else(|| format!("<unmapped:{label}>"));
+            match out.iter_mut().find(|(f, p, _)| *f == fam && p == path) {
+                Some((_, _, n)) => *n += 1,
+                None => out.push((fam, path, 1)),
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Fail unless every explicitly zoned family was observed on a path matching
+/// its requested mode. Returns the manifest string on success.
+pub fn route_census_verify(plan: &Q4ActPlan) -> Result<String, String> {
+    let summary = route_census_summary();
+    let mut lines = Vec::new();
+    let mut errors = Vec::new();
+    for f in Q4ProjectionFamily::ALL {
+        let want = plan.mode_for(f);
+        let observed: Vec<_> = summary
+            .iter()
+            .filter(|(fam, _, _)| fam == f.zone_name())
+            .collect();
+        let taken: usize = observed.iter().map(|(_, _, n)| *n).sum();
+        let paths: Vec<&str> = observed.iter().map(|(_, p, _)| *p).collect();
+        lines.push(format!("{}={:?} calls={} paths={:?}", f.zone_name(), want, taken, paths));
+        if want != Q4ActMode::F32 {
+            let expect_prefix = match want {
+                Q4ActMode::F16 => "F16",
+                Q4ActMode::Q8_1 => "Q8",
+                Q4ActMode::F32 => unreachable!(),
+            };
+            if taken == 0 {
+                errors.push(format!(
+                    "{} requested {:?} but was NEVER dispatched — the branch is \
+                     unreachable, so any timing for this arm is meaningless",
+                    f.zone_name(),
+                    want
+                ));
+            } else if !paths.iter().all(|p| p.starts_with(expect_prefix)) {
+                errors.push(format!(
+                    "{} requested {:?} but ran on {:?}",
+                    f.zone_name(),
+                    want,
+                    paths
+                ));
+            }
+        }
+    }
+    let manifest = format!("route_census: {}", lines.join(" | "));
+    if errors.is_empty() {
+        Ok(manifest)
+    } else {
+        Err(format!("{manifest}\n  ERRORS: {}", errors.join("; ")))
     }
 }

@@ -9344,6 +9344,55 @@ unsafe fn launch_matvec(
         let shmem_f32 = (in_dim as u32) * 4;
         let shmem_f16 = (in_dim as u32) * 2;
 
+        // ROUTE ORDER MATTERS. The F32ActKernel selector below RETURNS for the
+        // 9B (which initialises to Nr4), so any zoned-precision branch placed
+        // after it is unreachable dead code — that is exactly why the first
+        // F16 sweep measured ~1.01x for every family except `wo`: only the
+        // residual dispatcher, which has no NR selector, could reach F16.
+        // An explicitly requested mode must therefore be honoured HERE, before
+        // any default kernel selection, and must fail loudly rather than fall
+        // through to a different representation than was asked for.
+        {
+            let mode = crate::runtime_defaults::q4_act_plan().mode_for_label(label);
+            if mode == crate::runtime_defaults::Q4ActMode::F16 {
+                let Some(hgemv_fn) = kernels.hgemv_q4_0.as_ref() else {
+                    return Err(RuntimeError::Compute(format!(
+                        "{label}: F16 explicitly requested but hgemv_q4_0 failed to \
+                         compile; refusing to silently run a different precision"
+                    )));
+                };
+                if shmem_f16 > HGEMV_SHMEM_LIMIT {
+                    return Err(RuntimeError::Compute(format!(
+                        "{label}: F16 requested but needs {shmem_f16} B shared memory \
+                         (limit {HGEMV_SHMEM_LIMIT})"
+                    )));
+                }
+                let out_dim_u32 = out_dim as u32;
+                let in_dim_u32 = in_dim as u32;
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (hgemv_grid(out_dim_u32), 1, 1),
+                    block_dim: (HGEMV_BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: hgemv_shared_bytes(in_dim_u32),
+                };
+                unsafe {
+                    device
+                        .stream
+                        .launch_builder(hgemv_fn)
+                        .arg(w_q4)
+                        .arg(input)
+                        .arg(output)
+                        .arg(&out_dim_u32)
+                        .arg(&in_dim_u32)
+                        .launch(launch_cfg)
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("hgemv-zone Q4_0 {label}: {e}"))
+                        })?;
+                }
+                crate::runtime_defaults::route_census_record(label, "F16_HGEMV");
+                return Ok(());
+            }
+        }
+
         // LUMEN_CUDA_Q4_F32ACT_KERNEL variant selection.
         // Default `Smem` does NOTHING here and falls through to the unchanged
         // primary NR=2 smem path below (byte-identical). Row/Nr4/Nr8 are pure
@@ -9407,54 +9456,6 @@ unsafe fn launch_matvec(
                         })?;
                     return Ok(());
                 }
-            }
-        }
-
-        // Path 0.5: F16-ACTIVATION ZONE (`LUMEN_CUDA_Q4_F16_ZONE`).
-        //
-        // Takes precedence over the F32 smem path below because on the 9B the
-        // F32 path always wins on shared-memory size (in_dim <= 12288), so the
-        // existing hgemv Path 2 can never fire for this model. The zone flag is
-        // the only way to reach it.
-        //
-        // Global F16 decode is 181 tok/s vs F32's 88, but scores 12/15 vs
-        // 15/15 — and the repository localises that loss to the narrow GDN
-        // recurrence, NOT to `wo`. So this admits F16 per projection family and
-        // keeps the GDN carrier on F32 unless explicitly named. Unlike the Q8
-        // zone, `wo` IS admissible here: F16 carries no per-32 block scale, so
-        // the outlier mechanism that disqualifies `wo` under Q8 does not apply.
-        //
-        // Unset flag => this whole block is skipped => byte-identical default.
-        if crate::runtime_defaults::q4_act_plan().mode_for_label(label)
-            == crate::runtime_defaults::Q4ActMode::F16
-        {
-            if let Some(hgemv_fn) = kernels
-                .hgemv_q4_0
-                .as_ref()
-                .filter(|_| shmem_f16 <= HGEMV_SHMEM_LIMIT)
-            {
-                let out_dim_u32 = out_dim as u32;
-                let in_dim_u32 = in_dim as u32;
-                let grid = hgemv_grid(out_dim_u32);
-                let shmem = hgemv_shared_bytes(in_dim_u32);
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (HGEMV_BLOCK_DIM, 1, 1),
-                    shared_mem_bytes: shmem,
-                };
-                device
-                    .stream
-                    .launch_builder(hgemv_fn)
-                    .arg(w_q4)
-                    .arg(input)
-                    .arg(output)
-                    .arg(&out_dim_u32)
-                    .arg(&in_dim_u32)
-                    .launch(launch_cfg)
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("hgemv-zone Q4_0 {label} launch: {e}",))
-                    })?;
-                return Ok(());
             }
         }
 

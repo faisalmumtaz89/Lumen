@@ -283,6 +283,25 @@ pub(crate) fn run(
         }
     }
 
+    // ROUTE VERIFICATION: refuse to report timings for a branch that never ran.
+    // Two earlier sweeps produced plausible numbers from unreachable code — a
+    // string oracle that missed the GDN label spellings, and an F16 branch
+    // placed after an early return. Timing is meaningless if the requested
+    // representation was not the one dispatched.
+    if lumen_runtime::runtime_defaults::route_census_enabled() {
+        let plan = lumen_runtime::runtime_defaults::q4_act_plan();
+        match lumen_runtime::runtime_defaults::route_census_verify(plan) {
+            Ok(m) => {
+                eprintln!("[decode-bench] {m}");
+                asserts.push(("route_census".into(), m));
+            }
+            Err(e) => {
+                eprintln!("[decode-bench] FATAL: requested route was not taken.\n{e}");
+                std::process::exit(31);
+            }
+        }
+    }
+
     // every measured sequence must be token-identical (greedy + fresh state)
     if token_hashes.windows(2).any(|w| w[0] != w[1]) {
         eprintln!(
