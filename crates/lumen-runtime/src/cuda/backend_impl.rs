@@ -9409,6 +9409,52 @@ unsafe fn launch_matvec(
             }
         }
 
+        // Path 0.5: F16-ACTIVATION ZONE (`LUMEN_CUDA_Q4_F16_ZONE`).
+        //
+        // Takes precedence over the F32 smem path below because on the 9B the
+        // F32 path always wins on shared-memory size (in_dim <= 12288), so the
+        // existing hgemv Path 2 can never fire for this model. The zone flag is
+        // the only way to reach it.
+        //
+        // Global F16 decode is 181 tok/s vs F32's 88, but scores 12/15 vs
+        // 15/15 — and the repository localises that loss to the narrow GDN
+        // recurrence, NOT to `wo`. So this admits F16 per projection family and
+        // keeps the GDN carrier on F32 unless explicitly named. Unlike the Q8
+        // zone, `wo` IS admissible here: F16 carries no per-32 block scale, so
+        // the outlier mechanism that disqualifies `wo` under Q8 does not apply.
+        //
+        // Unset flag => this whole block is skipped => byte-identical default.
+        if crate::runtime_defaults::q4_f16_zone_admits(label) {
+            if let Some(hgemv_fn) = kernels
+                .hgemv_q4_0
+                .as_ref()
+                .filter(|_| shmem_f16 <= HGEMV_SHMEM_LIMIT)
+            {
+                let out_dim_u32 = out_dim as u32;
+                let in_dim_u32 = in_dim as u32;
+                let grid = hgemv_grid(out_dim_u32);
+                let shmem = hgemv_shared_bytes(in_dim_u32);
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (HGEMV_BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: shmem,
+                };
+                device
+                    .stream
+                    .launch_builder(hgemv_fn)
+                    .arg(w_q4)
+                    .arg(input)
+                    .arg(output)
+                    .arg(&out_dim_u32)
+                    .arg(&in_dim_u32)
+                    .launch(launch_cfg)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("hgemv-zone Q4_0 {label} launch: {e}",))
+                    })?;
+                return Ok(());
+            }
+        }
+
         // Path 1: smem kernel (F32 x, NR=2). F32-precision activations for the
         // Q4Raw attention/GDN projections (Q4_0 QUALITY FIX) — F16 activations
         // were measured insufficient on the 9B GDN (12/15 vs F32's 15/15), so
@@ -10087,6 +10133,46 @@ unsafe fn launch_matvec_residual(
     if let GpuWeightBuf::Q4Raw(w_q4) = weight {
         let shmem_f32 = (in_dim as u32) * 4;
         let shmem_f16 = (in_dim as u32) * 2;
+
+        // Path 0.5: F16-ACTIVATION ZONE (`LUMEN_CUDA_Q4_F16_ZONE`) — this is the
+        // `wo` residual matvec, the projection the Q8 zone can never admit
+        // (per-32 block scaling crushes its sigmoid-gated outliers). F16 has no
+        // block scale, so `wo` IS a legitimate F16 candidate and the measured
+        // F16 loss is localised to the GDN recurrence instead. Unset flag =>
+        // skipped => byte-identical default.
+        if crate::runtime_defaults::q4_f16_zone_admits(label) {
+            if let Some(hgemv_fn) = kernels
+                .hgemv_q4_0_residual
+                .as_ref()
+                .filter(|_| shmem_f16 <= HGEMV_SHMEM_LIMIT)
+            {
+                let out_dim_u32 = out_dim as u32;
+                let in_dim_u32 = in_dim as u32;
+                let grid = hgemv_grid(out_dim_u32);
+                let shmem = hgemv_shared_bytes(in_dim_u32);
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (HGEMV_BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: shmem,
+                };
+                device
+                    .stream
+                    .launch_builder(hgemv_fn)
+                    .arg(w_q4)
+                    .arg(input)
+                    .arg(residual)
+                    .arg(output)
+                    .arg(&out_dim_u32)
+                    .arg(&in_dim_u32)
+                    .launch(launch_cfg)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "hgemv-zone+residual Q4_0 {label} launch: {e}",
+                        ))
+                    })?;
+                return Ok(());
+            }
+        }
 
         // Path 1: smem kernel (F32 x, NR=2). F32-precision activations for the
         // Q4Raw attention output (wo) residual matvec — see launch_matvec Path 1.

@@ -1219,6 +1219,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_PTX_CACHE",
     "LUMEN_CUDA_PTX_CACHE_DIR",
     "LUMEN_CUDA_PRECISION_ZONE",
+    "LUMEN_CUDA_Q4_F16_ZONE",
     "LUMEN_CUDA_Q4_SPLIT",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
@@ -2432,6 +2433,8 @@ mod tests {
         "LUMEN_CUDA_PTX_CACHE",
         "LUMEN_CUDA_PTX_CACHE_DIR",
         "LUMEN_CUDA_PRECISION_ZONE",
+        "LUMEN_CUDA_Q4_F16_ZONE",
+    "LUMEN_CUDA_Q4_F16_ZONE",
     "LUMEN_CUDA_Q4_SPLIT",
         "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q4_MMVQ",
@@ -2630,5 +2633,98 @@ mod precision_zone_tests {
         assert_eq!(precision_zone_family("qkv"), Some("gdn_qkv"));
         assert_eq!(precision_zone_family("wq"), Some("attn_qkv"));
         assert_eq!(precision_zone_family("unknown_proj"), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F16-ACTIVATION ZONING for the Q4 decode path (`LUMEN_CUDA_Q4_F16_ZONE`)
+// ---------------------------------------------------------------------------
+//
+// This is a SEPARATE oracle from `precision_zone_admits` and deliberately does
+// NOT share its family map. Reusing the Q8 map here would be a correctness
+// error, because the two representations fail for different reasons:
+//
+//   * Q8_1 uses per-32 amax BLOCK scaling. On `wo` — whose input is
+//     sigmoid-gated and outlier-heavy — a single large channel sets the block
+//     scale and crushes the small channels. Hence `wo` is never Q8-admissible.
+//   * F16 has no block scale at all. It supplies roughly uniform RELATIVE
+//     precision across the vector, so the `wo` outlier mechanism does not
+//     apply. `wo` is therefore F16-admissible and is included below.
+//
+// The measured F16 failure is elsewhere: global-F16 decode runs at 181 tok/s
+// but scores 12/15 vs F32's 15/15, and the repository localises that to the
+// narrow GDN recurrence's precision threshold (see the Path-1 comment in
+// `backend_impl::launch_matvec`). So the GDN carrier projections are the
+// F32 keepers and everything else is a candidate for F16.
+//
+// Latency budget (why the keeper set must stay small): global F16 is
+// 5.525 ms/token and the 1.1x-of-llama.cpp target is 5.931 ms/token, so the
+// F32 keepers may cost at most ~0.406 ms/token in aggregate before the target
+// is out of reach on this lever alone.
+//
+// Usage:  LUMEN_CUDA_Q4_F16_ZONE=ffn_gate_up,ffn_down,attn_qkv,wo
+// Unset/empty => nothing admitted => byte-identical to today's default.
+
+/// Projection families admissible to F16-activation decode. Note this map
+/// INCLUDES `wo`, unlike the Q8 map — see the module comment for why that is
+/// correct rather than an oversight.
+fn q4_f16_zone_family(label: &str) -> Option<&'static str> {
+    match label {
+        "gate" | "up" | "gate_up" => Some("ffn_gate_up"),
+        "down" => Some("ffn_down"),
+        "wq" | "wk" | "wv" => Some("attn_qkv"),
+        "wo" => Some("wo"),
+        // GDN carrier projections: the measured F16 precision threshold lives
+        // here, so they are only admissible if named explicitly.
+        "qkv" => Some("gdn_qkv"),
+        "attn_gate" => Some("gdn_attn_gate"),
+        _ => None,
+    }
+}
+
+/// True iff this projection is admitted to F16-activation decode.
+/// Fail-closed: unset flag, empty value, or unknown label all keep F32.
+pub fn q4_f16_zone_admits(label: &str) -> bool {
+    use std::sync::OnceLock;
+    static ZONE: OnceLock<Vec<String>> = OnceLock::new();
+    let zone = ZONE.get_or_init(|| {
+        std::env::var("LUMEN_CUDA_Q4_F16_ZONE")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    if zone.is_empty() {
+        return false;
+    }
+    let Some(family) = q4_f16_zone_family(label) else {
+        return false;
+    };
+    zone.iter().any(|z| z == "all" || z == family)
+}
+
+#[cfg(test)]
+mod q4_f16_zone_tests {
+    use super::*;
+
+    #[test]
+    fn f16_map_includes_wo_unlike_the_q8_map() {
+        // The two oracles MUST differ here. Q8 crushes `wo` via per-32 block
+        // scaling; F16 has no block scale and does not share that failure.
+        assert_eq!(q4_f16_zone_family("wo"), Some("wo"));
+        assert_eq!(precision_zone_family("wo"), None);
+    }
+
+    #[test]
+    fn gdn_carrier_families_are_named_not_implicit() {
+        // The measured F16 threshold is in the GDN recurrence, so those
+        // projections must be opted in by name, never swept in by accident.
+        assert_eq!(q4_f16_zone_family("qkv"), Some("gdn_qkv"));
+        assert_eq!(q4_f16_zone_family("attn_gate"), Some("gdn_attn_gate"));
+        assert_eq!(q4_f16_zone_family("nonsense"), None);
     }
 }
