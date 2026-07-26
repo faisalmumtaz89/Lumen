@@ -146,3 +146,86 @@ extern "C" __global__ void matvec_q4_split_f32_lane(
         out[row] = total;
     }
 }
+
+// --------------------------------------------------------------------------
+// RESIDUAL variant: out[row] = dot + residual[row].
+//
+// `wo` (the attention output projection) dispatches through
+// `launch_matvec_residual`, a path the lane kernel never covered — so one
+// matvec in EVERY one of the 32 layers was still running the old
+// one-thread-per-block kernel. The full-attention block measured 192 GB/s
+// against the FFN's 600 GB/s while carrying only 5% of the model's bytes,
+// which is what pointed here.
+//
+// Identical decomposition and numerics to `matvec_q4_split_f32_lane`; the
+// only change is folding the residual add into the single writing thread,
+// which also saves a separate elementwise-add launch.
+// --------------------------------------------------------------------------
+extern "C" __global__ void matvec_q4_split_f32_lane_residual(
+    const unsigned char* __restrict__ weight_split,
+    const float* __restrict__ x,
+    const float* __restrict__ residual,
+    float* __restrict__ out,
+    unsigned int out_dim,
+    unsigned int in_dim)
+{
+    const unsigned int row = blockIdx.x;
+    if (row >= out_dim) return;
+
+    const unsigned int tid     = threadIdx.x;
+    const unsigned int warp_id = tid / WARP_SIZE;
+    const unsigned int lane    = tid % WARP_SIZE;
+    const unsigned int grp     = lane / LANES_PER_BLK;
+    const unsigned int w       = lane % LANES_PER_BLK;
+
+    const unsigned int nb = in_dim / Q4_BLOCK_ELEMS;
+    const unsigned long long row_bytes =
+        (unsigned long long)nb * (2ULL + (unsigned long long)Q4_NIBBLE_BYTES);
+    const unsigned char* rp = weight_split + (unsigned long long)row * row_bytes;
+    const unsigned short* row_scales = (const unsigned short*)rp;
+    const unsigned char*  row_nibs   = rp + 2ULL * nb;
+
+    float sumf = 0.0f;
+    for (unsigned int ib = warp_id * BLKS_PER_WARP + grp;
+         ib < nb;
+         ib += NR_WARPS * BLKS_PER_WARP) {
+
+        const int packed = *(const int*)(row_nibs
+            + (unsigned long long)ib * Q4_NIBBLE_BYTES + (unsigned long long)w * 4ULL);
+        const int lo = packed & 0x0F0F0F0F;
+        const int hi = (packed >> 4) & 0x0F0F0F0F;
+
+        const float* xb = x + (unsigned long long)ib * Q4_BLOCK_ELEMS;
+        const float4 xl = *(const float4*)(xb + w * 4);
+        const float4 xh = *(const float4*)(xb + 16 + w * 4);
+
+        float part = 0.0f;
+        part += (float)(((lo      ) & 0xFF) - 8) * xl.x;
+        part += (float)(((lo >>  8) & 0xFF) - 8) * xl.y;
+        part += (float)(((lo >> 16) & 0xFF) - 8) * xl.z;
+        part += (float)(((lo >> 24) & 0xFF) - 8) * xl.w;
+        part += (float)(((hi      ) & 0xFF) - 8) * xh.x;
+        part += (float)(((hi >>  8) & 0xFF) - 8) * xh.y;
+        part += (float)(((hi >> 16) & 0xFF) - 8) * xh.z;
+        part += (float)(((hi >> 24) & 0xFF) - 8) * xh.w;
+
+        part += __shfl_xor_sync(0xffffffff, part, 1);
+        part += __shfl_xor_sync(0xffffffff, part, 2);
+        if (w == 0) {
+            sumf += f16_bits_to_f32_lane(row_scales[ib]) * part;
+        }
+    }
+
+    sumf = warp_reduce_sum_lane(sumf);
+
+    __shared__ float warp_partials_res[NR_WARPS];
+    if (lane == 0) warp_partials_res[warp_id] = sumf;
+    __syncthreads();
+
+    if (tid == 0) {
+        float total = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < NR_WARPS; i++) total += warp_partials_res[i];
+        out[row] = total + residual[row];
+    }
+}

@@ -3109,20 +3109,34 @@ impl CudaBackend {
                     }
                 } else {
                     unsafe {
-                        launch_matvec_residual(
+                        // Lane decomposition first; falls through when the
+                        // variant is off or the layer has no split sibling.
+                        if !launch_matvec_residual_lane(
                             &self.device,
                             &st.kernels,
-                            &lw.wo,
+                            lw.q4_split_wo.as_ref(),
                             &st.scratch.attn_out,
                             &st.scratch.x_gpu,
                             &mut st.scratch.attn_proj,
                             hidden_dim,
                             q_dim,
                             "wo",
-                            lw.wo_f16.as_ref(),
-                            Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut(),
-                        )?;
+                        )? {
+                            launch_matvec_residual(
+                                &self.device,
+                                &st.kernels,
+                                &lw.wo,
+                                &st.scratch.attn_out,
+                                &st.scratch.x_gpu,
+                                &mut st.scratch.attn_proj,
+                                hidden_dim,
+                                q_dim,
+                                "wo",
+                                lw.wo_f16.as_ref(),
+                                Some(&mut st.scratch.input_f16),
+                                st.scratch.input_q8_1.as_mut(),
+                            )?;
+                        }
                     }
                 }
             }
@@ -9974,6 +9988,63 @@ unsafe fn launch_matvec_ext(
 /// # Safety
 ///
 /// Same constraints as `launch_matvec`, plus `residual` must have `out_dim` elements.
+/// Lane-striped residual matvec (`wo`). Returns Ok(false) to fall through.
+///
+/// `wo` runs in EVERY layer and never received the lane decomposition, because
+/// it dispatches through the residual path rather than `launch_matvec`. The
+/// full-attention block measured 192 GB/s against the FFN's 600 GB/s while
+/// holding only 5% of the model's bytes, which is what pointed here.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_matvec_residual_lane(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    q4_split_sibling: Option<&CudaSlice<u8>>,
+    input: &CudaSlice<f32>,
+    residual: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    out_dim: usize,
+    in_dim: usize,
+    label: &str,
+) -> Result<bool, RuntimeError> {
+    if crate::runtime_defaults::q4_split_f32_variant() != 4 {
+        return Ok(false);
+    }
+    // Control for the A/B: LUMEN_CUDA_LANE_WO=0 keeps the lane kernel on every
+    // other projection but leaves `wo` on the old path, so its contribution is
+    // separable within one container.
+    if matches!(std::env::var("LUMEN_CUDA_LANE_WO").ok().as_deref(), Some("0")) {
+        return Ok(false);
+    }
+    let (Some(f), Some(split_w)) = (
+        kernels.matvec_q4_split_f32_lane_residual.as_ref(),
+        q4_split_sibling,
+    ) else {
+        return Ok(false);
+    };
+    let out_dim_u32 = out_dim as u32;
+    let in_dim_u32 = in_dim as u32;
+    let cfg = CudarcLaunchConfig {
+        grid_dim: (out_dim_u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    device
+        .stream
+        .launch_builder(f)
+        .arg(split_w)
+        .arg(input)
+        .arg(residual)
+        .arg(output)
+        .arg(&out_dim_u32)
+        .arg(&in_dim_u32)
+        .launch(cfg)
+        .map_err(|e| {
+            RuntimeError::Compute(format!("matvec_q4_split_f32_lane_residual {label}: {e}"))
+        })?;
+    crate::runtime_defaults::route_census_record(label, "F32_SPLIT_SOA_LANE_RES");
+    Ok(true)
+}
+
 unsafe fn launch_matvec_residual(
     device: &CudaDevice,
     kernels: &KernelSet,
