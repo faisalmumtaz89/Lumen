@@ -148,12 +148,21 @@ extern "C" __global__ void matvec_q4_split_f32(
     }
 
     // Warp reduction, then one shared-memory pass across warps.
-    __shared__ float warp_partials[NR][BLOCK_DIM / WARP_SIZE];
+    //
+    // The partials REUSE the head of the x staging buffer rather than taking a
+    // separate __shared__ array. ffn_down has in_dim = 12288, so the dynamic
+    // request is 12288*4 = 49152 B = exactly the 48 KB default per-block cap on
+    // A100 (SM80); ANY additional static __shared__ would push the launch over
+    // the limit and fail at runtime on the single largest projection in the
+    // model. x is dead after the accumulation loop, and NR*(BLOCK_DIM/WARP_SIZE)
+    // = 32 floats always fits since in_dim >= 32 for every Q4 projection.
+    __syncthreads();
+    float* warp_partials = x_smem_sf32;
     const unsigned int warp_id = threadIdx.x / WARP_SIZE;
     #pragma unroll
     for (int row = 0; row < NR; row++) {
         float v = warp_reduce_sum_splitf32(sumf[row]);
-        if (lane == 0) warp_partials[row][warp_id] = v;
+        if (lane == 0) warp_partials[row * (BLOCK_DIM / WARP_SIZE) + warp_id] = v;
     }
     __syncthreads();
 
@@ -162,7 +171,8 @@ extern "C" __global__ void matvec_q4_split_f32(
         if (r0 + row < out_dim) {
             float total = 0.0f;
             #pragma unroll
-            for (int w = 0; w < BLOCK_DIM / WARP_SIZE; w++) total += warp_partials[row][w];
+            for (int w = 0; w < BLOCK_DIM / WARP_SIZE; w++)
+                total += warp_partials[row * (BLOCK_DIM / WARP_SIZE) + w];
             out[r0 + row] = total;
         }
     }
