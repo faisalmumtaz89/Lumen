@@ -5546,6 +5546,15 @@ impl CudaBackend {
                 }
             }
 
+            // Attribution ablation: skip the RECURRENCE (conv1d/SiLU, state
+            // update, norm-gate) but KEEP the GDN projections. Splits the GDN
+            // block's 31.4% of the token into projection work (attackable the
+            // same way FFN is) vs recurrence work (a different lever class).
+            // Rounds 1-11 never separated these.
+            if crate::runtime_defaults::decode_ablate("gdn_recur") {
+                return Ok(());
+            }
+
             // 1. ssm_conv1d_silu_prefill: conv1d + SiLU, advances conv_state.
             {
                 let conv_fn = st.kernels.ssm_conv1d_silu_prefill.as_ref().unwrap();
