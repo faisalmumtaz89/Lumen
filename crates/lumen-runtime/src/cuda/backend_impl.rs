@@ -11901,11 +11901,33 @@ unsafe fn repack_all_layers_q4_clone_to_split(
     // is raised). With the default 5.1 GB cap attention was never reached
     // anyway (FFN weights are larger and sort first), so the unset-env path is
     // unchanged.
+    // LUMEN_CUDA_Q4_SPLIT_ATTN=1 additionally clones the ATTENTION and GDN
+    // projections. Historically excluded because the Q8_1 residual split
+    // kernel (`matvec_q4_split_q8_1_locked_residual`) produced NaN logits —
+    // that reason does not apply to the F32-exact lane kernel, which is a
+    // different kernel entirely. Default OFF keeps decode byte-identical.
+    //
+    // Without this the lane kernel only ever reached FFN gate/up/down, so the
+    // measured 1.0944x was an FFN-ONLY result and every attention/GDN call
+    // site silently fell back for want of a sibling. GDN projections measured
+    // 455 GB/s against the FFN's 600, so that is where the decomposition is
+    // most needed.
+    let split_attn = matches!(
+        std::env::var("LUMEN_CUDA_Q4_SPLIT_ATTN").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    );
+
     #[derive(Copy, Clone, Debug)]
     enum SplitWeightKind {
         Gate,
         Up,
         Down,
+        Wq,
+        Wk,
+        Wv,
+        Wo,
+        AttnGate,
+        SsmOut,
     }
 
     struct Job {
@@ -11973,6 +11995,41 @@ unsafe fn repack_all_layers_q4_clone_to_split(
             hidden,
             inter,
         );
+
+        if split_attn {
+            // On GDN layers `wq` IS the fused GDN qkv projection; on
+            // full-attention layers it is the fused Q+gate. Either way it is
+            // the largest single matrix outside the FFN. out_dim is derived
+            // from the buffer so both shapes are handled without branching.
+            let rows = |w: &GpuWeightBuf| match w {
+                GpuWeightBuf::Q4Raw(b) => (b.len() / 18) * 32 / hidden,
+                _ => 0,
+            };
+            for (kind, w) in [
+                (SplitWeightKind::Wq, &layer.wq),
+                (SplitWeightKind::Wk, &layer.wk),
+                (SplitWeightKind::Wv, &layer.wv),
+            ] {
+                let out = rows(w);
+                if out > 0 {
+                    push_if_q4raw(&mut jobs, layer_idx, kind, w, out, hidden);
+                }
+            }
+            push_if_q4raw(&mut jobs, layer_idx, SplitWeightKind::Wo, &layer.wo, hidden, hidden);
+            if let Some(ag) = layer.attn_gate.as_ref() {
+                let out = rows(ag);
+                if out > 0 {
+                    push_if_q4raw(&mut jobs, layer_idx, SplitWeightKind::AttnGate, ag, out, hidden);
+                }
+            }
+            if let Some(so) = layer.ssm_out.as_ref() {
+                // ssm_out is [hidden, inner]: derive in_dim from the buffer.
+                let in_d = rows(so);
+                if in_d > 0 {
+                    push_if_q4raw(&mut jobs, layer_idx, SplitWeightKind::SsmOut, so, hidden, in_d);
+                }
+            }
+        }
     }
 
     jobs.sort_by(|a, b| {
@@ -12039,6 +12096,30 @@ unsafe fn repack_all_layers_q4_clone_to_split(
                     None
                 }
             }
+            SplitWeightKind::Wq => match &layer.wq {
+                GpuWeightBuf::Q4Raw(b) => Some(b),
+                _ => None,
+            },
+            SplitWeightKind::Wk => match &layer.wk {
+                GpuWeightBuf::Q4Raw(b) => Some(b),
+                _ => None,
+            },
+            SplitWeightKind::Wv => match &layer.wv {
+                GpuWeightBuf::Q4Raw(b) => Some(b),
+                _ => None,
+            },
+            SplitWeightKind::Wo => match &layer.wo {
+                GpuWeightBuf::Q4Raw(b) => Some(b),
+                _ => None,
+            },
+            SplitWeightKind::AttnGate => match layer.attn_gate.as_ref() {
+                Some(GpuWeightBuf::Q4Raw(b)) => Some(b),
+                _ => None,
+            },
+            SplitWeightKind::SsmOut => match layer.ssm_out.as_ref() {
+                Some(GpuWeightBuf::Q4Raw(b)) => Some(b),
+                _ => None,
+            },
         };
         let Some(raw_buf) = src_ref else { continue };
         match repack_q4_raw_to_split(device, repack_kernel, raw_buf, job.out_dim, job.in_dim) {
@@ -12047,6 +12128,12 @@ unsafe fn repack_all_layers_q4_clone_to_split(
                     SplitWeightKind::Gate => layer.q4_split_w_gate = Some(split_buf),
                     SplitWeightKind::Up => layer.q4_split_w_up = Some(split_buf),
                     SplitWeightKind::Down => layer.q4_split_w_down = Some(split_buf),
+                    SplitWeightKind::Wq => layer.q4_split_wq = Some(split_buf),
+                    SplitWeightKind::Wk => layer.q4_split_wk = Some(split_buf),
+                    SplitWeightKind::Wv => layer.q4_split_wv = Some(split_buf),
+                    SplitWeightKind::Wo => layer.q4_split_wo = Some(split_buf),
+                    SplitWeightKind::AttnGate => layer.q4_split_attn_gate = Some(split_buf),
+                    SplitWeightKind::SsmOut => layer.q4_split_ssm_out = Some(split_buf),
                 }
                 layers_with_split.insert(job.layer_idx);
                 bytes_cloned += job.size_bytes;

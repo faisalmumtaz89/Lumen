@@ -196,6 +196,8 @@ pub struct LayerWeightsGpu {
     pub q4_split_attn_gate: Option<CudaSlice<u8>>,
     pub q4_split_ssm_alpha: Option<CudaSlice<u8>>,
     pub q4_split_ssm_beta: Option<CudaSlice<u8>>,
+    /// Split sibling for the GDN output projection (4096x4096).
+    pub q4_split_ssm_out: Option<CudaSlice<u8>>,
 
     // --- Qwen3.5 full-attention Q+gate fusion weights ---
     /// Per-head Q RMSNorm weight: [head_dim] F32, shared across all heads.
@@ -1010,6 +1012,7 @@ pub fn upload_layer_weights(
         q4_split_attn_gate: None,
         q4_split_ssm_alpha: None,
         q4_split_ssm_beta: None,
+        q4_split_ssm_out: None,
         // Qwen3.5 full-attention per-head Q/K RMSNorm weights.
         attn_q_norm: match &subs.attn_q_norm {
             Some(s) if s.quant == QuantScheme::F32 => {
