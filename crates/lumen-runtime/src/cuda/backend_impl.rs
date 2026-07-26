@@ -4593,8 +4593,13 @@ impl CudaBackend {
             // split-layout: prefer Q8/Q4 split sibling for w_down via inline
             // F32->Q8_1 quantization (fused-down kernels target Q8Aligned/Q4Aligned
             // which the SPLIT preload skips).
-            let use_split_down = (st.kernels.use_q8_split_dispatch && lw.q8_split_w_down.is_some())
-                || (st.kernels.use_q4_split_dispatch && lw.q4_split_w_down.is_some());
+            // SECOND ffn_down split shortcut — the census showed ffn_down still
+            // at 0 F16 calls after only the first one was guarded.
+            let down_mode2 = crate::runtime_defaults::q4_act_plan()
+                .mode_for(crate::runtime_defaults::Q4ProjectionFamily::FfnDown);
+            let use_split_down = down_mode2 != crate::runtime_defaults::Q4ActMode::F16
+                && ((st.kernels.use_q8_split_dispatch && lw.q8_split_w_down.is_some())
+                    || (st.kernels.use_q4_split_dispatch && lw.q4_split_w_down.is_some()));
             if use_split_down {
                 let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref();
                 let q8_1_scratch = st.scratch.input_q8_1.as_mut();
