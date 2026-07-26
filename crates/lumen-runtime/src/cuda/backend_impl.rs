@@ -11073,6 +11073,7 @@ unsafe fn launch_matvec_split_f32(
     let kernel = match variant {
         2 => kernels.matvec_q4_split_f32_wr.as_ref(),
         3 => kernels.matvec_q4_split_f32_gmem.as_ref(),
+        4 => kernels.matvec_q4_split_f32_lane.as_ref(),
         _ => kernels.matvec_q4_split_f32.as_ref(),
     };
     let (Some(split_fn), Some(split_w)) = (kernel, q4_split_sibling) else {
@@ -11091,6 +11092,12 @@ unsafe fn launch_matvec_split_f32(
         3 => CudarcLaunchConfig {
             grid_dim: (out_dim_u32.div_ceil(4), 1, 1),
             block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        // lane-striped: ONE row per CTA, all 4 warps on that row
+        4 => CudarcLaunchConfig {
+            grid_dim: (out_dim_u32, 1, 1),
+            block_dim: (128, 1, 1),
             shared_mem_bytes: 0,
         },
         _ => CudarcLaunchConfig {
@@ -11114,6 +11121,7 @@ unsafe fn launch_matvec_split_f32(
         match variant {
             2 => "F32_SPLIT_SOA_WR",
             3 => "F32_SPLIT_SOA_GMEM",
+            4 => "F32_SPLIT_SOA_LANE",
             _ => "F32_SPLIT_SOA",
         },
     );

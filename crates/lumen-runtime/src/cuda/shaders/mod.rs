@@ -495,6 +495,10 @@ pub const MATVEC_Q4_SPLIT_F32_WR_KERNEL_SOURCE: &str =
 /// x read from global instead of staged. Attributes the 0.909x regression.
 pub const MATVEC_Q4_SPLIT_F32_GMEM_KERNEL_SOURCE: &str =
     include_str!("matvec_q4_split_f32_gmem.cu");
+/// Lane-striped: 4 lanes cooperate per Q4 block, 8 activations per lane,
+/// warp-contiguous weight loads. The F32-exact analogue of mmvq.
+pub const MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE: &str =
+    include_str!("matvec_q4_split_f32_lane.cu");
 
 /// Codegen-LOCKED variant of `MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE`. Same SoA
 /// split layout and integer dp4a dot, but every floating-point op in the

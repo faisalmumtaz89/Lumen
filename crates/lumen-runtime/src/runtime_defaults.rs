@@ -2967,6 +2967,9 @@ pub fn route_census_verify(plan: &Q4ActPlan) -> Result<String, String> {
 ///   global instead of staged in shared. Attributes the `1` regression to
 ///   staging (whose lane stride of 32 floats is the exact 32-bank period)
 ///   or clears it, with nothing else moving.
+/// * `4` — lane-striped: 4 lanes cooperate per Q4 block, 8 activations per
+///   lane, warp-CONTIGUOUS weight loads (variants 1-3 all had a 16-byte lane
+///   stride). The F32-exact analogue of llama.cpp's mmvq decomposition.
 pub fn q4_split_f32_variant() -> u8 {
     use std::sync::OnceLock;
     static V: OnceLock<u8> = OnceLock::new();
@@ -2974,6 +2977,7 @@ pub fn q4_split_f32_variant() -> u8 {
         Some("1") | Some("true") | Some("yes") | Some("on") => 1,
         Some("2") => 2,
         Some("3") => 3,
+        Some("4") => 4,
         _ => 0,
     })
 }

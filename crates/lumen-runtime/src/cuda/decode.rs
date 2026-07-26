@@ -482,6 +482,7 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q4_split_f32: Option<CudaFunction>,
     pub(crate) matvec_q4_split_f32_wr: Option<CudaFunction>,
     pub(crate) matvec_q4_split_f32_gmem: Option<CudaFunction>,
+    pub(crate) matvec_q4_split_f32_lane: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_residual: Option<CudaFunction>,
 
     // Codegen-LOCKED Q4 split matvec (same SoA layout + integer dot as
@@ -1786,6 +1787,19 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] matvec_q4_split_f32_gmem: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_split_f32_lane: match load_fn(
+            shaders::MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE,
+            "matvec_q4_split_f32_lane",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_split_f32_lane: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_split_f32_lane: FAILED: {e}");
                 None
             }
         },
