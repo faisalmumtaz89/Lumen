@@ -3365,6 +3365,80 @@ impl CudaBackend {
         // The fused kernel writes silu(gate)*up directly to scratch.gate,
         // so the SwiGLU step is skipped entirely.
         let fused_glu_fired = 'fused_glu: {
+            // LANE FUSED GLU (Q4, F32 activations). The dense FFN otherwise
+            // issues THREE dispatches per layer — gate matvec, up matvec, and a
+            // SwiGLU pass over inter_dim — i.e. 96 launches per token across 32
+            // layers, plus a full read+write of a 12288-float buffer per layer.
+            // This computes both projections in ONE CTA per output row and
+            // applies silu(gate)*up in-register, so the intermediate never
+            // round-trips through device memory.
+            //
+            // llama.cpp fuses exactly this (PR #16715) and its fusion stack is
+            // the single biggest documented batch-1 decode win (+27-42% on
+            // memory-bound models).
+            if crate::runtime_defaults::q4_split_f32_variant() == 4
+                && st.kernels.matvec_q4_split_f32_lane_gateup.is_some()
+                && lw.q4_split_w_gate.is_some()
+                && lw.q4_split_w_up.is_some()
+                && matches!(
+                    std::env::var("LUMEN_CUDA_LANE_FUSED_GLU").ok().as_deref(),
+                    Some("1") | Some("true") | Some("yes") | Some("on")
+                )
+            {
+                // rmsnorm(attn_proj) -> scratch.normed, same kernel and config
+                // the separate path uses.
+                {
+                    let block_size = rmsnorm_block_size(hidden_dim);
+                    let shared_bytes = rmsnorm_shared_bytes(block_size);
+                    let cfg = CudarcLaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (block_size, 1, 1),
+                        shared_mem_bytes: shared_bytes,
+                    };
+                    let dim = hidden_dim as u32;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.rmsnorm)
+                            .arg(&st.scratch.attn_proj)
+                            .arg(&lw.ffn_norm)
+                            .arg(&mut st.scratch.normed)
+                            .arg(&eps)
+                            .arg(&dim)
+                            .launch(cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("rmsnorm ffn (lane glu): {e}"))
+                    })?;
+                }
+                let f = st.kernels.matvec_q4_split_f32_lane_gateup.as_ref().unwrap();
+                let g = lw.q4_split_w_gate.as_ref().unwrap();
+                let u = lw.q4_split_w_up.as_ref().unwrap();
+                let out_dim_u32 = inter_dim as u32;
+                let in_dim_u32 = hidden_dim as u32;
+                let cfg = CudarcLaunchConfig {
+                    grid_dim: (out_dim_u32, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(f)
+                        .arg(g)
+                        .arg(u)
+                        .arg(&st.scratch.normed)
+                        .arg(&mut st.scratch.gate)
+                        .arg(&out_dim_u32)
+                        .arg(&in_dim_u32)
+                        .launch(cfg)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("lane fused glu L{layer_idx}: {e}"))
+                })?;
+                crate::runtime_defaults::route_census_record("ffn_glu", "LANE_FUSED_GLU");
+                break 'fused_glu true;
+            }
             // LUMEN_CUDA_Q8_MMVQ: mmvq-dp4a fused gate+up+SwiGLU on the Q8 split
             // layout (consult §2.7). Preferred over BOTH the separate mmvq
             // gate/up + swiglu_inplace path AND the scalar fused_glu_gemv when

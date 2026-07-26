@@ -229,3 +229,109 @@ extern "C" __global__ void matvec_q4_split_f32_lane_residual(
         out[row] = total + residual[row];
     }
 }
+
+// --------------------------------------------------------------------------
+// FUSED gate + up + SiLU, lane-striped.
+//
+// The dense FFN issues THREE dispatches per layer: gate matvec, up matvec, and
+// a SwiGLU elementwise pass over inter_dim. Across 32 layers that is 96
+// launches per token plus a full read+write of a 12288-float buffer per layer.
+// llama.cpp fuses exactly this pattern (PR #16715), and its fusion stack is
+// documented as the single biggest batch-1 decode win (+27-42% on
+// memory-bound models).
+//
+// One CTA owns one output row and computes BOTH projections for it, then
+// applies the activation in-register:
+//
+//     out[row] = silu(gate[row]) * up[row]
+//
+// so the SwiGLU buffer round-trip disappears entirely and three launches
+// become one. Both passes reuse the same lane decomposition as
+// matvec_q4_split_f32_lane, and x is read from global where it is L2-hot
+// across every CTA.
+//
+// Numerics: each dot product is accumulated exactly as the standalone lane
+// kernel accumulates it, and silu(g)*u is the same expression the standalone
+// SwiGLU kernel evaluates in F32. So the only difference from the unfused path
+// is that the intermediate never round-trips through device memory.
+//
+// Grid:  (inter_dim, 1, 1)
+// Block: (128, 1, 1)
+// --------------------------------------------------------------------------
+__device__ __forceinline__ float lane_row_dot(
+    const unsigned char* __restrict__ rp,
+    const float* __restrict__ x,
+    unsigned int nb,
+    unsigned int warp_id,
+    unsigned int grp,
+    unsigned int w)
+{
+    const unsigned short* row_scales = (const unsigned short*)rp;
+    const unsigned char*  row_nibs   = rp + 2ULL * nb;
+    float sumf = 0.0f;
+    for (unsigned int ib = warp_id * BLKS_PER_WARP + grp;
+         ib < nb;
+         ib += NR_WARPS * BLKS_PER_WARP) {
+        const int packed = *(const int*)(row_nibs
+            + (unsigned long long)ib * Q4_NIBBLE_BYTES + (unsigned long long)w * 4ULL);
+        const int lo = packed & 0x0F0F0F0F;
+        const int hi = (packed >> 4) & 0x0F0F0F0F;
+        const float* xb = x + (unsigned long long)ib * Q4_BLOCK_ELEMS;
+        const float4 xl = *(const float4*)(xb + w * 4);
+        const float4 xh = *(const float4*)(xb + 16 + w * 4);
+        float part = 0.0f;
+        part += (float)(((lo      ) & 0xFF) - 8) * xl.x;
+        part += (float)(((lo >>  8) & 0xFF) - 8) * xl.y;
+        part += (float)(((lo >> 16) & 0xFF) - 8) * xl.z;
+        part += (float)(((lo >> 24) & 0xFF) - 8) * xl.w;
+        part += (float)(((hi      ) & 0xFF) - 8) * xh.x;
+        part += (float)(((hi >>  8) & 0xFF) - 8) * xh.y;
+        part += (float)(((hi >> 16) & 0xFF) - 8) * xh.z;
+        part += (float)(((hi >> 24) & 0xFF) - 8) * xh.w;
+        part += __shfl_xor_sync(0xffffffff, part, 1);
+        part += __shfl_xor_sync(0xffffffff, part, 2);
+        if (w == 0) {
+            sumf += f16_bits_to_f32_lane(row_scales[ib]) * part;
+        }
+    }
+    return warp_reduce_sum_lane(sumf);
+}
+
+extern "C" __global__ void matvec_q4_split_f32_lane_gateup(
+    const unsigned char* __restrict__ gate_split,
+    const unsigned char* __restrict__ up_split,
+    const float* __restrict__ x,
+    float* __restrict__ out,          // [inter_dim] = silu(gate) * up
+    unsigned int out_dim,
+    unsigned int in_dim)
+{
+    const unsigned int row = blockIdx.x;
+    if (row >= out_dim) return;
+
+    const unsigned int tid     = threadIdx.x;
+    const unsigned int warp_id = tid / WARP_SIZE;
+    const unsigned int lane    = tid % WARP_SIZE;
+    const unsigned int grp     = lane / LANES_PER_BLK;
+    const unsigned int w       = lane % LANES_PER_BLK;
+
+    const unsigned int nb = in_dim / Q4_BLOCK_ELEMS;
+    const unsigned long long row_bytes =
+        (unsigned long long)nb * (2ULL + (unsigned long long)Q4_NIBBLE_BYTES);
+    const unsigned long long off = (unsigned long long)row * row_bytes;
+
+    const float g = lane_row_dot(gate_split + off, x, nb, warp_id, grp, w);
+    const float u = lane_row_dot(up_split   + off, x, nb, warp_id, grp, w);
+
+    __shared__ float part_g[NR_WARPS];
+    __shared__ float part_u[NR_WARPS];
+    if (lane == 0) { part_g[warp_id] = g; part_u[warp_id] = u; }
+    __syncthreads();
+
+    if (tid == 0) {
+        float gs = 0.0f, us = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < NR_WARPS; i++) { gs += part_g[i]; us += part_u[i]; }
+        // SiLU(gate) * up, identical to the standalone SwiGLU kernel in F32.
+        out[row] = (gs / (1.0f + __expf(-gs))) * us;
+    }
+}
