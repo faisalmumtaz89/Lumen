@@ -487,6 +487,14 @@ pub const MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q4_spl
 /// aligned split nibble stream as aligned ints and masks both halves in
 /// registers, while keeping EXACT F32 activation numerics.
 pub const MATVEC_Q4_SPLIT_F32_KERNEL_SOURCE: &str = include_str!("matvec_q4_split_f32.cu");
+/// Warp-per-row SoA variant: no shared staging, no xv[32] array. See the
+/// kernel header for why the smem/NR4 variant regressed to 0.909x.
+pub const MATVEC_Q4_SPLIT_F32_WR_KERNEL_SOURCE: &str =
+    include_str!("matvec_q4_split_f32_wr.cu");
+/// Single-variable control vs the smem variant: identical NR/geometry/dot,
+/// x read from global instead of staged. Attributes the 0.909x regression.
+pub const MATVEC_Q4_SPLIT_F32_GMEM_KERNEL_SOURCE: &str =
+    include_str!("matvec_q4_split_f32_gmem.cu");
 
 /// Codegen-LOCKED variant of `MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE`. Same SoA
 /// split layout and integer dp4a dot, but every floating-point op in the

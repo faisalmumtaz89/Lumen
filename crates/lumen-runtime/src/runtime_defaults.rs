@@ -2952,17 +2952,35 @@ pub fn route_census_verify(plan: &Q4ActPlan) -> Result<String, String> {
     }
 }
 
-/// `LUMEN_CUDA_Q4_SPLIT_F32=1` — route Q4 decode matvecs through the
+/// `LUMEN_CUDA_Q4_SPLIT_F32` — route Q4 decode matvecs through an
 /// F32-activation SoA kernel instead of the native-18-byte smem kernel.
 /// Correctness-neutral by design (identical activation numerics); only the
-/// weight access pattern changes. Default OFF.
-pub fn q4_split_f32_enabled() -> bool {
+/// weight access pattern and work decomposition change.
+///
+/// * `0`/unset — off (default), byte-identical to today.
+/// * `1` — smem-staged, NR=4, 256 threads. MEASURED 0.909x on 9B-Q4: half the
+///   block idles when nb (128 for in_dim 4096) is below blockDim, and staging
+///   x costs 48 KB on ffn_down, pinning it to one block per SM.
+/// * `2` — warp-per-row, 128 threads, NO shared staging, no xv[32] array.
+///   Every lane has work for any nb >= 32 and occupancy is register-bound.
+/// * `3` — single-variable control: identical to `1` except x is read from
+///   global instead of staged in shared. Attributes the `1` regression to
+///   staging (whose lane stride of 32 floats is the exact 32-bank period)
+///   or clears it, with nothing else moving.
+pub fn q4_split_f32_variant() -> u8 {
     use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("LUMEN_CUDA_Q4_SPLIT_F32").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
+    static V: OnceLock<u8> = OnceLock::new();
+    *V.get_or_init(|| match std::env::var("LUMEN_CUDA_Q4_SPLIT_F32").ok().as_deref() {
+        Some("1") | Some("true") | Some("yes") | Some("on") => 1,
+        Some("2") => 2,
+        Some("3") => 3,
+        _ => 0,
     })
+}
+
+/// True when either SoA F32 variant is requested. Used by the Q8_1 split
+/// shortcuts, which must yield so they do not claim a projection before
+/// `launch_matvec_ext` is reached.
+pub fn q4_split_f32_enabled() -> bool {
+    q4_split_f32_variant() != 0
 }

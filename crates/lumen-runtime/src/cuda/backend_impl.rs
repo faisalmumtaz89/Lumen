@@ -11064,20 +11064,40 @@ unsafe fn launch_matvec_split_f32(
     in_dim: usize,
     label: &str,
 ) -> Result<bool, RuntimeError> {
-    if !crate::runtime_defaults::q4_split_f32_enabled() {
+    let variant = crate::runtime_defaults::q4_split_f32_variant();
+    if variant == 0 {
         return Ok(false);
     }
-    let (Some(split_fn), Some(split_w)) =
-        (kernels.matvec_q4_split_f32.as_ref(), q4_split_sibling)
-    else {
+    // Variant 2 (warp-per-row) takes no shared memory and puts 4 rows in a
+    // 128-thread block; variant 1 (smem-staged NR=4) keeps the original shape.
+    let kernel = match variant {
+        2 => kernels.matvec_q4_split_f32_wr.as_ref(),
+        3 => kernels.matvec_q4_split_f32_gmem.as_ref(),
+        _ => kernels.matvec_q4_split_f32.as_ref(),
+    };
+    let (Some(split_fn), Some(split_w)) = (kernel, q4_split_sibling) else {
         return Ok(false);
     };
     let out_dim_u32 = out_dim as u32;
     let in_dim_u32 = in_dim as u32;
-    let launch_cfg = CudarcLaunchConfig {
-        grid_dim: (out_dim_u32.div_ceil(4), 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: in_dim_u32 * 4,
+    let launch_cfg = match variant {
+        // warp-per-row: 4 rows per 128-thread block, no shared at all
+        2 => CudarcLaunchConfig {
+            grid_dim: (out_dim_u32.div_ceil(4), 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        // gmem control: variant 1's geometry exactly, zero dynamic shared
+        3 => CudarcLaunchConfig {
+            grid_dim: (out_dim_u32.div_ceil(4), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        _ => CudarcLaunchConfig {
+            grid_dim: (out_dim_u32.div_ceil(4), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: in_dim_u32 * 4,
+        },
     };
     device
         .stream
@@ -11089,7 +11109,14 @@ unsafe fn launch_matvec_split_f32(
         .arg(&in_dim_u32)
         .launch(launch_cfg)
         .map_err(|e| RuntimeError::Compute(format!("matvec_q4_split_f32 {label}: {e}")))?;
-    crate::runtime_defaults::route_census_record(label, "F32_SPLIT_SOA");
+    crate::runtime_defaults::route_census_record(
+        label,
+        match variant {
+            2 => "F32_SPLIT_SOA_WR",
+            3 => "F32_SPLIT_SOA_GMEM",
+            _ => "F32_SPLIT_SOA",
+        },
+    );
     Ok(true)
 }
 
