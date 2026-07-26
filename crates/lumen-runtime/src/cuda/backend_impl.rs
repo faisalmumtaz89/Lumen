@@ -4309,9 +4309,17 @@ impl CudaBackend {
                 // route via launch_matvec_preq8_1_split (requires inline F32->Q8_1
                 // quantization since the existing fused-down kernels target
                 // Q8Aligned/Q4Aligned which we skipped under SPLIT).
-                let use_split_down = (st.kernels.use_q8_split_dispatch
-                    && lw.q8_split_w_down.is_some())
-                    || (st.kernels.use_q4_split_dispatch && lw.q4_split_w_down.is_some());
+                // An EXPLICIT precision request for ffn_down must beat the
+                // split/Q8_1 shortcut, which otherwise silently claims this
+                // projection before launch_matvec is ever reached — that is why
+                // ffn_down reported 0 F16 calls under the route census.
+                let down_mode = crate::runtime_defaults::q4_act_plan()
+                    .mode_for(crate::runtime_defaults::Q4ProjectionFamily::FfnDown);
+                let down_explicit_non_q8 =
+                    down_mode == crate::runtime_defaults::Q4ActMode::F16;
+                let use_split_down = !down_explicit_non_q8
+                    && ((st.kernels.use_q8_split_dispatch && lw.q8_split_w_down.is_some())
+                        || (st.kernels.use_q4_split_dispatch && lw.q4_split_w_down.is_some()));
                 if use_split_down {
                     let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref();
                     let q8_1_scratch = st.scratch.input_q8_1.as_mut();
@@ -10177,6 +10185,7 @@ unsafe fn launch_matvec_residual(
                             "hgemv-zone+residual Q4_0 {label} launch: {e}",
                         ))
                     })?;
+                crate::runtime_defaults::route_census_record(label, "F16_HGEMV_RESIDUAL");
                 return Ok(());
             }
         }
