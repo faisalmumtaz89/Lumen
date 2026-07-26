@@ -334,6 +334,8 @@ pub(crate) struct KernelSet {
     /// T=1 four-warp CTA grouping of the above. Bit-identical arithmetic;
     /// 1024 CTAs/layer instead of 4096 single-warp CTAs.
     pub(crate) gdn_prefill_fused_v3_t1_w4: Option<CudaFunction>,
+    /// conv1d+SiLU+L2norm(Q,K) fused into one launch at T=1.
+    pub(crate) ssm_conv1d_silu_l2norm_t1: Option<CudaFunction>,
     pub(crate) gdn_prefill_norm_gate: Option<CudaFunction>,
 
     // GDN F64-internal-accumulator variants (env-gated default OFF via
@@ -1294,6 +1296,12 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::GDN_KERNEL_SOURCE,
             "gdn_prefill_fused_v3_t1_w4",
         )
+        .ok(),
+        ssm_conv1d_silu_l2norm_t1: load_fn(
+            shaders::GDN_KERNEL_SOURCE,
+            "ssm_conv1d_silu_l2norm_t1",
+        )
+        .inspect_err(|e| cuda_log!("[CUDA] ssm_conv1d_silu_l2norm_t1: FAILED: {e}"))
         .ok(),
         gdn_prefill_norm_gate: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_norm_gate").ok(),
         // accumulator variants. Default-OFF; loaded best-effort.

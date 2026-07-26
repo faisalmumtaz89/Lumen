@@ -819,3 +819,114 @@ extern "C" __global__ void gdn_prefill_fused_v3_t1_w4(
     h_row[k_base + 2] = s2;
     h_row[k_base + 3] = s3;
 }
+
+
+// ============================================================================
+// ssm_conv1d_silu_l2norm_t1: conv1d + SiLU + L2-normalize(Q,K) in ONE kernel.
+//
+// WHY FUSION AND NOT GEOMETRY
+//
+// The GDN recurrence costs 1.351 ms/token = 56.3 us across 24 layers for FIVE
+// kernels each, i.e. ~11 us per kernel — essentially the per-launch cost, on a
+// phase that reads ~zero weight bytes. Reshaping one of those kernels into
+// four-warp CTAs (gdn_prefill_fused_v3_t1_w4) measured 1.0004x and 0.9972x in
+// two independent rounds: exactly what a PER-LAUNCH-bound phase predicts,
+// since CTA count is not what is being paid for. The lever is fewer launches.
+//
+// This merges the first two of the five: conv1d+SiLU, then the L2 normalize of
+// the Q and K heads, which previously required a separate pass because the
+// normalize needs a whole head's conv output. Assigning one CTA per HEAD makes
+// the dependency intra-CTA, so a __syncthreads() replaces a kernel boundary.
+//
+// Work assignment (T=1):
+//   CTA [0, n_kv)                -> Q head i   : conv+SiLU then L2 normalize
+//   CTA [n_kv, 2*n_kv)           -> K head i   : conv+SiLU then L2 normalize
+//   CTA [2*n_kv, ...)            -> V chunk    : conv+SiLU only (V is not normalized)
+//
+// Numerics: the convolution, the SiLU, the sum-of-squares and the reciprocal
+// are computed in F32 in the same order as the two standalone kernels, and the
+// same 1e-12 epsilon floor is applied, so the result is equivalent to running
+// them back to back.
+//
+// Grid:  (2*n_kv_heads + ceil(v_dim / BLOCK), 1, 1)
+// Block: (BLOCK, 1, 1)
+// ============================================================================
+#define GDN_FUSED_CONV_BLOCK 128
+
+extern "C" __global__ void ssm_conv1d_silu_l2norm_t1(
+    const float* __restrict__ input,    // [conv_dim]
+    float* __restrict__ conv_state,     // [buf_slots, conv_dim] circular R/W
+    const float* __restrict__ weight,   // [conv_dim, kernel_size]
+    float* __restrict__ output,         // [conv_dim] SiLU conv output, Q/K normalized
+    unsigned int conv_dim,
+    unsigned int kernel_size,
+    unsigned int state_pos,
+    unsigned int n_kv_heads,
+    unsigned int head_dim,
+    unsigned int qk_dim)
+{
+    const unsigned int tid = threadIdx.x;
+    const unsigned int blk = blockIdx.x;
+    const unsigned int buf_slots = kernel_size - 1;
+
+    // Resolve this CTA's slice of the qkv vector and whether it normalizes.
+    unsigned int base, count;
+    bool normalize;
+    if (blk < 2u * n_kv_heads) {
+        const unsigned int which = blk / n_kv_heads;     // 0 = Q, 1 = K
+        const unsigned int head  = blk % n_kv_heads;
+        base = which * qk_dim + head * head_dim;
+        count = head_dim;
+        normalize = true;
+    } else {
+        base = 2u * qk_dim + (blk - 2u * n_kv_heads) * GDN_FUSED_CONV_BLOCK;
+        if (base >= conv_dim) return;
+        count = conv_dim - base;
+        if (count > GDN_FUSED_CONV_BLOCK) count = GDN_FUSED_CONV_BLOCK;
+        normalize = false;
+    }
+
+    // --- conv1d + SiLU over this CTA's elements ---
+    float ss = 0.0f;
+    for (unsigned int i = tid; i < count; i += GDN_FUSED_CONV_BLOCK) {
+        const unsigned int gid = base + i;
+        const float inp = input[gid];
+        float sum = 0.0f;
+        for (unsigned int tap = 0; tap < buf_slots; tap++) {
+            const unsigned int slot = (state_pos + tap) % buf_slots;
+            sum += weight[gid * kernel_size + tap] * conv_state[slot * conv_dim + gid];
+        }
+        sum += weight[gid * kernel_size + buf_slots] * inp;
+        conv_state[state_pos * conv_dim + gid] = inp;
+
+        const float activated = sum / (1.0f + expf(-sum));
+        output[gid] = activated;
+        if (normalize) ss += activated * activated;
+    }
+
+    if (!normalize) return;
+
+    // --- L2 normalize this head. The dependency that previously forced a
+    // second kernel launch is now a __syncthreads(). ---
+    __shared__ float red[GDN_FUSED_CONV_BLOCK / 32];
+    __shared__ float inv_norm;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;
+    ss = warp_reduce_sum(ss);
+    if (lane == 0) red[warp] = ss;
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < GDN_FUSED_CONV_BLOCK / 32; i++) total += red[i];
+        const float norm = sqrtf(total);
+        const float eps = 1e-12f;
+        inv_norm = (norm > eps) ? (1.0f / norm) : (1.0f / eps);
+    }
+    __syncthreads();
+
+    const float s = inv_norm;
+    for (unsigned int i = tid; i < count; i += GDN_FUSED_CONV_BLOCK) {
+        output[base + i] *= s;
+    }
+}

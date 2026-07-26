@@ -5646,8 +5646,70 @@ impl CudaBackend {
                 return Ok(());
             }
 
+            // Fusion gate, read once so steps 1 and 3 agree.
+            let fused_conv_l2 = batch_u32 == 1
+                && !use_prefill_f64
+                && st.kernels.ssm_conv1d_silu_l2norm_t1.is_some()
+                && matches!(
+                    std::env::var("LUMEN_CUDA_GDN_FUSED_CONV").ok().as_deref(),
+                    Some("1") | Some("true") | Some("yes") | Some("on")
+                );
+            if std::env::var("LUMEN_CUDA_GDN_FUSED_CONV").is_ok() {
+                use std::sync::atomic::{AtomicBool, Ordering as O};
+                static SHOWN: AtomicBool = AtomicBool::new(false);
+                if !SHOWN.swap(true, O::Relaxed) {
+                    eprintln!(
+                        "[GDN_FUSED_CONV] dispatched={fused_conv_l2} (batch={batch_u32} \
+                         f64={use_prefill_f64} loaded={})",
+                        st.kernels.ssm_conv1d_silu_l2norm_t1.is_some(),
+                    );
+                }
+            }
+
             // 1. ssm_conv1d_silu_prefill: conv1d + SiLU, advances conv_state.
             {
+                // LUMEN_CUDA_GDN_FUSED_CONV=1: conv1d+SiLU AND the L2 normalize
+                // of Q/K in one launch, dropping step 3 below.
+                //
+                // The recurrence costs ~11 us per kernel across 5 kernels x 24
+                // layers while reading ~zero weight bytes — per-LAUNCH cost.
+                // That is why reshaping one kernel's CTAs (T1_W4) measured
+                // 1.0004x and 0.9972x in two rounds: CTA count is not what is
+                // being paid for. One CTA per head makes the normalize's
+                // dependency intra-CTA, so a __syncthreads() replaces a kernel
+                // boundary.
+                if fused_conv_l2 {
+                    let f = st.kernels.ssm_conv1d_silu_l2norm_t1.as_ref().unwrap();
+                    let v_blocks = (p.qkv_dim as u32)
+                        .saturating_sub(2 * qk_dim_u32)
+                        .div_ceil(128);
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (2 * num_kv_heads_u32 + v_blocks, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(f)
+                            .arg(&gdn.qkv_buf)
+                            .arg(&mut gdn.conv_states[gdn_idx])
+                            .arg(conv1d_weight)
+                            .arg(&mut gdn.qkv_conv_buf)
+                            .arg(&qkv_dim_u32)
+                            .arg(&kernel_size_u32)
+                            .arg(&state_pos)
+                            .arg(&num_kv_heads_u32)
+                            .arg(&head_dim_u32)
+                            .arg(&qk_dim_u32)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "GDN fused conv1d+silu+l2norm L{layer_idx}: {e}"
+                        ))
+                    })?;
+                } else {
                 let conv_fn = st.kernels.ssm_conv1d_silu_prefill.as_ref().unwrap();
                 let config = LaunchConfig::for_elements(p.qkv_dim);
                 let launch_cfg = CudarcLaunchConfig {
@@ -5674,6 +5736,7 @@ impl CudaBackend {
                         "GDN decode-via-prefill conv1d_silu L{layer_idx}: {e}"
                     ))
                 })?;
+                }
                 gdn.conv_positions[gdn_idx] = (state_pos + batch_u32) % buf_slots;
             }
 
@@ -5708,7 +5771,8 @@ impl CudaBackend {
             }
 
             // 3. l2_normalize_qk_strided[_f64accum]: L2-norm Q/K in-place on conv_out.
-            {
+            //    SKIPPED when the fused conv kernel already normalized them.
+            if !fused_conv_l2 {
                 let l2_fn = if use_prefill_f64 {
                     st.kernels
                         .l2_normalize_qk_strided_f64accum
