@@ -8586,6 +8586,15 @@ impl CudaBackend {
                     st.globals.output_proj_bf16.is_some(),
                 );
             }
+
+        // LIVE-PATH head ablation. codex-sol found decode_ablate("head") existed
+        // only in the LEGACY compute_final, never in this function — so the
+        // round-49 head arm skipped nothing and its "+0.070 ms" measured noise
+        // against a 1.08 GB tensor that should cost ~1.24 ms. Third instance of
+        // the two-surface pattern (ffn_down, attention entry, now this).
+        if crate::runtime_defaults::decode_ablate("head") {
+            return Ok(());
+        }
         }
         let hp = self.hp()?;
         let hidden_dim = hp.hidden_dim as usize;
@@ -8650,6 +8659,7 @@ impl CudaBackend {
         // Output projection: logits = output_proj * normed.
         // Prefer Q4Aligned dp4a (highest priority for Q4_0), then smem, then scalar.
         if let Some(ref proj_q4a) = st.globals.output_proj_q4_aligned {
+            crate::runtime_defaults::route_census_record("head", "HEAD_Q4_ALIGNED");
             // Path -1: Q4_0 final-projection matvec dispatch
             // for the Q4 output_proj. Env-gated `LUMEN_CUDA_MMV_Q_OUTPUT_PROJ=1`.
             // Default OFF preserves existing Q4Aligned dp4a path (byte-identical).
@@ -8763,6 +8773,7 @@ impl CudaBackend {
                 })?;
             }
         } else if let Some(ref proj_q4) = st.globals.output_proj_q4 {
+            crate::runtime_defaults::route_census_record("head", "HEAD_Q4");
             let out_dim = vocab_size as u32;
             let in_dim = hidden_dim as u32;
 
@@ -8980,6 +8991,7 @@ impl CudaBackend {
                 )?;
             }
         } else if let Some(ref proj_q8_split) = st.globals.output_proj_q8_split {
+            crate::runtime_defaults::route_census_record("head", "HEAD_Q8_SPLIT");
             // OUTPUT_PROJ_SPLIT: Q8 split (SoA) layout for output_proj.
             // Use the dedicated `matvec_q8_split_output_proj_nr32` kernel which
             // processes 32 output rows per CTA (vs NR=2 in the generic split
