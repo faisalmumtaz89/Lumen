@@ -2140,6 +2140,23 @@ impl CudaBackend {
         // full-attention layers, keeping their FFN. Part of splitting the 21%
         // "everything else" that llama.cpp evidently does not pay.
         } else if !crate::runtime_defaults::decode_ablate("attn") {
+            // Log EVERY layer entering the standard attention branch. The
+            // mid-branch probe saw only 4 of the 8 full-attention layers, and
+            // the census agrees (wq/wk/wv 4/token while wo is 8/token from the
+            // same block), so 4 layers diverge somewhere before the QKV
+            // decision. Probing at the entry pins down whether they enter at
+            // all.
+            {
+                use std::sync::atomic::{AtomicU64, Ordering as O};
+                static SEEN: AtomicU64 = AtomicU64::new(0);
+                let bit = 1u64 << (layer_idx.min(63));
+                if SEEN.fetch_or(bit, O::Relaxed) & bit == 0 {
+                    eprintln!(
+                        "[ATTNENTRY] layer={layer_idx} type={layer_type} \
+                         qgate={has_qgate_fusion}"
+                    );
+                }
+            }
             let lw: &LayerWeightsGpu = st.layer_weights_cache.get(layer_idx).ok_or_else(|| {
                 RuntimeError::Compute(format!(
                     "compute_layer_gpu: layer {layer_idx} not in GPU-resident cache",
