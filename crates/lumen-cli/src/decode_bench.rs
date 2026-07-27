@@ -288,6 +288,19 @@ pub(crate) fn run(
     // string oracle that missed the GDN label spellings, and an F16 branch
     // placed after an early return. Timing is meaningless if the requested
     // representation was not the one dispatched.
+    // Print the census ALWAYS, not only when a zone plan is being verified.
+    // Rounds 24-25 measured the int8 Q4 paths (aligned dp4a, split mmvq) as
+    // flat, and "flat" is indistinguishable from "never dispatched" without
+    // this — the exact trap that made three earlier rounds worthless.
+    {
+        let census = lumen_runtime::runtime_defaults::route_census_summary();
+        if census.is_empty() {
+            eprintln!("[Q4ROUTE] (census empty — no Q4 dispatch recorded)");
+        }
+        for (fam, path, n) in census {
+            eprintln!("[Q4ROUTE] {fam} -> {path} x{n}");
+        }
+    }
     if lumen_runtime::runtime_defaults::route_census_enabled() {
         let plan = lumen_runtime::runtime_defaults::q4_act_plan();
         match lumen_runtime::runtime_defaults::route_census_verify(plan) {

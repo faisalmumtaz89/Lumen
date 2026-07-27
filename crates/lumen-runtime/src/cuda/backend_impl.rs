@@ -11166,6 +11166,7 @@ unsafe fn launch_matvec_preq8_1(
         }
         GpuWeightBuf::Q4Aligned(w_q4a) => {
             if let Some(mv_fn) = kernels.matvec_q4_aligned_q8_1.as_ref() {
+                crate::runtime_defaults::route_census_record(label, "Q4_ALIGNED_DP4A");
                 let mv_grid = dp4a_q4_grid(out_dim_u32);
                 let mv_cfg = CudarcLaunchConfig {
                     grid_dim: (mv_grid, 1, 1),
@@ -11335,6 +11336,7 @@ unsafe fn launch_matvec_preq8_1_residual(
         }
         GpuWeightBuf::Q4Aligned(w_q4a) => {
             if let Some(mv_fn) = kernels.matvec_q4_aligned_q8_1_residual.as_ref() {
+                crate::runtime_defaults::route_census_record(label, "Q4_ALIGNED_DP4A_RES");
                 let mv_grid = dp4a_q4_grid(out_dim_u32);
                 let mv_cfg = CudarcLaunchConfig {
                     grid_dim: (mv_grid, 1, 1),
@@ -11625,6 +11627,7 @@ unsafe fn launch_matvec_preq8_1_split(
             // per-fragment -4*x_sum.
             if kernels.use_mmvq_q4 {
                 if let Some(mv_fn) = kernels.matvec_q4_split_q8_1_mmvq.as_ref() {
+                    crate::runtime_defaults::route_census_record(label, "Q4_SPLIT_MMVQ");
                     let out_dim_u32 = out_dim as u32;
                     let in_dim_u32 = in_dim as u32;
                     let mv_cfg = CudarcLaunchConfig {
