@@ -8563,6 +8563,30 @@ impl CudaBackend {
     /// Input: `st.scratch.x_gpu` (final hidden state, [hidden_dim]).
     /// Output: `st.logits_gpu` (logits, [vocab_size]).
     fn compute_final_gpu(&self, st: &mut MutableState) -> Result<(), RuntimeError> {
+        // lm_head COVERAGE PROBE. This projection was NEVER measured: its
+        // ablation arm failed rc=25 (determinism assert) and the "~657 GB/s,
+        // healthy" figure was arithmetic by subtraction, not measurement. It is
+        // vocab 248320 x hidden 4096 = 1.017 G params — about 11% of every
+        // weight byte in the model — and the dispatch is an 8-way chain over
+        // populated buffers, so the wrong one being populated is exactly the
+        // failure mode that cost this campaign five times.
+        {
+            use std::sync::atomic::{AtomicBool, Ordering as O};
+            static SHOWN: AtomicBool = AtomicBool::new(false);
+            if !SHOWN.swap(true, O::Relaxed) {
+                eprintln!(
+                    "[HEAD] q4_aligned={} q4={} q8_aligned={} q8_split={} q8={} \
+                     f16={} bf16={}",
+                    st.globals.output_proj_q4_aligned.is_some(),
+                    st.globals.output_proj_q4.is_some(),
+                    st.globals.output_proj_q8_aligned.is_some(),
+                    st.globals.output_proj_q8_split.is_some(),
+                    st.globals.output_proj_q8.is_some(),
+                    st.globals.output_proj_f16.is_some(),
+                    st.globals.output_proj_bf16.is_some(),
+                );
+            }
+        }
         let hp = self.hp()?;
         let hidden_dim = hp.hidden_dim as usize;
         let vocab_size = hp.vocab_size as usize;
