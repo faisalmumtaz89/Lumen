@@ -2713,7 +2713,75 @@ impl CudaBackend {
             // Q+gate fusion post-processing: deinterleave q_gate -> q + gate_buf,
             // then per-head RMSNorm on Q (attn_q_norm) and K (attn_k_norm).
             // Must run AFTER all QKV projection branches and BEFORE RoPE.
-            if has_qgate_fusion {
+            // LUMEN_CUDA_ATTN_PREP_FUSED=1: deinterleave + Q/K RMSNorm + NeoX
+            // RoPE in ONE launch instead of four.
+            //
+            // The full-attention block costs 172 us/layer while holding only
+            // 5% of the model's bytes, and after the projections each layer
+            // issues NINE commands. At the measured ~4.2 us marginal launch
+            // cost that is ~38 us/layer of pure overhead. These four ops
+            // needed separate launches only because each depends on the whole
+            // head vector (RMSNorm reduces over it; NeoX RoPE pairs d with
+            // d + rot/2) — one CTA per head makes both dependencies intra-CTA.
+            let attn_prep_fused = has_qgate_fusion
+                && st.kernels.q35_attn_prep_t1.is_some()
+                && lw.attn_q_norm.is_some()
+                && lw.attn_k_norm.is_some()
+                && hp.rope_params.as_ref().map(|r| r.neox).unwrap_or(false)
+                && head_dim <= 1024
+                && crate::runtime_defaults::attn_prep_fused_requested();
+            if crate::runtime_defaults::attn_prep_fused_requested() {
+                use std::sync::atomic::{AtomicBool, Ordering as O};
+                static SHOWN: AtomicBool = AtomicBool::new(false);
+                if !SHOWN.swap(true, O::Relaxed) {
+                    eprintln!(
+                        "[ATTN_PREP] dispatched={attn_prep_fused} (qgate={has_qgate_fusion} \
+                         loaded={} qn={} kn={} head_dim={head_dim})",
+                        st.kernels.q35_attn_prep_t1.is_some(),
+                        lw.attn_q_norm.is_some(),
+                        lw.attn_k_norm.is_some(),
+                    );
+                }
+            }
+            if attn_prep_fused {
+                let f = st.kernels.q35_attn_prep_t1.as_ref().unwrap();
+                let q_gate_buf = st.scratch.q_gate.as_ref().unwrap();
+                let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
+                let hd = head_dim as u32;
+                let nq = num_heads as u32;
+                let nkv = num_kv_heads as u32;
+                let pos_u32 = st.decode_pos_for_rope();
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (nq + nkv, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: hd * 4,
+                };
+                let qn = lw.attn_q_norm.as_ref().unwrap();
+                let kn = lw.attn_k_norm.as_ref().unwrap();
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(f)
+                        .arg(q_gate_buf)
+                        .arg(&mut st.scratch.q)
+                        .arg(st.scratch.gate_buf.as_mut().unwrap())
+                        .arg(&mut st.scratch.k)
+                        .arg(qn)
+                        .arg(kn)
+                        .arg(&eps)
+                        .arg(&nq)
+                        .arg(&nkv)
+                        .arg(&hd)
+                        .arg(&pos_u32)
+                        .arg(&theta)
+                        .arg(&rotary_dim)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("q35_attn_prep_t1 L{layer_idx}: {e}"))
+                })?;
+                crate::runtime_defaults::route_census_record("attn_prep", "FUSED_T1");
+            } else if has_qgate_fusion {
                 let q_gate_buf = st.scratch.q_gate.as_ref().unwrap();
                 let gate_buf = st.scratch.gate_buf.as_mut().unwrap();
 
@@ -2884,8 +2952,8 @@ impl CudaBackend {
                 }
             }
 
-            // 2. RoPE.
-            {
+            // 2. RoPE. SKIPPED when the fused prep kernel already applied it.
+            if !attn_prep_fused {
                 let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
                 let actual_rot = if rotary_dim > 0 && rotary_dim < head_dim as u32 {
                     rotary_dim as usize

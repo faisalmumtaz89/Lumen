@@ -496,6 +496,8 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q4_split_f32_lane_r4: Option<CudaFunction>,
     /// Wide-lane: 2 lanes per Q4 block, int2 loads, grid unchanged.
     pub(crate) matvec_q4_split_f32_lane_wide: Option<CudaFunction>,
+    /// Four attention-prep launches collapsed into one at T=1.
+    pub(crate) q35_attn_prep_t1: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_residual: Option<CudaFunction>,
 
     // Codegen-LOCKED Q4 split matvec (same SoA layout + integer dot as
@@ -1827,6 +1829,9 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        q35_attn_prep_t1: load_fn(shaders::ATTN_PREP_T1_KERNEL_SOURCE, "q35_attn_prep_t1")
+            .inspect_err(|e| cuda_log!("[CUDA] q35_attn_prep_t1: FAILED: {e}"))
+            .ok(),
         matvec_q4_split_f32_lane_wide: load_fn(
             shaders::MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE,
             "matvec_q4_split_f32_lane_wide",
