@@ -2151,7 +2151,28 @@ impl CudaBackend {
                 static SEEN: AtomicU64 = AtomicU64::new(0);
                 let bit = 1u64 << (layer_idx.min(63));
                 if SEEN.fetch_or(bit, O::Relaxed) & bit == 0 {
-                    eprintln!("[ATTNENTRY] layer={layer_idx} type={layer_type}");
+                    // Log the WEIGHT VARIANT for all 8 layers. The QKV dispatch
+                    // is an if/else chain on variant, and only 4 layers reach
+                    // the Q4 arm — so the other 4 hold a different (larger)
+                    // format and read several times the bytes per projection.
+                    let plw = &st.layer_weights_cache[layer_idx];
+                    let v = |w: &GpuWeightBuf| match w {
+                        GpuWeightBuf::F32(_) => "F32",
+                        GpuWeightBuf::F16Raw(_) => "F16Raw",
+                        GpuWeightBuf::Bf16Raw(_) => "Bf16Raw",
+                        GpuWeightBuf::Q8Raw(_) => "Q8Raw",
+                        GpuWeightBuf::Q8Aligned(_) => "Q8Aligned",
+                        GpuWeightBuf::Q4Raw(_) => "Q4Raw",
+                        GpuWeightBuf::Q4Aligned(_) => "Q4Aligned",
+                        GpuWeightBuf::Q4Split(_) => "Q4Split",
+                        _ => "other",
+                    };
+                    eprintln!(
+                        "[ATTNENTRY] layer={layer_idx} wq={} wk={} wv={} wo={} \
+                         wq_f16={}",
+                        v(&plw.wq), v(&plw.wk), v(&plw.wv), v(&plw.wo),
+                        plw.wq_f16.is_some(),
+                    );
                 }
             }
             let lw: &LayerWeightsGpu = st.layer_weights_cache.get(layer_idx).ok_or_else(|| {
