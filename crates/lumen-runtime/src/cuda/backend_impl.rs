@@ -6931,89 +6931,25 @@ impl CudaBackend {
             } else {
                 &gdn.output_buf
             };
-            // TENTH DEFECT: this called `launch_matvec`, the compatibility shim
-            // that passes None for the split sibling — so gdn_ssm_out could
-            // never reach the int8 preq path OR the SoA siblings, and it never
-            // appeared in the per-site census while gdn_qkv/alpha/beta/gate all
-            // did. It is [4096,4096] x 24 GDN layers = 402M params, ~226 MB per
-            // token, and `q4_split_ssm_out` was allocated but had no consumer.
-            //
-            // Route it like the FFN down site: int8 preq + split sibling when
-            // the plan admits it, otherwise the ext path WITH the sibling so
-            // the SoA kernel is at least reachable.
-            let ssm_wants_q8 = crate::runtime_defaults::q4_act_plan()
-                .mode_for(crate::runtime_defaults::Q4ProjectionFamily::GdnAttnGate)
-                == crate::runtime_defaults::Q4ActMode::Q8_1;
-            // Round 46: this path did NOT dispatch — the census showed no
-            // gdn_ssm_out entry at all. Report which clause failed rather than
-            // guessing; the likely one is the sibling being absent, the same
-            // buffer-not-allocated failure as the split-allocator defect.
-            {
-                use std::sync::atomic::{AtomicBool, Ordering as O};
-                static SHOWN: AtomicBool = AtomicBool::new(false);
-                if !SHOWN.swap(true, O::Relaxed) {
-                    eprintln!(
-                        "[SSMOUT] wants_q8={ssm_wants_q8} sibling={} quant_fn={} \
-                         q8_1_scratch={} weight={}",
-                        lw.q4_split_ssm_out.is_some(),
-                        st.kernels.quantize_f32_to_q8_1.is_some(),
-                        st.scratch.input_q8_1.is_some(),
-                        match ssm_out {
-                            GpuWeightBuf::Q4Raw(_) => "Q4Raw",
-                            GpuWeightBuf::Q4Aligned(_) => "Q4Aligned",
-                            GpuWeightBuf::Q8Raw(_) => "Q8Raw",
-                            GpuWeightBuf::F32(_) => "F32",
-                            _ => "other",
-                        },
-                    );
-                }
-            }
-            let ssm_q8_ok = ssm_wants_q8
-                && lw.q4_split_ssm_out.is_some()
-                && st.kernels.quantize_f32_to_q8_1.is_some()
-                && st.scratch.input_q8_1.is_some();
-            if ssm_q8_ok {
-                let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref().unwrap();
-                let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                unsafe {
-                    launch_quantize_input_q8_1(
-                        &self.device,
-                        quant_fn,
-                        ssm_input,
-                        q8_1_buf,
-                        p.value_dim,
-                        "gdn_ssm_out",
-                    )?;
-                    launch_matvec_preq8_1_split(
-                        &self.device,
-                        &st.kernels,
-                        ssm_out,
-                        None,
-                        lw.q4_split_ssm_out.as_ref(),
-                        q8_1_buf,
-                        &mut gdn.ssm_proj_buf,
-                        hidden_dim,
-                        p.value_dim,
-                        "gdn_ssm_out",
-                    )?;
-                }
-            } else {
-                unsafe {
-                    launch_matvec_ext(
-                        &self.device,
-                        &st.kernels,
-                        ssm_out,
-                        ssm_input,
-                        &mut gdn.ssm_proj_buf,
-                        hidden_dim,
-                        p.value_dim,
-                        "gdn_ssm_out",
-                        lw.ssm_out_f16.as_ref(),
-                        Some(&mut st.scratch.input_f16),
-                        st.scratch.input_q8_1.as_mut(),
-                        lw.q4_split_ssm_out.as_ref(),
-                    )?;
-                }
+            // gdn_ssm_out is Q8Raw — already Q8_0 in the model — so it was
+            // never on the F32 path and needs no Q4 split sibling. Its absence
+            // from the per-site census meant UNTAGGED, not unreachable: the Q8
+            // dispatch simply has no census call. Noted here because I briefly
+            // recorded it as a defect on exactly that misreading.
+            unsafe {
+                launch_matvec(
+                    &self.device,
+                    &st.kernels,
+                    ssm_out,
+                    ssm_input,
+                    &mut gdn.ssm_proj_buf,
+                    hidden_dim,
+                    p.value_dim,
+                    "gdn_ssm_out",
+                    lw.ssm_out_f16.as_ref(),
+                    Some(&mut st.scratch.input_f16),
+                    st.scratch.input_q8_1.as_mut(),
+                )?;
             }
         }
 
