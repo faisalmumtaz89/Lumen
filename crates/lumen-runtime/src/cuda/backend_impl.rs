@@ -10228,7 +10228,11 @@ unsafe fn launch_matvec_residual_lane(
     in_dim: usize,
     label: &str,
 ) -> Result<bool, RuntimeError> {
-    if crate::runtime_defaults::q4_split_f32_variant() != 4 {
+    // Accept every lane variant. Gating this on variant 4 alone silently
+    // regressed `wo` to the old path whenever variant 5 was selected, which
+    // would have contaminated the r4 A/B (codex-sol caught this before the
+    // measurement was interpreted).
+    if !matches!(crate::runtime_defaults::q4_split_f32_variant(), 4 | 5) {
         return Ok(false);
     }
     // Control for the A/B: LUMEN_CUDA_LANE_WO=0 keeps the lane kernel on every
