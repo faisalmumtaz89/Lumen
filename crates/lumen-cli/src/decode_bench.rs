@@ -300,6 +300,12 @@ pub(crate) fn run(
         for (fam, path, n) in census {
             eprintln!("[Q4ROUTE] {fam} -> {path} x{n}");
         }
+        // Per-LABEL cardinality: the family view aggregates, so a site taking
+        // BOTH a split and a fallback path, or firing the wrong number of
+        // times, does not show up there.
+        for (label, path, n) in lumen_runtime::runtime_defaults::route_census_by_label() {
+            eprintln!("[Q4SITE] {label} -> {path} x{n}");
+        }
     }
     if lumen_runtime::runtime_defaults::route_census_enabled() {
         let plan = lumen_runtime::runtime_defaults::q4_act_plan();

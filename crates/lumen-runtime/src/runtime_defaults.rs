@@ -2907,6 +2907,28 @@ pub fn route_census_record(label: &str, path: &'static str) {
 }
 
 /// Per-(family, path) counts observed so far.
+/// Per-LABEL (not per-family) counts, for cardinality auditing.
+///
+/// The family view aggregates, so `gdn_gate` can mask `gdn_ssm_out` and an
+/// expected-count violation is invisible. Defect-hunting has been the only
+/// productive mode in this campaign (int8 unreachable = +37%, ffn_down second
+/// site = +1.75%) while every ranked estimate missed, so this exists to make
+/// per-site cardinality checkable: each label should show ONE producer path and
+/// a count consistent with layers x tokens.
+pub fn route_census_by_label() -> Vec<(String, &'static str, usize)> {
+    let mut out: Vec<(String, &'static str, usize)> = Vec::new();
+    if let Ok(v) = ROUTE_CENSUS.lock() {
+        for (label, path) in v.iter() {
+            match out.iter_mut().find(|(l, p, _)| l == label && p == path) {
+                Some((_, _, n)) => *n += 1,
+                None => out.push((label.clone(), path, 1)),
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0).then(b.2.cmp(&a.2)));
+    out
+}
+
 pub fn route_census_summary() -> Vec<(String, &'static str, usize)> {
     let mut out: Vec<(String, &'static str, usize)> = Vec::new();
     if let Ok(v) = ROUTE_CENSUS.lock() {
