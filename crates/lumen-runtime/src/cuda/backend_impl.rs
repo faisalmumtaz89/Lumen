@@ -6931,20 +6931,65 @@ impl CudaBackend {
             } else {
                 &gdn.output_buf
             };
-            unsafe {
-                launch_matvec(
-                    &self.device,
-                    &st.kernels,
-                    ssm_out,
-                    ssm_input,
-                    &mut gdn.ssm_proj_buf,
-                    hidden_dim,
-                    p.value_dim,
-                    "gdn_ssm_out",
-                    lw.ssm_out_f16.as_ref(),
-                    Some(&mut st.scratch.input_f16),
-                    st.scratch.input_q8_1.as_mut(),
-                )?;
+            // TENTH DEFECT: this called `launch_matvec`, the compatibility shim
+            // that passes None for the split sibling — so gdn_ssm_out could
+            // never reach the int8 preq path OR the SoA siblings, and it never
+            // appeared in the per-site census while gdn_qkv/alpha/beta/gate all
+            // did. It is [4096,4096] x 24 GDN layers = 402M params, ~226 MB per
+            // token, and `q4_split_ssm_out` was allocated but had no consumer.
+            //
+            // Route it like the FFN down site: int8 preq + split sibling when
+            // the plan admits it, otherwise the ext path WITH the sibling so
+            // the SoA kernel is at least reachable.
+            let ssm_wants_q8 = crate::runtime_defaults::q4_act_plan()
+                .mode_for(crate::runtime_defaults::Q4ProjectionFamily::GdnAttnGate)
+                == crate::runtime_defaults::Q4ActMode::Q8_1;
+            let ssm_q8_ok = ssm_wants_q8
+                && lw.q4_split_ssm_out.is_some()
+                && st.kernels.quantize_f32_to_q8_1.is_some()
+                && st.scratch.input_q8_1.is_some();
+            if ssm_q8_ok {
+                let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref().unwrap();
+                let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
+                unsafe {
+                    launch_quantize_input_q8_1(
+                        &self.device,
+                        quant_fn,
+                        ssm_input,
+                        q8_1_buf,
+                        p.value_dim,
+                        "gdn_ssm_out",
+                    )?;
+                    launch_matvec_preq8_1_split(
+                        &self.device,
+                        &st.kernels,
+                        ssm_out,
+                        None,
+                        lw.q4_split_ssm_out.as_ref(),
+                        q8_1_buf,
+                        &mut gdn.ssm_proj_buf,
+                        hidden_dim,
+                        p.value_dim,
+                        "gdn_ssm_out",
+                    )?;
+                }
+            } else {
+                unsafe {
+                    launch_matvec_ext(
+                        &self.device,
+                        &st.kernels,
+                        ssm_out,
+                        ssm_input,
+                        &mut gdn.ssm_proj_buf,
+                        hidden_dim,
+                        p.value_dim,
+                        "gdn_ssm_out",
+                        lw.ssm_out_f16.as_ref(),
+                        Some(&mut st.scratch.input_f16),
+                        st.scratch.input_q8_1.as_mut(),
+                        lw.q4_split_ssm_out.as_ref(),
+                    )?;
+                }
             }
         }
 
