@@ -2445,7 +2445,11 @@ impl CudaBackend {
                 // Q4_0 QUALITY FIX (attention side): on the fragile 9B config,
                 // Q4Raw QKV uses F32 activations, not int8 Q8_1 dp4a. Other models
                 // keep dp4a (flag off). See weight_uses_f32_act_q4.
-                let qkv_use_preq = !weight_uses_f32_act_q4(&lw.wq, st.kernels.q4_decode_f32_act)
+                let qkv_use_preq = !weight_uses_f32_act_q4_fam(
+                    &lw.wq,
+                    st.kernels.q4_decode_f32_act,
+                    crate::runtime_defaults::Q4ProjectionFamily::AttnQkv,
+                )
                     && weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
                     && weight_uses_dp4a_q8_1(&lw.wk, &st.kernels)
                     && weight_uses_dp4a_q8_1(&lw.wv, &st.kernels)
@@ -4130,7 +4134,11 @@ impl CudaBackend {
                 // (GQ-004) into mild repetition that trips the spam detector; F32
                 // keeps long-form clean. Other models keep dp4a (flag off).
                 let ffn_use_preq =
-                    !weight_uses_f32_act_q4(&lw.w_gate, st.kernels.q4_decode_f32_act)
+                    !weight_uses_f32_act_q4_fam(
+                        &lw.w_gate,
+                        st.kernels.q4_decode_f32_act,
+                        crate::runtime_defaults::Q4ProjectionFamily::FfnGateUp,
+                    )
                         && weight_uses_dp4a_q8_1(&lw.w_gate, &st.kernels)
                         && weight_uses_dp4a_q8_1(&lw.w_up, &st.kernels)
                         && st.scratch.input_q8_1.is_some()
@@ -5069,8 +5077,15 @@ impl CudaBackend {
         // Q4_0 QUALITY FIX (GDN side): on the fragile 9B config, Q4Raw GDN
         // projections use F32 activations, not int8 Q8_1 dp4a. Other models keep
         // dp4a (flag off). See weight_uses_f32_act_q4.
-        let gdn_use_preq = !weight_uses_f32_act_q4(&lw.wq, st.kernels.q4_decode_f32_act)
-            && !weight_uses_f32_act_q4(attn_gate_w, st.kernels.q4_decode_f32_act)
+        let gdn_use_preq = !weight_uses_f32_act_q4_fam(
+            &lw.wq,
+            st.kernels.q4_decode_f32_act,
+            crate::runtime_defaults::Q4ProjectionFamily::GdnQkv,
+        ) && !weight_uses_f32_act_q4_fam(
+            attn_gate_w,
+            st.kernels.q4_decode_f32_act,
+            crate::runtime_defaults::Q4ProjectionFamily::GdnAttnGate,
+        )
             && weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
             && weight_uses_dp4a_q8_1(ssm_alpha_w, &st.kernels)
             && weight_uses_dp4a_q8_1(ssm_beta_w, &st.kernels)
@@ -12484,6 +12499,38 @@ unsafe fn repack_all_layers_q4_clone_to_split(
 /// on dp4a: its per-layer error is NOT amplified by the recurrence, and it is the
 /// bandwidth-critical path, so keeping dp4a preserves decode throughput.
 #[inline]
+/// Does this Q4 projection keep FULL F32 activations?
+///
+/// This must consult the typed `Q4ActPlan`, not just the global
+/// `q4_decode_f32_act` bool. The bool is the blunt whole-model switch; the plan
+/// is the per-family override that `LUMEN_CUDA_PRECISION_ZONE` /
+/// `LUMEN_CUDA_Q4_F16_ZONE` set.
+///
+/// Reading only the bool made every int8 branch UNREACHABLE on 9B no matter
+/// what zone was requested — `*_use_preq` is `!weight_uses_f32_act_q4(..)`, and
+/// the bool is true for this model, so the gate was always false. Rounds 24-26
+/// measured "flat" int8 results that were really the F32 path with extra env
+/// vars set; the route census caught it with calls=0 on all five families.
+///
+/// This is the same defect codex-sol flagged in consult #3 — the switch has
+/// five call sites and only the two inside `launch_matvec` had been converted.
+fn weight_uses_f32_act_q4_fam(
+    weight: &GpuWeightBuf,
+    q4_decode_f32_act: bool,
+    family: crate::runtime_defaults::Q4ProjectionFamily,
+) -> bool {
+    if !matches!(weight, GpuWeightBuf::Q4Raw(_)) {
+        return false;
+    }
+    let plan = crate::runtime_defaults::q4_act_plan();
+    if plan.is_default {
+        // No zone requested: preserve the shipping behaviour exactly.
+        q4_decode_f32_act
+    } else {
+        plan.mode_for(family) == crate::runtime_defaults::Q4ActMode::F32
+    }
+}
+
 fn weight_uses_f32_act_q4(weight: &GpuWeightBuf, q4_decode_f32_act: bool) -> bool {
     q4_decode_f32_act && matches!(weight, GpuWeightBuf::Q4Raw(_))
 }
