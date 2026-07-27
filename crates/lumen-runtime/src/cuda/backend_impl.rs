@@ -3571,6 +3571,8 @@ impl CudaBackend {
                 }
                 // 2. Fused gate+up+SwiGLU mmvq: q8_1 -> scratch.gate = silu(gate)*up.
                 {
+                    crate::runtime_defaults::route_census_record("gate", "Q8_1_FUSED_GLU");
+                    crate::runtime_defaults::route_census_record("up", "Q8_1_FUSED_GLU");
                     let fused_fn = st.kernels.fused_glu_gemv_q8_split_mmvq.as_ref().unwrap();
                     let wg = lw.q8_split_w_gate.as_ref().unwrap();
                     let wu = lw.q8_split_w_up.as_ref().unwrap();
@@ -11087,6 +11089,7 @@ unsafe fn launch_matvec_preq8_1(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
+    crate::runtime_defaults::route_census_record(label, "Q8_1_PREQ");
     let out_dim_u32 = out_dim as u32;
     let in_dim_u32 = in_dim as u32;
 
@@ -11254,6 +11257,7 @@ unsafe fn launch_matvec_preq8_1_residual(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
+    crate::runtime_defaults::route_census_record(label, "Q8_1_PREQ_RES");
     let out_dim_u32 = out_dim as u32;
     let in_dim_u32 = in_dim as u32;
 
@@ -11564,6 +11568,7 @@ unsafe fn launch_matvec_preq8_1_split(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
+    crate::runtime_defaults::route_census_record(label, "Q8_1_PREQ_SPLIT");
     // Q8 split path.
     if kernels.use_q8_split_dispatch {
         if let Some(split_buf) = q8_split_sibling {
@@ -11721,6 +11726,7 @@ unsafe fn launch_matvec_preq8_1_residual_split(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
+    crate::runtime_defaults::route_census_record(label, "Q8_1_PREQ_RES_SPLIT");
     if kernels.use_q8_split_dispatch {
         if let Some(split_buf) = q8_split_sibling {
             // LUMEN_CUDA_Q8_MMVQ: llama mmvq residual kernel takes precedence.
