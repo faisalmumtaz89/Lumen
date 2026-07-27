@@ -4955,6 +4955,25 @@ impl CudaBackend {
     /// builds the layer index mapping, and allocates all persistent state
     /// (h_states, conv_states) and ephemeral scratch buffers on the GPU.
     fn ensure_gdn_scratch(&self, st: &mut MutableState) -> Result<(), RuntimeError> {
+        // Ground truth for the wq/wk/wv cardinality question: the census
+        // shows 4 dispatches/token, and whether that is a DEFECT depends on
+        // how many full-attention layers actually exist. Read it from the
+        // layer cache rather than from a memory note — a note whose formula
+        // did not match the code has already cost this campaign once.
+        {
+            use std::sync::atomic::{AtomicBool, Ordering as O};
+            static SHOWN: AtomicBool = AtomicBool::new(false);
+            if !SHOWN.swap(true, O::Relaxed) {
+                let total = st.layer_weights_cache.len();
+                let gdn = st
+                    .layer_weights_cache
+                    .iter()
+                    .filter(|lw| lw.layer_type == 1)
+                    .count();
+                eprintln!("[LAYERS] total={total} gdn={gdn} full_attn={}", total - gdn);
+            }
+        }
+
         if st.gdn_scratch_gpu.is_some() {
             return Ok(());
         }
