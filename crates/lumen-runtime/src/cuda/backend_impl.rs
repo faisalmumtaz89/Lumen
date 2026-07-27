@@ -2151,10 +2151,7 @@ impl CudaBackend {
                 static SEEN: AtomicU64 = AtomicU64::new(0);
                 let bit = 1u64 << (layer_idx.min(63));
                 if SEEN.fetch_or(bit, O::Relaxed) & bit == 0 {
-                    eprintln!(
-                        "[ATTNENTRY] layer={layer_idx} type={layer_type} \
-                         qgate={has_qgate_fusion}"
-                    );
+                    eprintln!("[ATTNENTRY] layer={layer_idx} type={layer_type}");
                 }
             }
             let lw: &LayerWeightsGpu = st.layer_weights_cache.get(layer_idx).ok_or_else(|| {
