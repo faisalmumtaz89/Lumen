@@ -335,3 +335,112 @@ extern "C" __global__ void matvec_q4_split_f32_lane_gateup(
         out[row] = (gs / (1.0f + __expf(-gs))) * us;
     }
 }
+
+// --------------------------------------------------------------------------
+// MULTI-ROW lane kernel: ROWS_PER_CTA output rows share one pass over x.
+//
+// WHY: the single-row lane kernel re-reads the WHOLE activation vector in
+// every CTA. For an FFN gate projection that is 12288 CTAs x 16 KB = 196 MB of
+// L2 traffic for ONE matvec, ~590 MB per layer, ~19 GB per token across 32
+// layers. At A100's ~4 TB/s L2 that is ~4.7 ms — the same order as the entire
+// measured FFN time (4.50 ms at an implied 604 GB/s of HBM). So the FFN may not
+// be HBM-limited at all; it may be limited by L2 bandwidth spent re-reading x.
+//
+// Holding R rows per CTA divides that traffic by R: the two float4s a lane
+// loads for a Q4 block feed R independent dot products instead of one. Weight
+// traffic is unchanged (each row's nibbles are still read exactly once), so
+// this is a pure reduction in redundant activation reads.
+//
+// Cost is R accumulators and R weight pointers in registers, which is cheap
+// because the lane decomposition already dropped per-lane activation state
+// from 32 floats to 8.
+//
+// Numerics: each row's dot product accumulates in exactly the same order as
+// the single-row kernel, so results are bit-identical to variant 4.
+//
+// Grid:  (ceil(out_dim / ROWS_PER_CTA), 1, 1)
+// Block: (128, 1, 1)
+// --------------------------------------------------------------------------
+#define ROWS_PER_CTA 4
+
+extern "C" __global__ void matvec_q4_split_f32_lane_r4(
+    const unsigned char* __restrict__ weight_split,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    unsigned int out_dim,
+    unsigned int in_dim)
+{
+    const unsigned int r0 = blockIdx.x * ROWS_PER_CTA;
+    if (r0 >= out_dim) return;
+
+    const unsigned int tid     = threadIdx.x;
+    const unsigned int warp_id = tid / WARP_SIZE;
+    const unsigned int lane    = tid % WARP_SIZE;
+    const unsigned int grp     = lane / LANES_PER_BLK;
+    const unsigned int w       = lane % LANES_PER_BLK;
+
+    const unsigned int nb = in_dim / Q4_BLOCK_ELEMS;
+    const unsigned long long row_bytes =
+        (unsigned long long)nb * (2ULL + (unsigned long long)Q4_NIBBLE_BYTES);
+
+    const unsigned int rows = (out_dim - r0 < ROWS_PER_CTA) ? (out_dim - r0) : ROWS_PER_CTA;
+
+    float sumf[ROWS_PER_CTA];
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_CTA; r++) sumf[r] = 0.0f;
+
+    for (unsigned int ib = warp_id * BLKS_PER_WARP + grp;
+         ib < nb;
+         ib += NR_WARPS * BLKS_PER_WARP) {
+
+        // x loaded ONCE for all ROWS_PER_CTA rows — this is the whole point.
+        const float* xb = x + (unsigned long long)ib * Q4_BLOCK_ELEMS;
+        const float4 xl = *(const float4*)(xb + w * 4);
+        const float4 xh = *(const float4*)(xb + 16 + w * 4);
+
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_CTA; r++) {
+            if (r >= (int)rows) break;
+            const unsigned char* rp =
+                weight_split + (unsigned long long)(r0 + r) * row_bytes;
+            const unsigned short* row_scales = (const unsigned short*)rp;
+            const unsigned char*  row_nibs   = rp + 2ULL * nb;
+
+            const int packed = *(const int*)(row_nibs
+                + (unsigned long long)ib * Q4_NIBBLE_BYTES + (unsigned long long)w * 4ULL);
+            const int lo = packed & 0x0F0F0F0F;
+            const int hi = (packed >> 4) & 0x0F0F0F0F;
+
+            float part = 0.0f;
+            part += (float)(((lo      ) & 0xFF) - 8) * xl.x;
+            part += (float)(((lo >>  8) & 0xFF) - 8) * xl.y;
+            part += (float)(((lo >> 16) & 0xFF) - 8) * xl.z;
+            part += (float)(((lo >> 24) & 0xFF) - 8) * xl.w;
+            part += (float)(((hi      ) & 0xFF) - 8) * xh.x;
+            part += (float)(((hi >>  8) & 0xFF) - 8) * xh.y;
+            part += (float)(((hi >> 16) & 0xFF) - 8) * xh.z;
+            part += (float)(((hi >> 24) & 0xFF) - 8) * xh.w;
+
+            part += __shfl_xor_sync(0xffffffff, part, 1);
+            part += __shfl_xor_sync(0xffffffff, part, 2);
+            if (w == 0) {
+                sumf[r] += f16_bits_to_f32_lane(row_scales[ib]) * part;
+            }
+        }
+    }
+
+    __shared__ float partials[ROWS_PER_CTA][NR_WARPS];
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_CTA; r++) {
+        float v = warp_reduce_sum_lane(sumf[r]);
+        if (lane == 0) partials[r][warp_id] = v;
+    }
+    __syncthreads();
+
+    if (tid < rows) {
+        float total = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < NR_WARPS; i++) total += partials[tid][i];
+        out[r0 + tid] = total;
+    }
+}

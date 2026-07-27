@@ -2990,6 +2990,7 @@ pub fn q4_split_f32_variant() -> u8 {
         Some("2") => 2,
         Some("3") => 3,
         Some("4") => 4,
+        Some("5") => 5,
         _ => 0,
     })
 }

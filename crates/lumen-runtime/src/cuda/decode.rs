@@ -491,6 +491,9 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q4_split_f32_lane_residual: Option<CudaFunction>,
     /// Fused gate+up+SiLU: three FFN dispatches per layer collapse to one.
     pub(crate) matvec_q4_split_f32_lane_gateup: Option<CudaFunction>,
+    /// Multi-row lane kernel: 4 rows share one pass over x, cutting the
+    /// redundant L2 activation traffic 4x.
+    pub(crate) matvec_q4_split_f32_lane_r4: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_residual: Option<CudaFunction>,
 
     // Codegen-LOCKED Q4 split matvec (same SoA layout + integer dot as
@@ -1822,6 +1825,12 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        matvec_q4_split_f32_lane_r4: load_fn(
+            shaders::MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE,
+            "matvec_q4_split_f32_lane_r4",
+        )
+        .inspect_err(|e| cuda_log!("[CUDA] matvec_q4_split_f32_lane_r4: FAILED: {e}"))
+        .ok(),
         matvec_q4_split_f32_lane_gateup: load_fn(
             shaders::MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE,
             "matvec_q4_split_f32_lane_gateup",
