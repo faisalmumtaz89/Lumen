@@ -180,11 +180,15 @@ extern "C" __global__ void gdn_t1_coop_all(
 
     // gates: one head per low CTA, thread 0 (same formula as the batched kernel)
     if (blk < n_heads && tid == 0) {
-        const float a_raw = alpha_raw[blk];
-        const float sp = (a_raw > 20.0f) ? a_raw : log1pf(expf(a_raw));
-        alpha_buf[blk] = expf(ssm_a[blk] * (sp + dt_bias[blk]));
-        const float b = beta_raw[blk];
-        beta_buf[blk] = 1.0f / (1.0f + expf(-b));
+        // EXACTLY gdn_compute_gates_batched: dt_bias is added BEFORE the
+        // softplus, and the softplus uses logf(1+expf(x)) rather than log1pf.
+        // My first draft did neither, which would have diverged the recurrence
+        // silently — the harness would have reported "wrong output" with no
+        // pointer to the cause.
+        const float sp_input = alpha_raw[blk] + dt_bias[blk];
+        const float sp = (sp_input > 20.0f) ? sp_input : logf(1.0f + expf(sp_input));
+        alpha_buf[blk] = expf(ssm_a[blk] * sp);
+        beta_buf[blk] = 1.0f / (1.0f + expf(-beta_raw[blk]));
     }
 
     grid_sync_coop(barrier, gridDim.x);
