@@ -315,8 +315,25 @@ pub(crate) fn run(
         }
     }
 
-    // every measured sequence must be token-identical (greedy + fresh state)
-    if token_hashes.windows(2).any(|w| w[0] != w[1]) {
+    // Every measured sequence must be token-identical (greedy + fresh state).
+    //
+    // EXCEPT under LUMEN_DECODE_ABLATE: an ablation deliberately skips a phase,
+    // so a skipped state update legitimately makes sequences differ. The assert
+    // exists to catch state LEAKAGE in real arms; applying it to a
+    // timing-only ablation just refuses the measurement (rc=25) and leaves the
+    // phase unsplit — which is what happened to the gdn_recur and head arms in
+    // rounds 29b and 30. Ablation output is garbage by construction and is
+    // never admissible as a result; only its wall time is read.
+    let ablating = std::env::var("LUMEN_DECODE_ABLATE")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if ablating && token_hashes.windows(2).any(|w| w[0] != w[1]) {
+        eprintln!(
+            "[decode-bench] NOTE: sequences differ under LUMEN_DECODE_ABLATE \
+             (expected — a skipped phase changes output); timing still valid."
+        );
+    }
+    if !ablating && token_hashes.windows(2).any(|w| w[0] != w[1]) {
         eprintln!(
             "[decode-bench] FATAL: measured sequences are NOT token-identical \
              (hashes {token_hashes:?}). Greedy decode from a reset state must be \
