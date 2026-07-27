@@ -2727,7 +2727,7 @@ impl CudaBackend {
                 && st.kernels.q35_attn_prep_t1.is_some()
                 && lw.attn_q_norm.is_some()
                 && lw.attn_k_norm.is_some()
-                && hp.rope_params.as_ref().map(|r| r.neox).unwrap_or(false)
+                && hp.rope_neox
                 && head_dim <= 1024
                 && crate::runtime_defaults::attn_prep_fused_requested();
             if crate::runtime_defaults::attn_prep_fused_requested() {
@@ -2750,7 +2750,7 @@ impl CudaBackend {
                 let hd = head_dim as u32;
                 let nq = num_heads as u32;
                 let nkv = num_kv_heads as u32;
-                let pos_u32 = st.decode_pos_for_rope();
+                let pos_u32 = seq_pos as u32;
                 let launch_cfg = CudarcLaunchConfig {
                     grid_dim: (nq + nkv, 1, 1),
                     block_dim: (256, 1, 1),
