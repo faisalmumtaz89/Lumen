@@ -4839,6 +4839,29 @@ impl CudaBackend {
                             inter_dim,
                             "down split (sep swiglu)",
                         )?;
+                        // Same direct-residual fold as the other ffn_down
+                        // site. Patching only one of the two left decode on the
+                        // unfused path — the census caught it (ffn_down ->
+                        // Q8_1_PREQ_SPLIT, not ..._RES_SPLIT) and round 31's
+                        // 0.9975x was therefore measuring nothing.
+                        if crate::runtime_defaults::ffn_direct_residual()
+                            && lw.q4_split_w_down.is_some()
+                        {
+                            launch_matvec_preq8_1_residual_split(
+                                &self.device,
+                                &st.kernels,
+                                &lw.w_down,
+                                lw.q8_split_w_down.as_ref(),
+                                lw.q4_split_w_down.as_ref(),
+                                q8_1_buf,
+                                &st.scratch.attn_proj,
+                                &mut st.scratch.x_gpu,
+                                hidden_dim,
+                                inter_dim,
+                                "down",
+                            )?;
+                            st.ffn_wrote_x_gpu = true;
+                        } else {
                         launch_matvec_preq8_1_split(
                             &self.device,
                             &st.kernels,
@@ -4851,6 +4874,7 @@ impl CudaBackend {
                             inter_dim,
                             "down",
                         )?;
+                        }
                     }
                 } else {
                     unsafe {
