@@ -621,11 +621,35 @@ fn upload_tensor(
     // bytes on the largest attention matrix ([4096,8192] fused Q+gate), which
     // is ~460 MB of extra traffic per token. K-quants dequantise to F32 here,
     // so log the SOURCE scheme for attention tensors to identify the cause.
-    if name.contains("attn_q") || name.contains("wq") {
-        use std::sync::atomic::{AtomicU32, Ordering as O};
-        static N: AtomicU32 = AtomicU32::new(0);
-        if N.fetch_add(1, O::Relaxed) < 12 {
-            eprintln!("[UPLOAD] {name} quant={:?} bytes={}", slice.quant, raw.len());
+    // FULL QUANT INVENTORY. The wq Q6_K finding came from logging ONE tensor
+    // name; any other K-quant tensor is expanding to F32 the same way and is
+    // the same free win. Aggregate by (name-shape, scheme) so the whole model
+    // is visible in a handful of lines rather than hundreds.
+    {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        use std::sync::OnceLock;
+        static INV: OnceLock<Mutex<HashMap<(String, String), (usize, usize)>>> = OnceLock::new();
+        let inv = INV.get_or_init(|| Mutex::new(HashMap::new()));
+        // strip the layer index so blk.7.attn_q and blk.11.attn_q aggregate
+        let shape: String = name
+            .split('.')
+            .filter(|seg| !seg.chars().all(|c| c.is_ascii_digit()))
+            .collect::<Vec<_>>()
+            .join(".");
+        if let Ok(mut m) = inv.lock() {
+            let e = m.entry((shape, format!("{:?}", slice.quant))).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += raw.len();
+            // Dump once the model is fully uploaded (call count is stable by then).
+            let total: usize = m.values().map(|(n, _)| *n).sum();
+            if total % 64 == 0 {
+                let mut rows: Vec<_> = m.iter().collect();
+                rows.sort_by_key(|((sh, q), _)| (sh.clone(), q.clone()));
+                for ((sh, q), (n, bytes)) in rows {
+                    eprintln!("[INVENTORY] {sh} quant={q} count={n} src_bytes={bytes}");
+                }
+            }
         }
     }
     match slice.quant {
