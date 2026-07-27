@@ -1233,6 +1233,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
     "LUMEN_CUDA_GDN_COOP",
     "LUMEN_CUDA_KQUANT_REQUANT_Q8",
+    "LUMEN_CUDA_Q6K_NATIVE",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
     "LUMEN_CUDA_Q4_MMVQ",
@@ -2462,6 +2463,7 @@ mod tests {
     "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
     "LUMEN_CUDA_GDN_COOP",
     "LUMEN_CUDA_KQUANT_REQUANT_Q8",
+    "LUMEN_CUDA_Q6K_NATIVE",
         "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q4_MMVQ",
         "LUMEN_CUDA_Q8_MMVQ",
@@ -3149,6 +3151,20 @@ pub fn kquant_requant_q8() -> bool {
     *ON.get_or_init(|| {
         matches!(
             std::env::var("LUMEN_CUDA_KQUANT_REQUANT_Q8").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// `LUMEN_CUDA_Q6K_NATIVE=1` — keep Q6_K tensors in their source format and
+/// consume them with `matvec_q6_k_f32`, matching llama.cpp's own byte count
+/// (0.8203 B/weight) instead of expanding to Q8_0 (1.0625) or F32 (4.0).
+pub fn q6k_native() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_Q6K_NATIVE").ok().as_deref(),
             Some("1") | Some("true") | Some("yes") | Some("on")
         )
     })

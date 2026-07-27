@@ -497,6 +497,8 @@ pub const MATVEC_Q4_SPLIT_F32_GMEM_KERNEL_SOURCE: &str =
     include_str!("matvec_q4_split_f32_gmem.cu");
 /// Lane-striped: 4 lanes cooperate per Q4 block, 8 activations per lane,
 /// warp-contiguous weight loads. The F32-exact analogue of mmvq.
+/// Native Q6_K matvec, F32 activations — matches llama.cpp's byte count.
+pub const MATVEC_Q6_K_F32_KERNEL_SOURCE: &str = include_str!("matvec_q6_k_f32.cu");
 /// Cooperative single-launch T=1 GDN chain (conv/L2 + gates + state + norm-gate).
 pub const GDN_T1_COOP_KERNEL_SOURCE: &str = include_str!("gdn_t1_coop.cu");
 /// Fused T=1 attention prep: deinterleave + Q/K RMSNorm + NeoX RoPE.

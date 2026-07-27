@@ -45,6 +45,12 @@ pub enum GpuWeightBuf {
     /// Raw Q4_0 bytes on GPU (18 bytes per block of 32 elements).
     /// Dequantized on-the-fly by `matvec_q4_0`.
     Q4Raw(CudaSlice<u8>),
+    /// Raw Q6_K bytes on GPU (210 bytes per super-block of 256 elements =
+    /// 0.8203 B/weight). Consumed natively by `matvec_q6_k_f32`, which is what
+    /// llama.cpp does — Lumen previously dequantised these to F32 (4 B/w) or
+    /// Q8_0 (1.0625 B/w), paying 30% more bytes than the competitor on the
+    /// tensors a mixed-quant GGUF deliberately keeps at higher precision.
+    Q6KRaw(CudaSlice<u8>),
     /// Repacked Q4_0 with 20-byte aligned blocks (2B scale + 2B pad + 16B nibbles).
     /// Nibble data at offset +4 is 4-byte aligned, enabling native int* loads
     /// in the dp4a kernel (4 int loads vs 16 byte loads per block).
@@ -884,6 +890,19 @@ fn upload_tensor(
             // is not the default.
             //
             // The coherence gate is binding either way.
+            // Native Q6_K takes precedence: it matches llama.cpp's own byte
+            // count (0.8203 B/w) instead of paying 1.0625 for Q8_0.
+            if matches!(other, QuantScheme::Q6_K)
+                && crate::runtime_defaults::q6k_native()
+                && n_elements % 256 == 0
+            {
+                eprintln!(
+                    "[CUDA] upload {name}: Q6_K NATIVE ({n_elements} elements, {} bytes)",
+                    raw.len()
+                );
+                let gpu_buf = device.htod_copy(raw)?;
+                return Ok(GpuWeightBuf::Q6KRaw(gpu_buf));
+            }
             if crate::runtime_defaults::kquant_requant_q8() {
                 let q8 = quantize_f32_to_q8_0_host(&f32_data);
                 eprintln!(
@@ -1319,6 +1338,7 @@ pub fn dequant_layer_q8_to_f16(
             // value in the base weight slot (currently sibling-only).
             GpuWeightBuf::Q8Split(q8) => (q8.len() / 34) * 32,
             GpuWeightBuf::Q4Split(q4) => (q4.len() / 18) * 32,
+            GpuWeightBuf::Q6KRaw(q6) => (q6.len() / 210) * 256,
         }
     };
 

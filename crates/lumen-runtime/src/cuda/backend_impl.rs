@@ -10328,7 +10328,34 @@ unsafe fn launch_matvec_ext(
         }
     }
 
-    match weight {
+match weight {
+        // Native Q6_K: 210 B per 256 elements = 0.8203 B/weight, the same byte
+        // count llama.cpp reads. Falls through to an error only if the kernel
+        // failed to compile, which the loader reports unconditionally.
+        GpuWeightBuf::Q6KRaw(w_q6) => {
+            let f = kernels.matvec_q6_k_f32.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!("matvec_q6_k_f32 unavailable for {label}"))
+            })?;
+            let out_u32 = out_dim as u32;
+            let in_u32 = in_dim as u32;
+            let cfg = CudarcLaunchConfig {
+                grid_dim: (out_u32.div_ceil(4), 1, 1),
+                block_dim: (32, 4, 1),
+                shared_mem_bytes: 0,
+            };
+            device
+                .stream
+                .launch_builder(f)
+                .arg(w_q6)
+                .arg(input)
+                .arg(output)
+                .arg(&out_u32)
+                .arg(&in_u32)
+                .launch(cfg)
+                .map_err(|e| RuntimeError::Compute(format!("matvec_q6_k_f32 {label}: {e}")))?;
+            crate::runtime_defaults::route_census_record(label, "Q6K_NATIVE");
+            return Ok(());
+        }
         GpuWeightBuf::F32(w_f32) => {
             let cfg = GemvConfig {
                 trans: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
@@ -11061,6 +11088,13 @@ unsafe fn launch_matvec_residual(
     }
 
     match weight {
+        // No residual Q6_K kernel yet; `wo` is Q4 on every layer so this is
+        // unreachable in practice. Explicit error beats a silent wrong path.
+        GpuWeightBuf::Q6KRaw(_) => {
+            return Err(RuntimeError::Compute(format!(
+                "Q6_K residual matvec not implemented ({label})"
+            )));
+        }
         GpuWeightBuf::F32(w_f32) => {
             // Copy residual into output so cuBLAS can accumulate: y = W*x + y.
             device.stream.memcpy_dtod(residual, output).map_err(|e| {

@@ -496,6 +496,8 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q4_split_f32_lane_r4: Option<CudaFunction>,
     /// Wide-lane: 2 lanes per Q4 block, int2 loads, grid unchanged.
     pub(crate) matvec_q4_split_f32_lane_wide: Option<CudaFunction>,
+    /// Native Q6_K matvec (0.8203 B/weight, llama.cpp parity).
+    pub(crate) matvec_q6_k_f32: Option<CudaFunction>,
     /// Whole T=1 GDN post-projection chain in one cooperative launch.
     pub(crate) gdn_t1_coop_all: Option<CudaFunction>,
     /// Four attention-prep launches collapsed into one at T=1.
@@ -1831,6 +1833,9 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        matvec_q6_k_f32: load_fn(shaders::MATVEC_Q6_K_F32_KERNEL_SOURCE, "matvec_q6_k_f32")
+            .inspect_err(|e| eprintln!("[CUDA] matvec_q6_k_f32: NVRTC FAILED: {e}"))
+            .ok(),
         gdn_t1_coop_all: load_fn(shaders::GDN_T1_COOP_KERNEL_SOURCE, "gdn_t1_coop_all")
             .inspect_err(|e| eprintln!("[CUDA] gdn_t1_coop_all: NVRTC FAILED: {e}"))
             .ok(),
