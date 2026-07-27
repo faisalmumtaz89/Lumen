@@ -840,11 +840,93 @@ fn upload_tensor(
             }
 
             let f32_data = dequant_kquant_to_f32(raw, other, n_elements, f16_to_f32_generic)?;
+
+            // LUMEN_CUDA_KQUANT_REQUANT_Q8=1: land K-quants as Q8_0 instead of F32.
+            //
+            // Mixed-quant GGUFs put Q5_K/Q6_K on sensitive tensors alongside
+            // Q4_0 — on 9B-Q4 that is `wq` (the fused Q+gate [4096,8192]) for 4
+            // of the 8 full-attention layers. Lumen has no K-quant matvec, so
+            // this path expands them to F32: 4 B/weight, 134 MB per tensor,
+            // ~536 MB per token for those four layers. llama.cpp reads the SAME
+            // file and runs Q6_K natively at 0.66 B/weight, so it moves ~6x
+            // fewer bytes on the identical tensor — a real competitive gap
+            // rather than a tuning question.
+            //
+            // Q8_0 is the conservative landing: 1.0625 B/weight (3.8x fewer
+            // bytes than F32) and it carries MORE mantissa than Q6_K's 6-bit
+            // payload, so requantising a dequantised Q6_K block is close to
+            // lossless. Q4_0 would be denser still but would genuinely discard
+            // precision the GGUF author chose to keep on these tensors, so it
+            // is not the default.
+            //
+            // The coherence gate is binding either way.
+            if crate::runtime_defaults::kquant_requant_q8() {
+                let q8 = quantize_f32_to_q8_0_host(&f32_data);
+                eprintln!(
+                    "[CUDA] upload {name}: {other:?} -> Q8_0 ({n_elements} elements, \
+                     {} -> {} bytes on device)",
+                    f32_data.len() * 4,
+                    q8.len()
+                );
+                let gpu_buf = device.htod_copy(&q8)?;
+                return Ok(GpuWeightBuf::Q8Raw(gpu_buf));
+            }
             eprintln!("[CUDA] upload {name}: {other:?} dequant to F32 ({n_elements} elements)");
             let gpu_buf = device.htod_copy(&f32_data)?;
             Ok(GpuWeightBuf::F32(gpu_buf))
         }
     }
+}
+
+/// F32 -> IEEE-754 half bits (round-to-nearest-even), for Q8_0 block scales.
+fn f32_to_f16_bits(v: f32) -> u16 {
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let mut exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    let mut frac = (b & 0x007f_ffff) as u32;
+    if exp <= 0 {
+        if exp < -10 {
+            return sign;
+        }
+        frac |= 0x0080_0000;
+        let shift = (14 - exp) as u32;
+        let round = (frac >> (shift - 1)) & 1;
+        return sign | (((frac >> shift) + round) as u16);
+    }
+    if exp >= 0x1f {
+        return sign | 0x7c00;
+    }
+    let round = (frac >> 12) & 1;
+    let mut half = ((exp as u16) << 10) | ((frac >> 13) as u16);
+    if round == 1 {
+        half += 1;
+        if half & 0x7c00 == 0x7c00 {
+            exp += 1;
+        }
+    }
+    sign | half
+}
+
+/// Quantise F32 to Q8_0 blocks: [f16 scale][32 x int8] per 32 elements.
+///
+/// Mirrors `lumen_convert::dequant::quantize_f32_to_q8_0` — same absmax/127
+/// scale and same round-to-nearest — so a tensor requantised here is
+/// bit-identical to one the converter would have produced.
+fn quantize_f32_to_q8_0_host(data: &[f32]) -> Vec<u8> {
+    const QK: usize = 32;
+    let nb = data.len() / QK;
+    let mut out = Vec::with_capacity(nb * 34);
+    for b in 0..nb {
+        let blk = &data[b * QK..(b + 1) * QK];
+        let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        out.extend_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+        for &v in blk {
+            out.push(((v * id).round().clamp(-127.0, 127.0) as i8) as u8);
+        }
+    }
+    out
 }
 
 /// Upload a norm tensor to GPU as F32.
