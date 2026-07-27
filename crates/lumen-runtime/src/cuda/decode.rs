@@ -1832,7 +1832,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
         },
         gdn_t1_coop_all: load_fn(shaders::GDN_T1_COOP_KERNEL_SOURCE, "gdn_t1_coop_all")
-            .inspect_err(|e| cuda_log!("[CUDA] gdn_t1_coop_all: FAILED: {e}"))
+            .inspect_err(|e| eprintln!("[CUDA] gdn_t1_coop_all: NVRTC FAILED: {e}"))
             .ok(),
         q35_attn_prep_t1: load_fn(shaders::ATTN_PREP_T1_KERNEL_SOURCE, "q35_attn_prep_t1")
             .inspect_err(|e| cuda_log!("[CUDA] q35_attn_prep_t1: FAILED: {e}"))
