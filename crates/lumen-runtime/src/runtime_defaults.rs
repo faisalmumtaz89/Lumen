@@ -2952,7 +2952,23 @@ pub fn route_census_verify(plan: &Q4ActPlan) -> Result<String, String> {
                     f.zone_name(),
                     want
                 ));
-            } else if !paths.iter().all(|p| p.starts_with(expect_prefix)) {
+            // Path names must be CLASSIFIED, not prefix-matched. The
+            // post-launch tags added for stronger dispatch evidence
+            // ("Q4_SPLIT_Q8_1_LAUNCHED", "Q4_SPLIT_MMVQ_LAUNCHED") are int8
+            // routes that do not start with "Q8", so a bare prefix test marked
+            // a CORRECTLY dispatched arm as wrong and failed the whole run.
+            } else if !paths.iter().all(|p| {
+                let is_int8 = p.starts_with("Q8")
+                    || p.contains("Q8_1")
+                    || p.contains("MMVQ")
+                    || p.contains("DP4A");
+                let is_f16 = p.starts_with("F16") || p.contains("HGEMV");
+                match expect_prefix {
+                    "Q8" => is_int8,
+                    "F16" => is_f16,
+                    _ => p.starts_with(expect_prefix),
+                }
+            }) {
                 errors.push(format!(
                     "{} requested {:?} but ran on {:?}",
                     f.zone_name(),

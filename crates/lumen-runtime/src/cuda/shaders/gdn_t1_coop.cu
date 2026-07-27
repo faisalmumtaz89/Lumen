@@ -86,8 +86,11 @@ __device__ __forceinline__ void grid_sync_coop(unsigned int* bar, unsigned int n
             atomicExch(&bar[0], 0u);           // last arrival resets and flips
             atomicAdd(&bar[1], 1u);
         } else {
+            // Plain spin: __nanosleep is unavailable under NVRTC without an
+            // explicit arch flag (this is the NVRTC_ERROR_COMPILATION at line
+            // 90 that made the kernel load as None in round 33).
             while (atomicAdd(&bar[1], 0u) == gen) {
-                __nanosleep(64);
+                __threadfence();
             }
         }
         __threadfence();                       // observe everyone else's writes
