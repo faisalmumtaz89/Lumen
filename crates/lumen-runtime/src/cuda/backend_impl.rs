@@ -10232,7 +10232,7 @@ unsafe fn launch_matvec_residual_lane(
     // regressed `wo` to the old path whenever variant 5 was selected, which
     // would have contaminated the r4 A/B (codex-sol caught this before the
     // measurement was interpreted).
-    if !matches!(crate::runtime_defaults::q4_split_f32_variant(), 4 | 5) {
+    if !matches!(crate::runtime_defaults::q4_split_f32_variant(), 4 | 5 | 6) {
         return Ok(false);
     }
     // Control for the A/B: LUMEN_CUDA_LANE_WO=0 keeps the lane kernel on every
@@ -11397,6 +11397,7 @@ unsafe fn launch_matvec_split_f32(
         3 => kernels.matvec_q4_split_f32_gmem.as_ref(),
         4 => kernels.matvec_q4_split_f32_lane.as_ref(),
         5 => kernels.matvec_q4_split_f32_lane_r4.as_ref(),
+        6 => kernels.matvec_q4_split_f32_lane_wide.as_ref(),
         _ => kernels.matvec_q4_split_f32.as_ref(),
     };
     let (Some(split_fn), Some(split_w)) = (kernel, q4_split_sibling) else {
@@ -11429,6 +11430,13 @@ unsafe fn launch_matvec_split_f32(
             block_dim: (128, 1, 1),
             shared_mem_bytes: 0,
         },
+        // wide-lane: grid UNCHANGED (parallelism is the binding resource per
+        // round 21), wider per-instruction loads
+        6 => CudarcLaunchConfig {
+            grid_dim: (out_dim_u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        },
         _ => CudarcLaunchConfig {
             grid_dim: (out_dim_u32.div_ceil(4), 1, 1),
             block_dim: (256, 1, 1),
@@ -11452,6 +11460,7 @@ unsafe fn launch_matvec_split_f32(
             3 => "F32_SPLIT_SOA_GMEM",
             4 => "F32_SPLIT_SOA_LANE",
             5 => "F32_SPLIT_SOA_LANE_R4",
+            6 => "F32_SPLIT_SOA_LANE_WIDE",
             _ => "F32_SPLIT_SOA",
         },
     );
