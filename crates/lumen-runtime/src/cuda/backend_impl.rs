@@ -6012,6 +6012,7 @@ impl CudaBackend {
                         ))
                     })?;
                 } else {
+                crate::runtime_defaults::route_census_record("gdn_conv", "CONV_SILU");
                 let conv_fn = st.kernels.ssm_conv1d_silu_prefill.as_ref().unwrap();
                 let config = LaunchConfig::for_elements(p.qkv_dim);
                 let launch_cfg = CudarcLaunchConfig {
@@ -6044,6 +6045,7 @@ impl CudaBackend {
 
             // 2. gdn_compute_gates_batched: alpha/beta gates (-> alpha_buf/beta_buf).
             if !gdn_coop {
+                crate::runtime_defaults::route_census_record("gdn_gates", "GATES_BATCHED");
                 let gates_fn = st.kernels.gdn_compute_gates_batched.as_ref().unwrap();
                 let config = LaunchConfig::for_elements(p.num_heads);
                 let launch_cfg = CudarcLaunchConfig {
@@ -6679,6 +6681,7 @@ impl CudaBackend {
 
             // Step 4c: Compute gates
             {
+                crate::runtime_defaults::route_census_record("gdn_gates", "GATES_BATCHED");
                 let gates_fn = st.kernels.gdn_compute_gates.as_ref().ok_or_else(|| {
                     RuntimeError::Compute("GDN gdn_compute_gates kernel not compiled".into())
                 })?;
@@ -7277,6 +7280,7 @@ impl CudaBackend {
 
             // 1. ssm_conv1d_silu_prefill: batched conv1d + SiLU
             {
+                crate::runtime_defaults::route_census_record("gdn_conv", "CONV_SILU");
                 let conv_fn = st.kernels.ssm_conv1d_silu_prefill.as_ref().unwrap();
                 let config = LaunchConfig::for_elements(p.qkv_dim);
                 let launch_cfg = CudarcLaunchConfig {
@@ -7327,6 +7331,7 @@ impl CudaBackend {
             // 2. gdn_compute_gates_batched: batched gate computation
             // Writes to alpha_out and beta_out (NOT alpha_raw/beta_raw -- avoids borrow conflict)
             {
+                crate::runtime_defaults::route_census_record("gdn_gates", "GATES_BATCHED");
                 let gates_fn = st.kernels.gdn_compute_gates_batched.as_ref().unwrap();
                 let total = batch * p.num_heads;
                 let config = LaunchConfig::for_elements(total);
@@ -7737,6 +7742,7 @@ impl CudaBackend {
             let silu_fn = st.kernels.silu_inplace.as_ref().ok_or_else(|| {
                 RuntimeError::Compute("GDN silu_inplace kernel not compiled".into())
             })?;
+            crate::runtime_defaults::route_census_record("gdn_gates", "GATES_BATCHED");
             let gates_fn = st.kernels.gdn_compute_gates.as_ref().ok_or_else(|| {
                 RuntimeError::Compute("GDN gdn_compute_gates kernel not compiled".into())
             })?;
