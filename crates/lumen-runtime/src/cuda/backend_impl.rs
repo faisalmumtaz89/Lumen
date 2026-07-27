@@ -6944,6 +6944,30 @@ impl CudaBackend {
             let ssm_wants_q8 = crate::runtime_defaults::q4_act_plan()
                 .mode_for(crate::runtime_defaults::Q4ProjectionFamily::GdnAttnGate)
                 == crate::runtime_defaults::Q4ActMode::Q8_1;
+            // Round 46: this path did NOT dispatch — the census showed no
+            // gdn_ssm_out entry at all. Report which clause failed rather than
+            // guessing; the likely one is the sibling being absent, the same
+            // buffer-not-allocated failure as the split-allocator defect.
+            {
+                use std::sync::atomic::{AtomicBool, Ordering as O};
+                static SHOWN: AtomicBool = AtomicBool::new(false);
+                if !SHOWN.swap(true, O::Relaxed) {
+                    eprintln!(
+                        "[SSMOUT] wants_q8={ssm_wants_q8} sibling={} quant_fn={} \
+                         q8_1_scratch={} weight={}",
+                        lw.q4_split_ssm_out.is_some(),
+                        st.kernels.quantize_f32_to_q8_1.is_some(),
+                        st.scratch.input_q8_1.is_some(),
+                        match ssm_out {
+                            GpuWeightBuf::Q4Raw(_) => "Q4Raw",
+                            GpuWeightBuf::Q4Aligned(_) => "Q4Aligned",
+                            GpuWeightBuf::Q8Raw(_) => "Q8Raw",
+                            GpuWeightBuf::F32(_) => "F32",
+                            _ => "other",
+                        },
+                    );
+                }
+            }
             let ssm_q8_ok = ssm_wants_q8
                 && lw.q4_split_ssm_out.is_some()
                 && st.kernels.quantize_f32_to_q8_1.is_some()
