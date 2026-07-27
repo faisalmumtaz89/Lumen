@@ -11152,7 +11152,7 @@ unsafe fn launch_matvec_preq8_1(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_defaults::route_census_record(label, "Q8_1_PREQ");
+    crate::runtime_defaults::route_census_record(label, "ENTER_PREQ");
     let out_dim_u32 = out_dim as u32;
     let in_dim_u32 = in_dim as u32;
 
@@ -11320,7 +11320,7 @@ unsafe fn launch_matvec_preq8_1_residual(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_defaults::route_census_record(label, "Q8_1_PREQ_RES");
+    crate::runtime_defaults::route_census_record(label, "ENTER_PREQ_RES");
     let out_dim_u32 = out_dim as u32;
     let in_dim_u32 = in_dim as u32;
 
@@ -11631,7 +11631,10 @@ unsafe fn launch_matvec_preq8_1_split(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_defaults::route_census_record(label, "Q8_1_PREQ_SPLIT");
+    // NOTE: entry marker only — this helper can still fall through without
+    // launching if the sibling or kernel is absent. Proof of execution is the
+    // per-kernel tag recorded at the actual dispatch site below.
+    crate::runtime_defaults::route_census_record(label, "ENTER_PREQ_SPLIT");
     // Q8 split path.
     if kernels.use_q8_split_dispatch {
         if let Some(split_buf) = q8_split_sibling {
@@ -11761,6 +11764,7 @@ unsafe fn launch_matvec_preq8_1_split(
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec_q4_split_q8_1 preq {label}: {e}",))
                     })?;
+                crate::runtime_defaults::route_census_record(label, "Q4_SPLIT_Q8_1_LAUNCHED");
                 return Ok(());
             }
         }
@@ -11789,7 +11793,8 @@ unsafe fn launch_matvec_preq8_1_residual_split(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_defaults::route_census_record(label, "Q8_1_PREQ_RES_SPLIT");
+    // Entry marker only — see note in launch_matvec_preq8_1_split.
+    crate::runtime_defaults::route_census_record(label, "ENTER_PREQ_RES_SPLIT");
     if kernels.use_q8_split_dispatch {
         if let Some(split_buf) = q8_split_sibling {
             // LUMEN_CUDA_Q8_MMVQ: llama mmvq residual kernel takes precedence.
