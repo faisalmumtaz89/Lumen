@@ -616,6 +616,18 @@ fn upload_tensor(
     slice: &lumen_format::index::TensorSlice,
 ) -> Result<GpuWeightBuf, RuntimeError> {
     let raw = weights.subtensor_bytes(slice)?;
+    // Round 41 found wq stored as F32 on 4 of 8 full-attention layers while
+    // wk/wv/wo are Q4Raw. F32 is 4 B/weight against Q4_0's 0.5625 — 7.1x the
+    // bytes on the largest attention matrix ([4096,8192] fused Q+gate), which
+    // is ~460 MB of extra traffic per token. K-quants dequantise to F32 here,
+    // so log the SOURCE scheme for attention tensors to identify the cause.
+    if name.contains("attn_q") || name.contains("wq") {
+        use std::sync::atomic::{AtomicU32, Ordering as O};
+        static N: AtomicU32 = AtomicU32::new(0);
+        if N.fetch_add(1, O::Relaxed) < 12 {
+            eprintln!("[UPLOAD] {name} quant={:?} bytes={}", slice.quant, raw.len());
+        }
+    }
     match slice.quant {
         QuantScheme::F32 => {
             let f32_data = bytes_as_f32(raw)?;
