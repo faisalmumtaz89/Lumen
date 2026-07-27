@@ -1231,6 +1231,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_GDN_FUSED_CONV",
     "LUMEN_CUDA_ATTN_PREP_FUSED",
     "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
+    "LUMEN_CUDA_GDN_COOP",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
     "LUMEN_CUDA_Q4_MMVQ",
@@ -2458,6 +2459,7 @@ mod tests {
     "LUMEN_CUDA_GDN_FUSED_CONV",
     "LUMEN_CUDA_ATTN_PREP_FUSED",
     "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
+    "LUMEN_CUDA_GDN_COOP",
         "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q4_MMVQ",
         "LUMEN_CUDA_Q8_MMVQ",
@@ -3078,6 +3080,20 @@ pub fn ffn_direct_residual() -> bool {
     *ON.get_or_init(|| {
         matches!(
             std::env::var("LUMEN_CUDA_FFN_DIRECT_RESIDUAL").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// `LUMEN_CUDA_GDN_COOP=1` — run the whole T=1 GDN post-projection chain in one
+/// cooperative launch. Deadlocks if the grid is not co-resident, so the caller
+/// gates on kernel availability, T=1, non-F64, and the fixed 256x128 geometry.
+pub fn gdn_coop_requested() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_GDN_COOP").ok().as_deref(),
             Some("1") | Some("true") | Some("yes") | Some("on")
         )
     })

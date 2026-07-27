@@ -800,6 +800,10 @@ struct GdnScratchGpu {
     alpha_raw_buf: CudaSlice<f32>,
     /// Raw beta projection output (pre-gate transform): [num_heads] f32.
     beta_raw_buf: CudaSlice<f32>,
+    /// Grid-barrier scratch for the cooperative T=1 GDN megakernel: two u32s,
+    /// [0] = arrival counter, [1] = generation. Persistent so the barrier is
+    /// not reallocated per layer; the generation counter is free to wrap.
+    coop_barrier: CudaSlice<u32>,
     /// GDN state-update output: [value_dim] f32.
     output_buf: CudaSlice<f32>,
     /// RMSNorm + scale on output: [value_dim] f32.
@@ -5056,6 +5060,7 @@ impl CudaBackend {
             beta_buf: self.device.alloc_zeros::<f32>(params.num_heads)?,
             alpha_raw_buf: self.device.alloc_zeros::<f32>(params.num_heads)?,
             beta_raw_buf: self.device.alloc_zeros::<f32>(params.num_heads)?,
+            coop_barrier: self.device.alloc_zeros::<u32>(2)?,
             output_buf: self.device.alloc_zeros::<f32>(params.value_dim)?,
             normed_out_buf: self.device.alloc_zeros::<f32>(params.value_dim)?,
             gate_buf: self.device.alloc_zeros::<f32>(params.value_dim)?,
@@ -5810,8 +5815,82 @@ impl CudaBackend {
                 }
             }
 
+            // LUMEN_CUDA_GDN_COOP=1: the ENTIRE post-projection chain
+            // (conv/SiLU/L2 -> gates -> delta-rule state -> norm-gate) in ONE
+            // cooperative launch with two grid syncs, replacing steps 1-5.
+            //
+            // SAFETY: a cooperative launch DEADLOCKS if the grid is not
+            // co-resident, so this is gated on the kernel having loaded, T=1,
+            // the non-F64 path, and the fixed 256x128 geometry that A100 (108
+            // SMs) holds resident with room to spare. Anything unexpected
+            // falls back to the four-kernel chain rather than hanging.
+            let gdn_coop = batch_u32 == 1
+                && !use_prefill_f64
+                && st.kernels.gdn_t1_coop_all.is_some()
+                && lw.ssm_norm_tiled.is_some()
+                && head_dim_u32 == 128
+                && crate::runtime_defaults::gdn_coop_requested();
+            if crate::runtime_defaults::gdn_coop_requested() {
+                use std::sync::atomic::{AtomicBool, Ordering as O};
+                static SHOWN: AtomicBool = AtomicBool::new(false);
+                if !SHOWN.swap(true, O::Relaxed) {
+                    eprintln!(
+                        "[GDN_COOP] dispatched={gdn_coop} (batch={batch_u32} \
+                         f64={use_prefill_f64} loaded={} head_dim={head_dim_u32})",
+                        st.kernels.gdn_t1_coop_all.is_some(),
+                    );
+                }
+            }
+            if gdn_coop {
+                let f = st.kernels.gdn_t1_coop_all.as_ref().unwrap();
+                let ssm_norm = lw.ssm_norm_tiled.as_ref().unwrap();
+                let dt_bias = lw.ssm_dt_bias.as_ref().unwrap();
+                let ssm_a = lw.ssm_a.as_ref().unwrap();
+                let cfg = CudarcLaunchConfig {
+                    grid_dim: (256, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(f)
+                        .arg(&gdn.qkv_buf)
+                        .arg(&mut gdn.conv_states[gdn_idx])
+                        .arg(conv1d_weight)
+                        .arg(&mut gdn.qkv_conv_buf)
+                        .arg(dt_bias)
+                        .arg(ssm_a)
+                        .arg(&gdn.alpha_raw_buf)
+                        .arg(&gdn.beta_raw_buf)
+                        .arg(&mut gdn.alpha_buf)
+                        .arg(&mut gdn.beta_buf)
+                        .arg(&mut gdn.h_states[gdn_idx])
+                        .arg(&mut gdn.output_buf)
+                        .arg(ssm_norm)
+                        .arg(&gdn.gate_buf)
+                        .arg(&mut gdn.normed_out_buf)
+                        .arg(&mut gdn.coop_barrier)
+                        .arg(&num_heads_u32)
+                        .arg(&num_kv_heads_u32)
+                        .arg(&head_dim_u32)
+                        .arg(&head_dim_u32)
+                        .arg(&qk_dim_u32)
+                        .arg(&qkv_dim_u32)
+                        .arg(&kernel_size_u32)
+                        .arg(&state_pos)
+                        .arg(&eps)
+                        .launch_cooperative(cfg)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("gdn_t1_coop_all L{layer_idx}: {e}"))
+                })?;
+                gdn.conv_positions[gdn_idx] = (state_pos + batch_u32) % buf_slots;
+                crate::runtime_defaults::route_census_record("gdn_chain", "COOP_ALL_LAUNCHED");
+            }
+
             // 1. ssm_conv1d_silu_prefill: conv1d + SiLU, advances conv_state.
-            {
+            if !gdn_coop {
                 // LUMEN_CUDA_GDN_FUSED_CONV=1: conv1d+SiLU AND the L2 normalize
                 // of Q/K in one launch, dropping step 3 below.
                 //
@@ -5885,7 +5964,7 @@ impl CudaBackend {
             }
 
             // 2. gdn_compute_gates_batched: alpha/beta gates (-> alpha_buf/beta_buf).
-            {
+            if !gdn_coop {
                 let gates_fn = st.kernels.gdn_compute_gates_batched.as_ref().unwrap();
                 let config = LaunchConfig::for_elements(p.num_heads);
                 let launch_cfg = CudarcLaunchConfig {
@@ -5972,7 +6051,7 @@ impl CudaBackend {
                 );
             }
 
-            // 4. gdn_prefill_fused_v3[_f64accum]: delta-rule recurrence.
+            // 4. gdn_prefill_fused_v3[_f64accum]: delta-rule recurrence. (skipped under coop)
             //    Reads conv_out + alpha_out + beta_out, writes raw_out
             //    (output_buf), updates h_states[gdn_idx] in place.
             {
@@ -6097,7 +6176,7 @@ impl CudaBackend {
             // 5. gdn_prefill_norm_gate[_f64accum]: RMSNorm + SiLU(gate) ->
             //    normed_out_buf (the FINAL norm-gated GDN output). Step 11
             //    (ssm_out) reads normed_out_buf via used_fused_norm_gate=true.
-            {
+            if !gdn_coop {
                 let norm_fn = if use_prefill_f64 {
                     st.kernels.gdn_prefill_norm_gate_f64accum.as_ref().unwrap()
                 } else {
