@@ -1230,6 +1230,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_LANE_FUSED_GLU",
     "LUMEN_CUDA_GDN_FUSED_CONV",
     "LUMEN_CUDA_ATTN_PREP_FUSED",
+    "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
     "LUMEN_CUDA_Q4_MMVQ",
@@ -2456,6 +2457,7 @@ mod tests {
     "LUMEN_CUDA_LANE_FUSED_GLU",
     "LUMEN_CUDA_GDN_FUSED_CONV",
     "LUMEN_CUDA_ATTN_PREP_FUSED",
+    "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
         "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q4_MMVQ",
         "LUMEN_CUDA_Q8_MMVQ",
@@ -3062,6 +3064,20 @@ pub fn attn_prep_fused_requested() -> bool {
     *ON.get_or_init(|| {
         matches!(
             std::env::var("LUMEN_CUDA_ATTN_PREP_FUSED").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// `LUMEN_CUDA_FFN_DIRECT_RESIDUAL=1` — fold the FFN residual into the down
+/// projection's own store and write `x_gpu` directly, removing both the
+/// `residual_add` launch and the decode loop's layer-commit copy.
+pub fn ffn_direct_residual() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_FFN_DIRECT_RESIDUAL").ok().as_deref(),
             Some("1") | Some("true") | Some("yes") | Some("on")
         )
     })

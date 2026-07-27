@@ -856,6 +856,10 @@ struct MutableState {
     /// Number of decode tokens processed since last graph invalidation.
     /// 0 = not yet run, 1 = first token (no capture), 2+ = graph replay.
     decode_token_count: usize,
+    /// Set by the FFN when the down projection folded its residual into its own
+    /// store and wrote `x_gpu` directly, so the decode loop skips BOTH the
+    /// `residual_add` launch and the layer-commit dtod copy. Cleared per layer.
+    ffn_wrote_x_gpu: bool,
     /// GDN scratch (lazy-allocated on first GDN layer, persists for sequence lifetime).
     gdn_scratch_gpu: Option<GdnScratchGpu>,
     /// Pre-allocated cuBLAS workspace for CUDA graph capture compatibility.
@@ -4524,6 +4528,31 @@ impl CudaBackend {
                                 inter_dim,
                                 "down split",
                             )?;
+                            // LUMEN_CUDA_FFN_DIRECT_RESIDUAL=1: fold the
+                            // residual into the down projection's own store and
+                            // write x_gpu directly, removing BOTH the
+                            // residual_add launch and the decode loop's
+                            // layer-commit dtod copy (2 commands x 32 layers =
+                            // 64 per token, ~0.27 ms). The residual split
+                            // kernel is already loaded and dispatched.
+                            if crate::runtime_defaults::ffn_direct_residual()
+                                && lw.q4_split_w_down.is_some()
+                            {
+                                launch_matvec_preq8_1_residual_split(
+                                    &self.device,
+                                    &st.kernels,
+                                    &lw.w_down,
+                                    lw.q8_split_w_down.as_ref(),
+                                    lw.q4_split_w_down.as_ref(),
+                                    q8_1_buf,
+                                    &st.scratch.attn_proj,
+                                    &mut st.scratch.x_gpu,
+                                    hidden_dim,
+                                    inter_dim,
+                                    "down",
+                                )?;
+                                st.ffn_wrote_x_gpu = true;
+                            } else {
                             launch_matvec_preq8_1_split(
                                 &self.device,
                                 &st.kernels,
@@ -4536,6 +4565,7 @@ impl CudaBackend {
                                 inter_dim,
                                 "down",
                             )?;
+                            }
                         }
                     } else {
                         unsafe {
@@ -4861,7 +4891,12 @@ impl CudaBackend {
         }
 
         // Residual add: attn_proj += down.
-        {
+        //
+        // SKIPPED when the down projection already folded it in (see
+        // ffn_wrote_x_gpu). Per layer this launch plus the decode loop's
+        // layer-commit dtod copy are two commands; across 32 layers that is 64
+        // per token, ~0.27 ms at the measured ~4.2 us marginal launch cost.
+        if !st.ffn_wrote_x_gpu {
             let config = LaunchConfig::for_elements(hidden_dim);
             let launch_cfg = CudarcLaunchConfig {
                 grid_dim: (config.grid_dim, 1, 1),
@@ -9190,12 +9225,14 @@ impl CudaBackend {
                 .get(layer)
                 .and_then(|m| m.as_ref())
                 .is_some();
-            if !is_moe_layer {
+            if !is_moe_layer && !st.ffn_wrote_x_gpu {
                 self.device
                     .stream
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
                     .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
             }
+            // Per-layer flag: the next layer must not inherit it.
+            st.ffn_wrote_x_gpu = false;
         }
         self.compute_final_gpu(st)?;
         {
@@ -9296,12 +9333,14 @@ impl CudaBackend {
                 .get(layer)
                 .and_then(|m| m.as_ref())
                 .is_some();
-            if !is_moe_layer {
+            if !is_moe_layer && !st.ffn_wrote_x_gpu {
                 self.device
                     .stream
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
                     .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
             }
+            // Per-layer flag: the next layer must not inherit it.
+            st.ffn_wrote_x_gpu = false;
         }
         self.compute_final_gpu(st)?;
         {
@@ -14557,6 +14596,7 @@ impl ComputeBackend for CudaBackend {
             has_qgate_layers: false,
             has_moe_layers: false,
             decode_token_count: 0,
+            ffn_wrote_x_gpu: false,
             gdn_scratch_gpu: None,
             cublas_workspace,
             precomputed_ptrs: None,
