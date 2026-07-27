@@ -497,6 +497,8 @@ pub const MATVEC_Q4_SPLIT_F32_GMEM_KERNEL_SOURCE: &str =
     include_str!("matvec_q4_split_f32_gmem.cu");
 /// Lane-striped: 4 lanes cooperate per Q4 block, 8 activations per lane,
 /// warp-contiguous weight loads. The F32-exact analogue of mmvq.
+/// Cooperative single-launch T=1 GDN chain (conv/L2 + gates + state + norm-gate).
+pub const GDN_T1_COOP_KERNEL_SOURCE: &str = include_str!("gdn_t1_coop.cu");
 /// Fused T=1 attention prep: deinterleave + Q/K RMSNorm + NeoX RoPE.
 pub const ATTN_PREP_T1_KERNEL_SOURCE: &str = include_str!("attn_prep_t1.cu");
 pub const MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE: &str =

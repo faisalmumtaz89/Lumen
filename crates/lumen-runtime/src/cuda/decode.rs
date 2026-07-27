@@ -496,6 +496,8 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q4_split_f32_lane_r4: Option<CudaFunction>,
     /// Wide-lane: 2 lanes per Q4 block, int2 loads, grid unchanged.
     pub(crate) matvec_q4_split_f32_lane_wide: Option<CudaFunction>,
+    /// Whole T=1 GDN post-projection chain in one cooperative launch.
+    pub(crate) gdn_t1_coop_all: Option<CudaFunction>,
     /// Four attention-prep launches collapsed into one at T=1.
     pub(crate) q35_attn_prep_t1: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_residual: Option<CudaFunction>,
@@ -1829,6 +1831,9 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        gdn_t1_coop_all: load_fn(shaders::GDN_T1_COOP_KERNEL_SOURCE, "gdn_t1_coop_all")
+            .inspect_err(|e| cuda_log!("[CUDA] gdn_t1_coop_all: FAILED: {e}"))
+            .ok(),
         q35_attn_prep_t1: load_fn(shaders::ATTN_PREP_T1_KERNEL_SOURCE, "q35_attn_prep_t1")
             .inspect_err(|e| cuda_log!("[CUDA] q35_attn_prep_t1: FAILED: {e}"))
             .ok(),
