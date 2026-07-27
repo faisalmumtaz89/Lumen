@@ -2453,6 +2453,31 @@ impl CudaBackend {
                 // Q4_0 QUALITY FIX (attention side): on the fragile 9B config,
                 // Q4Raw QKV uses F32 activations, not int8 Q8_1 dp4a. Other models
                 // keep dp4a (flag off). See weight_uses_f32_act_q4.
+                // DEFECT PROBE: the per-site census shows wq/wk/wv dispatching
+                // 4x/token while [LAYERS] reports 8 full-attention layers, so
+                // half of them are NOT taking the int8 route. Log the decision
+                // and the weight variant per layer, once each, to find which.
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering as O};
+                    static SEEN: AtomicU64 = AtomicU64::new(0);
+                    let bit = 1u64 << (layer_idx.min(63));
+                    if SEEN.fetch_or(bit, O::Relaxed) & bit == 0 {
+                        let variant = |w: &GpuWeightBuf| match w {
+                            GpuWeightBuf::Q4Raw(_) => "Q4Raw",
+                            GpuWeightBuf::Q4Aligned(_) => "Q4Aligned",
+                            GpuWeightBuf::Q4Split(_) => "Q4Split",
+                            GpuWeightBuf::Q8Raw(_) => "Q8Raw",
+                            GpuWeightBuf::Q8Aligned(_) => "Q8Aligned",
+                            _ => "other",
+                        };
+                        eprintln!(
+                            "[QKVPATH] layer={layer_idx} wq={} wk={} wv={} \
+                             split_wq={} qgate_fusion={has_qgate_fusion}",
+                            variant(&lw.wq), variant(&lw.wk), variant(&lw.wv),
+                            lw.q4_split_wq.is_some(),
+                        );
+                    }
+                }
                 let qkv_use_preq = !weight_uses_f32_act_q4_fam(
                     &lw.wq,
                     st.kernels.q4_decode_f32_act,
