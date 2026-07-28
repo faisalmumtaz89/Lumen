@@ -127,11 +127,25 @@ extern "C" __global__ void matvec_q4_mma_s4(
             one[j] = 1;
         }
 
-        // B columns: gid 0 -> lo, 1 -> hi, 2 -> ones, else zero.
-        unsigned int bfrag = 0;
-        if (gid == 0)      bfrag = pack_s4x8(lo);
-        else if (gid == 1) bfrag = pack_s4x8(hi);
-        else if (gid == 2) bfrag = pack_s4x8(one);
+        // TWO MMAs, ZERO SHUFFLES.
+        //
+        // v1 put lo/hi/ones in columns 0/1/2 and measured 0.196x — a 5x
+        // regression — because recombining C0 + 16*C1 + 8*C2 needs terms from
+        // TWO lanes (tig=0 holds cols 0,1; tig=1 holds col 2), forcing a
+        // cross-lane reduction on EVERY 32-element block. At nb=128-384 that
+        // is hundreds of reductions per row and it swamped the arithmetic win.
+        //
+        // Splitting into two MMAs puts every term a row needs on the SAME lane
+        // (tig=0 holds D[gid][0] and D[gid][1] for both its rows), so the
+        // per-block reduction disappears entirely. Two tensor-core ops are far
+        // cheaper than ~36 shuffle ops.
+        //   MMA1 B = [lo, hi] -> d0 = C_lo(gid), d1 = C_hi(gid),
+        //                        d2 = C_lo(gid+8), d3 = C_hi(gid+8)
+        //   MMA2 B = [ones]   -> d0 = C_ones(gid), d2 = C_ones(gid+8)
+        unsigned int b_lohi = 0;
+        if (gid == 0)      b_lohi = pack_s4x8(lo);
+        else if (gid == 1) b_lohi = pack_s4x8(hi);
+        unsigned int b_ones = (gid == 0) ? pack_s4x8(one) : 0u;
 
         // --- weight fragment: rows row0+gid and row0+gid+8 ---
         int wv[8];
@@ -145,11 +159,9 @@ extern "C" __global__ void matvec_q4_mma_s4(
                 #pragma unroll
                 for (int j = 0; j < 8; j++) {
                     const int k = tig * 8 + j;
-                    // GGML de-interleave: k<16 -> low nibble of byte k,
-                    // k>=16 -> high nibble of byte k-16.
                     const int byte = (k < 16) ? (int)nib[k] : (int)nib[k - 16];
                     const int q = (k < 16) ? (byte & 0xF) : ((byte >> 4) & 0xF);
-                    wv[j] = q - 8;     // centre to signed s4
+                    wv[j] = q - 8;
                 }
                 afrag[half] = pack_s4x8(wv);
             } else {
@@ -157,51 +169,32 @@ extern "C" __global__ void matvec_q4_mma_s4(
             }
         }
 
-        int cfrag[4] = {0, 0, 0, 0};
-        int dfrag[4];
-        mma_m16n8k32_s4(dfrag, afrag, bfrag, cfrag);
+        int zero4[4] = {0, 0, 0, 0};
+        int d1f[4], d2f[4];
+        mma_m16n8k32_s4(d1f, afrag, b_lohi, zero4);
+        mma_m16n8k32_s4(d2f, afrag, b_ones, zero4);
 
-        // d[0],d[1] = rows gid,   cols tig*2, tig*2+1
-        // d[2],d[3] = rows gid+8, same cols
-        // Columns 0,1,2 carry lo, hi, ones; recombine dot = c0 + 16*c1 + 8*c2.
-        // Only the lanes owning those columns hold the terms, so shuffle them
-        // to lane 0 of each 4-lane group.
-        const int col_a = (int)(tig * 2);
-        const int col_b = col_a + 1;
-
-        int r0_terms[3] = {0, 0, 0};
-        int r8_terms[3] = {0, 0, 0};
-        if (col_a < 3) { r0_terms[col_a] = dfrag[0]; r8_terms[col_a] = dfrag[2]; }
-        if (col_b < 3) { r0_terms[col_b] = dfrag[1]; r8_terms[col_b] = dfrag[3]; }
-
-        #pragma unroll
-        for (int t = 0; t < 3; t++) {
-            #pragma unroll
-            for (int off = 1; off < 4; off <<= 1) {
-                r0_terms[t] += __shfl_xor_sync(0xffffffff, r0_terms[t], off);
-                r8_terms[t] += __shfl_xor_sync(0xffffffff, r8_terms[t], off);
+        // tig==0 holds columns 0 and 1 for both its rows, so all three terms
+        // land on one lane and no cross-lane step is needed.
+        if (tig == 0) {
+            const int dot_r0 = d1f[0] + 16 * d1f[1] + 8 * d2f[0];
+            const int dot_r8 = d1f[2] + 16 * d1f[3] + 8 * d2f[2];
+            const unsigned int rA = row0 + gid;
+            const unsigned int rB = row0 + gid + 8;
+            float sA = 0.0f, sB = 0.0f;
+            if (rA < out_dim) {
+                const unsigned short* sc =
+                    (const unsigned short*)(weight_split + (unsigned long long)rA * row_bytes);
+                asm("cvt.f32.f16 %0, %1;" : "=f"(sA) : "h"(sc[ib]));
             }
+            if (rB < out_dim) {
+                const unsigned short* sc =
+                    (const unsigned short*)(weight_split + (unsigned long long)rB * row_bytes);
+                asm("cvt.f32.f16 %0, %1;" : "=f"(sB) : "h"(sc[ib]));
+            }
+            acc_r0 += sA * d_act * (float)dot_r0;
+            acc_r8 += sB * d_act * (float)dot_r8;
         }
-
-        const int dot_r0 = r0_terms[0] + 16 * r0_terms[1] + 8 * r0_terms[2];
-        const int dot_r8 = r8_terms[0] + 16 * r8_terms[1] + 8 * r8_terms[2];
-
-        // Q4 block scales for the two rows this lane group owns.
-        const unsigned int rA = row0 + gid;
-        const unsigned int rB = row0 + gid + 8;
-        float sA = 0.0f, sB = 0.0f;
-        if (rA < out_dim) {
-            const unsigned short* sc =
-                (const unsigned short*)(weight_split + (unsigned long long)rA * row_bytes);
-            asm("cvt.f32.f16 %0, %1;" : "=f"(sA) : "h"(sc[ib]));
-        }
-        if (rB < out_dim) {
-            const unsigned short* sc =
-                (const unsigned short*)(weight_split + (unsigned long long)rB * row_bytes);
-            asm("cvt.f32.f16 %0, %1;" : "=f"(sB) : "h"(sc[ib]));
-        }
-        acc_r0 += sA * d_act * (float)dot_r0;
-        acc_r8 += sB * d_act * (float)dot_r8;
     }
 
     if (tig == 0) {
