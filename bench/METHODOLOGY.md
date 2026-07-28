@@ -221,7 +221,6 @@ LUMEN_CUDA_MMV_Q_MOE_DP4A=1               # default ON — +11.7% Q4
 | `LUMEN_CUDA_FA2_ATTN=1` | OFF | FA2 attention decode port | -2.7% Q8 | Per-call HBM alloc dominates at batch=1 |
 | `LUMEN_CUDA_GDN_SPLIT=1` | OFF | Split layout for GDN tensors (Q4 only) | +2.6% Q4 decode | Q8 + GDN_SPLIT does not fit in 80 GB VRAM |
 | `LUMEN_CUDA_Q8_SPLIT=1` | OFF | Raw + split layout for Q8_0 weights | +4.5% Q8 decode |  dense-9B opt-in; superseded by MMV_Q_DP4A for MoE |
-| `LUMEN_CUDA_Q4_SPLIT=1` | OFF | Raw + split layout for Q4_0 weights | +9.0% Q4 decode |  dense-9B opt-in; superseded by MMV_Q_MOE_DP4A for MoE |
 | `LUMEN_CUDA_OUTPUT_PROJ_SPLIT=1` | OFF | Big-NR variant for the 1 GB output projection tensor | +7.7% Q8 decode (alone) | Dense-9B path; output_proj llama.cpp port is the MoE-class equivalent |
 | `LUMEN_CUDA_OUTPUT_PROJ_NR=16` | OFF | Override `NR` from default 32 to 16 for the output projection | +1.6% Q8 decode | Dense-9B path |
 | `LUMEN_CUDA_Q8_SCALE_HW=1` | OFF | Native `LDG.E.U16` scale fetch in the Q8 matvec path | +0.4% Q8 decode | Below ±1.5% gate threshold |
@@ -241,7 +240,7 @@ LUMEN_CUDA_MMV_Q_MOE_DP4A=1               # default ON — +11.7% Q4
 
 ```bash
 modal run modal/bench_real_models.py --models qwen3.5-9b --quants q8_0,q4_0 \
-  --lumen-env "LUMEN_CUDA_GDN_SPLIT=1,LUMEN_CUDA_Q8_SPLIT=1,LUMEN_CUDA_Q4_SPLIT=1,\
+  --lumen-env "LUMEN_CUDA_GDN_SPLIT=1,LUMEN_CUDA_Q8_SPLIT=1,\
 LUMEN_CUDA_OUTPUT_PROJ_SPLIT=1,LUMEN_CUDA_Q8_SCALE_HW=1,LUMEN_CUDA_GDN_REGISTER_RESIDENT=1,\
 LUMEN_CUDA_OUTPUT_PROJ_NR=16,LUMEN_CUDA_BF16_GEMMEX=1"   # legacy value; current prod = 0
 ```

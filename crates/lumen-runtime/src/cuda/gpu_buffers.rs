@@ -74,7 +74,7 @@ pub enum GpuWeightBuf {
     /// Native `int*` loads (4 loads per block vs 16 byte loads in Q4Raw).
     ///
     /// Used only for the decode path; produced by `repack_q4_raw_to_split()`
-    /// when `LUMEN_CUDA_Q4_SPLIT=1` is set at session start. Original Q4Raw
+    /// at session start, budget permitting. Original Q4Raw
     /// is preserved alongside for prefill. Consumed by `matvec_q4_split_q8_1`.
     #[allow(dead_code)]
     Q4Split(CudaSlice<u8>),
@@ -138,7 +138,7 @@ pub struct LayerWeightsGpu {
 
     // --- split-layout integration: decode-only Q4 split siblings ---
     /// Mirror of the q8_split_* fields for Q4_0 weights. Populated by
-    /// `repack_layer_q4_clone_to_split()` when `LUMEN_CUDA_Q4_SPLIT=1`.
+    /// `repack_layer_q4_clone_to_split()`.
     pub q4_split_wq: Option<CudaSlice<u8>>,
     pub q4_split_wk: Option<CudaSlice<u8>>,
     pub q4_split_wv: Option<CudaSlice<u8>>,
@@ -854,7 +854,6 @@ fn upload_tensor(
     }
 }
 
-
 /// Quantise F32 to Q8_0 blocks: [f16 scale][32 x int8] per 32 elements.
 ///
 
@@ -955,7 +954,7 @@ pub fn upload_layer_weights(
         q8_split_w_up: None,
         q8_split_w_down: None,
         // Q4 split siblings start as None; populated by
-        // repack_layer_q4_clone_to_split() when LUMEN_CUDA_Q4_SPLIT=1.
+        // repack_layer_q4_clone_to_split().
         q4_split_wq: None,
         q4_split_wk: None,
         q4_split_wv: None,

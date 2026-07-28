@@ -137,10 +137,22 @@ pub(crate) fn run(
             "repetition_penalty".into(),
             format!("{:?}", sampling.repetition_penalty),
         ),
-        ("repeat_last_n".into(), format!("{:?}", sampling.repeat_last_n)),
-        ("kv_precision".into(), format!("{:?}", engine.config().kv_precision)),
-        ("max_seq_len".into(), engine.config().max_seq_len.to_string()),
-        ("num_layers".into(), engine.hyperparams().num_layers.to_string()),
+        (
+            "repeat_last_n".into(),
+            format!("{:?}", sampling.repeat_last_n),
+        ),
+        (
+            "kv_precision".into(),
+            format!("{:?}", engine.config().kv_precision),
+        ),
+        (
+            "max_seq_len".into(),
+            engine.config().max_seq_len.to_string(),
+        ),
+        (
+            "num_layers".into(),
+            engine.hyperparams().num_layers.to_string(),
+        ),
         (
             "num_experts".into(),
             engine.hyperparams().num_experts.unwrap_or(0).to_string(),
@@ -151,7 +163,10 @@ pub(crate) fn run(
         // missing-setter artifact — which once understated a 9-cell board by up
         // to 55% — impossible to reproduce unnoticed.
         ("setter_dense_quant_hint".into(), setters.0.to_string()),
-        ("setter_model_primary_quant".into(), format!("{:?}", setters.1)),
+        (
+            "setter_model_primary_quant".into(),
+            format!("{:?}", setters.1),
+        ),
         ("setter_model_block_count".into(), setters.2.to_string()),
         ("setter_model_is_moe".into(), setters.3.to_string()),
     ];
@@ -248,7 +263,11 @@ pub(crate) fn run(
             );
             std::process::exit(24);
         }
-        let tps = if secs > 0.0 { decode_calls as f64 / secs } else { 0.0 };
+        let tps = if secs > 0.0 {
+            decode_calls as f64 / secs
+        } else {
+            0.0
+        };
         eprintln!(
             "[decode-bench] {} seq{} {}: decode_calls={} decode_time={:.4}s tps={:.3} (seq wall {:.1}s)",
             cfg.cell,

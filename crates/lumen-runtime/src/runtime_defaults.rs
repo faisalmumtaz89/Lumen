@@ -2527,7 +2527,6 @@ mod tests {
     }
 }
 
-
 // ===========================================================================
 // Q4 ACTIVATION PLAN — per-family activation precision
 // ===========================================================================
@@ -2682,7 +2681,11 @@ impl Q4ActPlan {
                     .split(',')
                     .map(|t| t.trim().to_ascii_lowercase())
                     .any(|t| t == f.zone_name() || t == "all");
-                if named { Q4ActMode::Q8_1 } else { Q4ActMode::F32 }
+                if named {
+                    Q4ActMode::Q8_1
+                } else {
+                    Q4ActMode::F32
+                }
             };
             #[cfg(not(any(feature = "quality-oracle", feature = "activation-probe")))]
             let mode = match (narrow_gdn, dense) {
@@ -2734,7 +2737,6 @@ impl Q4ActPlan {
     }
 }
 
-
 #[cfg(test)]
 mod q4_act_plan_tests {
     use super::*;
@@ -2747,10 +2749,27 @@ mod q4_act_plan_tests {
         // a zoned family is never dispatched. An earlier version of this test
         // claimed the stronger invariant and was wrong: it omitted the live
         // `gdn_ssm_out` spelling.
-        for l in ["wq", "wk", "wv", "wo", "gate", "up", "gate_up", "down",
-                  "qkv", "gdn_qkv", "attn_gate", "gdn_gate", "gdn_attn_gate",
-                  "ssm_out", "gdn_ssm_out"] {
-            assert!(Q4ProjectionFamily::from_label(l).is_some(), "unmapped label {l}");
+        for l in [
+            "wq",
+            "wk",
+            "wv",
+            "wo",
+            "gate",
+            "up",
+            "gate_up",
+            "down",
+            "qkv",
+            "gdn_qkv",
+            "attn_gate",
+            "gdn_gate",
+            "gdn_attn_gate",
+            "ssm_out",
+            "gdn_ssm_out",
+        ] {
+            assert!(
+                Q4ProjectionFamily::from_label(l).is_some(),
+                "unmapped label {l}"
+            );
         }
         assert!(Q4ProjectionFamily::from_label("nonsense").is_none());
     }
@@ -2885,8 +2904,25 @@ static ROUTE_CENSUS: Mutex<Vec<(String, &'static str)>> = Mutex::new(Vec::new())
 /// expectation would agree with itself no matter what the GPU did.
 static INSTALLED_PLAN: Mutex<Option<Q4ActPlan>> = Mutex::new(None);
 
-/// Publish the resolved plan. Called by the backend once per model load.
-pub fn route_census_set_plan(plan: &Q4ActPlan) {
+/// Which families the loaded model actually HAS Q4 weights for.
+///
+/// Silence is not proof. Without this, a family the plan pinned to F32 that
+/// never dispatched at all passed verification — the check only rejected zero
+/// calls for int8 families. A model whose F32 route quietly stopped running
+/// would certify clean by doing nothing.
+static EXPECTED_FAMILIES: Mutex<Vec<Q4ProjectionFamily>> = Mutex::new(Vec::new());
+
+/// Publish the resolved plan and the families that must be observed.
+///
+/// Clears prior observations: a second model load in one process would
+/// otherwise verify the new plan against the old model's routes.
+pub fn route_census_set_plan(plan: &Q4ActPlan, expected: &[Q4ProjectionFamily]) {
+    if let Ok(mut v) = ROUTE_CENSUS.lock() {
+        v.clear();
+    }
+    if let Ok(mut g) = EXPECTED_FAMILIES.lock() {
+        *g = expected.to_vec();
+    }
     if let Ok(mut g) = INSTALLED_PLAN.lock() {
         *g = Some(plan.clone());
     }
@@ -2982,13 +3018,28 @@ pub fn route_census_verify() -> Result<String, String> {
             Some(p) => p,
             // Not an "assume the default" case: if no plan was installed the
             // backend never reached preload, so there is nothing to certify.
-            None => return Err("no activation plan was installed — the backend \
+            None => {
+                return Err("no activation plan was installed — the backend \
                                 never completed preload, so no route can be \
-                                certified".into()),
+                                certified"
+                    .into())
+            }
         },
         Err(_) => return Err("activation plan lock poisoned".into()),
     };
     let plan = &plan;
+    let expected = EXPECTED_FAMILIES
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    if expected.is_empty() {
+        return Err(
+            "no expected-family set was published — the backend did not \
+                    report which families it loaded Q4 weights for, so silence \
+                    cannot be distinguished from absence"
+                .into(),
+        );
+    }
     let summary = route_census_summary();
     let mut lines = Vec::new();
     let mut errors = Vec::new();
@@ -3000,18 +3051,25 @@ pub fn route_census_verify() -> Result<String, String> {
             .collect();
         let taken: usize = observed.iter().map(|(_, _, n)| *n).sum();
         let paths: Vec<&str> = observed.iter().map(|(_, p, _)| *p).collect();
-        lines.push(format!("{}={:?} calls={} paths={:?}", f.zone_name(), want, taken, paths));
+        lines.push(format!(
+            "{}={:?} calls={} paths={:?}",
+            f.zone_name(),
+            want,
+            taken,
+            paths
+        ));
 
-        // A family with zero calls is only an error when it was expected to
-        // run. `gdn_*` families are absent on non-GDN models and `ssm_out` is
-        // floored to Q8_0 by the converter, so silence is legitimate there —
-        // but silence on a family the plan put on int8 means the branch is
-        // unreachable and any timing for it is meaningless.
+        // Zero calls is an error for any family the model HAS Q4 weights for,
+        // whatever mode it planned. `gdn_*` are absent on non-GDN models and
+        // `ssm_out` is floored to Q8_0 by the converter, so silence there is
+        // legitimate — but that is decided by what was loaded, never by the
+        // absence of evidence.
         if taken == 0 {
-            if want == Q4ActMode::Q8_1 {
+            if expected.contains(&f) {
                 errors.push(format!(
-                    "{} planned {:?} but was NEVER dispatched — the branch is \
-                     unreachable, so any timing for this arm is meaningless",
+                    "{} planned {:?} and the model HAS Q4 weights for it, but it \
+                     was NEVER dispatched — the branch is unreachable, so any \
+                     timing for this arm is meaningless",
                     f.zone_name(),
                     want
                 ));
@@ -3042,4 +3100,3 @@ pub fn route_census_verify() -> Result<String, String> {
         Err(format!("{manifest}\n  ERRORS: {}", errors.join("; ")))
     }
 }
-

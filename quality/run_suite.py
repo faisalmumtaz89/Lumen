@@ -39,6 +39,9 @@ GATES = {
     "GQ-001": ("short.jsonl", 14 / 15, "short"),
     "GQ-002": ("medium.jsonl", 9 / 10, "generation"),
     "GQ-004": ("verylong.jsonl", 5 / 5, "verylong"),
+    # the degeneration traps in stress.jsonl are GQ-004 items and are scored
+    # under GQ-004b so neither corpus silently absorbs the other's results
+    "GQ-004b": ("stress.jsonl", 1.0, "stress"),
     # GQ-014 (multi-turn conversation fidelity): stateless chat protocol — each
     # turn re-POSTs the FULL alternating history. A conversation passes only if
     # EVERY turn passes (DD-* + answer/anchor + the per-turn cross-turn check);
@@ -62,6 +65,8 @@ GATES = {
     # where argmax margins are smallest, which is where a quantised activation
     # changes a token first.
     "GQ-010": ("stress.jsonl", 1.0, "stress"),
+    "GQ-009": ("stress.jsonl", 1.0, "stress"),
+    "GQ-012": ("stress.jsonl", 1.0, "stress"),
 }
 
 
@@ -365,6 +370,20 @@ def run_gate(base: str, gate: str) -> dict:
     items = load_corpus(fname)
     if not items:
         return {"gate": gate, "status": "DEFERRED", "evidence": f"no corpus {fname}"}
+    # stress.jsonl carries FOUR gates (6 GQ-010 retrieval, 5 GQ-009
+    # multilingual, 2 GQ-012 near-tie, 3 GQ-004 degeneration). Scoring the
+    # whole file under one gate name reports "16/16 GQ-010" for results that
+    # are mostly not GQ-010 at all.
+    if fname == "stress.jsonl":
+        # GQ-004b is the degeneration slice of stress.jsonl; its items carry
+        # the GQ-004 tag because that is the gate whose detectors judge them.
+        # The separate name keeps them from being folded into the verylong
+        # GQ-004 score, where a different pass threshold applies.
+        want = "GQ-004" if gate == "GQ-004b" else gate
+        items = [it for it in items if it.get("gate") == want]
+        if not items:
+            return {"gate": gate, "status": "DEFERRED",
+                    "evidence": f"no {gate} items in {fname}"}
     if gate in ("GQ-007", "GQ-008"):
         # One corpus, two gates: tool items belong to GQ-007, the rest to
         # GQ-008. Scoring both over the whole file would double-count.

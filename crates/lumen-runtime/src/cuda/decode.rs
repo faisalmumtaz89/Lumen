@@ -531,7 +531,7 @@ pub(crate) struct KernelSet {
     /// `in_dim % 256 == 0` (the int4 alignment contract). Byte-identical output.
     /// Default OFF pending on-A100 A/B measurement.
     pub(crate) use_q8_matvec_fast: bool,
-    /// `LUMEN_CUDA_Q4_SPLIT=1` AND matvec_q4_split_q8_1 loaded.
+    /// matvec_q4_split_q8_1 loaded and a sibling was cloned.
     pub(crate) use_q4_split_dispatch: bool,
     /// `LUMEN_CUDA_SOA_LOCKED=1` AND matvec_q4_split_q8_1_locked loaded.
     /// When true, the Q4 split dispatch selects the codegen-LOCKED kernel
@@ -1287,12 +1287,9 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         l2_normalize_qk_strided: load_fn(shaders::GDN_KERNEL_SOURCE, "l2_normalize_qk_strided")
             .ok(),
         gdn_prefill_fused_v3: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_fused_v3").ok(),
-        ssm_conv1d_silu_l2norm_t1: load_fn(
-            shaders::GDN_KERNEL_SOURCE,
-            "ssm_conv1d_silu_l2norm_t1",
-        )
-        .inspect_err(|e| cuda_log!("[CUDA] ssm_conv1d_silu_l2norm_t1: FAILED: {e}"))
-        .ok(),
+        ssm_conv1d_silu_l2norm_t1: load_fn(shaders::GDN_KERNEL_SOURCE, "ssm_conv1d_silu_l2norm_t1")
+            .inspect_err(|e| cuda_log!("[CUDA] ssm_conv1d_silu_l2norm_t1: FAILED: {e}"))
+            .ok(),
         gdn_prefill_norm_gate: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_norm_gate").ok(),
         // accumulator variants. Default-OFF; loaded best-effort.
         l2_normalize_qk_strided_f64accum: match load_fn(
