@@ -2986,10 +2986,16 @@ pub fn route_census_verify(plan: &Q4ActPlan) -> Result<String, String> {
             // routes that do not start with "Q8", so a bare prefix test marked
             // a CORRECTLY dispatched arm as wrong and failed the whole run.
             } else if !paths.iter().all(|p| {
+                // Every int8-ACTIVATION route, however the kernel is named.
+                // This classifier has now rejected a correctly-dispatched arm
+                // three times (Q4_SPLIT_Q8_1_LAUNCHED, then Q4_MMA_S4) because
+                // the name did not start with "Q8". The property that matters
+                // is the ACTIVATION type, not the kernel's label.
                 let is_int8 = p.starts_with("Q8")
                     || p.contains("Q8_1")
                     || p.contains("MMVQ")
-                    || p.contains("DP4A");
+                    || p.contains("DP4A")
+                    || p.contains("MMA_S4");
                 let is_f16 = p.starts_with("F16") || p.contains("HGEMV");
                 match expect_prefix {
                     "Q8" => is_int8,
