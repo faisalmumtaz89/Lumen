@@ -6,9 +6,13 @@ Spins (or connects to) a lumen server, runs the self-contained GQ-* gates
 DD-* detectors + answer keys, and emits the per-cell Required-Output-Format
 results table + a cell-<id>.json manifest.
 
-Fidelity gates (GQ-005/006 vs llama) and the coherence
-judge (GQ-013) are run by companion drivers; this driver marks them DEFERRED so
-the scorecard is explicit (AH-7: never a silent omission).
+GQ-005 (reference greedy fidelity vs llama.cpp) has a companion driver in this
+directory: gq005_fidelity.py. It is not run from here because it needs
+llama.cpp built against the same GGUF in the same container.
+
+GQ-006 (perplexity parity) and GQ-013 (coherence judge) have NO driver in this
+repository. This runner marks them DEFERRED rather than silently omitting them
+(AH-7), but "deferred to a driver nobody wrote" is a gap, not a plan.
 
 Usage:
   run_suite.py --model PATH --backend metal --cell 9b-q8-metal --port 8401
