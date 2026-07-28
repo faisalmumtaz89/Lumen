@@ -6,7 +6,7 @@ Spins (or connects to) a lumen server, runs the self-contained GQ-* gates
 DD-* detectors + answer keys, and emits the per-cell Required-Output-Format
 results table + a cell-<id>.json manifest.
 
-Fidelity gates (GQ-005/006 vs llama) and tool calling (GQ-007) and the coherence
+Fidelity gates (GQ-005/006 vs llama) and the coherence
 judge (GQ-013) are run by companion drivers; this driver marks them DEFERRED so
 the scorecard is explicit (AH-7: never a silent omission).
 
@@ -50,6 +50,18 @@ GATES = {
     # reference-greedy-fidelity-vs-llama gate (Section 10), referenced throughout
     # the suite docs and the MoE near-tie analysis; reusing 005 would collide.
     "GQ-014": ("multiturn.jsonl", 1.0, "multiturn"),
+    # GQ-008 structured-output adherence and GQ-007 tool calling: both are
+    # PARSE-OR-FAIL gates, so the threshold is 1.0. A JSON answer that is
+    # "nearly" valid is not valid, and a tool call with a mangled argument is a
+    # failure at the call site, not a near miss.
+    "GQ-008": ("structured.jsonl", 1.0, "structured"),
+    "GQ-007": ("structured.jsonl", 1.0, "structured"),
+    # GQ-009/010/012 share one corpus: long-context retrieval, multilingual
+    # instruction following, near-tie sampling and degeneration traps. These
+    # exist to stress ACTIVATION PRECISION specifically — near-tie prompts sit
+    # where argmax margins are smallest, which is where a quantised activation
+    # changes a token first.
+    "GQ-010": ("stress.jsonl", 1.0, "stress"),
 }
 
 
@@ -110,6 +122,36 @@ def query(base: str, prompt: str, max_tokens: int, temperature: float = 0.0) -> 
         resp = json.loads(r.read())
     choice = resp["choices"][0]
     return choice["message"]["content"], choice.get("finish_reason", "")
+
+
+def query_tools(base: str, prompt: str, tools: list[dict], max_tokens: int,
+                temperature: float = 0.0) -> tuple[str, str, list[dict]]:
+    """GQ-007 client: POST with an OpenAI-shaped `tools` array.
+
+    Returns (content, finish_reason, tool_calls). `tool_calls` is normalised to
+    a list of {"name", "arguments"} so the scorer does not have to care whether
+    the server nests them under `function` (OpenAI shape) or emits them flat.
+    An empty list means the model answered in prose, which is the correct
+    outcome for a negative item and a failure for a positive one.
+    """
+    body = json.dumps({
+        "model": "x",
+        "messages": [{"role": "user", "content": prompt}],
+        "tools": [{"type": "function", "function": t} for t in tools],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }).encode()
+    req = urllib.request.Request(f"{base}/v1/chat/completions", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=900) as r:
+        resp = json.loads(r.read())
+    choice = resp["choices"][0]
+    msg = choice.get("message", {})
+    calls = []
+    for c in (msg.get("tool_calls") or []):
+        fn = c.get("function", c)
+        calls.append({"name": fn.get("name"), "arguments": fn.get("arguments")})
+    return msg.get("content") or "", choice.get("finish_reason", ""), calls
 
 
 def query_messages(base: str, messages: list[dict], max_tokens: int,
@@ -195,7 +237,7 @@ def run_prompt(base: str, item: dict, kind: str) -> dict:
         expect_eos=True,
         check_term=item.get("require_eos", False),
     )
-    if kind == "verylong":
+    if kind == "verylong" or (kind == "stress" and item.get("kind") == "degeneration"):
         wv = window_detectors(text)
         if not wv.passed:
             v = wv
@@ -214,12 +256,127 @@ def run_prompt(base: str, item: dict, kind: str) -> dict:
     }
 
 
+def _extract_json(text: str):
+    """Pull a JSON value out of a reply, tolerating code fences but NOT prose.
+
+    Returns (value, error). A reply that needs prose stripped has already
+    disobeyed "return ONLY JSON", so the caller records it as a failure even
+    when the embedded JSON parses — adherence is the gate, not parseability.
+    """
+    t = text.strip()
+    fenced = False
+    if t.startswith("```"):
+        fenced = True
+        t = re.sub(r"^```[a-zA-Z]*\n?", "", t)
+        t = re.sub(r"```\s*$", "", t).strip()
+    try:
+        return json.loads(t), ("code-fenced" if fenced else None)
+    except Exception:
+        pass
+    m = re.search(r"[\[{].*[\]}]", t, re.S)
+    if not m:
+        return None, "no JSON found"
+    try:
+        return json.loads(m.group(0)), "JSON embedded in prose"
+    except Exception as e:
+        return None, f"unparseable: {type(e).__name__}"
+
+
+def run_structured(base: str, item: dict) -> dict:
+    """GQ-007 / GQ-008. Tool items go through the chat endpoint with `tools`."""
+    kind = item.get("kind")
+    notes = []
+    if kind in ("tool", "tool_negative"):
+        text, finish, calls = query_tools(
+            base, item["prompt"], item.get("tools", []), item.get("max_tokens", 256))
+        want = item.get("expect_tool")
+        if want is None:
+            # A tool was offered that the request does not need. Calling it is
+            # the failure this item exists to catch.
+            ok = not calls
+            if calls:
+                notes.append(f"called {calls[0].get('name')} when no call was needed")
+        elif not calls:
+            ok, _ = False, notes.append("no tool call emitted")
+        else:
+            got = calls[0]
+            ok = got.get("name") == want
+            if not ok:
+                notes.append(f"called {got.get('name')!r}, wanted {want!r}")
+            args = got.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args, _ = {}, notes.append("arguments not valid JSON")
+            for k, v in (item.get("expect_args") or {}).items():
+                got_v = (args or {}).get(k)
+                same = (str(got_v).strip().lower() == str(v).strip().lower()
+                        if not isinstance(v, (int, float)) else got_v == v)
+                if not same:
+                    ok = False
+                    notes.append(f"arg {k}={got_v!r} wanted {v!r}")
+        return {"id": item["id"], "passed": ok, "dd_passed": True, "dd_fired": [],
+                "answer_correct": ok, "on_topic": True, "finish_reason": finish,
+                "notes": notes, "snippet": text[:240].replace("\n", " ")}
+
+    text, finish = query(base, item["prompt"], item.get("max_tokens", 256))
+    if kind == "json":
+        val, err = _extract_json(text)
+        ok = val is not None and err is None
+        if err:
+            notes.append(err)
+        if val is not None:
+            need = item.get("require_keys") or []
+            n = item.get("require_array_len")
+            if n is not None:
+                if not isinstance(val, list) or len(val) != n:
+                    ok = False
+                    notes.append(f"wanted array of {n}, got {type(val).__name__}"
+                                 f"{'' if not isinstance(val, list) else f' len {len(val)}'}")
+                objs = val if isinstance(val, list) else []
+            else:
+                objs = [val]
+            for o in objs:
+                if not isinstance(o, dict):
+                    ok = False
+                    notes.append(f"element is {type(o).__name__}, not object")
+                    continue
+                missing = [k for k in need if k not in o]
+                if missing:
+                    ok = False
+                    notes.append(f"missing keys {missing}")
+    elif kind == "markdown_table":
+        rows = [l for l in text.splitlines()
+                if l.strip().startswith("|") and set(l.strip()) - set("|-: ")]
+        body = [r for r in rows[1:]] if rows else []
+        ok = len(body) == item.get("require_rows", 0)
+        if not ok:
+            notes.append(f"{len(body)} data rows, wanted {item.get('require_rows')}")
+    else:
+        ok, _ = False, notes.append(f"unknown structured kind {kind!r}")
+    return {"id": item["id"], "passed": ok, "dd_passed": True, "dd_fired": [],
+            "answer_correct": ok, "on_topic": True, "finish_reason": finish,
+            "notes": notes, "snippet": text[:240].replace("\n", " ")}
+
+
 def run_gate(base: str, gate: str) -> dict:
     fname, pass_frac, kind = GATES[gate]
     items = load_corpus(fname)
     if not items:
         return {"gate": gate, "status": "DEFERRED", "evidence": f"no corpus {fname}"}
-    results = [run_prompt(base, it, kind) for it in items]
+    if gate in ("GQ-007", "GQ-008"):
+        # One corpus, two gates: tool items belong to GQ-007, the rest to
+        # GQ-008. Scoring both over the whole file would double-count.
+        tool_kinds = ("tool", "tool_negative")
+        items = [it for it in items
+                 if (it.get("kind") in tool_kinds) == (gate == "GQ-007")]
+        if not items:
+            return {"gate": gate, "status": "DEFERRED",
+                    "evidence": f"no {gate} items in {fname}"}
+        results = [run_structured(base, it) for it in items]
+    else:
+        results = [run_prompt(base, it, kind) for it in items]
     npass = sum(1 for r in results if r["passed"])
     n = len(results)
     passed = npass >= max(1, round(pass_frac * n)) and npass == n if pass_frac >= 1.0 else npass >= round(pass_frac * n)
