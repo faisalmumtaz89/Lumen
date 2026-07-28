@@ -16,6 +16,12 @@ default = ["download"]
 download = ["ureq", "indicatif", "dirs", "sha2"]
 cuda = ["lumen-runtime/cuda"]
 
+# Test-only builds, forwarded from lumen-runtime so the model-quality harness —
+# which drives the CLI, not just the server — can build its control and
+# diagnostic arms. Never enabled in a release build.
+quality-oracle = ["lumen-runtime/quality-oracle"]
+activation-probe = ["lumen-runtime/activation-probe"]
+
 [dependencies]
 lumen-format.workspace = true
 lumen-runtime.workspace = true
