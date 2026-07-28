@@ -20,6 +20,7 @@ bin = ["dep:lumen-cli", "dep:lumen-convert", "dep:mimalloc"]
 # quality suite, which drives a server rather than the CLI, can build its
 # control arm from this same revision. Never enabled in a release build.
 quality-oracle = ["lumen-runtime/quality-oracle"]
+activation-probe = ["lumen-runtime/activation-probe"]
 
 # Standalone server binary; gated on the `bin` feature.
 # Gated on the `bin` feature so embedders that don't want the lumen-cli
