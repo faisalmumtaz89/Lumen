@@ -923,9 +923,6 @@ struct MutableState {
     /// Decode dispatches to `matvec_q8_split_q8_1` when the sibling is present.
     /// Falls back to the existing Q8Raw/Q8Aligned path when absent.
     use_q8_split: bool,
-    /// Q4Raw projection weights are cloned to split layout unconditionally;
-    /// weights. Clones into `q4_split_*` sibling buffers.
-    use_q4_split: bool,
     /// `LUMEN_CUDA_OUTPUT_PROJ_SPLIT=1`: clone the Q8Raw output projection
     /// (~1 GB on Qwen3.5-9B) into a split sibling for decode. Independent of
     /// `use_q8_split` so the contribution of the final projection can be
@@ -1162,7 +1159,19 @@ enum LayerOutput {
 /// The comment claiming this ran "before KV alloc" described an ordering the
 /// code does not have.
 fn resolve_split_clone_budget(env_var: &str, device: &CudaDevice) -> ResolvedSplitBudget {
-    let free_mem_bytes = device.free_memory().unwrap_or(0);
+    // A failed free-VRAM query yields a zero budget, which silently disables
+    // every sibling and looks identical to a deliberate `budget=0`. Say so.
+    let free_mem_bytes = match device.free_memory() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "[CUDA] WARNING: free-VRAM query failed ({e}); split-clone budget \
+                 resolves to 0 and NO split siblings will be created. Decode falls \
+                 back to the base kernels. Set {env_var}=N to override."
+            );
+            0
+        }
+    };
 
     // Resource-aware cap. No lower clamp: raising the budget back up to a fixed
     // floor would hand back the memory the subtraction just reserved.
@@ -11704,7 +11713,7 @@ unsafe fn repack_all_layers_q8_clone_to_split(
     layers: &mut [LayerWeightsGpu],
     hp: &ModelHyperparams,
     clone_budget_bytes: usize,
-) -> (usize, Option<usize>, usize, usize) {
+) -> (usize, Option<usize>, usize, usize, usize) {
     let hidden = hp.hidden_dim as usize;
     let inter = hp.intermediate_dim as usize;
 
@@ -11822,6 +11831,10 @@ unsafe fn repack_all_layers_q8_clone_to_split(
     let mut oom_layer: Option<usize> = None;
     let mut oom_count: usize = 0;
     let mut bytes_cloned: usize = 0;
+    // Jobs the loop actually reached. Reporting `jobs.len()` called every job
+    // "attempted" even when the budget stopped the loop after the first few,
+    // which reads as "the budget was ample" in exactly the case it was not.
+    let mut jobs_attempted: usize = 0;
 
     for job in &jobs {
         if oom_layer.is_some() {
@@ -11830,6 +11843,7 @@ unsafe fn repack_all_layers_q8_clone_to_split(
         if bytes_cloned + job.size_bytes > clone_budget_bytes {
             break;
         }
+        jobs_attempted += 1;
 
         let layer = &mut layers[job.layer_idx];
         let src_ref: Option<&CudaSlice<u8>> = match job.kind {
@@ -11874,7 +11888,13 @@ unsafe fn repack_all_layers_q8_clone_to_split(
         }
     }
 
-    (layers_with_split.len(), oom_layer, oom_count, jobs.len())
+    (
+        layers_with_split.len(),
+        oom_layer,
+        oom_count,
+        jobs_attempted,
+        jobs.len(),
+    )
 }
 
 /// Largest-first allocator for cloning every Q4Raw projection weight into the
@@ -11886,7 +11906,7 @@ unsafe fn repack_all_layers_q4_clone_to_split(
     layers: &mut [LayerWeightsGpu],
     hp: &ModelHyperparams,
     clone_budget_bytes: usize,
-) -> (usize, Option<usize>, usize, usize) {
+) -> (usize, Option<usize>, usize, usize, usize) {
     let hidden = hp.hidden_dim as usize;
     let inter = hp.intermediate_dim as usize;
 
@@ -11910,8 +11930,6 @@ unsafe fn repack_all_layers_q4_clone_to_split(
     // layout at FFN-only, so every attention and GDN call site fell back for
     // want of a sibling — GDN projections stream at 455 GB/s against the FFN's
     // 600, so they are where the aligned layout is needed most.
-    let split_attn = true;
-
     #[derive(Copy, Clone, Debug)]
     enum SplitWeightKind {
         Gate,
@@ -11991,7 +12009,7 @@ unsafe fn repack_all_layers_q4_clone_to_split(
             inter,
         );
 
-        if split_attn {
+        {
             // On GDN layers `wq` IS the fused GDN qkv projection; on
             // full-attention layers it is the fused Q+gate. Either way it is
             // the largest single matrix outside the FFN. out_dim is derived
@@ -12080,6 +12098,10 @@ unsafe fn repack_all_layers_q4_clone_to_split(
     let mut oom_layer: Option<usize> = None;
     let mut oom_count: usize = 0;
     let mut bytes_cloned: usize = 0;
+    // Jobs the loop actually reached. Reporting `jobs.len()` called every job
+    // "attempted" even when the budget stopped the loop after the first few,
+    // which reads as "the budget was ample" in exactly the case it was not.
+    let mut jobs_attempted: usize = 0;
 
     for job in &jobs {
         if oom_layer.is_some() {
@@ -12088,6 +12110,7 @@ unsafe fn repack_all_layers_q4_clone_to_split(
         if bytes_cloned + job.size_bytes > clone_budget_bytes {
             break;
         }
+        jobs_attempted += 1;
 
         let layer = &mut layers[job.layer_idx];
         let src_ref: Option<&CudaSlice<u8>> = match job.kind {
@@ -12162,7 +12185,13 @@ unsafe fn repack_all_layers_q4_clone_to_split(
         }
     }
 
-    (layers_with_split.len(), oom_layer, oom_count, jobs.len())
+    (
+        layers_with_split.len(),
+        oom_layer,
+        oom_count,
+        jobs_attempted,
+        jobs.len(),
+    )
 }
 
 // =============================================================================
@@ -14049,9 +14078,9 @@ impl ComputeBackend for CudaBackend {
             eprintln!("[CUDA] LUMEN_CUDA_Q8_MMVQ: Q8/Q4 split decode matvec uses the llama mmvq port (near-tie; GQ+router gated)");
         }
         // LUMEN_CUDA_SOA_LOCKED selects the codegen-LOCKED Q4 split kernel.
-        // It reuses the Q4 split (SoA) repack + sibling buffers, so it implies
-        // `use_q4_split` (the SoA buffers must exist for the locked kernel to
-        // read). Default resolved by `soa_locked_default` (ON for quantised
+        // It reuses the Q4 split (SoA) repack + sibling buffers, which are
+        // always built when the kernel loaded and the budget allowed. Default
+        // resolved by `soa_locked_default` (ON for quantised
         // dense, OFF for MoE/BF16); `LUMEN_CUDA_SOA_LOCKED=0` forces OFF.
         let use_soa_locked = env_truthy_or_default(
             "LUMEN_CUDA_SOA_LOCKED",
@@ -14062,10 +14091,9 @@ impl ComputeBackend for CudaBackend {
         // 4-byte aligned; without a sibling every Q4 decode matvec falls back
         // to byte-at-a-time unpacking. Sizing is the resource control
         // (LUMEN_CUDA_Q4_SPLIT_BUDGET_GB), not a feature switch.
-        let use_q4_split = true;
         if use_soa_locked {
             eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED=1: Q4_0 weights cloned to split layout; decode uses the codegen-locked split kernel");
-        } else if use_q4_split {
+        } else {
             eprintln!("[CUDA] Q4_0 weights will be cloned to split layout for decode");
         }
         // OUTPUT_PROJ_SPLIT defaults ON for Q8 dense (no-op
@@ -14127,7 +14155,7 @@ impl ComputeBackend for CudaBackend {
         if use_q8_matvec_fast && !kernels.use_q8_matvec_fast {
             eprintln!("[CUDA] LUMEN_CUDA_Q8_MATVEC_FAST=1 set but prerequisites missing (need Q8 split dispatch active + v4 kernels loaded); using scalar split kernel");
         }
-        kernels.use_q4_split_dispatch = use_q4_split && kernels.matvec_q4_split_q8_1.is_some();
+        kernels.use_q4_split_dispatch = kernels.matvec_q4_split_q8_1.is_some();
         // Locked Q4 split kernel selection. Effective only when the Q4 split
         // dispatch is active AND both locked kernels loaded. When the locked
         // kernels failed to compile, fall back to the unlocked split kernel.
@@ -14239,7 +14267,6 @@ impl ComputeBackend for CudaBackend {
             moe_repacked,
             use_q8_scale_hw,
             use_q8_split,
-            use_q4_split,
             use_output_proj_split,
             output_proj_nr,
         });
@@ -16899,13 +16926,14 @@ impl ComputeBackend for CudaBackend {
                 st.kernels.matvec_q8_split_q8_1.is_some(),
             ) {
                 // Resolve the split-clone VRAM budget (env override, else
-                // free-mem-aware default) at the clone site — preload, BEFORE the KV
-                // cache is allocated, so `free` still holds the KV headroom. Reuses
+                // free-mem-aware default) at the clone site. init() has already
+                // allocated the KV caches by now, so `free` excludes them and
+                // the resolver does not subtract a KV reserve again. Reuses
                 // the shared L8 resolver (same helper as the Q4 clone pass).
                 let budget =
                     resolve_split_clone_budget("LUMEN_CUDA_Q8_SPLIT_BUDGET_GB", &self.device);
                 let mem_before_q8_split = budget.free_mem_bytes;
-                let (n_layers_split, oom_layer, oom_count, total_jobs) = unsafe {
+                let (n_layers_split, oom_layer, oom_count, jobs_attempted, total_jobs) = unsafe {
                     repack_all_layers_q8_clone_to_split(
                         &self.device,
                         split_repack_fn,
@@ -16921,7 +16949,8 @@ impl ComputeBackend for CudaBackend {
                 eprintln!(
                     "[CUDA] Q8 split-clone budget: resolved={:.2} GB (free={:.2} GB, \
                      slack={:.2} GB, source={}); cloned \
-                     {n_layers_split}/{num_layers} FFN layers ({total_jobs} weight-jobs)",
+                     {n_layers_split}/{num_layers} FFN layers \
+                     ({jobs_attempted}/{total_jobs} weight-jobs reached)",
                     (budget.budget_bytes as f64) / 1.0e9,
                     (budget.free_mem_bytes as f64) / 1.0e9,
                     (budget.slack_bytes as f64) / 1.0e9,
@@ -17060,18 +17089,19 @@ impl ComputeBackend for CudaBackend {
         // pass so SPLIT can read Q4Raw before aligned mutates it.
         let mut layers_with_q4_split: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
-        if st.use_q4_split {
+        {
             if let (Some(ref split_repack_fn), true) = (
                 st.kernels.repack_q4_raw_to_split.as_ref(),
                 st.kernels.matvec_q4_split_q8_1.is_some(),
             ) {
                 // Resolve the split-clone VRAM budget (env override, else
-                // free-mem-aware default) at the clone site — preload, BEFORE the KV
-                // cache is allocated, so `free` still holds the KV headroom.
+                // free-mem-aware default) at the clone site. init() has already
+                // allocated the KV caches by now, so `free` excludes them and
+                // the resolver does not subtract a KV reserve again.
                 let budget =
                     resolve_split_clone_budget("LUMEN_CUDA_Q4_SPLIT_BUDGET_GB", &self.device);
                 let mem_before_q4_split = budget.free_mem_bytes;
-                let (n_layers_split, oom_layer, oom_count, total_jobs) = unsafe {
+                let (n_layers_split, oom_layer, oom_count, jobs_attempted, total_jobs) = unsafe {
                     repack_all_layers_q4_clone_to_split(
                         &self.device,
                         split_repack_fn,
@@ -17087,7 +17117,9 @@ impl ComputeBackend for CudaBackend {
                 eprintln!(
                     "[CUDA] Q4 split-clone budget: resolved={:.2} GB (free={:.2} GB, \
                      slack={:.2} GB, source={}); cloned \
-                     {n_layers_split}/{num_layers} FFN layers ({total_jobs} weight-jobs)",
+                     {n_layers_split}/{num_layers} layers \
+                     ({jobs_attempted}/{total_jobs} weight-jobs reached; FFN + \
+                     attention + GDN projections are all eligible)",
                     (budget.budget_bytes as f64) / 1.0e9,
                     (budget.free_mem_bytes as f64) / 1.0e9,
                     (budget.slack_bytes as f64) / 1.0e9,
@@ -17114,7 +17146,7 @@ impl ComputeBackend for CudaBackend {
                         layers_with_q4_split.insert(idx);
                     }
                 }
-            } else if st.use_q4_split {
+            } else {
                 eprintln!(
                     "[CUDA] split kernels unavailable; \
                      decode will use Q4Raw/Q4Aligned base path"

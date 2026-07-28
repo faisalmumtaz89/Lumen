@@ -2599,6 +2599,8 @@ impl Q4ProjectionFamily {
         }
     }
 
+    /// Index into a per-family array. `Q4ActPlan` stores modes positionally,
+    /// so this must match `ALL`'s order; `plan_array_is_family_indexed` pins it.
     const ALL: [Self; 6] = [
         Self::AttnQkv,
         Self::AttnWo,
@@ -2641,6 +2643,19 @@ impl Q4ActPlan {
     /// about a five-family plan, and no MoE quality campaign has been run —
     /// assuming the 9B result transfers is exactly the inference this policy
     /// exists to avoid.
+    ///
+    /// # Scope invariant
+    ///
+    /// The dense narrow-GDN row is evidence-backed for ONE model class:
+    /// Qwen3.5-9B Q4_0. Today that is not a gap, because the converter accepts
+    /// only Qwen3.5 dense and MoE (`select_converter`), so no other dense
+    /// narrow-GDN model can reach this code through a supported path. A
+    /// hand-authored LBC, or a future architecture with 32 GDN v-heads, WOULD
+    /// land here and inherit a policy nothing measured for it.
+    ///
+    /// Before adding another architecture: either re-run the quality campaign
+    /// for it, or narrow this row so the new model takes the conservative
+    /// all-F32 branch until it has been measured.
     ///
     /// On the `narrow_gdn` input: `gdn_dims()` falls back to the Qwen3.5-9B
     /// shape (v-heads 32) when `hp.gdn` is `None`, which is the case for older
@@ -2737,12 +2752,9 @@ impl Q4ActPlan {
         }
     }
 
+    /// Read on every Q4 decode dispatch, so it indexes rather than searching.
     pub fn mode_for(&self, family: Q4ProjectionFamily) -> Q4ActMode {
-        self.modes
-            .iter()
-            .find(|(f, _)| *f == family)
-            .map(|(_, m)| *m)
-            .unwrap_or(Q4ActMode::F32)
+        self.modes[family as usize].1
     }
 
     /// Convenience for dispatch sites that still carry a label.
@@ -2895,6 +2907,25 @@ mod q4_act_plan_tests {
             assert_eq!(p.mode_for(f), Q4ActMode::F32, "{f:?}");
         }
         assert!(p.manifest.contains("UNINSTALLED"), "{}", p.manifest);
+    }
+
+    /// `mode_for` indexes `modes` by `family as usize`, so the array must be
+    /// built in discriminant order. A reordering of either list would silently
+    /// return another family's activation mode on every dispatch.
+    #[test]
+    fn plan_array_is_family_indexed() {
+        for (i, f) in Q4ProjectionFamily::ALL.iter().enumerate() {
+            assert_eq!(
+                i, *f as usize,
+                "ALL[{i}] is {f:?}, whose discriminant is {}",
+                *f as usize
+            );
+        }
+        // and the plan itself must be laid out the same way
+        let p = Q4ActPlan::for_model(true, true);
+        for (i, f) in Q4ProjectionFamily::ALL.iter().enumerate() {
+            assert_eq!(p.modes[i].0, *f);
+        }
     }
 
     #[test]
