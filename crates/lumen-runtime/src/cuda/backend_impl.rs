@@ -4383,11 +4383,12 @@ impl CudaBackend {
                 // ffn_down reported 0 F16 calls under the route census.
                 let down_mode = crate::runtime_defaults::q4_act_plan()
                     .mode_for(crate::runtime_defaults::Q4ProjectionFamily::FfnDown);
-                // The shortcut may only claim this projection when the plan
-                // actually asks for Q8_1. Testing `== F16` let an F32 request
-                // fall through to the int8 path, so the plan's stated mode did
-                // not describe real behaviour.
-                let down_explicit_non_q8 = down_mode != crate::runtime_defaults::Q4ActMode::Q8_1
+                // ffn_down deliberately runs through the Q8_1 split path even
+                // though `q4_decode_f32_act` pins the rest of the model to F32
+                // activations: that exception is shipped behaviour and is worth
+                // ~12% of decode. Only an EXPLICIT non-Q8 request may override
+                // it, so a plan that merely reports its F32 default must not.
+                let down_explicit_non_q8 = down_mode == crate::runtime_defaults::Q4ActMode::F16
                     || crate::runtime_defaults::q4_split_f32_enabled();
                 let use_split_down = !down_explicit_non_q8
                     && ((st.kernels.use_q8_split_dispatch && lw.q8_split_w_down.is_some())
@@ -4699,7 +4700,7 @@ impl CudaBackend {
             // at 0 F16 calls after only the first one was guarded.
             let down_mode2 = crate::runtime_defaults::q4_act_plan()
                 .mode_for(crate::runtime_defaults::Q4ProjectionFamily::FfnDown);
-            let use_split_down = down_mode2 == crate::runtime_defaults::Q4ActMode::Q8_1
+            let use_split_down = down_mode2 != crate::runtime_defaults::Q4ActMode::F16
                 && !crate::runtime_defaults::q4_split_f32_enabled()
                 && ((st.kernels.use_q8_split_dispatch && lw.q8_split_w_down.is_some())
                     || (st.kernels.use_q4_split_dispatch && lw.q4_split_w_down.is_some()));
