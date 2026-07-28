@@ -1,6 +1,23 @@
 #!/usr/bin/env python3
 """GQ-005: reference greedy fidelity vs llama.cpp on the SAME GGUF.
 
+STATUS: NOT WORKING. Do not read results from this driver yet.
+
+The first run hung: `llama-cli` waits on stdin without `-st`, so prompt one
+burned the 1800 s timeout. Adding `-st` and the board's jinja flags fixed the
+hang and produced a WORSE failure — `first_div=0` on every prompt for every
+arm, meaning the very first word differs in all cases. With `--jinja` the
+reference output carries chat-template framing that the prompt-echo strip does
+not remove, so the two streams were never aligned to a common starting point.
+Zeros everywhere rank nothing.
+
+Fixing it needs the two engines emitting comparable streams: either compare
+token IDs from a server endpoint that exposes them, or align on the first
+content token after the template preamble rather than on the raw prompt echo.
+Recorded rather than deleted because the gate is worth having — it is the only
+axis that does not depend on our own repetition detectors, which the per-family
+bisect showed cannot separate these configurations.
+
 The suite calls this FOUNDATIONAL and the runner has been deferring it to a
 companion driver that did not exist. It is the gate that most directly tests
 this change: activation precision alters the token stream, and llama.cpp
