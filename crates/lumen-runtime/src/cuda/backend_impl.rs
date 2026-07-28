@@ -4791,11 +4791,8 @@ impl CudaBackend {
     /// builds the layer index mapping, and allocates all persistent state
     /// (h_states, conv_states) and ephemeral scratch buffers on the GPU.
     fn ensure_gdn_scratch(&self, st: &mut MutableState) -> Result<(), RuntimeError> {
-        // Ground truth for the wq/wk/wv cardinality question: the census
-        // shows 4 dispatches/token, and whether that is a DEFECT depends on
-        // how many full-attention layers actually exist. Read it from the
-        // layer cache rather than from a memory note — a note whose formula
- 
+        // Read the full-attention layer count from the layer cache rather than
+        // from a hardcoded formula: the two disagree on some conversions.
         if st.gdn_scratch_gpu.is_some() {
             return Ok(());
         }
@@ -5620,7 +5617,18 @@ impl CudaBackend {
                 && st.kernels.gdn_prefill_norm_gate_f64accum.is_some();
 
             // [GDNSTATE] one-time path diagnostic (env LUMEN_MOE_PROBE=1).
-     
+            {
+                let probe = moe_probe_enabled();
+                static SHOWN: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if probe && !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[GDNSTATE] PATH=decode-via-prefill use_prefill_f64={} f64_enabled={}",
+                        use_prefill_f64,
+                        gdn_f64_accum_enabled(),
+                    );
+                }
+            }
 
             // Fusion gate, read once so steps 1 and 3 agree.
             let fused_conv_l2 = batch_u32 == 1
@@ -5802,10 +5810,45 @@ impl CudaBackend {
                 );
             }
 
-            // 4. gdn_prefill_fused_v3[_f64accum]: delta-rule recurrence. (skipped under coop)
+            // 4. gdn_prefill_fused_v3[_f64accum]: delta-rule recurrence.
             //    Reads conv_out + alpha_out + beta_out, writes raw_out
             //    (output_buf), updates h_states[gdn_idx] in place.
-     
+            {
+                let state_fn = if use_prefill_f64 {
+                    st.kernels.gdn_prefill_fused_v3_f64accum.as_ref().unwrap()
+                } else {
+                    st.kernels.gdn_prefill_fused_v3.as_ref().unwrap()
+                };
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (head_dim_u32, num_heads_u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(state_fn)
+                        .arg(&mut gdn.h_states[gdn_idx])
+                        .arg(&gdn.qkv_conv_buf)
+                        .arg(&gdn.alpha_buf)
+                        .arg(&gdn.beta_buf)
+                        .arg(&mut gdn.output_buf)
+                        .arg(&num_heads_u32)
+                        .arg(&head_dim_u32)
+                        .arg(&head_dim_u32) // val_dim per head = head_dim
+                        .arg(&num_kv_heads_u32)
+                        .arg(&batch_u32)
+                        .arg(&qk_dim_u32)
+                        .arg(&qkv_dim_u32)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "GDN decode-via-prefill fused_v3 L{layer_idx}: {e}"
+                    ))
+                })?;
+            }
+
             // [GDNSTATE] mode=D phase=after + [XCHK] (env LUMEN_MOE_PROBE / LUMEN_XCHK).
             if gdnstate_probe_vp {
                 let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
@@ -7116,7 +7159,87 @@ impl CudaBackend {
 
             // 4. gdn_prefill_fused_v3: warp-parallel fused state update
             // Grid: (val_dim, num_heads), Block: (32, 1, 1)
-     
+            {
+                let state_fn = if use_prefill_f64 {
+                    st.kernels.gdn_prefill_fused_v3_f64accum.as_ref().unwrap()
+                } else {
+                    st.kernels.gdn_prefill_fused_v3.as_ref().unwrap()
+                };
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (head_dim_u32, num_heads_u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let qk_dim_u32 = p.qk_dim as u32;
+                let qkv_dim_u32 = p.qkv_dim as u32;
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(state_fn)
+                        .arg(&mut gdn.h_states[gdn_idx])
+                        .arg(&gdn_pf.conv_out)
+                        .arg(&gdn_pf.alpha_out)
+                        .arg(&gdn_pf.beta_out)
+                        .arg(&mut gdn_pf.raw_out)
+                        .arg(&num_heads_u32)
+                        .arg(&head_dim_u32)
+                        .arg(&head_dim_u32) // val_dim per head = head_dim
+                        .arg(&num_kv_heads_u32)
+                        .arg(&batch_u32)
+                        .arg(&qk_dim_u32)
+                        .arg(&qkv_dim_u32)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN prefill fused_v3 L{layer_idx}: {e}"))
+                })?;
+
+                // dump raw_out (post-state-update, pre-norm-gate)
+                if do_dump {
+                    self.device.synchronize()?;
+                    let host = self.device.dtoh_copy(&gdn_pf.raw_out)?;
+                    let n = batch * p.value_dim;
+                    let dir = dump_dir.as_ref().unwrap();
+                    let path = format!("{dir}/L{layer_idx}-raw_out.bin");
+                    let bytes: Vec<u8> = host[..n].iter().flat_map(|f| f.to_le_bytes()).collect();
+                    std::fs::write(&path, &bytes)
+                        .map_err(|e| RuntimeError::Compute(format!("dump {path}: {e}")))?;
+                    eprintln!(
+                        "[gdn-dump] L{layer_idx} raw_out shape=[{batch}, {}] -> {path}",
+                        p.value_dim
+                    );
+                }
+
+                // [GDNSTATE] PREFILL recurrent-state probe (env
+                // LUMEN_MOE_PROBE=1, default OFF -> byte-identical). Dumps the
+                // FINAL h_state (after scanning all `batch` tokens, i.e. the
+                // state through the last token of this prefill) and the
+                // conv_state circular buffer. When a decode step re-prefills the
+                // whole growing prefix from a fresh-zeroed state, this final
+                // h_state == "state through
+                // pos N" via the pure scan. Comparing it to the decode
+                // [GDNSTATE] mode=D phase=after (state through pos N via the
+                // incremental recurrence) is the H1/H2 discriminator. Mirrors
+                // the decode [GDNSTATE] dump in compute_gdn_attention_gpu_impl.
+                {
+                    let on = moe_probe_enabled();
+                    if on {
+                        let ss =
+                            |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                        let h_final = self.device.dtoh_copy(&gdn.h_states[gdn_idx])?;
+                        let conv_h = self.device.dtoh_copy(&gdn.conv_states[gdn_idx])?;
+                        eprintln!(
+                            "[GDNSTATE] mode=P phase=final batch={batch} layer={layer_idx} \
+                             h_sumsq={:.6} h_len={} conv_sumsq={:.6} conv_len={}",
+                            ss(&h_final),
+                            h_final.len(),
+                            ss(&conv_h),
+                            conv_h.len(),
+                        );
+                    }
+                }
+            }
+
             gdn_sub_ms!(_gsub_t, "scan_v3");
 
             // 5. gdn_prefill_norm_gate: batched RMSNorm + SiLU gate on raw output
