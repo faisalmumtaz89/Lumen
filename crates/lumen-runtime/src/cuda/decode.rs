@@ -3297,7 +3297,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         // Replaced per-model in preload_weights. Until then the exact path is
         // the only safe placeholder: a dispatch that ran before the real plan
         // was installed must not silently pick int8.
-        q4_act_plan: crate::runtime_defaults::Q4ActPlan::for_model(true, false),
+        q4_act_plan: crate::runtime_defaults::Q4ActPlan::uninstalled(),
         // Resolved ONCE in preload_weights from LUMEN_CUDA_Q4_F32ACT_KERNEL.
         // Default Smem (NR=2) = byte-identical to pre-flag behavior.
         q4_f32act_kernel: Q4F32ActKernel::Smem,

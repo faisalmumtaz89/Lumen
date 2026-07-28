@@ -2719,6 +2719,24 @@ impl Q4ActPlan {
         Self { modes, manifest }
     }
 
+    /// The plan a backend holds before `preload_weights` installs the real
+    /// one. Every family is F32 — the exact path.
+    ///
+    /// This is deliberately NOT a topology row. Using `for_model(true, false)`
+    /// as the placeholder encoded "MoE narrow-GDN" as lifecycle state, which
+    /// reads as a real policy decision and puts `ffn_down` on int8 before
+    /// anything has been measured about the model.
+    pub fn uninstalled() -> Self {
+        let mut modes = [(Q4ProjectionFamily::AttnQkv, Q4ActMode::F32); 6];
+        for (i, f) in Q4ProjectionFamily::ALL.iter().enumerate() {
+            modes[i] = (*f, Q4ActMode::F32);
+        }
+        Self {
+            modes,
+            manifest: "q4_act_plan UNINSTALLED (all-F32; preload has not run)".into(),
+        }
+    }
+
     pub fn mode_for(&self, family: Q4ProjectionFamily) -> Q4ActMode {
         self.modes
             .iter()
@@ -2865,6 +2883,18 @@ mod q4_act_plan_tests {
     #[test]
     fn shipping_build_is_not_labelled_oracle() {
         assert!(!Q4ActPlan::for_model(true, true).manifest.contains("ORACLE"));
+    }
+
+    /// The pre-preload placeholder must be the exact path on every family. It
+    /// was a real topology row (`for_model(true, false)`), which put
+    /// `ffn_down` on int8 before anything about the model had been read.
+    #[test]
+    fn uninstalled_plan_is_all_f32() {
+        let p = Q4ActPlan::uninstalled();
+        for f in Q4ProjectionFamily::ALL {
+            assert_eq!(p.mode_for(f), Q4ActMode::F32, "{f:?}");
+        }
+        assert!(p.manifest.contains("UNINSTALLED"), "{}", p.manifest);
     }
 
     #[test]
