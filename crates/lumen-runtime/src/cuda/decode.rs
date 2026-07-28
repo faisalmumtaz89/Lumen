@@ -556,11 +556,15 @@ pub(crate) struct KernelSet {
     /// mmvq kernels stay loaded but default OFF, opt-in for a future re-gate.
     /// Default OFF.
     pub(crate) use_mmvq_q4: bool,
-    /// Q4_0 QUALITY FIX (per-model): route Q4Raw decode projections through
-    /// F32-activation matvecs instead of the int8 Q8_1 dp4a path. Enabled ONLY
-    /// for the GDN-precision-fragile Qwen3.5-9B configuration (see the assignment
-    /// in `preload_weights`); 27B/MoE/non-GDN models keep the fast int8 dp4a path.
-    pub(crate) q4_decode_f32_act: bool,
+    /// Per-family activation policy for Q4Raw decode projections, derived from
+    /// model topology in `preload_weights` via [`Q4ActPlan::for_model`].
+    ///
+    /// Replaces a whole-model `q4_decode_f32_act` boolean. That boolean pinned
+    /// all six projection families to F32 on the narrow-GDN class because one
+    /// of them (`wo`) is precision-fragile, which cost the other five their
+    /// int8 path. Activation precision is a per-projection property, so the
+    /// policy is expressed per family.
+    pub(crate) q4_act_plan: crate::runtime_defaults::Q4ActPlan,
 
     /// F32-EXACT Q4_0 decode matvec variant selector (`LUMEN_CUDA_Q4_F32ACT_KERNEL`).
     /// Resolved ONCE in `preload_weights`; read at the two Q4_0 smem launch sites
@@ -3293,8 +3297,10 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         use_soa_locked: false,
         use_mmvq: false,
         use_mmvq_q4: false,
-        // Set per-model in preload_weights (default OFF = int8 dp4a path).
-        q4_decode_f32_act: false,
+        // Replaced per-model in preload_weights. Until then the exact path is
+        // the only safe placeholder: a dispatch that ran before the real plan
+        // was installed must not silently pick int8.
+        q4_act_plan: crate::runtime_defaults::Q4ActPlan::for_model(true, false),
         // Resolved ONCE in preload_weights from LUMEN_CUDA_Q4_F32ACT_KERNEL.
         // Default Smem (NR=2) = byte-identical to pre-flag behavior.
         q4_f32act_kernel: Q4F32ActKernel::Smem,

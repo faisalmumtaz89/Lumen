@@ -1114,41 +1114,14 @@ const SPLIT_CLONE_ACTIVATION_SLACK_BYTES: usize = 2_000_000_000; // 2 GB
 struct ResolvedSplitBudget {
     /// Upper cap (bytes) the largest-first clone loop fills up to.
     budget_bytes: usize,
-    /// Device free VRAM queried at the clone call site (preload, before KV alloc).
+    /// Device free VRAM queried at the clone call site.
     free_mem_bytes: usize,
-    /// VRAM reserved for the F32 KV cache that `init()` allocates after preload.
-    kv_reserve_bytes: usize,
     /// Activation / scratch slack held back ([`SPLIT_CLONE_ACTIVATION_SLACK_BYTES`]).
     slack_bytes: usize,
     /// True when the value came from the explicit `env_var` override.
     from_env: bool,
 }
 
-/// Resolves a split-clone VRAM budget, SHARED by the Q4 and Q8 clone passes.
-///
-/// * `env_var` — the explicit override key (`LUMEN_CUDA_Q4_SPLIT_BUDGET_GB` for the
-///   Q4 site, `LUMEN_CUDA_Q8_SPLIT_BUDGET_GB` for the Q8 site).
-/// * `device` — used to query FREE VRAM at the clone call site. The clone runs at
-///   preload, BEFORE `init()` allocates the KV cache, so this free figure still
-///   contains the KV headroom we then subtract.
-/// * `hp` — model config; supplies the KV-cache dims (layers / kv-heads / head-dim /
-///   max_seq_len) so the KV reserve is derived from the ACTUAL model, never hardcoded.
-///
-/// Resolution:
-/// * **`env_var` SET** (finite, > 0) → `gb * 1_000_000_000` bytes. Byte-for-byte the
-///   pre-lever behavior: the same explicit override maps to the same cap, so the
-///   env-override path is unchanged.
-/// * **`env_var` UNSET** → `max(5.1 GB, free_mem − KV_reserve − ACTIVATION_SLACK)`.
-///   On an 80 GB target with the 27B Q4 FFN (~9.6 GB), the resolved cap exceeds the
-///   FFN size so ALL 64 FFN layers clone (reproducing the gated +17%), while the
-///   subtracted `KV_reserve` provably preserves KV headroom.
-///
-/// `KV_reserve` mirrors `init()`'s allocation exactly: `init()` allocates a full
-/// F32 K and V cache for EVERY layer (`for _ in 0..num_layers`), even GDN layers,
-/// so counting all `num_layers` is both the ACTUAL usage and the conservative upper
-/// bound — the config does not expose a full-attn-only layer count here. The
-/// effective `max_seq_len` replicates `init()`'s `LUMEN_CUDA_MAX_SEQ_LEN` cap so the
-/// reserve tracks the cache that will actually be allocated.
 /// Where a layer left the updated hidden state.
 ///
 /// The FFN down projection can fold its residual and write `x_gpu` directly,
@@ -1164,69 +1137,59 @@ enum LayerOutput {
     InPlace,
 }
 
-fn resolve_split_clone_budget(
-    env_var: &str,
-    device: &CudaDevice,
-    hp: &ModelHyperparams,
-) -> ResolvedSplitBudget {
-    // Free VRAM at the clone call site (preload, before KV alloc).
+/// Resolves a split-clone VRAM budget, SHARED by the Q4 and Q8 clone passes.
+///
+/// This is a RESOURCE CONTROL, not a feature switch — the split layout itself
+/// is unconditional. It exists because sibling buffers are the one part of the
+/// design whose cost scales with the model and the card.
+///
+/// `env_var` is `LUMEN_CUDA_Q4_SPLIT_BUDGET_GB` at the Q4 site and
+/// `LUMEN_CUDA_Q8_SPLIT_BUDGET_GB` at the Q8 site:
+///
+/// * unset — resource-aware default: free VRAM minus activation slack.
+/// * `0` — clone nothing. Every projection stays on its base kernel.
+/// * `>0` — requested cap in GB, clamped to the resource-aware default so an
+///   over-large request cannot push preload into OOM.
+/// * anything else (negative, non-numeric) — hard error. A misspelled budget
+///   silently becoming "auto" is how a configuration gets benchmarked without
+///   anyone knowing which one ran.
+///
+/// # No KV reserve
+///
+/// An earlier version subtracted a computed KV-cache reserve from free VRAM.
+/// That double-counted: `init()` allocates the KV caches (see the `kv_caches`
+/// loop) and `preload_weights` — where this runs — errors unless `init()` has
+/// already completed. `free_memory()` therefore already excludes the KV cache.
+/// The comment claiming this ran "before KV alloc" described an ordering the
+/// code does not have.
+fn resolve_split_clone_budget(env_var: &str, device: &CudaDevice) -> ResolvedSplitBudget {
     let free_mem_bytes = device.free_memory().unwrap_or(0);
 
-    // Effective max_seq_len: mirror init()'s LUMEN_CUDA_MAX_SEQ_LEN cap logic so the
-    // KV reserve tracks the cache init() will actually allocate. `=0` is treated as
-    // "no cap" (identical to unset) — a zero cap would size the KV cache to 0 tokens.
-    let model_max_seq_len = hp.max_seq_len as usize;
-    let effective_max_seq_len = std::env::var("LUMEN_CUDA_MAX_SEQ_LEN")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&cap| cap > 0)
-        .map(|cap| model_max_seq_len.min(cap))
-        .unwrap_or(model_max_seq_len);
+    // Resource-aware cap. No lower clamp: raising the budget back up to a fixed
+    // floor would hand back the memory the subtraction just reserved.
+    let auto_bytes = free_mem_bytes.saturating_sub(SPLIT_CLONE_ACTIVATION_SLACK_BYTES);
 
-    // KV reserve == init()'s per-layer F32 K+V alloc, summed over ALL layers.
-    // KvCacheGpu allocs `num_kv_heads * max_seq_len * head_dim` f32 elems for K and
-    // the same for V, per layer. F32 => 4 bytes/elem.
-    const KV_DTYPE_BYTES: usize = 4; // KvCacheGpu k/v_cache: alloc_zeros::<f32>
-    let kv_reserve_bytes = (hp.num_layers as usize)
-        .saturating_mul(effective_max_seq_len)
-        .saturating_mul(hp.num_kv_heads as usize)
-        .saturating_mul(hp.head_dim as usize)
-        .saturating_mul(2) // K and V
-        .saturating_mul(KV_DTYPE_BYTES);
-
-    // Explicit override: byte-for-byte the pre-lever behavior.
-    if let Some(gb) = std::env::var(env_var)
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|gb| gb.is_finite() && *gb > 0.0)
-    {
-        return ResolvedSplitBudget {
-            budget_bytes: (gb * 1_000_000_000.0) as usize,
-            free_mem_bytes,
-            kv_reserve_bytes,
-            slack_bytes: SPLIT_CLONE_ACTIVATION_SLACK_BYTES,
-            from_env: true,
-        };
-    }
-
-    // Free-memory-aware default: reserve KV + activation slack from free VRAM.
-    //
-    // No lower clamp: raising the budget back up to a fixed floor would hand
-    // back memory the two `saturating_sub` calls just reserved for the KV cache
-    // and activations, which is the opposite of what they are for. On a device
-    // with less free VRAM than a clone needs the budget is simply small (or
-    // zero) and each `cudaMalloc` fails safe, leaving that layer on its base
-    // path.
-    let budget_bytes = free_mem_bytes
-        .saturating_sub(kv_reserve_bytes)
-        .saturating_sub(SPLIT_CLONE_ACTIVATION_SLACK_BYTES);
+    let budget_bytes = match std::env::var(env_var) {
+        Err(_) => auto_bytes,
+        Ok(raw) => match raw.trim().parse::<f64>() {
+            Ok(gb) if gb.is_finite() && gb >= 0.0 => {
+                ((gb * 1_000_000_000.0) as usize).min(auto_bytes)
+            }
+            _ => {
+                eprintln!(
+                    "[CUDA] FATAL: {env_var}={raw:?} is not a non-negative number of GB \
+                     (use 0 for no split siblings, or omit for the resource-aware default)"
+                );
+                std::process::exit(30);
+            }
+        },
+    };
 
     ResolvedSplitBudget {
         budget_bytes,
         free_mem_bytes,
-        kv_reserve_bytes,
         slack_bytes: SPLIT_CLONE_ACTIVATION_SLACK_BYTES,
-        from_env: false,
+        from_env: std::env::var(env_var).is_ok(),
     }
 }
 
@@ -2470,7 +2433,7 @@ impl CudaBackend {
                 // and the weight variant per layer, once each, to find which.
                          let qkv_use_preq = !weight_uses_f32_act_q4_fam(
                     &lw.wq,
-                    st.kernels.q4_decode_f32_act,
+                    &st.kernels.q4_act_plan,
                     crate::runtime_defaults::Q4ProjectionFamily::AttnQkv,
                 )
                     && weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
@@ -3085,9 +3048,17 @@ impl CudaBackend {
                 // through `launch_matvec_residual_split` -- requires quantizing the
                 // attention output to Q8_1 inline. Otherwise fall through to the
                 // existing `launch_matvec_residual` path.
-                let use_split_wo = ((st.kernels.use_q8_split_dispatch && lw.q8_split_wo.is_some())
-                    || (st.kernels.use_q4_split_dispatch && lw.q4_split_wo.is_some()))
-                    && !crate::runtime_defaults::q4_split_f32_enabled();
+                // Like the ffn_down shortcut, this quantizes to Q8_1 ahead of
+                // `launch_matvec_residual`, so it may only claim `wo` when the
+                // plan puts `wo` on int8. On the narrow-GDN dense class it does
+                // not — that is the one family the quality result depends on.
+                let use_split_wo = st
+                    .kernels
+                    .q4_act_plan
+                    .mode_for(crate::runtime_defaults::Q4ProjectionFamily::AttnWo)
+                    == crate::runtime_defaults::Q4ActMode::Q8_1
+                    && ((st.kernels.use_q8_split_dispatch && lw.q8_split_wo.is_some())
+                        || (st.kernels.use_q4_split_dispatch && lw.q4_split_wo.is_some()));
                 if use_split_wo {
                     // Quantize attention output to Q8_1 in scratch, then split residual matvec.
                     let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref();
@@ -4014,7 +3985,7 @@ impl CudaBackend {
                 let ffn_use_preq =
                     !weight_uses_f32_act_q4_fam(
                         &lw.w_gate,
-                        st.kernels.q4_decode_f32_act,
+                        &st.kernels.q4_act_plan,
                         crate::runtime_defaults::Q4ProjectionFamily::FfnGateUp,
                     )
                         && weight_uses_dp4a_q8_1(&lw.w_gate, &st.kernels)
@@ -4377,20 +4348,15 @@ impl CudaBackend {
                 // route via launch_matvec_preq8_1_split (requires inline F32->Q8_1
                 // quantization since the existing fused-down kernels target
                 // Q8Aligned/Q4Aligned which we skipped under SPLIT).
-                // An EXPLICIT precision request for ffn_down must beat the
-                // split/Q8_1 shortcut, which otherwise silently claims this
-                // projection before launch_matvec is ever reached — that is why
-                // ffn_down reported 0 F16 calls under the route census.
-                let down_mode = crate::runtime_defaults::q4_act_plan()
+                // This shortcut quantizes the down input to Q8_1 and claims
+                // the projection before `launch_matvec` is reached, so it must
+                // agree with the plan or the plan is fiction. `FfnDown` is
+                // Q8_1 on every class precisely because of this path.
+                let down_mode = st
+                    .kernels
+                    .q4_act_plan
                     .mode_for(crate::runtime_defaults::Q4ProjectionFamily::FfnDown);
-                // ffn_down deliberately runs through the Q8_1 split path even
-                // though `q4_decode_f32_act` pins the rest of the model to F32
-                // activations: that exception is shipped behaviour and is worth
-                // ~12% of decode. Only an EXPLICIT non-Q8 request may override
-                // it, so a plan that merely reports its F32 default must not.
-                let down_explicit_non_q8 = down_mode == crate::runtime_defaults::Q4ActMode::F16
-                    || crate::runtime_defaults::q4_split_f32_enabled();
-                let use_split_down = !down_explicit_non_q8
+                let use_split_down = down_mode == crate::runtime_defaults::Q4ActMode::Q8_1
                     && ((st.kernels.use_q8_split_dispatch && lw.q8_split_w_down.is_some())
                         || (st.kernels.use_q4_split_dispatch && lw.q4_split_w_down.is_some()));
                 if use_split_down {
@@ -4413,9 +4379,7 @@ impl CudaBackend {
                             // layer-commit dtod copy (2 commands x 32 layers =
                             // 64 per token, ~0.27 ms). The residual split
                             // kernel is already loaded and dispatched.
-                            if crate::runtime_defaults::ffn_direct_residual()
-                                && lw.q4_split_w_down.is_some()
-                            {
+                            if lw.q4_split_w_down.is_some() {
                                 launch_matvec_preq8_1_residual_split(
                                     &self.device,
                                     &st.kernels,
@@ -4696,12 +4660,14 @@ impl CudaBackend {
             // split-layout: prefer Q8/Q4 split sibling for w_down via inline
             // F32->Q8_1 quantization (fused-down kernels target Q8Aligned/Q4Aligned
             // which the SPLIT preload skips).
-            // SECOND ffn_down split shortcut — the census showed ffn_down still
-            // at 0 F16 calls after only the first one was guarded.
-            let down_mode2 = crate::runtime_defaults::q4_act_plan()
+            // SECOND ffn_down split shortcut. Both must consult the plan;
+            // guarding only the first left decode taking a different path
+            // depending on which swiglu variant ran, and the census caught it.
+            let down_mode2 = st
+                .kernels
+                .q4_act_plan
                 .mode_for(crate::runtime_defaults::Q4ProjectionFamily::FfnDown);
-            let use_split_down = down_mode2 != crate::runtime_defaults::Q4ActMode::F16
-                && !crate::runtime_defaults::q4_split_f32_enabled()
+            let use_split_down = down_mode2 == crate::runtime_defaults::Q4ActMode::Q8_1
                 && ((st.kernels.use_q8_split_dispatch && lw.q8_split_w_down.is_some())
                     || (st.kernels.use_q4_split_dispatch && lw.q4_split_w_down.is_some()));
             if use_split_down {
@@ -4720,9 +4686,7 @@ impl CudaBackend {
                         // Same direct-residual fold as the other ffn_down
                         // site. Patching only one of the two left decode on the
                         // unfused path — the census caught it (ffn_down ->
-                        if crate::runtime_defaults::ffn_direct_residual()
-                            && lw.q4_split_w_down.is_some()
-                        {
+                        if lw.q4_split_w_down.is_some() {
                             launch_matvec_preq8_1_residual_split(
                                 &self.device,
                                 &st.kernels,
@@ -5021,11 +4985,11 @@ impl CudaBackend {
         // dp4a (flag off). See weight_uses_f32_act_q4.
         let gdn_use_preq = !weight_uses_f32_act_q4_fam(
             &lw.wq,
-            st.kernels.q4_decode_f32_act,
+            &st.kernels.q4_act_plan,
             crate::runtime_defaults::Q4ProjectionFamily::GdnQkv,
         ) && !weight_uses_f32_act_q4_fam(
             attn_gate_w,
-            st.kernels.q4_decode_f32_act,
+            &st.kernels.q4_act_plan,
             crate::runtime_defaults::Q4ProjectionFamily::GdnAttnGate,
         )
             && weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
@@ -9382,21 +9346,14 @@ unsafe fn launch_matvec_ext(
     }
 
     // Q4Aligned: dp4a with pre-quantized Q8_1 input (20-byte aligned blocks).
-    // Q4Raw: dp4a EXCEPT on the fragile 9B config (kernels.q4_decode_f32_act),
-    // where it falls to the F32-activation matvec_q4_0_smem path below (the int8
-    // Q8_1-activation dp4a collapses quality through the 9B's GDN recurrence).
-    // 27B/MoE/non-GDN keep the fast int8 dp4a path.
-    // PRECISION ZONING: `q4_decode_f32_act` is a WHOLE-MODEL pin to F32
-    // activations for the fragile 9B GDN config. The measured quality cliff is
-    // concentrated in `wo`, not uniform, so a projection family explicitly
-    // admitted via LUMEN_CUDA_PRECISION_ZONE takes the fast dp4a path even on
-    // that config. Unset flag => admits nothing => byte-identical to before.
-    // `wo` is never admissible (see runtime_defaults::precision_zone_admits).
-    let act_mode = crate::runtime_defaults::q4_act_plan().mode_for_label(label);
-    let zone_admits = act_mode == crate::runtime_defaults::Q4ActMode::Q8_1;
+    // Q4Raw: dp4a when this projection family's planned activation mode is
+    // int8, otherwise the F32-activation matvec_q4_0_smem path below. The
+    // per-family plan comes from model topology (`Q4ActPlan::for_model`); on
+    // the narrow-GDN dense class only `wo` is pinned to F32.
+    let act_mode = kernels.q4_act_plan.mode_for_label(label);
+    let plan_admits_int8 = act_mode == crate::runtime_defaults::Q4ActMode::Q8_1;
     if matches!(weight, GpuWeightBuf::Q4Aligned(_))
-        || (matches!(weight, GpuWeightBuf::Q4Raw(_))
-            && (!kernels.q4_decode_f32_act || zone_admits))
+        || (matches!(weight, GpuWeightBuf::Q4Raw(_)) && plan_admits_int8)
     {
         // Path -1: Q4_0 dp4a mmvq dispatch.
         // Q8_1-activation x Q4_0-weight matvec with dp4a INT8 dot-product.
@@ -9509,54 +9466,6 @@ unsafe fn launch_matvec_ext(
         let shmem_f32 = (in_dim as u32) * 4;
         let shmem_f16 = (in_dim as u32) * 2;
 
-        // ROUTE ORDER MATTERS. The F32ActKernel selector below RETURNS for the
-        // 9B (which initialises to Nr4), so any zoned-precision branch placed
-        // after it is unreachable dead code — that is exactly why the first
-        // F16 sweep measured ~1.01x for every family except `wo`: only the
-        // residual dispatcher, which has no NR selector, could reach F16.
-        // An explicitly requested mode must therefore be honoured HERE, before
-        // any default kernel selection, and must fail loudly rather than fall
-        // through to a different representation than was asked for.
-        {
-            let mode = crate::runtime_defaults::q4_act_plan().mode_for_label(label);
-            if mode == crate::runtime_defaults::Q4ActMode::F16 {
-                let Some(hgemv_fn) = kernels.hgemv_q4_0.as_ref() else {
-                    return Err(RuntimeError::Compute(format!(
-                        "{label}: F16 explicitly requested but hgemv_q4_0 failed to \
-                         compile; refusing to silently run a different precision"
-                    )));
-                };
-                if shmem_f16 > HGEMV_SHMEM_LIMIT {
-                    return Err(RuntimeError::Compute(format!(
-                        "{label}: F16 requested but needs {shmem_f16} B shared memory \
-                         (limit {HGEMV_SHMEM_LIMIT})"
-                    )));
-                }
-                let out_dim_u32 = out_dim as u32;
-                let in_dim_u32 = in_dim as u32;
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (hgemv_grid(out_dim_u32), 1, 1),
-                    block_dim: (HGEMV_BLOCK_DIM, 1, 1),
-                    shared_mem_bytes: hgemv_shared_bytes(in_dim_u32),
-                };
-                unsafe {
-                    device
-                        .stream
-                        .launch_builder(hgemv_fn)
-                        .arg(w_q4)
-                        .arg(input)
-                        .arg(output)
-                        .arg(&out_dim_u32)
-                        .arg(&in_dim_u32)
-                        .launch(launch_cfg)
-                        .map_err(|e| {
-                            RuntimeError::Compute(format!("hgemv-zone Q4_0 {label}: {e}"))
-                        })?;
-                }
-                crate::runtime_defaults::route_census_record(label, "F16_HGEMV");
-                return Ok(());
-            }
-        }
 
         // LUMEN_CUDA_Q4_F32ACT_KERNEL variant selection.
         // Default `Smem` does NOTHING here and falls through to the unchanged
@@ -10057,18 +9966,6 @@ unsafe fn launch_matvec_residual_lane(
     in_dim: usize,
     label: &str,
 ) -> Result<bool, RuntimeError> {
-    // Accept every lane variant. Gating this on variant 4 alone silently
-    // regressed `wo` to the old path whenever variant 5 was selected, which
-    // measurement was interpreted).
-    if !matches!(crate::runtime_defaults::q4_split_f32_variant(), 4 | 5 | 6) {
-        return Ok(false);
-    }
-    // Control for the A/B: LUMEN_CUDA_LANE_WO=0 keeps the lane kernel on every
-    // other projection but leaves `wo` on the old path, so its contribution is
-    // separable within one container.
-    if matches!(std::env::var("LUMEN_CUDA_LANE_WO").ok().as_deref(), Some("0")) {
-        return Ok(false);
-    }
     let (Some(f), Some(split_w)) = (
         kernels.matvec_q4_split_f32_lane_residual.as_ref(),
         q4_split_sibling,
@@ -10280,19 +10177,12 @@ unsafe fn launch_matvec_residual(
     }
 
     // Q4Aligned residual: dp4a with pre-quantized Q8_1 input + fused residual.
-    // Q4Raw: dp4a EXCEPT on the fragile 9B config (kernels.q4_decode_f32_act),
-    // where it takes the F32-activation matvec_q4_0_smem_residual path below.
-    // PRECISION ZONING: `q4_decode_f32_act` is a WHOLE-MODEL pin to F32
-    // activations for the fragile 9B GDN config. The measured quality cliff is
-    // concentrated in `wo`, not uniform, so a projection family explicitly
-    // admitted via LUMEN_CUDA_PRECISION_ZONE takes the fast dp4a path even on
-    // that config. Unset flag => admits nothing => byte-identical to before.
-    // `wo` is never admissible (see runtime_defaults::precision_zone_admits).
-    let act_mode = crate::runtime_defaults::q4_act_plan().mode_for_label(label);
-    let zone_admits = act_mode == crate::runtime_defaults::Q4ActMode::Q8_1;
+    // Q4Raw: dp4a when this family's planned activation mode is int8; see the
+    // matching gate in `launch_matvec_ext`.
+    let act_mode = kernels.q4_act_plan.mode_for_label(label);
+    let plan_admits_int8 = act_mode == crate::runtime_defaults::Q4ActMode::Q8_1;
     if matches!(weight, GpuWeightBuf::Q4Aligned(_))
-        || (matches!(weight, GpuWeightBuf::Q4Raw(_))
-            && (!kernels.q4_decode_f32_act || zone_admits))
+        || (matches!(weight, GpuWeightBuf::Q4Raw(_)) && plan_admits_int8)
     {
         if let (Some(quant_fn), Some(q8_1_buf)) = (
             kernels.quantize_f32_to_q8_1.as_ref(),
@@ -10364,48 +10254,6 @@ unsafe fn launch_matvec_residual(
         let shmem_f32 = (in_dim as u32) * 4;
         let shmem_f16 = (in_dim as u32) * 2;
 
-        // Path 0.5: F16-ACTIVATION ZONE (`LUMEN_CUDA_Q4_F16_ZONE`) — this is the
-        // `wo` residual matvec, the projection the Q8 zone can never admit
-        // (per-32 block scaling crushes its sigmoid-gated outliers). F16 has no
-        // block scale, so `wo` IS a legitimate F16 candidate and the measured
-        // F16 loss is localised to the GDN recurrence instead. Unset flag =>
-        // skipped => byte-identical default.
-        if crate::runtime_defaults::q4_act_plan().mode_for_label(label)
-            == crate::runtime_defaults::Q4ActMode::F16
-        {
-            if let Some(hgemv_fn) = kernels
-                .hgemv_q4_0_residual
-                .as_ref()
-                .filter(|_| shmem_f16 <= HGEMV_SHMEM_LIMIT)
-            {
-                let out_dim_u32 = out_dim as u32;
-                let in_dim_u32 = in_dim as u32;
-                let grid = hgemv_grid(out_dim_u32);
-                let shmem = hgemv_shared_bytes(in_dim_u32);
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (HGEMV_BLOCK_DIM, 1, 1),
-                    shared_mem_bytes: shmem,
-                };
-                device
-                    .stream
-                    .launch_builder(hgemv_fn)
-                    .arg(w_q4)
-                    .arg(input)
-                    .arg(residual)
-                    .arg(output)
-                    .arg(&out_dim_u32)
-                    .arg(&in_dim_u32)
-                    .launch(launch_cfg)
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!(
-                            "hgemv-zone+residual Q4_0 {label} launch: {e}",
-                        ))
-                    })?;
-                crate::runtime_defaults::route_census_record(label, "F16_HGEMV_RESIDUAL");
-                return Ok(());
-            }
-        }
 
         // Path 1: smem kernel (F32 x, NR=2). F32-precision activations for the
         // Q4Raw attention output (wo) residual matvec — see launch_matvec Path 1.
@@ -11218,58 +11066,23 @@ unsafe fn launch_matvec_split_f32(
     in_dim: usize,
     label: &str,
 ) -> Result<bool, RuntimeError> {
-    let variant = crate::runtime_defaults::q4_split_f32_variant();
-    if variant == 0 {
-        return Ok(false);
-    }
     // Only the lane decomposition shipped: 4 lanes cooperate per Q4 block, 8
-    // activations per lane, warp-contiguous int loads. The smem-staged,
-    // warp-per-row, gmem, multi-row and wide variants were all measured and
-    // lost (0.909x / 0.727x / 0.986x / 0.899x / 0.898x) and are not carried.
-    let kernel = kernels.matvec_q4_split_f32_lane.as_ref();
-
-    let (Some(split_fn), Some(split_w)) = (kernel, q4_split_sibling) else {
+    // activations per lane, warp-contiguous int loads, one row per CTA. The
+    // smem-staged, warp-per-row, gmem, multi-row and wide variants were all
+    // measured and lost (0.909x / 0.727x / 0.986x / 0.899x / 0.898x); none is
+    // carried, so there is no geometry to select between.
+    let (Some(split_fn), Some(split_w)) = (
+        kernels.matvec_q4_split_f32_lane.as_ref(),
+        q4_split_sibling,
+    ) else {
         return Ok(false);
     };
     let out_dim_u32 = out_dim as u32;
     let in_dim_u32 = in_dim as u32;
-    let launch_cfg = match variant {
-        // warp-per-row: 4 rows per 128-thread block, no shared at all
-        2 => CudarcLaunchConfig {
-            grid_dim: (out_dim_u32.div_ceil(4), 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        },
-        // gmem control: variant 1's geometry exactly, zero dynamic shared
-        3 => CudarcLaunchConfig {
-            grid_dim: (out_dim_u32.div_ceil(4), 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        },
-        // lane-striped: ONE row per CTA, all 4 warps on that row
-        4 => CudarcLaunchConfig {
-            grid_dim: (out_dim_u32, 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        },
-        // multi-row lane: 4 rows per CTA sharing one pass over x
-        5 => CudarcLaunchConfig {
-            grid_dim: (out_dim_u32.div_ceil(4), 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        },
-        // wide-lane: grid UNCHANGED (parallelism is the binding resource per
-        // wider per-instruction loads
-        6 => CudarcLaunchConfig {
-            grid_dim: (out_dim_u32, 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        },
-        _ => CudarcLaunchConfig {
-            grid_dim: (out_dim_u32.div_ceil(4), 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: in_dim_u32 * 4,
-        },
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (out_dim_u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
     };
     device
         .stream
@@ -11281,17 +11094,7 @@ unsafe fn launch_matvec_split_f32(
         .arg(&in_dim_u32)
         .launch(launch_cfg)
         .map_err(|e| RuntimeError::Compute(format!("matvec_q4_split_f32 {label}: {e}")))?;
-    crate::runtime_defaults::route_census_record(
-        label,
-        match variant {
-            2 => "F32_SPLIT_SOA_WR",
-            3 => "F32_SPLIT_SOA_GMEM",
-            4 => "F32_SPLIT_SOA_LANE",
-            5 => "F32_SPLIT_SOA_LANE_R4",
-            6 => "F32_SPLIT_SOA_LANE_WIDE",
-            _ => "F32_SPLIT_SOA",
-        },
-    );
+    crate::runtime_defaults::route_census_record(label, "F32_SPLIT_SOA_LANE");
     Ok(true)
 }
 
@@ -11981,21 +11784,14 @@ unsafe fn repack_all_layers_q4_clone_to_split(
     // is raised). With the default 5.1 GB cap attention was never reached
     // anyway (FFN weights are larger and sort first), so the unset-env path is
     // unchanged.
-    // LUMEN_CUDA_Q4_SPLIT_ATTN=1 additionally clones the ATTENTION and GDN
-    // projections. Historically excluded because the Q8_1 residual split
-    // kernel (`matvec_q4_split_q8_1_locked_residual`) produced NaN logits —
-    // that reason does not apply to the F32-exact lane kernel, which is a
-    // different kernel entirely. Default OFF keeps decode byte-identical.
-    //
-    // Without this the lane kernel only ever reached FFN gate/up/down, so the
-    // measured 1.0944x was an FFN-ONLY result and every attention/GDN call
-    // site silently fell back for want of a sibling. GDN projections measured
-    // 455 GB/s against the FFN's 600, so that is where the decomposition is
-    // most needed.
-    let split_attn = matches!(
-        std::env::var("LUMEN_CUDA_Q4_SPLIT_ATTN").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    );
+    // Attention and GDN projections are cloned alongside the FFN set. They
+    // were once excluded because the Q8_1 residual split kernel
+    // (`matvec_q4_split_q8_1_locked_residual`) produced NaN logits on them;
+    // that kernel is not what runs here. Excluding them capped the split
+    // layout at FFN-only, so every attention and GDN call site fell back for
+    // want of a sibling — GDN projections stream at 455 GB/s against the FFN's
+    // 600, so they are where the aligned layout is needed most.
+    let split_attn = true;
 
     #[derive(Copy, Clone, Debug)]
     enum SplitWeightKind {
@@ -12252,35 +12048,24 @@ unsafe fn repack_all_layers_q4_clone_to_split(
 #[inline]
 /// Does this Q4 projection keep FULL F32 activations?
 ///
-/// This must consult the typed `Q4ActPlan`, not just the global
-/// `q4_decode_f32_act` bool. The bool is the blunt whole-model switch; the plan
-/// is the per-family override that `LUMEN_CUDA_PRECISION_ZONE` /
-/// `LUMEN_CUDA_Q4_F16_ZONE` set.
+/// Does this Q4 projection run on F32 activations?
 ///
-/// Reading only the bool made every int8 branch UNREACHABLE on 9B no matter
-/// what zone was requested — `*_use_preq` is `!weight_uses_f32_act_q4(..)`, and
-/// the bool is true for this model, so the gate was always false. Rounds 24-26
-/// measured "flat" int8 results that were really the F32 path with extra env
-/// vars set; the route census caught it with calls=0 on all five families.
-///
-/// The bool is the blunt whole-model switch; the plan is the per-family
-/// override. Reading only the bool makes every int8 branch unreachable
-/// whenever the bool is set, regardless of the requested zone.
+/// Answered from the typed per-family plan. An earlier version consulted a
+/// whole-model boolean instead, which made every int8 branch UNREACHABLE on
+/// the narrow-GDN class — `*_use_preq` is `!weight_uses_f32_act_q4_fam(..)`,
+/// and the boolean was true for that class, so the gate was always false.
+/// Three rounds of "flat" int8 measurements were really the F32 path running
+/// with extra configuration set. The route census is what caught it, with
+/// calls=0 on all five families.
 fn weight_uses_f32_act_q4_fam(
     weight: &GpuWeightBuf,
-    q4_decode_f32_act: bool,
+    plan: &crate::runtime_defaults::Q4ActPlan,
     family: crate::runtime_defaults::Q4ProjectionFamily,
 ) -> bool {
     if !matches!(weight, GpuWeightBuf::Q4Raw(_)) {
         return false;
     }
-    let plan = crate::runtime_defaults::q4_act_plan();
-    if plan.is_default {
-        // No zone requested: preserve the shipping behaviour exactly.
-        q4_decode_f32_act
-    } else {
-        plan.mode_for(family) == crate::runtime_defaults::Q4ActMode::F32
-    }
+    plan.mode_for(family) == crate::runtime_defaults::Q4ActMode::F32
 }
 
 
@@ -14133,7 +13918,12 @@ impl ComputeBackend for CudaBackend {
             "LUMEN_CUDA_SOA_LOCKED",
             crate::runtime_defaults::soa_locked_default,
         );
-        let use_q4_split = env_truthy("LUMEN_CUDA_Q4_SPLIT") || use_soa_locked;
+        // Q4 split/SoA siblings are always built when the kernel is loaded and
+        // the clone budget allows. The layout is what makes the nibble run
+        // 4-byte aligned; without a sibling every Q4 decode matvec falls back
+        // to byte-at-a-time unpacking. Sizing is the resource control
+        // (LUMEN_CUDA_Q4_SPLIT_BUDGET_GB), not a feature switch.
+        let use_q4_split = true;
         if use_soa_locked {
             eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED=1: Q4_0 weights cloned to split layout; decode uses the codegen-locked split kernel");
         } else if use_q4_split {
@@ -16975,11 +16765,7 @@ impl ComputeBackend for CudaBackend {
                 // free-mem-aware default) at the clone site — preload, BEFORE the KV
                 // cache is allocated, so `free` still holds the KV headroom. Reuses
                 // the shared L8 resolver (same helper as the Q4 clone pass).
-                let budget = resolve_split_clone_budget(
-                    "LUMEN_CUDA_Q8_SPLIT_BUDGET_GB",
-                    &self.device,
-                    &hp_copy,
-                );
+                let budget = resolve_split_clone_budget("LUMEN_CUDA_Q8_SPLIT_BUDGET_GB", &self.device);
                 let mem_before_q8_split = budget.free_mem_bytes;
                 let (n_layers_split, oom_layer, oom_count, total_jobs) = unsafe {
                     repack_all_layers_q8_clone_to_split(
@@ -16996,13 +16782,12 @@ impl ComputeBackend for CudaBackend {
                 // `total_jobs` gate/up/down weight-jobs were attempted.
                 eprintln!(
                     "[CUDA] Q8 split-clone budget: resolved={:.2} GB (free={:.2} GB, \
-                     kv_reserve={:.2} GB, slack={:.2} GB, source={}); cloned \
+                     slack={:.2} GB, source={}); cloned \
                      {n_layers_split}/{num_layers} FFN layers ({total_jobs} weight-jobs)",
                     (budget.budget_bytes as f64) / 1.0e9,
                     (budget.free_mem_bytes as f64) / 1.0e9,
-                    (budget.kv_reserve_bytes as f64) / 1.0e9,
                     (budget.slack_bytes as f64) / 1.0e9,
-                    if budget.from_env { "env" } else { "free-mem" },
+                    if budget.from_env { "env" } else { "auto" },
                 );
                 let mem_after_q8_split = self.device.free_memory().unwrap_or(0);
                 let consumed_gb =
@@ -17145,11 +16930,7 @@ impl ComputeBackend for CudaBackend {
                 // Resolve the split-clone VRAM budget (env override, else
                 // free-mem-aware default) at the clone site — preload, BEFORE the KV
                 // cache is allocated, so `free` still holds the KV headroom.
-                let budget = resolve_split_clone_budget(
-                    "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
-                    &self.device,
-                    &hp_copy,
-                );
+                let budget = resolve_split_clone_budget("LUMEN_CUDA_Q4_SPLIT_BUDGET_GB", &self.device);
                 let mem_before_q4_split = budget.free_mem_bytes;
                 let (n_layers_split, oom_layer, oom_count, total_jobs) = unsafe {
                     repack_all_layers_q4_clone_to_split(
@@ -17166,13 +16947,12 @@ impl ComputeBackend for CudaBackend {
                 // gate/up/down weight-jobs were attempted.
                 eprintln!(
                     "[CUDA] Q4 split-clone budget: resolved={:.2} GB (free={:.2} GB, \
-                     kv_reserve={:.2} GB, slack={:.2} GB, source={}); cloned \
+                     slack={:.2} GB, source={}); cloned \
                      {n_layers_split}/{num_layers} FFN layers ({total_jobs} weight-jobs)",
                     (budget.budget_bytes as f64) / 1.0e9,
                     (budget.free_mem_bytes as f64) / 1.0e9,
-                    (budget.kv_reserve_bytes as f64) / 1.0e9,
                     (budget.slack_bytes as f64) / 1.0e9,
-                    if budget.from_env { "env" } else { "free-mem" },
+                    if budget.from_env { "env" } else { "auto" },
                 );
                 let mem_after_q4_split = self.device.free_memory().unwrap_or(0);
                 let consumed_gb =
@@ -17278,13 +17058,12 @@ impl ComputeBackend for CudaBackend {
         // and is CERTIFIED clean on the fast int8 path (GQ-001/002/004 all pass), so
         // it keeps dp4a. Keyed off the GDN v-head width (a config value, not a name):
         // 32 -> F32, 48 -> int8. Gated on has_gdn so non-GDN models keep int8.
-        st.kernels.q4_decode_f32_act = has_gdn && hp_copy.gdn_dims().num_v_heads == 32;
-        if st.kernels.q4_decode_f32_act {
-            eprintln!(
-                "[CUDA] Q4_0 decode: F32-activation quality path ON \
-                 (narrow-GDN precision-fragile config, v_heads=32)"
-            );
-        }
+        let narrow_gdn = has_gdn && hp_copy.gdn_dims().num_v_heads == 32;
+        let dense = hp_copy.num_experts.is_none();
+        st.kernels.q4_act_plan =
+            crate::runtime_defaults::Q4ActPlan::for_model(narrow_gdn, dense);
+        eprintln!("[CUDA] {}", st.kernels.q4_act_plan.manifest);
+        crate::runtime_defaults::route_census_set_plan(&st.kernels.q4_act_plan);
 
         // LUMEN_CUDA_Q4_F32ACT_KERNEL: select among F32-EXACT Q4_0 decode matvec
         // variants at the two smem launch sites. ALL variants keep FULL F32
@@ -17293,7 +17072,7 @@ impl ComputeBackend for CudaBackend {
         //   "nr4"  -> matvec_q4_0_smem_nr4 (NR=4 wide smem)
         //   "nr8"  -> matvec_q4_0_smem_nr8 (NR=8 wide smem)
         //   "smem" -> explicit opt-out to the NR=2 path
-        // DEFAULT-ON: on the narrow-GDN F32-act path (q4_decode_f32_act = 9B-Q4 /
+        // DEFAULT-ON: on the narrow-GDN class (9B-Q4 /
         // MoE-Q4 dense), NR=4 is the default — occupancy win at BYTE-EXACT F32,
         // GQ-confirmed IDENTICAL to NR=2. All other (non-F32-act) paths keep NR=2.
         st.kernels.q4_f32act_kernel =
@@ -17302,7 +17081,7 @@ impl ComputeBackend for CudaBackend {
                 Some("nr4") => Q4F32ActKernel::Nr4,
                 Some("nr8") => Q4F32ActKernel::Nr8,
                 Some("smem") => Q4F32ActKernel::Smem,
-                _ if st.kernels.q4_decode_f32_act => Q4F32ActKernel::Nr4,
+                _ if narrow_gdn => Q4F32ActKernel::Nr4,
                 _ => Q4F32ActKernel::Smem,
             };
         if !matches!(st.kernels.q4_f32act_kernel, Q4F32ActKernel::Smem) {

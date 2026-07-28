@@ -308,8 +308,7 @@ pub(crate) fn run(
         }
     }
     if lumen_runtime::runtime_defaults::route_census_enabled() {
-        let plan = lumen_runtime::runtime_defaults::q4_act_plan();
-        match lumen_runtime::runtime_defaults::route_census_verify(plan) {
+        match lumen_runtime::runtime_defaults::route_census_verify() {
             Ok(m) => {
                 eprintln!("[decode-bench] {m}");
                 asserts.push(("route_census".into(), m));

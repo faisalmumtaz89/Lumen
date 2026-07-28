@@ -1159,9 +1159,9 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_AB_ITERATIONS",
     "LUMEN_AB_WARMUP",
     "LUMEN_ANTI_RESTATE",
-    "LUMEN_ANTI_RESTATE_SUBWORD",
-    "LUMEN_ANTI_RESTATE_NGRAM",
     "LUMEN_ANTI_RESTATE_LOOP",
+    "LUMEN_ANTI_RESTATE_NGRAM",
+    "LUMEN_ANTI_RESTATE_SUBWORD",
     "LUMEN_BASE_URL",
     "LUMEN_BENCH_ITERATIONS",
     "LUMEN_BENCH_SCALE",
@@ -1170,6 +1170,8 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CACHE_DIR",
     "LUMEN_CHAT_ENABLE_THINKING",
     "LUMEN_CORR010_MODEL",
+    "LUMEN_CUDA_ATTN_PRECISE",
+    "LUMEN_CUDA_ATTN_PRECISE_DBG",
     "LUMEN_CUDA_BF16_AUTOTUNE",
     "LUMEN_CUDA_BF16_GEMMEX",
     "LUMEN_CUDA_BF16_MATVEC",
@@ -1199,44 +1201,34 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_MOE_BATCHED_V2",
     "LUMEN_CUDA_MOE_BATCHED_V3",
     "LUMEN_CUDA_MOE_BF16_NATIVE",
-    "LUMEN_CUDA_MOE_DOWN_TILED_F32ACT",
     "LUMEN_CUDA_MOE_DECODE_F32",
     "LUMEN_CUDA_MOE_DECODE_F32_FFN",
+    "LUMEN_CUDA_MOE_DOWN_TILED_F32ACT",
     "LUMEN_CUDA_MOE_FUSED_NORM_ROUTER",
     "LUMEN_CUDA_MOE_GATE_UP_W10",
     "LUMEN_CUDA_MOE_GROUPED_TILED",
     "LUMEN_CUDA_MOE_PREFILL_BATCHED",
-    "LUMEN_CUDA_MOE_RESIDUAL_Q8",
-    "LUMEN_CUDA_SHARED_FUSED_DECODE",
     "LUMEN_CUDA_MOE_Q4_V3",
     "LUMEN_CUDA_MOE_Q4_V3B",
+    "LUMEN_CUDA_MOE_RESIDUAL_Q8",
     "LUMEN_CUDA_MOE_ROUTER_PARALLEL",
-    "LUMEN_CUDA_SHARED_TILED",
     "LUMEN_CUDA_OUTPUT_PROJ_NR",
     "LUMEN_CUDA_OUTPUT_PROJ_SPLIT",
     "LUMEN_CUDA_PREFILL_F32",
     "LUMEN_CUDA_PROFILE",
     "LUMEN_CUDA_PTX_CACHE",
     "LUMEN_CUDA_PTX_CACHE_DIR",
-    "LUMEN_CUDA_PRECISION_ZONE",
-    "LUMEN_CUDA_Q4_F16_ZONE",
+    "LUMEN_CUDA_Q4_MMVQ",
     "LUMEN_CUDA_Q4_ROUTE_ASSERT",
-    "LUMEN_CUDA_Q4_SPLIT",
-    "LUMEN_CUDA_Q4_SPLIT_F32",
-    "LUMEN_CUDA_LANE_WO",
-    "LUMEN_CUDA_Q4_SPLIT_ATTN",
-    "LUMEN_CUDA_GDN_T1_W4",
-    "LUMEN_CUDA_LANE_FUSED_GLU",
-    "LUMEN_CUDA_GDN_FUSED_CONV",
-    "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
-    "LUMEN_CUDA_Q4_MMVQ",
     "LUMEN_CUDA_Q8_MMVQ",
     "LUMEN_CUDA_Q8_PROJ_MMQ",
     "LUMEN_CUDA_Q8_SCALE_HW",
     "LUMEN_CUDA_Q8_SPLIT",
     "LUMEN_CUDA_Q8_SPLIT_BUDGET_GB",
+    "LUMEN_CUDA_SHARED_FUSED_DECODE",
+    "LUMEN_CUDA_SHARED_TILED",
     "LUMEN_CUDA_SKIP_BF16_PROBE",
     "LUMEN_CUDA_SOA_LOCKED",
     "LUMEN_CUDA_TOPK_MOE_FUSED",
@@ -1247,16 +1239,18 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_FREQUENCY_PENALTY",
     "LUMEN_GRAPH_DIAGNOSTIC",
     "LUMEN_KV_PRECISION",
-    "LUMEN_CUDA_ATTN_PRECISE",
-    "LUMEN_CUDA_ATTN_PRECISE_DBG",
     "LUMEN_METAL_ATTN_PRECISE",
     "LUMEN_METAL_BF16_GATE_UP_NR",
     "LUMEN_METAL_BF16_GDN_FULL_PREFILL_WARMUP",
     "LUMEN_METAL_BF16_GDN_QKV_GATE_PAIRED",
     "LUMEN_METAL_BF16_MMAP_ONLY",
+    "LUMEN_METAL_CB_SPLIT",
     "LUMEN_METAL_CONCURRENT_ENCODER",
     "LUMEN_METAL_CONCURRENT_ENCODER_VALIDATE",
     "LUMEN_METAL_DECODE_DELAY_US",
+    "LUMEN_METAL_DECODE_GPUTIME",
+    "LUMEN_METAL_DECODE_PROFILE",
+    "LUMEN_METAL_DEFAULTS_OFF",
     "LUMEN_METAL_FFN_DOWN_SPLITK",
     "LUMEN_METAL_FFN_GATE_UP_SWIGLU_FUSED",
     "LUMEN_METAL_FFN_GATE_UP_SWIGLU_FUSED_BF16",
@@ -1264,29 +1258,24 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_METAL_GDN_CONCURRENT_ENCODER",
     "LUMEN_METAL_GDN_CONCURRENT_ENCODER_VALIDATE",
     "LUMEN_METAL_GDN_SSM_OUT_F32_BATCHED",
-    "LUMEN_METAL_MMAP_ONLY",
-    "LUMEN_METAL_MOE_ROUTER_PARALLEL",
-    "LUMEN_METAL_MOE_ROUTER_TOPK_TGS",
-    "LUMEN_METAL_MOE_PREFILL_GROUPED",
-    "LUMEN_METAL_MOE_GATHER_VEC4",
-    "LUMEN_METAL_MOE_GEMM_TILEMAP",
-    "LUMEN_METAL_MOE_ROUTE_SORT",
-    "LUMEN_METAL_MOE_ROUTE_SORT_PAR",
-    "LUMEN_METAL_NAN_DUMP",
-    "LUMEN_METAL_DEFAULTS_OFF",
-    "LUMEN_METAL_PROFILE",
-    "LUMEN_METAL_DECODE_PROFILE",
     "LUMEN_METAL_GPU_SAMPLER",
     "LUMEN_METAL_GPU_SAMPLER_EXACT",
     "LUMEN_METAL_GPU_SAMPLER_QUIET",
-    "LUMEN_SPEC_DUMP_IDS",
-    "LUMEN_METAL_DECODE_GPUTIME",
-    "LUMEN_METAL_CB_SPLIT",
+    "LUMEN_METAL_MMAP_ONLY",
+    "LUMEN_METAL_MOE_GATHER_VEC4",
+    "LUMEN_METAL_MOE_GEMM_TILEMAP",
+    "LUMEN_METAL_MOE_PREFILL_GROUPED",
+    "LUMEN_METAL_MOE_ROUTER_PARALLEL",
+    "LUMEN_METAL_MOE_ROUTER_TOPK_TGS",
+    "LUMEN_METAL_MOE_ROUTE_SORT",
+    "LUMEN_METAL_MOE_ROUTE_SORT_PAR",
+    "LUMEN_METAL_NAN_DUMP",
     "LUMEN_METAL_PREFILL_GPUTIME",
+    "LUMEN_METAL_PROFILE",
+    "LUMEN_METAL_Q8_GDN_QKVGATE_2STREAM",
     "LUMEN_METAL_Q8_REPACKED",
     "LUMEN_METAL_Q8_REPACKED_FFN_DOWN",
     "LUMEN_METAL_Q8_REPACKED_GATE_UP",
-    "LUMEN_METAL_Q8_GDN_QKVGATE_2STREAM",
     "LUMEN_METAL_UNRETAINED_CMDBUFS",
     "LUMEN_MOE_PROBE",
     "LUMEN_PREFILL_TIMING",
@@ -1305,6 +1294,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_SOAK_STACK_LEAKS",
     "LUMEN_SOAK_STACK_TICKS",
     "LUMEN_SOAK_WARMUP_SEC",
+    "LUMEN_SPEC_DUMP_IDS",
     "LUMEN_SUFFIX_THRESHOLD",
     "LUMEN_TEST_OPENAI_SDK",
     "LUMEN_XCHK",
@@ -2429,10 +2419,9 @@ mod tests {
         "LUMEN_CUDA_MOE_GATE_UP_W10",
         "LUMEN_CUDA_MOE_GROUPED_TILED",
         "LUMEN_CUDA_MOE_PREFILL_BATCHED",
-        "LUMEN_CUDA_MOE_RESIDUAL_Q8",
-        "LUMEN_CUDA_SHARED_FUSED_DECODE",
         "LUMEN_CUDA_MOE_Q4_V3",
         "LUMEN_CUDA_MOE_Q4_V3B",
+        "LUMEN_CUDA_MOE_RESIDUAL_Q8",
         "LUMEN_CUDA_MOE_ROUTER_PARALLEL",
         "LUMEN_CUDA_OUTPUT_PROJ_NR",
         "LUMEN_CUDA_OUTPUT_PROJ_SPLIT",
@@ -2440,26 +2429,14 @@ mod tests {
         "LUMEN_CUDA_PROFILE",
         "LUMEN_CUDA_PTX_CACHE",
         "LUMEN_CUDA_PTX_CACHE_DIR",
-        "LUMEN_CUDA_PRECISION_ZONE",
-        "LUMEN_CUDA_Q4_F16_ZONE",
-        "LUMEN_CUDA_Q4_ROUTE_ASSERT",
-    "LUMEN_CUDA_Q4_ROUTE_ASSERT",
-    "LUMEN_CUDA_Q4_F16_ZONE",
-    "LUMEN_CUDA_Q4_ROUTE_ASSERT",
-    "LUMEN_CUDA_Q4_SPLIT",
-    "LUMEN_CUDA_Q4_SPLIT_F32",
-    "LUMEN_CUDA_LANE_WO",
-    "LUMEN_CUDA_Q4_SPLIT_ATTN",
-    "LUMEN_CUDA_GDN_T1_W4",
-    "LUMEN_CUDA_LANE_FUSED_GLU",
-    "LUMEN_CUDA_GDN_FUSED_CONV",
-    "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
-        "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q4_MMVQ",
+        "LUMEN_CUDA_Q4_ROUTE_ASSERT",
+        "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q8_MMVQ",
         "LUMEN_CUDA_Q8_PROJ_MMQ",
         "LUMEN_CUDA_Q8_SCALE_HW",
         "LUMEN_CUDA_Q8_SPLIT",
+        "LUMEN_CUDA_SHARED_FUSED_DECODE",
         "LUMEN_CUDA_SHARED_TILED",
         "LUMEN_CUDA_SKIP_BF16_PROBE",
         "LUMEN_CUDA_SOA_LOCKED",
@@ -2552,16 +2529,17 @@ mod tests {
 
 
 // ===========================================================================
-// Q4 ACTIVATION PLAN — the typed replacement for `q4_decode_f32_act`
+// Q4 ACTIVATION PLAN — per-family activation precision
 // ===========================================================================
 //
-// `q4_decode_f32_act` is a single whole-model boolean that pins EVERY Q4
-// projection on the 9B GDN config to F32 activations, because int8 was once
-// found to break quality *somewhere*. One bad projection condemned the whole
-// model. Activation precision is a per-projection property: some families
-// tolerate int8 and one (`AttnWo`) does not, so a whole-model switch either
-// gives up the fast path everywhere or risks quality on the family that needs
-// F32. The typed plan makes the choice per family.
+// This replaced a single whole-model boolean that pinned EVERY Q4 projection
+// on the narrow-GDN config to F32 activations, because int8 was once found to
+// break quality *somewhere*. One bad projection condemned the whole model.
+//
+// Activation precision is a per-projection property: most families tolerate
+// int8 and `AttnWo` does not, so a whole-model switch either gives up the fast
+// path everywhere or risks quality on the family that needs F32. Choosing per
+// family is worth ~40% of 9B-Q4 decode throughput.
 
 /// The six Q4 projection families. Typed so a dispatch site cannot silently
 /// fail to match by misspelling a label.
@@ -2576,18 +2554,17 @@ pub enum Q4ProjectionFamily {
 }
 
 /// Activation representation for one family's decode matvec.
+///
+/// F16 is deliberately absent. It was measured at parity with F32 on 9B-Q4
+/// decode once its routing was verified end to end, and its quality is worse,
+/// so it earns no place in a shipped policy. (An earlier throughput figure for
+/// F16 came from a branch that never dispatched.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Q4ActMode {
     /// Full F32 activations — the exact reference path.
     #[default]
     F32,
-    /// F16 activations (HGEMV). Measured at parity with F32 on 9B-Q4 decode
-    /// once routing was verified end to end, so it buys nothing there; an
-    /// earlier throughput figure for this mode was taken from a branch that
-    /// never dispatched. Quality also degrades relative to F32, with the loss
-    /// localised to the GDN recurrence.
-    F16,
-    /// Q8_1 int8 activations (dp4a). Never valid for `AttnWo`.
+    /// Q8_1 int8 activations (dp4a).
     Q8_1,
 }
 
@@ -2633,19 +2610,73 @@ impl Q4ProjectionFamily {
     ];
 }
 
-/// The resolved per-family activation plan, plus the requested/effective
-/// manifest that must travel with any benchmark number.
+/// The per-family activation plan for one model, plus the manifest that must
+/// travel with any benchmark number.
 #[derive(Debug, Clone)]
 pub struct Q4ActPlan {
     modes: [(Q4ProjectionFamily, Q4ActMode); 6],
     /// Human-readable manifest for the benchmark artifact and coherence gate.
     pub manifest: String,
-    /// True when neither zone flag was set — the plan is then the historical
-    /// default and dispatch must be byte-identical to it.
-    pub is_default: bool,
 }
 
 impl Q4ActPlan {
+    /// The shipped policy, derived from model topology.
+    ///
+    /// `narrow_gdn` is `has_gdn && gdn_dims().num_v_heads == 32`; `dense` is
+    /// `hp.num_experts.is_none()`. Both are config values, not model names.
+    ///
+    /// Why the narrow-GDN class is special: whole-model int8 activations
+    /// degenerate there — 9B-Q4 scored GQ 7/15 and Qwen3.5-MoE-Q4 scored
+    /// GQ-001 13/15. (llama.cpp degenerates identically on the same 9B GGUF,
+    /// so the effect is a property of the weights, not of this engine.) The
+    /// 27B has wider GDN heads (48) and is certified clean on int8.
+    ///
+    /// What changed: that cliff is concentrated in `wo`, whose sigmoid-gated
+    /// outliers defeat per-32-element block scaling. It is not uniform across
+    /// the six families. The previous whole-model pin let one fragile family
+    /// condemn the other five, which cost ~40% of 9B-Q4 decode throughput.
+    /// Dense narrow-GDN now pins only `wo`.
+    ///
+    /// MoE narrow-GDN keeps the F32 pin everywhere EXCEPT `ffn_down`. Its int8
+    /// result was measured on all six families at once, so it says nothing
+    /// about a five-family plan, and no MoE quality campaign has been run —
+    /// assuming the 9B result transfers is exactly the inference this policy
+    /// exists to avoid.
+    ///
+    /// `ffn_down` is Q8_1 there because that is what the code has always done:
+    /// the split shortcut quantizes the down projection's input to Q8_1 before
+    /// `launch_matvec` is ever reached, on every model with a down sibling.
+    /// The old whole-model boolean simply failed to describe it. Stating F32
+    /// for `ffn_down` would make the plan truthful only by changing shipped
+    /// behaviour on a model this campaign never measured — and that exact
+    /// substitution, made once already on the dense path, cost 12% of decode.
+    /// The plan describes reality; it does not prescribe an untested change.
+    pub fn for_model(narrow_gdn: bool, dense: bool) -> Self {
+        let mut modes = [(Q4ProjectionFamily::AttnQkv, Q4ActMode::F32); 6];
+        for (i, f) in Q4ProjectionFamily::ALL.iter().enumerate() {
+            let mode = match (narrow_gdn, dense) {
+                // Dense narrow-GDN (9B-Q4): only `wo` needs F32.
+                (true, true) if *f == Q4ProjectionFamily::AttnWo => Q4ActMode::F32,
+                (true, true) => Q4ActMode::Q8_1,
+                // MoE narrow-GDN: shipped behaviour, unchanged.
+                (true, false) if *f == Q4ProjectionFamily::FfnDown => Q4ActMode::Q8_1,
+                (true, false) => Q4ActMode::F32,
+                // Wide-GDN and non-GDN models: int8 throughout, as shipped.
+                (false, _) => Q4ActMode::Q8_1,
+            };
+            modes[i] = (*f, mode);
+        }
+        let manifest = format!(
+            "q4_act_plan narrow_gdn={narrow_gdn} dense={dense}: {}",
+            modes
+                .iter()
+                .map(|(f, m)| format!("{}={:?}", f.zone_name(), m))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        Self { modes, manifest }
+    }
+
     pub fn mode_for(&self, family: Q4ProjectionFamily) -> Q4ActMode {
         self.modes
             .iter()
@@ -2655,6 +2686,8 @@ impl Q4ActPlan {
     }
 
     /// Convenience for dispatch sites that still carry a label.
+    ///
+    /// An unmapped label yields F32 — the exact path — never a silent match.
     pub fn mode_for_label(&self, label: &str) -> Q4ActMode {
         Q4ProjectionFamily::from_label(label)
             .map(|f| self.mode_for(f))
@@ -2662,116 +2695,10 @@ impl Q4ActPlan {
     }
 }
 
-fn parse_zone(var: &str) -> Result<Vec<String>, String> {
-    let raw = match std::env::var(var) {
-        Ok(v) => v,
-        Err(_) => return Ok(Vec::new()),
-    };
-    let names: Vec<String> = raw
-        .split(',')
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let valid: Vec<&str> = Q4ProjectionFamily::ALL.iter().map(|f| f.zone_name()).collect();
-    for n in &names {
-        if n != "all" && !valid.contains(&n.as_str()) {
-            // FAIL STARTUP, never ignore: a typo silently zoning nothing is
-            // exactly how the first attempt produced a false ceiling.
-            return Err(format!(
-                "{var}: unknown family {n:?}; valid names are {valid:?} or \"all\""
-            ));
-        }
-    }
-    Ok(names)
-}
-
-fn zone_contains(zone: &[String], f: Q4ProjectionFamily) -> bool {
-    zone.iter().any(|z| z == "all" || z == f.zone_name())
-}
-
-/// Resolve `LUMEN_CUDA_PRECISION_ZONE` (Q8_1) and `LUMEN_CUDA_Q4_F16_ZONE`
-/// (F16) into one plan. Returns `Err` on a configuration that must not be
-/// benchmarked: an unknown family name, or one family claimed by both zones.
-pub fn resolve_q4_act_plan() -> Result<Q4ActPlan, String> {
-    let q8 = parse_zone("LUMEN_CUDA_PRECISION_ZONE")?;
-    let f16 = parse_zone("LUMEN_CUDA_Q4_F16_ZONE")?;
-    let is_default = q8.is_empty() && f16.is_empty();
-
-    let mut modes = [(Q4ProjectionFamily::AttnQkv, Q4ActMode::F32); 6];
-    let mut requested = Vec::new();
-    for (i, f) in Q4ProjectionFamily::ALL.iter().enumerate() {
-        let want_q8 = zone_contains(&q8, *f);
-        let want_f16 = zone_contains(&f16, *f);
-
-        // `wo` under Q8 is structurally rejected, including under "all": its
-        // sigmoid-gated outliers defeat per-32 block scaling. This is not a
-        // tunable.
-        let want_q8 = want_q8 && *f != Q4ProjectionFamily::AttnWo;
-
-        if want_q8 && want_f16 {
-            // Never silently prefer one because its branch is checked first.
-            return Err(format!(
-                "family {:?} is claimed by BOTH LUMEN_CUDA_PRECISION_ZONE (Q8_1) \
-                 and LUMEN_CUDA_Q4_F16_ZONE (F16); pick one",
-                f.zone_name()
-            ));
-        }
-        let mode = if want_f16 {
-            Q4ActMode::F16
-        } else if want_q8 {
-            Q4ActMode::Q8_1
-        } else {
-            Q4ActMode::F32
-        };
-        modes[i] = (*f, mode);
-        requested.push(format!("{}={:?}", f.zone_name(), mode));
-    }
-
-    let manifest = format!(
-        "q4_act_plan requested: {} | default={}",
-        requested.join(" "),
-        is_default
-    );
-    Ok(Q4ActPlan {
-        modes,
-        manifest,
-        is_default,
-    })
-}
-
-/// Process-wide plan, resolved once. A configuration error is fatal here
-/// rather than a fallback: benchmarking a silently-degraded plan is the
-/// failure mode this whole module exists to prevent.
-pub fn q4_act_plan() -> &'static Q4ActPlan {
-    use std::sync::OnceLock;
-    static PLAN: OnceLock<Q4ActPlan> = OnceLock::new();
-    PLAN.get_or_init(|| match resolve_q4_act_plan() {
-        Ok(p) => {
-            if !p.is_default {
-                eprintln!("[CUDA] {}", p.manifest);
-            }
-            p
-        }
-        Err(e) => {
-            eprintln!("[CUDA] FATAL: invalid Q4 activation zoning: {e}");
-            std::process::exit(30);
-        }
-    })
-}
 
 #[cfg(test)]
 mod q4_act_plan_tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // These tests mutate PROCESS-GLOBAL env vars, so they must not interleave;
-    // without this they race each other's `clear()` and fail spuriously.
-    static ZONE_SERIAL: Mutex<()> = Mutex::new(());
-
-    fn clear() {
-        std::env::remove_var("LUMEN_CUDA_PRECISION_ZONE");
-        std::env::remove_var("LUMEN_CUDA_Q4_F16_ZONE");
-    }
 
     #[test]
     fn known_dispatch_labels_map_to_a_family() {
@@ -2789,54 +2716,74 @@ mod q4_act_plan_tests {
         assert!(Q4ProjectionFamily::from_label("nonsense").is_none());
     }
 
+    /// The dense narrow-GDN class (9B-Q4) pins ONLY `wo`. This is the change
+    /// the campaign earned: the previous whole-model pin cost the other five
+    /// families their int8 path.
     #[test]
-    fn q8_never_admits_wo_even_under_all() {
-        let _serial = ZONE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-        clear();
-        std::env::set_var("LUMEN_CUDA_PRECISION_ZONE", "all");
-        let p = resolve_q4_act_plan().expect("plan");
+    fn dense_narrow_gdn_pins_only_wo() {
+        let p = Q4ActPlan::for_model(true, true);
         assert_eq!(p.mode_for(Q4ProjectionFamily::AttnWo), Q4ActMode::F32);
-        assert_eq!(p.mode_for(Q4ProjectionFamily::FfnGateUp), Q4ActMode::Q8_1);
-        clear();
-    }
-
-    #[test]
-    fn f16_does_admit_wo() {
-        let _serial = ZONE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-        clear();
-        std::env::set_var("LUMEN_CUDA_Q4_F16_ZONE", "wo");
-        let p = resolve_q4_act_plan().expect("plan");
-        assert_eq!(p.mode_for(Q4ProjectionFamily::AttnWo), Q4ActMode::F16);
-        clear();
-    }
-
-    #[test]
-    fn conflicting_claims_fail_rather_than_silently_pick_one() {
-        let _serial = ZONE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-        clear();
-        std::env::set_var("LUMEN_CUDA_PRECISION_ZONE", "ffn_gate_up");
-        std::env::set_var("LUMEN_CUDA_Q4_F16_ZONE", "ffn_gate_up");
-        assert!(resolve_q4_act_plan().is_err());
-        clear();
-    }
-
-    #[test]
-    fn unknown_family_name_fails_rather_than_zoning_nothing() {
-        let _serial = ZONE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-        clear();
-        std::env::set_var("LUMEN_CUDA_Q4_F16_ZONE", "ffn_gate_upp");
-        assert!(resolve_q4_act_plan().is_err());
-        clear();
-    }
-
-    #[test]
-    fn unset_is_all_f32_and_flagged_default() {
-        let _serial = ZONE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-        clear();
-        let p = resolve_q4_act_plan().expect("plan");
-        assert!(p.is_default);
         for f in Q4ProjectionFamily::ALL {
-            assert_eq!(p.mode_for(f), Q4ActMode::F32);
+            if f != Q4ProjectionFamily::AttnWo {
+                assert_eq!(p.mode_for(f), Q4ActMode::Q8_1, "{f:?} should be int8");
+            }
+        }
+    }
+
+    /// MoE narrow-GDN keeps the whole-model F32 pin. Its int8 regression was
+    /// measured with all six families at once, so it does not license a
+    /// five-family plan, and no MoE quality campaign has been run. If this
+    /// test is ever "fixed" to match the dense case, the campaign has to come
+    /// first.
+    #[test]
+    fn moe_narrow_gdn_keeps_the_whole_model_pin_except_ffn_down() {
+        let p = Q4ActPlan::for_model(true, false);
+        for f in Q4ProjectionFamily::ALL {
+            if f == Q4ProjectionFamily::FfnDown {
+                continue;
+            }
+            assert_eq!(p.mode_for(f), Q4ActMode::F32, "{f:?} must stay F32 on MoE");
+        }
+    }
+
+    /// `ffn_down` has ALWAYS taken the Q8_1 split path on every model with a
+    /// down sibling, including the models otherwise pinned to F32. The plan
+    /// records that rather than changing it. This is worth ~12% of decode and
+    /// was silently lost once by "fixing" the plan to say F32 instead.
+    #[test]
+    fn ffn_down_is_int8_on_every_class() {
+        for (narrow, dense) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert_eq!(
+                Q4ActPlan::for_model(narrow, dense).mode_for(Q4ProjectionFamily::FfnDown),
+                Q4ActMode::Q8_1,
+                "narrow_gdn={narrow} dense={dense}"
+            );
+        }
+    }
+
+    /// Wide-GDN (27B) and non-GDN models are certified on int8 and must be
+    /// left exactly as shipped.
+    #[test]
+    fn wide_gdn_and_non_gdn_are_unchanged_int8() {
+        for dense in [true, false] {
+            let p = Q4ActPlan::for_model(false, dense);
+            for f in Q4ProjectionFamily::ALL {
+                assert_eq!(p.mode_for(f), Q4ActMode::Q8_1, "{f:?} dense={dense}");
+            }
+        }
+    }
+
+    #[test]
+    fn unmapped_label_falls_to_the_exact_path() {
+        let p = Q4ActPlan::for_model(true, true);
+        assert_eq!(p.mode_for_label("nonsense"), Q4ActMode::F32);
+    }
+
+    #[test]
+    fn manifest_names_every_family() {
+        let m = Q4ActPlan::for_model(true, true).manifest;
+        for f in Q4ProjectionFamily::ALL {
+            assert!(m.contains(f.zone_name()), "manifest omits {f:?}: {m}");
         }
     }
 }
@@ -2860,6 +2807,21 @@ mod q4_act_plan_tests {
 use std::sync::Mutex;
 
 static ROUTE_CENSUS: Mutex<Vec<(String, &'static str)>> = Mutex::new(Vec::new());
+
+/// The plan the backend actually installed, published for verification.
+///
+/// The verifier must check the plan that RAN, not one the caller re-derives.
+/// Those can disagree — that disagreement is the entire class of defect this
+/// module exists to catch — and a verifier that reconstructs its own
+/// expectation would agree with itself no matter what the GPU did.
+static INSTALLED_PLAN: Mutex<Option<Q4ActPlan>> = Mutex::new(None);
+
+/// Publish the resolved plan. Called by the backend once per model load.
+pub fn route_census_set_plan(plan: &Q4ActPlan) {
+    if let Ok(mut g) = INSTALLED_PLAN.lock() {
+        *g = Some(plan.clone());
+    }
+}
 
 pub fn route_census_enabled() -> bool {
     use std::sync::OnceLock;
@@ -2923,9 +2885,41 @@ pub fn route_census_summary() -> Vec<(String, &'static str, usize)> {
     out
 }
 
-/// Fail unless every explicitly zoned family was observed on a path matching
-/// its requested mode. Returns the manifest string on success.
-pub fn route_census_verify(plan: &Q4ActPlan) -> Result<String, String> {
+/// Does this route name consume int8 activations?
+///
+/// Classified by the ACTIVATION TYPE the route consumes, never by prefix. A
+/// bare `starts_with("Q8")` test rejected a correctly-dispatched arm twice
+/// (`Q4_SPLIT_Q8_1_LAUNCHED`, `Q4_SPLIT_MMVQ_LAUNCHED`) because the kernel's
+/// name did not begin with "Q8", failing whole runs that were in fact right.
+fn route_is_int8(path: &str) -> bool {
+    path.starts_with("Q8")
+        || path.contains("Q8_1")
+        || path.contains("MMVQ")
+        || path.contains("DP4A")
+        || path.contains("MMA_S4")
+}
+
+/// Fail unless EVERY family was observed on a path matching its planned mode.
+/// Returns the manifest string on success.
+///
+/// F32 families are verified too. They were not, and that was a hole: `wo`
+/// staying on F32 is the single claim the narrow-GDN quality result rests on,
+/// and an unverified claim is what this module exists to prevent. A family
+/// silently drifting onto int8 would have passed the old check by doing
+/// nothing at all.
+pub fn route_census_verify() -> Result<String, String> {
+    let plan = match INSTALLED_PLAN.lock() {
+        Ok(g) => match g.clone() {
+            Some(p) => p,
+            // Not an "assume the default" case: if no plan was installed the
+            // backend never reached preload, so there is nothing to certify.
+            None => return Err("no activation plan was installed — the backend \
+                                never completed preload, so no route can be \
+                                certified".into()),
+        },
+        Err(_) => return Err("activation plan lock poisoned".into()),
+    };
+    let plan = &plan;
     let summary = route_census_summary();
     let mut lines = Vec::new();
     let mut errors = Vec::new();
@@ -2938,49 +2932,38 @@ pub fn route_census_verify(plan: &Q4ActPlan) -> Result<String, String> {
         let taken: usize = observed.iter().map(|(_, _, n)| *n).sum();
         let paths: Vec<&str> = observed.iter().map(|(_, p, _)| *p).collect();
         lines.push(format!("{}={:?} calls={} paths={:?}", f.zone_name(), want, taken, paths));
-        if want != Q4ActMode::F32 {
-            let expect_prefix = match want {
-                Q4ActMode::F16 => "F16",
-                Q4ActMode::Q8_1 => "Q8",
-                Q4ActMode::F32 => unreachable!(),
-            };
-            if taken == 0 {
+
+        // A family with zero calls is only an error when it was expected to
+        // run. `gdn_*` families are absent on non-GDN models and `ssm_out` is
+        // floored to Q8_0 by the converter, so silence is legitimate there —
+        // but silence on a family the plan put on int8 means the branch is
+        // unreachable and any timing for it is meaningless.
+        if taken == 0 {
+            if want == Q4ActMode::Q8_1 {
                 errors.push(format!(
-                    "{} requested {:?} but was NEVER dispatched — the branch is \
+                    "{} planned {:?} but was NEVER dispatched — the branch is \
                      unreachable, so any timing for this arm is meaningless",
                     f.zone_name(),
                     want
                 ));
-            // Path names must be CLASSIFIED, not prefix-matched. The
-            // post-launch tags added for stronger dispatch evidence
-            // ("Q4_SPLIT_Q8_1_LAUNCHED", "Q4_SPLIT_MMVQ_LAUNCHED") are int8
-            // routes that do not start with "Q8", so a bare prefix test marked
-            // a CORRECTLY dispatched arm as wrong and failed the whole run.
-            } else if !paths.iter().all(|p| {
-                // Every int8-ACTIVATION route, however the kernel is named.
-                // This classifier has now rejected a correctly-dispatched arm
-                // twice (e.g. Q4_SPLIT_Q8_1_LAUNCHED) because the name did not
-                // start with "Q8". The property that matters is the ACTIVATION
-                // type a route consumes, not the kernel's label.
-                let is_int8 = p.starts_with("Q8")
-                    || p.contains("Q8_1")
-                    || p.contains("MMVQ")
-                    || p.contains("DP4A")
-                    || p.contains("MMA_S4");
-                let is_f16 = p.starts_with("F16") || p.contains("HGEMV");
-                match expect_prefix {
-                    "Q8" => is_int8,
-                    "F16" => is_f16,
-                    _ => p.starts_with(expect_prefix),
-                }
-            }) {
-                errors.push(format!(
-                    "{} requested {:?} but ran on {:?}",
-                    f.zone_name(),
-                    want,
-                    paths
-                ));
             }
+            continue;
+        }
+
+        let ok = match want {
+            Q4ActMode::Q8_1 => paths.iter().all(|p| route_is_int8(p)),
+            // The exact path is defined by what it is NOT: any int8 route on a
+            // family the plan pinned to F32 is precisely the silent drift this
+            // check exists to catch.
+            Q4ActMode::F32 => paths.iter().all(|p| !route_is_int8(p)),
+        };
+        if !ok {
+            errors.push(format!(
+                "{} planned {:?} but ran on {:?}",
+                f.zone_name(),
+                want,
+                paths
+            ));
         }
     }
     let manifest = format!("route_census: {}", lines.join(" | "));
@@ -2991,101 +2974,3 @@ pub fn route_census_verify(plan: &Q4ActPlan) -> Result<String, String> {
     }
 }
 
-/// `LUMEN_CUDA_Q4_SPLIT_F32` — route Q4 decode matvecs through an
-/// F32-activation SoA kernel instead of the native-18-byte smem kernel.
-/// Correctness-neutral by design (identical activation numerics); only the
-/// weight access pattern and work decomposition change.
-///
-/// `LUMEN_CUDA_Q4_SPLIT_F32=1` — route Q4 decode matvecs through the
-/// lane-striped SoA kernel: 4 lanes cooperate per Q4 block, 8 activations per
-/// lane, warp-contiguous int loads. Correctness-neutral (F32 in, F32
-/// accumulate); only the weight access pattern and work decomposition change.
-pub fn q4_split_f32_variant() -> u8 {
-    if q4_split_f32_requested() {
-        4
-    } else {
-        0
-    }
-}
-
-/// Reads the env var once. This is the ONLY place that touches it — the two
-/// helpers above are derived from it, and must not be defined in terms of each
-/// other (an earlier refactor made `variant()` call `enabled()` and
-/// `enabled()` call `variant()`, which is unbounded recursion on every Q4
-/// decode dispatch; `cargo check` accepts it and the CPU test suite never
-/// exercises the CUDA path, so nothing catches it before the GPU does).
-fn q4_split_f32_requested() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("LUMEN_CUDA_Q4_SPLIT_F32").ok().as_deref(),
-            Some("1") | Some("2") | Some("3") | Some("4") | Some("5") | Some("6")
-                | Some("true") | Some("yes") | Some("on")
-        )
-    })
-}
-
-/// True when either SoA F32 variant is requested. Used by the Q8_1 split
-/// shortcuts, which must yield so they do not claim a projection before
-/// `launch_matvec_ext` is reached.
-pub fn q4_split_f32_enabled() -> bool {
-    q4_split_f32_requested()
-}
-
-/// `LUMEN_DECODE_ABLATE` — VALIDATION-ONLY phase attribution.
-///
-/// Skips a whole phase of the decode layer so the wall-time delta measures
-/// that phase's share of the token. The output is NUMERICALLY GARBAGE by
-/// construction; the audited battery still performs exactly N decode calls, so
-/// the TIMING is exact. Never enable outside attribution runs.
-///
-///
-
-/// `LUMEN_CUDA_GDN_T1_W4=1` — four-warp CTA grouping for the T=1 GDN
-/// recurrence. Read once; the dispatch site logs whether the guard actually
-/// admitted it, so "requested" and "reached" are never conflated.
-pub fn gdn_t1_w4_requested() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("LUMEN_CUDA_GDN_T1_W4").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
-}
-
-
-/// `LUMEN_CUDA_FFN_DIRECT_RESIDUAL=1` — fold the FFN residual into the down
-/// projection's own store and write `x_gpu` directly, removing both the
-/// `residual_add` launch and the decode loop's layer-commit copy.
-pub fn ffn_direct_residual() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("LUMEN_CUDA_FFN_DIRECT_RESIDUAL").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
-}
-
-
-
-
-
-
-#[cfg(test)]
-mod q4_split_f32_recursion_guard {
-    /// Regression test for an unbounded-recursion refactor: `variant()` was
-    /// defined as `if enabled() {4} else {0}` while `enabled()` was
-    /// `variant() != 0`. Both compile; both stack-overflow on first call.
-    /// The CPU suite never touches the CUDA dispatch, so only a GPU run would
-    /// have found it. Calling each once is sufficient — recursion aborts.
-    #[test]
-    fn variant_and_enabled_terminate() {
-        let _ = super::q4_split_f32_variant();
-        let _ = super::q4_split_f32_enabled();
-    }
-}
