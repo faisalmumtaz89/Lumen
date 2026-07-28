@@ -496,6 +496,8 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q4_split_f32_lane_r4: Option<CudaFunction>,
     /// Wide-lane: 2 lanes per Q4 block, int2 loads, grid unchanged.
     pub(crate) matvec_q4_split_f32_lane_wide: Option<CudaFunction>,
+    /// Validation-only no-op, for the launch-cost slope probe.
+    pub(crate) noop_probe: Option<CudaFunction>,
     /// Q4xQ8_1 on INT4 tensor cores — A100 does 1248 INT4 TOPS vs 624 INT8.
     pub(crate) matvec_q4_mma_s4: Option<CudaFunction>,
     /// Native Q6_K matvec (0.8203 B/weight, llama.cpp parity).
@@ -1835,6 +1837,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        noop_probe: load_fn(shaders::NOOP_PROBE_KERNEL_SOURCE, "noop_probe").ok(),
         matvec_q4_mma_s4: load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_MMA_S4_KERNEL_SOURCE,
             "matvec_q4_mma_s4",

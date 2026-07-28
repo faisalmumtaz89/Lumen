@@ -3282,6 +3282,37 @@ impl CudaBackend {
             }
         } // end else (standard attention path — skipped for GDN layers)
 
+        // LUMEN_DECODE_NOOP_LAUNCHES=N: inject N no-op launches per layer and
+        // read the slope. The campaign has been quoting 4.2 us/launch from a
+        // SINGLE point (the conv fusion removed 24 launches for +0.10 ms) and
+        // extrapolating it across ~395 launches to claim ~1.66 ms of overhead.
+        // Marginal is not average and launches overlap with work, so that very
+        // likely overstates the recoverable gap. This measures it directly.
+        {
+            let n = crate::runtime_defaults::decode_noop_launches();
+            if n > 0 {
+                if let Some(f) = st.kernels.noop_probe.as_ref() {
+                    let cfg = CudarcLaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    for _ in 0..n {
+                        unsafe {
+                            self.device
+                                .stream
+                                .launch_builder(f)
+                                .arg(&mut st.scratch.input_f16)
+                                .launch(cfg)
+                        }
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("noop_probe: {e}"))
+                        })?;
+                    }
+                }
+            }
+        }
+
         // Attribution ablation: skip the whole FFN block (gate/up/SwiGLU/down).
         // On 9B this is 3 of every ~4 projection bytes, so it is the dominant
         // matvec phase and its delta bounds all FFN kernel work.

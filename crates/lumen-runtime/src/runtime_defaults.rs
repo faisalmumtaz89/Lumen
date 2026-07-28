@@ -1235,6 +1235,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_KQUANT_REQUANT_Q8",
     "LUMEN_CUDA_Q6K_NATIVE",
     "LUMEN_CUDA_Q4_MMA_S4",
+    "LUMEN_DECODE_NOOP_LAUNCHES",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
     "LUMEN_CUDA_Q4_MMVQ",
@@ -2466,6 +2467,7 @@ mod tests {
     "LUMEN_CUDA_KQUANT_REQUANT_Q8",
     "LUMEN_CUDA_Q6K_NATIVE",
     "LUMEN_CUDA_Q4_MMA_S4",
+    "LUMEN_DECODE_NOOP_LAUNCHES",
         "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q4_MMVQ",
         "LUMEN_CUDA_Q8_MMVQ",
@@ -3189,5 +3191,19 @@ pub fn q4_mma_s4() -> bool {
             std::env::var("LUMEN_CUDA_Q4_MMA_S4").ok().as_deref(),
             Some("1") | Some("true") | Some("yes") | Some("on")
         )
+    })
+}
+
+/// `LUMEN_DECODE_NOOP_LAUNCHES=N` — validation only. Inject N no-op launches
+/// per layer so the marginal cost of a launch can be read off the slope
+/// instead of extrapolated from one data point.
+pub fn decode_noop_launches() -> u32 {
+    use std::sync::OnceLock;
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("LUMEN_DECODE_NOOP_LAUNCHES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
     })
 }
