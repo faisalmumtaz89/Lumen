@@ -1234,6 +1234,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_GDN_COOP",
     "LUMEN_CUDA_KQUANT_REQUANT_Q8",
     "LUMEN_CUDA_Q6K_NATIVE",
+    "LUMEN_CUDA_Q4_MMA_S4",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
     "LUMEN_CUDA_Q4_MMVQ",
@@ -2464,6 +2465,7 @@ mod tests {
     "LUMEN_CUDA_GDN_COOP",
     "LUMEN_CUDA_KQUANT_REQUANT_Q8",
     "LUMEN_CUDA_Q6K_NATIVE",
+    "LUMEN_CUDA_Q4_MMA_S4",
         "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q4_MMVQ",
         "LUMEN_CUDA_Q8_MMVQ",
@@ -3165,6 +3167,20 @@ pub fn q6k_native() -> bool {
     *ON.get_or_init(|| {
         matches!(
             std::env::var("LUMEN_CUDA_Q6K_NATIVE").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// `LUMEN_CUDA_Q4_MMA_S4=1` — run Q4xQ8_1 decode matvecs on the INT4 tensor
+/// cores. Exact (the Q8_1 activation is decomposed losslessly into two signed
+/// 4-bit halves plus a constant), so it is not a precision trade.
+pub fn q4_mma_s4() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_Q4_MMA_S4").ok().as_deref(),
             Some("1") | Some("true") | Some("yes") | Some("on")
         )
     })

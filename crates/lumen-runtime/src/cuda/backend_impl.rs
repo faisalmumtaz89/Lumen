@@ -11907,6 +11907,38 @@ unsafe fn launch_matvec_preq8_1_split(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
+    // INT4 tensor-core path. Preferred when requested and a Q4 split sibling
+    // exists: the FFN is instruction-bound (1135 GB/s vs the 1905 lm_head
+    // demonstrates on the same GPU), and A100 rates INT4 at 1248 TOPS against
+    // 624 for INT8. Exact arithmetic, so the coherence gate is the judge.
+    if crate::runtime_defaults::q4_mma_s4() {
+        if let (Some(f), Some(split_w)) =
+            (kernels.matvec_q4_mma_s4.as_ref(), q4_split_sibling)
+        {
+            let out_u32 = out_dim as u32;
+            let in_u32 = in_dim as u32;
+            let cfg = CudarcLaunchConfig {
+                grid_dim: (out_u32.div_ceil(64), 1, 1),
+                block_dim: (32, 4, 1),
+                shared_mem_bytes: 0,
+            };
+            device
+                .stream
+                .launch_builder(f)
+                .arg(split_w)
+                .arg(q8_1_buf)
+                .arg(output)
+                .arg(&out_u32)
+                .arg(&in_u32)
+                .launch(cfg)
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("matvec_q4_mma_s4 {label}: {e}"))
+                })?;
+            crate::runtime_defaults::route_census_record(label, "Q4_MMA_S4_LAUNCHED");
+            return Ok(());
+        }
+    }
+
     // NOTE: entry marker only — this helper can still fall through without
     // launching if the sibling or kernel is absent. Proof of execution is the
     // per-kernel tag recorded at the actual dispatch site below.

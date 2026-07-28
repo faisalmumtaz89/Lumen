@@ -496,6 +496,8 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q4_split_f32_lane_r4: Option<CudaFunction>,
     /// Wide-lane: 2 lanes per Q4 block, int2 loads, grid unchanged.
     pub(crate) matvec_q4_split_f32_lane_wide: Option<CudaFunction>,
+    /// Q4xQ8_1 on INT4 tensor cores — A100 does 1248 INT4 TOPS vs 624 INT8.
+    pub(crate) matvec_q4_mma_s4: Option<CudaFunction>,
     /// Native Q6_K matvec (0.8203 B/weight, llama.cpp parity).
     pub(crate) matvec_q6_k_f32: Option<CudaFunction>,
     /// Whole T=1 GDN post-projection chain in one cooperative launch.
@@ -1833,6 +1835,12 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        matvec_q4_mma_s4: load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_MMA_S4_KERNEL_SOURCE,
+            "matvec_q4_mma_s4",
+        )
+        .inspect_err(|e| eprintln!("[CUDA] matvec_q4_mma_s4: NVRTC FAILED: {e}"))
+        .ok(),
         matvec_q6_k_f32: load_fn(shaders::MATVEC_Q6_K_F32_KERNEL_SOURCE, "matvec_q6_k_f32")
             .inspect_err(|e| eprintln!("[CUDA] matvec_q6_k_f32: NVRTC FAILED: {e}"))
             .ok(),
