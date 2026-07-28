@@ -2632,11 +2632,25 @@ impl Q4ActPlan {
     /// so the effect is a property of the weights, not of this engine.) The
     /// 27B has wider GDN heads (48) and is certified clean on int8.
     ///
-    /// What changed: that cliff is concentrated in `wo`, whose sigmoid-gated
-    /// outliers defeat per-32-element block scaling. It is not uniform across
-    /// the six families. The previous whole-model pin let one fragile family
-    /// condemn the other five, which cost ~40% of 9B-Q4 decode throughput.
-    /// Dense narrow-GDN now pins only `wo`.
+    /// Dense narrow-GDN stays on the exact path for ALL SIX families, and
+    /// `ffn_down` moves there too — it had been int8 via the split shortcut.
+    ///
+    /// A five-family int8 policy was measured at +67.8% decode (150.20 tok/s
+    /// co-located, 0.979x llama.cpp) and is NOT shipped, because no available
+    /// gate could certify it. The long-form corpus produced a non-monotonic
+    /// ranking across per-family arms — adding `attn_qkv` REPAIRED two
+    /// failures and beat the all-F32 control at 15/15 — so GQ-004's 15
+    /// threshold-scored items cannot separate these configurations in either
+    /// direction. Unproven is not the same as harmful, and it is not the same
+    /// as safe; it is a reason to hold.
+    ///
+    /// The throughput this configuration does deliver (+10.9% over v0.5.0)
+    /// comes from the split/SoA layout, the lane kernel and the
+    /// direct-residual store, none of which touch activation precision.
+    ///
+    /// Revisiting this needs a long-form corpus large enough that a two-item
+    /// difference is meaningful, or a graded degeneration score rather than a
+    /// binary threshold. See quality/CAMPAIGN-EVIDENCE.md.
     ///
     /// MoE narrow-GDN keeps the F32 pin everywhere EXCEPT `ffn_down`. Its int8
     /// result was measured on all six families at once, so it says nothing
@@ -2704,9 +2718,8 @@ impl Q4ActPlan {
             };
             #[cfg(not(any(feature = "quality-oracle", feature = "activation-probe")))]
             let mode = match (narrow_gdn, dense) {
-                // Dense narrow-GDN (9B-Q4): only `wo` needs F32.
-                (true, true) if *f == Q4ProjectionFamily::AttnWo => Q4ActMode::F32,
-                (true, true) => Q4ActMode::Q8_1,
+                // Dense narrow-GDN (9B-Q4): the exact path, every family.
+                (true, true) => Q4ActMode::F32,
                 // MoE narrow-GDN: shipped behaviour, unchanged.
                 (true, false) if *f == Q4ProjectionFamily::FfnDown => Q4ActMode::Q8_1,
                 (true, false) => Q4ActMode::F32,
@@ -2809,14 +2822,16 @@ mod q4_act_plan_tests {
     /// families their int8 path.
     // Describes the SHIPPING policy; the oracle build deliberately overrides it.
     #[cfg(not(feature = "quality-oracle"))]
+    /// Dense narrow-GDN ships the exact path on every family. A five-family
+    /// int8 policy measured +67.8% here and is deliberately NOT shipped: the
+    /// long-form gate ranked per-family arms non-monotonically, so it could
+    /// neither convict nor clear it. If this test is ever relaxed, the corpus
+    /// has to grow first.
     #[test]
-    fn dense_narrow_gdn_pins_only_wo() {
+    fn dense_narrow_gdn_is_all_f32() {
         let p = Q4ActPlan::for_model(true, true);
-        assert_eq!(p.mode_for(Q4ProjectionFamily::AttnWo), Q4ActMode::F32);
         for f in Q4ProjectionFamily::ALL {
-            if f != Q4ProjectionFamily::AttnWo {
-                assert_eq!(p.mode_for(f), Q4ActMode::Q8_1, "{f:?} should be int8");
-            }
+            assert_eq!(p.mode_for(f), Q4ActMode::F32, "{f:?} must be exact");
         }
     }
 
@@ -2838,34 +2853,22 @@ mod q4_act_plan_tests {
         }
     }
 
-    /// `ffn_down` has ALWAYS taken the Q8_1 split path on every model with a
-    /// down sibling, including the models otherwise pinned to F32. The plan
-    /// records that rather than changing it. This is worth ~12% of decode and
-    /// was silently lost once by "fixing" the plan to say F32 instead.
-    // Describes the SHIPPING policy; the oracle build deliberately overrides it.
-    #[cfg(not(feature = "quality-oracle"))]
+    /// `ffn_down` takes the Q8_1 split path on every class EXCEPT dense
+    /// narrow-GDN, which now runs it exact along with the other five. That
+    /// exception is worth ~7.7% there and is given up with the rest of the
+    /// activation policy, not separately.
     #[test]
-    fn ffn_down_is_int8_on_every_class() {
-        for (narrow, dense) in [(true, true), (true, false), (false, true), (false, false)] {
+    fn ffn_down_is_int8_except_on_dense_narrow_gdn() {
+        assert_eq!(
+            Q4ActPlan::for_model(true, true).mode_for(Q4ProjectionFamily::FfnDown),
+            Q4ActMode::F32
+        );
+        for (narrow, dense) in [(true, false), (false, true), (false, false)] {
             assert_eq!(
                 Q4ActPlan::for_model(narrow, dense).mode_for(Q4ProjectionFamily::FfnDown),
                 Q4ActMode::Q8_1,
                 "narrow_gdn={narrow} dense={dense}"
             );
-        }
-    }
-
-    /// Wide-GDN (27B) and non-GDN models are certified on int8 and must be
-    /// left exactly as shipped.
-    // Describes the SHIPPING policy; the oracle build deliberately overrides it.
-    #[cfg(not(feature = "quality-oracle"))]
-    #[test]
-    fn wide_gdn_and_non_gdn_are_unchanged_int8() {
-        for dense in [true, false] {
-            let p = Q4ActPlan::for_model(false, dense);
-            for f in Q4ProjectionFamily::ALL {
-                assert_eq!(p.mode_for(f), Q4ActMode::Q8_1, "{f:?} dense={dense}");
-            }
         }
     }
 
