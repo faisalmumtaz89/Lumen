@@ -4384,6 +4384,21 @@ impl CudaBackend {
             }
         } // end if !fused_glu_fired
 
+        // Split the FFN by projection. lm_head moves 1.08 GB at 1905 GB/s
+        // while the FFN moves 2.72 GB at 1071 GB/s on the same GPU and token —
+        // if the FFN reached lm_head's rate it would save 1.11 ms, exactly the
+        // gap to 1.25x. They differ in BOTH kernel and shape (one 248320-row
+        // launch vs 96 launches at 12288/4096 rows), so this ablation keeps
+        // gate/up (12288 rows) and drops down (4096 rows) to separate them.
+        //
+        // Skipping down leaves attn_proj as the layer output, which is
+        // numerically wrong by construction — timing-only, like every other
+        // LUMEN_DECODE_ABLATE arm.
+        if crate::runtime_defaults::decode_ablate("ffn_down") {
+            st.ffn_wrote_x_gpu = false;
+            return Ok(());
+        }
+
         // SwiGLU + Down projection.
         //
         // When fused_glu_fired: SwiGLU is already applied inline. scratch.gate
