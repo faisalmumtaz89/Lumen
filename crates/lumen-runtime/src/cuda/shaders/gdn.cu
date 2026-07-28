@@ -829,7 +829,11 @@ extern "C" __global__ void gdn_prefill_fused_v3_t1_w4(
 // The GDN recurrence costs 1.351 ms/token = 56.3 us across 24 layers for FIVE
 // kernels each, i.e. ~11 us per kernel — essentially the per-launch cost, on a
 // phase that reads ~zero weight bytes. Reshaping one of those kernels into
-// four-warp CTAs (gdn_prefill_fused_v3_t1_w4) measured 1.0004x and 0.9972x in
+// Single-warp CTAs cap residency by CTA slots rather than by warps, so this
+// groups four state columns into one four-warp CTA. Arithmetic is unchanged:
+// warp w runs exactly the T=1 tail loop of gdn_prefill_fused_v3 for its own
+// column, preserving the via-prefill path's numerics.
+
 // two independent rounds: exactly what a PER-LAUNCH-bound phase predicts,
 // since CTA count is not what is being paid for. The lever is fewer launches.
 //

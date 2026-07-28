@@ -1223,7 +1223,6 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_Q4_ROUTE_ASSERT",
     "LUMEN_CUDA_Q4_SPLIT",
     "LUMEN_CUDA_Q4_SPLIT_F32",
-    "LUMEN_DECODE_ABLATE",
     "LUMEN_CUDA_LANE_WO",
     "LUMEN_CUDA_Q4_SPLIT_ATTN",
     "LUMEN_CUDA_GDN_T1_W4",
@@ -1231,11 +1230,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_GDN_FUSED_CONV",
     "LUMEN_CUDA_ATTN_PREP_FUSED",
     "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
-    "LUMEN_CUDA_GDN_COOP",
     "LUMEN_CUDA_KQUANT_REQUANT_Q8",
-    "LUMEN_CUDA_Q6K_NATIVE",
-    "LUMEN_CUDA_Q4_MMA_S4",
-    "LUMEN_DECODE_NOOP_LAUNCHES",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
     "LUMEN_CUDA_Q4_MMVQ",
@@ -2455,7 +2450,6 @@ mod tests {
     "LUMEN_CUDA_Q4_ROUTE_ASSERT",
     "LUMEN_CUDA_Q4_SPLIT",
     "LUMEN_CUDA_Q4_SPLIT_F32",
-    "LUMEN_DECODE_ABLATE",
     "LUMEN_CUDA_LANE_WO",
     "LUMEN_CUDA_Q4_SPLIT_ATTN",
     "LUMEN_CUDA_GDN_T1_W4",
@@ -2463,11 +2457,7 @@ mod tests {
     "LUMEN_CUDA_GDN_FUSED_CONV",
     "LUMEN_CUDA_ATTN_PREP_FUSED",
     "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
-    "LUMEN_CUDA_GDN_COOP",
     "LUMEN_CUDA_KQUANT_REQUANT_Q8",
-    "LUMEN_CUDA_Q6K_NATIVE",
-    "LUMEN_CUDA_Q4_MMA_S4",
-    "LUMEN_DECODE_NOOP_LAUNCHES",
         "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q4_MMVQ",
         "LUMEN_CUDA_Q8_MMVQ",
@@ -2572,30 +2562,10 @@ mod tests {
 // `q4_decode_f32_act` is a single whole-model boolean that pins EVERY Q4
 // projection on the 9B GDN config to F32 activations, because int8 was once
 // found to break quality *somewhere*. One bad projection condemned the whole
-// model, and the cost is large: 9B-Q4 decodes at 88 tok/s while llama.cpp
-// reaches 153 on the identical GGUF, because F32 activations foreclose both
-// the dp4a and HGEMV paths.
-//
-// This replaces that boolean with a per-family PLAN resolved once at startup.
-// Three hard lessons are encoded here:
-//
-//  1. STRINGS ARE NOT AN ORACLE. A first attempt matched dispatch labels by
-//     string and silently missed families whose call sites use different
-//     spellings — the GDN sites pass "gdn_qkv"/"gdn_gate" while the map was
-//     written for "qkv"/"attn_gate", so those families never zoned at all and
-//     the experiment reported a false ceiling. Labels are now logging only;
-//     dispatch decisions take a typed `Q4ActMode`.
-//
-//  2. THE TWO REPRESENTATIONS FAIL DIFFERENTLY. Q8_1 uses per-32 amax block
-//     scaling, so `wo`'s sigmoid-gated outliers crush its small channels —
-//     Q8 therefore structurally rejects `AttnWo`. F16 carries no block scale
-//     and supplies uniform relative precision, so `wo` IS F16-admissible.
-//
-//  3. THE BASELINE IS NOT PURE F32. With no environment set, quantized dense
-//     defaults SOA_LOCKED on, and the FFN-down split shortcut already
-//     quantizes to Q8_1 without consulting any oracle. The unset plan must
-//     reproduce that exactly, or the "repair" would itself move the reference
-//     token stream.
+// model. Activation precision is a per-projection property: some families
+// tolerate int8 and one (`AttnWo`) does not, so a whole-model switch either
+// gives up the fast path everywhere or risks quality on the family that needs
+// F32. The typed plan makes the choice per family.
 
 /// The six Q4 projection families. Typed so a dispatch site cannot silently
 /// fail to match by misspelling a label.
@@ -2615,8 +2585,11 @@ pub enum Q4ActMode {
     /// Full F32 activations — the exact reference path.
     #[default]
     F32,
-    /// F16 activations (HGEMV). Global-F16 measures 181 tok/s but 12/15 vs
-    /// F32's 15/15, with the loss localised to the GDN recurrence.
+    /// F16 activations (HGEMV). Measured at parity with F32 on 9B-Q4 decode
+    /// once routing was verified end to end, so it buys nothing there; an
+    /// earlier throughput figure for this mode was taken from a branch that
+    /// never dispatched. Quality also degrades relative to F32, with the loss
+    /// localised to the GDN recurrence.
     F16,
     /// Q8_1 int8 activations (dp4a). Never valid for `AttnWo`.
     Q8_1,
@@ -2919,10 +2892,10 @@ pub fn route_census_record(label: &str, path: &'static str) {
 ///
 /// The family view aggregates, so `gdn_gate` can mask `gdn_ssm_out` and an
 /// expected-count violation is invisible. Defect-hunting has been the only
-/// productive mode in this campaign (int8 unreachable = +37%, ffn_down second
-/// site = +1.75%) while every ranked estimate missed, so this exists to make
-/// per-site cardinality checkable: each label should show ONE producer path and
-/// a count consistent with layers x tokens.
+/// Per-LABEL counts, for cardinality auditing. The family view aggregates,
+/// so one site can mask another and an expected-count violation stays
+/// invisible; each label should show ONE producer path and a count consistent
+/// with layers x tokens.
 pub fn route_census_by_label() -> Vec<(String, &'static str, usize)> {
     let mut out: Vec<(String, &'static str, usize)> = Vec::new();
     if let Ok(v) = ROUTE_CENSUS.lock() {
@@ -2990,9 +2963,9 @@ pub fn route_census_verify(plan: &Q4ActPlan) -> Result<String, String> {
             } else if !paths.iter().all(|p| {
                 // Every int8-ACTIVATION route, however the kernel is named.
                 // This classifier has now rejected a correctly-dispatched arm
-                // three times (Q4_SPLIT_Q8_1_LAUNCHED, then Q4_MMA_S4) because
-                // the name did not start with "Q8". The property that matters
-                // is the ACTIVATION type, not the kernel's label.
+                // twice (e.g. Q4_SPLIT_Q8_1_LAUNCHED) because the name did not
+                // start with "Q8". The property that matters is the ACTIVATION
+                // type a route consumes, not the kernel's label.
                 let is_int8 = p.starts_with("Q8")
                     || p.contains("Q8_1")
                     || p.contains("MMVQ")
@@ -3027,30 +3000,33 @@ pub fn route_census_verify(plan: &Q4ActPlan) -> Result<String, String> {
 /// Correctness-neutral by design (identical activation numerics); only the
 /// weight access pattern and work decomposition change.
 ///
-/// * `0`/unset — off (default), byte-identical to today.
-/// * `1` — smem-staged, NR=4, 256 threads. MEASURED 0.909x on 9B-Q4: half the
-///   block idles when nb (128 for in_dim 4096) is below blockDim, and staging
-///   x costs 48 KB on ffn_down, pinning it to one block per SM.
-/// * `2` — warp-per-row, 128 threads, NO shared staging, no xv[32] array.
-///   Every lane has work for any nb >= 32 and occupancy is register-bound.
-/// * `3` — single-variable control: identical to `1` except x is read from
-///   global instead of staged in shared. Attributes the `1` regression to
-///   staging (whose lane stride of 32 floats is the exact 32-bank period)
-///   or clears it, with nothing else moving.
-/// * `4` — lane-striped: 4 lanes cooperate per Q4 block, 8 activations per
-///   lane, warp-CONTIGUOUS weight loads (variants 1-3 all had a 16-byte lane
-///   stride). The F32-exact analogue of llama.cpp's mmvq decomposition.
+/// `LUMEN_CUDA_Q4_SPLIT_F32=1` — route Q4 decode matvecs through the
+/// lane-striped SoA kernel: 4 lanes cooperate per Q4 block, 8 activations per
+/// lane, warp-contiguous int loads. Correctness-neutral (F32 in, F32
+/// accumulate); only the weight access pattern and work decomposition change.
 pub fn q4_split_f32_variant() -> u8 {
+    if q4_split_f32_requested() {
+        4
+    } else {
+        0
+    }
+}
+
+/// Reads the env var once. This is the ONLY place that touches it — the two
+/// helpers above are derived from it, and must not be defined in terms of each
+/// other (an earlier refactor made `variant()` call `enabled()` and
+/// `enabled()` call `variant()`, which is unbounded recursion on every Q4
+/// decode dispatch; `cargo check` accepts it and the CPU test suite never
+/// exercises the CUDA path, so nothing catches it before the GPU does).
+fn q4_split_f32_requested() -> bool {
     use std::sync::OnceLock;
-    static V: OnceLock<u8> = OnceLock::new();
-    *V.get_or_init(|| match std::env::var("LUMEN_CUDA_Q4_SPLIT_F32").ok().as_deref() {
-        Some("1") | Some("true") | Some("yes") | Some("on") => 1,
-        Some("2") => 2,
-        Some("3") => 3,
-        Some("4") => 4,
-        Some("5") => 5,
-        Some("6") => 6,
-        _ => 0,
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_Q4_SPLIT_F32").ok().as_deref(),
+            Some("1") | Some("2") | Some("3") | Some("4") | Some("5") | Some("6")
+                | Some("true") | Some("yes") | Some("on")
+        )
     })
 }
 
@@ -3058,7 +3034,7 @@ pub fn q4_split_f32_variant() -> u8 {
 /// shortcuts, which must yield so they do not claim a projection before
 /// `launch_matvec_ext` is reached.
 pub fn q4_split_f32_enabled() -> bool {
-    q4_split_f32_variant() != 0
+    q4_split_f32_requested()
 }
 
 /// `LUMEN_DECODE_ABLATE` — VALIDATION-ONLY phase attribution.
@@ -3068,32 +3044,7 @@ pub fn q4_split_f32_enabled() -> bool {
 /// construction; the audited battery still performs exactly N decode calls, so
 /// the TIMING is exact. Never enable outside attribution runs.
 ///
-/// This exists because the campaign's founding premise — that the Q4
-/// projection matvecs dominate the token, justified by the identity
-/// 5.181 GB/token / 11.34 ms = 456 GB/s — was never measured across eight
-/// rounds of kernel work. Ablation answers the sharper question directly: if a
-/// phase were FREE, what would the cell run at? That is an UPPER bound on any
-/// kernel work targeting it, so a target above the ablation ceiling is
-/// unreachable by definition rather than by argument.
 ///
-/// Values: `ffn`, `gdn`, `attn`, or a comma-separated combination.
-pub fn decode_ablate(phase: &str) -> bool {
-    use std::sync::OnceLock;
-    static SET: OnceLock<Vec<String>> = OnceLock::new();
-    SET.get_or_init(|| {
-        std::env::var("LUMEN_DECODE_ABLATE")
-            .ok()
-            .map(|v| {
-                v.split(',')
-                    .map(|s| s.trim().to_ascii_lowercase())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
-    .iter()
-    .any(|p| p == phase)
-}
 
 /// `LUMEN_CUDA_GDN_T1_W4=1` — four-warp CTA grouping for the T=1 GDN
 /// recurrence. Read once; the dispatch site logs whether the guard actually
@@ -3137,19 +3088,6 @@ pub fn ffn_direct_residual() -> bool {
     })
 }
 
-/// `LUMEN_CUDA_GDN_COOP=1` — run the whole T=1 GDN post-projection chain in one
-/// cooperative launch. Deadlocks if the grid is not co-resident, so the caller
-/// gates on kernel availability, T=1, non-F64, and the fixed 256x128 geometry.
-pub fn gdn_coop_requested() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("LUMEN_CUDA_GDN_COOP").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
-}
 
 /// `LUMEN_CUDA_KQUANT_REQUANT_Q8=1` — land K-quant tensors as Q8_0 rather than
 /// expanding them to F32 at upload. Mixed-quant GGUFs put Q5_K/Q6_K on
@@ -3166,44 +3104,19 @@ pub fn kquant_requant_q8() -> bool {
     })
 }
 
-/// `LUMEN_CUDA_Q6K_NATIVE=1` — keep Q6_K tensors in their source format and
-/// consume them with `matvec_q6_k_f32`, matching llama.cpp's own byte count
-/// (0.8203 B/weight) instead of expanding to Q8_0 (1.0625) or F32 (4.0).
-pub fn q6k_native() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("LUMEN_CUDA_Q6K_NATIVE").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
-}
 
-/// `LUMEN_CUDA_Q4_MMA_S4=1` — run Q4xQ8_1 decode matvecs on the INT4 tensor
-/// cores. Exact (the Q8_1 activation is decomposed losslessly into two signed
-/// 4-bit halves plus a constant), so it is not a precision trade.
-pub fn q4_mma_s4() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("LUMEN_CUDA_Q4_MMA_S4").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
-}
 
-/// `LUMEN_DECODE_NOOP_LAUNCHES=N` — validation only. Inject N no-op launches
-/// per layer so the marginal cost of a launch can be read off the slope
-/// instead of extrapolated from one data point.
-pub fn decode_noop_launches() -> u32 {
-    use std::sync::OnceLock;
-    static N: OnceLock<u32> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("LUMEN_DECODE_NOOP_LAUNCHES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    })
+
+#[cfg(test)]
+mod q4_split_f32_recursion_guard {
+    /// Regression test for an unbounded-recursion refactor: `variant()` was
+    /// defined as `if enabled() {4} else {0}` while `enabled()` was
+    /// `variant() != 0`. Both compile; both stack-overflow on first call.
+    /// The CPU suite never touches the CUDA dispatch, so only a GPU run would
+    /// have found it. Calling each once is sufficient — recursion aborts.
+    #[test]
+    fn variant_and_enabled_terminate() {
+        let _ = super::q4_split_f32_variant();
+        let _ = super::q4_split_f32_enabled();
+    }
 }

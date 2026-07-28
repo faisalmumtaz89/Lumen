@@ -479,32 +479,6 @@ pub const MATVEC_Q8_SPLIT_Q8_1_MMVQ_KERNEL_SOURCE: &str =
 /// Requires SM 6.1+ (dp4a).
 pub const MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q4_split_q8_1.cu");
 
-/// F32-ACTIVATION sibling of the split/SoA Q4 matvec. Attacks the real 9B-Q4
-/// gap: Lumen achieves 456 GB/s where llama.cpp reaches 793 GB/s on the SAME
-/// weight bytes, because the default `matvec_q4_0_smem` gives each thread one
-/// 18-byte block (never 32B-aligned, so lanes never coalesce) and unpacks
-/// nibbles with sixteen single-BYTE loads. This reads the contiguous, 4-byte
-/// aligned split nibble stream as aligned ints and masks both halves in
-/// registers, while keeping EXACT F32 activation numerics.
-pub const MATVEC_Q4_SPLIT_F32_KERNEL_SOURCE: &str = include_str!("matvec_q4_split_f32.cu");
-/// Warp-per-row SoA variant: no shared staging, no xv[32] array. See the
-/// kernel header for why the smem/NR4 variant regressed to 0.909x.
-pub const MATVEC_Q4_SPLIT_F32_WR_KERNEL_SOURCE: &str =
-    include_str!("matvec_q4_split_f32_wr.cu");
-/// Single-variable control vs the smem variant: identical NR/geometry/dot,
-/// x read from global instead of staged. Attributes the 0.909x regression.
-pub const MATVEC_Q4_SPLIT_F32_GMEM_KERNEL_SOURCE: &str =
-    include_str!("matvec_q4_split_f32_gmem.cu");
-/// Lane-striped: 4 lanes cooperate per Q4 block, 8 activations per lane,
-/// warp-contiguous weight loads. The F32-exact analogue of mmvq.
-/// Validation-only no-op launch, for measuring marginal launch cost.
-pub const NOOP_PROBE_KERNEL_SOURCE: &str = include_str!("noop_probe.cu");
-/// Q4_0 x Q8_1 matvec on the INT4 tensor cores (mma.sync.m16n8k32.s4).
-pub const MATVEC_Q4_MMA_S4_KERNEL_SOURCE: &str = include_str!("matvec_q4_mma_s4.cu");
-/// Native Q6_K matvec, F32 activations — matches llama.cpp's byte count.
-pub const MATVEC_Q6_K_F32_KERNEL_SOURCE: &str = include_str!("matvec_q6_k_f32.cu");
-/// Cooperative single-launch T=1 GDN chain (conv/L2 + gates + state + norm-gate).
-pub const GDN_T1_COOP_KERNEL_SOURCE: &str = include_str!("gdn_t1_coop.cu");
 /// Fused T=1 attention prep: deinterleave + Q/K RMSNorm + NeoX RoPE.
 pub const ATTN_PREP_T1_KERNEL_SOURCE: &str = include_str!("attn_prep_t1.cu");
 pub const MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE: &str =

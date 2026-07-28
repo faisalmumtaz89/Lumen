@@ -45,12 +45,6 @@ pub enum GpuWeightBuf {
     /// Raw Q4_0 bytes on GPU (18 bytes per block of 32 elements).
     /// Dequantized on-the-fly by `matvec_q4_0`.
     Q4Raw(CudaSlice<u8>),
-    /// Raw Q6_K bytes on GPU (210 bytes per super-block of 256 elements =
-    /// 0.8203 B/weight). Consumed natively by `matvec_q6_k_f32`, which is what
-    /// llama.cpp does — Lumen previously dequantised these to F32 (4 B/w) or
-    /// Q8_0 (1.0625 B/w), paying 30% more bytes than the competitor on the
-    /// tensors a mixed-quant GGUF deliberately keeps at higher precision.
-    Q6KRaw(CudaSlice<u8>),
     /// Repacked Q4_0 with 20-byte aligned blocks (2B scale + 2B pad + 16B nibbles).
     /// Nibble data at offset +4 is 4-byte aligned, enabling native int* loads
     /// in the dp4a kernel (4 int loads vs 16 byte loads per block).
@@ -622,42 +616,6 @@ fn upload_tensor(
     slice: &lumen_format::index::TensorSlice,
 ) -> Result<GpuWeightBuf, RuntimeError> {
     let raw = weights.subtensor_bytes(slice)?;
-    // Round 41 found wq stored as F32 on 4 of 8 full-attention layers while
-    // wk/wv/wo are Q4Raw. F32 is 4 B/weight against Q4_0's 0.5625 — 7.1x the
-    // bytes on the largest attention matrix ([4096,8192] fused Q+gate), which
-    // is ~460 MB of extra traffic per token. K-quants dequantise to F32 here,
-    // so log the SOURCE scheme for attention tensors to identify the cause.
-    // FULL QUANT INVENTORY. The wq Q6_K finding came from logging ONE tensor
-    // name; any other K-quant tensor is expanding to F32 the same way and is
-    // the same free win. Aggregate by (name-shape, scheme) so the whole model
-    // is visible in a handful of lines rather than hundreds.
-    {
-        use std::collections::HashMap;
-        use std::sync::Mutex;
-        use std::sync::OnceLock;
-        static INV: OnceLock<Mutex<HashMap<(String, String), (usize, usize)>>> = OnceLock::new();
-        let inv = INV.get_or_init(|| Mutex::new(HashMap::new()));
-        // strip the layer index so blk.7.attn_q and blk.11.attn_q aggregate
-        let shape: String = name
-            .split('.')
-            .filter(|seg| !seg.chars().all(|c| c.is_ascii_digit()))
-            .collect::<Vec<_>>()
-            .join(".");
-        if let Ok(mut m) = inv.lock() {
-            let e = m.entry((shape, format!("{:?}", slice.quant))).or_insert((0, 0));
-            e.0 += 1;
-            e.1 += raw.len();
-            // Dump once the model is fully uploaded (call count is stable by then).
-            let total: usize = m.values().map(|(n, _)| *n).sum();
-            if total % 64 == 0 {
-                let mut rows: Vec<_> = m.iter().collect();
-                rows.sort_by_key(|((sh, q), _)| (sh.clone(), q.clone()));
-                for ((sh, q), (n, bytes)) in rows {
-                    eprintln!("[INVENTORY] {sh} quant={q} count={n} src_bytes={bytes}");
-                }
-            }
-        }
-    }
     match slice.quant {
         QuantScheme::F32 => {
             let f32_data = bytes_as_f32(raw)?;
@@ -890,19 +848,6 @@ fn upload_tensor(
             // is not the default.
             //
             // The coherence gate is binding either way.
-            // Native Q6_K takes precedence: it matches llama.cpp's own byte
-            // count (0.8203 B/w) instead of paying 1.0625 for Q8_0.
-            if matches!(other, QuantScheme::Q6_K)
-                && crate::runtime_defaults::q6k_native()
-                && n_elements % 256 == 0
-            {
-                eprintln!(
-                    "[CUDA] upload {name}: Q6_K NATIVE ({n_elements} elements, {} bytes)",
-                    raw.len()
-                );
-                let gpu_buf = device.htod_copy(raw)?;
-                return Ok(GpuWeightBuf::Q6KRaw(gpu_buf));
-            }
             if crate::runtime_defaults::kquant_requant_q8() {
                 let q8 = quantize_f32_to_q8_0_host(&f32_data);
                 eprintln!(
@@ -1338,7 +1283,6 @@ pub fn dequant_layer_q8_to_f16(
             // value in the base weight slot (currently sibling-only).
             GpuWeightBuf::Q8Split(q8) => (q8.len() / 34) * 32,
             GpuWeightBuf::Q4Split(q4) => (q4.len() / 18) * 32,
-            GpuWeightBuf::Q6KRaw(q6) => (q6.len() / 210) * 256,
         }
     };
 

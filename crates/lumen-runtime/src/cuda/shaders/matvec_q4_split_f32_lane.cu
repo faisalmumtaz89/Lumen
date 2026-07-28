@@ -2,17 +2,13 @@
 // Q4 split-layout matvec, F32 acts, LANE-STRIPED inner product (F32-exact
 // analogue of llama.cpp's mmvq decomposition).
 //
-// This is the last credible batch-1 kernel architecture for this cell. If it
-// does not clear 1.10x, kernel-only attainment of 168.6 tok/s is not a
-// supportable campaign plan and the formulation has to change.
+// WHY LANES COOPERATE PER BLOCK
 //
-// WHAT IS DIFFERENT FROM EVERY EARLIER VARIANT
-//
-// Variants 1/2/3 all give ONE THREAD A WHOLE Q4 BLOCK: 32 activations live per
-// thread, four packed ints read per thread, 16-byte lane stride on the weight
-// loads. llama's mmvq does the opposite — several lanes COOPERATE on one
-// block, so per-lane live state collapses and the weight loads become
-// warp-contiguous.
+// The straightforward decomposition gives ONE THREAD A WHOLE Q4 BLOCK: 32
+// activations live per thread, four packed ints read per thread, and a 16-byte
+// lane stride on the weight loads, so a warp's accesses are never contiguous.
+// Having several lanes cooperate on one block collapses per-lane live state and
+// makes the weight loads warp-contiguous instead.
 //
 // Here: FOUR LANES PER Q4 BLOCK.
 //
@@ -28,9 +24,9 @@
 //     float4 addresses are consecutive, so those loads coalesce too.
 //   * The block's four lane-partials are combined with two __shfl_xor steps
 //     (masks 1 and 2), then the group leader applies the block scale ONCE.
-//     No atomics, no second kernel, no split-K across CTAs — codex-sol ruled
-//     multi-CTA split-K out at these grids (1024-3072 CTAs is already 9-28
-//     waves over 108 SMs, so residency is not the constraint).
+//     No atomics, no second kernel, and no split-K across CTAs: at these
+//     grids (1024-3072 CTAs, i.e. 9-28 waves over 108 SMs) residency is not
+//     the constraint, so splitting K would add reduction traffic for nothing.
 //
 // ONE ROW PER CTA, 128 threads. All four warps work the same row, striding the
 // block axis by 32 blocks (8 blocks per warp per step). x is re-read by every
@@ -257,84 +253,6 @@ extern "C" __global__ void matvec_q4_split_f32_lane_residual(
 //
 // Grid:  (inter_dim, 1, 1)
 // Block: (128, 1, 1)
-// --------------------------------------------------------------------------
-__device__ __forceinline__ float lane_row_dot(
-    const unsigned char* __restrict__ rp,
-    const float* __restrict__ x,
-    unsigned int nb,
-    unsigned int warp_id,
-    unsigned int grp,
-    unsigned int w)
-{
-    const unsigned short* row_scales = (const unsigned short*)rp;
-    const unsigned char*  row_nibs   = rp + 2ULL * nb;
-    float sumf = 0.0f;
-    for (unsigned int ib = warp_id * BLKS_PER_WARP + grp;
-         ib < nb;
-         ib += NR_WARPS * BLKS_PER_WARP) {
-        const int packed = *(const int*)(row_nibs
-            + (unsigned long long)ib * Q4_NIBBLE_BYTES + (unsigned long long)w * 4ULL);
-        const int lo = packed & 0x0F0F0F0F;
-        const int hi = (packed >> 4) & 0x0F0F0F0F;
-        const float* xb = x + (unsigned long long)ib * Q4_BLOCK_ELEMS;
-        const float4 xl = *(const float4*)(xb + w * 4);
-        const float4 xh = *(const float4*)(xb + 16 + w * 4);
-        float part = 0.0f;
-        part += (float)(((lo      ) & 0xFF) - 8) * xl.x;
-        part += (float)(((lo >>  8) & 0xFF) - 8) * xl.y;
-        part += (float)(((lo >> 16) & 0xFF) - 8) * xl.z;
-        part += (float)(((lo >> 24) & 0xFF) - 8) * xl.w;
-        part += (float)(((hi      ) & 0xFF) - 8) * xh.x;
-        part += (float)(((hi >>  8) & 0xFF) - 8) * xh.y;
-        part += (float)(((hi >> 16) & 0xFF) - 8) * xh.z;
-        part += (float)(((hi >> 24) & 0xFF) - 8) * xh.w;
-        part += __shfl_xor_sync(0xffffffff, part, 1);
-        part += __shfl_xor_sync(0xffffffff, part, 2);
-        if (w == 0) {
-            sumf += f16_bits_to_f32_lane(row_scales[ib]) * part;
-        }
-    }
-    return warp_reduce_sum_lane(sumf);
-}
-
-extern "C" __global__ void matvec_q4_split_f32_lane_gateup(
-    const unsigned char* __restrict__ gate_split,
-    const unsigned char* __restrict__ up_split,
-    const float* __restrict__ x,
-    float* __restrict__ out,          // [inter_dim] = silu(gate) * up
-    unsigned int out_dim,
-    unsigned int in_dim)
-{
-    const unsigned int row = blockIdx.x;
-    if (row >= out_dim) return;
-
-    const unsigned int tid     = threadIdx.x;
-    const unsigned int warp_id = tid / WARP_SIZE;
-    const unsigned int lane    = tid % WARP_SIZE;
-    const unsigned int grp     = lane / LANES_PER_BLK;
-    const unsigned int w       = lane % LANES_PER_BLK;
-
-    const unsigned int nb = in_dim / Q4_BLOCK_ELEMS;
-    const unsigned long long row_bytes =
-        (unsigned long long)nb * (2ULL + (unsigned long long)Q4_NIBBLE_BYTES);
-    const unsigned long long off = (unsigned long long)row * row_bytes;
-
-    const float g = lane_row_dot(gate_split + off, x, nb, warp_id, grp, w);
-    const float u = lane_row_dot(up_split   + off, x, nb, warp_id, grp, w);
-
-    __shared__ float part_g[NR_WARPS];
-    __shared__ float part_u[NR_WARPS];
-    if (lane == 0) { part_g[warp_id] = g; part_u[warp_id] = u; }
-    __syncthreads();
-
-    if (tid == 0) {
-        float gs = 0.0f, us = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < NR_WARPS; i++) { gs += part_g[i]; us += part_u[i]; }
-        // SiLU(gate) * up, identical to the standalone SwiGLU kernel in F32.
-        out[row] = (gs / (1.0f + __expf(-gs))) * us;
-    }
-}
 
 // --------------------------------------------------------------------------
 // MULTI-ROW lane kernel: ROWS_PER_CTA output rows share one pass over x.
@@ -360,100 +278,15 @@ extern "C" __global__ void matvec_q4_split_f32_lane_gateup(
 //
 // Grid:  (ceil(out_dim / ROWS_PER_CTA), 1, 1)
 // Block: (128, 1, 1)
-// --------------------------------------------------------------------------
-#define ROWS_PER_CTA 4
-
-extern "C" __global__ void matvec_q4_split_f32_lane_r4(
-    const unsigned char* __restrict__ weight_split,
-    const float* __restrict__ x,
-    float* __restrict__ out,
-    unsigned int out_dim,
-    unsigned int in_dim)
-{
-    const unsigned int r0 = blockIdx.x * ROWS_PER_CTA;
-    if (r0 >= out_dim) return;
-
-    const unsigned int tid     = threadIdx.x;
-    const unsigned int warp_id = tid / WARP_SIZE;
-    const unsigned int lane    = tid % WARP_SIZE;
-    const unsigned int grp     = lane / LANES_PER_BLK;
-    const unsigned int w       = lane % LANES_PER_BLK;
-
-    const unsigned int nb = in_dim / Q4_BLOCK_ELEMS;
-    const unsigned long long row_bytes =
-        (unsigned long long)nb * (2ULL + (unsigned long long)Q4_NIBBLE_BYTES);
-
-    const unsigned int rows = (out_dim - r0 < ROWS_PER_CTA) ? (out_dim - r0) : ROWS_PER_CTA;
-
-    float sumf[ROWS_PER_CTA];
-    #pragma unroll
-    for (int r = 0; r < ROWS_PER_CTA; r++) sumf[r] = 0.0f;
-
-    for (unsigned int ib = warp_id * BLKS_PER_WARP + grp;
-         ib < nb;
-         ib += NR_WARPS * BLKS_PER_WARP) {
-
-        // x loaded ONCE for all ROWS_PER_CTA rows — this is the whole point.
-        const float* xb = x + (unsigned long long)ib * Q4_BLOCK_ELEMS;
-        const float4 xl = *(const float4*)(xb + w * 4);
-        const float4 xh = *(const float4*)(xb + 16 + w * 4);
-
-        #pragma unroll
-        for (int r = 0; r < ROWS_PER_CTA; r++) {
-            if (r >= (int)rows) break;
-            const unsigned char* rp =
-                weight_split + (unsigned long long)(r0 + r) * row_bytes;
-            const unsigned short* row_scales = (const unsigned short*)rp;
-            const unsigned char*  row_nibs   = rp + 2ULL * nb;
-
-            const int packed = *(const int*)(row_nibs
-                + (unsigned long long)ib * Q4_NIBBLE_BYTES + (unsigned long long)w * 4ULL);
-            const int lo = packed & 0x0F0F0F0F;
-            const int hi = (packed >> 4) & 0x0F0F0F0F;
-
-            float part = 0.0f;
-            part += (float)(((lo      ) & 0xFF) - 8) * xl.x;
-            part += (float)(((lo >>  8) & 0xFF) - 8) * xl.y;
-            part += (float)(((lo >> 16) & 0xFF) - 8) * xl.z;
-            part += (float)(((lo >> 24) & 0xFF) - 8) * xl.w;
-            part += (float)(((hi      ) & 0xFF) - 8) * xh.x;
-            part += (float)(((hi >>  8) & 0xFF) - 8) * xh.y;
-            part += (float)(((hi >> 16) & 0xFF) - 8) * xh.z;
-            part += (float)(((hi >> 24) & 0xFF) - 8) * xh.w;
-
-            part += __shfl_xor_sync(0xffffffff, part, 1);
-            part += __shfl_xor_sync(0xffffffff, part, 2);
-            if (w == 0) {
-                sumf[r] += f16_bits_to_f32_lane(row_scales[ib]) * part;
-            }
-        }
-    }
-
-    __shared__ float partials[ROWS_PER_CTA][NR_WARPS];
-    #pragma unroll
-    for (int r = 0; r < ROWS_PER_CTA; r++) {
-        float v = warp_reduce_sum_lane(sumf[r]);
-        if (lane == 0) partials[r][warp_id] = v;
-    }
-    __syncthreads();
-
-    if (tid < rows) {
-        float total = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < NR_WARPS; i++) total += partials[tid][i];
-        out[r0 + tid] = total;
-    }
-}
 
 
 // --------------------------------------------------------------------------
 // WIDE-LANE variant: TWO lanes per Q4 block, int2 weight loads.
 //
-// Round 21 killed the multi-row direction: R=4 measured 0.8985x because
-// cutting the grid 12288 -> 3072 CTAs starved memory-level parallelism, which
-// cost far more than the redundant activation reads it saved. So the FFN is
-// parallelism/latency-bound on WEIGHT loads, and the grid must not shrink.
-//
+// One row per CTA. Widening to multiple rows per CTA, or to fewer/wider loads,
+// both measured slower here: the grid must stay large enough to keep memory-level
+// parallelism up, which is the binding resource at batch 1.
+
 // This keeps ONE row per CTA (grid unchanged, parallelism unchanged) and
 // instead widens each load. With two lanes per block each lane reads an int2 —
 // 8 nibble bytes = 16 weights — so a 32-lane warp covers 16 blocks as 256
@@ -465,86 +298,3 @@ extern "C" __global__ void matvec_q4_split_f32_lane_r4(
 //
 // Numerics: same dequant, same F32 accumulation, and the intra-block reduction
 // is one __shfl_xor step instead of two because only two lanes cooperate.
-// --------------------------------------------------------------------------
-#define WIDE_LANES_PER_BLK 2
-#define WIDE_BLKS_PER_WARP (WARP_SIZE / WIDE_LANES_PER_BLK)   // 16
-
-__device__ __forceinline__ float wide_half_dot(int packed, const float4 xa, const float4 xb) {
-    const int lo = packed & 0x0F0F0F0F;
-    const int hi = (packed >> 4) & 0x0F0F0F0F;
-    float acc = 0.0f;
-    acc += (float)(((lo      ) & 0xFF) - 8) * xa.x;
-    acc += (float)(((lo >>  8) & 0xFF) - 8) * xa.y;
-    acc += (float)(((lo >> 16) & 0xFF) - 8) * xa.z;
-    acc += (float)(((lo >> 24) & 0xFF) - 8) * xa.w;
-    acc += (float)(((hi      ) & 0xFF) - 8) * xb.x;
-    acc += (float)(((hi >>  8) & 0xFF) - 8) * xb.y;
-    acc += (float)(((hi >> 16) & 0xFF) - 8) * xb.z;
-    acc += (float)(((hi >> 24) & 0xFF) - 8) * xb.w;
-    return acc;
-}
-
-extern "C" __global__ void matvec_q4_split_f32_lane_wide(
-    const unsigned char* __restrict__ weight_split,
-    const float* __restrict__ x,
-    float* __restrict__ out,
-    unsigned int out_dim,
-    unsigned int in_dim)
-{
-    const unsigned int row = blockIdx.x;
-    if (row >= out_dim) return;
-
-    const unsigned int tid     = threadIdx.x;
-    const unsigned int warp_id = tid / WARP_SIZE;
-    const unsigned int lane    = tid % WARP_SIZE;
-    const unsigned int grp     = lane / WIDE_LANES_PER_BLK;   // block within warp
-    const unsigned int w       = lane % WIDE_LANES_PER_BLK;   // 0 = ints 0-1, 1 = ints 2-3
-
-    const unsigned int nb = in_dim / Q4_BLOCK_ELEMS;
-    const unsigned long long row_bytes =
-        (unsigned long long)nb * (2ULL + (unsigned long long)Q4_NIBBLE_BYTES);
-    const unsigned char* rp = weight_split + (unsigned long long)row * row_bytes;
-    const unsigned short* row_scales = (const unsigned short*)rp;
-    const unsigned char*  row_nibs   = rp + 2ULL * nb;
-
-    float sumf = 0.0f;
-    for (unsigned int ib = warp_id * WIDE_BLKS_PER_WARP + grp;
-         ib < nb;
-         ib += NR_WARPS * WIDE_BLKS_PER_WARP) {
-
-        // int2 = 8 nibble bytes = 16 weights. Lanes 2g and 2g+1 read the two
-        // halves of one block, so a warp's 32 lanes span 16 blocks = 256
-        // contiguous bytes.
-        const int2 packed2 = *(const int2*)(row_nibs
-            + (unsigned long long)ib * Q4_NIBBLE_BYTES + (unsigned long long)w * 8ULL);
-
-        const float* xb = x + (unsigned long long)ib * Q4_BLOCK_ELEMS;
-        const unsigned int e0 = w * 8;   // this lane's first low-nibble element
-        const float4 xa0 = *(const float4*)(xb + e0);
-        const float4 xb0 = *(const float4*)(xb + 16 + e0);
-        const float4 xa1 = *(const float4*)(xb + e0 + 4);
-        const float4 xb1 = *(const float4*)(xb + 16 + e0 + 4);
-
-        float part = wide_half_dot(packed2.x, xa0, xb0)
-                   + wide_half_dot(packed2.y, xa1, xb1);
-
-        // Only two lanes cooperate, so one shuffle completes the block.
-        part += __shfl_xor_sync(0xffffffff, part, 1);
-        if (w == 0) {
-            sumf += f16_bits_to_f32_lane(row_scales[ib]) * part;
-        }
-    }
-
-    sumf = warp_reduce_sum_lane(sumf);
-
-    __shared__ float wide_partials[NR_WARPS];
-    if (lane == 0) wide_partials[warp_id] = sumf;
-    __syncthreads();
-
-    if (tid == 0) {
-        float total = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < NR_WARPS; i++) total += wide_partials[i];
-        out[row] = total;
-    }
-}

@@ -483,27 +483,8 @@ pub(crate) struct KernelSet {
 
     // Q4 split (SoA) matvec against pre-quantized Q8_1 input (dp4a, NR=4).
     pub(crate) matvec_q4_split_q8_1: Option<CudaFunction>,
-    /// F32-activation SoA matvec (`LUMEN_CUDA_Q4_SPLIT_F32=1`).
-    pub(crate) matvec_q4_split_f32: Option<CudaFunction>,
-    pub(crate) matvec_q4_split_f32_wr: Option<CudaFunction>,
-    pub(crate) matvec_q4_split_f32_gmem: Option<CudaFunction>,
     pub(crate) matvec_q4_split_f32_lane: Option<CudaFunction>,
     pub(crate) matvec_q4_split_f32_lane_residual: Option<CudaFunction>,
-    /// Fused gate+up+SiLU: three FFN dispatches per layer collapse to one.
-    pub(crate) matvec_q4_split_f32_lane_gateup: Option<CudaFunction>,
-    /// Multi-row lane kernel: 4 rows share one pass over x, cutting the
-    /// redundant L2 activation traffic 4x.
-    pub(crate) matvec_q4_split_f32_lane_r4: Option<CudaFunction>,
-    /// Wide-lane: 2 lanes per Q4 block, int2 loads, grid unchanged.
-    pub(crate) matvec_q4_split_f32_lane_wide: Option<CudaFunction>,
-    /// Validation-only no-op, for the launch-cost slope probe.
-    pub(crate) noop_probe: Option<CudaFunction>,
-    /// Q4xQ8_1 on INT4 tensor cores — A100 does 1248 INT4 TOPS vs 624 INT8.
-    pub(crate) matvec_q4_mma_s4: Option<CudaFunction>,
-    /// Native Q6_K matvec (0.8203 B/weight, llama.cpp parity).
-    pub(crate) matvec_q6_k_f32: Option<CudaFunction>,
-    /// Whole T=1 GDN post-projection chain in one cooperative launch.
-    pub(crate) gdn_t1_coop_all: Option<CudaFunction>,
     /// Four attention-prep launches collapsed into one at T=1.
     pub(crate) q35_attn_prep_t1: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_residual: Option<CudaFunction>,
@@ -1785,45 +1766,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        matvec_q4_split_f32: match load_fn(
-            shaders::MATVEC_Q4_SPLIT_F32_KERNEL_SOURCE,
-            "matvec_q4_split_f32",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_q4_split_f32: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_q4_split_f32: FAILED: {e}");
-                None
-            }
-        },
-        matvec_q4_split_f32_wr: match load_fn(
-            shaders::MATVEC_Q4_SPLIT_F32_WR_KERNEL_SOURCE,
-            "matvec_q4_split_f32_wr",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_q4_split_f32_wr: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_q4_split_f32_wr: FAILED: {e}");
-                None
-            }
-        },
-        matvec_q4_split_f32_gmem: match load_fn(
-            shaders::MATVEC_Q4_SPLIT_F32_GMEM_KERNEL_SOURCE,
-            "matvec_q4_split_f32_gmem",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_q4_split_f32_gmem: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_q4_split_f32_gmem: FAILED: {e}");
-                None
-            }
-        },
         matvec_q4_split_f32_lane: match load_fn(
             shaders::MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE,
             "matvec_q4_split_f32_lane",
@@ -1837,40 +1779,9 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        noop_probe: load_fn(shaders::NOOP_PROBE_KERNEL_SOURCE, "noop_probe").ok(),
-        matvec_q4_mma_s4: load_fn_sm80_fast_math(
-            shaders::MATVEC_Q4_MMA_S4_KERNEL_SOURCE,
-            "matvec_q4_mma_s4",
-        )
-        .inspect_err(|e| eprintln!("[CUDA] matvec_q4_mma_s4: NVRTC FAILED: {e}"))
-        .ok(),
-        matvec_q6_k_f32: load_fn(shaders::MATVEC_Q6_K_F32_KERNEL_SOURCE, "matvec_q6_k_f32")
-            .inspect_err(|e| eprintln!("[CUDA] matvec_q6_k_f32: NVRTC FAILED: {e}"))
-            .ok(),
-        gdn_t1_coop_all: load_fn(shaders::GDN_T1_COOP_KERNEL_SOURCE, "gdn_t1_coop_all")
-            .inspect_err(|e| eprintln!("[CUDA] gdn_t1_coop_all: NVRTC FAILED: {e}"))
-            .ok(),
         q35_attn_prep_t1: load_fn(shaders::ATTN_PREP_T1_KERNEL_SOURCE, "q35_attn_prep_t1")
             .inspect_err(|e| cuda_log!("[CUDA] q35_attn_prep_t1: FAILED: {e}"))
             .ok(),
-        matvec_q4_split_f32_lane_wide: load_fn(
-            shaders::MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE,
-            "matvec_q4_split_f32_lane_wide",
-        )
-        .inspect_err(|e| cuda_log!("[CUDA] matvec_q4_split_f32_lane_wide: FAILED: {e}"))
-        .ok(),
-        matvec_q4_split_f32_lane_r4: load_fn(
-            shaders::MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE,
-            "matvec_q4_split_f32_lane_r4",
-        )
-        .inspect_err(|e| cuda_log!("[CUDA] matvec_q4_split_f32_lane_r4: FAILED: {e}"))
-        .ok(),
-        matvec_q4_split_f32_lane_gateup: load_fn(
-            shaders::MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE,
-            "matvec_q4_split_f32_lane_gateup",
-        )
-        .inspect_err(|e| cuda_log!("[CUDA] matvec_q4_split_f32_lane_gateup: FAILED: {e}"))
-        .ok(),
         matvec_q4_split_f32_lane_residual: match load_fn(
             shaders::MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE,
             "matvec_q4_split_f32_lane_residual",

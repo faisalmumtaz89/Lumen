@@ -494,16 +494,7 @@ pub(crate) unsafe fn launch_gemm_projection(
         return Ok(());
     }
 
-    match weight {
-        // Native Q6_K is a DECODE lever; prefill keeps the
-        // dequant->F16->HGEMM path. Explicit error rather than a
-        // silent mis-dispatch.
-        GpuWeightBuf::Q6KRaw(_) => {
-            return Err(RuntimeError::Compute(
-                "Q6_K prefill matvec not implemented".to_string(),
-            ));
-        }
-        GpuWeightBuf::F32(w_f32) => {
+    match weight {        GpuWeightBuf::F32(w_f32) => {
             let weight_needed = out_dim * in_dim;
             if w_f32.len() < weight_needed {
                 return Err(RuntimeError::Compute(format!(
@@ -1050,16 +1041,7 @@ pub(crate) unsafe fn launch_gemm_residual(
         return Ok(());
     }
 
-    match weight {
-        // Native Q6_K is a DECODE lever; prefill keeps the
-        // dequant->F16->HGEMM path. Explicit error rather than a
-        // silent mis-dispatch.
-        GpuWeightBuf::Q6KRaw(_) => {
-            return Err(RuntimeError::Compute(
-                "Q6_K prefill matvec not implemented".to_string(),
-            ));
-        }
-        GpuWeightBuf::F32(w_f32) => {
+    match weight {        GpuWeightBuf::F32(w_f32) => {
             let weight_needed = out_dim * in_dim;
             if w_f32.len() < weight_needed {
                 return Err(RuntimeError::Compute(format!(
@@ -2342,16 +2324,7 @@ unsafe fn launch_matvec_slice(
     let out_dim_u32 = out_dim as u32;
     let in_dim_u32 = in_dim as u32;
 
-    match weight {
-        // Native Q6_K is a DECODE lever; prefill keeps the
-        // dequant->F16->HGEMM path. Explicit error rather than a
-        // silent mis-dispatch.
-        GpuWeightBuf::Q6KRaw(_) => {
-            return Err(RuntimeError::Compute(
-                "Q6_K prefill matvec not implemented".to_string(),
-            ));
-        }
-        GpuWeightBuf::F32(_) => unreachable!("F32 uses cuBLAS SGEMM path"),
+    match weight {        GpuWeightBuf::F32(_) => unreachable!("F32 uses cuBLAS SGEMM path"),
         GpuWeightBuf::F16Raw(w_f16) => {
             device
                 .stream
@@ -2965,16 +2938,7 @@ unsafe fn launch_matvec_residual_slice(
     let out_dim_u32 = out_dim as u32;
     let in_dim_u32 = in_dim as u32;
 
-    match weight {
-        // Native Q6_K is a DECODE lever; prefill keeps the
-        // dequant->F16->HGEMM path. Explicit error rather than a
-        // silent mis-dispatch.
-        GpuWeightBuf::Q6KRaw(_) => {
-            return Err(RuntimeError::Compute(
-                "Q6_K prefill matvec not implemented".to_string(),
-            ));
-        }
-        GpuWeightBuf::F32(_) => unreachable!("F32 uses cuBLAS SGEMM path"),
+    match weight {        GpuWeightBuf::F32(_) => unreachable!("F32 uses cuBLAS SGEMM path"),
         GpuWeightBuf::Q8Aligned(w_q8a) => {
             // Q8_0 aligned residual prefill: dp4a with native int* loads.
             use super::decode::{matvec_q8_0_grid, Q8_0_BLOCK_DIM};
