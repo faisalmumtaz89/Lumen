@@ -2654,6 +2654,14 @@ impl Q4ActPlan {
     pub fn for_model(narrow_gdn: bool, dense: bool) -> Self {
         let mut modes = [(Q4ProjectionFamily::AttnQkv, Q4ActMode::F32); 6];
         for (i, f) in Q4ProjectionFamily::ALL.iter().enumerate() {
+            // Quality-oracle build: the exact-path control arm. See the
+            // `quality-oracle` feature in Cargo.toml — compile-time only.
+            #[cfg(feature = "quality-oracle")]
+            let mode = {
+                let _ = (narrow_gdn, dense);
+                Q4ActMode::F32
+            };
+            #[cfg(not(feature = "quality-oracle"))]
             let mode = match (narrow_gdn, dense) {
                 // Dense narrow-GDN (9B-Q4): only `wo` needs F32.
                 (true, true) if *f == Q4ProjectionFamily::AttnWo => Q4ActMode::F32,
@@ -2666,8 +2674,16 @@ impl Q4ActPlan {
             };
             modes[i] = (*f, mode);
         }
+        // The oracle build must announce itself. Evidence collected from a
+        // control arm that was silently mislabelled as the candidate would be
+        // worse than no evidence.
+        let build = if cfg!(feature = "quality-oracle") {
+            "QUALITY-ORACLE BUILD (all-F32 control, not a shipping config) "
+        } else {
+            ""
+        };
         let manifest = format!(
-            "q4_act_plan narrow_gdn={narrow_gdn} dense={dense}: {}",
+            "{build}q4_act_plan narrow_gdn={narrow_gdn} dense={dense}: {}",
             modes
                 .iter()
                 .map(|(f, m)| format!("{}={:?}", f.zone_name(), m))
@@ -2719,6 +2735,8 @@ mod q4_act_plan_tests {
     /// The dense narrow-GDN class (9B-Q4) pins ONLY `wo`. This is the change
     /// the campaign earned: the previous whole-model pin cost the other five
     /// families their int8 path.
+    // Describes the SHIPPING policy; the oracle build deliberately overrides it.
+    #[cfg(not(feature = "quality-oracle"))]
     #[test]
     fn dense_narrow_gdn_pins_only_wo() {
         let p = Q4ActPlan::for_model(true, true);
@@ -2735,6 +2753,8 @@ mod q4_act_plan_tests {
     /// five-family plan, and no MoE quality campaign has been run. If this
     /// test is ever "fixed" to match the dense case, the campaign has to come
     /// first.
+    // Describes the SHIPPING policy; the oracle build deliberately overrides it.
+    #[cfg(not(feature = "quality-oracle"))]
     #[test]
     fn moe_narrow_gdn_keeps_the_whole_model_pin_except_ffn_down() {
         let p = Q4ActPlan::for_model(true, false);
@@ -2750,6 +2770,8 @@ mod q4_act_plan_tests {
     /// down sibling, including the models otherwise pinned to F32. The plan
     /// records that rather than changing it. This is worth ~12% of decode and
     /// was silently lost once by "fixing" the plan to say F32 instead.
+    // Describes the SHIPPING policy; the oracle build deliberately overrides it.
+    #[cfg(not(feature = "quality-oracle"))]
     #[test]
     fn ffn_down_is_int8_on_every_class() {
         for (narrow, dense) in [(true, true), (true, false), (false, true), (false, false)] {
@@ -2763,6 +2785,8 @@ mod q4_act_plan_tests {
 
     /// Wide-GDN (27B) and non-GDN models are certified on int8 and must be
     /// left exactly as shipped.
+    // Describes the SHIPPING policy; the oracle build deliberately overrides it.
+    #[cfg(not(feature = "quality-oracle"))]
     #[test]
     fn wide_gdn_and_non_gdn_are_unchanged_int8() {
         for dense in [true, false] {
@@ -2777,6 +2801,28 @@ mod q4_act_plan_tests {
     fn unmapped_label_falls_to_the_exact_path() {
         let p = Q4ActPlan::for_model(true, true);
         assert_eq!(p.mode_for_label("nonsense"), Q4ActMode::F32);
+    }
+
+    /// The oracle feature must actually reach every family. A control arm that
+    /// quietly matched the candidate on some family would make a paired
+    /// comparison look clean for the wrong reason.
+    #[cfg(feature = "quality-oracle")]
+    #[test]
+    fn oracle_build_is_all_f32_and_says_so() {
+        for (narrow, dense) in [(true, true), (true, false), (false, true)] {
+            let p = Q4ActPlan::for_model(narrow, dense);
+            for f in Q4ProjectionFamily::ALL {
+                assert_eq!(p.mode_for(f), Q4ActMode::F32, "{f:?}");
+            }
+            assert!(p.manifest.contains("QUALITY-ORACLE"), "{}", p.manifest);
+        }
+    }
+
+    /// Guards the inverse: a shipping build must never claim to be the oracle.
+    #[cfg(not(feature = "quality-oracle"))]
+    #[test]
+    fn shipping_build_is_not_labelled_oracle() {
+        assert!(!Q4ActPlan::for_model(true, true).manifest.contains("ORACLE"));
     }
 
     #[test]

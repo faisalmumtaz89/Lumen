@@ -13,3 +13,13 @@
 {"id": "short-conv-02", "gate": "GQ-001", "prompt": "How many minutes are in 3 hours?", "is_math": true, "answers": ["180"], "max_tokens": 256}
 {"id": "short-def-01", "gate": "GQ-001", "prompt": "Define the word 'photosynthesis' in one sentence.", "is_math": false, "answers": ["light", "energy", "sunlight"], "max_tokens": 160}
 {"id": "short-reason-01", "gate": "GQ-001", "prompt": "If a train travels 60 km in 30 minutes, what is its speed in km/h?", "is_math": true, "answers": ["120"], "max_tokens": 512}
+{"id": "short-arith-07", "gate": "GQ-001", "prompt": "What is 45 multiplied by 12? Give only the number.", "is_math": true, "answers": ["540"], "max_tokens": 384}
+{"id": "short-arith-08", "gate": "GQ-001", "prompt": "Compute 2 to the power of 10. Give only the number.", "is_math": true, "answers": ["1024"], "max_tokens": 384}
+{"id": "short-arith-09", "gate": "GQ-001", "prompt": "What is 15% of 200? Give only the number.", "is_math": true, "answers": ["30"], "max_tokens": 384}
+{"id": "short-arith-10", "gate": "GQ-001", "prompt": "Compute 987 minus 654. Give only the number.", "is_math": true, "answers": ["333"], "max_tokens": 384}
+{"id": "short-arith-11", "gate": "GQ-001", "prompt": "What is the sum of the first 10 positive integers? Give only the number.", "is_math": true, "answers": ["55"], "max_tokens": 384}
+{"id": "short-fact-06", "gate": "GQ-001", "prompt": "What is the largest ocean on Earth? Answer in two words.", "is_math": false, "answers": ["Pacific"], "max_tokens": 384}
+{"id": "short-fact-07", "gate": "GQ-001", "prompt": "How many sides does a hexagon have? Give only the number.", "is_math": false, "answers": ["6", "six"], "max_tokens": 384}
+{"id": "short-fact-08", "gate": "GQ-001", "prompt": "What is the chemical formula for water? Give only the formula.", "is_math": false, "answers": ["H2O", "H\u2082O"], "max_tokens": 384}
+{"id": "short-conv-03", "gate": "GQ-001", "prompt": "How many grams are in 2.5 kilograms? Give only the number.", "is_math": true, "answers": ["2500", "2,500"], "max_tokens": 384}
+{"id": "short-reason-02", "gate": "GQ-001", "prompt": "A shop sells pens at 3 for $6. How much do 7 pens cost? Give only the amount.", "is_math": true, "answers": ["14"], "max_tokens": 384}

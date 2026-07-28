@@ -20,6 +20,17 @@ cuda = ["dep:cudarc"]
 # feature have zero overhead from the inject path.
 test-fault-injection = []
 
+# Quality-oracle build: forces EVERY Q4 projection family onto F32 activations,
+# overriding the topology-derived plan. This is the reference arm the shipped
+# activation policy is measured against — a paired quality comparison needs an
+# exact-path control built from the SAME source revision, so that any
+# difference is attributable to activation precision and nothing else.
+#
+# Compile-time only, and deliberately so: there is no runtime switch for it,
+# it is never enabled in a release build, and it cannot be reached by setting
+# an environment variable on a shipped binary.
+quality-oracle = []
+
 [dependencies]
 lumen-format.workspace = true
 thiserror.workspace = true
