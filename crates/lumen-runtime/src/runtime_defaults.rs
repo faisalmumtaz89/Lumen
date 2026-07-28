@@ -2643,6 +2643,16 @@ impl Q4ActPlan {
     /// assuming the 9B result transfers is exactly the inference this policy
     /// exists to avoid.
     ///
+    /// On the `narrow_gdn` input: `gdn_dims()` falls back to the Qwen3.5-9B
+    /// shape (v-heads 32) when `hp.gdn` is `None`, which is the case for older
+    /// v3 LBC files. A v3 file of a WIDE-GDN model therefore classifies as
+    /// narrow and takes the `wo`-pinned policy. That direction is deliberate:
+    /// it costs `wo` its int8 path on such a file, which is slower but never
+    /// wrong, whereas classifying an unknown model as wide would put a
+    /// possibly-fragile `wo` on int8. The previous whole-model boolean used
+    /// the identical predicate and pinned all six families there, so this is
+    /// strictly less conservative than what shipped.
+    ///
     /// `ffn_down` is Q8_1 there because that is what the code has always done:
     /// the split shortcut quantizes the down projection's input to Q8_1 before
     /// `launch_matvec` is ever reached, on every model with a down sibling.
@@ -2661,7 +2671,20 @@ impl Q4ActPlan {
                 let _ = (narrow_gdn, dense);
                 Q4ActMode::F32
             };
-            #[cfg(not(feature = "quality-oracle"))]
+            // Diagnostic build: put exactly the named families on int8 so each
+            // one's quality contribution can be measured separately. See the
+            // `activation-probe` feature — compile-time only.
+            #[cfg(all(feature = "activation-probe", not(feature = "quality-oracle")))]
+            let mode = {
+                let _ = (narrow_gdn, dense);
+                let want = std::env::var("LUMEN_Q4_ACT_PROBE").unwrap_or_default();
+                let named = want
+                    .split(',')
+                    .map(|t| t.trim().to_ascii_lowercase())
+                    .any(|t| t == f.zone_name() || t == "all");
+                if named { Q4ActMode::Q8_1 } else { Q4ActMode::F32 }
+            };
+            #[cfg(not(any(feature = "quality-oracle", feature = "activation-probe")))]
             let mode = match (narrow_gdn, dense) {
                 // Dense narrow-GDN (9B-Q4): only `wo` needs F32.
                 (true, true) if *f == Q4ProjectionFamily::AttnWo => Q4ActMode::F32,

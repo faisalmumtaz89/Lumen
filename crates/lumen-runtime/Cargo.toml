@@ -31,6 +31,13 @@ test-fault-injection = []
 # an environment variable on a shipped binary.
 quality-oracle = []
 
+# Diagnostic build for locating WHICH projection families tolerate int8
+# activations. Reads `LUMEN_Q4_ACT_PROBE` (comma-separated family names) and
+# puts exactly those on Q8_1 with every other family on F32, ignoring the
+# shipped policy. Compile-time gated for the same reason as `quality-oracle`:
+# a shipped binary must have no way to reach it.
+activation-probe = []
+
 [dependencies]
 lumen-format.workspace = true
 thiserror.workspace = true

@@ -16,6 +16,11 @@ cuda = ["lumen-runtime/cuda"]
 # (empty) feature surface so the dep graph stays minimal.
 bin = ["dep:lumen-cli", "dep:lumen-convert", "dep:mimalloc"]
 
+# Forwards lumen-runtime's compile-time all-F32 quality oracle so the model
+# quality suite, which drives a server rather than the CLI, can build its
+# control arm from this same revision. Never enabled in a release build.
+quality-oracle = ["lumen-runtime/quality-oracle"]
+
 # Standalone server binary; gated on the `bin` feature.
 # Gated on the `bin` feature so embedders that don't want the lumen-cli
 # tokenizer pull keep their dep graph clean.
