@@ -331,9 +331,6 @@ pub(crate) struct KernelSet {
     pub(crate) gdn_compute_gates_batched: Option<CudaFunction>,
     pub(crate) l2_normalize_qk_strided: Option<CudaFunction>,
     pub(crate) gdn_prefill_fused_v3: Option<CudaFunction>,
-    /// T=1 four-warp CTA grouping of the above. Bit-identical arithmetic;
-    /// 1024 CTAs/layer instead of 4096 single-warp CTAs.
-    pub(crate) gdn_prefill_fused_v3_t1_w4: Option<CudaFunction>,
     /// conv1d+SiLU+L2norm(Q,K) fused into one launch at T=1.
     pub(crate) ssm_conv1d_silu_l2norm_t1: Option<CudaFunction>,
     pub(crate) gdn_prefill_norm_gate: Option<CudaFunction>,
@@ -485,8 +482,6 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q4_split_q8_1: Option<CudaFunction>,
     pub(crate) matvec_q4_split_f32_lane: Option<CudaFunction>,
     pub(crate) matvec_q4_split_f32_lane_residual: Option<CudaFunction>,
-    /// Four attention-prep launches collapsed into one at T=1.
-    pub(crate) q35_attn_prep_t1: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_residual: Option<CudaFunction>,
 
     // Codegen-LOCKED Q4 split matvec (same SoA layout + integer dot as
@@ -1288,11 +1283,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         l2_normalize_qk_strided: load_fn(shaders::GDN_KERNEL_SOURCE, "l2_normalize_qk_strided")
             .ok(),
         gdn_prefill_fused_v3: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_fused_v3").ok(),
-        gdn_prefill_fused_v3_t1_w4: load_fn(
-            shaders::GDN_KERNEL_SOURCE,
-            "gdn_prefill_fused_v3_t1_w4",
-        )
-        .ok(),
         ssm_conv1d_silu_l2norm_t1: load_fn(
             shaders::GDN_KERNEL_SOURCE,
             "ssm_conv1d_silu_l2norm_t1",
@@ -1779,9 +1769,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        q35_attn_prep_t1: load_fn(shaders::ATTN_PREP_T1_KERNEL_SOURCE, "q35_attn_prep_t1")
-            .inspect_err(|e| cuda_log!("[CUDA] q35_attn_prep_t1: FAILED: {e}"))
-            .ok(),
         matvec_q4_split_f32_lane_residual: match load_fn(
             shaders::MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE,
             "matvec_q4_split_f32_lane_residual",

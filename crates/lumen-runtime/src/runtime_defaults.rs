@@ -1228,9 +1228,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_GDN_T1_W4",
     "LUMEN_CUDA_LANE_FUSED_GLU",
     "LUMEN_CUDA_GDN_FUSED_CONV",
-    "LUMEN_CUDA_ATTN_PREP_FUSED",
     "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
-    "LUMEN_CUDA_KQUANT_REQUANT_Q8",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
     "LUMEN_CUDA_Q4_MMVQ",
@@ -2455,9 +2453,7 @@ mod tests {
     "LUMEN_CUDA_GDN_T1_W4",
     "LUMEN_CUDA_LANE_FUSED_GLU",
     "LUMEN_CUDA_GDN_FUSED_CONV",
-    "LUMEN_CUDA_ATTN_PREP_FUSED",
     "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
-    "LUMEN_CUDA_KQUANT_REQUANT_Q8",
         "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q4_MMVQ",
         "LUMEN_CUDA_Q8_MMVQ",
@@ -3060,19 +3056,6 @@ pub fn gdn_t1_w4_requested() -> bool {
     })
 }
 
-/// `LUMEN_CUDA_ATTN_PREP_FUSED=1` — deinterleave + Q/K RMSNorm + NeoX RoPE in
-/// one launch at T=1. Read once; the dispatch site logs whether the guard
-/// actually admitted it.
-pub fn attn_prep_fused_requested() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("LUMEN_CUDA_ATTN_PREP_FUSED").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
-}
 
 /// `LUMEN_CUDA_FFN_DIRECT_RESIDUAL=1` — fold the FFN residual into the down
 /// projection's own store and write `x_gpu` directly, removing both the
@@ -3089,20 +3072,6 @@ pub fn ffn_direct_residual() -> bool {
 }
 
 
-/// `LUMEN_CUDA_KQUANT_REQUANT_Q8=1` — land K-quant tensors as Q8_0 rather than
-/// expanding them to F32 at upload. Mixed-quant GGUFs put Q5_K/Q6_K on
-/// sensitive tensors, and with no K-quant matvec Lumen pays 4 B/weight where
-/// llama.cpp pays 0.66 natively on the same file.
-pub fn kquant_requant_q8() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("LUMEN_CUDA_KQUANT_REQUANT_Q8").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
-}
 
 
 

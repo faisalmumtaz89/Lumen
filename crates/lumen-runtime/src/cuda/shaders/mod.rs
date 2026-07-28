@@ -479,8 +479,6 @@ pub const MATVEC_Q8_SPLIT_Q8_1_MMVQ_KERNEL_SOURCE: &str =
 /// Requires SM 6.1+ (dp4a).
 pub const MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q4_split_q8_1.cu");
 
-/// Fused T=1 attention prep: deinterleave + Q/K RMSNorm + NeoX RoPE.
-pub const ATTN_PREP_T1_KERNEL_SOURCE: &str = include_str!("attn_prep_t1.cu");
 pub const MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE: &str =
     include_str!("matvec_q4_split_f32_lane.cu");
 

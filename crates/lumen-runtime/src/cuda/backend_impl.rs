@@ -800,10 +800,6 @@ struct GdnScratchGpu {
     alpha_raw_buf: CudaSlice<f32>,
     /// Raw beta projection output (pre-gate transform): [num_heads] f32.
     beta_raw_buf: CudaSlice<f32>,
-    /// Grid-barrier scratch for the cooperative T=1 GDN megakernel: two u32s,
-    /// [0] = arrival counter, [1] = generation. Persistent so the barrier is
-    /// not reallocated per layer; the generation counter is free to wrap.
-    coop_barrier: CudaSlice<u32>,
     /// GDN state-update output: [value_dim] f32.
     output_buf: CudaSlice<f32>,
     /// RMSNorm + scale on output: [value_dim] f32.
@@ -863,7 +859,7 @@ struct MutableState {
     /// Set by the FFN when the down projection folded its residual into its own
     /// store and wrote `x_gpu` directly, so the decode loop skips BOTH the
     /// `residual_add` launch and the layer-commit dtod copy. Cleared per layer.
-    ffn_wrote_x_gpu: bool,
+
     /// GDN scratch (lazy-allocated on first GDN layer, persists for sequence lifetime).
     gdn_scratch_gpu: Option<GdnScratchGpu>,
     /// Pre-allocated cuBLAS workspace for CUDA graph capture compatibility.
@@ -1098,11 +1094,6 @@ fn cuda_decode_delay_us() -> u64 {
     })
 }
 
-/// Historical floor for a split-clone VRAM budget: 5.1 GB. The free-memory-aware
-/// default never resolves below this so that a small / heavily-loaded GPU keeps
-/// the exact pre-lever clone set (Q4_0 Qwen3.5-9B is ~5 GB total, fully cloned
-/// under this floor), preserving byte-identical decode there.
-const SPLIT_CLONE_MIN_BUDGET_BYTES: usize = 5_100_000_000;
 
 /// Bytes held back from the free-memory-aware split-clone budget for per-token
 /// activations and transient scratch that live *beyond* weights + KV cache.
@@ -1158,6 +1149,21 @@ struct ResolvedSplitBudget {
 /// bound — the config does not expose a full-attn-only layer count here. The
 /// effective `max_seq_len` replicates `init()`'s `LUMEN_CUDA_MAX_SEQ_LEN` cap so the
 /// reserve tracks the cache that will actually be allocated.
+/// Where a layer left the updated hidden state.
+///
+/// The FFN down projection can fold its residual and write `x_gpu` directly,
+/// which makes the decode loop's commit copy redundant. Returning that fact is
+/// preferable to a sticky flag on `MutableState`: the two `ffn_down` dispatch
+/// sites and the two decode paths would otherwise each have to agree on
+/// setting and clearing it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayerOutput {
+    /// Result is in `scratch.attn_proj`; the caller must commit it.
+    NeedsCommit,
+    /// Result is already in `scratch.x_gpu`.
+    InPlace,
+}
+
 fn resolve_split_clone_budget(
     env_var: &str,
     device: &CudaDevice,
@@ -1203,12 +1209,17 @@ fn resolve_split_clone_budget(
         };
     }
 
-    // Free-memory-aware default: reserve KV + activation slack from free VRAM, never
-    // dropping below the 5.1 GB historical floor.
+    // Free-memory-aware default: reserve KV + activation slack from free VRAM.
+    //
+    // No lower clamp: raising the budget back up to a fixed floor would hand
+    // back memory the two `saturating_sub` calls just reserved for the KV cache
+    // and activations, which is the opposite of what they are for. On a device
+    // with less free VRAM than a clone needs the budget is simply small (or
+    // zero) and each `cudaMalloc` fails safe, leaving that layer on its base
+    // path.
     let budget_bytes = free_mem_bytes
         .saturating_sub(kv_reserve_bytes)
-        .saturating_sub(SPLIT_CLONE_ACTIVATION_SLACK_BYTES)
-        .max(SPLIT_CLONE_MIN_BUDGET_BYTES);
+        .saturating_sub(SPLIT_CLONE_ACTIVATION_SLACK_BYTES);
 
     ResolvedSplitBudget {
         budget_bytes,
@@ -2098,7 +2109,7 @@ impl CudaBackend {
         layer_idx: usize,
         seq_pos: usize,
         st: &mut MutableState,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<LayerOutput, RuntimeError> {
         let hp = self.hp()?;
         let hidden_dim = hp.hidden_dim as usize;
         let num_heads = hp.num_heads as usize;
@@ -2729,68 +2740,7 @@ impl CudaBackend {
             // Q+gate fusion post-processing: deinterleave q_gate -> q + gate_buf,
             // then per-head RMSNorm on Q (attn_q_norm) and K (attn_k_norm).
             // Must run AFTER all QKV projection branches and BEFORE RoPE.
-            // LUMEN_CUDA_ATTN_PREP_FUSED=1: deinterleave + Q/K RMSNorm + NeoX
-            // RoPE in ONE launch instead of four.
-            //
-            // The full-attention block costs 172 us/layer while holding only
-            // 5% of the model's bytes, and after the projections each layer
-            // issues NINE commands. At the measured ~4.2 us marginal launch
-            // cost that is ~38 us/layer of pure overhead. These four ops
-            // needed separate launches only because each depends on the whole
-            // head vector (RMSNorm reduces over it; NeoX RoPE pairs d with
-            // d + rot/2) — one CTA per head makes both dependencies intra-CTA.
-            let attn_prep_fused = has_qgate_fusion
-                && st.kernels.q35_attn_prep_t1.is_some()
-                && lw.attn_q_norm.is_some()
-                && lw.attn_k_norm.is_some()
-                && hp.rope_neox
-                && head_dim <= 1024
-                && crate::runtime_defaults::attn_prep_fused_requested();
-            if crate::runtime_defaults::attn_prep_fused_requested() {
-                use std::sync::atomic::{AtomicBool, Ordering as O};
-                static SHOWN: AtomicBool = AtomicBool::new(false);
-                if !SHOWN.swap(true, O::Relaxed) {
-                                    }
-            }
-            if attn_prep_fused {
-                let f = st.kernels.q35_attn_prep_t1.as_ref().unwrap();
-                let q_gate_buf = st.scratch.q_gate.as_ref().unwrap();
-                let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
-                let hd = head_dim as u32;
-                let nq = num_heads as u32;
-                let nkv = num_kv_heads as u32;
-                let pos_u32 = seq_pos as u32;
-                let launch_cfg = CudarcLaunchConfig {
-                    grid_dim: (nq + nkv, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: hd * 4,
-                };
-                let qn = lw.attn_q_norm.as_ref().unwrap();
-                let kn = lw.attn_k_norm.as_ref().unwrap();
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(f)
-                        .arg(q_gate_buf)
-                        .arg(&mut st.scratch.q)
-                        .arg(st.scratch.gate_buf.as_mut().unwrap())
-                        .arg(&mut st.scratch.k)
-                        .arg(qn)
-                        .arg(kn)
-                        .arg(&eps)
-                        .arg(&nq)
-                        .arg(&nkv)
-                        .arg(&hd)
-                        .arg(&pos_u32)
-                        .arg(&theta)
-                        .arg(&rotary_dim)
-                        .launch(launch_cfg)
-                }
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("q35_attn_prep_t1 L{layer_idx}: {e}"))
-                })?;
-                crate::runtime_defaults::route_census_record("attn_prep", "FUSED_T1");
-            } else if has_qgate_fusion {
+            if has_qgate_fusion {
                 let q_gate_buf = st.scratch.q_gate.as_ref().unwrap();
                 let gate_buf = st.scratch.gate_buf.as_mut().unwrap();
 
@@ -2961,8 +2911,8 @@ impl CudaBackend {
                 }
             }
 
-            // 2. RoPE. SKIPPED when the fused prep kernel already applied it.
-            if !attn_prep_fused {
+            // 2. RoPE.
+            {
                 let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
                 let actual_rot = if rotary_dim > 0 && rotary_dim < head_dim as u32 {
                     rotary_dim as usize
@@ -3425,8 +3375,9 @@ impl CudaBackend {
                 eprintln!("[XCHK] step={step} L={layer_idx} moe_expert_ids={ids:?} gate_w={ws:?}");
             }
 
-            // MoE branch is complete; skip the dense FFN block below.
-            return Ok(());
+            // MoE branch is complete; skip the dense FFN block below. MoE
+            // leaves its result in attn_proj, so the caller still commits.
+            return Ok(LayerOutput::NeedsCommit);
         }
 
         // 6. FFN: fused or separate rmsnorm + gate/up + swiglu + down + residual.
@@ -4432,7 +4383,11 @@ impl CudaBackend {
                 // ffn_down reported 0 F16 calls under the route census.
                 let down_mode = crate::runtime_defaults::q4_act_plan()
                     .mode_for(crate::runtime_defaults::Q4ProjectionFamily::FfnDown);
-                let down_explicit_non_q8 = down_mode == crate::runtime_defaults::Q4ActMode::F16
+                // The shortcut may only claim this projection when the plan
+                // actually asks for Q8_1. Testing `== F16` let an F32 request
+                // fall through to the int8 path, so the plan's stated mode did
+                // not describe real behaviour.
+                let down_explicit_non_q8 = down_mode != crate::runtime_defaults::Q4ActMode::Q8_1
                     || crate::runtime_defaults::q4_split_f32_enabled();
                 let use_split_down = !down_explicit_non_q8
                     && ((st.kernels.use_q8_split_dispatch && lw.q8_split_w_down.is_some())
@@ -4473,7 +4428,7 @@ impl CudaBackend {
                                     inter_dim,
                                     "down",
                                 )?;
-                                st.ffn_wrote_x_gpu = true;
+                                return Ok(LayerOutput::InPlace);
                             } else {
                             launch_matvec_preq8_1_split(
                                 &self.device,
@@ -4744,7 +4699,7 @@ impl CudaBackend {
             // at 0 F16 calls after only the first one was guarded.
             let down_mode2 = crate::runtime_defaults::q4_act_plan()
                 .mode_for(crate::runtime_defaults::Q4ProjectionFamily::FfnDown);
-            let use_split_down = down_mode2 != crate::runtime_defaults::Q4ActMode::F16
+            let use_split_down = down_mode2 == crate::runtime_defaults::Q4ActMode::Q8_1
                 && !crate::runtime_defaults::q4_split_f32_enabled()
                 && ((st.kernels.use_q8_split_dispatch && lw.q8_split_w_down.is_some())
                     || (st.kernels.use_q4_split_dispatch && lw.q4_split_w_down.is_some()));
@@ -4780,7 +4735,7 @@ impl CudaBackend {
                                 inter_dim,
                                 "down",
                             )?;
-                            st.ffn_wrote_x_gpu = true;
+                            return Ok(LayerOutput::InPlace);
                         } else {
                         launch_matvec_preq8_1_split(
                             &self.device,
@@ -4840,7 +4795,7 @@ impl CudaBackend {
         // ffn_wrote_x_gpu). Per layer this launch plus the decode loop's
         // layer-commit dtod copy are two commands; across 32 layers that is 64
         // per token, ~0.27 ms at the measured ~4.2 us marginal launch cost.
-        if !st.ffn_wrote_x_gpu {
+        {
             let config = LaunchConfig::for_elements(hidden_dim);
             let launch_cfg = CudarcLaunchConfig {
                 grid_dim: (config.grid_dim, 1, 1),
@@ -4860,9 +4815,9 @@ impl CudaBackend {
             .map_err(|e| RuntimeError::Compute(format!("residual_add launch: {e}")))?;
         }
 
-        // Layer output is now in st.scratch.attn_proj. The caller must copy it
-        // to st.scratch.x_gpu before the next layer (done via device memcpy).
-        Ok(())
+        // Layer output is in st.scratch.attn_proj; the caller commits it to
+        // st.scratch.x_gpu before the next layer.
+        Ok(LayerOutput::NeedsCommit)
     }
 
     /// Lazily allocate GDN GPU scratch buffers on first use.
@@ -4981,7 +4936,6 @@ impl CudaBackend {
             beta_buf: self.device.alloc_zeros::<f32>(params.num_heads)?,
             alpha_raw_buf: self.device.alloc_zeros::<f32>(params.num_heads)?,
             beta_raw_buf: self.device.alloc_zeros::<f32>(params.num_heads)?,
-            coop_barrier: self.device.alloc_zeros::<u32>(2)?,
             output_buf: self.device.alloc_zeros::<f32>(params.value_dim)?,
             normed_out_buf: self.device.alloc_zeros::<f32>(params.value_dim)?,
             gate_buf: self.device.alloc_zeros::<f32>(params.value_dim)?,
@@ -8966,7 +8920,7 @@ impl CudaBackend {
     ) -> Result<Logits, RuntimeError> {
         self.embed_token_gpu(token_id, st)?;
         for layer in 0..num_layers {
-            self.compute_layer_gpu(layer, seq_pos, st)?;
+            let layer_out = self.compute_layer_gpu(layer, seq_pos, st)?;
             // FIX-DTOD: For DENSE layers, dense FFN writes to a separate
             // buffer (attn_proj) and we propagate the post-FFN residual to x_gpu
             // here. For MoE layers, `encode_moe_ffn_decode` writes the MoE FFN
@@ -8979,14 +8933,12 @@ impl CudaBackend {
                 .get(layer)
                 .and_then(|m| m.as_ref())
                 .is_some();
-            if !is_moe_layer && !st.ffn_wrote_x_gpu {
+            if !is_moe_layer && layer_out == LayerOutput::NeedsCommit {
                 self.device
                     .stream
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
                     .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
             }
-            // Per-layer flag: the next layer must not inherit it.
-            st.ffn_wrote_x_gpu = false;
         }
         self.compute_final_gpu(st)?;
         {
@@ -9078,7 +9030,7 @@ impl CudaBackend {
     ) -> Result<u32, RuntimeError> {
         self.embed_token_gpu(token_id, st)?;
         for layer in 0..num_layers {
-            self.compute_layer_gpu(layer, seq_pos, st)?;
+            let layer_out = self.compute_layer_gpu(layer, seq_pos, st)?;
             // Mirror decode_token_normal's FIX-DTOD: propagate the post-FFN
             // residual for dense layers; skip for MoE layers (encode_moe_ffn_decode
             // already wrote the post-FFN state in-place to st.scratch.x_gpu).
@@ -9087,14 +9039,12 @@ impl CudaBackend {
                 .get(layer)
                 .and_then(|m| m.as_ref())
                 .is_some();
-            if !is_moe_layer && !st.ffn_wrote_x_gpu {
+            if !is_moe_layer && layer_out == LayerOutput::NeedsCommit {
                 self.device
                     .stream
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
                     .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
             }
-            // Per-layer flag: the next layer must not inherit it.
-            st.ffn_wrote_x_gpu = false;
         }
         self.compute_final_gpu(st)?;
         {
@@ -12332,9 +12282,6 @@ fn weight_uses_f32_act_q4_fam(
     }
 }
 
-fn weight_uses_f32_act_q4(weight: &GpuWeightBuf, q4_decode_f32_act: bool) -> bool {
-    q4_decode_f32_act && matches!(weight, GpuWeightBuf::Q4Raw(_))
-}
 
 fn weight_uses_dp4a_q8_1(weight: &GpuWeightBuf, kernels: &KernelSet) -> bool {
     match weight {
@@ -14352,7 +14299,6 @@ impl ComputeBackend for CudaBackend {
             has_qgate_layers: false,
             has_moe_layers: false,
             decode_token_count: 0,
-            ffn_wrote_x_gpu: false,
             gdn_scratch_gpu: None,
             cublas_workspace,
             precomputed_ptrs: None,
@@ -14548,7 +14494,21 @@ impl ComputeBackend for CudaBackend {
             // Upload x to GPU, run GPU-resident compute, download result.
             let x_f32 = x.as_f32_slice();
             self.device.htod_copy_into(x_f32, &mut st.scratch.x_gpu)?;
-            self.compute_layer_gpu(layer_idx, seq_pos, st)?;
+            let layer_out = self.compute_layer_gpu(layer_idx, seq_pos, st)?;
+            // This path reads the layer result back from `x_gpu`, so it must
+            // honour the same commit contract as the decode loop. It did not
+            // before: `compute_layer_gpu` returned `()` and the copy was simply
+            // absent, so a layer leaving its result in `attn_proj` was read
+            // back stale. Making the destination part of the return type turned
+            // that latent bug into a compile-time obligation.
+            if layer_out == LayerOutput::NeedsCommit {
+                self.device
+                    .stream
+                    .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}"))
+                    })?;
+            }
             self.device.synchronize()?;
             let result = self.device.dtoh_copy(&st.scratch.x_gpu)?;
             x.write_f32_from(&result);
