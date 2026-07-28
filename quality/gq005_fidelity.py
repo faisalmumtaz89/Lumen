@@ -111,10 +111,17 @@ def lumen_gen(binary, prompt):
 
 
 def llama_gen(prompt):
+    # `-st` (single-turn) plus the jinja/thinking flags are what the board
+    # harness uses. Without -st, llama-cli waits on stdin after generating and
+    # the run hangs until the timeout — which is how the first attempt burned
+    # 1800 s on prompt one.
     p = subprocess.run(
         f'/opt/lumen/bin/llama-cli -m "{GGUF}" -ngl 99 -n {NTOK} --temp 0 --seed 42 '
-        f'--repeat-penalty 1.0 -no-cnv -p {json.dumps(prompt)} 2>/dev/null',
-        shell=True, capture_output=True, text=True, timeout=1800)
+        f'--jinja --chat-template-kwargs \'{{"enable_thinking":false}}\' '
+        f'--reasoning-budget 0 -st --no-warmup --repeat-penalty 1.0 '
+        f'-p {json.dumps(prompt)} 2>/dev/null',
+        shell=True, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        timeout=900)
     out = (p.stdout or "").strip()
     # llama-cli echoes the prompt; drop it so both streams start at generation
     if out.startswith(prompt):
