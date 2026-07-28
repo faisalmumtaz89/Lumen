@@ -2476,7 +2476,7 @@ fn run_with_mmap(
         // when the operator did not pass `--repeat-penalty`).
         let resolved_sampling = effective_sampling(sampling);
 
-        // BENCHMARK ARTIFACT (default-OFF, `LUMEN_DECODE_BENCH=1`): the audited
+        // Audited fixed-decode battery, activated by `LUMEN_DECODE_BENCH=1`: the
         // fixed-decode battery. This Metal batched-prefill path bypasses
         // `run_engine`, so the hook is repeated here — on the fully-configured
         // Metal backend, after preload/global-tensor/expert-cache setup, so the
@@ -2667,7 +2667,7 @@ fn run_engine(
     let resolved_sampling = effective_sampling(sampling);
     let sampling = &resolved_sampling;
 
-    // BENCHMARK ARTIFACT (default-OFF, `LUMEN_DECODE_BENCH=1`): the audited
+    // Audited fixed-decode battery, activated by `LUMEN_DECODE_BENCH=1`: the
     // fixed-decode battery. It hooks in HERE, after every `run_with_*` has
     // opened the provider, installed the four model-aware setters and fully
     // configured the backend — so the benchmark measures the shipping setup by

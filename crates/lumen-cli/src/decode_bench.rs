@@ -1,4 +1,9 @@
-//! Audited fixed-decode benchmark mode (BENCHMARK ARTIFACT — not shipped).
+//! Audited fixed-decode benchmark mode, activated by `LUMEN_DECODE_BENCH=1`.
+//!
+//! This module IS compiled into the shipping CLI, and the `decode_loop_time`
+//! clock it reads is a public field on `InferenceMetrics`. Calling it "not
+//! shipped" was wrong: unset, it costs one boolean test per generation, but it
+//! is present in every release binary and is part of the public surface.
 //!
 //! # Why this exists
 //!
