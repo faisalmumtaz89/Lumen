@@ -5825,6 +5825,28 @@ impl CudaBackend {
             && gdn.q_norm_buf_rr.is_some()
             && gdn.k_norm_buf_rr.is_some();
 
+        // Round 53 measured LUMEN_CUDA_GDN_REGISTER_RESIDENT=1 at 0.990x and I
+        // nearly recorded that as "the kernel does not help". It never ran:
+        // the gate requires !gdn_decode_via_prefill, and 9B decode takes the
+        // via-prefill path by default, so the arm only measured the two levers
+        // I had removed alongside it. Sixth arm this campaign to produce a
+        // plausible number while measuring nothing.
+        if register_resident_env {
+            use std::sync::atomic::{AtomicBool, Ordering as O};
+            static SHOWN: AtomicBool = AtomicBool::new(false);
+            if !SHOWN.swap(true, O::Relaxed) {
+                eprintln!(
+                    "[GDN_RR] dispatched={use_register_resident_phase4} \
+                     via_prefill={gdn_decode_via_prefill} p123={} p4={} \
+                     qbuf={} kbuf={}",
+                    st.kernels.gdn_phase123_register_resident.is_some(),
+                    st.kernels.gdn_phase4_register_resident.is_some(),
+                    gdn.q_norm_buf_rr.is_some(),
+                    gdn.k_norm_buf_rr.is_some(),
+                );
+            }
+        }
+
         if gdn_decode_via_prefill {
             // === GDN DECODE VIA PREFILL KERNELS @ T=1 (structural parity) ===
             // Dispatch the five PREFILL fused GDN kernels on the single new
