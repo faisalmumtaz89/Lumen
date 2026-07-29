@@ -130,8 +130,12 @@ fn bf16_autotune_enabled() -> bool {
 fn gdn_split_sites_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
+    // DEFAULT-ON (kill-switch `=0`): harness KEEP 2026-07-30 — +6.83%
+    // (CI [5.96, 7.71], sigma_d 0.659%), corpus token-identical to the
+    // certified golden, DET-001 + sampling + SoL pass. Artifact:
+    // cuda_evaluate_result_gdnsplit.json @ 83ebb54.
     *CACHED.get_or_init(|| {
-        let on = parse_env_truthy("LUMEN_CUDA_GDN_SPLIT_SITES").unwrap_or(false);
+        let on = parse_env_truthy("LUMEN_CUDA_GDN_SPLIT_SITES").unwrap_or(true);
         if on {
             // Unconditional dispatch-proof marker (not behind VERBOSE).
             eprintln!("[GDN] SPLIT_SITES=ON: gdn_qkv/gdn_gate use Q4 split siblings");
