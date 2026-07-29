@@ -59,6 +59,59 @@
 //! * `cupti` -- the Rust event profiler stays OFF; see
 //!   `tools/cupti-inject/README.md` for the out-of-process CUPTI mode.
 //!
+//! # Verified coverage and known blind spots
+//!
+//! An independent launch-site census of the decode path (186 sites) found every
+//! kernel launch, every `launch_*` helper, every cuBLAS call, and every
+//! `memcpy_dtod` inside exactly one depth-0 phase. The depth-1 children tile
+//! their parent's launch set exactly for `full_attn` (7 children), `gdn_attn`
+//! (4) and `ffn` (2) -- the parent-minus-children difference there is
+//! inter-phase submission gap, not hidden work.
+//!
+//! The blind spots that remain, stated so they are not rediscovered as
+//! surprises:
+//!
+//! * **`head` has one depth-1 child.** The lm_head dispatch chain is 26 of the
+//!   27 launches in `compute_final_gpu` and has ten early returns, so it is
+//!   reported as the derived `head - final_norm` rather than bracketed. That
+//!   derived value is exactly the lm_head cost, but level 2 buys no resolution
+//!   *within* lm_head (activation quantize vs. matvec are not separable).
+//! * **Three D2H readbacks sit outside the token bracket** because they run
+//!   after `token_end`: the full-vocab logits copy on the sampling path
+//!   (~1 MB/token), the 4-byte argmax copy on the greedy path, and an
+//!   `LUMEN_XCHK` probe. They are real time and appear in
+//!   `host_outside_span_us`, never in the phase table.
+//! * **`moe.rs` carries no brackets and contains its own `synchronize()`
+//!   calls.** On a MoE model the `moe_ffn` phase therefore spans forced host
+//!   round-trips and is not comparable to the other phases. Dense models never
+//!   enter it.
+//! * **Error paths leak their brackets.** Roughly 250 `?` sites and three
+//!   `return Err` sites lie inside brackets. Every one aborts the token, so
+//!   `token_settle` is never reached and `token_begin` discards the partial
+//!   token while adding to `unclosed`. A leak can therefore never contaminate a
+//!   later token's numbers, but it is counted rather than prevented -- check
+//!   `unclosed_brackets=0` on the health line before trusting a run.
+//!
+//! # Reading the numbers
+//!
+//! Prefer `p50` over `mean` for the per-token quantities. The first decode
+//! token of a run pays one-time costs that land inside a bracket and are not
+//! representative:
+//!
+//! * `ensure_gdn_scratch` allocates every GDN state and conv-state buffer on
+//!   the first GDN layer of the first token, inside the `gdn_attn` bracket.
+//! * kernel PTX may still be resolving on first dispatch.
+//!
+//! Because each `generate` call emits its own `[PROFILE]` block with its own
+//! label, a benchmark's warmup sequences absorb this and the measured
+//! sequences are clean. A single-generation run does not have that luxury, so
+//! read `p50`.
+//!
+//! Per-phase figures are `us_per_token` totals, which have no per-token
+//! distribution attached -- a phase's total is summed across all its calls in
+//! all tokens and then divided by the token count. A phase whose cost is
+//! bimodal will not reveal that here.
+//!
 //! # Why no extra synchronization
 //!
 //! Events are recorded into a pool and their elapsed times are read only in
