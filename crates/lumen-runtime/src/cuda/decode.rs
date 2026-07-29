@@ -831,6 +831,31 @@ pub(crate) struct KernelSet {
     pub(crate) moe_shared_down_q4_0_residual_accum: Option<CudaFunction>,
 }
 
+/// Q8_1 raw-sum convention (default-OFF, `LUMEN_CUDA_Q8_1_RAWSUM=1`): prepend
+/// the NVRTC define that switches the Q8_1 quantizers' header sum field from
+/// `d*sum(quants)` to llama.cpp b10032's `sum(x)` convention. Applied only to
+/// the sources whose kernels WRITE Q8_1 headers (quantize_f32_to_q8_1,
+/// rmsnorm_to_q8_1, fused_residual_rmsnorm_q8_1); consumers read the field
+/// blind. The prepend changes the PTX-cache source hash, so the two variants
+/// cannot collide in the on-disk cache.
+fn q8_1_rawsum_source(src: &'static str) -> std::borrow::Cow<'static, str> {
+    static RAWSUM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *RAWSUM.get_or_init(|| {
+        let on = std::env::var("LUMEN_CUDA_Q8_1_RAWSUM").is_ok_and(|v| v == "1");
+        if on {
+            // Unconditional (not behind LUMEN_CUDA_VERBOSE): dispatch proof for
+            // the A/B harness — a silent variant selection is unverifiable.
+            eprintln!("[Q8_1] RAWSUM=ON: quantizer header sum = sum(x) (llama.cpp convention)");
+        }
+        on
+    });
+    if on {
+        std::borrow::Cow::Owned(format!("#define Q8_1_RAWSUM 1\n{src}"))
+    } else {
+        std::borrow::Cow::Borrowed(src)
+    }
+}
+
 /// Compile all CUDA kernels via NVRTC and return the kernel function handles.
 ///
 /// Each .cu source is compiled into a separate PTX module. This avoids
@@ -1485,7 +1510,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         // dp4a with pre-quantized Q8_1 input
         // Compiled with --use_fast_math for accelerated scale multiplication.
         quantize_f32_to_q8_1: match load_fn_sm80_fast_math(
-            shaders::MATVEC_DP4A_Q8_1_KERNEL_SOURCE,
+            q8_1_rawsum_source(shaders::MATVEC_DP4A_Q8_1_KERNEL_SOURCE).as_ref(),
             "quantize_f32_to_q8_1",
         ) {
             Ok(f) => {
@@ -2178,7 +2203,10 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
         },
         // Fused RMSNorm + Q8_1 quantization (dispatch count reduction for Q8_0 dp4a path)
-        rmsnorm_to_q8_1: match load_fn(shaders::RMSNORM_Q8_1_KERNEL_SOURCE, "rmsnorm_to_q8_1") {
+        rmsnorm_to_q8_1: match load_fn(
+            q8_1_rawsum_source(shaders::RMSNORM_Q8_1_KERNEL_SOURCE).as_ref(),
+            "rmsnorm_to_q8_1",
+        ) {
             Ok(f) => {
                 cuda_log!("[CUDA] rmsnorm_to_q8_1: OK");
                 Some(f)
@@ -2189,7 +2217,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
         },
         fused_residual_rmsnorm_q8_1: match load_fn(
-            shaders::RMSNORM_Q8_1_KERNEL_SOURCE,
+            q8_1_rawsum_source(shaders::RMSNORM_Q8_1_KERNEL_SOURCE).as_ref(),
             "fused_residual_rmsnorm_q8_1",
         ) {
             Ok(f) => {

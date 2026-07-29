@@ -54,6 +54,15 @@
 #define Q8_0_BLOCK_SIZE  32
 #define Q8_0_BYTES       34   // 2B f16 scale + 32B int8 quants
 #define Q8_1_BYTES       36   // 2B f16 scale + 2B f16 sum + 32B int8 quants
+
+// Q8_1 header sum convention. 0 (default): s = d*sum(quants), exact for the
+// dequantized int8 vector. 1: s = sum(x) over the original F32 values —
+// llama.cpp b10032's quantize_q8_1 convention. Selected at NVRTC compile time
+// by a host-side source prepend (LUMEN_CUDA_Q8_1_RAWSUM=1); the prepend changes
+// the PTX-cache source hash, so the two variants can never collide in cache.
+#ifndef Q8_1_RAWSUM
+#define Q8_1_RAWSUM 0
+#endif
 #define WARP_SIZE        32
 
 // ---- Matvec kernel constants ----
@@ -146,7 +155,19 @@ extern "C" __global__ __launch_bounds__(32, 1) void quantize_f32_to_q8_1(
     // Clamp to [-127, 127] (should already be in range, but be safe).
     qi = qi < -127 ? -127 : (qi > 127 ? 127 : qi);
 
-    // Compute partial sum for the Q8_1 sum field: sum(quants).
+    // Compute the Q8_1 sum field.
+#if Q8_1_RAWSUM
+    // Raw-sum convention (llama.cpp b10032 quantize_q8_1): s = sum(x) over the
+    // ORIGINAL F32 values. The Q4_0 zero-point correction -8*s then carries the
+    // pre-quantization information instead of the requantized approximation.
+    float qsum = val;
+    qsum += __shfl_xor_sync(0xffffffff, qsum, 16);
+    qsum += __shfl_xor_sync(0xffffffff, qsum, 8);
+    qsum += __shfl_xor_sync(0xffffffff, qsum, 4);
+    qsum += __shfl_xor_sync(0xffffffff, qsum, 2);
+    qsum += __shfl_xor_sync(0xffffffff, qsum, 1);
+    float weighted_sum = qsum;
+#else
     // Use warp shuffle to sum all 32 quantized values.
     float qi_f = (float)qi;
     float qsum = qi_f;
@@ -159,6 +180,7 @@ extern "C" __global__ __launch_bounds__(32, 1) void quantize_f32_to_q8_1(
 
     // Weighted sum: s = d * sum(quants).
     float weighted_sum = scale * qsum;
+#endif
 
     // Write the Q8_1 block. Lane 0 writes the header; all lanes write their quant byte.
     char* block_out = output + (unsigned long long)block_idx * Q8_1_BYTES;

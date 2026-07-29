@@ -35,6 +35,13 @@
 #define WARP_SIZE 32
 #define Q8_1_BYTES 36
 
+// Q8_1 header sum convention — see matvec_dp4a_q8_1.cu. 0 (default):
+// s = d*sum(quants). 1: s = sum(normed x), llama.cpp b10032 convention.
+// Selected by host-side source prepend (LUMEN_CUDA_Q8_1_RAWSUM=1).
+#ifndef Q8_1_RAWSUM
+#define Q8_1_RAWSUM 0
+#endif
+
 // Warp-level sum reduction using butterfly shuffle.
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     val += __shfl_xor_sync(0xffffffff, val, 16);
@@ -133,6 +140,17 @@ extern "C" __global__ void rmsnorm_to_q8_1(
         int qi = __float2int_rn(val * scale_inv);
         qi = qi < -127 ? -127 : (qi > 127 ? 127 : qi);
 
+#if Q8_1_RAWSUM
+        // Raw-sum convention: s = sum(normed x) over the ORIGINAL F32 values.
+        float qsum = val;
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 16);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 8);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 4);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 2);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 1);
+
+        float weighted_sum = qsum;
+#else
         // Compute sum(quants) for Q8_1 sum field.
         float qi_f = (float)qi;
         float qsum = qi_f;
@@ -143,6 +161,7 @@ extern "C" __global__ void rmsnorm_to_q8_1(
         qsum += __shfl_xor_sync(0xffffffff, qsum, 1);
 
         float weighted_sum = scale * qsum;
+#endif
 
         // Write Q8_1 block.
         char* block_out = output_q8_1 + (unsigned long long)blk * Q8_1_BYTES;
@@ -254,6 +273,17 @@ extern "C" __global__ void fused_residual_rmsnorm_q8_1(
         int qi = __float2int_rn(val * scale_inv);
         qi = qi < -127 ? -127 : (qi > 127 ? 127 : qi);
 
+#if Q8_1_RAWSUM
+        // Raw-sum convention: s = sum(normed x) over the ORIGINAL F32 values.
+        float qsum = val;
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 16);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 8);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 4);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 2);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 1);
+
+        float weighted_sum = qsum;
+#else
         float qi_f = (float)qi;
         float qsum = qi_f;
         qsum += __shfl_xor_sync(0xffffffff, qsum, 16);
@@ -263,6 +293,7 @@ extern "C" __global__ void fused_residual_rmsnorm_q8_1(
         qsum += __shfl_xor_sync(0xffffffff, qsum, 1);
 
         float weighted_sum = scale * qsum;
+#endif
 
         char* block_out = output_q8_1 + (unsigned long long)blk * Q8_1_BYTES;
 
