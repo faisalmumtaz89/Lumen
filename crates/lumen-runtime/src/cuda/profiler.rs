@@ -1170,6 +1170,76 @@ mod tests {
         assert!(!out.contains("NaN") && !out.contains("inf"), "{out}");
     }
 
+    /// Renders a representative `[PROFILE]` block so the output format can be
+    /// inspected without a GPU. Ignored by default because it is a
+    /// documentation aid, not an assertion:
+    ///
+    /// ```text
+    /// cargo test -p lumen-runtime --features cuda --lib \
+    ///     cuda::profiler::tests::show_profile_output_format -- --ignored --nocapture
+    /// ```
+    ///
+    /// Shape numbers match Qwen3.5-9B (24 GDN + 8 full-attn); the timings are
+    /// invented and must not be quoted as measurements.
+    #[test]
+    #[ignore = "documentation aid: run with --ignored --nocapture to see the output format"]
+    fn show_profile_output_format() {
+        // (phase, calls/token, us/token) -- fabricated, illustrative only.
+        let shape: &[(Phase, u64, f64)] = &[
+            (Phase::Embed, 1, 3.1),
+            (Phase::GdnAttn, 24, 3980.0),
+            (Phase::FullAttn, 8, 1520.0),
+            (Phase::Ffn, 32, 2110.0),
+            (Phase::LayerCommit, 32, 96.0),
+            (Phase::Head, 1, 640.0),
+            (Phase::Argmax, 1, 21.0),
+            (Phase::GdnQkv, 24, 1450.0),
+            (Phase::GdnConvRecur, 24, 1900.0),
+            (Phase::GdnOut, 24, 520.0),
+            (Phase::GdnGlue, 24, 60.0),
+            (Phase::AttnQkv, 8, 610.0),
+            (Phase::AttnQkNorm, 8, 90.0),
+            (Phase::AttnRope, 8, 62.0),
+            (Phase::AttnKvWrite, 8, 74.0),
+            (Phase::AttnCore, 8, 300.0),
+            (Phase::AttnWo, 8, 340.0),
+            (Phase::FfnGateUp, 32, 1290.0),
+            (Phase::FfnDownResid, 32, 790.0),
+            (Phase::FinalNorm, 1, 8.0),
+        ];
+        let tokens = 128usize;
+        let attributed: f64 = shape
+            .iter()
+            .filter(|(p, _, _)| p.depth() == 0)
+            .map(|(_, _, us)| us)
+            .sum();
+        let s = Summary {
+            tokens,
+            rows: shape
+                .iter()
+                .map(|(p, calls, us)| PhaseRow {
+                    phase: *p,
+                    calls: calls * tokens as u64,
+                    total_us: us * tokens as f64,
+                })
+                .collect(),
+            wall_us_mean: 9120.0,
+            wall_us_p50: 9105.0,
+            gpu_span_us_mean: 8790.0,
+            gpu_span_us_p50: 8781.0,
+            attributed_us_mean: attributed,
+            attributed_us_p50: attributed,
+            unclosed: 0,
+            nest_errors: 0,
+            event_errors: 0,
+            pool_high_water: 634,
+            outside_token: 0,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_summary(&mut buf, "gen1", &s);
+        print!("{}", String::from_utf8(buf).expect("utf8"));
+    }
+
     #[test]
     fn empty_summary_still_writes_a_wellformed_block() {
         let s = Summary::default();
