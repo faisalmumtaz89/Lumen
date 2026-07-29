@@ -52,12 +52,36 @@
 //!   brackets = 634 event records per token, against roughly 400 existing
 //!   kernel launches per token.
 //!
+//! * `cupti` -- the Rust event profiler stays OFF; see
+//!   `tools/cupti-inject/README.md` for the out-of-process CUPTI mode.
+//!
 //! The overhead of either level is UNMEASURED. Establish it with an A/B (flag
 //! off vs on, same weights, same prompt) before quoting any absolute number,
 //! and compare level 1 against level 2 -- their disagreement is the
 //! measurement of what the depth-1 brackets cost.
-//! * `cupti` -- the Rust event profiler stays OFF; see
-//!   `tools/cupti-inject/README.md` for the out-of-process CUPTI mode.
+//!
+//! # Segment boundaries
+//!
+//! One `[PROFILE]` block is emitted per `Engine::generate` call, via the
+//! [`SegmentGuard`] returned by [`begin_segment`]. It is a drop guard rather
+//! than a post-loop statement for a specific reason: the decode loop propagates
+//! errors with `?`, and every token that already completed has been folded into
+//! the accumulator by its own [`token_settle`]. A statement after the loop is
+//! skipped on error, and those orphaned tokens would then be reported inside the
+//! NEXT segment's block under a label implying they belonged to it. Dropping
+//! happens on every exit path, so a failed segment reports the tokens it did
+//! complete, under its own label, and leaves nothing behind.
+//!
+//! # Concurrency
+//!
+//! The profiler is a single process-wide singleton. Today that is safe because
+//! each `CudaBackend` holds its own `state` mutex across an entire decode call,
+//! serializing all bracket calls for that instance. It is NOT safe by
+//! construction: two `CudaBackend` instances decoding concurrently (multi-model
+//! or multi-GPU in one process) would interleave brackets into the same stack.
+//! That corrupts both instances' numbers rather than crashing, but it is
+//! detectable -- it shows up as `nest_errors` on the health line, which is
+//! exactly why that counter is reported.
 //!
 //! # Verified coverage and known blind spots
 //!
@@ -85,12 +109,25 @@
 //!   calls.** On a MoE model the `moe_ffn` phase therefore spans forced host
 //!   round-trips and is not comparable to the other phases. Dense models never
 //!   enter it.
-//! * **Error paths leak their brackets.** Roughly 250 `?` sites and three
+//! * **Error paths leak their brackets.** Roughly 250 `?` sites and five
 //!   `return Err` sites lie inside brackets. Every one aborts the token, so
 //!   `token_settle` is never reached and `token_begin` discards the partial
-//!   token while adding to `unclosed`. A leak can therefore never contaminate a
-//!   later token's numbers, but it is counted rather than prevented -- check
-//!   `unclosed_brackets=0` on the health line before trusting a run.
+//!   token, counting it in both `unclosed` and `abandoned_tokens`. Nothing is
+//!   read off an unsynchronized event, so a leak can never contaminate a later
+//!   token -- but the whole token is dropped rather than partially salvaged,
+//!   including phases that had already closed cleanly.
+//! * **`gpu_unattributed_us` conflates two causes** with opposite remedies:
+//!   inter-phase submission gap ("fuse or overlap") and a launch covered by no
+//!   bracket ("go add a bracket"). It cannot tell you which. The per-parent
+//!   `uncovered` lines narrow it -- a residual that GROWS inside one depth-0
+//!   parent after a code change points at a new unbracketed launch in that
+//!   parent -- but treat a large global residual as "investigate", never as
+//!   evidence for a specific lever.
+//!
+//! Read the `health` lines before anything else. `scope=lifetime` is
+//! process-cumulative and `scope=segment` is this block only; a defect that
+//! appeared in an earlier segment stays visible in the lifetime line forever,
+//! which is why both are printed.
 //!
 //! # Reading the numbers
 //!
@@ -393,25 +430,71 @@ struct Bracket {
     end: u32,
 }
 
-#[derive(Default)]
-struct Health {
+/// Defect counters. Every one of these should read 0 on a trustworthy run.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HealthCounts {
     /// Brackets still open when the token ended (an early return skipped a
-    /// close). Their time lands in `gpu_unattributed`.
-    unclosed: u64,
-    /// `end` called for a phase that was not the innermost open bracket.
-    nest_errors: u64,
+    /// close). The token is discarded, so this never corrupts another token --
+    /// but the token's data is lost, not partially salvaged.
+    pub unclosed: u64,
+    /// `end` called for a phase that was not the innermost open bracket. Also
+    /// the signal that two `CudaBackend` instances are interleaving into this
+    /// process-wide profiler (see the module docs).
+    pub nest_errors: u64,
     /// `cuEventCreate` / `cuEventRecord` / `cuEventElapsedTime` failures.
-    event_errors: u64,
-    /// Largest number of events a single token needed.
-    pool_high_water: usize,
+    pub event_errors: u64,
     /// `begin` calls that arrived while no decode token was open, and were
     /// therefore not recorded. `compute_layer_gpu` is reachable from the
     /// `ComputeBackend::compute_layer` trait method (the streaming / per-layer
     /// path) as well as from the decode loop; that work is real but is not part
     /// of a decode token, so it is dropped rather than folded into the next
     /// token's totals. A non-zero count here means such calls happened.
-    outside_token: u64,
+    pub outside_token: u64,
+    /// Tokens whose depth-0 phase sum EXCEEDED the whole-token GPU span by more
+    /// than `RESIDUAL_EPSILON_US`.
+    ///
+    /// Phases nest inside the token bracket and do not overlap, so this is
+    /// mathematically impossible beyond event-timer quantization. A non-zero
+    /// count means the ordering assumption is broken somewhere and the residual
+    /// arithmetic cannot be trusted. Without this counter the `.max(0.0)` clamp
+    /// on the reported residuals would silently absorb exactly that bug.
+    pub negative_residual: u64,
+    /// Tokens abandoned before `token_end` (an error propagated mid-token).
+    pub abandoned_tokens: u64,
+    /// Largest number of events a single token needed.
+    pub pool_high_water: usize,
 }
+
+impl HealthCounts {
+    /// Field-wise difference, for reporting "since the last print" alongside
+    /// the process-lifetime totals.
+    fn since(&self, base: &HealthCounts) -> HealthCounts {
+        HealthCounts {
+            unclosed: self.unclosed.saturating_sub(base.unclosed),
+            nest_errors: self.nest_errors.saturating_sub(base.nest_errors),
+            event_errors: self.event_errors.saturating_sub(base.event_errors),
+            outside_token: self.outside_token.saturating_sub(base.outside_token),
+            negative_residual: self.negative_residual.saturating_sub(base.negative_residual),
+            abandoned_tokens: self.abandoned_tokens.saturating_sub(base.abandoned_tokens),
+            pool_high_water: self.pool_high_water,
+        }
+    }
+
+    /// True when every defect counter is zero.
+    pub fn is_clean(&self) -> bool {
+        self.unclosed == 0
+            && self.nest_errors == 0
+            && self.event_errors == 0
+            && self.outside_token == 0
+            && self.negative_residual == 0
+            && self.abandoned_tokens == 0
+    }
+}
+
+/// Tolerance for the "phases cannot exceed the token span" check. CUDA event
+/// timestamps quantize at roughly half a microsecond, and a token accumulates
+/// ~100-300 brackets, so a few microseconds of accumulated rounding is benign.
+const RESIDUAL_EPSILON_US: f64 = 4.0;
 
 #[derive(Default)]
 struct Accum {
@@ -448,7 +531,14 @@ struct Profiler {
     /// Set once `token_end` has recorded its event; cleared by `token_settle`.
     pending: bool,
     accum: Accum,
-    health: Health,
+    /// Process-lifetime defect counters. Deliberately NOT cleared by `reset`,
+    /// so a defect cannot be erased by a segment boundary.
+    health: HealthCounts,
+    /// Snapshot of `health` at the last print, so each `[PROFILE]` block can
+    /// report both the lifetime totals and the delta for its own segment.
+    /// Without the delta, a defect from segment 0 reads identically in every
+    /// later segment's health line forever.
+    health_baseline: HealthCounts,
 }
 
 impl Profiler {
@@ -464,7 +554,8 @@ impl Profiler {
             in_token: false,
             pending: false,
             accum: Accum::default(),
-            health: Health::default(),
+            health: HealthCounts::default(),
+            health_baseline: HealthCounts::default(),
         }
     }
 
@@ -546,6 +637,15 @@ impl Profiler {
             .wall_start
             .map(|t| t.elapsed().as_secs_f64() * 1e6)
             .unwrap_or(0.0);
+
+        // Phases nest inside the token bracket and never overlap, so the phase
+        // sum cannot exceed the token span by more than timer quantization.
+        // Detect the violation PER TOKEN, where it is unambiguous -- checking
+        // only the reported means would let a systematic ordering bug hide
+        // behind the `.max(0.0)` clamp in `Summary`.
+        if gpu_span > 0.0 && attributed > gpu_span + RESIDUAL_EPSILON_US {
+            self.health.negative_residual += 1;
+        }
 
         self.accum.wall_us.push(wall);
         self.accum.gpu_span_us.push(gpu_span);
@@ -650,9 +750,14 @@ pub fn token_begin(stream: &CudaStream) {
             }
             p.settle();
         } else if p.cursor != 0 || !p.open.is_empty() {
-            // A token was abandoned before `token_end`. Discard its partial
-            // brackets; there is no completed closing event to time against.
+            // A token was abandoned before `token_end` (an error propagated
+            // mid-token). Discard its partial brackets: there is no completed
+            // closing event to time against, and reading elapsed times off
+            // events that may not have completed would produce garbage. The
+            // whole token is dropped rather than partially salvaged, which is
+            // why this is counted separately from `unclosed`.
             p.health.unclosed += p.open.len() as u64;
+            p.health.abandoned_tokens += 1;
             p.open.clear();
             p.closed.clear();
             p.cursor = 0;
@@ -714,11 +819,10 @@ pub struct Summary {
     pub gpu_span_us_p50: f64,
     pub attributed_us_mean: f64,
     pub attributed_us_p50: f64,
-    pub unclosed: u64,
-    pub nest_errors: u64,
-    pub event_errors: u64,
-    pub pool_high_water: usize,
-    pub outside_token: u64,
+    /// Process-lifetime defect counters.
+    pub health: HealthCounts,
+    /// Defect counters accrued since the previous print.
+    pub health_delta: HealthCounts,
 }
 
 impl Summary {
@@ -734,12 +838,57 @@ impl Summary {
         (self.wall_us_mean - self.gpu_span_us_mean).max(0.0)
     }
 
+    /// Per-token microseconds for one phase.
+    fn phase_us_per_token(&self, phase: Phase) -> Option<f64> {
+        self.rows
+            .iter()
+            .find(|r| r.phase == phase)
+            .map(|r| self.per_token(r.total_us))
+    }
+
+    /// Time inside a depth-0 phase that none of its depth-1 children claimed.
+    ///
+    /// Returns `None` when the phase has no children recorded (level 1, or a
+    /// phase with no children at all). This localizes what
+    /// `gpu_unattributed_us` can only report globally: a growing per-parent
+    /// residual points at a launch inside that parent covered by no child.
+    pub fn uncovered_in(&self, parent: Phase) -> Option<f64> {
+        let total = self.phase_us_per_token(parent)?;
+        let mut children = 0.0;
+        let mut any = false;
+        for row in &self.rows {
+            if row.phase.parent() == Some(parent) {
+                any = true;
+                children += self.per_token(row.total_us);
+            }
+        }
+        if !any {
+            return None;
+        }
+        Some((total - children).max(0.0))
+    }
+
     fn per_token(&self, total: f64) -> f64 {
         if self.tokens == 0 {
             0.0
         } else {
             total / self.tokens as f64
         }
+    }
+}
+
+/// Format `num/den` as a percentage, or `n/a` when the denominator is not
+/// meaningfully positive.
+///
+/// Flooring the denominator at an epsilon instead would emit a finite but
+/// absurd figure (a zero `attributed_us_mean` produced
+/// `pct_of_attributed=1000000000000.00`), which a parser would happily ingest
+/// as a real percentage. `n/a` cannot be mistaken for data.
+fn pct(num: f64, den: f64) -> String {
+    if den <= 1e-6 || !den.is_finite() || !num.is_finite() {
+        "n/a".to_string()
+    } else {
+        format!("{:.2}", 100.0 * num / den)
     }
 }
 
@@ -788,22 +937,69 @@ pub fn summary() -> Summary {
             gpu_span_us_p50: p50(&p.accum.gpu_span_us),
             attributed_us_mean: mean(&p.accum.attributed_us),
             attributed_us_p50: p50(&p.accum.attributed_us),
-            unclosed: p.health.unclosed,
-            nest_errors: p.health.nest_errors,
-            event_errors: p.health.event_errors,
-            pool_high_water: p.health.pool_high_water,
-            outside_token: p.health.outside_token,
+            health: p.health,
+            health_delta: p.health.since(&p.health_baseline),
         }
     })
     .unwrap_or_default()
 }
 
-/// Clear per-phase and per-token accumulation. The event pool and the health
-/// counters survive, so pool reuse continues and defects stay visible.
+/// Clear per-phase and per-token accumulation, and rebase the health delta.
+///
+/// The event pool and the lifetime health counters survive, so pool reuse
+/// continues and a defect cannot be erased by a segment boundary.
 pub fn reset() {
     let _ = with(|p| {
         p.accum = Accum::default();
+        p.health_baseline = p.health;
     });
+}
+
+/// RAII guard that flushes one decode segment on drop.
+///
+/// This exists because flushing at the end of the decode loop is not enough.
+/// `Engine::generate` propagates decode errors with `?`, so a statement placed
+/// after the loop is skipped on error -- while the tokens that already
+/// completed have each been folded into the accumulator by their own
+/// `token_settle`. Those orphans would then be silently reported inside the
+/// NEXT successful segment's block, under a label implying they belonged to it.
+///
+/// Dropping is the one thing that happens on every exit path, so the flush
+/// lives here. A failed segment reports the tokens it did complete, under its
+/// own label, and leaves nothing behind.
+pub struct SegmentGuard {
+    seq: u64,
+}
+
+impl Drop for SegmentGuard {
+    fn drop(&mut self) {
+        if level() == 0 {
+            return;
+        }
+        print_and_reset(&format!("gen{}", self.seq));
+        // print_and_reset only resets when it printed (tokens > 0); force the
+        // rebase so an empty segment cannot carry state forward either.
+        reset();
+    }
+}
+
+/// Open a decode segment. The returned guard must be held for the whole
+/// segment; it prints and clears on drop. No-op when profiling is disabled.
+pub fn begin_segment() -> SegmentGuard {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if level() > 0 {
+        // Defensive: if a previous guard could not run (process teardown, a
+        // panic with abort), discard whatever it left rather than attributing
+        // it here.
+        let _ = with(|p| {
+            if p.accum.tokens() > 0 {
+                p.accum = Accum::default();
+            }
+            p.health_baseline = p.health;
+        });
+    }
+    SegmentGuard { seq }
 }
 
 /// Emit the `[PROFILE]` block to stderr and clear the accumulator.
@@ -827,8 +1023,8 @@ pub fn print_and_reset(label: &str) {
 /// after a fixed `[PROFILE] <kind>` prefix, so the output greps and parses
 /// without a schema.
 pub fn write_summary<W: std::io::Write>(w: &mut W, label: &str, s: &Summary) {
-    let wall = s.wall_us_mean.max(1e-9);
-    let attributed = s.attributed_us_mean.max(1e-9);
+    let wall = s.wall_us_mean;
+    let attributed = s.attributed_us_mean;
 
     let _ = writeln!(
         w,
@@ -852,12 +1048,12 @@ pub fn write_summary<W: std::io::Write>(w: &mut W, label: &str, s: &Summary) {
     let host_gap = s.host_outside_span_us();
     let _ = writeln!(
         w,
-        "[PROFILE] residual gpu_unattributed_us={:.3} gpu_unattributed_pct_of_wall={:.2} \
-         host_outside_span_us={:.3} host_outside_span_pct_of_wall={:.2}",
+        "[PROFILE] residual gpu_unattributed_us={:.3} gpu_unattributed_pct_of_wall={} \
+         host_outside_span_us={:.3} host_outside_span_pct_of_wall={}",
         unattributed,
-        100.0 * unattributed / wall,
+        pct(unattributed, wall),
         host_gap,
-        100.0 * host_gap / wall,
+        pct(host_gap, wall),
     );
 
     for row in &s.rows {
@@ -871,50 +1067,94 @@ pub fn write_summary<W: std::io::Write>(w: &mut W, label: &str, s: &Summary) {
         let _ = writeln!(
             w,
             "[PROFILE] phase depth={} name={} parent={} calls_per_token={:.2} us_per_token={:.3} \
-             pct_of_wall={:.2} pct_of_attributed={:.2}",
+             pct_of_wall={} pct_of_attributed={}",
             row.phase.depth(),
             row.phase.name(),
             parent,
             calls_per_tok,
             per_tok,
-            100.0 * per_tok / wall,
-            100.0 * per_tok / attributed,
+            pct(per_tok, wall),
+            pct(per_tok, attributed),
         );
     }
 
-    // lm_head is not directly bracketable (six early returns in the dispatch
-    // chain), so report it as Head minus FinalNorm when both are present.
-    let head = s
-        .rows
-        .iter()
-        .find(|r| r.phase == Phase::Head)
-        .map(|r| s.per_token(r.total_us));
-    let final_norm = s
-        .rows
-        .iter()
-        .find(|r| r.phase == Phase::FinalNorm)
-        .map(|r| s.per_token(r.total_us));
-    if let (Some(h), Some(fnorm)) = (head, final_norm) {
-        let lm = (h - fnorm).max(0.0);
-        let _ = writeln!(
-            w,
-            "[PROFILE] derived name=lm_head from=head-final_norm us_per_token={:.3} \
-             pct_of_wall={:.2}",
-            lm,
-            100.0 * lm / wall,
-        );
+    // Per-parent residual: time inside a depth-0 phase claimed by none of its
+    // depth-1 children. For a fully tiled parent this is submission gap; if it
+    // GROWS after a code change, a new launch went in uncovered. This is the
+    // only handle the tool offers on that distinction -- the global
+    // `gpu_unattributed_us` conflates the two causes and cannot separate them.
+    for parent in ALL_PHASES.iter().filter(|p| p.depth() == 0) {
+        if let Some(uncovered) = s.uncovered_in(*parent) {
+            let total = s.phase_us_per_token(*parent).unwrap_or(0.0);
+            let _ = writeln!(
+                w,
+                "[PROFILE] uncovered parent={} us_per_token={:.3} pct_of_parent={}",
+                parent.name(),
+                uncovered,
+                pct(uncovered, total),
+            );
+        }
     }
 
+    // lm_head is not directly bracketable (ten early returns in the dispatch
+    // chain), so report it as Head minus FinalNorm. When the F16 fast path
+    // returns before the final RMSNorm, FinalNorm never runs and the difference
+    // is undefined -- say so explicitly rather than omitting the row, so a
+    // missing lm_head figure cannot be mistaken for a zero-cost lm_head.
+    let head = s.phase_us_per_token(Phase::Head);
+    let final_norm = s.phase_us_per_token(Phase::FinalNorm);
+    match (head, final_norm) {
+        (Some(h), Some(fnorm)) => {
+            let lm = (h - fnorm).max(0.0);
+            let _ = writeln!(
+                w,
+                "[PROFILE] derived name=lm_head from=head-final_norm us_per_token={:.3} \
+                 pct_of_wall={}",
+                lm,
+                pct(lm, wall),
+            );
+        }
+        (Some(_), None) => {
+            let _ = writeln!(
+                w,
+                "[PROFILE] derived name=lm_head status=unavailable \
+                 reason=final_norm_never_ran note=f16_fast_path_or_level_1"
+            );
+        }
+        _ => {}
+    }
+
+    let brackets_per_token =
+        s.rows.iter().map(|r| r.calls).sum::<u64>() as f64 / s.tokens.max(1) as f64;
+    // Lifetime totals, then this segment's delta. The lifetime line alone would
+    // make a defect from segment 0 read identically in every later segment.
     let _ = writeln!(
         w,
-        "[PROFILE] health unclosed_brackets={} nest_errors={} event_errors={} \
-         outside_token_brackets={} pool_high_water={} brackets_per_token={:.1}",
-        s.unclosed,
-        s.nest_errors,
-        s.event_errors,
-        s.outside_token,
-        s.pool_high_water,
-        s.rows.iter().map(|r| r.calls).sum::<u64>() as f64 / s.tokens.max(1) as f64,
+        "[PROFILE] health scope=lifetime clean={} unclosed_brackets={} nest_errors={} \
+         event_errors={} outside_token_brackets={} negative_residual_tokens={} \
+         abandoned_tokens={} pool_high_water={} brackets_per_token={:.1}",
+        s.health.is_clean(),
+        s.health.unclosed,
+        s.health.nest_errors,
+        s.health.event_errors,
+        s.health.outside_token,
+        s.health.negative_residual,
+        s.health.abandoned_tokens,
+        s.health.pool_high_water,
+        brackets_per_token,
+    );
+    let _ = writeln!(
+        w,
+        "[PROFILE] health scope=segment clean={} unclosed_brackets={} nest_errors={} \
+         event_errors={} outside_token_brackets={} negative_residual_tokens={} \
+         abandoned_tokens={}",
+        s.health_delta.is_clean(),
+        s.health_delta.unclosed,
+        s.health_delta.nest_errors,
+        s.health_delta.event_errors,
+        s.health_delta.outside_token,
+        s.health_delta.negative_residual,
+        s.health_delta.abandoned_tokens,
     );
     let _ = writeln!(w, "[PROFILE] end label={label}");
 }
@@ -1003,11 +1243,12 @@ mod tests {
         let s = summary();
         assert_eq!(s.tokens, 0);
         assert!(s.rows.is_empty());
-        assert_eq!(s.unclosed, 0);
-        assert_eq!(s.nest_errors, 0);
-        assert_eq!(s.event_errors, 0);
-        assert_eq!(s.outside_token, 0);
-        assert_eq!(s.pool_high_water, 0, "no event may be allocated when off");
+        assert!(s.health.is_clean());
+        assert!(s.health_delta.is_clean());
+        assert_eq!(
+            s.health.pool_high_water, 0,
+            "no event may be allocated when off"
+        );
     }
 
     #[test]
@@ -1084,24 +1325,6 @@ mod tests {
         assert!(out.contains("label=unit"), "{out}");
     }
 
-    #[test]
-    fn summary_omits_lm_head_when_final_norm_missing() {
-        let s = Summary {
-            tokens: 1,
-            rows: vec![PhaseRow {
-                phase: Phase::Head,
-                calls: 1,
-                total_us: 10.0,
-            }],
-            wall_us_mean: 20.0,
-            ..Default::default()
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        write_summary(&mut buf, "unit", &s);
-        let out = String::from_utf8(buf).expect("utf8");
-        assert!(!out.contains("lm_head"), "{out}");
-    }
-
     /// The output contract downstream analysis depends on: after the
     /// `[PROFILE] <kind>` prefix, every whitespace-separated token is exactly
     /// one `key=value` pair. A bare token would silently break any
@@ -1125,11 +1348,11 @@ mod tests {
             gpu_span_us_p50: 7490.0,
             attributed_us_mean: 6800.0,
             attributed_us_p50: 6790.0,
-            unclosed: 0,
-            nest_errors: 0,
-            event_errors: 0,
-            pool_high_water: 634,
-            outside_token: 0,
+            health: HealthCounts {
+                pool_high_water: 634,
+                ..Default::default()
+            },
+            health_delta: HealthCounts::default(),
         };
         let mut buf: Vec<u8> = Vec::new();
         write_summary(&mut buf, "contract", &s);
@@ -1165,7 +1388,7 @@ mod tests {
         assert_eq!(kinds.last().map(String::as_str), Some("end"));
         assert_eq!(kinds.iter().filter(|k| *k == "token").count(), 1);
         assert_eq!(kinds.iter().filter(|k| *k == "residual").count(), 1);
-        assert_eq!(kinds.iter().filter(|k| *k == "health").count(), 1);
+        assert_eq!(kinds.iter().filter(|k| *k == "health").count(), 2);
         // No NaN/inf can reach a parser.
         assert!(!out.contains("NaN") && !out.contains("inf"), "{out}");
     }
@@ -1229,15 +1452,149 @@ mod tests {
             gpu_span_us_p50: 8781.0,
             attributed_us_mean: attributed,
             attributed_us_p50: attributed,
-            unclosed: 0,
-            nest_errors: 0,
-            event_errors: 0,
-            pool_high_water: 634,
-            outside_token: 0,
+            health: HealthCounts {
+                pool_high_water: 634,
+                ..Default::default()
+            },
+            health_delta: HealthCounts::default(),
         };
         let mut buf: Vec<u8> = Vec::new();
         write_summary(&mut buf, "gen1", &s);
         print!("{}", String::from_utf8(buf).expect("utf8"));
+    }
+
+    /// A depth-0 phase whose children do not account for all of its time must
+    /// report the shortfall, and it must be attributed to the right parent.
+    #[test]
+    fn uncovered_localizes_the_shortfall_per_parent() {
+        let s = Summary {
+            tokens: 2,
+            rows: vec![
+                // full_attn 1000/token, children sum to 900 -> 100 uncovered.
+                PhaseRow { phase: Phase::FullAttn, calls: 2, total_us: 2000.0 },
+                PhaseRow { phase: Phase::AttnQkv, calls: 2, total_us: 1200.0 },
+                PhaseRow { phase: Phase::AttnCore, calls: 2, total_us: 600.0 },
+                // ffn 500/token, children sum to 500 -> 0 uncovered (tiled).
+                PhaseRow { phase: Phase::Ffn, calls: 2, total_us: 1000.0 },
+                PhaseRow { phase: Phase::FfnGateUp, calls: 2, total_us: 600.0 },
+                PhaseRow { phase: Phase::FfnDownResid, calls: 2, total_us: 400.0 },
+                // argmax has no children at all -> None, not Some(0).
+                PhaseRow { phase: Phase::Argmax, calls: 2, total_us: 40.0 },
+            ],
+            wall_us_mean: 2000.0,
+            ..Default::default()
+        };
+        assert_eq!(s.uncovered_in(Phase::FullAttn), Some(100.0));
+        assert_eq!(s.uncovered_in(Phase::Ffn), Some(0.0));
+        assert_eq!(
+            s.uncovered_in(Phase::Argmax),
+            None,
+            "a phase with no recorded children must not report a shortfall"
+        );
+        assert_eq!(
+            s.uncovered_in(Phase::GdnAttn),
+            None,
+            "a phase that never ran must not report a shortfall"
+        );
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_summary(&mut buf, "unit", &s);
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(
+            out.contains("uncovered parent=full_attn us_per_token=100.000 pct_of_parent=10.00"),
+            "{out}"
+        );
+        assert!(out.contains("uncovered parent=ffn us_per_token=0.000"), "{out}");
+        assert!(!out.contains("parent=argmax us_per_token"), "{out}");
+    }
+
+    /// lm_head must never be silently absent: when `final_norm` did not run the
+    /// difference is undefined, and an omitted row could be misread as a
+    /// zero-cost lm_head.
+    #[test]
+    fn lm_head_unavailability_is_stated_not_omitted() {
+        let s = Summary {
+            tokens: 1,
+            rows: vec![PhaseRow { phase: Phase::Head, calls: 1, total_us: 500.0 }],
+            wall_us_mean: 1000.0,
+            ..Default::default()
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_summary(&mut buf, "unit", &s);
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(
+            out.contains("name=lm_head status=unavailable reason=final_norm_never_ran"),
+            "{out}"
+        );
+        assert!(!out.contains("from=head-final_norm"), "{out}");
+    }
+
+    /// Both health scopes must be emitted, and the segment delta must be
+    /// independent of the lifetime totals.
+    #[test]
+    fn health_reports_lifetime_and_segment_separately() {
+        let s = Summary {
+            tokens: 1,
+            rows: vec![PhaseRow { phase: Phase::Embed, calls: 1, total_us: 5.0 }],
+            wall_us_mean: 100.0,
+            health: HealthCounts {
+                unclosed: 7,
+                nest_errors: 2,
+                negative_residual: 1,
+                abandoned_tokens: 3,
+                pool_high_water: 200,
+                ..Default::default()
+            },
+            // This segment contributed only one of the seven unclosed brackets.
+            health_delta: HealthCounts { unclosed: 1, ..Default::default() },
+            ..Default::default()
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_summary(&mut buf, "unit", &s);
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(
+            out.contains("health scope=lifetime clean=false unclosed_brackets=7 nest_errors=2"),
+            "{out}"
+        );
+        assert!(out.contains("negative_residual_tokens=1"), "{out}");
+        assert!(out.contains("abandoned_tokens=3"), "{out}");
+        assert!(
+            out.contains("health scope=segment clean=false unclosed_brackets=1 nest_errors=0"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn health_since_is_fieldwise_and_saturating() {
+        let base = HealthCounts {
+            unclosed: 5,
+            nest_errors: 1,
+            event_errors: 2,
+            outside_token: 3,
+            negative_residual: 4,
+            abandoned_tokens: 6,
+            pool_high_water: 10,
+        };
+        let now = HealthCounts {
+            unclosed: 9,
+            nest_errors: 1,
+            event_errors: 2,
+            outside_token: 5,
+            negative_residual: 4,
+            abandoned_tokens: 6,
+            pool_high_water: 42,
+        };
+        let d = now.since(&base);
+        assert_eq!(d.unclosed, 4);
+        assert_eq!(d.nest_errors, 0);
+        assert_eq!(d.outside_token, 2);
+        assert!(d.is_clean() == false);
+        // pool_high_water is a watermark, not a count: carried, not differenced.
+        assert_eq!(d.pool_high_water, 42);
+        // A baseline ahead of the current value (can only happen if health were
+        // ever reset) must saturate to 0, not underflow-panic.
+        assert_eq!(base.since(&now).unclosed, 0);
+        assert!(HealthCounts::default().is_clean());
     }
 
     #[test]

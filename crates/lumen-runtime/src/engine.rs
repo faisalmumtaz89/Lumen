@@ -336,6 +336,22 @@ impl InferenceEngine {
         // sample), but a benchmark that compares against llama-bench's tgN must time
         // exactly N decode calls and nothing else — including no full-vocab scan
         // that the shipping GPU-argmax path never performs per token.
+        // Per-phase CUDA decode profile (`LUMEN_CUDA_PROFILE`, default OFF ->
+        // no-op). Lives here rather than in the backend because the backend is
+        // reached as `&dyn ComputeBackend` upstream, with no `Any` supertrait to
+        // downcast through.
+        //
+        // It is a drop guard, not a statement after the loop: the decode loop
+        // below propagates errors with `?`, and every token that already
+        // completed has been folded into the profiler's accumulator by its own
+        // `token_settle`. A post-loop flush is skipped on error, and those
+        // orphaned tokens would then surface inside the NEXT segment's block
+        // under a label implying they belonged to it. Dropping happens on every
+        // exit path, so each `generate` call reports exactly its own tokens and
+        // leaves nothing behind.
+        #[cfg(feature = "cuda")]
+        let _profile_segment = crate::cuda::profiler::begin_segment();
+
         let decode_loop_start = Instant::now();
 
         if use_gpu_greedy {
@@ -411,20 +427,6 @@ impl InferenceEngine {
         let decode_time = decode_start.elapsed();
         let decode_loop_time = decode_loop_start.elapsed();
         let total_time = total_start.elapsed();
-
-        // Per-phase CUDA decode profile (`LUMEN_CUDA_PROFILE`, default OFF ->
-        // no-op). Emitted here because the backend is reached as
-        // `&dyn ComputeBackend` upstream and cannot be downcast to CudaBackend.
-        // Each `generate` call gets its own `[PROFILE]` block with a monotonic
-        // label, so warmup sequences stay separable from measured ones and no
-        // accumulation leaks between them.
-        #[cfg(feature = "cuda")]
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static SEQ: AtomicU64 = AtomicU64::new(0);
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            crate::cuda::profiler::print_and_reset(&format!("gen{seq}"));
-        }
 
         let io = match weights.io_snapshot() {
             Some(snap) => IoMetrics {
