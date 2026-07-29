@@ -114,6 +114,27 @@ fn bf16_autotune_enabled() -> bool {
     })
 }
 
+/// DEFAULT-OFF candidate (`LUMEN_CUDA_GDN_SPLIT_SITES=1`): pass the Q4 split
+/// siblings at the two GDN `launch_matvec` sites (fused `gdn_qkv` [4096,8192]
+/// — the largest matvec on the 24 GDN layers — and `gdn_gate`). The split
+/// clones are ALREADY created for both (SplitWeightKind::Wq / AttnGate) and
+/// sit unread in VRAM: the plain `launch_matvec` shim hard-codes the sibling
+/// to `None`, so these two sites never took the split/lane upgrade every
+/// full-attn and FFN projection got (r2 audit §8.9). Same weights, same
+/// bytes, same activation precision — kernel/access-pattern only.
+fn gdn_split_sites_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let on = parse_env_truthy("LUMEN_CUDA_GDN_SPLIT_SITES").unwrap_or(false);
+        if on {
+            // Unconditional dispatch-proof marker (not behind VERBOSE).
+            eprintln!("[GDN] SPLIT_SITES=ON: gdn_qkv/gdn_gate use Q4 split siblings");
+        }
+        on
+    })
+}
+
 /// Env-gate for the custom bandwidth-optimal BF16 decode GEMV kernel
 /// (`matvec_bf16_v4`). DEFAULT-OFF: unset / `0` keeps the cuBLAS `GemmEx`
 /// batch-1 GEMV path byte-identical. When set (`1|true|yes|on`), every eligible
@@ -5286,7 +5307,7 @@ impl CudaBackend {
             // (dead work: nothing consumes this result before the overwrite).
             if !gdn_skip_dup_qkv {
                 unsafe {
-                    launch_matvec(
+                    launch_matvec_ext(
                         &self.device,
                         &st.kernels,
                         &lw.wq,
@@ -5298,6 +5319,13 @@ impl CudaBackend {
                         lw.wq_f16.as_ref(),
                         Some(&mut st.scratch.input_f16),
                         st.scratch.input_q8_1.as_mut(),
+                        // r2 §8.9: the split clone (SplitWeightKind::Wq) exists
+                        // but this F32-path site never consumed it. Default-OFF.
+                        if gdn_split_sites_enabled() {
+                            lw.q4_split_wq.as_ref()
+                        } else {
+                            None
+                        },
                     )?;
                 }
             }
@@ -5388,7 +5416,7 @@ impl CudaBackend {
 
             // Gate matvec (moved here from step 9 to share quantized input)
             unsafe {
-                launch_matvec(
+                launch_matvec_ext(
                     &self.device,
                     &st.kernels,
                     attn_gate_w,
@@ -5400,6 +5428,13 @@ impl CudaBackend {
                     lw.attn_gate_f16.as_ref(),
                     Some(&mut st.scratch.input_f16),
                     st.scratch.input_q8_1.as_mut(),
+                    // r2 §8.9: split clone (SplitWeightKind::AttnGate) exists;
+                    // this site never consumed it. Default-OFF.
+                    if gdn_split_sites_enabled() {
+                        lw.q4_split_attn_gate.as_ref()
+                    } else {
+                        None
+                    },
                 )?;
             }
         }
@@ -17247,7 +17282,12 @@ impl ComputeBackend for CudaBackend {
                     expected.push(f);
                 }
             };
-            for lw in &st.layer_weights_cache {
+            // Iterate the freshly-built `cache`, NOT st.layer_weights_cache —
+            // the latter is not assigned until after this block (r2 audit
+            // §6.0: iterating it here read the PREVIOUS load's value, empty on
+            // first load, so expected==[] and the verifier either hard-failed
+            // on plumbing or certified silence).
+            for lw in &cache {
                 // GDN layers reuse `wq` as their fused in-projection and
                 // dispatch it under the `gdn_qkv` label, so which family a
                 // layer contributes depends on its layer_type.
