@@ -976,6 +976,40 @@ mod tests {
         assert_eq!(before, names.len(), "duplicate phase name");
     }
 
+    /// The default-OFF contract, to the extent it is testable without a GPU.
+    ///
+    /// `begin`/`end`/`token_begin`/`token_end` need a live `CudaStream`, which
+    /// cannot be constructed on a machine without an NVIDIA device, so this
+    /// covers only the gate itself plus the two stream-free entry points. The
+    /// gate is what every other entry point checks first, so proving it reads 0
+    /// and that the stream-free paths are inert is the meaningful part; the
+    /// remainder is verified by inspection (each begins with the same
+    /// `level() == 0` early return).
+    #[test]
+    fn disabled_by_default_and_stream_free_entry_points_are_inert() {
+        if std::env::var("LUMEN_CUDA_PROFILE").is_ok() {
+            // An operator running the suite with the flag exported would
+            // otherwise see a spurious failure. The contract under test is the
+            // default, so skip rather than assert the wrong thing.
+            return;
+        }
+        assert_eq!(level(), 0, "must be disabled when the env var is unset");
+        assert!(!enabled());
+
+        // Neither of these may panic, print, or accumulate state.
+        token_settle();
+        print_and_reset("must-not-print");
+
+        let s = summary();
+        assert_eq!(s.tokens, 0);
+        assert!(s.rows.is_empty());
+        assert_eq!(s.unclosed, 0);
+        assert_eq!(s.nest_errors, 0);
+        assert_eq!(s.event_errors, 0);
+        assert_eq!(s.outside_token, 0);
+        assert_eq!(s.pool_high_water, 0, "no event may be allocated when off");
+    }
+
     #[test]
     fn stats_helpers() {
         assert_eq!(mean(&[]), 0.0);
