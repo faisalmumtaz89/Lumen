@@ -26,6 +26,10 @@ pub mod kv;
 #[cfg(target_os = "macos")]
 pub mod metal;
 pub mod pipeline;
+/// Q6_K block layout reference + host mirror of the `matvec_q6_k_f32` CUDA
+/// kernel's index math. Deliberately outside `cuda/` so its tests run on hosts
+/// without the `cuda` feature or an NVIDIA GPU.
+pub mod q6k_ref;
 pub mod runtime_defaults;
 pub mod sampling;
 pub mod session;

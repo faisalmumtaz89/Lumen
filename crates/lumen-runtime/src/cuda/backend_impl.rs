@@ -35,9 +35,9 @@ use super::gpu_buffers::{upload_layer_weights, GpuWeightBuf, LayerWeightsGpu};
 // Per-phase decode profiler. Every `prof::` call short-circuits on a cached
 // `u8` when `LUMEN_CUDA_PROFILE` is unset, so the default path records no
 // events and adds no synchronization.
+use super::kv_cache::KvCacheGpu;
 use super::profiler as prof;
 use super::profiler::Phase as Ph;
-use super::kv_cache::KvCacheGpu;
 use super::shaders::EMBED_KERNEL_SOURCE;
 use super::types::LaunchConfig;
 use cudarc::cublas::{sys as cublas_sys, Gemv, GemvConfig};
@@ -9379,6 +9379,69 @@ unsafe fn launch_matvec(
     )
 }
 
+/// Launch `matvec_q6_k_f32` / `matvec_q6_k_f32_nr8` (candidates C1/C3).
+///
+/// Contract, matching the shader header:
+/// * args `(weight, x, out, out_dim, in_dim)`
+/// * grid `(ceil(out_dim / nr), 1, 1)`, block `(128, 1, 1)` = 4 warps
+/// * `in_dim % 256 == 0` — the kernel derives its super-block count as
+///   `in_dim / 256`, so a ragged tail would read past the row. Checked here
+///   rather than trusted: `upload_tensor` guards on the element count, but this
+///   guards the SHAPE the caller passes, which is a different fact.
+/// * `nr` must match the kernel handle (1 for `matvec_q6_k_f32`, 8 for `_nr8`).
+///
+/// Weight bytes read: `out_dim * (in_dim / 256) * 210`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_matvec_q6_k(
+    device: &CudaDevice,
+    f: &CudaFunction,
+    weight: &CudaSlice<u8>,
+    input: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    out_dim: usize,
+    in_dim: usize,
+    nr: u32,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    const Q6K_BLOCK_ELEM: usize = 256;
+    const Q6K_BLOCK_BYTE: usize = 210;
+    const Q6K_THREADS: u32 = 128;
+
+    if in_dim % Q6K_BLOCK_ELEM != 0 {
+        return Err(RuntimeError::Compute(format!(
+            "matvec_q6_k_f32 {label}: in_dim {in_dim} is not a multiple of \
+             {Q6K_BLOCK_ELEM} (Q6_K super-block)"
+        )));
+    }
+    let needed = out_dim * (in_dim / Q6K_BLOCK_ELEM) * Q6K_BLOCK_BYTE;
+    if weight.len() < needed {
+        return Err(RuntimeError::Compute(format!(
+            "matvec_q6_k_f32 {label}: weight buffer has {} bytes, needs {needed} \
+             for [{out_dim} x {in_dim}]",
+            weight.len()
+        )));
+    }
+
+    let out_u32 = out_dim as u32;
+    let in_u32 = in_dim as u32;
+    let cfg = CudarcLaunchConfig {
+        grid_dim: (out_u32.div_ceil(nr), 1, 1),
+        block_dim: (Q6K_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    device
+        .stream
+        .launch_builder(f)
+        .arg(weight)
+        .arg(input)
+        .arg(output)
+        .arg(&out_u32)
+        .arg(&in_u32)
+        .launch(cfg)
+        .map_err(|e| RuntimeError::Compute(format!("matvec_q6_k_f32 {label}: {e}")))?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_matvec_ext(
     device: &CudaDevice,
@@ -10001,6 +10064,25 @@ unsafe fn launch_matvec_ext(
     }
 
     match weight {
+        // Native Q6_K (candidate C1, `LUMEN_CUDA_Q6K_NATIVE=1`): 210 B per 256
+        // elements = 0.8203 B/weight, the same byte count llama.cpp reads.
+        // Only reachable when `upload_tensor` produced a `Q6KRaw`, which only
+        // happens with the flag on, so this arm is unreachable by default.
+        //
+        // Deliberately a hard error rather than a fallback if the kernel is
+        // absent: an armed flag that silently does nothing is the exact failure
+        // mode that cost this campaign three debug cycles.
+        GpuWeightBuf::Q6KRaw(w_q6) => {
+            let f = kernels.matvec_q6_k_f32.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!(
+                    "matvec_q6_k_f32 unavailable for {label}: LUMEN_CUDA_Q6K_NATIVE is armed \
+                     (the weight was uploaded as Q6KRaw) but the kernel failed to compile"
+                ))
+            })?;
+            launch_matvec_q6_k(device, f, w_q6, input, output, out_dim, in_dim, 1, label)?;
+            crate::runtime_defaults::route_census_record(label, "Q6K_NATIVE");
+            return Ok(());
+        }
         GpuWeightBuf::F32(w_f32) => {
             let cfg = GemvConfig {
                 trans: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
@@ -10670,6 +10752,15 @@ unsafe fn launch_matvec_residual(
     }
 
     match weight {
+        // No residual Q6_K kernel: the residual sites are `wo` and `w_down`,
+        // which are Q4_0 on every layer of every shipped model, so a Q6_K
+        // weight cannot reach here. Explicit error beats a silent wrong path
+        // if a future mixed-quant file puts a K-quant on one of them.
+        GpuWeightBuf::Q6KRaw(_) => {
+            return Err(RuntimeError::Compute(format!(
+                "Q6_K residual matvec not implemented ({label}):                  LUMEN_CUDA_Q6K_NATIVE cannot cover residual projections"
+            )));
+        }
         GpuWeightBuf::F32(w_f32) => {
             // Copy residual into output so cuBLAS can accumulate: y = W*x + y.
             device.stream.memcpy_dtod(residual, output).map_err(|e| {

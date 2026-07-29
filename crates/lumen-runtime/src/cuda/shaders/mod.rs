@@ -482,6 +482,26 @@ pub const MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q4_spl
 pub const MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE: &str =
     include_str!("matvec_q4_split_f32_lane.cu");
 
+/// Native Q6_K matvec with F32 activations — reads 210 B per 256 elements
+/// (0.8203 B/weight), the same byte count llama.cpp reads, instead of the
+/// 4.0 B/weight F32 expansion / 2.0 B/weight F16 cache the default path uses.
+///
+/// Unit of work is one 32-element group; a 128-thread CTA owns `NR` output rows
+/// and reuses each activation slice across them. All floating-point ops are
+/// pinned with inline-PTX `.rn`, so the F32 result is independent of compiler
+/// reassociation. Only baseline PTX (`cvt.f32.f16`, `add/fma.rn.f32`,
+/// `cvt.rn.f32.s32`, `shfl.sync.bfly.b32`) — no dp4a, no mma — so it loads
+/// through the plain `load_fn`, like `matvec_q4_split_f32_lane`.
+///
+/// The element mapping is regression-tested without a GPU against the ggml
+/// packer by `lumen_runtime::q6k_ref`; see that module before editing the
+/// inner loop, because the natural reading of the `ql` nibbles is wrong.
+///
+/// Kernels: `matvec_q6_k_f32` (NR=1, layer projections),
+/// `matvec_q6_k_f32_nr8` (NR=8, the [248320 x 4096] head).
+/// Requires: `in_dim % 256 == 0`.
+pub const MATVEC_Q6_K_F32_KERNEL_SOURCE: &str = include_str!("matvec_q6_k_f32.cu");
+
 /// Codegen-LOCKED variant of `MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE`. Same SoA
 /// split layout and integer dp4a dot, but every floating-point op in the
 /// per-block epilogue and the cross-warp reduction is pinned with inline-PTX

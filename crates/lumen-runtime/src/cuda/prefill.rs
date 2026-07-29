@@ -495,6 +495,17 @@ pub(crate) unsafe fn launch_gemm_projection(
     }
 
     match weight {
+        // Native Q6_K is a DECODE-only lever (`LUMEN_CUDA_Q6K_NATIVE` /
+        // `LUMEN_CUDA_LMHEAD_Q6K`); prefill keeps the dequant->F16->HGEMM path
+        // and there is no Q6_K GEMM. Explicit error rather than a silent
+        // mis-dispatch. Reachable only if a Q6_K weight is routed through
+        // prefill, which the flags' upload path does not do for prefill-live
+        // tensors -- see the deliverable notes on the prefill/decode split.
+        GpuWeightBuf::Q6KRaw(_) => {
+            return Err(RuntimeError::Compute(
+                "Q6_K prefill matmul not implemented".to_string(),
+            ));
+        }
         GpuWeightBuf::F32(w_f32) => {
             let weight_needed = out_dim * in_dim;
             if w_f32.len() < weight_needed {
@@ -1043,6 +1054,17 @@ pub(crate) unsafe fn launch_gemm_residual(
     }
 
     match weight {
+        // Native Q6_K is a DECODE-only lever (`LUMEN_CUDA_Q6K_NATIVE` /
+        // `LUMEN_CUDA_LMHEAD_Q6K`); prefill keeps the dequant->F16->HGEMM path
+        // and there is no Q6_K GEMM. Explicit error rather than a silent
+        // mis-dispatch. Reachable only if a Q6_K weight is routed through
+        // prefill, which the flags' upload path does not do for prefill-live
+        // tensors -- see the deliverable notes on the prefill/decode split.
+        GpuWeightBuf::Q6KRaw(_) => {
+            return Err(RuntimeError::Compute(
+                "Q6_K prefill matmul not implemented".to_string(),
+            ));
+        }
         GpuWeightBuf::F32(w_f32) => {
             let weight_needed = out_dim * in_dim;
             if w_f32.len() < weight_needed {
@@ -2327,6 +2349,17 @@ unsafe fn launch_matvec_slice(
     let in_dim_u32 = in_dim as u32;
 
     match weight {
+        // Native Q6_K is a DECODE-only lever (`LUMEN_CUDA_Q6K_NATIVE` /
+        // `LUMEN_CUDA_LMHEAD_Q6K`); prefill keeps the dequant->F16->HGEMM path
+        // and there is no Q6_K GEMM. Explicit error rather than a silent
+        // mis-dispatch. Reachable only if a Q6_K weight is routed through
+        // prefill, which the flags' upload path does not do for prefill-live
+        // tensors -- see the deliverable notes on the prefill/decode split.
+        GpuWeightBuf::Q6KRaw(_) => {
+            return Err(RuntimeError::Compute(
+                "Q6_K prefill matmul not implemented".to_string(),
+            ));
+        }
         GpuWeightBuf::F32(_) => unreachable!("F32 uses cuBLAS SGEMM path"),
         GpuWeightBuf::F16Raw(w_f16) => {
             device
@@ -2942,6 +2975,17 @@ unsafe fn launch_matvec_residual_slice(
     let in_dim_u32 = in_dim as u32;
 
     match weight {
+        // Native Q6_K is a DECODE-only lever (`LUMEN_CUDA_Q6K_NATIVE` /
+        // `LUMEN_CUDA_LMHEAD_Q6K`); prefill keeps the dequant->F16->HGEMM path
+        // and there is no Q6_K GEMM. Explicit error rather than a silent
+        // mis-dispatch. Reachable only if a Q6_K weight is routed through
+        // prefill, which the flags' upload path does not do for prefill-live
+        // tensors -- see the deliverable notes on the prefill/decode split.
+        GpuWeightBuf::Q6KRaw(_) => {
+            return Err(RuntimeError::Compute(
+                "Q6_K prefill matmul not implemented".to_string(),
+            ));
+        }
         GpuWeightBuf::F32(_) => unreachable!("F32 uses cuBLAS SGEMM path"),
         GpuWeightBuf::Q8Aligned(w_q8a) => {
             // Q8_0 aligned residual prefill: dp4a with native int* loads.
