@@ -2351,6 +2351,161 @@ impl CudaBackend {
                         }
                     }
                 }
+            } else if crate::runtime_defaults::qkv_decouple()
+                && matches!(&lw.wq, GpuWeightBuf::F32(_))
+                && lw.wq_f16.is_some()
+                && lw.wk_f16.is_some()
+                && lw.wv_f16.is_some()
+            {
+                // ---------------------------------------------------------------
+                // C2 (`LUMEN_CUDA_QKV_DECOUPLE=1`): DECOUPLED QKV dispatch.
+                //
+                // This branch is a variant of the F16-HGEMV branch immediately
+                // below, entered only when the flag is set. With the flag unset
+                // the guard is false on its first conjunct and control falls to
+                // the original branch unchanged, so flag-off behaviour is
+                // byte-identical by construction -- no reordering, no shared
+                // state, nothing to keep in sync beyond the guard itself.
+                //
+                // WHAT THE DEFAULT BRANCH GETS WRONG. Its guard is "wq is F32
+                // AND all three F16 caches exist". It never inspects wk/wv's
+                // actual weight format -- only whether a cache happens to be
+                // present. On 9B-Q4 layers 3/15/27/31, wq is a host-dequanted
+                // Q6_K (hence F32) while wk/wv are natively Q4Raw, and
+                // dequant_layer_q8_to_f16 builds F16 caches for Q4Raw on every
+                // full-attention layer. So two 0.5625 B/w tensors get read at
+                // 2.0 B/w through cublasGemmBatchedEx:
+                //
+                //   8 tensors x 4,194,304 w x (2.0 - 0.5625) B/w
+                //     = 48,234,496 B = 46.0 MiB/token   (18.0 -> 64.0 MiB)
+                //
+                // It also silently bypasses the F32-exact activation policy:
+                // q4_act_plan is only consulted inside launch_matvec_ext, which
+                // this branch never reaches, so wk/wv run F16 activations on a
+                // family the plan pins to F32.
+                //
+                // WHY THEY WERE COUPLED IN THE FIRST PLACE. Not a fused kernel
+                // and not a shared output buffer -- wq/wk/wv are already
+                // separate launches into separate buffers. The real coupling is
+                // the ACTIVATION FORMAT: this branch normalizes once to F16,
+                // while the native Q4 ladder consumes F32 `scratch.normed`. A
+                // split dispatch needs both, which is the one extra kernel this
+                // branch pays: an RMSNorm over hidden_dim (~16 KB write).
+                //
+                // ORDERING. `normed` (F32) is produced first, then `input_f16`,
+                // then wq consumes `input_f16`, then wk/wv consume `normed`.
+                // The two norms read the same `x_gpu` and write disjoint
+                // buffers. wq is dispatched BEFORE wk/wv because
+                // launch_matvec_ext is passed `input_f16` as scratch and would
+                // be free to overwrite it on an HGEMV fallback arm; with Q4Raw
+                // weights and an F32 plan it takes the native ladder and does
+                // not, but the ordering makes that a non-issue rather than an
+                // invariant to remember.
+                //
+                // The precomputed KV pointer arrays (pcp.kv_*_ptrs) simply go
+                // unread on these layers. They stay allocated and index-aligned
+                // for every layer, so nothing else observes the difference.
+                //
+                // NOT byte-identical: F16 weights are swapped for F32-exact Q4.
+                // ---------------------------------------------------------------
+                {
+                    let block_size = rmsnorm_block_size(hidden_dim);
+                    let shared_bytes = rmsnorm_shared_bytes(block_size);
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (block_size, 1, 1),
+                        shared_mem_bytes: shared_bytes,
+                    };
+                    let dim = hidden_dim as u32;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.rmsnorm)
+                            .arg(&st.scratch.x_gpu)
+                            .arg(&lw.attn_norm)
+                            .arg(&mut st.scratch.normed)
+                            .arg(&eps)
+                            .arg(&dim)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("rmsnorm attn decouple launch: {e}"))
+                    })?;
+                }
+                unsafe {
+                    launch_fused_rmsnorm_f16(
+                        &self.device,
+                        &st.kernels,
+                        &st.scratch.x_gpu,
+                        &lw.attn_norm,
+                        &mut st.scratch.input_f16,
+                        eps,
+                        hidden_dim,
+                        "attn DECOUPLE",
+                    )?;
+                }
+                // wq keeps its own route: the F16 cache today, or C1's native
+                // Q6_K kernel when LUMEN_CUDA_Q6K_NATIVE is also on (in which
+                // case wq is Q6KRaw, this guard is false, and we are not here
+                // at all -- C1 subsumes C2 on these layers).
+                if let Some(ref wq_f16) = lw.wq_f16 {
+                    let (wq_out_buf, wq_od) = if has_qgate_fusion {
+                        (
+                            st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>,
+                            wq_out_dim,
+                        )
+                    } else {
+                        (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
+                    };
+                    unsafe {
+                        launch_hgemv_f16_preconverted(
+                            &self.device,
+                            wq_f16,
+                            &st.scratch.input_f16,
+                            wq_out_buf,
+                            wq_od,
+                            hidden_dim,
+                            "wq",
+                            st.algo_cache.get(wq_od, hidden_dim),
+                        )?;
+                    }
+                    // The default branch records nothing at all, which is why
+                    // the census reports wq/wk/wv at 4/token against 8
+                    // full-attention layers. Tag it so this arm is observable.
+                    crate::runtime_defaults::route_census_record("wq", "HGEMV_F16_DECOUPLED");
+                }
+                // wk/wv now reach launch_matvec_ext, so they get the native Q4
+                // ladder, their SoA split siblings, and the activation plan.
+                unsafe {
+                    launch_matvec_ext(
+                        &self.device,
+                        &st.kernels,
+                        &lw.wk,
+                        &st.scratch.normed,
+                        &mut st.scratch.k,
+                        kv_dim,
+                        hidden_dim,
+                        "wk",
+                        lw.wk_f16.as_ref(),
+                        Some(&mut st.scratch.input_f16),
+                        st.scratch.input_q8_1.as_mut(),
+                        lw.q4_split_wk.as_ref(),
+                    )?;
+                    launch_matvec_ext(
+                        &self.device,
+                        &st.kernels,
+                        &lw.wv,
+                        &st.scratch.normed,
+                        &mut st.scratch.v,
+                        kv_dim,
+                        hidden_dim,
+                        "wv",
+                        lw.wv_f16.as_ref(),
+                        Some(&mut st.scratch.input_f16),
+                        st.scratch.input_q8_1.as_mut(),
+                        lw.q4_split_wv.as_ref(),
+                    )?;
+                }
             } else if matches!(&lw.wq, GpuWeightBuf::F32(_))
                 && lw.wq_f16.is_some()
                 && lw.wk_f16.is_some()
