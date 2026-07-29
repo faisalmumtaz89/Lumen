@@ -32,6 +32,11 @@ use super::decode::{
 };
 use super::ffi::CudaDevice;
 use super::gpu_buffers::{upload_layer_weights, GpuWeightBuf, LayerWeightsGpu};
+// Per-phase decode profiler. Every `prof::` call short-circuits on a cached
+// `u8` when `LUMEN_CUDA_PROFILE` is unset, so the default path records no
+// events and adds no synchronization.
+use super::profiler as prof;
+use super::profiler::Phase as Ph;
 use super::kv_cache::KvCacheGpu;
 use super::shaders::EMBED_KERNEL_SOURCE;
 use super::types::LaunchConfig;
@@ -2111,11 +2116,14 @@ impl CudaBackend {
             // hidden state). x_gpu is NOT updated here -- it retains the old value.
             // The FFN block reads from attn_proj, and the caller copies attn_proj
             // to x_gpu after the full layer (GDN attention + FFN) completes.
+            prof::begin(Ph::GdnAttn, &self.device.stream);
             self.compute_gdn_attention_gpu(layer_idx, st)?;
+            prof::end(Ph::GdnAttn, &self.device.stream);
         // Attribution ablation: skip the standard attention block on the 8
         // full-attention layers, keeping their FFN. Part of splitting the 21%
         // "everything else" that llama.cpp evidently does not pay.
         } else {
+            prof::begin(Ph::FullAttn, &self.device.stream);
             // Log EVERY layer entering the standard attention branch. The
             // mid-branch probe saw only 4 of the 8 full-attention layers, and
             // the census agrees (wq/wk/wv 4/token while wo is 8/token from the
@@ -2133,6 +2141,12 @@ impl CudaBackend {
             // scratch buffer, then deinterleave + per-head norm produces final Q and gate.
             let has_qgate_fusion = lw.attn_q_norm.is_some();
             let wq_out_dim = if has_qgate_fusion { q_dim * 2 } else { q_dim };
+
+            // `AttnQkv` covers the input RMSNorm together with the projections:
+            // the norm kernel is selected inside each weight-format arm and one
+            // arm fuses it into the projection kernel itself, so no standalone
+            // input-norm region exists to bracket.
+            prof::begin(Ph::AttnQkv, &self.device.stream);
 
             // 1. Fused RMSNorm + QKV projections (same logic as compute_layer).
             // For mixed-precision models (e.g. Qwen3.5-9B Q4 LBC where wq is
@@ -2707,9 +2721,12 @@ impl CudaBackend {
                 }
             }
 
+            prof::end(Ph::AttnQkv, &self.device.stream);
+
             // Q+gate fusion post-processing: deinterleave q_gate -> q + gate_buf,
             // then per-head RMSNorm on Q (attn_q_norm) and K (attn_k_norm).
             // Must run AFTER all QKV projection branches and BEFORE RoPE.
+            prof::begin(Ph::AttnQkNorm, &self.device.stream);
             if has_qgate_fusion {
                 let q_gate_buf = st.scratch.q_gate.as_ref().unwrap();
                 let gate_buf = st.scratch.gate_buf.as_mut().unwrap();
@@ -2820,7 +2837,10 @@ impl CudaBackend {
                 }
             }
 
+            prof::end(Ph::AttnQkNorm, &self.device.stream);
+
             // QKV bias (Qwen2-family, decode).
+            prof::begin(Ph::AttnBias, &self.device.stream);
             if lw.bq.is_some() || lw.bk.is_some() || lw.bv.is_some() {
                 let block = 256u32;
                 unsafe {
@@ -2881,7 +2901,10 @@ impl CudaBackend {
                 }
             }
 
+            prof::end(Ph::AttnBias, &self.device.stream);
+
             // 2. RoPE.
+            prof::begin(Ph::AttnRope, &self.device.stream);
             {
                 let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
                 let actual_rot = if rotary_dim > 0 && rotary_dim < head_dim as u32 {
@@ -2928,19 +2951,24 @@ impl CudaBackend {
                 .map_err(|e| RuntimeError::Compute(format!("rope launch: {e}")))?;
             }
 
+            prof::end(Ph::AttnRope, &self.device.stream);
+
             // 3. KV cache write.
+            prof::begin(Ph::AttnKvWrite, &self.device.stream);
             {
                 let kv_cache = st.kv_caches.get_mut(layer_idx).ok_or_else(|| {
                     RuntimeError::Compute(format!("no KV cache for layer {layer_idx}"))
                 })?;
                 kv_cache.append_kv(&self.device, &st.scratch.k, &st.scratch.v)?;
             }
+            prof::end(Ph::AttnKvWrite, &self.device.stream);
 
             // 4. Attention. gate: routes to the tiled streaming-softmax
             // kernel at long context (seq_len > LUMEN_CUDA_DECODE_TILED_THRESHOLD,
             // default 0 = "tiled-always") or when LUMEN_CUDA_DECODE_TILED=1
             // forces it. Operators can set `LUMEN_CUDA_DECODE_TILED_THRESHOLD=
             // 4294967295` to opt out (force single-block below the 40_950 ceiling).
+            prof::begin(Ph::AttnCore, &self.device.stream);
             {
                 let kv_cache = &st.kv_caches[layer_idx];
                 let attn_seq_len = kv_cache.seq_len() as u32;
@@ -2967,6 +2995,13 @@ impl CudaBackend {
                 }
                 .map_err(|e| RuntimeError::Compute(format!("attention_decode launch: {e}")))?;
             }
+
+            prof::end(Ph::AttnCore, &self.device.stream);
+
+            // `AttnWo` spans the sigmoid gating, its copy, and the output
+            // projection (which folds the post-attention residual, so there is
+            // no separate residual region to bracket).
+            prof::begin(Ph::AttnWo, &self.device.stream);
 
             // 4b. Q+gate sigmoid gating: attn_out = sigmoid(gate_buf) * attn_out.
             // Applied AFTER attention, BEFORE output projection.
@@ -3145,6 +3180,8 @@ impl CudaBackend {
                     }
                 }
             }
+            prof::end(Ph::AttnWo, &self.device.stream);
+            prof::end(Ph::FullAttn, &self.device.stream);
         } // end else (standard attention path — skipped for GDN layers)
 
         // Re-borrow layer weights for the FFN block (shared between standard and GDN layers).
@@ -3154,6 +3191,7 @@ impl CudaBackend {
         // the three-phase MoE forward (router -> per-expert FFN -> accum) and
         // skip the dense FFN block below entirely.
         if let Some(moe_meta) = st.moe_meta_cache.get(layer_idx).and_then(|m| m.as_ref()) {
+            prof::begin(Ph::MoeFfn, &self.device.stream);
             let moe_layer_blob = lw.moe_layer_blob.as_ref().ok_or_else(|| {
                 RuntimeError::Compute(format!(
                     "MoE layer {layer_idx} missing moe_layer_blob; \
@@ -3354,8 +3392,16 @@ impl CudaBackend {
 
             // MoE branch is complete; skip the dense FFN block below. MoE
             // leaves its result in attn_proj, so the caller still commits.
+            prof::end(Ph::MoeFfn, &self.device.stream);
             return Ok(LayerOutput::NeedsCommit);
         }
+
+        // Dense FFN block. `Ffn` is the depth-0 region (shared by GDN and
+        // full-attention layers); `FfnGateUp` / `FfnDownResid` refine it. Both
+        // must be closed before EVERY exit of the FFN block -- two arms fold
+        // the residual into the down store and `return` early.
+        prof::begin(Ph::Ffn, &self.device.stream);
+        prof::begin(Ph::FfnGateUp, &self.device.stream);
 
         // 6. FFN: fused or separate rmsnorm + gate/up + swiglu + down + residual.
         //
@@ -4167,6 +4213,9 @@ impl CudaBackend {
             }
         } // end if !fused_glu_fired
 
+        prof::end(Ph::FfnGateUp, &self.device.stream);
+        prof::begin(Ph::FfnDownResid, &self.device.stream);
+
         // SwiGLU + Down projection.
         //
         // When fused_glu_fired: SwiGLU is already applied inline. scratch.gate
@@ -4396,6 +4445,10 @@ impl CudaBackend {
                                     inter_dim,
                                     "down",
                                 )?;
+                                // Residual folded into the down store: this arm
+                                // exits the FFN block here.
+                                prof::end(Ph::FfnDownResid, &self.device.stream);
+                                prof::end(Ph::Ffn, &self.device.stream);
                                 return Ok(LayerOutput::InPlace);
                             } else {
                                 launch_matvec_preq8_1_split(
@@ -4703,6 +4756,10 @@ impl CudaBackend {
                                 inter_dim,
                                 "down",
                             )?;
+                            // Residual folded into the down store: this arm
+                            // exits the FFN block here.
+                            prof::end(Ph::FfnDownResid, &self.device.stream);
+                            prof::end(Ph::Ffn, &self.device.stream);
                             return Ok(LayerOutput::InPlace);
                         } else {
                             launch_matvec_preq8_1_split(
@@ -4782,6 +4839,9 @@ impl CudaBackend {
             }
             .map_err(|e| RuntimeError::Compute(format!("residual_add launch: {e}")))?;
         }
+
+        prof::end(Ph::FfnDownResid, &self.device.stream);
+        prof::end(Ph::Ffn, &self.device.stream);
 
         // Layer output is in st.scratch.attn_proj; the caller commits it to
         // st.scratch.x_gpu before the next layer.
@@ -5082,6 +5142,11 @@ impl CudaBackend {
         // it: dispatch ONLY the parity projection. Arithmetic-identical
         // (BYTE-identical); env-gated default-OFF for the A/B gate.
         let gdn_skip_dup_qkv = gdn_convstate_parity_qkv && gdn_skip_dup_qkv_enabled();
+
+        // `GdnQkv` brackets the whole projection region, not one arm, so
+        // flipping between the fused-preq, unfused, and convstate-parity arms
+        // cannot move work out of the phase table.
+        prof::begin(Ph::GdnQkv, &self.device.stream);
 
         if gdn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
             // === FUSED: RMSNorm + Q8_1 quantize in 1 dispatch ===
@@ -5466,6 +5531,14 @@ impl CudaBackend {
                 _ => {}
             }
         }
+
+        prof::end(Ph::GdnQkv, &self.device.stream);
+
+        // `GdnConvRecur` brackets conv1d together with the recurrent state
+        // update. They are merged because three of the four dispatch arms
+        // (fused-conv, register-resident, megakernel) fuse conv and recurrence
+        // into a single kernel, so no split is honest across all arms.
+        prof::begin(Ph::GdnConvRecur, &self.device.stream);
 
         // [GDNPROJSS] DECODE GDN projection-output whole-buffer sumsq (env
         // LUMEN_MOE_PROBE=1, default OFF -> byte-identical). Captures the GDN
@@ -6435,6 +6508,12 @@ impl CudaBackend {
             }
         }
 
+        prof::end(Ph::GdnConvRecur, &self.device.stream);
+
+        // `GdnOut` spans the output norm-gate region and the ssm_out
+        // projection (Step 11).
+        prof::begin(Ph::GdnOut, &self.device.stream);
+
         // --- Steps 8+10: Fused RMSNorm + SiLU(gate) * normed output ---
         // Fused path: gdn_rmsnorm_silu_gate (2 kernels -> 1).
         // Falls back to unfused rmsnorm + silu_mul if unavailable.
@@ -6591,6 +6670,9 @@ impl CudaBackend {
             }
         }
 
+        prof::end(Ph::GdnOut, &self.device.stream);
+        prof::begin(Ph::GdnGlue, &self.device.stream);
+
         // --- Step 12+13: Fused residual add + copy ---
         // attn_proj = x_gpu + ssm_proj (via residual_add_copy, 1 dispatch).
         // x_gpu is NOT updated here -- it will be updated by the FFN residual
@@ -6618,6 +6700,7 @@ impl CudaBackend {
                 RuntimeError::Compute(format!("GDN residual_add_copy L{layer_idx}: {e}"))
             })?;
         }
+        prof::end(Ph::GdnGlue, &self.device.stream);
 
         Ok(())
     }
@@ -8199,6 +8282,14 @@ impl CudaBackend {
         }
 
         // RMSNorm with final_norm weights (for non-F16 output projection paths).
+        //
+        // This is the only straight-line region of `compute_final_gpu`. The
+        // lm_head dispatch chain below has six early returns, so it is NOT
+        // bracketed directly; it is reported as the derived residual
+        // `head - final_norm`. The F16 fast path above returns before this
+        // point, in which case `final_norm` records no call and the derived
+        // lm_head row is omitted rather than fabricated.
+        prof::begin(Ph::FinalNorm, &self.device.stream);
         {
             let block_size = rmsnorm_block_size(hidden_dim);
             let shared_bytes = rmsnorm_shared_bytes(block_size);
@@ -8221,6 +8312,7 @@ impl CudaBackend {
             }
             .map_err(|e| RuntimeError::Compute(format!("rmsnorm final launch: {e}")))?;
         }
+        prof::end(Ph::FinalNorm, &self.device.stream);
 
         // Output projection: logits = output_proj * normed.
         // Prefer Q4Aligned dp4a (highest priority for Q4_0), then smem, then scalar.
@@ -9005,7 +9097,10 @@ impl CudaBackend {
         st: &mut MutableState,
         kv: &mut crate::kv::KvCache,
     ) -> Result<Logits, RuntimeError> {
+        prof::token_begin(&self.device.stream);
+        prof::begin(Ph::Embed, &self.device.stream);
         self.embed_token_gpu(token_id, st)?;
+        prof::end(Ph::Embed, &self.device.stream);
         for layer in 0..num_layers {
             let layer_out = self.compute_layer_gpu(layer, seq_pos, st)?;
             // FIX-DTOD: For DENSE layers, dense FFN writes to a separate
@@ -9021,13 +9116,17 @@ impl CudaBackend {
                 .and_then(|m| m.as_ref())
                 .is_some();
             if !is_moe_layer && layer_out == LayerOutput::NeedsCommit {
+                prof::begin(Ph::LayerCommit, &self.device.stream);
                 self.device
                     .stream
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
                     .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
+                prof::end(Ph::LayerCommit, &self.device.stream);
             }
         }
+        prof::begin(Ph::Head, &self.device.stream);
         self.compute_final_gpu(st)?;
+        prof::end(Ph::Head, &self.device.stream);
         {
             let vocab = hp.vocab_size;
             let launch_cfg = CudarcLaunchConfig {
@@ -9035,6 +9134,7 @@ impl CudaBackend {
                 block_dim: (1024, 1, 1),
                 shared_mem_bytes: 0,
             };
+            prof::begin(Ph::Argmax, &self.device.stream);
             unsafe {
                 self.device
                     .stream
@@ -9045,7 +9145,11 @@ impl CudaBackend {
                     .launch(launch_cfg)
             }
             .map_err(|e| RuntimeError::Compute(format!("argmax launch: {e}")))?;
+            prof::end(Ph::Argmax, &self.device.stream);
         }
+        // Close the token's GPU-span bracket BEFORE the sync (see the greedy
+        // path for the rationale).
+        prof::token_end(&self.device.stream);
         // Full real-logits readback (see `decode_token` for the full
         // rationale). Was a one-hot synthesis that destroyed the
         // distribution and caused sampling gibberish on both models.
@@ -9056,6 +9160,8 @@ impl CudaBackend {
         // established the empirical precedent for this mitigation.
         maybe_apply_cuda_decode_delay();
         let logits_host = self.device.dtoh_copy(&st.logits_gpu)?;
+        // Stream already synchronized above -- no added synchronization.
+        prof::token_settle();
         // [XCHK] Cross-backend forensic probe (env LUMEN_XCHK=1, default OFF ->
         // byte-identical). Final whole-vocab logits sumsq/absmax + top-8 (id,val)
         // and the residual-stream sumsq, in the SAME schema as the Metal [XCHK]
@@ -9115,7 +9221,10 @@ impl CudaBackend {
         st: &mut MutableState,
         kv: &mut crate::kv::KvCache,
     ) -> Result<u32, RuntimeError> {
+        prof::token_begin(&self.device.stream);
+        prof::begin(Ph::Embed, &self.device.stream);
         self.embed_token_gpu(token_id, st)?;
+        prof::end(Ph::Embed, &self.device.stream);
         for layer in 0..num_layers {
             let layer_out = self.compute_layer_gpu(layer, seq_pos, st)?;
             // Mirror decode_token_normal's FIX-DTOD: propagate the post-FFN
@@ -9127,13 +9236,17 @@ impl CudaBackend {
                 .and_then(|m| m.as_ref())
                 .is_some();
             if !is_moe_layer && layer_out == LayerOutput::NeedsCommit {
+                prof::begin(Ph::LayerCommit, &self.device.stream);
                 self.device
                     .stream
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
                     .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
+                prof::end(Ph::LayerCommit, &self.device.stream);
             }
         }
+        prof::begin(Ph::Head, &self.device.stream);
         self.compute_final_gpu(st)?;
+        prof::end(Ph::Head, &self.device.stream);
         {
             let vocab = hp.vocab_size;
             let launch_cfg = CudarcLaunchConfig {
@@ -9141,6 +9254,7 @@ impl CudaBackend {
                 block_dim: (1024, 1, 1),
                 shared_mem_bytes: 0,
             };
+            prof::begin(Ph::Argmax, &self.device.stream);
             unsafe {
                 self.device
                     .stream
@@ -9151,7 +9265,11 @@ impl CudaBackend {
                     .launch(launch_cfg)
             }
             .map_err(|e| RuntimeError::Compute(format!("argmax launch: {e}")))?;
+            prof::end(Ph::Argmax, &self.device.stream);
         }
+        // Close the token's GPU-span bracket BEFORE the sync, so the event
+        // times the GPU work rather than the host's synchronize call.
+        prof::token_end(&self.device.stream);
         // Sync is still required to make the argmax index host-visible, but we
         // copy back only the single u32 the kernel wrote -- NOT the full vocab.
         self.device.synchronize()?;
@@ -9159,6 +9277,9 @@ impl CudaBackend {
         // (default OFF -> no-op).
         maybe_apply_cuda_decode_delay();
         let token_host = self.device.dtoh_copy(&st.argmax_result)?;
+        // The stream is already synchronized above, so reading the event
+        // elapsed times here adds no synchronization of its own.
+        prof::token_settle();
         let token = token_host.first().copied().unwrap_or(0);
         kv.advance_seq_len()?;
         st.decode_token_count += 1;

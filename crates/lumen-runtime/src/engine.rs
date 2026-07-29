@@ -412,6 +412,20 @@ impl InferenceEngine {
         let decode_loop_time = decode_loop_start.elapsed();
         let total_time = total_start.elapsed();
 
+        // Per-phase CUDA decode profile (`LUMEN_CUDA_PROFILE`, default OFF ->
+        // no-op). Emitted here because the backend is reached as
+        // `&dyn ComputeBackend` upstream and cannot be downcast to CudaBackend.
+        // Each `generate` call gets its own `[PROFILE]` block with a monotonic
+        // label, so warmup sequences stay separable from measured ones and no
+        // accumulation leaks between them.
+        #[cfg(feature = "cuda")]
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            crate::cuda::profiler::print_and_reset(&format!("gen{seq}"));
+        }
+
         let io = match weights.io_snapshot() {
             Some(snap) => IoMetrics {
                 bytes_read: snap.bytes_read,

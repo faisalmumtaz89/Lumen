@@ -28,6 +28,12 @@ pub(crate) mod kv_cache;
 pub(crate) mod moe;
 pub(crate) mod prefill;
 pub(crate) mod prefill_attention;
+/// Per-phase decode profiler (CUDA-event brackets, `LUMEN_CUDA_PROFILE`).
+///
+/// Public so the decode-loop driver in `engine` can emit the summary; the
+/// module was tracked but never declared here, so `LUMEN_CUDA_PROFILE` had
+/// nothing to activate.
+pub mod profiler;
 /// Persistent on-disk cache for NVRTC-compiled kernel PTX (cold-start fix).
 pub(crate) mod ptx_cache;
 /// Embedded CUDA kernel source strings, compiled to PTX at runtime via NVRTC.
