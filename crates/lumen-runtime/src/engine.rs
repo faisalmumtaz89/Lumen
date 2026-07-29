@@ -336,6 +336,23 @@ impl InferenceEngine {
         // sample), but a benchmark that compares against llama-bench's tgN must time
         // exactly N decode calls and nothing else — including no full-vocab scan
         // that the shipping GPU-argmax path never performs per token.
+
+        // Per-phase CUDA decode profile (`LUMEN_CUDA_PROFILE`, default OFF ->
+        // no-op). Lives here rather than in the backend because the backend is
+        // reached as `&dyn ComputeBackend` upstream, with no `Any` supertrait to
+        // downcast through.
+        //
+        // It is a drop guard, not a statement after the loop: the decode loop
+        // below propagates errors with `?`, and every token that already
+        // completed has been folded into the profiler's accumulator by its own
+        // `token_settle`. A post-loop flush is skipped on error, and those
+        // orphaned tokens would then surface inside the NEXT segment's block
+        // under a label implying they belonged to it. Dropping happens on every
+        // exit path, so each `generate` call reports exactly its own tokens and
+        // leaves nothing behind.
+        #[cfg(feature = "cuda")]
+        let _profile_segment = crate::cuda::profiler::begin_segment();
+
         let decode_loop_start = Instant::now();
 
         if use_gpu_greedy {
