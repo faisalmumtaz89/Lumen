@@ -336,6 +336,7 @@ impl InferenceEngine {
         // sample), but a benchmark that compares against llama-bench's tgN must time
         // exactly N decode calls and nothing else — including no full-vocab scan
         // that the shipping GPU-argmax path never performs per token.
+
         // Per-phase CUDA decode profile (`LUMEN_CUDA_PROFILE`, default OFF ->
         // no-op). Lives here rather than in the backend because the backend is
         // reached as `&dyn ComputeBackend` upstream, with no `Any` supertrait to
