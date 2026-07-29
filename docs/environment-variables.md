@@ -143,9 +143,9 @@ stays byte-identical to history. Set any to `=0` to opt out on MoE.
 
 | Variable | Default | Category | Effect | When to touch |
 |---|---|---|---|---|
-| `LUMEN_CUDA_PROFILE` | OFF | diagnostic | Per-kernel CUDA-side profiling. | Primary CUDA perf field-triage. |
+| `LUMEN_CUDA_PROFILE` | OFF | diagnostic | Per-phase decode profiling via CUDA-event brackets; prints one `[PROFILE]` block per `generate` call to stderr. `1` = block-level phases (embed / gdn_attn / full_attn / ffn / layer_commit / head / argmax); `2` = also the sub-phases within each block; `cupti` = leave this off and use `tools/cupti-inject` instead. Adds no synchronization: event elapsed times are read after the sync the decode path already performs. | Primary CUDA perf field-triage. Attribute decode time to phases, and read `gpu_unattributed` / `host_outside_span` to see what the phases do *not* explain. Do not combine with `LUMEN_XCHK` or `LUMEN_MOE_PROBE` — they inject blocking readbacks that invalidate every span. |
 | `LUMEN_CUDA_VERBOSE` | OFF | diagnostic | Verbose CUDA backend logging (kernel-load failures). | Diagnose kernel-load / driver issues. |
-| `LUMEN_CUDA_GDN_SUBSTAGE_TIMING` | OFF | diagnostic | Per-substage GDN timing. | Attribute time inside the GDN block. |
+| `LUMEN_CUDA_GDN_SUBSTAGE_TIMING` | OFF | diagnostic | Per-substage GDN timing. Forces a `synchronize()` per substage, so it perturbs what it measures and covers prefill layer 0 only; prefer `LUMEN_CUDA_PROFILE=2` for decode. | Attribute time inside the GDN block during **prefill**. |
 | `LUMEN_CUDA_ATTN_PRECISE_DBG` | OFF | diagnostic | One-shot attention-precision engagement print. | Confirm which attention path engaged. |
 | `LUMEN_CUDA_FORCE_SCALAR_ATTN` | OFF | diagnostic | Force the scalar attention kernel (correctness reference). | Compare WMMA vs. scalar attention output. |
 | `LUMEN_GRAPH_DIAGNOSTIC` | `false` | diagnostic | Emit CUDA-graph capture diagnostics. | The only lever to debug the crash-prone graph path. |

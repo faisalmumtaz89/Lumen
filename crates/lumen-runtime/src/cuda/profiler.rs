@@ -1015,6 +1015,74 @@ mod tests {
         assert!(!out.contains("lm_head"), "{out}");
     }
 
+    /// The output contract downstream analysis depends on: after the
+    /// `[PROFILE] <kind>` prefix, every whitespace-separated token is exactly
+    /// one `key=value` pair. A bare token would silently break any
+    /// `awk`/`split('=')` parser.
+    #[test]
+    fn every_output_token_is_a_key_value_pair() {
+        let s = Summary {
+            tokens: 3,
+            rows: ALL_PHASES
+                .iter()
+                .enumerate()
+                .map(|(i, p)| PhaseRow {
+                    phase: *p,
+                    calls: 3 * (i as u64 + 1),
+                    total_us: 10.0 * (i as f64 + 1.0),
+                })
+                .collect(),
+            wall_us_mean: 8000.0,
+            wall_us_p50: 7990.0,
+            gpu_span_us_mean: 7500.0,
+            gpu_span_us_p50: 7490.0,
+            attributed_us_mean: 6800.0,
+            attributed_us_p50: 6790.0,
+            unclosed: 0,
+            nest_errors: 0,
+            event_errors: 0,
+            pool_high_water: 634,
+            outside_token: 0,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_summary(&mut buf, "contract", &s);
+        let out = String::from_utf8(buf).expect("utf8");
+
+        let mut kinds = Vec::new();
+        for line in out.lines() {
+            let rest = line
+                .strip_prefix("[PROFILE] ")
+                .unwrap_or_else(|| panic!("missing prefix: {line}"));
+            let mut toks = rest.split_whitespace();
+            let kind = toks.next().unwrap_or_else(|| panic!("no kind: {line}"));
+            assert!(
+                !kind.contains('='),
+                "first token must be a bare kind, got {kind:?} in {line}"
+            );
+            kinds.push(kind.to_string());
+            for t in toks {
+                let mut it = t.splitn(2, '=');
+                let k = it.next().unwrap_or("");
+                let v = it.next();
+                assert!(!k.is_empty(), "empty key in {line}");
+                let v = v.unwrap_or_else(|| panic!("token {t:?} is not key=value in {line}"));
+                assert!(!v.is_empty(), "empty value for {k} in {line}");
+                assert!(!v.contains('='), "value contains '=': {t:?} in {line}");
+            }
+        }
+
+        // Every phase with calls > 0 must produce exactly one phase row.
+        let phase_rows = kinds.iter().filter(|k| *k == "phase").count();
+        assert_eq!(phase_rows, PHASE_COUNT, "one row per phase expected");
+        assert_eq!(kinds.first().map(String::as_str), Some("meta"));
+        assert_eq!(kinds.last().map(String::as_str), Some("end"));
+        assert_eq!(kinds.iter().filter(|k| *k == "token").count(), 1);
+        assert_eq!(kinds.iter().filter(|k| *k == "residual").count(), 1);
+        assert_eq!(kinds.iter().filter(|k| *k == "health").count(), 1);
+        // No NaN/inf can reach a parser.
+        assert!(!out.contains("NaN") && !out.contains("inf"), "{out}");
+    }
+
     #[test]
     fn empty_summary_still_writes_a_wellformed_block() {
         let s = Summary::default();
