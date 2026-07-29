@@ -415,6 +415,73 @@ pub(crate) fn dequantize_q5_k(src: &[u8], n_elements: u64) -> Vec<u8> {
     out
 }
 
+/// Dequantize Q6_K with the CORRECT (ggml) element mapping.
+///
+/// Layout `[128B ql][64B qh][16B int8 scales][2B f16 d]`, 210 bytes per 256
+/// elements. A super-block is two independent halves of 128; half `h` uses
+/// `ql + 64h`, `qh + 32h`, `scales + 8h` and produces elements
+/// `[128h, 128h+128)`. With `l = 0..31`, `is = l/16`:
+///
+/// ```text
+///   out[128h + l +  0] = d * sc[is+0] * (((ql[l   ] & 0xF) | ((qh[l]>>0 & 3)<<4)) - 32)
+///   out[128h + l + 32] = d * sc[is+2] * (((ql[l+32] & 0xF) | ((qh[l]>>2 & 3)<<4)) - 32)
+///   out[128h + l + 64] = d * sc[is+4] * (((ql[l   ] >>  4) | ((qh[l]>>4 & 3)<<4)) - 32)
+///   out[128h + l + 96] = d * sc[is+6] * (((ql[l+32] >>  4) | ((qh[l]>>6 & 3)<<4)) - 32)
+/// ```
+///
+/// **The two nibbles of one `ql` byte land 64 output slots apart, never 32.**
+/// Byte `ql[l]` carries elements `l` and `l+64`; `ql[l+32]` carries `l+32` and
+/// `l+96`. Fixed by the packer (`ggml-quants.c quantize_row_q6_K_ref`:
+/// `ql[l] = q1 | (q3 << 4)` with `q1 = L[l]`, `q3 = L[l+64]`), so it is not a
+/// convention a reader may choose. `q6k_ggml_mapping_inverts_the_packer` proves
+/// this function inverts that packer exactly.
+///
+/// Reached only when `LUMEN_Q6K_LAYOUT_FIX=1`; [`dequantize_q6_k`] still
+/// defaults to the swapped mapping so in-flight baselines are not invalidated.
+fn dequantize_q6_k_ggml(src: &[u8], n_elements: u64) -> Vec<u8> {
+    let n = n_elements as usize;
+    let block_size = 210;
+    let mut out = Vec::with_capacity(n * 4);
+    let n_blocks = src.len() / block_size;
+    let mut written = 0usize;
+    for b in 0..n_blocks {
+        if written >= n {
+            break;
+        }
+        let bp = &src[b * block_size..b * block_size + block_size];
+        let d = f16_to_f32(u16::from_le_bytes([bp[208], bp[209]]));
+        for half in 0..2usize {
+            let ql = &bp[64 * half..];
+            let qh = &bp[128 + 32 * half..];
+            let sc = &bp[192 + 8 * half..];
+            // (ql byte offset, high nibble?) per group, in OUTPUT order:
+            // g=0 -> ql[l] low, g=1 -> ql[l+32] low,
+            // g=2 -> ql[l] high, g=3 -> ql[l+32] high.
+            for (g, (ql_off, hi_nib)) in [(0usize, false), (32, false), (0, true), (32, true)]
+                .into_iter()
+                .enumerate()
+            {
+                for l in 0..32usize {
+                    if written >= n {
+                        break;
+                    }
+                    let lo = if hi_nib {
+                        (ql[ql_off + l] >> 4) as i32
+                    } else {
+                        (ql[ql_off + l] & 0x0F) as i32
+                    };
+                    let hb = ((qh[l] >> (2 * g as u32)) & 3) as i32;
+                    let q = (lo | (hb << 4)) - 32;
+                    let s = sc[2 * g + l / 16] as i8 as f32;
+                    out.extend_from_slice(&(d * s * q as f32).to_le_bytes());
+                    written += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Dequantize Q6_K: block_size=256, type_size=210.
 /// Layout: [128 bytes ql] [64 bytes qh] [16 bytes scales (int8)] [2 bytes f16 d]
 /// Note: d is at the END of the block.
@@ -422,6 +489,37 @@ pub(crate) fn dequantize_q6_k(src: &[u8], n_elements: u64) -> Vec<u8> {
     let n = n_elements as usize;
     let mut out = Vec::with_capacity(n * 4);
     let block_size = 210;
+
+    // C0 (`LUMEN_Q6K_LAYOUT_FIX=1`): use the ggml element mapping.
+    //
+    // The loop below is the SHIPPED mapping and it is WRONG. ggml packs element
+    // `l` and element `l+64` into the two nibbles of `ql[l]`, and elements
+    // `l+32` / `l+96` into `ql[l+32]` (`ggml-quants.c
+    // quantize_row_q6_K_ref`: `ql[l] = q1 | (q3 << 4)` with `q1 = L[l]`,
+    // `q3 = L[l+64]`). The group-1 and group-2 arms below instead assume one
+    // byte's two nibbles are 32 output slots apart, so they assemble each value
+    // from the low 4 bits of one weight and the high 2 bits of another. An
+    // exact-integer round trip through the ggml packer puts that at 126 of every
+    // 256 elements wrong.
+    //
+    // Both existing unit tests for this function (`dequantize_q6_k_known_block`
+    // with all-zero `ql`, and `dequantize_q6_k_nonzero_values` with `ql = 0x11`)
+    // use bytes whose low and high nibbles are EQUAL, which makes the swap
+    // invisible; so does any data whose values repeat with period 32. That is
+    // why it survived. `lumen_runtime::q6k_ref` holds the reference, the ggml
+    // packer, and GPU-free regression tests including one that pins exactly
+    // this blind spot.
+    //
+    // On this path the defect reaches production through the Q6_K
+    // `output.weight` requant (every 9B-Q4 LBC) and every K-quant layer tensor
+    // upcast by `ConvertTarget::Metal`.
+    //
+    // Default-OFF only so in-flight 9B-Q4 baselines are not silently
+    // invalidated mid-campaign. It should be promoted to unconditional.
+    if crate::env_gates::q6k_layout_fix() {
+        return dequantize_q6_k_ggml(src, n_elements);
+    }
+
     let mut written = 0usize;
     let mut offset = 0usize;
     while written < n && offset + block_size <= src.len() {
@@ -1265,5 +1363,130 @@ mod q3_k_encoder_tests {
             "Q3_K SNR on smooth signal: {:.2} dB (must be >= 20 dB)",
             snr_db,
         );
+    }
+}
+
+#[cfg(test)]
+mod q6k_layout_tests {
+    use super::*;
+
+    /// Verbatim transcription of the ggml Q6_K PACKER
+    /// (`ggml-quants.c quantize_row_q6_K_ref` @ llama.cpp `3b53219`). This is
+    /// the ground truth: a reader is correct iff it inverts this.
+    fn pack_q6_k(codes: &[u8; 256], scales: &[i8; 16], d_bits: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 210];
+        for j in (0..256).step_by(128) {
+            let base_ql = (j / 128) * 64;
+            let base_qh = 128 + (j / 128) * 32;
+            for l in 0..32 {
+                let q1 = codes[j + l] & 0xF;
+                let q2 = codes[j + l + 32] & 0xF;
+                let q3 = codes[j + l + 64] & 0xF;
+                let q4 = codes[j + l + 96] & 0xF;
+                b[base_ql + l] = q1 | (q3 << 4);
+                b[base_ql + l + 32] = q2 | (q4 << 4);
+                b[base_qh + l] = (codes[j + l] >> 4)
+                    | ((codes[j + l + 32] >> 4) << 2)
+                    | ((codes[j + l + 64] >> 4) << 4)
+                    | ((codes[j + l + 96] >> 4) << 6);
+            }
+        }
+        for (i, &s) in scales.iter().enumerate() {
+            b[192 + i] = s as u8;
+        }
+        b[208..210].copy_from_slice(&d_bits.to_le_bytes());
+        b
+    }
+
+    fn as_f32(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    /// splitmix64, so the test data is reproducible without a dev-dependency.
+    fn rand_codes_scales(seed: u64) -> ([u8; 256], [i8; 16]) {
+        let mut st = seed;
+        let mut next = || {
+            st = st.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = st;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) >> 32) as u32
+        };
+        let mut codes = [0u8; 256];
+        for c in codes.iter_mut() {
+            *c = (next() % 64) as u8;
+        }
+        let mut scales = [0i8; 16];
+        for s in scales.iter_mut() {
+            // Non-zero, so a wrong scale index cannot hide behind a zero product.
+            let mag = 1 + (next() % 127) as i32;
+            *s = if next() % 2 == 0 { mag } else { -mag } as i8;
+        }
+        (codes, scales)
+    }
+
+    /// THE decisive test: the ggml reader must invert the ggml packer exactly.
+    /// `d = 1.0` keeps every product an exact small integer, so this compares
+    /// with `==` and has no tolerance to hide behind.
+    #[test]
+    fn q6k_ggml_mapping_inverts_the_packer() {
+        for trial in 0..32u64 {
+            let (codes, scales) = rand_codes_scales(0x2026_0730 ^ trial);
+            let block = pack_q6_k(&codes, &scales, 0x3C00); // f16 1.0
+            let got = as_f32(&dequantize_q6_k_ggml(&block, 256));
+            assert_eq!(got.len(), 256);
+            for i in 0..256 {
+                let want = (scales[i / 16] as f32) * (codes[i] as f32 - 32.0);
+                assert_eq!(got[i], want, "trial {trial} element {i}");
+            }
+        }
+    }
+
+    /// The SHIPPED reader does NOT invert the packer: groups 1 and 2 take their
+    /// `ql` nibble from the wrong byte, corrupting ~half of every super-block.
+    /// This pins the defect so a silent "fix" or regression is visible.
+    #[test]
+    fn q6k_default_mapping_is_wrong() {
+        let (codes, scales) = rand_codes_scales(0x2026_0730);
+        let block = pack_q6_k(&codes, &scales, 0x3C00);
+        let good = as_f32(&dequantize_q6_k_ggml(&block, 256));
+        let shipped = as_f32(&dequantize_q6_k(&block, 256));
+
+        let wrong = (0..256).filter(|&i| good[i] != shipped[i]).count();
+        assert!(
+            wrong > 100 && wrong <= 128,
+            "expected the ql-nibble swap to corrupt roughly half the block \
+             (at most the two swapped groups = 128); got {wrong}/256"
+        );
+        // Groups 0 and 3 of each half are unaffected by the swap.
+        for half in 0..2 {
+            for g in [0usize, 3] {
+                for l in 0..32 {
+                    let i = 128 * half + 32 * g + l;
+                    assert_eq!(good[i], shipped[i], "group {g} must be unaffected at {i}");
+                }
+            }
+        }
+    }
+
+    /// Why the defect survived: both existing tests for `dequantize_q6_k`
+    /// (all-zero `ql`, and `ql = 0x11`) use bytes whose low and high nibbles are
+    /// EQUAL, which makes the swap unobservable. A test built on such data
+    /// proves nothing about the mapping.
+    #[test]
+    fn uniform_code_patterns_cannot_detect_the_swap() {
+        for code in [0u8, 1, 17, 63] {
+            let codes = [code; 256];
+            let scales = [5i8; 16];
+            let block = pack_q6_k(&codes, &scales, 0x3C00);
+            assert_eq!(
+                as_f32(&dequantize_q6_k_ggml(&block, 256)),
+                as_f32(&dequantize_q6_k(&block, 256)),
+                "uniform code {code} is blind to the swap"
+            );
+        }
     }
 }

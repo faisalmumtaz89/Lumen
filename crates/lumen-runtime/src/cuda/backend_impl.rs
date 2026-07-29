@@ -767,6 +767,13 @@ struct GpuGlobals {
     /// full F32 dynamic range. Avoids the ~4 GB F32 inflation that previously
     /// caused OOM during preload on Qwen3.5-9B BF16.
     output_proj_bf16: Option<CudaSlice<u8>>,
+    /// Output projection as raw Q6_K bytes (candidate C3, `Some` only when
+    /// `LUMEN_CUDA_LMHEAD_Q6K=1` AND the LBC actually stores the head as Q6_K).
+    /// Dispatched via `matvec_q6_k_f32_nr8` at 0.8203 B/weight -- the same byte
+    /// count llama.cpp reads -- instead of the 1.0625 B/weight Q8_0 the
+    /// converter otherwise requantizes it to, which is 234.9 MiB/token on the
+    /// 1,017,118,720-weight 9B head.
+    output_proj_q6k: Option<CudaSlice<u8>>,
     /// Embedding table (F32 path): [vocab_size * hidden_dim]
     /// Empty if embedding uses a quantized raw path instead.
     embedding: CudaSlice<f32>,
@@ -8505,6 +8512,58 @@ impl CudaBackend {
         prof::end(Ph::FinalNorm, &self.device.stream);
 
         // Output projection: logits = output_proj * normed.
+        //
+        // C3 (`LUMEN_CUDA_LMHEAD_Q6K=1`) takes priority when present. It is
+        // first in the chain so it cannot be shadowed, and it is entered only
+        // when `output_proj_q6k` is `Some`, which requires both the flag and an
+        // LBC that actually stores the head as Q6_K (a `-q6khead` file). With
+        // the flag off the field is `None`, the `if let` fails, and the chain
+        // below runs exactly as before.
+        //
+        // BYTES: the default path requantizes this tensor to Q8_0 at convert and
+        // streams 1.0625 B/weight. Native Q6_K is 0.8203, so on the 9B head
+        //   1,017,118,720 w x (1.0625 - 0.8203) = 246,333,440 B = 234.9 MiB/token
+        // -- 4.5% of the entire weight stream, and the largest single format
+        // mismatch on the model. It also drops a lossy Q6_K -> F32 -> Q8_0
+        // round trip that additionally goes through a defective host dequantiser
+        // (see `runtime_defaults::q6k_layout_fix`).
+        //
+        // Activations stay F32 here: `scratch.normed` is already F32 at this
+        // point, so unlike the Q8 split path there is no `quantize_f32_to_q8_1`
+        // launch -- one kernel instead of two. Worth noting because the head has
+        // no `Q4ProjectionFamily`, so the activation plan never covered it and
+        // the default route runs int8 outside any policy.
+        //
+        // NR=8: the head shape is [out=248320, in=4096], an extreme aspect
+        // ratio. NR=1 would give 248320 CTAs each re-reading the whole 16 KB
+        // activation vector; NR=8 amortizes that 8x for 31040 CTAs, still ~287x
+        // oversubscribed on 108 SMs. UNVERIFIED as throughput -- NR was chosen
+        // by the same reasoning the sibling Q8 head kernel documents, not by
+        // measurement, and it is the obvious first knob if C3 underperforms.
+        if let Some(ref proj_q6k) = st.globals.output_proj_q6k {
+            crate::runtime_defaults::route_census_record("head", "HEAD_Q6K_NATIVE");
+            let f = st.kernels.matvec_q6_k_f32_nr8.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(
+                    "matvec_q6_k_f32_nr8 unavailable: LUMEN_CUDA_LMHEAD_Q6K is armed and the \
+                     head was uploaded as Q6_K, but the kernel failed to compile"
+                        .to_string(),
+                )
+            })?;
+            unsafe {
+                launch_matvec_q6_k(
+                    &self.device,
+                    f,
+                    proj_q6k,
+                    &st.scratch.normed,
+                    &mut st.logits_gpu,
+                    vocab_size,
+                    hidden_dim,
+                    8,
+                    "head",
+                )?;
+            }
+            return Ok(());
+        }
         // Prefer Q4Aligned dp4a (highest priority for Q4_0), then smem, then scalar.
         if let Some(ref proj_q4a) = st.globals.output_proj_q4_aligned {
             crate::runtime_defaults::route_census_record("head", "HEAD_Q4_ALIGNED");
@@ -14294,21 +14353,42 @@ impl ComputeBackend for CudaBackend {
             output_proj_q4,
             output_proj_f16_raw,
             output_proj_bf16_raw,
+            output_proj_q6k_raw,
         ) = if has_raw_output_proj {
             let raw = self.output_proj_raw.as_ref().unwrap();
             let placeholder: CudaSlice<f32> = self.device.alloc_zeros(1)?;
             match self.output_proj_quant {
                 QuantScheme::Q8_0 => {
                     let gpu_q8 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, Some(gpu_q8), None, None, None)
+                    (placeholder, Some(gpu_q8), None, None, None, None)
                 }
                 QuantScheme::Q4_0 => {
                     let gpu_q4 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, None, Some(gpu_q4), None, None)
+                    (placeholder, None, Some(gpu_q4), None, None, None)
                 }
                 QuantScheme::F16 => {
                     let gpu_f16 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, None, None, Some(gpu_f16), None)
+                    (placeholder, None, None, Some(gpu_f16), None, None)
+                }
+                // C3: native Q6_K head. Reachable only when
+                // `LUMEN_CUDA_LMHEAD_Q6K=1` let a Q6_K `output.weight` past the
+                // CLI allow-list, which in turn requires an LBC converted with
+                // the same flag (and therefore a `-q6khead` filename). Rejecting
+                // it when the kernel is absent is deliberate: a 4.0 B/w cuBLAS
+                // SGEMV fallback would measure as a large REGRESSION and be
+                // mistaken for the lever failing, rather than the kernel missing.
+                QuantScheme::Q6_K if crate::runtime_defaults::lmhead_q6k() => {
+                    let raw_mb = raw.len() as f64 / 1.0e6;
+                    // Element count from the block geometry (210 B per 256), so
+                    // the marker needs no hyperparams plumbing.
+                    let elems = (raw.len() / 210) * 256;
+                    eprintln!(
+                        "[Q6K] LMHEAD uploading native Q6_K output_proj: {raw_mb:.1} MB, \
+                         {elems} elements ({:.4} B/w vs 1.0625 for Q8_0)",
+                        raw.len() as f64 / elems.max(1) as f64
+                    );
+                    let gpu_q6k = self.device.htod_copy(raw.as_slice())?;
+                    (placeholder, None, None, None, None, Some(gpu_q6k))
                 }
                 QuantScheme::Bf16 => {
                     // BF16 output_proj: upload raw bytes (2 B/elem) and dispatch
@@ -14317,17 +14397,18 @@ impl ComputeBackend for CudaBackend {
                     let raw_mb = raw.len() as f64 / 1.0e6;
                     eprintln!("[CUDA mem] uploading BF16 output_proj raw: {raw_mb:.1} MB");
                     let gpu_bf16 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, None, None, None, Some(gpu_bf16))
+                    (placeholder, None, None, None, Some(gpu_bf16), None)
                 }
                 other => {
                     return Err(RuntimeError::Compute(format!(
-                        "CUDA init: output_proj raw quant {other:?} not supported (only Q8_0, Q4_0, F16, Bf16)",
+                        "CUDA init: output_proj raw quant {other:?} not supported (only Q8_0, Q4_0, F16, Bf16, \
+                         or Q6_K with LUMEN_CUDA_LMHEAD_Q6K=1)",
                     )));
                 }
             }
         } else {
             let gpu_f32 = self.device.htod_copy(&self.output_proj)?;
-            (gpu_f32, None, None, None, None)
+            (gpu_f32, None, None, None, None, None)
         };
         let mem_after_output_proj = self.device.free_memory().unwrap_or(0);
         eprintln!(
@@ -14346,6 +14427,7 @@ impl ComputeBackend for CudaBackend {
             output_proj_q4,
             output_proj_q4_aligned: None, // Populated during preload_weights
             output_proj_bf16: output_proj_bf16_raw,
+            output_proj_q6k: output_proj_q6k_raw,
             embedding: embedding_f32,
             embedding_q8,
             embedding_f16: embedding_f16_raw,

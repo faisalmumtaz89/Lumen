@@ -90,8 +90,30 @@ pub fn cached_gguf(filename: &str) -> Option<PathBuf> {
 }
 
 /// Get the path where an LBC file would be cached.
+///
+/// The filename is `<key>-<quant><variant>.lbc`, where `<variant>` comes from
+/// [`lumen_convert::env_gates::lbc_variant_suffix`] and is EMPTY unless a
+/// convert-time K-quant format gate is armed. So the canonical name is
+/// unchanged for every existing cache entry, and a gated variant conversion
+/// (`LUMEN_CUDA_LMHEAD_Q6K`, `LUMEN_CUDA_SSMOUT_NATIVE`, `LUMEN_Q6K_LAYOUT_FIX`)
+/// lands on its own file instead of overwriting the baseline.
+///
+/// This matters because the gates change the *content* of the `.lbc` — which
+/// format a tensor is stored in is fixed when the file is written. Without a
+/// distinguishing name, arming a gate on a harness that converts once per
+/// volume would overwrite the baseline LBC in place, and the A/B would then
+/// silently compare an arm against itself. Both the writer here and the reader
+/// in [`cached_lbc`] go through this one function, so they cannot disagree.
+///
+/// KNOWN GAP (pre-existing, not introduced here): the filename still does not
+/// encode `ConvertTarget` or `requant_to`. A macOS host writes Metal-upcast
+/// content to this canonical name, and `--requant q4_0` / `--requant q8_0`
+/// outputs are indistinguishable on disk. The `-metal` suffix that
+/// [`cached_lbc`] probes for is never written by any code path — it is a manual
+/// convention requiring `lumen convert --target metal --output <...>-metal.lbc`.
 pub fn lbc_path(key: &str, quant: &str) -> PathBuf {
-    cache_dir().join(format!("{key}-{quant}.lbc"))
+    let variant = lumen_convert::env_gates::lbc_variant_suffix();
+    cache_dir().join(format!("{key}-{quant}{variant}.lbc"))
 }
 
 /// Get the path where a GGUF file would be cached.

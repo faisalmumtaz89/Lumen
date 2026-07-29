@@ -341,67 +341,105 @@ fn do_convert_from_reader<R: Read + Seek>(
 
     // Weight tying: if output.weight is absent, use dedup (store once, share at runtime).
     let requant_target = opts.requant_to;
-    let (output_proj, weight_tying, output_proj_quant) =
-        if let Some(output_proj_tensor) = gguf.find_tensor(OUTPUT_PROJ_NAME) {
-            let output_proj_bytes = read_tensor_data(reader, gguf, output_proj_tensor)?;
-            // Handle requantization of output_proj
-            if let Some(QuantScheme::Q4_0) = requant_target {
-                let f32_data = ensure_f32_global(
-                    output_proj_bytes.clone(),
-                    output_proj_tensor.ggml_type,
-                    OUTPUT_PROJ_NAME,
-                    output_proj_tensor.n_elements(),
-                )?;
-                let n_elems = output_proj_tensor.n_elements() as usize;
-                let q4_data = quantize_f32_to_q4_0(&f32_data, n_elems);
-                eprintln!(
-                    "  Requantized output.weight to Q4_0 ({} bytes, {} elements)",
-                    q4_data.len(),
-                    n_elems
-                );
-                (q4_data, false, QuantScheme::Q4_0)
-            } else if output_proj_tensor.ggml_type == GgmlType::Q8_0 {
-                eprintln!(
-                    "  Keeping output.weight as Q8_0 ({} bytes, {} elements)",
-                    output_proj_bytes.len(),
-                    output_proj_tensor.n_elements()
-                );
-                (output_proj_bytes, false, QuantScheme::Q8_0)
-            } else if output_proj_tensor.ggml_type == GgmlType::Q4_0 {
-                eprintln!(
-                    "  Keeping output.weight as Q4_0 ({} bytes, {} elements)",
-                    output_proj_bytes.len(),
-                    output_proj_tensor.n_elements()
-                );
-                (output_proj_bytes, false, QuantScheme::Q4_0)
-            } else if output_proj_tensor.ggml_type == GgmlType::F16 {
-                eprintln!(
-                    "  Keeping output.weight as F16 ({} bytes, {} elements)",
-                    output_proj_bytes.len(),
-                    output_proj_tensor.n_elements()
-                );
-                (output_proj_bytes, false, QuantScheme::F16)
-            } else if output_proj_tensor.ggml_type == GgmlType::BF16 {
-                // BF16 output_proj: 2 bytes/elem, fits in the runtime's Bf16Raw
-                // upload path. Keeping the source bytes avoids the F32 inflation
-                // that previously caused A100-80GB OOM during preload_weights on
-                // Qwen3.5-9B BF16 (embedding 2 GB + output_proj 2 GB + 30+ GB of
-                // F32-inflated layer weights blew past free VRAM).
-                eprintln!(
-                    "  Keeping output.weight as Bf16 ({} bytes, {} elements)",
-                    output_proj_bytes.len(),
-                    output_proj_tensor.n_elements()
-                );
-                (output_proj_bytes, false, QuantScheme::Bf16)
-            } else if matches!(
+    let (output_proj, weight_tying, output_proj_quant) = if let Some(output_proj_tensor) =
+        gguf.find_tensor(OUTPUT_PROJ_NAME)
+    {
+        let output_proj_bytes = read_tensor_data(reader, gguf, output_proj_tensor)?;
+        // Handle requantization of output_proj
+        if let Some(QuantScheme::Q4_0) = requant_target {
+            let f32_data = ensure_f32_global(
+                output_proj_bytes.clone(),
                 output_proj_tensor.ggml_type,
-                GgmlType::Q6_K
-                    | GgmlType::Q5_K
-                    | GgmlType::Q4_K
-                    | GgmlType::Q3_K
-                    | GgmlType::Q2_K
-                    | GgmlType::Q8_K
-            ) {
+                OUTPUT_PROJ_NAME,
+                output_proj_tensor.n_elements(),
+            )?;
+            let n_elems = output_proj_tensor.n_elements() as usize;
+            let q4_data = quantize_f32_to_q4_0(&f32_data, n_elems);
+            eprintln!(
+                "  Requantized output.weight to Q4_0 ({} bytes, {} elements)",
+                q4_data.len(),
+                n_elems
+            );
+            (q4_data, false, QuantScheme::Q4_0)
+        } else if output_proj_tensor.ggml_type == GgmlType::Q8_0 {
+            eprintln!(
+                "  Keeping output.weight as Q8_0 ({} bytes, {} elements)",
+                output_proj_bytes.len(),
+                output_proj_tensor.n_elements()
+            );
+            (output_proj_bytes, false, QuantScheme::Q8_0)
+        } else if output_proj_tensor.ggml_type == GgmlType::Q4_0 {
+            eprintln!(
+                "  Keeping output.weight as Q4_0 ({} bytes, {} elements)",
+                output_proj_bytes.len(),
+                output_proj_tensor.n_elements()
+            );
+            (output_proj_bytes, false, QuantScheme::Q4_0)
+        } else if output_proj_tensor.ggml_type == GgmlType::F16 {
+            eprintln!(
+                "  Keeping output.weight as F16 ({} bytes, {} elements)",
+                output_proj_bytes.len(),
+                output_proj_tensor.n_elements()
+            );
+            (output_proj_bytes, false, QuantScheme::F16)
+        } else if output_proj_tensor.ggml_type == GgmlType::BF16 {
+            // BF16 output_proj: 2 bytes/elem, fits in the runtime's Bf16Raw
+            // upload path. Keeping the source bytes avoids the F32 inflation
+            // that previously caused A100-80GB OOM during preload_weights on
+            // Qwen3.5-9B BF16 (embedding 2 GB + output_proj 2 GB + 30+ GB of
+            // F32-inflated layer weights blew past free VRAM).
+            eprintln!(
+                "  Keeping output.weight as Bf16 ({} bytes, {} elements)",
+                output_proj_bytes.len(),
+                output_proj_tensor.n_elements()
+            );
+            (output_proj_bytes, false, QuantScheme::Bf16)
+        } else if matches!(
+            output_proj_tensor.ggml_type,
+            GgmlType::Q6_K
+                | GgmlType::Q5_K
+                | GgmlType::Q4_K
+                | GgmlType::Q3_K
+                | GgmlType::Q2_K
+                | GgmlType::Q8_K
+        ) {
+            // C3 (`LUMEN_CUDA_LMHEAD_Q6K=1`): keep the K-quant head as-is.
+            //
+            // The requant below is the largest single format mismatch on the
+            // 9B-Q4 decode path:
+            //
+            //   1,017,118,720 weights x (1.0625 - 0.8203) B/w
+            //     = 246,333,440 B = 234.9 MiB/token   (795.7 -> 1030.6 MiB)
+            //
+            // and it is lossy twice: once through Q6_K -> F32 -> Q8_0, and
+            // once through the swapped `ql` mapping in `dequantize_q6_k`
+            // (see `env_gates::q6k_layout_fix`) which corrupts 126 of every
+            // 256 elements. So this arm is both a bandwidth lever and a
+            // correctness one.
+            //
+            // The comment below is accurate about the default runtime: there
+            // IS no K-quant dispatch kernel by default. C3 adds one
+            // (`matvec_q6_k_f32_nr8`) and gates the CLI's
+            // `set_output_proj_raw` allow-list and `CudaBackend::init` to
+            // accept Q6_K, so the "slow F32 fallback" it warns about does
+            // not apply when the flag is on. The flag is read at BOTH ends
+            // and the LBC filename carries a `-q6khead` suffix, so a variant
+            // LBC can never be loaded by an unflagged runtime.
+            //
+            // Only Q6_K is passed through. The other K-quants in this arm
+            // (Q5_K/Q4_K/Q3_K/Q2_K/Q8_K) have no native kernel even with
+            // the flag on, so they keep the requant rather than silently
+            // landing on cuBLAS SGEMV at 4.0 B/w.
+            if crate::env_gates::lmhead_q6k() && output_proj_tensor.ggml_type == GgmlType::Q6_K {
+                eprintln!(
+                    "[Q6K] LMHEAD keeping output.weight as Q6_K ({} bytes, {} elements, \
+                         {:.4} B/w)",
+                    output_proj_bytes.len(),
+                    output_proj_tensor.n_elements(),
+                    output_proj_bytes.len() as f64 / output_proj_tensor.n_elements() as f64
+                );
+                (output_proj_bytes, false, QuantScheme::Q6_K)
+            } else {
                 // K-quant output.weight: dequantize and requantize to a supported format.
                 // llama-quantize often keeps output.weight as Q6_K even in Q4_0 GGUFs.
                 // The runtime only has fast dispatch kernels for Q8_0/Q4_0/F16/F32,
@@ -430,25 +468,26 @@ fn do_convert_from_reader<R: Read + Seek>(
                     );
                     (q8_data, false, QuantScheme::Q8_0)
                 }
-            } else {
-                let data = ensure_f32_global(
-                    output_proj_bytes,
-                    output_proj_tensor.ggml_type,
-                    OUTPUT_PROJ_NAME,
-                    output_proj_tensor.n_elements(),
-                )?;
-                (data, false, QuantScheme::F32)
             }
         } else {
-            // Weight tying: output_proj shares embedding storage (zero-copy dedup).
-            // Runtime uses the embedding buffer for both lookup and logits projection.
-            let embed_size_mb = embedding.len() as f64 / 1_048_576.0;
-            eprintln!(
-                "  Weight tying: output_proj shares embedding storage ({:.1} MB saved)",
-                embed_size_mb
-            );
-            (Vec::new(), true, embedding_quant)
-        };
+            let data = ensure_f32_global(
+                output_proj_bytes,
+                output_proj_tensor.ggml_type,
+                OUTPUT_PROJ_NAME,
+                output_proj_tensor.n_elements(),
+            )?;
+            (data, false, QuantScheme::F32)
+        }
+    } else {
+        // Weight tying: output_proj shares embedding storage (zero-copy dedup).
+        // Runtime uses the embedding buffer for both lookup and logits projection.
+        let embed_size_mb = embedding.len() as f64 / 1_048_576.0;
+        eprintln!(
+            "  Weight tying: output_proj shares embedding storage ({:.1} MB saved)",
+            embed_size_mb
+        );
+        (Vec::new(), true, embedding_quant)
+    };
 
     // Select architecture-specific converter
     let converter = arch::select_converter(&arch, hp.num_experts);
