@@ -45,10 +45,17 @@
 //! * unset / `0` / `off` -- disabled. Every entry point returns after reading
 //!   one cached `u8`. No event is created, none is recorded, no lock is taken,
 //!   and no synchronization is added: behaviour is unchanged.
-//! * `1` -- coarse. Depth-0 phases only (~99 brackets/token on Qwen3.5-9B).
-//! * `2` -- fine. Depth-0 + depth-1 (~316 brackets/token). Higher fidelity,
-//!   higher perturbation -- roughly doubles the launch count of the token, so
-//!   compare `1` against `2` before trusting either in absolute terms.
+//! * `1` -- coarse. Depth-0 phases only. On Qwen3.5-9B (24 GDN + 8 full-attn)
+//!   that is 1 embed + 24 gdn_attn + 8 full_attn + 32 ffn + 32 layer_commit +
+//!   1 head + 1 argmax = 99 brackets = 198 event records per token.
+//! * `2` -- fine. Depth-0 + depth-1: 99 + (8*7 + 24*4 + 32*2 + 1) = 316
+//!   brackets = 634 event records per token, against roughly 400 existing
+//!   kernel launches per token.
+//!
+//! The overhead of either level is UNMEASURED. Establish it with an A/B (flag
+//! off vs on, same weights, same prompt) before quoting any absolute number,
+//! and compare level 1 against level 2 -- their disagreement is the
+//! measurement of what the depth-1 brackets cost.
 //! * `cupti` -- the Rust event profiler stays OFF; see
 //!   `tools/cupti-inject/README.md` for the out-of-process CUPTI mode.
 //!
