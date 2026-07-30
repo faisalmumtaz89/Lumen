@@ -360,6 +360,10 @@ pub(crate) struct KernelSet {
     // recovering ~20-bit mantissa while staying on tensor cores.
     pub(crate) flash_attention_wmma_split: Option<CudaFunction>,
 
+    // Tiled two-phase argmax variants (LUMEN_CUDA_ARGMAX_TILED, default-OFF;
+    // byte-identical output — see argmax.cu). Option: absent => single-block.
+    pub(crate) argmax_f32_tile_phase1: Option<CudaFunction>,
+    pub(crate) argmax_f32_tile_phase2: Option<CudaFunction>,
     // GPU-side argmax: finds index of max value in logits buffer.
     // Single block of 1024 threads, reads back 4 bytes instead of vocab_size*4.
     pub(crate) argmax_f32: CudaFunction,
@@ -1177,6 +1181,22 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         )
         .ok(),
         argmax_f32: load_fn(shaders::ARGMAX_KERNEL_SOURCE, "argmax_f32")?,
+        argmax_f32_tile_phase1: match load_fn(shaders::ARGMAX_KERNEL_SOURCE, "argmax_f32_tile_phase1")
+        {
+            Ok(f) => Some(f),
+            Err(e) => {
+                cuda_log!("[CUDA] argmax_f32_tile_phase1: FAILED: {e}");
+                None
+            }
+        },
+        argmax_f32_tile_phase2: match load_fn(shaders::ARGMAX_KERNEL_SOURCE, "argmax_f32_tile_phase2")
+        {
+            Ok(f) => Some(f),
+            Err(e) => {
+                cuda_log!("[CUDA] argmax_f32_tile_phase2: FAILED: {e}");
+                None
+            }
+        },
         // Q8_0 shared-memory matvec (PRIMARY Q8_0 decode path)
         matvec_q8_0_smem: match load_fn(shaders::MATVEC_Q8_0_SMEM_KERNEL_SOURCE, "matvec_q8_0_smem")
         {
