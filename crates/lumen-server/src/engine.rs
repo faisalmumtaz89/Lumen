@@ -192,6 +192,23 @@ pub enum TokenEvent {
     /// UTF-8 fragment (may be empty if the byte boundary did not yet
     /// resolve to a complete character).
     Token { token_id: u32, delta_text: String },
+    /// INSTRUMENT-ONLY (`LUMEN_BENCH_TOKEN_IDS=1`): the raw generated token ids
+    /// and the per-request EOS set, emitted immediately BEFORE `Done`.
+    ///
+    /// A separate variant rather than fields on `Done` so the shipping event
+    /// shape is untouched when the surface is off, and so a wire layer that
+    /// forgets to handle it fails to compile rather than silently dropping the
+    /// ids.
+    ///
+    /// `generated_token_ids` is the engine's own sampled-token record, in order,
+    /// pre-detokenization — INCLUDING the terminating EOS id, which the decode
+    /// loop otherwise consumes on its `break` without ever emitting a `Token`
+    /// event. Collecting at the wire layer would therefore have silently lost
+    /// the terminator, which is precisely the id the cert lane compares on.
+    BenchTokenIds {
+        generated_token_ids: Vec<u32>,
+        eos_token_ids: Vec<u32>,
+    },
     /// Generation ended cleanly. `finish_reason` is one of
     /// `"stop"` (EOS or stop sequence), `"length"` (max tokens reached),
     /// or `"tool_calls"` (the model emitted at least one tool call).
@@ -1507,6 +1524,10 @@ impl EngineWorker {
         // budget (the entry guard breaks emitting nothing — byte-identical to
         // the pre-Part-4 `for _ in 0..0`). Every other exit reassigns it.
         let mut finish_reason = FinishReason::Stop;
+        // INSTRUMENT-ONLY (LUMEN_BENCH_TOKEN_IDS): the engine's own sampled-token
+        // record. Empty and never touched when the surface is off.
+        let bench_ids_on = lumen_runtime::runtime_defaults::bench_token_ids_enabled();
+        let mut bench_token_ids: Vec<u32> = Vec::new();
 
         // -- Part 4: reasoning-phase state machine + forced-close -----------
         //
@@ -1708,6 +1729,13 @@ impl EngineWorker {
                 }
             };
             generated += 1;
+            // Record BEFORE the EOS check: the EOS branch `break`s without ever
+            // emitting a `Token` event, so recording after it (or at the wire
+            // layer) would silently drop the terminating id -- the one the cert
+            // lane compares on.
+            if bench_ids_on {
+                bench_token_ids.push(token_id);
+            }
             // Charge the token to the active phase. A token that carries (or
             // completes) `</think>` is the last reasoning token; the answer
             // begins on the following token.
@@ -1820,6 +1848,19 @@ impl EngineWorker {
             );
         }
 
+        if bench_ids_on {
+            let _ = self.send_event_polling_cancel(
+                &tokens_tx,
+                &cancel,
+                TokenEvent::BenchTokenIds {
+                    generated_token_ids: bench_token_ids.clone(),
+                    // The SAME value the wire layer put into JobRequest, so the
+                    // cert lane compares against what the engine actually used
+                    // to decide stopping -- not a re-derived set.
+                    eos_token_ids: request.eos_token_ids.clone(),
+                },
+            );
+        }
         let _ = self.send_event_polling_cancel(
             &tokens_tx,
             &cancel,

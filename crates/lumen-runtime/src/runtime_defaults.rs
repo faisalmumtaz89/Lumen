@@ -1165,6 +1165,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_BASE_URL",
     "LUMEN_BENCH_ITERATIONS",
     "LUMEN_BENCH_MASK_EOG",
+    "LUMEN_BENCH_TOKEN_IDS",
     "LUMEN_BENCH_SCALE",
     "LUMEN_BENCH_TOKENS",
     "LUMEN_BENCH_WARMUP",
@@ -2385,6 +2386,7 @@ mod tests {
         "LUMEN_BASE_URL",
         "LUMEN_BENCH_ITERATIONS",
         "LUMEN_BENCH_MASK_EOG",
+        "LUMEN_BENCH_TOKEN_IDS",
         "LUMEN_BENCH_SCALE",
         "LUMEN_BENCH_TOKENS",
         "LUMEN_BENCH_WARMUP",
@@ -3343,6 +3345,35 @@ pub fn q6k_report_armed_flags() {
     });
 }
 
+/// `LUMEN_BENCH_TOKEN_IDS=1` — INSTRUMENT-ONLY response surface.
+///
+/// When set, `lumen-server` chat/completions responses additionally carry the
+/// raw GENERATED token-id array, the finish_reason it already computes, and the
+/// per-request EOS set. The cert lane needs those to compare EOG behaviour
+/// across engines, which converts a refuses-forever gate into a measurement.
+///
+/// Unset => shipping responses byte-identical. Exact-value parse, same shape as
+/// the reviewed EOG mask: `=1` only. `=true`/`=on`/`=0`/empty are all OFF, and
+/// there is no presence-parse.
+///
+/// The ids come from the engine's OWN sampled-token record (the `token_id` the
+/// decode loop produced), never from re-tokenizing output text — the protocol
+/// forbids the latter because detokenize/retokenize is not round-trip stable.
+pub fn bench_token_ids_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = campaign_flag("LUMEN_BENCH_TOKEN_IDS");
+        if on {
+            eprintln!(
+                "[BENCH] TOKEN_IDS=ON: responses carry raw generated token ids + \
+                 eos set (instrument-only surface)"
+            );
+        }
+        on
+    })
+}
+
 /// The masked-logit sentinel. MUST equal the value `mask_logits_neg_inf` writes
 /// in `argmax.cu`, or the GPU and host selection paths could disagree on a tie.
 pub const EOG_MASK_SENTINEL: f32 = -3.402_823_466e38;
@@ -3824,5 +3855,45 @@ mod eog_mask_tests {
             mask_at < sample_at,
             "the mask must be applied BEFORE selection, not after"
         );
+    }
+}
+
+#[cfg(test)]
+mod bench_token_ids_tests {
+    use super::*;
+
+    /// Exact-value parse, same shape as the reviewed EOG mask. `=1` only.
+    /// No presence-parse: `=0`, `=true`, `=on`, empty must all be OFF, so an
+    /// operator cannot accidentally arm an instrument surface on a shipping box.
+    #[test]
+    fn token_ids_flag_is_exact_value_one_only() {
+        let name = "LUMEN_BENCH_TOKEN_IDS_PARSE_PROBE";
+        for (v, want) in [
+            ("1", true),
+            ("0", false),
+            ("true", false),
+            ("on", false),
+            ("yes", false),
+            ("", false),
+            (" 1", false),
+            ("1 ", false),
+            ("01", false),
+        ] {
+            std::env::set_var(name, v);
+            assert_eq!(campaign_flag(name), want, "value {v:?}");
+        }
+        std::env::remove_var(name);
+        assert!(!campaign_flag(name), "unset must be OFF");
+    }
+
+    /// OFF must be a true no-op: the resolver reports false and the surface is
+    /// never attached, so shipping responses stay byte-identical.
+    #[test]
+    fn token_ids_off_is_shipping_behaviour() {
+        if std::env::var("LUMEN_BENCH_TOKEN_IDS").is_ok() {
+            eprintln!("skipping: LUMEN_BENCH_TOKEN_IDS is set in this environment");
+            return;
+        }
+        assert!(!bench_token_ids_enabled());
     }
 }

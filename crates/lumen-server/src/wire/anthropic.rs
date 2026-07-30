@@ -582,6 +582,16 @@ async fn drive_messages_stream(
     while let Some(evt) = rx.recv().await {
         match evt {
             TokenEvent::PrefillDone { .. } => {}
+            // INSTRUMENT-ONLY surface: not representable on a streaming
+            // response body. Rule 3 forbids silent omission, so refuse loudly
+            // rather than drop the ids -- the protocol uses non-streaming.
+            TokenEvent::BenchTokenIds { .. } => {
+                let err = json!({"type": "error", "error": { "type": "api_error",
+                    "message": "LUMEN_BENCH_TOKEN_IDS is not supported on streaming \
+responses; use stream=false" }});
+                let _ = tx.send(sse_event("error", &err.to_string())).await;
+                return;
+            }
             TokenEvent::Token { delta_text, .. } => {
                 let delta = emitter.push(&delta_text);
                 // Reasoning trace -> a `thinking` content block, emitted BEFORE
@@ -878,10 +888,19 @@ pub async fn collect_messages(
     let mut prompt_tokens = 0usize;
     let mut completion_tokens = 0usize;
     let mut finish = FinishReason::Stop;
+    // INSTRUMENT-ONLY (LUMEN_BENCH_TOKEN_IDS): (generated ids, eos set).
+    let mut bench_ids: Option<(Vec<u32>, Vec<u32>)> = None;
 
     while let Some(evt) = rx.recv().await {
         match evt {
             TokenEvent::PrefillDone { .. } => {}
+            // INSTRUMENT-ONLY surface (LUMEN_BENCH_TOKEN_IDS).
+            TokenEvent::BenchTokenIds {
+                generated_token_ids,
+                eos_token_ids,
+            } => {
+                bench_ids = Some((generated_token_ids, eos_token_ids));
+            }
             TokenEvent::Token { delta_text, .. } => {
                 let delta = emitter.push(&delta_text);
                 reasoning.push_str(&delta.reasoning);
