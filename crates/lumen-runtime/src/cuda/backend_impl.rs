@@ -119,6 +119,43 @@ fn bf16_autotune_enabled() -> bool {
     })
 }
 
+/// EOG-mask ID set for the fixed-horizon quality protocol
+/// (`LUMEN_BENCH_MASK_EOG="id1,id2"`) — INSTRUMENT-ONLY test surface. When
+/// set, `launch_argmax` writes -FLT_MAX to these logit positions before the
+/// argmax (both variants honor it at the single entry point), so greedy can
+/// never select an EOG token and a max-tokens request generates exactly
+/// max-tokens. Exact numeric parse: any non-u32 element disables the ENTIRE
+/// mask with a loud error line (fail-closed toward shipping behavior — a
+/// half-parsed mask would measure a different protocol than pinned).
+/// Empty/unset = shipping behavior, byte-identical (no kernel launch).
+/// Sampled paths are NOT masked — the protocol is greedy-only by design.
+fn bench_mask_eog_ids() -> &'static [u32] {
+    use std::sync::OnceLock;
+    static IDS: OnceLock<Vec<u32>> = OnceLock::new();
+    IDS.get_or_init(|| {
+        let Ok(raw) = std::env::var("LUMEN_BENCH_MASK_EOG") else {
+            return Vec::new();
+        };
+        if raw.trim().is_empty() {
+            return Vec::new();
+        }
+        let parsed: Result<Vec<u32>, _> =
+            raw.split(',').map(|t| t.trim().parse::<u32>()).collect();
+        match parsed {
+            Ok(ids) if !ids.is_empty() => {
+                eprintln!("[BENCH] MASK_EOG=ON ids={ids:?} (fixed-horizon protocol surface)");
+                ids
+            }
+            _ => {
+                eprintln!(
+                    "[BENCH] MASK_EOG PARSE ERROR in {raw:?} — mask DISABLED (shipping behavior)"
+                );
+                Vec::new()
+            }
+        }
+    })
+}
+
 /// Tiled-argmax phase-1 tile count. 128 blocks over vocab 248320 = ~1940
 /// elements/block — spreads the ~1 MB logits read across the whole GPU
 /// instead of one SM. Output byte-identical (associative max-then-min-index).
@@ -910,6 +947,8 @@ struct MutableState {
     /// (val, idx) pairs. Always allocated (1 KB) so the flag needs no realloc.
     argmax_partial_val: CudaSlice<f32>,
     argmax_partial_idx: CudaSlice<u32>,
+    /// EOG-mask id buffer (LUMEN_BENCH_MASK_EOG); None when the mask is off.
+    bench_mask_eog_gpu: Option<CudaSlice<u32>>,
     /// Whether the model has any GDN layers.
     has_gdn_layers: bool,
     /// Whether the model has Q+gate fusion layers (disables graph capture).
@@ -8651,6 +8690,37 @@ impl CudaBackend {
     /// reduction operator (max value, then min index) is associative and
     /// commutative, so tiling changes grouping, never the result.
     fn launch_argmax(&self, st: &mut MutableState, vocab: u32) -> Result<(), RuntimeError> {
+        // Fixed-horizon protocol EOG mask (see bench_mask_eog_ids): applied at
+        // this single entry point so BOTH argmax variants honor it identically.
+        // Mutates st.logits_gpu in place (documented instrument-only surface).
+        if let Some(ids_gpu) = st.bench_mask_eog_gpu.as_ref() {
+            if let Some(mask_fn) = st.kernels.mask_logits_neg_inf.clone() {
+                let k = ids_gpu.len() as u32;
+                let cfg = CudarcLaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (k.max(1), 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(&mask_fn)
+                        .arg(&mut st.logits_gpu)
+                        .arg(ids_gpu)
+                        .arg(&k)
+                        .arg(&vocab)
+                        .launch(cfg)
+                }
+                .map(|_| ())
+                .map_err(|e| RuntimeError::Compute(format!("eog mask launch: {e}")))?;
+            } else {
+                // Mask requested but kernel unavailable: refusing to silently run
+                // the wrong protocol — fail the decode loudly.
+                return Err(RuntimeError::Compute(
+                    "LUMEN_BENCH_MASK_EOG set but mask_logits_neg_inf failed to load".into(),
+                ));
+            }
+        }
         if argmax_tiled_enabled() {
             if let (Some(p1), Some(p2)) = (
                 st.kernels.argmax_f32_tile_phase1.clone(),
@@ -15284,6 +15354,14 @@ impl ComputeBackend for CudaBackend {
             argmax_result: self.device.alloc_zeros::<u32>(1)?,
             argmax_partial_val: self.device.alloc_zeros::<f32>(ARGMAX_TILES)?,
             argmax_partial_idx: self.device.alloc_zeros::<u32>(ARGMAX_TILES)?,
+            bench_mask_eog_gpu: {
+                let ids = bench_mask_eog_ids();
+                if ids.is_empty() {
+                    None
+                } else {
+                    Some(self.device.htod_copy(ids)?)
+                }
+            },
             has_gdn_layers: false,
             has_qgate_layers: false,
             has_moe_layers: false,

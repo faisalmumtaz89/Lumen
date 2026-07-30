@@ -159,6 +159,30 @@ extern "C" __global__ void argmax_f32_tile_phase1(
     }
 }
 
+// ============================================================================
+// EOG-mask (LUMEN_BENCH_MASK_EOG, protocol test-surface): writes -FLT_MAX to
+// the given logit positions BEFORE argmax, so a masked token can never be
+// selected by greedy — the "highest-probability continuation conditional on
+// continuing" estimand of the fixed-horizon quality protocol. NOTE: this
+// mutates the logits buffer in place; any downstream reader of this step's
+// logits (debug dumps, XCHK) sees -FLT_MAX at the masked ids. Instrument-only.
+// k is tiny (<= 8); one thread per id.
+// ============================================================================
+extern "C" __global__ void mask_logits_neg_inf(
+    float* __restrict__ logits,
+    const unsigned int* __restrict__ ids,
+    unsigned int k,
+    unsigned int n)
+{
+    unsigned int i = threadIdx.x;
+    if (i < k) {
+        unsigned int id = ids[i];
+        if (id < n) {
+            logits[id] = -3.402823466e+38f;
+        }
+    }
+}
+
 // Phase 2: one warp reduces the partials. num_partials <= 128.
 extern "C" __global__ void argmax_f32_tile_phase2(
     const float* __restrict__ partial_val,
