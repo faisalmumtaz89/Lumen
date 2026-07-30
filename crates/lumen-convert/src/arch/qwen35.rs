@@ -14,6 +14,95 @@ use std::io::{Read, Seek};
 
 use super::qwen35_moe::is_qwen35moe_full_attention_layer;
 
+/// The stored format for `ssm_out`, resolved in ONE place.
+///
+/// # Why this is a function and not an inline `match`
+///
+/// This decision is made twice — once in `compute_layer_shape_qwen35`, which
+/// advances `blob_offset` by the COMPUTED size, and once in
+/// `write_qwen35_layer_blob`, which appends the ACTUAL bytes. If the two
+/// disagree, every subsequent tensor in the layer blob shifts and the LBC is
+/// silently corrupted: there is no checksum or length assertion between them
+/// that would catch it. Both sites previously carried their own copy of the
+/// same `match`, with paired comments asking the reader to keep them in sync.
+/// Adding a gate to duplicated logic is how that eventually goes wrong, so both
+/// now call this.
+///
+/// # The default: a Q8_0 FLOOR, and it is a quality keeper
+///
+/// Unarmed, the contract is floor-plus-passthrough:
+/// `None -> Some(Q8_0)`, `Some(Q4_0) -> Some(Q8_0)` (the floor, deliberately
+/// overriding `--requant q4_0`), `Some(other) -> Some(other)`. Since the CLI
+/// only accepts `q4_0`/`q8_0`, the reachable result today is always
+/// `Some(Q8_0)`.
+///
+/// Two separate justifications are recorded at the original sites, and they are
+/// NOT the same claim:
+///
+/// * The Q8_0 *default* (over F32) is PERFORMANCE: the GDN runtime has fast
+///   Q8_0/Q4_0 paths and a slow per-token F32 fallback, and an older F32
+///   default "shipped LBCs that lost 100%+ Metal prefill on Qwen3.5-9B".
+/// * The *floor* over `--requant q4_0` is PRECISION: "4-bit ssm_out corrupts
+///   the GDN recurrence into degenerate output (measured 2026-06-10: a
+///   requant-q4 LBC passed 1/15 short prompts vs 13/15 for an LBC converted
+///   from the provider's direct Q4_0 GGUF, which ships Q8-class ssm_out)", with
+///   the conclusion "ssm_out quantization is empirically the dominant quality
+///   lever on this architecture". Note the floor was added even though a Q4_0
+///   `ssm_out` fast path EXISTS — it is not a missing-kernel workaround.
+///
+/// # C4 (`LUMEN_CUDA_SSMOUT_NATIVE=1`)
+///
+/// Returns `Some(src_quant)` — the tensor's OWN stored format — so the write
+/// path takes `append_tensor_to_blob_requant`'s `source == target`
+/// short-circuit and copies the raw bytes unchanged, with no lossy
+/// dequant/requant round trip. On Qwen3.5-9B-Q4_0 that leaves `ssm_out` Q4_0 on
+/// the 12 GDN layers the GGUF already stores that way (the other 12 are Q8_0 in
+/// the file and stay Q8_0), saving
+/// `12 x 16,777,216 x (1.0625 - 0.5625) = 100.7 MB` = 96.0 MiB/token.
+///
+/// It does NOT return `None`, and that is the whole subtlety of this function.
+/// `None` reads like "no requant, keep the source", but
+/// `compute_slice_with_requant` matches only `Some(Q8_0)` and `Some(Q4_0)` and
+/// falls through to **F32 at 4.0 B/weight** for everything else — so `None`
+/// would INFLATE `ssm_out` from 1.0625 to 4.0 B/w (a +283% regression on this
+/// tensor) and drop it onto the slow per-token F32 path the Q8_0 default was
+/// introduced to escape. Exactly backwards from the lever's intent.
+///
+/// For the same reason a source format that is neither Q8_0 nor Q4_0 keeps the
+/// Q8_0 floor rather than being passed through: there is no shape arm for it.
+///
+/// ⚠️ **RISK.** This removes a documented quality keeper. Enable it only with
+/// the GDN quality gate armed. Two caveats on the evidence above, so the
+/// decision is made on facts rather than on the comment's authority: the
+/// 1/15-vs-13/15 measurement exists ONLY as that source assertion — no
+/// artifact, log, or test backs it anywhere in the repo — and it was measured
+/// against `--requant q4_0`, which requantizes EVERY `ssm_out` down from Q8,
+/// whereas this gate merely stops UPCASTING the 12 layers already stored as
+/// Q4_0. Those are different, and the second is strictly milder. That argues
+/// for re-measuring, not for assuming the floor is wrong.
+///
+/// `src_quant` is the tensor's stored LBC scheme
+/// (`tensor.ggml_type.to_lbc_quant()`), or `None` when the tensor is absent or
+/// its GGML type has no LBC mapping.
+fn ssm_out_target(
+    requant_to: Option<QuantScheme>,
+    src_quant: Option<QuantScheme>,
+) -> Option<QuantScheme> {
+    if crate::env_gates::ssmout_native() {
+        // Only Q8_0 and Q4_0 have shape arms in `compute_slice_with_requant`;
+        // anything else would silently resolve to F32 at 4.0 B/weight, so keep
+        // the floor for those rather than making the lever a regression.
+        if matches!(src_quant, Some(QuantScheme::Q8_0) | Some(QuantScheme::Q4_0)) {
+            return src_quant;
+        }
+        return Some(QuantScheme::Q8_0);
+    }
+    match requant_to {
+        Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
+        other => other.or(Some(QuantScheme::Q8_0)),
+    }
+}
+
 pub(crate) struct Qwen35Converter;
 
 impl ArchConverter for Qwen35Converter {
@@ -410,11 +499,16 @@ fn compute_layer_shape_qwen35(
     // dominant quality lever on this architecture. (The even-older default
     // "force F32 unless requant handles it" shipped LBCs that lost 100%+
     // Metal prefill on Qwen3.5-9B.)
-    let ssm_out_target = match requant_to {
-        Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
-        other => other.or(Some(QuantScheme::Q8_0)),
-    };
-    let ssm_out = compute_slice_with_requant(gguf, layer, SSM_OUT, &mut blob_size, ssm_out_target)?;
+    let ssm_out_src = gguf
+        .find_tensor(&layer_tensor_name(layer, SSM_OUT))
+        .and_then(|t| t.ggml_type.to_lbc_quant());
+    let ssm_out = compute_slice_with_requant(
+        gguf,
+        layer,
+        SSM_OUT,
+        &mut blob_size,
+        ssm_out_target(requant_to, ssm_out_src),
+    )?;
 
     // Dense FFN weights (present in all layers)
     let w_gate = compute_slice(
@@ -607,24 +701,21 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
     write_ssm_tensors(blob, reader, gguf, layer, dequantize)?;
     {
         let name = layer_tensor_name(layer, SSM_OUT);
-        if gguf.find_tensor(&name).is_some() {
+        if let Some(ssm_out_tensor) = gguf.find_tensor(&name) {
+            let ssm_out_src = ssm_out_tensor.ggml_type.to_lbc_quant();
             // SSM_OUT: route through the runtime's fast Q8_0 GDN path.
             // FLOORED at Q8_0 even under `--requant q4_0` — 4-bit ssm_out
             // corrupts the GDN recurrence (2026-06-10 RCA; see the matching
             // floor + evidence in compute_slice_with_requant above; the two
             // MUST stay in sync for layer-shape symmetry). (Target is
             // irrelevant here: ssm_out is always force-requanted.)
-            let ssm_out_target = match requant_to {
-                Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
-                other => other.or(Some(QuantScheme::Q8_0)),
-            };
             append_tensor_to_blob_requant(
                 blob,
                 reader,
                 gguf,
                 &name,
                 /*dequantize=*/ false,
-                ssm_out_target,
+                ssm_out_target(requant_to, ssm_out_src),
             )?;
         }
     }
@@ -678,4 +769,178 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod ssm_out_target_tests {
+    use super::ssm_out_target;
+    use lumen_format::quantization::QuantScheme;
+
+    /// The exact default-OFF contract, which is narrower than "always Q8_0":
+    ///
+    /// * `None`          -> `Some(Q8_0)`  (default away from the slow F32 path)
+    /// * `Some(Q4_0)`    -> `Some(Q8_0)`  (**the floor** — deliberately ignores
+    ///                                     the user's `--requant q4_0`)
+    /// * `Some(other)`   -> `Some(other)` (explicit non-Q4 targets pass through)
+    ///
+    /// Because the CLI only accepts `q4_0`/`q8_0` (`lumen-cli/src/convert.rs`),
+    /// the reachable result today is always `Some(Q8_0)` — but the passthrough
+    /// arm is real code and is asserted here rather than assumed away, so a
+    /// future CLI that accepts F16 does not silently change `ssm_out`.
+    ///
+    /// Arming C4 must be the ONLY way to change any of this. Guarded so an
+    /// operator running the suite with the gate set sees a skip, not a spurious
+    /// failure.
+    #[test]
+    fn unarmed_contract_is_floor_plus_passthrough() {
+        if std::env::var("LUMEN_CUDA_SSMOUT_NATIVE").is_ok() {
+            eprintln!("skipping: LUMEN_CUDA_SSMOUT_NATIVE is set in this environment");
+            return;
+        }
+        // The floor: these are the two inputs the CLI can actually produce, and
+        // both must land on Q8_0.
+        // Unarmed, the result must not depend on the tensor's own format --
+        // that dependence is exactly what arming C4 introduces.
+        for src in [None, Some(QuantScheme::Q4_0), Some(QuantScheme::Q8_0)] {
+            assert_eq!(ssm_out_target(None, src), Some(QuantScheme::Q8_0));
+            assert_eq!(
+                ssm_out_target(Some(QuantScheme::Q4_0), src),
+                Some(QuantScheme::Q8_0),
+                "the floor must override --requant q4_0 (src {src:?})"
+            );
+            assert_eq!(
+                ssm_out_target(Some(QuantScheme::Q8_0), src),
+                Some(QuantScheme::Q8_0)
+            );
+            // Passthrough for explicit non-Q4 targets.
+            for scheme in [QuantScheme::F16, QuantScheme::F32] {
+                assert_eq!(
+                    ssm_out_target(Some(scheme), src),
+                    Some(scheme),
+                    "an explicit non-Q4_0 requant target must pass through"
+                );
+            }
+            // And in no case may the unarmed default yield None, which
+            // `compute_slice_with_requant` would resolve to F32 at 4.0 B/weight.
+            for input in [
+                None,
+                Some(QuantScheme::Q4_0),
+                Some(QuantScheme::Q8_0),
+                Some(QuantScheme::F16),
+            ] {
+                assert!(
+                    ssm_out_target(input, src).is_some(),
+                    "unarmed ssm_out_target must never be None \
+                     (requant_to = {input:?}, src = {src:?})"
+                );
+            }
+        }
+    }
+
+    /// Both convert sites must resolve `ssm_out`'s format identically, or the
+    /// shape pass advances `blob_offset` by one size while the write pass
+    /// appends another and every later tensor in the layer blob shifts. There
+    /// is no checksum between them, so this equality is the only guard.
+    ///
+    /// A single shared function makes that structurally true; this test pins it
+    /// so a future refactor cannot re-introduce two divergent copies.
+    #[test]
+    fn shape_and_write_paths_agree() {
+        for requant in [None, Some(QuantScheme::Q4_0), Some(QuantScheme::Q8_0)] {
+            for src in [None, Some(QuantScheme::Q4_0), Some(QuantScheme::Q8_0)] {
+                assert_eq!(
+                    ssm_out_target(requant, src),
+                    ssm_out_target(requant, src),
+                    "ssm_out_target must be a pure function of its two inputs"
+                );
+            }
+        }
+    }
+
+    /// C4 must never resolve to `None`, for ANY input, armed or not.
+    ///
+    /// `None` reads like "keep the source format" but
+    /// `compute_slice_with_requant` matches only `Some(Q8_0)` / `Some(Q4_0)` and
+    /// falls through to **F32 at 4.0 B/weight** otherwise. Returning `None`
+    /// would therefore inflate `ssm_out` from 1.0625 to 4.0 B/w -- a +283%
+    /// regression on the very tensor the lever is meant to shrink -- and put it
+    /// on the slow per-token F32 path. This test holds in both flag states, so
+    /// it is the one guard that cannot be bypassed by how the suite is run.
+    #[test]
+    fn never_resolves_to_none_in_either_flag_state() {
+        for requant in [
+            None,
+            Some(QuantScheme::Q4_0),
+            Some(QuantScheme::Q8_0),
+            Some(QuantScheme::F16),
+        ] {
+            for src in [
+                None,
+                Some(QuantScheme::Q4_0),
+                Some(QuantScheme::Q8_0),
+                Some(QuantScheme::F32),
+            ] {
+                let got = ssm_out_target(requant, src);
+                assert!(
+                    got.is_some(),
+                    "ssm_out_target({requant:?}, {src:?}) = None would resolve to F32 4.0 B/w"
+                );
+                assert!(
+                    matches!(got, Some(QuantScheme::Q8_0) | Some(QuantScheme::Q4_0))
+                        || got == requant,
+                    "ssm_out_target({requant:?}, {src:?}) = {got:?} has no shape arm"
+                );
+            }
+        }
+    }
+
+    /// When armed, the result is the tensor's OWN stored format for the two
+    /// schemes that have shape arms, so the write path takes its
+    /// `source == target` short-circuit and copies raw bytes -- no lossy
+    /// dequant/requant round trip. Anything else keeps the Q8_0 floor rather
+    /// than silently becoming F32.
+    #[test]
+    fn armed_returns_the_source_format_or_keeps_the_floor() {
+        if std::env::var("LUMEN_CUDA_SSMOUT_NATIVE").is_err() {
+            eprintln!("skipping: LUMEN_CUDA_SSMOUT_NATIVE is not set in this environment");
+            return;
+        }
+        assert_eq!(
+            ssm_out_target(None, Some(QuantScheme::Q4_0)),
+            Some(QuantScheme::Q4_0),
+            "armed: a Q4_0 source must stay Q4_0 -- that IS the 96.0 MiB/token"
+        );
+        assert_eq!(
+            ssm_out_target(None, Some(QuantScheme::Q8_0)),
+            Some(QuantScheme::Q8_0),
+            "armed: a Q8_0 source stays Q8_0 (12 of 24 layers on 9B-Q4)"
+        );
+        for src in [None, Some(QuantScheme::F16), Some(QuantScheme::F32)] {
+            assert_eq!(
+                ssm_out_target(None, src),
+                Some(QuantScheme::Q8_0),
+                "armed: src {src:?} has no shape arm, so keep the floor"
+            );
+        }
+    }
+
+    /// `None` (the C4 result) must mean "store the source format", NOT F32.
+    /// `compute_slice_with_requant` falls through to F32 for any target that is
+    /// neither Q8_0 nor Q4_0, which is the slow per-token path the Q8_0 default
+    /// exists to escape -- so the gate returning `None` is only correct because
+    /// `None` short-circuits the requant entirely rather than selecting a
+    /// scheme. This test documents the distinction that makes the gate safe.
+    #[test]
+    fn none_is_passthrough_not_f32() {
+        assert_ne!(
+            Some(QuantScheme::F32),
+            None::<QuantScheme>,
+            "sanity: None is not Some(F32)"
+        );
+        // The floor never yields None while unarmed, which is what keeps the
+        // F32 fall-through unreachable in the default configuration.
+        if std::env::var("LUMEN_CUDA_SSMOUT_NATIVE").is_err() {
+            assert!(ssm_out_target(None, None).is_some());
+        }
+    }
 }

@@ -1448,8 +1448,18 @@ mod q6k_layout_tests {
     /// The SHIPPED reader does NOT invert the packer: groups 1 and 2 take their
     /// `ql` nibble from the wrong byte, corrupting ~half of every super-block.
     /// This pins the defect so a silent "fix" or regression is visible.
+    ///
+    /// Skipped when `LUMEN_Q6K_LAYOUT_FIX=1`, because with the gate armed
+    /// `dequantize_q6_k` delegates to the correct reader and the two agree by
+    /// construction. That inversion is the point of the gate, not a failure --
+    /// but it must not turn the suite red for an operator who runs it with the
+    /// fix on, so the skip is explicit rather than implicit.
     #[test]
     fn q6k_default_mapping_is_wrong() {
+        if crate::env_gates::q6k_layout_fix() {
+            eprintln!("skipping: LUMEN_Q6K_LAYOUT_FIX=1, the default reader IS the ggml reader");
+            return;
+        }
         let (codes, scales) = rand_codes_scales(0x2026_0730);
         let block = pack_q6_k(&codes, &scales, 0x3C00);
         let good = as_f32(&dequantize_q6_k_ggml(&block, 256));
@@ -1476,6 +1486,10 @@ mod q6k_layout_tests {
     /// (all-zero `ql`, and `ql = 0x11`) use bytes whose low and high nibbles are
     /// EQUAL, which makes the swap unobservable. A test built on such data
     /// proves nothing about the mapping.
+    /// (Holds in BOTH flag states: if the gate is armed the two readers are the
+    /// same function, so equality is trivially true; if not, the swap exists but
+    /// uniform data cannot see it. Either way the claim being documented — that
+    /// this data shape proves nothing — stands.)
     #[test]
     fn uniform_code_patterns_cannot_detect_the_swap() {
         for code in [0u8, 1, 17, 63] {
