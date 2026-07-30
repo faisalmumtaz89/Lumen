@@ -83,6 +83,20 @@ pub fn sample_token_with_state(
     state: &mut SamplerState,
     rng: &mut Xorshift64,
 ) -> u32 {
+    // FIXED-HORIZON PROTOCOL EOG MASK (LUMEN_BENCH_MASK_EOG), host path.
+    //
+    // The CUDA GPU-argmax path masks on device inside `launch_argmax`, but that
+    // does NOT cover every selection: the prefill-boundary token — and any token
+    // taken from `pending_logits` — is chosen HERE, from host logits produced by
+    // `compute_final`, with no backend call (session.rs "Path A"). Masking only
+    // on the GPU left that token unmasked, so a boundary EOG still terminated at
+    // one token and the instrument could not deliver its stated contract of
+    // exactly N ids on every tree.
+    //
+    // Masking at this single host choke point covers all three `session.rs` call
+    // sites and every non-CUDA backend, using the same sentinel and the same
+    // pinned id set as the kernel. No-op (and byte-identical) when unset.
+    crate::runtime_defaults::apply_eog_mask(&mut logits.data);
     let token = crate::sampling::sample_logits(&mut logits.data, params, state, rng);
     state.record(token);
     token

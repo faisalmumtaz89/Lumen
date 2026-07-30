@@ -130,30 +130,11 @@ fn bf16_autotune_enabled() -> bool {
 /// Empty/unset = shipping behavior, byte-identical (no kernel launch).
 /// Sampled paths are NOT masked — the protocol is greedy-only by design.
 fn bench_mask_eog_ids() -> &'static [u32] {
-    use std::sync::OnceLock;
-    static IDS: OnceLock<Vec<u32>> = OnceLock::new();
-    IDS.get_or_init(|| {
-        let Ok(raw) = std::env::var("LUMEN_BENCH_MASK_EOG") else {
-            return Vec::new();
-        };
-        if raw.trim().is_empty() {
-            return Vec::new();
-        }
-        let parsed: Result<Vec<u32>, _> =
-            raw.split(',').map(|t| t.trim().parse::<u32>()).collect();
-        match parsed {
-            Ok(ids) if !ids.is_empty() => {
-                eprintln!("[BENCH] MASK_EOG=ON ids={ids:?} (fixed-horizon protocol surface)");
-                ids
-            }
-            _ => {
-                eprintln!(
-                    "[BENCH] MASK_EOG PARSE ERROR in {raw:?} — mask DISABLED (shipping behavior)"
-                );
-                Vec::new()
-            }
-        }
-    })
+    // Delegates to the single source of truth so the GPU mask and the host mask
+    // (engine::sample_token_with_state) can never disagree on the id set, the
+    // sentinel, or the parse. Previously this was a private duplicate that
+    // silently disabled the mask on a parse error; see runtime_defaults.
+    crate::runtime_defaults::bench_mask_eog_ids()
 }
 
 /// Tiled-argmax phase-1 tile count. 128 blocks over vocab 248320 = ~1940
