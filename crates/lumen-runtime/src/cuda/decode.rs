@@ -1181,16 +1181,20 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         )
         .ok(),
         argmax_f32: load_fn(shaders::ARGMAX_KERNEL_SOURCE, "argmax_f32")?,
-        argmax_f32_tile_phase1: match load_fn(shaders::ARGMAX_KERNEL_SOURCE, "argmax_f32_tile_phase1")
-        {
+        argmax_f32_tile_phase1: match load_fn(
+            shaders::ARGMAX_KERNEL_SOURCE,
+            "argmax_f32_tile_phase1",
+        ) {
             Ok(f) => Some(f),
             Err(e) => {
                 cuda_log!("[CUDA] argmax_f32_tile_phase1: FAILED: {e}");
                 None
             }
         },
-        argmax_f32_tile_phase2: match load_fn(shaders::ARGMAX_KERNEL_SOURCE, "argmax_f32_tile_phase2")
-        {
+        argmax_f32_tile_phase2: match load_fn(
+            shaders::ARGMAX_KERNEL_SOURCE,
+            "argmax_f32_tile_phase2",
+        ) {
             Ok(f) => Some(f),
             Err(e) => {
                 cuda_log!("[CUDA] argmax_f32_tile_phase2: FAILED: {e}");
