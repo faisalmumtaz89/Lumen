@@ -132,7 +132,9 @@ fn argmax_tiled_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        let on = parse_env_truthy("LUMEN_CUDA_ARGMAX_TILED").unwrap_or(false);
+        // DEFAULT-ON (kill-switch =0): bundle KEEP 2026-07-30 +3.16% CI [2.48,3.84]
+        // with GDN_AB_FUSED; byte-identical (cuda_evaluate_result_bundle2.json).
+        let on = parse_env_truthy("LUMEN_CUDA_ARGMAX_TILED").unwrap_or(true);
         if on {
             eprintln!("[ARGMAX] TILED=ON: two-phase {ARGMAX_TILES}-tile reduction");
         }

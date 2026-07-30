@@ -3378,7 +3378,11 @@ pub fn gdn_ab_fused() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = campaign_flag("LUMEN_CUDA_GDN_AB_FUSED");
+        // DEFAULT-ON (kill-switch `=0`): bundle KEEP 2026-07-30 with
+        // ARGMAX_TILED — +3.16% (CI [2.48, 3.84], sigma_d 1.16%), corpus
+        // token-identical to the certified golden (bit-identical kernel body;
+        // cuda_evaluate_result_bundle2.json @ 76c9804).
+        let on = !std::env::var("LUMEN_CUDA_GDN_AB_FUSED").is_ok_and(|v| v == "0");
         if on {
             eprintln!(
                 "[GDN] AB_FUSED=ON: ssm_alpha+ssm_beta share one quantize and one \
