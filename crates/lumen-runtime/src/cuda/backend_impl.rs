@@ -8545,25 +8545,15 @@ impl CudaBackend {
         // by the same reasoning the sibling Q8 head kernel documents, not by
         // measurement, and it is the obvious first knob if C3 underperforms.
         if let Some(ref proj_q6k) = st.globals.output_proj_q6k {
-            crate::runtime_defaults::route_census_record("head", "HEAD_Q6K_NATIVE");
-            let f = st.kernels.matvec_q6_k_f32_nr8.as_ref().ok_or_else(|| {
-                RuntimeError::Compute(
-                    "matvec_q6_k_f32_nr8 unavailable: LUMEN_CUDA_LMHEAD_Q6K is armed and the \
-                     head was uploaded as Q6_K, but the kernel failed to compile"
-                        .to_string(),
-                )
-            })?;
             unsafe {
-                launch_matvec_q6_k(
+                dispatch_output_proj_q6k(
                     &self.device,
-                    f,
+                    &st.kernels,
                     proj_q6k,
                     &st.scratch.normed,
                     &mut st.logits_gpu,
                     vocab_size,
                     hidden_dim,
-                    8,
-                    "head",
                 )?;
             }
             return Ok(());
@@ -9658,6 +9648,49 @@ unsafe fn launch_matvec_q6_k(
         .launch(cfg)
         .map_err(|e| RuntimeError::Compute(format!("matvec_q6_k_f32 {label}: {e}")))?;
     Ok(())
+}
+
+/// Dispatch the native Q6_K output projection (candidate C3).
+///
+/// SINGLE SOURCE OF TRUTH for both head paths:
+///   * `compute_final_gpu` -- the GPU-resident decode loop
+///   * `compute_final`     -- the host-activation path, which is what the
+///                            PREFILL-BOUNDARY token (the first sample, before
+///                            the decode loop) actually routes through
+///
+/// Both already rmsnorm into the SAME `st.scratch.normed` GPU buffer and both
+/// write `st.logits_gpu`, so routing them through one helper makes the two
+/// paths' logits **bit-identical by construction** rather than by assertion --
+/// same kernel, same inputs, same launch geometry, no tolerance to argue about.
+///
+/// That structural guarantee is the point. All three C3 integration defects
+/// found on the A100 came from the same root cause: `compute_final` /
+/// `compute_layer` are full duplicates of the `_gpu` chains, and a candidate
+/// added to one silently misses the other. Naming the kernel in exactly one
+/// place removes that failure mode for this head instead of patching its third
+/// instance. `q6k_ref::head_kernel_is_dispatched_from_exactly_one_place` pins it.
+///
+/// NR=8 matches the `matvec_q6_k_f32_nr8` handle; see `launch_matvec_q6_k`.
+unsafe fn dispatch_output_proj_q6k(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    proj_q6k: &CudaSlice<u8>,
+    normed: &CudaSlice<f32>,
+    logits: &mut CudaSlice<f32>,
+    vocab_size: usize,
+    hidden_dim: usize,
+) -> Result<(), RuntimeError> {
+    crate::runtime_defaults::route_census_record("head", "HEAD_Q6K_NATIVE");
+    let f = kernels.matvec_q6_k_f32_nr8.as_ref().ok_or_else(|| {
+        RuntimeError::Compute(
+            "matvec_q6_k_f32_nr8 unavailable: LUMEN_CUDA_LMHEAD_Q6K is armed and the head \
+             was uploaded as Q6_K, but the kernel failed to compile"
+                .to_string(),
+        )
+    })?;
+    launch_matvec_q6_k(
+        device, f, proj_q6k, normed, logits, vocab_size, hidden_dim, 8, "head",
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15506,37 +15539,43 @@ impl ComputeBackend for CudaBackend {
         // Reuse the pre-allocated logits_gpu buffer from MutableState.
         //
         {
-            // C3 guard. This function is the host-activation twin of
-            // `compute_final_gpu` and duplicates its whole dispatch chain, but
-            // it has no `output_proj_q6k` arm -- and adding a real one here is
-            // out of scope for a decode lever, because this path takes an
-            // `ActivationBuffer` rather than the GPU-resident `scratch.normed`
-            // the kernel needs.
+            // C3 (`LUMEN_CUDA_LMHEAD_Q6K=1`): native Q6_K head on the
+            // host-activation path.
             //
-            // Without this guard a Q6_K head would fall through EVERY arm below
-            // (all the `output_proj_*` fields are `None`) and reach the terminal
-            // cuBLAS SGEMV on `st.globals.output_proj` -- which for any
-            // raw-output-proj model is the 1-element `alloc_zeros(1)`
-            // PLACEHOLDER. That is garbage logits or an out-of-bounds read, i.e.
-            // exactly the silent-wrong-answer failure this campaign's rules
-            // exist to prevent. Fail loudly instead.
+            // THIS is the path the PREFILL-BOUNDARY token takes -- the first
+            // sample after prompt processing, before the GPU-resident decode
+            // loop starts. An earlier revision only guarded here and told the
+            // operator to "use the GPU-resident decode path", which was wrong
+            // advice: the battery DOES use that path for the decode loop, but the
+            // boundary token routes through this function regardless, so the
+            // guard fired on every run.
             //
-            // Note this chain already has the same structural gap for BF16 (no
-            // `output_proj_bf16` arm here either), which is evidence the path is
-            // not exercised for the GPU-resident decode classes -- the canonical
-            // bench runs `decode_token_greedy` -> `compute_final_gpu`. But it IS
-            // reachable from `session.rs` and `engine.rs`, so "probably unused"
-            // is not good enough to leave unguarded.
-            if st.globals.output_proj_q6k.is_some() {
-                return Err(RuntimeError::Compute(
-                    "LUMEN_CUDA_LMHEAD_Q6K: a native Q6_K output_proj reached compute_final \
-                     (the host-activation path), which has no Q6_K arm and would otherwise \
-                     multiply against a 1-element placeholder buffer. Use the GPU-resident \
-                     decode path (compute_final_gpu), or unset LUMEN_CUDA_LMHEAD_Q6K."
-                        .to_string(),
-                ));
-            }
-            if let Some(ref proj_q4a) = st.globals.output_proj_q4_aligned {
+            // No host-side dequant is needed, and specifically NOT the 4 GB
+            // full-head F32 expansion one might reach for: this function is
+            // already GPU-resident internally. It uploads `x` to
+            // `scratch.x_gpu` and rmsnorms into `scratch.normed` -- the SAME
+            // buffer `compute_final_gpu` uses -- then writes `logits_gpu` and
+            // copies back. So the same kernel on the same input yields
+            // BIT-IDENTICAL logits to the decode path, with no tolerance to
+            // justify. `dispatch_output_proj_q6k` is the single shared
+            // dispatcher that makes that structural.
+            //
+            // Placed FIRST so it cannot be shadowed. With the flag off
+            // `output_proj_q6k` is `None`, the `if let` fails, and the chain
+            // below runs byte-for-byte as before.
+            if let Some(ref proj_q6k) = st.globals.output_proj_q6k {
+                unsafe {
+                    dispatch_output_proj_q6k(
+                        &self.device,
+                        &st.kernels,
+                        proj_q6k,
+                        &st.scratch.normed,
+                        &mut st.logits_gpu,
+                        vocab_size,
+                        hidden_dim,
+                    )?;
+                }
+            } else if let Some(ref proj_q4a) = st.globals.output_proj_q4_aligned {
                 // Q4Aligned dp4a output projection (highest priority for Q4_0).
                 if let (Some(ref quant_fn), Some(ref mv_fn)) = (
                     st.kernels.quantize_f32_to_q8_1.as_ref(),

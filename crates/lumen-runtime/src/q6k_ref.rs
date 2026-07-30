@@ -785,6 +785,67 @@ mod tests {
         );
     }
 
+    /// The Q6_K head kernel must be dispatched from EXACTLY ONE place, and both
+    /// head paths must go through it.
+    ///
+    /// Root cause of all three C3 integration defects found on the A100:
+    /// `compute_final` and `compute_layer` are full duplicates of the `_gpu`
+    /// chains, so a candidate wired into one silently misses the other. The third
+    /// defect was precisely this -- the PREFILL-BOUNDARY token (first sample,
+    /// before the decode loop) routes through `compute_final`, not
+    /// `compute_final_gpu`.
+    ///
+    /// Naming the kernel once, inside `dispatch_output_proj_q6k`, makes the two
+    /// paths' logits bit-identical BY CONSTRUCTION (same kernel, same
+    /// `scratch.normed`, same `logits_gpu`) instead of by a tolerance assertion.
+    /// This test pins that invariant so a future edit cannot re-duplicate it.
+    ///
+    /// Source-level because the real property is structural and there is no GPU
+    /// here; `include_str!` from this non-cuda module keeps the check on the
+    /// DEFAULT test command, which `cuda::` would have cfg-gated it off.
+    #[test]
+    fn head_kernel_is_dispatched_from_exactly_one_place() {
+        const SRC: &str = include_str!("cuda/backend_impl.rs");
+
+        // Count ACTUAL dispatches, i.e. field accesses on the KernelSet, not
+        // prose. Doc comments and the error string also name the kernel, and
+        // counting those would make this test assert formatting rather than
+        // structure -- a distinction the first cut of this test got wrong.
+        let dispatches = SRC.matches("kernels.matvec_q6_k_f32_nr8").count();
+        assert_eq!(
+            dispatches, 1,
+            "the KernelSet field `matvec_q6_k_f32_nr8` is accessed {dispatches} times in \
+             backend_impl.rs; it must be accessed exactly once, inside \
+             dispatch_output_proj_q6k. A second access is a duplicated head dispatch, \
+             which is how the prefill-boundary path silently missed C3."
+        );
+
+        // Both head paths must call the shared dispatcher: one definition plus
+        // two call sites (compute_final_gpu and compute_final).
+        let calls = SRC.matches("dispatch_output_proj_q6k(").count();
+        assert_eq!(
+            calls, 3,
+            "expected 1 definition + 2 call sites of dispatch_output_proj_q6k \
+             (compute_final_gpu and compute_final), found {calls} occurrences"
+        );
+
+        // And the dead-end guard that used to sit in compute_final must be gone:
+        // failing there is not a fix, it is the bug reported from the A100.
+        assert!(
+            !SRC.contains("a native Q6_K output_proj reached compute_final"),
+            "the compute_final guard must be REPLACED by a real dispatch, not kept -- \
+             the prefill-boundary token takes that path on every run"
+        );
+
+        // Both head paths must exist and each must reference the Q6_K global, so
+        // this test fails if either arm is deleted rather than silently passing.
+        assert_eq!(
+            SRC.matches("st.globals.output_proj_q6k").count(),
+            2,
+            "both compute_final_gpu and compute_final must test output_proj_q6k"
+        );
+    }
+
     /// A zero `d` (the packer's all-zero-block escape) must produce zeros, not
     /// NaN, through the whole path.
     #[test]
