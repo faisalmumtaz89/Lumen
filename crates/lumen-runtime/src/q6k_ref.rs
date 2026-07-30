@@ -405,6 +405,90 @@ pub fn row_dot_kernel_order(row: &[u8], x: &[f32], in_dim: usize) -> f32 {
     partials.iter().fold(0.0f32, |a, &b| a + b)
 }
 
+/// Host mirror of `matvec_q6_k_q8_1`'s per-row dot: native Q6_K weights against
+/// PRE-QUANTIZED Q8_1 activations (candidate C1b, the dp4a route).
+///
+/// Reproduces `vec_dot_q6_K_q8_1` semantics (ggml/src/ggml-cuda/vecdotq.cuh:620-644)
+/// on this file's lane mapping: per 4-byte group, mask nibbles, splice the two
+/// high bits, apply the -32 bias, take an EXACT integer dot against four int8
+/// activations, scale by the int8 sub-block scale, then by the Q8_1 block's f32
+/// scale; `d` once per super-block.
+///
+/// `input_q8_1` is the in-tree Q8_1 layout: 36 bytes per 32 elements,
+/// `[f16 d][f16 sum][32 x int8]`, quants at offset +4. The `sum` field is
+/// deliberately UNREAD -- Q4_0/Q4_1 need it to correct their weight offset, but
+/// Q6_K applies -32 per element before the dot, so there is no correction term.
+/// llama.cpp's implementation has the same shape.
+pub fn row_dot_q8_1_kernel_order(row: &[u8], input_q8_1: &[u8], in_dim: usize) -> f32 {
+    const NW: usize = 32;
+    const NWARPS: usize = 4;
+    const Q8_1_BYTES: usize = 36;
+    assert_eq!(in_dim % Q6K_BLOCK_ELEM, 0);
+    let nb = in_dim / Q6K_BLOCK_ELEM;
+
+    let ld_u32 = |b: &[u8], off: usize| -> u32 {
+        u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+    };
+    let vsub32 = |v: u32| -> [i32; 4] {
+        let mut o = [0i32; 4];
+        for (k, slot) in o.iter_mut().enumerate() {
+            *slot = ((v >> (8 * k)) & 0xFF) as i32 - 32;
+        }
+        o
+    };
+
+    let mut partials = vec![0.0f32; NWARPS * NW];
+    for warp_id in 0..NWARPS {
+        for lane in 0..NW {
+            let p = lane * 4;
+            let half = p >> 6;
+            let p_h = p & 63;
+            let qh_off = half * 32 + (p_h & 31);
+            let sh_lo = 2 * (p_h >> 5) as u32;
+            let sc_i = 8 * half + (p_h >> 4);
+            let elem_lo = half * 128 + p_h;
+            let elem_hi = elem_lo + 64;
+
+            let mut sumf = 0.0f32;
+            let mut ib = warp_id;
+            while ib < nb {
+                let bp = &row[ib * Q6K_BLOCK_BYTE..];
+                let vl = ld_u32(bp, p);
+                let vh = ld_u32(bp, 128 + qh_off);
+                let qlo = vsub32((vl & 0x0F0F_0F0F) | (((vh >> sh_lo) & 0x0303_0303) << 4));
+                let qhi =
+                    vsub32(((vl >> 4) & 0x0F0F_0F0F) | (((vh >> (sh_lo + 4)) & 0x0303_0303) << 4));
+
+                let mut dot = |g: usize, q: [i32; 4]| -> (i32, f32) {
+                    let blk = g >> 5;
+                    let off = g & 31;
+                    let base = blk * Q8_1_BYTES;
+                    let d8 = f16_bits_to_f32(u16::from_le_bytes([
+                        input_q8_1[base],
+                        input_q8_1[base + 1],
+                    ]));
+                    let mut acc = 0i32;
+                    for k in 0..4 {
+                        acc += q[k] * (input_q8_1[base + 4 + off + k] as i8 as i32);
+                    }
+                    (acc, d8)
+                };
+                let (dot_lo, d8_lo) = dot(ib * Q6K_BLOCK_ELEM + elem_lo, qlo);
+                let (dot_hi, d8_hi) = dot(ib * Q6K_BLOCK_ELEM + elem_hi, qhi);
+
+                let sc = &bp[192..208];
+                let mut acc = 0.0f32;
+                acc = d8_lo.mul_add((dot_lo as f32) * (sc[sc_i] as i8 as i32 as f32), acc);
+                acc = d8_hi.mul_add((dot_hi as f32) * (sc[sc_i + 4] as i8 as i32 as f32), acc);
+                sumf = decode_d(bp).mul_add(acc, sumf);
+                ib += NWARPS;
+            }
+            partials[warp_id * NW + lane] = sumf;
+        }
+    }
+    partials.iter().fold(0.0f32, |a, &b| a + b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,6 +808,105 @@ mod tests {
         assert!(
             rel < 1e-6,
             "kernel-order dot {got} vs f64 reference {want} (rel {rel:.3e})"
+        );
+    }
+
+    /// C1b parity: the dp4a (int8-activation) route must agree with the F32
+    /// route to within Q8_1 activation-quantization error, on the SAME weights.
+    ///
+    /// The two kernels differ only in how the activation is represented, so a
+    /// disagreement beyond Q8_1's own quantization step means the int8 lane
+    /// mapping, the nibble/high-bit splice, the scale indexing, or the Q8_1
+    /// offsets are wrong -- exactly the class of error that produced a 45%-wrong
+    /// dot in the archived patch.
+    ///
+    /// Tolerance is derived, not tuned: Q8_1 encodes each 32-element block at
+    /// d = max|x|/127, so per-element error is bounded by d/2 and the relative
+    /// error of a 4096-term dot is ~1/254 in the worst case. 1% is a loose but
+    /// meaningful bound -- a mis-indexed scale or a swapped nibble blows past it
+    /// by orders of magnitude (verified: swapping the two scale indices gives
+    /// ~50% error).
+    #[test]
+    fn dp4a_route_matches_the_f32_route() {
+        let in_dim = 4096usize;
+        let nb = in_dim / Q6K_BLOCK_ELEM;
+        let mut rng = Rng::new(0xC1B);
+
+        let mut row = Vec::with_capacity(nb * Q6K_BLOCK_BYTE);
+        for _ in 0..nb {
+            let codes = random_codes(&mut rng);
+            let scales = random_scales(&mut rng);
+            row.extend_from_slice(&pack_block(&codes, &scales, 0.001953125));
+        }
+        let x: Vec<f32> = (0..in_dim).map(|_| rng.unit_f32()).collect();
+
+        // Encode x as Q8_1, the in-tree 36-byte layout.
+        let mut q8_1 = vec![0u8; (in_dim / 32) * 36];
+        for b in 0..(in_dim / 32) {
+            let blk = &x[b * 32..(b + 1) * 32];
+            let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+            let base = b * 36;
+            q8_1[base..base + 2].copy_from_slice(&f32_to_f16_bits_rne(d).to_le_bytes());
+            let mut sum = 0.0f32;
+            for (k, &v) in blk.iter().enumerate() {
+                let q = if d > 0.0 {
+                    (v / d).round().clamp(-127.0, 127.0) as i8
+                } else {
+                    0
+                };
+                q8_1[base + 4 + k] = q as u8;
+                sum += (q as f32) * d;
+            }
+            // `sum` is written for layout fidelity; Q6_K must not read it.
+            q8_1[base + 2..base + 4].copy_from_slice(&f32_to_f16_bits_rne(sum).to_le_bytes());
+        }
+
+        let f32_route = row_dot_kernel_order(&row, &x, in_dim);
+        let dp4a_route = row_dot_q8_1_kernel_order(&row, &q8_1, in_dim);
+
+        let mag = f32_route.abs().max(1.0);
+        let rel = (f32_route - dp4a_route).abs() / mag;
+        assert!(
+            rel < 0.01,
+            "dp4a route {dp4a_route} vs F32 route {f32_route} (rel {rel:.4}) -- \
+             beyond Q8_1 quantization error, so the int8 mapping is wrong"
+        );
+        assert!(f32_route.abs() > 1.0, "test data must be non-trivial");
+    }
+
+    /// The Q8_1 `sum` field must NOT influence a Q6_K dot. Q4_0/Q4_1 need it to
+    /// correct their weight offset; Q6_K applies -32 per element before the dot,
+    /// so reading it would double-correct. Corrupting the field must change
+    /// nothing.
+    #[test]
+    fn q8_1_sum_field_is_unread_by_q6k() {
+        let in_dim = 512usize;
+        let nb = in_dim / Q6K_BLOCK_ELEM;
+        let mut rng = Rng::new(5150);
+        let mut row = Vec::new();
+        for _ in 0..nb {
+            let codes = random_codes(&mut rng);
+            let scales = random_scales(&mut rng);
+            row.extend_from_slice(&pack_block(&codes, &scales, 0.015625));
+        }
+        let mut q8_1 = vec![0u8; (in_dim / 32) * 36];
+        for b in 0..(in_dim / 32) {
+            let base = b * 36;
+            q8_1[base..base + 2].copy_from_slice(&f32_to_f16_bits_rne(0.01).to_le_bytes());
+            for k in 0..32 {
+                q8_1[base + 4 + k] = (rng.below(255) as i32 - 127) as i8 as u8;
+            }
+        }
+        let clean = row_dot_q8_1_kernel_order(&row, &q8_1, in_dim);
+        for b in 0..(in_dim / 32) {
+            q8_1[b * 36 + 2] = 0x7B;
+            q8_1[b * 36 + 3] = 0x5C;
+        }
+        let poisoned = row_dot_q8_1_kernel_order(&row, &q8_1, in_dim);
+        assert_eq!(
+            clean, poisoned,
+            "the Q8_1 sum field must not affect a Q6_K dot"
         );
     }
 

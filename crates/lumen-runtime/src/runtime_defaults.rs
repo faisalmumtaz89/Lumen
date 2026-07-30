@@ -1221,6 +1221,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_PTX_CACHE_DIR",
     "LUMEN_CUDA_Q4_MMVQ",
     "LUMEN_CUDA_Q4_ROUTE_ASSERT",
+    "LUMEN_CUDA_Q6K_DP4A",
     "LUMEN_CUDA_Q6K_NATIVE",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
@@ -2437,6 +2438,7 @@ mod tests {
         "LUMEN_CUDA_PTX_CACHE_DIR",
         "LUMEN_CUDA_Q4_MMVQ",
         "LUMEN_CUDA_Q4_ROUTE_ASSERT",
+        "LUMEN_CUDA_Q6K_DP4A",
         "LUMEN_CUDA_Q6K_NATIVE",
         "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q8_MMVQ",
@@ -3289,6 +3291,47 @@ pub fn qkv_decouple() -> bool {
             eprintln!(
                 "[QKV] DECOUPLE=ON: wk/wv leave the F16 batched HGEMV, \
                  dispatch native Q4 (+1 rmsnorm/layer)"
+            );
+        }
+        on
+    })
+}
+
+/// `LUMEN_CUDA_Q6K_DP4A=1` (candidate C1b) — dispatch native Q6_K weights
+/// against PRE-QUANTIZED Q8_1 activations with `matvec_q6_k_q8_1` (dp4a),
+/// instead of the F32-activation `matvec_q6_k_f32`.
+///
+/// Scoped to the four coupled `wq` surfaces (Qwen3.5-9B-Q4_0 full-attention
+/// layers 3/15/27/31), NOT the head. Rationale: the F32 kernel is compute-bound
+/// because F32 activations allow one `fma` per element, while `dp4a` folds four
+/// int8 MACs into one instruction. Those four layers are also the only sites
+/// where an int8 activation plan has ALREADY pre-quantized the activation into
+/// `scratch.input_q8_1`, so the Q8_1 buffer this needs exists for free — and
+/// under such a plan they currently divert to F16 HGEMV at 2.0 B/weight, so this
+/// replaces the worst read in the model's attention block with 0.8203 B/weight.
+///
+/// ONLY engages when the activation plan for `AttnQkv` actually says `Q8_1`.
+/// Under the shipping dense-narrow-GDN plan (F32 for all six families) this flag
+/// is inert by construction — `weight_uses_f32_act_q4_fam` reports F32 for a
+/// `Q6KRaw` weight, which keeps `qkv_use_preq` false and routes to the F32
+/// kernel. That guard matters: without it, arming this flag under an F32 plan
+/// would have silently pushed `wk`/`wv` onto int8 activations too, violating the
+/// very policy the plan exists to enforce.
+///
+/// Loaded via `load_fn_sm80_fast_math`, never plain `load_fn`: NVRTC's default
+/// architecture is below sm_61 and would reject `dp4a.s32.s32`, leaving the
+/// handle `None` and this flag silently inert.
+///
+/// NOT byte-identical when ON: int8 activations replace F32 ones.
+pub fn q6k_dp4a() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = campaign_flag("LUMEN_CUDA_Q6K_DP4A");
+        if on {
+            eprintln!(
+                "[Q6K] DP4A=ON: native Q6_K x Q8_1 int8 activations on the coupled wq \
+                 surfaces (inert unless the AttnQkv plan is Q8_1)"
             );
         }
         on

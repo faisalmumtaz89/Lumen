@@ -11741,6 +11741,52 @@ unsafe fn launch_matvec_preq8_1_split(
     // launching if the sibling or kernel is absent. Proof of execution is the
     // per-kernel tag recorded at the actual dispatch site below.
     crate::runtime_defaults::route_census_record(label, "Q8_1_PREQ_SPLIT");
+    // C1b: native Q6_K against the pre-quantized Q8_1 activation. First, because
+    // no split sibling exists or applies for a Q6_K weight -- the Q8/Q4 branches
+    // below would fall straight through and the caller would see a silent no-op.
+    // Reachable only when `weight_uses_dp4a_q8_1` said yes, i.e. the flag is on,
+    // the kernel compiled, and the AttnQkv plan is Q8_1.
+    if let GpuWeightBuf::Q6KRaw(w_q6) = weight {
+        let f = kernels.matvec_q6_k_q8_1.as_ref().ok_or_else(|| {
+            RuntimeError::Compute(format!(
+                "matvec_q6_k_q8_1 unavailable for {label}: LUMEN_CUDA_Q6K_DP4A is armed \
+                 and the int8 route was selected, but the kernel failed to compile"
+            ))
+        })?;
+        const Q6K_BLOCK_ELEM: usize = 256;
+        const Q6K_BLOCK_BYTE: usize = 210;
+        if in_dim % Q6K_BLOCK_ELEM != 0 {
+            return Err(RuntimeError::Compute(format!(
+                "matvec_q6_k_q8_1 {label}: in_dim {in_dim} is not a multiple of 256"
+            )));
+        }
+        let needed = out_dim * (in_dim / Q6K_BLOCK_ELEM) * Q6K_BLOCK_BYTE;
+        if w_q6.len() < needed {
+            return Err(RuntimeError::Compute(format!(
+                "matvec_q6_k_q8_1 {label}: weight has {} bytes, needs {needed}",
+                w_q6.len()
+            )));
+        }
+        let out_dim_u32 = out_dim as u32;
+        let in_dim_u32 = in_dim as u32;
+        let cfg = CudarcLaunchConfig {
+            grid_dim: (out_dim_u32, 1, 1),
+            block_dim: (DP4A_Q8_1_BLOCK_DIM, 1, 1), // 128 = 4 warps
+            shared_mem_bytes: 0,
+        };
+        device
+            .stream
+            .launch_builder(f)
+            .arg(w_q6)
+            .arg(q8_1_buf)
+            .arg(output)
+            .arg(&out_dim_u32)
+            .arg(&in_dim_u32)
+            .launch(cfg)
+            .map_err(|e| RuntimeError::Compute(format!("matvec_q6_k_q8_1 {label}: {e}")))?;
+        crate::runtime_defaults::route_census_record(label, "Q6K_DP4A");
+        return Ok(());
+    }
     // Q8 split path.
     if kernels.use_q8_split_dispatch {
         if let Some(split_buf) = q8_split_sibling {
@@ -12729,7 +12775,17 @@ fn weight_uses_f32_act_q4_fam(
     plan: &crate::runtime_defaults::Q4ActPlan,
     family: crate::runtime_defaults::Q4ProjectionFamily,
 ) -> bool {
-    if !matches!(weight, GpuWeightBuf::Q4Raw(_)) {
+    // Q6KRaw is admitted alongside Q4Raw so the activation PLAN stays
+    // authoritative for a native Q6_K weight (candidate C1b). Without this, a
+    // `Q6KRaw` wq reported "not F32-pinned" and, once `weight_uses_dp4a_q8_1`
+    // learned to say yes for it, `qkv_use_preq` would have gone true under the
+    // SHIPPING F32 plan -- silently dragging wk/wv onto int8 activations too,
+    // which is the exact policy violation the plan exists to prevent.
+    //
+    // Flag-off safety: with LUMEN_CUDA_Q6K_DP4A unset, `weight_uses_dp4a_q8_1`
+    // returns false for Q6KRaw, so `qkv_use_preq` is false either way and this
+    // arm changes nothing.
+    if !matches!(weight, GpuWeightBuf::Q4Raw(_) | GpuWeightBuf::Q6KRaw(_)) {
         return false;
     }
     plan.mode_for(family) == crate::runtime_defaults::Q4ActMode::F32
@@ -12741,6 +12797,11 @@ fn weight_uses_dp4a_q8_1(weight: &GpuWeightBuf, kernels: &KernelSet) -> bool {
         GpuWeightBuf::Q8Aligned(_) => kernels.matvec_q8_aligned_q8_1.is_some(),
         GpuWeightBuf::Q4Aligned(_) => kernels.matvec_q4_aligned_q8_1.is_some(),
         GpuWeightBuf::Q4Raw(_) => kernels.matvec_q4_0_dp4a.is_some(),
+        // C1b: only when armed AND the dp4a kernel actually compiled. Default
+        // OFF keeps the previous `_ => false`, so no route changes.
+        GpuWeightBuf::Q6KRaw(_) => {
+            crate::runtime_defaults::q6k_dp4a() && kernels.matvec_q6_k_q8_1.is_some()
+        }
         _ => false,
     }
 }

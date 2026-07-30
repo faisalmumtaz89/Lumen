@@ -490,6 +490,10 @@ pub(crate) struct KernelSet {
     // (`LUMEN_CUDA_PREFILL_F32`), the sibling of dequant_q8_0_to_f32 /
     // dequant_q4_0_to_f32. Without it a native-Q6_K weight aborts prefill.
     pub(crate) dequant_q6_k_to_f32: Option<CudaFunction>,
+    // Native Q6_K x pre-quantized Q8_1 activations (dp4a), `LUMEN_CUDA_Q6K_DP4A=1`.
+    // MUST load via load_fn_sm80_fast_math: NVRTC's default arch is below sm_61
+    // and would reject `dp4a.s32.s32`, leaving this None and the flag inert.
+    pub(crate) matvec_q6_k_q8_1: Option<CudaFunction>,
     pub(crate) matvec_q4_split_f32_lane: Option<CudaFunction>,
     pub(crate) matvec_q4_split_f32_lane_residual: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_residual: Option<CudaFunction>,
@@ -1844,6 +1848,25 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                     eprintln!("[Q6K] dequant_q6_k_to_f32: NVRTC FAILED (flag armed): {e}");
                 } else {
                     cuda_log!("[CUDA] dequant_q6_k_to_f32: FAILED: {e}");
+                }
+                None
+            }
+        },
+        // dp4a kernel -> sm80 fast-math loader, NOT plain load_fn. The `.rn`
+        // pinning inside makes it immune to --use_fast_math.
+        matvec_q6_k_q8_1: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q6_K_F32_KERNEL_SOURCE,
+            "matvec_q6_k_q8_1",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q6_k_q8_1: OK");
+                Some(f)
+            }
+            Err(e) => {
+                if crate::runtime_defaults::q6k_dp4a() {
+                    eprintln!("[Q6K] matvec_q6_k_q8_1: NVRTC FAILED (flag armed): {e}");
+                } else {
+                    cuda_log!("[CUDA] matvec_q6_k_q8_1: FAILED: {e}");
                 }
                 None
             }
