@@ -10810,6 +10810,18 @@ unsafe fn launch_matvec_residual_lane(
     ) else {
         return Ok(false);
     };
+    // Direct-call-only (compute_layer_gpu), never reached through
+    // launch_matvec_residual, so it needs its own guard. This is the LIVE `wo`
+    // path whenever AttnWo stays on F32 activations -- including the
+    // activation-probe config, where only attn_qkv/ffn_gate_up/ffn_down move to
+    // Q8_1 and wo does not. Opened AFTER the let-else so a fall-through that
+    // launches nothing records nothing. Bytes are the Q4 split layout:
+    // 18 B per 32-weight block.
+    let _prof_surface = prof::matvec_surface(
+        label,
+        (out_dim as u64) * ((in_dim as u64) / 32) * 18,
+        &device.stream,
+    );
     let out_dim_u32 = out_dim as u32;
     let in_dim_u32 = in_dim as u32;
     let cfg = CudarcLaunchConfig {
