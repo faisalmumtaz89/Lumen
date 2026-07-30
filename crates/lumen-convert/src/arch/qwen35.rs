@@ -793,7 +793,7 @@ mod ssm_out_target_tests {
     /// failure.
     #[test]
     fn unarmed_contract_is_floor_plus_passthrough() {
-        if std::env::var("LUMEN_CUDA_SSMOUT_NATIVE").is_ok() {
+        if crate::env_gates::ssmout_native() {
             eprintln!("skipping: LUMEN_CUDA_SSMOUT_NATIVE is set in this environment");
             return;
         }
@@ -901,7 +901,7 @@ mod ssm_out_target_tests {
     /// than silently becoming F32.
     #[test]
     fn armed_returns_the_source_format_or_keeps_the_floor() {
-        if std::env::var("LUMEN_CUDA_SSMOUT_NATIVE").is_err() {
+        if !crate::env_gates::ssmout_native() {
             eprintln!("skipping: LUMEN_CUDA_SSMOUT_NATIVE is not set in this environment");
             return;
         }
@@ -939,7 +939,7 @@ mod ssm_out_target_tests {
         );
         // The floor never yields None while unarmed, which is what keeps the
         // F32 fall-through unreachable in the default configuration.
-        if std::env::var("LUMEN_CUDA_SSMOUT_NATIVE").is_err() {
+        if !crate::env_gates::ssmout_native() {
             assert!(ssm_out_target(None, None).is_some());
         }
     }

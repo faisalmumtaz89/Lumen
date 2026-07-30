@@ -15502,6 +15502,36 @@ impl ComputeBackend for CudaBackend {
         // Reuse the pre-allocated logits_gpu buffer from MutableState.
         //
         {
+            // C3 guard. This function is the host-activation twin of
+            // `compute_final_gpu` and duplicates its whole dispatch chain, but
+            // it has no `output_proj_q6k` arm -- and adding a real one here is
+            // out of scope for a decode lever, because this path takes an
+            // `ActivationBuffer` rather than the GPU-resident `scratch.normed`
+            // the kernel needs.
+            //
+            // Without this guard a Q6_K head would fall through EVERY arm below
+            // (all the `output_proj_*` fields are `None`) and reach the terminal
+            // cuBLAS SGEMV on `st.globals.output_proj` -- which for any
+            // raw-output-proj model is the 1-element `alloc_zeros(1)`
+            // PLACEHOLDER. That is garbage logits or an out-of-bounds read, i.e.
+            // exactly the silent-wrong-answer failure this campaign's rules
+            // exist to prevent. Fail loudly instead.
+            //
+            // Note this chain already has the same structural gap for BF16 (no
+            // `output_proj_bf16` arm here either), which is evidence the path is
+            // not exercised for the GPU-resident decode classes -- the canonical
+            // bench runs `decode_token_greedy` -> `compute_final_gpu`. But it IS
+            // reachable from `session.rs` and `engine.rs`, so "probably unused"
+            // is not good enough to leave unguarded.
+            if st.globals.output_proj_q6k.is_some() {
+                return Err(RuntimeError::Compute(
+                    "LUMEN_CUDA_LMHEAD_Q6K: a native Q6_K output_proj reached compute_final \
+                     (the host-activation path), which has no Q6_K arm and would otherwise \
+                     multiply against a 1-element placeholder buffer. Use the GPU-resident \
+                     decode path (compute_final_gpu), or unset LUMEN_CUDA_LMHEAD_Q6K."
+                        .to_string(),
+                ));
+            }
             if let Some(ref proj_q4a) = st.globals.output_proj_q4_aligned {
                 // Q4Aligned dp4a output projection (highest priority for Q4_0).
                 if let (Some(ref quant_fn), Some(ref mv_fn)) = (
