@@ -2205,6 +2205,30 @@ impl CudaBackend {
             // input-norm region exists to bracket.
             prof::begin(Ph::AttnQkv, &self.device.stream);
 
+            // Classify this layer's QKV dispatch family so the per-surface
+            // brackets below land in the right one.
+            //
+            // On Qwen3.5-9B Q4_0 the ONLY K-quant layer tensor is `attn_q`,
+            // Q6_K on 4 of the 8 full-attention layers. Q6_K is host-dequantized
+            // to F32 at upload by default (`Q6KRaw` only under
+            // LUMEN_CUDA_Q6K_NATIVE), and in a weight slot an F32 buffer can
+            // ONLY have come from a dequantized K-quant -- norms are separate
+            // `CudaSlice<f32>` fields, not `GpuWeightBuf`. So this matches the
+            // dispatch guard's own first conjunct exactly, which makes the
+            // bracket boundary and the branch boundary the same boundary.
+            //
+            // `wk`/`wv` are natively Q4_0 on ALL 8 layers; they are dragged onto
+            // the coupled path by the guard, not by their own format. That is
+            // campaign lever C2, and it is why the split is per-LAYER here even
+            // though the underlying weight split is per-TENSOR.
+            prof::set_attn_family(
+                if matches!(&lw.wq, GpuWeightBuf::F32(_) | GpuWeightBuf::Q6KRaw(_)) {
+                    prof::AttnFamily::Q6kCoupled
+                } else {
+                    prof::AttnFamily::NativeQ4
+                },
+            );
+
             // 1. Fused RMSNorm + QKV projections (same logic as compute_layer).
             // For mixed-precision models (e.g. Qwen3.5-9B Q4 LBC where wq is
             // dequantized from Q6_K to F32 but wk/wv remain Q4_0 as Q4Raw),
@@ -4837,6 +4861,7 @@ impl CudaBackend {
                         shared_mem_bytes: 0,
                     };
                     let n = inter_dim as u32;
+                    let _prof_swiglu = prof::guard(Ph::FfnSwiglu, &self.device.stream);
                     unsafe {
                         self.device
                             .stream
@@ -4906,6 +4931,7 @@ impl CudaBackend {
                         shared_mem_bytes: 0,
                     };
                     let n = inter_dim as u32;
+                    let _prof_swiglu = prof::guard(Ph::FfnSwiglu, &self.device.stream);
                     unsafe {
                         self.device
                             .stream
@@ -4944,6 +4970,7 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 };
                 let n = inter_dim as u32;
+                let _prof_swiglu = prof::guard(Ph::FfnSwiglu, &self.device.stream);
                 unsafe {
                     self.device
                         .stream
@@ -5070,6 +5097,7 @@ impl CudaBackend {
                 shared_mem_bytes: 0,
             };
             let n = hidden_dim as u32;
+            let _prof_resid = prof::guard(Ph::FfnResidual, &self.device.stream);
             unsafe {
                 self.device
                     .stream
@@ -5572,6 +5600,7 @@ impl CudaBackend {
                     shared_mem_bytes: shared_bytes,
                 };
                 let dim = hidden_dim as u32;
+                let _prof_gdn_norm = prof::guard(Ph::GdnNorm, &self.device.stream);
                 unsafe {
                     self.device
                         .stream
@@ -5974,6 +6003,13 @@ impl CudaBackend {
                 if !SHOWN.swap(true, O::Relaxed) {}
             }
 
+            // `GdnConv` covers step 1 only. CAVEAT: with
+            // LUMEN_CUDA_GDN_FUSED_CONV=1 (default off) the single
+            // `ssm_conv1d_silu_l2norm_t1` kernel does conv1d+SiLU AND the Q/K
+            // L2 normalize, so on that arm the L2 work is attributed to
+            // gdn_conv rather than gdn_recur. One kernel cannot be split.
+            let _prof_gdn_conv = prof::guard(Ph::GdnConv, &self.device.stream);
+
             // 1. ssm_conv1d_silu_prefill: conv1d + SiLU, advances conv_state.
             {
                 // LUMEN_CUDA_GDN_FUSED_CONV=1: conv1d+SiLU AND the L2 normalize
@@ -6048,6 +6084,11 @@ impl CudaBackend {
                 }
                 gdn.conv_positions[gdn_idx] = (state_pos + batch_u32) % buf_slots;
             }
+            drop(_prof_gdn_conv);
+
+            // `GdnRecur` covers steps 2-4 (gates, L2 normalize, delta-rule state
+            // update). Closed before the norm-gate, which belongs to gdn_out.
+            let _prof_gdn_recur = prof::guard(Ph::GdnRecur, &self.device.stream);
 
             // 2. gdn_compute_gates_batched: alpha/beta gates (-> alpha_buf/beta_buf).
             {
@@ -6218,6 +6259,9 @@ impl CudaBackend {
                 eprintln!("[XCHK] step={step} L={layer_idx} gdn_conv_state sumsq={csq:.6} absmax={cmx:.6}");
             }
 
+            drop(_prof_gdn_recur);
+
+            let _prof_gdn_norm_gate = prof::guard(Ph::GdnNormGate, &self.device.stream);
             // 5. gdn_prefill_norm_gate[_f64accum]: RMSNorm + SiLU(gate) ->
             //    normed_out_buf (the FINAL norm-gated GDN output). Step 11
             //    (ssm_out) reads normed_out_buf via used_fused_norm_gate=true.
@@ -8561,6 +8605,42 @@ impl CudaBackend {
         .map_err(|e| RuntimeError::Compute(format!("argmax launch: {e}")))
     }
 
+    /// Weight bytes the lm_head projection will stream this token.
+    ///
+    /// Mirrors the priority order of the dispatch chain in `compute_final_gpu`
+    /// so the declared traffic matches the arm that actually runs. Returns 0
+    /// when no head buffer is populated, which reports as `n/a` rather than as
+    /// a head that moved no bytes.
+    fn output_proj_bytes(&self, st: &MutableState) -> u64 {
+        let vocab = self.cached_vocab_size as u64;
+        let hidden = self.cached_hidden_dim as u64;
+        if vocab == 0 || hidden == 0 {
+            return 0;
+        }
+        let nb32 = hidden / 32;
+        let nb256 = hidden / 256;
+        let g = &st.globals;
+        // Order matches the dispatch chain: F16 fast path, then C3 Q6_K, then
+        // Q4Aligned, Q4, Q8Split, Q8Aligned, Q8, BF16, F32.
+        if g.output_proj_f16.is_some() {
+            vocab * hidden * 2
+        } else if g.output_proj_q6k.is_some() {
+            vocab * nb256 * (crate::q6k_ref::Q6K_BLOCK_BYTE as u64)
+        } else if g.output_proj_q4_aligned.is_some() {
+            vocab * nb32 * 20
+        } else if g.output_proj_q4.is_some() {
+            vocab * nb32 * 18
+        } else if g.output_proj_q8_split.is_some() || g.output_proj_q8.is_some() {
+            vocab * nb32 * 34
+        } else if g.output_proj_q8_aligned.is_some() {
+            vocab * nb32 * 36
+        } else if g.output_proj_bf16.is_some() {
+            vocab * hidden * 2
+        } else {
+            vocab * hidden * 4
+        }
+    }
+
     fn compute_final_gpu(&self, st: &mut MutableState) -> Result<(), RuntimeError> {
         // lm_head COVERAGE PROBE. This projection was NEVER measured: its
         // ablation arm failed rc=25 (determinism assert) and the "~657 GB/s,
@@ -8636,6 +8716,21 @@ impl CudaBackend {
             .map_err(|e| RuntimeError::Compute(format!("rmsnorm final launch: {e}")))?;
         }
         prof::end(Ph::FinalNorm, &self.device.stream);
+
+        // `HeadMv` measures the lm_head projection directly. A guard, not a
+        // manual close: the dispatch chain below has NINE early returns
+        // (previously mis-documented as six), and Drop fires on every one plus
+        // the tail. That makes `head == final_norm + head_quant + head_mv` an
+        // identity instead of the `head - final_norm` subtraction it used to be,
+        // and needs no code motion to achieve.
+        //
+        // Bytes follow the same priority order as the dispatch chain below, so
+        // the declared traffic matches the arm that actually runs. lm_head is
+        // vocab x hidden = 1.017 G weights on 9B -- about 11% of every weight
+        // byte in the model, and campaign lever C3 (Q8_0 -> Q6_K) turns on
+        // whether that byte reduction converts into time here.
+        let head_bytes = self.output_proj_bytes(st);
+        let _prof_head_mv = prof::guard_bytes(Ph::HeadMv, head_bytes, &self.device.stream);
 
         // Output projection: logits = output_proj * normed.
         //
@@ -9788,6 +9883,34 @@ unsafe fn dispatch_output_proj_q6k(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// On-GPU weight bytes a matvec streams for `(out_dim, in_dim)`.
+///
+/// Computed from the dims and the variant rather than read from
+/// `CudaSlice::len()`, because some buffers are deliberately oversized at the
+/// tail (see the note at the split-sibling validation) and `len()` would
+/// over-report. This is the number the kernel actually reads, which is what an
+/// effective-bandwidth figure needs.
+///
+/// Block geometry: Q4_0 18 B / 32 elems, Q8_0 34 B / 32, Q8Aligned 36 B / 32,
+/// Q4Aligned 20 B / 32, Q6_K 210 B / 256.
+fn profiler_weight_bytes(weight: &GpuWeightBuf, out_dim: usize, in_dim: usize) -> u64 {
+    let out = out_dim as u64;
+    let ind = in_dim as u64;
+    let nb32 = ind / 32;
+    let nb256 = ind / 256;
+    match weight {
+        GpuWeightBuf::F32(_) => out * ind * 4,
+        GpuWeightBuf::F16Raw(_) | GpuWeightBuf::Bf16Raw(_) => out * ind * 2,
+        GpuWeightBuf::Q8Raw(_) | GpuWeightBuf::Q8Split(_) => out * nb32 * 34,
+        GpuWeightBuf::Q8Aligned(_) => out * nb32 * 36,
+        GpuWeightBuf::Q4Raw(_) | GpuWeightBuf::Q4Split(_) => out * nb32 * 18,
+        GpuWeightBuf::Q4Aligned(_) => out * nb32 * 20,
+        GpuWeightBuf::Q6KRaw(_) => {
+            out * nb256 * (crate::q6k_ref::Q6K_BLOCK_BYTE as u64)
+        }
+    }
+}
+
 unsafe fn launch_matvec_ext(
     device: &CudaDevice,
     kernels: &KernelSet,
@@ -9802,6 +9925,24 @@ unsafe fn launch_matvec_ext(
     mut input_q8_1_scratch: Option<&mut CudaSlice<u8>>,
     q4_split_sibling: Option<&CudaSlice<u8>>,
 ) -> Result<(), RuntimeError> {
+    // Per-surface bracket, keyed on the label this helper already receives.
+    // An RAII guard rather than manual closes: this function has 23 `return`
+    // statements and dozens of `?` sites, so a hand-closed bracket would leak
+    // on any of them.
+    //
+    // Bytes are declared here from the ACTUAL variant and dims, so a weight
+    // that arrives as a dequantized F32 (a Q6_K landing on the default path)
+    // reports its real 4 B/weight rather than an assumed 0.5625.
+    //
+    // NOTE ON DOUBLE COUNTING: `launch_matvec` forwards here, and the arms that
+    // tail-call `launch_hgemv_f16` / `launch_bf16_matvec_with_fallback` /
+    // `launch_matvec_q6_k` / `launch_matvec_split_f32` do NOT carry their own
+    // surface guard, precisely so the surface is counted once.
+    let _prof_surface = prof::matvec_surface(
+        label,
+        profiler_weight_bytes(weight, out_dim, in_dim),
+        &device.stream,
+    );
     // SoA F32 lane fast path. Correctness-neutral: same
     // F32 activations, same F32 accumulation — only the weight ACCESS PATTERN
     // changes, from misaligned 18-byte AoS blocks read bytewise to a 4-byte
@@ -9858,16 +9999,24 @@ unsafe fn launch_matvec_ext(
                     block_dim: (32, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                device
-                    .stream
-                    .launch_builder(quant_fn)
-                    .arg(input)
-                    .arg(&mut *q8_1_buf)
-                    .arg(&in_dim_u32)
-                    .launch(quant_cfg)
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("quantize_q8_1_rawsum {label}: {e}",))
-                    })?;
+                // Activation quantize, timed separately from the matvec. Its
+                // span is netted OUT of the enclosing surface bracket (see
+                // Phase::excludes_span_from_parent), so the matvec's reported
+                // effective GB/s is weight bytes over matvec time -- not
+                // diluted by a quantize that moved no weight bytes.
+                {
+                    let _prof_q = prof::quant_surface(label, (in_dim as u64) * 4 + u64::from(super::decode::q8_1_buffer_bytes(in_dim as u32)), &device.stream);
+                    device
+                        .stream
+                        .launch_builder(quant_fn)
+                        .arg(input)
+                        .arg(&mut *q8_1_buf)
+                        .arg(&in_dim_u32)
+                        .launch(quant_cfg)
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("quantize_q8_1_rawsum {label}: {e}",))
+                        })?;
+                }
 
                 // mul_mat_vec_q_q8_0: grid=(nrows_x,1,1) block=(32, 4, 1) = 128 threads
                 let mv_cfg = CudarcLaunchConfig {
@@ -9909,16 +10058,21 @@ unsafe fn launch_matvec_ext(
                 block_dim: (Q8_1_QUANT_BLOCK_DIM, 1, 1),
                 shared_mem_bytes: 0,
             };
-            device
-                .stream
-                .launch_builder(quant_fn)
-                .arg(input)
-                .arg(&mut *q8_1_buf)
-                .arg(&in_dim_u32)
-                .launch(quant_cfg)
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("quantize_f32_to_q8_1 {label}: {e}",))
-                })?;
+            // Timed separately and netted out of the surface bracket (see the
+            // rawsum arm above for the rationale).
+            {
+                let _prof_q = prof::quant_surface(label, (in_dim as u64) * 4 + u64::from(super::decode::q8_1_buffer_bytes(in_dim as u32)), &device.stream);
+                device
+                    .stream
+                    .launch_builder(quant_fn)
+                    .arg(input)
+                    .arg(&mut *q8_1_buf)
+                    .arg(&in_dim_u32)
+                    .launch(quant_cfg)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("quantize_f32_to_q8_1 {label}: {e}",))
+                    })?;
+            }
 
             // Step 2: dp4a matvec with Q8_1 input.
             let mv_grid = dp4a_q8_1_grid(out_dim_u32);
@@ -10686,6 +10840,18 @@ unsafe fn launch_matvec_residual_lane(
     ) else {
         return Ok(false);
     };
+    // Direct-call-only (compute_layer_gpu), never reached through
+    // launch_matvec_residual, so it needs its own guard. This is the LIVE `wo`
+    // path whenever AttnWo stays on F32 activations -- including the
+    // activation-probe config, where only attn_qkv/ffn_gate_up/ffn_down move to
+    // Q8_1 and wo does not. Opened AFTER the let-else so a fall-through that
+    // launches nothing records nothing. Bytes are the Q4 split layout:
+    // 18 B per 32-weight block.
+    let _prof_surface = prof::matvec_surface(
+        label,
+        (out_dim as u64) * ((in_dim as u64) / 32) * 18,
+        &device.stream,
+    );
     let out_dim_u32 = out_dim as u32;
     let in_dim_u32 = in_dim as u32;
     let cfg = CudarcLaunchConfig {
@@ -10724,6 +10890,13 @@ unsafe fn launch_matvec_residual(
     mut input_f16_scratch: Option<&mut CudaSlice<u8>>,
     mut input_q8_1_scratch: Option<&mut CudaSlice<u8>>,
 ) -> Result<(), RuntimeError> {
+    // Per-surface bracket (15 `return` statements here -- RAII, see the note in
+    // launch_matvec_ext). The children it tail-calls carry no guard of their own.
+    let _prof_surface = prof::matvec_surface(
+        label,
+        profiler_weight_bytes(weight, out_dim, in_dim),
+        &device.stream,
+    );
     // --- Native quantized kernels: read Q8_0/Q4_0 directly ---
     // Priority: dp4a Q8_1 > smem (F32 x) > hgemv (F16 x) > cuBLAS HGEMV > dp4a/scalar.
 
@@ -11360,6 +11533,14 @@ unsafe fn launch_quantize_input_q8_1(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
+    // Caller-side activation quantize. Bytes = F32 activation read + Q8_1
+    // written, which is what makes a duplicate quantize visible as traffic
+    // rather than only as a call count.
+    let _prof_quant = prof::quant_surface(
+        label,
+        (in_dim as u64) * 4 + u64::from(super::decode::q8_1_buffer_bytes(in_dim as u32)),
+        &device.stream,
+    );
     let in_dim_u32 = in_dim as u32;
     let quant_grid = q8_1_quant_grid(in_dim_u32);
     let quant_cfg = CudarcLaunchConfig {
@@ -11403,6 +11584,11 @@ unsafe fn launch_matvec_preq8_1(
     label: &str,
 ) -> Result<(), RuntimeError> {
     crate::runtime_defaults::route_census_record(label, "Q8_1_PREQ");
+    let _prof_surface = prof::matvec_surface(
+        label,
+        profiler_weight_bytes(weight, out_dim, in_dim),
+        &device.stream,
+    );
     let out_dim_u32 = out_dim as u32;
     let in_dim_u32 = in_dim as u32;
 
@@ -11571,6 +11757,11 @@ unsafe fn launch_matvec_preq8_1_residual(
     label: &str,
 ) -> Result<(), RuntimeError> {
     crate::runtime_defaults::route_census_record(label, "Q8_1_PREQ_RES");
+    let _prof_surface = prof::matvec_surface(
+        label,
+        profiler_weight_bytes(weight, out_dim, in_dim),
+        &device.stream,
+    );
     let out_dim_u32 = out_dim as u32;
     let in_dim_u32 = in_dim as u32;
 
@@ -11835,6 +12026,11 @@ unsafe fn launch_matvec_preq8_1_split(
     // launching if the sibling or kernel is absent. Proof of execution is the
     // per-kernel tag recorded at the actual dispatch site below.
     crate::runtime_defaults::route_census_record(label, "Q8_1_PREQ_SPLIT");
+    let _prof_surface = prof::matvec_surface(
+        label,
+        profiler_weight_bytes(weight, out_dim, in_dim),
+        &device.stream,
+    );
     // C1b: native Q6_K against the pre-quantized Q8_1 activation. First, because
     // no split sibling exists or applies for a Q6_K weight -- the Q8/Q4 branches
     // below would fall straight through and the caller would see a silent no-op.
@@ -12053,6 +12249,11 @@ unsafe fn launch_matvec_preq8_1_residual_split(
 ) -> Result<(), RuntimeError> {
     // Entry marker only — see note in launch_matvec_preq8_1_split.
     crate::runtime_defaults::route_census_record(label, "Q8_1_PREQ_RES_SPLIT");
+    let _prof_surface = prof::matvec_surface(
+        label,
+        profiler_weight_bytes(weight, out_dim, in_dim),
+        &device.stream,
+    );
     if kernels.use_q8_split_dispatch {
         if let Some(split_buf) = q8_split_sibling {
             // LUMEN_CUDA_Q8_MMVQ: llama mmvq residual kernel takes precedence.
@@ -13700,6 +13901,17 @@ unsafe fn launch_hgemv_f16_preconverted(
     label: &str,
     algo: cublas_sys::cublasGemmAlgo_t,
 ) -> Result<(), RuntimeError> {
+    // This helper is reached ONLY from direct call sites, never through
+    // `launch_matvec_ext`, so without its own guard the whole F16 cuBLAS HGEMV
+    // path records nothing at depth 2 -- and that path IS the Q6_K-coupled
+    // wq/wk/wv arm (campaign levers C1/C2) plus the F16 ffn and head arms.
+    // Bytes are the F16 weight cache: 2 B/weight, which is what makes the
+    // coupled-vs-native byte gap visible.
+    let _prof_surface = prof::matvec_surface(
+        label,
+        (out_dim as u64) * (in_dim as u64) * 2,
+        &device.stream,
+    );
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
 
@@ -13895,6 +14107,14 @@ unsafe fn launch_hgemv_f16_batched(
     label: &str,
     algo: cublas_sys::cublasGemmAlgo_t,
 ) -> Result<(), RuntimeError> {
+    // Direct-call-only, like the preconverted twin. Label is "kv" (wk+wv) or
+    // "gate_up" (gate+up): one batched GEMM covering TWO surfaces, so the phase
+    // is named for what the launch is rather than pretending it splits.
+    let _prof_surface = prof::matvec_surface(
+        label,
+        (out_dim as u64) * (in_dim as u64) * 2 * (w_f16_slices.len() as u64),
+        &device.stream,
+    );
     let batch_count = w_f16_slices.len();
     debug_assert_eq!(batch_count, output_f32_slices.len());
     debug_assert!(batch_count >= 2 && batch_count <= 3);
@@ -13992,6 +14212,12 @@ unsafe fn launch_hgemv_f16_batched_precomputed(
     label: &str,
     algo: cublas_sys::cublasGemmAlgo_t,
 ) -> Result<(), RuntimeError> {
+    // Direct-call-only; see launch_hgemv_f16_batched for the two-surface note.
+    let _prof_surface = prof::matvec_surface(
+        label,
+        (out_dim as u64) * (in_dim as u64) * 2 * (batch_count as u64),
+        &device.stream,
+    );
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
 
