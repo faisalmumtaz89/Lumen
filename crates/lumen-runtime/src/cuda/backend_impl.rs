@@ -35,9 +35,9 @@ use super::gpu_buffers::{upload_layer_weights, GpuWeightBuf, LayerWeightsGpu};
 // Per-phase decode profiler. Every `prof::` call short-circuits on a cached
 // `u8` when `LUMEN_CUDA_PROFILE` is unset, so the default path records no
 // events and adds no synchronization.
+use super::kv_cache::KvCacheGpu;
 use super::profiler as prof;
 use super::profiler::Phase as Ph;
-use super::kv_cache::KvCacheGpu;
 use super::shaders::EMBED_KERNEL_SOURCE;
 use super::types::LaunchConfig;
 use cudarc::cublas::{sys as cublas_sys, Gemv, GemvConfig};
@@ -771,6 +771,13 @@ struct GpuGlobals {
     /// full F32 dynamic range. Avoids the ~4 GB F32 inflation that previously
     /// caused OOM during preload on Qwen3.5-9B BF16.
     output_proj_bf16: Option<CudaSlice<u8>>,
+    /// Output projection as raw Q6_K bytes (candidate C3, `Some` only when
+    /// `LUMEN_CUDA_LMHEAD_Q6K=1` AND the LBC actually stores the head as Q6_K).
+    /// Dispatched via `matvec_q6_k_f32_nr8` at 0.8203 B/weight -- the same byte
+    /// count llama.cpp reads -- instead of the 1.0625 B/weight Q8_0 the
+    /// converter otherwise requantizes it to, which is 234.9 MiB/token on the
+    /// 1,017,118,720-weight 9B head.
+    output_proj_q6k: Option<CudaSlice<u8>>,
     /// Embedding table (F32 path): [vocab_size * hidden_dim]
     /// Empty if embedding uses a quantized raw path instead.
     embedding: CudaSlice<f32>,
@@ -2354,6 +2361,161 @@ impl CudaBackend {
                             )?;
                         }
                     }
+                }
+            } else if crate::runtime_defaults::qkv_decouple()
+                && matches!(&lw.wq, GpuWeightBuf::F32(_))
+                && lw.wq_f16.is_some()
+                && lw.wk_f16.is_some()
+                && lw.wv_f16.is_some()
+            {
+                // ---------------------------------------------------------------
+                // C2 (`LUMEN_CUDA_QKV_DECOUPLE=1`): DECOUPLED QKV dispatch.
+                //
+                // This branch is a variant of the F16-HGEMV branch immediately
+                // below, entered only when the flag is set. With the flag unset
+                // the guard is false on its first conjunct and control falls to
+                // the original branch unchanged, so flag-off behaviour is
+                // byte-identical by construction -- no reordering, no shared
+                // state, nothing to keep in sync beyond the guard itself.
+                //
+                // WHAT THE DEFAULT BRANCH GETS WRONG. Its guard is "wq is F32
+                // AND all three F16 caches exist". It never inspects wk/wv's
+                // actual weight format -- only whether a cache happens to be
+                // present. On 9B-Q4 layers 3/15/27/31, wq is a host-dequanted
+                // Q6_K (hence F32) while wk/wv are natively Q4Raw, and
+                // dequant_layer_q8_to_f16 builds F16 caches for Q4Raw on every
+                // full-attention layer. So two 0.5625 B/w tensors get read at
+                // 2.0 B/w through cublasGemmBatchedEx:
+                //
+                //   8 tensors x 4,194,304 w x (2.0 - 0.5625) B/w
+                //     = 48,234,496 B = 46.0 MiB/token   (18.0 -> 64.0 MiB)
+                //
+                // It also silently bypasses the F32-exact activation policy:
+                // q4_act_plan is only consulted inside launch_matvec_ext, which
+                // this branch never reaches, so wk/wv run F16 activations on a
+                // family the plan pins to F32.
+                //
+                // WHY THEY WERE COUPLED IN THE FIRST PLACE. Not a fused kernel
+                // and not a shared output buffer -- wq/wk/wv are already
+                // separate launches into separate buffers. The real coupling is
+                // the ACTIVATION FORMAT: this branch normalizes once to F16,
+                // while the native Q4 ladder consumes F32 `scratch.normed`. A
+                // split dispatch needs both, which is the one extra kernel this
+                // branch pays: an RMSNorm over hidden_dim (~16 KB write).
+                //
+                // ORDERING. `normed` (F32) is produced first, then `input_f16`,
+                // then wq consumes `input_f16`, then wk/wv consume `normed`.
+                // The two norms read the same `x_gpu` and write disjoint
+                // buffers. wq is dispatched BEFORE wk/wv because
+                // launch_matvec_ext is passed `input_f16` as scratch and would
+                // be free to overwrite it on an HGEMV fallback arm; with Q4Raw
+                // weights and an F32 plan it takes the native ladder and does
+                // not, but the ordering makes that a non-issue rather than an
+                // invariant to remember.
+                //
+                // The precomputed KV pointer arrays (pcp.kv_*_ptrs) simply go
+                // unread on these layers. They stay allocated and index-aligned
+                // for every layer, so nothing else observes the difference.
+                //
+                // NOT byte-identical: F16 weights are swapped for F32-exact Q4.
+                // ---------------------------------------------------------------
+                {
+                    let block_size = rmsnorm_block_size(hidden_dim);
+                    let shared_bytes = rmsnorm_shared_bytes(block_size);
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (block_size, 1, 1),
+                        shared_mem_bytes: shared_bytes,
+                    };
+                    let dim = hidden_dim as u32;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.rmsnorm)
+                            .arg(&st.scratch.x_gpu)
+                            .arg(&lw.attn_norm)
+                            .arg(&mut st.scratch.normed)
+                            .arg(&eps)
+                            .arg(&dim)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("rmsnorm attn decouple launch: {e}"))
+                    })?;
+                }
+                unsafe {
+                    launch_fused_rmsnorm_f16(
+                        &self.device,
+                        &st.kernels,
+                        &st.scratch.x_gpu,
+                        &lw.attn_norm,
+                        &mut st.scratch.input_f16,
+                        eps,
+                        hidden_dim,
+                        "attn DECOUPLE",
+                    )?;
+                }
+                // wq keeps its own route: the F16 cache today, or C1's native
+                // Q6_K kernel when LUMEN_CUDA_Q6K_NATIVE is also on (in which
+                // case wq is Q6KRaw, this guard is false, and we are not here
+                // at all -- C1 subsumes C2 on these layers).
+                if let Some(ref wq_f16) = lw.wq_f16 {
+                    let (wq_out_buf, wq_od) = if has_qgate_fusion {
+                        (
+                            st.scratch.q_gate.as_mut().unwrap() as &mut CudaSlice<f32>,
+                            wq_out_dim,
+                        )
+                    } else {
+                        (&mut st.scratch.q as &mut CudaSlice<f32>, q_dim)
+                    };
+                    unsafe {
+                        launch_hgemv_f16_preconverted(
+                            &self.device,
+                            wq_f16,
+                            &st.scratch.input_f16,
+                            wq_out_buf,
+                            wq_od,
+                            hidden_dim,
+                            "wq",
+                            st.algo_cache.get(wq_od, hidden_dim),
+                        )?;
+                    }
+                    // The default branch records nothing at all, which is why
+                    // the census reports wq/wk/wv at 4/token against 8
+                    // full-attention layers. Tag it so this arm is observable.
+                    crate::runtime_defaults::route_census_record("wq", "HGEMV_F16_DECOUPLED");
+                }
+                // wk/wv now reach launch_matvec_ext, so they get the native Q4
+                // ladder, their SoA split siblings, and the activation plan.
+                unsafe {
+                    launch_matvec_ext(
+                        &self.device,
+                        &st.kernels,
+                        &lw.wk,
+                        &st.scratch.normed,
+                        &mut st.scratch.k,
+                        kv_dim,
+                        hidden_dim,
+                        "wk",
+                        lw.wk_f16.as_ref(),
+                        Some(&mut st.scratch.input_f16),
+                        st.scratch.input_q8_1.as_mut(),
+                        lw.q4_split_wk.as_ref(),
+                    )?;
+                    launch_matvec_ext(
+                        &self.device,
+                        &st.kernels,
+                        &lw.wv,
+                        &st.scratch.normed,
+                        &mut st.scratch.v,
+                        kv_dim,
+                        hidden_dim,
+                        "wv",
+                        lw.wv_f16.as_ref(),
+                        Some(&mut st.scratch.input_f16),
+                        st.scratch.input_q8_1.as_mut(),
+                        lw.q4_split_wv.as_ref(),
+                    )?;
                 }
             } else if matches!(&lw.wq, GpuWeightBuf::F32(_))
                 && lw.wq_f16.is_some()
@@ -8354,6 +8516,58 @@ impl CudaBackend {
         prof::end(Ph::FinalNorm, &self.device.stream);
 
         // Output projection: logits = output_proj * normed.
+        //
+        // C3 (`LUMEN_CUDA_LMHEAD_Q6K=1`) takes priority when present. It is
+        // first in the chain so it cannot be shadowed, and it is entered only
+        // when `output_proj_q6k` is `Some`, which requires both the flag and an
+        // LBC that actually stores the head as Q6_K (a `-q6khead` file). With
+        // the flag off the field is `None`, the `if let` fails, and the chain
+        // below runs exactly as before.
+        //
+        // BYTES: the default path requantizes this tensor to Q8_0 at convert and
+        // streams 1.0625 B/weight. Native Q6_K is 0.8203, so on the 9B head
+        //   1,017,118,720 w x (1.0625 - 0.8203) = 246,333,440 B = 234.9 MiB/token
+        // -- 4.5% of the entire weight stream, and the largest single format
+        // mismatch on the model. It also drops a lossy Q6_K -> F32 -> Q8_0
+        // round trip that additionally goes through a defective host dequantiser
+        // (see `runtime_defaults::q6k_layout_fix`).
+        //
+        // Activations stay F32 here: `scratch.normed` is already F32 at this
+        // point, so unlike the Q8 split path there is no `quantize_f32_to_q8_1`
+        // launch -- one kernel instead of two. Worth noting because the head has
+        // no `Q4ProjectionFamily`, so the activation plan never covered it and
+        // the default route runs int8 outside any policy.
+        //
+        // NR=8: the head shape is [out=248320, in=4096], an extreme aspect
+        // ratio. NR=1 would give 248320 CTAs each re-reading the whole 16 KB
+        // activation vector; NR=8 amortizes that 8x for 31040 CTAs, still ~287x
+        // oversubscribed on 108 SMs. UNVERIFIED as throughput -- NR was chosen
+        // by the same reasoning the sibling Q8 head kernel documents, not by
+        // measurement, and it is the obvious first knob if C3 underperforms.
+        if let Some(ref proj_q6k) = st.globals.output_proj_q6k {
+            crate::runtime_defaults::route_census_record("head", "HEAD_Q6K_NATIVE");
+            let f = st.kernels.matvec_q6_k_f32_nr8.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(
+                    "matvec_q6_k_f32_nr8 unavailable: LUMEN_CUDA_LMHEAD_Q6K is armed and the \
+                     head was uploaded as Q6_K, but the kernel failed to compile"
+                        .to_string(),
+                )
+            })?;
+            unsafe {
+                launch_matvec_q6_k(
+                    &self.device,
+                    f,
+                    proj_q6k,
+                    &st.scratch.normed,
+                    &mut st.logits_gpu,
+                    vocab_size,
+                    hidden_dim,
+                    8,
+                    "head",
+                )?;
+            }
+            return Ok(());
+        }
         // Prefer Q4Aligned dp4a (highest priority for Q4_0), then smem, then scalar.
         if let Some(ref proj_q4a) = st.globals.output_proj_q4_aligned {
             crate::runtime_defaults::route_census_record("head", "HEAD_Q4_ALIGNED");
@@ -9383,6 +9597,69 @@ unsafe fn launch_matvec(
     )
 }
 
+/// Launch `matvec_q6_k_f32` / `matvec_q6_k_f32_nr8` (candidates C1/C3).
+///
+/// Contract, matching the shader header:
+/// * args `(weight, x, out, out_dim, in_dim)`
+/// * grid `(ceil(out_dim / nr), 1, 1)`, block `(128, 1, 1)` = 4 warps
+/// * `in_dim % 256 == 0` — the kernel derives its super-block count as
+///   `in_dim / 256`, so a ragged tail would read past the row. Checked here
+///   rather than trusted: `upload_tensor` guards on the element count, but this
+///   guards the SHAPE the caller passes, which is a different fact.
+/// * `nr` must match the kernel handle (1 for `matvec_q6_k_f32`, 8 for `_nr8`).
+///
+/// Weight bytes read: `out_dim * (in_dim / 256) * 210`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_matvec_q6_k(
+    device: &CudaDevice,
+    f: &CudaFunction,
+    weight: &CudaSlice<u8>,
+    input: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    out_dim: usize,
+    in_dim: usize,
+    nr: u32,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    const Q6K_BLOCK_ELEM: usize = 256;
+    const Q6K_BLOCK_BYTE: usize = 210;
+    const Q6K_THREADS: u32 = 128;
+
+    if in_dim % Q6K_BLOCK_ELEM != 0 {
+        return Err(RuntimeError::Compute(format!(
+            "matvec_q6_k_f32 {label}: in_dim {in_dim} is not a multiple of \
+             {Q6K_BLOCK_ELEM} (Q6_K super-block)"
+        )));
+    }
+    let needed = out_dim * (in_dim / Q6K_BLOCK_ELEM) * Q6K_BLOCK_BYTE;
+    if weight.len() < needed {
+        return Err(RuntimeError::Compute(format!(
+            "matvec_q6_k_f32 {label}: weight buffer has {} bytes, needs {needed} \
+             for [{out_dim} x {in_dim}]",
+            weight.len()
+        )));
+    }
+
+    let out_u32 = out_dim as u32;
+    let in_u32 = in_dim as u32;
+    let cfg = CudarcLaunchConfig {
+        grid_dim: (out_u32.div_ceil(nr), 1, 1),
+        block_dim: (Q6K_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    device
+        .stream
+        .launch_builder(f)
+        .arg(weight)
+        .arg(input)
+        .arg(output)
+        .arg(&out_u32)
+        .arg(&in_u32)
+        .launch(cfg)
+        .map_err(|e| RuntimeError::Compute(format!("matvec_q6_k_f32 {label}: {e}")))?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_matvec_ext(
     device: &CudaDevice,
@@ -10005,6 +10282,25 @@ unsafe fn launch_matvec_ext(
     }
 
     match weight {
+        // Native Q6_K (candidate C1, `LUMEN_CUDA_Q6K_NATIVE=1`): 210 B per 256
+        // elements = 0.8203 B/weight, the same byte count llama.cpp reads.
+        // Only reachable when `upload_tensor` produced a `Q6KRaw`, which only
+        // happens with the flag on, so this arm is unreachable by default.
+        //
+        // Deliberately a hard error rather than a fallback if the kernel is
+        // absent: an armed flag that silently does nothing is the exact failure
+        // mode that cost this campaign three debug cycles.
+        GpuWeightBuf::Q6KRaw(w_q6) => {
+            let f = kernels.matvec_q6_k_f32.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!(
+                    "matvec_q6_k_f32 unavailable for {label}: LUMEN_CUDA_Q6K_NATIVE is armed \
+                     (the weight was uploaded as Q6KRaw) but the kernel failed to compile"
+                ))
+            })?;
+            launch_matvec_q6_k(device, f, w_q6, input, output, out_dim, in_dim, 1, label)?;
+            crate::runtime_defaults::route_census_record(label, "Q6K_NATIVE");
+            return Ok(());
+        }
         GpuWeightBuf::F32(w_f32) => {
             let cfg = GemvConfig {
                 trans: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
@@ -10674,6 +10970,15 @@ unsafe fn launch_matvec_residual(
     }
 
     match weight {
+        // No residual Q6_K kernel: the residual sites are `wo` and `w_down`,
+        // which are Q4_0 on every layer of every shipped model, so a Q6_K
+        // weight cannot reach here. Explicit error beats a silent wrong path
+        // if a future mixed-quant file puts a K-quant on one of them.
+        GpuWeightBuf::Q6KRaw(_) => {
+            return Err(RuntimeError::Compute(format!(
+                "Q6_K residual matvec not implemented ({label}):                  LUMEN_CUDA_Q6K_NATIVE cannot cover residual projections"
+            )));
+        }
         GpuWeightBuf::F32(w_f32) => {
             // Copy residual into output so cuBLAS can accumulate: y = W*x + y.
             device.stream.memcpy_dtod(residual, output).map_err(|e| {
@@ -14052,21 +14357,42 @@ impl ComputeBackend for CudaBackend {
             output_proj_q4,
             output_proj_f16_raw,
             output_proj_bf16_raw,
+            output_proj_q6k_raw,
         ) = if has_raw_output_proj {
             let raw = self.output_proj_raw.as_ref().unwrap();
             let placeholder: CudaSlice<f32> = self.device.alloc_zeros(1)?;
             match self.output_proj_quant {
                 QuantScheme::Q8_0 => {
                     let gpu_q8 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, Some(gpu_q8), None, None, None)
+                    (placeholder, Some(gpu_q8), None, None, None, None)
                 }
                 QuantScheme::Q4_0 => {
                     let gpu_q4 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, None, Some(gpu_q4), None, None)
+                    (placeholder, None, Some(gpu_q4), None, None, None)
                 }
                 QuantScheme::F16 => {
                     let gpu_f16 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, None, None, Some(gpu_f16), None)
+                    (placeholder, None, None, Some(gpu_f16), None, None)
+                }
+                // C3: native Q6_K head. Reachable only when
+                // `LUMEN_CUDA_LMHEAD_Q6K=1` let a Q6_K `output.weight` past the
+                // CLI allow-list, which in turn requires an LBC converted with
+                // the same flag (and therefore a `-q6khead` filename). Rejecting
+                // it when the kernel is absent is deliberate: a 4.0 B/w cuBLAS
+                // SGEMV fallback would measure as a large REGRESSION and be
+                // mistaken for the lever failing, rather than the kernel missing.
+                QuantScheme::Q6_K if crate::runtime_defaults::lmhead_q6k() => {
+                    let raw_mb = raw.len() as f64 / 1.0e6;
+                    // Element count from the block geometry (210 B per 256), so
+                    // the marker needs no hyperparams plumbing.
+                    let elems = (raw.len() / 210) * 256;
+                    eprintln!(
+                        "[Q6K] LMHEAD uploading native Q6_K output_proj: {raw_mb:.1} MB, \
+                         {elems} elements ({:.4} B/w vs 1.0625 for Q8_0)",
+                        raw.len() as f64 / elems.max(1) as f64
+                    );
+                    let gpu_q6k = self.device.htod_copy(raw.as_slice())?;
+                    (placeholder, None, None, None, None, Some(gpu_q6k))
                 }
                 QuantScheme::Bf16 => {
                     // BF16 output_proj: upload raw bytes (2 B/elem) and dispatch
@@ -14075,17 +14401,18 @@ impl ComputeBackend for CudaBackend {
                     let raw_mb = raw.len() as f64 / 1.0e6;
                     eprintln!("[CUDA mem] uploading BF16 output_proj raw: {raw_mb:.1} MB");
                     let gpu_bf16 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, None, None, None, Some(gpu_bf16))
+                    (placeholder, None, None, None, Some(gpu_bf16), None)
                 }
                 other => {
                     return Err(RuntimeError::Compute(format!(
-                        "CUDA init: output_proj raw quant {other:?} not supported (only Q8_0, Q4_0, F16, Bf16)",
+                        "CUDA init: output_proj raw quant {other:?} not supported (only Q8_0, Q4_0, F16, Bf16, \
+                         or Q6_K with LUMEN_CUDA_LMHEAD_Q6K=1)",
                     )));
                 }
             }
         } else {
             let gpu_f32 = self.device.htod_copy(&self.output_proj)?;
-            (gpu_f32, None, None, None, None)
+            (gpu_f32, None, None, None, None, None)
         };
         let mem_after_output_proj = self.device.free_memory().unwrap_or(0);
         eprintln!(
@@ -14104,6 +14431,7 @@ impl ComputeBackend for CudaBackend {
             output_proj_q4,
             output_proj_q4_aligned: None, // Populated during preload_weights
             output_proj_bf16: output_proj_bf16_raw,
+            output_proj_q6k: output_proj_q6k_raw,
             embedding: embedding_f32,
             embedding_q8,
             embedding_f16: embedding_f16_raw,
@@ -15178,6 +15506,36 @@ impl ComputeBackend for CudaBackend {
         // Reuse the pre-allocated logits_gpu buffer from MutableState.
         //
         {
+            // C3 guard. This function is the host-activation twin of
+            // `compute_final_gpu` and duplicates its whole dispatch chain, but
+            // it has no `output_proj_q6k` arm -- and adding a real one here is
+            // out of scope for a decode lever, because this path takes an
+            // `ActivationBuffer` rather than the GPU-resident `scratch.normed`
+            // the kernel needs.
+            //
+            // Without this guard a Q6_K head would fall through EVERY arm below
+            // (all the `output_proj_*` fields are `None`) and reach the terminal
+            // cuBLAS SGEMV on `st.globals.output_proj` -- which for any
+            // raw-output-proj model is the 1-element `alloc_zeros(1)`
+            // PLACEHOLDER. That is garbage logits or an out-of-bounds read, i.e.
+            // exactly the silent-wrong-answer failure this campaign's rules
+            // exist to prevent. Fail loudly instead.
+            //
+            // Note this chain already has the same structural gap for BF16 (no
+            // `output_proj_bf16` arm here either), which is evidence the path is
+            // not exercised for the GPU-resident decode classes -- the canonical
+            // bench runs `decode_token_greedy` -> `compute_final_gpu`. But it IS
+            // reachable from `session.rs` and `engine.rs`, so "probably unused"
+            // is not good enough to leave unguarded.
+            if st.globals.output_proj_q6k.is_some() {
+                return Err(RuntimeError::Compute(
+                    "LUMEN_CUDA_LMHEAD_Q6K: a native Q6_K output_proj reached compute_final \
+                     (the host-activation path), which has no Q6_K arm and would otherwise \
+                     multiply against a 1-element placeholder buffer. Use the GPU-resident \
+                     decode path (compute_final_gpu), or unset LUMEN_CUDA_LMHEAD_Q6K."
+                        .to_string(),
+                ));
+            }
             if let Some(ref proj_q4a) = st.globals.output_proj_q4_aligned {
                 // Q4Aligned dp4a output projection (highest priority for Q4_0).
                 if let (Some(ref quant_fn), Some(ref mv_fn)) = (

@@ -1194,6 +1194,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_LEGACY_DEFAULTS",
     "LUMEN_CUDA_MAX_SEQ_LEN",
     "LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ",
+    "LUMEN_CUDA_LMHEAD_Q6K",
     "LUMEN_CUDA_MMV_Q_DP4A",
     "LUMEN_CUDA_MMV_Q_MOE_DP4A",
     "LUMEN_CUDA_MMV_Q_OUTPUT_PROJ",
@@ -1220,6 +1221,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_PTX_CACHE_DIR",
     "LUMEN_CUDA_Q4_MMVQ",
     "LUMEN_CUDA_Q4_ROUTE_ASSERT",
+    "LUMEN_CUDA_Q6K_NATIVE",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
     "LUMEN_CUDA_Q8_MMVQ",
@@ -1230,7 +1232,9 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_SHARED_FUSED_DECODE",
     "LUMEN_CUDA_SHARED_TILED",
     "LUMEN_CUDA_SKIP_BF16_PROBE",
+    "LUMEN_CUDA_QKV_DECOUPLE",
     "LUMEN_CUDA_SOA_LOCKED",
+    "LUMEN_CUDA_SSMOUT_NATIVE",
     "LUMEN_CUDA_TOPK_MOE_FUSED",
     "LUMEN_CUDA_VERBOSE",
     "LUMEN_DUMP_EXPERTS",
@@ -1279,6 +1283,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_METAL_UNRETAINED_CMDBUFS",
     "LUMEN_MOE_PROBE",
     "LUMEN_PREFILL_TIMING",
+    "LUMEN_Q6K_LAYOUT_FIX",
     "LUMEN_QWEN35_9B_BF16",
     "LUMEN_QWEN35_9B_PATH",
     "LUMEN_QWEN35_9B_Q4",
@@ -2405,6 +2410,7 @@ mod tests {
         "LUMEN_CUDA_LEGACY_DEFAULTS",
         "LUMEN_CUDA_MAX_SEQ_LEN",
         "LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ",
+        "LUMEN_CUDA_LMHEAD_Q6K",
         "LUMEN_CUDA_MMV_Q_DP4A",
         "LUMEN_CUDA_MMV_Q_MOE_DP4A",
         "LUMEN_CUDA_MMV_Q_OUTPUT_PROJ",
@@ -2431,6 +2437,7 @@ mod tests {
         "LUMEN_CUDA_PTX_CACHE_DIR",
         "LUMEN_CUDA_Q4_MMVQ",
         "LUMEN_CUDA_Q4_ROUTE_ASSERT",
+        "LUMEN_CUDA_Q6K_NATIVE",
         "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q8_MMVQ",
         "LUMEN_CUDA_Q8_PROJ_MMQ",
@@ -2439,7 +2446,9 @@ mod tests {
         "LUMEN_CUDA_SHARED_FUSED_DECODE",
         "LUMEN_CUDA_SHARED_TILED",
         "LUMEN_CUDA_SKIP_BF16_PROBE",
+        "LUMEN_CUDA_QKV_DECOUPLE",
         "LUMEN_CUDA_SOA_LOCKED",
+        "LUMEN_CUDA_SSMOUT_NATIVE",
         "LUMEN_CUDA_TOPK_MOE_FUSED",
         "LUMEN_CUDA_VERBOSE",
         "LUMEN_DUMP_EXPERTS",
@@ -2488,6 +2497,7 @@ mod tests {
         "LUMEN_METAL_UNRETAINED_CMDBUFS",
         "LUMEN_MOE_PROBE",
         "LUMEN_PREFILL_TIMING",
+        "LUMEN_Q6K_LAYOUT_FIX",
         "LUMEN_QWEN35_9B_BF16",
         "LUMEN_QWEN35_9B_PATH",
         "LUMEN_QWEN35_9B_Q4",
@@ -3163,4 +3173,219 @@ pub fn route_census_verify() -> Result<String, String> {
     } else {
         Err(format!("{manifest}\n  ERRORS: {}", errors.join("; ")))
     }
+}
+
+// ===========================================================================
+// K-QUANT FORMAT LEVER FAMILY (9B-Q4 campaign) — four independent candidates
+// ===========================================================================
+//
+// A "Q4_0" GGUF is MIXED. On Qwen3.5-9B-Q4_0 the non-Q4_0 decode-path tensors
+// are `output.weight` (Q6_K in the file, requantized to Q8_0 at convert) and
+// `attn_q` (the fused Q+gate, Q6_K on full-attention layers 3/15/27/31, kept
+// as Q6_K by `ConvertTarget::Generic`). Neither has a native dispatch kernel
+// today, so both are expanded and both stream more bytes per token than
+// llama.cpp reads from the identical file. `ssm_out` is separately floored to
+// Q8_0 at convert on all 24 GDN layers.
+//
+// Each flag below is an INDEPENDENT, DEFAULT-OFF candidate so the campaign can
+// evaluate them one at a time. Every one is `"1"`-only boolean (gate-legal),
+// cached in a `OnceLock` so the hot decode path never pays `std::env::var`,
+// and prints an UNCONDITIONAL one-line marker to stderr when active — a
+// silently-selected variant is unverifiable, and this repo has already lost
+// debug cycles to a flag whose kernel did not exist.
+//
+// Per-token weight bytes at stake (verified against the GGUF tensor table):
+//   C1 attn_q  4 x 33,554,432 w x (2.0 - 0.8203) B/w = 151.0 MiB  (F16 cache)
+//   C2 wk/wv   8 x  4,194,304 w x (2.0 - 0.5625) B/w =  46.0 MiB  (F16 cache)
+//   C3 lm_head 1,017,118,720 w x (1.0625 - 0.8203) B/w = 234.9 MiB (Q8_0 requant)
+//   C4 ssm_out 12 x 16,777,216 w x (1.0625 - 0.5625) B/w = 96.0 MiB (Q8_0 floor)
+//
+// `"1"`-only parsing is deliberate and differs from the older
+// `Some("1")|Some("true")|Some("yes")|Some("on")` helpers in this file: the
+// campaign's gate treats a flag as a two-valued switch, and the loose form has
+// already produced two live defects in this tree (`=on` disabling one dialect,
+// `=0` enabling another). `FLAG=0`, `FLAG=true`, `FLAG=` and unset all mean
+// OFF here, with no exceptions.
+
+/// Parse a campaign lever flag: ON iff the value is exactly `"1"`.
+fn campaign_flag(name: &'static str) -> bool {
+    std::env::var(name).is_ok_and(|v| v == "1")
+}
+
+/// `LUMEN_CUDA_Q6K_NATIVE=1` (candidate C1) — keep Q6_K layer tensors in their
+/// source format as `GpuWeightBuf::Q6KRaw` and consume them with the native
+/// `matvec_q6_k_f32` kernel at 210 B per 256 elements = 0.8203 B/weight, the
+/// same byte count llama.cpp reads. Default OFF expands them to F32 (4.0 B/w
+/// resident) and decodes through a 2.0 B/w F16 cache via cuBLAS HGEMV.
+///
+/// On 9B-Q4 this applies to `attn_q` on layers 3/15/27/31 (the only K-quant
+/// that survives `ConvertTarget::Generic`), saving 151.0 MiB/token of weight
+/// traffic.
+///
+/// PREFILL IS UNCHANGED. An F16 cache is still built for a `Q6KRaw` weight, so
+/// `launch_gemm_projection`'s F16-cache fast path fires before its `match` and
+/// batched prefill runs the identical tensor-core HGEMM it runs today (today the
+/// weight is an F32 buffer plus an F16 cache, and that fast path keys on the
+/// cache, not the buffer). Without that cache, arming this flag aborts at prompt
+/// processing on the "Q6_K prefill matmul not implemented" arm. Residency is
+/// 0.8203 + 2.0 = 2.82 B/weight against 4.0 + 2.0 = 6.0, so ~425 MiB of VRAM is
+/// reclaimed across the four tensors rather than the 663.0 MiB a cache-free
+/// landing would give.
+///
+/// LIMITATION: the F16-cache pass early-returns for GDN layers (an A100-80GB
+/// OOM guard), so a K-quant tensor on a GDN layer would get no cache and prefill
+/// would fail loudly with a message naming this flag. That does not occur on
+/// Qwen3.5-9B-Q4_0. Setting `LUMEN_CUDA_PREFILL_F32` alongside this flag also
+/// reaches that error, because it disables the fast path.
+///
+/// NOT byte-identical when ON: the native kernel reads the true Q6_K values,
+/// whereas the F32/F16 path today reads them through a host dequantiser with a
+/// swapped `ql` nibble mapping (see [`q6k_layout_fix`]). Quality-gated
+/// externally.
+///
+/// Side effect worth knowing: with this ON, `wq` is no longer
+/// `GpuWeightBuf::F32`, so the QKV coupling guard in `compute_layer_gpu` stops
+/// firing and `wk`/`wv` return to their native Q4 route for free — i.e. C1
+/// subsumes C2 on those four layers. C2 exists to get that win with C1 OFF.
+pub fn q6k_native() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = campaign_flag("LUMEN_CUDA_Q6K_NATIVE");
+        if on {
+            eprintln!(
+                "[Q6K] NATIVE=ON: K-quant layer tensors stay Q6_K (0.8203 B/w), \
+                 dispatch matvec_q6_k_f32"
+            );
+        }
+        on
+    })
+}
+
+/// `LUMEN_CUDA_QKV_DECOUPLE=1` (candidate C2) — when `wq` is a host-dequanted
+/// K-quant (`GpuWeightBuf::F32` with an F16 cache) but `wk`/`wv` are natively
+/// `Q4Raw`, stop dragging `wk`/`wv` onto the F16 cuBLAS batched HGEMV just
+/// because they happen to own an F16 cache.
+///
+/// The default-OFF branch guards on "`wq` is F32 AND all three F16 caches
+/// exist" and never inspects `wk`/`wv`'s actual weight format, so on 9B-Q4
+/// layers 3/15/27/31 two 0.5625 B/w Q4_0 tensors are read at 2.0 B/w from
+/// their F16 caches. That is 46.0 MiB/token, and it also silently bypasses the
+/// F32-exact activation policy those families are pinned to.
+///
+/// ON dispatches `wq` through its own route (F16 HGEMV, or C1's native Q6_K
+/// kernel when that is also on) and `wk`/`wv` through `launch_matvec_ext`,
+/// which reaches the native Q4 ladder and their SoA split siblings. Costs one
+/// extra RMSNorm over `hidden_dim` because the two routes consume different
+/// activation formats (F16 vs F32).
+///
+/// NOT byte-identical when ON: F16 weights are swapped for F32-exact Q4_0.
+pub fn qkv_decouple() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = campaign_flag("LUMEN_CUDA_QKV_DECOUPLE");
+        if on {
+            eprintln!(
+                "[QKV] DECOUPLE=ON: wk/wv leave the F16 batched HGEMV, \
+                 dispatch native Q4 (+1 rmsnorm/layer)"
+            );
+        }
+        on
+    })
+}
+
+/// `LUMEN_CUDA_LMHEAD_Q6K=1` (candidate C3) — accept a Q6_K `output.weight`
+/// from the LBC and dispatch it with the native `matvec_q6_k_f32_nr8` kernel
+/// instead of requantizing it to Q8_0 at convert time.
+///
+/// This is the largest single format mismatch on the model: the lm_head is
+/// 1,017,118,720 weights, so Q6_K -> Q8_0 costs
+/// `1,017,118,720 x (1.0625 - 0.8203) = 246.3 MB = 234.9 MiB/token`, 4.5% of
+/// the whole weight stream, more than the `attn_q` and `wk`/`wv` items
+/// combined. It also doubles as a quality fix, because the requant runs
+/// through the defective host dequantiser (see [`q6k_layout_fix`]).
+///
+/// **This flag is read at CONVERT time as well as at decode time.** The LBC
+/// must be re-converted for this arm, and because `lbc_path` keys only on
+/// `(model key, quant tag)` the variant would otherwise clobber the baseline
+/// cache entry — so `lumen_convert::env_gates::lbc_variant_suffix()` appends
+/// `-q6khead` to the filename whenever it is set. Both arms can therefore
+/// coexist in one `LUMEN_CACHE_DIR`.
+pub fn lmhead_q6k() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = campaign_flag("LUMEN_CUDA_LMHEAD_Q6K");
+        if on {
+            eprintln!(
+                "[Q6K] LMHEAD=ON: output.weight kept Q6_K (0.8203 B/w), \
+                 dispatch matvec_q6_k_f32_nr8; LBC suffix -q6khead"
+            );
+        }
+        on
+    })
+}
+
+/// `LUMEN_Q6K_LAYOUT_FIX=1` (candidate C0, correctness) — read Q6_K blocks
+/// with the ggml element mapping instead of the swapped one currently shipped.
+///
+/// # The defect
+///
+/// Two host dequantisers — `lumen_convert::dequant::dequantize_q6_k` and
+/// `lumen_runtime::cuda::gpu_buffers::dequant_kquant_to_f32` — take their `ql`
+/// nibble for output slots `l+32` and `l+64` from the wrong byte. ggml packs
+/// element `l` and element `l+64` into the two nibbles of `ql[l]`, and
+/// elements `l+32` / `l+96` into `ql[l+32]`
+/// (`ggml-quants.c quantize_row_q6_K_ref`: `ql[l] = q1 | (q3 << 4)`). Both
+/// Lumen readers instead assume `ql[l]`'s two nibbles are 32 slots apart, so
+/// they combine the low 4 bits of one weight with the high 2 bits of another.
+///
+/// Measured with an exact-integer round trip through the ggml packer: **126 of
+/// every 256 elements decode to the wrong value.** See
+/// `lumen_runtime::q6k_ref` for the reference, the mirror, and the regression
+/// tests (`legacy_mapping_is_wrong`), all of which run without a GPU.
+///
+/// # Why it survived
+///
+/// Both existing Q6_K unit tests (`lumen-convert/src/convert.rs`, the
+/// all-zero-`ql` and `ql=0x11` cases) use `ql` bytes whose low and high
+/// nibbles are EQUAL, which makes the swap invisible. So does any test data
+/// whose values repeat with period 32. `q6k_ref::equal_nibble_patterns_cannot_
+/// detect_the_swap` pins that observation so it is not re-learned.
+///
+/// # Blast radius when OFF (i.e. today)
+///
+/// * `output.weight` on every 9B-Q4 LBC: Q6_K -> `ensure_f32_global` -> this
+///   dequantiser -> `quantize_f32_to_q8_0`. The shipped lm_head is built from
+///   corrupted weights on both `Generic` and `Metal` targets.
+/// * `attn_q` layers 3/15/27/31 on a `Generic` (Linux-converted) LBC, via the
+///   runtime's F32 upload path.
+/// * Every K-quant tensor upcast by `ConvertTarget::Metal`.
+///
+/// # Why it is behind a flag rather than simply fixed
+///
+/// Flipping it changes flag-OFF behaviour, which would silently invalidate
+/// every existing 9B-Q4 baseline measurement mid-campaign. It is gated so the
+/// fix can be A/B'd and quality-gated like any other arm, and so the decision
+/// to promote it to unconditional is made deliberately. **It should be
+/// promoted.** Note that C1 and C3 bypass these dequantisers entirely for the
+/// tensors they cover, so they deliver the same correction on those tensors
+/// independently of this flag.
+///
+/// Convert-time reads also append `-q6kfix` to the LBC filename so a corrected
+/// LBC cannot be mistaken for a baseline one.
+pub fn q6k_layout_fix() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = campaign_flag("LUMEN_Q6K_LAYOUT_FIX");
+        if on {
+            eprintln!(
+                "[Q6K] LAYOUT_FIX=ON: host Q6_K dequant uses the ggml ql \
+                 mapping (fixes 126/256 corrupted elements per super-block)"
+            );
+        }
+        on
+    })
 }

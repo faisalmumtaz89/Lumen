@@ -139,6 +139,30 @@ stays byte-identical to history. Set any to `=0` to opt out on MoE.
 | `LUMEN_CUDA_MOE_DECODE_F32` | OFF | config | F32 MoE decode path. Retained pending the open BF16-MoE decode RCA. | `=1` only for the BF16-MoE decode investigation. |
 | `LUMEN_CUDA_MOE_DECODE_F32_FFN` | OFF | config | F32 MoE decode FFN path (pairs with `MOE_DECODE_F32`). Retained pending the open BF16-MoE decode RCA. | `=1` only for the BF16-MoE decode investigation. |
 
+## K-quant format levers (9B-Q4 campaign — all default-OFF, `"1"`-only)
+
+A "Q4_0" GGUF is mixed: `llama-quantize` keeps sensitive tensors at higher
+precision. On Qwen3.5-9B-Q4_0 that is `output.weight` (Q6_K in the file) and
+`attn_q` (Q6_K on full-attention layers 3/15/27/31). Lumen has no native
+K-quant matvec, so both are expanded and stream more bytes per token than
+llama.cpp reads from the identical file. These four candidates close that, one
+at a time.
+
+**Parsing:** each is ON **only** for the exact value `"1"`. `=0`, `=true`,
+`=on`, `=` and unset all mean OFF. This differs from the older loose-truthy
+CUDA flags on purpose.
+
+**Marker:** each prints one unconditional `[Q6K]` / `[QKV]` / `[SSM]` line to
+stderr when active. No marker means the lever did not engage.
+
+| Variable | Default | Category | Effect | When to touch |
+|---|---|---|---|---|
+| `LUMEN_CUDA_Q6K_NATIVE` | OFF | config | **C1.** Keep Q6_K layer tensors as `Q6KRaw` and dispatch `matvec_q6_k_f32` at 0.8203 B/weight instead of expanding to F32 (4.0 resident) and streaming a 2.0 B/weight F16 cache. On 9B-Q4 covers `attn_q` on layers 3/15/27/31: **−151.0 MiB/token**, −663 MiB VRAM. Side effect: `wq` stops being `F32`, so the QKV coupling guard goes unsatisfiable and `wk`/`wv` return to native Q4 for free (subsumes C2 on those layers). Not byte-identical. | `=1` to A/B the native Q6_K layer matvec. |
+| `LUMEN_CUDA_QKV_DECOUPLE` | OFF | config | **C2.** Stop dragging natively-`Q4Raw` `wk`/`wv` onto the F16 batched cuBLAS HGEMV merely because they own an F16 cache. Dispatches `wq` on its own route and `wk`/`wv` through `launch_matvec_ext` (native Q4 + SoA siblings). **−46.0 MiB/token**; costs one extra RMSNorm per affected layer because the two routes want different activation formats. Independent of C1. Not byte-identical. | `=1` to A/B the decoupled QKV dispatch. |
+| `LUMEN_CUDA_LMHEAD_Q6K` | OFF | config | **C3.** Keep `output.weight` Q6_K instead of requantizing it to Q8_0 at convert, and dispatch `matvec_q6_k_f32_nr8` at the head shape `[248320 × 4096]`. Largest single mismatch on the model: **−234.9 MiB/token** (4.5% of the weight stream). **Read at CONVERT time too — the LBC must be re-converted, and the filename gets a `-q6khead` suffix so it cannot clobber the baseline cache entry.** Not byte-identical. | `=1` (at convert **and** at run) to A/B the native Q6_K head. |
+| `LUMEN_CUDA_SSMOUT_NATIVE` | OFF | config | **C4.** Remove the convert-time Q8_0 floor on `ssm_out`, letting it stay Q4_0 on the 12 GDN layers the GGUF stores that way. **−96.0 MiB/token.** ⚠️ **The floor is a documented quality keeper**, not an oversight: a requant-q4 LBC measured 1/15 short prompts passing vs 13/15 for a Q8-class `ssm_out` (2026-06-10), and `ssm_out` sits inside the GDN recurrence. Convert-time flag; LBC filename gets a `-ssmq4` suffix. **Must clear the GDN quality gate before it is even a candidate.** | `=1` only with the quality suite armed. |
+| `LUMEN_Q6K_LAYOUT_FIX` | OFF | correctness | **C0.** Read Q6_K blocks with the ggml element mapping. The shipped host dequantizers take the `ql` nibble for output slots `l+32`/`l+64` from the wrong byte, so **126 of every 256 elements decode to the wrong value** — affecting the requantized lm_head on every 9B-Q4 LBC and `attn_q` on Generic LBCs. Default-OFF only so in-flight baselines are not silently invalidated. Convert reads add a `-q6kfix` LBC suffix. **Should be promoted to unconditional.** | `=1` to measure the corrected weights; see `lumen_runtime::q6k_ref`. |
+
 ## CUDA — diagnostics
 
 | Variable | Default | Category | Effect | When to touch |

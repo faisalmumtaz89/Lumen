@@ -495,6 +495,27 @@ pub(crate) unsafe fn launch_gemm_projection(
     }
 
     match weight {
+        // Native Q6_K (`LUMEN_CUDA_Q6K_NATIVE` / `LUMEN_CUDA_LMHEAD_Q6K`) is a
+        // DECODE-only lever: prefill keeps the F16 HGEMM path and there is no
+        // Q6_K GEMM. This arm is normally UNREACHABLE, because
+        // `dequant_layer_q8_to_f16` builds an F16 cache for `Q6KRaw` precisely so
+        // the F16-cache fast path above returns before this `match` -- prefill
+        // then runs the identical tensor-core route it runs today.
+        //
+        // The one way to land here is to also set `LUMEN_CUDA_PREFILL_F32`,
+        // which disables that fast path (note it is parsed with `.is_ok()`, so
+        // even `=0` enables it). That combination is a diagnostic mistake, not a
+        // supported configuration, so it fails loudly and says why rather than
+        // silently mis-dispatching.
+        GpuWeightBuf::Q6KRaw(_) => {
+            return Err(RuntimeError::Compute(
+                "Q6_K prefill matmul not implemented: a native-Q6_K weight reached the \
+                 prefill match, which means the F16-cache fast path was bypassed -- \
+                 unset LUMEN_CUDA_PREFILL_F32 (it is presence-parsed, so even =0 sets it) \
+                 or unset LUMEN_CUDA_Q6K_NATIVE / LUMEN_CUDA_LMHEAD_Q6K"
+                    .to_string(),
+            ));
+        }
         GpuWeightBuf::F32(w_f32) => {
             let weight_needed = out_dim * in_dim;
             if w_f32.len() < weight_needed {
@@ -1043,6 +1064,27 @@ pub(crate) unsafe fn launch_gemm_residual(
     }
 
     match weight {
+        // Native Q6_K (`LUMEN_CUDA_Q6K_NATIVE` / `LUMEN_CUDA_LMHEAD_Q6K`) is a
+        // DECODE-only lever: prefill keeps the F16 HGEMM path and there is no
+        // Q6_K GEMM. This arm is normally UNREACHABLE, because
+        // `dequant_layer_q8_to_f16` builds an F16 cache for `Q6KRaw` precisely so
+        // the F16-cache fast path above returns before this `match` -- prefill
+        // then runs the identical tensor-core route it runs today.
+        //
+        // The one way to land here is to also set `LUMEN_CUDA_PREFILL_F32`,
+        // which disables that fast path (note it is parsed with `.is_ok()`, so
+        // even `=0` enables it). That combination is a diagnostic mistake, not a
+        // supported configuration, so it fails loudly and says why rather than
+        // silently mis-dispatching.
+        GpuWeightBuf::Q6KRaw(_) => {
+            return Err(RuntimeError::Compute(
+                "Q6_K prefill matmul not implemented: a native-Q6_K weight reached the \
+                 prefill match, which means the F16-cache fast path was bypassed -- \
+                 unset LUMEN_CUDA_PREFILL_F32 (it is presence-parsed, so even =0 sets it) \
+                 or unset LUMEN_CUDA_Q6K_NATIVE / LUMEN_CUDA_LMHEAD_Q6K"
+                    .to_string(),
+            ));
+        }
         GpuWeightBuf::F32(w_f32) => {
             let weight_needed = out_dim * in_dim;
             if w_f32.len() < weight_needed {
@@ -2327,6 +2369,27 @@ unsafe fn launch_matvec_slice(
     let in_dim_u32 = in_dim as u32;
 
     match weight {
+        // Native Q6_K (`LUMEN_CUDA_Q6K_NATIVE` / `LUMEN_CUDA_LMHEAD_Q6K`) is a
+        // DECODE-only lever: prefill keeps the F16 HGEMM path and there is no
+        // Q6_K GEMM. This arm is normally UNREACHABLE, because
+        // `dequant_layer_q8_to_f16` builds an F16 cache for `Q6KRaw` precisely so
+        // the F16-cache fast path above returns before this `match` -- prefill
+        // then runs the identical tensor-core route it runs today.
+        //
+        // The one way to land here is to also set `LUMEN_CUDA_PREFILL_F32`,
+        // which disables that fast path (note it is parsed with `.is_ok()`, so
+        // even `=0` enables it). That combination is a diagnostic mistake, not a
+        // supported configuration, so it fails loudly and says why rather than
+        // silently mis-dispatching.
+        GpuWeightBuf::Q6KRaw(_) => {
+            return Err(RuntimeError::Compute(
+                "Q6_K prefill matmul not implemented: a native-Q6_K weight reached the \
+                 prefill match, which means the F16-cache fast path was bypassed -- \
+                 unset LUMEN_CUDA_PREFILL_F32 (it is presence-parsed, so even =0 sets it) \
+                 or unset LUMEN_CUDA_Q6K_NATIVE / LUMEN_CUDA_LMHEAD_Q6K"
+                    .to_string(),
+            ));
+        }
         GpuWeightBuf::F32(_) => unreachable!("F32 uses cuBLAS SGEMM path"),
         GpuWeightBuf::F16Raw(w_f16) => {
             device
@@ -2942,6 +3005,27 @@ unsafe fn launch_matvec_residual_slice(
     let in_dim_u32 = in_dim as u32;
 
     match weight {
+        // Native Q6_K (`LUMEN_CUDA_Q6K_NATIVE` / `LUMEN_CUDA_LMHEAD_Q6K`) is a
+        // DECODE-only lever: prefill keeps the F16 HGEMM path and there is no
+        // Q6_K GEMM. This arm is normally UNREACHABLE, because
+        // `dequant_layer_q8_to_f16` builds an F16 cache for `Q6KRaw` precisely so
+        // the F16-cache fast path above returns before this `match` -- prefill
+        // then runs the identical tensor-core route it runs today.
+        //
+        // The one way to land here is to also set `LUMEN_CUDA_PREFILL_F32`,
+        // which disables that fast path (note it is parsed with `.is_ok()`, so
+        // even `=0` enables it). That combination is a diagnostic mistake, not a
+        // supported configuration, so it fails loudly and says why rather than
+        // silently mis-dispatching.
+        GpuWeightBuf::Q6KRaw(_) => {
+            return Err(RuntimeError::Compute(
+                "Q6_K prefill matmul not implemented: a native-Q6_K weight reached the \
+                 prefill match, which means the F16-cache fast path was bypassed -- \
+                 unset LUMEN_CUDA_PREFILL_F32 (it is presence-parsed, so even =0 sets it) \
+                 or unset LUMEN_CUDA_Q6K_NATIVE / LUMEN_CUDA_LMHEAD_Q6K"
+                    .to_string(),
+            ));
+        }
         GpuWeightBuf::F32(_) => unreachable!("F32 uses cuBLAS SGEMM path"),
         GpuWeightBuf::Q8Aligned(w_q8a) => {
             // Q8_0 aligned residual prefill: dp4a with native int* loads.

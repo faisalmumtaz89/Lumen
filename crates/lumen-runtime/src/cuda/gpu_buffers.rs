@@ -45,6 +45,33 @@ pub enum GpuWeightBuf {
     /// Raw Q4_0 bytes on GPU (18 bytes per block of 32 elements).
     /// Dequantized on-the-fly by `matvec_q4_0`.
     Q4Raw(CudaSlice<u8>),
+    /// Raw Q6_K bytes on GPU (210 bytes per super-block of 256 elements =
+    /// 0.8203 B/weight). Consumed natively by `matvec_q6_k_f32`, which is what
+    /// llama.cpp does. Only ever constructed when `LUMEN_CUDA_Q6K_NATIVE=1`
+    /// (layer tensors) or `LUMEN_CUDA_LMHEAD_Q6K=1` (the head); the default
+    /// path still host-dequantizes K-quants to `F32` at 4.0 B/weight and
+    /// decodes through a 2.0 B/weight F16 cache, i.e. 2.44x more bytes than
+    /// the competitor moves on the identical tensor.
+    ///
+    /// An F16 cache IS still built for this variant, but only for batched
+    /// PREFILL: `launch_gemm_projection` / `launch_gemm_residual` have an
+    /// F16-cache fast path that fires before their `match weight`, so prefill
+    /// takes the same tensor-core HGEMM route it takes today. Decode never reads
+    /// that cache. Residency is therefore 0.8203 + 2.0 = 2.82 B/weight against
+    /// 4.0 + 2.0 = 6.0 for the default F32-plus-cache landing.
+    ///
+    /// Having a cache does NOT re-arm the QKV coupling guard in
+    /// `compute_layer_gpu`: that guard is
+    /// `matches!(&lw.wq, GpuWeightBuf::F32(_)) && <caches exist>`, and a Q6KRaw
+    /// `wq` fails the first conjunct regardless. So `wk`/`wv` on a
+    /// mixed-precision layer still keep their native Q4 route.
+    ///
+    /// LIMITATION: the F16-cache pass early-returns for GDN layers (an
+    /// A100-80GB OOM guard), so a K-quant tensor on a GDN layer would get no
+    /// cache and prefill would fail loudly. That does not occur on
+    /// Qwen3.5-9B-Q4_0, whose only surviving K-quant layer tensor is `attn_q` on
+    /// the full-attention layers 3/15/27/31.
+    Q6KRaw(CudaSlice<u8>),
     /// Repacked Q4_0 with 20-byte aligned blocks (2B scale + 2B pad + 16B nibbles).
     /// Nibble data at offset +4 is 4-byte aligned, enabling native int* loads
     /// in the dp4a kernel (4 int loads vs 16 byte loads per block).
@@ -309,6 +336,35 @@ fn dequant_kquant_to_f32(
             // Layout: [128B ql, 64B qh, 16B scales, 2B f16_d]
             let block_size = 210;
             let n_blocks = raw.len() / block_size;
+
+            // C0 (`LUMEN_Q6K_LAYOUT_FIX=1`): use the ggml element mapping.
+            //
+            // The loop below is the SHIPPED mapping and it is WRONG: groups 1
+            // and 2 take their `ql` nibble from the wrong byte, so 126 of every
+            // 256 elements decode to a value built from the low 4 bits of one
+            // weight and the high 2 bits of another. See
+            // `runtime_defaults::q6k_layout_fix` for the full write-up and
+            // `crate::q6k_ref` for the reference, the ggml packer, and the
+            // GPU-free regression tests that prove both readings.
+            //
+            // Kept default-OFF only so the campaign's existing 9B-Q4 baselines
+            // are not silently invalidated mid-flight. It should be promoted to
+            // unconditional.
+            if crate::runtime_defaults::q6k_layout_fix() {
+                let mut scratch = [0.0f32; crate::q6k_ref::Q6K_BLOCK_ELEM];
+                for b in 0..n_blocks {
+                    let bp = &raw[b * block_size..];
+                    crate::q6k_ref::dequant_block(bp, &mut scratch);
+                    let base = b * crate::q6k_ref::Q6K_BLOCK_ELEM;
+                    let take = n_elements.saturating_sub(base).min(scratch.len());
+                    if take == 0 {
+                        break;
+                    }
+                    out[base..base + take].copy_from_slice(&scratch[..take]);
+                }
+                return Ok(out);
+            }
+
             let mut written = 0usize;
             for b in 0..n_blocks {
                 let bp = &raw[b * block_size..];
@@ -804,6 +860,35 @@ fn upload_tensor(
                 )));
             }
 
+            // C1 (`LUMEN_CUDA_Q6K_NATIVE=1`): keep Q6_K as-is and let the
+            // native `matvec_q6_k_f32` kernel read 210 B per 256 elements —
+            // 0.8203 B/weight, matching llama.cpp's own byte count on this
+            // tensor instead of paying 4.0 resident / 2.0 streamed.
+            //
+            // Guarded on the block multiple because the kernel derives its
+            // super-block count as `in_dim / 256`; a ragged tail would read
+            // past the row. Every shipped K-quant tensor has
+            // `n_elements % 256 == 0` by construction (K-quants are defined on
+            // 256-element super-blocks), so the guard is a safety net, not a
+            // filter — and if it ever rejects, the marker below is absent and
+            // the tensor visibly falls back to F32 rather than silently.
+            //
+            // Default OFF is byte-identical: with the flag unset this block is
+            // skipped entirely and the F32 dequant below runs unchanged, in the
+            // same order, producing the same buffer.
+            if matches!(other, QuantScheme::Q6_K)
+                && crate::runtime_defaults::q6k_native()
+                && n_elements % 256 == 0
+            {
+                eprintln!(
+                    "[Q6K] NATIVE site={name} elems={n_elements} bytes={} b_per_w={:.4}",
+                    raw.len(),
+                    raw.len() as f64 / n_elements as f64
+                );
+                let gpu_buf = device.htod_copy(raw)?;
+                return Ok(GpuWeightBuf::Q6KRaw(gpu_buf));
+            }
+
             fn f16_to_f32_generic(bits: u16) -> f32 {
                 let sign = ((bits >> 15) & 1) as u32;
                 let exp = ((bits >> 10) & 0x1f) as u32;
@@ -829,24 +914,28 @@ fn upload_tensor(
 
             let f32_data = dequant_kquant_to_f32(raw, other, n_elements, f16_to_f32_generic)?;
 
-            // LUMEN_CUDA_KQUANT_REQUANT_Q8=1: land K-quants as Q8_0 instead of F32.
+            // Default K-quant landing: F32, 4.0 B/weight resident. Decode then
+            // reads the 2.0 B/weight F16 cache built by
+            // `dequant_layer_q8_to_f16`, so the STREAMED figure is 2.0 B/w --
+            // 2.44x what llama.cpp reads from the same Q6_K bytes (0.8203).
             //
-            // Mixed-quant GGUFs put Q5_K/Q6_K on sensitive tensors alongside
-            // Q4_0 — on 9B-Q4 that is `wq` (the fused Q+gate [4096,8192]) for 4
-            // of the 8 full-attention layers. Lumen has no K-quant matvec, so
-            // this path expands them to F32: 4 B/weight, 134 MB per tensor,
-            // ~536 MB per token for those four layers. llama.cpp reads the SAME
-            // file and runs Q6_K natively at 0.66 B/weight, so it moves ~6x
-            // fewer bytes on the identical tensor — a real competitive gap
-            // rather than a tuning question.
+            // NOTE FOR ANYONE GREPPING THIS FILE: an 18-line comment used to
+            // sit here describing a `LUMEN_CUDA_KQUANT_REQUANT_Q8=1` lever.
+            // That code was deleted in `442f63d` and the comment was left
+            // behind, so the repo advertised a flag that did nothing; setting
+            // it had no effect, and it produced at least one wrong analysis.
+            // Its numbers were also wrong three ways (it quoted 536 MB/token of
+            // residency as if it were traffic, 0.66 B/w for Q6_K instead of
+            // 0.8203, and a 6x ratio instead of 2.44x). It is replaced by this
+            // note plus the two REAL levers, which are implemented above and in
+            // `backend_impl.rs`:
+            //   LUMEN_CUDA_Q6K_NATIVE=1  -> layer tensors stay Q6_K (see above)
+            //   LUMEN_CUDA_LMHEAD_Q6K=1  -> output.weight stays Q6_K
             //
-            // Q8_0 is the conservative landing: 1.0625 B/weight (3.8x fewer
-            // bytes than F32) and it carries MORE mantissa than Q6_K's 6-bit
-            // payload, so requantising a dequantised Q6_K block is close to
-            // lossless. Q4_0 would be denser still but would genuinely discard
-            // precision the GGUF author chose to keep on these tensors, so it
-            // is not the default.
-            //
+            // On this path the element mapping used by `dequant_kquant_to_f32`
+            // is the SWAPPED one unless `LUMEN_Q6K_LAYOUT_FIX=1`; see that
+            // flag's docs for why that matters (126/256 elements per Q6_K
+            // super-block decode to the wrong value).
             eprintln!("[CUDA] upload {name}: {other:?} dequant to F32 ({n_elements} elements)");
             let gpu_buf = device.htod_copy(&f32_data)?;
             Ok(GpuWeightBuf::F32(gpu_buf))
@@ -1192,6 +1281,43 @@ pub fn dequant_layer_q8_to_f16(
                 Ok(Some(f16_buf))
             }
             GpuWeightBuf::Q4Aligned(_) => Ok(None), // Q4Aligned uses dp4a path, no F16 cache needed
+            // Q6KRaw (candidate C1) still needs an F16 cache, and NOT for
+            // decode -- decode reads the 0.8203 B/weight Q6_K bytes natively via
+            // `matvec_q6_k_f32`. The cache exists for batched PREFILL:
+            // `launch_gemm_projection` has an F16-cache fast path that fires
+            // BEFORE its `match weight`, so a Q6_K weight carrying a cache takes
+            // the identical tensor-core HGEMM route it takes today (today the
+            // weight is an F32 buffer plus an F16 cache, and the fast path fires
+            // on the cache, not the buffer). Without this arm, prefill would
+            // fall through to the explicit "Q6_K prefill matmul not implemented"
+            // error and arming C1 would abort at prompt processing -- which is
+            // exactly what the first cut of this candidate did.
+            //
+            // The Q6_K bytes are already on device, so this costs one load-time
+            // DtoH of the raw tensor (~27 MB per `attn_q`, 4 tensors) plus a host
+            // dequant. Residency becomes 0.8203 + 2.0 = 2.82 B/weight against
+            // 4.0 + 2.0 = 6.0 today, so the F32 buffer's 4.0 is still reclaimed.
+            //
+            // Critically this does NOT re-arm the QKV coupling guard: that guard
+            // is `matches!(&lw.wq, GpuWeightBuf::F32(_)) && <caches exist>`, and a
+            // Q6KRaw `wq` fails the first conjunct whatever its cache state. So
+            // C1 still subsumes C2 on the four affected layers.
+            //
+            // Uses the correct ggml mapping via `q6k_ref`, so the prefill cache
+            // is built from the TRUE weights even when `LUMEN_Q6K_LAYOUT_FIX` is
+            // off -- C1 fixes those tensors independently of C0.
+            GpuWeightBuf::Q6KRaw(q6) => {
+                let raw = device.dtoh_copy(q6)?;
+                let f16_bytes = crate::q6k_ref::dequant_to_f16_bytes(&raw, n);
+                if f16_bytes.len() != n * 2 {
+                    return Err(RuntimeError::Compute(format!(
+                        "Q6_K F16 cache: produced {} bytes for {n} elements (expected {})",
+                        f16_bytes.len(),
+                        n * 2
+                    )));
+                }
+                Ok(Some(device.htod_copy(&f16_bytes)?))
+            }
             _ => Ok(None), // F16Raw already in the right format for HGEMM -- no dequant needed
         }
     };
@@ -1223,6 +1349,8 @@ pub fn dequant_layer_q8_to_f16(
             // value in the base weight slot (currently sibling-only).
             GpuWeightBuf::Q8Split(q8) => (q8.len() / 34) * 32,
             GpuWeightBuf::Q4Split(q4) => (q4.len() / 18) * 32,
+            // Q6_K: 210 bytes per super-block of 256 elements.
+            GpuWeightBuf::Q6KRaw(q6) => (q6.len() / crate::q6k_ref::Q6K_BLOCK_BYTE) * 256,
         }
     };
 

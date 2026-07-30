@@ -480,6 +480,12 @@ pub(crate) struct KernelSet {
 
     // Q4 split (SoA) matvec against pre-quantized Q8_1 input (dp4a, NR=4).
     pub(crate) matvec_q4_split_q8_1: Option<CudaFunction>,
+    // Native Q6_K matvec, F32 activations (0.8203 B/weight — llama.cpp parity).
+    // `LUMEN_CUDA_Q6K_NATIVE=1` / `LUMEN_CUDA_LMHEAD_Q6K=1`. NR=1 for layer
+    // projections, NR=8 for the extreme-aspect-ratio head. Plain `load_fn`:
+    // baseline PTX only, no dp4a.
+    pub(crate) matvec_q6_k_f32: Option<CudaFunction>,
+    pub(crate) matvec_q6_k_f32_nr8: Option<CudaFunction>,
     pub(crate) matvec_q4_split_f32_lane: Option<CudaFunction>,
     pub(crate) matvec_q4_split_f32_lane_residual: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_residual: Option<CudaFunction>,
@@ -1779,6 +1785,45 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] matvec_q8_split_q8_1_mmvq_residual: FAILED: {e}");
+                None
+            }
+        },
+        // Native Q6_K matvec (candidates C1/C3). Plain `load_fn` is correct:
+        // the kernel's only inline PTX is `cvt.f32.f16` plus `.rn`-pinned
+        // baseline FP ops, exactly like `matvec_q4_split_f32_lane` above, so no
+        // raised `--gpu-architecture` is needed. A load failure is reported
+        // UNCONDITIONALLY (not behind LUMEN_CUDA_VERBOSE) whenever a Q6_K flag
+        // is armed, because the dispatch sites hard-error rather than silently
+        // falling back — the failure mode this repo has already paid for twice
+        // is a flag whose kernel quietly does not exist.
+        matvec_q6_k_f32: match load_fn(shaders::MATVEC_Q6_K_F32_KERNEL_SOURCE, "matvec_q6_k_f32") {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q6_k_f32: OK");
+                Some(f)
+            }
+            Err(e) => {
+                if crate::runtime_defaults::q6k_native() || crate::runtime_defaults::lmhead_q6k() {
+                    eprintln!("[Q6K] matvec_q6_k_f32: NVRTC FAILED (flag armed): {e}");
+                } else {
+                    cuda_log!("[CUDA] matvec_q6_k_f32: FAILED: {e}");
+                }
+                None
+            }
+        },
+        matvec_q6_k_f32_nr8: match load_fn(
+            shaders::MATVEC_Q6_K_F32_KERNEL_SOURCE,
+            "matvec_q6_k_f32_nr8",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q6_k_f32_nr8: OK");
+                Some(f)
+            }
+            Err(e) => {
+                if crate::runtime_defaults::lmhead_q6k() {
+                    eprintln!("[Q6K] matvec_q6_k_f32_nr8: NVRTC FAILED (flag armed): {e}");
+                } else {
+                    cuda_log!("[CUDA] matvec_q6_k_f32_nr8: FAILED: {e}");
+                }
                 None
             }
         },

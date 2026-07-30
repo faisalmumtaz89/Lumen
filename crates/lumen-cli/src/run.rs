@@ -1910,10 +1910,24 @@ pub(crate) fn create_backend(
     // BF16 added to the raw-weight allow-list. Without this, BF16 LBC models silently route
     // through the F32 CPU-dequant fallback and the BF16 raw-weight path
     // is skipped. Load-bearing for the BF16 path's prefill kernel.
-    if matches!(
+    //
+    // C3 (`LUMEN_CUDA_LMHEAD_Q6K=1`): Q6_K joins the allow-list so a Q6_K
+    // `output.weight` reaches `set_output_proj_raw` and can be dispatched by the
+    // native `matvec_q6_k_f32_nr8` kernel at 0.8203 B/weight instead of being
+    // requantized to Q8_0 (1.0625) at convert. Without the flag a Q6_K head is
+    // rejected here exactly as before and arrives as F32 via
+    // `set_global_tensors`, so flag-off behaviour is unchanged.
+    //
+    // The same flag gates the convert side, and it also adds a `-q6khead`
+    // suffix to the LBC filename — so a Q6_K-head LBC cannot be produced
+    // without the flag, and cannot be picked up by a runtime that lacks it.
+    let lmhead_q6k_ok =
+        lumen_convert::env_gates::lmhead_q6k() && matches!(output_proj_quant, QuantScheme::Q6_K);
+    if (matches!(
         output_proj_quant,
         QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
-    ) && !output_proj_raw.is_empty()
+    ) || lmhead_q6k_ok)
+        && !output_proj_raw.is_empty()
     {
         if verbose {
             eprintln!(
