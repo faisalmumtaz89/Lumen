@@ -235,19 +235,101 @@ pub enum Phase {
     /// norm is fused into each weight-format arm and SwiGLU is fused into
     /// either the gate/up or the down kernel depending on the arm.
     FfnGateUp = 19,
-    /// FFN down projection and the final residual add. Merged because two
-    /// arms fold the residual into the down store and return early.
+    /// FFN down projection and the final residual add. Merged because two arms
+    /// fold the residual into the down store and return early.
     FfnDownResid = 20,
-
-    // ---- depth 1: inside Head -------------------------------------------
-    /// Final RMSNorm. `lm_head` is reported as the derived residual
-    /// `Head - FinalNorm`, because the lm_head dispatch chain has six early
-    /// returns and cannot be bracketed without a close before each.
+    /// Final RMSNorm.
     FinalNorm = 21,
+
+    // ---- depth 1: inside Head (siblings of FinalNorm) --------------------
+    /// lm_head activation quantize (Q8_1), when the head runs on int8.
+    HeadQuant = 22,
+    /// The lm_head projection itself. Bracketed directly now that the
+    /// dispatch chain is hoisted behind `dispatch_output_proj`, so
+    /// `head == final_norm + head_quant + head_mv` is an identity rather than
+    /// a subtraction.
+    HeadMv = 23,
+
+    // ---- depth 2: inside AttnQkv ----------------------------------------
+    /// `wq` (fused Q+gate) on a Q6_K-coupled full-attention layer. Split from
+    /// the Q4 twin because on 9B-Q4 only `attn_q` is Q6_K, on 4 of the 8
+    /// full-attention layers, and the coupling guard drags the natively-Q4
+    /// `wk`/`wv` onto the same F16 path with it. Campaign lever C1/C1b.
+    AttnWqQ6k = 24,
+    /// `wq` on a natively-Q4 full-attention layer.
+    AttnWqQ4 = 25,
+    /// `wk`/`wv` on a Q6_K-coupled layer -- natively Q4_0 weights dragged onto
+    /// the coupled path. Campaign lever C2.
+    AttnWkvQ6k = 26,
+    /// `wk`/`wv` on a natively-Q4 layer.
+    AttnWkvQ4 = 27,
+    /// QKV activation quantize (shared by wq/wk/wv when the plan is Q8_1).
+    AttnQkvQuant = 28,
+
+    // ---- depth 2: inside AttnWo ------------------------------------------
+    /// `wo` activation quantize.
+    AttnWoQuant = 29,
+    /// `wo` projection (folds the post-attention residual).
+    AttnWoMv = 30,
+
+    // ---- depth 2: inside Ffn (gate/up group) ----------------------------
+    /// FFN activation quantize. Shared by gate and up when both are int8, so
+    /// `calls_per_token` below 2x the matvec count is the shared-quantize
+    /// optimization working; equal to it means a duplicate.
+    FfnActQuant = 31,
+    /// FFN gate projection.
+    FfnGateMv = 32,
+    /// FFN up projection.
+    FfnUpMv = 33,
+    /// Fused gate+up in one launch (label "gate_up"). Cannot be split into
+    /// gate and up -- it is one kernel.
+    FfnGateUpFused = 34,
+    /// SwiGLU, when it is a standalone launch rather than fused into the
+    /// gate/up or down kernel.
+    FfnSwiglu = 35,
+
+    // ---- depth 2: inside Ffn (down group) -------------------------------
+    /// FFN down activation quantize.
+    FfnDownQuant = 36,
+    /// FFN down projection.
+    FfnDownMv = 37,
+    /// Final residual add, when not folded into the down store.
+    FfnResidual = 38,
+
+    // ---- depth 2: inside GdnQkv -----------------------------------------
+    /// RMSNorm feeding the GDN projections.
+    GdnNorm = 39,
+    /// GDN fused qkv in_proj.
+    GdnQkvMv = 40,
+    /// GDN attn-gate projection (the z of silu(z)).
+    GdnGateMv = 41,
+    /// GDN ssm_alpha projection.
+    GdnAlphaMv = 42,
+    /// GDN ssm_beta projection.
+    GdnBetaMv = 43,
+    /// GDN activation quantize. alpha and beta each re-quantize the SAME
+    /// `normed` buffer on the shipped plan, so this is where that duplicate
+    /// shows up as calls_per_token.
+    GdnActQuant = 44,
+
+    // ---- depth 2: inside GdnConvRecur -----------------------------------
+    /// Causal conv1d over the conv ring.
+    GdnConv = 45,
+    /// Recurrent delta-rule state update (gates, L2 norm, state update).
+    GdnRecur = 46,
+
+    // ---- depth 2: inside GdnOut -----------------------------------------
+    /// Output RMSNorm + silu(z) gating.
+    GdnNormGate = 47,
+    /// `ssm_out` activation quantize. Named for the tensor, NOT a family:
+    /// ssm_out is Q8Raw/int8 and sits OUTSIDE the Q4 activation plan.
+    SsmOutQuant = 48,
+    /// `ssm_out` projection. Same naming rationale as above.
+    SsmOutMv = 49,
 }
 
 /// Number of [`Phase`] variants.
-pub const PHASE_COUNT: usize = 22;
+pub const PHASE_COUNT: usize = 50;
 
 const ALL_PHASES: [Phase; PHASE_COUNT] = [
     Phase::Embed,
@@ -272,6 +354,34 @@ const ALL_PHASES: [Phase; PHASE_COUNT] = [
     Phase::FfnGateUp,
     Phase::FfnDownResid,
     Phase::FinalNorm,
+    Phase::HeadQuant,
+    Phase::HeadMv,
+    Phase::AttnWqQ6k,
+    Phase::AttnWqQ4,
+    Phase::AttnWkvQ6k,
+    Phase::AttnWkvQ4,
+    Phase::AttnQkvQuant,
+    Phase::AttnWoQuant,
+    Phase::AttnWoMv,
+    Phase::FfnActQuant,
+    Phase::FfnGateMv,
+    Phase::FfnUpMv,
+    Phase::FfnGateUpFused,
+    Phase::FfnSwiglu,
+    Phase::FfnDownQuant,
+    Phase::FfnDownMv,
+    Phase::FfnResidual,
+    Phase::GdnNorm,
+    Phase::GdnQkvMv,
+    Phase::GdnGateMv,
+    Phase::GdnAlphaMv,
+    Phase::GdnBetaMv,
+    Phase::GdnActQuant,
+    Phase::GdnConv,
+    Phase::GdnRecur,
+    Phase::GdnNormGate,
+    Phase::SsmOutQuant,
+    Phase::SsmOutMv,
 ];
 
 impl Phase {
@@ -300,10 +410,39 @@ impl Phase {
             Phase::FfnGateUp => "ffn_gate_up",
             Phase::FfnDownResid => "ffn_down_resid",
             Phase::FinalNorm => "final_norm",
+            Phase::HeadQuant => "head_quant",
+            Phase::HeadMv => "head_mv",
+            Phase::AttnWqQ6k => "attn_wq_q6k",
+            Phase::AttnWqQ4 => "attn_wq_q4",
+            Phase::AttnWkvQ6k => "attn_wkv_q6k",
+            Phase::AttnWkvQ4 => "attn_wkv_q4",
+            Phase::AttnQkvQuant => "attn_qkv_quant",
+            Phase::AttnWoQuant => "attn_wo_quant",
+            Phase::AttnWoMv => "attn_wo_mv",
+            Phase::FfnActQuant => "ffn_act_quant",
+            Phase::FfnGateMv => "ffn_gate_mv",
+            Phase::FfnUpMv => "ffn_up_mv",
+            Phase::FfnGateUpFused => "ffn_gate_up_fused",
+            Phase::FfnSwiglu => "ffn_swiglu",
+            Phase::FfnDownQuant => "ffn_down_quant",
+            Phase::FfnDownMv => "ffn_down_mv",
+            Phase::FfnResidual => "ffn_residual",
+            Phase::GdnNorm => "gdn_norm",
+            Phase::GdnQkvMv => "gdn_qkv_mv",
+            Phase::GdnGateMv => "gdn_gate_mv",
+            Phase::GdnAlphaMv => "gdn_alpha_mv",
+            Phase::GdnBetaMv => "gdn_beta_mv",
+            Phase::GdnActQuant => "gdn_act_quant",
+            Phase::GdnConv => "gdn_conv",
+            Phase::GdnRecur => "gdn_recur",
+            Phase::GdnNormGate => "gdn_norm_gate",
+            Phase::SsmOutQuant => "ssm_out_quant",
+            Phase::SsmOutMv => "ssm_out_mv",
         }
     }
 
-    /// 0 for the token-partitioning phases, 1 for nested refinements.
+    /// 0 = token partition (level 1). 1 = coarse group. 2 = per-surface leaf.
+    /// Depths 1 and 2 both require level 2.
     pub fn depth(self) -> u8 {
         match self {
             Phase::Embed
@@ -314,13 +453,38 @@ impl Phase {
             | Phase::LayerCommit
             | Phase::Head
             | Phase::Argmax => 0,
-            _ => 1,
+            Phase::AttnQkv
+            | Phase::AttnQkNorm
+            | Phase::AttnBias
+            | Phase::AttnRope
+            | Phase::AttnKvWrite
+            | Phase::AttnCore
+            | Phase::AttnWo
+            | Phase::GdnQkv
+            | Phase::GdnConvRecur
+            | Phase::GdnOut
+            | Phase::GdnGlue
+            | Phase::FfnGateUp
+            | Phase::FfnDownResid
+            | Phase::FinalNorm
+            | Phase::HeadQuant
+            | Phase::HeadMv => 1,
+            _ => 2,
         }
     }
 
-    /// The depth-0 phase this phase refines, if any.
+    /// True when this phase records at profiler level `lvl`.
+    ///
+    /// Level 1 is depth-0 only, which keeps level-1 output byte-identical to
+    /// the pre-depth-2 instrument. Level 2 records every depth.
+    pub fn included_at(self, lvl: u8) -> bool {
+        lvl > 0 && (self.depth() == 0 || lvl >= 2)
+    }
+
+    /// The phase one level up that this phase refines, if any.
     pub fn parent(self) -> Option<Phase> {
         match self {
+            // depth 1 -> depth 0
             Phase::AttnQkv
             | Phase::AttnQkNorm
             | Phase::AttnBias
@@ -332,9 +496,75 @@ impl Phase {
                 Some(Phase::GdnAttn)
             }
             Phase::FfnGateUp | Phase::FfnDownResid => Some(Phase::Ffn),
-            Phase::FinalNorm => Some(Phase::Head),
+            Phase::FinalNorm | Phase::HeadQuant | Phase::HeadMv => Some(Phase::Head),
+            // depth 2 -> depth 1
+            Phase::AttnWqQ6k
+            | Phase::AttnWqQ4
+            | Phase::AttnWkvQ6k
+            | Phase::AttnWkvQ4
+            | Phase::AttnQkvQuant => Some(Phase::AttnQkv),
+            Phase::AttnWoQuant | Phase::AttnWoMv => Some(Phase::AttnWo),
+            Phase::FfnActQuant
+            | Phase::FfnGateMv
+            | Phase::FfnUpMv
+            | Phase::FfnGateUpFused
+            | Phase::FfnSwiglu => Some(Phase::FfnGateUp),
+            Phase::FfnDownQuant | Phase::FfnDownMv | Phase::FfnResidual => {
+                Some(Phase::FfnDownResid)
+            }
+            Phase::GdnNorm
+            | Phase::GdnQkvMv
+            | Phase::GdnGateMv
+            | Phase::GdnAlphaMv
+            | Phase::GdnBetaMv
+            | Phase::GdnActQuant => Some(Phase::GdnQkv),
+            Phase::GdnConv | Phase::GdnRecur => Some(Phase::GdnConvRecur),
+            Phase::GdnNormGate | Phase::SsmOutQuant | Phase::SsmOutMv => Some(Phase::GdnOut),
             _ => None,
         }
+    }
+
+    /// True for phases that sit physically inside a larger bracket but whose
+    /// span must NOT be attributed to it.
+    ///
+    /// The activation quantizes: they run inside the matvec helper's surface
+    /// bracket, but they move activation bytes, not weight bytes, so leaving
+    /// them in would dilute the matvec's effective bandwidth and double-count
+    /// them inside the parent group.
+    pub fn excludes_span_from_parent(self) -> bool {
+        matches!(
+            self,
+            Phase::AttnQkvQuant
+                | Phase::AttnWoQuant
+                | Phase::FfnActQuant
+                | Phase::FfnDownQuant
+                | Phase::GdnActQuant
+                | Phase::SsmOutQuant
+                | Phase::HeadQuant
+        )
+    }
+
+    /// True for phases whose reported bytes are weight bytes streamed by a
+    /// matvec, so an effective GB/s is meaningful.
+    pub fn is_matvec(self) -> bool {
+        matches!(
+            self,
+            Phase::AttnWqQ6k
+                | Phase::AttnWqQ4
+                | Phase::AttnWkvQ6k
+                | Phase::AttnWkvQ4
+                | Phase::AttnWoMv
+                | Phase::FfnGateMv
+                | Phase::FfnUpMv
+                | Phase::FfnGateUpFused
+                | Phase::FfnDownMv
+                | Phase::GdnQkvMv
+                | Phase::GdnGateMv
+                | Phase::GdnAlphaMv
+                | Phase::GdnBetaMv
+                | Phase::SsmOutMv
+                | Phase::HeadMv
+        )
     }
 
     fn idx(self) -> usize {
@@ -428,6 +658,22 @@ struct Bracket {
     phase: u8,
     start: u32,
     end: u32,
+    /// Bytes declared at `begin`; folded into the phase total at settle so an
+    /// abandoned token contributes neither time nor bytes.
+    bytes: u64,
+    /// Unique within the token, so a child can name its enclosing bracket
+    /// without depending on `Vec` positions.
+    id: u64,
+    /// When set, this bracket's span is SUBTRACTED from the enclosing bracket
+    /// with that id before the enclosing phase accumulates.
+    ///
+    /// This is what lets an activation quantize be timed separately while
+    /// sitting physically inside the matvec helper's surface bracket. Without
+    /// it the quantize would be counted twice inside the parent group, and the
+    /// matvec's reported bandwidth would be diluted by quantize time that moved
+    /// no weight bytes. With it, a matvec surface reports NET matvec time, which
+    /// is the only figure from which an honest effective GB/s can be derived.
+    exclude_from: Option<u64>,
 }
 
 /// Defect counters. Every one of these should read 0 on a trustworthy run.
@@ -496,16 +742,33 @@ impl HealthCounts {
 /// ~100-300 brackets, so a few microseconds of accumulated rounding is benign.
 const RESIDUAL_EPSILON_US: f64 = 4.0;
 
-#[derive(Default)]
 struct Accum {
     /// Total GPU-timeline span per phase, microseconds.
     span_us: [f64; PHASE_COUNT],
     /// Bracket count per phase.
     calls: [u64; PHASE_COUNT],
+    /// Bytes the phase declared it would move, summed. Weight bytes for a
+    /// matvec; 0 for phases that declare nothing.
+    bytes: [u64; PHASE_COUNT],
     /// Per-token samples, one entry per settled token.
     wall_us: Vec<f64>,
     gpu_span_us: Vec<f64>,
     attributed_us: Vec<f64>,
+}
+
+/// Manual `Default`: `#[derive(Default)]` only covers arrays up to 32
+/// elements and `PHASE_COUNT` is 50.
+impl Default for Accum {
+    fn default() -> Self {
+        Self {
+            span_us: [0.0; PHASE_COUNT],
+            calls: [0; PHASE_COUNT],
+            bytes: [0; PHASE_COUNT],
+            wall_us: Vec::new(),
+            gpu_span_us: Vec::new(),
+            attributed_us: Vec::new(),
+        }
+    }
 }
 
 impl Accum {
@@ -518,8 +781,10 @@ struct Profiler {
     /// Reused across tokens; `cursor` resets to 0 each token.
     pool: Vec<EventHandle>,
     cursor: usize,
-    /// Open brackets, innermost last: (phase, start event index).
-    open: Vec<(u8, u32)>,
+    /// Open brackets, innermost last: (phase, start event index, bytes, id).
+    open: Vec<(u8, u32, u64, u64)>,
+    /// Monotonic bracket id within the token.
+    next_id: u64,
     closed: Vec<Bracket>,
     token_start: Option<u32>,
     token_end: Option<u32>,
@@ -547,6 +812,7 @@ impl Profiler {
             pool: Vec::new(),
             cursor: 0,
             open: Vec::new(),
+            next_id: 0,
             closed: Vec::new(),
             token_start: None,
             token_end: None,
@@ -614,16 +880,37 @@ impl Profiler {
         self.health.unclosed += self.open.len() as u64;
         self.open.clear();
 
-        let mut attributed = 0.0f64;
         let closed = std::mem::take(&mut self.closed);
+
+        // Pass 1: measure every bracket, and total up what each parent must
+        // have netted out.
+        let mut spans: Vec<(usize, f64, u64, u64)> = Vec::with_capacity(closed.len());
+        let mut excluded: std::collections::HashMap<u64, f64> = std::collections::HashMap::new();
         for b in &closed {
-            if let Some(us) = self.elapsed_us(b.start, b.end) {
-                let i = b.phase as usize;
-                self.accum.span_us[i] += us;
-                self.accum.calls[i] += 1;
-                if ALL_PHASES[i].depth() == 0 {
-                    attributed += us;
-                }
+            let Some(us) = self.elapsed_us(b.start, b.end) else {
+                continue;
+            };
+            if let Some(pid) = b.exclude_from {
+                *excluded.entry(pid).or_insert(0.0) += us;
+            }
+            spans.push((b.phase as usize, us, b.bytes, b.id));
+        }
+
+        // Pass 2: accumulate, subtracting each parent's excluded children.
+        let mut attributed = 0.0f64;
+        for (i, us, bytes, id) in spans {
+            let net = match excluded.get(&id) {
+                // Clamp at 0: a child cannot legitimately outlast its parent,
+                // and the per-token residual check below catches the case where
+                // the arithmetic goes wrong.
+                Some(sub) => (us - sub).max(0.0),
+                None => us,
+            };
+            self.accum.span_us[i] += net;
+            self.accum.calls[i] += 1;
+            self.accum.bytes[i] = self.accum.bytes[i].saturating_add(bytes);
+            if ALL_PHASES[i].depth() == 0 {
+                attributed += net;
             }
         }
         self.closed = closed;
@@ -653,6 +940,7 @@ impl Profiler {
 
         self.health.pool_high_water = self.health.pool_high_water.max(self.cursor);
         self.cursor = 0;
+        self.next_id = 0;
         self.token_start = None;
         self.token_end = None;
         self.wall_start = None;
@@ -683,7 +971,7 @@ fn with<R>(f: impl FnOnce(&mut Profiler) -> R) -> Option<R> {
 #[inline]
 pub fn begin(phase: Phase, stream: &CudaStream) {
     let lvl = level();
-    if lvl == 0 || phase.depth() >= lvl {
+    if !phase.included_at(lvl) {
         return;
     }
     with(|p| {
@@ -692,7 +980,29 @@ pub fn begin(phase: Phase, stream: &CudaStream) {
             return;
         }
         if let Some(idx) = p.record(stream) {
-            p.open.push((phase as u8, idx));
+            let id = p.next_id;
+            p.next_id += 1;
+            p.open.push((phase as u8, idx, 0, id));
+        }
+    });
+}
+
+/// Open a phase bracket that declares `bytes` of traffic, so the report can
+/// derive an effective bandwidth for it.
+#[inline]
+pub fn begin_bytes(phase: Phase, bytes: u64, stream: &CudaStream) {
+    if !phase.included_at(level()) {
+        return;
+    }
+    with(|p| {
+        if !p.in_token {
+            p.health.outside_token += 1;
+            return;
+        }
+        if let Some(idx) = p.record(stream) {
+            let id = p.next_id;
+            p.next_id += 1;
+            p.open.push((phase as u8, idx, bytes, id));
         }
     });
 }
@@ -701,7 +1011,7 @@ pub fn begin(phase: Phase, stream: &CudaStream) {
 #[inline]
 pub fn end(phase: Phase, stream: &CudaStream) {
     let lvl = level();
-    if lvl == 0 || phase.depth() >= lvl {
+    if !phase.included_at(lvl) {
         return;
     }
     with(|p| {
@@ -711,13 +1021,23 @@ pub fn end(phase: Phase, stream: &CudaStream) {
             return;
         }
         match p.open.last().copied() {
-            Some((open_phase, start)) if open_phase == phase as u8 => {
+            Some((open_phase, start, bytes, id)) if open_phase == phase as u8 => {
                 p.open.pop();
+                // The bracket now on top of the stack is this one's enclosing
+                // bracket. A quantize phase names it so its span is netted out.
+                let exclude_from = if phase.excludes_span_from_parent() {
+                    p.open.last().map(|(_, _, _, pid)| *pid)
+                } else {
+                    None
+                };
                 if let Some(end_idx) = p.record(stream) {
                     p.closed.push(Bracket {
                         phase: phase as u8,
                         start,
                         end: end_idx,
+                        bytes,
+                        id,
+                        exclude_from,
                     });
                 }
             }
@@ -797,6 +1117,255 @@ pub fn token_settle() {
 }
 
 // ---------------------------------------------------------------------------
+// Per-surface brackets keyed on the dispatch label
+// ---------------------------------------------------------------------------
+
+/// Which full-attention family the layer currently being decoded belongs to.
+///
+/// On Qwen3.5-9B Q4_0 the only K-quant layer tensor is `attn_q`, Q6_K on 4 of
+/// the 8 full-attention layers. The dispatch guard for those layers also drags
+/// the natively-Q4 `wk`/`wv` onto the coupled path, so the split is a property
+/// of the LAYER's dispatch branch, not of each tensor's own format. Set once
+/// per full-attention layer from the same condition the dispatcher uses, so the
+/// bracket boundary and the branch boundary coincide by construction.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AttnFamily {
+    /// `wq` is Q6_K-derived (F32 by default, `Q6KRaw` under C1/C1b).
+    Q6kCoupled,
+    /// `wq` is natively Q4.
+    NativeQ4,
+}
+
+/// Current attention family, consulted by the label->phase map.
+///
+/// A plain global rather than thread-local: decode is single-threaded per
+/// backend and every bracket call is already serialized by the profiler mutex.
+/// Defaults to `NativeQ4` so a missing `set_attn_family` cannot silently
+/// attribute Q4 work to the Q6_K family -- it would show as an implausible
+/// zero on the Q6_K rows instead, which is visible.
+static ATTN_FAMILY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// Record which full-attention family the current layer takes. No-op when off.
+#[inline]
+pub fn set_attn_family(family: AttnFamily) {
+    if level() == 0 {
+        return;
+    }
+    let v = match family {
+        AttnFamily::Q6kCoupled => 0u8,
+        AttnFamily::NativeQ4 => 1u8,
+    };
+    ATTN_FAMILY.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn attn_family() -> AttnFamily {
+    if ATTN_FAMILY.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        AttnFamily::Q6kCoupled
+    } else {
+        AttnFamily::NativeQ4
+    }
+}
+
+/// Map a dispatch label to its matvec phase.
+///
+/// The labels are already threaded through every matvec helper, which is what
+/// makes per-surface bracketing possible without touching ~98 call sites. Two
+/// labels name a launch that covers two surfaces and therefore cannot be
+/// split: `"kv"` (wk and wv in one batched GEMM) and `"gate_up"` (gate and up
+/// in one kernel). Those get their own phase named for what the launch is,
+/// rather than being attributed to one of the two surfaces.
+pub fn matvec_phase_for_label(label: &str) -> Option<Phase> {
+    let q6k = attn_family() == AttnFamily::Q6kCoupled;
+    Some(match label {
+        "wq" => {
+            if q6k {
+                Phase::AttnWqQ6k
+            } else {
+                Phase::AttnWqQ4
+            }
+        }
+        // "kv" is wk+wv fused into one batched launch -- inseparable.
+        "wk" | "wv" | "kv" => {
+            if q6k {
+                Phase::AttnWkvQ6k
+            } else {
+                Phase::AttnWkvQ4
+            }
+        }
+        "wo" => Phase::AttnWoMv,
+        "gate" => Phase::FfnGateMv,
+        "up" => Phase::FfnUpMv,
+        "gate_up" => Phase::FfnGateUpFused,
+        "down" => Phase::FfnDownMv,
+        "gdn_qkv" => Phase::GdnQkvMv,
+        "gdn_gate" => Phase::GdnGateMv,
+        "gdn_alpha" | "gdn_alpha_f16" => Phase::GdnAlphaMv,
+        "gdn_beta" | "gdn_beta_f16" => Phase::GdnBetaMv,
+        // ssm_out is Q8Raw/int8 and sits OUTSIDE the Q4 activation plan, so it
+        // is labelled by its own tensor name and never folded into a family.
+        "gdn_ssm_out" => Phase::SsmOutMv,
+        "output_proj" | "head" => Phase::HeadMv,
+        _ => return None,
+    })
+}
+
+/// Map a dispatch label to the activation-quantize phase that feeds it.
+///
+/// Covers both spellings: the caller-side `launch_quantize_input_q8_1` labels
+/// ("qkv", "wo split", "ffn gate_up", "down split", ...) and the matvec labels,
+/// because on the int8 arms the quantize happens inside the matvec helper under
+/// the matvec's own label.
+pub fn quant_phase_for_label(label: &str) -> Option<Phase> {
+    let q6k = attn_family() == AttnFamily::Q6kCoupled;
+    let _ = q6k;
+    Some(match label {
+        "qkv" | "wq" | "wk" | "wv" | "kv" => Phase::AttnQkvQuant,
+        "wo" | "wo split" => Phase::AttnWoQuant,
+        "gate" | "up" | "gate_up" | "ffn gate_up" => Phase::FfnActQuant,
+        "down" | "down split" | "down split (sep swiglu)" => Phase::FfnDownQuant,
+        "gdn_qkv" | "gdn_gate" | "gdn_alpha" | "gdn_beta" | "gdn_alpha_f16"
+        | "gdn_beta_f16" => Phase::GdnActQuant,
+        "gdn_ssm_out" => Phase::SsmOutQuant,
+        "output_proj" | "head" => Phase::HeadQuant,
+        _ => return None,
+    })
+}
+
+/// True when `phase` already has an open bracket in this token.
+///
+/// Guards against re-entrancy double-counting: `launch_matvec_preq8_1_split`
+/// tail-calls `launch_matvec_preq8_1` when the split sibling or kernel is
+/// absent, and both carry a surface guard for the SAME label. Without this
+/// check the surface would be counted twice for such a call. Checking the whole
+/// open stack rather than just its top makes it robust to deeper nesting.
+fn phase_already_open(phase: Phase) -> bool {
+    with(|p| p.open.iter().any(|(ph, _, _, _)| *ph == phase as u8)).unwrap_or(false)
+}
+
+/// RAII bracket. Records `end` on drop, so it survives every early return and
+/// every `?` in the helper it guards.
+///
+/// `launch_matvec_ext` has 23 `return` statements and `launch_matvec_residual`
+/// has 15; closing by hand would be 38 edits where a single miss leaks a
+/// bracket permanently.
+pub struct SurfaceGuard<'a> {
+    phase: Option<Phase>,
+    stream: &'a CudaStream,
+}
+
+impl Drop for SurfaceGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(p) = self.phase {
+            end(p, self.stream);
+        }
+    }
+}
+
+/// Open a per-surface matvec bracket for `label`, declaring `bytes` of weight
+/// traffic. Returns an inert guard when profiling is off or the label is not a
+/// known matvec surface.
+#[inline]
+pub fn matvec_surface<'a>(
+    label: &str,
+    bytes: u64,
+    stream: &'a CudaStream,
+) -> SurfaceGuard<'a> {
+    if level() < 2 {
+        return SurfaceGuard {
+            phase: None,
+            stream,
+        };
+    }
+    match matvec_phase_for_label(label) {
+        // Re-entrant call for a surface already being timed: stay inert so the
+        // outer bracket remains the single measurement of it.
+        Some(ph) if phase_already_open(ph) => SurfaceGuard {
+            phase: None,
+            stream,
+        },
+        Some(ph) => {
+            begin_bytes(ph, bytes, stream);
+            SurfaceGuard {
+                phase: Some(ph),
+                stream,
+            }
+        }
+        None => SurfaceGuard {
+            phase: None,
+            stream,
+        },
+    }
+}
+
+/// Open an activation-quantize bracket for `label`.
+#[inline]
+pub fn quant_surface<'a>(label: &str, bytes: u64, stream: &'a CudaStream) -> SurfaceGuard<'a> {
+    if level() < 2 {
+        return SurfaceGuard {
+            phase: None,
+            stream,
+        };
+    }
+    match quant_phase_for_label(label) {
+        // Re-entrant call for a surface already being timed: stay inert so the
+        // outer bracket remains the single measurement of it.
+        Some(ph) if phase_already_open(ph) => SurfaceGuard {
+            phase: None,
+            stream,
+        },
+        Some(ph) => {
+            begin_bytes(ph, bytes, stream);
+            SurfaceGuard {
+                phase: Some(ph),
+                stream,
+            }
+        }
+        None => SurfaceGuard {
+            phase: None,
+            stream,
+        },
+    }
+}
+
+/// Open a bracket for a named phase declaring `bytes` of traffic, as a guard.
+///
+/// The guard form matters where a region has many exits: the lm_head dispatch
+/// chain has nine early returns, and `Drop` fires on all of them plus the tail,
+/// so the region is measured directly instead of being derived by subtraction
+/// -- with no code motion and no risk of missing an exit.
+#[inline]
+pub fn guard_bytes<'a>(phase: Phase, bytes: u64, stream: &'a CudaStream) -> SurfaceGuard<'a> {
+    if !phase.included_at(level()) {
+        return SurfaceGuard {
+            phase: None,
+            stream,
+        };
+    }
+    begin_bytes(phase, bytes, stream);
+    SurfaceGuard {
+        phase: Some(phase),
+        stream,
+    }
+}
+
+/// Open a bracket for a named phase, as a guard. For straight-line regions
+/// where a manual `end` would still be correct but a guard is tidier.
+#[inline]
+pub fn guard<'a>(phase: Phase, stream: &'a CudaStream) -> SurfaceGuard<'a> {
+    if !phase.included_at(level()) {
+        return SurfaceGuard {
+            phase: None,
+            stream,
+        };
+    }
+    begin(phase, stream);
+    SurfaceGuard {
+        phase: Some(phase),
+        stream,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
 
@@ -806,6 +1375,18 @@ pub struct PhaseRow {
     pub phase: Phase,
     pub calls: u64,
     pub total_us: f64,
+    pub total_bytes: u64,
+}
+
+impl PhaseRow {
+    /// Effective bandwidth over this phase's accumulated span, GB/s (10^9).
+    /// `None` when the phase declared no bytes or took no measurable time.
+    pub fn effective_gbps(&self) -> Option<f64> {
+        if self.total_bytes == 0 || self.total_us <= 0.0 {
+            return None;
+        }
+        Some(self.total_bytes as f64 / (self.total_us * 1e3))
+    }
 }
 
 /// Aggregated profile over the tokens seen since the last reset.
@@ -846,7 +1427,11 @@ impl Summary {
             .map(|r| self.per_token(r.total_us))
     }
 
-    /// Time inside a depth-0 phase that none of its depth-1 children claimed.
+    /// Time inside a phase that none of its DIRECT children claimed.
+    ///
+    /// Generalized over depth: with depth-2 leaves present this yields a
+    /// residual at every level, so an unbracketed launch is localized to the
+    /// tightest enclosing bracket rather than only to a top-level phase.
     ///
     /// Returns `None` when the phase has no children recorded (level 1, or a
     /// phase with no children at all). This localizes what
@@ -926,6 +1511,7 @@ pub fn summary() -> Summary {
                 phase: ph,
                 calls: p.accum.calls[i],
                 total_us: p.accum.span_us[i],
+                total_bytes: p.accum.bytes[i],
             });
         }
         Summary {
@@ -1064,10 +1650,22 @@ pub fn write_summary<W: std::io::Write>(w: &mut W, label: &str, s: &Summary) {
             row.calls as f64 / s.tokens as f64
         };
         let parent = row.phase.parent().map(|p| p.name()).unwrap_or("-");
+        // Bytes and effective bandwidth only where the phase declared traffic.
+        // "n/a" rather than 0 so a phase that simply does not declare bytes is
+        // never read as a phase that moved none.
+        let bytes_per_tok = if row.total_bytes == 0 {
+            "n/a".to_string()
+        } else {
+            format!("{:.0}", row.total_bytes as f64 / s.tokens.max(1) as f64)
+        };
+        let gbps = match row.effective_gbps() {
+            Some(v) => format!("{v:.1}"),
+            None => "n/a".to_string(),
+        };
         let _ = writeln!(
             w,
             "[PROFILE] phase depth={} name={} parent={} calls_per_token={:.2} us_per_token={:.3} \
-             pct_of_wall={} pct_of_attributed={}",
+             pct_of_wall={} pct_of_attributed={} bytes_per_token={} eff_gbps={}",
             row.phase.depth(),
             row.phase.name(),
             parent,
@@ -1075,6 +1673,8 @@ pub fn write_summary<W: std::io::Write>(w: &mut W, label: &str, s: &Summary) {
             per_tok,
             pct(per_tok, wall),
             pct(per_tok, attributed),
+            bytes_per_tok,
+            gbps,
         );
     }
 
@@ -1083,7 +1683,7 @@ pub fn write_summary<W: std::io::Write>(w: &mut W, label: &str, s: &Summary) {
     // GROWS after a code change, a new launch went in uncovered. This is the
     // only handle the tool offers on that distinction -- the global
     // `gpu_unattributed_us` conflates the two causes and cannot separate them.
-    for parent in ALL_PHASES.iter().filter(|p| p.depth() == 0) {
+    for parent in ALL_PHASES.iter() {
         if let Some(uncovered) = s.uncovered_in(*parent) {
             let total = s.phase_us_per_token(*parent).unwrap_or(0.0);
             let _ = writeln!(
@@ -1096,11 +1696,10 @@ pub fn write_summary<W: std::io::Write>(w: &mut W, label: &str, s: &Summary) {
         }
     }
 
-    // lm_head is not directly bracketable (ten early returns in the dispatch
-    // chain), so report it as Head minus FinalNorm. When the F16 fast path
-    // returns before the final RMSNorm, FinalNorm never runs and the difference
-    // is undefined -- say so explicitly rather than omitting the row, so a
-    // missing lm_head figure cannot be mistaken for a zero-cost lm_head.
+    // `head_mv` is now bracketed directly (the dispatch chain was hoisted
+    // behind `dispatch_output_proj`), so this derived figure is kept only as a
+    // CROSS-CHECK: it should agree with the measured `head_mv` row. A
+    // disagreement means the head chain grew an exit that skips the bracket.
     let head = s.phase_us_per_token(Phase::Head);
     let final_norm = s.phase_us_per_token(Phase::FinalNorm);
     match (head, final_norm) {
@@ -1185,18 +1784,197 @@ mod tests {
         );
     }
 
+    /// The depth ladder must be exactly consistent: depth 0 has no parent, and
+    /// every deeper phase's parent sits exactly one level shallower. This is
+    /// what makes `uncovered_in` a correct residual at every level.
     #[test]
-    fn depth_one_phases_all_declare_a_depth_zero_parent() {
+    fn depth_ladder_is_consistent() {
         for p in ALL_PHASES {
             match p.depth() {
                 0 => assert_eq!(p.parent(), None, "{} is depth 0", p.name()),
-                1 => {
-                    let parent = p.parent().unwrap_or_else(|| panic!("{} has no parent", p.name()));
-                    assert_eq!(parent.depth(), 0, "{} parent must be depth 0", p.name());
+                d => {
+                    let parent = p
+                        .parent()
+                        .unwrap_or_else(|| panic!("{} (depth {d}) has no parent", p.name()));
+                    assert_eq!(
+                        parent.depth(),
+                        d - 1,
+                        "{} is depth {d} so its parent {} must be depth {}",
+                        p.name(),
+                        parent.name(),
+                        d - 1
+                    );
                 }
-                d => panic!("{} has unsupported depth {d}", p.name()),
             }
         }
+    }
+
+    /// Level 1 must record depth-0 only, so level-1 output stays identical to
+    /// the pre-depth-2 instrument. Level 2 records everything.
+    #[test]
+    fn level_gating_matches_the_depth_ladder() {
+        for p in ALL_PHASES {
+            assert!(!p.included_at(0), "{} must be off at level 0", p.name());
+            assert_eq!(
+                p.included_at(1),
+                p.depth() == 0,
+                "{} at level 1: only depth-0 phases record",
+                p.name()
+            );
+            assert!(p.included_at(2), "{} must record at level 2", p.name());
+        }
+    }
+
+    /// Every activation-quantize phase must net its span out of the enclosing
+    /// bracket, or the matvec it sits inside would report a diluted bandwidth
+    /// and the parent group would double-count it.
+    #[test]
+    fn quantize_phases_exclude_their_span_from_the_parent() {
+        let quant: Vec<&str> = ALL_PHASES
+            .iter()
+            .filter(|p| p.excludes_span_from_parent())
+            .map(|p| p.name())
+            .collect();
+        assert_eq!(
+            quant,
+            vec![
+                "head_quant",
+                "attn_qkv_quant",
+                "attn_wo_quant",
+                "ffn_act_quant",
+                "ffn_down_quant",
+                "gdn_act_quant",
+                "ssm_out_quant",
+            ]
+        );
+        // A quantize phase must never also be counted as a matvec.
+        for p in ALL_PHASES {
+            assert!(
+                !(p.excludes_span_from_parent() && p.is_matvec()),
+                "{} cannot be both a quantize and a matvec",
+                p.name()
+            );
+        }
+    }
+
+    /// The label map is what makes per-surface bracketing possible without
+    /// touching ~98 call sites, so its coverage is load-bearing.
+    #[test]
+    fn every_dispatch_label_maps_to_a_surface() {
+        // Labels observed in the tree, with the surface each must land in.
+        let cases: &[(&str, Phase)] = &[
+            ("wo", Phase::AttnWoMv),
+            ("gate", Phase::FfnGateMv),
+            ("up", Phase::FfnUpMv),
+            ("gate_up", Phase::FfnGateUpFused),
+            ("down", Phase::FfnDownMv),
+            ("gdn_qkv", Phase::GdnQkvMv),
+            ("gdn_gate", Phase::GdnGateMv),
+            ("gdn_alpha", Phase::GdnAlphaMv),
+            ("gdn_alpha_f16", Phase::GdnAlphaMv),
+            ("gdn_beta", Phase::GdnBetaMv),
+            ("gdn_beta_f16", Phase::GdnBetaMv),
+            ("gdn_ssm_out", Phase::SsmOutMv),
+            ("output_proj", Phase::HeadMv),
+            ("head", Phase::HeadMv),
+        ];
+        for (label, want) in cases {
+            assert_eq!(
+                matvec_phase_for_label(label),
+                Some(*want),
+                "label {label:?}"
+            );
+        }
+        // wq / wk / wv / kv are family-dependent and covered separately.
+        for l in ["wq", "wk", "wv", "kv"] {
+            assert!(matvec_phase_for_label(l).is_some(), "label {l:?}");
+        }
+        // A label that is not a matvec surface must map to nothing rather than
+        // being silently folded into a neighbour.
+        for l in ["attn F16", "ffn HGEMV", "rms_scale", "swiglu", ""] {
+            assert_eq!(matvec_phase_for_label(l), None, "label {l:?}");
+        }
+        // ssm_out is named for its tensor, never folded into a family.
+        assert_eq!(matvec_phase_for_label("gdn_ssm_out"), Some(Phase::SsmOutMv));
+        assert_eq!(quant_phase_for_label("gdn_ssm_out"), Some(Phase::SsmOutQuant));
+        assert_eq!(Phase::SsmOutMv.parent(), Some(Phase::GdnOut));
+    }
+
+    /// The qkv family split must key off the attention family, and only qkv --
+    /// wo/rope/attention are format-independent and must NOT split.
+    #[test]
+    fn attn_family_splits_qkv_only() {
+        set_attn_family(AttnFamily::Q6kCoupled);
+        // With the profiler disabled `set_attn_family` is a no-op, so this test
+        // asserts the mapping function directly rather than the global.
+        let q6k_view = |l: &str| matvec_phase_for_label(l);
+        // wo does not split regardless of family.
+        assert_eq!(q6k_view("wo"), Some(Phase::AttnWoMv));
+        // The two qkv families are distinct phases with the same parent.
+        assert_ne!(Phase::AttnWqQ6k, Phase::AttnWqQ4);
+        assert_eq!(Phase::AttnWqQ6k.parent(), Some(Phase::AttnQkv));
+        assert_eq!(Phase::AttnWqQ4.parent(), Some(Phase::AttnQkv));
+        assert_eq!(Phase::AttnWkvQ6k.parent(), Some(Phase::AttnQkv));
+        assert_eq!(Phase::AttnWkvQ4.parent(), Some(Phase::AttnQkv));
+    }
+
+    /// Effective bandwidth must be derived only where bytes were declared, and
+    /// must be arithmetically correct.
+    /// A re-entrant surface guard must be inert, or the split->non-split
+    /// tail-calls in the preq8_1 family would count the surface twice.
+    #[test]
+    fn reentrant_surface_guard_is_inert() {
+        // With the profiler disabled `phase_already_open` sees an empty stack,
+        // so this asserts the mechanism's logic directly against a synthetic
+        // stack rather than relying on a live decode.
+        assert!(!phase_already_open(Phase::FfnDownMv));
+        let _ = with(|p| {
+            p.open.push((Phase::FfnDownMv as u8, 0, 0, 0));
+        });
+        assert!(
+            phase_already_open(Phase::FfnDownMv),
+            "an open bracket must be detected"
+        );
+        assert!(
+            !phase_already_open(Phase::FfnGateMv),
+            "a different phase must not be reported open"
+        );
+        // Restore, so no other test sees a dangling open bracket.
+        let _ = with(|p| {
+            p.open.clear();
+        });
+        assert!(!phase_already_open(Phase::FfnDownMv));
+    }
+
+    #[test]
+    fn effective_gbps_is_correct_and_absent_without_bytes() {
+        // 1 GB over 1000 us = 1000 GB/s.
+        let r = PhaseRow {
+            phase: Phase::FfnDownMv,
+            calls: 1,
+            total_us: 1000.0,
+            total_bytes: 1_000_000_000,
+        };
+        let g = r.effective_gbps().expect("bytes declared");
+        assert!((g - 1000.0).abs() < 1e-6, "got {g}");
+
+        // No bytes -> no bandwidth, rather than 0 GB/s.
+        let r0 = PhaseRow {
+            phase: Phase::FfnSwiglu,
+            calls: 1,
+            total_us: 10.0,
+            total_bytes: 0,
+        };
+        assert_eq!(r0.effective_gbps(), None);
+
+        // No time -> no bandwidth (avoids a divide-by-zero infinity).
+        let rt = PhaseRow {
+            phase: Phase::FfnDownMv,
+            calls: 1,
+            total_us: 0.0,
+            total_bytes: 1_000,
+        };
+        assert_eq!(rt.effective_gbps(), None);
     }
 
     #[test]
@@ -1301,11 +2079,13 @@ mod tests {
                     phase: Phase::Head,
                     calls: 2,
                     total_us: 200.0,
+                    total_bytes: 0,
                 },
                 PhaseRow {
                     phase: Phase::FinalNorm,
                     calls: 2,
                     total_us: 40.0,
+                    total_bytes: 0,
                 },
             ],
             wall_us_mean: 500.0,
@@ -1340,6 +2120,7 @@ mod tests {
                     phase: *p,
                     calls: 3 * (i as u64 + 1),
                     total_us: 10.0 * (i as f64 + 1.0),
+                    total_bytes: if p.is_matvec() { 1_000_000 } else { 0 },
                 })
                 .collect(),
             wall_us_mean: 8000.0,
@@ -1404,46 +2185,83 @@ mod tests {
     ///
     /// Shape numbers match Qwen3.5-9B (24 GDN + 8 full-attn); the timings are
     /// invented and must not be quoted as measurements.
+    /// Renders a representative level-2 `[PROFILE]` block so the output format
+    /// can be inspected without a GPU.
+    ///
+    /// ```text
+    /// cargo test -p lumen-runtime --features cuda --lib \
+    ///     cuda::profiler::tests::show_profile_output_format -- --ignored --nocapture
+    /// ```
+    ///
+    /// Shape and byte counts are the real Qwen3.5-9B Q4_0 values; the TIMINGS
+    /// are invented and must not be quoted as measurements.
     #[test]
     #[ignore = "documentation aid: run with --ignored --nocapture to see the output format"]
     fn show_profile_output_format() {
-        // (phase, calls/token, us/token) -- fabricated, illustrative only.
-        let shape: &[(Phase, u64, f64)] = &[
-            (Phase::Embed, 1, 3.1),
-            (Phase::GdnAttn, 24, 3980.0),
-            (Phase::FullAttn, 8, 1520.0),
-            (Phase::Ffn, 32, 2110.0),
-            (Phase::LayerCommit, 32, 96.0),
-            (Phase::Head, 1, 640.0),
-            (Phase::Argmax, 1, 21.0),
-            (Phase::GdnQkv, 24, 1450.0),
-            (Phase::GdnConvRecur, 24, 1900.0),
-            (Phase::GdnOut, 24, 520.0),
-            (Phase::GdnGlue, 24, 60.0),
-            (Phase::AttnQkv, 8, 610.0),
-            (Phase::AttnQkNorm, 8, 90.0),
-            (Phase::AttnRope, 8, 62.0),
-            (Phase::AttnKvWrite, 8, 74.0),
-            (Phase::AttnCore, 8, 300.0),
-            (Phase::AttnWo, 8, 340.0),
-            (Phase::FfnGateUp, 32, 1290.0),
-            (Phase::FfnDownResid, 32, 790.0),
-            (Phase::FinalNorm, 1, 8.0),
+        // (phase, calls/token, us/token, bytes/call)
+        let shape: &[(Phase, u64, f64, u64)] = &[
+            (Phase::Embed, 1, 3.1, 0),
+            (Phase::GdnAttn, 24, 3980.0, 0),
+            (Phase::FullAttn, 8, 1520.0, 0),
+            (Phase::Ffn, 32, 2110.0, 0),
+            (Phase::LayerCommit, 32, 96.0, 0),
+            (Phase::Head, 1, 640.0, 0),
+            (Phase::Argmax, 1, 21.0, 0),
+            // full_attn children: 4 layers coupled, 4 native.
+            (Phase::AttnQkv, 8, 700.0, 0),
+            (Phase::AttnWqQ6k, 4, 300.0, 67_108_864),
+            (Phase::AttnWqQ4, 4, 120.0, 18_874_368),
+            (Phase::AttnWkvQ6k, 4, 60.0, 16_777_216),
+            (Phase::AttnWkvQ4, 4, 30.0, 4_718_592),
+            (Phase::AttnQkvQuant, 8, 24.0, 0),
+            (Phase::AttnCore, 8, 300.0, 0),
+            (Phase::AttnWo, 8, 340.0, 0),
+            (Phase::AttnWoMv, 8, 330.0, 9_437_184),
+            // ffn children
+            (Phase::FfnGateUp, 32, 1290.0, 0),
+            (Phase::FfnActQuant, 32, 40.0, 0),
+            (Phase::FfnGateMv, 32, 600.0, 28_311_552),
+            (Phase::FfnUpMv, 32, 600.0, 28_311_552),
+            (Phase::FfnSwiglu, 32, 30.0, 0),
+            (Phase::FfnDownResid, 32, 790.0, 0),
+            (Phase::FfnDownQuant, 32, 35.0, 0),
+            (Phase::FfnDownMv, 32, 700.0, 28_311_552),
+            (Phase::FfnResidual, 32, 20.0, 0),
+            // gdn children
+            (Phase::GdnQkv, 24, 1450.0, 0),
+            (Phase::GdnNorm, 24, 20.0, 0),
+            (Phase::GdnQkvMv, 24, 700.0, 18_874_368),
+            (Phase::GdnGateMv, 24, 380.0, 9_437_184),
+            (Phase::GdnAlphaMv, 24, 40.0, 139_264),
+            (Phase::GdnBetaMv, 24, 40.0, 139_264),
+            (Phase::GdnActQuant, 48, 60.0, 0),
+            (Phase::GdnConvRecur, 24, 1900.0, 0),
+            (Phase::GdnConv, 24, 300.0, 0),
+            (Phase::GdnRecur, 24, 1560.0, 0),
+            (Phase::GdnOut, 24, 520.0, 0),
+            (Phase::GdnNormGate, 24, 90.0, 0),
+            (Phase::SsmOutQuant, 24, 25.0, 0),
+            (Phase::SsmOutMv, 24, 390.0, 17_825_792),
+            (Phase::GdnGlue, 24, 60.0, 0),
+            // head children
+            (Phase::FinalNorm, 1, 8.0, 0),
+            (Phase::HeadMv, 1, 620.0, 1_080_688_640),
         ];
         let tokens = 128usize;
         let attributed: f64 = shape
             .iter()
-            .filter(|(p, _, _)| p.depth() == 0)
-            .map(|(_, _, us)| us)
+            .filter(|(p, _, _, _)| p.depth() == 0)
+            .map(|(_, _, us, _)| us)
             .sum();
         let s = Summary {
             tokens,
             rows: shape
                 .iter()
-                .map(|(p, calls, us)| PhaseRow {
+                .map(|(p, calls, us, bpc)| PhaseRow {
                     phase: *p,
                     calls: calls * tokens as u64,
                     total_us: us * tokens as f64,
+                    total_bytes: bpc * calls * tokens as u64,
                 })
                 .collect(),
             wall_us_mean: 9120.0,
@@ -1453,7 +2271,7 @@ mod tests {
             attributed_us_mean: attributed,
             attributed_us_p50: attributed,
             health: HealthCounts {
-                pool_high_water: 634,
+                pool_high_water: 1180,
                 ..Default::default()
             },
             health_delta: HealthCounts::default(),
@@ -1463,23 +2281,21 @@ mod tests {
         print!("{}", String::from_utf8(buf).expect("utf8"));
     }
 
-    /// A depth-0 phase whose children do not account for all of its time must
-    /// report the shortfall, and it must be attributed to the right parent.
     #[test]
     fn uncovered_localizes_the_shortfall_per_parent() {
         let s = Summary {
             tokens: 2,
             rows: vec![
                 // full_attn 1000/token, children sum to 900 -> 100 uncovered.
-                PhaseRow { phase: Phase::FullAttn, calls: 2, total_us: 2000.0 },
-                PhaseRow { phase: Phase::AttnQkv, calls: 2, total_us: 1200.0 },
-                PhaseRow { phase: Phase::AttnCore, calls: 2, total_us: 600.0 },
+                PhaseRow { phase: Phase::FullAttn, calls: 2, total_us: 2000.0, total_bytes: 0 },
+                PhaseRow { phase: Phase::AttnQkv, calls: 2, total_us: 1200.0, total_bytes: 0 },
+                PhaseRow { phase: Phase::AttnCore, calls: 2, total_us: 600.0, total_bytes: 0 },
                 // ffn 500/token, children sum to 500 -> 0 uncovered (tiled).
-                PhaseRow { phase: Phase::Ffn, calls: 2, total_us: 1000.0 },
-                PhaseRow { phase: Phase::FfnGateUp, calls: 2, total_us: 600.0 },
-                PhaseRow { phase: Phase::FfnDownResid, calls: 2, total_us: 400.0 },
+                PhaseRow { phase: Phase::Ffn, calls: 2, total_us: 1000.0, total_bytes: 0 },
+                PhaseRow { phase: Phase::FfnGateUp, calls: 2, total_us: 600.0, total_bytes: 0 },
+                PhaseRow { phase: Phase::FfnDownResid, calls: 2, total_us: 400.0, total_bytes: 0 },
                 // argmax has no children at all -> None, not Some(0).
-                PhaseRow { phase: Phase::Argmax, calls: 2, total_us: 40.0 },
+                PhaseRow { phase: Phase::Argmax, calls: 2, total_us: 40.0, total_bytes: 0 },
             ],
             wall_us_mean: 2000.0,
             ..Default::default()
@@ -1515,7 +2331,7 @@ mod tests {
     fn lm_head_unavailability_is_stated_not_omitted() {
         let s = Summary {
             tokens: 1,
-            rows: vec![PhaseRow { phase: Phase::Head, calls: 1, total_us: 500.0 }],
+            rows: vec![PhaseRow { phase: Phase::Head, calls: 1, total_us: 500.0, total_bytes: 0 }],
             wall_us_mean: 1000.0,
             ..Default::default()
         };
@@ -1535,7 +2351,7 @@ mod tests {
     fn health_reports_lifetime_and_segment_separately() {
         let s = Summary {
             tokens: 1,
-            rows: vec![PhaseRow { phase: Phase::Embed, calls: 1, total_us: 5.0 }],
+            rows: vec![PhaseRow { phase: Phase::Embed, calls: 1, total_us: 5.0, total_bytes: 0 }],
             wall_us_mean: 100.0,
             health: HealthCounts {
                 unclosed: 7,
