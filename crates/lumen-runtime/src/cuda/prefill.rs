@@ -507,14 +507,55 @@ pub(crate) unsafe fn launch_gemm_projection(
         // even `=0` enables it). That combination is a diagnostic mistake, not a
         // supported configuration, so it fails loudly and says why rather than
         // silently mis-dispatching.
-        GpuWeightBuf::Q6KRaw(_) => {
-            return Err(RuntimeError::Compute(
-                "Q6_K prefill matmul not implemented: a native-Q6_K weight reached the \
-                 prefill match, which means the F16-cache fast path was bypassed -- \
-                 unset LUMEN_CUDA_PREFILL_F32 (it is presence-parsed, so even =0 sets it) \
-                 or unset LUMEN_CUDA_Q6K_NATIVE / LUMEN_CUDA_LMHEAD_Q6K"
-                    .to_string(),
-            ));
+        GpuWeightBuf::Q6KRaw(w_q6) => {
+            // Native Q6_K on the EXACT-F32 prefill path. Reached when the
+            // F16-cache fast path above was bypassed -- in practice because
+            // `LUMEN_CUDA_PREFILL_F32` is set (note it is presence-parsed, so
+            // even `=0` sets it), or because the weight sits on a GDN layer
+            // where the F16-cache pass early-returns for OOM reasons.
+            //
+            // Dequantize to a true-F32 staging buffer and SGEMM, exactly as the
+            // Q8_0 and Q4_0 arms do under `force_f32`. This does NOT weaken the
+            // exact-F32 contract: the staging buffer carries full-precision F32
+            // decoded from the stored 6-bit codes, which is strictly MORE precise
+            // than the F16 cache the fast path would have used, and the SGEMM
+            // consuming it is unchanged.
+            let num_elements = out_dim * in_dim;
+            if dequant_scratch.len() < num_elements {
+                return Err(RuntimeError::Compute(format!(
+                    "sgemm {label}: dequant scratch too small for Q6_K: have {} elements, \
+                     need {num_elements} (out_dim={out_dim}, in_dim={in_dim})",
+                    dequant_scratch.len(),
+                )));
+            }
+            launch_dequant_q6_k_to_f32(
+                device,
+                kernels,
+                w_q6,
+                dequant_scratch,
+                num_elements,
+                label,
+            )?;
+            let cfg = GemmConfig {
+                transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                m: out_dim as i32,
+                n: batch as i32,
+                k: in_dim as i32,
+                alpha: 1.0f32,
+                lda: in_dim as i32,
+                ldb: in_dim as i32,
+                beta: 0.0f32,
+                ldc: out_dim as i32,
+            };
+            device
+                .blas
+                .gemm(cfg, &*dequant_scratch, input, output)
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "cuBLAS SGEMM fallback (dequant Q6_K) {label}: {e}"
+                    ))
+                })?;
         }
         GpuWeightBuf::F32(w_f32) => {
             let weight_needed = out_dim * in_dim;
@@ -1076,14 +1117,55 @@ pub(crate) unsafe fn launch_gemm_residual(
         // even `=0` enables it). That combination is a diagnostic mistake, not a
         // supported configuration, so it fails loudly and says why rather than
         // silently mis-dispatching.
-        GpuWeightBuf::Q6KRaw(_) => {
-            return Err(RuntimeError::Compute(
-                "Q6_K prefill matmul not implemented: a native-Q6_K weight reached the \
-                 prefill match, which means the F16-cache fast path was bypassed -- \
-                 unset LUMEN_CUDA_PREFILL_F32 (it is presence-parsed, so even =0 sets it) \
-                 or unset LUMEN_CUDA_Q6K_NATIVE / LUMEN_CUDA_LMHEAD_Q6K"
-                    .to_string(),
-            ));
+        GpuWeightBuf::Q6KRaw(w_q6) => {
+            // Native Q6_K on the EXACT-F32 prefill path. Reached when the
+            // F16-cache fast path above was bypassed -- in practice because
+            // `LUMEN_CUDA_PREFILL_F32` is set (note it is presence-parsed, so
+            // even `=0` sets it), or because the weight sits on a GDN layer
+            // where the F16-cache pass early-returns for OOM reasons.
+            //
+            // Dequantize to a true-F32 staging buffer and SGEMM, exactly as the
+            // Q8_0 and Q4_0 arms do under `force_f32`. This does NOT weaken the
+            // exact-F32 contract: the staging buffer carries full-precision F32
+            // decoded from the stored 6-bit codes, which is strictly MORE precise
+            // than the F16 cache the fast path would have used, and the SGEMM
+            // consuming it is unchanged.
+            let num_elements = out_dim * in_dim;
+            if dequant_scratch.len() < num_elements {
+                return Err(RuntimeError::Compute(format!(
+                    "sgemm {label}: dequant scratch too small for Q6_K: have {} elements, \
+                     need {num_elements} (out_dim={out_dim}, in_dim={in_dim})",
+                    dequant_scratch.len(),
+                )));
+            }
+            launch_dequant_q6_k_to_f32(
+                device,
+                kernels,
+                w_q6,
+                dequant_scratch,
+                num_elements,
+                label,
+            )?;
+            let cfg = GemmConfig {
+                transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                m: out_dim as i32,
+                n: batch as i32,
+                k: in_dim as i32,
+                alpha: 1.0f32,
+                lda: in_dim as i32,
+                ldb: in_dim as i32,
+                beta: 0.0f32,
+                ldc: out_dim as i32,
+            };
+            device
+                .blas
+                .gemm(cfg, &*dequant_scratch, input, output)
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "cuBLAS SGEMM fallback (dequant Q6_K) {label}: {e}"
+                    ))
+                })?;
         }
         GpuWeightBuf::F32(w_f32) => {
             let weight_needed = out_dim * in_dim;
@@ -2225,6 +2307,66 @@ unsafe fn launch_dequant_q8_0_to_f32(
 ///
 /// `q4_data` must contain valid Q4_0 blocks. `f32_out` must have at least
 /// `num_elements` elements.
+/// Dequantize Q6_K weights to an F32 staging buffer for cuBLAS SGEMM.
+///
+/// The sibling of [`launch_dequant_q4_0_to_f32`] for the exact-F32 prefill path
+/// (`LUMEN_CUDA_PREFILL_F32`), which bypasses the F16-cache fast path and needs
+/// a true-F32 weight. Q6_K previously had no such staging, so a native-Q6_K
+/// `attn_q` (candidate C1) aborted prefill on the "not implemented" arm.
+///
+/// Grid is one CTA per 256-element super-block, 64 threads each, matching ggml's
+/// `dequantize_block_q6_K`. Requires `num_elements % 256 == 0`, which every
+/// K-quant tensor satisfies by construction.
+///
+/// # Safety
+/// Caller must ensure `f32_out` holds at least `num_elements` floats and
+/// `q6k_data` holds at least `num_elements / 256 * 210` bytes.
+unsafe fn launch_dequant_q6_k_to_f32(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    q6k_data: &CudaSlice<u8>,
+    f32_out: &mut CudaSlice<f32>,
+    num_elements: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    const Q6K_BLOCK_ELEM: usize = 256;
+    const Q6K_BLOCK_BYTE: usize = 210;
+    let f = kernels.dequant_q6_k_to_f32.as_ref().ok_or_else(|| {
+        RuntimeError::Compute(format!(
+            "dequant_q6_k_to_f32 unavailable for {label}: a native-Q6_K weight needs \
+             F32 staging for the LUMEN_CUDA_PREFILL_F32 path but the kernel failed to compile"
+        ))
+    })?;
+    if num_elements % Q6K_BLOCK_ELEM != 0 {
+        return Err(RuntimeError::Compute(format!(
+            "dequant_q6_k_to_f32 {label}: {num_elements} elements is not a multiple of 256"
+        )));
+    }
+    let n_blocks = num_elements / Q6K_BLOCK_ELEM;
+    if q6k_data.len() < n_blocks * Q6K_BLOCK_BYTE {
+        return Err(RuntimeError::Compute(format!(
+            "dequant_q6_k_to_f32 {label}: weight has {} bytes, needs {}",
+            q6k_data.len(),
+            n_blocks * Q6K_BLOCK_BYTE
+        )));
+    }
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (n_blocks as u32, 1, 1),
+        block_dim: (64, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n = num_elements as u32;
+    device
+        .stream
+        .launch_builder(f)
+        .arg(q6k_data)
+        .arg(f32_out)
+        .arg(&n)
+        .launch(launch_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("dequant_q6_k_to_f32 {label}: {e}")))?;
+    Ok(())
+}
+
 unsafe fn launch_dequant_q4_0_to_f32(
     device: &CudaDevice,
     kernels: &KernelSet,

@@ -350,6 +350,8 @@ pub fn read_output_proj_global(
     let expected_q8_bytes = (n_elements / 32) * 34;
     let expected_q4_bytes = (n_elements / 32) * 18;
     let expected_f16_bytes = n_elements * 2;
+    // Q6_K: 210 bytes per 256-element super-block = 0.8203 B/weight.
+    let expected_q6k_bytes = (n_elements / 256) * 210;
 
     if raw_bytes.len() == expected_f32_bytes {
         let f32_data = bytes_to_f32(&raw_bytes);
@@ -369,6 +371,55 @@ pub fn read_output_proj_global(
     } else if raw_bytes.len() == expected_q4_bytes {
         let f32_data = dequantize_q4_0_to_f32(&raw_bytes, n_elements);
         (f32_data, raw_bytes, QuantScheme::Q4_0)
+    } else if raw_bytes.len() == expected_q6k_bytes {
+        // Native Q6_K head (candidate C3, `LUMEN_CUDA_LMHEAD_Q6K=1` at convert).
+        //
+        // WITHOUT this arm a Q6_K `output.weight` fell to the `else` below and was
+        // reported as `QuantScheme::F32` with an EMPTY raw vector. Three silent
+        // consequences, all observed on the A100:
+        //
+        //  1. `set_model_dense_quant(F32)` -> HINT_UNSET, so the audited decode
+        //     battery refused with "model-aware setters not resolved
+        //     (dense_hint=unset)" / exit 26. That refusal is CORRECT fail-closed
+        //     behaviour -- unset hints route to legacy kernels -- and it is the
+        //     only reason this defect was caught rather than measured.
+        //     `set_model_dense_quant` itself already maps Q6_K -> HINT_QUANTISED,
+        //     identical to Q8_0; it was never reached with the true scheme.
+        //  2. `output_proj_raw` came back EMPTY, so `run.rs`'s
+        //     `!output_proj_raw.is_empty()` guard failed, `set_output_proj_raw`
+        //     was never called, `output_proj_q6k` stayed `None`, and **C3's kernel
+        //     never dispatched at all.** The lever was a silent no-op.
+        //  3. `bytes_to_f32` reinterpreted 210-byte super-blocks as F32, producing
+        //     a vector ~4.9x SHORTER than `vocab * hidden` (208,588,800 vs
+        //     1,017,118,720 on 9B) -- garbage or an out-of-bounds read for any
+        //     consumer that touched it.
+        //
+        // Length inference is unambiguous: the five schemes have pairwise distinct
+        // bytes-per-weight (4.0 / 2.0 / 1.0625 / 0.8203 / 0.5625), so no other
+        // format yields this length. No existing LBC can reach this arm either --
+        // convert requantized every K-quant head to Q8_0 until C3, and a C3 LBC
+        // carries a `-q6khead` filename.
+        //
+        // The F32 fallback vector uses the CORRECT ggml mapping via `q6k_ref`, so
+        // this arm is right in BOTH C3 flag states: with the runtime flag on,
+        // `set_output_proj_raw` consumes `raw_bytes` and the F32 vector is unused;
+        // with it off, the F32 vector is what gets used, and it is now accurate
+        // rather than garbage.
+        let mut f32_data = vec![0.0f32; n_elements];
+        let mut scratch = [0.0f32; crate::q6k_ref::Q6K_BLOCK_ELEM];
+        for (b, chunk) in raw_bytes
+            .chunks_exact(crate::q6k_ref::Q6K_BLOCK_BYTE)
+            .enumerate()
+        {
+            let base = b * crate::q6k_ref::Q6K_BLOCK_ELEM;
+            if base >= n_elements {
+                break;
+            }
+            crate::q6k_ref::dequant_block(chunk, &mut scratch);
+            let take = (n_elements - base).min(scratch.len());
+            f32_data[base..base + take].copy_from_slice(&scratch[..take]);
+        }
+        (f32_data, raw_bytes, QuantScheme::Q6_K)
     } else {
         // Unknown format -- try F32 interpretation (backward compat)
         let f32_data = bytes_to_f32(&raw_bytes);
@@ -996,5 +1047,167 @@ mod tests {
             "resolved ssm_out must lie within the resolved (raw) blob — the \
              get_layer_blocking path would leave it overrunning",
         );
+    }
+}
+
+/// Regression tests for the C3 native-Q6_K head (`LUMEN_CUDA_LMHEAD_Q6K`).
+///
+/// Both failures below were reproduced on an A100 and were invisible to all 619
+/// existing lib tests, because nothing exercised `read_output_proj_global` with a
+/// Q6_K-length buffer.
+#[cfg(test)]
+mod q6k_output_proj_tests {
+    use super::*;
+    use crate::runtime_defaults;
+
+    /// Build a Q6_K byte stream of `n_elements` weights with non-trivial content:
+    /// distinct nibbles per byte and non-zero signed scales, so a wrong element
+    /// mapping cannot hide.
+    fn synth_q6k(n_elements: usize) -> Vec<u8> {
+        assert_eq!(n_elements % 256, 0);
+        let mut out = Vec::with_capacity(n_elements / 256 * 210);
+        for b in 0..(n_elements / 256) {
+            // ql: low nibble != high nibble
+            for i in 0..128 {
+                out.push((((i + b) % 15) as u8) | ((((i + 7 + b) % 15) as u8) << 4));
+            }
+            // qh: all four 2-bit fields distinct
+            for i in 0..64 {
+                out.push(((i + b) % 256) as u8);
+            }
+            // scales: non-zero, alternating sign
+            for i in 0..16 {
+                let mag = 1 + ((i + b) % 100) as i8;
+                out.push((if i % 2 == 0 { mag } else { -mag }) as u8);
+            }
+            out.extend_from_slice(&0x3C00u16.to_le_bytes()); // f16 1.0
+        }
+        out
+    }
+
+    /// THE defect. A Q6_K-length `output.weight` must be recognised as Q6_K and
+    /// must return its raw bytes.
+    ///
+    /// Before the fix it fell through to the "unknown format" arm and returned
+    /// `(garbage_f32, Vec::new(), QuantScheme::F32)`, which (a) made
+    /// `set_model_dense_quant(F32)` leave the dense hint UNSET so the audited
+    /// battery refused with exit 26, and (b) left `output_proj_raw` EMPTY so
+    /// `set_output_proj_raw` was never called and C3's kernel never dispatched.
+    #[test]
+    fn q6k_output_proj_is_recognised_and_keeps_its_raw_bytes() {
+        let vocab = 512usize;
+        let hidden = 256usize;
+        let n = vocab * hidden;
+        let raw = synth_q6k(n);
+        assert_eq!(raw.len(), n / 256 * 210, "synth length");
+
+        let (f32_data, raw_out, scheme) =
+            read_output_proj_global(raw.clone(), vocab, hidden, QuantScheme::Q6_K);
+
+        assert_eq!(
+            scheme,
+            QuantScheme::Q6_K,
+            "a Q6_K-length head must report Q6_K, not F32 -- reporting F32 leaves \
+             MODEL_DENSE_QUANT_HINT unset and the decode battery refuses (exit 26)"
+        );
+        assert!(
+            !raw_out.is_empty(),
+            "raw bytes must survive -- run.rs guards set_output_proj_raw on \
+             !output_proj_raw.is_empty(), so an empty vec silently disables C3"
+        );
+        assert_eq!(
+            raw_out.len(),
+            raw.len(),
+            "raw bytes must be passed through intact"
+        );
+        assert_eq!(
+            f32_data.len(),
+            n,
+            "the F32 fallback must be vocab*hidden long; the old bytes_to_f32 \
+             reinterpretation produced a vector ~4.9x too short"
+        );
+    }
+
+    /// The F32 fallback vector must carry the CORRECT ggml-mapped values, because
+    /// it is what gets used when the LBC has a Q6_K head but the runtime flag is
+    /// off. Cross-checked against `q6k_ref::dequant_block`, which is itself
+    /// verified against the ggml packer.
+    #[test]
+    fn q6k_output_proj_f32_fallback_uses_the_ggml_mapping() {
+        let vocab = 4usize;
+        let hidden = 256usize;
+        let n = vocab * hidden;
+        let raw = synth_q6k(n);
+        let (f32_data, _, _) =
+            read_output_proj_global(raw.clone(), vocab, hidden, QuantScheme::Q6_K);
+
+        let mut want = vec![0.0f32; n];
+        let mut scratch = [0.0f32; crate::q6k_ref::Q6K_BLOCK_ELEM];
+        for b in 0..(n / 256) {
+            crate::q6k_ref::dequant_block(&raw[b * 210..], &mut scratch);
+            want[b * 256..(b + 1) * 256].copy_from_slice(&scratch);
+        }
+        assert_eq!(
+            f32_data, want,
+            "F32 fallback must match the verified reference"
+        );
+        assert!(
+            want.iter().any(|v| *v != 0.0),
+            "test data must be non-trivial or it proves nothing"
+        );
+    }
+
+    /// The hint mapping the battery depends on. `set_model_dense_quant` must
+    /// resolve the snapshot for a Q6_K head to the SAME hint a requant-Q8_0 head
+    /// produced, so that no non-lm_head kernel-family selection changes.
+    ///
+    /// `dense_hint` is a three-valued tag (`"bf16"` / `"quantised"` / `"unset"`)
+    /// and `Q8_0` already maps to `"quantised"`, so `"quantised"` is exactly
+    /// "behaves as it did before C3". `"unset"` is the failure the battery caught.
+    #[test]
+    fn q6k_head_resolves_the_dense_hint_like_q8_0() {
+        // `MODEL_DENSE_QUANT_HINT` is a process-global atomic with no getter for
+        // the raw tag, so capture the observable state and restore it at the end.
+        // Verified no other test in this crate reads or writes the dense hint.
+        let (original_hint, ..) = runtime_defaults::model_setter_snapshot();
+
+        runtime_defaults::set_model_dense_quant(QuantScheme::Q8_0);
+        let (q8_hint, ..) = runtime_defaults::model_setter_snapshot();
+
+        runtime_defaults::set_model_dense_quant(QuantScheme::Q6_K);
+        let (q6_hint, ..) = runtime_defaults::model_setter_snapshot();
+
+        assert_ne!(
+            q6_hint, "unset",
+            "a Q6_K head must resolve the dense hint; 'unset' routes to LEGACY \
+             kernels and the audited battery refuses to measure (exit 26)"
+        );
+        assert_eq!(
+            q6_hint, q8_hint,
+            "Q6_K must produce the SAME hint as the requant-Q8_0 head it replaces, \
+             so no non-lm_head kernel-family selection changes"
+        );
+        assert_eq!(q6_hint, "quantised");
+
+        // Every other K-quant class the converter can emit must behave the same.
+        for scheme in [
+            QuantScheme::Q2_K,
+            QuantScheme::Q3_K,
+            QuantScheme::Q4_K,
+            QuantScheme::Q5_K,
+        ] {
+            runtime_defaults::set_model_dense_quant(scheme);
+            let (h, ..) = runtime_defaults::model_setter_snapshot();
+            assert_eq!(h, "quantised", "{scheme:?} must resolve the hint");
+        }
+
+        // Restore whatever the process had before, so this test leaves no trace.
+        runtime_defaults::set_model_dense_quant(match original_hint {
+            "bf16" => QuantScheme::Bf16,
+            "quantised" => QuantScheme::Q8_0,
+            _ => QuantScheme::F32, // maps back to HINT_UNSET
+        });
+        let (restored, ..) = runtime_defaults::model_setter_snapshot();
+        assert_eq!(restored, original_hint, "test must restore the global hint");
     }
 }

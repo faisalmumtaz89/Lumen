@@ -745,6 +745,46 @@ mod tests {
         }
     }
 
+    /// Every kernel symbol the CUDA loaders request must actually EXIST in the
+    /// shader source.
+    ///
+    /// This guards the exact trap that has cost this repo debug cycles twice: a
+    /// `load_fn(SOURCE, "name")` call is evidence that someone INTENDED a kernel,
+    /// not that one exists. `LUMEN_CUDA_GDN_FUSED_CONV` was reported as a live
+    /// default-off lever on the strength of its loader call alone, while
+    /// `ssm_conv1d_silu_l2norm_t1` existed in no `.cu` file at all -- so the flag
+    /// was unsatisfiable at any value and the kernel handle was permanently
+    /// `None`.
+    ///
+    /// The shader is `include_str!`d here rather than referenced through
+    /// `cuda::shaders`, because that module is `cfg(feature = "cuda")`-gated and
+    /// would make this check invisible on the default test command -- which is
+    /// precisely how such a gap survives.
+    #[test]
+    fn every_requested_kernel_symbol_exists_in_the_shader() {
+        const SRC: &str = include_str!("cuda/shaders/matvec_q6_k_f32.cu");
+        for sym in [
+            "matvec_q6_k_f32",     // NR=1, layer projections (C1)
+            "matvec_q6_k_f32_nr8", // NR=8, the [248320 x 4096] head (C3)
+            "dequant_q6_k_to_f32", // F32 staging for the exact-F32 prefill path
+        ] {
+            let decl = format!("void {sym}(");
+            assert!(
+                SRC.contains(&decl),
+                "decode.rs asks load_fn for kernel '{sym}' but no `void {sym}(` \
+                 definition exists in matvec_q6_k_f32.cu -- the handle would be \
+                 permanently None and the flag silently inert"
+            );
+        }
+        // Each must be an extern "C" entry point, or NVRTC name-mangles it and
+        // `load_function` fails to resolve the symbol at runtime.
+        assert_eq!(
+            SRC.matches("extern \"C\" __global__").count(),
+            3,
+            "all three kernels must be extern \"C\" __global__ entry points"
+        );
+    }
+
     /// A zero `d` (the packer's all-zero-block escape) must produce zeros, not
     /// NaN, through the whole path.
     #[test]

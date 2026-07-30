@@ -299,3 +299,66 @@ void matvec_q6_k_f32_nr8(
 {
     matvec_q6_k_f32_impl<8>(weight, x, out, out_dim, in_dim);
 }
+
+// ==========================================================================
+// dequant_q6_k_to_f32: Q6_K -> F32 staging for the EXACT-F32 PREFILL path.
+//
+// WHY THIS EXISTS
+//
+// `launch_gemm_projection` / `launch_gemm_residual` have an F16-cache fast path
+// that normally serves a native-Q6_K weight during prefill. `LUMEN_CUDA_
+// PREFILL_F32` disables that fast path (it is presence-parsed, so even `=0`
+// enables the bypass) and forces every projection through cuBLAS SGEMM-F32
+// against a dequantized F32 staging buffer. Q8_0 and Q4_0 already have
+// `launch_dequant_q8_0_to_f32` / `launch_dequant_q4_0_to_f32` for exactly this;
+// Q6_K did not, so a native-Q6_K `attn_q` hit the "not implemented" arm and
+// aborted prefill. This is the missing sibling.
+//
+// It does NOT weaken the exact-F32 contract: the output is true F32, dequantized
+// at full precision from the stored 6-bit codes, which is strictly MORE precise
+// than the F16 cache the fast path would have used. The SGEMM that consumes it
+// is unchanged.
+//
+// MAPPING: term-for-term ggml `dequantize_block_q6_K`
+// (ggml/src/ggml-cuda/convert.cu:270-294 @ 3b53219), i.e. the CORRECT pairing --
+// ql[l] low -> element l, ql[l+32] low -> l+32, ql[l] high -> l+64,
+// ql[l+32] high -> l+96. See the header of this file and `q6k_ref` for why the
+// natural reading is wrong.
+//
+// Grid:  (n_blocks, 1, 1)   one CTA per 256-element super-block
+// Block: (64, 1, 1)         ip = tid/32 selects the half, il = tid%32
+// ==========================================================================
+extern "C" __global__ void dequant_q6_k_to_f32(
+    const unsigned char* __restrict__ w,
+    float* __restrict__ y,
+    unsigned int n_elements)
+{
+    const unsigned long long ib = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int ip  = tid >> 5;        // 0 or 1: which 128-element half
+    const unsigned int il  = tid & 31u;       // 0..31 within the half
+
+    const unsigned char* bp = w + ib * (unsigned long long)Q6K_BLOCK_BYTE;
+    const unsigned long long base =
+        ib * (unsigned long long)Q6K_BLOCK_ELEM + 128ull * ip + il;
+
+    const float d = q6k_f16_to_f32(
+        (unsigned short)(bp[208] | ((unsigned short)bp[209] << 8)));
+
+    const unsigned char* ql = bp + 64u * ip + il;
+    const unsigned char  qh = bp[128u + 32u * ip + il];
+    const signed char*   sc = (const signed char*)(bp + 192u + 8u * ip + (il >> 4));
+
+    if (base +  0ull < n_elements)
+        y[base +  0ull] = d * (float)sc[0]
+            * (float)((int)((ql[ 0] & 0x0F) | (((qh >> 0) & 3) << 4)) - 32);
+    if (base + 32ull < n_elements)
+        y[base + 32ull] = d * (float)sc[2]
+            * (float)((int)((ql[32] & 0x0F) | (((qh >> 2) & 3) << 4)) - 32);
+    if (base + 64ull < n_elements)
+        y[base + 64ull] = d * (float)sc[4]
+            * (float)((int)((ql[ 0] >>   4) | (((qh >> 4) & 3) << 4)) - 32);
+    if (base + 96ull < n_elements)
+        y[base + 96ull] = d * (float)sc[6]
+            * (float)((int)((ql[32] >>   4) | (((qh >> 6) & 3) << 4)) - 32);
+}

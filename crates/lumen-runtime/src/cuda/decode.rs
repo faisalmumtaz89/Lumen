@@ -486,6 +486,10 @@ pub(crate) struct KernelSet {
     // baseline PTX only, no dp4a.
     pub(crate) matvec_q6_k_f32: Option<CudaFunction>,
     pub(crate) matvec_q6_k_f32_nr8: Option<CudaFunction>,
+    // Q6_K -> F32 staging dequant for the exact-F32 PREFILL path
+    // (`LUMEN_CUDA_PREFILL_F32`), the sibling of dequant_q8_0_to_f32 /
+    // dequant_q4_0_to_f32. Without it a native-Q6_K weight aborts prefill.
+    pub(crate) dequant_q6_k_to_f32: Option<CudaFunction>,
     pub(crate) matvec_q4_split_f32_lane: Option<CudaFunction>,
     pub(crate) matvec_q4_split_f32_lane_residual: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_residual: Option<CudaFunction>,
@@ -1823,6 +1827,23 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                     eprintln!("[Q6K] matvec_q6_k_f32_nr8: NVRTC FAILED (flag armed): {e}");
                 } else {
                     cuda_log!("[CUDA] matvec_q6_k_f32_nr8: FAILED: {e}");
+                }
+                None
+            }
+        },
+        dequant_q6_k_to_f32: match load_fn(
+            shaders::MATVEC_Q6_K_F32_KERNEL_SOURCE,
+            "dequant_q6_k_to_f32",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] dequant_q6_k_to_f32: OK");
+                Some(f)
+            }
+            Err(e) => {
+                if crate::runtime_defaults::q6k_native() || crate::runtime_defaults::lmhead_q6k() {
+                    eprintln!("[Q6K] dequant_q6_k_to_f32: NVRTC FAILED (flag armed): {e}");
+                } else {
+                    cuda_log!("[CUDA] dequant_q6_k_to_f32: FAILED: {e}");
                 }
                 None
             }
