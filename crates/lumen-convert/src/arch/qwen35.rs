@@ -894,6 +894,69 @@ mod ssm_out_target_tests {
         }
     }
 
+    /// C4 SCOPE: armed, the gate must restore the GGUF's MIXED source formats --
+    /// 12 Q4_0 + 12 Q8_0 across the 24 GDN layers of Qwen3.5-9B-Q4_0 -- i.e.
+    /// source==target passthrough for every layer. NOT a floor (all 24 -> Q8_0,
+    /// which is the unarmed behaviour and saves nothing) and NOT a blanket
+    /// conversion (all 24 -> Q4_0, which would push the 12 Q8_0 layers DOWN in
+    /// precision inside the GDN recurrence -- a quality change nobody asked for
+    /// and exactly what the 2026-06-10 measurement warns about).
+    ///
+    /// Passthrough matters beyond byte count: `append_tensor_to_blob_requant`
+    /// short-circuits when `tensor.ggml_type.to_lbc_quant() == Some(target)`, so
+    /// source==target copies the raw bytes with NO lossy dequant/requant round
+    /// trip. A blanket Q4_0 would instead requantize all 24.
+    #[test]
+    fn armed_restores_the_mixed_source_formats() {
+        if !crate::env_gates::ssmout_native() {
+            eprintln!("skipping: LUMEN_CUDA_SSMOUT_NATIVE is not set in this environment");
+            return;
+        }
+        // The 24 GDN layers of Qwen3.5-9B (the full-attention layers are
+        // 3/7/11/15/19/23/27/31 and carry no ssm_out), and the GGUF's own split:
+        // ssm_out is Q8_0 on 0,1,2,6,10,14,18,22,26,28,29,30, Q4_0 on the rest.
+        // NOTE these are MODEL layer numbers, not 0..24 indices -- a first cut of
+        // this test iterated 0..24 and got a 16/8 split, which is why the
+        // assertion below is on the counted mix and not just on passthrough.
+        let gdn_layers: [u32; 24] = [
+            0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 20, 21, 22, 24, 25, 26, 28, 29, 30,
+        ];
+        let q8_layers = [0, 1, 2, 6, 10, 14, 18, 22, 26, 28, 29, 30];
+        let mut n_q4 = 0;
+        let mut n_q8 = 0;
+        for layer in gdn_layers {
+            let src = if q8_layers.contains(&layer) {
+                QuantScheme::Q8_0
+            } else {
+                QuantScheme::Q4_0
+            };
+            let got = ssm_out_target(None, Some(src));
+            assert_eq!(
+                got,
+                Some(src),
+                "layer {layer}: armed C4 must PASS THROUGH the source format \
+                 (got {got:?}, source {src:?})"
+            );
+            match src {
+                QuantScheme::Q4_0 => n_q4 += 1,
+                _ => n_q8 += 1,
+            }
+        }
+        assert_eq!((n_q4, n_q8), (12, 12), "the 9B split is 12 Q4_0 + 12 Q8_0");
+
+        // Explicitly rule out the two wrong shapes.
+        assert_ne!(
+            ssm_out_target(None, Some(QuantScheme::Q4_0)),
+            Some(QuantScheme::Q8_0),
+            "armed C4 must not re-apply the floor to a Q4_0 source"
+        );
+        assert_ne!(
+            ssm_out_target(None, Some(QuantScheme::Q8_0)),
+            Some(QuantScheme::Q4_0),
+            "armed C4 must not blanket-convert a Q8_0 source down to Q4_0"
+        );
+    }
+
     /// When armed, the result is the tensor's OWN stored format for the two
     /// schemes that have shape arms, so the write path takes its
     /// `source == target` short-circuit and copies raw bytes -- no lossy
