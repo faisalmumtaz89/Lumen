@@ -1182,6 +1182,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_FFN_FUSED_GLU",
     "LUMEN_CUDA_FORCE_SCALAR_ATTN",
     "LUMEN_CUDA_GDN_AB_F16",
+    "LUMEN_CUDA_GDN_AB_FUSED",
     "LUMEN_CUDA_GDN_AB_F32",
     "LUMEN_CUDA_GDN_CONVSTATE_PARITY",
     "LUMEN_CUDA_GDN_DECODE_MEGAKERNEL_F64",
@@ -2400,6 +2401,7 @@ mod tests {
         "LUMEN_CUDA_FFN_FUSED_GLU",
         "LUMEN_CUDA_FORCE_SCALAR_ATTN",
         "LUMEN_CUDA_GDN_AB_F16",
+        "LUMEN_CUDA_GDN_AB_FUSED",
         "LUMEN_CUDA_GDN_AB_F32",
         "LUMEN_CUDA_GDN_CONVSTATE_PARITY",
         "LUMEN_CUDA_GDN_DECODE_MEGAKERNEL_F64",
@@ -3329,13 +3331,62 @@ pub fn q6k_report_armed_flags() {
         let dp4a = q6k_dp4a();
         let head = lmhead_q6k();
         let fix = q6k_layout_fix();
-        if native || dp4a || head || fix {
+        let ab = gdn_ab_fused();
+        if native || dp4a || head || fix || ab {
             eprintln!(
-                "[Q6K] ARMED: NATIVE={} DP4A={} LMHEAD={} LAYOUT_FIX={}",
-                native as u8, dp4a as u8, head as u8, fix as u8
+                "[Q6K] ARMED: NATIVE={} DP4A={} LMHEAD={} LAYOUT_FIX={} GDN_AB_FUSED={}",
+                native as u8, dp4a as u8, head as u8, fix as u8, ab as u8
             );
         }
     });
+}
+
+/// `LUMEN_CUDA_GDN_AB_FUSED=1` (candidate G1) — collapse the GDN `ssm_alpha` and
+/// `ssm_beta` projections into ONE quantize + ONE matvec per layer.
+///
+/// # What the profile found
+///
+/// `ssm_alpha` and `ssm_beta` are both force-requantized to Q8_0 at convert (the
+/// runtime's GDN gate matvec is Q8_0-only), so each takes the Q8Raw dp4a ladder
+/// inside `launch_matvec_ext`: `quantize_q8_1_rawsum` + `mul_mat_vec_q_q8_0`.
+/// Both quantize the IDENTICAL `scratch.normed`. A layer therefore pays FOUR
+/// launches where two would do, and 24 GDN layers pay 96 per token — the r2
+/// audit's §8.10, now confirmed by the level-2 profile as
+/// `gdn_act_quant` at 48 calls/token.
+///
+/// These projections are [hidden_dim -> num_heads], ~139 KB of weights, and the
+/// profile measured 13.2 GB/s effective against 579 GB/s for `gdn_qkv_mv` under
+/// the same bracket cost and the same 24 calls/token. They are
+/// LAUNCH-LATENCY-BOUND, not bandwidth-bound, so the lever is launch count.
+///
+/// # Note on the activation plan
+///
+/// These weights are `Q8Raw`, and the Q8 ladder is evaluated BEFORE the Q4
+/// activation plan is consulted, so alpha/beta run int8 Q8_1 activations on EVERY
+/// config — including `no_gdn`, where the Q4 GDN families are pinned to F32. The
+/// plan does not reach them. That is why this is an int8 fusion and not an F32
+/// one, and it is also the §8.2 "outside the plan entirely" finding.
+///
+/// # Numerics
+///
+/// BIT-IDENTICAL. The fused kernel selects its (weight, destination) pair from
+/// `blockIdx.y` and is otherwise verbatim `mul_mat_vec_q_q8_0`, so each row keeps
+/// the same lane assignment, K-block stride, dot order and reduction. Nothing is
+/// reassociated; only the host's launch count changes. Golden anchors and DET are
+/// unaffected by construction rather than by measurement.
+pub fn gdn_ab_fused() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = campaign_flag("LUMEN_CUDA_GDN_AB_FUSED");
+        if on {
+            eprintln!(
+                "[GDN] AB_FUSED=ON: ssm_alpha+ssm_beta share one quantize and one \
+                 matvec launch per layer (4 -> 2; 96 -> 48 per token)"
+            );
+        }
+        on
+    })
 }
 
 /// `LUMEN_CUDA_Q6K_DP4A=1` (candidate C1b) — dispatch native Q6_K weights

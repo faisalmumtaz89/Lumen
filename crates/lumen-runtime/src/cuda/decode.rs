@@ -498,6 +498,10 @@ pub(crate) struct KernelSet {
     // MUST load via load_fn_sm80_fast_math: NVRTC's default arch is below sm_61
     // and would reject `dp4a.s32.s32`, leaving this None and the flag inert.
     pub(crate) matvec_q6_k_q8_1: Option<CudaFunction>,
+    // Fused GDN alpha+beta: two Q8_0 matvecs sharing one Q8_1 activation
+    // (`LUMEN_CUDA_GDN_AB_FUSED=1`). Lives in mmv_q.cu and so loads via
+    // load_fn_sm61, the same class as its dp4a siblings in that file.
+    pub(crate) mul_mat_vec_q_q8_0_ab_fused: Option<CudaFunction>,
     pub(crate) matvec_q4_split_f32_lane: Option<CudaFunction>,
     pub(crate) matvec_q4_split_f32_lane_residual: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_residual: Option<CudaFunction>,
@@ -2931,6 +2935,23 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] mul_mat_vec_q_q8_0: FAILED: {e}");
+                None
+            }
+        },
+        mul_mat_vec_q_q8_0_ab_fused: match load_fn_sm61(
+            shaders::MMV_Q_DP4A_KERNEL_SOURCE,
+            "mul_mat_vec_q_q8_0_ab_fused",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] mul_mat_vec_q_q8_0_ab_fused: OK");
+                Some(f)
+            }
+            Err(e) => {
+                if crate::runtime_defaults::gdn_ab_fused() {
+                    eprintln!("[GDN] mul_mat_vec_q_q8_0_ab_fused: NVRTC FAILED (flag armed): {e}");
+                } else {
+                    cuda_log!("[CUDA] mul_mat_vec_q_q8_0_ab_fused: FAILED: {e}");
+                }
                 None
             }
         },

@@ -5693,6 +5693,111 @@ impl CudaBackend {
                         cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
                     )?;
                 }
+            } else if crate::runtime_defaults::gdn_ab_fused()
+                && matches!(ssm_alpha_w, GpuWeightBuf::Q8Raw(_))
+                && matches!(ssm_beta_w, GpuWeightBuf::Q8Raw(_))
+                && st.kernels.mul_mat_vec_q_q8_0_ab_fused.is_some()
+                && st.kernels.quantize_q8_1_rawsum.is_some()
+                && st.scratch.input_q8_1.is_some()
+                && hidden_dim % 32 == 0
+            {
+                // === G1: fused GDN alpha+beta (LUMEN_CUDA_GDN_AB_FUSED=1) ===
+                //
+                // Default-OFF path. The `else` below is the shipped behaviour and
+                // is left byte-for-byte intact; this branch is an addition, and
+                // its guard's FIRST conjunct is the cached flag, so unarmed builds
+                // skip it on a bool load.
+                //
+                // WHAT IT REPLACES. Both weights are Q8Raw (force-requantized at
+                // convert because the GDN gate matvec is Q8_0-only), so each
+                // `launch_matvec` below enters the Q8Raw dp4a ladder and issues
+                // `quantize_q8_1_rawsum` + `mul_mat_vec_q_q8_0` on the IDENTICAL
+                // `scratch.normed`. Four launches per layer, 96 per token across
+                // 24 GDN layers (r2 audit §8.10; level-2 profile shows
+                // `gdn_act_quant` at 48 calls/token, i.e. the duplicate).
+                //
+                // These are [hidden_dim -> num_heads] projections, ~139 KB of
+                // weights, measured at 13.2 GB/s effective against 579 GB/s for
+                // `gdn_qkv_mv` under the same bracket and call count. They are
+                // launch-latency-bound, so launch count IS the lever.
+                //
+                // Here: quantize ONCE, then one fused matvec whose `blockIdx.y`
+                // picks alpha or beta. Two launches per layer, 48 per token.
+                //
+                // BIT-IDENTICAL: the fused kernel is verbatim
+                // `mul_mat_vec_q_q8_0` apart from selecting its (weight, dst) pair
+                // from `blockIdx.y`, so every row keeps the same lane assignment,
+                // K-block stride, dot order and reduction. Nothing is
+                // reassociated.
+                let hd_u32 = hidden_dim as u32;
+                let rows_u32 = p.num_heads as u32;
+
+                // 1. Quantize the shared activation once.
+                {
+                    let quant_fn = st.kernels.quantize_q8_1_rawsum.as_ref().unwrap();
+                    let cfg = CudarcLaunchConfig {
+                        grid_dim: (q8_1_quant_grid(hd_u32), 1, 1),
+                        block_dim: (Q8_1_QUANT_BLOCK_DIM, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(quant_fn)
+                            .arg(&st.scratch.normed)
+                            .arg(st.scratch.input_q8_1.as_mut().unwrap())
+                            .arg(&hd_u32)
+                            .launch(cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("gdn_ab_fused quantize L{layer_idx}: {e}"))
+                    })?;
+                }
+
+                // 2. One matvec for both streams. grid.y = 2.
+                {
+                    let fused_fn = st.kernels.mul_mat_vec_q_q8_0_ab_fused.as_ref().unwrap();
+                    let (GpuWeightBuf::Q8Raw(wa), GpuWeightBuf::Q8Raw(wb)) =
+                        (ssm_alpha_w, ssm_beta_w)
+                    else {
+                        unreachable!("guarded by matches! above");
+                    };
+                    let cfg = CudarcLaunchConfig {
+                        grid_dim: (rows_u32, 2, 1),
+                        block_dim: (32, 4, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(fused_fn)
+                            .arg(wa)
+                            .arg(wb)
+                            .arg(st.scratch.input_q8_1.as_ref().unwrap())
+                            .arg(&mut gdn.alpha_raw_buf)
+                            .arg(&mut gdn.beta_raw_buf)
+                            .arg(&hd_u32)
+                            .arg(&rows_u32)
+                            .launch(cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("gdn_ab_fused matvec L{layer_idx}: {e}"))
+                    })?;
+                }
+
+                // DISPATCH PROOF: unconditional, one-shot.
+                {
+                    static SHOWN: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!(
+                            "[GDN] AB_FUSED DISPATCHED rows={rows_u32} in_dim={hd_u32} \
+                             (2 launches/layer, was 4)"
+                        );
+                    }
+                }
+                crate::runtime_defaults::route_census_record("gdn_alpha", "GDN_AB_FUSED");
+                crate::runtime_defaults::route_census_record("gdn_beta", "GDN_AB_FUSED");
             } else {
                 // Alpha matvec
                 unsafe {
@@ -9905,9 +10010,7 @@ fn profiler_weight_bytes(weight: &GpuWeightBuf, out_dim: usize, in_dim: usize) -
         GpuWeightBuf::Q8Aligned(_) => out * nb32 * 36,
         GpuWeightBuf::Q4Raw(_) | GpuWeightBuf::Q4Split(_) => out * nb32 * 18,
         GpuWeightBuf::Q4Aligned(_) => out * nb32 * 20,
-        GpuWeightBuf::Q6KRaw(_) => {
-            out * nb256 * (crate::q6k_ref::Q6K_BLOCK_BYTE as u64)
-        }
+        GpuWeightBuf::Q6KRaw(_) => out * nb256 * (crate::q6k_ref::Q6K_BLOCK_BYTE as u64),
     }
 }
 
@@ -10005,7 +10108,12 @@ unsafe fn launch_matvec_ext(
                 // effective GB/s is weight bytes over matvec time -- not
                 // diluted by a quantize that moved no weight bytes.
                 {
-                    let _prof_q = prof::quant_surface(label, (in_dim as u64) * 4 + u64::from(super::decode::q8_1_buffer_bytes(in_dim as u32)), &device.stream);
+                    let _prof_q = prof::quant_surface(
+                        label,
+                        (in_dim as u64) * 4
+                            + u64::from(super::decode::q8_1_buffer_bytes(in_dim as u32)),
+                        &device.stream,
+                    );
                     device
                         .stream
                         .launch_builder(quant_fn)
@@ -10061,7 +10169,12 @@ unsafe fn launch_matvec_ext(
             // Timed separately and netted out of the surface bracket (see the
             // rawsum arm above for the rationale).
             {
-                let _prof_q = prof::quant_surface(label, (in_dim as u64) * 4 + u64::from(super::decode::q8_1_buffer_bytes(in_dim as u32)), &device.stream);
+                let _prof_q = prof::quant_surface(
+                    label,
+                    (in_dim as u64) * 4
+                        + u64::from(super::decode::q8_1_buffer_bytes(in_dim as u32)),
+                    &device.stream,
+                );
                 device
                     .stream
                     .launch_builder(quant_fn)

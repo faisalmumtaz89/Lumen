@@ -910,6 +910,91 @@ mod tests {
         );
     }
 
+    /// G1 (`LUMEN_CUDA_GDN_AB_FUSED`): the fused alpha+beta kernel must be
+    /// BIT-IDENTICAL to the single-matrix kernel it replaces, not merely close.
+    ///
+    /// The claim in the flag's docs is that the fusion changes only the host's
+    /// launch count -- `blockIdx.y` selects the (weight, destination) pair and
+    /// every other line is verbatim `mul_mat_vec_q_q8_0`. That is a claim about
+    /// SOURCE, and it is checkable without a GPU: extract both kernel bodies and
+    /// require the fused body to reduce to the single body once the stream
+    /// selection is removed. If someone "optimizes" the fused kernel by
+    /// interleaving the two accumulations, the per-row op order changes, the last
+    /// bit moves, and the golden anchors are no longer guaranteed -- and this test
+    /// fails, forcing the reassociation to be argued explicitly.
+    ///
+    /// Negative-verified: perturbing one arithmetic line in the fused body (e.g.
+    /// hoisting `d8_0 * d8_1`) breaks the equality.
+    #[test]
+    fn gdn_ab_fused_kernel_is_verbatim_the_single_matrix_kernel() {
+        const SRC: &str = include_str!("cuda/shaders/mmv_q.cu");
+
+        fn body_of(src: &str, sym: &str) -> String {
+            let at = src
+                .find(&format!("void {sym}("))
+                .unwrap_or_else(|| panic!("kernel {sym} not found in mmv_q.cu"));
+            // From the end of the signature to the closing brace at column 0.
+            let open = src[at..].find('{').expect("kernel body") + at;
+            let end = src[open..]
+                .find("\n}\n")
+                .expect("kernel closing brace at column 0")
+                + open;
+            src[open..end].to_string()
+        }
+
+        // Compare only the ARITHMETIC lines, so comments and the stream-selection
+        // preamble cannot mask or fake a match.
+        fn arith(body: &str) -> Vec<String> {
+            body.lines()
+                // Strip TRAILING comments too, not just comment-only lines: the
+                // single-matrix kernel annotates several lines (`// rpb=1`,
+                // `// [0..128)`) and the fused copy does not. A first cut of this
+                // test compared raw lines and failed on exactly that -- the test
+                // being over-strict about formatting, not the kernel differing.
+                .map(|l| match l.find("//") {
+                    Some(i) => l[..i].trim(),
+                    None => l.trim(),
+                })
+                .filter(|l| {
+                    !l.is_empty()
+                        && !l.contains("blockIdx.y")
+                        && !l.contains("__restrict__ vx =")
+                        && !l.contains("__restrict__ dst =")
+                })
+                .map(|l| l.to_string())
+                .collect()
+        }
+
+        let single = arith(&body_of(SRC, "mul_mat_vec_q_q8_0"));
+        let fused = arith(&body_of(SRC, "mul_mat_vec_q_q8_0_ab_fused"));
+
+        assert!(
+            !single.is_empty() && !fused.is_empty(),
+            "failed to extract kernel bodies"
+        );
+        assert_eq!(
+            fused, single,
+            "the fused alpha+beta kernel is no longer verbatim mul_mat_vec_q_q8_0 \
+             (ignoring the blockIdx.y stream selection). Any arithmetic difference \
+             REASSOCIATES the per-row reduction, so the bit-identity claim in \
+             `runtime_defaults::gdn_ab_fused` no longer holds and DET / the golden \
+             anchors must be re-argued rather than assumed."
+        );
+
+        // The fused kernel must actually take TWO weight and TWO dst pointers, or
+        // it is not fusing anything.
+        let sig_at = SRC.find("void mul_mat_vec_q_q8_0_ab_fused(").unwrap();
+        // Slice to the opening BRACE, not to the first ')': the parameter comments
+        // contain parentheses ("stream A (alpha)"), and stopping at the first ')'
+        // truncated the signature before `vx_b` -- another instance of the test
+        // being wrong about text rather than the kernel being wrong.
+        let sig_end = sig_at + SRC[sig_at..].find('{').unwrap();
+        let sig = &SRC[sig_at..sig_end];
+        for param in ["vx_a", "vx_b", "dst_a", "dst_b", "vy"] {
+            assert!(sig.contains(param), "fused signature is missing `{param}`");
+        }
+    }
+
     /// ARCH-CLASS INVARIANT: every kernel's module CONTENT must be legal at its
     /// loader's minimum architecture.
     ///

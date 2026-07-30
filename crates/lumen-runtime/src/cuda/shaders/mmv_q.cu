@@ -389,3 +389,110 @@ extern "C" __global__ void mul_mat_vec_q_q4_0(
         dst[row0] = tmp;
     }
 }
+
+// ============================================================================
+// mul_mat_vec_q_q8_0_ab_fused — TWO Q8_0 matvecs sharing ONE Q8_1 activation.
+//
+// WHY (r2 audit §8.10, confirmed by the level-2 profile)
+//
+// The GDN gate projections `ssm_alpha` and `ssm_beta` are both forced to Q8_0 at
+// convert (the runtime's GDN gate matvec is Q8_0-only), so each takes the Q8Raw
+// dp4a ladder inside `launch_matvec_ext`: `quantize_q8_1_rawsum` +
+// `mul_mat_vec_q_q8_0`. Both quantize the IDENTICAL `scratch.normed`, so a layer
+// pays FOUR launches where two would do, and 24 layers pay 96/token.
+//
+// They are also tiny: [4096 -> num_heads] is ~139 KB of weights, and the profile
+// measured 13.2 GB/s effective against 579 GB/s for `gdn_qkv_mv` under the same
+// bracket cost and the same 24 calls/token. That ratio is the signal — these are
+// launch-latency-bound, not bandwidth-bound, so the fix is fewer launches, not a
+// faster inner loop.
+//
+// Per layer: quantize once + ONE fused matvec = 2 launches, replacing
+// quantize/matvec/quantize/matvec = 4. Per token: 48 instead of 96.
+//
+// NUMERICS ARE BIT-IDENTICAL to `mul_mat_vec_q_q8_0`, deliberately.
+//
+// `blockIdx.y` selects which (weight, destination) pair a CTA serves; every other
+// line is verbatim from the single-matrix kernel, so each output row is computed
+// by the same lane assignment, the same K-block stride, the same
+// `vec_dot_q8_0_q8_1_impl` calls in the same order, and the same two-stage
+// shared-memory reduction. There is NO cross-row interleaving and therefore NO
+// reassociation to justify against the golden anchors — the only thing that
+// changed is how many times the host called into the GPU.
+//
+// The alternative (one thread issuing loads for BOTH matrices to overlap their
+// memory streams) would interleave the two accumulations and perturb the last
+// bit. It is left unbuilt until this lands and is measured, because for a
+// launch-bound projection the launch count is the whole lever and bit-identity is
+// worth more than speculative ILP.
+//
+// Grid:  (nrows_x, 2, 1)   blockIdx.y = 0 -> alpha, 1 -> beta
+// Block: (32, 4, 1)        identical to mul_mat_vec_q_q8_0
+//
+// Both weights must share `ncols_x` (they do: both project from `hidden_dim`) and
+// `nrows_x` (both emit `num_heads`). The host asserts this before dispatch.
+// ============================================================================
+extern "C" __global__ void mul_mat_vec_q_q8_0_ab_fused(
+    const unsigned char* __restrict__ vx_a,  // Q8_0 weights, stream A (alpha)
+    const unsigned char* __restrict__ vx_b,  // Q8_0 weights, stream B (beta)
+    const unsigned char* __restrict__ vy,    // shared Q8_1 activation
+    float* __restrict__ dst_a,               // [nrows_x] F32 out, stream A
+    float* __restrict__ dst_b,               // [nrows_x] F32 out, stream B
+    unsigned int ncols_x,                    // = in_dim (shared)
+    unsigned int nrows_x)                    // = out_dim (shared)
+{
+    const int row0 = blockIdx.x;
+    if (row0 >= (int)nrows_x) return;
+
+    // The ONLY departure from mul_mat_vec_q_q8_0: pick the stream.
+    const unsigned char* __restrict__ vx = (blockIdx.y == 0) ? vx_a : vx_b;
+    float* __restrict__ dst = (blockIdx.y == 0) ? dst_a : dst_b;
+
+    const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
+
+    const int blocks_per_row_x = ncols_x / QK8_0;
+    constexpr int blocks_per_iter = VDR_Q8_0_Q8_1_MMVQ * BLOCK_DIM / QI8_0;
+
+    int kbx0 = tid / (QI8_0 / VDR_Q8_0_Q8_1_MMVQ);
+    const int kqs = VDR_Q8_0_Q8_1_MMVQ * (tid % (QI8_0 / VDR_Q8_0_Q8_1_MMVQ));
+
+    const unsigned long long row_bytes_x = (unsigned long long)blocks_per_row_x * 34;
+    const unsigned char* x_row = vx + (unsigned long long)row0 * row_bytes_x;
+
+    float tmp = 0.0f;
+
+    for (int kbx = kbx0; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const unsigned char* bq8_0 = x_row + (unsigned long long)kbx * 34;
+        const unsigned short d_bits =
+            (unsigned short)bq8_0[0] | ((unsigned short)bq8_0[1] << 8);
+        const float d8_0 = f16_bits_to_f32(d_bits);
+        const int8_t* bq8_0_qs = (const int8_t*)(bq8_0 + 2);
+
+        const unsigned char* bq8_1 = vy + (unsigned long long)kbx * 36;
+        const unsigned short d8_1_bits =
+            (unsigned short)bq8_1[0] | ((unsigned short)bq8_1[1] << 8);
+        const float d8_1 = f16_bits_to_f32(d8_1_bits);
+        const int8_t* bq8_1_qs = (const int8_t*)(bq8_1 + 4);
+
+        tmp += vec_dot_q8_0_q8_1_impl(bq8_0_qs, bq8_1_qs, kqs, d8_0, d8_1);
+    }
+
+    __shared__ float tmp_shared[NWARPS - 1][WARP_SIZE];
+
+    if (threadIdx.y > 0) {
+        tmp_shared[threadIdx.y - 1][threadIdx.x] = tmp;
+    }
+    __syncthreads();
+
+    if (threadIdx.y > 0) return;
+
+    #pragma unroll
+    for (int l = 0; l < NWARPS - 1; ++l) {
+        tmp += tmp_shared[l][threadIdx.x];
+    }
+    tmp = warp_reduce_sum(tmp);
+
+    if (threadIdx.x == 0) {
+        dst[row0] = tmp;
+    }
+}
