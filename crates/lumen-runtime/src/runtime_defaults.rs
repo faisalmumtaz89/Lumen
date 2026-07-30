@@ -1219,6 +1219,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_PROFILE",
     "LUMEN_CUDA_PTX_CACHE",
     "LUMEN_CUDA_PTX_CACHE_DIR",
+    "LUMEN_CUDA_PTX_REJECT_TTL_SECS",
     "LUMEN_CUDA_Q4_MMVQ",
     "LUMEN_CUDA_Q4_ROUTE_ASSERT",
     "LUMEN_CUDA_Q6K_DP4A",
@@ -2436,6 +2437,7 @@ mod tests {
         "LUMEN_CUDA_PROFILE",
         "LUMEN_CUDA_PTX_CACHE",
         "LUMEN_CUDA_PTX_CACHE_DIR",
+        "LUMEN_CUDA_PTX_REJECT_TTL_SECS",
         "LUMEN_CUDA_Q4_MMVQ",
         "LUMEN_CUDA_Q4_ROUTE_ASSERT",
         "LUMEN_CUDA_Q6K_DP4A",
@@ -3295,6 +3297,45 @@ pub fn qkv_decouple() -> bool {
         }
         on
     })
+}
+
+/// Print the armed state of every Q6_K candidate flag ONCE, EAGERLY, at kernel
+/// compile time — independent of whether any dispatch predicate is ever reached.
+///
+/// # Why this exists
+///
+/// Each flag's marker used to live inside its own `OnceLock` resolver, so it only
+/// printed on FIRST CALL. That made "flag armed but the dispatch predicate
+/// short-circuited before consulting it" indistinguishable from "flag not set" —
+/// which is exactly what happened on the A100: `LUMEN_CUDA_Q6K_DP4A=1` was set,
+/// `Q6KRaw` uploads were visible, and the `[Q6K] DP4A=ON` line never appeared, so
+/// there was no way to tell from the log whether the flag had been read at all.
+///
+/// `qkv_use_preq` is a chain of `&&`, and Rust short-circuits: if
+/// `weight_uses_f32_act_q4_fam` reports the family F32-pinned, or either
+/// `wk`/`wv` lacks a dp4a route, `weight_uses_dp4a_q8_1(&lw.wq)` — the only
+/// caller of `q6k_dp4a()` on the hot path — is never evaluated.
+///
+/// Calling every resolver here forces each marker out at startup. Combined with
+/// the DISPATCH-proof marker at the launch site and the blocked-reason diagnostic
+/// in the QKV chain, the three states are now separable in a log:
+/// not armed / armed-but-blocked (with the reason) / armed-and-dispatched.
+pub fn q6k_report_armed_flags() {
+    use std::sync::OnceLock;
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        // Touch every resolver so its own one-shot marker fires now.
+        let native = q6k_native();
+        let dp4a = q6k_dp4a();
+        let head = lmhead_q6k();
+        let fix = q6k_layout_fix();
+        if native || dp4a || head || fix {
+            eprintln!(
+                "[Q6K] ARMED: NATIVE={} DP4A={} LMHEAD={} LAYOUT_FIX={}",
+                native as u8, dp4a as u8, head as u8, fix as u8
+            );
+        }
+    });
 }
 
 /// `LUMEN_CUDA_Q6K_DP4A=1` (candidate C1b) — dispatch native Q6_K weights

@@ -502,6 +502,21 @@ pub const MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE: &str =
 /// Requires: `in_dim % 256 == 0`.
 pub const MATVEC_Q6_K_F32_KERNEL_SOURCE: &str = include_str!("matvec_q6_k_f32.cu");
 
+/// Native Q6_K matvec against PRE-QUANTIZED Q8_1 activations (dp4a) —
+/// candidate C1b, `LUMEN_CUDA_Q6K_DP4A=1`, scoped to the four coupled `wq`
+/// surfaces.
+///
+/// SEPARATE FILE FROM `MATVEC_Q6_K_F32_KERNEL_SOURCE` ON PURPOSE. NVRTC compiles
+/// a translation unit, not a kernel, so arch requirements are a property of the
+/// FILE. The F32 kernels load through the plain `load_fn` (no
+/// `--gpu-architecture`, default below sm_61); co-locating `dp4a.s32.s32` with
+/// them made the whole module fail CUDA_ERROR_INVALID_PTX on an A100 and left
+/// every Q6_K handle `None`.
+///
+/// Kernels: `matvec_q6_k_q8_1`.
+/// Requires SM 6.1+ (dp4a) — load via `load_fn_sm80_fast_math`.
+pub const MATVEC_Q6_K_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q6_k_q8_1.cu");
+
 /// Codegen-LOCKED variant of `MATVEC_Q4_SPLIT_Q8_1_KERNEL_SOURCE`. Same SoA
 /// split layout and integer dp4a dot, but every floating-point op in the
 /// per-block epilogue and the cross-warp reduction is pinned with inline-PTX

@@ -273,14 +273,104 @@ pub(crate) fn mark_driver_reject(key: &CacheKey) {
     }
 }
 
+/// How long a driver-reject marker is trusted, in seconds. `0` disables markers
+/// entirely (always recompile). Override with `LUMEN_CUDA_PTX_REJECT_TTL_SECS`.
+///
+/// 24 hours keeps the warm-launch benefit across a working session while bounding
+/// how long a WRONG marker can suppress a compile that would now succeed.
+const REJECT_TTL_SECS_DEFAULT: u64 = 24 * 60 * 60;
+
+fn reject_ttl_secs() -> u64 {
+    use std::sync::OnceLock;
+    static TTL: OnceLock<u64> = OnceLock::new();
+    *TTL.get_or_init(|| {
+        std::env::var("LUMEN_CUDA_PTX_REJECT_TTL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(REJECT_TTL_SECS_DEFAULT)
+    })
+}
+
 /// Whether this key was previously recorded as driver-rejected (see
 /// [`mark_driver_reject`]). Returns `false` when caching is disabled so the
 /// kill switch fully restores the un-cached compile-every-time behavior.
+///
+/// # Why this is not a bare `path.exists()` any more
+///
+/// It used to be, and that turned ONE bad marker write into a persistent
+/// cross-process outage. A test compiled a shader that genuinely could not
+/// build (an sm_61 opcode had been added to a plain-`load_fn` translation unit),
+/// the driver rejected it, a marker landed in a PERSISTENT cache volume, and
+/// every later production launch then reported "skipping doomed recompile" for
+/// `matvec_q6_k_f32` and `dequant_q6_k_to_f32` -- including after the source
+/// defect was understood -- until the volume was purged by hand.
+///
+/// The marker itself was not wrong: the key covers
+/// `sha256(source) || arch || fast_math || cc || nvrtc || driver`, so a marker
+/// really does mean "this exact compile failed on this exact driver", and fixing
+/// the source changes the digest and retires the marker automatically. What was
+/// wrong is that a marker was trusted FOREVER and with no way back, so any
+/// transient rejection (a compile OOM, a flaky driver state, a half-written
+/// cache volume) became permanent.
+///
+/// Two bounds now apply:
+///
+/// 1. **TTL** -- a marker older than [`reject_ttl_secs`] is ignored and deleted,
+///    so a stale marker cannot outlive a day.
+/// 2. **Verify-once-per-process** -- the FIRST marker a process would honor is
+///    ignored anyway, and the compile is retried. If it fails again the marker is
+///    re-written and every subsequent marker in that process is honored, so the
+///    cost of self-healing is exactly one wasted compile per process while the
+///    original purpose (not recompiling ~76 always-failing kernels every launch)
+///    is preserved.
+///
+/// Both are observable: honoring a marker logs its path so an operator can purge
+/// precisely, instead of nuking the volume.
 pub(crate) fn is_driver_rejected(key: &CacheKey) -> bool {
     if !cache_enabled() {
         return false;
     }
-    key.reject_path().map(|p| p.exists()).unwrap_or(false)
+    let ttl = reject_ttl_secs();
+    if ttl == 0 {
+        return false;
+    }
+    let Some(path) = key.reject_path() else {
+        return false;
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return false; // no marker
+    };
+
+    // Bound 1: TTL. An unreadable mtime is treated as expired -- fail toward
+    // recompiling (correct, slow) rather than toward skipping (fast, wrong).
+    let expired = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age.as_secs() >= ttl)
+        .unwrap_or(true);
+    if expired {
+        let _ = std::fs::remove_file(&path);
+        return false;
+    }
+
+    // Bound 2: verify-once-per-process.
+    static VERIFIED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !VERIFIED_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[CUDA] PTX driver-reject marker present ({}); re-verifying once this \
+             process before trusting it",
+            path.display()
+        );
+        return false;
+    }
+
+    eprintln!(
+        "[CUDA] honoring PTX driver-reject marker {} (purge this file, or set \
+         LUMEN_CUDA_PTX_REJECT_TTL_SECS=0, to force a recompile)",
+        path.display()
+    );
+    true
 }
 
 /// Serialize a cache entry: MAGIC || u32 len(payload) || payload || u32 crc(payload).

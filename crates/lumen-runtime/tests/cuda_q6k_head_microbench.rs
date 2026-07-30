@@ -106,6 +106,30 @@ struct Measurement {
 #[test]
 #[ignore = "allocates ~800 MB VRAM; run explicitly on an A100 with --ignored --nocapture"]
 fn q6k_head_rate_decision_gate() {
+    // CACHE ISOLATION -- must run BEFORE any compile touches the PTX cache.
+    //
+    // This test previously shared production's cache keys and poisoned them. When
+    // it compiled a shader that genuinely could not build, the driver rejected the
+    // PTX and a driver-reject marker landed in the PERSISTENT /cache/ptx volume;
+    // every later production launch then skipped `matvec_q6_k_f32` and
+    // `dequant_q6_k_to_f32` as "doomed" until the volume was purged by hand.
+    //
+    // Note the cache key did NOT differ from production's -- see the report. This
+    // test used `compile_and_load`, the exact call the production `load_fn` uses
+    // (arch `None` -> "default", fast_math false) on the exact same source, so the
+    // digest was production's by construction. Widening the key would not have
+    // helped; only isolating the DIRECTORY does.
+    //
+    // A per-run tmpdir means a bad compile here can never be visible to a
+    // production process, whatever the key.
+    let cache_dir =
+        std::env::temp_dir().join(format!("lumen_q6k_microbench_ptx_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&cache_dir);
+    std::env::set_var("LUMEN_CACHE_DIR", &cache_dir);
+    // Belt and braces: even inside the tmpdir, never trust a marker this run.
+    std::env::set_var("LUMEN_CUDA_PTX_REJECT_TTL_SECS", "0");
+    println!("PTX cache isolated to {}", cache_dir.display());
+
     let device = match std::panic::catch_unwind(|| CudaDevice::new(0)) {
         Ok(Ok(d)) => d,
         Ok(Err(e)) => {
@@ -183,8 +207,10 @@ fn q6k_head_rate_decision_gate() {
     // The dp4a kernel needs the sm80 fast-math pipeline; plain compile would
     // reject `dp4a.s32.s32`. Compiled separately so a failure here cannot mask
     // the F32 numbers.
-    let module_dp4a = device
-        .compile_and_load_with_arch_fast_math(shaders::MATVEC_Q6_K_F32_KERNEL_SOURCE, "compute_80");
+    let module_dp4a = device.compile_and_load_with_arch_fast_math(
+        shaders::MATVEC_Q6_K_Q8_1_KERNEL_SOURCE,
+        "compute_80",
+    );
 
     let mut results: Vec<Measurement> = Vec::new();
 

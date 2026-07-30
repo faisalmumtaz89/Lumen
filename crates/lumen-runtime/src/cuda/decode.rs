@@ -880,6 +880,9 @@ fn q8_1_rawsum_source(src: &'static str) -> std::borrow::Cow<'static, str> {
 /// symbol conflicts between kernels that define identically-named device
 /// helper functions (e.g., `warp_reduce_sum` appears in multiple .cu files).
 pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, RuntimeError> {
+    // Force every Q6_K candidate's armed marker out NOW, before any dispatch
+    // predicate can short-circuit past the resolver that would have printed it.
+    crate::runtime_defaults::q6k_report_armed_flags();
     let load_fn = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
         let module = device.compile_and_load(source)?;
         module
@@ -1879,7 +1882,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         // dp4a kernel -> sm80 fast-math loader, NOT plain load_fn. The `.rn`
         // pinning inside makes it immune to --use_fast_math.
         matvec_q6_k_q8_1: match load_fn_sm80_fast_math(
-            shaders::MATVEC_Q6_K_F32_KERNEL_SOURCE,
+            shaders::MATVEC_Q6_K_Q8_1_KERNEL_SOURCE,
             "matvec_q6_k_q8_1",
         ) {
             Ok(f) => {

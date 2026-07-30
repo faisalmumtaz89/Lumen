@@ -910,6 +910,93 @@ mod tests {
         );
     }
 
+    /// ARCH-CLASS INVARIANT: every kernel's module CONTENT must be legal at its
+    /// loader's minimum architecture.
+    ///
+    /// THIS IS THE TEST THAT WOULD HAVE CAUGHT THE A100 FAILURE. The dp4a kernel
+    /// was appended to matvec_q6_k_f32.cu to share its verified lane mapping and
+    /// `.rn` primitives. But NVRTC compiles a TRANSLATION UNIT, not a kernel, and
+    /// the F32 kernels load through the plain `load_fn`, which passes no
+    /// `--gpu-architecture` and so targets a default below sm_61. One
+    /// `dp4a.s32.s32` anywhere in that file made the WHOLE module fail with
+    /// CUDA_ERROR_INVALID_PTX, so `matvec_q6_k_f32`, `matvec_q6_k_f32_nr4` AND
+    /// `dequant_q6_k_to_f32` all became `None` -- C1 and C3 silently disabled.
+    ///
+    /// The sibling symbol-existence test cannot see this: every symbol was present
+    /// and correctly named. The file simply could not be compiled by its loader.
+    /// Arch requirement is a property of the FILE, so that is what this checks.
+    ///
+    /// It also caught its own first draft: matching the bare string "dp4a" tripped
+    /// on a comment that said "No dp4a, no mma", so the patterns below are PTX
+    /// mnemonics with their separator, not prose.
+    #[test]
+    fn kernel_module_content_matches_its_loader_min_arch() {
+        // (file, source, loader, min-arch class). Only the shaders this module
+        // owns; the rest of the directory has its own loader assignments.
+        struct Shader {
+            file: &'static str,
+            src: &'static str,
+            loader: &'static str,
+            allows_raised: bool,
+        }
+        let shaders = [
+            Shader {
+                file: "matvec_q6_k_f32.cu",
+                src: include_str!("cuda/shaders/matvec_q6_k_f32.cu"),
+                loader: "load_fn (plain, no --gpu-architecture)",
+                allows_raised: false,
+            },
+            Shader {
+                file: "matvec_q6_k_q8_1.cu",
+                src: include_str!("cuda/shaders/matvec_q6_k_q8_1.cu"),
+                loader: "load_fn_sm80_fast_math (compute_80)",
+                allows_raised: true,
+            },
+        ];
+        // PTX mnemonics that require a raised arch, with the loader that provides it.
+        let raised: [(&str, &str); 4] = [
+            ("dp4a.", "sm_61+ -> load_fn_sm61 / load_fn_sm80*"),
+            ("mma.sync", "sm_80+ -> load_fn_sm80*"),
+            (
+                "cvt.rn.bf16.f32",
+                "sm_80+ -> load_fn_sm80*, or a __CUDA_ARCH__ guard",
+            ),
+            ("__dp4a(", "intrinsic NVRTC cannot resolve without headers"),
+        ];
+
+        for sh in &shaders {
+            for (opcode, why) in &raised {
+                let present = sh.src.contains(opcode);
+                if !sh.allows_raised {
+                    assert!(
+                        !present,
+                        "{} is loaded via {} but contains `{}`, which needs {}. NVRTC \
+                         compiles the whole translation unit, so this makes EVERY kernel \
+                         in the file fail to load -- not just the one using it. Move the \
+                         offending kernel into its own .cu file.",
+                        sh.file, sh.loader, opcode, why
+                    );
+                }
+            }
+        }
+
+        // Positive half: the dp4a file must actually still contain its opcode, or
+        // the split silently degraded into a plain kernel that only looks correct.
+        let dp4a_src = shaders[1].src;
+        assert!(
+            dp4a_src.contains("dp4a."),
+            "matvec_q6_k_q8_1.cu must contain the dp4a opcode it exists for"
+        );
+        // And the two files must not have drifted apart on the decode constants
+        // they both hard-code.
+        for c in ["Q6K_BLOCK_ELEM   256", "Q6K_BLOCK_BYTE   210"] {
+            assert!(
+                shaders[0].src.contains(c) && dp4a_src.contains(c),
+                "both Q6_K shaders must agree on `{c}`"
+            );
+        }
+    }
+
     /// A zero `d` (the packer's all-zero-block escape) must produce zeros, not
     /// NaN, through the whole path.
     #[test]

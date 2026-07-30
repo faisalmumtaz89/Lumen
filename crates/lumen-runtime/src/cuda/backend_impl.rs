@@ -2675,6 +2675,36 @@ impl CudaBackend {
                     && st.scratch.input_q8_1.is_some()
                     && st.kernels.quantize_f32_to_q8_1.is_some();
 
+                // SELF-DIAGNOSIS for candidate C1b. `qkv_use_preq` is a chain of
+                // `&&` and Rust short-circuits, so an armed dp4a flag that never
+                // engages leaves no trace of WHY -- which is exactly what the A100
+                // log showed. When the flag is armed and the weight really is a
+                // native Q6_K, name the failing conjunct once.
+                if crate::runtime_defaults::q6k_dp4a()
+                    && matches!(&lw.wq, GpuWeightBuf::Q6KRaw(_))
+                    && !qkv_use_preq
+                {
+                    static SHOWN: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!(
+                            "[Q6K] DP4A armed but NOT engaged on L{layer_idx}: \
+                             attn_qkv_plan_is_f32={} q6k_kernel={} wk_dp4a={} wv_dp4a={} \
+                             q8_1_scratch={} quantizer={}",
+                            weight_uses_f32_act_q4_fam(
+                                &lw.wq,
+                                &st.kernels.q4_act_plan,
+                                crate::runtime_defaults::Q4ProjectionFamily::AttnQkv,
+                            ) as u8,
+                            st.kernels.matvec_q6_k_q8_1.is_some() as u8,
+                            weight_uses_dp4a_q8_1(&lw.wk, &st.kernels) as u8,
+                            weight_uses_dp4a_q8_1(&lw.wv, &st.kernels) as u8,
+                            st.scratch.input_q8_1.is_some() as u8,
+                            st.kernels.quantize_f32_to_q8_1.is_some() as u8,
+                        );
+                    }
+                }
+
                 // Fused RMSNorm + Q8_1: skip separate rmsnorm + quantize_f32_to_q8_1
                 // when the fused kernel is available. Saves 1 dispatch per norm site.
                 if qkv_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
@@ -11848,6 +11878,18 @@ unsafe fn launch_matvec_preq8_1_split(
             .arg(&in_dim_u32)
             .launch(cfg)
             .map_err(|e| RuntimeError::Compute(format!("matvec_q6_k_q8_1 {label}: {e}")))?;
+        // DISPATCH PROOF: unconditional, one-shot. The census tag only lands when
+        // the census is armed, and the flag's own marker fires at startup; neither
+        // proves this kernel actually RAN. This does.
+        {
+            static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[Q6K] DP4A DISPATCHED site={label} rows={out_dim} in_dim={in_dim} \
+                     (0.8203 B/w, int8 activations)"
+                );
+            }
+        }
         crate::runtime_defaults::route_census_record(label, "Q6K_DP4A");
         return Ok(());
     }
