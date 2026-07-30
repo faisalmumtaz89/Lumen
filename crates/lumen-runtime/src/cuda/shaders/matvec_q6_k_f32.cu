@@ -143,57 +143,85 @@ __device__ __forceinline__ float q6k_warp_allreduce(float v) {
     return v;
 }
 
-// --------------------------------------------------------------------------
-// Decode the 32 six-bit codes of unit `u` for one row and dot them with the
-// 32 pre-loaded activations. Returns the group's contribution BEFORE the
-// per-super-block `d` scale.
+
+// ---------------------------------------------------------------------------
+// THE MATVEC. Rewritten after the first version measured ~90 GB/s on an A100
+// (~4% MBU, ~9x off the achievable rate) and turned C1 into a REGRESSION:
+// full_attn 1165 -> 2072us where the byte math predicted about -200us.
 //
-// unit u -> super-block ib = u / 8, half = (u % 8) / 4, group g = u % 4.
-// --------------------------------------------------------------------------
-__device__ __forceinline__ float q6k_unit_dot(
-    const unsigned char* __restrict__ block_base,  // start of super-block ib
-    unsigned int half,
-    unsigned int g,
-    const float* __restrict__ xv)                  // 32 activations for this unit
+// WHAT WAS WRONG. Both faults are named in the header of the in-tree kernel that
+// already reaches the target rate class, matvec_q4_split_f32_lane.cu:
+//
+//  1. OCCUPANCY. The old kernel staged `float xv[32]` -- 32 registers of
+//     activations per thread -- which forced `__launch_bounds__(128, 2)`: two
+//     CTAs per SM, 256 of 2048 resident threads, 12.5% occupancy. A
+//     bandwidth-bound kernel at 12.5% occupancy has almost no memory-level
+//     parallelism with which to hide latency. The Q4 lane kernel's header calls
+//     out deleting exactly that array as "what lifts occupancy", and NR=8
+//     multiplied the same pressure. Activations are now 8 floats (two float4).
+//  2. COALESCING. Each thread read a 32-byte RUN of `ql`, one byte at a time, so
+//     at any given instruction the warp's 32 addresses were scattered over ~840
+//     bytes -- 32 useful bytes per 4+ sectors fetched, repeated 32 times per
+//     unit. Lanes now read 4 CONSECUTIVE ql bytes each, so a warp covers one
+//     block's 128-byte ql array contiguously, and activations are float4.
+//
+// ALIGNMENT -- the reason this cannot simply copy the Q4 kernel. Q6_K's block is
+// 210 bytes, not a multiple of 4, so `ql` is only 2-byte aligned on odd blocks
+// and a 4-byte `int` load would be illegal. 210 IS even, so 16-bit loads are
+// always legal: each lane issues two `unsigned short` loads and assembles them
+// with a shift+or. That recovers whole-word nibble arithmetic (the 0x0F0F0F0F /
+// 0x30303030 masks, and one `__vsubss4` applying the -32 bias to four bytes at
+// once) without ever misaligning an access.
+//
+// Shared-memory staging of the 210-byte block was considered and REJECTED: a
+// block is consumed by exactly one warp, so each lane would stage ~7 bytes in
+// order to read ~6.5 back -- more instructions than the short loads it saves.
+//
+// DECOMPOSITION. One warp owns one super-block; lane L owns `ql` bytes 4L..4L+3,
+// i.e. 8 elements. Within a half, `ql` byte p carries element p in its LOW
+// nibble and element p+64 in its HIGH nibble -- one uniform rule covering all
+// four ggml "groups", which is what collapses the old four-way branch:
+//
+//   half = p / 64,  p_h = p % 64
+//   low  nibble -> element half*128 + p_h        qh bit shift 2*(p_h/32)
+//   high nibble -> element half*128 + p_h + 64   qh bit shift 2*(p_h/32) + 4
+//   scales: sc[8*half + p_h/16] (low), sc[8*half + p_h/16 + 4] (high)
+//
+// Because p is a multiple of 4, all four of a lane's bytes share one scale pair
+// and one qh shift, and the four qh bytes they need are consecutive -- so qh is
+// two short loads too. Both element runs are contiguous, hence float4.
+//
+// A CTA is 128 threads = 4 warps owning NR output rows, striding blocks by 4.
+// The activation float4 pair is loaded ONCE per block-step and reused across all
+// NR rows, which is what amortizes the activation re-read at head scale.
+//
+// NUMERICS UNCHANGED from the first version: F32 accumulation in a fixed order,
+// every FP op pinned with inline-PTX `.rn`, `d` applied once per super-block, and
+// per-element weight terms exact in int32 before conversion.
+// `q6k_ref::row_dot_kernel_order` mirrors this decomposition and is checked
+// against an f64 reference; the layout tests are decomposition-independent.
+// ---------------------------------------------------------------------------
+
+// Assemble a 4-byte little-endian word from two 2-byte-aligned halves.
+// `base + off` must be 2-byte aligned, which every Q6_K block offset is.
+__device__ __forceinline__ unsigned int q6k_load_u32_align2(
+    const unsigned char* __restrict__ base, unsigned int off)
 {
-    const unsigned char* ql = block_base + 64u * half;
-    const unsigned char* qh = block_base + 128u + 32u * half;
-    const signed char*   sc = (const signed char*)(block_base + 192u + 8u * half);
+    const unsigned short* p = (const unsigned short*)(base + off);
+    return (unsigned int)p[0] | ((unsigned int)p[1] << 16);
+}
 
-    // Group g selects: which ql byte (l vs l+32), which nibble (low vs high),
-    // the qh bit pair (2*g), and the scale base (2*g).
-    //   g=0 -> ql[l]    low   g=1 -> ql[l+32] low
-    //   g=2 -> ql[l]    high  g=3 -> ql[l+32] high
-    const unsigned int ql_off   = (g & 1u) ? 32u : 0u;   // g=1,3 use the +32 byte
-    const unsigned int hi_nib   = (g >> 1) & 1u;         // g=2,3 use the high nibble
-    const unsigned int qh_shift = 2u * g;
-    const signed char* scg      = sc + 2u * g;
-
-    float acc = 0.0f;
-
-    // Two scale sub-groups of 16 elements each (is = l/16). Hoisting the
-    // scale out of the inner 16 keeps the op count down and the order fixed.
-    #pragma unroll
-    for (int is = 0; is < 2; is++) {
-        const float sc_f = q6k_i2f_rn((int)scg[is]);
-        float sub = 0.0f;
-        #pragma unroll
-        for (int k = 0; k < 16; k++) {
-            const int l = is * 16 + k;
-            const int lo = hi_nib ? (int)(ql[ql_off + l] >> 4)
-                                  : (int)(ql[ql_off + l] & 0x0F);
-            const int hb = (int)((qh[l] >> qh_shift) & 3u);
-            const int q  = (lo | (hb << 4)) - 32;        // 6-bit code, offset
-            sub = q6k_fma_rn(q6k_i2f_rn(q), xv[l], sub);
-        }
-        acc = q6k_fma_rn(sc_f, sub, acc);
-    }
+// Dot four already -32-biased int8 codes packed in `q4` with four activations,
+// in a fixed order, pinned .rn.
+__device__ __forceinline__ float q6k_dot4(unsigned int q4, const float4 x, float acc)
+{
+    acc = q6k_fma_rn(q6k_i2f_rn((int)(signed char)(q4      )), x.x, acc);
+    acc = q6k_fma_rn(q6k_i2f_rn((int)(signed char)(q4 >>  8)), x.y, acc);
+    acc = q6k_fma_rn(q6k_i2f_rn((int)(signed char)(q4 >> 16)), x.z, acc);
+    acc = q6k_fma_rn(q6k_i2f_rn((int)(signed char)(q4 >> 24)), x.w, acc);
     return acc;
 }
 
-// --------------------------------------------------------------------------
-// Generic kernel template: <NR rows per CTA>.
-// --------------------------------------------------------------------------
 template<int NR>
 __device__ __forceinline__ void matvec_q6_k_f32_impl(
     const unsigned char* __restrict__ weight,  // [out_dim][nb * 210]
@@ -206,28 +234,31 @@ __device__ __forceinline__ void matvec_q6_k_f32_impl(
     const unsigned int warp_id = threadIdx.x / NW;
     const unsigned int lane    = threadIdx.x % NW;
 
-    const unsigned int nb        = in_dim / Q6K_BLOCK_ELEM;
-    const unsigned int n_units   = nb * Q6K_GROUPS_PER_B;
+    const unsigned int nb = in_dim / Q6K_BLOCK_ELEM;
     const unsigned long long row_bytes =
         (unsigned long long)nb * (unsigned long long)Q6K_BLOCK_BYTE;
+
+    // Lane -> ql bytes 4L..4L+3, and everything that follows from it.
+    const unsigned int p       = lane * 4u;                 // 0..124
+    const unsigned int half    = p >> 6;                    // 0 or 1
+    const unsigned int p_h     = p & 63u;                   // 0..60 in the half
+    const unsigned int qh_off  = half * 32u + (p_h & 31u);  // 4-aligned
+    const unsigned int sh_lo   = 2u * (p_h >> 5);           // 0 or 2
+    const unsigned int sc_i    = 8u * half + (p_h >> 4);    // low-nibble scale
+    const unsigned int elem_lo = half * 128u + p_h;
+    const unsigned int elem_hi = elem_lo + 64u;
 
     float sumf[NR];
     #pragma unroll
     for (int r = 0; r < NR; r++) sumf[r] = 0.0f;
 
-    // Each thread sweeps units with a fixed stride; the activation slice is
-    // loaded once per unit and reused across all NR rows.
-    for (unsigned int u = threadIdx.x; u < n_units; u += THREADS_PER_BLOCK) {
-        const unsigned int ib   = u / Q6K_GROUPS_PER_B;
-        const unsigned int rem  = u % Q6K_GROUPS_PER_B;
-        const unsigned int half = rem / 4u;
-        const unsigned int g    = rem % 4u;
-
-        // Unit u covers output elements [32*u, 32*u + 32) -- contiguous.
-        const float* xsrc = x + (unsigned long long)u * Q6K_GROUP_ELEM;
-        float xv[Q6K_GROUP_ELEM];
-        #pragma unroll
-        for (int k = 0; k < Q6K_GROUP_ELEM; k++) xv[k] = xsrc[k];
+    // Warp `warp_id` takes blocks warp_id, warp_id+4, ...: the CTA advances 4
+    // blocks per step and each block is owned by exactly one warp.
+    for (unsigned int ib = warp_id; ib < nb; ib += NWARPS) {
+        // Activations: two contiguous runs of 4, loaded once for all NR rows.
+        const float* xb = x + (unsigned long long)ib * Q6K_BLOCK_ELEM;
+        const float4 xl = *(const float4*)(xb + elem_lo);
+        const float4 xh = *(const float4*)(xb + elem_hi);
 
         #pragma unroll
         for (int r = 0; r < NR; r++) {
@@ -238,16 +269,29 @@ __device__ __forceinline__ void matvec_q6_k_f32_impl(
                 + (unsigned long long)row * row_bytes
                 + (unsigned long long)ib * Q6K_BLOCK_BYTE;
 
+            const unsigned int vl = q6k_load_u32_align2(bp, p);
+            const unsigned int vh = q6k_load_u32_align2(bp, 128u + qh_off);
+
+            const unsigned int nlo = vl & 0x0F0F0F0Fu;
+            const unsigned int blo = ((vh >> sh_lo) & 0x03030303u) << 4;
+            const unsigned int qlo = __vsubss4(nlo | blo, 0x20202020u);
+
+            const unsigned int nhi = (vl >> 4) & 0x0F0F0F0Fu;
+            const unsigned int bhi = ((vh >> (sh_lo + 4u)) & 0x03030303u) << 4;
+            const unsigned int qhi = __vsubss4(nhi | bhi, 0x20202020u);
+
+            const signed char* sc = (const signed char*)(bp + 192u);
             const float d = q6k_f16_to_f32(
                 (unsigned short)(bp[208] | ((unsigned short)bp[209] << 8)));
 
-            const float acc = q6k_unit_dot(bp, half, g, xv);
+            float acc = 0.0f;
+            acc = q6k_fma_rn(q6k_i2f_rn((int)sc[sc_i]), q6k_dot4(qlo, xl, 0.0f), acc);
+            acc = q6k_fma_rn(q6k_i2f_rn((int)sc[sc_i + 4u]), q6k_dot4(qhi, xh, 0.0f), acc);
             sumf[r] = q6k_fma_rn(d, acc, sumf[r]);
         }
     }
 
-    // LOCKED reduction: butterfly within each warp, then a fixed fold over
-    // the NWARPS-1 partner warps, then a single store.
+    // LOCKED reduction: butterfly within each warp, fixed cross-warp fold.
     #pragma unroll
     for (int r = 0; r < NR; r++) sumf[r] = q6k_warp_allreduce(sumf[r]);
 
@@ -273,10 +317,12 @@ __device__ __forceinline__ void matvec_q6_k_f32_impl(
     }
 }
 
-// NR=1: one output row per CTA. Used for layer projections (e.g. the fused
-// Q+gate `wq` [out=8192, in=4096] -> 8192 CTAs).
-extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 4)
-void matvec_q6_k_f32(
+// NR=1: one output row per CTA -- the shape the fast in-tree Q4 lane kernel uses.
+// For `wq` [out=8192, in=4096] that is 8192 CTAs (~76 waves over 108 SMs) with no
+// activation staging, so occupancy is bounded only by the small register
+// footprint. Deliberately NO `__launch_bounds__` cap: pinning CTAs/SM to 2 is the
+// fault this rewrite exists to remove.
+extern "C" __global__ void matvec_q6_k_f32(
     const unsigned char* __restrict__ weight,
     const float* __restrict__ x,
     float* __restrict__ out,
@@ -286,18 +332,20 @@ void matvec_q6_k_f32(
     matvec_q6_k_f32_impl<1>(weight, x, out, out_dim, in_dim);
 }
 
-// NR=8: eight rows per CTA. Used for the extreme-aspect-ratio head shape
-// [out=248320, in=4096] -> 31040 CTAs, ~287x oversubscription on 108 SMs,
-// with the activation slice amortized 8x.
-extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 2)
-void matvec_q6_k_f32_nr8(
+// NR=4: four rows per CTA, for the extreme-aspect-ratio head [248320 x 4096].
+// At NR=1 the head would be 248320 CTAs each re-reading the whole 16 KB
+// activation vector (~4 GB of L1/L2 traffic against 834 MB of weight DRAM); NR=4
+// quarters that for 62080 CTAs, still ~574x oversubscribed on 108 SMs. The reuse
+// costs 8 activation floats plus 4 accumulators -- unlike the old NR=8, which
+// paid 32 staged floats for it.
+extern "C" __global__ void matvec_q6_k_f32_nr4(
     const unsigned char* __restrict__ weight,
     const float* __restrict__ x,
     float* __restrict__ out,
     unsigned int out_dim,
     unsigned int in_dim)
 {
-    matvec_q6_k_f32_impl<8>(weight, x, out, out_dim, in_dim);
+    matvec_q6_k_f32_impl<4>(weight, x, out, out_dim, in_dim);
 }
 
 // ==========================================================================

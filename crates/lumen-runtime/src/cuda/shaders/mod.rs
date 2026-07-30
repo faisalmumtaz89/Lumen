@@ -498,7 +498,7 @@ pub const MATVEC_Q4_SPLIT_F32_LANE_KERNEL_SOURCE: &str =
 /// inner loop, because the natural reading of the `ql` nibbles is wrong.
 ///
 /// Kernels: `matvec_q6_k_f32` (NR=1, layer projections),
-/// `matvec_q6_k_f32_nr8` (NR=8, the [248320 x 4096] head).
+/// `matvec_q6_k_f32_nr4` (NR=4, the [248320 x 4096] head).
 /// Requires: `in_dim % 256 == 0`.
 pub const MATVEC_Q6_K_F32_KERNEL_SOURCE: &str = include_str!("matvec_q6_k_f32.cu");
 

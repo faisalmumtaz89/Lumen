@@ -419,7 +419,7 @@ fn do_convert_from_reader<R: Read + Seek>(
             //
             // The comment below is accurate about the default runtime: there
             // IS no K-quant dispatch kernel by default. C3 adds one
-            // (`matvec_q6_k_f32_nr8`) and gates the CLI's
+            // (`matvec_q6_k_f32_nr4`) and gates the CLI's
             // `set_output_proj_raw` allow-list and `CudaBackend::init` to
             // accept Q6_K, so the "slow F32 fallback" it warns about does
             // not apply when the flag is on. The flag is read at BOTH ends

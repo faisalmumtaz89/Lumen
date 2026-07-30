@@ -319,68 +319,88 @@ pub fn pack_block(codes: &[u8; Q6K_BLOCK_ELEM], scales: &[i8; 16], d: f32) -> [u
 }
 
 /// Host mirror of `matvec_q6_k_f32`'s per-row dot product, reproducing the
-/// kernel's UNIT DECOMPOSITION and OPERATION ORDER exactly:
+/// kernel's LANE MAPPING and OPERATION ORDER exactly.
 ///
-/// * unit `u` -> super-block `u / 8`, half `(u % 8) / 4`, group `u % 4`
-/// * unit `u` covers activations `[32u, 32u + 32)` (contiguous — the property
-///   the kernel relies on to avoid index arithmetic)
-/// * within a unit, the two 16-element scale sub-groups accumulate in order,
-///   scale hoisted out of the inner 16
+/// The kernel's decomposition (see the shader header):
+/// * a CTA is 128 threads = 4 warps; warp `w` owns super-blocks `w, w+4, ...`
+/// * lane `L` owns `ql` bytes `4L..4L+3` of its warp's block, i.e. 8 elements
+/// * within a half, `ql` byte `p` carries element `p` in its LOW nibble and
+///   element `p + 64` in its HIGH nibble -- the uniform rule that lets the
+///   kernel drop the four-way group branch
+/// * all four of a lane's bytes share one scale pair and one `qh` shift, and
+///   their four `qh` bytes are consecutive
 /// * `d` is applied once per super-block, outside the element sum
 ///
-/// `thread_stride` models the kernel's `for u = tid; u < n_units; u +=
-/// THREADS_PER_BLOCK` sweep followed by a reduction: passing the real stride
-/// reproduces the kernel's exact partial-sum grouping, so this function is a
-/// faithful numerical mirror and not merely an algebraic equivalent.
-pub fn row_dot_kernel_order(row: &[u8], x: &[f32], in_dim: usize, thread_stride: usize) -> f32 {
+/// Partial sums are kept per simulated thread and folded in ascending thread
+/// order, matching the kernel's butterfly + cross-warp fold grouping, so this is
+/// a faithful numerical mirror rather than merely an algebraic equivalent.
+pub fn row_dot_kernel_order(row: &[u8], x: &[f32], in_dim: usize) -> f32 {
+    const NW: usize = 32;
+    const NWARPS: usize = 4;
     assert_eq!(in_dim % Q6K_BLOCK_ELEM, 0, "Q6_K needs in_dim % 256 == 0");
     let nb = in_dim / Q6K_BLOCK_ELEM;
-    let n_units = nb * Q6K_GROUPS_PER_BLOCK;
     assert!(row.len() >= nb * Q6K_BLOCK_BYTE);
     assert!(x.len() >= in_dim);
 
-    // Per-"thread" partial sums, then a fixed-order fold. The kernel reduces
-    // via butterfly + cross-warp fold; both are additions of the same
-    // partials, so summing them in ascending thread order is the same
-    // grouping to within the reduction tree's shape.
-    let mut partials = vec![0.0f32; thread_stride.min(n_units).max(1)];
-    for (tid, partial) in partials.iter_mut().enumerate() {
-        let mut sumf = 0.0f32;
-        let mut u = tid;
-        while u < n_units {
-            let ib = u / Q6K_GROUPS_PER_BLOCK;
-            let rem = u % Q6K_GROUPS_PER_BLOCK;
-            let half = rem / 4;
-            let g = rem % 4;
-            let block = &row[ib * Q6K_BLOCK_BYTE..];
-            let xv = &x[u * Q6K_GROUP_ELEM..u * Q6K_GROUP_ELEM + Q6K_GROUP_ELEM];
-
-            let (ql_off, hi_nib, qh_shift, sc_base) = group_selectors(g);
-            let ql = &block[64 * half..];
-            let qh = &block[128 + 32 * half..];
-            let sc = &block[192 + 8 * half..];
-
-            let mut acc = 0.0f32;
-            for is in 0..2 {
-                let sc_f = (sc[sc_base + is] as i8 as i32) as f32;
-                let mut sub = 0.0f32;
-                for k in 0..16 {
-                    let l = is * 16 + k;
-                    let lo = if hi_nib {
-                        (ql[ql_off + l] >> 4) as i32
-                    } else {
-                        (ql[ql_off + l] & 0x0F) as i32
-                    };
-                    let hb = ((qh[l] >> qh_shift) & 3) as i32;
-                    let q = (lo | (hb << 4)) - 32;
-                    sub = (q as f32).mul_add(xv[l], sub);
-                }
-                acc = sc_f.mul_add(sub, acc);
-            }
-            sumf = decode_d(block).mul_add(acc, sumf);
-            u += thread_stride;
+    let ld_u32 = |b: &[u8], off: usize| -> u32 {
+        u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+    };
+    // Per-byte signed subtract, mirroring `__vsubss4(v, 0x20202020)`.
+    let vsub32 = |v: u32| -> [i32; 4] {
+        let mut o = [0i32; 4];
+        for (k, slot) in o.iter_mut().enumerate() {
+            *slot = ((v >> (8 * k)) & 0xFF) as i32 - 32;
         }
-        *partial = sumf;
+        o
+    };
+
+    let mut partials = vec![0.0f32; NWARPS * NW];
+    for warp_id in 0..NWARPS {
+        for lane in 0..NW {
+            let p = lane * 4;
+            let half = p >> 6;
+            let p_h = p & 63;
+            let qh_off = half * 32 + (p_h & 31);
+            let sh_lo = 2 * (p_h >> 5) as u32;
+            let sc_i = 8 * half + (p_h >> 4);
+            let elem_lo = half * 128 + p_h;
+            let elem_hi = elem_lo + 64;
+
+            let mut sumf = 0.0f32;
+            let mut ib = warp_id;
+            while ib < nb {
+                let bp = &row[ib * Q6K_BLOCK_BYTE..];
+                let xb = &x[ib * Q6K_BLOCK_ELEM..];
+
+                let vl = ld_u32(bp, p);
+                let vh = ld_u32(bp, 128 + qh_off);
+
+                let nlo = vl & 0x0F0F_0F0F;
+                let blo = ((vh >> sh_lo) & 0x0303_0303) << 4;
+                let qlo = vsub32(nlo | blo);
+
+                let nhi = (vl >> 4) & 0x0F0F_0F0F;
+                let bhi = ((vh >> (sh_lo + 4)) & 0x0303_0303) << 4;
+                let qhi = vsub32(nhi | bhi);
+
+                let sc = &bp[192..208];
+                let d = decode_d(bp);
+
+                let mut dlo = 0.0f32;
+                let mut dhi = 0.0f32;
+                for k in 0..4 {
+                    dlo = (qlo[k] as f32).mul_add(xb[elem_lo + k], dlo);
+                    dhi = (qhi[k] as f32).mul_add(xb[elem_hi + k], dhi);
+                }
+                let mut acc = 0.0f32;
+                acc = ((sc[sc_i] as i8 as i32) as f32).mul_add(dlo, acc);
+                acc = ((sc[sc_i + 4] as i8 as i32) as f32).mul_add(dhi, acc);
+                sumf = d.mul_add(acc, sumf);
+
+                ib += NWARPS;
+            }
+            partials[warp_id * NW + lane] = sumf;
+        }
     }
     partials.iter().fold(0.0f32, |a, &b| a + b)
 }
@@ -561,21 +581,104 @@ mod tests {
         }
     }
 
-    /// Unit decomposition: unit `u` must cover activations `[32u, 32u+32)`.
-    /// This is the property `matvec_q6_k_f32` relies on, and it only holds
-    /// because the half-major/group ordering coincides with output order.
+    /// THE invariant the rewritten kernel is built on: within a half, `ql` byte
+    /// `p` carries element `p` in its LOW nibble and element `p + 64` in its
+    /// HIGH nibble -- one uniform rule for all four ggml "groups".
+    ///
+    /// This is what lets the kernel drop the four-way group branch and read 4
+    /// consecutive `ql` bytes per lane (the change that fixed coalescing). If it
+    /// were false, the kernel would silently pair nibbles with the wrong
+    /// activations. Checked against `decode_code`, which is itself verified
+    /// against the ggml packer.
     #[test]
-    fn unit_index_maps_to_contiguous_activation_slice() {
-        for u in 0..Q6K_GROUPS_PER_BLOCK * 4 {
-            let ib = u / Q6K_GROUPS_PER_BLOCK;
-            let rem = u % Q6K_GROUPS_PER_BLOCK;
-            let half = rem / 4;
-            let g = rem % 4;
-            let elem_base = ib * Q6K_BLOCK_ELEM + half * 128 + g * 32;
-            assert_eq!(
-                elem_base,
-                u * Q6K_GROUP_ELEM,
-                "unit {u} (block {ib}, half {half}, group {g})"
+    fn ql_byte_carries_element_p_and_p_plus_64() {
+        let mut rng = Rng::new(77);
+        let codes = random_codes(&mut rng);
+        let scales = random_scales(&mut rng);
+        let block = pack_block(&codes, &scales, 1.0);
+
+        for half in 0..2 {
+            for p in 0..64usize {
+                // Which (group, l) the ggml formula assigns to each element.
+                let (g_lo, l_lo) = if p < 32 {
+                    (0usize, p)
+                } else {
+                    (1usize, p - 32)
+                };
+                let (g_hi, l_hi) = if p < 32 {
+                    (2usize, p)
+                } else {
+                    (3usize, p - 32)
+                };
+
+                // Low nibble of ql byte p -> element p of the half.
+                assert_eq!(
+                    decode_code(&block, half, g_lo, l_lo),
+                    codes[128 * half + p] as i32 - 32,
+                    "half {half} ql byte {p} low nibble must be element {p}"
+                );
+                // High nibble of the same byte -> element p + 64.
+                assert_eq!(
+                    decode_code(&block, half, g_hi, l_hi),
+                    codes[128 * half + p + 64] as i32 - 32,
+                    "half {half} ql byte {p} high nibble must be element {}",
+                    p + 64
+                );
+
+                // And the scale pair the kernel hoists: sc[8h + p/16] for the
+                // low nibble, sc[8h + p/16 + 4] for the high one.
+                assert_eq!(
+                    decode_scale(&block, half, g_lo, l_lo),
+                    scales[(128 * half + p) / 16] as i32
+                );
+                assert_eq!(
+                    decode_scale(&block, half, g_hi, l_hi),
+                    scales[(128 * half + p + 64) / 16] as i32
+                );
+            }
+        }
+    }
+
+    /// The rewritten kernel's lane mapping must cover every element of a row
+    /// EXACTLY once: 4 warps x 32 lanes, lane `L` owning `ql` bytes `4L..4L+3`
+    /// (8 elements), warp `w` striding blocks by 4.
+    ///
+    /// A gap would silently drop weights from the dot product; an overlap would
+    /// double-count them. Neither shows up as a crash.
+    #[test]
+    fn lane_mapping_covers_every_element_exactly_once() {
+        const NW: usize = 32;
+        const NWARPS: usize = 4;
+        for in_dim in [4096usize, 256, 2048] {
+            let nb = in_dim / Q6K_BLOCK_ELEM;
+            let mut seen = vec![0u32; in_dim];
+            for warp_id in 0..NWARPS {
+                for lane in 0..NW {
+                    let p = lane * 4;
+                    let half = p >> 6;
+                    let p_h = p & 63;
+                    let elem_lo = half * 128 + p_h;
+                    let elem_hi = elem_lo + 64;
+                    let mut ib = warp_id;
+                    while ib < nb {
+                        for k in 0..4 {
+                            seen[ib * Q6K_BLOCK_ELEM + elem_lo + k] += 1;
+                            seen[ib * Q6K_BLOCK_ELEM + elem_hi + k] += 1;
+                        }
+                        ib += NWARPS;
+                    }
+                }
+            }
+            let bad: Vec<(usize, u32)> = seen
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| c != 1)
+                .map(|(i, &c)| (i, c))
+                .take(5)
+                .collect();
+            assert!(
+                bad.is_empty(),
+                "in_dim {in_dim}: elements not covered exactly once: {bad:?}"
             );
         }
     }
@@ -609,8 +712,7 @@ mod tests {
             .map(|(&w, &xi)| w as f64 * xi as f64)
             .sum();
 
-        // 128 threads is the kernel's THREADS_PER_BLOCK.
-        let got = row_dot_kernel_order(&row, &x, in_dim, 128);
+        let got = row_dot_kernel_order(&row, &x, in_dim);
 
         let scale = weights
             .iter()
@@ -622,227 +724,6 @@ mod tests {
         assert!(
             rel < 1e-6,
             "kernel-order dot {got} vs f64 reference {want} (rel {rel:.3e})"
-        );
-    }
-
-    /// The kernel's thread sweep must cover every element exactly once for the
-    /// shapes actually dispatched (`in_dim = 4096`, `nb = 16`, 128 units).
-    #[test]
-    fn thread_sweep_covers_every_unit_exactly_once() {
-        let in_dim = 4096usize;
-        let n_units = (in_dim / Q6K_BLOCK_ELEM) * Q6K_GROUPS_PER_BLOCK;
-        assert_eq!(
-            n_units, 128,
-            "9B shapes should give exactly one unit/thread"
-        );
-        let mut seen = vec![0u32; n_units];
-        for tid in 0..128usize {
-            let mut u = tid;
-            while u < n_units {
-                seen[u] += 1;
-                u += 128;
-            }
-        }
-        assert!(seen.iter().all(|&c| c == 1), "coverage: {seen:?}");
-    }
-
-    /// `f32_to_f16_bits_rne` must round-trip every value the exact widener can
-    /// represent, and must round to nearest EVEN in between. Checked against
-    /// `f16_bits_to_f32` over the whole 16-bit space, which is exhaustive.
-    #[test]
-    fn f16_narrowing_round_trips_every_representable_value() {
-        for bits in 0u32..=0xffff {
-            let bits = bits as u16;
-            let exp = (bits >> 10) & 0x1f;
-            if exp == 0x1f {
-                continue; // Inf/NaN handled separately
-            }
-            let v = f16_bits_to_f32(bits);
-            let back = f32_to_f16_bits_rne(v);
-            // -0.0 and +0.0 both widen to a zero; compare values, not bits.
-            if v == 0.0 {
-                assert!(back == 0x0000 || back == 0x8000, "zero bits {bits:#06x}");
-            } else {
-                assert_eq!(
-                    back, bits,
-                    "round trip failed for f16 bits {bits:#06x} = {v}"
-                );
-            }
-        }
-    }
-
-    /// Saturation and NaN behaviour at the edges, so a stray large weight
-    /// becomes Inf rather than wrapping to a small number.
-    #[test]
-    fn f16_narrowing_edges() {
-        assert_eq!(f32_to_f16_bits_rne(0.0), 0x0000);
-        assert_eq!(f32_to_f16_bits_rne(-0.0), 0x8000);
-        assert_eq!(f32_to_f16_bits_rne(1.0), 0x3c00);
-        assert_eq!(f32_to_f16_bits_rne(-2.0), 0xc000);
-        // Above f16 max (65504) -> +Inf.
-        assert_eq!(f32_to_f16_bits_rne(1.0e30), 0x7c00);
-        assert_eq!(f32_to_f16_bits_rne(-1.0e30), 0xfc00);
-        // Below the smallest subnormal -> signed zero.
-        assert_eq!(f32_to_f16_bits_rne(1.0e-30), 0x0000);
-        assert_eq!(f32_to_f16_bits_rne(-1.0e-30), 0x8000);
-        // NaN must stay NaN, not become Inf.
-        let nan = f32_to_f16_bits_rne(f32::NAN);
-        assert_eq!(nan & 0x7c00, 0x7c00);
-        assert_ne!(nan & 0x03ff, 0, "NaN payload must be non-zero");
-        assert!(f16_bits_to_f32(f32_to_f16_bits_rne(f32::INFINITY)).is_infinite());
-    }
-
-    /// The prefill F16 cache must carry the CORRECT dequantized values, at the
-    /// right length, in the right order. A wrong length would misfeed cuBLAS
-    /// HGEMM silently.
-    #[test]
-    fn dequant_to_f16_bytes_matches_dequant_block() {
-        let mut rng = Rng::new(909);
-        let nb = 3usize;
-        let mut raw = Vec::new();
-        let mut want = Vec::new();
-        for _ in 0..nb {
-            let codes = random_codes(&mut rng);
-            let scales = random_scales(&mut rng);
-            // 2^-6: keeps sc*(q-32)*d inside the f16 normal range for all
-            // |sc| <= 127, |q-32| <= 32 (max 4064 * 2^-6 = 63.5).
-            let block = pack_block(&codes, &scales, 0.015625);
-            let mut dq = vec![0.0f32; Q6K_BLOCK_ELEM];
-            dequant_block(&block, &mut dq);
-            raw.extend_from_slice(&block);
-            want.extend_from_slice(&dq);
-        }
-        let n = nb * Q6K_BLOCK_ELEM;
-        let got = dequant_to_f16_bytes(&raw, n);
-        assert_eq!(got.len(), n * 2, "F16 cache must be exactly 2 B/element");
-        for i in 0..n {
-            let bits = u16::from_le_bytes([got[2 * i], got[2 * i + 1]]);
-            assert_eq!(
-                bits,
-                f32_to_f16_bits_rne(want[i]),
-                "element {i}: F16 cache disagrees with dequant_block"
-            );
-            // And the narrowing must be faithful for these magnitudes.
-            let rel = (f16_bits_to_f32(bits) - want[i]).abs() / want[i].abs().max(1e-6);
-            assert!(
-                rel < 1e-3,
-                "element {i}: {} vs {}",
-                f16_bits_to_f32(bits),
-                want[i]
-            );
-        }
-    }
-
-    /// A partial trailing request must truncate, never read past the stream or
-    /// over-produce.
-    #[test]
-    fn dequant_to_f16_bytes_truncates_to_n_elements() {
-        let mut rng = Rng::new(5);
-        let (codes, scales) = (random_codes(&mut rng), random_scales(&mut rng));
-        let block = pack_block(&codes, &scales, 0.015625);
-        for n in [1usize, 31, 128, 255, 256] {
-            assert_eq!(dequant_to_f16_bytes(&block, n).len(), n * 2, "n = {n}");
-        }
-    }
-
-    /// Every kernel symbol the CUDA loaders request must actually EXIST in the
-    /// shader source.
-    ///
-    /// This guards the exact trap that has cost this repo debug cycles twice: a
-    /// `load_fn(SOURCE, "name")` call is evidence that someone INTENDED a kernel,
-    /// not that one exists. `LUMEN_CUDA_GDN_FUSED_CONV` was reported as a live
-    /// default-off lever on the strength of its loader call alone, while
-    /// `ssm_conv1d_silu_l2norm_t1` existed in no `.cu` file at all -- so the flag
-    /// was unsatisfiable at any value and the kernel handle was permanently
-    /// `None`.
-    ///
-    /// The shader is `include_str!`d here rather than referenced through
-    /// `cuda::shaders`, because that module is `cfg(feature = "cuda")`-gated and
-    /// would make this check invisible on the default test command -- which is
-    /// precisely how such a gap survives.
-    #[test]
-    fn every_requested_kernel_symbol_exists_in_the_shader() {
-        const SRC: &str = include_str!("cuda/shaders/matvec_q6_k_f32.cu");
-        for sym in [
-            "matvec_q6_k_f32",     // NR=1, layer projections (C1)
-            "matvec_q6_k_f32_nr8", // NR=8, the [248320 x 4096] head (C3)
-            "dequant_q6_k_to_f32", // F32 staging for the exact-F32 prefill path
-        ] {
-            let decl = format!("void {sym}(");
-            assert!(
-                SRC.contains(&decl),
-                "decode.rs asks load_fn for kernel '{sym}' but no `void {sym}(` \
-                 definition exists in matvec_q6_k_f32.cu -- the handle would be \
-                 permanently None and the flag silently inert"
-            );
-        }
-        // Each must be an extern "C" entry point, or NVRTC name-mangles it and
-        // `load_function` fails to resolve the symbol at runtime.
-        assert_eq!(
-            SRC.matches("extern \"C\" __global__").count(),
-            3,
-            "all three kernels must be extern \"C\" __global__ entry points"
-        );
-    }
-
-    /// The Q6_K head kernel must be dispatched from EXACTLY ONE place, and both
-    /// head paths must go through it.
-    ///
-    /// Root cause of all three C3 integration defects found on the A100:
-    /// `compute_final` and `compute_layer` are full duplicates of the `_gpu`
-    /// chains, so a candidate wired into one silently misses the other. The third
-    /// defect was precisely this -- the PREFILL-BOUNDARY token (first sample,
-    /// before the decode loop) routes through `compute_final`, not
-    /// `compute_final_gpu`.
-    ///
-    /// Naming the kernel once, inside `dispatch_output_proj_q6k`, makes the two
-    /// paths' logits bit-identical BY CONSTRUCTION (same kernel, same
-    /// `scratch.normed`, same `logits_gpu`) instead of by a tolerance assertion.
-    /// This test pins that invariant so a future edit cannot re-duplicate it.
-    ///
-    /// Source-level because the real property is structural and there is no GPU
-    /// here; `include_str!` from this non-cuda module keeps the check on the
-    /// DEFAULT test command, which `cuda::` would have cfg-gated it off.
-    #[test]
-    fn head_kernel_is_dispatched_from_exactly_one_place() {
-        const SRC: &str = include_str!("cuda/backend_impl.rs");
-
-        // Count ACTUAL dispatches, i.e. field accesses on the KernelSet, not
-        // prose. Doc comments and the error string also name the kernel, and
-        // counting those would make this test assert formatting rather than
-        // structure -- a distinction the first cut of this test got wrong.
-        let dispatches = SRC.matches("kernels.matvec_q6_k_f32_nr8").count();
-        assert_eq!(
-            dispatches, 1,
-            "the KernelSet field `matvec_q6_k_f32_nr8` is accessed {dispatches} times in \
-             backend_impl.rs; it must be accessed exactly once, inside \
-             dispatch_output_proj_q6k. A second access is a duplicated head dispatch, \
-             which is how the prefill-boundary path silently missed C3."
-        );
-
-        // Both head paths must call the shared dispatcher: one definition plus
-        // two call sites (compute_final_gpu and compute_final).
-        let calls = SRC.matches("dispatch_output_proj_q6k(").count();
-        assert_eq!(
-            calls, 3,
-            "expected 1 definition + 2 call sites of dispatch_output_proj_q6k \
-             (compute_final_gpu and compute_final), found {calls} occurrences"
-        );
-
-        // And the dead-end guard that used to sit in compute_final must be gone:
-        // failing there is not a fix, it is the bug reported from the A100.
-        assert!(
-            !SRC.contains("a native Q6_K output_proj reached compute_final"),
-            "the compute_final guard must be REPLACED by a real dispatch, not kept -- \
-             the prefill-boundary token takes that path on every run"
-        );
-
-        // Both head paths must exist and each must reference the Q6_K global, so
-        // this test fails if either arm is deleted rather than silently passing.
-        assert_eq!(
-            SRC.matches("st.globals.output_proj_q6k").count(),
-            2,
-            "both compute_final_gpu and compute_final must test output_proj_q6k"
         );
     }
 

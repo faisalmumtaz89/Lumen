@@ -1913,7 +1913,7 @@ pub(crate) fn create_backend(
     //
     // C3 (`LUMEN_CUDA_LMHEAD_Q6K=1`): Q6_K joins the allow-list so a Q6_K
     // `output.weight` reaches `set_output_proj_raw` and can be dispatched by the
-    // native `matvec_q6_k_f32_nr8` kernel at 0.8203 B/weight instead of being
+    // native `matvec_q6_k_f32_nr4` kernel at 0.8203 B/weight instead of being
     // requantized to Q8_0 (1.0625) at convert. Without the flag a Q6_K head is
     // rejected here exactly as before and arrives as F32 via
     // `set_global_tensors`, so flag-off behaviour is unchanged.

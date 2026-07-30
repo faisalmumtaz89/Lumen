@@ -773,7 +773,7 @@ struct GpuGlobals {
     output_proj_bf16: Option<CudaSlice<u8>>,
     /// Output projection as raw Q6_K bytes (candidate C3, `Some` only when
     /// `LUMEN_CUDA_LMHEAD_Q6K=1` AND the LBC actually stores the head as Q6_K).
-    /// Dispatched via `matvec_q6_k_f32_nr8` at 0.8203 B/weight -- the same byte
+    /// Dispatched via `matvec_q6_k_f32_nr4` at 0.8203 B/weight -- the same byte
     /// count llama.cpp reads -- instead of the 1.0625 B/weight Q8_0 the
     /// converter otherwise requantizes it to, which is 234.9 MiB/token on the
     /// 1,017,118,720-weight 9B head.
@@ -9587,7 +9587,7 @@ unsafe fn launch_matvec(
     )
 }
 
-/// Launch `matvec_q6_k_f32` / `matvec_q6_k_f32_nr8` (candidates C1/C3).
+/// Launch `matvec_q6_k_f32` / `matvec_q6_k_f32_nr4` (candidates C1/C3).
 ///
 /// Contract, matching the shader header:
 /// * args `(weight, x, out, out_dim, in_dim)`
@@ -9596,7 +9596,7 @@ unsafe fn launch_matvec(
 ///   `in_dim / 256`, so a ragged tail would read past the row. Checked here
 ///   rather than trusted: `upload_tensor` guards on the element count, but this
 ///   guards the SHAPE the caller passes, which is a different fact.
-/// * `nr` must match the kernel handle (1 for `matvec_q6_k_f32`, 8 for `_nr8`).
+/// * `nr` must match the kernel handle (1 for `matvec_q6_k_f32`, 4 for `_nr4`).
 ///
 /// Weight bytes read: `out_dim * (in_dim / 256) * 210`.
 #[allow(clippy::too_many_arguments)]
@@ -9670,7 +9670,7 @@ unsafe fn launch_matvec_q6_k(
 /// place removes that failure mode for this head instead of patching its third
 /// instance. `q6k_ref::head_kernel_is_dispatched_from_exactly_one_place` pins it.
 ///
-/// NR=8 matches the `matvec_q6_k_f32_nr8` handle; see `launch_matvec_q6_k`.
+/// NR=4 matches the `matvec_q6_k_f32_nr4` handle; see `launch_matvec_q6_k`.
 unsafe fn dispatch_output_proj_q6k(
     device: &CudaDevice,
     kernels: &KernelSet,
@@ -9681,15 +9681,15 @@ unsafe fn dispatch_output_proj_q6k(
     hidden_dim: usize,
 ) -> Result<(), RuntimeError> {
     crate::runtime_defaults::route_census_record("head", "HEAD_Q6K_NATIVE");
-    let f = kernels.matvec_q6_k_f32_nr8.as_ref().ok_or_else(|| {
+    let f = kernels.matvec_q6_k_f32_nr4.as_ref().ok_or_else(|| {
         RuntimeError::Compute(
-            "matvec_q6_k_f32_nr8 unavailable: LUMEN_CUDA_LMHEAD_Q6K is armed and the head \
+            "matvec_q6_k_f32_nr4 unavailable: LUMEN_CUDA_LMHEAD_Q6K is armed and the head \
              was uploaded as Q6_K, but the kernel failed to compile"
                 .to_string(),
         )
     })?;
     launch_matvec_q6_k(
-        device, f, proj_q6k, normed, logits, vocab_size, hidden_dim, 8, "head",
+        device, f, proj_q6k, normed, logits, vocab_size, hidden_dim, 4, "head",
     )
 }
 

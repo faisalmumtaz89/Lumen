@@ -3296,7 +3296,7 @@ pub fn qkv_decouple() -> bool {
 }
 
 /// `LUMEN_CUDA_LMHEAD_Q6K=1` (candidate C3) — accept a Q6_K `output.weight`
-/// from the LBC and dispatch it with the native `matvec_q6_k_f32_nr8` kernel
+/// from the LBC and dispatch it with the native `matvec_q6_k_f32_nr4` kernel
 /// instead of requantizing it to Q8_0 at convert time.
 ///
 /// This is the largest single format mismatch on the model: the lm_head is
@@ -3320,7 +3320,7 @@ pub fn lmhead_q6k() -> bool {
         if on {
             eprintln!(
                 "[Q6K] LMHEAD=ON: output.weight kept Q6_K (0.8203 B/w), \
-                 dispatch matvec_q6_k_f32_nr8; LBC suffix -q6khead"
+                 dispatch matvec_q6_k_f32_nr4; LBC suffix -q6khead"
             );
         }
         on

@@ -482,10 +482,10 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q4_split_q8_1: Option<CudaFunction>,
     // Native Q6_K matvec, F32 activations (0.8203 B/weight — llama.cpp parity).
     // `LUMEN_CUDA_Q6K_NATIVE=1` / `LUMEN_CUDA_LMHEAD_Q6K=1`. NR=1 for layer
-    // projections, NR=8 for the extreme-aspect-ratio head. Plain `load_fn`:
+    // projections, NR=4 for the extreme-aspect-ratio head. Plain `load_fn`:
     // baseline PTX only, no dp4a.
     pub(crate) matvec_q6_k_f32: Option<CudaFunction>,
-    pub(crate) matvec_q6_k_f32_nr8: Option<CudaFunction>,
+    pub(crate) matvec_q6_k_f32_nr4: Option<CudaFunction>,
     // Q6_K -> F32 staging dequant for the exact-F32 PREFILL path
     // (`LUMEN_CUDA_PREFILL_F32`), the sibling of dequant_q8_0_to_f32 /
     // dequant_q4_0_to_f32. Without it a native-Q6_K weight aborts prefill.
@@ -1814,19 +1814,19 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        matvec_q6_k_f32_nr8: match load_fn(
+        matvec_q6_k_f32_nr4: match load_fn(
             shaders::MATVEC_Q6_K_F32_KERNEL_SOURCE,
-            "matvec_q6_k_f32_nr8",
+            "matvec_q6_k_f32_nr4",
         ) {
             Ok(f) => {
-                cuda_log!("[CUDA] matvec_q6_k_f32_nr8: OK");
+                cuda_log!("[CUDA] matvec_q6_k_f32_nr4: OK");
                 Some(f)
             }
             Err(e) => {
                 if crate::runtime_defaults::lmhead_q6k() {
-                    eprintln!("[Q6K] matvec_q6_k_f32_nr8: NVRTC FAILED (flag armed): {e}");
+                    eprintln!("[Q6K] matvec_q6_k_f32_nr4: NVRTC FAILED (flag armed): {e}");
                 } else {
-                    cuda_log!("[CUDA] matvec_q6_k_f32_nr8: FAILED: {e}");
+                    cuda_log!("[CUDA] matvec_q6_k_f32_nr4: FAILED: {e}");
                 }
                 None
             }
