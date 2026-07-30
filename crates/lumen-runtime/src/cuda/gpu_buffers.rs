@@ -53,13 +53,24 @@ pub enum GpuWeightBuf {
     /// decodes through a 2.0 B/weight F16 cache, i.e. 2.44x more bytes than
     /// the competitor moves on the identical tensor.
     ///
-    /// No F16 cache is built for this variant (`dequant_layer_q8_to_f16`
-    /// returns `None`), which is deliberate: it makes the QKV coupling guard
-    /// in `compute_layer_gpu` unsatisfiable, so `wk`/`wv` on a mixed-precision
-    /// layer keep their native Q4 route.
+    /// An F16 cache IS still built for this variant, but only for batched
+    /// PREFILL: `launch_gemm_projection` / `launch_gemm_residual` have an
+    /// F16-cache fast path that fires before their `match weight`, so prefill
+    /// takes the same tensor-core HGEMM route it takes today. Decode never reads
+    /// that cache. Residency is therefore 0.8203 + 2.0 = 2.82 B/weight against
+    /// 4.0 + 2.0 = 6.0 for the default F32-plus-cache landing.
     ///
-    /// Prefill has no Q6_K path and returns an explicit error rather than
-    /// silently mis-dispatching; the flags are decode levers.
+    /// Having a cache does NOT re-arm the QKV coupling guard in
+    /// `compute_layer_gpu`: that guard is
+    /// `matches!(&lw.wq, GpuWeightBuf::F32(_)) && <caches exist>`, and a Q6KRaw
+    /// `wq` fails the first conjunct regardless. So `wk`/`wv` on a
+    /// mixed-precision layer still keep their native Q4 route.
+    ///
+    /// LIMITATION: the F16-cache pass early-returns for GDN layers (an
+    /// A100-80GB OOM guard), so a K-quant tensor on a GDN layer would get no
+    /// cache and prefill would fail loudly. That does not occur on
+    /// Qwen3.5-9B-Q4_0, whose only surviving K-quant layer tensor is `attn_q` on
+    /// the full-attention layers 3/15/27/31.
     Q6KRaw(CudaSlice<u8>),
     /// Repacked Q4_0 with 20-byte aligned blocks (2B scale + 2B pad + 16B nibbles).
     /// Nibble data at offset +4 is 4-byte aligned, enabling native int* loads
@@ -1270,13 +1281,43 @@ pub fn dequant_layer_q8_to_f16(
                 Ok(Some(f16_buf))
             }
             GpuWeightBuf::Q4Aligned(_) => Ok(None), // Q4Aligned uses dp4a path, no F16 cache needed
-            // Q6KRaw is consumed natively by `matvec_q6_k_f32`, so building an
-            // F16 cache would only add 2.0 B/weight of VRAM that decode never
-            // reads. Returning None here is also load-bearing for candidate C2:
-            // the QKV coupling guard in `compute_layer_gpu` requires
-            // `wq_f16.is_some()`, so a native Q6_K `wq` makes that guard
-            // unsatisfiable and `wk`/`wv` keep their native Q4 route.
-            GpuWeightBuf::Q6KRaw(_) => Ok(None),
+            // Q6KRaw (candidate C1) still needs an F16 cache, and NOT for
+            // decode -- decode reads the 0.8203 B/weight Q6_K bytes natively via
+            // `matvec_q6_k_f32`. The cache exists for batched PREFILL:
+            // `launch_gemm_projection` has an F16-cache fast path that fires
+            // BEFORE its `match weight`, so a Q6_K weight carrying a cache takes
+            // the identical tensor-core HGEMM route it takes today (today the
+            // weight is an F32 buffer plus an F16 cache, and the fast path fires
+            // on the cache, not the buffer). Without this arm, prefill would
+            // fall through to the explicit "Q6_K prefill matmul not implemented"
+            // error and arming C1 would abort at prompt processing -- which is
+            // exactly what the first cut of this candidate did.
+            //
+            // The Q6_K bytes are already on device, so this costs one load-time
+            // DtoH of the raw tensor (~27 MB per `attn_q`, 4 tensors) plus a host
+            // dequant. Residency becomes 0.8203 + 2.0 = 2.82 B/weight against
+            // 4.0 + 2.0 = 6.0 today, so the F32 buffer's 4.0 is still reclaimed.
+            //
+            // Critically this does NOT re-arm the QKV coupling guard: that guard
+            // is `matches!(&lw.wq, GpuWeightBuf::F32(_)) && <caches exist>`, and a
+            // Q6KRaw `wq` fails the first conjunct whatever its cache state. So
+            // C1 still subsumes C2 on the four affected layers.
+            //
+            // Uses the correct ggml mapping via `q6k_ref`, so the prefill cache
+            // is built from the TRUE weights even when `LUMEN_Q6K_LAYOUT_FIX` is
+            // off -- C1 fixes those tensors independently of C0.
+            GpuWeightBuf::Q6KRaw(q6) => {
+                let raw = device.dtoh_copy(q6)?;
+                let f16_bytes = crate::q6k_ref::dequant_to_f16_bytes(&raw, n);
+                if f16_bytes.len() != n * 2 {
+                    return Err(RuntimeError::Compute(format!(
+                        "Q6_K F16 cache: produced {} bytes for {n} elements (expected {})",
+                        f16_bytes.len(),
+                        n * 2
+                    )));
+                }
+                Ok(Some(device.htod_copy(&f16_bytes)?))
+            }
             _ => Ok(None), // F16Raw already in the right format for HGEMM -- no dequant needed
         }
     };

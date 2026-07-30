@@ -3220,7 +3220,23 @@ fn campaign_flag(name: &'static str) -> bool {
 ///
 /// On 9B-Q4 this applies to `attn_q` on layers 3/15/27/31 (the only K-quant
 /// that survives `ConvertTarget::Generic`), saving 151.0 MiB/token of weight
-/// traffic and 663.0 MiB of VRAM.
+/// traffic.
+///
+/// PREFILL IS UNCHANGED. An F16 cache is still built for a `Q6KRaw` weight, so
+/// `launch_gemm_projection`'s F16-cache fast path fires before its `match` and
+/// batched prefill runs the identical tensor-core HGEMM it runs today (today the
+/// weight is an F32 buffer plus an F16 cache, and that fast path keys on the
+/// cache, not the buffer). Without that cache, arming this flag aborts at prompt
+/// processing on the "Q6_K prefill matmul not implemented" arm. Residency is
+/// 0.8203 + 2.0 = 2.82 B/weight against 4.0 + 2.0 = 6.0, so ~425 MiB of VRAM is
+/// reclaimed across the four tensors rather than the 663.0 MiB a cache-free
+/// landing would give.
+///
+/// LIMITATION: the F16-cache pass early-returns for GDN layers (an A100-80GB
+/// OOM guard), so a K-quant tensor on a GDN layer would get no cache and prefill
+/// would fail loudly with a message naming this flag. That does not occur on
+/// Qwen3.5-9B-Q4_0. Setting `LUMEN_CUDA_PREFILL_F32` alongside this flag also
+/// reaches that error, because it disables the fast path.
 ///
 /// NOT byte-identical when ON: the native kernel reads the true Q6_K values,
 /// whereas the F32/F16 path today reads them through a host dequantiser with a

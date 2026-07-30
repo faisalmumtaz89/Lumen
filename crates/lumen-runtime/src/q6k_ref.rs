@@ -99,6 +99,96 @@ fn f32_to_f16_bits(v: f32) -> u16 {
     (sign << 15) | ((new_exp as u16) << 10) | ((frac >> 13) as u16)
 }
 
+/// Round-to-nearest-even binary32 -> binary16, with subnormal, overflow and
+/// NaN handling. Used to build the F16 cache a native-Q6_K weight still needs
+/// for the batched PREFILL HGEMM path.
+///
+/// Unlike the `metal::repack_q4` twin this is not `cfg(target_os = "macos")`,
+/// so it is available on the CUDA build.
+pub fn f32_to_f16_bits_rne(v: f32) -> u16 {
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let mut exp = ((b >> 23) & 0xff) as i32;
+    let mant = b & 0x7f_ffff;
+
+    if exp == 0xff {
+        // Inf / NaN. Preserve NaN-ness (a zero payload would turn NaN to Inf).
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+
+    exp -= 127;
+    if exp > 15 {
+        return sign | 0x7c00; // overflow -> Inf
+    }
+    if exp < -24 {
+        return sign; // underflows past the smallest subnormal -> signed zero
+    }
+
+    if exp < -14 {
+        // Subnormal f16: shift the implicit leading 1 into the mantissa.
+        let shift = (-14 - exp) as u32; // 1..=10
+        let m = mant | 0x80_0000;
+        let sig = m >> (shift + 13);
+        // Round to nearest even on the bits shifted out.
+        let rem_shift = shift + 13;
+        let half = 1u32 << (rem_shift - 1);
+        let rem = m & ((1u32 << rem_shift) - 1);
+        let mut out = sig;
+        if rem > half || (rem == half && (sig & 1) == 1) {
+            out += 1;
+        }
+        return sign | out as u16;
+    }
+
+    // Normal f16.
+    let mut sig = mant >> 13;
+    let rem = mant & 0x1fff;
+    let mut e = (exp + 15) as u32;
+    if rem > 0x1000 || (rem == 0x1000 && (sig & 1) == 1) {
+        sig += 1;
+        if sig == 0x400 {
+            // Mantissa carried out: bump the exponent.
+            sig = 0;
+            e += 1;
+            if e >= 31 {
+                return sign | 0x7c00;
+            }
+        }
+    }
+    sign | ((e as u16) << 10) | sig as u16
+}
+
+/// Dequantize a Q6_K byte stream straight to F16 bytes (2 B/element), using the
+/// CORRECT ggml mapping.
+///
+/// This is what lets a `GpuWeightBuf::Q6KRaw` weight keep working for batched
+/// PREFILL: `launch_gemm_projection` has an F16-cache fast path that fires
+/// before its `match weight`, so a Q6_K weight with an F16 cache takes the exact
+/// same tensor-core HGEMM route it takes today (today it is an F32 buffer plus an
+/// F16 cache, and the fast path fires on the cache, not the buffer). Decode
+/// meanwhile reads the 0.8203 B/weight Q6_K bytes natively.
+///
+/// Net residency for a native Q6_K weight is therefore 0.8203 + 2.0 = 2.82
+/// B/weight against 4.0 + 2.0 = 6.0 today.
+pub fn dequant_to_f16_bytes(raw: &[u8], n_elements: usize) -> Vec<u8> {
+    let n_blocks = raw.len() / Q6K_BLOCK_BYTE;
+    let mut out = Vec::with_capacity(n_elements * 2);
+    let mut scratch = [0.0f32; Q6K_BLOCK_ELEM];
+    for b in 0..n_blocks {
+        if out.len() / 2 >= n_elements {
+            break;
+        }
+        dequant_block(&raw[b * Q6K_BLOCK_BYTE..], &mut scratch);
+        for &v in scratch.iter() {
+            if out.len() / 2 >= n_elements {
+                break;
+            }
+            out.extend_from_slice(&f32_to_f16_bits_rne(v).to_le_bytes());
+        }
+    }
+    out
+}
+
 /// Which `(ql byte offset, high-nibble?, qh bit shift, scale base)` a group
 /// index `g` (0..4) selects. Mirrors `q6k_unit_dot` in `matvec_q6_k_f32.cu`.
 ///
@@ -554,6 +644,105 @@ mod tests {
             }
         }
         assert!(seen.iter().all(|&c| c == 1), "coverage: {seen:?}");
+    }
+
+    /// `f32_to_f16_bits_rne` must round-trip every value the exact widener can
+    /// represent, and must round to nearest EVEN in between. Checked against
+    /// `f16_bits_to_f32` over the whole 16-bit space, which is exhaustive.
+    #[test]
+    fn f16_narrowing_round_trips_every_representable_value() {
+        for bits in 0u32..=0xffff {
+            let bits = bits as u16;
+            let exp = (bits >> 10) & 0x1f;
+            if exp == 0x1f {
+                continue; // Inf/NaN handled separately
+            }
+            let v = f16_bits_to_f32(bits);
+            let back = f32_to_f16_bits_rne(v);
+            // -0.0 and +0.0 both widen to a zero; compare values, not bits.
+            if v == 0.0 {
+                assert!(back == 0x0000 || back == 0x8000, "zero bits {bits:#06x}");
+            } else {
+                assert_eq!(
+                    back, bits,
+                    "round trip failed for f16 bits {bits:#06x} = {v}"
+                );
+            }
+        }
+    }
+
+    /// Saturation and NaN behaviour at the edges, so a stray large weight
+    /// becomes Inf rather than wrapping to a small number.
+    #[test]
+    fn f16_narrowing_edges() {
+        assert_eq!(f32_to_f16_bits_rne(0.0), 0x0000);
+        assert_eq!(f32_to_f16_bits_rne(-0.0), 0x8000);
+        assert_eq!(f32_to_f16_bits_rne(1.0), 0x3c00);
+        assert_eq!(f32_to_f16_bits_rne(-2.0), 0xc000);
+        // Above f16 max (65504) -> +Inf.
+        assert_eq!(f32_to_f16_bits_rne(1.0e30), 0x7c00);
+        assert_eq!(f32_to_f16_bits_rne(-1.0e30), 0xfc00);
+        // Below the smallest subnormal -> signed zero.
+        assert_eq!(f32_to_f16_bits_rne(1.0e-30), 0x0000);
+        assert_eq!(f32_to_f16_bits_rne(-1.0e-30), 0x8000);
+        // NaN must stay NaN, not become Inf.
+        let nan = f32_to_f16_bits_rne(f32::NAN);
+        assert_eq!(nan & 0x7c00, 0x7c00);
+        assert_ne!(nan & 0x03ff, 0, "NaN payload must be non-zero");
+        assert!(f16_bits_to_f32(f32_to_f16_bits_rne(f32::INFINITY)).is_infinite());
+    }
+
+    /// The prefill F16 cache must carry the CORRECT dequantized values, at the
+    /// right length, in the right order. A wrong length would misfeed cuBLAS
+    /// HGEMM silently.
+    #[test]
+    fn dequant_to_f16_bytes_matches_dequant_block() {
+        let mut rng = Rng::new(909);
+        let nb = 3usize;
+        let mut raw = Vec::new();
+        let mut want = Vec::new();
+        for _ in 0..nb {
+            let codes = random_codes(&mut rng);
+            let scales = random_scales(&mut rng);
+            // 2^-6: keeps sc*(q-32)*d inside the f16 normal range for all
+            // |sc| <= 127, |q-32| <= 32 (max 4064 * 2^-6 = 63.5).
+            let block = pack_block(&codes, &scales, 0.015625);
+            let mut dq = vec![0.0f32; Q6K_BLOCK_ELEM];
+            dequant_block(&block, &mut dq);
+            raw.extend_from_slice(&block);
+            want.extend_from_slice(&dq);
+        }
+        let n = nb * Q6K_BLOCK_ELEM;
+        let got = dequant_to_f16_bytes(&raw, n);
+        assert_eq!(got.len(), n * 2, "F16 cache must be exactly 2 B/element");
+        for i in 0..n {
+            let bits = u16::from_le_bytes([got[2 * i], got[2 * i + 1]]);
+            assert_eq!(
+                bits,
+                f32_to_f16_bits_rne(want[i]),
+                "element {i}: F16 cache disagrees with dequant_block"
+            );
+            // And the narrowing must be faithful for these magnitudes.
+            let rel = (f16_bits_to_f32(bits) - want[i]).abs() / want[i].abs().max(1e-6);
+            assert!(
+                rel < 1e-3,
+                "element {i}: {} vs {}",
+                f16_bits_to_f32(bits),
+                want[i]
+            );
+        }
+    }
+
+    /// A partial trailing request must truncate, never read past the stream or
+    /// over-produce.
+    #[test]
+    fn dequant_to_f16_bytes_truncates_to_n_elements() {
+        let mut rng = Rng::new(5);
+        let (codes, scales) = (random_codes(&mut rng), random_scales(&mut rng));
+        let block = pack_block(&codes, &scales, 0.015625);
+        for n in [1usize, 31, 128, 255, 256] {
+            assert_eq!(dequant_to_f16_bytes(&block, n).len(), n * 2, "n = {n}");
+        }
     }
 
     /// A zero `d` (the packer's all-zero-block escape) must produce zeros, not
