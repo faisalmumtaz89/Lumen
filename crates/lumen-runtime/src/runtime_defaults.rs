@@ -3345,6 +3345,38 @@ pub fn q6k_report_armed_flags() {
     });
 }
 
+/// `LUMEN_CUDA_UNFUSED_NORM_QUANT=1` — dispatch the SEPARATE `rmsnorm` +
+/// `quantize_f32_to_q8_1` kernels instead of the fused `rmsnorm_to_q8_1`.
+///
+/// Dispatch-only: both kernels already exist and are already used elsewhere.
+/// This is the 30-minute empirical test for "does the FUSED kernel carry the
+/// int8 quality defect", isolating fusion from the quantizer itself.
+///
+/// Note what it does NOT change: both paths write the same Q8_1 header
+/// convention (`Q8_1_RAWSUM=0`, i.e. `s = d*sum(quants)`), because that is a
+/// compile-time define shared by both shaders. So if this flag moves quality,
+/// the defect is in the FUSION (the fused kernel's reduction, its rounding, or
+/// its scale derivation); if it does not, the convention itself is the suspect
+/// and `LUMEN_CUDA_Q8_1_RAWSUM=1` is the next lever. The two flags are
+/// deliberately independent so the campaign can separate those causes.
+///
+/// Default OFF, `"1"`-exact, marker on activation. Numerics are NOT expected to
+/// be byte-identical when ON — that is the point of the experiment.
+pub fn cuda_unfused_norm_quant() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = campaign_flag("LUMEN_CUDA_UNFUSED_NORM_QUANT");
+        if on {
+            eprintln!(
+                "[INT8] UNFUSED_NORM_QUANT=ON: separate rmsnorm + quantize_f32_to_q8_1 \
+                 replaces the fused rmsnorm_to_q8_1 at every decode feed point"
+            );
+        }
+        on
+    })
+}
+
 /// `LUMEN_BENCH_TOKEN_IDS=1` — INSTRUMENT-ONLY response surface.
 ///
 /// When set, `lumen-server` chat/completions responses additionally carry the

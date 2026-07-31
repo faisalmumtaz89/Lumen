@@ -2753,7 +2753,10 @@ impl CudaBackend {
 
                 // Fused RMSNorm + Q8_1: skip separate rmsnorm + quantize_f32_to_q8_1
                 // when the fused kernel is available. Saves 1 dispatch per norm site.
-                if qkv_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
+                if qkv_use_preq
+                    && st.kernels.rmsnorm_to_q8_1.is_some()
+                    && !crate::runtime_defaults::cuda_unfused_norm_quant()
+                {
                     let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
                     let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
                     let block_size = rmsnorm_block_size(hidden_dim);
@@ -3725,6 +3728,7 @@ impl CudaBackend {
                 && !mmvq_glu_opt_out
                 && st.kernels.fused_glu_gemv_q8_split_mmvq.is_some()
                 && st.kernels.rmsnorm_to_q8_1.is_some()
+                && !crate::runtime_defaults::cuda_unfused_norm_quant()
                 && st.scratch.input_q8_1.is_some()
                 && lw.q8_split_w_gate.is_some()
                 && lw.q8_split_w_up.is_some()
@@ -4332,7 +4336,10 @@ impl CudaBackend {
                     && st.kernels.quantize_f32_to_q8_1.is_some();
 
                 // Fused RMSNorm + Q8_1 for FFN: saves 1 dispatch per layer.
-                if ffn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
+                if ffn_use_preq
+                    && st.kernels.rmsnorm_to_q8_1.is_some()
+                    && !crate::runtime_defaults::cuda_unfused_norm_quant()
+                {
                     let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
                     let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
                     let block_size = rmsnorm_block_size(hidden_dim);
@@ -5440,7 +5447,10 @@ impl CudaBackend {
         // cannot move work out of the phase table.
         prof::begin(Ph::GdnQkv, &self.device.stream);
 
-        if gdn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
+        if gdn_use_preq
+            && st.kernels.rmsnorm_to_q8_1.is_some()
+            && !crate::runtime_defaults::cuda_unfused_norm_quant()
+        {
             // === FUSED: RMSNorm + Q8_1 quantize in 1 dispatch ===
             // Then all 3 matvecs (QKV, alpha, beta) use launch_matvec_preq8_1
             // sharing the single quantized input. Saves 4 separate quantize dispatches.
