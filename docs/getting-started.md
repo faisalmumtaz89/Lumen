@@ -1,6 +1,6 @@
 # Getting Started with Lumen
 
-Lumen runs **LLM inference in Rust, for Apple Silicon and NVIDIA CUDA**. Built from scratch with zero ML dependencies — no PyTorch, no ONNX, no Python runtime. v1 (current) ships verified support for **Qwen3.5-9B**, **Qwen3.6-27B**, and **Qwen3.5-MoE 35B-A3B**; additional model families are planned.
+Lumen runs **LLM inference in Rust, for Apple Silicon and NVIDIA CUDA**. Built from scratch with zero ML dependencies — no PyTorch, no ONNX, no Python runtime. v1 (current) ships verified support for **Qwen3.5-9B**, **Qwen3.6-27B**, **Qwen3.8-27B**, and **Qwen3.5-MoE 35B-A3B**; additional model families are planned.
 
 This page is the 5-minute path: install, pull a model, run inference. The Qwen3.5 examples below reflect what is currently shipped end-to-end — more model families coming.
 
@@ -32,7 +32,7 @@ Reference: top-level [`README.md`](../README.md) § Build.
 
 ## 2. Pull a model
 
-The registry currently lists v1 cells (Qwen3.5 family). Future model families will appear here as they ship.
+The registry currently lists the v1 cells (Qwen3.5 family plus the Qwen3.6-27B and Qwen3.8-27B dense models). Future model families will appear here as they ship.
 
 ```bash
 # Default: Qwen3.5-9B at Q8_0 (~10 GB GGUF download, converts to LBC on first use)

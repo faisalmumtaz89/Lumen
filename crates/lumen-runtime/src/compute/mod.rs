@@ -454,6 +454,27 @@ pub trait ComputeBackend: Send + Sync {
     /// Reset recurrent state (GDN h_state, conv_state).
     fn reset_recurrent_state(&self) {}
 
+    /// Reconcile speculative decode-ahead with the host KV cursor before a
+    /// warm append repairs the un-fed tail token.
+    ///
+    /// A pipelined decode path (Metal's lean greedy pipeline) keeps one
+    /// committed command buffer in flight beyond the last returned token; that
+    /// CB has already processed the tail token device-side (KV slot written,
+    /// recurrent state advanced) while the host cursor still lags by one.
+    /// Re-feeding the tail in that state advances GDN recurrent state TWICE
+    /// and corrupts the continuation.
+    ///
+    /// Returns `true` when the backend had such a speculative step in flight
+    /// (now synchronized): the caller must only advance the host KV cursor
+    /// instead of re-feeding the tail. The default (no speculation) returns
+    /// `false`.
+    fn reconcile_speculative_tail(
+        &self,
+        _kv: &mut crate::kv::KvCache,
+    ) -> Result<bool, RuntimeError> {
+        Ok(false)
+    }
+
     // ====================================================================
     // disk-KV save/load sync hooks.
     // ====================================================================

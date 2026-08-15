@@ -1,14 +1,14 @@
 # Lumen Model Support Matrix
 
-This page is the source of truth for what is currently **verified-against-llama.cpp** end-to-end. Lumen runs LLM inference in Rust for Apple Silicon and NVIDIA CUDA; v1 (current) verifies the Qwen3.5 family and additional model families are planned. Architectures outside the v1 set (llama, mistral, qwen2, phi, gemma) are currently rejected at GGUF conversion because they have not yet been gated end-to-end on this runtime.
+This page is the source of truth for what is currently **verified-against-llama.cpp** end-to-end. Lumen runs LLM inference in Rust for Apple Silicon and NVIDIA CUDA; v1 (current) verifies the Qwen3.5 family plus the Qwen3.6-27B and Qwen3.8-27B dense models; additional model families are planned. Architectures outside the v1 set (llama, mistral, qwen2, phi, gemma) are currently rejected at GGUF conversion because they have not yet been gated end-to-end on this runtime.
 
 ## What is verified
 
-Each backend (CUDA + Metal) is validated end-to-end on the full models × quants matrix against llama.cpp (2026-06-02).
+Each backend (CUDA + Metal) is validated end-to-end against llama.cpp per the matrices below; validation dates are per row, and cells marked N/A are excluded by capacity policy rather than validated.
 
 ### CUDA (NVIDIA, compute capability 8.0+ — Ampere / Hopper)
 
-Benchmarked on an A100-80GB; see [`bench/RESULTS.md`](../bench/RESULTS.md) for the rig and full numbers.
+Benchmarked on an A100-80GB (27B-class BF16 cells on H100 — sm_80 routes BF16 through F32 and cannot hold them); see [`bench/RESULTS.md`](../bench/RESULTS.md) for the rig and full numbers.
 
 | Model | Quant | Status | × llama.cpp decode (canonical) | Notes |
 |-------|-------|--------|------:|---|
@@ -20,7 +20,10 @@ Benchmarked on an A100-80GB; see [`bench/RESULTS.md`](../bench/RESULTS.md) for t
 | Qwen3.5-MoE-35B-A3B | BF16 | Production-ready with caveats | 0.902× llama.cpp (recommended) | Requires dedicated 80 GB+ GPU (peak 72.4 GB) |
 | Qwen3.6-27B dense | Q8_0 | Production-ready | 0.85× llama.cpp | All quality gates pristine (2026-06-11 checklist) |
 | Qwen3.6-27B dense | Q4_0 | Production-ready | 0.66× llama.cpp | All quality gates pristine |
-| Qwen3.6-27B dense | BF16 | Production-ready | 0.89× llama.cpp | All quality gates pristine |
+| Qwen3.6-27B dense | BF16 | Production-ready | 0.89× llama.cpp | All quality gates pass; shares the deterministic stray-first-token issue noted on the Qwen3.8-27B BF16 row |
+| Qwen3.8-27B dense | Q8_0 | Production-ready | **1.02× llama.cpp** | All quality gates pristine + DET-001 50/50 (2026-08-14, A100; llama.cpp b10032 co-located, same GGUF) |
+| Qwen3.8-27B dense | Q4_0 | Production-ready | 0.93× llama.cpp | All quality gates pristine + DET-001 50/50 (2026-08-14, A100) |
+| Qwen3.8-27B dense | BF16 | Production-ready (H100 / sm_90) | 0.87× llama.cpp | All quality gates pass + DET-001 50/50 (2026-08-14, H100 — sm_90 native BF16). Known issue: a deterministic stray first token at BF16, shared with Qwen3.6-27B BF16 (tracked prefill-numerics issue) |
 
 ### Metal (Apple Silicon, M-series)
 
@@ -35,7 +38,10 @@ Benchmarked on an M3 Ultra; see [`bench/RESULTS.md`](../bench/RESULTS.md) for th
 | Qwen3.5-MoE-35B-A3B | Q4_0 | Production-ready (functional) | 0.18× | 0.08× | Same mmap default; same MoE-perf caveat |
 | Qwen3.6-27B dense | Q8_0 | Production-ready | **1.03× (beats llama.cpp)** | 0.86× | All quality gates pristine (2026-06-11) |
 | Qwen3.6-27B dense | Q4_0 | Production-ready | 0.99× | 0.82× | All quality gates pristine |
-| Qwen3.6-27B dense | BF16 | Production-ready | — | — | All quality gates pristine; perf row pending |
+| Qwen3.6-27B dense | BF16 | N/A on Metal | — | — | Same ~50 GiB capacity-margin arithmetic as the Qwen3.8-27B BF16 row below; validated on CUDA H100 instead |
+| Qwen3.8-27B dense | Q8_0 | Production-ready | **1.15× (beats llama.cpp)** | — | All quality gates pristine + DET-001 50/50 (2026-08-14, M3 Ultra; llama.cpp b10032, same GGUF); prefill row pending |
+| Qwen3.8-27B dense | Q4_0 | Production-ready | **1.30× (beats llama.cpp)** | — | All quality gates pristine + DET-001 50/50 (2026-08-14); prefill row pending |
+| Qwen3.8-27B dense | BF16 | N/A on Metal | — | — | ~50 GiB weights sit inside the capacity margin policy on the 96 GB test rig (same arithmetic as Qwen3.6-27B BF16); validated on CUDA H100 instead |
 
 ## What is not (yet) supported
 
