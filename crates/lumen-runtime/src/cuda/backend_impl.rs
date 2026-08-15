@@ -6448,7 +6448,10 @@ impl CudaBackend {
             if let (Some(split_buf), Some(quant_fn), Some(q8_1_buf)) = (
                 lw.q8_split_ssm_out.as_ref(),
                 st.kernels.quantize_q8_1_rawsum.as_ref(),
-                st.scratch.input_q8_1.as_mut(),
+                st.scratch
+                    .input_q8_1
+                    .as_mut()
+                    .filter(|b| b.len() >= p.value_dim.div_ceil(32) * 36),
             ) {
                 let in_dim_u32 = p.value_dim as u32;
                 let q_blocks = in_dim_u32.div_ceil(32);
@@ -11568,10 +11571,8 @@ unsafe fn repack_all_layers_q8_clone_to_split(
         // the same mmvq/scalar family, different weight layout.
         if crate::runtime_defaults::q8_split_ssmout_enabled() {
             if let Some(w) = layer.ssm_out.as_ref() {
-                let vdim = hp
-                    .gdn
-                    .map(|g| (g.num_v_heads * g.head_dim) as usize)
-                    .unwrap_or(0);
+                let gd = hp.gdn_dims();
+                let vdim = (gd.num_v_heads * gd.head_dim) as usize;
                 if vdim > 0 {
                     push_if_q8raw(
                         &mut jobs,
