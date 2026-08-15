@@ -7,6 +7,59 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-08-15
+
+### Added
+
+- **Qwen3.8-27B day-zero support** (`qwen3.8-27b`, Q8_0 / Q4_0 / BF16). The
+  model ships the same `qwen35` (GatedDeltaNet, dense) GGUF architecture and
+  shapes as Qwen3.6-27B, so all existing 27B kernels and optimizations apply
+  directly. The revised Qwen3.8 chat template (`reasoning_effort` system
+  preamble, `preserve_thinking`, tojson argument serialization) renders
+  byte-identical to HuggingFace's `render_jinja_template` across a 58-shape
+  conformance corpus (fixtures + test included). Validated end-to-end on both
+  backends: quality suites, DET-001 byte-determinism (50/50 on all five
+  runnable cells), multi-turn GQ-014 (8/8 with replay determinism and
+  cold-respawn cache-equivalence), and the native tool-calling battery.
+  Decode vs llama.cpp b10032 on identical weights: Metal Q4 1.30× / Q8 1.15×
+  (M3 Ultra), CUDA Q4 0.93× / Q8 1.02× (A100), BF16 0.87× (H100).
+- `ComputeBackend::reconcile_speculative_tail`: lets the session detect that
+  a pipelined decode path already processed the trailing token device-side
+  (Metal's lean greedy pipeline keeps one speculative command buffer in
+  flight) so warm continuations advance the KV cursor instead of feeding the
+  token twice.
+
+### Fixed
+
+- **Warm-session KV lag (all backends).** A completed generation left the
+  final sampled token in the transcript without its forward pass
+  (`kv.seq_len() == tokens.len() - 1`). A follow-up request that extended
+  the session's exact token history then either failed with an HTTP 500
+  (`prefill_from` start-position assert, batched path) or silently wrote
+  every appended token one KV slot early, producing wrong output
+  (short-suffix path). The session now reconciles the un-fed tail at every
+  append entry — suffix prefill, warm `extend` (including the server's
+  forced-`</think>` injection), and the macOS external-prefill path — and
+  reports the repair in `processed_tokens` / prefill timing.
+- GDN warm appends now advance token-by-token: the batched prefill resume
+  does not continue live recurrent state (h_state / conv_state) mid-stream.
+- A sampling-route switch over a live speculative pipeline (e.g. a greedy
+  request followed by a temperature request reusing the same session) now
+  cold-rebuilds instead of double-advancing GDN recurrent state.
+- Quickstart accepted neither `qwen3.6-27b` nor `qwen3.8-27b`; both are now
+  in the model catalog, name validation, and help text.
+
+### Quality gates
+
+- DD-SPAM assesses raw units first (unchanged strictness) and applies a
+  bounded markdown-table-line exemption — 2–16 pipes per line with
+  Unicode-aware cell content or an alignment row — only when the dominant
+  unit is table scaffolding, fixing a false FAIL on a legitimate
+  table-closing answer while adversarial glyph streams still fire.
+- `window_detectors` windows keep their original 256/128 word membership but
+  are sliced from the source text by character spans, preserving line
+  structure for line-aware detectors.
+
 ## [0.5.0] — 2026-07-25
 
 ### Added
@@ -138,7 +191,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.5.0...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.2.0...v0.3.0
