@@ -222,6 +222,8 @@ MODELS (registry source of truth: model_registry.toml):
                          all downloadable.
     qwen3.6-27b          Q8_0 (~29 GB), Q4_0 (~15 GB), BF16 (~55 GB 2-shard)
                          all downloadable.
+    qwen3.8-27b          Q8_0 (~29 GB), Q4_0 (~16 GB), BF16 (~55 GB 2-shard)
+                         all downloadable.
 
     Quickstart only auto-pulls the combos above; any other (model, quant) is
     refused with guidance (prepare it yourself, then re-run --model <path.lbc>).
@@ -424,6 +426,11 @@ build_catalog() {
   _catalog_add "qwen3.6-27b:q8_0" "~29 GB" "~30 GB" "~56 GB" "Dense 27B, 8-bit (best quality)" "1"
   _catalog_add "qwen3.6-27b:q4_0" "~15 GB" "~16 GB" "~29 GB" "Dense 27B, 4-bit (smaller)" "1"
   _catalog_add "qwen3.6-27b:bf16" "~55 GB" "~56 GB" "~105 GB" "Dense 27B, full precision" "1"
+  # Dense Qwen3.8-27B — identical shapes/sizes to Qwen3.6-27B (same GDN
+  # ratio-3 architecture, retrained weights).
+  _catalog_add "qwen3.8-27b:q8_0" "~29 GB" "~29 GB" "~58 GB" "Dense 27B (Qwen3.8), 8-bit (best quality)" "1"
+  _catalog_add "qwen3.8-27b:q4_0" "~16 GB" "~17 GB" "~33 GB" "Dense 27B (Qwen3.8), 4-bit (smaller)" "1"
+  _catalog_add "qwen3.8-27b:bf16" "~55 GB" "~53 GB" "~108 GB" "Dense 27B (Qwen3.8), full precision" "1"
 }
 
 # Find the catalog index for a "<model>:<quant>" spec. Echoes index or "-1".
@@ -470,7 +477,11 @@ KNOWN_MODELS="qwen3-5-9b
 qwen3.5-9b
 qwen3-5-moe-35b-a3b
 qwen3.5-moe-35b-a3b
-qwen3.5-moe"
+qwen3.5-moe
+qwen3-6-27b
+qwen3.6-27b
+qwen3-8-27b
+qwen3.8-27b"
 
 model_looks_like_path() {
   case "$1" in
@@ -502,6 +513,10 @@ canonical_model_name() {
       printf '%s' "qwen3.5-9b" ;;
     qwen3-5-moe-35b-a3b|qwen3.5-moe-35b-a3b|qwen3.5-moe)
       printf '%s' "qwen3.5-moe-35b-a3b" ;;
+    qwen3-6-27b|qwen3.6-27b)
+      printf '%s' "qwen3.6-27b" ;;
+    qwen3-8-27b|qwen3.8-27b)
+      printf '%s' "qwen3.8-27b" ;;
     *)
       printf '%s' "$1" ;;
   esac
@@ -1153,6 +1168,8 @@ validate_selection() {
     log_error "Known models (from model_registry.toml):"
     log_error "  qwen3.5-9b"
     log_error "  qwen3.5-moe-35b-a3b   (alias: qwen3.5-moe)"
+    log_error "  qwen3.6-27b"
+    log_error "  qwen3.8-27b"
     log_error "Run 'lumen models' for the live registry + cached LBCs."
     die "model name not recognized"
   fi

@@ -3269,6 +3269,32 @@ impl ComputeBackend for MetalF32Backend {
         self.reset_gdn_state();
     }
 
+    fn reconcile_speculative_tail(
+        &self,
+        kv: &mut crate::kv::KvCache,
+    ) -> Result<bool, RuntimeError> {
+        // The lean greedy pipeline leaves exactly one committed CB in flight
+        // past the last returned token; it processes the tail token at
+        // position `kv.seq_len()` (KV slot written, GDN state advanced)
+        // before the host cursor accounts for it. Drain, and report whether a
+        // drained CB covered that tail slot so the caller advances the cursor
+        // instead of re-feeding.
+        let mut guard = self
+            .scratch
+            .lock()
+            .map_err(|_| RuntimeError::Compute("Metal scratch lock poisoned".into()))?;
+        let Some(s) = guard.as_mut() else {
+            return Ok(false);
+        };
+        if s.pipe_inflight.is_empty() {
+            return Ok(false);
+        }
+        let tail_pos = kv.seq_len();
+        let covered = s.pipe_inflight.iter().any(|(_, _, seq)| *seq == tail_pos);
+        Self::pipe_drain_locked(s);
+        Ok(covered)
+    }
+
     /// drain pending GPU work, transpose F16 KV from the
     /// Metal-native layout into the CPU mirror, and optionally extract the
     /// GDN recurrent state. The CPU buffer this writes into is what the

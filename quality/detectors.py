@@ -217,7 +217,37 @@ def dd_subword(text: str) -> DetectorResult:
 # DD-SPAM — no single token/word > 20% of a >50-unit output
 # ---------------------------------------------------------------------------
 
+# Markdown table/rule structure: units made only of pipes, colons, and dashes
+# ('|', ':---', '---:', '|------|------|'). These are formatting, not content —
+# a table-dense 256-word window legitimately pushes '|' past any content
+# threshold (a real 27B-Q8 vlong answer closed with a summary table whose final
+# window was 22.7% '|').
+_MD_STRUCT_RE = re.compile(r"^[|:\-]+$")
+
+# A proper markdown table LINE: 2–16 pipes (a real table has columns+1 pipes,
+# far under 16) and either word-character cell content (`[^\W_]` — Unicode
+# letters/digits, so non-Latin tables qualify) or a pure alignment row built
+# only of pipes/colons/dashes/spaces. Free-floating glyph streams fail the
+# pipe bound or the shape.
+_ALIGN_ROW_RE = re.compile(r"^\s*\|[\s:\-|]*\|\s*$")
+
+
+def _is_table_line(line: str) -> bool:
+    pipes = line.count("|")
+    if not 2 <= pipes <= 16:
+        return False
+    return bool(re.search(r"[^\W_]", line)) or bool(_ALIGN_ROW_RE.match(line))
+
+
 def dd_spam(text: str, token_ids: list[int] | None = None) -> DetectorResult:
+    """Frequency gate over RAW units first — identical strictness to the
+    original detector for every non-table stream (nothing is excluded up
+    front, so padding/interleaving games cannot weaken it). Only when the
+    offending unit is itself table scaffolding does the table exemption
+    engage: units on properly-shaped table lines are removed and the gate is
+    re-applied to the remainder, so legitimate tables of any compactness and
+    any script stay green while glyph gluts that are not shaped like tables
+    still fire."""
     units = token_ids if token_ids is not None else [w.lower() for w in _words(text)]
     if len(units) <= 50:
         return DetectorResult("DD-SPAM", True, "too short to assess")
@@ -226,9 +256,36 @@ def dd_spam(text: str, token_ids: list[int] | None = None) -> DetectorResult:
         counts[u] = counts.get(u, 0) + 1
     top, c = max(counts.items(), key=lambda kv: kv[1])
     frac = c / len(units)
-    if frac > 0.20:
+    if frac <= 0.20:
+        return DetectorResult("DD-SPAM", True, f"max unit {frac:.1%}")
+    if token_ids is not None or not _MD_STRUCT_RE.match(str(top)):
         return DetectorResult("DD-SPAM", False, f"unit {top!r} is {frac:.1%} of output")
-    return DetectorResult("DD-SPAM", True, f"max unit {frac:.1%}")
+    # The dominant unit is table scaffolding: re-assess without proper table
+    # lines. A window that is genuinely a table loses its scaffolding here; a
+    # glyph glut is not shaped like table rows and keeps firing.
+    kept = [
+        w.lower()
+        for line in text.splitlines()
+        if not _is_table_line(line)
+        for w in _words(line)
+    ]
+    if len(kept) <= 50:
+        return DetectorResult(
+            "DD-SPAM", True, f"unit {top!r} {frac:.1%} is table scaffolding"
+        )
+    kcounts: dict = {}
+    for u in kept:
+        kcounts[u] = kcounts.get(u, 0) + 1
+    ktop, kc = max(kcounts.items(), key=lambda kv: kv[1])
+    kfrac = kc / len(kept)
+    if kfrac > 0.20:
+        return DetectorResult(
+            "DD-SPAM", False,
+            f"unit {ktop!r} is {kfrac:.1%} of output outside table lines",
+        )
+    return DetectorResult(
+        "DD-SPAM", True, f"max unit outside table lines {kfrac:.1%}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +546,93 @@ _SELFTEST = [
         "little patient practice you will develop a reliable instinct for the small "
         "adjustments that matter most. Happy brewing!",
         False, False, set(),
+    ),
+    (
+        # REAL capture (27B-Q8 vlong-explain-01 tail): the answer closes with
+        # a "Summary of the Flow" markdown table where '|' is ~23% of the
+        # window's raw units. The table-line exemption (engaged only when the
+        # dominant unit is scaffolding) removes the properly-shaped rows and
+        # the remaining prose is clean, so this must PASS.
+        "markdown_table_dense_window (REAL 27b-q8 vlong DD-SPAM false-fire guard, should PASS)",
+        "the display in real-time.\n\n---\n\n## Summary of the Flow\n\n"
+        "| Step | Technology | Key Action |\n"
+        "|------|------------|------------|\n"
+        "| 1 | **DNS** | Resolve domain name to IP address |\n"
+        "| 2 | **TCP/IP** | Establish reliable connection via three-way handshake |\n"
+        "| 3 | **TLS** | Secure the channel with encryption and authentication |\n"
+        "| 4 | **HTTP** | Send GET request and receive HTML response |\n"
+        "| 5 | **Browser Engine** | Parse HTML/CSS, fetch resources, build DOM/CSSOM |\n"
+        "| 6 | **Rendering** | Create Render Tree, calculate layout, paint pixels |\n"
+        "| 7 | **JavaScript** | Execute logic, handle events, update UI dynamically |\n\n"
+        "This entire process typically completes in under a second for well-optimized websites, "
+        "thanks to parallelism, caching, and hardware acceleration. Understanding these layers "
+        "helps developers diagnose performance issues, security vulnerabilities, and connectivity "
+        "problems effectively.",
+        False, False, set(),
+    ),
+    (
+        # Non-Latin compact table: the cell-content test is Unicode-aware
+        # ([^\W_]), so an Arabic 4x8 table's scaffolding is exempt exactly
+        # like the ASCII one. Must PASS.
+        "compact_table_arabic (DD-SPAM Unicode table guard, should PASS)",
+        "| \u0627\u0644\u0627\u0633\u0645 | \u0627\u0644\u0646\u0648\u0639 | \u0627\u0644\u062d\u062c\u0645 | \u0645\u0644\u0627\u062d\u0638\u0629 |\n"
+        "| :--- | :--- | :--- | :--- |\n"
+        "| \u0639\u0646\u0635\u06311 | \u0646\u0648\u06391 | 1 | \u062c\u064a\u062f |\n"
+        "| \u0639\u0646\u0635\u06312 | \u0646\u0648\u06392 | 4 | \u062c\u064a\u062f |\n"
+        "| \u0639\u0646\u0635\u06313 | \u0646\u0648\u06393 | 7 | \u062c\u064a\u062f |\n"
+        "| \u0639\u0646\u0635\u06314 | \u0646\u0648\u06391 | 10 | \u062c\u064a\u062f |\n"
+        "| \u0639\u0646\u0635\u06315 | \u0646\u0648\u06392 | 13 | \u062c\u064a\u062f |\n"
+        "| \u0639\u0646\u0635\u06316 | \u0646\u0648\u06393 | 16 | \u062c\u064a\u062f |\n"
+        "| \u0639\u0646\u0635\u06317 | \u0646\u0648\u06391 | 19 | \u062c\u064a\u062f |\n"
+        "| \u0639\u0646\u0635\u06318 | \u0646\u0648\u06392 | 22 | \u062c\u064a\u062f |",
+        False, False, set(),
+    ),
+    (
+        # Degenerate pipe/dash spam: proves the DD-SPAM structural-unit exclusion
+        # opens no hole — a stream of pure table scaffolding is still caught by
+        # DD-CHARSPAM (periodic char stream once whitespace collapses).
+        "pipe_spam (DD-SPAM exclusion hole guard, should FAIL DD-CHARSPAM)",
+        "| | --- | | " * 80,
+        False, True, {"DD-CHARSPAM"},
+    ),
+    (
+        # Compact legitimate table with minimal prose (4 columns x 8 rows: 90
+        # raw units, ~36 content units, 50 pipes). The DD-SPAM raw fallback is
+        # gated on the window being essentially glyph-only, so a real table
+        # whose cells carry alphanumeric content must PASS even though the
+        # structural exclusion collapses it below the assessment floor.
+        "compact_table (DD-SPAM raw-fallback table guard, should PASS)",
+        "| Name | Type | Size | Note |\n"
+        "| :--- | :--- | :--- | :--- |\n"
+        "| item0 | kind0 | 1 | ok |\n"
+        "| item1 | kind1 | 4 | ok |\n"
+        "| item2 | kind2 | 7 | ok |\n"
+        "| item3 | kind0 | 10 | ok |\n"
+        "| item4 | kind1 | 13 | ok |\n"
+        "| item5 | kind2 | 16 | ok |\n"
+        "| item6 | kind0 | 19 | ok |\n"
+        "| item7 | kind1 | 22 | ok |",
+        False, False, set(),
+    ),
+    (
+        # Aperiodic structural-glyph stream: 60 '|' among 140 varied pipe/dash
+        # units, shuffled (no period, char-8gram ratio above the DD-CHARSPAM
+        # floor). The DD-SPAM structural exclusion must NOT open a hole here:
+        # when exclusion collapses a long window below the assessment floor,
+        # DD-SPAM re-assesses the raw units and the 30% '|' concentration
+        # fires.
+        "aperiodic_structural_glut (DD-SPAM raw-fallback guard, should FAIL DD-SPAM)",
+        '---: | |: :--- | | ---- |: |: | | ::-- ---: ---- | :--- ---: ---: |: ::-- |--| ---: :--- :--- | ---- | ::-- ---: |: | | :| :| |: | |: ---: | | |--| | ---: ---: :--- ---- ---- :| ---- |--| | |: :| ---: |: | | ::-- :--- ---- | | |: ---: | | :| |--| | |: ---: :--- ---: | :--- | ---: ::-- :| ---: :--- | :--- ---- ---- :--- ---- ---: :| ::-- :--- | ::-- |: | | ---: | | ::-- ::-- ---: ---- |--| ---- :--- :--- |: |: ---- ::-- :| ---: :--- | :--- |: ---: | :--- |: :| :--- | | :| | ---- ---- :--- :--- ::-- ::-- | |--| :--- ---: ---- :| :| |: | :| | | | | |: | | | :| | |--| | ---- ---- :--- |: ---- | | ::-- | ---: |--| ---: :--- :--- :--- |--| | | :--- | ---- ---- :--- | ::-- |--| ::-- | | |--| :| | |: ::-- |: | :| ---- | |--| | |--| :| ---- |',
+        False, True, {"DD-SPAM"},
+    ),
+    (
+        # The same aperiodic structural stream prefixed with eight distinct
+        # padding words. Density thresholds would be gamed by exactly this;
+        # the neighbor rule only shields the handful of units touching the
+        # padding, so DD-SPAM still fires on the remaining glut.
+        "padded_structural_glut (DD-SPAM padding-bypass guard, should FAIL DD-SPAM)",
+        'contextword00 contextword01 contextword02 contextword03 contextword04 contextword05 contextword06 contextword07 ---: | |: :--- | | ---- |: |: | | ::-- ---: ---- | :--- ---: ---: |: ::-- |--| ---: :--- :--- | ---- | ::-- ---: |: | | :| :| |: | |: ---: | | |--| | ---: ---: :--- ---- ---- :| ---- |--| | |: :| ---: |: | | ::-- :--- ---- | | |: ---: | | :| |--| | |: ---: :--- ---: | :--- | ---: ::-- :| ---: :--- | :--- ---- ---- :--- ---- ---: :| ::-- :--- | ::-- |: | | ---: | | ::-- ::-- ---: ---- |--| ---- :--- :--- |: |: ---- ::-- :| ---: :--- | :--- |: ---: | :--- |: :| :--- | | :| | ---- ---- :--- :--- ::-- ::-- | |--| :--- ---: ---- :| :| |: | :| | | | | |: | | | :| | |--| | ---- ---- :--- |: ---- | | ::-- | ---: |--| ---: :--- :--- :--- |--| | | :--- | ---- ---- :--- | ::-- |--| ::-- | | |--| :| | |: ::-- |: | :| ---- | |--| | |--| :| ---- |',
+        False, True, {"DD-SPAM"},
     ),
     (
         # GQ-005 multi-turn shape: a single reply under a running "answer in
