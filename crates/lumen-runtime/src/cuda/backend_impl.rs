@@ -4997,6 +4997,13 @@ impl CudaBackend {
         // it: dispatch ONLY the parity projection. Arithmetic-identical
         // (BYTE-identical); env-gated default-OFF for the A/B gate.
         let gdn_skip_dup_qkv = gdn_convstate_parity_qkv && gdn_skip_dup_qkv_enabled();
+        if let Some(p) = st.profiler.as_mut() {
+            p.begin(
+                "gdn_proj",
+                super::profiler::LayerType::Gdn,
+                &self.device.stream,
+            );
+        }
 
         if gdn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
             // === FUSED: RMSNorm + Q8_1 quantize in 1 dispatch ===
@@ -5441,6 +5448,14 @@ impl CudaBackend {
         // (the prefill norm-gate fuses RMSNorm + SiLU(gate)), so the decode
         // Steps 8/10 norm-gate is skipped and Step 11 (ssm_out) reads
         // `normed_out_buf`. OFF / missing-kernels → byte-identical.
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("gdn_proj", &self.device.stream);
+            p.begin(
+                "gdn_recur",
+                super::profiler::LayerType::Gdn,
+                &self.device.stream,
+            );
+        }
         let gdn_decode_via_prefill = gdn_decode_via_prefill_enabled()
             && st.kernels.ssm_conv1d_silu_prefill.is_some()
             && st.kernels.gdn_compute_gates_batched.is_some()
@@ -6406,6 +6421,14 @@ impl CudaBackend {
             used_fused_norm_gate = false;
         }
 
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("gdn_recur", &self.device.stream);
+            p.begin(
+                "gdn_ssm_out",
+                super::profiler::LayerType::Gdn,
+                &self.device.stream,
+            );
+        }
         // --- Step 11: Output projection -> ssm_proj ---
         // Fused path: reads from normed_out_buf. Unfused path: reads from output_buf.
         {
@@ -6434,6 +6457,9 @@ impl CudaBackend {
             }
         }
 
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("gdn_ssm_out", &self.device.stream);
+        }
         // --- Step 12+13: Fused residual add + copy ---
         // attn_proj = x_gpu + ssm_proj (via residual_add_copy, 1 dispatch).
         // x_gpu is NOT updated here -- it will be updated by the FFN residual
