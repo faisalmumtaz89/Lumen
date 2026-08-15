@@ -327,10 +327,29 @@ mod tests {
     const REAL_TEMPLATE: &str = include_str!("../tests/fixtures/qwen35_chat_template.jinja");
     const REFERENCE_CORPUS: &str = include_str!("../tests/fixtures/qwen35_render_reference.json");
 
+    // Qwen3.8 ships a revised embedded template (fixture, sha256
+    // 701ba13a085c0c1b5e05414dec1aa3069904f962beee36f0899e441720b83974): it
+    // injects a `reasoning_effort` system preamble (default xhigh), preserves
+    // historical `<think>` content by default (`preserve_thinking`), skips
+    // empty-string tool arguments, and serializes non-string scalar args via
+    // `tojson`. Its corpus re-renders the full Qwen3.5 shape set plus shapes
+    // for those new paths through the same HF `render_jinja_template` oracle.
+    const QWEN38_TEMPLATE: &str = include_str!("../tests/fixtures/qwen38_chat_template.jinja");
+    const QWEN38_CORPUS: &str = include_str!("../tests/fixtures/qwen38_render_reference.json");
+
     #[test]
     fn embedded_template_byte_identical_to_reference_jinja2() {
+        assert_corpus_byte_identical(REAL_TEMPLATE, REFERENCE_CORPUS);
+    }
+
+    #[test]
+    fn qwen38_template_byte_identical_to_reference_jinja2() {
+        assert_corpus_byte_identical(QWEN38_TEMPLATE, QWEN38_CORPUS);
+    }
+
+    fn assert_corpus_byte_identical(template: &str, corpus_json: &str) {
         let corpus: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(REFERENCE_CORPUS).expect("parse reference corpus");
+            serde_json::from_str(corpus_json).expect("parse reference corpus");
         let mut failures = Vec::new();
         for (name, rec) in &corpus {
             let messages = &rec["messages"];
@@ -339,7 +358,7 @@ mod tests {
             let add_generation_prompt = rec["add_generation_prompt"].as_bool().unwrap_or(true);
             let expected = rec["expected"].as_str().expect("expected string");
             match render_chat_prompt(
-                REAL_TEMPLATE,
+                template,
                 messages,
                 tools,
                 add_generation_prompt,

@@ -164,18 +164,27 @@ def anchors_ok(text: str, item: dict) -> bool:
 
 
 def window_detectors(text: str, win_words: int = 256) -> dd.QualityVerdict:
-    """Sliding-window DD over a long output to catch late-onset degeneration."""
-    words = text.split()
-    if len(words) <= win_words:
+    """Sliding-window DD over a long output to catch late-onset degeneration.
+
+    Window MEMBERSHIP is the original word-granularity scheme (256-word
+    windows, 128-word step, tail windows included), but each window's text is
+    SLICED from the original string by word character-spans, so newlines and
+    all other structure survive into the detectors — DD-SPAM's markdown table
+    exemption needs real line boundaries, and a flat word-join destroyed
+    them. No synthetic lines are ever manufactured."""
+    spans = [m.span() for m in re.finditer(r"\S+", text)]
+    if len(spans) <= win_words:
         return dd.evaluate(text)
     worst = None
-    for i in range(0, len(words), win_words // 2):
-        chunk = " ".join(words[i : i + win_words])
-        v = dd.evaluate(chunk)
+    for i in range(0, len(spans), win_words // 2):
+        lo = spans[i][0]
+        hi = spans[min(i + win_words, len(spans)) - 1][1]
+        v = dd.evaluate(text[lo:hi])
         if not v.passed:
             return v
         worst = v
     return worst or dd.evaluate(text)
+
 
 
 # ---------------------------------------------------------------------------

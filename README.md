@@ -18,7 +18,7 @@ lumen run qwen3.5-9b:q8_0 "Write a haiku about Rust"
 
 That one command downloads the model on first use, converts it, picks your backend (Metal on Apple Silicon, CUDA on NVIDIA), and streams tokens.
 
-> **Status:** Production-ready for the shipped Qwen3.5 / Qwen3.6 models (dense 9B, dense 27B, and MoE-30B-A3B) on NVIDIA CUDA (compute capability 8.0+) and Apple Silicon (M-series). The public API and the binary `.lbc` format are not yet stable — **read [Production deployment](docs/production.md) before deploying.**
+> **Status:** Production-ready for the shipped Qwen3.5 / Qwen3.6 / Qwen3.8 models (dense 9B, dense 27B, and MoE-30B-A3B) on NVIDIA CUDA (compute capability 8.0+) and Apple Silicon (M-series). The public API and the binary `.lbc` format are not yet stable — **read [Production deployment](docs/production.md) before deploying.**
 
 ## Quick start
 
@@ -60,12 +60,13 @@ More install paths (Docker, the one-command `clone → running server` script): 
 
 ## Supported models & hardware
 
-v1 (current) verifies the Qwen3.5 family and the Qwen3.6-27B dense model end-to-end; more model families are planned.
+v1 (current) verifies the Qwen3.5 family and the Qwen3.6-27B / Qwen3.8-27B dense models end-to-end; more model families are planned.
 
 | Model | Architecture | Parameters | Quants |
 |-------|--------------|------------|--------|
 | `qwen3.5-9b` | Dense GDN-hybrid | 9B | Q8_0, Q4_0, BF16 |
 | `qwen3.6-27b` | Dense GDN-hybrid | 27B | Q8_0, Q4_0, BF16 |
+| `qwen3.8-27b` | Dense GDN-hybrid | 27B | Q8_0, Q4_0, BF16 |
 | `qwen3.5-moe` | MoE GDN-hybrid | 30B total / 3B active | Q8_0, Q4_0, BF16 |
 
 | Backend | Hardware | Status |

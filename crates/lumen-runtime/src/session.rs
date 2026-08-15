@@ -66,9 +66,10 @@ pub struct SuffixPrefillResult {
     /// Number of new (uncached) tokens that needed processing.
     pub suffix_len: usize,
 
-    /// Number of tokens actually processed by the backend in this call. Equal
-    /// to `suffix_len` except in the "exact-match, no extension" edge case
-    /// where it is zero.
+    /// Number of tokens actually processed by the backend in this call.
+    /// Usually `suffix_len`; zero in the "exact-match, no extension" edge
+    /// case, and `suffix_len + 1` when a warm append also repaired the one
+    /// un-fed tail token a completed generation leaves behind.
     pub processed_tokens: usize,
 
     /// True iff the prior KV had to be discarded (no shared prefix, or
@@ -337,18 +338,39 @@ impl Session {
         // compatibility before any KV read/write touches the backend, so the
         // user sees an explicit "Metal requires F16" / "CUDA requires F32"
         // error instead of downstream silent data corruption.
-        if self.tokens.is_empty() {
+        let warm = !self.tokens.is_empty();
+        let mut caught_up = 0usize;
+        let mut catch_up_time = Duration::ZERO;
+        if !warm {
             self.validate_backend(backend)?;
             backend.reset_recurrent_state();
+        } else {
+            // Mid-stream append (e.g. the server's forced-`</think>` injection
+            // while a generation is live): reconcile the one-token KV lag
+            // first, or every appended token lands one slot early.
+            let (fed, took) = self.catch_up_unfed_tail(backend, weights)?;
+            caught_up = fed;
+            catch_up_time = took;
         }
 
         let start = Instant::now();
-        let logits = if caps.batched_prefill {
+        let logits = if caps.batched_prefill && !(warm && caps.gdn) {
             // Backend handles KV advance internally.
             let last_hidden = backend.prefill(prompt, weights, &mut self.kv)?;
             let mut x = ActivationBuffer::zeros(last_hidden.len(), ComputeDtype::F32);
             x.write_f32_from(&last_hidden);
             backend.compute_final(&x)?
+        } else if caps.batched_prefill {
+            // Warm GDN append: the batched prefill does not continue the live
+            // recurrent state mid-stream (same reason the warm-append suffix
+            // dispatch in `extend_with_cache` routes GDN through the decode
+            // loop); advance token-by-token instead. Only the server's short
+            // forced-close injection reaches this arm today.
+            let mut logits: Option<Logits> = None;
+            for &token_id in prompt {
+                logits = Some(backend.decode_token(token_id, weights, &mut self.kv)?);
+            }
+            logits.expect("non-empty prompt produced logits")
         } else {
             // Token-at-a-time path: forward_pass does NOT advance kv.seq_len,
             // so we step it after each token.
@@ -375,8 +397,8 @@ impl Session {
         self.pending_logits = Some(logits);
 
         Ok(PrefillResult {
-            processed_tokens: prompt.len(),
-            prefill_time: elapsed,
+            processed_tokens: prompt.len() + caught_up,
+            prefill_time: elapsed + catch_up_time,
         })
     }
 
@@ -431,6 +453,69 @@ impl Session {
             },
             Err(_) => Self::DEFAULT_SUFFIX_THRESHOLD,
         }
+    }
+
+    /// Feed the single un-fed trailing token that a completed sampling step
+    /// leaves behind. `next_token` pushes the sampled token into `tokens` and
+    /// defers its forward pass to the NEXT call — which never comes once a
+    /// generation stops — so a finished session sits at
+    /// `kv.seq_len() == tokens.len() - 1` with `pending_logits == None`.
+    /// Appending new tokens past that state without this catch-up places every
+    /// appended token one KV slot early (and desyncs GDN recurrent state).
+    /// A cold prefill of the same history would have processed this token at
+    /// exactly this position, so the catch-up is cold-equivalent. No-op in
+    /// every other state (`pending_logits` present means the tail token is
+    /// merely unsampled, which `next_token` handles; equal lengths mean the
+    /// KV is already caught up).
+    ///
+    /// Returns `(tokens_fed, elapsed)` — `(0, ZERO)` when nothing was needed —
+    /// so callers can fold the repair into their reported `processed_tokens`
+    /// and per-call prefill time. The elapsed time is also added to the
+    /// session's cumulative `prefill_time`.
+    fn catch_up_unfed_tail(
+        &mut self,
+        backend: &dyn ComputeBackend,
+        weights: &dyn WeightProvider,
+    ) -> Result<(usize, Duration), RuntimeError> {
+        if self.pending_logits.is_some()
+            || self.tokens.is_empty()
+            || self.kv.seq_len() + 1 != self.tokens.len()
+        {
+            return Ok((0, Duration::ZERO));
+        }
+        let last = *self.tokens.last().expect("non-empty checked above");
+        let start = Instant::now();
+        // A pipelined decode path may have ALREADY processed the tail token
+        // speculatively (device KV slot written, GDN state advanced) — the
+        // host cursor alone lags. Re-feeding in that state advances recurrent
+        // state twice; only the cursor needs to move.
+        if backend.reconcile_speculative_tail(&mut self.kv)? {
+            self.kv.advance_seq_len()?;
+            let elapsed = start.elapsed();
+            self.prefill_time += elapsed;
+            return Ok((0, elapsed));
+        }
+        if backend.caps().batched_prefill {
+            // GPU-resident: one decode step; advances the KV internally. The
+            // returned logits are predictions for the next position, which the
+            // caller's own append work supersedes.
+            let _ = backend.decode_token(last, weights, &mut self.kv)?;
+        } else {
+            let num_layers = self.hyperparams.num_layers as usize;
+            let _ = forward_pass(
+                last,
+                num_layers,
+                &self.config,
+                weights,
+                backend,
+                &mut self.kv,
+                &mut self.timings,
+            )?;
+            self.kv.advance_seq_len()?;
+        }
+        let elapsed = start.elapsed();
+        self.prefill_time += elapsed;
+        Ok((1, elapsed))
     }
 
     /// Run prefill against `new_full_prompt`, reusing the live KV cache for
@@ -576,6 +661,13 @@ impl Session {
         let suffix = &new_full_prompt[common..];
         let suffix_len = suffix.len();
 
+        // Warm append: reconcile the one-token KV lag a completed sampling
+        // step leaves behind before dispatching the suffix (see
+        // `catch_up_unfed_tail`). A no-op in the truncated flows above, where
+        // the KV already matches `tokens`. The repair is folded into the
+        // returned `processed_tokens` / `prefill_time` below.
+        let (caught_up, catch_up_time) = self.catch_up_unfed_tail(backend, weights)?;
+
         // empty-suffix early exit.
         //
         // The empty-suffix path is reachable in release builds when the new
@@ -678,8 +770,17 @@ impl Session {
 
         // Case 4: tiny suffix -- single-token decode path. Cheaper than a
         // batched prefill dispatch for short tails.
+        //
+        // GDN backends take this path for EVERY warm-append suffix, not just
+        // tiny ones: the batched prefill dispatch resumes positional KV
+        // correctly but does not continue the recurrent state (h_state /
+        // conv_state) from the live mid-stream values, so its logits diverge
+        // from a cold prefill of the same tokens (observed: warm batched
+        // append produced off-context text while this per-token loop is
+        // byte-identical to cold). The decode loop advances the recurrent
+        // state token-by-token, exactly like generation itself.
         let start = Instant::now();
-        if suffix_len < suffix_threshold.max(1) {
+        if suffix_len < suffix_threshold.max(1) || backend.caps().gdn {
             // For each suffix token, run one forward pass. Use the same loop
             // as the token-at-a-time prefill branch so the result is exact.
             let caps = backend.caps();
@@ -721,10 +822,10 @@ impl Session {
             return Ok(SuffixPrefillResult {
                 reused_prefix_len: common,
                 suffix_len,
-                processed_tokens: suffix_len,
+                processed_tokens: suffix_len + caught_up,
                 fell_back_to_cold: false,
                 used_single_token_path: true,
-                prefill_time: elapsed,
+                prefill_time: elapsed + catch_up_time,
             });
         }
 
@@ -763,10 +864,10 @@ impl Session {
         Ok(SuffixPrefillResult {
             reused_prefix_len: common,
             suffix_len,
-            processed_tokens: suffix_len,
+            processed_tokens: suffix_len + caught_up,
             fell_back_to_cold: false,
             used_single_token_path: false,
-            prefill_time: elapsed,
+            prefill_time: elapsed + catch_up_time,
         })
     }
 
@@ -1082,6 +1183,8 @@ impl Session {
                 max_seq_len,
             )));
         }
+        let mut caught_up = 0usize;
+        let mut catch_up_time = Duration::ZERO;
         if self.tokens.is_empty() {
             // Validate KV precision once on the first call. The
             // external prefill backend (Accelerate AMX) writes the same
@@ -1089,6 +1192,14 @@ impl Session {
             // backend's storage contract is what must be honored.
             self.validate_backend(decode_backend)?;
             decode_backend.reset_recurrent_state();
+        } else {
+            // Warm append: reconcile the one-token KV lag (see
+            // `catch_up_unfed_tail`) with the DECODE backend — it owns the
+            // recurrent state and decode kernels; the external AMX backend
+            // only batch-prefills.
+            let (fed, took) = self.catch_up_unfed_tail(decode_backend, weights)?;
+            caught_up = fed;
+            catch_up_time = took;
         }
 
         let start = Instant::now();
@@ -1102,8 +1213,8 @@ impl Session {
         self.tokens.extend_from_slice(prompt);
         self.pending_logits = Some(logits);
         Ok(PrefillResult {
-            processed_tokens: prompt.len(),
-            prefill_time: elapsed,
+            processed_tokens: prompt.len() + caught_up,
+            prefill_time: elapsed + catch_up_time,
         })
     }
 
@@ -1123,6 +1234,32 @@ impl Session {
         // the rolling repeat-last-n window see prompt + previously generated
         // tokens regardless of which extend path was taken.
         Self::sync_sampler_state(&self.tokens, &mut self.sampler_state);
+
+        // Route-switch guard: a prior pipelined-greedy generation may have
+        // left one speculative decode step in flight covering the un-sampled
+        // tail (`pending_logits == None`, `kv.seq_len() == tokens.len() - 1`).
+        // Continuing on the pipelined route is fine — it manages its own
+        // speculation — but a switch to the sequential/logits route (e.g. the
+        // server reusing this session with different sampling) would decode
+        // the tail a second time and advance GDN recurrent state twice. The
+        // speculative step kept only the argmax, not the full logits this
+        // route needs, and recurrent state cannot rewind — so rebuild cold:
+        // one batched re-prefill of the full history, which leaves
+        // `pending_logits` at exactly the position this call must sample.
+        if self.pending_logits.is_none() && !self.tokens.is_empty() {
+            let caps = backend.caps();
+            let switching_off_greedy = !crate::engine::use_gpu_greedy_predicate(
+                &self.sampling,
+                caps.gpu_resident,
+                caps.gpu_argmax,
+            );
+            if switching_off_greedy && backend.reconcile_speculative_tail(&mut self.kv)? {
+                let history = std::mem::take(&mut self.tokens);
+                self.truncate_to(0);
+                backend.reset_recurrent_state();
+                self.extend(&history, backend, weights)?;
+            }
+        }
 
         let last = match self.pending_logits.take() {
             Some(mut logits) => {
@@ -1868,6 +2005,389 @@ mod tests {
         assert_eq!(r.prefill_time, Duration::ZERO);
         // Token history must not be touched.
         assert_eq!(session.token_count(), prior_len);
+    }
+
+    /// A completed generation leaves the FINAL sampled token in `tokens`
+    /// without its forward pass (`next_token` samples first and feeds the
+    /// token on the NEXT call), so a warm session arrives at
+    /// `extend_with_cache` with `kv.seq_len() == tokens.len() - 1`. A warm
+    /// EXACT extension must catch the KV up (feed that token) before
+    /// dispatching the suffix; without it the batched path rejects the
+    /// start_pos mismatch and the per-token path silently writes every
+    /// suffix token one KV slot too early (observed live as an HTTP 500 and
+    /// as warm-vs-cold text divergence respectively).
+    #[test]
+    fn extend_with_cache_warm_append_after_generation_catches_kv_up() {
+        let (provider, backend, hp) = synthetic_setup();
+        let config = baseline_config(128);
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let mut session = Session::new(config, hp, sampling).unwrap();
+        let prompt = vec![0u32, 1, 2, 3];
+        session.extend(&prompt, &backend, &provider).unwrap();
+        for _ in 0..3 {
+            session.next_token(&backend, &provider).unwrap();
+        }
+        let prior = session.token_count();
+        assert_eq!(
+            session.kv().seq_len(),
+            prior - 1,
+            "precondition: the final sampled token must not have been fed"
+        );
+
+        // Exact extension with a suffix past DEFAULT_SUFFIX_THRESHOLD so the
+        // large-suffix dispatch is representative.
+        let mut extended: Vec<u32> = session.tokens().to_vec();
+        extended.extend((0..40).map(|i| (i % 4) as u32));
+        let r = session
+            .extend_with_cache(
+                &extended,
+                &backend,
+                &provider,
+                Session::DEFAULT_SUFFIX_THRESHOLD,
+            )
+            .unwrap();
+        assert_eq!(r.reused_prefix_len, prior);
+        assert!(!r.fell_back_to_cold);
+        assert_eq!(session.token_count(), extended.len());
+        assert_eq!(
+            session.kv().seq_len(),
+            extended.len(),
+            "KV must be fully caught up: every token, including the one that \
+             lagged at entry, occupies its own slot"
+        );
+
+        // Length equality is necessary but not sufficient (a wrong catch-up
+        // token would still satisfy it): the warm continuation must SAMPLE the
+        // same stream as a cold session prefilled with the identical tokens.
+        let (provider2, backend2, hp2) = synthetic_setup();
+        let sampling2 = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let mut cold = Session::new(baseline_config(128), hp2, sampling2).unwrap();
+        cold.extend(&extended, &backend2, &provider2).unwrap();
+        for step in 0..4 {
+            let w = session.next_token(&backend, &provider).unwrap();
+            let c = cold.next_token(&backend2, &provider2).unwrap();
+            assert_eq!(w, c, "warm and cold continuations diverged at step {step}");
+        }
+    }
+
+    /// `Session::extend` on a live session (the server's forced-`</think>`
+    /// injection path) arrives in the same lagging state as a completed
+    /// generation and must catch the KV up before prefilling the injected
+    /// tokens; without it every injected token lands one slot early.
+    #[test]
+    fn extend_on_live_session_catches_kv_up() {
+        let (provider, backend, hp) = synthetic_setup();
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let mut session = Session::new(baseline_config(128), hp, sampling).unwrap();
+        session
+            .extend(&[0u32, 1, 2, 3], &backend, &provider)
+            .unwrap();
+        for _ in 0..2 {
+            session.next_token(&backend, &provider).unwrap();
+        }
+        let prior = session.token_count();
+        assert_eq!(
+            session.kv().seq_len(),
+            prior - 1,
+            "precondition: lagging tail"
+        );
+        let inject = [1u32, 2, 3];
+        session.extend(&inject, &backend, &provider).unwrap();
+        assert_eq!(session.token_count(), prior + inject.len());
+        assert_eq!(
+            session.kv().seq_len(),
+            prior + inject.len(),
+            "catch-up + injection must leave the KV exactly at tokens.len()"
+        );
+    }
+
+    /// Mock GPU backend for the warm-append dispatch tests: batched prefill +
+    /// optional GDN + optional speculative decode-ahead, with a rolling state
+    /// hash so any double-feed, skipped token, or misordering changes the
+    /// final state (length-only assertions cannot catch a wrong-token repair).
+    struct MockGpuBackend {
+        gdn: bool,
+        state: std::sync::atomic::AtomicU64,
+        prefill_calls: std::sync::atomic::AtomicU64,
+        decode_calls: std::sync::atomic::AtomicU64,
+        speculative_tail: std::sync::Mutex<Option<u32>>,
+    }
+
+    impl MockGpuBackend {
+        fn new(gdn: bool) -> Self {
+            Self {
+                gdn,
+                state: std::sync::atomic::AtomicU64::new(0),
+                prefill_calls: std::sync::atomic::AtomicU64::new(0),
+                decode_calls: std::sync::atomic::AtomicU64::new(0),
+                speculative_tail: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn fold(&self, token: u32) {
+            let s = self.state.load(Ordering::SeqCst);
+            self.state.store(
+                s.wrapping_mul(31).wrapping_add(token as u64 + 1),
+                Ordering::SeqCst,
+            );
+        }
+
+        fn state_val(&self) -> u64 {
+            self.state.load(Ordering::SeqCst)
+        }
+
+        fn logits(&self) -> Logits {
+            let mut data = vec![0.0f32; 8];
+            data[(self.state_val() % 8) as usize] = 1.0;
+            Logits { data }
+        }
+    }
+
+    impl ComputeBackend for MockGpuBackend {
+        fn init(&mut self, _hp: &ModelHyperparams) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+        fn compute_layer(
+            &self,
+            _layer_idx: usize,
+            _x: &mut crate::compute::ActivationBuffer,
+            _weights: &crate::weight::cache::LayerView,
+            _kv: Option<&mut crate::kv::KvCacheView>,
+            _seq_pos: usize,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+        fn compute_final(
+            &self,
+            _x: &crate::compute::ActivationBuffer,
+        ) -> Result<Logits, RuntimeError> {
+            Ok(self.logits())
+        }
+        fn embed_token(&self, _t: u32) -> Result<crate::compute::ActivationBuffer, RuntimeError> {
+            Ok(crate::compute::ActivationBuffer::zeros(
+                4,
+                crate::compute::ComputeDtype::F32,
+            ))
+        }
+        fn set_global_tensors(&mut self, _e: Vec<f32>, _n: Vec<f32>, _o: Vec<f32>) {}
+        fn caps(&self) -> crate::compute::BackendCaps {
+            crate::compute::BackendCaps {
+                batched_prefill: true,
+                gpu_resident: true,
+                gdn: self.gdn,
+                moe: false,
+                gpu_argmax: false,
+            }
+        }
+        fn prefill(
+            &self,
+            tokens: &[u32],
+            _weights: &dyn WeightProvider,
+            kv: &mut crate::kv::KvCache,
+        ) -> Result<Vec<f32>, RuntimeError> {
+            self.prefill_calls.fetch_add(1, Ordering::SeqCst);
+            for &t in tokens {
+                self.fold(t);
+                kv.advance_seq_len()?;
+            }
+            Ok(vec![0.0; 4])
+        }
+        fn decode_token(
+            &self,
+            token_id: u32,
+            _weights: &dyn WeightProvider,
+            kv: &mut crate::kv::KvCache,
+        ) -> Result<Logits, RuntimeError> {
+            self.decode_calls.fetch_add(1, Ordering::SeqCst);
+            self.fold(token_id);
+            kv.advance_seq_len()?;
+            Ok(self.logits())
+        }
+        fn reset_recurrent_state(&self) {
+            // Model a true GDN cold restart: recurrent state is rebuilt from
+            // scratch by the subsequent prefill.
+            self.state.store(0, Ordering::SeqCst);
+        }
+        fn reconcile_speculative_tail(
+            &self,
+            _kv: &mut crate::kv::KvCache,
+        ) -> Result<bool, RuntimeError> {
+            match self.speculative_tail.lock().unwrap().take() {
+                Some(tail) => {
+                    // The "device" already processed the tail speculatively.
+                    self.fold(tail);
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
+    }
+
+    /// Drive a session on the mock to the post-generation lagging state
+    /// (`kv == tokens.len() - 1`, `pending == None`) and return it with the
+    /// extended exact-append prompt to replay.
+    fn mock_warm_lagging_session(
+        backend: &MockGpuBackend,
+        provider: &SyncWeightProvider,
+        hp: ModelHyperparams,
+    ) -> (Session, Vec<u32>) {
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let mut session = Session::new(baseline_config(128), hp, sampling).unwrap();
+        session.extend(&[0u32, 1, 2, 3], backend, provider).unwrap();
+        for _ in 0..2 {
+            session.next_token(backend, provider).unwrap();
+        }
+        assert_eq!(session.kv().seq_len(), session.token_count() - 1);
+        assert!(session.pending_logits.is_none());
+        let mut extended = session.tokens().to_vec();
+        extended.extend((0..40).map(|i| (i % 4) as u32));
+        (session, extended)
+    }
+
+    /// Cold-reference state: fold the full extended sequence once, in order.
+    fn cold_state(gdn: bool, extended: &[u32]) -> u64 {
+        let cold = MockGpuBackend::new(gdn);
+        for &t in extended {
+            cold.fold(t);
+        }
+        cold.state_val()
+    }
+
+    /// Warm GDN append must route through the per-token decode loop (never the
+    /// batched prefill, which cannot continue recurrent state mid-stream), and
+    /// the repaired stream must fold every token exactly once — byte-equal to
+    /// a cold prefill of the same tokens.
+    #[test]
+    fn warm_append_gdn_decode_loop_matches_cold_state() {
+        let (provider, _nb, hp) = synthetic_setup();
+        let backend = MockGpuBackend::new(true);
+        let (mut session, extended) = mock_warm_lagging_session(&backend, &provider, hp);
+        let prefills_before = backend.prefill_calls.load(Ordering::SeqCst);
+        let decodes_before = backend.decode_calls.load(Ordering::SeqCst);
+        session
+            .extend_with_cache(
+                &extended,
+                &backend,
+                &provider,
+                Session::DEFAULT_SUFFIX_THRESHOLD,
+            )
+            .unwrap();
+        assert_eq!(
+            backend.prefill_calls.load(Ordering::SeqCst),
+            prefills_before,
+            "GDN warm append must not dispatch batched prefill"
+        );
+        // 1 catch-up + 40 suffix tokens, each exactly once.
+        assert_eq!(
+            backend.decode_calls.load(Ordering::SeqCst) - decodes_before,
+            41
+        );
+        assert_eq!(session.kv().seq_len(), extended.len());
+        assert_eq!(backend.state_val(), cold_state(true, &extended));
+    }
+
+    /// Non-GDN warm append keeps the batched suffix dispatch; the catch-up
+    /// must leave `start_pos == kv.seq_len()` so `prefill_from` accepts it,
+    /// and the folded state must equal cold.
+    #[test]
+    fn warm_append_non_gdn_batched_matches_cold_state() {
+        let (provider, _nb, hp) = synthetic_setup();
+        let backend = MockGpuBackend::new(false);
+        let (mut session, extended) = mock_warm_lagging_session(&backend, &provider, hp);
+        let decodes_before = backend.decode_calls.load(Ordering::SeqCst);
+        session
+            .extend_with_cache(
+                &extended,
+                &backend,
+                &provider,
+                Session::DEFAULT_SUFFIX_THRESHOLD,
+            )
+            .unwrap();
+        // Exactly the catch-up decode; the suffix went through batched prefill.
+        assert_eq!(
+            backend.decode_calls.load(Ordering::SeqCst) - decodes_before,
+            1
+        );
+        assert_eq!(session.kv().seq_len(), extended.len());
+        assert_eq!(backend.state_val(), cold_state(false, &extended));
+    }
+
+    /// When the backend reports the tail token was already processed by a
+    /// speculative decode-ahead step (Metal's lean pipeline), the catch-up
+    /// must only advance the cursor — re-feeding would fold the tail twice
+    /// and diverge from cold (the live Metal double-feed defect).
+    #[test]
+    fn warm_append_speculative_tail_not_double_fed() {
+        let (provider, _nb, hp) = synthetic_setup();
+        let backend = MockGpuBackend::new(true);
+        let (mut session, extended) = mock_warm_lagging_session(&backend, &provider, hp);
+        let tail = *session.tokens().last().unwrap();
+        *backend.speculative_tail.lock().unwrap() = Some(tail);
+        let decodes_before = backend.decode_calls.load(Ordering::SeqCst);
+        session
+            .extend_with_cache(
+                &extended,
+                &backend,
+                &provider,
+                Session::DEFAULT_SUFFIX_THRESHOLD,
+            )
+            .unwrap();
+        // Suffix decodes only — the tail was reconciled, not re-fed.
+        assert_eq!(
+            backend.decode_calls.load(Ordering::SeqCst) - decodes_before,
+            40
+        );
+        assert_eq!(session.kv().seq_len(), extended.len());
+        assert_eq!(backend.state_val(), cold_state(true, &extended));
+    }
+
+    /// A pipelined-greedy generation followed by a route switch to the
+    /// sequential/logits path (same session, new sampling) must NOT decode the
+    /// speculatively-processed tail a second time: `next_token`'s route-switch
+    /// guard rebuilds cold, and the resulting state must equal a cold prefill
+    /// of the same history.
+    #[test]
+    fn route_switch_after_speculative_tail_rebuilds_cold() {
+        let (provider, _nb, hp) = synthetic_setup();
+        let backend = MockGpuBackend::new(true);
+        let (mut session, _extended) = mock_warm_lagging_session(&backend, &provider, hp);
+        let history = session.tokens().to_vec();
+        *backend.speculative_tail.lock().unwrap() = Some(*history.last().unwrap());
+        // Switch route: non-greedy sampling forces the sequential/logits path.
+        session.set_sampling(SamplingParams {
+            temperature: 0.7,
+            seed: Some(7),
+            ..Default::default()
+        });
+        let prefills_before = backend.prefill_calls.load(Ordering::SeqCst);
+        session.next_token(&backend, &provider).unwrap();
+        assert_eq!(
+            backend.prefill_calls.load(Ordering::SeqCst),
+            prefills_before + 1,
+            "route switch over live speculation must cold-rebuild via one batched prefill"
+        );
+        // The rebuild folded the history exactly once from a reset state, and
+        // the sampled token came from the rebuilt pending logits (no tail
+        // decode ran).
+        assert_eq!(backend.state_val(), cold_state(true, &history));
+        assert_eq!(session.token_count(), history.len() + 1);
+        assert_eq!(session.kv().seq_len(), history.len());
     }
 
     /// `extend_with_cache` on an empty prompt + FRESH session still

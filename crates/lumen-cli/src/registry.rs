@@ -386,6 +386,35 @@ mod tests {
     }
 
     #[test]
+    fn resolve_qwen38_27b() {
+        // Qwen3.8-27B ships the same qwen35 (GatedDeltaNet, dense) GGUF arch
+        // and the same text-config shapes as Qwen3.6-27B; the registry entry
+        // is the only enablement surface. BF16 is a 2-shard split GGUF nested
+        // under a `BF16/` subdir in the provider repo.
+        let reg = load_registry();
+        let entry = reg
+            .resolve("qwen3.8-27b")
+            .expect("alias qwen3.8-27b must resolve");
+        assert_eq!(entry.key, "qwen3-8-27b");
+        assert_eq!(entry.architecture, "qwen35");
+        for quant in ["Q8_0", "Q4_0", "BF16"] {
+            assert!(
+                entry.gguf_files.contains_key(quant),
+                "qwen3-8-27b must declare {quant}"
+            );
+        }
+        assert!(!entry.gguf_files["Q8_0"].is_multi_shard());
+        let bf16 = &entry.gguf_files["BF16"];
+        assert!(bf16.is_multi_shard(), "BF16 must list both shard files");
+        for f in &bf16.files {
+            assert!(
+                f.starts_with("BF16/") && f.contains("-of-"),
+                "BF16 shard must be the nested *-of-* path: {f}"
+            );
+        }
+    }
+
+    #[test]
     fn gguf_source_single_file_accessor() {
         // Sanity-check the file()/files accessors on a synthetic source.
         let src = GgufSource {
