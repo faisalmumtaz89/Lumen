@@ -11712,6 +11712,7 @@ unsafe fn repack_all_layers_q4_clone_to_split(
         AttnWq,
         AttnWk,
         AttnWv,
+        AttnWo,
     }
 
     struct Job {
@@ -11817,6 +11818,20 @@ unsafe fn repack_all_layers_q4_clone_to_split(
                     kv_heads * head_dim,
                     hidden,
                 );
+                // Probe flag: the residual-split wo kernel was recorded as
+                // producing NaN logits in an earlier campaign; this arm exists
+                // to re-test that verdict on current source before any wider
+                // rollout. Never enabled by the primary flag.
+                if crate::runtime_defaults::q4_split_wo_probe_enabled() {
+                    push_if_q4raw(
+                        &mut jobs,
+                        layer_idx,
+                        SplitWeightKind::AttnWo,
+                        &layer.wo,
+                        hidden,
+                        heads * head_dim,
+                    );
+                }
             }
         }
         push_if_q4raw(
@@ -11934,6 +11949,13 @@ unsafe fn repack_all_layers_q4_clone_to_split(
                     None
                 }
             }
+            SplitWeightKind::AttnWo => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.wo {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
         };
         let Some(raw_buf) = src_ref else { continue };
         match repack_q4_raw_to_split(device, repack_kernel, raw_buf, job.out_dim, job.in_dim) {
@@ -11948,6 +11970,7 @@ unsafe fn repack_all_layers_q4_clone_to_split(
                     SplitWeightKind::GdnGate => layer.q4_split_attn_gate = Some(split_buf),
                     SplitWeightKind::AttnWk => layer.q4_split_wk = Some(split_buf),
                     SplitWeightKind::AttnWv => layer.q4_split_wv = Some(split_buf),
+                    SplitWeightKind::AttnWo => layer.q4_split_wo = Some(split_buf),
                 }
                 layers_with_split.insert(job.layer_idx);
                 bytes_cloned += job.size_bytes;
