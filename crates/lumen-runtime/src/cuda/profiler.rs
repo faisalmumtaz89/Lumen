@@ -194,6 +194,29 @@ impl StageProfiler {
         if summary.write_json(&mut buf).is_ok() {
             eprintln!("[cuda-profile] {}", String::from_utf8_lossy(&buf));
         }
+        for e in &summary.entries {
+            if e.median_us > 0.0 && e.std_us > 0.10 * e.median_us && e.samples.len() > 16 {
+                let head: Vec<String> = e
+                    .samples
+                    .iter()
+                    .take(8)
+                    .map(|v| format!("{v:.1}"))
+                    .collect();
+                let thin: Vec<String> = e
+                    .samples
+                    .iter()
+                    .step_by(64)
+                    .take(48)
+                    .map(|v| format!("{v:.1}"))
+                    .collect();
+                eprintln!(
+                    "[cuda-profile-spread] {} first8=[{}] every64th=[{}]",
+                    e.stage,
+                    head.join(","),
+                    thin.join(",")
+                );
+            }
+        }
     }
 
     /// Collect all recorded events into a summary. Synchronizes the last event
