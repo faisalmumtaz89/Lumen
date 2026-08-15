@@ -6440,20 +6440,67 @@ impl CudaBackend {
             } else {
                 &gdn.output_buf
             };
-            unsafe {
-                launch_matvec(
-                    &self.device,
-                    &st.kernels,
-                    ssm_out,
-                    ssm_input,
-                    &mut gdn.ssm_proj_buf,
-                    hidden_dim,
-                    p.value_dim,
-                    "gdn_ssm_out",
-                    lw.ssm_out_f16.as_ref(),
-                    Some(&mut st.scratch.input_f16),
-                    st.scratch.input_q8_1.as_mut(),
-                )?;
+            // Split-sibling route: quantize the F32 gated output to Q8_1 (the
+            // same kernel the raw dp4a path uses) and dispatch the split-layout
+            // matvec. Falls through to the raw route when the sibling or any
+            // required piece is absent, keeping the base path untouched.
+            let mut ssm_split_done = false;
+            if let (Some(split_buf), Some(quant_fn), Some(q8_1_buf)) = (
+                lw.q8_split_ssm_out.as_ref(),
+                st.kernels.quantize_q8_1_rawsum.as_ref(),
+                st.scratch.input_q8_1.as_mut(),
+            ) {
+                let in_dim_u32 = p.value_dim as u32;
+                let q_blocks = in_dim_u32.div_ceil(32);
+                let quant_cfg = CudarcLaunchConfig {
+                    grid_dim: (q_blocks, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(quant_fn)
+                        .arg(ssm_input)
+                        .arg(&mut *q8_1_buf)
+                        .arg(&in_dim_u32)
+                        .launch(quant_cfg)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("quantize_q8_1 gdn_ssm_out L{layer_idx}: {e}"))
+                })?;
+                unsafe {
+                    launch_matvec_preq8_1_split(
+                        &self.device,
+                        &st.kernels,
+                        ssm_out,
+                        Some(split_buf),
+                        None,
+                        q8_1_buf,
+                        &mut gdn.ssm_proj_buf,
+                        hidden_dim,
+                        p.value_dim,
+                        "gdn_ssm_out",
+                    )?;
+                }
+                ssm_split_done = true;
+            }
+            if !ssm_split_done {
+                unsafe {
+                    launch_matvec(
+                        &self.device,
+                        &st.kernels,
+                        ssm_out,
+                        ssm_input,
+                        &mut gdn.ssm_proj_buf,
+                        hidden_dim,
+                        p.value_dim,
+                        "gdn_ssm_out",
+                        lw.ssm_out_f16.as_ref(),
+                        Some(&mut st.scratch.input_f16),
+                        st.scratch.input_q8_1.as_mut(),
+                    )?;
+                }
             }
         }
 
@@ -11448,6 +11495,7 @@ unsafe fn repack_all_layers_q8_clone_to_split(
         Gate,
         Up,
         Down,
+        SsmOut,
     }
 
     struct Job {
@@ -11515,6 +11563,27 @@ unsafe fn repack_all_layers_q8_clone_to_split(
             hidden,
             inter,
         );
+        // GDN ssm_out is Q8 even on Q4 models (converter requant); its split
+        // sibling field existed unpopulated. Flag-gated: the split route is
+        // the same mmvq/scalar family, different weight layout.
+        if crate::runtime_defaults::q8_split_ssmout_enabled() {
+            if let Some(w) = layer.ssm_out.as_ref() {
+                let vdim = hp
+                    .gdn
+                    .map(|g| (g.num_v_heads * g.head_dim) as usize)
+                    .unwrap_or(0);
+                if vdim > 0 {
+                    push_if_q8raw(
+                        &mut jobs,
+                        layer_idx,
+                        SplitWeightKind::SsmOut,
+                        w,
+                        hidden,
+                        vdim,
+                    );
+                }
+            }
+        }
     }
 
     // Largest-first. Tie-break: full-attention layers before GDN (higher per-token
@@ -11582,6 +11651,10 @@ unsafe fn repack_all_layers_q8_clone_to_split(
                     None
                 }
             }
+            SplitWeightKind::SsmOut => match layer.ssm_out.as_ref() {
+                Some(GpuWeightBuf::Q8Raw(b)) => Some(b),
+                _ => None,
+            },
         };
         let Some(raw_buf) = src_ref else { continue };
         match repack_q8_raw_to_split(device, repack_kernel, raw_buf, job.out_dim, job.in_dim) {
@@ -11590,6 +11663,7 @@ unsafe fn repack_all_layers_q8_clone_to_split(
                     SplitWeightKind::Gate => layer.q8_split_w_gate = Some(split_buf),
                     SplitWeightKind::Up => layer.q8_split_w_up = Some(split_buf),
                     SplitWeightKind::Down => layer.q8_split_w_down = Some(split_buf),
+                    SplitWeightKind::SsmOut => layer.q8_split_ssm_out = Some(split_buf),
                 }
                 layers_with_split.insert(job.layer_idx);
                 bytes_cloned += job.size_bytes;

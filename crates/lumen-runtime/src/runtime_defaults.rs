@@ -1076,6 +1076,13 @@ pub fn q4_split_attn_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_ATTN"), Ok(v) if v == "1")
 }
 
+/// `LUMEN_CUDA_Q8_SPLIT_SSMOUT=1`: clone the GDN `ssm_out` Q8 weight into its
+/// per-row split sibling and dispatch it through the Q8 split family instead
+/// of the raw-layout dp4a route. Default OFF.
+pub fn q8_split_ssmout_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_Q8_SPLIT_SSMOUT"), Ok(v) if v == "1")
+}
+
 /// Per-process default for `LUMEN_CUDA_SOA_LOCKED` when the env is unset.
 /// ON for quantised dense (the codegen-locked Q4_0 split matvec: word-load
 /// nibble stream + load-hoist + `.rn`-pinned epilogue, bit-deterministic and
@@ -1199,6 +1206,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_PTX_CACHE_DIR",
     "LUMEN_CUDA_Q4_SPLIT",
     "LUMEN_CUDA_Q4_SPLIT_ATTN",
+    "LUMEN_CUDA_Q8_SPLIT_SSMOUT",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
     "LUMEN_CUDA_Q4_MMVQ",
