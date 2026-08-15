@@ -846,6 +846,9 @@ struct MutableState {
     logits_gpu: CudaSlice<f32>,
     /// GPU-side argmax result: [1] u32. Avoids reading back full vocab logits.
     argmax_result: CudaSlice<u32>,
+    /// Per-stage decode timing (`LUMEN_CUDA_PROFILE=1`; `None` otherwise —
+    /// begin/end short-circuit to one Option check on the default path).
+    profiler: Option<super::profiler::StageProfiler>,
     /// Whether the model has any GDN layers.
     has_gdn_layers: bool,
     /// Whether the model has Q+gate fusion layers (disables graph capture).
@@ -2121,8 +2124,17 @@ impl CudaBackend {
             // hidden state). x_gpu is NOT updated here -- it retains the old value.
             // The FFN block reads from attn_proj, and the caller copies attn_proj
             // to x_gpu after the full layer (GDN attention + FFN) completes.
+            if let Some(p) = st.profiler.as_mut() {
+                p.begin("gdn_attn", super::profiler::LayerType::Gdn, &self.device.stream);
+            }
             self.compute_gdn_attention_gpu(layer_idx, st)?;
+            if let Some(p) = st.profiler.as_mut() {
+                p.end("gdn_attn", &self.device.stream);
+            }
         } else {
+            if let Some(p) = st.profiler.as_mut() {
+                p.begin("full_attn", super::profiler::LayerType::Full, &self.device.stream);
+            }
             let lw: &LayerWeightsGpu = st.layer_weights_cache.get(layer_idx).ok_or_else(|| {
                 RuntimeError::Compute(format!(
                     "compute_layer_gpu: layer {layer_idx} not in GPU-resident cache",
@@ -3112,8 +3124,14 @@ impl CudaBackend {
                     }
                 }
             }
+            if let Some(p) = st.profiler.as_mut() {
+                p.end("full_attn", &self.device.stream);
+            }
         } // end else (standard attention path — skipped for GDN layers)
 
+        if let Some(p) = st.profiler.as_mut() {
+            p.begin("ffn", super::profiler::LayerType::Whole, &self.device.stream);
+        }
         // Re-borrow layer weights for the FFN block (shared between standard and GDN layers).
         let lw: &LayerWeightsGpu = &st.layer_weights_cache[layer_idx];
 
@@ -3320,6 +3338,9 @@ impl CudaBackend {
             }
 
             // MoE branch is complete; skip the dense FFN block below.
+            if let Some(p) = st.profiler.as_mut() {
+                p.end("ffn", &self.device.stream);
+            }
             return Ok(());
         }
 
@@ -4670,6 +4691,9 @@ impl CudaBackend {
             .map_err(|e| RuntimeError::Compute(format!("residual_add launch: {e}")))?;
         }
 
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("ffn", &self.device.stream);
+        }
         // Layer output is now in st.scratch.attn_proj. The caller must copy it
         // to st.scratch.x_gpu before the next layer (done via device memcpy).
         Ok(())
@@ -8800,7 +8824,13 @@ impl CudaBackend {
         st: &mut MutableState,
         kv: &mut crate::kv::KvCache,
     ) -> Result<Logits, RuntimeError> {
+        if let Some(p) = st.profiler.as_mut() {
+            p.begin("embed", super::profiler::LayerType::Whole, &self.device.stream);
+        }
         self.embed_token_gpu(token_id, st)?;
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("embed", &self.device.stream);
+        }
         for layer in 0..num_layers {
             self.compute_layer_gpu(layer, seq_pos, st)?;
             // FIX-DTOD: For DENSE layers, dense FFN writes to a separate
@@ -8821,6 +8851,9 @@ impl CudaBackend {
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
                     .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
             }
+        }
+        if let Some(p) = st.profiler.as_mut() {
+            p.begin("final_argmax", super::profiler::LayerType::Whole, &self.device.stream);
         }
         self.compute_final_gpu(st)?;
         {
@@ -8910,7 +8943,13 @@ impl CudaBackend {
         st: &mut MutableState,
         kv: &mut crate::kv::KvCache,
     ) -> Result<u32, RuntimeError> {
+        if let Some(p) = st.profiler.as_mut() {
+            p.begin("embed", super::profiler::LayerType::Whole, &self.device.stream);
+        }
         self.embed_token_gpu(token_id, st)?;
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("embed", &self.device.stream);
+        }
         for layer in 0..num_layers {
             self.compute_layer_gpu(layer, seq_pos, st)?;
             // Mirror decode_token_normal's FIX-DTOD: propagate the post-FFN
@@ -8927,6 +8966,9 @@ impl CudaBackend {
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
                     .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
             }
+        }
+        if let Some(p) = st.profiler.as_mut() {
+            p.begin("final_argmax", super::profiler::LayerType::Whole, &self.device.stream);
         }
         self.compute_final_gpu(st)?;
         {
@@ -8949,6 +8991,10 @@ impl CudaBackend {
         }
         // Sync is still required to make the argmax index host-visible, but we
         // copy back only the single u32 the kernel wrote -- NOT the full vocab.
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("final_argmax", &self.device.stream);
+            p.record_token();
+        }
         self.device.synchronize()?;
         // Keep the optional per-step CPU sleep for parity with the logits path
         // (default OFF -> no-op).
@@ -13742,6 +13788,7 @@ impl ComputeBackend for CudaBackend {
             use_q4_split,
             use_output_proj_split,
             output_proj_nr,
+            profiler: super::profiler::StageProfiler::from_env(),
         });
 
         Ok(())

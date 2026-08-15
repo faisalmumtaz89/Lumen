@@ -27,6 +27,7 @@ pub(crate) mod kv_cache;
 /// CUDA MoE forward-path types.
 pub(crate) mod moe;
 pub(crate) mod prefill;
+pub(crate) mod profiler;
 pub(crate) mod prefill_attention;
 /// Persistent on-disk cache for NVRTC-compiled kernel PTX (cold-start fix).
 pub(crate) mod ptx_cache;

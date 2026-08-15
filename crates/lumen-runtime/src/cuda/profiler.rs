@@ -214,6 +214,28 @@ impl StageProfiler {
     }
 }
 
+#[cfg(feature = "cuda")]
+impl Drop for StageProfiler {
+    /// Emit the summary when the owning backend state is torn down, so the
+    /// profile needs no explicit collection call on the decode path. Stderr
+    /// (tagged `[cuda-profile]`) keeps stdout byte-identical for harnesses
+    /// that hash generated text.
+    fn drop(&mut self) {
+        if self.decode_tokens == 0 || self.stages.is_empty() {
+            return;
+        }
+        let summary = self.collect();
+        let mut buf = Vec::new();
+        if summary.write_table(&mut buf).is_ok() {
+            eprint!("{}", String::from_utf8_lossy(&buf));
+        }
+        buf.clear();
+        if summary.write_json(&mut buf).is_ok() {
+            eprintln!("[cuda-profile] {}", String::from_utf8_lossy(&buf));
+        }
+    }
+}
+
 /// One row in the profiler output.
 #[derive(Clone, Debug)]
 pub struct StageEntry {
@@ -300,23 +322,6 @@ impl ProfilerSummary {
         }
         writeln!(w, "")?;
         Ok(())
-    }
-
-    /// Identify the top-N slowest stages by µs/token contribution.
-    pub fn top_stages(&self, n: usize) -> Vec<(String, f64, f64)> {
-        let total_per_tok = self.total_us_per_token().max(1e-9);
-        let mut ranked: Vec<(String, f64, f64)> = self
-            .entries
-            .iter()
-            .map(|e| {
-                let per_tok = e.median_us * (e.samples.len() as f64) / (self.decode_tokens.max(1) as f64);
-                let pct = 100.0 * per_tok / total_per_tok;
-                (format!("{} {}", e.layer_type.as_str(), e.stage), per_tok, pct)
-            })
-            .collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        ranked.truncate(n);
-        ranked
     }
 }
 
