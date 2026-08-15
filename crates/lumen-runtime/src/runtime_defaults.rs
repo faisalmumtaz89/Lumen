@@ -1091,6 +1091,14 @@ pub fn q4_split_wo_probe_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_WO"), Ok(v) if v == "1")
 }
 
+/// `LUMEN_CUDA_SSMOUT_RESID_FOLD=1`: when the ssm_out split route is active,
+/// dispatch its residual variant so the projection writes `attn_proj = W*x +
+/// x_gpu` directly and the per-layer residual_add_copy launch is skipped.
+/// Default OFF.
+pub fn ssmout_residual_fold_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_SSMOUT_RESID_FOLD"), Ok(v) if v == "1")
+}
+
 /// Per-process default for `LUMEN_CUDA_SOA_LOCKED` when the env is unset.
 /// ON for quantised dense (the codegen-locked Q4_0 split matvec: word-load
 /// nibble stream + load-hoist + `.rn`-pinned epilogue, bit-deterministic and
@@ -1215,6 +1223,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_Q4_SPLIT",
     "LUMEN_CUDA_Q4_SPLIT_ATTN",
     "LUMEN_CUDA_Q4_SPLIT_WO",
+    "LUMEN_CUDA_SSMOUT_RESID_FOLD",
     "LUMEN_CUDA_Q8_SPLIT_SSMOUT",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",

@@ -6431,6 +6431,7 @@ impl CudaBackend {
         }
         // --- Step 11: Output projection -> ssm_proj ---
         // Fused path: reads from normed_out_buf. Unfused path: reads from output_buf.
+        let mut ssm_residual_folded = false;
         {
             let ssm_out = lw.ssm_out.as_ref().ok_or_else(|| {
                 RuntimeError::Compute(format!("GDN L{layer_idx}: ssm_out weight missing",))
@@ -6472,19 +6473,41 @@ impl CudaBackend {
                 .map_err(|e| {
                     RuntimeError::Compute(format!("quantize_q8_1 gdn_ssm_out L{layer_idx}: {e}"))
                 })?;
-                unsafe {
-                    launch_matvec_preq8_1_split(
-                        &self.device,
-                        &st.kernels,
-                        ssm_out,
-                        Some(split_buf),
-                        None,
-                        q8_1_buf,
-                        &mut gdn.ssm_proj_buf,
-                        hidden_dim,
-                        p.value_dim,
-                        "gdn_ssm_out",
-                    )?;
+                if crate::runtime_defaults::ssmout_residual_fold_enabled() {
+                    // Fold the residual into the projection: attn_proj =
+                    // ssm_out * gated + x_gpu in ONE kernel, making Step 12's
+                    // separate residual_add_copy unnecessary for this layer.
+                    unsafe {
+                        launch_matvec_preq8_1_residual_split(
+                            &self.device,
+                            &st.kernels,
+                            ssm_out,
+                            Some(split_buf),
+                            None,
+                            q8_1_buf,
+                            &st.scratch.x_gpu,
+                            &mut st.scratch.attn_proj,
+                            hidden_dim,
+                            p.value_dim,
+                            "gdn_ssm_out",
+                        )?;
+                    }
+                    ssm_residual_folded = true;
+                } else {
+                    unsafe {
+                        launch_matvec_preq8_1_split(
+                            &self.device,
+                            &st.kernels,
+                            ssm_out,
+                            Some(split_buf),
+                            None,
+                            q8_1_buf,
+                            &mut gdn.ssm_proj_buf,
+                            hidden_dim,
+                            p.value_dim,
+                            "gdn_ssm_out",
+                        )?;
+                    }
                 }
                 ssm_split_done = true;
             }
@@ -6515,7 +6538,9 @@ impl CudaBackend {
         // x_gpu is NOT updated here -- it will be updated by the FFN residual
         // (x_gpu = attn_proj + down) which already reads from attn_proj.
         // This eliminates 1 dispatch vs the prior residual_add + memcpy_dtod pair.
-        {
+        // Skipped entirely when the split projection already folded the
+        // residual and wrote attn_proj itself.
+        if !ssm_residual_folded {
             let config = LaunchConfig::for_elements(hidden_dim);
             let launch_cfg = CudarcLaunchConfig {
                 grid_dim: (config.grid_dim, 1, 1),
