@@ -1067,6 +1067,15 @@ pub fn q8_split_default() -> bool {
     }
 }
 
+/// `LUMEN_CUDA_Q4_SPLIT_ATTN=1`: extend the Q4 split-clone pass beyond the
+/// dense FFN set to the non-residual attention/GDN projections (GDN fused
+/// QKV + gate, full-attention Wq/Wk/Wv). The dispatch sites already prefer a
+/// split sibling when present and run the codegen-locked kernel, so the flag
+/// only widens which weights receive siblings. Default OFF.
+pub fn q4_split_attn_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_ATTN"), Ok(v) if v == "1")
+}
+
 /// Per-process default for `LUMEN_CUDA_SOA_LOCKED` when the env is unset.
 /// ON for quantised dense (the codegen-locked Q4_0 split matvec: word-load
 /// nibble stream + load-hoist + `.rn`-pinned epilogue, bit-deterministic and
@@ -1189,6 +1198,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_PTX_CACHE",
     "LUMEN_CUDA_PTX_CACHE_DIR",
     "LUMEN_CUDA_Q4_SPLIT",
+    "LUMEN_CUDA_Q4_SPLIT_ATTN",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
     "LUMEN_CUDA_Q4_MMVQ",
