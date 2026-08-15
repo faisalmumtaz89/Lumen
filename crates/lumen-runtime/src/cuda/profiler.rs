@@ -139,7 +139,9 @@ impl StageProfiler {
         };
         // SAFETY: ev was just created; stream outlives this call.
         if unsafe { event::record(ev, stream.cu_stream()) }.is_err() {
-            unsafe { let _ = event::destroy(ev); };
+            unsafe {
+                let _ = event::destroy(ev);
+            };
             return;
         }
         bucket.starts.push(ev);
@@ -160,7 +162,9 @@ impl StageProfiler {
             Err(_) => return,
         };
         if unsafe { event::record(ev, stream.cu_stream()) }.is_err() {
-            unsafe { let _ = event::destroy(ev); };
+            unsafe {
+                let _ = event::destroy(ev);
+            };
             return;
         }
         bucket.ends.push(ev);
@@ -170,6 +174,26 @@ impl StageProfiler {
     /// Record that a decode token has completed (for µs/token normalization).
     pub fn record_token(&mut self) {
         self.decode_tokens = self.decode_tokens.saturating_add(1);
+    }
+
+    /// Emit the summary for the tokens recorded so far and release every CUDA
+    /// event. Called at each generation boundary so a long-lived server emits
+    /// one profile per generation instead of retaining events until teardown.
+    /// No-op when nothing was recorded.
+    pub fn flush(&mut self) {
+        if self.decode_tokens == 0 || self.stages.is_empty() {
+            return;
+        }
+        let summary = self.collect();
+        self.decode_tokens = 0;
+        let mut buf = Vec::new();
+        if summary.write_table(&mut buf).is_ok() {
+            eprint!("{}", String::from_utf8_lossy(&buf));
+        }
+        buf.clear();
+        if summary.write_json(&mut buf).is_ok() {
+            eprintln!("[cuda-profile] {}", String::from_utf8_lossy(&buf));
+        }
     }
 
     /// Collect all recorded events into a summary. Synchronizes the last event
@@ -183,7 +207,9 @@ impl StageProfiler {
             }
             // Synchronize the last event to ensure all preceding records are
             // visible to the host (single barrier per stage).
-            unsafe { let _ = event::synchronize(bucket.ends[n - 1]); };
+            unsafe {
+                let _ = event::synchronize(bucket.ends[n - 1]);
+            };
             let mut samples: Vec<f64> = Vec::with_capacity(n);
             for i in 0..n {
                 let ms = match unsafe { event::elapsed(bucket.starts[i], bucket.ends[i]) } {
@@ -203,9 +229,11 @@ impl StageProfiler {
             });
         }
         entries.sort_by(|a, b| {
-            a.layer_type
-                .cmp(&b.layer_type)
-                .then_with(|| b.median_us.partial_cmp(&a.median_us).unwrap_or(std::cmp::Ordering::Equal))
+            a.layer_type.cmp(&b.layer_type).then_with(|| {
+                b.median_us
+                    .partial_cmp(&a.median_us)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
         ProfilerSummary {
             entries,
@@ -221,18 +249,7 @@ impl Drop for StageProfiler {
     /// (tagged `[cuda-profile]`) keeps stdout byte-identical for harnesses
     /// that hash generated text.
     fn drop(&mut self) {
-        if self.decode_tokens == 0 || self.stages.is_empty() {
-            return;
-        }
-        let summary = self.collect();
-        let mut buf = Vec::new();
-        if summary.write_table(&mut buf).is_ok() {
-            eprint!("{}", String::from_utf8_lossy(&buf));
-        }
-        buf.clear();
-        if summary.write_json(&mut buf).is_ok() {
-            eprintln!("[cuda-profile] {}", String::from_utf8_lossy(&buf));
-        }
+        self.flush();
     }
 }
 
@@ -270,7 +287,11 @@ impl ProfilerSummary {
     pub fn write_json<W: std::io::Write>(&self, mut w: W) -> std::io::Result<()> {
         writeln!(w, "{{")?;
         writeln!(w, "  \"decode_tokens\": {},", self.decode_tokens)?;
-        writeln!(w, "  \"total_us_per_token\": {:.3},", self.total_us_per_token())?;
+        writeln!(
+            w,
+            "  \"total_us_per_token\": {:.3},",
+            self.total_us_per_token()
+        )?;
         writeln!(w, "  \"stages\": [")?;
         for (i, e) in self.entries.iter().enumerate() {
             let comma = if i + 1 == self.entries.len() { "" } else { "," };
@@ -297,17 +318,26 @@ impl ProfilerSummary {
         writeln!(w, "")?;
         writeln!(w, "=== Lumen CUDA Stage Profile ===")?;
         writeln!(w, "Tokens recorded: {}", self.decode_tokens)?;
-        writeln!(w, "Total per-token (sum of stage medians): {:.1} µs", total_per_tok)?;
+        writeln!(
+            w,
+            "Total per-token (sum of stage medians): {:.1} µs",
+            total_per_tok
+        )?;
         writeln!(w, "")?;
         writeln!(
             w,
             "| {:<10} | {:<28} | {:>9} | {:>9} | {:>7} | {:>9} |",
             "Layer", "Stage", "µs/token", "% total", "calls", "std_us"
         )?;
-        writeln!(w, "|{:-<12}|{:-<30}|{:->11}|{:->11}|{:->9}|{:->11}|", "", "", "", "", "", "")?;
+        writeln!(
+            w,
+            "|{:-<12}|{:-<30}|{:->11}|{:->11}|{:->9}|{:->11}|",
+            "", "", "", "", "", ""
+        )?;
         for e in &self.entries {
             // µs/token = median_us * calls / decode_tokens
-            let per_tok = e.median_us * (e.samples.len() as f64) / (self.decode_tokens.max(1) as f64);
+            let per_tok =
+                e.median_us * (e.samples.len() as f64) / (self.decode_tokens.max(1) as f64);
             let pct = 100.0 * per_tok / total_per_tok;
             writeln!(
                 w,
@@ -326,13 +356,17 @@ impl ProfilerSummary {
 }
 
 fn mean(xs: &[f64]) -> f64 {
-    if xs.is_empty() { return 0.0; }
+    if xs.is_empty() {
+        return 0.0;
+    }
     xs.iter().sum::<f64>() / (xs.len() as f64)
 }
 
 fn median(xs: &[f64]) -> f64 {
     // xs is pre-sorted by caller.
-    if xs.is_empty() { return 0.0; }
+    if xs.is_empty() {
+        return 0.0;
+    }
     let mid = xs.len() / 2;
     if xs.len() % 2 == 0 {
         0.5 * (xs[mid - 1] + xs[mid])
@@ -342,7 +376,9 @@ fn median(xs: &[f64]) -> f64 {
 }
 
 fn std_dev(xs: &[f64]) -> f64 {
-    if xs.len() < 2 { return 0.0; }
+    if xs.len() < 2 {
+        return 0.0;
+    }
     let m = mean(xs);
     let var = xs.iter().map(|x| (x - m).powi(2)).sum::<f64>() / ((xs.len() - 1) as f64);
     var.sqrt()
@@ -404,7 +440,10 @@ mod tests {
 
     #[test]
     fn summary_total_zero_decode_tokens() {
-        let s = ProfilerSummary { entries: vec![], decode_tokens: 0 };
+        let s = ProfilerSummary {
+            entries: vec![],
+            decode_tokens: 0,
+        };
         assert!(s.total_us_per_token() >= 0.0);
     }
 }

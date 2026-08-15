@@ -8938,6 +8938,10 @@ impl CudaBackend {
             eprintln!("[XCHK] step={step} residual_x sumsq={xsq:.6} absmax={xmx:.6}");
             eprintln!("[XCHK] step={step} logits sumsq={lsq:.6} absmax={lmx:.6} top8={top8:?}");
         }
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("final_argmax", &self.device.stream);
+            p.record_token();
+        }
         kv.advance_seq_len()?;
         st.decode_token_count += 1;
         Ok(Logits { data: logits_host })
@@ -11646,7 +11650,11 @@ unsafe fn repack_all_layers_q4_clone_to_split(
         }
     }
 
-    let clone_attn = crate::runtime_defaults::q4_split_attn_enabled();
+    // Narrow-GDN configs (v_heads == 32, e.g. Qwen3.5-9B) route Q4 attention/
+    // GDN projections through F32-activation matvecs that cannot consume split
+    // siblings, so cloning them there would only burn VRAM.
+    let attn_route_live = !(hp.gdn.is_some() && hp.gdn_dims().num_v_heads == 32);
+    let clone_attn = attn_route_live && crate::runtime_defaults::q4_split_attn_enabled();
     for (layer_idx, layer) in layers.iter().enumerate() {
         if clone_attn {
             if layer.layer_type == 1 {
@@ -15100,6 +15108,9 @@ impl ComputeBackend for CudaBackend {
         // stale data from leaking across generate() calls.
         if let Ok(mut guard) = self.state.lock() {
             if let Some(ref mut st) = *guard {
+                if let Some(p) = st.profiler.as_mut() {
+                    p.flush();
+                }
                 for kv_cache in &mut st.kv_caches {
                     kv_cache.reset();
                 }
@@ -16578,7 +16589,8 @@ impl ComputeBackend for CudaBackend {
                 eprintln!(
                     "[CUDA] Q8 split-clone budget: resolved={:.2} GB (free={:.2} GB, \
                      kv_reserve={:.2} GB, slack={:.2} GB, source={}); cloned \
-                     {n_layers_split}/{num_layers} FFN layers ({total_jobs} weight-jobs)",
+                     {n_layers_split}/{num_layers} layers ({total_jobs} weight-jobs \
+                     enumerated: FFN always, attention when LUMEN_CUDA_Q4_SPLIT_ATTN=1)",
                     (budget.budget_bytes as f64) / 1.0e9,
                     (budget.free_mem_bytes as f64) / 1.0e9,
                     (budget.kv_reserve_bytes as f64) / 1.0e9,
@@ -16748,7 +16760,8 @@ impl ComputeBackend for CudaBackend {
                 eprintln!(
                     "[CUDA] Q4 split-clone budget: resolved={:.2} GB (free={:.2} GB, \
                      kv_reserve={:.2} GB, slack={:.2} GB, source={}); cloned \
-                     {n_layers_split}/{num_layers} FFN layers ({total_jobs} weight-jobs)",
+                     {n_layers_split}/{num_layers} layers ({total_jobs} weight-jobs \
+                     enumerated: FFN always, attention when LUMEN_CUDA_Q4_SPLIT_ATTN=1)",
                     (budget.budget_bytes as f64) / 1.0e9,
                     (budget.free_mem_bytes as f64) / 1.0e9,
                     (budget.kv_reserve_bytes as f64) / 1.0e9,
