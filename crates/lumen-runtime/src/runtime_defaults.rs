@@ -1117,6 +1117,15 @@ pub fn attn_sigmoid_inplace_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_ATTN_SIG_INPLACE"), Ok(v) if v == "1")
 }
 
+/// `LUMEN_CUDA_Q8_AB_BANK=1` (probe): the GDN alpha+beta Q8Raw matvecs
+/// ([48,5120] each, 24-CTA grids) issue as ONE banked launch. The banked
+/// kernel duplicates the raw-route body verbatim but compiles under
+/// fast-math, so equality vs the two-launch route is byte-gate-validated,
+/// not assumed. Default OFF.
+pub fn q8_ab_bank_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_Q8_AB_BANK"), Ok(v) if v == "1")
+}
+
 /// `LUMEN_CUDA_Q4_AB_BANK=1` (probe): alpha+beta issue as one two-pointer
 /// banked launch (24 CTAs) instead of two 12-CTA launches. Reuses the proven
 /// qkv+gate banked kernel; bit-identical per row. Default OFF.
@@ -1284,6 +1293,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_GDN_NG_Q8",
     "LUMEN_CUDA_GDN_P123_FUSE",
     "LUMEN_CUDA_ATTN_SIG_INPLACE",
+    "LUMEN_CUDA_Q8_AB_BANK",
     "LUMEN_CUDA_Q4_AB_BANK",
     "LUMEN_CUDA_Q4_PROJ_BANK4",
     "LUMEN_CUDA_Q4_PROJ_PAIR",

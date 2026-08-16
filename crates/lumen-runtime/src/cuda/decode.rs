@@ -428,6 +428,7 @@ pub(crate) struct KernelSet {
     // NR=2 rows/block, 128 threads, NO shmem for input. SM 6.1+.
     pub(crate) quantize_f32_to_q8_1: Option<CudaFunction>,
     pub(crate) matvec_q8_0_q8_1: Option<CudaFunction>,
+    pub(crate) matvec_q8_0_q8_1_banked: Option<CudaFunction>,
     pub(crate) matvec_q8_0_q8_1_residual: Option<CudaFunction>,
 
     // Q4_0 dp4a kernels: native Q4_0 weights + pre-quantized Q8_1 input.
@@ -1549,6 +1550,11 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        matvec_q8_0_q8_1_banked: load_fn_sm80_fast_math(
+            shaders::MATVEC_DP4A_Q8_1_KERNEL_SOURCE,
+            "matvec_q8_0_q8_1_banked",
+        )
+        .ok(),
         matvec_q8_0_q8_1: match load_fn_sm80_fast_math(
             shaders::MATVEC_DP4A_Q8_1_KERNEL_SOURCE,
             "matvec_q8_0_q8_1",

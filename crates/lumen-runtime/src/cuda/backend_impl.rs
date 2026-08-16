@@ -5278,32 +5278,57 @@ impl CudaBackend {
                     )?;
                 }
             } else if !bank4 {
-                // LUMEN_CUDA_Q4_AB_BANK: alpha+beta as one two-pointer banked
-                // launch (bit-identical; same kernel the qkv+gate bank uses).
-                let ab_banked = crate::runtime_defaults::q4_ab_bank_enabled()
-                    && st.kernels.use_q4_split_dispatch
-                    && st.kernels.use_soa_locked
-                    && !st.kernels.use_mmvq_q4
-                    && st.kernels.matvec_q4_split_q8_1_locked_banked.is_some()
-                    && lw.q4_split_ssm_alpha.is_some()
-                    && lw.q4_split_ssm_beta.is_some();
+                // LUMEN_CUDA_Q8_AB_BANK: alpha+beta (Q8Raw on this model —
+                // the converter forces them to Q8_0, so the Q4-split bank can
+                // never engage here) as ONE banked raw-route launch. Equality
+                // vs the two-launch route is byte-gate-validated (fast-math
+                // compile), not assumed.
+                let ab_banked = crate::runtime_defaults::q8_ab_bank_enabled()
+                    && st.kernels.matvec_q8_0_q8_1_banked.is_some()
+                    && matches!(ssm_alpha_w, GpuWeightBuf::Q8Raw(_))
+                    && matches!(ssm_beta_w, GpuWeightBuf::Q8Raw(_));
                 if ab_banked {
-                    let (a_out, b_out) = (&mut gdn.alpha_raw_buf, &mut gdn.beta_raw_buf);
-                    unsafe {
-                        launch_matvec_preq8_1_q4_banked(
-                            &self.device,
-                            &st.kernels,
-                            lw.q4_split_ssm_alpha.as_ref().unwrap(),
-                            lw.q4_split_ssm_beta.as_ref().unwrap(),
-                            q8_1_buf,
-                            a_out,
-                            b_out,
-                            p.num_heads,
-                            p.num_heads,
-                            hidden_dim,
-                            "gdn_ab_bank",
-                        )?;
+                    // Positive treatment census: a probe arm that never prints
+                    // this marker did NOT engage (r3 lesson: two earlier bank
+                    // variants gated on always-None fields and measured noise).
+                    {
+                        static SHOWN: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            eprintln!("[ABBANK] Q8 alpha+beta banked route ACTIVE");
+                        }
                     }
+                    let (GpuWeightBuf::Q8Raw(w_a), GpuWeightBuf::Q8Raw(w_b)) =
+                        (ssm_alpha_w, ssm_beta_w)
+                    else {
+                        unreachable!("ab_banked checks Q8Raw")
+                    };
+                    let mv_fn = st.kernels.matvec_q8_0_q8_1_banked.as_ref().unwrap();
+                    let out_u32 = p.num_heads as u32;
+                    let in_dim_u32 = hidden_dim as u32;
+                    let grid = 2 * dp4a_q8_1_grid(out_u32);
+                    let mv_cfg = CudarcLaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (DP4A_Q8_1_BLOCK_DIM, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(mv_fn)
+                            .arg(w_a)
+                            .arg(w_b)
+                            .arg(&*q8_1_buf)
+                            .arg(&mut gdn.alpha_raw_buf)
+                            .arg(&mut gdn.beta_raw_buf)
+                            .arg(&out_u32)
+                            .arg(&out_u32)
+                            .arg(&in_dim_u32)
+                            .launch(mv_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("gdn_ab_bank_q8 L{layer_idx}: {e}"))
+                    })?;
                 } else {
                     unsafe {
                         launch_matvec_preq8_1_split(
