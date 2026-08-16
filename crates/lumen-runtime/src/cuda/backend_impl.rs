@@ -846,6 +846,9 @@ struct MutableState {
     logits_gpu: CudaSlice<f32>,
     /// GPU-side argmax result: [1] u32. Avoids reading back full vocab logits.
     argmax_result: CudaSlice<u32>,
+    /// Per-stage decode timing (`LUMEN_CUDA_PROFILE=1`; `None` otherwise —
+    /// begin/end short-circuit to one Option check on the default path).
+    profiler: Option<super::profiler::StageProfiler>,
     /// Whether the model has any GDN layers.
     has_gdn_layers: bool,
     /// Whether the model has Q+gate fusion layers (disables graph capture).
@@ -2121,8 +2124,25 @@ impl CudaBackend {
             // hidden state). x_gpu is NOT updated here -- it retains the old value.
             // The FFN block reads from attn_proj, and the caller copies attn_proj
             // to x_gpu after the full layer (GDN attention + FFN) completes.
+            if let Some(p) = st.profiler.as_mut() {
+                p.begin(
+                    "gdn_attn",
+                    super::profiler::LayerType::Gdn,
+                    &self.device.stream,
+                );
+            }
             self.compute_gdn_attention_gpu(layer_idx, st)?;
+            if let Some(p) = st.profiler.as_mut() {
+                p.end("gdn_attn", &self.device.stream);
+            }
         } else {
+            if let Some(p) = st.profiler.as_mut() {
+                p.begin(
+                    "full_attn",
+                    super::profiler::LayerType::Full,
+                    &self.device.stream,
+                );
+            }
             let lw: &LayerWeightsGpu = st.layer_weights_cache.get(layer_idx).ok_or_else(|| {
                 RuntimeError::Compute(format!(
                     "compute_layer_gpu: layer {layer_idx} not in GPU-resident cache",
@@ -3112,8 +3132,18 @@ impl CudaBackend {
                     }
                 }
             }
+            if let Some(p) = st.profiler.as_mut() {
+                p.end("full_attn", &self.device.stream);
+            }
         } // end else (standard attention path — skipped for GDN layers)
 
+        if let Some(p) = st.profiler.as_mut() {
+            p.begin(
+                "ffn",
+                super::profiler::LayerType::Whole,
+                &self.device.stream,
+            );
+        }
         // Re-borrow layer weights for the FFN block (shared between standard and GDN layers).
         let lw: &LayerWeightsGpu = &st.layer_weights_cache[layer_idx];
 
@@ -3320,6 +3350,9 @@ impl CudaBackend {
             }
 
             // MoE branch is complete; skip the dense FFN block below.
+            if let Some(p) = st.profiler.as_mut() {
+                p.end("ffn", &self.device.stream);
+            }
             return Ok(());
         }
 
@@ -4670,6 +4703,9 @@ impl CudaBackend {
             .map_err(|e| RuntimeError::Compute(format!("residual_add launch: {e}")))?;
         }
 
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("ffn", &self.device.stream);
+        }
         // Layer output is now in st.scratch.attn_proj. The caller must copy it
         // to st.scratch.x_gpu before the next layer (done via device memcpy).
         Ok(())
@@ -4961,6 +4997,13 @@ impl CudaBackend {
         // it: dispatch ONLY the parity projection. Arithmetic-identical
         // (BYTE-identical); env-gated default-OFF for the A/B gate.
         let gdn_skip_dup_qkv = gdn_convstate_parity_qkv && gdn_skip_dup_qkv_enabled();
+        if let Some(p) = st.profiler.as_mut() {
+            p.begin(
+                "gdn_proj",
+                super::profiler::LayerType::Gdn,
+                &self.device.stream,
+            );
+        }
 
         if gdn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
             // === FUSED: RMSNorm + Q8_1 quantize in 1 dispatch ===
@@ -5405,6 +5448,14 @@ impl CudaBackend {
         // (the prefill norm-gate fuses RMSNorm + SiLU(gate)), so the decode
         // Steps 8/10 norm-gate is skipped and Step 11 (ssm_out) reads
         // `normed_out_buf`. OFF / missing-kernels → byte-identical.
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("gdn_proj", &self.device.stream);
+            p.begin(
+                "gdn_recur",
+                super::profiler::LayerType::Gdn,
+                &self.device.stream,
+            );
+        }
         let gdn_decode_via_prefill = gdn_decode_via_prefill_enabled()
             && st.kernels.ssm_conv1d_silu_prefill.is_some()
             && st.kernels.gdn_compute_gates_batched.is_some()
@@ -6370,8 +6421,17 @@ impl CudaBackend {
             used_fused_norm_gate = false;
         }
 
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("gdn_recur", &self.device.stream);
+            p.begin(
+                "gdn_ssm_out",
+                super::profiler::LayerType::Gdn,
+                &self.device.stream,
+            );
+        }
         // --- Step 11: Output projection -> ssm_proj ---
         // Fused path: reads from normed_out_buf. Unfused path: reads from output_buf.
+        let mut ssm_residual_folded = false;
         {
             let ssm_out = lw.ssm_out.as_ref().ok_or_else(|| {
                 RuntimeError::Compute(format!("GDN L{layer_idx}: ssm_out weight missing",))
@@ -6381,29 +6441,106 @@ impl CudaBackend {
             } else {
                 &gdn.output_buf
             };
-            unsafe {
-                launch_matvec(
-                    &self.device,
-                    &st.kernels,
-                    ssm_out,
-                    ssm_input,
-                    &mut gdn.ssm_proj_buf,
-                    hidden_dim,
-                    p.value_dim,
-                    "gdn_ssm_out",
-                    lw.ssm_out_f16.as_ref(),
-                    Some(&mut st.scratch.input_f16),
-                    st.scratch.input_q8_1.as_mut(),
-                )?;
+            // Split-sibling route: quantize the F32 gated output to Q8_1 (the
+            // same kernel the raw dp4a path uses) and dispatch the split-layout
+            // matvec. Falls through to the raw route when the sibling or any
+            // required piece is absent, keeping the base path untouched.
+            let mut ssm_split_done = false;
+            if let (Some(split_buf), Some(quant_fn), Some(q8_1_buf)) = (
+                lw.q8_split_ssm_out.as_ref(),
+                st.kernels.quantize_q8_1_rawsum.as_ref(),
+                st.scratch
+                    .input_q8_1
+                    .as_mut()
+                    .filter(|b| b.len() >= p.value_dim.div_ceil(32) * 36),
+            ) {
+                let in_dim_u32 = p.value_dim as u32;
+                let q_blocks = in_dim_u32.div_ceil(32);
+                let quant_cfg = CudarcLaunchConfig {
+                    grid_dim: (q_blocks, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(quant_fn)
+                        .arg(ssm_input)
+                        .arg(&mut *q8_1_buf)
+                        .arg(&in_dim_u32)
+                        .launch(quant_cfg)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("quantize_q8_1 gdn_ssm_out L{layer_idx}: {e}"))
+                })?;
+                if crate::runtime_defaults::ssmout_residual_fold_enabled() {
+                    // Fold the residual into the projection: attn_proj =
+                    // ssm_out * gated + x_gpu in ONE kernel, making Step 12's
+                    // separate residual_add_copy unnecessary for this layer.
+                    unsafe {
+                        launch_matvec_preq8_1_residual_split(
+                            &self.device,
+                            &st.kernels,
+                            ssm_out,
+                            Some(split_buf),
+                            None,
+                            q8_1_buf,
+                            &st.scratch.x_gpu,
+                            &mut st.scratch.attn_proj,
+                            hidden_dim,
+                            p.value_dim,
+                            "gdn_ssm_out",
+                        )?;
+                    }
+                    ssm_residual_folded = true;
+                } else {
+                    unsafe {
+                        launch_matvec_preq8_1_split(
+                            &self.device,
+                            &st.kernels,
+                            ssm_out,
+                            Some(split_buf),
+                            None,
+                            q8_1_buf,
+                            &mut gdn.ssm_proj_buf,
+                            hidden_dim,
+                            p.value_dim,
+                            "gdn_ssm_out",
+                        )?;
+                    }
+                }
+                ssm_split_done = true;
+            }
+            if !ssm_split_done {
+                unsafe {
+                    launch_matvec(
+                        &self.device,
+                        &st.kernels,
+                        ssm_out,
+                        ssm_input,
+                        &mut gdn.ssm_proj_buf,
+                        hidden_dim,
+                        p.value_dim,
+                        "gdn_ssm_out",
+                        lw.ssm_out_f16.as_ref(),
+                        Some(&mut st.scratch.input_f16),
+                        st.scratch.input_q8_1.as_mut(),
+                    )?;
+                }
             }
         }
 
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("gdn_ssm_out", &self.device.stream);
+        }
         // --- Step 12+13: Fused residual add + copy ---
         // attn_proj = x_gpu + ssm_proj (via residual_add_copy, 1 dispatch).
         // x_gpu is NOT updated here -- it will be updated by the FFN residual
         // (x_gpu = attn_proj + down) which already reads from attn_proj.
         // This eliminates 1 dispatch vs the prior residual_add + memcpy_dtod pair.
-        {
+        // Skipped entirely when the split projection already folded the
+        // residual and wrote attn_proj itself.
+        if !ssm_residual_folded {
             let config = LaunchConfig::for_elements(hidden_dim);
             let launch_cfg = CudarcLaunchConfig {
                 grid_dim: (config.grid_dim, 1, 1),
@@ -8800,7 +8937,17 @@ impl CudaBackend {
         st: &mut MutableState,
         kv: &mut crate::kv::KvCache,
     ) -> Result<Logits, RuntimeError> {
+        if let Some(p) = st.profiler.as_mut() {
+            p.begin(
+                "embed",
+                super::profiler::LayerType::Whole,
+                &self.device.stream,
+            );
+        }
         self.embed_token_gpu(token_id, st)?;
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("embed", &self.device.stream);
+        }
         for layer in 0..num_layers {
             self.compute_layer_gpu(layer, seq_pos, st)?;
             // FIX-DTOD: For DENSE layers, dense FFN writes to a separate
@@ -8821,6 +8968,13 @@ impl CudaBackend {
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
                     .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
             }
+        }
+        if let Some(p) = st.profiler.as_mut() {
+            p.begin(
+                "final_argmax",
+                super::profiler::LayerType::Whole,
+                &self.device.stream,
+            );
         }
         self.compute_final_gpu(st)?;
         {
@@ -8885,6 +9039,10 @@ impl CudaBackend {
             eprintln!("[XCHK] step={step} residual_x sumsq={xsq:.6} absmax={xmx:.6}");
             eprintln!("[XCHK] step={step} logits sumsq={lsq:.6} absmax={lmx:.6} top8={top8:?}");
         }
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("final_argmax", &self.device.stream);
+            p.record_token();
+        }
         kv.advance_seq_len()?;
         st.decode_token_count += 1;
         Ok(Logits { data: logits_host })
@@ -8910,7 +9068,17 @@ impl CudaBackend {
         st: &mut MutableState,
         kv: &mut crate::kv::KvCache,
     ) -> Result<u32, RuntimeError> {
+        if let Some(p) = st.profiler.as_mut() {
+            p.begin(
+                "embed",
+                super::profiler::LayerType::Whole,
+                &self.device.stream,
+            );
+        }
         self.embed_token_gpu(token_id, st)?;
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("embed", &self.device.stream);
+        }
         for layer in 0..num_layers {
             self.compute_layer_gpu(layer, seq_pos, st)?;
             // Mirror decode_token_normal's FIX-DTOD: propagate the post-FFN
@@ -8927,6 +9095,13 @@ impl CudaBackend {
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
                     .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
             }
+        }
+        if let Some(p) = st.profiler.as_mut() {
+            p.begin(
+                "final_argmax",
+                super::profiler::LayerType::Whole,
+                &self.device.stream,
+            );
         }
         self.compute_final_gpu(st)?;
         {
@@ -8949,6 +9124,10 @@ impl CudaBackend {
         }
         // Sync is still required to make the argmax index host-visible, but we
         // copy back only the single u32 the kernel wrote -- NOT the full vocab.
+        if let Some(p) = st.profiler.as_mut() {
+            p.end("final_argmax", &self.device.stream);
+            p.record_token();
+        }
         self.device.synchronize()?;
         // Keep the optional per-step CPU sleep for parity with the logits path
         // (default OFF -> no-op).
@@ -11344,6 +11523,7 @@ unsafe fn repack_all_layers_q8_clone_to_split(
         Gate,
         Up,
         Down,
+        SsmOut,
     }
 
     struct Job {
@@ -11411,6 +11591,25 @@ unsafe fn repack_all_layers_q8_clone_to_split(
             hidden,
             inter,
         );
+        // GDN ssm_out is Q8 even on Q4 models (converter requant); its split
+        // sibling field existed unpopulated. Flag-gated: the split route is
+        // the same mmvq/scalar family, different weight layout.
+        if crate::runtime_defaults::q8_split_ssmout_enabled() {
+            if let Some(w) = layer.ssm_out.as_ref() {
+                let gd = hp.gdn_dims();
+                let vdim = (gd.num_v_heads * gd.head_dim) as usize;
+                if vdim > 0 {
+                    push_if_q8raw(
+                        &mut jobs,
+                        layer_idx,
+                        SplitWeightKind::SsmOut,
+                        w,
+                        hidden,
+                        vdim,
+                    );
+                }
+            }
+        }
     }
 
     // Largest-first. Tie-break: full-attention layers before GDN (higher per-token
@@ -11478,6 +11677,10 @@ unsafe fn repack_all_layers_q8_clone_to_split(
                     None
                 }
             }
+            SplitWeightKind::SsmOut => match layer.ssm_out.as_ref() {
+                Some(GpuWeightBuf::Q8Raw(b)) => Some(b),
+                _ => None,
+            },
         };
         let Some(raw_buf) = src_ref else { continue };
         match repack_q8_raw_to_split(device, repack_kernel, raw_buf, job.out_dim, job.in_dim) {
@@ -11486,6 +11689,7 @@ unsafe fn repack_all_layers_q8_clone_to_split(
                     SplitWeightKind::Gate => layer.q8_split_w_gate = Some(split_buf),
                     SplitWeightKind::Up => layer.q8_split_w_up = Some(split_buf),
                     SplitWeightKind::Down => layer.q8_split_w_down = Some(split_buf),
+                    SplitWeightKind::SsmOut => layer.q8_split_ssm_out = Some(split_buf),
                 }
                 layers_with_split.insert(job.layer_idx);
                 bytes_cloned += job.size_bytes;
@@ -11514,24 +11718,26 @@ unsafe fn repack_all_layers_q4_clone_to_split(
     let hidden = hp.hidden_dim as usize;
     let inter = hp.intermediate_dim as usize;
 
-    // Only the dense FFN weights (Gate/Up/Down) are cloned to Q4 split siblings.
-    // The full-attention projections (Wq/Wk/Wv/Wo) are deliberately EXCLUDED:
-    // the residual-split `wo` decode kernel
-    // (`matvec_q4_split_q8_1_locked_residual`) is not yet correct and produces
-    // NaN logits, so cloning attention weights -- which only happens once the
-    // clone budget is raised past the (larger, sort-first) FFN set -- garbles
-    // decode (token 0 repeated). FFN split is bitwise-identical to the AoS
-    // `matvec_q4_0_dp4a` path via the `.rn` codegen lock, so restricting the
-    // clone to FFN keeps decode byte-identical at ANY budget while still
-    // delivering the FFN SoA speedup on 27B (all 64 FFN layers when the budget
-    // is raised). With the default 5.1 GB cap attention was never reached
-    // anyway (FFN weights are larger and sort first), so the unset-env path is
-    // unchanged.
+    // Dense FFN weights (Gate/Up/Down) always clone to Q4 split siblings —
+    // bitwise-identical to the AoS `matvec_q4_0_dp4a` path via the `.rn`
+    // codegen lock. `LUMEN_CUDA_Q4_SPLIT_ATTN=1` extends the clone set to the
+    // non-residual attention/GDN projections (GDN fused-QKV + gate,
+    // full-attention Wq/Wk/Wv), whose dispatch sites already prefer a split
+    // sibling when present and run the same locked kernel (same K=hidden inner
+    // loop the FFN gate/up clones prove). `wo` stays EXCLUDED unconditionally:
+    // its residual-split decode kernel (`matvec_q4_split_q8_1_locked_residual`)
+    // produces NaN logits.
     #[derive(Copy, Clone, Debug)]
     enum SplitWeightKind {
         Gate,
         Up,
         Down,
+        GdnQkv,
+        GdnGate,
+        AttnWq,
+        AttnWk,
+        AttnWv,
+        AttnWo,
     }
 
     struct Job {
@@ -11571,10 +11777,88 @@ unsafe fn repack_all_layers_q4_clone_to_split(
         }
     }
 
+    // Narrow-GDN configs (v_heads == 32, e.g. Qwen3.5-9B) route Q4 attention/
+    // GDN projections through F32-activation matvecs that cannot consume split
+    // siblings, so cloning them there would only burn VRAM.
+    let attn_route_live = !(hp.gdn.is_some() && hp.gdn_dims().num_v_heads == 32);
+    let clone_attn = attn_route_live && crate::runtime_defaults::q4_split_attn_enabled();
     for (layer_idx, layer) in layers.iter().enumerate() {
-        // FFN-only: attention (Wq/Wk/Wv/Wo) is intentionally not cloned (see the
-        // SplitWeightKind comment) so attention decode stays on the base dp4a
-        // path and output remains byte-identical to the AoS path.
+        if clone_attn {
+            if layer.layer_type == 1 {
+                // GDN layer: wq holds the fused QKV projection; attn_gate the
+                // z-gate projection. Both share in_dim = hidden.
+                let gd = hp.gdn_dims();
+                let qkv_out =
+                    ((gd.num_k_heads * gd.head_dim) * 2 + gd.num_v_heads * gd.head_dim) as usize;
+                push_if_q4raw(
+                    &mut jobs,
+                    layer_idx,
+                    SplitWeightKind::GdnQkv,
+                    &layer.wq,
+                    qkv_out,
+                    hidden,
+                );
+                if let Some(gate_w) = layer.attn_gate.as_ref() {
+                    push_if_q4raw(
+                        &mut jobs,
+                        layer_idx,
+                        SplitWeightKind::GdnGate,
+                        gate_w,
+                        (gd.num_v_heads * gd.head_dim) as usize,
+                        hidden,
+                    );
+                }
+            } else {
+                // Full-attention layer: wq is Q+gate fused when attn_q_norm is
+                // present (out = q_dim * 2), plain Q otherwise.
+                let heads = hp.num_heads as usize;
+                let kv_heads = hp.num_kv_heads as usize;
+                let head_dim = hp.head_dim as usize;
+                let q_out = if layer.attn_q_norm.is_some() {
+                    heads * head_dim * 2
+                } else {
+                    heads * head_dim
+                };
+                push_if_q4raw(
+                    &mut jobs,
+                    layer_idx,
+                    SplitWeightKind::AttnWq,
+                    &layer.wq,
+                    q_out,
+                    hidden,
+                );
+                push_if_q4raw(
+                    &mut jobs,
+                    layer_idx,
+                    SplitWeightKind::AttnWk,
+                    &layer.wk,
+                    kv_heads * head_dim,
+                    hidden,
+                );
+                push_if_q4raw(
+                    &mut jobs,
+                    layer_idx,
+                    SplitWeightKind::AttnWv,
+                    &layer.wv,
+                    kv_heads * head_dim,
+                    hidden,
+                );
+                // Probe flag: the residual-split wo kernel was recorded as
+                // producing NaN logits in an earlier campaign; this arm exists
+                // to re-test that verdict on current source before any wider
+                // rollout. Never enabled by the primary flag.
+                if crate::runtime_defaults::q4_split_wo_probe_enabled() {
+                    push_if_q4raw(
+                        &mut jobs,
+                        layer_idx,
+                        SplitWeightKind::AttnWo,
+                        &layer.wo,
+                        hidden,
+                        heads * head_dim,
+                    );
+                }
+            }
+        }
         push_if_q4raw(
             &mut jobs,
             layer_idx,
@@ -11665,6 +11949,38 @@ unsafe fn repack_all_layers_q4_clone_to_split(
                     None
                 }
             }
+            SplitWeightKind::GdnQkv | SplitWeightKind::AttnWq => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.wq {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            SplitWeightKind::GdnGate => match layer.attn_gate.as_ref() {
+                Some(GpuWeightBuf::Q4Raw(b)) => Some(b),
+                _ => None,
+            },
+            SplitWeightKind::AttnWk => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.wk {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            SplitWeightKind::AttnWv => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.wv {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            SplitWeightKind::AttnWo => {
+                if let GpuWeightBuf::Q4Raw(b) = &layer.wo {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
         };
         let Some(raw_buf) = src_ref else { continue };
         match repack_q4_raw_to_split(device, repack_kernel, raw_buf, job.out_dim, job.in_dim) {
@@ -11673,6 +11989,13 @@ unsafe fn repack_all_layers_q4_clone_to_split(
                     SplitWeightKind::Gate => layer.q4_split_w_gate = Some(split_buf),
                     SplitWeightKind::Up => layer.q4_split_w_up = Some(split_buf),
                     SplitWeightKind::Down => layer.q4_split_w_down = Some(split_buf),
+                    SplitWeightKind::GdnQkv | SplitWeightKind::AttnWq => {
+                        layer.q4_split_wq = Some(split_buf)
+                    }
+                    SplitWeightKind::GdnGate => layer.q4_split_attn_gate = Some(split_buf),
+                    SplitWeightKind::AttnWk => layer.q4_split_wk = Some(split_buf),
+                    SplitWeightKind::AttnWv => layer.q4_split_wv = Some(split_buf),
+                    SplitWeightKind::AttnWo => layer.q4_split_wo = Some(split_buf),
                 }
                 layers_with_split.insert(job.layer_idx);
                 bytes_cloned += job.size_bytes;
@@ -13742,6 +14065,7 @@ impl ComputeBackend for CudaBackend {
             use_q4_split,
             use_output_proj_split,
             output_proj_nr,
+            profiler: super::profiler::StageProfiler::from_env(),
         });
 
         Ok(())
@@ -14933,6 +15257,9 @@ impl ComputeBackend for CudaBackend {
         // stale data from leaking across generate() calls.
         if let Ok(mut guard) = self.state.lock() {
             if let Some(ref mut st) = *guard {
+                if let Some(p) = st.profiler.as_mut() {
+                    p.flush();
+                }
                 for kv_cache in &mut st.kv_caches {
                     kv_cache.reset();
                 }
@@ -16411,7 +16738,8 @@ impl ComputeBackend for CudaBackend {
                 eprintln!(
                     "[CUDA] Q8 split-clone budget: resolved={:.2} GB (free={:.2} GB, \
                      kv_reserve={:.2} GB, slack={:.2} GB, source={}); cloned \
-                     {n_layers_split}/{num_layers} FFN layers ({total_jobs} weight-jobs)",
+                     {n_layers_split}/{num_layers} layers ({total_jobs} weight-jobs \
+                     enumerated: FFN always, attention when LUMEN_CUDA_Q4_SPLIT_ATTN=1)",
                     (budget.budget_bytes as f64) / 1.0e9,
                     (budget.free_mem_bytes as f64) / 1.0e9,
                     (budget.kv_reserve_bytes as f64) / 1.0e9,
@@ -16581,7 +16909,8 @@ impl ComputeBackend for CudaBackend {
                 eprintln!(
                     "[CUDA] Q4 split-clone budget: resolved={:.2} GB (free={:.2} GB, \
                      kv_reserve={:.2} GB, slack={:.2} GB, source={}); cloned \
-                     {n_layers_split}/{num_layers} FFN layers ({total_jobs} weight-jobs)",
+                     {n_layers_split}/{num_layers} layers ({total_jobs} weight-jobs \
+                     enumerated: FFN always, attention when LUMEN_CUDA_Q4_SPLIT_ATTN=1)",
                     (budget.budget_bytes as f64) / 1.0e9,
                     (budget.free_mem_bytes as f64) / 1.0e9,
                     (budget.kv_reserve_bytes as f64) / 1.0e9,

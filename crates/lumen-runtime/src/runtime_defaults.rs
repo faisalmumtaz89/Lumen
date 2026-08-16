@@ -1067,6 +1067,41 @@ pub fn q8_split_default() -> bool {
     }
 }
 
+/// `LUMEN_CUDA_Q4_SPLIT_ATTN` (default ON): extend the Q4 split-clone pass
+/// beyond the dense FFN set to the non-residual attention/GDN projections
+/// (GDN fused QKV + gate, full-attention Wq/Wk/Wv). The dispatch sites
+/// already prefer a split sibling when present and run the codegen-locked
+/// kernel — output is byte-identical to the AoS route — so the setting only
+/// widens which weights receive siblings. The clone pass itself skips
+/// narrow-GDN configs (v_heads == 32) whose F32-activation dispatch cannot
+/// consume the siblings. `=0` opts out.
+pub fn q4_split_attn_enabled() -> bool {
+    !matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_ATTN"), Ok(v) if v == "0")
+}
+
+/// `LUMEN_CUDA_Q8_SPLIT_SSMOUT` (default ON): clone the GDN `ssm_out` Q8
+/// weight into its per-row split sibling and dispatch it through the Q8
+/// split family instead of the raw-layout route. `=0` opts out.
+pub fn q8_split_ssmout_enabled() -> bool {
+    !matches!(std::env::var("LUMEN_CUDA_Q8_SPLIT_SSMOUT"), Ok(v) if v == "0")
+}
+
+/// `LUMEN_CUDA_Q4_SPLIT_WO=1` (probe): clone the full-attention `wo` into its
+/// Q4 split sibling, routing its decode through the residual-split kernel an
+/// earlier campaign recorded as broken — exists to re-test that verdict on
+/// current source. Default OFF.
+pub fn q4_split_wo_probe_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_WO"), Ok(v) if v == "1")
+}
+
+/// `LUMEN_CUDA_SSMOUT_RESID_FOLD=1`: when the ssm_out split route is active,
+/// dispatch its residual variant so the projection writes `attn_proj = W*x +
+/// x_gpu` directly and the per-layer residual_add_copy launch is skipped.
+/// Default OFF.
+pub fn ssmout_residual_fold_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_SSMOUT_RESID_FOLD"), Ok(v) if v == "1")
+}
+
 /// Per-process default for `LUMEN_CUDA_SOA_LOCKED` when the env is unset.
 /// ON for quantised dense (the codegen-locked Q4_0 split matvec: word-load
 /// nibble stream + load-hoist + `.rn`-pinned epilogue, bit-deterministic and
@@ -1189,6 +1224,10 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_PTX_CACHE",
     "LUMEN_CUDA_PTX_CACHE_DIR",
     "LUMEN_CUDA_Q4_SPLIT",
+    "LUMEN_CUDA_Q4_SPLIT_ATTN",
+    "LUMEN_CUDA_Q4_SPLIT_WO",
+    "LUMEN_CUDA_SSMOUT_RESID_FOLD",
+    "LUMEN_CUDA_Q8_SPLIT_SSMOUT",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
     "LUMEN_CUDA_Q4_MMVQ",
