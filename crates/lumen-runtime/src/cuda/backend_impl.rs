@@ -1477,6 +1477,14 @@ fn gdn_convstate_parity_enabled() -> bool {
 /// is itself true (MoE bf16/Q8), so dense / Q4 / non-parity paths are
 /// unaffected. Set `LUMEN_CUDA_GDN_SKIP_DUP_QKV=0` to force the legacy
 /// double-projection (A/B baseline). Cached: read per-GDN-layer per-token.
+/// One-time positive treatment census for the tabled-RoPE variant.
+fn rope_tab_census() {
+    static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[ROPETAB] tabled NeoX RoPE ACTIVE");
+    }
+}
+
 /// One-time positive treatment census for the V4LOAD variant.
 fn v4load_census() {
     static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2533,60 +2541,108 @@ impl CudaBackend {
                             .launch(launch_cfg)
                     }
                     .map_err(|e| RuntimeError::Compute(format!("rmsnorm_to_q8_1 attn: {e}")))?;
-                    unsafe {
-                        // split-layout: prefer Q8Split/Q4Split sibling buffers on QKV when set.
-                        // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
-                        if has_qgate_fusion {
-                            launch_matvec_preq8_1_split(
+                    // LUMEN_CUDA_ATTN_BANK3: wq/wk/wv as ONE banked launch
+                    // (4-way kernel, empty fourth slot => zero CTAs there).
+                    let attn_bank3 = crate::runtime_defaults::attn_bank3_enabled()
+                        && has_qgate_fusion
+                        && st.kernels.use_q4_split_dispatch
+                        && st.kernels.use_soa_locked
+                        && !st.kernels.use_mmvq_q4
+                        && st.kernels.matvec_q4_split_q8_1_locked_bank4.is_some()
+                        && lw.q8_split_wq.is_none()
+                        && lw.q4_split_wq.is_some()
+                        && lw.q4_split_wk.is_some()
+                        && lw.q4_split_wv.is_some();
+                    if attn_bank3 {
+                        {
+                            static SHOWN: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("[BANK3] wq/wk/wv banked launch ACTIVE");
+                            }
+                        }
+                        // Split scratch borrows: q_gate/k/v are distinct fields;
+                        // `normed` is the dead fourth output (zero CTAs route to
+                        // it — out_d = 0 rows).
+                        let (q_gate, k_buf, v_buf, dead) = (
+                            st.scratch.q_gate.as_mut().unwrap(),
+                            &mut st.scratch.k,
+                            &mut st.scratch.v,
+                            &mut st.scratch.normed,
+                        );
+                        unsafe {
+                            launch_matvec_preq8_1_q4_bank4(
                                 &self.device,
                                 &st.kernels,
-                                &lw.wq,
-                                lw.q8_split_wq.as_ref(),
-                                lw.q4_split_wq.as_ref(),
+                                [
+                                    lw.q4_split_wq.as_ref().unwrap(),
+                                    lw.q4_split_wk.as_ref().unwrap(),
+                                    lw.q4_split_wv.as_ref().unwrap(),
+                                    lw.q4_split_wv.as_ref().unwrap(),
+                                ],
                                 q8_1_buf,
-                                st.scratch.q_gate.as_mut().unwrap(),
-                                wq_out_dim,
+                                [q_gate, k_buf, v_buf, dead],
+                                [wq_out_dim, kv_dim, kv_dim, 0],
                                 hidden_dim,
-                                "wq",
-                            )?;
-                        } else {
-                            launch_matvec_preq8_1_split(
-                                &self.device,
-                                &st.kernels,
-                                &lw.wq,
-                                lw.q8_split_wq.as_ref(),
-                                lw.q4_split_wq.as_ref(),
-                                q8_1_buf,
-                                &mut st.scratch.q,
-                                q_dim,
-                                hidden_dim,
-                                "wq",
+                                "attn_qkv_bank3",
                             )?;
                         }
-                        launch_matvec_preq8_1_split(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wk,
-                            lw.q8_split_wk.as_ref(),
-                            lw.q4_split_wk.as_ref(),
-                            q8_1_buf,
-                            &mut st.scratch.k,
-                            kv_dim,
-                            hidden_dim,
-                            "wk",
-                        )?;
-                        launch_matvec_preq8_1_split(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wv,
-                            lw.q8_split_wv.as_ref(),
-                            lw.q4_split_wv.as_ref(),
-                            q8_1_buf,
-                            &mut st.scratch.v,
-                            kv_dim,
-                            hidden_dim,
-                            "wv",
-                        )?;
+                    } else {
+                        unsafe {
+                            // split-layout: prefer Q8Split/Q4Split sibling buffers on QKV when set.
+                            // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                            if has_qgate_fusion {
+                                launch_matvec_preq8_1_split(
+                                    &self.device,
+                                    &st.kernels,
+                                    &lw.wq,
+                                    lw.q8_split_wq.as_ref(),
+                                    lw.q4_split_wq.as_ref(),
+                                    q8_1_buf,
+                                    st.scratch.q_gate.as_mut().unwrap(),
+                                    wq_out_dim,
+                                    hidden_dim,
+                                    "wq",
+                                )?;
+                            } else {
+                                launch_matvec_preq8_1_split(
+                                    &self.device,
+                                    &st.kernels,
+                                    &lw.wq,
+                                    lw.q8_split_wq.as_ref(),
+                                    lw.q4_split_wq.as_ref(),
+                                    q8_1_buf,
+                                    &mut st.scratch.q,
+                                    q_dim,
+                                    hidden_dim,
+                                    "wq",
+                                )?;
+                            }
+                            launch_matvec_preq8_1_split(
+                                &self.device,
+                                &st.kernels,
+                                &lw.wk,
+                                lw.q8_split_wk.as_ref(),
+                                lw.q4_split_wk.as_ref(),
+                                q8_1_buf,
+                                &mut st.scratch.k,
+                                kv_dim,
+                                hidden_dim,
+                                "wk",
+                            )?;
+                            launch_matvec_preq8_1_split(
+                                &self.device,
+                                &st.kernels,
+                                &lw.wv,
+                                lw.q8_split_wv.as_ref(),
+                                lw.q4_split_wv.as_ref(),
+                                q8_1_buf,
+                                &mut st.scratch.v,
+                                kv_dim,
+                                hidden_dim,
+                                "wv",
+                            )?;
+                        }
                     }
                 } else if qkv_use_preq {
                     // Fallback: separate rmsnorm + quantize_f32_to_q8_1 (fused kernel unavailable).
@@ -2962,7 +3018,15 @@ impl CudaBackend {
                 // dimension pairing instead of standard interleaved pairing.
                 let rope_neox = hp.rope_neox;
                 let rope_fn = if rope_neox {
-                    &st.kernels.rope_apply_neox
+                    if crate::runtime_defaults::rope_tabled_enabled()
+                        && (rotary_dim == 0 || rotary_dim as usize <= 256)
+                        && st.kernels.rope_apply_neox_tabled.is_some()
+                    {
+                        rope_tab_census();
+                        st.kernels.rope_apply_neox_tabled.as_ref().unwrap()
+                    } else {
+                        &st.kernels.rope_apply_neox
+                    }
                 } else {
                     &st.kernels.rope_apply
                 };
@@ -15035,7 +15099,15 @@ impl ComputeBackend for CudaBackend {
             // NeoX RoPE: models with partial rotary_dim use half-offset dimension pairing.
             let rope_neox = hp.rope_neox;
             let rope_fn = if rope_neox {
-                &st.kernels.rope_apply_neox
+                if crate::runtime_defaults::rope_tabled_enabled()
+                    && (rotary_dim == 0 || rotary_dim as usize <= 256)
+                    && st.kernels.rope_apply_neox_tabled.is_some()
+                {
+                    rope_tab_census();
+                    st.kernels.rope_apply_neox_tabled.as_ref().unwrap()
+                } else {
+                    &st.kernels.rope_apply_neox
+                }
             } else {
                 &st.kernels.rope_apply
             };

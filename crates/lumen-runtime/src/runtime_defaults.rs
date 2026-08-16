@@ -1117,6 +1117,23 @@ pub fn attn_sigmoid_inplace_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_ATTN_SIG_INPLACE"), Ok(v) if v == "1")
 }
 
+/// `LUMEN_CUDA_ROPE_TAB=1` (probe): NeoX RoPE reads its cos/sin pairs from
+/// a per-CTA shared table computed once (identical expression, identical
+/// inputs => identical bits) instead of every thread recomputing
+/// powf/cosf/sinf. Default OFF.
+pub fn rope_tabled_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_ROPE_TAB"), Ok(v) if v == "1")
+}
+
+/// `LUMEN_CUDA_ATTN_BANK3=1` (probe): full-attention wq/wk/wv issue as ONE
+/// banked launch (virtual row concat via the 4-way kernel with an empty
+/// fourth slot) off their shared Q8_1 input — two launch boundaries removed
+/// and the tiny wk/wv grids (256 CTAs each) ride the wq grid's tail.
+/// Bit-identical per row. Default OFF.
+pub fn attn_bank3_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_ATTN_BANK3"), Ok(v) if v == "1")
+}
+
 /// `LUMEN_CUDA_Q4_V4LOAD` (default ON, GDN-bank-scoped; `=0` opts out):
 /// the banked GDN launch loads the nibble
 /// stream as one 128-bit uint4 instead of four u32 words (alignment-guarded
@@ -1311,6 +1328,8 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_GDN_NG_Q8",
     "LUMEN_CUDA_GDN_P123_FUSE",
     "LUMEN_CUDA_ATTN_SIG_INPLACE",
+    "LUMEN_CUDA_ROPE_TAB",
+    "LUMEN_CUDA_ATTN_BANK3",
     "LUMEN_CUDA_Q4_V4LOAD",
     "LUMEN_CUDA_Q4_B160",
     "LUMEN_CUDA_Q8_AB_BANK",

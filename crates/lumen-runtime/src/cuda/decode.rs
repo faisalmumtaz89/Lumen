@@ -186,6 +186,7 @@ pub(crate) struct KernelSet {
     pub(crate) rmsnorm_batched: CudaFunction,
     pub(crate) rope_apply_batched: CudaFunction,
     pub(crate) rope_apply_neox: CudaFunction,
+    pub(crate) rope_apply_neox_tabled: Option<CudaFunction>,
     pub(crate) rope_apply_batched_neox: CudaFunction,
     pub(crate) bias_add_batched: CudaFunction,
     pub(crate) bias_add: CudaFunction,
@@ -991,6 +992,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         rmsnorm_batched: load_fn(shaders::PREFILL_KERNEL_SOURCE, "rmsnorm_batched")?,
         rope_apply_batched: load_fn(shaders::PREFILL_KERNEL_SOURCE, "rope_apply_batched")?,
         rope_apply_neox: load_fn(shaders::ROPE_KERNEL_SOURCE, "rope_apply_neox")?,
+        rope_apply_neox_tabled: load_fn(shaders::ROPE_KERNEL_SOURCE, "rope_apply_neox_tabled").ok(),
         rope_apply_batched_neox: load_fn(
             shaders::PREFILL_KERNEL_SOURCE,
             "rope_apply_batched_neox",
