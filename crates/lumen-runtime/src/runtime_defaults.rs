@@ -1110,6 +1110,20 @@ pub fn gdn_p123_fuse_enabled() -> bool {
     !matches!(std::env::var("LUMEN_CUDA_GDN_P123_FUSE"), Ok(v) if v == "0")
 }
 
+/// `LUMEN_CUDA_ATTN_SIG_INPLACE=1` (probe): the full-attention sigmoid gate
+/// multiplies attn_out in place, removing the temp write + DtoD copy per
+/// full-attn layer. Same arithmetic per element => bit-identical. Default OFF.
+pub fn attn_sigmoid_inplace_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_ATTN_SIG_INPLACE"), Ok(v) if v == "1")
+}
+
+/// `LUMEN_CUDA_Q4_AB_BANK=1` (probe): alpha+beta issue as one two-pointer
+/// banked launch (24 CTAs) instead of two 12-CTA launches. Reuses the proven
+/// qkv+gate banked kernel; bit-identical per row. Default OFF.
+pub fn q4_ab_bank_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_Q4_AB_BANK"), Ok(v) if v == "1")
+}
+
 /// `LUMEN_CUDA_Q4_PROJ_BANK4=1` (probe): four-way banked launch — qkv, gate,
 /// alpha, beta issue as ONE virtual-row-concat launch off the shared Q8_1
 /// input (bit-identical per row; removes three launch boundaries per GDN
@@ -1268,6 +1282,8 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_Q4_SPLIT_ATTN",
     "LUMEN_CUDA_GDN_NG_Q8",
     "LUMEN_CUDA_GDN_P123_FUSE",
+    "LUMEN_CUDA_ATTN_SIG_INPLACE",
+    "LUMEN_CUDA_Q4_AB_BANK",
     "LUMEN_CUDA_Q4_PROJ_BANK4",
     "LUMEN_CUDA_Q4_PROJ_PAIR",
     "LUMEN_CUDA_Q4_PROJ_BANK",

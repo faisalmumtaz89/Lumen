@@ -636,6 +636,7 @@ pub(crate) struct KernelSet {
     pub(crate) deinterleave_qgate: Option<CudaFunction>,
     // sigmoid_mul: sigmoid(gate) * x -> out (for gating attention output).
     pub(crate) sigmoid_mul: Option<CudaFunction>,
+    pub(crate) sigmoid_mul_inplace: Option<CudaFunction>,
     // rmsnorm_per_head_inplace: Per-head RMSNorm with shared [head_dim] weight across heads.
     pub(crate) rmsnorm_per_head_inplace: Option<CudaFunction>,
 
@@ -2253,6 +2254,8 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        sigmoid_mul_inplace: load_fn(shaders::QGATE_FUSION_KERNEL_SOURCE, "sigmoid_mul_inplace")
+            .ok(),
         sigmoid_mul: match load_fn(shaders::QGATE_FUSION_KERNEL_SOURCE, "sigmoid_mul") {
             Ok(f) => {
                 cuda_log!("[CUDA] sigmoid_mul: OK");

@@ -71,6 +71,22 @@ extern "C" __global__ void sigmoid_mul(
     out[idx] = sig * x[idx];
 }
 
+// sigmoid_mul_inplace: same arithmetic, x updated in place (element-wise
+// same-index read/write — no cross-thread aliasing, so no __restrict__ claim
+// on the in/out pointer). Removes the temp-buffer round-trip + DtoD copy.
+extern "C" __global__ void sigmoid_mul_inplace(
+    const float* __restrict__ gate,    // [n]
+    float* x,                          // [n] in/out
+    unsigned int n)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float g = gate[idx];
+    float sig = 1.0f / (1.0f + expf(-g));
+    x[idx] = sig * x[idx];
+}
+
 // ============================================================================
 // rmsnorm_per_head_inplace: Per-head RMSNorm with shared weight across heads.
 //

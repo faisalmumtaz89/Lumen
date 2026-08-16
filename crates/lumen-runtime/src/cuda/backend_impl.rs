@@ -2992,7 +2992,34 @@ impl CudaBackend {
             // for Qwen3.5-MoE-35B-A3B where `q_dim=4096 > hidden_dim=2048`,
             // corrupting adjacent GPU memory and producing gibberish output.
             if has_qgate_fusion {
-                if let Some(ref sigmoid_fn) = st.kernels.sigmoid_mul {
+                // C0 (LUMEN_CUDA_ATTN_SIG_INPLACE): gate attn_out in place —
+                // same per-element arithmetic, no temp write, no DtoD.
+                let sig_inplace = crate::runtime_defaults::attn_sigmoid_inplace_enabled()
+                    && st.kernels.sigmoid_mul_inplace.is_some();
+                if sig_inplace {
+                    let sigmoid_fn = st.kernels.sigmoid_mul_inplace.as_ref().unwrap();
+                    let gate_buf = st.scratch.gate_buf.as_ref().unwrap();
+                    let n = q_dim as u32;
+                    let block = 256u32;
+                    let grid = (n + block - 1) / block;
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(sigmoid_fn)
+                            .arg(gate_buf)
+                            .arg(&mut st.scratch.attn_out)
+                            .arg(&n)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("sigmoid_mul_inplace launch: {e}"))
+                    })?;
+                } else if let Some(ref sigmoid_fn) = st.kernels.sigmoid_mul {
                     let gate_buf = st.scratch.gate_buf.as_ref().unwrap();
                     let n = q_dim as u32;
                     let block = 256u32;
@@ -5227,35 +5254,63 @@ impl CudaBackend {
                     )?;
                 }
             } else if !bank4 {
-                unsafe {
-                    launch_matvec_preq8_1_split(
-                        &self.device,
-                        &st.kernels,
-                        ssm_alpha_w,
-                        None,
-                        lw.q4_split_ssm_alpha.as_ref(),
-                        q8_1_buf,
-                        &mut gdn.alpha_raw_buf,
-                        p.num_heads,
-                        hidden_dim,
-                        "gdn_alpha",
-                    )?;
-                }
+                // LUMEN_CUDA_Q4_AB_BANK: alpha+beta as one two-pointer banked
+                // launch (bit-identical; same kernel the qkv+gate bank uses).
+                let ab_banked = crate::runtime_defaults::q4_ab_bank_enabled()
+                    && st.kernels.use_q4_split_dispatch
+                    && st.kernels.use_soa_locked
+                    && !st.kernels.use_mmvq_q4
+                    && st.kernels.matvec_q4_split_q8_1_locked_banked.is_some()
+                    && lw.q4_split_ssm_alpha.is_some()
+                    && lw.q4_split_ssm_beta.is_some();
+                if ab_banked {
+                    let (a_out, b_out) = (&mut gdn.alpha_raw_buf, &mut gdn.beta_raw_buf);
+                    unsafe {
+                        launch_matvec_preq8_1_q4_banked(
+                            &self.device,
+                            &st.kernels,
+                            lw.q4_split_ssm_alpha.as_ref().unwrap(),
+                            lw.q4_split_ssm_beta.as_ref().unwrap(),
+                            q8_1_buf,
+                            a_out,
+                            b_out,
+                            p.num_heads,
+                            p.num_heads,
+                            hidden_dim,
+                            "gdn_ab_bank",
+                        )?;
+                    }
+                } else {
+                    unsafe {
+                        launch_matvec_preq8_1_split(
+                            &self.device,
+                            &st.kernels,
+                            ssm_alpha_w,
+                            None,
+                            lw.q4_split_ssm_alpha.as_ref(),
+                            q8_1_buf,
+                            &mut gdn.alpha_raw_buf,
+                            p.num_heads,
+                            hidden_dim,
+                            "gdn_alpha",
+                        )?;
+                    }
 
-                // Beta matvec with shared pre-quantized input.
-                unsafe {
-                    launch_matvec_preq8_1_split(
-                        &self.device,
-                        &st.kernels,
-                        ssm_beta_w,
-                        None,
-                        lw.q4_split_ssm_beta.as_ref(),
-                        q8_1_buf,
-                        &mut gdn.beta_raw_buf,
-                        p.num_heads,
-                        hidden_dim,
-                        "gdn_beta",
-                    )?;
+                    // Beta matvec with shared pre-quantized input.
+                    unsafe {
+                        launch_matvec_preq8_1_split(
+                            &self.device,
+                            &st.kernels,
+                            ssm_beta_w,
+                            None,
+                            lw.q4_split_ssm_beta.as_ref(),
+                            q8_1_buf,
+                            &mut gdn.beta_raw_buf,
+                            p.num_heads,
+                            hidden_dim,
+                            "gdn_beta",
+                        )?;
+                    }
                 }
             }
 
