@@ -27,7 +27,7 @@ use cudarc::driver::CudaFunction;
 /// trace, and the long-term fix (root cause: dp4a PTX validity on
 /// SM 80) is tracked as.
 #[inline]
-fn cuda_verbose() -> bool {
+pub(crate) fn cuda_verbose() -> bool {
     // Read once per process; OS env var reads are not on a hot path here
     // (every call site is inside the one-shot `compile_all_kernels`).
     static CHECKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -186,6 +186,8 @@ pub(crate) struct KernelSet {
     pub(crate) rmsnorm_batched: CudaFunction,
     pub(crate) rope_apply_batched: CudaFunction,
     pub(crate) rope_apply_neox: CudaFunction,
+    pub(crate) rope_apply_neox_tabled: Option<CudaFunction>,
+    pub(crate) attn_prep_fused: Option<CudaFunction>,
     pub(crate) rope_apply_batched_neox: CudaFunction,
     pub(crate) bias_add_batched: CudaFunction,
     pub(crate) bias_add: CudaFunction,
@@ -328,6 +330,14 @@ pub(crate) struct KernelSet {
     // gdn_prefill_fused_v3: warp-parallel fused state update (4x unrolled).
     // gdn_prefill_norm_gate: batched RMSNorm + SiLU gate on raw output.
     pub(crate) ssm_conv1d_silu_prefill: Option<CudaFunction>,
+    /// T=1 fusion of conv+SiLU / gates / QK-L2 (first three via-prefill
+    /// launches) — dispatched by default (LUMEN_CUDA_GDN_P123_FUSE=0 opts out) on the
+    /// F32 (dense) path.
+    pub(crate) gdn_decode_phase123_fused: Option<CudaFunction>,
+    /// T=1 norm-gate that also emits the Q8_1 blocks of its own output
+    /// (elides the separate quantize launch before the ssm_out split matvec).
+    /// Dispatched by default (LUMEN_CUDA_GDN_NG_Q8=0 opts out) on the F32 (dense) path.
+    pub(crate) gdn_prefill_norm_gate_q8: Option<CudaFunction>,
     pub(crate) gdn_compute_gates_batched: Option<CudaFunction>,
     pub(crate) l2_normalize_qk_strided: Option<CudaFunction>,
     pub(crate) gdn_prefill_fused_v3: Option<CudaFunction>,
@@ -358,6 +368,10 @@ pub(crate) struct KernelSet {
     // recovering ~20-bit mantissa while staying on tensor cores.
     pub(crate) flash_attention_wmma_split: Option<CudaFunction>,
 
+    // Tiled two-phase argmax variants (default ON; LUMEN_CUDA_ARGMAX_TILED=0 opts out;
+    // byte-identical output — see argmax.cu). Option: absent => single-block.
+    pub(crate) argmax_f32_tile_phase1: Option<CudaFunction>,
+    pub(crate) argmax_f32_tile_phase2: Option<CudaFunction>,
     // GPU-side argmax: finds index of max value in logits buffer.
     // Single block of 1024 threads, reads back 4 bytes instead of vocab_size*4.
     pub(crate) argmax_f32: CudaFunction,
@@ -416,6 +430,7 @@ pub(crate) struct KernelSet {
     // NR=2 rows/block, 128 threads, NO shmem for input. SM 6.1+.
     pub(crate) quantize_f32_to_q8_1: Option<CudaFunction>,
     pub(crate) matvec_q8_0_q8_1: Option<CudaFunction>,
+    pub(crate) matvec_q8_0_q8_1_banked: Option<CudaFunction>,
     pub(crate) matvec_q8_0_q8_1_residual: Option<CudaFunction>,
 
     // Q4_0 dp4a kernels: native Q4_0 weights + pre-quantized Q8_1 input.
@@ -486,6 +501,18 @@ pub(crate) struct KernelSet {
     // unlocked split kernel when `use_soa_locked` is set.
     pub(crate) matvec_q4_split_q8_1_locked: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_locked_residual: Option<CudaFunction>,
+    pub(crate) matvec_q4_split_q8_1_locked_banked: Option<CudaFunction>,
+    /// 160-thread compile variants of the locked kernels for the nb=160
+    /// (in_dim 5120) shape: all lanes productive in the K-loop instead of
+    /// 160/256. Same source, THREADS_PER_BLOCK redefined; the dropped warps
+    /// only ever folded exact +0.0 partials, so output is bit-identical.
+    /// 128-bit-load compile variants (LUMEN_Q4_V4LOAD define prepended):
+    /// one uint4 transaction replaces four u32 nibble loads. Integer loads
+    /// are exact => bit-identical output.
+    pub(crate) matvec_q4_split_q8_1_locked_banked_v4: Option<CudaFunction>,
+    pub(crate) matvec_q4_split_q8_1_locked_banked_b160_v4: Option<CudaFunction>,
+    pub(crate) matvec_q4_split_q8_1_locked_banked_b160: Option<CudaFunction>,
+    pub(crate) matvec_q4_split_q8_1_locked_bank4: Option<CudaFunction>,
 
     // llama mmvq port on the Q4 split layout (`LUMEN_CUDA_Q8_MMVQ`, default-OFF;
     // shares the Q8 mmvq flag). 2-lane VDR striping + one-row/CTA + lane-
@@ -623,8 +650,9 @@ pub(crate) struct KernelSet {
     // Qwen3.5 Q+gate fusion kernels (full-attention layers only).
     // deinterleave_qgate: Split [Q_h0, gate_h0, Q_h1, gate_h1, ...] -> Q + gate.
     pub(crate) deinterleave_qgate: Option<CudaFunction>,
-    // sigmoid_mul: sigmoid(gate) * x -> out (for gating attention output).
+    // sigmoid_mul: sigmoid(gate) * x -> out (prefill gating path).
     pub(crate) sigmoid_mul: Option<CudaFunction>,
+    pub(crate) sigmoid_mul_inplace: Option<CudaFunction>,
     // rmsnorm_per_head_inplace: Per-head RMSNorm with shared [head_dim] weight across heads.
     pub(crate) rmsnorm_per_head_inplace: Option<CudaFunction>,
 
@@ -823,11 +851,6 @@ pub(crate) struct KernelSet {
     pub(crate) moe_shared_down_q4_0_residual_accum: Option<CudaFunction>,
 }
 
-/// Compile all CUDA kernels via NVRTC and return the kernel function handles.
-///
-/// Each .cu source is compiled into a separate PTX module. This avoids
-/// symbol conflicts between kernels that define identically-named device
-/// helper functions (e.g., `warp_reduce_sum` appears in multiple .cu files).
 pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, RuntimeError> {
     let load_fn = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
         let module = device.compile_and_load(source)?;
@@ -948,6 +971,8 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         rmsnorm_batched: load_fn(shaders::PREFILL_KERNEL_SOURCE, "rmsnorm_batched")?,
         rope_apply_batched: load_fn(shaders::PREFILL_KERNEL_SOURCE, "rope_apply_batched")?,
         rope_apply_neox: load_fn(shaders::ROPE_KERNEL_SOURCE, "rope_apply_neox")?,
+        rope_apply_neox_tabled: load_fn(shaders::ROPE_KERNEL_SOURCE, "rope_apply_neox_tabled").ok(),
+        attn_prep_fused: load_fn(shaders::QGATE_FUSION_KERNEL_SOURCE, "attn_prep_fused").ok(),
         rope_apply_batched_neox: load_fn(
             shaders::PREFILL_KERNEL_SOURCE,
             "rope_apply_batched_neox",
@@ -1130,6 +1155,26 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         )
         .ok(),
         argmax_f32: load_fn(shaders::ARGMAX_KERNEL_SOURCE, "argmax_f32")?,
+        argmax_f32_tile_phase1: match load_fn(
+            shaders::ARGMAX_KERNEL_SOURCE,
+            "argmax_f32_tile_phase1",
+        ) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                cuda_log!("[CUDA] argmax_f32_tile_phase1: FAILED: {e}");
+                None
+            }
+        },
+        argmax_f32_tile_phase2: match load_fn(
+            shaders::ARGMAX_KERNEL_SOURCE,
+            "argmax_f32_tile_phase2",
+        ) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                cuda_log!("[CUDA] argmax_f32_tile_phase2: FAILED: {e}");
+                None
+            }
+        },
         // Q8_0 shared-memory matvec (PRIMARY Q8_0 decode path)
         matvec_q8_0_smem: match load_fn(shaders::MATVEC_Q8_0_SMEM_KERNEL_SOURCE, "matvec_q8_0_smem")
         {
@@ -1272,6 +1317,10 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
         },
         // GDN fused prefill kernels
+        gdn_decode_phase123_fused: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_decode_phase123_fused")
+            .ok(),
+        gdn_prefill_norm_gate_q8: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_norm_gate_q8")
+            .ok(),
         ssm_conv1d_silu_prefill: load_fn(shaders::GDN_KERNEL_SOURCE, "ssm_conv1d_silu_prefill")
             .ok(),
         gdn_compute_gates_batched: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_compute_gates_batched")
@@ -1280,7 +1329,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             .ok(),
         gdn_prefill_fused_v3: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_fused_v3").ok(),
         gdn_prefill_norm_gate: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_norm_gate").ok(),
-        // accumulator variants. Default-OFF; loaded best-effort.
+        // accumulator variants. Default ON; loaded best-effort.
         l2_normalize_qk_strided_f64accum: match load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,
             "l2_normalize_qk_strided_f64accum",
@@ -1486,6 +1535,11 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        matvec_q8_0_q8_1_banked: load_fn_sm80_fast_math(
+            shaders::MATVEC_DP4A_Q8_1_KERNEL_SOURCE,
+            "matvec_q8_0_q8_1_banked",
+        )
+        .ok(),
         matvec_q8_0_q8_1: match load_fn_sm80_fast_math(
             shaders::MATVEC_DP4A_Q8_1_KERNEL_SOURCE,
             "matvec_q8_0_q8_1",
@@ -1826,6 +1880,59 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] matvec_q4_split_q8_1_locked_residual: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_split_q8_1_locked_banked_v4: load_fn_sm80_fast_math(
+            &format!(
+                "#define LUMEN_Q4_V4LOAD 1\n{}",
+                shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE
+            ),
+            "matvec_q4_split_q8_1_locked_banked",
+        )
+        .ok(),
+        matvec_q4_split_q8_1_locked_banked_b160_v4: {
+            let base_src = shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE.replace(
+                "#define THREADS_PER_BLOCK 256",
+                "#define THREADS_PER_BLOCK 160",
+            );
+            assert_ne!(base_src, shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE);
+            let src = format!("#define LUMEN_Q4_V4LOAD 1\n{base_src}");
+            load_fn_sm80_fast_math(&src, "matvec_q4_split_q8_1_locked_banked").ok()
+        },
+        matvec_q4_split_q8_1_locked_banked_b160: {
+            let src = shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE.replace(
+                "#define THREADS_PER_BLOCK 256",
+                "#define THREADS_PER_BLOCK 160",
+            );
+            // A silent replace miss would compile a duplicate 256-thread
+            // kernel and erase this variant's win with no error.
+            assert_ne!(src, shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE);
+            load_fn_sm80_fast_math(&src, "matvec_q4_split_q8_1_locked_banked").ok()
+        },
+        matvec_q4_split_q8_1_locked_bank4: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE,
+            "matvec_q4_split_q8_1_locked_bank4",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_locked_bank4: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_locked_bank4: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_split_q8_1_locked_banked: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE,
+            "matvec_q4_split_q8_1_locked_banked",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_locked_banked: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_locked_banked: FAILED: {e}");
                 None
             }
         },
@@ -2176,6 +2283,8 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        sigmoid_mul_inplace: load_fn(shaders::QGATE_FUSION_KERNEL_SOURCE, "sigmoid_mul_inplace")
+            .ok(),
         sigmoid_mul: match load_fn(shaders::QGATE_FUSION_KERNEL_SOURCE, "sigmoid_mul") {
             Ok(f) => {
                 cuda_log!("[CUDA] sigmoid_mul: OK");
