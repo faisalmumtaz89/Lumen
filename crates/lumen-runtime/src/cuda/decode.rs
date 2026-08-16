@@ -500,6 +500,13 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q4_split_q8_1_locked: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_locked_residual: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_locked_banked: Option<CudaFunction>,
+    /// 160-thread compile variants of the locked kernels for the nb=160
+    /// (in_dim 5120) shape: all lanes productive in the K-loop instead of
+    /// 160/256. Same source, THREADS_PER_BLOCK redefined; the dropped warps
+    /// only ever folded exact +0.0 partials, so output is bit-identical
+    /// (byte-gate enforced).
+    pub(crate) matvec_q4_split_q8_1_locked_b160: Option<CudaFunction>,
+    pub(crate) matvec_q4_split_q8_1_locked_banked_b160: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_locked_paired: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_locked_bank4: Option<CudaFunction>,
 
@@ -1898,6 +1905,22 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        matvec_q4_split_q8_1_locked_b160: load_fn_sm80_fast_math(
+            &shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE.replace(
+                "#define THREADS_PER_BLOCK 256",
+                "#define THREADS_PER_BLOCK 160",
+            ),
+            "matvec_q4_split_q8_1_locked",
+        )
+        .ok(),
+        matvec_q4_split_q8_1_locked_banked_b160: load_fn_sm80_fast_math(
+            &shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE.replace(
+                "#define THREADS_PER_BLOCK 256",
+                "#define THREADS_PER_BLOCK 160",
+            ),
+            "matvec_q4_split_q8_1_locked_banked",
+        )
+        .ok(),
         matvec_q4_split_q8_1_locked_bank4: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE,
             "matvec_q4_split_q8_1_locked_bank4",
