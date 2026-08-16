@@ -1094,20 +1094,20 @@ pub fn q4_split_wo_probe_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_WO"), Ok(v) if v == "1")
 }
 
-/// `LUMEN_CUDA_GDN_NG_Q8=1` (probe): the T=1 via-prefill norm-gate also
+/// `LUMEN_CUDA_GDN_NG_Q8` (default ON; `=0` opts out): the T=1 via-prefill norm-gate also
 /// emits the Q8_1 quantization of its own output, eliding the separate
 /// quantize launch before the ssm_out split matvec. Verbatim-cloned
 /// arithmetic => bit-identical bytes; dense-F32 path only. Default OFF.
 pub fn gdn_ng_q8_enabled() -> bool {
-    matches!(std::env::var("LUMEN_CUDA_GDN_NG_Q8"), Ok(v) if v == "1")
+    !matches!(std::env::var("LUMEN_CUDA_GDN_NG_Q8"), Ok(v) if v == "0")
 }
 
-/// `LUMEN_CUDA_GDN_P123_FUSE=1` (probe): fuse the first three T=1
+/// `LUMEN_CUDA_GDN_P123_FUSE` (default ON; `=0` opts out): fuse the first three T=1
 /// via-prefill GDN launches (conv+SiLU, gates, QK-L2) into one kernel.
 /// Per-op arithmetic cloned verbatim => bit-identical; dense-F32 path only.
 /// Default OFF.
 pub fn gdn_p123_fuse_enabled() -> bool {
-    matches!(std::env::var("LUMEN_CUDA_GDN_P123_FUSE"), Ok(v) if v == "1")
+    !matches!(std::env::var("LUMEN_CUDA_GDN_P123_FUSE"), Ok(v) if v == "0")
 }
 
 /// `LUMEN_CUDA_Q4_PROJ_BANK4=1` (probe): four-way banked launch — qkv, gate,
@@ -1127,20 +1127,20 @@ pub fn q4_proj_pair_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_Q4_PROJ_PAIR"), Ok(v) if v == "1")
 }
 
-/// `LUMEN_CUDA_Q4_PROJ_BANK=1` (probe): bank the GDN qkv + gate Q4 split
+/// `LUMEN_CUDA_Q4_PROJ_BANK` (default ON; `=0` opts out): bank the GDN qkv + gate Q4 split
 /// matvecs into ONE launch of `matvec_q4_split_q8_1_locked_banked` (both read
 /// the same pre-quantized Q8_1 input; per-row math untouched, so output is
 /// bit-identical to the two-launch route). Default OFF.
 pub fn q4_proj_bank_enabled() -> bool {
-    matches!(std::env::var("LUMEN_CUDA_Q4_PROJ_BANK"), Ok(v) if v == "1")
+    !matches!(std::env::var("LUMEN_CUDA_Q4_PROJ_BANK"), Ok(v) if v == "0")
 }
 
-/// `LUMEN_CUDA_SSMOUT_RESID_FOLD=1`: when the ssm_out split route is active,
+/// `LUMEN_CUDA_SSMOUT_RESID_FOLD` (default ON; `=0` opts out): when the ssm_out split route is active,
 /// dispatch its residual variant so the projection writes `attn_proj = W*x +
 /// x_gpu` directly and the per-layer residual_add_copy launch is skipped.
-/// Default OFF.
+///
 pub fn ssmout_residual_fold_enabled() -> bool {
-    matches!(std::env::var("LUMEN_CUDA_SSMOUT_RESID_FOLD"), Ok(v) if v == "1")
+    !matches!(std::env::var("LUMEN_CUDA_SSMOUT_RESID_FOLD"), Ok(v) if v == "0")
 }
 
 /// Per-process default for `LUMEN_CUDA_SOA_LOCKED` when the env is unset.
