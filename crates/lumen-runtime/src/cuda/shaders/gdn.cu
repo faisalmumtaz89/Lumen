@@ -789,6 +789,121 @@ extern "C" __global__ void gdn_prefill_fused_v3(
 // Block: (val_dim, 1, 1) -- threads cooperate across val_dim
 // Shared memory: (block_size / 32 + 1) * 4 bytes for cross-warp reduction
 // ============================================================================
+// gdn_prefill_norm_gate_q8: T=1 variant of gdn_prefill_norm_gate that ALSO
+// emits the Q8_1 quantization of its own output, eliding the separate
+// quantize_q8_1_rawsum launch before the ssm_out split matvec.
+//
+// The F32 path is a verbatim clone (same reductions, same op order), so
+// ssm_out is bit-identical. The Q8 epilogue clones quantize_q8_1_rawsum
+// exactly — same xor-butterfly warp max/sum orders, d = amax/127,
+// q = __float2int_rn(xi/d), header {f16 d, f16 raw F32 sum} — applied to the
+// SAME register value that was just stored, so all bytes equal what the
+// separate kernel would produce from the stored buffer.
+//
+// Host guarantees: T == 1, val_dim == blockDim.x, val_dim % 32 == 0 (full
+// warps; every lane live at the reductions).
+//
+// Grid: (num_heads, 1, 1)  Block: (val_dim, 1, 1)
+// ============================================================================
+__device__ __forceinline__ float gdn_warp_reduce_max(float val) {
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 16));
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 8));
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 4));
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 2));
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 1));
+    return val;
+}
+
+__device__ __forceinline__ unsigned short gdn_f32_to_f16_bits(float v) {
+    unsigned short bits;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(bits) : "f"(v));
+    return bits;
+}
+
+extern "C" __global__ void gdn_prefill_norm_gate_q8(
+    const float* __restrict__ raw_out,    // [num_heads, val_dim]
+    const float* __restrict__ gate_all,   // [num_heads * val_dim]
+    const float* __restrict__ norm_scale, // [scale_n_heads, val_dim]
+    float* __restrict__ ssm_out,          // [num_heads * val_dim]
+    unsigned char* __restrict__ vy,       // [num_heads*val_dim/32 * 36] Q8_1
+    unsigned int num_heads,
+    unsigned int val_dim,
+    float eps,
+    unsigned int scale_n_heads)
+{
+    extern __shared__ float shared[];
+
+    unsigned int h = blockIdx.x;
+    if (h >= num_heads) return;
+
+    unsigned int vj = threadIdx.x;
+    unsigned int block_size = blockDim.x;
+    unsigned int warp_id = vj >> 5;
+    unsigned int lane_id = vj & 31u;
+    unsigned int num_warps = (block_size + 31) >> 5;
+
+    unsigned int idx = h * val_dim + vj;
+
+    float val = (vj < val_dim) ? raw_out[idx] : 0.0f;
+
+    float ss = val * val;
+    ss = warp_reduce_sum(ss);
+
+    if (lane_id == 0) {
+        shared[warp_id] = ss;
+    }
+    __syncthreads();
+
+    float total_ss = 0.0f;
+    if (warp_id == 0) {
+        total_ss = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+        total_ss = warp_reduce_sum(total_ss);
+    }
+    if (vj == 0) {
+        shared[0] = total_ss;
+    }
+    __syncthreads();
+    total_ss = shared[0];
+
+    if (vj >= val_dim) return;
+
+    float rms = sqrtf(total_ss / (float)val_dim + eps);
+    float inv_rms = 1.0f / rms;
+
+    unsigned int scale_h = (scale_n_heads == 1) ? 0 : h;
+    float normed = val * inv_rms * norm_scale[scale_h * val_dim + vj];
+
+    float g = gate_all[idx];
+    float silu_g = g / (1.0f + expf(-g));
+
+    float xi = silu_g * normed;
+    ssm_out[idx] = xi;
+
+    // ---- Q8_1 epilogue (verbatim quantize_q8_1_rawsum semantics) ----
+    float amax = fabsf(xi);
+    float qsum = xi;
+    amax = gdn_warp_reduce_max(amax);
+    qsum = warp_reduce_sum(qsum);
+
+    const float d = amax / 127.0f;
+    const signed char q =
+        (amax == 0.0f) ? (signed char)0 : (signed char)__float2int_rn(xi / d);
+
+    unsigned int ib = idx >> 5;
+    unsigned char* yb = vy + ib * 36u;
+    yb[4 + lane_id] = (unsigned char)q;
+    if (lane_id == 0) {
+        const unsigned short d_bits = gdn_f32_to_f16_bits(d);
+        const unsigned short s_bits = gdn_f32_to_f16_bits(qsum);
+        yb[0] = (unsigned char)(d_bits & 0xFF);
+        yb[1] = (unsigned char)((d_bits >> 8) & 0xFF);
+        yb[2] = (unsigned char)(s_bits & 0xFF);
+        yb[3] = (unsigned char)((s_bits >> 8) & 0xFF);
+    }
+}
+
+
+// ============================================================================
 extern "C" __global__ void gdn_prefill_norm_gate(
     const float* __restrict__ raw_out,    // [T, num_heads, val_dim]
     const float* __restrict__ gate_all,   // [T, num_heads * val_dim]

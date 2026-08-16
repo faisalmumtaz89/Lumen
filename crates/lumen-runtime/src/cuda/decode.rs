@@ -332,6 +332,10 @@ pub(crate) struct KernelSet {
     /// launches) — dispatched only under LUMEN_CUDA_GDN_P123_FUSE=1 on the
     /// F32 (dense) path.
     pub(crate) gdn_decode_phase123_fused: Option<CudaFunction>,
+    /// T=1 norm-gate that also emits the Q8_1 blocks of its own output
+    /// (elides the separate quantize launch before the ssm_out split matvec).
+    /// Dispatched only under LUMEN_CUDA_GDN_NG_Q8=1 on the F32 (dense) path.
+    pub(crate) gdn_prefill_norm_gate_q8: Option<CudaFunction>,
     pub(crate) gdn_compute_gates_batched: Option<CudaFunction>,
     pub(crate) l2_normalize_qk_strided: Option<CudaFunction>,
     pub(crate) gdn_prefill_fused_v3: Option<CudaFunction>,
@@ -1291,6 +1295,8 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         },
         // GDN fused prefill kernels
         gdn_decode_phase123_fused: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_decode_phase123_fused")
+            .ok(),
+        gdn_prefill_norm_gate_q8: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_norm_gate_q8")
             .ok(),
         ssm_conv1d_silu_prefill: load_fn(shaders::GDN_KERNEL_SOURCE, "ssm_conv1d_silu_prefill")
             .ok(),

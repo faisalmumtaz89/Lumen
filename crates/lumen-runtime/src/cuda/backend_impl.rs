@@ -5542,6 +5542,22 @@ impl CudaBackend {
             && gdn.q_norm_buf_rr.is_some()
             && gdn.k_norm_buf_rr.is_some();
 
+        // B2 (LUMEN_CUDA_GDN_NG_Q8): when the norm-gate can emit the Q8_1
+        // blocks itself AND the ssm_out split route will consume them, the
+        // separate quantize launch at Step 11 is elided. Eligibility computed
+        // once here so the norm-gate site and Step 11 agree exactly.
+        let ssm_ng_q8_eligible = crate::runtime_defaults::gdn_ng_q8_enabled()
+            && st.kernels.gdn_prefill_norm_gate_q8.is_some()
+            && lw.q8_split_ssm_out.is_some()
+            && p.head_dim % 32 == 0
+            && p.value_dim == p.num_heads * p.head_dim
+            && st
+                .scratch
+                .input_q8_1
+                .as_ref()
+                .is_some_and(|b| b.len() >= p.value_dim.div_ceil(32) * 36);
+        let mut ssm_q8_from_norm_gate = false;
+
         if gdn_decode_via_prefill {
             // === GDN DECODE VIA PREFILL KERNELS @ T=1 (structural parity) ===
             // Dispatch the five PREFILL fused GDN kernels on the single new
@@ -5847,7 +5863,38 @@ impl CudaBackend {
             // 5. gdn_prefill_norm_gate[_f64accum]: RMSNorm + SiLU(gate) ->
             //    normed_out_buf (the FINAL norm-gated GDN output). Step 11
             //    (ssm_out) reads normed_out_buf via used_fused_norm_gate=true.
-            {
+            if ssm_ng_q8_eligible && !use_prefill_f64 {
+                let norm_fn = st.kernels.gdn_prefill_norm_gate_q8.as_ref().unwrap();
+                let block_dim = (p.head_dim as u32).min(1024);
+                let norm_shared = ((block_dim + 31) / 32 + 1) * 4;
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (num_heads_u32, 1, 1),
+                    block_dim: (block_dim, 1, 1),
+                    shared_mem_bytes: norm_shared,
+                };
+                let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(norm_fn)
+                        .arg(&gdn.output_buf)
+                        .arg(&gdn.gate_buf)
+                        .arg(ssm_norm)
+                        .arg(&mut gdn.normed_out_buf)
+                        .arg(&mut *q8_1_buf)
+                        .arg(&num_heads_u32)
+                        .arg(&head_dim_u32) // val_dim per head = head_dim
+                        .arg(&eps)
+                        .arg(&num_heads_u32) // scale_n_heads
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "GDN decode-via-prefill norm_gate_q8 L{layer_idx}: {e}"
+                    ))
+                })?;
+                ssm_q8_from_norm_gate = true;
+            } else {
                 let norm_fn = if use_prefill_f64 {
                     st.kernels.gdn_prefill_norm_gate_f64accum.as_ref().unwrap()
                 } else {
@@ -6545,25 +6592,31 @@ impl CudaBackend {
                     .as_mut()
                     .filter(|b| b.len() >= p.value_dim.div_ceil(32) * 36),
             ) {
-                let in_dim_u32 = p.value_dim as u32;
-                let q_blocks = in_dim_u32.div_ceil(32);
-                let quant_cfg = CudarcLaunchConfig {
-                    grid_dim: (q_blocks, 1, 1),
-                    block_dim: (32, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(quant_fn)
-                        .arg(ssm_input)
-                        .arg(&mut *q8_1_buf)
-                        .arg(&in_dim_u32)
-                        .launch(quant_cfg)
+                // B2: the norm-gate already wrote these exact Q8_1 bytes; the
+                // separate quantize launch is pure dead work in that case.
+                if !ssm_q8_from_norm_gate {
+                    let in_dim_u32 = p.value_dim as u32;
+                    let q_blocks = in_dim_u32.div_ceil(32);
+                    let quant_cfg = CudarcLaunchConfig {
+                        grid_dim: (q_blocks, 1, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(quant_fn)
+                            .arg(ssm_input)
+                            .arg(&mut *q8_1_buf)
+                            .arg(&in_dim_u32)
+                            .launch(quant_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "quantize_q8_1 gdn_ssm_out L{layer_idx}: {e}"
+                        ))
+                    })?;
                 }
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("quantize_q8_1 gdn_ssm_out L{layer_idx}: {e}"))
-                })?;
                 if crate::runtime_defaults::ssmout_residual_fold_enabled() {
                     // Fold the residual into the projection: attn_proj =
                     // ssm_out * gated + x_gpu in ONE kernel, making Step 12's

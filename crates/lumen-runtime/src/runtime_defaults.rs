@@ -1094,6 +1094,14 @@ pub fn q4_split_wo_probe_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_WO"), Ok(v) if v == "1")
 }
 
+/// `LUMEN_CUDA_GDN_NG_Q8=1` (probe): the T=1 via-prefill norm-gate also
+/// emits the Q8_1 quantization of its own output, eliding the separate
+/// quantize launch before the ssm_out split matvec. Verbatim-cloned
+/// arithmetic => bit-identical bytes; dense-F32 path only. Default OFF.
+pub fn gdn_ng_q8_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_GDN_NG_Q8"), Ok(v) if v == "1")
+}
+
 /// `LUMEN_CUDA_GDN_P123_FUSE=1` (probe): fuse the first three T=1
 /// via-prefill GDN launches (conv+SiLU, gates, QK-L2) into one kernel.
 /// Per-op arithmetic cloned verbatim => bit-identical; dense-F32 path only.
@@ -1241,6 +1249,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_PTX_CACHE_DIR",
     "LUMEN_CUDA_Q4_SPLIT",
     "LUMEN_CUDA_Q4_SPLIT_ATTN",
+    "LUMEN_CUDA_GDN_NG_Q8",
     "LUMEN_CUDA_GDN_P123_FUSE",
     "LUMEN_CUDA_Q4_PROJ_BANK",
     "LUMEN_CUDA_SLACK_L2QK_CYCLES",
