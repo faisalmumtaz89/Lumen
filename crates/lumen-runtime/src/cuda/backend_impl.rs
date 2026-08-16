@@ -11653,16 +11653,11 @@ unsafe fn launch_matvec_preq8_1_split(
                     return Ok(());
                 }
             }
-            // B160 (probe): at nb=160 the 256-thread K-loop idles 96 lanes;
-            // the 160-thread compile variant keeps every lane productive.
-            let use_b160 = kernels.use_soa_locked
-                && crate::runtime_defaults::q4_b160_enabled()
-                && (in_dim >> 5) == 160
-                && kernels.matvec_q4_split_q8_1_locked_b160.is_some();
-            let mv_fn_opt = if use_b160 {
-                b160_census();
-                kernels.matvec_q4_split_q8_1_locked_b160.as_ref()
-            } else if kernels.use_soa_locked {
+            // B160 note: the 160-thread variant measured +2 µs/L on the GDN
+            // bank but −3 µs/L on FFN gate/up (same nb=160 shape, larger
+            // grids) — so it dispatches ONLY from the banked GDN launcher,
+            // never here.
+            let mv_fn_opt = if kernels.use_soa_locked {
                 kernels.matvec_q4_split_q8_1_locked.as_ref()
             } else {
                 kernels.matvec_q4_split_q8_1.as_ref()
@@ -11671,10 +11666,9 @@ unsafe fn launch_matvec_preq8_1_split(
                 let out_dim_u32 = out_dim as u32;
                 let in_dim_u32 = in_dim as u32;
                 let mv_grid = dp4a_q4_grid(out_dim_u32);
-                let block_dim = if use_b160 { 160 } else { DP4A_Q4_BLOCK_DIM };
                 let mv_cfg = CudarcLaunchConfig {
                     grid_dim: (mv_grid, 1, 1),
-                    block_dim: (block_dim, 1, 1),
+                    block_dim: (DP4A_Q4_BLOCK_DIM, 1, 1),
                     shared_mem_bytes: 0,
                 };
                 device

@@ -1117,13 +1117,13 @@ pub fn attn_sigmoid_inplace_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_ATTN_SIG_INPLACE"), Ok(v) if v == "1")
 }
 
-/// `LUMEN_CUDA_Q4_B160=1` (probe): route nb=160 (in_dim 5120) locked-Q4
-/// matvecs through the 160-thread compile variant — every lane productive in
+/// `LUMEN_CUDA_Q4_B160` (default ON; `=0` opts out): route the GDN banked
+/// nb=160 launch through the 160-thread compile variant — every lane productive in
 /// the K-loop instead of 160/256, ~+50% load-issuing lanes at full
 /// occupancy. The dropped warps only folded exact +0.0 partials, so output
 /// is expected bit-identical (byte-gate enforced). Default OFF.
 pub fn q4_b160_enabled() -> bool {
-    matches!(std::env::var("LUMEN_CUDA_Q4_B160"), Ok(v) if v == "1")
+    !matches!(std::env::var("LUMEN_CUDA_Q4_B160"), Ok(v) if v == "0")
 }
 
 /// `LUMEN_CUDA_Q8_AB_BANK` (default ON; `=0` opts out): the GDN alpha+beta Q8Raw matvecs
