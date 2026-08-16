@@ -270,7 +270,7 @@ extern "C" __global__ void attn_prep_fused(
     val[tid] = normed;
     __syncthreads();
     float out_v = normed;
-    if (tid < actual_rot) {
+    if (tid < 2u * half_rot) {
         if (tid < half_rot) {
             out_v = val[tid] * tcos[tid] - val[tid + half_rot] * tsin[tid];
         } else {
