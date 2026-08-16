@@ -458,6 +458,130 @@ extern "C" __global__ void l2_normalize_qk_strided(
 
 
 // ============================================================================
+// gdn_decode_phase123_fused: T=1 fusion of the first three via-prefill
+// launches (ssm_conv1d_silu_prefill + gdn_compute_gates_batched +
+// l2_normalize_qk_strided) into ONE launch.
+//
+// Grid: (2*num_kv_heads + num_v_heads, 1, 1) CTAs -- for the 27B shapes
+// (16 Q + 16 K + 48 V) = 80 CTAs. Block: (head_dim, 1, 1) = 128 threads,
+// one channel per thread.
+//
+//   CTA 0..num_kv_heads-1:                Q head — conv+SiLU then the exact
+//                                         l2 reduction/scale for its 128
+//                                         channels; writes the SCALED value
+//                                         (the unnormalized intermediate was
+//                                         never read by anything downstream).
+//   CTA num_kv_heads..2*num_kv_heads-1:   K head — same as Q.
+//   CTA 2*num_kv_heads..+num_v_heads-1:   V head — conv+SiLU written raw;
+//                                         thread 0 additionally computes the
+//                                         head's alpha/beta gates (the exact
+//                                         gdn_compute_gates_batched formula).
+//
+// DETERMINISM: every per-channel/per-head operation sequence is cloned
+// verbatim from the three source kernels (same conv tap order, same SiLU,
+// same warp_reduce_sum tree + shared fold with block_size == head_dim, same
+// softplus branch), so all four outputs (conv_out, conv_state, alpha, beta)
+// are bit-identical to the three-launch chain. Only launch boundaries and the
+// dead unnormalized Q/K global write are removed.
+// ============================================================================
+extern "C" __global__ void gdn_decode_phase123_fused(
+    const float* __restrict__ input,      // [qkv_dim] qkv projection (T=1)
+    float* __restrict__ conv_state,       // [buf_slots, qkv_dim] ring R/W
+    const float* __restrict__ conv_weight,// [qkv_dim, kernel_size]
+    float* __restrict__ conv_out,         // [qkv_dim] OUTPUT
+    const float* __restrict__ alpha_raw,  // [num_v_heads] gk_proj output
+    const float* __restrict__ beta_raw,   // [num_v_heads] pre-sigmoid mix
+    const float* __restrict__ dt_bias,    // [num_v_heads]
+    const float* __restrict__ ssm_a,      // [num_v_heads] -exp(A_log)
+    float* __restrict__ alpha_out,        // [num_v_heads] OUTPUT
+    float* __restrict__ beta_out,         // [num_v_heads] OUTPUT
+    unsigned int num_kv_heads,
+    unsigned int num_v_heads,
+    unsigned int head_dim,
+    unsigned int qk_dim,
+    unsigned int qkv_dim,
+    unsigned int kernel_size,
+    unsigned int state_pos)
+{
+    __shared__ float shared[33];
+
+    unsigned int b = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    if (tid >= head_dim) return;
+
+    // Channel this thread owns.
+    unsigned int c;
+    int is_qk;
+    unsigned int v_head = 0;
+    if (b < num_kv_heads) {
+        c = b * head_dim + tid;                       // Q
+        is_qk = 1;
+    } else if (b < 2u * num_kv_heads) {
+        c = qk_dim + (b - num_kv_heads) * head_dim + tid; // K
+        is_qk = 1;
+    } else {
+        v_head = b - 2u * num_kv_heads;
+        c = 2u * qk_dim + v_head * head_dim + tid;    // V
+        is_qk = 0;
+    }
+
+    // ---- phase 1: conv1d + SiLU + ring update (exact T=1 clone) ----
+    unsigned int buf_slots = kernel_size - 1;
+    float inp = input[c];
+    float sum = 0.0f;
+    for (unsigned int tap = 0; tap < buf_slots; tap++) {
+        unsigned int slot = (state_pos + tap) % buf_slots;
+        sum += conv_weight[c * kernel_size + tap] * conv_state[slot * qkv_dim + c];
+    }
+    sum += conv_weight[c * kernel_size + buf_slots] * inp;
+    conv_state[state_pos * qkv_dim + c] = inp;
+    float activated = sum / (1.0f + expf(-sum));
+
+    if (!is_qk) {
+        conv_out[c] = activated;
+        // ---- phase 2: gates for this V head (exact clone, thread 0) ----
+        if (tid == 0) {
+            float sp_input = alpha_raw[v_head] + dt_bias[v_head];
+            float sp;
+            if (sp_input > 20.0f) {
+                sp = sp_input;
+            } else {
+                sp = logf(1.0f + expf(sp_input));
+            }
+            float gate = ssm_a[v_head] * sp;
+            alpha_out[v_head] = expf(gate);
+            beta_out[v_head] = 1.0f / (1.0f + expf(-beta_raw[v_head]));
+        }
+        return;
+    }
+
+    // ---- phase 3: L2 norm over this head's channels (exact clone: one
+    // element per thread at block_size == head_dim, same reduction tree) ----
+    unsigned int warp_id = tid >> 5;
+    unsigned int lane_id = tid & 31u;
+    unsigned int num_warps = (head_dim + 31) >> 5;
+    float eps = 1e-12f;
+
+    float v = activated;
+    float ss = v * v;
+    ss = warp_reduce_sum(ss);
+    if (lane_id == 0) shared[warp_id] = ss;
+    __syncthreads();
+    float total_ss = 0.0f;
+    if (warp_id == 0) {
+        total_ss = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+        total_ss = warp_reduce_sum(total_ss);
+    }
+    if (tid == 0) shared[0] = total_ss;
+    __syncthreads();
+    total_ss = shared[0];
+    float norm = sqrtf(total_ss);
+    float scale = (norm > eps) ? (1.0f / norm) : (1.0f / eps);
+    conv_out[c] = v * scale;
+}
+
+
+// ============================================================================
 // gdn_prefill_fused_v3: Warp-parallel GDN prefill state update (4x unrolled)
 //
 // Direct port of Metal's gdn_prefill_fused_v3_chunked kernel.

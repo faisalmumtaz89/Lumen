@@ -328,6 +328,10 @@ pub(crate) struct KernelSet {
     // gdn_prefill_fused_v3: warp-parallel fused state update (4x unrolled).
     // gdn_prefill_norm_gate: batched RMSNorm + SiLU gate on raw output.
     pub(crate) ssm_conv1d_silu_prefill: Option<CudaFunction>,
+    /// T=1 fusion of conv+SiLU / gates / QK-L2 (first three via-prefill
+    /// launches) — dispatched only under LUMEN_CUDA_GDN_P123_FUSE=1 on the
+    /// F32 (dense) path.
+    pub(crate) gdn_decode_phase123_fused: Option<CudaFunction>,
     pub(crate) gdn_compute_gates_batched: Option<CudaFunction>,
     pub(crate) l2_normalize_qk_strided: Option<CudaFunction>,
     pub(crate) gdn_prefill_fused_v3: Option<CudaFunction>,
@@ -1286,6 +1290,8 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
         },
         // GDN fused prefill kernels
+        gdn_decode_phase123_fused: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_decode_phase123_fused")
+            .ok(),
         ssm_conv1d_silu_prefill: load_fn(shaders::GDN_KERNEL_SOURCE, "ssm_conv1d_silu_prefill")
             .ok(),
         gdn_compute_gates_batched: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_compute_gates_batched")

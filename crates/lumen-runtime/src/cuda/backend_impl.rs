@@ -5597,8 +5597,57 @@ impl CudaBackend {
                 }
             }
 
+            // Fused phase-123 route (LUMEN_CUDA_GDN_P123_FUSE=1): one launch
+            // replaces launches 1-3 below on the dense F32 path. The kernel
+            // clones each per-channel/per-head op sequence verbatim, so
+            // conv_out/conv_state/alpha/beta are bit-identical to the chain.
+            let p123_fused = crate::runtime_defaults::gdn_p123_fuse_enabled()
+                && !use_prefill_f64
+                && st.kernels.gdn_decode_phase123_fused.is_some()
+                && p.qk_dim == p.num_kv_heads * p.head_dim
+                && p.value_dim == p.num_heads * p.head_dim
+                && p.qkv_dim == 2 * p.qk_dim + p.value_dim
+                && p.head_dim >= 32
+                && p.head_dim <= 1024;
+            if p123_fused {
+                let fuse_fn = st.kernels.gdn_decode_phase123_fused.as_ref().unwrap();
+                let grid = 2 * num_kv_heads_u32 + num_heads_u32;
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (head_dim_u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(fuse_fn)
+                        .arg(&gdn.qkv_buf)
+                        .arg(&mut gdn.conv_states[gdn_idx])
+                        .arg(conv1d_weight)
+                        .arg(&mut gdn.qkv_conv_buf)
+                        .arg(&gdn.alpha_raw_buf)
+                        .arg(&gdn.beta_raw_buf)
+                        .arg(dt_bias)
+                        .arg(ssm_a)
+                        .arg(&mut gdn.alpha_buf)
+                        .arg(&mut gdn.beta_buf)
+                        .arg(&num_kv_heads_u32)
+                        .arg(&num_heads_u32)
+                        .arg(&head_dim_u32)
+                        .arg(&qk_dim_u32)
+                        .arg(&qkv_dim_u32)
+                        .arg(&kernel_size_u32)
+                        .arg(&state_pos)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN decode p123-fused L{layer_idx}: {e}"))
+                })?;
+                gdn.conv_positions[gdn_idx] = (state_pos + batch_u32) % buf_slots;
+            }
+
             // 1. ssm_conv1d_silu_prefill: conv1d + SiLU, advances conv_state.
-            {
+            if !p123_fused {
                 let conv_fn = st.kernels.ssm_conv1d_silu_prefill.as_ref().unwrap();
                 let config = LaunchConfig::for_elements(p.qkv_dim);
                 let launch_cfg = CudarcLaunchConfig {
@@ -5629,7 +5678,7 @@ impl CudaBackend {
             }
 
             // 2. gdn_compute_gates_batched: alpha/beta gates (-> alpha_buf/beta_buf).
-            {
+            if !p123_fused {
                 let gates_fn = st.kernels.gdn_compute_gates_batched.as_ref().unwrap();
                 let config = LaunchConfig::for_elements(p.num_heads);
                 let launch_cfg = CudarcLaunchConfig {
@@ -5659,7 +5708,7 @@ impl CudaBackend {
             }
 
             // 3. l2_normalize_qk_strided[_f64accum]: L2-norm Q/K in-place on conv_out.
-            {
+            if !p123_fused {
                 let l2_fn = if use_prefill_f64 {
                     st.kernels
                         .l2_normalize_qk_strided_f64accum

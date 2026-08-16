@@ -1094,6 +1094,14 @@ pub fn q4_split_wo_probe_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_WO"), Ok(v) if v == "1")
 }
 
+/// `LUMEN_CUDA_GDN_P123_FUSE=1` (probe): fuse the first three T=1
+/// via-prefill GDN launches (conv+SiLU, gates, QK-L2) into one kernel.
+/// Per-op arithmetic cloned verbatim => bit-identical; dense-F32 path only.
+/// Default OFF.
+pub fn gdn_p123_fuse_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_GDN_P123_FUSE"), Ok(v) if v == "1")
+}
+
 /// `LUMEN_CUDA_Q4_PROJ_BANK=1` (probe): bank the GDN qkv + gate Q4 split
 /// matvecs into ONE launch of `matvec_q4_split_q8_1_locked_banked` (both read
 /// the same pre-quantized Q8_1 input; per-row math untouched, so output is
@@ -1233,6 +1241,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_PTX_CACHE_DIR",
     "LUMEN_CUDA_Q4_SPLIT",
     "LUMEN_CUDA_Q4_SPLIT_ATTN",
+    "LUMEN_CUDA_GDN_P123_FUSE",
     "LUMEN_CUDA_Q4_PROJ_BANK",
     "LUMEN_CUDA_SLACK_L2QK_CYCLES",
     "LUMEN_CUDA_SLACK_NORMGATE_CYCLES",
