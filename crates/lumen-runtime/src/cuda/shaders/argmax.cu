@@ -82,7 +82,7 @@ extern "C" __global__ void argmax_f32(
 }
 
 // ============================================================================
-// Tiled two-phase argmax (LUMEN_CUDA_ARGMAX_TILED=1, default-OFF).
+// Tiled two-phase argmax (default ON; LUMEN_CUDA_ARGMAX_TILED=0 opts out).
 //
 // The single-block kernel above reads the whole logits vector (vocab 248320 =
 // ~1 MB) from ONE SM — single-SM read bandwidth, ~128 us in-bracket on A100.

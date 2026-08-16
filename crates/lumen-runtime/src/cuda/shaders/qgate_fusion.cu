@@ -9,7 +9,8 @@
 //
 // Kernels:
 //   deinterleave_qgate: Split interleaved Q+gate into separate Q and gate buffers
-//   sigmoid_mul: sigmoid(gate) * x in-place
+//   sigmoid_mul: sigmoid(gate) * x -> out (out-of-place; prefill path)
+//   sigmoid_mul_inplace: sigmoid(gate) * x in place (decode path)
 //   rmsnorm_per_head_inplace: Per-head RMSNorm (shared weight across heads)
 //
 // NVRTC-compatible: no system includes, extern "C" linkage.
