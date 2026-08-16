@@ -722,6 +722,12 @@ fn canonical_default_on() -> bool {
     !legacy_defaults_enabled()
 }
 
+/// Public view of the master-rollback default (`LUMEN_CUDA_LEGACY_DEFAULTS`)
+/// for optimization gates resolved outside this module.
+pub fn canonical_default_on_pub() -> bool {
+    canonical_default_on()
+}
+
 /// Per-process default for `LUMEN_CUDA_MOE_BATCHED` when the env is unset.
 /// ON by default — fires only for MoE models, no effect on dense.
 pub fn moe_batched_default() -> bool {
@@ -1209,6 +1215,9 @@ pub fn q4_proj_bank_enabled() -> bool {
 /// `LUMEN_CUDA_SSMOUT_RESID_FOLD` (default ON; `=0` opts out): when the ssm_out split route is active,
 /// dispatch its residual variant so the projection writes `attn_proj = W*x +
 /// x_gpu` directly and the per-layer residual_add_copy launch is skipped.
+/// Byte-identical for normal-range activations; the folded add runs in a
+/// flush-to-zero kernel, so a subnormal residual can differ in the last bit
+/// from the separately-compiled legacy add.
 ///
 pub fn ssmout_residual_fold_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();

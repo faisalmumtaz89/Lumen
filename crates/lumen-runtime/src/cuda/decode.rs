@@ -368,7 +368,7 @@ pub(crate) struct KernelSet {
     // recovering ~20-bit mantissa while staying on tensor cores.
     pub(crate) flash_attention_wmma_split: Option<CudaFunction>,
 
-    // Tiled two-phase argmax variants (LUMEN_CUDA_ARGMAX_TILED, default-OFF;
+    // Tiled two-phase argmax variants (default ON; LUMEN_CUDA_ARGMAX_TILED=0 opts out;
     // byte-identical output — see argmax.cu). Option: absent => single-block.
     pub(crate) argmax_f32_tile_phase1: Option<CudaFunction>,
     pub(crate) argmax_f32_tile_phase2: Option<CudaFunction>,

@@ -127,13 +127,8 @@ fn argmax_tiled_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        let on = parse_env_truthy("LUMEN_CUDA_ARGMAX_TILED").unwrap_or(true);
-        if on {
-            if super::decode::cuda_verbose() {
-                eprintln!("[ARGMAX] TILED=ON: two-phase {ARGMAX_TILES}-tile reduction");
-            }
-        }
-        on
+        parse_env_truthy("LUMEN_CUDA_ARGMAX_TILED")
+            .unwrap_or_else(crate::runtime_defaults::canonical_default_on_pub)
     })
 }
 /// Env-gate for the custom bandwidth-optimal BF16 decode GEMV kernel
@@ -2854,7 +2849,10 @@ impl CudaBackend {
                     && lw.bk.is_none()
                     && lw.bv.is_none()
                     && head_dim <= 1024
-                    && head_dim % 32 == 0)
+                    && head_dim % 32 == 0
+                    && head_dim > 0
+                    && num_heads > 0
+                    && num_kv_heads > 0)
                 {
                     break 'block false;
                 }
@@ -3132,8 +3130,15 @@ impl CudaBackend {
                 // dimension pairing instead of standard interleaved pairing.
                 let rope_neox = hp.rope_neox;
                 let rope_fn = if rope_neox {
+                    // Bound the EFFECTIVE rotary width: rotary_dim == 0 means
+                    // full head_dim, and the tabled kernel holds 128 pairs.
+                    let actual_rot = if rotary_dim > 0 && (rotary_dim as usize) < head_dim {
+                        rotary_dim as usize
+                    } else {
+                        head_dim
+                    };
                     if crate::runtime_defaults::rope_tabled_enabled()
-                        && (rotary_dim == 0 || rotary_dim as usize <= 256)
+                        && actual_rot <= 256
                         && st.kernels.rope_apply_neox_tabled.is_some()
                     {
                         rope_tab_census();
@@ -5815,6 +5820,8 @@ impl CudaBackend {
             && st.kernels.gdn_prefill_norm_gate_q8.is_some()
             && lw.q8_split_ssm_out.is_some()
             && p.head_dim % 32 == 0
+            && p.head_dim > 0
+            && p.head_dim <= 1024
             && p.value_dim == p.num_heads * p.head_dim
             && st
                 .scratch
@@ -5889,6 +5896,7 @@ impl CudaBackend {
                 && p.value_dim == p.num_heads * p.head_dim
                 && p.qkv_dim == 2 * p.qk_dim + p.value_dim
                 && p.head_dim >= 32
+                && p.head_dim % 32 == 0
                 && p.head_dim <= 1024;
             if p123_fused {
                 let fuse_fn = st.kernels.gdn_decode_phase123_fused.as_ref().unwrap();
@@ -8512,6 +8520,13 @@ impl CudaBackend {
     /// commutative, so tiling changes grouping, never the result.
     fn launch_argmax(&self, st: &mut MutableState, vocab: u32) -> Result<(), RuntimeError> {
         if argmax_tiled_enabled() {
+            static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SHOWN.load(std::sync::atomic::Ordering::Relaxed)
+                && !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed)
+                && super::decode::cuda_verbose()
+            {
+                eprintln!("[ARGMAX] TILED=ON: two-phase {ARGMAX_TILES}-tile reduction");
+            }
             if let (Some(p1), Some(p2)) = (
                 st.kernels.argmax_f32_tile_phase1.clone(),
                 st.kernels.argmax_f32_tile_phase2.clone(),
@@ -11475,8 +11490,6 @@ unsafe fn launch_matvec_preq8_1_residual(
 /// Same constraints as `launch_matvec_preq8_1`. The sibling buffer is
 /// produced by `repack_layer_q8_clone_to_split()` and has identical element
 /// count to the base weight.
-#[allow(clippy::too_many_arguments)]
-#[inline]
 /// Four-slot banked Q4 split matvec off one shared Q8_1 input — one launch
 /// covers up to four weights' rows (a slot with 0 rows gets no CTAs). The
 /// live consumer is the full-attention wq/wk/wv bank, which passes an empty
@@ -15083,8 +15096,15 @@ impl ComputeBackend for CudaBackend {
             // NeoX RoPE: models with partial rotary_dim use half-offset dimension pairing.
             let rope_neox = hp.rope_neox;
             let rope_fn = if rope_neox {
+                // Bound the EFFECTIVE rotary width: rotary_dim == 0 means full
+                // head_dim, and the tabled kernel holds 128 pairs.
+                let actual_rot = if rotary_dim > 0 && (rotary_dim as usize) < head_dim {
+                    rotary_dim as usize
+                } else {
+                    head_dim
+                };
                 if crate::runtime_defaults::rope_tabled_enabled()
-                    && (rotary_dim == 0 || rotary_dim as usize <= 256)
+                    && actual_rot <= 256
                     && st.kernels.rope_apply_neox_tabled.is_some()
                 {
                     rope_tab_census();

@@ -296,12 +296,12 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_spl
 }
 
 
-// Four-way banked variant: one launch covers qkv, gate, alpha, beta rows —
+// Four-slot banked variant: one launch covers up to four weights' rows —
 // all against the SAME pre-quantized Q8_1 input. Same virtual-row-concat
 // construction as the two-way banked kernel (block-uniform select, untouched
-// per-row body) => bit-identical outputs; removes three launch boundaries
-// and lets the tiny alpha/beta grids (12 CTAs each at out_dim 48) ride the
-// tail of the large grids instead of paying two standalone ramp/drains.
+// per-row body) => bit-identical outputs. A slot with 0 rows contributes no
+// CTAs; the live consumer is the full-attention wq/wk/wv bank, which passes
+// an empty fourth slot.
 extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_split_q8_1_locked_bank4(
     const char* __restrict__ weight_a,
     const char* __restrict__ weight_b,
