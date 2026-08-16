@@ -829,6 +829,19 @@ pub(crate) struct KernelSet {
 /// Each .cu source is compiled into a separate PTX module. This avoids
 /// symbol conflicts between kernels that define identically-named device
 /// helper functions (e.g., `warp_reduce_sum` appears in multiple .cu files).
+/// Slack-slope probe support: when `env_key` holds a positive integer, prepend
+/// `#define {define} N` to the GDN kernel source so the guarded tail spin in
+/// that kernel compiles in. Unset (the default) returns the pristine source —
+/// identical string, identical PTX, zero shipping-path effect.
+fn gdn_source_with_slack(env_key: &str, define: &str) -> std::borrow::Cow<'static, str> {
+    match std::env::var(env_key) {
+        Ok(v) if v.parse::<u64>().map(|n| n > 0).unwrap_or(false) => std::borrow::Cow::Owned(
+            format!("#define {define} {v}\n{}", shaders::GDN_KERNEL_SOURCE),
+        ),
+        _ => std::borrow::Cow::Borrowed(shaders::GDN_KERNEL_SOURCE),
+    }
+}
+
 pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, RuntimeError> {
     let load_fn = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
         let module = device.compile_and_load(source)?;
@@ -1277,10 +1290,20 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             .ok(),
         gdn_compute_gates_batched: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_compute_gates_batched")
             .ok(),
-        l2_normalize_qk_strided: load_fn(shaders::GDN_KERNEL_SOURCE, "l2_normalize_qk_strided")
-            .ok(),
+        l2_normalize_qk_strided: load_fn(
+            &gdn_source_with_slack("LUMEN_CUDA_SLACK_L2QK_CYCLES", "LUMEN_SLACK_L2QK_CYCLES"),
+            "l2_normalize_qk_strided",
+        )
+        .ok(),
         gdn_prefill_fused_v3: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_fused_v3").ok(),
-        gdn_prefill_norm_gate: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_norm_gate").ok(),
+        gdn_prefill_norm_gate: load_fn(
+            &gdn_source_with_slack(
+                "LUMEN_CUDA_SLACK_NORMGATE_CYCLES",
+                "LUMEN_SLACK_NORMGATE_CYCLES",
+            ),
+            "gdn_prefill_norm_gate",
+        )
+        .ok(),
         // accumulator variants. Default-OFF; loaded best-effort.
         l2_normalize_qk_strided_f64accum: match load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,

@@ -442,6 +442,18 @@ extern "C" __global__ void l2_normalize_qk_strided(
             head[i] *= scale;
         }
     }
+#ifdef LUMEN_SLACK_L2QK_CYCLES
+
+    // Slack-slope probe (LUMEN_CUDA_SLACK_*_CYCLES, compile-time define via the
+    // loader; absent => this block does not exist in the compiled source).
+    // Thread 0 spins ~N cycles at the kernel tail so the measured CUDA-event
+    // duration grows by a known amount; the whole-token delta then yields
+    // rho = dT/(L*dK), the fraction of an isolated saving that converts.
+    if (threadIdx.x == 0) {
+        long long slack_t0 = clock64();
+        while (clock64() - slack_t0 < (long long)LUMEN_SLACK_L2QK_CYCLES) {}
+    }
+#endif
 }
 
 
@@ -718,5 +730,17 @@ extern "C" __global__ void gdn_prefill_norm_gate(
     float silu_g = g / (1.0f + expf(-g));
 
     ssm_out[gate_idx] = silu_g * normed;
+#ifdef LUMEN_SLACK_NORMGATE_CYCLES
+
+    // Slack-slope probe (LUMEN_CUDA_SLACK_*_CYCLES, compile-time define via the
+    // loader; absent => this block does not exist in the compiled source).
+    // Thread 0 spins ~N cycles at the kernel tail so the measured CUDA-event
+    // duration grows by a known amount; the whole-token delta then yields
+    // rho = dT/(L*dK), the fraction of an isolated saving that converts.
+    if (vj == 0) {
+        long long slack_t0 = clock64();
+        while (clock64() - slack_t0 < (long long)LUMEN_SLACK_NORMGATE_CYCLES) {}
+    }
+#endif
 }
 
