@@ -119,7 +119,7 @@ fn bf16_autotune_enabled() -> bool {
 /// instead of one SM. Output byte-identical (associative max-then-min-index).
 const ARGMAX_TILES: usize = 128;
 
-/// DEFAULT-OFF candidate (`LUMEN_CUDA_ARGMAX_TILED=1`): two-phase tiled argmax
+/// Default ON (`LUMEN_CUDA_ARGMAX_TILED=0` opts out): two-phase tiled argmax
 /// replacing the single-block reduction (one SM reading ~1 MB ≈ 128 µs
 /// in-bracket). Same reduction operator, same tie semantics (CORR-011),
 /// byte-identical output by construction.
@@ -127,7 +127,7 @@ fn argmax_tiled_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        let on = parse_env_truthy("LUMEN_CUDA_ARGMAX_TILED").unwrap_or(false);
+        let on = parse_env_truthy("LUMEN_CUDA_ARGMAX_TILED").unwrap_or(true);
         if on {
             eprintln!("[ARGMAX] TILED=ON: two-phase {ARGMAX_TILES}-tile reduction");
         }
