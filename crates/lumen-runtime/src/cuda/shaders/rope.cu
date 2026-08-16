@@ -119,3 +119,64 @@ extern "C" __global__ void rope_apply_neox(
         k[i1] = x0 * sin_a + x1 * cos_a;
     }
 }
+
+// Tabled NeoX RoPE: only half_rot distinct (cos, sin) pairs exist per launch,
+// but every thread recomputes powf/cosf/sinf for its pair index. Here the
+// first half_rot threads of each CTA compute each pair ONCE into shared
+// memory (the identical expression on identical inputs => identical bits)
+// and every thread reads its pair from the table. Host guarantees
+// half_rot <= 128. Rotation arithmetic and pairing are unchanged.
+extern "C" __global__ void rope_apply_neox_tabled(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    unsigned int pos,
+    unsigned int num_q_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    float theta_base,
+    unsigned int rotary_dim)
+{
+    unsigned int actual_rot = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
+    unsigned int half_rot = actual_rot >> 1;
+
+    __shared__ float tcos[128];
+    __shared__ float tsin[128];
+    if (threadIdx.x < half_rot) {
+        unsigned int d = threadIdx.x;
+        float freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)actual_rot);
+        float angle = (float)pos * freq;
+        tcos[d] = cosf(angle);
+        tsin[d] = sinf(angle);
+    }
+    __syncthreads();
+
+    unsigned int total_q_pairs = num_q_heads * half_rot;
+    unsigned int total_k_pairs = num_kv_heads * half_rot;
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < total_q_pairs) {
+        unsigned int d = idx % half_rot;
+        unsigned int head_offset = (idx / half_rot) * head_dim;
+        float cos_a = tcos[d];
+        float sin_a = tsin[d];
+        unsigned int i0 = head_offset + d;
+        unsigned int i1 = head_offset + d + half_rot;
+        float x0 = q[i0];
+        float x1 = q[i1];
+        q[i0] = x0 * cos_a - x1 * sin_a;
+        q[i1] = x0 * sin_a + x1 * cos_a;
+    }
+
+    if (idx < total_k_pairs) {
+        unsigned int d = idx % half_rot;
+        unsigned int head_offset = (idx / half_rot) * head_dim;
+        float cos_a = tcos[d];
+        float sin_a = tsin[d];
+        unsigned int i0 = head_offset + d;
+        unsigned int i1 = head_offset + d + half_rot;
+        float x0 = k[i0];
+        float x1 = k[i1];
+        k[i0] = x0 * cos_a - x1 * sin_a;
+        k[i1] = x0 * sin_a + x1 * cos_a;
+    }
+}

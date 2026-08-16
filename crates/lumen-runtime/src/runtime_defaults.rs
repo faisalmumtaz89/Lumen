@@ -722,6 +722,12 @@ fn canonical_default_on() -> bool {
     !legacy_defaults_enabled()
 }
 
+/// Public view of the master-rollback default (`LUMEN_CUDA_LEGACY_DEFAULTS`)
+/// for optimization gates resolved outside this module.
+pub fn canonical_default_on_pub() -> bool {
+    canonical_default_on()
+}
+
 /// Per-process default for `LUMEN_CUDA_MOE_BATCHED` when the env is unset.
 /// ON by default — fires only for MoE models, no effect on dense.
 pub fn moe_batched_default() -> bool {
@@ -1094,12 +1100,131 @@ pub fn q4_split_wo_probe_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_WO"), Ok(v) if v == "1")
 }
 
-/// `LUMEN_CUDA_SSMOUT_RESID_FOLD=1`: when the ssm_out split route is active,
+/// `LUMEN_CUDA_GDN_NG_Q8` (default ON; `=0` opts out): the T=1 via-prefill norm-gate also
+/// emits the Q8_1 quantization of its own output, eliding the separate
+/// quantize launch before the ssm_out split matvec. Verbatim-cloned
+/// arithmetic => bit-identical bytes; dense-F32 path only.
+pub fn gdn_ng_q8_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_GDN_NG_Q8") {
+        Ok(v) => v != "0",
+        Err(_) => canonical_default_on(),
+    })
+}
+
+/// `LUMEN_CUDA_GDN_P123_FUSE` (default ON; `=0` opts out): fuse the first three T=1
+/// via-prefill GDN launches (conv+SiLU, gates, QK-L2) into one kernel.
+/// Per-op arithmetic cloned verbatim => bit-identical; dense-F32 path only.
+pub fn gdn_p123_fuse_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_GDN_P123_FUSE") {
+        Ok(v) => v != "0",
+        Err(_) => canonical_default_on(),
+    })
+}
+
+/// `LUMEN_CUDA_ROPE_TAB` (default ON; `=0` opts out): NeoX RoPE reads its cos/sin pairs from
+/// a per-CTA shared table computed once (identical expression, identical
+/// inputs => identical bits) instead of every thread recomputing
+/// powf/cosf/sinf.
+pub fn rope_tabled_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_ROPE_TAB") {
+        Ok(v) => v != "0",
+        Err(_) => canonical_default_on(),
+    })
+}
+
+/// `LUMEN_CUDA_ATTN_PREP_FUSE` (default ON; `=0` opts out): the six-launch full-attention
+/// prep chain (deinterleave, per-head Q/K norms, NeoX RoPE, K/V cache
+/// appends) issues as ONE kernel. Per-value op sequences cloned verbatim =>
+/// bit-identical; the region is CPU-launch-shadow bound, so the launch count
+/// is the lever.
+pub fn attn_prep_fuse_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_ATTN_PREP_FUSE") {
+        Ok(v) => v != "0",
+        Err(_) => canonical_default_on(),
+    })
+}
+
+/// `LUMEN_CUDA_ATTN_BANK3` (default ON; `=0` opts out): full-attention wq/wk/wv issue as ONE
+/// banked launch (virtual row concat via the 4-way kernel with an empty
+/// fourth slot) off their shared Q8_1 input — two launch boundaries removed
+/// and the tiny wk/wv grids (256 CTAs each) ride the wq grid's tail.
+/// Bit-identical per row.
+pub fn attn_bank3_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_ATTN_BANK3") {
+        Ok(v) => v != "0",
+        Err(_) => canonical_default_on(),
+    })
+}
+
+/// `LUMEN_CUDA_Q4_V4LOAD` (default ON, GDN-bank-scoped; `=0` opts out):
+/// the banked GDN launch loads the nibble
+/// stream as one 128-bit uint4 instead of four u32 words (alignment-guarded
+/// at dispatch). Integer loads are exact => bit-identical; gate-verified.
+///
+pub fn q4_v4load_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_Q4_V4LOAD") {
+        Ok(v) => v != "0",
+        Err(_) => canonical_default_on(),
+    })
+}
+
+/// `LUMEN_CUDA_Q4_B160` (default ON; `=0` opts out): route the GDN banked
+/// nb=160 launch through the 160-thread compile variant — every lane productive in
+/// the K-loop instead of 160/256, ~+50% load-issuing lanes at full
+/// occupancy. The dropped warps only folded exact +0.0 partials, so output
+/// is expected bit-identical (byte-gate enforced).
+pub fn q4_b160_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_Q4_B160") {
+        Ok(v) => v != "0",
+        Err(_) => canonical_default_on(),
+    })
+}
+
+/// `LUMEN_CUDA_Q8_AB_BANK` (default ON; `=0` opts out): the GDN alpha+beta Q8Raw matvecs
+/// ([48,5120] each, 24-CTA grids) issue as ONE banked launch. The banked
+/// kernel duplicates the raw-route body verbatim but compiles under
+/// fast-math, so equality vs the two-launch route is validated by output-equality tests
+/// rather than assumed.
+pub fn q8_ab_bank_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_Q8_AB_BANK") {
+        Ok(v) => v != "0",
+        Err(_) => canonical_default_on(),
+    })
+}
+
+/// `LUMEN_CUDA_Q4_PROJ_BANK` (default ON; `=0` opts out): bank the GDN qkv + gate Q4 split
+/// matvecs into ONE launch of `matvec_q4_split_q8_1_locked_banked` (both read
+/// the same pre-quantized Q8_1 input; per-row math untouched, so output is
+/// bit-identical to the two-launch route).
+pub fn q4_proj_bank_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_Q4_PROJ_BANK") {
+        Ok(v) => v != "0",
+        Err(_) => canonical_default_on(),
+    })
+}
+
+/// `LUMEN_CUDA_SSMOUT_RESID_FOLD` (default ON; `=0` opts out): when the ssm_out split route is active,
 /// dispatch its residual variant so the projection writes `attn_proj = W*x +
 /// x_gpu` directly and the per-layer residual_add_copy launch is skipped.
-/// Default OFF.
+/// Byte-identical for normal-range activations; the folded add runs in a
+/// flush-to-zero kernel, so a subnormal residual can differ in the last bit
+/// from the separately-compiled legacy add.
+///
 pub fn ssmout_residual_fold_enabled() -> bool {
-    matches!(std::env::var("LUMEN_CUDA_SSMOUT_RESID_FOLD"), Ok(v) if v == "1")
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_SSMOUT_RESID_FOLD") {
+        Ok(v) => v != "0",
+        Err(_) => canonical_default_on(),
+    })
 }
 
 /// Per-process default for `LUMEN_CUDA_SOA_LOCKED` when the env is unset.
@@ -1164,9 +1289,9 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_AB_ITERATIONS",
     "LUMEN_AB_WARMUP",
     "LUMEN_ANTI_RESTATE",
-    "LUMEN_ANTI_RESTATE_SUBWORD",
-    "LUMEN_ANTI_RESTATE_NGRAM",
     "LUMEN_ANTI_RESTATE_LOOP",
+    "LUMEN_ANTI_RESTATE_NGRAM",
+    "LUMEN_ANTI_RESTATE_SUBWORD",
     "LUMEN_BASE_URL",
     "LUMEN_BENCH_ITERATIONS",
     "LUMEN_BENCH_SCALE",
@@ -1175,6 +1300,11 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CACHE_DIR",
     "LUMEN_CHAT_ENABLE_THINKING",
     "LUMEN_CORR010_MODEL",
+    "LUMEN_CUDA_ARGMAX_TILED",
+    "LUMEN_CUDA_ATTN_BANK3",
+    "LUMEN_CUDA_ATTN_PRECISE",
+    "LUMEN_CUDA_ATTN_PRECISE_DBG",
+    "LUMEN_CUDA_ATTN_PREP_FUSE",
     "LUMEN_CUDA_BF16_AUTOTUNE",
     "LUMEN_CUDA_BF16_GEMMEX",
     "LUMEN_CUDA_BF16_MATVEC",
@@ -1190,8 +1320,11 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_GDN_DECODE_MEGAKERNEL_F64",
     "LUMEN_CUDA_GDN_DECODE_VIA_PREFILL",
     "LUMEN_CUDA_GDN_F64_ACCUM",
+    "LUMEN_CUDA_GDN_NG_Q8",
+    "LUMEN_CUDA_GDN_P123_FUSE",
     "LUMEN_CUDA_GDN_PREFILL_F64",
     "LUMEN_CUDA_GDN_REGISTER_RESIDENT",
+    "LUMEN_CUDA_GDN_SKIP_DUP_QKV",
     "LUMEN_CUDA_GDN_SUBSTAGE_TIMING",
     "LUMEN_CUDA_GPU_SAMPLE",
     "LUMEN_CUDA_LEGACY_DEFAULTS",
@@ -1204,40 +1337,46 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_MOE_BATCHED_V2",
     "LUMEN_CUDA_MOE_BATCHED_V3",
     "LUMEN_CUDA_MOE_BF16_NATIVE",
-    "LUMEN_CUDA_MOE_DOWN_TILED_F32ACT",
     "LUMEN_CUDA_MOE_DECODE_F32",
     "LUMEN_CUDA_MOE_DECODE_F32_FFN",
+    "LUMEN_CUDA_MOE_DOWN_TILED_F32ACT",
     "LUMEN_CUDA_MOE_FUSED_NORM_ROUTER",
     "LUMEN_CUDA_MOE_GATE_UP_W10",
     "LUMEN_CUDA_MOE_GROUPED_TILED",
     "LUMEN_CUDA_MOE_PREFILL_BATCHED",
-    "LUMEN_CUDA_MOE_RESIDUAL_Q8",
-    "LUMEN_CUDA_SHARED_FUSED_DECODE",
     "LUMEN_CUDA_MOE_Q4_V3",
     "LUMEN_CUDA_MOE_Q4_V3B",
+    "LUMEN_CUDA_MOE_RESIDUAL_Q8",
     "LUMEN_CUDA_MOE_ROUTER_PARALLEL",
-    "LUMEN_CUDA_SHARED_TILED",
     "LUMEN_CUDA_OUTPUT_PROJ_NR",
     "LUMEN_CUDA_OUTPUT_PROJ_SPLIT",
     "LUMEN_CUDA_PREFILL_F32",
     "LUMEN_CUDA_PROFILE",
     "LUMEN_CUDA_PTX_CACHE",
     "LUMEN_CUDA_PTX_CACHE_DIR",
+    "LUMEN_CUDA_Q4_B160",
+    "LUMEN_CUDA_Q4_F32ACT_KERNEL",
+    "LUMEN_CUDA_Q4_MMVQ",
+    "LUMEN_CUDA_Q4_PROJ_BANK",
     "LUMEN_CUDA_Q4_SPLIT",
     "LUMEN_CUDA_Q4_SPLIT_ATTN",
-    "LUMEN_CUDA_Q4_SPLIT_WO",
-    "LUMEN_CUDA_SSMOUT_RESID_FOLD",
-    "LUMEN_CUDA_Q8_SPLIT_SSMOUT",
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
+    "LUMEN_CUDA_Q4_SPLIT_WO",
+    "LUMEN_CUDA_Q4_V4LOAD",
+    "LUMEN_CUDA_Q8_AB_BANK",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
-    "LUMEN_CUDA_Q4_MMVQ",
     "LUMEN_CUDA_Q8_MMVQ",
     "LUMEN_CUDA_Q8_PROJ_MMQ",
     "LUMEN_CUDA_Q8_SCALE_HW",
     "LUMEN_CUDA_Q8_SPLIT",
     "LUMEN_CUDA_Q8_SPLIT_BUDGET_GB",
+    "LUMEN_CUDA_Q8_SPLIT_SSMOUT",
+    "LUMEN_CUDA_ROPE_TAB",
+    "LUMEN_CUDA_SHARED_FUSED_DECODE",
+    "LUMEN_CUDA_SHARED_TILED",
     "LUMEN_CUDA_SKIP_BF16_PROBE",
     "LUMEN_CUDA_SOA_LOCKED",
+    "LUMEN_CUDA_SSMOUT_RESID_FOLD",
     "LUMEN_CUDA_TOPK_MOE_FUSED",
     "LUMEN_CUDA_VERBOSE",
     "LUMEN_DUMP_EXPERTS",
@@ -1246,16 +1385,18 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_FREQUENCY_PENALTY",
     "LUMEN_GRAPH_DIAGNOSTIC",
     "LUMEN_KV_PRECISION",
-    "LUMEN_CUDA_ATTN_PRECISE",
-    "LUMEN_CUDA_ATTN_PRECISE_DBG",
     "LUMEN_METAL_ATTN_PRECISE",
     "LUMEN_METAL_BF16_GATE_UP_NR",
     "LUMEN_METAL_BF16_GDN_FULL_PREFILL_WARMUP",
     "LUMEN_METAL_BF16_GDN_QKV_GATE_PAIRED",
     "LUMEN_METAL_BF16_MMAP_ONLY",
+    "LUMEN_METAL_CB_SPLIT",
     "LUMEN_METAL_CONCURRENT_ENCODER",
     "LUMEN_METAL_CONCURRENT_ENCODER_VALIDATE",
     "LUMEN_METAL_DECODE_DELAY_US",
+    "LUMEN_METAL_DECODE_GPUTIME",
+    "LUMEN_METAL_DECODE_PROFILE",
+    "LUMEN_METAL_DEFAULTS_OFF",
     "LUMEN_METAL_FFN_DOWN_SPLITK",
     "LUMEN_METAL_FFN_GATE_UP_SWIGLU_FUSED",
     "LUMEN_METAL_FFN_GATE_UP_SWIGLU_FUSED_BF16",
@@ -1263,29 +1404,24 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_METAL_GDN_CONCURRENT_ENCODER",
     "LUMEN_METAL_GDN_CONCURRENT_ENCODER_VALIDATE",
     "LUMEN_METAL_GDN_SSM_OUT_F32_BATCHED",
-    "LUMEN_METAL_MMAP_ONLY",
-    "LUMEN_METAL_MOE_ROUTER_PARALLEL",
-    "LUMEN_METAL_MOE_ROUTER_TOPK_TGS",
-    "LUMEN_METAL_MOE_PREFILL_GROUPED",
-    "LUMEN_METAL_MOE_GATHER_VEC4",
-    "LUMEN_METAL_MOE_GEMM_TILEMAP",
-    "LUMEN_METAL_MOE_ROUTE_SORT",
-    "LUMEN_METAL_MOE_ROUTE_SORT_PAR",
-    "LUMEN_METAL_NAN_DUMP",
-    "LUMEN_METAL_DEFAULTS_OFF",
-    "LUMEN_METAL_PROFILE",
-    "LUMEN_METAL_DECODE_PROFILE",
     "LUMEN_METAL_GPU_SAMPLER",
     "LUMEN_METAL_GPU_SAMPLER_EXACT",
     "LUMEN_METAL_GPU_SAMPLER_QUIET",
-    "LUMEN_SPEC_DUMP_IDS",
-    "LUMEN_METAL_DECODE_GPUTIME",
-    "LUMEN_METAL_CB_SPLIT",
+    "LUMEN_METAL_MMAP_ONLY",
+    "LUMEN_METAL_MOE_GATHER_VEC4",
+    "LUMEN_METAL_MOE_GEMM_TILEMAP",
+    "LUMEN_METAL_MOE_PREFILL_GROUPED",
+    "LUMEN_METAL_MOE_ROUTER_PARALLEL",
+    "LUMEN_METAL_MOE_ROUTER_TOPK_TGS",
+    "LUMEN_METAL_MOE_ROUTE_SORT",
+    "LUMEN_METAL_MOE_ROUTE_SORT_PAR",
+    "LUMEN_METAL_NAN_DUMP",
     "LUMEN_METAL_PREFILL_GPUTIME",
+    "LUMEN_METAL_PROFILE",
+    "LUMEN_METAL_Q8_GDN_QKVGATE_2STREAM",
     "LUMEN_METAL_Q8_REPACKED",
     "LUMEN_METAL_Q8_REPACKED_FFN_DOWN",
     "LUMEN_METAL_Q8_REPACKED_GATE_UP",
-    "LUMEN_METAL_Q8_GDN_QKVGATE_2STREAM",
     "LUMEN_METAL_UNRETAINED_CMDBUFS",
     "LUMEN_MOE_PROBE",
     "LUMEN_PREFILL_TIMING",
@@ -1304,6 +1440,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_SOAK_STACK_LEAKS",
     "LUMEN_SOAK_STACK_TICKS",
     "LUMEN_SOAK_WARMUP_SEC",
+    "LUMEN_SPEC_DUMP_IDS",
     "LUMEN_SUFFIX_THRESHOLD",
     "LUMEN_TEST_OPENAI_SDK",
     "LUMEN_XCHK",
@@ -2390,8 +2527,11 @@ mod tests {
         "LUMEN_CACHE_DIR",
         "LUMEN_CHAT_ENABLE_THINKING",
         "LUMEN_CORR010_MODEL",
+        "LUMEN_CUDA_ARGMAX_TILED",
+        "LUMEN_CUDA_ATTN_BANK3",
         "LUMEN_CUDA_ATTN_PRECISE",
         "LUMEN_CUDA_ATTN_PRECISE_DBG",
+        "LUMEN_CUDA_ATTN_PREP_FUSE",
         "LUMEN_CUDA_BF16_AUTOTUNE",
         "LUMEN_CUDA_BF16_GEMMEX",
         "LUMEN_CUDA_BF16_MATVEC",
@@ -2407,8 +2547,11 @@ mod tests {
         "LUMEN_CUDA_GDN_DECODE_MEGAKERNEL_F64",
         "LUMEN_CUDA_GDN_DECODE_VIA_PREFILL",
         "LUMEN_CUDA_GDN_F64_ACCUM",
+        "LUMEN_CUDA_GDN_NG_Q8",
+        "LUMEN_CUDA_GDN_P123_FUSE",
         "LUMEN_CUDA_GDN_PREFILL_F64",
         "LUMEN_CUDA_GDN_REGISTER_RESIDENT",
+        "LUMEN_CUDA_GDN_SKIP_DUP_QKV",
         "LUMEN_CUDA_GDN_SUBSTAGE_TIMING",
         "LUMEN_CUDA_GPU_SAMPLE",
         "LUMEN_CUDA_LEGACY_DEFAULTS",
@@ -2428,10 +2571,9 @@ mod tests {
         "LUMEN_CUDA_MOE_GATE_UP_W10",
         "LUMEN_CUDA_MOE_GROUPED_TILED",
         "LUMEN_CUDA_MOE_PREFILL_BATCHED",
-        "LUMEN_CUDA_MOE_RESIDUAL_Q8",
-        "LUMEN_CUDA_SHARED_FUSED_DECODE",
         "LUMEN_CUDA_MOE_Q4_V3",
         "LUMEN_CUDA_MOE_Q4_V3B",
+        "LUMEN_CUDA_MOE_RESIDUAL_Q8",
         "LUMEN_CUDA_MOE_ROUTER_PARALLEL",
         "LUMEN_CUDA_OUTPUT_PROJ_NR",
         "LUMEN_CUDA_OUTPUT_PROJ_SPLIT",
@@ -2439,16 +2581,29 @@ mod tests {
         "LUMEN_CUDA_PROFILE",
         "LUMEN_CUDA_PTX_CACHE",
         "LUMEN_CUDA_PTX_CACHE_DIR",
-        "LUMEN_CUDA_Q4_SPLIT",
-        "LUMEN_CUDA_Q8_MATVEC_FAST",
+        "LUMEN_CUDA_Q4_B160",
+        "LUMEN_CUDA_Q4_F32ACT_KERNEL",
         "LUMEN_CUDA_Q4_MMVQ",
+        "LUMEN_CUDA_Q4_PROJ_BANK",
+        "LUMEN_CUDA_Q4_SPLIT",
+        "LUMEN_CUDA_Q4_SPLIT_ATTN",
+        "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
+        "LUMEN_CUDA_Q4_SPLIT_WO",
+        "LUMEN_CUDA_Q4_V4LOAD",
+        "LUMEN_CUDA_Q8_AB_BANK",
+        "LUMEN_CUDA_Q8_MATVEC_FAST",
         "LUMEN_CUDA_Q8_MMVQ",
         "LUMEN_CUDA_Q8_PROJ_MMQ",
         "LUMEN_CUDA_Q8_SCALE_HW",
         "LUMEN_CUDA_Q8_SPLIT",
+        "LUMEN_CUDA_Q8_SPLIT_BUDGET_GB",
+        "LUMEN_CUDA_Q8_SPLIT_SSMOUT",
+        "LUMEN_CUDA_ROPE_TAB",
+        "LUMEN_CUDA_SHARED_FUSED_DECODE",
         "LUMEN_CUDA_SHARED_TILED",
         "LUMEN_CUDA_SKIP_BF16_PROBE",
         "LUMEN_CUDA_SOA_LOCKED",
+        "LUMEN_CUDA_SSMOUT_RESID_FOLD",
         "LUMEN_CUDA_TOPK_MOE_FUSED",
         "LUMEN_CUDA_VERBOSE",
         "LUMEN_DUMP_EXPERTS",

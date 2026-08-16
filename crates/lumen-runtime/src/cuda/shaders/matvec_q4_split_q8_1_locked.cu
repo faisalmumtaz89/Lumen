@@ -153,9 +153,10 @@ __device__ __forceinline__ void matvec_q4_split_body(
     float* __restrict__ out,
     unsigned int out_dim,
     unsigned int in_dim,
-    const float* __restrict__ residual)
+    const float* __restrict__ residual,
+    unsigned int vblock)
 {
-    unsigned int r0 = blockIdx.x * NR;
+    unsigned int r0 = vblock * NR;
     unsigned int warp_id = threadIdx.x / NW;
     unsigned int lane    = threadIdx.x % NW;
 
@@ -207,8 +208,23 @@ __device__ __forceinline__ void matvec_q4_split_body(
             wsb[row] = *(const unsigned short*)(row_base + scale_off);
             const unsigned int* w_nibbles =
                 (const unsigned int*)(row_base + nibble_off);
+#ifdef LUMEN_Q4_V4LOAD
+            // 128-bit load variant (compile-time define, absent by default):
+            // one uint4 transaction replaces four u32 loads. Host guarantees
+            // 16-byte alignment (2*nb % 16 == 0 for the dispatched shapes;
+            // base is cudaMalloc-256-aligned). Integer loads are exact — the
+            // unpacked words and everything downstream are bit-identical.
+            {
+                const uint4 wv4 = *(const uint4*)w_nibbles;
+                wpk[row][0] = wv4.x;
+                wpk[row][1] = wv4.y;
+                wpk[row][2] = wv4.z;
+                wpk[row][3] = wv4.w;
+            }
+#else
             #pragma unroll
             for (int k = 0; k < 4; k++) wpk[row][k] = w_nibbles[k];
+#endif
         }
 
         // ---- PHASE B: locked accumulate, rows 0..NR-1 in the SAME order, with
@@ -240,7 +256,7 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_spl
     unsigned int out_dim,
     unsigned int in_dim)
 {
-    matvec_q4_split_body(weight_q4_split, input_q8_1, out, out_dim, in_dim, 0);
+    matvec_q4_split_body(weight_q4_split, input_q8_1, out, out_dim, in_dim, 0, blockIdx.x);
 }
 
 extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_split_q8_1_locked_residual(
@@ -251,5 +267,76 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_spl
     unsigned int out_dim,
     unsigned int in_dim)
 {
-    matvec_q4_split_body(weight_q4_split, input_q8_1, out, out_dim, in_dim, residual);
+    matvec_q4_split_body(weight_q4_split, input_q8_1, out, out_dim, in_dim, residual, blockIdx.x);
+}
+
+// Banked two-weight variant: ONE launch covers weight A's rows then weight B's
+// rows, both against the SAME pre-quantized Q8_1 input. Removes a launch and
+// lets B's CTAs fill the tail of A's final wave. The block-level pointer/index
+// select is uniform per CTA and the per-row body (locked epilogue, locked
+// reductions, fixed block visitation) is untouched, so each output element is
+// bit-identical to the two-launch route.
+extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_split_q8_1_locked_banked(
+    const char* __restrict__ weight_a,
+    const char* __restrict__ weight_b,
+    const char* __restrict__ input_q8_1,
+    float* __restrict__ out_a_ptr,
+    float* __restrict__ out_b_ptr,
+    unsigned int out_a,
+    unsigned int out_b,
+    unsigned int in_dim)
+{
+    unsigned int grid_a = (out_a + (unsigned int)NR - 1u) / (unsigned int)NR;
+    if (blockIdx.x < grid_a) {
+        matvec_q4_split_body(weight_a, input_q8_1, out_a_ptr, out_a, in_dim, 0, blockIdx.x);
+    } else {
+        matvec_q4_split_body(weight_b, input_q8_1, out_b_ptr, out_b, in_dim, 0,
+                             blockIdx.x - grid_a);
+    }
+}
+
+
+// Four-slot banked variant: one launch covers up to four weights' rows —
+// all against the SAME pre-quantized Q8_1 input. Same virtual-row-concat
+// construction as the two-way banked kernel (block-uniform select, untouched
+// per-row body) => bit-identical outputs. A slot with 0 rows contributes no
+// CTAs; the live consumer is the full-attention wq/wk/wv bank, which passes
+// an empty fourth slot.
+extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_split_q8_1_locked_bank4(
+    const char* __restrict__ weight_a,
+    const char* __restrict__ weight_b,
+    const char* __restrict__ weight_c,
+    const char* __restrict__ weight_d,
+    const char* __restrict__ input_q8_1,
+    float* __restrict__ out_a_ptr,
+    float* __restrict__ out_b_ptr,
+    float* __restrict__ out_c_ptr,
+    float* __restrict__ out_d_ptr,
+    unsigned int out_a,
+    unsigned int out_b,
+    unsigned int out_c,
+    unsigned int out_d,
+    unsigned int in_dim)
+{
+    const unsigned int nr = (unsigned int)NR;
+    unsigned int grid_a = (out_a + nr - 1u) / nr;
+    unsigned int grid_b = (out_b + nr - 1u) / nr;
+    unsigned int grid_c = (out_c + nr - 1u) / nr;
+    unsigned int vb = blockIdx.x;
+    if (vb < grid_a) {
+        matvec_q4_split_body(weight_a, input_q8_1, out_a_ptr, out_a, in_dim, 0, vb);
+        return;
+    }
+    vb -= grid_a;
+    if (vb < grid_b) {
+        matvec_q4_split_body(weight_b, input_q8_1, out_b_ptr, out_b, in_dim, 0, vb);
+        return;
+    }
+    vb -= grid_b;
+    if (vb < grid_c) {
+        matvec_q4_split_body(weight_c, input_q8_1, out_c_ptr, out_c, in_dim, 0, vb);
+        return;
+    }
+    vb -= grid_c;
+    matvec_q4_split_body(weight_d, input_q8_1, out_d_ptr, out_d, in_dim, 0, vb);
 }

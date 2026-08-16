@@ -408,3 +408,140 @@ extern "C" __global__ __launch_bounds__(MV_THREADS, 1) void matvec_q8_0_q8_1_res
         }
     }
 }
+
+
+// ==========================================================================
+// Banked two-weight variant of matvec_q8_0_q8_1: ONE launch covers weight
+// A's rows then weight B's rows against the same Q8_1 input (virtual row
+// concatenation — block-uniform select, per-row loop body duplicated
+// verbatim from matvec_q8_0_q8_1 above; the original kernel is untouched).
+// Removes one launch boundary for tiny row counts (e.g. the GDN alpha/beta
+// [48,5120] pair). Output equality vs the two-launch route is enforced by
+// the byte-identity gate (this file compiles under --use_fast_math, so the
+// equality is validated, not assumed).
+// ==========================================================================
+__device__ __forceinline__ void matvec_q8_0_q8_1_vbody(
+    const char* __restrict__ weight_q8,
+    const char* __restrict__ input_q8_1,
+    float* __restrict__ out,
+    unsigned int out_dim,
+    unsigned int in_dim,
+    unsigned int vblock)
+{
+    const unsigned int r0 = vblock * MV_NR;  // first output row for this bank half
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp_id = tid / WARP_SIZE;
+    const unsigned int lane = tid % WARP_SIZE;
+
+    const unsigned int nb = in_dim >> 5;  // Number of Q8_0 blocks per row
+    const unsigned long long row_bytes = (unsigned long long)nb * Q8_0_BYTES;
+
+    // Per-row accumulators
+    float sumf[MV_NR];
+    #pragma unroll
+    for (int r = 0; r < MV_NR; r++) sumf[r] = 0.0f;
+
+    // Main loop: each thread handles 1 Q8_0/Q8_1 block pair per iteration,
+    // striding by MV_THREADS (128) blocks.
+    for (unsigned int ib = tid; ib < nb; ib += MV_THREADS) {
+
+        // --- Load Q8_1 input block (shared across NR rows) ---
+        const char* x_block = input_q8_1 + (unsigned long long)ib * Q8_1_BYTES;
+
+        // Read f16 input scale (bytes 0-1, little-endian).
+        unsigned short x_scale_bits = (unsigned short)(unsigned char)x_block[0]
+                                    | ((unsigned short)(unsigned char)x_block[1] << 8);
+        float x_scale = f16_bits_to_f32(x_scale_bits);
+
+        // Load 32 int8 input values from x_block+4 (4-byte aligned).
+        const int* xq = (const int*)(x_block + 4);
+
+        // Preload input packed words.
+        int xv[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++) xv[k] = xq[k];
+
+        // --- Process NR output rows with same x-values ---
+        #pragma unroll
+        for (int row = 0; row < MV_NR; row++) {
+            if (r0 + row >= out_dim) break;
+
+            const char* w_block = weight_q8
+                + (unsigned long long)(r0 + row) * row_bytes
+                + (unsigned long long)ib * Q8_0_BYTES;
+
+            // Read f16 weight scale (bytes 0-1, little-endian).
+            unsigned short w_scale_bits = (unsigned short)(unsigned char)w_block[0]
+                                        | ((unsigned short)(unsigned char)w_block[1] << 8);
+            float w_scale = f16_bits_to_f32(w_scale_bits);
+
+            // Load 32 int8 weight values from w_block+2 as uint16 pairs.
+            // Q8_0 quant data at +2 is 2-byte aligned (34-byte blocks, even offset).
+            // uint16 loads: 2 loads + 1 shift + 1 OR = 4 ops per int32 word,
+            // vs byte loads: 4 loads + 3 shifts + 3 ORs = 10 ops per int32 word.
+            // NOT 4-byte aligned, so int* cast is unsafe (XID 13 on A100).
+            const unsigned short* w16 = (const unsigned short*)(w_block + 2);
+
+            int acc = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                int w_word = (int)w16[k * 2] | ((int)w16[k * 2 + 1] << 16);
+                acc = dp4a_s32(w_word, xv[k], acc);
+            }
+
+            // Combined scale: w_scale * x_scale * int_dot_product.
+            // Q8_0 has zero-point=0, so no correction term needed.
+            sumf[row] += w_scale * x_scale * (float)acc;
+        }
+    }
+
+    // --- Cross-warp reduction via simple shmem (3 warps write, warp 0 sums) ---
+    #pragma unroll
+    for (int r = 0; r < MV_NR; r++) {
+        sumf[r] = warp_reduce_sum(sumf[r]);
+    }
+
+    __shared__ float shmem[(MV_NWARPS - 1) * MV_NR];
+
+    if (warp_id > 0 && lane == 0) {
+        #pragma unroll
+        for (int r = 0; r < MV_NR; r++) {
+            shmem[(warp_id - 1) * MV_NR + r] = sumf[r];
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        #pragma unroll
+        for (int r = 0; r < MV_NR; r++) {
+            float total = sumf[r];
+            #pragma unroll
+            for (int w = 0; w < MV_NWARPS - 1; w++) {
+                total += shmem[w * MV_NR + r];
+            }
+            if (r0 + r < out_dim) {
+                out[r0 + r] = total;
+            }
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(MV_THREADS, 1) void matvec_q8_0_q8_1_banked(
+    const char* __restrict__ weight_a,
+    const char* __restrict__ weight_b,
+    const char* __restrict__ input_q8_1,
+    float* __restrict__ out_a,
+    float* __restrict__ out_b,
+    unsigned int out_a_dim,
+    unsigned int out_b_dim,
+    unsigned int in_dim)
+{
+    unsigned int grid_a = (out_a_dim + (unsigned int)MV_NR - 1u) / (unsigned int)MV_NR;
+    if (blockIdx.x < grid_a) {
+        matvec_q8_0_q8_1_vbody(weight_a, input_q8_1, out_a, out_a_dim, in_dim, blockIdx.x);
+    } else {
+        matvec_q8_0_q8_1_vbody(weight_b, input_q8_1, out_b, out_b_dim, in_dim,
+                               blockIdx.x - grid_a);
+    }
+}

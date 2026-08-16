@@ -92,6 +92,19 @@ Set any to `=0` to opt out. Model-aware defaults are noted per row.
 | `LUMEN_CUDA_OUTPUT_PROJ_SPLIT` | ON (Q8-dense); OFF else | kill-switch | Split-K layout for the ~1 GB output projection. | `=0` to A/B the packed output_proj. |
 | `LUMEN_CUDA_OUTPUT_PROJ_NR` | `16` (Q8-dense) / `1` else | config | Rows-per-thread (NR) for output_proj; unrecognised → warn + `32`. | Tune output_proj occupancy on new GPUs. |
 | `LUMEN_CUDA_SOA_LOCKED` | ON (Q4-dense); OFF else | kill-switch | Codegen-locked SoA Q4 matvec (word-load reorder; +30% path). | `=0` to A/B the AoS Q4 matvec. |
+| `LUMEN_CUDA_Q4_SPLIT_ATTN` | ON | kill-switch | Builds Q4 split (SoA) siblings for the GDN qkv/gate and attention Wq/Wk/Wv projections, not just FFN. Byte-identical. | `=0` to A/B the FFN-only clone pass. |
+| `LUMEN_CUDA_Q8_SPLIT_SSMOUT` | ON | kill-switch | Q8 split sibling + pre-quantized dispatch for the GDN output projection. Byte-identical. | `=0` to A/B the raw ssm_out route. |
+| `LUMEN_CUDA_GDN_P123_FUSE` | ON | kill-switch | Fuses the three per-layer GDN decode prep launches (conv+SiLU, gates, QK L2-norm) into one kernel. Byte-identical. | `=0` to A/B the three-launch chain. |
+| `LUMEN_CUDA_GDN_NG_Q8` | ON | kill-switch | The GDN norm-gate also emits the Q8_1 blocks of its own output, eliding a separate quantize launch. Byte-identical. | `=0` to A/B the separate quantize. |
+| `LUMEN_CUDA_SSMOUT_RESID_FOLD` | ON | kill-switch | Folds the residual add into the ssm_out split projection, eliding a per-layer copy kernel. Byte-identical. | `=0` to A/B the separate residual add. |
+| `LUMEN_CUDA_Q4_PROJ_BANK` | ON | kill-switch | GDN qkv + gate issue as one banked launch off their shared quantized input. Byte-identical. | `=0` to A/B two separate launches. |
+| `LUMEN_CUDA_Q8_AB_BANK` | ON | kill-switch | GDN alpha + beta issue as one banked launch off the shared quantized input. Output-equality validated. | `=0` to A/B two separate launches. |
+| `LUMEN_CUDA_Q4_B160` | ON | kill-switch | 160-thread compile of the locked Q4 kernel for the banked GDN launch (all lanes productive at its in-dim). Byte-identical. | `=0` to A/B the 256-thread compile. |
+| `LUMEN_CUDA_Q4_V4LOAD` | ON | kill-switch | 128-bit nibble loads in the banked GDN launch (one uint4 replaces four u32 loads). Byte-identical. | `=0` to A/B word loads. |
+| `LUMEN_CUDA_ATTN_BANK3` | ON | kill-switch | Full-attention wq/wk/wv issue as one banked launch off their shared quantized input. Byte-identical. | `=0` to A/B three separate launches. |
+| `LUMEN_CUDA_ROPE_TAB` | ON | kill-switch | NeoX RoPE reads cos/sin from a per-CTA table computed once instead of per-thread transcendentals. Byte-identical. Governs the standalone RoPE kernel only — the fused prep path computes its table internally, so a full per-thread-RoPE A/B also needs `LUMEN_CUDA_ATTN_PREP_FUSE=0`. | `=0` (with `LUMEN_CUDA_ATTN_PREP_FUSE=0`) to A/B per-thread angle computation. |
+| `LUMEN_CUDA_ATTN_PREP_FUSE` | ON | kill-switch | Fuses the six-launch full-attention prep chain (deinterleave, Q/K per-head norms, RoPE, K/V cache appends) into one kernel. Byte-identical. | `=0` to A/B the launch chain. |
+| `LUMEN_CUDA_ARGMAX_TILED` | ON | kill-switch | Two-phase tiled greedy argmax (whole-GPU read + one-warp reduce) instead of a single-block scan. Byte-identical. | `=0` to A/B the single-block argmax. |
 | `LUMEN_CUDA_Q4_SPLIT` | armed by `SOA_LOCKED` for Q4-dense (env A/B only) | kill-switch | Raw+split layout for Q4_0 weights (+9.0% Q4 decode); load-bearing under SoA-lock. | Leave as-is; the env read is A/B-only. |
 | `LUMEN_CUDA_Q8_PROJ_MMQ` | ON for MoE, OFF for dense (model-aware) | kill-switch | Q8 projection via MMQ. | `=0`/`=1` to A/B MMQ vs. matvec projection. |
 | `LUMEN_CUDA_SHARED_TILED` | ON (only `0/false/no` disables) | kill-switch | Shared-memory tiled path for the MoE shared expert. | `=0` to A/B the untiled shared expert. |
