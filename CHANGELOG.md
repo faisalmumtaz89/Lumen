@@ -7,6 +7,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-08-17
+
+### Changed
+
+- **CUDA decode performance round for the dense GDN models** (Qwen3.8-27B /
+  Qwen3.6-27B; Qwen3.5-9B unaffected and verified byte-identical). The
+  per-token launch chain shrinks on both the GDN and full-attention
+  sections: the GDN prep launches fuse into one kernel, the norm-gate emits
+  its own quantized blocks, the residual add folds into the output
+  projection, the qkv+gate / alpha+beta / attention wq+wk+wv projections
+  each issue as one banked launch off their shared quantized input, the
+  six-launch attention prep chain (deinterleave, per-head norms, RoPE, K/V
+  appends) fuses into one kernel, and the greedy argmax goes two-phase.
+  ≈ +3% decode wall on 27B Q4/Q8. Every route is byte-identical to the
+  v0.6.0 certified baselines (determinism-hash equality at n=50, golden
+  continuity, quality gates on all five validated cells) and each
+  optimization has a documented `=0` kill-switch respecting
+  `LUMEN_CUDA_LEGACY_DEFAULTS` (see `docs/environment-variables.md`).
+- The full-attention sigmoid gate runs in place unconditionally, removing a
+  temp-buffer write and a device copy per full-attention layer.
+
+### Removed
+
+- Experimental probe surface that measured flat or negative (kernel
+  variants, an unreachable dispatch path, and instrumentation hooks whose
+  target kernels no longer run under shipping defaults), after an
+  adversarial two-reviewer evaluation. Implementations remain available
+  under `probe/*` git tags.
+
 ## [0.6.0] — 2026-08-15
 
 ### Added
