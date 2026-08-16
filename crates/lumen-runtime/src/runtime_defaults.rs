@@ -1125,6 +1125,15 @@ pub fn rope_tabled_enabled() -> bool {
     !matches!(std::env::var("LUMEN_CUDA_ROPE_TAB"), Ok(v) if v == "0")
 }
 
+/// `LUMEN_CUDA_ATTN_PREP_FUSE=1` (probe): the six-launch full-attention
+/// prep chain (deinterleave, per-head Q/K norms, NeoX RoPE, K/V cache
+/// appends) issues as ONE kernel. Per-value op sequences cloned verbatim =>
+/// bit-identical; the region is CPU-launch-shadow bound, so the launch count
+/// is the lever. Default OFF.
+pub fn attn_prep_fuse_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_ATTN_PREP_FUSE"), Ok(v) if v == "1")
+}
+
 /// `LUMEN_CUDA_ATTN_BANK3` (default ON; `=0` opts out): full-attention wq/wk/wv issue as ONE
 /// banked launch (virtual row concat via the 4-way kernel with an empty
 /// fourth slot) off their shared Q8_1 input — two launch boundaries removed
@@ -1329,6 +1338,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_GDN_P123_FUSE",
     "LUMEN_CUDA_ATTN_SIG_INPLACE",
     "LUMEN_CUDA_ROPE_TAB",
+    "LUMEN_CUDA_ATTN_PREP_FUSE",
     "LUMEN_CUDA_ATTN_BANK3",
     "LUMEN_CUDA_Q4_V4LOAD",
     "LUMEN_CUDA_Q4_B160",

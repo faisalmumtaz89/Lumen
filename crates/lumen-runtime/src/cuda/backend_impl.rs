@@ -2818,10 +2818,95 @@ impl CudaBackend {
                 }
             }
 
+            // LUMEN_CUDA_ATTN_PREP_FUSE: the whole prep chain below
+            // (deinterleave, Q/K per-head norms, NeoX RoPE, K/V appends) as
+            // ONE launch. The region is CPU-launch-shadow bound, so launch
+            // count is the lever; per-value arithmetic is cloned verbatim.
+            let attn_prep_fused_done = 'block: {
+                if !(crate::runtime_defaults::attn_prep_fuse_enabled()
+                    && has_qgate_fusion
+                    && hp.rope_neox
+                    && st.kernels.attn_prep_fused.is_some()
+                    && lw.attn_q_norm.is_some()
+                    && lw.attn_k_norm.is_some()
+                    && lw.bq.is_none()
+                    && lw.bk.is_none()
+                    && lw.bv.is_none()
+                    && head_dim <= 1024
+                    && head_dim % 32 == 0)
+                {
+                    break 'block false;
+                }
+                let rotary_dim_r = hp.rotary_dim.unwrap_or(0) as usize;
+                let actual_rot = if rotary_dim_r > 0 && rotary_dim_r < head_dim {
+                    rotary_dim_r
+                } else {
+                    head_dim
+                };
+                if actual_rot / 2 > 128 {
+                    break 'block false;
+                }
+                let kv_cache = st.kv_caches.get_mut(layer_idx).ok_or_else(|| {
+                    RuntimeError::Compute(format!("KV cache missing for layer {layer_idx}"))
+                })?;
+                if kv_cache.seq_len() >= kv_cache.max_seq_len {
+                    return Err(RuntimeError::KvCache(format!(
+                        "KV cache full: seq_len={} >= max_seq_len={}",
+                        kv_cache.seq_len(),
+                        kv_cache.max_seq_len,
+                    )));
+                }
+                {
+                    static SHOWN: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("[ATTNPREP] fused prep chain ACTIVE");
+                    }
+                }
+                let fuse_fn = st.kernels.attn_prep_fused.as_ref().unwrap();
+                let pos = kv_cache.seq_len() as u32;
+                let max_seq_u32 = kv_cache.max_seq_len as u32;
+                let nqh = num_heads as u32;
+                let nkvh = num_kv_heads as u32;
+                let hd = head_dim as u32;
+                let rotary_dim_u32 = hp.rotary_dim.unwrap_or(0) as u32;
+                let grid = nqh + 2 * nkvh;
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (hd, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(fuse_fn)
+                        .arg(st.scratch.q_gate.as_ref().unwrap())
+                        .arg(&mut st.scratch.q)
+                        .arg(st.scratch.gate_buf.as_mut().unwrap())
+                        .arg(&mut st.scratch.k)
+                        .arg(&st.scratch.v)
+                        .arg(lw.attn_q_norm.as_ref().unwrap())
+                        .arg(lw.attn_k_norm.as_ref().unwrap())
+                        .arg(&mut kv_cache.k_cache)
+                        .arg(&mut kv_cache.v_cache)
+                        .arg(&pos)
+                        .arg(&max_seq_u32)
+                        .arg(&nqh)
+                        .arg(&nkvh)
+                        .arg(&hd)
+                        .arg(&eps)
+                        .arg(&theta)
+                        .arg(&rotary_dim_u32)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!("attn_prep_fused L{layer_idx}: {e}")))?;
+                true
+            };
+
             // Q+gate fusion post-processing: deinterleave q_gate -> q + gate_buf,
             // then per-head RMSNorm on Q (attn_q_norm) and K (attn_k_norm).
             // Must run AFTER all QKV projection branches and BEFORE RoPE.
-            if has_qgate_fusion {
+            if has_qgate_fusion && !attn_prep_fused_done {
                 let q_gate_buf = st.scratch.q_gate.as_ref().unwrap();
                 let gate_buf = st.scratch.gate_buf.as_mut().unwrap();
 
@@ -2993,7 +3078,7 @@ impl CudaBackend {
             }
 
             // 2. RoPE.
-            {
+            if !attn_prep_fused_done {
                 let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
                 let actual_rot = if rotary_dim > 0 && rotary_dim < head_dim as u32 {
                     rotary_dim as usize
@@ -3052,7 +3137,9 @@ impl CudaBackend {
                 let kv_cache = st.kv_caches.get_mut(layer_idx).ok_or_else(|| {
                     RuntimeError::Compute(format!("no KV cache for layer {layer_idx}"))
                 })?;
-                kv_cache.append_kv(&self.device, &st.scratch.k, &st.scratch.v)?;
+                if !attn_prep_fused_done {
+                    kv_cache.append_kv(&self.device, &st.scratch.k, &st.scratch.v)?;
+                }
             }
 
             // 4. Attention. gate: routes to the tiled streaming-softmax
