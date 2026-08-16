@@ -1477,6 +1477,14 @@ fn gdn_convstate_parity_enabled() -> bool {
 /// is itself true (MoE bf16/Q8), so dense / Q4 / non-parity paths are
 /// unaffected. Set `LUMEN_CUDA_GDN_SKIP_DUP_QKV=0` to force the legacy
 /// double-projection (A/B baseline). Cached: read per-GDN-layer per-token.
+/// One-time positive treatment census for the V4LOAD variant.
+fn v4load_census() {
+    static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[V4LOAD] 128-bit nibble-load locked-Q4 variant ACTIVE");
+    }
+}
+
 /// One-time positive treatment census for the B160 variant.
 fn b160_census() {
     static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -11498,13 +11506,28 @@ unsafe fn launch_matvec_preq8_1_q4_banked(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
+    let v4_ok = crate::runtime_defaults::q4_v4load_enabled() && ((in_dim >> 5) * 2) % 16 == 0;
     let use_b160 = crate::runtime_defaults::q4_b160_enabled()
         && (in_dim >> 5) == 160
         && kernels.matvec_q4_split_q8_1_locked_banked_b160.is_some();
-    let mv_fn = if use_b160 {
+    let mv_fn = if use_b160 && v4_ok && kernels.matvec_q4_split_q8_1_locked_banked_b160_v4.is_some()
+    {
+        b160_census();
+        v4load_census();
+        kernels
+            .matvec_q4_split_q8_1_locked_banked_b160_v4
+            .as_ref()
+            .unwrap()
+    } else if use_b160 {
         b160_census();
         kernels
             .matvec_q4_split_q8_1_locked_banked_b160
+            .as_ref()
+            .unwrap()
+    } else if v4_ok && kernels.matvec_q4_split_q8_1_locked_banked_v4.is_some() {
+        v4load_census();
+        kernels
+            .matvec_q4_split_q8_1_locked_banked_v4
             .as_ref()
             .unwrap()
     } else {
@@ -11657,7 +11680,14 @@ unsafe fn launch_matvec_preq8_1_split(
             // bank but −3 µs/L on FFN gate/up (same nb=160 shape, larger
             // grids) — so it dispatches ONLY from the banked GDN launcher,
             // never here.
-            let mv_fn_opt = if kernels.use_soa_locked {
+            let v4_ok = kernels.use_soa_locked
+                && crate::runtime_defaults::q4_v4load_enabled()
+                && ((in_dim >> 5) * 2) % 16 == 0
+                && kernels.matvec_q4_split_q8_1_locked_v4.is_some();
+            let mv_fn_opt = if v4_ok {
+                v4load_census();
+                kernels.matvec_q4_split_q8_1_locked_v4.as_ref()
+            } else if kernels.use_soa_locked {
                 kernels.matvec_q4_split_q8_1_locked.as_ref()
             } else {
                 kernels.matvec_q4_split_q8_1.as_ref()

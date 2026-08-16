@@ -1117,6 +1117,14 @@ pub fn attn_sigmoid_inplace_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_ATTN_SIG_INPLACE"), Ok(v) if v == "1")
 }
 
+/// `LUMEN_CUDA_Q4_V4LOAD=1` (probe): locked-Q4 matvecs load the nibble
+/// stream as one 128-bit uint4 instead of four u32 words (alignment-guarded
+/// at dispatch). Integer loads are exact => bit-identical; gate-verified.
+/// Default OFF.
+pub fn q4_v4load_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_Q4_V4LOAD"), Ok(v) if v == "1")
+}
+
 /// `LUMEN_CUDA_Q4_B160` (default ON; `=0` opts out): route the GDN banked
 /// nb=160 launch through the 160-thread compile variant — every lane productive in
 /// the K-loop instead of 160/256, ~+50% load-issuing lanes at full
@@ -1302,6 +1310,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_GDN_NG_Q8",
     "LUMEN_CUDA_GDN_P123_FUSE",
     "LUMEN_CUDA_ATTN_SIG_INPLACE",
+    "LUMEN_CUDA_Q4_V4LOAD",
     "LUMEN_CUDA_Q4_B160",
     "LUMEN_CUDA_Q8_AB_BANK",
     "LUMEN_CUDA_Q4_AB_BANK",

@@ -208,8 +208,23 @@ __device__ __forceinline__ void matvec_q4_split_body(
             wsb[row] = *(const unsigned short*)(row_base + scale_off);
             const unsigned int* w_nibbles =
                 (const unsigned int*)(row_base + nibble_off);
+#ifdef LUMEN_Q4_V4LOAD
+            // 128-bit load variant (compile-time define, absent by default):
+            // one uint4 transaction replaces four u32 loads. Host guarantees
+            // 16-byte alignment (2*nb % 16 == 0 for the dispatched shapes;
+            // base is cudaMalloc-256-aligned). Integer loads are exact — the
+            // unpacked words and everything downstream are bit-identical.
+            {
+                const uint4 wv4 = *(const uint4*)w_nibbles;
+                wpk[row][0] = wv4.x;
+                wpk[row][1] = wv4.y;
+                wpk[row][2] = wv4.z;
+                wpk[row][3] = wv4.w;
+            }
+#else
             #pragma unroll
             for (int k = 0; k < 4; k++) wpk[row][k] = w_nibbles[k];
+#endif
         }
 
         // ---- PHASE B: locked accumulate, rows 0..NR-1 in the SAME order, with
