@@ -1152,6 +1152,14 @@ pub fn q4_v4load_enabled() -> bool {
     !matches!(std::env::var("LUMEN_CUDA_Q4_V4LOAD"), Ok(v) if v == "0")
 }
 
+/// `LUMEN_CUDA_Q4_NR2_DOWN=1` (probe): dispatch the NR=2 locked-Q4 compile
+/// variant for the long-K FFN-down signature only (out 5120, in 17408).
+/// Same per-row block ownership, DP4A order and pinned reduction =>
+/// bit-identical. Default OFF.
+pub fn q4_nr2_down_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_Q4_NR2_DOWN"), Ok(v) if v == "1")
+}
+
 /// `LUMEN_CUDA_Q4_B160` (default ON; `=0` opts out): route the GDN banked
 /// nb=160 launch through the 160-thread compile variant — every lane productive in
 /// the K-loop instead of 160/256, ~+50% load-issuing lanes at full
@@ -1341,6 +1349,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_ATTN_PREP_FUSE",
     "LUMEN_CUDA_ATTN_BANK3",
     "LUMEN_CUDA_Q4_V4LOAD",
+    "LUMEN_CUDA_Q4_NR2_DOWN",
     "LUMEN_CUDA_Q4_B160",
     "LUMEN_CUDA_Q8_AB_BANK",
     "LUMEN_CUDA_Q4_AB_BANK",

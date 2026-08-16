@@ -1477,6 +1477,14 @@ fn gdn_convstate_parity_enabled() -> bool {
 /// is itself true (MoE bf16/Q8), so dense / Q4 / non-parity paths are
 /// unaffected. Set `LUMEN_CUDA_GDN_SKIP_DUP_QKV=0` to force the legacy
 /// double-projection (A/B baseline). Cached: read per-GDN-layer per-token.
+/// One-time positive treatment census for the NR2 long-K variant.
+fn nr2_census() {
+    static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[NR2] NR=2 locked-Q4 long-K variant ACTIVE");
+    }
+}
+
 /// One-time positive treatment census for the tabled-RoPE variant.
 fn rope_tab_census() {
     static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -11839,7 +11847,19 @@ unsafe fn launch_matvec_preq8_1_split(
             // V4LOAD note: like B160, the 128-bit-load variant gains ~1 tick
             // on the GDN bank but loses 3-4 µs/L on FFN gate/up — it therefore
             // dispatches ONLY from the banked GDN launcher, never here.
-            let mv_fn_opt = if kernels.use_soa_locked {
+            //
+            // NR2 (LUMEN_CUDA_Q4_NR2_DOWN): long-K rows (in >= 2*out, i.e. the
+            // FFN down signature) run the NR=2 compile of the SAME locked
+            // source — fewer registers, higher occupancy; short-K shapes keep
+            // NR4. Per-row ownership/order unchanged => bit-identical.
+            let use_nr2 = kernels.use_soa_locked
+                && crate::runtime_defaults::q4_nr2_down_enabled()
+                && in_dim >= 2 * out_dim
+                && kernels.matvec_q4_split_q8_1_locked_nr2.is_some();
+            let mv_fn_opt = if use_nr2 {
+                nr2_census();
+                kernels.matvec_q4_split_q8_1_locked_nr2.as_ref()
+            } else if kernels.use_soa_locked {
                 kernels.matvec_q4_split_q8_1_locked.as_ref()
             } else {
                 kernels.matvec_q4_split_q8_1.as_ref()
@@ -11847,7 +11867,11 @@ unsafe fn launch_matvec_preq8_1_split(
             if let Some(mv_fn) = mv_fn_opt {
                 let out_dim_u32 = out_dim as u32;
                 let in_dim_u32 = in_dim as u32;
-                let mv_grid = dp4a_q4_grid(out_dim_u32);
+                let mv_grid = if use_nr2 {
+                    (out_dim_u32 + 1) / 2
+                } else {
+                    dp4a_q4_grid(out_dim_u32)
+                };
                 let mv_cfg = CudarcLaunchConfig {
                     grid_dim: (mv_grid, 1, 1),
                     block_dim: (DP4A_Q4_BLOCK_DIM, 1, 1),

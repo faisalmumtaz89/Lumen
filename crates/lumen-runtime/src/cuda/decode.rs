@@ -507,6 +507,12 @@ pub(crate) struct KernelSet {
     /// 160/256. Same source, THREADS_PER_BLOCK redefined; the dropped warps
     /// only ever folded exact +0.0 partials, so output is bit-identical
     /// (byte-gate enforced).
+    /// NR=2 compile variant for the long-K FFN-down shape (out 5120, in
+    /// 17408): fewer registers, higher occupancy; measured ~6% kernel win on
+    /// long-K rows while hurting short-K shapes — dispatched by signature
+    /// only. Same per-row ownership/order => bit-identical.
+    pub(crate) matvec_q4_split_q8_1_locked_nr2: Option<CudaFunction>,
+    pub(crate) matvec_q4_split_q8_1_locked_nr2_residual: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_locked_b160: Option<CudaFunction>,
     /// 128-bit-load compile variants (LUMEN_Q4_V4LOAD define prepended):
     /// one uint4 transaction replaces four u32 nibble loads. Integer loads
@@ -1940,6 +1946,18 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 )
             ),
             "matvec_q4_split_q8_1_locked_banked",
+        )
+        .ok(),
+        matvec_q4_split_q8_1_locked_nr2: load_fn_sm80_fast_math(
+            &shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE
+                .replace("#define NR       4", "#define NR       2"),
+            "matvec_q4_split_q8_1_locked",
+        )
+        .ok(),
+        matvec_q4_split_q8_1_locked_nr2_residual: load_fn_sm80_fast_math(
+            &shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE
+                .replace("#define NR       4", "#define NR       2"),
+            "matvec_q4_split_q8_1_locked_residual",
         )
         .ok(),
         matvec_q4_split_q8_1_locked_b160: load_fn_sm80_fast_math(
