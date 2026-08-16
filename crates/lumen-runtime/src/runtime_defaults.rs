@@ -1067,20 +1067,23 @@ pub fn q8_split_default() -> bool {
     }
 }
 
-/// `LUMEN_CUDA_Q4_SPLIT_ATTN=1`: extend the Q4 split-clone pass beyond the
-/// dense FFN set to the non-residual attention/GDN projections (GDN fused
-/// QKV + gate, full-attention Wq/Wk/Wv). The dispatch sites already prefer a
-/// split sibling when present and run the codegen-locked kernel, so the flag
-/// only widens which weights receive siblings. Default OFF.
+/// `LUMEN_CUDA_Q4_SPLIT_ATTN` (default ON): extend the Q4 split-clone pass
+/// beyond the dense FFN set to the non-residual attention/GDN projections
+/// (GDN fused QKV + gate, full-attention Wq/Wk/Wv). The dispatch sites
+/// already prefer a split sibling when present and run the codegen-locked
+/// kernel — output is byte-identical to the AoS route — so the setting only
+/// widens which weights receive siblings. The clone pass itself skips
+/// narrow-GDN configs (v_heads == 32) whose F32-activation dispatch cannot
+/// consume the siblings. `=0` opts out.
 pub fn q4_split_attn_enabled() -> bool {
-    matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_ATTN"), Ok(v) if v == "1")
+    !matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_ATTN"), Ok(v) if v == "0")
 }
 
-/// `LUMEN_CUDA_Q8_SPLIT_SSMOUT=1`: clone the GDN `ssm_out` Q8 weight into its
-/// per-row split sibling and dispatch it through the Q8 split family instead
-/// of the raw-layout dp4a route. Default OFF.
+/// `LUMEN_CUDA_Q8_SPLIT_SSMOUT` (default ON): clone the GDN `ssm_out` Q8
+/// weight into its per-row split sibling and dispatch it through the Q8
+/// split family instead of the raw-layout route. `=0` opts out.
 pub fn q8_split_ssmout_enabled() -> bool {
-    matches!(std::env::var("LUMEN_CUDA_Q8_SPLIT_SSMOUT"), Ok(v) if v == "1")
+    !matches!(std::env::var("LUMEN_CUDA_Q8_SPLIT_SSMOUT"), Ok(v) if v == "0")
 }
 
 /// `LUMEN_CUDA_Q4_SPLIT_WO=1` (probe): clone the full-attention `wo` into its
