@@ -1110,6 +1110,15 @@ pub fn gdn_p123_fuse_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_GDN_P123_FUSE"), Ok(v) if v == "1")
 }
 
+/// `LUMEN_CUDA_Q4_PROJ_PAIR=1` (probe): TRUE paired banking — the first
+/// ceil(gate_rows/NR) CTAs of the qkv grid also compute the gate rows off a
+/// single per-block Q8_1 input load. Per-row math and accumulation order are
+/// the locked kernel's verbatim => bit-identical. Takes precedence over
+/// LUMEN_CUDA_Q4_PROJ_BANK when both are set. Default OFF.
+pub fn q4_proj_pair_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_Q4_PROJ_PAIR"), Ok(v) if v == "1")
+}
+
 /// `LUMEN_CUDA_Q4_PROJ_BANK=1` (probe): bank the GDN qkv + gate Q4 split
 /// matvecs into ONE launch of `matvec_q4_split_q8_1_locked_banked` (both read
 /// the same pre-quantized Q8_1 input; per-row math untouched, so output is
@@ -1251,6 +1260,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_Q4_SPLIT_ATTN",
     "LUMEN_CUDA_GDN_NG_Q8",
     "LUMEN_CUDA_GDN_P123_FUSE",
+    "LUMEN_CUDA_Q4_PROJ_PAIR",
     "LUMEN_CUDA_Q4_PROJ_BANK",
     "LUMEN_CUDA_SLACK_L2QK_CYCLES",
     "LUMEN_CUDA_SLACK_NORMGATE_CYCLES",
