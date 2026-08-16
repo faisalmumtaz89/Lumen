@@ -496,6 +496,7 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q4_split_q8_1_locked_residual: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_locked_banked: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_locked_paired: Option<CudaFunction>,
+    pub(crate) matvec_q4_split_q8_1_locked_bank4: Option<CudaFunction>,
 
     // llama mmvq port on the Q4 split layout (`LUMEN_CUDA_Q8_MMVQ`, default-OFF;
     // shares the Q8 mmvq flag). 2-lane VDR striping + one-row/CTA + lane-
@@ -1863,6 +1864,19 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] matvec_q4_split_q8_1_locked_residual: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_split_q8_1_locked_bank4: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE,
+            "matvec_q4_split_q8_1_locked_bank4",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_locked_bank4: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_split_q8_1_locked_bank4: FAILED: {e}");
                 None
             }
         },

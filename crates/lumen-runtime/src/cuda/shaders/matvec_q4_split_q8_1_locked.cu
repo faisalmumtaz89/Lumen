@@ -413,3 +413,49 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_spl
         reduce_and_store_locked(out_b_ptr, sumf_b, r0, out_b, warp_id, lane, 0);
     }
 }
+
+
+// Four-way banked variant: one launch covers qkv, gate, alpha, beta rows —
+// all against the SAME pre-quantized Q8_1 input. Same virtual-row-concat
+// construction as the two-way banked kernel (block-uniform select, untouched
+// per-row body) => bit-identical outputs; removes three launch boundaries
+// and lets the tiny alpha/beta grids (12 CTAs each at out_dim 48) ride the
+// tail of the large grids instead of paying two standalone ramp/drains.
+extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_split_q8_1_locked_bank4(
+    const char* __restrict__ weight_a,
+    const char* __restrict__ weight_b,
+    const char* __restrict__ weight_c,
+    const char* __restrict__ weight_d,
+    const char* __restrict__ input_q8_1,
+    float* __restrict__ out_a_ptr,
+    float* __restrict__ out_b_ptr,
+    float* __restrict__ out_c_ptr,
+    float* __restrict__ out_d_ptr,
+    unsigned int out_a,
+    unsigned int out_b,
+    unsigned int out_c,
+    unsigned int out_d,
+    unsigned int in_dim)
+{
+    const unsigned int nr = (unsigned int)NR;
+    unsigned int grid_a = (out_a + nr - 1u) / nr;
+    unsigned int grid_b = (out_b + nr - 1u) / nr;
+    unsigned int grid_c = (out_c + nr - 1u) / nr;
+    unsigned int vb = blockIdx.x;
+    if (vb < grid_a) {
+        matvec_q4_split_body(weight_a, input_q8_1, out_a_ptr, out_a, in_dim, 0, vb);
+        return;
+    }
+    vb -= grid_a;
+    if (vb < grid_b) {
+        matvec_q4_split_body(weight_b, input_q8_1, out_b_ptr, out_b, in_dim, 0, vb);
+        return;
+    }
+    vb -= grid_b;
+    if (vb < grid_c) {
+        matvec_q4_split_body(weight_c, input_q8_1, out_c_ptr, out_c, in_dim, 0, vb);
+        return;
+    }
+    vb -= grid_c;
+    matvec_q4_split_body(weight_d, input_q8_1, out_d_ptr, out_d, in_dim, 0, vb);
+}
