@@ -2900,6 +2900,11 @@ impl CudaBackend {
                         .launch(launch_cfg)
                 }
                 .map_err(|e| RuntimeError::Compute(format!("attn_prep_fused L{layer_idx}: {e}")))?;
+                // The fused kernel replaced append_kv, which also advances the
+                // cache's seq_len (attention below must cover the token just
+                // appended at `pos`). Advance it here or the current token
+                // never attends to itself.
+                kv_cache.advance_seq_len_by(1);
                 true
             };
 
