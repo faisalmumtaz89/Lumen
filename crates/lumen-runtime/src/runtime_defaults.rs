@@ -1117,12 +1117,13 @@ pub fn attn_sigmoid_inplace_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_ATTN_SIG_INPLACE"), Ok(v) if v == "1")
 }
 
-/// `LUMEN_CUDA_Q4_V4LOAD=1` (probe): locked-Q4 matvecs load the nibble
+/// `LUMEN_CUDA_Q4_V4LOAD` (default ON, GDN-bank-scoped; `=0` opts out):
+/// the banked GDN launch loads the nibble
 /// stream as one 128-bit uint4 instead of four u32 words (alignment-guarded
 /// at dispatch). Integer loads are exact => bit-identical; gate-verified.
 /// Default OFF.
 pub fn q4_v4load_enabled() -> bool {
-    matches!(std::env::var("LUMEN_CUDA_Q4_V4LOAD"), Ok(v) if v == "1")
+    !matches!(std::env::var("LUMEN_CUDA_Q4_V4LOAD"), Ok(v) if v == "0")
 }
 
 /// `LUMEN_CUDA_Q4_B160` (default ON; `=0` opts out): route the GDN banked

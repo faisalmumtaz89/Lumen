@@ -11680,14 +11680,10 @@ unsafe fn launch_matvec_preq8_1_split(
             // bank but −3 µs/L on FFN gate/up (same nb=160 shape, larger
             // grids) — so it dispatches ONLY from the banked GDN launcher,
             // never here.
-            let v4_ok = kernels.use_soa_locked
-                && crate::runtime_defaults::q4_v4load_enabled()
-                && ((in_dim >> 5) * 2) % 16 == 0
-                && kernels.matvec_q4_split_q8_1_locked_v4.is_some();
-            let mv_fn_opt = if v4_ok {
-                v4load_census();
-                kernels.matvec_q4_split_q8_1_locked_v4.as_ref()
-            } else if kernels.use_soa_locked {
+            // V4LOAD note: like B160, the 128-bit-load variant gains ~1 tick
+            // on the GDN bank but loses 3-4 µs/L on FFN gate/up — it therefore
+            // dispatches ONLY from the banked GDN launcher, never here.
+            let mv_fn_opt = if kernels.use_soa_locked {
                 kernels.matvec_q4_split_q8_1_locked.as_ref()
             } else {
                 kernels.matvec_q4_split_q8_1.as_ref()
