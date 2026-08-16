@@ -80,3 +80,111 @@ extern "C" __global__ void argmax_f32(
         }
     }
 }
+
+// ============================================================================
+// Tiled two-phase argmax (LUMEN_CUDA_ARGMAX_TILED=1, default-OFF).
+//
+// The single-block kernel above reads the whole logits vector (vocab 248320 =
+// ~1 MB) from ONE SM — single-SM read bandwidth, ~128 us in-bracket on A100.
+// Phase 1 spreads the read across NUM_TILES blocks (whole-GPU bandwidth);
+// phase 2 reduces the NUM_TILES (val, idx) partials in one tiny block.
+//
+// SEMANTICS IDENTICAL to argmax_f32 (CORR-011): the reduction operator is
+// "max value, then min index", associative + commutative, so the tiled
+// grouping produces the SAME (max, min-index) pair — output byte-identical.
+// NaN never selected (same comparators). Each phase-1 block scans a
+// CONTIGUOUS tile with the same strict-> strided loop, so per-thread lowest-
+// index behavior is preserved within tiles; cross-tile ties resolve by
+// other_idx < best_idx exactly as the warp reduction does.
+// ============================================================================
+
+extern "C" __global__ void argmax_f32_tile_phase1(
+    const float* __restrict__ data,
+    float* __restrict__ partial_val,      // [gridDim.x]
+    unsigned int* __restrict__ partial_idx, // [gridDim.x]
+    unsigned int n)
+{
+    __shared__ float s_val[32];
+    __shared__ unsigned int s_idx[32];
+
+    // Contiguous tile per block: [tile_lo, tile_hi)
+    unsigned int tile = (n + gridDim.x - 1) / gridDim.x;
+    unsigned int lo = blockIdx.x * tile;
+    unsigned int hi = lo + tile < n ? lo + tile : n;
+
+    float best_val = -3.402823466e+38f;
+    unsigned int best_idx = 0;
+
+    for (unsigned int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+        float v = data[i];
+        if (v > best_val) {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other_val = __shfl_xor_sync(0xffffffff, best_val, offset);
+        unsigned int other_idx = __shfl_xor_sync(0xffffffff, best_idx, offset);
+        if (other_val > best_val || (other_val == best_val && other_idx < best_idx)) {
+            best_val = other_val;
+            best_idx = other_idx;
+        }
+    }
+
+    unsigned int lane = threadIdx.x & 31;
+    unsigned int warp_id = threadIdx.x >> 5;
+    if (lane == 0) {
+        s_val[warp_id] = best_val;
+        s_idx[warp_id] = best_idx;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        unsigned int num_warps = blockDim.x >> 5;
+        best_val = (lane < num_warps) ? s_val[lane] : -3.402823466e+38f;
+        best_idx = (lane < num_warps) ? s_idx[lane] : 0;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_val = __shfl_xor_sync(0xffffffff, best_val, offset);
+            unsigned int other_idx = __shfl_xor_sync(0xffffffff, best_idx, offset);
+            if (other_val > best_val || (other_val == best_val && other_idx < best_idx)) {
+                best_val = other_val;
+                best_idx = other_idx;
+            }
+        }
+        if (lane == 0) {
+            partial_val[blockIdx.x] = best_val;
+            partial_idx[blockIdx.x] = best_idx;
+        }
+    }
+}
+
+// Phase 2: one warp reduces the partials. num_partials <= 128.
+extern "C" __global__ void argmax_f32_tile_phase2(
+    const float* __restrict__ partial_val,
+    const unsigned int* __restrict__ partial_idx,
+    unsigned int* __restrict__ result,
+    unsigned int num_partials)
+{
+    float best_val = -3.402823466e+38f;
+    unsigned int best_idx = 0;
+    for (unsigned int i = threadIdx.x; i < num_partials; i += 32) {
+        float v = partial_val[i];
+        unsigned int idx = partial_idx[i];
+        if (v > best_val || (v == best_val && idx < best_idx)) {
+            best_val = v;
+            best_idx = idx;
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other_val = __shfl_xor_sync(0xffffffff, best_val, offset);
+        unsigned int other_idx = __shfl_xor_sync(0xffffffff, best_idx, offset);
+        if (other_val > best_val || (other_val == best_val && other_idx < best_idx)) {
+            best_val = other_val;
+            best_idx = other_idx;
+        }
+    }
+    if (threadIdx.x == 0) {
+        result[0] = best_idx;
+    }
+}

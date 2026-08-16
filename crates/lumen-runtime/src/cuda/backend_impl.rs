@@ -114,6 +114,26 @@ fn bf16_autotune_enabled() -> bool {
     })
 }
 
+/// Tiled-argmax phase-1 tile count. 128 blocks over vocab 248320 = ~1940
+/// elements/block — spreads the ~1 MB logits read across the whole GPU
+/// instead of one SM. Output byte-identical (associative max-then-min-index).
+const ARGMAX_TILES: usize = 128;
+
+/// DEFAULT-OFF candidate (`LUMEN_CUDA_ARGMAX_TILED=1`): two-phase tiled argmax
+/// replacing the single-block reduction (one SM reading ~1 MB ≈ 128 µs
+/// in-bracket). Same reduction operator, same tie semantics (CORR-011),
+/// byte-identical output by construction.
+fn argmax_tiled_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let on = parse_env_truthy("LUMEN_CUDA_ARGMAX_TILED").unwrap_or(false);
+        if on {
+            eprintln!("[ARGMAX] TILED=ON: two-phase {ARGMAX_TILES}-tile reduction");
+        }
+        on
+    })
+}
 /// Env-gate for the custom bandwidth-optimal BF16 decode GEMV kernel
 /// (`matvec_bf16_v4`). DEFAULT-OFF: unset / `0` keeps the cuBLAS `GemmEx`
 /// batch-1 GEMV path byte-identical. When set (`1|true|yes|on`), every eligible
@@ -849,6 +869,10 @@ struct MutableState {
     /// Per-stage decode timing (`LUMEN_CUDA_PROFILE=1`; `None` otherwise —
     /// begin/end short-circuit to one Option check on the default path).
     profiler: Option<super::profiler::StageProfiler>,
+    /// Tiled-argmax phase-1 partials (LUMEN_CUDA_ARGMAX_TILED=1): [ARGMAX_TILES]
+    /// (val, idx) pairs. Always allocated (1 KB) so the flag needs no realloc.
+    argmax_partial_val: CudaSlice<f32>,
+    argmax_partial_idx: CudaSlice<u32>,
     /// Whether the model has any GDN layers.
     has_gdn_layers: bool,
     /// Whether the model has Q+gate fusion layers (disables graph capture).
@@ -8354,6 +8378,73 @@ impl CudaBackend {
     ///
     /// Input: `st.scratch.x_gpu` (final hidden state, [hidden_dim]).
     /// Output: `st.logits_gpu` (logits, [vocab_size]).
+    /// GPU argmax into `st.argmax_result`. Tiled two-phase when
+    /// `LUMEN_CUDA_ARGMAX_TILED=1` and both tile kernels loaded; else the
+    /// single-block kernel. Outputs are byte-identical (see argmax.cu) — the
+    /// reduction operator (max value, then min index) is associative and
+    /// commutative, so tiling changes grouping, never the result.
+    fn launch_argmax(&self, st: &mut MutableState, vocab: u32) -> Result<(), RuntimeError> {
+        if argmax_tiled_enabled() {
+            if let (Some(p1), Some(p2)) = (
+                st.kernels.argmax_f32_tile_phase1.clone(),
+                st.kernels.argmax_f32_tile_phase2.clone(),
+            ) {
+                let tiles = ARGMAX_TILES as u32;
+                let cfg1 = CudarcLaunchConfig {
+                    grid_dim: (tiles, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let cfg2 = CudarcLaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(&p1)
+                        .arg(&st.logits_gpu)
+                        .arg(&mut st.argmax_partial_val)
+                        .arg(&mut st.argmax_partial_idx)
+                        .arg(&vocab)
+                        .launch(cfg1)
+                        .and_then(|_| {
+                            self.device
+                                .stream
+                                .launch_builder(&p2)
+                                .arg(&st.argmax_partial_val)
+                                .arg(&st.argmax_partial_idx)
+                                .arg(&mut st.argmax_result)
+                                .arg(&tiles)
+                                .launch(cfg2)
+                        })
+                }
+                .map(|_| ())
+                .map_err(|e| RuntimeError::Compute(format!("tiled argmax launch: {e}")))?;
+                return Ok(());
+            }
+            // Kernels failed to load: fall through to the single-block path
+            // (logged at load time) rather than erroring the decode.
+        }
+        let launch_cfg = CudarcLaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.device
+                .stream
+                .launch_builder(&st.kernels.argmax_f32)
+                .arg(&st.logits_gpu)
+                .arg(&mut st.argmax_result)
+                .arg(&vocab)
+                .launch(launch_cfg)
+        }
+        .map(|_| ())
+        .map_err(|e| RuntimeError::Compute(format!("argmax launch: {e}")))
+    }
+
     fn compute_final_gpu(&self, st: &mut MutableState) -> Result<(), RuntimeError> {
         let hp = self.hp()?;
         let hidden_dim = hp.hidden_dim as usize;
@@ -9237,21 +9328,7 @@ impl CudaBackend {
         self.compute_final_gpu(st)?;
         {
             let vocab = hp.vocab_size;
-            let launch_cfg = CudarcLaunchConfig {
-                grid_dim: (1, 1, 1),
-                block_dim: (1024, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(&st.kernels.argmax_f32)
-                    .arg(&st.logits_gpu)
-                    .arg(&mut st.argmax_result)
-                    .arg(&vocab)
-                    .launch(launch_cfg)
-            }
-            .map_err(|e| RuntimeError::Compute(format!("argmax launch: {e}")))?;
+            self.launch_argmax(st, vocab)?;
         }
         // Full real-logits readback (see `decode_token` for the full
         // rationale). Was a one-hot synthesis that destroyed the
@@ -9364,21 +9441,7 @@ impl CudaBackend {
         self.compute_final_gpu(st)?;
         {
             let vocab = hp.vocab_size;
-            let launch_cfg = CudarcLaunchConfig {
-                grid_dim: (1, 1, 1),
-                block_dim: (1024, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(&st.kernels.argmax_f32)
-                    .arg(&st.logits_gpu)
-                    .arg(&mut st.argmax_result)
-                    .arg(&vocab)
-                    .launch(launch_cfg)
-            }
-            .map_err(|e| RuntimeError::Compute(format!("argmax launch: {e}")))?;
+            self.launch_argmax(st, vocab)?;
         }
         // Sync is still required to make the argmax index host-visible, but we
         // copy back only the single u32 the kernel wrote -- NOT the full vocab.
@@ -14450,6 +14513,8 @@ impl ComputeBackend for CudaBackend {
             layer_weights_cache: Vec::new(),
             logits_gpu,
             argmax_result: self.device.alloc_zeros::<u32>(1)?,
+            argmax_partial_val: self.device.alloc_zeros::<f32>(ARGMAX_TILES)?,
+            argmax_partial_idx: self.device.alloc_zeros::<u32>(ARGMAX_TILES)?,
             has_gdn_layers: false,
             has_qgate_layers: false,
             has_moe_layers: false,
