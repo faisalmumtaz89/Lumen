@@ -1094,6 +1094,14 @@ pub fn q4_split_wo_probe_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_WO"), Ok(v) if v == "1")
 }
 
+/// `LUMEN_CUDA_Q4_PROJ_BANK=1` (probe): bank the GDN qkv + gate Q4 split
+/// matvecs into ONE launch of `matvec_q4_split_q8_1_locked_banked` (both read
+/// the same pre-quantized Q8_1 input; per-row math untouched, so output is
+/// bit-identical to the two-launch route). Default OFF.
+pub fn q4_proj_bank_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_Q4_PROJ_BANK"), Ok(v) if v == "1")
+}
+
 /// `LUMEN_CUDA_SSMOUT_RESID_FOLD=1`: when the ssm_out split route is active,
 /// dispatch its residual variant so the projection writes `attn_proj = W*x +
 /// x_gpu` directly and the per-layer residual_add_copy launch is skipped.
@@ -1225,6 +1233,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_PTX_CACHE_DIR",
     "LUMEN_CUDA_Q4_SPLIT",
     "LUMEN_CUDA_Q4_SPLIT_ATTN",
+    "LUMEN_CUDA_Q4_PROJ_BANK",
     "LUMEN_CUDA_Q4_SPLIT_WO",
     "LUMEN_CUDA_SSMOUT_RESID_FOLD",
     "LUMEN_CUDA_Q8_SPLIT_SSMOUT",

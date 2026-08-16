@@ -153,9 +153,10 @@ __device__ __forceinline__ void matvec_q4_split_body(
     float* __restrict__ out,
     unsigned int out_dim,
     unsigned int in_dim,
-    const float* __restrict__ residual)
+    const float* __restrict__ residual,
+    unsigned int vblock)
 {
-    unsigned int r0 = blockIdx.x * NR;
+    unsigned int r0 = vblock * NR;
     unsigned int warp_id = threadIdx.x / NW;
     unsigned int lane    = threadIdx.x % NW;
 
@@ -240,7 +241,7 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_spl
     unsigned int out_dim,
     unsigned int in_dim)
 {
-    matvec_q4_split_body(weight_q4_split, input_q8_1, out, out_dim, in_dim, 0);
+    matvec_q4_split_body(weight_q4_split, input_q8_1, out, out_dim, in_dim, 0, blockIdx.x);
 }
 
 extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_split_q8_1_locked_residual(
@@ -251,5 +252,30 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_spl
     unsigned int out_dim,
     unsigned int in_dim)
 {
-    matvec_q4_split_body(weight_q4_split, input_q8_1, out, out_dim, in_dim, residual);
+    matvec_q4_split_body(weight_q4_split, input_q8_1, out, out_dim, in_dim, residual, blockIdx.x);
+}
+
+// Banked two-weight variant: ONE launch covers weight A's rows then weight B's
+// rows, both against the SAME pre-quantized Q8_1 input. Removes a launch and
+// lets B's CTAs fill the tail of A's final wave. The block-level pointer/index
+// select is uniform per CTA and the per-row body (locked epilogue, locked
+// reductions, fixed block visitation) is untouched, so each output element is
+// bit-identical to the two-launch route.
+extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_split_q8_1_locked_banked(
+    const char* __restrict__ weight_a,
+    const char* __restrict__ weight_b,
+    const char* __restrict__ input_q8_1,
+    float* __restrict__ out_a_ptr,
+    float* __restrict__ out_b_ptr,
+    unsigned int out_a,
+    unsigned int out_b,
+    unsigned int in_dim)
+{
+    unsigned int grid_a = (out_a + (unsigned int)NR - 1u) / (unsigned int)NR;
+    if (blockIdx.x < grid_a) {
+        matvec_q4_split_body(weight_a, input_q8_1, out_a_ptr, out_a, in_dim, 0, blockIdx.x);
+    } else {
+        matvec_q4_split_body(weight_b, input_q8_1, out_b_ptr, out_b, in_dim, 0,
+                             blockIdx.x - grid_a);
+    }
 }

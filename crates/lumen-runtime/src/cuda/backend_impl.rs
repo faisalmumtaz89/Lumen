@@ -1453,6 +1453,11 @@ fn gdn_convstate_parity_enabled() -> bool {
 /// is itself true (MoE bf16/Q8), so dense / Q4 / non-parity paths are
 /// unaffected. Set `LUMEN_CUDA_GDN_SKIP_DUP_QKV=0` to force the legacy
 /// double-projection (A/B baseline). Cached: read per-GDN-layer per-token.
+#[inline]
+fn lumen_runtime_defaults_q4_proj_bank() -> bool {
+    crate::runtime_defaults::q4_proj_bank_enabled()
+}
+
 fn gdn_skip_dup_qkv_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| parse_env_truthy("LUMEN_CUDA_GDN_SKIP_DUP_QKV").unwrap_or(true))
@@ -5070,7 +5075,41 @@ impl CudaBackend {
             // split-layout: prefer Q8/Q4 split siblings for the fused QKV weight.
             // Skipped when the parity reprojection below overwrites qkv_buf
             // (dead work: nothing consumes this result before the overwrite).
-            if !gdn_skip_dup_qkv {
+            //
+            // LUMEN_CUDA_Q4_PROJ_BANK: when both qkv and gate have Q4 split
+            // siblings and the locked Q4 route is the one each would take
+            // anyway (no Q8 sibling, no mmvq override), issue BOTH projections
+            // as one banked launch here and skip the separate gate launch
+            // below. Per-row math is untouched => bit-identical output.
+            let qkv_gate_banked = !gdn_skip_dup_qkv
+                && lumen_runtime_defaults_q4_proj_bank()
+                && st.kernels.use_q4_split_dispatch
+                && st.kernels.use_soa_locked
+                && !st.kernels.use_mmvq_q4
+                && st.kernels.matvec_q4_split_q8_1_locked_banked.is_some()
+                && lw.q8_split_wq.is_none()
+                && lw.q4_split_wq.is_some()
+                && lw.q4_split_attn_gate.is_some();
+            if qkv_gate_banked {
+                let (qkv_out, gate_out) = (&mut gdn.qkv_buf, &mut gdn.gate_buf);
+                let wq_split = lw.q4_split_wq.as_ref().unwrap();
+                let gate_split = lw.q4_split_attn_gate.as_ref().unwrap();
+                unsafe {
+                    launch_matvec_preq8_1_q4_banked(
+                        &self.device,
+                        &st.kernels,
+                        wq_split,
+                        gate_split,
+                        q8_1_buf,
+                        qkv_out,
+                        gate_out,
+                        p.qkv_dim,
+                        p.value_dim,
+                        hidden_dim,
+                        "gdn_qkv_gate_bank",
+                    )?;
+                }
+            } else if !gdn_skip_dup_qkv {
                 unsafe {
                     launch_matvec_preq8_1_split(
                         &self.device,
@@ -5161,20 +5200,23 @@ impl CudaBackend {
                 }
             }
 
-            // Gate matvec with shared pre-quantized input.
-            unsafe {
-                launch_matvec_preq8_1_split(
-                    &self.device,
-                    &st.kernels,
-                    attn_gate_w,
-                    None,
-                    lw.q4_split_attn_gate.as_ref(),
-                    q8_1_buf,
-                    &mut gdn.gate_buf,
-                    p.value_dim,
-                    hidden_dim,
-                    "gdn_gate",
-                )?;
+            // Gate matvec with shared pre-quantized input (already issued by
+            // the banked qkv+gate launch when that route was taken above).
+            if !qkv_gate_banked {
+                unsafe {
+                    launch_matvec_preq8_1_split(
+                        &self.device,
+                        &st.kernels,
+                        attn_gate_w,
+                        None,
+                        lw.q4_split_attn_gate.as_ref(),
+                        q8_1_buf,
+                        &mut gdn.gate_buf,
+                        p.value_dim,
+                        hidden_dim,
+                        "gdn_gate",
+                    )?;
+                }
             }
         } else {
             // === UNFUSED: separate RMSNorm + per-matvec quantize ===
@@ -11029,6 +11071,54 @@ unsafe fn launch_matvec_preq8_1_residual(
 /// count to the base weight.
 #[allow(clippy::too_many_arguments)]
 #[inline]
+/// Banked Q4 split matvec: ONE launch computes weight A's rows then weight
+/// B's rows against the same pre-quantized Q8_1 input (locked kernel family;
+/// per-row math identical to the two-launch route => bit-identical output).
+/// Caller guarantees both Q4 split siblings exist and the locked Q4 route is
+/// the one the two individual launches would have taken.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_matvec_preq8_1_q4_banked(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    w_a: &CudaSlice<u8>,
+    w_b: &CudaSlice<u8>,
+    q8_1_buf: &CudaSlice<u8>,
+    out_a: &mut CudaSlice<f32>,
+    out_b: &mut CudaSlice<f32>,
+    out_a_dim: usize,
+    out_b_dim: usize,
+    in_dim: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    let mv_fn = kernels
+        .matvec_q4_split_q8_1_locked_banked
+        .as_ref()
+        .expect("caller checks banked kernel presence");
+    let out_a_u32 = out_a_dim as u32;
+    let out_b_u32 = out_b_dim as u32;
+    let in_dim_u32 = in_dim as u32;
+    let grid = dp4a_q4_grid(out_a_u32) + dp4a_q4_grid(out_b_u32);
+    let mv_cfg = CudarcLaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (DP4A_Q4_BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    device
+        .stream
+        .launch_builder(mv_fn)
+        .arg(w_a)
+        .arg(w_b)
+        .arg(q8_1_buf)
+        .arg(out_a)
+        .arg(out_b)
+        .arg(&out_a_u32)
+        .arg(&out_b_u32)
+        .arg(&in_dim_u32)
+        .launch(mv_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("matvec_q4_split_q8_1_banked {label}: {e}")))?;
+    Ok(())
+}
+
 unsafe fn launch_matvec_preq8_1_split(
     device: &CudaDevice,
     kernels: &KernelSet,
