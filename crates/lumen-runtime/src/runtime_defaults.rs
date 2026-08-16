@@ -1178,21 +1178,6 @@ pub fn q8_ab_bank_enabled() -> bool {
     !matches!(std::env::var("LUMEN_CUDA_Q8_AB_BANK"), Ok(v) if v == "0")
 }
 
-/// `LUMEN_CUDA_Q4_AB_BANK=1` (probe): alpha+beta issue as one two-pointer
-/// banked launch (24 CTAs) instead of two 12-CTA launches. Reuses the proven
-/// qkv+gate banked kernel; bit-identical per row. Default OFF.
-pub fn q4_ab_bank_enabled() -> bool {
-    matches!(std::env::var("LUMEN_CUDA_Q4_AB_BANK"), Ok(v) if v == "1")
-}
-
-/// `LUMEN_CUDA_Q4_PROJ_BANK4=1` (probe): four-way banked launch — qkv, gate,
-/// alpha, beta issue as ONE virtual-row-concat launch off the shared Q8_1
-/// input (bit-identical per row; removes three launch boundaries per GDN
-/// layer). Takes precedence over BANK/PAIR when set. Default OFF.
-pub fn q4_proj_bank4_enabled() -> bool {
-    matches!(std::env::var("LUMEN_CUDA_Q4_PROJ_BANK4"), Ok(v) if v == "1")
-}
-
 /// `LUMEN_CUDA_Q4_PROJ_PAIR=1` (probe): TRUE paired banking — the first
 /// ceil(gate_rows/NR) CTAs of the qkv grid also compute the gate rows off a
 /// single per-block Q8_1 input load. Per-row math and accumulation order are
@@ -1352,8 +1337,6 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_Q4_NR2_DOWN",
     "LUMEN_CUDA_Q4_B160",
     "LUMEN_CUDA_Q8_AB_BANK",
-    "LUMEN_CUDA_Q4_AB_BANK",
-    "LUMEN_CUDA_Q4_PROJ_BANK4",
     "LUMEN_CUDA_Q4_PROJ_PAIR",
     "LUMEN_CUDA_Q4_PROJ_BANK",
     "LUMEN_CUDA_SLACK_L2QK_CYCLES",

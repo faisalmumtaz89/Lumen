@@ -5312,57 +5312,19 @@ impl CudaBackend {
             // anyway (no Q8 sibling, no mmvq override), issue BOTH projections
             // as one banked launch here and skip the separate gate launch
             // below. Per-row math is untouched => bit-identical output.
-            let bank4 = !gdn_skip_dup_qkv
-                && !gdn_ab_f16
-                && crate::runtime_defaults::q4_proj_bank4_enabled()
+            let pair_pref = crate::runtime_defaults::q4_proj_pair_enabled()
+                && st.kernels.matvec_q4_split_q8_1_locked_paired.is_some()
+                && dp4a_q4_grid(p.value_dim as u32) <= dp4a_q4_grid(p.qkv_dim as u32);
+            let qkv_gate_banked = !gdn_skip_dup_qkv
+                && (pair_pref || lumen_runtime_defaults_q4_proj_bank())
                 && st.kernels.use_q4_split_dispatch
                 && st.kernels.use_soa_locked
                 && !st.kernels.use_mmvq_q4
-                && st.kernels.matvec_q4_split_q8_1_locked_bank4.is_some()
+                && (pair_pref || st.kernels.matvec_q4_split_q8_1_locked_banked.is_some())
                 && lw.q8_split_wq.is_none()
                 && lw.q4_split_wq.is_some()
-                && lw.q4_split_attn_gate.is_some()
-                && lw.q4_split_ssm_alpha.is_some()
-                && lw.q4_split_ssm_beta.is_some();
-            if bank4 {
-                unsafe {
-                    launch_matvec_preq8_1_q4_bank4(
-                        &self.device,
-                        &st.kernels,
-                        [
-                            lw.q4_split_wq.as_ref().unwrap(),
-                            lw.q4_split_attn_gate.as_ref().unwrap(),
-                            lw.q4_split_ssm_alpha.as_ref().unwrap(),
-                            lw.q4_split_ssm_beta.as_ref().unwrap(),
-                        ],
-                        q8_1_buf,
-                        [
-                            &mut gdn.qkv_buf,
-                            &mut gdn.gate_buf,
-                            &mut gdn.alpha_raw_buf,
-                            &mut gdn.beta_raw_buf,
-                        ],
-                        [p.qkv_dim, p.value_dim, p.num_heads, p.num_heads],
-                        hidden_dim,
-                        "gdn_proj_bank4",
-                    )?;
-                }
-            }
-            let pair_pref = !bank4
-                && crate::runtime_defaults::q4_proj_pair_enabled()
-                && st.kernels.matvec_q4_split_q8_1_locked_paired.is_some()
-                && dp4a_q4_grid(p.value_dim as u32) <= dp4a_q4_grid(p.qkv_dim as u32);
-            let qkv_gate_banked = bank4
-                || (!gdn_skip_dup_qkv
-                    && (pair_pref || lumen_runtime_defaults_q4_proj_bank())
-                    && st.kernels.use_q4_split_dispatch
-                    && st.kernels.use_soa_locked
-                    && !st.kernels.use_mmvq_q4
-                    && (pair_pref || st.kernels.matvec_q4_split_q8_1_locked_banked.is_some())
-                    && lw.q8_split_wq.is_none()
-                    && lw.q4_split_wq.is_some()
-                    && lw.q4_split_attn_gate.is_some());
-            if qkv_gate_banked && !bank4 {
+                && lw.q4_split_attn_gate.is_some();
+            if qkv_gate_banked {
                 let (qkv_out, gate_out) = (&mut gdn.qkv_buf, &mut gdn.gate_buf);
                 let wq_split = lw.q4_split_wq.as_ref().unwrap();
                 let gate_split = lw.q4_split_attn_gate.as_ref().unwrap();
@@ -5399,7 +5361,7 @@ impl CudaBackend {
                         )?;
                     }
                 }
-            } else if !bank4 && !gdn_skip_dup_qkv {
+            } else if !gdn_skip_dup_qkv {
                 unsafe {
                     launch_matvec_preq8_1_split(
                         &self.device,
@@ -5457,7 +5419,7 @@ impl CudaBackend {
                         cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
                     )?;
                 }
-            } else if !bank4 {
+            } else {
                 // LUMEN_CUDA_Q8_AB_BANK: alpha+beta (Q8Raw on this model —
                 // the converter forces them to Q8_0, so the Q4-split bank can
                 // never engage here) as ONE banked raw-route launch. Equality
