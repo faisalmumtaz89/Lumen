@@ -513,6 +513,10 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q4_split_q8_1_locked_banked_b160_v4: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_locked_banked_b160: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_locked_bank4: Option<CudaFunction>,
+    // NR=1 (one row per CTA) residual variant of the locked Q4 split kernel:
+    // grid = out_dim CTAs. Byte-identical per row (grid mapping only); wins
+    // on short-N long-K shapes (FFN down) where NR=4 underfills the GPU.
+    pub(crate) matvec_q4_split_q8_1_locked_residual_nr1: Option<CudaFunction>,
 
     // llama mmvq port on the Q4 split layout (`LUMEN_CUDA_Q8_MMVQ`, default-OFF;
     // shares the Q8 mmvq flag). 2-lane VDR striping + one-row/CTA + lane-
@@ -1909,6 +1913,14 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             // kernel and erase this variant's win with no error.
             assert_ne!(src, shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE);
             load_fn_sm80_fast_math(&src, "matvec_q4_split_q8_1_locked_banked").ok()
+        },
+        matvec_q4_split_q8_1_locked_residual_nr1: {
+            let src = shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE
+                .replace("#define NR       4", "#define NR       1");
+            // A silent replace miss would compile a duplicate NR=4 kernel and
+            // erase this variant's win with no error.
+            assert_ne!(src, shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE);
+            load_fn_sm80_fast_math(&src, "matvec_q4_split_q8_1_locked_residual").ok()
         },
         matvec_q4_split_q8_1_locked_bank4: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE,

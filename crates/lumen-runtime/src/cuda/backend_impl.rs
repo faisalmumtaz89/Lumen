@@ -12162,7 +12162,16 @@ unsafe fn launch_matvec_preq8_1_residual_split(
                     return Ok(());
                 }
             }
-            let mv_fn_opt = if kernels.use_soa_locked {
+            // LUMEN_CUDA_Q4_DOWN_NR1: one row per CTA for the down
+            // projection (short-N long-K underfills the NR=4 grid; measured
+            // +0.17 ms/token isolated at byte-identical outputs).
+            let use_nr1 = crate::runtime_defaults::q4_down_nr1()
+                && label == "down"
+                && kernels.use_soa_locked
+                && kernels.matvec_q4_split_q8_1_locked_residual_nr1.is_some();
+            let mv_fn_opt = if use_nr1 {
+                kernels.matvec_q4_split_q8_1_locked_residual_nr1.as_ref()
+            } else if kernels.use_soa_locked {
                 kernels.matvec_q4_split_q8_1_locked_residual.as_ref()
             } else {
                 kernels.matvec_q4_split_q8_1_residual.as_ref()
@@ -12170,7 +12179,20 @@ unsafe fn launch_matvec_preq8_1_residual_split(
             if let Some(mv_fn) = mv_fn_opt {
                 let out_dim_u32 = out_dim as u32;
                 let in_dim_u32 = in_dim as u32;
-                let mv_grid = dp4a_q4_grid(out_dim_u32);
+                let mv_grid = if use_nr1 {
+                    {
+                        use std::sync::OnceLock;
+                        static MARK: OnceLock<()> = OnceLock::new();
+                        MARK.get_or_init(|| {
+                            if super::decode::cuda_verbose() {
+                                eprintln!("[CUDA] Q4_DOWN_NR1: down projection uses the NR=1 grid");
+                            }
+                        });
+                    }
+                    out_dim_u32
+                } else {
+                    dp4a_q4_grid(out_dim_u32)
+                };
                 let mv_cfg = CudarcLaunchConfig {
                     grid_dim: (mv_grid, 1, 1),
                     block_dim: (DP4A_Q4_BLOCK_DIM, 1, 1),
