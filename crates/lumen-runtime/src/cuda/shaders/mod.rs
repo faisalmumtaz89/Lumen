@@ -525,6 +525,11 @@ pub const MATVEC_Q6K_HEAD_KERNEL_SOURCE: &str = include_str!("matvec_q6k_head.cu
 /// Plain and residual-folding variants.
 pub const MATVEC_Q5K_SPLIT_KERNEL_SOURCE: &str = include_str!("matvec_q5k_split.cu");
 
+/// Banked F32 matvec for the GDN ssm_alpha/ssm_beta gates kept in their
+/// F32 source form: both projections in ONE launch (they are tiny and
+/// launch-bound, not bandwidth-bound).
+pub const MATVEC_F32_GATES_KERNEL_SOURCE: &str = include_str!("matvec_f32_gates.cu");
+
 /// Q4_1 matvec against Q8_1 input (plain + residual variants). Serves the
 /// FFN down tensors that Q4_0-preset GGUFs store as Q4_1; the Q8_1 sum field
 /// supplies the per-block min term without an extra dp4a.

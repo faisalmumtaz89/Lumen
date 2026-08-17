@@ -5762,38 +5762,78 @@ impl CudaBackend {
             // Q8Raw; the F16/MMQ branches use the dequanted cache / Q8 bytes
             // respectively.
             //
-            // Source-fidelity F32 gates project as plain SGEMVs from the F32
-            // `normed` materialized above (launch_matvec's F32 arm) — the
-            // exact weights the source GGUF stores, on the exact activation
-            // the prefill projection reads.
+            // Source-fidelity F32 gates: prefer the banked custom kernel
+            // (BOTH projections in one launch — the tensors are ~1 MB each,
+            // so serving them through two cuBLAS SGEMVs pays two fixed launch
+            // overheads per GDN layer for negligible work). Fallback: two
+            // plain SGEMVs via launch_matvec's F32 arm. Either way the
+            // activation is the F32 `normed` materialized above — the exact
+            // weights the source GGUF stores, on the exact activation the
+            // prefill projection reads.
             if gdn_ab_f32 {
-                unsafe {
-                    launch_matvec(
-                        &self.device,
-                        &st.kernels,
-                        ssm_alpha_w,
-                        &st.scratch.normed,
-                        &mut gdn.alpha_raw_buf,
-                        p.num_heads,
-                        hidden_dim,
-                        "gdn_alpha_f32",
-                        None,
-                        Some(&mut st.scratch.input_f16),
-                        None,
-                    )?;
-                    launch_matvec(
-                        &self.device,
-                        &st.kernels,
-                        ssm_beta_w,
-                        &st.scratch.normed,
-                        &mut gdn.beta_raw_buf,
-                        p.num_heads,
-                        hidden_dim,
-                        "gdn_beta_f32",
-                        None,
-                        Some(&mut st.scratch.input_f16),
-                        None,
-                    )?;
+                let banked = match (
+                    st.kernels.matvec_f32_gates_banked.as_ref(),
+                    ssm_alpha_w,
+                    ssm_beta_w,
+                ) {
+                    (Some(mv_fn), GpuWeightBuf::F32(w_a), GpuWeightBuf::F32(w_b)) => {
+                        Some((mv_fn, w_a, w_b))
+                    }
+                    _ => None,
+                };
+                if let Some((mv_fn, w_a, w_b)) = banked {
+                    let out_dim_u32 = p.num_heads as u32;
+                    let in_dim_u32 = hidden_dim as u32;
+                    let mv_cfg = CudarcLaunchConfig {
+                        grid_dim: (2 * out_dim_u32, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(mv_fn)
+                            .arg(w_a)
+                            .arg(w_b)
+                            .arg(&st.scratch.normed)
+                            .arg(&mut gdn.alpha_raw_buf)
+                            .arg(&mut gdn.beta_raw_buf)
+                            .arg(&out_dim_u32)
+                            .arg(&in_dim_u32)
+                            .launch(mv_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec_f32_gates_banked L{layer_idx}: {e}"))
+                    })?;
+                } else {
+                    unsafe {
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            ssm_alpha_w,
+                            &st.scratch.normed,
+                            &mut gdn.alpha_raw_buf,
+                            p.num_heads,
+                            hidden_dim,
+                            "gdn_alpha_f32",
+                            None,
+                            Some(&mut st.scratch.input_f16),
+                            None,
+                        )?;
+                        launch_matvec(
+                            &self.device,
+                            &st.kernels,
+                            ssm_beta_w,
+                            &st.scratch.normed,
+                            &mut gdn.beta_raw_buf,
+                            p.num_heads,
+                            hidden_dim,
+                            "gdn_beta_f32",
+                            None,
+                            Some(&mut st.scratch.input_f16),
+                            None,
+                        )?;
+                    }
                 }
             } else if gdn_ab_f16 {
                 let alpha_f16 = lw.ssm_alpha_f16.as_ref().expect("gdn_ab_f16 guards Some");

@@ -537,6 +537,9 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q6k_head: Option<CudaFunction>,
     /// Q5_K matvec (split-plane layout, NR=2) for GDN ssm_out kept in its
     /// source K-quant form. Plain + residual-folding variants.
+    /// Banked F32 gates matvec (alpha+beta in one launch) for GDN gates
+    /// kept in their F32 source form.
+    pub(crate) matvec_f32_gates_banked: Option<CudaFunction>,
     pub(crate) matvec_q5k_split: Option<CudaFunction>,
     pub(crate) matvec_q5k_split_residual: Option<CudaFunction>,
     /// Q4_1 matvec against Q8_1 input for FFN down tensors kept in their
@@ -1986,6 +1989,19 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] matvec_q6k_head: FAILED: {e}");
+                None
+            }
+        },
+        matvec_f32_gates_banked: match load_fn_sm80_fast_math(
+            shaders::MATVEC_F32_GATES_KERNEL_SOURCE,
+            "matvec_f32_gates_banked",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_f32_gates_banked: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_f32_gates_banked: FAILED: {e}");
                 None
             }
         },
