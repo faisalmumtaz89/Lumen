@@ -1306,6 +1306,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_ATTN_PRECISE_DBG",
     "LUMEN_CUDA_ATTN_PREP_FUSE",
     "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
+    "LUMEN_CUDA_FFN_GATE_UP_BANK",
     "LUMEN_CUDA_BF16_AUTOTUNE",
     "LUMEN_CUDA_BF16_GEMMEX",
     "LUMEN_CUDA_BF16_MATVEC",
@@ -2534,6 +2535,7 @@ mod tests {
         "LUMEN_CUDA_ATTN_PRECISE_DBG",
         "LUMEN_CUDA_ATTN_PREP_FUSE",
         "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
+        "LUMEN_CUDA_FFN_GATE_UP_BANK",
         "LUMEN_CUDA_BF16_AUTOTUNE",
         "LUMEN_CUDA_BF16_GEMMEX",
         "LUMEN_CUDA_BF16_MATVEC",
@@ -2707,6 +2709,21 @@ pub fn ffn_direct_residual() -> bool {
             std::env::var("LUMEN_CUDA_FFN_DIRECT_RESIDUAL")
                 .ok()
                 .as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// `LUMEN_CUDA_FFN_GATE_UP_BANK=1` (default OFF while in probe phase): FFN
+/// gate and up projections issue as ONE banked launch off the shared Q8_1
+/// input (baseline 256-thread kernel; B160/V4 variants are GDN-only wins and
+/// measured FFN regressions). Bit-identical per row to the two-launch route.
+pub fn ffn_gate_up_bank() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_FFN_GATE_UP_BANK").ok().as_deref(),
             Some("1") | Some("true") | Some("yes") | Some("on")
         )
     })

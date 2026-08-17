@@ -4257,32 +4257,72 @@ impl CudaBackend {
                             .launch(launch_cfg)
                     }
                     .map_err(|e| RuntimeError::Compute(format!("rmsnorm_to_q8_1 ffn: {e}")))?;
-                    unsafe {
-                        // split-layout: prefer Q8Split/Q4Split sibling buffers on FFN gate/up when set.
-                        launch_matvec_preq8_1_split(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_gate,
-                            lw.q8_split_w_gate.as_ref(),
-                            lw.q4_split_w_gate.as_ref(),
-                            q8_1_buf,
-                            &mut st.scratch.gate,
-                            inter_dim,
-                            hidden_dim,
-                            "gate",
-                        )?;
-                        launch_matvec_preq8_1_split(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_up,
-                            lw.q8_split_w_up.as_ref(),
-                            lw.q4_split_w_up.as_ref(),
-                            q8_1_buf,
-                            &mut st.scratch.up,
-                            inter_dim,
-                            hidden_dim,
-                            "up",
-                        )?;
+                    // LUMEN_CUDA_FFN_GATE_UP_BANK=1: one banked launch covers
+                    // gate's rows then up's rows off the shared Q8_1 input
+                    // (baseline 256-thread kernel forced — B160/V4 are GDN-only
+                    // wins). Per-row body identical => bit-identical outputs.
+                    let bank_gate_up = crate::runtime_defaults::ffn_gate_up_bank()
+                        && st.kernels.use_q4_split_dispatch
+                        && st.kernels.matvec_q4_split_q8_1_locked_banked.is_some()
+                        && lw.q4_split_w_gate.is_some()
+                        && lw.q4_split_w_up.is_some();
+                    if bank_gate_up {
+                        let (gate_out, up_out) = (&mut st.scratch.gate, &mut st.scratch.up);
+                        unsafe {
+                            launch_matvec_preq8_1_q4_banked(
+                                &self.device,
+                                &st.kernels,
+                                lw.q4_split_w_gate.as_ref().unwrap(),
+                                lw.q4_split_w_up.as_ref().unwrap(),
+                                q8_1_buf,
+                                gate_out,
+                                up_out,
+                                inter_dim,
+                                inter_dim,
+                                hidden_dim,
+                                "ffn gate+up bank",
+                                true,
+                            )?;
+                        }
+                        {
+                            use std::sync::OnceLock;
+                            static MARK: OnceLock<()> = OnceLock::new();
+                            MARK.get_or_init(|| {
+                                if super::decode::cuda_verbose() {
+                                    eprintln!(
+                                        "[CUDA] FFN_GATE_UP_BANK: gate+up as one banked launch (baseline kernel)"
+                                    );
+                                }
+                            });
+                        }
+                    } else {
+                        unsafe {
+                            // split-layout: prefer Q8Split/Q4Split sibling buffers on FFN gate/up when set.
+                            launch_matvec_preq8_1_split(
+                                &self.device,
+                                &st.kernels,
+                                &lw.w_gate,
+                                lw.q8_split_w_gate.as_ref(),
+                                lw.q4_split_w_gate.as_ref(),
+                                q8_1_buf,
+                                &mut st.scratch.gate,
+                                inter_dim,
+                                hidden_dim,
+                                "gate",
+                            )?;
+                            launch_matvec_preq8_1_split(
+                                &self.device,
+                                &st.kernels,
+                                &lw.w_up,
+                                lw.q8_split_w_up.as_ref(),
+                                lw.q4_split_w_up.as_ref(),
+                                q8_1_buf,
+                                &mut st.scratch.up,
+                                inter_dim,
+                                hidden_dim,
+                                "up",
+                            )?;
+                        }
                     }
                 } else if ffn_use_preq {
                     // Fallback: separate rmsnorm + quantize_f32_to_q8_1 (fused kernel unavailable).
@@ -5383,6 +5423,7 @@ impl CudaBackend {
                         p.value_dim,
                         hidden_dim,
                         "gdn_qkv_gate_bank",
+                        false,
                     )?;
                 }
             } else if !gdn_skip_dup_qkv {
@@ -11626,9 +11667,15 @@ unsafe fn launch_matvec_preq8_1_q4_banked(
     out_b_dim: usize,
     in_dim: usize,
     label: &str,
+    force_baseline: bool,
 ) -> Result<(), RuntimeError> {
-    let v4_ok = crate::runtime_defaults::q4_v4load_enabled() && ((in_dim >> 5) * 2) % 16 == 0;
-    let use_b160 = crate::runtime_defaults::q4_b160_enabled()
+    // `force_baseline` pins the 256-thread/u32 kernel: the B160/V4 variants
+    // are banked wins only on the GDN pool and measured regressions on FFN.
+    let v4_ok = !force_baseline
+        && crate::runtime_defaults::q4_v4load_enabled()
+        && ((in_dim >> 5) * 2) % 16 == 0;
+    let use_b160 = !force_baseline
+        && crate::runtime_defaults::q4_b160_enabled()
         && (in_dim >> 5) == 160
         && kernels.matvec_q4_split_q8_1_locked_banked_b160.is_some();
     let mv_fn = if use_b160 && v4_ok && kernels.matvec_q4_split_q8_1_locked_banked_b160_v4.is_some()
