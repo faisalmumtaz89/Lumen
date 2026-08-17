@@ -199,7 +199,19 @@ pub(crate) fn append_tensor_to_blob_requant_with_target<R: Read + Seek>(
             dequantize_to_f32_bytes(&data, tensor.ggml_type, tensor.n_elements(), tensor_name)?;
         blob.extend_from_slice(&f32_data);
     } else if tensor.ggml_type == crate::gguf::GgmlType::Q4_1 {
-        // Q4_1 has no dedicated GPU kernel (neither Metal nor CUDA).
+        // SOURCE_FIDELITY: keep Q4_1 verbatim — the min term is part of the
+        // source quantization and the CUDA runtime serves Q4_1 natively
+        // (matvec_q4_1_q8_1). Must mirror the Q4_1 keep in the qwen35 plan.
+        if target != ConvertTarget::Metal && crate::convert::source_fidelity() {
+            eprintln!(
+                "    Kept Q4_1 verbatim: {tensor_name} ({} bytes)",
+                data.len()
+            );
+            blob.extend_from_slice(&data);
+            return Ok(());
+        }
+        // Q4_1 has no dedicated GPU kernel (neither Metal nor CUDA dispatches
+        // it outside the source-fidelity route).
         // Requantize to Q4_0: dequant Q4_1 -> F32 -> quantize Q4_0.
         let f32_data =
             dequantize_to_f32_bytes(&data, tensor.ggml_type, tensor.n_elements(), tensor_name)?;

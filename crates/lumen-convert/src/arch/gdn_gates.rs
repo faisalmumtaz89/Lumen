@@ -212,7 +212,16 @@ pub(crate) fn write_ssm_tensors<R: Read + Seek>(
                 && !matches!(tensor.ggml_type, GgmlType::F32)
                 && matches!(*suffix, SSM_A | SSM_CONV1D | SSM_DT | SSM_NORM);
             let src_quant = tensor.ggml_type.to_lbc_quant();
-            if is_alpha_or_beta && !matches!(src_quant, Some(QuantScheme::Q8_0)) {
+            // SOURCE_FIDELITY: keep F32 alpha/beta verbatim — must mirror the
+            // `keep_source_gates` branch in `compute_ssm_tensor_slice` above
+            // (plan and writer MUST agree on layer-blob layout).
+            let keep_source_gates = crate::convert::source_fidelity()
+                && is_alpha_or_beta
+                && matches!(src_quant, Some(QuantScheme::F32));
+            if is_alpha_or_beta
+                && !matches!(src_quant, Some(QuantScheme::Q8_0))
+                && !keep_source_gates
+            {
                 // Force-requantize to Q8_0 (dequant to F32 first, then quantize to Q8_0)
                 append_tensor_to_blob_requant(
                     blob,

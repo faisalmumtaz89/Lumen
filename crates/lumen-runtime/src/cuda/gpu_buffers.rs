@@ -1610,6 +1610,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn f32_to_f16_bits_reference_values() {
+        // Known encodings.
+        assert_eq!(f32_to_f16_bits(0.0), 0x0000);
+        assert_eq!(f32_to_f16_bits(-0.0), 0x8000);
+        assert_eq!(f32_to_f16_bits(1.0), 0x3C00);
+        assert_eq!(f32_to_f16_bits(-2.5), 0xC100);
+        assert_eq!(f32_to_f16_bits(65504.0), 0x7BFF); // f16 max
+        assert_eq!(f32_to_f16_bits(65536.0), 0x7C00); // overflow -> inf
+        assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x7C00);
+        assert_eq!(f32_to_f16_bits(f32::NEG_INFINITY), 0xFC00);
+        assert_eq!(f32_to_f16_bits(6.103515625e-05), 0x0400); // smallest normal
+        assert_eq!(f32_to_f16_bits(5.9604645e-08), 0x0001); // smallest subnormal
+        assert!(f32_to_f16_bits(f32::NAN) & 0x7C00 == 0x7C00);
+        assert!(f32_to_f16_bits(f32::NAN) & 0x03FF != 0);
+    }
+
+    #[test]
+    fn f16_bits_roundtrip_exact() {
+        // Every finite f16 value must round-trip bit-exactly through
+        // host_f16_to_f32 -> f32_to_f16_bits (f32 represents all f16 values).
+        for bits in 0u16..=0xFFFF {
+            let exp = (bits >> 10) & 0x1F;
+            let frac = bits & 0x3FF;
+            if exp == 31 {
+                continue; // inf/NaN
+            }
+            let back = f32_to_f16_bits(host_f16_to_f32(bits));
+            // -0.0 and 0.0 keep their signs; everything else exact.
+            assert_eq!(back, bits, "roundtrip failed for {bits:#06x} (frac {frac})");
+        }
+    }
+
+    #[test]
+    fn f32_to_f16_bits_round_to_nearest_even() {
+        // 1 + 2^-11 is exactly halfway between 1.0 and the next f16
+        // (1 + 2^-10); RNE keeps the even mantissa (1.0 = 0x3C00).
+        assert_eq!(f32_to_f16_bits(1.0 + f32::powi(2.0, -11)), 0x3C00);
+        // 1 + 3*2^-11 is halfway between 0x3C01 and 0x3C02; RNE -> 0x3C02.
+        assert_eq!(f32_to_f16_bits(1.0 + 3.0 * f32::powi(2.0, -11)), 0x3C02);
+        // Just above halfway rounds up.
+        assert_eq!(f32_to_f16_bits(1.0 + f32::powi(2.0, -11) * 1.001), 0x3C01);
+    }
+
+    #[test]
     fn bytes_as_f32_valid() {
         let vals: Vec<f32> = vec![1.0, 2.0, 3.0];
         let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();

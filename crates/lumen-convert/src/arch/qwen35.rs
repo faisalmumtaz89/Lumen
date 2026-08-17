@@ -164,10 +164,12 @@ fn compute_layer_shape_qwen35(
             *blob_offset += size;
             Ok(slice)
         } else if tensor.ggml_type == GgmlType::Q4_1 {
-            if crate::convert::source_fidelity() {
+            if target != ConvertTarget::Metal && crate::convert::source_fidelity() {
                 // SOURCE_FIDELITY: keep Q4_1 verbatim (the min term is part of
                 // the source quantization; stripping it to Q4_0 is a quality
-                // downcast the reference engine does not perform).
+                // downcast the reference engine does not perform). CUDA-only:
+                // Metal has no Q4_1 kernel, so the Metal target still
+                // requantizes (mirrors append_tensor_to_blob_requant_with_target).
                 let n_elements = tensor.n_elements();
                 let size = ((n_elements as usize / 32) * 20) as u64;
                 let slice = TensorSlice {
@@ -277,6 +279,24 @@ fn compute_layer_shape_qwen35(
                 } else {
                     ((n_elements / 32 * 18) as u64, QuantScheme::Q4_0)
                 }
+            }
+            None => {
+                // SOURCE_FIDELITY passthrough: a None target keeps the source
+                // scheme verbatim (the ssm_out caller only passes None for
+                // sources the runtime serves natively: Q5_K, Q8_0). Must
+                // mirror `write_layer_blob`'s None-target verbatim copy.
+                let quant = src_quant.ok_or_else(|| ConvertError::UnsupportedTensorType {
+                    tensor: name.clone(),
+                    ggml_type: format!("{:?}", tensor.ggml_type),
+                })?;
+                let size =
+                    tensor
+                        .byte_size()
+                        .ok_or_else(|| ConvertError::UnsupportedTensorType {
+                            tensor: name.clone(),
+                            ggml_type: format!("{:?} (unknown block geometry)", tensor.ggml_type),
+                        })?;
+                (size, quant)
             }
             _ => ((n_elements * 4) as u64, QuantScheme::F32),
         };
@@ -432,7 +452,8 @@ fn compute_layer_shape_qwen35(
     let ssm_out_src = gguf
         .find_tensor(&layer_tensor_name(layer, SSM_OUT))
         .map(|t| t.ggml_type);
-    let ssm_out_target = if crate::convert::source_fidelity()
+    let ssm_out_target = if target != ConvertTarget::Metal
+        && crate::convert::source_fidelity()
         && matches!(
             ssm_out_src,
             Some(crate::gguf::GgmlType::Q5_K) | Some(crate::gguf::GgmlType::Q8_0)
@@ -644,9 +665,21 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
             // floor + evidence in compute_slice_with_requant above; the two
             // MUST stay in sync for layer-shape symmetry). (Target is
             // irrelevant here: ssm_out is always force-requanted.)
-            let ssm_out_target = match requant_to {
-                Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
-                other => other.or(Some(QuantScheme::Q8_0)),
+            // SOURCE_FIDELITY: keep the source scheme verbatim (None target =
+            // passthrough) — must mirror the plan's `ssm_out_target` above.
+            let src = gguf.find_tensor(&name).map(|t| t.ggml_type);
+            let ssm_out_target = if target != ConvertTarget::Metal
+                && crate::convert::source_fidelity()
+                && matches!(
+                    src,
+                    Some(crate::gguf::GgmlType::Q5_K) | Some(crate::gguf::GgmlType::Q8_0)
+                ) {
+                None
+            } else {
+                match requant_to {
+                    Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
+                    other => other.or(Some(QuantScheme::Q8_0)),
+                }
             };
             append_tensor_to_blob_requant(
                 blob,
