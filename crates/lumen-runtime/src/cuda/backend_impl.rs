@@ -4513,64 +4513,32 @@ impl CudaBackend {
                         inter_dim,
                         "down q4_1",
                     )?;
-                }
-                let out_dim_u32 = hidden_dim as u32;
-                let in_dim_u32 = inter_dim as u32;
-                // One row per 256-thread CTA.
-                let mv_cfg = CudarcLaunchConfig {
-                    grid_dim: (out_dim_u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                if crate::runtime_defaults::ffn_direct_residual() {
-                    let mv_fn = st.kernels.matvec_q4_1_residual.as_ref().ok_or_else(|| {
-                        RuntimeError::Compute(
-                            "Q4_1 w_down present but matvec_q4_1_residual unavailable".into(),
-                        )
-                    })?;
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(mv_fn)
-                            .arg(wd_q41)
-                            .arg(&*q8_1_buf)
-                            .arg(&st.scratch.attn_proj)
-                            .arg(&mut st.scratch.x_gpu)
-                            .arg(&out_dim_u32)
-                            .arg(&in_dim_u32)
-                            .launch(mv_cfg)
+                    if crate::runtime_defaults::ffn_direct_residual() {
+                        launch_matvec_q4_1_preq8_1(
+                            &self.device,
+                            &st.kernels,
+                            wd_q41,
+                            q8_1_buf,
+                            Some(&st.scratch.attn_proj),
+                            &mut st.scratch.x_gpu,
+                            hidden_dim,
+                            inter_dim,
+                            "down",
+                        )?;
+                        ffn_in_place = true;
+                    } else {
+                        launch_matvec_q4_1_preq8_1(
+                            &self.device,
+                            &st.kernels,
+                            wd_q41,
+                            q8_1_buf,
+                            None,
+                            &mut st.scratch.down,
+                            hidden_dim,
+                            inter_dim,
+                            "down",
+                        )?;
                     }
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("matvec_q4_1_residual L{layer_idx}: {e}"))
-                    })?;
-                    ffn_in_place = true;
-                } else {
-                    let mv_fn = st.kernels.matvec_q4_1.as_ref().ok_or_else(|| {
-                        RuntimeError::Compute(
-                            "Q4_1 w_down present but matvec_q4_1 unavailable".into(),
-                        )
-                    })?;
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(mv_fn)
-                            .arg(wd_q41)
-                            .arg(&*q8_1_buf)
-                            .arg(&mut st.scratch.down)
-                            .arg(&out_dim_u32)
-                            .arg(&in_dim_u32)
-                            .launch(mv_cfg)
-                    }
-                    .map_err(|e| RuntimeError::Compute(format!("matvec_q4_1 L{layer_idx}: {e}")))?;
-                }
-                {
-                    use std::sync::OnceLock;
-                    static MARK: OnceLock<()> = OnceLock::new();
-                    MARK.get_or_init(|| {
-                        if super::decode::cuda_verbose() {
-                            eprintln!("[CUDA] Q4_1_DOWN: w_down served from source Q4_1 blocks");
-                        }
-                    });
                 }
                 q4_1_done = true;
             }
@@ -4885,6 +4853,76 @@ impl CudaBackend {
                             st.scratch.input_q8_1.as_mut(),
                         )?;
                     }
+                }
+            }
+        } else if lw.q4_1_w_down.is_some()
+            && st.kernels.quantize_f32_to_q8_1.is_some()
+            && st
+                .scratch
+                .input_q8_1
+                .as_ref()
+                .is_some_and(|b| b.len() >= inter_dim.div_ceil(32) * 36)
+        {
+            // Source-fidelity route (non-fused chain): w_down kept in its
+            // Q4_1 source form. SwiGLU in place, quantize to Q8_1, then the
+            // dedicated dp4a kernel. Must precede the F16Raw arm below — a
+            // Q4_1 layer's base buffer IS the F16 image.
+            {
+                let config = LaunchConfig::for_elements(inter_dim);
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (config.grid_dim, 1, 1),
+                    block_dim: (config.block_dim, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let n = inter_dim as u32;
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(&st.kernels.swiglu_inplace)
+                        .arg(&mut st.scratch.gate)
+                        .arg(&st.scratch.up)
+                        .arg(&n)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!("swiglu q4_1 launch: {e}")))?;
+            }
+            let wd_q41 = lw.q4_1_w_down.as_ref().unwrap();
+            let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref().unwrap();
+            let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
+            unsafe {
+                launch_quantize_input_q8_1(
+                    &self.device,
+                    quant_fn,
+                    &st.scratch.gate,
+                    q8_1_buf,
+                    inter_dim,
+                    "down q4_1 (sep swiglu)",
+                )?;
+                if crate::runtime_defaults::ffn_direct_residual() {
+                    launch_matvec_q4_1_preq8_1(
+                        &self.device,
+                        &st.kernels,
+                        wd_q41,
+                        q8_1_buf,
+                        Some(&st.scratch.attn_proj),
+                        &mut st.scratch.x_gpu,
+                        hidden_dim,
+                        inter_dim,
+                        "down",
+                    )?;
+                    ffn_in_place = true;
+                } else {
+                    launch_matvec_q4_1_preq8_1(
+                        &self.device,
+                        &st.kernels,
+                        wd_q41,
+                        q8_1_buf,
+                        None,
+                        &mut st.scratch.down,
+                        hidden_dim,
+                        inter_dim,
+                        "down",
+                    )?;
                 }
             }
         } else if let GpuWeightBuf::F16Raw(ref wd_f16) = lw.w_down {
@@ -12197,6 +12235,78 @@ unsafe fn launch_matvec_preq8_1_q4_banked(
         .arg(&in_dim_u32)
         .launch(mv_cfg)
         .map_err(|e| RuntimeError::Compute(format!("matvec_q4_split_q8_1_banked {label}: {e}")))?;
+    Ok(())
+}
+
+/// Q4_1 matvec against a pre-quantized Q8_1 activation (source-fidelity
+/// route: w_down kept in its Q4_1 source form). `residual` selects the
+/// residual-folding variant (out = W*x + residual, the FFN_DIRECT_RESIDUAL
+/// sibling); the Q8_1 sum field supplies the per-block min term.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn launch_matvec_q4_1_preq8_1(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    weight_q4_1: &CudaSlice<u8>,
+    q8_1_buf: &CudaSlice<u8>,
+    residual: Option<&CudaSlice<f32>>,
+    output: &mut CudaSlice<f32>,
+    out_dim: usize,
+    in_dim: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    let out_dim_u32 = out_dim as u32;
+    let in_dim_u32 = in_dim as u32;
+    // One row per 256-thread CTA.
+    let mv_cfg = CudarcLaunchConfig {
+        grid_dim: (out_dim_u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    match residual {
+        Some(res) => {
+            let mv_fn = kernels.matvec_q4_1_residual.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!(
+                    "Q4_1 {label} present but matvec_q4_1_residual unavailable"
+                ))
+            })?;
+            device
+                .stream
+                .launch_builder(mv_fn)
+                .arg(weight_q4_1)
+                .arg(q8_1_buf)
+                .arg(res)
+                .arg(output)
+                .arg(&out_dim_u32)
+                .arg(&in_dim_u32)
+                .launch(mv_cfg)
+                .map_err(|e| RuntimeError::Compute(format!("matvec_q4_1_residual {label}: {e}")))?;
+        }
+        None => {
+            let mv_fn = kernels.matvec_q4_1.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!("Q4_1 {label} present but matvec_q4_1 unavailable"))
+            })?;
+            device
+                .stream
+                .launch_builder(mv_fn)
+                .arg(weight_q4_1)
+                .arg(q8_1_buf)
+                .arg(output)
+                .arg(&out_dim_u32)
+                .arg(&in_dim_u32)
+                .launch(mv_cfg)
+                .map_err(|e| RuntimeError::Compute(format!("matvec_q4_1 {label}: {e}")))?;
+        }
+    }
+    {
+        use std::sync::OnceLock;
+        static MARK: OnceLock<()> = OnceLock::new();
+        MARK.get_or_init(|| {
+            if super::decode::cuda_verbose() {
+                eprintln!("[CUDA] Q4_1_DOWN: w_down served from source Q4_1 blocks");
+            }
+        });
+    }
     Ok(())
 }
 
