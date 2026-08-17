@@ -4497,9 +4497,11 @@ impl CudaBackend {
             // prefill and the fallback below.
             let mut q4_1_done = false;
             if let (Some(wd_q41), Some(quant_fn), Some(q8_1_buf)) = (
-                lw.q4_1_w_down
-                    .as_ref()
-                    .filter(|_| crate::runtime_defaults::q4_1_down_enabled()),
+                lw.q4_1_w_down.as_ref().filter(|_| {
+                    crate::runtime_defaults::q4_1_down_enabled()
+                        && st.kernels.matvec_q4_1.is_some()
+                        && st.kernels.matvec_q4_1_residual.is_some()
+                }),
                 st.kernels.quantize_f32_to_q8_1.as_ref(),
                 st.scratch
                     .input_q8_1
@@ -4859,6 +4861,8 @@ impl CudaBackend {
             }
         } else if lw.q4_1_w_down.is_some()
             && crate::runtime_defaults::q4_1_down_enabled()
+            && st.kernels.matvec_q4_1.is_some()
+            && st.kernels.matvec_q4_1_residual.is_some()
             && st.kernels.quantize_f32_to_q8_1.is_some()
             && st
                 .scratch
@@ -6260,7 +6264,10 @@ impl CudaBackend {
         let ssm_ng_q8_eligible = crate::runtime_defaults::gdn_ng_q8_enabled()
             && st.kernels.gdn_prefill_norm_gate_q8.is_some()
             && (lw.q8_split_ssm_out.is_some()
-                || (lw.ssm_out_q5k.is_some() && crate::runtime_defaults::q5k_ssmout_enabled()))
+                || (lw.ssm_out_q5k.is_some()
+                    && crate::runtime_defaults::q5k_ssmout_enabled()
+                    && st.kernels.matvec_q5k_split.is_some()
+                    && st.kernels.matvec_q5k_split_residual.is_some()))
             && p.head_dim % 32 == 0
             && p.head_dim > 0
             && p.head_dim <= 1024
@@ -7303,9 +7310,13 @@ impl CudaBackend {
             // (split planes). Mutually exclusive with the Q8 split sibling
             // below by construction (the artifact stores one format).
             if let (Some((ref qs, ref qh, ref sc, ref dm)), Some(quant_fn), Some(q8_1_buf)) = (
-                lw.ssm_out_q5k
-                    .as_ref()
-                    .filter(|_| crate::runtime_defaults::q5k_ssmout_enabled()),
+                lw.ssm_out_q5k.as_ref().filter(|_| {
+                    // Handle presence checked here so an NVRTC load failure
+                    // falls back to the F16 image instead of hard-erroring.
+                    crate::runtime_defaults::q5k_ssmout_enabled()
+                        && st.kernels.matvec_q5k_split.is_some()
+                        && st.kernels.matvec_q5k_split_residual.is_some()
+                }),
                 st.kernels.quantize_q8_1_rawsum.as_ref(),
                 st.scratch
                     .input_q8_1
@@ -9217,7 +9228,9 @@ impl CudaBackend {
                 (Some(q), Some(m), Some(b)) => (q, m, b),
                 _ => {
                     return Err(RuntimeError::Compute(
-                        "Q6_K output head present but quantize/matvec kernels unavailable".into(),
+                        "Q6_K output head present but quantize/matvec kernels unavailable \
+                             (LUMEN_CUDA_Q6K_HEAD=0 serves an F32 fallback)"
+                            .into(),
                     ))
                 }
             };
@@ -16199,7 +16212,66 @@ impl ComputeBackend for CudaBackend {
         // 3. MatVec: logits = output_proj * normed
         // Reuse the pre-allocated logits_gpu buffer from MutableState.
         {
-            if let Some(ref proj_q4a) = st.globals.output_proj_q4_aligned {
+            if let Some((ref ql, ref qh, ref sc, ref dd)) = st.globals.output_proj_q6k {
+                // Q6_K head (source K-quant, split planes) — the same route
+                // `compute_final_gpu` dispatches. MUST come first: when the
+                // planes exist, `globals.output_proj` is a one-float
+                // placeholder, so every other arm below would read garbage
+                // (the first post-prefill token flows through THIS finalizer,
+                // not compute_final_gpu — missing this arm collapsed the
+                // fidelity e2e to 2-token outputs).
+                let (quant_fn, mv_fn, q8_1_buf) = match (
+                    st.kernels.quantize_f32_to_q8_1.as_ref(),
+                    st.kernels.matvec_q6k_head.as_ref(),
+                    st.scratch.input_q8_1.as_mut(),
+                ) {
+                    (Some(q), Some(m), Some(b)) => (q, m, b),
+                    _ => {
+                        return Err(RuntimeError::Compute(
+                            "Q6_K output head present but quantize/matvec kernels unavailable"
+                                .into(),
+                        ))
+                    }
+                };
+                let out_dim_u32 = vocab_size as u32;
+                let in_dim_u32 = hidden_dim as u32;
+                let quant_grid = q8_1_quant_grid(in_dim_u32);
+                let quant_cfg = CudarcLaunchConfig {
+                    grid_dim: (quant_grid, 1, 1),
+                    block_dim: (Q8_1_QUANT_BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(quant_fn)
+                        .arg(&st.scratch.normed)
+                        .arg(&mut *q8_1_buf)
+                        .arg(&in_dim_u32)
+                        .launch(quant_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!("quantize final q6k head: {e}")))?;
+                let mv_cfg = CudarcLaunchConfig {
+                    grid_dim: (out_dim_u32.div_ceil(2), 1, 1),
+                    block_dim: (64, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(mv_fn)
+                        .arg(ql)
+                        .arg(qh)
+                        .arg(sc)
+                        .arg(dd)
+                        .arg(&*q8_1_buf)
+                        .arg(&mut st.logits_gpu)
+                        .arg(&out_dim_u32)
+                        .arg(&in_dim_u32)
+                        .launch(mv_cfg)
+                }
+                .map_err(|e| RuntimeError::Compute(format!("matvec_q6k_head launch: {e}")))?;
+            } else if let Some(ref proj_q4a) = st.globals.output_proj_q4_aligned {
                 // Q4Aligned dp4a output projection (highest priority for Q4_0).
                 if let (Some(ref quant_fn), Some(ref mv_fn)) = (
                     st.kernels.quantize_f32_to_q8_1.as_ref(),

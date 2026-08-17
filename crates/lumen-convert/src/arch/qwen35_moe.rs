@@ -305,6 +305,20 @@ fn compute_layer_shape_qwen35moe(
             *blob_offset += size;
             Ok(slice)
         } else if tensor.ggml_type == GgmlType::Q4_1 {
+            if target != ConvertTarget::Metal && crate::convert::source_fidelity() {
+                // SOURCE_FIDELITY: keep Q4_1 verbatim — MUST mirror the shared
+                // writer's Q4_1 keep in `append_tensor_to_blob_requant_with_target`
+                // (plan/writer size agreement), same as the dense converter.
+                let n_elements = tensor.n_elements();
+                let size = ((n_elements as usize / 32) * 20) as u64;
+                let slice = TensorSlice {
+                    offset: *blob_offset,
+                    length: size,
+                    quant: QuantScheme::Q4_1,
+                };
+                *blob_offset += size;
+                return Ok(slice);
+            }
             // Q4_1 has no dedicated GPU kernel -- requantize to Q4_0.
             let n_elements = tensor.n_elements();
             assert!(
@@ -486,7 +500,7 @@ fn compute_layer_shape_qwen35moe(
 
     // SSM tensors (linear attention layers only) — ssm_alpha/beta MUST be Q8_0.
     // Shared logic in gdn_gates handles force-requant from F32/F16/BF16 to Q8_0.
-    let ssm = compute_ssm_slices(gguf, layer, &mut blob_size, dequantize)?;
+    let ssm = compute_ssm_slices(gguf, layer, &mut blob_size, dequantize, target)?;
     let ssm_a = ssm.ssm_a;
     let ssm_conv1d = ssm.ssm_conv1d;
     let ssm_dt = ssm.ssm_dt;
@@ -730,7 +744,7 @@ fn write_qwen35moe_layer_blob<R: Read + Seek>(
 
     // SSM tensors (if present) — shared GDN gate logic handles force-requant
     // of ssm_alpha/beta to Q8_0 when source is F32/F16/BF16.
-    write_ssm_tensors(blob, reader, gguf, layer, dequantize)?;
+    write_ssm_tensors(blob, reader, gguf, layer, dequantize, target)?;
     {
         let name = layer_tensor_name(layer, SSM_OUT);
         if gguf.find_tensor(&name).is_some() {

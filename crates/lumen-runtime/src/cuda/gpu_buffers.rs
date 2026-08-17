@@ -762,8 +762,13 @@ fn upload_tensor(
                     let byte = bp[4 + i];
                     let lo = (byte & 0x0F) as f32;
                     let hi = ((byte >> 4) & 0x0F) as f32;
-                    f32_data[b * 32 + 2 * i] = scale * lo + min;
-                    f32_data[b * 32 + 2 * i + 1] = scale * hi + min;
+                    // GGML Q4_1 element order: low nibbles fill elements
+                    // 0..16, high nibbles fill 16..32 (de-interleaved — NOT
+                    // pairwise). The pairwise `2*i / 2*i+1` this used to do
+                    // permuted 30 of every 32 columns; dormant while no
+                    // artifact stored Q4_1, load-bearing for source fidelity.
+                    f32_data[b * 32 + i] = scale * lo + min;
+                    f32_data[b * 32 + 16 + i] = scale * hi + min;
                 }
             }
             let f16_bytes: Vec<u8> = f32_data

@@ -425,7 +425,7 @@ fn compute_layer_shape_qwen35(
     // SSM tensors (linear attention layers only) — never requantized to user target.
     // ssm_alpha/beta MUST be Q8_0 — the GDN runtime hardcodes Q8_0 matvec kernels.
     // Shared logic in gdn_gates handles force-requant from F32/F16/BF16 to Q8_0.
-    let ssm = compute_ssm_slices(gguf, layer, &mut blob_size, dequantize)?;
+    let ssm = compute_ssm_slices(gguf, layer, &mut blob_size, dequantize, target)?;
     let ssm_a = ssm.ssm_a;
     let ssm_conv1d = ssm.ssm_conv1d;
     let ssm_dt = ssm.ssm_dt;
@@ -655,7 +655,7 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
 
     // SSM tensors (if present) — shared GDN gate logic handles force-requant
     // of ssm_alpha/beta to Q8_0 when source is F32/F16/BF16.
-    write_ssm_tensors(blob, reader, gguf, layer, dequantize)?;
+    write_ssm_tensors(blob, reader, gguf, layer, dequantize, target)?;
     {
         let name = layer_tensor_name(layer, SSM_OUT);
         if gguf.find_tensor(&name).is_some() {
