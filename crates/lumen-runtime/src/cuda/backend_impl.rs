@@ -4497,7 +4497,9 @@ impl CudaBackend {
             // prefill and the fallback below.
             let mut q4_1_done = false;
             if let (Some(wd_q41), Some(quant_fn), Some(q8_1_buf)) = (
-                lw.q4_1_w_down.as_ref(),
+                lw.q4_1_w_down
+                    .as_ref()
+                    .filter(|_| crate::runtime_defaults::q4_1_down_enabled()),
                 st.kernels.quantize_f32_to_q8_1.as_ref(),
                 st.scratch
                     .input_q8_1
@@ -4856,6 +4858,7 @@ impl CudaBackend {
                 }
             }
         } else if lw.q4_1_w_down.is_some()
+            && crate::runtime_defaults::q4_1_down_enabled()
             && st.kernels.quantize_f32_to_q8_1.is_some()
             && st
                 .scratch
@@ -6256,7 +6259,8 @@ impl CudaBackend {
         // once here so the norm-gate site and Step 11 agree exactly.
         let ssm_ng_q8_eligible = crate::runtime_defaults::gdn_ng_q8_enabled()
             && st.kernels.gdn_prefill_norm_gate_q8.is_some()
-            && (lw.q8_split_ssm_out.is_some() || lw.ssm_out_q5k.is_some())
+            && (lw.q8_split_ssm_out.is_some()
+                || (lw.ssm_out_q5k.is_some() && crate::runtime_defaults::q5k_ssmout_enabled()))
             && p.head_dim % 32 == 0
             && p.head_dim > 0
             && p.head_dim <= 1024
@@ -7299,7 +7303,9 @@ impl CudaBackend {
             // (split planes). Mutually exclusive with the Q8 split sibling
             // below by construction (the artifact stores one format).
             if let (Some((ref qs, ref qh, ref sc, ref dm)), Some(quant_fn), Some(q8_1_buf)) = (
-                lw.ssm_out_q5k.as_ref(),
+                lw.ssm_out_q5k
+                    .as_ref()
+                    .filter(|_| crate::runtime_defaults::q5k_ssmout_enabled()),
                 st.kernels.quantize_q8_1_rawsum.as_ref(),
                 st.scratch
                     .input_q8_1
@@ -15033,6 +15039,24 @@ impl ComputeBackend for CudaBackend {
                     eprintln!("[CUDA mem] uploading BF16 output_proj raw: {raw_mb:.1} MB");
                     let gpu_bf16 = self.device.htod_copy(raw.as_slice())?;
                     (placeholder, None, None, None, Some(gpu_bf16))
+                }
+                QuantScheme::Q6_K if !crate::runtime_defaults::q6k_head_enabled() => {
+                    // Kill-switch (LUMEN_CUDA_Q6K_HEAD=0, debug/bisect): serve
+                    // the head from a host F32 dequant instead of the planes.
+                    // ~5 GB VRAM for the 27B head; F32 SGEMV dispatch.
+                    let n_elements = (raw.len() / 210) * 256;
+                    let f32_data = super::gpu_buffers::dequant_kquant_to_f32(
+                        raw,
+                        QuantScheme::Q6_K,
+                        n_elements,
+                        super::gpu_buffers::host_f16_to_f32,
+                    )?;
+                    eprintln!(
+                        "[CUDA mem] Q6K_HEAD disabled: uploading F32 head fallback ({:.1} MB)",
+                        (n_elements * 4) as f64 / 1.0e6
+                    );
+                    let gpu_f32 = self.device.htod_copy(&f32_data)?;
+                    (gpu_f32, None, None, None, None)
                 }
                 QuantScheme::Q6_K => {
                     // Q6_K head: split the 210-byte superblocks (ql 128 / qh 64

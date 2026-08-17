@@ -282,7 +282,7 @@ fn estimate_quant_elements(byte_len: usize, scheme: QuantScheme) -> usize {
 
 /// Host IEEE f16 bits -> f32. Module-level twin of the per-arm copies inside
 /// `upload_tensor`; used where a `fn(u16) -> f32` must be passed by name.
-fn host_f16_to_f32(bits: u16) -> f32 {
+pub(super) fn host_f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1f) as u32;
     let frac = (bits & 0x3ff) as u32;
@@ -373,7 +373,7 @@ fn decode_k_scales(scales: &[u8]) -> ([u8; 8], [u8; 8]) {
 ///
 /// All implementations match the reference layout exactly (same as
 /// lumen-convert::dequant).
-fn dequant_kquant_to_f32(
+pub(super) fn dequant_kquant_to_f32(
     raw: &[u8],
     scheme: QuantScheme,
     n_elements: usize,

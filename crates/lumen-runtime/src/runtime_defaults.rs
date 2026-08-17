@@ -1227,6 +1227,38 @@ pub fn ssmout_residual_fold_enabled() -> bool {
     })
 }
 
+/// `LUMEN_CUDA_Q5K_SSMOUT=0`: kill-switch for the source-fidelity Q5_K
+/// ssm_out decode route (falls back to the F16 image via HGEMV). Default ON.
+pub fn q5k_ssmout_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_Q5K_SSMOUT") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
+/// `LUMEN_CUDA_Q4_1_DOWN=0`: kill-switch for the source-fidelity Q4_1
+/// w_down decode route (falls back to the F16 image via HGEMV). Default ON.
+pub fn q4_1_down_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_Q4_1_DOWN") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
+/// `LUMEN_CUDA_Q6K_HEAD=0`: kill-switch for the source-fidelity Q6_K output
+/// head planes. When OFF the CUDA init skips the plane build and serves the
+/// head from the provider's F32 dequant copy (SGEMV; ~5 GB extra VRAM —
+/// debug/bisect only). Default ON.
+pub fn q6k_head_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_Q6K_HEAD") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
 /// Per-process default for `LUMEN_CUDA_SOA_LOCKED` when the env is unset.
 /// ON for quantised dense (the codegen-locked Q4_0 split matvec: word-load
 /// nibble stream + load-hoist + `.rn`-pinned epilogue, bit-deterministic and
@@ -1302,6 +1334,9 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CONVERT_KEEP_Q6K_OUTPUT",
     "LUMEN_CONVERT_SOURCE_FIDELITY",
     "LUMEN_CORR010_MODEL",
+    "LUMEN_CUDA_Q4_1_DOWN",
+    "LUMEN_CUDA_Q5K_SSMOUT",
+    "LUMEN_CUDA_Q6K_HEAD",
     "LUMEN_CUDA_ARGMAX_TILED",
     "LUMEN_CUDA_ATTN_BANK3",
     "LUMEN_CUDA_ATTN_PRECISE",
