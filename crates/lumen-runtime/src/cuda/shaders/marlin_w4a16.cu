@@ -160,3 +160,176 @@ void lumen_marlin_m1_g32_m8_bn128_probe(
         out_f32[wcol + c + 8u] = c2;
     }
 }
+
+// --------------------------------------------------------------------------
+// Pipelined production candidate: cp.async multi-stage GEMV.
+//
+// One CTA per 128 output columns, persistent over the full K extent.
+// Each pipeline stage covers K128: 16 weight tiles (8 KB), 4 scale groups
+// x 128 columns (1 KB) and 128 activation halves (256 B), staged to shared
+// memory with 16-byte cp.async.cg and consumed by the same fragment path the
+// probe kernel validates. Stage count is a compile-time knob
+// (LUMEN_MARLIN_STAGES, default 4) so the isolated sweep can A/B 2/3/4.
+//
+// Requires N % 128 == 0 and K % 128 == 0 (all converted 27B projections
+// satisfy both; the dispatcher must enforce, not assume).
+// --------------------------------------------------------------------------
+
+#ifndef LUMEN_MARLIN_STAGES
+#define LUMEN_MARLIN_STAGES 4
+#endif
+
+#define MARLIN_STAGE_W_U32 2048u  // 16 tiles x 128 words
+#define MARLIN_STAGE_S_U16 512u   // 4 groups x 128 cols
+#define MARLIN_STAGE_X_U16 128u
+#define MARLIN_STAGE_U32 (MARLIN_STAGE_W_U32 + MARLIN_STAGE_S_U16 / 2u + MARLIN_STAGE_X_U16 / 2u)
+#define MARLIN_CHUNKS_W 512u      // 16-byte cp.async chunks per stage
+#define MARLIN_CHUNKS_S 64u
+#define MARLIN_CHUNKS_X 16u
+#define MARLIN_CHUNKS (MARLIN_CHUNKS_W + MARLIN_CHUNKS_S + MARLIN_CHUNKS_X)
+
+__device__ __forceinline__ unsigned int smem_u32_addr(const void* ptr)
+{
+    unsigned int addr;
+    asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }"
+        : "=r"(addr) : "l"(ptr));
+    return addr;
+}
+
+__device__ __forceinline__ void cp_async_16(unsigned int smem_addr, const void* gptr)
+{
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                 :: "r"(smem_addr), "l"(gptr));
+}
+
+__device__ __forceinline__ void cp_async_commit()
+{
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+// Wait until at most `n` copy groups remain in flight (immediate operand).
+#define CP_ASYNC_WAIT(n) asm volatile("cp.async.wait_group %0;\n" :: "n"(n))
+
+// Issue one stage's copies: k-base `kb`, ring slot `slot`.
+__device__ __forceinline__ void marlin_issue_stage(
+    unsigned int* smem, unsigned int slot,
+    const unsigned int* __restrict__ q_words,
+    const unsigned short* __restrict__ scale_bits,
+    const unsigned short* __restrict__ x_f16,
+    unsigned int n_dim, unsigned int kb, unsigned int cta_chunk64)
+{
+    unsigned int* stage = smem + slot * MARLIN_STAGE_U32;
+    unsigned int* stage_w = stage;
+    unsigned short* stage_s = (unsigned short*)(stage + MARLIN_STAGE_W_U32);
+    unsigned short* stage_x = stage_s + MARLIN_STAGE_S_U16;
+    const unsigned int tiles_per_krow = n_dim / 64u;
+    const unsigned int g0 = kb >> 5;
+
+    for (unsigned int i = threadIdx.x; i < MARLIN_CHUNKS; i += MARLIN_THREADS) {
+        if (i < MARLIN_CHUNKS_W) {
+            const unsigned int tile_seq = i / 32u;   // 0..16: (kt, chunk-half)
+            const unsigned int kt = tile_seq / 2u;
+            const unsigned int tl = tile_seq % 2u;
+            const unsigned int cw = i % 32u;         // 16B chunk inside tile
+            const unsigned long long gtile =
+                (unsigned long long)((kb >> 4) + kt) * tiles_per_krow
+                + cta_chunk64 + tl;
+            cp_async_16(smem_u32_addr(stage_w + kt * 256u + tl * 128u + cw * 4u),
+                        q_words + gtile * 128u + cw * 4u);
+        } else if (i < MARLIN_CHUNKS_W + MARLIN_CHUNKS_S) {
+            const unsigned int j = i - MARLIN_CHUNKS_W;
+            const unsigned int gl = j / 16u;         // group 0..4
+            const unsigned int ch = (j % 16u) / 8u;  // chunk half 0..2
+            const unsigned int w16 = (j % 8u) * 8u;  // u16 offset in chunk
+            cp_async_16(smem_u32_addr(stage_s + gl * 128u + ch * 64u + w16),
+                        scale_bits + (unsigned long long)(g0 + gl) * n_dim
+                            + (cta_chunk64 + ch) * 64u + w16);
+        } else {
+            const unsigned int j = i - MARLIN_CHUNKS_W - MARLIN_CHUNKS_S;
+            cp_async_16(smem_u32_addr(stage_x + j * 8u), x_f16 + kb + j * 8u);
+        }
+    }
+    cp_async_commit();
+}
+
+extern "C" __global__ __launch_bounds__(MARLIN_THREADS, 1)
+void lumen_marlin_m1_g32_m8_bn128_s4(
+    const unsigned int* __restrict__ q_words,
+    const unsigned short* __restrict__ scale_bits,
+    const unsigned short* __restrict__ x_f16,
+    float* __restrict__ out_f32,
+    unsigned int n_dim,
+    unsigned int k_dim)
+{
+    __shared__ unsigned int smem[LUMEN_MARLIN_STAGES * MARLIN_STAGE_U32];
+
+    const unsigned int warp = threadIdx.x / 32u;
+    const unsigned int lane = threadIdx.x % 32u;
+    const unsigned int n0 = blockIdx.x * 128u;
+    const unsigned int wcol = n0 + 16u * warp;
+    const unsigned int wp = warp % 4u;   // packing warp inside the tile
+    const unsigned int tl = warp / 4u;   // which of the CTA's two 64-chunks
+    const unsigned int cta_chunk64 = n0 / 64u;
+    const unsigned int c = lane / 4u;
+    const unsigned int nstages = k_dim >> 7;
+
+    float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+
+    // Prologue: fill all but one ring slot. If K is too short to fill the
+    // ring, pad with EMPTY commit groups so the fixed `wait_group` count
+    // below still proves the oldest real stage has landed.
+    unsigned int issued = 0;
+    for (; issued < (unsigned int)(LUMEN_MARLIN_STAGES - 1) && issued < nstages; issued++) {
+        marlin_issue_stage(smem, issued % LUMEN_MARLIN_STAGES, q_words, scale_bits,
+                           x_f16, n_dim, issued * 128u, cta_chunk64);
+    }
+    for (unsigned int e = issued; e < (unsigned int)(LUMEN_MARLIN_STAGES - 1); e++) {
+        cp_async_commit();
+    }
+
+    for (unsigned int s = 0; s < nstages; s++) {
+        CP_ASYNC_WAIT(LUMEN_MARLIN_STAGES - 2);
+        __syncthreads();
+
+        // Overlap: issue the stage that will be needed furthest ahead into
+        // the slot freed by the previous iteration's compute.
+        if (issued < nstages) {
+            marlin_issue_stage(smem, issued % LUMEN_MARLIN_STAGES, q_words, scale_bits,
+                               x_f16, n_dim, issued * 128u, cta_chunk64);
+            issued++;
+        }
+
+        const unsigned int* stage = smem + (s % LUMEN_MARLIN_STAGES) * MARLIN_STAGE_U32;
+        const unsigned int* stage_w = stage;
+        const unsigned int* stage_s32 = stage + MARLIN_STAGE_W_U32;      // scales as u32
+        const unsigned int* stage_x32 = stage + MARLIN_STAGE_W_U32 + MARLIN_STAGE_S_U16 / 2u;
+
+        unsigned int s_n2 = 0u, s_n8_2 = 0u;
+        #pragma unroll
+        for (unsigned int k16 = 0; k16 < 8u; k16++) {
+            if ((k16 & 1u) == 0u) {
+                const unsigned int gl = k16 >> 1;
+                const unsigned int sv = stage_s32[gl * 64u + tl * 32u + 4u * c + wp];
+                s_n2 = prmt(sv, 0x1010u);
+                s_n8_2 = prmt(sv, 0x3232u);
+            }
+            const unsigned int word = stage_w[k16 * 256u + tl * 128u + lane * 4u + wp];
+            unsigned int a0, a1, a2, a3;
+            dequant_frag_a(word, s_n2, s_n8_2, a0, a1, a2, a3);
+
+            unsigned int b0 = 0u, b1 = 0u;
+            if (lane < 4u) {
+                b0 = stage_x32[k16 * 8u + lane];
+                b1 = stage_x32[k16 * 8u + lane + 4u];
+            }
+            mma_m16n8k16_f32(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+        }
+        // No trailing barrier: the next iteration's wait_group + head
+        // __syncthreads fences the ring slot before it is overwritten.
+    }
+
+    if ((lane & 3u) == 0u) {
+        out_f32[wcol + c] = c0;
+        out_f32[wcol + c + 8u] = c2;
+    }
+}
