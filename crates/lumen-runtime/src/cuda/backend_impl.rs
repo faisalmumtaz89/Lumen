@@ -845,6 +845,21 @@ struct GdnScratchGpu {
 /// `compute_layer` takes `&self`, so mutable GPU state (scratch buffers,
 /// KV caches) must be wrapped in a Mutex. The lock is uncontended in
 /// single-threaded inference (~20ns overhead, negligible vs GPU compute).
+/// Where a layer left the updated hidden state.
+///
+/// The FFN down projection can fold its residual and write `x_gpu` directly
+/// (LUMEN_CUDA_FFN_DIRECT_RESIDUAL), which makes the decode loop's commit copy
+/// redundant. Returning that fact beats a sticky flag on `MutableState`: the
+/// dispatch site and the two decode paths would otherwise each have to agree
+/// on setting and clearing it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayerOutput {
+    /// Result is in `scratch.attn_proj`; the caller must commit it to `x_gpu`.
+    NeedsCommit,
+    /// Result is already in `scratch.x_gpu`.
+    InPlace,
+}
+
 struct MutableState {
     /// Compiled kernel function handles.
     kernels: KernelSet,
@@ -2159,7 +2174,7 @@ impl CudaBackend {
         layer_idx: usize,
         seq_pos: usize,
         st: &mut MutableState,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<LayerOutput, RuntimeError> {
         let hp = self.hp()?;
         let hidden_dim = hp.hidden_dim as usize;
         let num_heads = hp.num_heads as usize;
@@ -3568,12 +3583,20 @@ impl CudaBackend {
                 eprintln!("[XCHK] step={step} L={layer_idx} moe_expert_ids={ids:?} gate_w={ws:?}");
             }
 
-            // MoE branch is complete; skip the dense FFN block below.
+            // MoE branch is complete; skip the dense FFN block below. The MoE
+            // FFN wrote the post-FFN state in-place to `x_gpu`, so the caller
+            // must NOT commit `attn_proj` over it.
             if let Some(p) = st.profiler.as_mut() {
                 p.end("ffn", &self.device.stream);
             }
-            return Ok(());
+            return Ok(LayerOutput::InPlace);
         }
+
+        // FFN direct-residual: set when the down projection folds the residual
+        // into its own store and writes x_gpu directly, eliding BOTH the
+        // residual_add launch and the decode loop's layer-commit D2D copy
+        // (2 commands x 64 layers = 128 per token).
+        let mut ffn_in_place = false;
 
         // 6. FFN: fused or separate rmsnorm + gate/up + swiglu + down + residual.
         //
@@ -4235,32 +4258,72 @@ impl CudaBackend {
                             .launch(launch_cfg)
                     }
                     .map_err(|e| RuntimeError::Compute(format!("rmsnorm_to_q8_1 ffn: {e}")))?;
-                    unsafe {
-                        // split-layout: prefer Q8Split/Q4Split sibling buffers on FFN gate/up when set.
-                        launch_matvec_preq8_1_split(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_gate,
-                            lw.q8_split_w_gate.as_ref(),
-                            lw.q4_split_w_gate.as_ref(),
-                            q8_1_buf,
-                            &mut st.scratch.gate,
-                            inter_dim,
-                            hidden_dim,
-                            "gate",
-                        )?;
-                        launch_matvec_preq8_1_split(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_up,
-                            lw.q8_split_w_up.as_ref(),
-                            lw.q4_split_w_up.as_ref(),
-                            q8_1_buf,
-                            &mut st.scratch.up,
-                            inter_dim,
-                            hidden_dim,
-                            "up",
-                        )?;
+                    // LUMEN_CUDA_FFN_GATE_UP_BANK=1: one banked launch covers
+                    // gate's rows then up's rows off the shared Q8_1 input
+                    // (baseline 256-thread kernel forced — B160/V4 are GDN-only
+                    // wins). Per-row body identical => bit-identical outputs.
+                    let bank_gate_up = crate::runtime_defaults::ffn_gate_up_bank()
+                        && st.kernels.use_q4_split_dispatch
+                        && st.kernels.matvec_q4_split_q8_1_locked_banked.is_some()
+                        && lw.q4_split_w_gate.is_some()
+                        && lw.q4_split_w_up.is_some();
+                    if bank_gate_up {
+                        let (gate_out, up_out) = (&mut st.scratch.gate, &mut st.scratch.up);
+                        unsafe {
+                            launch_matvec_preq8_1_q4_banked(
+                                &self.device,
+                                &st.kernels,
+                                lw.q4_split_w_gate.as_ref().unwrap(),
+                                lw.q4_split_w_up.as_ref().unwrap(),
+                                q8_1_buf,
+                                gate_out,
+                                up_out,
+                                inter_dim,
+                                inter_dim,
+                                hidden_dim,
+                                "ffn gate+up bank",
+                                true,
+                            )?;
+                        }
+                        {
+                            use std::sync::OnceLock;
+                            static MARK: OnceLock<()> = OnceLock::new();
+                            MARK.get_or_init(|| {
+                                if super::decode::cuda_verbose() {
+                                    eprintln!(
+                                        "[CUDA] FFN_GATE_UP_BANK: gate+up as one banked launch (baseline kernel)"
+                                    );
+                                }
+                            });
+                        }
+                    } else {
+                        unsafe {
+                            // split-layout: prefer Q8Split/Q4Split sibling buffers on FFN gate/up when set.
+                            launch_matvec_preq8_1_split(
+                                &self.device,
+                                &st.kernels,
+                                &lw.w_gate,
+                                lw.q8_split_w_gate.as_ref(),
+                                lw.q4_split_w_gate.as_ref(),
+                                q8_1_buf,
+                                &mut st.scratch.gate,
+                                inter_dim,
+                                hidden_dim,
+                                "gate",
+                            )?;
+                            launch_matvec_preq8_1_split(
+                                &self.device,
+                                &st.kernels,
+                                &lw.w_up,
+                                lw.q8_split_w_up.as_ref(),
+                                lw.q4_split_w_up.as_ref(),
+                                q8_1_buf,
+                                &mut st.scratch.up,
+                                inter_dim,
+                                hidden_dim,
+                                "up",
+                            )?;
+                        }
                     }
                 } else if ffn_use_preq {
                     // Fallback: separate rmsnorm + quantize_f32_to_q8_1 (fused kernel unavailable).
@@ -4378,6 +4441,34 @@ impl CudaBackend {
                 }
             }
         } // end if !fused_glu_fired
+
+        // One-shot down-route census (verbose): names the branch the down
+        // projection will actually take, so dispatch changes can be verified
+        // against the live route instead of a fallback.
+        {
+            use std::sync::OnceLock;
+            static ROUTE: OnceLock<()> = OnceLock::new();
+            ROUTE.get_or_init(|| {
+                if super::decode::cuda_verbose() {
+                    let variant = match &lw.w_down {
+                        GpuWeightBuf::F32(_) => "F32",
+                        GpuWeightBuf::F16Raw(_) => "F16Raw",
+                        GpuWeightBuf::Bf16Raw(_) => "Bf16Raw",
+                        GpuWeightBuf::Q8Raw(_) => "Q8Raw",
+                        GpuWeightBuf::Q8Aligned(_) => "Q8Aligned",
+                        GpuWeightBuf::Q4Raw(_) => "Q4Raw",
+                        GpuWeightBuf::Q4Aligned(_) => "Q4Aligned",
+                        _ => "other",
+                    };
+                    eprintln!(
+                        "[CUDA route] ffn down: w_down={variant} fused_glu_fired={fused_glu_fired} q8_split_sib={} q4_split_sib={} f16_cache={}",
+                        lw.q8_split_w_down.is_some(),
+                        lw.q4_split_w_down.is_some(),
+                        lw.w_down_f16.is_some(),
+                    );
+                }
+            });
+        }
 
         // SwiGLU + Down projection.
         //
@@ -4512,7 +4603,56 @@ impl CudaBackend {
             } else if let GpuWeightBuf::Q4Aligned(ref wd_q4a) = lw.w_down {
                 // Fused down for Q4Aligned: inline F32->Q8_1 quantize + dp4a in one dispatch.
                 // Eliminates the separate quantize_f32_to_q8_1 kernel.
-                if let Some(ref fused_fn) = st.kernels.matvec_q4_aligned_f32 {
+                //
+                // LUMEN_CUDA_FFN_DIRECT_RESIDUAL=1: use the residual sibling
+                // (already loaded) with attn_proj as the residual and x_gpu as
+                // the store — the residual add is the same single plain f32 add
+                // the separate residual_add launch performs (the reduce ends in
+                // an add, so no FMA contraction is possible), keeping output
+                // bytes unchanged while eliding residual_add + the layer-commit
+                // D2D (2 commands x 64 layers per token).
+                let direct_resid_q4a = crate::runtime_defaults::ffn_direct_residual()
+                    && st.kernels.matvec_q4_aligned_f32_residual.is_some();
+                if direct_resid_q4a {
+                    let fused_fn = st.kernels.matvec_q4_aligned_f32_residual.as_ref().unwrap();
+                    let out_dim_u32 = hidden_dim as u32;
+                    let in_dim_u32 = inter_dim as u32;
+                    let grid = dp4a_q4_grid(out_dim_u32);
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (DP4A_Q4_BLOCK_DIM, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(fused_fn)
+                            .arg(wd_q4a)
+                            .arg(&st.scratch.gate)
+                            .arg(&st.scratch.attn_proj)
+                            .arg(&mut st.scratch.x_gpu)
+                            .arg(&out_dim_u32)
+                            .arg(&in_dim_u32)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec_q4_aligned_f32_residual down L{layer_idx}: {e}",
+                        ))
+                    })?;
+                    ffn_in_place = true;
+                    {
+                        use std::sync::OnceLock;
+                        static MARK: OnceLock<()> = OnceLock::new();
+                        MARK.get_or_init(|| {
+                            if super::decode::cuda_verbose() {
+                                eprintln!(
+                                    "[CUDA] FFN_DIRECT_RESIDUAL: q4-aligned down folds residual -> x_gpu"
+                                );
+                            }
+                        });
+                    }
+                } else if let Some(ref fused_fn) = st.kernels.matvec_q4_aligned_f32 {
                     let out_dim_u32 = hidden_dim as u32;
                     let in_dim_u32 = inter_dim as u32;
                     let grid = dp4a_q4_grid(out_dim_u32);
@@ -4577,18 +4717,51 @@ impl CudaBackend {
                                 inter_dim,
                                 "down split",
                             )?;
-                            launch_matvec_preq8_1_split(
-                                &self.device,
-                                &st.kernels,
-                                &lw.w_down,
-                                lw.q8_split_w_down.as_ref(),
-                                lw.q4_split_w_down.as_ref(),
-                                q8_1_buf,
-                                &mut st.scratch.down,
-                                hidden_dim,
-                                inter_dim,
-                                "down",
-                            )?;
+                            if crate::runtime_defaults::ffn_direct_residual() {
+                                // Fold the residual into the down projection's
+                                // own store: x_gpu = W_down*q8 + attn_proj.
+                                // dot+residual uses the same locked fadd_rn as
+                                // the separate residual_add (IEEE add commutes
+                                // bit-exactly), so output bytes are unchanged.
+                                launch_matvec_preq8_1_residual_split(
+                                    &self.device,
+                                    &st.kernels,
+                                    &lw.w_down,
+                                    lw.q8_split_w_down.as_ref(),
+                                    lw.q4_split_w_down.as_ref(),
+                                    q8_1_buf,
+                                    &st.scratch.attn_proj,
+                                    &mut st.scratch.x_gpu,
+                                    hidden_dim,
+                                    inter_dim,
+                                    "down",
+                                )?;
+                                ffn_in_place = true;
+                                {
+                                    use std::sync::OnceLock;
+                                    static MARK: OnceLock<()> = OnceLock::new();
+                                    MARK.get_or_init(|| {
+                                        if super::decode::cuda_verbose() {
+                                            eprintln!(
+                                                "[CUDA] FFN_DIRECT_RESIDUAL: down folds residual -> x_gpu (residual_add + layer-commit D2D elided)"
+                                            );
+                                        }
+                                    });
+                                }
+                            } else {
+                                launch_matvec_preq8_1_split(
+                                    &self.device,
+                                    &st.kernels,
+                                    &lw.w_down,
+                                    lw.q8_split_w_down.as_ref(),
+                                    lw.q4_split_w_down.as_ref(),
+                                    q8_1_buf,
+                                    &mut st.scratch.down,
+                                    hidden_dim,
+                                    inter_dim,
+                                    "down",
+                                )?;
+                            }
                         }
                     } else {
                         unsafe {
@@ -4750,7 +4923,59 @@ impl CudaBackend {
             // Reads F32 gateand up[], computes silu(gate)*up inline,
             // quantizes to Q8_1 in registers, and does dp4a against Q4Aligned weights.
             // Replaces 3 dispatches (swiglu + quantize + matvec) with 1.
-            if let Some(ref fused_fn) = st.kernels.matvec_q4_aligned_f32_swiglu {
+            //
+            // LUMEN_CUDA_FFN_DIRECT_RESIDUAL=1: the _residual sibling folds the
+            // residual into the same dispatch (attn_proj as residual, x_gpu as
+            // the store) — one plain f32 add identical to the separate
+            // residual_add launch, so output bytes are unchanged while the
+            // residual_add + layer-commit D2D pair (2 x 64 per token) is elided.
+            let direct_resid_q4sw = crate::runtime_defaults::ffn_direct_residual()
+                && st.kernels.matvec_q4_aligned_f32_swiglu_residual.is_some();
+            if direct_resid_q4sw {
+                let fused_fn = st
+                    .kernels
+                    .matvec_q4_aligned_f32_swiglu_residual
+                    .as_ref()
+                    .unwrap();
+                let out_dim_u32 = hidden_dim as u32;
+                let in_dim_u32 = inter_dim as u32;
+                let grid = dp4a_q4_grid(out_dim_u32);
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (DP4A_Q4_BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(fused_fn)
+                        .arg(wd_q4a)
+                        .arg(&st.scratch.gate)
+                        .arg(&st.scratch.up)
+                        .arg(&st.scratch.attn_proj)
+                        .arg(&mut st.scratch.x_gpu)
+                        .arg(&out_dim_u32)
+                        .arg(&in_dim_u32)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "matvec_q4_aligned_f32_swiglu_residual down L{layer_idx}: {e}",
+                    ))
+                })?;
+                ffn_in_place = true;
+                {
+                    use std::sync::OnceLock;
+                    static MARK: OnceLock<()> = OnceLock::new();
+                    MARK.get_or_init(|| {
+                        if super::decode::cuda_verbose() {
+                            eprintln!(
+                                "[CUDA] FFN_DIRECT_RESIDUAL: q4-aligned swiglu-down folds residual -> x_gpu"
+                            );
+                        }
+                    });
+                }
+            } else if let Some(ref fused_fn) = st.kernels.matvec_q4_aligned_f32_swiglu {
                 let out_dim_u32 = hidden_dim as u32;
                 let in_dim_u32 = inter_dim as u32;
                 let grid = dp4a_q4_grid(out_dim_u32);
@@ -4852,18 +5077,51 @@ impl CudaBackend {
                             inter_dim,
                             "down split (sep swiglu)",
                         )?;
-                        launch_matvec_preq8_1_split(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_down,
-                            lw.q8_split_w_down.as_ref(),
-                            lw.q4_split_w_down.as_ref(),
-                            q8_1_buf,
-                            &mut st.scratch.down,
-                            hidden_dim,
-                            inter_dim,
-                            "down",
-                        )?;
+                        if crate::runtime_defaults::ffn_direct_residual() {
+                            // Fold the residual into the split down matvec's
+                            // own store (residual sibling kernel, same locked
+                            // fadd.rn add as the separate residual_add), and
+                            // write x_gpu directly — eliding residual_add and
+                            // the layer-commit D2D (2 x 64 commands/token).
+                            launch_matvec_preq8_1_residual_split(
+                                &self.device,
+                                &st.kernels,
+                                &lw.w_down,
+                                lw.q8_split_w_down.as_ref(),
+                                lw.q4_split_w_down.as_ref(),
+                                q8_1_buf,
+                                &st.scratch.attn_proj,
+                                &mut st.scratch.x_gpu,
+                                hidden_dim,
+                                inter_dim,
+                                "down",
+                            )?;
+                            ffn_in_place = true;
+                            {
+                                use std::sync::OnceLock;
+                                static MARK: OnceLock<()> = OnceLock::new();
+                                MARK.get_or_init(|| {
+                                    if super::decode::cuda_verbose() {
+                                        eprintln!(
+                                            "[CUDA] FFN_DIRECT_RESIDUAL: sep-swiglu split down folds residual -> x_gpu"
+                                        );
+                                    }
+                                });
+                            }
+                        } else {
+                            launch_matvec_preq8_1_split(
+                                &self.device,
+                                &st.kernels,
+                                &lw.w_down,
+                                lw.q8_split_w_down.as_ref(),
+                                lw.q4_split_w_down.as_ref(),
+                                q8_1_buf,
+                                &mut st.scratch.down,
+                                hidden_dim,
+                                inter_dim,
+                                "down",
+                            )?;
+                        }
                     }
                 } else {
                     unsafe {
@@ -4902,7 +5160,10 @@ impl CudaBackend {
         }
 
         // Residual add: attn_proj += down.
-        {
+        //
+        // SKIPPED when the down projection already folded it in and wrote
+        // x_gpu directly (ffn_in_place).
+        if !ffn_in_place {
             let config = LaunchConfig::for_elements(hidden_dim);
             let launch_cfg = CudarcLaunchConfig {
                 grid_dim: (config.grid_dim, 1, 1),
@@ -4925,9 +5186,13 @@ impl CudaBackend {
         if let Some(p) = st.profiler.as_mut() {
             p.end("ffn", &self.device.stream);
         }
-        // Layer output is now in st.scratch.attn_proj. The caller must copy it
-        // to st.scratch.x_gpu before the next layer (done via device memcpy).
-        Ok(())
+        // NeedsCommit: layer output is in st.scratch.attn_proj and the caller
+        // copies it to st.scratch.x_gpu. InPlace: x_gpu already holds it.
+        Ok(if ffn_in_place {
+            LayerOutput::InPlace
+        } else {
+            LayerOutput::NeedsCommit
+        })
     }
 
     /// Lazily allocate GDN GPU scratch buffers on first use.
@@ -5321,6 +5586,7 @@ impl CudaBackend {
                         p.value_dim,
                         hidden_dim,
                         "gdn_qkv_gate_bank",
+                        false,
                     )?;
                 }
             } else if !gdn_skip_dup_qkv {
@@ -9440,7 +9706,7 @@ impl CudaBackend {
             p.end("embed", &self.device.stream);
         }
         for layer in 0..num_layers {
-            self.compute_layer_gpu(layer, seq_pos, st)?;
+            let layer_out = self.compute_layer_gpu(layer, seq_pos, st)?;
             // FIX-DTOD: For DENSE layers, dense FFN writes to a separate
             // buffer (attn_proj) and we propagate the post-FFN residual to x_gpu
             // here. For MoE layers, `encode_moe_ffn_decode` writes the MoE FFN
@@ -9448,12 +9714,7 @@ impl CudaBackend {
             // OVERWROTE that output with the stale pre-FFN attn+residual,
             // destroying the MoE contribution every layer, every token. Gate
             // on moe_meta_cache to skip the dtod for MoE layers.
-            let is_moe_layer = st
-                .moe_meta_cache
-                .get(layer)
-                .and_then(|m| m.as_ref())
-                .is_some();
-            if !is_moe_layer {
+            if layer_out == LayerOutput::NeedsCommit {
                 self.device
                     .stream
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
@@ -9557,16 +9818,13 @@ impl CudaBackend {
             p.end("embed", &self.device.stream);
         }
         for layer in 0..num_layers {
-            self.compute_layer_gpu(layer, seq_pos, st)?;
-            // Mirror decode_token_normal's FIX-DTOD: propagate the post-FFN
-            // residual for dense layers; skip for MoE layers (encode_moe_ffn_decode
-            // already wrote the post-FFN state in-place to st.scratch.x_gpu).
-            let is_moe_layer = st
-                .moe_meta_cache
-                .get(layer)
-                .and_then(|m| m.as_ref())
-                .is_some();
-            if !is_moe_layer {
+            let layer_out = self.compute_layer_gpu(layer, seq_pos, st)?;
+            // Commit the layer result per the typed contract: NeedsCommit
+            // means the post-FFN state is in `attn_proj` (dense layers whose
+            // down route did not fold the residual); InPlace covers both the
+            // direct-residual fold and the MoE FFN, which write `x_gpu`
+            // themselves.
+            if layer_out == LayerOutput::NeedsCommit {
                 self.device
                     .stream
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
@@ -11564,9 +11822,15 @@ unsafe fn launch_matvec_preq8_1_q4_banked(
     out_b_dim: usize,
     in_dim: usize,
     label: &str,
+    force_baseline: bool,
 ) -> Result<(), RuntimeError> {
-    let v4_ok = crate::runtime_defaults::q4_v4load_enabled() && ((in_dim >> 5) * 2) % 16 == 0;
-    let use_b160 = crate::runtime_defaults::q4_b160_enabled()
+    // `force_baseline` pins the 256-thread/u32 kernel: the B160/V4 variants
+    // are banked wins only on the GDN pool and measured regressions on FFN.
+    let v4_ok = !force_baseline
+        && crate::runtime_defaults::q4_v4load_enabled()
+        && ((in_dim >> 5) * 2) % 16 == 0;
+    let use_b160 = !force_baseline
+        && crate::runtime_defaults::q4_b160_enabled()
         && (in_dim >> 5) == 160
         && kernels.matvec_q4_split_q8_1_locked_banked_b160.is_some();
     let mv_fn = if use_b160 && v4_ok && kernels.matvec_q4_split_q8_1_locked_banked_b160_v4.is_some()
@@ -14851,7 +15115,16 @@ impl ComputeBackend for CudaBackend {
             // Upload x to GPU, run GPU-resident compute, download result.
             let x_f32 = x.as_f32_slice();
             self.device.htod_copy_into(x_f32, &mut st.scratch.x_gpu)?;
-            self.compute_layer_gpu(layer_idx, seq_pos, st)?;
+            let layer_out = self.compute_layer_gpu(layer_idx, seq_pos, st)?;
+            // Honor the typed placement contract: NeedsCommit leaves the
+            // post-FFN state in `attn_proj`; downloading `x_gpu` without the
+            // commit copy would return the stale pre-layer activation.
+            if layer_out == LayerOutput::NeedsCommit {
+                self.device
+                    .stream
+                    .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
+                    .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
+            }
             self.device.synchronize()?;
             let result = self.device.dtoh_copy(&st.scratch.x_gpu)?;
             x.write_f32_from(&result);

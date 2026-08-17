@@ -1305,6 +1305,8 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_ATTN_PRECISE",
     "LUMEN_CUDA_ATTN_PRECISE_DBG",
     "LUMEN_CUDA_ATTN_PREP_FUSE",
+    "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
+    "LUMEN_CUDA_FFN_GATE_UP_BANK",
     "LUMEN_CUDA_BF16_AUTOTUNE",
     "LUMEN_CUDA_BF16_GEMMEX",
     "LUMEN_CUDA_BF16_MATVEC",
@@ -2532,6 +2534,8 @@ mod tests {
         "LUMEN_CUDA_ATTN_PRECISE",
         "LUMEN_CUDA_ATTN_PRECISE_DBG",
         "LUMEN_CUDA_ATTN_PREP_FUSE",
+        "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
+        "LUMEN_CUDA_FFN_GATE_UP_BANK",
         "LUMEN_CUDA_BF16_AUTOTUNE",
         "LUMEN_CUDA_BF16_GEMMEX",
         "LUMEN_CUDA_BF16_MATVEC",
@@ -2689,4 +2693,35 @@ mod tests {
             );
         }
     }
+}
+
+/// `LUMEN_CUDA_FFN_DIRECT_RESIDUAL` (default ON; `=0` opts out): the
+/// FFN down projection folds its residual into its own store and writes
+/// `x_gpu` directly, eliding both the `residual_add` launch and the decode
+/// loop's layer-commit D2D copy (2 commands x 64 layers per token). On the
+/// validated Q4/Q8 split routes the residual add is the same explicitly
+/// pinned single `add.rn.f32` the separate launch performs, so output bytes
+/// are unchanged; routes without an eligible residual sibling keep the
+/// separate tail.
+pub fn ffn_direct_residual() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_FFN_DIRECT_RESIDUAL") {
+        Ok(v) => v != "0",
+        Err(_) => canonical_default_on(),
+    })
+}
+
+/// `LUMEN_CUDA_FFN_GATE_UP_BANK` (default ON; `=0` opts out): FFN
+/// gate and up projections issue as ONE banked launch off the shared Q8_1
+/// input (baseline 256-thread kernel; B160/V4 variants are GDN-only wins and
+/// measured FFN regressions). Bit-identical per row to the two-launch
+/// route.
+pub fn ffn_gate_up_bank() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_FFN_GATE_UP_BANK") {
+        Ok(v) => v != "0",
+        Err(_) => canonical_default_on(),
+    })
 }
