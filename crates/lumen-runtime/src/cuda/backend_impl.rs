@@ -3583,12 +3583,13 @@ impl CudaBackend {
                 eprintln!("[XCHK] step={step} L={layer_idx} moe_expert_ids={ids:?} gate_w={ws:?}");
             }
 
-            // MoE branch is complete; skip the dense FFN block below. MoE
-            // leaves its result in attn_proj, so the caller still commits.
+            // MoE branch is complete; skip the dense FFN block below. The MoE
+            // FFN wrote the post-FFN state in-place to `x_gpu`, so the caller
+            // must NOT commit `attn_proj` over it.
             if let Some(p) = st.profiler.as_mut() {
                 p.end("ffn", &self.device.stream);
             }
-            return Ok(LayerOutput::NeedsCommit);
+            return Ok(LayerOutput::InPlace);
         }
 
         // FFN direct-residual: set when the down projection folds the residual
@@ -9713,12 +9714,7 @@ impl CudaBackend {
             // OVERWROTE that output with the stale pre-FFN attn+residual,
             // destroying the MoE contribution every layer, every token. Gate
             // on moe_meta_cache to skip the dtod for MoE layers.
-            let is_moe_layer = st
-                .moe_meta_cache
-                .get(layer)
-                .and_then(|m| m.as_ref())
-                .is_some();
-            if !is_moe_layer && layer_out == LayerOutput::NeedsCommit {
+            if layer_out == LayerOutput::NeedsCommit {
                 self.device
                     .stream
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
@@ -9823,15 +9819,12 @@ impl CudaBackend {
         }
         for layer in 0..num_layers {
             let layer_out = self.compute_layer_gpu(layer, seq_pos, st)?;
-            // Mirror decode_token_normal's FIX-DTOD: propagate the post-FFN
-            // residual for dense layers; skip for MoE layers (encode_moe_ffn_decode
-            // already wrote the post-FFN state in-place to st.scratch.x_gpu).
-            let is_moe_layer = st
-                .moe_meta_cache
-                .get(layer)
-                .and_then(|m| m.as_ref())
-                .is_some();
-            if !is_moe_layer && layer_out == LayerOutput::NeedsCommit {
+            // Commit the layer result per the typed contract: NeedsCommit
+            // means the post-FFN state is in `attn_proj` (dense layers whose
+            // down route did not fold the residual); InPlace covers both the
+            // direct-residual fold and the MoE FFN, which write `x_gpu`
+            // themselves.
+            if layer_out == LayerOutput::NeedsCommit {
                 self.device
                     .stream
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
@@ -15122,7 +15115,16 @@ impl ComputeBackend for CudaBackend {
             // Upload x to GPU, run GPU-resident compute, download result.
             let x_f32 = x.as_f32_slice();
             self.device.htod_copy_into(x_f32, &mut st.scratch.x_gpu)?;
-            self.compute_layer_gpu(layer_idx, seq_pos, st)?;
+            let layer_out = self.compute_layer_gpu(layer_idx, seq_pos, st)?;
+            // Honor the typed placement contract: NeedsCommit leaves the
+            // post-FFN state in `attn_proj`; downloading `x_gpu` without the
+            // commit copy would return the stale pre-layer activation.
+            if layer_out == LayerOutput::NeedsCommit {
+                self.device
+                    .stream
+                    .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
+                    .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
+            }
             self.device.synchronize()?;
             let result = self.device.dtoh_copy(&st.scratch.x_gpu)?;
             x.write_f32_from(&result);
