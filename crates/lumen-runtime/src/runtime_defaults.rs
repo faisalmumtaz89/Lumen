@@ -2701,10 +2701,8 @@ mod tests {
 /// loop's layer-commit D2D copy (2 commands x 64 layers per token). On the
 /// validated Q4/Q8 split routes the residual add is the same explicitly
 /// pinned single `add.rn.f32` the separate launch performs, so output bytes
-/// are unchanged (verified live and via DET-001 vs the certified hashes);
-/// routes without an eligible residual sibling keep the separate tail.
-/// Measured +0.14 ms/token alone; super-additive with the gate+up bank
-/// (+0.46-0.51 ms/token stacked).
+/// are unchanged; routes without an eligible residual sibling keep the
+/// separate tail.
 pub fn ffn_direct_residual() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
@@ -2718,8 +2716,7 @@ pub fn ffn_direct_residual() -> bool {
 /// gate and up projections issue as ONE banked launch off the shared Q8_1
 /// input (baseline 256-thread kernel; B160/V4 variants are GDN-only wins and
 /// measured FFN regressions). Bit-identical per row to the two-launch
-/// route. Measured +0.27 ms/token alone; super-additive with the
-/// direct-residual fold.
+/// route.
 pub fn ffn_gate_up_bank() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();

@@ -4443,8 +4443,8 @@ impl CudaBackend {
         } // end if !fused_glu_fired
 
         // One-shot down-route census (verbose): names the branch the down
-        // projection will actually take, so levers hook the live site instead
-        // of a fallback.
+        // projection will actually take, so dispatch changes can be verified
+        // against the live route instead of a fallback.
         {
             use std::sync::OnceLock;
             static ROUTE: OnceLock<()> = OnceLock::new();
