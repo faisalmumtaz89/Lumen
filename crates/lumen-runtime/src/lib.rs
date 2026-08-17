@@ -26,7 +26,6 @@ pub mod kv;
 #[cfg(target_os = "macos")]
 pub mod metal;
 pub mod pipeline;
-pub mod q4_marlin;
 pub mod runtime_defaults;
 pub mod sampling;
 pub mod session;
