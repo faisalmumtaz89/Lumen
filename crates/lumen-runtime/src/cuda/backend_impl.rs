@@ -5076,18 +5076,51 @@ impl CudaBackend {
                             inter_dim,
                             "down split (sep swiglu)",
                         )?;
-                        launch_matvec_preq8_1_split(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_down,
-                            lw.q8_split_w_down.as_ref(),
-                            lw.q4_split_w_down.as_ref(),
-                            q8_1_buf,
-                            &mut st.scratch.down,
-                            hidden_dim,
-                            inter_dim,
-                            "down",
-                        )?;
+                        if crate::runtime_defaults::ffn_direct_residual() {
+                            // Fold the residual into the split down matvec's
+                            // own store (residual sibling kernel, same locked
+                            // fadd.rn add as the separate residual_add), and
+                            // write x_gpu directly — eliding residual_add and
+                            // the layer-commit D2D (2 x 64 commands/token).
+                            launch_matvec_preq8_1_residual_split(
+                                &self.device,
+                                &st.kernels,
+                                &lw.w_down,
+                                lw.q8_split_w_down.as_ref(),
+                                lw.q4_split_w_down.as_ref(),
+                                q8_1_buf,
+                                &st.scratch.attn_proj,
+                                &mut st.scratch.x_gpu,
+                                hidden_dim,
+                                inter_dim,
+                                "down",
+                            )?;
+                            ffn_in_place = true;
+                            {
+                                use std::sync::OnceLock;
+                                static MARK: OnceLock<()> = OnceLock::new();
+                                MARK.get_or_init(|| {
+                                    if super::decode::cuda_verbose() {
+                                        eprintln!(
+                                            "[CUDA] FFN_DIRECT_RESIDUAL: sep-swiglu split down folds residual -> x_gpu"
+                                        );
+                                    }
+                                });
+                            }
+                        } else {
+                            launch_matvec_preq8_1_split(
+                                &self.device,
+                                &st.kernels,
+                                &lw.w_down,
+                                lw.q8_split_w_down.as_ref(),
+                                lw.q4_split_w_down.as_ref(),
+                                q8_1_buf,
+                                &mut st.scratch.down,
+                                hidden_dim,
+                                inter_dim,
+                                "down",
+                            )?;
+                        }
                     }
                 } else {
                     unsafe {
