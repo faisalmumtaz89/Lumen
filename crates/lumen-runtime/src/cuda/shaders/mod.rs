@@ -520,6 +520,16 @@ pub const MATVEC_Q8_SPLIT_OUTPUT_PROJ_KERNEL_SOURCE: &str =
 /// requantized Q8_0 copy.
 pub const MATVEC_Q6K_HEAD_KERNEL_SOURCE: &str = include_str!("matvec_q6k_head.cu");
 
+/// Q5_K matvec (split-plane layout) against Q8_1 input. Serves GDN `ssm_out`
+/// in its source K-quant form (5.5 bpw) instead of the requantized Q8_0 copy.
+/// Plain and residual-folding variants.
+pub const MATVEC_Q5K_SPLIT_KERNEL_SOURCE: &str = include_str!("matvec_q5k_split.cu");
+
+/// Q4_1 matvec against Q8_1 input (plain + residual variants). Serves the
+/// FFN down tensors that Q4_0-preset GGUFs store as Q4_1; the Q8_1 sum field
+/// supplies the per-block min term without an extra dp4a.
+pub const MATVEC_Q4_1_KERNEL_SOURCE: &str = include_str!("matvec_q4_1_q8_1.cu");
+
 /// One-time repack from Q8Raw (34-byte AoS) to per-row split (SoA) layout.
 /// Runs once during `preload_weights`, NOT on the decode hot path.
 pub const REPACK_Q8_RAW_TO_SPLIT_KERNEL_SOURCE: &str = include_str!("repack_q8_raw_to_split.cu");

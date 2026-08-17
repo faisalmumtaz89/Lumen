@@ -535,6 +535,14 @@ pub(crate) struct KernelSet {
     /// Q6_K output-head matvec (split-plane layout, NR=2). Loaded lazily so
     /// artifacts with a Q8_0 head pay nothing.
     pub(crate) matvec_q6k_head: Option<CudaFunction>,
+    /// Q5_K matvec (split-plane layout, NR=2) for GDN ssm_out kept in its
+    /// source K-quant form. Plain + residual-folding variants.
+    pub(crate) matvec_q5k_split: Option<CudaFunction>,
+    pub(crate) matvec_q5k_split_residual: Option<CudaFunction>,
+    /// Q4_1 matvec against Q8_1 input for FFN down tensors kept in their
+    /// source Q4_1 form. Plain + residual-folding variants.
+    pub(crate) matvec_q4_1: Option<CudaFunction>,
+    pub(crate) matvec_q4_1_residual: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr8: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr16: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr64: Option<CudaFunction>,
@@ -1978,6 +1986,58 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] matvec_q6k_head: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q5k_split: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q5K_SPLIT_KERNEL_SOURCE,
+            "matvec_q5k_split_q8_1",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q5k_split: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q5k_split: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q5k_split_residual: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q5K_SPLIT_KERNEL_SOURCE,
+            "matvec_q5k_split_q8_1_residual",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q5k_split_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q5k_split_residual: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_1: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_1_KERNEL_SOURCE,
+            "matvec_q4_1_q8_1",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_1: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_1: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_1_residual: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_1_KERNEL_SOURCE,
+            "matvec_q4_1_q8_1_residual",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_1_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_1_residual: FAILED: {e}");
                 None
             }
         },

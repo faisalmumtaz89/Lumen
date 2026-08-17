@@ -4490,7 +4490,93 @@ impl CudaBackend {
         if fused_glu_fired {
             // Fused kernel already computed silu(gate)*up into scratch.gate.
             // Just run the down projection reading from scratch.gate.
-            if let GpuWeightBuf::F16Raw(ref wd_f16) = lw.w_down {
+            //
+            // Source-fidelity route first: w_down kept in its Q4_1 source form
+            // (raw 20-byte blocks). Quantize the fused output to Q8_1 and run
+            // the dedicated dp4a kernel; the base F16 image only serves
+            // prefill and the fallback below.
+            let mut q4_1_done = false;
+            if let (Some(wd_q41), Some(quant_fn), Some(q8_1_buf)) = (
+                lw.q4_1_w_down.as_ref(),
+                st.kernels.quantize_f32_to_q8_1.as_ref(),
+                st.scratch
+                    .input_q8_1
+                    .as_mut()
+                    .filter(|b| b.len() >= inter_dim.div_ceil(32) * 36),
+            ) {
+                unsafe {
+                    launch_quantize_input_q8_1(
+                        &self.device,
+                        quant_fn,
+                        &st.scratch.gate,
+                        q8_1_buf,
+                        inter_dim,
+                        "down q4_1",
+                    )?;
+                }
+                let out_dim_u32 = hidden_dim as u32;
+                let in_dim_u32 = inter_dim as u32;
+                // One row per 256-thread CTA.
+                let mv_cfg = CudarcLaunchConfig {
+                    grid_dim: (out_dim_u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                if crate::runtime_defaults::ffn_direct_residual() {
+                    let mv_fn = st.kernels.matvec_q4_1_residual.as_ref().ok_or_else(|| {
+                        RuntimeError::Compute(
+                            "Q4_1 w_down present but matvec_q4_1_residual unavailable".into(),
+                        )
+                    })?;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(mv_fn)
+                            .arg(wd_q41)
+                            .arg(&*q8_1_buf)
+                            .arg(&st.scratch.attn_proj)
+                            .arg(&mut st.scratch.x_gpu)
+                            .arg(&out_dim_u32)
+                            .arg(&in_dim_u32)
+                            .launch(mv_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec_q4_1_residual L{layer_idx}: {e}"))
+                    })?;
+                    ffn_in_place = true;
+                } else {
+                    let mv_fn = st.kernels.matvec_q4_1.as_ref().ok_or_else(|| {
+                        RuntimeError::Compute(
+                            "Q4_1 w_down present but matvec_q4_1 unavailable".into(),
+                        )
+                    })?;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(mv_fn)
+                            .arg(wd_q41)
+                            .arg(&*q8_1_buf)
+                            .arg(&mut st.scratch.down)
+                            .arg(&out_dim_u32)
+                            .arg(&in_dim_u32)
+                            .launch(mv_cfg)
+                    }
+                    .map_err(|e| RuntimeError::Compute(format!("matvec_q4_1 L{layer_idx}: {e}")))?;
+                }
+                {
+                    use std::sync::OnceLock;
+                    static MARK: OnceLock<()> = OnceLock::new();
+                    MARK.get_or_init(|| {
+                        if super::decode::cuda_verbose() {
+                            eprintln!("[CUDA] Q4_1_DOWN: w_down served from source Q4_1 blocks");
+                        }
+                    });
+                }
+                q4_1_done = true;
+            }
+            if q4_1_done {
+                // handled above
+            } else if let GpuWeightBuf::F16Raw(ref wd_f16) = lw.w_down {
                 // Convert fused output F32 -> F16 for HGEMV down projection.
                 let config = LaunchConfig::for_elements(inter_dim);
                 let launch_cfg = CudarcLaunchConfig {
@@ -5388,14 +5474,24 @@ impl CudaBackend {
             RuntimeError::Compute(format!("GDN L{layer_idx}: attn_gate weight missing",))
         })?;
 
+        // Source-fidelity artifacts keep ssm_alpha/ssm_beta in their F32
+        // source form. The tensors are tiny ([num_heads, hidden]), so they
+        // ride the fused pre-quantized route as plain F32 SGEMVs from the
+        // materialized `normed` (the same activation the prefill projections
+        // read) instead of disqualifying the whole layer from `gdn_use_preq`
+        // (which would drop qkv/gate off their split fast paths).
+        let gdn_ab_f32 = matches!(ssm_alpha_w, GpuWeightBuf::F32(_))
+            && matches!(ssm_beta_w, GpuWeightBuf::F32(_));
+
         // Q4_0 QUALITY FIX (GDN side): on the fragile 9B config, Q4Raw GDN
         // projections use F32 activations, not int8 Q8_1 dp4a. Other models keep
         // dp4a (flag off). See weight_uses_f32_act_q4.
         let gdn_use_preq = !weight_uses_f32_act_q4(&lw.wq, st.kernels.q4_decode_f32_act)
             && !weight_uses_f32_act_q4(attn_gate_w, st.kernels.q4_decode_f32_act)
             && weight_uses_dp4a_q8_1(&lw.wq, &st.kernels)
-            && weight_uses_dp4a_q8_1(ssm_alpha_w, &st.kernels)
-            && weight_uses_dp4a_q8_1(ssm_beta_w, &st.kernels)
+            && (gdn_ab_f32
+                || (weight_uses_dp4a_q8_1(ssm_alpha_w, &st.kernels)
+                    && weight_uses_dp4a_q8_1(ssm_beta_w, &st.kernels)))
             && weight_uses_dp4a_q8_1(attn_gate_w, &st.kernels)
             && st.scratch.input_q8_1.is_some()
             && st.kernels.quantize_f32_to_q8_1.is_some();
@@ -5505,8 +5601,9 @@ impl CudaBackend {
             // (the fused rmsnorm_to_q8_1 below only writes the quantized buffer
             // used by qkv/gate). One extra 2048-wide RMSNorm per GDN decode step
             // — negligible cost. Done BEFORE the `q8_1_buf` mutable borrow so
-            // the two scratch fields are accessed sequentially.
-            if gdn_ab_f16 {
+            // the two scratch fields are accessed sequentially. F32 source
+            // gates (gdn_ab_f32) need the same F32 `normed` for their SGEMVs.
+            if gdn_ab_f16 || gdn_ab_f32 {
                 let block_size = rmsnorm_block_size(hidden_dim);
                 let shared_bytes = rmsnorm_shared_bytes(block_size);
                 let launch_cfg = CudarcLaunchConfig {
@@ -5619,7 +5716,41 @@ impl CudaBackend {
             // per-token pre-Q8_1 tile matvec. `ssm_alpha_w`/`ssm_beta_w` are
             // Q8Raw; the F16/MMQ branches use the dequanted cache / Q8 bytes
             // respectively.
-            if gdn_ab_f16 {
+            //
+            // Source-fidelity F32 gates project as plain SGEMVs from the F32
+            // `normed` materialized above (launch_matvec's F32 arm) — the
+            // exact weights the source GGUF stores, on the exact activation
+            // the prefill projection reads.
+            if gdn_ab_f32 {
+                unsafe {
+                    launch_matvec(
+                        &self.device,
+                        &st.kernels,
+                        ssm_alpha_w,
+                        &st.scratch.normed,
+                        &mut gdn.alpha_raw_buf,
+                        p.num_heads,
+                        hidden_dim,
+                        "gdn_alpha_f32",
+                        None,
+                        Some(&mut st.scratch.input_f16),
+                        None,
+                    )?;
+                    launch_matvec(
+                        &self.device,
+                        &st.kernels,
+                        ssm_beta_w,
+                        &st.scratch.normed,
+                        &mut gdn.beta_raw_buf,
+                        p.num_heads,
+                        hidden_dim,
+                        "gdn_beta_f32",
+                        None,
+                        Some(&mut st.scratch.input_f16),
+                        None,
+                    )?;
+                }
+            } else if gdn_ab_f16 {
                 let alpha_f16 = lw.ssm_alpha_f16.as_ref().expect("gdn_ab_f16 guards Some");
                 unsafe {
                     launch_hgemv_f16(
@@ -6087,7 +6218,7 @@ impl CudaBackend {
         // once here so the norm-gate site and Step 11 agree exactly.
         let ssm_ng_q8_eligible = crate::runtime_defaults::gdn_ng_q8_enabled()
             && st.kernels.gdn_prefill_norm_gate_q8.is_some()
-            && lw.q8_split_ssm_out.is_some()
+            && (lw.q8_split_ssm_out.is_some() || lw.ssm_out_q5k.is_some())
             && p.head_dim % 32 == 0
             && p.head_dim > 0
             && p.head_dim <= 1024
@@ -7126,7 +7257,119 @@ impl CudaBackend {
             // matvec. Falls through to the raw route when the sibling or any
             // required piece is absent, keeping the base path untouched.
             let mut ssm_split_done = false;
-            if let (Some(split_buf), Some(quant_fn), Some(q8_1_buf)) = (
+            // Source-fidelity route: ssm_out kept in its Q5_K source form
+            // (split planes). Mutually exclusive with the Q8 split sibling
+            // below by construction (the artifact stores one format).
+            if let (Some((ref qs, ref qh, ref sc, ref dm)), Some(quant_fn), Some(q8_1_buf)) = (
+                lw.ssm_out_q5k.as_ref(),
+                st.kernels.quantize_q8_1_rawsum.as_ref(),
+                st.scratch
+                    .input_q8_1
+                    .as_mut()
+                    .filter(|b| b.len() >= p.value_dim.div_ceil(32) * 36),
+            ) {
+                if !ssm_q8_from_norm_gate {
+                    let in_dim_u32 = p.value_dim as u32;
+                    let q_blocks = in_dim_u32.div_ceil(32);
+                    let quant_cfg = CudarcLaunchConfig {
+                        grid_dim: (q_blocks, 1, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(quant_fn)
+                            .arg(ssm_input)
+                            .arg(&mut *q8_1_buf)
+                            .arg(&in_dim_u32)
+                            .launch(quant_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "quantize_q8_1 gdn_ssm_out q5k L{layer_idx}: {e}"
+                        ))
+                    })?;
+                }
+                let out_dim_u32 = hidden_dim as u32;
+                let in_dim_u32 = p.value_dim as u32;
+                // NR=2 rows per CTA (64-thread blocks), grid = ceil(hidden/2).
+                let mv_cfg = CudarcLaunchConfig {
+                    grid_dim: (out_dim_u32.div_ceil(2), 1, 1),
+                    block_dim: (64, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let fold = crate::runtime_defaults::ssmout_residual_fold_enabled();
+                if fold {
+                    let mv_fn =
+                        st.kernels
+                            .matvec_q5k_split_residual
+                            .as_ref()
+                            .ok_or_else(|| {
+                                RuntimeError::Compute(
+                            "Q5_K ssm_out present but matvec_q5k_split_residual unavailable".into(),
+                        )
+                            })?;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(mv_fn)
+                            .arg(qs)
+                            .arg(qh)
+                            .arg(sc)
+                            .arg(dm)
+                            .arg(&*q8_1_buf)
+                            .arg(&st.scratch.x_gpu)
+                            .arg(&mut st.scratch.attn_proj)
+                            .arg(&out_dim_u32)
+                            .arg(&in_dim_u32)
+                            .launch(mv_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec_q5k_split_residual L{layer_idx}: {e}"
+                        ))
+                    })?;
+                    ssm_residual_folded = true;
+                } else {
+                    let mv_fn = st.kernels.matvec_q5k_split.as_ref().ok_or_else(|| {
+                        RuntimeError::Compute(
+                            "Q5_K ssm_out present but matvec_q5k_split unavailable".into(),
+                        )
+                    })?;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(mv_fn)
+                            .arg(qs)
+                            .arg(qh)
+                            .arg(sc)
+                            .arg(dm)
+                            .arg(&*q8_1_buf)
+                            .arg(&mut gdn.ssm_proj_buf)
+                            .arg(&out_dim_u32)
+                            .arg(&in_dim_u32)
+                            .launch(mv_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("matvec_q5k_split L{layer_idx}: {e}"))
+                    })?;
+                }
+                {
+                    use std::sync::OnceLock;
+                    static MARK: OnceLock<()> = OnceLock::new();
+                    MARK.get_or_init(|| {
+                        if super::decode::cuda_verbose() {
+                            eprintln!(
+                                "[CUDA] Q5K_SSMOUT: ssm_out served from source Q5_K planes (fold={fold})"
+                            );
+                        }
+                    });
+                }
+                ssm_split_done = true;
+            }
+            if let (false, Some(split_buf), Some(quant_fn), Some(q8_1_buf)) = (
+                ssm_split_done,
                 lw.q8_split_ssm_out.as_ref(),
                 st.kernels.quantize_q8_1_rawsum.as_ref(),
                 st.scratch
