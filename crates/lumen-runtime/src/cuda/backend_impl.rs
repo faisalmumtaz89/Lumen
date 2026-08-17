@@ -4441,6 +4441,34 @@ impl CudaBackend {
             }
         } // end if !fused_glu_fired
 
+        // One-shot down-route census (verbose): names the branch the down
+        // projection will actually take, so levers hook the live site instead
+        // of a fallback.
+        {
+            use std::sync::OnceLock;
+            static ROUTE: OnceLock<()> = OnceLock::new();
+            ROUTE.get_or_init(|| {
+                if super::decode::cuda_verbose() {
+                    let variant = match &lw.w_down {
+                        GpuWeightBuf::F32(_) => "F32",
+                        GpuWeightBuf::F16Raw(_) => "F16Raw",
+                        GpuWeightBuf::Bf16Raw(_) => "Bf16Raw",
+                        GpuWeightBuf::Q8Raw(_) => "Q8Raw",
+                        GpuWeightBuf::Q8Aligned(_) => "Q8Aligned",
+                        GpuWeightBuf::Q4Raw(_) => "Q4Raw",
+                        GpuWeightBuf::Q4Aligned(_) => "Q4Aligned",
+                        _ => "other",
+                    };
+                    eprintln!(
+                        "[CUDA route] ffn down: w_down={variant} fused_glu_fired={fused_glu_fired} q8_split_sib={} q4_split_sib={} f16_cache={}",
+                        lw.q8_split_w_down.is_some(),
+                        lw.q4_split_w_down.is_some(),
+                        lw.w_down_f16.is_some(),
+                    );
+                }
+            });
+        }
+
         // SwiGLU + Down projection.
         //
         // When fused_glu_fired: SwiGLU is already applied inline. scratch.gate
