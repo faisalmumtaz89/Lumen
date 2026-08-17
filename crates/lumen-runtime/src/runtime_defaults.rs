@@ -1305,6 +1305,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_ATTN_PRECISE",
     "LUMEN_CUDA_ATTN_PRECISE_DBG",
     "LUMEN_CUDA_ATTN_PREP_FUSE",
+    "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
     "LUMEN_CUDA_BF16_AUTOTUNE",
     "LUMEN_CUDA_BF16_GEMMEX",
     "LUMEN_CUDA_BF16_MATVEC",
@@ -2532,6 +2533,7 @@ mod tests {
         "LUMEN_CUDA_ATTN_PRECISE",
         "LUMEN_CUDA_ATTN_PRECISE_DBG",
         "LUMEN_CUDA_ATTN_PREP_FUSE",
+        "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
         "LUMEN_CUDA_BF16_AUTOTUNE",
         "LUMEN_CUDA_BF16_GEMMEX",
         "LUMEN_CUDA_BF16_MATVEC",
@@ -2689,4 +2691,23 @@ mod tests {
             );
         }
     }
+}
+
+/// `LUMEN_CUDA_FFN_DIRECT_RESIDUAL=1` (default OFF while in probe phase): the
+/// FFN down projection folds its residual into its own store and writes
+/// `x_gpu` directly, eliding both the `residual_add` launch and the decode
+/// loop's layer-commit D2D copy (2 commands x 64 layers per token). The
+/// dot+residual store uses the same locked `fadd.rn` sequence as the separate
+/// add, so output bytes are unchanged.
+pub fn ffn_direct_residual() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_FFN_DIRECT_RESIDUAL")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
 }

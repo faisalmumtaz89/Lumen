@@ -845,6 +845,21 @@ struct GdnScratchGpu {
 /// `compute_layer` takes `&self`, so mutable GPU state (scratch buffers,
 /// KV caches) must be wrapped in a Mutex. The lock is uncontended in
 /// single-threaded inference (~20ns overhead, negligible vs GPU compute).
+/// Where a layer left the updated hidden state.
+///
+/// The FFN down projection can fold its residual and write `x_gpu` directly
+/// (LUMEN_CUDA_FFN_DIRECT_RESIDUAL), which makes the decode loop's commit copy
+/// redundant. Returning that fact beats a sticky flag on `MutableState`: the
+/// dispatch site and the two decode paths would otherwise each have to agree
+/// on setting and clearing it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayerOutput {
+    /// Result is in `scratch.attn_proj`; the caller must commit it to `x_gpu`.
+    NeedsCommit,
+    /// Result is already in `scratch.x_gpu`.
+    InPlace,
+}
+
 struct MutableState {
     /// Compiled kernel function handles.
     kernels: KernelSet,
@@ -2159,7 +2174,7 @@ impl CudaBackend {
         layer_idx: usize,
         seq_pos: usize,
         st: &mut MutableState,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<LayerOutput, RuntimeError> {
         let hp = self.hp()?;
         let hidden_dim = hp.hidden_dim as usize;
         let num_heads = hp.num_heads as usize;
@@ -3568,12 +3583,19 @@ impl CudaBackend {
                 eprintln!("[XCHK] step={step} L={layer_idx} moe_expert_ids={ids:?} gate_w={ws:?}");
             }
 
-            // MoE branch is complete; skip the dense FFN block below.
+            // MoE branch is complete; skip the dense FFN block below. MoE
+            // leaves its result in attn_proj, so the caller still commits.
             if let Some(p) = st.profiler.as_mut() {
                 p.end("ffn", &self.device.stream);
             }
-            return Ok(());
+            return Ok(LayerOutput::NeedsCommit);
         }
+
+        // FFN direct-residual: set when the down projection folds the residual
+        // into its own store and writes x_gpu directly, eliding BOTH the
+        // residual_add launch and the decode loop's layer-commit D2D copy
+        // (2 commands x 64 layers = 128 per token).
+        let mut ffn_in_place = false;
 
         // 6. FFN: fused or separate rmsnorm + gate/up + swiglu + down + residual.
         //
@@ -4577,18 +4599,51 @@ impl CudaBackend {
                                 inter_dim,
                                 "down split",
                             )?;
-                            launch_matvec_preq8_1_split(
-                                &self.device,
-                                &st.kernels,
-                                &lw.w_down,
-                                lw.q8_split_w_down.as_ref(),
-                                lw.q4_split_w_down.as_ref(),
-                                q8_1_buf,
-                                &mut st.scratch.down,
-                                hidden_dim,
-                                inter_dim,
-                                "down",
-                            )?;
+                            if crate::runtime_defaults::ffn_direct_residual() {
+                                // Fold the residual into the down projection's
+                                // own store: x_gpu = W_down*q8 + attn_proj.
+                                // dot+residual uses the same locked fadd_rn as
+                                // the separate residual_add (IEEE add commutes
+                                // bit-exactly), so output bytes are unchanged.
+                                launch_matvec_preq8_1_residual_split(
+                                    &self.device,
+                                    &st.kernels,
+                                    &lw.w_down,
+                                    lw.q8_split_w_down.as_ref(),
+                                    lw.q4_split_w_down.as_ref(),
+                                    q8_1_buf,
+                                    &st.scratch.attn_proj,
+                                    &mut st.scratch.x_gpu,
+                                    hidden_dim,
+                                    inter_dim,
+                                    "down",
+                                )?;
+                                ffn_in_place = true;
+                                {
+                                    use std::sync::OnceLock;
+                                    static MARK: OnceLock<()> = OnceLock::new();
+                                    MARK.get_or_init(|| {
+                                        if super::decode::cuda_verbose() {
+                                            eprintln!(
+                                                "[CUDA] FFN_DIRECT_RESIDUAL: down folds residual -> x_gpu (residual_add + layer-commit D2D elided)"
+                                            );
+                                        }
+                                    });
+                                }
+                            } else {
+                                launch_matvec_preq8_1_split(
+                                    &self.device,
+                                    &st.kernels,
+                                    &lw.w_down,
+                                    lw.q8_split_w_down.as_ref(),
+                                    lw.q4_split_w_down.as_ref(),
+                                    q8_1_buf,
+                                    &mut st.scratch.down,
+                                    hidden_dim,
+                                    inter_dim,
+                                    "down",
+                                )?;
+                            }
                         }
                     } else {
                         unsafe {
@@ -4902,7 +4957,10 @@ impl CudaBackend {
         }
 
         // Residual add: attn_proj += down.
-        {
+        //
+        // SKIPPED when the down projection already folded it in and wrote
+        // x_gpu directly (ffn_in_place).
+        if !ffn_in_place {
             let config = LaunchConfig::for_elements(hidden_dim);
             let launch_cfg = CudarcLaunchConfig {
                 grid_dim: (config.grid_dim, 1, 1),
@@ -4925,9 +4983,13 @@ impl CudaBackend {
         if let Some(p) = st.profiler.as_mut() {
             p.end("ffn", &self.device.stream);
         }
-        // Layer output is now in st.scratch.attn_proj. The caller must copy it
-        // to st.scratch.x_gpu before the next layer (done via device memcpy).
-        Ok(())
+        // NeedsCommit: layer output is in st.scratch.attn_proj and the caller
+        // copies it to st.scratch.x_gpu. InPlace: x_gpu already holds it.
+        Ok(if ffn_in_place {
+            LayerOutput::InPlace
+        } else {
+            LayerOutput::NeedsCommit
+        })
     }
 
     /// Lazily allocate GDN GPU scratch buffers on first use.
@@ -9440,7 +9502,7 @@ impl CudaBackend {
             p.end("embed", &self.device.stream);
         }
         for layer in 0..num_layers {
-            self.compute_layer_gpu(layer, seq_pos, st)?;
+            let layer_out = self.compute_layer_gpu(layer, seq_pos, st)?;
             // FIX-DTOD: For DENSE layers, dense FFN writes to a separate
             // buffer (attn_proj) and we propagate the post-FFN residual to x_gpu
             // here. For MoE layers, `encode_moe_ffn_decode` writes the MoE FFN
@@ -9453,7 +9515,7 @@ impl CudaBackend {
                 .get(layer)
                 .and_then(|m| m.as_ref())
                 .is_some();
-            if !is_moe_layer {
+            if !is_moe_layer && layer_out == LayerOutput::NeedsCommit {
                 self.device
                     .stream
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
@@ -9557,7 +9619,7 @@ impl CudaBackend {
             p.end("embed", &self.device.stream);
         }
         for layer in 0..num_layers {
-            self.compute_layer_gpu(layer, seq_pos, st)?;
+            let layer_out = self.compute_layer_gpu(layer, seq_pos, st)?;
             // Mirror decode_token_normal's FIX-DTOD: propagate the post-FFN
             // residual for dense layers; skip for MoE layers (encode_moe_ffn_decode
             // already wrote the post-FFN state in-place to st.scratch.x_gpu).
@@ -9566,7 +9628,7 @@ impl CudaBackend {
                 .get(layer)
                 .and_then(|m| m.as_ref())
                 .is_some();
-            if !is_moe_layer {
+            if !is_moe_layer && layer_out == LayerOutput::NeedsCommit {
                 self.device
                     .stream
                     .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
