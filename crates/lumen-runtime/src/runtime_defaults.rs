@@ -2698,10 +2698,13 @@ mod tests {
 /// `LUMEN_CUDA_FFN_DIRECT_RESIDUAL` (default ON; `=0` opts out): the
 /// FFN down projection folds its residual into its own store and writes
 /// `x_gpu` directly, eliding both the `residual_add` launch and the decode
-/// loop's layer-commit D2D copy (2 commands x 64 layers per token). The
-/// dot+residual store uses the same locked `fadd.rn` sequence as the separate
-/// add, so output bytes are unchanged. Measured +0.14 ms/token alone;
-/// super-additive with the gate+up bank (+0.46-0.51 ms/token stacked).
+/// loop's layer-commit D2D copy (2 commands x 64 layers per token). On the
+/// validated Q4/Q8 split routes the residual add is the same explicitly
+/// pinned single `add.rn.f32` the separate launch performs, so output bytes
+/// are unchanged (verified live and via DET-001 vs the certified hashes);
+/// routes without an eligible residual sibling keep the separate tail.
+/// Measured +0.14 ms/token alone; super-additive with the gate+up bank
+/// (+0.46-0.51 ms/token stacked).
 pub fn ffn_direct_residual() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
