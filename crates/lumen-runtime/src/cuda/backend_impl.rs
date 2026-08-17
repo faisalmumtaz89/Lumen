@@ -4574,7 +4574,56 @@ impl CudaBackend {
             } else if let GpuWeightBuf::Q4Aligned(ref wd_q4a) = lw.w_down {
                 // Fused down for Q4Aligned: inline F32->Q8_1 quantize + dp4a in one dispatch.
                 // Eliminates the separate quantize_f32_to_q8_1 kernel.
-                if let Some(ref fused_fn) = st.kernels.matvec_q4_aligned_f32 {
+                //
+                // LUMEN_CUDA_FFN_DIRECT_RESIDUAL=1: use the residual sibling
+                // (already loaded) with attn_proj as the residual and x_gpu as
+                // the store — the residual add is the same single plain f32 add
+                // the separate residual_add launch performs (the reduce ends in
+                // an add, so no FMA contraction is possible), keeping output
+                // bytes unchanged while eliding residual_add + the layer-commit
+                // D2D (2 commands x 64 layers per token).
+                let direct_resid_q4a = crate::runtime_defaults::ffn_direct_residual()
+                    && st.kernels.matvec_q4_aligned_f32_residual.is_some();
+                if direct_resid_q4a {
+                    let fused_fn = st.kernels.matvec_q4_aligned_f32_residual.as_ref().unwrap();
+                    let out_dim_u32 = hidden_dim as u32;
+                    let in_dim_u32 = inter_dim as u32;
+                    let grid = dp4a_q4_grid(out_dim_u32);
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (DP4A_Q4_BLOCK_DIM, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(fused_fn)
+                            .arg(wd_q4a)
+                            .arg(&st.scratch.gate)
+                            .arg(&st.scratch.attn_proj)
+                            .arg(&mut st.scratch.x_gpu)
+                            .arg(&out_dim_u32)
+                            .arg(&in_dim_u32)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "matvec_q4_aligned_f32_residual down L{layer_idx}: {e}",
+                        ))
+                    })?;
+                    ffn_in_place = true;
+                    {
+                        use std::sync::OnceLock;
+                        static MARK: OnceLock<()> = OnceLock::new();
+                        MARK.get_or_init(|| {
+                            if super::decode::cuda_verbose() {
+                                eprintln!(
+                                    "[CUDA] FFN_DIRECT_RESIDUAL: q4-aligned down folds residual -> x_gpu"
+                                );
+                            }
+                        });
+                    }
+                } else if let Some(ref fused_fn) = st.kernels.matvec_q4_aligned_f32 {
                     let out_dim_u32 = hidden_dim as u32;
                     let in_dim_u32 = inter_dim as u32;
                     let grid = dp4a_q4_grid(out_dim_u32);
