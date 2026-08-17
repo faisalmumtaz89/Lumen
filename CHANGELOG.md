@@ -7,6 +7,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-08-17
+
+### Changed
+
+- **CUDA FFN decode tail restructuring** (dense GDN models). The down
+  projection folds its residual into its own store and writes the layer
+  output buffer directly — eliding the separate residual-add launch and the
+  per-layer commit copy — and the gate/up projections issue as one banked
+  launch off their shared quantized input. ≈ +4% decode wall on
+  Qwen3.8-27B Q4_0 and ≈ +2% on Q8_0 (A100). Byte-identical to the v0.7.0
+  certified baselines (determinism-hash equality at n=50 on both 27B
+  quants; Qwen3.5-9B and the MoE model verified byte-identical end to end;
+  quality, sampling, tool-calling and KV-cache-equivalence gates pass; 1-hour
+  server soak clean). Both changes carry documented `=0` kill-switches
+  respecting `LUMEN_CUDA_LEGACY_DEFAULTS` (see
+  `docs/environment-variables.md`).
+- Layer-output placement on the CUDA decode path is now a typed contract
+  shared by all callers, fixing a pre-existing stale-read on the public
+  layer-compute path (dense layers whose result had not been committed could
+  be read back one layer stale).
+- A one-shot verbose route census names the FFN down-projection dispatch
+  branch actually taken (`LUMEN_CUDA_VERBOSE=1`), making dispatch-level
+  changes verifiable against the live route.
+
 ## [0.7.0] — 2026-08-17
 
 ### Changed
