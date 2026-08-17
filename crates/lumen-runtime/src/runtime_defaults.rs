@@ -2728,17 +2728,15 @@ pub fn ffn_gate_up_bank() -> bool {
     })
 }
 
-/// `LUMEN_CUDA_Q4_DOWN_NR1=1` (default OFF while in probe phase): the FFN
-/// down projection's locked Q4 split matvec runs one row per CTA (grid =
-/// out_dim) instead of four. Byte-identical per row — the grid mapping is the
-/// only change; the short-N long-K down shape underfills the NR=4 grid.
+/// `LUMEN_CUDA_Q4_DOWN_NR1` (default ON; `=0` opts out): the FFN down
+/// projection's locked Q4 split matvec runs one row per CTA (grid = out_dim)
+/// instead of four. Byte-identical per row — the grid mapping is the only
+/// change; the short-N long-K down shape underfills the NR=4 grid.
 pub fn q4_down_nr1() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        matches!(
-            std::env::var("LUMEN_CUDA_Q4_DOWN_NR1").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_Q4_DOWN_NR1") {
+        Ok(v) => v != "0",
+        Err(_) => canonical_default_on(),
     })
 }
