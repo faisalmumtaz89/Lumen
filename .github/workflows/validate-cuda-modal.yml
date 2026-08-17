@@ -55,7 +55,7 @@ jobs:
     outputs:
       relevant: ${{ steps.detect.outputs.relevant }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - id: detect
@@ -97,7 +97,7 @@ jobs:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: guard — secrets present
         run: |
@@ -106,7 +106,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 
@@ -115,7 +115,7 @@ jobs:
 
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup show
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
 
       # --locked: the committed Cargo.lock is load-bearing (it pins cudarc 0.19.3,
       # whose feature surface is THE fix for the no-SDK startup crash). Enforce it.

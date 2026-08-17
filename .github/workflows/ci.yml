@@ -33,10 +33,10 @@ jobs:
     name: cpu tests + lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install pinned toolchain (rust-toolchain.toml -> 1.93.1 + rustfmt/clippy)
         run: rustup show
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
       # HARD gates. The repo is fmt-clean and clippy-clean under the pinned toolchain
       # (rust-toolchain.toml 1.93.1). clippy uses the deliberate [workspace.lints]
       # policy (deny clippy::all + a curated allow-list) — no `-D warnings` needed
@@ -59,10 +59,10 @@ jobs:
     name: build linux/cuda (sm_80 target)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup show
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
       - name: build server (cuda)
         run: cargo build --release --locked -p lumen-server -p lumen-cli --features bin,cuda
       - name: compile cuda unit tests (no GPU run)
@@ -84,10 +84,10 @@ jobs:
     name: build macos/metal (arm64)
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup show
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
       # clippy the metal-only path here (cfg(macos) code is excluded on the ubuntu
       # run). Same [workspace.lints] policy.
       - name: clippy (workspace, metal path)
