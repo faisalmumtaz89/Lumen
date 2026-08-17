@@ -515,6 +515,11 @@ pub const MATVEC_Q4_SPLIT_Q8_1_MMVQ_KERNEL_SOURCE: &str =
 pub const MATVEC_Q8_SPLIT_OUTPUT_PROJ_KERNEL_SOURCE: &str =
     include_str!("matvec_q8_split_output_proj.cu");
 
+/// Q6_K output-head matvec (split-plane layout) against Q8_1 input. Serves
+/// `output.weight` in its source K-quant form (6.5625 bpw) instead of the
+/// requantized Q8_0 copy.
+pub const MATVEC_Q6K_HEAD_KERNEL_SOURCE: &str = include_str!("matvec_q6k_head.cu");
+
 /// One-time repack from Q8Raw (34-byte AoS) to per-row split (SoA) layout.
 /// Runs once during `preload_weights`, NOT on the decode hot path.
 pub const REPACK_Q8_RAW_TO_SPLIT_KERNEL_SOURCE: &str = include_str!("repack_q8_raw_to_split.cu");

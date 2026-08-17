@@ -749,6 +749,9 @@ struct GpuGlobals {
     /// the F16-cache prefill path keeps its source.
     output_proj_q8_split: Option<CudaSlice<u8>>,
     /// Output projection as raw Q4_0 bytes (None if not Q4_0).
+    /// Q6_K output head as four lossless split planes (ql / qh / scales / d),
+    /// preserving the source K-quant bytes (6.5625 bpw vs Q8_0's 8.5).
+    output_proj_q6k: Option<(CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>)>,
     output_proj_q4: Option<CudaSlice<u8>>,
     /// Output projection as 20-byte aligned Q4_0 (None if not Q4_0 or repack failed).
     /// Preferred over output_proj_q4 for decode (int* nibble loads vs byte loads).
@@ -8915,6 +8918,75 @@ impl CudaBackend {
         }
 
         // Output projection: logits = output_proj * normed.
+        // Q6_K head (source K-quant, split planes): quantize normed x to Q8_1
+        // and run the dedicated dp4a kernel. Present only when the artifact
+        // kept `output.weight` in Q6_K; the Q8_0-head artifact is unaffected.
+        if let Some((ref ql, ref qh, ref sc, ref dd)) = st.globals.output_proj_q6k {
+            let (quant_fn, mv_fn, q8_1_buf) = match (
+                st.kernels.quantize_f32_to_q8_1.as_ref(),
+                st.kernels.matvec_q6k_head.as_ref(),
+                st.scratch.input_q8_1.as_mut(),
+            ) {
+                (Some(q), Some(m), Some(b)) => (q, m, b),
+                _ => {
+                    return Err(RuntimeError::Compute(
+                        "Q6_K output head present but quantize/matvec kernels unavailable".into(),
+                    ))
+                }
+            };
+            let out_dim_u32 = vocab_size as u32;
+            let in_dim_u32 = hidden_dim as u32;
+            let quant_grid = q8_1_quant_grid(in_dim_u32);
+            let quant_cfg = CudarcLaunchConfig {
+                grid_dim: (quant_grid, 1, 1),
+                block_dim: (Q8_1_QUANT_BLOCK_DIM, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.device
+                    .stream
+                    .launch_builder(quant_fn)
+                    .arg(&st.scratch.normed)
+                    .arg(&mut *q8_1_buf)
+                    .arg(&in_dim_u32)
+                    .launch(quant_cfg)
+            }
+            .map_err(|e| RuntimeError::Compute(format!("quantize final q6k head: {e}")))?;
+            // NR=2 rows per CTA (64-thread blocks), grid = ceil(vocab/2).
+            let mv_cfg = CudarcLaunchConfig {
+                grid_dim: ((out_dim_u32 + 1) / 2, 1, 1),
+                block_dim: (64, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.device
+                    .stream
+                    .launch_builder(mv_fn)
+                    .arg(ql)
+                    .arg(qh)
+                    .arg(sc)
+                    .arg(dd)
+                    .arg(&*q8_1_buf)
+                    .arg(&mut st.logits_gpu)
+                    .arg(&out_dim_u32)
+                    .arg(&in_dim_u32)
+                    .launch(mv_cfg)
+            }
+            .map_err(|e| RuntimeError::Compute(format!("matvec_q6k_head launch: {e}")))?;
+            {
+                use std::sync::OnceLock;
+                static MARK: OnceLock<()> = OnceLock::new();
+                MARK.get_or_init(|| {
+                    if super::decode::cuda_verbose() {
+                        eprintln!(
+                            "[CUDA] Q6K_HEAD: output projection served from source Q6_K planes"
+                        );
+                    }
+                });
+            }
+            return Ok(());
+        }
+
         // Prefer Q4Aligned dp4a (highest priority for Q4_0), then smem, then scalar.
         if let Some(ref proj_q4a) = st.globals.output_proj_q4_aligned {
             // Path -1: Q4_0 final-projection matvec dispatch
@@ -14572,6 +14644,12 @@ impl ComputeBackend for CudaBackend {
         // BF16 output_proj now uploads RAW bytes (2 B/elem) instead of dequanting
         // to F32 (4 B/elem) — saves ~4 GB on Qwen3.5-9B. Dispatched via the
         // matvec_bf16 kernel in compute_final_gpu.
+        let mut output_proj_q6k: Option<(
+            CudaSlice<u8>,
+            CudaSlice<u8>,
+            CudaSlice<u8>,
+            CudaSlice<u8>,
+        )> = None;
         let (
             output_proj_f32,
             output_proj_q8,
@@ -14603,9 +14681,37 @@ impl ComputeBackend for CudaBackend {
                     let gpu_bf16 = self.device.htod_copy(raw.as_slice())?;
                     (placeholder, None, None, None, Some(gpu_bf16))
                 }
+                QuantScheme::Q6_K => {
+                    // Q6_K head: split the 210-byte superblocks (ql 128 / qh 64
+                    // / sc 16 / d 2) into four aligned planes, preserving the
+                    // source bytes exactly.
+                    let n_sb = raw.len() / 210;
+                    let raw_mb = raw.len() as f64 / 1.0e6;
+                    eprintln!(
+                        "[CUDA mem] uploading Q6_K output_proj (split planes): {raw_mb:.1} MB"
+                    );
+                    let mut ql = vec![0u8; n_sb * 128];
+                    let mut qh = vec![0u8; n_sb * 64];
+                    let mut sc = vec![0u8; n_sb * 16];
+                    let mut dd = vec![0u8; n_sb * 2];
+                    for i in 0..n_sb {
+                        let b = &raw[i * 210..(i + 1) * 210];
+                        ql[i * 128..(i + 1) * 128].copy_from_slice(&b[0..128]);
+                        qh[i * 64..(i + 1) * 64].copy_from_slice(&b[128..192]);
+                        sc[i * 16..(i + 1) * 16].copy_from_slice(&b[192..208]);
+                        dd[i * 2..(i + 1) * 2].copy_from_slice(&b[208..210]);
+                    }
+                    output_proj_q6k = Some((
+                        self.device.htod_copy(ql.as_slice())?,
+                        self.device.htod_copy(qh.as_slice())?,
+                        self.device.htod_copy(sc.as_slice())?,
+                        self.device.htod_copy(dd.as_slice())?,
+                    ));
+                    (placeholder, None, None, None, None)
+                }
                 other => {
                     return Err(RuntimeError::Compute(format!(
-                        "CUDA init: output_proj raw quant {other:?} not supported (only Q8_0, Q4_0, F16, Bf16)",
+                        "CUDA init: output_proj raw quant {other:?} not supported (only Q8_0, Q4_0, Q6_K, F16, Bf16)",
                     )));
                 }
             }
@@ -14628,6 +14734,7 @@ impl ComputeBackend for CudaBackend {
             output_proj_q8_aligned: None, // Populated during preload_weights
             output_proj_q8_split: None,   // populated when LUMEN_CUDA_OUTPUT_PROJ_SPLIT=1
             output_proj_q4,
+            output_proj_q6k,
             output_proj_q4_aligned: None, // Populated during preload_weights
             output_proj_bf16: output_proj_bf16_raw,
             embedding: embedding_f32,

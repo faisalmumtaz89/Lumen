@@ -532,6 +532,9 @@ pub(crate) struct KernelSet {
     // `matvec_q8_split_output_proj` field continues to alias the nr32 variant
     // so existing dispatch sites keep working.
     pub(crate) matvec_q8_split_output_proj: Option<CudaFunction>,
+    /// Q6_K output-head matvec (split-plane layout, NR=2). Loaded lazily so
+    /// artifacts with a Q8_0 head pay nothing.
+    pub(crate) matvec_q6k_head: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr8: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr16: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr64: Option<CudaFunction>,
@@ -1965,6 +1968,19 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         },
         // explicit NR=8/16/64/128 handles for `LUMEN_CUDA_OUTPUT_PROJ_NR`.
         // Failure to load is non-fatal; dispatch falls back to nr32 above.
+        matvec_q6k_head: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q6K_HEAD_KERNEL_SOURCE,
+            "matvec_q6k_split_q8_1",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q6k_head: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q6k_head: FAILED: {e}");
+                None
+            }
+        },
         matvec_q8_split_output_proj_nr8: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_SPLIT_OUTPUT_PROJ_KERNEL_SOURCE,
             "matvec_q8_split_output_proj_nr8",

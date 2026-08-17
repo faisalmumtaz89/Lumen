@@ -406,29 +406,49 @@ fn do_convert_from_reader<R: Read + Seek>(
                 // llama-quantize often keeps output.weight as Q6_K even in Q4_0 GGUFs.
                 // The runtime only has fast dispatch kernels for Q8_0/Q4_0/F16/F32,
                 // so storing K-quant as-is would hit the slow F32 fallback path.
-                let f32_data = ensure_f32_global(
-                    output_proj_bytes,
-                    output_proj_tensor.ggml_type,
-                    OUTPUT_PROJ_NAME,
-                    output_proj_tensor.n_elements(),
-                )?;
-                let n_elems = output_proj_tensor.n_elements() as usize;
-                if requant_target == Some(QuantScheme::Q4_0) {
-                    let q4_data = quantize_f32_to_q4_0(&f32_data, n_elems);
+                //
+                // LUMEN_CONVERT_KEEP_Q6K_OUTPUT=1: preserve a Q6_K output.weight
+                // verbatim (6.5625 bpw, the exact bytes llama.cpp serves) for the
+                // CUDA backend's dedicated Q6_K head kernel. Requires a runtime
+                // with that kernel; other backends would hit the slow fallback.
+                if output_proj_tensor.ggml_type == GgmlType::Q6_K
+                    && matches!(
+                        std::env::var("LUMEN_CONVERT_KEEP_Q6K_OUTPUT")
+                            .ok()
+                            .as_deref(),
+                        Some("1") | Some("true") | Some("yes") | Some("on")
+                    )
+                {
                     eprintln!(
-                        "  K-quant output.weight ({:?}): requantized to Q4_0 ({} bytes)",
-                        output_proj_tensor.ggml_type,
-                        q4_data.len()
+                        "  K-quant output.weight (Q6_K): kept verbatim ({} bytes)",
+                        output_proj_bytes.len()
                     );
-                    (q4_data, false, QuantScheme::Q4_0)
+                    (output_proj_bytes.to_vec(), false, QuantScheme::Q6_K)
                 } else {
-                    let q8_data = quantize_f32_to_q8_0(&f32_data, n_elems);
-                    eprintln!(
-                        "  K-quant output.weight ({:?}): requantized to Q8_0 ({} bytes)",
+                    let f32_data = ensure_f32_global(
+                        output_proj_bytes,
                         output_proj_tensor.ggml_type,
-                        q8_data.len()
-                    );
-                    (q8_data, false, QuantScheme::Q8_0)
+                        OUTPUT_PROJ_NAME,
+                        output_proj_tensor.n_elements(),
+                    )?;
+                    let n_elems = output_proj_tensor.n_elements() as usize;
+                    if requant_target == Some(QuantScheme::Q4_0) {
+                        let q4_data = quantize_f32_to_q4_0(&f32_data, n_elems);
+                        eprintln!(
+                            "  K-quant output.weight ({:?}): requantized to Q4_0 ({} bytes)",
+                            output_proj_tensor.ggml_type,
+                            q4_data.len()
+                        );
+                        (q4_data, false, QuantScheme::Q4_0)
+                    } else {
+                        let q8_data = quantize_f32_to_q8_0(&f32_data, n_elems);
+                        eprintln!(
+                            "  K-quant output.weight ({:?}): requantized to Q8_0 ({} bytes)",
+                            output_proj_tensor.ggml_type,
+                            q8_data.len()
+                        );
+                        (q8_data, false, QuantScheme::Q8_0)
+                    }
                 }
             } else {
                 let data = ensure_f32_global(
