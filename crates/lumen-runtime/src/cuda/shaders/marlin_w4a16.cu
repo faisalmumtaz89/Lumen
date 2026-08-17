@@ -19,6 +19,9 @@
 // the limiting physics — the kernel is bandwidth-bound (~28 flop/B issued vs
 // A100's ~186 flop/B balance point).
 //
+// Word order inside a tile is warp-major (warp*32 + lane): each consuming
+// warp's 32 word loads map 1:1 onto the 32 shared-memory banks (the
+// lane-major order serialized every warp load into four wavefronts).
 // Nibble-order -> fragment mapping (from the pack spec, order [0,2,4,6,1,3,5,7]):
 //   (word >> 0) & 0x000f000f -> {v0,v1} = A-frag a0 (n,   k+{0,1})
 //   (word >> 4) & 0x000f000f -> {v2,v3} = A-frag a2 (n,   k+{8,9})
@@ -139,7 +142,7 @@ void lumen_marlin_m1_g32_m8_bn128_probe(
         }
 
         const unsigned int tile_id = (k0 >> 4) * tiles_per_krow + wcol / 64u;
-        const unsigned int word = q_words[tile_id * 128u + lane * 4u + wp];
+        const unsigned int word = q_words[tile_id * 128u + wp * 32u + lane];
 
         unsigned int a0, a1, a2, a3;
         dequant_frag_a(word, s_n2, s_n8_2, a0, a1, a2, a3);
@@ -313,7 +316,7 @@ void lumen_marlin_m1_g32_m8_bn128_s4(
                 s_n2 = prmt(sv, 0x1010u);
                 s_n8_2 = prmt(sv, 0x3232u);
             }
-            const unsigned int word = stage_w[k16 * 256u + tl * 128u + lane * 4u + wp];
+            const unsigned int word = stage_w[k16 * 256u + tl * 128u + wp * 32u + lane];
             unsigned int a0, a1, a2, a3;
             dequant_frag_a(word, s_n2, s_n8_2, a0, a1, a2, a3);
 

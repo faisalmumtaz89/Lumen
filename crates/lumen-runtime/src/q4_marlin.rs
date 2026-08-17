@@ -18,13 +18,15 @@
 //!
 //! Packed layout (kernel-facing, `Q[k][n] = q(n, k)`):
 //! * Nibble plane: K16×N64 tiles, tile_id = (k0/16)*(N/64) + (n0/64); each
-//!   tile is 128 u32 words. Word `lane*4 + warp` (warp 0..4, lane 0..32) holds
+//!   tile is 128 u32 words. Word `warp*32 + lane` (warp 0..4, lane 0..32) holds
 //!   the eight quants of one `mma.sync.m16n8k16` A-operand fragment slot, with
 //!   c = lane/4, r = 2*(lane%4), n = n0 + 16*warp + c:
 //!     v = [Q[k0+r][n],   Q[k0+r+1][n],   Q[k0+r+8][n],   Q[k0+r+9][n],
 //!          Q[k0+r][n+8], Q[k0+r+1][n+8], Q[k0+r+8][n+8], Q[k0+r+9][n+8]]
 //!   packed in nibble order [0,2,4,6,1,3,5,7] (low nibble first), so the
 //!   in-kernel LOP3 expansion yields both halves of the fragment directly.
+//!   Warp-major word order makes the consuming warp's 32 loads hit 32
+//!   distinct shared-memory banks (lane-major order serialized 4-way).
 //!   This permutation is derived from the Marlin kernel's packing
 //!   (IST-DASLab/marlin and the vLLM repacker, both Apache-2.0).
 //! * Scale plane: logical `D[g][n]` (g = k/32, bits verbatim), stored g-major;
@@ -109,7 +111,7 @@ pub fn pack_q4_marlin(src: &[u8], n: usize, k: usize) -> Result<MarlinQ4Packed, 
                         let q = src_quant(src, nb, col + dn, k0 + r + dk);
                         word |= q << (4 * b);
                     }
-                    tile[lane * 4 + warp] = word;
+                    tile[warp * 32 + lane] = word;
                 }
             }
         }
@@ -165,7 +167,7 @@ pub fn unpack_q4_marlin(p: &MarlinQ4Packed) -> Vec<u8> {
                     let c = lane / 4;
                     let r = 2 * (lane % 4);
                     let col = n0 + 16 * warp + c;
-                    let word = tile[lane * 4 + warp];
+                    let word = tile[warp * 32 + lane];
                     for (b, &vi) in NIBBLE_ORDER.iter().enumerate() {
                         let (dk, dn) = FRAG_OFFSETS[vi];
                         let q = ((word >> (4 * b)) & 0xF) as u8;
@@ -289,7 +291,7 @@ mod tests {
                     for lane in 0..32 {
                         let c = lane / 4;
                         let r = 2 * (lane % 4);
-                        let word = packed.q_words[tile_id * 128 + lane * 4 + warp];
+                        let word = packed.q_words[tile_id * 128 + warp * 32 + lane];
                         for (b, &vi) in NIBBLE_ORDER.iter().enumerate() {
                             let (dk, dn) = FRAG_OFFSETS[vi];
                             let (row, kk) = (n0 + 16 * warp + c + dn, k0 + r + dk);
@@ -319,7 +321,7 @@ mod tests {
         // needs c=9 -> invalid; the valid decomposition is dn=8, v-index 7
         // (dk=9,dn=8) -> ORDER position b=7, c=1, lane=4*(1? ) ... lane/4=c=1,
         // lane%4=0 -> lane=4, warp=0. tile_id=(16/16)*(64/64)+0=1.
-        // word index = tile*128 + lane*4 + warp = 128 + 16. bits 28..32.
+        // word index = tile*128 + warp*32 + lane = 128 + 4. bits 28..32.
         let (n, k) = (64, 32);
         let nb = k / 32;
         let mut src = vec![0u8; n * nb * BLOCK_BYTES];
@@ -327,7 +329,7 @@ mod tests {
         src[(9 * nb) * BLOCK_BYTES + 2 + 9] = 0xF0;
         let packed = pack_q4_marlin(&src, n, k).unwrap();
         for (idx, &w) in packed.q_words.iter().enumerate() {
-            if idx == 128 + 16 {
+            if idx == 128 + 4 {
                 assert_eq!(w, 0xF000_0000, "delta nibble misplaced within word");
             } else {
                 assert_eq!(w, 0, "unexpected nonzero word at {idx}");
