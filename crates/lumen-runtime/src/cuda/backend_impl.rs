@@ -18744,6 +18744,51 @@ impl ComputeBackend for CudaBackend {
         self.decode_token_greedy_normal(token_id, seq_pos, num_layers, hp, st, kv)
     }
 
+    fn decode_token_greedy_enqueue(
+        &self,
+        token_id: u32,
+        _weights: &dyn WeightProvider,
+        kv: &mut crate::kv::KvCache,
+    ) -> Result<(), RuntimeError> {
+        let hp = self.hp()?;
+        let num_layers = hp.num_layers as usize;
+        let seq_pos = kv.seq_len();
+
+        let mut state_guard = self.state.lock().unwrap();
+        let st = state_guard
+            .as_mut()
+            .ok_or_else(|| RuntimeError::Compute("CUDA backend not initialized".into()))?;
+        if st.layer_weights_cache.len() < num_layers {
+            return Err(RuntimeError::Compute(
+                "decode_token_greedy_enqueue requires GPU-resident weights".into(),
+            ));
+        }
+
+        // Identical kernel sequence to decode_token_greedy_normal: embed,
+        // per-layer compute with the typed layer-output commit, final
+        // projection, on-GPU argmax. No profiler brackets, no terminal
+        // synchronize, no readback — the queue keeps filling.
+        self.embed_token_gpu(token_id, st)?;
+        for layer in 0..num_layers {
+            let layer_out = self.compute_layer_gpu(layer, seq_pos, st)?;
+            if layer_out == LayerOutput::NeedsCommit {
+                self.device
+                    .stream
+                    .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
+                    .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
+            }
+        }
+        self.compute_final_gpu(st)?;
+        self.launch_argmax(st, hp.vocab_size)?;
+        kv.advance_seq_len()?;
+        st.decode_token_count += 1;
+        Ok(())
+    }
+
+    fn backend_synchronize(&self) -> Result<(), RuntimeError> {
+        self.device.synchronize()
+    }
+
     fn decode_token(
         &self,
         token_id: u32,

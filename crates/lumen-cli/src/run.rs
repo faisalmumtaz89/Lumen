@@ -2644,6 +2644,28 @@ fn run_engine(
     let resolved_sampling = effective_sampling(sampling);
     let sampling = &resolved_sampling;
 
+    // Measurement-only queued-burst exposure probe (LUMEN_CUDA_BURST_PROBE=1):
+    // prints one JSON record and exits. Window/warm/M come from
+    // LUMEN_BURST_WARM (default 32) and LUMEN_BURST_M (default 64).
+    if std::env::var("LUMEN_CUDA_BURST_PROBE").as_deref() == Ok("1") {
+        let warm: usize = std::env::var("LUMEN_BURST_WARM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32);
+        let m: usize = std::env::var("LUMEN_BURST_M")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        match engine.burst_probe(prompt_tokens, weights, backend, warm, m) {
+            Ok(json) => println!("[BURST_PROBE] {json}"),
+            Err(e) => {
+                eprintln!("[BURST_PROBE] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     // Metal batched prefill is handled in the run_with_* functions directly,
     // not here, to avoid creating a second Metal backend.
 
