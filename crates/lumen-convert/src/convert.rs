@@ -6,6 +6,24 @@
 
 use crate::arch;
 use crate::dequant::*;
+
+/// `LUMEN_CONVERT_SOURCE_FIDELITY=1`: preserve every tensor in the exact
+/// format the source GGUF stores it, instead of requantizing to the runtime's
+/// historical fast-path formats. Covers: Q6_K `output.weight`, K-quant
+/// `ssm_out` (Q5_K in Q4_0-preset files), Q4_1 layer tensors (8 of 64
+/// `ffn_down` in Q4_0-preset files carry Q4_1's min term), and F32
+/// `ssm_alpha`/`ssm_beta` gates. Requires a runtime with the matching decode
+/// kernels; the resulting artifact streams byte-for-byte the same weights the
+/// reference engine reads from the same file.
+pub(crate) fn source_fidelity() -> bool {
+    matches!(
+        std::env::var("LUMEN_CONVERT_SOURCE_FIDELITY")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
 use crate::gguf::{GgmlType, GgufError, GgufFile};
 use crate::hyperparams::{detect_quant_scheme, extract_hyperparams, quant_descriptor_for};
 use crate::sharded::{MultiShardReader, ShardError, ShardedGguf};
@@ -412,12 +430,13 @@ fn do_convert_from_reader<R: Read + Seek>(
                 // CUDA backend's dedicated Q6_K head kernel. Requires a runtime
                 // with that kernel; other backends would hit the slow fallback.
                 if output_proj_tensor.ggml_type == GgmlType::Q6_K
-                    && matches!(
-                        std::env::var("LUMEN_CONVERT_KEEP_Q6K_OUTPUT")
-                            .ok()
-                            .as_deref(),
-                        Some("1") | Some("true") | Some("yes") | Some("on")
-                    )
+                    && (source_fidelity()
+                        || matches!(
+                            std::env::var("LUMEN_CONVERT_KEEP_Q6K_OUTPUT")
+                                .ok()
+                                .as_deref(),
+                            Some("1") | Some("true") | Some("yes") | Some("on")
+                        ))
                 {
                     eprintln!(
                         "  K-quant output.weight (Q6_K): kept verbatim ({} bytes)",

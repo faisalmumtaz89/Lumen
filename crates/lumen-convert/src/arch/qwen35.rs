@@ -164,6 +164,20 @@ fn compute_layer_shape_qwen35(
             *blob_offset += size;
             Ok(slice)
         } else if tensor.ggml_type == GgmlType::Q4_1 {
+            if crate::convert::source_fidelity() {
+                // SOURCE_FIDELITY: keep Q4_1 verbatim (the min term is part of
+                // the source quantization; stripping it to Q4_0 is a quality
+                // downcast the reference engine does not perform).
+                let n_elements = tensor.n_elements();
+                let size = ((n_elements as usize / 32) * 20) as u64;
+                let slice = TensorSlice {
+                    offset: *blob_offset,
+                    length: size,
+                    quant: QuantScheme::Q4_1,
+                };
+                *blob_offset += size;
+                return Ok(slice);
+            }
             // Q4_1 has no dedicated GPU kernel -- requantize to Q4_0.
             let n_elements = tensor.n_elements();
             assert!(
@@ -410,9 +424,25 @@ fn compute_layer_shape_qwen35(
     // dominant quality lever on this architecture. (The even-older default
     // "force F32 unless requant handles it" shipped LBCs that lost 100%+
     // Metal prefill on Qwen3.5-9B.)
-    let ssm_out_target = match requant_to {
-        Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
-        other => other.or(Some(QuantScheme::Q8_0)),
+    // SOURCE_FIDELITY: keep ssm_out in its source format when the runtime can
+    // serve it (Q5_K in Q4_0-preset files, Q8_0 in Q8 files). The Q8_0 floor
+    // below guards the historical hazard — REQUANTIZING ssm_out DOWN to 4-bit
+    // corrupts the recurrence; serving the provider's own Q5_K is the
+    // reference engine's configuration, not a down-requant.
+    let ssm_out_src = gguf
+        .find_tensor(&layer_tensor_name(layer, SSM_OUT))
+        .map(|t| t.ggml_type);
+    let ssm_out_target = if crate::convert::source_fidelity()
+        && matches!(
+            ssm_out_src,
+            Some(crate::gguf::GgmlType::Q5_K) | Some(crate::gguf::GgmlType::Q8_0)
+        ) {
+        None
+    } else {
+        match requant_to {
+            Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
+            other => other.or(Some(QuantScheme::Q8_0)),
+        }
     };
     let ssm_out = compute_slice_with_requant(gguf, layer, SSM_OUT, &mut blob_size, ssm_out_target)?;
 

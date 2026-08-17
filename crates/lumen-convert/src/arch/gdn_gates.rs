@@ -119,7 +119,13 @@ pub(crate) fn compute_ssm_tensor_slice(
         }
     };
 
-    if is_alpha_or_beta && !matches!(quant, QuantScheme::Q8_0) {
+    // SOURCE_FIDELITY: keep F32 alpha/beta gates at source precision — the
+    // runtime routes non-Q8 gate weights through the generic F32 matvec. The
+    // force-requant below is the historical default (runtime hardcoded Q8_0
+    // gate kernels).
+    let keep_source_gates =
+        crate::convert::source_fidelity() && is_alpha_or_beta && matches!(quant, QuantScheme::F32);
+    if is_alpha_or_beta && !matches!(quant, QuantScheme::Q8_0) && !keep_source_gates {
         let n_elements = tensor.n_elements() as usize;
         assert!(
             n_elements % 32 == 0,
