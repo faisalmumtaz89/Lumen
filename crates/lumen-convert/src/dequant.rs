@@ -430,15 +430,23 @@ pub(crate) fn dequantize_q6_k(src: &[u8], n_elements: u64) -> Vec<u8> {
         let scales = &src[offset + 192..offset + 208];
         let d = f16_to_f32(u16::from_le_bytes([src[offset + 208], src[offset + 209]]));
 
-        // Q6_K dequantization following the ggml reference layout.
-        // Each block has 256 values split into two halves of 128.
-        // Each half uses 64 bytes of ql, 32 bytes of qh, and 8 scales.
-        // Within each half, values are arranged as 4 groups of 32:
-        //   group 0: ql[0..32] low nibble,  qh[0..32] bits [0..1]
-        //   group 1: ql[0..32] high nibble, qh[0..32] bits [2..3]
-        //   group 2: ql[32..64] low nibble, qh[0..32] bits [4..5]
+        // Q6_K dequantization following the ggml reference layout
+        // (dequantize_row_q6_K). Each block has 256 values split into two
+        // halves of 128. Each half uses 64 bytes of ql, 32 bytes of qh, and
+        // 8 scales. Within each half, values are arranged as 4 groups of 32:
+        //   group 0: ql[0..32]  low nibble,  qh[0..32] bits [0..1]
+        //   group 1: ql[32..64] low nibble,  qh[0..32] bits [2..3]
+        //   group 2: ql[0..32]  high nibble, qh[0..32] bits [4..5]
         //   group 3: ql[32..64] high nibble, qh[0..32] bits [6..7]
         // Each group of 32 uses 2 consecutive scales (16 values per scale).
+        //
+        // HISTORY (2026-08-17): groups 1 and 2 were SWAPPED here (ql[0..32]
+        // high nibble served group 1, ql[32..64] low nibble served group 2)
+        // since the original implementation — wrong data nibbles paired with
+        // the right qh bits and scales for every middle half-band of every
+        // superblock. The uniform-block unit tests were permutation-blind.
+        // Caught by the source-fidelity Q6_K head census; verified against
+        // ggml-quants.c and a positional cross-check.
         let mut idx = 0usize;
         for half in 0..2 {
             let ql_ptr = &ql[64 * half..];
@@ -458,12 +466,12 @@ pub(crate) fn dequantize_q6_k(src: &[u8], n_elements: u64) -> Vec<u8> {
                 out.extend_from_slice(&val.to_le_bytes());
                 idx += 1;
             }
-            // Group 1: high nibbles of ql[0..32], qh bits [2..3]
+            // Group 1: low nibbles of ql[32..64], qh bits [2..3]
             for j in 0..32 {
                 if written + idx >= n {
                     break;
                 }
-                let q_lo = (ql_ptr[j] >> 4) & 0x0F;
+                let q_lo = ql_ptr[32 + j] & 0x0F;
                 let q_hi = ((qh_ptr[j] >> 2) & 3) << 4;
                 let q = (q_lo | q_hi) as i32 - 32;
                 let sc = sc_ptr[2 + j / 16] as i8 as f32;
@@ -471,12 +479,12 @@ pub(crate) fn dequantize_q6_k(src: &[u8], n_elements: u64) -> Vec<u8> {
                 out.extend_from_slice(&val.to_le_bytes());
                 idx += 1;
             }
-            // Group 2: low nibbles of ql[32..64], qh bits [4..5]
+            // Group 2: high nibbles of ql[0..32], qh bits [4..5]
             for j in 0..32 {
                 if written + idx >= n {
                     break;
                 }
-                let q_lo = ql_ptr[32 + j] & 0x0F;
+                let q_lo = (ql_ptr[j] >> 4) & 0x0F;
                 let q_hi = ((qh_ptr[j] >> 4) & 3) << 4;
                 let q = (q_lo | q_hi) as i32 - 32;
                 let sc = sc_ptr[4 + j / 16] as i8 as f32;

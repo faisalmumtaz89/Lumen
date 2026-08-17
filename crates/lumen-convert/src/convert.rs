@@ -1348,6 +1348,52 @@ mod tests {
         }
     }
 
+    /// Position-varying Q6_K block against a direct transcription of ggml's
+    /// `dequantize_row_q6_K`. The uniform-block tests above are blind to band
+    /// permutations — this test exists because groups 1/2 were swapped here
+    /// for the library's entire history and every uniform test passed.
+    #[test]
+    fn dequantize_q6_k_matches_ggml_reference() {
+        let mut state = 0x9E3779B9u32;
+        let mut block = [0u8; 210];
+        for b in block.iter_mut() {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (state >> 24) as u8;
+        }
+        let d_bits = f32_to_f16_bits(1.5);
+        block[208..210].copy_from_slice(&d_bits.to_le_bytes());
+
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let sc = &block[192..208];
+        let d = 1.5f32;
+        let mut expected = [0.0f32; 256];
+        for half in 0..2usize {
+            let (qlh, qhh, sch) = (&ql[64 * half..], &qh[32 * half..], &sc[8 * half..]);
+            for l in 0..32usize {
+                let is = l / 16;
+                let q1 = ((qlh[l] & 0xF) | ((qhh[l] & 3) << 4)) as i32 - 32;
+                let q2 = ((qlh[l + 32] & 0xF) | (((qhh[l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((qlh[l] >> 4) | (((qhh[l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((qlh[l + 32] >> 4) | (((qhh[l] >> 6) & 3) << 4)) as i32 - 32;
+                expected[128 * half + l] = d * (sch[is] as i8 as f32) * q1 as f32;
+                expected[128 * half + l + 32] = d * (sch[is + 2] as i8 as f32) * q2 as f32;
+                expected[128 * half + l + 64] = d * (sch[is + 4] as i8 as f32) * q3 as f32;
+                expected[128 * half + l + 96] = d * (sch[is + 6] as i8 as f32) * q4 as f32;
+            }
+        }
+
+        let result = dequantize_q6_k(&block, 256);
+        let values: Vec<f32> = result
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), 256);
+        for i in 0..256 {
+            assert_eq!(values[i], expected[i], "Q6_K ggml mismatch at element {i}");
+        }
+    }
+
     #[test]
     fn dequantize_q2_k_known_block() {
         let mut block = Vec::new();

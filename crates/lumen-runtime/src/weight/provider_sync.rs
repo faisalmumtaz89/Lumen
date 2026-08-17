@@ -226,6 +226,57 @@ pub fn dequantize_q8_0_to_f32(src: &[u8], n_elements: usize) -> Vec<f32> {
     out
 }
 
+/// Dequantize Q6_K superblocks to Vec<f32>.
+/// Q6_K block layout (256 elements, 210 bytes): [128B ql low-4s] [64B qh
+/// upper-2s] [16B int8 sub-scales] [2B f16 d]. GGML group order: for each
+/// 128-element half, four 32-element groups combine ql lo/hi nibbles of
+/// ql[0..32]/ql[32..64] with qh bit-pairs 0/2/4/6; value = d * sc * (q - 32).
+/// Matches `lumen-convert::dequant` and the CUDA host reference exactly.
+pub fn dequantize_q6_k_to_f32(src: &[u8], n_elements: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n_elements];
+    let block_size = 210;
+    let n_blocks = src.len() / block_size;
+    let mut written = 0usize;
+    for b in 0..n_blocks {
+        let bp = &src[b * block_size..];
+        let ql = &bp[0..128];
+        let qh = &bp[128..192];
+        let scales = &bp[192..208];
+        let d = f16_bits_to_f32(u16::from_le_bytes([bp[208], bp[209]]));
+        let mut idx = 0usize;
+        for half in 0..2usize {
+            let ql_ptr = &ql[64 * half..];
+            let qh_ptr = &qh[32 * half..];
+            let sc_ptr = &scales[8 * half..];
+            for group in 0..4usize {
+                // Group g reads ql byte (g%2)*32+j (lo nibble for g<2, hi for
+                // g>=2) and qh bit pair 2*g of qh[j].
+                let ql_base = (group & 1) * 32;
+                let use_hi = group >= 2;
+                let hshift = 2 * group as u32;
+                for j in 0..32usize {
+                    if written + idx >= n_elements {
+                        break;
+                    }
+                    let ql_byte = ql_ptr[ql_base + j];
+                    let q_lo = if use_hi {
+                        (ql_byte >> 4) & 0x0F
+                    } else {
+                        ql_byte & 0x0F
+                    };
+                    let q_hi = ((qh_ptr[j] >> hshift) & 3) << 4;
+                    let q = (q_lo | q_hi) as i32 - 32;
+                    let sc = sc_ptr[2 * group + j / 16] as i8 as f32;
+                    out[written + idx] = d * sc * q as f32;
+                    idx += 1;
+                }
+            }
+        }
+        written += idx;
+    }
+    out
+}
+
 /// Dequantize Q4_0 bytes to Vec<f32>.
 /// Q4_0 block layout: [2 bytes f16 scale] [16 bytes packed nibbles], total 18 bytes per 32 elements.
 /// GGML de-interleaved order: indices 0-15 use lo nibbles, indices 16-31 use hi nibbles.
@@ -350,6 +401,16 @@ pub fn read_output_proj_global(
     let expected_q8_bytes = (n_elements / 32) * 34;
     let expected_q4_bytes = (n_elements / 32) * 18;
     let expected_f16_bytes = n_elements * 2;
+    let expected_q6k_bytes = (n_elements / 256) * 210;
+
+    // Q6_K head (source-fidelity artifacts): keep the raw superblocks for the
+    // CUDA dp4a plane kernel AND materialize the F32 copy for CPU fallbacks.
+    // Checked before the length cascade — without this branch the final else
+    // used to misinterpret the Q6_K bytes as F32 and drop the raw entirely.
+    if matches!(header_quant, QuantScheme::Q6_K) && raw_bytes.len() == expected_q6k_bytes {
+        let f32_data = dequantize_q6_k_to_f32(&raw_bytes, n_elements);
+        return (f32_data, raw_bytes, QuantScheme::Q6_K);
+    }
 
     if raw_bytes.len() == expected_f32_bytes {
         let f32_data = bytes_to_f32(&raw_bytes);
@@ -646,6 +707,55 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SYNC_RAW_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Position-varying Q6_K block dequantized against a direct transcription
+    /// of ggml's `dequantize_row_q6_K`. A uniform block cannot catch band
+    /// permutations (the historical groups-1/2 swap in other dequant copies),
+    /// so every byte here differs.
+    #[test]
+    fn dequantize_q6_k_matches_ggml_reference() {
+        // Deterministic varying bytes (LCG).
+        let mut state = 0x12345678u32;
+        let mut block = [0u8; 210];
+        for b in block.iter_mut() {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (state >> 24) as u8;
+        }
+        // Keep d a sane positive f16 (1.5).
+        let d_bits = 0x3E00u16;
+        block[208..210].copy_from_slice(&d_bits.to_le_bytes());
+
+        // ggml reference: for each 128-half, l in 0..32:
+        //   y[l+0]  = d*sc[l/16+0]*((ql[l]&0xF    | ((qh[l]>>0 &3)<<4)) - 32)
+        //   y[l+32] = d*sc[l/16+2]*((ql[l+32]&0xF | ((qh[l]>>2 &3)<<4)) - 32)
+        //   y[l+64] = d*sc[l/16+4]*((ql[l]>>4     | ((qh[l]>>4 &3)<<4)) - 32)
+        //   y[l+96] = d*sc[l/16+6]*((ql[l+32]>>4  | ((qh[l]>>6 &3)<<4)) - 32)
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let sc = &block[192..208];
+        let d = f16_bits_to_f32(d_bits);
+        let mut expected = [0.0f32; 256];
+        for half in 0..2usize {
+            let (qlh, qhh, sch) = (&ql[64 * half..], &qh[32 * half..], &sc[8 * half..]);
+            for l in 0..32usize {
+                let is = l / 16;
+                let q1 = ((qlh[l] & 0xF) | (((qhh[l]) & 3) << 4)) as i32 - 32;
+                let q2 = ((qlh[l + 32] & 0xF) | (((qhh[l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((qlh[l] >> 4) | (((qhh[l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((qlh[l + 32] >> 4) | (((qhh[l] >> 6) & 3) << 4)) as i32 - 32;
+                expected[128 * half + l] = d * (sch[is] as i8 as f32) * q1 as f32;
+                expected[128 * half + l + 32] = d * (sch[is + 2] as i8 as f32) * q2 as f32;
+                expected[128 * half + l + 64] = d * (sch[is + 4] as i8 as f32) * q3 as f32;
+                expected[128 * half + l + 96] = d * (sch[is + 6] as i8 as f32) * q4 as f32;
+            }
+        }
+
+        let got = dequantize_q6_k_to_f32(&block, 256);
+        assert_eq!(got.len(), 256);
+        for i in 0..256 {
+            assert_eq!(got[i], expected[i], "Q6_K mismatch at element {i}");
+        }
+    }
 
     /// Write the given LBC bytes to a unique temp file and return its path.
     fn write_test_lbc(data: &[u8], tag: &str) -> std::path::PathBuf {

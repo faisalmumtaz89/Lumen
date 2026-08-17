@@ -414,24 +414,27 @@ fn dequant_kquant_to_f32(
                         out[written + idx] = d * sc * q as f32;
                         idx += 1;
                     }
-                    // Group 1: high nibbles of ql[0..32], qh bits [2..3]
+                    // Group 1: low nibbles of ql[32..64], qh bits [2..3].
+                    // (2026-08-17: groups 1/2 were band-swapped vs the ggml
+                    // reference — same bug as lumen-convert's dequantize_q6_k;
+                    // see the HISTORY note there.)
                     for j in 0..32 {
                         if written + idx >= n_elements {
                             break;
                         }
-                        let q_lo = (ql_ptr[j] >> 4) & 0x0F;
+                        let q_lo = ql_ptr[32 + j] & 0x0F;
                         let q_hi = ((qh_ptr[j] >> 2) & 3) << 4;
                         let q = (q_lo | q_hi) as i32 - 32;
                         let sc = sc_ptr[2 + j / 16] as i8 as f32;
                         out[written + idx] = d * sc * q as f32;
                         idx += 1;
                     }
-                    // Group 2: low nibbles of ql[32..64], qh bits [4..5]
+                    // Group 2: high nibbles of ql[0..32], qh bits [4..5]
                     for j in 0..32 {
                         if written + idx >= n_elements {
                             break;
                         }
-                        let q_lo = ql_ptr[32 + j] & 0x0F;
+                        let q_lo = (ql_ptr[j] >> 4) & 0x0F;
                         let q_hi = ((qh_ptr[j] >> 4) & 3) << 4;
                         let q = (q_lo | q_hi) as i32 - 32;
                         let sc = sc_ptr[4 + j / 16] as i8 as f32;
