@@ -1904,10 +1904,14 @@ fn create_backend(
     // BF16 added to the raw-weight allow-list. Without this, BF16 LBC models silently route
     // through the F32 CPU-dequant fallback and the BF16 raw-weight path
     // is skipped. Load-bearing for the BF16 path's prefill kernel.
-    if matches!(
+    // Q6_K (source-fidelity head) is CUDA-only: the CUDA backend splits the
+    // superblocks into dp4a planes; Metal/CPU have no Q6_K head kernel and
+    // keep the F32 dequant copy instead.
+    if (matches!(
         output_proj_quant,
         QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
-    ) && !output_proj_raw.is_empty()
+    ) || (use_cuda && output_proj_quant == QuantScheme::Q6_K))
+        && !output_proj_raw.is_empty()
     {
         if verbose {
             eprintln!(

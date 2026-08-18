@@ -197,6 +197,19 @@ pub struct LayerWeightsGpu {
     pub q4_split_ssm_alpha: Option<CudaSlice<u8>>,
     pub q4_split_ssm_beta: Option<CudaSlice<u8>>,
 
+    // --- source-fidelity siblings (tensors kept in their source GGUF form) ---
+    /// `ssm_out` kept in its source Q5_K form, as four lossless split planes
+    /// (qs 128 / qh 32 / scales 12 / d+dmin 4 bytes per 256-element
+    /// superblock) for the decode dp4a kernel. The base `ssm_out` buffer holds
+    /// an F16 image for prefill HGEMM. Populated when the artifact stores
+    /// ssm_out as Q5_K (source-fidelity conversion).
+    pub ssm_out_q5k: Option<(CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>)>,
+    /// `w_down` kept in its source Q4_1 form (raw 20-byte blocks) for the
+    /// decode dp4a kernel. The base `w_down` buffer holds an F16 image for
+    /// prefill HGEMM. Populated when the artifact stores w_down as Q4_1
+    /// (source-fidelity conversion).
+    pub q4_1_w_down: Option<CudaSlice<u8>>,
+
     // --- Qwen3.5 full-attention Q+gate fusion weights ---
     /// Per-head Q RMSNorm weight: [head_dim] F32, shared across all heads.
     /// Present only for Qwen3.5 full-attention layers (where attn_q has fused Q+gate).
@@ -267,6 +280,73 @@ fn estimate_quant_elements(byte_len: usize, scheme: QuantScheme) -> usize {
     n_blocks * bs_elem
 }
 
+/// Host IEEE f16 bits -> f32. Module-level twin of the per-arm copies inside
+/// `upload_tensor`; used where a `fn(u16) -> f32` must be passed by name.
+pub(super) fn host_f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x3ff) as u32;
+    if exp == 0 {
+        if frac == 0 {
+            return if sign == 1 { -0.0 } else { 0.0 };
+        }
+        let v = (frac as f32) * 6.103515625e-05 / 1024.0;
+        return if sign == 1 { -v } else { v };
+    }
+    if exp == 31 {
+        return if frac != 0 {
+            f32::NAN
+        } else if sign == 1 {
+            f32::NEG_INFINITY
+        } else {
+            f32::INFINITY
+        };
+    }
+    f32::from_bits((sign << 31) | ((exp - 15 + 127) << 23) | (frac << 13))
+}
+
+/// Host f32 -> IEEE f16 bits, round-to-nearest-even (matches the GPU
+/// `f32_to_f16_vec` kernel's cvt.rn behavior). Used to build F16 weight
+/// images for tensors kept in their source K-quant/Q4_1 form.
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 255 {
+        // Inf / NaN (preserve a quiet-NaN payload bit).
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+    let unbiased = exp - 127;
+    if unbiased > 15 {
+        return sign | 0x7c00; // overflow -> inf
+    }
+    if unbiased >= -14 {
+        // Normal f16.
+        let mant16 = (mant >> 13) as u16;
+        let round = mant & 0x1fff;
+        let mut h = sign | (((unbiased + 15) as u16) << 10) | mant16;
+        if round > 0x1000 || (round == 0x1000 && (mant16 & 1) == 1) {
+            h = h.wrapping_add(1); // carries ripple into the exponent correctly
+        }
+        h
+    } else if unbiased >= -25 {
+        // Subnormal f16.
+        let total_shift = (13 - 14 - unbiased) as u32; // 14..25
+        let mant_full = mant | 0x0080_0000;
+        let mant16 = (mant_full >> total_shift) as u16;
+        let rem = mant_full & ((1u32 << total_shift) - 1);
+        let half = 1u32 << (total_shift - 1);
+        let mut h = sign | mant16;
+        if rem > half || (rem == half && (mant16 & 1) == 1) {
+            h = h.wrapping_add(1);
+        }
+        h
+    } else {
+        sign // underflow to signed zero
+    }
+}
+
 /// Decode K-quant scales from 12 packed bytes into 8 scale + 8 min arrays.
 ///
 /// Used by Q4_K and Q5_K. The 12 bytes encode 8 6-bit scales and 8 6-bit mins
@@ -293,7 +373,7 @@ fn decode_k_scales(scales: &[u8]) -> ([u8; 8], [u8; 8]) {
 ///
 /// All implementations match the reference layout exactly (same as
 /// lumen-convert::dequant).
-fn dequant_kquant_to_f32(
+pub(super) fn dequant_kquant_to_f32(
     raw: &[u8],
     scheme: QuantScheme,
     n_elements: usize,
@@ -334,24 +414,25 @@ fn dequant_kquant_to_f32(
                         out[written + idx] = d * sc * q as f32;
                         idx += 1;
                     }
-                    // Group 1: high nibbles of ql[0..32], qh bits [2..3]
+                    // Group 1: low nibbles of ql[32..64], qh bits [2..3]
+                    // (order MUST match ggml's dequantize_row_q6_K).
                     for j in 0..32 {
                         if written + idx >= n_elements {
                             break;
                         }
-                        let q_lo = (ql_ptr[j] >> 4) & 0x0F;
+                        let q_lo = ql_ptr[32 + j] & 0x0F;
                         let q_hi = ((qh_ptr[j] >> 2) & 3) << 4;
                         let q = (q_lo | q_hi) as i32 - 32;
                         let sc = sc_ptr[2 + j / 16] as i8 as f32;
                         out[written + idx] = d * sc * q as f32;
                         idx += 1;
                     }
-                    // Group 2: low nibbles of ql[32..64], qh bits [4..5]
+                    // Group 2: high nibbles of ql[0..32], qh bits [4..5]
                     for j in 0..32 {
                         if written + idx >= n_elements {
                             break;
                         }
-                        let q_lo = ql_ptr[32 + j] & 0x0F;
+                        let q_lo = (ql_ptr[j] >> 4) & 0x0F;
                         let q_hi = ((qh_ptr[j] >> 4) & 3) << 4;
                         let q = (q_lo | q_hi) as i32 - 32;
                         let sc = sc_ptr[4 + j / 16] as i8 as f32;
@@ -604,7 +685,8 @@ fn dequant_kquant_to_f32(
 /// - `QuantScheme::Bf16`: upload raw bytes as `GpuWeightBuf::Bf16Raw`.
 /// - `QuantScheme::Q8_0`: upload raw bytes as `GpuWeightBuf::Q8Raw`.
 /// - `QuantScheme::Q4_0`: upload raw bytes as `GpuWeightBuf::Q4Raw`.
-/// - `QuantScheme::Q4_1`, `Q5_0`: dequant to F32 on host.
+/// - `QuantScheme::Q4_1`: dequant to F16 on host (uploaded as `F16Raw`).
+/// - `QuantScheme::Q5_0`: dequant to F32 on host.
 /// - K-quants (`Q6_K`, `Q5_K`, `Q4_K`, `Q3_K`, `Q2_K`): dequant to F32 on host.
 /// The F32 buffer gets an F16 cache via `dequant_layer_q8_to_f16()` for HGEMV.
 fn upload_tensor(
@@ -636,7 +718,10 @@ fn upload_tensor(
         }
         QuantScheme::Q4_1 => {
             // Q4_1 is used for some tensors in "Q4_0" GGUFs (e.g. w_down).
-            // Dequantize to F32 on host and upload as F32.
+            // Dequantize on host and upload an F16 image (F16Raw): half the
+            // VRAM of the former F32 upload, and both prefill (HGEMM) and
+            // decode fallback (HGEMV) consume F16Raw natively. Decode's fast
+            // path reads the raw Q4_1 sibling (`q4_1_w_down`) via dp4a.
             // Q4_1 block: 20 bytes = f16 scale (2B) + f16 min (2B) + 16 nibble-pair bytes (32 elements).
             let n_blocks = raw.len() / 20;
             let n_elements = n_blocks * 32;
@@ -675,12 +760,21 @@ fn upload_tensor(
                     let byte = bp[4 + i];
                     let lo = (byte & 0x0F) as f32;
                     let hi = ((byte >> 4) & 0x0F) as f32;
-                    f32_data[b * 32 + 2 * i] = scale * lo + min;
-                    f32_data[b * 32 + 2 * i + 1] = scale * hi + min;
+                    // GGML Q4_1 element order: low nibbles fill elements
+                    // 0..16, high nibbles fill 16..32 (de-interleaved — NOT
+                    // pairwise). The pairwise `2*i / 2*i+1` this used to do
+                    // permuted 30 of every 32 columns; dormant while no
+                    // artifact stored Q4_1, load-bearing for source fidelity.
+                    f32_data[b * 32 + i] = scale * lo + min;
+                    f32_data[b * 32 + 16 + i] = scale * hi + min;
                 }
             }
-            let gpu_buf = device.htod_copy(&f32_data)?;
-            Ok(GpuWeightBuf::F32(gpu_buf))
+            let f16_bytes: Vec<u8> = f32_data
+                .iter()
+                .flat_map(|&x| f32_to_f16_bits(x).to_le_bytes())
+                .collect();
+            let gpu_buf = device.htod_copy(&f16_bytes)?;
+            Ok(GpuWeightBuf::F16Raw(gpu_buf))
         }
         QuantScheme::Q5_0 => {
             // Q5_0: 22 bytes per block of 32 elements.
@@ -871,6 +965,55 @@ pub fn upload_layer_weights(
 ) -> Result<LayerWeightsGpu, RuntimeError> {
     let subs = &weights.subtensors;
 
+    // Source-fidelity artifacts keep ssm_out in its source Q5_K form. Base
+    // buffer becomes an F16 image (first-class prefill HGEMM / decode HGEMV
+    // path); the raw superblocks are additionally split into four aligned
+    // planes for the decode dp4a kernel (matvec_q5k_split_q8_1).
+    let (ssm_out_base, ssm_out_q5k) = match &subs.ssm_out {
+        Some(s) if s.quant == QuantScheme::Q5_K => {
+            let raw = weights.subtensor_bytes(s)?;
+            let n_blocks = raw.len() / 176;
+            let f32_data =
+                dequant_kquant_to_f32(raw, QuantScheme::Q5_K, n_blocks * 256, host_f16_to_f32)?;
+            let f16_bytes: Vec<u8> = f32_data
+                .iter()
+                .flat_map(|&x| f32_to_f16_bits(x).to_le_bytes())
+                .collect();
+            let mut qs = vec![0u8; n_blocks * 128];
+            let mut qh = vec![0u8; n_blocks * 32];
+            let mut sc = vec![0u8; n_blocks * 12];
+            let mut dm = vec![0u8; n_blocks * 4];
+            for b in 0..n_blocks {
+                let bp = &raw[b * 176..(b + 1) * 176];
+                dm[b * 4..(b + 1) * 4].copy_from_slice(&bp[0..4]);
+                sc[b * 12..(b + 1) * 12].copy_from_slice(&bp[4..16]);
+                qh[b * 32..(b + 1) * 32].copy_from_slice(&bp[16..48]);
+                qs[b * 128..(b + 1) * 128].copy_from_slice(&bp[48..176]);
+            }
+            (
+                Some(GpuWeightBuf::F16Raw(device.htod_copy(&f16_bytes)?)),
+                Some((
+                    device.htod_copy(&qs)?,
+                    device.htod_copy(&qh)?,
+                    device.htod_copy(&sc)?,
+                    device.htod_copy(&dm)?,
+                )),
+            )
+        }
+        Some(s) => (Some(upload_tensor(device, weights, "ssm_out", s)?), None),
+        None => (None, None),
+    };
+
+    // Source-fidelity artifacts keep some w_down tensors in their source Q4_1
+    // form. `upload_tensor` gives the F16 base image; the raw 20-byte blocks
+    // are kept alongside for the decode dp4a kernel (matvec_q4_1_q8_1).
+    let q4_1_w_down = if subs.w_down.quant == QuantScheme::Q4_1 {
+        let raw = weights.subtensor_bytes(&subs.w_down)?;
+        Some(device.htod_copy(raw)?)
+    } else {
+        None
+    };
+
     Ok(LayerWeightsGpu {
         wq: upload_tensor(device, weights, "wq", &subs.wq)?,
         wk: upload_tensor(device, weights, "wk", &subs.wk)?,
@@ -989,10 +1132,7 @@ pub fn upload_layer_weights(
             }
             _ => None,
         },
-        ssm_out: match &subs.ssm_out {
-            Some(s) => Some(upload_tensor(device, weights, "ssm_out", s)?),
-            None => None,
-        },
+        ssm_out: ssm_out_base,
         attn_gate: match &subs.attn_gate {
             Some(s) => Some(upload_tensor(device, weights, "attn_gate", s)?),
             None => None,
@@ -1010,6 +1150,8 @@ pub fn upload_layer_weights(
         q4_split_attn_gate: None,
         q4_split_ssm_alpha: None,
         q4_split_ssm_beta: None,
+        ssm_out_q5k,
+        q4_1_w_down,
         // Qwen3.5 full-attention per-head Q/K RMSNorm weights.
         attn_q_norm: match &subs.attn_q_norm {
             Some(s) if s.quant == QuantScheme::F32 => {
@@ -1472,6 +1614,50 @@ pub fn repack_layer_q4_to_aligned(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f32_to_f16_bits_reference_values() {
+        // Known encodings.
+        assert_eq!(f32_to_f16_bits(0.0), 0x0000);
+        assert_eq!(f32_to_f16_bits(-0.0), 0x8000);
+        assert_eq!(f32_to_f16_bits(1.0), 0x3C00);
+        assert_eq!(f32_to_f16_bits(-2.5), 0xC100);
+        assert_eq!(f32_to_f16_bits(65504.0), 0x7BFF); // f16 max
+        assert_eq!(f32_to_f16_bits(65536.0), 0x7C00); // overflow -> inf
+        assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x7C00);
+        assert_eq!(f32_to_f16_bits(f32::NEG_INFINITY), 0xFC00);
+        assert_eq!(f32_to_f16_bits(6.103515625e-05), 0x0400); // smallest normal
+        assert_eq!(f32_to_f16_bits(5.9604645e-08), 0x0001); // smallest subnormal
+        assert!(f32_to_f16_bits(f32::NAN) & 0x7C00 == 0x7C00);
+        assert!(f32_to_f16_bits(f32::NAN) & 0x03FF != 0);
+    }
+
+    #[test]
+    fn f16_bits_roundtrip_exact() {
+        // Every finite f16 value must round-trip bit-exactly through
+        // host_f16_to_f32 -> f32_to_f16_bits (f32 represents all f16 values).
+        for bits in 0u16..=0xFFFF {
+            let exp = (bits >> 10) & 0x1F;
+            let frac = bits & 0x3FF;
+            if exp == 31 {
+                continue; // inf/NaN
+            }
+            let back = f32_to_f16_bits(host_f16_to_f32(bits));
+            // -0.0 and 0.0 keep their signs; everything else exact.
+            assert_eq!(back, bits, "roundtrip failed for {bits:#06x} (frac {frac})");
+        }
+    }
+
+    #[test]
+    fn f32_to_f16_bits_round_to_nearest_even() {
+        // 1 + 2^-11 is exactly halfway between 1.0 and the next f16
+        // (1 + 2^-10); RNE keeps the even mantissa (1.0 = 0x3C00).
+        assert_eq!(f32_to_f16_bits(1.0 + f32::powi(2.0, -11)), 0x3C00);
+        // 1 + 3*2^-11 is halfway between 0x3C01 and 0x3C02; RNE -> 0x3C02.
+        assert_eq!(f32_to_f16_bits(1.0 + 3.0 * f32::powi(2.0, -11)), 0x3C02);
+        // Just above halfway rounds up.
+        assert_eq!(f32_to_f16_bits(1.0 + f32::powi(2.0, -11) * 1.001), 0x3C01);
+    }
 
     #[test]
     fn bytes_as_f32_valid() {

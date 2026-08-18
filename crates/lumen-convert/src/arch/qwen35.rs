@@ -164,6 +164,22 @@ fn compute_layer_shape_qwen35(
             *blob_offset += size;
             Ok(slice)
         } else if tensor.ggml_type == GgmlType::Q4_1 {
+            if target != ConvertTarget::Metal && crate::convert::source_fidelity() {
+                // SOURCE_FIDELITY: keep Q4_1 verbatim (the min term is part of
+                // the source quantization; stripping it to Q4_0 is a quality
+                // downcast the reference engine does not perform). CUDA-only:
+                // Metal has no Q4_1 kernel, so the Metal target still
+                // requantizes (mirrors append_tensor_to_blob_requant_with_target).
+                let n_elements = tensor.n_elements();
+                let size = ((n_elements as usize / 32) * 20) as u64;
+                let slice = TensorSlice {
+                    offset: *blob_offset,
+                    length: size,
+                    quant: QuantScheme::Q4_1,
+                };
+                *blob_offset += size;
+                return Ok(slice);
+            }
             // Q4_1 has no dedicated GPU kernel -- requantize to Q4_0.
             let n_elements = tensor.n_elements();
             assert!(
@@ -263,6 +279,24 @@ fn compute_layer_shape_qwen35(
                 } else {
                     ((n_elements / 32 * 18) as u64, QuantScheme::Q4_0)
                 }
+            }
+            None => {
+                // SOURCE_FIDELITY passthrough: a None target keeps the source
+                // scheme verbatim (the ssm_out caller only passes None for
+                // sources the runtime serves natively: Q5_K, Q8_0). Must
+                // mirror `write_layer_blob`'s None-target verbatim copy.
+                let quant = src_quant.ok_or_else(|| ConvertError::UnsupportedTensorType {
+                    tensor: name.clone(),
+                    ggml_type: format!("{:?}", tensor.ggml_type),
+                })?;
+                let size =
+                    tensor
+                        .byte_size()
+                        .ok_or_else(|| ConvertError::UnsupportedTensorType {
+                            tensor: name.clone(),
+                            ggml_type: format!("{:?} (unknown block geometry)", tensor.ggml_type),
+                        })?;
+                (size, quant)
             }
             _ => ((n_elements * 4) as u64, QuantScheme::F32),
         };
@@ -391,7 +425,7 @@ fn compute_layer_shape_qwen35(
     // SSM tensors (linear attention layers only) — never requantized to user target.
     // ssm_alpha/beta MUST be Q8_0 — the GDN runtime hardcodes Q8_0 matvec kernels.
     // Shared logic in gdn_gates handles force-requant from F32/F16/BF16 to Q8_0.
-    let ssm = compute_ssm_slices(gguf, layer, &mut blob_size, dequantize)?;
+    let ssm = compute_ssm_slices(gguf, layer, &mut blob_size, dequantize, target)?;
     let ssm_a = ssm.ssm_a;
     let ssm_conv1d = ssm.ssm_conv1d;
     let ssm_dt = ssm.ssm_dt;
@@ -410,9 +444,26 @@ fn compute_layer_shape_qwen35(
     // dominant quality lever on this architecture. (The even-older default
     // "force F32 unless requant handles it" shipped LBCs that lost 100%+
     // Metal prefill on Qwen3.5-9B.)
-    let ssm_out_target = match requant_to {
-        Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
-        other => other.or(Some(QuantScheme::Q8_0)),
+    // SOURCE_FIDELITY: keep ssm_out in its source format when the runtime can
+    // serve it (Q5_K in Q4_0-preset files, Q8_0 in Q8 files). The Q8_0 floor
+    // below guards the historical hazard — REQUANTIZING ssm_out DOWN to 4-bit
+    // corrupts the recurrence; serving the provider's own Q5_K is the
+    // reference engine's configuration, not a down-requant.
+    let ssm_out_src = gguf
+        .find_tensor(&layer_tensor_name(layer, SSM_OUT))
+        .map(|t| t.ggml_type);
+    let ssm_out_target = if target != ConvertTarget::Metal
+        && crate::convert::source_fidelity()
+        && matches!(
+            ssm_out_src,
+            Some(crate::gguf::GgmlType::Q5_K) | Some(crate::gguf::GgmlType::Q8_0)
+        ) {
+        None
+    } else {
+        match requant_to {
+            Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
+            other => other.or(Some(QuantScheme::Q8_0)),
+        }
     };
     let ssm_out = compute_slice_with_requant(gguf, layer, SSM_OUT, &mut blob_size, ssm_out_target)?;
 
@@ -604,7 +655,7 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
 
     // SSM tensors (if present) — shared GDN gate logic handles force-requant
     // of ssm_alpha/beta to Q8_0 when source is F32/F16/BF16.
-    write_ssm_tensors(blob, reader, gguf, layer, dequantize)?;
+    write_ssm_tensors(blob, reader, gguf, layer, dequantize, target)?;
     {
         let name = layer_tensor_name(layer, SSM_OUT);
         if gguf.find_tensor(&name).is_some() {
@@ -614,9 +665,21 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
             // floor + evidence in compute_slice_with_requant above; the two
             // MUST stay in sync for layer-shape symmetry). (Target is
             // irrelevant here: ssm_out is always force-requanted.)
-            let ssm_out_target = match requant_to {
-                Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
-                other => other.or(Some(QuantScheme::Q8_0)),
+            // SOURCE_FIDELITY: keep the source scheme verbatim (None target =
+            // passthrough) — must mirror the plan's `ssm_out_target` above.
+            let src = gguf.find_tensor(&name).map(|t| t.ggml_type);
+            let ssm_out_target = if target != ConvertTarget::Metal
+                && crate::convert::source_fidelity()
+                && matches!(
+                    src,
+                    Some(crate::gguf::GgmlType::Q5_K) | Some(crate::gguf::GgmlType::Q8_0)
+                ) {
+                None
+            } else {
+                match requant_to {
+                    Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
+                    other => other.or(Some(QuantScheme::Q8_0)),
+                }
             };
             append_tensor_to_blob_requant(
                 blob,

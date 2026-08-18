@@ -4,7 +4,7 @@
 //! matvec kernels for these tensors. This module centralises the force-requant
 //! logic so both the dense and MoE converters handle it identically.
 
-use crate::convert::ConvertError;
+use crate::convert::{ConvertError, ConvertTarget};
 use crate::gguf::{GgmlType, GgufFile};
 use crate::tensor_io::*;
 use crate::tensor_names::*;
@@ -28,6 +28,7 @@ pub(crate) fn compute_ssm_tensor_slice(
     suffix: &str,
     blob_offset: &mut u64,
     dequantize: bool,
+    target: ConvertTarget,
 ) -> Result<Option<TensorSlice>, ConvertError> {
     let name = layer_tensor_name(layer, suffix);
     let tensor = match gguf.find_tensor(&name) {
@@ -119,7 +120,17 @@ pub(crate) fn compute_ssm_tensor_slice(
         }
     };
 
-    if is_alpha_or_beta && !matches!(quant, QuantScheme::Q8_0) {
+    // SOURCE_FIDELITY: keep F32 alpha/beta gates at source precision — the
+    // runtime routes non-Q8 gate weights through the generic F32 matvec. The
+    // force-requant below is the historical default (runtime hardcoded Q8_0
+    // gate kernels).
+    // CUDA-only: Metal binds these offsets to Q8_0 kernels unconditionally
+    // and would parse an F32 stream as 34-byte Q8 blocks.
+    let keep_source_gates = target != ConvertTarget::Metal
+        && crate::convert::source_fidelity()
+        && is_alpha_or_beta
+        && matches!(quant, QuantScheme::F32);
+    if is_alpha_or_beta && !matches!(quant, QuantScheme::Q8_0) && !keep_source_gates {
         let n_elements = tensor.n_elements() as usize;
         assert!(
             n_elements % 32 == 0,
@@ -171,14 +182,29 @@ pub(crate) fn compute_ssm_slices(
     layer: usize,
     blob_offset: &mut u64,
     dequantize: bool,
+    target: ConvertTarget,
 ) -> Result<SsmSlices, ConvertError> {
     Ok(SsmSlices {
-        ssm_a: compute_ssm_tensor_slice(gguf, layer, SSM_A, blob_offset, dequantize)?,
-        ssm_conv1d: compute_ssm_tensor_slice(gguf, layer, SSM_CONV1D, blob_offset, dequantize)?,
-        ssm_dt: compute_ssm_tensor_slice(gguf, layer, SSM_DT, blob_offset, dequantize)?,
-        ssm_beta: compute_ssm_tensor_slice(gguf, layer, SSM_BETA, blob_offset, dequantize)?,
-        ssm_alpha: compute_ssm_tensor_slice(gguf, layer, SSM_ALPHA, blob_offset, dequantize)?,
-        ssm_norm: compute_ssm_tensor_slice(gguf, layer, SSM_NORM, blob_offset, dequantize)?,
+        ssm_a: compute_ssm_tensor_slice(gguf, layer, SSM_A, blob_offset, dequantize, target)?,
+        ssm_conv1d: compute_ssm_tensor_slice(
+            gguf,
+            layer,
+            SSM_CONV1D,
+            blob_offset,
+            dequantize,
+            target,
+        )?,
+        ssm_dt: compute_ssm_tensor_slice(gguf, layer, SSM_DT, blob_offset, dequantize, target)?,
+        ssm_beta: compute_ssm_tensor_slice(gguf, layer, SSM_BETA, blob_offset, dequantize, target)?,
+        ssm_alpha: compute_ssm_tensor_slice(
+            gguf,
+            layer,
+            SSM_ALPHA,
+            blob_offset,
+            dequantize,
+            target,
+        )?,
+        ssm_norm: compute_ssm_tensor_slice(gguf, layer, SSM_NORM, blob_offset, dequantize, target)?,
     })
 }
 
@@ -193,6 +219,7 @@ pub(crate) fn write_ssm_tensors<R: Read + Seek>(
     gguf: &GgufFile,
     layer: usize,
     dequantize: bool,
+    target: ConvertTarget,
 ) -> Result<(), ConvertError> {
     for suffix in &SSM_SUFFIXES {
         let name = layer_tensor_name(layer, suffix);
@@ -206,7 +233,17 @@ pub(crate) fn write_ssm_tensors<R: Read + Seek>(
                 && !matches!(tensor.ggml_type, GgmlType::F32)
                 && matches!(*suffix, SSM_A | SSM_CONV1D | SSM_DT | SSM_NORM);
             let src_quant = tensor.ggml_type.to_lbc_quant();
-            if is_alpha_or_beta && !matches!(src_quant, Some(QuantScheme::Q8_0)) {
+            // SOURCE_FIDELITY: keep F32 alpha/beta verbatim — must mirror the
+            // `keep_source_gates` branch in `compute_ssm_tensor_slice` above
+            // (plan and writer MUST agree on layer-blob layout).
+            let keep_source_gates = target != ConvertTarget::Metal
+                && crate::convert::source_fidelity()
+                && is_alpha_or_beta
+                && matches!(src_quant, Some(QuantScheme::F32));
+            if is_alpha_or_beta
+                && !matches!(src_quant, Some(QuantScheme::Q8_0))
+                && !keep_source_gates
+            {
                 // Force-requantize to Q8_0 (dequant to F32 first, then quantize to Q8_0)
                 append_tensor_to_blob_requant(
                     blob,

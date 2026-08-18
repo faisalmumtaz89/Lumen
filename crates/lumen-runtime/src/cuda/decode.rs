@@ -513,6 +513,10 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_q4_split_q8_1_locked_banked_b160_v4: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_locked_banked_b160: Option<CudaFunction>,
     pub(crate) matvec_q4_split_q8_1_locked_bank4: Option<CudaFunction>,
+    // NR=1 (one row per CTA) residual variant of the locked Q4 split kernel:
+    // grid = out_dim CTAs. Byte-identical per row (grid mapping only); wins
+    // on short-N long-K shapes (FFN down) where NR=4 underfills the GPU.
+    pub(crate) matvec_q4_split_q8_1_locked_residual_nr1: Option<CudaFunction>,
 
     // llama mmvq port on the Q4 split layout (`LUMEN_CUDA_Q8_MMVQ`, default-OFF;
     // shares the Q8 mmvq flag). 2-lane VDR striping + one-row/CTA + lane-
@@ -528,6 +532,20 @@ pub(crate) struct KernelSet {
     // `matvec_q8_split_output_proj` field continues to alias the nr32 variant
     // so existing dispatch sites keep working.
     pub(crate) matvec_q8_split_output_proj: Option<CudaFunction>,
+    /// Q6_K output-head matvec (split-plane layout, NR=2). Loaded lazily so
+    /// artifacts with a Q8_0 head pay nothing.
+    pub(crate) matvec_q6k_head: Option<CudaFunction>,
+    /// Q5_K matvec (split-plane layout, NR=2) for GDN ssm_out kept in its
+    /// source K-quant form. Plain + residual-folding variants.
+    /// Banked F32 gates matvec (alpha+beta in one launch) for GDN gates
+    /// kept in their F32 source form.
+    pub(crate) matvec_f32_gates_banked: Option<CudaFunction>,
+    pub(crate) matvec_q5k_split: Option<CudaFunction>,
+    pub(crate) matvec_q5k_split_residual: Option<CudaFunction>,
+    /// Q4_1 matvec against Q8_1 input for FFN down tensors kept in their
+    /// source Q4_1 form. Plain + residual-folding variants.
+    pub(crate) matvec_q4_1: Option<CudaFunction>,
+    pub(crate) matvec_q4_1_residual: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr8: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr16: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr64: Option<CudaFunction>,
@@ -1910,6 +1928,14 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             assert_ne!(src, shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE);
             load_fn_sm80_fast_math(&src, "matvec_q4_split_q8_1_locked_banked").ok()
         },
+        matvec_q4_split_q8_1_locked_residual_nr1: {
+            let src = shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE
+                .replace("#define NR       4", "#define NR       1");
+            // A silent replace miss would compile a duplicate NR=4 kernel and
+            // erase this variant's win with no error.
+            assert_ne!(src, shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE);
+            load_fn_sm80_fast_math(&src, "matvec_q4_split_q8_1_locked_residual").ok()
+        },
         matvec_q4_split_q8_1_locked_bank4: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE,
             "matvec_q4_split_q8_1_locked_bank4",
@@ -1953,6 +1979,84 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         },
         // explicit NR=8/16/64/128 handles for `LUMEN_CUDA_OUTPUT_PROJ_NR`.
         // Failure to load is non-fatal; dispatch falls back to nr32 above.
+        matvec_q6k_head: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q6K_HEAD_KERNEL_SOURCE,
+            "matvec_q6k_split_q8_1",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q6k_head: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q6k_head: FAILED: {e}");
+                None
+            }
+        },
+        matvec_f32_gates_banked: match load_fn_sm80_fast_math(
+            shaders::MATVEC_F32_GATES_KERNEL_SOURCE,
+            "matvec_f32_gates_banked",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_f32_gates_banked: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_f32_gates_banked: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q5k_split: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q5K_SPLIT_KERNEL_SOURCE,
+            "matvec_q5k_split_q8_1",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q5k_split: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q5k_split: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q5k_split_residual: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q5K_SPLIT_KERNEL_SOURCE,
+            "matvec_q5k_split_q8_1_residual",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q5k_split_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q5k_split_residual: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_1: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_1_KERNEL_SOURCE,
+            "matvec_q4_1_q8_1",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_1: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_1: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_1_residual: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_1_KERNEL_SOURCE,
+            "matvec_q4_1_q8_1_residual",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_1_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_1_residual: FAILED: {e}");
+                None
+            }
+        },
         matvec_q8_split_output_proj_nr8: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_SPLIT_OUTPUT_PROJ_KERNEL_SOURCE,
             "matvec_q8_split_output_proj_nr8",
