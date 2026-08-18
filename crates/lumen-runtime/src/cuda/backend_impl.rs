@@ -5541,6 +5541,29 @@ impl CudaBackend {
             && st.scratch.input_q8_1.is_some()
             && st.kernels.quantize_f32_to_q8_1.is_some();
 
+        // Source-fidelity glue bundle (LUMEN_CUDA_GDN_GLUE): dual-output
+        // rmsnorm_to_q8_1 elides the F32-gates plain-RMSNorm launch, and the
+        // banked gates (+transform epilogue) concatenate with p123 into one
+        // launch. ALL downstream conditions (p123 fusion dims, F64 twin OFF,
+        // kernels present, head_dim=128 to match the cloned 128-thread gates
+        // reduction) are folded HERE so the gates skip and the fused p123
+        // dispatch can never disagree.
+        let gdn_glue = gdn_ab_f32
+            && gdn_use_preq
+            && crate::runtime_defaults::gdn_glue_enabled()
+            && st.kernels.gdn_ab_p123_fused.is_some()
+            && st.kernels.rmsnorm_to_q8_1_dual.is_some()
+            && crate::runtime_defaults::gdn_p123_fuse_enabled()
+            && !(gdn_f64_accum_enabled()
+                && st.kernels.l2_normalize_qk_strided_f64accum.is_some()
+                && st.kernels.gdn_prefill_fused_v3_f64accum.is_some()
+                && st.kernels.gdn_prefill_norm_gate_f64accum.is_some())
+            && st.kernels.gdn_decode_phase123_fused.is_some()
+            && p.qk_dim == p.num_kv_heads * p.head_dim
+            && p.value_dim == p.num_heads * p.head_dim
+            && p.qkv_dim == 2 * p.qk_dim + p.value_dim
+            && p.head_dim == 128;
+
         // === DECODE GDN projection alignment with PREFILL (MoE-gated) ===
         // The batched PREFILL computes the GDN q/k/v/gate/alpha/beta
         // projections through `mmq_q8_0_batched` for MoE Q8 models (see
@@ -5648,7 +5671,7 @@ impl CudaBackend {
             // — negligible cost. Done BEFORE the `q8_1_buf` mutable borrow so
             // the two scratch fields are accessed sequentially. F32 source
             // gates (gdn_ab_f32) need the same F32 `normed` for their SGEMVs.
-            if gdn_ab_f16 || gdn_ab_f32 {
+            if (gdn_ab_f16 || gdn_ab_f32) && !gdn_glue {
                 let block_size = rmsnorm_block_size(hidden_dim);
                 let shared_bytes = rmsnorm_shared_bytes(block_size);
                 let launch_cfg = CudarcLaunchConfig {
@@ -5673,7 +5696,6 @@ impl CudaBackend {
                 })?;
             }
 
-            let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
             let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
             let bs = rmsnorm_block_size(hidden_dim);
             let lc = CudarcLaunchConfig {
@@ -5682,18 +5704,43 @@ impl CudaBackend {
                 shared_mem_bytes: rmsnorm_shared_bytes(bs),
             };
             let dim = hidden_dim as u32;
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(fused_fn)
-                    .arg(&st.scratch.x_gpu)
-                    .arg(&lw.attn_norm)
-                    .arg(&mut *q8_1_buf)
-                    .arg(&eps)
-                    .arg(&dim)
-                    .launch(lc)
+            if gdn_glue {
+                // Glue bundle: one dual-output launch produces the Q8_1
+                // blocks AND the F32 normed vector (bit-equal to the plain
+                // RMSNorm: same partition, same reductions, same expression).
+                let dual_fn = st.kernels.rmsnorm_to_q8_1_dual.as_ref().unwrap();
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(dual_fn)
+                        .arg(&st.scratch.x_gpu)
+                        .arg(&lw.attn_norm)
+                        .arg(&mut *q8_1_buf)
+                        .arg(&mut st.scratch.normed)
+                        .arg(&eps)
+                        .arg(&dim)
+                        .launch(lc)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN rmsnorm_to_q8_1_dual L{layer_idx}: {e}"))
+                })?;
+            } else {
+                let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(fused_fn)
+                        .arg(&st.scratch.x_gpu)
+                        .arg(&lw.attn_norm)
+                        .arg(&mut *q8_1_buf)
+                        .arg(&eps)
+                        .arg(&dim)
+                        .launch(lc)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN rmsnorm_to_q8_1 L{layer_idx}: {e}"))
+                })?;
             }
-            .map_err(|e| RuntimeError::Compute(format!("GDN rmsnorm_to_q8_1 L{layer_idx}: {e}")))?;
 
             // QKV matvec with pre-quantized input.
             // split-layout: prefer Q8/Q4 split siblings for the fused QKV weight.
@@ -5770,7 +5817,10 @@ impl CudaBackend {
             // activation is the F32 `normed` materialized above — the exact
             // weights the source GGUF stores, on the exact activation the
             // prefill projection reads.
-            if gdn_ab_f32 {
+            if gdn_ab_f32 && gdn_glue {
+                // Glue bundle: alpha/beta projections + transforms ride the
+                // fused p123 launch below — nothing to do here.
+            } else if gdn_ab_f32 {
                 let banked = match (
                     st.kernels.matvec_f32_gates_banked.as_ref(),
                     ssm_alpha_w,
@@ -6387,7 +6437,63 @@ impl CudaBackend {
                 && p.head_dim >= 32
                 && p.head_dim % 32 == 0
                 && p.head_dim <= 1024;
-            if p123_fused {
+            if gdn_glue {
+                // Glue bundle: banked F32 gates (+transform epilogue) and the
+                // p123 CTAs in ONE launch (gdn_glue folds every p123_fused
+                // condition, so this path fully replaces the p123 dispatch).
+                let (GpuWeightBuf::F32(w_a), GpuWeightBuf::F32(w_b)) = (ssm_alpha_w, ssm_beta_w)
+                else {
+                    unreachable!("gdn_glue requires F32 gates")
+                };
+                let fuse_fn = st.kernels.gdn_ab_p123_fused.as_ref().unwrap();
+                let in_dim_u32 = hidden_dim as u32;
+                let grid = 2 * num_heads_u32 + 2 * num_kv_heads_u32 + num_heads_u32;
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (head_dim_u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(fuse_fn)
+                        .arg(w_a)
+                        .arg(w_b)
+                        .arg(&st.scratch.normed)
+                        .arg(dt_bias)
+                        .arg(ssm_a)
+                        .arg(&mut gdn.alpha_buf)
+                        .arg(&mut gdn.beta_buf)
+                        .arg(&in_dim_u32)
+                        .arg(&gdn.qkv_buf)
+                        .arg(&mut gdn.conv_states[gdn_idx])
+                        .arg(conv1d_weight)
+                        .arg(&mut gdn.qkv_conv_buf)
+                        .arg(&num_kv_heads_u32)
+                        .arg(&num_heads_u32)
+                        .arg(&head_dim_u32)
+                        .arg(&qk_dim_u32)
+                        .arg(&qkv_dim_u32)
+                        .arg(&kernel_size_u32)
+                        .arg(&state_pos)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN glue ab+p123 L{layer_idx}: {e}"))
+                })?;
+                gdn.conv_positions[gdn_idx] = (state_pos + batch_u32) % buf_slots;
+                {
+                    use std::sync::OnceLock;
+                    static MARK: OnceLock<()> = OnceLock::new();
+                    MARK.get_or_init(|| {
+                        if super::decode::cuda_verbose() {
+                            eprintln!(
+                                "[CUDA] GDN_GLUE: gates+p123 fused launch ACTIVE (dual rmsnorm)"
+                            );
+                        }
+                    });
+                }
+            } else if p123_fused {
                 let fuse_fn = st.kernels.gdn_decode_phase123_fused.as_ref().unwrap();
                 let grid = 2 * num_kv_heads_u32 + num_heads_u32;
                 let launch_cfg = CudarcLaunchConfig {

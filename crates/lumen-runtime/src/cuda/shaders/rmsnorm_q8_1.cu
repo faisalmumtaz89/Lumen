@@ -279,3 +279,99 @@ extern "C" __global__ void fused_residual_rmsnorm_q8_1(
         block_out[4 + lane_id] = (char)(qi & 0xFF);
     }
 }
+
+// ============================================================================
+// rmsnorm_to_q8_1_dual: verbatim clone of rmsnorm_to_q8_1 that ALSO stores
+// the F32 normed value (`x[i]*rms*weight[i]` — the exact value the plain
+// `rmsnorm` kernel produces: same strided sum-of-squares partition at the
+// same block size, same warp/cross-warp reduction, same rms expression).
+// Elides the source-fidelity F32-gates route's extra plain-RMSNorm launch
+// (LUMEN_CUDA_GDN_GLUE). Keep in lock-step with rmsnorm_to_q8_1 above.
+// ============================================================================
+extern "C" __global__ void rmsnorm_to_q8_1_dual(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    char* __restrict__ output_q8_1,
+    float* __restrict__ normed_out,      // [dim] F32 normed OUTPUT
+    float eps,
+    unsigned int dim)
+{
+    extern __shared__ float shared[];
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int block_size = blockDim.x;
+    const unsigned int warp_id = tid >> 5;
+    const unsigned int lane_id = tid & 31u;
+    const unsigned int num_warps = block_size >> 5;
+
+    float sum_sq = 0.0f;
+    for (unsigned int i = tid; i < dim; i += block_size) {
+        float val = x[i];
+        sum_sq += val * val;
+    }
+    sum_sq = warp_reduce_sum(sum_sq);
+    if (lane_id == 0) {
+        shared[warp_id] = sum_sq;
+    }
+    __syncthreads();
+    float total = 0.0f;
+    if (warp_id == 0) {
+        total = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+        total = warp_reduce_sum(total);
+    }
+    if (tid == 0) {
+        float rms = 1.0f / sqrtf(total / (float)dim + eps);
+        shared[0] = rms;
+    }
+    __syncthreads();
+    float rms = shared[0];
+
+    const unsigned int num_blocks = dim >> 5;
+    for (unsigned int blk = warp_id; blk < num_blocks; blk += num_warps) {
+        unsigned int base = blk * WARP_SIZE;
+        unsigned int idx = base + lane_id;
+
+        float val = x[idx] * rms * weight[idx];
+        normed_out[idx] = val;
+
+        float amax = val < 0.0f ? -val : val;
+        float tmp;
+        tmp = __shfl_xor_sync(0xffffffff, amax, 16);
+        amax = tmp > amax ? tmp : amax;
+        tmp = __shfl_xor_sync(0xffffffff, amax, 8);
+        amax = tmp > amax ? tmp : amax;
+        tmp = __shfl_xor_sync(0xffffffff, amax, 4);
+        amax = tmp > amax ? tmp : amax;
+        tmp = __shfl_xor_sync(0xffffffff, amax, 2);
+        amax = tmp > amax ? tmp : amax;
+        tmp = __shfl_xor_sync(0xffffffff, amax, 1);
+        amax = tmp > amax ? tmp : amax;
+
+        float scale = amax / 127.0f;
+        float scale_inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+
+        int qi = __float2int_rn(val * scale_inv);
+        qi = qi < -127 ? -127 : (qi > 127 ? 127 : qi);
+
+        float qi_f = (float)qi;
+        float qsum = qi_f;
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 16);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 8);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 4);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 2);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 1);
+
+        float weighted_sum = scale * qsum;
+
+        char* block_out = output_q8_1 + (unsigned long long)blk * Q8_1_BYTES;
+        if (lane_id == 0) {
+            unsigned short d_f16 = f32_to_f16_bits(scale);
+            block_out[0] = (char)(d_f16 & 0xFF);
+            block_out[1] = (char)((d_f16 >> 8) & 0xFF);
+            unsigned short s_f16 = f32_to_f16_bits(weighted_sum);
+            block_out[2] = (char)(s_f16 & 0xFF);
+            block_out[3] = (char)((s_f16 >> 8) & 0xFF);
+        }
+        block_out[4 + lane_id] = (char)(qi & 0xFF);
+    }
+}

@@ -661,6 +661,12 @@ pub(crate) struct KernelSet {
     // rmsnorm_to_q8_1: RMSNorm + Q8_1 quantize in one kernel.
     // Replaces rmsnorm + quantize_f32_to_q8_1 at 2 sites/layer (attn_norm, ffn_norm).
     pub(crate) rmsnorm_to_q8_1: Option<CudaFunction>,
+    /// Dual-output twin: also stores the F32 normed vector (source-fidelity
+    /// glue bundle, LUMEN_CUDA_GDN_GLUE).
+    pub(crate) rmsnorm_to_q8_1_dual: Option<CudaFunction>,
+    /// Banked F32 gates (+transform epilogue) concatenated with p123 in one
+    /// launch (source-fidelity glue bundle).
+    pub(crate) gdn_ab_p123_fused: Option<CudaFunction>,
     // fused_residual_rmsnorm_q8_1: Residual add + RMSNorm + Q8_1 quantize.
     // For Q8_0 inter-layer boundaries: fuses residual_add_copy + rmsnorm + quantize_f32_to_q8_1.
     pub(crate) fused_residual_rmsnorm_q8_1: Option<CudaFunction>,
@@ -2352,6 +2358,9 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
         },
         // Fused RMSNorm + Q8_1 quantization (dispatch count reduction for Q8_0 dp4a path)
+        rmsnorm_to_q8_1_dual: load_fn(shaders::RMSNORM_Q8_1_KERNEL_SOURCE, "rmsnorm_to_q8_1_dual")
+            .ok(),
+        gdn_ab_p123_fused: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_ab_p123_fused").ok(),
         rmsnorm_to_q8_1: match load_fn(shaders::RMSNORM_Q8_1_KERNEL_SOURCE, "rmsnorm_to_q8_1") {
             Ok(f) => {
                 cuda_log!("[CUDA] rmsnorm_to_q8_1: OK");

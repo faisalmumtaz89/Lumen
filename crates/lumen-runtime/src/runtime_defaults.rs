@@ -1227,6 +1227,17 @@ pub fn ssmout_residual_fold_enabled() -> bool {
     })
 }
 
+/// `LUMEN_CUDA_GDN_GLUE=1`: source-fidelity GDN glue bundle — dual-output
+/// rmsnorm_to_q8_1 (elides the F32-gates route's extra plain-RMSNorm launch)
+/// + banked gates with transform epilogue concatenated into the p123 launch
+/// (−2 launches per GDN layer). Every expression is a verbatim clone, so the
+/// greedy stream must stay byte-identical (gated in the A/B). Default OFF
+/// pending the engine A/B.
+pub fn gdn_glue_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| matches!(std::env::var("LUMEN_CUDA_GDN_GLUE"), Ok(v) if v == "1"))
+}
+
 /// `LUMEN_CUDA_Q5K_SSMOUT=0`: kill-switch for the source-fidelity Q5_K
 /// ssm_out decode route (falls back to the F16 image via HGEMV). Default ON.
 pub fn q5k_ssmout_enabled() -> bool {
@@ -1356,6 +1367,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_FORCE_SCALAR_ATTN",
     "LUMEN_CUDA_GDN_AB_F16",
     "LUMEN_CUDA_GDN_AB_F32",
+    "LUMEN_CUDA_GDN_GLUE",
     "LUMEN_CUDA_GDN_CONVSTATE_PARITY",
     "LUMEN_CUDA_GDN_DECODE_MEGAKERNEL_F64",
     "LUMEN_CUDA_GDN_DECODE_VIA_PREFILL",
