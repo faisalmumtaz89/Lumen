@@ -40,15 +40,6 @@
 // ==========================================================================
 
 #define NR       4
-// Occupancy floor for every entry point in this family. Default 1 (the
-// historical binding). Q4→75 campaign: 5 forces regs 52→47 on SM80 (the
-// one-register allocation-granularity cliff: 49r rounds to 4 CTAs/SM, 47r
-// fits 5) — probe-validated +2.88 µs/layer on the FFN trio, bit-identical.
-// Overridden by prepending `#define Q4_MINBLOCKS 5` at NVRTC compile
-// (env LUMEN_CUDA_Q4_LB5; source-prefix so the PTX cache keys correctly).
-#ifndef Q4_MINBLOCKS
-#define Q4_MINBLOCKS 1
-#endif
 #define NW       32
 #define THREADS_PER_BLOCK 256
 #define NWARPS   (THREADS_PER_BLOCK / NW)
@@ -258,7 +249,7 @@ __device__ __forceinline__ void matvec_q4_split_body(
     reduce_and_store_locked(out, sumf, r0, out_dim, warp_id, lane, residual);
 }
 
-extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, Q4_MINBLOCKS) void matvec_q4_split_q8_1_locked(
+extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_split_q8_1_locked(
     const char* __restrict__ weight_q4_split,
     const char* __restrict__ input_q8_1,
     float* __restrict__ out,
@@ -268,7 +259,7 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, Q4_MINBLOCKS) void ma
     matvec_q4_split_body(weight_q4_split, input_q8_1, out, out_dim, in_dim, 0, blockIdx.x);
 }
 
-extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, Q4_MINBLOCKS) void matvec_q4_split_q8_1_locked_residual(
+extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_split_q8_1_locked_residual(
     const char* __restrict__ weight_q4_split,
     const char* __restrict__ input_q8_1,
     const float* __restrict__ residual,
@@ -285,7 +276,7 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, Q4_MINBLOCKS) void ma
 // select is uniform per CTA and the per-row body (locked epilogue, locked
 // reductions, fixed block visitation) is untouched, so each output element is
 // bit-identical to the two-launch route.
-extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, Q4_MINBLOCKS) void matvec_q4_split_q8_1_locked_banked(
+extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_split_q8_1_locked_banked(
     const char* __restrict__ weight_a,
     const char* __restrict__ weight_b,
     const char* __restrict__ input_q8_1,
@@ -311,7 +302,7 @@ extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, Q4_MINBLOCKS) void ma
 // per-row body) => bit-identical outputs. A slot with 0 rows contributes no
 // CTAs; the live consumer is the full-attention wq/wk/wv bank, which passes
 // an empty fourth slot.
-extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, Q4_MINBLOCKS) void matvec_q4_split_q8_1_locked_bank4(
+extern "C" __global__ __launch_bounds__(THREADS_PER_BLOCK, 1) void matvec_q4_split_q8_1_locked_bank4(
     const char* __restrict__ weight_a,
     const char* __restrict__ weight_b,
     const char* __restrict__ weight_c,

@@ -12245,40 +12245,6 @@ unsafe fn launch_matvec_preq8_1_q4_banked(
         && crate::runtime_defaults::q4_b160_enabled()
         && (in_dim >> 5) == 160
         && kernels.matvec_q4_split_q8_1_locked_banked_b160.is_some();
-    // FFN-only LB5 twin (LUMEN_CUDA_Q4_LB5): force_baseline marks the FFN
-    // site; GDN calls with force_baseline=false and keeps the base kernel.
-    if force_baseline
-        && crate::runtime_defaults::q4_lb5_enabled()
-        && kernels.matvec_q4_split_q8_1_locked_banked_lb5.is_some()
-    {
-        let mv_fn = kernels
-            .matvec_q4_split_q8_1_locked_banked_lb5
-            .as_ref()
-            .unwrap();
-        let out_a_u32 = out_a_dim as u32;
-        let out_b_u32 = out_b_dim as u32;
-        let in_dim_u32 = in_dim as u32;
-        let grid = dp4a_q4_grid(out_a_u32) + dp4a_q4_grid(out_b_u32);
-        let mv_cfg = CudarcLaunchConfig {
-            grid_dim: (grid, 1, 1),
-            block_dim: (DP4A_Q4_BLOCK_DIM, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        device
-            .stream
-            .launch_builder(mv_fn)
-            .arg(w_a)
-            .arg(w_b)
-            .arg(q8_1_buf)
-            .arg(out_a)
-            .arg(out_b)
-            .arg(&out_a_u32)
-            .arg(&out_b_u32)
-            .arg(&in_dim_u32)
-            .launch(mv_cfg)
-            .map_err(|e| RuntimeError::Compute(format!("matvec_q4_banked_lb5 {label}: {e}")))?;
-        return Ok(());
-    }
     let mv_fn = if use_b160 && v4_ok && kernels.matvec_q4_split_q8_1_locked_banked_b160_v4.is_some()
     {
         b160_census();
@@ -12527,16 +12493,7 @@ unsafe fn launch_matvec_preq8_1_split(
             // from the banked GDN launcher, never here.
             //
             let mv_fn_opt = if kernels.use_soa_locked {
-                // FFN-only LB5 twin (LUMEN_CUDA_Q4_LB5): gate/up labels only;
-                // attention/GDN labels keep the base bounds.
-                if crate::runtime_defaults::q4_lb5_enabled()
-                    && matches!(label, "gate" | "up")
-                    && kernels.matvec_q4_split_q8_1_locked_lb5.is_some()
-                {
-                    kernels.matvec_q4_split_q8_1_locked_lb5.as_ref()
-                } else {
-                    kernels.matvec_q4_split_q8_1_locked.as_ref()
-                }
+                kernels.matvec_q4_split_q8_1_locked.as_ref()
             } else {
                 kernels.matvec_q4_split_q8_1.as_ref()
             };

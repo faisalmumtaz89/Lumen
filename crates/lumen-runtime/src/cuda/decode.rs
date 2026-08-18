@@ -9,19 +9,6 @@ use super::shaders;
 use crate::error::RuntimeError;
 use cudarc::driver::CudaFunction;
 
-/// Locked Q4-split source with the SM80 occupancy floor raised to 5 CTAs/SM
-/// (`Q4_MINBLOCKS 5`, regs 52→47 over the allocation-granularity cliff).
-/// Compiled as SEPARATE handles and dispatched ONLY at FFN sites under
-/// `LUMEN_CUDA_Q4_LB5` — the family-wide flag measured −0.267 ms/tok at
-/// engine level (GDN/attention shapes lose more than FFN gains). Source
-/// prefix (not a compiler flag) so the PTX cache keys correctly.
-fn q4_locked_lb5_src() -> String {
-    format!(
-        "#define Q4_MINBLOCKS 5\n{}",
-        shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE
-    )
-}
-
 /// kernel-load chatter throttle.
 ///
 /// `compile_all_kernels` writes a `[CUDA] <kernel>: OK | FAILED: <reason>`
@@ -530,10 +517,6 @@ pub(crate) struct KernelSet {
     // grid = out_dim CTAs. Byte-identical per row (grid mapping only); wins
     // on short-N long-K shapes (FFN down) where NR=4 underfills the GPU.
     pub(crate) matvec_q4_split_q8_1_locked_residual_nr1: Option<CudaFunction>,
-    /// LB5 (occupancy-floor-5) twins of the locked kernels, FFN-dispatch only
-    /// under `LUMEN_CUDA_Q4_LB5` (route-specific: GDN/attention keep base).
-    pub(crate) matvec_q4_split_q8_1_locked_lb5: Option<CudaFunction>,
-    pub(crate) matvec_q4_split_q8_1_locked_banked_lb5: Option<CudaFunction>,
 
     // llama mmvq port on the Q4 split layout (`LUMEN_CUDA_Q8_MMVQ`, default-OFF;
     // shares the Q8 mmvq flag). 2-lane VDR striping + one-row/CTA + lane-
@@ -1953,16 +1936,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             assert_ne!(src, shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE);
             load_fn_sm80_fast_math(&src, "matvec_q4_split_q8_1_locked_residual").ok()
         },
-        matvec_q4_split_q8_1_locked_lb5: load_fn_sm80_fast_math(
-            &q4_locked_lb5_src(),
-            "matvec_q4_split_q8_1_locked",
-        )
-        .ok(),
-        matvec_q4_split_q8_1_locked_banked_lb5: load_fn_sm80_fast_math(
-            &q4_locked_lb5_src(),
-            "matvec_q4_split_q8_1_locked_banked",
-        )
-        .ok(),
         matvec_q4_split_q8_1_locked_bank4: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE,
             "matvec_q4_split_q8_1_locked_bank4",

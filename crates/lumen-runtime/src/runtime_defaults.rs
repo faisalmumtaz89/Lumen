@@ -1227,16 +1227,6 @@ pub fn ssmout_residual_fold_enabled() -> bool {
     })
 }
 
-/// `LUMEN_CUDA_Q4_LB5=1`: compile the locked Q4-split kernel family with an
-/// occupancy floor of 5 CTAs/SM (`Q4_MINBLOCKS 5`), lifting regs/thread over
-/// the SM80 allocation-granularity cliff (52→47). Probe-validated
-/// +2.88 µs/layer (+0.184 ms/token) on the SXM FFN trio, bit-identical.
-/// Default OFF pending the same-container engine A/B.
-pub fn q4_lb5_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| matches!(std::env::var("LUMEN_CUDA_Q4_LB5"), Ok(v) if v == "1"))
-}
-
 /// `LUMEN_CUDA_Q5K_SSMOUT=0`: kill-switch for the source-fidelity Q5_K
 /// ssm_out decode route (falls back to the F16 image via HGEMV). Default ON.
 pub fn q5k_ssmout_enabled() -> bool {
@@ -1345,7 +1335,6 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CONVERT_SOURCE_FIDELITY",
     "LUMEN_CORR010_MODEL",
     "LUMEN_CUDA_Q4_1_DOWN",
-    "LUMEN_CUDA_Q4_LB5",
     "LUMEN_CUDA_Q5K_SSMOUT",
     "LUMEN_CUDA_Q6K_HEAD",
     "LUMEN_CUDA_ARGMAX_TILED",
