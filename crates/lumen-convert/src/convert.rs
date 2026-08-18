@@ -6,6 +6,24 @@
 
 use crate::arch;
 use crate::dequant::*;
+
+/// `LUMEN_CONVERT_SOURCE_FIDELITY=1`: preserve every tensor in the exact
+/// format the source GGUF stores it, instead of requantizing to the runtime's
+/// historical fast-path formats. Covers: Q6_K `output.weight`, K-quant
+/// `ssm_out` (Q5_K in Q4_0-preset files), Q4_1 layer tensors (8 of 64
+/// `ffn_down` in Q4_0-preset files carry Q4_1's min term), and F32
+/// `ssm_alpha`/`ssm_beta` gates. Requires a runtime with the matching decode
+/// kernels; the resulting artifact streams byte-for-byte the same weights the
+/// reference engine reads from the same file.
+pub(crate) fn source_fidelity() -> bool {
+    matches!(
+        std::env::var("LUMEN_CONVERT_SOURCE_FIDELITY")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
 use crate::gguf::{GgmlType, GgufError, GgufFile};
 use crate::hyperparams::{detect_quant_scheme, extract_hyperparams, quant_descriptor_for};
 use crate::sharded::{MultiShardReader, ShardError, ShardedGguf};
@@ -406,29 +424,50 @@ fn do_convert_from_reader<R: Read + Seek>(
                 // llama-quantize often keeps output.weight as Q6_K even in Q4_0 GGUFs.
                 // The runtime only has fast dispatch kernels for Q8_0/Q4_0/F16/F32,
                 // so storing K-quant as-is would hit the slow F32 fallback path.
-                let f32_data = ensure_f32_global(
-                    output_proj_bytes,
-                    output_proj_tensor.ggml_type,
-                    OUTPUT_PROJ_NAME,
-                    output_proj_tensor.n_elements(),
-                )?;
-                let n_elems = output_proj_tensor.n_elements() as usize;
-                if requant_target == Some(QuantScheme::Q4_0) {
-                    let q4_data = quantize_f32_to_q4_0(&f32_data, n_elems);
+                //
+                // LUMEN_CONVERT_KEEP_Q6K_OUTPUT=1: preserve a Q6_K output.weight
+                // verbatim (6.5625 bpw, the exact bytes llama.cpp serves) for the
+                // CUDA backend's dedicated Q6_K head kernel. Requires a runtime
+                // with that kernel; other backends would hit the slow fallback.
+                if output_proj_tensor.ggml_type == GgmlType::Q6_K
+                    && (source_fidelity()
+                        || matches!(
+                            std::env::var("LUMEN_CONVERT_KEEP_Q6K_OUTPUT")
+                                .ok()
+                                .as_deref(),
+                            Some("1") | Some("true") | Some("yes") | Some("on")
+                        ))
+                {
                     eprintln!(
-                        "  K-quant output.weight ({:?}): requantized to Q4_0 ({} bytes)",
-                        output_proj_tensor.ggml_type,
-                        q4_data.len()
+                        "  K-quant output.weight (Q6_K): kept verbatim ({} bytes)",
+                        output_proj_bytes.len()
                     );
-                    (q4_data, false, QuantScheme::Q4_0)
+                    (output_proj_bytes.to_vec(), false, QuantScheme::Q6_K)
                 } else {
-                    let q8_data = quantize_f32_to_q8_0(&f32_data, n_elems);
-                    eprintln!(
-                        "  K-quant output.weight ({:?}): requantized to Q8_0 ({} bytes)",
+                    let f32_data = ensure_f32_global(
+                        output_proj_bytes,
                         output_proj_tensor.ggml_type,
-                        q8_data.len()
-                    );
-                    (q8_data, false, QuantScheme::Q8_0)
+                        OUTPUT_PROJ_NAME,
+                        output_proj_tensor.n_elements(),
+                    )?;
+                    let n_elems = output_proj_tensor.n_elements() as usize;
+                    if requant_target == Some(QuantScheme::Q4_0) {
+                        let q4_data = quantize_f32_to_q4_0(&f32_data, n_elems);
+                        eprintln!(
+                            "  K-quant output.weight ({:?}): requantized to Q4_0 ({} bytes)",
+                            output_proj_tensor.ggml_type,
+                            q4_data.len()
+                        );
+                        (q4_data, false, QuantScheme::Q4_0)
+                    } else {
+                        let q8_data = quantize_f32_to_q8_0(&f32_data, n_elems);
+                        eprintln!(
+                            "  K-quant output.weight ({:?}): requantized to Q8_0 ({} bytes)",
+                            output_proj_tensor.ggml_type,
+                            q8_data.len()
+                        );
+                        (q8_data, false, QuantScheme::Q8_0)
+                    }
                 }
             } else {
                 let data = ensure_f32_global(
@@ -1306,6 +1345,52 @@ mod tests {
                 (v - (-31.0)).abs() < 1e-2,
                 "Q6_K nonzero mismatch at {i}: got {v}, expected -31.0"
             );
+        }
+    }
+
+    /// Position-varying Q6_K block against a direct transcription of ggml's
+    /// `dequantize_row_q6_K`. The uniform-block tests above are blind to band
+    /// permutations — this test exists because groups 1/2 were swapped here
+    /// for the library's entire history and every uniform test passed.
+    #[test]
+    fn dequantize_q6_k_matches_ggml_reference() {
+        let mut state = 0x9E3779B9u32;
+        let mut block = [0u8; 210];
+        for b in block.iter_mut() {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (state >> 24) as u8;
+        }
+        let d_bits = f32_to_f16_bits(1.5);
+        block[208..210].copy_from_slice(&d_bits.to_le_bytes());
+
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let sc = &block[192..208];
+        let d = 1.5f32;
+        let mut expected = [0.0f32; 256];
+        for half in 0..2usize {
+            let (qlh, qhh, sch) = (&ql[64 * half..], &qh[32 * half..], &sc[8 * half..]);
+            for l in 0..32usize {
+                let is = l / 16;
+                let q1 = ((qlh[l] & 0xF) | ((qhh[l] & 3) << 4)) as i32 - 32;
+                let q2 = ((qlh[l + 32] & 0xF) | (((qhh[l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((qlh[l] >> 4) | (((qhh[l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((qlh[l + 32] >> 4) | (((qhh[l] >> 6) & 3) << 4)) as i32 - 32;
+                expected[128 * half + l] = d * (sch[is] as i8 as f32) * q1 as f32;
+                expected[128 * half + l + 32] = d * (sch[is + 2] as i8 as f32) * q2 as f32;
+                expected[128 * half + l + 64] = d * (sch[is + 4] as i8 as f32) * q3 as f32;
+                expected[128 * half + l + 96] = d * (sch[is + 6] as i8 as f32) * q4 as f32;
+            }
+        }
+
+        let result = dequantize_q6_k(&block, 256);
+        let values: Vec<f32> = result
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), 256);
+        for i in 0..256 {
+            assert_eq!(values[i], expected[i], "Q6_K ggml mismatch at element {i}");
         }
     }
 
