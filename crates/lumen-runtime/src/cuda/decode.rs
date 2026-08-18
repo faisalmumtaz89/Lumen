@@ -27,6 +27,19 @@ use cudarc::driver::CudaFunction;
 /// trace, and the long-term fix (root cause: dp4a PTX validity on
 /// SM 80) is tracked as.
 #[inline]
+
+/// Apply the Q4 occupancy-floor prefix (env `LUMEN_CUDA_Q4_LB5`) to a locked
+/// Q4-split kernel source. Prefixing the SOURCE (not a compiler flag) keeps
+/// the PTX cache key honest. Applied AFTER any structural `.replace(...)`
+/// so the replace-hit asserts keep comparing against the pristine constant.
+fn q4_locked_src(src: &str) -> String {
+    if crate::runtime_defaults::q4_lb5_enabled() {
+        format!("#define Q4_MINBLOCKS 5\n{src}")
+    } else {
+        src.to_string()
+    }
+}
+
 pub(crate) fn cuda_verbose() -> bool {
     // Read once per process; OS env var reads are not on a hot path here
     // (every call site is inside the one-shot `compile_all_kernels`).
@@ -1876,7 +1889,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         // pipeline -- the kernel's inline `.rn` PTX ops are immune to
         // --use_fast_math, so the lock holds regardless of the loader flags.
         matvec_q4_split_q8_1_locked: match load_fn_sm80_fast_math(
-            shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE,
+            &q4_locked_src(shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE),
             "matvec_q4_split_q8_1_locked",
         ) {
             Ok(f) => {
@@ -1889,7 +1902,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
         },
         matvec_q4_split_q8_1_locked_residual: match load_fn_sm80_fast_math(
-            shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE,
+            &q4_locked_src(shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE),
             "matvec_q4_split_q8_1_locked_residual",
         ) {
             Ok(f) => {
@@ -1902,10 +1915,10 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
         },
         matvec_q4_split_q8_1_locked_banked_v4: load_fn_sm80_fast_math(
-            &format!(
+            &q4_locked_src(&format!(
                 "#define LUMEN_Q4_V4LOAD 1\n{}",
                 shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE
-            ),
+            )),
             "matvec_q4_split_q8_1_locked_banked",
         )
         .ok(),
@@ -1916,7 +1929,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             );
             assert_ne!(base_src, shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE);
             let src = format!("#define LUMEN_Q4_V4LOAD 1\n{base_src}");
-            load_fn_sm80_fast_math(&src, "matvec_q4_split_q8_1_locked_banked").ok()
+            load_fn_sm80_fast_math(&q4_locked_src(&src), "matvec_q4_split_q8_1_locked_banked").ok()
         },
         matvec_q4_split_q8_1_locked_banked_b160: {
             let src = shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE.replace(
@@ -1926,7 +1939,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             // A silent replace miss would compile a duplicate 256-thread
             // kernel and erase this variant's win with no error.
             assert_ne!(src, shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE);
-            load_fn_sm80_fast_math(&src, "matvec_q4_split_q8_1_locked_banked").ok()
+            load_fn_sm80_fast_math(&q4_locked_src(&src), "matvec_q4_split_q8_1_locked_banked").ok()
         },
         matvec_q4_split_q8_1_locked_residual_nr1: {
             let src = shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE
@@ -1934,10 +1947,11 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             // A silent replace miss would compile a duplicate NR=4 kernel and
             // erase this variant's win with no error.
             assert_ne!(src, shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE);
-            load_fn_sm80_fast_math(&src, "matvec_q4_split_q8_1_locked_residual").ok()
+            load_fn_sm80_fast_math(&q4_locked_src(&src), "matvec_q4_split_q8_1_locked_residual")
+                .ok()
         },
         matvec_q4_split_q8_1_locked_bank4: match load_fn_sm80_fast_math(
-            shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE,
+            &q4_locked_src(shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE),
             "matvec_q4_split_q8_1_locked_bank4",
         ) {
             Ok(f) => {
@@ -1950,7 +1964,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
         },
         matvec_q4_split_q8_1_locked_banked: match load_fn_sm80_fast_math(
-            shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE,
+            &q4_locked_src(shaders::MATVEC_Q4_SPLIT_Q8_1_LOCKED_KERNEL_SOURCE),
             "matvec_q4_split_q8_1_locked_banked",
         ) {
             Ok(f) => {
