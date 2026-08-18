@@ -974,6 +974,11 @@ extern "C" __global__ void gdn_prefill_norm_gate(
 // Grid: 2*num_v_heads + 2*num_kv_heads + num_v_heads CTAs, block = head_dim
 // (=128 on Qwen3.8-27B; the gate rows use the same 128-thread reduction as
 // matvec_f32_gates_banked).
+//
+// Compiled WITHOUT fast-math (the p123 transforms need precise expf/logf,
+// matching the plain-compiled p123 kernel). The banked gates kernel this
+// replaces compiles WITH fast-math, whose only numeric delta here is FTZ on
+// subnormal dot partials — bounded empirically by the byte-identity gate.
 // ============================================================================
 extern "C" __global__ void gdn_ab_p123_fused(
     // gates part
