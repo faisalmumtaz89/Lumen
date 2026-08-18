@@ -440,13 +440,9 @@ pub(crate) fn dequantize_q6_k(src: &[u8], n_elements: u64) -> Vec<u8> {
         //   group 3: ql[32..64] high nibble, qh[0..32] bits [6..7]
         // Each group of 32 uses 2 consecutive scales (16 values per scale).
         //
-        // HISTORY (2026-08-17): groups 1 and 2 were SWAPPED here (ql[0..32]
-        // high nibble served group 1, ql[32..64] low nibble served group 2)
-        // since the original implementation — wrong data nibbles paired with
-        // the right qh bits and scales for every middle half-band of every
-        // superblock. The uniform-block unit tests were permutation-blind.
-        // Caught by the source-fidelity Q6_K head census; verified against
-        // ggml-quants.c and a positional cross-check.
+        // The group order MUST match ggml's `dequantize_row_q6_K` exactly;
+        // uniform-block tests cannot detect a band permutation, so any change
+        // here must keep the position-varying reference test green.
         let mut idx = 0usize;
         for half in 0..2 {
             let ql_ptr = &ql[64 * half..];

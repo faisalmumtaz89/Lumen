@@ -421,31 +421,6 @@ pub trait ComputeBackend: Send + Sync {
         ))
     }
 
-    /// Measurement-only: enqueue one greedy decode step's full GPU pipeline
-    /// (embed -> per-layer -> final projection -> on-GPU argmax) WITHOUT the
-    /// terminal synchronization or index readback, so a caller can queue many
-    /// steps back-to-back and measure the device-side makespan of the queued
-    /// burst. The caller supplies the input token (pre-recorded from a normal
-    /// greedy pass), so no readback is needed. Advances `kv.seq_len()`
-    /// internally like `decode_token_greedy`. Backends without an enqueue-only
-    /// path return an error; production decode never calls this.
-    fn decode_token_greedy_enqueue(
-        &self,
-        _token_id: u32,
-        _weights: &dyn WeightProvider,
-        _kv: &mut KvCache,
-    ) -> Result<(), RuntimeError> {
-        Err(RuntimeError::Compute(
-            "enqueue-only greedy decode not supported on this backend".into(),
-        ))
-    }
-
-    /// Block until all previously enqueued device work is complete. No-op on
-    /// backends whose decode calls are already synchronous.
-    fn backend_synchronize(&self) -> Result<(), RuntimeError> {
-        Ok(())
-    }
-
     /// [Option A] GPU temperature-sampled decode returning the token id directly
     /// (Metal only; `LUMEN_METAL_GPU_SAMPLER=1`). The token is SAMPLED on the GPU
     /// (parity-matched to the CPU `sample_logits`) and chained through the lean

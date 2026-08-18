@@ -414,10 +414,8 @@ pub(super) fn dequant_kquant_to_f32(
                         out[written + idx] = d * sc * q as f32;
                         idx += 1;
                     }
-                    // Group 1: low nibbles of ql[32..64], qh bits [2..3].
-                    // (2026-08-17: groups 1/2 were band-swapped vs the ggml
-                    // reference — same bug as lumen-convert's dequantize_q6_k;
-                    // see the HISTORY note there.)
+                    // Group 1: low nibbles of ql[32..64], qh bits [2..3]
+                    // (order MUST match ggml's dequantize_row_q6_K).
                     for j in 0..32 {
                         if written + idx >= n_elements {
                             break;
