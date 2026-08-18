@@ -7,6 +7,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-08-18
+
+### Added
+
+- **Source-fidelity conversion** (`LUMEN_CONVERT_SOURCE_FIDELITY=1`). The
+  converter preserves tensors in the exact format the source GGUF stores —
+  Q6_K output head, K-quant `ssm_out` (Q5_K in Q4_0-preset files), Q4_1
+  layer tensors, and F32 GDN `ssm_alpha`/`ssm_beta` gates — instead of
+  requantizing them, and the CUDA runtime serves each of these formats
+  natively (dedicated split-plane dp4a kernels for the Q6_K head and Q5_K
+  `ssm_out`, a Q4_1 dp4a kernel with exact min-term handling, and a banked
+  F32 gates kernel that keeps the fused GDN projection route). Per-route
+  fall-back switches are documented in `docs/environment-variables.md`.
+  Artifacts without these formats dispatch byte-identically to v0.8.0; the
+  keeps are excluded on the Metal target.
+
+### Fixed
+
+- **Q6_K dequantization band order.** Both host Q6_K dequant
+  implementations read two of the four bands per 128-element half in the
+  wrong order relative to the ggml reference — every artifact whose
+  `output.weight` was requantized from a Q6_K source (all Q4_0-preset
+  conversions, CUDA and Metal targets) shipped an output head with
+  misassembled weights. Fixed in both copies with new permutation-sensitive
+  reference tests (the prior uniform-block tests could not detect ordering
+  errors). **Affected artifacts should be reconverted**; greedy
+  determinism baselines for those cells are re-established.
+- The CLI and server raw-head allow-lists now admit a Q6_K output head on
+  the CUDA backend, and the weight providers recognize it by header quant
+  (previously the raw head was silently dropped and misinterpreted).
+- The Q4_1 host dequantization used pairwise nibble order instead of ggml's
+  de-interleaved layout (dormant until source fidelity made it
+  load-bearing).
+
+### Validation
+
+- Full production checklist on the release build: unit suites, quality,
+  sampling, determinism (50/50 byte-identical greedy), GQ-014 multi-turn,
+  and tool-calling gates pass for the new and existing artifacts; decode
+  throughput at parity with v0.8.0.
+
 ## [0.8.0] — 2026-08-17
 
 ### Changed
