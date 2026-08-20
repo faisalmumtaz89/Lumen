@@ -126,6 +126,7 @@ pub fn prefill_attention_sequential(
                 q_single as &CudaSlice<f32>,
                 &kv_cache.k_cache,
                 &kv_cache.v_cache,
+                None,
                 &mut *attn_out_single,
                 nh,
                 nkvh,

@@ -1677,6 +1677,7 @@ pub(crate) unsafe fn launch_attention_for_token(
         q_single as &CudaSlice<f32>,
         &kv_cache.k_cache,
         &kv_cache.v_cache,
+        None,
         &mut *attn_out_single,
         nh,
         nkvh,
@@ -1787,20 +1788,117 @@ pub(crate) unsafe fn launch_attention_decode_tiled(
     Ok(())
 }
 
+/// Split factor for the split-K decode-attention pair. Single source for the
+/// scratch sizing (`GpuScratch::attn_splitk`) and the partial-pass grid.
+pub(crate) const ATTN_SPLITK_S: u32 = 4;
+
+/// Split-K shape eligibility: the accumulator slots cover `head_dim` exactly
+/// (same 128-lane slot addressing as the tiled kernel, 8 slots max).
+fn attention_decode_splitk_supports_head_dim(head_dim: u32) -> bool {
+    head_dim % ATTN_DECODE_TILED_BLOCK_DIM == 0 && head_dim <= 1024
+}
+
+/// Launch the split-K decode-attention pair (`LUMEN_CUDA_ATTN_SPLITK`):
+/// sequence-parallel partial pass on a `num_heads * S` grid, then a
+/// `num_heads`-CTA merge. Shares the tiled kernel's input/output buffer
+/// contract but additionally requires `head_dim <= 1024` (enforced by
+/// `attention_decode_splitk_supports_head_dim`); `scratch` holds the
+/// per-chunk (m, l, o) triples sized for `ATTN_SPLITK_S`.
+///
+/// # Safety
+///
+/// Same input/output buffer contract as `launch_attention_decode_tiled`,
+/// plus correctly sized split-K scratch and `head_dim <= 1024`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_attention_decode_splitk(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    q: &CudaSlice<f32>,
+    k_cache: &CudaSlice<f32>,
+    v_cache: &CudaSlice<f32>,
+    scratch: &mut (CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>),
+    attn_out: &mut CudaSlice<f32>,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    max_seq_len: u32,
+    scale: f32,
+) -> Result<(), RuntimeError> {
+    const S: u32 = ATTN_SPLITK_S;
+    if !attention_decode_splitk_supports_head_dim(head_dim) {
+        return Err(RuntimeError::Compute(format!(
+            "attention_decode_splitk: unsupported head_dim ({head_dim}); \
+             requires head_dim % {ATTN_DECODE_TILED_BLOCK_DIM} == 0 and <= 1024"
+        )));
+    }
+    let (partial_fn, merge_fn) = match (
+        kernels.attention_decode_splitk_partial.as_ref(),
+        kernels.attention_decode_splitk_merge.as_ref(),
+    ) {
+        (Some(p), Some(m)) => (p, m),
+        _ => {
+            return Err(RuntimeError::Compute(
+                "attention_decode_splitk: kernels not available".into(),
+            ))
+        }
+    };
+    let shared_bytes = attention_decode_tiled_shared_bytes(head_dim);
+    let (m_part, l_part, o_part) = scratch;
+    device
+        .stream
+        .launch_builder(partial_fn)
+        .arg(q)
+        .arg(k_cache)
+        .arg(v_cache)
+        .arg(&mut *m_part)
+        .arg(&mut *l_part)
+        .arg(&mut *o_part)
+        .arg(&num_heads)
+        .arg(&num_kv_heads)
+        .arg(&head_dim)
+        .arg(&seq_len)
+        .arg(&max_seq_len)
+        .arg(&scale)
+        .arg(&S)
+        .launch(CudarcLaunchConfig {
+            grid_dim: (num_heads * S, 1, 1),
+            block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
+            shared_mem_bytes: shared_bytes,
+        })
+        .map_err(|e| RuntimeError::Compute(format!("attention_decode_splitk_partial: {e}")))?;
+    device
+        .stream
+        .launch_builder(merge_fn)
+        .arg(&*m_part)
+        .arg(&*l_part)
+        .arg(&*o_part)
+        .arg(attn_out)
+        .arg(&num_heads)
+        .arg(&head_dim)
+        .arg(&S)
+        .launch(CudarcLaunchConfig {
+            grid_dim: (num_heads, 1, 1),
+            block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        })
+        .map_err(|e| RuntimeError::Compute(format!("attention_decode_splitk_merge: {e}")))?;
+    Ok(())
+}
+
 /// Gate-and-dispatch the appropriate decode-attention kernel for `seq_len`.
 ///
-/// Single source of truth for the kernel selection logic, used at all five
-/// production launch sites:
+/// Single source of truth for the kernel selection logic, used at the
+/// launch sites:
 ///   1. `backend_impl.rs::compute_layer_gpu` — primary decode entry
-///   2. `backend_impl.rs::compute_layer_decode` per-layer body
-///   3. `backend_impl.rs` CUDA graph capture body (eager-fallback gate
-///      lives at the caller; this wrapper is bypassed when graph capture
-///      is active and the variant is Tiled — see caller `:4810`)
-///   4. `prefill.rs::launch_attention_for_token` per-token prefill fallback
-///   5. `prefill_attention.rs::prefill_attention_sequential` per-token prefill
+///      (supplies split-K scratch)
+///   2. `backend_impl.rs::compute_layer` per-layer body
+///      (supplies split-K scratch)
+///   3. `prefill.rs::launch_attention_for_token` per-token prefill fallback
+///   4. `prefill_attention.rs::prefill_attention_sequential` per-token prefill
 ///
-/// Returns the variant chosen so callers (notably the CUDA graph site) can
-/// branch on it for eager-fallback decisions WITHOUT re-evaluating the gate.
+/// Returns the variant chosen (informational — current callers discard it;
+/// the selector's own gate is the single decision point).
 ///
 /// # Safety
 ///
@@ -1812,6 +1910,7 @@ pub(crate) unsafe fn launch_attention_decode_gated(
     q: &CudaSlice<f32>,
     k_cache: &CudaSlice<f32>,
     v_cache: &CudaSlice<f32>,
+    splitk_scratch: Option<&mut (CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>)>,
     attn_out: &mut CudaSlice<f32>,
     num_heads: u32,
     num_kv_heads: u32,
@@ -1823,6 +1922,37 @@ pub(crate) unsafe fn launch_attention_decode_gated(
     let force_tiled = decode_tiled_force_enabled();
     let threshold = decode_tiled_threshold();
     let mut variant = attention_decode_variant(seq_len, force_tiled, threshold);
+
+    // Split-K upgrade: applies only to the AUTO Tiled selection — an explicit
+    // `LUMEN_CUDA_DECODE_TILED=1` still forces the tiled kernel, and a
+    // SingleBlock selection (including the threshold opt-out) is untouched.
+    // Requires caller-supplied scratch, both kernels, and an eligible shape;
+    // anything else falls through to the existing selection.
+    if variant == AttentionDecodeVariant::Tiled && !force_tiled {
+        if let Some(scratch) = splitk_scratch {
+            if kernels.attention_decode_splitk_partial.is_some()
+                && kernels.attention_decode_splitk_merge.is_some()
+                && attention_decode_splitk_supports_head_dim(head_dim)
+            {
+                launch_attention_decode_splitk(
+                    device,
+                    kernels,
+                    q,
+                    k_cache,
+                    v_cache,
+                    scratch,
+                    attn_out,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    seq_len,
+                    max_seq_len,
+                    scale,
+                )?;
+                return Ok(AttentionDecodeVariant::SplitK);
+            }
+        }
+    }
 
     // hardware-compat guard: the tiled kernel requires
     // `head_dim % BLOCK_DIM == 0` and `head_dim >= BLOCK_DIM`.
@@ -1842,6 +1972,9 @@ pub(crate) unsafe fn launch_attention_decode_gated(
     }
 
     match variant {
+        // SplitK returns early from the upgrade block above; the selector
+        // never produces it here.
+        AttentionDecodeVariant::SplitK => unreachable!(),
         AttentionDecodeVariant::SingleBlock => {
             // Single-block fast path (existing kernel, byte-identical to the
             // the prior dispatch when force_tiled = false and
