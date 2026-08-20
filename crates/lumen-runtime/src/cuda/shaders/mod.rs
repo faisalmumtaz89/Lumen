@@ -117,8 +117,7 @@ pub const ATTENTION_DECODE_TILED_KERNEL_SOURCE: &str = include_str!("attention_d
 /// one-CTA-per-head occupancy ceiling. Selected via `LUMEN_CUDA_ATTN_SPLITK`
 /// (model-aware default: ON for Q8_0- and BF16-body dense models); near-tie
 /// class (cross-chunk merge order).
-pub const ATTENTION_DECODE_SPLITK_KERNEL_SOURCE: &str =
-    include_str!("attention_decode_splitk.cu");
+pub const ATTENTION_DECODE_SPLITK_KERNEL_SOURCE: &str = include_str!("attention_decode_splitk.cu");
 
 /// Tiled GEMM F32 kernels for batched prefill (32x32 tiles, shared memory).
 pub const GEMM_F32_KERNEL_SOURCE: &str = include_str!("gemm_f32.cu");
