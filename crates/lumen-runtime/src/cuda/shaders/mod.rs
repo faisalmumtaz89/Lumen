@@ -102,12 +102,23 @@ pub const ATTENTION_KERNEL_SOURCE: &str = include_str!("attention.cu");
 /// online-softmax mechanics. Per-CTA shared memory is constant in `seq_len`
 /// (~1.6 KB at T_C=128, head_dim=256); no dynamic-shmem opt-in required.
 ///
-/// Capability-gated via `decode::attention_decode_variant`: routes to this
-/// kernel when `seq_len > LUMEN_CUDA_DECODE_TILED_THRESHOLD` ( default
-/// 0 = "tiled-always") OR `LUMEN_CUDA_DECODE_TILED=1` is set. Operators can
-/// set `LUMEN_CUDA_DECODE_TILED_THRESHOLD=4294967295` to opt out (force
-/// single-block below the 40_950 structural ceiling).
+/// Capability-gated via `decode::attention_decode_variant`: the base
+/// selector picks this kernel when `seq_len >
+/// LUMEN_CUDA_DECODE_TILED_THRESHOLD` (default 0 = Tiled base selection for
+/// every positive seq_len) OR `LUMEN_CUDA_DECODE_TILED=1` is set; eligible
+/// automatic selections may upgrade to split-K, and incompatible head_dims
+/// fall back to single-block. Operators can set
+/// `LUMEN_CUDA_DECODE_TILED_THRESHOLD=4294967295` to keep the base selector
+/// on single-block (launchable only below the 40_950 structural ceiling).
 pub const ATTENTION_DECODE_TILED_KERNEL_SOURCE: &str = include_str!("attention_decode_tiled.cu");
+
+/// Split-K decode attention: sequence-parallel twin of the tiled kernel for
+/// few-head models (grid = heads x S chunks + a merge pass), lifting the
+/// one-CTA-per-head occupancy ceiling. Selected via `LUMEN_CUDA_ATTN_SPLITK`
+/// (model-aware default: ON for Q8_0- and BF16-body dense models); near-tie
+/// class (cross-chunk merge order).
+pub const ATTENTION_DECODE_SPLITK_KERNEL_SOURCE: &str =
+    include_str!("attention_decode_splitk.cu");
 
 /// Tiled GEMM F32 kernels for batched prefill (32x32 tiles, shared memory).
 pub const GEMM_F32_KERNEL_SOURCE: &str = include_str!("gemm_f32.cu");

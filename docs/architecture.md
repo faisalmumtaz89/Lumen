@@ -24,7 +24,7 @@ The forward-pass surface is transformer + GDN-hybrid (dense or MoE FFN). v1's sh
 
 - **Dense FFN**: fused gate + up + SwiGLU + down kernel
 - **MoE FFN**: routes the top-K experts per token through stacked gate + up + SwiGLU + down kernels
-- **Long-context decode**: tiled streaming-softmax attention kernel that runs past the 40,950-token shared-memory ceiling (default for all sequence lengths; `ATTN_DECODE_TILED_DEFAULT_THRESHOLD = 0`)
+- **Long-context decode**: tiled/split-K streaming-softmax attention past the 40,950-token single-block shared-memory ceiling. Threshold 0 (`ATTN_DECODE_TILED_DEFAULT_THRESHOLD`) selects Tiled as the base variant for every sequence length; eligible Q8_0/BF16-body dense calls upgrade to the split-K pair (`LUMEN_CUDA_ATTN_SPLITK`)
 
 ## LBC binary format
 

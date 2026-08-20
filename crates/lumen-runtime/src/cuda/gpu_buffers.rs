@@ -179,12 +179,17 @@ pub struct LayerWeightsGpu {
 
     // --- split-layout integration: GDN-weight split (SoA) decode-only siblings ---
     /// Per-row split sibling for `ssm_out` when the underlying weight is Q8Raw.
-    /// Reserved for future Q8 + GDN_SPLIT path. Currently inactive:
-    /// confirmed Q8 + GDN_SPLIT exhausts VRAM on A100-80GB (decode -30% from
-    /// reduced KV cache headroom). Q4 only via the q4_split_* fields below.
-    #[allow(dead_code)]
+    /// Eligible for population by the Q8 clone pass when
+    /// `LUMEN_CUDA_Q8_SPLIT_SSMOUT=1` (default ON) — subject to global
+    /// `LUMEN_CUDA_Q8_SPLIT` enablement, Q8Raw eligibility, the clone budget,
+    /// and allocation success.
     pub q8_split_ssm_out: Option<CudaSlice<u8>>,
-    #[allow(dead_code)]
+    /// Per-row split sibling for the GDN z-gate projection when Q8Raw.
+    /// Eligible for population by the Q8 clone pass on wide-GDN models when
+    /// `LUMEN_CUDA_Q8_SPLIT_ATTN=1` (default ON — see
+    /// `q8_split_attn_enabled`) — subject to global `LUMEN_CUDA_Q8_SPLIT`
+    /// enablement, Q8Raw eligibility, the clone budget, and allocation
+    /// success.
     pub q8_split_attn_gate: Option<CudaSlice<u8>>,
     #[allow(dead_code)]
     pub q8_split_ssm_alpha: Option<CudaSlice<u8>>,

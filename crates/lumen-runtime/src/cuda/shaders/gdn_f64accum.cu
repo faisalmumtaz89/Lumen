@@ -526,3 +526,113 @@ extern "C" __global__ void gdn_rmsnorm_silu_gate_f64accum(
         out[i] = silu_g * normed;
     }
 }
+
+// ============================================================================
+// gdn_decode_phase123_fused_f64norm: the phase-1/2/3 fusion used when the
+// F64 recurrence mode is on (the recurrence itself stays in its own kernel).
+// Twin of gdn_decode_phase123_fused (gdn.cu). Phases 1 (conv1d+SiLU+ring) and 2
+// (alpha/beta gates) are that kernel's exact F32 sequences — identical to
+// the unfused chain under F64 too, which selects the same F32 kernels for
+// those phases. Phase 3 (Q/K L2-norm) accumulates, reduces, roots and
+// scales in F64, cloning l2_normalize_qk_strided_f64accum's per-head
+// arithmetic exactly (one element per thread at block_size == head_dim,
+// same F64 reduction tree, same (float)((double)v * scale) store), so all
+// four outputs are bit-identical to the F64 three-launch chain. Only launch
+// boundaries and the dead unnormalized Q/K global write are removed.
+// Grid/block contract identical to gdn_decode_phase123_fused.
+// ============================================================================
+extern "C" __global__ void gdn_decode_phase123_fused_f64norm(
+    const float* __restrict__ input,      // [qkv_dim] qkv projection (T=1)
+    float* __restrict__ conv_state,       // [buf_slots, qkv_dim] ring R/W
+    const float* __restrict__ conv_weight,// [qkv_dim, kernel_size]
+    float* __restrict__ conv_out,         // [qkv_dim] OUTPUT
+    const float* __restrict__ alpha_raw,  // [num_v_heads] gk_proj output
+    const float* __restrict__ beta_raw,   // [num_v_heads] pre-sigmoid mix
+    const float* __restrict__ dt_bias,    // [num_v_heads]
+    const float* __restrict__ ssm_a,      // [num_v_heads] -exp(A_log)
+    float* __restrict__ alpha_out,        // [num_v_heads] OUTPUT
+    float* __restrict__ beta_out,         // [num_v_heads] OUTPUT
+    unsigned int num_kv_heads,
+    unsigned int num_v_heads,
+    unsigned int head_dim,
+    unsigned int qk_dim,
+    unsigned int qkv_dim,
+    unsigned int kernel_size,
+    unsigned int state_pos)
+{
+    __shared__ double sharedD[33];
+
+    unsigned int b = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    if (tid >= head_dim) return;
+
+    unsigned int c;
+    int is_qk;
+    unsigned int v_head = 0;
+    if (b < num_kv_heads) {
+        c = b * head_dim + tid;                       // Q
+        is_qk = 1;
+    } else if (b < 2u * num_kv_heads) {
+        c = qk_dim + (b - num_kv_heads) * head_dim + tid; // K
+        is_qk = 1;
+    } else {
+        v_head = b - 2u * num_kv_heads;
+        c = 2u * qk_dim + v_head * head_dim + tid;    // V
+        is_qk = 0;
+    }
+
+    // ---- phase 1: conv1d + SiLU + ring update (exact F32 clone) ----
+    unsigned int buf_slots = kernel_size - 1;
+    float inp = input[c];
+    float sum = 0.0f;
+    for (unsigned int tap = 0; tap < buf_slots; tap++) {
+        unsigned int slot = (state_pos + tap) % buf_slots;
+        sum += conv_weight[c * kernel_size + tap] * conv_state[slot * qkv_dim + c];
+    }
+    sum += conv_weight[c * kernel_size + buf_slots] * inp;
+    conv_state[state_pos * qkv_dim + c] = inp;
+    float activated = sum / (1.0f + expf(-sum));
+
+    if (!is_qk) {
+        conv_out[c] = activated;
+        // ---- phase 2: gates for this V head (exact F32 clone, thread 0) ----
+        if (tid == 0) {
+            float sp_input = alpha_raw[v_head] + dt_bias[v_head];
+            float sp;
+            if (sp_input > 20.0f) {
+                sp = sp_input;
+            } else {
+                sp = logf(1.0f + expf(sp_input));
+            }
+            float gate = ssm_a[v_head] * sp;
+            alpha_out[v_head] = expf(gate);
+            beta_out[v_head] = 1.0f / (1.0f + expf(-beta_raw[v_head]));
+        }
+        return;
+    }
+
+    // ---- phase 3: F64 L2 norm (exact clone of the strided F64 kernel:
+    // one element per thread at block_size == head_dim) ----
+    unsigned int warp_id = tid >> 5;
+    unsigned int lane_id = tid & 31u;
+    unsigned int num_warps = (head_dim + 31) >> 5;
+    double eps = 1e-12;
+
+    float v = activated;
+    double dv = (double)v;
+    double ss = dv * dv;
+    ss = warp_reduce_sum_f64(ss);
+    if (lane_id == 0) sharedD[warp_id] = ss;
+    __syncthreads();
+    double total_ss = 0.0;
+    if (warp_id == 0) {
+        total_ss = (lane_id < num_warps) ? sharedD[lane_id] : 0.0;
+        total_ss = warp_reduce_sum_f64(total_ss);
+    }
+    if (tid == 0) sharedD[0] = total_ss;
+    __syncthreads();
+    total_ss = sharedD[0];
+    double norm = sqrt(total_ss);
+    double scale = (norm > eps) ? (1.0 / norm) : (1.0 / eps);
+    conv_out[c] = (float)((double)v * scale);
+}
