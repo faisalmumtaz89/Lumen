@@ -271,3 +271,202 @@ extern "C" __global__ void matvec_bf16_v4(
         }
     }
 }
+
+// ============================================================================
+// matvec_bf16_v4_nr1: ONE output row per block specialization of
+// matvec_bf16_v4 (same uint4 weight loads, same F32 unpack/accumulate, same
+// two-level reduction shape). NR=2 amortises each x load across two rows
+// but halves the launched grid size; NR=1's extra row-level parallelism
+// measured faster on H100 decode shapes.
+// Selected via `LUMEN_CUDA_BF16_NR1`.
+// Same in_dim % 8 == 0 contract as matvec_bf16_v4. Grid = (out_dim, 1, 1).
+// ============================================================================
+extern "C" __global__ void matvec_bf16_v4_nr1(
+    const unsigned short* __restrict__ weight_bf16, // [out_dim * in_dim] bf16 bits
+    const float*          __restrict__ x,           // [in_dim] f32
+    float*                __restrict__ out,         // [out_dim] f32
+    unsigned int out_dim,
+    unsigned int in_dim)
+{
+    unsigned int row = blockIdx.x;
+    if (row >= out_dim) return;
+    unsigned int warp_id = threadIdx.x / NW_BF16;
+    unsigned int lane    = threadIdx.x % NW_BF16;
+    unsigned int nvec = in_dim >> 3;
+
+    const unsigned short* row_ptr = weight_bf16 + (unsigned long long)row * in_dim;
+    float sum = 0.0f;
+    for (unsigned int c = threadIdx.x; c < nvec; c += TPB_BF16) {
+        unsigned int base = c << 3;
+        const float4* x4 = (const float4*)(x + base);
+        float4 xa = x4[0];
+        float4 xb = x4[1];
+        uint4 w = *(const uint4*)(row_ptr + base);
+        float w0 = bf16_bits_to_f32((unsigned short)(w.x & 0xffffu));
+        float w1 = bf16_bits_to_f32((unsigned short)(w.x >> 16));
+        float w2 = bf16_bits_to_f32((unsigned short)(w.y & 0xffffu));
+        float w3 = bf16_bits_to_f32((unsigned short)(w.y >> 16));
+        float w4 = bf16_bits_to_f32((unsigned short)(w.z & 0xffffu));
+        float w5 = bf16_bits_to_f32((unsigned short)(w.z >> 16));
+        float w6 = bf16_bits_to_f32((unsigned short)(w.w & 0xffffu));
+        float w7 = bf16_bits_to_f32((unsigned short)(w.w >> 16));
+        sum += w0 * xa.x + w1 * xa.y + w2 * xa.z + w3 * xa.w
+             + w4 * xb.x + w5 * xb.y + w6 * xb.z + w7 * xb.w;
+    }
+
+    __shared__ float shmem[NW_BF16];
+    if (warp_id == 0) shmem[lane] = 0.0f;
+    sum = warp_reduce_sum_bf16v4(sum);
+    __syncthreads();
+    if (lane == 0) shmem[warp_id] = sum;
+    __syncthreads();
+    if (warp_id == 0) {
+        float val = (lane < (TPB_BF16 / NW_BF16)) ? shmem[lane] : 0.0f;
+        val = warp_reduce_sum_bf16v4(val);
+        if (lane == 0) out[row] = val;
+    }
+}
+
+// ============================================================================
+// fused_glu_gemv_bf16_nr1: fused gate+up+SwiGLU for BF16 dense FFN decode.
+// One CTA computes row r of BOTH W_gate and W_up off the shared F32 normed
+// activation (each x chunk read once feeds both dot products), then applies
+// SwiGLU in-register: out[r] = silu(gate_dot) * up_dot. Replaces the
+// separate gate matvec + up matvec + swiglu_inplace sub-sequence.
+//
+// Per-stream arithmetic is matvec_bf16_v4_nr1's exactly (same chunk order,
+// eight-term expression, warp/block reduction); the SiLU is swiglu_inplace's
+// exact formula (g / (1 + expf(-g))). The separate path's F32 round-trip of
+// gate_dot / up_dot through scratch is lossless, so this kernel's output is
+// byte-identical to the separate sub-sequence.
+// Same in_dim % 8 == 0 contract. Grid = (inter_dim, 1, 1), block = 128.
+// ============================================================================
+extern "C" __global__ void fused_glu_gemv_bf16_nr1(
+    const unsigned short* __restrict__ w_gate,  // [inter_dim * in_dim] bf16 bits
+    const unsigned short* __restrict__ w_up,    // [inter_dim * in_dim] bf16 bits
+    const float*          __restrict__ x,       // [in_dim] f32 (normed)
+    float*                __restrict__ out,     // [inter_dim] f32 = silu(g)*u
+    unsigned int inter_dim,
+    unsigned int in_dim)
+{
+    unsigned int row = blockIdx.x;
+    if (row >= inter_dim) return;
+    unsigned int warp_id = threadIdx.x / NW_BF16;
+    unsigned int lane    = threadIdx.x % NW_BF16;
+    unsigned int nvec = in_dim >> 3;
+
+    const unsigned short* gp = w_gate + (unsigned long long)row * in_dim;
+    const unsigned short* up = w_up + (unsigned long long)row * in_dim;
+    float sg = 0.0f;
+    float su = 0.0f;
+    for (unsigned int c = threadIdx.x; c < nvec; c += TPB_BF16) {
+        unsigned int base = c << 3;
+        const float4* x4 = (const float4*)(x + base);
+        float4 xa = x4[0];
+        float4 xb = x4[1];
+        uint4 wg = *(const uint4*)(gp + base);
+        float g0 = bf16_bits_to_f32((unsigned short)(wg.x & 0xffffu));
+        float g1 = bf16_bits_to_f32((unsigned short)(wg.x >> 16));
+        float g2 = bf16_bits_to_f32((unsigned short)(wg.y & 0xffffu));
+        float g3 = bf16_bits_to_f32((unsigned short)(wg.y >> 16));
+        float g4 = bf16_bits_to_f32((unsigned short)(wg.z & 0xffffu));
+        float g5 = bf16_bits_to_f32((unsigned short)(wg.z >> 16));
+        float g6 = bf16_bits_to_f32((unsigned short)(wg.w & 0xffffu));
+        float g7 = bf16_bits_to_f32((unsigned short)(wg.w >> 16));
+        sg += g0 * xa.x + g1 * xa.y + g2 * xa.z + g3 * xa.w
+            + g4 * xb.x + g5 * xb.y + g6 * xb.z + g7 * xb.w;
+        uint4 wu = *(const uint4*)(up + base);
+        float u0 = bf16_bits_to_f32((unsigned short)(wu.x & 0xffffu));
+        float u1 = bf16_bits_to_f32((unsigned short)(wu.x >> 16));
+        float u2 = bf16_bits_to_f32((unsigned short)(wu.y & 0xffffu));
+        float u3 = bf16_bits_to_f32((unsigned short)(wu.y >> 16));
+        float u4 = bf16_bits_to_f32((unsigned short)(wu.z & 0xffffu));
+        float u5 = bf16_bits_to_f32((unsigned short)(wu.z >> 16));
+        float u6 = bf16_bits_to_f32((unsigned short)(wu.w & 0xffffu));
+        float u7 = bf16_bits_to_f32((unsigned short)(wu.w >> 16));
+        su += u0 * xa.x + u1 * xa.y + u2 * xa.z + u3 * xa.w
+            + u4 * xb.x + u5 * xb.y + u6 * xb.z + u7 * xb.w;
+    }
+
+    __shared__ float shmem[2 * NW_BF16];
+    if (warp_id == 0) {
+        shmem[lane] = 0.0f;
+        shmem[NW_BF16 + lane] = 0.0f;
+    }
+    sg = warp_reduce_sum_bf16v4(sg);
+    su = warp_reduce_sum_bf16v4(su);
+    __syncthreads();
+    if (lane == 0) {
+        shmem[warp_id] = sg;
+        shmem[NW_BF16 + warp_id] = su;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        float g = (lane < (TPB_BF16 / NW_BF16)) ? shmem[lane] : 0.0f;
+        float u = (lane < (TPB_BF16 / NW_BF16)) ? shmem[NW_BF16 + lane] : 0.0f;
+        g = warp_reduce_sum_bf16v4(g);
+        u = warp_reduce_sum_bf16v4(u);
+        if (lane == 0) {
+            float silu_g = g / (1.0f + expf(-g));
+            out[row] = silu_g * u;
+        }
+    }
+}
+
+// ============================================================================
+// matvec_bf16_v4_nr1_residual: residual variant of matvec_bf16_v4_nr1.
+// out[row] = residual[row] + dot(W_bf16[row, :], x). Serves the full-attention
+// `wo` decode projection (`LUMEN_CUDA_BF16_WO_NR1`), replacing the cuBLAS
+// chain (dtod residual copy + F32->BF16 activation conversion + GemmEx
+// beta=1) with one launch reading the F32 activation directly. Numerics:
+// lossless BF16->F32 weight upcast with F32 activation and accumulation,
+// avoiding the GemmEx route's BF16 activation-input downcast; the differing
+// reduction order means output is not guaranteed byte-identical to it.
+// Same in_dim % 8 == 0 contract. Grid = (out_dim, 1, 1).
+// ============================================================================
+extern "C" __global__ void matvec_bf16_v4_nr1_residual(
+    const unsigned short* __restrict__ weight_bf16, // [out_dim * in_dim] bf16 bits
+    const float*          __restrict__ x,           // [in_dim] f32
+    const float*          __restrict__ residual,    // [out_dim] f32
+    float*                __restrict__ out,         // [out_dim] f32
+    unsigned int out_dim,
+    unsigned int in_dim)
+{
+    unsigned int row = blockIdx.x;
+    if (row >= out_dim) return;
+    unsigned int warp_id = threadIdx.x / NW_BF16;
+    unsigned int lane    = threadIdx.x % NW_BF16;
+    unsigned int nvec = in_dim >> 3;
+
+    const unsigned short* row_ptr = weight_bf16 + (unsigned long long)row * in_dim;
+    float sum = 0.0f;
+    for (unsigned int c = threadIdx.x; c < nvec; c += TPB_BF16) {
+        unsigned int base = c << 3;
+        const float4* x4 = (const float4*)(x + base);
+        float4 xa = x4[0];
+        float4 xb = x4[1];
+        uint4 w = *(const uint4*)(row_ptr + base);
+        float w0 = bf16_bits_to_f32((unsigned short)(w.x & 0xffffu));
+        float w1 = bf16_bits_to_f32((unsigned short)(w.x >> 16));
+        float w2 = bf16_bits_to_f32((unsigned short)(w.y & 0xffffu));
+        float w3 = bf16_bits_to_f32((unsigned short)(w.y >> 16));
+        float w4 = bf16_bits_to_f32((unsigned short)(w.z & 0xffffu));
+        float w5 = bf16_bits_to_f32((unsigned short)(w.z >> 16));
+        float w6 = bf16_bits_to_f32((unsigned short)(w.w & 0xffffu));
+        float w7 = bf16_bits_to_f32((unsigned short)(w.w >> 16));
+        sum += w0 * xa.x + w1 * xa.y + w2 * xa.z + w3 * xa.w
+             + w4 * xb.x + w5 * xb.y + w6 * xb.z + w7 * xb.w;
+    }
+
+    __shared__ float shmem[NW_BF16];
+    if (warp_id == 0) shmem[lane] = 0.0f;
+    sum = warp_reduce_sum_bf16v4(sum);
+    __syncthreads();
+    if (lane == 0) shmem[warp_id] = sum;
+    __syncthreads();
+    if (warp_id == 0) {
+        float val = (lane < (TPB_BF16 / NW_BF16)) ? shmem[lane] : 0.0f;
+        val = warp_reduce_sum_bf16v4(val);
+        if (lane == 0) out[row] = residual[row] + val;
+    }
+}

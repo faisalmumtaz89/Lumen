@@ -107,12 +107,27 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_bf16_residual: CudaFunction,
 
     // Bandwidth-optimal BF16 decode GEMV (uint4 vectorized weight load, F32
-    // accumulate). Gated DEFAULT-OFF behind `LUMEN_CUDA_BF16_MATVEC`; dispatched
-    // for every eligible BF16 decode matvec through `launch_matvec` (FFN
-    // gate/up/down, attention wq/wk/wv, GDN qkv/gate/ssm_out) when the flag is
+    // accumulate). DEFAULT-ON behind `LUMEN_CUDA_BF16_MATVEC` (kill-switch);
+    // dispatched for every eligible BF16 decode matvec through `launch_matvec`
+    // (FFN gate/up/down, attention wq/wk/wv, GDN qkv/gate/ssm_out) when the flag is
     // set, excluding the GDN alpha/beta precision keepers.
     // `Option` so a compile failure degrades gracefully to the cuBLAS path.
     pub(crate) matvec_bf16_v4: Option<CudaFunction>,
+    /// One-row/CTA specialization of `matvec_bf16_v4` (`LUMEN_CUDA_BF16_NR1`,
+    /// default ON): on H100 the NR=2 blocking loses ~0.7 ms/token across the
+    /// live 27B shapes. BYTE-IDENTICAL to NR=2 — the per-row F32 accumulation
+    /// sequence is unchanged, only the CTA that computes each row.
+    pub(crate) matvec_bf16_v4_nr1: Option<CudaFunction>,
+    /// Fused gate+up+SwiGLU for BF16 dense FFN (`LUMEN_CUDA_BF16_FUSED_GLU`,
+    /// default ON): one CTA computes both dots off the shared F32 normed
+    /// activation. Byte-identical to the separate gate/up/swiglu sub-sequence.
+    pub(crate) fused_glu_gemv_bf16_nr1: Option<CudaFunction>,
+    /// One-row residual matvec for the BF16 `wo` projection
+    /// (`LUMEN_CUDA_BF16_WO_NR1=1`): replaces the cuBLAS chain (residual
+    /// copy + F32->BF16 convert + GemmEx) with one launch; keeps the
+    /// activation in F32 (the GemmEx route downcasts it to BF16), with a
+    /// differing reduction order (near-tie class).
+    pub(crate) matvec_bf16_v4_nr1_residual: Option<CudaFunction>,
 
     // F32 <-> F16 conversion kernels (for cuBLAS HGEMM activation conversion)
     pub(crate) f32_to_f16_vec: CudaFunction,
@@ -159,13 +174,19 @@ pub(crate) struct KernelSet {
     // Dao 2022 online-softmax mechanics. Per-CTA shmem is constant in seq_len
     // (~1.6 KB at head_dim=256); no dynamic-shmem opt-in required.
     //
-    // Optional: NVRTC compile may fail on extremely old drivers; the
-    // capability gate at `decode::attention_decode_variant` ignores the
-    // tiled path when this field is `None`, falling back to the single-block
-    // kernel. (At `seq_len > 40_950` the single-block kernel cannot launch,
-    // so a missing tiled kernel surfaces as a runtime error from
-    // `attention_decode_can_launch`.)
+    // Optional: NVRTC compile may fail on extremely old drivers. If absent,
+    // a Tiled selection errors at dispatch — the selector
+    // (`decode::attention_decode_variant`) never inspects kernel
+    // availability — though eligible automatic selections may still be
+    // served by the split-K pair.
     pub(crate) attention_decode_tiled: Option<CudaFunction>,
+
+    // Split-K decode-attention pair (sequence-parallel twin of the tiled
+    // kernel, `LUMEN_CUDA_ATTN_SPLITK` — model-aware default: ON for Q8_0-
+    // and BF16-body dense models, OFF otherwise); both must be present for
+    // the split-K route to dispatch.
+    pub(crate) attention_decode_splitk_partial: Option<CudaFunction>,
+    pub(crate) attention_decode_splitk_merge: Option<CudaFunction>,
 
     // Tiled GEMM for batched prefill (superseded by cuBLAS HGEMM; kept for fallback).
     #[allow(dead_code)]
@@ -334,6 +355,10 @@ pub(crate) struct KernelSet {
     /// launches) — dispatched by default (LUMEN_CUDA_GDN_P123_FUSE=0 opts out) on the
     /// F32 (dense) path.
     pub(crate) gdn_decode_phase123_fused: Option<CudaFunction>,
+    /// F64-recurrence twin of the p123 fusion: phases 1/2 exact F32 clones,
+    /// phase-3 L2 norm in F64 (l2_normalize_qk_strided_f64accum's exact
+    /// arithmetic) — bit-identical to the F64 three-launch chain.
+    pub(crate) gdn_decode_phase123_fused_f64norm: Option<CudaFunction>,
     /// T=1 norm-gate that also emits the Q8_1 blocks of its own output
     /// (elides the separate quantize launch before the ssm_out split matvec).
     /// Dispatched by default (LUMEN_CUDA_GDN_NG_Q8=0 opts out) on the F32 (dense) path.
@@ -931,6 +956,29 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         // compile on this device, the `LUMEN_CUDA_BF16_MATVEC` path is simply
         // unavailable and dispatch falls through to cuBLAS GemmEx.
         matvec_bf16_v4: load_fn(shaders::MATVEC_BF16_KERNEL_SOURCE, "matvec_bf16_v4").ok(),
+        matvec_bf16_v4_nr1: if crate::runtime_defaults::bf16_nr1_enabled() {
+            load_fn(shaders::MATVEC_BF16_KERNEL_SOURCE, "matvec_bf16_v4_nr1").ok()
+        } else {
+            None
+        },
+        fused_glu_gemv_bf16_nr1: if crate::runtime_defaults::bf16_fused_glu_enabled() {
+            load_fn(
+                shaders::MATVEC_BF16_KERNEL_SOURCE,
+                "fused_glu_gemv_bf16_nr1",
+            )
+            .ok()
+        } else {
+            None
+        },
+        matvec_bf16_v4_nr1_residual: if crate::runtime_defaults::bf16_wo_nr1_enabled() {
+            load_fn(
+                shaders::MATVEC_BF16_KERNEL_SOURCE,
+                "matvec_bf16_v4_nr1_residual",
+            )
+            .ok()
+        } else {
+            None
+        },
         f32_to_f16_vec: load_fn(shaders::CONVERT_F16_KERNEL_SOURCE, "f32_to_f16_vec")?,
         f32_to_f16_vec4: load_fn(shaders::CONVERT_F16_KERNEL_SOURCE, "f32_to_f16_vec4").ok(),
         f16_to_f32_vec: load_fn(shaders::CONVERT_F16_KERNEL_SOURCE, "f16_to_f32_vec")?,
@@ -962,11 +1010,40 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             Err(e) => {
                 cuda_log!(
                     "[CUDA] attention_decode_tiled: FAILED ({e}); \
-                     long-context decode (seq_len > {}) will error at dispatch",
+                     long-context decode (seq_len > {}) will error at dispatch \
+                     (eligible automatic calls may use split-K)",
                     ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN
                 );
                 None
             }
+        },
+        attention_decode_splitk_partial: if crate::runtime_defaults::attn_splitk_enabled() {
+            match load_fn(
+                shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,
+                "attention_decode_splitk_partial",
+            ) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    cuda_log!("[CUDA] attention_decode_splitk_partial: FAILED ({e})");
+                    None
+                }
+            }
+        } else {
+            None
+        },
+        attention_decode_splitk_merge: if crate::runtime_defaults::attn_splitk_enabled() {
+            match load_fn(
+                shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,
+                "attention_decode_splitk_merge",
+            ) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    cuda_log!("[CUDA] attention_decode_splitk_merge: FAILED ({e})");
+                    None
+                }
+            }
+        } else {
+            None
         },
         gemm_f32: load_fn(shaders::GEMM_F32_KERNEL_SOURCE, "gemm_f32")?,
         gemm_f32_residual: load_fn(shaders::GEMM_F32_KERNEL_SOURCE, "gemm_f32_residual")?,
@@ -1337,6 +1414,11 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         // GDN fused prefill kernels
         gdn_decode_phase123_fused: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_decode_phase123_fused")
             .ok(),
+        gdn_decode_phase123_fused_f64norm: load_fn(
+            shaders::GDN_F64ACCUM_KERNEL_SOURCE,
+            "gdn_decode_phase123_fused_f64norm",
+        )
+        .ok(),
         gdn_prefill_norm_gate_q8: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_prefill_norm_gate_q8")
             .ok(),
         ssm_conv1d_silu_prefill: load_fn(shaders::GDN_KERNEL_SOURCE, "ssm_conv1d_silu_prefill")
@@ -3590,31 +3672,21 @@ pub(crate) fn opt_in_attention_decode_dyn_shmem(fns: &[&CudaFunction]) -> Result
 // `seq_len > 40_950` (the single-block kernel's SM-8.0 extended-shmem
 // ceiling, see `ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN` above).
 //
-// Two paths cohabit:
-//   - Single-block `attention_decode` (existing, fast): seq_len <= 40_950.
-//   - Tiled `attention_decode_tiled` (NEW): seq_len up to KV cache cap.
+// Three variants cohabit:
+//   - Single-block `attention_decode` (fast at short context): selected when
+//     `seq_len <= LUMEN_CUDA_DECODE_TILED_THRESHOLD` and the threshold is
+//     nonzero (default 0 = Tiled is the base selection for every positive
+//     seq_len), and used when the tiled kernel cannot serve the head_dim.
+//   - Tiled `attention_decode_tiled`: seq_len up to the KV cache cap.
+//   - Split-K pair `attention_decode_splitk_*` (`LUMEN_CUDA_ATTN_SPLITK`,
+//     model-aware default): upgrades the AUTO Tiled selection when the
+//     kernels + scratch are present and the shape is eligible — see
+//     `launch_attention_decode_gated` in prefill.rs.
 //
-// Routing is decided by `attention_decode_variant(seq_len, force_tiled)`,
-// a pure function of two inputs. The host wraps every `attention_decode`
-// launch with this gate. There are FIVE such launch points in the
-// production CUDA path:
-//   1. backend_impl.rs decode primary entry
-//   2. backend_impl.rs per-layer decode body
-//   3. backend_impl.rs CUDA graph capture body (eager-fallback when Tiled;
-//      graph fast path preserved at seq_len <= threshold)
-//   4. prefill.rs   per-token prefill fallback launcher
-//   5. prefill_attention.rs sequential per-token prefill launcher
-//
-// User decisions:
-//   - Tiled-decode acceptance criterion amended (physics-grounded gate; enforces).
-//   - Split-K decode: conditional, deferred to a future revision.
-//   - Graph capture at seq_len > threshold: eager-fallback (no tiled-graph kernel).
-//   - `LUMEN_CUDA_DECODE_TILED` default: opt-in only (FORCE-mode for
-//     A/B benching). Auto-routing happens via the THRESHOLD-based predicate
-//     below: when `seq_len > LUMEN_CUDA_DECODE_TILED_THRESHOLD` (default
-//     `ATTN_DECODE_TILED_DEFAULT_THRESHOLD = 36_864`, i.e. ~10% below the
-//     40_950 ceiling), the tiled path is selected automatically. will
-//     refine the production default empirically.
+// `attention_decode_variant(seq_len, force_tiled, threshold)` decides
+// SingleBlock vs Tiled; the split-K upgrade layers on top at the gated
+// launcher. The four launch sites are listed on
+// `launch_attention_decode_gated` (prefill.rs).
 
 /// KV tile width for `attention_decode_tiled` (must match `T_C` in the kernel).
 pub(crate) const ATTN_DECODE_TILED_T_C: u32 = 128;
@@ -3696,6 +3768,11 @@ pub(crate) const ATTN_DECODE_TILED_DEFAULT_THRESHOLD: u32 = 0;
 pub(crate) enum AttentionDecodeVariant {
     SingleBlock,
     Tiled,
+    /// Sequence-parallel split-K pair; selected inside the gated dispatcher
+    /// when the auto-selection lands on Tiled, the shape is eligible, and the
+    /// caller supplied split-K scratch. Explicit `LUMEN_CUDA_DECODE_TILED=1`
+    /// or a SingleBlock threshold opt-out takes precedence.
+    SplitK,
 }
 
 /// Pure gate predicate. Unit-testable; mirrors the established pattern of

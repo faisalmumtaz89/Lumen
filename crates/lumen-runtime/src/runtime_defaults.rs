@@ -1050,8 +1050,10 @@ pub fn ffn_fused_glu_skip_default() -> bool {
 
 /// Per-process default for `LUMEN_CUDA_Q8_SPLIT` when unset. ON for Q8
 /// dense (clones Q8_0 weights to the split layout, ~0.6 GB extra VRAM on
-/// A100, enables `matvec_q8_split_q8_1`). No-op when the model has no
-/// Q8_0 weights.
+/// A100 for the FFN set, enables `matvec_q8_split_q8_1`) and for BF16
+/// dense (clones the converter's Q8-floored GDN `ssm_out` tensors —
+/// 48 jobs / ~1.61 GB on 27B — see the BF16 arm below). No-op when the
+/// model has no Q8_0 weights.
 ///
 /// **scope fix**: explicitly OFF for MoE (Qwen3.5-MoE-30B-A3B).
 /// The Q8 SPLIT clone pass operates on per-layer `wq/wk/wv/wo/w_gate/w_up/
@@ -1066,11 +1068,38 @@ pub fn ffn_fused_glu_skip_default() -> bool {
 /// ("Only Q8 dense benefits") matches this scope exactly.
 pub fn q8_split_default() -> bool {
     match MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) {
-        // Only Q8 dense benefits; Q4/BF16/F32 ignore the split sibling.
-        // MoE: explicit OFF (measured root-cause).
+        // Q8 dense: full clone set. MoE: explicit OFF (measured root-cause).
         HINT_QUANTISED if !model_is_moe() => canonical_default_on(),
+        // BF16 dense: the converter Q8-floors the GDN `ssm_out` tensors, so
+        // the clone pass enumerates exactly those 48 (all other weights are
+        // Bf16Raw and skipped — census-verified: 48 jobs, 1.61 GB) and the
+        // split mmvq route serves them (+0.462 ms/token engine ABBA on H100,
+        // stream byte-identical to the raw mmvq route).
+        HINT_BF16 if !model_is_moe() => canonical_default_on(),
         _ => false,
     }
+}
+
+/// Canonical gate for the output-projection companion defaults
+/// (`OUTPUT_PROJ_SPLIT`, `Q8_SCALE_HW`, `OUTPUT_PROJ_NR`): quantized output
+/// head, dense, canonical defaults on. Reads the coarse output-head hint —
+/// it does NOT identify the body scheme — and deliberately excludes
+/// `q8_split_default`'s BF16 arm above.
+fn quantized_output_head_canonical() -> bool {
+    MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) == HINT_QUANTISED
+        && !model_is_moe()
+        && canonical_default_on()
+}
+
+/// BF16-dense-body canonical gate for the BF16 decode levers
+/// (`bf16_ab_q8bank_enabled`, `bf16_wo_nr1_enabled`). Keyed on the EXACT
+/// primary/bulk scheme (`model_dense_quant`), not the coarse output-head
+/// hint: these levers reroute BODY projections, and the body scheme is the
+/// signal that cannot be confounded by a higher-precision lm_head.
+fn bf16_dense_canonical() -> bool {
+    matches!(model_dense_quant(), Some(QuantScheme::Bf16))
+        && !model_is_moe()
+        && canonical_default_on()
 }
 
 /// `LUMEN_CUDA_Q4_SPLIT_ATTN` (default ON): extend the Q4 split-clone pass
@@ -1083,6 +1112,39 @@ pub fn q8_split_default() -> bool {
 /// consume the siblings. `=0` opts out.
 pub fn q4_split_attn_enabled() -> bool {
     !matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_ATTN"), Ok(v) if v == "0")
+}
+
+/// `LUMEN_CUDA_Q8_SPLIT_ATTN` (default ON): extend the Q8 split-clone pass
+/// beyond the dense FFN set to the non-residual attention/GDN projections
+/// (GDN fused QKV + gate, full-attention Wq/Wk/Wv). Q8 twin of
+/// `LUMEN_CUDA_Q4_SPLIT_ATTN`, scoped to wide-GDN models (v_heads != 32) —
+/// the dispatch sites already prefer a Q8 split sibling when present; on
+/// non-GDN and narrow-GDN models the clone pass leaves attention untouched
+/// (see the clone-pass comment). `=0` opts out.
+pub fn q8_split_attn_enabled() -> bool {
+    !matches!(std::env::var("LUMEN_CUDA_Q8_SPLIT_ATTN"), Ok(v) if v == "0")
+}
+
+/// `LUMEN_CUDA_PROFILE_ATTN_LEAF`: with `LUMEN_CUDA_PROFILE=1`, additionally
+/// brackets ONE full-attention sub-stage as the `attn_leaf` row in the profile
+/// table. Values: `norm_q8`, `qkv`, `prep`, `attn_core`, `gate`, `wo`. One
+/// leaf per run keeps the event stream small enough not to distort the span
+/// it measures. Unset or unrecognized value: no leaf bracket. Caveats:
+/// `norm_q8` and `qkv` are emitted only on the quantized/BF16 projection
+/// branches (preq and non-preq) — F32/F16-cache branches and the fused-norm
+/// failure fallback emit no row for those two, while `prep`, `attn_core`,
+/// `gate`, and `wo` bracket the shared post-projection stages on every
+/// branch. The leaf nests inside `full_attn`, so the profile summary's
+/// TOTAL double-counts it — read the leaf row against `full_attn`, never
+/// the total.
+pub fn profile_attn_leaf() -> Option<&'static str> {
+    static CACHE: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let v = std::env::var("LUMEN_CUDA_PROFILE_ATTN_LEAF").ok()?;
+        ["norm_q8", "qkv", "prep", "attn_core", "gate", "wo"]
+            .into_iter()
+            .find(|s| *s == v)
+    })
 }
 
 /// `LUMEN_CUDA_Q8_SPLIT_SSMOUT` (default ON): clone the GDN `ssm_out` Q8
@@ -1100,6 +1162,121 @@ pub fn q4_split_wo_probe_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_WO"), Ok(v) if v == "1")
 }
 
+/// `LUMEN_CUDA_ATTN_SPLITK` (model-aware default: ON for Q8_0- and
+/// BF16-body dense models, OFF otherwise): route the full-attention decode
+/// step through the split-K kernel pair (sequence-parallel: heads x 4 chunks
+/// + merge) instead of the one-CTA-per-head tiled kernel. Lifts the
+/// occupancy ceiling on few-head models (27B: 24 CTAs -> 96 + 24) and cuts
+/// each partial CTA's sequence walk to ~1/4 (total work stays linear in
+/// context length). Quality-equivalent
+/// near-tie — the cross-chunk merge sums in a different order than the
+/// tiled kernel's progressive rescale. `=0` opts out, `=1` forces on; unset
+/// resolves model-aware: ON for Q8_0-body and BF16-body dense models (the
+/// classes the engine A/Bs + full GQ/DET gates banked: Q8 +0.195 ms/tok on
+/// A100-SXM, BF16 +0.298 ms/tok on H100), following the canonical-defaults
+/// master switch. Q4-body models stay on the tiled route — the gates run
+/// FAILED Q4 quality with split-K on (near-tie perturbation lands on the
+/// noisier quant), so widening further is a separate, gated decision.
+pub fn attn_splitk_enabled() -> bool {
+    match std::env::var("LUMEN_CUDA_ATTN_SPLITK") {
+        Ok(v) if v == "0" => false,
+        Ok(v) if v == "1" => true,
+        _ => {
+            matches!(
+                model_dense_quant(),
+                Some(QuantScheme::Q8_0) | Some(QuantScheme::Bf16)
+            ) && !model_is_moe()
+                && canonical_default_on()
+        }
+    }
+}
+
+/// `LUMEN_CUDA_BF16_NR1` (default ON): route the broad BF16 decode matvecs
+/// through the one-row/CTA `matvec_bf16_v4_nr1` kernel instead of the NR=2
+/// `matvec_bf16_v4` (+0.303 ms/token engine ABBA on H100; leaf 18.369 vs
+/// 19.085 weighted ms/token). BYTE-IDENTICAL to the NR=2 route — the per-row
+/// F32 accumulation sequence is unchanged, only the CTA that computes it —
+/// verified by 256-token greedy md5 equality on the live 27B artifact.
+/// `=0` opts out; unset follows the canonical-defaults master switch.
+pub fn bf16_nr1_enabled() -> bool {
+    match std::env::var("LUMEN_CUDA_BF16_NR1") {
+        Ok(v) if v == "0" => false,
+        Ok(v) if v == "1" => true,
+        _ => canonical_default_on(),
+    }
+}
+
+/// `LUMEN_CUDA_BF16_FUSED_GLU` (default ON): on the GPU-resident decode
+/// path, serve the BF16 dense FFN gate+up+SwiGLU with ONE fused kernel
+/// (both dots off the shared F32 normed activation) instead of the separate
+/// gate matvec + up matvec + swiglu_inplace sub-sequence (+0.510 ms/token
+/// engine ABBA on H100; the non-resident streaming fallback keeps the
+/// separate sequence).
+/// BYTE-IDENTICAL to that separate custom-matvec route — verified by
+/// 256-token greedy md5 equality on the live 27B artifact. Dispatch also
+/// requires `LUMEN_CUDA_BF16_MATVEC` on (the identity baseline; `=0` there
+/// restores the pre-existing BF16 fallback dispatch for the layer). `=0`
+/// opts out; unset follows the canonical-defaults master switch.
+pub fn bf16_fused_glu_enabled() -> bool {
+    match std::env::var("LUMEN_CUDA_BF16_FUSED_GLU") {
+        Ok(v) if v == "0" => false,
+        Ok(v) if v == "1" => true,
+        _ => canonical_default_on(),
+    }
+}
+
+/// `LUMEN_CUDA_BF16_AB_Q8BANK` (default ON for BF16-dense): on the BF16 GDN
+/// route, quantize the normed activation ONCE and serve the Q8-forced ssm
+/// alpha+beta projections with the existing banked raw-route kernel —
+/// replacing the two separate quantize+matvec pairs the generic dispatch
+/// previously ran (the Q8 route's bank is unreachable here because BF16
+/// qkv/gate disqualify its prequant predicate). +0.308 ms/token engine ABBA
+/// on H100. Near-tie class (banked kernel; DET+GQ gate-banked). `=0` opts
+/// out, `=1` forces on; unset resolves ON for BF16-body dense non-MoE ONLY —
+/// the default converter path Q8-forces alpha/beta across quants
+/// (source-fidelity artifacts may preserve F32 gates, which fail the Q8Raw
+/// predicate and stay on the fallback), so without the body scope this arm
+/// would also intercept the Q4/Q8 models' generic route.
+pub fn bf16_ab_q8bank_enabled() -> bool {
+    match std::env::var("LUMEN_CUDA_BF16_AB_Q8BANK") {
+        Ok(v) if v == "0" => false,
+        Ok(v) if v == "1" => true,
+        _ => bf16_dense_canonical(),
+    }
+}
+
+/// `LUMEN_CUDA_BF16_WO_NR1` (default ON for BF16-dense): serve the BF16
+/// full-attention `wo` decode projection with the one-row residual matvec
+/// (F32 activation read directly, BF16->F32 lossless weight upcast, F32
+/// accumulate + residual add in one launch) instead of the cuBLAS chain
+/// (residual dtod copy + F32->BF16 conversion + GemmEx beta=1). +0.186
+/// ms/token engine ABBA on H100; keeps the activation in F32 (the GemmEx
+/// route downcasts it to BF16), and the differing reduction order means
+/// output is not guaranteed byte-identical (near-tie class, DET+GQ
+/// gate-banked). `=0` opts out; unset resolves ON for BF16-body dense
+/// non-MoE, following the canonical-defaults master switch. Dispatch also
+/// requires `LUMEN_CUDA_BF16_MATVEC` on — `=0` there restores the
+/// pre-existing BF16 fallback dispatch for the layer.
+pub fn bf16_wo_nr1_enabled() -> bool {
+    match std::env::var("LUMEN_CUDA_BF16_WO_NR1") {
+        Ok(v) if v == "0" => false,
+        Ok(v) if v == "1" => true,
+        _ => bf16_dense_canonical(),
+    }
+}
+
+/// `LUMEN_CUDA_Q8_SPLIT_WO=1` (probe): clone the full-attention `wo` into its
+/// Q8 split sibling. Unlike the Q4 twin above, the Q8 residual-split route it
+/// enables (`matvec_q8_split_q8_1_mmvq_residual`) is the same kernel already
+/// shipping for the FFN down and folded ssm_out projections. Default OFF.
+/// Consumed INSIDE the attention clone pass: it only takes effect on
+/// wide-GDN models with `LUMEN_CUDA_Q8_SPLIT_ATTN` on — with the attention
+/// clone off (or on non-wide-GDN models) `=1` clones nothing, so an A/B
+/// probe there is a silent no-op, not a treatment arm.
+pub fn q8_split_wo_probe_enabled() -> bool {
+    matches!(std::env::var("LUMEN_CUDA_Q8_SPLIT_WO"), Ok(v) if v == "1")
+}
+
 /// `LUMEN_CUDA_GDN_NG_Q8` (default ON; `=0` opts out): the T=1 via-prefill norm-gate also
 /// emits the Q8_1 quantization of its own output, eliding the separate
 /// quantize launch before the ssm_out split matvec. Verbatim-cloned
@@ -1114,7 +1291,9 @@ pub fn gdn_ng_q8_enabled() -> bool {
 
 /// `LUMEN_CUDA_GDN_P123_FUSE` (default ON; `=0` opts out): fuse the first three T=1
 /// via-prefill GDN launches (conv+SiLU, gates, QK-L2) into one kernel.
-/// Per-op arithmetic cloned verbatim => bit-identical; dense-F32 path only.
+/// Per-op arithmetic cloned verbatim => bit-identical. The F32 path uses
+/// `gdn_decode_phase123_fused`; the F64-recurrence path uses the
+/// `_f64norm` twin (phase-3 L2 in F64, bit-identical to its 3-launch chain).
 pub fn gdn_p123_fuse_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_GDN_P123_FUSE") {
@@ -1283,24 +1462,25 @@ pub fn soa_locked_default() -> bool {
 }
 
 /// Per-process default for `LUMEN_CUDA_OUTPUT_PROJ_SPLIT` when unset. ON
-/// for Q8 dense (output projection in particular). Same gating logic as
-/// `q8_split_default`.
+/// for Q8 dense (output projection in particular). Gated by
+/// `quantized_output_head_canonical` — deliberately NARROWER than `q8_split_default`,
+/// which also turns on for BF16 dense.
 pub fn output_proj_split_default() -> bool {
-    q8_split_default()
+    quantized_output_head_canonical()
 }
 
 /// Per-process default for `LUMEN_CUDA_Q8_SCALE_HW` when unset. ON for
 /// Q8 dense (prefer the `matvec_q8_aligned_q8_1_hw` kernel that uses
 /// hardware-scale dp4a; no-op when the kernel is absent or not Q8 dense).
 pub fn q8_scale_hw_default() -> bool {
-    q8_split_default()
+    quantized_output_head_canonical()
 }
 
 /// Per-process default for `LUMEN_CUDA_OUTPUT_PROJ_NR` when unset. Returns
 /// `16` for Q8 dense (the measured optimum). `1` is the legacy
 /// default for any other configuration.
 pub fn output_proj_nr_default() -> u32 {
-    if q8_split_default() {
+    if quantized_output_head_canonical() {
         16
     } else {
         1
@@ -1342,13 +1522,18 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_ATTN_PRECISE",
     "LUMEN_CUDA_ATTN_PRECISE_DBG",
     "LUMEN_CUDA_ATTN_PREP_FUSE",
+    "LUMEN_CUDA_ATTN_SPLITK",
     "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
     "LUMEN_CUDA_FFN_GATE_UP_BANK",
     "LUMEN_CUDA_Q4_DOWN_NR1",
+    "LUMEN_CUDA_BF16_AB_Q8BANK",
     "LUMEN_CUDA_BF16_AUTOTUNE",
+    "LUMEN_CUDA_BF16_FUSED_GLU",
     "LUMEN_CUDA_BF16_GEMMEX",
     "LUMEN_CUDA_BF16_MATVEC",
     "LUMEN_CUDA_BF16_MOE_V3",
+    "LUMEN_CUDA_BF16_NR1",
+    "LUMEN_CUDA_BF16_WO_NR1",
     "LUMEN_CUDA_DECODE_DELAY_US",
     "LUMEN_CUDA_DECODE_TILED",
     "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
@@ -1392,6 +1577,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_OUTPUT_PROJ_SPLIT",
     "LUMEN_CUDA_PREFILL_F32",
     "LUMEN_CUDA_PROFILE",
+    "LUMEN_CUDA_PROFILE_ATTN_LEAF",
     "LUMEN_CUDA_PTX_CACHE",
     "LUMEN_CUDA_PTX_CACHE_DIR",
     "LUMEN_CUDA_Q4_B160",
@@ -1409,8 +1595,10 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_Q8_PROJ_MMQ",
     "LUMEN_CUDA_Q8_SCALE_HW",
     "LUMEN_CUDA_Q8_SPLIT",
+    "LUMEN_CUDA_Q8_SPLIT_ATTN",
     "LUMEN_CUDA_Q8_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q8_SPLIT_SSMOUT",
+    "LUMEN_CUDA_Q8_SPLIT_WO",
     "LUMEN_CUDA_ROPE_TAB",
     "LUMEN_CUDA_SHARED_FUSED_DECODE",
     "LUMEN_CUDA_SHARED_TILED",
@@ -2010,12 +2198,18 @@ mod tests {
     }
 
     #[test]
-    fn bf16_dense_does_not_set_q8_only_defaults() {
+    fn bf16_dense_q8_default_scope() {
         let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         reset_for_tests();
         set_model_dense_quant(QuantScheme::Bf16);
-        // BF16 dense is unaffected by Q8-only defaults; they stay legacy OFF.
-        assert!(!q8_split_default(), "BF16 should NOT default Q8_SPLIT=ON");
+        // BF16 dense keeps the Q8-only defaults OFF with ONE exception:
+        // Q8_SPLIT defaults ON — the converter Q8-floors the GDN ssm_out
+        // tensors, so the clone pass serves exactly those via the split
+        // route (48 jobs on 27B).
+        assert!(
+            q8_split_default(),
+            "BF16 dense should default Q8_SPLIT=ON (Q8-floored ssm_out set)"
+        );
         assert!(
             !output_proj_split_default(),
             "BF16 should NOT default OUTPUT_PROJ_SPLIT=ON"
@@ -2032,6 +2226,37 @@ mod tests {
         assert!(
             !ffn_fused_glu_skip_default(),
             "BF16 should NOT default to SKIP fused GLU (kernel is no-op anyway)"
+        );
+    }
+
+    #[test]
+    fn bf16_body_levers_key_on_primary_quant() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset_for_tests();
+        // The BF16 body levers key on the PRIMARY (bulk) scheme, not the
+        // coarse output-head hint: the converter Q8-forces GDN alpha/beta on
+        // EVERY quant, so a body-scope miss would silently reroute the Q4/Q8
+        // models' generic alpha/beta path.
+        set_model_primary_quant(QuantScheme::Bf16);
+        assert!(
+            bf16_ab_q8bank_enabled(),
+            "BF16 body should default AB_Q8BANK=ON"
+        );
+        assert!(bf16_wo_nr1_enabled(), "BF16 body should default WO_NR1=ON");
+
+        reset_for_tests();
+        set_model_primary_quant(QuantScheme::Q4_0);
+        assert!(
+            !bf16_ab_q8bank_enabled(),
+            "Q4 body must NOT default AB_Q8BANK=ON (precision-fragile route)"
+        );
+        assert!(!bf16_wo_nr1_enabled(), "Q4 body must NOT default WO_NR1=ON");
+
+        reset_for_tests();
+        set_model_primary_quant(QuantScheme::Q8_0);
+        assert!(
+            !bf16_ab_q8bank_enabled(),
+            "Q8 body must NOT default AB_Q8BANK=ON"
         );
     }
 
@@ -2572,13 +2797,18 @@ mod tests {
         "LUMEN_CUDA_ATTN_PRECISE",
         "LUMEN_CUDA_ATTN_PRECISE_DBG",
         "LUMEN_CUDA_ATTN_PREP_FUSE",
+        "LUMEN_CUDA_ATTN_SPLITK",
         "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
         "LUMEN_CUDA_FFN_GATE_UP_BANK",
         "LUMEN_CUDA_Q4_DOWN_NR1",
+        "LUMEN_CUDA_BF16_AB_Q8BANK",
         "LUMEN_CUDA_BF16_AUTOTUNE",
+        "LUMEN_CUDA_BF16_FUSED_GLU",
         "LUMEN_CUDA_BF16_GEMMEX",
         "LUMEN_CUDA_BF16_MATVEC",
         "LUMEN_CUDA_BF16_MOE_V3",
+        "LUMEN_CUDA_BF16_NR1",
+        "LUMEN_CUDA_BF16_WO_NR1",
         "LUMEN_CUDA_DECODE_DELAY_US",
         "LUMEN_CUDA_DECODE_TILED",
         "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
@@ -2622,6 +2852,7 @@ mod tests {
         "LUMEN_CUDA_OUTPUT_PROJ_SPLIT",
         "LUMEN_CUDA_PREFILL_F32",
         "LUMEN_CUDA_PROFILE",
+        "LUMEN_CUDA_PROFILE_ATTN_LEAF",
         "LUMEN_CUDA_PTX_CACHE",
         "LUMEN_CUDA_PTX_CACHE_DIR",
         "LUMEN_CUDA_Q4_B160",
@@ -2639,8 +2870,10 @@ mod tests {
         "LUMEN_CUDA_Q8_PROJ_MMQ",
         "LUMEN_CUDA_Q8_SCALE_HW",
         "LUMEN_CUDA_Q8_SPLIT",
+        "LUMEN_CUDA_Q8_SPLIT_ATTN",
         "LUMEN_CUDA_Q8_SPLIT_BUDGET_GB",
         "LUMEN_CUDA_Q8_SPLIT_SSMOUT",
+        "LUMEN_CUDA_Q8_SPLIT_WO",
         "LUMEN_CUDA_ROPE_TAB",
         "LUMEN_CUDA_SHARED_FUSED_DECODE",
         "LUMEN_CUDA_SHARED_TILED",
