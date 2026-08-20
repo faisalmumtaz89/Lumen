@@ -7,6 +7,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-08-20
+
+### Added
+
+- **Split-K decode attention** (`LUMEN_CUDA_ATTN_SPLITK`). A sequence-parallel
+  kernel pair (per-head KV walk split across 4 partial CTAs plus an
+  online-softmax merge) that lifts the one-CTA-per-head occupancy ceiling of
+  the tiled decode-attention kernel on few-head models. Model-aware default:
+  ON for Q8_0- and BF16-body dense models; other models keep the tiled route.
+- **Q8 split-clone attention coverage** (`LUMEN_CUDA_Q8_SPLIT_ATTN`). The Q8
+  raw+split clone pass now also builds SoA siblings for the GDN qkv/gate and
+  full-attention Wq/Wk/Wv projections on wide-GDN models, serving them through
+  the existing split mmvq kernel family.
+- **BF16 decode kernels.** Four new default-ON routes for BF16-body dense
+  models, each with a documented kill-switch: a one-row-per-CTA GEMV
+  (`LUMEN_CUDA_BF16_NR1`, byte-identical to the previous blocking), a fused
+  gate+up+SwiGLU FFN kernel (`LUMEN_CUDA_BF16_FUSED_GLU`, byte-identical to
+  the separate sequence), a banked route for the Q8-converted GDN alpha/beta
+  projections (`LUMEN_CUDA_BF16_AB_Q8BANK`), and a one-launch residual matvec
+  for the attention output projection (`LUMEN_CUDA_BF16_WO_NR1`) that keeps
+  the activation in F32. The Q8 split-clone pass also serves the
+  converter-forced Q8 GDN `ssm_out` tensors on BF16 models.
+- **Fused GDN phase-1/2/3 under F64 recurrence.** A twin of the fused
+  conv+gates+L2-norm decode kernel whose normalization accumulates in F64,
+  bit-identical to the previous three-launch chain, re-enabling the fusion in
+  F64-recurrence mode.
+- `LUMEN_CUDA_PROFILE_ATTN_LEAF` diagnostic: per-sub-stage bracketing of the
+  full-attention block under the existing profiler.
+
+Quality, sampling, determinism, and tool-calling gates pass on this build for
+Q4/Q8/BF16; the Q4 route is byte-identical to the v0.9.0 certified baseline.
+
 ## [0.9.0] — 2026-08-18
 
 ### Added
@@ -285,7 +317,11 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.6.0...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.3.0...v0.4.0
