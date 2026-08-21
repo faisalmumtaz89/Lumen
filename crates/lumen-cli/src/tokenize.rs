@@ -180,9 +180,19 @@ impl BpeTokenizer {
                 special_tokens.push((tok_str.clone(), id));
             }
 
-            // Collect stop tokens.
+            // Collect stop tokens. `<|endoftext|>` is a declared EOS for
+            // Qwen-family models (generation_config lists it alongside
+            // `<|im_end|>`); the GGUF metadata carries only one eos id, so
+            // the alternates must come from this scan. It is gated on the
+            // special flag (Qwen GGUFs mark it control/type-3) so a vocab
+            // where that spelling is ordinary text does not truncate output.
             match tok_str.as_str() {
                 "<|eot_id|>" | "<|im_end|>" => {
+                    if !stop_token_ids.contains(&id) {
+                        stop_token_ids.push(id);
+                    }
+                }
+                "<|endoftext|>" if is_special => {
                     if !stop_token_ids.contains(&id) {
                         stop_token_ids.push(id);
                     }
@@ -844,6 +854,44 @@ mod tests {
             chat_template: None,
         };
         BpeTokenizer::from_tokenizer_data(&data)
+    }
+
+    #[test]
+    fn endoftext_stop_token_gated_on_special_type() {
+        // `<|endoftext|>` joins the stop set only when the vocabulary marks
+        // it special (type 3 = control / 4 = user-defined); a vocabulary
+        // where that spelling is ordinary text (type 1) must NOT stop on it.
+        let make = |token_types: Vec<u32>| {
+            let data = lumen_convert::tokenizer_data::TokenizerData {
+                model_type: "gpt2".into(),
+                pre_tokenizer: "qwen35".into(),
+                tokens: vec!["a".into(), "<|im_end|>".into(), "<|endoftext|>".into()],
+                token_types,
+                scores: vec![0.0; 3],
+                merges: Vec::new(),
+                bos_token_id: 0,
+                eos_token_id: 1,
+                pad_token_id: None,
+                add_bos_token: false,
+                add_eos_token: false,
+                add_space_prefix: false,
+                chat_template: None,
+            };
+            BpeTokenizer::from_tokenizer_data(&data)
+        };
+        let special = make(vec![1, 3, 3]);
+        assert!(
+            special.stop_token_ids.contains(&2),
+            "control-type <|endoftext|> must stop"
+        );
+        let ordinary = make(vec![1, 3, 1]);
+        assert!(
+            !ordinary.stop_token_ids.contains(&2),
+            "ordinary-type <|endoftext|> must not stop"
+        );
+        // <|im_end|> stays a stop token in both (pre-existing behavior).
+        assert!(special.stop_token_ids.contains(&1));
+        assert!(ordinary.stop_token_ids.contains(&1));
     }
 
     #[test]

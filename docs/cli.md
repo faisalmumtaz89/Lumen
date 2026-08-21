@@ -10,6 +10,7 @@ The canonical, always-up-to-date reference is `lumen run --help` (printed by [`c
 | `lumen pull <model:quant>` | Download GGUF, convert to LBC, cache; do not run |
 | `lumen models` | List all registry entries and disk-cached LBCs |
 | `lumen convert --input <gguf> --output <lbc> [--requant <q>]` | Manually convert a GGUF to LBC (optionally re-quantize) |
+| `lumen convert --input <donor-gguf> --from-hf <dir> --output <lbc>` | Import an HF compressed-tensors INT4 checkpoint (CUDA-only CtInt4G32; see `docs/lbc-format.md`) |
 | `lumen --help` / `lumen run --help` / `lumen convert --help` | Full reference |
 
 ## Common flags (excerpt)

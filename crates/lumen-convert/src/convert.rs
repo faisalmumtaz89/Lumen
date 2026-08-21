@@ -155,7 +155,9 @@ impl fmt::Display for ConvertError {
                 got,
             } => write!(f, "tensor {tensor}: expected shape {expected}, got {got}"),
             Self::UnsupportedTensorType { tensor, ggml_type } => {
-                write!(f, "tensor {tensor}: unsupported GGML type {ggml_type}")
+                // Source-neutral wording: this error covers both GGUF (GGML
+                // type tags) and HF safetensors (dtype/shape) inputs.
+                write!(f, "tensor {tensor}: unsupported tensor type {ggml_type}")
             }
         }
     }

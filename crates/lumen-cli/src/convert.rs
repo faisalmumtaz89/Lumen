@@ -16,6 +16,8 @@ pub(crate) fn convert_cmd(args: &[String]) {
     // Q8_0 in the LBC (Metal backend has no K-quant kernels). On Linux
     // (CUDA host) we keep the legacy Generic behaviour.
     let mut target: ConvertTarget = default_target_for_host();
+    let mut target_explicit = false;
+    let mut hf_dir: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -76,6 +78,18 @@ pub(crate) fn convert_cmd(args: &[String]) {
                         std::process::exit(1);
                     }
                 };
+                target_explicit = true;
+            }
+            "--from-hf" => {
+                i += 1;
+                hf_dir = Some(
+                    args.get(i)
+                        .unwrap_or_else(|| {
+                            eprintln!("Error: --from-hf requires a checkpoint directory");
+                            std::process::exit(1);
+                        })
+                        .clone(),
+                );
             }
             "--help" | "-h" => {
                 print_convert_usage();
@@ -114,6 +128,41 @@ pub(crate) fn convert_cmd(args: &[String]) {
         requant_to: requant,
         target,
     };
+
+    if let Some(hf) = hf_dir {
+        // HF import: `--input` is the donor GGUF (tokenizer + hyperparams);
+        // all tensor data comes from the checkpoint directory. The GGUF
+        // conversion options have no meaning here — reject rather than
+        // silently ignore them.
+        if dequantize || requant.is_some() || target_explicit {
+            eprintln!(
+                "Error: --dequantize / --requant / --target do not apply to --from-hf \
+                 (the checkpoint's quantization is preserved as-is, CUDA only)"
+            );
+            std::process::exit(1);
+        }
+        let hf_path = Path::new(&hf);
+        if !hf_path.is_dir() {
+            eprintln!("Error: --from-hf directory not found: {hf}");
+            std::process::exit(1);
+        }
+        println!("Converting HF checkpoint: {hf} (donor: {input_path}) -> {output_path}");
+        match lumen_convert::convert_hf::convert_hf_ct_to_lbc(
+            hf_path,
+            input,
+            Path::new(&output_path),
+        ) {
+            Ok(stats) => {
+                println!("{stats}");
+                println!("Done.");
+            }
+            Err(e) => {
+                eprintln!("Conversion error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     println!("Converting: {input_path} -> {output_path} (target={target:?})");
 

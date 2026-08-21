@@ -545,6 +545,13 @@ pub const MATVEC_F32_GATES_KERNEL_SOURCE: &str = include_str!("matvec_f32_gates.
 /// supplies the per-block min term without an extra dp4a.
 pub const MATVEC_Q4_1_KERNEL_SOURCE: &str = include_str!("matvec_q4_1_q8_1.cu");
 
+/// CtInt4G32 matvec against Q8_1 input (plain + residual) + F16 dequant for
+/// the prefill HGEMM path. Serves imported compressed-tensors pack-quantized
+/// INT4 g32 checkpoints. The zero-point term needs the exact integer sum of
+/// the activation quants, recomputed in-kernel via dp4a — the Q8_1 block's
+/// f16 sum field is too coarse once multiplied by the zero point.
+pub const MATVEC_CT4_G32_KERNEL_SOURCE: &str = include_str!("matvec_ct4_g32.cu");
+
 /// One-time repack from Q8Raw (34-byte AoS) to per-row split (SoA) layout.
 /// Runs once during `preload_weights`, NOT on the decode hot path.
 pub const REPACK_Q8_RAW_TO_SPLIT_KERNEL_SOURCE: &str = include_str!("repack_q8_raw_to_split.cu");

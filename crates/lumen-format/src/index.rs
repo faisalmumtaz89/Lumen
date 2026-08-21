@@ -111,6 +111,48 @@ pub struct SubtensorOffsets {
     pub layer_type: Option<u8>,
 }
 
+impl SubtensorOffsets {
+    /// True if any nonempty slice in this layer carries `scheme`. Used for
+    /// backend-capability checks: LBC permits per-tensor quantization, so
+    /// the header's primary scheme alone cannot prove a scheme is absent.
+    pub fn uses_quant(&self, scheme: QuantScheme) -> bool {
+        let hit = |t: &TensorSlice| t.length > 0 && t.quant == scheme;
+        let opt = |t: &Option<TensorSlice>| t.as_ref().is_some_and(hit);
+        hit(&self.wq)
+            || hit(&self.wk)
+            || hit(&self.wv)
+            || hit(&self.wo)
+            || hit(&self.w_gate)
+            || hit(&self.w_up)
+            || hit(&self.w_down)
+            || hit(&self.attn_norm)
+            || hit(&self.ffn_norm)
+            || opt(&self.bq)
+            || opt(&self.bk)
+            || opt(&self.bv)
+            || opt(&self.router_weight)
+            || opt(&self.shared_expert_gate)
+            || opt(&self.shared_expert_up)
+            || opt(&self.shared_expert_down)
+            || opt(&self.attn_gate)
+            || opt(&self.attn_post_norm)
+            || opt(&self.ssm_a)
+            || opt(&self.ssm_conv1d)
+            || opt(&self.ssm_dt)
+            || opt(&self.ssm_beta)
+            || opt(&self.ssm_alpha)
+            || opt(&self.ssm_norm)
+            || opt(&self.ssm_out)
+            || opt(&self.attn_q_norm)
+            || opt(&self.attn_k_norm)
+            || opt(&self.ffn_gate_inp_shexp)
+            || self.experts.as_ref().is_some_and(|es| {
+                es.iter()
+                    .any(|e| hit(&e.gate) || hit(&e.up) || hit(&e.down))
+            })
+    }
+}
+
 /// A (offset, length) pair identifying a tensor within a layer blob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TensorSlice {

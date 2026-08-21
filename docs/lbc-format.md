@@ -37,6 +37,7 @@ Each tensor entry in the table includes name, dtype, dimensions, byte offset, an
 | BF16  | 2 | Reference precision; highest quality |
 | Q8_0  | ~1.06 | 32-element groups, F16 scale per group |
 | Q4_0  | ~0.56 | 32-element groups, F16 scale per group |
+| CtInt4G32 | ~0.58 | Imported compressed-tensors "pack-quantized" INT4: 32-element groups, BF16 scale + 4-bit zero-point per group. Every quantized value is preserved exactly (no dequantization; rows/column-blocks are reindexed where the GGUF tensor conventions require it). CUDA runtime only. |
 
 K-quants (Q4_K / Q5_K / Q6_K / Q2_K / Q3_K) and MXFP4 are not runtime-supported; they are dequantized to Q8_0 / BF16 at convert-time.
 
@@ -48,6 +49,11 @@ lumen convert --input model.gguf --output model.lbc
 
 # Convert + re-quantize
 lumen convert --input model.gguf --output model.lbc --requant q4_0
+
+# Import a Hugging Face compressed-tensors checkpoint (pack-quantized INT4
+# group-32, indexed sharded safetensors, dense qwen35-family models only);
+# the GGUF supplies tokenizer + hyperparameters only
+lumen convert --input donor.gguf --from-hf /path/to/hf-checkpoint --output model.lbc
 ```
 
-The converter streams one layer at a time, filters the MTP (Next-N) head, and currently accepts the v1 architecture set (`qwen35` / `qwen35moe`); architectures outside the v1 set are rejected at conversion ([`crates/lumen-convert/src/hyperparams.rs`](../crates/lumen-convert/src/hyperparams.rs)) and additional architecture entries will be added as new model families ship.
+The GGUF converter streams one layer at a time, filters the MTP (Next-N) head, and currently accepts the v1 architecture set (`qwen35` / `qwen35moe`); the HF import path accepts dense `qwen35` models only. Architectures outside these sets are rejected at conversion ([`crates/lumen-convert/src/hyperparams.rs`](../crates/lumen-convert/src/hyperparams.rs)) and additional architecture entries will be added as new model families ship.

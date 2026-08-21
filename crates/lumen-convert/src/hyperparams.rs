@@ -380,5 +380,14 @@ pub(crate) fn quant_descriptor_for(scheme: QuantScheme) -> QuantizationDescripto
             block_byte_size: 110,
             scale_offset_in_block: None,
         },
+        // Planar (three concatenated planes per tensor slice, sizes derived
+        // from the logical shape) — no fixed block; scales live in their own
+        // plane. See the `QuantScheme::CtInt4G32` doc for the layout.
+        QuantScheme::CtInt4G32 => QuantizationDescriptor {
+            scheme,
+            group_size: QuantGroupSize::Group(32),
+            block_byte_size: 0,
+            scale_offset_in_block: None,
+        },
     }
 }
