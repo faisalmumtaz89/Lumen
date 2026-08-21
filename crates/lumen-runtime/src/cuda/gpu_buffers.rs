@@ -78,6 +78,13 @@ pub enum GpuWeightBuf {
     /// is preserved alongside for prefill. Consumed by `matvec_q4_split_q8_1`.
     #[allow(dead_code)]
     Q4Split(CudaSlice<u8>),
+    /// CtInt4G32 (imported compressed-tensors pack-quantized INT4 g32)
+    /// repacked into 20-byte decode blocks: `d bf16 (2B) | zp u8 (1B) |
+    /// pad (1B) | 16 GGML-paired nibble bytes` per 32 elements, row-major.
+    /// Built by `repack_ct4_blocks()` during upload; consumed by
+    /// `matvec_ct4_q8_1(_residual)` at decode and `dequant_ct4_to_f16`
+    /// for the prefill HGEMM path.
+    Ct4Raw(CudaSlice<u8>),
 }
 
 /// Per-layer weight buffers resident on GPU.
@@ -683,6 +690,148 @@ pub(super) fn dequant_kquant_to_f32(
     Ok(out)
 }
 
+/// Repack CtInt4G32 source planes (qweight ‖ scale ‖ zero_point, the LBC
+/// slice layout) into the 20-byte decode blocks `Ct4Raw` holds:
+/// `d bf16 | zp u8 | pad | 16 GGML-paired nibble bytes` per (row, group).
+/// Pure permutation + unpack — every stored value is preserved exactly.
+fn repack_ct4_blocks(raw: &[u8], out_dim: usize, in_dim: usize) -> Result<Vec<u8>, RuntimeError> {
+    let groups = in_dim / 32;
+    // Plane sizes come from the single source of truth in lumen-format.
+    let planes = lumen_format::CtInt4G32Planes::for_shape(out_dim as u64, in_dim as u64)
+        .map_err(|e| RuntimeError::Compute(format!("CtInt4G32 slice: {e}")))?;
+    if raw.len() as u64 != planes.total_bytes() {
+        return Err(RuntimeError::Compute(format!(
+            "CtInt4G32 slice: {} bytes does not match [{out_dim}, {in_dim}] \
+             (expected {})",
+            raw.len(),
+            planes.total_bytes(),
+        )));
+    }
+    let (qs, rest) = raw.split_at(planes.qweight_bytes as usize);
+    let (scales, zps) = rest.split_at(planes.scale_bytes as usize);
+
+    let mut out = vec![0u8; out_dim * groups * 20];
+    for row in 0..out_dim {
+        let qrow = &qs[row * in_dim / 2..(row + 1) * in_dim / 2];
+        let srow = &scales[row * groups * 2..(row + 1) * groups * 2];
+        for g in 0..groups {
+            let blk = &mut out[(row * groups + g) * 20..(row * groups + g + 1) * 20];
+            blk[0..2].copy_from_slice(&srow[g * 2..g * 2 + 2]);
+            // zero-point: 4-bit, packed 8 rows per i32 word along out_dim.
+            let z_off = ((row / 8) * groups + g) * 4;
+            let z_word =
+                u32::from_le_bytes([zps[z_off], zps[z_off + 1], zps[z_off + 2], zps[z_off + 3]]);
+            blk[2] = ((z_word >> (4 * (row % 8))) & 0xF) as u8;
+            // nibbles: source little-first along k (byte j = elems 2j, 2j+1);
+            // target byte i = elem i | elem i+16 << 4.
+            let src = &qrow[g * 16..(g + 1) * 16];
+            let nib = |e: usize| (src[e / 2] >> (4 * (e & 1))) & 0xF;
+            for (i, b) in blk[4..20].iter_mut().enumerate() {
+                *b = nib(i) | (nib(i + 16) << 4);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Upload a CtInt4G32 tensor: host-repack the source planes into decode
+/// blocks and upload as `Ct4Raw`. With `LUMEN_CUDA_CT4_DP4A=0`, dequantize
+/// to F16 instead and serve through the existing F16 routes (the W4A16
+/// diagnostic reference for the dp4a route).
+fn upload_ct4_tensor(
+    device: &CudaDevice,
+    weights: &LayerView,
+    name: &str,
+    slice: &lumen_format::index::TensorSlice,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<GpuWeightBuf, RuntimeError> {
+    let raw = weights.subtensor_bytes(slice)?;
+    let blocks = repack_ct4_blocks(raw, out_dim, in_dim)?;
+    let force_f16 = crate::runtime_defaults::ct4_f16_roles()
+        .map_err(RuntimeError::Compute)?
+        .is_some_and(|roles| roles.iter().any(|r| r == "*" || r == name));
+    if !force_f16 {
+        return Ok(GpuWeightBuf::Ct4Raw(device.htod_copy(&blocks)?));
+    }
+    let mut f16 = vec![0u8; out_dim * in_dim * 2];
+    for (b, blk) in blocks.chunks_exact(20).enumerate() {
+        let d = f32::from_bits(u32::from(u16::from_le_bytes([blk[0], blk[1]])) << 16);
+        let zp = f32::from(blk[2]);
+        for i in 0..32 {
+            let byte = blk[4 + (i & 15)];
+            let q = if i < 16 { byte & 0xF } else { byte >> 4 };
+            let v = d * (f32::from(q) - zp);
+            let bits = f32_to_f16_bits(v);
+            let e = b * 32 + i;
+            f16[e * 2..e * 2 + 2].copy_from_slice(&bits.to_le_bytes());
+        }
+    }
+    Ok(GpuWeightBuf::F16Raw(device.htod_copy(&f16)?))
+}
+
+/// Recover a CtInt4G32 tensor's out_dim from its slice byte length and known
+/// in_dim. `total(n) = n*per_row + ceil(n/8)*zp_word` is strictly increasing
+/// in `n`, so the solution is unique; solving per residue class `n mod 8`
+/// makes the inversion exact for every valid `n` (no estimate window).
+fn ct4_out_dim(total_bytes: usize, in_dim: usize) -> Result<usize, RuntimeError> {
+    let groups = in_dim / 32;
+    if in_dim == 0 || in_dim % 32 != 0 {
+        return Err(RuntimeError::Compute(format!(
+            "CtInt4G32 slice: in_dim {in_dim} is not a positive multiple of 32"
+        )));
+    }
+    let per_row = in_dim / 2 + groups * 2;
+    let zp_word = groups * 4;
+    for r in 0..8usize {
+        // n = 8m + r, so total = (8m + r)*per_row + ceil((8m + r)/8)*zp_word.
+        let zp_words = if r == 0 { 0 } else { 1 };
+        let base = r * per_row + zp_words * zp_word;
+        if total_bytes < base {
+            continue;
+        }
+        let rem = total_bytes - base;
+        let denom = 8 * per_row + zp_word;
+        if rem % denom == 0 {
+            let n = 8 * (rem / denom) + r;
+            if n > 0 && n * per_row + n.div_ceil(8) * zp_word == total_bytes {
+                return Ok(n);
+            }
+        }
+    }
+    Err(RuntimeError::Compute(format!(
+        "CtInt4G32 slice: {total_bytes} bytes has no valid out_dim for in_dim {in_dim}"
+    )))
+}
+
+/// Upload a projection weight, routing CtInt4G32 slices through the decode
+/// repack (`in_dim` from the tensor role) and everything else through
+/// `upload_tensor`. `allowed_out` is the role's set of valid output
+/// dimensions — a slice that decodes to any other row count is rejected
+/// here, BEFORE upload, because downstream launchers derive dimensions from
+/// the hyperparameters, not from the buffer.
+fn upload_projection_tensor(
+    device: &CudaDevice,
+    weights: &LayerView,
+    name: &str,
+    slice: &lumen_format::index::TensorSlice,
+    in_dim: usize,
+    allowed_out: &[usize],
+) -> Result<GpuWeightBuf, RuntimeError> {
+    if slice.quant == QuantScheme::CtInt4G32 {
+        let out_dim = ct4_out_dim(slice.length as usize, in_dim)?;
+        if !allowed_out.contains(&out_dim) {
+            return Err(RuntimeError::Compute(format!(
+                "CtInt4G32 {name}: slice decodes to [{out_dim}, {in_dim}] but this \
+                 role requires out_dim in {allowed_out:?}"
+            )));
+        }
+        upload_ct4_tensor(device, weights, name, slice, out_dim, in_dim)
+    } else {
+        upload_tensor(device, weights, name, slice)
+    }
+}
+
 /// Upload a single tensor to GPU as the appropriate format based on its quantization.
 ///
 /// - `QuantScheme::F32`: reinterpret bytes as f32, upload as `GpuWeightBuf::F32`.
@@ -1005,6 +1154,21 @@ pub fn upload_layer_weights(
                 )),
             )
         }
+        Some(s) if s.quant == QuantScheme::CtInt4G32 => {
+            let gd = hp.gdn_dims();
+            let in_dim = (gd.num_v_heads * gd.head_dim) as usize;
+            (
+                Some(upload_projection_tensor(
+                    device,
+                    weights,
+                    "ssm_out",
+                    s,
+                    in_dim,
+                    &[hp.hidden_dim as usize],
+                )?),
+                None,
+            )
+        }
         Some(s) => (Some(upload_tensor(device, weights, "ssm_out", s)?), None),
         None => (None, None),
     };
@@ -1019,11 +1183,27 @@ pub fn upload_layer_weights(
         None
     };
 
+    let hidden = hp.hidden_dim as usize;
+    let q_dim = (hp.num_heads * hp.head_dim) as usize;
+    let kv_dim = (hp.num_kv_heads * hp.head_dim) as usize;
+    let gdn_qkv_rows = {
+        let gd = hp.gdn_dims();
+        ((2 * gd.num_k_heads + gd.num_v_heads) * gd.head_dim) as usize
+    };
     Ok(LayerWeightsGpu {
-        wq: upload_tensor(device, weights, "wq", &subs.wq)?,
-        wk: upload_tensor(device, weights, "wk", &subs.wk)?,
-        wv: upload_tensor(device, weights, "wv", &subs.wv)?,
-        wo: upload_tensor(device, weights, "wo", &subs.wo)?,
+        // wq holds: plain Q (q_dim), fused Q+gate (2*q_dim), or the GDN
+        // fused in_proj_qkv (qkv rows) depending on the layer type.
+        wq: upload_projection_tensor(
+            device,
+            weights,
+            "wq",
+            &subs.wq,
+            hidden,
+            &[q_dim, 2 * q_dim, gdn_qkv_rows],
+        )?,
+        wk: upload_projection_tensor(device, weights, "wk", &subs.wk, hidden, &[kv_dim])?,
+        wv: upload_projection_tensor(device, weights, "wv", &subs.wv, hidden, &[kv_dim])?,
+        wo: upload_projection_tensor(device, weights, "wo", &subs.wo, q_dim, &[hidden])?,
         bq: match &subs.bq {
             Some(s) if s.quant == QuantScheme::F32 => {
                 let raw = weights.subtensor_bytes(s)?;
@@ -1057,9 +1237,30 @@ pub fn upload_layer_weights(
             };
             upload_norm_tensor(device, weights, "ffn_norm", ffn_norm_slice)?
         },
-        w_gate: upload_tensor(device, weights, "w_gate", &subs.w_gate)?,
-        w_up: upload_tensor(device, weights, "w_up", &subs.w_up)?,
-        w_down: upload_tensor(device, weights, "w_down", &subs.w_down)?,
+        w_gate: upload_projection_tensor(
+            device,
+            weights,
+            "w_gate",
+            &subs.w_gate,
+            hidden,
+            &[hp.intermediate_dim as usize],
+        )?,
+        w_up: upload_projection_tensor(
+            device,
+            weights,
+            "w_up",
+            &subs.w_up,
+            hidden,
+            &[hp.intermediate_dim as usize],
+        )?,
+        w_down: upload_projection_tensor(
+            device,
+            weights,
+            "w_down",
+            &subs.w_down,
+            hp.intermediate_dim as usize,
+            &[hidden],
+        )?,
         // F16 caches start as None; populated by dequant_layer_q8_to_f16().
         wq_f16: None,
         wk_f16: None,
@@ -1139,7 +1340,17 @@ pub fn upload_layer_weights(
         },
         ssm_out: ssm_out_base,
         attn_gate: match &subs.attn_gate {
-            Some(s) => Some(upload_tensor(device, weights, "attn_gate", s)?),
+            Some(s) => Some(upload_projection_tensor(
+                device,
+                weights,
+                "attn_gate",
+                s,
+                hidden,
+                &[{
+                    let gd = hp.gdn_dims();
+                    (gd.num_v_heads * gd.head_dim) as usize
+                }],
+            )?),
             None => None,
         },
         // GDN F16 caches start as None; populated by dequant_layer_q8_to_f16().
@@ -1334,6 +1545,10 @@ pub fn dequant_layer_q8_to_f16(
             GpuWeightBuf::Q4Aligned(q4a) => {
                 // Q4Aligned: 20 bytes per block of 32 elements
                 (q4a.len() / 20) * 32
+            }
+            GpuWeightBuf::Ct4Raw(ct4) => {
+                // Ct4Raw: 20 bytes per block of 32 elements
+                (ct4.len() / 20) * 32
             }
             GpuWeightBuf::F32(f32_buf) => f32_buf.len(),
             GpuWeightBuf::F16Raw(f16_buf) => f16_buf.len() / 2,
@@ -1744,5 +1959,27 @@ mod tests {
                 "BF16 round-trip changed {v} to {back}",
             );
         }
+    }
+
+    #[test]
+    fn ct4_out_dim_exact_inversion() {
+        // Every (n, k) with k % 32 == 0 must invert exactly — including small
+        // k (few groups) and n not a multiple of 8, where a linear-estimate
+        // probe goes wrong.
+        for k in [32usize, 64, 96, 160, 4096, 6144] {
+            for n in [1usize, 7, 8, 9, 1000, 1024, 1033, 11007, 248320] {
+                let groups = k / 32;
+                let total = n * (k / 2 + groups * 2) + n.div_ceil(8) * groups * 4;
+                assert_eq!(
+                    super::ct4_out_dim(total, k).unwrap(),
+                    n,
+                    "failed for [{n}, {k}]"
+                );
+            }
+        }
+        // Invalid byte counts and in_dims are rejected.
+        assert!(super::ct4_out_dim(1, 4096).is_err());
+        assert!(super::ct4_out_dim(1000, 0).is_err());
+        assert!(super::ct4_out_dim(1000, 33).is_err());
     }
 }

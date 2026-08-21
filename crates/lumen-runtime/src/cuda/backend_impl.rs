@@ -697,7 +697,8 @@ struct GpuScratch {
     attn_proj: CudaSlice<f32>,
     /// Precomputed RMS scale scalar for fused norm+matvec: [1]
     rms_scale: CudaSlice<f32>,
-    /// F16 scratch for cuBLAS HGEMV input conversion: [max(hidden_dim, inter_dim) * 2] bytes.
+    /// F16 scratch for cuBLAS HGEMV input conversion: sized to the widest
+    /// matvec input (hidden, intermediate, q_dim, GDN value_dim) * 2 bytes.
     ///
     /// Used by `launch_hgemv_f16` to convert F32 activations to F16 before
     /// `cublasGemmEx` with N=1, which triggers NVIDIA's optimized GEMV path.
@@ -705,7 +706,7 @@ struct GpuScratch {
 
     /// Pre-quantized Q8_1 input buffer for dp4a matvec.
     ///
-    /// Size: max(hidden_dim, inter_dim) / 32 * 36 bytes.
+    /// Size: widest matvec input (see `input_f16`) / 32 * 36 bytes.
     /// Populated by `quantize_f32_to_q8_1` kernel once per activation vector,
     /// then reused across all Q8_0 matvec calls sharing that input.
     /// None if dp4a Q8_1 kernels failed to compile.
@@ -2334,9 +2335,15 @@ impl CudaBackend {
                         )?;
                     }
                 }
-            } else if matches!(&lw.wq, GpuWeightBuf::F16Raw(_)) {
+            } else if matches!(&lw.wq, GpuWeightBuf::F16Raw(_))
+                && matches!(&lw.wk, GpuWeightBuf::F16Raw(_))
+                && matches!(&lw.wv, GpuWeightBuf::F16Raw(_))
+            {
                 // F16 HGEMV path: Fused RMSNorm + F32->F16 in ONE kernel (saves 1 dispatch),
                 // then cuBLAS HGEMV for all QKV projections (cached F16 input).
+                // All THREE projections must be F16-backed: the precomputed KV
+                // pointer arrays below launch unconditionally, so a mixed
+                // layer (e.g. F16 wq + BF16 wk) must take the per-weight path.
                 unsafe {
                     launch_fused_rmsnorm_f16(
                         &self.device,
@@ -11168,6 +11175,51 @@ unsafe fn launch_matvec(
         }
     }
 
+    // CtInt4G32: dp4a against pre-quantized Q8_1 input (the only decode
+    // route for this format — no scalar/HGEMV fallback exists).
+    if let GpuWeightBuf::Ct4Raw(w_ct4) = weight {
+        let (Some(quant_fn), Some(mv_fn), Some(q8_1_buf)) = (
+            kernels.quantize_f32_to_q8_1.as_ref(),
+            kernels.matvec_ct4.as_ref(),
+            input_q8_1_scratch.as_deref_mut(),
+        ) else {
+            return Err(RuntimeError::Compute(format!(
+                "matvec {label}: CtInt4G32 requires the ct4 dp4a kernel and \
+                 Q8_1 scratch (kernel or scratch unavailable)"
+            )));
+        };
+        let expected_w = out_dim * (in_dim / 32) * 20;
+        let needed_q8 = (in_dim / 32) * 36;
+        if in_dim % 32 != 0 || w_ct4.len() != expected_w || q8_1_buf.len() < needed_q8 {
+            return Err(RuntimeError::Compute(format!(
+                "matvec {label}: CtInt4G32 shape mismatch: weight {} bytes \
+                 (expected {expected_w} for [{out_dim}, {in_dim}]), \
+                 Q8_1 scratch {} bytes (need {needed_q8})",
+                w_ct4.len(),
+                q8_1_buf.len(),
+            )));
+        }
+        launch_quantize_input_q8_1(device, quant_fn, input, q8_1_buf, in_dim, label)?;
+        let out_dim_u32 = out_dim as u32;
+        let in_dim_u32 = in_dim as u32;
+        let launch_cfg = CudarcLaunchConfig {
+            grid_dim: (out_dim_u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        device
+            .stream
+            .launch_builder(mv_fn)
+            .arg(w_ct4)
+            .arg(&*q8_1_buf)
+            .arg(output)
+            .arg(&out_dim_u32)
+            .arg(&in_dim_u32)
+            .launch(launch_cfg)
+            .map_err(|e| RuntimeError::Compute(format!("matvec_ct4 {label} launch: {e}")))?;
+        return Ok(());
+    }
+
     match weight {
         GpuWeightBuf::F32(w_f32) => {
             let cfg = GemvConfig {
@@ -11383,6 +11435,12 @@ unsafe fn launch_matvec(
         // split-layout: Q8Split/Q4Split are sibling buffers consumed only by
         // `launch_matvec_preq8_1_split`. Reaching the base `launch_matvec`
         // means the caller passed a sibling as the base weight, which is a bug.
+        GpuWeightBuf::Ct4Raw(_) => {
+            return Err(RuntimeError::Compute(format!(
+                "Ct4Raw reached fallback match in matvec {label} — \
+                 handled by the early ct4 dp4a path"
+            )));
+        }
         GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
                 "Q8Split/Q4Split sibling reached fallback match in matvec {label} — \
@@ -11787,6 +11845,54 @@ unsafe fn launch_matvec_residual(
         }
     }
 
+    // CtInt4G32: dp4a against pre-quantized Q8_1 input (the only decode
+    // route for this format — no scalar/HGEMV fallback exists).
+    if let GpuWeightBuf::Ct4Raw(w_ct4) = weight {
+        let (Some(quant_fn), Some(mv_fn), Some(q8_1_buf)) = (
+            kernels.quantize_f32_to_q8_1.as_ref(),
+            kernels.matvec_ct4_residual.as_ref(),
+            input_q8_1_scratch.as_deref_mut(),
+        ) else {
+            return Err(RuntimeError::Compute(format!(
+                "matvec {label}: CtInt4G32 requires the ct4 dp4a kernel and \
+                 Q8_1 scratch (kernel or scratch unavailable)"
+            )));
+        };
+        let expected_w = out_dim * (in_dim / 32) * 20;
+        let needed_q8 = (in_dim / 32) * 36;
+        if in_dim % 32 != 0 || w_ct4.len() != expected_w || q8_1_buf.len() < needed_q8 {
+            return Err(RuntimeError::Compute(format!(
+                "matvec+residual {label}: CtInt4G32 shape mismatch: weight {} bytes \
+                 (expected {expected_w} for [{out_dim}, {in_dim}]), \
+                 Q8_1 scratch {} bytes (need {needed_q8})",
+                w_ct4.len(),
+                q8_1_buf.len(),
+            )));
+        }
+        launch_quantize_input_q8_1(device, quant_fn, input, q8_1_buf, in_dim, label)?;
+        let out_dim_u32 = out_dim as u32;
+        let in_dim_u32 = in_dim as u32;
+        let launch_cfg = CudarcLaunchConfig {
+            grid_dim: (out_dim_u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        device
+            .stream
+            .launch_builder(mv_fn)
+            .arg(w_ct4)
+            .arg(&*q8_1_buf)
+            .arg(residual)
+            .arg(output)
+            .arg(&out_dim_u32)
+            .arg(&in_dim_u32)
+            .launch(launch_cfg)
+            .map_err(|e| {
+                RuntimeError::Compute(format!("matvec_ct4_residual {label} launch: {e}"))
+            })?;
+        return Ok(());
+    }
+
     match weight {
         GpuWeightBuf::F32(w_f32) => {
             // Copy residual into output so cuBLAS can accumulate: y = W*x + y.
@@ -12011,6 +12117,12 @@ unsafe fn launch_matvec_residual(
         // `launch_matvec_residual_split`. Reaching the base
         // `launch_matvec_residual` means the caller passed a sibling as the
         // base weight, which is a bug.
+        GpuWeightBuf::Ct4Raw(_) => {
+            return Err(RuntimeError::Compute(format!(
+                "Ct4Raw reached fallback match in matvec+residual {label} — \
+                 handled by the early ct4 dp4a path"
+            )));
+        }
         GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
                 "Q8Split/Q4Split sibling reached fallback match in matvec+residual {label} — \
@@ -15365,11 +15477,22 @@ impl ComputeBackend for CudaBackend {
             x_gpu: self.device.alloc_zeros(hidden_dim)?,
             attn_proj: self.device.alloc_zeros(hidden_dim)?,
             rms_scale: self.device.alloc_zeros(1)?,
-            // F16 scratch for HGEMV: max(hidden_dim, inter_dim) elements * 2 bytes each.
-            input_f16: self
-                .device
-                .alloc_zeros::<u8>(hidden_dim.max(inter_dim) * 2)?,
-            // Q8_1 scratch for dp4a matvec: max(hidden_dim, inter_dim) / 32 * 36 bytes.
+            // F16/Q8_1 scratch cover every matvec input width: hidden and
+            // intermediate, plus the projection inputs that can exceed both —
+            // attention wo consumes q_dim and the GDN exit projection
+            // (ssm_out) consumes value_dim.
+            input_f16: {
+                let gdn_value_dim = hyperparams.gdn.as_ref().map_or(0, |_| {
+                    let gd = hyperparams.gdn_dims();
+                    (gd.num_v_heads * gd.head_dim) as usize
+                });
+                let max_in = hidden_dim
+                    .max(inter_dim)
+                    .max(num_heads * head_dim)
+                    .max(gdn_value_dim);
+                self.device.alloc_zeros::<u8>(max_in * 2)?
+            },
+            // Q8_1 scratch for dp4a matvec: max input width / 32 * 36 bytes.
             // Only allocate if the dp4a Q8_1 kernels compiled successfully.
             // also allocate when mul_mat_vec_q_q{8,4}_0 compiled
             // (the dp4a-mmvq dispatch uses the same scratch layout).
@@ -15377,12 +15500,20 @@ impl ComputeBackend for CudaBackend {
                 && (kernels.matvec_q8_0_q8_1.is_some()
                     || kernels.matvec_q8_aligned_q8_1.is_some()
                     || kernels.matvec_q4_0_dp4a.is_some()
-                    || kernels.matvec_q4_aligned_q8_1.is_some()))
+                    || kernels.matvec_q4_aligned_q8_1.is_some()
+                    || kernels.matvec_ct4.is_some()))
                 || (kernels.quantize_q8_1_rawsum.is_some()
                     && (kernels.mul_mat_vec_q_q8_0.is_some()
                         || kernels.mul_mat_vec_q_q4_0.is_some()))
             {
-                let max_dim = hidden_dim.max(inter_dim) as u32;
+                let gdn_value_dim = hyperparams.gdn.as_ref().map_or(0, |_| {
+                    let gd = hyperparams.gdn_dims();
+                    (gd.num_v_heads * gd.head_dim) as usize
+                });
+                let max_dim = hidden_dim
+                    .max(inter_dim)
+                    .max(num_heads * head_dim)
+                    .max(gdn_value_dim) as u32;
                 let buf_bytes = decode::q8_1_buffer_bytes(max_dim) as usize;
                 match self.device.alloc_zeros::<u8>(buf_bytes) {
                     Ok(buf) => {
@@ -17093,6 +17224,26 @@ impl ComputeBackend for CudaBackend {
                 .map_err(|e| {
                     RuntimeError::Compute(format!("matvec output_proj Q8_0 launch: {e}"))
                 })?;
+            } else if let Some(ref proj_bf16) = st.globals.output_proj_bf16 {
+                // BF16 head: same launcher as the decode-path head dispatch.
+                // Without this arm the chain falls through to the F32 GEMV
+                // below, which reads the one-float placeholder that raw-head
+                // uploads leave in `globals.output_proj` — garbage logits for
+                // the one token this finalizer produces (the first token
+                // after prefill).
+                unsafe {
+                    launch_bf16_matvec_with_fallback(
+                        &self.device,
+                        &st.kernels,
+                        proj_bf16,
+                        &st.scratch.normed,
+                        &mut st.logits_gpu,
+                        &mut st.scratch.input_f16,
+                        vocab_size,
+                        hidden_dim,
+                        "output_proj final",
+                    )?;
+                }
             } else {
                 // F32 output projection path: cuBLAS SGEMV.
                 // SAFETY: output_proj is [vocab_size, hidden_dim] (uploaded in init).
@@ -17370,7 +17521,13 @@ impl ComputeBackend for CudaBackend {
             None
         };
 
-        // Allocate batch-sized scratch buffers.
+        // Allocate batch-sized scratch buffers. Q+gate fusion (attn_q_norm
+        // present) projects wq at out = q_dim * 2, so the shared dequant
+        // scratch must budget the doubled matrix on those models.
+        let qgate_fused = st
+            .layer_weights_cache
+            .iter()
+            .any(|lw| lw.attn_q_norm.is_some());
         let mut pf = super::prefill::alloc_prefill_scratch(
             &self.device,
             batch,
@@ -17380,6 +17537,7 @@ impl ComputeBackend for CudaBackend {
             inter_dim,
             gdn_dims.map(|(q, _)| q),
             gdn_dims.map(|(_, v)| v),
+            qgate_fused,
         )?;
 
         // Allocate GDN prefill scratch if the model has GDN layers.
@@ -18477,6 +18635,50 @@ impl ComputeBackend for CudaBackend {
                     layer_idx, e,
                 ))
             })?;
+            // Fail fast on the FIRST layer that will keep a raw Ct4 tensor,
+            // before the multi-GB upload: Ct4 decode needs its kernel trio +
+            // Q8_1 scratch, and those load failures (e.g. no SM80 dp4a) are
+            // otherwise swallowed until the first request. A role is exempt
+            // when the F16-force env converts it at upload.
+            {
+                let s = &layer_view.subtensors;
+                let f16_roles = crate::runtime_defaults::ct4_f16_roles()
+                    .map_err(RuntimeError::Compute)?
+                    .unwrap_or_default();
+                let forced = |role: &str| f16_roles.iter().any(|r| r == "*" || r == role);
+                let mut ct4_slices = vec![
+                    ("wq", &s.wq),
+                    ("wk", &s.wk),
+                    ("wv", &s.wv),
+                    ("wo", &s.wo),
+                    ("w_gate", &s.w_gate),
+                    ("w_up", &s.w_up),
+                    ("w_down", &s.w_down),
+                ];
+                if let Some(t) = s.attn_gate.as_ref() {
+                    ct4_slices.push(("attn_gate", t));
+                }
+                if let Some(t) = s.ssm_out.as_ref() {
+                    ct4_slices.push(("ssm_out", t));
+                }
+                let any_raw_ct4 = ct4_slices
+                    .iter()
+                    .any(|(role, t)| t.quant == QuantScheme::CtInt4G32 && !forced(role));
+                if any_raw_ct4
+                    && (st.kernels.matvec_ct4.is_none()
+                        || st.kernels.matvec_ct4_residual.is_none()
+                        || st.kernels.dequant_ct4_to_f16.is_none()
+                        || st.kernels.quantize_f32_to_q8_1.is_none()
+                        || st.scratch.input_q8_1.is_none())
+                {
+                    return Err(RuntimeError::Compute(
+                        "CtInt4G32 weights need the ct4 dp4a kernels + Q8_1 scratch, which \
+                         failed to load on this GPU (SM80+ required). Set LUMEN_CUDA_CT4_DP4A=0 \
+                         to serve via F16 dequant instead."
+                            .into(),
+                    ));
+                }
+            }
             // build per-layer MoE metadata when the layer has experts.
             // We build this BEFORE upload_layer_weights so the meta references
             // offsets that remain stable across the upload (the upload writes

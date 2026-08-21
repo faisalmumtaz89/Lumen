@@ -571,6 +571,12 @@ pub(crate) struct KernelSet {
     /// source Q4_1 form. Plain + residual-folding variants.
     pub(crate) matvec_q4_1: Option<CudaFunction>,
     pub(crate) matvec_q4_1_residual: Option<CudaFunction>,
+    /// CtInt4G32 matvec against Q8_1 input (imported pack-quantized INT4
+    /// g32 checkpoints). Plain + residual-folding variants, plus the F16
+    /// dequant used by the prefill HGEMM path.
+    pub(crate) matvec_ct4: Option<CudaFunction>,
+    pub(crate) matvec_ct4_residual: Option<CudaFunction>,
+    pub(crate) dequant_ct4_to_f16: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr8: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr16: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr64: Option<CudaFunction>,
@@ -2136,6 +2142,42 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] matvec_q4_1_residual: FAILED: {e}");
+                None
+            }
+        },
+        matvec_ct4: match load_fn_sm80_fast_math(
+            shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
+            "matvec_ct4_q8_1",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_ct4: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_ct4: FAILED: {e}");
+                None
+            }
+        },
+        matvec_ct4_residual: match load_fn_sm80_fast_math(
+            shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
+            "matvec_ct4_q8_1_residual",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_ct4_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_ct4_residual: FAILED: {e}");
+                None
+            }
+        },
+        dequant_ct4_to_f16: match load_fn_sm80_fast_math(
+            shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
+            "dequant_ct4_to_f16",
+        ) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                cuda_log!("[CUDA] dequant_ct4_to_f16: FAILED: {e}");
                 None
             }
         },

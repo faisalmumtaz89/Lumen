@@ -26,6 +26,23 @@ pub struct LbcFile {
     pub tokenizer: Option<TokenizerSection>,
 }
 
+impl LbcFile {
+    /// True if `scheme` appears anywhere in the file: the primary descriptor,
+    /// a global tensor, or any per-layer slice. Backend-capability guards
+    /// must use this rather than the primary scheme alone — LBC permits
+    /// per-tensor quantization overrides.
+    pub fn uses_quant(&self, scheme: crate::QuantScheme) -> bool {
+        self.header.quantization.scheme == scheme
+            || self.header.embedding.quant == scheme
+            || self.header.final_norm.quant == scheme
+            || self.header.output_proj.quant == scheme
+            || self
+                .layer_indices
+                .iter()
+                .any(|li| li.subtensors.uses_quant(scheme))
+    }
+}
+
 /// The fixed-size header is at most this many bytes. This is a generous
 /// upper bound; the actual header is smaller, but we read a bit extra to
 /// be safe and avoid a second read in most cases.

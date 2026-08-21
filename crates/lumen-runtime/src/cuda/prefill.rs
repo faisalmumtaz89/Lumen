@@ -164,6 +164,7 @@ pub(crate) fn alloc_prefill_scratch(
     inter_dim: usize,
     gdn_qkv_dim: Option<usize>,
     gdn_value_dim: Option<usize>,
+    qgate_fused: bool,
 ) -> Result<PrefillScratch, RuntimeError> {
     // Maximum weight matrix size across all projections that share this scratch.
     //
@@ -173,7 +174,13 @@ pub(crate) fn alloc_prefill_scratch(
     let gdn_qkv = gdn_qkv_dim.unwrap_or(0);
     let gdn_value = gdn_value_dim.unwrap_or(0);
     let max_weight_elems = [
-        q_dim * hidden_dim,     // wq
+        q_dim * hidden_dim, // wq
+        // wq with Q+gate fusion projects out = q_dim * 2 through this scratch.
+        if qgate_fused {
+            2 * q_dim * hidden_dim
+        } else {
+            0
+        },
         kv_dim * hidden_dim,    // wk, wv
         hidden_dim * q_dim,     // wo
         inter_dim * hidden_dim, // w_gate, w_up
@@ -814,6 +821,41 @@ pub(crate) unsafe fn launch_gemm_projection(
                 )?;
             }
         }
+        GpuWeightBuf::Ct4Raw(w_ct4) => {
+            // CtInt4G32 prefill: dequantize to F16 scratch, then HGEMM —
+            // the same pattern as the Q4Raw arm above. No F32 fallback
+            // exists for this format (its dequant kernel emits F16 only).
+            let num_elements = out_dim * in_dim;
+            let f16_bytes_needed = num_elements * 2;
+            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+                return Err(RuntimeError::Compute(format!(
+                    "gemm {label}: CtInt4G32 requires the F16 HGEMM path \
+                     (dequant_f16 has {} bytes, need {f16_bytes_needed}; \
+                     LUMEN_CUDA_PREFILL_F32 is unsupported for this format)",
+                    dequant_f16.len(),
+                )));
+            }
+            launch_dequant_ct4_to_f16(device, kernels, w_ct4, dequant_f16, num_elements, label)?;
+            launch_f32_to_f16_fast(
+                device,
+                kernels,
+                input,
+                activation_f16,
+                batch * in_dim,
+                label,
+            )?;
+            launch_cublas_hgemm(
+                device,
+                dequant_f16,
+                activation_f16,
+                output,
+                out_dim,
+                batch,
+                in_dim,
+                0.0,
+                label,
+            )?;
+        }
         GpuWeightBuf::Q8Aligned(_) => {
             // Q8Aligned in batched prefill: fall back to per-row matvec
             // (aligned format is optimized for single-token decode, not GEMM).
@@ -1315,6 +1357,45 @@ pub(crate) unsafe fn launch_gemm_residual(
                     label,
                 )?;
             }
+        }
+        GpuWeightBuf::Ct4Raw(w_ct4) => {
+            // CtInt4G32 prefill: dequantize to F16 scratch, then HGEMM —
+            // the same pattern as the Q4Raw arm above. No F32 fallback
+            // exists for this format (its dequant kernel emits F16 only).
+            let num_elements = out_dim * in_dim;
+            let f16_bytes_needed = num_elements * 2;
+            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+                return Err(RuntimeError::Compute(format!(
+                    "gemm {label}: CtInt4G32 requires the F16 HGEMM path \
+                     (dequant_f16 has {} bytes, need {f16_bytes_needed}; \
+                     LUMEN_CUDA_PREFILL_F32 is unsupported for this format)",
+                    dequant_f16.len(),
+                )));
+            }
+            // beta=1.0 accumulates into `output`, so it must hold the residual first.
+            device.stream.memcpy_dtod(residual, output).map_err(|e| {
+                RuntimeError::Compute(format!("dtod residual copy (CtInt4G32) {label}: {e}"))
+            })?;
+            launch_dequant_ct4_to_f16(device, kernels, w_ct4, dequant_f16, num_elements, label)?;
+            launch_f32_to_f16_fast(
+                device,
+                kernels,
+                input,
+                activation_f16,
+                batch * in_dim,
+                label,
+            )?;
+            launch_cublas_hgemm(
+                device,
+                dequant_f16,
+                activation_f16,
+                output,
+                out_dim,
+                batch,
+                in_dim,
+                1.0,
+                label,
+            )?;
         }
         GpuWeightBuf::Q8Aligned(_) => {
             // Q8Aligned in batched prefill residual: fall back to per-row matvec.
@@ -2414,6 +2495,56 @@ unsafe fn launch_dequant_q4_0_to_f16(
     Ok(())
 }
 
+/// Launch `dequant_ct4_to_f16`: CtInt4G32 decode blocks -> F16 image.
+///
+/// # Safety
+///
+/// Same contract as `launch_dequant_q4_0_to_f16`.
+unsafe fn launch_dequant_ct4_to_f16(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    ct4_data: &CudaSlice<u8>,
+    f16_out: &mut CudaSlice<u8>,
+    num_elements: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    let dequant_fn = kernels.dequant_ct4_to_f16.as_ref().ok_or_else(|| {
+        RuntimeError::Compute(format!("dequant_ct4_to_f16 {label}: kernel unavailable"))
+    })?;
+    // 32 elements per 20-byte block; the kernel indexes blocks straight from
+    // the element id, so a short weight buffer would read out of bounds.
+    let expected_w = num_elements / 32 * 20;
+    let needed_out = num_elements * 2;
+    if num_elements % 32 != 0
+        || ct4_data.len() != expected_w
+        || f16_out.len() < needed_out
+        || u32::try_from(num_elements).is_err()
+    {
+        return Err(RuntimeError::Compute(format!(
+            "dequant_ct4_to_f16 {label}: shape mismatch: {num_elements} elements, \
+             weight {} bytes (expected {expected_w}), out {} bytes (need {needed_out})",
+            ct4_data.len(),
+            f16_out.len(),
+        )));
+    }
+    let config = LaunchConfig::for_elements(num_elements);
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (config.grid_dim, 1, 1),
+        block_dim: (config.block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n = num_elements as u32;
+    device
+        .stream
+        .launch_builder(dequant_fn)
+        .arg(ct4_data)
+        .arg(f16_out)
+        .arg(&n)
+        .launch(launch_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("dequant_ct4_to_f16 {label}: {e}")))?;
+    Ok(())
+}
+
 /// Per-row matvec dispatch for non-F32 fallback path.
 ///
 /// Dispatches the appropriate matvec kernel for a single row within a batched matrix,
@@ -2461,6 +2592,12 @@ unsafe fn launch_matvec_slice(
 
     match weight {
         GpuWeightBuf::F32(_) => unreachable!("F32 uses cuBLAS SGEMM path"),
+        GpuWeightBuf::Ct4Raw(_) => {
+            return Err(RuntimeError::Compute(format!(
+                "matvec_slice {label}: CtInt4G32 is served by the prefill \
+                 HGEMM path, not the per-row fallback"
+            )));
+        }
         GpuWeightBuf::F16Raw(w_f16) => {
             device
                 .stream
@@ -3076,6 +3213,12 @@ unsafe fn launch_matvec_residual_slice(
 
     match weight {
         GpuWeightBuf::F32(_) => unreachable!("F32 uses cuBLAS SGEMM path"),
+        GpuWeightBuf::Ct4Raw(_) => {
+            return Err(RuntimeError::Compute(format!(
+                "matvec_slice_residual {label}: CtInt4G32 is served by the \
+                 prefill HGEMM path, not the per-row fallback"
+            )));
+        }
         GpuWeightBuf::Q8Aligned(w_q8a) => {
             // Q8_0 aligned residual prefill: dp4a with native int* loads.
             use super::decode::{matvec_q8_0_grid, Q8_0_BLOCK_DIM};

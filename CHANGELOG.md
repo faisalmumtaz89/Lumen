@@ -7,6 +7,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Added
+
+- **Hugging Face compressed-tensors import** (`lumen convert --from-hf <dir>`):
+  converts pack-quantized INT4 group-32 checkpoints (dense qwen35-family
+  models, indexed sharded safetensors) to LBC as the new `CtInt4G32` scheme,
+  preserving every quantized value exactly. Served by new CUDA W4A8 dp4a
+  decode kernels (SM80+) with an F16-dequant prefill path;
+  `LUMEN_CUDA_CT4_DP4A=0` selects an F16 reference route. A donor GGUF of the
+  same model supplies tokenizer and hyperparameter metadata only.
+
+### Fixed
+
+- First token after prefill could be wrong for models whose output head is
+  served from a raw BF16 buffer (the host finalizer lacked a BF16 arm).
+- `<|endoftext|>` is now honored as an alternate end-of-sequence token when
+  the vocabulary marks it special, matching the model's declared generation
+  config.
+
 ## [0.10.0] — 2026-08-20
 
 ### Added
