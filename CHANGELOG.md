@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-08-21
+
 ### Added
 
 - **Hugging Face compressed-tensors import** (`lumen convert --from-hf <dir>`):
