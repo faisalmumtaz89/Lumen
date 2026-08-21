@@ -31,7 +31,7 @@ pub use header::{Endianness, GlobalTensorRange, LbcHeader, LBC_MAGIC, LBC_VERSIO
 pub use hyperparams::ModelHyperparams;
 pub use index::{ExpertSlice, LayerIndex, SubtensorOffsets, TensorSlice};
 pub use large_model::{generate_large_model, generate_large_model_f16, LargeModelConfig};
-pub use quantization::{QuantGroupSize, QuantScheme, QuantizationDescriptor};
+pub use quantization::{CtInt4G32Planes, QuantGroupSize, QuantScheme, QuantizationDescriptor};
 pub use reader::LbcFile;
 pub use streaming_writer::{LayerShape, StreamingLbcWriter};
 pub use tokenizer::TokenizerSection;

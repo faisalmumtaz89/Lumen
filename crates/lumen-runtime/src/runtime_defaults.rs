@@ -62,7 +62,7 @@ const HINT_QUANTISED: u8 = 2;
 
 /// Stores the EXACT **primary / bulk** model `QuantScheme` (the body
 /// attention+FFN weight scheme, `lbc.header.quantization.scheme`), via
-/// `QuantScheme::to_u8` (range 0..=11), so resolvers that must distinguish
+/// `QuantScheme::to_u8` (range 0..=12), so resolvers that must distinguish
 /// *within* the "quantised" bucket (e.g. Q4_0-vs-Q8_0 attention-precision
 /// tuning) can do so.
 ///
@@ -79,7 +79,7 @@ const HINT_QUANTISED: u8 = 2;
 /// `model_dense_quant()`; it NEVER feeds the coarse-hint resolvers, so they
 /// stay byte-identical. `255` = unset sentinel (no LBC opened, or a legacy
 /// caller that never invoked the setter) — can never collide with a real
-/// `to_u8` tag (max 11).
+/// `to_u8` tag (max 12).
 static MODEL_PRIMARY_QUANT_SCHEME: AtomicU8 = AtomicU8::new(QUANT_SCHEME_UNSET);
 
 const QUANT_SCHEME_UNSET: u8 = 255;
@@ -137,7 +137,8 @@ pub fn set_model_dense_quant(scheme: QuantScheme) {
         | QuantScheme::Q5_K
         | QuantScheme::Q6_K
         | QuantScheme::Q2_K
-        | QuantScheme::Q3_K => HINT_QUANTISED,
+        | QuantScheme::Q3_K
+        | QuantScheme::CtInt4G32 => HINT_QUANTISED,
         // F32/F16 → leave as legacy (HINT_UNSET == 0 means
         // "fall through to legacy default ON" in the resolvers).
         QuantScheme::F32 | QuantScheme::F16 => HINT_UNSET,
@@ -1265,6 +1266,67 @@ pub fn bf16_wo_nr1_enabled() -> bool {
     }
 }
 
+/// `LUMEN_CUDA_CT4_DP4A` (default ON): serve imported CtInt4G32 weights via
+/// the W4A8 dp4a decode kernel. `=0` dequantizes ALL of them to F16 at
+/// upload and serves the existing F16 routes instead (W4A16-style reference,
+/// ~3.2x the weight bytes). A comma-separated role list (e.g.
+/// `=ssm_out,attn_gate`) forces F16 for those roles only; unknown role
+/// names are a startup error. Naming any of wq/wk/wv selects all three:
+/// the attention QKV path dispatches the trio together, so a partial F16
+/// conversion there would mix incompatible routes.
+///
+/// `Ok(None)` = dp4a for everything (default); `Ok(Some(roles))` = force
+/// F16 for the named roles (`"*"` = all); `Err` = malformed value.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn ct4_f16_roles() -> Result<Option<Vec<String>>, String> {
+    match std::env::var("LUMEN_CUDA_CT4_DP4A") {
+        Ok(raw) => parse_ct4_f16_roles(&raw),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Pure parser behind [`ct4_f16_roles`] (separated for unit testing).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn parse_ct4_f16_roles(raw: &str) -> Result<Option<Vec<String>>, String> {
+    const ROLES: [&str; 9] = [
+        "wq",
+        "wk",
+        "wv",
+        "wo",
+        "w_gate",
+        "w_up",
+        "w_down",
+        "ssm_out",
+        "attn_gate",
+    ];
+    match raw.trim() {
+        "" | "1" => Ok(None),
+        "0" => Ok(Some(vec!["*".into()])),
+        v => {
+            let mut roles: Vec<String> = Vec::new();
+            for r in v.split(',').map(str::trim).filter(|r| !r.is_empty()) {
+                if !ROLES.contains(&r) {
+                    return Err(format!(
+                        "LUMEN_CUDA_CT4_DP4A: unknown role {r:?} (expected 0, 1, \
+                         or a comma-separated subset of {ROLES:?})"
+                    ));
+                }
+                if !roles.iter().any(|x| x == r) {
+                    roles.push(r.to_owned());
+                }
+            }
+            if roles.iter().any(|r| r == "wq" || r == "wk" || r == "wv") {
+                for qkv in ["wq", "wk", "wv"] {
+                    if !roles.iter().any(|x| x == qkv) {
+                        roles.push(qkv.to_owned());
+                    }
+                }
+            }
+            Ok(if roles.is_empty() { None } else { Some(roles) })
+        }
+    }
+}
+
 /// `LUMEN_CUDA_Q8_SPLIT_WO=1` (probe): clone the full-attention `wo` into its
 /// Q8 split sibling. Unlike the Q4 twin above, the Q8 residual-split route it
 /// enables (`matvec_q8_split_q8_1_mmvq_residual`) is the same kernel already
@@ -1534,6 +1596,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_BF16_MOE_V3",
     "LUMEN_CUDA_BF16_NR1",
     "LUMEN_CUDA_BF16_WO_NR1",
+    "LUMEN_CUDA_CT4_DP4A",
     "LUMEN_CUDA_DECODE_DELAY_US",
     "LUMEN_CUDA_DECODE_TILED",
     "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
@@ -1887,6 +1950,27 @@ mod tests {
     // serial-test mutex enforces that exactly one test at a time observes
     // the global state we toggle. The lock is taken FIRST in each test.
     static SERIAL: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn ct4_role_parsing() {
+        // Pure parser — no env access, no SERIAL lock needed.
+        assert_eq!(parse_ct4_f16_roles("").unwrap(), None);
+        assert_eq!(parse_ct4_f16_roles("1").unwrap(), None);
+        assert_eq!(parse_ct4_f16_roles(" 0 ").unwrap(), Some(vec!["*".into()]));
+        assert_eq!(
+            parse_ct4_f16_roles("ssm_out, w_down").unwrap(),
+            Some(vec!["ssm_out".into(), "w_down".into()])
+        );
+        // Naming any of q/k/v pulls in the whole trio (the QKV path
+        // dispatches all three together).
+        let qkv = parse_ct4_f16_roles("wk").unwrap().unwrap();
+        for role in ["wk", "wq", "wv"] {
+            assert!(qkv.iter().any(|r| r == role), "missing {role}");
+        }
+        // Typos and unknown roles are errors, not silent no-ops.
+        assert!(parse_ct4_f16_roles("w_dwon").is_err());
+        assert!(parse_ct4_f16_roles("false").is_err());
+    }
 
     #[test]
     fn server_default_decode_delay_is_50us() {
@@ -2809,6 +2893,7 @@ mod tests {
         "LUMEN_CUDA_BF16_MOE_V3",
         "LUMEN_CUDA_BF16_NR1",
         "LUMEN_CUDA_BF16_WO_NR1",
+        "LUMEN_CUDA_CT4_DP4A",
         "LUMEN_CUDA_DECODE_DELAY_US",
         "LUMEN_CUDA_DECODE_TILED",
         "LUMEN_CUDA_DECODE_TILED_THRESHOLD",

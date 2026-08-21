@@ -10,7 +10,8 @@ COMMANDS:
     run                   Run inference on a model (single-process; cold-loads every invocation)
     pull                  Download and convert a model from the registry
     models                List cached and available models
-    convert               Convert a GGUF model to LBC format
+    convert               Convert a GGUF model (or import an HF compressed-tensors
+                          checkpoint via --from-hf) to LBC format
     generate-test-model   Generate a synthetic model (LBC file)
     bench                 Run benchmarks (I/O, throughput, cold/warm)
     purge                 Evict a model file from the OS page cache
@@ -219,6 +220,14 @@ OPTIONS:
                          metal:   upcast K-quant layer tensors (Q2..Q6_K) to Q8_0
                                   (Metal has no K-quant dispatch kernels).
                          generic: keep K-quant layer tensors as-is (CUDA host).
-                         Default: metal on macOS, generic elsewhere."
+                         Default: metal on macOS, generic elsewhere.
+    --from-hf <dir>      Import a Hugging Face compressed-tensors checkpoint
+                         directory (pack-quantized INT4 group-32, indexed
+                         sharded safetensors; dense qwen35-family models).
+                         --input then names a donor GGUF of the same model,
+                         used only for tokenizer and hyperparameter metadata;
+                         all tensor data comes from the checkpoint. CUDA
+                         runtime only. Not combinable with --dequantize,
+                         --requant, or --target."
     );
 }

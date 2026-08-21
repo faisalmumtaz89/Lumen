@@ -1136,6 +1136,40 @@ pub(crate) fn run_inference(args: &[String]) {
         save_path: session_save_path.clone(),
     };
 
+    // CtInt4G32 has CUDA kernels only. Reject here — from the lightweight
+    // header/index, before any provider opens or multi-GB global expansion —
+    // so every run mode (async/sync/mmap, CPU/Metal) fails fast with the
+    // same message instead of misreading packed planes downstream. The scan
+    // covers per-tensor slices, not just the primary scheme.
+    {
+        let has_ct4 = lumen_format::reader::LbcFile::open(path)
+            .map(|lbc| lbc.uses_quant(QuantScheme::CtInt4G32))
+            .unwrap_or(false);
+        if has_ct4 {
+            if !cfg!(feature = "cuda") {
+                eprintln!(
+                    "Error: this model (CtInt4G32) requires a lumen build with the \
+                     `cuda` feature"
+                );
+                std::process::exit(1);
+            }
+            if !use_cuda {
+                eprintln!("Error: this model (CtInt4G32) requires the CUDA backend (--cuda)");
+                std::process::exit(1);
+            }
+            if use_async || !gpu_resident {
+                // Neither the async provider path nor streaming mode
+                // preloads GPU-resident weights, which Ct4 (GDN) decode
+                // requires.
+                eprintln!(
+                    "Error: CtInt4G32 models require GPU-resident preload; \
+                     --async / --no-gpu-resident / --streaming are not supported"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     if use_async {
         run_with_async(
             path,
@@ -1855,6 +1889,7 @@ fn create_cpu_or_metal_backend(
 ///   0 = auto-detect (all available cores), N = use exactly N threads.
 #[allow(clippy::too_many_arguments)]
 fn create_backend(
+    primary_quant: QuantScheme,
     use_simd: bool,
     #[allow(unused_variables)] use_metal: bool,
     #[allow(unused_variables)] use_cuda: bool,
@@ -1872,6 +1907,17 @@ fn create_backend(
     #[allow(unused_variables)] embedding_quant: QuantScheme,
     #[allow(unused_variables)] weight_tying: bool,
 ) -> Box<dyn ComputeBackend> {
+    // CtInt4G32 has CUDA kernels only; no other backend can serve the
+    // packed planes. (Belt-and-braces: the run dispatcher already rejects
+    // Ct4 for non-CUDA modes before any provider opens.)
+    #[allow(unused_variables)]
+    let is_ct4 = primary_quant == QuantScheme::CtInt4G32;
+    #[cfg(feature = "cuda")]
+    let is_ct4 = is_ct4 && !use_cuda;
+    if is_ct4 {
+        eprintln!("Error: this model (CtInt4G32) requires the CUDA backend (--cuda)");
+        std::process::exit(1);
+    }
     // Construct the concrete backend and box it. All subsequent setup goes
     // through the ComputeBackend trait, keeping the logic backend-agnostic.
     #[allow(unused_mut)]
@@ -2029,6 +2075,7 @@ fn run_with_async(
     hyperparams_capped.max_seq_len = max_seq_len as u32;
 
     let backend = create_backend(
+        provider.lbc().header.quantization.scheme,
         use_simd,
         use_metal,
         use_cuda,
@@ -2155,6 +2202,7 @@ fn run_with_sync(
     // flagged unused-mut without this allow. Mirrors `run_with_async`.
     #[allow(unused_mut)]
     let mut backend = create_backend(
+        provider.lbc().header.quantization.scheme,
         use_simd,
         use_metal,
         use_cuda,
@@ -2559,6 +2607,7 @@ fn run_with_mmap(
 
     #[allow(unused_mut)]
     let mut backend = create_backend(
+        provider.lbc().header.quantization.scheme,
         use_simd,
         use_metal,
         use_cuda,

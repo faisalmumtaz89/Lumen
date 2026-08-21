@@ -562,6 +562,7 @@ fn wire_global_tensors_and_raw(
     g: &WeightGlobals<'_>,
     skip_f32_when_raw: bool,
     accept_q6k_head: bool,
+    accept_bf16_head: bool,
 ) {
     // When a native-quant raw blob is present for a scheme the backend uploads
     // directly (Q8_0/Q4_0/F16), `init()` builds the GPU buffer straight from the
@@ -585,10 +586,16 @@ fn wire_global_tensors_and_raw(
     ) && !g.embedding_raw.is_empty();
     // Q6_K (source-fidelity head) is CUDA-only: the CUDA backend splits the
     // superblocks into dp4a planes; Metal/CPU have no Q6_K head kernel.
+    // Bf16 matches the CLI allow-list (run.rs): Metal and CUDA serve a raw
+    // BF16 head natively; leaving it out silently doubles the head's memory
+    // via the F32 fallback and skips the native BF16 dispatch. The CPU
+    // backend has no raw BF16 head path, so forwarding there would only
+    // clone a multi-GB buffer to discard it.
     let output_proj_has_raw = (matches!(
         g.output_proj_quant,
         QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16
-    ) || (accept_q6k_head && g.output_proj_quant == QuantScheme::Q6_K))
+    ) || (accept_bf16_head && g.output_proj_quant == QuantScheme::Bf16)
+        || (accept_q6k_head && g.output_proj_quant == QuantScheme::Q6_K))
         && !g.output_proj_raw.is_empty();
     backend.set_global_tensors(
         if skip_f32_when_raw && embedding_has_raw {
@@ -656,6 +663,19 @@ async fn run(args: Args) -> Result<(), String> {
     // Resolve the backend first — the weight-provider choice depends on it.
     let backend_choice = select_backend(args.backend);
     eprintln!("[lumen-server] backend: {backend_choice:?}");
+
+    // CtInt4G32 has CUDA kernels only; no other backend can serve the packed
+    // planes. Check the lightweight header/index HERE — per-tensor slices,
+    // not just the primary scheme — before the provider reads multi-GB
+    // weight data, so an unsupported combination fails fast instead of
+    // OOM-ing. A no-CUDA build fails here too, not after global expansion.
+    if lbc.uses_quant(lumen_format::quantization::QuantScheme::CtInt4G32)
+        && !(cfg!(feature = "cuda") && matches!(backend_choice, BackendChoice::Cuda))
+    {
+        return Err("this model (CtInt4G32) requires the CUDA backend \
+                    (a lumen-server build with the `cuda` feature)"
+            .into());
+    }
 
     // Provider selection: the Metal GPU-resident path defaults
     // to the zero-copy `MmapWeightProvider` so the no-copy unified-buffer path
@@ -766,7 +786,7 @@ async fn run(args: Args) -> Result<(), String> {
                     .map_err(|e| format!("Metal backend unavailable: {e}"))?;
                 // Metal: skip the unused F32 dequant when the native-quant raw
                 // is present — runtime-validated byte-identical (see fn doc).
-                wire_global_tensors_and_raw(&mut metal, &provider.globals(), true, false);
+                wire_global_tensors_and_raw(&mut metal, &provider.globals(), true, false, true);
                 metal
                     .init(&hyperparams_capped)
                     .map_err(|e| format!("Metal init: {e}"))?;
@@ -793,7 +813,7 @@ async fn run(args: Args) -> Result<(), String> {
                 // CUDA: keep the F32 dequant (skip=false) — byte-identical to
                 // the long-standing path until validated on real CUDA hardware
                 // (its embed_token CPU fallback still reads self.embedding).
-                wire_global_tensors_and_raw(&mut cuda, &provider.globals(), false, true);
+                wire_global_tensors_and_raw(&mut cuda, &provider.globals(), false, true, true);
                 cuda.init(&hyperparams_capped)
                     .map_err(|e| format!("CUDA init: {e}"))?;
                 cuda.preload_weights(provider.as_dyn())
@@ -811,7 +831,7 @@ async fn run(args: Args) -> Result<(), String> {
             let mut cpu = NaiveF32Backend::new();
             // CPU: keep the F32 dequant (skip=false) — the CPU backend reads it
             // directly and does not build a GPU buffer from the raw.
-            wire_global_tensors_and_raw(&mut cpu, &provider.globals(), false, false);
+            wire_global_tensors_and_raw(&mut cpu, &provider.globals(), false, false, false);
             cpu.init(&hyperparams_capped)
                 .map_err(|e| format!("CPU init: {e}"))?;
             (Box::new(cpu), KvPrecision::F32)

@@ -35,6 +35,24 @@ pub enum QuantScheme {
     Q2_K,
     /// 3-bit with per-group scales.
     Q3_K,
+    /// compressed-tensors "pack-quantized" INT4, group-32, asymmetric
+    /// (imported from HF safetensors checkpoints, e.g. AWQ/GPTQ-class
+    /// releases compressed with this format).
+    ///
+    /// A tensor slice with this scheme holds the three source planes
+    /// byte-for-byte, concatenated in fixed order with sizes derived from
+    /// the logical shape `[n, k]` (`k % 32 == 0`, zero-points 4-bit packed
+    /// along n):
+    ///
+    /// 1. `weight_packed`  — `n * k / 2` bytes (i32 words, 8 nibbles each,
+    ///    little-nibble-first along k; values unsigned 0..=15)
+    /// 2. `weight_scale`   — `n * (k / 32) * 2` bytes (BF16, one per group)
+    /// 3. `weight_zero_point` — `ceil(n / 8) * (k / 32) * 4` bytes (i32
+    ///    words packing 8 rows' 4-bit zero-points, little-nibble-first
+    ///    along n; unsigned 0..=15)
+    ///
+    /// Dequantization: `w = (q - zp) * scale` per 32-element group along k.
+    CtInt4G32,
 }
 
 /// Number of elements sharing a scale/zero-point.
@@ -73,6 +91,8 @@ impl QuantScheme {
             Self::Q6_K => 6.0,
             Self::Q2_K => 2.0,
             Self::Q3_K => 3.0,
+            // 4 (packed) + 16/32 (BF16 scale) + 4/32 (packed zero-point).
+            Self::CtInt4G32 => 4.625,
         }
     }
 
@@ -95,6 +115,7 @@ impl QuantScheme {
             Self::Q6_K => 9,
             Self::Q2_K => 10,
             Self::Q3_K => 11,
+            Self::CtInt4G32 => 12,
         }
     }
 
@@ -113,6 +134,7 @@ impl QuantScheme {
             9 => Ok(Self::Q6_K),
             10 => Ok(Self::Q2_K),
             11 => Ok(Self::Q3_K),
+            12 => Ok(Self::CtInt4G32),
             _ => Err(crate::FormatError::UnsupportedQuantization(format!(
                 "unknown quant scheme tag: {tag}"
             ))),
@@ -120,11 +142,59 @@ impl QuantScheme {
     }
 }
 
+/// Byte sizes of the three planes of a [`QuantScheme::CtInt4G32`] tensor
+/// slice for logical shape `[n, k]`, in their fixed slice order. The single
+/// source of truth for the plane derivation — the converter sizes writes
+/// with it and the runtime locates planes with it.
+///
+/// Requires `k % 32 == 0` (the group size); `n` may be any positive value
+/// (the zero-point plane rounds `n` up to a whole number of packed words).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CtInt4G32Planes {
+    pub qweight_bytes: u64,
+    pub scale_bytes: u64,
+    pub zero_point_bytes: u64,
+}
+
+impl CtInt4G32Planes {
+    pub fn for_shape(n: u64, k: u64) -> Result<Self, crate::FormatError> {
+        if n == 0 || k == 0 || k % 32 != 0 {
+            return Err(crate::FormatError::UnsupportedQuantization(format!(
+                "CtInt4G32 requires n > 0 and k % 32 == 0, got [{n}, {k}]"
+            )));
+        }
+        let groups = k / 32;
+        let overflow = || {
+            crate::FormatError::UnsupportedQuantization(format!(
+                "CtInt4G32 shape [{n}, {k}] overflows plane arithmetic"
+            ))
+        };
+        Ok(Self {
+            qweight_bytes: n.checked_mul(k).map(|v| v / 2).ok_or_else(overflow)?,
+            scale_bytes: n
+                .checked_mul(groups)
+                .and_then(|v| v.checked_mul(2))
+                .ok_or_else(overflow)?,
+            zero_point_bytes: n
+                .div_ceil(8)
+                .checked_mul(groups)
+                .and_then(|v| v.checked_mul(4))
+                .ok_or_else(overflow)?,
+        })
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        // Cannot overflow: each plane is at most n*k/2 bytes and for_shape
+        // already rejected shapes whose products exceed u64.
+        self.qweight_bytes + self.scale_bytes + self.zero_point_bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ALL_SCHEMES: [QuantScheme; 12] = [
+    const ALL_SCHEMES: [QuantScheme; 13] = [
         QuantScheme::F32,
         QuantScheme::F16,
         QuantScheme::Bf16,
@@ -137,6 +207,7 @@ mod tests {
         QuantScheme::Q6_K,
         QuantScheme::Q2_K,
         QuantScheme::Q3_K,
+        QuantScheme::CtInt4G32,
     ];
 
     #[test]
@@ -150,13 +221,48 @@ mod tests {
 
     #[test]
     fn invalid_tags_return_error() {
-        assert!(QuantScheme::from_u8(12).is_err());
+        assert!(QuantScheme::from_u8(13).is_err());
         assert!(QuantScheme::from_u8(255).is_err());
     }
 
     #[test]
+    fn ct_int4_g32_planes_match_source_checkpoint_shapes() {
+        // Plane sizes must equal the safetensors plane byte sizes of real
+        // pack-quantized checkpoints (Qwen3.8-27B: down_proj [5120, 17408]
+        // stores qweight i32[5120, 2176], scale bf16[5120, 544],
+        // zero_point i32[640, 544]; gate_proj is the transpose case).
+        let p = CtInt4G32Planes::for_shape(5120, 17408).unwrap();
+        assert_eq!(p.qweight_bytes, 44_564_480);
+        assert_eq!(p.scale_bytes, 5_570_560);
+        assert_eq!(p.zero_point_bytes, 1_392_640);
+        assert_eq!(p.total_bytes(), 44_564_480 + 5_570_560 + 1_392_640);
+
+        let p = CtInt4G32Planes::for_shape(17408, 5120).unwrap();
+        assert_eq!(p.qweight_bytes, 44_564_480);
+        assert_eq!(p.scale_bytes, 5_570_560);
+        assert_eq!(p.zero_point_bytes, 1_392_640);
+    }
+
+    #[test]
+    fn ct_int4_g32_planes_round_up_zero_point_rows() {
+        // n not divisible by 8: the zero-point plane packs 8 rows per i32
+        // word, so 9 rows need 2 words per group.
+        let p = CtInt4G32Planes::for_shape(9, 64).unwrap();
+        assert_eq!(p.qweight_bytes, 9 * 64 / 2);
+        assert_eq!(p.scale_bytes, 9 * 2 * 2);
+        assert_eq!(p.zero_point_bytes, 2 * 2 * 4);
+    }
+
+    #[test]
+    fn ct_int4_g32_planes_reject_bad_shapes() {
+        assert!(CtInt4G32Planes::for_shape(0, 64).is_err());
+        assert!(CtInt4G32Planes::for_shape(16, 0).is_err());
+        assert!(CtInt4G32Planes::for_shape(16, 48).is_err());
+    }
+
+    #[test]
     fn bits_per_weight_correctness() {
-        let expected: [(QuantScheme, f32); 12] = [
+        let expected: [(QuantScheme, f32); 13] = [
             (QuantScheme::F32, 32.0),
             (QuantScheme::F16, 16.0),
             (QuantScheme::Bf16, 16.0),
@@ -169,6 +275,9 @@ mod tests {
             (QuantScheme::Q6_K, 6.0),
             (QuantScheme::Q2_K, 2.0),
             (QuantScheme::Q3_K, 3.0),
+            // Effective density including scale + zero-point metadata
+            // (4 payload bits + 0.5 scale + 0.125 zero-point per weight).
+            (QuantScheme::CtInt4G32, 4.625),
         ];
         for (scheme, bits) in expected {
             assert_eq!(
@@ -196,5 +305,6 @@ mod tests {
         assert!(QuantScheme::Q6_K.is_quantized());
         assert!(QuantScheme::Q2_K.is_quantized());
         assert!(QuantScheme::Q3_K.is_quantized());
+        assert!(QuantScheme::CtInt4G32.is_quantized());
     }
 }

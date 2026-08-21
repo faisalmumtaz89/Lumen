@@ -24,6 +24,7 @@ Benchmarked on an A100-80GB (27B-class BF16 cells on H100 — sm_80 routes BF16 
 | Qwen3.8-27B dense | Q8_0 | Production-ready | **1.02× llama.cpp** | All quality gates pristine + DET-001 50/50 (2026-08-14, A100; llama.cpp b10032 co-located, same GGUF) |
 | Qwen3.8-27B dense | Q4_0 | Production-ready | 0.93× llama.cpp | All quality gates pristine + DET-001 50/50 (2026-08-14, A100) |
 | Qwen3.8-27B dense | BF16 | Production-ready (H100 / sm_90) | 0.87× llama.cpp | All quality gates pass + DET-001 50/50 (2026-08-14, H100 — sm_90 native BF16). Known issue: a deterministic stray first token at BF16, shared with Qwen3.6-27B BF16 (tracked prefill-numerics issue) |
+| Qwen3.8-27B dense | CtInt4G32 (HF import) | Production-ready, compatibility cell (SM80+) | — (no llama.cpp equivalent format) | Serves the community compressed-tensors INT4 g32 checkpoint byte-exactly (`lumen convert --from-hf`); quality + DET-001 50/50 verified on A100. W4A8 dp4a route — slower than engines with W4A16 4-bit kernels on the same bytes |
 
 ### Metal (Apple Silicon, M-series)
 

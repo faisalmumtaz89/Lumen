@@ -793,6 +793,7 @@ name = "lumen-convert"
 version = "0.10.0"
 dependencies = [
  "lumen-format",
+ "serde_json",
 ]
 
 [[package]]
