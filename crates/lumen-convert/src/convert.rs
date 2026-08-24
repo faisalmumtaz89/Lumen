@@ -197,10 +197,11 @@ impl From<lumen_format::FormatError> for ConvertError {
 /// Auto-detects multi-shard GGUFs by parsing the filename for the
 /// `*-NNNNN-of-MMMMM.gguf` pattern. For a single-file GGUF the conversion is
 /// byte-identical to the legacy path. For a multi-shard GGUF, all sibling
-/// shards in the same directory are discovered, validated (consistent
-/// `split.count`, contiguous `split.no`, no tensor-name collisions, matching
-/// GGUF version + alignment), and presented as a single merged view to the
-/// downstream pipeline.
+/// shards in the same directory are discovered, validated (agreeing non-zero
+/// `split.count` declarations — a zero is the merge tool's "no longer split"
+/// marker, not a claim — contiguous `split.no`, no tensor-name collisions,
+/// matching GGUF version + alignment), and presented as a single merged view
+/// to the downstream pipeline.
 ///
 /// Reads the GGUF header and metadata to extract model hyperparameters, then
 /// streams tensor data layer-by-layer to produce the LBC file. Peak memory
