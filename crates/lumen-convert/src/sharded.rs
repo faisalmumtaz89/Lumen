@@ -526,7 +526,9 @@ fn read_u16_metadata(file: &GgufFile, key: &str) -> Option<u16> {
 }
 
 /// Verify the shard set is well-formed:
-///   - all shards declare the same `split.count` (if any of them declare it),
+///   - every shard declaring a non-zero `split.count` agrees on it (a zero
+///     declaration is the reference merge tool's "no longer split" marker,
+///     never a claim of zero shards),
 ///   - the `split.no` values are exactly {0, 1, ..., N-1},
 ///   - GGUF version is the same across shards,
 ///   - alignment is the same across shards.
@@ -537,7 +539,16 @@ fn validate_shards(specs: &[ShardSpec]) -> Result<(), ShardError> {
 
     let first_version = specs[0].file.version;
     let first_alignment = specs[0].file.alignment;
-    let declared_count = read_u16_metadata(&specs[0].file, SPLIT_COUNT_KEY);
+    // `split.count = 0` is the reference `llama-gguf-split --merge` tool's
+    // marker for "merged, no longer split" (the split.* keys survive the merge
+    // with count zeroed; upstream writes it under `i_split == 0`). A zero is
+    // "no claim", never a claim of 0 shards — so the authoritative declared
+    // count is the FIRST NON-ZERO declaration across the set, not shard 0's
+    // raw value: a zeroed shard 0 must not disable the sibling checks below
+    // (a sibling honestly declaring 3 shards still refuses a 2-file set).
+    let declared_count = specs
+        .iter()
+        .find_map(|s| read_u16_metadata(&s.file, SPLIT_COUNT_KEY).filter(|&count| count > 0));
 
     for spec in specs.iter().skip(1) {
         if spec.file.version != first_version {
@@ -990,6 +1001,100 @@ mod tests {
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(values, vec![1.0; 16]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn open_merged_file_with_zeroed_split_count() {
+        // `llama-gguf-split --merge` output: a single file that still carries
+        // the split.* keys with `split.count = 0` ("no longer split"). Must
+        // open as a plain 1-shard view, not error with MissingShards.
+        let dir = temp_dir();
+        let mut b = GgufBuilder::new();
+        b.add_string("general.architecture", "qwen35");
+        b.add_u32("qwen35.block_count", 1);
+        b.add_u16("split.no", 0);
+        b.add_u16("split.count", 0);
+        b.add_i32("split.tensors.count", 1);
+        b.add_f32_tensor("token_embd.weight", &[4, 4], &[2.0; 16]);
+        let p = dir.join("model-merged.gguf");
+        std::fs::write(&p, b.build()).unwrap();
+
+        let sharded = ShardedGguf::open(&p).unwrap();
+        assert_eq!(sharded.shard_count(), 1);
+        let m = sharded.merged();
+        assert_eq!(m.tensors.len(), 1);
+
+        let t = m.find_tensor("token_embd.weight").unwrap().clone();
+        let data = sharded.read_tensor_data(&t).unwrap();
+        let values: Vec<f32> = data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, vec![2.0; 16]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn zeroed_shard0_count_does_not_disable_sibling_validation() {
+        // Shard 0 declares split.count=0 while its sibling honestly declares 3:
+        // the zero is "no claim", so the sibling's claim governs and the 2-file
+        // set must refuse as incomplete — never open as a truncated model.
+        let dir = temp_dir();
+        let mut b1 = GgufBuilder::new();
+        b1.add_string("general.architecture", "qwen35");
+        b1.add_u16("split.no", 0);
+        b1.add_u16("split.count", 0);
+        b1.add_f32_tensor("token_embd.weight", &[4, 4], &[1.0; 16]);
+        let p1 = dir.join(make_shard_filename("trunc", 1, 2));
+        std::fs::write(&p1, b1.build()).unwrap();
+        let mut b2 = GgufBuilder::new();
+        b2.add_string("general.architecture", "qwen35");
+        b2.add_u16("split.no", 1);
+        b2.add_u16("split.count", 3);
+        b2.add_f32_tensor("blk.0.attn_q.weight", &[4, 4], &[1.0; 16]);
+        let p2 = dir.join(make_shard_filename("trunc", 2, 2));
+        std::fs::write(&p2, b2.build()).unwrap();
+
+        let err = ShardedGguf::open(&p1).unwrap_err();
+        match err {
+            ShardError::MissingShards {
+                expected, present, ..
+            } => {
+                assert_eq!(expected, 3);
+                assert_eq!(present, 2);
+            }
+            other => panic!("expected MissingShards, got {other}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn declared_count_exceeding_present_set_errors_in_validate() {
+        // Both files exist (filename discovery is satisfied) but both declare
+        // split.count=3 — the declared-vs-present guard in validate_shards
+        // itself must refuse.
+        let dir = temp_dir();
+        for (name, no) in [("token_embd.weight", 0u16), ("blk.0.attn_q.weight", 1u16)] {
+            let mut b = GgufBuilder::new();
+            b.add_string("general.architecture", "qwen35");
+            b.add_u16("split.no", no);
+            b.add_u16("split.count", 3);
+            b.add_f32_tensor(name, &[4, 4], &[1.0; 16]);
+            let p = dir.join(make_shard_filename("overclaim", u32::from(no) + 1, 2));
+            std::fs::write(&p, b.build()).unwrap();
+        }
+        let p1 = dir.join(make_shard_filename("overclaim", 1, 2));
+        let err = ShardedGguf::open(&p1).unwrap_err();
+        match err {
+            ShardError::MissingShards {
+                expected, present, ..
+            } => {
+                assert_eq!(expected, 3);
+                assert_eq!(present, 2);
+            }
+            other => panic!("expected MissingShards, got {other}"),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
