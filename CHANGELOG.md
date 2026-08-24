@@ -7,6 +7,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-08-24
+
+### Fixed
+
+- Merged GGUFs produced by `llama-gguf-split --merge` (which retain the
+  `split.*` metadata keys with `split.count = 0`) are now accepted: a zero
+  declaration is the merge tool's "no longer split" marker, not a claim of
+  zero shards. The authoritative declared count is the first non-zero
+  declaration across the set, so a zeroed shard 0 cannot disable the
+  sibling-count checks on multi-file shard sets.
+
 ## [0.11.0] — 2026-08-21
 
 ### Added
@@ -337,7 +348,9 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.10.0...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/faisalmumtaz89/Lumen/compare/v0.11.0...v0.11.1
+[0.11.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.7.0...v0.8.0
