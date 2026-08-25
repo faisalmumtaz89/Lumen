@@ -1266,15 +1266,15 @@ pub fn bf16_wo_nr1_enabled() -> bool {
     }
 }
 
-/// `LUMEN_CUDA_CT4_EXACTK` (default OFF): launch the CtInt4G32 decode matvec
-/// with a block size matched to the reduction depth instead of the fixed 256.
-/// The K=5120 / K=6144 projection shapes have only 160 / 192 g32 blocks per
-/// row, so at 256 threads 37.5% / 25% of every CTA's warps hold no work; the
-/// exact-K kernels (160 / 192 threads, reduction folding a zero-padded
-/// 8-slot array) remove those idle warps with bit-identical output.
-/// K=17408 (FFN down) keeps the 256-thread kernel.
+/// `LUMEN_CUDA_CT4_EXACTK` (default ON; `=0` opts out): launch the CtInt4G32
+/// decode matvec with a block size matched to the reduction depth instead of
+/// the fixed 256. The K=5120 / K=6144 projection shapes have only 160 / 192
+/// g32 blocks per row, so at 256 threads 37.5% / 25% of every CTA's warps
+/// hold no work; the exact-K kernels (160 / 192 threads, reduction folding a
+/// zero-padded 8-slot array) remove those idle warps with bit-identical
+/// output. K=17408 (FFN down) keeps the 256-thread kernel.
 fn parse_ct4_exactk(raw: Result<String, std::env::VarError>) -> bool {
-    matches!(raw, Ok(v) if v.trim() == "1")
+    !matches!(raw, Ok(v) if v.trim() == "0")
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -2808,19 +2808,17 @@ mod tests {
 
     #[test]
     fn ct4_exactk_parses_strict_one_only() {
-        // LUMEN_CUDA_CT4_EXACTK is strictly `=1` (default OFF): serialized
-        // booleans like "false"/"no" and any other value must stay OFF.
+        // LUMEN_CUDA_CT4_EXACTK is default ON with a strict `=0` escape hatch:
+        // only an explicit `0` (whitespace-tolerant) disables the shipping
+        // exact-K route; unset, empty, and any other value stay ON.
         use std::env::VarError;
         for (raw, want) in [
-            (Err(VarError::NotPresent), false),
-            (Ok(String::new()), false),
+            (Err(VarError::NotPresent), true),
+            (Ok(String::new()), true),
             (Ok("0".into()), false),
             (Ok(" 0 ".into()), false),
-            (Ok("off".into()), false),
-            (Ok("false".into()), false),
-            (Ok("no".into()), false),
-            (Ok("2".into()), false),
-            (Ok("true".into()), false),
+            (Ok("off".into()), true),
+            (Ok("false".into()), true),
             (Ok("1".into()), true),
             (Ok(" 1 ".into()), true),
         ] {
