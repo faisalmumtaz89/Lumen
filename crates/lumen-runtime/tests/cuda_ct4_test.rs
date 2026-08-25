@@ -268,6 +268,71 @@ fn run_case(out_dim: usize, in_dim: usize, seed: u64, with_residual: bool) {
     }
 }
 
+/// Exact-K variants (LUMEN_CUDA_CT4_EXACTK): the 160-/192-thread kernels must
+/// produce BITWISE-identical output to the 256-thread kernel on their target
+/// shapes (nb == TPB, zero-padded 8-slot fold).
+fn run_exactk_bitwise_case(out_dim: usize, in_dim: usize, tpb: u32, seed: u64) {
+    let (ctx, stream) = create_context();
+    let src = lumen_runtime::cuda::shaders::MATVEC_CT4_G32_KERNEL_SOURCE;
+    let ptx = compile_ptx(src).expect("NVRTC compile failed for matvec_ct4_g32.cu");
+    let module = ctx.load_module(ptx).expect("Failed to load ct4 module");
+    let legacy = module.load_function("matvec_ct4_q8_1").unwrap();
+    let exact = module
+        .load_function(&format!("matvec_ct4_q8_1_t{tpb}"))
+        .unwrap();
+
+    let blocks = random_blocks(out_dim, in_dim, seed);
+    let weight_bytes: Vec<u8> = blocks.iter().flat_map(|b| b.to_bytes()).collect();
+    let mut s = seed ^ 0x9e37;
+    let x: Vec<f32> = (0..in_dim)
+        .map(|_| ((rng_next(&mut s) % 512) as f32 - 256.0) / 256.0)
+        .collect();
+    let q8_1 = quantize_q8_1(&x);
+
+    let w_gpu = stream.clone_htod(&weight_bytes).unwrap();
+    let x_gpu = stream.clone_htod(&q8_1).unwrap();
+    let out_u32 = out_dim as u32;
+    let in_u32 = in_dim as u32;
+    let mut outs: Vec<Vec<f32>> = Vec::new();
+    for (f, threads) in [(&legacy, 256u32), (&exact, tpb)] {
+        let mut out_gpu: CudaSlice<f32> = stream.alloc_zeros(out_dim).unwrap();
+        let cfg = LaunchConfig {
+            grid_dim: (out_dim as u32, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(f)
+                .arg(&w_gpu)
+                .arg(&x_gpu)
+                .arg(&mut out_gpu)
+                .arg(&out_u32)
+                .arg(&in_u32)
+                .launch(cfg)
+                .unwrap();
+        }
+        outs.push(stream.clone_dtoh(&out_gpu).unwrap());
+    }
+    for (i, (a, b)) in outs[0].iter().zip(&outs[1]).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "row {i}: t{tpb} {b} != legacy {a} (out_dim={out_dim}, in_dim={in_dim})"
+        );
+    }
+}
+
+#[test]
+fn test_ct4_exactk_t160_bitwise_k5120() {
+    run_exactk_bitwise_case(64, 5120, 160, 11);
+}
+
+#[test]
+fn test_ct4_exactk_t192_bitwise_k6144() {
+    run_exactk_bitwise_case(64, 6144, 192, 12);
+}
+
 #[test]
 fn test_ct4_matvec_small() {
     run_case(4, 32, 1, false);

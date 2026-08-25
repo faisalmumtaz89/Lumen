@@ -1529,6 +1529,16 @@ fn v4load_census() {
 }
 
 /// One-time verbose marker proving the 160-thread variant dispatched.
+fn ct4_exactk_census() {
+    static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SHOWN.load(std::sync::atomic::Ordering::Relaxed)
+        && !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed)
+        && super::decode::cuda_verbose()
+    {
+        eprintln!("[CT4-EXACTK] exact-K CT4 variant ACTIVE (nb=160/192 shapes)");
+    }
+}
+
 fn b160_census() {
     static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     // Load-only fast path: after the first call this is a relaxed load, not
@@ -11200,11 +11210,31 @@ unsafe fn launch_matvec(
             )));
         }
         launch_quantize_input_q8_1(device, quant_fn, input, q8_1_buf, in_dim, label)?;
+        // LUMEN_CUDA_CT4_EXACTK: K=5120/6144 rows have 160/192 g32 blocks —
+        // the exact-K kernels drop the wholly idle warps (bit-identical
+        // reduction, zero-padded 8-slot fold). K=17408 stays on 256.
+        let (mv_fn, tpb) = match (crate::runtime_defaults::ct4_exactk(), in_dim) {
+            (true, 5120) => match kernels.matvec_ct4_t160.as_ref() {
+                Some(f) => {
+                    ct4_exactk_census();
+                    (f, 160)
+                }
+                None => (mv_fn, 256),
+            },
+            (true, 6144) => match kernels.matvec_ct4_t192.as_ref() {
+                Some(f) => {
+                    ct4_exactk_census();
+                    (f, 192)
+                }
+                None => (mv_fn, 256),
+            },
+            _ => (mv_fn, 256),
+        };
         let out_dim_u32 = out_dim as u32;
         let in_dim_u32 = in_dim as u32;
         let launch_cfg = CudarcLaunchConfig {
             grid_dim: (out_dim_u32, 1, 1),
-            block_dim: (256, 1, 1),
+            block_dim: (tpb, 1, 1),
             shared_mem_bytes: 0,
         };
         device
@@ -11870,11 +11900,29 @@ unsafe fn launch_matvec_residual(
             )));
         }
         launch_quantize_input_q8_1(device, quant_fn, input, q8_1_buf, in_dim, label)?;
+        // LUMEN_CUDA_CT4_EXACTK — same selection as the non-residual site.
+        let (mv_fn, tpb) = match (crate::runtime_defaults::ct4_exactk(), in_dim) {
+            (true, 5120) => match kernels.matvec_ct4_residual_t160.as_ref() {
+                Some(f) => {
+                    ct4_exactk_census();
+                    (f, 160)
+                }
+                None => (mv_fn, 256),
+            },
+            (true, 6144) => match kernels.matvec_ct4_residual_t192.as_ref() {
+                Some(f) => {
+                    ct4_exactk_census();
+                    (f, 192)
+                }
+                None => (mv_fn, 256),
+            },
+            _ => (mv_fn, 256),
+        };
         let out_dim_u32 = out_dim as u32;
         let in_dim_u32 = in_dim as u32;
         let launch_cfg = CudarcLaunchConfig {
             grid_dim: (out_dim_u32, 1, 1),
-            block_dim: (256, 1, 1),
+            block_dim: (tpb, 1, 1),
             shared_mem_bytes: 0,
         };
         device
