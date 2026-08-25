@@ -1266,6 +1266,23 @@ pub fn bf16_wo_nr1_enabled() -> bool {
     }
 }
 
+/// `LUMEN_CUDA_CT4_EXACTK` (default OFF): launch the CtInt4G32 decode matvec
+/// with a block size matched to the reduction depth instead of the fixed 256.
+/// The K=5120 / K=6144 projection shapes have only 160 / 192 g32 blocks per
+/// row, so at 256 threads 37.5% / 25% of every CTA's warps hold no work; the
+/// exact-K kernels (160 / 192 threads, reduction folding a zero-padded
+/// 8-slot array) remove those idle warps with bit-identical output.
+/// K=17408 (FFN down) keeps the 256-thread kernel.
+fn parse_ct4_exactk(raw: Result<String, std::env::VarError>) -> bool {
+    matches!(raw, Ok(v) if v.trim() == "1")
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn ct4_exactk() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| parse_ct4_exactk(std::env::var("LUMEN_CUDA_CT4_EXACTK")))
+}
+
 /// `LUMEN_CUDA_CT4_DP4A` (default ON): serve imported CtInt4G32 weights via
 /// the W4A8 dp4a decode kernel. `=0` dequantizes ALL of them to F16 at
 /// upload and serves the existing F16 routes instead (W4A16-style reference,
@@ -1597,6 +1614,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_BF16_NR1",
     "LUMEN_CUDA_BF16_WO_NR1",
     "LUMEN_CUDA_CT4_DP4A",
+    "LUMEN_CUDA_CT4_EXACTK",
     "LUMEN_CUDA_DECODE_DELAY_US",
     "LUMEN_CUDA_DECODE_TILED",
     "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
@@ -2789,6 +2807,28 @@ mod tests {
     // ---- F1 + F2: allowlist membership (no false unknown-env typo warning) ----
 
     #[test]
+    fn ct4_exactk_parses_strict_one_only() {
+        // LUMEN_CUDA_CT4_EXACTK is strictly `=1` (default OFF): serialized
+        // booleans like "false"/"no" and any other value must stay OFF.
+        use std::env::VarError;
+        for (raw, want) in [
+            (Err(VarError::NotPresent), false),
+            (Ok(String::new()), false),
+            (Ok("0".into()), false),
+            (Ok(" 0 ".into()), false),
+            (Ok("off".into()), false),
+            (Ok("false".into()), false),
+            (Ok("no".into()), false),
+            (Ok("2".into()), false),
+            (Ok("true".into()), false),
+            (Ok("1".into()), true),
+            (Ok(" 1 ".into()), true),
+        ] {
+            assert_eq!(parse_ct4_exactk(raw.clone()), want, "raw={raw:?}");
+        }
+    }
+
+    #[test]
     fn newly_documented_env_vars_are_in_allowlist_and_do_not_warn() {
         let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -2894,6 +2934,7 @@ mod tests {
         "LUMEN_CUDA_BF16_NR1",
         "LUMEN_CUDA_BF16_WO_NR1",
         "LUMEN_CUDA_CT4_DP4A",
+        "LUMEN_CUDA_CT4_EXACTK",
         "LUMEN_CUDA_DECODE_DELAY_US",
         "LUMEN_CUDA_DECODE_TILED",
         "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
