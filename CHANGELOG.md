@@ -7,6 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-08-25
+
+### Changed
+
+- `LUMEN_CUDA_CT4_EXACTK` is now **on by default** — the exact-K CtInt4G32
+  decode launch (bit-identical, measured +11.3% decode on Qwen3.8-27B ct4)
+  ships as the standard route. An explicit `LUMEN_CUDA_CT4_EXACTK=0` restores
+  the fixed-256 launch.
+
 ## [0.12.0] — 2026-08-25
 
 ### Added
@@ -361,7 +370,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.12.0...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/faisalmumtaz89/Lumen/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/faisalmumtaz89/Lumen/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.10.0...v0.11.0
