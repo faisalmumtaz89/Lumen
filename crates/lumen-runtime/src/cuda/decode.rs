@@ -576,6 +576,10 @@ pub(crate) struct KernelSet {
     /// dequant used by the prefill HGEMM path.
     pub(crate) matvec_ct4: Option<CudaFunction>,
     pub(crate) matvec_ct4_residual: Option<CudaFunction>,
+    pub(crate) matvec_ct4_t160: Option<CudaFunction>,
+    pub(crate) matvec_ct4_t192: Option<CudaFunction>,
+    pub(crate) matvec_ct4_residual_t160: Option<CudaFunction>,
+    pub(crate) matvec_ct4_residual_t192: Option<CudaFunction>,
     pub(crate) dequant_ct4_to_f16: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr8: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr16: Option<CudaFunction>,
@@ -2168,6 +2172,58 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] matvec_ct4_residual: FAILED: {e}");
+                None
+            }
+        },
+        matvec_ct4_t160: match load_fn_sm80_fast_math(
+            shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
+            "matvec_ct4_q8_1_t160",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_ct4_t160: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_ct4_t160: FAILED: {e}");
+                None
+            }
+        },
+        matvec_ct4_t192: match load_fn_sm80_fast_math(
+            shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
+            "matvec_ct4_q8_1_t192",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_ct4_t192: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_ct4_t192: FAILED: {e}");
+                None
+            }
+        },
+        matvec_ct4_residual_t160: match load_fn_sm80_fast_math(
+            shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
+            "matvec_ct4_q8_1_residual_t160",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_ct4_residual_t160: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_ct4_residual_t160: FAILED: {e}");
+                None
+            }
+        },
+        matvec_ct4_residual_t192: match load_fn_sm80_fast_math(
+            shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
+            "matvec_ct4_q8_1_residual_t192",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_ct4_residual_t192: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_ct4_residual_t192: FAILED: {e}");
                 None
             }
         },

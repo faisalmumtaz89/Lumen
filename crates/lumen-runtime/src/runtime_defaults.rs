@@ -1266,6 +1266,21 @@ pub fn bf16_wo_nr1_enabled() -> bool {
     }
 }
 
+/// `LUMEN_CUDA_CT4_EXACTK` (default OFF): launch the CtInt4G32 decode matvec
+/// with a block size matched to the reduction depth instead of the fixed 256.
+/// The K=5120 / K=6144 projection shapes have only 160 / 192 g32 blocks per
+/// row, so at 256 threads 37.5% / 25% of every CTA's warps hold no work; the
+/// exact-K kernels (160 / 192 threads, reduction folding a zero-padded
+/// 8-slot array) remove those idle warps with bit-identical output.
+/// K=17408 (FFN down) keeps the 256-thread kernel.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn ct4_exactk() -> bool {
+    std::env::var("LUMEN_CUDA_CT4_EXACTK").is_ok_and(|v| {
+        let t = v.trim();
+        !(t.is_empty() || t == "0" || t.eq_ignore_ascii_case("off"))
+    })
+}
+
 /// `LUMEN_CUDA_CT4_DP4A` (default ON): serve imported CtInt4G32 weights via
 /// the W4A8 dp4a decode kernel. `=0` dequantizes ALL of them to F16 at
 /// upload and serves the existing F16 routes instead (W4A16-style reference,
@@ -1597,6 +1612,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_BF16_NR1",
     "LUMEN_CUDA_BF16_WO_NR1",
     "LUMEN_CUDA_CT4_DP4A",
+    "LUMEN_CUDA_CT4_EXACTK",
     "LUMEN_CUDA_DECODE_DELAY_US",
     "LUMEN_CUDA_DECODE_TILED",
     "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
@@ -2894,6 +2910,7 @@ mod tests {
         "LUMEN_CUDA_BF16_NR1",
         "LUMEN_CUDA_BF16_WO_NR1",
         "LUMEN_CUDA_CT4_DP4A",
+        "LUMEN_CUDA_CT4_EXACTK",
         "LUMEN_CUDA_DECODE_DELAY_US",
         "LUMEN_CUDA_DECODE_TILED",
         "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
