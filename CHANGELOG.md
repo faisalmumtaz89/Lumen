@@ -7,6 +7,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-08-25
+
+### Added
+
+- **`LUMEN_CUDA_CT4_EXACTK`** (default OFF): exact-K launch geometry for the
+  CtInt4G32 decode matvec. The K=5120 / K=6144 projection shapes carry only
+  160 / 192 g32 blocks per row, so the fixed 256-thread kernel idled 37.5% /
+  25% of every CTA's warps; with the flag set those shapes launch 160- /
+  192-thread kernels whose reduction folds a zero-padded 8-slot array —
+  bit-identical output (greedy decode byte-identical to the v0.11.0 release
+  anchor), measured **+11.3% decode** on Qwen3.8-27B CtInt4G32 (A100,
+  50.5 → 56.7 tok/s). K=17408 keeps the 256-thread kernel.
+
 ## [0.11.1] — 2026-08-24
 
 ### Fixed
@@ -348,7 +361,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.11.1...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/faisalmumtaz89/Lumen/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.9.0...v0.10.0
