@@ -1273,12 +1273,14 @@ pub fn bf16_wo_nr1_enabled() -> bool {
 /// exact-K kernels (160 / 192 threads, reduction folding a zero-padded
 /// 8-slot array) remove those idle warps with bit-identical output.
 /// K=17408 (FFN down) keeps the 256-thread kernel.
+fn parse_ct4_exactk(raw: Result<String, std::env::VarError>) -> bool {
+    matches!(raw, Ok(v) if v.trim() == "1")
+}
+
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn ct4_exactk() -> bool {
-    std::env::var("LUMEN_CUDA_CT4_EXACTK").is_ok_and(|v| {
-        let t = v.trim();
-        !(t.is_empty() || t == "0" || t.eq_ignore_ascii_case("off"))
-    })
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| parse_ct4_exactk(std::env::var("LUMEN_CUDA_CT4_EXACTK")))
 }
 
 /// `LUMEN_CUDA_CT4_DP4A` (default ON): serve imported CtInt4G32 weights via
@@ -2803,6 +2805,28 @@ mod tests {
     }
 
     // ---- F1 + F2: allowlist membership (no false unknown-env typo warning) ----
+
+    #[test]
+    fn ct4_exactk_parses_strict_one_only() {
+        // LUMEN_CUDA_CT4_EXACTK is strictly `=1` (default OFF): serialized
+        // booleans like "false"/"no" and any other value must stay OFF.
+        use std::env::VarError;
+        for (raw, want) in [
+            (Err(VarError::NotPresent), false),
+            (Ok(String::new()), false),
+            (Ok("0".into()), false),
+            (Ok(" 0 ".into()), false),
+            (Ok("off".into()), false),
+            (Ok("false".into()), false),
+            (Ok("no".into()), false),
+            (Ok("2".into()), false),
+            (Ok("true".into()), false),
+            (Ok("1".into()), true),
+            (Ok(" 1 ".into()), true),
+        ] {
+            assert_eq!(parse_ct4_exactk(raw.clone()), want, "raw={raw:?}");
+        }
+    }
 
     #[test]
     fn newly_documented_env_vars_are_in_allowlist_and_do_not_warn() {

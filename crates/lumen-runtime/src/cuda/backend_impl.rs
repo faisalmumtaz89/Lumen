@@ -1529,6 +1529,16 @@ fn v4load_census() {
 }
 
 /// One-time verbose marker proving the 160-thread variant dispatched.
+fn ct4_exactk_census() {
+    static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SHOWN.load(std::sync::atomic::Ordering::Relaxed)
+        && !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed)
+        && super::decode::cuda_verbose()
+    {
+        eprintln!("[CT4-EXACTK] exact-K CT4 variant ACTIVE (nb=160/192 shapes)");
+    }
+}
+
 fn b160_census() {
     static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     // Load-only fast path: after the first call this is a relaxed load, not
@@ -11205,11 +11215,17 @@ unsafe fn launch_matvec(
         // reduction, zero-padded 8-slot fold). K=17408 stays on 256.
         let (mv_fn, tpb) = match (crate::runtime_defaults::ct4_exactk(), in_dim) {
             (true, 5120) => match kernels.matvec_ct4_t160.as_ref() {
-                Some(f) => (f, 160),
+                Some(f) => {
+                    ct4_exactk_census();
+                    (f, 160)
+                }
                 None => (mv_fn, 256),
             },
             (true, 6144) => match kernels.matvec_ct4_t192.as_ref() {
-                Some(f) => (f, 192),
+                Some(f) => {
+                    ct4_exactk_census();
+                    (f, 192)
+                }
                 None => (mv_fn, 256),
             },
             _ => (mv_fn, 256),
@@ -11887,11 +11903,17 @@ unsafe fn launch_matvec_residual(
         // LUMEN_CUDA_CT4_EXACTK — same selection as the non-residual site.
         let (mv_fn, tpb) = match (crate::runtime_defaults::ct4_exactk(), in_dim) {
             (true, 5120) => match kernels.matvec_ct4_residual_t160.as_ref() {
-                Some(f) => (f, 160),
+                Some(f) => {
+                    ct4_exactk_census();
+                    (f, 160)
+                }
                 None => (mv_fn, 256),
             },
             (true, 6144) => match kernels.matvec_ct4_residual_t192.as_ref() {
-                Some(f) => (f, 192),
+                Some(f) => {
+                    ct4_exactk_census();
+                    (f, 192)
+                }
                 None => (mv_fn, 256),
             },
             _ => (mv_fn, 256),

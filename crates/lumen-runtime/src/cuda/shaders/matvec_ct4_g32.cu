@@ -125,6 +125,8 @@ void matvec_ct4_q8_1_residual(
 // the same order — missing warps contribute +0.0f, which is exact.
 template<int TPB>
 __device__ __forceinline__ float ct4_block_reduce_pad8(float v) {
+    static_assert(TPB % 32 == 0 && TPB >= 32 && TPB <= 256,
+                  "pad8 fold: TPB must be a full-warp multiple within 8 slots");
     __shared__ float shmem[8];
     if (threadIdx.x < 8) shmem[threadIdx.x] = 0.0f;
     __syncthreads();

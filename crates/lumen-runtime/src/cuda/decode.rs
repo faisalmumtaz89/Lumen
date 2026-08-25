@@ -2175,57 +2175,73 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        matvec_ct4_t160: match load_fn_sm80_fast_math(
-            shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
-            "matvec_ct4_q8_1_t160",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_ct4_t160: OK");
-                Some(f)
+        matvec_ct4_t160: if crate::runtime_defaults::ct4_exactk() {
+            match load_fn_sm80_fast_math(
+                shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
+                "matvec_ct4_q8_1_t160",
+            ) {
+                Ok(f) => {
+                    cuda_log!("[CUDA] matvec_ct4_t160: OK");
+                    Some(f)
+                }
+                Err(e) => {
+                    cuda_log!("[CUDA] matvec_ct4_t160: FAILED: {e}");
+                    None
+                }
             }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_ct4_t160: FAILED: {e}");
-                None
-            }
+        } else {
+            None
         },
-        matvec_ct4_t192: match load_fn_sm80_fast_math(
-            shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
-            "matvec_ct4_q8_1_t192",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_ct4_t192: OK");
-                Some(f)
+        matvec_ct4_t192: if crate::runtime_defaults::ct4_exactk() {
+            match load_fn_sm80_fast_math(
+                shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
+                "matvec_ct4_q8_1_t192",
+            ) {
+                Ok(f) => {
+                    cuda_log!("[CUDA] matvec_ct4_t192: OK");
+                    Some(f)
+                }
+                Err(e) => {
+                    cuda_log!("[CUDA] matvec_ct4_t192: FAILED: {e}");
+                    None
+                }
             }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_ct4_t192: FAILED: {e}");
-                None
-            }
+        } else {
+            None
         },
-        matvec_ct4_residual_t160: match load_fn_sm80_fast_math(
-            shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
-            "matvec_ct4_q8_1_residual_t160",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_ct4_residual_t160: OK");
-                Some(f)
+        matvec_ct4_residual_t160: if crate::runtime_defaults::ct4_exactk() {
+            match load_fn_sm80_fast_math(
+                shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
+                "matvec_ct4_q8_1_residual_t160",
+            ) {
+                Ok(f) => {
+                    cuda_log!("[CUDA] matvec_ct4_residual_t160: OK");
+                    Some(f)
+                }
+                Err(e) => {
+                    cuda_log!("[CUDA] matvec_ct4_residual_t160: FAILED: {e}");
+                    None
+                }
             }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_ct4_residual_t160: FAILED: {e}");
-                None
-            }
+        } else {
+            None
         },
-        matvec_ct4_residual_t192: match load_fn_sm80_fast_math(
-            shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
-            "matvec_ct4_q8_1_residual_t192",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] matvec_ct4_residual_t192: OK");
-                Some(f)
+        matvec_ct4_residual_t192: if crate::runtime_defaults::ct4_exactk() {
+            match load_fn_sm80_fast_math(
+                shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
+                "matvec_ct4_q8_1_residual_t192",
+            ) {
+                Ok(f) => {
+                    cuda_log!("[CUDA] matvec_ct4_residual_t192: OK");
+                    Some(f)
+                }
+                Err(e) => {
+                    cuda_log!("[CUDA] matvec_ct4_residual_t192: FAILED: {e}");
+                    None
+                }
             }
-            Err(e) => {
-                cuda_log!("[CUDA] matvec_ct4_residual_t192: FAILED: {e}");
-                None
-            }
+        } else {
+            None
         },
         dequant_ct4_to_f16: match load_fn_sm80_fast_math(
             shaders::MATVEC_CT4_G32_KERNEL_SOURCE,
