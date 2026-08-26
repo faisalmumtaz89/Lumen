@@ -25,7 +25,8 @@ stage="$(mktemp -d)/lumen-${TAG}-linux-x86_64-cuda"
 mkdir -p "$stage/bin"
 cp linux-bins/lumen linux-bins/lumen-server "$stage/bin/"
 chmod +x "$stage/bin/"*
-for lic in LICENSE-APACHE LICENSE-MIT LICENSE; do [ -f "$lic" ] && cp "$lic" "$stage/"; done
+# Unguarded cp: a missing legal file must fail the release, not skip silently.
+for lic in LICENSE-APACHE LICENSE-MIT THIRD_PARTY_NOTICES.md; do cp "$lic" "$stage/"; done
 cat > "$stage/README.txt" <<EOF
 Lumen — LLM inference for Linux x86_64 / NVIDIA CUDA
 Build: ${TAG}

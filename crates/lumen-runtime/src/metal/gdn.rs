@@ -1200,6 +1200,19 @@ impl MetalF32Backend {
         let new_conv_pos = (conv_pos + 1) % buf_slots;
 
         let use_high_occupancy = pso_state_l2_sg.is_some() && pso_norm_scale.is_some();
+        if !use_high_occupancy {
+            // Tiers 1-2 fuse the conv-state update into kernels that share
+            // conv_state across threadgroups; surface the silent kernel
+            // change instead of degrading invisibly.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "[Metal] WARNING: high-occupancy GDN pipeline unavailable \
+                     (gdn_state_output_l2_sg or gdn_decode_norm_scale pipeline \
+                     creation failed) — falling back to the lower tiers"
+                );
+            });
+        }
 
         if use_high_occupancy {
             // === Tier 0: HIGH-OCCUPANCY path ===

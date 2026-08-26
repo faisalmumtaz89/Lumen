@@ -30,6 +30,16 @@ pub(crate) fn is_k_quant(t: GgmlType) -> bool {
     )
 }
 
+/// Returns true if a Metal-target conversion must upcast this GGML type to
+/// Q8_0: the K-quant family plus legacy Q5_0, none of which the Metal
+/// backend has matmul or dequant kernels for (its resident loader accepts
+/// only F32/F16/BF16/Q8_0/Q4_0 for dense layer slices). Every Metal upcast gate — here and in
+/// the per-arch slice planners, which must mirror this byte layout — routes
+/// through this predicate so the planner and the blob writer cannot diverge.
+pub(crate) fn metal_needs_upcast(t: GgmlType) -> bool {
+    is_k_quant(t) || t == GgmlType::Q5_0
+}
+
 // `effective_lbc_quant_for_target` and `effective_byte_size_for_target`
 // helpers were considered but not needed: each layer-shape computation site
 // (`compute_layer_shape_qwen35{,moe}` + `compute_stacked_slice`) handles the
@@ -117,9 +127,9 @@ pub(crate) fn append_tensor_to_blob_requant<R: Read + Seek>(
 /// Target-aware version of [`append_tensor_to_blob_requant`].
 ///
 /// When `target == ConvertTarget::Metal` and the source tensor is a K-quant
-/// family member (Q2_K..Q6_K, Q8_K), the tensor is upcast to Q8_0 via the
+/// family member (Q2_K..Q6_K, Q8_K) or legacy Q5_0, the tensor is upcast to Q8_0 via the
 /// existing dequant -> Q8_0 quantize pipeline. This avoids hitting the
-/// Metal backend's missing K-quant kernels at runtime (the Q4 MoE-30B
+/// Metal backend's missing K-quant kernels at runtime (the Q4 MoE-35B
 /// regression that caused layer 3 NaN).
 ///
 /// Norm tensors (anything whose name contains "norm") are exempted from the
@@ -139,17 +149,18 @@ pub(crate) fn append_tensor_to_blob_requant_with_target<R: Read + Seek>(
     let data = read_tensor_data(reader, gguf, tensor)?;
     let is_norm = tensor_name.contains("norm");
 
-    // Metal target: K-quant layer tensor (non-norm) -- upcast to Q8_0.
+    // Metal target: K-quant or legacy-Q5_0 layer tensor (non-norm) -- upcast
+    // to Q8_0.
     // Numerically lossless within Q8_0 precision: Q8_0 has 8-bit mantissa
     // per element vs. Q6_K's 6-bit, so the round-trip dequant->Q8_0 is
     // a strict precision upgrade. Skip when user already set --requant or
     // --dequantize, those flags take precedence.
-    let needs_metal_kquant_upcast = target == ConvertTarget::Metal
+    let needs_metal_upcast = target == ConvertTarget::Metal
         && !is_norm
         && !dequantize
         && requant_to.is_none()
-        && is_k_quant(tensor.ggml_type);
-    if needs_metal_kquant_upcast {
+        && metal_needs_upcast(tensor.ggml_type);
+    if needs_metal_upcast {
         let f32_data =
             dequantize_to_f32_bytes(&data, tensor.ggml_type, tensor.n_elements(), tensor_name)?;
         let n_elems = tensor.n_elements() as usize;
@@ -277,4 +288,64 @@ pub(crate) fn try_compute_bias_slice(
     };
     *blob_offset += size;
     Some(slice)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gguf::{GgmlType, GgufBuilder, GgufFile};
+    use std::io::Cursor;
+
+    #[test]
+    fn metal_target_upcasts_q5_0_layer_tensor_to_q8_0() {
+        // 64-element Q5_0 tensor = 2 blocks x 22 bytes. Metal has no Q5_0
+        // kernels (the runtime resident loader rejects the scheme), so the
+        // Metal target must upcast it to Q8_0 (2 blocks x 34 bytes), exactly
+        // like the K-quants.
+        let mut q5 = vec![0u8; 2 * 22];
+        for block in q5.chunks_exact_mut(22) {
+            block[0..2].copy_from_slice(&0x3C00u16.to_le_bytes()); // scale 1.0
+            for (i, b) in block[6..22].iter_mut().enumerate() {
+                *b = (i as u8) | (((15 - i) as u8) << 4);
+            }
+        }
+        let mut builder = GgufBuilder::new();
+        builder.add_tensor("blk.0.ffn_gate.weight", GgmlType::Q5_0, &[32, 2], q5);
+        let bytes = builder.build();
+        let gguf = GgufFile::parse(&mut bytes.as_slice()).unwrap();
+        let mut reader = Cursor::new(&bytes);
+
+        let mut blob = Vec::new();
+        append_tensor_to_blob_requant_with_target(
+            &mut blob,
+            &mut reader,
+            &gguf,
+            "blk.0.ffn_gate.weight",
+            false,
+            None,
+            ConvertTarget::Metal,
+        )
+        .unwrap();
+        assert_eq!(
+            blob.len(),
+            2 * 34,
+            "Metal target must emit Q8_0 blocks for a Q5_0 source, got {} bytes",
+            blob.len()
+        );
+
+        // The Generic target keeps Q5_0 verbatim (CUDA dequantizes at load).
+        let mut generic_blob = Vec::new();
+        let mut reader2 = Cursor::new(&bytes);
+        append_tensor_to_blob_requant_with_target(
+            &mut generic_blob,
+            &mut reader2,
+            &gguf,
+            "blk.0.ffn_gate.weight",
+            false,
+            None,
+            ConvertTarget::Generic,
+        )
+        .unwrap();
+        assert_eq!(generic_blob.len(), 2 * 22);
+    }
 }

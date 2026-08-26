@@ -294,7 +294,7 @@ __device__ void topk_moe_fused_no_bias_impl(
 }
 
 // NVRTC-compatible C-linkage entry points. We ship two instantiations
-// (n_experts=128 for Qwen3.5-MoE-30B/35B-A3B; n_experts=256 forward-compatible
+// (n_experts=128 for Qwen3.5-MoE-35B-A3B; n_experts=256 forward-compatible
 // for larger variants). The Lumen dispatch will pick the matching variant at
 // runtime based on `meta.num_experts`. Power-of-two ≤ 256 is sufficient for
 // all known production Qwen3.5-MoE configs.
@@ -337,7 +337,7 @@ extern "C" __launch_bounds__(128, 1) __global__ void topk_moe_fused_256_no_bias(
         use_sigmoid, with_norm, delayed_softmax);
 }
 
-// 64-expert variant covers small-MoE test models and the eventual 30B-A3B-like
+// 64-expert variant covers small-MoE test models and the eventual 35B-A3B-like
 // quant variants that might ship with fewer routed experts. Kept as a safety
 // net; not directly referenced by the production dispatch unless num_experts==64.
 extern "C" __launch_bounds__(128, 1) __global__ void topk_moe_fused_64_no_bias(

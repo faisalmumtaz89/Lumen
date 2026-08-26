@@ -147,8 +147,9 @@ fn compute_layer_shape_qwen35(
             };
             *blob_offset += size;
             Ok(slice)
-        } else if target == ConvertTarget::Metal && !is_norm && is_k_quant(tensor.ggml_type) {
-            // Metal K-quant upcast to Q8_0. Must match
+        } else if target == ConvertTarget::Metal && !is_norm && metal_needs_upcast(tensor.ggml_type)
+        {
+            // Metal K-quant / legacy-Q5_0 upcast to Q8_0. Must match
             // `append_tensor_to_blob_requant_with_target` byte layout.
             let n_elements = tensor.n_elements() as usize;
             assert!(
