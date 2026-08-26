@@ -7,7 +7,7 @@ This directory contains the perf-benchmarking suite. Methodology lives in [METHO
 The published benchmark suite is currently scoped to Lumen's v1 model family on two accelerator families. Additional model families will be added to the suite as they ship.
 
 - **Primary model (v1)**: Qwen3.5-9B (`qwen35` architecture — GDN hybrid + dense FFN)
-- **Secondary model (v1)**: Qwen3.5-MoE 35B-A3B (`qwen35moe`; architecture-truthful active-parameter label is 30B-A3B) — see [RESULTS.md](RESULTS.md)
+- **Secondary model (v1)**: Qwen3.5-MoE-35B-A3B (`qwen35moe`) — see [RESULTS.md](RESULTS.md)
 - **Backends measured**: CUDA on NVIDIA A100-80GB (SM 80) and Metal on Apple Silicon M3 Ultra
 
 Architectures outside the v1 set are out of scope for the currently-published benchmark.

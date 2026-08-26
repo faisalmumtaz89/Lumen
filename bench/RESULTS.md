@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-06-02
 
-> **Scope (2026-06-02):** The benchmark suite is currently scoped to Lumen's v1 model family (Qwen3.5). All numbers below are measured on Qwen3.5-9B dense and Qwen3.5-MoE-30B-A3B. Additional model families will be added to this suite as they ship.
+> **Scope (2026-06-02):** The benchmark suite is currently scoped to Lumen's v1 model family (Qwen3.5). All numbers below are measured on Qwen3.5-9B dense and Qwen3.5-MoE-35B-A3B. Additional model families will be added to this suite as they ship.
 
 Methodology: [METHODOLOGY.md](METHODOLOGY.md). How to reproduce: [README.md](README.md). Deployment guidance: [`docs/production.md`](../docs/production.md).
 
@@ -10,7 +10,7 @@ Methodology: [METHODOLOGY.md](METHODOLOGY.md). How to reproduce: [README.md](REA
 
 ## TL;DR — production-realistic numbers
 
-Workload-weighted decode (CUDA, Qwen3.5-MoE-30B-A3B on A100-80GB):
+Workload-weighted decode (CUDA, Qwen3.5-MoE-35B-A3B on A100-80GB):
 
 | Quant | Canonical 5-trial | Workload-weighted mean (tok/s) | Workload-weighted × llama.cpp | Recommended for production? |
 |-------|---------------------------:|----------------:|----------------:|----------------------------|
@@ -22,9 +22,9 @@ Workload-weighted means are the equal-weight average across short / medium / lon
 
 ---
 
-## Per-workload empirical results (CUDA, Qwen3.5-MoE-30B-A3B)
+## Per-workload empirical results (CUDA, Qwen3.5-MoE-35B-A3B)
 
-Conditions: Qwen3.5-MoE-30B-A3B on A100-80GB PCIe, GPU 1 isolated, driver 580.126.20, CUDA 12.2.140, sm_80. canonical 12-env-var stack. PURE-greedy `--temperature 0 --seed 42 --repeat-penalty 1.0 --repeat-last-n 0`. Each cell is 3-trial median.
+Conditions: Qwen3.5-MoE-35B-A3B on A100-80GB PCIe, GPU 1 isolated, driver 580.126.20, CUDA 12.2.140, sm_80. canonical 12-env-var stack. PURE-greedy `--temperature 0 --seed 42 --repeat-penalty 1.0 --repeat-last-n 0`. Each cell is 3-trial median.
 
 ### Decode tok/s per (workload pattern × quant)
 
@@ -166,19 +166,19 @@ The canonical headline configurations as of the 2026-06-02 CUDA benchmark run.
 
 ### Qwen3.5-MoE 35B-A3B decode — historical arc (SUPERSEDED)
 
-> **Superseded by the [TL;DR](#tldr--production-realistic-numbers) and [per-workload](#per-workload-empirical-results-cuda-qwen35-moe-30b-a3b) tables above (re-bench, 2026-06-02).** The canonical current MoE-30B-A3B decode numbers are **Q8 82.1 tok/s = 0.584× llama.cpp** and **Q4 105.6 tok/s = 0.674× llama.cpp** (measured against the current llama.cpp baselines 138.71 / 155.56). The rows below are retained for historical traceability of the perf+correctness arc and use an earlier llama.cpp baseline (140.65 / 156.71) and earlier Lumen build; do not cite them as current.
+> **Superseded by the [TL;DR](#tldr--production-realistic-numbers) and [per-workload](#per-workload-empirical-results-cuda-qwen35-moe-35b-a3b) tables above (re-bench, 2026-06-02).** The canonical current MoE-35B-A3B decode numbers are **Q8 82.1 tok/s = 0.584× llama.cpp** and **Q4 105.6 tok/s = 0.674× llama.cpp** (measured against the current llama.cpp baselines 138.71 / 155.56). The rows below are retained for historical traceability of the perf+correctness arc and use an earlier llama.cpp baseline (140.65 / 156.71) and earlier Lumen build; do not cite them as current.
 
 The qwen35moe CUDA runtime path closed cleanly (one-line `BLOCK_DIM` fix in `moe_accum.cu:19`); the historical perf+correctness arc was:
 
 | Model | Quant | Decode tok/s | llama.cpp | × llama.cpp | Restated gate | Source release |
 |-------|-------|-------------:|---:|-----:|---------------|----------------|
-| Qwen3.5-MoE 30B-A3B *(model name correction)* | Q8_0 | **~71.8** *(historical; superseded by 82.1 = 0.584×)* | 140.65 | 0.510× | ≥0.65× llama.cpp | (earlier 8-flag stack) |
-| Qwen3.5-MoE 30B-A3B | Q4_0 | **~80.9** *(historical; superseded by 105.6 = 0.674×)* | 156.71 | 0.516× | ≥0.73× llama.cpp | |
-| Qwen3.5-MoE 30B-A3B | BF16 | see canonical production config below | — | — | — | canonical 8-flag stack |
-| Qwen3.5-MoE 30B-A3B (original Q8) | Q8_0 | 17.79 (legacy) | — | — | — | D.1 (legacy reference) |
+| Qwen3.5-MoE 35B-A3B | Q8_0 | **~71.8** *(historical; superseded by 82.1 = 0.584×)* | 140.65 | 0.510× | ≥0.65× llama.cpp | (earlier 8-flag stack) |
+| Qwen3.5-MoE 35B-A3B | Q4_0 | **~80.9** *(historical; superseded by 105.6 = 0.674×)* | 156.71 | 0.516× | ≥0.73× llama.cpp | |
+| Qwen3.5-MoE 35B-A3B | BF16 | see canonical production config below | — | — | — | canonical 8-flag stack |
+| Qwen3.5-MoE 35B-A3B (original Q8) | Q8_0 | 17.79 (legacy) | — | — | — | D.1 (legacy reference) |
 | Qwen3.5-9B dense (regression check) | Q8_0 | 41.35 (legacy) | — | — | — | D.2 (legacy reference) |
 
-**Canonical production config (CUDA, Qwen3.5-MoE-30B-A3B BF16)**:
+**Canonical production config (CUDA, Qwen3.5-MoE-35B-A3B BF16)**:
 
 ```bash
 # canonical 8-flag stack (defaults ON, opt-out=0):
@@ -240,12 +240,12 @@ Source: `bench/METHODOLOGY.md`. Hardware: Mac Studio M3 Ultra 96 GB. Baseline: `
 | Q4 dense-9B | Q4_0 | 660.0 | 963.0 | 0.69× cold-load; **warm-state 0.88×** | 80.9 / 88.3 | 79.7 / 75.5 | **1.02×** / **1.17×** | canonical warm-state |
 | BF16 dense-9B | BF16 | 630.2 | 956.2 | 0.66× warm-state (up from 0.31× baseline, +2.2× cumulative) | 32.1 | 38.7 | **0.83×** | canonical |
 
-### Qwen3.5-MoE-35B-A3B (architecture-truthful: 30B-A3B active)
+### Qwen3.5-MoE-35B-A3B
 
 | Config | Quant | Lumen prefill (tok/s) | Lumen decode (tok/s) | llama.cpp baseline | Note |
 |--------|-------|----------------------:|---------------------:|--------------------|------|
-| Q8 MoE-30B-A3B | Q8_0 | 24.2 | 17.2 | none | llama-bench 8680 cannot load Qwen3.5-MoE-A3B (missing `ssm_conv1d` — GDN MoE unsupported). **Lumen is the sole provider on Apple Silicon.** Requires `LUMEN_METAL_MMAP_ONLY=1`. |
-| Q4 MoE-30B-A3B | Q4_0 | 34.6 | 17.4 | none | Same architectural limitation as the Q8 MoE config. Sole provider. Requires `LUMEN_METAL_MMAP_ONLY=1`. |
+| Q8 MoE-35B-A3B | Q8_0 | 24.2 | 17.2 | none | llama-bench 8680 cannot load Qwen3.5-MoE-A3B (missing `ssm_conv1d` — GDN MoE unsupported). **Lumen is the sole provider on Apple Silicon.** Requires `LUMEN_METAL_MMAP_ONLY=1`. |
+| Q4 MoE-35B-A3B | Q4_0 | 34.6 | 17.4 | none | Same architectural limitation as the Q8 MoE config. Sole provider. Requires `LUMEN_METAL_MMAP_ONLY=1`. |
 
 ### Methodology asymmetry
 
@@ -253,7 +253,7 @@ Lumen's `lumen run` per-process measurement includes the model cold-load in the 
 
 ### Metal production status
 
-The dense-9B Q8 and Q4 configs clear the 0.9× llama.cpp competitive gate on decode. The BF16 dense-9B config and the Q8 / Q4 MoE-30B-A3B configs are functional and production-ready: BF16 dense-9B is below the 0.5× sanity floor on prefill (a known structural baseline), and the MoE configs have no external baseline because llama-bench cannot load GDN MoE. The BF16 dense-9B and both MoE configs require `LUMEN_METAL_MMAP_ONLY=1` to fit the 96 GB residency budget.
+The dense-9B Q8 and Q4 configs clear the 0.9× llama.cpp competitive gate on decode. The BF16 dense-9B config and the Q8 / Q4 MoE-35B-A3B configs are functional and production-ready: BF16 dense-9B is below the 0.5× sanity floor on prefill (a known structural baseline), and the MoE configs have no external baseline because llama-bench cannot load GDN MoE. The BF16 dense-9B and both MoE configs require `LUMEN_METAL_MMAP_ONLY=1` to fit the 96 GB residency budget.
 
 ---
 

@@ -984,7 +984,7 @@ pub(crate) fn allocate_moe_scratch(
         expert_assembled: None,
         // Shared expert scratch is only required when a shared expert is present.
         // Allocated unconditionally here so the encode path doesn't need lazy alloc;
-        // ~hidden_dim + inter_dim F32 floats ≈ 14 KB on Qwen3.5-30B-A3B.
+        // ~hidden_dim + inter_dim F32 floats ≈ 14 KB on Qwen3.5-35B-A3B.
         shared_gate_buf: Some(device.alloc_zeros::<f32>(shared_inter_dim.max(1))?),
         shared_down_buf: Some(device.alloc_zeros::<f32>(hidden_dim)?),
         shared_gate_scalar: Some(device.alloc_zeros::<f32>(1)?),

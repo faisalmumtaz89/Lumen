@@ -7,6 +7,7 @@ The canonical, always-up-to-date reference is `lumen run --help` (printed by [`c
 | Command | Purpose |
 |---------|---------|
 | `lumen run <model:quant> "<prompt>"` | Pull (if needed), convert (if needed), run inference, print text |
+| `lumen run <model> "<prompt>"` | Bare name: uses the registry default quant (Q8_0) if its LBC is cached, else the sole cached quant if exactly one is; otherwise it lists the quants and exits — it never picks one to download |
 | `lumen pull <model:quant>` | Download GGUF, convert to LBC, cache; do not run |
 | `lumen models` | List all registry entries and disk-cached LBCs |
 | `lumen convert --input <gguf> --output <lbc> [--requant <q>]` | Manually convert a GGUF to LBC (optionally re-quantize) |

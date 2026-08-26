@@ -317,6 +317,37 @@ pub(super) fn host_f16_to_f32(bits: u16) -> f32 {
     f32::from_bits((sign << 31) | ((exp - 15 + 127) << 23) | (frac << 13))
 }
 
+/// Dequantize a Q5_0 plane (22-byte blocks of 32 elements: f16 scale +
+/// 4 bytes of packed high bits + 16 bytes of packed low nibbles) to F32.
+fn dequant_q5_0_to_f32(raw: &[u8]) -> Vec<f32> {
+    let n_blocks = raw.len() / 22;
+    let mut f32_data = vec![0.0f32; n_blocks * 32];
+    for b in 0..n_blocks {
+        let bp = &raw[b * 22..];
+        let scale = host_f16_to_f32((bp[0] as u16) | ((bp[1] as u16) << 8));
+        let qh = (bp[2] as u32)
+            | ((bp[3] as u32) << 8)
+            | ((bp[4] as u32) << 16)
+            | ((bp[5] as u32) << 24);
+        let qs = &bp[6..]; // 16 nibble-pair bytes
+                           // GGML Q5_0 element order: low nibbles fill elements 0..16, high
+                           // nibbles fill 16..32 (de-interleaved — NOT pairwise), and qh bit j
+                           // is the high bit of element j.
+        for i in 0..16 {
+            let byte = qs[i];
+            let lo_nibble = (byte & 0x0F) as u32;
+            let hi_nibble = ((byte >> 4) & 0x0F) as u32;
+            let lo_hi = (qh >> i) & 1;
+            let hi_hi = (qh >> (i + 16)) & 1;
+            let lo_val = (lo_nibble | (lo_hi << 4)) as f32 - 16.0;
+            let hi_val = (hi_nibble | (hi_hi << 4)) as f32 - 16.0;
+            f32_data[b * 32 + i] = scale * lo_val;
+            f32_data[b * 32 + 16 + i] = scale * hi_val;
+        }
+    }
+    f32_data
+}
+
 /// Host f32 -> IEEE f16 bits, round-to-nearest-even (matches the GPU
 /// `f32_to_f16_vec` kernel's cvt.rn behavior). Used to build F16 weight
 /// images for tensors kept in their source K-quant/Q4_1 form.
@@ -931,57 +962,11 @@ fn upload_tensor(
             Ok(GpuWeightBuf::F16Raw(gpu_buf))
         }
         QuantScheme::Q5_0 => {
-            // Q5_0: 22 bytes per block of 32 elements.
-            // Layout: f16 scale (2B) + 4B high-bits + 16B low-nibbles.
-            let n_blocks = raw.len() / 22;
-            let n_elements = n_blocks * 32;
-            let mut f32_data = vec![0.0f32; n_elements];
-
-            fn f16_to_f32_q5(bits: u16) -> f32 {
-                let sign = ((bits >> 15) & 1) as u32;
-                let exp = ((bits >> 10) & 0x1f) as u32;
-                let frac = (bits & 0x3ff) as u32;
-                if exp == 0 {
-                    if frac == 0 {
-                        return if sign == 1 { -0.0 } else { 0.0 };
-                    }
-                    let v = (frac as f32) * 6.103515625e-05 / 1024.0;
-                    return if sign == 1 { -v } else { v };
-                }
-                if exp == 31 {
-                    return if frac != 0 {
-                        f32::NAN
-                    } else if sign == 1 {
-                        f32::NEG_INFINITY
-                    } else {
-                        f32::INFINITY
-                    };
-                }
-                f32::from_bits((sign << 31) | ((exp - 15 + 127) << 23) | (frac << 13))
-            }
-
-            for b in 0..n_blocks {
-                let bp = &raw[b * 22..];
-                let scale = f16_to_f32_q5((bp[0] as u16) | ((bp[1] as u16) << 8));
-                // 4 bytes of high bits (1 bit per element, packed as u32)
-                let qh = (bp[2] as u32)
-                    | ((bp[3] as u32) << 8)
-                    | ((bp[4] as u32) << 16)
-                    | ((bp[5] as u32) << 24);
-                let qs = &bp[6..]; // 16 nibble-pair bytes
-                for i in 0..16 {
-                    let byte = qs[i];
-                    let lo_nibble = (byte & 0x0F) as u32;
-                    let hi_nibble = ((byte >> 4) & 0x0F) as u32;
-                    let lo_hi = (qh >> (2 * i)) & 1;
-                    let hi_hi = (qh >> (2 * i + 1)) & 1;
-                    let lo_val = (lo_nibble | (lo_hi << 4)) as f32 - 16.0;
-                    let hi_val = (hi_nibble | (hi_hi << 4)) as f32 - 16.0;
-                    f32_data[b * 32 + 2 * i] = scale * lo_val;
-                    f32_data[b * 32 + 2 * i + 1] = scale * hi_val;
-                }
-            }
-            eprintln!("[CUDA] upload {name}: Q5_0 dequant to F32 ({n_elements} elements)");
+            let f32_data = dequant_q5_0_to_f32(raw);
+            eprintln!(
+                "[CUDA] upload {name}: Q5_0 dequant to F32 ({} elements)",
+                f32_data.len()
+            );
             let gpu_buf = device.htod_copy(&f32_data)?;
             Ok(GpuWeightBuf::F32(gpu_buf))
         }
@@ -1834,6 +1819,45 @@ pub fn repack_layer_q4_to_aligned(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dequant_q5_0_matches_ggml_reference_layout() {
+        // GGML Q5_0: element j < 16 reads the LOW nibble of qs[j]; element
+        // j >= 16 reads the HIGH nibble of qs[j - 16]; qh bit j is the high
+        // bit of element j; value = scale * (code - 16).
+        //
+        // The codes are a scrambled permutation of 0..=31 (NOT the identity:
+        // any affine code sequence has code[i+16] == code[i] + 16 (mod 32),
+        // which makes both nibbles of every qs byte equal and hides
+        // nibble-misrouting bugs).
+        const CODES: [u8; 32] = [
+            28, 9, 19, 10, 29, 5, 7, 22, 0, 14, 8, 15, 23, 24, 21, 13, 25, 27, 6, 16, 26, 18, 11,
+            3, 17, 2, 1, 31, 12, 4, 30, 20,
+        ];
+        // Two blocks with different scales so the 22-byte source / 32-element
+        // destination strides are exercised, not just block 0.
+        let scales_f16: [u16; 2] = [0x3C00, 0x4000]; // 1.0, 2.0
+        let mut raw = [0u8; 44];
+        for (b, block) in raw.chunks_exact_mut(22).enumerate() {
+            block[0..2].copy_from_slice(&scales_f16[b].to_le_bytes());
+            let mut qh: u32 = 0;
+            for (j, &code) in CODES.iter().enumerate() {
+                qh |= (((code >> 4) & 1) as u32) << j;
+            }
+            block[2..6].copy_from_slice(&qh.to_le_bytes());
+            for i in 0..16 {
+                block[6 + i] = (CODES[i] & 0x0F) | ((CODES[i + 16] & 0x0F) << 4);
+            }
+        }
+
+        let out = dequant_q5_0_to_f32(&raw);
+        assert_eq!(out.len(), 64);
+        for (j, &v) in out.iter().enumerate() {
+            let scale = if j < 32 { 1.0 } else { 2.0 };
+            let expected = scale * (CODES[j % 32] as f32 - 16.0);
+            assert_eq!(v, expected, "element {j}: got {v}, expected {expected}");
+        }
+    }
 
     #[test]
     fn f32_to_f16_bits_reference_values() {

@@ -8,7 +8,7 @@ Lumen is a general LLM inference engine, but the production-validated surface
 area today is intentionally narrow:
 
 - **Models**: v1 ships verified-against-llama.cpp support for the Qwen3.5
-  family (dense-9B and MoE-30B-A3B). Additional model families are planned;
+  family (dense-9B and MoE-35B-A3B). Additional model families are planned;
   the converter currently rejects architectures outside the v1 set so the
   runtime only dispatches code that has been gated end-to-end. New-family
   PRs are welcome but should start with a scope-change issue describing the

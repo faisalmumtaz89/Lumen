@@ -414,13 +414,13 @@ build_catalog() {
   _catalog_add "qwen3.5-9b:q8_0" "~10 GB" "~11 GB" "~19 GB" "Dense 9B, production default (best quality)" "1"
   _catalog_add "qwen3.5-9b:q4_0" "~5.4 GB" "~6 GB" "~12 GB" "Dense 9B, 4-bit (smaller)" "1"
   _catalog_add "qwen3.5-9b:bf16" "~18 GB" "~19 GB" "~35 GB" "Dense 9B, full precision" "1"
-  # MoE 30B-A3B (3B active). All three quants downloadable. CAT_DISK is the
+  # MoE 35B-A3B (3B active). All three quants downloadable. CAT_DISK is the
   # true transient peak (source GGUF + converted LBC held simultaneously).
   # BF16 is a 2-shard split GGUF nested in a HF subdirectory; the downloader
   # fetches each shard from its nested URL and caches them flat + adjacent.
-  _catalog_add "qwen3.5-moe-35b-a3b:q4_0" "~19 GB" "~21 GB" "~39 GB" "MoE 30B (3B active), 4-bit" "1"
-  _catalog_add "qwen3.5-moe-35b-a3b:q8_0" "~37 GB" "~38 GB" "~71 GB" "MoE 30B (3B active), 8-bit" "1"
-  _catalog_add "qwen3.5-moe-35b-a3b:bf16" "~71 GB" "~72 GB" "~140 GB" "MoE 30B (3B active), full precision" "1"
+  _catalog_add "qwen3.5-moe-35b-a3b:q4_0" "~19 GB" "~21 GB" "~39 GB" "MoE 35B (3B active), 4-bit" "1"
+  _catalog_add "qwen3.5-moe-35b-a3b:q8_0" "~37 GB" "~38 GB" "~71 GB" "MoE 35B (3B active), 8-bit" "1"
+  _catalog_add "qwen3.5-moe-35b-a3b:bf16" "~71 GB" "~72 GB" "~140 GB" "MoE 35B (3B active), full precision" "1"
   # Dense Qwen3.6-27B (GDN ratio-3). All three quants downloadable; BF16 is a
   # 2-shard split GGUF (same nested HF-subdir layout as the MoE BF16).
   _catalog_add "qwen3.6-27b:q8_0" "~29 GB" "~30 GB" "~56 GB" "Dense 27B, 8-bit (best quality)" "1"

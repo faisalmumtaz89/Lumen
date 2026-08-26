@@ -547,10 +547,11 @@ mod tests {
     use super::*;
 
     /// Serializes tests that mutate the process-global `LUMEN_CUDA_PTX_CACHE_DIR`
-    /// env var. Each uses a unique temp dir, but the env var that points at it is
-    /// process-wide, so without this lock parallel `cargo test` runs clobber each
-    /// other's setting. Poison-tolerant: a panic in one test must not wedge the rest.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// env var. The lock is the crate-wide `ENV_TEST_LOCK`: process env is
+    /// global, so a per-module mutex cannot exclude env-mutating or
+    /// env-walking tests in other modules. Poison-tolerant: a panic in one
+    /// test must not wedge the rest.
+    use crate::ENV_TEST_LOCK as ENV_LOCK;
 
     /// SHA-256 of "abc" is the canonical FIPS 180-4 test vector.
     #[test]

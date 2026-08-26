@@ -48,7 +48,7 @@ use std::path::Path;
 /// CUDA ships dedicated K-quant (Q2/Q3/Q4/Q5/Q6_K) dequant kernels, so
 /// K-quant layer tensors can ride through unchanged. Metal currently has
 /// **no** K-quant kernels, so layer tensors stored as K-quant in the source
-/// GGUF (e.g. `attn_q` in the Q4 MoE-30B GGUF) must be upcast to a
+/// GGUF (e.g. `attn_q` in the Q4 MoE-35B GGUF) must be upcast to a
 /// scheme Metal does support (Q8_0).
 ///
 /// `Generic` leaves K-quant layer tensors as-is (CUDA path).
@@ -430,9 +430,13 @@ fn do_convert_from_reader<R: Read + Seek>(
                 //
                 // LUMEN_CONVERT_KEEP_Q6K_OUTPUT=1: preserve a Q6_K output.weight
                 // verbatim (6.5625 bpw, the exact bytes llama.cpp serves) for the
-                // CUDA backend's dedicated Q6_K head kernel. Requires a runtime
-                // with that kernel; other backends would hit the slow fallback.
-                if output_proj_tensor.ggml_type == GgmlType::Q6_K
+                // CUDA backend's dedicated Q6_K head kernel. Never on the Metal
+                // target — Metal has no Q6_K head kernel and would serve the
+                // head through the F32-dequant fallback (4 bytes/elem streamed
+                // per token), so Metal conversions requantize to the fast
+                // Q8_0 head path (same rule as every other fidelity gate).
+                if opts.target != ConvertTarget::Metal
+                    && output_proj_tensor.ggml_type == GgmlType::Q6_K
                     && (source_fidelity()
                         || matches!(
                             std::env::var("LUMEN_CONVERT_KEEP_Q6K_OUTPUT")
