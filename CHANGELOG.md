@@ -322,7 +322,7 @@ Q4/Q8/BF16; the Q4 route is byte-identical to the v0.9.0 certified baseline.
 CUDA (NVIDIA, compute capability 8.0+ — Ampere / Hopper; benchmarked on A100-80GB):
 
 - Qwen3.5-9B dense at Q8_0 (**0.91× llama.cpp** decode), Q4_0 (0.64× llama.cpp), BF16 (**0.93–0.94× llama.cpp** decode)
-- Qwen3.5-MoE-35B-A3B (architecture-truthful active params: 30B-A3B) at Q8_0 (0.584× llama.cpp), Q4_0 (0.674× llama.cpp), and **BF16 (0.902× llama.cpp, production-recommended)**
+- Qwen3.5-MoE-35B-A3B at Q8_0 (0.584× llama.cpp), Q4_0 (0.674× llama.cpp), and **BF16 (0.902× llama.cpp, production-recommended)**
 - Validated end-to-end on the full models × quants matrix against llama.cpp
 
 Metal (Apple Silicon, M-series; benchmarked on M3 Ultra):
@@ -351,7 +351,7 @@ Metal (Apple Silicon, M-series; benchmarked on M3 Ultra):
 - Concurrent CLI bursts (≥4) per GPU are unsupported by design — use `lumen-server`
 - Q8 / Q4 prefill × llama.cpp ratios are structurally below 1.0 on the current NVRTC compute_61 stack
 - PURE-greedy long-form generation (≥512 tokens) deterministically loops — use `--temperature 0.7` or, on DENSE models, `--repetition-penalty 1.05 --repeat-last-n 64` (when omitted the server/CLI apply a model-aware penalty: 1.05 dense / 1.03 MoE — MoE must stay ≤ 1.03 or arithmetic corrupts)
-- BF16 MoE-30B-A3B requires a dedicated 80 GB+ GPU (peak VRAM 72.4 GB)
+- BF16 MoE-35B-A3B requires a dedicated 80 GB+ GPU (peak VRAM 72.4 GB)
 - `lumen-server` Authorization / CORS / per-request timeout are not implemented; deploy behind a reverse proxy
 - BF16-dense / Q8-MoE / Q4-MoE on Metal require `LUMEN_METAL_MMAP_ONLY=1` (M3 Ultra 96 GB residency budget)
 

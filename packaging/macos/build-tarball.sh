@@ -6,7 +6,7 @@
 #   bin/lumen          (CLI: pull / convert / models / run)
 #   bin/lumen-server   (OpenAI/Anthropic-compatible HTTP server)
 #   README.txt         (run note + prereqs)
-#   LICENSE            (if present at repo root)
+#   LICENSE-APACHE / LICENSE-MIT / THIRD_PARTY_NOTICES.md
 #
 # The Metal backend compiles its MSL shaders at runtime from source embedded in
 # the binary (sub-second). There is NO separate .metallib or shader directory to
@@ -49,9 +49,11 @@ cargo build --release -p lumen-server --features bin
 mkdir -p "$STAGE/bin"
 cp "$TARGET_DIR/release/lumen"        "$STAGE/bin/"
 cp "$TARGET_DIR/release/lumen-server" "$STAGE/bin/"
-# Dual-licensed MIT OR Apache-2.0 — ship both license texts.
-for lic in LICENSE-APACHE LICENSE-MIT LICENSE; do
-    [[ -f "$REPO_ROOT/$lic" ]] && cp "$REPO_ROOT/$lic" "$STAGE/"
+# Dual-licensed MIT OR Apache-2.0 — ship both license texts, plus the
+# third-party notices the ported MLX / llama.cpp kernel code requires.
+# Unguarded cp: a missing legal file must FAIL the build, not skip silently.
+for lic in LICENSE-APACHE LICENSE-MIT THIRD_PARTY_NOTICES.md; do
+    cp "$REPO_ROOT/$lic" "$STAGE/"
 done
 
 # Strip is already effectively done by cargo release profile; re-assert arch.

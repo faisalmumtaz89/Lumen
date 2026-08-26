@@ -149,7 +149,9 @@ stays byte-identical to history. Set any to `=0` to opt out on MoE.
 
 | Variable | Default | Category | Effect | When to touch |
 |---|---|---|---|---|
-| `LUMEN_CUDA_DECODE_DELAY_US` | `0` (CLI) / `50` (server) | config | CPU sleep (µs) after `device.synchronize()` per decode step; serialises inter-step submission to close a GPU-scheduler timing race for MoE-Q4 server determinism. Unparseable → default; no upper clamp. | Raise on a server if MoE-Q4 determinism drifts; `0` on the deterministic CLI. |
+| `LUMEN_CONVERT_SOURCE_FIDELITY` | `false` | config (convert-time) | Preserve supported source tensor formats verbatim on non-Metal conversions (Q5_K `ssm_out`, Q6_K output head, Q4_1 layer tensors) instead of requantizing. | Set when byte-exact parity with the source checkpoint matters more than the fastest kernels. |
+| `LUMEN_CONVERT_KEEP_Q6K_OUTPUT` | `false` | config (convert-time) | Preserve a Q6_K output head verbatim on non-Metal conversions (subset of `LUMEN_CONVERT_SOURCE_FIDELITY`). | Set for CUDA source-fidelity heads without the rest of the fidelity set. |
+| `LUMEN_CUDA_DECODE_DELAY_US` | `0` (CLI) / `50` (server) | config | CPU sleep (µs) after `device.synchronize()` per decode step — an empirical mitigation for observed cross-request decode non-determinism under server concurrency (not a root-caused fix). Unparseable → default; no upper clamp. | Raise on a server if MoE-Q4 determinism drifts; leave `0` on the CLI. |
 | `LUMEN_CUDA_MAX_SEQ_LEN` | unset = model max | config | Cap KV-cache max sequence length. `=0` is treated as **no cap** (a 0-length KV cache previously faulted the GPU with an illegal address; guarded 2026-07-14); non-numeric ignored. | Set to bound KV memory for long-context models. |
 | `LUMEN_CUDA_ATTN_PRECISE` | numeric, model-aware: `3` (scalar — exact-F32 QK^T **and** exact-F32 P@V) for every supported production class (MoE + dense 9B/27B × Q4/Q8/BF16); `0` (legacy F16 WMMA) only for unset/legacy callers | config | Batch-≥16 WMMA prefill full-attention precision. `0`=F16 QK^T + F16 P@V (legacy); `1`=qkf32 (exact QK^T, F16 P@V — closes the QK^T carrier but REOPENS the P@V hole, regresses GQ-014); `2`=pvf32 (F16 QK^T, exact P@V — heals GQ-014 but leaves the F16-QK carrier that flips case-08); `3`=scalar (both exact-F32, ratified default — heals both); `4`=split (hi/lo tensor-core approx, unqualified). | Force `1` (qkf32) or `2` (pvf32) to A/B the two carriers in isolation; `3` is the ratified correctness default. |
 | `LUMEN_CUDA_DECODE_TILED` | OFF (force-mode opt-in) | config | Force the tiled streaming-softmax decode kernel. | `=1` to exercise the tiled decode kernel. |
@@ -173,7 +175,6 @@ stays byte-identical to history. Set any to `=0` to opt out on MoE.
 | `LUMEN_CUDA_GDN_SUBSTAGE_TIMING` | OFF | diagnostic | Per-substage GDN timing. | Attribute time inside the GDN block. |
 | `LUMEN_CUDA_ATTN_PRECISE_DBG` | OFF | diagnostic | One-shot attention-precision engagement print. | Confirm which attention path engaged. |
 | `LUMEN_CUDA_FORCE_SCALAR_ATTN` | OFF | diagnostic | Force the scalar attention kernel (correctness reference). | Compare WMMA vs. scalar attention output. |
-| `LUMEN_GRAPH_DIAGNOSTIC` | `false` | diagnostic | Emit CUDA-graph capture diagnostics. | The only lever to debug the crash-prone graph path. |
 
 ---
 

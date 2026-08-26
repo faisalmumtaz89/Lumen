@@ -175,10 +175,10 @@ ENVIRONMENT VARIABLES (CUDA backend):
     LUMEN_CUDA_DECODE_DELAY_US=<N>
                           Per-decode-step CPU sleep in microseconds, applied AFTER
                           `device.synchronize()` in the CUDA decode paths. Default
-                          `0` (OFF) is bit-exact. Set `=50` to mitigate a CUDA-
-                          scheduler timing race seen under heavy MoE Q4 server
-                          concurrency. CLI is deterministic without this knob.
-                          Cost <=1% TPOT."
+                          `0` (OFF) is bit-exact. Set `=50` as an empirical
+                          mitigation for decode non-determinism observed under
+                          heavy MoE Q4 server concurrency (not a root-caused
+                          fix). Cost <=1% TPOT."
     );
 }
 

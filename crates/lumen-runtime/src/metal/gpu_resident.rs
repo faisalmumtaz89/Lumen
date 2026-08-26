@@ -12,6 +12,21 @@ use super::{MetalF32Backend, PAGE_SIZE};
 use crate::error::RuntimeError;
 use lumen_format::quantization::QuantScheme;
 
+/// Quant schemes the Metal DENSE DECODE path can serve for named layer
+/// slices. Q4_1 is deliberately absent: Metal's Q4_1 kernels cover only MoE
+/// experts and batched prefill; the dense decode dispatch falls through to
+/// an F32-reading pipeline that would silently misread Q4_1 blocks.
+fn dense_slice_quant_supported(q: QuantScheme) -> bool {
+    matches!(
+        q,
+        QuantScheme::F32
+            | QuantScheme::F16
+            | QuantScheme::Bf16
+            | QuantScheme::Q8_0
+            | QuantScheme::Q4_0
+    )
+}
+
 impl MetalF32Backend {
     /// Pre-load ALL layer weights into a single private (GPU-only) Metal buffer.
     ///
@@ -51,7 +66,7 @@ impl MetalF32Backend {
         //
         // shipped this as `LUMEN_METAL_BF16_MMAP_ONLY` gated to BF16.
         // generalized to `LUMEN_METAL_MMAP_ONLY` covering BF16, Q8, Q4
-        // for MoE 30B-A3B Q8/Q4 LBCs where the legacy Pass 1/2/3 dup pushes
+        // for MoE 35B-A3B Q8/Q4 LBCs where the legacy Pass 1/2/3 dup pushes
         // peak RSS above the 5 GB free-RAM BAIL threshold even on 96 GB hosts
         // BF16 alias `LUMEN_METAL_BF16_MMAP_ONLY=1` is preserved for backward
         // compat — either env enables the same path.
@@ -175,32 +190,27 @@ impl MetalF32Backend {
                 cursor as u64
             };
             let st = &layer_view.subtensors;
-            // Reject quant schemes the Metal backend has no dispatch kernels
-            // for BEFORE upload. Without this, a `--target generic` LBC (K-quant
-            // tensors intact, fine on CUDA) loads "successfully" and generates
-            // pad-token garbage — the dispatch catch-alls feed K-quant bytes to
-            // a non-K pipeline. Fail loudly with the remedy instead.
+            // Reject quant schemes the Metal DENSE decode path has no dispatch
+            // kernels for BEFORE upload. Without this, a `--target generic`
+            // LBC (K-quant or source-fidelity Q4_1 tensors intact, fine on
+            // CUDA) loads "successfully" and generates garbage — the dispatch
+            // catch-alls feed those bytes to an F32-reading pipeline. Fail
+            // loudly with the remedy instead.
             for (name, slice) in st.named_slices() {
                 if slice.length == 0 {
                     continue;
                 }
-                match slice.quant {
-                    QuantScheme::F32
-                    | QuantScheme::F16
-                    | QuantScheme::Bf16
-                    | QuantScheme::Q8_0
-                    | QuantScheme::Q4_0
-                    | QuantScheme::Q4_1 => {}
-                    other => {
-                        return Err(RuntimeError::Compute(format!(
-                            "layer {layer} tensor '{name}' is {other:?}: the Metal \
-                             backend has no dispatch kernels for this quant scheme. \
-                             This LBC was converted for a different backend \
-                             (`--target generic`); re-convert with \
-                             `lumen convert --target metal` (K-quant layer tensors \
-                             are upcast to Q8_0)."
-                        )));
-                    }
+                if !dense_slice_quant_supported(slice.quant) {
+                    return Err(RuntimeError::Compute(format!(
+                        "layer {layer} tensor '{name}' is {:?}: the Metal \
+                         backend has no dense DECODE dispatch kernels for this \
+                         quant scheme. This LBC was converted for a different \
+                         backend (`--target generic`); re-convert with \
+                         `lumen convert --target metal` (K-quant and legacy \
+                         Q5_0 layer tensors are upcast to Q8_0, Q4_1 is \
+                         re-quantized to Q4_0).",
+                        slice.quant
+                    )));
                 }
             }
             layer_metas.push(CachedLayerMeta {
@@ -379,7 +389,7 @@ impl MetalF32Backend {
             let span = align(span_raw);
 
             // Sanity: don't wrap absurd sizes (defensive — Qwen3.5-9B BF16
-            // mmap span is ~16.3 GB; MoE-30B BF16 ~60 GB if we ever extend).
+            // mmap span is ~16.3 GB; MoE-35B BF16 ~60 GB if we ever extend).
             const MAX_MMAP_SPAN_BYTES: usize = 96 * 1024 * 1024 * 1024; // 96 GB
             if span > MAX_MMAP_SPAN_BYTES {
                 return Err(RuntimeError::Compute(format!(
@@ -2114,5 +2124,36 @@ impl MetalF32Backend {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_slice_quant_allowlist() {
+        for q in [
+            QuantScheme::F32,
+            QuantScheme::F16,
+            QuantScheme::Bf16,
+            QuantScheme::Q8_0,
+            QuantScheme::Q4_0,
+        ] {
+            assert!(dense_slice_quant_supported(q), "{q:?} must be servable");
+        }
+        // Q4_1 has MoE-expert kernels only; dense dispatch would misread it.
+        for q in [
+            QuantScheme::Q4_1,
+            QuantScheme::Q5_0,
+            QuantScheme::Q4_K,
+            QuantScheme::Q5_K,
+            QuantScheme::Q6_K,
+            QuantScheme::Q2_K,
+            QuantScheme::Q3_K,
+            QuantScheme::CtInt4G32,
+        ] {
+            assert!(!dense_slice_quant_supported(q), "{q:?} must be rejected");
+        }
     }
 }

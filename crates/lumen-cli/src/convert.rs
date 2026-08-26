@@ -182,7 +182,7 @@ pub(crate) fn convert_cmd(args: &[String]) {
 ///
 /// On macOS the only available GPU backend is Metal, and Metal has no
 /// K-quant dispatch kernels. So we default to `Metal` to ensure any K-quant
-/// layer tensor (e.g. the Q6_K `attn_q` in the Q4 MoE-30B GGUF) gets upcast to Q8_0 at convert
+/// layer tensor (e.g. the Q6_K `attn_q` in the Q4 MoE-35B GGUF) gets upcast to Q8_0 at convert
 /// time -- matches what CUDA's K-quant dequant kernels do implicitly.
 ///
 /// On Linux/Windows the host is presumed to be CUDA-capable, so we keep

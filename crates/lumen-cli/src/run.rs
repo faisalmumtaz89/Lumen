@@ -1545,22 +1545,54 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
     } else if entry.gguf_files.len() == 1 {
         // Only one quant available — auto-select it.
         entry.gguf_files.keys().next().unwrap().clone()
-    } else {
-        // Multiple quants — require explicit choice.
+    } else if entry.gguf_files.contains_key(reg.default_quant())
+        && crate::cache::cached_lbc(&entry.key, reg.default_quant()).is_some()
+    {
+        // Multiple quants, none specified, and the registry's declared
+        // default is already cached — use it (lumen-server resolves a bare
+        // model name to the same default quant, though unconditionally).
         eprintln!(
-            "Multiple quantizations available for {}:\n",
-            entry.display_name
-        );
-        let mut quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
-        quants.sort();
-        for q in &quants {
-            eprintln!("  {}:{}", model_name, q.to_lowercase());
-        }
-        eprintln!(
-            "\nSpecify one: lumen run {}:<quant> \"your prompt\"",
+            "Using default quantization {} for {} (override with {}:<quant>)",
+            reg.default_quant().to_lowercase(),
+            entry.display_name,
             model_name
         );
-        std::process::exit(1);
+        reg.default_quant().to_owned()
+    } else {
+        // Multiple quants, none cached as the default. If exactly one quant
+        // has a cached LBC, use it; otherwise require an explicit choice.
+        // A bare model name never starts a download — only an explicit
+        // `model:quant` does.
+        let mut cached: Vec<&String> = entry
+            .gguf_files
+            .keys()
+            .filter(|q| crate::cache::cached_lbc(&entry.key, q).is_some())
+            .collect();
+        if cached.len() == 1 {
+            let q = cached.remove(0).clone();
+            eprintln!(
+                "Using cached quantization {} for {} (override with {}:<quant>)",
+                q.to_lowercase(),
+                entry.display_name,
+                model_name
+            );
+            q
+        } else {
+            eprintln!(
+                "Multiple quantizations available for {}:\n",
+                entry.display_name
+            );
+            let mut quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+            quants.sort();
+            for q in &quants {
+                eprintln!("  {}:{}", model_name, q.to_lowercase());
+            }
+            eprintln!(
+                "\nSpecify one: lumen run {}:<quant> \"your prompt\"",
+                model_name
+            );
+            std::process::exit(1);
+        }
     };
     let quant = quant.as_str();
 
@@ -2047,7 +2079,7 @@ fn run_with_async(
     );
     // Feed the MoE flag into the runtime defaults so the Q8-only
     // resolvers (Q8_SPLIT / OUTPUT_PROJ_SPLIT / Q8_SCALE_HW /
-    // OUTPUT_PROJ_NR / FFN_FUSED_GLU_SKIP) stay OFF on MoE 30B-A3B.
+    // OUTPUT_PROJ_NR / FFN_FUSED_GLU_SKIP) stay OFF on MoE 35B-A3B.
     // Without this gate, `q8_split_default()` returned `true` for Q8 MoE
     // and the SPLIT clone pass corrupted MoE decode into 1 valid token
     // followed by 159 `[PAD248319]` per prompt.
@@ -2716,12 +2748,18 @@ fn run_engine(
             );
             std::process::exit(2);
         }
-        let mut accel = AccelerateBatchBackend::new(
+        let mut accel = match AccelerateBatchBackend::new(
             hyperparams,
             prompt_tokens.len(),
-            embedding.to_vec(),
-            final_norm.to_vec(),
-        );
+            embedding,
+            final_norm,
+        ) {
+            Ok(accel) => accel,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        };
         match engine.generate_with_prefill(
             prompt_tokens,
             weights,

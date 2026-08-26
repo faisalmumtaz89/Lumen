@@ -808,10 +808,6 @@ struct GdnScratchGpu {
     /// Stored on host; uploaded as kernel arg each dispatch.
     conv_positions: Vec<u32>,
 
-    /// GPU-resident conv positions for the GDN decode conv ring.
-    /// Each entry is a single u32 on GPU, synced from host `conv_positions`.
-    conv_positions_gpu: Option<Vec<CudaSlice<u32>>>,
-
     /// Layer index mapping: layer_idx -> gdn_scratch_index.
     /// `gdn_layer_map[layer_idx] = Some(gdn_idx)` for GDN layers, `None` for standard.
     gdn_layer_map: Vec<Option<usize>>,
@@ -899,13 +895,11 @@ struct MutableState {
     argmax_partial_idx: CudaSlice<u32>,
     /// Whether the model has any GDN layers.
     has_gdn_layers: bool,
-    /// Whether the model has Q+gate fusion layers (disables graph capture).
-    has_qgate_layers: bool,
     /// Whether the model has any MoE layers. Populated in `preload_weights`
     /// from `moe_meta_cache`.
     has_moe_layers: bool,
-    /// Number of decode tokens processed since last graph invalidation.
-    /// 0 = not yet run, 1 = first token (no capture), 2+ = graph replay.
+    /// Number of decode tokens processed this sequence; used as the step
+    /// ordinal for the XCHK forensic probe.
     decode_token_count: usize,
     /// GDN scratch (lazy-allocated on first GDN layer, persists for sequence lifetime).
     gdn_scratch_gpu: Option<GdnScratchGpu>,
@@ -1128,8 +1122,8 @@ fn cuda_decode_delay_us() -> u64 {
     static CACHED: OnceLock<u64> = OnceLock::new();
     *CACHED.get_or_init(|| {
         // fall through to the runtime-defaults resolver when
-        // the env var is unset. Server path returns `50` µs (closes the
-        // race); CLI returns `0` (no slowdown). The env var
+        // the env var is unset. Server path returns `50` µs (an empirical
+        // mitigation, not a root-caused fix); CLI returns `0`. The env var
         // still wins when set explicitly so existing scripts / CI / A-B
         // benchmark drivers are unaffected. The OnceLock cache prevents
         // the hot decode path from paying for env::var or atomic reads
@@ -5587,40 +5581,6 @@ impl CudaBackend {
         }
         let conv_positions = vec![0u32; gdn_count];
 
-        // GPU-resident conv positions
-        // for CUDA graph capture. One u32 per GDN layer. The host counter
-        // `conv_positions[gdn_idx]` is kept in lockstep via:
-        //   (a) initial htod_copy from host before begin_capture (in decode_token)
-        //   (b) `advance_conv_position` kernel inside the captured graph
-        //   (c) post-replay host counter advance (in decode_token)
-        // This makes the megakernel-graph variant `gdn_decode_megakernel_graph`
-        // graph-capturable: the kernel reads state_pos from this device pointer
-        // instead of a host-scalar arg that would otherwise be baked into the
-        // graph (preventing replay with a changed value).
-        //
-        // Only allocate when graph capture for GDN is supported. The
-        // `can_use_graph` gate downstream additionally verifies the
-        // gdn_decode_megakernel_graph kernel compiled (it might fail on older
-        // GPUs missing certain PTX features).
-        let conv_positions_gpu: Option<Vec<CudaSlice<u32>>> = {
-            let mut v = Vec::with_capacity(gdn_count);
-            let mut alloc_ok = true;
-            for _ in 0..gdn_count {
-                match self.device.alloc_zeros::<u32>(1) {
-                    Ok(s) => v.push(s),
-                    Err(_) => {
-                        alloc_ok = false;
-                        break;
-                    }
-                }
-            }
-            if alloc_ok {
-                Some(v)
-            } else {
-                None
-            }
-        };
-
         // Allocate ephemeral scratch buffers (shared across layers).
         // Q_norm/K_norm buffers are allocated only when LUMEN_CUDA_GDN_REGISTER_RESIDENT=1
         // because they are unused by the existing megakernel path.
@@ -5649,7 +5609,6 @@ impl CudaBackend {
             h_states,
             conv_states,
             conv_positions,
-            conv_positions_gpu,
             gdn_layer_map,
             qkv_buf: self.device.alloc_zeros::<f32>(params.qkv_dim)?,
             qkv_conv_buf: self.device.alloc_zeros::<f32>(params.qkv_dim)?,
@@ -5691,8 +5650,7 @@ impl CudaBackend {
     /// state (x + ssm_proj) ready for the shared FFN block. `x_gpu` is NOT
     /// updated -- it retains the pre-GDN value. The caller updates `x_gpu`
     /// after the full layer (GDN attention + FFN) completes.
-    /// Eager-path entry point (no graph capture). Equivalent to
-    /// `compute_gdn_attention_gpu_impl(layer_idx, st, false)`.
+    /// Thin wrapper over `compute_gdn_attention_gpu_impl`.
     fn compute_gdn_attention_gpu(
         &self,
         layer_idx: usize,
@@ -10434,10 +10392,10 @@ impl CudaBackend {
         // rationale). Was a one-hot synthesis that destroyed the
         // distribution and caused sampling gibberish on both models.
         self.device.synchronize()?;
-        // optional per-step CPU sleep to close the GPU-scheduler
-        // timing race (mirror of the `decode_token` sync below). Default OFF;
-        // set `LUMEN_CUDA_DECODE_DELAY_US=50` to opt in; the Metal path
-        // established the empirical precedent for this mitigation.
+        // optional per-step CPU sleep (mirror of the `decode_token` sync
+        // below): an empirical mitigation for cross-request decode
+        // non-determinism. Defaults to 50 µs on the server path, 0 on the
+        // CLI; `LUMEN_CUDA_DECODE_DELAY_US` overrides.
         maybe_apply_cuda_decode_delay();
         let logits_host = self.device.dtoh_copy(&st.logits_gpu)?;
         // [XCHK] Cross-backend forensic probe (env LUMEN_XCHK=1, default OFF ->
@@ -15846,21 +15804,25 @@ impl ComputeBackend for CudaBackend {
         // headroom for all model sizes (up to hidden_dim=8192, inter_dim=28672).
         const CUBLAS_WORKSPACE_SIZE: usize = 32 * 1024 * 1024; // 32 MB
         let cublas_workspace = match self.device.alloc_zeros::<u8>(CUBLAS_WORKSPACE_SIZE) {
-            Ok(ws) => match self.device.set_cublas_workspace(&ws) {
-                Ok(()) => {
-                    eprintln!(
-                        "[CUDA] cuBLAS workspace: {} MB (graph-capture ready)",
-                        CUBLAS_WORKSPACE_SIZE / (1024 * 1024),
-                    );
-                    Some(ws)
+            Ok(ws) => {
+                match self.device.set_cublas_workspace(&ws) {
+                    Ok(()) => {
+                        eprintln!(
+                            "[CUDA] cuBLAS workspace: {} MB",
+                            CUBLAS_WORKSPACE_SIZE / (1024 * 1024),
+                        );
+                        Some(ws)
+                    }
+                    Err(e) => {
+                        eprintln!("[CUDA] cublasSetWorkspace failed (using cuBLAS-managed workspace): {e}");
+                        None
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[CUDA] cublasSetWorkspace failed (graph capture disabled): {e}");
-                    None
-                }
-            },
+            }
             Err(e) => {
-                eprintln!("[CUDA] cuBLAS workspace alloc failed (graph capture disabled): {e}");
+                eprintln!(
+                    "[CUDA] cuBLAS workspace alloc failed (using cuBLAS-managed workspace): {e}"
+                );
                 None
             }
         };
@@ -16071,7 +16033,7 @@ impl ComputeBackend for CudaBackend {
                 // weights at this dim (Qwen3.5-MoE encoding). For
                 // Qwen3.5-MoE the shared expert uses the same dim. Both buffers
                 // are sized to `inter_dim` — safe upper bound; over-allocation
-                // is at most ~8 KB on 30B-A3B.
+                // is at most ~8 KB on 35B-A3B.
                 let expert_inter_dim = inter_dim;
                 let shared_inter_dim = inter_dim;
                 Some(super::moe::allocate_moe_scratch(
@@ -16111,7 +16073,6 @@ impl ComputeBackend for CudaBackend {
             argmax_partial_val: self.device.alloc_zeros::<f32>(ARGMAX_TILES)?,
             argmax_partial_idx: self.device.alloc_zeros::<u32>(ARGMAX_TILES)?,
             has_gdn_layers: false,
-            has_qgate_layers: false,
             has_moe_layers: false,
             decode_token_count: 0,
             gdn_scratch_gpu: None,
@@ -17448,12 +17409,6 @@ impl ComputeBackend for CudaBackend {
                         }
                     }
                     gdn.conv_positions.fill(0);
-                    // Also zero GPU-resident conv positions for graph capture.
-                    if let Some(ref mut gpu_pos) = gdn.conv_positions_gpu {
-                        for p in gpu_pos.iter_mut() {
-                            let _ = self.device.htod_copy_into(&[0u32], p);
-                        }
-                    }
                 }
             }
         }
@@ -19225,7 +19180,6 @@ impl ComputeBackend for CudaBackend {
         }
 
         st.has_gdn_layers = has_gdn;
-        st.has_qgate_layers = has_qgate;
         // Detect MoE layers from `moe_meta_cache` (populated earlier in
         // preload_weights).
         let has_moe = st.moe_meta_cache.iter().any(|m| m.is_some());
@@ -19646,10 +19600,11 @@ mod tests {
 
     /// Serializes the BF16-state tests. The process-wide statics
     /// (`BF16_GEMMEX_AVAILABLE`, `BF16_GEMMEX_FALLBACK_ARMED`) are not
-    /// thread-local; tests must run sequentially.
+    /// thread-local, and one test also removes an env var — so the guard
+    /// takes the crate-wide `ENV_TEST_LOCK` (a per-module mutex cannot
+    /// exclude env access from tests in other modules).
     fn bf16_state_test_lock() -> &'static TestMutex<()> {
-        static LOCK: OnceLock<TestMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| TestMutex::new(()))
+        &crate::ENV_TEST_LOCK
     }
 
     /// Returns a guard that records and restores the BF16 GemmEx
@@ -19690,10 +19645,10 @@ mod tests {
         // Simulate a successful probe + no runtime failures yet.
         BF16_GEMMEX_AVAILABLE.store(true, Ordering::Relaxed);
         BF16_GEMMEX_FALLBACK_ARMED.store(false, Ordering::Relaxed);
-        // SAFETY: a single-test setter on a process-static env var
-        // before the gate is read; restored on drop is not required
-        // because subsequent tests do not depend on this variable being
-        // unset (each test sets the value it needs).
+        // SAFETY: the guard holds the crate-wide ENV_TEST_LOCK, so no
+        // other test thread mutates or walks the process environment
+        // concurrently. Restoration is not required: each test sets the
+        // value it needs.
         unsafe {
             std::env::remove_var("LUMEN_CUDA_BF16_GEMMEX");
         }

@@ -73,7 +73,8 @@ const PAGE_SIZE: usize = 4096;
 /// Per-process cached resolver for `LUMEN_METAL_DECODE_DELAY_US`.
 ///
 /// Falls through to `runtime_defaults::metal_decode_delay_us_default()` when
-/// the env var is unset (server → 50 µs, CLI → 0). An explicit env value
+/// the env var is unset (0 — Metal greedy decode is deterministic at the
+/// kernel level since the DET-001 fixes). An explicit env value
 /// always wins so A/B benchmark drivers and CI can pin it. The `OnceLock`
 /// cache keeps the hot decode path to a single integer load after the first
 /// decode token of the process.
@@ -89,12 +90,13 @@ fn metal_decode_delay_us() -> u64 {
 
 /// Apply the decode-delay after a per-token `commit_and_wait()`.
 ///
-/// When the resolved delay is `0` this is a single integer load + branch with
-/// no syscall — the path stays bit-exact and the only cost is one comparison.
-/// When non-zero it issues a CPU `thread::sleep` for the configured number of
-/// microseconds, which stabilises the GPU-scheduler wall-clock window that
-/// otherwise lets a near-tie top-1/top-2 logit pair resolve differently across
-/// repeated in-process decode calls (greedy-decode determinism guard).
+/// When the resolved delay is `0` (the default) this is a single integer
+/// load + branch with no syscall — the path stays bit-exact and the only
+/// cost is one comparison. A non-zero value issues a CPU `thread::sleep` for
+/// the configured number of microseconds — a diagnostic perturbation of GPU
+/// scheduler timing, not a determinism guarantee (DET-001 is fixed at the
+/// kernel level; a CPU sleep cannot make a within-token FP reduction
+/// deterministic).
 #[inline(always)]
 fn maybe_apply_metal_decode_delay() {
     let delay_us = metal_decode_delay_us();

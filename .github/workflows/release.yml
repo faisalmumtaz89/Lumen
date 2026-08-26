@@ -196,7 +196,9 @@ jobs:
           repo="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"  # ghcr requires lowercase
           img="ghcr.io/${repo}"
           chmod +x packaging/modal/bin/* || true
-          # Context = packaging/modal so the Dockerfile's `COPY bin/...` resolves.
+          # Context = packaging/modal so the Dockerfile's `COPY bin/...` resolves;
+          # the license/notice files must be staged into it for the same reason.
+          cp LICENSE-APACHE LICENSE-MIT THIRD_PARTY_NOTICES.md packaging/modal/
           docker build -t "${img}:${GITHUB_REF_NAME}" packaging/modal
           docker push "${img}:${GITHUB_REF_NAME}"
           # Move :latest only on a FINAL release — a pre-release tag (v0.1.0-rc.1,
