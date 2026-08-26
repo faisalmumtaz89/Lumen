@@ -7,6 +7,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-08-26
+
+### Fixed
+
+- **Accelerate prefill (`--accelerate`) no longer crashes or reads out of
+  bounds**: the backend refuses models whose position encoding it cannot
+  compute (NeoX-layout, partial-RoPE, RoPE-scaled) at construction, and
+  validates every weight plane's quant scheme, byte length, and alignment
+  before any `f32` reinterpret. What used to panic (or silently compute on
+  out-of-bounds memory) is now a clean, actionable error.
+- **CUDA Q5_0 host dequantization** used the wrong nibble/high-bit layout
+  (30 of every 32 values corrupted on that path). Fixed to the GGML
+  reference layout; latent — no shipped conversion produced Q5_0 CUDA LBCs.
+- **`--target metal` conversions of Q5_0 GGUFs** produced files the Metal
+  backend then refused to load. Q5_0 layer tensors now upcast to Q8_0 at
+  convert time, like the K-quants.
+- **Metal resident load rejects dense Q4_1 layer tensors** (only reachable
+  from `--target generic` source-fidelity files) instead of silently
+  misreading them; the error names the reconversion remedy.
+- **Metal-target conversions no longer keep a Q6_K output head** under
+  `LUMEN_CONVERT_SOURCE_FIDELITY=1` / `LUMEN_CONVERT_KEEP_Q6K_OUTPUT=1`
+  (Metal would serve it through the slow F32-dequant fallback); the head
+  is requantized to the fast Q8_0 path, matching every other fidelity gate.
+- A racy provider test and a cross-module environment-variable race in the
+  test suite (per-module locks replaced by one crate-wide env test lock).
+
+### Changed
+
+- **`lumen run <model>` with a bare registry name** now selects the registry
+  default quant when its LBC is cached, or the sole cached quant when
+  exactly one exists, instead of always exiting with a list. A bare name
+  never starts a download.
+- **The installer probes the CUDA userland** (libcuda/libnvrtc/libcublas)
+  on NVIDIA hosts and prints an actionable warning when libraries are
+  missing, instead of installing binaries that fail on first inference.
+- **`THIRD_PARTY_NOTICES.md`** (MLX, llama.cpp/ggml kernel-port notices,
+  Qwen chat-template attribution, crate license families) now ships in the
+  release tarballs, the Homebrew keg, the installer's `share/doc/lumen`,
+  and the Docker image; release staging fails if the file is missing.
+- Comments and documentation describing removed machinery (CUDA-graph
+  capture, stale K-quant/MXFP4 conversion claims, 30B→35B MoE naming) were
+  corrected tree-wide; dead graph-era fields and the phantom
+  `LUMEN_GRAPH_DIAGNOSTIC` env var were removed.
+- CI now executes the `lumen-runtime` test suite (it was compiled but
+  never run) and compile-checks every CUDA test target.
+
 ## [0.12.1] — 2026-08-25
 
 ### Changed
@@ -371,6 +417,7 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
 [unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.12.1...HEAD
+[0.13.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/faisalmumtaz89/Lumen/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/faisalmumtaz89/Lumen/compare/v0.11.0...v0.11.1
