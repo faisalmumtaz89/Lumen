@@ -51,7 +51,7 @@ use std::sync::OnceLock;
 static PATH_IS_SERVER: AtomicBool = AtomicBool::new(false);
 
 /// Encodes the dense-quant hint set by the binary. `0` = unset (use legacy
-/// "default ON" BF16-gemmex behaviour, default OFF graph capture), `1` =
+/// "default ON" BF16-gemmex behaviour), `1` =
 /// BF16, `2` = quantised (Q8/Q4/etc.). Encoded as `AtomicU8` so the read
 /// path is one relaxed load.
 static MODEL_DENSE_QUANT_HINT: AtomicU8 = AtomicU8::new(0);
@@ -68,7 +68,7 @@ const HINT_QUANTISED: u8 = 2;
 ///
 /// **Why the PRIMARY scheme, not `output_proj_quant`.** The coarse
 /// `MODEL_DENSE_QUANT_HINT` is fed from `output_proj_quant` (the lm_head),
-/// which only needs the BF16-vs-quantised split for the GemmEx / graph
+/// which only needs the BF16-vs-quantised split for the GemmEx
 /// resolvers. But GGUF keeps the lm_head at higher precision than the body:
 /// the "27B-Q4_0" LBC has `output_proj_quant == Q8_0` — IDENTICAL to the
 /// "27B-Q8_0" LBC's lm_head. So `output_proj_quant` CANNOT separate q4 from q8
@@ -84,11 +84,11 @@ static MODEL_PRIMARY_QUANT_SCHEME: AtomicU8 = AtomicU8::new(QUANT_SCHEME_UNSET);
 
 const QUANT_SCHEME_UNSET: u8 = 255;
 
-/// Tracks whether the loaded LBC declares MoE experts (i.e. Qwen3.5-MoE-30B-A3B
+/// Tracks whether the loaded LBC declares MoE experts (i.e. Qwen3.5-MoE-35B-A3B
 /// class). `false` = dense; `true` = experts > 0 reported by the LBC
 /// hyperparams. Finding: the Q8 "split sibling" weight clone path
 /// (`LUMEN_CUDA_Q8_SPLIT=1`) is byte-identical to the canonical Q8 dense
-/// decode kernel BUT causes catastrophic PAD-token spam on Q8 MoE 30B-A3B
+/// decode kernel BUT causes catastrophic PAD-token spam on Q8 MoE 35B-A3B
 /// (every prompt: 1 valid first token + 159 `[PAD248319]`). Previously
 /// `q8_split_default()` flipped the default ON for any `HINT_QUANTISED`
 /// model — Q8 MoE matches that hint via its Q8_0 output_proj, so the default
@@ -121,7 +121,7 @@ pub fn set_path_is_server(is_server: bool) {
 /// * `Bf16` → BF16-gemmex default ON.
 /// * `Q8_0` / `Q4_0` / other quantised schemes → BF16-gemmex default OFF.
 /// * Unset (this setter never called) → preserves legacy behaviour
-///   (BF16-gemmex default ON, graph capture default OFF).
+///   (BF16-gemmex default ON).
 ///
 /// Idempotent. Called from `lumen-server::run` and `lumen-cli::run`
 /// immediately after `SyncWeightProvider::open` returns.
@@ -352,7 +352,7 @@ pub fn attn_precise_default() -> u8 {
 /// resolvers (`q8_split_default`, `output_proj_split_default`,
 /// `q8_scale_hw_default`, `output_proj_nr_default`,
 /// `ffn_fused_glu_skip_default`) so they correctly stay OFF for MoE
-/// 30B-A3B
+/// 35B-A3B
 /// while remaining ON for dense Q8 (dense Q8 9B, 0.907× llama.cpp) and dense Q4.
 ///
 /// Idempotent — calling twice with the same value is a no-op. The CLI /
@@ -402,8 +402,9 @@ pub(crate) fn model_is_moe_bf16() -> bool {
 /// 391). An elevated `1.08` MoE-only default masked it. The actual root cause
 /// is the GatedDeltaNet (GDN) single-token DECODE recurrence, NOT the
 /// decode-attention kernel: three structurally different decode-attention
-/// kernels (single-block materialise-all, CUDA-graph single-block, FA2
-/// split-K online softmax) ALL produced the identical loop, while running the
+/// kernels (single-block materialise-all, a since-removed CUDA-graph
+/// single-block variant, FA2 split-K online softmax) ALL produced the
+/// identical loop, while running the
 /// GDN delta-rule state update in F64 (`LUMEN_CUDA_GDN_F64_ACCUM`, now
 /// default-ON for MoE via [`gdn_f64_accum_default`]) breaks it and reaches a
 /// clean `340 + 51 = 391` at **pure greedy `rp = 1.0`** (A100, q8). The
@@ -613,9 +614,10 @@ pub fn think_prompt_tail(enable_thinking: bool) -> &'static str {
 // ---------------------------------------------------------------------------
 
 /// Resolves the per-process default for `LUMEN_CUDA_DECODE_DELAY_US` when
-/// the env var is not set. Server path returns `50` µs (closes the
-/// race); CLI returns `0` (no slowdown, CLI is already
-/// fork-deterministic).
+/// the env var is not set. Server path returns `50` µs — an empirical
+/// mitigation for observed cross-request decode non-determinism, not a
+/// root-caused fix. CLI returns `0` (no slowdown; the observed
+/// non-determinism was server-concurrency-specific).
 pub fn cuda_decode_delay_us_default() -> u64 {
     if PATH_IS_SERVER.load(Ordering::Relaxed) {
         50
@@ -625,40 +627,15 @@ pub fn cuda_decode_delay_us_default() -> u64 {
 }
 
 /// Resolves the per-process default for `LUMEN_METAL_DECODE_DELAY_US` when the
-/// env var is not set. Returns `50` µs for BOTH the server AND the CLI path.
-///
-/// This DIVERGES from the CUDA policy (CUDA CLI returns `0`). The reason is
-/// empirical: CUDA's CLI decode path replays a captured CUDA graph, so it is
-/// bit-deterministic without any delay. The Metal backend has NO equivalent
-/// graph-capture replay — its greedy decode (`decode_token_greedy`) is the
-/// same on CLI and server, and was measured to be non-deterministic
-/// across BOTH repeated in-process requests AND repeated cold-start `lumen run`
-/// invocations at delay=0 (Q8 ~10% within-process / ~27% cross-process; Q4
-/// ~30%). The divergence is the documented GPU-scheduler near-tie
-/// timing race: at a sub-ULP-margin top-1/top-2 logit pair, scheduler-timing-
-/// dependent floating-point reduction order in the upstream GPU kernels flips
-/// the on-GPU argmax. (The argmax kernel itself is deterministic.)
-///
-/// IMPORTANT — this delay is a MITIGATION, not a cure. A sweep of the value
-/// over 30-60-trial samples found NO value yields a reliable 30/30: the
-/// rate is noisy and non-monotonic (Q8 ~1.7% residual at 50-200µs, WORSE at
-/// 500µs; Q4 barely improves). A CPU inter-token sleep only perturbs the
-/// scheduler-timing distribution; it cannot make a within-token GPU FP
-/// reduction deterministic. 50µs reduces user-visible Q8 non-determinism ~6×
-/// (10%→~1.7%) at ~0.45% TPOT cost, and unifies the CLI/server default. A true
-/// hard guarantee would require deterministic-reduction kernels (out of scope).
-///
-/// UPDATE: the DET-001 decode non-determinism is now ROOT-CAUSED and FIXED
-/// (two intra-kernel cross-threadgroup races in the decode full-attention path —
-/// the `fused_rope_kv_mha` in-place K write-back, and the `deinterleave_norm_assemble`
-/// qgate-read vs K/V-write aliasing on the shared qkv_buf). With both fixed, Metal
-/// greedy decode is byte-deterministic at 100/100 on Q8 and Q4 (and Q8 byte-matches
-/// llama.cpp). The decode-delay was always a MITIGATION that did not generalize and
-/// cost ~0.45% TPOT; it is now UNNECESSARY. **Default reverted to 0 (bit-exact).** The
-/// `LUMEN_METAL_DECODE_DELAY_US` env var remains available for diagnostics.
+/// env var is not set. Returns `0` for both server and CLI: the three
+/// DET-001 intra-kernel cross-threadgroup races in the decode path are fixed
+/// at the kernel level (see `tests/metal_greedy_determinism_test.rs` for the
+/// enumeration and the repeated-run gate, and
+/// `scripts/metal_determinism_regression.sh`), so no inter-token delay is
+/// needed for them. A CPU sleep only perturbs the GPU scheduler-timing
+/// distribution and cannot make a within-token FP reduction deterministic;
+/// the env var remains available for diagnostics.
 pub fn metal_decode_delay_us_default() -> u64 {
-    // DET-001 is fixed at the kernel level; no scheduler-timing mitigation
-    // is needed. 0 = bit-exact no-op path. Operators can still set the env var.
     0
 }
 
@@ -771,8 +748,8 @@ pub fn gdn_register_resident_default() -> bool {
 ///
 /// **Empirical isolation (A100, q8, pure greedy rp=1.0).** Three structurally
 /// different decode-attention kernels — single-block materialise-all
-/// (`attention_decode`), CUDA-graph single-block, and FA2 split-K online
-/// softmax — ALL produce the identical loop, ruling
+/// (`attention_decode`), a since-removed CUDA-graph single-block variant, and
+/// FA2 split-K online softmax — ALL produced the identical loop, ruling
 /// the attention kernel OUT as the cause. Enabling F64 on the GDN phase-4
 /// state update (`gdn_phase4_register_resident_f64accum`, the default
 /// register-resident decode path) breaks the loop and reaches a clean,
@@ -1056,7 +1033,7 @@ pub fn ffn_fused_glu_skip_default() -> bool {
 /// 48 jobs / ~1.61 GB on 27B — see the BF16 arm below). No-op when the
 /// model has no Q8_0 weights.
 ///
-/// **scope fix**: explicitly OFF for MoE (Qwen3.5-MoE-30B-A3B).
+/// **scope fix**: explicitly OFF for MoE (Qwen3.5-MoE-35B-A3B).
 /// The Q8 SPLIT clone pass operates on per-layer `wq/wk/wv/wo/w_gate/w_up/
 /// w_down` Q8_0 tensors; on an MoE LBC the dense MLP path is replaced by
 /// per-expert weights and the clone pass cloned 70 jobs / 0.6 GB on MoE
@@ -1692,7 +1669,6 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_DUMP_GDN_L0_BIN",
     "LUMEN_DUMP_NORMED",
     "LUMEN_FREQUENCY_PENALTY",
-    "LUMEN_GRAPH_DIAGNOSTIC",
     "LUMEN_KV_PRECISION",
     "LUMEN_METAL_ATTN_PRECISE",
     "LUMEN_METAL_BF16_GATE_UP_NR",
@@ -1961,13 +1937,13 @@ pub fn validator_was_run() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     // The tests in this module mutate process-wide state (atomics + env).
     // Cargo runs tests in parallel within a binary by default; the
-    // serial-test mutex enforces that exactly one test at a time observes
-    // the global state we toggle. The lock is taken FIRST in each test.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    // crate-wide env lock enforces that exactly one test at a time observes
+    // the global state we toggle (env mutation in ANY module races env reads
+    // here, so the lock must be crate-global). Taken FIRST in each test.
+    use crate::ENV_TEST_LOCK as SERIAL;
 
     #[test]
     fn ct4_role_parsing() {
@@ -1996,6 +1972,7 @@ mod tests {
         reset_for_tests();
         set_path_is_server(true);
         assert_eq!(cuda_decode_delay_us_default(), 50);
+        reset_for_tests();
     }
 
     #[test]
@@ -2012,12 +1989,12 @@ mod tests {
     #[test]
     fn metal_default_decode_delay_is_zero_after_det001_fix() {
         let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-        // DET-001 is now ROOT-CAUSED and FIXED at the kernel level (two
-        // intra-kernel cross-threadgroup races in the decode full-attention path).
-        // Metal greedy decode is byte-deterministic (100/100 Q8+Q4) at delay=0, so
-        // the mitigation delay (~0.45% TPOT, never a hard guarantee) is no
-        // longer needed. The Metal default is reverted to 0 (bit-exact) on BOTH
-        // paths; LUMEN_METAL_DECODE_DELAY_US remains available for diagnostics.
+        // The three DET-001 intra-kernel cross-threadgroup races in the
+        // decode path are fixed at the kernel level (see
+        // tests/metal_greedy_determinism_test.rs), so the mitigation delay
+        // (~0.45% TPOT, never a hard guarantee) is no longer needed. The
+        // Metal default is 0 (bit-exact) on BOTH paths;
+        // LUMEN_METAL_DECODE_DELAY_US remains available for diagnostics.
         reset_for_tests();
         set_path_is_server(true);
         assert_eq!(
@@ -2532,8 +2509,8 @@ mod tests {
 
         // Validated 2026-06-11: dense BF16 now defaults F64 ON —
         // the F32 GDN delta-rule decode recurrence accumulates ULP drift into
-        // a repetition attractor on long generations; F64 heals it (coupled
-        // with decode-graph OFF).
+        // a repetition attractor on long generations; F64 heals it (measured
+        // with the since-removed decode-graph path OFF).
         reset_for_tests();
         set_model_dense_quant(QuantScheme::Bf16);
         assert!(
@@ -3010,7 +2987,6 @@ mod tests {
         "LUMEN_DUMP_GDN_L0_BIN",
         "LUMEN_DUMP_NORMED",
         "LUMEN_FREQUENCY_PENALTY",
-        "LUMEN_GRAPH_DIAGNOSTIC",
         "LUMEN_KV_PRECISION",
         "LUMEN_METAL_ATTN_PRECISE",
         "LUMEN_METAL_BF16_GATE_UP_NR",

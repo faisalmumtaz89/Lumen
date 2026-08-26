@@ -22,6 +22,7 @@ class Lumen < Formula
   def install
     bin.install "bin/lumen"
     bin.install "bin/lumen-server"
+    prefix.install "LICENSE-APACHE", "LICENSE-MIT", "THIRD_PARTY_NOTICES.md"
   end
 
   def caveats

@@ -6,7 +6,7 @@ This document describes the methodology used for Lumen's published benchmark sui
 
 The published benchmark suite is scoped to the v1 model family. Additional model families will be added to the suite as they ship.
 
-- **Models measured (v1)**: Qwen3.5-9B (`qwen35`) and Qwen3.5-MoE 35B-A3B (`qwen35moe`; architecture-truthful active-parameter label is 30B-A3B)
+- **Models measured (v1)**: Qwen3.5-9B (`qwen35`) and Qwen3.5-MoE-35B-A3B (`qwen35moe`)
 - **Backends measured**: CUDA on NVIDIA A100-80GB (SM 80) and Metal on Apple Silicon M3 Ultra
 - **Canonical headline configuration**: pp128 + gen128, batch=1 (the (M, G) envelope extends this — see "Prompt and Generation Sizes" below)
 
@@ -92,7 +92,7 @@ When citing decode tok/s, ALWAYS report the (M, G) pair, not M alone. The bench 
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| Warmup runs | 1 | Prime GPU caches, JIT, cuBLAS workspace, CUDA graph capture |
+| Warmup runs | 1 | Prime GPU caches, JIT, cuBLAS workspace |
 | Measured runs | 5 | Industry standard (llama-bench, vLLM benchmarks) |
 | Batch size | 1 | Single-stream latency-oriented workload |
 
@@ -100,7 +100,7 @@ When citing decode tok/s, ALWAYS report the (M, G) pair, not M alone. The bench 
 
 Each engine runs in the same A100 container with the same GPU. CUDA graphs:
 
-- **Lumen** captures a CUDA graph during the warmup phase and replays it for measured tokens.
+- **Lumen** submits decode kernels eagerly (no CUDA graph capture; the graph path was removed after measurement showed zero launch exposure).
 - **llama.cpp** uses its own CUDA graph mechanism.
 - **vLLM** is run with `enforce_eager=True` (CUDA graphs disabled in vLLM).
 
@@ -190,7 +190,7 @@ Ratio = Lumen / baseline
 
 Lumen exposes several CUDA optimizations as environment variables. The **canonical production stack is 12 flags total** (8 default-ON opt-out flags + 4 load-bearing perf levers). All default to ON except `LUMEN_CUDA_BF16_GEMMEX` (which must be `0`), so setting them explicitly is idempotent.
 
-### canonical production env stack (CUDA, MoE-30B-A3B, BF16 0.9× llama.cpp gate)
+### canonical production env stack (CUDA, MoE-35B-A3B, BF16 0.9× llama.cpp gate)
 
 ```bash
 # canonical 8-flag stack (default-ON; opt-out=0):

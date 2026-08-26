@@ -47,6 +47,7 @@ RUN apt-get update \
 #   scp <build-host>:.../release/lumen        packaging/modal/bin/
 COPY bin/lumen-server /opt/lumen/bin/lumen-server
 COPY bin/lumen        /opt/lumen/bin/lumen
+COPY LICENSE-APACHE LICENSE-MIT THIRD_PARTY_NOTICES.md /opt/lumen/
 RUN chmod +x /opt/lumen/bin/lumen-server /opt/lumen/bin/lumen
 
 ENV PATH="/opt/lumen/bin:${PATH}"

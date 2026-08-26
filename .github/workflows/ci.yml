@@ -27,9 +27,10 @@ env:
 
 jobs:
   test-cpu:
-    # The CPU reference suite (lumen-format, lumen-convert, lumen-cli) runs without
-    # a GPU — see README "Requirements". The lumen-runtime GPU paths are validated
-    # in the dedicated GPU workflows, not here.
+    # The CPU reference suite (lumen-format, lumen-convert, lumen-cli, and
+    # lumen-runtime's CPU-side tests) runs without a GPU — see README
+    # "Requirements". The lumen-runtime GPU paths are validated in the
+    # dedicated GPU workflows, not here.
     name: cpu tests + lint
     runs-on: ubuntu-latest
     steps:
@@ -48,7 +49,7 @@ jobs:
       - name: clippy (workspace)
         run: cargo clippy --locked --workspace --release
       - name: cpu test suite
-        run: cargo test --locked -p lumen-format -p lumen-convert -p lumen-cli --release
+        run: cargo test --locked -p lumen-format -p lumen-convert -p lumen-cli -p lumen-runtime --release
       - name: detector self-test
         run: python3 quality/detectors.py --selftest
 
@@ -65,7 +66,14 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: build server (cuda)
         run: cargo build --release --locked -p lumen-server -p lumen-cli --features bin,cuda
-      - name: compile cuda unit tests (no GPU run)
+      # The cuda::prefill_attention lib tests and the cuda integration test
+      # binaries need a physical GPU (cudarc dlopen of libcuda), so this
+      # runner executes the host-side lib suite only — but compiles every
+      # cuda-feature test target so an integration-test build break cannot
+      # ship unnoticed.
+      - name: cuda unit tests (host-side; GPU-requiring skipped)
+        run: "cargo test --locked -p lumen-runtime --lib --features cuda --release -- --skip cuda::prefill_attention::"
+      - name: compile all cuda test targets (no GPU run)
         run: cargo test --locked -p lumen-runtime --features cuda --release --no-run
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

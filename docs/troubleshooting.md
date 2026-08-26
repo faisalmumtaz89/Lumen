@@ -12,7 +12,7 @@ A 9.5 GB Q8 dense-9B model takes ~86 s with warm OS cache and up to ~95 s cold-c
 
 ## OOM during model load
 
-- **BF16 MoE-30B-A3B**: peak 72.4 GB on a 80 GB A100 — requires a dedicated GPU, no co-tenant workloads.
+- **BF16 MoE-35B-A3B**: peak 72.4 GB on a 80 GB A100 — requires a dedicated GPU, no co-tenant workloads.
 - **Metal BF16 dense / Q8 MoE / Q4 MoE**: set `LUMEN_METAL_MMAP_ONLY=1`. The 96 GB residency budget on M3 Ultra cannot fit the LBC AND a full eager allocation; mmap-only is the documented operating mode.
 - **CUDA + concurrent process**: a peer consuming > 5 GB can race `cuMemAlloc` and cause OOM mid-upload. Reserve the GPU.
 

@@ -51,8 +51,8 @@ Benchmarked on an M3 Ultra; see [`bench/RESULTS.md`](../bench/RESULTS.md) for th
 | llama / mistral / qwen2 / phi / gemma architectures | Currently rejected at conversion | Not yet on the verified-against-llama.cpp matrix. v1 scope decision; planned for future model-family releases. |
 | NVIDIA hardware below compute capability 8.0 (pre-Ampere) | Untested | Ampere/Hopper (e.g. A100, H100) is the kernel target; older cards may compile but are not gated |
 | Apple Silicon outside the M-series tested configuration | Untested | The published Metal benchmarks were measured on an M3 Ultra |
-| K-quants (Q4_K, Q5_K, Q6_K, Q2_K, Q3_K) at runtime | Converted to Q8_0 at GGUF→LBC import | No K-quant dispatch kernels |
-| MXFP4 at runtime | Converted to Q8_0 at GGUF→LBC import | Same reason |
+| K-quants (Q4_K, Q5_K, Q6_K, Q2_K, Q3_K) at runtime | Backend-dependent at GGUF→LBC import. `--target metal` upcasts K-quant (and legacy Q5_0) layer tensors to Q8_0 and re-quantizes Q4_1 to Q4_0, unless an explicit `--requant`/`--dequantize` overrides. Generic/CUDA conversions carry K-quant layer planes verbatim and CUDA dequantizes them to F32 at load — except MoE shared-expert planes, which are always requantized to Q4_0. Two role-specific tensors are requantized by default and preserved with `LUMEN_CONVERT_SOURCE_FIDELITY=1` for dedicated CUDA kernels: a Q5_K `ssm_out` and a Q6_K output head | No general K-quant matmul kernels; CUDA kernels exist only for the two preserved roles |
+| MXFP4 at runtime | No LBC representation: required MXFP4 layer tensors are rejected at conversion; optional tensors and MoE shared-expert planes are dequantized (to F32, or Q4_0 for shared-expert gate/up) | No MXFP4 runtime kernels |
 | Batched serving (batch > 1 per request) | Not implemented | Single-stream decode is the optimization target |
 | Speculative decoding / MTP heads | Filtered at conversion | Out of scope |
 

@@ -133,10 +133,11 @@ ENVIRONMENT VARIABLES (CUDA backend):
     LUMEN_CUDA_DECODE_DELAY_US=<N>
                            Per-decode-step CPU sleep in microseconds, applied
                            after `cudaDeviceSynchronize` in the CUDA decode
-                           paths. `lumen-server` defaults to `50` (auto-applied)
-                           to mitigate a CUDA-scheduler timing race under heavy
-                           MoE Q4 concurrency; the `lumen run` CLI defaults to
-                           `0`. Set `=0` to disable on the server. Cost <=1% TPOT.
+                           paths. `lumen-server` defaults to `50` — an empirical
+                           mitigation for decode non-determinism observed under
+                           heavy MoE Q4 concurrency (not a root-caused fix); the
+                           `lumen run` CLI defaults to `0`. Set `=0` to disable
+                           on the server. Cost <=1% TPOT.
 
 EXAMPLES:
     # Positional model:quant, auto-detect backend, default port 8000
@@ -350,6 +351,11 @@ fn resolve_model_path(model: &str, quant_arg: Option<&str>) -> Result<PathBuf, S
         Some(p) if !model[p + 1..].is_empty() => (&model[..p], Some(&model[p + 1..])),
         _ => (model, None),
     };
+    // The quant fallback must match model_registry.toml's [meta]
+    // default_quant. lumen-cli prefers that default for a bare name when its
+    // LBC is cached (falling back to a sole cached quant); the server always
+    // uses it. (Key resolution also differs: the server only rewrites dots
+    // to dashes and does not resolve registry [aliases].)
     let quant = quant_arg
         .map(str::to_owned)
         .or_else(|| tag_quant.map(|s| s.to_owned()))
@@ -742,7 +748,7 @@ async fn run(args: Args) -> Result<(), String> {
     );
     // Feed the MoE flag alongside the dense-quant hint so
     // the Q8-only flag resolvers (`q8_split_default` and the chain that
-    // delegates to it) stay OFF on MoE 30B-A3B. Without this gate, MoE
+    // delegates to it) stay OFF on MoE 35B-A3B. Without this gate, MoE
     // Q8 MoE emits 1 valid token then 159 `[PAD248319]` per prompt.
     lumen_runtime::runtime_defaults::set_model_is_moe(
         provider.lbc().header.hyperparams.num_experts.unwrap_or(0) > 0,

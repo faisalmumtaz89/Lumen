@@ -11,6 +11,13 @@
 //! + Cache     Backend
 //! ```
 
+/// Crate-wide lock serializing tests that mutate process environment
+/// variables. Process env is global state: a per-module lock cannot exclude
+/// an env-mutating test in another module, and a concurrent `set_var` while
+/// another thread walks `env::vars()` is undefined behavior.
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(target_os = "macos")]
 pub mod accelerate;
 pub mod chat_template;

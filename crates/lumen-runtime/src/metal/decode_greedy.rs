@@ -2895,8 +2895,8 @@ impl MetalF32Backend {
             decode_profile::record_final();
             decode_profile::maybe_report_and_reset(64);
         }
-        // DET-001: stabilise the GPU-scheduler near-tie window on repeated
-        // in-process decode calls (no-op when the delay resolves to 0).
+        // Diagnostic inter-token delay; resolves to 0 by default (DET-001 is
+        // fixed at the kernel level) and is then a no-op.
         super::maybe_apply_metal_decode_delay();
 
         // [XCHK] Cross-backend per-op forensic probe (env LUMEN_XCHK=1, default

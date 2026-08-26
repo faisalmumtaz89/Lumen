@@ -555,11 +555,11 @@ mod tests {
         let _view = provider.get_layer_blocking(0).unwrap();
         assert!(provider.try_get_layer(0).is_some());
 
-        // Release it.
+        // Release it. The eviction counter is the race-free observable:
+        // releasing wakes the I/O thread, which immediately starts refilling
+        // the emptied slot, so asserting the slot is empty would race that
+        // refill by design.
         provider.release_layer_hint(0);
-
-        // Should no longer be available.
-        assert!(provider.try_get_layer(0).is_none());
 
         let stats = provider.stats();
         assert_eq!(stats.evictions, 1);

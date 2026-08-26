@@ -16,7 +16,7 @@ The CLI cold-loads weights on every invocation. A 16-client concurrent burst aga
 Operational policy items required before production deployment:
 
 1. **GPU reservation**:
-   - BF16 MoE-30B-A3B → dedicated 80 GB+ GPU (A100-80GB, H100, MI300). No co-tenant workloads.
+   - BF16 MoE-35B-A3B → dedicated 80 GB+ GPU (A100-80GB, H100, MI300). No co-tenant workloads.
    - Q8 MoE → 56 GB free GPU minimum (A100-80GB shared is OK if peer load < 20 GB).
    - Q4 MoE → 30 GB free GPU minimum (A100-40GB OK).
    - Dense-9B → 24 GB free GPU minimum (A100-40GB / L40S / 3090 / 4090 OK).
@@ -34,7 +34,7 @@ Operational policy items required before production deployment:
 
 - **Concurrency C ≥ 4 per GPU under CLI mode**: structurally unsupported; cold-start contention dominates. Use `lumen-server` instead.
 - **Prefill × llama.cpp ratio is structurally below 1.0** at all quants on the current NVRTC compute_61 + non-monolithic-encoder stack.
-- **Q8 / Q4 decode × llama.cpp ratio is structurally locked at 0.584× / 0.674×** on CUDA MoE-30B-A3B. **For llama.cpp-equivalent throughput on MoE-30B-A3B, deploy BF16** (0.902× llama.cpp empirical, requires 80 GB+ GPU).
+- **Q8 / Q4 decode × llama.cpp ratio is structurally locked at 0.584× / 0.674×** on CUDA MoE-35B-A3B. **For llama.cpp-equivalent throughput on MoE-35B-A3B, deploy BF16** (0.902× llama.cpp empirical, requires 80 GB+ GPU).
 - **PURE-greedy long-form (≥ 512 tokens)** deterministically loops on all 4 quants. Use sampling or repetition penalty in production.
 - **`lumen-server` mid-stream client disconnect** can wedge the engine worker. Pending fix; work around with a reverse-proxy that buffers SSE responses.
 - **`lumen-server` Authorization / CORS / per-request timeout** are not implemented; deploy behind a reverse proxy that enforces auth, CORS, and request deadlines.
@@ -42,15 +42,15 @@ Operational policy items required before production deployment:
 
 ## GPU memory peaks
 
-| Quant | Qwen3.5-9B (peak VRAM) | Qwen3.5-MoE-30B-A3B (peak VRAM, 5-trial) |
+| Quant | Qwen3.5-9B (peak VRAM) | Qwen3.5-MoE-35B-A3B (peak VRAM, 5-trial) |
 |-------|-----------------------:|-------------------------------------------------------:|
 | Q4_0  | ~5.1 GB                | **24.1 GB** (LBC 20.7 GB)                              |
 | Q8_0  | ~10.0 GB / ~22.9 GB (with cuBLAS workspace + cache) | **54.3 GB** (LBC 37.6 GB) |
 | BF16  | ~17.8 GB               | **72.4 GB** (LBC 69.7 GB)                              |
 
-Qwen3.5-MoE-30B-A3B at all three quants fits on a single A100-80GB (validated under the models-and-quants matrix audit).
+Qwen3.5-MoE-35B-A3B at all three quants fits on a single A100-80GB (validated under the models-and-quants matrix audit).
 
-**BF16 MoE-30B-A3B headroom warning**: peak 72.4 GB on 80 GB A100 leaves only ~7.6 GB headroom. Any concurrent process consuming > 5 GB can race `cuMemAlloc` and cause OOM mid-upload. In a multi-tenant deployment, BF16 MoE requires a dedicated 80 GB+ GPU reservation. No co-tenant workloads. For shared-GPU deployments, use Q8 (54 GB peak) or Q4 (24 GB peak).
+**BF16 MoE-35B-A3B headroom warning**: peak 72.4 GB on 80 GB A100 leaves only ~7.6 GB headroom. Any concurrent process consuming > 5 GB can race `cuMemAlloc` and cause OOM mid-upload. In a multi-tenant deployment, BF16 MoE requires a dedicated 80 GB+ GPU reservation. No co-tenant workloads. For shared-GPU deployments, use Q8 (54 GB peak) or Q4 (24 GB peak).
 
 KV cache is auto-sized to fit remaining VRAM; `--context-len` overrides. KV growth is bit-perfect to the theoretical formula: `max_seq_len × num_layers × num_kv_heads × head_dim × 4 (F32) × 2 (K + V)`.
 

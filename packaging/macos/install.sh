@@ -124,6 +124,35 @@ has_nvidia() {
   return 1
 }
 
+# The prebuilt CUDA binary loads the driver and toolkit userland dynamically
+# at first inference (`lumen --version` succeeds without them), so a missing
+# library would otherwise surface as a confusing failure on the first run.
+cuda_lib_present() {  # $1 = library name prefix, e.g. libnvrtc.so
+  local d f
+  if have ldconfig && ldconfig -p 2>/dev/null | grep -q "$1"; then return 0; fi
+  local -a dirs=(/usr/lib/x86_64-linux-gnu /usr/lib /usr/lib64 /usr/lib/wsl/lib
+                 /usr/local/cuda/lib64 /usr/local/cuda/targets/x86_64-linux/lib)
+  local IFS=':'
+  for d in ${LD_LIBRARY_PATH:-}; do dirs+=("$d"); done
+  for d in "${dirs[@]}"; do
+    for f in "$d/$1"*; do [ -e "$f" ] && return 0; done
+  done
+  return 1
+}
+
+check_cuda_userland() {
+  local missing=""
+  cuda_lib_present libcuda.so   || missing="$missing libcuda"
+  cuda_lib_present libnvrtc.so  || missing="$missing libnvrtc"
+  cuda_lib_present libcublas.so || missing="$missing libcublas"
+  if [ -n "$missing" ]; then
+    err "CUDA libraries not found on the loader paths this probe checked:$missing"
+    err "The install will complete, but inference will fail unless the NVIDIA"
+    err "driver userland and the CUDA 12.x toolkit runtime are loadable at run"
+    err "time (or LD_LIBRARY_PATH points at them)."
+  fi
+}
+
 OS="$(uname -s)"; ARCH="$(uname -m)"
 case "$OS" in
   Darwin)
@@ -138,6 +167,7 @@ case "$OS" in
     if has_nvidia; then
       PLAT="linux-x86_64-cuda"; BACKEND="cuda"
       PLAT_LABEL="Linux · x86_64 + NVIDIA → CUDA"
+      check_cuda_userland
     else
       err "no NVIDIA GPU detected — the prebuilt Linux binary is CUDA-only."
       err "For a CPU build, build from source: cargo install --path crates/lumen-cli   (or ./scripts/quickstart.sh)"
@@ -251,6 +281,13 @@ install_to() {
   for b in lumen lumen-server; do
     $S install -m 0755 "$SRC/bin/$b" "$d/$b" 2>/dev/null || return 1
   done
+  # The tarball's license + third-party notice files must accompany the
+  # installed copies; older tarballs may lack them, so this is best-effort.
+  if [ -f "$SRC/LICENSE-MIT" ]; then
+    $S mkdir -p "$d/../share/doc/lumen" 2>/dev/null && for f in LICENSE-APACHE LICENSE-MIT THIRD_PARTY_NOTICES.md; do
+      [ -f "$SRC/$f" ] && $S install -m 0644 "$SRC/$f" "$d/../share/doc/lumen/$f" 2>/dev/null
+    done
+  fi
   return 0
 }
 
@@ -364,7 +401,7 @@ if [ "$INTERACTIVE" = "1" ]; then
   say ""
   say "  ${C_BOLD}Choose a model${C_RESET}"
   say "    1  Qwen3.5 9B    ${C_DIM}dense · ~10 GB @ Q8${C_RESET}        ${C_GREEN}(recommended)${C_RESET}"
-  say "    2  Qwen3.5 MoE   ${C_DIM}30B-A3B · mixture-of-experts${C_RESET}"
+  say "    2  Qwen3.5 MoE   ${C_DIM}35B-A3B · mixture-of-experts${C_RESET}"
   say "    3  Qwen3.6 27B   ${C_DIM}dense · largest${C_RESET}"
   printf '  %s›%s ' "$C_CYAN" "$C_RESET"
   read -r pick < /dev/tty || pick=""

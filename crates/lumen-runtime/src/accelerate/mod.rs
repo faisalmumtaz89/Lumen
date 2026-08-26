@@ -78,12 +78,17 @@ impl AccelerateBatchBackend {
     ///
     /// `max_batch` is the maximum number of tokens in a single prefill batch
     /// (typically the prompt length).
+    ///
+    /// Fails for models whose position encoding this backend cannot compute:
+    /// it applies full-head, interleaved (GPT-J-style) RoPE with no scaling,
+    /// so partial-RoPE (`rotary_dim != head_dim`), NeoX-layout, and
+    /// rope-scaled models would produce silently wrong activations.
     pub fn new(
         hp: &ModelHyperparams,
         max_batch: usize,
-        embedding: Vec<f32>,
-        final_norm: Vec<f32>,
-    ) -> Self {
+        embedding: &[f32],
+        final_norm: &[f32],
+    ) -> Result<Self, RuntimeError> {
         let hidden_dim = hp.hidden_dim as usize;
         let num_heads = hp.num_heads as usize;
         let num_kv_heads = hp.num_kv_heads as usize;
@@ -95,6 +100,31 @@ impl AccelerateBatchBackend {
         let gqa_ratio = num_heads / num_kv_heads;
         let half_dim = head_dim / 2;
         let eps = hp.norm_eps;
+
+        if hp.rope_neox {
+            return Err(RuntimeError::Compute(
+                "Accelerate prefill applies interleaved (GPT-J) RoPE; this model uses \
+                 NeoX layout — re-run without --accelerate"
+                    .into(),
+            ));
+        }
+        if let Some(rotary_dim) = hp.rotary_dim {
+            if rotary_dim as usize != head_dim {
+                return Err(RuntimeError::Compute(format!(
+                    "Accelerate prefill applies full-head RoPE; this model rotates only \
+                     {rotary_dim} of {head_dim} dims — re-run without --accelerate"
+                )));
+            }
+        }
+        if let Some(rope) = hp.rope_params.as_ref() {
+            if rope.scaling_type != lumen_format::hyperparams::RopeScalingType::None {
+                return Err(RuntimeError::Compute(format!(
+                    "Accelerate prefill does not apply RoPE scaling ({:?}) — \
+                     re-run without --accelerate",
+                    rope.scaling_type
+                )));
+            }
+        }
 
         // RoPE tables
         let theta = hp.rope_params.as_ref().map(|r| r.theta).unwrap_or(10000.0);
@@ -109,13 +139,14 @@ impl AccelerateBatchBackend {
             }
         }
 
-        // Dequant buffer: sized for the largest weight matrix.
-        // w_gate and w_up are [inter_dim x hidden_dim] — the biggest per-layer matrices.
-        let max_weight_elems = inter_dim * hidden_dim;
+        // Dequant buffer: sized for the largest weight matrix — w_gate/w_up
+        // [inter_dim x hidden_dim] or, when q_dim exceeds inter_dim, wq/wo
+        // [q_dim x hidden_dim].
+        let max_weight_elems = inter_dim.max(q_dim) * hidden_dim;
 
-        AccelerateBatchBackend {
-            embedding,
-            final_norm,
+        Ok(AccelerateBatchBackend {
+            embedding: embedding.to_vec(),
+            final_norm: final_norm.to_vec(),
             dequant_buf: vec![0.0f32; max_weight_elems],
             x_batch: vec![0.0f32; max_batch * hidden_dim],
             normed_batch: vec![0.0f32; max_batch * hidden_dim],
@@ -143,7 +174,7 @@ impl AccelerateBatchBackend {
             attn_scale: 1.0 / (head_dim as f32).sqrt(),
             max_seq_len,
             pool: ThreadPool::with_default_threads(),
-        }
+        })
     }
 
     /// Run batched prefill: process all prompt tokens through all layers.
@@ -239,15 +270,19 @@ impl AccelerateBatchBackend {
         let w_down_bytes = weights.subtensor_bytes(&st.w_down)?;
 
         // ---- 1. RMSNorm all tokens ----
+        let attn_norm_kind =
+            validated_norm_plane(st.attn_norm.quant, attn_norm_bytes.len(), hidden_dim)?;
         for t in 0..batch_size {
             let x_start = t * hidden_dim;
             let x_slice = &self.x_batch[x_start..x_start + hidden_dim];
             let out_slice = &mut self.normed_batch[t * hidden_dim..(t + 1) * hidden_dim];
-            match st.attn_norm.quant {
-                QuantScheme::Q8_0 => {
+            match attn_norm_kind {
+                NormPlane::Q8_0 => {
                     simd_kernels::rmsnorm_q8_0_simd(out_slice, x_slice, attn_norm_bytes, eps)
                 }
-                _ => simd_kernels::rmsnorm_bytes_simd(out_slice, x_slice, attn_norm_bytes, eps),
+                NormPlane::F32 => {
+                    simd_kernels::rmsnorm_bytes_simd(out_slice, x_slice, attn_norm_bytes, eps)
+                }
             }
         }
 
@@ -262,7 +297,7 @@ impl AccelerateBatchBackend {
             q_dim,
             hidden_dim,
             &self.pool,
-        );
+        )?;
 
         // ---- 3. K, V projections ----
         dequant_and_gemm(
@@ -275,7 +310,7 @@ impl AccelerateBatchBackend {
             kv_dim,
             hidden_dim,
             &self.pool,
-        );
+        )?;
         dequant_and_gemm(
             &mut self.v_batch,
             &self.normed_batch,
@@ -286,7 +321,7 @@ impl AccelerateBatchBackend {
             kv_dim,
             hidden_dim,
             &self.pool,
-        );
+        )?;
 
         // ---- 4. RoPE per-token + write KV cache ----
         for t in 0..batch_size {
@@ -447,22 +482,26 @@ impl AccelerateBatchBackend {
             hidden_dim,
             q_dim,
             &self.pool,
-        );
+        )?;
 
         // ---- 7. Residual add: x_batch += attn_proj_batch ----
         let n = batch_size * hidden_dim;
         simd_kernels::vadd_inplace_simd(&mut self.x_batch[..n], &self.attn_proj_batch[..n]);
 
         // ---- 8. FFN RMSNorm ----
+        let ffn_norm_kind =
+            validated_norm_plane(st.ffn_norm.quant, ffn_norm_bytes.len(), hidden_dim)?;
         for t in 0..batch_size {
             let x_start = t * hidden_dim;
             let x_slice = &self.x_batch[x_start..x_start + hidden_dim];
             let out_slice = &mut self.normed_batch[t * hidden_dim..(t + 1) * hidden_dim];
-            match st.ffn_norm.quant {
-                QuantScheme::Q8_0 => {
+            match ffn_norm_kind {
+                NormPlane::Q8_0 => {
                     simd_kernels::rmsnorm_q8_0_simd(out_slice, x_slice, ffn_norm_bytes, eps)
                 }
-                _ => simd_kernels::rmsnorm_bytes_simd(out_slice, x_slice, ffn_norm_bytes, eps),
+                NormPlane::F32 => {
+                    simd_kernels::rmsnorm_bytes_simd(out_slice, x_slice, ffn_norm_bytes, eps)
+                }
             }
         }
 
@@ -477,7 +516,7 @@ impl AccelerateBatchBackend {
             inter_dim,
             hidden_dim,
             &self.pool,
-        );
+        )?;
         dequant_and_gemm(
             &mut self.up_batch,
             &self.normed_batch,
@@ -488,7 +527,7 @@ impl AccelerateBatchBackend {
             inter_dim,
             hidden_dim,
             &self.pool,
-        );
+        )?;
 
         // ---- 10. SwiGLU: gate = silu(gate) * up ----
         simd_kernels::swiglu_inplace_simd(
@@ -507,7 +546,7 @@ impl AccelerateBatchBackend {
             hidden_dim,
             inter_dim,
             &self.pool,
-        );
+        )?;
 
         // ---- 12. Residual add: x_batch += down_batch ----
         let n = batch_size * hidden_dim;
@@ -520,6 +559,50 @@ impl AccelerateBatchBackend {
     }
 }
 
+/// Norm weight plane whose quant and byte length have been validated.
+#[derive(Clone, Copy)]
+enum NormPlane {
+    Q8_0,
+    F32,
+}
+
+/// Error for a weight plane whose byte length does not match what its quant
+/// scheme requires for the given logical shape. Zero-length planes are how the
+/// converter marks tensors a layer does not have (e.g. GDN layers have no
+/// separate wk/wv/wo), so undersized planes are expected on unsupported
+/// architectures, not just on corrupt files.
+fn plane_size_error(quant: QuantScheme, actual: usize, expected: usize) -> RuntimeError {
+    RuntimeError::Compute(format!(
+        "Accelerate prefill: {quant:?} weight plane is {actual} bytes, expected {expected}; \
+         this model's layer layout is not supported by --accelerate, re-run without it"
+    ))
+}
+
+/// Validate a norm weight plane (quant scheme + byte length) for `n` elements.
+fn validated_norm_plane(
+    quant: QuantScheme,
+    actual_bytes: usize,
+    n: usize,
+) -> Result<NormPlane, RuntimeError> {
+    let (kind, expected) = match quant {
+        QuantScheme::Q8_0 => (
+            NormPlane::Q8_0,
+            n.div_ceil(Q8_0_GROUP_SIZE) * Q8_0_BLOCK_SIZE,
+        ),
+        QuantScheme::F32 => (NormPlane::F32, n * 4),
+        q => {
+            return Err(RuntimeError::Compute(format!(
+                "Accelerate prefill supports F32 and Q8_0 norm weights, got {q:?}; \
+                 re-run without --accelerate"
+            )));
+        }
+    };
+    if actual_bytes != expected {
+        return Err(plane_size_error(quant, actual_bytes, expected));
+    }
+    Ok(kind)
+}
+
 /// Dequantize a weight matrix (if Q8_0) and perform batched GEMM via Accelerate.
 ///
 /// Computes: out[batch, out_dim] = input[batch, in_dim] x W^T[in_dim, out_dim]
@@ -527,6 +610,12 @@ impl AccelerateBatchBackend {
 /// Where W is stored row-major as [out_dim, in_dim] (each row is one output neuron).
 /// `dequant_buf` is a reusable scratch buffer for dequantized weights.
 /// `pool` is used to parallelize Q8_0 dequantization across cores.
+///
+/// Only F32 and Q8_0 weights are supported, and the plane's byte length must
+/// cover the [out_dim x in_dim] shape for its scheme; anything else is an
+/// error (reinterpreting a short or quantized plane as F32 would read out of
+/// bounds — zero-length sentinel planes are routine on unsupported
+/// architectures).
 #[allow(clippy::too_many_arguments)]
 fn dequant_and_gemm(
     out: &mut [f32],
@@ -538,19 +627,51 @@ fn dequant_and_gemm(
     out_dim: usize,
     in_dim: usize,
     pool: &ThreadPool,
-) {
+) -> Result<(), RuntimeError> {
     match quant {
         QuantScheme::Q8_0 => {
+            let expected = out_dim * in_dim.div_ceil(Q8_0_GROUP_SIZE) * Q8_0_BLOCK_SIZE;
+            if w_bytes.len() != expected {
+                return Err(plane_size_error(quant, w_bytes.len(), expected));
+            }
+            if dequant_buf.len() < out_dim * in_dim {
+                return Err(RuntimeError::Compute(format!(
+                    "Accelerate prefill: dequant scratch holds {} elements, {} needed \
+                     for a [{out_dim} x {in_dim}] weight matrix",
+                    dequant_buf.len(),
+                    out_dim * in_dim
+                )));
+            }
             dequantize_q8_0_to_f32_parallel(pool, dequant_buf, w_bytes, out_dim, in_dim);
             gemm_batch(out, input, dequant_buf, batch_size, out_dim, in_dim);
         }
-        _ => {
+        QuantScheme::F32 => {
+            let expected = out_dim * in_dim * 4;
+            if w_bytes.len() != expected {
+                return Err(plane_size_error(quant, w_bytes.len(), expected));
+            }
+            if w_bytes.as_ptr().align_offset(std::mem::align_of::<f32>()) != 0 {
+                return Err(RuntimeError::Compute(
+                    "Accelerate prefill: F32 weight plane is not 4-byte aligned; \
+                     re-run without --accelerate"
+                        .into(),
+                ));
+            }
+            // SAFETY: the checks above guarantee w_bytes covers out_dim * in_dim
+            // little-endian f32 values at a 4-byte-aligned address.
             let w_f32 = unsafe {
                 std::slice::from_raw_parts(w_bytes.as_ptr() as *const f32, out_dim * in_dim)
             };
             gemm_batch(out, input, w_f32, batch_size, out_dim, in_dim);
         }
+        q => {
+            return Err(RuntimeError::Compute(format!(
+                "Accelerate prefill supports F32 and Q8_0 weights, got {q:?}; \
+                 re-run without --accelerate"
+            )));
+        }
     }
+    Ok(())
 }
 
 /// Parallel wrapper around `dequantize_q8_0_to_f32`.
@@ -893,6 +1014,247 @@ fn apply_rope_single(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_dequant_and_gemm_rejects_non_f32_non_q8_quants() {
+        let pool = ThreadPool::with_default_threads();
+        let mut out = vec![0.0f32; 2];
+        let input = vec![1.0f32; 32];
+        let mut dequant_buf = vec![0.0f32; 64];
+        // Q4_0 plane for [2 x 32]: 18 bytes per 32-element block.
+        let w_q4 = vec![0u8; 2 * 18];
+        let err = dequant_and_gemm(
+            &mut out,
+            &input,
+            &mut dequant_buf,
+            &w_q4,
+            QuantScheme::Q4_0,
+            1,
+            2,
+            32,
+            &pool,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Q4_0"),
+            "error names the quant: {err}"
+        );
+    }
+
+    #[test]
+    fn test_dequant_and_gemm_f32_nonsquare() {
+        let pool = ThreadPool::with_default_threads();
+        // W = [[1,2,3],[4,5,6]] as [out_dim=2 x in_dim=3]; input = [1,1,1]
+        // -> out = [6, 15]. Non-square with distinct values so a transposed
+        // or dimension-swapped GEMM cannot pass.
+        let w_store: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let w_bytes: Vec<u8> = w_store.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // Copy into an f32-backed allocation so the reinterpret is aligned.
+        let mut w_aligned = vec![0.0f32; w_store.len()];
+        for (dst, chunk) in w_aligned.iter_mut().zip(w_bytes.chunks_exact(4)) {
+            *dst = f32::from_le_bytes(chunk.try_into().unwrap());
+        }
+        let w: &[u8] = unsafe {
+            std::slice::from_raw_parts(w_aligned.as_ptr() as *const u8, w_aligned.len() * 4)
+        };
+        let input = vec![1.0f32, 1.0, 1.0];
+        let mut out = vec![0.0f32; 2];
+        let mut dequant_buf = vec![0.0f32; 6];
+        dequant_and_gemm(
+            &mut out,
+            &input,
+            &mut dequant_buf,
+            w,
+            QuantScheme::F32,
+            1,
+            2,
+            3,
+            &pool,
+        )
+        .unwrap();
+        assert_eq!(out, vec![6.0, 15.0]);
+    }
+
+    #[test]
+    fn test_dequant_and_gemm_rejects_short_f32_plane() {
+        let pool = ThreadPool::with_default_threads();
+        let mut out = vec![0.0f32; 2];
+        let input = vec![1.0f32; 32];
+        let mut dequant_buf = vec![0.0f32; 64];
+        // Zero-length plane: the converter's sentinel for tensors a layer
+        // does not have (e.g. GDN layers have no separate wk/wv/wo).
+        let err = dequant_and_gemm(
+            &mut out,
+            &input,
+            &mut dequant_buf,
+            &[],
+            QuantScheme::F32,
+            1,
+            2,
+            32,
+            &pool,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("0 bytes"),
+            "error names the size: {err}"
+        );
+    }
+
+    #[test]
+    fn test_dequant_and_gemm_rejects_short_q8_plane() {
+        let pool = ThreadPool::with_default_threads();
+        let mut out = vec![0.0f32; 2];
+        let input = vec![1.0f32; 32];
+        let mut dequant_buf = vec![0.0f32; 64];
+        // [2 x 32] Q8_0 needs 2 blocks x 34 bytes = 68; provide one block.
+        let w_short = vec![0u8; 34];
+        let err = dequant_and_gemm(
+            &mut out,
+            &input,
+            &mut dequant_buf,
+            &w_short,
+            QuantScheme::Q8_0,
+            1,
+            2,
+            32,
+            &pool,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("expected 68"),
+            "error names the size: {err}"
+        );
+    }
+
+    #[test]
+    fn test_new_rejects_unsupported_rope() {
+        use lumen_format::hyperparams::{RopeParams, RopeScalingType};
+        let base = ModelHyperparams {
+            num_layers: 1,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+            hidden_dim: 8,
+            intermediate_dim: 16,
+            vocab_size: 8,
+            max_seq_len: 4,
+            rope_params: None,
+            num_experts: None,
+            num_active_experts: None,
+            norm_eps: 1e-5,
+            rotary_dim: None,
+            rope_neox: false,
+            gdn: None,
+        };
+        let emb = vec![0.0f32; 8 * 8];
+        let norm = vec![1.0f32; 8];
+
+        assert!(AccelerateBatchBackend::new(&base, 1, &emb, &norm).is_ok());
+
+        let neox = ModelHyperparams {
+            rope_neox: true,
+            ..base
+        };
+        let err = AccelerateBatchBackend::new(&neox, 1, &emb, &norm)
+            .err()
+            .expect("expected refusal");
+        assert!(err.to_string().contains("NeoX"), "{err}");
+
+        let partial = ModelHyperparams {
+            rotary_dim: Some(2),
+            ..base
+        };
+        let err = AccelerateBatchBackend::new(&partial, 1, &emb, &norm)
+            .err()
+            .expect("expected refusal");
+        assert!(err.to_string().contains("2 of 4"), "{err}");
+
+        // Full-head rotary_dim is accepted.
+        let full = ModelHyperparams {
+            rotary_dim: Some(4),
+            ..base
+        };
+        assert!(AccelerateBatchBackend::new(&full, 1, &emb, &norm).is_ok());
+
+        let scaled = ModelHyperparams {
+            rope_params: Some(RopeParams {
+                theta: 10000.0,
+                scaling_factor: 2.0,
+                scaling_type: RopeScalingType::Linear,
+            }),
+            ..base
+        };
+        let err = AccelerateBatchBackend::new(&scaled, 1, &emb, &norm)
+            .err()
+            .expect("expected refusal");
+        assert!(err.to_string().contains("scaling"), "{err}");
+    }
+
+    #[test]
+    fn test_dequant_and_gemm_rejects_oversized_f32_plane() {
+        let pool = ThreadPool::with_default_threads();
+        let mut out = vec![0.0f32; 2];
+        let input = vec![1.0f32; 2];
+        let mut dequant_buf = vec![0.0f32; 4];
+        // [2 x 2] F32 expects 16 bytes; an oversized plane (e.g. a fused
+        // Q+gate tensor wider than q_dim) must be refused, not truncated.
+        let w_big = vec![0u8; 32];
+        let err = dequant_and_gemm(
+            &mut out,
+            &input,
+            &mut dequant_buf,
+            &w_big,
+            QuantScheme::F32,
+            1,
+            2,
+            2,
+            &pool,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("expected 16"), "{err}");
+    }
+
+    #[test]
+    fn test_dequant_and_gemm_rejects_small_dequant_buf() {
+        let pool = ThreadPool::with_default_threads();
+        let mut out = vec![0.0f32; 2];
+        let input = vec![1.0f32; 32];
+        // Correctly sized [2 x 32] Q8_0 plane, but scratch for one row only.
+        let w_q8 = vec![0u8; 2 * 34];
+        let mut dequant_buf = vec![0.0f32; 32];
+        let err = dequant_and_gemm(
+            &mut out,
+            &input,
+            &mut dequant_buf,
+            &w_q8,
+            QuantScheme::Q8_0,
+            1,
+            2,
+            32,
+            &pool,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("scratch"), "{err}");
+    }
+
+    #[test]
+    fn test_validated_norm_plane() {
+        // F32 norm of 8 elements needs 32 bytes.
+        assert!(matches!(
+            validated_norm_plane(QuantScheme::F32, 32, 8),
+            Ok(NormPlane::F32)
+        ));
+        // Q8_0 norm of 8 elements needs one 34-byte block.
+        assert!(matches!(
+            validated_norm_plane(QuantScheme::Q8_0, 34, 8),
+            Ok(NormPlane::Q8_0)
+        ));
+        // Zero-length sentinel plane is rejected, not fed to the kernel.
+        assert!(validated_norm_plane(QuantScheme::F32, 0, 8).is_err());
+        // Unsupported norm quant is rejected.
+        assert!(validated_norm_plane(QuantScheme::F16, 16, 8).is_err());
+    }
 
     #[test]
     fn test_dequantize_q8_0_roundtrip() {

@@ -103,7 +103,7 @@ fn append_stacked_expert_slice<R: Read + Seek>(
         let f32_data =
             dequantize_to_f32_bytes(&buf, tensor.ggml_type, expert_elements, tensor_name)?;
         blob.extend_from_slice(&f32_data);
-    } else if target == ConvertTarget::Metal && is_k_quant(tensor.ggml_type) {
+    } else if target == ConvertTarget::Metal && metal_needs_upcast(tensor.ggml_type) {
         // Metal K-quant upcast for stacked expert weights: dequant slice to F32
         // then quantize to Q8_0. Must match compute_stacked_slice's reported
         // byte size when target == Metal.
@@ -185,7 +185,7 @@ fn compute_stacked_slice(
         };
         *blob_offset += size;
         Ok(slice)
-    } else if target == ConvertTarget::Metal && is_k_quant(tensor.ggml_type) {
+    } else if target == ConvertTarget::Metal && metal_needs_upcast(tensor.ggml_type) {
         // Metal K-quant upcast: stacked expert slice -> Q8_0.
         let expert_elements = tensor.n_elements() / num_experts;
         assert!(
@@ -289,8 +289,13 @@ fn compute_layer_shape_qwen35moe(
             };
             *blob_offset += size;
             Ok(slice)
-        } else if target == ConvertTarget::Metal && !is_norm && is_k_quant(tensor.ggml_type) {
-            // Metal K-quant upcast for layer tensor: Qx_K -> Q8_0.
+        } else if target == ConvertTarget::Metal && !is_norm && metal_needs_upcast(tensor.ggml_type)
+        {
+            // Metal K-quant / legacy-Q5_0 upcast for layer tensor -> Q8_0.
+            // The !is_norm guard is load-bearing: the writer routes norm
+            // tensors through append_tensor_to_blob, which is Generic-target
+            // and can never upcast, so a norm upcast planned here would
+            // desync the planner from the writer.
             let n_elements = tensor.n_elements();
             assert!(
                 n_elements % 32 == 0,

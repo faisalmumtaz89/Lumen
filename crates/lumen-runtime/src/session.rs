@@ -1517,7 +1517,6 @@ mod tests {
     use lumen_format::ModelHyperparams;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
 
     use crate::compute::cpu_naive::NaiveF32Backend;
     use crate::compute::ComputeBackend;
@@ -1531,10 +1530,11 @@ mod tests {
     /// default multithreaded test runner, an env `set_var`/`remove_var` in one
     /// test races sibling tests reading the same variable. Every env-mutating
     /// test in this module holds this lock for the full set→read→restore window
-    /// so the mutation is never observed concurrently. Mirrors the per-crate
-    /// `SERIAL` pattern in `runtime_defaults.rs`. Test-only; no production code
-    /// path takes this lock.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    /// so the mutation is never observed concurrently. The lock is the
+    /// crate-wide `ENV_TEST_LOCK`: process env is global, so a per-module
+    /// mutex cannot exclude env-mutating tests in other modules. Test-only;
+    /// no production code path takes this lock.
+    use crate::ENV_TEST_LOCK as SERIAL;
 
     fn synthetic_setup() -> (SyncWeightProvider, NaiveF32Backend, ModelHyperparams) {
         let cfg = TestModelConfig::default();
