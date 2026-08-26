@@ -172,6 +172,27 @@ fn generic_target_preserves_q5_0() {
 }
 
 #[test]
+fn moe_requant_is_refused() {
+    let gguf = build_q5_model(true);
+    let out = std::env::temp_dir().join(format!("lockstep_moe_req_{}.lbc", std::process::id()));
+    let opts = ConvertOptions {
+        requant_to: Some(QuantScheme::Q4_0),
+        ..Default::default()
+    };
+    std::fs::remove_file(&out).ok();
+    let err =
+        convert_gguf_bytes_to_lbc(&gguf, &out, &opts).expect_err("MoE --requant must be refused");
+    assert!(
+        matches!(
+            err,
+            lumen_convert::convert::ConvertError::UnsupportedOption(_)
+        ),
+        "{err}"
+    );
+    assert!(!out.exists(), "no partial output on refusal");
+}
+
+#[test]
 fn metal_target_q5_0_respects_flag_precedence() {
     // --dequantize wins over the upcast on both sides of the planner/writer.
     let deq = ConvertOptions {

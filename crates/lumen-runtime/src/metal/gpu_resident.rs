@@ -213,6 +213,61 @@ impl MetalF32Backend {
                     )));
                 }
             }
+            // The dense-FFN gate+up dispatch arms for Q4_0/F16/Bf16/F32
+            // select on the gate's quant alone and bind w_up_off regardless,
+            // and the fused shaders stride both pointers with one row_bytes
+            // derived from the gate's scheme — a gate/up quant mismatch
+            // (producible: the converter upcasts K-quant tensors per tensor)
+            // would compute silently wrong output.
+            if st.w_gate.length > 0 && st.w_up.length > 0 && st.w_gate.quant != st.w_up.quant {
+                return Err(RuntimeError::Compute(format!(
+                    "layer {layer}: ffn_gate is {:?} but ffn_up is {:?}: the \
+                     Metal fused FFN kernels require the pair to share one \
+                     quant scheme. Re-convert with a uniform quantization \
+                     (e.g. `lumen convert --target metal --requant q8_0`).",
+                    st.w_gate.quant, st.w_up.quant
+                )));
+            }
+            // On GDN layers the decode path pairs attn_gate with the qkv
+            // route: the Q8_0 qkv+gate 2-stream kernel (default-on) decodes
+            // the gate as Q8_0 without consulting its quant, and the non-Q8
+            // route's gate fallback reads anything outside {Q4_0, F16, Bf16}
+            // as F32 — so a Q8_0/non-Q8_0 split between attn_qkv and
+            // attn_gate in either direction computes silently wrong output.
+            // Full-attention layers dispatch attn_gate on its own quant and
+            // are exempt.
+            if let (Some(1), Some(gate)) = (st.layer_type, st.attn_gate.as_ref()) {
+                if gate.length > 0
+                    && ((st.wq.quant == QuantScheme::Q8_0) != (gate.quant == QuantScheme::Q8_0))
+                {
+                    return Err(RuntimeError::Compute(format!(
+                        "layer {layer}: attn_qkv is {:?} but attn_gate is {:?}: \
+                         the Metal GDN decode path requires the pair to agree \
+                         on whether it is Q8_0. Re-convert from a source GGUF \
+                         with a uniform quantization (`--requant q8_0` also \
+                         works for dense models).",
+                        st.wq.quant, gate.quant
+                    )));
+                }
+            }
+            // The MoE expert dispatch has the same shape: it selects the
+            // fused gate+up pipeline on the expert gate's quant alone
+            // (CachedMoeMeta carries no up quant), so a per-expert gate/up
+            // mismatch would also compute silently wrong output.
+            if let Some(experts) = st.experts.as_ref() {
+                for (i, e) in experts.iter().enumerate() {
+                    if e.gate.length > 0 && e.up.length > 0 && e.gate.quant != e.up.quant {
+                        return Err(RuntimeError::Compute(format!(
+                            "layer {layer} expert {i}: gate is {:?} but up is {:?}: \
+                             the Metal fused expert FFN kernels require the pair \
+                             to share one quant scheme. Re-convert with \
+                             `lumen convert --target metal` from a source GGUF \
+                             whose expert tensors share one quantization.",
+                            e.gate.quant, e.up.quant
+                        )));
+                    }
+                }
+            }
             layer_metas.push(CachedLayerMeta {
                 attn_norm_off: base + st.attn_norm.offset,
                 wq_off: base + st.wq.offset,

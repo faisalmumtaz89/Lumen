@@ -325,6 +325,7 @@ async fn boot_soak_server(
         lumen_format::QuantScheme::Q8_0
             | lumen_format::QuantScheme::Q4_0
             | lumen_format::QuantScheme::F16
+            | lumen_format::QuantScheme::Bf16
     ) {
         backend.set_embedding_raw(provider.embedding_raw.clone(), qs);
     }
@@ -334,6 +335,7 @@ async fn boot_soak_server(
         lumen_format::QuantScheme::Q8_0
             | lumen_format::QuantScheme::Q4_0
             | lumen_format::QuantScheme::F16
+            | lumen_format::QuantScheme::Bf16
     ) {
         backend.set_output_proj_raw(provider.output_proj_raw.clone(), qs_out);
     }

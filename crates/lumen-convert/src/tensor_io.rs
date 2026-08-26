@@ -17,7 +17,8 @@ use std::io::{Read, Seek, SeekFrom};
 /// Metal has no K-quant matmul or dequant kernels -- any layer tensor stored
 /// as a K-quant type must be upcast to Q8_0 at convert time so Metal can
 /// dispatch to its tiled Q8_0 matmul kernels at runtime. CUDA, by contrast,
-/// ships full K-quant dequant kernels (cf. lumen-runtime/cuda/gpu_buffers.rs:340).
+/// dequantizes K-quant planes host-side at load
+/// (lumen-runtime/src/cuda/gpu_buffers.rs).
 pub(crate) fn is_k_quant(t: GgmlType) -> bool {
     matches!(
         t,
@@ -150,11 +151,10 @@ pub(crate) fn append_tensor_to_blob_requant_with_target<R: Read + Seek>(
     let is_norm = tensor_name.contains("norm");
 
     // Metal target: K-quant or legacy-Q5_0 layer tensor (non-norm) -- upcast
-    // to Q8_0.
-    // Numerically lossless within Q8_0 precision: Q8_0 has 8-bit mantissa
-    // per element vs. Q6_K's 6-bit, so the round-trip dequant->Q8_0 is
-    // a strict precision upgrade. Skip when user already set --requant or
-    // --dequantize, those flags take precedence.
+    // to Q8_0. The round trip re-quantizes with new block scales; Q8_0's
+    // 8-bit mantissa keeps the additional loss below the source quant's own
+    // error. Skip when user already set --requant or --dequantize, those
+    // flags take precedence.
     let needs_metal_upcast = target == ConvertTarget::Metal
         && !is_norm
         && !dequantize

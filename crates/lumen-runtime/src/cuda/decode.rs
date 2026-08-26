@@ -203,6 +203,7 @@ pub(crate) struct KernelSet {
     pub(crate) embed_batch_f32: CudaFunction,
     pub(crate) embed_batch_q8_0: CudaFunction,
     pub(crate) embed_batch_f16: CudaFunction,
+    pub(crate) embed_batch_bf16: CudaFunction,
     pub(crate) embed_batch_q4_0: CudaFunction,
     pub(crate) rmsnorm_batched: CudaFunction,
     pub(crate) rope_apply_batched: CudaFunction,
@@ -812,9 +813,10 @@ pub(crate) struct KernelSet {
     // Q8_1-activation x {Q8_0,Q4_0}-weight matvec with dp4a INT8
     // dot-product, plus the `quantize_q8_1` activation pre-pass. Replaces the
     // 4 Lumen matvec kernels identified as the dominant per-token
-    // cost (63.3% TPOT). Gated behind `LUMEN_CUDA_MMV_Q_DP4A=1` (default OFF).
-    // NVRTC failure leaves the existing `matvec_q8_0_smem` / `matvec_q4_0` /
-    // batched MoE kernels as the fallback (byte-identical to).
+    // cost (63.3% TPOT). Gated by `LUMEN_CUDA_MMV_Q_DP4A` (canonical
+    // default ON via runtime_defaults). NVRTC failure leaves the existing
+    // `matvec_q8_0_smem` / `matvec_q4_0` / batched MoE kernels as the
+    // fallback.
     pub(crate) quantize_q8_1_rawsum: Option<CudaFunction>,
     pub(crate) mul_mat_vec_q_q8_0: Option<CudaFunction>,
     pub(crate) mul_mat_vec_q_q4_0: Option<CudaFunction>,
@@ -840,8 +842,9 @@ pub(crate) struct KernelSet {
 
     // BF16 output_proj matvec (replaces cuBLAS HGEMV at the
     // largest BF16 decode call, 16.7% TPOT measured).
-    // Env-gated `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ=1` (default OFF). NVRTC
-    // failure leaves cuBLAS HGEMV path as fallback (byte-identical).
+    // Gated by `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ` (canonical default ON via
+    // runtime_defaults). NVRTC failure leaves the cuBLAS HGEMV path as
+    // fallback.
     pub(crate) mul_mat_vec_f_bf16: Option<CudaFunction>,
 
     // MoE per-expert FFN kernels.
@@ -1072,6 +1075,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         embed_batch_f32: load_fn(shaders::PREFILL_KERNEL_SOURCE, "embed_batch_f32")?,
         embed_batch_q8_0: load_fn(shaders::PREFILL_KERNEL_SOURCE, "embed_batch_q8_0")?,
         embed_batch_f16: load_fn(shaders::PREFILL_EMBED_KERNEL_SOURCE, "embed_batch_f16")?,
+        embed_batch_bf16: load_fn(shaders::PREFILL_EMBED_KERNEL_SOURCE, "embed_batch_bf16")?,
         embed_batch_q4_0: load_fn(shaders::PREFILL_EMBED_KERNEL_SOURCE, "embed_batch_q4_0")?,
         rmsnorm_batched: load_fn(shaders::PREFILL_KERNEL_SOURCE, "rmsnorm_batched")?,
         rope_apply_batched: load_fn(shaders::PREFILL_KERNEL_SOURCE, "rope_apply_batched")?,

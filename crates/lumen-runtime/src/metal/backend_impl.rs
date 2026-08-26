@@ -3005,6 +3005,8 @@ impl ComputeBackend for MetalF32Backend {
                 match self.embedding_quant {
                     QuantScheme::Q8_0 => enc.set_pipeline_state(&pipelines.embed_token_q8_0),
                     QuantScheme::Q4_0 => enc.set_pipeline_state(&pipelines.embed_token_q4_0),
+                    QuantScheme::F16 => enc.set_pipeline_state(&pipelines.embed_token_f16),
+                    QuantScheme::Bf16 => enc.set_pipeline_state(&pipelines.embed_token_bf16),
                     _ => enc.set_pipeline_state(&pipelines.embed_token),
                 }
                 enc.set_buffer(embed_buf_ref, embed_off, 0);
