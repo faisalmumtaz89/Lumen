@@ -72,7 +72,7 @@ jobs:
       # cuda-feature test target so an integration-test build break cannot
       # ship unnoticed.
       - name: cuda unit tests (host-side; GPU-requiring skipped)
-        run: cargo test --locked -p lumen-runtime --lib --features cuda --release -- --skip cuda::prefill_attention::
+        run: "cargo test --locked -p lumen-runtime --lib --features cuda --release -- --skip cuda::prefill_attention::"
       - name: compile all cuda test targets (no GPU run)
         run: cargo test --locked -p lumen-runtime --features cuda --release --no-run
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
