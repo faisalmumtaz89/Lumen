@@ -7,6 +7,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Fixed
+
+- **Metal load validation now runs on every execution path and covers the
+  tensor classes the dispatch reads with a hardcoded scheme.** The
+  layer-quant checks moved into one validator that also runs on streaming /
+  non-resident loading (previously unguarded), and gained new checks:
+  `ssm_alpha`/`ssm_beta` must be Q8_0 (the Metal GDN gate pipelines read
+  them as Q8_0 only); expert banks must share one quant scheme (dispatch
+  applies expert 0's schemes to all); shared-expert tensors must form a
+  complete gate/up/down set on the fused-kernel quants; and
+  norm/router/SSM-scalar tensors must be F32 (every Metal shader reads
+  them as F32; CUDA already rejected these at load).
+- **Weight-tied models load correctly on Metal's staged (non-mmap) path
+  when the output head and embedding are stored in different
+  representations.** The tied-head alias now applies only when the two
+  representations match; previously a tied BF16 model computed wrong
+  logits on that path (the BF16-typed head shader read F32 bytes).
+- **`--dequantize` works on dense GDN models again.** The converter's
+  planner and writer disagreed on `ssm_alpha`/`ssm_beta` under
+  `--dequantize`, aborting the conversion for every real Qwen3.5/3.8 GGUF.
+  Non-Metal targets now write true F32 gates (CUDA serves them); the Metal
+  target keeps the Q8_0 force so the output stays loadable. Dequantized
+  MoE expert banks are served by Metal's per-expert float path.
+
+### Changed
+
+- Benchmark and capacity documentation scopes each provenance claim to what
+  its artifact records: BF16 battery cells are separate same-GPU H100
+  batteries (not co-located), the llama.cpp build/protocol attestation
+  applies to the co-located A100 cells only, the A100-80GB BF16-MoE fit is
+  stated as unverified (conflicting unretained records), and the
+  Qwen3.6-27B CUDA rows carry the retained record (0.892×/0.820×).
+
 ## [0.14.0] — 2026-08-27
 
 ### Fixed
@@ -34,7 +67,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 - **Published benchmark and capacity documentation now carries only
   retained-artifact provenance.** The unretained 2026-06-02 dataset is
-  marked as such, and the retained 2026-07-16 co-located battery is the
+  marked as such, and the retained 2026-07-16 battery (co-located A100
+  quant cells; separate same-GPU H100 BF16 batteries) is the
   published record — notably dense-9B Q8 0.970× / Q4 0.979× vs llama.cpp
   (better than the withdrawn figures) and MoE BF16 0.575× on H100 (the
   earlier 0.902× "production-recommended" claim is withdrawn). VRAM figures
@@ -401,8 +435,8 @@ Q4/Q8/BF16; the Q4 route is byte-identical to the v0.9.0 certified baseline.
 
 CUDA (NVIDIA, compute capability 8.0+ — Ampere / Hopper; benchmarked on A100-80GB):
 
-- Qwen3.5-9B dense at Q8_0 (**0.91× llama.cpp** decode), Q4_0 (0.64× llama.cpp), BF16 (**0.93–0.94× llama.cpp** decode) *(2026-08-26 correction: artifacts not retained; retained co-located record — Q8 0.970×, Q4 0.979× on A100, BF16 0.727× on H100)*
-- Qwen3.5-MoE-35B-A3B at Q8_0 (0.584× llama.cpp), Q4_0 (0.674× llama.cpp), and **BF16 (0.902× llama.cpp, production-recommended)** *(2026-08-26 correction: these ratios have no retained measurement artifacts and the production recommendation is withdrawn — under the retained record BF16 is the lowest MoE ratio; the retained co-located record is 0.567×/0.598× on A100 and BF16 0.575× on H100 — see bench/RESULTS.md)*
+- Qwen3.5-9B dense at Q8_0 (**0.91× llama.cpp** decode), Q4_0 (0.64× llama.cpp), BF16 (**0.93–0.94× llama.cpp** decode) *(2026-08-26 correction: artifacts not retained; retained record — Q8 0.970×, Q4 0.979× on A100 co-located, BF16 0.727× on H100 in separate per-engine batteries)*
+- Qwen3.5-MoE-35B-A3B at Q8_0 (0.584× llama.cpp), Q4_0 (0.674× llama.cpp), and **BF16 (0.902× llama.cpp, production-recommended)** *(2026-08-26 correction: these ratios have no retained measurement artifacts and the production recommendation is withdrawn — under the retained record BF16 is the lowest MoE ratio; the retained record is 0.567×/0.598× on A100 co-located and BF16 0.575× on H100 in separate per-engine batteries — see bench/RESULTS.md)*
 - Validated end-to-end on the full models × quants matrix against llama.cpp
 
 Metal (Apple Silicon, M-series; benchmarked on M3 Ultra):

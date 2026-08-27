@@ -65,9 +65,11 @@ impl ComputeBackend for MetalF32Backend {
                 self.embedding = Vec::new();
             } else {
                 self.embedding_buf = Some(self.upload_f32(&self.embedding)?);
+                self.embedding_quant = QuantScheme::F32;
             }
         } else {
             self.embedding_buf = Some(self.upload_f32(&self.embedding)?);
+            self.embedding_quant = QuantScheme::F32;
         }
         // The raw native-quant embedding bytes have served their sole purpose:
         // they were copied into `embedding_buf` (the GPU MTLBuffer) in the
@@ -102,18 +104,21 @@ impl ComputeBackend for MetalF32Backend {
                 self.output_proj = Vec::new();
             } else {
                 self.output_proj_buf = Some(self.upload_f32(&self.output_proj)?);
+                self.output_proj_quant = QuantScheme::F32;
             }
         } else {
             self.output_proj_buf = Some(self.upload_f32(&self.output_proj)?);
+            self.output_proj_quant = QuantScheme::F32;
         }
         // Symmetric to `embedding_raw` above: the raw output_proj bytes were
         // copied into `output_proj_buf` (L78) and have no other reader (full
         // grep of `self.output_proj_raw` in metal/ shows L76 is the ONLY read;
         // compute_final reads `output_proj_buf`, the GPU-resident preload blits
         // from `output_proj_buf.contents()`, and weight tying reuses the
-        // embedding offset without touching this). Under weight tying this Vec
-        // is typically empty already; freeing is still correct. ~0 GB tied,
-        // up to ~0.66 GB untied. Non-quantized models: already None (no-op).
+        // embedding offset without touching this). The converter aliases the
+        // tied head to the embedding blob, so providers materialize this Vec
+        // for tied models too; freeing recovers up to ~0.66 GB either way.
+        // Non-quantized models: already None (no-op).
         self.output_proj_raw = None;
 
         // Compute dimensions

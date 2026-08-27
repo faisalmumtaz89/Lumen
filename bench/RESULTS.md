@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-08-26
 
-> **Scope (2026-06-02):** The benchmark suite is currently scoped to Lumen's v1 model family (Qwen3.5). All numbers below are measured on Qwen3.5-9B dense and Qwen3.5-MoE-35B-A3B. Additional model families will be added to this suite as they ship.
+> **Scope:** The benchmark suite covers Lumen's v1 model family: Qwen3.5-9B dense, Qwen3.5-MoE-35B-A3B, and (from the retained 2026-07-16 battery) Qwen3.6-27B dense CUDA decode. Additional model families will be added as they ship.
 
 Methodology: [METHODOLOGY.md](METHODOLOGY.md). How to reproduce: [README.md](README.md). Deployment guidance: [`docs/production.md`](../docs/production.md).
 
@@ -10,9 +10,13 @@ Methodology: [METHODOLOGY.md](METHODOLOGY.md). How to reproduce: [README.md](REA
 
 ## TL;DR — production-realistic numbers
 
-Retained co-located record (2026-07-16 battery, tree 887a9e4; per its
-record, both engines in one container per cell, 5 runs — A100 PCIe for
-Q8/Q4, H100 for BF16):
+Retained record (2026-07-16 battery; 5 decode runs per engine per cell;
+the artifacts record no engine commit). Q8/Q4 cells are co-located — both
+engines in one A100 PCIe container per cell, llama.cpp build `5839ba3`,
+tg256. The BF16 cells are separate Lumen and llama.cpp batteries on the
+same H100 GPU model and driver; their artifacts record per-run decode
+rates but not the llama.cpp build or bench protocol, and same-container
+co-residency is not recorded for them:
 
 | Quant | GPU | Lumen (tok/s) | llama.cpp | × llama.cpp |
 |-------|-----|------------:|----------:|------------:|
@@ -97,7 +101,7 @@ Cold-start gate "≤30 s for ≤10 B model" is N/A for 35B-A3B MoE (active 3B bu
 | C=2 | 50.0 / 93.6 (asymmetric) | 143.6 | **1.35×** |
 | C≥4 | n/a — no server-side scheduler in Lumen CLI; deploy `lumen-server` for ≥4 concurrent clients | n/a | n/a |
 
-Per-GPU OOM ceilings (single A100-80GB): Q4 ~C=3, Q8 ~C=2, BF16 C=1. C≥4 requires weight-sharing scheduler (deferred to KV-cache / server work).
+Per-GPU OOM ceilings (single A100-80GB, 2026-06-02 dataset — artifacts not retained; the A100 BF16-MoE fit is unverified per docs/production.md): Q4 ~C=3, Q8 ~C=2, BF16 C=1. C≥4 requires weight-sharing scheduler (deferred to KV-cache / server work).
 
 ---
 
@@ -105,25 +109,40 @@ Per-GPU OOM ceilings (single A100-80GB): Q4 ~C=3, Q8 ~C=2, BF16 C=1. C≥4 requi
 
 | Field | Value |
 |-------|-------|
-| Date | 2026-05-26 (latest re-bench) |
+| Date | Summary table: 2026-07-16 battery. Historical subsections below: 2026-05-26 re-bench |
 | Model | Qwen3.5-9B dense (`qwen35` architecture — GDN hybrid + dense FFN) |
 | Hardware | NVIDIA A100-80GB (PCIe canonical for parity baselines; SXM4 used for long-context / soak scenarios where annotated) |
 | CUDA | 12.6.3 |
 | Lumen | CUDA backend, opt-in stack enabled (see [METHODOLOGY.md](METHODOLOGY.md)) |
-| llama.cpp | commit `0ec191e`, co-located in the same A100 container |
+| llama.cpp | Summary table: `5839ba3` (tg256) for the A100 rows; not recorded for the BF16 row. Historical subsections: `0ec191e`, co-located in the same A100 container |
 | vLLM | 0.21.0 (BF16 only; transformers 5.5.4, tokenizers 0.22.2, `VLLM_USE_FLASHINFER_SAMPLER=0`) |
-| Config | pp128 + gen128, batch=1, 5 trials, 1 warmup, median reported (canonical headline; see "Decode envelope" below for the full (M, G) parameter space) |
+| Config | Summary table: tg256 decode battery, 5 runs. Historical subsections: pp128 + gen128, batch=1, 5 trials, 1 warmup, median reported (see "Decode envelope" below for the full (M, G) parameter space) |
 | GGUF source | `bartowski/Qwen_Qwen3.5-9B-GGUF` (BF16 generated via `convert_hf_to_gguf.py --outtype bf16`) |
 
 ### Summary — Qwen3.5-9B dense
 
-Retained co-located record (same 2026-07-16 battery as the MoE TL;DR):
+Retained record (same 2026-07-16 battery as the TL;DR — co-located A100
+for Q8/Q4, llama.cpp `5839ba3` tg256; the BF16 row is separate same-GPU
+H100 batteries with build/protocol not recorded in the artifacts):
 
 | Quant | GPU | Lumen (tok/s) | llama.cpp | × llama.cpp |
 |-------|-----|------------:|----------:|------------:|
 | Q8_0 | A100-80GB | 114.1 | 117.6 | **0.970×** |
 | Q4_0 | A100-80GB | 146.6 | 149.8 | **0.979×** |
 | BF16 | H100 | 106.5 | 146.6 | 0.727× |
+
+### Summary — Qwen3.6-27B dense (CUDA)
+
+Retained record (same 2026-07-16 battery; the staging artifact names the
+source file `Qwen_Qwen3.6-27B-Q8_0.gguf`). Q8/Q4 co-located on A100 PCIe,
+llama.cpp `5839ba3` tg256; the BF16 row is separate same-GPU H100
+batteries (build/protocol not recorded in those artifacts):
+
+| Quant | GPU | Lumen (tok/s) | llama.cpp | × llama.cpp |
+|-------|-----|------------:|----------:|------------:|
+| Q8_0 | A100-80GB PCIe | 35.08 | 39.35 | 0.891× |
+| Q4_0 | A100-80GB PCIe | 45.34 | 55.32 | 0.820× |
+| BF16 | H100 | 40.42 | 49.40 | 0.818× |
 
 The 2026-06-02 headline (Q8 0.907×, Q4 0.635×, BF16 0.931–0.940×, and the
 prefill ratios) has no retained measurement artifacts — see the provenance
@@ -195,7 +214,7 @@ note in the TL;DR:
 
 ### Qwen3.5-MoE 35B-A3B decode — historical arc (SUPERSEDED)
 
-> **Superseded by the retained co-located record in the [TL;DR](#tldr--production-realistic-numbers) (the 2026-06-02 [per-workload](#per-workload-empirical-results-cuda-qwen35-moe-35b-a3b) tables are themselves withdrawn — artifacts not retained).** The 2026-06-02 numbers this note originally pointed at (Q8 82.1 = 0.584×, Q4 105.6 = 0.674×) have no retained measurement artifacts; the retained co-located record is in the TL;DR (Q8 79.2 = 0.567×, Q4 93.6 = 0.598×). The rows below are retained for historical traceability of the perf+correctness arc and use an earlier llama.cpp baseline (140.65 / 156.71) and earlier Lumen build; do not cite them as current.
+> **Superseded by the retained record in the [TL;DR](#tldr--production-realistic-numbers) (the 2026-06-02 [per-workload](#per-workload-empirical-results-cuda-qwen35-moe-35b-a3b) tables are themselves withdrawn — artifacts not retained).** The 2026-06-02 numbers this note originally pointed at (Q8 82.1 = 0.584×, Q4 105.6 = 0.674×) have no retained measurement artifacts; the retained co-located record is in the TL;DR (Q8 79.2 = 0.567×, Q4 93.6 = 0.598×). The rows below are retained for historical traceability of the perf+correctness arc and use an earlier llama.cpp baseline (140.65 / 156.71) and earlier Lumen build; do not cite them as current.
 
 The qwen35moe CUDA runtime path closed cleanly (one-line `BLOCK_DIM` fix in `moe_accum.cu:19`); the historical perf+correctness arc was:
 
