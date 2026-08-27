@@ -2001,10 +2001,15 @@ fn create_backend(
         }
         backend.set_output_proj_raw(output_proj_raw, output_proj_quant);
     }
-    if matches!(
+    // BF16 embedding raw is CUDA-only for now: CUDA's bf16 embed path is
+    // hardware-validated. Metal has bf16 embed pipelines wired at every
+    // dispatch site but the raw path has not been validated on hardware;
+    // CPU's set_embedding_raw is a no-op. Both keep the F32 dequant copy.
+    if (matches!(
         embedding_quant,
         QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16
-    ) && !embedding_raw.is_empty()
+    ) || (use_cuda && embedding_quant == QuantScheme::Bf16))
+        && !embedding_raw.is_empty()
     {
         if verbose {
             eprintln!(

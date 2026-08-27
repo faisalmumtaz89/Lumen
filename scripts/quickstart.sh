@@ -1195,7 +1195,7 @@ validate_selection() {
     local lumen_hint ; lumen_hint="$(lumen_cmd_hint)"
     log_error "Either pick one of the above, or prepare '$SEL_SPEC' yourself:"
     log_error "  $lumen_hint pull <model>:<quant> --yes      # if the registry has that GGUF"
-    log_error "  $lumen_hint convert --input <src.gguf> --output <out.lbc> [--requant <q>]"
+    log_error "  $lumen_hint convert --input <src.gguf> --output <out.lbc> [--requant <q>]  (--requant: dense models only)"
     log_error "  …then re-run:  $0 --model <path-to.lbc>"
     log_error "Run '$lumen_hint models' for the live registry + your cached LBCs."
     die "unsupported quickstart model/quant combination: $SEL_SPEC"

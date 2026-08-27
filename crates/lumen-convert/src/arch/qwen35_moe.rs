@@ -557,6 +557,9 @@ fn compute_layer_shape_qwen35moe(
     }
 
     // Shared expert weights: requantize to Q4_0 for efficient runtime dispatch.
+    // The Metal shared-expert dispatch selects its fused gate+up pipeline
+    // on the gate's quant alone, so gate/up staying uniform here is
+    // load-bearing for correctness, not just efficiency.
     // The source formats (MXFP4 for gate/up, Q6_K for down) lack direct LBC mappings,
     // so we dequantize to F32 then requantize to Q4_0.  Q4_0 byte size = (n_elements / 32) * 18.
     let try_compute_slice_q4 = |gguf: &GgufFile,

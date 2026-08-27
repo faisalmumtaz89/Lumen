@@ -10134,7 +10134,7 @@ impl CudaBackend {
             // Path -1: Q8_0 final-projection matvec dispatch
             // for the Q8 raw output_proj branch (used when aligned dp4a kernels
             // fail to JIT, as observed on this build env for MoE-35B).
-            // Env-gated `LUMEN_CUDA_MMV_Q_OUTPUT_PROJ=1`. Default OFF.
+            // Gated by `LUMEN_CUDA_MMV_Q_OUTPUT_PROJ` (canonical default ON).
             if super::moe::mmv_q_output_proj_enabled() {
                 if let (Some(quant_fn), Some(mv_fn), Some(ref mut q8_1_buf)) = (
                     st.kernels.quantize_q8_1_rawsum.as_ref(),
@@ -10217,7 +10217,7 @@ impl CudaBackend {
             .map_err(|e| RuntimeError::Compute(format!("matvec output_proj Q8_0 launch: {e}")))?;
         } else if let Some(ref proj_bf16) = st.globals.output_proj_bf16 {
             // Path -1: BF16 output_proj matvec dispatch.
-            // Env-gated `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ=1`. Default OFF
+            // Gated by `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ` (canonical default ON)
             // preserves the existing cuBLAS HGEMV-BF16 path (byte-identical).
             //
             // measured the cuBLAS HGEMV-BF16 path at 1218 µs / call ×
@@ -10572,7 +10572,7 @@ unsafe fn launch_matvec(
         // Path -1: Q8_0 dp4a mmvq dispatch.
         // Q8_1-activation x Q8_0-weight matvec with dp4a INT8 dot-product.
         // Two-launch sequence: quantize_q8_1_rawsum → mul_mat_vec_q_q8_0.
-        // Env-gated `LUMEN_CUDA_MMV_Q_DP4A=1`. Default OFF preserves byte-identity.
+        // Gated by `LUMEN_CUDA_MMV_Q_DP4A` (canonical default ON).
         if super::moe::mmv_q_dp4a_enabled() {
             if let (Some(quant_fn), Some(mv_fn), Some(q8_1_buf)) = (
                 kernels.quantize_q8_1_rawsum.as_ref(),
@@ -15600,7 +15600,7 @@ impl ComputeBackend for CudaBackend {
 
         // Upload embedding: prefer quantized raw if available, else F32.
         // BF16 embedding now uploads RAW bytes (2 B/elem) instead of dequanting
-        // to F32 (4 B/elem) — saves ~4 GB on Qwen3.5-9B (vocab=248320, hidden=4096).
+        // to F32 (4 B/elem) — saves ~2 GB on Qwen3.5-9B (vocab=248320, hidden=4096; BF16 raw is half the F32 copy).
         let has_raw_embedding = self.embedding_raw.is_some();
         let (embedding_f32, embedding_q8, embedding_f16_raw, embedding_q4_raw, embedding_bf16_raw) =
             if has_raw_embedding {
@@ -15621,8 +15621,9 @@ impl ComputeBackend for CudaBackend {
                     }
                     QuantScheme::Bf16 => {
                         // BF16 embedding: upload raw bytes (2 B/elem) and dispatch via
-                        // the dedicated embed_token_bf16 kernel. Saves ~4 GB GPU VRAM
-                        // vs the previous host-side BF16 -> F32 dequant path.
+                        // the dedicated embed_token_bf16 kernel. Halves the embedding's
+                        // GPU footprint (~2 GB on a 248320x4096 vocab) vs the
+                        // host-side BF16 -> F32 dequant path.
                         let raw_mb = raw.len() as f64 / 1.0e6;
                         eprintln!("[CUDA mem] uploading BF16 embedding raw: {raw_mb:.1} MB");
                         let gpu_bf16 = self.device.htod_copy(raw.as_slice())?;
@@ -15647,7 +15648,7 @@ impl ComputeBackend for CudaBackend {
 
         // Upload output projection: prefer quantized raw if available, else F32.
         // BF16 output_proj now uploads RAW bytes (2 B/elem) instead of dequanting
-        // to F32 (4 B/elem) — saves ~4 GB on Qwen3.5-9B. Dispatched via the
+        // to F32 (4 B/elem) — saves ~2 GB on Qwen3.5-9B. Dispatched via the
         // matvec_bf16 kernel in compute_final_gpu.
         let mut output_proj_q6k: Option<(
             CudaSlice<u8>,
@@ -15679,7 +15680,7 @@ impl ComputeBackend for CudaBackend {
                 }
                 QuantScheme::Bf16 => {
                     // BF16 output_proj: upload raw bytes (2 B/elem) and dispatch
-                    // via the matvec_bf16 kernel. Saves ~4 GB GPU VRAM vs the
+                    // via the matvec_bf16 kernel. Saves ~2 GB GPU VRAM vs the
                     // previous host-side BF16 -> F32 dequant + cuBLAS SGEMV path.
                     let raw_mb = raw.len() as f64 / 1.0e6;
                     eprintln!("[CUDA mem] uploading BF16 output_proj raw: {raw_mb:.1} MB");
@@ -17564,12 +17565,24 @@ impl ComputeBackend for CudaBackend {
 
         // Step 1: Batch embed all tokens into [batch, hidden_dim].
         unsafe {
+            // The F32 embedding slot is a 1-element placeholder whenever a
+            // raw variant is resident; a raw scheme without a matching batch
+            // arm below would gather out of bounds from it.
+            debug_assert!(
+                st.globals.embedding_q8.is_some()
+                    || st.globals.embedding_f16.is_some()
+                    || st.globals.embedding_bf16.is_some()
+                    || st.globals.embedding_q4.is_some()
+                    || st.globals.embedding.len() > 1,
+                "batched embed would read the placeholder F32 embedding"
+            );
             super::prefill::launch_embed_batch(
                 &self.device,
                 &st.kernels,
                 &st.globals.embedding,
                 st.globals.embedding_q8.as_ref(),
                 st.globals.embedding_f16.as_ref(),
+                st.globals.embedding_bf16.as_ref(),
                 st.globals.embedding_q4.as_ref(),
                 &pf.token_ids_gpu,
                 &mut pf.x,
