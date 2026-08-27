@@ -8,16 +8,16 @@ Each backend (CUDA + Metal) is validated end-to-end against llama.cpp per the ma
 
 ### CUDA (NVIDIA, compute capability 8.0+ — Ampere / Hopper)
 
-Benchmarked on an A100-80GB (27B-class BF16 cells on H100 — sm_80 routes BF16 through F32 and cannot hold them); see [`bench/RESULTS.md`](../bench/RESULTS.md) for the rig and full numbers.
+Benchmarked on an A100-80GB (27B-class BF16 cells on H100 — sm_80 routes BF16 through F32 and cannot hold them; the MoE BF16 record is also H100-measured); see [`bench/RESULTS.md`](../bench/RESULTS.md) for the rig and full numbers.
 
 | Model | Quant | Status | × llama.cpp decode (canonical) | Notes |
 |-------|-------|--------|------:|---|
-| Qwen3.5-9B dense | Q8_0 | Production-ready | **0.91× llama.cpp** | All robustness and correctness gates pass |
-| Qwen3.5-9B dense | Q4_0 | Production-ready (functional) | 0.64× llama.cpp | Below 0.9× perf gate (structural ceiling); all functional gates pass |
-| Qwen3.5-9B dense | BF16 | Production-ready | **0.93–0.94× llama.cpp** | Highest-precision |
-| Qwen3.5-MoE-35B-A3B | Q8_0 | Production-ready (functional) | 0.584× llama.cpp | MoE_Q8_SPLIT=OFF default validated |
-| Qwen3.5-MoE-35B-A3B | Q4_0 | Production-ready (functional) | 0.674× llama.cpp | Same MoE setup path as Q8 MoE |
-| Qwen3.5-MoE-35B-A3B | BF16 | Production-ready with caveats | 0.902× llama.cpp (recommended) | Requires dedicated 80 GB+ GPU (peak 72.4 GB) |
+| Qwen3.5-9B dense | Q8_0 | Production-ready | **0.970× llama.cpp** (retained co-located A100 record: 114.1 vs 117.6) | All robustness and correctness gates pass |
+| Qwen3.5-9B dense | Q4_0 | Production-ready | **0.979× llama.cpp** (retained co-located A100 record: 146.6 vs 149.8) | All functional gates pass |
+| Qwen3.5-9B dense | BF16 | Production-ready | 0.727× llama.cpp (retained co-located H100 record: 106.5 vs 146.6; earlier 0.93–0.94× not retained) | Highest-precision |
+| Qwen3.5-MoE-35B-A3B | Q8_0 | Production-ready (functional) | 0.567× llama.cpp (retained co-located A100 record: 79.2 vs 139.7) | MoE_Q8_SPLIT=OFF default validated |
+| Qwen3.5-MoE-35B-A3B | Q4_0 | Production-ready (functional) | 0.598× llama.cpp (retained co-located A100 record: 93.6 vs 156.5) | Same MoE setup path as Q8 MoE |
+| Qwen3.5-MoE-35B-A3B | BF16 | Production-ready with caveats | 0.575× llama.cpp (retained co-located H100 record: 104.1 vs 181.1; the previously published 0.902× has no retained artifact) | Requires dedicated 80 GB+ GPU (peak 72,475 MiB ≈ 70.8 GiB, H100-measured; A100 decode unmeasured) |
 | Qwen3.6-27B dense | Q8_0 | Production-ready | 0.85× llama.cpp | All quality gates pristine (2026-06-11 checklist) |
 | Qwen3.6-27B dense | Q4_0 | Production-ready | 0.66× llama.cpp | All quality gates pristine |
 | Qwen3.6-27B dense | BF16 | Production-ready | 0.89× llama.cpp | All quality gates pass; shares the deterministic stray-first-token issue noted on the Qwen3.8-27B BF16 row |

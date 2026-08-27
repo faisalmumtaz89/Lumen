@@ -1,6 +1,6 @@
 # Benchmark Results
 
-**Last updated:** 2026-06-02
+**Last updated:** 2026-08-26
 
 > **Scope (2026-06-02):** The benchmark suite is currently scoped to Lumen's v1 model family (Qwen3.5). All numbers below are measured on Qwen3.5-9B dense and Qwen3.5-MoE-35B-A3B. Additional model families will be added to this suite as they ship.
 
@@ -10,19 +10,30 @@ Methodology: [METHODOLOGY.md](METHODOLOGY.md). How to reproduce: [README.md](REA
 
 ## TL;DR — production-realistic numbers
 
-Workload-weighted decode (CUDA, Qwen3.5-MoE-35B-A3B on A100-80GB):
+Retained co-located record (2026-07-16 battery, tree 887a9e4; per its
+record, both engines in one container per cell, 5 runs — A100 PCIe for
+Q8/Q4, H100 for BF16):
 
-| Quant | Canonical 5-trial | Workload-weighted mean (tok/s) | Workload-weighted × llama.cpp | Recommended for production? |
-|-------|---------------------------:|----------------:|----------------:|----------------------------|
-| **BF16** | **91.4** tok/s = 0.902× llama.cpp | **87.4** | **0.883×** | **YES** — clears all production gates including workload stability and bandwidth utilization |
-| Q8_0  | 82.1 = 0.584× llama.cpp | 76.4 | 0.551× | OK at the empirical-realistic gate (structural Lumen ceiling) |
-| Q4_0  | 105.6 = 0.674× llama.cpp | 99.5 | 0.640× | OK at the empirical-realistic gate (highest throughput / cheapest VRAM) |
+| Quant | GPU | Lumen (tok/s) | llama.cpp | × llama.cpp |
+|-------|-----|------------:|----------:|------------:|
+| Q8_0 | A100-80GB | 79.2 | 139.7 | 0.567× |
+| Q4_0 | A100-80GB | 93.6 | 156.5 | 0.598× |
+| BF16 | H100 | 104.1 | 181.1 | 0.575× — highest absolute throughput, lowest ratio; A100 decode unmeasured |
 
-Workload-weighted means are the equal-weight average across short / medium / long / code / multi-turn prompts. Realistic workloads run 3-7% below the canonical-prompt 5-trial median.
+> **Provenance note (2026-08-26):** the previously published 2026-06-02
+> dataset — BF16 91.4 = 0.902×, Q8 82.1 = 0.584×, Q4 105.6 = 0.674×, the
+> workload-weighted means, the workload-stability percentages, and the
+> bandwidth-utilization table below — has **no retained measurement
+> artifacts**. Those sections are kept for historical context only and must
+> not be cited. Additional retained BF16-MoE records: 78.8 tok/s (H200,
+> 3-trial quality-confirmation cell, no comparator), 96.1 median (H100 soak
+> window), 113.6 (H100 remeasure, no comparator).
 
 ---
 
 ## Per-workload empirical results (CUDA, Qwen3.5-MoE-35B-A3B)
+
+*(2026-06-02 dataset — artifacts not retained; see provenance note)*
 
 Conditions: Qwen3.5-MoE-35B-A3B on A100-80GB PCIe, GPU 1 isolated, driver 580.126.20, CUDA 12.2.140, sm_80. canonical 12-env-var stack. PURE-greedy `--temperature 0 --seed 42 --repeat-penalty 1.0 --repeat-last-n 0`. Each cell is 3-trial median.
 
@@ -39,6 +50,8 @@ Conditions: Qwen3.5-MoE-35B-A3B on A100-80GB PCIe, GPU 1 isolated, driver 580.12
 
 ### Prefill tok/s per (workload pattern × quant)
 
+*(2026-06-02 dataset — artifacts not retained; see provenance note)*
+
 | Workload | Q8 Lumen | Q8 llama.cpp | Q8 × llama.cpp | Q4 Lumen | Q4 llama.cpp | Q4 × llama.cpp | BF16 Lumen | BF16 llama.cpp | BF16 × llama.cpp |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | Short Q&A (~50)            | 114.4 | 866.0 | 0.132× | 179.5 | 1124.8 | 0.160× | 109.2 | 1030.5 | 0.106× |
@@ -51,15 +64,19 @@ Conditions: Qwen3.5-MoE-35B-A3B on A100-80GB PCIe, GPU 1 isolated, driver 580.12
 
 ### Memory-bandwidth utilization (decode, single-stream, A100-80GB theoretical 1935 GB/s HBM2e)
 
+*(2026-06-02 dataset — artifacts not retained; see provenance note)*
+
 | Quant | Active weights/token | Lumen achieved BW | Lumen % theoretical | llama.cpp achieved BW | llama.cpp % theoretical |
 |-------|---------------------:|------------------:|--------------------:|---------------:|-----------------:|
 | Q8    | 3.0 GB | 229 GB/s | 11.8% | 416 GB/s | 21.5% |
 | Q4    | 1.5 GB | 149 GB/s | 7.7%  | 233 GB/s | 12.1% |
 | BF16  | 6.0 GB | **524 GB/s** | **27.1%** | 594 GB/s | 30.7% |
 
-BF16 is bandwidth-bound (27.1% utilized = within 4 pp of llama.cpp ceiling 30.7%); Q8 / Q4 are compute-bound (NVRTC compute_61 ISA loses ~30-40% per-kernel throughput vs llama.cpp's sm_80 cubin). **Revised bandwidth-utilization gate: ≥25% theoretical** (original ≥50% exceeds llama.cpp's own ceiling on the same silicon). BF16 PASSES revised gate.
+BF16 is bandwidth-bound (27.1% utilized = within 4 pp of llama.cpp ceiling 30.7%); Q8 / Q4 are compute-bound (NVRTC compute_61 ISA loses ~30-40% per-kernel throughput vs llama.cpp's sm_80 cubin). **Revised bandwidth-utilization gate: ≥25% theoretical** (original ≥50% exceeds llama.cpp's own ceiling on the same silicon). The BF16 pass verdict on this gate is withdrawn (artifacts not retained).
 
 ### Cold-start TTFT (full model load + first 8 tokens)
+
+*(2026-06-02 dataset — artifacts not retained; see provenance note)*
 
 | Quant | LBC size | Cold (warm OS page cache) | Cold-cold (no OS cache) estimate |
 |-------|---------:|--------------------------:|---------------------------------:|
@@ -71,6 +88,8 @@ BF16 is bandwidth-bound (27.1% utilized = within 4 pp of llama.cpp ceiling 30.7%
 Cold-start gate "≤30 s for ≤10 B model" is N/A for 35B-A3B MoE (active 3B but on-disk weight ≥19 GB). **Production recommendation**: pre-warm LBC into OS page cache at service startup (`cat /path/to/model.lbc > /dev/null`). Once warm, subsequent `lumen run` cold-loads stay within the warm-cache budget above.
 
 ### Concurrency scaling (process-level only — Lumen has no batch scheduler)
+
+*(2026-06-02 dataset — artifacts not retained; see provenance note)*
 
 | Concurrency | Per-client decode (tok/s) | Aggregate (tok/s) | Scaling vs C=1 |
 |-------------|--------------------------:|------------------:|---------------:|
@@ -96,15 +115,25 @@ Per-GPU OOM ceilings (single A100-80GB): Q4 ~C=3, Q8 ~C=2, BF16 C=1. C≥4 requi
 | Config | pp128 + gen128, batch=1, 5 trials, 1 warmup, median reported (canonical headline; see "Decode envelope" below for the full (M, G) parameter space) |
 | GGUF source | `bartowski/Qwen_Qwen3.5-9B-GGUF` (BF16 generated via `convert_hf_to_gguf.py --outtype bf16`) |
 
-### Summary — Qwen3.5-9B dense (canonical headline, last updated 2026-06-02)
+### Summary — Qwen3.5-9B dense
 
-The canonical headline configurations as of the 2026-06-02 CUDA benchmark run.
+Retained co-located record (same 2026-07-16 battery as the MoE TL;DR):
+
+| Quant | GPU | Lumen (tok/s) | llama.cpp | × llama.cpp |
+|-------|-----|------------:|----------:|------------:|
+| Q8_0 | A100-80GB | 114.1 | 117.6 | **0.970×** |
+| Q4_0 | A100-80GB | 146.6 | 149.8 | **0.979×** |
+| BF16 | H100 | 106.5 | 146.6 | 0.727× |
+
+The 2026-06-02 headline (Q8 0.907×, Q4 0.635×, BF16 0.931–0.940×, and the
+prefill ratios) has no retained measurement artifacts — see the provenance
+note in the TL;DR:
 
 | Quant | Decode vs llama.cpp | Prefill vs llama.cpp | Config |
 |-------|--------------------:|---------------------:|--------|
-| Q8_0  | **0.907×** | 0.75× | Q8 dense-9B |
-| Q4_0  | **0.635×** | 0.71× | Q4 dense-9B |
-| BF16 (cuBLAS GemmEx, default-on)  | **0.931×–0.940×** | 0.97× | BF16 dense-9B |
+| Q8_0  | 0.907× *(not retained)* | 0.75× | Q8 dense-9B |
+| Q4_0  | 0.635× *(not retained)* | 0.71× | Q4 dense-9B |
+| BF16 (cuBLAS GemmEx, default-on)  | 0.931×–0.940× *(not retained)* | 0.97× | BF16 dense-9B |
 
 **Historical reference:**
 
@@ -166,14 +195,14 @@ The canonical headline configurations as of the 2026-06-02 CUDA benchmark run.
 
 ### Qwen3.5-MoE 35B-A3B decode — historical arc (SUPERSEDED)
 
-> **Superseded by the [TL;DR](#tldr--production-realistic-numbers) and [per-workload](#per-workload-empirical-results-cuda-qwen35-moe-35b-a3b) tables above (re-bench, 2026-06-02).** The canonical current MoE-35B-A3B decode numbers are **Q8 82.1 tok/s = 0.584× llama.cpp** and **Q4 105.6 tok/s = 0.674× llama.cpp** (measured against the current llama.cpp baselines 138.71 / 155.56). The rows below are retained for historical traceability of the perf+correctness arc and use an earlier llama.cpp baseline (140.65 / 156.71) and earlier Lumen build; do not cite them as current.
+> **Superseded by the retained co-located record in the [TL;DR](#tldr--production-realistic-numbers) (the 2026-06-02 [per-workload](#per-workload-empirical-results-cuda-qwen35-moe-35b-a3b) tables are themselves withdrawn — artifacts not retained).** The 2026-06-02 numbers this note originally pointed at (Q8 82.1 = 0.584×, Q4 105.6 = 0.674×) have no retained measurement artifacts; the retained co-located record is in the TL;DR (Q8 79.2 = 0.567×, Q4 93.6 = 0.598×). The rows below are retained for historical traceability of the perf+correctness arc and use an earlier llama.cpp baseline (140.65 / 156.71) and earlier Lumen build; do not cite them as current.
 
 The qwen35moe CUDA runtime path closed cleanly (one-line `BLOCK_DIM` fix in `moe_accum.cu:19`); the historical perf+correctness arc was:
 
 | Model | Quant | Decode tok/s | llama.cpp | × llama.cpp | Restated gate | Source release |
 |-------|-------|-------------:|---:|-----:|---------------|----------------|
-| Qwen3.5-MoE 35B-A3B | Q8_0 | **~71.8** *(historical; superseded by 82.1 = 0.584×)* | 140.65 | 0.510× | ≥0.65× llama.cpp | (earlier 8-flag stack) |
-| Qwen3.5-MoE 35B-A3B | Q4_0 | **~80.9** *(historical; superseded by 105.6 = 0.674×)* | 156.71 | 0.516× | ≥0.73× llama.cpp | |
+| Qwen3.5-MoE 35B-A3B | Q8_0 | **~71.8** *(historical; retained current record 79.2 = 0.567×)* | 140.65 | 0.510× | ≥0.65× llama.cpp | (earlier 8-flag stack) |
+| Qwen3.5-MoE 35B-A3B | Q4_0 | **~80.9** *(historical; retained current record 93.6 = 0.598×)* | 156.71 | 0.516× | ≥0.73× llama.cpp | |
 | Qwen3.5-MoE 35B-A3B | BF16 | see canonical production config below | — | — | — | canonical 8-flag stack |
 | Qwen3.5-MoE 35B-A3B (original Q8) | Q8_0 | 17.79 (legacy) | — | — | — | D.1 (legacy reference) |
 | Qwen3.5-9B dense (regression check) | Q8_0 | 41.35 (legacy) | — | — | — | D.2 (legacy reference) |
@@ -191,25 +220,27 @@ LUMEN_CUDA_BF16_MOE_V3=1                # default ON
 LUMEN_CUDA_MOE_Q4_V3=1                  # default ON
 LUMEN_CUDA_MOE_Q4_V3B=1                 # default ON
 
-# canonical default (the BF16 0.9× llama.cpp lever):
-LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ=1       # default ON — clears BF16 0.902× llama.cpp on full integrated stack
+# canonical default (the BF16 output_proj lever):
+LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ=1       # default ON — llama.cpp-parity BF16 output_proj matvec
 
 # Pair with the +1 LoC CLI fix in lumen-cli/src/run.rs that allows
 # Bf16 in set_output_proj_raw — without that, BF16 LBC raw weights are never
 # uploaded and llama.cpp kernel never engages.
 ```
 
-**BF16 reaches 0.902× llama.cpp on the two-backend validation matrix.**
+**The previously published BF16 0.902× llama.cpp figure has no retained measurement artifact** — see the provenance note in the TL;DR for the retained records.
 
 ### Audit-restated per-quant gates
 
-The canonical 5-trial median on "Once upon a time" is the load-bearing reference. The two-backend validation matrix adds workload-stability gates across short / medium / long / code / multi-turn patterns:
+*(2026-06-02 dataset — artifacts not retained; see provenance note)*
+
+The canonical 5-trial median on "Once upon a time" was the load-bearing reference for this dataset. The two-backend validation matrix adds workload-stability gates across short / medium / long / code / multi-turn patterns:
 
 | Quant | Decode gate | Workload-stability gate | Bandwidth gate | Result |
 |-------|------------------------------|------------------------------------------|--------------------------|---------|
-| BF16  | ≥0.9× llama.cpp = 91.2 tok/s ✅ 91.4 | ≤15% range across 5 workloads ✅ 10.1% | ≥25% theoretical ✅ 27.1% | **PASS all** |
-| Q8    | ≥0.585× llama.cpp = 82 tok/s ✅ 82.1 | ≤15% range ✅ 9.1% | ≥25% ❌ 11.8% (compute-bound) | **PASS at gate**, BW informational |
-| Q4    | ≥0.61× llama.cpp = 95 tok/s ✅ 105.6 | ≤15% range ✅ 9.6% | ≥25% ❌ 7.7% (compute-bound) | **PASS +11% margin**, BW informational |
+| BF16  | ≥0.9× llama.cpp = 91.2 tok/s — 91.4 | ≤15% range across 5 workloads — 10.1% | ≥25% theoretical — 27.1% | *verdict withdrawn — artifacts not retained* |
+| Q8    | ≥0.585× llama.cpp = 82 tok/s — 82.1 | ≤15% range — 9.1% | ≥25% — 11.8% (compute-bound) | *verdict withdrawn — artifacts not retained* |
+| Q4    | ≥0.61× llama.cpp = 95 tok/s — 105.6 | ≤15% range — 9.6% | ≥25% — 7.7% (compute-bound) | *verdict withdrawn — artifacts not retained* |
 
 ### BF16 — Lumen vs vLLM 0.21.0 (Qwen3.5-9B)
 

@@ -215,7 +215,8 @@ OPTIONS:
     --output <path>      Path to output LBC file (default: input with .lbc extension)
     --dequantize         Dequantize all tensors to F32 (larger but compatible)
     --requant <scheme>   Requantize weights to target scheme during conversion
-                         Supported: q4_0, q8_0
+                         Supported: q4_0, q8_0. Dense models only (refused for
+                         MoE: expert tensors carry their source quantization).
     --target <backend>   Runtime backend the LBC is being prepared for.
                          metal:   upcast K-quant layer tensors (Q2..Q6_K) to Q8_0
                                   (Metal has no K-quant dispatch kernels).

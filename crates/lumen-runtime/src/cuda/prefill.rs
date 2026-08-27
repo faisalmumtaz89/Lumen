@@ -236,6 +236,7 @@ pub(crate) unsafe fn launch_embed_batch(
     embedding_f32: &CudaSlice<f32>,
     embedding_q8: Option<&CudaSlice<u8>>,
     embedding_f16: Option<&CudaSlice<u8>>,
+    embedding_bf16: Option<&CudaSlice<u8>>,
     embedding_q4: Option<&CudaSlice<u8>>,
     token_ids_gpu: &CudaSlice<u32>,
     output: &mut CudaSlice<f32>,
@@ -252,8 +253,20 @@ pub(crate) unsafe fn launch_embed_batch(
     let batch_u32 = batch as u32;
     let hd = hidden_dim as u32;
 
-    // Dispatch priority: F16 > Q4_0 > Q8_0 > F32 (same order as embed_token_gpu)
-    if let Some(emb_f16) = embedding_f16 {
+    // Dispatch priority: BF16 > F16 > Q4_0 > Q8_0 > F32 (same order as
+    // embed_token_gpu)
+    if let Some(emb_bf16) = embedding_bf16 {
+        device
+            .stream
+            .launch_builder(&kernels.embed_batch_bf16)
+            .arg(emb_bf16)
+            .arg(token_ids_gpu)
+            .arg(output)
+            .arg(&batch_u32)
+            .arg(&hd)
+            .launch(launch_cfg)
+            .map_err(|e| RuntimeError::Compute(format!("embed_batch_bf16 launch: {e}")))?;
+    } else if let Some(emb_f16) = embedding_f16 {
         device
             .stream
             .launch_builder(&kernels.embed_batch_f16)
