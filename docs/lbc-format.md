@@ -39,7 +39,7 @@ Each tensor entry in the table includes name, dtype, dimensions, byte offset, an
 | Q4_0  | ~0.56 | 32-element groups, F16 scale per group |
 | CtInt4G32 | ~0.58 | Imported compressed-tensors "pack-quantized" INT4: 32-element groups, BF16 scale + 4-bit zero-point per group. Every quantized value is preserved exactly (no dequantization; rows/column-blocks are reindexed where the GGUF tensor conventions require it). CUDA runtime only. |
 
-K-quants (Q4_K / Q5_K / Q6_K / Q2_K / Q3_K) have no general runtime matmul kernels: Metal-target conversions upcast them to Q8_0, while generic conversions may carry K-quant planes that CUDA dequantizes to F32 at load (with dedicated CUDA kernels only for a fidelity-preserved Q5_K `ssm_out` and Q6_K output head). MXFP4 is dequantized to F32 at convert time.
+K-quants (Q4_K / Q5_K / Q6_K / Q2_K / Q3_K) have no general runtime matmul kernels: Metal-target conversions upcast them to Q8_0, while generic conversions may carry K-quant planes that CUDA dequantizes to F32 at load (with dedicated CUDA kernels only for a fidelity-preserved Q5_K `ssm_out` and Q6_K output head). MXFP4 has no LBC representation: required MXFP4 layer tensors are rejected at conversion; optional MXFP4 tensors are dequantized to F32 (MoE shared-expert gate/up planes to Q4_0).
 
 ## Conversion
 
@@ -48,7 +48,7 @@ K-quants (Q4_K / Q5_K / Q6_K / Q2_K / Q3_K) have no general runtime matmul kerne
 lumen convert --input model.gguf --output model.lbc
 
 # Convert + re-quantize
-lumen convert --input model.gguf --output model.lbc --requant q4_0
+lumen convert --input model.gguf --output model.lbc --requant q4_0   # dense models only
 
 # Import a Hugging Face compressed-tensors checkpoint (pack-quantized INT4
 # group-32, indexed sharded safetensors, dense qwen35-family models only);

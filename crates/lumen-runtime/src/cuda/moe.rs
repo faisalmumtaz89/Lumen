@@ -566,16 +566,14 @@ pub(crate) fn moe_batched_v2_enabled() -> bool {
     })
 }
 
-/// BF16 output_proj matvec kernel — single decisive perf lever for the BF16
-/// 0.902× llama.cpp gate clear. When enabled, replaces the
-/// cuBLAS HGEMV-BF16 dispatch in `compute_final_gpu` for the BF16 output_proj
-/// branch with the dedicated batch=1 matvec.
+/// BF16 output_proj matvec kernel for the BF16 output_proj decode path
+/// (`compute_final_gpu`, all architectures). When enabled, replaces the cuBLAS HGEMV-BF16 dispatch in
+/// `compute_final_gpu` for the BF16 output_proj branch with the dedicated
+/// batch=1 matvec.
 ///
-/// **default ON**. This is the load-bearing lever for the BF16 0.9× llama.cpp
-/// gate clear (5/5 trials ≥91.3 tok/s, median 91.4 = 0.902× llama.cpp,
-/// integration bench). Operators may opt out with `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ=0`
+/// **default ON**. Operators may opt out with `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ=0`
 /// for A/B testing or rollback to the cuBLAS HGEMV path. The dedicated kernel
-/// produces byte-equivalent output at ncols_dst=1 (MD5 350824e7 == cuBLAS path).
+/// produces byte-equivalent output at ncols_dst=1 to the cuBLAS path.
 ///
 /// **MUST be paired** with the `+1 LoC` BF16 CLI fix in `crates/lumen-cli/src/run.rs`
 /// that allows BF16 in the `set_output_proj_raw` allow-list; without that fix,
@@ -598,10 +596,8 @@ pub(crate) fn mmv_bf16_output_proj_enabled() -> bool {
 /// `matvec_q8_aligned_q8_1` / `matvec_q4_aligned_q8_1` dispatch in
 /// `compute_final_gpu` with's dp4a-mmvq matvec kernels.
 ///
-/// **default OFF**. By measurement, the Q8/Q4 output_proj
-/// matvec ports deliver only +1.5%/-1.6% deltas (within noise) on the integrated
-/// stack. Kept as opt-in `LUMEN_CUDA_MMV_Q_OUTPUT_PROJ=1` to preserve byte-
-/// identity at default config; user-elect splice for future eval/tuning.
+/// Defaults through `runtime_defaults::mmv_q_output_proj_default()`
+/// (canonical default ON). `LUMEN_CUDA_MMV_Q_OUTPUT_PROJ=0` opts out.
 pub(crate) fn mmv_q_output_proj_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
@@ -624,11 +620,10 @@ pub(crate) fn mmv_q_output_proj_enabled() -> bool {
 /// through the dispatch: quantize_q8_1 + mul_mat_vec_q_q8_0 /
 /// mul_mat_vec_q_q4_0.
 ///
-/// **default ON**. isolated bench measured +7.1% Q8 / +6.3% Q4
-/// decode at 1-trial with byte-identical correctness vs OFF for both quants
-/// (Q8 `Thinking Process:` ≈ OFF, Q4 multi-prompt COH). Dense-9B Q8 was BYTE-
-/// IDENTICAL to OFF. Carries into the integrated stack
-/// that delivers BF16 0.902× llama.cpp. Operators may opt out with `LUMEN_CUDA_MMV_Q_DP4A=0`.
+/// **default ON**, quality-equivalent to OFF (dense-9B Q8 measured
+/// byte-identical; MoE Q8/Q4 coherence-verified — the Q8_1 activation
+/// pre-quant is not generally byte-identical to the F32-activation path).
+/// Operators may opt out with `LUMEN_CUDA_MMV_Q_DP4A=0`.
 pub(crate) fn mmv_q_dp4a_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();

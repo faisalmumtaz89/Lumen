@@ -45,7 +45,7 @@ lumen pull qwen3.5-moe-35b-a3b:q4_0
 
 `lumen models` lists everything cached and everything available. The model registry source-of-truth is `model_registry.toml`. Unsupported `(model, quant)` combinations are rejected with a clear error listing available alternatives.
 
-All three `qwen3.5-9b` quants (Q8_0, Q4_0, BF16) are in the registry and auto-download. To re-quantize a custom GGUF/LBC for a different target, use `lumen convert --input <gguf> --output <lbc> --requant q4_0`. See [`docs/cli.md`](cli.md) for convert options.
+All three `qwen3.5-9b` quants (Q8_0, Q4_0, BF16) are in the registry and auto-download. To re-quantize a custom dense-model GGUF for a different target, use `lumen convert --input <gguf> --output <lbc> --requant q4_0` (`--requant` is refused for MoE models). See [`docs/cli.md`](cli.md) for convert options.
 
 ## 3. Run inference
 

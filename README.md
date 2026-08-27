@@ -100,13 +100,14 @@ Wire formats, reasoning / extended thinking, sampling & reproducibility, and emb
 
 Lumen optimizes for **batch-1, GPU-resident decode latency** — single-stream interactive serving.
 
-Workload-weighted decode (Qwen3.5-MoE-35B-A3B, A100-80GB, mean across short / medium / long / code / multi-turn):
+Retained co-located decode record (Qwen3.5-MoE-35B-A3B, Lumen and llama.cpp
+in the same container, 5 runs):
 
-| Quant | Decode (tok/s) |
-|-------|---------------:|
-| Q8_0  | 76.4 |
-| Q4_0  | 99.5 |
-| BF16  | 87.4 |
+| Quant | GPU | Decode (tok/s) | × llama.cpp |
+|-------|-----|---------------:|------------:|
+| Q8_0  | A100-80GB | 79.2 | 0.567× |
+| Q4_0  | A100-80GB | 93.6 | 0.598× |
+| BF16  | H100 | 104.1 | 0.575× |
 
 Full per-cell decode + prefill numbers (every model × quant, on A100-80GB and M3 Ultra), methodology, and baseline comparisons: **[bench/RESULTS.md](bench/RESULTS.md)**. Long-context decode is validated to 65K+ tokens.
 

@@ -79,7 +79,7 @@ In addition to the canonical pp128+gen128 anchor, the workload-stability matrix 
 | Code generation     | ~100 | 800 | Structured Rust/Python/C output |
 | Multi-turn          | ~500 (3-turn) | 200 ea | Chat sessions, KV reuse scenarios |
 
-**Workload-stability gate**: decode tok/s range across the 5 workloads must be ≤15% within a quant. Empirical results at: Q8 9.1%, Q4 9.6%, BF16 10.1% — all PASS. Workload-weighted means are reported in [RESULTS.md](RESULTS.md) §"TL;DR — production-realistic numbers".
+**Workload-stability gate**: decode tok/s range across the 5 workloads must be ≤15% within a quant. (The 2026-06-02 empirical results — Q8 9.1%, Q4 9.6%, BF16 10.1% — have no retained measurement artifacts; see the provenance note in RESULTS.md.) The 2026-06-02 workload-weighted means in RESULTS.md are withdrawn (artifacts not retained; see its provenance note).
 
 
 
@@ -190,7 +190,7 @@ Ratio = Lumen / baseline
 
 Lumen exposes several CUDA optimizations as environment variables. The **canonical production stack is 12 flags total** (8 default-ON opt-out flags + 4 load-bearing perf levers). All default to ON except `LUMEN_CUDA_BF16_GEMMEX` (which must be `0`), so setting them explicitly is idempotent.
 
-### canonical production env stack (CUDA, MoE-35B-A3B, BF16 0.9× llama.cpp gate)
+### canonical production env stack (CUDA, MoE-35B-A3B)
 
 ```bash
 # canonical 8-flag stack (default-ON; opt-out=0):
@@ -204,19 +204,20 @@ LUMEN_CUDA_MOE_Q4_V3=1                    # default ON
 LUMEN_CUDA_MOE_Q4_V3B=1                   # default ON
 
 # Canonical defaults (the 4 load-bearing perf levers):
-LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ=1         # default ON — load-bearing for BF16 0.902× llama.cpp
+LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ=1         # default ON — load-bearing BF16 output_proj matvec
 LUMEN_CUDA_TOPK_MOE_FUSED=1               # default ON — +6-8% all 3 MoE quants
-LUMEN_CUDA_MMV_Q_DP4A=1                   # default ON — +7.1% Q8, +6.3% Q4
+LUMEN_CUDA_MMV_Q_DP4A=1                   # default ON — dp4a-mmvq dispatch (ledger-recorded +7.1% Q8 / +6.3% Q4)
 LUMEN_CUDA_MMV_Q_MOE_DP4A=1               # default ON — +11.7% Q4
 ```
 
-**The 4 canonical defaults (`LUMEN_CUDA_TOPK_MOE_FUSED`, `LUMEN_CUDA_MMV_Q_DP4A`, `LUMEN_CUDA_MMV_Q_MOE_DP4A`, plus the `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ`) each toggle a specific code path; all default to ON so that out-of-the-box runs reproduce the published gate-clear numbers. To A/B against any prior baseline, set the corresponding gate to `=0`.**
+**The 4 canonical defaults (`LUMEN_CUDA_TOPK_MOE_FUSED`, `LUMEN_CUDA_MMV_Q_DP4A`, `LUMEN_CUDA_MMV_Q_MOE_DP4A`, plus the `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ`) each toggle a specific code path; all default to ON so that out-of-the-box runs use the canonical stack. To A/B against any prior baseline, set the corresponding gate to `=0`.**
 
 ### Optional opt-ins (kept env-gated, default OFF)
 
+*(Per-flag gains in this table were recorded during the 2026-06/07 campaigns; their raw measurement artifacts are not individually retained.)*
+
 | Env var | Default | Path it toggles | Measured gain | Why default-OFF |
 |---------|---------|-----------------|--------------:|------------------|
-| `LUMEN_CUDA_MMV_Q_OUTPUT_PROJ=1` | OFF | T2-retry Q8/Q4 output_proj llama.cpp port | +1.5% / -1.6% (noise) | Within noise floor; kept opt-in for byte-identity preservation on Q8/Q4 vocab head |
 | `LUMEN_CUDA_MOE_BATCHED_V4=1` | OFF | V4 MoE FFN cooperative-CTA register-budget-reduced kernels | +16.8% Q8 standalone | Not integrated to main; ~450 LoC dispatch wiring deferred to a future release |
 | `LUMEN_CUDA_FA2_ATTN=1` | OFF | FA2 attention decode port | -2.7% Q8 | Per-call HBM alloc dominates at batch=1 |
 | `LUMEN_CUDA_GDN_SPLIT=1` | OFF | Split layout for GDN tensors (Q4 only) | +2.6% Q4 decode | Q8 + GDN_SPLIT does not fit in 80 GB VRAM |
@@ -228,6 +229,8 @@ LUMEN_CUDA_MMV_Q_MOE_DP4A=1               # default ON — +11.7% Q4
 | `LUMEN_CUDA_DECODE_DELAY_US=<N>` | `0` (CLI/bench) | CPU sleep (µs) after the per-decode-step `device.synchronize()`; serializes inter-step submission to close the GPU-scheduler timing race that surfaces as MoE Q4 **server**-only non-determinism. `lumen-server` applies `50` automatically. | n/a — determinism knob, not a perf lever | CLI / Q8 / BF16 are deterministic without it. Cost ≤1% TPOT per acceptance gate. |
 
 ### Opt-out matrix (rollback)
+
+*(2026-06 ladder values — artifacts not retained; see the provenance note in RESULTS.md)*
 
 | Scenario | env vars to set | Effect |
 |----------|-----------------|--------|

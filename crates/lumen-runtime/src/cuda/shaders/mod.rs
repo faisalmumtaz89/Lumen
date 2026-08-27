@@ -70,20 +70,17 @@ pub const MMQ_Q4_0_KERNEL_SOURCE: &str = include_str!("mmq_q4_0.cu");
 ///
 /// Env-gated: `LUMEN_CUDA_MMV_Q_DP4A=1` (sub-gates per call site) replaces
 /// `matvec_q8_0_smem`, `matvec_q4_0`, and the MoE FFN batched paths with
-/// the dp4a-mmvq dispatch. Default ON for production (byte-identical
-/// correctness verified; +7.1% Q8 / +6.3% Q4 isolated; carries into the
-/// integrated stack that delivers BF16 0.902× llama.cpp).
+/// the dp4a-mmvq dispatch. Default ON for production (quality-equivalent;
+/// dense-9B Q8 measured byte-identical).
 // mmv_q.cu kernel (sentinel: v3 with QI4_0=4, s=raw_sum).
 pub const MMV_Q_DP4A_KERNEL_SOURCE: &str = include_str!("mmv_q.cu");
 
 // mmv_q_moe.cu — Q8_0/Q4_0 batched MoE FFN matvec (gate+up+SwiGLU + down).
 pub const MMV_Q_MOE_DP4A_KERNEL_SOURCE: &str = include_str!("mmv_q_moe.cu");
 
-// mul_mat_vec_f_bf16.cu — BF16 output_proj matvec kernel
-// (16.7% TPOT ncu trace). The single decisive empirical lever that clears
-// the 0.9× llama.cpp gate for BF16 (5/5 trials at or above gate;
-// median 91.4 = 0.902× llama.cpp). Env-gated `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ=1`,
-// **default ON**; users can opt out with `=0` for A/B testing.
+// mul_mat_vec_f_bf16.cu — BF16 output_proj matvec kernel. Env-gated
+// `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ=1`, **default ON**; users can opt out
+// with `=0` for A/B testing.
 pub const MMV_F_BF16_KERNEL_SOURCE: &str = include_str!("mul_mat_vec_f_bf16.cu");
 
 /// Q4_0 matrix-vector multiply kernels (matvec with on-the-fly 4-bit dequantization).

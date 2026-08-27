@@ -45,16 +45,19 @@ use std::path::Path;
 /// Runtime backend the LBC is being prepared for.
 ///
 /// Different GPU backends support different sets of quantization kernels.
-/// CUDA ships dedicated K-quant (Q2/Q3/Q4/Q5/Q6_K) dequant kernels, so
-/// K-quant layer tensors can ride through unchanged. Metal currently has
+/// CUDA dequantizes K-quant (Q2/Q3/Q4/Q5/Q6_K) layer planes host-side at
+/// load (plus dedicated dp4a kernels for a fidelity-preserved Q5_K
+/// `ssm_out` and Q6_K output head), so K-quant layer tensors can ride
+/// through unchanged. Metal currently has
 /// **no** K-quant kernels, so layer tensors stored as K-quant in the source
 /// GGUF (e.g. `attn_q` in the Q4 MoE-35B GGUF) must be upcast to a
 /// scheme Metal does support (Q8_0).
 ///
 /// `Generic` leaves K-quant layer tensors as-is (CUDA path).
 /// `Metal` upcasts any K-quant layer-projection tensor (attn_q/k/v, ffn_*)
-/// to Q8_0 at convert time -- numerically lossless within Q8_0 precision
-/// (Q8_0 is higher precision per element than Q6_K in practice).
+/// to Q8_0 at convert time -- the round trip re-quantizes with new block
+/// scales, but Q8_0's 8-bit mantissa keeps the additional loss below the
+/// source K-quant's own quantization error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConvertTarget {
     /// CUDA-style: keep K-quant layer tensors as-is.
@@ -73,9 +76,10 @@ pub struct ConvertOptions {
     /// Produces larger files but compatible with the naive F32 backend.
     pub dequantize_to_f32: bool,
     /// If set, requantize weight tensors to this scheme during conversion.
-    /// Only Q4_0 is currently supported as a target. The source weights are
-    /// first dequantized to F32, then requantized to the target scheme.
-    /// Norm tensors remain F32 regardless.
+    /// Q4_0 and Q8_0 are the supported targets, dense models only (the MoE
+    /// converter refuses the flag). The source weights are first dequantized
+    /// to F32, then requantized to the target scheme. Norm tensors remain
+    /// F32 regardless.
     pub requant_to: Option<QuantScheme>,
     /// Runtime backend the LBC is being prepared for. See [`ConvertTarget`].
     pub target: ConvertTarget,
@@ -136,6 +140,7 @@ pub enum ConvertError {
         tensor: String,
         ggml_type: String,
     },
+    UnsupportedOption(String),
 }
 
 impl fmt::Display for ConvertError {
@@ -159,6 +164,7 @@ impl fmt::Display for ConvertError {
                 // type tags) and HF safetensors (dtype/shape) inputs.
                 write!(f, "tensor {tensor}: unsupported tensor type {ggml_type}")
             }
+            Self::UnsupportedOption(msg) => write!(f, "unsupported option: {msg}"),
         }
     }
 }
@@ -280,6 +286,22 @@ fn do_convert_from_reader<R: Read + Seek>(
 ) -> Result<ConvertStats, ConvertError> {
     let (hp, arch) = extract_hyperparams(gguf)?;
     let num_layers = hp.num_layers as usize;
+
+    // The MoE converter has no requant path — no layer tensor is
+    // requantized — so accepting the flag would stamp a requant scheme in
+    // the header that the planes do not have. Refuse before any tensor is
+    // read, keyed on the same architecture set `select_converter` uses.
+    if matches!(arch.as_str(), "qwen35moe" | "qwen3_5_moe" | "qwen3.5_moe")
+        && opts.requant_to.is_some()
+    {
+        return Err(ConvertError::UnsupportedOption(
+            "--requant is not supported for MoE models (the MoE converter \
+             carries layer tensors in their source quantization); convert \
+             without --requant or start from a source GGUF at the desired \
+             quantization"
+                .into(),
+        ));
+    }
 
     // Detect primary quantization scheme.
     let quant_scheme = if let Some(target) = opts.requant_to {

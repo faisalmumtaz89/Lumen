@@ -38,6 +38,10 @@ is `LUMEN_CUDA_BF16_GEMMEX=0` (required for BF16 P3 correctness on MoE).
 
 ## General runtime
 
+Per-flag percentage gains cited below were recorded during the 2026-06/07
+campaigns; their raw measurement artifacts are not individually retained
+unless a source is named.
+
 | Variable | Default | Category | Effect | When to touch |
 |---|---|---|---|---|
 | `LUMEN_KV_PRECISION` | backend: Metal `f16`, CUDA/CPU `f32` | config | KV-cache precision (`f16`/`f32`); invalid value warns + falls back. CLI `--kv-precision` wins. **Metal is F16-only** (`f32` rejected — GPU-resident KV buffers are allocated F16) and **CUDA is currently F32-only** (`f16` rejected with a clear error; the CUDA F16 KV dispatch path is future work). | `f32` for a numerical-parity check on CPU. |
@@ -70,8 +74,8 @@ Set any to `=0` to opt out. Model-aware defaults are noted per row.
 | `LUMEN_CUDA_BF16_MOE_V3` | ON (no-op on dense/Q8/Q4) | kill-switch | Canonical BF16 MoE V3 FFN path. | `=0` only to A/B the legacy BF16 MoE path. |
 | `LUMEN_CUDA_BF16_AUTOTUNE` | ON | kill-switch | BF16 GEMM autotune selection. | `=0` to pin a fixed BF16 GEMM config. |
 | `LUMEN_CUDA_GDN_REGISTER_RESIDENT` | ON (GDN models) | kill-switch | Register-resident GDN two-launch dispatch (+9.4% Q8, +10.3% Q4). | `=0` to A/B the legacy GDN dispatch. |
-| `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ` | ON | kill-switch | BF16 output_proj llama.cpp-parity matvec; load-bearing for 0.902× llama.cpp. | `=0` only to A/B output_proj. |
-| `LUMEN_CUDA_MMV_Q_DP4A` | ON | kill-switch | dp4a dense matvec (+7.1% Q8, +6.3% Q4). | `=0` to fall back to the scalar matvec. |
+| `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ` | ON | kill-switch | BF16 output_proj llama.cpp-parity matvec; load-bearing for the BF16 head path. | `=0` only to A/B output_proj. |
+| `LUMEN_CUDA_MMV_Q_DP4A` | ON | kill-switch | dp4a dense matvec (quality-equivalent; dense-9B Q8 measured byte-identical). | `=0` to fall back to the scalar matvec. |
 | `LUMEN_CUDA_MMV_Q_MOE_DP4A` | ON dense; OFF for MoE (model-aware) | kill-switch | MoE batched dp4a matvec (+11.7% Q4). | `=1` to force on for MoE experimentation. |
 | `LUMEN_CUDA_MMV_Q_OUTPUT_PROJ` | ON (canonical) | kill-switch | Q8/Q4 output_proj llama.cpp-parity port (within noise floor). | `=0` to A/B output_proj. |
 | `LUMEN_CUDA_FFN_FUSED_GLU` | model-aware (quant-dense uses dp4a fall-through) | kill-switch | Fused gate+up+SwiGLU FFN. | `=1`/`=0` to A/B the fused vs. split FFN. |

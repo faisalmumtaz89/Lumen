@@ -151,3 +151,31 @@ extern "C" __global__ void embed_batch_q4_0(
     unsigned int nibble = (elem_in_block < 16u) ? (byte_val & 0x0Fu) : ((byte_val >> 4) & 0x0Fu);
     output[idx] = scale * ((float)nibble - 8.0f);
 }
+
+// ============================================================================
+// embed_batch_bf16: BF16 batched token embedding lookup
+//
+// Each element is 2-byte bfloat16 (high half of an f32). Dequantizes to F32
+// by shifting into the f32 exponent/mantissa position.
+// ============================================================================
+
+extern "C" __global__ void embed_batch_bf16(
+    const unsigned short* __restrict__ embedding_bf16, // [vocab_size, hidden_dim] as bf16
+    const unsigned int* __restrict__ token_ids,        // [batch]
+    float* __restrict__ output,                        // [batch, hidden_dim]
+    unsigned int batch,
+    unsigned int hidden_dim)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = batch * hidden_dim;
+    if (idx >= total) return;
+
+    unsigned int tok = idx / hidden_dim;
+    unsigned int dim = idx % hidden_dim;
+    unsigned int token_id = token_ids[tok];
+
+    unsigned short bits =
+        embedding_bf16[(unsigned long long)token_id * hidden_dim + dim];
+    unsigned int x = ((unsigned int)bits) << 16;
+    output[idx] = __int_as_float((int)x);
+}
