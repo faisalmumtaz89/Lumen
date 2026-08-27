@@ -869,6 +869,9 @@ impl MetalF32Backend {
     /// (heap-allocated LayerView from async provider), we fall back to
     /// `new_buffer_with_bytes` which copies.
     fn create_layer_buffer(&self, weights: &LayerView) -> Result<MetalBuffer, RuntimeError> {
+        // Streaming / non-resident paths reach the dispatch kernels without
+        // GPU-resident preload; this is their once-per-layer validation point.
+        gpu_resident::validate_layer_quants(weights.layer_idx, &weights.subtensors)?;
         let blob = weights.as_bytes();
         let ptr = blob.as_ptr();
         let len = blob.len();
@@ -917,6 +920,7 @@ impl MetalF32Backend {
         weights: &LayerView,
         non_expert_end: usize,
     ) -> Result<MetalBuffer, RuntimeError> {
+        gpu_resident::validate_layer_quants(weights.layer_idx, &weights.subtensors)?;
         let blob = weights.as_bytes();
         let ptr = blob.as_ptr();
         let len = non_expert_end.min(blob.len());

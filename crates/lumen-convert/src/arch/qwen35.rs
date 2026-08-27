@@ -424,8 +424,9 @@ fn compute_layer_shape_qwen35(
         try_compute_opt_slice(gguf, layer, ATTN_GATE_WEIGHT, &mut blob_size, dequantize)?;
 
     // SSM tensors (linear attention layers only) — never requantized to user target.
-    // ssm_alpha/beta MUST be Q8_0 — the GDN runtime hardcodes Q8_0 matvec kernels.
-    // Shared logic in gdn_gates handles force-requant from F32/F16/BF16 to Q8_0.
+    // ssm_alpha/beta are Q8_0 on default paths (Metal's GDN kernels read only
+    // Q8_0; CUDA also serves F32 gates). Shared logic in gdn_gates handles the
+    // force-requant and the `--dequantize` / source-fidelity exceptions.
     let ssm = compute_ssm_slices(gguf, layer, &mut blob_size, dequantize, target)?;
     let ssm_a = ssm.ssm_a;
     let ssm_conv1d = ssm.ssm_conv1d;

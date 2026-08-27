@@ -10,6 +10,7 @@ use super::repack_q8;
 use super::types::{CachedLayerMeta, CachedMoeMeta};
 use super::{MetalF32Backend, PAGE_SIZE};
 use crate::error::RuntimeError;
+use lumen_format::index::TensorSlice;
 use lumen_format::quantization::QuantScheme;
 
 /// Quant schemes the Metal DENSE DECODE path can serve for named layer
@@ -25,6 +26,212 @@ fn dense_slice_quant_supported(q: QuantScheme) -> bool {
             | QuantScheme::Q8_0
             | QuantScheme::Q4_0
     )
+}
+
+/// Reject layer tensors the Metal dispatch paths would misparse, before any
+/// Metal path can execute over the blob. Called once per layer at GPU-resident
+/// preload, and at zero-copy layer-buffer creation for the streaming /
+/// non-resident paths (which never run preload).
+pub(super) fn validate_layer_quants(
+    layer: usize,
+    st: &lumen_format::index::SubtensorOffsets,
+) -> Result<(), RuntimeError> {
+    // Reject quant schemes the Metal DENSE decode path has no dispatch
+    // kernels for. Without this, a `--target generic` LBC (K-quant or
+    // source-fidelity Q4_1 tensors intact, fine on CUDA) runs "successfully"
+    // and generates garbage — the dispatch catch-alls feed those bytes to an
+    // F32-reading pipeline. Fail loudly with the remedy instead.
+    for (name, slice) in st.named_slices() {
+        if slice.length == 0 {
+            continue;
+        }
+        if !dense_slice_quant_supported(slice.quant) {
+            return Err(RuntimeError::Compute(format!(
+                "layer {layer} tensor '{name}' is {:?}: the Metal \
+                 backend has no dense DECODE dispatch kernels for this \
+                 quant scheme. This LBC was converted for a different \
+                 backend (`--target generic`); re-convert with \
+                 `lumen convert --target metal` (K-quant and legacy \
+                 Q5_0 layer tensors are upcast to Q8_0, Q4_1 is \
+                 re-quantized to Q4_0).",
+                slice.quant
+            )));
+        }
+    }
+    // The dense-FFN gate+up dispatch arms for Q4_0/F16/Bf16/F32
+    // select on the gate's quant alone and bind w_up_off regardless,
+    // and the fused shaders stride both pointers with one row_bytes
+    // derived from the gate's scheme — a gate/up quant mismatch
+    // (producible: the converter upcasts K-quant tensors per tensor)
+    // would compute silently wrong output.
+    if st.w_gate.length > 0 && st.w_up.length > 0 && st.w_gate.quant != st.w_up.quant {
+        return Err(RuntimeError::Compute(format!(
+            "layer {layer}: ffn_gate is {:?} but ffn_up is {:?}: the \
+             Metal fused FFN kernels require the pair to share one \
+             quant scheme. Re-convert with a uniform quantization \
+             (e.g. `lumen convert --target metal --requant q8_0`).",
+            st.w_gate.quant, st.w_up.quant
+        )));
+    }
+    // On GDN layers the decode path pairs attn_gate with the qkv
+    // route: the Q8_0 qkv+gate 2-stream kernel (default-on) decodes
+    // the gate as Q8_0 without consulting its quant, and the non-Q8
+    // routes' gate fallbacks read schemes they lack an arm for as
+    // F32 — so a Q8_0/non-Q8_0 split between attn_qkv and
+    // attn_gate in either direction computes silently wrong output.
+    // Full-attention layers dispatch attn_gate on its own quant and
+    // are exempt.
+    if let (Some(1), Some(gate)) = (st.layer_type, st.attn_gate.as_ref()) {
+        if gate.length > 0
+            && ((st.wq.quant == QuantScheme::Q8_0) != (gate.quant == QuantScheme::Q8_0))
+        {
+            return Err(RuntimeError::Compute(format!(
+                "layer {layer}: attn_qkv is {:?} but attn_gate is {:?}: \
+                 the Metal GDN decode path requires the pair to agree \
+                 on whether it is Q8_0. Re-convert from a source GGUF \
+                 with a uniform quantization (`--requant q8_0` also \
+                 works for dense models).",
+                st.wq.quant, gate.quant
+            )));
+        }
+    }
+    // The GDN gate pipelines (decode and prefill) decode ssm_alpha/ssm_beta
+    // as Q8_0 unconditionally (offsets are bound without consulting their
+    // quant). The converter stores them as Q8_0 on every Metal-target path,
+    // but source-fidelity conversions for other targets keep F32 gates, and
+    // `--dequantize` writes F32 when the source stores them as Q8_0 —
+    // these pipelines would parse those bytes as Q8_0 blocks, computing
+    // silently wrong output.
+    for (name, slice) in [("ssm_alpha", &st.ssm_alpha), ("ssm_beta", &st.ssm_beta)] {
+        if let Some(s) = slice {
+            if s.length > 0 && s.quant != QuantScheme::Q8_0 {
+                return Err(RuntimeError::Compute(format!(
+                    "layer {layer}: {name} is {:?}: the Metal GDN gate \
+                     pipelines read ssm_alpha/ssm_beta as Q8_0. Re-convert \
+                     with `lumen convert --target metal` (it stores these \
+                     tensors as Q8_0).",
+                    s.quant
+                )));
+            }
+        }
+    }
+    // The MoE expert dispatch has the same shape: it selects the
+    // fused gate+up pipeline on the expert gate's quant alone
+    // (CachedMoeMeta carries no up quant), so a per-expert gate/up
+    // mismatch would also compute silently wrong output.
+    if let Some(experts) = st.experts.as_ref() {
+        for (i, e) in experts.iter().enumerate() {
+            if e.gate.length > 0 && e.up.length > 0 && e.gate.quant != e.up.quant {
+                return Err(RuntimeError::Compute(format!(
+                    "layer {layer} expert {i}: gate is {:?} but up is {:?}: \
+                     the Metal fused expert FFN kernels require the pair \
+                     to share one quant scheme. Re-convert with \
+                     `lumen convert --target metal` from a source GGUF \
+                     whose expert tensors share one quantization.",
+                    e.gate.quant, e.up.quant
+                )));
+            }
+        }
+        // Expert dispatch takes its quant schemes from expert 0 alone
+        // (CachedMoeMeta carries one scheme set for the whole bank), so a
+        // layer whose experts differ from expert 0 would decode the others
+        // at the wrong stride. The format stores per-expert schemes and does
+        // not enforce uniformity; reject the divergence here.
+        if let Some(first) = experts.first() {
+            for (i, e) in experts.iter().enumerate().skip(1) {
+                let pairs = [
+                    ("gate", e.gate.quant, first.gate.quant),
+                    ("up", e.up.quant, first.up.quant),
+                    ("down", e.down.quant, first.down.quant),
+                ];
+                if let Some((name, got, want)) = pairs.iter().find(|(_, a, b)| a != b).copied() {
+                    return Err(RuntimeError::Compute(format!(
+                        "layer {layer} expert {i}: {name} is {got:?} but \
+                         expert 0's is {want:?}: the Metal expert dispatch \
+                         applies expert 0's quant schemes to every expert. \
+                         Re-convert from a source GGUF whose experts share \
+                         one quantization.",
+                    )));
+                }
+            }
+        }
+    }
+    // The shared-expert FFN dispatch selects on the gate's quant alone and
+    // binds up_off regardless (CachedMoeMeta carries no shared-expert up
+    // quant), and only the Q8_0/Q4_0/Q4_1 arms select genuinely fused
+    // gate+up+SwiGLU shaders — the F16/Bf16/F32 arms select plain matmuls
+    // whose parameter lists end before the up-projection binding, silently
+    // dropping up and SwiGLU.
+    let shexp_present = [
+        st.shared_expert_gate.as_ref(),
+        st.shared_expert_up.as_ref(),
+        st.shared_expert_down.as_ref(),
+    ]
+    .map(|t| t.is_some_and(|s| s.length > 0));
+    if shexp_present.iter().any(|&p| p) && !shexp_present.iter().all(|&p| p) {
+        // The runtime uses the gate's presence as the shared-expert feature
+        // flag and unwraps the other two tensors during dispatch.
+        return Err(RuntimeError::Compute(format!(
+            "layer {layer}: incomplete shared-expert tensors (gate/up/down \
+             present: {shexp_present:?}): a shared expert requires all \
+             three. Re-convert with `lumen convert --target metal`."
+        )));
+    }
+    if let (Some(gate), Some(up)) = (st.shared_expert_gate.as_ref(), st.shared_expert_up.as_ref()) {
+        if gate.length > 0 && up.length > 0 {
+            if gate.quant != up.quant {
+                return Err(RuntimeError::Compute(format!(
+                    "layer {layer}: shared-expert gate is {:?} but up is {:?}: \
+                     the Metal fused shared-expert kernels require the pair to \
+                     share one quant scheme. Re-convert with \
+                     `lumen convert --target metal`.",
+                    gate.quant, up.quant
+                )));
+            }
+            if !matches!(gate.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0) {
+                return Err(RuntimeError::Compute(format!(
+                    "layer {layer}: shared-expert gate/up is {:?}: the Metal \
+                     shared-expert FFN has fused kernels only for Q8_0/Q4_0 \
+                     (its Q4_1 arm is unreachable — the layer-tensor \
+                     allowlist rejects Q4_1 upstream). Re-convert with \
+                     `lumen convert --target metal` (it quantizes the \
+                     shared-expert tensors).",
+                    gate.quant
+                )));
+            }
+        }
+    }
+    // Every Metal shader reads norm tensors, the MoE routers, and the SSM
+    // scalar tensors as F32 without consulting their quant (CUDA rejects
+    // non-F32 norms at load; Metal must too). The converter writes them F32
+    // on its forced paths, but a source GGUF storing e.g. F16 norms passes
+    // the allowlist above and would be misread.
+    let f32_only: [(&str, Option<&TensorSlice>); 11] = [
+        ("attn_norm", Some(&st.attn_norm)),
+        ("ffn_norm", Some(&st.ffn_norm)),
+        ("attn_post_norm", st.attn_post_norm.as_ref()),
+        ("attn_q_norm", st.attn_q_norm.as_ref()),
+        ("attn_k_norm", st.attn_k_norm.as_ref()),
+        ("ssm_norm", st.ssm_norm.as_ref()),
+        ("ssm_a", st.ssm_a.as_ref()),
+        ("ssm_conv1d", st.ssm_conv1d.as_ref()),
+        ("ssm_dt", st.ssm_dt.as_ref()),
+        ("router_weight", st.router_weight.as_ref()),
+        ("ffn_gate_inp_shexp", st.ffn_gate_inp_shexp.as_ref()),
+    ];
+    for (name, slice) in f32_only {
+        if let Some(s) = slice {
+            if s.length > 0 && s.quant != QuantScheme::F32 {
+                return Err(RuntimeError::Compute(format!(
+                    "layer {layer}: {name} is {:?}: the Metal kernels read \
+                     this tensor as F32. Re-convert from a source GGUF whose \
+                     norm/router/SSM-scalar tensors are F32.",
+                    s.quant
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl MetalF32Backend {
@@ -190,84 +397,7 @@ impl MetalF32Backend {
                 cursor as u64
             };
             let st = &layer_view.subtensors;
-            // Reject quant schemes the Metal DENSE decode path has no dispatch
-            // kernels for BEFORE upload. Without this, a `--target generic`
-            // LBC (K-quant or source-fidelity Q4_1 tensors intact, fine on
-            // CUDA) loads "successfully" and generates garbage — the dispatch
-            // catch-alls feed those bytes to an F32-reading pipeline. Fail
-            // loudly with the remedy instead.
-            for (name, slice) in st.named_slices() {
-                if slice.length == 0 {
-                    continue;
-                }
-                if !dense_slice_quant_supported(slice.quant) {
-                    return Err(RuntimeError::Compute(format!(
-                        "layer {layer} tensor '{name}' is {:?}: the Metal \
-                         backend has no dense DECODE dispatch kernels for this \
-                         quant scheme. This LBC was converted for a different \
-                         backend (`--target generic`); re-convert with \
-                         `lumen convert --target metal` (K-quant and legacy \
-                         Q5_0 layer tensors are upcast to Q8_0, Q4_1 is \
-                         re-quantized to Q4_0).",
-                        slice.quant
-                    )));
-                }
-            }
-            // The dense-FFN gate+up dispatch arms for Q4_0/F16/Bf16/F32
-            // select on the gate's quant alone and bind w_up_off regardless,
-            // and the fused shaders stride both pointers with one row_bytes
-            // derived from the gate's scheme — a gate/up quant mismatch
-            // (producible: the converter upcasts K-quant tensors per tensor)
-            // would compute silently wrong output.
-            if st.w_gate.length > 0 && st.w_up.length > 0 && st.w_gate.quant != st.w_up.quant {
-                return Err(RuntimeError::Compute(format!(
-                    "layer {layer}: ffn_gate is {:?} but ffn_up is {:?}: the \
-                     Metal fused FFN kernels require the pair to share one \
-                     quant scheme. Re-convert with a uniform quantization \
-                     (e.g. `lumen convert --target metal --requant q8_0`).",
-                    st.w_gate.quant, st.w_up.quant
-                )));
-            }
-            // On GDN layers the decode path pairs attn_gate with the qkv
-            // route: the Q8_0 qkv+gate 2-stream kernel (default-on) decodes
-            // the gate as Q8_0 without consulting its quant, and the non-Q8
-            // route's gate fallback reads anything outside {Q4_0, F16, Bf16}
-            // as F32 — so a Q8_0/non-Q8_0 split between attn_qkv and
-            // attn_gate in either direction computes silently wrong output.
-            // Full-attention layers dispatch attn_gate on its own quant and
-            // are exempt.
-            if let (Some(1), Some(gate)) = (st.layer_type, st.attn_gate.as_ref()) {
-                if gate.length > 0
-                    && ((st.wq.quant == QuantScheme::Q8_0) != (gate.quant == QuantScheme::Q8_0))
-                {
-                    return Err(RuntimeError::Compute(format!(
-                        "layer {layer}: attn_qkv is {:?} but attn_gate is {:?}: \
-                         the Metal GDN decode path requires the pair to agree \
-                         on whether it is Q8_0. Re-convert from a source GGUF \
-                         with a uniform quantization (`--requant q8_0` also \
-                         works for dense models).",
-                        st.wq.quant, gate.quant
-                    )));
-                }
-            }
-            // The MoE expert dispatch has the same shape: it selects the
-            // fused gate+up pipeline on the expert gate's quant alone
-            // (CachedMoeMeta carries no up quant), so a per-expert gate/up
-            // mismatch would also compute silently wrong output.
-            if let Some(experts) = st.experts.as_ref() {
-                for (i, e) in experts.iter().enumerate() {
-                    if e.gate.length > 0 && e.up.length > 0 && e.gate.quant != e.up.quant {
-                        return Err(RuntimeError::Compute(format!(
-                            "layer {layer} expert {i}: gate is {:?} but up is {:?}: \
-                             the Metal fused expert FFN kernels require the pair \
-                             to share one quant scheme. Re-convert with \
-                             `lumen convert --target metal` from a source GGUF \
-                             whose expert tensors share one quantization.",
-                            e.gate.quant, e.up.quant
-                        )));
-                    }
-                }
-            }
+            validate_layer_quants(layer, st)?;
             layer_metas.push(CachedLayerMeta {
                 attn_norm_off: base + st.attn_norm.offset,
                 wq_off: base + st.wq.offset,
@@ -517,8 +647,15 @@ impl MetalF32Backend {
             })?;
             let proj_len = proj_buf_ref.length() as usize;
 
-            // Weight tying: output_proj shares embedding storage (no separate allocation)
-            let effective_proj_len = if self.weight_tying { 0 } else { proj_len };
+            // Weight tying: output_proj shares embedding storage (no separate
+            // allocation) — but only when both buffers hold the same
+            // representation. The frontend can admit a raw non-F32 head while
+            // the embedding stays F32 (BF16 models on Metal admit the raw
+            // head but not the raw embedding); the final-projection shader is
+            // selected by output_proj_quant, so aliasing it to differently-
+            // represented embedding bytes would compute wrong logits.
+            let tie_alias = self.weight_tying && self.output_proj_quant == self.embedding_quant;
+            let effective_proj_len = if tie_alias { 0 } else { proj_len };
             global_bytes = embed_len + norm_len + effective_proj_len;
             // Include globals in the unified private buffer.
             include_globals = true;
@@ -528,7 +665,7 @@ impl MetalF32Backend {
                 cursor = align(cursor + embed_len);
                 let no_ = cursor;
                 cursor = align(cursor + norm_len);
-                if self.weight_tying {
+                if tie_alias {
                     // output_proj reuses embedding offset
                     (eo, no_, eo)
                 } else {
@@ -578,7 +715,7 @@ impl MetalF32Backend {
                         dst_base.add(norm_offset),
                         norm_len,
                     );
-                    if !self.weight_tying {
+                    if !tie_alias {
                         std::ptr::copy_nonoverlapping(
                             proj_buf_ref.contents() as *const u8,
                             dst_base.add(proj_offset),
@@ -1575,9 +1712,9 @@ impl MetalF32Backend {
                     .as_ref()
                     .map(|p| p.qmv_q4_0_rmsnorm_f16sc.is_some())
                     .unwrap_or(false);
-            // Require a genuine separate Q8_0 output_proj. Under weight tying the
-            // output_proj buffer aliases the (Q4) embedding -> its bytes are NOT a
-            // Q8_0 lm_head, so skip. F16/Bf16/Q4 lm_heads also skip (Q8-only lever).
+            // Require an untied Q8_0 output_proj: the lever is validated on
+            // standalone Q8_0 lm_heads only, so tied models conservatively
+            // skip. F16/Bf16/Q4 lm_heads also skip (Q8-only lever).
             if !self.weight_tying
                 && self.output_proj_quant == QuantScheme::Q8_0
                 && hidden_dim_u % 512 == 0
@@ -2185,6 +2322,222 @@ impl MetalF32Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lumen_format::index::{SubtensorOffsets, TensorSlice};
+
+    fn slice(quant: QuantScheme) -> TensorSlice {
+        TensorSlice {
+            offset: 0,
+            length: 1024,
+            quant,
+        }
+    }
+
+    fn gdn_layer(gates: QuantScheme) -> SubtensorOffsets {
+        SubtensorOffsets {
+            wq: slice(QuantScheme::Q8_0),
+            wk: slice(QuantScheme::Q8_0),
+            wv: slice(QuantScheme::Q8_0),
+            wo: slice(QuantScheme::Q8_0),
+            bq: None,
+            bk: None,
+            bv: None,
+            w_gate: slice(QuantScheme::Q8_0),
+            w_up: slice(QuantScheme::Q8_0),
+            w_down: slice(QuantScheme::Q8_0),
+            attn_norm: slice(QuantScheme::F32),
+            ffn_norm: slice(QuantScheme::F32),
+            router_weight: None,
+            experts: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: Some(slice(QuantScheme::Q8_0)),
+            attn_post_norm: None,
+            ssm_a: Some(slice(QuantScheme::F32)),
+            ssm_conv1d: Some(slice(QuantScheme::F32)),
+            ssm_dt: Some(slice(QuantScheme::F32)),
+            ssm_beta: Some(slice(gates)),
+            ssm_alpha: Some(slice(gates)),
+            ssm_norm: Some(slice(QuantScheme::F32)),
+            ssm_out: Some(slice(QuantScheme::Q8_0)),
+            attn_q_norm: None,
+            attn_k_norm: None,
+            ffn_gate_inp_shexp: None,
+            layer_type: Some(1),
+        }
+    }
+
+    #[test]
+    fn q8_gates_accepted() {
+        assert!(validate_layer_quants(0, &gdn_layer(QuantScheme::Q8_0)).is_ok());
+    }
+
+    #[test]
+    fn f32_gates_rejected() {
+        let err = validate_layer_quants(0, &gdn_layer(QuantScheme::F32)).unwrap_err();
+        assert!(err.to_string().contains("ssm_alpha is F32"), "{err}");
+    }
+
+    #[test]
+    fn gate_up_mismatch_rejected() {
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.w_up = slice(QuantScheme::Q4_0);
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("ffn_gate is Q8_0"), "{err}");
+    }
+
+    #[test]
+    fn gdn_qkv_gate_split_rejected_both_directions() {
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.attn_gate = Some(slice(QuantScheme::Q4_0));
+        assert!(validate_layer_quants(0, &st).is_err());
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.wq = slice(QuantScheme::Q4_0);
+        st.w_gate = slice(QuantScheme::Q4_0);
+        st.w_up = slice(QuantScheme::Q4_0);
+        st.w_down = slice(QuantScheme::Q4_0);
+        assert!(validate_layer_quants(0, &st).is_err());
+    }
+
+    #[test]
+    fn full_attention_gate_split_exempt() {
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.layer_type = Some(0);
+        st.attn_gate = Some(slice(QuantScheme::Q4_0));
+        st.ssm_alpha = None;
+        st.ssm_beta = None;
+        assert!(validate_layer_quants(0, &st).is_ok());
+    }
+
+    #[test]
+    fn expert_bank_nonuniform_rejected() {
+        use lumen_format::index::ExpertSlice;
+        let e = |q: QuantScheme| ExpertSlice {
+            gate: slice(q),
+            up: slice(q),
+            down: slice(q),
+        };
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.layer_type = None;
+        st.attn_gate = None;
+        st.ssm_alpha = None;
+        st.ssm_beta = None;
+        st.experts = Some(vec![e(QuantScheme::Q4_0), e(QuantScheme::Q4_0)]);
+        assert!(validate_layer_quants(0, &st).is_ok());
+        st.experts = Some(vec![e(QuantScheme::Q4_0), e(QuantScheme::Q8_0)]);
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("expert 0's"), "{err}");
+    }
+
+    #[test]
+    fn shared_expert_pair_and_quant_rejected() {
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.layer_type = None;
+        st.attn_gate = None;
+        st.ssm_alpha = None;
+        st.ssm_beta = None;
+        st.shared_expert_gate = Some(slice(QuantScheme::Q4_0));
+        st.shared_expert_up = Some(slice(QuantScheme::Q4_0));
+        st.shared_expert_down = Some(slice(QuantScheme::Q4_0));
+        assert!(validate_layer_quants(0, &st).is_ok());
+        st.shared_expert_up = Some(slice(QuantScheme::Q8_0));
+        assert!(validate_layer_quants(0, &st).is_err());
+        st.shared_expert_gate = Some(slice(QuantScheme::F16));
+        st.shared_expert_up = Some(slice(QuantScheme::F16));
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("fused kernels only"), "{err}");
+    }
+
+    #[test]
+    fn f32_expert_bank_accepted() {
+        // F16/Bf16/F32 expert banks are legitimately served: the batched
+        // dispatch's quant gate routes them to the legacy per-expert path,
+        // which has real float arms. Only pair/uniformity divergence and the
+        // schemes the dense allowlist rejects are refused.
+        use lumen_format::index::ExpertSlice;
+        let e = |q: QuantScheme| ExpertSlice {
+            gate: slice(q),
+            up: slice(q),
+            down: slice(q),
+        };
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.layer_type = None;
+        st.attn_gate = None;
+        st.ssm_alpha = None;
+        st.ssm_beta = None;
+        st.experts = Some(vec![e(QuantScheme::F32), e(QuantScheme::F32)]);
+        assert!(validate_layer_quants(0, &st).is_ok());
+        st.experts = Some(vec![e(QuantScheme::Bf16), e(QuantScheme::Bf16)]);
+        assert!(validate_layer_quants(0, &st).is_ok());
+    }
+
+    #[test]
+    fn expert_gate_up_pair_mismatch_rejected() {
+        use lumen_format::index::ExpertSlice;
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.layer_type = None;
+        st.attn_gate = None;
+        st.ssm_alpha = None;
+        st.ssm_beta = None;
+        st.experts = Some(vec![ExpertSlice {
+            gate: slice(QuantScheme::Q4_0),
+            up: slice(QuantScheme::Q8_0),
+            down: slice(QuantScheme::Q4_0),
+        }]);
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("expert 0: gate is Q4_0"), "{err}");
+    }
+
+    #[test]
+    fn incomplete_shared_expert_rejected() {
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.layer_type = None;
+        st.attn_gate = None;
+        st.ssm_alpha = None;
+        st.ssm_beta = None;
+        st.shared_expert_gate = Some(slice(QuantScheme::Q4_0));
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(
+            err.to_string().contains("incomplete shared-expert"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn non_f32_norm_rejected() {
+        let setters: [(&str, fn(&mut SubtensorOffsets, TensorSlice)); 11] = [
+            ("attn_norm", |st, t| st.attn_norm = t),
+            ("ffn_norm", |st, t| st.ffn_norm = t),
+            ("attn_post_norm", |st, t| st.attn_post_norm = Some(t)),
+            ("attn_q_norm", |st, t| st.attn_q_norm = Some(t)),
+            ("attn_k_norm", |st, t| st.attn_k_norm = Some(t)),
+            ("ssm_norm", |st, t| st.ssm_norm = Some(t)),
+            ("ssm_a", |st, t| st.ssm_a = Some(t)),
+            ("ssm_conv1d", |st, t| st.ssm_conv1d = Some(t)),
+            ("ssm_dt", |st, t| st.ssm_dt = Some(t)),
+            ("router_weight", |st, t| st.router_weight = Some(t)),
+            ("ffn_gate_inp_shexp", |st, t| {
+                st.ffn_gate_inp_shexp = Some(t)
+            }),
+        ];
+        for (name, set) in setters {
+            let mut st = gdn_layer(QuantScheme::Q8_0);
+            set(&mut st, slice(QuantScheme::F16));
+            let err = validate_layer_quants(0, &st).expect_err(&format!("{name} must require F32"));
+            assert!(
+                err.to_string().contains(&format!("{name} is F16")),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_dense_quant_rejected() {
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.w_down = slice(QuantScheme::Q6_K);
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("w_down"), "{err}");
+    }
 
     #[test]
     fn dense_slice_quant_allowlist() {

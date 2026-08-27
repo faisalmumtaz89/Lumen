@@ -213,7 +213,11 @@ USAGE:
 OPTIONS:
     --input <path>       Path to input GGUF model file (required)
     --output <path>      Path to output LBC file (default: input with .lbc extension)
-    --dequantize         Dequantize all tensors to F32 (larger but compatible)
+    --dequantize         Dequantize tensors to F32 (larger but compatible).
+                         Kernel-required exceptions stay quantized: dense
+                         models keep ssm_out Q8_0 by default, and the Metal
+                         target keeps ssm_alpha/ssm_beta Q8_0 (its GDN
+                         kernels read only Q8_0).
     --requant <scheme>   Requantize weights to target scheme during conversion
                          Supported: q4_0, q8_0. Dense models only (refused for
                          MoE: expert tensors carry their source quantization).
