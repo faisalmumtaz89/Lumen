@@ -1,8 +1,10 @@
 //! Shared GDN (GatedDeltaNet) gate conversion logic for Qwen3.5 architectures.
 //!
-//! GGUF stores ssm_alpha/ssm_beta as F32, but the GDN runtime hardcodes Q8_0
-//! matvec kernels for these tensors. This module centralises the force-requant
-//! logic so both the dense and MoE converters handle it identically.
+//! GGUF stores ssm_alpha/ssm_beta as F32. Metal's GDN gate kernels read them
+//! as Q8_0 only, so default conversions force-requantize them; CUDA also
+//! serves F32 gates (source-fidelity / `--dequantize` non-Metal artifacts).
+//! This module centralises that logic so both the dense and MoE converters
+//! handle it identically.
 
 use crate::convert::{ConvertError, ConvertTarget};
 use crate::gguf::{GgmlType, GgufFile};
@@ -36,7 +38,12 @@ pub(crate) fn compute_ssm_tensor_slice(
         None => return Ok(None),
     };
 
-    if dequantize {
+    // `--dequantize` yields F32 for every SSM tensor on non-Metal targets
+    // (their runtimes serve F32 gates). The Metal target keeps ssm_alpha/
+    // ssm_beta on the Q8_0 force below — Metal's gate pipelines read them as
+    // Q8_0 only, so an F32 pair would make the output unloadable there.
+    let is_alpha_or_beta = suffix == SSM_ALPHA || suffix == SSM_BETA;
+    if dequantize && !(is_alpha_or_beta && target == ConvertTarget::Metal) {
         let n_elements = tensor.n_elements();
         let size = n_elements * 4;
         let slice = TensorSlice {
@@ -48,10 +55,9 @@ pub(crate) fn compute_ssm_tensor_slice(
         return Ok(Some(slice));
     }
 
-    // Force ssm_alpha/beta to Q8_0 if not already -- runtime hardcodes Q8_0 matvec.
+    // Force ssm_alpha/beta to Q8_0 if not already -- Metal hardcodes Q8_0 matvec.
     // Handle types with no direct LBC mapping (Q8_1, Q5_1, etc.) by going through
     // the dequant->F32->Q8_0 path for alpha/beta, or dequant->F32 for other SSM tensors.
-    let is_alpha_or_beta = suffix == SSM_ALPHA || suffix == SSM_BETA;
     // The runtime SSM-scalar slots (ssm_a, ssm_conv1d, ssm_dt, ssm_norm) are
     // typed `Option<CudaSlice<f32>>` — they only accept F32. If the GGUF
     // stores them in F16 / BF16 / quantized format, we must dequantize at
@@ -240,9 +246,12 @@ pub(crate) fn write_ssm_tensors<R: Read + Seek>(
                 && crate::convert::source_fidelity()
                 && is_alpha_or_beta
                 && matches!(src_quant, Some(QuantScheme::F32));
-            if is_alpha_or_beta
-                && !matches!(src_quant, Some(QuantScheme::Q8_0))
-                && !keep_source_gates
+            // Mirror `compute_ssm_tensor_slice`: `--dequantize` yields F32
+            // gates for non-Metal targets; the Metal target keeps the Q8_0
+            // force so the output stays loadable there. Plan and writer MUST
+            // agree on layer-blob layout.
+            let gate_stays_q8 = is_alpha_or_beta && (!dequantize || target == ConvertTarget::Metal);
+            if gate_stays_q8 && !keep_source_gates && !matches!(src_quant, Some(QuantScheme::Q8_0))
             {
                 // Force-requantize to Q8_0 (dequant to F32 first, then quantize to Q8_0)
                 append_tensor_to_blob_requant(
@@ -260,7 +269,12 @@ pub(crate) fn write_ssm_tensors<R: Read + Seek>(
                 )?;
             } else {
                 append_tensor_to_blob_requant(
-                    blob, reader, gguf, &name, dequantize, /*requant_to=*/ None,
+                    blob,
+                    reader,
+                    gguf,
+                    &name,
+                    dequantize && !gate_stays_q8,
+                    /*requant_to=*/ None,
                 )?;
             }
         }

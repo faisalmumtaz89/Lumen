@@ -774,9 +774,11 @@ pub fn gdn_f64_accum_default() -> bool {
 /// cache and cuBLAS `cublasGemmEx` (HGEMV in decode, HGEMM in prefill) in
 /// BOTH paths, MoE-gated.
 ///
-/// The GDN `ssm_alpha` / `ssm_beta` weights are stored `Q8Raw` in every LBC
-/// quant (the GGUF source is F32; the MoE converter force-requantizes them to
-/// Q8_0). With the keeper Q8-prefill-MMQ default ON, the batched PREFILL
+/// The GDN `ssm_alpha` / `ssm_beta` weights are stored `Q8Raw` in default
+/// conversions (the GGUF source is typically F32; the converter
+/// force-requantizes them to Q8_0 — source-fidelity, HF-import, and
+/// `--dequantize` non-Metal artifacts carry F32 gates and take the F32
+/// route instead). With the keeper Q8-prefill-MMQ default ON, the batched PREFILL
 /// projects them via `mmq_q8_0_batched` (INT8 MMA) while the single-token
 /// DECODE uses the per-token Q8_1/dp4a `matvec_q8_0_q8_1` tile matvec — a
 /// DIFFERENT activation-quant granularity + INT8 reduction order. The

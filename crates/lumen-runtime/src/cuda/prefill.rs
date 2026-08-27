@@ -453,9 +453,10 @@ pub(crate) unsafe fn launch_gemm_projection(
 
     // `ssm_alpha` and `ssm_beta` weights are stored as F32 in the
     // GGUF source and an F32 SGEMM dispatch is the canonical reference path.
-    // Lumen's MoE converter force-requantizes them to Q8_0 at LBC creation
-    // time (see `crates/lumen-convert/src/arch/gdn_gates.rs`), so the runtime
-    // path runs them through HGEMM-F16 / MMQ-Q8 — both of which introduce
+    // Default conversions force-requantize them to Q8_0 at LBC creation
+    // time (see `crates/lumen-convert/src/arch/gdn_gates.rs`; source-fidelity,
+    // HF-import, and `--dequantize` non-Metal artifacts keep F32), so the
+    // default runtime path runs them through HGEMM-F16 / MMQ-Q8 — both of which introduce
     // ~0.4-3.4% per-element rounding noise from the requant step. When the
     // `gdn_alpha`/`gdn_beta` projection is routed through F32 SGEMM, it matches
     // that canonical F32 path (modulo SGEMM accumulator order).

@@ -100,8 +100,9 @@ Wire formats, reasoning / extended thinking, sampling & reproducibility, and emb
 
 Lumen optimizes for **batch-1, GPU-resident decode latency** — single-stream interactive serving.
 
-Retained co-located decode record (Qwen3.5-MoE-35B-A3B, Lumen and llama.cpp
-in the same container, 5 runs):
+Retained decode record (Qwen3.5-MoE-35B-A3B, 5 runs per engine; Q8/Q4
+co-located — both engines in one A100 container; BF16 measured in separate
+same-GPU H100 batteries):
 
 | Quant | GPU | Decode (tok/s) | × llama.cpp |
 |-------|-----|---------------:|------------:|
