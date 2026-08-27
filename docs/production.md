@@ -1,6 +1,6 @@
 # Production Deployment
 
-Read this before deploying Lumen to production. Source: the two-backend (CUDA + Metal) validation matrix, verified end-to-end against llama.cpp (2026-06-02).
+Read this before deploying Lumen to production. Source: the two-backend (CUDA + Metal) validation matrix, verified end-to-end against llama.cpp; throughput and capacity figures cite their per-claim provenance below (the retained records are the 2026-07-16 battery and the A100/H100 soaks).
 
 ## Choose the right serving mode
 
@@ -16,7 +16,7 @@ The CLI cold-loads weights on every invocation. A 16-client concurrent burst aga
 Operational policy items required before production deployment:
 
 1. **GPU reservation**:
-   - BF16 MoE-35B-A3B → dedicated 80 GB+ GPU (A100-80GB — load validated, decode throughput unmeasured on A100 — H100, MI300). No co-tenant workloads.
+   - BF16 MoE-35B-A3B → dedicated H100/H200-class GPU (validated there; the A100-80GB fit is unverified — see the headroom warning below). No co-tenant workloads.
    - Q8 MoE → ≥62 GiB free GPU minimum (measured peak 61,089 MiB; A100-80GB shared is OK if peer load < 17 GiB).
    - Q4 MoE → 30 GB free GPU minimum (A100-40GB OK).
    - Dense-9B → 24 GB free GPU minimum (A100-40GB / L40S / 3090 / 4090 OK).
@@ -34,7 +34,7 @@ Operational policy items required before production deployment:
 
 - **Concurrency C ≥ 4 per GPU under CLI mode**: structurally unsupported; cold-start contention dominates. Use `lumen-server` instead.
 - **Prefill × llama.cpp ratio is structurally below 1.0** at all quants on the current NVRTC compute_61 + non-monolithic-encoder stack.
-- **MoE-35B-A3B decode vs llama.cpp — retained co-located record**: Q8 0.567× and Q4 0.598× on A100; BF16 0.575× on H100 (104.1 vs 181.1 tok/s — the highest absolute throughput of the three but the lowest ratio; A100 decode unmeasured). The previously published 0.902×/0.584×/0.674× figures have no retained measurement artifacts.
+- **MoE-35B-A3B decode vs llama.cpp — retained record**: Q8 0.567× and Q4 0.598× on A100 (co-located); BF16 0.575× on H100 (separate per-engine batteries; 104.1 vs 181.1 tok/s — the highest absolute throughput of the three but the lowest ratio; A100 decode unmeasured). The previously published 0.902×/0.584×/0.674× figures have no retained measurement artifacts.
 - **PURE-greedy long-form (≥ 512 tokens)** deterministically loops on all 4 quants. Use sampling or repetition penalty in production.
 - **`lumen-server` mid-stream client disconnect** can wedge the engine worker. Pending fix; work around with a reverse-proxy that buffers SSE responses.
 - **`lumen-server` Authorization / CORS / per-request timeout** are not implemented; deploy behind a reverse proxy that enforces auth, CORS, and request deadlines.
@@ -48,9 +48,9 @@ Operational policy items required before production deployment:
 | Q8_0  | ~10.0 GB / ~22.9 GB (with cuBLAS workspace + cache) | **61,089 MiB ≈ 59.7 GiB** (A100 soak; LBC 37.6 GB) |
 | BF16  | ~17.8 GB               | **72,475 MiB ≈ 70.8 GiB** (H100 soak; LBC 69.7 GB)     |
 
-Qwen3.5-MoE-35B-A3B loads at all three quants on a single A100-80GB (the 69.7 GB BF16 LBC is within capacity; the validation harness records every cell fitting — retained load-time measurements are H100/H200). The BF16 peak-VRAM figure above was measured on H100; the A100 estimate is ≈74,955 MiB ≈ 73.2 GiB — the H100 peak plus ≈2,480 MiB for sm_80's F32 upcast of the non-expert BF16 projection set (source-derived estimate ≈1.03e9 elements × 2 extra bytes ≈ 1,965 MiB; the embedding and output head upload raw BF16 on every architecture and are excluded) and an estimated ≈515 MiB of sm_80-only F16 prefill caches. An independent estimate in the defect register implies a ≈2,575 MiB delta — within 4% of this one.
+Qwen3.5-MoE-35B-A3B loads at Q4_0 and Q8_0 on a single A100-80GB (measured). The BF16 cell has **no retained A100 load artifact**: the retained BF16 measurements (decode battery, 1-hour soak) are from H100/H200, and the unretained records conflict — a withdrawn 2026-06-02 dataset recorded an A100 load, while a later validation note recorded the load exceeding A100-80GB. Treat A100 BF16 as unvalidated. The BF16 peak-VRAM figure above was measured on H100; the A100 estimate is ≈74,955 MiB ≈ 73.2 GiB — the H100 peak plus ≈2,480 MiB for sm_80's F32 upcast of the non-expert BF16 projection set (source-derived estimate ≈1.03e9 elements × 2 extra bytes ≈ 1,965 MiB; the embedding and output head upload raw BF16 on every architecture and are excluded) and an estimated ≈515 MiB of sm_80-only F16 prefill caches. An independently derived estimate of the same delta gives ≈2,575 MiB — within 4% of this one.
 
-**BF16 MoE-35B-A3B headroom warning**: the H100-measured peak is 72,475 MiB; the A100 estimate is ≈74,955 MiB against the 81,152 MiB an A100-80GB PCIe reports, leaving ≈6.0 GiB estimated headroom — an upper bound (CUDA context and driver reserve consume several hundred MiB before any allocation). Any concurrent process consuming a few GiB can race `cuMemAlloc` and cause OOM mid-upload. In a multi-tenant deployment, BF16 MoE requires a dedicated 80 GB+ GPU reservation. No co-tenant workloads. For shared-GPU deployments, use Q8 (61,089 MiB ≈ 59.7 GiB peak) or Q4 (24.1 GB peak).
+**BF16 MoE-35B-A3B headroom warning**: the H100-measured peak is 72,475 MiB; the A100 estimate is ≈74,955 MiB against the 81,152 MiB an A100-80GB PCIe reports, leaving ≈6.0 GiB estimated nominal headroom — an upper bound (CUDA context and driver reserve consume several hundred MiB before any allocation), and the conflicting unretained load records above mean even that margin is unconfirmed. Any concurrent process consuming a few GiB can race `cuMemAlloc` and cause OOM mid-upload. Deploy BF16 MoE on validated H100/H200-class hardware. No co-tenant workloads. For shared-GPU deployments, use Q8 (61,089 MiB ≈ 59.7 GiB peak) or Q4 (24.1 GB peak).
 
 KV cache is auto-sized to fit remaining VRAM; `--context-len` overrides. KV growth is bit-perfect to the theoretical formula: `max_seq_len × num_layers × num_kv_heads × head_dim × 4 (F32) × 2 (K + V)`.
 
@@ -60,7 +60,7 @@ The matrix below summarizes the validation state across operational dimensions a
 
 | Dimension | State |
 |-----------|-------|
-| Models × Quants matrix | Validated — Q8/Q4 throughput on A100; BF16 decode measured on H100/H200 only (needs an 80 GB+ GPU) |
+| Models × Quants matrix | Validated — Q8/Q4 throughput on A100; BF16 decode measured on H100/H200 only (A100-80GB BF16 MoE unvalidated) |
 | Correctness suite | Greedy parity differs from llama.cpp (root cause: chat template) |
 | KV cache & memory | Validated (single-tenant) |
 | Long-form generation | PURE-greedy loops; BF16 first-token argmax is context-length-sensitive — pin `--context-len` |
@@ -69,4 +69,4 @@ The matrix below summarizes the validation state across operational dimensions a
 | Stability & soak | Validated (CLI per-process); a 16-client burst against `lumen run` fails by design — use `lumen-server` |
 | Error handling & edge cases | Four protocol-completeness gaps remain; deploy behind a reverse proxy |
 | Determinism & reproducibility | Validated — kernels byte-deterministic at a fixed seed; server + CLI randomize the seed by default, so pin `seed` / `--seed` (or `temperature 0`) to reproduce |
-| Perf parity vs llama.cpp | Retained co-located record: BF16 0.575× (H100), Q8 0.567× / Q4 0.598× (A100) |
+| Perf vs llama.cpp | Retained record: Q8 0.567× / Q4 0.598× (A100, co-located); BF16 0.575× (H100, separate per-engine batteries) |

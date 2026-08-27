@@ -10,17 +10,19 @@ Each backend (CUDA + Metal) is validated end-to-end against llama.cpp per the ma
 
 Benchmarked on an A100-80GB (27B-class BF16 cells on H100 — sm_80 routes BF16 through F32 and cannot hold them; the MoE BF16 record is also H100-measured); see [`bench/RESULTS.md`](../bench/RESULTS.md) for the rig and full numbers.
 
+**Status reflects functional verification** (correctness, robustness, and determinism gates), not decode-speed parity: a cell can be production-ready while decoding slower than llama.cpp on the same hardware — the ratio column carries the observed record. Cells below ~0.95× are open performance targets.
+
 | Model | Quant | Status | × llama.cpp decode (canonical) | Notes |
 |-------|-------|--------|------:|---|
 | Qwen3.5-9B dense | Q8_0 | Production-ready | **0.970× llama.cpp** (retained co-located A100 record: 114.1 vs 117.6) | All robustness and correctness gates pass |
 | Qwen3.5-9B dense | Q4_0 | Production-ready | **0.979× llama.cpp** (retained co-located A100 record: 146.6 vs 149.8) | All functional gates pass |
-| Qwen3.5-9B dense | BF16 | Production-ready | 0.727× llama.cpp (retained co-located H100 record: 106.5 vs 146.6; earlier 0.93–0.94× not retained) | Highest-precision |
+| Qwen3.5-9B dense | BF16 | Production-ready | 0.727× llama.cpp (retained same-GPU H100 record, separate per-engine batteries: 106.5 vs 146.6; earlier 0.93–0.94× not retained) | Highest-precision |
 | Qwen3.5-MoE-35B-A3B | Q8_0 | Production-ready (functional) | 0.567× llama.cpp (retained co-located A100 record: 79.2 vs 139.7) | MoE_Q8_SPLIT=OFF default validated |
 | Qwen3.5-MoE-35B-A3B | Q4_0 | Production-ready (functional) | 0.598× llama.cpp (retained co-located A100 record: 93.6 vs 156.5) | Same MoE setup path as Q8 MoE |
-| Qwen3.5-MoE-35B-A3B | BF16 | Production-ready with caveats | 0.575× llama.cpp (retained co-located H100 record: 104.1 vs 181.1; the previously published 0.902× has no retained artifact) | Requires dedicated 80 GB+ GPU (peak 72,475 MiB ≈ 70.8 GiB, H100-measured; A100 decode unmeasured) |
-| Qwen3.6-27B dense | Q8_0 | Production-ready | 0.85× llama.cpp | All quality gates pristine (2026-06-11 checklist) |
-| Qwen3.6-27B dense | Q4_0 | Production-ready | 0.66× llama.cpp | All quality gates pristine |
-| Qwen3.6-27B dense | BF16 | Production-ready | 0.89× llama.cpp | All quality gates pass; shares the deterministic stray-first-token issue noted on the Qwen3.8-27B BF16 row |
+| Qwen3.5-MoE-35B-A3B | BF16 | Production-ready with caveats | 0.575× llama.cpp (retained same-GPU H100 record, separate per-engine batteries: 104.1 vs 181.1; the previously published 0.902× has no retained artifact) | Requires a dedicated H100/H200-class GPU (peak 72,475 MiB ≈ 70.8 GiB, H100-measured; the A100-80GB fit is unverified and A100 decode unmeasured) |
+| Qwen3.6-27B dense | Q8_0 | Production-ready | 0.891× llama.cpp (retained 2026-07-16 co-located A100 record: 35.08 vs 39.35; see bench/RESULTS.md) | All quality gates pristine (2026-06-11 checklist; earlier 0.85× not artifact-retained) |
+| Qwen3.6-27B dense | Q4_0 | Production-ready | 0.820× llama.cpp (retained 2026-07-16 co-located A100 record: 45.34 vs 55.32; see bench/RESULTS.md) | All quality gates pristine (earlier 0.66× not artifact-retained) |
+| Qwen3.6-27B dense | BF16 | Production-ready (H100) | 0.818× llama.cpp (retained 2026-07-16 same-GPU H100 record, separate per-engine batteries: 40.4 vs 49.4; earlier 0.89× not artifact-retained) | All quality gates pass; shares the deterministic stray-first-token issue noted on the Qwen3.8-27B BF16 row |
 | Qwen3.8-27B dense | Q8_0 | Production-ready | **1.02× llama.cpp** | All quality gates pristine + DET-001 50/50 (2026-08-14, A100; llama.cpp b10032 co-located, same GGUF) |
 | Qwen3.8-27B dense | Q4_0 | Production-ready | 0.93× llama.cpp | All quality gates pristine + DET-001 50/50 (2026-08-14, A100) |
 | Qwen3.8-27B dense | BF16 | Production-ready (H100 / sm_90) | 0.87× llama.cpp | All quality gates pass + DET-001 50/50 (2026-08-14, H100 — sm_90 native BF16). Known issue: a deterministic stray first token at BF16, shared with Qwen3.6-27B BF16 (tracked prefill-numerics issue) |
