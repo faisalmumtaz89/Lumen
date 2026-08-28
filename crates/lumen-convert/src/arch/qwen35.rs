@@ -68,6 +68,8 @@ fn compute_layer_shape_qwen35(
 ) -> Result<LayerShape, ConvertError> {
     let mut blob_size = 0u64;
     let is_full_attn = is_qwen35moe_full_attention_layer(layer);
+    let gdn_pair_q8 = !is_full_attn
+        && super::gdn_gates::metal_gdn_pair_forces_q8(gguf, layer, dequantize, requant_to, target);
 
     // Helper to compute a TensorSlice for a given tensor.
     let compute_slice = |gguf: &GgufFile,
@@ -79,6 +81,19 @@ fn compute_layer_shape_qwen35(
             .find_tensor(name)
             .ok_or_else(|| ConvertError::MissingTensor(name.to_string()))?;
         let is_norm = name.contains("norm");
+        // Norm tensors are always written F32 (mirrors the writer's forced
+        // dequantize in `append_tensor_to_blob_requant_with_target` — every
+        // backend reads norm weights as F32 and rejects anything else).
+        if is_norm && tensor.ggml_type != GgmlType::F32 {
+            let size = tensor.n_elements() * 4;
+            let slice = TensorSlice {
+                offset: *blob_offset,
+                length: size,
+                quant: QuantScheme::F32,
+            };
+            *blob_offset += size;
+            return Ok(slice);
+        }
 
         // Check if requantization applies
         if let Some(target_q) = requant_to {
@@ -384,12 +399,27 @@ fn compute_layer_shape_qwen35(
             length: 0,
             quant: QuantScheme::F32,
         };
-        wq = compute_slice(
-            gguf,
-            &layer_tensor_name(layer, ATTN_QKV),
-            &mut blob_size,
-            dequantize,
-        )?;
+        let qkv_name = layer_tensor_name(layer, ATTN_QKV);
+        wq = if gdn_pair_q8 {
+            let t = gguf
+                .find_tensor(&qkv_name)
+                .ok_or_else(|| ConvertError::MissingTensor(qkv_name.clone()))?;
+            let n = t.n_elements() as usize;
+            assert!(
+                n % 32 == 0,
+                "Q8_0 requires elements divisible by 32, got {n} for {qkv_name}"
+            );
+            let size = ((n / 32) * 34) as u64;
+            let slice = TensorSlice {
+                offset: blob_size,
+                length: size,
+                quant: QuantScheme::Q8_0,
+            };
+            blob_size += size;
+            slice
+        } else {
+            compute_slice(gguf, &qkv_name, &mut blob_size, dequantize)?
+        };
         wk = z;
         wv = z;
         wo = z;
@@ -419,9 +449,29 @@ fn compute_layer_shape_qwen35(
         }
     };
 
-    // Attention gate (full attention layers only)
-    let attn_gate =
-        try_compute_opt_slice(gguf, layer, ATTN_GATE_WEIGHT, &mut blob_size, dequantize)?;
+    // Attention gate — GDN layers on this architecture (full attention
+    // fuses the gate into attn_q; the runtime still dispatches a separate
+    // attn_gate on its own quant wherever one exists)
+    let attn_gate = if gdn_pair_q8 {
+        let name = layer_tensor_name(layer, ATTN_GATE_WEIGHT);
+        gguf.find_tensor(&name).map(|t| {
+            let n = t.n_elements() as usize;
+            assert!(
+                n % 32 == 0,
+                "Q8_0 requires elements divisible by 32, got {n} for {name}"
+            );
+            let size = ((n / 32) * 34) as u64;
+            let slice = TensorSlice {
+                offset: blob_size,
+                length: size,
+                quant: QuantScheme::Q8_0,
+            };
+            blob_size += size;
+            slice
+        })
+    } else {
+        try_compute_opt_slice(gguf, layer, ATTN_GATE_WEIGHT, &mut blob_size, dequantize)?
+    };
 
     // SSM tensors (linear attention layers only) — never requantized to user target.
     // ssm_alpha/beta are Q8_0 on default paths (Metal's GDN kernels read only
@@ -574,6 +624,13 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
     target: ConvertTarget,
 ) -> Result<(), ConvertError> {
     let is_full_attn = is_qwen35moe_full_attention_layer(layer);
+    let gdn_pair_q8 = !is_full_attn
+        && super::gdn_gates::metal_gdn_pair_forces_q8(gguf, layer, dequantize, requant_to, target);
+    if gdn_pair_q8 {
+        eprintln!(
+            "    Metal GDN pair force: layer {layer} attn_qkv+attn_gate -> Q8_0 (mixed source)"
+        );
+    }
 
     // Attention projections: layout differs by layer type
     if is_full_attn {
@@ -596,8 +653,12 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
             reader,
             gguf,
             &layer_tensor_name(layer, ATTN_QKV),
-            dequantize,
-            requant_to,
+            if gdn_pair_q8 { false } else { dequantize },
+            if gdn_pair_q8 {
+                Some(QuantScheme::Q8_0)
+            } else {
+                requant_to
+            },
             target,
         )?;
     }
@@ -649,8 +710,12 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
             reader,
             gguf,
             &attn_gate_name,
-            dequantize,
-            requant_to,
+            if gdn_pair_q8 { false } else { dequantize },
+            if gdn_pair_q8 {
+                Some(QuantScheme::Q8_0)
+            } else {
+                requant_to
+            },
             target,
         )?;
     }

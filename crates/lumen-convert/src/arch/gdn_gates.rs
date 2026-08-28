@@ -281,3 +281,34 @@ pub(crate) fn write_ssm_tensors<R: Read + Seek>(
     }
     Ok(())
 }
+
+/// Whether a GDN layer's `attn_qkv`/`attn_gate` pair must both be written
+/// Q8_0 on the Metal target.
+///
+/// Metal's GDN decode path requires the pair to agree on whether it is Q8_0
+/// (the loader rejects a split). The per-tensor K-quant upcast can
+/// manufacture that split from a uniform source, and mixed-source GGUFs can
+/// carry one natively — so under default flags, when the pair's post-upcast
+/// schemes would split on the Q8_0 axis, both tensors are force-written
+/// Q8_0. Single decision point for the dense and MoE planners AND writers.
+pub(crate) fn metal_gdn_pair_forces_q8(
+    gguf: &GgufFile,
+    layer: usize,
+    dequantize: bool,
+    requant_to: Option<QuantScheme>,
+    target: ConvertTarget,
+) -> bool {
+    if target != ConvertTarget::Metal || dequantize || requant_to.is_some() {
+        return false;
+    }
+    let qkv = gguf.find_tensor(&layer_tensor_name(layer, ATTN_QKV));
+    let gate = gguf.find_tensor(&layer_tensor_name(layer, ATTN_GATE_WEIGHT));
+    let (Some(qkv), Some(gate)) = (qkv, gate) else {
+        return false;
+    };
+    // Q8_1 is unconditionally requantized to Q8_0 by both converters, so it
+    // lands on the Q8 side of the pair.
+    let is_q8_after_target =
+        |t: GgmlType| t == GgmlType::Q8_0 || t == GgmlType::Q8_1 || metal_needs_upcast(t);
+    is_q8_after_target(qkv.ggml_type) != is_q8_after_target(gate.ggml_type)
+}

@@ -193,6 +193,236 @@ fn moe_requant_is_refused() {
 }
 
 #[test]
+fn non_f32_norms_forced_to_f32_on_every_target() {
+    // Both backends read norm weights as F32 and reject anything else at
+    // load, so the converter must never pass a non-F32 norm through.
+    let arch = "qwen35";
+    let k = |s: &str| format!("{arch}.{s}");
+    let mut b = GgufBuilder::new();
+    b.add_string("general.architecture", arch);
+    b.add_u32(&k("block_count"), 1);
+    b.add_u32(&k("attention.head_count"), HEADS);
+    b.add_u32(&k("attention.head_count_kv"), KVH);
+    b.add_u32(&k("attention.key_length"), HID as u32 / HEADS);
+    b.add_u32(&k("embedding_length"), HID as u32);
+    b.add_u32(&k("feed_forward_length"), INTER as u32);
+    b.add_u32(&k("context_length"), 64);
+    b.add_f32(&k("rope.freq_base"), 10000.0);
+    b.add_f32(&k("attention.layer_norm_rms_epsilon"), 1e-5);
+    b.add_f32_tensor(
+        "token_embd.weight",
+        &[VOCAB, HID],
+        &vec![0.0; (VOCAB * HID) as usize],
+    );
+    b.add_f32_tensor("output_norm.weight", &[HID], &vec![1.0; HID as usize]);
+    let kvd = (HID / HEADS as u64) * KVH as u64;
+    let p = "blk.0";
+    let mut q = |nm: &str, dims: &[u64]| {
+        let n: u64 = dims.iter().product();
+        b.add_tensor(&format!("{p}.{nm}"), GgmlType::Q5_0, dims, q5_bytes(n));
+    };
+    q("attn_qkv.weight", &[HID, HID]);
+    q("attn_q.weight", &[HID, HID]);
+    q("attn_k.weight", &[HID, kvd]);
+    q("attn_v.weight", &[HID, kvd]);
+    q("attn_output.weight", &[HID, HID]);
+    q("ffn_gate.weight", &[HID, INTER]);
+    q("ffn_up.weight", &[HID, INTER]);
+    q("ffn_down.weight", &[INTER, HID]);
+    let f16_ones: Vec<u8> = (0..HID).flat_map(|_| 0x3C00u16.to_le_bytes()).collect();
+    b.add_tensor(
+        &format!("{p}.attn_norm.weight"),
+        GgmlType::F16,
+        &[HID],
+        f16_ones.clone(),
+    );
+    b.add_tensor(
+        &format!("{p}.ffn_norm.weight"),
+        GgmlType::F16,
+        &[HID],
+        f16_ones,
+    );
+    let gguf = b.build();
+    for target in [ConvertTarget::Metal, ConvertTarget::Generic] {
+        let out = std::env::temp_dir().join(format!(
+            "lumen_lockstep_f16norm_{target:?}_{}.lbc",
+            std::process::id()
+        ));
+        let opts = ConvertOptions {
+            target,
+            ..Default::default()
+        };
+        convert_gguf_bytes_to_lbc(&gguf, &out, &opts)
+            .unwrap_or_else(|e| panic!("{target:?}: {e:?}"));
+        let f = LbcFile::open(&out).unwrap();
+        let st = &f.layer_indices[0].subtensors;
+        assert_eq!(
+            (st.attn_norm.quant, st.attn_norm.length),
+            (QuantScheme::F32, HID * 4),
+            "{target:?}: attn_norm must be forced to F32"
+        );
+        assert_eq!(st.ffn_norm.quant, QuantScheme::F32);
+        std::fs::remove_file(&out).ok();
+    }
+}
+
+#[test]
+fn metal_gdn_qkv_gate_pair_written_uniformly() {
+    // A per-tensor upcast (or a mixed source) must not produce the
+    // Q8/non-Q8 attn_qkv/attn_gate split the Metal loader rejects: when the
+    // pair would split on the Q8_0 axis, both are written Q8_0.
+    let build = |qkv: GgmlType, gate: GgmlType| -> Vec<u8> {
+        let arch = "qwen35";
+        let k = |s: &str| format!("{arch}.{s}");
+        let mut b = GgufBuilder::new();
+        b.add_string("general.architecture", arch);
+        b.add_u32(&k("block_count"), 1);
+        b.add_u32(&k("attention.head_count"), HEADS);
+        b.add_u32(&k("attention.head_count_kv"), KVH);
+        b.add_u32(&k("attention.key_length"), HID as u32 / HEADS);
+        b.add_u32(&k("embedding_length"), HID as u32);
+        b.add_u32(&k("feed_forward_length"), INTER as u32);
+        b.add_u32(&k("context_length"), 64);
+        b.add_f32(&k("rope.freq_base"), 10000.0);
+        b.add_f32(&k("attention.layer_norm_rms_epsilon"), 1e-5);
+        b.add_f32_tensor(
+            "token_embd.weight",
+            &[VOCAB, HID],
+            &vec![0.0; (VOCAB * HID) as usize],
+        );
+        b.add_f32_tensor("output_norm.weight", &[HID], &vec![1.0; HID as usize]);
+        let kvd = (HID / HEADS as u64) * KVH as u64;
+        let p = "blk.0";
+        let add = |b: &mut GgufBuilder, nm: &str, t: GgmlType, dims: &[u64]| {
+            let n: u64 = dims.iter().product();
+            let bytes = match t {
+                GgmlType::Q5_0 => q5_bytes(n),
+                GgmlType::Q8_0 => {
+                    let mut v = vec![0u8; (n / 32) as usize * 34];
+                    for c in v.chunks_exact_mut(34) {
+                        c[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+                    }
+                    v
+                }
+                GgmlType::Q4_0 => {
+                    let mut v = vec![0u8; (n / 32) as usize * 18];
+                    for c in v.chunks_exact_mut(18) {
+                        c[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+                    }
+                    v
+                }
+                GgmlType::Q4_K => vec![0u8; (n / 256) as usize * 144],
+                // Q8_1: 36 bytes per 32-element block (f16 scale + f16 sum + 32 qs)
+                GgmlType::Q8_1 => {
+                    let mut v = vec![0u8; (n / 32) as usize * 36];
+                    for c in v.chunks_exact_mut(36) {
+                        c[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+                    }
+                    v
+                }
+                other => panic!("unsupported test type {other:?}"),
+            };
+            b.add_tensor(&format!("{p}.{nm}"), t, dims, bytes);
+        };
+        add(&mut b, "attn_qkv.weight", qkv, &[HID, HID]);
+        add(&mut b, "attn_gate.weight", gate, &[HID, HID]);
+        for nm in ["attn_q.weight", "attn_output.weight"] {
+            add(&mut b, nm, GgmlType::Q8_0, &[HID, HID]);
+        }
+        add(&mut b, "attn_k.weight", GgmlType::Q8_0, &[HID, kvd]);
+        add(&mut b, "attn_v.weight", GgmlType::Q8_0, &[HID, kvd]);
+        add(&mut b, "ffn_gate.weight", GgmlType::Q8_0, &[HID, INTER]);
+        add(&mut b, "ffn_up.weight", GgmlType::Q8_0, &[HID, INTER]);
+        add(&mut b, "ffn_down.weight", GgmlType::Q8_0, &[INTER, HID]);
+        b.add_f32_tensor(
+            &format!("{p}.attn_norm.weight"),
+            &[HID],
+            &vec![1.0; HID as usize],
+        );
+        b.add_f32_tensor(
+            &format!("{p}.ffn_norm.weight"),
+            &[HID],
+            &vec![1.0; HID as usize],
+        );
+        b.build()
+    };
+    // (qkv, gate, expected pair quants on the Metal target)
+    let cases = [
+        (
+            GgmlType::Q4_K,
+            GgmlType::Q4_0,
+            QuantScheme::Q8_0,
+            QuantScheme::Q8_0,
+        ),
+        (
+            GgmlType::Q4_0,
+            GgmlType::Q4_K,
+            QuantScheme::Q8_0,
+            QuantScheme::Q8_0,
+        ),
+        // Q8_1 requantizes to Q8_0, so it sits on the Q8 side of the pair
+        (
+            GgmlType::Q8_1,
+            GgmlType::Q4_0,
+            QuantScheme::Q8_0,
+            QuantScheme::Q8_0,
+        ),
+        // already-Q8 member passes through while its partner is forced
+        (
+            GgmlType::Q8_0,
+            GgmlType::Q4_0,
+            QuantScheme::Q8_0,
+            QuantScheme::Q8_0,
+        ),
+        // uniform non-Q8 pair stays untouched (no split, no force)
+        (
+            GgmlType::Q4_0,
+            GgmlType::Q4_0,
+            QuantScheme::Q4_0,
+            QuantScheme::Q4_0,
+        ),
+    ];
+    for (qkv, gate, want_qkv, want_gate) in cases {
+        let gguf = build(qkv, gate);
+        let out = std::env::temp_dir().join(format!(
+            "lumen_lockstep_pair_{qkv:?}_{gate:?}_{}.lbc",
+            std::process::id()
+        ));
+        let opts = ConvertOptions {
+            target: ConvertTarget::Metal,
+            ..Default::default()
+        };
+        convert_gguf_bytes_to_lbc(&gguf, &out, &opts)
+            .unwrap_or_else(|e| panic!("{qkv:?}/{gate:?}: {e:?}"));
+        let f = LbcFile::open(&out).unwrap();
+        let st = &f.layer_indices[0].subtensors;
+        assert_eq!(st.wq.quant, want_qkv, "{qkv:?}/{gate:?} qkv");
+        assert_eq!(
+            st.attn_gate.unwrap().quant,
+            want_gate,
+            "{qkv:?}/{gate:?} gate"
+        );
+        std::fs::remove_file(&out).ok();
+    }
+    // Generic target: the force never fires (mixed pairs pass through).
+    let gguf = build(GgmlType::Q4_K, GgmlType::Q4_0);
+    let out = std::env::temp_dir().join(format!(
+        "lumen_lockstep_pair_generic_{}.lbc",
+        std::process::id()
+    ));
+    let opts = ConvertOptions {
+        target: ConvertTarget::Generic,
+        ..Default::default()
+    };
+    convert_gguf_bytes_to_lbc(&gguf, &out, &opts).unwrap();
+    let f = LbcFile::open(&out).unwrap();
+    let st = &f.layer_indices[0].subtensors;
+    assert_eq!(st.wq.quant, QuantScheme::Q4_K);
+    assert_eq!(st.attn_gate.unwrap().quant, QuantScheme::Q4_0);
+    std::fs::remove_file(&out).ok();
+}
+
+#[test]
 fn moe_dequantize_writes_f32_experts_on_both_targets() {
     // F16/Bf16/F32 expert banks are served by the Metal legacy per-expert
     // path and by CUDA, so `--dequantize` MoE output is loadable on both
@@ -427,4 +657,93 @@ fn dequantize_gdn_gates_lockstep() {
         convert_and_probe_gates("generic_default_f32src", GgmlType::F32, &generic),
         (QuantScheme::Q8_0, 16 * 34)
     );
+}
+
+#[test]
+fn metal_gdn_pair_force_covers_moe_converter() {
+    // The MoE converter duplicates the pair wiring; pin one mixed cell.
+    let arch = "qwen35moe";
+    let k = |s: &str| format!("{arch}.{s}");
+    let mut b = GgufBuilder::new();
+    b.add_string("general.architecture", arch);
+    b.add_u32(&k("block_count"), 1);
+    b.add_u32(&k("attention.head_count"), HEADS);
+    b.add_u32(&k("attention.head_count_kv"), KVH);
+    b.add_u32(&k("attention.key_length"), HID as u32 / HEADS);
+    b.add_u32(&k("embedding_length"), HID as u32);
+    b.add_u32(&k("feed_forward_length"), INTER as u32);
+    b.add_u32(&k("context_length"), 64);
+    b.add_f32(&k("rope.freq_base"), 10000.0);
+    b.add_f32(&k("attention.layer_norm_rms_epsilon"), 1e-5);
+    b.add_u32(&k("expert_count"), NEXP as u32);
+    b.add_u32(&k("expert_used_count"), 2);
+    b.add_f32_tensor(
+        "token_embd.weight",
+        &[VOCAB, HID],
+        &vec![0.0; (VOCAB * HID) as usize],
+    );
+    b.add_f32_tensor("output_norm.weight", &[HID], &vec![1.0; HID as usize]);
+    let kvd = (HID / HEADS as u64) * KVH as u64;
+    let p = "blk.0";
+    let mut q = |nm: &str, dims: &[u64]| {
+        let n: u64 = dims.iter().product();
+        b.add_tensor(&format!("{p}.{nm}"), GgmlType::Q5_0, dims, q5_bytes(n));
+    };
+    q("attn_q.weight", &[HID, HID]);
+    q("attn_k.weight", &[HID, kvd]);
+    q("attn_v.weight", &[HID, kvd]);
+    q("attn_output.weight", &[HID, HID]);
+    q("ffn_gate_exps.weight", &[HID, INTER, NEXP]);
+    q("ffn_up_exps.weight", &[HID, INTER, NEXP]);
+    q("ffn_down_exps.weight", &[INTER, HID, NEXP]);
+    b.add_f32_tensor(
+        &format!("{p}.ffn_gate_inp.weight"),
+        &[HID, NEXP],
+        &vec![0.0; (HID * NEXP) as usize],
+    );
+    // mixed pair: K-quant qkv (upcasts) + Q4_0 gate (would stay) -> both Q8_0
+    b.add_tensor(
+        &format!("{p}.attn_qkv.weight"),
+        GgmlType::Q4_K,
+        &[HID, HID],
+        vec![0u8; ((HID * HID) / 256) as usize * 144],
+    );
+    {
+        let n = HID * HID;
+        let mut v = vec![0u8; (n / 32) as usize * 18];
+        for c in v.chunks_exact_mut(18) {
+            c[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        }
+        b.add_tensor(
+            &format!("{p}.attn_gate.weight"),
+            GgmlType::Q4_0,
+            &[HID, HID],
+            v,
+        );
+    }
+    b.add_f32_tensor(
+        &format!("{p}.attn_norm.weight"),
+        &[HID],
+        &vec![1.0; HID as usize],
+    );
+    b.add_f32_tensor(
+        &format!("{p}.ffn_norm.weight"),
+        &[HID],
+        &vec![1.0; HID as usize],
+    );
+    let gguf = b.build();
+    let out = std::env::temp_dir().join(format!(
+        "lumen_lockstep_pair_moe_{}.lbc",
+        std::process::id()
+    ));
+    let opts = ConvertOptions {
+        target: ConvertTarget::Metal,
+        ..Default::default()
+    };
+    convert_gguf_bytes_to_lbc(&gguf, &out, &opts).unwrap();
+    let f = LbcFile::open(&out).unwrap();
+    let st = &f.layer_indices[0].subtensors;
+    assert_eq!(st.wq.quant, QuantScheme::Q8_0);
+    assert_eq!(st.attn_gate.unwrap().quant, QuantScheme::Q8_0);
+    std::fs::remove_file(&out).ok();
 }
