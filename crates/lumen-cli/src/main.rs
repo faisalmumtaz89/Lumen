@@ -82,7 +82,7 @@ fn pull_cmd(args: &[String]) {
                 quant_override = Some(
                     args.get(i)
                         .unwrap_or_else(|| {
-                            eprintln!("Error: --quant requires a value (e.g. Q8_0, Q4_0, F16)");
+                            eprintln!("Error: --quant requires a value (e.g. Q8_0, Q4_0, BF16)");
                             std::process::exit(1);
                         })
                         .clone(),

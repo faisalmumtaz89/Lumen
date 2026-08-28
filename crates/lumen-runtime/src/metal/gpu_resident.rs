@@ -88,9 +88,9 @@ pub(super) fn validate_layer_quants(
             return Err(RuntimeError::Compute(format!(
                 "layer {layer}: attn_qkv is {:?} but attn_gate is {:?}: \
                  the Metal GDN decode path requires the pair to agree \
-                 on whether it is Q8_0. Re-convert from a source GGUF \
-                 with a uniform quantization (`--requant q8_0` also \
-                 works for dense models).",
+                 on whether it is Q8_0. Re-convert with \
+                 `lumen convert --target metal` (it writes the pair \
+                 uniformly).",
                 st.wq.quant, gate.quant
             )));
         }

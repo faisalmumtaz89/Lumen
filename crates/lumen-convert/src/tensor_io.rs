@@ -134,7 +134,10 @@ pub(crate) fn append_tensor_to_blob_requant<R: Read + Seek>(
 /// regression that caused layer 3 NaN).
 ///
 /// Norm tensors (anything whose name contains "norm") are exempted from the
-/// upcast and always stay F32. Same applies under the Generic target.
+/// upcast and are always written F32: the GPU backends read norm weights as
+/// F32 (Metal rejects every non-F32 per-layer norm at load; CUDA rejects
+/// the attention norms), so a non-F32 norm source is dequantized here
+/// regardless of flags.
 pub(crate) fn append_tensor_to_blob_requant_with_target<R: Read + Seek>(
     blob: &mut Vec<u8>,
     reader: &mut R,
@@ -149,6 +152,7 @@ pub(crate) fn append_tensor_to_blob_requant_with_target<R: Read + Seek>(
         .ok_or_else(|| ConvertError::MissingTensor(tensor_name.to_string()))?;
     let data = read_tensor_data(reader, gguf, tensor)?;
     let is_norm = tensor_name.contains("norm");
+    let dequantize = dequantize || (is_norm && tensor.ggml_type != GgmlType::F32);
 
     // Metal target: K-quant or legacy-Q5_0 layer tensor (non-norm) -- upcast
     // to Q8_0. The round trip re-quantizes with new block scales; Q8_0's
