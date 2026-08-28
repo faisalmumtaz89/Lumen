@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-08-28
+
 ### Fixed
 
 - **The converter no longer produces Metal-target files its own loader
@@ -515,6 +517,7 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
 [unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.12.1...HEAD
+[0.16.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.12.1...v0.13.0
