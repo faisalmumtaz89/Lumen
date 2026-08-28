@@ -7,6 +7,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Fixed
+
+- **The converter no longer produces Metal-target files its own loader
+  rejects.** Norm tensors are always written F32 (both backends read norm
+  weights as F32 and refuse anything else at load; a non-F32-norm source
+  GGUF previously converted silently and then failed to load). On the Metal
+  target, a GDN layer's `attn_qkv`/`attn_gate` pair is written uniformly:
+  when a per-tensor upcast (or a mixed source, including Q8_1) would split
+  the pair on the Q8_0 axis, both tensors are written Q8_0, with a notice
+  printed. The loader's mismatch remedy now recommends the plain
+  re-conversion that actually works for dense and MoE models.
+- The registry no longer advertises an F16 quantization no model ships;
+  `lumen pull` help text matches.
+
+### Changed
+
+- Metal validation suite metadata records the tested binary's path, sha256,
+  and engine commit; the release-gates harness stamps the correct release
+  tag inside its cloud container.
+
 ## [0.15.0] — 2026-08-28
 
 ### Fixed
@@ -32,6 +52,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   Non-Metal targets now write true F32 gates (CUDA serves them); the Metal
   target keeps the Q8_0 force so the output stays loadable. Dequantized
   MoE expert banks are served by Metal's per-expert float path.
+  **Disclosure:** before v0.15.0, an LBC whose `ssm_alpha`/`ssm_beta` were
+  stored F32 loaded and computed **silently wrong output** on Metal (F32
+  gate bytes read as Q8_0 blocks). Two conversion paths produced such
+  files: `--dequantize --target metal` on a GGUF whose gates were already
+  Q8_0, and `LUMEN_CONVERT_SOURCE_FIDELITY=1` on a non-Metal target with
+  the F32-source gates real GGUFs ship (most `--dequantize` combinations
+  instead aborted at conversion). If you ran either output on Metal with
+  an earlier release, re-convert with `--target metal`.
 
 ### Changed
 
@@ -40,7 +68,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   batteries (not co-located), the llama.cpp build/protocol attestation
   applies to the co-located A100 cells only, the A100-80GB BF16-MoE fit is
   stated as unverified (conflicting unretained records), and the
-  Qwen3.6-27B CUDA rows carry the retained record (0.892×/0.820×).
+  Qwen3.6-27B CUDA rows carry the retained record (0.891×/0.820×).
 
 ## [0.14.0] — 2026-08-27
 

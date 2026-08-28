@@ -16,7 +16,7 @@ supported_architectures = [
     "qwen35moe",  # Qwen3.5 MoE (GatedDeltaNet, sparse FFN)
 ]
 
-supported_quantizations = ["BF16", "F16", "Q8_0", "Q4_0"]
+supported_quantizations = ["BF16", "Q8_0", "Q4_0"]
 
 
 # =============================================================================
