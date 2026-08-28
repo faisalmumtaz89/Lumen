@@ -38,7 +38,7 @@ ARGUMENTS:
     <model-name>          Model name or alias from the registry: qwen3.5-9b, qwen3.6-27b, qwen3.5-moe
 
 OPTIONS:
-    --quant <scheme>      Quantization format (default: Q8_0). Available: Q8_0, Q4_0, BF16, F16
+    --quant <scheme>      Quantization format (default: Q8_0). Available: Q8_0, Q4_0, BF16
     --yes, -y             Skip download confirmation prompt
     -h, --help            Print this help message
 
