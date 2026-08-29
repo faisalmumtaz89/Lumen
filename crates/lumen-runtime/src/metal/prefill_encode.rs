@@ -545,6 +545,12 @@ impl MetalF32Backend {
         pipelines: &MetalPipelines,
         scratch: &mut MetalScratch,
     ) -> Result<(), RuntimeError> {
+        // Streaming path: the persistent GDN state buffers are allocated on
+        // first touch (the GPU-resident preload allocates them up front).
+        if weights.subtensors.layer_type == Some(1) {
+            self.ensure_gdn_layer_state(scratch, layer_idx)?;
+        }
+
         // Per-layer concurrent encoder + greedy wavefront scheduler.
         // Eligible only for Qwen3.5 full-attention layers with dense FFN, no
         // Split-K, no deep-profile (which intentionally splits encoders for
@@ -1776,27 +1782,9 @@ impl MetalF32Backend {
                     ssm_out_off: st.ssm_out.map(|s| base_off + s.offset),
                     ssm_out_quant: st.ssm_out.map(|s| s.quant),
                     gdn_layer_idx: if st.layer_type == Some(1) {
-                        // Count GDN layers (layer_type=1) with index < layer_idx.
-                        // GDN layers are every layer EXCEPT every 4th (full attention).
-                        // layer_type=1 for GDN, layer_type=0 for full attention.
-                        // gdn_idx is the sequential count of GDN layers before this one.
-                        let mut gdn_count = 0usize;
-                        // Use gdn_layer_idx_map if populated (GPU-resident path),
-                        // otherwise compute from layer_idx assuming every 4th layer
-                        // is full attention (Qwen3.5 pattern: full_attention_interval=4).
-                        if let Some(Some(idx)) = scratch.gdn_layer_idx_map.get(layer_idx) {
-                            Some(*idx)
-                        } else {
-                            // Count non-full-attention layers before this one.
-                            // Full attention layers: 3, 7, 11, 15, 19, 23, 27, 31, 35, 39
-                            // (every 4th starting from 3, i.e. (layer + 1) % 4 == 0)
-                            for l in 0..layer_idx {
-                                if (l + 1) % 4 != 0 {
-                                    gdn_count += 1;
-                                }
-                            }
-                            Some(gdn_count)
-                        }
+                        // Populated by preload (resident) or ensure_gdn_layer_state
+                        // (streaming, called at the top of this function).
+                        scratch.gdn_layer_idx_map.get(layer_idx).copied().flatten()
                     } else {
                         None
                     },

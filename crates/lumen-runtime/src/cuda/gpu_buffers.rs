@@ -1066,6 +1066,28 @@ fn upload_tensor(
     }
 }
 
+/// Upload an optional F32 QKV bias. The bias kernels read `float*`; a
+/// non-F32 bias must fail loudly rather than be silently dropped (the
+/// norm uploads already enforce this).
+fn upload_bias_tensor(
+    device: &CudaDevice,
+    weights: &LayerView,
+    name: &str,
+    slice: &Option<lumen_format::index::TensorSlice>,
+) -> Result<Option<CudaSlice<f32>>, RuntimeError> {
+    match slice {
+        Some(s) if s.quant == QuantScheme::F32 => {
+            let raw = weights.subtensor_bytes(s)?;
+            Ok(Some(device.htod_copy(bytes_as_f32(raw)?)?))
+        }
+        Some(s) => Err(RuntimeError::Compute(format!(
+            "CUDA bias upload: {name} uses {:?}, biases must be F32",
+            s.quant
+        ))),
+        None => Ok(None),
+    }
+}
+
 /// Upload a norm tensor to GPU as F32.
 ///
 /// Norm weights (attn_norm, ffn_norm) are always stored as F32, even in
@@ -1189,27 +1211,9 @@ pub fn upload_layer_weights(
         wk: upload_projection_tensor(device, weights, "wk", &subs.wk, hidden, &[kv_dim])?,
         wv: upload_projection_tensor(device, weights, "wv", &subs.wv, hidden, &[kv_dim])?,
         wo: upload_projection_tensor(device, weights, "wo", &subs.wo, q_dim, &[hidden])?,
-        bq: match &subs.bq {
-            Some(s) if s.quant == QuantScheme::F32 => {
-                let raw = weights.subtensor_bytes(s)?;
-                Some(device.htod_copy(bytes_as_f32(raw)?)?)
-            }
-            _ => None,
-        },
-        bk: match &subs.bk {
-            Some(s) if s.quant == QuantScheme::F32 => {
-                let raw = weights.subtensor_bytes(s)?;
-                Some(device.htod_copy(bytes_as_f32(raw)?)?)
-            }
-            _ => None,
-        },
-        bv: match &subs.bv {
-            Some(s) if s.quant == QuantScheme::F32 => {
-                let raw = weights.subtensor_bytes(s)?;
-                Some(device.htod_copy(bytes_as_f32(raw)?)?)
-            }
-            _ => None,
-        },
+        bq: upload_bias_tensor(device, weights, "bq", &subs.bq)?,
+        bk: upload_bias_tensor(device, weights, "bk", &subs.bk)?,
+        bv: upload_bias_tensor(device, weights, "bv", &subs.bv)?,
         attn_norm: upload_norm_tensor(device, weights, "attn_norm", &subs.attn_norm)?,
         // Prefer attn_post_norm when ffn_norm sentinel is absent (length=0).
         // Qwen3.5 GDN layers use post_attention_norm as the FFN pre-norm;

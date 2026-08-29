@@ -222,11 +222,47 @@ pub(crate) struct CudaMoePrefillGrouped {
 /// `LayerWeightsGpu`).
 pub(crate) fn build_moe_meta(
     subtensors: &lumen_format::index::SubtensorOffsets,
-) -> Option<CudaMoeMeta> {
-    let experts = subtensors.experts.as_ref()?;
-    let router = subtensors.router_weight.as_ref()?;
+) -> Result<Option<CudaMoeMeta>, RuntimeError> {
+    let (Some(experts), Some(router)) = (
+        subtensors.experts.as_ref(),
+        subtensors.router_weight.as_ref(),
+    ) else {
+        return Ok(None);
+    };
     if experts.is_empty() {
-        return None;
+        return Ok(None);
+    }
+
+    // The dispatch applies expert 0's schemes to the whole bank, and the
+    // fused gate+up kernels are selected from the gate's scheme alone — a
+    // within-expert gate/up split or any expert diverging from expert 0
+    // would be decoded at the wrong stride. The format stores per-expert
+    // schemes and does not enforce uniformity; reject the divergence here
+    // (mirrors the Metal loader's checks).
+    let first = &experts[0];
+    for (i, e) in experts.iter().enumerate() {
+        if e.gate.quant != e.up.quant {
+            return Err(RuntimeError::Compute(format!(
+                "expert {i}: gate is {:?} but up is {:?}: the CUDA fused \
+                 expert kernels require the pair to share one quant scheme. \
+                 Re-convert from a source GGUF whose expert tensors share \
+                 one quantization.",
+                e.gate.quant, e.up.quant
+            )));
+        }
+        let pairs = [
+            ("gate", e.gate.quant, first.gate.quant),
+            ("up", e.up.quant, first.up.quant),
+            ("down", e.down.quant, first.down.quant),
+        ];
+        if let Some((name, got, want)) = pairs.iter().find(|(_, a, b)| a != b).copied() {
+            return Err(RuntimeError::Compute(format!(
+                "expert {i}: {name} is {got:?} but expert 0's is {want:?}: \
+                 the CUDA expert dispatch applies expert 0's quant schemes \
+                 to every expert. Re-convert from a source GGUF whose \
+                 experts share one quantization.",
+            )));
+        }
     }
 
     let num_experts = experts.len();
@@ -240,11 +276,10 @@ pub(crate) fn build_moe_meta(
         expert_down_offs.push(e.down.offset);
     }
 
-    // All experts share the same quant scheme (set by the converter).
-    let expert_gate_quant = experts[0].gate.quant;
-    let expert_down_quant = experts[0].down.quant;
+    let expert_gate_quant = first.gate.quant;
+    let expert_down_quant = first.down.quant;
 
-    Some(CudaMoeMeta {
+    Ok(Some(CudaMoeMeta {
         router_weight_off: router.offset,
         expert_gate_offs,
         expert_up_offs,
@@ -255,7 +290,7 @@ pub(crate) fn build_moe_meta(
         shared_up: subtensors.shared_expert_up,
         shared_down: subtensors.shared_expert_down,
         ffn_gate_inp_shexp: subtensors.ffn_gate_inp_shexp,
-    })
+    }))
 }
 
 /// Build the GPU-resident offset tables required by the Phase-F batched
@@ -6162,7 +6197,7 @@ mod tests {
             ffn_gate_inp_shexp: None,
             layer_type: Some(0),
         };
-        assert!(build_moe_meta(&subtensors).is_none());
+        assert!(build_moe_meta(&subtensors).unwrap().is_none());
     }
 
     /// Verify `build_moe_meta` populates per-expert offsets for an MoE layer.
@@ -6214,13 +6249,34 @@ mod tests {
             ffn_gate_inp_shexp: None,
             layer_type: Some(0),
         };
-        let meta = build_moe_meta(&subtensors).expect("MoE meta must build");
+        let meta = build_moe_meta(&subtensors)
+            .unwrap()
+            .expect("MoE meta must build");
         assert_eq!(meta.router_weight_off, 1000);
         assert_eq!(meta.expert_gate_offs, vec![2000, 4000]);
         assert_eq!(meta.expert_up_offs, vec![2512, 4512]);
         assert_eq!(meta.expert_down_offs, vec![3024, 5024]);
         assert_eq!(meta.expert_gate_quant, QuantScheme::Q8_0);
         assert_eq!(meta.expert_down_quant, QuantScheme::Q8_0);
+
+        // Within-expert gate/up split is rejected.
+        let mut bad = subtensors.clone();
+        bad.experts.as_mut().unwrap()[1].up = dummy_slice(4512, 512, QuantScheme::Q4_0);
+        let err = build_moe_meta(&bad).err().expect("must reject");
+        assert!(
+            err.to_string().contains("gate is Q8_0 but up is Q4_0"),
+            "{err}"
+        );
+
+        // Cross-expert divergence from expert 0 is rejected, including the
+        // previously never-read `up` scheme.
+        let mut bad = subtensors.clone();
+        let e1 = &mut bad.experts.as_mut().unwrap()[1];
+        e1.gate = dummy_slice(4000, 512, QuantScheme::Q4_0);
+        e1.up = dummy_slice(4512, 512, QuantScheme::Q4_0);
+        e1.down = dummy_slice(5024, 512, QuantScheme::Q4_0);
+        let err = build_moe_meta(&bad).err().expect("must reject");
+        assert!(err.to_string().contains("expert 0's"), "{err}");
     }
 
     /// Verify `moe_batched_enabled` defaults to OFF.

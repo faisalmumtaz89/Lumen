@@ -1134,3 +1134,86 @@ fn test_gdn_chunk_scan_matches_serial_cpu() {
     }
     eprintln!("test_gdn_chunk_scan_matches_serial_cpu: PASS");
 }
+
+#[test]
+fn ensure_gdn_layer_state_is_lazy_and_idempotent() {
+    use crate::compute::ComputeBackend;
+    use lumen_format::hyperparams::{GdnDims, ModelHyperparams, RopeParams, RopeScalingType};
+    let mut backend = MetalF32Backend::new().unwrap();
+    let hp = ModelHyperparams {
+        hidden_dim: 64,
+        num_heads: 4,
+        num_kv_heads: 4,
+        num_layers: 3,
+        vocab_size: 32,
+        max_seq_len: 64,
+        intermediate_dim: 128,
+        head_dim: 16,
+        norm_eps: 1e-5,
+        rope_params: Some(RopeParams {
+            theta: 10000.0,
+            scaling_factor: 1.0,
+            scaling_type: RopeScalingType::None,
+        }),
+        num_experts: None,
+        num_active_experts: None,
+        rotary_dim: None,
+        rope_neox: false,
+        gdn: Some(GdnDims {
+            num_v_heads: 4,
+            num_k_heads: 2,
+            head_dim: 8,
+            conv_kernel: 4,
+        }),
+    };
+    backend.init(&hp).unwrap();
+    let mut guard = backend.scratch.lock().unwrap();
+    let s = guard.as_mut().unwrap();
+
+    // Streaming first-touch allocates in visit order and is idempotent.
+    let idx0 = backend.ensure_gdn_layer_state(s, 0).unwrap();
+    let idx2 = backend.ensure_gdn_layer_state(s, 2).unwrap();
+    assert_eq!((idx0, idx2), (0, 1));
+    assert_eq!(backend.ensure_gdn_layer_state(s, 0).unwrap(), 0);
+    assert_eq!(s.gdn_h_states.len(), 2);
+    assert_eq!(s.gdn_h_states_f16.len(), 2);
+    assert_eq!(s.gdn_conv_states.len(), 2);
+    assert_eq!(s.gdn_conv_positions.len(), 2);
+    assert_eq!(s.gdn_layer_idx_map[0], Some(0));
+    assert_eq!(s.gdn_layer_idx_map[2], Some(1));
+
+    // A pre-populated map entry (the resident-preload state) must never
+    // trigger a second allocation, and every mapped index must stay backed
+    // by state.
+    s.gdn_layer_idx_map[1] = Some(0);
+    assert_eq!(backend.ensure_gdn_layer_state(s, 1).unwrap(), 0);
+    assert_eq!(s.gdn_h_states.len(), 2);
+    for idx in s.gdn_layer_idx_map.iter().flatten() {
+        assert!(*idx < s.gdn_h_states.len(), "mapped index without state");
+    }
+
+    // A mapped index with no backing state (a preload that failed partway)
+    // must error, never index out of bounds or silently reallocate.
+    s.gdn_layer_idx_map[1] = Some(7);
+    let err = backend
+        .ensure_gdn_layer_state(s, 1)
+        .expect_err("unbacked mapped index must be rejected");
+    assert!(err.to_string().contains("state buffers exist"), "{err}");
+    s.gdn_layer_idx_map[1] = None;
+
+    // A validation failure must leave every piece of state untouched —
+    // no map growth, no state pushes, no scratch allocation.
+    let map_before = s.gdn_layer_idx_map.clone();
+    let states_before = s.gdn_h_states.len();
+    s.gdn_conv_kernel_size = 0;
+    let err = backend
+        .ensure_gdn_layer_state(s, 9)
+        .expect_err("malformed conv_kernel must be rejected");
+    assert!(err.to_string().contains("conv_kernel"), "{err}");
+    assert_eq!(s.gdn_layer_idx_map, map_before, "map mutated on failure");
+    assert_eq!(
+        s.gdn_h_states.len(),
+        states_before,
+        "state pushed on failure"
+    );
+}

@@ -15374,6 +15374,41 @@ unsafe fn launch_fused_norm_dual_matvec_f32(
     Ok(())
 }
 
+/// Expected raw byte length for a `[vocab, hidden]` global tensor in the given
+/// scheme, when the scheme has a fixed block layout. `None` for schemes whose
+/// raw layout is not a plain block stream (validated elsewhere).
+fn raw_global_expected_len(quant: QuantScheme, n_elements: usize) -> Option<usize> {
+    let block =
+        |elems: usize, bytes: usize| (n_elements % elems == 0).then(|| n_elements / elems * bytes);
+    match quant {
+        QuantScheme::Q8_0 => block(32, 34),
+        QuantScheme::Q4_0 => block(32, 18),
+        QuantScheme::F16 | QuantScheme::Bf16 => Some(n_elements * 2),
+        QuantScheme::Q6_K => block(256, 210),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod raw_global_len_tests {
+    use super::*;
+
+    #[test]
+    fn expected_lengths_match_block_layouts() {
+        let n = 16384;
+        assert_eq!(raw_global_expected_len(QuantScheme::Q8_0, n), Some(17408));
+        assert_eq!(raw_global_expected_len(QuantScheme::Q4_0, n), Some(9216));
+        assert_eq!(raw_global_expected_len(QuantScheme::F16, n), Some(32768));
+        assert_eq!(raw_global_expected_len(QuantScheme::Bf16, n), Some(32768));
+        assert_eq!(raw_global_expected_len(QuantScheme::Q6_K, n), Some(13440));
+        assert_eq!(raw_global_expected_len(QuantScheme::CtInt4G32, n), None);
+        assert_eq!(raw_global_expected_len(QuantScheme::F32, n), None);
+        // element counts that do not fill whole blocks are unmappable
+        assert_eq!(raw_global_expected_len(QuantScheme::Q8_0, 33), None);
+        assert_eq!(raw_global_expected_len(QuantScheme::Q6_K, 300), None);
+    }
+}
+
 impl ComputeBackend for CudaBackend {
     fn init(&mut self, hyperparams: &ModelHyperparams) -> Result<(), RuntimeError> {
         self.hyperparams = Some(*hyperparams);
@@ -15605,6 +15640,18 @@ impl ComputeBackend for CudaBackend {
         let (embedding_f32, embedding_q8, embedding_f16_raw, embedding_q4_raw, embedding_bf16_raw) =
             if has_raw_embedding {
                 let raw = self.embedding_raw.as_ref().unwrap();
+                let n = hyperparams.vocab_size as usize * hyperparams.hidden_dim as usize;
+                if let Some(expected) = raw_global_expected_len(self.embedding_quant, n) {
+                    if raw.len() != expected {
+                        return Err(RuntimeError::Compute(format!(
+                            "embedding raw is {} bytes but {:?} [{} x {}] requires {expected}",
+                            raw.len(),
+                            self.embedding_quant,
+                            hyperparams.vocab_size,
+                            hyperparams.hidden_dim
+                        )));
+                    }
+                }
                 let placeholder: CudaSlice<f32> = self.device.alloc_zeros(1)?;
                 match self.embedding_quant {
                     QuantScheme::Q8_0 => {
@@ -15664,6 +15711,18 @@ impl ComputeBackend for CudaBackend {
             output_proj_bf16_raw,
         ) = if has_raw_output_proj {
             let raw = self.output_proj_raw.as_ref().unwrap();
+            let n = hyperparams.vocab_size as usize * hyperparams.hidden_dim as usize;
+            if let Some(expected) = raw_global_expected_len(self.output_proj_quant, n) {
+                if raw.len() != expected {
+                    return Err(RuntimeError::Compute(format!(
+                        "output_proj raw is {} bytes but {:?} [{} x {}] requires {expected}",
+                        raw.len(),
+                        self.output_proj_quant,
+                        hyperparams.vocab_size,
+                        hyperparams.hidden_dim
+                    )));
+                }
+            }
             let placeholder: CudaSlice<f32> = self.device.alloc_zeros(1)?;
             match self.output_proj_quant {
                 QuantScheme::Q8_0 => {
@@ -17483,6 +17542,12 @@ impl ComputeBackend for CudaBackend {
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         let batch = tokens.len();
+        let vocab = hp.vocab_size as usize;
+        if let Some(&bad) = tokens.iter().find(|&&t| t as usize >= vocab) {
+            return Err(RuntimeError::Compute(format!(
+                "prefill token id {bad} out of range (vocab_size {vocab})"
+            )));
+        }
 
         // Detect GDN layers for batched prefill routing.
         let has_gdn = {
@@ -18700,7 +18765,7 @@ impl ComputeBackend for CudaBackend {
             // offsets that remain stable across the upload (the upload writes
             // bytes into the layer's main GPU buffer, the byte offsets
             // computed by the converter are preserved through the htod copy).
-            if let Some(meta) = super::moe::build_moe_meta(&layer_view.subtensors) {
+            if let Some(meta) = super::moe::build_moe_meta(&layer_view.subtensors)? {
                 if layer_idx < st.moe_meta_cache.len() {
                     // eagerly build the Phase-F batched-expert GPU
                     // offset tables. The tables are tiny (~6 KB / layer at
