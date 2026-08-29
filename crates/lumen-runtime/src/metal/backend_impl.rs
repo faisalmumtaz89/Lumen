@@ -438,8 +438,9 @@ impl ComputeBackend for MetalF32Backend {
             shared_expert_down_buf: None,
             attn_gate_buf: None,
 
-            // GDN state: defaults for non-hybrid models. Overridden in
-            // preload_weights_gpu_resident when Qwen3.5-MoE is detected.
+            // GDN state: empty for non-hybrid models. Populated by
+            // preload_weights_gpu_resident (resident) or lazily by
+            // ensure_gdn_layer_state (streaming) for GDN layers.
             gdn_h_states: Vec::new(),
             gdn_h_states_f16: Vec::new(),
             gdn_conv_states: Vec::new(),
@@ -609,6 +610,12 @@ impl ComputeBackend for MetalF32Backend {
             s.x_buf.write_f32(x_f32);
         }
 
+        // Streaming path: the persistent GDN state buffers are allocated on
+        // first touch (the GPU-resident preload allocates them up front).
+        if weights.subtensors.layer_type == Some(1) {
+            self.ensure_gdn_layer_state(s, layer_idx)?;
+        }
+
         // GPU-resident path: prefer unified private buffer, then per-layer buffers,
         // then fall back to cached zero-copy layer buffer.
         let layer_buf: &MetalBuffer;
@@ -711,99 +718,6 @@ impl ComputeBackend for MetalF32Backend {
         let kv =
             kv.ok_or_else(|| RuntimeError::Compute("KV cache view required for attention".into()))?;
         let new_seq_len = kv.seq_len + 1;
-
-        // ================================================================
-        // Lazy GDN state allocation for streaming path.
-        // GPU-resident path allocates in preload_weights_gpu_resident;
-        // streaming path needs lazy init on first encounter of each GDN layer.
-        // ================================================================
-        if is_gdn_layer {
-            // Extend gdn_layer_idx_map to cover this layer_idx if needed.
-            if s.gdn_layer_idx_map.len() <= layer_idx {
-                s.gdn_layer_idx_map.resize(layer_idx + 1, None);
-            }
-            if s.gdn_layer_idx_map[layer_idx].is_none() {
-                let gdn_idx = s.gdn_h_states.len();
-                s.gdn_layer_idx_map[layer_idx] = Some(gdn_idx);
-
-                // GDN dimensions differ from full-attention hyperparams; they
-                // come from the resolved SSM dims (9B {32,16,128,4} default, or
-                // 27B {48,16,128,4}) populated in init() from hyperparams.gdn_dims().
-                let gdn_num_v_heads = s.gdn_num_v_heads; // ssm.time_step_rank
-                let gdn_num_k_heads = s.gdn_num_k_heads; // ssm.group_count
-                let gdn_head_dim = s.gdn_head_dim; // ssm.state_size
-                                                   // Fused QKV channels: 2 * (num_k_heads*head_dim) + num_v_heads*head_dim
-                                                   //   9B = 8192, 27B = 10240.
-                let gdn_qkv_dim =
-                    2 * gdn_num_k_heads * gdn_head_dim + gdn_num_v_heads * gdn_head_dim;
-                // V / gate / output-projection width = num_v_heads * head_dim
-                //   9B = 4096, 27B = 6144.
-                let gdn_q_dim = gdn_num_v_heads * gdn_head_dim;
-                let conv_kernel_size = s.gdn_conv_kernel_size;
-                let h_state_size = gdn_num_v_heads * gdn_head_dim * gdn_head_dim;
-                let conv_state_size = (conv_kernel_size - 1) * gdn_qkv_dim;
-
-                // Persistent h_state: F32 (4 B/elem).
-                let h_buf = self.device.new_buffer(h_state_size * 4).ok_or_else(|| {
-                    RuntimeError::Compute("Failed to allocate GDN h_state".into())
-                })?;
-                h_buf.write_f32(&vec![0.0f32; h_state_size]);
-
-                let c_buf = self.device.new_buffer(conv_state_size * 4).ok_or_else(|| {
-                    RuntimeError::Compute("Failed to allocate GDN conv_state".into())
-                })?;
-                c_buf.write_f32(&vec![0.0f32; conv_state_size]);
-
-                s.gdn_h_states.push(h_buf);
-                // Length-sync the lazy F16 h_state mirror (filled on the first decode
-                // touch by the default F16 decode recurrence).
-                s.gdn_h_states_f16.push(std::cell::RefCell::new(None));
-                s.gdn_conv_states.push(c_buf);
-                s.gdn_conv_positions.push(0);
-                s.gdn_conv_kernel_size = conv_kernel_size;
-                s.gdn_num_layers = s.gdn_h_states.len();
-
-                // Allocate GDN scratch buffers if not yet done (first GDN layer).
-                if s.gdn_alpha_buf.is_none() {
-                    s.gdn_alpha_buf =
-                        Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
-                            RuntimeError::Compute("Failed to allocate GDN alpha buf".into())
-                        })?);
-                    s.gdn_beta_buf =
-                        Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
-                            RuntimeError::Compute("Failed to allocate GDN beta buf".into())
-                        })?);
-                    s.gdn_output_buf =
-                        Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
-                            RuntimeError::Compute("Failed to allocate GDN output buf".into())
-                        })?);
-                    s.gdn_ssm_proj_buf =
-                        Some(self.device.new_buffer(hidden_dim * 4).ok_or_else(|| {
-                            RuntimeError::Compute("Failed to allocate GDN ssm_proj buf".into())
-                        })?);
-                    s.gdn_gate_sigmoid_buf =
-                        Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
-                            RuntimeError::Compute("Failed to allocate GDN gate sigmoid buf".into())
-                        })?);
-                    s.gdn_normed_out_buf =
-                        Some(self.device.new_buffer(gdn_q_dim * 4).ok_or_else(|| {
-                            RuntimeError::Compute("Failed to allocate GDN normed_out buf".into())
-                        })?);
-                    s.gdn_alpha_raw_buf =
-                        Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
-                            RuntimeError::Compute("Failed to allocate GDN alpha_raw buf".into())
-                        })?);
-                    s.gdn_beta_raw_buf =
-                        Some(self.device.new_buffer(gdn_num_v_heads * 4).ok_or_else(|| {
-                            RuntimeError::Compute("Failed to allocate GDN beta_raw buf".into())
-                        })?);
-                    s.gdn_qkv_conv_buf =
-                        Some(self.device.new_buffer(gdn_qkv_dim * 4).ok_or_else(|| {
-                            RuntimeError::Compute("Failed to allocate GDN qkv_conv buf".into())
-                        })?);
-                }
-            }
-        }
 
         // ================================================================
         // SINGLE command buffer for the ENTIRE layer (16 encoders, 1 sync).

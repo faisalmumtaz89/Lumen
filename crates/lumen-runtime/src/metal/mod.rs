@@ -698,6 +698,115 @@ pub struct MetalF32Backend {
 }
 
 impl MetalF32Backend {
+    /// Ensure the persistent GDN state and shared GDN scratch buffers for
+    /// `layer_idx` exist, returning its GDN index. The GPU-resident preload
+    /// allocates these up front; the streaming decode and batched-prefill
+    /// paths allocate lazily on first touch (layers are visited in order, so
+    /// indices match the model's GDN layer sequence). Idempotent.
+    pub(crate) fn ensure_gdn_layer_state(
+        &self,
+        s: &mut MetalScratch,
+        layer_idx: usize,
+    ) -> Result<usize, RuntimeError> {
+        if let Some(idx) = s.gdn_layer_idx_map.get(layer_idx).copied().flatten() {
+            if idx >= s.gdn_h_states.len() {
+                return Err(RuntimeError::Compute(format!(
+                    "GDN layer {layer_idx} maps to index {idx} but only {} \
+                     state buffers exist (a prior preload failed partway)",
+                    s.gdn_h_states.len()
+                )));
+            }
+            return Ok(idx);
+        }
+        if s.gdn_conv_kernel_size == 0 {
+            return Err(RuntimeError::Compute(
+                "GDN conv_kernel is 0 (malformed LBC hyperparams)".into(),
+            ));
+        }
+        let gdn_idx = s.gdn_h_states.len();
+
+        // GDN dimensions differ from full-attention hyperparams; they come
+        // from the resolved SSM dims (9B {32,16,128,4} default, or
+        // 27B {48,16,128,4}) populated in init() from hyperparams.gdn_dims().
+        let gdn_num_v_heads = s.gdn_num_v_heads; // ssm.time_step_rank
+        let gdn_num_k_heads = s.gdn_num_k_heads; // ssm.group_count
+        let gdn_head_dim = s.gdn_head_dim; // ssm.state_size
+                                           // Fused QKV channels: 2 * (num_k_heads*head_dim) + num_v_heads*head_dim
+                                           //   9B = 8192, 27B = 10240.
+        let gdn_qkv_dim = 2 * gdn_num_k_heads * gdn_head_dim + gdn_num_v_heads * gdn_head_dim;
+        // V / gate / output-projection width = num_v_heads * head_dim
+        //   9B = 4096, 27B = 6144.
+        let gdn_q_dim = gdn_num_v_heads * gdn_head_dim;
+        let hidden_dim = s.hidden_dim;
+        let conv_kernel_size = s.gdn_conv_kernel_size;
+        let h_state_size = gdn_num_v_heads * gdn_head_dim * gdn_head_dim;
+        let conv_state_size = (conv_kernel_size - 1) * gdn_qkv_dim;
+
+        // Persistent h_state: F32 (4 B/elem).
+        let h_buf = self
+            .device
+            .new_buffer(h_state_size * 4)
+            .ok_or_else(|| RuntimeError::Compute("Failed to allocate GDN h_state".into()))?;
+        h_buf.write_f32(&vec![0.0f32; h_state_size]);
+
+        let c_buf = self
+            .device
+            .new_buffer(conv_state_size * 4)
+            .ok_or_else(|| RuntimeError::Compute("Failed to allocate GDN conv_state".into()))?;
+        c_buf.write_f32(&vec![0.0f32; conv_state_size]);
+
+        // Stage the shared scratch bundle BEFORE mutating any state: every
+        // allocation must succeed before anything is committed, so a failure
+        // leaves the scratch exactly as it was.
+        let scratch_bundle = if s.gdn_alpha_buf.is_none() {
+            let alloc = |bytes: usize, what: &str| {
+                self.device
+                    .new_buffer(bytes)
+                    .ok_or_else(|| RuntimeError::Compute(format!("Failed to allocate GDN {what}")))
+            };
+            Some((
+                alloc(gdn_num_v_heads * 4, "alpha buf")?,
+                alloc(gdn_num_v_heads * 4, "beta buf")?,
+                alloc(gdn_q_dim * 4, "output buf")?,
+                alloc(hidden_dim * 4, "ssm_proj buf")?,
+                alloc(gdn_q_dim * 4, "gate sigmoid buf")?,
+                alloc(gdn_q_dim * 4, "normed_out buf")?,
+                alloc(gdn_num_v_heads * 4, "alpha_raw buf")?,
+                alloc(gdn_num_v_heads * 4, "beta_raw buf")?,
+                alloc(gdn_qkv_dim * 4, "qkv_conv buf")?,
+            ))
+        } else {
+            None
+        };
+
+        // All allocations succeeded — commit state, then the map entry last.
+        s.gdn_h_states.push(h_buf);
+        // Length-sync the lazy F16 h_state mirror (filled on the first decode
+        // touch by the default F16 decode recurrence).
+        s.gdn_h_states_f16.push(std::cell::RefCell::new(None));
+        s.gdn_conv_states.push(c_buf);
+        s.gdn_conv_positions.push(0);
+        s.gdn_num_layers = s.gdn_h_states.len();
+        if let Some((alpha, beta, output, ssm_proj, gate_sig, normed, alpha_raw, beta_raw, qkv)) =
+            scratch_bundle
+        {
+            s.gdn_alpha_buf = Some(alpha);
+            s.gdn_beta_buf = Some(beta);
+            s.gdn_output_buf = Some(output);
+            s.gdn_ssm_proj_buf = Some(ssm_proj);
+            s.gdn_gate_sigmoid_buf = Some(gate_sig);
+            s.gdn_normed_out_buf = Some(normed);
+            s.gdn_alpha_raw_buf = Some(alpha_raw);
+            s.gdn_beta_raw_buf = Some(beta_raw);
+            s.gdn_qkv_conv_buf = Some(qkv);
+        }
+        if s.gdn_layer_idx_map.len() <= layer_idx {
+            s.gdn_layer_idx_map.resize(layer_idx + 1, None);
+        }
+        s.gdn_layer_idx_map[layer_idx] = Some(gdn_idx);
+        Ok(gdn_idx)
+    }
+
     /// Create a new Metal compute backend.
     ///
     /// Returns an error if Metal is not available on this system.

@@ -20,6 +20,71 @@ use std::io::{Read, Seek};
 /// ssm_norm is a norm tensor (F32).
 const SSM_SUFFIXES: [&str; 6] = [SSM_A, SSM_CONV1D, SSM_DT, SSM_BETA, SSM_ALPHA, SSM_NORM];
 
+/// How one SSM tensor is materialized in the layer blob.
+enum SsmForm {
+    /// Source bytes verbatim (size = source byte size, quant = source scheme).
+    KeepSource,
+    /// Dequantized to F32 (size = 4n, quant = F32).
+    F32,
+    /// Requantized via F32 to Q8_0 (size = 34n/32, quant = Q8_0).
+    Q8,
+}
+
+/// Single decision point for how an SSM tensor is written: the planner sizes
+/// from this and the writer produces bytes from it, so the layer-blob layout
+/// cannot desync between them.
+///
+/// ssm_alpha/ssm_beta are Q8_0 wherever Metal must load the file (its GDN
+/// gate pipelines read them as Q8_0 only); non-Metal targets serve F32 gates,
+/// so `--dequantize` and SOURCE_FIDELITY may keep them F32 there. The SSM
+/// scalars (a, conv1d, dt, norm) are always F32 — the runtime slots are typed
+/// `f32`.
+fn ssm_tensor_form(
+    name: &str,
+    suffix: &str,
+    t: GgmlType,
+    dequantize: bool,
+    target: ConvertTarget,
+) -> Result<SsmForm, ConvertError> {
+    debug_assert!(
+        SSM_SUFFIXES.contains(&suffix),
+        "ssm_tensor_form governs only the six core SSM tensors, got {suffix}"
+    );
+    let is_gate = suffix == SSM_ALPHA || suffix == SSM_BETA;
+    if is_gate {
+        if dequantize && target != ConvertTarget::Metal {
+            return Ok(SsmForm::F32);
+        }
+        if target != ConvertTarget::Metal && crate::convert::source_fidelity() && t == GgmlType::F32
+        {
+            return Ok(SsmForm::KeepSource);
+        }
+        if t == GgmlType::Q8_0 {
+            return Ok(SsmForm::KeepSource);
+        }
+        if t == GgmlType::F32 || t.has_dequant_path() {
+            return Ok(SsmForm::Q8);
+        }
+        return Err(ConvertError::UnsupportedTensorType {
+            tensor: name.to_string(),
+            ggml_type: format!("{t:?}"),
+        });
+    }
+    if dequantize {
+        return Ok(SsmForm::F32);
+    }
+    if t == GgmlType::F32 {
+        return Ok(SsmForm::KeepSource);
+    }
+    if t.has_dequant_path() {
+        return Ok(SsmForm::F32);
+    }
+    Err(ConvertError::UnsupportedTensorType {
+        tensor: name.to_string(),
+        ggml_type: format!("{t:?} (cannot force-dequant SSM scalar to F32)"),
+    })
+}
+
 /// Compute a [`TensorSlice`] for a single SSM tensor, applying force-requant
 /// to Q8_0 for ssm_alpha/ssm_beta when needed.
 ///
@@ -37,135 +102,41 @@ pub(crate) fn compute_ssm_tensor_slice(
         Some(t) => t,
         None => return Ok(None),
     };
-
-    // `--dequantize` yields F32 for every SSM tensor on non-Metal targets
-    // (their runtimes serve F32 gates). The Metal target keeps ssm_alpha/
-    // ssm_beta on the Q8_0 force below — Metal's gate pipelines read them as
-    // Q8_0 only, so an F32 pair would make the output unloadable there.
-    let is_alpha_or_beta = suffix == SSM_ALPHA || suffix == SSM_BETA;
-    if dequantize && !(is_alpha_or_beta && target == ConvertTarget::Metal) {
-        let n_elements = tensor.n_elements();
-        let size = n_elements * 4;
-        let slice = TensorSlice {
-            offset: *blob_offset,
-            length: size,
-            quant: QuantScheme::F32,
+    let (length, quant) =
+        match ssm_tensor_form(&name, suffix, tensor.ggml_type, dequantize, target)? {
+            SsmForm::KeepSource => {
+                let size =
+                    tensor
+                        .byte_size()
+                        .ok_or_else(|| ConvertError::UnsupportedTensorType {
+                            tensor: name.clone(),
+                            ggml_type: format!("{:?} (unknown block geometry)", tensor.ggml_type),
+                        })?;
+                let quant = tensor.ggml_type.to_lbc_quant().ok_or_else(|| {
+                    ConvertError::UnsupportedTensorType {
+                        tensor: name.clone(),
+                        ggml_type: format!("{:?}", tensor.ggml_type),
+                    }
+                })?;
+                (size, quant)
+            }
+            SsmForm::F32 => (tensor.n_elements() * 4, QuantScheme::F32),
+            SsmForm::Q8 => {
+                let n_elements = tensor.n_elements() as usize;
+                assert!(
+                    n_elements % 32 == 0,
+                    "Q8_0 requires elements divisible by 32, got {n_elements} for {name}"
+                );
+                (((n_elements / 32) * 34) as u64, QuantScheme::Q8_0)
+            }
         };
-        *blob_offset += size;
-        return Ok(Some(slice));
-    }
-
-    // Force ssm_alpha/beta to Q8_0 if not already -- Metal hardcodes Q8_0 matvec.
-    // Handle types with no direct LBC mapping (Q8_1, Q5_1, etc.) by going through
-    // the dequant->F32->Q8_0 path for alpha/beta, or dequant->F32 for other SSM tensors.
-    // The runtime SSM-scalar slots (ssm_a, ssm_conv1d, ssm_dt, ssm_norm) are
-    // typed `Option<CudaSlice<f32>>` — they only accept F32. If the GGUF
-    // stores them in F16 / BF16 / quantized format, we must dequantize at
-    // convert time so the runtime can upload them without misinterpretation.
-    let needs_f32_force = !is_alpha_or_beta
-        && !matches!(tensor.ggml_type, GgmlType::F32)
-        && matches!(suffix, SSM_A | SSM_CONV1D | SSM_DT | SSM_NORM);
-
-    if needs_f32_force {
-        if !tensor.ggml_type.has_dequant_path() {
-            return Err(ConvertError::UnsupportedTensorType {
-                tensor: name.to_string(),
-                ggml_type: format!(
-                    "{:?} (cannot force-dequant SSM scalar to F32)",
-                    tensor.ggml_type
-                ),
-            });
-        }
-        let n_elements = tensor.n_elements();
-        let size = n_elements * 4;
-        let slice = TensorSlice {
-            offset: *blob_offset,
-            length: size,
-            quant: QuantScheme::F32,
-        };
-        *blob_offset += size;
-        return Ok(Some(slice));
-    }
-
-    let quant = match tensor.ggml_type.to_lbc_quant() {
-        Some(q) => q,
-        None if is_alpha_or_beta && tensor.ggml_type.has_dequant_path() => {
-            // No LBC mapping but dequantizable: force-requant to Q8_0 via dequant->F32->Q8_0
-            let n_elements = tensor.n_elements() as usize;
-            assert!(
-                n_elements % 32 == 0,
-                "Q8_0 requires elements divisible by 32, got {n_elements} for {name}"
-            );
-            let num_blocks = n_elements / 32;
-            let size = (num_blocks * 34) as u64;
-            let slice = TensorSlice {
-                offset: *blob_offset,
-                length: size,
-                quant: QuantScheme::Q8_0,
-            };
-            *blob_offset += size;
-            return Ok(Some(slice));
-        }
-        None if tensor.ggml_type.has_dequant_path() => {
-            // Non-alpha/beta SSM tensor with dequantizable but non-LBC type: force F32
-            let n_elements = tensor.n_elements();
-            let size = n_elements * 4;
-            let slice = TensorSlice {
-                offset: *blob_offset,
-                length: size,
-                quant: QuantScheme::F32,
-            };
-            *blob_offset += size;
-            return Ok(Some(slice));
-        }
-        None => {
-            return Err(ConvertError::UnsupportedTensorType {
-                tensor: name.to_string(),
-                ggml_type: format!("{:?}", tensor.ggml_type),
-            });
-        }
+    let slice = TensorSlice {
+        offset: *blob_offset,
+        length,
+        quant,
     };
-
-    // SOURCE_FIDELITY: keep F32 alpha/beta gates at source precision — the
-    // runtime routes non-Q8 gate weights through the generic F32 matvec. The
-    // force-requant below is the historical default (runtime hardcoded Q8_0
-    // gate kernels).
-    // CUDA-only: Metal binds these offsets to Q8_0 kernels unconditionally
-    // and would parse an F32 stream as 34-byte Q8 blocks.
-    let keep_source_gates = target != ConvertTarget::Metal
-        && crate::convert::source_fidelity()
-        && is_alpha_or_beta
-        && matches!(quant, QuantScheme::F32);
-    if is_alpha_or_beta && !matches!(quant, QuantScheme::Q8_0) && !keep_source_gates {
-        let n_elements = tensor.n_elements() as usize;
-        assert!(
-            n_elements % 32 == 0,
-            "Q8_0 requires elements divisible by 32, got {n_elements} for {name}"
-        );
-        let num_blocks = n_elements / 32;
-        let size = (num_blocks * 34) as u64; // Q8_0: 34 bytes per 32 elements
-        let slice = TensorSlice {
-            offset: *blob_offset,
-            length: size,
-            quant: QuantScheme::Q8_0,
-        };
-        *blob_offset += size;
-        Ok(Some(slice))
-    } else {
-        let size = tensor
-            .byte_size()
-            .ok_or_else(|| ConvertError::UnsupportedTensorType {
-                tensor: name.to_string(),
-                ggml_type: format!("{:?} (unknown block geometry)", tensor.ggml_type),
-            })?;
-        let slice = TensorSlice {
-            offset: *blob_offset,
-            length: size,
-            quant,
-        };
-        *blob_offset += size;
-        Ok(Some(slice))
-    }
+    *blob_offset += length;
+    Ok(Some(slice))
 }
 
 /// All SSM tensor slices needed by a GDN layer (shape computation).
@@ -230,52 +201,23 @@ pub(crate) fn write_ssm_tensors<R: Read + Seek>(
     for suffix in &SSM_SUFFIXES {
         let name = layer_tensor_name(layer, suffix);
         if let Some(tensor) = gguf.find_tensor(&name) {
-            let is_alpha_or_beta = *suffix == SSM_ALPHA || *suffix == SSM_BETA;
-            // The runtime SSM-scalar slots (ssm_a, ssm_conv1d, ssm_dt, ssm_norm)
-            // accept only F32. If the GGUF stored them in F16/BF16/quant, we
-            // dequant here so layout matches the slice produced by
-            // `compute_ssm_tensor_slice`. ssm_alpha/beta are handled below.
-            let needs_f32_force = !is_alpha_or_beta
-                && !matches!(tensor.ggml_type, GgmlType::F32)
-                && matches!(*suffix, SSM_A | SSM_CONV1D | SSM_DT | SSM_NORM);
-            let src_quant = tensor.ggml_type.to_lbc_quant();
-            // SOURCE_FIDELITY: keep F32 alpha/beta verbatim — must mirror the
-            // `keep_source_gates` branch in `compute_ssm_tensor_slice` above
-            // (plan and writer MUST agree on layer-blob layout).
-            let keep_source_gates = target != ConvertTarget::Metal
-                && crate::convert::source_fidelity()
-                && is_alpha_or_beta
-                && matches!(src_quant, Some(QuantScheme::F32));
-            // Mirror `compute_ssm_tensor_slice`: `--dequantize` yields F32
-            // gates for non-Metal targets; the Metal target keeps the Q8_0
-            // force so the output stays loadable there. Plan and writer MUST
-            // agree on layer-blob layout.
-            let gate_stays_q8 = is_alpha_or_beta && (!dequantize || target == ConvertTarget::Metal);
-            if gate_stays_q8 && !keep_source_gates && !matches!(src_quant, Some(QuantScheme::Q8_0))
-            {
-                // Force-requantize to Q8_0 (dequant to F32 first, then quantize to Q8_0)
-                append_tensor_to_blob_requant(
-                    blob,
-                    reader,
-                    gguf,
-                    &name,
-                    false,
-                    Some(QuantScheme::Q8_0),
-                )?;
-            } else if needs_f32_force {
-                // Dequantize F16/BF16/quant to F32 for runtime compatibility.
-                append_tensor_to_blob_requant(
-                    blob, reader, gguf, &name, /*dequantize=*/ true, /*requant_to=*/ None,
-                )?;
-            } else {
-                append_tensor_to_blob_requant(
-                    blob,
-                    reader,
-                    gguf,
-                    &name,
-                    dequantize && !gate_stays_q8,
-                    /*requant_to=*/ None,
-                )?;
+            match ssm_tensor_form(&name, suffix, tensor.ggml_type, dequantize, target)? {
+                SsmForm::KeepSource => {
+                    append_tensor_to_blob_requant(blob, reader, gguf, &name, false, None)?;
+                }
+                SsmForm::F32 => {
+                    append_tensor_to_blob_requant(blob, reader, gguf, &name, true, None)?;
+                }
+                SsmForm::Q8 => {
+                    append_tensor_to_blob_requant(
+                        blob,
+                        reader,
+                        gguf,
+                        &name,
+                        false,
+                        Some(QuantScheme::Q8_0),
+                    )?;
+                }
             }
         }
     }

@@ -156,6 +156,53 @@ pub(super) fn validate_layer_quants(
             }
         }
     }
+    // Optional tensors are either absent (None) or real: the converter never
+    // emits a zero-length optional slice, while the dispatch paths gate on
+    // presence alone — a `Some` with length 0 would pass every quant check
+    // above as "absent" and then be bound (or unwrapped) at dispatch.
+    let optional_slices: [(&str, Option<&TensorSlice>); 19] = [
+        ("bq", st.bq.as_ref()),
+        ("bk", st.bk.as_ref()),
+        ("bv", st.bv.as_ref()),
+        ("router_weight", st.router_weight.as_ref()),
+        ("shared_expert_gate", st.shared_expert_gate.as_ref()),
+        ("shared_expert_up", st.shared_expert_up.as_ref()),
+        ("shared_expert_down", st.shared_expert_down.as_ref()),
+        ("attn_gate", st.attn_gate.as_ref()),
+        ("attn_post_norm", st.attn_post_norm.as_ref()),
+        ("ssm_a", st.ssm_a.as_ref()),
+        ("ssm_conv1d", st.ssm_conv1d.as_ref()),
+        ("ssm_dt", st.ssm_dt.as_ref()),
+        ("ssm_beta", st.ssm_beta.as_ref()),
+        ("ssm_alpha", st.ssm_alpha.as_ref()),
+        ("ssm_norm", st.ssm_norm.as_ref()),
+        ("ssm_out", st.ssm_out.as_ref()),
+        ("attn_q_norm", st.attn_q_norm.as_ref()),
+        ("attn_k_norm", st.attn_k_norm.as_ref()),
+        ("ffn_gate_inp_shexp", st.ffn_gate_inp_shexp.as_ref()),
+    ];
+    for (name, slice) in optional_slices {
+        if let Some(t) = slice {
+            if t.length == 0 {
+                return Err(RuntimeError::Compute(format!(
+                    "layer {layer}: {name} is present but zero-length \
+                     (malformed LBC). Re-convert with `lumen convert`."
+                )));
+            }
+        }
+    }
+    if let Some(experts) = st.experts.as_ref() {
+        for (i, e) in experts.iter().enumerate() {
+            for (name, t) in [("gate", &e.gate), ("up", &e.up), ("down", &e.down)] {
+                if t.length == 0 {
+                    return Err(RuntimeError::Compute(format!(
+                        "layer {layer} expert {i}: {name} is zero-length \
+                         (malformed LBC). Re-convert with `lumen convert`."
+                    )));
+                }
+            }
+        }
+    }
     // The shared-expert FFN dispatch selects on the gate's quant alone and
     // binds up_off regardless (CachedMoeMeta carries no shared-expert up
     // quant), and only the Q8_0/Q4_0/Q4_1 arms select genuinely fused
@@ -201,12 +248,32 @@ pub(super) fn validate_layer_quants(
             }
         }
     }
-    // Every Metal shader reads norm tensors, the MoE routers, and the SSM
-    // scalar tensors as F32 without consulting their quant (CUDA rejects
-    // non-F32 norms at load; Metal must too). The converter writes them F32
-    // on its forced paths, but a source GGUF storing e.g. F16 norms passes
-    // the allowlist above and would be misread.
-    let f32_only: [(&str, Option<&TensorSlice>); 11] = [
+    // The QKV biases are read as F32 by the attention shaders. The fused
+    // bias decode arms (non-F32 weight schemes) apply biases only when all
+    // three are present — a partial set would be silently dropped there.
+    // The F32-weight fallback applies each bias independently, so partial
+    // sets are valid with F32 projections.
+    let bias_present = [st.bq.is_some(), st.bk.is_some(), st.bv.is_some()];
+    let qkv_all_f32 = st.wq.quant == QuantScheme::F32
+        && st.wk.quant == QuantScheme::F32
+        && st.wv.quant == QuantScheme::F32;
+    if bias_present.iter().any(|&p| p) && !bias_present.iter().all(|&p| p) && !qkv_all_f32 {
+        return Err(RuntimeError::Compute(format!(
+            "layer {layer}: incomplete QKV bias set (bq/bk/bv present: \
+             {bias_present:?}) with quantized projections: the fused bias \
+             kernels require all three. Re-convert with `lumen convert`."
+        )));
+    }
+    // Every Metal shader reads norm tensors, the MoE routers, the SSM
+    // scalar tensors, and the QKV biases as F32 without consulting their
+    // quant (CUDA rejects non-F32 norms at load; Metal must too). The
+    // converter writes them F32 on its forced paths, but a source GGUF
+    // storing e.g. F16 norms passes the allowlist above and would be
+    // misread.
+    let f32_only: [(&str, Option<&TensorSlice>); 14] = [
+        ("bq", st.bq.as_ref()),
+        ("bk", st.bk.as_ref()),
+        ("bv", st.bv.as_ref()),
         ("attn_norm", Some(&st.attn_norm)),
         ("ffn_norm", Some(&st.ffn_norm)),
         ("attn_post_norm", st.attn_post_norm.as_ref()),
@@ -917,7 +984,12 @@ impl MetalF32Backend {
                 let gdn_num_k_heads = s.gdn_num_k_heads; // ssm.group_count
                 let gdn_head_dim = s.gdn_head_dim; // ssm.state_size
                 let conv_kernel_size = s.gdn_conv_kernel_size; // ssm.conv_kernel
-                                                               // Fused QKV channels: 2*qk_dim + v_dim (9B=8192, 27B=10240).
+                if conv_kernel_size == 0 {
+                    return Err(RuntimeError::Compute(
+                        "GDN conv_kernel is 0 (malformed LBC hyperparams)".into(),
+                    ));
+                }
+                // Fused QKV channels: 2*qk_dim + v_dim (9B=8192, 27B=10240).
                 let gdn_qkv_dim =
                     2 * gdn_num_k_heads * gdn_head_dim + gdn_num_v_heads * gdn_head_dim;
                 // V / gate / output-projection width = num_v_heads*head_dim (9B=4096, 27B=6144).
@@ -1007,6 +1079,16 @@ impl MetalF32Backend {
                 let _ = (h_state_mb, conv_mb, conv_kernel_size);
             }
         }
+
+        // Keep the layer->GDN-index map in sync so the streaming-path lazy
+        // allocator (`ensure_gdn_layer_state`) is a no-op after a resident
+        // preload. Populated only now that the state buffers above exist — a
+        // mapped index must never outlive its backing state.
+        s.gdn_layer_idx_map = s
+            .cached_layer_meta
+            .iter()
+            .map(|m| m.gdn_layer_idx)
+            .collect();
 
         // Clear legacy per-layer buffers (unified replaces them)
         s.gpu_resident_layers = None;
@@ -2501,6 +2583,68 @@ mod tests {
             err.to_string().contains("incomplete shared-expert"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn zero_length_optional_rejected() {
+        let zero = TensorSlice {
+            offset: 0,
+            length: 0,
+            quant: QuantScheme::Q4_0,
+        };
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.shared_expert_gate = Some(zero);
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("zero-length"), "{err}");
+        // Truncated-to-zero alongside real siblings must still be reported
+        // as zero-length, not as an absent tensor.
+        st.shared_expert_up = Some(slice(QuantScheme::Q4_0));
+        st.shared_expert_down = Some(slice(QuantScheme::Q4_0));
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("zero-length"), "{err}");
+
+        use lumen_format::index::ExpertSlice;
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.layer_type = None;
+        st.attn_gate = None;
+        st.ssm_alpha = None;
+        st.ssm_beta = None;
+        st.experts = Some(vec![ExpertSlice {
+            gate: slice(QuantScheme::Q4_0),
+            up: zero,
+            down: slice(QuantScheme::Q4_0),
+        }]);
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("up is zero-length"), "{err}");
+    }
+
+    #[test]
+    fn partial_bias_set_rejected() {
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.layer_type = Some(0);
+        st.attn_gate = None;
+        st.ssm_alpha = None;
+        st.ssm_beta = None;
+        st.bq = Some(slice(QuantScheme::F32));
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("incomplete QKV bias"), "{err}");
+        // Partial sets are valid when the projections are F32: the F32
+        // fallback applies each bias independently.
+        let mut f32_st = st.clone();
+        f32_st.wq = slice(QuantScheme::F32);
+        f32_st.wk = slice(QuantScheme::F32);
+        f32_st.wv = slice(QuantScheme::F32);
+        f32_st.w_gate = slice(QuantScheme::F32);
+        f32_st.w_up = slice(QuantScheme::F32);
+        f32_st.w_down = slice(QuantScheme::F32);
+        f32_st.wo = slice(QuantScheme::F32);
+        assert!(validate_layer_quants(0, &f32_st).is_ok());
+        st.bk = Some(slice(QuantScheme::F32));
+        st.bv = Some(slice(QuantScheme::F32));
+        assert!(validate_layer_quants(0, &st).is_ok());
+        st.bv = Some(slice(QuantScheme::F16));
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("bv is F16"), "{err}");
     }
 
     #[test]

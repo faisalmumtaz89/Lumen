@@ -1391,6 +1391,13 @@ impl MetalF32Backend {
 
             // Dispatch 2: Shared expert gate+up+SwiGLU -- reads normed_buf (parallel with dispatch 1)
             {
+                // Only the genuinely fused gate+up+SwiGLU kernels are valid
+                // here: this single-encoder path binds the up projection at
+                // buffer(5), which the plain matvec shaders do not declare —
+                // dispatching one of those would silently drop the up
+                // projection and the SwiGLU. Load validation admits only
+                // Q8_0/Q4_0 shared-expert pairs, so the error arm is
+                // unreachable for any loadable LBC.
                 let (se_ffn_tg, se_ffn_n_tg) = match gate_quant {
                     QuantScheme::Q8_0 => {
                         enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q8_0_2sg);
@@ -1404,17 +1411,10 @@ impl MetalF32Backend {
                         enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q4_1_deferred);
                         (128u64, se_inter as u64)
                     }
-                    QuantScheme::F16 => {
-                        enc.set_pipeline_state(&pipelines.matmul_f16_deferred_nr2);
-                        (128u64, ((se_inter as u64) + 1) / 2)
-                    }
-                    QuantScheme::Bf16 => {
-                        enc.set_pipeline_state(&pipelines.matmul_bf16_deferred_nr2);
-                        (128u64, ((se_inter as u64) + 1) / 2)
-                    }
-                    _ => {
-                        enc.set_pipeline_state(&pipelines.matmul_bytes_f32);
-                        (s.matmul_tg_size, se_inter as u64)
+                    other => {
+                        return Err(RuntimeError::Compute(format!(
+                            "shared-expert gate quant {other:?} has no fused gate+up kernel on the single-encoder MoE path"
+                        )));
                     }
                 };
                 enc.set_buffer(layer_buf, gate_off, 0);
