@@ -1016,10 +1016,9 @@ pub(crate) fn run_inference(args: &[String]) {
     // `run_with_sync` performs the GPU-resident preload that GDN requires.
     //
     // `--async` is intentionally STILL excluded here: `run_with_async` does not
-    // perform the GPU-resident preload, so auto-selecting Metal for it would
-    // panic in the streaming GDN batched-prefill path (`gdn_h_states` unallocated).
-    // Wiring the async provider's GPU-resident path is out of scope for this fix;
-    // `--async` behaviour is left exactly as it was on the prior baseline.
+    // perform the GPU-resident preload, and Metal's decode drivers require
+    // GPU-resident weights, so auto-selecting Metal for it would fail at the
+    // first decode step.
     if !explicitly_chose_backend && !use_async {
         #[cfg(target_os = "macos")]
         {
