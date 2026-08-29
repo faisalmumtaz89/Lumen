@@ -16,7 +16,7 @@ Benchmarked on an A100-80GB (27B-class BF16 cells on H100 — sm_80 routes BF16 
 |-------|-------|--------|------:|---|
 | Qwen3.5-9B dense | Q8_0 | Production-ready | **0.970× llama.cpp** (retained co-located A100 record: 114.1 vs 117.6) | All robustness and correctness gates pass |
 | Qwen3.5-9B dense | Q4_0 | Production-ready | **0.979× llama.cpp** (retained co-located A100 record: 146.6 vs 149.8) | All functional gates pass |
-| Qwen3.5-9B dense | BF16 | Production-ready | 0.727× llama.cpp (retained same-GPU H100 record, separate per-engine batteries: 106.5 vs 146.6; earlier 0.93–0.94× not retained) | Highest-precision |
+| Qwen3.5-9B dense | BF16 | Production-ready | 0.726× llama.cpp (retained same-GPU H100 record, separate per-engine batteries: 106.5 vs 146.6; earlier 0.93–0.94× not retained) | Highest-precision |
 | Qwen3.5-MoE-35B-A3B | Q8_0 | Production-ready (functional) | 0.567× llama.cpp (retained co-located A100 record: 79.2 vs 139.7) | MoE_Q8_SPLIT=OFF default validated |
 | Qwen3.5-MoE-35B-A3B | Q4_0 | Production-ready (functional) | 0.598× llama.cpp (retained co-located A100 record: 93.6 vs 156.5) | Same MoE setup path as Q8 MoE |
 | Qwen3.5-MoE-35B-A3B | BF16 | Production-ready with caveats | 0.575× llama.cpp (retained same-GPU H100 record, separate per-engine batteries: 104.1 vs 181.1; the previously published 0.902× has no retained artifact) | Requires a dedicated H100/H200-class GPU (peak 72,475 MiB ≈ 70.8 GiB, H100-measured; the A100-80GB fit is unverified and A100 decode unmeasured) |
@@ -42,7 +42,7 @@ Benchmarked on an M3 Ultra; see [`bench/RESULTS.md`](../bench/RESULTS.md) for th
 | Qwen3.6-27B dense | Q8_0 | Production-ready | **1.03× (beats llama.cpp)** | 0.86× | All quality gates pristine (2026-06-11) |
 | Qwen3.6-27B dense | Q4_0 | Production-ready | 0.99× | 0.82× | All quality gates pristine |
 | Qwen3.6-27B dense | BF16 | N/A on Metal | — | — | Same ~50 GiB capacity-margin arithmetic as the Qwen3.8-27B BF16 row below; validated on CUDA H100 instead |
-| Qwen3.8-27B dense | Q8_0 | Production-ready | **1.15× (beats llama.cpp)** | — | All quality gates pristine + DET-001 50/50 (2026-08-14, M3 Ultra; llama.cpp b10032, same GGUF); prefill row pending |
+| Qwen3.8-27B dense | Q8_0 | Production-ready (functional) | withdrawn — under re-measurement (the 2026-08-14 1.15× predates a machine-level bimodal-speed finding; audited re-runs read below it and are quarantined until the trigger is isolated) | — | All quality gates pristine + DET-001 50/50 (2026-08-14, M3 Ultra; llama.cpp b10032, same GGUF); prefill row pending |
 | Qwen3.8-27B dense | Q4_0 | Production-ready | **1.30× (beats llama.cpp)** | — | All quality gates pristine + DET-001 50/50 (2026-08-14); prefill row pending |
 | Qwen3.8-27B dense | BF16 | N/A on Metal | — | — | ~50 GiB weights sit inside the capacity margin policy on the 96 GB test rig (same arithmetic as Qwen3.6-27B BF16); validated on CUDA H100 instead |
 

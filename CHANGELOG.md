@@ -7,6 +7,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Fixed
+
+- **CUDA MoE loading validates the expert bank** the way Metal already does:
+  a within-expert gate/up quant split, or any expert whose schemes diverge
+  from expert 0's (including the up projection, which was previously never
+  checked at all), is rejected at load with the reconversion remedy instead
+  of being decoded at the wrong stride.
+- **Metal load validation closes the remaining malformed-input classes**:
+  zero-length optional tensors (which previously passed every check as
+  "absent" and then crashed or misread at dispatch), incomplete QKV bias
+  sets on quantized projections (the fused bias kernels silently dropped
+  partial sets; F32 projections keep applying partial sets independently),
+  and non-F32 biases. CUDA gains the matching non-F32 bias rejection
+  instead of silently dropping the tensor.
+- **GDN state bookkeeping is atomic**: the layer-to-state map is committed
+  only after every allocation succeeds, on both the resident and streaming
+  paths, and a mapped-but-unbacked index reports a clean error instead of
+  indexing out of bounds.
+- **`--metal --no-gpu-resident` no longer crashes on GDN models.** The
+  batched prefill path never allocated the GDN recurrent state (index
+  panic); allocation now happens on first touch via one shared, idempotent
+  path also used by streaming decode, and the resident preload records the
+  layer-to-state mapping it always implied. Resident output is
+  byte-identical; streaming prefill now works, with decode reporting the
+  pre-existing GPU-resident requirement as a clean error. Also cures the
+  same crash under `--metal --async`.
+- **Metal's shared-expert fused dispatch can no longer silently drop the
+  up-projection.** The float arms selected plain matvec shaders while
+  binding a fused-kernel buffer; those arms now error instead (such
+  shared-expert schemes are rejected at load anyway).
+- **CUDA `init` validates raw embedding/head byte lengths** against the
+  scheme's block layout, and **prefill rejects out-of-range token ids**
+  before any GPU work (previously an out-of-bounds device read via
+  `--tokens` or a library caller).
+- Malformed GDN hyperparams (`conv_kernel = 0`) are rejected on both the
+  resident and streaming allocation paths.
+
+### Changed
+
+- The Metal Qwen3.8-27B Q8_0 decode claim (1.15× llama.cpp) is withdrawn
+  pending re-measurement: bracketed audited batteries reproduce a
+  Q8-specific deficit with machine state and file paging both excluded.
+  The 9B BF16 ratio is corrected to 0.726× (rounding).
+- The converter's six SSM tensors are planned and written from one shared
+  decision (`SsmForm`), removing the triple-mirrored planner/writer logic
+  that had desynced twice. Output is byte-identical (448-case differential
+  vs the previous release).
+
 ## [0.16.0] — 2026-08-28
 
 ### Fixed
@@ -348,6 +396,8 @@ Q4/Q8/BF16; the Q4 route is byte-identical to the v0.9.0 certified baseline.
   cold-respawn cache-equivalence), and the native tool-calling battery.
   Decode vs llama.cpp b10032 on identical weights: Metal Q4 1.30× / Q8 1.15×
   (M3 Ultra), CUDA Q4 0.93× / Q8 1.02× (A100), BF16 0.87× (H100).
+  *(2026-08-29 correction: the Metal Q8 1.15× is withdrawn pending
+  re-measurement — see docs/support.md.)*
 - `ComputeBackend::reconcile_speculative_tail`: lets the session detect that
   a pipelined decode path already processed the trailing token device-side
   (Metal's lean greedy pipeline keeps one speculative command buffer in
@@ -467,7 +517,7 @@ Q4/Q8/BF16; the Q4 route is byte-identical to the v0.9.0 certified baseline.
 
 CUDA (NVIDIA, compute capability 8.0+ — Ampere / Hopper; benchmarked on A100-80GB):
 
-- Qwen3.5-9B dense at Q8_0 (**0.91× llama.cpp** decode), Q4_0 (0.64× llama.cpp), BF16 (**0.93–0.94× llama.cpp** decode) *(2026-08-26 correction: artifacts not retained; retained record — Q8 0.970×, Q4 0.979× on A100 co-located, BF16 0.727× on H100 in separate per-engine batteries)*
+- Qwen3.5-9B dense at Q8_0 (**0.91× llama.cpp** decode), Q4_0 (0.64× llama.cpp), BF16 (**0.93–0.94× llama.cpp** decode) *(2026-08-26 correction: artifacts not retained; retained record — Q8 0.970×, Q4 0.979× on A100 co-located, BF16 0.726× on H100 in separate per-engine batteries)*
 - Qwen3.5-MoE-35B-A3B at Q8_0 (0.584× llama.cpp), Q4_0 (0.674× llama.cpp), and **BF16 (0.902× llama.cpp, production-recommended)** *(2026-08-26 correction: these ratios have no retained measurement artifacts and the production recommendation is withdrawn — under the retained record BF16 is the lowest MoE ratio; the retained record is 0.567×/0.598× on A100 co-located and BF16 0.575× on H100 in separate per-engine batteries — see bench/RESULTS.md)*
 - Validated end-to-end on the full models × quants matrix against llama.cpp
 
