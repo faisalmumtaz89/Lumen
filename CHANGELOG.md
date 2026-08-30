@@ -7,6 +7,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-08-31
+
+### Fixed
+
+- **Attention projections are validated dimensionally at load** (both
+  backends): the v0.18.0 guard checked quant uniformity and contiguity but
+  never dimensions, so a uniform, contiguous `wq` with fused-Q+gate
+  geometry on a full-attention layer without per-head norms was still
+  loaded and generated rather than being rejected — and a zero-length
+  `wk` suppressed
+  the guard entirely. Loaders now require the exact packed byte length the
+  dispatch implies: `wq` = GDN in-projection rows on GDN layers (Metal
+  additionally requires `wk`/`wv` empty there), else `2*q_dim` with
+  per-head norms, else `q_dim`; `wk`/`wv` = exactly `kv_dim` rows on
+  full attention. Kernels derive dimensions from hyperparams, so byte
+  length is the load-time observable for this class of wrong-geometry
+  artifact.
+- **CUDA projection geometry covers every fixed-layout scheme** — the
+  enforcement its doc contract already claimed: Q5_0 and all five
+  K-quants (which reach CUDA verbatim under `--target cuda`) now get
+  exact row checks; non-block-multiple widths and `in_dim 0` fail closed
+  instead of skipping.
+- **Zero-length mandatory tensors are rejected** (CUDA): `wq` on every
+  layer, `wk`/`wv`/`wo` on full attention, and the dense FFN trio on
+  non-MoE layers — where MoE means router AND a non-empty expert bank;
+  a half-declared MoE layer is rejected rather than silently exempted.
+- **A missing FFN pre-norm is a load error, not a silent misread** (both
+  backends): `ffn_norm` zero-sentinel with `attn_post_norm` absent
+  previously produced a present zero-length norm buffer on CUDA and an
+  offset-0 F32 misread on Metal. The rejection keys on `attn_post_norm`'s
+  absence — never on the zero sentinel, which is legitimate on every
+  shipped GDN/MoE layer.
+- **GDN validation honors the documented compatibility default**:
+  declared header dims when present, else the QWEN35_9B default the
+  kernels already dispatch on; a defaulted mismatch errors with a NOTE
+  naming the missing `ssm.*` keys.
+- The Q8_0 GDN test-model generator violated the converter contract
+  (separate non-empty `wk`/`wv`/`wo` on its GDN layer, no declared GDN
+  dims); its attention geometry now mirrors the contract.
+
 ## [0.18.0] — 2026-08-30
 
 ### Fixed
