@@ -434,27 +434,45 @@ pub fn generate_test_model_q8_0_gdn(config: &TestModelQ8Config) -> Vec<u8> {
             slice
         };
 
+        let is_gdn = layer == 0;
         // Mandatory projection weights: Q8_0 (drives `needs_dequant = true`).
+        // GDN layers mirror the converter contract: wq holds the fused
+        // in-projection (the hyperparams below declare GDN dims whose
+        // expected row count equals q_dim, so the same blob serves) and
+        // wk/wv/wo are zero-length absence sentinels. Full-attention layers
+        // keep the separate projections.
         let wq = add(
             &mut blob,
             rng.gen_q8_0_bytes(q_dim * hidden),
             QuantScheme::Q8_0,
         );
-        let wk = add(
-            &mut blob,
-            rng.gen_q8_0_bytes(kv_dim * hidden),
-            QuantScheme::Q8_0,
-        );
-        let wv = add(
-            &mut blob,
-            rng.gen_q8_0_bytes(kv_dim * hidden),
-            QuantScheme::Q8_0,
-        );
-        let wo = add(
-            &mut blob,
-            rng.gen_q8_0_bytes(hidden * q_dim),
-            QuantScheme::Q8_0,
-        );
+        let wk = if is_gdn {
+            add(&mut blob, Vec::new(), QuantScheme::Q8_0)
+        } else {
+            add(
+                &mut blob,
+                rng.gen_q8_0_bytes(kv_dim * hidden),
+                QuantScheme::Q8_0,
+            )
+        };
+        let wv = if is_gdn {
+            add(&mut blob, Vec::new(), QuantScheme::Q8_0)
+        } else {
+            add(
+                &mut blob,
+                rng.gen_q8_0_bytes(kv_dim * hidden),
+                QuantScheme::Q8_0,
+            )
+        };
+        let wo = if is_gdn {
+            add(&mut blob, Vec::new(), QuantScheme::Q8_0)
+        } else {
+            add(
+                &mut blob,
+                rng.gen_q8_0_bytes(hidden * q_dim),
+                QuantScheme::Q8_0,
+            )
+        };
         let w_gate = add(
             &mut blob,
             rng.gen_q8_0_bytes(inter * hidden),
@@ -480,7 +498,6 @@ pub fn generate_test_model_q8_0_gdn(config: &TestModelQ8Config) -> Vec<u8> {
         // offsets are cloned UNCHANGED, so they become stale — they index the
         // wrong content in the rebuilt blob. Layer 1 stays full-attention (no
         // ssm_*) so the model is a genuine hybrid like Qwen3.5-9B.
-        let is_gdn = layer == 0;
         let (ssm_a, ssm_conv1d, ssm_dt, ssm_beta, ssm_alpha, ssm_norm, ssm_out, layer_type) =
             if is_gdn {
                 // ssm_conv1d: short conv kernel; ssm_a/dt/norm: F32 scalars.
@@ -566,7 +583,23 @@ pub fn generate_test_model_q8_0_gdn(config: &TestModelQ8Config) -> Vec<u8> {
         norm_eps: 1e-5,
         rotary_dim: None,
         rope_neox: false,
-        gdn: None,
+        // Declared GDN dims must agree with the fused in-projection the GDN
+        // layer carries: (2*num_k_heads + num_v_heads) * head_dim == q_dim,
+        // which is what the loaders validate. num_k_heads=1, num_v_heads=2
+        // gives a divisor of 4, so any 4-multiple q_dim works.
+        gdn: {
+            let q_dim = config.num_heads * config.head_dim;
+            assert!(
+                q_dim % 4 == 0,
+                "GDN test model needs q_dim divisible by 4 for consistent dims"
+            );
+            Some(crate::hyperparams::GdnDims {
+                num_v_heads: 2,
+                num_k_heads: 1,
+                head_dim: q_dim / 4,
+                conv_kernel: 4,
+            })
+        },
     };
     let qd = QuantizationDescriptor {
         scheme: QuantScheme::Q8_0,

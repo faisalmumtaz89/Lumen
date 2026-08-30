@@ -601,6 +601,10 @@ pub struct MetalF32Backend {
     scratch: Mutex<Option<MetalScratch>>,
     cached_hidden_dim: usize,
     cached_vocab_size: usize,
+    /// Attention-geometry expectations from init() hyperparams; lock-free
+    /// so streaming layer-buffer creation can validate without the scratch
+    /// mutex. None until init() runs.
+    cached_attn_dims: Option<gpu_resident::AttnDims>,
 
     // ====================================================================
     // MoE expert caching infrastructure
@@ -846,6 +850,7 @@ impl MetalF32Backend {
             weight_tying: false,
             scratch: Mutex::new(None),
             cached_hidden_dim: 0,
+            cached_attn_dims: None,
             cached_vocab_size: 0,
             expert_profiler: None,
             expert_cache: None,
@@ -981,6 +986,10 @@ impl MetalF32Backend {
         // Streaming / non-resident paths reach the dispatch kernels without
         // GPU-resident preload; this is their once-per-layer validation point.
         gpu_resident::validate_layer_quants(weights.layer_idx, &weights.subtensors)?;
+        let dims = self.cached_attn_dims.ok_or_else(|| {
+            RuntimeError::Compute("Metal attention dims not set: call init() first".into())
+        })?;
+        gpu_resident::validate_attention_dims(weights.layer_idx, &weights.subtensors, &dims)?;
         let blob = weights.as_bytes();
         let ptr = blob.as_ptr();
         let len = blob.len();
@@ -1030,6 +1039,10 @@ impl MetalF32Backend {
         non_expert_end: usize,
     ) -> Result<MetalBuffer, RuntimeError> {
         gpu_resident::validate_layer_quants(weights.layer_idx, &weights.subtensors)?;
+        let dims = self.cached_attn_dims.ok_or_else(|| {
+            RuntimeError::Compute("Metal attention dims not set: call init() first".into())
+        })?;
+        gpu_resident::validate_attention_dims(weights.layer_idx, &weights.subtensors, &dims)?;
         let blob = weights.as_bytes();
         let ptr = blob.as_ptr();
         let len = non_expert_end.min(blob.len());
