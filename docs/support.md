@@ -37,8 +37,8 @@ Benchmarked on an M3 Ultra; see [`bench/RESULTS.md`](../bench/RESULTS.md) for th
 | Qwen3.5-9B dense | Q8_0 | Production-ready (default) | **0.98×** | 0.95× | Cleared 0.9× decode gate |
 | Qwen3.5-9B dense | Q4_0 | Production-ready | **1.02×** / **1.17×** (beats llama.cpp) | 0.88× | Below 0.9× prefill (structural) |
 | Qwen3.5-9B dense | BF16 | Production-ready (functional) | 0.83× | 0.66× (up from 0.31×) | mmap zero-copy load (the default on Metal) |
-| Qwen3.5-MoE-35B-A3B | Q8_0 | Production-ready (functional) | 0.21× | 0.09× | mmap zero-copy load (the default on Metal). (llama.cpp build 8680 could not load this arch; current llama.cpp builds can — ratios vs a 2026-06-11 build. MoE perf on Metal is a known optimization target.) |
-| Qwen3.5-MoE-35B-A3B | Q4_0 | Production-ready (functional) | 0.18× | 0.08× | Same mmap default; same MoE-perf caveat |
+| Qwen3.5-MoE-35B-A3B | Q8_0 | Production-ready (functional) | not retained | not retained | mmap zero-copy load (the default on Metal). Earlier 0.21×/0.09× ratios have no retained artifact (the cited bench records `none` for these cells — llama-bench 8680 could not load this arch); MoE perf on Metal is a known optimization target |
+| Qwen3.5-MoE-35B-A3B | Q4_0 | Production-ready (functional) | not retained | not retained | Same mmap default; earlier 0.18×/0.08× ratios have no retained artifact; same MoE-perf caveat |
 | Qwen3.6-27B dense | Q8_0 | Production-ready | **1.03× (beats llama.cpp)** | 0.86× | All quality gates pristine (2026-06-11) |
 | Qwen3.6-27B dense | Q4_0 | Production-ready | 0.99× | 0.82× | All quality gates pristine |
 | Qwen3.6-27B dense | BF16 | N/A on Metal | — | — | Same ~50 GiB capacity-margin arithmetic as the Qwen3.8-27B BF16 row below; validated on CUDA H100 instead |

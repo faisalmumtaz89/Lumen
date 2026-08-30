@@ -15377,16 +15377,74 @@ unsafe fn launch_fused_norm_dual_matvec_f32(
 /// Expected raw byte length for a `[vocab, hidden]` global tensor in the given
 /// scheme, when the scheme has a fixed block layout. `None` for schemes whose
 /// raw layout is not a plain block stream (validated elsewhere).
-fn raw_global_expected_len(quant: QuantScheme, n_elements: usize) -> Option<usize> {
-    let block =
-        |elems: usize, bytes: usize| (n_elements % elems == 0).then(|| n_elements / elems * bytes);
+/// `Ok(Some(len))` = the scheme has a fixed block layout and `len` is the
+/// only valid raw size. `Ok(None)` = the layout is not length-checkable
+/// here (e.g. CtInt4G32's composite planes). `Err` = the dimensions are
+/// malformed for the scheme (non-block-multiple element count or overflow).
+fn raw_global_expected_len(
+    quant: QuantScheme,
+    n_elements: usize,
+) -> Result<Option<usize>, RuntimeError> {
+    // The embed/head kernels compute element and byte offsets in 32-bit
+    // (`token_id * hidden_dim + idx`, `block_idx * block_bytes`), so both
+    // the element count and the raw byte length must fit u32 — beyond
+    // that the kernels wrap and read the wrong rows.
+    if n_elements > 1usize << 32 {
+        return Err(RuntimeError::Compute(format!(
+            "{quant:?} global of {n_elements} elements exceeds the 32-bit \
+             element indexing the kernels use (malformed hyperparams)"
+        )));
+    }
+    let block = |elems: usize, bytes: usize| {
+        if n_elements % elems != 0 {
+            return Err(RuntimeError::Compute(format!(
+                "{quant:?} global of {n_elements} elements is not a multiple \
+                 of the {elems}-element block size (malformed hyperparams)"
+            )));
+        }
+        match (n_elements / elems).checked_mul(bytes) {
+            Some(len) if len <= 1usize << 32 => Ok(Some(len)),
+            _ => Err(RuntimeError::Compute(format!(
+                "{quant:?} global of {n_elements} elements exceeds the \
+                 32-bit byte indexing the kernels use (malformed \
+                 hyperparams)"
+            ))),
+        }
+    };
     match quant {
         QuantScheme::Q8_0 => block(32, 34),
         QuantScheme::Q4_0 => block(32, 18),
-        QuantScheme::F16 | QuantScheme::Bf16 => Some(n_elements * 2),
+        QuantScheme::F16 | QuantScheme::Bf16 => block(1, 2),
         QuantScheme::Q6_K => block(256, 210),
-        _ => None,
+        _ => Ok(None),
     }
+}
+
+/// The output-head matvec kernels lay blocks out per row
+/// ([vocab rows] x [hidden/block_elems blocks]), so the row width itself
+/// must be block-aligned — flattened vocab*hidden divisibility alone
+/// admits totals whose rows split blocks (e.g. hidden=48 under Q8_0),
+/// which the kernels misindex. The embedding keeps the flattened check:
+/// its lookup kernels tolerate blocks crossing row boundaries.
+fn validate_output_head_row_alignment(
+    quant: QuantScheme,
+    hidden_dim: usize,
+) -> Result<(), RuntimeError> {
+    let row_block_elems = match quant {
+        QuantScheme::Q8_0 | QuantScheme::Q4_0 => Some(32usize),
+        QuantScheme::Q6_K => Some(256usize),
+        _ => None,
+    };
+    if let Some(elems) = row_block_elems {
+        if hidden_dim % elems != 0 {
+            return Err(RuntimeError::Compute(format!(
+                "output_proj is {quant:?} but hidden_dim {hidden_dim} is \
+                 not a multiple of the {elems}-element block row layout \
+                 the head kernels require (malformed hyperparams)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -15396,16 +15454,51 @@ mod raw_global_len_tests {
     #[test]
     fn expected_lengths_match_block_layouts() {
         let n = 16384;
-        assert_eq!(raw_global_expected_len(QuantScheme::Q8_0, n), Some(17408));
-        assert_eq!(raw_global_expected_len(QuantScheme::Q4_0, n), Some(9216));
-        assert_eq!(raw_global_expected_len(QuantScheme::F16, n), Some(32768));
-        assert_eq!(raw_global_expected_len(QuantScheme::Bf16, n), Some(32768));
-        assert_eq!(raw_global_expected_len(QuantScheme::Q6_K, n), Some(13440));
-        assert_eq!(raw_global_expected_len(QuantScheme::CtInt4G32, n), None);
-        assert_eq!(raw_global_expected_len(QuantScheme::F32, n), None);
-        // element counts that do not fill whole blocks are unmappable
-        assert_eq!(raw_global_expected_len(QuantScheme::Q8_0, 33), None);
-        assert_eq!(raw_global_expected_len(QuantScheme::Q6_K, 300), None);
+        let ok = |q, n| raw_global_expected_len(q, n).unwrap();
+        assert_eq!(ok(QuantScheme::Q8_0, n), Some(17408));
+        assert_eq!(ok(QuantScheme::Q4_0, n), Some(9216));
+        assert_eq!(ok(QuantScheme::F16, n), Some(32768));
+        assert_eq!(ok(QuantScheme::Bf16, n), Some(32768));
+        assert_eq!(ok(QuantScheme::Q6_K, n), Some(13440));
+        assert_eq!(ok(QuantScheme::CtInt4G32, n), None);
+        assert_eq!(ok(QuantScheme::F32, n), None);
+        // element counts that do not fill whole blocks are malformed, not
+        // skippable
+        assert!(raw_global_expected_len(QuantScheme::Q8_0, 33).is_err());
+        assert!(raw_global_expected_len(QuantScheme::Q6_K, 300).is_err());
+        // overflow is an error, never a wrap
+        assert!(raw_global_expected_len(QuantScheme::Bf16, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn rejects_globals_beyond_u32_indexing() {
+        // Element count over u32::MAX: kernels index elements in 32-bit.
+        let err = raw_global_expected_len(QuantScheme::Q8_0, 1usize << 33).unwrap_err();
+        assert!(err.to_string().contains("32-bit element indexing"), "{err}");
+        // Element count fits u32 but the Q8_0 byte length (n/32*34) does
+        // not: kernels index bytes in 32-bit too.
+        let n = 4_100_000_000usize / 32 * 32;
+        assert!(n <= u32::MAX as usize);
+        let err = raw_global_expected_len(QuantScheme::Q8_0, n).unwrap_err();
+        assert!(err.to_string().contains("32-bit byte indexing"), "{err}");
+    }
+
+    #[test]
+    fn output_head_rejects_row_misaligned_hidden() {
+        // Total block-aligned but rows split blocks: vocab=2 x hidden=48
+        // gives 96 elements (3 Q8_0 blocks), yet each row is 1.5 blocks —
+        // the flattened length check alone accepts it.
+        let err = validate_output_head_row_alignment(QuantScheme::Q8_0, 48).unwrap_err();
+        assert!(err.to_string().contains("block row layout"), "{err}");
+        let err = validate_output_head_row_alignment(QuantScheme::Q4_0, 48).unwrap_err();
+        assert!(err.to_string().contains("block row layout"), "{err}");
+        let err = validate_output_head_row_alignment(QuantScheme::Q6_K, 128).unwrap_err();
+        assert!(err.to_string().contains("256-element"), "{err}");
+        assert!(validate_output_head_row_alignment(QuantScheme::Q8_0, 64).is_ok());
+        assert!(validate_output_head_row_alignment(QuantScheme::Q4_0, 64).is_ok());
+        assert!(validate_output_head_row_alignment(QuantScheme::Q6_K, 512).is_ok());
+        // Float heads have no block rows; any hidden width is fine.
+        assert!(validate_output_head_row_alignment(QuantScheme::F16, 48).is_ok());
     }
 }
 
@@ -15641,7 +15734,7 @@ impl ComputeBackend for CudaBackend {
             if has_raw_embedding {
                 let raw = self.embedding_raw.as_ref().unwrap();
                 let n = hyperparams.vocab_size as usize * hyperparams.hidden_dim as usize;
-                if let Some(expected) = raw_global_expected_len(self.embedding_quant, n) {
+                if let Some(expected) = raw_global_expected_len(self.embedding_quant, n)? {
                     if raw.len() != expected {
                         return Err(RuntimeError::Compute(format!(
                             "embedding raw is {} bytes but {:?} [{} x {}] requires {expected}",
@@ -15712,7 +15805,11 @@ impl ComputeBackend for CudaBackend {
         ) = if has_raw_output_proj {
             let raw = self.output_proj_raw.as_ref().unwrap();
             let n = hyperparams.vocab_size as usize * hyperparams.hidden_dim as usize;
-            if let Some(expected) = raw_global_expected_len(self.output_proj_quant, n) {
+            validate_output_head_row_alignment(
+                self.output_proj_quant,
+                hyperparams.hidden_dim as usize,
+            )?;
+            if let Some(expected) = raw_global_expected_len(self.output_proj_quant, n)? {
                 if raw.len() != expected {
                     return Err(RuntimeError::Compute(format!(
                         "output_proj raw is {} bytes but {:?} [{} x {}] requires {expected}",
@@ -18760,6 +18857,9 @@ impl ComputeBackend for CudaBackend {
                     ));
                 }
             }
+            // Validate slices before ANY per-layer GPU work (meta tables
+            // included), keeping the validator's before-upload contract true.
+            super::gpu_buffers::validate_layer_slices(layer_idx, &layer_view.subtensors)?;
             // build per-layer MoE metadata when the layer has experts.
             // We build this BEFORE upload_layer_weights so the meta references
             // offsets that remain stable across the upload (the upload writes

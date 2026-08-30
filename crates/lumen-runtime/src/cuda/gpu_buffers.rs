@@ -1109,6 +1109,123 @@ fn upload_norm_tensor(
     device.htod_copy(f32_data)
 }
 
+/// Reject present-but-zero-length optional tensors before any upload: the
+/// upload and dispatch paths gate on presence alone, so a `Some` with
+/// length 0 would become a "present" GPU buffer the kernels then read
+/// past. The converter never emits one.
+pub(crate) fn validate_layer_slices(
+    layer: usize,
+    subs: &lumen_format::index::SubtensorOffsets,
+) -> Result<(), RuntimeError> {
+    let optional_slices: [(&str, Option<&lumen_format::index::TensorSlice>); 19] = [
+        ("bq", subs.bq.as_ref()),
+        ("bk", subs.bk.as_ref()),
+        ("bv", subs.bv.as_ref()),
+        ("router_weight", subs.router_weight.as_ref()),
+        ("shared_expert_gate", subs.shared_expert_gate.as_ref()),
+        ("shared_expert_up", subs.shared_expert_up.as_ref()),
+        ("shared_expert_down", subs.shared_expert_down.as_ref()),
+        ("attn_gate", subs.attn_gate.as_ref()),
+        ("attn_post_norm", subs.attn_post_norm.as_ref()),
+        ("ssm_a", subs.ssm_a.as_ref()),
+        ("ssm_conv1d", subs.ssm_conv1d.as_ref()),
+        ("ssm_dt", subs.ssm_dt.as_ref()),
+        ("ssm_beta", subs.ssm_beta.as_ref()),
+        ("ssm_alpha", subs.ssm_alpha.as_ref()),
+        ("ssm_norm", subs.ssm_norm.as_ref()),
+        ("ssm_out", subs.ssm_out.as_ref()),
+        ("attn_q_norm", subs.attn_q_norm.as_ref()),
+        ("attn_k_norm", subs.attn_k_norm.as_ref()),
+        ("ffn_gate_inp_shexp", subs.ffn_gate_inp_shexp.as_ref()),
+    ];
+    for (name, slice) in optional_slices {
+        if let Some(t) = slice {
+            if t.length == 0 {
+                return Err(RuntimeError::Compute(format!(
+                    "layer {layer}: {name} is present but zero-length \
+                     (malformed LBC). Re-convert with `lumen convert`."
+                )));
+            }
+        }
+    }
+    if let Some(experts) = subs.experts.as_ref() {
+        for (i, e) in experts.iter().enumerate() {
+            for (name, t) in [("gate", &e.gate), ("up", &e.up), ("down", &e.down)] {
+                if t.length == 0 {
+                    return Err(RuntimeError::Compute(format!(
+                        "layer {layer} expert {i}: {name} is zero-length \
+                         (malformed LBC). Re-convert with `lumen convert`."
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod layer_slice_tests {
+    use super::*;
+    use lumen_format::index::{ExpertSlice, SubtensorOffsets, TensorSlice};
+
+    #[test]
+    fn zero_length_optionals_rejected() {
+        let t = |offset: u64, length: u64| TensorSlice {
+            offset,
+            length,
+            quant: QuantScheme::F32,
+        };
+        let mut subs = SubtensorOffsets {
+            wq: t(0, 64),
+            wk: t(64, 64),
+            wv: t(128, 64),
+            wo: t(192, 64),
+            bq: None,
+            bk: None,
+            bv: None,
+            w_gate: t(256, 64),
+            w_up: t(320, 64),
+            w_down: t(384, 64),
+            attn_norm: t(448, 16),
+            ffn_norm: t(464, 16),
+            router_weight: None,
+            experts: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            ffn_gate_inp_shexp: None,
+            layer_type: None,
+        };
+        assert!(validate_layer_slices(0, &subs).is_ok());
+        subs.bq = Some(t(480, 0));
+        let err = validate_layer_slices(0, &subs).unwrap_err();
+        assert!(
+            err.to_string().contains("bq is present but zero-length"),
+            "{err}"
+        );
+        subs.bq = None;
+        subs.experts = Some(vec![ExpertSlice {
+            gate: t(480, 64),
+            up: t(544, 0),
+            down: t(608, 64),
+        }]);
+        let err = validate_layer_slices(0, &subs).unwrap_err();
+        assert!(err.to_string().contains("up is zero-length"), "{err}");
+    }
+}
+
 /// Upload a single layer's weight tensors from a `LayerView` to GPU memory.
 ///
 /// Extracts each subtensor's raw bytes and uploads according to quant scheme:
@@ -1125,6 +1242,9 @@ pub fn upload_layer_weights(
     hp: &ModelHyperparams,
 ) -> Result<LayerWeightsGpu, RuntimeError> {
     let subs = &weights.subtensors;
+    let layer = weights.layer_idx;
+
+    validate_layer_slices(layer, subs)?;
 
     // Source-fidelity artifacts keep ssm_out in its source Q5_K form. Base
     // buffer becomes an F16 image (first-class prefill HGEMM / decode HGEMV
