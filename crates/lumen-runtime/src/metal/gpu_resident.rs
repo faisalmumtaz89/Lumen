@@ -28,6 +28,127 @@ fn dense_slice_quant_supported(q: QuantScheme) -> bool {
     )
 }
 
+/// Attention-geometry expectations derived from hyperparams at `init()`.
+/// Plain values (no locks) so streaming load paths can validate without
+/// touching the scratch mutex.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AttnDims {
+    pub(crate) q_dim: usize,
+    pub(crate) kv_dim: usize,
+    pub(crate) hidden: usize,
+    /// Fused GDN in-projection rows: (2*num_k_heads + num_v_heads)*head_dim
+    /// from declared header dims, else the documented QWEN35_9B
+    /// compatibility default — the same default the kernels dispatch on, so
+    /// a headerless 9B-era artifact keeps loading and any mismatched
+    /// artifact fails with observed-vs-expected named in the error.
+    pub(crate) gdn_qkv_rows: usize,
+    /// Whether the header actually declared GDN dims (false = the 9B
+    /// compatibility default is in effect; mismatch errors say so).
+    pub(crate) gdn_declared: bool,
+}
+
+/// Exact packed byte length of one weight row of `hidden` input columns in
+/// `quant`. Errors on schemes without a servable fixed layout and on
+/// non-block-multiple widths (the dispatch kernels stride rows by
+/// `hidden/32` blocks).
+fn attn_row_bytes(
+    layer: usize,
+    name: &str,
+    quant: QuantScheme,
+    hidden: usize,
+) -> Result<usize, RuntimeError> {
+    match quant {
+        QuantScheme::F32 => Ok(hidden * 4),
+        QuantScheme::F16 | QuantScheme::Bf16 => Ok(hidden * 2),
+        QuantScheme::Q8_0 | QuantScheme::Q4_0 => {
+            if hidden % 32 != 0 {
+                return Err(RuntimeError::Compute(format!(
+                    "layer {layer}: {name} is {quant:?} but hidden_dim \
+                     {hidden} is not a multiple of the 32-element block \
+                     (malformed hyperparams)"
+                )));
+            }
+            Ok(hidden / 32 * if quant == QuantScheme::Q8_0 { 34 } else { 18 })
+        }
+        other => Err(RuntimeError::Compute(format!(
+            "layer {layer}: {name} is {other:?}, which the Metal attention \
+             kernels cannot serve. Re-convert with `lumen convert --target \
+             metal`."
+        ))),
+    }
+}
+
+/// Reject attention projections whose byte length disagrees with the row
+/// count the dispatch derives from hyperparams. The routing predicate is
+/// tensor PRESENCE (`attn_q_norm`), not architecture — the LBC carries no
+/// architecture field — so a converted tensor with the wrong geometry
+/// (e.g. a fused Q+gate wq on a layer routed to the single-launch path)
+/// loads in-bounds and computes silently wrong output. Kernels take row
+/// counts from hyperparams, never from the buffer, so byte length is the
+/// one load-time observable that catches the whole class.
+pub(super) fn validate_attention_dims(
+    layer: usize,
+    st: &lumen_format::index::SubtensorOffsets,
+    d: &AttnDims,
+) -> Result<(), RuntimeError> {
+    let expect = |name: &str,
+                  slice: &lumen_format::index::TensorSlice,
+                  rows: usize|
+     -> Result<(), RuntimeError> {
+        let row = attn_row_bytes(layer, name, slice.quant, d.hidden)?;
+        let want = rows as u64 * row as u64;
+        if slice.length != want {
+            return Err(RuntimeError::Compute(format!(
+                "layer {layer}: {name} is {} bytes but the dispatch expects \
+                 {rows} rows x {row} bytes = {want} ({:?}, hidden {}). The \
+                 kernels derive dimensions from hyperparams, so this tensor \
+                 would be read at the wrong geometry. Re-convert with \
+                 `lumen convert`.",
+                slice.length, slice.quant, d.hidden
+            )));
+        }
+        Ok(())
+    };
+    if st.layer_type == Some(1) {
+        // GDN: wq holds the fused in-projection; wk/wv are converter zero
+        // sentinels — a non-empty wk/wv here is malformed.
+        expect("attn_qkv (wq)", &st.wq, d.gdn_qkv_rows).map_err(|e| {
+            if d.gdn_declared {
+                e
+            } else {
+                RuntimeError::Compute(format!(
+                    "{e} NOTE: the model header declares no GDN dims, so the \
+                     expectation is the Qwen3.5-9B compatibility default — \
+                     if this is not a 9B-geometry model, re-convert from a \
+                     GGUF carrying the ssm.* keys."
+                ))
+            }
+        })?;
+        if st.wk.length != 0 || st.wv.length != 0 {
+            return Err(RuntimeError::Compute(format!(
+                "layer {layer}: GDN layer carries non-empty wk/wv ({} / {} \
+                 bytes); the fused in-projection leaves both empty. \
+                 Re-convert with `lumen convert`.",
+                st.wk.length, st.wv.length
+            )));
+        }
+        return Ok(());
+    }
+    // Full attention: wq is 2*q_dim rows under Q+gate fusion (detected by
+    // per-head Q-norm presence), q_dim rows otherwise; wk/wv are always
+    // kv_dim rows — zero-length wk/wv on a full-attention layer is
+    // malformed, not a sentinel.
+    let wq_rows = if st.attn_q_norm.is_some() {
+        2 * d.q_dim
+    } else {
+        d.q_dim
+    };
+    expect("wq", &st.wq, wq_rows)?;
+    expect("wk", &st.wk, d.kv_dim)?;
+    expect("wv", &st.wv, d.kv_dim)?;
+    Ok(())
+}
+
 /// Reject layer tensors the Metal dispatch paths would misparse, before any
 /// Metal path can execute over the blob. Called once per layer at GPU-resident
 /// preload, and at zero-copy layer-buffer creation for the streaming /
@@ -138,6 +259,19 @@ pub(super) fn validate_layer_quants(
                 st.wq.quant
             )));
         }
+    }
+    // The FFN pre-norm must exist somewhere: ffn_norm is legitimately a
+    // zero sentinel when attn_post_norm carries the pre-norm (GDN / MoE
+    // layers), but with BOTH absent the loaders' fallbacks misbehave —
+    // Metal resolves the norm offset to 0 and reads whatever tensor lives
+    // there as F32; CUDA uploads a zero-length "present" norm buffer the
+    // rmsnorm kernel indexes past.
+    if st.ffn_norm.length == 0 && st.attn_post_norm.is_none() {
+        return Err(RuntimeError::Compute(format!(
+            "layer {layer}: ffn_norm is empty and attn_post_norm is absent \
+             — no FFN pre-norm exists (malformed LBC). Re-convert with \
+             `lumen convert`."
+        )));
     }
     // The GDN prefill projections (attn_qkv in-projection, attn_gate,
     // ssm_out) dispatch on Q8_0/Bf16/Q4_0 arms with a per-token F32
@@ -413,6 +547,9 @@ impl MetalF32Backend {
         })?;
 
         let num_layers = s.num_layers;
+        let attn_dims = self.cached_attn_dims.ok_or_else(|| {
+            RuntimeError::Compute("Metal attention dims not set: call init() first".into())
+        })?;
 
         // Quiet by default — CLI controls verbosity.
 
@@ -555,6 +692,7 @@ impl MetalF32Backend {
             };
             let st = &layer_view.subtensors;
             validate_layer_quants(layer, st)?;
+            validate_attention_dims(layer, st, &attn_dims)?;
             layer_metas.push(CachedLayerMeta {
                 attn_norm_off: base + st.attn_norm.offset,
                 wq_off: base + st.wq.offset,
@@ -2682,6 +2820,161 @@ mod tests {
         let mut st = gdn_layer(QuantScheme::Q8_0);
         st.wq = at(0, QuantScheme::F32);
         st.attn_gate = Some(slice(QuantScheme::F32));
+        assert!(validate_layer_quants(0, &st).is_ok());
+    }
+
+    fn full_attn_dims() -> AttnDims {
+        // Matches the tiny-model geometry the repro artifacts use:
+        // hidden 64, 8 heads x 8 head_dim (q_dim 64), 4 kv heads (kv_dim 32).
+        AttnDims {
+            q_dim: 64,
+            kv_dim: 32,
+            hidden: 64,
+            gdn_qkv_rows: 128,
+            gdn_declared: true,
+        }
+    }
+
+    fn attn_st(wq_len: u64, wk_len: u64, wv_len: u64) -> SubtensorOffsets {
+        // Q8_0 row of 64 columns = 2 blocks x 34 = 68 bytes.
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.layer_type = Some(0);
+        st.attn_gate = None;
+        st.ssm_alpha = None;
+        st.ssm_beta = None;
+        st.wq = TensorSlice {
+            offset: 0,
+            length: wq_len,
+            quant: QuantScheme::Q8_0,
+        };
+        st.wk = TensorSlice {
+            offset: wq_len,
+            length: wk_len,
+            quant: QuantScheme::Q8_0,
+        };
+        st.wv = TensorSlice {
+            offset: wq_len + wk_len,
+            length: wv_len,
+            quant: QuantScheme::Q8_0,
+        };
+        st
+    }
+
+    #[test]
+    fn attention_dims_reject_wrong_row_counts() {
+        let d = full_attn_dims();
+        // Correct plain full-attention geometry loads: wq 64 rows, wk/wv 32.
+        let st = attn_st(64 * 68, 32 * 68, 32 * 68);
+        assert!(validate_attention_dims(0, &st, &d).is_ok());
+        // Canonical C2: fused Q+gate wq (2*q_dim rows) on a layer WITHOUT
+        // per-head norms — the round-6 quant/contiguity guard passed this.
+        let st = attn_st(128 * 68, 32 * 68, 32 * 68);
+        let err = validate_attention_dims(0, &st, &d).unwrap_err();
+        assert!(err.to_string().contains("expects 64 rows"), "{err}");
+        // With per-head norms the SAME wq length is the correct geometry...
+        let mut st = attn_st(128 * 68, 32 * 68, 32 * 68);
+        st.attn_q_norm = Some(slice(QuantScheme::F32));
+        st.attn_k_norm = Some(slice(QuantScheme::F32));
+        assert!(validate_attention_dims(0, &st, &d).is_ok());
+        // ...and a plain-q wq is rejected there.
+        let mut st = attn_st(64 * 68, 32 * 68, 32 * 68);
+        st.attn_q_norm = Some(slice(QuantScheme::F32));
+        st.attn_k_norm = Some(slice(QuantScheme::F32));
+        let err = validate_attention_dims(0, &st, &d).unwrap_err();
+        assert!(err.to_string().contains("expects 128 rows"), "{err}");
+        // Zero-length wk on a full-attention layer no longer suppresses
+        // anything: it fails the kv_dim expectation directly.
+        let st = attn_st(64 * 68, 0, 32 * 68);
+        let err = validate_attention_dims(0, &st, &d).unwrap_err();
+        assert!(err.to_string().contains("wk is 0 bytes"), "{err}");
+        // Wrong wv row count.
+        let st = attn_st(64 * 68, 32 * 68, 16 * 68);
+        let err = validate_attention_dims(0, &st, &d).unwrap_err();
+        assert!(err.to_string().contains("wv is 1088 bytes"), "{err}");
+    }
+
+    #[test]
+    fn attention_dims_gdn_layers() {
+        let d = full_attn_dims();
+        // GDN: wq holds the fused in-projection (gdn_qkv_rows), wk/wv empty.
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.wq = TensorSlice {
+            offset: 0,
+            length: 128 * 68,
+            quant: QuantScheme::Q8_0,
+        };
+        st.wk = TensorSlice {
+            offset: 0,
+            length: 0,
+            quant: QuantScheme::Q8_0,
+        };
+        st.wv = TensorSlice {
+            offset: 0,
+            length: 0,
+            quant: QuantScheme::Q8_0,
+        };
+        assert!(validate_attention_dims(0, &st, &d).is_ok());
+        // Wrong in-projection size.
+        st.wq.length = 64 * 68;
+        let err = validate_attention_dims(0, &st, &d).unwrap_err();
+        assert!(err.to_string().contains("expects 128 rows"), "{err}");
+        // Non-empty wk on a GDN layer is malformed.
+        st.wq.length = 128 * 68;
+        st.wk.length = 32 * 68;
+        let err = validate_attention_dims(0, &st, &d).unwrap_err();
+        assert!(err.to_string().contains("non-empty wk/wv"), "{err}");
+    }
+
+    #[test]
+    fn attention_dims_row_bytes_per_scheme() {
+        let d = full_attn_dims();
+        // F32 rows: 64 cols x 4 bytes = 256/row.
+        let mut st = attn_st(0, 0, 0);
+        st.wq = TensorSlice {
+            offset: 0,
+            length: 64 * 256,
+            quant: QuantScheme::F32,
+        };
+        st.wk = TensorSlice {
+            offset: 0,
+            length: 32 * 256,
+            quant: QuantScheme::F32,
+        };
+        st.wv = TensorSlice {
+            offset: 0,
+            length: 32 * 256,
+            quant: QuantScheme::F32,
+        };
+        assert!(validate_attention_dims(0, &st, &d).is_ok());
+        // Bf16 rows: 128 bytes; wrong length rejected.
+        st.wq.quant = QuantScheme::Bf16;
+        st.wq.length = 64 * 128 + 2;
+        let err = validate_attention_dims(0, &st, &d).unwrap_err();
+        assert!(err.to_string().contains("wq is"), "{err}");
+        // Quantized rows require a 32-multiple hidden width.
+        let d_odd = AttnDims {
+            hidden: 48,
+            ..full_attn_dims()
+        };
+        let st = attn_st(64 * 68, 32 * 68, 32 * 68);
+        let err = validate_attention_dims(0, &st, &d_odd).unwrap_err();
+        assert!(err.to_string().contains("not a multiple"), "{err}");
+    }
+
+    #[test]
+    fn ffn_pre_norm_must_exist() {
+        // ffn_norm zero + attn_post_norm absent = no FFN pre-norm anywhere.
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.ffn_norm = TensorSlice {
+            offset: 0,
+            length: 0,
+            quant: QuantScheme::F32,
+        };
+        st.attn_post_norm = None;
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("no FFN pre-norm"), "{err}");
+        // The shipped-model shape: zero ffn_norm WITH attn_post_norm loads.
+        st.attn_post_norm = Some(slice(QuantScheme::F32));
         assert!(validate_layer_quants(0, &st).is_ok());
     }
 

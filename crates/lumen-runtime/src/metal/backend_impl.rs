@@ -21,6 +21,16 @@ impl ComputeBackend for MetalF32Backend {
     fn init(&mut self, hyperparams: &ModelHyperparams) -> Result<(), RuntimeError> {
         self.cached_hidden_dim = hyperparams.hidden_dim as usize;
         self.cached_vocab_size = hyperparams.vocab_size as usize;
+        self.cached_attn_dims = Some(super::gpu_resident::AttnDims {
+            q_dim: (hyperparams.num_heads * hyperparams.head_dim) as usize,
+            kv_dim: (hyperparams.num_kv_heads * hyperparams.head_dim) as usize,
+            hidden: hyperparams.hidden_dim as usize,
+            gdn_qkv_rows: {
+                let gd = hyperparams.gdn_dims();
+                ((2 * gd.num_k_heads + gd.num_v_heads) * gd.head_dim) as usize
+            },
+            gdn_declared: hyperparams.gdn.is_some(),
+        });
 
         // Compile shader pipelines
         let pipelines = self.compile_pipelines()?;
