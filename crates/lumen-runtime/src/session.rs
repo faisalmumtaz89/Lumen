@@ -1540,7 +1540,8 @@ mod tests {
         let cfg = TestModelConfig::default();
         let bytes = generate_test_model(&cfg);
         let id = SESSION_TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("lumen_session_test_{id}"));
+        let dir =
+            std::env::temp_dir().join(format!("lumen_session_test_{}_{id}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test_model.lbc");
         {
@@ -2603,7 +2604,8 @@ mod tests {
         assert_eq!(session.tokens().len(), session.kv().seq_len());
 
         let dir = std::env::temp_dir().join(format!(
-            "lumen_session_save_load_{}",
+            "lumen_session_save_load_{}_{}",
+            std::process::id(),
             SESSION_TEST_COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2656,7 +2658,8 @@ mod tests {
         session.extend(&prompt, &backend, &provider).unwrap();
 
         let dir = std::env::temp_dir().join(format!(
-            "lumen_session_fp_mismatch_{}",
+            "lumen_session_fp_mismatch_{}_{}",
+            std::process::id(),
             SESSION_TEST_COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2709,7 +2712,8 @@ mod tests {
         session.extend(&prompt, &backend, &provider).unwrap();
 
         let dir = std::env::temp_dir().join(format!(
-            "lumen_session_idempotent_{}",
+            "lumen_session_idempotent_{}_{}",
+            std::process::id(),
             SESSION_TEST_COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&dir).unwrap();

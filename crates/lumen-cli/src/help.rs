@@ -129,7 +129,8 @@ OPTIONS:
     --cuda-device <n>     Select CUDA device ordinal (default: 0, implies --cuda)
     --accelerate          Use Accelerate AMX batched prefill (macOS only, use with --simd)
     --gpu-resident        Pre-load all weights into GPU Metal buffers (DEFAULT with --metal)
-    --no-gpu-resident     Disable GPU-resident mode, use SSD-streaming (alias: --streaming)
+    --no-gpu-resident     Disable GPU-resident mode, use SSD-streaming (alias: --streaming).
+                          CUDA only: Metal decode requires resident weights
     --option-a            MoE: dispatch only top-K experts per token (streaming + GPU-resident)
     --routing-bias <f>    MoE: cache-conditional routing bias lambda (default: 0.0 = disabled)
     --context-len <n>     Max context length for KV cache (default: auto-sized to prompt + generation + headroom).

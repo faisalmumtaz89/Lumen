@@ -939,7 +939,27 @@ impl MetalF32Backend {
                                 "Failed to create encoder for shared expert down".into(),
                             )
                         })?;
+                        // Full down-quant coverage mirroring the fused
+                        // variant: the guard admits any down quant next to a
+                        // float gate/up pair, so Q8_0/Q4_0/Q4_1 must select
+                        // their dequant kernels — the F32 arm reads raw
+                        // quantized bytes as floats.
                         let (d_pso, d_tg, d_n_tg) = match down_quant {
+                            QuantScheme::Q8_0 => (
+                                &pipelines.dequant_matmul_q8_0_2sg,
+                                64u64,
+                                ((hidden_dim as u64) + 7) / 8,
+                            ),
+                            QuantScheme::Q4_0 => (
+                                &pipelines.dequant_matmul_q4_0_deferred_nr2,
+                                128u64,
+                                ((hidden_dim as u64) + 1) / 2,
+                            ),
+                            QuantScheme::Q4_1 => (
+                                &pipelines.dequant_matmul_q4_1_deferred,
+                                128u64,
+                                ((hidden_dim as u64) + 3) / 4,
+                            ),
                             QuantScheme::F16 => (
                                 &pipelines.matmul_f16_deferred_nr2,
                                 128u64,
@@ -956,8 +976,14 @@ impl MetalF32Backend {
                                 hidden_dim as u64,
                             ),
                         };
-                        let down_need_hidden_byte =
-                            matches!(down_quant, QuantScheme::F16 | QuantScheme::Bf16);
+                        let down_need_hidden_byte = matches!(
+                            down_quant,
+                            QuantScheme::Q8_0
+                                | QuantScheme::Q4_0
+                                | QuantScheme::Q4_1
+                                | QuantScheme::F16
+                                | QuantScheme::Bf16
+                        );
                         enc3.set_pipeline_state(d_pso);
                         enc3.set_buffer(layer_buf, down_off, 0);
                         enc3.set_buffer(se_gate_buf, 0, 1);
@@ -1325,10 +1351,15 @@ impl MetalF32Backend {
         let hidden_dim = s.hidden_dim;
         let has_shared = meta.shared_expert_gate_off.is_some();
 
-        // Check if we can use the fused down+accum+shared kernel
+        // Check if we can use the fused down+accum+shared kernel. The
+        // gate quant must be one the fused gate+up+SwiGLU shaders cover:
+        // float gate/up pairs are loadable but only servable by the
+        // non-fused path's separate-matmul fallback.
         let has_fused_shared_kernel = has_shared && {
             let down_quant = moe_meta.expert_down_quant;
             let se_down_quant = meta.shared_expert_down_quant.unwrap_or(QuantScheme::F32);
+            let se_gate_quant = meta.shared_expert_gate_quant.unwrap_or(QuantScheme::F32);
+            let gate_fusable = matches!(se_gate_quant, QuantScheme::Q8_0 | QuantScheme::Q4_0);
             let fused_avail = match (down_quant, se_down_quant) {
                 (QuantScheme::Q8_0, QuantScheme::Q8_0) => {
                     pipelines.moe_batched_down_accum_shared_q8_0.is_some()
@@ -1342,6 +1373,7 @@ impl MetalF32Backend {
                 _ => false,
             };
             fused_avail
+                && gate_fusable
                 && s.moe_shared_down_offsets
                     .get(layer_idx)
                     .and_then(|o| o.as_ref())
@@ -1395,9 +1427,9 @@ impl MetalF32Backend {
                 // here: this single-encoder path binds the up projection at
                 // buffer(5), which the plain matvec shaders do not declare —
                 // dispatching one of those would silently drop the up
-                // projection and the SwiGLU. Load validation admits only
-                // Q8_0/Q4_0 shared-expert pairs, so the error arm is
-                // unreachable for any loadable LBC.
+                // projection and the SwiGLU. The selector above only routes
+                // Q8_0/Q4_0 gate quants here (float pairs take the
+                // non-fused path), so the error arm is unreachable.
                 let (se_ffn_tg, se_ffn_n_tg) = match gate_quant {
                     QuantScheme::Q8_0 => {
                         enc.set_pipeline_state(&pipelines.ffn_fused_gate_up_swiglu_q8_0_2sg);
@@ -1583,26 +1615,32 @@ impl MetalF32Backend {
                 );
             }
             _ => {
-                // F16/F32 fallback: gate matmul
-                let (fb_pso, fb_tg, fb_n_tg) = if gate_quant == QuantScheme::F16 {
-                    (
+                // F16/Bf16/F32 fallback: separate gate and up matmuls, then
+                // SwiGLU behind a barrier (this encoder may be concurrent).
+                let needs_dims = matches!(gate_quant, QuantScheme::F16 | QuantScheme::Bf16);
+                let (fb_pso, fb_tg, fb_n_tg) = match gate_quant {
+                    QuantScheme::F16 => (
                         &pipelines.matmul_f16_deferred_nr2,
                         128u64,
                         ((se_inter as u64) + 1) / 2,
-                    )
-                } else {
-                    (
+                    ),
+                    QuantScheme::Bf16 => (
+                        &pipelines.matmul_bf16_deferred_nr2,
+                        128u64,
+                        ((se_inter as u64) + 1) / 2,
+                    ),
+                    _ => (
                         &pipelines.matmul_bytes_f32,
                         s.matmul_tg_size,
                         se_inter as u64,
-                    )
+                    ),
                 };
                 enc.set_pipeline_state(fb_pso);
                 enc.set_buffer(layer_buf, gate_off, 0);
                 enc.set_buffer(&s.normed_buf, 0, 1);
                 enc.set_buffer(se_gate_buf, 0, 2);
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
-                if gate_quant == QuantScheme::F16 {
+                if needs_dims {
                     enc.set_bytes(&(se_inter as u32).to_le_bytes(), 4);
                 }
                 enc.dispatch_threadgroups(MTLSize::new(fb_n_tg, 1, 1), MTLSize::new(fb_tg, 1, 1));
@@ -1610,6 +1648,8 @@ impl MetalF32Backend {
                 enc.set_buffer(layer_buf, up_off, 0);
                 enc.set_buffer(se_down_buf, 0, 2);
                 enc.dispatch_threadgroups(MTLSize::new(fb_n_tg, 1, 1), MTLSize::new(fb_tg, 1, 1));
+                // Barrier: gate/up matmuls write the buffers SwiGLU reads.
+                enc.memory_barrier_with_scope(1);
                 // SwiGLU
                 enc.set_pipeline_state(&pipelines.swiglu);
                 enc.set_buffer(se_gate_buf, 0, 0);

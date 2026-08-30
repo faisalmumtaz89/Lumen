@@ -974,7 +974,10 @@ pub(crate) struct MetalScratch {
     pub(crate) shared_expert_inter_dim: usize,
     /// Scratch buffer for shared expert fused gate+up output: [shared_expert_inter_dim] f32.
     pub(crate) shared_expert_gate_buf: Option<MetalBuffer>,
-    /// Scratch buffer for shared expert down projection output: [hidden_dim] f32.
+    /// Scratch buffer for shared expert down projection output:
+    /// [max(hidden_dim, shared_expert_inter_dim)] f32 — the float gate/up
+    /// fallback stages its up-projection intermediate here before the down
+    /// projection overwrites it with [hidden_dim].
     pub(crate) shared_expert_down_buf: Option<MetalBuffer>,
     /// Scratch buffer for attention output gate logits: [hidden_dim] f32.
     pub(crate) attn_gate_buf: Option<MetalBuffer>,

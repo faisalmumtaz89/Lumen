@@ -965,6 +965,11 @@ impl MetalF32Backend {
                 enc.set_bytes(&(hidden_dim as u32).to_le_bytes(), 3);
                 enc.set_bytes(&eps.to_le_bytes(), 4);
                 enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(norm_tg_size, 1, 1));
+                // This route runs inside the concurrent projection cluster:
+                // nothing else orders the RMSNorm write against the QKV
+                // matvec below (and the F32 attn_gate fallback later in the
+                // cluster), both of which read normed_buf.
+                enc.memory_barrier_with_resources(&[&s.normed_buf]);
                 let tg = match meta.wq_quant {
                     QuantScheme::Q4_0 => {
                         enc.set_pipeline_state(&pipelines.dequant_matmul_q4_0_deferred_nr2);
