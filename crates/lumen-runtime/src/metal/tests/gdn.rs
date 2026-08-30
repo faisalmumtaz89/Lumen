@@ -1217,3 +1217,57 @@ fn ensure_gdn_layer_state_is_lazy_and_idempotent() {
         "state pushed on failure"
     );
 }
+
+/// A GDN model must survive batched prefill WITHOUT a GPU-resident preload:
+/// the lazy allocator is wired into that path, and losing the wiring brings
+/// back the unallocated-state panic this test exists to catch.
+#[test]
+fn gdn_prefill_without_preload_does_not_panic() {
+    use crate::compute::ComputeBackend;
+    use crate::weight::provider_sync::SyncWeightProvider;
+    use lumen_format::test_model::{generate_test_model_q8_0_gdn, TestModelQ8Config};
+
+    let data = generate_test_model_q8_0_gdn(&TestModelQ8Config::default());
+    let dir = std::env::temp_dir().join(format!("lumen_gdn_prefill_wiring_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("gdn.lbc");
+    std::fs::write(&path, &data).unwrap();
+
+    let provider = SyncWeightProvider::open(&path).unwrap();
+    let hp = provider.lbc().header.hyperparams;
+    let mut backend = MetalF32Backend::new().unwrap();
+    backend.set_global_tensors(
+        provider.embedding.clone(),
+        provider.final_norm.clone(),
+        provider.output_proj.clone(),
+    );
+    backend.init(&hp).unwrap();
+
+    let mut kv = crate::kv::KvCache::new(crate::kv::KvCacheConfig {
+        max_seq_len: hp.max_seq_len as usize,
+        num_layers: hp.num_layers as usize,
+        num_kv_heads: hp.num_kv_heads as usize,
+        head_dim: hp.head_dim as usize,
+        precision: crate::kv::KvPrecision::F32,
+    })
+    .unwrap();
+
+    // No preload: the batched-prefill path must lazily allocate GDN state.
+    // Losing the allocator wiring surfaces as the "no gdn_layer_idx" error
+    // (the meta builder reads the unpopulated map), which the assertion
+    // below rejects; with the wiring intact, this fixture stops at a clean
+    // missing-attn_gate shape error (the generator emits no fused gate).
+    let result = backend.prefill(
+        &[1, 2, 3],
+        &provider as &dyn crate::weight::cache::WeightProvider,
+        &mut kv,
+    );
+    match result {
+        Ok(_) => {}
+        Err(e) => assert!(
+            e.to_string().contains("attn_gate_off"),
+            "unexpected streaming GDN prefill error: {e}"
+        ),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

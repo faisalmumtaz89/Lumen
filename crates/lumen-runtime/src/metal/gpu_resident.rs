@@ -73,6 +73,32 @@ pub(super) fn validate_layer_quants(
             st.w_gate.quant, st.w_up.quant
         )));
     }
+    // Full-attention layers WITHOUT per-head Q/K norms take the fused
+    // single-launch QKV path: one kernel selected on wq's quant reads all
+    // qkv_dim rows from wq's offset, so wq/wk/wv must share one quant scheme
+    // and be contiguous. (Layers with attn_q_norm use the Q+gate path, which
+    // projects K/V separately on their own quants and is exempt.)
+    if st.layer_type != Some(1) && st.attn_q_norm.is_none() && st.wk.length > 0 && st.wv.length > 0
+    {
+        if st.wk.quant != st.wq.quant || st.wv.quant != st.wq.quant {
+            return Err(RuntimeError::Compute(format!(
+                "layer {layer}: attn q/k/v quants differ ({:?}/{:?}/{:?}): \
+                 the Metal fused QKV launch reads all rows at wq's scheme. \
+                 Re-convert from a source GGUF with uniform Q/K/V \
+                 quantization (`--requant q8_0` also works for dense models).",
+                st.wq.quant, st.wk.quant, st.wv.quant
+            )));
+        }
+        let wq_end = st.wq.offset.checked_add(st.wq.length);
+        let wk_end = st.wk.offset.checked_add(st.wk.length);
+        if wq_end != Some(st.wk.offset) || wk_end != Some(st.wv.offset) {
+            return Err(RuntimeError::Compute(format!(
+                "layer {layer}: attn q/k/v tensors are not contiguous \
+                 (malformed LBC): the Metal fused QKV launch reads them as \
+                 one span. Re-convert with `lumen convert`."
+            )));
+        }
+    }
     // On GDN layers the decode path pairs attn_gate with the qkv
     // route: the Q8_0 qkv+gate 2-stream kernel (default-on) decodes
     // the gate as Q8_0 without consulting its quant, and the non-Q8
@@ -93,6 +119,50 @@ pub(super) fn validate_layer_quants(
                  uniformly).",
                 st.wq.quant, gate.quant
             )));
+        }
+    }
+    // On GDN layers an F32 attn_gate takes the decode fallback that reads
+    // `normed_buf`, which only the F32 QKV route writes — the fused
+    // Q4_0/F16/Bf16 QKV routes RMSNorm inline from `x_buf` and leave
+    // `normed_buf` stale, so gate-F32 next to a fused QKV route computes
+    // silently wrong output. (Q8_0 QKV + F32 gate is already rejected by
+    // the Q8 pairing rule above.)
+    if let (Some(1), Some(gate)) = (st.layer_type, st.attn_gate.as_ref()) {
+        if gate.length > 0 && gate.quant == QuantScheme::F32 && st.wq.quant != QuantScheme::F32 {
+            return Err(RuntimeError::Compute(format!(
+                "layer {layer}: attn_gate is F32 but attn_qkv is {:?}: the \
+                 Metal GDN decode F32-gate fallback reads the separate \
+                 RMSNorm buffer, which only the F32 QKV route populates. \
+                 Re-convert with `lumen convert --target metal` (it writes \
+                 the pair uniformly).",
+                st.wq.quant
+            )));
+        }
+    }
+    // The GDN prefill projections (attn_qkv in-projection, attn_gate,
+    // ssm_out) dispatch on Q8_0/Bf16/Q4_0 arms with a per-token F32
+    // fallback loop — there is no F16 arm, so F16 weight bytes would be
+    // read as f32, computing silently wrong prefill output (decode has
+    // F16 arms; a real run prefills first, so the config is broken
+    // end-to-end). Reject F16 on those tensors for GDN layers until the
+    // prefill kernels gain F16 coverage.
+    if st.layer_type == Some(1) {
+        let f16_checked = [
+            ("attn_qkv", Some(&st.wq)),
+            ("attn_gate", st.attn_gate.as_ref()),
+            ("ssm_out", st.ssm_out.as_ref()),
+        ];
+        for (name, slice) in f16_checked {
+            if let Some(sl) = slice {
+                if sl.length > 0 && sl.quant == QuantScheme::F16 {
+                    return Err(RuntimeError::Compute(format!(
+                        "layer {layer}: {name} is F16: the Metal GDN prefill \
+                         projections have no F16 kernel arm and would read \
+                         the bytes as F32. Re-convert with `--quant bf16` \
+                         or a quantized target (Q8_0/Q4_0)."
+                    )));
+                }
+            }
         }
     }
     // The GDN gate pipelines (decode and prefill) decode ssm_alpha/ssm_beta
@@ -205,10 +275,10 @@ pub(super) fn validate_layer_quants(
     }
     // The shared-expert FFN dispatch selects on the gate's quant alone and
     // binds up_off regardless (CachedMoeMeta carries no shared-expert up
-    // quant), and only the Q8_0/Q4_0/Q4_1 arms select genuinely fused
-    // gate+up+SwiGLU shaders — the F16/Bf16/F32 arms select plain matmuls
-    // whose parameter lists end before the up-projection binding, silently
-    // dropping up and SwiGLU.
+    // quant): the Q8_0/Q4_0 arms select fused gate+up+SwiGLU shaders, and
+    // the F16/Bf16/F32 arms take the separate gate/up matmul + barrier +
+    // SwiGLU fallback. Both require the gate/up pair to share the quant the
+    // dispatch selected; down projects independently on its own quant.
     let shexp_present = [
         st.shared_expert_gate.as_ref(),
         st.shared_expert_up.as_ref(),
@@ -235,12 +305,22 @@ pub(super) fn validate_layer_quants(
                     gate.quant, up.quant
                 )));
             }
-            if !matches!(gate.quant, QuantScheme::Q8_0 | QuantScheme::Q4_0) {
+            // The down projection dispatches independently on its own
+            // quant (it has arms for every servable scheme), so only the
+            // gate/up pair is constrained: uniform, and on a scheme the
+            // fused kernels or the float fallback serve.
+            if !matches!(
+                gate.quant,
+                QuantScheme::Q8_0
+                    | QuantScheme::Q4_0
+                    | QuantScheme::F16
+                    | QuantScheme::Bf16
+                    | QuantScheme::F32
+            ) {
                 return Err(RuntimeError::Compute(format!(
                     "layer {layer}: shared-expert gate/up is {:?}: the Metal \
-                     shared-expert FFN has fused kernels only for Q8_0/Q4_0 \
-                     (its Q4_1 arm is unreachable — the layer-tensor \
-                     allowlist rejects Q4_1 upstream). Re-convert with \
+                     shared-expert FFN serves Q8_0/Q4_0 (fused) and \
+                     F16/Bf16/F32 (separate matmuls). Re-convert with \
                      `lumen convert --target metal` (it quantizes the \
                      shared-expert tensors).",
                     gate.quant
@@ -254,6 +334,16 @@ pub(super) fn validate_layer_quants(
     // The F32-weight fallback applies each bias independently, so partial
     // sets are valid with F32 projections.
     let bias_present = [st.bq.is_some(), st.bk.is_some(), st.bv.is_some()];
+    // The Q+gate attention path (layers with per-head Q/K norms) has no bias
+    // handling at all — a bias there would be silently ignored, not dropped
+    // partially.
+    if bias_present.iter().any(|&p| p) && st.layer_type != Some(1) && st.attn_q_norm.is_some() {
+        return Err(RuntimeError::Compute(format!(
+            "layer {layer}: QKV biases are present on a Q+gate attention \
+             layer, which does not apply biases. Re-convert from a source \
+             GGUF without attention biases."
+        )));
+    }
     let qkv_all_f32 = st.wq.quant == QuantScheme::F32
         && st.wk.quant == QuantScheme::F32
         && st.wv.quant == QuantScheme::F32;
@@ -886,12 +976,18 @@ impl MetalF32Backend {
                                 "Failed to allocate shared_expert_gate_buf".into(),
                             )
                         })?);
-                    s.shared_expert_down_buf =
-                        Some(self.device.new_buffer(hidden * 4).ok_or_else(|| {
-                            RuntimeError::Compute(
-                                "Failed to allocate shared_expert_down_buf".into(),
-                            )
-                        })?);
+                    // The float gate/up fallback stages the up projection
+                    // (se_inter floats) in this buffer before the down
+                    // projection overwrites it with hidden floats.
+                    s.shared_expert_down_buf = Some(
+                        self.device
+                            .new_buffer(hidden.max(se_inter) * 4)
+                            .ok_or_else(|| {
+                                RuntimeError::Compute(
+                                    "Failed to allocate shared_expert_down_buf".into(),
+                                )
+                            })?,
+                    );
                 }
 
                 // Partial RoPE: Qwen3.5 uses partial_rotary_factor=0.25,
@@ -1170,10 +1266,12 @@ impl MetalF32Backend {
         }
 
         // ====================================================================
-        // Runtime Q8_0 hot-weight repack (env-gated, default OFF).
+        // Runtime Q8_0 hot-weight repack (env-gated; default ON for dense
+        // models under Metal defaults, OFF for MoE — see
+        // `graph_reorder::q8_repacked_enabled`).
         // ====================================================================
         //
-        // When `LUMEN_METAL_Q8_REPACKED=1`, allocate extra Metal buffers
+        // When repack is enabled, allocate extra Metal buffers
         // containing the FFN-down weights and the gate+up pair in a stripe
         // SoA layout (see `metal/repack_q8.rs`). The packed kernels in
         // `shaders/gemm_q8_0.msl` (`*_packed`) consume these. The original
@@ -1185,7 +1283,7 @@ impl MetalF32Backend {
         //
         // Across 32 layers: ~1.6 GB FFN-down + ~3.2 GB gate+up =  ~4.8 GB
         // additional VRAM. M3 Ultra 96 GB headroom comfortably accomodates
-        // this; for smaller machines, the env gate keeps it off by default.
+        // this; smaller machines can opt out with `LUMEN_METAL_Q8_REPACKED=0`.
         {
             use super::graph_reorder as gr;
             let want_repack = gr::q8_repacked_enabled();
@@ -2414,11 +2512,19 @@ mod tests {
         }
     }
 
+    fn at(offset: u64, quant: QuantScheme) -> TensorSlice {
+        TensorSlice {
+            offset,
+            length: 1024,
+            quant,
+        }
+    }
+
     fn gdn_layer(gates: QuantScheme) -> SubtensorOffsets {
         SubtensorOffsets {
-            wq: slice(QuantScheme::Q8_0),
-            wk: slice(QuantScheme::Q8_0),
-            wv: slice(QuantScheme::Q8_0),
+            wq: at(0, QuantScheme::Q8_0),
+            wk: at(1024, QuantScheme::Q8_0),
+            wv: at(2048, QuantScheme::Q8_0),
             wo: slice(QuantScheme::Q8_0),
             bq: None,
             bk: None,
@@ -2482,6 +2588,104 @@ mod tests {
     }
 
     #[test]
+    fn fused_qkv_launch_requires_uniform_contiguous() {
+        // Full attention without per-head Q/K norms takes the single-launch
+        // path: mixed quants rejected, gaps rejected, uniform+contiguous ok,
+        // and layers WITH attn_q_norm (Q+gate path) are exempt.
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.layer_type = Some(0);
+        st.attn_gate = None;
+        st.ssm_alpha = None;
+        st.ssm_beta = None;
+        assert!(validate_layer_quants(0, &st).is_ok());
+        let mut mixed = st.clone();
+        mixed.wk = at(1024, QuantScheme::Q4_0);
+        let err = validate_layer_quants(0, &mixed).unwrap_err();
+        assert!(err.to_string().contains("q/k/v quants differ"), "{err}");
+        let mut mixed_v = st.clone();
+        mixed_v.wv = at(2048, QuantScheme::Q4_0);
+        let err = validate_layer_quants(0, &mixed_v).unwrap_err();
+        assert!(err.to_string().contains("q/k/v quants differ"), "{err}");
+        let mut gap = st.clone();
+        gap.wv = at(4096, QuantScheme::Q8_0);
+        let err = validate_layer_quants(0, &gap).unwrap_err();
+        assert!(err.to_string().contains("not contiguous"), "{err}");
+        let mut gap_k = st.clone();
+        gap_k.wk = at(1536, QuantScheme::Q8_0);
+        gap_k.wv = at(2560, QuantScheme::Q8_0);
+        let err = validate_layer_quants(0, &gap_k).unwrap_err();
+        assert!(err.to_string().contains("not contiguous"), "{err}");
+        let mut with_norms = mixed;
+        with_norms.attn_q_norm = Some(slice(QuantScheme::F32));
+        with_norms.attn_k_norm = Some(slice(QuantScheme::F32));
+        assert!(validate_layer_quants(0, &with_norms).is_ok());
+    }
+
+    #[test]
+    fn gdn_f16_prefill_tensors_rejected() {
+        // GDN prefill has no F16 arm on attn_qkv/attn_gate/ssm_out; the
+        // guard must reject F16 there and admit Bf16 (which has arms).
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.wq = at(0, QuantScheme::F16);
+        st.attn_gate = Some(slice(QuantScheme::F16));
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("attn_qkv is F16"), "{err}");
+
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.ssm_out = Some(slice(QuantScheme::F16));
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("ssm_out is F16"), "{err}");
+
+        // attn_gate alone F16 (wq stays Q8_0): isolates the gate entry.
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.attn_gate = Some(slice(QuantScheme::F16));
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("attn_gate is F16"), "{err}");
+
+        // Bf16 on the same tensors loads (prefill has Bf16 arms).
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.wq = at(0, QuantScheme::Bf16);
+        st.attn_gate = Some(slice(QuantScheme::Bf16));
+        st.ssm_out = Some(slice(QuantScheme::Bf16));
+        assert!(validate_layer_quants(0, &st).is_ok());
+
+        // Full-attention layers are exempt: F16 wq with per-head norms
+        // takes the Q+gate path, not the GDN prefill projections.
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.layer_type = Some(0);
+        st.attn_gate = None;
+        st.ssm_alpha = None;
+        st.ssm_beta = None;
+        st.wq = at(0, QuantScheme::F16);
+        st.wk = at(1024, QuantScheme::F16);
+        st.wv = at(2048, QuantScheme::F16);
+        assert!(validate_layer_quants(0, &st).is_ok());
+    }
+
+    #[test]
+    fn gdn_f32_gate_requires_f32_qkv() {
+        // The decode F32-gate fallback reads normed_buf, which only the
+        // F32 QKV route writes; fused Q4_0/F16/Bf16 QKV routes leave it
+        // stale. F32/F32 (dequantized models) stays loadable.
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.wq = at(0, QuantScheme::Q4_0);
+        st.attn_gate = Some(slice(QuantScheme::F32));
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("attn_gate is F32"), "{err}");
+
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.wq = at(0, QuantScheme::Bf16);
+        st.attn_gate = Some(slice(QuantScheme::F32));
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("attn_gate is F32"), "{err}");
+
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.wq = at(0, QuantScheme::F32);
+        st.attn_gate = Some(slice(QuantScheme::F32));
+        assert!(validate_layer_quants(0, &st).is_ok());
+    }
+
+    #[test]
     fn full_attention_gate_split_exempt() {
         let mut st = gdn_layer(QuantScheme::Q8_0);
         st.layer_type = Some(0);
@@ -2524,10 +2728,16 @@ mod tests {
         assert!(validate_layer_quants(0, &st).is_ok());
         st.shared_expert_up = Some(slice(QuantScheme::Q8_0));
         assert!(validate_layer_quants(0, &st).is_err());
+        // A uniform float gate/up pair is served by the separate-matmul
+        // fallback regardless of the down scheme (down dispatches on its
+        // own quant).
         st.shared_expert_gate = Some(slice(QuantScheme::F16));
         st.shared_expert_up = Some(slice(QuantScheme::F16));
-        let err = validate_layer_quants(0, &st).unwrap_err();
-        assert!(err.to_string().contains("fused kernels only"), "{err}");
+        assert!(validate_layer_quants(0, &st).is_ok());
+        st.shared_expert_gate = Some(slice(QuantScheme::Bf16));
+        st.shared_expert_up = Some(slice(QuantScheme::Bf16));
+        st.shared_expert_down = Some(slice(QuantScheme::F32));
+        assert!(validate_layer_quants(0, &st).is_ok());
     }
 
     #[test]
@@ -2619,6 +2829,22 @@ mod tests {
     }
 
     #[test]
+    fn bias_on_qgate_layer_rejected() {
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.layer_type = Some(0);
+        st.attn_gate = None;
+        st.ssm_alpha = None;
+        st.ssm_beta = None;
+        st.attn_q_norm = Some(slice(QuantScheme::F32));
+        st.attn_k_norm = Some(slice(QuantScheme::F32));
+        st.bq = Some(slice(QuantScheme::F32));
+        st.bk = Some(slice(QuantScheme::F32));
+        st.bv = Some(slice(QuantScheme::F32));
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("Q+gate attention"), "{err}");
+    }
+
+    #[test]
     fn partial_bias_set_rejected() {
         let mut st = gdn_layer(QuantScheme::Q8_0);
         st.layer_type = Some(0);
@@ -2631,9 +2857,9 @@ mod tests {
         // Partial sets are valid when the projections are F32: the F32
         // fallback applies each bias independently.
         let mut f32_st = st.clone();
-        f32_st.wq = slice(QuantScheme::F32);
-        f32_st.wk = slice(QuantScheme::F32);
-        f32_st.wv = slice(QuantScheme::F32);
+        f32_st.wq = at(0, QuantScheme::F32);
+        f32_st.wk = at(1024, QuantScheme::F32);
+        f32_st.wv = at(2048, QuantScheme::F32);
         f32_st.w_gate = slice(QuantScheme::F32);
         f32_st.w_up = slice(QuantScheme::F32);
         f32_st.w_down = slice(QuantScheme::F32);

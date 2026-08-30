@@ -42,12 +42,64 @@ impl ComputeBackend for MetalF32Backend {
         self.pipelines = Some(pipelines);
 
         // Upload global tensors to GPU
+        // The embed/head shaders compute element and byte offsets in 32-bit
+        // (`token_id * hidden_dim + gid`, `block_idx * block_bytes`), so
+        // every accessed index and byte offset must fit u32: counts and
+        // lengths up to 2^32 are fine (max index 2^32-1), beyond wraps.
+        // The raw length must also match the scheme's packed size exactly —
+        // a truncated blob would send the shaders past the buffer.
+        let n_global = hyperparams.vocab_size as usize * hyperparams.hidden_dim as usize;
+        let validate_raw_global =
+            |raw_len: usize, quant: QuantScheme, name: &str| -> Result<(), RuntimeError> {
+                if n_global > 1usize << 32 || raw_len > 1usize << 32 {
+                    return Err(RuntimeError::Compute(format!(
+                        "{name} of {n_global} elements / {raw_len} bytes exceeds \
+                     the 32-bit indexing the Metal kernels use (malformed \
+                     hyperparams)"
+                    )));
+                }
+                let expected = match quant {
+                    QuantScheme::Q8_0 => {
+                        if n_global % 32 != 0 {
+                            return Err(RuntimeError::Compute(format!(
+                                "{name} of {n_global} elements is not a multiple \
+                             of the 32-element Q8_0 block (malformed \
+                             hyperparams)"
+                            )));
+                        }
+                        Some(n_global / 32 * 34)
+                    }
+                    QuantScheme::Q4_0 => {
+                        if n_global % 32 != 0 {
+                            return Err(RuntimeError::Compute(format!(
+                                "{name} of {n_global} elements is not a multiple \
+                             of the 32-element Q4_0 block (malformed \
+                             hyperparams)"
+                            )));
+                        }
+                        Some(n_global / 32 * 18)
+                    }
+                    QuantScheme::F16 | QuantScheme::Bf16 => Some(n_global * 2),
+                    _ => None,
+                };
+                if let Some(expected) = expected {
+                    if raw_len != expected {
+                        return Err(RuntimeError::Compute(format!(
+                            "{name} raw is {raw_len} bytes but {quant:?} \
+                         [{} x {}] requires {expected}",
+                            hyperparams.vocab_size, hyperparams.hidden_dim
+                        )));
+                    }
+                }
+                Ok(())
+            };
         // Upload embedding: use raw quantized bytes if available, else F32
         if let Some(ref raw) = self.embedding_raw {
             if matches!(
                 self.embedding_quant,
                 QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
             ) {
+                validate_raw_global(raw.len(), self.embedding_quant, "embedding")?;
                 self.embedding_buf =
                     Some(self.device.new_buffer_with_bytes(raw).ok_or_else(|| {
                         RuntimeError::Compute("Failed to create quantized embedding buffer".into())
@@ -90,6 +142,25 @@ impl ComputeBackend for MetalF32Backend {
                 self.output_proj_quant,
                 QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
             ) {
+                validate_raw_global(raw.len(), self.output_proj_quant, "output_proj")?;
+                // The head matvec kernels stride rows by
+                // `blocks_per_row = hidden_dim / 32`, so the row width
+                // itself must be block-aligned — a flattened-aligned but
+                // row-misaligned head (e.g. hidden=48) would misindex
+                // every row past the first (same closer as CUDA's
+                // `validate_output_head_row_alignment`).
+                if matches!(
+                    self.output_proj_quant,
+                    QuantScheme::Q8_0 | QuantScheme::Q4_0
+                ) && hyperparams.hidden_dim % 32 != 0
+                {
+                    return Err(RuntimeError::Compute(format!(
+                        "output_proj is {:?} but hidden_dim {} is not a \
+                         multiple of the 32-element block row layout the \
+                         Metal head kernels require (malformed hyperparams)",
+                        self.output_proj_quant, hyperparams.hidden_dim
+                    )));
+                }
                 self.output_proj_buf =
                     Some(self.device.new_buffer_with_bytes(raw).ok_or_else(|| {
                         RuntimeError::Compute("Failed to create Q8_0 output_proj buffer".into())
