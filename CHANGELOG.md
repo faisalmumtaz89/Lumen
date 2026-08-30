@@ -7,6 +7,57 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-08-30
+
+### Fixed
+
+- **The single-launch fused QKV path is guarded at load** (Metal): full
+  attention layers without per-head Q/K norms dispatch one uniform-width
+  kernel over wq/wk/wv, which requires uniform quantization and
+  byte-contiguity — a converted model violating either would previously
+  load and generate silently wrong output. That the unguarded path is
+  reachable at all was reproduced: a `qwen35`-declared GGUF omitting
+  `attn_q_norm` converts cleanly onto it. The loader now rejects such
+  layouts with a reconversion remedy.
+- **Float shared experts are served correctly end-to-end** (Metal): the
+  load guard now admits gate/up pairs uniform in {Q8_0, Q4_0, F16, Bf16,
+  F32} with the down projection independent — matching what the kernels
+  dispatch — instead of over-rejecting float trios; the fused fallback
+  gained its missing Bf16 arm and a memory barrier before SwiGLU
+  (numerics checked against a CPU reference; the test encodes on a
+  concurrent compute encoder so the barrier is load-bearing there); the
+  single-encoder MoE selector routes float gate/up pairs to the non-fused
+  fallback instead of an error arm; the raw encoder's float-gate fallback
+  gained the full down-quant dispatch (Q8_0/Q4_0 down weights were
+  previously read as raw f32 bytes); and the shared-expert down scratch
+  buffer is sized `max(hidden_dim, shared_expert_inter_dim)` so the float
+  fallback's gate/up intermediate cannot overrun it.
+- **GDN load validation closes two silent-corruption classes** (Metal):
+  F16 weights on the GDN prefill projections (attn_qkv, attn_gate,
+  ssm_out) — which have no F16 kernel arm and were read as f32 — are
+  rejected at load, as is an F32 attn_gate next to a non-F32 QKV route
+  (the F32-gate decode fallback reads a normalization buffer only the F32
+  QKV route writes). The F32 QKV route itself gained the memory barrier
+  its concurrent projection cluster was missing.
+- **Output-head raw weights are validated per row, not just in total**
+  (both backends): the head matvec kernels lay quantization blocks out per
+  row, so `hidden_dim` itself must be block-aligned — a total-aligned but
+  row-misaligned head previously uploaded cleanly and misindexed every row
+  past the first. CUDA additionally validates this for Q6_K heads.
+- **Global tensors are capped to the kernels' 32-bit indexing** (both
+  backends): embedding and output-head kernels compute element and byte
+  offsets in 32-bit; element counts or packed byte lengths past 2^32 are
+  now rejected at load instead of wrapping. Metal additionally validates
+  raw globals against the scheme's exact packed length (CUDA already did).
+- **CUDA per-layer slice validation runs before any GPU work**: the
+  zero-length checks are hoisted above MoE metadata table construction at
+  preload; the output head and embedding raw-length validation rejects
+  non-block-multiple element counts with checked arithmetic.
+- **Session temp files are process-unique**: five session/provider staging
+  paths gained `std::process::id()` suffixes, so concurrent processes no
+  longer clobber each other's session staging files (model-download
+  staging still uses fixed names; tracked separately).
+
 ## [0.17.0] — 2026-08-29
 
 ### Fixed
