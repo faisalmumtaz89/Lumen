@@ -761,7 +761,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "lumen-bench"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "lumen-format",
  "lumen-runtime",
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-cli"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "dirs",
  "fancy-regex",
@@ -790,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-convert"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "lumen-format",
  "serde_json",
@@ -798,14 +798,14 @@ dependencies = [
 
 [[package]]
 name = "lumen-format"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "lumen-runtime"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "cudarc",
  "libc",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-server"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "axum",
  "bytes",
