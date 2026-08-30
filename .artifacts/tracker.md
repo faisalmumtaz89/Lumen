@@ -148,19 +148,62 @@ item; close with the shipping release.
   has zero production call sites, so it is no mitigation today. Guard
   needs dims plumbed into `build_moe_meta` — do with the next CUDA MoE
   change.
-- **QKV-SHAPE · fused-QKV shape-assumption class not fully closed** — the
-  new Metal guard closes the quant/contiguity instance, not the class.
-  Remaining members: (a) no row-count validation — the closer is asserting
-  wq rows == q_dim (or 2*q_dim when `attn_q_norm` is present) and wk/wv ==
-  kv_dim, derived from slice length / bytes-per-row; blocked in
-  `create_layer_buffer` by the scratch-buffer lock already being held
-  (naive re-lock deadlocks — needs the dims passed in, not re-derived);
-  (b) CUDA sibling predicate `has_qgate_fusion = lw.attn_q_norm.is_some()`
-  (`cuda/backend_impl.rs:~2258`) has no equivalent guard; (c) Metal
-  option-A fused QKV (`metal/moe.rs:2554`) gates only on
-  `gdn_layer_idx.is_none()`; (d) the converter still emits
-  guard-rejected layouts silently — a convert-time check would fail fast.
-  Do as one change with dims plumbed through.
+- **QKV-SHAPE · instance closed (round 7); class members remain** — row-count validation now
+  enforced at load on BOTH backends: Metal `validate_attention_dims`
+  (wq == q_dim / 2*q_dim by `attn_q_norm` presence / declared-GDN
+  in-projection rows; wk/wv == kv_dim on full attention, empty on GDN;
+  dims passed lock-free via `cached_attn_dims`, honoring the deadlock
+  constraint) at all three load paths; CUDA `validate_projection_geometry`
+  in `upload_projection_tensor` with presence-aware allowed row counts,
+  covering Q5_0 and all five K-quants (which reach CUDA verbatim under
+  `--target cuda`) with non-block-multiple widths failing closed, plus
+  `validate_mandatory_presence` closing zero-length suppression for wq,
+  full-attention wk/wv/wo, and the dense FFN trio (MoE = router AND
+  non-empty experts; half-declared MoE is rejected).
+  GDN expectations use declared header dims when present, else the
+  documented QWEN35_9B compatibility default — the same default the
+  kernels dispatch on, so headerless 9B-era artifacts still load; a
+  defaulted mismatch fails with observed-vs-expected plus a NOTE naming
+  the missing `ssm.*` keys. Canonical repro artifacts (uniform,
+  contiguous, fused-geometry wq; zero-length wk; both loaded silently on
+  v0.18.0) now rejected: `evidence-v0190/c2{b,c}.{gguf,lbc}` +
+  `gen_c2_variants.py`. Remaining class members, recorded honestly:
+  (a) converter still emits these layouts silently — convert-time
+  fail-fast is the round-7 Category-2 item; (b) Metal checks wq/wk/wv
+  only — wo and the dense FFN trio have no Metal geometry/presence check
+  (CUDA covers them; `gpu_resident.rs:~1828` even derives a qmv repack
+  row count FROM the buffer); (c) GDN dims are pinned only through their
+  SUM — {32,16,128} and {48,8,128} both give 8192 rows, and no ssm_*
+  tensor is cross-checked against `hp.gdn`; (d) non-CtInt4G32 `ssm_out`
+  has no CUDA geometry check; (e) byte-length checks are inherently blind
+  to transposition/permutation and to the F32-vs-2xF16 length collision —
+  not closable this way, stated as a limit; (f) no MoE artifact exists on
+  this machine, so Qwen3.5-MoE full-attention geometry is covered by
+  converter-source reasoning plus the CI Modal matrix, not a local
+  byte-level check. The old entry's member (c),
+  `metal/moe.rs:2554` option-A, is covered transitively (all its weight
+  paths pass a validated load point) and the route is documented dead
+  outside tests.
+- **N1 · CLOSED (round 7)** — `ffn_norm` zero-sentinel with
+  `attn_post_norm` absent produced a present zero-length norm buffer on
+  CUDA (`unwrap_or` fell back to the sentinel itself) and an offset-0 F32
+  misread on Metal (`map_or(0)`). Both loaders now reject the combination,
+  keyed on `attn_post_norm`'s absence — NEVER on the zero sentinel alone,
+  which is legitimate on every shipped GDN/MoE layer (the brick trap the
+  round-7 report warned about). Repro: `evidence-v0190/c2n1.{gguf,lbc}`
+  (loaded silently on v0.18.0; clean error now).
+- **Pre-existing lint (not CI-gated)** — `runtime_defaults.rs:1940` trips
+  clippy `items_after_test_module` under `--all-targets` (CI's gate,
+  `ci.yml:50`, does not use that flag). Out of round-7 scope; sweep when
+  touched.
+- **GDN test-model fixture was contract-violating** —
+  `generate_test_model_q8_0_gdn` wrote GDN layers with separate non-empty
+  wk/wv/wo and no declared GDN dims (so `gdn_dims()` silently defaulted
+  to 9B geometry). The round-7 loader validation caught it; the fixture's
+  ATTENTION geometry now mirrors the converter contract (fused wq, empty
+  wk/wv/wo, declared dims consistent with q_dim). Its ssm_* tensor sizes
+  remain hidden/head_dim-derived rather than GDN-dim-consistent, and it
+  still omits `attn_gate` — the pre-existing generator gap below.
 - **TEMP-PATH · fixed-name staging paths remain** — the PID fix covered
   the 5 session/provider sites only. The verified remaining production
   instance: `lumen-cli/download.rs:171` builds `{filename}.part` (and

@@ -298,9 +298,9 @@ fn build_gdn_layer(layer_idx: usize, hp: &ModelHyperparams) -> LayerView {
 // `GdnParams::from_hyperparams` and (b) include `attn_gate` — the decode
 // megakernel errors "attn_gate weight missing" otherwise. The format-guard
 // fixture `generate_test_model_q8_0_gdn` satisfies NEITHER (no `attn_gate`; its
-// ssm_* tensors are sized from hidden/head_dim, not the SSM dims; and `hp.gdn`
-// is `None` so `GdnParams` defaults to the Qwen3.5-9B dims). So we build a small,
-// self-consistent hybrid LBC here: `hp.gdn = Some({V=4,K=2,D=128,C=4})` with
+// ssm_* tensors are sized from hidden/head_dim, not the SSM dims — though its
+// attention geometry and declared `hp.gdn` are now converter-consistent). So we
+// build a small, self-consistent hybrid LBC here: `hp.gdn = Some({V=4,K=2,D=128,C=4})` with
 // layer 0 a full GDN layer (all ssm_* + attn_gate present) and layer 1 a standard
 // full-attention layer. All weights are F32 (`launch_matvec` has an F32 arm), so
 // preload uploads them natively and the decode GDN pipeline runs end-to-end.
