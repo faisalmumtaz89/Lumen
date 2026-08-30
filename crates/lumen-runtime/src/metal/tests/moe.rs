@@ -3507,3 +3507,347 @@ fn test_sigmoid_scale_add_correctness() {
         result[0]
     );
 }
+
+/// The shared-expert float fallback (separate gate/up matmuls + barrier +
+/// SwiGLU + down) must match a CPU reference for a Bf16 trio.
+#[test]
+fn shared_expert_fused_bf16_trio_matches_cpu() {
+    let backend = MetalF32Backend::new().unwrap();
+    let mut backend = backend;
+    let hp = test_hyperparams();
+    backend.init(&hp).unwrap();
+
+    let hidden = hp.hidden_dim as usize;
+    let se_inter = 16usize;
+    let bf16 = |v: f32| -> [u8; 2] { ((v.to_bits() >> 16) as u16).to_le_bytes() };
+
+    // Deterministic small weights and input.
+    let val = |i: usize| ((i * 7 + 3) % 11) as f32 / 11.0 - 0.4;
+    let gate_w: Vec<f32> = (0..se_inter * hidden).map(val).collect();
+    let up_w: Vec<f32> = (0..se_inter * hidden).map(|i| val(i + 1)).collect();
+    let down_w: Vec<f32> = (0..hidden * se_inter).map(|i| val(i + 2)).collect();
+    let x: Vec<f32> = (0..hidden).map(|i| val(i + 5)).collect();
+
+    // Bf16 truncation-of-f32 for both the GPU bytes and the CPU reference.
+    let trunc = |v: f32| f32::from_bits((v.to_bits() >> 16) << 16);
+    let mut blob: Vec<u8> = Vec::new();
+    let gate_off = 0u64;
+    for &v in &gate_w {
+        blob.extend_from_slice(&bf16(v));
+    }
+    let up_off = blob.len() as u64;
+    for &v in &up_w {
+        blob.extend_from_slice(&bf16(v));
+    }
+    let down_off = blob.len() as u64;
+    for &v in &down_w {
+        blob.extend_from_slice(&bf16(v));
+    }
+    let layer_buf = backend.device.new_buffer_with_bytes(&blob).unwrap();
+
+    {
+        let mut guard = backend.scratch.lock().unwrap();
+        let s = guard.as_mut().unwrap();
+        s.shared_expert_inter_dim = se_inter;
+        s.shared_expert_gate_buf = Some(backend.device.new_buffer(se_inter * 4).unwrap());
+        s.shared_expert_down_buf =
+            Some(backend.device.new_buffer(hidden.max(se_inter) * 4).unwrap());
+        s.normed_buf.write_f32(&x);
+    }
+
+    let guard = backend.scratch.lock().unwrap();
+    let s = guard.as_ref().unwrap();
+    let pipelines = backend.pipelines.as_ref().unwrap();
+    let cmd = backend.queue.new_command_buffer().unwrap();
+    // Concurrent encoder: the production MoE decode path encodes this
+    // function onto one, so the internal barrier (not encoder serialization)
+    // must order gate/up before SwiGLU for this test to pass.
+    let enc = cmd.new_concurrent_compute_encoder().unwrap();
+    MetalF32Backend::encode_shared_expert_ffn_decode_fused(
+        &enc,
+        pipelines,
+        s,
+        &layer_buf,
+        gate_off,
+        up_off,
+        down_off,
+        lumen_format::quantization::QuantScheme::Bf16,
+        lumen_format::quantization::QuantScheme::Bf16,
+        None,
+    )
+    .unwrap();
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let mut gpu_out = vec![0.0f32; hidden];
+    s.shared_expert_down_buf
+        .as_ref()
+        .unwrap()
+        .read_f32(&mut gpu_out);
+
+    // CPU reference with the same bf16-truncated weights.
+    let dot = |w: &[f32], row: usize, x: &[f32]| -> f32 {
+        (0..hidden).map(|d| trunc(w[row * hidden + d]) * x[d]).sum()
+    };
+    let mut swiglu = vec![0.0f32; se_inter];
+    for r in 0..se_inter {
+        let g = dot(&gate_w, r, &x);
+        let u = dot(&up_w, r, &x);
+        swiglu[r] = (g / (1.0 + (-g).exp())) * u;
+    }
+    for r in 0..hidden {
+        let expect: f32 = (0..se_inter)
+            .map(|k| trunc(down_w[r * se_inter + k]) * swiglu[k])
+            .sum();
+        let got = gpu_out[r];
+        assert!(
+            (got - expect).abs() < 1e-2 * expect.abs().max(1.0),
+            "row {r}: gpu {got} vs cpu {expect}"
+        );
+    }
+}
+
+#[test]
+fn moe_with_float_shared_gate_up_takes_nonfused_path() {
+    // Regression: the fused down+accum+shared selector keyed on down quants
+    // only, so a loadable routed-Q4 / shared-F16-gate+up / Q4-down layer
+    // selected the fused path and died on its "no fused gate+up kernel"
+    // error arm instead of reaching the non-fused fallback.
+    use crate::metal::types::{CachedLayerMeta, CachedMoeMeta};
+    use lumen_format::quantization::QuantScheme;
+
+    let mut backend = MetalF32Backend::new().unwrap();
+    let hp = test_hyperparams();
+    backend.init(&hp).unwrap();
+
+    let hidden = hp.hidden_dim as usize;
+    let inter = 32usize;
+    let se_inter = 32usize;
+    let top_k = 1usize;
+    let layer_buf = backend.device.new_buffer(1 << 16).unwrap();
+
+    {
+        let mut guard = backend.scratch.lock().unwrap();
+        let s = guard.as_mut().unwrap();
+        s.moe_expert_inter_dim = inter;
+        s.moe_num_active_experts = top_k;
+        s.moe_batched_swiglu_buf = Some(backend.device.new_buffer(top_k * inter * 4).unwrap());
+        s.shared_expert_inter_dim = se_inter;
+        s.shared_expert_gate_buf = Some(backend.device.new_buffer(se_inter * 4).unwrap());
+        s.shared_expert_down_buf =
+            Some(backend.device.new_buffer(hidden.max(se_inter) * 4).unwrap());
+        // Make every OTHER fused-selector condition true, so gate-quant
+        // fusability is the deciding factor.
+        s.moe_shared_gate_scalar_buf = Some(backend.device.new_buffer(4).unwrap());
+        s.moe_shared_down_offsets = vec![Some(
+            backend
+                .device
+                .new_buffer_with_bytes(&0u64.to_le_bytes())
+                .unwrap(),
+        )];
+    }
+
+    let moe_meta = CachedMoeMeta {
+        router_weight_off: 0,
+        expert_gate_offs: vec![0],
+        expert_up_offs: vec![0],
+        expert_down_offs: vec![0],
+        expert_gate_quant: QuantScheme::Q4_0,
+        expert_down_quant: QuantScheme::Q4_0,
+    };
+    let meta = CachedLayerMeta {
+        attn_norm_off: 0,
+        wq_off: 0,
+        wo_off: 0,
+        ffn_norm_off: 0,
+        w_gate_off: 0,
+        w_up_off: 0,
+        w_down_off: 0,
+        wq_quant: QuantScheme::Q4_0,
+        wo_quant: QuantScheme::Q4_0,
+        w_gate_quant: QuantScheme::Q4_0,
+        w_up_quant: QuantScheme::Q4_0,
+        w_down_quant: QuantScheme::Q4_0,
+        bq_off: None,
+        bk_off: None,
+        bv_off: None,
+        moe_meta: None,
+        shared_expert_gate_off: Some(0),
+        shared_expert_up_off: Some(8192),
+        shared_expert_down_off: Some(16384),
+        shared_expert_gate_quant: Some(QuantScheme::F16),
+        shared_expert_down_quant: Some(QuantScheme::Q4_0),
+        attn_gate_off: None,
+        attn_gate_quant: None,
+        attn_post_norm_off: None,
+        has_qgate_fusion: false,
+        wk_off: None,
+        wv_off: None,
+        wk_quant: None,
+        wv_quant: None,
+        attn_q_norm_off: None,
+        attn_k_norm_off: None,
+        ffn_gate_inp_shexp_off: None,
+        layer_type: None,
+        ssm_a_off: None,
+        ssm_conv1d_off: None,
+        ssm_dt_off: None,
+        ssm_beta_off: None,
+        ssm_alpha_off: None,
+        ssm_norm_off: None,
+        ssm_out_off: None,
+        ssm_out_quant: None,
+        gdn_layer_idx: None,
+    };
+
+    let ids_buf = backend
+        .device
+        .new_buffer_with_bytes(&0u32.to_le_bytes())
+        .unwrap();
+    let wts_buf = backend
+        .device
+        .new_buffer_with_bytes(&1.0f32.to_le_bytes())
+        .unwrap();
+    // Offset tables read by the batched shaders: two u64 (gate, up) per
+    // expert in the gate_up table, one u64 per expert in the down table.
+    // Initialized, full-width allocations — an uninitialized or undersized
+    // table is an invalid GPU fixture even when the offsets land on zeros.
+    let gu_offs: Vec<u8> = [0u64; 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let gu_off_buf = backend.device.new_buffer_with_bytes(&gu_offs).unwrap();
+    let dn_off_buf = backend
+        .device
+        .new_buffer_with_bytes(&0u64.to_le_bytes())
+        .unwrap();
+
+    let guard = backend.scratch.lock().unwrap();
+    let s = guard.as_ref().unwrap();
+    let pipelines = backend.pipelines.as_ref().unwrap();
+    // Precondition: the Q4/Q4 fused shared pipeline must exist, otherwise
+    // this test cannot discriminate the selector's gate-quant condition.
+    assert!(pipelines.moe_batched_down_accum_shared_q4_0.is_some());
+    let cmd = backend.queue.new_command_buffer().unwrap();
+    let enc = cmd.new_concurrent_compute_encoder().unwrap();
+    let result = MetalF32Backend::encode_moe_ffn_with_shared_fused(
+        &enc,
+        pipelines,
+        s,
+        &layer_buf,
+        0,
+        &moe_meta,
+        &meta,
+        &ids_buf,
+        &wts_buf,
+        &gu_off_buf,
+        &dn_off_buf,
+    );
+    enc.end_encoding();
+    result.unwrap();
+    cmd.commit();
+    cmd.wait_until_completed();
+}
+
+#[test]
+fn shared_expert_raw_float_gate_q4_down_matches_cpu() {
+    // Regression: the raw shared-expert encoder's float-gate fallback
+    // dispatched the down projection on an F16/Bf16-else-F32 match, so a
+    // loadable Bf16-gate/up + Q4_0-down trio read raw Q4_0 bytes as f32.
+    // The down dispatch now mirrors the fused variant's full quant coverage.
+    let mut backend = MetalF32Backend::new().unwrap();
+    let hp = test_hyperparams();
+    backend.init(&hp).unwrap();
+
+    let hidden = hp.hidden_dim as usize;
+    let se_inter = 32usize;
+    let bf16 = |v: f32| -> [u8; 2] { ((v.to_bits() >> 16) as u16).to_le_bytes() };
+    let trunc = |v: f32| f32::from_bits((v.to_bits() >> 16) << 16);
+    let val = |i: usize| ((i * 7 + 3) % 11) as f32 / 11.0 - 0.4;
+
+    let gate_w: Vec<f32> = (0..se_inter * hidden).map(val).collect();
+    let up_w: Vec<f32> = (0..se_inter * hidden).map(|i| val(i + 1)).collect();
+    let x: Vec<f32> = (0..hidden).map(|i| val(i + 5)).collect();
+
+    let mut blob: Vec<u8> = Vec::new();
+    let gate_off = 0u64;
+    for &v in &gate_w {
+        blob.extend_from_slice(&bf16(v));
+    }
+    let up_off = blob.len() as u64;
+    for &v in &up_w {
+        blob.extend_from_slice(&bf16(v));
+    }
+    // Q4_0 down: hidden rows x se_inter cols = one 18-byte block per row
+    // ([f16 scale][16 qs]; elems 0-15 low nibbles, 16-31 high nibbles;
+    // value = scale * (nibble - 8)). Scale 0.5 = f16 0x3800 exactly.
+    let down_off = blob.len() as u64;
+    let scale = 0.5f32;
+    let nib = |r: usize, k: usize| ((r * 5 + k * 3) % 16) as u8;
+    let mut down_dq = vec![0.0f32; hidden * se_inter];
+    for r in 0..hidden {
+        blob.extend_from_slice(&0x3800u16.to_le_bytes());
+        for b in 0..16 {
+            let lo = nib(r, b);
+            let hi = nib(r, b + 16);
+            blob.push(lo | (hi << 4));
+            down_dq[r * se_inter + b] = scale * (lo as i32 - 8) as f32;
+            down_dq[r * se_inter + b + 16] = scale * (hi as i32 - 8) as f32;
+        }
+    }
+    let layer_buf = backend.device.new_buffer_with_bytes(&blob).unwrap();
+
+    {
+        let mut guard = backend.scratch.lock().unwrap();
+        let s = guard.as_mut().unwrap();
+        s.shared_expert_inter_dim = se_inter;
+        s.shared_expert_gate_buf = Some(backend.device.new_buffer(se_inter * 4).unwrap());
+        s.shared_expert_down_buf =
+            Some(backend.device.new_buffer(hidden.max(se_inter) * 4).unwrap());
+        s.normed_buf.write_f32(&x);
+    }
+
+    let guard = backend.scratch.lock().unwrap();
+    let s = guard.as_ref().unwrap();
+    let pipelines = backend.pipelines.as_ref().unwrap();
+    let cmd = backend.queue.new_command_buffer().unwrap();
+    MetalF32Backend::encode_shared_expert_ffn_decode_raw(
+        &cmd,
+        pipelines,
+        s,
+        &layer_buf,
+        gate_off,
+        up_off,
+        down_off,
+        lumen_format::quantization::QuantScheme::Bf16,
+        lumen_format::quantization::QuantScheme::Q4_0,
+        None,
+    )
+    .unwrap();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let mut gpu_out = vec![0.0f32; hidden];
+    s.shared_expert_down_buf
+        .as_ref()
+        .unwrap()
+        .read_f32(&mut gpu_out);
+
+    let dot = |w: &[f32], row: usize| -> f32 {
+        (0..hidden).map(|d| trunc(w[row * hidden + d]) * x[d]).sum()
+    };
+    let mut swiglu = vec![0.0f32; se_inter];
+    for r in 0..se_inter {
+        let g = dot(&gate_w, r);
+        let u = dot(&up_w, r);
+        swiglu[r] = (g / (1.0 + (-g).exp())) * u;
+    }
+    for r in 0..hidden {
+        let expect: f32 = (0..se_inter)
+            .map(|k| down_dq[r * se_inter + k] * swiglu[k])
+            .sum();
+        let got = gpu_out[r];
+        assert!(
+            (got - expect).abs() < 1e-2 * expect.abs().max(1.0),
+            "row {r}: gpu {got} vs cpu {expect}"
+        );
+    }
+}

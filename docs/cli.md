@@ -31,7 +31,7 @@ The canonical, always-up-to-date reference is `lumen run --help` (printed by [`c
 | `--kv-disk-dir <path>` | Directory for disk-persistent KV cache |
 | `--kv-disk-space-mb <n>` | KV cache space budget on disk |
 | `--session-save <p>` / `--session-resume <p>` | Persist / restore a Session across runs (Metal today) |
-| `--no-gpu-resident` | Stream weights from disk instead of GPU memory |
+| `--no-gpu-resident` | Stream weights from disk instead of GPU memory (CUDA only: Metal decode requires resident weights) |
 | `--gpu-resident` | Force GPU-resident weights |
 | `--verbose` | Show diagnostics and metrics |
 | `--profile` | Per-operation timing breakdown (implies `--verbose`) |
