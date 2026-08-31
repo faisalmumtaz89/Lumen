@@ -510,8 +510,10 @@ mod inner {
                 }
                 continue;
             };
-            // Accept both `{pid}` (v0.20-era) and `{pid}-{nonce}` forms;
-            // liveness keys on the pid component only.
+            // Accept both the bare `{pid}` form (never emitted by any
+            // released binary — accepted defensively) and the
+            // `{pid}-{nonce}` form; liveness keys on the pid component
+            // only.
             let pid = pid.split('-').next().unwrap_or(pid);
             if pid.chars().all(|c| c.is_ascii_digit()) && !pid.is_empty() {
                 // Deletion rule, safe across users AND PID namespaces:

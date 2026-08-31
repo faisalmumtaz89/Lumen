@@ -43,7 +43,10 @@ item; close with the shipping release.
   run cannot *prove* the race absent — the barrier's necessity rests on
   the Metal ordering model, the test keeps it exercised);
   `shared_expert_down_buf` is now sized `hidden.max(se_inter)` floats so
-  the fallback's gate/up intermediate cannot overrun it. The load guard
+  the fallback's gate/up intermediate cannot overrun it — for shipped
+  MoE geometry (se_inter 512 < hidden 2048) this is byte-identical to
+  the previous `hidden * 4`; the resize guards non-shipped geometries
+  only. The load guard
   admits gate/up pairs uniform in {Q8_0, Q4_0, F16, Bf16, F32} with down
   independent — matching kernel truth — so the over-rejection of float
   shared experts is gone. The single-encoder MoE selector
@@ -95,8 +98,11 @@ item; close with the shipping release.
 - **EMBED-U32-CAP · CLOSED (guarded)** — the CUDA and Metal embed/head
   kernels compute element and byte offsets in 32-bit
   (`token_id * hidden_dim + gid`, `block_idx * block_bytes`), wrapping
-  past 2^32 with no loader cap. Both backends now reject globals whose
-  element count or byte length exceeds 2^32 (exact boundary: counts up
+  past 2^32 with no loader cap. Both backends now reject raw quantized
+  globals whose
+  element count or byte length exceeds 2^32 (the plain-F32 upload path
+  sits outside these functions and remains uncapped — see the
+  Verified-latent entry below) (exact boundary: counts up
   to 2^32 are fine, max index 2^32-1) — `raw_global_expected_len` on
   CUDA, `validate_raw_global` in Metal `init`, which now also checks the
   raw byte length equals the scheme's packed size (a truncated blob
@@ -197,12 +203,21 @@ item; close with the shipping release.
   per-sentence before any figure ships. The Metal 1.30× attribution is
   relabeled in docs/support.md (same GGUF, sequential per-engine runs —
   `benchmark/history/20260824T090000Z__v0.11.0-metal/board-lite.json`
-  records co_located: false on all 9 cells), and an evidence-policy
+  records co_located: false on all 9 engine comparisons across its 3
+  cells; its per-cell raw JSON carries lumen_version v0.11.0-dirty, a
+  provenance nit on an artifact whose numbers were re-derived
+  independently), and an evidence-policy
   note above the CUDA matrix covers both matrices (the Metal section
   carries a one-line pointer to it). NOTE: an earlier resolution doc
   claimed this ledger entry existed before it did — that false
   action-claim is part of the round-7 record and drove the
-  claim-classification discipline (code/artifact/action) now in force;
+  claim-classification discipline (code/artifact/action) now in force.
+  A second false action-claim from the same era is retracted here: the
+  v0.17.0 resolution's "hoisted above build_moe_meta" implied a
+  pre-existing call that was moved, but `validate_layer_slices` and
+  BOTH its call sites were new in d0960ce — nothing existed to hoist
+  (the v0.18.0 CHANGELOG bullet now carries a dated correction, and the
+  retained resolution doc an appended one);
   with both errata now written, both halves of the reviewer's R8
   refutation are closed.
 - **N1 · CLOSED (round 7)** — `ffn_norm` zero-sentinel with
@@ -338,9 +353,35 @@ item; close with the shipping release.
   microsecond-class TOCTOU — absolute closure needs serialized cleanup,
   deliberately out of scope; every misfire direction is
   keep-not-delete except that window, and it additionally requires a
-  same-pid-same-nonce name reuse.
+  same-pid-same-nonce name reuse. The guard's and the rename path's
+  (dev,ino) identity re-checks are reasoned, not tested: no guard-reuse
+  regression test exists (r7 review finding, accepted).
 
 ## Verified-latent (guard exists or path unreachable; do not fix unprompted)
+
+- **F32-GATE-STREAMING · mode-level over-reject, contained by F1** —
+  the GDN F32-gate load guard (GDN-GATE-F32 above) is backend-wide, but
+  the Metal serial streaming decoder always writes `normed_buf`, so the
+  F32-gate-next-to-fused-QKV combination it rejects would be valid
+  there. Streaming decode is unreachable while `caps()` hardcodes
+  gpu_resident=true (the caps() entry below), so no live impact; if
+  streaming ever becomes reachable, scope the guard to the resident
+  path. (Round-7 report §3 item 5, accepted as stated.)
+- **PROVIDER-SYNC-F32-FALLBACK** — `weight/provider_sync.rs:433-437`
+  (and the sibling `read_output_proj_global`) reinterpret any
+  unrecognized-format global buffer as F32 ("backward compat") instead
+  of erroring; a wrong-sized buffer is silently read as F32 data.
+  Round-7 report §4 A2(c) second half, accepted: unchanged since
+  v0.18.0, contained by the conversion-side scheme gating; a fail-closed
+  arm is the fix when touched.
+- **PLAIN-F32-GLOBAL-CAP** — the u32 element/byte caps cover the raw
+  quantized global paths only (EMBED-U32-CAP above); plain-F32 globals
+  upload via a separate path with no cap on either backend. Containment
+  is thinner than the raw paths' 1.6x margin: a dequantized 9B-scale
+  F32 global (248320 x 4096 x 4 = 4,068,474,880 bytes) sits ~5% below
+  the 2^32 byte boundary; a larger vocab at F32 would cross it with no
+  loader check on this path. Extending the cap to the F32 upload path
+  is the fix when touched. Round-7 report §4 A2(f), accepted as stated.
 
 - **C5b · Metal Q4_1 MoE expert kernels unreachable** — `named_slices()`
   covers experts and the layer-tensor allowlist rejects Q4_1, so the expert
