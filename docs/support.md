@@ -12,6 +12,23 @@ Benchmarked on an A100-80GB (27B-class BF16 cells on H100 — sm_80 routes BF16 
 
 **Status reflects functional verification** (correctness, robustness, and determinism gates), not decode-speed parity: a cell can be production-ready while decoding slower than llama.cpp on the same hardware — the ratio column carries the observed record. Cells below ~0.95× are open performance targets.
 
+> **Evidence policy (both matrices below):** ratios marked "retained
+> record" have measurement artifacts on disk that reproduce the digit; a
+> 2026-08-30 audit of 70 published ratio derivations found every
+> artifact-backed figure exact or rounded conservatively (zero rounded in
+> Lumen's favor). Rows WITHOUT a "retained" label state observed
+> historical measurements whose raw artifacts were not kept — the same
+> review separately counted roughly seventeen such ratios, out of about
+> twenty-six published, across both matrices; where a board does exist
+> for one of them it reads more favourably than the published figure
+> (stale-conservative, not slanted). Figures whose artifacts were found
+> wrong were withdrawn rather than restated. Three *previously* published
+> figures rounded toward Lumen (0.892, 0.727, 1.15 for true 0.891, 0.726,
+> 1.145); all three were corrected (0.891, 0.726) or withdrawn (1.15×) in
+> earlier rounds — which is why the seventy re-derived current rows
+> contain none — and the two retained files still carrying old digits now
+> bear dated errata.
+
 | Model | Quant | Status | × llama.cpp decode (canonical) | Notes |
 |-------|-------|--------|------:|---|
 | Qwen3.5-9B dense | Q8_0 | Production-ready | **0.970× llama.cpp** (retained co-located A100 record: 114.1 vs 117.6) | All robustness and correctness gates pass |
@@ -32,6 +49,8 @@ Benchmarked on an A100-80GB (27B-class BF16 cells on H100 — sm_80 routes BF16 
 
 Benchmarked on an M3 Ultra; see [`bench/RESULTS.md`](../bench/RESULTS.md) for the rig and full numbers.
 
+> The evidence policy stated above the CUDA matrix applies to this matrix as well.
+
 | Model | Quant | Status | Decode × llama.cpp | Prefill × llama.cpp | Notes |
 |-------|-------|--------|------:|------:|---|
 | Qwen3.5-9B dense | Q8_0 | Production-ready (default) | **0.98×** | 0.95× | Cleared 0.9× decode gate |
@@ -43,7 +62,7 @@ Benchmarked on an M3 Ultra; see [`bench/RESULTS.md`](../bench/RESULTS.md) for th
 | Qwen3.6-27B dense | Q4_0 | Production-ready | 0.99× | 0.82× | All quality gates pristine |
 | Qwen3.6-27B dense | BF16 | N/A on Metal | — | — | Same ~50 GiB capacity-margin arithmetic as the Qwen3.8-27B BF16 row below; validated on CUDA H100 instead |
 | Qwen3.8-27B dense | Q8_0 | Production-ready (functional) | withdrawn — under re-measurement (the 2026-08-14 1.15× predates a machine-level bimodal-speed finding; audited re-runs read below it and are quarantined until the trigger is isolated) | — | All quality gates pristine + DET-001 50/50 (2026-08-14, M3 Ultra; llama.cpp b10032, same GGUF); prefill row pending |
-| Qwen3.8-27B dense | Q4_0 | Production-ready | **1.30× (beats llama.cpp)** | — | All quality gates pristine + DET-001 50/50 (2026-08-14); prefill row pending |
+| Qwen3.8-27B dense | Q4_0 | Production-ready | **1.30× (beats llama.cpp)** | — | All quality gates pristine + DET-001 50/50 (2026-08-14); ratio from the 2026-08-24 board (40.17 vs 30.57 = 1.314, published conservatively): same GGUF, sequential per-engine runs on the strictly-serial M3 Ultra — not co-resident processes; prefill row pending |
 | Qwen3.8-27B dense | BF16 | N/A on Metal | — | — | ~50 GiB weights sit inside the capacity margin policy on the 96 GB test rig (same arithmetic as Qwen3.6-27B BF16); validated on CUDA H100 instead |
 
 ## What is not (yet) supported
