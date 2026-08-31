@@ -197,9 +197,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   raw-length validation rejects
   non-block-multiple element counts with checked arithmetic for the
   fixed-block-layout schemes it covers (Q8_0/Q4_0/F16/Bf16, plus Q6_K
-  heads); other schemes are not length-checked here — CUDA's direct
-  raw-buffer setters reject them, while on the ordinary provider path
-  they are never forwarded as raw (the provider reads them, with
+  heads); other schemes are not length-checked here — raw globals
+  handed over via the direct raw setters are rejected for unsupported
+  schemes during backend initialization, while on the ordinary provider
+  path they are never forwarded as raw (the provider reads them, with
   unknown formats reinterpreted as F32 — a tracked residual — and the
   backend uploads the resulting F32 copy).
 - **Session temp files are process-unique**: five session/provider staging
