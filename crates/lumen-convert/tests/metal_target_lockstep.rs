@@ -44,6 +44,15 @@ fn build_q5_model(moe: bool) -> Vec<u8> {
     b.add_u32(&k("context_length"), 64);
     b.add_f32(&k("rope.freq_base"), 10000.0);
     b.add_f32(&k("attention.layer_norm_rms_epsilon"), 1e-5);
+    // Declared GDN dims coherent with EVERY fixture tensor: v_dim =
+    // time_step_rank * state_size = 8*8 = 64 = HID (attn_gate / ssm_out /
+    // nh), and attn_qkv rows = (2*group_count + time_step_rank) *
+    // state_size = (4+8)*8 = 96. The post-planning contract gate
+    // (v0.20.0) validates both.
+    b.add_u32(&k("ssm.time_step_rank"), 8);
+    b.add_u32(&k("ssm.group_count"), 2);
+    b.add_u32(&k("ssm.state_size"), 8);
+    b.add_u32(&k("ssm.conv_kernel"), 4);
     if moe {
         b.add_u32(&k("expert_count"), NEXP as u32);
         b.add_u32(&k("expert_used_count"), 2);
@@ -61,7 +70,7 @@ fn build_q5_model(moe: bool) -> Vec<u8> {
             let n: u64 = dims.iter().product();
             b.add_tensor(&format!("{p}.{nm}"), GgmlType::Q5_0, dims, q5_bytes(n));
         };
-        q("attn_qkv.weight", &[HID, HID]);
+        q("attn_qkv.weight", &[HID, 96]);
         q("attn_q.weight", &[HID, HID]);
         q("attn_k.weight", &[HID, kvd]);
         q("attn_v.weight", &[HID, kvd]);
@@ -209,6 +218,15 @@ fn non_f32_norms_forced_to_f32_on_every_target() {
     b.add_u32(&k("context_length"), 64);
     b.add_f32(&k("rope.freq_base"), 10000.0);
     b.add_f32(&k("attention.layer_norm_rms_epsilon"), 1e-5);
+    // Declared GDN dims coherent with EVERY fixture tensor: v_dim =
+    // time_step_rank * state_size = 8*8 = 64 = HID (attn_gate / ssm_out /
+    // nh), and attn_qkv rows = (2*group_count + time_step_rank) *
+    // state_size = (4+8)*8 = 96. The post-planning contract gate
+    // (v0.20.0) validates both.
+    b.add_u32(&k("ssm.time_step_rank"), 8);
+    b.add_u32(&k("ssm.group_count"), 2);
+    b.add_u32(&k("ssm.state_size"), 8);
+    b.add_u32(&k("ssm.conv_kernel"), 4);
     b.add_f32_tensor(
         "token_embd.weight",
         &[VOCAB, HID],
@@ -221,7 +239,7 @@ fn non_f32_norms_forced_to_f32_on_every_target() {
         let n: u64 = dims.iter().product();
         b.add_tensor(&format!("{p}.{nm}"), GgmlType::Q5_0, dims, q5_bytes(n));
     };
-    q("attn_qkv.weight", &[HID, HID]);
+    q("attn_qkv.weight", &[HID, 96]);
     q("attn_q.weight", &[HID, HID]);
     q("attn_k.weight", &[HID, kvd]);
     q("attn_v.weight", &[HID, kvd]);
@@ -285,6 +303,12 @@ fn metal_gdn_qkv_gate_pair_written_uniformly() {
         b.add_u32(&k("context_length"), 64);
         b.add_f32(&k("rope.freq_base"), 10000.0);
         b.add_f32(&k("attention.layer_norm_rms_epsilon"), 1e-5);
+        // Declared GDN dims coherent with every fixture tensor: v_dim =
+        // 8*8 = 64 = HID; attn_qkv rows = (2*2+8)*8 = 96.
+        b.add_u32(&k("ssm.time_step_rank"), 8);
+        b.add_u32(&k("ssm.group_count"), 2);
+        b.add_u32(&k("ssm.state_size"), 8);
+        b.add_u32(&k("ssm.conv_kernel"), 4);
         b.add_f32_tensor(
             "token_embd.weight",
             &[VOCAB, HID],
@@ -324,7 +348,7 @@ fn metal_gdn_qkv_gate_pair_written_uniformly() {
             };
             b.add_tensor(&format!("{p}.{nm}"), t, dims, bytes);
         };
-        add(&mut b, "attn_qkv.weight", qkv, &[HID, HID]);
+        add(&mut b, "attn_qkv.weight", qkv, &[HID, 96]);
         add(&mut b, "attn_gate.weight", gate, &[HID, HID]);
         for nm in ["attn_q.weight", "attn_output.weight"] {
             add(&mut b, nm, GgmlType::Q8_0, &[HID, HID]);
@@ -405,7 +429,10 @@ fn metal_gdn_qkv_gate_pair_written_uniformly() {
         std::fs::remove_file(&out).ok();
     }
     // Generic target: the force never fires (mixed pairs pass through).
-    let gguf = build(GgmlType::Q4_K, GgmlType::Q4_0);
+    // Q5_0 rather than Q4_K: the fixture's in_dim (64) is not a K-quant
+    // 256-multiple, and the post-planning contract gate correctly refuses
+    // widths the CUDA loader would refuse — Q5_0's 32-element blocks fit.
+    let gguf = build(GgmlType::Q5_0, GgmlType::Q4_0);
     let out = std::env::temp_dir().join(format!(
         "lumen_lockstep_pair_generic_{}.lbc",
         std::process::id()
@@ -417,7 +444,7 @@ fn metal_gdn_qkv_gate_pair_written_uniformly() {
     convert_gguf_bytes_to_lbc(&gguf, &out, &opts).unwrap();
     let f = LbcFile::open(&out).unwrap();
     let st = &f.layer_indices[0].subtensors;
-    assert_eq!(st.wq.quant, QuantScheme::Q4_K);
+    assert_eq!(st.wq.quant, QuantScheme::Q5_0);
     assert_eq!(st.attn_gate.unwrap().quant, QuantScheme::Q4_0);
     std::fs::remove_file(&out).ok();
 }
@@ -480,8 +507,13 @@ fn build_gdn_model(gates: GgmlType) -> Vec<u8> {
     b.add_u32(&k("context_length"), 64);
     b.add_f32(&k("rope.freq_base"), 10000.0);
     b.add_f32(&k("attention.layer_norm_rms_epsilon"), 1e-5);
+    // Declared GDN dims coherent with EVERY fixture tensor: v_dim =
+    // time_step_rank * state_size = 8*8 = 64 = HID (attn_gate / ssm_out /
+    // nh), and attn_qkv rows = (2*group_count + time_step_rank) *
+    // state_size = (4+8)*8 = 96. The post-planning contract gate
+    // (v0.20.0) validates both.
     b.add_u32(&k("ssm.time_step_rank"), 8);
-    b.add_u32(&k("ssm.group_count"), 4);
+    b.add_u32(&k("ssm.group_count"), 2);
     b.add_u32(&k("ssm.state_size"), 8);
     b.add_u32(&k("ssm.conv_kernel"), 4);
     b.add_f32_tensor(
@@ -497,7 +529,7 @@ fn build_gdn_model(gates: GgmlType) -> Vec<u8> {
             let n: u64 = dims.iter().product();
             b.add_tensor(&format!("{p}.{nm}"), GgmlType::Q5_0, dims, q5_bytes(n));
         };
-        q("attn_qkv.weight", &[HID, HID]);
+        q("attn_qkv.weight", &[HID, 96]);
         q("attn_q.weight", &[HID, HID]);
         q("attn_k.weight", &[HID, kvd]);
         q("attn_v.weight", &[HID, kvd]);
@@ -519,8 +551,8 @@ fn build_gdn_model(gates: GgmlType) -> Vec<u8> {
         b.add_f32_tensor(&format!("{p}.ssm_a"), &[nh], &vec![-0.5; nh as usize]);
         b.add_f32_tensor(
             &format!("{p}.ssm_conv1d.weight"),
-            &[4, HID],
-            &vec![0.1; (4 * HID) as usize],
+            &[4, 96],
+            &vec![0.1; (4 * 96) as usize],
         );
         b.add_f32_tensor(&format!("{p}.ssm_dt.bias"), &[nh], &vec![0.0; nh as usize]);
         b.add_f32_tensor(
@@ -675,6 +707,15 @@ fn metal_gdn_pair_force_covers_moe_converter() {
     b.add_u32(&k("context_length"), 64);
     b.add_f32(&k("rope.freq_base"), 10000.0);
     b.add_f32(&k("attention.layer_norm_rms_epsilon"), 1e-5);
+    // Declared GDN dims coherent with EVERY fixture tensor: v_dim =
+    // time_step_rank * state_size = 8*8 = 64 = HID (attn_gate / ssm_out /
+    // nh), and attn_qkv rows = (2*group_count + time_step_rank) *
+    // state_size = (4+8)*8 = 96. The post-planning contract gate
+    // (v0.20.0) validates both.
+    b.add_u32(&k("ssm.time_step_rank"), 8);
+    b.add_u32(&k("ssm.group_count"), 2);
+    b.add_u32(&k("ssm.state_size"), 8);
+    b.add_u32(&k("ssm.conv_kernel"), 4);
     b.add_u32(&k("expert_count"), NEXP as u32);
     b.add_u32(&k("expert_used_count"), 2);
     b.add_f32_tensor(
@@ -705,8 +746,8 @@ fn metal_gdn_pair_force_covers_moe_converter() {
     b.add_tensor(
         &format!("{p}.attn_qkv.weight"),
         GgmlType::Q4_K,
-        &[HID, HID],
-        vec![0u8; ((HID * HID) / 256) as usize * 144],
+        &[HID, 96],
+        vec![0u8; ((HID * 96) / 256) as usize * 144],
     );
     {
         let n = HID * HID;
@@ -746,4 +787,186 @@ fn metal_gdn_pair_force_covers_moe_converter() {
     assert_eq!(st.wq.quant, QuantScheme::Q8_0);
     assert_eq!(st.attn_gate.unwrap().quant, QuantScheme::Q8_0);
     std::fs::remove_file(&out).ok();
+}
+
+/// The post-planning contract gate must refuse, IN-REPO, one instance of
+/// every refusal class the out-of-repo probes exercise. One 4-layer dense
+/// builder (block 3 = full attention) with a per-case mutation, so each
+/// named rule is the sole discriminator; asserts the loader-rule text
+/// surfaces through the conversion error.
+#[derive(Clone, Copy, PartialEq)]
+enum GateCase {
+    Baseline,
+    C2Geometry,      // fused-size wq, no per-head norms
+    NoPreNorm,       // ffn_norm removed, no post_attention_norm
+    QGateBias,       // per-head norms + full bias set
+    ZeroLenOptional, // present 0-element bias
+}
+
+fn build_gate_case(case: GateCase) -> Vec<u8> {
+    let k = |s: &str| format!("qwen35.{s}");
+    let mut b = GgufBuilder::new();
+    b.add_string("general.architecture", "qwen35");
+    b.add_u32(&k("block_count"), 4);
+    b.add_u32(&k("attention.head_count"), HEADS);
+    b.add_u32(&k("attention.head_count_kv"), KVH);
+    b.add_u32(&k("attention.key_length"), HID as u32 / HEADS);
+    b.add_u32(&k("embedding_length"), HID as u32);
+    b.add_u32(&k("feed_forward_length"), INTER as u32);
+    b.add_u32(&k("context_length"), 64);
+    b.add_f32(&k("rope.freq_base"), 10000.0);
+    b.add_f32(&k("attention.layer_norm_rms_epsilon"), 1e-5);
+    b.add_u32(&k("ssm.time_step_rank"), 8);
+    b.add_u32(&k("ssm.group_count"), 2);
+    b.add_u32(&k("ssm.state_size"), 8);
+    b.add_u32(&k("ssm.conv_kernel"), 4);
+    b.add_f32_tensor(
+        "token_embd.weight",
+        &[VOCAB, HID],
+        &vec![0.0; (VOCAB * HID) as usize],
+    );
+    b.add_f32_tensor("output_norm.weight", &[HID], &vec![1.0; HID as usize]);
+    let kvd = (HID / HEADS as u64) * KVH as u64;
+    for l in 0..4u32 {
+        let p = format!("blk.{l}");
+        let full_attn = l == 3;
+        let mut q = |nm: &str, dims: &[u64]| {
+            let n: u64 = dims.iter().product();
+            b.add_tensor(&format!("{p}.{nm}"), GgmlType::Q5_0, dims, q5_bytes(n));
+        };
+        if full_attn {
+            let wq_rows = if case == GateCase::C2Geometry || case == GateCase::QGateBias {
+                2 * HID // fused Q+gate geometry
+            } else {
+                HID
+            };
+            q("attn_q.weight", &[HID, wq_rows]);
+            q("attn_k.weight", &[HID, kvd]);
+            q("attn_v.weight", &[HID, kvd]);
+            q("attn_output.weight", &[HID, HID]);
+        } else {
+            q("attn_qkv.weight", &[HID, 96]);
+            q("attn_gate.weight", &[HID, HID]);
+        }
+        q("ffn_gate.weight", &[HID, INTER]);
+        q("ffn_up.weight", &[HID, INTER]);
+        q("ffn_down.weight", &[INTER, HID]);
+        b.add_f32_tensor(
+            &format!("{p}.attn_norm.weight"),
+            &[HID],
+            &vec![1.0; HID as usize],
+        );
+        if !(full_attn && case == GateCase::NoPreNorm) {
+            b.add_f32_tensor(
+                &format!("{p}.ffn_norm.weight"),
+                &[HID],
+                &vec![1.0; HID as usize],
+            );
+        }
+        if !full_attn {
+            let nh = 8u64;
+            b.add_f32_tensor(&format!("{p}.ssm_a"), &[nh], &vec![-0.5; nh as usize]);
+            b.add_f32_tensor(
+                &format!("{p}.ssm_conv1d.weight"),
+                &[4, 96],
+                &vec![0.1; (4 * 96) as usize],
+            );
+            b.add_f32_tensor(&format!("{p}.ssm_dt.bias"), &[nh], &vec![0.0; nh as usize]);
+            b.add_f32_tensor(
+                &format!("{p}.ssm_norm.weight"),
+                &[HID / nh],
+                &vec![1.0; (HID / nh) as usize],
+            );
+            b.add_tensor(
+                &format!("{p}.ssm_out.weight"),
+                GgmlType::Q5_0,
+                &[HID, HID],
+                q5_bytes(HID * HID),
+            );
+            b.add_f32_tensor(
+                &format!("{p}.ssm_alpha.weight"),
+                &[HID, nh],
+                &vec![0.1; (HID * nh) as usize],
+            );
+            b.add_f32_tensor(
+                &format!("{p}.ssm_beta.weight"),
+                &[HID, nh],
+                &vec![0.1; (HID * nh) as usize],
+            );
+        }
+        if full_attn && case == GateCase::QGateBias {
+            let hd = HID / HEADS as u64;
+            b.add_f32_tensor(
+                &format!("{p}.attn_q_norm.weight"),
+                &[hd],
+                &vec![1.0; hd as usize],
+            );
+            b.add_f32_tensor(
+                &format!("{p}.attn_k_norm.weight"),
+                &[hd],
+                &vec![1.0; hd as usize],
+            );
+            b.add_f32_tensor(
+                &format!("{p}.attn_q.bias"),
+                &[HID],
+                &vec![0.0; HID as usize],
+            );
+            b.add_f32_tensor(
+                &format!("{p}.attn_k.bias"),
+                &[kvd],
+                &vec![0.0; kvd as usize],
+            );
+            b.add_f32_tensor(
+                &format!("{p}.attn_v.bias"),
+                &[kvd],
+                &vec![0.0; kvd as usize],
+            );
+        }
+        if full_attn && case == GateCase::ZeroLenOptional {
+            b.add_f32_tensor(&format!("{p}.attn_q.bias"), &[0], &[]);
+            b.add_f32_tensor(
+                &format!("{p}.attn_k.bias"),
+                &[kvd],
+                &vec![0.0; kvd as usize],
+            );
+            b.add_f32_tensor(
+                &format!("{p}.attn_v.bias"),
+                &[kvd],
+                &vec![0.0; kvd as usize],
+            );
+        }
+    }
+    b.build()
+}
+
+#[test]
+fn contract_gate_refuses_loader_rejected_plans() {
+    let out = std::env::temp_dir().join(format!("lumen_gate_neg_{}.lbc", std::process::id()));
+    let opts = ConvertOptions {
+        target: ConvertTarget::Generic,
+        ..Default::default()
+    };
+    let run = |case: GateCase| {
+        let r = convert_gguf_bytes_to_lbc(&build_gate_case(case), &out, &opts);
+        std::fs::remove_file(&out).ok();
+        r
+    };
+    // Baseline converts on the generic target.
+    run(GateCase::Baseline).expect("baseline must convert");
+    let refuse = |case: GateCase, needle: &str| {
+        let err = run(case).expect_err(needle);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(needle),
+            "wrong refusal (wanted {needle:?}): {msg}"
+        );
+    };
+    // Geometry (canonical C2 shape) — universal, generic target included.
+    refuse(GateCase::C2Geometry, "requires out_dim in");
+    // Missing FFN pre-norm — universal (the round-8 filing fix).
+    refuse(GateCase::NoPreNorm, "no FFN pre-norm exists");
+    // Q+gate + bias policy.
+    refuse(GateCase::QGateBias, "Q+gate attention layer");
+    // Present-but-zero-length optional — universal (moved 19-entry rule).
+    refuse(GateCase::ZeroLenOptional, "present but zero-length");
 }

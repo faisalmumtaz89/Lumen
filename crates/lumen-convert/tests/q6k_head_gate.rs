@@ -40,6 +40,12 @@ fn build_q6k_headed_model() -> Vec<u8> {
     }
     b.add_f32("qwen35.rope.freq_base", 10000.0);
     b.add_f32("qwen35.attention.layer_norm_rms_epsilon", 1e-5);
+    // Declared GDN dims coherent with every fixture tensor: v_dim = 8*8 =
+    // 64 = HID; attn_qkv rows = (2*2+8)*8 = 96.
+    b.add_u32("qwen35.ssm.time_step_rank", 8);
+    b.add_u32("qwen35.ssm.group_count", 2);
+    b.add_u32("qwen35.ssm.state_size", 8);
+    b.add_u32("qwen35.ssm.conv_kernel", 4);
     b.add_f32_tensor(
         "token_embd.weight",
         &[VOCAB, HID],
@@ -55,7 +61,7 @@ fn build_q6k_headed_model() -> Vec<u8> {
     );
     let kvd = 32u64;
     for (nm, dims) in [
-        ("attn_qkv.weight", [HID, HID]),
+        ("attn_qkv.weight", [HID, 96]),
         ("attn_q.weight", [HID, HID]),
         ("attn_k.weight", [HID, kvd]),
         ("attn_v.weight", [HID, kvd]),
