@@ -401,7 +401,10 @@ pub fn generate_large_model_f16<W: Write>(w: W, config: &LargeModelConfig) -> io
         let blob = generate_layer_blob_f16(config, &mut rng);
         sw.write_layer(&blob)?;
     }
-    sw.finish()?;
+    // finish() hands the writer back; flush explicitly — BufWriter's
+    // Drop swallows I/O errors, which would let a failed final flush
+    // publish a silently truncated file.
+    sw.finish()?.flush()?;
 
     Ok(())
 }
@@ -459,7 +462,10 @@ pub fn generate_large_model<W: Write>(w: W, config: &LargeModelConfig) -> io::Re
         let blob = generate_layer_blob(config, &mut rng);
         sw.write_layer(&blob)?;
     }
-    sw.finish()?;
+    // finish() hands the writer back; flush explicitly — BufWriter's
+    // Drop swallows I/O errors, which would let a failed final flush
+    // publish a silently truncated file.
+    sw.finish()?.flush()?;
 
     Ok(())
 }

@@ -44,7 +44,10 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 fn write_q8_model() -> std::path::PathBuf {
     let data = generate_test_model_q8_0(&TestModelQ8Config::default());
     let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("lumen_metal_argmax_parity_{id}"));
+    let dir = std::env::temp_dir().join(format!(
+        "lumen_metal_argmax_parity_{}_{id}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("model_q8.lbc");
     std::fs::File::create(&path)

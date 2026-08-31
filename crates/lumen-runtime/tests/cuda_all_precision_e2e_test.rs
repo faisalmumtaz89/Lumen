@@ -306,7 +306,10 @@ fn dequant_layer_to_f32(
 /// Write LBC bytes to a temp file and return a SyncWeightProvider.
 fn write_and_open(lbc_data: &[u8], label: &str) -> SyncWeightProvider {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("lumen_cuda_all_prec_{label}_{id}"));
+    let dir = std::env::temp_dir().join(format!(
+        "lumen_cuda_all_prec_{label}_{}_{id}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("test_model.lbc");
     {

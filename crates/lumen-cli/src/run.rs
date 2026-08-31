@@ -1674,6 +1674,10 @@ fn resolve_download_gguf_shards(
 
 #[cfg(feature = "download")]
 fn resolve_download_gguf(repo: &str, filename: &str, verbose: bool) -> std::path::PathBuf {
+    // Reclaim before the cache-hit return (see pull_download_gguf).
+    if let Ok((_, local_name)) = crate::download::split_repo_path(filename) {
+        crate::download::reclaim_stale_parts(&crate::cache::cache_dir(), &local_name);
+    }
     if let Some(existing) = crate::cache::cached_gguf(filename) {
         if verbose {
             eprintln!("GGUF already downloaded: {}", existing.display());
