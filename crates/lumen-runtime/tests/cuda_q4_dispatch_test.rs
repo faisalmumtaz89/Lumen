@@ -52,7 +52,10 @@ fn q4_config(seed: u64) -> TestModelQ4Config {
 /// Write a generated LBC to a unique temp file and open a `SyncWeightProvider`.
 fn open_provider(lbc: &[u8], tag: &str) -> SyncWeightProvider {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("lumen_cuda_q4_dispatch_{tag}_{id}"));
+    let dir = std::env::temp_dir().join(format!(
+        "lumen_cuda_q4_dispatch_{tag}_{}_{id}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("model.lbc");
     {

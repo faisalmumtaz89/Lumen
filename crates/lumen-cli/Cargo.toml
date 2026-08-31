@@ -17,6 +17,7 @@ download = ["ureq", "indicatif", "dirs", "sha2"]
 cuda = ["lumen-runtime/cuda"]
 
 [dependencies]
+libc = "0.2"
 lumen-format.workspace = true
 lumen-runtime.workspace = true
 lumen-convert.workspace = true

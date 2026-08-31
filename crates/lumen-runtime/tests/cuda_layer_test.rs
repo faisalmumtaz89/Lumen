@@ -28,7 +28,8 @@ fn setup_backends() -> Result<(SyncWeightProvider, NaiveF32Backend, CudaBackend)
     let lbc_data = generate_test_model(&config);
 
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("lumen_cuda_layer_test_{id}"));
+    let dir =
+        std::env::temp_dir().join(format!("lumen_cuda_layer_test_{}_{id}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("test_model.lbc");
     {

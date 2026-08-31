@@ -20,7 +20,10 @@ fn temp_dir(label: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("lumen-cli-test-{label}-{id}"));
+    let dir = std::env::temp_dir().join(format!(
+        "lumen-cli-test-{label}-{}_{id}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
