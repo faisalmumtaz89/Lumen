@@ -245,12 +245,34 @@ pub(crate) fn metal_gdn_pair_forces_q8(
     }
     let qkv = gguf.find_tensor(&layer_tensor_name(layer, ATTN_QKV));
     let gate = gguf.find_tensor(&layer_tensor_name(layer, ATTN_GATE_WEIGHT));
-    let (Some(qkv), Some(gate)) = (qkv, gate) else {
+    let (Some(qkv), gate) = (qkv, gate) else {
         return false;
+    };
+    let Some(gate) = gate else {
+        // Gate absent (malformed source — GDN serving requires it, and the
+        // runtime errors cleanly at dispatch). Still force an F16 qkv to
+        // Q8_0 so the LOAD does not reject what the dispatch would
+        // diagnose more precisely.
+        return qkv.ggml_type == GgmlType::F16;
     };
     // Q8_1 is unconditionally requantized to Q8_0 by both converters, so it
     // lands on the Q8 side of the pair.
     let is_q8_after_target =
         |t: GgmlType| t == GgmlType::Q8_0 || t == GgmlType::Q8_1 || metal_needs_upcast(t);
+    // F16 forces the pair too: the Metal GDN prefill projections have no
+    // F16 arm (the loader rejects F16 there), so an F16 source must land
+    // Q8_0 — otherwise this converter emits an artifact its own loader
+    // refuses. Bf16 stays: the prefill has Bf16 arms.
+    let is_f16 = |t: GgmlType| t == GgmlType::F16;
+    // An F32/non-F32 SPLIT forces the pair as well: the Metal decode
+    // F32-gate fallback reads a norm buffer only the F32 QKV route writes,
+    // so the loader rejects gate-F32 next to a non-F32 qkv (and vice
+    // versa the qkv-F32 route pairs with a gate arm that exists, but
+    // uniform Q8 is the safe landing for any split). F32/F32 stays: it is
+    // loadable and `--dequantize` produces exactly that.
+    let is_f32 = |t: GgmlType| t == GgmlType::F32;
     is_q8_after_target(qkv.ggml_type) != is_q8_after_target(gate.ggml_type)
+        || is_f16(qkv.ggml_type)
+        || is_f16(gate.ggml_type)
+        || (is_f32(qkv.ggml_type) != is_f32(gate.ggml_type))
 }

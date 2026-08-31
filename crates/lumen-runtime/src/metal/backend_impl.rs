@@ -30,6 +30,11 @@ impl ComputeBackend for MetalF32Backend {
                 ((2 * gd.num_k_heads + gd.num_v_heads) * gd.head_dim) as usize
             },
             gdn_declared: hyperparams.gdn.is_some(),
+            gdn_v_dim: {
+                let gd = hyperparams.gdn_dims();
+                (gd.num_v_heads * gd.head_dim) as usize
+            },
+            gdn_conv_kernel: hyperparams.gdn_dims().conv_kernel as usize,
         });
 
         // Compile shader pipelines

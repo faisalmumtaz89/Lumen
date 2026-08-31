@@ -233,37 +233,10 @@ pub(crate) fn build_moe_meta(
         return Ok(None);
     }
 
-    // The dispatch applies expert 0's schemes to the whole bank, and the
-    // fused gate+up kernels are selected from the gate's scheme alone — a
-    // within-expert gate/up split or any expert diverging from expert 0
-    // would be decoded at the wrong stride. The format stores per-expert
-    // schemes and does not enforce uniformity; reject the divergence here
-    // (mirrors the Metal loader's checks).
-    let first = &experts[0];
-    for (i, e) in experts.iter().enumerate() {
-        if e.gate.quant != e.up.quant {
-            return Err(RuntimeError::Compute(format!(
-                "expert {i}: gate is {:?} but up is {:?}: the CUDA fused \
-                 expert kernels require the pair to share one quant scheme. \
-                 Re-convert from a source GGUF whose expert tensors share \
-                 one quantization.",
-                e.gate.quant, e.up.quant
-            )));
-        }
-        let pairs = [
-            ("gate", e.gate.quant, first.gate.quant),
-            ("up", e.up.quant, first.up.quant),
-            ("down", e.down.quant, first.down.quant),
-        ];
-        if let Some((name, got, want)) = pairs.iter().find(|(_, a, b)| a != b).copied() {
-            return Err(RuntimeError::Compute(format!(
-                "expert {i}: {name} is {got:?} but expert 0's is {want:?}: \
-                 the CUDA expert dispatch applies expert 0's quant schemes \
-                 to every expert. Re-convert from a source GGUF whose \
-                 experts share one quantization.",
-            )));
-        }
-    }
+    // Uniformity rules live in the shared serving rules (single source of
+    // truth, also enforced at convert time by validate_layer_plan).
+    lumen_format::serving_rules::validate_expert_bank(subtensors)
+        .map_err(crate::error::RuntimeError::Compute)?;
 
     let num_experts = experts.len();
     let mut expert_gate_offs = Vec::with_capacity(num_experts);
@@ -276,8 +249,8 @@ pub(crate) fn build_moe_meta(
         expert_down_offs.push(e.down.offset);
     }
 
-    let expert_gate_quant = first.gate.quant;
-    let expert_down_quant = first.down.quant;
+    let expert_gate_quant = experts[0].gate.quant;
+    let expert_down_quant = experts[0].down.quant;
 
     Ok(Some(CudaMoeMeta {
         router_weight_off: router.offset,

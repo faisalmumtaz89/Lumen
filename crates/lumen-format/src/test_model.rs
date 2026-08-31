@@ -501,7 +501,9 @@ pub fn generate_test_model_q8_0_gdn(config: &TestModelQ8Config) -> Vec<u8> {
         let (ssm_a, ssm_conv1d, ssm_dt, ssm_beta, ssm_alpha, ssm_norm, ssm_out, layer_type) =
             if is_gdn {
                 // ssm_conv1d: short conv kernel; ssm_a/dt/norm: F32 scalars.
-                let ssm_conv1d = add(&mut blob, rng.gen_norm_bytes(hidden), QuantScheme::F32);
+                // conv1d holds qkv_rows x conv_kernel F32s; with the
+                // declared dims qkv_rows == q_dim and conv_kernel == 4.
+                let ssm_conv1d = add(&mut blob, rng.gen_norm_bytes(q_dim * 4), QuantScheme::F32);
                 let ssm_a = add(&mut blob, rng.gen_norm_bytes(head_dim), QuantScheme::F32);
                 let ssm_dt = add(&mut blob, rng.gen_norm_bytes(head_dim), QuantScheme::F32);
                 let ssm_norm = add(&mut blob, rng.gen_norm_bytes(hidden), QuantScheme::F32);

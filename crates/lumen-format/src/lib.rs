@@ -21,6 +21,7 @@ pub mod large_model;
 pub mod quantization;
 pub mod reader;
 pub(crate) mod rng;
+pub mod serving_rules;
 pub mod streaming_writer;
 pub mod test_model;
 pub mod tokenizer;

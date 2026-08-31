@@ -841,132 +841,23 @@ fn ct4_out_dim(total_bytes: usize, in_dim: usize) -> Result<usize, RuntimeError>
 /// dimensions — a slice that decodes to any other row count is rejected
 /// here, BEFORE upload, because downstream launchers derive dimensions from
 /// the hyperparameters, not from the buffer.
-/// Enforce projection geometry for every fixed-layout scheme: the launchers
-/// derive row counts from hyperparams, so a slice whose byte length decodes
-/// to any other row count is read at the wrong geometry — in-bounds, silent
-/// garbage. Zero-length slices are converter absence sentinels (wo and
-/// wk/wv on GDN layers, dense FFN tensors on MoE layers) — presence is
-/// validated where the role demands it; geometry only applies to tensors
-/// that exist. Floats (F32/F16/Bf16) and every block scheme the CUDA
-/// upload path accepts (Q8_0/Q4_0/Q4_1/Q5_0 and the K-quants, which reach
-/// this path verbatim under `--target cuda`/generic — the Q8_0 upcast is
-/// Metal-target-only) are covered here; CtInt4G32 is enforced in
-/// `upload_projection_tensor`'s ct4 branch.
+/// Thin wrappers over the shared serving rules in `lumen_format` — the
+/// single source of truth also enforced at convert time. Kept as the
+/// CUDA-local entry points so call sites and tests are unchanged.
 fn validate_projection_geometry(
     name: &str,
     slice: &lumen_format::index::TensorSlice,
     in_dim: usize,
     allowed_out: &[usize],
 ) -> Result<(), RuntimeError> {
-    // (block elements, block bytes) per fixed-layout scheme. A width that
-    // does not divide into whole blocks is malformed row geometry — the
-    // kernels truncate to in_dim/block blocks per row — so it must FAIL,
-    // never fall through to a skip (Metal's `attn_row_bytes` twin behaves
-    // the same way).
-    let block = match slice.quant {
-        QuantScheme::F32 => Some((1usize, 4usize)),
-        QuantScheme::F16 | QuantScheme::Bf16 => Some((1, 2)),
-        QuantScheme::Q8_0 => Some((32, 34)),
-        QuantScheme::Q4_0 => Some((32, 18)),
-        QuantScheme::Q4_1 => Some((32, 20)),
-        QuantScheme::Q5_0 => Some((32, 22)),
-        QuantScheme::Q2_K => Some((256, 84)),
-        QuantScheme::Q3_K => Some((256, 110)),
-        QuantScheme::Q4_K => Some((256, 144)),
-        QuantScheme::Q5_K => Some((256, 176)),
-        QuantScheme::Q6_K => Some((256, 210)),
-        _ => None,
-    };
-    let row_bytes = match block {
-        Some((elems, bytes)) => {
-            if in_dim == 0 {
-                return Err(RuntimeError::Compute(format!(
-                    "{name} role has in_dim 0 (malformed hyperparams)."
-                )));
-            }
-            if in_dim % elems != 0 {
-                return Err(RuntimeError::Compute(format!(
-                    "{name} is {:?} but in_dim {in_dim} is not a multiple \
-                     of the {elems}-element block — the kernels would \
-                     truncate the row (malformed hyperparams).",
-                    slice.quant
-                )));
-            }
-            Some(in_dim / elems * bytes)
-        }
-        None => None,
-    };
-    if let (Some(row), true) = (row_bytes, slice.length > 0) {
-        let len = slice.length as usize;
-        let ok = len % row == 0 && allowed_out.contains(&(len / row));
-        if !ok {
-            return Err(RuntimeError::Compute(format!(
-                "{name} is {len} bytes ({:?}, in_dim {in_dim}, {row} \
-                 bytes/row) but this role requires out_dim in \
-                 {allowed_out:?}. The kernels derive dimensions from \
-                 hyperparams, so this tensor would be read at the wrong \
-                 geometry. Re-convert with `lumen convert`.",
-                slice.quant
-            )));
-        }
-    }
-    Ok(())
+    lumen_format::serving_rules::validate_projection_geometry(name, slice, in_dim, allowed_out)
+        .map_err(RuntimeError::Compute)
 }
 
-/// Zero-length mandatory tensors would suppress the geometry checks (zero
-/// skips as an absence sentinel), so presence is enforced for every tensor
-/// whose role demands it: wq always; wk/wv/wo on full attention (GDN's
-/// fused in-projection legitimately leaves them empty); the dense FFN trio
-/// on non-MoE layers (MoE layers route through experts and leave dense
-/// sentinels).
 fn validate_mandatory_presence(
     subs: &lumen_format::index::SubtensorOffsets,
 ) -> Result<(), RuntimeError> {
-    if subs.wq.length == 0 {
-        return Err(RuntimeError::Compute(
-            "layer carries an empty wq; every layer requires an attention \
-             (or GDN in-) projection (malformed LBC). Re-convert with \
-             `lumen convert`."
-                .into(),
-        ));
-    }
-    if subs.layer_type != Some(1)
-        && (subs.wk.length == 0 || subs.wv.length == 0 || subs.wo.length == 0)
-    {
-        return Err(RuntimeError::Compute(format!(
-            "full-attention layer carries empty wk/wv/wo ({} / {} / {} \
-             bytes); the attention dispatch requires all three (malformed \
-             LBC). Re-convert with `lumen convert`.",
-            subs.wk.length, subs.wv.length, subs.wo.length
-        )));
-    }
-    // A layer routes through experts only when BOTH the router and a
-    // non-empty expert bank exist (the runtime's own MoE predicate);
-    // router-without-experts or experts-without-router is malformed, and a
-    // half-declared MoE layer must not exempt the dense FFN requirement.
-    let has_experts = subs.experts.as_ref().is_some_and(|e| !e.is_empty());
-    let is_moe = subs.router_weight.is_some() && has_experts;
-    if subs.router_weight.is_some() != has_experts {
-        return Err(RuntimeError::Compute(format!(
-            "layer declares router_weight={} but expert bank {} (malformed \
-             LBC — MoE requires both). Re-convert with `lumen convert`.",
-            subs.router_weight.is_some(),
-            if has_experts {
-                "present"
-            } else {
-                "absent/empty"
-            }
-        )));
-    }
-    if !is_moe && (subs.w_gate.length == 0 || subs.w_up.length == 0 || subs.w_down.length == 0) {
-        return Err(RuntimeError::Compute(format!(
-            "non-MoE layer carries empty dense FFN tensors (gate/up/down = \
-             {} / {} / {} bytes; malformed LBC). Re-convert with `lumen \
-             convert`.",
-            subs.w_gate.length, subs.w_up.length, subs.w_down.length
-        )));
-    }
-    Ok(())
+    lumen_format::serving_rules::validate_mandatory_presence(subs).map_err(RuntimeError::Compute)
 }
 
 fn upload_projection_tensor(
@@ -1238,59 +1129,11 @@ fn upload_norm_tensor(
     device.htod_copy(f32_data)
 }
 
-/// Reject present-but-zero-length optional tensors before any upload: the
-/// upload and dispatch paths gate on presence alone, so a `Some` with
-/// length 0 would become a "present" GPU buffer the kernels then read
-/// past. The converter never emits one.
 pub(crate) fn validate_layer_slices(
     layer: usize,
     subs: &lumen_format::index::SubtensorOffsets,
 ) -> Result<(), RuntimeError> {
-    let optional_slices: [(&str, Option<&lumen_format::index::TensorSlice>); 19] = [
-        ("bq", subs.bq.as_ref()),
-        ("bk", subs.bk.as_ref()),
-        ("bv", subs.bv.as_ref()),
-        ("router_weight", subs.router_weight.as_ref()),
-        ("shared_expert_gate", subs.shared_expert_gate.as_ref()),
-        ("shared_expert_up", subs.shared_expert_up.as_ref()),
-        ("shared_expert_down", subs.shared_expert_down.as_ref()),
-        ("attn_gate", subs.attn_gate.as_ref()),
-        ("attn_post_norm", subs.attn_post_norm.as_ref()),
-        ("ssm_a", subs.ssm_a.as_ref()),
-        ("ssm_conv1d", subs.ssm_conv1d.as_ref()),
-        ("ssm_dt", subs.ssm_dt.as_ref()),
-        ("ssm_beta", subs.ssm_beta.as_ref()),
-        ("ssm_alpha", subs.ssm_alpha.as_ref()),
-        ("ssm_norm", subs.ssm_norm.as_ref()),
-        ("ssm_out", subs.ssm_out.as_ref()),
-        ("attn_q_norm", subs.attn_q_norm.as_ref()),
-        ("attn_k_norm", subs.attn_k_norm.as_ref()),
-        ("ffn_gate_inp_shexp", subs.ffn_gate_inp_shexp.as_ref()),
-    ];
-    for (name, slice) in optional_slices {
-        if let Some(t) = slice {
-            if t.length == 0 {
-                return Err(RuntimeError::Compute(format!(
-                    "layer {layer}: {name} is present but zero-length \
-                     (malformed LBC). Re-convert with `lumen convert`."
-                )));
-            }
-        }
-    }
-    if let Some(experts) = subs.experts.as_ref() {
-        for (i, e) in experts.iter().enumerate() {
-            for (name, t) in [("gate", &e.gate), ("up", &e.up), ("down", &e.down)] {
-                if t.length == 0 {
-                    return Err(RuntimeError::Compute(format!(
-                        "layer {layer} expert {i}: {name} is zero-length \
-                         (malformed LBC). Re-convert with `lumen convert`."
-                    )));
-                }
-            }
-        }
-    }
-
-    Ok(())
+    lumen_format::serving_rules::validate_layer_slices(layer, subs).map_err(RuntimeError::Compute)
 }
 
 /// Upload a single layer's weight tensors from a `LayerView` to GPU memory.
@@ -1392,6 +1235,16 @@ pub fn upload_layer_weights(
         ((2 * gd.num_k_heads + gd.num_v_heads) * gd.head_dim) as usize
     };
     validate_mandatory_presence(subs)?;
+    {
+        let gd = hp.gdn_dims();
+        lumen_format::serving_rules::validate_gdn_conv1d(
+            weights.layer_idx,
+            subs,
+            ((2 * gd.num_k_heads + gd.num_v_heads) * gd.head_dim) as usize,
+            gd.conv_kernel as usize,
+        )
+        .map_err(RuntimeError::Compute)?;
+    }
     Ok(LayerWeightsGpu {
         // wq's expected row count is decided by the same predicates the
         // dispatch routes on: GDN layers carry the fused in-projection;
@@ -2461,6 +2314,21 @@ mod projection_geometry_tests {
         st.w_gate.length = 0;
         st.w_up.length = 0;
         st.w_down.length = 0;
+        assert!(validate_mandatory_presence(&st).is_ok());
+        // Q+gate layers (per-head norms) reject any bias set — one policy
+        // on both backends (round-7 N3).
+        let mut st = base.clone();
+        st.attn_q_norm = Some(sl(64, QuantScheme::F32));
+        st.attn_k_norm = Some(sl(64, QuantScheme::F32));
+        st.bq = Some(sl(256, QuantScheme::F32));
+        assert!(validate_mandatory_presence(&st)
+            .unwrap_err()
+            .to_string()
+            .contains("Q+gate attention layer"));
+        // The same biases WITHOUT per-head norms stay admitted (qwen2-style
+        // biased attention is served).
+        st.attn_q_norm = None;
+        st.attn_k_norm = None;
         assert!(validate_mandatory_presence(&st).is_ok());
         // Router without experts is malformed, never an exemption.
         let mut st = base.clone();

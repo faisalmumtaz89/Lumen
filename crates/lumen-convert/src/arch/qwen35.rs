@@ -628,7 +628,7 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
         && super::gdn_gates::metal_gdn_pair_forces_q8(gguf, layer, dequantize, requant_to, target);
     if gdn_pair_q8 {
         eprintln!(
-            "    Metal GDN pair force: layer {layer} attn_qkv+attn_gate -> Q8_0 (mixed source)"
+            "    Metal GDN pair force: layer {layer} attn_qkv+attn_gate -> Q8_0 (mixed or F16 source)"
         );
     }
 
