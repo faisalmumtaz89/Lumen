@@ -15379,12 +15379,14 @@ unsafe fn launch_fused_norm_dual_matvec_f32(
 /// path does not length-check: raw globals stored via the direct setters are
 /// rejected for unsupported schemes during backend initialization (the
 /// setters themselves only store), and on the ordinary provider path a
-/// non-colliding unsupported length is read with unknown formats
-/// reinterpreted as F32, the resulting F32 copy uploading via the plain-F32
-/// path (no length or cap check). Known length collision, tracked: Q4_K's
+/// four-byte-aligned, non-colliding unsupported buffer is read with unknown
+/// formats reinterpreted as F32 (a non-aligned one panics in bytes_to_f32),
+/// the resulting F32 copy uploading via the plain-F32 path (no length or
+/// cap check). Known behavior-changing detector collision, tracked: Q4_K's
 /// packed size equals Q4_0's (144 B / 256 elems), so a hand-built Q4_K
 /// global would be misdetected as Q4_0 and forwarded raw; the converter
-/// never emits K-quant globals.
+/// never emits a colliding K-quant global (fidelity mode may preserve a
+/// Q6_K head, 210 B / 256 — unique).
 /// `Ok(Some(len))` = the scheme has a fixed block layout and `len` is the
 /// only valid raw size. `Ok(None)` = the layout is not length-checkable
 /// here (e.g. CtInt4G32's composite planes). `Err` = the dimensions are

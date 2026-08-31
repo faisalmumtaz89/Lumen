@@ -380,20 +380,32 @@ item; close with the shipping release.
   streaming ever becomes reachable, scope the guard to the resident
   path. (Round-7 report §3 item 5, accepted as stated.)
 - **PROVIDER-SYNC-F32-FALLBACK** — `weight/provider_sync.rs:433-437`
-  (and the sibling `read_output_proj_global`) reinterpret any
+  (and the sibling `read_output_proj_global`) reinterpret an
   unrecognized-format global buffer as F32 ("backward compat") instead
-  of erroring; a wrong-sized buffer is silently read as F32 data.
-  SHARPER SUB-CASE (2026-08-31, r5 review find): the detectors are
-  length-only, and Q4_K's packed length collides EXACTLY with Q4_0's
+  of erroring — when the byte length is four-byte-aligned; a
+  NON-aligned unrecognized buffer (e.g. a 256-element Q3_K global at
+  110 bytes) PANICS in `bytes_to_f32`'s alignment assert rather than
+  failing cleanly (r6 review find; hand-built artifacts only).
+  SHARPER SUB-CASE (2026-08-31, r5 review find): the Q4_0 detection
+  branches are length-only (the F16/Bf16 arms and the output-proj Q6_K
+  arm consult the header), and Q4_K's packed length collides EXACTLY
+  with Q4_0's
   (144 bytes per 256 elements — the repo's own `ggml_byte_size_for`
   test asserts both), so a hand-built Q4_K global would be
   misclassified as Q4_0 and forwarded RAW through the setters —
-  silently wrong dequantization, not an F32 fallback. Containment: the
-  converter never emits K-quant globals (K-quant heads requantize to
-  Q8_0/Q4_0 by default; SOURCE_FIDELITY preserves only a Q6_K head,
-  whose 210-byte block collides with nothing), so the path needs a
-  hand-built LBC. Fix when touched: scheme-aware or fail-closed
-  detectors + a Q4_K/Q4_0 collision test.
+  silently wrong dequantization, not an F32 fallback. The full
+  fixed-layout sweep yields three equal-length pairs (Q4_0/Q4_K 144,
+  Q5_0/Q5_K 176, F16/Bf16 512 per 256 elements), but only Q4_0/Q4_K
+  changes raw-forwarding behavior: F16/Bf16 are header-disambiguated
+  and Q5_0/Q5_K both miss every recognized detector length.
+  Containment: the converter never emits a COLLIDING K-quant global —
+  K-quant heads requantize to Q8_0/Q4_0 by default, and non-Metal
+  fidelity mode (`LUMEN_CONVERT_SOURCE_FIDELITY=1` or
+  `LUMEN_CONVERT_KEEP_Q6K_OUTPUT=1`) may preserve a Q6_K head, whose
+  210-byte block collides with nothing — so the raw-forwarding path
+  needs a hand-built LBC. Fix when touched: scheme-aware or
+  fail-closed detectors (covering the Q5_0/Q5_K pair while there) + a
+  Q4_K/Q4_0 collision test.
   Round-7 report §4 A2(c) second half, accepted: unchanged since
   v0.18.0, contained by the conversion-side scheme gating; a fail-closed
   arm is the fix when touched.
