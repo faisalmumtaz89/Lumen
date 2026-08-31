@@ -177,12 +177,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **Global tensors are capped to the kernels' 32-bit indexing** (both
   backends): embedding and output-head kernels compute element and byte
   offsets in 32-bit; element counts or packed byte lengths past 2^32 are
-  now rejected at load instead of wrapping. Metal additionally validates
+  now rejected at load instead of wrapping on the raw quantized global
+  paths (the plain-F32 upload path is outside these checks — tracked). Metal additionally validates
   raw globals against the scheme's exact packed length (CUDA already did).
 - **CUDA per-layer slice validation runs before any GPU work**: the
-  zero-length checks are hoisted above MoE metadata table construction at
-  preload; the output head and embedding raw-length validation rejects
-  non-block-multiple element counts with checked arithmetic.
+  zero-length checks run above MoE metadata table construction at
+  preload (correction 2026-08-31: this bullet originally said "hoisted
+  above", implying a pre-existing call was moved — `validate_layer_slices`
+  and both its call sites were new in this release; the ordering claim
+  stands, the repair narrative was false); the output head and embedding
+  raw-length validation rejects
+  non-block-multiple element counts with checked arithmetic for the
+  fixed-block-layout schemes it covers (Q8_0/Q4_0/F16/Bf16, plus Q6_K
+  heads); other schemes are refused by the embedding/output-head quant
+  allowlists rather than length-checked here.
 - **Session temp files are process-unique**: five session/provider staging
   paths gained `std::process::id()` suffixes, so concurrent processes no
   longer clobber each other's session staging files (model-download
