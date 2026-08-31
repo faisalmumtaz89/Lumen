@@ -471,13 +471,17 @@ item; close with the shipping release.
   (b) Metal checks wq/wk/wv
   only — wo and the dense FFN trio have no Metal geometry/presence check
   (CUDA covers them; `gpu_resident.rs:~1828` even derives a qmv repack
-  row count FROM the buffer); (c) GDN dims are pinned only through their
-  SUM — {32,16,128} and {48,8,128} both give 8192 rows; aggregate checks
-  cannot distinguish the component head decompositions (narrowed
-  2026-08-31: `ssm_conv1d` IS cross-checked against the aggregate
-  `hp.gdn` geometry by `validate_gdn_conv1d` on both loaders and at the
-  convert gate — the residual is decomposition ambiguity, not an absent
-  cross-check); (d) non-CtInt4G32 `ssm_out`
+  row count FROM the buffer); (c) GDN dims are pinned through their
+  aggregates, not their decomposition (narrowed twice 2026-08-31:
+  `ssm_conv1d` IS cross-checked against the aggregate `hp.gdn` geometry
+  by `validate_gdn_conv1d` on both loaders and at the convert gate, and
+  a present `attn_gate` is checked against v_heads x head_dim on CUDA
+  and at the gate — so {32,16,128} vs {48,8,128}, same row sum but
+  different gate product, IS distinguishable there; the true residual
+  is decompositions sharing BOTH aggregates, e.g. {32,16,128} vs
+  {64,32,64} — row sum 8192 and gate product 4096 alike — plus Metal
+  loading and gate-absent artifacts, where only the sum is pinned);
+  (d) non-CtInt4G32 `ssm_out`
   has no CUDA geometry check; (e) byte-length checks are inherently blind
   to transposition/permutation and to the F32-vs-2xF16 length collision —
   not closable this way, stated as a limit; (f) narrowed in Category 2: the real MoE GGUF's
