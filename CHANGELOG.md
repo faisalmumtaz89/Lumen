@@ -7,6 +7,58 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-08-31
+
+### Fixed
+
+- **Model-download staging is concurrency-safe across processes, users,
+  and PID namespaces**: the `.part` staging file is created exclusively
+  (`O_EXCL`) as `{filename}.{pid}-{nonce}.part` with collision-retried
+  nonces, so two containers that are both namespace-local PID 1 on a
+  shared cache volume can no longer truncate each other's staging and
+  publish a silently partial final file. Hashing reads the download's own
+  descriptor (a pathname reopen could read a reused name's bytes), the
+  path's device+inode identity is verified against the held descriptor
+  before the atomic rename, and every error path after the cleanup
+  guard is armed (one fallible `fstat` sits between the exclusive open
+  and arming) — rename failure and panic unwind included — removes the
+  staging file only after re-checking it is still ours. Residual,
+  recorded in the tracker: the identity re-checks on the rename and
+  cleanup paths each leave a microsecond-class check-to-act window,
+  reachable only through a same-PID-same-nonce staging-name reuse.
+- **Stale staging is reclaimed without touching a download it observes
+  live** (a transfer stalled beyond the 60-second mtime grace can be
+  reclaimed — by a foreign-namespace scanner, or by any scanner if the
+  writer resumes only after the staleness sample, since the sample and
+  the unlink are separate steps — in which case that download fails
+  rather than publishing (an explicit retry message when the pre-rename
+  identity check observes the reclamation, else a plain rename error),
+  the sole exceptions being the check-to-rename name-reuse window
+  ledgered above and concurrently running pre-0.21 binaries, which
+  hash and rename by pathname and carry no such guarantee):
+  reclamation runs on every invocation (including cache hits) and
+  deletes a PID-named staging file only when the file's mtime is stale
+  (a live writer in any PID
+  namespace refreshes mtime on every chunk) and its recorded process is
+  locally dead or the file is over a day old; a process alive under
+  another user is kept. The liveness check is a silent `kill(pid, 0)` — no subprocess, no
+  console noise — and treats permission errors (`EPERM`) as "alive"
+  (until the file passes the one-day threshold, which reclaims
+  regardless of liveness). Legacy fixed-name `.part` litter from older
+  versions carries no PID and is reclaimed on age alone, when over an
+  hour stale.
+- **The bench model cache publishes atomically**: `bench_{size}.lbc`
+  generation stages to an exclusive temp file and renames, so a
+  concurrent process can no longer accept a partially generated model;
+  the model generators also flush explicitly after finishing
+  (`BufWriter`'s drop swallows I/O errors).
+- **Test temp paths are process-unique everywhere**: the two fixtures the
+  round-7 report reproduced failing under concurrent test runs (30/40
+  and 22/40), five counter-only source-crate siblings, and twenty-one
+  integration-test directories now carry the process id — verified with
+  twenty concurrent pairs (forty runs), zero failures, against a
+  same-session control that still reproduced the old failure.
+
 ## [0.20.0] — 2026-08-31
 
 ### Fixed
